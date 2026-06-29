@@ -55,6 +55,7 @@ class BehaviorModel(ObservableObject, ProjectDependentProtocol):
                 pellet_device=hardware_model,
                 inference=inference,
                 topcam_presence=topcam_presence,
+                tunnel_headfix_enabled=hardware_model.tunnel_headfix_enabled,
             )
         self._system_machine: SystemMachine = system_machine
         self._hardware_model = hardware_model
@@ -70,8 +71,10 @@ class BehaviorModel(ObservableObject, ProjectDependentProtocol):
 
     @BehaviorAlgorithm.relay_func(wait=False)
     def _hardware_model_property_changed(self, name, value, _):
-        if name == HardwareModel.TUNNEL_HEADFIX_ENABLED and not value:
-            self._disable_tunnel_headfix_behavior()
+        if name == HardwareModel.TUNNEL_HEADFIX_ENABLED:
+            self._system_machine.tunnel_headfix_enabled = value
+            if not value:
+                self._disable_tunnel_headfix_behavior()
 
     def _disable_tunnel_headfix_behavior(self):
         analysis = self._analysis
@@ -188,6 +191,7 @@ class BehaviorModel(ObservableObject, ProjectDependentProtocol):
         analysis.device_comm_alarm.config = alarm_cfg.device_comm_error
         analysis.external_doors_alarm.config = alarm_cfg.external_doors
         # so that they emit the CONFIG changed event.
+        system_m.tunnel_headfix_enabled = self._hardware_model.tunnel_headfix_enabled
         if not self._hardware_model.tunnel_headfix_enabled:
             self._disable_tunnel_headfix_behavior()
 

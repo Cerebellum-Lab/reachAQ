@@ -1590,6 +1590,7 @@ class AppModel(ObservableObject):
         logger.verbose("Will use algo record_prebuffer_duration=%.1f seconds", prebuffer_duration)
         self._behavior.algorithm.record_prebuffer_duration = prebuffer_duration
 
+        self._hardware.load_config(configuration.hardware)
         self.inference.load_configuration(configuration.inference)
         self.laser.load_configuration(configuration.laser)
         self.behavior.load_configuration(configuration.behavior)
@@ -1610,8 +1611,6 @@ class AppModel(ObservableObject):
         analysis = self._analysis
         analysis.system_fault_alarm.set_persistence_config(configuration.persistence)
         self._refresh_cage_clean_data()
-
-        self._hardware.load_config(configuration.hardware)
 
         self.configuration_loaded_event(configuration)
 

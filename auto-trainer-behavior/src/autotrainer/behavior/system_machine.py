@@ -67,6 +67,7 @@ class SystemMachine(StateMachine):
                  algorithm: Optional[BehaviorAlgorithm] = None,
                  project_info: Optional[ProjectInfo] = None,
                  topcam_presence: Optional[PresenceDetectionAttrs] = None,
+                 tunnel_headfix_enabled: bool = True,
                  ):
 
         initial_state = SystemState.cage
@@ -122,6 +123,7 @@ class SystemMachine(StateMachine):
 
         self._pellet_device = pellet_device
         self._tunnel_device = tunnel_device
+        self._tunnel_headfix_enabled = tunnel_headfix_enabled
         self._msg_handler = msg_handler
 
         algo = self._algorithm = BehaviorAlgorithm(
@@ -217,6 +219,21 @@ class SystemMachine(StateMachine):
         return self._intersession
 
     @property
+    def tunnel_headfix_enabled(self) -> bool:
+        return self._tunnel_headfix_enabled
+
+    @tunnel_headfix_enabled.setter
+    def tunnel_headfix_enabled(self, value: bool):
+        prev, self._tunnel_headfix_enabled = self._tunnel_headfix_enabled, value
+        if prev != value:
+            logger.info("tunnel/headfix behavior enabled changed to: %s", value)
+        if not value:
+            self._timer_consider_close_gate.cancel()
+            self._timer_auto_clamp_evaluate.cancel()
+            self._timer_auto_clamp_disengage.cancel()
+            self._autoclamp_set_in_progress(False)
+
+    @property
     def project(self) -> ProjectInfo:
         return self._project_info
 
@@ -231,6 +248,18 @@ class SystemMachine(StateMachine):
     @property
     def shift_xyz_handler(self) -> ShiftXYZHandler:
         return self._shift_xyz_handler
+
+    def can_enter_tunnel(self, *, reason: str = "NA") -> bool:
+        if self._tunnel_headfix_enabled:
+            return True
+        logger.warning("Blocked enter_tunnel(%s): tunnel/headfix hardware is disabled", reason)
+        return False
+
+    def can_exit_intersession_to_tunnel(self) -> bool:
+        if self._tunnel_headfix_enabled:
+            return True
+        logger.warning("Blocked exit_intersession_to_tunnel: tunnel/headfix hardware is disabled")
+        return False
 
     def before_enter_tunnel(self, *, reason: str = "NA"):
         pellet_state = self._pellet_machine.state
@@ -313,6 +342,11 @@ class SystemMachine(StateMachine):
             self._pellet_machine.environment_changed()
 
     def after_exit_intersession(self):
+        if not self._tunnel_headfix_enabled:
+            self._timer_consider_close_gate.cancel()
+            with self._algorithm.set_allow_reentrant(True):
+                self.exit_intersession_to_cage()
+            return
         if self._analysis.load_cell_monitor.is_engaged:
             with self._algorithm.set_allow_reentrant(True):
                 self.exit_intersession_to_tunnel()
@@ -375,9 +409,10 @@ class SystemMachine(StateMachine):
             remains1 = math.inf
         # second possibility:
         ctx = load_cell_tare.get_context()
-        load_cell_low_var_age = perf_now - ctx.low_variance_engaged_perf_c
+        load_cell_low_var_age = math.inf
         tun_missing_age = algo.all_cams_scene_parts_presence_context.get_animal_absence_age(perf_now=perf_now)
-        if remains1 > 0 and cfg.animal_tunnel_no_activity_delay > 0:
+        if remains1 > 0 and cfg.animal_tunnel_no_activity_delay > 0 and self._tunnel_headfix_enabled:
+            load_cell_low_var_age = perf_now - ctx.low_variance_engaged_perf_c
             if ctx.low_variance_engaged:
                 min_age = min(tun_missing_age, load_cell_low_var_age)
                 last_activity_age2 = min(min_age, in_session_age)
@@ -430,8 +465,9 @@ class SystemMachine(StateMachine):
     def on_session_capture_ended(self, reason: RecordingEndingReason):
         self._timer_consider_auto_end_session.cancel()
         if reason == RecordingEndingReason.MISSING_ANIMAL_ACTIVITY_TIMEOUT:
-            logger.notice("Forcing tare load cell due to %s", reason)
-            self._tunnel_device.tare_load_cell()
+            if self._tunnel_headfix_enabled:
+                logger.notice("Forcing tare load cell due to %s", reason)
+                self._tunnel_device.tare_load_cell()
         p_now = get_perf_now()
         self._batch_sessions_total_duration += p_now - self._session_started_perf_c
         cur_project = self._project_info.to_local_value()
@@ -453,7 +489,10 @@ class SystemMachine(StateMachine):
         can_batch_session = False
         cur_sessions_batch = self._batch_project_sessions_list
         batch_sess_cfg = algo.batch_session_recording_config
-        load_cell_engaged = self._analysis.load_cell_monitor.is_engaged
+        load_cell_engaged = (
+            self._tunnel_headfix_enabled
+            and self._analysis.load_cell_monitor.is_engaged
+        )
         if can_perform_analysis:
             if batch_sess_cfg.enabled or len(cur_sessions_batch) > 0:
                 # > 0:  in case it's disabled while there is some session(s) currently batched
@@ -562,6 +601,8 @@ class SystemMachine(StateMachine):
 
     @BehaviorAlgorithm.relay_func(wait=False)
     def _on_headbar_pressure_monitor_property_changed(self, name: str, value, _):
+        if not self._tunnel_headfix_enabled:
+            return
         if name == HeadbarPressureMonitor.IS_ENGAGED_PROPERTY:
             self._event_manager.post_event_content(
                 ApiEventKind.headFixationForceDetectorChanged, data=dict(is_enabled=value))
@@ -570,6 +611,8 @@ class SystemMachine(StateMachine):
 
     @BehaviorAlgorithm.relay_func(wait=False)
     def _on_load_cell_monitor_property_changed(self, name: str, value, _):
+        if not self._tunnel_headfix_enabled:
+            return
         if self._state == SystemState.intersession:
             self._event_manager.post_event_content(ApiEventKind.headfixLoadCellChangedInIntersession,
                                                    data=dict(is_enabled=value))
@@ -600,6 +643,9 @@ class SystemMachine(StateMachine):
 
     @BehaviorAlgorithm.relay_func(wait=False)
     def _evaluate_auto_clamp(self, *, caller: str="NA"):
+        if not self._tunnel_headfix_enabled:
+            logger.debug("auto-clamp skipped because tunnel/headfix hardware is disabled")
+            return
         algo = self._algorithm
         if algo.algo_paused:
             logger.debug("auto_clamp: algo-paused, skipping evaluate")
@@ -655,6 +701,9 @@ class SystemMachine(StateMachine):
 
     @BehaviorAlgorithm.relay_func(wait=False)
     def _on_load_cell_tare_requested(self, *, force: bool = False):
+        if not self._tunnel_headfix_enabled:
+            logger.debug("Skipping load-cell tare request because tunnel/headfix hardware is disabled")
+            return False
         if force or not self._algorithm.is_in_session:
             self._tunnel_device.tare_load_cell()
             self._event_manager.post_event_content(ApiEventKind.headfixAutoTare)
@@ -831,9 +880,8 @@ class SystemMachine(StateMachine):
                         self._last_pellet_loading_perf_c, self._last_pellet_loaded_perf_c)
         #
         if not prev_pellet_seen and response.pellet_seen and (
-            self._state == SystemState.tunnel
+            self._is_ready_for_reach_session()
             and not algo.is_in_session
-            and self._analysis.load_cell_monitor.is_engaged
             and (
                 self._pellet_machine.state == PelletState.monitoring
                 or algo.head_fixation_enabled)  # or using auto-clamp which allows start session before
@@ -925,6 +973,9 @@ class SystemMachine(StateMachine):
     @BehaviorAlgorithm.relay_func(wait=False)
     def _consider_close_gate_during_intersession(self):
         self._timer_consider_close_gate.cancel()  # always
+        if not self._tunnel_headfix_enabled:
+            logger.debug("auto_close_gate skipped because tunnel/headfix hardware is disabled")
+            return
         algo = self._algorithm
         close_cfg = algo.auto_close_gate_on_intersession_config
         if not close_cfg.enabled:
@@ -998,7 +1049,8 @@ class SystemMachine(StateMachine):
         if name == props.HEAD_FIXATION_ENABLED:
             if not new_value:
                 logger.debug("auto-clamp disabled (backing off to baseline intensity)")
-                self._disengage_auto_clamp()
+                if self._tunnel_headfix_enabled:
+                    self._disengage_auto_clamp()
                 # todo: don't we want : self._execute_disengage_auto_clamp() ?
 
         elif name == props.AUTO_CORRECT_MOTOR_DRIFT:
@@ -1018,27 +1070,33 @@ class SystemMachine(StateMachine):
                         algo.end_capture_session(reason=RecordingEndingReason.ALGO_PAUSED)
                 if algo.status != BehaviorAlgoStatus.IDLE:
                     with algo.set_allow_reentrant(True):
-                        for action_func in (
-                            tunnel_dev.open_tunnel_gate,
-                            lambda: self._update_magnet_position(0),
-                            lambda: self._pellet_machine.move_home(force=True),
-                        ):
+                        action_funcs = [lambda: self._pellet_machine.move_home(force=True)]
+                        if self._tunnel_headfix_enabled:
+                            action_funcs[:0] = [
+                                tunnel_dev.open_tunnel_gate,
+                                lambda: self._update_magnet_position(0),
+                            ]
+                        for action_func in action_funcs:
                             try:
                                 action_func()
                             except Exception as err:
                                 logger.warning("%s failed: %s, but continuing", action_func, err)
             else:
                 if algo.status != BehaviorAlgoStatus.IDLE:
-                    tunnel_dev.open_tunnel_gate()
-                    self._update_magnet_position(algo.baseline_intensity)
+                    if self._tunnel_headfix_enabled:
+                        tunnel_dev.open_tunnel_gate()
+                        self._update_magnet_position(algo.baseline_intensity)
                 # No need of pellet_dev.send_pellet() :
                 # pellet-machine will resume whatever operation needs to be, like going from home -> send-pellet,
                 # or load-pellet, depending on live conditions.
                 #
                 # trigger load cell property changed check, so that new session will be started if mouse still in tunnel
-                self._on_load_cell_monitor_property_changed(
-                    LoadCellMonitor.IS_ENGAGED_PROPERTY, self._analysis.load_cell_monitor.is_engaged, None
-                )
+                if self._tunnel_headfix_enabled:
+                    self._on_load_cell_monitor_property_changed(
+                        LoadCellMonitor.IS_ENGAGED_PROPERTY, self._analysis.load_cell_monitor.is_engaged, None
+                    )
+                else:
+                    self._consider_start_session(reason="algo_unpaused_no_tunnel_headfix")
                 # also trigger others checks:
                 self._on_inference_property_changed(InferenceProtocol.STATUS, self._inference.status, None)
 
@@ -1046,6 +1104,8 @@ class SystemMachine(StateMachine):
             self._analysis.pellet_misplaced_monitor.dcs_config = new_value
 
     def _on_auto_tunnel_sweep_property_changed(self, name, value, _):
+        if not self._tunnel_headfix_enabled:
+            return
         if name == BaseDetector.IS_ENGAGED:
             if value:
                 self._pellet_device.set_tunnel_fan_on()
@@ -1067,7 +1127,7 @@ class SystemMachine(StateMachine):
                     consumed, self._last_pellet_loaded_perf_c, self._last_pellet_loading_perf_c,
                     self._last_pellet_failed_loaded_perf_c)
         self._last_pellet_loading_perf_c = p_now
-        if consumed:
+        if consumed and self._tunnel_headfix_enabled:
             analysis.autoclamp_evasion_detector.increment_pellets_consumed()
 
         self._timer_consider_start_session.cancel()  # we will get a pellet_loaded event once it's finished
@@ -1075,7 +1135,7 @@ class SystemMachine(StateMachine):
         #
         clamp_cfg = algo.active_config.head_clamp
         self._disengage_auto_clamp_load_count += 1
-        if clamp_cfg.release_mode == HeadClampReleaseMode.ACTIVITY:
+        if self._tunnel_headfix_enabled and clamp_cfg.release_mode == HeadClampReleaseMode.ACTIVITY:
             if self._disengage_auto_clamp_load_count >= clamp_cfg.auto_clamp_release_load_count:
                 self._disengage_auto_clamp()
 
@@ -1130,9 +1190,22 @@ class SystemMachine(StateMachine):
             self._set_pellet_delivered_presented(project, perf_c - algo.recording_start_perf_c)
 
     def _update_magnet_position(self, position: float):
+        if not self._tunnel_headfix_enabled:
+            logger.debug("Skipping head magnet update because tunnel/headfix hardware is disabled")
+            return
         self._tunnel_device.update_head_magnet_intensity(position)
 
+    def _is_ready_for_reach_session(self) -> bool:
+        if not self._tunnel_headfix_enabled:
+            return self._state == SystemState.cage
+        return (
+            self._state == SystemState.tunnel
+            and self._analysis.load_cell_monitor.is_engaged
+        )
+
     def _consider_enter_tunnel(self, reason: str="NA"):
+        if not self._tunnel_headfix_enabled:
+            return
         if not (
             self._state == SystemState.cage
             and self._inference.status == InferenceStatus.live
@@ -1157,17 +1230,18 @@ class SystemMachine(StateMachine):
         pellet_machine = self._pellet_machine
         send_begin_age = pellet_machine.get_pellet_send_begin_age(perf_now)
         send_end_age = pellet_machine.get_pellet_send_end_age(perf_now)
+        device_ready = self._is_ready_for_reach_session()
         logger.verbose(
-            "consider_start_session: load_cell.engaged=%s "
+            "consider_start_session: device_ready=%s load_cell.engaged=%s "
             "state=%s pellet-state=%s recently_seen=%s seen_age=%.1f in_session=%s "
             "send_begin_age=%.1f send_end_age=%.1f",
+            device_ready,
             self._analysis.load_cell_monitor.is_engaged,
             self._state, self._pellet_machine.state, algo.pellet_recently_seen, pellet_seen_age,
             algo.is_in_session, send_begin_age, send_end_age)
         if not (
-            self._state == SystemState.tunnel
+            device_ready
             and not algo.is_in_session
-            and self._analysis.load_cell_monitor.is_engaged
             and algo.is_pellet_recently_seen()
         ):
             logger.debug("Not good state")
@@ -1337,6 +1411,7 @@ class SystemMachine(StateMachine):
             trigger=enter_tunnel,
             source=[SystemState.cage, SystemState.tunnel],
             dest=SystemState.tunnel,
+            conditions=can_enter_tunnel,
             before=before_enter_tunnel,
             after=after_enter_tunnel,
         ),
@@ -1373,6 +1448,7 @@ class SystemMachine(StateMachine):
             trigger=exit_intersession_to_tunnel,
             source=SystemState.intersession,
             dest=SystemState.tunnel,
+            conditions=can_exit_intersession_to_tunnel,
             after=after_exit_intersession_to_tunnel,
         ),
         dict(
