@@ -341,6 +341,14 @@ class AppModel(ObservableObject):
             self._right_camera,
             self._top_camera,
         ]
+        self._camera_by_id = {
+            camera.camera_id: camera
+            for camera in self._cameras
+        }
+        self._reach_cameras = (
+            self._left_camera,
+            self._right_camera,
+        )
 
         self._system_message_queue = queue.Queue()  # only dedicated to CAN bus messages reading/handling
 
@@ -682,7 +690,7 @@ class AppModel(ObservableObject):
 
     def _get_monitored_cams(self):
         cams = []  # put primary first
-        monitored_cams = (self._left_camera, self._right_camera)
+        monitored_cams = self._reach_cameras
         for cam in monitored_cams:
             if cam.is_primary:
                 cams.append(cam)
@@ -799,6 +807,17 @@ class AppModel(ObservableObject):
     @property
     def top_camera(self):
         return self._top_camera
+
+    @property
+    def cameras(self) -> Tuple[VideoCaptureModel, ...]:
+        return tuple(self._cameras)
+
+    @property
+    def reach_cameras(self) -> Tuple[VideoCaptureModel, ...]:
+        return self._reach_cameras
+
+    def get_camera_model(self, camera_id: CameraId) -> Optional[VideoCaptureModel]:
+        return self._camera_by_id.get(camera_id)
 
     @property
     def top_camera_presence_detection(self):
@@ -1238,7 +1257,7 @@ class AppModel(ObservableObject):
             self._inference_queue = None
 
         #
-        synced_cameras = (self._left_camera, self._right_camera)  # normally/usually left cam is primary
+        synced_cameras = self._reach_cameras  # normally/usually left cam is primary
         did_start = True
 
         # 1) prepare synced primary camera(s)

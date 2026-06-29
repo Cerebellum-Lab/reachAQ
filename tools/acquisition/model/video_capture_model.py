@@ -149,6 +149,10 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
         return self._camera_index
 
     @property
+    def camera_id(self) -> CameraId:
+        return self._id
+
+    @property
     def video_status(self) -> CaptureProcessStatus:
         return CaptureProcessStatus(self._video_status.value)
 
