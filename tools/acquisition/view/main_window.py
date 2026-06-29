@@ -1186,6 +1186,16 @@ class MainWindow(QMainWindow):
             # plus:
             toolbar.setMaximumHeight(toolbar.minimumSizeHint().height())
 
+    def _update_tunnel_headfix_visibility(self, is_enabled: bool):
+        for action in (
+            self.load_cell_trigger_action,
+            self.force_headbar_detector_action,
+        ):
+            if not is_enabled and action.isChecked():
+                action.setChecked(False)
+            action.setVisible(is_enabled)
+        self._status_label_magnet_intensity.setVisible(is_enabled)
+
     def _configure_statusbar(self):
         self._status_label = QLabel("")
         bar = self._status_bar = QStatusBar(self)
@@ -1206,6 +1216,7 @@ class MainWindow(QMainWindow):
         hbox.addWidget(lbl)
         bar.addPermanentWidget(widget)
         self.setStatusBar(bar)
+        self._update_tunnel_headfix_visibility(self._app_model.hardware.tunnel_headfix_enabled)
 
     def _toggle_diagnostics_view(self):
         self.main_content.set_diagnostics_visible(not self.main_content.is_diagnostics_visible)
@@ -1276,6 +1287,10 @@ class MainWindow(QMainWindow):
         return fake_result
 
     def _internal_simulate_trigger_load_cell(self):
+        if not self._app_model.hardware.tunnel_headfix_enabled:
+            logger.warning("Blocked internal load-cell simulation: tunnel/headfix hardware is disabled")
+            self.load_cell_trigger_action.setChecked(False)
+            return
         is_checked = self.load_cell_trigger_action.isChecked()
         app_model = self._app_model
         load_cell_monitor = app_model.analysis.load_cell_monitor
@@ -1296,6 +1311,10 @@ class MainWindow(QMainWindow):
         load_cell_monitor.force_engaged(is_checked)
 
     def _internal_set_force_headbar_detector(self):
+        if not self._app_model.hardware.tunnel_headfix_enabled:
+            logger.warning("Blocked internal headbar detector simulation: tunnel/headfix hardware is disabled")
+            self.force_headbar_detector_action.setChecked(False)
+            return
         new_value = self.force_headbar_detector_action.isChecked()
         self._app_model.analysis.headbar_pressure_monitor.force_engaged(new_value)
 
@@ -1671,6 +1690,8 @@ class MainWindow(QMainWindow):
         elif property_name in {hard.POS_XYZ, hard.SEND_X, hard.SEND_Y, hard.SEND_Z}:
             self._status_label_pos.update_coordinate(hard.last_dcs_position)
             self._status_label_send_pos.update_coordinate(hard.last_dcs_set_position)
+        elif property_name == hard.TUNNEL_HEADFIX_ENABLED:
+            self._update_tunnel_headfix_visibility(value)
 
     @invoke_method
     def _on_behavior_algo_property_changed(self, name: str, value, _):
