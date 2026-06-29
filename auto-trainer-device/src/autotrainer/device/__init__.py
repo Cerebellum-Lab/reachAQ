@@ -18,3 +18,6 @@ from .emulation_interface import EmulationInterface
 from .can_device import CanDevice, HAVE_CAN_DEVICE
 from .can_transport import (CanTransportConfiguration, CanTransportKind, CanTransportProtocol,
                             normalize_can_transport_kind)
+from .laser import (LaserChannelConfiguration, LaserChannelId, LaserControllerProtocol,
+                    LaserFeedbackSample, LaserSystemConfiguration, NullLaserController,
+                    normalize_laser_channel_id)
