@@ -25,6 +25,7 @@ from autotrainer.pyside.content_widget import ContentWidget, invoke_method
 
 from autotrainer.training import TrainingPlan, TrainingPhase
 from tools.acquisition.model.app_model import AppModel
+from tools.acquisition.model.hardware_model import HardwareModel
 from tools.acquisition.view.alarm_content import AlarmContent
 from tools.acquisition.view.analysis_content import AnalysisContent
 from tools.acquisition.view.behavior_content import BehaviorContent
@@ -153,6 +154,7 @@ class MainContent(ContentWidget):
 
         # finally, register handlers to events:
         app_model.property_changed += self._model_property_changed
+        app_model.hardware.property_changed += self._hardware_model_property_changed
         app_model.configuration_loaded_event += self._on_config_loaded
         #
         inference = app_model.inference
@@ -274,7 +276,9 @@ class MainContent(ContentWidget):
         plan_content = self._training_plan_content = TrainingPlanContent()
         left.addWidget(plan_content)
 
-        phase_content = self._training_phase_content = TrainingPhaseContent()
+        phase_content = self._training_phase_content = TrainingPhaseContent(
+            tunnel_headfix_enabled=self._app_model.hardware.tunnel_headfix_enabled,
+        )
         left.addWidget(phase_content)
 
         layout.addLayout(left, stretch=1)
@@ -518,6 +522,11 @@ class MainContent(ContentWidget):
             self.training_plan_changed.emit(app_model.training_plan)
         elif name in {props.TRAINING_PLAN_PROP, props.TRAINING_PHASE_PROP}:
             self.training_plan_changed.emit(app_model.training_plan)
+
+    @invoke_method
+    def _hardware_model_property_changed(self, name: str, value, _):
+        if name == HardwareModel.TUNNEL_HEADFIX_ENABLED:
+            self._training_phase_content.set_tunnel_headfix_enabled(value)
 
     @invoke_method
     def _on_config_loaded(self, config):

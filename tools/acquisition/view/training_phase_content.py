@@ -25,8 +25,9 @@ class TrainingPhaseCard(CardWidget):
     #  and add a set_training_phase method to allow update in-place,
     #  instead of having to fully reconstruct always the card.
 
-    def __init__(self, phase: TrainingPhase):
+    def __init__(self, phase: TrainingPhase, *, tunnel_headfix_enabled: bool = True):
         super().__init__(title="Current Phase")
+        self._tunnel_headfix_enabled = tunnel_headfix_enabled
 
         label = self._header_right_label = QLabel(phase.name)
         self.header.setRightContent(label)
@@ -127,7 +128,11 @@ class TrainingPhaseCard(CardWidget):
             r += 1
 
         magnet_intensity = phase.magnet_intensity
-        if not phase.use_magnet_baseline_intensity and magnet_intensity is not None:
+        if (
+            self._tunnel_headfix_enabled
+            and not phase.use_magnet_baseline_intensity
+            and magnet_intensity is not None
+        ):
             grid.addWidget(QLabel("Magnet Intensity"), r, c)
             hbox = QHBoxLayout()
             label = self._device_magnet_start_intensity_label = QLabel(str(magnet_intensity))
@@ -192,7 +197,7 @@ class TrainingPhaseCard(CardWidget):
         layout.addLayout(grid)
         r = c = 0
         #
-        if phase.use_magnet_baseline_intensity:
+        if self._tunnel_headfix_enabled and phase.use_magnet_baseline_intensity:
             grid.addWidget(QLabel("Use Baseline Intensity"), r, c)
             grid.addWidget(QLabel("On"), r, c + 1)
             r += 1
@@ -201,10 +206,11 @@ class TrainingPhaseCard(CardWidget):
         grid.addWidget(QLabel("On" if phase.is_pellet_shift_enabled else "Off"), r, c + 1)
         r += 1
         #
-        grid.addWidget(QLabel("Auto-Clamp"), r, c)
-        grid.addWidget(QLabel("On" if phase.is_auto_clamp_enabled else "Off"), r, c + 1)
-        r += 1
-        if phase.is_auto_clamp_enabled:
+        if self._tunnel_headfix_enabled:
+            grid.addWidget(QLabel("Auto-Clamp"), r, c)
+            grid.addWidget(QLabel("On" if phase.is_auto_clamp_enabled else "Off"), r, c + 1)
+            r += 1
+        if self._tunnel_headfix_enabled and phase.is_auto_clamp_enabled:
             grid.addWidget(QLabel("Auto-Clamp Release Delay"), r, c)
             hbox = QHBoxLayout()
             hbox.addWidget(QLabel(f"{phase.auto_clamp_no_activity_release_delay:.1f}"))
@@ -227,13 +233,24 @@ class TrainingPhaseCard(CardWidget):
 
 class TrainingPhaseContent(StackedWidget):
 
-    def __init__(self):
+    def __init__(self, *, tunnel_headfix_enabled: bool = True):
         super().__init__()
+        self._tunnel_headfix_enabled = tunnel_headfix_enabled
         self._phase_card_by_phase_id: Dict[str, QWidget] = {}
         self._phase_by_phase_id: Dict[str, TrainingPlan] = {}
         self._training_phase: Optional[TrainingPhase] = None
         card = self._empty_card = CardWidget(title="Current Phase")
         self.addWidget(card)
+
+    def set_tunnel_headfix_enabled(self, is_enabled: bool):
+        if self._tunnel_headfix_enabled == is_enabled:
+            return
+        self._tunnel_headfix_enabled = is_enabled
+        for card in self._phase_card_by_phase_id.values():
+            self.removeWidget(card)
+            card.setParent(None)
+        self._phase_card_by_phase_id.clear()
+        self.set_training_phase(self._training_phase, force_refresh=True)
 
     @invoke_method
     def set_training_phase(self, phase: Optional[TrainingPhase], *, force_refresh: bool=False):
@@ -256,7 +273,7 @@ class TrainingPhaseContent(StackedWidget):
             card.setParent(None)
 
         logger.debug("Adding new phase %s with %s actions", phase.phase_id, len(phase.session_actions))
-        card = TrainingPhaseCard(phase)
+        card = TrainingPhaseCard(phase, tunnel_headfix_enabled=self._tunnel_headfix_enabled)
         self.addWidget(card)
         self._phase_card_by_phase_id[phase.phase_id] = card
         self.setCurrentWidget(card)
