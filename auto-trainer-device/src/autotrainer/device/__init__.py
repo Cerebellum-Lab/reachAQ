@@ -16,3 +16,5 @@ from .device_interface import (DeviceInterface, Target, Motor, ServoConfig, Step
                                SensorStatus, Status)
 from .emulation_interface import EmulationInterface
 from .can_device import CanDevice, HAVE_CAN_DEVICE
+from .can_transport import (CanTransportConfiguration, CanTransportKind, CanTransportProtocol,
+                            normalize_can_transport_kind)
