@@ -1277,6 +1277,7 @@ class PreferencesContent(QWidget):
     def _create_alarms_tab(self):
         app_model = self._app_model
         analysis = app_model.analysis
+        tunnel_headfix_enabled = app_model.hardware.tunnel_headfix_enabled
         alarm_monitor = analysis.emergency_alarm_monitor
         alarm_cfg = analysis.emergency_alarm_monitor.config
 
@@ -1335,6 +1336,7 @@ class PreferencesContent(QWidget):
 
         cur_row = 0
         cur_col = 0
+        tunnel_headfix_rows = []
 
         self._use_audio_load_cell_thrashing_toggle, tog_emergency, tog_autoresume, refresh_cb = self._make_alarm_entries(
             grid_layout, "Animal Thrashing Alarm", analysis.animal_thrashing_alarm, cur_row, cur_col)
@@ -1356,6 +1358,7 @@ class PreferencesContent(QWidget):
         grid_layout.addWidget(spinbox, cur_row, cur_col + 1)
         cur_row += 1
 
+        load_cell_start_row = cur_row
         grid_layout.addWidget(QLabel("LoadCell thrash % time:"), cur_row, cur_col)
         spinbox = QSpinBox()
         refresh_cb.append(lambda e=spinbox: e.setEnabled(self._use_audio_load_cell_thrashing_toggle.isChecked()))
@@ -1381,6 +1384,7 @@ class PreferencesContent(QWidget):
         spinbox.valueChanged.connect(load_cell_thrash_count_value_changed)
         grid_layout.addWidget(spinbox, cur_row, cur_col + 1)
         cur_row += 1
+        tunnel_headfix_rows.extend(range(load_cell_start_row, cur_row))
 
         grid_layout.addWidget(QLabel("Audio thrash % time:"), cur_row, cur_col)
         spinbox = QSpinBox()
@@ -1408,6 +1412,7 @@ class PreferencesContent(QWidget):
         grid_layout.addWidget(spinbox, cur_row, cur_col + 1)
         cur_row += 1
 
+        animal_missing_start_row = cur_row
         tog_use, tog_emerg, tog_resume, refresh_cb = self._make_alarm_entries(
             grid_layout, "Animal Missing Alarm", analysis.presence_in_cage_alarm, cur_row, cur_col)
         cur_row += 3
@@ -1430,10 +1435,13 @@ class PreferencesContent(QWidget):
         spinbox.valueChanged.connect(missing_delay_after_exit_tunnel_value_changed)
         grid_layout.addWidget(spinbox, cur_row, cur_col + 1)
         cur_row += 1
+        tunnel_headfix_rows.extend(range(animal_missing_start_row, cur_row))
 
+        animal_evasion_start_row = cur_row
         self._make_alarm_entries(grid_layout, "Animal Evasion Alarm",
                                  analysis.animal_evasion_alarm, cur_row, cur_col)
         cur_row += 3
+        tunnel_headfix_rows.extend(range(animal_evasion_start_row, cur_row))
 
         # right side:
 
@@ -1487,6 +1495,9 @@ class PreferencesContent(QWidget):
         cur_row += 3
 
         # finally
+        for row in tunnel_headfix_rows:
+            set_row_col_visible(grid_layout, row, 0, tunnel_headfix_enabled)
+            set_row_col_visible(grid_layout, row, 1, tunnel_headfix_enabled)
         refresh_enabled_states()
 
         tab = QWidget(None)

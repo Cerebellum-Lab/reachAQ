@@ -65,7 +65,40 @@ class BehaviorModel(ObservableObject, ProjectDependentProtocol):
         #     f"pellet.{StateMachine.Properties.STATE_PROPERTY}", new_val, old_val)
         # actually unused event (pellet.state)
 
+        hardware_model.property_changed += self._hardware_model_property_changed
         analysis.emergency_alarm_monitor.property_changed += self._alarm_monitor_property_changed
+
+    @BehaviorAlgorithm.relay_func(wait=False)
+    def _hardware_model_property_changed(self, name, value, _):
+        if name == HardwareModel.TUNNEL_HEADFIX_ENABLED and not value:
+            self._disable_tunnel_headfix_behavior()
+
+    def _disable_tunnel_headfix_behavior(self):
+        analysis = self._analysis
+        algo = self._system_machine.algorithm
+        logger.info("Disabling tunnel/headfix-dependent behavior because the hardware is disabled")
+        algo.head_fixation_enabled = False
+        algo.active_config.head_clamp.enabled = False
+        algo.auto_close_gate_on_intersession_config.enabled = False
+        analysis.auto_tunnel_sweep_monitor.config.enabled = False
+        analysis.auto_tunnel_sweep_monitor.stop()
+
+        thrash_alarm = analysis.animal_thrashing_alarm
+        thrash_cfg = thrash_alarm.config
+        thrash_changed = (
+            thrash_cfg.load_cell_thrash_percent_on != 0
+            or thrash_cfg.load_cell_thrash_count != 0
+        )
+        if thrash_changed:
+            thrash_cfg.load_cell_thrash_percent_on = 0
+            thrash_cfg.load_cell_thrash_count = 0
+            thrash_alarm.property_changed(thrash_alarm.CONFIG, thrash_cfg, None)
+
+        for alarm in (analysis.presence_in_cage_alarm, analysis.animal_evasion_alarm):
+            cfg = alarm.config
+            if cfg.use:
+                cfg.use = False
+                alarm.property_changed(alarm.CONFIG, cfg, None)
 
     @BehaviorAlgorithm.relay_func(wait=False)
     def _alarm_monitor_property_changed(self, name, value, old_value):
@@ -155,6 +188,8 @@ class BehaviorModel(ObservableObject, ProjectDependentProtocol):
         analysis.device_comm_alarm.config = alarm_cfg.device_comm_error
         analysis.external_doors_alarm.config = alarm_cfg.external_doors
         # so that they emit the CONFIG changed event.
+        if not self._hardware_model.tunnel_headfix_enabled:
+            self._disable_tunnel_headfix_behavior()
 
     def save_configuration(self) -> BehaviorConfiguration:
         algo = self._system_machine.algorithm
