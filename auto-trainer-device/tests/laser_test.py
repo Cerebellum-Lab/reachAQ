@@ -3,6 +3,7 @@ import pytest
 from autotrainer.device import (
     LaserChannelConfiguration,
     LaserChannelId,
+    LaserPulseTrain,
     LaserSystemConfiguration,
     NullLaserController,
 )
@@ -81,3 +82,29 @@ def test_null_laser_controller_reports_missing_command_copy_input():
         controller.read_command_copy_voltage(LaserChannelId.LASER_1)
 
     assert controller.read_feedback_sample(LaserChannelId.LASER_1).command_copy_volts is None
+
+
+def test_laser_pulse_train_requires_frequency_for_multiple_pulses():
+    with pytest.raises(ValueError, match="frequency_hz"):
+        LaserPulseTrain(
+            channel_id=LaserChannelId.LASER_1,
+            amplitude_volts=1.0,
+            duration_ms=10.0,
+            pulse_count=2,
+        )
+
+
+def test_null_laser_controller_runs_pulse_train():
+    system = LaserSystemConfiguration.from_channels([make_channel()])
+    controller = NullLaserController(system)
+
+    controller.run_pulse_train(
+        LaserPulseTrain(
+            channel_id=LaserChannelId.LASER_1,
+            amplitude_volts=2.0,
+            duration_ms=10.0,
+        )
+    )
+
+    assert controller.read_diode_voltage(LaserChannelId.LASER_1) == 0.0
+    assert not controller.is_shutter_open(LaserChannelId.LASER_1)

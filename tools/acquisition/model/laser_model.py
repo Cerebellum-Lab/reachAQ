@@ -7,6 +7,7 @@ from autotrainer.device import (
     LaserControllerProtocol,
     LaserChannelId,
     LaserFeedbackSample,
+    LaserPulseTrain,
     LaserSystemConfiguration,
     NidaqLaserController,
     NullLaserController,
@@ -85,6 +86,9 @@ class LaserModel(ObservableObject):
 
     def read_command_copy_voltage(self, channel_id: Union[LaserChannelId, int]) -> float:
         return self._require_controller().read_command_copy_voltage(channel_id)
+
+    def run_pulse_train(self, pulse_train: LaserPulseTrain) -> None:
+        self._require_controller().run_pulse_train(pulse_train)
 
     def close_all_shutters(self) -> None:
         controller = self._controller
