@@ -588,7 +588,10 @@ class SystemMachine(StateMachine):
         if name == InferenceProtocol.STATUS:
             logger.verbose("Inference status change: %s -> %s ; system_state=%s",
                            prev_value, new_value, self.state)
-            self._consider_enter_tunnel(reason="inference_begin_live_when_load_cell_engaged")
+            if not self._tunnel_headfix_enabled and new_value == InferenceStatus.live:
+                self._consider_start_session(reason="inference_begin_live_no_tunnel_headfix")
+            else:
+                self._consider_enter_tunnel(reason="inference_begin_live_when_load_cell_engaged")
 
     @BehaviorAlgorithm.relay_func(wait=False)
     def _on_inference_segmentation_finished(self, project: ProjectInfo, success: bool, *, error: str="NA"):
@@ -1197,7 +1200,10 @@ class SystemMachine(StateMachine):
 
     def _is_ready_for_reach_session(self) -> bool:
         if not self._tunnel_headfix_enabled:
-            return self._state == SystemState.cage
+            return (
+                self._state == SystemState.cage
+                and self._inference.status == InferenceStatus.live
+            )
         return (
             self._state == SystemState.tunnel
             and self._analysis.load_cell_monitor.is_engaged
