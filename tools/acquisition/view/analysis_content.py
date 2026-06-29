@@ -139,6 +139,11 @@ class AnalysisContent(ContentWidget):
 
         self._headbar_switch_engaged = QtIndicator(text="Headbar DIO Switch")
         layout.addWidget(self._headbar_switch_engaged)
+        self._tunnel_headfix_widgets = (
+            self._load_cell_monitor_engaged,
+            self._headbar_pressure_monitor_engaged,
+            self._headbar_switch_engaged,
+        )
 
         card = self._card_widget = CardWidget(title="Analysis", header_right_layout=layout)
 
@@ -171,7 +176,7 @@ class AnalysisContent(ContentWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
         layout.setAlignment(Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignLeft)
-        label = QLabel("Load Cell Threshold (g):")
+        label = self._load_cell_engaged_threshold_label = QLabel("Load Cell Threshold (g):")
         label.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(label)
         spinbox = self._load_cell_engaged_threshold_spinbox = QDoubleSpinBox()
@@ -222,11 +227,24 @@ class AnalysisContent(ContentWidget):
         msg_handler.measurement_callback = self._measurement_received
         msg_handler.audio_callback = self._audio_received
         user_pref.property_changed += self._on_user_pref_changed
+        hardware_model.property_changed += self._hardware_model_property_changed
+        self._update_tunnel_headfix_visibility(hardware_model.tunnel_headfix_enabled)
         #
         on_measurement_graph_changed(
             _graph_by_name.get(user_pref.measurement_graph, AVAILABLE_GRAPHS[0]).name
         )
         self.measurement_graph_changed.connect(on_measurement_graph_changed)
+
+    def _update_tunnel_headfix_visibility(self, is_enabled: bool):
+        for widget in self._tunnel_headfix_widgets:
+            widget.setVisible(is_enabled)
+        self._load_cell_engaged_threshold_label.setVisible(is_enabled)
+        self._load_cell_engaged_threshold_spinbox.setVisible(is_enabled)
+
+    @invoke_method
+    def _hardware_model_property_changed(self, name: str, value, _):
+        if name == HardwareModel.TUNNEL_HEADFIX_ENABLED:
+            self._update_tunnel_headfix_visibility(value)
 
     def set_is_capture_active(self, is_active: bool):
         if is_active:
