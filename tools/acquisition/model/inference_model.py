@@ -20,7 +20,7 @@ from autotrainer.core.logging import get_verbose_logger, make_log_dict_config
 from autotrainer.core.pose_elements import SceneElement, AllHandsParts
 
 from autotrainer.inference import PoseProcess, InferenceCommandMessageKind, InferenceStatusMessageKind, PoseAlgorithm, \
-    InferenceMode, InferenceStatus, InferenceMonitorDataMsg
+    InferenceMode, InferenceStatus, InferenceMonitorDataMsg, detect_gpu_runtime
 from autotrainer.inference.pose_result_process import InferenceMonitorDataProc
 from autotrainer.inference.analysis import intersession_process, IntersessionResponse
 
@@ -245,6 +245,10 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
 
     def start(self, live_queue: FixedArrayMultiQueue) -> bool:
 
+        if not self._can_start_live_inference():
+            self._set_status(InferenceStatus.stopped)
+            return False
+
         if self._process_pool is None:
             self._process_pool = multiprocessing.Pool(
                 processes=1,  # we only need 1 atm
@@ -296,6 +300,17 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
         proc.start()
 
         return True
+
+    @staticmethod
+    def _can_start_live_inference() -> bool:
+        gpu_status = detect_gpu_runtime()
+        if gpu_status.is_available:
+            logger.info("Live inference GPU runtime available via %s: %s",
+                        gpu_status.backend, gpu_status.devices)
+            return True
+        logger.error("Live inference requires GPU acceleration; refusing to start. backend=%s error=%s",
+                     gpu_status.backend, gpu_status.error)
+        return False
 
     def stop(self):
         if self._status in {InferenceStatus.stopped, InferenceStatus.stopping}:

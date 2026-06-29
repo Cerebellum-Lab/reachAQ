@@ -1374,7 +1374,10 @@ class AppModel(ObservableObject):
         # Start inference & hardware AFTER cameras started, so we can see the initial eventual motor move.
         if self._inference.is_enabled:
             logger.info("Starting inference ..")
-            self._inference.start(self._inference_queue)
+            if not self._inference.start(self._inference_queue):
+                logger.error("Inference did not start; stopping capture")
+                self.capture_stop(force=True)
+                return False
             watchdog_mon_register(WatchdogItems.POSE_DATA_MONITOR_PROC,
                                   lambda: self._inference.watchdog_monitor_data_proc_perf_c)
 
