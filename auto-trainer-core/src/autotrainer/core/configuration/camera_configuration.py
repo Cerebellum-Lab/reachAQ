@@ -2,7 +2,7 @@ import re
 import urllib.parse
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
-from typing import Dict, Any
+from typing import Dict, Any, Tuple
 
 from typing_extensions import Self
 
@@ -20,6 +20,10 @@ class CameraId(IntEnum):
     Left = 0
     Right = 1
     Web = 2
+    Camera3 = 3
+    Camera4 = 4
+    Camera5 = 5
+    Camera6 = 6
 
     def __str__(self) -> str:
         # Used as part of video file and related naming conventions.
@@ -29,8 +33,18 @@ class CameraId(IntEnum):
             return "right"
         elif self == CameraId.Web:
             return "web"
+        elif self in (CameraId.Camera3, CameraId.Camera4, CameraId.Camera5, CameraId.Camera6):
+            return f"camera{int(self)}"
         else:
             raise ValueError(f"Invalid camera id: {self}")
+
+    @classmethod
+    def supported_count(cls) -> int:
+        return 6
+
+    @classmethod
+    def reach_camera_ids(cls) -> Tuple["CameraId", ...]:
+        return (cls.Left, cls.Right, cls.Camera3, cls.Camera4, cls.Camera5, cls.Camera6)
 
 
 @dataclass
