@@ -30,6 +30,7 @@ from .emulation_interface import EmulationInterface
 from .device_api import DeviceApi
 from autotrainer.core.analysis.head_fix_measurement import HeadFixMeasurement
 from .can_interface import CanInterface, Target, target_of_motor
+from .can_transport import CanTransportConfiguration, CanTransportKind
 from .device_interface import (
     Acknowledge,
     AnalogOutput,
@@ -190,7 +191,8 @@ class CanDevice(Device):
         Motor.PELLET_Z_MOTOR: 2,
     }
 
-    def __init__(self, api: Optional[DeviceApi] = None, buffer_size: int = 50, force_emulation: bool = False):
+    def __init__(self, api: Optional[DeviceApi] = None, buffer_size: int = 50, force_emulation: bool = False,
+                 *, can_transport: Optional[CanTransportConfiguration] = None):
         """
         Initialize the CANbus device interface.
 
@@ -198,9 +200,10 @@ class CanDevice(Device):
             api: The device API instance to use for communication
             buffer_size: Size of the measurement buffer
             force_emulation: Whether to force using emulation mode even if hardware is available
+            can_transport: CAN backend selection. Defaults to the existing pyjerrycan path.
         """
-        self._interface: Union[CanInterface, EmulationInterface] = \
-            CanInterface() if HAVE_CAN_DEVICE and not force_emulation else EmulationInterface()
+        self._can_transport_configuration = can_transport or CanTransportConfiguration()
+        self._interface: Union[CanInterface, EmulationInterface] = self._make_device_interface(force_emulation)
 
         super().__init__(self._interface, api)
 
@@ -268,6 +271,20 @@ class CanDevice(Device):
                 uuid_ack_timeout_engaged_property_name=self.MAGNET_UUID_ACK_TIMEOUT_ENGAGED,
             ),
         }
+
+    @property
+    def can_transport_configuration(self) -> CanTransportConfiguration:
+        return self._can_transport_configuration
+
+    def _make_device_interface(self, force_emulation: bool) -> Union[CanInterface, EmulationInterface]:
+        transport = self._can_transport_configuration
+        if force_emulation or transport.kind == CanTransportKind.EMULATION:
+            return EmulationInterface()
+        if transport.kind != CanTransportKind.PYJERRYCAN:
+            raise NotImplementedError(
+                f"{transport.kind.value} CAN transport is configured but no backend adapter is implemented yet"
+            )
+        return CanInterface() if HAVE_CAN_DEVICE else EmulationInterface()
 
     def _init_default_move_configs(self):
         self._load_pellet = default_load_pellet()

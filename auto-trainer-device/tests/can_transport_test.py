@@ -1,8 +1,10 @@
 import pytest
 
 from autotrainer.device import (
+    CanDevice,
     CanTransportConfiguration,
     CanTransportKind,
+    EmulationInterface,
     normalize_can_transport_kind,
 )
 
@@ -37,3 +39,15 @@ def test_normalize_can_transport_kind_rejects_unknown_kind():
 def test_can_transport_configuration_rejects_invalid_bitrate():
     with pytest.raises(ValueError):
         CanTransportConfiguration(kind="socketcan", bitrate=0)
+
+
+def test_can_device_accepts_explicit_emulation_transport():
+    device = CanDevice(can_transport=CanTransportConfiguration(kind="emulation"))
+
+    assert device.can_transport_configuration.kind == CanTransportKind.EMULATION
+    assert isinstance(device.device_interface, EmulationInterface)
+
+
+def test_can_device_rejects_linux_transport_until_adapter_exists():
+    with pytest.raises(NotImplementedError):
+        CanDevice(can_transport=CanTransportConfiguration(kind="socketcan"))
