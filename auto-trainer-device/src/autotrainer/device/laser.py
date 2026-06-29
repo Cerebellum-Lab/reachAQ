@@ -105,8 +105,14 @@ class LaserControllerProtocol(Protocol):
     def read_diode_voltage(self, channel_id: Union[LaserChannelId, int]) -> float:
         """Read diode feedback voltage for the requested laser."""
 
+    def read_feedback_sample(self, channel_id: Union[LaserChannelId, int]) -> LaserFeedbackSample:
+        """Read diode feedback with the current command voltage."""
+
     def close_all_shutters(self) -> None:
         """Force all configured shutters closed."""
+
+    def close(self) -> None:
+        """Release controller resources."""
 
 
 class NullLaserController:
@@ -147,9 +153,20 @@ class NullLaserController:
         channel = self._configuration.get_channel(channel_id)
         return self._command_volts[channel.channel_id] * channel.feedback_scale
 
+    def read_feedback_sample(self, channel_id: Union[LaserChannelId, int]) -> LaserFeedbackSample:
+        channel = self._configuration.get_channel(channel_id)
+        return LaserFeedbackSample(
+            channel_id=channel.channel_id,
+            command_volts=self._command_volts[channel.channel_id],
+            diode_volts=self.read_diode_voltage(channel.channel_id),
+        )
+
     def close_all_shutters(self) -> None:
         for channel_id in self._shutter_open:
             self._shutter_open[channel_id] = False
+
+    def close(self) -> None:
+        self.close_all_shutters()
 
     def is_shutter_open(self, channel_id: Union[LaserChannelId, int]) -> bool:
         channel = self._configuration.get_channel(channel_id)

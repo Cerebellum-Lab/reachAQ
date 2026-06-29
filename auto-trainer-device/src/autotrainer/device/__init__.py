@@ -21,3 +21,4 @@ from .can_transport import (CanTransportConfiguration, CanTransportKind, CanTran
 from .laser import (LaserChannelConfiguration, LaserChannelId, LaserControllerProtocol,
                     LaserFeedbackSample, LaserSystemConfiguration, NullLaserController,
                     normalize_laser_channel_id)
+from .nidaq_laser import NidaqLaserController
