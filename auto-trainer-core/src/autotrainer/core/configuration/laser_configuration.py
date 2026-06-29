@@ -63,7 +63,7 @@ class LaserSystemConfiguration:
     VALID_BACKENDS: ClassVar[Tuple[str, ...]] = ("disabled", "null", "nidaq")
 
     channels: Tuple[LaserChannelConfiguration, ...] = tuple()
-    hardware_timed: bool = True
+    hardware_timed: bool = False
     sample_rate_hz: Optional[float] = None
     backend: str = "disabled"
     pmt_shutter_output: Optional[str] = None
@@ -89,7 +89,7 @@ class LaserSystemConfiguration:
         cls,
         channels: Iterable[LaserChannelConfiguration],
         *,
-        hardware_timed: bool = True,
+        hardware_timed: bool = False,
         sample_rate_hz: Optional[float] = None,
         backend: str = "disabled",
         pmt_shutter_output: Optional[str] = None,

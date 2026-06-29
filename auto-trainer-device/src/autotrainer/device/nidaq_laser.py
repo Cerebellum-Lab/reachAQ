@@ -44,6 +44,11 @@ class NidaqLaserController:
     """
 
     def __init__(self, configuration: LaserSystemConfiguration):
+        if configuration.hardware_timed:
+            raise NotImplementedError(
+                "Hardware-timed laser output is not implemented yet. Use hardware_timed=False for "
+                "manual/on-demand voltage and shutter control."
+            )
         self._nidaqmx = _load_nidaqmx()
         self._configuration = configuration
         self._tasks: Dict[LaserChannelId, _NidaqLaserTasks] = {}
