@@ -972,6 +972,7 @@ class PreferencesContent(QWidget):
         prefs = app_model.preferences
         load_cell_monitor = analysis.load_cell_monitor
         algo = app_model.behavior.algorithm
+        tunnel_headfix_enabled = app_model.hardware.tunnel_headfix_enabled
 
         top_layout = QHBoxLayout()
 
@@ -985,6 +986,7 @@ class PreferencesContent(QWidget):
         left_grid_layout.setSpacing(4)
         left_grid_layout.setHorizontalSpacing(10)
         left_layout.addLayout(left_grid_layout)
+        tunnel_headfix_left_rows = []
 
         cur_row = 0
         cur_col = 0
@@ -1008,6 +1010,7 @@ class PreferencesContent(QWidget):
         cur_row += 1
 
         #
+        load_cell_start_row = cur_row
         label = QLabel("<b>Load Cell Thrash Detector</b>")
         left_grid_layout.addWidget(label, cur_row, cur_col)
         cur_row += 1
@@ -1045,6 +1048,7 @@ class PreferencesContent(QWidget):
         spinbox.valueChanged.connect(thrashing_max_weight_threshold_changed)
         left_grid_layout.addWidget(spinbox, cur_row, cur_col + 1)
         cur_row += 1
+        tunnel_headfix_left_rows.extend(range(load_cell_start_row, cur_row))
 
         audio_thrash_det = analysis.audio_thrashing_monitor
         label = QLabel("<b>Audio Detector</b>")
@@ -1094,6 +1098,7 @@ class PreferencesContent(QWidget):
         left_grid_layout.addWidget(spinbox, cur_row, cur_col + 1)
         cur_row += 1
 
+        autoclamp_start_row = cur_row
         autoclamp_evasion_det = analysis.autoclamp_evasion_detector
         left_grid_layout.addWidget(QLabel("<b>AutoClamp Evasion:</b>"), cur_row, cur_col)
         cur_row += 1
@@ -1113,6 +1118,12 @@ class PreferencesContent(QWidget):
         left_grid_layout.addWidget(QLabel("Current count:"), cur_row, cur_col)
         label = QLabel(f"{autoclamp_evasion_det.pellets_consumed}")
         left_grid_layout.addWidget(label, cur_row, cur_col + 1)
+        cur_row += 1
+        tunnel_headfix_left_rows.extend(range(autoclamp_start_row, cur_row))
+
+        for row in tunnel_headfix_left_rows:
+            set_row_col_visible(left_grid_layout, row, 0, tunnel_headfix_enabled)
+            set_row_col_visible(left_grid_layout, row, 1, tunnel_headfix_enabled)
 
         # right side
         right_layout = QFormLayout()
