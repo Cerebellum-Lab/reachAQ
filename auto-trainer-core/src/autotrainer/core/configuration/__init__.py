@@ -109,5 +109,7 @@ from .behavior_configuration import BehaviorConfiguration, ShiftXYZTarget
 from .camera_configuration import CameraConfiguration, CameraId
 from .hardware_configuration import HardwareConfiguration
 from .inference_configuration import InferenceConfiguration
+from .laser_configuration import LaserChannelConfiguration, LaserChannelId, LaserSystemConfiguration, \
+    normalize_laser_channel_id
 from .persistence_configuration import PersistenceConfiguration
 from .system_configuration import SystemConfiguration

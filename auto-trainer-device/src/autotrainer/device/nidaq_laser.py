@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import Dict, Union
+from typing import Dict, Optional, Union
 
 from .laser import (
     LaserChannelConfiguration,
@@ -16,6 +16,7 @@ from .laser import (
 class _NidaqLaserTasks:
     analog_output: object
     diode_input: object
+    command_monitor_input: Optional[object]
     shutter_output: object
     auxiliary_output: object
 
@@ -24,9 +25,11 @@ class _NidaqLaserTasks:
             self.shutter_output,
             self.auxiliary_output,
             self.analog_output,
+            self.command_monitor_input,
             self.diode_input,
         ):
-            task.close()
+            if task is not None:
+                task.close()
 
 
 class NidaqLaserController:
@@ -34,9 +37,10 @@ class NidaqLaserController:
 
     The first implementation uses on-demand NI-DAQmx tasks. The channel model is
     intentionally compatible with hardware-timed task construction later: one
-    analog output task per laser writes the command voltage and optional command
-    copy together, one analog input task reads diode feedback, and each digital
-    output line is controlled independently.
+    analog output task per laser writes the command voltage and optional AO
+    command copy together, one analog input task reads diode feedback, an
+    optional second analog input task reads a measured command monitor, and each
+    digital output line is controlled independently.
     """
 
     def __init__(self, configuration: LaserSystemConfiguration):
@@ -83,12 +87,20 @@ class NidaqLaserController:
         raw = self._tasks[channel.channel_id].diode_input.read()
         return float(raw) * channel.feedback_scale
 
+    def read_command_monitor_voltage(self, channel_id: Union[LaserChannelId, int]) -> Optional[float]:
+        channel = self._configuration.get_channel(channel_id)
+        task = self._tasks[channel.channel_id].command_monitor_input
+        if task is None:
+            return None
+        return float(task.read()) * channel.command_monitor_scale
+
     def read_feedback_sample(self, channel_id: Union[LaserChannelId, int]) -> LaserFeedbackSample:
         normalized = normalize_laser_channel_id(channel_id)
         return LaserFeedbackSample(
             channel_id=normalized,
             command_volts=self._command_volts[normalized],
             diode_volts=self.read_diode_voltage(normalized),
+            command_monitor_volts=self.read_command_monitor_voltage(normalized),
         )
 
     def close_all_shutters(self) -> None:
@@ -126,6 +138,11 @@ class NidaqLaserController:
         diode_input = self._nidaqmx.Task(f"laser_{channel.channel_id.value}_ai")
         diode_input.ai_channels.add_ai_voltage_chan(channel.diode_input)
 
+        command_monitor_input = None
+        if channel.command_monitor_input:
+            command_monitor_input = self._nidaqmx.Task(f"laser_{channel.channel_id.value}_command_monitor_ai")
+            command_monitor_input.ai_channels.add_ai_voltage_chan(channel.command_monitor_input)
+
         shutter_output = self._nidaqmx.Task(f"laser_{channel.channel_id.value}_shutter")
         shutter_output.do_channels.add_do_chan(channel.shutter_output)
 
@@ -135,6 +152,7 @@ class NidaqLaserController:
         return _NidaqLaserTasks(
             analog_output=analog_output,
             diode_input=diode_input,
+            command_monitor_input=command_monitor_input,
             shutter_output=shutter_output,
             auxiliary_output=auxiliary_output,
         )

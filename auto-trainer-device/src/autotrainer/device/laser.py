@@ -1,82 +1,14 @@
 from __future__ import annotations
 
 import dataclasses
-import enum
-from typing import Dict, Iterable, Optional, Protocol, Tuple, Union
+from typing import Dict, Optional, Protocol, Union
 
-
-class LaserChannelId(enum.IntEnum):
-    LASER_1 = 1
-    LASER_2 = 2
-    LASER_3 = 3
-    LASER_4 = 4
-
-
-def normalize_laser_channel_id(value: Union[LaserChannelId, int]) -> LaserChannelId:
-    return value if isinstance(value, LaserChannelId) else LaserChannelId(int(value))
-
-
-@dataclasses.dataclass(frozen=True)
-class LaserChannelConfiguration:
-    """NI-DAQ channel assignment for one independently controlled laser."""
-
-    channel_id: LaserChannelId
-    analog_output: str
-    diode_input: str
-    shutter_output: str
-    auxiliary_output: str
-    command_copy_output: Optional[str] = None
-    minimum_command_volts: float = 0.0
-    maximum_command_volts: float = 5.0
-    feedback_scale: float = 1.0
-
-    def __post_init__(self):
-        object.__setattr__(self, "channel_id", normalize_laser_channel_id(self.channel_id))
-        for name in ("analog_output", "diode_input", "shutter_output", "auxiliary_output"):
-            if not getattr(self, name):
-                raise ValueError(f"{name} must be provided")
-        if self.maximum_command_volts <= self.minimum_command_volts:
-            raise ValueError("maximum_command_volts must be greater than minimum_command_volts")
-        if self.feedback_scale <= 0:
-            raise ValueError("feedback_scale must be positive")
-
-    def clamp_command_voltage(self, volts: float) -> float:
-        return min(max(volts, self.minimum_command_volts), self.maximum_command_volts)
-
-
-@dataclasses.dataclass(frozen=True)
-class LaserSystemConfiguration:
-    """Configuration for up to four laser channels."""
-
-    channels: Tuple[LaserChannelConfiguration, ...] = tuple()
-    hardware_timed: bool = True
-    sample_rate_hz: Optional[float] = None
-
-    def __post_init__(self):
-        channel_ids = tuple(channel.channel_id for channel in self.channels)
-        if len(channel_ids) > 4:
-            raise ValueError("at most four laser channels are supported")
-        if len(set(channel_ids)) != len(channel_ids):
-            raise ValueError("laser channel IDs must be unique")
-        if self.sample_rate_hz is not None and self.sample_rate_hz <= 0:
-            raise ValueError("sample_rate_hz must be positive when provided")
-
-    @classmethod
-    def from_channels(
-        cls,
-        channels: Iterable[LaserChannelConfiguration],
-        *,
-        hardware_timed: bool = True,
-        sample_rate_hz: Optional[float] = None,
-    ) -> "LaserSystemConfiguration":
-        return cls(tuple(channels), hardware_timed=hardware_timed, sample_rate_hz=sample_rate_hz)
-
-    def get_channel(self, channel_id: Union[LaserChannelId, int]) -> LaserChannelConfiguration:
-        normalized = normalize_laser_channel_id(channel_id)
-        for channel in self.channels:
-            if channel.channel_id == normalized:
-                return channel
-        raise KeyError(f"laser channel {normalized.value} is not configured")
+from autotrainer.core import (
+    LaserChannelConfiguration,
+    LaserChannelId,
+    LaserSystemConfiguration,
+    normalize_laser_channel_id,
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -84,6 +16,7 @@ class LaserFeedbackSample:
     channel_id: LaserChannelId
     command_volts: float
     diode_volts: float
+    command_monitor_volts: Optional[float] = None
 
 
 class LaserControllerProtocol(Protocol):
@@ -105,8 +38,11 @@ class LaserControllerProtocol(Protocol):
     def read_diode_voltage(self, channel_id: Union[LaserChannelId, int]) -> float:
         """Read diode feedback voltage for the requested laser."""
 
+    def read_command_monitor_voltage(self, channel_id: Union[LaserChannelId, int]) -> Optional[float]:
+        """Read measured command-monitor voltage when the channel has a monitor input."""
+
     def read_feedback_sample(self, channel_id: Union[LaserChannelId, int]) -> LaserFeedbackSample:
-        """Read diode feedback with the current command voltage."""
+        """Read diode feedback and command-monitor feedback with the current command voltage."""
 
     def close_all_shutters(self) -> None:
         """Force all configured shutters closed."""
@@ -153,12 +89,19 @@ class NullLaserController:
         channel = self._configuration.get_channel(channel_id)
         return self._command_volts[channel.channel_id] * channel.feedback_scale
 
+    def read_command_monitor_voltage(self, channel_id: Union[LaserChannelId, int]) -> Optional[float]:
+        channel = self._configuration.get_channel(channel_id)
+        if channel.command_monitor_input is None:
+            return None
+        return self._command_volts[channel.channel_id] * channel.command_monitor_scale
+
     def read_feedback_sample(self, channel_id: Union[LaserChannelId, int]) -> LaserFeedbackSample:
         channel = self._configuration.get_channel(channel_id)
         return LaserFeedbackSample(
             channel_id=channel.channel_id,
             command_volts=self._command_volts[channel.channel_id],
             diode_volts=self.read_diode_voltage(channel.channel_id),
+            command_monitor_volts=self.read_command_monitor_voltage(channel.channel_id),
         )
 
     def close_all_shutters(self) -> None:

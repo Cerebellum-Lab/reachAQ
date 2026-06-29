@@ -22,6 +22,7 @@ from .behavior_configuration import BehaviorConfiguration, add_behavior_configur
 from .camera_configuration import CameraConfiguration, CameraId
 from .hardware_configuration import HardwareConfiguration
 from .inference_configuration import InferenceConfiguration
+from .laser_configuration import LaserChannelConfiguration, LaserSystemConfiguration
 from .persistence_configuration import PersistenceConfiguration
 from ..project.project_info import DATE_FORMAT, TIME_FORMAT
 
@@ -42,11 +43,12 @@ class SystemConfiguration:
 
     DEFAULT_PATH: ClassVar[Path] = DEFAULT_CONFIG_DIR.joinpath(f"{DEFAULT_NAME}.yaml")  # caller/user must expanduser() on it
 
-    version: int = 51
+    version: int = 52
 
     cameras: List[CameraConfiguration] = field(default_factory=list)
     hardware: HardwareConfiguration = field(default_factory=HardwareConfiguration)
     inference: InferenceConfiguration = field(default_factory=InferenceConfiguration)
+    laser: LaserSystemConfiguration = field(default_factory=LaserSystemConfiguration)
     behavior: BehaviorConfiguration = field(default_factory=BehaviorConfiguration)
     persistence: PersistenceConfiguration = field(default_factory=PersistenceConfiguration)
     watchdog: WatchdogConfig = field(default_factory=WatchdogConfig)
@@ -181,6 +183,7 @@ class SystemConfiguration:
         ]
         self.hardware = HardwareConfiguration(**content.get("hardware", {}))
         self.inference = InferenceConfiguration(**content.get("inference", {}))
+        self.laser = LaserSystemConfiguration(**content.get("laser", {}))
         self.behavior = BehaviorConfiguration.from_version_one(content.get("behavior", {}))
         self.persistence = PersistenceConfiguration(**content.get("persistence", {}))
 
@@ -194,6 +197,8 @@ _tag_2_cls = dict(
     HardwareConfiguration=HardwareConfiguration,
     CameraConfiguration=CameraConfiguration,
     InferenceConfiguration=InferenceConfiguration,
+    LaserChannelConfiguration=LaserChannelConfiguration,
+    LaserSystemConfiguration=LaserSystemConfiguration,
     WatchdogConfig=WatchdogConfig,
     AlarmDetectorConfig=AlarmDetectorConfig,
     AnimalEvasionAlarmConfig=AnimalEvasionAlarmConfig,

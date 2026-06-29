@@ -44,6 +44,20 @@ class LaserModel(ObservableObject):
     def configure_nidaq(self, configuration: LaserSystemConfiguration) -> None:
         self.set_controller(NidaqLaserController(configuration))
 
+    def load_configuration(self, configuration: LaserSystemConfiguration) -> None:
+        if configuration.backend == "null":
+            self.configure_null(configuration)
+        elif configuration.backend == "nidaq":
+            self.configure_nidaq(configuration)
+        else:
+            prev_config = self._configuration
+            self.close()
+            self._configuration = configuration
+            self._on_property_changed(self.CONFIGURATION, configuration, prev_config)
+
+    def save_configuration(self) -> LaserSystemConfiguration:
+        return self._configuration
+
     def set_controller(self, controller: LaserControllerProtocol) -> None:
         prev_config = self._configuration
         self.close()
@@ -66,6 +80,9 @@ class LaserModel(ObservableObject):
         prev, self._last_feedback_sample = self._last_feedback_sample, sample
         self._on_property_changed(self.LAST_FEEDBACK_SAMPLE, sample, prev)
         return sample
+
+    def read_command_monitor_voltage(self, channel_id: Union[LaserChannelId, int]) -> Optional[float]:
+        return self._require_controller().read_command_monitor_voltage(channel_id)
 
     def close_all_shutters(self) -> None:
         controller = self._controller

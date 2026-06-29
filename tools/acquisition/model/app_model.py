@@ -1591,6 +1591,7 @@ class AppModel(ObservableObject):
         self._behavior.algorithm.record_prebuffer_duration = prebuffer_duration
 
         self.inference.load_configuration(configuration.inference)
+        self.laser.load_configuration(configuration.laser)
         self.behavior.load_configuration(configuration.behavior)
 
         self._analysis.watchdog_monitor.config = configuration.watchdog
@@ -2118,6 +2119,7 @@ class AppModel(ObservableObject):
         configuration = SystemConfiguration(cameras=cameras,
                                             hardware=hardware_configuration,
                                             inference=self._inference.save_configuration(),
+                                            laser=self._laser.save_configuration(),
                                             behavior=self._behavior.save_configuration(),
                                             persistence=PersistenceConfiguration(output_location=self.output_location))
 

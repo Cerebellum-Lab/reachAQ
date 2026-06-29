@@ -303,7 +303,8 @@ from .animal import AnimalSubject
 from .perf_monitor import PerfMonitor
 from .queue_util import clear_queue
 from .notification import NotificationCenter, Notification, TriggerNotification, post_trigger_enable
-from .configuration import HardwareConfiguration, InferenceConfiguration, PersistenceConfiguration
+from .configuration import HardwareConfiguration, InferenceConfiguration, LaserChannelConfiguration, LaserChannelId, \
+    LaserSystemConfiguration, PersistenceConfiguration, normalize_laser_channel_id
 
 from .message import MotorConfigurations, Motor
 from .message import SystemStatusMessageKind, SystemCommandKind, MeasurementMessageProtocol, AudioSpectrumMessage
