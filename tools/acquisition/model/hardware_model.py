@@ -16,7 +16,7 @@ from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
 from autotrainer.core.event import post_api_detector_event_content
 from autotrainer.core.message import SystemDataArgsKwargs
 from autotrainer.device import (DeviceConnectionProtocol, HAVE_CAN_DEVICE, DeviceConnection, CanDevice,
-                                StepperConfig, ServoConfig, Device, ColorLed)
+                                StepperConfig, ServoConfig, Device, ColorLed, Target)
 from autotrainer.behavior import TunnelDeviceProtocol, PelletDeviceProtocol
 
 logger = get_verbose_logger(__name__)
@@ -491,7 +491,10 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
         # configured to generate messages as frequently as the real device.
         buffer_size = 10 if HAVE_CAN_DEVICE else 1
         #
-        can_device = self._can_device = CanDevice(buffer_size=buffer_size)
+        can_device = self._can_device = CanDevice(
+            buffer_size=buffer_size,
+            required_targets=(Target.PELLET_DEVICE,),
+        )
         self.set_device_ack_timeout(self._device_ack_timeout_delay)  # ensure it's used
         self.set_board_status_timeout(self._board_status_timeout)
 

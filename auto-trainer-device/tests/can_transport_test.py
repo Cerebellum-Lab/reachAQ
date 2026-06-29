@@ -5,6 +5,7 @@ from autotrainer.device import (
     CanTransportConfiguration,
     CanTransportKind,
     EmulationInterface,
+    Target,
     normalize_can_transport_kind,
 )
 
@@ -41,6 +42,22 @@ def test_can_transport_configuration_rejects_invalid_bitrate():
         CanTransportConfiguration(kind="socketcan", bitrate=0)
 
 
+def test_can_transport_configuration_reads_environment(monkeypatch):
+    monkeypatch.setenv("AUTOTRAINER_CAN_TRANSPORT", "socketcan")
+    monkeypatch.setenv("AUTOTRAINER_CAN_CHANNEL", "can1")
+    monkeypatch.setenv("AUTOTRAINER_CAN_BITRATE", "500000")
+    monkeypatch.setenv("AUTOTRAINER_CAN_DATA_BITRATE", "2000000")
+    monkeypatch.setenv("AUTOTRAINER_CAN_FD", "true")
+
+    config = CanTransportConfiguration.from_environment()
+
+    assert config.kind == CanTransportKind.SOCKETCAN
+    assert config.channel == "can1"
+    assert config.bitrate == 500000
+    assert config.data_bitrate == 2000000
+    assert config.fd is True
+
+
 def test_can_device_accepts_explicit_emulation_transport():
     device = CanDevice(can_transport=CanTransportConfiguration(kind="emulation"))
 
@@ -51,3 +68,14 @@ def test_can_device_accepts_explicit_emulation_transport():
 def test_can_device_rejects_linux_transport_until_adapter_exists():
     with pytest.raises(NotImplementedError):
         CanDevice(can_transport=CanTransportConfiguration(kind="socketcan"))
+
+
+def test_can_device_accepts_pellet_only_required_targets():
+    device = CanDevice(
+        can_transport=CanTransportConfiguration(kind="emulation"),
+        required_targets=(Target.PELLET_DEVICE,),
+    )
+
+    assert device.required_targets == (Target.PELLET_DEVICE,)
+    assert device.is_target_required(Target.PELLET_DEVICE)
+    assert not device.is_target_required(Target.MAGNET_DEVICE)

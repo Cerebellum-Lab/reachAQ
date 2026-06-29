@@ -15,7 +15,7 @@ import queue
 import threading
 import time
 from functools import partial
-from typing import Tuple, Union, SupportsInt, List, Optional, Any, cast, Dict
+from typing import Iterable, Tuple, Union, SupportsInt, List, Optional, Any, cast, Dict
 
 from autotrainer.core import Offset3DTuple, get_perf_now, Motor
 from autotrainer.core.logging import get_verbose_logger
@@ -192,7 +192,8 @@ class CanDevice(Device):
     }
 
     def __init__(self, api: Optional[DeviceApi] = None, buffer_size: int = 50, force_emulation: bool = False,
-                 *, can_transport: Optional[CanTransportConfiguration] = None):
+                 *, can_transport: Optional[CanTransportConfiguration] = None,
+                 required_targets: Optional[Iterable[Target]] = None):
         """
         Initialize the CANbus device interface.
 
@@ -201,8 +202,10 @@ class CanDevice(Device):
             buffer_size: Size of the measurement buffer
             force_emulation: Whether to force using emulation mode even if hardware is available
             can_transport: CAN backend selection. Defaults to the existing pyjerrycan path.
+            required_targets: CAN boards that must be present for this runtime.
         """
-        self._can_transport_configuration = can_transport or CanTransportConfiguration()
+        self._can_transport_configuration = can_transport or CanTransportConfiguration.from_environment()
+        self._required_targets = tuple(required_targets or (Target.PELLET_DEVICE, Target.MAGNET_DEVICE))
         self._interface: Union[CanInterface, EmulationInterface] = self._make_device_interface(force_emulation)
 
         super().__init__(self._interface, api)
@@ -276,6 +279,13 @@ class CanDevice(Device):
     def can_transport_configuration(self) -> CanTransportConfiguration:
         return self._can_transport_configuration
 
+    @property
+    def required_targets(self) -> Tuple[Target, ...]:
+        return self._required_targets
+
+    def is_target_required(self, target: Target) -> bool:
+        return target in self._required_targets
+
     def _make_device_interface(self, force_emulation: bool) -> Union[CanInterface, EmulationInterface]:
         transport = self._can_transport_configuration
         if force_emulation or transport.kind == CanTransportKind.EMULATION:
@@ -284,7 +294,7 @@ class CanDevice(Device):
             raise NotImplementedError(
                 f"{transport.kind.value} CAN transport is configured but no backend adapter is implemented yet"
             )
-        return CanInterface() if HAVE_CAN_DEVICE else EmulationInterface()
+        return CanInterface(required_targets=self._required_targets) if HAVE_CAN_DEVICE else EmulationInterface()
 
     def _init_default_move_configs(self):
         self._load_pellet = default_load_pellet()
@@ -294,6 +304,12 @@ class CanDevice(Device):
         self._open_tunnel_gate = default_open_gate()
         self._close_tunnel_gate = default_close_gate()
         self._move_retract = default_move_retract()
+
+    def _handle_update_scale_tare(self):
+        if not self.is_target_required(Target.MAGNET_DEVICE):
+            logger.debug("Skipping scale tare because magnet/headfix CAN target is not required")
+            return True
+        return self._interface.tare_load_cell()
 
     def _clear_caches(self):
         for cache in (
@@ -449,7 +465,7 @@ class CanDevice(Device):
 
             SystemCommandKind.SET_MOVE_RETRACT_PROCEDURE: set_move_retract_proc,
 
-            SystemCommandKind.UPDATE_SCALE_TARE: lambda _: self._interface.tare_load_cell(),
+            SystemCommandKind.UPDATE_SCALE_TARE: lambda _: self._handle_update_scale_tare(),
 
             SystemCommandKind.SET_DIGITAL_OUTPUT:
                 lambda data: self._interface.set_digital_output(DigitalOutputs(data[0]), data[1]),
@@ -583,10 +599,17 @@ class CanDevice(Device):
             boards_timeout = self.default_board_status_timeout_delay  # re-read
             pellet_age = p_now - self._interface.pellet_status_perf_c
             tunnel_age = p_now - self._interface.tunnel_status_perf_c
-            if any(age > boards_timeout / 2 for age in (pellet_age, tunnel_age)):
+            check_pellet = self.is_target_required(Target.PELLET_DEVICE)
+            check_tunnel = self.is_target_required(Target.MAGNET_DEVICE)
+            ages = []
+            if check_pellet:
+                ages.append(pellet_age)
+            if check_tunnel:
+                ages.append(tunnel_age)
+            if any(age > boards_timeout / 2 for age in ages):
                 logger.verbose("pellet_status_age=%.1f tunnel_status_age=%.1f", pellet_age, tunnel_age)
-            self.pellet_status_timeout_engaged = pellet_age > boards_timeout
-            self.tunnel_status_timeout_engaged = tunnel_age > boards_timeout
+            self.pellet_status_timeout_engaged = check_pellet and pellet_age > boards_timeout
+            self.tunnel_status_timeout_engaged = check_tunnel and tunnel_age > boards_timeout
         logger.verbose("exiting")
 
     def _command_handler(self):
@@ -1079,7 +1102,7 @@ class CanDevice(Device):
             kind, data = data
             return self._find_command_next_board_target(kind, data)
         elif kind == SystemCommandKind.UPDATE_SCALE_TARE:
-            return Target.MAGNET_DEVICE
+            return Target.MAGNET_DEVICE if self.is_target_required(Target.MAGNET_DEVICE) else None
         elif kind in {
             SystemCommandKind.SET_DIGITAL_OUTPUT,
             SystemCommandKind.SET_ANALOG_OUTPUT,
@@ -1130,7 +1153,7 @@ class CanDevice(Device):
         elif kind == SystemCommandKind.BOARD_REBOOT:
             return data
         elif kind == SystemCommandKind.REQUEST_VERSION:
-            # it's both boards, but doesn't use uuid, so does not matter, safe to give any:
+            # It does not use uuid, so there is no single board pending context to track.
             return None
         elif kind in {SystemCommandKind.STREAM_START, SystemCommandKind.STREAM_STOP}:
             # is no CAN operation

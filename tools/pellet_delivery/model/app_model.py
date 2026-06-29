@@ -10,7 +10,7 @@ from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
 from autotrainer.core import (ObservableObject, SystemMessageHandler, SystemCommandKind, MessageHandler, Motor,
                               EventManager, Offset3DTuple, MotorConfigurations, SystemStatusMessageKind)
 from autotrainer.core.logging import get_verbose_logger
-from autotrainer.device import (CanDevice, MotorConfigurationFile, DeviceConnection, CompoundMovements)
+from autotrainer.device import (CanDevice, MotorConfigurationFile, DeviceConnection, CompoundMovements, Target)
 
 from tools.pellet_delivery.model.user_settings import UserSettings
 
@@ -346,7 +346,11 @@ class AppModel(ObservableObject):
             self._device_connection.use_compound_movements(movements)
 
     def connect_to_device(self):
-        self._device_connection = DeviceConnection(CanDevice(), self._message_handler.input_queue, name="pellet-can")
+        self._device_connection = DeviceConnection(
+            CanDevice(required_targets=(Target.PELLET_DEVICE,)),
+            self._message_handler.input_queue,
+            name="pellet-can",
+        )
         self._device_connection.request_connect()
         self._send_command(SystemCommandKind.REQUEST_VERSION)
         #

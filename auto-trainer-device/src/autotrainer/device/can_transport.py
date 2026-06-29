@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+import os
 from typing import Any, Mapping, Optional, Protocol, Union
 
 
@@ -52,9 +53,38 @@ class CanTransportConfiguration:
             values["kind"] = values.pop("type")
         return cls(**values)
 
+    @classmethod
+    def from_environment(cls, prefix: str = "AUTOTRAINER_CAN_") -> "CanTransportConfiguration":
+        values = {}
+        env = os.environ
+        kind = env.get(f"{prefix}TRANSPORT", env.get(f"{prefix}TYPE"))
+        if kind:
+            values["kind"] = kind
+        for env_name, field_name in (
+            ("CHANNEL", "channel"),
+            ("BITRATE", "bitrate"),
+            ("DATA_BITRATE", "data_bitrate"),
+            ("FD", "fd"),
+            ("RECEIVE_TIMEOUT_SECONDS", "receive_timeout_seconds"),
+        ):
+            value = env.get(f"{prefix}{env_name}")
+            if value is not None:
+                values[field_name] = _parse_environment_value(field_name, value)
+        return cls.from_mapping(values)
+
     @property
     def uses_linux_can_stack(self) -> bool:
         return self.kind in {CanTransportKind.SOCKETCAN, CanTransportKind.PCAN_BASIC}
+
+
+def _parse_environment_value(name: str, value: str) -> Any:
+    if name in {"bitrate", "data_bitrate"}:
+        return int(value)
+    if name == "receive_timeout_seconds":
+        return float(value)
+    if name == "fd":
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return value
 
 
 class CanTransportProtocol(Protocol):

@@ -21,7 +21,7 @@ import warnings
 from enum import Enum, IntEnum
 from operator import attrgetter
 from pathlib import Path
-from typing import Type, Optional, Dict, Union, Any, Tuple
+from typing import Iterable, Type, Optional, Dict, Union, Any, Tuple
 
 
 try:
@@ -376,7 +376,7 @@ class CanInterface(DeviceInterface):
         """
         return cls._uuid
 
-    def __init__(self):
+    def __init__(self, required_targets: Optional[Iterable[Target]] = None):
         """
         Initialize the CanInterface Class.
 
@@ -387,6 +387,7 @@ class CanInterface(DeviceInterface):
         the connection protocol.
         """
         super().__init__()
+        self._required_targets = tuple(required_targets or (Target.PELLET_DEVICE, Target.MAGNET_DEVICE))
 
         if JerryCAN is None:
             self._jc = None
@@ -734,9 +735,26 @@ class CanInterface(DeviceInterface):
     def are_addresses_valid(self) -> bool:
         """
         Returns:
-             bool: True if both the magnet and pellet CANbus addresses are valid
+             bool: True if all required CANbus target addresses are valid
         """
-        return self.magnet_address is not None and self.pellet_address is not None
+        return all(self._has_address(target) for target in self._required_targets)
+
+    @property
+    def required_targets(self) -> Tuple[Target, ...]:
+        return self._required_targets
+
+    def is_target_required(self, target: Target) -> bool:
+        return target in self._required_targets
+
+    def _has_address(self, target: Target) -> bool:
+        if target == Target.PELLET_DEVICE:
+            return self.pellet_address is not None
+        if target == Target.MAGNET_DEVICE:
+            return self.magnet_address is not None
+        raise ValueError(f"Unhandled target: {target}")
+
+    def _missing_required_targets(self) -> Tuple[Target, ...]:
+        return tuple(target for target in self._required_targets if not self._has_address(target))
 
     def _tgt2addr(self, target: Target) -> int:
         """
@@ -814,15 +832,16 @@ class CanInterface(DeviceInterface):
                 tot_flushed += len(flushed)
                 for msg in flushed:
                     self._assign_address(msg)
-                    if self.pellet_address is not None and self.magnet_address is not None:
+                    if self.are_addresses_valid():
                         break
-                if self.pellet_address is not None and self.magnet_address is not None:
+                if self.are_addresses_valid():
                     break
                 if time.perf_counter() > t_end:
-                    logger.critical("Could not obtain both pellet and magnet CAN bus addresses in time, "
-                                    "either one or both of them is/are shutdown, "
-                                    "either there is a CAN bus or CAN system related issue. "
-                                    "You shall restart the app if/when that's corrected.")
+                    logger.critical("Could not obtain required CAN bus addresses in time, "
+                                    "missing targets: %s. Either the required board is shutdown, "
+                                    "there is a CAN bus or CAN system related issue, or required_targets "
+                                    "needs to match the attached hardware.",
+                                    self._missing_required_targets())
                     break
             logger.notice("pellet_address=%s magnet_address=%s ; flushed %s",
                         self.pellet_address, self.magnet_address, tot_flushed)
@@ -1090,9 +1109,10 @@ class CanInterface(DeviceInterface):
         query(Motor.PELLET_X_MOTOR, StepperConfig)
         query(Motor.PELLET_Y_MOTOR, StepperConfig)
         query(Motor.PELLET_Z_MOTOR, StepperConfig)
-        #
         query(Motor.PELLET_LOAD_SERVO, ServoConfig)
         query(Motor.PELLET_COVER_SERVO, ServoConfig)
+        if not self.is_target_required(Target.MAGNET_DEVICE):
+            return
         query(Motor.TUNNEL_MAGNET_SERVO, ServoConfig)
         query(Motor.TUNNEL_GATE_SERVO, ServoConfig)
         query(Motor.TUNNEL_FAN_SERVO, ServoConfig)
@@ -1648,18 +1668,17 @@ class CanInterface(DeviceInterface):
 
     def request_version(self) -> bool:
         """
-        Request the versions of the pellet and magnet board firmware
+        Request the versions of the required board firmware
 
         Returns:
             bool: True if successful else False
         """
-        pellet = self._tgt2addr(Target.PELLET_DEVICE)
-        magnet = self._tgt2addr(Target.MAGNET_DEVICE)
-        rc = self._jc.BootloaderCommand(pellet,
-                                        JerryCANBootloaderCmd.SubCommand.VERSION)
-        if rc == 0:
-             rc = self._jc.BootloaderCommand(magnet,
-                                             JerryCANBootloaderCmd.SubCommand.VERSION)
+        rc = 0
+        for target in self.required_targets:
+            addr = self._tgt2addr(target)
+            rc = self._jc.BootloaderCommand(addr, JerryCANBootloaderCmd.SubCommand.VERSION)
+            if rc != 0:
+                break
         return rc == 0
 
     # NOTE: E-Stop is not implemented in the target
