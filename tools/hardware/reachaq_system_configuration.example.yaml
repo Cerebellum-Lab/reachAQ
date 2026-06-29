@@ -1,0 +1,129 @@
+# reachAQ Dell/Ubuntu system configuration example.
+# Replace NI-DAQ device/channel names, camera identifiers, paths, and voltage limits with the bench rig values.
+# CAN transport is configured through reachaq_hardware.env.example because the current CAN runtime reads environment.
+
+!SystemConfiguration
+version: 53
+cameras:
+- !CameraConfiguration
+  id: 0
+  name: left
+  isEnabled: true
+  isRecordEnabled: true
+  recordMode: 1
+  recordPrebufferDuration: 1.0
+  isStillImageCaptureEnabled: false
+  stillImageCaptureInterval: 0.0
+  scheme: spinnaker
+  host: ''
+  port: 0
+  path: left
+  params:
+    fps: 150
+- !CameraConfiguration
+  id: 1
+  name: right
+  isEnabled: true
+  isRecordEnabled: true
+  recordMode: 1
+  recordPrebufferDuration: 1.0
+  isStillImageCaptureEnabled: false
+  stillImageCaptureInterval: 0.0
+  scheme: spinnaker
+  host: ''
+  port: 0
+  path: right
+  params:
+    fps: 150
+- !CameraConfiguration
+  id: 3
+  name: camera3
+  isEnabled: false
+  isRecordEnabled: false
+  recordMode: 1
+  recordPrebufferDuration: 1.0
+  isStillImageCaptureEnabled: false
+  stillImageCaptureInterval: 0.0
+  scheme: spinnaker
+  host: ''
+  port: 0
+  path: camera3
+  params:
+    fps: 150
+hardware: !HardwareConfiguration
+  tunnelIdentifier: ''
+  pelletIdentifier: CAN
+  tunnelHeadfixEnabled: false
+  minAckTimeout: 3.0
+  boardStatusTimeout: 15.0
+inference: !InferenceConfiguration
+  poseModelLocation: /opt/reachaq/models/reach_pose_model
+  isEnabled: true
+  intersessionWaitTime: 2.0
+laser: !LaserSystemConfiguration
+  # Confirm the actual NI-DAQ model and device alias in NI MAX before using this file.
+  backend: nidaq
+  hardwareTimed: true
+  sampleRateHz: 10000.0
+  pmtShutterOutput: Dev1/port0/line7
+  triggerListenerInputs: []
+  channels:
+  - !LaserChannelConfiguration
+    channelId: 1
+    analogOutput: Dev1/ao0
+    diodeInput: Dev1/ai0
+    commandCopyInput: Dev1/ai1
+    shutterOutput: Dev1/port0/line0
+    auxiliaryOutput: Dev1/port0/line1
+    triggerSource: /Dev1/PFI0
+    triggerOutput: Dev1/port0/line2
+    timingTriggerOutput: Dev1/port0/line3
+    minimumCommandVolts: 0.0
+    maximumCommandVolts: 5.0
+    feedbackScale: 1.0
+    commandCopyScale: 1.0
+  - !LaserChannelConfiguration
+    channelId: 2
+    analogOutput: Dev1/ao1
+    diodeInput: Dev1/ai2
+    commandCopyInput: Dev1/ai3
+    shutterOutput: Dev1/port0/line4
+    auxiliaryOutput: Dev1/port0/line5
+    triggerSource: /Dev1/PFI0
+    triggerOutput: Dev1/port0/line6
+    timingTriggerOutput: Dev1/port1/line0
+    minimumCommandVolts: 0.0
+    maximumCommandVolts: 5.0
+    feedbackScale: 1.0
+    commandCopyScale: 1.0
+behavior: !BehaviorConfiguration
+  pelletDelivery: !PelletDeliveryConfiguration
+    isEnabled: false
+    isPelletCoverEnabled: true
+    isIntersessionAnalysisEnabled: true
+    maxPelletsPerSession: 10
+    maxPelletsPerDay: 75
+    maxPelletMissingSeconds: 15.0
+  headClamp: !HeadClampConfiguration
+    minBaselineIntensity: 0.0
+    maxBaselineIntensity: 90.0
+    baselineIntensityIncrement: 10.0
+    autoClampIntensity: 100
+    autoClampReleaseToneFreq: 7000
+    autoClampReleaseToneDelay: 0.1
+  headbarPressure: !HeadbarPressureConfiguration
+    threshold: 20
+    duration: 0.5
+  autoTare: !LoadCellAutoTareConfiguration
+    threshold: 0.1
+    rangeThreshold: 0.75
+    duration: 2.0
+  loadCell: !LoadCellConfiguration
+    threshold: 15.0
+    thresholdDuration: 0.25
+    minEventDuration: 3.0
+    minPostEventHoldDuration: 6.0
+persistence: !PersistenceConfiguration
+  outputLocation: /data/reachaq
+watchdog: !WatchdogConfig
+  timeoutTriggerDelay: 5.0
