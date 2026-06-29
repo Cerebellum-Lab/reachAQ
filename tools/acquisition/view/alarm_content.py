@@ -127,7 +127,8 @@ class AlarmContent(ContentWidget):
         form_layout_detectors.addRow(label, None)
 
         self._load_cell_thrash_status = make_detector_icon(name="det-load-cell-thrash")
-        form_layout_detectors.addRow("Load Cell Thrash:", self._load_cell_thrash_status)
+        self._load_cell_thrash_label = make_label("Load Cell Thrash:")
+        form_layout_detectors.addRow(self._load_cell_thrash_label, self._load_cell_thrash_status)
         self.load_cell_thrashing_changed.connect(self._load_cell_thrash_status.setStatus)
 
         self._audio_spectrum_status = make_detector_icon(name="det-audio")
@@ -179,6 +180,11 @@ class AlarmContent(ContentWidget):
         # emergency alarm controls 3 sub-alarms:
         analysis.pellet_misplaced_monitor.property_changed += self._pellet_misplaced_property_changed
         analysis.system_maintenance_alarm.property_changed += self._system_maint_mon_property_changed
+        self._update_tunnel_headfix_visibility(hardware_model.tunnel_headfix_enabled)
+
+    def _update_tunnel_headfix_visibility(self, is_enabled: bool):
+        self._load_cell_thrash_label.setVisible(is_enabled)
+        self._load_cell_thrash_status.setVisible(is_enabled)
 
     @invoke_method
     def _on_alarm_prop_changed(self, ctx: AlarmContentContext, name: str, value, _):
@@ -215,6 +221,8 @@ class AlarmContent(ContentWidget):
             self.slide_door_changed.emit(value)
         elif name == HardwareModel.DEVICE_ACK_TIMEOUT_ENGAGED:
             self.device_ack_timeout_changed.emit(value)
+        elif name == HardwareModel.TUNNEL_HEADFIX_ENABLED:
+            self._update_tunnel_headfix_visibility(value)
 
     @invoke_method
     def _load_cell_property_changed(self, name: str, new_value, _):
