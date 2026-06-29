@@ -49,11 +49,13 @@ class LaserModel(ObservableObject):
             self.configure_null(configuration)
         elif configuration.backend == "nidaq":
             self.configure_nidaq(configuration)
-        else:
+        elif configuration.backend == "disabled":
             prev_config = self._configuration
             self.close()
             self._configuration = configuration
             self._on_property_changed(self.CONFIGURATION, configuration, prev_config)
+        else:
+            raise ValueError(f"Unsupported laser backend: {configuration.backend}")
 
     def save_configuration(self) -> LaserSystemConfiguration:
         return self._configuration
@@ -81,8 +83,8 @@ class LaserModel(ObservableObject):
         self._on_property_changed(self.LAST_FEEDBACK_SAMPLE, sample, prev)
         return sample
 
-    def read_command_monitor_voltage(self, channel_id: Union[LaserChannelId, int]) -> Optional[float]:
-        return self._require_controller().read_command_monitor_voltage(channel_id)
+    def read_command_copy_voltage(self, channel_id: Union[LaserChannelId, int]) -> float:
+        return self._require_controller().read_command_copy_voltage(channel_id)
 
     def close_all_shutters(self) -> None:
         controller = self._controller

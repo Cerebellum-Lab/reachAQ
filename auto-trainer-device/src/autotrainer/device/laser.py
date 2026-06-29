@@ -16,7 +16,7 @@ class LaserFeedbackSample:
     channel_id: LaserChannelId
     command_volts: float
     diode_volts: float
-    command_monitor_volts: Optional[float] = None
+    command_copy_volts: Optional[float] = None
 
 
 class LaserControllerProtocol(Protocol):
@@ -38,11 +38,11 @@ class LaserControllerProtocol(Protocol):
     def read_diode_voltage(self, channel_id: Union[LaserChannelId, int]) -> float:
         """Read diode feedback voltage for the requested laser."""
 
-    def read_command_monitor_voltage(self, channel_id: Union[LaserChannelId, int]) -> Optional[float]:
-        """Read measured command-monitor voltage when the channel has a monitor input."""
+    def read_command_copy_voltage(self, channel_id: Union[LaserChannelId, int]) -> float:
+        """Read measured AI command-copy voltage for the requested laser."""
 
     def read_feedback_sample(self, channel_id: Union[LaserChannelId, int]) -> LaserFeedbackSample:
-        """Read diode feedback and command-monitor feedback with the current command voltage."""
+        """Read diode feedback and optional AI command-copy feedback with the current command voltage."""
 
     def close_all_shutters(self) -> None:
         """Force all configured shutters closed."""
@@ -89,11 +89,14 @@ class NullLaserController:
         channel = self._configuration.get_channel(channel_id)
         return self._command_volts[channel.channel_id] * channel.feedback_scale
 
-    def read_command_monitor_voltage(self, channel_id: Union[LaserChannelId, int]) -> Optional[float]:
+    def read_command_copy_voltage(self, channel_id: Union[LaserChannelId, int]) -> float:
         channel = self._configuration.get_channel(channel_id)
-        if channel.command_monitor_input is None:
-            return None
-        return self._command_volts[channel.channel_id] * channel.command_monitor_scale
+        command_copy_volts = self._read_optional_command_copy_voltage(channel.channel_id)
+        if command_copy_volts is None:
+            raise RuntimeError(
+                f"laser channel {channel.channel_id.value} has no AI command-copy input configured"
+            )
+        return command_copy_volts
 
     def read_feedback_sample(self, channel_id: Union[LaserChannelId, int]) -> LaserFeedbackSample:
         channel = self._configuration.get_channel(channel_id)
@@ -101,8 +104,14 @@ class NullLaserController:
             channel_id=channel.channel_id,
             command_volts=self._command_volts[channel.channel_id],
             diode_volts=self.read_diode_voltage(channel.channel_id),
-            command_monitor_volts=self.read_command_monitor_voltage(channel.channel_id),
+            command_copy_volts=self._read_optional_command_copy_voltage(channel.channel_id),
         )
+
+    def _read_optional_command_copy_voltage(self, channel_id: Union[LaserChannelId, int]) -> Optional[float]:
+        channel = self._configuration.get_channel(channel_id)
+        if channel.command_copy_input is None:
+            return None
+        return self._command_volts[channel.channel_id] * channel.command_copy_scale
 
     def close_all_shutters(self) -> None:
         for channel_id in self._shutter_open:

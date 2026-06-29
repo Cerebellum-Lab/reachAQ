@@ -30,15 +30,14 @@ class LaserChannelConfiguration:
     diode_input: str
     shutter_output: str
     auxiliary_output: str
-    command_monitor_input: Optional[str] = None
-    command_copy_output: Optional[str] = None
+    command_copy_input: Optional[str] = None
     trigger_source: Optional[str] = None
     trigger_output: Optional[str] = None
     timing_trigger_output: Optional[str] = None
     minimum_command_volts: float = 0.0
     maximum_command_volts: float = 5.0
     feedback_scale: float = 1.0
-    command_monitor_scale: float = 1.0
+    command_copy_scale: float = 1.0
 
     def __post_init__(self):
         object.__setattr__(self, "channel_id", normalize_laser_channel_id(self.channel_id))
@@ -49,8 +48,8 @@ class LaserChannelConfiguration:
             raise ValueError("maximum_command_volts must be greater than minimum_command_volts")
         if self.feedback_scale <= 0:
             raise ValueError("feedback_scale must be positive")
-        if self.command_monitor_scale <= 0:
-            raise ValueError("command_monitor_scale must be positive")
+        if self.command_copy_scale <= 0:
+            raise ValueError("command_copy_scale must be positive")
 
     def clamp_command_voltage(self, volts: float) -> float:
         return min(max(volts, self.minimum_command_volts), self.maximum_command_volts)
@@ -77,10 +76,14 @@ class LaserSystemConfiguration:
             raise ValueError("at most four laser channels are supported")
         if len(set(channel_ids)) != len(channel_ids):
             raise ValueError("laser channel IDs must be unique")
-        if self.sample_rate_hz is not None and self.sample_rate_hz <= 0:
-            raise ValueError("sample_rate_hz must be positive when provided")
         if self.backend not in self.VALID_BACKENDS:
             raise ValueError(f"laser backend must be one of: {', '.join(self.VALID_BACKENDS)}")
+        if self.backend != "disabled" and not channel_ids:
+            raise ValueError(f"laser backend '{self.backend}' requires at least one configured channel")
+        if self.sample_rate_hz is not None and self.sample_rate_hz <= 0:
+            raise ValueError("sample_rate_hz must be positive when provided")
+        if self.backend != "disabled" and self.hardware_timed and self.sample_rate_hz is None:
+            raise ValueError("hardware_timed laser output requires sample_rate_hz")
         if any(not value for value in self.trigger_listener_inputs):
             raise ValueError("trigger_listener_inputs cannot contain empty channel names")
 

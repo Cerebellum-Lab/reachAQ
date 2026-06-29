@@ -8,15 +8,14 @@ from autotrainer.device import (
 )
 
 
-def make_channel(channel_id=LaserChannelId.LASER_1):
+def make_channel(channel_id=LaserChannelId.LASER_1, command_copy_input="Dev1/ai1"):
     return LaserChannelConfiguration(
         channel_id=channel_id,
         analog_output="Dev1/ao0",
         diode_input="Dev1/ai0",
         shutter_output="Dev1/port0/line0",
         auxiliary_output="Dev1/port0/line1",
-        command_monitor_input="Dev1/ai1",
-        command_copy_output="Dev1/ao1",
+        command_copy_input=command_copy_input,
     )
 
 
@@ -64,11 +63,21 @@ def test_null_laser_controller_tracks_outputs():
 
     assert applied == 2.25
     assert controller.read_diode_voltage(LaserChannelId.LASER_1) == 2.25
-    assert controller.read_command_monitor_voltage(LaserChannelId.LASER_1) == 2.25
-    assert controller.read_feedback_sample(LaserChannelId.LASER_1).command_monitor_volts == 2.25
+    assert controller.read_command_copy_voltage(LaserChannelId.LASER_1) == 2.25
+    assert controller.read_feedback_sample(LaserChannelId.LASER_1).command_copy_volts == 2.25
     assert controller.is_shutter_open(LaserChannelId.LASER_1)
     assert controller.is_auxiliary_output_enabled(LaserChannelId.LASER_1)
 
     controller.close_all_shutters()
 
     assert not controller.is_shutter_open(LaserChannelId.LASER_1)
+
+
+def test_null_laser_controller_reports_missing_command_copy_input():
+    system = LaserSystemConfiguration.from_channels([make_channel(command_copy_input=None)])
+    controller = NullLaserController(system)
+
+    with pytest.raises(RuntimeError, match="AI command-copy input"):
+        controller.read_command_copy_voltage(LaserChannelId.LASER_1)
+
+    assert controller.read_feedback_sample(LaserChannelId.LASER_1).command_copy_volts is None

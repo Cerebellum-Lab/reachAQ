@@ -43,7 +43,7 @@ class SystemConfiguration:
 
     DEFAULT_PATH: ClassVar[Path] = DEFAULT_CONFIG_DIR.joinpath(f"{DEFAULT_NAME}.yaml")  # caller/user must expanduser() on it
 
-    version: int = 52
+    version: int = 53
 
     cameras: List[CameraConfiguration] = field(default_factory=list)
     hardware: HardwareConfiguration = field(default_factory=HardwareConfiguration)
@@ -183,9 +183,31 @@ class SystemConfiguration:
         ]
         self.hardware = HardwareConfiguration(**content.get("hardware", {}))
         self.inference = InferenceConfiguration(**content.get("inference", {}))
-        self.laser = LaserSystemConfiguration(**content.get("laser", {}))
+        self.laser = LaserSystemConfiguration(**self._deserialize_laser_configuration(content.get("laser", {})))
         self.behavior = BehaviorConfiguration.from_version_one(content.get("behavior", {}))
         self.persistence = PersistenceConfiguration(**content.get("persistence", {}))
+
+    @staticmethod
+    def _deserialize_laser_configuration(content: Dict) -> Dict:
+        laser = dict(content or {})
+        channels = []
+        for channel in laser.get("channels", []):
+            if isinstance(channel, LaserChannelConfiguration):
+                channels.append(channel)
+                continue
+            channel = dict(channel)
+            if "command_copy_input" not in channel and "command_monitor_input" in channel:
+                channel["command_copy_input"] = channel.pop("command_monitor_input")
+            else:
+                channel.pop("command_monitor_input", None)
+            if "command_copy_scale" not in channel and "command_monitor_scale" in channel:
+                channel["command_copy_scale"] = channel.pop("command_monitor_scale")
+            else:
+                channel.pop("command_monitor_scale", None)
+            channel.pop("command_copy_output", None)
+            channels.append(LaserChannelConfiguration(**channel))
+        laser["channels"] = tuple(channels)
+        return laser
 
 
 #
