@@ -32,6 +32,7 @@ from tools.acquisition.view.camera_content import CameraContent
 from tools.acquisition.view.diagnostics_content import DiagnosticsContent
 from tools.acquisition.view.hardware_control_content import HardwareControlContent
 from tools.acquisition.view.hardware_status_content import HardwareStatusContent
+from tools.acquisition.view.laser_control_content import LaserControlContent
 from tools.acquisition.view.training_phase_content import TrainingPhaseContent
 from tools.acquisition.view.training_phase_progress_content import TrainingPhaseProgressContent
 from tools.acquisition.view.training_plan_content import TrainingPlanContent
@@ -240,6 +241,10 @@ class MainContent(ContentWidget):
         hardware_control_content = self._hardware_control_content = HardwareControlContent(self._app_model)
         end_layout.addWidget(hardware_control_content)
         self._content_widgets.append(hardware_control_content)
+
+        laser_control_content = self._laser_control_content = LaserControlContent(self._app_model)
+        end_layout.addWidget(laser_control_content)
+        self._content_widgets.append(laser_control_content)
 
         hardware_status_content = self._hardware_status_content = HardwareStatusContent(self._app_model)
         end_layout.addWidget(hardware_status_content)
