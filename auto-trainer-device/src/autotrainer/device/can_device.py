@@ -290,10 +290,8 @@ class CanDevice(Device):
         transport = self._can_transport_configuration
         if force_emulation or transport.kind == CanTransportKind.EMULATION:
             return EmulationInterface()
-        if transport.kind != CanTransportKind.PYJERRYCAN:
-            raise NotImplementedError(
-                f"{transport.kind.value} CAN transport is configured but no backend adapter is implemented yet"
-            )
+        if transport.uses_linux_can_stack:
+            return CanInterface(required_targets=self._required_targets, can_transport=transport)
         return CanInterface(required_targets=self._required_targets) if HAVE_CAN_DEVICE else EmulationInterface()
 
     def _init_default_move_configs(self):

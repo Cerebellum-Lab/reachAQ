@@ -30,6 +30,8 @@ try:
         JerryCANBootloaderCmd
 except ModuleNotFoundError:
     jerry = JerryCAN = None
+    from .socketcan_jerrycan import JerryCANMsg, JerryCANCmdType, JerryCANCfgMsg, AbsOrRel, \
+        JerryCANBootloaderCmd
 else:
     from importlib.metadata import version
     jerry_v = tuple(
@@ -41,6 +43,7 @@ else:
 
 from autotrainer.core import get_perf_now, Offset3DTuple
 from autotrainer.core.logging import get_verbose_logger
+from .can_transport import CanTransportConfiguration
 from .device_interface import (
     DeviceInterface,
     Acknowledge,
@@ -69,6 +72,8 @@ from .device_interface import (
     Version,
 )
 from .stepper_motor import mm_to_turns, turns_to_mm
+from .socketcan_jerrycan import SocketCanJerryCAN
+from . import socketcan_jerrycan
 
 
 logger = get_verbose_logger(__name__)
@@ -376,7 +381,8 @@ class CanInterface(DeviceInterface):
         """
         return cls._uuid
 
-    def __init__(self, required_targets: Optional[Iterable[Target]] = None):
+    def __init__(self, required_targets: Optional[Iterable[Target]] = None,
+                 can_transport: Optional[CanTransportConfiguration] = None):
         """
         Initialize the CanInterface Class.
 
@@ -388,8 +394,23 @@ class CanInterface(DeviceInterface):
         """
         super().__init__()
         self._required_targets = tuple(required_targets or (Target.PELLET_DEVICE, Target.MAGNET_DEVICE))
+        self._can_transport = can_transport or CanTransportConfiguration()
+        if self._can_transport.uses_linux_can_stack:
+            self._jerrycan_msg_cls = socketcan_jerrycan.JerryCANMsg
+            self._jerrycan_cmd_type = socketcan_jerrycan.JerryCANCmdType
+            self._jerrycan_cfg_msg_cls = socketcan_jerrycan.JerryCANCfgMsg
+            self._abs_or_rel = socketcan_jerrycan.AbsOrRel
+            self._bootloader_cmd_cls = socketcan_jerrycan.JerryCANBootloaderCmd
+        else:
+            self._jerrycan_msg_cls = JerryCANMsg
+            self._jerrycan_cmd_type = JerryCANCmdType
+            self._jerrycan_cfg_msg_cls = JerryCANCfgMsg
+            self._abs_or_rel = AbsOrRel
+            self._bootloader_cmd_cls = JerryCANBootloaderCmd
 
-        if JerryCAN is None:
+        if self._can_transport.uses_linux_can_stack:
+            self._jc = SocketCanJerryCAN(self._can_transport)
+        elif JerryCAN is None:
             self._jc = None
         else:
             self._jc = JerryCAN()
@@ -442,51 +463,52 @@ class CanInterface(DeviceInterface):
             Union[PelletDigitalInputs, MagnetDigitalInputs], int]] = {}
 
         # Simple handlers implemented as lambdas
+        cmd_type = self._jerrycan_cmd_type
         self._handlers = {
-            JerryCANCmdType.HEARTBEAT: lambda msg: Heartbeat(target=_addr2tgt(msg.dst_id)),
-            JerryCANCmdType.BOOTLOADER_RESPONSE: self._translate_bootloader,
-            JerryCANCmdType.CFG_RESPONSE: self._translate_config,
-            JerryCANCmdType.GPIO_READ: self._translate_gpio,
-            JerryCANCmdType.TONE: lambda msg: Tone(
+            cmd_type.HEARTBEAT: lambda msg: Heartbeat(target=_addr2tgt(msg.dst_id)),
+            cmd_type.BOOTLOADER_RESPONSE: self._translate_bootloader,
+            cmd_type.CFG_RESPONSE: self._translate_config,
+            cmd_type.GPIO_READ: self._translate_gpio,
+            cmd_type.TONE: lambda msg: Tone(
                 target=_addr2tgt(msg.dst_id),
                 time_remaining_ms=msg.tone.duration_ms,
                 frequency_hz=msg.tone.frequency_hz
             ),
-            JerryCANCmdType.ANALOG_OUT: self._translate_analog_out,
-            JerryCANCmdType.LOAD_CELL_READ: lambda msg: LoadCellReading(
+            cmd_type.ANALOG_OUT: self._translate_analog_out,
+            cmd_type.LOAD_CELL_READ: lambda msg: LoadCellReading(
                 target=_addr2tgt(msg.dst_id),
                 load=self.round_float(float(msg.load_cell_read.load_mv) / 1000.0 * self.load_cell_factor),
             ),
-            JerryCANCmdType.PRESSURE_READ: lambda msg: PressureReading(
+            cmd_type.PRESSURE_READ: lambda msg: PressureReading(
                 target=_addr2tgt(msg.dst_id),
                 pressure=self.round_float(float(msg.pressure_read.pressure)),
             ),
-            JerryCANCmdType.RGB_LED: lambda msg: ColorLed(
+            cmd_type.RGB_LED: lambda msg: ColorLed(
                 target=_addr2tgt(msg.dst_id),
                 red=msg.rgb_led.red,
                 green=msg.rgb_led.green,
                 blue=msg.rgb_led.blue
             ),
-            JerryCANCmdType.AUDIO_MAGNITUDE_DATA_BEGIN: self._handle_audio_begin,
-            JerryCANCmdType.AUDIO_MAGNITUDE_DATA_CONT: self._handle_audio_cont,
-            JerryCANCmdType.AUDIO_MAGNITUDE_DATA_END: self._handle_audio_end,
-            JerryCANCmdType.DOOR_SENSOR: self._translate_door_sensor,
-            JerryCANCmdType.SERVO_STATUS: self._translate_servo_status,
-            JerryCANCmdType.STEPPER_STATUS: self._handle_stepper_status,
-            JerryCANCmdType.TEMP_HUM_READ: lambda msg: SensorStatus(
+            cmd_type.AUDIO_MAGNITUDE_DATA_BEGIN: self._handle_audio_begin,
+            cmd_type.AUDIO_MAGNITUDE_DATA_CONT: self._handle_audio_cont,
+            cmd_type.AUDIO_MAGNITUDE_DATA_END: self._handle_audio_end,
+            cmd_type.DOOR_SENSOR: self._translate_door_sensor,
+            cmd_type.SERVO_STATUS: self._translate_servo_status,
+            cmd_type.STEPPER_STATUS: self._handle_stepper_status,
+            cmd_type.TEMP_HUM_READ: lambda msg: SensorStatus(
                 target=_addr2tgt(msg.dst_id),
                 temperature_c=self.round_float(float(msg.temp_hum_read.temperature) / 100.0),
                 humidity_percent=self.round_float(float(msg.temp_hum_read.humidity) / 100.0),
             ),
-            JerryCANCmdType.ACKNOWLEDGE: lambda msg: Acknowledge(uuid=msg.uuid),
+            cmd_type.ACKNOWLEDGE: lambda msg: Acknowledge(uuid=msg.uuid),
             # no-op handlers, to silence the warning if unknown message type
-            JerryCANCmdType.STEPPER_HOME: no_op,
-            JerryCANCmdType.STEPPER_MOVE: no_op,
-            JerryCANCmdType.CFG_WRITE: no_op,
-            JerryCANCmdType.SERVO_MOVE: no_op,
-            JerryCANCmdType.GPIO_WRITE: no_op,
-            JerryCANCmdType.DELAY: no_op,
-            JerryCANCmdType.BOOTLOADER_DATA: no_op,
+            cmd_type.STEPPER_HOME: no_op,
+            cmd_type.STEPPER_MOVE: no_op,
+            cmd_type.CFG_WRITE: no_op,
+            cmd_type.SERVO_MOVE: no_op,
+            cmd_type.GPIO_WRITE: no_op,
+            cmd_type.DELAY: no_op,
+            cmd_type.BOOTLOADER_DATA: no_op,
         }
 
     def __allow_fake_status_time(self, motor):
@@ -813,8 +835,9 @@ class CanInterface(DeviceInterface):
         self._is_open = self._jc.Open() == 0
 
         self._read_msgs = self._jc.ReceiveMessages if hasattr(self._jc, "ReceiveMessages") else self._read_by_one_msg
-        self._get_timestamp_ns = attrgetter("timestamp_ns") if hasattr(JerryCANMsg, "timestamp_ns") else self._assign_timestamp_ns
-        self._get_index = attrgetter("index") if hasattr(JerryCANMsg, "index") else (lambda _: time.perf_counter_ns())
+        msg_cls = self._jerrycan_msg_cls
+        self._get_timestamp_ns = attrgetter("timestamp_ns") if hasattr(msg_cls(), "timestamp_ns") else self._assign_timestamp_ns
+        self._get_index = attrgetter("index") if hasattr(msg_cls(), "index") else (lambda _: time.perf_counter_ns())
         logger.debug("Using %s and %s and %s", self._read_msgs, self._get_timestamp_ns, self._get_index)
 
         self._cnt_none = 0
@@ -1190,7 +1213,7 @@ class CanInterface(DeviceInterface):
                                                        position,
                                                        velocity,
                                                        acceleration,
-                                                       AbsOrRel.ABSOLUTE,
+                                                       self._abs_or_rel.ABSOLUTE,
                                                        uuid)
         logger.debug("%s: servo move %.3f mm with v=%.3f mm/s**2 ; res=%s uuid=%s ; config=%s",
                      motor, position, velocity, res, uuid, config)
@@ -1290,7 +1313,7 @@ class CanInterface(DeviceInterface):
             turns_position,
             turns_velocity,
             turns_acceleration,
-            AbsOrRel.RELATIVE if relative else AbsOrRel.ABSOLUTE,
+            self._abs_or_rel.RELATIVE if relative else self._abs_or_rel.ABSOLUTE,
             save_as_fixed,
             uuid,
         )
@@ -1555,12 +1578,12 @@ class CanInterface(DeviceInterface):
             bool: True if successful else False
         """
         target = target_of_motor(motor)
-        msg = JerryCANCfgMsg()
+        msg = self._jerrycan_cfg_msg_cls()
         if is_servo(motor):
-            msg.type = JerryCANCfgMsg.Type.SERVO
+            msg.type = self._jerrycan_cfg_msg_cls.Type.SERVO
             msg.servo.motor_id = _motor_to_id(motor)
         else:
-            msg.type = JerryCANCfgMsg.Type.STEPPER
+            msg.type = self._jerrycan_cfg_msg_cls.Type.STEPPER
             msg.stepper.motor_id = _motor_to_id(motor)
 
         addr = self._tgt2addr(target)
@@ -1676,7 +1699,7 @@ class CanInterface(DeviceInterface):
         rc = 0
         for target in self.required_targets:
             addr = self._tgt2addr(target)
-            rc = self._jc.BootloaderCommand(addr, JerryCANBootloaderCmd.SubCommand.VERSION)
+            rc = self._jc.BootloaderCommand(addr, self._bootloader_cmd_cls.SubCommand.VERSION)
             if rc != 0:
                 break
         return rc == 0
@@ -1710,8 +1733,7 @@ class CanInterface(DeviceInterface):
             res.index = self._get_index(message)
         return res
 
-    @staticmethod
-    def _translate_bootloader(message) -> Optional[Version]:
+    def _translate_bootloader(self, message) -> Optional[Version]:
         """
         Translate bootloader response messages.
 
@@ -1721,7 +1743,7 @@ class CanInterface(DeviceInterface):
         Returns:
             Version object if the bootloader response is a version request, None otherwise
         """
-        if message.bootloader_response.type == JerryCANBootloaderCmd.SubCommand.VERSION:
+        if message.bootloader_response.type == self._bootloader_cmd_cls.SubCommand.VERSION:
             target = _addr2tgt(message.dst_id)
             if hasattr(message.bootloader_response.version, "running_major"):
                 # pyjerrycan < 1.2.0
@@ -1746,9 +1768,9 @@ class CanInterface(DeviceInterface):
         Returns:
             ServoConfig or StepperConfig object depending on the message type
         """
-        if message.cfg_response.type == JerryCANCfgMsg.Type.SERVO:
+        if message.cfg_response.type == self._jerrycan_cfg_msg_cls.Type.SERVO:
             return self._translate_servo_config(message)
-        elif message.cfg_response.type == JerryCANCfgMsg.Type.STEPPER:
+        elif message.cfg_response.type == self._jerrycan_cfg_msg_cls.Type.STEPPER:
             return self._translate_stepper_config(message)
         logger.warning("Unknown config type: %s", message.cfg_response.type)
         return None
@@ -2037,7 +2059,7 @@ class CanInterface(DeviceInterface):
 
     def board_reboot(self, target: Target):
         addr = self._tgt2addr(target)
-        rc = self._jc.BootloaderCommand(addr, JerryCANBootloaderCmd.SubCommand.REBOOT)
+        rc = self._jc.BootloaderCommand(addr, self._bootloader_cmd_cls.SubCommand.REBOOT)
         if rc != 0:
             logger.error("board_reboot failed: SendMessage(dst_id=%s): rc=%s", addr, rc)
         return rc == 0

@@ -65,9 +65,10 @@ def test_can_device_accepts_explicit_emulation_transport():
     assert isinstance(device.device_interface, EmulationInterface)
 
 
-def test_can_device_rejects_linux_transport_until_adapter_exists():
-    with pytest.raises(NotImplementedError):
-        CanDevice(can_transport=CanTransportConfiguration(kind="socketcan"))
+def test_can_device_accepts_linux_transport_backend():
+    device = CanDevice(can_transport=CanTransportConfiguration(kind="socketcan"))
+
+    assert device.can_transport_configuration.kind == CanTransportKind.SOCKETCAN
 
 
 def test_can_device_accepts_pellet_only_required_targets():
