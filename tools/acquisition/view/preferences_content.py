@@ -191,6 +191,14 @@ class PreferencesContent(QWidget):
         behavior = app_model.behavior
         analysis = behavior.analysis
         algo = behavior.algorithm
+        tunnel_headfix_enabled = app_model.hardware.tunnel_headfix_enabled
+        if not tunnel_headfix_enabled:
+            algo.head_fixation_enabled = False
+            algo.active_config.head_clamp.enabled = False
+            algo.auto_close_gate_on_intersession_config.enabled = False
+            analysis.auto_tunnel_sweep_monitor.config.enabled = False
+            analysis.auto_tunnel_sweep_monitor.stop()
+            algo.batch_session_recording_config.enabled = False
 
         states_refresh = []
         add_enabled_state = states_refresh.append
@@ -243,6 +251,7 @@ class PreferencesContent(QWidget):
         left_grid_layout.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         left_grid_layout.setSpacing(2)
         left_grid_layout.setHorizontalSpacing(10)
+        tunnel_headfix_left_rows = []
 
         grids_hbox_layout = QHBoxLayout()
         grids_hbox_layout.setContentsMargins(0, 0, 0, 0)
@@ -490,6 +499,7 @@ class PreferencesContent(QWidget):
         left_grid_layout.addWidget(spinbox, cur_row, cur_col + 1)
         cur_row += 1
         #
+        auto_close_start_row = cur_row
         left_grid_layout.addWidget(QLabel("<b>Auto-close gate during intertrial analysis:</b>"), cur_row, cur_col)
         auto_close_gate_cfg = algo.auto_close_gate_on_intersession_config
         toggle = QSwitch()
@@ -525,6 +535,7 @@ class PreferencesContent(QWidget):
         spinbox.valueChanged.connect(spinbox_value_changed)
         left_grid_layout.addWidget(spinbox, cur_row, cur_col + 1)
         cur_row += 1
+        tunnel_headfix_left_rows.extend(range(auto_close_start_row, cur_row))
 
         # right part:
         right_grid_layout = QGridLayout()
@@ -846,8 +857,16 @@ class PreferencesContent(QWidget):
         refresh_enabled_states()
 
         #
+        for row in tunnel_headfix_left_rows:
+            set_row_col_visible(left_grid_layout, row, 0, tunnel_headfix_enabled)
+            set_row_col_visible(left_grid_layout, row, 1, tunnel_headfix_enabled)
+
+        right_widget = QWidget()
+        right_widget.setLayout(right_grid_layout)
+        right_widget.setVisible(tunnel_headfix_enabled)
+
         grids_hbox_layout.addLayout(left_grid_layout)
-        grids_hbox_layout.addLayout(right_grid_layout, stretch=1)
+        grids_hbox_layout.addWidget(right_widget, stretch=1)
         main_layout.addLayout(grids_hbox_layout)
         #
         tab = QWidget()
