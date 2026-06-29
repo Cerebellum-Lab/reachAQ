@@ -2316,16 +2316,18 @@ class AppModel(ObservableObject):
         hard = self._hardware
         algo = self._behavior.algorithm
         analysis = self._behavior.analysis
+        tunnel_headfix_enabled = hard.tunnel_headfix_enabled
         magnet_intensity = hard.head_magnet_intensity
         project = self._project_info
         if project is None:
             project = self.make_project_info()
+        if not tunnel_headfix_enabled:
+            magnet_intensity = math.nan
         if magnet_intensity is None:
             magnet_intensity = math.nan
         doors_mon = analysis.external_doors_alarm
         doors_state = doors_mon.doors_state
         alarm_mon = analysis.emergency_alarm_monitor
-        load_cell = analysis.load_cell_monitor
         audio_mon = analysis.animal_thrashing_alarm
         presence_mon = analysis.global_animal_presence_alarm
         misplaced_mon = analysis.pellet_misplaced_monitor
@@ -2343,11 +2345,6 @@ class AppModel(ObservableObject):
                 is_active=doors_state.sliding.open or False,
             ),
             ApiDetectorStatus(
-                detector_id=ApiDetectorKind.loadCellThrash,
-                is_enabled=load_cell.running,
-                is_active=load_cell.thrashing_detected,
-            ),
-            ApiDetectorStatus(
                 detector_id=ApiDetectorKind.audioThrash,
                 is_enabled=audio_mon.running,
                 is_active=audio_mon.is_engaged,
@@ -2363,6 +2360,16 @@ class AppModel(ObservableObject):
                 is_active=hard.device_ack_timeout_engaged,
             ),
         ]
+        if tunnel_headfix_enabled:
+            load_cell = analysis.load_cell_monitor
+            detectors.insert(
+                2,
+                ApiDetectorStatus(
+                    detector_id=ApiDetectorKind.loadCellThrash,
+                    is_enabled=load_cell.running,
+                    is_active=load_cell.thrashing_detected,
+                ),
+            )
 
         alarms = []
         for alarm in analysis.alarms:
@@ -2417,10 +2424,10 @@ class AppModel(ObservableObject):
             ),
             tunnel_device=ApiTunnelDeviceStatus(
                 magnet_intensity=magnet_intensity,
-                gate_open=hard.tunnel_gate_open_status,
+                gate_open=hard.tunnel_gate_open_status if tunnel_headfix_enabled else False,
             ),
             behavior=ApiBehaviorStatus(
-                baseline_magnet_intensity=algo.baseline_intensity,
+                baseline_magnet_intensity=algo.baseline_intensity if tunnel_headfix_enabled else math.nan,
                 reaches=reach_status,
             )
         )
