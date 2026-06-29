@@ -1,13 +1,17 @@
 from __future__ import annotations
 
-from typing import Optional, Union
+from typing import Optional, Tuple, Union
 
 from autotrainer.core import ObservableObject
 from autotrainer.device import (
     LaserControllerProtocol,
+    LaserCalibrationPoint,
+    LaserCalibrationRamp,
     LaserChannelId,
+    LaserDiodePowerCurve,
     LaserFeedbackSample,
     LaserPulseTrain,
+    LaserSynchronizedPulseTrain,
     LaserSystemConfiguration,
     NidaqLaserController,
     NullLaserController,
@@ -89,6 +93,26 @@ class LaserModel(ObservableObject):
 
     def run_pulse_train(self, pulse_train: LaserPulseTrain) -> None:
         self._require_controller().run_pulse_train(pulse_train)
+
+    def run_synchronized_pulse_train(self, pulse_train: LaserSynchronizedPulseTrain) -> None:
+        self._require_controller().run_synchronized_pulse_train(pulse_train)
+
+    def run_calibration_ramp(self, ramp: LaserCalibrationRamp) -> Tuple[LaserCalibrationPoint, ...]:
+        points = self._require_controller().run_calibration_ramp(ramp)
+        if points:
+            prev, self._last_feedback_sample = self._last_feedback_sample, LaserFeedbackSample(
+                channel_id=points[-1].channel_id,
+                command_volts=points[-1].command_volts,
+                diode_volts=points[-1].diode_volts,
+                command_copy_volts=points[-1].command_copy_volts,
+            )
+            self._on_property_changed(self.LAST_FEEDBACK_SAMPLE, self._last_feedback_sample, prev)
+        return points
+
+    def make_diode_power_curve(self, points: Tuple[LaserCalibrationPoint, ...]) -> LaserDiodePowerCurve:
+        if not points:
+            raise ValueError("calibration points cannot be empty")
+        return LaserDiodePowerCurve(points[0].channel_id, points)
 
     def close_all_shutters(self) -> None:
         controller = self._controller

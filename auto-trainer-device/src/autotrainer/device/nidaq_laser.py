@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from typing import Dict, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 from .laser import (
+    LaserCalibrationPoint,
+    LaserCalibrationRamp,
     LaserChannelConfiguration,
     LaserChannelId,
     LaserFeedbackSample,
     LaserPulseTrain,
+    LaserSynchronizedPulseTrain,
     LaserSystemConfiguration,
     normalize_laser_channel_id,
 )
@@ -121,79 +124,334 @@ class NidaqLaserController:
         )
 
     def run_pulse_train(self, pulse_train: LaserPulseTrain) -> None:
+        self.run_synchronized_pulse_train(
+            LaserSynchronizedPulseTrain(
+                pulse_trains=(pulse_train,),
+                trigger_source=pulse_train.trigger_source,
+                trigger_edge=pulse_train.trigger_edge,
+                enable_pmt_shutter=pulse_train.enable_pmt_shutter,
+                wait=pulse_train.wait,
+                timeout_seconds=pulse_train.timeout_seconds,
+            )
+        )
+
+    def run_synchronized_pulse_train(self, pulse_train: LaserSynchronizedPulseTrain) -> None:
         if not self._configuration.hardware_timed:
             raise RuntimeError("Hardware-timed laser pulse trains require laser configuration hardware_timed=True")
         if not pulse_train.wait:
             raise NotImplementedError("Asynchronous hardware-timed laser output is not implemented yet")
-        if pulse_train.enable_pmt_shutter:
-            raise NotImplementedError("Hardware-timed PMT shutter sequencing is not implemented yet")
-        channel = self._configuration.get_channel(pulse_train.channel_id)
-        if not channel.minimum_command_volts <= pulse_train.amplitude_volts <= channel.maximum_command_volts:
-            raise ValueError(
-                f"laser channel {channel.channel_id.value} amplitude {pulse_train.amplitude_volts} V is outside "
-                f"the configured range {channel.minimum_command_volts}..{channel.maximum_command_volts} V"
-            )
-        waveform = self._build_pulse_train_waveform(channel, pulse_train)
+        channels = [
+            self._configuration.get_channel(channel_pulse.channel_id)
+            for channel_pulse in pulse_train.pulse_trains
+        ]
+        for channel, channel_pulse in zip(channels, pulse_train.pulse_trains):
+            self._validate_command_voltage(channel, channel_pulse.amplitude_volts)
         sample_rate_hz = self._require_sample_rate()
+        waveforms = [
+            self._build_pulse_train_waveform(channel, channel_pulse)
+            for channel, channel_pulse in zip(channels, pulse_train.pulse_trains)
+        ]
+        pmt_enabled = pulse_train.enable_pmt_shutter or any(
+            channel_pulse.enable_pmt_shutter for channel_pulse in pulse_train.pulse_trains
+        )
+        pmt_open_delay_ms = max(
+            (channel_pulse.pmt_shutter_open_delay_ms for channel_pulse in pulse_train.pulse_trains),
+            default=0.0,
+        ) if pmt_enabled else 0.0
+        pmt_close_delay_ms = max(
+            (channel_pulse.pmt_shutter_close_delay_ms for channel_pulse in pulse_train.pulse_trains),
+            default=0.0,
+        ) if pmt_enabled else 0.0
+        pre_samples = _samples_from_ms(pmt_open_delay_ms, sample_rate_hz)
+        post_samples = _samples_from_ms(pmt_close_delay_ms, sample_rate_hz)
+        max_waveform_samples = max(len(waveform) for waveform in waveforms)
+        timed_waveforms = []
+        for channel, waveform in zip(channels, waveforms):
+            minimum = channel.minimum_command_volts
+            timed_waveforms.append(
+                [minimum] * pre_samples
+                + waveform
+                + [minimum] * (max_waveform_samples - len(waveform) + post_samples)
+            )
+        total_samples = len(timed_waveforms[0])
         timeout_seconds = pulse_train.timeout_seconds
         if timeout_seconds is None:
-            timeout_seconds = len(waveform) / sample_rate_hz + 5.0
-        task = self._create_analog_output_task(channel, f"laser_{channel.channel_id.value}_pulse_ao")
+            timeout_seconds = total_samples / sample_rate_hz + 5.0
+        ao_task = self._create_synchronized_analog_output_task(channels, "laser_sync_pulse_ao")
+        digital_tasks = []
         run_error = None
         try:
-            task.timing.cfg_samp_clk_timing(
+            ao_task.timing.cfg_samp_clk_timing(
                 rate=sample_rate_hz,
                 sample_mode=self._nidaqmx.constants.AcquisitionType.FINITE,
-                samps_per_chan=len(waveform),
+                samps_per_chan=total_samples,
             )
             if pulse_train.trigger_source:
-                task.triggers.start_trigger.cfg_dig_edge_start_trig(
+                ao_task.triggers.start_trigger.cfg_dig_edge_start_trig(
                     pulse_train.trigger_source,
                     trigger_edge=self._get_trigger_edge(pulse_train.trigger_edge),
                 )
-            task.write(waveform, auto_start=False)
-            if pulse_train.open_shutter:
-                self.set_shutter_open(channel.channel_id, True)
-            task.start()
-            task.wait_until_done(timeout=timeout_seconds)
+            ao_task.write(timed_waveforms[0] if len(timed_waveforms) == 1 else timed_waveforms, auto_start=False)
+            sample_clock_source = self._analog_output_sample_clock_source(channels[0].analog_output)
+            if pmt_enabled:
+                pmt_line = self._require_pmt_shutter_output()
+                digital_tasks.append(
+                    self._create_finite_digital_output_task(
+                        pmt_line,
+                        "laser_pmt_shutter_do",
+                        [True] * total_samples,
+                        sample_rate_hz,
+                        total_samples,
+                        sample_clock_source,
+                        pulse_train.trigger_source,
+                        pulse_train.trigger_edge,
+                    )
+                )
+            for channel, channel_pulse in zip(channels, pulse_train.pulse_trains):
+                if channel_pulse.emit_trigger_output:
+                    if channel.trigger_output is None:
+                        raise RuntimeError(
+                            f"laser channel {channel.channel_id.value} requested trigger output, "
+                            "but trigger_output is not configured"
+                        )
+                    digital_tasks.append(
+                        self._create_finite_digital_output_task(
+                            channel.trigger_output,
+                            f"laser_{channel.channel_id.value}_trigger_do",
+                            self._build_digital_pulse_waveform(
+                                total_samples,
+                                channel_pulse.trigger_output_pulse_ms,
+                                sample_rate_hz,
+                            ),
+                            sample_rate_hz,
+                            total_samples,
+                            sample_clock_source,
+                            pulse_train.trigger_source,
+                            pulse_train.trigger_edge,
+                        )
+                    )
+                if channel_pulse.emit_timing_trigger_output:
+                    if channel.timing_trigger_output is None:
+                        raise RuntimeError(
+                            f"laser channel {channel.channel_id.value} requested timing trigger output, "
+                            "but timing_trigger_output is not configured"
+                        )
+                    digital_tasks.append(
+                        self._create_finite_digital_output_task(
+                            channel.timing_trigger_output,
+                            f"laser_{channel.channel_id.value}_timing_trigger_do",
+                            self._build_digital_pulse_waveform(
+                                total_samples,
+                                channel_pulse.timing_trigger_output_pulse_ms,
+                                sample_rate_hz,
+                            ),
+                            sample_rate_hz,
+                            total_samples,
+                            sample_clock_source,
+                            pulse_train.trigger_source,
+                            pulse_train.trigger_edge,
+                        )
+                    )
+            for channel, channel_pulse in zip(channels, pulse_train.pulse_trains):
+                if channel_pulse.open_shutter:
+                    self.set_shutter_open(channel.channel_id, True)
+            for task in digital_tasks:
+                task.start()
+            ao_task.start()
+            ao_task.wait_until_done(timeout=timeout_seconds)
+            for task in digital_tasks:
+                task.wait_until_done(timeout=timeout_seconds)
         except Exception as exc:
             run_error = exc
             raise
         finally:
-            errors = []
-            try:
-                task.stop()
-            except Exception as exc:
-                errors.append(("pulse task stop", exc))
-                logger.exception("Failed to stop NI-DAQ laser pulse task for channel %s", channel.channel_id.value)
-            try:
-                task.close()
-            except Exception as exc:
-                errors.append(("pulse task close", exc))
-                logger.exception("Failed to close NI-DAQ laser pulse task for channel %s", channel.channel_id.value)
+            self._cleanup_pulse_train(
+                ao_task=ao_task,
+                digital_tasks=digital_tasks,
+                channels=channels,
+                channel_pulses=pulse_train.pulse_trains,
+                close_pmt=pmt_enabled,
+                run_error=run_error,
+            )
+
+    def run_calibration_ramp(self, ramp: LaserCalibrationRamp) -> Tuple[LaserCalibrationPoint, ...]:
+        if not self._configuration.hardware_timed:
+            raise RuntimeError("Hardware-timed laser calibration ramps require laser configuration hardware_timed=True")
+        channel = self._configuration.get_channel(ramp.channel_id)
+        self._validate_command_voltage(channel, ramp.start_volts)
+        self._validate_command_voltage(channel, ramp.stop_volts)
+        if ramp.enable_pmt_shutter and (
+            ramp.pmt_shutter_open_delay_ms > 0 or ramp.pmt_shutter_close_delay_ms > 0
+        ):
+            raise NotImplementedError("PMT shutter delays for calibration ramps are not implemented yet")
+        sample_rate_hz = self._require_sample_rate()
+        waveform = self._build_calibration_ramp_waveform(ramp)
+        timeout_seconds = ramp.timeout_seconds
+        if timeout_seconds is None:
+            timeout_seconds = len(waveform) / sample_rate_hz + 5.0
+        ao_task = self._create_analog_output_task(channel, f"laser_{channel.channel_id.value}_calibration_ao")
+        ai_task = self._create_calibration_input_task(channel)
+        digital_tasks = []
+        run_error = None
+        points = ()
+        try:
+            ao_task.timing.cfg_samp_clk_timing(
+                rate=sample_rate_hz,
+                sample_mode=self._nidaqmx.constants.AcquisitionType.FINITE,
+                samps_per_chan=len(waveform),
+            )
+            sample_clock_source = self._analog_output_sample_clock_source(channel.analog_output)
+            ai_task.timing.cfg_samp_clk_timing(
+                rate=sample_rate_hz,
+                source=sample_clock_source,
+                sample_mode=self._nidaqmx.constants.AcquisitionType.FINITE,
+                samps_per_chan=len(waveform),
+            )
+            if ramp.enable_pmt_shutter:
+                digital_tasks.append(
+                    self._create_finite_digital_output_task(
+                        self._require_pmt_shutter_output(),
+                        "laser_pmt_shutter_calibration_do",
+                        [True] * len(waveform),
+                        sample_rate_hz,
+                        len(waveform),
+                        sample_clock_source,
+                        None,
+                        "rising",
+                    )
+                )
+            ao_task.write(waveform, auto_start=False)
+            if ramp.open_shutter:
+                self.set_shutter_open(channel.channel_id, True)
+            for task in digital_tasks:
+                task.start()
+            ai_task.start()
+            ao_task.start()
+            ao_task.wait_until_done(timeout=timeout_seconds)
+            ai_task.wait_until_done(timeout=timeout_seconds)
+            raw_samples = ai_task.read(number_of_samples_per_channel=len(waveform), timeout=timeout_seconds)
+            points = self._build_calibration_points(channel, ramp, raw_samples)
+        except Exception as exc:
+            run_error = exc
+            raise
+        finally:
+            self._cleanup_calibration_ramp(
+                ao_task=ao_task,
+                ai_task=ai_task,
+                digital_tasks=digital_tasks,
+                channel=channel,
+                ramp=ramp,
+                run_error=run_error,
+            )
+        return points
+
+    def _validate_command_voltage(self, channel: LaserChannelConfiguration, volts: float) -> None:
+        if not channel.minimum_command_volts <= volts <= channel.maximum_command_volts:
+            raise ValueError(
+                f"laser channel {channel.channel_id.value} command {volts} V is outside "
+                f"the configured range {channel.minimum_command_volts}..{channel.maximum_command_volts} V"
+            )
+
+    def _cleanup_pulse_train(
+        self,
+        ao_task: object,
+        digital_tasks: List[object],
+        channels: List[LaserChannelConfiguration],
+        channel_pulses: Tuple[LaserPulseTrain, ...],
+        close_pmt: bool,
+        run_error: Optional[BaseException],
+    ) -> None:
+        errors = []
+        self._stop_and_close_task("pulse analog output task", ao_task, errors)
+        for index, task in enumerate(digital_tasks):
+            self._stop_and_close_task(f"pulse digital output task {index}", task, errors)
+        for channel in channels:
             try:
                 self.set_command_voltage(channel.channel_id, channel.minimum_command_volts)
             except Exception as exc:
-                errors.append(("command reset", exc))
+                errors.append((f"channel {channel.channel_id.value} command reset", exc))
                 logger.exception("Failed to reset NI-DAQ laser command for channel %s", channel.channel_id.value)
-            if pulse_train.close_shutter:
+        for channel, channel_pulse in zip(channels, channel_pulses):
+            if channel_pulse.close_shutter:
                 try:
                     self.set_shutter_open(channel.channel_id, False)
                 except Exception as exc:
-                    errors.append(("shutter close", exc))
+                    errors.append((f"channel {channel.channel_id.value} shutter close", exc))
                     logger.exception("Failed to close NI-DAQ laser shutter for channel %s", channel.channel_id.value)
-            if errors:
-                locations = ", ".join(location for location, _ in errors)
-                cleanup_error = RuntimeError(
-                    f"Failed to clean up NI-DAQ laser pulse train for channel {channel.channel_id.value}: {locations}"
+        if close_pmt:
+            try:
+                self._write_transient_digital_line(
+                    self._require_pmt_shutter_output(),
+                    False,
+                    "laser_pmt_shutter_reset",
                 )
-                if run_error is None:
-                    raise cleanup_error from errors[0][1]
-                logger.error(
-                    "Failed to clean up NI-DAQ laser pulse train for channel %s after output error: %s",
-                    channel.channel_id.value,
-                    locations,
+            except Exception as exc:
+                errors.append(("PMT shutter close", exc))
+                logger.exception("Failed to close NI-DAQ PMT shutter output")
+        self._raise_or_log_cleanup_errors("NI-DAQ laser pulse train", errors, run_error)
+
+    def _cleanup_calibration_ramp(
+        self,
+        ao_task: object,
+        ai_task: object,
+        digital_tasks: List[object],
+        channel: LaserChannelConfiguration,
+        ramp: LaserCalibrationRamp,
+        run_error: Optional[BaseException],
+    ) -> None:
+        errors = []
+        self._stop_and_close_task("calibration analog output task", ao_task, errors)
+        self._stop_and_close_task("calibration analog input task", ai_task, errors)
+        for index, task in enumerate(digital_tasks):
+            self._stop_and_close_task(f"calibration digital output task {index}", task, errors)
+        try:
+            self.set_command_voltage(channel.channel_id, channel.minimum_command_volts)
+        except Exception as exc:
+            errors.append((f"channel {channel.channel_id.value} command reset", exc))
+            logger.exception("Failed to reset NI-DAQ laser command for channel %s", channel.channel_id.value)
+        if ramp.close_shutter:
+            try:
+                self.set_shutter_open(channel.channel_id, False)
+            except Exception as exc:
+                errors.append((f"channel {channel.channel_id.value} shutter close", exc))
+                logger.exception("Failed to close NI-DAQ laser shutter for channel %s", channel.channel_id.value)
+        if ramp.enable_pmt_shutter:
+            try:
+                self._write_transient_digital_line(
+                    self._require_pmt_shutter_output(),
+                    False,
+                    "laser_pmt_shutter_calibration_reset",
                 )
+            except Exception as exc:
+                errors.append(("PMT shutter close", exc))
+                logger.exception("Failed to close NI-DAQ PMT shutter output after calibration")
+        self._raise_or_log_cleanup_errors("NI-DAQ laser calibration ramp", errors, run_error)
+
+    def _stop_and_close_task(self, name: str, task: object, errors: list) -> None:
+        try:
+            task.stop()
+        except Exception as exc:
+            errors.append((f"{name} stop", exc))
+            logger.exception("Failed to stop %s", name)
+        try:
+            task.close()
+        except Exception as exc:
+            errors.append((f"{name} close", exc))
+            logger.exception("Failed to close %s", name)
+
+    def _raise_or_log_cleanup_errors(
+        self,
+        context: str,
+        errors: list,
+        run_error: Optional[BaseException],
+    ) -> None:
+        if not errors:
+            return
+        locations = ", ".join(location for location, _ in errors)
+        cleanup_error = RuntimeError(f"Failed to clean up {context}: {locations}")
+        if run_error is None:
+            raise cleanup_error from errors[0][1]
+        logger.error("Failed to clean up %s after output error: %s", context, locations)
 
     def close_all_shutters(self) -> None:
         errors = []
@@ -265,10 +523,71 @@ class NidaqLaserController:
         )
         return analog_output
 
+    def _create_synchronized_analog_output_task(self, channels: List[LaserChannelConfiguration], name: str):
+        analog_output = self._nidaqmx.Task(name)
+        for channel in channels:
+            analog_output.ao_channels.add_ao_voltage_chan(
+                channel.analog_output,
+                min_val=channel.minimum_command_volts,
+                max_val=channel.maximum_command_volts,
+            )
+        return analog_output
+
+    def _create_calibration_input_task(self, channel: LaserChannelConfiguration):
+        analog_input = self._nidaqmx.Task(f"laser_{channel.channel_id.value}_calibration_ai")
+        analog_input.ai_channels.add_ai_voltage_chan(channel.diode_input)
+        if channel.command_copy_input is not None:
+            analog_input.ai_channels.add_ai_voltage_chan(channel.command_copy_input)
+        return analog_input
+
+    def _create_finite_digital_output_task(
+        self,
+        physical_line: str,
+        name: str,
+        waveform: List[bool],
+        sample_rate_hz: float,
+        total_samples: int,
+        sample_clock_source: str,
+        trigger_source: Optional[str],
+        trigger_edge: str,
+    ):
+        if len(waveform) != total_samples:
+            raise RuntimeError(
+                f"digital output waveform for {physical_line} has {len(waveform)} samples, "
+                f"expected {total_samples}"
+            )
+        digital_output = self._nidaqmx.Task(name)
+        try:
+            digital_output.do_channels.add_do_chan(physical_line)
+            digital_output.timing.cfg_samp_clk_timing(
+                rate=sample_rate_hz,
+                source=sample_clock_source,
+                sample_mode=self._nidaqmx.constants.AcquisitionType.FINITE,
+                samps_per_chan=total_samples,
+            )
+            if trigger_source:
+                digital_output.triggers.start_trigger.cfg_dig_edge_start_trig(
+                    trigger_source,
+                    trigger_edge=self._get_trigger_edge(trigger_edge),
+                )
+            digital_output.write(waveform, auto_start=False)
+        except Exception:
+            digital_output.close()
+            raise
+        return digital_output
+
     def _write_transient_analog_sample(self, channel: LaserChannelConfiguration, volts: float) -> None:
         task = self._create_analog_output_task(channel, f"laser_{channel.channel_id.value}_manual_ao")
         try:
             task.write(volts, auto_start=True)
+        finally:
+            task.close()
+
+    def _write_transient_digital_line(self, physical_line: str, enabled: bool, name: str) -> None:
+        task = self._nidaqmx.Task(name)
+        try:
+            task.do_channels.add_do_chan(physical_line)
+            task.write(bool(enabled), auto_start=True)
         finally:
             task.close()
 
@@ -310,6 +629,75 @@ class NidaqLaserController:
             raise ValueError("laser pulse train waveform is empty")
         return waveform
 
+    def _build_digital_pulse_waveform(
+        self,
+        total_samples: int,
+        pulse_ms: float,
+        sample_rate_hz: float,
+    ) -> List[bool]:
+        pulse_samples = min(total_samples, max(1, _samples_from_ms(pulse_ms, sample_rate_hz)))
+        return [True] * pulse_samples + [False] * (total_samples - pulse_samples)
+
+    def _build_calibration_ramp_waveform(self, ramp: LaserCalibrationRamp) -> List[float]:
+        waveform = []
+        for index in range(ramp.steps):
+            fraction = index / (ramp.steps - 1)
+            command_volts = ramp.start_volts + fraction * (ramp.stop_volts - ramp.start_volts)
+            waveform.extend([command_volts] * ramp.samples_per_step)
+        if not waveform:
+            raise ValueError("laser calibration ramp waveform is empty")
+        return waveform
+
+    def _build_calibration_points(
+        self,
+        channel: LaserChannelConfiguration,
+        ramp: LaserCalibrationRamp,
+        raw_samples,
+    ) -> Tuple[LaserCalibrationPoint, ...]:
+        channel_count = 2 if channel.command_copy_input is not None else 1
+        samples = self._normalize_ai_samples(raw_samples, channel_count)
+        points = []
+        for index in range(ramp.steps):
+            start = index * ramp.samples_per_step
+            stop = start + ramp.samples_per_step
+            fraction = index / (ramp.steps - 1)
+            command_volts = ramp.start_volts + fraction * (ramp.stop_volts - ramp.start_volts)
+            diode_volts = _mean(samples[0][start:stop]) * channel.feedback_scale
+            command_copy_volts = None
+            if channel.command_copy_input is not None:
+                command_copy_volts = _mean(samples[1][start:stop]) * channel.command_copy_scale
+            points.append(
+                LaserCalibrationPoint(
+                    channel_id=channel.channel_id,
+                    command_volts=command_volts,
+                    diode_volts=diode_volts,
+                    command_copy_volts=command_copy_volts,
+                )
+            )
+        return tuple(points)
+
+    def _normalize_ai_samples(self, raw_samples, channel_count: int) -> List[List[float]]:
+        raw_samples = list(raw_samples)
+        if channel_count == 1:
+            if raw_samples and isinstance(raw_samples[0], (list, tuple)):
+                return [list(raw_samples[0])]
+            return [list(raw_samples)]
+        if len(raw_samples) != channel_count:
+            raise RuntimeError(f"expected {channel_count} analog input channels, received {len(raw_samples)}")
+        return [list(channel_samples) for channel_samples in raw_samples]
+
+    def _require_pmt_shutter_output(self) -> str:
+        pmt_shutter_output = self._configuration.pmt_shutter_output
+        if pmt_shutter_output is None:
+            raise RuntimeError("PMT shutter output requested, but laser pmt_shutter_output is not configured")
+        return pmt_shutter_output
+
+    def _analog_output_sample_clock_source(self, physical_channel: str) -> str:
+        parts = physical_channel.strip("/").split("/")
+        if len(parts) < 2 or not parts[0]:
+            raise RuntimeError(f"cannot infer NI-DAQ AO sample clock source from physical channel {physical_channel}")
+        return f"/{parts[0]}/ao/SampleClock"
+
     def _require_sample_rate(self) -> float:
         sample_rate_hz = self._configuration.sample_rate_hz
         if sample_rate_hz is None:
@@ -328,6 +716,13 @@ def _samples_from_ms(value_ms: float, sample_rate_hz: float) -> int:
     if value_ms <= 0:
         return 0
     return max(1, int(round(value_ms * sample_rate_hz / 1000.0)))
+
+
+def _mean(values) -> float:
+    values = list(values)
+    if not values:
+        raise RuntimeError("cannot average an empty calibration sample segment")
+    return float(sum(values)) / len(values)
 
 
 def _load_nidaqmx():

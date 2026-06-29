@@ -18,7 +18,8 @@ from .emulation_interface import EmulationInterface
 from .can_device import CanDevice, HAVE_CAN_DEVICE
 from .can_transport import (CanTransportConfiguration, CanTransportKind, CanTransportProtocol,
                             normalize_can_transport_kind)
-from .laser import (LaserChannelConfiguration, LaserChannelId, LaserControllerProtocol,
-                    LaserFeedbackSample, LaserPulseTrain, LaserSystemConfiguration, NullLaserController,
+from .laser import (LaserCalibrationPoint, LaserCalibrationRamp, LaserChannelConfiguration, LaserChannelId,
+                    LaserControllerProtocol, LaserDiodePowerCurve, LaserFeedbackSample, LaserPulseTrain,
+                    LaserSynchronizedPulseTrain, LaserSystemConfiguration, NullLaserController,
                     normalize_laser_channel_id)
 from .nidaq_laser import NidaqLaserController
