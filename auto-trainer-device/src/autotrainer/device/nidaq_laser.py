@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import numbers
 from typing import Dict, List, Optional, Tuple, Union
 
 from .laser import (
@@ -679,7 +680,7 @@ class NidaqLaserController:
     def _normalize_ai_samples(self, raw_samples, channel_count: int) -> List[List[float]]:
         raw_samples = list(raw_samples)
         if channel_count == 1:
-            if raw_samples and isinstance(raw_samples[0], (list, tuple)):
+            if raw_samples and not isinstance(raw_samples[0], numbers.Number):
                 return [list(raw_samples[0])]
             return [list(raw_samples)]
         if len(raw_samples) != channel_count:
