@@ -63,6 +63,7 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
     HEAD_MAGNET_INTENSITY = "head_magnet_intensity"
     TUNNEL_GATE_POSITION = "tunnel_gate_position"
     TUNNEL_GATE_OPEN_STATUS = "tunnel_gate_open_status"
+    TUNNEL_HEADFIX_ENABLED = "tunnel_headfix_enabled"
 
     def __init__(
         self,
@@ -295,6 +296,10 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
         """
         return self._head_magnet_position
 
+    @property
+    def tunnel_headfix_enabled(self) -> bool:
+        return self._tunnel_headfix_enabled
+
     def update_head_magnet_intensity(self, value: Optional[float]) -> Optional[UUID]:
         if not self._tunnel_headfix_enabled:
             logger.debug("Skipping head magnet command because tunnel/headfix hardware is disabled")
@@ -463,7 +468,8 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
         return self._send_with_token(self._device_conn, SystemCommandKind.SET_RGB_LED, (r, g, b))
 
     def load_config(self, config: HardwareConfiguration):
-        self._tunnel_headfix_enabled = config.tunnel_headfix_enabled
+        prev, self._tunnel_headfix_enabled = self._tunnel_headfix_enabled, config.tunnel_headfix_enabled
+        self._on_property_changed(self.TUNNEL_HEADFIX_ENABLED, self._tunnel_headfix_enabled, prev)
         self.set_device_ack_timeout(config.min_ack_timeout)
         self.set_board_status_timeout(config.board_status_timeout)
 

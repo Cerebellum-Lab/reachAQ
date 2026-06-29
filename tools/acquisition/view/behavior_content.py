@@ -17,6 +17,7 @@ from autotrainer.pyside.DayTotalCount import DailyAndTotalCountsLabel
 from tools.acquisition.model.app_model import AppModel
 from tools.acquisition.model.inference_model import InferenceModel
 from tools.acquisition.model.behavior_model import BehaviorModel
+from tools.acquisition.model.hardware_model import HardwareModel
 
 
 class BehaviorContent(ContentWidget):
@@ -103,14 +104,16 @@ class BehaviorContent(ContentWidget):
         left_layout.addWidget(toggle, left_cur_row, 1, alignment=Qt.AlignmentFlag.AlignLeft)
         left_cur_row += 1
 
-        left_layout.addWidget(QLabel("Auto-Clamp:"), left_cur_row, 0)
+        label = self._head_fixation_label = QLabel("Auto-Clamp:")
+        left_layout.addWidget(label, left_cur_row, 0)
         toggle = self._head_fixation_toggle = QSwitch()
         toggle.stateChanged.connect(self._head_fixation_toggle_state_changed)
         toggle.setToolTip("Enables automatic magnet adjustment to 100% when the headbar detector is triggered.")
         left_layout.addWidget(toggle, left_cur_row, 1, alignment=Qt.AlignmentFlag.AlignLeft)
         left_cur_row += 1
 
-        left_layout.addWidget(QLabel("Head Magnet Baseline:"), left_cur_row, 0)
+        label = self._head_magnet_baseline_title_label = QLabel("Head Magnet Baseline:")
+        left_layout.addWidget(label, left_cur_row, 0)
         label = self._head_magnet_baseline_label = QLabel(f"{self._behavior_model.algorithm.baseline_intensity:.1f}%")
         label.setContentsMargins(0, 4, 0, 0)
         left_layout.addWidget(self._head_magnet_baseline_label, left_cur_row, 1)
@@ -226,6 +229,7 @@ class BehaviorContent(ContentWidget):
         #
 
         inference_model.property_changed += self._inference_model_property_changed
+        app_model.hardware.property_changed += self._hardware_model_property_changed
         system_machine.shift_xyz_handler.property_changed += self._shift_xyz_property_changed
 
         system_machine.events.state_changed += lambda old, new: self._system_machine_state_label.setText(new)
@@ -235,6 +239,7 @@ class BehaviorContent(ContentWidget):
         algo.property_changed += self._algorithm_property_changed
         self.status_changed.connect(self._inference_status.setText)
         self.set_is_editable(False)
+        self._update_tunnel_headfix_visibility(app_model.hardware.tunnel_headfix_enabled)
 
     def set_is_editable(self, is_editable: bool):
         self._stack_layout.setCurrentIndex(1 if is_editable else 0)
@@ -251,6 +256,23 @@ class BehaviorContent(ContentWidget):
     def _make_position_baseline(self):
         self._behavior_model.use_current_head_magnet_position_as_baseline()
         self._app_model.save_configuration()
+
+    def _update_tunnel_headfix_visibility(self, is_enabled: bool):
+        if not is_enabled and self._head_fixation_toggle.isChecked():
+            self._behavior_model.algorithm.head_fixation_enabled = False
+        for widget in (
+            self._head_fixation_label,
+            self._head_fixation_toggle,
+            self._head_magnet_baseline_title_label,
+            self._head_magnet_baseline_label,
+            self._make_baseline_button,
+        ):
+            widget.setVisible(is_enabled)
+
+    @invoke_method
+    def _hardware_model_property_changed(self, name, value, _):
+        if name == HardwareModel.TUNNEL_HEADFIX_ENABLED:
+            self._update_tunnel_headfix_visibility(value)
 
     @invoke_method
     def _algorithm_property_changed(self, name, value, _):

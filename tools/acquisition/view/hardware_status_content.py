@@ -11,6 +11,7 @@ from autotrainer.pyside.content_widget import ContentWidget, invoke_method
 from autotrainer.pyside.xyz_label import XYZQLabel
 
 from tools.acquisition.model.app_model import AppModel
+from tools.acquisition.model.hardware_model import HardwareModel
 
 
 logger = get_verbose_logger(__name__)
@@ -51,11 +52,12 @@ class HardwareStatusContent(ContentWidget):
 
         cur_row = cur_col = 0
 
-        label = QLabel("<b>Tunnel:</b>")
+        label = self._tunnel_section_label = QLabel("<b>Tunnel:</b>")
         layout.addWidget(label, cur_row, cur_col)
         cur_row += 1
 
-        layout.addWidget(QLabel("Head magnet (%):"), cur_row, cur_col)
+        self._head_magnet_label = QLabel("Head magnet (%):")
+        layout.addWidget(self._head_magnet_label, cur_row, cur_col)
         self._head_magnet = QLabel("(no updates)")
         layout.addWidget(self._head_magnet, cur_row, cur_col + 1)
         cur_row += 1
@@ -138,6 +140,18 @@ class HardwareStatusContent(ContentWidget):
         self.send_z_changed.connect(partial(xyz_update, self._send_pellet_xyz, "z"))
         self.load_arm_changed.connect(lambda x: self._load_arm.setText(str(round(x, 1))))
         self.cover_arm_changed.connect(lambda x: self._cover_arm.setText(str(round(x, 1))))
+        app_model.hardware.property_changed += self._on_hardware_model_property_changed
+        self._update_tunnel_headfix_visibility(app_model.hardware.tunnel_headfix_enabled)
+
+    def _update_tunnel_headfix_visibility(self, is_enabled: bool):
+        self._tunnel_section_label.setVisible(is_enabled)
+        self._head_magnet_label.setVisible(is_enabled)
+        self._head_magnet.setVisible(is_enabled)
+
+    @invoke_method
+    def _on_hardware_model_property_changed(self, property_name: str, value, _):
+        if property_name == HardwareModel.TUNNEL_HEADFIX_ENABLED:
+            self._update_tunnel_headfix_visibility(value)
 
     @invoke_method
     def _model_property_changed(self, property_name: str, value, _):

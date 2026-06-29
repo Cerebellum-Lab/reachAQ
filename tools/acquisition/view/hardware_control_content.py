@@ -62,7 +62,8 @@ class HardwareControlContent(ContentWidget):
         layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight)
         layout.setSpacing(8)
 
-        layout.addWidget(QLabel("Tunnel:"))
+        self._tunnel_version_label = QLabel("Tunnel:")
+        layout.addWidget(self._tunnel_version_label)
         self._tunnel_version = QLabel("(unknown version)")
         layout.addWidget(self._tunnel_version)
 
@@ -84,7 +85,7 @@ class HardwareControlContent(ContentWidget):
         layout.setVerticalSpacing(4)
         layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
 
-        label = QLabel("<b>Tunnel</b>")
+        label = self._tunnel_section_label = QLabel("<b>Tunnel</b>")
         label.setAlignment(Qt.AlignCenter)
         layout.addWidget(label, 0, 0)
         vbox = QVBoxLayout()
@@ -124,12 +125,14 @@ class HardwareControlContent(ContentWidget):
         right_layout.setSpacing(4)
         right_layout.addWidget(self._head_magnet_position_spinbox)
         right_layout.addWidget(self._head_magnet_move_button)
-        form_layout.addRow("Head magnet intensity (%):", right_layout)
+        self._head_magnet_row_label = QLabel("Head magnet intensity (%):")
+        form_layout.addRow(self._head_magnet_row_label, right_layout)
 
         button = self._tare_button = QPushButton("Tare")
         add_cmd_widget(button)
         button.clicked.connect(lambda: log_hardware_cmd(self._hardware_model.tare_load_cell))
-        form_layout.addRow(QLabel("Load cell:"), self._tare_button)
+        self._load_cell_row_label = QLabel("Load cell:")
+        form_layout.addRow(self._load_cell_row_label, self._tare_button)
 
         layout.addLayout(form_layout, 1, 0)
 
@@ -266,6 +269,7 @@ class HardwareControlContent(ContentWidget):
         app_model.behavior.algorithm.property_changed += self._on_algo_property_changed
         app_model.property_changed += self._on_app_model_property_changed
         self._hardware_model.property_changed += self._on_hardware_model_property_changed
+        self._update_tunnel_headfix_visibility(self._hardware_model.tunnel_headfix_enabled)
 
     def _set_pos_limits(self):
         limits = self._travel_limits
@@ -338,6 +342,19 @@ class HardwareControlContent(ContentWidget):
         else:
             self._card_widget.header.setTitle("Hardware Control")
 
+    def _update_tunnel_headfix_visibility(self, is_enabled: bool):
+        for widget in (
+            self._tunnel_version_label,
+            self._tunnel_version,
+            self._tunnel_section_label,
+            self._head_magnet_row_label,
+            self._head_magnet_position_spinbox,
+            self._head_magnet_move_button,
+            self._load_cell_row_label,
+            self._tare_button,
+        ):
+            widget.setVisible(is_enabled)
+
     def set_commands_enabled(self, enabled: bool = True):
         for widget in self._commands_widgets:
             widget.setEnabled(enabled)
@@ -356,6 +373,9 @@ class HardwareControlContent(ContentWidget):
                 self._tunnel_version.setText(value.replace("emulator", "").strip())
             else:
                 self._tunnel_version.setText("(unknown version)")
+
+        elif property_name == HardwareModel.TUNNEL_HEADFIX_ENABLED:
+            self._update_tunnel_headfix_visibility(value)
 
         elif property_name == HardwareModel.PELLET_VERSION_PROPERTY:
             self._update_title(value)
