@@ -84,6 +84,7 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
         self._device_pellet_status_timeout_engaged = False
         self._device_tunnel_status_timeout_engaged = False
         self._device_stream_started = False
+        self._tunnel_headfix_enabled = False
 
         self._pending_tokens: Dict[UUID, Tuple[SystemCommandKind, float]] = {}
 
@@ -295,6 +296,9 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
         return self._head_magnet_position
 
     def update_head_magnet_intensity(self, value: Optional[float]) -> Optional[UUID]:
+        if not self._tunnel_headfix_enabled:
+            logger.debug("Skipping head magnet command because tunnel/headfix hardware is disabled")
+            return None
         if value is None:  # caller should not call instead eventually
             return
         if isinstance(value, str):
@@ -312,12 +316,21 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
         return self._tunnel_gate_open_status
 
     def open_tunnel_gate(self) -> Optional[UUID]:
+        if not self._tunnel_headfix_enabled:
+            logger.debug("Skipping open tunnel gate command because tunnel/headfix hardware is disabled")
+            return None
         return self._send_with_token(self._device_conn, SystemCommandKind.OPEN_TUNNEL_GATE)
 
     def close_tunnel_gate(self) -> Optional[UUID]:
+        if not self._tunnel_headfix_enabled:
+            logger.debug("Skipping close tunnel gate command because tunnel/headfix hardware is disabled")
+            return None
         return self._send_with_token(self._device_conn, SystemCommandKind.CLOSE_TUNNEL_GATE)
 
     def tare_load_cell(self) -> Optional[UUID]:
+        if not self._tunnel_headfix_enabled:
+            logger.debug("Skipping load-cell tare command because tunnel/headfix hardware is disabled")
+            return None
         return self._send_with_token(self._device_conn, SystemCommandKind.UPDATE_SCALE_TARE)
 
     def _set_axis(self, value: float, *, absolute: bool = True,
@@ -434,9 +447,15 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
         return self._send_with_token(self._device_conn, SystemCommandKind.DELAY, amount)
 
     def set_tunnel_fan_on(self) -> Optional[UUID]:
+        if not self._tunnel_headfix_enabled:
+            logger.debug("Skipping tunnel fan command because tunnel/headfix hardware is disabled")
+            return None
         return self._send_with_token(self._device_conn, SystemCommandKind.TUNNEL_FAN_ON)
 
     def set_tunnel_fan_off(self) -> Optional[UUID]:
+        if not self._tunnel_headfix_enabled:
+            logger.debug("Skipping tunnel fan command because tunnel/headfix hardware is disabled")
+            return None
         return self._send_with_token(self._device_conn, SystemCommandKind.TUNNEL_FAN_OFF)
 
     def set_color_led(self, r: int, g: int, b: int):
@@ -444,6 +463,7 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
         return self._send_with_token(self._device_conn, SystemCommandKind.SET_RGB_LED, (r, g, b))
 
     def load_config(self, config: HardwareConfiguration):
+        self._tunnel_headfix_enabled = config.tunnel_headfix_enabled
         self.set_device_ack_timeout(config.min_ack_timeout)
         self.set_board_status_timeout(config.board_status_timeout)
 
@@ -529,7 +549,10 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
         logger.success("STREAM_START acknowledged")
         self._device_stream_started = True
 
-        send_dev_cmd(SystemCommandKind.UPDATE_SCALE_TARE)
+        if self._tunnel_headfix_enabled:
+            send_dev_cmd(SystemCommandKind.UPDATE_SCALE_TARE)
+        else:
+            logger.debug("Skipping startup scale tare because tunnel/headfix hardware is disabled")
 
         prev_thread = self._check_timedout_commands_thread
         if prev_thread is None or not prev_thread.is_alive():
@@ -579,6 +602,9 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
             self.property_changed(self.DEVICE_PELLET_STATUS_TIMEOUT_ENGAGED, value, prev_value)
             is_dev_comm_err_possible = True
         elif name == props.TUNNEL_STATUS_TIMEOUT_ENGAGED:
+            if not self._tunnel_headfix_enabled:
+                logger.debug("Ignoring tunnel status timeout because tunnel/headfix hardware is disabled")
+                return
             post_api_detector_event_content(
                 self._event_manager,
                 ApiDetectorKind.tunnelStatusMessageInterruption,
@@ -599,6 +625,12 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
 
     def _message_handler_property_changed(self, name: str, value, old_value):
         props = MessageHandler
+        if not self._tunnel_headfix_enabled and name in {
+            props.HEAD_MAGNET_INTENSITY_PROPERTY,
+            props.HEAD_GATE_PROPERTY,
+            props.TUNNEL_GATE_OPEN_STATUS,
+        }:
+            return
         if name == props.HEAD_MAGNET_INTENSITY_PROPERTY:
             prev, self._head_magnet_position = self._head_magnet_position, value
             self._on_property_changed(self.HEAD_MAGNET_INTENSITY, value, prev)

@@ -2071,7 +2071,11 @@ class AppModel(ObservableObject):
         animal.to_file(dst)
 
     def _create_configuration(self) -> SystemConfiguration:
-        hardware_configuration = HardwareConfiguration(tunnel_identifier="CAN", pellet_identifier="CAN")
+        hardware_configuration = HardwareConfiguration(
+            tunnel_identifier="CAN",
+            pellet_identifier="CAN",
+            tunnel_headfix_enabled=False,
+        )
 
         cameras = []
         for camera in self._cameras:
