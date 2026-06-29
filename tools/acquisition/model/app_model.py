@@ -89,6 +89,7 @@ from tools.autotrainer_version import __version__ as app_version
 from tools.acquisition.model.helpers import get_config_location
 from tools.acquisition.model.hardware_model import HardwareModel
 from tools.acquisition.model.inference_model import InferenceModel
+from tools.acquisition.model.laser_model import LaserModel
 from tools.acquisition.model.behavior_model import BehaviorModel
 from tools.acquisition.model.user_preferences import UserPreferences, get_default_animals_location
 from tools.acquisition.model.video_capture_model import VideoCaptureModel
@@ -358,6 +359,7 @@ class AppModel(ObservableObject):
         self._system_message_handler.start()
 
         self._hardware = HardwareModel(self._system_message_handler, sensor_analysis=analysis)
+        self._laser = LaserModel()
 
         self._inference_queue = None
 
@@ -817,6 +819,10 @@ class AppModel(ObservableObject):
     @property
     def hardware(self) -> HardwareModel:
         return self._hardware
+
+    @property
+    def laser(self) -> LaserModel:
+        return self._laser
 
     @property
     def message_handler(self) -> SystemMessageHandler:
@@ -1459,6 +1465,10 @@ class AppModel(ObservableObject):
         for item in WatchdogItems:
             watchdog_mon_unregister(item)
 
+        try:
+            self._laser.close_all_shutters()
+        except Exception as err:
+            logger.exception("Failed to close laser shutters during capture stop: %s", err)
         self._inference.stop()
         self._hardware.disconnect()
 
@@ -1656,6 +1666,11 @@ class AppModel(ObservableObject):
 
         # ensure go back to IDLE mode + stop cameras & inference & analysis + hardware disconnect :
         self.capture_stop()
+
+        try:
+            self._laser.close()
+        except Exception as err:
+            logger.exception("Failed to close laser controller: %s", err)
 
         if self._inference is not None:
             # fully terminate inference, which keeps a background process alive between different stop/start
