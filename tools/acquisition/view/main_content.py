@@ -8,7 +8,7 @@ from PySide6 import QtCore
 from PySide6.QtCore import QTimer, Slot, Signal, Qt, QSize, QPoint, QPointF
 from PySide6.QtGui import QPixmap, QPainter, QPen, QPolygon, QPolygonF, QImage, QFont
 from PySide6.QtWidgets import QGridLayout, QHBoxLayout, QVBoxLayout, QStackedLayout, QWidget, QSizePolicy, QScrollBar, \
-    QScrollArea, QLayout
+    QScrollArea, QLayout, QSplitter, QTabWidget
 
 from autotrainer.core import AnimalSubject, ProjectInfo
 from autotrainer.core.logging import get_verbose_logger
@@ -33,6 +33,7 @@ from tools.acquisition.view.diagnostics_content import DiagnosticsContent
 from tools.acquisition.view.hardware_control_content import HardwareControlContent
 from tools.acquisition.view.hardware_status_content import HardwareStatusContent
 from tools.acquisition.view.laser_control_content import LaserControlContent
+from tools.acquisition.view.protocol_content import ProtocolContent
 from tools.acquisition.view.training_phase_content import TrainingPhaseContent
 from tools.acquisition.view.training_phase_progress_content import TrainingPhaseProgressContent
 from tools.acquisition.view.training_plan_content import TrainingPlanContent
@@ -62,8 +63,19 @@ class MainContent(ContentWidget):
 
         self.setContentsMargins(0, 0, 0, 0)
 
-        main_layout = self._main_layout = QVBoxLayout()
-        self.setLayout(main_layout)
+        root_layout = QHBoxLayout()
+        self.setLayout(root_layout)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+
+        self._main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        root_layout.addWidget(self._main_splitter)
+
+        left_content = self._left_content = QWidget()
+        left_content.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._main_splitter.addWidget(left_content)
+
+        main_layout = self._main_layout = QVBoxLayout(left_content)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(4)
 
@@ -130,6 +142,14 @@ class MainContent(ContentWidget):
         # Optional fourth row - diagnostics
         self._diagnostics_content = DiagnosticsContent(self._app_model)
         main_layout.addWidget(self._diagnostics_content)
+
+        self._right_side_tabs = self._create_right_side_tabs()
+        self._main_splitter.addWidget(self._right_side_tabs)
+        self._main_splitter.setCollapsible(0, False)
+        self._main_splitter.setCollapsible(1, True)
+        self._main_splitter.setStretchFactor(0, 1)
+        self._main_splitter.setStretchFactor(1, 0)
+        self._main_splitter.setSizes([1180, 430])
 
         self._frame_count = 0
         self._start = 0
@@ -235,15 +255,28 @@ class MainContent(ContentWidget):
         end_layout.addWidget(hardware_control_content)
         self._content_widgets.append(hardware_control_content)
 
-        laser_control_content = self._laser_control_content = LaserControlContent(self._app_model)
-        end_layout.addWidget(laser_control_content)
-        self._content_widgets.append(laser_control_content)
-
         hardware_status_content = self._hardware_status_content = HardwareStatusContent(self._app_model)
         end_layout.addWidget(hardware_status_content)
         self._content_widgets.append(hardware_status_content)
 
         return widget
+
+    def _create_right_side_tabs(self):
+        tabs = QTabWidget()
+        tabs.setObjectName("ReachAQRightSideTabs")
+        tabs.setDocumentMode(True)
+        tabs.setMinimumWidth(0)
+        tabs.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+
+        laser_control_content = self._laser_control_content = LaserControlContent(self._app_model)
+        tabs.addTab(laser_control_content, "Laser Control")
+        self._content_widgets.append(laser_control_content)
+
+        protocol_content = self._protocol_content = ProtocolContent()
+        tabs.addTab(protocol_content, "Protocol")
+        self._content_widgets.append(protocol_content)
+
+        return tabs
 
     def _create_protocol_phase_end_widget(self):
         widget = QWidget()

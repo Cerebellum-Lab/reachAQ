@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 
+import pyqtgraph as pg
 from PySide6.QtCore import QObject, QThread, Signal, Slot, Qt
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
-    QFormLayout,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -15,14 +15,16 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
     QSpinBox,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
 from autotrainer.core.logging import get_verbose_logger
 from autotrainer.device import LaserCalibrationRamp, LaserChannelConfiguration, LaserPulseTrain
-from autotrainer.pyside import CardWidget
+from autotrainer.pyside import CardWidget, PGWidget
 from autotrainer.pyside.content_widget import ContentWidget, invoke_method
 from tools.acquisition.model.app_model import AppModel
 from tools.acquisition.model.laser_model import LaserModel
@@ -49,42 +51,39 @@ class _LaserOperationWorker(QObject):
             self.failed.emit(message)
 
 
-class LaserControlContent(ContentWidget):
-    """Thin operator controls for the laser model."""
+class _LaserChannelTab(QWidget):
+    """Single-laser controls and pulse preview."""
 
-    def __init__(self, app_model: AppModel):
+    def __init__(
+        self,
+        app_model: AppModel,
+        channel: LaserChannelConfiguration,
+        sample_rate_hz: Optional[float],
+        start_operation: Callable[[str, Callable[[], object]], None],
+        set_status: Callable[[str, bool], None],
+    ):
         super().__init__()
 
         self._app_model = app_model
-        self._is_editable = True
-        self._is_capture_active = False
-        self._operation_thread: Optional[QThread] = None
-        self._operation_worker: Optional[_LaserOperationWorker] = None
+        self._channel = channel
+        self._sample_rate_hz = sample_rate_hz
+        self._start_operation = start_operation
+        self._set_parent_status = set_status
 
-        header_layout = QHBoxLayout()
-        header_layout.setContentsMargins(0, 0, 0, 0)
-        header_layout.setSpacing(8)
-        header_layout.addWidget(QLabel("Backend:"))
-        self._backend_label = QLabel("disabled")
-        header_layout.addWidget(self._backend_label)
-        header_layout.addWidget(QLabel("Rate:"))
-        self._sample_rate_label = QLabel("manual")
-        header_layout.addWidget(self._sample_rate_label)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
-        self._card_widget = CardWidget(title="Laser Control", header_right_layout=header_layout)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(8)
+        layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
-        content = QWidget()
-        layout = QVBoxLayout(content)
-        layout.setContentsMargins(8, 4, 8, 6)
-        layout.setSpacing(6)
-        layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-
-        selector_layout = QFormLayout()
-        selector_layout.setContentsMargins(0, 0, 0, 0)
-        selector_layout.setHorizontalSpacing(8)
-        self._channel_combo = QComboBox()
-        selector_layout.addRow("Channel:", self._channel_combo)
-        layout.addLayout(selector_layout)
+        sample_rate = "manual" if sample_rate_hz is None else f"{sample_rate_hz:g} Hz"
+        channel_label = QLabel(
+            f"Rate {sample_rate} | AO {channel.analog_output} | "
+            f"Diode {channel.diode_input} | Shutter {channel.shutter_output}"
+        )
+        channel_label.setWordWrap(True)
+        layout.addWidget(channel_label)
 
         pulse_group = QGroupBox("Pulse Train")
         pulse_layout = QGridLayout(pulse_group)
@@ -92,7 +91,7 @@ class LaserControlContent(ContentWidget):
         pulse_layout.setHorizontalSpacing(8)
         pulse_layout.setVerticalSpacing(4)
 
-        self._amplitude = self._make_voltage_spinbox()
+        self._amplitude = self._make_voltage_spinbox(channel)
         self._duration_ms = self._make_ms_spinbox(10.0)
         self._baseline_ms = self._make_ms_spinbox(0.0)
         self._post_stim_ms = self._make_ms_spinbox(0.0)
@@ -104,7 +103,7 @@ class LaserControlContent(ContentWidget):
         self._frequency_hz.setDecimals(3)
         self._frequency_hz.setValue(10.0)
         self._frequency_hz.setSuffix(" Hz")
-        self._trigger_source = QLineEdit()
+        self._trigger_source = QLineEdit(channel.trigger_source or "")
         self._trigger_source.setPlaceholderText("optional NI-DAQ trigger route")
         self._trigger_edge = QComboBox()
         self._trigger_edge.addItems(("rising", "falling"))
@@ -116,6 +115,7 @@ class LaserControlContent(ContentWidget):
         self._enable_pmt = QCheckBox("PMT shutter")
         self._emit_trigger = QCheckBox("Trigger DO")
         self._emit_timing_trigger = QCheckBox("Timing DO")
+        self._run_pulse_button = QPushButton("Run Pulse")
 
         pulse_layout.addWidget(QLabel("Amplitude:"), 0, 0)
         pulse_layout.addWidget(self._amplitude, 0, 1)
@@ -137,9 +137,22 @@ class LaserControlContent(ContentWidget):
         pulse_layout.addWidget(self._enable_pmt, 4, 2)
         pulse_layout.addWidget(self._emit_trigger, 5, 0)
         pulse_layout.addWidget(self._emit_timing_trigger, 5, 1)
-        self._run_pulse_button = QPushButton("Run Pulse")
         pulse_layout.addWidget(self._run_pulse_button, 5, 3)
         layout.addWidget(pulse_group)
+
+        self._preview_plot = PGWidget()
+        self._preview_plot.setMinimumHeight(150)
+        self._preview_plot.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._preview_plot.clear()
+        self._preview_plot.setBackground("w")
+        self._preview_plot.getAxis("bottom").setLabel("Time", units="s")
+        self._preview_plot.getAxis("left").setLabel("Command", units="V")
+        self._preview_plot.setMouseEnabled(x=False, y=False)
+        self._preview_curve = self._preview_plot.plot([], [], pen=pg.mkPen(color=(30, 90, 180), width=2))
+        self._preview_status = QLabel("")
+        self._preview_status.setWordWrap(True)
+        layout.addWidget(self._preview_plot, stretch=1)
+        layout.addWidget(self._preview_status)
 
         ramp_group = QGroupBox("Calibration Ramp")
         ramp_layout = QGridLayout(ramp_group)
@@ -147,8 +160,10 @@ class LaserControlContent(ContentWidget):
         ramp_layout.setHorizontalSpacing(8)
         ramp_layout.setVerticalSpacing(4)
 
-        self._ramp_start = self._make_voltage_spinbox()
-        self._ramp_stop = self._make_voltage_spinbox()
+        self._ramp_start = self._make_voltage_spinbox(channel)
+        self._ramp_start.setValue(channel.minimum_command_volts)
+        self._ramp_stop = self._make_voltage_spinbox(channel)
+        self._ramp_stop.setValue(channel.maximum_command_volts)
         self._ramp_steps = QSpinBox()
         self._ramp_steps.setRange(2, 10000)
         self._ramp_steps.setValue(11)
@@ -170,29 +185,7 @@ class LaserControlContent(ContentWidget):
         ramp_layout.addWidget(self._run_ramp_button, 2, 3)
         layout.addWidget(ramp_group)
 
-        footer = QWidget()
-        footer_layout = QHBoxLayout(footer)
-        footer_layout.setContentsMargins(0, 0, 0, 0)
-        footer_layout.setSpacing(8)
-        self._progress = QProgressBar()
-        self._progress.setRange(0, 0)
-        self._progress.setVisible(False)
-        self._status_label = QLabel("Laser controller not configured")
-        footer_layout.addWidget(self._progress)
-        footer_layout.addWidget(self._status_label, stretch=1)
-
-        self._card_widget.setContentWidget(content)
-        self._card_widget.footer.setContent(footer)
-
-        root_layout = QVBoxLayout()
-        root_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-        root_layout.setContentsMargins(0, 0, 0, 0)
-        root_layout.setSpacing(0)
-        root_layout.addWidget(self._card_widget)
-        self.setLayout(root_layout)
-
-        self._controls = (
-            self._channel_combo,
+        self._pulse_controls = (
             self._amplitude,
             self._duration_ms,
             self._baseline_ms,
@@ -206,6 +199,8 @@ class LaserControlContent(ContentWidget):
             self._enable_pmt,
             self._emit_trigger,
             self._emit_timing_trigger,
+        )
+        self._ramp_controls = (
             self._ramp_start,
             self._ramp_stop,
             self._ramp_steps,
@@ -213,20 +208,23 @@ class LaserControlContent(ContentWidget):
             self._ramp_pmt,
         )
 
-        self._channel_combo.currentIndexChanged.connect(self._selected_channel_changed)
         self._run_pulse_button.clicked.connect(self._run_pulse)
         self._run_ramp_button.clicked.connect(self._run_calibration_ramp)
-        app_model.laser.property_changed += self._on_laser_property_changed
+        self._connect_preview_signals()
+        self._refresh_preview()
 
-        self._refresh_from_model()
+    @property
+    def channel_id_value(self) -> int:
+        return int(self._channel.channel_id)
 
     @staticmethod
-    def _make_voltage_spinbox() -> QDoubleSpinBox:
+    def _make_voltage_spinbox(channel: LaserChannelConfiguration) -> QDoubleSpinBox:
         spinbox = QDoubleSpinBox()
         spinbox.setDecimals(3)
         spinbox.setSingleStep(0.050)
         spinbox.setSuffix(" V")
-        spinbox.setRange(0.0, 10.0)
+        spinbox.setRange(channel.minimum_command_volts, channel.maximum_command_volts)
+        spinbox.setValue(channel.minimum_command_volts)
         return spinbox
 
     @staticmethod
@@ -239,70 +237,80 @@ class LaserControlContent(ContentWidget):
         spinbox.setValue(value)
         return spinbox
 
-    @invoke_method
-    def _on_laser_property_changed(self, property_name: str, _value, _old_value):
-        if property_name in (LaserModel.CONFIGURATION, LaserModel.IS_CONNECTED):
-            self._refresh_from_model()
+    def _connect_preview_signals(self) -> None:
+        for spinbox in (
+            self._amplitude,
+            self._duration_ms,
+            self._baseline_ms,
+            self._post_stim_ms,
+            self._pulse_count,
+            self._frequency_hz,
+        ):
+            spinbox.valueChanged.connect(self._refresh_preview)
+        self._trigger_source.textChanged.connect(self._refresh_preview)
+        self._trigger_edge.currentTextChanged.connect(self._refresh_preview)
+        for checkbox in (
+            self._open_shutter,
+            self._close_shutter,
+            self._enable_pmt,
+            self._emit_trigger,
+            self._emit_timing_trigger,
+        ):
+            checkbox.toggled.connect(self._refresh_preview)
 
-    def _refresh_from_model(self) -> None:
-        configuration = self._app_model.laser.configuration
-        current = self._selected_channel_value()
-        self._backend_label.setText(configuration.backend)
-        if configuration.sample_rate_hz is None:
-            self._sample_rate_label.setText("manual")
-        else:
-            self._sample_rate_label.setText(f"{configuration.sample_rate_hz:g} Hz")
-
-        self._channel_combo.blockSignals(True)
-        self._channel_combo.clear()
-        for channel in configuration.channels:
-            self._channel_combo.addItem(f"Laser {channel.channel_id.value}", int(channel.channel_id))
-        if current is not None:
-            index = self._channel_combo.findData(current)
-            if index >= 0:
-                self._channel_combo.setCurrentIndex(index)
-        self._channel_combo.blockSignals(False)
-        self._selected_channel_changed()
-        self._update_enabled_state()
-
-    def _selected_channel_value(self) -> Optional[int]:
-        data = self._channel_combo.currentData()
-        return None if data is None else int(data)
-
-    def _selected_channel(self) -> Optional[LaserChannelConfiguration]:
-        channel_id = self._selected_channel_value()
-        if channel_id is None:
-            return None
-        for channel in self._app_model.laser.configuration.channels:
-            if int(channel.channel_id) == channel_id:
-                return channel
-        return None
-
-    def _selected_channel_changed(self, *_args) -> None:
-        channel = self._selected_channel()
-        if channel is None:
-            self._set_status("Laser controller not configured", is_error=False)
-            return
-        minimum = channel.minimum_command_volts
-        maximum = channel.maximum_command_volts
-        for spinbox in (self._amplitude, self._ramp_start, self._ramp_stop):
-            spinbox.setRange(minimum, maximum)
-        self._amplitude.setValue(min(max(self._amplitude.value(), minimum), maximum))
-        self._ramp_start.setValue(minimum)
-        self._ramp_stop.setValue(maximum)
-        self._trigger_source.setText(channel.trigger_source or "")
-        self._set_status(f"Ready: laser {channel.channel_id.value}", is_error=False)
+    def set_controls_enabled(self, ready: bool, can_run_ramp: bool) -> None:
+        for control in self._pulse_controls:
+            control.setEnabled(ready)
+        self._run_pulse_button.setEnabled(ready)
+        for control in self._ramp_controls:
+            control.setEnabled(can_run_ramp)
+        self._run_ramp_button.setEnabled(can_run_ramp)
 
     def _run_pulse(self) -> None:
-        channel = self._selected_channel()
-        if channel is None:
-            self._set_status("No laser channel is configured", is_error=True)
+        try:
+            pulse_train = self._build_pulse_train()
+            self._validate_pulse_train(pulse_train)
+        except Exception as exc:
+            self._set_parent_status(str(exc) or exc.__class__.__name__, True)
             return
+
+        def operation():
+            self._app_model.laser.run_pulse_train(pulse_train)
+            return f"Pulse complete: laser {self._channel.channel_id.value}"
+
+        self._start_operation(f"Running laser {self._channel.channel_id.value} pulse train", operation)
+
+    def _run_calibration_ramp(self) -> None:
+        try:
+            ramp = LaserCalibrationRamp(
+                channel_id=self._channel.channel_id,
+                start_volts=self._ramp_start.value(),
+                stop_volts=self._ramp_stop.value(),
+                steps=self._ramp_steps.value(),
+                samples_per_step=self._ramp_samples_per_step.value(),
+                enable_pmt_shutter=self._ramp_pmt.isChecked(),
+            )
+        except Exception as exc:
+            self._set_parent_status(str(exc) or exc.__class__.__name__, True)
+            return
+
+        def operation():
+            points = self._app_model.laser.run_calibration_ramp(ramp)
+            self._app_model.laser.make_diode_power_curve(points)
+            last = points[-1]
+            return (
+                f"Ramp complete: {len(points)} points, last diode {last.diode_volts:.3f} V, "
+                "monotonic curve validated"
+            )
+
+        self._start_operation(f"Running laser {self._channel.channel_id.value} calibration ramp", operation)
+
+    def _build_pulse_train(self) -> LaserPulseTrain:
         pulse_count = self._pulse_count.value()
         frequency_hz = self._frequency_hz.value() if pulse_count > 1 else None
         trigger_source = self._trigger_source.text().strip() or None
-        pulse_train = LaserPulseTrain(
-            channel_id=channel.channel_id,
+        return LaserPulseTrain(
+            channel_id=self._channel.channel_id,
             amplitude_volts=self._amplitude.value(),
             duration_ms=self._duration_ms.value(),
             baseline_ms=self._baseline_ms.value(),
@@ -318,36 +326,196 @@ class LaserControlContent(ContentWidget):
             emit_timing_trigger_output=self._emit_timing_trigger.isChecked(),
         )
 
-        def operation():
-            self._app_model.laser.run_pulse_train(pulse_train)
-            return f"Pulse complete: laser {channel.channel_id.value}"
+    def _validate_pulse_train(self, pulse_train: LaserPulseTrain) -> None:
+        minimum = self._channel.minimum_command_volts
+        maximum = self._channel.maximum_command_volts
+        if not minimum <= pulse_train.amplitude_volts <= maximum:
+            raise ValueError(
+                f"laser channel {self._channel.channel_id.value} command "
+                f"{pulse_train.amplitude_volts} V is outside {minimum}..{maximum} V"
+            )
+        if pulse_train.pulse_count > 1:
+            period_ms = 1000.0 / pulse_train.frequency_hz
+            if pulse_train.duration_ms > period_ms:
+                raise ValueError(
+                    f"laser pulse duration {pulse_train.duration_ms:g} ms exceeds pulse period "
+                    f"{period_ms:g} ms at {pulse_train.frequency_hz:g} Hz"
+                )
 
-        self._start_operation("Running laser pulse train", operation)
-
-    def _run_calibration_ramp(self) -> None:
-        channel = self._selected_channel()
-        if channel is None:
-            self._set_status("No laser channel is configured", is_error=True)
+    def _refresh_preview(self, *_args) -> None:
+        try:
+            pulse_train = self._build_pulse_train()
+            self._validate_pulse_train(pulse_train)
+            x_values, y_values = self._build_preview_points(pulse_train)
+        except Exception as exc:
+            self._preview_curve.setData([], [])
+            self._preview_plot.setVisible(False)
+            self._preview_status.setText(str(exc) or exc.__class__.__name__)
+            self._preview_status.setStyleSheet("color: #b00020;")
             return
-        ramp = LaserCalibrationRamp(
-            channel_id=channel.channel_id,
-            start_volts=self._ramp_start.value(),
-            stop_volts=self._ramp_stop.value(),
-            steps=self._ramp_steps.value(),
-            samples_per_step=self._ramp_samples_per_step.value(),
-            enable_pmt_shutter=self._ramp_pmt.isChecked(),
+        self._preview_curve.setData(x_values, y_values)
+        self._preview_plot.setVisible(True)
+        self._preview_status.setText("")
+        self._preview_status.setStyleSheet("")
+        max_x = max(x_values[-1], 0.001)
+        span = max(self._channel.maximum_command_volts - self._channel.minimum_command_volts, 1.0)
+        self._preview_plot.setXRange(0.0, max_x, padding=0.02)
+        self._preview_plot.setYRange(
+            self._channel.minimum_command_volts - span * 0.05,
+            self._channel.maximum_command_volts + span * 0.05,
+            padding=0.0,
         )
 
-        def operation():
-            points = self._app_model.laser.run_calibration_ramp(ramp)
-            self._app_model.laser.make_diode_power_curve(points)
-            last = points[-1]
-            return (
-                f"Ramp complete: {len(points)} points, last diode {last.diode_volts:.3f} V, "
-                "monotonic curve validated"
-            )
+    def _build_preview_points(self, pulse_train: LaserPulseTrain) -> Tuple[list, list]:
+        minimum = self._channel.minimum_command_volts
+        amplitude = pulse_train.amplitude_volts
+        duration_s = pulse_train.duration_ms / 1000.0
+        baseline_s = pulse_train.baseline_ms / 1000.0
+        post_stim_s = pulse_train.post_stim_ms / 1000.0
+        period_s = (1.0 / pulse_train.frequency_hz) if pulse_train.frequency_hz is not None else duration_s
 
-        self._start_operation("Running laser calibration ramp", operation)
+        x_values = [0.0]
+        y_values = [minimum]
+        current_t = 0.0
+
+        def horizontal(to_t: float) -> None:
+            nonlocal current_t
+            if to_t <= current_t:
+                return
+            x_values.append(to_t)
+            y_values.append(y_values[-1])
+            current_t = to_t
+
+        def transition(value: float) -> None:
+            x_values.append(current_t)
+            y_values.append(y_values[-1])
+            x_values.append(current_t)
+            y_values.append(value)
+
+        horizontal(baseline_s)
+        for pulse_index in range(pulse_train.pulse_count):
+            pulse_start = baseline_s + pulse_index * period_s
+            horizontal(pulse_start)
+            transition(amplitude)
+            horizontal(pulse_start + duration_s)
+            transition(minimum)
+        horizontal(current_t + post_stim_s)
+        return x_values, y_values
+
+
+class LaserControlContent(ContentWidget):
+    """Thin operator controls for the laser model."""
+
+    def __init__(self, app_model: AppModel):
+        super().__init__()
+
+        self._app_model = app_model
+        self._is_editable = True
+        self._is_capture_active = False
+        self._operation_thread: Optional[QThread] = None
+        self._operation_worker: Optional[_LaserOperationWorker] = None
+        self._channel_tabs: Tuple[_LaserChannelTab, ...] = tuple()
+
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+        header_layout = QHBoxLayout()
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(8)
+        header_layout.addWidget(QLabel("Backend:"))
+        self._backend_label = QLabel("disabled")
+        header_layout.addWidget(self._backend_label)
+        header_layout.addWidget(QLabel("Rate:"))
+        self._sample_rate_label = QLabel("manual")
+        header_layout.addWidget(self._sample_rate_label)
+
+        self._card_widget = CardWidget(title="Laser Control", header_right_layout=header_layout)
+        self._card_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+        self._tabs = QTabWidget()
+        self._tabs.setDocumentMode(True)
+        self._tabs.setUsesScrollButtons(True)
+        self._tabs.setMinimumWidth(0)
+        self._tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._card_widget.setContentWidget(self._tabs)
+
+        footer = QWidget()
+        footer_layout = QHBoxLayout(footer)
+        footer_layout.setContentsMargins(0, 0, 0, 0)
+        footer_layout.setSpacing(8)
+        self._progress = QProgressBar()
+        self._progress.setRange(0, 0)
+        self._progress.setVisible(False)
+        self._status_label = QLabel("Laser controller not configured")
+        footer_layout.addWidget(self._progress)
+        footer_layout.addWidget(self._status_label, stretch=1)
+        self._card_widget.footer.setContent(footer)
+
+        root_layout = QVBoxLayout()
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+        root_layout.addWidget(self._card_widget, stretch=1)
+        self.setLayout(root_layout)
+
+        app_model.laser.property_changed += self._on_laser_property_changed
+        self._refresh_from_model()
+
+    @invoke_method
+    def _on_laser_property_changed(self, property_name: str, _value, _old_value):
+        if property_name in (LaserModel.CONFIGURATION, LaserModel.IS_CONNECTED):
+            self._refresh_from_model()
+
+    def _refresh_from_model(self) -> None:
+        configuration = self._app_model.laser.configuration
+        current = self._current_channel_id()
+        self._backend_label.setText(configuration.backend)
+        if configuration.sample_rate_hz is None:
+            self._sample_rate_label.setText("manual")
+        else:
+            self._sample_rate_label.setText(f"{configuration.sample_rate_hz:g} Hz")
+
+        self._clear_tabs()
+        tabs = []
+        for channel in configuration.channels:
+            tab = _LaserChannelTab(
+                self._app_model,
+                channel,
+                configuration.sample_rate_hz,
+                self._start_operation,
+                self._set_status_from_tab,
+            )
+            self._tabs.addTab(tab, f"Laser {channel.channel_id.value}")
+            tabs.append(tab)
+        if not tabs:
+            empty = QWidget()
+            empty.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            self._tabs.addTab(empty, "No lasers")
+        self._channel_tabs = tuple(tabs)
+        if current is not None:
+            for index, tab in enumerate(self._channel_tabs):
+                if tab.channel_id_value == current:
+                    self._tabs.setCurrentIndex(index)
+                    break
+        if self._channel_tabs:
+            self._set_status(f"Ready: {len(self._channel_tabs)} configured laser(s)", is_error=False)
+        else:
+            self._set_status("Laser controller not configured", is_error=False)
+        self._update_enabled_state()
+
+    def _clear_tabs(self) -> None:
+        while self._tabs.count():
+            widget = self._tabs.widget(0)
+            self._tabs.removeTab(0)
+            widget.deleteLater()
+        self._channel_tabs = tuple()
+
+    def _current_channel_id(self) -> Optional[int]:
+        widget = self._tabs.currentWidget()
+        if isinstance(widget, _LaserChannelTab):
+            return widget.channel_id_value
+        return None
+
+    def _set_status_from_tab(self, message: str, is_error: bool) -> None:
+        self._set_status(message, is_error=is_error)
 
     def _start_operation(self, status: str, operation: Callable[[], object]) -> None:
         if self._operation_thread is not None:
@@ -401,12 +569,9 @@ class LaserControlContent(ContentWidget):
     def _update_enabled_state(self, *, is_running: Optional[bool] = None) -> None:
         if is_running is None:
             is_running = self._operation_thread is not None
-        has_channel = self._selected_channel() is not None
-        ready = self._is_editable and self._app_model.laser.is_connected and has_channel and not is_running
-        for control in self._controls:
-            control.setEnabled(ready)
-        self._run_pulse_button.setEnabled(ready)
-        self._run_ramp_button.setEnabled(ready and not self._is_capture_active)
+        ready = self._is_editable and self._app_model.laser.is_connected and not is_running
+        for tab in self._channel_tabs:
+            tab.set_controls_enabled(ready, ready and not self._is_capture_active)
 
     @invoke_method
     def set_is_editable(self, is_editable: bool):
