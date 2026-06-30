@@ -89,6 +89,7 @@ from tools.acquisition.model.helpers import get_config_location
 from tools.acquisition.model.hardware_model import HardwareModel
 from tools.acquisition.model.inference_model import InferenceModel
 from tools.acquisition.model.laser_model import LaserModel
+from tools.acquisition.model.nidaq_signal_monitor_model import NidaqSignalMonitorModel
 from tools.acquisition.model.behavior_model import BehaviorModel
 from tools.acquisition.model.user_preferences import UserPreferences, get_default_animals_location
 from tools.acquisition.model.video_capture_model import VideoCaptureModel
@@ -367,6 +368,7 @@ class AppModel(ObservableObject):
 
         self._hardware = HardwareModel(self._system_message_handler, sensor_analysis=analysis)
         self._laser = LaserModel()
+        self._nidaq_signal_monitor = NidaqSignalMonitorModel()
 
         self._inference_queue = None
 
@@ -401,6 +403,7 @@ class AppModel(ObservableObject):
             self._top_camera,
             self._inference,
             self._behavior,
+            self._nidaq_signal_monitor,
         ]
 
         self._animals: List[AnimalSubject] = []
@@ -835,6 +838,10 @@ class AppModel(ObservableObject):
     @property
     def laser(self) -> LaserModel:
         return self._laser
+
+    @property
+    def nidaq_signal_monitor(self) -> NidaqSignalMonitorModel:
+        return self._nidaq_signal_monitor
 
     @property
     def message_handler(self) -> SystemMessageHandler:
@@ -1586,6 +1593,7 @@ class AppModel(ObservableObject):
         self._hardware.load_config(configuration.hardware)
         self.inference.load_configuration(configuration.inference)
         self.laser.load_configuration(configuration.laser)
+        self.nidaq_signal_monitor.load_configuration(configuration.nidaq_stream)
         self.behavior.load_configuration(configuration.behavior)
 
         self._analysis.watchdog_monitor.config = configuration.watchdog
@@ -1679,6 +1687,11 @@ class AppModel(ObservableObject):
             self._laser.close()
         except Exception as err:
             logger.exception("Failed to close laser controller: %s", err)
+
+        try:
+            self._nidaq_signal_monitor.close()
+        except Exception as err:
+            logger.exception("Failed to close NI-DAQ signal monitor: %s", err)
 
         if self._inference is not None:
             # fully terminate inference, which keeps a background process alive between different stop/start
@@ -2090,6 +2103,7 @@ class AppModel(ObservableObject):
                                             hardware=hardware_configuration,
                                             inference=self._inference.save_configuration(),
                                             laser=self._laser.save_configuration(),
+                                            nidaq_stream=self._nidaq_signal_monitor.save_configuration(),
                                             behavior=self._behavior.save_configuration(),
                                             persistence=PersistenceConfiguration(output_location=self.output_location))
 

@@ -3,7 +3,7 @@
 # CAN transport is configured through reachaq_hardware.env.example because the current CAN runtime reads environment.
 
 !SystemConfiguration
-version: 53
+version: 54
 cameras:
 - !CameraConfiguration
   id: 0
@@ -96,6 +96,58 @@ laser: !LaserSystemConfiguration
     maximumCommandVolts: 5.0
     feedbackScale: 1.0
     commandCopyScale: 1.0
+nidaqStream: !NidaqSignalStreamConfiguration
+  # This monitor is for operator-visible rolling input checks and acquisition-side CSV signal copies.
+  # Use actual AI/DI input lines from the bench NI-DAQ channel map.
+  isEnabled: false
+  sampleRateHz: 1000.0
+  readChunkSize: 100
+  rollingWindowSeconds: 10.0
+  recordToAcquisition: true
+  outputName: nidaq_signals
+  channels:
+  - !NidaqSignalChannelConfiguration
+    name: laser1_diode
+    physicalChannel: Dev1/ai0
+    kind: analog
+    unit: V
+    minimum: -10.0
+    maximum: 10.0
+  - !NidaqSignalChannelConfiguration
+    name: laser1_command_copy
+    physicalChannel: Dev1/ai1
+    kind: analog
+    unit: V
+    minimum: -10.0
+    maximum: 10.0
+  - !NidaqSignalChannelConfiguration
+    name: laser2_diode
+    physicalChannel: Dev1/ai2
+    kind: analog
+    unit: V
+    minimum: -10.0
+    maximum: 10.0
+  - !NidaqSignalChannelConfiguration
+    name: laser2_command_copy
+    physicalChannel: Dev1/ai3
+    kind: analog
+    unit: V
+    minimum: -10.0
+    maximum: 10.0
+  - !NidaqSignalChannelConfiguration
+    name: trigger_feedback
+    physicalChannel: Dev1/port1/line1
+    kind: digital
+    unit: logic
+    minimum: 0.0
+    maximum: 1.0
+  - !NidaqSignalChannelConfiguration
+    name: shutter_feedback
+    physicalChannel: Dev1/port1/line2
+    kind: digital
+    unit: logic
+    minimum: 0.0
+    maximum: 1.0
 behavior: !BehaviorConfiguration
   pelletDelivery: !PelletDeliveryConfiguration
     isEnabled: false

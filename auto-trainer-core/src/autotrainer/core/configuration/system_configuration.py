@@ -23,6 +23,7 @@ from .camera_configuration import CameraConfiguration, CameraId
 from .hardware_configuration import HardwareConfiguration
 from .inference_configuration import InferenceConfiguration
 from .laser_configuration import LaserChannelConfiguration, LaserSystemConfiguration
+from .nidaq_stream_configuration import NidaqSignalChannelConfiguration, NidaqSignalStreamConfiguration
 from .persistence_configuration import PersistenceConfiguration
 from ..project.project_info import DATE_FORMAT, TIME_FORMAT
 
@@ -43,12 +44,13 @@ class SystemConfiguration:
 
     DEFAULT_PATH: ClassVar[Path] = DEFAULT_CONFIG_DIR.joinpath(f"{DEFAULT_NAME}.yaml")  # caller/user must expanduser() on it
 
-    version: int = 53
+    version: int = 54
 
     cameras: List[CameraConfiguration] = field(default_factory=list)
     hardware: HardwareConfiguration = field(default_factory=HardwareConfiguration)
     inference: InferenceConfiguration = field(default_factory=InferenceConfiguration)
     laser: LaserSystemConfiguration = field(default_factory=LaserSystemConfiguration)
+    nidaq_stream: NidaqSignalStreamConfiguration = field(default_factory=NidaqSignalStreamConfiguration)
     behavior: BehaviorConfiguration = field(default_factory=BehaviorConfiguration)
     persistence: PersistenceConfiguration = field(default_factory=PersistenceConfiguration)
     watchdog: WatchdogConfig = field(default_factory=WatchdogConfig)
@@ -221,6 +223,8 @@ _tag_2_cls = dict(
     InferenceConfiguration=InferenceConfiguration,
     LaserChannelConfiguration=LaserChannelConfiguration,
     LaserSystemConfiguration=LaserSystemConfiguration,
+    NidaqSignalChannelConfiguration=NidaqSignalChannelConfiguration,
+    NidaqSignalStreamConfiguration=NidaqSignalStreamConfiguration,
     WatchdogConfig=WatchdogConfig,
     AlarmDetectorConfig=AlarmDetectorConfig,
     AnimalEvasionAlarmConfig=AnimalEvasionAlarmConfig,

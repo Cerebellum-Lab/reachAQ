@@ -214,11 +214,7 @@ class MainContent(ContentWidget):
         self._content_widgets.append(behavior_content)
 
         self._analysis_content = AnalysisContent(
-            app_model.hardware,
-            app_model.inference,
-            app_model.analysis,
-            app_model.message_handler,
-            app_model.preferences,
+            app_model.nidaq_signal_monitor,
         )
         mid_layout.addWidget(self._analysis_content, 1)
         self._content_widgets.append(self._analysis_content)

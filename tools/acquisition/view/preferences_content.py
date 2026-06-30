@@ -20,7 +20,6 @@ from autotrainer.pyside import QSwitch
 
 from tools.acquisition.model.app_model import AppModel
 from tools.acquisition.model.user_preferences import UserPreferences
-from tools.acquisition.view.analysis_content import AVAILABLE_GRAPHS
 
 logger = get_verbose_logger(__name__)
 
@@ -77,9 +76,6 @@ class PreferencesContent(QWidget):
 
         self._behavior_tab = self._create_behavior_tab()
         tabs.addTab(self._behavior_tab, "Behavior")
-
-        self._analysis_tab = self._create_analysis_tab()
-        tabs.addTab(self._analysis_tab, "Analysis")
 
         self._advanced_tab = self._create_advanced_tab()
         tabs.addTab(self._advanced_tab, "Advanced")
@@ -859,32 +855,6 @@ class PreferencesContent(QWidget):
         tab = QWidget()
         tab.setLayout(main_layout)
         apply_size_policy(tab, (QSwitch, QSpinBox, QDoubleSpinBox))
-
-        return tab
-
-    def _on_graph_combox_changed(self, idx: int):
-        graph = self._measurement_graph_combo.itemData(idx)
-        if graph is not None:
-            self._preferences.measurement_graph = graph.name
-        else:
-            logger.warning("graph None")
-
-    def _create_analysis_tab(self):
-        form_layout = QFormLayout(None)
-        combo = self._measurement_graph_combo = QComboBox()
-
-        pref_graph_name = self._preferences.measurement_graph
-        for idx, graph in enumerate(AVAILABLE_GRAPHS):
-            combo.addItem(graph.display, graph)
-            if graph.name == pref_graph_name:
-                combo.setCurrentIndex(idx)
-
-        combo.currentIndexChanged.connect(self._on_graph_combox_changed)
-
-        form_layout.addRow("Measurement graph:", combo)
-
-        tab = QWidget(None)
-        tab.setLayout(form_layout)
 
         return tab
 

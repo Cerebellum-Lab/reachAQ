@@ -23,3 +23,4 @@ from .laser import (LaserCalibrationPoint, LaserCalibrationRamp, LaserChannelCon
                     LaserSynchronizedPulseTrain, LaserSystemConfiguration, NullLaserController,
                     normalize_laser_channel_id)
 from .nidaq_laser import NidaqLaserController
+from .nidaq_signal_stream import NidaqSignalSampleBlock, NidaqSignalStreamController

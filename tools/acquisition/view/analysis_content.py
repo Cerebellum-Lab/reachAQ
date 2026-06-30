@@ -1,322 +1,229 @@
-import dataclasses
+from __future__ import annotations
 
-from typing import Tuple, Optional, Dict, List
+from typing import Dict, List, Tuple
 
-from PySide6.QtCore import Signal, Qt
-from PySide6.QtWidgets import QLabel, QLineEdit, QWidget, QVBoxLayout, QHBoxLayout, QSizePolicy, QStackedLayout, \
-    QDoubleSpinBox, QComboBox
+import pyqtgraph as pg
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QSizePolicy, QVBoxLayout, QWidget
 
+from autotrainer.core import NidaqSignalChannelConfiguration, NidaqSignalStreamConfiguration
 from autotrainer.core.logging import get_verbose_logger
-from autotrainer.core import PerfMonitor, SensorAnalysis, LoadCellMonitor, Offset3DTuple, SystemMessageHandler
-from autotrainer.pyside import PGWidget, CardWidget, QtIndicator
-from autotrainer.pyside.StackedContent import StackedLayout
+from autotrainer.device import NidaqSignalSampleBlock
+from autotrainer.pyside import CardWidget, PGWidget
 from autotrainer.pyside.content_widget import ContentWidget, invoke_method
-
-from tools.acquisition.model.hardware_model import HardwareModel
-from tools.acquisition.model.inference_model import InferenceModel
-from tools.acquisition.model.user_preferences import UserPreferences
+from tools.acquisition.model.nidaq_signal_monitor_model import NidaqSignalMonitorModel
 
 
 logger = get_verbose_logger(__name__)
 
 _GRAY_COLOR_TUPLE = (240, 240, 240)
-
-_ACTIVE_LOAD_CELL_COLOR = (0, 250, 154)
-_INACTIVE_LOAD_CELL_COLOR = _GRAY_COLOR_TUPLE
-
-
-def _render_offset_3d_value(value: Optional[Offset3DTuple]) -> str:
-    return "n/a" if value is None else ", ".join(f"{coord:.1f}" for coord in value)
-
-
-@dataclasses.dataclass
-class _GraphItem:
-    measure_idx: int  # correspond to index in tuple pass to measurement received callback
-    name: str
-    display: str
-    unit: str
-    y_range: Tuple[int, int]
-    x_range: Optional[Tuple[int, int]] = None
-    ticks: Optional[List[Tuple[int, str]]] = None
-
-
-_weight_graph = _GraphItem(
-    measure_idx=0,
-    name="weight",
-    display="Weight",
-    unit="gr",
-    y_range=(-1, 101),
-)
-_audio_graph = _GraphItem(
-    measure_idx=-1,
-    name="audio",
-    display="Audio",
-    unit="dB",
-    y_range=(0, 200), x_range=(0, 64),
-    ticks=[(i, str(i * 1500)) for i in range(0, 64, 10)],
+_PLOT_COLORS = (
+    (30, 90, 180),
+    (210, 80, 70),
+    (50, 150, 90),
+    (180, 120, 30),
+    (135, 85, 170),
+    (70, 160, 180),
+    (80, 80, 80),
+    (190, 70, 130),
 )
 
-# NB: same order than SensorAnalysis.measurements_received method
-AVAILABLE_GRAPHS = (
-    _weight_graph,
-    _GraphItem(
-        measure_idx=1, name="switch", display="Switch", unit="1/0", y_range=(-1, 2)),
-    _GraphItem(measure_idx=2, name="pressure", display="Pressure", unit="Cnts", y_range=(-1, 4099)),
-    _GraphItem(measure_idx=3, name="temperature", display="Temperature", unit="\u00b0C", y_range=(-1, 40)),
-    _GraphItem(measure_idx=4, name="humidity", display="Humidity", unit="%", y_range=(-1, 101)),
-    _audio_graph,
-)
 
-_graph_by_name = {
-    graph.name: graph
-    for graph in AVAILABLE_GRAPHS
-}
+class _NidaqRollingPlot(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self._plot = PGWidget(self)
+        self._plot.clear()
+        self._plot.setBackground("w")
+        self._plot.getPlotItem().getViewBox().setBackgroundColor(_GRAY_COLOR_TUPLE)
+        self._plot.getAxis("bottom").setLabel("Time (s)")
+        self._plot.getAxis("left").setLabel("Signal")
+        self._legend = self._plot.addLegend(offset=(-8, 8))
+        layout.addWidget(self._plot)
 
+        self._configuration = NidaqSignalStreamConfiguration()
+        self._curves: Dict[str, object] = {}
+        self._x_values: Dict[str, List[float]] = {}
+        self._y_values: Dict[str, List[float]] = {}
+        self._latest_x = 0.0
 
-def _make_graph_plot(graph: _GraphItem):
-    widget = QWidget()
-    widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-    layout = QHBoxLayout()
-    plot = PGWidget(widget)
-    plot.setBackground("w")
-    plot.setMinimumHeight(140)
-    plot.scale_x = 100.0
-    if graph.ticks is None:
-        plot.getAxis("bottom").setLabel("Time (s)")
-    else:
-        plot.getAxis('bottom').setTicks([graph.ticks])
-    plot.getAxis("left").setLabel(f"{graph.display} ({graph.unit})")
-    view_box = plot.getViewBox()
-    if graph.x_range is not None:
-        view_box.setRange(xRange=graph.x_range)
-    view_box.setRange(yRange=graph.y_range)
-    layout.addWidget(plot, alignment=Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-    widget.setLayout(layout)
-    plot.widget = widget
-    plot.getPlotItem().getViewBox().setBackgroundColor(_GRAY_COLOR_TUPLE)
-    return plot
+    def configure(self, configuration: NidaqSignalStreamConfiguration) -> None:
+        self._configuration = configuration
+        self._plot.clear()
+        self._legend = self._plot.addLegend(offset=(-8, 8))
+        self._curves.clear()
+        self._x_values.clear()
+        self._y_values.clear()
+        self._latest_x = 0.0
+        for index, channel in enumerate(configuration.channels):
+            color = _PLOT_COLORS[index % len(_PLOT_COLORS)]
+            style = Qt.PenStyle.DashLine if channel.kind == "digital" else Qt.PenStyle.SolidLine
+            pen = pg.mkPen(color=color, width=1.5, style=style)
+            display_name = f"{channel.name} ({channel.unit})"
+            self._curves[channel.name] = self._plot.plot([], [], pen=pen, name=display_name)
+            self._x_values[channel.name] = []
+            self._y_values[channel.name] = []
+        self._apply_y_range(configuration.channels)
+        self._plot.setXRange(0, configuration.rolling_window_seconds, padding=0)
+
+    def clear(self) -> None:
+        for channel_name, curve in self._curves.items():
+            self._x_values[channel_name] = []
+            self._y_values[channel_name] = []
+            curve.setData([], [])
+        self._latest_x = 0.0
+        self._plot.setXRange(0, self._configuration.rolling_window_seconds, padding=0)
+
+    def append(self, block: NidaqSignalSampleBlock) -> None:
+        if tuple(block.channels) != tuple(self._configuration.channels):
+            self.configure(
+                NidaqSignalStreamConfiguration(
+                    channels=block.channels,
+                    is_enabled=self._configuration.is_enabled,
+                    sample_rate_hz=block.sample_rate_hz,
+                    read_chunk_size=self._configuration.read_chunk_size,
+                    rolling_window_seconds=self._configuration.rolling_window_seconds,
+                    record_to_acquisition=self._configuration.record_to_acquisition,
+                    output_name=self._configuration.output_name,
+                )
+            )
+
+        for channel in block.channels:
+            values = block.values.get(channel.name)
+            if not values:
+                continue
+            x_values = self._x_values.setdefault(channel.name, [])
+            y_values = self._y_values.setdefault(channel.name, [])
+            first_sample = block.sample_index / block.sample_rate_hz
+            x_values.extend(first_sample + index / block.sample_rate_hz for index in range(len(values)))
+            y_values.extend(values)
+            self._latest_x = max(self._latest_x, x_values[-1])
+
+        cutoff = max(0.0, self._latest_x - self._configuration.rolling_window_seconds)
+        for channel_name, curve in self._curves.items():
+            x_values = self._x_values[channel_name]
+            y_values = self._y_values[channel_name]
+            trim = 0
+            while trim < len(x_values) and x_values[trim] < cutoff:
+                trim += 1
+            if trim:
+                del x_values[:trim]
+                del y_values[:trim]
+            curve.setData(x_values, y_values)
+
+        x_min = max(0.0, self._latest_x - self._configuration.rolling_window_seconds)
+        x_max = max(self._configuration.rolling_window_seconds, self._latest_x)
+        self._plot.setXRange(x_min, x_max, padding=0)
+
+    def _apply_y_range(self, channels: Tuple[NidaqSignalChannelConfiguration, ...]) -> None:
+        minimums = [channel.minimum for channel in channels if channel.minimum is not None]
+        maximums = [channel.maximum for channel in channels if channel.maximum is not None]
+        if minimums and maximums:
+            self._plot.setYRange(min(minimums), max(maximums), padding=0.05)
+        else:
+            self._plot.enableAutoRange(axis="y")
 
 
 class AnalysisContent(ContentWidget):
+    """Rolling NI-DAQ input stream display for acquisition hardware checks."""
 
-    diamond_triangle_offset_changed = Signal(str, name="diamond_triangle_offset_changed")
-    star_triangle_offset_changed = Signal(str, name="star_triangle_offset_changed")
-    measurement_graph_changed = Signal(str, name="measurement_graph_changed")
-
-    def __init__(
-        self,
-        hardware_model: HardwareModel,
-        inference_model: InferenceModel,
-        analysis: SensorAnalysis,
-        msg_handler: SystemMessageHandler,
-        user_pref: UserPreferences,
-    ):
+    def __init__(self, nidaq_signal_monitor: NidaqSignalMonitorModel):
         super().__init__()
 
-        self._hardware_model = hardware_model
-        self._analysis = analysis
-        self._user_pref = user_pref
+        self._nidaq_signal_monitor = nidaq_signal_monitor
 
-        # Header
-        layout = QHBoxLayout()
-        layout.setContentsMargins(0, 0, 0, 0)
+        header_layout = QHBoxLayout()
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(8)
+        header_layout.addWidget(QLabel("NI-DAQ:"))
+        self._stream_state_label = QLabel("disabled")
+        header_layout.addWidget(self._stream_state_label)
+        header_layout.addWidget(QLabel("Rate:"))
+        self._sample_rate_label = QLabel("n/a")
+        header_layout.addWidget(self._sample_rate_label)
+        header_layout.addWidget(QLabel("Channels:"))
+        self._channel_count_label = QLabel("0")
+        header_layout.addWidget(self._channel_count_label)
+        header_layout.addWidget(QLabel("Recording:"))
+        self._recording_label = QLabel("off")
+        header_layout.addWidget(self._recording_label)
 
-        layout.addWidget(QLabel("D-T:"))
-        self._triangle_diamond_offset = QLabel("n/a")
-        self.diamond_triangle_offset_changed.connect(self._triangle_diamond_offset.setText)
-        layout.addWidget(self._triangle_diamond_offset)
+        self._card_widget = CardWidget(title="Analysis", header_right_layout=header_layout)
+        self._rolling_plot = _NidaqRollingPlot()
+        self._card_widget.setContentWidget(self._rolling_plot)
 
-        layout.addWidget(QLabel("S-T:"))
-        self._star_triangle_offset = QLabel("n/a")
-        self.star_triangle_offset_changed.connect(self._star_triangle_offset.setText)
-        layout.addWidget(self._star_triangle_offset)
+        footer = QWidget()
+        footer_layout = QHBoxLayout(footer)
+        footer_layout.setContentsMargins(4, 0, 0, 0)
+        footer_layout.setSpacing(8)
+        self._start_stop_button = QPushButton("Start Stream")
+        self._clear_button = QPushButton("Clear")
+        self._status_label = QLabel("NI-DAQ signal stream disabled")
+        self._status_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        footer_layout.addWidget(self._start_stop_button)
+        footer_layout.addWidget(self._clear_button)
+        footer_layout.addWidget(self._status_label)
+        self._card_widget.footer.setContent(footer)
 
-        self._load_cell_monitor_engaged = QtIndicator(text="Load Cell")
-        layout.addWidget(self._load_cell_monitor_engaged)
-
-        self._headbar_pressure_monitor_engaged = QtIndicator(text="Headbar Pressure")
-        layout.addWidget(self._headbar_pressure_monitor_engaged)
-
-        self._headbar_switch_engaged = QtIndicator(text="Headbar DIO Switch")
-        layout.addWidget(self._headbar_switch_engaged)
-        self._tunnel_headfix_widgets = (
-            self._load_cell_monitor_engaged,
-            self._headbar_pressure_monitor_engaged,
-            self._headbar_switch_engaged,
-        )
-
-        card = self._card_widget = CardWidget(title="Analysis", header_right_layout=layout)
-
-        self._measurement_plots: Dict[str, PGWidget] = {
-            graph.name: _make_graph_plot(graph)
-            for graph in AVAILABLE_GRAPHS
-        }
-        weight_plot = self._plot_weight = self._measurement_plots[_weight_graph.name]
-        weight_plot.getPlotItem().getViewBox().setBackgroundColor(_INACTIVE_LOAD_CELL_COLOR)
-
-        self._selected_graph: Optional[_GraphItem] = None
-
-        def on_measurement_graph_changed(graph_name: str):
-            # logger.verbose("on_measurement_graph_changed: %s", graph_name)
-            graph = _graph_by_name.get(graph_name, None)
-            selected = self._selected_graph
-            if graph is not None and (selected is None or graph.name != selected.name):
-                self._selected_graph = graph
-                measure_plot = self._measurement_plots[graph.name]
-                # measure_plot.centralWidget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-                self._card_widget.setContentWidget(measure_plot)
-                # logger.debug("set new graph: %s", measure_plot)
-
-        # Footer
-        self._footer = QWidget()
-        self._footer.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
-        self._footer.setContentsMargins(0, 0, 0, 0)
-
-        layout = QHBoxLayout()
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
-        layout.setAlignment(Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignLeft)
-        label = self._load_cell_engaged_threshold_label = QLabel("Load Cell Threshold (g):")
-        label.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(label)
-        spinbox = self._load_cell_engaged_threshold_spinbox = QDoubleSpinBox()
-        spinbox.setContentsMargins(0, 0, 0, 0)
-        spinbox.setMaximumHeight(25)
-        spinbox.setDecimals(1)
-        spinbox.setSingleStep(1)
-        spinbox.setRange(0, 100)
-        def value_changed(value):
-            analysis.load_cell_monitor.load_cell_engaged_threshold = value
-        spinbox.valueChanged.connect(value_changed)
-        spinbox.setValue(analysis.load_cell_monitor.load_cell_engaged_threshold)
-        layout.addWidget(spinbox)
-
-        combo = self._measurement_graph_combo = QComboBox()
-        pref_graph_name = self._user_pref.measurement_graph
-        for idx, graph in enumerate(AVAILABLE_GRAPHS):
-            combo.addItem(graph.display, graph)
-            if graph.name == pref_graph_name:
-                combo.setCurrentIndex(idx)
-        combo.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(combo, stretch=1, alignment=Qt.AlignmentFlag.AlignRight)
-        combo.currentIndexChanged.connect(self._on_graph_combox_changed)
-
-        self._footer.setLayout(layout)
-
-        self._card_widget.footer.setContent(self._footer)
-        # default CardWidget.footer layout margins are too big
-        self._card_widget.footer.layout().setContentsMargins(4, 0, 0, 0)
-
-        # Final layout
         layout = QVBoxLayout()
         layout.addWidget(self._card_widget)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-
         self.setLayout(layout)
 
-        self._perf_monitor = PerfMonitor(name="headFixContent", units="mps", report_window=30)
+        nidaq_signal_monitor.sample_block_received += self._sample_block_received
+        nidaq_signal_monitor.property_changed += self._model_property_changed
+        self._start_stop_button.clicked.connect(self._toggle_stream)
+        self._clear_button.clicked.connect(self._rolling_plot.clear)
+        self._refresh_from_model()
 
-        self.set_is_editable(False)
+    def on_close(self):
+        self._nidaq_signal_monitor.sample_block_received -= self._sample_block_received
+        self._nidaq_signal_monitor.property_changed -= self._model_property_changed
 
-        inference_model.star_triangle_offset_changed += self._star_triangle_offset_changed
-        inference_model.diamond_triangle_offset_changed += self._diamond_triangle_offset_changed
-
-        self._analysis.load_cell_monitor.property_changed += self._load_cell_monitor_property_changed
-
-        msg_handler.measurement_callback = self._measurement_received
-        msg_handler.audio_callback = self._audio_received
-        user_pref.property_changed += self._on_user_pref_changed
-        hardware_model.property_changed += self._hardware_model_property_changed
-        self._update_tunnel_headfix_visibility(hardware_model.tunnel_headfix_enabled)
-        #
-        on_measurement_graph_changed(
-            _graph_by_name.get(user_pref.measurement_graph, AVAILABLE_GRAPHS[0]).name
-        )
-        self.measurement_graph_changed.connect(on_measurement_graph_changed)
-
-    def _update_tunnel_headfix_visibility(self, is_enabled: bool):
-        for widget in self._tunnel_headfix_widgets:
-            widget.setVisible(is_enabled)
-        self._load_cell_engaged_threshold_label.setVisible(is_enabled)
-        self._load_cell_engaged_threshold_spinbox.setVisible(is_enabled)
-
-    @invoke_method
-    def _hardware_model_property_changed(self, name: str, value, _):
-        if name == HardwareModel.TUNNEL_HEADFIX_ENABLED:
-            self._update_tunnel_headfix_visibility(value)
-
-    def set_is_capture_active(self, is_active: bool):
-        if is_active:
-            self._perf_monitor.reset()
-
-    @invoke_method
-    def use_cache(self):
-        selected = self._selected_graph
-        for plot_name, plot in self._measurement_plots.items():
-            if selected is not None and plot_name == selected.name:
-                plot.use_cache()
-            else:
-                plot.replace_cache([])
-        self._load_cell_monitor_engaged.setState(self._analysis.load_cell_monitor.is_engaged)
-        self._headbar_switch_engaged.setState(self._analysis.is_headbar_switch_engaged)
-        self._headbar_pressure_monitor_engaged.setState(self._analysis.headbar_pressure_monitor.is_engaged)
-
-    def _on_graph_combox_changed(self, idx: int):
-        graph = self._measurement_graph_combo.itemData(idx)
-        if graph is not None:
-            self._user_pref.measurement_graph = graph.name
+    def _toggle_stream(self) -> None:
+        if self._nidaq_signal_monitor.is_running:
+            self._nidaq_signal_monitor.stop()
         else:
-            logger.warning("graph None")
+            self._nidaq_signal_monitor.start()
+        self._refresh_from_model()
+
+    def use_cache(self) -> None:
+        """Retained for MainContent's periodic refresh loop; stream samples arrive via model events."""
 
     @invoke_method
-    def _measurement_received(self, measurements: Tuple[List[float], List[bool], List[float], List[float], List[float]]):
-        # weight_vals, switch_vals, pressure_vals, temperature_vals, humidity_vals
-        values = measurements[_weight_graph.measure_idx]
-        self._perf_monitor.add_cycles(len(values))
-        #
-        selected = self._selected_graph
-        for plot_name, plot in self._measurement_plots.items():
-            graph = _graph_by_name[plot_name]
-            if graph.measure_idx >= 0 and selected is not None and graph.name == selected.name:
-                plot.cache_data(measurements[graph.measure_idx])
+    def _sample_block_received(self, block: NidaqSignalSampleBlock) -> None:
+        self._rolling_plot.append(block)
 
     @invoke_method
-    def _audio_received(self, spectrum):
-        selected = self._selected_graph
-        if selected is not None and selected.name == _audio_graph.name:
-            audio_plot = self._measurement_plots[_audio_graph.name]
-            audio_plot.replace_cache(spectrum)
+    def _model_property_changed(self, _name: str, _value, _old_value) -> None:
+        self._refresh_from_model()
 
-    @invoke_method
-    def _load_cell_monitor_property_changed(self, name, value, _):
-        if name == LoadCellMonitor.IS_ENGAGED_PROPERTY:
-            if value:
-                self._plot_weight.getPlotItem().getViewBox().setBackgroundColor(_ACTIVE_LOAD_CELL_COLOR)
-            else:
-                self._plot_weight.getPlotItem().getViewBox().setBackgroundColor(_INACTIVE_LOAD_CELL_COLOR)
-        elif name == LoadCellMonitor.LOAD_CELL_ENGAGED_THRESHOLD_PROPERTY:
-            self._load_cell_engaged_threshold_spinbox.setValue(value)
-
-    @invoke_method
-    def _diamond_triangle_offset_changed(self, offset: Optional[Offset3DTuple]):
-        self.diamond_triangle_offset_changed.emit(_render_offset_3d_value(offset))
-
-    @invoke_method
-    def _star_triangle_offset_changed(self, offset: Optional[Offset3DTuple]):
-        self.star_triangle_offset_changed.emit(
-            "n/a" if offset is None else f"{offset.distance:.1f} mm"
-        )
-
-    @invoke_method
-    def _on_user_pref_changed(self, name: str, value, old_value):
-        if name == UserPreferences.MEASUREMENT_GRAPH:
-            self.measurement_graph_changed.emit(value)
-            pref_graph_name = value
-            combo = self._measurement_graph_combo
-            for idx, graph in enumerate(AVAILABLE_GRAPHS):
-                if graph.name == pref_graph_name:
-                    combo.blockSignals(True)
-                    combo.setCurrentIndex(idx)
-                    combo.blockSignals(False)
-                    break
+    def _refresh_from_model(self) -> None:
+        model = self._nidaq_signal_monitor
+        configuration = model.configuration
+        self._rolling_plot.configure(configuration)
+        self._stream_state_label.setText("running" if model.is_running else "stopped")
+        if not configuration.is_enabled:
+            self._stream_state_label.setText("disabled")
+        self._sample_rate_label.setText(f"{configuration.sample_rate_hz:g} Hz")
+        self._channel_count_label.setText(str(len(configuration.channels)))
+        self._start_stop_button.setText("Stop Stream" if model.is_running else "Start Stream")
+        self._start_stop_button.setEnabled(configuration.is_enabled)
+        recording_path = model.recording_path
+        if not configuration.is_enabled or not model.is_running:
+            self._recording_label.setText("off")
+        elif recording_path is None:
+            self._recording_label.setText("off" if not configuration.record_to_acquisition else "waiting")
+        else:
+            self._recording_label.setText(recording_path.name)
+        error_message = model.error_message
+        if error_message:
+            self._status_label.setText(error_message)
+            self._status_label.setStyleSheet("color: #b00020;")
+        else:
+            self._status_label.setText(model.status_message)
+            self._status_label.setStyleSheet("")
