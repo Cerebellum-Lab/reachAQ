@@ -36,6 +36,9 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
 
     TUNNEL_IDENTIFIER_PROPERTY = "tunnel_identifier"
     PELLET_IDENTIFIER_PROPERTY = "pellet_identifier"
+    CAN_ENABLED = "can_enabled"
+    PELLET_CONTROLLER_ENABLED = "pellet_controller_enabled"
+    NIDAQ_ENABLED = "nidaq_enabled"
 
     PENDING_COMMAND_PROPERTY = "pending_command"
 
@@ -85,6 +88,9 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
         self._device_pellet_status_timeout_engaged = False
         self._device_tunnel_status_timeout_engaged = False
         self._device_stream_started = False
+        self._can_enabled = True
+        self._pellet_controller_enabled = True
+        self._nidaq_enabled = False
         self._tunnel_headfix_enabled = False
 
         self._pending_tokens: Dict[UUID, Tuple[SystemCommandKind, float]] = {}
@@ -218,6 +224,14 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
     def device_ack_timeout_engaged(self):
         return self._device_ack_timeout_engaged
 
+    @property
+    def pellet_status_timeout_engaged(self) -> bool:
+        return self._device_pellet_status_timeout_engaged
+
+    @property
+    def tunnel_status_timeout_engaged(self) -> bool:
+        return self._device_tunnel_status_timeout_engaged
+
     @device_ack_timeout_engaged.setter
     def device_ack_timeout_engaged(self, value):
         prev, self._device_ack_timeout_engaged = self._device_ack_timeout_engaged, value
@@ -299,6 +313,22 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
     @property
     def tunnel_headfix_enabled(self) -> bool:
         return self._tunnel_headfix_enabled
+
+    @property
+    def can_enabled(self) -> bool:
+        return self._can_enabled
+
+    @property
+    def pellet_controller_enabled(self) -> bool:
+        return self._pellet_controller_enabled
+
+    @property
+    def nidaq_enabled(self) -> bool:
+        return self._nidaq_enabled
+
+    @property
+    def requires_connection(self) -> bool:
+        return self._can_enabled and self._pellet_controller_enabled
 
     def update_head_magnet_intensity(self, value: Optional[float]) -> Optional[UUID]:
         if not self._tunnel_headfix_enabled:
@@ -468,10 +498,26 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
         return self._send_with_token(self._device_conn, SystemCommandKind.SET_RGB_LED, (r, g, b))
 
     def load_config(self, config: HardwareConfiguration):
-        prev, self._tunnel_headfix_enabled = self._tunnel_headfix_enabled, config.tunnel_headfix_enabled
-        self._on_property_changed(self.TUNNEL_HEADFIX_ENABLED, self._tunnel_headfix_enabled, prev)
+        self._set_boolean_config(self.CAN_ENABLED, "_can_enabled", config.can_enabled)
+        self._set_boolean_config(
+            self.PELLET_CONTROLLER_ENABLED,
+            "_pellet_controller_enabled",
+            config.pellet_controller_enabled,
+        )
+        self._set_boolean_config(self.NIDAQ_ENABLED, "_nidaq_enabled", config.nidaq_enabled)
+        self._set_boolean_config(
+            self.TUNNEL_HEADFIX_ENABLED,
+            "_tunnel_headfix_enabled",
+            config.tunnel_headfix_enabled,
+        )
         self.set_device_ack_timeout(config.min_ack_timeout)
         self.set_board_status_timeout(config.board_status_timeout)
+
+    def _set_boolean_config(self, property_name: str, attr_name: str, value: bool) -> None:
+        prev = getattr(self, attr_name)
+        value = bool(value)
+        setattr(self, attr_name, value)
+        self._on_property_changed(property_name, value, prev)
 
     def set_board_status_timeout(self, timeout: Optional[float]):
         self._board_status_timeout = timeout
@@ -500,6 +546,12 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
         return dev_dev is not None and dev_dev.connected
 
     def connect(self, cmd_queue: Queue):
+        if not self._can_enabled:
+            logger.notice("Skipping hardware connection because CAN bus is disabled in configuration")
+            return
+        if not self._pellet_controller_enabled:
+            logger.notice("Skipping hardware connection because pellet controller is disabled in configuration")
+            return
         logger.notice("%s: connect with %s", self, cmd_queue)
         self._disconnect_event.clear()
 

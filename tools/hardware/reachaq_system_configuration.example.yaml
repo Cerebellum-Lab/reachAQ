@@ -3,7 +3,7 @@
 # CAN transport is configured through reachaq_hardware.env.example because the current CAN runtime reads environment.
 
 !SystemConfiguration
-version: 55
+version: 56
 cameras:
 - !CameraConfiguration
   id: 0
@@ -53,6 +53,9 @@ cameras:
 hardware: !HardwareConfiguration
   tunnelIdentifier: ''
   pelletIdentifier: CAN
+  canEnabled: true
+  pelletControllerEnabled: true
+  nidaqEnabled: true
   tunnelHeadfixEnabled: false
   minAckTimeout: 3.0
   boardStatusTimeout: 15.0

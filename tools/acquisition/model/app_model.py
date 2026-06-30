@@ -1358,7 +1358,7 @@ class AppModel(ObservableObject):
         hard = self._hardware
         hard.connect(self._system_message_handler.input_queue)
         # hard.set_auto_correct_motor_drift(algo.auto_correct_motors_drift)  # disabled
-        if wait_connected:
+        if wait_connected and hard.requires_connection:
             timeout = 3
             # full establishement of connection to/from device should be very fast actually, but not immediate,
             # so this timeout.
@@ -2111,10 +2111,20 @@ class AppModel(ObservableObject):
         animal.to_file(dst)
 
     def _create_configuration(self) -> SystemConfiguration:
+        loaded_hardware = (
+            self._loaded_configuration.hardware
+            if self._loaded_configuration is not None
+            else HardwareConfiguration(tunnel_identifier="CAN", pellet_identifier="CAN", tunnel_headfix_enabled=False)
+        )
         hardware_configuration = HardwareConfiguration(
-            tunnel_identifier="CAN",
-            pellet_identifier="CAN",
-            tunnel_headfix_enabled=False,
+            tunnel_identifier=loaded_hardware.tunnel_identifier,
+            pellet_identifier=loaded_hardware.pellet_identifier,
+            can_enabled=self._hardware.can_enabled,
+            pellet_controller_enabled=self._hardware.pellet_controller_enabled,
+            nidaq_enabled=self._hardware.nidaq_enabled,
+            tunnel_headfix_enabled=self._hardware.tunnel_headfix_enabled,
+            min_ack_timeout=loaded_hardware.min_ack_timeout,
+            board_status_timeout=loaded_hardware.board_status_timeout,
         )
 
         cameras = []
