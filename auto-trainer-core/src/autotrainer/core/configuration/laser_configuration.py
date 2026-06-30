@@ -29,7 +29,7 @@ class LaserChannelConfiguration:
     analog_output: str
     diode_input: str
     shutter_output: str
-    auxiliary_output: str
+    auxiliary_output: Optional[str] = None
     command_copy_input: Optional[str] = None
     trigger_source: Optional[str] = None
     trigger_output: Optional[str] = None
@@ -41,7 +41,7 @@ class LaserChannelConfiguration:
 
     def __post_init__(self):
         object.__setattr__(self, "channel_id", normalize_laser_channel_id(self.channel_id))
-        for name in ("analog_output", "diode_input", "shutter_output", "auxiliary_output"):
+        for name in ("analog_output", "diode_input", "shutter_output"):
             if not getattr(self, name):
                 raise ValueError(f"{name} must be provided")
         if self.maximum_command_volts <= self.minimum_command_volts:

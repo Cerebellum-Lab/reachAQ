@@ -54,6 +54,7 @@ from tools.acquisition.model.handle_3d_calibration import make_3d_calib
 from tools.acquisition.model.training_plan import get_plan_id
 from tools.acquisition.model.user_preferences import UserPreferences
 from tools.acquisition.view.main_content import MainContent
+from tools.acquisition.view.nidaq_port_configuration_dialog import NidaqPortConfigurationDialog
 from tools.acquisition.view.preferences_dialog import PreferencesDialog
 from tools.acquisition.view.debug_content import DebugView
 
@@ -204,6 +205,7 @@ class MainWindow(QMainWindow):
         #
         stopped = not started
         self.edit_camera_settings_action.setEnabled(stopped)
+        self.edit_daq_ports_action.setEnabled(stopped)
         self.make_3d_calib_action.setEnabled(stopped)
         #
         run_action = self.run_action
@@ -803,6 +805,25 @@ class MainWindow(QMainWindow):
             self.main_content.set_is_editable(True)
             self.run_action.setEnabled(False)
 
+    def _edit_daq_ports(self):
+        configuration = self._app_model.loaded_configuration
+        if configuration is None:
+            QMessageBox.critical(self, "DAQ Port Configuration", "No system configuration is loaded.")
+            return
+        dialog = NidaqPortConfigurationDialog(configuration, self)
+        self._add_box_to_open_dialogs(dialog)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            self._app_model.update_daq_port_configuration(
+                dialog.nidaq_ports,
+                dialog.laser_configuration,
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "DAQ Port Configuration", str(exc) or exc.__class__.__name__)
+            return
+        self.statusBar().showMessage("DAQ port configuration saved", 5000)
+
     def _show_preferences(self):
         dialog = PreferencesDialog(self._preferences, self._app_model)
         self._add_box_to_open_dialogs(dialog)
@@ -834,6 +855,10 @@ class MainWindow(QMainWindow):
         action.setCheckable(True)
         action.setChecked(False)
         action.triggered.connect(self._edit_camera_settings)
+
+        action = self.edit_daq_ports_action = QAction(QIcon(qta.icon("fa5s.plug")), "Edit DAQ Ports", self)
+        action.setToolTip("Edit NI-DAQ port assignments")
+        action.triggered.connect(self._edit_daq_ports)
 
         action = self.run_action = QAction(QIcon(qta.icon("ei.play")), "Start", self)
         action.setToolTip("Start or stop acquisition")
@@ -939,6 +964,7 @@ class MainWindow(QMainWindow):
 
         edit_menu = menu_bar.addMenu("Edit")
         edit_menu.addAction(self.edit_camera_settings_action)
+        edit_menu.addAction(self.edit_daq_ports_action)
 
         tools_menu = menu_bar.addMenu("Tools")
         tools_menu.addAction(self.calib_diamond_triangle_action)

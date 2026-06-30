@@ -27,7 +27,7 @@ class _NidaqLaserTasks:
     diode_input: object
     command_copy_input: Optional[object]
     shutter_output: object
-    auxiliary_output: object
+    auxiliary_output: Optional[object]
 
     def close(self) -> None:
         errors = []
@@ -70,7 +70,8 @@ class NidaqLaserController:
                 self._command_volts[channel.channel_id] = channel.minimum_command_volts
                 self.set_command_voltage(channel.channel_id, channel.minimum_command_volts)
                 self.set_shutter_open(channel.channel_id, False)
-                self.set_auxiliary_output(channel.channel_id, False)
+                if channel.auxiliary_output is not None:
+                    self.set_auxiliary_output(channel.channel_id, False)
         except Exception:
             try:
                 self.close()
@@ -99,7 +100,12 @@ class NidaqLaserController:
 
     def set_auxiliary_output(self, channel_id: Union[LaserChannelId, int], enabled: bool) -> None:
         channel = self._configuration.get_channel(channel_id)
-        self._tasks[channel.channel_id].auxiliary_output.write(bool(enabled), auto_start=True)
+        auxiliary_output = self._tasks[channel.channel_id].auxiliary_output
+        if auxiliary_output is None:
+            raise RuntimeError(
+                f"laser channel {channel.channel_id.value} has no auxiliary_output configured"
+            )
+        auxiliary_output.write(bool(enabled), auto_start=True)
 
     def read_diode_voltage(self, channel_id: Union[LaserChannelId, int]) -> float:
         channel = self._configuration.get_channel(channel_id)
@@ -473,7 +479,8 @@ class NidaqLaserController:
                 continue
             try:
                 self.set_shutter_open(channel.channel_id, False)
-                self.set_auxiliary_output(channel.channel_id, False)
+                if channel.auxiliary_output is not None:
+                    self.set_auxiliary_output(channel.channel_id, False)
                 self.set_command_voltage(channel.channel_id, channel.minimum_command_volts)
             except Exception as exc:
                 errors.append((f"channel {channel.channel_id.value} reset", exc))
@@ -504,8 +511,10 @@ class NidaqLaserController:
         shutter_output = self._nidaqmx.Task(f"laser_{channel.channel_id.value}_shutter")
         shutter_output.do_channels.add_do_chan(channel.shutter_output)
 
-        auxiliary_output = self._nidaqmx.Task(f"laser_{channel.channel_id.value}_aux")
-        auxiliary_output.do_channels.add_do_chan(channel.auxiliary_output)
+        auxiliary_output = None
+        if channel.auxiliary_output is not None:
+            auxiliary_output = self._nidaqmx.Task(f"laser_{channel.channel_id.value}_aux")
+            auxiliary_output.do_channels.add_do_chan(channel.auxiliary_output)
 
         return _NidaqLaserTasks(
             analog_output=analog_output,

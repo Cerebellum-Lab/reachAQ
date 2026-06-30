@@ -111,6 +111,7 @@ from .hardware_configuration import HardwareConfiguration
 from .inference_configuration import InferenceConfiguration
 from .laser_configuration import LaserChannelConfiguration, LaserChannelId, LaserSystemConfiguration, \
     normalize_laser_channel_id
+from .nidaq_port_configuration import NidaqPortConfiguration
 from .nidaq_stream_configuration import NidaqSignalChannelConfiguration, NidaqSignalStreamConfiguration
 from .persistence_configuration import PersistenceConfiguration
 from .system_configuration import SystemConfiguration

@@ -23,6 +23,7 @@ from .camera_configuration import CameraConfiguration, CameraId
 from .hardware_configuration import HardwareConfiguration
 from .inference_configuration import InferenceConfiguration
 from .laser_configuration import LaserChannelConfiguration, LaserSystemConfiguration
+from .nidaq_port_configuration import NidaqPortConfiguration
 from .nidaq_stream_configuration import NidaqSignalChannelConfiguration, NidaqSignalStreamConfiguration
 from .persistence_configuration import PersistenceConfiguration
 from ..project.project_info import DATE_FORMAT, TIME_FORMAT
@@ -44,12 +45,13 @@ class SystemConfiguration:
 
     DEFAULT_PATH: ClassVar[Path] = DEFAULT_CONFIG_DIR.joinpath(f"{DEFAULT_NAME}.yaml")  # caller/user must expanduser() on it
 
-    version: int = 54
+    version: int = 55
 
     cameras: List[CameraConfiguration] = field(default_factory=list)
     hardware: HardwareConfiguration = field(default_factory=HardwareConfiguration)
     inference: InferenceConfiguration = field(default_factory=InferenceConfiguration)
     laser: LaserSystemConfiguration = field(default_factory=LaserSystemConfiguration)
+    nidaq_ports: NidaqPortConfiguration = field(default_factory=NidaqPortConfiguration)
     nidaq_stream: NidaqSignalStreamConfiguration = field(default_factory=NidaqSignalStreamConfiguration)
     behavior: BehaviorConfiguration = field(default_factory=BehaviorConfiguration)
     persistence: PersistenceConfiguration = field(default_factory=PersistenceConfiguration)
@@ -186,6 +188,7 @@ class SystemConfiguration:
         self.hardware = HardwareConfiguration(**content.get("hardware", {}))
         self.inference = InferenceConfiguration(**content.get("inference", {}))
         self.laser = LaserSystemConfiguration(**self._deserialize_laser_configuration(content.get("laser", {})))
+        self.nidaq_ports = NidaqPortConfiguration(**content.get("nidaq_ports", {}))
         self.behavior = BehaviorConfiguration.from_version_one(content.get("behavior", {}))
         self.persistence = PersistenceConfiguration(**content.get("persistence", {}))
 
@@ -223,6 +226,7 @@ _tag_2_cls = dict(
     InferenceConfiguration=InferenceConfiguration,
     LaserChannelConfiguration=LaserChannelConfiguration,
     LaserSystemConfiguration=LaserSystemConfiguration,
+    NidaqPortConfiguration=NidaqPortConfiguration,
     NidaqSignalChannelConfiguration=NidaqSignalChannelConfiguration,
     NidaqSignalStreamConfiguration=NidaqSignalStreamConfiguration,
     WatchdogConfig=WatchdogConfig,

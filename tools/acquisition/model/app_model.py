@@ -35,6 +35,8 @@ from autotrainer.core import (
     CameraId,
     PersistenceConfiguration,
     HardwareConfiguration,
+    LaserSystemConfiguration,
+    NidaqPortConfiguration,
     Notification,
     NotificationCenter,
     TriggerNotification,
@@ -261,6 +263,7 @@ class AppModel(ObservableObject):
         self._preferences = preferences
         self._loaded_configuration: Optional[SystemConfiguration] = None
         self._loaded_config_dir_path = Path()
+        self._nidaq_ports = NidaqPortConfiguration()
 
         self._output_location = PersistenceConfiguration.get_default_output_path().as_posix()
         self._project_info: Optional[ProjectInfo] = None
@@ -842,6 +845,10 @@ class AppModel(ObservableObject):
     @property
     def nidaq_signal_monitor(self) -> NidaqSignalMonitorModel:
         return self._nidaq_signal_monitor
+
+    @property
+    def nidaq_ports(self) -> NidaqPortConfiguration:
+        return self._nidaq_ports
 
     @property
     def message_handler(self) -> SystemMessageHandler:
@@ -1593,6 +1600,7 @@ class AppModel(ObservableObject):
         self._hardware.load_config(configuration.hardware)
         self.inference.load_configuration(configuration.inference)
         self.laser.load_configuration(configuration.laser)
+        self._nidaq_ports = configuration.nidaq_ports
         self.nidaq_signal_monitor.load_configuration(configuration.nidaq_stream)
         self.behavior.load_configuration(configuration.behavior)
 
@@ -1640,6 +1648,20 @@ class AppModel(ObservableObject):
         logger.info("Saving configuration to %s", loc)
         conf = self._create_configuration()
         conf.save_default(loc)
+
+    def update_daq_port_configuration(
+        self,
+        nidaq_ports: NidaqPortConfiguration,
+        laser_configuration: LaserSystemConfiguration,
+    ) -> None:
+        if self._loaded_configuration is None:
+            raise RuntimeError("Cannot update DAQ port configuration before a system configuration is loaded")
+        self._nidaq_ports = nidaq_ports
+        self._laser.set_configuration_offline(laser_configuration)
+        self._loaded_configuration.nidaq_ports = nidaq_ports
+        self._loaded_configuration.laser = laser_configuration
+        self.configuration_loaded_event(self._loaded_configuration)
+        self.save_configuration()
 
     def on_activated(self):
         """Must be called at start"""
@@ -2103,6 +2125,7 @@ class AppModel(ObservableObject):
                                             hardware=hardware_configuration,
                                             inference=self._inference.save_configuration(),
                                             laser=self._laser.save_configuration(),
+                                            nidaq_ports=self._nidaq_ports,
                                             nidaq_stream=self._nidaq_signal_monitor.save_configuration(),
                                             behavior=self._behavior.save_configuration(),
                                             persistence=PersistenceConfiguration(output_location=self.output_location))

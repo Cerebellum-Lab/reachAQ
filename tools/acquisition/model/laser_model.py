@@ -62,6 +62,12 @@ class LaserModel(ObservableObject):
         else:
             raise ValueError(f"Unsupported laser backend: {configuration.backend}")
 
+    def set_configuration_offline(self, configuration: LaserSystemConfiguration) -> None:
+        prev_config = self._configuration
+        self.close()
+        self._configuration = configuration
+        self._on_property_changed(self.CONFIGURATION, configuration, prev_config)
+
     def save_configuration(self) -> LaserSystemConfiguration:
         return self._configuration
 

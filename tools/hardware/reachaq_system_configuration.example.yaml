@@ -3,7 +3,7 @@
 # CAN transport is configured through reachaq_hardware.env.example because the current CAN runtime reads environment.
 
 !SystemConfiguration
-version: 54
+version: 55
 cameras:
 - !CameraConfiguration
   id: 0
@@ -96,6 +96,14 @@ laser: !LaserSystemConfiguration
     maximumCommandVolts: 5.0
     feedbackScale: 1.0
     commandCopyScale: 1.0
+nidaqPorts: !NidaqPortConfiguration
+  deviceName: Dev1
+  tone1: Dev1/port1/line3
+  tone2: Dev1/port1/line4
+  tone3R: Dev1/port1/line5
+  tone3L: Dev1/port1/line6
+  camFrames: Dev1/port1/line1
+  barcode: Dev1/port1/line2
 nidaqStream: !NidaqSignalStreamConfiguration
   # This monitor is for operator-visible rolling input checks and acquisition-side CSV signal copies.
   # Use actual AI/DI input lines from the bench NI-DAQ channel map.

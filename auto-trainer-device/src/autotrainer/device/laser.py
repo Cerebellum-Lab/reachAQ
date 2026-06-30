@@ -261,6 +261,10 @@ class NullLaserController:
 
     def set_auxiliary_output(self, channel_id: Union[LaserChannelId, int], enabled: bool) -> None:
         channel = self._configuration.get_channel(channel_id)
+        if channel.auxiliary_output is None:
+            raise RuntimeError(
+                f"laser channel {channel.channel_id.value} has no auxiliary_output configured"
+            )
         self._aux_enabled[channel.channel_id] = bool(enabled)
 
     def read_diode_voltage(self, channel_id: Union[LaserChannelId, int]) -> float:
@@ -374,4 +378,8 @@ class NullLaserController:
 
     def is_auxiliary_output_enabled(self, channel_id: Union[LaserChannelId, int]) -> bool:
         channel = self._configuration.get_channel(channel_id)
+        if channel.auxiliary_output is None:
+            raise RuntimeError(
+                f"laser channel {channel.channel_id.value} has no auxiliary_output configured"
+            )
         return self._aux_enabled[channel.channel_id]

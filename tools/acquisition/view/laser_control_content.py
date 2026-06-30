@@ -75,6 +75,7 @@ class _LaserChannelTab(QWidget):
         self._sample_rate_hz = sample_rate_hz
         self._start_operation = start_operation
         self._set_parent_status = set_status
+        self._controls_can_edit = True
 
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
@@ -113,8 +114,12 @@ class _LaserChannelTab(QWidget):
         self._frequency_hz.setDecimals(3)
         self._frequency_hz.setValue(10.0)
         self._frequency_hz.setSuffix(" Hz")
+        self._trigger_mode = QComboBox()
+        self._trigger_mode.addItems(("internal", "external"))
+        if channel.trigger_source:
+            self._trigger_mode.setCurrentText("external")
         self._trigger_source = QLineEdit(channel.trigger_source or "")
-        self._trigger_source.setPlaceholderText("optional NI-DAQ trigger route")
+        self._trigger_source.setPlaceholderText("NI-DAQ trigger route")
         self._trigger_edge = QComboBox()
         self._trigger_edge.addItems(("rising", "falling"))
 
@@ -139,9 +144,12 @@ class _LaserChannelTab(QWidget):
         pulse_layout.addWidget(self._pulse_count, 2, 1)
         pulse_layout.addWidget(QLabel("Frequency:"), 2, 2)
         pulse_layout.addWidget(self._frequency_hz, 2, 3)
-        pulse_layout.addWidget(QLabel("Trigger:"), 3, 0)
-        pulse_layout.addWidget(self._trigger_source, 3, 1, 1, 2)
+        pulse_layout.addWidget(QLabel("Trigger Mode:"), 3, 0)
+        pulse_layout.addWidget(self._trigger_mode, 3, 1)
+        pulse_layout.addWidget(QLabel("Trigger Type:"), 3, 2)
         pulse_layout.addWidget(self._trigger_edge, 3, 3)
+        pulse_layout.addWidget(QLabel("Trigger Source:"), 4, 0)
+        pulse_layout.addWidget(self._trigger_source, 4, 1, 1, 3)
         shutter_options = QWidget()
         shutter_options_layout = QHBoxLayout(shutter_options)
         shutter_options_layout.setContentsMargins(0, 0, 0, 0)
@@ -149,7 +157,7 @@ class _LaserChannelTab(QWidget):
         shutter_options_layout.addWidget(self._open_shutter)
         shutter_options_layout.addWidget(self._close_shutter)
         shutter_options_layout.addWidget(self._enable_pmt)
-        pulse_layout.addWidget(shutter_options, 4, 0, 1, 4)
+        pulse_layout.addWidget(shutter_options, 5, 0, 1, 4)
 
         trigger_options = QWidget()
         trigger_options_layout = QHBoxLayout(trigger_options)
@@ -158,8 +166,8 @@ class _LaserChannelTab(QWidget):
         trigger_options_layout.addWidget(self._emit_trigger)
         trigger_options_layout.addWidget(self._emit_timing_trigger)
         trigger_options_layout.addStretch(1)
-        pulse_layout.addWidget(trigger_options, 5, 0, 1, 3)
-        pulse_layout.addWidget(self._run_pulse_button, 5, 3)
+        pulse_layout.addWidget(trigger_options, 6, 0, 1, 3)
+        pulse_layout.addWidget(self._run_pulse_button, 6, 3)
         layout.addWidget(pulse_group)
 
         self._preview_plot = PGWidget()
@@ -220,6 +228,7 @@ class _LaserChannelTab(QWidget):
             self._post_stim_ms,
             self._pulse_count,
             self._frequency_hz,
+            self._trigger_mode,
             self._trigger_source,
             self._trigger_edge,
             self._open_shutter,
@@ -239,6 +248,7 @@ class _LaserChannelTab(QWidget):
         self._run_pulse_button.clicked.connect(self._run_pulse)
         self._run_ramp_button.clicked.connect(self._run_calibration_ramp)
         self._connect_preview_signals()
+        self._refresh_trigger_mode_enabled()
         self._refresh_preview()
 
     @property
@@ -286,6 +296,7 @@ class _LaserChannelTab(QWidget):
         ):
             spinbox.valueChanged.connect(self._refresh_preview)
         self._trigger_source.textChanged.connect(self._refresh_preview)
+        self._trigger_mode.currentTextChanged.connect(self._on_trigger_mode_changed)
         self._trigger_edge.currentTextChanged.connect(self._refresh_preview)
         for checkbox in (
             self._open_shutter,
@@ -297,8 +308,10 @@ class _LaserChannelTab(QWidget):
             checkbox.toggled.connect(self._refresh_preview)
 
     def set_controls_enabled(self, can_edit: bool, can_run_pulse: bool, can_run_ramp: bool) -> None:
+        self._controls_can_edit = can_edit
         for control in self._pulse_controls:
             control.setEnabled(can_edit)
+        self._refresh_trigger_mode_enabled()
         self._run_pulse_button.setEnabled(can_run_pulse)
         for control in self._ramp_controls:
             control.setEnabled(can_edit)
@@ -358,7 +371,11 @@ class _LaserChannelTab(QWidget):
     def _build_pulse_train(self) -> LaserPulseTrain:
         pulse_count = self._pulse_count.value()
         frequency_hz = self._frequency_hz.value() if pulse_count > 1 else None
-        trigger_source = self._trigger_source.text().strip() or None
+        trigger_source = None
+        if self._trigger_mode.currentText() == "external":
+            trigger_source = self._trigger_source.text().strip()
+            if not trigger_source:
+                raise ValueError("External trigger mode requires a trigger source")
         return LaserPulseTrain(
             channel_id=self._channel.channel_id,
             amplitude_volts=self._amplitude.value(),
@@ -375,6 +392,15 @@ class _LaserChannelTab(QWidget):
             emit_trigger_output=self._emit_trigger.isChecked(),
             emit_timing_trigger_output=self._emit_timing_trigger.isChecked(),
         )
+
+    def _on_trigger_mode_changed(self) -> None:
+        self._refresh_trigger_mode_enabled()
+        self._refresh_preview()
+
+    def _refresh_trigger_mode_enabled(self) -> None:
+        is_external = self._trigger_mode.currentText() == "external"
+        self._trigger_source.setEnabled(self._controls_can_edit and is_external)
+        self._trigger_edge.setEnabled(self._controls_can_edit and is_external)
 
     def _validate_pulse_train(self, pulse_train: LaserPulseTrain) -> None:
         minimum = self._channel.minimum_command_volts
