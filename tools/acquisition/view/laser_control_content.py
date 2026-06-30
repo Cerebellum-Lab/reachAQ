@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 from autotrainer.core.logging import get_verbose_logger
-from autotrainer.device import LaserCalibrationRamp, LaserChannelConfiguration, LaserPulseTrain
+from autotrainer.device import LaserCalibrationRamp, LaserChannelConfiguration, LaserChannelId, LaserPulseTrain
 from autotrainer.pyside import CardWidget, PGWidget
 from autotrainer.pyside.content_widget import ContentWidget, invoke_method
 from tools.acquisition.model.app_model import AppModel
@@ -31,6 +31,10 @@ from tools.acquisition.model.laser_model import LaserModel
 
 
 logger = get_verbose_logger(__name__)
+
+_LASER_PULSE_TRAIN_COUNT = 4
+_DEFAULT_MINIMUM_COMMAND_VOLTS = 0.0
+_DEFAULT_MAXIMUM_COMMAND_VOLTS = 5.0
 
 
 class _LaserOperationWorker(QObject):
@@ -58,6 +62,7 @@ class _LaserChannelTab(QWidget):
         self,
         app_model: AppModel,
         channel: LaserChannelConfiguration,
+        is_configured: bool,
         sample_rate_hz: Optional[float],
         start_operation: Callable[[str, Callable[[], object]], None],
         set_status: Callable[[str, bool], None],
@@ -66,6 +71,7 @@ class _LaserChannelTab(QWidget):
 
         self._app_model = app_model
         self._channel = channel
+        self._is_configured = is_configured
         self._sample_rate_hz = sample_rate_hz
         self._start_operation = start_operation
         self._set_parent_status = set_status
@@ -78,10 +84,14 @@ class _LaserChannelTab(QWidget):
         layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
         sample_rate = "manual" if sample_rate_hz is None else f"{sample_rate_hz:g} Hz"
-        channel_label = QLabel(
-            f"Rate {sample_rate} | AO {channel.analog_output} | "
-            f"Diode {channel.diode_input} | Shutter {channel.shutter_output}"
-        )
+        if is_configured:
+            channel_text = (
+                f"Rate {sample_rate} | AO {channel.analog_output} | "
+                f"Diode {channel.diode_input} | Shutter {channel.shutter_output}"
+            )
+        else:
+            channel_text = f"Rate {sample_rate} | Hardware channel not mapped"
+        channel_label = QLabel(channel_text)
         channel_label.setWordWrap(True)
         layout.addWidget(channel_label)
 
@@ -217,6 +227,10 @@ class _LaserChannelTab(QWidget):
     def channel_id_value(self) -> int:
         return int(self._channel.channel_id)
 
+    @property
+    def is_configured(self) -> bool:
+        return self._is_configured
+
     @staticmethod
     def _make_voltage_spinbox(channel: LaserChannelConfiguration) -> QDoubleSpinBox:
         spinbox = QDoubleSpinBox()
@@ -258,15 +272,21 @@ class _LaserChannelTab(QWidget):
         ):
             checkbox.toggled.connect(self._refresh_preview)
 
-    def set_controls_enabled(self, ready: bool, can_run_ramp: bool) -> None:
+    def set_controls_enabled(self, can_edit: bool, can_run_pulse: bool, can_run_ramp: bool) -> None:
         for control in self._pulse_controls:
-            control.setEnabled(ready)
-        self._run_pulse_button.setEnabled(ready)
+            control.setEnabled(can_edit)
+        self._run_pulse_button.setEnabled(can_run_pulse)
         for control in self._ramp_controls:
-            control.setEnabled(can_run_ramp)
+            control.setEnabled(can_edit)
         self._run_ramp_button.setEnabled(can_run_ramp)
 
     def _run_pulse(self) -> None:
+        if not self._is_configured:
+            self._set_parent_status(
+                f"Laser {self._channel.channel_id.value} has no hardware channel mapping",
+                True,
+            )
+            return
         try:
             pulse_train = self._build_pulse_train()
             self._validate_pulse_train(pulse_train)
@@ -281,6 +301,12 @@ class _LaserChannelTab(QWidget):
         self._start_operation(f"Running laser {self._channel.channel_id.value} pulse train", operation)
 
     def _run_calibration_ramp(self) -> None:
+        if not self._is_configured:
+            self._set_parent_status(
+                f"Laser {self._channel.channel_id.value} has no hardware channel mapping",
+                True,
+            )
+            return
         try:
             ramp = LaserCalibrationRamp(
                 channel_id=self._channel.channel_id,
@@ -475,31 +501,55 @@ class LaserControlContent(ContentWidget):
 
         self._clear_tabs()
         tabs = []
-        for channel in configuration.channels:
+        configured_channels = {
+            int(channel.channel_id): channel
+            for channel in configuration.channels
+        }
+        for channel_index in range(1, _LASER_PULSE_TRAIN_COUNT + 1):
+            channel = configured_channels.get(channel_index)
+            is_configured = channel is not None
+            if channel is None:
+                channel = self._make_placeholder_channel(channel_index)
             tab = _LaserChannelTab(
                 self._app_model,
                 channel,
+                is_configured,
                 configuration.sample_rate_hz,
                 self._start_operation,
                 self._set_status_from_tab,
             )
-            self._tabs.addTab(tab, f"Laser {channel.channel_id.value}")
+            self._tabs.addTab(tab, f"Laser {channel_index}")
             tabs.append(tab)
-        if not tabs:
-            empty = QWidget()
-            empty.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-            self._tabs.addTab(empty, "No lasers")
         self._channel_tabs = tuple(tabs)
         if current is not None:
             for index, tab in enumerate(self._channel_tabs):
                 if tab.channel_id_value == current:
                     self._tabs.setCurrentIndex(index)
                     break
-        if self._channel_tabs:
-            self._set_status(f"Ready: {len(self._channel_tabs)} configured laser(s)", is_error=False)
+        configured_count = sum(tab.is_configured for tab in self._channel_tabs)
+        if configured_count:
+            self._set_status(
+                f"Ready: {configured_count}/{_LASER_PULSE_TRAIN_COUNT} laser channel(s) mapped",
+                is_error=False,
+            )
         else:
-            self._set_status("Laser controller not configured", is_error=False)
+            self._set_status(
+                f"Pulse train editor ready; 0/{_LASER_PULSE_TRAIN_COUNT} hardware channel(s) mapped",
+                is_error=False,
+            )
         self._update_enabled_state()
+
+    @staticmethod
+    def _make_placeholder_channel(channel_index: int) -> LaserChannelConfiguration:
+        return LaserChannelConfiguration(
+            channel_id=LaserChannelId(channel_index),
+            analog_output="unconfigured",
+            diode_input="unconfigured",
+            shutter_output="unconfigured",
+            auxiliary_output="unconfigured",
+            minimum_command_volts=_DEFAULT_MINIMUM_COMMAND_VOLTS,
+            maximum_command_volts=_DEFAULT_MAXIMUM_COMMAND_VOLTS,
+        )
 
     def _clear_tabs(self) -> None:
         while self._tabs.count():
@@ -569,9 +619,12 @@ class LaserControlContent(ContentWidget):
     def _update_enabled_state(self, *, is_running: Optional[bool] = None) -> None:
         if is_running is None:
             is_running = self._operation_thread is not None
-        ready = self._is_editable and self._app_model.laser.is_connected and not is_running
+        can_edit = self._is_editable and not is_running
+        can_run = can_edit and self._app_model.laser.is_connected
         for tab in self._channel_tabs:
-            tab.set_controls_enabled(ready, ready and not self._is_capture_active)
+            can_run_pulse = can_run and tab.is_configured
+            can_run_ramp = can_run_pulse and not self._is_capture_active
+            tab.set_controls_enabled(can_edit, can_run_pulse, can_run_ramp)
 
     @invoke_method
     def set_is_editable(self, is_editable: bool):
