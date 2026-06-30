@@ -41,6 +41,8 @@ from tools.acquisition.view.training_plan_progress_content import TrainingPlanPr
 
 logger = get_verbose_logger(__name__)
 
+_REACHAQ_PROTOCOL_UI_ENABLED = False
+
 
 class MainContent(ContentWidget):
 
@@ -51,6 +53,7 @@ class MainContent(ContentWidget):
         super().__init__()
 
         self._app_model = app_model
+        self._protocol_ui_enabled = _REACHAQ_PROTOCOL_UI_ENABLED
 
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setObjectName("MainContent")
@@ -76,8 +79,10 @@ class MainContent(ContentWidget):
         self._mid_widget_manual = self._create_mid_widget_manual(app_model)
         mid_stacked_layout.addWidget(self._mid_widget_manual)
 
-        self._protocol_phase_progress_widget = self._create_protocol_phase_progress_widget()
-        mid_stacked_layout.addWidget(self._protocol_phase_progress_widget)
+        self._protocol_phase_progress_widget = None
+        if self._protocol_ui_enabled:
+            self._protocol_phase_progress_widget = self._create_protocol_phase_progress_widget()
+            mid_stacked_layout.addWidget(self._protocol_phase_progress_widget)
 
         # Third row // bottom widgets
         end_stacked_widget = self._end_stacked_widget = QWidget()
@@ -89,47 +94,54 @@ class MainContent(ContentWidget):
         end_widget_manual = self._end_widget_manual = self._create_end_widget_manual()
         end_stacked_layout.addWidget(end_widget_manual)
 
-        # we limit end_protocol_phase widget to max size between alarm and phase content:
-        def size_hint(orig=end_stacked_widget.sizeHint):
-            if end_stacked_layout.currentWidget() == end_protocol_phase_widget:
-                sz1 = self._training_phase_content.minimumSizeHint()
-                sz2 = self._alarm_content.minimumSizeHint()
-                w = max(sz1.width(), sz2.width())
-                h = max(sz1.height(), sz2.height())
-                return QSize(w, h)
-            else:
-                return orig()
-        end_stacked_widget.sizeHint = size_hint
+        self._training_plan_content = None
+        self._training_phase_content = None
+        self._training_plan_progress_content = None
+        self._training_phase_progress_content = None
+        self._protocol_phase_end_widget = None
 
-        def min_size(orig=end_stacked_widget.minimumSize):
-            if end_stacked_layout.currentWidget() == end_protocol_phase_widget:
-                sz1 = self._training_phase_content.minimumSize()
-                sz2 = self._alarm_content.minimumSize()
-                w = max(sz1.width(), sz2.width())
-                h = max(sz1.height(), sz2.height())
-                return QSize(w, h)
-            else:
-                return orig()
-        end_stacked_widget.minimumSize = min_size
+        if self._protocol_ui_enabled:
+            # we limit end_protocol_phase widget to max size between alarm and phase content:
+            def size_hint(orig=end_stacked_widget.sizeHint):
+                if end_stacked_layout.currentWidget() == end_protocol_phase_widget:
+                    sz1 = self._training_phase_content.minimumSizeHint()
+                    sz2 = self._alarm_content.minimumSizeHint()
+                    w = max(sz1.width(), sz2.width())
+                    h = max(sz1.height(), sz2.height())
+                    return QSize(w, h)
+                else:
+                    return orig()
+            end_stacked_widget.sizeHint = size_hint
 
-        # def max_size(orig=end_stacked_widget.maximumSize):
-        #     if end_stacked_layout.currentWidget() == end_protocol_phase_widget:
-        #         tpc = self._training_phase_content
-        #         h1 = tpc.maximumSize().height()    # or tpc.minimumSizeHint().height()
-        #         h2 = self._alarm_content.maximumSize().height()
-        #         sz.setHeight(max(h1, h2))
-        #     else:
-        #         return orig()
-        #     return sz
-        # end_stacked_widget.maximumSize = size_hint
+            def min_size(orig=end_stacked_widget.minimumSize):
+                if end_stacked_layout.currentWidget() == end_protocol_phase_widget:
+                    sz1 = self._training_phase_content.minimumSize()
+                    sz2 = self._alarm_content.minimumSize()
+                    w = max(sz1.width(), sz2.width())
+                    h = max(sz1.height(), sz2.height())
+                    return QSize(w, h)
+                else:
+                    return orig()
+            end_stacked_widget.minimumSize = min_size
 
-        end_protocol_phase_widget = self._protocol_phase_end_widget = self._create_protocol_phase_end_widget()
-        end_stacked_layout.addWidget(end_protocol_phase_widget)
+            # def max_size(orig=end_stacked_widget.maximumSize):
+            #     if end_stacked_layout.currentWidget() == end_protocol_phase_widget:
+            #         tpc = self._training_phase_content
+            #         h1 = tpc.maximumSize().height()    # or tpc.minimumSizeHint().height()
+            #         h2 = self._alarm_content.maximumSize().height()
+            #         sz.setHeight(max(h1, h2))
+            #     else:
+            #         return orig()
+            #     return sz
+            # end_stacked_widget.maximumSize = size_hint
 
-        self._training_plan_content.sizeHint = size_hint  # trying
-        # self._training_plan_content.minimumSize = size_hint
-        # self._training_phase_content.sizeHint = size_hint
-        # self._training_phase_content.minimumSize = size_hint
+            end_protocol_phase_widget = self._protocol_phase_end_widget = self._create_protocol_phase_end_widget()
+            end_stacked_layout.addWidget(end_protocol_phase_widget)
+
+            self._training_plan_content.sizeHint = size_hint  # trying
+            # self._training_plan_content.minimumSize = size_hint
+            # self._training_phase_content.sizeHint = size_hint
+            # self._training_phase_content.minimumSize = size_hint
 
         end_stacked_layout.setCurrentWidget(end_widget_manual)
 
@@ -164,6 +176,10 @@ class MainContent(ContentWidget):
         self.training_mode_changed.connect(self._update_training_mode)
         self.training_plan_changed.connect(self._update_training_plan)
 
+    @property
+    def protocol_ui_enabled(self) -> bool:
+        return self._protocol_ui_enabled
+
     def _create_top_widget_manual(self):
         widget = QWidget()
         widget.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
@@ -191,10 +207,7 @@ class MainContent(ContentWidget):
 
         top_layout.addStretch(1)
 
-        self._top_camera_content = CameraContent(app_model, self._app_model.top_camera)
-        self._top_camera_content.camera_view.setTitle("Top Camera")
-        top_layout.addWidget(self._top_camera_content)
-        self._content_widgets.append(self._top_camera_content)
+        self._top_camera_content = None
 
         top_layout.addStretch(1)
 
@@ -305,6 +318,13 @@ class MainContent(ContentWidget):
     def _update_training_mode(self, training_mode: TrainingMode):
         logger.verbose("updating training mode to %s", training_mode)
         alarm_content = self._alarm_content
+        if not self._protocol_ui_enabled:
+            self._alarm_content_manual_layout.removeWidget(alarm_content)
+            self._alarm_content_manual_layout.addWidget(alarm_content)
+            self._mid_stacked_layout.setCurrentWidget(self._mid_widget_manual)
+            self._end_stacked_layout.setCurrentWidget(self._end_widget_manual)
+            self.update()
+            return
         # remove from both, given if not present then it's identical to no-op,
         self._protocol_progress_alarm_content_layout.removeWidget(alarm_content)
         self._alarm_content_manual_layout.removeWidget(alarm_content)
@@ -320,6 +340,8 @@ class MainContent(ContentWidget):
         self.update()
 
     def _update_training_plan(self, plan: Optional[TrainingPlan]):
+        if not self._protocol_ui_enabled:
+            return
         logger.debug("setting plan to %s (%s)", plan, hex(id(plan)))
         self._training_phase_content.set_training_phase(
             None if plan is None else plan.current_phase,
@@ -345,7 +367,8 @@ class MainContent(ContentWidget):
         if model.right_camera.is_enabled:
             self._right_camera_content.update_image()
         if model.top_camera.is_enabled:
-            self._top_camera_content.update_image()
+            if self._top_camera_content is not None:
+                self._top_camera_content.update_image()
         self._analysis_content.use_cache()
 
     def refresh_pose(self, response: PoseResponse):
@@ -388,7 +411,8 @@ class MainContent(ContentWidget):
 
         self._app_model.left_camera.set_display_fcn(self._left_camera_content.refresh_image)
         self._app_model.right_camera.set_display_fcn(self._right_camera_content.refresh_image)
-        self._app_model.top_camera.set_display_fcn(self._top_camera_content.refresh_image)
+        if self._top_camera_content is not None:
+            self._app_model.top_camera.set_display_fcn(self._top_camera_content.refresh_image)
 
         for widget in self._content_widgets:
             widget.on_activated()
@@ -525,7 +549,7 @@ class MainContent(ContentWidget):
 
     @invoke_method
     def _hardware_model_property_changed(self, name: str, value, _):
-        if name == HardwareModel.TUNNEL_HEADFIX_ENABLED:
+        if name == HardwareModel.TUNNEL_HEADFIX_ENABLED and self._training_phase_content is not None:
             self._training_phase_content.set_tunnel_headfix_enabled(value)
 
     @invoke_method

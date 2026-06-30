@@ -831,6 +831,9 @@ class MainWindow(QMainWindow):
         self._reset_cage_clean_action.setToolTip(txt)
 
     def _set_autoclamp_evasion(self, det: AutoClampEvasionDetector):
+        if not self._app_model.hardware.tunnel_headfix_enabled:
+            self._reset_autoclamp_evasion_action.setVisible(False)
+            return
         det = self._app_model.analysis.autoclamp_evasion_detector
         action = self._reset_autoclamp_evasion_action
         action.setVisible(det.is_engaged or os.getenv("AUTOTRAINER_SHOW_AUTOCLAMP_EVASION") == "1")
@@ -976,22 +979,7 @@ class MainWindow(QMainWindow):
         combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         combo.addItem("Idle", userData=AppModelStatus.IDLE)
         combo.addItem("Running", userData=AppModelStatus.ACQUIRING)
-        combo.addItem("Animal in device", userData=AppModelStatus.ANIMAL_IN_DEVICE)
-        combo.addItem("Animal in training", userData=AppModelStatus.ANIMAL_IN_TRAINING)
         combo.currentIndexChanged.connect(self._on_system_mode_combo_changed)
-        def show_app_model_status_combo(combo=combo, orig_show=combo.showPopup):
-            in_training_idx = combo.findData(AppModelStatus.ANIMAL_IN_TRAINING)
-            item = combo.model().item(in_training_idx)
-            prev_flags = item.flags()
-            try:
-                dcs_cfg = app_model.behavior.algorithm.load_diamond_triangle_config()
-            except Exception as err:
-                logger.verbose("Cannot load diamond-triangle config: %s", err)
-                dcs_cfg = None
-            item.setFlags((prev_flags | Qt.ItemFlag.ItemIsEnabled) if dcs_cfg is not None and dcs_cfg.fully_valid
-                          else (prev_flags & ~Qt.ItemFlag.ItemIsEnabled))
-            orig_show()
-        combo.showPopup = show_app_model_status_combo
         toolbar.addWidget(combo)
         # toolbar.addAction(self.run_action)
         # toolbar.addAction(self.animal_in_device_action)
@@ -1000,11 +988,7 @@ class MainWindow(QMainWindow):
 
         toolbar.addAction(self.show_reach_event_action)
         toolbar.addAction(self._reset_pellet_loaded_count_action)
-        toolbar.addAction(self._reset_cage_clean_action)
         toolbar.addAction(self._reset_autoclamp_evasion_action)
-
-        toolbar.addAction(self.previous_training_phase_action)
-        toolbar.addAction(self.next_training_phase_action)
 
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -1033,11 +1017,7 @@ class MainWindow(QMainWindow):
 
         toolbar.addSeparator()
 
-        label = QLabel("Training Mode:")
-        label.setContentsMargins(8, 0, 0, 0)
-        toolbar.addWidget(label)
         combo = self._training_mode_combo = QComboBox()
-        toolbar.addWidget(combo)
         combo.setDuplicatesEnabled(False)
         for mode in TrainingMode:
             combo.addItem(mode.value,
@@ -1051,15 +1031,7 @@ class MainWindow(QMainWindow):
             app_model.training_mode = selected_mode
         combo.currentIndexChanged.connect(training_mode_index_changed)
 
-        label = QLabel("Protocol:")
-        label.setContentsMargins(8, 0, 0, 0)
-        widget = QWidget()
-        self._widget_training_plan_action = toolbar.addWidget(widget)
-        layout = QHBoxLayout(widget)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(label)
         combo = self._training_plan_combo = QComboBox()
-        layout.addWidget(combo)
 
         def training_plan_index_changed(_):
             plan_id = self._training_plan_combo.currentData()
@@ -1068,24 +1040,47 @@ class MainWindow(QMainWindow):
             app_model.training_plan = selected_plan
 
         combo.currentIndexChanged.connect(training_plan_index_changed)
+        self._widget_training_plan_action = None
 
-        def update_training_mode(training_mode: TrainingMode):
-            logger.debug("Updating training_mode to %s", training_mode)
-            is_non_manual = training_mode != TrainingMode.MANUAL
-            self._widget_training_plan_action.setVisible(is_non_manual)
-            self._status_training_widget.setVisible(is_non_manual)
-            animal = app_model.selected_animal
-            plan_id = None if animal is None else animal.training.current_protocol
-            training_plan_idx = self._training_plan_index_by_plan_id.get(plan_id, -1)
-            self._training_plan_combo.blockSignals(True)
-            self._training_plan_combo.setCurrentIndex(training_plan_idx)
-            self._training_plan_combo.blockSignals(False)
-            # self.main_content.training_plan_changed.emit(self._app_model.training_plan)
-            self._app_model.training_mode = training_mode
-            self._refresh_prev_next_phases()
+        if self.main_content.protocol_ui_enabled:
+            label = QLabel("Training Mode:")
+            label.setContentsMargins(8, 0, 0, 0)
+            toolbar.addWidget(label)
+            toolbar.addWidget(self._training_mode_combo)
 
-        update_training_mode(self._app_model.training_mode)
-        self.training_mode_changed.connect(update_training_mode)
+            label = QLabel("Protocol:")
+            label.setContentsMargins(8, 0, 0, 0)
+            widget = QWidget()
+            self._widget_training_plan_action = toolbar.addWidget(widget)
+            layout = QHBoxLayout(widget)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.addWidget(label)
+            layout.addWidget(self._training_plan_combo)
+
+            toolbar.addAction(self.previous_training_phase_action)
+            toolbar.addAction(self.next_training_phase_action)
+
+            def update_training_mode(training_mode: TrainingMode):
+                logger.debug("Updating training_mode to %s", training_mode)
+                is_non_manual = training_mode != TrainingMode.MANUAL
+                self._widget_training_plan_action.setVisible(is_non_manual)
+                self._status_training_widget.setVisible(is_non_manual)
+                animal = app_model.selected_animal
+                plan_id = None if animal is None else animal.training.current_protocol
+                training_plan_idx = self._training_plan_index_by_plan_id.get(plan_id, -1)
+                self._training_plan_combo.blockSignals(True)
+                self._training_plan_combo.setCurrentIndex(training_plan_idx)
+                self._training_plan_combo.blockSignals(False)
+                # self.main_content.training_plan_changed.emit(self._app_model.training_plan)
+                self._app_model.training_mode = training_mode
+                self._refresh_prev_next_phases()
+
+            update_training_mode(self._app_model.training_mode)
+            self.training_mode_changed.connect(update_training_mode)
+        else:
+            self._training_mode_combo.setCurrentIndex(self._training_mode_combo.findText(TrainingMode.MANUAL.value))
+            app_model.training_mode = TrainingMode.MANUAL
+            self._status_training_widget.setVisible(False)
 
         toolbar.addSeparator()
 
@@ -1195,6 +1190,7 @@ class MainWindow(QMainWindow):
                 action.setChecked(False)
             action.setVisible(is_enabled)
         self._status_label_magnet_intensity.setVisible(is_enabled)
+        self.calib_diamond_triangle_action.setVisible(is_enabled)
 
     def _configure_statusbar(self):
         self._status_label = QLabel("")
@@ -1483,6 +1479,10 @@ class MainWindow(QMainWindow):
 
     @invoke_method
     def _refresh_prev_next_phases(self):
+        if not self.main_content.protocol_ui_enabled:
+            self.previous_training_phase_action.setVisible(False)
+            self.next_training_phase_action.setVisible(False)
+            return
         attached = self._app_model.attached_plan
         if attached is None or self._app_model.training_mode != TrainingMode.MANUAL_WITH_PROTOCOL:
             self.previous_training_phase_action.setVisible(False)
