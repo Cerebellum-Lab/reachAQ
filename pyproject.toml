@@ -37,6 +37,7 @@ old_platform = [
 [project.scripts]
 auto-trainer-local = "tools.acquisition.gui:main"
 auto-trainer-headless = "tools.acquisition.headless:main"
+reachaq = "reachAQ.app:main"
 # etc... but is same than:
 # python -m tools.acquisition.headless   # for instance.
 #
@@ -61,6 +62,8 @@ where = [
 include = [
     "autotrainer.*",
     "tools",
+    "reachAQ",
+    "reachAQ.*",
 ]
 namespaces = true
 

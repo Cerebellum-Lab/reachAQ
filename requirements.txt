@@ -1,0 +1,10 @@
+# Local development/runtime install for reachAQ.
+#
+# Runtime dependencies are declared in pyproject.toml and the embedded
+# auto-trainer subproject pyproject files. Installing the local package pulls
+# those dependencies, including the PySide6 6.6.x cap needed for this app.
+-e .
+
+# Build frontend for producing local wheel artifacts:
+#   python -m build --wheel --outdir build/wheelhouse
+build >= 1.2, < 2
