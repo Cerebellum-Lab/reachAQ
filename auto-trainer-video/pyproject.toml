@@ -20,7 +20,7 @@ dependencies = [
     'auto-trainer-core',
 
     'numpy >= 1.23.5, < 2',
-    'opencv-python >= 4.12, < 5',
+    'opencv-python >= 4.10, < 4.12',
 
     # FLIR/spinnaker camera
     'spinnaker-python >= 3.2, < 3.3 ; platform_machine == "aarch64"',
