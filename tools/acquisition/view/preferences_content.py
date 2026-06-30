@@ -33,6 +33,7 @@ logger = get_verbose_logger(__name__)
 
 
 _DELAY_OR_DURATION_MAX_VALUE = 999_999  # in seconds, ~277 hours, ~= 11.5 days
+_REACHAQ_TOPCAM_PRESENCE_UI_ENABLED = False
 
 
 def apply_size_policy(tab, klasses):
@@ -1128,46 +1129,48 @@ class PreferencesContent(QWidget):
         # right side
         right_layout = QFormLayout()
 
-        right_layout.addRow("<b>TopCam Presence</b>", QWidget())
+        self._presence_sum_percent_threshold_spinbox = None
+        if _REACHAQ_TOPCAM_PRESENCE_UI_ENABLED:
+            right_layout.addRow("<b>TopCam Presence</b>", QWidget())
 
-        spinbox = self._presence_sum_percent_threshold_spinbox = QDoubleSpinBox()
-        spinbox.setRange(0, 100)
-        spinbox.setSingleStep(0.1)
-        spinbox.setDecimals(1)
-        spinbox.setValue(app_model.top_camera_presence_detection.pc_threshold)
-        def topcam_pres_det_pc_threshold_changed(value: float):
-            app_model.top_camera_presence_detection.pc_threshold = value
-        spinbox.valueChanged.connect(topcam_pres_det_pc_threshold_changed)
-        right_layout.addRow("% threshold:", spinbox)
+            spinbox = self._presence_sum_percent_threshold_spinbox = QDoubleSpinBox()
+            spinbox.setRange(0, 100)
+            spinbox.setSingleStep(0.1)
+            spinbox.setDecimals(1)
+            spinbox.setValue(app_model.top_camera_presence_detection.pc_threshold)
+            def topcam_pres_det_pc_threshold_changed(value: float):
+                app_model.top_camera_presence_detection.pc_threshold = value
+            spinbox.valueChanged.connect(topcam_pres_det_pc_threshold_changed)
+            right_layout.addRow("% threshold:", spinbox)
 
-        spinbox = QDoubleSpinBox()
-        spinbox.setRange(0, 100)
-        spinbox.setSingleStep(0.1)
-        spinbox.setDecimals(1)
-        spinbox.setValue(app_model.top_camera_presence_detection.pc_high_exclude_threshold)
-        def topcam_pres_det_high_exc_threshold_changed(value: float):
-            app_model.top_camera_presence_detection.pc_high_exclude_threshold = value
-        spinbox.valueChanged.connect(topcam_pres_det_high_exc_threshold_changed)
-        right_layout.addRow("high-% exclude threshold:", spinbox)
+            spinbox = QDoubleSpinBox()
+            spinbox.setRange(0, 100)
+            spinbox.setSingleStep(0.1)
+            spinbox.setDecimals(1)
+            spinbox.setValue(app_model.top_camera_presence_detection.pc_high_exclude_threshold)
+            def topcam_pres_det_high_exc_threshold_changed(value: float):
+                app_model.top_camera_presence_detection.pc_high_exclude_threshold = value
+            spinbox.valueChanged.connect(topcam_pres_det_high_exc_threshold_changed)
+            right_layout.addRow("high-% exclude threshold:", spinbox)
 
-        spinbox = QSpinBox()
-        spinbox.setRange(0, 255)
-        spinbox.setSingleStep(1)
-        spinbox.setValue(app_model.top_camera_presence_detection.mask_lower_zero)
-        def topcam_pres_det_mask_lower_zero_changed(value: float):
-            app_model.top_camera_presence_detection.mask_lower_zero = value
-        spinbox.valueChanged.connect(topcam_pres_det_mask_lower_zero_changed)
-        right_layout.addRow("Mask Lower Zero:", spinbox)
+            spinbox = QSpinBox()
+            spinbox.setRange(0, 255)
+            spinbox.setSingleStep(1)
+            spinbox.setValue(app_model.top_camera_presence_detection.mask_lower_zero)
+            def topcam_pres_det_mask_lower_zero_changed(value: float):
+                app_model.top_camera_presence_detection.mask_lower_zero = value
+            spinbox.valueChanged.connect(topcam_pres_det_mask_lower_zero_changed)
+            right_layout.addRow("Mask Lower Zero:", spinbox)
 
-        spinbox = QDoubleSpinBox()
-        spinbox.setRange(0, 100)
-        spinbox.setSingleStep(0.1)
-        spinbox.setDecimals(1)
-        spinbox.setValue(app_model.top_camera_presence_detection.max_delay_skip_threshold)
-        def topcam_pres_det_max_delay_skip_threshold_changed(value: float):
-            app_model.top_camera_presence_detection.max_delay_skip_threshold = value
-        spinbox.valueChanged.connect(topcam_pres_det_max_delay_skip_threshold_changed)
-        right_layout.addRow("Max Delay Skip Seconds:", spinbox)
+            spinbox = QDoubleSpinBox()
+            spinbox.setRange(0, 100)
+            spinbox.setSingleStep(0.1)
+            spinbox.setDecimals(1)
+            spinbox.setValue(app_model.top_camera_presence_detection.max_delay_skip_threshold)
+            def topcam_pres_det_max_delay_skip_threshold_changed(value: float):
+                app_model.top_camera_presence_detection.max_delay_skip_threshold = value
+            spinbox.valueChanged.connect(topcam_pres_det_max_delay_skip_threshold_changed)
+            right_layout.addRow("Max Delay Skip Seconds:", spinbox)
 
         #
         maint_mon = analysis.system_maintenance_alarm
