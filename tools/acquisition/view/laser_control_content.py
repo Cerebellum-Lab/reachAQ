@@ -118,13 +118,13 @@ class _LaserChannelTab(QWidget):
         self._trigger_edge = QComboBox()
         self._trigger_edge.addItems(("rising", "falling"))
 
-        self._open_shutter = QCheckBox("Open shutter")
+        self._open_shutter = self._make_checkbox("Open shutter")
         self._open_shutter.setChecked(True)
-        self._close_shutter = QCheckBox("Close shutter")
+        self._close_shutter = self._make_checkbox("Close shutter")
         self._close_shutter.setChecked(True)
-        self._enable_pmt = QCheckBox("PMT shutter")
-        self._emit_trigger = QCheckBox("Trigger DO")
-        self._emit_timing_trigger = QCheckBox("Timing DO")
+        self._enable_pmt = self._make_checkbox("PMT shutter")
+        self._emit_trigger = self._make_checkbox("Trigger DO")
+        self._emit_timing_trigger = self._make_checkbox("Timing DO")
         self._run_pulse_button = QPushButton("Run Pulse")
 
         pulse_layout.addWidget(QLabel("Amplitude:"), 0, 0)
@@ -142,11 +142,23 @@ class _LaserChannelTab(QWidget):
         pulse_layout.addWidget(QLabel("Trigger:"), 3, 0)
         pulse_layout.addWidget(self._trigger_source, 3, 1, 1, 2)
         pulse_layout.addWidget(self._trigger_edge, 3, 3)
-        pulse_layout.addWidget(self._open_shutter, 4, 0)
-        pulse_layout.addWidget(self._close_shutter, 4, 1)
-        pulse_layout.addWidget(self._enable_pmt, 4, 2)
-        pulse_layout.addWidget(self._emit_trigger, 5, 0)
-        pulse_layout.addWidget(self._emit_timing_trigger, 5, 1)
+        shutter_options = QWidget()
+        shutter_options_layout = QHBoxLayout(shutter_options)
+        shutter_options_layout.setContentsMargins(0, 0, 0, 0)
+        shutter_options_layout.setSpacing(12)
+        shutter_options_layout.addWidget(self._open_shutter)
+        shutter_options_layout.addWidget(self._close_shutter)
+        shutter_options_layout.addWidget(self._enable_pmt)
+        pulse_layout.addWidget(shutter_options, 4, 0, 1, 4)
+
+        trigger_options = QWidget()
+        trigger_options_layout = QHBoxLayout(trigger_options)
+        trigger_options_layout.setContentsMargins(0, 0, 0, 0)
+        trigger_options_layout.setSpacing(12)
+        trigger_options_layout.addWidget(self._emit_trigger)
+        trigger_options_layout.addWidget(self._emit_timing_trigger)
+        trigger_options_layout.addStretch(1)
+        pulse_layout.addWidget(trigger_options, 5, 0, 1, 3)
         pulse_layout.addWidget(self._run_pulse_button, 5, 3)
         layout.addWidget(pulse_group)
 
@@ -180,7 +192,7 @@ class _LaserChannelTab(QWidget):
         self._ramp_samples_per_step = QSpinBox()
         self._ramp_samples_per_step.setRange(1, 1000000)
         self._ramp_samples_per_step.setValue(100)
-        self._ramp_pmt = QCheckBox("PMT shutter")
+        self._ramp_pmt = self._make_checkbox("PMT shutter")
         self._run_ramp_button = QPushButton("Run Ramp")
 
         ramp_layout.addWidget(QLabel("Start:"), 0, 0)
@@ -191,8 +203,14 @@ class _LaserChannelTab(QWidget):
         ramp_layout.addWidget(self._ramp_steps, 1, 1)
         ramp_layout.addWidget(QLabel("Samples/step:"), 1, 2)
         ramp_layout.addWidget(self._ramp_samples_per_step, 1, 3)
-        ramp_layout.addWidget(self._ramp_pmt, 2, 0)
-        ramp_layout.addWidget(self._run_ramp_button, 2, 3)
+        ramp_actions = QWidget()
+        ramp_actions_layout = QHBoxLayout(ramp_actions)
+        ramp_actions_layout.setContentsMargins(0, 0, 0, 0)
+        ramp_actions_layout.setSpacing(12)
+        ramp_actions_layout.addWidget(self._ramp_pmt)
+        ramp_actions_layout.addStretch(1)
+        ramp_actions_layout.addWidget(self._run_ramp_button)
+        ramp_layout.addWidget(ramp_actions, 2, 0, 1, 4)
         layout.addWidget(ramp_group)
 
         self._pulse_controls = (
@@ -240,6 +258,12 @@ class _LaserChannelTab(QWidget):
         spinbox.setRange(channel.minimum_command_volts, channel.maximum_command_volts)
         spinbox.setValue(channel.minimum_command_volts)
         return spinbox
+
+    @staticmethod
+    def _make_checkbox(text: str) -> QCheckBox:
+        checkbox = QCheckBox(text)
+        checkbox.setSizePolicy(QSizePolicy.Policy.MinimumExpanding, QSizePolicy.Policy.Preferred)
+        return checkbox
 
     @staticmethod
     def _make_ms_spinbox(value: float) -> QDoubleSpinBox:
