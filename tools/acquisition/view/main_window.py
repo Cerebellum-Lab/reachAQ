@@ -980,6 +980,12 @@ class MainWindow(QMainWindow):
         app_model = self._app_model
 
         toolbar = QToolBar("Run Toolbar")
+        toolbar.setObjectName("RunToolbar")
+        toolbar.setIconSize(QSize(18, 18))
+        toolbar.setStyleSheet(
+            "#RunToolbar {background-color: #f3f4f6; border-bottom: 1px solid #c9cdd3; spacing: 6px; padding: 2px;}"
+            "#RunToolbar QLabel {color: #20242a;}"
+        )
         toolbar.setFloatable(False)
         toolbar.setMovable(False)
         self.addToolBar(toolbar)
@@ -1099,6 +1105,12 @@ class MainWindow(QMainWindow):
         if self._is_dev:
             self.addToolBarBreak()
             toolbar = self._dev_toolbar = QToolBar("Dev Toolbar")
+            toolbar.setObjectName("DevToolbar")
+            toolbar.setIconSize(QSize(18, 18))
+            toolbar.setStyleSheet(
+                "#DevToolbar {background-color: #f3f4f6; border-bottom: 1px solid #d6d9de; spacing: 6px; padding: 1px;}"
+                "#DevToolbar QLabel {color: #20242a;}"
+            )
             toolbar.setContentsMargins(0, 0, 0, 0)
             # toolbar.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
             self.addToolBar(toolbar)

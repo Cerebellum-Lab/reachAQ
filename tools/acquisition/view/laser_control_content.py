@@ -78,10 +78,28 @@ class _LaserChannelTab(QWidget):
         self._controls_can_edit = True
 
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setObjectName("LaserChannelTab")
+        self.setStyleSheet(
+            "#LaserChannelTab QLabel {color: #2f343a;}"
+            "#LaserChannelTab QLabel#LaserChannelSummary {color: #5b6470;}"
+            "#LaserChannelTab QLabel#LaserPreviewStatus {color: #5b6470;}"
+            "#LaserChannelTab QGroupBox {"
+            "color: #20242a; font-weight: 600; border: 1px solid #d1d5db; "
+            "margin-top: 8px; padding-top: 8px;"
+            "}"
+            "#LaserChannelTab QGroupBox::title {subcontrol-origin: margin; left: 8px; padding: 0px 3px;}"
+            "#LaserChannelTab QCheckBox {color: #2f343a; spacing: 4px;}"
+            "#LaserChannelTab QCheckBox:disabled {color: #68717d;}"
+            "#LaserChannelTab QLineEdit:disabled,"
+            "#LaserChannelTab QSpinBox:disabled,"
+            "#LaserChannelTab QDoubleSpinBox:disabled,"
+            "#LaserChannelTab QComboBox:disabled {color: #4f5965; background-color: #edf0f3;}"
+            "#LaserChannelTab QPushButton {min-height: 22px; padding: 2px 8px;}"
+        )
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(8)
+        layout.setContentsMargins(6, 4, 6, 6)
+        layout.setSpacing(6)
         layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
         sample_rate = "manual" if sample_rate_hz is None else f"{sample_rate_hz:g} Hz"
@@ -93,14 +111,17 @@ class _LaserChannelTab(QWidget):
         else:
             channel_text = f"Rate {sample_rate} | Hardware channel not mapped"
         channel_label = QLabel(channel_text)
+        channel_label.setObjectName("LaserChannelSummary")
         channel_label.setWordWrap(True)
         layout.addWidget(channel_label)
 
         pulse_group = QGroupBox("Pulse Train")
         pulse_layout = QGridLayout(pulse_group)
-        pulse_layout.setContentsMargins(8, 6, 8, 8)
-        pulse_layout.setHorizontalSpacing(8)
-        pulse_layout.setVerticalSpacing(4)
+        pulse_layout.setContentsMargins(8, 4, 8, 6)
+        pulse_layout.setHorizontalSpacing(6)
+        pulse_layout.setVerticalSpacing(3)
+        pulse_layout.setColumnMinimumWidth(0, 82)
+        pulse_layout.setColumnMinimumWidth(2, 76)
 
         self._amplitude = self._make_voltage_spinbox(channel)
         self._duration_ms = self._make_ms_spinbox(10.0)
@@ -132,37 +153,38 @@ class _LaserChannelTab(QWidget):
         self._emit_timing_trigger = self._make_checkbox("Timing DO")
         self._run_pulse_button = QPushButton("Run Pulse")
 
-        pulse_layout.addWidget(QLabel("Amplitude:"), 0, 0)
+        pulse_layout.addWidget(self._form_label("Amplitude:"), 0, 0)
         pulse_layout.addWidget(self._amplitude, 0, 1)
-        pulse_layout.addWidget(QLabel("Duration:"), 0, 2)
+        pulse_layout.addWidget(self._form_label("Duration:"), 0, 2)
         pulse_layout.addWidget(self._duration_ms, 0, 3)
-        pulse_layout.addWidget(QLabel("Baseline:"), 1, 0)
+        pulse_layout.addWidget(self._form_label("Baseline:"), 1, 0)
         pulse_layout.addWidget(self._baseline_ms, 1, 1)
-        pulse_layout.addWidget(QLabel("Post-stim:"), 1, 2)
+        pulse_layout.addWidget(self._form_label("Post-stim:"), 1, 2)
         pulse_layout.addWidget(self._post_stim_ms, 1, 3)
-        pulse_layout.addWidget(QLabel("Count:"), 2, 0)
+        pulse_layout.addWidget(self._form_label("Count:"), 2, 0)
         pulse_layout.addWidget(self._pulse_count, 2, 1)
-        pulse_layout.addWidget(QLabel("Frequency:"), 2, 2)
+        pulse_layout.addWidget(self._form_label("Frequency:"), 2, 2)
         pulse_layout.addWidget(self._frequency_hz, 2, 3)
-        pulse_layout.addWidget(QLabel("Trigger Mode:"), 3, 0)
+        pulse_layout.addWidget(self._form_label("Trigger Mode:"), 3, 0)
         pulse_layout.addWidget(self._trigger_mode, 3, 1)
-        pulse_layout.addWidget(QLabel("Trigger Type:"), 3, 2)
+        pulse_layout.addWidget(self._form_label("Trigger Type:"), 3, 2)
         pulse_layout.addWidget(self._trigger_edge, 3, 3)
-        pulse_layout.addWidget(QLabel("Trigger Source:"), 4, 0)
+        pulse_layout.addWidget(self._form_label("Trigger Source:"), 4, 0)
         pulse_layout.addWidget(self._trigger_source, 4, 1, 1, 3)
         shutter_options = QWidget()
         shutter_options_layout = QHBoxLayout(shutter_options)
         shutter_options_layout.setContentsMargins(0, 0, 0, 0)
-        shutter_options_layout.setSpacing(12)
+        shutter_options_layout.setSpacing(8)
         shutter_options_layout.addWidget(self._open_shutter)
         shutter_options_layout.addWidget(self._close_shutter)
         shutter_options_layout.addWidget(self._enable_pmt)
+        shutter_options_layout.addStretch(1)
         pulse_layout.addWidget(shutter_options, 5, 0, 1, 4)
 
         trigger_options = QWidget()
         trigger_options_layout = QHBoxLayout(trigger_options)
         trigger_options_layout.setContentsMargins(0, 0, 0, 0)
-        trigger_options_layout.setSpacing(12)
+        trigger_options_layout.setSpacing(8)
         trigger_options_layout.addWidget(self._emit_trigger)
         trigger_options_layout.addWidget(self._emit_timing_trigger)
         trigger_options_layout.addStretch(1)
@@ -171,8 +193,9 @@ class _LaserChannelTab(QWidget):
         layout.addWidget(pulse_group)
 
         self._preview_plot = PGWidget()
-        self._preview_plot.setMinimumHeight(150)
-        self._preview_plot.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._preview_plot.setMinimumHeight(120)
+        self._preview_plot.setMaximumHeight(180)
+        self._preview_plot.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._preview_plot.clear()
         self._preview_plot.setBackground("w")
         self._preview_plot.getAxis("bottom").setLabel("Time", units="s")
@@ -180,15 +203,18 @@ class _LaserChannelTab(QWidget):
         self._preview_plot.setMouseEnabled(x=False, y=False)
         self._preview_curve = self._preview_plot.plot([], [], pen=pg.mkPen(color=(30, 90, 180), width=2))
         self._preview_status = QLabel("")
+        self._preview_status.setObjectName("LaserPreviewStatus")
         self._preview_status.setWordWrap(True)
-        layout.addWidget(self._preview_plot, stretch=1)
+        layout.addWidget(self._preview_plot)
         layout.addWidget(self._preview_status)
 
         ramp_group = QGroupBox("Calibration Ramp")
         ramp_layout = QGridLayout(ramp_group)
-        ramp_layout.setContentsMargins(8, 6, 8, 8)
-        ramp_layout.setHorizontalSpacing(8)
-        ramp_layout.setVerticalSpacing(4)
+        ramp_layout.setContentsMargins(8, 4, 8, 6)
+        ramp_layout.setHorizontalSpacing(6)
+        ramp_layout.setVerticalSpacing(3)
+        ramp_layout.setColumnMinimumWidth(0, 82)
+        ramp_layout.setColumnMinimumWidth(2, 76)
 
         self._ramp_start = self._make_voltage_spinbox(channel)
         self._ramp_start.setValue(channel.minimum_command_volts)
@@ -203,18 +229,18 @@ class _LaserChannelTab(QWidget):
         self._ramp_pmt = self._make_checkbox("PMT shutter")
         self._run_ramp_button = QPushButton("Run Ramp")
 
-        ramp_layout.addWidget(QLabel("Start:"), 0, 0)
+        ramp_layout.addWidget(self._form_label("Start:"), 0, 0)
         ramp_layout.addWidget(self._ramp_start, 0, 1)
-        ramp_layout.addWidget(QLabel("Stop:"), 0, 2)
+        ramp_layout.addWidget(self._form_label("Stop:"), 0, 2)
         ramp_layout.addWidget(self._ramp_stop, 0, 3)
-        ramp_layout.addWidget(QLabel("Steps:"), 1, 0)
+        ramp_layout.addWidget(self._form_label("Steps:"), 1, 0)
         ramp_layout.addWidget(self._ramp_steps, 1, 1)
-        ramp_layout.addWidget(QLabel("Samples/step:"), 1, 2)
+        ramp_layout.addWidget(self._form_label("Samples/step:"), 1, 2)
         ramp_layout.addWidget(self._ramp_samples_per_step, 1, 3)
         ramp_actions = QWidget()
         ramp_actions_layout = QHBoxLayout(ramp_actions)
         ramp_actions_layout.setContentsMargins(0, 0, 0, 0)
-        ramp_actions_layout.setSpacing(12)
+        ramp_actions_layout.setSpacing(8)
         ramp_actions_layout.addWidget(self._ramp_pmt)
         ramp_actions_layout.addStretch(1)
         ramp_actions_layout.addWidget(self._run_ramp_button)
@@ -260,6 +286,13 @@ class _LaserChannelTab(QWidget):
         return self._is_configured
 
     @staticmethod
+    def _form_label(text: str) -> QLabel:
+        label = QLabel(text)
+        label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        label.setMinimumWidth(74)
+        return label
+
+    @staticmethod
     def _make_voltage_spinbox(channel: LaserChannelConfiguration) -> QDoubleSpinBox:
         spinbox = QDoubleSpinBox()
         spinbox.setDecimals(3)
@@ -272,7 +305,7 @@ class _LaserChannelTab(QWidget):
     @staticmethod
     def _make_checkbox(text: str) -> QCheckBox:
         checkbox = QCheckBox(text)
-        checkbox.setSizePolicy(QSizePolicy.Policy.MinimumExpanding, QSizePolicy.Policy.Preferred)
+        checkbox.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Preferred)
         return checkbox
 
     @staticmethod
@@ -493,15 +526,34 @@ class LaserControlContent(ContentWidget):
         self._channel_tabs: Tuple[_LaserChannelTab, ...] = tuple()
 
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setObjectName("LaserControlContent")
+        self.setStyleSheet(
+            "#LaserControlContent QLabel {color: #2f343a;}"
+            "#LaserControlContent QLabel#LaserMetaLabel {color: #5b6470;}"
+            "#LaserControlContent QLabel#LaserMetaValue {color: #20242a; font-weight: 600;}"
+            "#LaserControlContent QTabWidget::pane {border: 0px; background: #ffffff;}"
+            "#LaserControlContent QTabBar::tab {"
+            "background: #e7eaee; color: #20242a; border: 1px solid #c9cdd3; "
+            "padding: 4px 10px;"
+            "}"
+            "#LaserControlContent QTabBar::tab:selected {background: #ffffff; border-bottom-color: #ffffff;}"
+            "#LaserControlContent QTabBar::tab:!selected {margin-top: 2px;}"
+        )
 
         header_layout = QHBoxLayout()
         header_layout.setContentsMargins(0, 0, 0, 0)
-        header_layout.setSpacing(8)
-        header_layout.addWidget(QLabel("Backend:"))
+        header_layout.setSpacing(6)
+        backend_text = QLabel("Backend:")
+        backend_text.setObjectName("LaserMetaLabel")
+        header_layout.addWidget(backend_text)
         self._backend_label = QLabel("disabled")
+        self._backend_label.setObjectName("LaserMetaValue")
         header_layout.addWidget(self._backend_label)
-        header_layout.addWidget(QLabel("Rate:"))
+        rate_text = QLabel("Rate:")
+        rate_text.setObjectName("LaserMetaLabel")
+        header_layout.addWidget(rate_text)
         self._sample_rate_label = QLabel("manual")
+        self._sample_rate_label.setObjectName("LaserMetaValue")
         header_layout.addWidget(self._sample_rate_label)
 
         self._card_widget = CardWidget(title="Laser Control", header_right_layout=header_layout)
@@ -517,11 +569,12 @@ class LaserControlContent(ContentWidget):
         footer = QWidget()
         footer_layout = QHBoxLayout(footer)
         footer_layout.setContentsMargins(0, 0, 0, 0)
-        footer_layout.setSpacing(8)
+        footer_layout.setSpacing(6)
         self._progress = QProgressBar()
         self._progress.setRange(0, 0)
         self._progress.setVisible(False)
         self._status_label = QLabel("Laser controller not configured")
+        self._status_label.setObjectName("LaserStatus")
         footer_layout.addWidget(self._progress)
         footer_layout.addWidget(self._status_label, stretch=1)
         self._card_widget.footer.setContent(footer)

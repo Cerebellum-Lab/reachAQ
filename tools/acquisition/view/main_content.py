@@ -57,7 +57,7 @@ class MainContent(ContentWidget):
 
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setObjectName("MainContent")
-        self.setStyleSheet("#MainContent {background-color: #f7f7f7}")
+        self.setStyleSheet("#MainContent {background-color: #f3f4f6}")
 
         self._content_widgets: List[ContentWidget] = []
 
@@ -77,7 +77,7 @@ class MainContent(ContentWidget):
 
         main_layout = self._main_layout = QVBoxLayout(left_content)
         main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.setSpacing(4)
+        main_layout.setSpacing(6)
 
         self._top_widget_manual = self._create_top_widget_manual()
         main_layout.addWidget(self._top_widget_manual)
@@ -188,7 +188,7 @@ class MainContent(ContentWidget):
         widget.setContentsMargins(4, 4, 4, 0)
         top_layout = QHBoxLayout(widget)
         top_layout.setContentsMargins(4, 4, 4, 0)
-        top_layout.setSpacing(16)
+        top_layout.setSpacing(8)
         top_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
 
         # allow auto set of spacing between cameras
@@ -223,7 +223,7 @@ class MainContent(ContentWidget):
         mid_layout = QHBoxLayout(widget)
         mid_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         mid_layout.setContentsMargins(4, 4, 4, 0)
-        mid_layout.setSpacing(16)
+        mid_layout.setSpacing(8)
 
         behavior_content = BehaviorContent(
             app_model,
@@ -249,7 +249,7 @@ class MainContent(ContentWidget):
         end_layout = QHBoxLayout(widget)
         end_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         end_layout.setContentsMargins(4, 4, 4, 4)
-        end_layout.setSpacing(16)
+        end_layout.setSpacing(8)
 
         hardware_control_content = self._hardware_control_content = HardwareControlContent(self._app_model)
         end_layout.addWidget(hardware_control_content)
@@ -267,6 +267,12 @@ class MainContent(ContentWidget):
         tabs.setDocumentMode(True)
         tabs.setMinimumWidth(0)
         tabs.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        tabs.setStyleSheet(
+            "QTabWidget::pane {border: 1px solid #c9cdd3; background: #ffffff; top: -1px;}"
+            "QTabBar::tab {background: #e7eaee; color: #20242a; border: 1px solid #c9cdd3; padding: 4px 10px;}"
+            "QTabBar::tab:selected {background: #ffffff; border-bottom-color: #ffffff;}"
+            "QTabBar::tab:!selected {margin-top: 2px;}"
+        )
 
         laser_control_content = self._laser_control_content = LaserControlContent(self._app_model)
         tabs.addTab(laser_control_content, "Laser Control")

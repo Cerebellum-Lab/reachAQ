@@ -8,14 +8,15 @@ from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLayout
 
 
 class CardHeader(QWidget):
-    DEFAULT_BACKGROUND_COLOR = "#00b6de"
-    DEFAULT_TITLE_COLOR = "white"
+    DEFAULT_BACKGROUND_COLOR = "#eef1f4"
+    DEFAULT_TITLE_COLOR = "#20242a"
 
     @staticmethod
     def _make_main_layout():
         layout = QHBoxLayout()
         layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-        layout.setContentsMargins(6, 4, 4, 6)
+        layout.setContentsMargins(6, 3, 6, 3)
+        layout.setSpacing(6)
         return layout
 
     def __init__(self, title: str = "", background_color: Optional[str] = None, title_color: Optional[str] = None):
@@ -33,10 +34,12 @@ class CardHeader(QWidget):
         style = (
             f"""#CardHeader {{
             background-color: {background_color};
-            padding: 8px;
-            border-top-left-radius: 6px;
-            border-top-right-radius: 6px;
+            padding: 0px;
+            border-bottom: 1px solid #c9cdd3;
+            border-top-left-radius: 4px;
+            border-top-right-radius: 4px;
             }}""")
+        style += f"#CardHeader QLabel {{color: {title_color};}}"
         self.setStyleSheet(style)
 
         layout = self._layout = self._make_main_layout()

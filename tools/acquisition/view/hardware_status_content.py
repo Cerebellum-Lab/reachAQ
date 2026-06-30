@@ -40,6 +40,17 @@ class HardwareStatusContent(ContentWidget):
         self._message_handler = app_model.message_handler
         self._camera_status_labels: Dict[object, QLabel] = {}
 
+        self.setObjectName("HardwareStatusContent")
+        self.setStyleSheet(
+            "#HardwareStatusContent QLabel {color: #2f343a;}"
+            "#HardwareStatusContent QLabel#StatusSection {"
+            "color: #20242a; font-weight: 600; padding-top: 5px; padding-bottom: 2px;"
+            "border-bottom: 1px solid #d6d9de;"
+            "}"
+            "#HardwareStatusContent QLabel#StatusName {color: #5b6470;}"
+            "#HardwareStatusContent QLabel#StatusValue {color: #20242a;}"
+        )
+
         self._card_widget = CardWidget(title="Hardware Status")
         self._message_handler.property_changed += self._model_property_changed
 
@@ -51,7 +62,10 @@ class HardwareStatusContent(ContentWidget):
         layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         layout.setContentsMargins(8, 6, 8, 8)
         layout.setHorizontalSpacing(8)
-        layout.setVerticalSpacing(4)
+        layout.setVerticalSpacing(3)
+        layout.setColumnMinimumWidth(0, 118)
+        layout.setColumnStretch(0, 0)
+        layout.setColumnStretch(1, 1)
         content_layout.addLayout(layout)
 
         self._row = 0
@@ -112,15 +126,21 @@ class HardwareStatusContent(ContentWidget):
         self._refresh_status()
 
     def _add_section(self, title: str) -> QLabel:
-        label = QLabel(f"<b>{title}</b>")
-        label.setContentsMargins(0, 6, 0, 0)
+        label = QLabel(title)
+        label.setObjectName("StatusSection")
+        label.setContentsMargins(0, 4, 0, 0)
         self._grid_layout.addWidget(label, self._row, 0, 1, 2)
         self._row += 1
         return label
 
     def _add_row(self, label_text: str, value_widget: Optional[QLabel] = None) -> QLabel:
-        self._grid_layout.addWidget(QLabel(label_text), self._row, 0)
+        name_label = QLabel(label_text)
+        name_label.setObjectName("StatusName")
+        name_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        name_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._grid_layout.addWidget(name_label, self._row, 0)
         label = value_widget or QLabel("(unknown)")
+        label.setObjectName("StatusValue")
         label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self._grid_layout.addWidget(label, self._row, 1)
         self._row += 1
@@ -163,8 +183,11 @@ class HardwareStatusContent(ContentWidget):
 
         self._tunnel_section_label = self._add_section("Tunnel / Headfix")
         self._head_magnet_label = QLabel("Head magnet (%):")
+        self._head_magnet_label.setObjectName("StatusName")
+        self._head_magnet_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self._grid_layout.addWidget(self._head_magnet_label, self._row, 0)
         self._head_magnet = QLabel("(no updates)")
+        self._head_magnet.setObjectName("StatusValue")
         self._grid_layout.addWidget(self._head_magnet, self._row, 1)
         self._row += 1
 
@@ -345,13 +368,13 @@ class HardwareStatusContent(ContentWidget):
     def _set_label_status(self, label: QLabel, text: str, state: str) -> None:
         label.setText(text)
         if state == "ok":
-            label.setStyleSheet("color: #1b6e3c;")
+            label.setStyleSheet("color: #1b6e3c; font-weight: 500;")
         elif state == "error":
-            label.setStyleSheet("color: #b00020;")
+            label.setStyleSheet("color: #b00020; font-weight: 600;")
         elif state == "disabled":
-            label.setStyleSheet("color: #666;")
+            label.setStyleSheet("color: #68717d;")
         else:
-            label.setStyleSheet("color: #7a5c00;")
+            label.setStyleSheet("color: #8a5a00; font-weight: 500;")
 
     def _update_tunnel_headfix_visibility(self, is_enabled: bool):
         self._tunnel_section_label.setVisible(is_enabled)
