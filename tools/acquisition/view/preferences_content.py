@@ -92,9 +92,6 @@ class PreferencesContent(QWidget):
         self._detectors_tab = self._create_detectors_tab()
         tabs.addTab(self._detectors_tab, "Detectors")
 
-        self._alarms_tab = self._create_alarms_tab()
-        tabs.addTab(self._alarms_tab, "Alarms")
-
         self._advanced_tab = self._create_advanced_tab()
         tabs.addTab(self._advanced_tab, "Advanced")
 

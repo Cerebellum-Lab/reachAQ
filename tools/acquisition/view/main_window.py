@@ -16,7 +16,7 @@ from typing import List, Optional, Dict, Tuple, Callable, Union, Literal
 from PySide6.QtCore import Qt, QCoreApplication, Signal, QSize, QKeyCombination
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (QMainWindow, QStatusBar, QToolBar, QLabel, QMessageBox, QApplication,
-                               QSizePolicy, QWidget, QComboBox, QLineEdit, QFileDialog, QPushButton, QHBoxLayout,
+                               QSizePolicy, QWidget, QComboBox, QLineEdit, QFileDialog, QHBoxLayout,
                                QSpinBox, QDoubleSpinBox, QFrame, QDialog)
 import qtawesome as qta
 
@@ -169,8 +169,6 @@ class MainWindow(QMainWindow):
         user_preferences.property_changed += self._on_preferences_property_changed
 
         analysis = app_model.analysis
-        analysis.emergency_alarm_monitor.property_changed += self._on_alarm_monitor_property_changed
-        analysis.system_maintenance_alarm.property_changed += self._on_system_maintenance_prop_changed
         analysis.autoclamp_evasion_detector.property_changed += self._on_autoclamp_evasion_property_changed
 
         self.running_status_changed.connect(self._set_start_or_stop)
@@ -935,9 +933,6 @@ class MainWindow(QMainWindow):
         action = self._reset_animal_pellet_counts_action = QAction(QIcon(qta.icon("fa5s.sync")), tooltip, self)
         action.triggered.connect(self._reset_animal_pellet_counts)
 
-        action = self.emergency_stop_action = QAction("Emergency", self)
-        action.setCheckable(True)
-
         action = self.quit_action = QAction("Quit")
         action.setShortcut(QKeyCombination(Qt.Modifier.CTRL, Qt.Key.Key_Q))
         action.triggered.connect(lambda: self._app.quit())
@@ -966,7 +961,6 @@ class MainWindow(QMainWindow):
     def _configure_toolbar(self):
 
         app_model = self._app_model
-        behavior = app_model.behavior
 
         toolbar = QToolBar("Run Toolbar")
         toolbar.setFloatable(False)
@@ -1085,32 +1079,6 @@ class MainWindow(QMainWindow):
         toolbar.addSeparator()
 
         toolbar.addAction(self.preferences_action)
-
-        toolbar.addSeparator()
-
-        emergency_button = QPushButton("Emergency")
-        emergency_button.setCheckable(True)
-        emergency_button.setObjectName("EmergencyButton")
-        emergency_button.setStyleSheet("#EmergencyButton {background-color: red; color: white; min-width: 100px}")
-
-        @invoke_method
-        def update_emergency_ui(is_toggled: bool, source: str):
-            emergency_button.setText("Resume" if is_toggled else "Emergency")
-            self.setWindowTitle(f"{self._title} - BEHAVIOR ALGORITHM PAUSED - Source: {source}" if is_toggled else self._title)
-            if source != "user-button":
-                emergency_button.blockSignals(True)  # prevent overwrite of reason with user-button
-                emergency_button.setChecked(is_toggled)
-                emergency_button.blockSignals(False)
-
-        def emergency_stop_triggered(is_toggled: bool):
-            logger.verbose("emergency_stop_triggered: %s", is_toggled)
-            (behavior.emergency_stop if is_toggled else behavior.emergency_resume)("user-button")
-
-        emergency_button.toggled.connect(emergency_stop_triggered)
-        behavior.emergency_stopped += lambda src: update_emergency_ui(True, source=src)
-        behavior.emergency_resumed += lambda src: update_emergency_ui(False, source=src)
-
-        toolbar.addWidget(emergency_button)
 
         if self._is_dev:
             self.addToolBarBreak()
