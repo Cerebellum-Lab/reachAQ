@@ -304,10 +304,12 @@ class HardwareStatusContent(ContentWidget):
         except Exception as exc:
             return f"Config error: {exc}"
         parts = [transport.kind.value, transport.channel]
-        if transport.interface:
-            parts.append(transport.interface)
         if transport.bitrate:
             parts.append(f"{transport.bitrate} bps")
+        if transport.data_bitrate:
+            parts.append(f"data {transport.data_bitrate} bps")
+        if transport.fd:
+            parts.append("CAN-FD")
         return " / ".join(str(part) for part in parts if part)
 
     @staticmethod
