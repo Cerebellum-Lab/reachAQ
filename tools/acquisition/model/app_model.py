@@ -21,10 +21,9 @@ from typing import Optional, List, Dict, Callable, Any, Union, ClassVar, Protoco
 
 import pandas
 import yaml
-from autotrainer.core.analysis.alarm_detector import AlarmDetector
 
 from autotrainer.api import ApiSystemStatus, ApiDetectorKind, ApiProjectStatus, \
-    ApiAlarmStatus, ApiDetectorStatus, ApiTunnelDeviceStatus, ApiPelletDeviceStatus, ApiTrainingMode, \
+    ApiDetectorStatus, ApiTunnelDeviceStatus, ApiPelletDeviceStatus, ApiTrainingMode, \
     ApiSystemConfiguration, ApiApplicationMode, ApiCommand, ApiCommandRequestErrorKind
 from autotrainer.api.api_system_status import ApiBehaviorStatus, ApiReachStatus
 
@@ -286,7 +285,7 @@ class AppModel(ObservableObject):
         self._prev_raw_diamond_coord: Offset3DTuple = Offset3DTuple(math.nan, math.nan, math.nan)
         self._prev_valid_diamond_perf_c: float = -math.inf
         self._check_diamond_coord_enabled = True
-        self._trigger_emergency_on_bad_diamond_coord = False
+        self._report_bad_diamond_coord_error = False
         self._warned_bad_diamond_coord = False
         self._triggered_bad_diamond_coord = False
         self._p_start_capture = -math.inf
@@ -427,9 +426,6 @@ class AppModel(ObservableObject):
         algo.session_capture_ending += self._on_session_capture_ended
         # algo.session_ending += self._on_session_ending
 
-        behavior_model.emergency_stopped += self._on_emergency_stopped
-        behavior_model.emergency_resumed += self._on_emergency_resumed
-
         intersession = system_machine.intersession
         intersession.events.property_changed += self._on_intersession_property_changed
 
@@ -437,8 +433,6 @@ class AppModel(ObservableObject):
         pellet_m.events.pellet_loaded += self._on_pellet_loaded
         pellet_m.events.pellet_sent += self._on_pellet_sent
 
-        analysis.emergency_alarm_monitor.property_changed += self._on_alarm_monitor_property_changed
-        analysis.system_maintenance_alarm.property_changed += self._on_system_maint_prop_changed
         analysis.watchdog_monitor.property_changed += self._on_watchdog_property_changed
         analysis.autoclamp_evasion_detector.property_changed += self._on_autoclamp_evasion_property_changed
 
@@ -485,8 +479,7 @@ class AppModel(ObservableObject):
         self.current_day_changed(new_day)
 
     def check_max_pellet_loaded(self):
-        mon = self._analysis.system_maintenance_alarm
-        mon.update_pellet_loaded(self._preferences.pellet_load_count_total)
+        return None
 
     @property
     def app_lock(self) -> threading.RLock:
@@ -1608,10 +1601,6 @@ class AppModel(ObservableObject):
         # and:
         self._load_animals()
 
-        analysis = self._analysis
-        analysis.system_fault_alarm.set_persistence_config(configuration.persistence)
-        self._refresh_cage_clean_data()
-
         self.configuration_loaded_event(configuration)
 
         return True
@@ -1815,10 +1804,7 @@ class AppModel(ObservableObject):
             # yet, it will be done by pellet-machine automatically if/when status goes to animal-in-training
 
     def _refresh_cage_clean_data(self):
-        self._analysis.system_maintenance_alarm.set_cage_clean_next_day(
-            self._preferences.cage_clean_previous_day
-            + timedelta(days=self._behavior.algorithm.active_config.cage_cleaning.clean_days_interval)
-        )
+        return None
 
     def _on_preferences_property_changed(self, name: str, value, old_value):
         prefs = UserPreferences
@@ -1837,20 +1823,6 @@ class AppModel(ObservableObject):
         cur_led = self._hardware.color_led
         if cur_led is None or color != (cur_led.red, cur_led.green, cur_led.blue):
             self._hardware.set_color_led(*color)
-
-    def _on_alarm_monitor_property_changed(self, name, value, _):
-        alarm_mon = self._analysis.emergency_alarm_monitor
-        if name == alarm_mon.IS_ENGAGED:
-            self._update_led_color()
-        elif name == alarm_mon.ALARM_DETECTOR_PROPERTY_CHANGED:
-            detector = value[0]
-            detector: AlarmDetector
-            sub_name = value[1]
-            if sub_name in (detector.IS_ENGAGED, detector.CONFIG):
-                self._update_led_color()
-
-    def _on_system_maint_prop_changed(self, name, value, _):
-        self.check_max_pellet_loaded()
 
     def _on_watchdog_property_changed(self, name, value, old_value):
         wd_mon = self._analysis.watchdog_monitor
@@ -2029,12 +2001,11 @@ class AppModel(ObservableObject):
         ):
             if not self._triggered_bad_diamond_coord:
                 self._triggered_bad_diamond_coord = True
-                if self._trigger_emergency_on_bad_diamond_coord:
-                    self._behavior.emergency_stop(source="Diamond-Coord-Check")
+                if self._report_bad_diamond_coord_error:
                     self.on_error("Diamond not detected or invalid position",
                                   "Could not ensure valid diamond position for too long.\n\n"
                                   "Please re-execute a diamond-triangle calibration via menu Tools -> Calibrate Coordinate System\n\n"
-                                  "Then click Resume to resume from the emergency."
+                                  "Automatic pause is disabled in reachAQ, so acquisition was not paused automatically."
                                   )
                 else:
                     logger.error("Bad diamond coord check: distance=%.2f ; %s vs %s",
@@ -2263,12 +2234,22 @@ class AppModel(ObservableObject):
             return self._handle_rpc_async_command(request, self.capture_stop)
 
         elif cmd == ApiCommand.EMERGENCY_STOP:
-            self._behavior.emergency_stop(source="RpcService")
-            return dict(reason="RpcService")
+            return ApiCommandRequestResponse(
+                result=ApiCommandRequestResult.FAILED,
+                nonce=request.nonce,
+                command=cmd,
+                error_code=ApiCommandRequestErrorKind.COMMAND_ERROR,
+                error_message="Emergency stop is disabled in reachAQ; use STOP_ACQUISITION for controlled shutdown.",
+            )
 
         elif cmd == ApiCommand.EMERGENCY_RESUME:
-            self._behavior.emergency_resume(source="RpcService")
-            return dict(reason="RpcService")
+            return ApiCommandRequestResponse(
+                result=ApiCommandRequestResult.FAILED,
+                nonce=request.nonce,
+                command=cmd,
+                error_code=ApiCommandRequestErrorKind.COMMAND_ERROR,
+                error_message="Emergency resume is disabled in reachAQ; no emergency pause state is maintained.",
+            )
 
         elif cmd == ApiCommand.USER_DEFINED:
             logger.verbose("TODO")
@@ -2324,64 +2305,18 @@ class AppModel(ObservableObject):
             magnet_intensity = math.nan
         if magnet_intensity is None:
             magnet_intensity = math.nan
-        doors_mon = analysis.external_doors_alarm
-        doors_state = doors_mon.doors_state
-        alarm_mon = analysis.emergency_alarm_monitor
-        audio_mon = analysis.animal_thrashing_alarm
-        presence_mon = analysis.global_animal_presence_alarm
         misplaced_mon = analysis.pellet_misplaced_monitor
         animal = self._selected_animal
 
         detectors = [
             ApiDetectorStatus(
-                detector_id=ApiDetectorKind.frontDoor,
-                is_enabled=doors_mon.running,
-                is_active=doors_state.front.open or False,
-            ),
-            ApiDetectorStatus(
-                detector_id=ApiDetectorKind.slidingDoor,
-                is_enabled=doors_mon.running,
-                is_active=doors_state.sliding.open or False,
-            ),
-            ApiDetectorStatus(
-                detector_id=ApiDetectorKind.audioThrash,
-                is_enabled=audio_mon.running,
-                is_active=audio_mon.is_engaged,
-            ),
-            ApiDetectorStatus(
                 detector_id=ApiDetectorKind.pelletMisplaced,
                 is_enabled=misplaced_mon.running,
                 is_active=misplaced_mon.is_engaged,
             ),
-            ApiDetectorStatus(
-                detector_id=ApiDetectorKind.deviceAckTimeOut,
-                is_enabled=self._acquisition_started,
-                is_active=hard.device_ack_timeout_engaged,
-            ),
         ]
-        if tunnel_headfix_enabled:
-            load_cell = analysis.load_cell_monitor
-            detectors.insert(
-                2,
-                ApiDetectorStatus(
-                    detector_id=ApiDetectorKind.loadCellThrash,
-                    is_enabled=load_cell.running,
-                    is_active=load_cell.thrashing_detected,
-                ),
-            )
 
         alarms = []
-        for alarm in analysis.alarms:
-            alarm_cfg = alarm.config
-            alarms.append(
-                ApiAlarmStatus(
-                    alarm_id=alarm.alarm_api_kind,
-                    is_enabled=alarm_cfg.use,
-                    is_active=alarm.is_engaged,
-                    is_stop_condition=alarm_cfg.is_emergency_condition,
-                    is_auto_resume_enabled=alarm_cfg.allow_autoresume_on_cleared,
-                )
-            )
 
         dcs_pos_xyz = hard.last_dcs_position
         dcs_send_xyz = hard.last_dcs_set_position
@@ -2433,15 +2368,6 @@ class AppModel(ObservableObject):
         return system_status
 
     #
-
-    def _on_emergency_stopped(self, source: str):
-        s = "\n".join(source.split(" "))
-        self._right_camera.set_text_overlay(f"Emergency: {s}", color="red")
-        self._update_led_color()
-
-    def _on_emergency_resumed(self, source):
-        self._right_camera.set_text_overlay(None)
-        self._update_led_color()
 
     # pellet machine events
 

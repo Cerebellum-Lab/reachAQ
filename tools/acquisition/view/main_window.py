@@ -809,24 +809,15 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def _set_reset_vat_text(self):
-        analysis = self._app_model.analysis
-        maint_cfg = analysis.system_maintenance_alarm.config
         prefs = self._preferences
         txt = (
             f"Reset vat pellet count (vat refilled)\n"
-            f"{prefs.pellet_load_count_total} of "
-            f"{maint_cfg.max_pellets_loaded_count} pellets presented before refill"
+            f"{prefs.pellet_load_count_total} pellets presented since refill"
         )
         self._reset_pellet_loaded_count_action.setToolTip(txt)
 
     def _set_reset_cage_clean_text(self):
-        n_days = self._app_model.get_days_before_cage_clean()
-        if n_days < 0:
-            msg = f"Cage cleaning is overdue by {-n_days} days"
-        else:
-            msg = f"{n_days} days until next required cleaning"
-        txt = f"Mark the cage as cleaned.\n{msg}"
-        self._reset_cage_clean_action.setToolTip(txt)
+        self._reset_cage_clean_action.setToolTip("Mark the cage as cleaned.")
 
     def _set_autoclamp_evasion(self, det: AutoClampEvasionDetector):
         if not self._app_model.hardware.tunnel_headfix_enabled:
@@ -994,7 +985,6 @@ class MainWindow(QMainWindow):
         self._notes.setText(self._app_model.notes)
         self._notes.textChanged.connect(self.notes_changed)
         self._notes.setContentsMargins(4, 0, 8, 0)
-        # note: this margin allows the emergency button to be greater
         toolbar.addWidget(self._notes)
 
         toolbar.addWidget(QLabel("Subject:"))
@@ -1222,16 +1212,6 @@ class MainWindow(QMainWindow):
         elif name == prefs.SERIAL_NUMBER:
             self._title = _make_window_title(prefs)
             self.setWindowTitle(self._title)
-
-    @invoke_method
-    def _on_alarm_monitor_property_changed(self, name, value, _):
-        pass
-
-    @invoke_method
-    def _on_system_maintenance_prop_changed(self, name, value, _):
-        mon = self._app_model.analysis.system_maintenance_alarm
-        if name == mon.CONFIG:
-            self._set_reset_vat_text()
 
     def _simulate_intersession_segmentation(self, intersession_block):
         logger.verbose("Simulate feed-intersession-analysis: %s", intersession_block)

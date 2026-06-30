@@ -3,10 +3,8 @@ from datetime import datetime
 from typing import Optional, Callable
 
 from autotrainer.behavior import SystemMachine, InferenceProtocol, BehaviorAlgorithm, SystemState, IntersessionState
-from autotrainer.behavior.behavior_algorithm import BehaviorAlgoProps, BehaviorAlgoStatus
 from autotrainer.core import (ObservableObject, ProjectInfo, SensorAnalysis, BehaviorConfiguration,
-                              SystemMessageHandler, EventManager, ApiEventKind)
-from autotrainer.core.analysis.alarm_monitor import EmergencyReason, emergency_reason_2_api_alarm_kind
+                              SystemMessageHandler, ApiEventKind)
 from autotrainer.core.event import post_api_event_content
 from autotrainer.core.logging import get_verbose_logger
 from autotrainer.core.video_detection import PresenceDetectionAttrs
@@ -23,9 +21,8 @@ class BehaviorModel(ObservableObject, ProjectDependentProtocol):
     aspects of the behavior system that are specific to the application.  General behavior functionality should be
     located in the module.
 
-    Emergency stopped and resumed are defined as dedicated events due to their application-wide interest and possible
-    subscription.  Anything that triggers an emergency stop/resume should pass through the `emergency_stop` and
-    `emergency_resume` methods to ensure
+    Emergency stopped/resumed events are retained for compatibility with upstream code, but reachAQ disables alarm-driven
+    emergency behavior and rejects direct emergency-stop/resume requests explicitly.
     """
 
     # events type hint
@@ -67,7 +64,6 @@ class BehaviorModel(ObservableObject, ProjectDependentProtocol):
         # actually unused event (pellet.state)
 
         hardware_model.property_changed += self._hardware_model_property_changed
-        analysis.emergency_alarm_monitor.property_changed += self._alarm_monitor_property_changed
 
     @BehaviorAlgorithm.relay_func(wait=False)
     def _hardware_model_property_changed(self, name, value, _):
@@ -85,65 +81,6 @@ class BehaviorModel(ObservableObject, ProjectDependentProtocol):
         algo.auto_close_gate_on_intersession_config.enabled = False
         analysis.auto_tunnel_sweep_monitor.config.enabled = False
         analysis.auto_tunnel_sweep_monitor.stop()
-
-        thrash_alarm = analysis.animal_thrashing_alarm
-        thrash_cfg = thrash_alarm.config
-        thrash_changed = (
-            thrash_cfg.load_cell_thrash_percent_on != 0
-            or thrash_cfg.load_cell_thrash_count != 0
-        )
-        if thrash_changed:
-            thrash_cfg.load_cell_thrash_percent_on = 0
-            thrash_cfg.load_cell_thrash_count = 0
-            thrash_alarm.property_changed(thrash_alarm.CONFIG, thrash_cfg, None)
-
-        for alarm in (analysis.presence_in_cage_alarm, analysis.animal_evasion_alarm):
-            cfg = alarm.config
-            if cfg.use:
-                cfg.use = False
-                alarm.property_changed(alarm.CONFIG, cfg, None)
-
-    @BehaviorAlgorithm.relay_func(wait=False)
-    def _alarm_monitor_property_changed(self, name, value, old_value):
-        # logger.debug("alarm-mon: %s : %s -> %s", name, old_value, value)
-        alarm_mon = self._analysis.emergency_alarm_monitor
-        if name == alarm_mon.IS_ENGAGED:
-            algo = self._system_machine.algorithm
-            algo_status = algo.status
-            if not value:
-                # nothing engaged, all ok
-                if algo.algo_paused:
-                    self.emergency_resume("alarm-monitor-resumed")
-            else:
-                if algo_status is BehaviorAlgoStatus.ANIMAL_IN_TRAINING:
-                    valid_reasons = list(EmergencyReason)
-                elif algo_status is BehaviorAlgoStatus.ANIMAL_IN_DEVICE:
-                    valid_reasons = {  # == all but mouse thrashing, should we include it ?
-                        EmergencyReason.DOORS_OPEN,
-                        EmergencyReason.GLOBAL_ANIMAL_PRESENCE,
-                        EmergencyReason.DEVICE_COMM_ERROR,
-                        EmergencyReason.SYSTEM_FAULT,
-                        EmergencyReason.SYSTEM_MAINTENANCE,
-                    }
-                else:  # idle or acquiring (== running)
-                    valid_reasons = {
-                        EmergencyReason.SYSTEM_FAULT,
-                        EmergencyReason.SYSTEM_MAINTENANCE,
-                        EmergencyReason.DEVICE_COMM_ERROR,
-                    }
-                #
-                engaged_reasons = alarm_mon.engaged_reasons
-                filtered_valid_reasons = list(filter(lambda v: v in valid_reasons, engaged_reasons))
-                logger.verbose("filtered_reasons=%s", filtered_valid_reasons)
-                if len(filtered_valid_reasons) > 0:
-                    # at least one possible valid reason engaged
-                    reasons = " ".join(reason.name for reason in engaged_reasons)
-                    self.emergency_stop(f"alarm-monitor: {reasons}")
-                else:
-                    logger.verbose("skipping emergency stop ; algo status=%s reasons=%s",
-                                   algo_status, engaged_reasons)
-                    if algo.algo_paused:
-                        self.emergency_resume("alarm-monitor-no-valid-condition-remaining")
 
     @property
     def analysis(self) -> SensorAnalysis:
@@ -178,19 +115,6 @@ class BehaviorModel(ObservableObject, ProjectDependentProtocol):
         analysis.audio_thrashing_monitor.config = config.audio
         analysis.auto_tunnel_sweep_monitor.config = config.auto_tunnel_sweep
         analysis.autoclamp_evasion_detector.config = config.autoclamp_evasion_detector
-        #
-        alarm_cfg = config.emergency_alarm
-        analysis.emergency_alarm_monitor.config = alarm_cfg
-        # also need to set explicitly the different alarm configs on their alarm instance:
-        analysis.animal_evasion_alarm.config = alarm_cfg.animal_evasion
-        analysis.animal_thrashing_alarm.config = alarm_cfg.animal_thrashing
-        analysis.system_fault_alarm.config = alarm_cfg.system_fault
-        analysis.system_maintenance_alarm.config = alarm_cfg.system_maintenance
-        analysis.presence_in_cage_alarm.config = alarm_cfg.presence_in_cage
-        analysis.global_animal_presence_alarm.config = alarm_cfg.global_animal_presence
-        analysis.device_comm_alarm.config = alarm_cfg.device_comm_error
-        analysis.external_doors_alarm.config = alarm_cfg.external_doors
-        # so that they emit the CONFIG changed event.
         system_m.tunnel_headfix_enabled = self._hardware_model.tunnel_headfix_enabled
         if not self._hardware_model.tunnel_headfix_enabled:
             self._disable_tunnel_headfix_behavior()
@@ -215,16 +139,6 @@ class BehaviorModel(ObservableObject, ProjectDependentProtocol):
         config.auto_tare = analysis.load_cell_tare_monitor.save_configuration()
         config.headbar_pressure = analysis.headbar_pressure_monitor.config
         config.audio = analysis.audio_thrashing_monitor.config
-        #
-        alarm_cfg = config.emergency_alarm = analysis.emergency_alarm_monitor.config
-        alarm_cfg.external_doors = analysis.external_doors_alarm.config
-        alarm_cfg.global_animal_presence = analysis.global_animal_presence_alarm.config
-        alarm_cfg.device_comm_error = analysis.device_comm_alarm.config
-        alarm_cfg.presence_in_cage = analysis.presence_in_cage_alarm.config
-        alarm_cfg.animal_thrashing = analysis.animal_thrashing_alarm.config
-        alarm_cfg.system_fault = analysis.system_fault_alarm.config
-        alarm_cfg.system_maintenance = analysis.system_maintenance_alarm.config
-        alarm_cfg.animal_evasion = analysis.animal_evasion_alarm.config
 
         top_cam = algo.top_camera_presence_detection
         config.topcam_presence_detection = None if top_cam is None else top_cam.to_config()
@@ -264,55 +178,31 @@ class BehaviorModel(ObservableObject, ProjectDependentProtocol):
 
     @BehaviorAlgorithm.relay_func()
     def emergency_stop(self, source: str):
-        algo = self._system_machine.algorithm
-        logger.info("emergency_stop called: %s - current=%s", source, algo.algo_paused)
-        if algo.algo_paused and source == self._source_emergency:
-            return
-        algo.algo_paused = True
-        self._source_emergency = source
-        api_alarm_kinds = list(map(emergency_reason_2_api_alarm_kind,
-                                   self._analysis.emergency_alarm_monitor.engaged_reasons))
-        post_api_event_content(
-            ApiEventKind.emergencyStop,
-            data=dict(reason=source, active_alarms=api_alarm_kinds))
-        self.emergency_stopped(source)
+        raise RuntimeError(
+            f"Emergency stop is disabled in reachAQ; request source={source!r}. "
+            "Use stop acquisition for controlled shutdown."
+        )
 
     @BehaviorAlgorithm.relay_func()
     def emergency_resume(self, source: str):
-        algo = self._system_machine.algorithm
-        logger.info("emergency_resume called: %s - current=%s", source, algo.algo_paused)
-        if not algo.algo_paused:
-            return
-        if self._source_emergency == "user-button" and source != "user-button":
-            logger.notice("Refusing resume from emergency given was set by user ; resume source=%s", source)
-            return
-        algo.algo_paused = False
-        self._source_emergency = None
-        post_api_event_content(ApiEventKind.emergencyResume, data=dict(reason=source))
-        self.emergency_resumed(source)
+        raise RuntimeError(
+            f"Emergency resume is disabled in reachAQ; request source={source!r}. "
+            "No emergency pause state is maintained."
+        )
 
     def get_led_color(self, *, now: Optional[datetime]=None):
         if now is None:
             now = datetime.now()
         algo = self._system_machine.algorithm
         cfg_led = algo.active_config.led_alarm
-        alarm_mon = self._analysis.emergency_alarm_monitor
-        if alarm_mon.is_engaged or algo.algo_paused:
-            color = (100, 0, 0)  # red
-        else:
-            is_warn = any(
-                det.is_engaged and det.config.use and not det.config.is_emergency_condition
-                for det in (ctx.detector for ctx in alarm_mon.alarms.values())
-            )
-            color = (100, 100, 0) if is_warn else (0, 100, 0)
-            # yellow or green
-            cur_time = now.time()
-            start, stop = cfg_led.start_ignore_hour, cfg_led.stop_ignore_hour
-            in_ignore_window = (
-                (start <= cur_time <= stop)
-                if start < stop
-                else (cur_time >= start or cur_time <= stop)
-            )
-            if in_ignore_window:
-                color = (0, 0, 0)
+        color = (0, 100, 0)
+        cur_time = now.time()
+        start, stop = cfg_led.start_ignore_hour, cfg_led.stop_ignore_hour
+        in_ignore_window = (
+            (start <= cur_time <= stop)
+            if start < stop
+            else (cur_time >= start or cur_time <= stop)
+        )
+        if in_ignore_window:
+            color = (0, 0, 0)
         return color

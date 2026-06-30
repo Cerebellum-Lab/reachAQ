@@ -26,7 +26,7 @@ from .audio_spectrum_monitor import AudioSpectrumThrashMonitor
 from .headbar_pressure_monitor import HeadbarPressureMonitor
 from .load_cell_monitor import LoadCellMonitor
 from .load_cell_tare_monitor import LoadCellTareMonitor
-from .alarm_monitor import EmergencyAlarmMonitor, EmergencyReason
+from .alarm_monitor import EmergencyAlarmMonitor
 from .global_animal_presence_monitor import GlobalAnimalPresenceAlarm
 from .external_doors_monitor import ExternalDoorsAlarm
 from .pellet_position_monitor import PelletMisplacedDetector
@@ -37,6 +37,12 @@ from .system_maintenance_alarm import SystemMaintenanceAlarm
 from .system_fault_monitor import SystemFaultAlarm
 
 logger = get_verbose_logger(__name__)
+
+
+def _disable_alarm_config(config):
+    for attr in ("use", "is_emergency_condition", "allow_autoresume_on_cleared"):
+        if hasattr(config, attr):
+            setattr(config, attr, False)
 
 
 # TODO: Separate true analysis from data recording to file(s) for post-analysis.
@@ -106,57 +112,42 @@ class SensorAnalysis(ObservableObject):
             topcam_presence_attrs=topcam_presence,
         )
 
-        alarm_mon = self._alarm_monitor = EmergencyAlarmMonitor()
+        self._alarm_monitor = EmergencyAlarmMonitor()
 
         self._autoclamp_evasion_detector = AutoClampEvasionDetector(
             loadcell_detector=self._load_cell_monitor,
             headbar_detector=self._headbar_pressure_monitor,
         )
         self._animal_evasion_alarm = AnimalEvasionAlarm()
-        self._animal_evasion_alarm.register_sub_detector("autoclamp_evasion", self._autoclamp_evasion_detector)
-
-        #  dynamically handled alarm sub-monitors:
-        reg_alarm_cond = alarm_mon.register_detector
-        reg_alarm_cond(EmergencyReason.ANIMAL_EVASION, self._animal_evasion_alarm)
-        reg_alarm_cond(EmergencyReason.MOUSE_THRASHING, self._animal_thrash_alarm)
-        reg_alarm_cond(EmergencyReason.SYSTEM_MAINTENANCE, self._system_maintenance_alarm)
-        reg_alarm_cond(EmergencyReason.SYSTEM_FAULT, self._system_fault_alarm)
-        reg_alarm_cond(EmergencyReason.DOORS_OPEN, self._external_doors_alarm)
-        reg_alarm_cond(EmergencyReason.GLOBAL_ANIMAL_PRESENCE, self._global_animal_presence_alarm)
-        reg_alarm_cond(EmergencyReason.IN_CAGE_AFTER_EXIT_TUNNEL, self._presence_in_cage_alarm)
-        reg_alarm_cond(EmergencyReason.DEVICE_COMM_ERROR, self._device_comm_alarm)
 
         self._perf_monitor = PerfMonitor(name="<sensor-analysis>", units="mps", report_window=30)
 
+        alarm_candidates = [
+            self._animal_thrash_alarm,
+            self._animal_evasion_alarm,
+            self._system_maintenance_alarm,
+            self._system_fault_alarm,
+            self._external_doors_alarm,
+            self._global_animal_presence_alarm,
+            self._presence_in_cage_alarm,
+            self._device_comm_alarm,
+        ]
+
         self._detectors = [
-            self._alarm_monitor,  # put first
             self._load_cell_monitor,
             self._tare_detector,
             self._audio_thrashing_monitor,
             self._pellet_misplaced_monitor,
             self._auto_tunnel_sweep_monitor,
             self._watchdog_monitor,
-            self._system_maintenance_alarm,
-            self._system_fault_alarm,
-            self._global_animal_presence_alarm,
-            self._presence_in_cage_alarm,
-            self._device_comm_alarm,
-            self._external_doors_alarm,
-            self._animal_thrash_alarm,
             self._autoclamp_evasion_detector,
-            self._animal_evasion_alarm,
         ]
 
-        self._alarms = [
-            self._animal_thrash_alarm,
-            self._animal_evasion_alarm,
-            self._system_maintenance_alarm,
-            self._system_fault_alarm,
-            self._external_doors_alarm,
-            self._global_animal_presence_alarm,
-            self._presence_in_cage_alarm,
-            self._device_comm_alarm,
-        ]
+        logger.info("Alarm and emergency monitors disabled for reachAQ runtime")
+        _disable_alarm_config(self._alarm_monitor.config)
+        for alarm in alarm_candidates:
+            _disable_alarm_config(alarm.config)
+        self._alarms = []
 
     @property
     def alarms(self) -> List[AlarmDetector]:
