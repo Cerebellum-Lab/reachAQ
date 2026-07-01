@@ -16,6 +16,7 @@ class NidaqDevicePorts:
 def discover_nidaq_devices() -> Tuple[Tuple[NidaqDevicePorts, ...], Optional[str]]:
     try:
         from nidaqmx.system import System
+        from nidaqmx.errors import DaqNotFoundError
     except ModuleNotFoundError:
         return tuple(), (
             "NI-DAQmx discovery is unavailable because the nidaqmx Python package is not installed."
@@ -44,6 +45,11 @@ def discover_nidaq_devices() -> Tuple[Tuple[NidaqDevicePorts, ...], Optional[str
                 )
             )
         return tuple(devices), None
+    except DaqNotFoundError as exc:
+        return tuple(), (
+            "NI-DAQmx discovery is unavailable because the NI-DAQmx runtime/C driver is not installed "
+            f"or not loadable by this OS environment: {exc}"
+        )
     except Exception as exc:
         return tuple(), f"NI-DAQmx discovery failed: {exc}"
 
