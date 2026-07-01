@@ -62,6 +62,13 @@ logger = get_verbose_logger(__name__)
 
 _this_dir = Path(__file__).parent.resolve()
 
+_TOOLBAR_ICON_COLOR = "#20242a"
+_TOOLBAR_ICON_WARNING_COLOR = "#b00020"
+
+
+def _toolbar_icon(name: str, *, color: str = _TOOLBAR_ICON_COLOR) -> QIcon:
+    return QIcon(qta.icon(name, color=color))
+
 
 _calibrate_timer = make_daemon_timer
 
@@ -86,6 +93,7 @@ class MainWindow(QMainWindow):
 
     training_mode_changed = Signal(TrainingMode)
     running_status_changed = Signal(bool)  # True == running/acquiring
+    hardware_refresh_finished = Signal(str, bool)  # message, is_error
     # todo: integrate within on_app_model_status_changed event handling
 
     def __init__(
@@ -113,6 +121,7 @@ class MainWindow(QMainWindow):
         self._close_event = None
         self._start_capture_thread = None
         self._stop_capture_thread = None
+        self._hardware_refresh_thread = None
 
         self.setWindowTitle(self._title)
 
@@ -173,6 +182,7 @@ class MainWindow(QMainWindow):
         analysis.autoclamp_evasion_detector.property_changed += self._on_autoclamp_evasion_property_changed
 
         self.running_status_changed.connect(self._set_start_or_stop)
+        self.hardware_refresh_finished.connect(self._on_hardware_refresh_finished)
         #
         self._reload_animals(self._app_model.animals)  # after all property_changed connect above
         #
@@ -206,6 +216,7 @@ class MainWindow(QMainWindow):
         stopped = not started
         self.edit_camera_settings_action.setEnabled(stopped)
         self.edit_daq_ports_action.setEnabled(stopped)
+        self.refresh_hardware_action.setEnabled(stopped and self._hardware_refresh_thread is None)
         self.make_3d_calib_action.setEnabled(stopped)
         #
         run_action = self.run_action
@@ -213,11 +224,11 @@ class MainWindow(QMainWindow):
         run_action.setChecked(started)
         run_action.blockSignals(False)
         if started:
-            icon = qta.icon('ei.stop')
+            icon = _toolbar_icon('ei.stop')
             run_action.setText("Stop")
             run_action.setIcon(icon)
         else:
-            icon = qta.icon('ei.play')
+            icon = _toolbar_icon('ei.play')
             run_action.setText("Start")
             run_action.setIcon(icon)
 
@@ -225,6 +236,7 @@ class MainWindow(QMainWindow):
         app_model = self._app_model
         self.run_action.setEnabled(False)
         self.make_3d_calib_action.setEnabled(False)
+        self.refresh_hardware_action.setEnabled(False)
         self.animal_in_device_action.setEnabled(False)
         self.animal_in_training_action.setEnabled(False)
         self._app_model_status_combo.setEnabled(False)
@@ -280,6 +292,41 @@ class MainWindow(QMainWindow):
             thread = threading.Thread(target=exec_stop_capture, daemon=True, name="StopAcquisition")
             self._stop_capture_thread = thread
             thread.start()
+
+    def _refresh_hardware_bindings(self):
+        if self._hardware_refresh_thread is not None and self._hardware_refresh_thread.is_alive():
+            self.statusBar().showMessage("Hardware refresh already in progress", 5000)
+            return
+        if self._app_model.acquisition_started or self._app_model.status != AppModelStatus.IDLE:
+            self.statusBar().showMessage("Hardware refresh is only available while acquisition is idle", 5000)
+            return
+
+        self.refresh_hardware_action.setEnabled(False)
+        self._status_label.setText("Refreshing hardware...")
+
+        def refresh_worker():
+            try:
+                message = self._app_model.refresh_hardware_bindings()
+                is_error = False
+            except Exception as exc:
+                logger.exception("Hardware refresh failed")
+                message = f"Hardware refresh failed: {str(exc) or exc.__class__.__name__}"
+                is_error = True
+            self.hardware_refresh_finished.emit(message, is_error)
+
+        thread = threading.Thread(target=refresh_worker, daemon=True, name="RefreshHardware")
+        self._hardware_refresh_thread = thread
+        thread.start()
+
+    def _on_hardware_refresh_finished(self, message: str, is_error: bool):
+        self._hardware_refresh_thread = None
+        self._status_label.setText("")
+        self.refresh_hardware_action.setEnabled(
+            not self._app_model.acquisition_started and self._app_model.status == AppModelStatus.IDLE
+        )
+        self.statusBar().showMessage(message, 12000)
+        if is_error:
+            QMessageBox.warning(self, "Hardware Refresh", message)
 
     def _on_system_mode_combo_changed(self, idx: int):
         status = self._app_model_status_combo.itemData(idx)
@@ -586,7 +633,7 @@ class MainWindow(QMainWindow):
         offsets = []
         positions = []
         action.setChecked(True)
-        action.setIcon(qta.icon("fa5s.crosshairs", color='red'))
+        action.setIcon(_toolbar_icon("fa5s.crosshairs", color=_TOOLBAR_ICON_WARNING_COLOR))
         before_pellet_delivery_enabled = algo.pellet_delivery_enabled
         algo.pellet_delivery_enabled = False
         start_perf_c = time.perf_counter()
@@ -608,7 +655,7 @@ class MainWindow(QMainWindow):
         self._timer_calibrate_diamond_triangle.cancel()
         app_model.inference.pose_response_ready -= record_offsets
         algo.pellet_delivery_enabled = before_pellet_delivery_enabled
-        action.setIcon(qta.icon("fa5s.crosshairs"))
+        action.setIcon(_toolbar_icon("fa5s.crosshairs"))
         action.setChecked(False)
         #
         self._diamond_triangle_calib_run = None  # MUST be before
@@ -850,64 +897,70 @@ class MainWindow(QMainWindow):
         action.setToolTip(f"Reset AutoClamp Evasion\n{det.pellets_consumed} out of {det.config.pellets_consumed_trigger}")
 
     def _create_actions(self):
-        action = self.edit_camera_settings_action = QAction(QIcon(qta.icon("fa5s.edit")), "Edit Camera Settings", self)
+        action = self.edit_camera_settings_action = QAction(_toolbar_icon("fa5s.edit"), "Edit Camera Settings", self)
         action.setToolTip("Edit Camera Settings")
         action.setCheckable(True)
         action.setChecked(False)
         action.triggered.connect(self._edit_camera_settings)
 
-        action = self.edit_daq_ports_action = QAction(QIcon(qta.icon("fa5s.plug")), "Edit DAQ Ports", self)
+        action = self.edit_daq_ports_action = QAction(_toolbar_icon("fa5s.plug"), "Edit DAQ Ports", self)
         action.setToolTip("Edit NI-DAQ port assignments")
         action.triggered.connect(self._edit_daq_ports)
 
-        action = self.run_action = QAction(QIcon(qta.icon("ei.play")), "Start", self)
+        action = self.refresh_hardware_action = QAction(_toolbar_icon("fa5s.sync"), "Refresh Hardware", self)
+        action.setToolTip(
+            "Scan camera sources, NI-DAQ devices, CAN adapter, and pellet delivery board while acquisition is idle"
+        )
+        action.triggered.connect(self._refresh_hardware_bindings)
+
+        action = self.run_action = QAction(_toolbar_icon("ei.play"), "Start", self)
         action.setToolTip("Start or stop acquisition")
         action.setCheckable(True)
         action.setShortcut(QKeyCombination(Qt.Modifier.CTRL, Qt.Key.Key_R))
         action.triggered.connect(self._on_capture_start_stop)
 
-        action = self.animal_in_device_action = QAction(QIcon(qta.icon("fa5s.vector-square")), "Animal in device", self)
+        action = self.animal_in_device_action = QAction(_toolbar_icon("fa5s.vector-square"), "Animal in device", self)
         action.setCheckable(True)
         action.triggered.connect(self._on_animal_in_device_triggered)
 
-        action = self.animal_in_training_action = QAction(QIcon(qta.icon("fa5s.chalkboard-teacher")), "Animal in training", self)
+        action = self.animal_in_training_action = QAction(_toolbar_icon("fa5s.chalkboard-teacher"), "Animal in training", self)
         action.setCheckable(True)
         action.triggered.connect(self._on_animal_in_training_triggered)
 
-        action = self.show_reach_event_action = QAction(QIcon(qta.icon("fa5s.bezier-curve")), "Show Previous Reach", self)
+        action = self.show_reach_event_action = QAction(_toolbar_icon("fa5s.bezier-curve"), "Show Previous Reach", self)
         action.setCheckable(True)
         action.setEnabled(False)  # comment me to be able to show 20260205_agx001_trial011 on start
         action.triggered.connect(self.on_show_reach_event)
 
-        action = self._reset_pellet_loaded_count_action = QAction(QIcon(qta.icon("fa5s.fill")), "Reset Pellet VAT Load Count", self)
+        action = self._reset_pellet_loaded_count_action = QAction(_toolbar_icon("fa5s.fill"), "Reset Pellet VAT Load Count", self)
         action.triggered.connect(self.on_reset_pellet_loaded_count)
 
-        action = self._reset_cage_clean_action = QAction(QIcon(qta.icon("fa5s.broom")), "Reset Cage Clean", self)
+        action = self._reset_cage_clean_action = QAction(_toolbar_icon("fa5s.broom"), "Reset Cage Clean", self)
         action.triggered.connect(self.on_reset_cage_clean)
 
-        action = self._reset_autoclamp_evasion_action = QAction(QIcon(qta.icon("ei.vimeo")), "Reset AutoClamp Evasion", self)
+        action = self._reset_autoclamp_evasion_action = QAction(_toolbar_icon("ei.vimeo"), "Reset AutoClamp Evasion", self)
         action.setVisible(False)
         action.triggered.connect(self.on_reset_autoclamp_evasion)
 
-        action = self.next_training_phase_action = QAction(QIcon(qta.icon("fa5s.arrow-alt-circle-right")), "Next Phase", self)
+        action = self.next_training_phase_action = QAction(_toolbar_icon("fa5s.arrow-alt-circle-right"), "Next Phase", self)
         action.setVisible(False)
         action.setShortcut(QKeyCombination(Qt.Modifier.CTRL, Qt.Key.Key_Right))
         action.triggered.connect(self.on_next_plan_phase)
 
-        action = self.previous_training_phase_action = QAction(QIcon(qta.icon("fa5s.arrow-alt-circle-left")), "Previous Phase", self)
+        action = self.previous_training_phase_action = QAction(_toolbar_icon("fa5s.arrow-alt-circle-left"), "Previous Phase", self)
         action.setVisible(False)
         action.setShortcut(QKeyCombination(Qt.Modifier.CTRL, Qt.Key.Key_Left))
         action.triggered.connect(self.on_previous_plan_phase)
 
         self._diamond_triangle_calib_run = None
         self._timer_calibrate_diamond_triangle = no_op_timer
-        action = self.calib_diamond_triangle_action = QAction(QIcon(qta.icon("fa5s.crosshairs")), "Calibrate Coordinate System", self)
+        action = self.calib_diamond_triangle_action = QAction(_toolbar_icon("fa5s.crosshairs"), "Calibrate Coordinate System", self)
         action.setToolTip("Calibrate the relative offset between the pellet delivery spoon and the tunnel")
         action.setCheckable(True)
         action.triggered.connect(self.on_calibrate_diamond_triangle)
         action.setEnabled(False)
 
-        action = self.make_3d_calib_action = QAction(QIcon(qta.icon("fa5s.crosshairs")), "Make 3D calibration", self)
+        action = self.make_3d_calib_action = QAction(_toolbar_icon("fa5s.crosshairs"), "Make 3D calibration", self)
         action.setCheckable(True)
         action.triggered.connect(self.on_3d_calibrate)
 
@@ -942,11 +995,11 @@ class MainWindow(QMainWindow):
         action.setCheckable(True)
         action.triggered.connect(self._internal_detection_result_toggle)
 
-        action = self.preferences_action = QAction(QIcon(qta.icon("fa5s.cog")), "Preferences", self)
+        action = self.preferences_action = QAction(_toolbar_icon("fa5s.cog"), "Preferences", self)
         action.triggered.connect(self._show_preferences)
 
         tooltip = "Reset pellet and reach counts for this animal"
-        action = self._reset_animal_pellet_counts_action = QAction(QIcon(qta.icon("fa5s.sync")), tooltip, self)
+        action = self._reset_animal_pellet_counts_action = QAction(_toolbar_icon("fa5s.sync"), tooltip, self)
         action.triggered.connect(self._reset_animal_pellet_counts)
 
         action = self.quit_action = QAction("Quit")
@@ -1005,6 +1058,7 @@ class MainWindow(QMainWindow):
         combo.addItem("Running", userData=AppModelStatus.ACQUIRING)
         combo.currentIndexChanged.connect(self._on_system_mode_combo_changed)
         toolbar.addWidget(combo)
+        toolbar.addAction(self.refresh_hardware_action)
         # toolbar.addAction(self.run_action)
         # toolbar.addAction(self.animal_in_device_action)
         # toolbar.addAction(self.animal_in_training_action)
@@ -1489,7 +1543,7 @@ class MainWindow(QMainWindow):
         ):
             action.setVisible(True)
             name = f"fa5s.arrow-alt-circle-{direction}"
-            action.setIcon(qta.icon(name))
+            action.setIcon(_toolbar_icon(name))
             action.setEnabled(can_do)
 
     @invoke_method
@@ -1592,6 +1646,11 @@ class MainWindow(QMainWindow):
             else:
                 logger.warning("unhandled app model status: %s", value)
 
+            self.refresh_hardware_action.setEnabled(
+                value is AppModelStatus.IDLE
+                and not app_model.acquisition_started
+                and self._hardware_refresh_thread is None
+            )
             self.blockSignals(False)
 
             self.main_content.set_is_capture_active(value != AppModelStatus.IDLE)

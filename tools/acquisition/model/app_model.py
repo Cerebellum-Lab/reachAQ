@@ -70,6 +70,7 @@ from autotrainer.inference.config import load_calib_stereo_params
 from autotrainer.inference.analysis.prepare_jetson_data import DEFAULT_CAM_OFFSET_FILE_NAME
 
 from autotrainer.core.capture import CaptureProcessStatus
+from autotrainer.device import CanInterface, CanTransportConfiguration, Target
 
 from autotrainer.behavior.behavior_algorithm import BehaviorAlgoProps, BehaviorAlgoStatus
 from autotrainer.behavior import IntersessionState, BehaviorAlgorithm, TrainingMode, InferenceProtocol, SystemMachine, \
@@ -91,10 +92,11 @@ from tools.acquisition.model.helpers import get_config_location
 from tools.acquisition.model.hardware_model import HardwareModel
 from tools.acquisition.model.inference_model import InferenceModel
 from tools.acquisition.model.laser_model import LaserModel
+from tools.acquisition.model.nidaq_discovery import discover_nidaq_devices
 from tools.acquisition.model.nidaq_signal_monitor_model import NidaqSignalMonitorModel
 from tools.acquisition.model.behavior_model import BehaviorModel
 from tools.acquisition.model.user_preferences import UserPreferences, get_default_animals_location
-from tools.acquisition.model.video_capture_model import VideoCaptureModel
+from tools.acquisition.model.video_capture_model import VideoCaptureModel, create_camera_list
 
 logger = get_verbose_logger(__name__)
 
@@ -849,6 +851,113 @@ class AppModel(ObservableObject):
     @property
     def nidaq_ports(self) -> NidaqPortConfiguration:
         return self._nidaq_ports
+
+    def refresh_hardware_bindings(self) -> str:
+        if self._acquisition_started or self._status != AppModelStatus.IDLE:
+            raise RuntimeError("Hardware refresh is only available while acquisition is idle")
+
+        details: List[str] = []
+        warnings_list: List[str] = []
+
+        try:
+            camera_sources = create_camera_list(include_hardware=True)
+            source_urls = {source.url for source in camera_sources}
+            for camera in self._cameras:
+                camera.refresh_camera_list(camera_sources)
+            missing_enabled_cameras = [
+                camera.name
+                for camera in self._cameras
+                if (
+                    camera.is_enabled
+                    and camera.camera_source is not None
+                    and camera.camera_source.url not in source_urls
+                )
+            ]
+            details.append(f"cameras {len(camera_sources)} source(s)")
+            if missing_enabled_cameras:
+                warnings_list.append(
+                    "configured camera(s) not currently discovered: "
+                    + ", ".join(missing_enabled_cameras)
+                )
+        except Exception as exc:
+            logger.exception("Hardware refresh camera scan failed")
+            warnings_list.append(f"camera scan failed: {str(exc) or exc.__class__.__name__}")
+
+        try:
+            nidaq_devices, nidaq_error = discover_nidaq_devices()
+            details.append(f"NI-DAQ {len(nidaq_devices)} device(s)")
+            if nidaq_error:
+                warnings_list.append(nidaq_error)
+            configured_nidaq_device = self._nidaq_ports.device_name
+            discovered_nidaq_names = {device.name for device in nidaq_devices}
+            if (
+                self._hardware.nidaq_enabled
+                and configured_nidaq_device
+                and configured_nidaq_device not in discovered_nidaq_names
+            ):
+                warnings_list.append(f"configured NI-DAQ device not discovered: {configured_nidaq_device}")
+        except Exception as exc:
+            logger.exception("Hardware refresh NI-DAQ scan failed")
+            warnings_list.append(f"NI-DAQ scan failed: {str(exc) or exc.__class__.__name__}")
+
+        details.append(self._scan_can_pellet_hardware(warnings_list))
+
+        laser_configuration = self._laser.configuration
+        if laser_configuration.backend == "disabled":
+            details.append("laser not in use")
+        elif self._laser.is_connected:
+            details.append(f"laser {laser_configuration.backend} connected")
+        else:
+            details.append(f"laser {laser_configuration.backend} configured")
+            warnings_list.append(f"laser backend {laser_configuration.backend} is configured but not connected")
+
+        message = "Hardware refresh: " + ", ".join(details)
+        if warnings_list:
+            warning_text = "; ".join(warnings_list)
+            logger.warning("%s; warnings: %s", message, warning_text)
+            return f"{message}; warnings: {warning_text}"
+        logger.notice(message)
+        return message
+
+    def _scan_can_pellet_hardware(self, warnings_list: List[str]) -> str:
+        hardware = self._hardware
+        if not hardware.can_enabled and not hardware.pellet_controller_enabled:
+            return "CAN/pellet not in use"
+        if not hardware.can_enabled:
+            return "CAN not in use"
+        if not hardware.pellet_controller_enabled:
+            return "pellet controller not in use"
+        if hardware.connected:
+            return "CAN/pellet connected"
+
+        interface = None
+        try:
+            transport = CanTransportConfiguration.from_environment()
+            interface = CanInterface(
+                required_targets=(Target.PELLET_DEVICE,),
+                can_transport=transport,
+            )
+            if not interface.open():
+                warnings_list.append(
+                    f"CAN transport did not open: {transport.kind.value} {transport.channel}"
+                )
+                return "CAN unavailable"
+            if not interface.are_addresses_valid():
+                warnings_list.append(
+                    f"pellet CAN board not discovered on {transport.kind.value} {transport.channel}"
+                )
+                return "CAN open, pellet missing"
+            return f"CAN/pellet found {interface.pellet_address}"
+        except Exception as exc:
+            logger.exception("Hardware refresh CAN/pellet scan failed")
+            warnings_list.append(f"CAN/pellet scan failed: {str(exc) or exc.__class__.__name__}")
+            return "CAN/pellet scan failed"
+        finally:
+            if interface is not None:
+                try:
+                    interface.close()
+                except Exception:
+                    logger.exception("Failed to close CAN scan interface")
 
     @property
     def message_handler(self) -> SystemMessageHandler:

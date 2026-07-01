@@ -32,7 +32,7 @@ from tools.acquisition.model.user_preferences import UserPreferences
 logger = get_verbose_logger(__name__)
 
 
-def create_camera_list():
+def create_camera_list(*, include_hardware: bool = False):
     cameras = list()
 
     cameras.append(CaptureCameraAttrs(name="Random Image", url="random://0?width=300&height=200"))
@@ -46,9 +46,29 @@ def create_camera_list():
         for line in lines:
             parts = line.split(",")
             if len(parts) == 2:
-                cameras.append(CaptureCameraAttrs(name=parts[0].strip(), url=parts[1].strip()))
+                _append_unique_camera(cameras, parts[0].strip(), parts[1].strip())
+
+    if include_hardware:
+        for serial in VideoManager.list_spin_cameras():
+            _append_unique_camera(cameras, f"Spinnaker {serial}", f"spinnaker://{serial}")
+        for index in VideoManager.list_usb_cameras():
+            _append_unique_camera(cameras, f"USB Camera {index}", f"opencv://{index}")
 
     return cameras
+
+
+def _append_unique_camera(cameras: List[CaptureCameraAttrs], name: str, url: str) -> None:
+    if not name or not url:
+        return
+    if any(camera.url == url for camera in cameras):
+        return
+    candidate = name
+    suffix = 1
+    existing_names = {camera.name for camera in cameras}
+    while candidate in existing_names:
+        candidate = f"{name} ({suffix})"
+        suffix += 1
+    cameras.append(CaptureCameraAttrs(name=candidate, url=url))
 
 
 class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
@@ -182,6 +202,29 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
     @property
     def camera_list(self) -> List[CaptureCameraAttrs]:
         return self._camera_list
+
+    def refresh_camera_list(self, camera_list: Optional[Iterable[CaptureCameraAttrs]] = None) -> int:
+        old_list = self._camera_list
+        refreshed = list(create_camera_list(include_hardware=True) if camera_list is None else camera_list)
+        current_source = self._camera_source
+        if (
+            current_source is not None
+            and current_source.url
+            and not any(camera.url == current_source.url for camera in refreshed)
+        ):
+            refreshed.insert(0, current_source)
+        self._camera_list = refreshed
+        self.property_changed(self.CAMERA_LIST_PROP, self._camera_list, old_list)
+        if current_source is not None:
+            matching_source = next(
+                (camera for camera in refreshed if camera.url == current_source.url),
+                None,
+            )
+            if matching_source is not None and matching_source != current_source:
+                previous_source = self._camera_source
+                self._camera_source = matching_source
+                self.property_changed(self.CAMERA_PROP, matching_source, previous_source)
+        return len(self._camera_list)
 
     @property
     def camera_source(self) -> CaptureCameraAttrs:
