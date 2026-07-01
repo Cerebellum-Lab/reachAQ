@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import dataclasses
+import json
+import subprocess
+import sys
 from typing import List, Optional, Tuple
 
 
@@ -14,6 +17,66 @@ class NidaqDevicePorts:
 
 
 def discover_nidaq_devices() -> Tuple[Tuple[NidaqDevicePorts, ...], Optional[str]]:
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import dataclasses, json; "
+            "from tools.acquisition.model.nidaq_discovery import _discover_nidaq_devices_direct; "
+            "devices, error = _discover_nidaq_devices_direct(); "
+            "print(json.dumps({'devices': [dataclasses.asdict(device) for device in devices], 'error': error}))"
+        ),
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return tuple(), "NI-DAQmx discovery timed out while probing devices."
+
+    if completed.returncode != 0:
+        stderr = completed.stderr.strip()
+        detail = (
+            f"signal {-completed.returncode}"
+            if completed.returncode < 0
+            else f"exit code {completed.returncode}"
+        )
+        if stderr:
+            detail = f"{detail}: {stderr}"
+        return tuple(), (
+            "NI-DAQmx discovery failed in an isolated probe process "
+            f"({detail}). The NI-DAQmx native runtime may be installed but unusable in this OS environment."
+        )
+
+    json_line = _last_stdout_line(completed.stdout)
+    if not json_line:
+        return tuple(), "NI-DAQmx discovery returned no device data."
+
+    try:
+        payload = json.loads(json_line)
+    except json.JSONDecodeError as exc:
+        return tuple(), f"NI-DAQmx discovery returned invalid device data: {exc}"
+
+    devices = tuple(
+        NidaqDevicePorts(
+            name=str(device["name"]),
+            analog_outputs=tuple(device.get("analog_outputs", tuple())),
+            analog_inputs=tuple(device.get("analog_inputs", tuple())),
+            digital_outputs=tuple(device.get("digital_outputs", tuple())),
+            digital_inputs=tuple(device.get("digital_inputs", tuple())),
+        )
+        for device in payload.get("devices", tuple())
+        if device.get("name")
+    )
+    error = payload.get("error")
+    return devices, str(error) if error else None
+
+
+def _discover_nidaq_devices_direct() -> Tuple[Tuple[NidaqDevicePorts, ...], Optional[str]]:
     try:
         from nidaqmx.system import System
         from nidaqmx.errors import DaqNotFoundError
@@ -77,3 +140,8 @@ def _channel_names(*collections) -> Tuple[str, ...]:
             if name and name not in names:
                 names.append(name)
     return tuple(names)
+
+
+def _last_stdout_line(stdout: str) -> str:
+    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+    return lines[-1] if lines else ""
