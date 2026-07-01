@@ -19,8 +19,8 @@ logger = get_verbose_logger(__name__)
 
 missing_file = "The configuration file {0} does not exist.  A default configuration will be loaded."
 
-CardHeader.DEFAULT_BACKGROUND_COLOR = "#eef1f4"
-CardHeader.DEFAULT_TITLE_COLOR = "#20242a"
+CardHeader.DEFAULT_BACKGROUND_COLOR = "#cfb87c"
+CardHeader.DEFAULT_TITLE_COLOR = "black"
 
 
 def verify_configuration(configuration: Optional[Path]):

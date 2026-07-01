@@ -957,7 +957,12 @@ class MainWindow(QMainWindow):
         menu_bar = self.menuBar()
 
         menu_bar.setObjectName("MenuBar")
-        menu_bar.setStyleSheet("#MenuBar {background-color: #eee}")
+        menu_bar.setStyleSheet(
+            "#MenuBar {background-color: #f3f4f6; color: #20242a;}"
+            "#MenuBar::item {background: transparent; color: #20242a; padding: 2px 8px;}"
+            "#MenuBar::item:selected {background: #e1e5eb;}"
+            "#MenuBar::item:disabled {color: #68717d;}"
+        )
 
         file_menu = menu_bar.addMenu("File")
         file_menu.addAction(self.quit_action)
@@ -985,6 +990,8 @@ class MainWindow(QMainWindow):
         toolbar.setStyleSheet(
             "#RunToolbar {background-color: #f3f4f6; border-bottom: 1px solid #c9cdd3; spacing: 6px; padding: 2px;}"
             "#RunToolbar QLabel {color: #20242a;}"
+            "#RunToolbar QToolButton {color: #20242a;}"
+            "#RunToolbar QToolButton:disabled {color: #68717d;}"
         )
         toolbar.setFloatable(False)
         toolbar.setMovable(False)
@@ -1110,6 +1117,8 @@ class MainWindow(QMainWindow):
             toolbar.setStyleSheet(
                 "#DevToolbar {background-color: #f3f4f6; border-bottom: 1px solid #d6d9de; spacing: 6px; padding: 1px;}"
                 "#DevToolbar QLabel {color: #20242a;}"
+                "#DevToolbar QToolButton {color: #20242a;}"
+                "#DevToolbar QToolButton:disabled {color: #68717d;}"
             )
             toolbar.setContentsMargins(0, 0, 0, 0)
             # toolbar.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
