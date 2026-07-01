@@ -303,6 +303,8 @@ class MainWindow(QMainWindow):
 
         self.refresh_hardware_action.setEnabled(False)
         self._status_label.setText("Refreshing hardware...")
+        self.main_content.set_hardware_refreshing(True)
+        QCoreApplication.processEvents()
 
         def refresh_worker():
             try:
@@ -321,6 +323,7 @@ class MainWindow(QMainWindow):
     def _on_hardware_refresh_finished(self, message: str, is_error: bool):
         self._hardware_refresh_thread = None
         self._status_label.setText("")
+        self.main_content.set_hardware_refreshing(False)
         self.refresh_hardware_action.setEnabled(
             not self._app_model.acquisition_started and self._app_model.status == AppModelStatus.IDLE
         )
