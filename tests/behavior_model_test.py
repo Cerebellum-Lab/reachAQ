@@ -1,9 +1,7 @@
 import datetime as dtm
-from unittest import mock
 
 import pytest
 
-from autotrainer.behavior.pellet import PelletState
 from tools.acquisition.model.app_model import AppModel
 
 from tools.acquisition.model.app_model_status import AppModelStatus
@@ -55,81 +53,26 @@ class TestEmergency(MockSystemMachine):
         self._app_model = app_model
         self._behavior = app_model.behavior
 
-    @pytest.mark.parametrize("baseline_intensity", [0, 5, 100])
-    def test_pause_then_resume(self, app_model, baseline_intensity):
+    def test_emergency_stop_is_disabled(self, app_model):
         algo = app_model.behavior.algorithm
-        self.pellet.state = PelletState.loading
-        self.pellet_state_trans.clear()
-        algo.baseline_intensity = baseline_intensity
         assert not algo.algo_paused
-        tunnel_dev = self.tunnel_dev
-        pellet_dev = self.pellet_dev
-        tunnel_dev.reset_mock()  # ensure clear
-        pellet_dev.reset_mock()  # ensure clear
-        #
         assert app_model.behavior.source_emergency is None
-        assert self.pellet_state_trans == []
-        app_model.behavior.emergency_stop(source="testing")
-        assert self.pellet_state_trans == [PelletState.home]
-        assert app_model.behavior.source_emergency == "testing"
-        assert algo.algo_paused
-        assert tunnel_dev.open_tunnel_gate.call_args_list == [mock.call()]
-        assert pellet_dev.send_pellet.call_args_list == []
-        assert tunnel_dev.update_head_magnet_intensity.call_args_list == [mock.call(0)]
-        tunnel_dev.reset_mock()  # ensure clear
-        pellet_dev.reset_mock()  # ensure clear
-        assert self.pellet_state_trans == [PelletState.home]
-        app_model.behavior.emergency_resume(source="testing")
+
+        with pytest.raises(RuntimeError, match="Emergency stop is disabled in reachAQ"):
+            app_model.behavior.emergency_stop(source="testing")
+
         assert app_model.behavior.source_emergency is None
         assert not algo.algo_paused
-        assert tunnel_dev.open_tunnel_gate.call_args_list == [mock.call()]
-        assert tunnel_dev.update_head_magnet_intensity.call_args_list == [mock.call(algo.baseline_intensity)]
-        self.mock_pellet_ack(until_none=True)
-        self.mock_pose_response(pellet_seen=True)
-        assert self.pellet_state_trans == [
-            PelletState.home,
-            PelletState.covering,
-            PelletState.retract,
-        ]
-        # assert pellet_m.send_pellet.call_args_list == [mock.call()]  # is now handled by pellet_machine
 
-    def test_engage_many_times_keeps_last_reason(self, app_model):
+    def test_emergency_resume_is_disabled(self, app_model):
         algo = app_model.behavior.algorithm
         assert not algo.algo_paused
-        tunnel_dev = self.tunnel_dev
-        pellet_dev = self.pellet_dev
-        #
-        app_model.behavior.emergency_stop(source="testing")
-        assert app_model.behavior.source_emergency == "testing"
-        tunnel_dev.reset_mock()  # ensure clear
-        pellet_dev.reset_mock()  # ensure clear
-        #
-        app_model.behavior.emergency_stop(source="testing2")
-        assert app_model.behavior.source_emergency == "testing2"
-        assert tunnel_dev.open_tunnel_gate.call_args_list == []
-        assert pellet_dev.send_pellet.call_args_list == []
-        assert tunnel_dev.update_head_magnet_intensity.call_args_list == []
+        assert app_model.behavior.source_emergency is None
 
-    def test_user_source_cannot_be_resumed(self, app_model):
-        algo = app_model.behavior.algorithm
-        assert not algo.algo_paused
-        tunnel_dev = self.tunnel_dev
-        pellet_dev = self.pellet_dev
-        app_model.behavior.emergency_stop(source="user-button")
-        assert app_model.behavior.source_emergency == "user-button"
-        assert algo.algo_paused
-        tunnel_dev.reset_mock()  # ensure clear
-        pellet_dev.reset_mock()  # ensure clear
-        # now:
-        app_model.behavior.emergency_resume(source="something-else")
-        # but still engaged:
-        assert algo.algo_paused
-        assert app_model.behavior.source_emergency == "user-button"
-        assert tunnel_dev.open_tunnel_gate.call_args_list == []
-        assert pellet_dev.send_pellet.call_args_list == []
-        assert tunnel_dev.update_head_magnet_intensity.call_args_list == []
-        # now:
-        app_model.behavior.emergency_resume(source="user-button")
+        with pytest.raises(RuntimeError, match="Emergency resume is disabled in reachAQ"):
+            app_model.behavior.emergency_resume(source="testing")
+
+        assert app_model.behavior.source_emergency is None
         assert not algo.algo_paused
 
 
