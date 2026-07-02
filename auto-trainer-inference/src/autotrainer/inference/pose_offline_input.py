@@ -23,6 +23,10 @@ _local_do_debug = True
 logger = get_verbose_logger(__name__)
 
 
+def _get_project_camera_names(project: ProjectInfo) -> Tuple[str, ...]:
+    return tuple(project.camera_names) or (project.camera_1, project.camera_2)
+
+
 class InferenceIncorrectStatus(RuntimeError):
     """For when in analysis but inference change status"""
 
@@ -314,7 +318,7 @@ class OfflineInputProcess:
 
     def _feed_intersession_analysis_execute(self, project, wait_stop_recorded):
         captures_d: Dict[int, cv2.VideoCapture] = {}
-        cams = (project.camera_1, project.camera_2)
+        cams = _get_project_camera_names(project)
         n_cams = len(cams)
         cams_paths = [
             tuple(map(Path, project.get_video_path(name=cam, allow_overwrite=True)))

@@ -58,6 +58,15 @@ def test_explicit_session(root):
     assert session_source.session_index == 12
 
 
+def test_camera_names_preserve_legacy_camera_fields(root):
+    info = ProjectInfo(root=root, camera_names=("left", "right", "camera3"))
+
+    assert info.camera_1 == "left"
+    assert info.camera_2 == "right"
+    assert info.camera_names == ("left", "right", "camera3")
+    assert info.to_local_value().camera_names == info.camera_names
+
+
 def test_without_session_and_when_are_shared(root):
     module = importlib.import_module(ProjectInfo.__module__)
     unix_start_as_local = datetime(2001, 1, 1, tzinfo=timezone.utc).astimezone().replace(tzinfo=None)

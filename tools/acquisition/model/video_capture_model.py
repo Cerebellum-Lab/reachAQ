@@ -287,6 +287,9 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
     def is_primary(self) -> bool:
         return self._is_primary
 
+    def set_runtime_primary(self, is_primary: bool) -> None:
+        self._is_primary = is_primary
+
     @property
     def shape(self) -> Tuple[int, int]:
         """
@@ -363,6 +366,8 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
     def on_prepare_capture(
         self,
         network_queue: Optional[FixedArrayMultiQueue] = None,
+        *,
+        inference_index: Optional[int] = None,
     ) -> bool:
         self._last_error = None
         if not self._is_enabled:
@@ -388,7 +393,9 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
             camera = CaptureCameraAttrs(name=self._name, url=url)
 
             inference = None if network_queue is None else CaptureInferenceAttrs(
-                queue=network_queue, index=self._camera_index)
+                queue=network_queue,
+                index=self._camera_index if inference_index is None else inference_index,
+            )
 
             capture_attrs = CaptureAttrs(
                 command_queue=self._video_command_queue,

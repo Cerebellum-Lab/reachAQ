@@ -38,6 +38,7 @@ class LivePoseResultProcessWorker(multiprocessing.Process):
         monitored_parts_offsets: List[Tuple[str, str]],
         input_q: multiprocessing.Queue,
         output_q: multiprocessing.Queue,
+        camera_count: int = 2,
         generation: int,
         log_config: Optional[Dict] = None,
     ):
@@ -51,6 +52,7 @@ class LivePoseResultProcessWorker(multiprocessing.Process):
         self._pose_algo = pose_algo
         self._monitored_parts_offsets = monitored_parts_offsets
         self._output_q = output_q
+        self._camera_count = camera_count
         self._generation = generation
 
     @property
@@ -110,7 +112,11 @@ class LivePoseResultProcessWorker(multiprocessing.Process):
                 continue
             count_processed += 1
             rsp = self._pose_algo.process(
-                pose_data, pairs_3d_offsets=self._monitored_parts_offsets, sequence=seq_nr)
+                pose_data,
+                pairs_3d_offsets=self._monitored_parts_offsets,
+                sequence=seq_nr,
+                camera_count=self._camera_count,
+            )
             data = (
                 InferenceMonitorDataMsg.POSE_RESULT_READY,  # cmd
                 ((rsp,), None)  # args, kwargs

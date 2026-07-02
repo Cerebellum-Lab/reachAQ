@@ -370,7 +370,7 @@ class SystemMachine(StateMachine):
 
         def do_clean():
             paths_removed = []
-            for cam_name in (project.camera_1, project.camera_2):
+            for cam_name in tuple(project.camera_names) or (project.camera_1, project.camera_2):
                 paths = map(Path, chain(
                     project.get_video_path(cam_name, allow_overwrite=True),
                     [project.get_intersession_pose_path(cam_name, suffix="_live")],

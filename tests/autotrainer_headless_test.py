@@ -105,6 +105,27 @@ def test_load_config(app_model, trainer_config_dir, animals_dir, calib_dir, syst
     assert Path(pref.configuration_location) == trainer_config_dir
 
 
+def test_load_config_extra_reach_camera_slot(app_model, trainer_config_dir, system_config):
+    camera3 = CameraConfiguration(
+        id=CameraId.Camera3,
+        name=CameraId.Camera3.name,
+        is_enabled=True,
+        params=dict(width=300, height=200),
+        scheme="random",
+        record_prebuffer_duration=0,
+    )
+    system_config.cameras.append(camera3)
+    system_config.save_default(trainer_config_dir)
+
+    assert app_model.load_configuration() is True
+
+    loaded_camera3 = app_model.get_camera_model(CameraId.Camera3)
+    assert len(app_model.reach_cameras) == CameraId.supported_count()
+    assert loaded_camera3.is_enabled
+    assert loaded_camera3.name == "camera3"
+    assert app_model.make_project_info().camera_names == ("camera3",)
+
+
 def test_start_stop(app_model, settings_ini_path):
     assert not settings_ini_path.exists()
     assert app_model.load_configuration() is True

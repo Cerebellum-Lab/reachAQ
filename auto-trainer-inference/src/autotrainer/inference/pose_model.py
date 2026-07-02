@@ -51,9 +51,9 @@ class PoseModel:
     def predict(self, frames: numpy.ndarray) -> typing.List[numpy.ndarray]:
         """
         Return pose data for the given video frames.  Although there are no restrictions imposed here, the data is
-        generally assumed to be interleaved left and right camera frames of "batch_size" (which is 2 times the number
-        of frames per camera for two cameras) where the batch size is generally something that has been configured for
-        or determined by the pose model implementation.
+        generally assumed to be interleaved camera frames of "batch_size" (camera count times the number of frames per
+        camera) where the batch size is generally something that has been configured for or determined by the pose model
+        implementation.
 
         Args:
             frames: a numpy array of video frame data with shape (frame_count, height, width, 3)

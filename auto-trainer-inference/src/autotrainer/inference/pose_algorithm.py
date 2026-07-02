@@ -49,12 +49,8 @@ class PoseResponse:
     perf_c: float = dataclasses.field(default_factory=get_perf_now)
     """Perf counter when this response applies"""
 
-    parts_flags: Tuple[
-        Dict[str, bool],
-        Dict[str, bool],
-        Dict[str, bool],
-    ] = dataclasses.field(default_factory=lambda: ({}, {}, {}))
-    """Tuple indicating part seen for left, right, and both (same frame)"""
+    parts_flags: Tuple[Dict[str, bool], ...] = dataclasses.field(default_factory=lambda: ({}, {}, {}))
+    """Tuple indicating part seen for each camera, followed by all cameras in the same frame."""
 
     locations: List[Dict[str, PoseLocation]] = dataclasses.field(default_factory=list)
     """X, Y locations for each part for each camera, if above threshold, otherwise -1, -1 (or not present)"""
@@ -70,7 +66,7 @@ class PoseResponse:
     @property
     def pellet_seen(self) -> bool:
         """Default logic/conditions for pellet seen"""
-        return self.parts_flags[2].get(SceneElement.Pellet, False)
+        return self.parts_flags[-1].get(SceneElement.Pellet, False)
 
     @property
     def star_seen(self):
@@ -81,7 +77,7 @@ class PoseResponse:
     def mouse_seen(self) -> bool:
         """Default logic/conditions for mouse seen: require seen in ALL/both cams"""
         # return all(flags.get(SceneElement.Nose, False) for flags in self.parts_flags)
-        return self.parts_flags[2].get(SceneElement.Nose, False)
+        return self.parts_flags[-1].get(SceneElement.Nose, False)
 
     @property
     def diamond_seen(self):
@@ -334,6 +330,9 @@ class PoseAlgorithm:
         if stereo_params is None:
             warnings.warn("no stereo params available, can't 3d-triangulate", UserWarning, stacklevel=3)
             return self._empty_3d, self._empty_3d
+        if len(per_cam_detection) < 2:
+            warnings.warn("at least two cameras are required for 3d-triangulate", UserWarning, stacklevel=3)
+            return self._empty_3d, self._empty_3d
         p_thresh = 0.9  # confidence threshold for DLC raw output
         min_cluster = 10  # maximum allowed interpolation
         # not sure min_cluster change anything for when nbr frames == 1 (per cam)
@@ -385,19 +384,24 @@ class PoseAlgorithm:
         *,
         pairs_3d_offsets: Pairs3dOffsetT = (),
         sequence: Optional[int] = None,
+        camera_count: int = 2,
     ) -> PoseResponse:
         """
         Process the frames from the pose model and return a PoseResponse.
         Args:
-            all_frames: and interleaved list of pose frame data from the left and right cameras.
+            all_frames: an interleaved list of pose frame data from all cameras.
             pairs_3d_offsets: List of 2-tuple pairs of parts to compute their 3d offsets.
         Returns:
             PoseResponse: a PoseResponse object with the processed data
         """
-        left_frames = all_frames[0::2]
-        right_frames = all_frames[1::2]
+        if camera_count < 1:
+            raise ValueError(f"camera_count must be at least 1, got {camera_count}")
+        per_cam_frames = [
+            all_frames[camera_index::camera_count]
+            for camera_index in range(camera_count)
+        ]
 
-        return self.process_frames(left_frames, right_frames,
+        return self.process_frames(*per_cam_frames,
                                    pairs_3d_offsets=pairs_3d_offsets,
                                    sequence=sequence)
 
@@ -418,28 +422,31 @@ class PoseAlgorithm:
         """
         self._sequence += 1
 
-        left_frames = per_cam_frames[0]
-        right_frames = per_cam_frames[1]
+        if len(per_cam_frames) == 0:
+            raise ValueError("At least one camera frame sequence is required")
 
-        locations_1 = self._find_parts(left_frames)
-        locations_2 = self._find_parts(right_frames)
+        locations_by_cam = [
+            self._find_parts(frames)
+            for frames in per_cam_frames
+        ]
 
-        parts_flag_1 = dict(self._default_parts_flag)
-        parts_flag_2 = dict(self._default_parts_flag)
-        parts_flag_3 = dict(self._default_parts_flag)
+        parts_flags_by_cam = [
+            dict(self._default_parts_flag)
+            for _ in per_cam_frames
+        ]
+        parts_flag_all = dict(self._default_parts_flag)
 
         # get parts presence:
-        for pose_l, pose_r in zip(left_frames, right_frames):
+        for poses in zip(*per_cam_frames):
             for idx, part in enumerate(self._parts_list):
-                if pose_l[idx, 2] >= PoseAlgorithm.MIN_CONFIDENCE_PRESENT_THRESHOLD:
-                    parts_flag_1[part] = True
-                    maybe_dual = True
-                else:
-                    maybe_dual = False
-                if pose_r[idx, 2] >= PoseAlgorithm.MIN_CONFIDENCE_PRESENT_THRESHOLD:
-                    parts_flag_2[part] = True
-                    if maybe_dual:
-                        parts_flag_3[part] = True
+                seen_by_all = True
+                for cam_idx, pose in enumerate(poses):
+                    if pose[idx, 2] >= PoseAlgorithm.MIN_CONFIDENCE_PRESENT_THRESHOLD:
+                        parts_flags_by_cam[cam_idx][part] = True
+                    else:
+                        seen_by_all = False
+                if seen_by_all:
+                    parts_flag_all[part] = True
 
         selected_cams_frames = per_cam_frames
         # if self.process_frames_select_frames_method == "last_one":
@@ -472,23 +479,21 @@ class PoseAlgorithm:
                 additional_names=[],
             )
             assert len(process_hands_results) == len(df)
-            v0_raw = process_hands_results.iloc[0:len(selected_cams_frames[0])]
-            v1_raw = process_hands_results.iloc[len(selected_cams_frames[0]):]
-            for elem in SceneElement.L_Hand, SceneElement.R_Hand:
-                if __debug__ and elem not in process_hands_results.columns:
-                    logger.warning("%s not present in hands results", elem)
-                    continue
-                # if self.process_frames_select_frames_method == "last_one":
-                #     v0 = v0_raw[elem].iloc[-1]
-                #     v1 = v1_raw[elem].iloc[-1]
-                # else:
-                # but if want uses most likelihood, then:
-                v0 = v0_raw[elem].sort_values(by="likelihood", ascending=False).reset_index().iloc[0]
-                v1 = v1_raw[elem].sort_values(by="likelihood", ascending=False).reset_index().iloc[0]
-                if v0['likelihood'] >= self.MIN_CONFIDENCE_PRESENT_THRESHOLD:
-                    locations_1[elem] = PoseLocation(-1, *v0[_xy_col_names])
-                if v1['likelihood'] >= self.MIN_CONFIDENCE_PRESENT_THRESHOLD:
-                    locations_2[elem] = PoseLocation(-1, *v1[_xy_col_names])
+            start_idx = 0
+            for cam_idx, frames in enumerate(selected_cams_frames):
+                raw = process_hands_results.iloc[start_idx:start_idx + len(frames)]
+                start_idx += len(frames)
+                for elem in SceneElement.L_Hand, SceneElement.R_Hand:
+                    if __debug__ and elem not in process_hands_results.columns:
+                        logger.warning("%s not present in hands results", elem)
+                        continue
+                    # if self.process_frames_select_frames_method == "last_one":
+                    #     val = raw[elem].iloc[-1]
+                    # else:
+                    # but if want uses most likelihood, then:
+                    val = raw[elem].sort_values(by="likelihood", ascending=False).reset_index().iloc[0]
+                    if val['likelihood'] >= self.MIN_CONFIDENCE_PRESENT_THRESHOLD:
+                        locations_by_cam[cam_idx][elem] = PoseLocation(-1, *val[_xy_col_names])
         #
         locations_3d = {}
         raw_3d_loc = {}
@@ -523,8 +528,8 @@ class PoseAlgorithm:
             sequence = self._sequence
         response = PoseResponse(
             sequence=sequence,
-            parts_flags=(parts_flag_1, parts_flag_2, parts_flag_3),
-            locations=[locations_1, locations_2],
+            parts_flags=tuple(parts_flags_by_cam + [parts_flag_all]),
+            locations=locations_by_cam,
             parts_3d_offsets=dict(parts_3d_offsets),
             locations_3d=locations_3d,
             raw_loc_3d=raw_3d_loc,
@@ -568,14 +573,15 @@ def update_scene_elements_context_from_pose(
 ):
     """Update in-place the given context based on the given response"""
     perf_c = pose_response.perf_c
-    p1, p2, pall = pose_response.parts_flags[:3]
+    cam_flags = pose_response.parts_flags[:-1]
+    pall = pose_response.parts_flags[-1]
     p_any_miss = any_cam_context.missing_last_perf_c
     p_any_pres = any_cam_context.present_last_perf_c
     p_all_miss = all_cams_context.missing_last_perf_c
     p_all_pres = all_cams_context.present_last_perf_c
     prev_parts = set(p_any_miss) | set(p_any_pres)
-    all_seen_parts = set(p1) | set(p2)
+    all_seen_parts = set().union(*cam_flags) if len(cam_flags) > 0 else set()
     all_parts = prev_parts | all_seen_parts
-    _loop_parts(perf_c, all_parts, lambda p: p1.get(p, False) or p2.get(p, False), p_any_miss, p_any_pres)
+    _loop_parts(perf_c, all_parts, lambda p: any(flags.get(p, False) for flags in cam_flags), p_any_miss, p_any_pres)
     _loop_parts(perf_c, all_parts, lambda p: pall.get(p, False), p_all_miss, p_all_pres)
     any_cam_context.last_perf_c = all_cams_context.last_perf_c = perf_c

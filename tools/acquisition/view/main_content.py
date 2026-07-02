@@ -44,6 +44,12 @@ logger = get_verbose_logger(__name__)
 _REACHAQ_PROTOCOL_UI_ENABLED = False
 
 
+def _camera_panel_title(camera_name: str) -> str:
+    if camera_name.startswith("camera") and camera_name[6:].isdigit():
+        return f"Camera {camera_name[6:]}"
+    return f"{camera_name.capitalize()} Camera"
+
+
 class MainContent(ContentWidget):
 
     training_mode_changed = Signal(TrainingMode)
@@ -186,32 +192,32 @@ class MainContent(ContentWidget):
         widget = QWidget()
         widget.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
         widget.setContentsMargins(4, 4, 4, 0)
-        top_layout = QHBoxLayout(widget)
+        top_layout = QGridLayout(widget)
         top_layout.setContentsMargins(4, 4, 4, 0)
         top_layout.setSpacing(8)
         top_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
 
-        # allow auto set of spacing between cameras
-        top_layout.addStretch(1)
-
         app_model = self._app_model
-        self._left_camera_content = CameraContent(app_model, app_model.left_camera)
-        self._left_camera_content.camera_view.setTitle("Left Camera")
-        top_layout.addWidget(self._left_camera_content)
-        self._content_widgets.append(self._left_camera_content)
-
-        top_layout.addStretch(1)
-
-        self._right_camera_content = CameraContent(app_model, self._app_model.right_camera)
-        self._right_camera_content.camera_view.setTitle("Right Camera")
-        top_layout.addWidget(self._right_camera_content)
-        self._content_widgets.append(self._right_camera_content)
-
-        top_layout.addStretch(1)
-
+        self._reach_camera_contents = []
+        self._reach_camera_content_by_model = {}
+        self._left_camera_content = None
+        self._right_camera_content = None
+        columns = 3
+        for idx, camera in enumerate(app_model.reach_cameras):
+            camera_content = CameraContent(app_model, camera)
+            camera_content.camera_view.setTitle(_camera_panel_title(camera.name))
+            top_layout.addWidget(camera_content, idx // columns, idx % columns)
+            self._content_widgets.append(camera_content)
+            self._reach_camera_contents.append((camera, camera_content))
+            self._reach_camera_content_by_model[camera] = camera_content
+            if camera is app_model.left_camera:
+                self._left_camera_content = camera_content
+            elif camera is app_model.right_camera:
+                self._right_camera_content = camera_content
         self._top_camera_content = None
 
-        top_layout.addStretch(1)
+        for column in range(columns):
+            top_layout.setColumnStretch(column, 1)
 
         return widget
 
@@ -366,20 +372,19 @@ class MainContent(ContentWidget):
     @Slot()
     def update_image(self):
         model = self._app_model
-        if model.left_camera.is_enabled:
-            self._left_camera_content.update_image()
-        if model.right_camera.is_enabled:
-            self._right_camera_content.update_image()
+        for camera, camera_content in self._reach_camera_contents:
+            if camera.is_enabled:
+                camera_content.update_image()
         if model.top_camera.is_enabled:
             if self._top_camera_content is not None:
                 self._top_camera_content.update_image()
         self._analysis_content.use_cache()
 
     def refresh_pose(self, response: PoseResponse):
-        if self._app_model.left_camera.is_enabled:
-            self._left_camera_content.refresh_pose(response.locations[0])
-        if self._app_model.right_camera.is_enabled:
-            self._right_camera_content.refresh_pose(response.locations[1])
+        for idx, camera in enumerate(self._app_model.inference_cameras):
+            camera_content = self._reach_camera_content_by_model.get(camera)
+            if camera_content is not None and camera.is_enabled and idx < len(response.locations):
+                camera_content.refresh_pose(response.locations[idx])
         if __debug__:
             perf_now = time.perf_counter()
             if perf_now >= self._next_parts_3d_loc_report:
@@ -413,8 +418,8 @@ class MainContent(ContentWidget):
     def on_activated(self):
         self._app_model.on_activated()
 
-        self._app_model.left_camera.set_display_fcn(self._left_camera_content.refresh_image)
-        self._app_model.right_camera.set_display_fcn(self._right_camera_content.refresh_image)
+        for camera, camera_content in self._reach_camera_contents:
+            camera.set_display_fcn(camera_content.refresh_image)
         if self._top_camera_content is not None:
             self._app_model.top_camera.set_display_fcn(self._top_camera_content.refresh_image)
 
@@ -500,8 +505,8 @@ class MainContent(ContentWidget):
     ):
         logger.verbose("show_analysis_reach_events: %s", prj)
         if prj is None:
-            for cam in (self._left_camera_content, self._right_camera_content):
-                cam.camera_view.image_view.set_reach_overlay(None)
+            for _, camera_content in self._reach_camera_contents:
+                camera_content.camera_view.image_view.set_reach_overlay(None)
             return
         loc = prj.get_reach_event_path()
         df_reach = pandas.read_hdf(loc, key="reach")
@@ -510,10 +515,12 @@ class MainContent(ContentWidget):
         logger.verbose("reach:\n%s\npellet:\n%s\n", df_reach, df_pellet)
         logger.debug("trajectory:\n%s", df_trajectory)
         logger.debug("looping over %s reaches", len(df_reach))
-        for (cam_name, cam) in (
-            ("left", self._left_camera_content),
-            ("right", self._right_camera_content),
-        ):
+        available_cam_names = set(df_trajectory.columns.get_level_values(0))
+        for camera, cam in self._reach_camera_contents:
+            cam_name = camera.name
+            if cam_name not in available_cam_names:
+                cam.camera_view.image_view.set_reach_overlay(None)
+                continue
             assert len(df_trajectory.index.unique(0)) == len(df_reach)
             img_view = cam.camera_view.image_view
             width_f, height_f = img_view.size_factor

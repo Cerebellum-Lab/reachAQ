@@ -8,6 +8,7 @@ import math
 import os
 import pickle
 import queue
+import re
 import shlex
 import subprocess
 import threading
@@ -33,6 +34,7 @@ from autotrainer.core import (
     SystemMessageHandler,
     SystemConfiguration,
     CameraId,
+    CameraConfiguration,
     PersistenceConfiguration,
     HardwareConfiguration,
     LaserSystemConfiguration,
@@ -272,6 +274,7 @@ class AppModel(ObservableObject):
         self._animal_name = ""
         self._notes = ""
         self._left_camera = self._right_camera = None
+        self._reach_cameras: Tuple[VideoCaptureModel, ...] = ()
 
         self._timer_daily: DaemonTimer = _daily_timer(0, self._on_daily_timer)
         self._current_day: Optional[date] = None
@@ -307,33 +310,30 @@ class AppModel(ObservableObject):
         self._handle_proc_msg_thread.start()
         # end not sure
 
-        # this is used to sync the start record frame of both cameras:
+        # this is used to sync the start record frame of all reach cameras:
         self._cams_record_enabled = mp_ctx.Value(ctypes.c_bool, False)
         self._cams_synced_frame_index = mp_ctx.Value(ctypes.c_int64, -1)
 
         self._record_stop_sema = mp_ctx.Semaphore(0)
-        # and this is used to notify the end of recording from the 2 camera video_record threads to the offline one,
+        # and this is used to notify the end of recording from the reach-camera video_record threads to the offline one,
         # so that the later doesn't try to open the video files, before they are finished written to and closed.
         # Preventing the opencv lib to emit warning on stderr.
 
-        self._left_camera = VideoCaptureModel(
-            "left", self._preferences, 0,
-            msg_queue=proc_msg_queue, cam_id=CameraId.Left,
-            synced_cam_frame_index=self._cams_synced_frame_index,
-            synced_cam_recording=self._cams_record_enabled,
-            record_stop_sema=self._record_stop_sema,
-        )
-
-        self._right_camera = VideoCaptureModel(
-            "right",
-            self._preferences,
-            1,
-            msg_queue=proc_msg_queue,
-            cam_id=CameraId.Right,
-            synced_cam_frame_index=self._cams_synced_frame_index,
-            synced_cam_recording=self._cams_record_enabled,
-            record_stop_sema=self._record_stop_sema,
-        )
+        reach_cameras = []
+        for camera_index, camera_id in enumerate(CameraId.reach_camera_ids()):
+            reach_cameras.append(VideoCaptureModel(
+                str(camera_id),
+                self._preferences,
+                camera_index,
+                msg_queue=proc_msg_queue,
+                cam_id=camera_id,
+                synced_cam_frame_index=self._cams_synced_frame_index,
+                synced_cam_recording=self._cams_record_enabled,
+                record_stop_sema=self._record_stop_sema,
+            ))
+        self._reach_cameras = tuple(reach_cameras)
+        self._left_camera = self._reach_cameras[0]
+        self._right_camera = self._reach_cameras[1]
 
         self._top_camera_presence_detection = PresenceDetectionAttrs()
         self._top_camera = VideoCaptureModel("web", self._preferences, -1,
@@ -341,19 +341,14 @@ class AppModel(ObservableObject):
                                              msg_queue=None,  # not interested to webcam status for now.
                                              cam_id=CameraId.Web)
 
-        self._cameras = [  # must respect camera_idx/inference_index order
-            self._left_camera,
-            self._right_camera,
+        self._cameras = [  # must respect camera_idx order
+            *self._reach_cameras,
             self._top_camera,
         ]
         self._camera_by_id = {
             camera.camera_id: camera
             for camera in self._cameras
         }
-        self._reach_cameras = (
-            self._left_camera,
-            self._right_camera,
-        )
 
         self._system_message_queue = queue.Queue()  # only dedicated to CAN bus messages reading/handling
 
@@ -376,6 +371,7 @@ class AppModel(ObservableObject):
         self._nidaq_signal_monitor = NidaqSignalMonitorModel()
 
         self._inference_queue = None
+        self._inference_cameras: Tuple[VideoCaptureModel, ...] = ()
 
         self._pose_algorithm: PoseAlgorithm = None
         self._inference: InferenceModel = None  # noqa. needed before reload_calib
@@ -403,8 +399,7 @@ class AppModel(ObservableObject):
         system_machine = behavior_model.system_machine  # ensure same
 
         self._models: List[ProjectDependentProtocol] = [
-            self._left_camera,
-            self._right_camera,
+            *self._reach_cameras,
             self._top_camera,
             self._inference,
             self._behavior,
@@ -602,18 +597,44 @@ class AppModel(ObservableObject):
         self._pose_algorithm = pose_algo
 
     def _identify_primary_main_cam_idx(self):
-        for idx, cam in enumerate(self._cameras):
-            if cam.is_primary:
-                logger.debug("using primary cam_idx=%s", idx)
-                return idx
+        ordered_cameras = self._ordered_reach_cameras(enabled_only=True) or self._ordered_reach_cameras()
+        if len(ordered_cameras) > 0:
+            primary = ordered_cameras[0]
+            logger.debug("using primary cam_idx=%s", primary.camera_index)
+            return primary.camera_index
         logger.verbose(
             "No primary camera defined, using camera-0 as main one: %s",
             self._cameras[0],
         )
         return 0
 
+    def _ordered_reach_cameras(self, *, enabled_only: bool = False) -> Tuple[VideoCaptureModel, ...]:
+        cameras = [
+            camera for camera in self._reach_cameras
+            if not enabled_only or camera.is_enabled
+        ]
+        if len(cameras) == 0:
+            return ()
+        primary = next((camera for camera in cameras if camera.is_primary), cameras[0])
+        return (primary, *(camera for camera in cameras if camera is not primary))
+
+    def _ensure_reach_primary_camera(self) -> None:
+        enabled_cameras = [
+            camera for camera in self._reach_cameras
+            if camera.is_enabled
+        ]
+        if len(enabled_cameras) > 0 and not any(camera.is_primary for camera in enabled_cameras):
+            enabled_cameras[0].set_runtime_primary(True)
+
+    @staticmethod
+    def _camera_timing_field_name(camera: VideoCaptureModel) -> str:
+        name = re.sub(r"[^0-9A-Za-z]+", "_", camera.name).strip("_").lower()
+        return name or f"camera_{camera.camera_index}"
+
     def _merge_camera_timestamp_files(self, project: ProjectInfo, cams: Tuple[VideoCaptureModel]):
-        # assert len(cams) == 2
+        if len(cams) == 0:
+            logger.warning("_merge_camera_timestamp_files called without cameras")
+            return
         timing_path = project.get_frame_timing_path()
         data = []
         prim_cam = cams[0]  # primary
@@ -653,16 +674,31 @@ class AppModel(ObservableObject):
                     df = df.tail(-(main_cam_first_frame_id - cur_first_frame_id)).reset_index(drop=True)
             data[idx_df] = df
         #
-        df_second_cam = data[1]
         r0 = df_main_cam[:1]
         start_frame_id = r0['frame_id'][0]
         first_frame_utc_when = r0['frame_time'][0]
         logger.debug("start_frame_id=%s (utc_when=%s)", start_frame_id, first_frame_utc_when)
+        camera_field_names = []
+        used_camera_field_names = set()
+        for cam in cams:
+            base_name = self._camera_timing_field_name(cam)
+            name = base_name
+            suffix = 1
+            while name in used_camera_field_names:
+                suffix += 1
+                name = f"{base_name}_{suffix}"
+            used_camera_field_names.add(name)
+            camera_field_names.append(name)
         timing_csv_fields = [
             'frame_id',
             'frame_when',
             'frame_present_primary',
             'frame_present_secondary',
+            *(
+                field
+                for camera_field_name in camera_field_names
+                for field in (f"frame_when_{camera_field_name}", f"frame_present_{camera_field_name}")
+            ),
             'utc_when',
         ]
         with timing_path.open("w") as fh:
@@ -673,11 +709,7 @@ class AppModel(ObservableObject):
                 # expected_frame_id = start_frame_id + idx
                 utc_when = first_frame_utc_when + idx * frame_duration
                 frame_when = df_main_cam['frame_when'][idx]
-                # protect in case of secondary camera recorded less frames:
-                if idx >= len(df_second_cam):
-                    second_frame_when = math.nan
-                else:
-                    second_frame_when = df_second_cam['frame_when'][idx]
+                second_frame_when = data[1]['frame_when'][idx] if len(data) > 1 and idx < len(data[1]) else math.nan
                 d = dict(
                     frame_id=frame_id,
                     frame_when=frame_when if math.isfinite(frame_when) else "",  # could keep the math.nan otherwise
@@ -685,22 +717,21 @@ class AppModel(ObservableObject):
                     frame_present_secondary=1 if math.isfinite(second_frame_when) else 0,
                     utc_when=utc_when,
                 )
+                for cam, df, camera_field_name in zip(cams, data, camera_field_names):
+                    if idx >= len(df):
+                        camera_frame_when = math.nan
+                    else:
+                        camera_frame_when = df['frame_when'][idx]
+                    d[f"frame_when_{camera_field_name}"] = (
+                        camera_frame_when if math.isfinite(camera_frame_when) else ""
+                    )
+                    d[f"frame_present_{camera_field_name}"] = 1 if math.isfinite(camera_frame_when) else 0
                 dw.writerow(d)
         logger.info("Written %s entries into %s", len(df_main_cam), timing_path)
         self._remove_timestamps_txt_files(project)
 
     def _get_monitored_cams(self):
-        cams = []  # put primary first
-        monitored_cams = self._reach_cameras
-        for cam in monitored_cams:
-            if cam.is_primary:
-                cams.append(cam)
-                break
-        for cam in monitored_cams:
-            if not cam.is_primary:
-                cams.append(cam)
-        monitored_cams = tuple(cams)
-        return monitored_cams
+        return self._ordered_reach_cameras(enabled_only=True)
 
     def _handle_proc_msg_queue(self):
         proc_msg_q = self._multiproc_msg_queue
@@ -764,7 +795,7 @@ class AppModel(ObservableObject):
             if cam_idx in monitored_cam_indices:
                 cams_closed_finished[cam_idx] = (project, frames_written)
                 if all(cam.camera_index in cams_closed_finished for cam in monitored_cams):
-                    project = cams_closed_finished[0][0]  # always take the primary cam passed project as ref.
+                    project = cams_closed_finished[monitored_cams[0].camera_index][0]
                     self._merge_camera_timestamp_files(project, monitored_cams)
                     cams_closed_finished.clear()  # now clear
         else:
@@ -816,6 +847,10 @@ class AppModel(ObservableObject):
     @property
     def reach_cameras(self) -> Tuple[VideoCaptureModel, ...]:
         return self._reach_cameras
+
+    @property
+    def inference_cameras(self) -> Tuple[VideoCaptureModel, ...]:
+        return self._inference_cameras
 
     def get_camera_model(self, camera_id: CameraId) -> Optional[VideoCaptureModel]:
         return self._camera_by_id.get(camera_id)
@@ -1279,14 +1314,18 @@ class AppModel(ObservableObject):
         return animal
 
     def make_project_info(self) -> ProjectInfo:
-        left = None if self._left_camera is None else self._left_camera.name
-        right = None if self._right_camera is None else self._right_camera.name
+        camera_names = tuple(camera.name for camera in self._reach_cameras if camera.is_enabled)
+        if len(camera_names) == 0:
+            camera_names = tuple(camera.name for camera in self._reach_cameras[:2])
+        left = camera_names[0] if len(camera_names) > 0 else ""
+        right = camera_names[1] if len(camera_names) > 1 else ""
         return ProjectInfo(
             root=self._output_location,
             device_id=self._preferences.serial_number,
             ensure_exists=True,
             camera_1=left,
             camera_2=right,
+            camera_names=camera_names,
             mp_manager=self._mp_manager,  # required,
             # so to have shared values that can be put to multiprocess queue.
             # The active ProjectInfo must effectively be shared across all processes/threads.
@@ -1349,31 +1388,62 @@ class AppModel(ObservableObject):
 
         self._behavior.on_prepare_capture()  # might be better at the end...
 
+        self._ensure_reach_primary_camera()
         self._inference_queue = None
+        self._inference_cameras = ()
+        inference_camera_indices = {}
 
         if self._inference.is_enabled:
-            shape_1 = self._left_camera.shape
-            shape_2 = self._right_camera.shape
-            if shape_1 == shape_2:
+            inference_cameras = self._ordered_reach_cameras(enabled_only=True)
+            inference_error = None
+            if len(inference_cameras) < 2:
+                inference_error = (
+                    "Live inference requires at least two enabled reach cameras; "
+                    f"found {len(inference_cameras)}."
+                )
+            else:
+                shape = inference_cameras[0].shape
+                mismatched_cameras = [
+                    camera.name
+                    for camera in inference_cameras
+                    if camera.shape != shape
+                ]
+                if len(mismatched_cameras) > 0:
+                    inference_error = (
+                        "Live inference requires all enabled reach cameras to use the same frame size; "
+                        f"mismatched cameras: {', '.join(mismatched_cameras)}."
+                    )
+            if inference_error is None:
                 self._inference_queue = FixedArrayMultiQueue(
                     # live queue does not need/require a lot of "depth" == total nbr of batches that can sit
                     # in the ring-buffer-queue at the same time.
                     # Now only using a "depth" of 1 frame batches,
                     # this should makes less delay / be more reactive in live inference results,
                     1,
-                    2,
+                    len(inference_cameras),
                     3,
-                    shape=shape_1,
+                    shape=shape,
+                    primary=0,
                     name="inference_q",
                     mp_ctx=get_mp_ctx(),
                 )
+                inference_camera_indices = {
+                    camera: camera_index
+                    for camera_index, camera in enumerate(inference_cameras)
+                }
+                self._inference_cameras = inference_cameras
             else:
-                logger.warning("inference disabled: left and right camera frame sizes do not match")
+                logger.error(inference_error)
+                self.on_error("Inference configuration error", inference_error)
+                self.project = None
+                with self.app_lock:
+                    self._acquisition_starting = False
+                return False
         else:
             self._inference_queue = None
 
         #
-        synced_cameras = self._reach_cameras  # normally/usually left cam is primary
+        synced_cameras = self._ordered_reach_cameras(enabled_only=True)  # normally/usually left cam is primary
         did_start = True
 
         # 1) prepare synced primary camera(s)
@@ -1381,7 +1451,11 @@ class AppModel(ObservableObject):
             for camera in synced_cameras:
                 if camera.is_primary and camera.is_enabled:
                     logger.info("Preparing capture on %s", camera.name)
-                    did_start = camera.on_prepare_capture(self._inference_queue)
+                    inference_index = inference_camera_indices.get(camera)
+                    did_start = camera.on_prepare_capture(
+                        self._inference_queue if inference_index is not None else None,
+                        inference_index=inference_index,
+                    )
                     if not did_start:
                         self.on_error("Camera Process Failed",
                                       _failed_camera_template(camera.name, camera.last_error))
@@ -1400,7 +1474,11 @@ class AppModel(ObservableObject):
             for camera in synced_cameras:
                 if not camera.is_primary and camera.is_enabled:
                     logger.info("Preparing capture on %s", camera.name)
-                    did_start = camera.on_prepare_capture(self._inference_queue)
+                    inference_index = inference_camera_indices.get(camera)
+                    did_start = camera.on_prepare_capture(
+                        self._inference_queue if inference_index is not None else None,
+                        inference_index=inference_index,
+                    )
                     if not did_start:
                         self.on_error("Camera Process Failed",
                                       _failed_camera_template(camera.name, camera.last_error))
@@ -1669,9 +1747,22 @@ class AppModel(ObservableObject):
         prebuffer_duration = 0
 
         frame_rate = None
-        if (left_cam_cfg := configuration.get_camera(CameraId.Left)) is not None:
-            prebuffer_duration = left_cam_cfg.record_prebuffer_duration
-            frame_rate = left_cam_cfg.params.get("fps")
+        reach_camera_configs = []
+        for camera in self._reach_cameras:
+            camera_config = configuration.get_camera(camera.camera_id)
+            if camera_config is None:
+                camera_config = CameraConfiguration(
+                    id=camera.camera_id,
+                    name=str(camera.camera_id),
+                    is_enabled=False,
+                    scheme="random",
+                    params=dict(width=300, height=200),
+                    record_prebuffer_duration=0,
+                )
+            reach_camera_configs.append((camera, camera_config))
+            prebuffer_duration = max(prebuffer_duration, camera_config.record_prebuffer_duration)
+            if frame_rate is None:
+                frame_rate = camera_config.params.get("fps")
 
         pose_algo = self._pose_algorithm
         pose_algo.frame_rate = frame_rate
@@ -1680,18 +1771,19 @@ class AppModel(ObservableObject):
         # which force a sync to pose-result process.
         self._behavior.system_machine.intersession.frame_rate = frame_rate
 
-        if (right_cam_cfg := configuration.get_camera(CameraId.Right)) is not None:
-            prebuffer_duration = max(prebuffer_duration, right_cam_cfg.record_prebuffer_duration)
-            if right_cam_cfg.record_prebuffer_duration != prebuffer_duration:
-                logger.warning("left & right cameras don't have same record_prebuffer_duration: %s vs %s ; using max",
-                               right_cam_cfg.record_prebuffer_duration, prebuffer_duration)
-            right_cam_cfg.record_prebuffer_duration = prebuffer_duration
+        for camera, camera_config in reach_camera_configs:
+            if camera_config.record_prebuffer_duration != prebuffer_duration:
+                logger.warning(
+                    "reach cameras don't have same record_prebuffer_duration: %s=%s vs max=%s ; using max",
+                    camera.name,
+                    camera_config.record_prebuffer_duration,
+                    prebuffer_duration,
+                )
+            camera_config.record_prebuffer_duration = prebuffer_duration
 
-        if left_cam_cfg is not None:
-            self._left_camera.load_configuration(left_cam_cfg)
-
-        if right_cam_cfg is not None:
-            self._right_camera.load_configuration(right_cam_cfg)
+        for camera, camera_config in reach_camera_configs:
+            camera.load_configuration(camera_config)
+        self._ensure_reach_primary_camera()
 
         if (camera := configuration.get_camera(CameraId.Web)) is not None:
             self._top_camera.load_configuration(camera)
@@ -1906,7 +1998,9 @@ class AppModel(ObservableObject):
         cur_inter_state = self._behavior.system_machine.intersession.state
         if cur_inter_state != IntersessionState.idle:
             parts.append(f"Intersession: {cur_inter_state}")
-        self._left_camera.text_overlay = None if len(parts) == 0 else "\n".join(parts)
+        text_overlay = None if len(parts) == 0 else "\n".join(parts)
+        for camera in self._reach_cameras:
+            camera.text_overlay = text_overlay
 
     def _set_animal_base_positions(self, animal: AnimalSubject):
         xyz = Offset3DTuple(animal.pellet_x, animal.pellet_y, animal.pellet_z)
@@ -2097,9 +2191,8 @@ class AppModel(ObservableObject):
             else:
                 self._analysis.watchdog_monitor.unregister_watchdog(WatchdogItems.POSE_PROCESS)
 
-            left_cam = self._left_camera
-            left_cam.display_dots_detection = new_is_live
-            self._right_camera.display_dots_detection = new_is_live
+            for camera in self._reach_cameras:
+                camera.display_dots_detection = new_is_live
             self._update_status_text_overlay()
         elif name == InferenceModel.MODEL_LOCATION:
             if value:
@@ -2276,6 +2369,7 @@ class AppModel(ObservableObject):
             "appVersion": self._app_version,
             "animalName": self.animal_name,
             "notes": self.notes or "",
+            "cameraNames": list(project.camera_names),
             "session": session,
             "t_pellet_delivered": project.t_pellet_delivered,
             "t_pellet_presented": project.t_pellet_presented,

@@ -41,6 +41,10 @@ LIVE_WORKERS_RENEW_TIMER_DELAY = float(os.getenv("AUTOTRAINER_LIVE_WORKERS_RENEW
                                                  60 * 60))
 
 
+def _get_project_camera_names(project: ProjectInfo) -> Tuple[str, ...]:
+    return tuple(project.camera_names) or (project.camera_1, project.camera_2)
+
+
 # even better is to use __debug__ and use "python -O ..."
 # see https://docs.python.org/3/using/cmdline.html#cmdoption-O
 _local_do_debug = False
@@ -103,6 +107,7 @@ class InferenceMonitorDataProc(multiprocessing.Process):
         self._cmd_ack_event = cmd_ack_event
         self._msg_queue = msg_queue
         self._frames_per_camera = frames_per_cam
+        self._camera_count = len(_get_project_camera_names(project))
         self._recording_live_batch = int(os.getenv("INFERENCE_LIVE_BATCH", 150 * 5))  # 5s at 150 FPS
         self._monitored_parts_offsets = monitored_parts_offsets
         self._parts_offsets = 0
@@ -158,6 +163,7 @@ class InferenceMonitorDataProc(multiprocessing.Process):
             monitored_parts_offsets=self._monitored_parts_offsets,
             output_q=self._msg_queue,
             input_q=self._live_input_q,
+            camera_count=self._camera_count,
             generation=generation,
             log_config=self._log_dict_config,
         )
@@ -333,8 +339,8 @@ class InferenceMonitorDataProc(multiprocessing.Process):
         pose_data: Optional[List[numpy.ndarray]]
         frames_indices: Optional[numpy.ndarray]
 
-        frames_per_batch = 3
-        cams = [project.camera_1, project.camera_2]
+        frames_per_batch = self._frames_per_camera
+        cams = list(_get_project_camera_names(project))
         n_cams = len(cams)
         range_cams: List[int] = list(range(n_cams))
         cams_frame_idx_fhs = None

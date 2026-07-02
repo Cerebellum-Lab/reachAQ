@@ -105,3 +105,34 @@ def test_algorithm_output():
     verify_all_false(response.parts_flags[0], "Part05")
     verify_all_false(response.parts_flags[1], "Part05")
     verify_all_false(response.parts_flags[2])
+
+
+def test_algorithm_output_three_cameras():
+    parts = ["Part00", "Part01"]
+    algorithm = PoseAlgorithm()
+    algorithm.initialize(parts)
+    data = [
+        numpy.zeros((len(parts), 3))
+        for _ in range(6)
+    ]
+
+    # Second frame for each of three interleaved cameras sees Part00.
+    for frame_index in (3, 4, 5):
+        data[frame_index][0][2] = 0.95
+    # Only the third camera sees Part01.
+    data[5][1][2] = 0.95
+
+    response = algorithm.process(data, camera_count=3)
+
+    assert len(response.parts_flags) == 4
+    assert len(response.locations) == 3
+    verify_all_false(response.parts_flags[0], "Part00")
+    verify_all_false(response.parts_flags[1], "Part00")
+    assert response.parts_flags[2]["Part00"] is True
+    assert response.parts_flags[2]["Part01"] is True
+    verify_all_false(response.parts_flags[-1], "Part00")
+    assert response.parts_flags[-1]["Part01"] is False
+    assert all("Part00" in locations for locations in response.locations)
+    assert "Part01" not in response.locations[0]
+    assert "Part01" not in response.locations[1]
+    assert "Part01" in response.locations[2]
