@@ -319,19 +319,10 @@ class AppModel(ObservableObject):
         # so that the later doesn't try to open the video files, before they are finished written to and closed.
         # Preventing the opencv lib to emit warning on stderr.
 
-        reach_cameras = []
-        for camera_index, camera_id in enumerate(CameraId.reach_camera_ids()):
-            reach_cameras.append(VideoCaptureModel(
-                str(camera_id),
-                self._preferences,
-                camera_index,
-                msg_queue=proc_msg_queue,
-                cam_id=camera_id,
-                synced_cam_frame_index=self._cams_synced_frame_index,
-                synced_cam_recording=self._cams_record_enabled,
-                record_stop_sema=self._record_stop_sema,
-            ))
-        self._reach_cameras = tuple(reach_cameras)
+        self._reach_cameras = tuple(
+            self._make_reach_camera_model(camera_id, camera_index)
+            for camera_index, camera_id in enumerate((CameraId.Left, CameraId.Right))
+        )
         self._left_camera = self._reach_cameras[0]
         self._right_camera = self._reach_cameras[1]
 
@@ -450,6 +441,77 @@ class AppModel(ObservableObject):
             logger.verbose("Scheduled send_system_status in %.1f seconds", delay)
 
         one_minute_timer_handle_and_reschedule()
+
+    def _make_reach_camera_model(self, camera_id: CameraId, camera_index: int) -> VideoCaptureModel:
+        return VideoCaptureModel(
+            str(camera_id),
+            self._preferences,
+            camera_index,
+            msg_queue=self._multiproc_msg_queue,
+            cam_id=camera_id,
+            synced_cam_frame_index=self._cams_synced_frame_index,
+            synced_cam_recording=self._cams_record_enabled,
+            record_stop_sema=self._record_stop_sema,
+        )
+
+    @staticmethod
+    def _configured_reach_camera_ids(configuration: SystemConfiguration) -> Tuple[CameraId, ...]:
+        reach_camera_ids = set(CameraId.reach_camera_ids())
+        configured_ids: List[CameraId] = []
+        for camera_config in configuration.cameras:
+            camera_id = camera_config.id
+            if camera_id in reach_camera_ids and camera_id not in configured_ids:
+                configured_ids.append(camera_id)
+        return tuple(configured_ids)
+
+    def _refresh_camera_collections(self) -> None:
+        self._left_camera = next(
+            (camera for camera in self._reach_cameras if camera.camera_id == CameraId.Left),
+            None,
+        )
+        self._right_camera = next(
+            (camera for camera in self._reach_cameras if camera.camera_id == CameraId.Right),
+            None,
+        )
+        self._cameras = [
+            *self._reach_cameras,
+            self._top_camera,
+        ]
+        self._camera_by_id = {
+            camera.camera_id: camera
+            for camera in self._cameras
+        }
+        self._models = [
+            *self._reach_cameras,
+            self._top_camera,
+            self._inference,
+            self._behavior,
+            self._nidaq_signal_monitor,
+        ]
+        if self._project_info is not None:
+            for camera in self._reach_cameras:
+                camera.project = self._project_info
+
+    def _sync_reach_cameras_to_configuration(self, configuration: SystemConfiguration) -> None:
+        configured_camera_ids = self._configured_reach_camera_ids(configuration)
+        current_by_id = {
+            camera.camera_id: camera
+            for camera in self._reach_cameras
+        }
+        next_cameras: List[VideoCaptureModel] = []
+        for camera_index, camera_id in enumerate(configured_camera_ids):
+            camera = current_by_id.pop(camera_id, None)
+            if camera is None or camera.camera_index != camera_index:
+                if camera is not None:
+                    camera.on_close()
+                camera = self._make_reach_camera_model(camera_id, camera_index)
+            next_cameras.append(camera)
+
+        for removed_camera in current_by_id.values():
+            removed_camera.on_close()
+
+        self._reach_cameras = tuple(next_cameras)
+        self._refresh_camera_collections()
 
     @BehaviorAlgorithm.relay_func(wait=False)
     def _on_daily_timer(self):
@@ -1744,6 +1806,8 @@ class AppModel(ObservableObject):
 
         configuration: SystemConfiguration = self.get_config_from_location(location)
 
+        self._sync_reach_cameras_to_configuration(configuration)
+
         prebuffer_duration = 0
 
         frame_rate = None
@@ -1751,14 +1815,7 @@ class AppModel(ObservableObject):
         for camera in self._reach_cameras:
             camera_config = configuration.get_camera(camera.camera_id)
             if camera_config is None:
-                camera_config = CameraConfiguration(
-                    id=camera.camera_id,
-                    name=str(camera.camera_id),
-                    is_enabled=False,
-                    scheme="random",
-                    params=dict(width=300, height=200),
-                    record_prebuffer_duration=0,
-                )
+                continue
             reach_camera_configs.append((camera, camera_config))
             prebuffer_duration = max(prebuffer_duration, camera_config.record_prebuffer_duration)
             if frame_rate is None:

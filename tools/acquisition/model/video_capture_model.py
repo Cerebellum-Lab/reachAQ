@@ -477,6 +477,7 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
     def on_close(self):
         logger.debug("closing %s", self.name)
         self.on_capture_stop()
+        NotificationCenter.default_center().remove_observer(TriggerNotification.CAPTURE_ID, self._on_trigger)
 
     @property
     def active_config(self) -> CameraConfiguration:

@@ -202,11 +202,58 @@ class MainContent(ContentWidget):
         self._reach_camera_content_by_model = {}
         self._left_camera_content = None
         self._right_camera_content = None
-        columns = 3
-        for idx, camera in enumerate(app_model.reach_cameras):
+        self._top_layout = top_layout
+        self._reach_camera_grid_column_count = 0
+        self._reach_camera_grid_row_count = 0
+        self._rebuild_reach_camera_grid()
+        self._top_camera_content = None
+
+        return widget
+
+    @staticmethod
+    def _reach_camera_grid_columns(camera_count: int) -> int:
+        if camera_count <= 1:
+            return 1
+        if camera_count <= 3:
+            return camera_count
+        if camera_count == 4:
+            return 2
+        return 3
+
+    def _clear_reach_camera_grid(self) -> None:
+        for camera, camera_content in self._reach_camera_contents:
+            del camera  # unused
+            self._top_layout.removeWidget(camera_content)
+            if camera_content in self._content_widgets:
+                self._content_widgets.remove(camera_content)
+            camera_content.close()
+            camera_content.setParent(None)
+            camera_content.deleteLater()
+        self._reach_camera_contents = []
+        self._reach_camera_content_by_model = {}
+        self._left_camera_content = None
+        self._right_camera_content = None
+
+    def _rebuild_reach_camera_grid(self) -> None:
+        self._clear_reach_camera_grid()
+
+        app_model = self._app_model
+        cameras = app_model.reach_cameras
+        columns = self._reach_camera_grid_columns(len(cameras))
+        rows = max(1, math.ceil(len(cameras) / columns))
+
+        for column in range(max(self._reach_camera_grid_column_count, columns)):
+            self._top_layout.setColumnStretch(column, 1 if column < columns else 0)
+        for row in range(max(self._reach_camera_grid_row_count, rows)):
+            self._top_layout.setRowStretch(row, 1 if row < rows else 0)
+        self._reach_camera_grid_column_count = columns
+        self._reach_camera_grid_row_count = rows
+
+        for idx, camera in enumerate(cameras):
             camera_content = CameraContent(app_model, camera)
+            camera_content.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
             camera_content.camera_view.setTitle(_camera_panel_title(camera.name))
-            top_layout.addWidget(camera_content, idx // columns, idx % columns)
+            self._top_layout.addWidget(camera_content, idx // columns, idx % columns)
             self._content_widgets.append(camera_content)
             self._reach_camera_contents.append((camera, camera_content))
             self._reach_camera_content_by_model[camera] = camera_content
@@ -214,12 +261,6 @@ class MainContent(ContentWidget):
                 self._left_camera_content = camera_content
             elif camera is app_model.right_camera:
                 self._right_camera_content = camera_content
-        self._top_camera_content = None
-
-        for column in range(columns):
-            top_layout.setColumnStretch(column, 1)
-
-        return widget
 
     def _create_mid_widget_manual(self, app_model):
         widget = QWidget()
@@ -566,6 +607,7 @@ class MainContent(ContentWidget):
     @invoke_method
     def _on_config_loaded(self, config):
         del config  # unused
+        self._rebuild_reach_camera_grid()
         # only re-setting the current selected animal
         self._hardware_control_content.set_selected_animal(self._app_model.selected_animal)
         # this allows to set correctly for the possible diamond-triangle config loaded

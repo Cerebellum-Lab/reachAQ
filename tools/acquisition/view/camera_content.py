@@ -75,6 +75,11 @@ class CameraContent(ContentWidget):
     def camera_view(self) -> QCaptureView:
         return self._capture_view
 
+    def close(self):
+        NotificationCenter.default_center().remove_observer(TriggerNotification.CAPTURE_ID, self._trigger_received)
+        self._model.property_changed -= self._on_model_property_changed
+        super().close()
+
     @Slot(ndarray, float)
     def refresh_image(self, data: ndarray, fps: float):
         row, col = data.shape

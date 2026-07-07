@@ -98,6 +98,8 @@ def test_load_config(app_model, trainer_config_dir, animals_dir, calib_dir, syst
     assert res is True
     assert app_model.left_camera.name == "left"
     assert app_model.right_camera.name == "right"
+    assert len(app_model.reach_cameras) == 2
+    assert app_model.get_camera_model(CameraId.Camera3) is None
     assert app_model.top_camera.name == "web"
     assert app_model.output_location == system_config.persistence.output_location
     pref = app_model.preferences
@@ -120,7 +122,7 @@ def test_load_config_extra_reach_camera_slot(app_model, trainer_config_dir, syst
     assert app_model.load_configuration() is True
 
     loaded_camera3 = app_model.get_camera_model(CameraId.Camera3)
-    assert len(app_model.reach_cameras) == CameraId.supported_count()
+    assert len(app_model.reach_cameras) == 3
     assert loaded_camera3.is_enabled
     assert loaded_camera3.name == "camera3"
     assert app_model.make_project_info().camera_names == ("camera3",)
