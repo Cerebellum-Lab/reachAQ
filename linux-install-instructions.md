@@ -444,6 +444,26 @@ conda run -n "$REACHAQ_ENV" python tools/hardware/validate_can_hardware.py \
   --action discover
 ```
 
+Optional PEAK terminal monitor:
+
+```bash
+codename="$(lsb_release -cs)"
+wget -q "http://www.peak-system.com/debian/dists/${codename}/peak-system.sources" \
+  -O /tmp/peak-system.sources
+wget -q http://www.peak-system.com/debian/peak-system-public-key.asc \
+  -O /tmp/peak-system-public-key.asc
+sudo install -m 0644 /tmp/peak-system.sources /etc/apt/sources.list.d/peak-system.sources
+sudo install -m 0644 /tmp/peak-system-public-key.asc /etc/apt/trusted.gpg.d/peak-system-public-key.asc
+sudo apt-get update
+sudo apt-get install -y pcanview-ncurses
+```
+
+Run it after the CAN interfaces are up:
+
+```bash
+pcanview-ncurses
+```
+
 Use PEAK's out-of-tree PCAN-Linux package only when the in-kernel SocketCAN
 driver is missing, too old for the adapter, or the rig intentionally uses PCAN
 Basic instead of SocketCAN.
