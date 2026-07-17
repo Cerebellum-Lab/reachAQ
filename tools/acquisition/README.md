@@ -1,139 +1,140 @@
 # Acquisition UI
 
-## Using Configurations
-Configuration files load preset values for the settings of each module (cameras, devices, behavior, output).  When 
-the application starts it will load the most recent configuration file, if available and be in non-edit mode.
+The acquisition application is the reachAQ operator UI for camera acquisition,
+hardware status, pellet delivery, NI-DAQ port mapping, laser controls, behavior,
+and inference.
 
-To make changes to module settings use the Edit Configuration toolbar button.  This will change the controls in 
-each module view area to be editable where applicable.  Make the desired changes, exit edit mode (using the same
-toolbar button), and then use the Save or Save As... File menu items to save the configuration to a new or
-existing file.
+## Launch
 
-See a complete configuration file with all allowed fields at the end of this document.  Using only a subset
-of values that should not be the default is valid.
+Use the reachAQ entry point from the configured conda environment:
+
+```bash
+conda run -n reachaq python -m reachAQ.app \
+  --start-mode idle \
+  -c "$HOME/Autotrainer/system_configuration.yaml"
+```
+
+Use idle mode during hardware bring-up so the app does not immediately start
+acquisition. For software-only camera testing:
+
+```bash
+conda run -n reachaq python -m reachAQ.app \
+  --start-mode idle \
+  --random-cameras \
+  -c "$HOME/Autotrainer/system_configuration.yaml"
+```
+
+The random-camera override is in-memory for that run and does not overwrite the
+configured physical camera serials when the app closes.
+
+## Configurations
+
+Configuration files load preset values for cameras, devices, NI-DAQ channels,
+laser controls, behavior, inference, and output. On Linux reachAQ rigs, the
+default local config is usually:
+
+```text
+~/Autotrainer/system_configuration.yaml
+```
+
+The app saves configuration back to the preferences configuration directory. For
+alternate software-only configs, use a separate preferences file and config
+directory so test settings do not overwrite the bench config.
+
+## Cameras
+
+Reach cameras are configured as `CameraConfiguration` entries. The left and
+right cameras are the normal two-camera reachAQ setup. Cameras 3-6 appear in
+the UI only when explicitly present in the configuration.
+
+reachAQ does not require a webcam. Leave the `web` camera absent or disabled
+unless a rig intentionally configures it.
+
+For Spinnaker cameras, put the camera serial or configured Spinnaker identifier
+in `host`:
+
+```yaml
+- !CameraConfiguration
+  id: 0
+  name: left
+  isEnabled: true
+  isRecordEnabled: true
+  recordMode: 1
+  recordPrebufferDuration: 1.0
+  scheme: spinnaker
+  host: '24152533'
+  port: 0
+  path: ''
+  params:
+    fps: 150
+    width: 256
+    height: 256
+    hbin: 4
+    vbin: 4
+    exposure: 175
+    primary: 'yes'
+```
+
+The matching right camera should use its own serial and `primary: 'no'`.
+
+## NI-DAQ Ports
+
+The DAQ port editor discovers devices through NI-DAQmx and lists only channels
+reported by the selected device. It also prevents duplicate channel assignments
+across roles. If a selected device has no analog input channels, analog-input
+roles are disabled instead of allowing an invalid assignment.
+
+On the current PXIe-1073 / PXI-6713 setup, NI-DAQmx reports:
+
+```text
+Device: PXI1Slot4
+AO: PXI1Slot4/ao0 through PXI1Slot4/ao7
+AI: none
+DIO: PXI1Slot4/port0/line0 through PXI1Slot4/port0/line7
+```
+
+The 6713 can provide analog outputs and digital I/O, but it cannot provide
+analog input readback. Add a supported NI analog-input card if laser diode or
+command-copy feedback channels are required.
+
+## Output
+
+Set acquisition output in the persistence section:
+
+```yaml
+persistence: !PersistenceConfiguration
+  outputLocation: /home/<USER>/Documents/rawdatalocal
+```
+
+Create the directory before running acquisition:
+
+```bash
+mkdir -p "$HOME/Documents/rawdatalocal"
+```
 
 ## Reference
 
-### Menus/Toolbar Buttons
+### Toolbar
 
-#### Toolbars
-* Run/stop - start and stop acquisition and device interaction
-* Edit Configuration - change the window to edit mode to change settings
-* Preferences - set system level application preferences that are not part of configuration files
-  * Device Name of this system
-  * Log Level for the application and related services
+* Run/stop - start and stop acquisition and device interaction.
+* Edit Configuration - change editable module settings.
+* Preferences - set system-level application preferences.
+* Hardware Refresh - scan camera sources, NI-DAQ devices, CAN adapter, and pellet delivery board while idle.
+* Edit DAQ Ports - configure named NI-DAQ roles from discovered device channels.
 
-#### Menus
-* File -> Open Configuration - open an existing configuration file
-* File -> Save Configuration (As) - save the current configuration file or as a new file
-* View -> Diagnostics - show or hide the diagnostics panel
+### Menus
+
+* File -> Open Configuration - open an existing configuration file.
+* File -> Save Configuration / Save As - save the current configuration.
+* View -> Diagnostics - show or hide the diagnostics panel.
 
 ### Camera Control
-* Video Capture - will not start the camera subprocess when not enabled
-* Recode Mode - `Continuous` to record entire duration, `Trigger` to only record based on trigger events
-* Video Recording - capture all frames to video files
-* Image Capture - capture still images at a specified interval
-* Image Capture Interval - interval for still image capture
 
-### Head Fix Device
-* Port - local device serial port
-* Position - `0-100` (corresponds to `Axx` command)
-* Load Cell Trigger - value above which recording will be enabled if a camera record mde is `Trigger`
-* Graph - previous 5 seconds of scale data
-* Header/Load Cell/Force Detector `(Dis)Engaged` indicates the state of these sensors
-  * Note that this is not necessarily the instantaneous value of the sensor, but the result of
-  any logic such as a minimum time to consider the load cell engaged, etc.
-* Tare - Tare the load cell
+* Video Capture - starts capture only when the camera is enabled.
+* Record Mode - `Continuous` records the full duration, `Trigger` records around trigger events.
+* Video Recording - writes frames to video files.
+* Image Capture - captures still images at a configured interval.
 
-### Pellet Delivery
-* Port - local device serial port
-* Home - device `H` command
-* Load - device `P` command
-* Send - device `M` command
-* Release - device `R` command
-* Cover - device `Q` command (not implemented)
-* X - device `Ixx` command
-* Y - device `Jxx` command
-* Z - device `Kxx` command
-
-### Behavior
-* Enable - enable or disable pellet delivery based on marker detection
-* Model - the folder containing the DLC model to use
-
-### Metadata
-* `Name` and `Notes` to be saved as part of the session metadata
-
-### Output
-* Output Location - location for recorded video files
-
-### Log
-Logs from any module that is not a subprocess.  Additional subprocess log messages can be seen at the command line.
-
-## System Configuration
-* The unit number for the output directory structure/file names can be set by editing `~/.config/Colorado/Auto Trainer.conf`
- and adding 
-```
-[system]
-serial_number=12345
-```
-
-## Example Configuration File
-
-Most values can be set by configuring the subsystem in the application and saving the configuration.  Others
-must explicitly be added to the file.
-
-```yaml
-camera1:
-  id: left
-  name: Spinnaker 33199919
-  url: spinnaker://33199919?fps=150&width=300&height=200&hbin=4&vbin=4&exposure=250&primary=true
-  isEnabled: true
-  isRecordEnabled: true
-  recordMode: 1
-  isStillImageCaptureEnabled: false
-  stillImageCaptureInterval: 5
-camera2:
-  id: right
-  name: Spinnaker 33199895
-  url: spinnaker://33199895?fps=150&width=300&height=200&hbin=4&vbin=4&exposure=250&primary=true
-  isEnabled: true
-  isRecordEnabled: true
-  recordMode: 1
-  isStillImageCaptureEnabled: false
-  stillImageCaptureInterval: 5
-camera3:
-  id: web
-  name: ELP
-  url: opencv://0?mjpeg=true&width=1920&height=1080&fps=30
-  isEnabled: true
-  isRecordEnabled: true
-  recordMode: 0
-  isStillImageCaptureEnabled: true
-  stillImageCaptureInterval: 5.0
-headFix:
-  port: /dev/ttyACM0
-  position: 0
-  loadCell:
-    loadTrigger: 8
-    minLoadOnDuration: 0.250
-    minEventDuration: 4.0
-    minLoadOffDuration: 2.0
-pelletDelivery:
-  port: /dev/ttyACM1
-  x: 0
-  y: 0
-  z: 0
-inference:
-  model: /home/jetson/models/Christie-2024-05-02
-  isEnabled: true
-behavior:
-  maxPelletMissingSeconds: 1.0
-  maxPelletsPerSession: 15
-  maxPelletsPerDay: 120
-  minBaselineIntensity: 5.0
-  maxBaselineIntensity: 90.0
-  baselineIntensityIncrement: 15.0
-  defaultBaselineIntensity: 30.0
-
-outputLocation: /home/jetson/output
-```
+See [../../linux-install-instructions.md](../../linux-install-instructions.md)
+and [../hardware/reachaq_system_configuration.example.yaml](../hardware/reachaq_system_configuration.example.yaml)
+for the current Linux hardware setup and example config.

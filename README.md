@@ -1,8 +1,9 @@
-# Autotrainer
+# Autotrainer / reachAQ
 
 
 * [Overview](#overview)
 * [Installation instructions](INSTALL.md)
+* [reachAQ Linux install guide](linux-install-instructions.md)
 * [Applications](#applications)
   * [Acquisition](#acquisition-application)
   * [Tunnel Test](#tunnel-test-application)
@@ -21,10 +22,16 @@
 * [Code Guidelines](#code-guidelines)
 
 ## Overview
-This repository contains the Autotrainer modules and applications that are primarily used on-device.  A monorepo
+This repository contains the Autotrainer modules and reachAQ applications that are primarily used on-device.  A monorepo
 is used here primarily as a development convenience.  Individual modules and applications can and are installed
 in on devices independently.  This loose-coupling should be assumed when managing dependencies or refactoring
 common code.
+
+For the current reachAQ Dell/Ubuntu runtime, use
+[linux-install-instructions.md](linux-install-instructions.md). The expected
+environment name is `reachaq`, the GUI entry point is `python -m reachAQ.app`,
+and local acquisition data should be configured under
+`$HOME/Documents/rawdatalocal`.
 
 ## Applications
 
@@ -36,11 +43,12 @@ from the core logic of the applications for two reasons:
 **Current Applications**
 
 * Acquisition Application
-  *  The local user interface for integrated camera, head fix, pellet delivery, and pose inference modules 
-  * `python -m tools.acquisition.gui`
+  * The local user interface for integrated camera, head fix, pellet delivery, and pose inference modules
+  * `python -m reachAQ.app --start-mode idle -c ~/Autotrainer/system_configuration.yaml`
     * [Detailed Instructions](tools/acquisition/README.md)
+    * Use `--random-cameras` to start with software-generated frames when no physical cameras are configured.
   * Headless implementation for command line only
-    * `python -m tools.acquisition.headless`
+    * `auto-trainer-headless --start-mode idle -c ~/Autotrainer/system_configuration.yaml`
 * Tunnel Test Application
   * Standalone UI for interfacing with the tunnel hardware components
   * `python -m tools.head_fix.gui`
@@ -193,7 +201,7 @@ guidelines are in place for future additions and changes to help with and improv
 * Style generally follows PEP8.  This is the default in most editors or lint tools.
   * An exception is made for `autotrainer.pyside`.  Classes derived from PySide follow PySide conventions.
 * All modules are defined as namespace packages to allow for separation of modules under the same `autotrainer` namespace.
-* Code, particularly in modules, should be as platform-agnostic as possible despite having a current target (Jetson->Ubuntu 20.04).
+* Code, particularly in modules, should be as platform-agnostic as possible despite having a current reachAQ target of Ubuntu 22.04 on x86_64.
   * Fallback support does not need to match the target platform behavior where is can not (e.g. CUDA), but allow the code to run as correctly as possible.
   * This is primarily for automated testing in other environments such as GitHub Actions.
   * Secondarily, it allows for development off-hardware when not available or not practical.

@@ -1,6 +1,8 @@
 # reachAQ Dell/Ubuntu system configuration example.
-# Replace NI-DAQ device/channel names, camera identifiers, paths, and voltage limits with the bench rig values.
+# Replace camera serials, NI-DAQ device/channel names, model paths, and voltage limits with the bench rig values.
 # CAN transport is configured through reachaq_hardware.env.example because the current CAN runtime reads environment.
+# Cameras 3-6 and web camera entries are intentionally omitted; they appear in the UI only when explicitly configured.
+# The current PXIe-1073/PXI-6713 rig is expected to appear as PXI1Slot4 with AO 0-7, no AI, and port0/line0-7 DIO.
 
 !SystemConfiguration
 version: 56
@@ -15,11 +17,19 @@ cameras:
   isStillImageCaptureEnabled: false
   stillImageCaptureInterval: 0.0
   scheme: spinnaker
-  host: ''
+  host: '<LEFT_CAMERA_SERIAL>'
   port: 0
-  path: left
+  path: ''
   params:
     fps: 150
+    width: 256
+    height: 256
+    hbin: 4
+    vbin: 4
+    exposure: 175
+    gain: 1
+    gamma: 0.7
+    primary: 'yes'
 - !CameraConfiguration
   id: 1
   name: right
@@ -30,26 +40,19 @@ cameras:
   isStillImageCaptureEnabled: false
   stillImageCaptureInterval: 0.0
   scheme: spinnaker
-  host: ''
+  host: '<RIGHT_CAMERA_SERIAL>'
   port: 0
-  path: right
+  path: ''
   params:
     fps: 150
-- !CameraConfiguration
-  id: 3
-  name: camera3
-  isEnabled: false
-  isRecordEnabled: false
-  recordMode: 1
-  recordPrebufferDuration: 1.0
-  isStillImageCaptureEnabled: false
-  stillImageCaptureInterval: 0.0
-  scheme: spinnaker
-  host: ''
-  port: 0
-  path: camera3
-  params:
-    fps: 150
+    width: 256
+    height: 256
+    hbin: 4
+    vbin: 4
+    exposure: 175
+    gain: 1
+    gamma: 0.7
+    primary: 'no'
 hardware: !HardwareConfiguration
   tunnelIdentifier: ''
   pelletIdentifier: CAN
@@ -64,101 +67,32 @@ inference: !InferenceConfiguration
   isEnabled: true
   intersessionWaitTime: 2.0
 laser: !LaserSystemConfiguration
-  # Confirm the actual NI-DAQ model and device alias in NI MAX before using this file.
-  backend: nidaq
-  hardwareTimed: true
-  sampleRateHz: 10000.0
-  pmtShutterOutput: Dev1/port0/line7
+  # The PXI-6713 has analog outputs but no analog inputs. Keep laser feedback disabled
+  # until a supported analog-input device is configured for diode/command-copy inputs.
+  backend: disabled
+  hardwareTimed: false
+  sampleRateHz: null
+  pmtShutterOutput: null
   triggerListenerInputs: []
-  channels:
-  - !LaserChannelConfiguration
-    channelId: 1
-    analogOutput: Dev1/ao0
-    diodeInput: Dev1/ai0
-    commandCopyInput: Dev1/ai1
-    shutterOutput: Dev1/port0/line0
-    auxiliaryOutput: Dev1/port0/line1
-    triggerSource: /Dev1/PFI0
-    triggerOutput: Dev1/port0/line2
-    timingTriggerOutput: Dev1/port0/line3
-    minimumCommandVolts: 0.0
-    maximumCommandVolts: 5.0
-    feedbackScale: 1.0
-    commandCopyScale: 1.0
-  - !LaserChannelConfiguration
-    channelId: 2
-    analogOutput: Dev1/ao1
-    diodeInput: Dev1/ai2
-    commandCopyInput: Dev1/ai3
-    shutterOutput: Dev1/port0/line4
-    auxiliaryOutput: Dev1/port0/line5
-    triggerSource: /Dev1/PFI0
-    triggerOutput: Dev1/port0/line6
-    timingTriggerOutput: Dev1/port1/line0
-    minimumCommandVolts: 0.0
-    maximumCommandVolts: 5.0
-    feedbackScale: 1.0
-    commandCopyScale: 1.0
+  channels: []
 nidaqPorts: !NidaqPortConfiguration
-  deviceName: Dev1
-  tone1: Dev1/port1/line3
-  tone2: Dev1/port1/line4
-  tone3R: Dev1/port1/line5
-  tone3L: Dev1/port1/line6
-  camFrames: Dev1/port1/line1
-  barcode: Dev1/port1/line2
+  deviceName: PXI1Slot4
+  tone1: PXI1Slot4/port0/line0
+  tone2: PXI1Slot4/port0/line1
+  tone3R: PXI1Slot4/port0/line2
+  tone3L: PXI1Slot4/port0/line3
+  camFrames: PXI1Slot4/port0/line4
+  barcode: PXI1Slot4/port0/line5
 nidaqStream: !NidaqSignalStreamConfiguration
   # This monitor is for operator-visible rolling input checks and acquisition-side CSV signal copies.
-  # Use actual AI/DI input lines from the bench NI-DAQ channel map.
+  # The PXI-6713 does not provide analog inputs. Add channels only after a supported input device is present.
   isEnabled: false
   sampleRateHz: 1000.0
   readChunkSize: 100
   rollingWindowSeconds: 10.0
   recordToAcquisition: true
   outputName: nidaq_signals
-  channels:
-  - !NidaqSignalChannelConfiguration
-    name: laser1_diode
-    physicalChannel: Dev1/ai0
-    kind: analog
-    unit: V
-    minimum: -10.0
-    maximum: 10.0
-  - !NidaqSignalChannelConfiguration
-    name: laser1_command_copy
-    physicalChannel: Dev1/ai1
-    kind: analog
-    unit: V
-    minimum: -10.0
-    maximum: 10.0
-  - !NidaqSignalChannelConfiguration
-    name: laser2_diode
-    physicalChannel: Dev1/ai2
-    kind: analog
-    unit: V
-    minimum: -10.0
-    maximum: 10.0
-  - !NidaqSignalChannelConfiguration
-    name: laser2_command_copy
-    physicalChannel: Dev1/ai3
-    kind: analog
-    unit: V
-    minimum: -10.0
-    maximum: 10.0
-  - !NidaqSignalChannelConfiguration
-    name: trigger_feedback
-    physicalChannel: Dev1/port1/line1
-    kind: digital
-    unit: logic
-    minimum: 0.0
-    maximum: 1.0
-  - !NidaqSignalChannelConfiguration
-    name: shutter_feedback
-    physicalChannel: Dev1/port1/line2
-    kind: digital
-    unit: logic
-    minimum: 0.0
-    maximum: 1.0
+  channels: []
 behavior: !BehaviorConfiguration
   pelletDelivery: !PelletDeliveryConfiguration
     isEnabled: false
@@ -168,9 +102,8 @@ behavior: !BehaviorConfiguration
     maxPelletsPerDay: 75
     maxPelletMissingSeconds: 15.0
   headClamp: !HeadClampConfiguration
-    minBaselineIntensity: 0.0
-    maxBaselineIntensity: 90.0
-    baselineIntensityIncrement: 10.0
+    enabled: false
+    baselineIntensity: 0.0
     autoClampIntensity: 100
     autoClampReleaseToneFreq: 7000
     autoClampReleaseToneDelay: 0.1
@@ -182,11 +115,12 @@ behavior: !BehaviorConfiguration
     rangeThreshold: 0.75
     duration: 2.0
   loadCell: !LoadCellConfiguration
-    threshold: 15.0
+    weightActiveThreshold: 15.0
+    weightInactiveThreshold: 2.0
     thresholdDuration: 0.25
     minEventDuration: 3.0
     minPostEventHoldDuration: 6.0
 persistence: !PersistenceConfiguration
-  outputLocation: /data/reachaq
+  outputLocation: /home/<USER>/Documents/rawdatalocal
 watchdog: !WatchdogConfig
   timeoutTriggerDelay: 5.0

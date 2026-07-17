@@ -265,7 +265,7 @@ PY
 
 The configured DAQ must appear through `nilsdev` or
 `nidaqmx.system.System.local().devices` before reachAQ can use channels such as
-`Dev1/ao0`, `Dev1/ai0`, and `Dev1/port0/line0`.
+`<DEVICE>/ao0`, `<DEVICE>/ai0`, and `<DEVICE>/port0/line0`.
 
 NI currently documents kernel/IOMMU caveats for some drivers on Linux kernel 6.8
 and newer. If NI hardware is absent after install and reboot, check NI's current
@@ -356,6 +356,10 @@ lspci -nnk | grep -A3 -Ei 'peak|pcan|can' || true
 lsusb | grep -Ei 'peak|pcan' || true
 ```
 
+The current PEAK PCIe card on this workstation is recognized as PCI device
+`001c:0013` with kernel driver `peak_pciefd` and exposes two SocketCAN
+interfaces: `can0` and `can1`.
+
 Bring up the bus after confirming the bench bitrate:
 
 ```bash
@@ -435,8 +439,10 @@ Edit `~/Autotrainer/system_configuration.yaml` for the target machine:
   hardware flags: enable only connected subsystems.
 - `laser.backend`: use `nidaq` for NI-DAQ laser control, `null` or `disabled`
   for a software-only smoke test.
-- `laser.channels`, `nidaqPorts`, and `nidaqStream`: replace every `Dev1/...`
+- `laser.channels`, `nidaqPorts`, and `nidaqStream`: replace every placeholder
   channel with the actual NI-DAQ device alias and channel map.
+  The in-app DAQ port editor uses NI-DAQmx discovery to list only channel types
+  supported by the selected device and rejects duplicate assignments.
 
 For this workstation's requested local data path, the persistence section is:
 
@@ -581,6 +587,7 @@ conda run -n "$REACHAQ_ENV" python -m pytest \
   tests/autotrainer_headless_test.py::test_load_config_extra_reach_camera_slot \
   tests/autotrainer_headless_test.py::test_load_config_random_camera_override \
   tests/autotrainer_headless_test.py::test_load_config_random_camera_override_adds_default_reach_cameras \
+  tests/nidaq_port_configuration_dialog_test.py \
   -q
 ```
 
@@ -607,7 +614,7 @@ conda run -n "$REACHAQ_ENV" python -m pytest \
 
 ## Current Workstation Reference
 
-The machine used to build these notes was checked on 2026-07-07:
+The machine used to build these notes was checked on 2026-07-17:
 
 - OS: Ubuntu 22.04.5 LTS, x86_64.
 - Kernel: `6.8.0-124-generic`.
@@ -621,7 +628,7 @@ The machine used to build these notes was checked on 2026-07-07:
   `1093:2b80` using kernel driver `niwf`, and `nilsdev` listed `PXI1Slot4`.
 - CAN: PEAK PCIe card detected by `peak_pciefd`, exposing `can0` and `can1`.
 - Data output: `/home/christielab10/Documents/rawdatalocal`.
-- Focused verification result: `21 passed`.
+- Focused verification result: `8 passed`.
 
 ## Upstream References
 

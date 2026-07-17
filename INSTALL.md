@@ -1,87 +1,62 @@
 # Installation
 
-*Work in Progress* - there may be out of date or missing information.
+This repository still contains the broader Autotrainer modules, but the current
+Linux reachAQ bring-up path is documented in:
 
-## Requirements
-Absent specific camera support, *Auto Trainer* is independent of platform and Python version >= 3.8.  Choice of cameras may 
-place requirements on platform or Python version.
+- [linux-install-instructions.md](linux-install-instructions.md)
 
-### System Installs/Requirements
-#### Anaconda
-Anaconda is required for full feature support.  Tested with `Anaconda3-2023.09-0-Linux-aarch64.sh`.
+Use that guide for a machine that needs to run the reachAQ application with
+Spinnaker cameras, NI-DAQmx/PXI hardware, PEAK SocketCAN, inference, and local
+data output.
 
-### Teledyne/Blackfly Camera Support
+## Current ReachAQ Runtime
 
-* These cameras require installation of version 3 of the Spinnaker SDK/runtime for your platform.
-* Platforms are limited to Windows and Ubuntu 20.04
-* Python version is limited to 3.8
-
-#### arm64 example
+The current Linux runtime convention is:
 
 ```bash
-gunzip spinnaker-3.2.0.62-arm64-pkg-20.04.tar.gz
-tar -xvf spinnaker-3.2.0.62-arm64-pkg-20.04.tar
-cd spinnaker-3.2.0.62-arm64/
-sudo apt-get install libusb-1.0-0  # (no-op was already the most recent)
-sudo apt-get --fix-broken install
-sudo ./remove_spinnaker_arm.sh  # remove previous version if any
-sudo ./install_spinnaker_arm.sh
+export REACHAQ_REPO="$HOME/Documents/reachAQ"
+export REACHAQ_ENV="reachaq"
+export REACHAQ_CONFIG="$HOME/Autotrainer/system_configuration.yaml"
+export REACHAQ_DATA="$HOME/Documents/rawdatalocal"
 ```
 
-## Platform Specific Requirements 
+Create/install the Python environment from the repo root:
 
-Please see https://github.com/Mouse-GYM/auto-trainer-device-deployment
-
-## Package Installation
-
-1) Create a Conda environment ; only once first time:
-`conda create -n auto-trainer-1 python=3.8`
-
-2) activate it: `conda activate auto-trainer-1` ; **every time**.
-
-3) Once first time: clone this repository.
-    - create or update the ~/.netrc file so that it contains :
-    ```
-    machine github.com
-    login Mouse-Gym
-    password <PASTE_THE_PAT_HERE>
-    ```
-    and replace `<PAST_THE_PAT_HERE>` by what you will be given for it.
-    - then clone the current repository:
-    `git clone https://github.com/Mouse-GYM/auto-trainer.git`, and enter it: `cd auto-trainer`
-
-4) FLIR ; only once first time.
-   To include support for Teledyne/Blackfly cameras, install the appropriate wheel for your platform, *e.g.,*
-   - `pip install ./library/spinnaker_python-3.2.0.62-cp38-cp38-linux_aarch64.whl`
-   - `pip install ./library/spinnaker_python-3.2.0.62-cp38-cp38-linux_x86_64.whl`
-   - `pip install .\library\spinnaker_python-3.2.0.62-cp38-cp38-win_amd64.whl`
-
-5) **Jetson Only** and only once first time:
-   1) `conda install --channel=conda-forge ffmpeg=6.0.0`
-   2) Unfortunately nvidia torch wheel version is not fully valid, and prevent to be installed with regular index-url,
-      so we have to :
-      - `wget https://developer.download.nvidia.cn/compute/redist/jp/v512/pytorch/torch-2.1.0a0+41361538.nv23.06-cp38-cp38-linux_aarch64.whl`
-      - `pip install ./torch-2.1.0a0+41361538.nv23.06-cp38-cp38-linux_aarch64.whl`
-   3) On the other hand, nvidia tensorflow wheel version is valid, so we can do:
-      - `pip install tensorflow==2.12.0+nv23.06 --extra-index-url https://developer.download.nvidia.com/compute/redist/jp/v512`
-   4) `pip install ./path/to/pyjerrycan-1.2.5-cp38-cp38-linux_aarch64.whl`
-     - Usually pyjerrycan wheel file is copied in home dir.
-
-6) Activate an appropriate branch, *e.g.,*
-`git checkout develop`
-
-7) From the repository directory perform the following Python package installation steps.
-`pip install -e .`
-
-
-### LD_PRELOAD
-
-A command similar to following must be used or added to `.bashrc`/`.bash_profile`
-
-```shell
-# NB: long line: copy to the end:
-export LD_PRELOAD="${LD_PRELOAD}:/usr/lib/aarch64-linux-gnu/libffi.so.7:/usr/lib/aarch64-linux-gnu/libgomp.so.1:/lib/aarch64-linux-gnu/libGLdispatch.so.0:/home/$USER/anaconda3/envs/auto-trainer-1/lib/python3.8/site-packages/scikit_learn.libs/libgomp-d22c30c5.so.1.0.0"
+```bash
+conda create -y -n "$REACHAQ_ENV" python=3.8
+conda run -n "$REACHAQ_ENV" python -m pip install --upgrade pip setuptools wheel build
+conda run -n "$REACHAQ_ENV" python -m pip install -r requirements.txt
+conda run -n "$REACHAQ_ENV" python -m pip install -e '.[test]'
 ```
 
-The exact filenames of the last two in particular may be slightly different based on versioning. There will be an
-error message in the console with the exact filename if it is different from the above.
+Install the matching Spinnaker SDK and Python wheel, NI Linux drivers, and CAN
+tools as described in the Linux guide before expecting full hardware operation.
+
+Start the GUI with:
+
+```bash
+conda run -n "$REACHAQ_ENV" python -m reachAQ.app --start-mode idle -c "$REACHAQ_CONFIG"
+```
+
+For a software-only camera smoke test:
+
+```bash
+conda run -n "$REACHAQ_ENV" python -m reachAQ.app \
+  --start-mode idle \
+  --random-cameras \
+  -c "$REACHAQ_CONFIG"
+```
+
+Headless mode remains available through:
+
+```bash
+conda run -n "$REACHAQ_ENV" auto-trainer-headless --start-mode idle -c "$REACHAQ_CONFIG"
+```
+
+## Legacy Notes
+
+Older Autotrainer deployments used environment names such as
+`auto-trainer-1`, Jetson-specific dependency pins, and direct module entry
+points like `python -m tools.acquisition.gui`. Those may still be useful for
+legacy rigs, but they are not the current reachAQ Dell/Ubuntu setup. Prefer the
+Linux guide above when setting up a new reachAQ Linux machine.
