@@ -17,7 +17,7 @@ the target machine.
 
 ```bash
 export REACHAQ_REPO="$HOME/Documents/reachAQ"
-export REACHAQ_ENV="reachaq-py38"
+export REACHAQ_ENV="reachaq"
 export REACHAQ_CONFIG="$HOME/Autotrainer/system_configuration.yaml"
 export REACHAQ_DATA="$HOME/Documents/rawdatalocal"
 ```
@@ -212,9 +212,22 @@ sudo apt install ./ni-ubuntu2204-drivers-2026Q2.deb
 sudo apt update
 sudo apt install -y dkms expat libopenal1
 apt-cache search ni-daqmx
-sudo apt install -y ni-daqmx ni-hwcfg-utility
+sudo apt install -y ni-daqmx ni-pxiplatformservices ni-qpxi ni-hwcfg-utility
 sudo dkms autoinstall
 sudo reboot
+```
+
+For PXI/PXIe chassis over MXI, install NI-DAQmx plus PXI Platform Services.
+`ni-pxiplatformservices` provides the PXI resource-manager stack, MXI support,
+and `nipxiconfig`. `ni-qpxi` adds PXI query support used by NI System
+Configuration. `ni-visa` is optional for VISA/instrument workflows, but reachAQ's
+NI output path uses NI-DAQmx device names through `nidaqmx`, not VISA:
+
+```bash
+sudo apt install -y ni-daqmx ni-pxiplatformservices ni-qpxi ni-hwcfg-utility
+
+# Optional, only if you also need NI-VISA resource visibility/tools:
+sudo apt install -y ni-visa ni-visa-passport-pxi
 ```
 
 After reboot, verify the NI services and kernel modules:
@@ -229,8 +242,9 @@ Verify DAQ visibility:
 
 ```bash
 lsusb | grep -Ei 'national|instruments' || true
-lspci -nn | grep -Ei 'national|instruments|daq' || true
+lspci -nn | grep -Ei '1093|national|instruments|daq|6713|pxi|plx|10b5' || true
 lsni -v
+nipxiconfig --list-system --verbose
 nilsdev
 nidaqmxconfig --export /tmp/reachaq-nidaqmx-export.ini
 sed -n '1,120p' /tmp/reachaq-nidaqmx-export.ini
@@ -256,6 +270,77 @@ The configured DAQ must appear through `nilsdev` or
 NI currently documents kernel/IOMMU caveats for some drivers on Linux kernel 6.8
 and newer. If NI hardware is absent after install and reboot, check NI's current
 Ubuntu driver page for the target driver release.
+
+### PXIe-1073 / NI 6713 Over MXI
+
+The PXIe-1073 chassis with an NI 6713 analog-output card should be treated as a
+PCI/PXI device path, not as USB hardware. Bring it up in this order:
+
+1. Power down the computer and PXIe-1073.
+2. Seat the NI 6713 firmly in the PXIe-1073.
+3. Connect the MXI cable between the computer-side NI MXI interface and the
+   PXIe-1073.
+4. Power on the PXIe-1073 first and wait for the chassis/MXI link LEDs to
+   settle.
+5. Power on the computer and boot Linux with the chassis already on.
+6. Run the verification commands below before starting reachAQ.
+
+```bash
+lspci -tv
+lspci -nnk | grep -A4 -Ei '1093|national|6713|10b5|plx'
+journalctl -k -b --no-pager | grep -Ei 'pxi|mxi|8361|1073|6713|1093|plx|bus number' | tail -200
+lsni -v
+nipxiconfig --list-system --verbose
+nilsdev
+```
+
+Expected progression:
+
+- `lspci` should show the MXI/PLX bridge chain and an NI endpoint for the 6713
+  with vendor ID `1093`.
+- `lsni -v` should show the MXI link/chassis instead of only the host computer.
+- `nipxiconfig --list-system --verbose` should report PXI/PXIe system
+  information.
+- `nilsdev` should list a DAQmx device before reachAQ can use channels such as
+  `PXI1Slot4/ao0`.
+
+If Linux shows only the MXI bridge or PLX switch and no NI `1093` endpoint,
+the chassis/card has not enumerated at the PCIe layer yet. Do a cold boot with
+the PXIe chassis powered on before the PC. If `journalctl` reports
+`No bus number available for hot-added bridge`, the chassis was hot-added or the
+BIOS did not reserve enough downstream PCIe bus numbers. Check BIOS/firmware for
+PCIe options such as Above 4G Decoding, PCIe hotplug/pre-boot enumeration, and
+ASPM/power-management settings, then cold boot again. Also try a different PCIe
+slot for the MXI host card and verify the MXI cable/link LEDs.
+
+If the hardware appears in `lspci` but not `nilsdev`, rebuild DKMS and restart
+NI services or reboot:
+
+```bash
+sudo dkms autoinstall
+sudo systemctl restart nipal nidevldu nidrum nimxssvr ni-pxipf-nipxirm-bind nipxicmsd
+sudo reboot
+```
+
+Once `nilsdev` lists the NI 6713, update
+`~/Autotrainer/system_configuration.yaml` so `laser.channels`,
+`nidaqPorts.deviceName`, and any `nidaqStream` channels use that device alias.
+The NI 6713 provides analog output, TTL-compatible digital I/O, and timing I/O;
+it does not provide analog input. If the reachAQ laser configuration uses
+`diodeInput` or `commandCopyInput` analog feedback channels, add a supported
+NI-DAQ analog-input device or disable/adjust that feedback path before expecting
+full laser readback behavior.
+
+Confirmed on this workstation, the NI 6713 appears as `PXI1Slot4`:
+
+```text
+nilsdev: PXI1Slot4
+ProductType: PXI-6713
+AO: PXI1Slot4/ao0 through PXI1Slot4/ao7
+AI: none
+DIO: PXI1Slot4/port0/line0 through PXI1Slot4/port0/line7
+Counters: PXI1Slot4/ctr0, PXI1Slot4/ctr1, PXI1Slot4/freqout
+```
 
 ## CAN / PEAK SocketCAN
 
@@ -376,6 +461,51 @@ conda run -n "$REACHAQ_ENV" python tools/hardware/validate_laser_hardware.py \
   --action connect
 ```
 
+### Software-Only Random Cameras
+
+To start the app without physical camera hardware, keep your normal system
+configuration but add `--random-cameras`. This changes camera sources in memory
+for the current run only and does not overwrite the hardware camera config on
+close:
+
+```bash
+conda run -n "$REACHAQ_ENV" python -m reachAQ.app \
+  --start-mode idle \
+  --random-cameras \
+  -c "$REACHAQ_CONFIG"
+```
+
+The override converts configured reach/web camera entries to `random://`
+sources. If the config has no reach camera entries at all, it creates enabled
+random `left` and `right` reach cameras for that run.
+
+For a fully software-only config file, keep it in a separate configuration
+directory with a matching preferences file. This matters because the app saves
+configuration back to the preferences configuration directory on close:
+
+```bash
+mkdir -p "$HOME/Autotrainer-random/animals"
+cp "$REACHAQ_REPO/tools/hardware/reachaq_random_camera_configuration.example.yaml" \
+  "$HOME/Autotrainer-random/system_configuration.yaml"
+python - <<'PY'
+from pathlib import Path
+root = Path.home() / "Autotrainer-random"
+config = root / "system_configuration.yaml"
+text = config.read_text()
+text = text.replace("/tmp/reachaq-random-data", str(Path.home() / "Documents/rawdatalocal"))
+config.write_text(text)
+(root / "settings.ini").write_text(
+    "[system]\n"
+    f"configuration_location={root.as_posix()}\n"
+    f"animal_location={(root / 'animals').as_posix()}\n"
+)
+PY
+conda run -n "$REACHAQ_ENV" python -m reachAQ.app \
+  --start-mode idle \
+  --preferences-file "$HOME/Autotrainer-random/settings.ini" \
+  -c "$HOME/Autotrainer-random/system_configuration.yaml"
+```
+
 ## Launch
 
 Load CAN environment variables before running with CAN hardware enabled:
@@ -423,7 +553,7 @@ ln -sf "$CONDA_BASE/envs/$REACHAQ_ENV/bin/auto-trainer-headless" run-auto-traine
 ```
 
 You can also use the absolute conda env path directly, for example
-`/home/<USER>/anaconda3/envs/reachaq-py38/bin/reachaq`.
+`/home/<USER>/anaconda3/envs/reachaq/bin/reachaq`.
 
 ## Verification
 
@@ -449,6 +579,8 @@ conda run -n "$REACHAQ_ENV" python -m pytest \
   tests/autotrainer_headless_test.py::test_cli_help \
   tests/autotrainer_headless_test.py::test_load_config \
   tests/autotrainer_headless_test.py::test_load_config_extra_reach_camera_slot \
+  tests/autotrainer_headless_test.py::test_load_config_random_camera_override \
+  tests/autotrainer_headless_test.py::test_load_config_random_camera_override_adds_default_reach_cameras \
   -q
 ```
 
@@ -480,9 +612,13 @@ The machine used to build these notes was checked on 2026-07-07:
 - OS: Ubuntu 22.04.5 LTS, x86_64.
 - Kernel: `6.8.0-124-generic`.
 - Repo: `/home/christielab10/Documents/reachAQ`, branch `devel`.
-- Conda env: `/home/christielab10/anaconda3/envs/reachaq-py38`.
+- Conda env: `/home/christielab10/anaconda3/envs/reachaq`.
 - Spinnaker SDK runtime: 3.2.0.57 under `/opt/spinnaker`.
 - NI-DAQmx: 26.3.1 from the NI 2026 Q2 Ubuntu 22.04 repo.
+- PXI Platform Services: 26.3 from the NI 2026 Q2 Ubuntu 22.04 repo.
+- PXIe/MXI observation on 2026-07-17: `lsni -v` saw `MXI1` as an NI PCIe-8361
+  and `PXIChassis1` as an NI PXIe-1073. `lspci` saw the NI PXI-6713 endpoint
+  `1093:2b80` using kernel driver `niwf`, and `nilsdev` listed `PXI1Slot4`.
 - CAN: PEAK PCIe card detected by `peak_pciefd`, exposing `can0` and `can1`.
 - Data output: `/home/christielab10/Documents/rawdatalocal`.
 - Focused verification result: `21 passed`.
@@ -491,8 +627,16 @@ The machine used to build these notes was checked on 2026-07-07:
 
 - NI Ubuntu driver install:
   https://www.ni.com/docs/en-US/bundle/ni-platform-on-linux-desktop/page/installing-ni-products-ubuntu.html
+- NI supported Linux driver packages:
+  https://www.ni.com/docs/en-US/bundle/ni-platform-on-linux-desktop/page/supported-drivers-for-linux-distributions.html
 - NI-DAQmx Python docs:
   https://nidaqmx-python.readthedocs.io/en/latest/
+- NI-DAQmx for Linux readme, including supported NI 6713 AO devices:
+  https://www.ni.com/pdf/manuals/378678b.html
+- NI PXI Platform Services Linux readme:
+  https://www.ni.com/pdf/manuals/378682a.html
+- NI MXI-Express troubleshooting guide:
+  https://knowledge.ni.com/KnowledgeArticleDetails?id=kA03q000000x0MKCAY
 - PEAK Linux / SocketCAN driver notes:
   https://www.peak-system.com/fileadmin/media/linux/index.php
 - PEAK SocketCAN driver implementation notes:
