@@ -103,6 +103,7 @@ class MainWindow(QMainWindow):
         config_file: Optional[Path],
         *,
         is_dev: bool = False,
+        random_cameras: bool = False,
     ):
         super().__init__(None)
 
@@ -160,7 +161,7 @@ class MainWindow(QMainWindow):
         app_model.training_plan_deserialized += self._on_training_plan_deserialized
 
         try:
-            app_model.load_configuration(config_file)
+            app_model.load_configuration(config_file, random_cameras=random_cameras)
         except Exception as err:
             tb = traceback.format_exc()
             app_model.on_error("Failed load configuration",

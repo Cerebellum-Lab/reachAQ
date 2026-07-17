@@ -105,6 +105,12 @@ logger = get_verbose_logger(__name__)
 # allow be patched from tests
 _daily_timer = make_daemon_timer
 
+_RANDOM_CAMERA_DEFAULT_PARAMS = {
+    "width": 300,
+    "height": 200,
+    "fps": 30,
+}
+
 
 def _failed_camera_template(name: str, error: str):
     return f"Failed to start capture process for camera {name}:\n\t{error}\nPlease check all connections and settings."
@@ -267,6 +273,7 @@ class AppModel(ObservableObject):
         self._preferences = preferences
         self._loaded_configuration: Optional[SystemConfiguration] = None
         self._loaded_config_dir_path = Path()
+        self._loaded_configuration_has_runtime_override = False
         self._nidaq_ports = NidaqPortConfiguration()
 
         self._output_location = PersistenceConfiguration.get_default_output_path().as_posix()
@@ -331,6 +338,7 @@ class AppModel(ObservableObject):
                                              presence_detection=self._top_camera_presence_detection,
                                              msg_queue=None,  # not interested to webcam status for now.
                                              cam_id=CameraId.Web)
+        self._top_camera.is_enabled = False
 
         self._cameras = [  # must respect camera_idx order
             *self._reach_cameras,
@@ -512,6 +520,67 @@ class AppModel(ObservableObject):
 
         self._reach_cameras = tuple(next_cameras)
         self._refresh_camera_collections()
+
+    @staticmethod
+    def _make_random_camera_config(camera_id: CameraId) -> CameraConfiguration:
+        camera_config = CameraConfiguration(
+            id=camera_id,
+            name=str(camera_id),
+            is_enabled=True,
+            is_record_enabled=False,
+            record_prebuffer_duration=0,
+            scheme="random",
+            params=dict(_RANDOM_CAMERA_DEFAULT_PARAMS),
+        )
+        camera_config.params["primary"] = "yes" if camera_id == CameraId.Left else "no"
+        return camera_config
+
+    @classmethod
+    def _configure_camera_as_random(cls, camera_config: CameraConfiguration) -> None:
+        camera_config.scheme = "random"
+        camera_config.host = ""
+        camera_config.port = 0
+        camera_config.path = ""
+
+        params = dict(camera_config.params)
+        for key, value in _RANDOM_CAMERA_DEFAULT_PARAMS.items():
+            params.setdefault(key, value)
+        if camera_config.id == CameraId.Left:
+            params["primary"] = "yes"
+        elif camera_config.id in CameraId.reach_camera_ids():
+            params.setdefault("primary", "no")
+        camera_config.params = params
+
+    @classmethod
+    def _apply_random_camera_override(cls, configuration: SystemConfiguration) -> None:
+        reach_ids = set(CameraId.reach_camera_ids())
+        reach_configs_by_id = {
+            camera_config.id: camera_config
+            for camera_config in configuration.cameras
+            if camera_config.id in reach_ids
+        }
+
+        if len(reach_configs_by_id) == 0:
+            for camera_id in (CameraId.Left, CameraId.Right):
+                camera_config = cls._make_random_camera_config(camera_id)
+                configuration.cameras.append(camera_config)
+                reach_configs_by_id[camera_id] = camera_config
+
+        should_enable_default_reach_cameras = not any(
+            config.is_enabled for config in reach_configs_by_id.values()
+        )
+        for camera_id in (CameraId.Left, CameraId.Right):
+            camera_config = reach_configs_by_id.get(camera_id)
+            if camera_config is None:
+                continue
+            if should_enable_default_reach_cameras:
+                camera_config.is_enabled = True
+
+        for camera_config in configuration.cameras:
+            if camera_config.id in reach_ids or camera_config.id == CameraId.Web:
+                cls._configure_camera_as_random(camera_config)
+
+        configuration._camera_map = {}
 
     @BehaviorAlgorithm.relay_func(wait=False)
     def _on_daily_timer(self):
@@ -1800,11 +1869,14 @@ class AppModel(ObservableObject):
             configuration.save_file(location, as_yaml=True)
         return configuration
 
-    def load_configuration(self, location: Optional[Path] = None):
+    def load_configuration(self, location: Optional[Path] = None, *, random_cameras: bool = False):
         if location is None:
             location = self.get_config_location()
 
         configuration: SystemConfiguration = self.get_config_from_location(location)
+        if random_cameras:
+            logger.notice("Using random camera override for this run")
+            self._apply_random_camera_override(configuration)
 
         self._sync_reach_cameras_to_configuration(configuration)
 
@@ -1866,6 +1938,7 @@ class AppModel(ObservableObject):
 
         self._loaded_configuration = configuration
         self._loaded_config_dir_path = location.parent.resolve()
+        self._loaded_configuration_has_runtime_override = random_cameras
 
         # only at the end:
         self.output_location = configuration.persistence.output_location
@@ -1901,6 +1974,9 @@ class AppModel(ObservableObject):
         if self._loaded_configuration is None:
             # do not save if loaded_config is still None, which signify the load configuration failed,
             # so we won't overwrite the (currently) bad user config file with one having all defaults.
+            return
+        if self._loaded_configuration_has_runtime_override:
+            logger.info("Skipping configuration save because this run used runtime camera overrides")
             return
         loc = self._preferences.configuration_location
         logger.info("Saving configuration to %s", loc)

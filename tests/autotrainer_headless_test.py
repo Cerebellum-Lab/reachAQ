@@ -128,6 +128,19 @@ def test_load_config_extra_reach_camera_slot(app_model, trainer_config_dir, syst
     assert app_model.make_project_info().camera_names == ("camera3",)
 
 
+def test_load_config_without_web_camera_keeps_top_disabled(app_model, trainer_config_dir, system_config):
+    system_config.cameras = [
+        cam for cam in system_config.cameras
+        if cam.id != CameraId.Web
+    ]
+    system_config.save_default(trainer_config_dir)
+
+    assert app_model.load_configuration() is True
+
+    assert app_model.top_camera.name == "web"
+    assert not app_model.top_camera.is_enabled
+
+
 def test_start_stop(app_model, settings_ini_path):
     assert not settings_ini_path.exists()
     assert app_model.load_configuration() is True
@@ -142,6 +155,40 @@ def test_start_stop(app_model, settings_ini_path):
 def test_cli_help():
     output = subprocess.check_output([sys.executable, "-m", "tools.acquisition.headless", "-h"]).decode()
     assert "usage: " in output
+    assert "--random-cameras" in output
+
+
+def test_load_config_random_camera_override(app_model, trainer_config_dir, system_config):
+    for cam in system_config.cameras:
+        if cam.id in (CameraId.Left, CameraId.Right):
+            cam.scheme = "spinnaker"
+            cam.path = cam.name
+            cam.params = {"fps": 150}
+            cam.is_enabled = True
+    system_config.save_default(trainer_config_dir)
+
+    assert app_model.load_configuration(random_cameras=True) is True
+
+    for cam in app_model.reach_cameras:
+        assert cam.is_enabled
+        assert cam.camera_source.url.startswith("random://")
+        assert "fps=150" in cam.camera_source.url
+    assert app_model.left_camera.is_primary
+    assert not app_model.right_camera.is_primary
+
+
+def test_load_config_random_camera_override_adds_default_reach_cameras(app_model, trainer_config_dir, system_config):
+    system_config.cameras = [
+        cam for cam in system_config.cameras
+        if cam.id not in CameraId.reach_camera_ids()
+    ]
+    system_config.save_default(trainer_config_dir)
+
+    assert app_model.load_configuration(random_cameras=True) is True
+
+    assert tuple(cam.camera_id for cam in app_model.reach_cameras) == (CameraId.Left, CameraId.Right)
+    assert all(cam.is_enabled for cam in app_model.reach_cameras)
+    assert all(cam.camera_source.url.startswith("random://") for cam in app_model.reach_cameras)
 
 
 @pytest.mark.skipif(sys.platform.startswith("win"), reason="hang atm. mostlikely signal related, different on windows")

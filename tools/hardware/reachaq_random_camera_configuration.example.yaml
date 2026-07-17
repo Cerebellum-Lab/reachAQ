@@ -1,0 +1,98 @@
+# reachAQ software-only camera configuration.
+# Use this when you want the app to start without physical camera hardware.
+
+!SystemConfiguration
+version: 56
+cameras:
+- !CameraConfiguration
+  id: 0
+  name: left
+  isEnabled: true
+  isRecordEnabled: false
+  recordMode: 1
+  recordPrebufferDuration: 0.0
+  isStillImageCaptureEnabled: false
+  stillImageCaptureInterval: 0.0
+  scheme: random
+  host: ''
+  port: 0
+  path: ''
+  params:
+    width: 300
+    height: 200
+    fps: 30
+    primary: 'yes'
+- !CameraConfiguration
+  id: 1
+  name: right
+  isEnabled: true
+  isRecordEnabled: false
+  recordMode: 1
+  recordPrebufferDuration: 0.0
+  isStillImageCaptureEnabled: false
+  stillImageCaptureInterval: 0.0
+  scheme: random
+  host: ''
+  port: 0
+  path: ''
+  params:
+    width: 300
+    height: 200
+    fps: 30
+    primary: 'no'
+- !CameraConfiguration
+  id: 2
+  name: web
+  isEnabled: false
+  isRecordEnabled: false
+  recordMode: 0
+  recordPrebufferDuration: 0.0
+  isStillImageCaptureEnabled: false
+  stillImageCaptureInterval: 0.0
+  scheme: random
+  host: ''
+  port: 0
+  path: ''
+  params:
+    width: 300
+    height: 200
+    fps: 15
+hardware: !HardwareConfiguration
+  tunnelIdentifier: ''
+  pelletIdentifier: ''
+  canEnabled: false
+  pelletControllerEnabled: false
+  nidaqEnabled: false
+  tunnelHeadfixEnabled: false
+  minAckTimeout: 3.0
+  boardStatusTimeout: 15.0
+inference: !InferenceConfiguration
+  poseModelLocation: ''
+  isEnabled: false
+laser: !LaserSystemConfiguration
+  backend: disabled
+  hardwareTimed: false
+  sampleRateHz: null
+  pmtShutterOutput: null
+  triggerListenerInputs: []
+  channels: []
+nidaqPorts: !NidaqPortConfiguration
+  deviceName: ''
+  tone1: ''
+  tone2: ''
+  tone3R: ''
+  tone3L: ''
+  camFrames: ''
+  barcode: ''
+nidaqStream: !NidaqSignalStreamConfiguration
+  isEnabled: false
+  sampleRateHz: 1000.0
+  readChunkSize: 100
+  rollingWindowSeconds: 10.0
+  recordToAcquisition: false
+  outputName: nidaq_signals
+  channels: []
+persistence: !PersistenceConfiguration
+  outputLocation: /tmp/reachaq-random-data
+watchdog: !WatchdogConfig
+  timeoutTriggerDelay: 5.0

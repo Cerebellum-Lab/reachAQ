@@ -35,7 +35,7 @@ def _exec_main(args):
     app_model.rpc_service = plugin.service
 
     try:
-        app_model.load_configuration(config_file)
+        app_model.load_configuration(config_file, random_cameras=args.random_cameras)
     except Exception as err:
         logger.exception("Could not load config: %s", err)
         app_model.on_close()
