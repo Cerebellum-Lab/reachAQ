@@ -1,0 +1,13 @@
+# Environment file for /etc/systemd/system/reachaq-can.service.
+# Install to /etc/default/reachaq-can and edit for the target rig.
+
+REACHAQ_CAN_INTERFACES="can0 can1"
+REACHAQ_CAN_BITRATE=1000000
+REACHAQ_CAN_RESTART_MS=100
+REACHAQ_CAN_TXQUEUELEN=1000
+REACHAQ_CAN_WAIT_SECONDS=30
+REACHAQ_CAN_DRIVER=peak_pciefd
+
+# Classic CAN is expected for the current reachAQ PEAK PCIe setup.
+REACHAQ_CAN_FD=false
+# REACHAQ_CAN_DBITRATE=2000000

@@ -1,0 +1,16 @@
+[Unit]
+Description=Bring up reachAQ SocketCAN interfaces
+Documentation=man:ip-link(8)
+Wants=network-pre.target
+Wants=systemd-udev-settle.service
+After=systemd-udev-settle.service
+Before=network.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/default/reachaq-can
+ExecStart=/usr/local/sbin/reachaq-bring-up-can
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -369,6 +369,62 @@ sudo ip link set can0 up
 ip -details link show can0
 ```
 
+To bring up both current PEAK PCIe channels manually:
+
+```bash
+for dev in can0 can1; do
+  sudo ip link set "$dev" down || true
+  sudo ip link set "$dev" type can bitrate 1000000 restart-ms 100
+  sudo ip link set "$dev" txqueuelen 1000
+  sudo ip link set "$dev" up
+done
+ip -details -brief link show type can
+```
+
+### CAN Interfaces On Boot
+
+Install the repo-provided systemd oneshot service so Linux brings `can0` and
+`can1` up on every boot:
+
+```bash
+cd "$REACHAQ_REPO"
+sudo install -m 0755 tools/hardware/reachaq-bring-up-can.sh /usr/local/sbin/reachaq-bring-up-can
+sudo install -m 0644 tools/hardware/reachaq-can.default /etc/default/reachaq-can
+sudo install -m 0644 tools/hardware/reachaq-can.service /etc/systemd/system/reachaq-can.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now reachaq-can.service
+```
+
+The default service settings are:
+
+```bash
+REACHAQ_CAN_INTERFACES="can0 can1"
+REACHAQ_CAN_BITRATE=1000000
+REACHAQ_CAN_RESTART_MS=100
+REACHAQ_CAN_TXQUEUELEN=1000
+REACHAQ_CAN_DRIVER=peak_pciefd
+REACHAQ_CAN_FD=false
+```
+
+Edit `/etc/default/reachaq-can` if another rig uses a different interface list,
+bitrate, driver, or CAN-FD settings. Do not configure the same CAN interfaces
+through another boot mechanism at the same time.
+
+Verify the boot service immediately after installing:
+
+```bash
+systemctl --no-pager status reachaq-can.service
+ip -details -brief link show type can
+journalctl -u reachaq-can.service -b --no-pager
+```
+
+Expected interface state:
+
+```text
+can0 UP ...
+can1 UP ...
+```
+
 Load the reachAQ CAN environment variables:
 
 ```bash
