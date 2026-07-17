@@ -458,10 +458,31 @@ sudo apt-get update
 sudo apt-get install -y pcanview-ncurses
 ```
 
-Run it after the CAN interfaces are up:
+The Debian package is named `pcanview-ncurses`, but it installs the executable
+as `/usr/bin/pcanview`:
 
 ```bash
-pcanview-ncurses
+dpkg -L pcanview-ncurses | grep /usr/bin
+pcanview
+```
+
+Important: `pcanview` expects PEAK's `/dev/pcanx` character-device driver path,
+not Linux SocketCAN interfaces such as `can0` and `can1`. On the current
+reachAQ workstation the PEAK card is handled by the in-kernel SocketCAN driver
+`peak_pciefd`, so `can0`/`can1` should be monitored with `candump`,
+`cansniffer`, `ip -details link`, or the repo helper instead:
+
+```bash
+candump can0
+cansniffer can0
+```
+
+Only use `pcanview` if the rig intentionally uses PEAK's out-of-tree PCAN driver
+and `/dev/pcan*` devices exist:
+
+```bash
+ls -l /dev/pcan*
+pcanview /dev/pcan0
 ```
 
 Use PEAK's out-of-tree PCAN-Linux package only when the in-kernel SocketCAN
