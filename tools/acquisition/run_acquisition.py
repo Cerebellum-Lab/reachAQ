@@ -18,6 +18,7 @@ from autotrainer.behavior import BehaviorAlgorithm
 logger = get_verbose_logger(__name__)
 
 missing_file = "The configuration file %s does not exist; a default configuration will be loaded"
+_INITIAL_WINDOW_REDUCTION_PIXELS = 300
 
 CardHeader.DEFAULT_BACKGROUND_COLOR = "#cfb87c"
 CardHeader.DEFAULT_TITLE_COLOR = "black"
@@ -28,6 +29,15 @@ def verify_configuration(configuration: Optional[Path]):
         logger.error(missing_file, configuration)
 
     return True
+
+
+def _set_compact_initial_window_size(window) -> None:
+    """Reduce the layout-derived startup size without fixing later resizing."""
+    window.adjustSize()
+    window.resize(
+        max(1, window.width() - _INITIAL_WINDOW_REDUCTION_PIXELS),
+        max(1, window.height() - _INITIAL_WINDOW_REDUCTION_PIXELS),
+    )
 
 
 def run_acquisition(
@@ -92,6 +102,7 @@ def run_acquisition(
 
     signal.signal(signal.SIGINT, handle_sigint)
 
+    _set_compact_initial_window_size(window)
     window.show()
     # window.showMaximized()
     window.move(QtGui.QGuiApplication.primaryScreen().availableGeometry().center() - window.rect().center())
