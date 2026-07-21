@@ -145,7 +145,8 @@ conda run -n reachaq python tools/hardware/validate_laser_hardware.py \
   --action connect
 ```
 
-In the Analysis card, selected input signals are saved immediately under
+Main Analysis camera/barcode/tone selections and the diode/command-copy
+selections owned by each Laser Control tab are saved immediately under
 `nidaqStream.channels`. Stream task creation happens in an isolated child
 process because a broken or incompatible NI-DAQmx native runtime can terminate
 the Python interpreter. If the worker exits with `SIGSEGV` or does not become

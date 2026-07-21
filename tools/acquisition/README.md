@@ -110,12 +110,13 @@ Discovery runs in a background worker. While it is active, the UI displays
 shows the discovery error if no usable device is returned.
 
 The Analysis card contains **Stream** and **Signals** tabs. Signals lists camera
-frame, barcode, laser diode, and laser command-copy inputs. A checkbox becomes
+frame, barcode, Tone 1, Tone 2, Tone 3 right, and Tone 3 left inputs. Laser
+signals are intentionally excluded from this card. A checkbox becomes
 selectable only after that signal has a physical assignment in **Edit → Edit
-DAQ Ports** and NI-DAQ is enabled. Stop the stream before changing selections;
-every checkbox change is immediately saved in `nidaqStream.channels`. Start
-Stream and Clear are disabled when NI-DAQ is disabled, and Start Stream also
-requires at least one selected channel.
+DAQ Ports** and NI-DAQ is enabled. Stop the stream before changing main Analysis
+selections; every checkbox change is immediately saved in
+`nidaqStream.channels`. Start Stream and Clear are disabled when NI-DAQ is
+disabled, and Start Stream also requires at least one selected Analysis channel.
 
 NI-DAQmx task creation and reads run in an isolated worker process. The Analysis
 card stays responsive while the worker starts, and a native driver crash such as
@@ -138,12 +139,21 @@ analog input readback. Add a supported NI analog-input card if laser diode or
 command-copy feedback channels are required.
 
 Each Laser Control tab includes an Output Stream graph with independent
-Start/Pause and Clear controls. Manual/internal and externally triggered pulse
-operations append their command waveform. When the shared NI-DAQ stream
-contains that laser's diode or command-copy input, the measured samples are
-added to the same graph. Calibration always resumes and clears the associated
-graph, then displays every returned command, diode, and command-copy ramp point
-without applying the Analysis rolling-window trim.
+Start/Pause and Clear controls plus selectors for that laser's diode feedback
+and command-copy inputs. **Start DAQ Inputs** starts the shared input worker;
+the button clearly labels its shared stop action while it is running. These
+selections also persist immediately in `nidaqStream.channels`, while remaining
+absent from the main Analysis selector and plot. Manual/internal and externally
+triggered pulse operations append their command waveform. Selected measured
+inputs from the shared NI-DAQ stream are added to the corresponding laser
+graph. Calibration always resumes and clears the associated graph, then
+displays every returned command, diode, and command-copy ramp point without
+applying the Analysis rolling-window trim.
+
+Every stream option and curve uses the same high-contrast color assignment:
+the first displayed signal is blue, the second green, followed by orange,
+purple, red, teal, magenta, and blue-gray. A compact matching legend appears
+below the main Analysis graph and below every laser Output Stream graph.
 
 ## Output
 

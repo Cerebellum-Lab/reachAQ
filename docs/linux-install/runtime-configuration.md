@@ -150,4 +150,4 @@ Last checked 2026-07-21:
 - PEAK PCIe adapter on `peak_pciefd`, exposing `can0` and `can1`.
 - Quadro T1000 present but using `nouveau`; live inference unavailable.
 - Local output `/home/christielab10/Documents/rawdatalocal`.
-- Focused non-hardware/installer verification: 49 passed.
+- Focused non-hardware/installer verification: 52 passed.
