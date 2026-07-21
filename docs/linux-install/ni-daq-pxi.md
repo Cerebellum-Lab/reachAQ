@@ -157,8 +157,10 @@ verify that each selected channel supports the requested input task.
 For camera/barcode TTL streams, use a hardware-clocked input rate of at least
 5 kHz; reachAQ defaults to 10 kHz with 500-sample reads. Digital-only tasks use
 `ctr0` on the input device to generate the sample clock. Confirm that the
-counter is not reserved by another task. The UI redraws buffered rolling
-windows at about 30 Hz; this does not reduce the hardware capture rate.
+counter is not reserved by another task. The UI redraws a peak-preserving,
+display-bounded view of the rolling buffer at about 30 Hz; this does not reduce
+the hardware capture rate. Set the graph's visible duration in seconds and its
+vertical minimum/maximum in volts with the controls beneath the graph.
 
 ## References
 

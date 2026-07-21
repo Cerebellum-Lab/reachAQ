@@ -36,6 +36,7 @@ _WORKER_ERROR = "error"
 _WORKER_STOPPED = "stopped"
 _WORKER_LOG = "log"
 _DEFAULT_STARTUP_TIMEOUT_SECONDS = 10.0
+_RECORDING_QUEUE_BLOCKS = 256
 
 
 def _put_worker_message(message_queue, message) -> None:
@@ -138,8 +139,9 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
         self._process_stop_event = None
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.RLock()
-        self._recording_file: Optional[TextIO] = None
-        self._recording_writer: Optional[csv.writer] = None
+        self._recording_queue: Optional[queue.Queue] = None
+        self._recording_stop_event: Optional[threading.Event] = None
+        self._recording_thread: Optional[threading.Thread] = None
         self._recording_path: Optional[Path] = None
         self._recording_blocked = False
         self._recording_last_flush = 0.0
@@ -473,6 +475,7 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
         if project is None:
             self._set_recording_path(None)
             return
+        file = None
         try:
             source = project.get_source_path(self._configuration.output_name)
             path = Path(f"{source.full_path}.csv")
@@ -485,58 +488,96 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
                     + [channel.name for channel in self._configuration.channels]
                 )
                 file.flush()
-            self._recording_file = file
-            self._recording_writer = writer
+            recording_queue = queue.Queue(maxsize=_RECORDING_QUEUE_BLOCKS)
+            stop_event = threading.Event()
+            recording_thread = threading.Thread(
+                target=self._recording_loop,
+                args=(file, writer, recording_queue, stop_event),
+                name="nidaq_signal_writer",
+                daemon=True,
+            )
+            self._recording_queue = recording_queue
+            self._recording_stop_event = stop_event
+            self._recording_thread = recording_thread
             self._recording_last_flush = time.monotonic()
             self._set_recording_path(path)
+            recording_thread.start()
         except Exception as exc:
             logger.exception("Failed to open NI-DAQ signal recording file")
             self._recording_blocked = True
             self._close_recording_file()
+            if file is not None and (self._recording_thread is None or self._recording_thread.ident is None):
+                file.close()
             self._set_error(f"NI-DAQ signal recording disabled: {str(exc) or exc.__class__.__name__}")
 
     def _write_block(self, block: NidaqSignalSampleBlock) -> None:
-        with self._lock:
-            writer = self._recording_writer
-            file = self._recording_file
-            if writer is None or file is None:
-                return
-            try:
-                for sample_offset in range(block.sample_count):
-                    writer.writerow(
-                        [
-                            block.wall_time + sample_offset / block.sample_rate_hz,
-                            block.perf_time + sample_offset / block.sample_rate_hz,
-                            block.sample_index + sample_offset,
-                        ]
-                        + [
-                            block.values.get(channel.name, ())[sample_offset]
-                            if sample_offset < len(block.values.get(channel.name, ()))
-                            else ""
-                            for channel in block.channels
-                        ]
-                    )
+        recording_queue = self._recording_queue
+        if recording_queue is None:
+            return
+        try:
+            recording_queue.put_nowait(block)
+        except queue.Full:
+            message = (
+                f"NI-DAQ signal recording stopped: writer queue exceeded "
+                f"{_RECORDING_QUEUE_BLOCKS} blocks"
+            )
+            logger.error(message)
+            self._recording_blocked = True
+            self._close_recording_file()
+            self._set_error(message)
+
+    def _recording_loop(self, file: TextIO, writer, recording_queue, stop_event) -> None:
+        try:
+            while not (stop_event.is_set() and recording_queue.empty()):
+                try:
+                    block = recording_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                rows = (
+                    [
+                        block.wall_time + sample_offset / block.sample_rate_hz,
+                        block.perf_time + sample_offset / block.sample_rate_hz,
+                        block.sample_index + sample_offset,
+                    ]
+                    + [
+                        block.values.get(channel.name, ())[sample_offset]
+                        if sample_offset < len(block.values.get(channel.name, ()))
+                        else ""
+                        for channel in block.channels
+                    ]
+                    for sample_offset in range(block.sample_count)
+                )
+                writer.writerows(rows)
                 now = time.monotonic()
                 if now - self._recording_last_flush >= 1.0:
                     file.flush()
                     self._recording_last_flush = now
-            except Exception as exc:
-                logger.exception("Failed to write NI-DAQ signal recording samples")
-                self._recording_blocked = True
-                self._close_recording_file()
-                self._set_error(f"NI-DAQ signal recording stopped: {str(exc) or exc.__class__.__name__}")
-
-    def _close_recording_file(self) -> None:
-        file = self._recording_file
-        self._recording_file = None
-        self._recording_writer = None
-        self._recording_last_flush = 0.0
-        if file is not None:
+        except Exception as exc:
+            logger.exception("Failed to write NI-DAQ signal recording samples")
+            self._recording_blocked = True
+            self._close_recording_file()
+            self._set_error(f"NI-DAQ signal recording stopped: {str(exc) or exc.__class__.__name__}")
+        finally:
             try:
                 file.close()
             except Exception as exc:
                 logger.exception("Failed to close NI-DAQ signal recording file")
                 self._set_error(str(exc) or exc.__class__.__name__)
+
+    def _close_recording_file(self) -> None:
+        stop_event = self._recording_stop_event
+        thread = self._recording_thread
+        self._recording_queue = None
+        self._recording_stop_event = None
+        self._recording_thread = None
+        self._recording_last_flush = 0.0
+        self._set_recording_path(None)
+        if stop_event is not None:
+            stop_event.set()
+        if thread is not None and thread.ident is not None and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
+            if thread.is_alive():
+                logger.warning("NI-DAQ signal recording writer is still draining buffered samples")
 
     def _set_running(self, value: bool) -> None:
         prev, self._is_running = self._is_running, value

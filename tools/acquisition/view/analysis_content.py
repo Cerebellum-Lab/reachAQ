@@ -11,12 +11,12 @@ import pyqtgraph as pg
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWidgets import (
     QCheckBox,
+    QDoubleSpinBox,
     QHBoxLayout,
     QLabel,
     QPushButton,
     QScrollArea,
     QSizePolicy,
-    QSpinBox,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -62,6 +62,8 @@ class _NidaqRollingPlot(QWidget):
         self._curves: Dict[str, object] = {}
         self._buffers: Dict[str, RollingStreamBuffer] = {}
         self._latest_x = 0.0
+        self._window_seconds = self._configuration.rolling_window_seconds
+        self._voltage_range: Optional[Tuple[float, float]] = None
 
     def configure(
         self,
@@ -81,10 +83,8 @@ class _NidaqRollingPlot(QWidget):
         self._curves.clear()
         self._buffers.clear()
         self._latest_x = 0.0
-        capacity = max(
-            configuration.read_chunk_size,
-            int(math.ceil(configuration.sample_rate_hz * configuration.rolling_window_seconds)),
-        )
+        self._window_seconds = min(self._window_seconds, 60.0)
+        capacity = self._buffer_capacity()
         legend_entries = []
         for index, channel in enumerate(configuration.channels):
             color = colors_by_name.get(channel.name, stream_signal_color(index))
@@ -94,36 +94,64 @@ class _NidaqRollingPlot(QWidget):
             self._buffers[channel.name] = RollingStreamBuffer(capacity)
             legend_entries.append((display_name, color, False))
         self._legend.set_entries(legend_entries)
-        self._apply_y_range(configuration.channels)
-        self._plot.getPlotItem().setDownsampling(auto=True, mode="peak")
+        if self._voltage_range is None:
+            self._apply_y_range(configuration.channels)
+        else:
+            self._plot.setYRange(*self._voltage_range, padding=0)
         self._plot.getPlotItem().setClipToView(True)
-        self._plot.setXRange(0, configuration.rolling_window_seconds, padding=0)
+        self._plot.setXRange(0, self._window_seconds, padding=0)
 
     def clear(self) -> None:
         for channel_name, curve in self._curves.items():
             self._buffers[channel_name].clear()
             curve.setData([], [])
         self._latest_x = 0.0
-        self._plot.setXRange(0, self._configuration.rolling_window_seconds, padding=0)
+        self._plot.setXRange(0, self._window_seconds, padding=0)
 
     def append(self, block: NidaqSignalSampleBlock) -> None:
+        first_sample = block.sample_index / block.sample_rate_hz
+        sample_count = max((len(values) for values in block.values.values()), default=0)
+        x_values = first_sample + np.arange(sample_count, dtype=np.float64) / block.sample_rate_hz
         for channel in self._configuration.channels:
             values = block.values.get(channel.name)
             if not values:
                 continue
-            first_sample = block.sample_index / block.sample_rate_hz
-            x_values = first_sample + np.arange(len(values), dtype=np.float64) / block.sample_rate_hz
-            self._buffers[channel.name].append(x_values, values)
-            self._latest_x = max(self._latest_x, float(x_values[-1]))
+            self._buffers[channel.name].append(x_values[: len(values)], values)
+            self._latest_x = max(self._latest_x, float(x_values[len(values) - 1]))
 
     def redraw(self) -> None:
+        total_point_limit = max(1000, min(3000, self._plot.width() * 3 // 2))
+        point_limit = max(256, total_point_limit // max(1, len(self._curves)))
         for channel_name, curve in self._curves.items():
-            x_values, y_values = self._buffers[channel_name].ordered()
-            curve.setData(x_values, y_values)
+            x_values, y_values = self._buffers[channel_name].ordered_for_plot(point_limit)
+            curve.setData(x_values, y_values, skipFiniteCheck=True)
 
-        x_min = max(0.0, self._latest_x - self._configuration.rolling_window_seconds)
-        x_max = max(self._configuration.rolling_window_seconds, self._latest_x)
+        x_min = max(0.0, self._latest_x - self._window_seconds)
+        x_max = max(self._window_seconds, self._latest_x)
         self._plot.setXRange(x_min, x_max, padding=0)
+
+    def set_time_window(self, seconds: float) -> None:
+        seconds = max(0.1, min(60.0, float(seconds)))
+        if math.isclose(seconds, self._window_seconds):
+            return
+        self._window_seconds = seconds
+        capacity = self._buffer_capacity()
+        for buffer in self._buffers.values():
+            buffer.resize(capacity)
+        self.redraw()
+
+    def set_voltage_range(self, minimum: float, maximum: float) -> None:
+        minimum, maximum = float(minimum), float(maximum)
+        if maximum <= minimum:
+            return
+        self._voltage_range = (minimum, maximum)
+        self._plot.setYRange(minimum, maximum, padding=0)
+
+    def _buffer_capacity(self) -> int:
+        return max(
+            self._configuration.read_chunk_size,
+            int(math.ceil(self._configuration.sample_rate_hz * self._window_seconds)),
+        )
 
     def _apply_y_range(self, channels: Tuple[NidaqSignalChannelConfiguration, ...]) -> None:
         minimums = [channel.minimum for channel in channels if channel.minimum is not None]
@@ -189,20 +217,32 @@ class AnalysisContent(ContentWidget):
         footer_layout.setSpacing(8)
         self._start_stop_button = QPushButton("Start Stream")
         self._clear_button = QPushButton("Clear")
-        self._graph_width = QSpinBox()
-        self._graph_width.setRange(320, 2400)
-        self._graph_width.setValue(640)
-        self._graph_width.setSuffix(" px wide")
-        self._graph_height = QSpinBox()
-        self._graph_height.setRange(160, 1400)
-        self._graph_height.setValue(280)
-        self._graph_height.setSuffix(" px high")
+        footer_layout.addWidget(QLabel("Window:"))
+        self._graph_seconds = QDoubleSpinBox()
+        self._graph_seconds.setDecimals(1)
+        self._graph_seconds.setRange(0.1, 60.0)
+        self._graph_seconds.setSingleStep(0.5)
+        self._graph_seconds.setValue(self._nidaq_signal_monitor.configuration.rolling_window_seconds)
+        self._graph_seconds.setSuffix(" s")
+        footer_layout.addWidget(QLabel("Y min:"))
+        self._graph_min_volts = QDoubleSpinBox()
+        self._graph_min_volts.setDecimals(2)
+        self._graph_min_volts.setRange(-1000.0, 1000.0)
+        self._graph_min_volts.setValue(0.0)
+        self._graph_min_volts.setSuffix(" V")
+        footer_layout.addWidget(QLabel("Y max:"))
+        self._graph_max_volts = QDoubleSpinBox()
+        self._graph_max_volts.setDecimals(2)
+        self._graph_max_volts.setRange(-1000.0, 1000.0)
+        self._graph_max_volts.setValue(5.0)
+        self._graph_max_volts.setSuffix(" V")
         self._status_label = QLabel("NI-DAQ signal stream disabled")
         self._status_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         footer_layout.addWidget(self._start_stop_button)
         footer_layout.addWidget(self._clear_button)
-        footer_layout.addWidget(self._graph_width)
-        footer_layout.addWidget(self._graph_height)
+        footer_layout.addWidget(self._graph_seconds)
+        footer_layout.addWidget(self._graph_min_volts)
+        footer_layout.addWidget(self._graph_max_volts)
         footer_layout.addWidget(self._status_label)
         self._card_widget.footer.setContent(footer)
 
@@ -218,10 +258,12 @@ class AnalysisContent(ContentWidget):
         app_model.laser.property_changed += self._laser_property_changed
         self._start_stop_button.clicked.connect(self._toggle_stream)
         self._clear_button.clicked.connect(self._rolling_plot.clear)
-        self._graph_width.valueChanged.connect(self._rolling_plot.setMinimumWidth)
-        self._graph_height.valueChanged.connect(self._rolling_plot.setMinimumHeight)
-        self._rolling_plot.setMinimumSize(self._graph_width.value(), self._graph_height.value())
+        self._graph_seconds.valueChanged.connect(self._apply_graph_view)
+        self._graph_min_volts.valueChanged.connect(self._apply_graph_view)
+        self._graph_max_volts.valueChanged.connect(self._apply_graph_view)
+        self._apply_graph_view()
         self._plot_timer = QTimer(self)
+        self._plot_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._plot_timer.setInterval(33)
         self._plot_timer.timeout.connect(self._flush_pending_blocks)
         self._plot_timer.start()
@@ -242,6 +284,20 @@ class AnalysisContent(ContentWidget):
         else:
             self._nidaq_signal_monitor.start()
         self._refresh_from_model()
+
+    def _apply_graph_view(self, *_args) -> None:
+        self._rolling_plot.set_time_window(self._graph_seconds.value())
+        minimum = self._graph_min_volts.value()
+        maximum = self._graph_max_volts.value()
+        if maximum <= minimum:
+            changed = self.sender()
+            if changed is self._graph_min_volts:
+                self._graph_max_volts.setValue(minimum + 0.01)
+            else:
+                self._graph_min_volts.setValue(maximum - 0.01)
+            minimum = self._graph_min_volts.value()
+            maximum = self._graph_max_volts.value()
+        self._rolling_plot.set_voltage_range(minimum, maximum)
 
     def use_cache(self) -> None:
         """Drain buffered stream samples on the application's display cadence."""

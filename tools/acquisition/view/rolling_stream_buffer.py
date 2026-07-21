@@ -61,6 +61,19 @@ class RollingStreamBuffer:
         self._next = (self._next + count) % self._capacity
         self._size = min(self._capacity, self._size + count)
 
+    def resize(self, capacity: int) -> None:
+        """Resize the ring while retaining the newest samples."""
+        capacity = max(1, int(capacity))
+        if capacity == self._capacity:
+            return
+        x_values, y_values = self.ordered()
+        self._capacity = capacity
+        self._x = np.empty(capacity, dtype=np.float64)
+        self._y = np.empty(capacity, dtype=np.float64)
+        self._next = 0
+        self._size = 0
+        self.append(x_values[-capacity:], y_values[-capacity:])
+
     def ordered(self) -> Tuple[np.ndarray, np.ndarray]:
         if self._size == 0:
             return np.empty(0, dtype=np.float64), np.empty(0, dtype=np.float64)
@@ -73,3 +86,39 @@ class RollingStreamBuffer:
             np.concatenate((self._x[start:], self._x[: self._size - split])),
             np.concatenate((self._y[start:], self._y[: self._size - split])),
         )
+
+    def ordered_for_plot(self, max_points: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Return a bounded peak envelope suitable for a live plot.
+
+        Each output bucket retains both its minimum and maximum in time order.
+        This keeps narrow TTL pulses visible while avoiding the cost of sending
+        an entire high-rate acquisition window through Qt on every repaint.
+        """
+        x_values, y_values = self.ordered()
+        max_points = max(2, int(max_points))
+        if x_values.size <= max_points:
+            return x_values, y_values
+
+        bucket_count = max(1, max_points // 2)
+        bucket_size = int(np.ceil(x_values.size / bucket_count))
+        usable_size = (x_values.size // bucket_size) * bucket_size
+        if usable_size < bucket_size:
+            return x_values[-max_points:], y_values[-max_points:]
+
+        # Discard at most one partial bucket from the oldest edge so the newest
+        # sample is always represented in the rolling display.
+        x_buckets = x_values[-usable_size:].reshape(-1, bucket_size)
+        y_buckets = y_values[-usable_size:].reshape(-1, bucket_size)
+        min_indices = np.argmin(y_buckets, axis=1)
+        max_indices = np.argmax(y_buckets, axis=1)
+        first_indices = np.minimum(min_indices, max_indices)
+        second_indices = np.maximum(min_indices, max_indices)
+        rows = np.arange(y_buckets.shape[0])
+
+        plot_x = np.empty(y_buckets.shape[0] * 2, dtype=np.float64)
+        plot_y = np.empty(y_buckets.shape[0] * 2, dtype=np.float64)
+        plot_x[0::2] = x_buckets[rows, first_indices]
+        plot_x[1::2] = x_buckets[rows, second_indices]
+        plot_y[0::2] = y_buckets[rows, first_indices]
+        plot_y[1::2] = y_buckets[rows, second_indices]
+        return plot_x, plot_y

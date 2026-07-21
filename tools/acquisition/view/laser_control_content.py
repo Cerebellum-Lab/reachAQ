@@ -278,7 +278,6 @@ class _LaserChannelTab(QWidget):
         self._trace_plot.setBackground("w")
         self._trace_plot.getAxis("bottom").setLabel("Time", units="s")
         self._trace_plot.getAxis("left").setLabel("Voltage", units="V")
-        self._trace_plot.getPlotItem().setDownsampling(auto=True, mode="peak")
         self._trace_plot.getPlotItem().setClipToView(True)
         self._trace_curves = {
             "command": self._trace_plot.plot(
@@ -304,6 +303,7 @@ class _LaserChannelTab(QWidget):
             curve_name: RollingStreamBuffer(trace_capacity)
             for curve_name in self._trace_curves
         }
+        self._trace_window_seconds = stream_configuration.rolling_window_seconds
 
         self._trace_tabs = QTabWidget(trace_group)
         self._trace_tabs.setDocumentMode(True)
@@ -325,14 +325,25 @@ class _LaserChannelTab(QWidget):
         trace_actions = QHBoxLayout()
         self._trace_toggle_button = QPushButton("Start Stream")
         self._trace_clear_button = QPushButton("Clear")
-        self._trace_width = QSpinBox()
-        self._trace_width.setRange(320, 2400)
-        self._trace_width.setValue(520)
-        self._trace_width.setSuffix(" px wide")
-        self._trace_height = QSpinBox()
-        self._trace_height.setRange(160, 1400)
-        self._trace_height.setValue(220)
-        self._trace_height.setSuffix(" px high")
+        trace_actions.addWidget(QLabel("Window:"))
+        self._trace_seconds = QDoubleSpinBox()
+        self._trace_seconds.setDecimals(1)
+        self._trace_seconds.setRange(0.1, 60.0)
+        self._trace_seconds.setSingleStep(0.5)
+        self._trace_seconds.setValue(self._trace_window_seconds)
+        self._trace_seconds.setSuffix(" s")
+        trace_actions.addWidget(QLabel("Y min:"))
+        self._trace_min_volts = QDoubleSpinBox()
+        self._trace_min_volts.setDecimals(2)
+        self._trace_min_volts.setRange(-1000.0, 1000.0)
+        self._trace_min_volts.setValue(channel.minimum_command_volts)
+        self._trace_min_volts.setSuffix(" V")
+        trace_actions.addWidget(QLabel("Y max:"))
+        self._trace_max_volts = QDoubleSpinBox()
+        self._trace_max_volts.setDecimals(2)
+        self._trace_max_volts.setRange(-1000.0, 1000.0)
+        self._trace_max_volts.setValue(channel.maximum_command_volts)
+        self._trace_max_volts.setSuffix(" V")
         self._trace_daq_button = QPushButton("Start DAQ Inputs")
         self._trace_daq_button.setToolTip(
             "Starts or stops the shared NI-DAQ input worker used by Analysis and all laser graphs."
@@ -342,8 +353,9 @@ class _LaserChannelTab(QWidget):
         trace_actions.addWidget(self._trace_toggle_button)
         trace_actions.addWidget(self._trace_clear_button)
         trace_actions.addWidget(self._trace_daq_button)
-        trace_actions.addWidget(self._trace_width)
-        trace_actions.addWidget(self._trace_height)
+        trace_actions.addWidget(self._trace_seconds)
+        trace_actions.addWidget(self._trace_min_volts)
+        trace_actions.addWidget(self._trace_max_volts)
         trace_actions.addWidget(self._trace_status, stretch=1)
         trace_stream_layout.addLayout(trace_actions)
 
@@ -420,8 +432,10 @@ class _LaserChannelTab(QWidget):
         self._run_ramp_button.clicked.connect(self._run_calibration_ramp)
         self._trace_toggle_button.clicked.connect(self._toggle_trace_stream)
         self._trace_clear_button.clicked.connect(self._clear_trace)
-        self._trace_width.valueChanged.connect(self._trace_plot.setMinimumWidth)
-        self._trace_height.valueChanged.connect(self._trace_plot.setMinimumHeight)
+        self._trace_seconds.valueChanged.connect(self._apply_trace_view)
+        self._trace_min_volts.valueChanged.connect(self._apply_trace_view)
+        self._trace_max_volts.valueChanged.connect(self._apply_trace_view)
+        self._apply_trace_view()
         self._trace_daq_button.clicked.connect(self._toggle_daq_input_stream)
         for key, checkbox in self._trace_signal_checkboxes.items():
             checkbox.toggled.connect(
@@ -646,11 +660,12 @@ class _LaserChannelTab(QWidget):
             self._trace_status.setText(f"Streaming — latest: {trace.source}")
 
     def redraw_trace(self) -> None:
+        total_point_limit = max(1000, min(3000, self._trace_plot.width() * 3 // 2))
+        point_limit = max(256, total_point_limit // max(1, len(self._trace_curves)))
         for curve_name, curve in self._trace_curves.items():
-            curve_x, curve_y = self._trace_buffers[curve_name].ordered()
+            curve_x, curve_y = self._trace_buffers[curve_name].ordered_for_plot(point_limit)
             self._trace_data[curve_name] = (curve_x.tolist(), curve_y.tolist())
-            curve.setData(curve_x, curve_y)
-        self._trace_plot.enableAutoRange(axis="y")
+            curve.setData(curve_x, curve_y, skipFiniteCheck=True)
         populated_x_values = [
             curve_x
             for curve_x, _curve_y in self._trace_data.values()
@@ -658,11 +673,34 @@ class _LaserChannelTab(QWidget):
         ]
         if not populated_x_values:
             return
-        x_min = min(curve_x[0] for curve_x in populated_x_values)
         x_max = max(curve_x[-1] for curve_x in populated_x_values)
-        if x_max <= x_min:
-            x_max = x_min + 0.001
-        self._trace_plot.setXRange(x_min, x_max, padding=0.02)
+        x_min = max(0.0, x_max - self._trace_window_seconds)
+        self._trace_plot.setXRange(x_min, max(self._trace_window_seconds, x_max), padding=0)
+
+    def _apply_trace_view(self, *_args) -> None:
+        seconds = float(self._trace_seconds.value())
+        if seconds != self._trace_window_seconds:
+            self._trace_window_seconds = seconds
+            configuration = self._app_model.nidaq_signal_monitor.configuration
+            capacity = max(
+                configuration.read_chunk_size,
+                int(configuration.sample_rate_hz * seconds),
+            )
+            for buffer in self._trace_buffers.values():
+                buffer.resize(capacity)
+
+        minimum = self._trace_min_volts.value()
+        maximum = self._trace_max_volts.value()
+        if maximum <= minimum:
+            changed = self.sender()
+            if changed is self._trace_min_volts:
+                self._trace_max_volts.setValue(minimum + 0.01)
+            else:
+                self._trace_min_volts.setValue(maximum - 0.01)
+            minimum = self._trace_min_volts.value()
+            maximum = self._trace_max_volts.value()
+        self._trace_plot.setYRange(minimum, maximum, padding=0)
+        self.redraw_trace()
 
     def append_signal_block(self, block: NidaqSignalSampleBlock, *, redraw: bool = True) -> bool:
         if not self._is_configured or not self._trace_streaming:
@@ -968,6 +1006,7 @@ class LaserControlContent(ContentWidget):
         app_model.nidaq_signal_monitor.property_changed += self._on_nidaq_monitor_property_changed
         app_model.nidaq_signal_monitor.sample_block_received += self._on_nidaq_sample_block
         self._stream_plot_timer = QTimer(self)
+        self._stream_plot_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._stream_plot_timer.setInterval(33)
         self._stream_plot_timer.timeout.connect(self._flush_nidaq_sample_blocks)
         self._stream_plot_timer.start()
