@@ -29,9 +29,12 @@ FLIR, NI/PXI, PEAK CAN, and NVIDIA guides applicable to the target system.
 Start the GUI with:
 
 ```bash
-conda run -n reachaq python -m reachAQ.app \
+conda run --no-capture-output -n reachaq python -m reachAQ.app \
   -c "$HOME/Autotrainer/system_configuration.yaml"
 ```
+
+Keep `--no-capture-output` in long-running launch commands. Without it, Conda
+buffers stdout/stderr and terminal logs may not appear until the app exits.
 
 The GUI starts idle by default. Cameras, NI-DAQ, CAN, and live inference do not
 start until the operator selects Running. Use `--start-mode acquiring` only
@@ -40,7 +43,7 @@ when immediate acquisition startup is intentional.
 For a software-only camera smoke test:
 
 ```bash
-conda run -n reachaq python -m reachAQ.app \
+conda run --no-capture-output -n reachaq python -m reachAQ.app \
   --random-cameras \
   --no-live-inference \
   -c "$HOME/Autotrainer/system_configuration.yaml"
@@ -51,7 +54,7 @@ headless mode starts acquisition by default because it has no operator control
 that can start an idle process later.
 
 ```bash
-conda run -n reachaq auto-trainer-headless \
+conda run --no-capture-output -n reachaq auto-trainer-headless \
   --no-live-inference \
   -c "$HOME/Autotrainer/system_configuration.yaml"
 ```

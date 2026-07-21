@@ -89,7 +89,7 @@ Common options:
 | `--config-dir PATH` | Select the configuration directory |
 | `--data-dir PATH` | Select the acquisition output directory |
 | `--install-miniconda` | Bootstrap Miniconda only when conda is absent |
-| `--run-tests` | Run the focused 39-test non-hardware/installer suite |
+| `--run-tests` | Run the focused 46-test non-hardware/installer suite |
 | `--without-test-deps` | Omit the Python test extra |
 | `--skip-system-packages` | Skip apt update/install |
 | `--skip-python-env` | Reuse but do not modify the conda environment |
@@ -142,10 +142,13 @@ The [runtime guide](docs/linux-install/runtime-configuration.md) covers:
 Safe first GUI launch after configuration:
 
 ```bash
-conda run -n reachaq python -m reachAQ.app \
+conda run --no-capture-output -n reachaq python -m reachAQ.app \
   --no-live-inference \
   -c "$HOME/Autotrainer/system_configuration.yaml"
 ```
+
+`--no-capture-output` makes application logs stream to the launching terminal.
+Omitting it causes Conda to hold stdout/stderr until the application exits.
 
 The GUI opens idle by default. No acquisition hardware starts until the
 operator selects Running.

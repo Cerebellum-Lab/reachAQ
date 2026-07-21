@@ -59,3 +59,24 @@ def test_portable_installer_continues_after_failure_and_reports_at_end(tmp_path)
     assert "FAIL  Preflight | Validate repository checkout" in output
     assert "PASS  Preflight | Create runtime directories" in output
     assert "Completed with failures. Review every FAIL entry above." in output
+
+
+def test_documented_conda_application_launches_stream_terminal_output():
+    launch_lines = []
+    for document in REPO_ROOT.rglob("*.md"):
+        for line_number, line in enumerate(document.read_text().splitlines(), start=1):
+            if "conda run" in line and (
+                "python -m reachAQ.app" in line or "auto-trainer-headless" in line
+            ):
+                launch_lines.append((document, line_number, line))
+
+    assert launch_lines
+    missing_live_output = [
+        f"{document.relative_to(REPO_ROOT)}:{line_number}: {line}"
+        for document, line_number, line in launch_lines
+        if "--no-capture-output" not in line
+    ]
+    assert not missing_live_output, (
+        "Long-running conda launches must use --no-capture-output for live terminal logs:\n"
+        + "\n".join(missing_live_output)
+    )

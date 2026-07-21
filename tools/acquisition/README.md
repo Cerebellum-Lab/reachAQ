@@ -9,9 +9,12 @@ and inference.
 Use the reachAQ entry point from the configured conda environment:
 
 ```bash
-conda run -n reachaq python -m reachAQ.app \
+conda run --no-capture-output -n reachaq python -m reachAQ.app \
   -c "$HOME/Autotrainer/system_configuration.yaml"
 ```
+
+The `--no-capture-output` option is required for live terminal logging when the
+application is launched through Conda.
 
 The GUI starts idle by default, so camera and DAQ configuration remain editable
 until Start is selected. Use `--start-mode acquiring` only when immediate
@@ -21,7 +24,7 @@ one run with `--live-inference` or `--no-live-inference`.
 For software-only camera testing:
 
 ```bash
-conda run -n reachaq python -m reachAQ.app \
+conda run --no-capture-output -n reachaq python -m reachAQ.app \
   --random-cameras \
   --no-live-inference \
   -c "$HOME/Autotrainer/system_configuration.yaml"
@@ -95,14 +98,31 @@ The matching right camera should use its own serial and `primary: 'no'`.
 
 ## NI-DAQ Ports
 
-The DAQ port editor discovers devices through NI-DAQmx and lists only channels
-reported by the selected device. It also prevents duplicate channel assignments
-across roles. If a selected device has no analog input channels, analog-input
-roles are disabled instead of allowing an invalid assignment.
+The DAQ port editor discovers devices through NI-DAQmx. The channel-source
+selector controls which device contributes new choices; assignments already
+selected from other devices remain visible and selected while the source
+changes. The editor also prevents duplicate channel assignments across roles.
+If the selected source has no channels of a required type and that role has no
+retained assignment, the role is disabled instead of allowing an invalid choice.
 
 Discovery runs in a background worker. While it is active, the UI displays
 `Discovering NI-DAQ devices...`; the editor opens when discovery completes or
 shows the discovery error if no usable device is returned.
+
+The Analysis card contains **Stream** and **Signals** tabs. Signals lists camera
+frame, barcode, laser diode, and laser command-copy inputs. A checkbox becomes
+selectable only after that signal has a physical assignment in **Edit → Edit
+DAQ Ports** and NI-DAQ is enabled. Stop the stream before changing selections;
+every checkbox change is immediately saved in `nidaqStream.channels`. Start
+Stream and Clear are disabled when NI-DAQ is disabled, and Start Stream also
+requires at least one selected channel.
+
+NI-DAQmx task creation and reads run in an isolated worker process. The Analysis
+card stays responsive while the worker starts, and a native driver crash such as
+`SIGSEGV` is shown as a stream error instead of terminating reachAQ. A worker
+that does not become ready within 10 seconds is stopped and reported as a
+startup timeout. Hardware initialization milestones from the worker are relayed
+to both the application log and terminal.
 
 On the current PXIe-1073 / PXI-6713 setup, NI-DAQmx reports:
 
@@ -116,6 +136,14 @@ DIO: PXI1Slot4/port0/line0 through PXI1Slot4/port0/line7
 The 6713 can provide analog outputs and digital I/O, but it cannot provide
 analog input readback. Add a supported NI analog-input card if laser diode or
 command-copy feedback channels are required.
+
+Each Laser Control tab includes an Output Stream graph with independent
+Start/Pause and Clear controls. Manual/internal and externally triggered pulse
+operations append their command waveform. When the shared NI-DAQ stream
+contains that laser's diode or command-copy input, the measured samples are
+added to the same graph. Calibration always resumes and clears the associated
+graph, then displays every returned command, diode, and command-copy ramp point
+without applying the Analysis rolling-window trim.
 
 ## Output
 
@@ -144,6 +172,11 @@ mkdir -p "$HOME/Documents/rawdatalocal"
 * Training Mode and Protocol - select the active training workflow when the
   protocol UI is enabled.
 * Preferences - configure live inference and other application preferences.
+
+The Hardware Status table uses `Enabled`, `Devices`, and `Info` columns. The
+Info column preserves the latest Hardware Refresh discovery result and appends
+the current binding, stream, or connection state. Discovery results remain
+visible even when that hardware category is disabled.
 
 ### Menus
 

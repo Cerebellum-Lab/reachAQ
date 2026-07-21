@@ -420,8 +420,10 @@ run_focused_tests() {
             tests/autotrainer_headless_test.py::test_load_config_extra_reach_camera_slot \
             tests/autotrainer_headless_test.py::test_load_config_random_camera_override \
             tests/autotrainer_headless_test.py::test_load_config_random_camera_override_adds_default_reach_cameras \
+            tests/hardware_status_content_test.py \
             tests/nidaq_port_configuration_dialog_test.py \
             tests/reachaq_linux_install_test.py \
+            tests/signal_stream_ui_test.py \
             -q
     )
 }

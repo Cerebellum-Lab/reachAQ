@@ -145,6 +145,14 @@ conda run -n reachaq python tools/hardware/validate_laser_hardware.py \
   --action connect
 ```
 
+In the Analysis card, selected input signals are saved immediately under
+`nidaqStream.channels`. Stream task creation happens in an isolated child
+process because a broken or incompatible NI-DAQmx native runtime can terminate
+the Python interpreter. If the worker exits with `SIGSEGV` or does not become
+ready within 10 seconds, reachAQ remains open and displays the failure. Treat
+that message as a driver/device problem: re-run the discovery checks above and
+verify that each selected channel supports the requested input task.
+
 ## References
 
 - [NI Ubuntu installation](https://www.ni.com/docs/en-US/bundle/ni-platform-on-linux-desktop/page/installing-ni-products-ubuntu.html)

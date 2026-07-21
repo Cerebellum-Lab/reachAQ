@@ -44,7 +44,7 @@ no GPU preflight is required when the operator later selects Running:
 
 ```bash
 cd "$REACHAQ_REPO"
-conda run -n "$REACHAQ_ENV" python -m reachAQ.app \
+conda run --no-capture-output -n "$REACHAQ_ENV" python -m reachAQ.app \
   --no-live-inference \
   -c "$REACHAQ_CONFIG"
 ```
@@ -54,7 +54,7 @@ intentional. Headless mode has no idle operator control, so it starts
 acquisition by default:
 
 ```bash
-conda run -n "$REACHAQ_ENV" auto-trainer-headless \
+conda run --no-capture-output -n "$REACHAQ_ENV" auto-trainer-headless \
   --no-live-inference \
   -c "$REACHAQ_CONFIG"
 ```
@@ -73,7 +73,7 @@ set +a
 run; it does not overwrite physical camera serials on close:
 
 ```bash
-conda run -n "$REACHAQ_ENV" python -m reachAQ.app \
+conda run --no-capture-output -n "$REACHAQ_ENV" python -m reachAQ.app \
   --random-cameras \
   --no-live-inference \
   -c "$REACHAQ_CONFIG"
@@ -120,6 +120,10 @@ HARDWARE INIT | FAILED
 Each camera, CAN, NI-DAQ, laser, and GPU operation includes elapsed timing. The
 last `START` without a terminal state identifies the current wait.
 
+The documented launch commands use `conda run --no-capture-output`. Do not omit
+that option: default `conda run` captures the stream and can hide every terminal
+record until reachAQ exits.
+
 ## Common failures
 
 | Symptom | Next check |
@@ -146,4 +150,4 @@ Last checked 2026-07-21:
 - PEAK PCIe adapter on `peak_pciefd`, exposing `can0` and `can1`.
 - Quadro T1000 present but using `nouveau`; live inference unavailable.
 - Local output `/home/christielab10/Documents/rawdatalocal`.
-- Focused non-hardware/installer verification: 39 passed.
+- Focused non-hardware/installer verification: 49 passed.
