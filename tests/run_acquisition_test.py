@@ -1,32 +1,17 @@
-from tools.acquisition.run_acquisition import _set_compact_initial_window_size
+from tools.acquisition.run_acquisition import _show_default_window
 
 
 class _WindowStub:
     def __init__(self):
-        self._width = 640
-        self._height = 480
-        self.adjusted = False
+        self.maximized = False
 
-    def adjustSize(self):
-        self.adjusted = True
-        self._width = 1800
-        self._height = 1000
-
-    def width(self):
-        return self._width
-
-    def height(self):
-        return self._height
-
-    def resize(self, width, height):
-        self._width = width
-        self._height = height
+    def showMaximized(self):
+        self.maximized = True
 
 
-def test_initial_window_is_reduced_by_300_pixels_in_each_dimension():
+def test_initial_window_is_maximized():
     window = _WindowStub()
 
-    _set_compact_initial_window_size(window)
+    _show_default_window(window)
 
-    assert window.adjusted
-    assert (window.width(), window.height()) == (1500, 700)
+    assert window.maximized

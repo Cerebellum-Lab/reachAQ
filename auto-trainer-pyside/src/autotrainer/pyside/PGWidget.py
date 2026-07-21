@@ -1,5 +1,6 @@
 from pyqtgraph import PlotWidget
 import pyqtgraph as pg
+from PySide6.QtWidgets import QSizePolicy
 
 pg.ViewBox.suggestPadding = lambda *_: 0.02
 
@@ -10,6 +11,10 @@ class PGWidget(PlotWidget):
             parent=parent,
             axisItems={"top": pg.AxisItem(orientation="top", showValues=False),
                        "right": pg.AxisItem(orientation="right", showValues=False)})
+        # PlotWidget's size hint must never establish a panel resize floor. The
+        # containing layout owns its physical pixel size in both dimensions.
+        self.setMinimumSize(0, 0)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
 
         self.x = []
         self.y = []

@@ -44,7 +44,8 @@ _GRAY_COLOR_TUPLE = (240, 240, 240)
 class _NidaqRollingPlot(QWidget):
     def __init__(self):
         super().__init__()
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setMinimumSize(0, 0)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         self._plot = PGWidget(self)
@@ -198,6 +199,8 @@ class AnalysisContent(ContentWidget):
         self._rolling_plot = _NidaqRollingPlot()
         self._content_tabs = QTabWidget()
         self._content_tabs.setDocumentMode(True)
+        self._content_tabs.setMinimumSize(0, 0)
+        self._content_tabs.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         self._content_tabs.addTab(self._rolling_plot, "Stream")
 
         self._signal_scroll = QScrollArea()

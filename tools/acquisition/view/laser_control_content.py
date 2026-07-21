@@ -99,7 +99,7 @@ class _LaserChannelTab(QWidget):
         self._trace_streaming = False
         self._trace_data: Dict[str, Tuple[List[float], List[float]]] = {}
 
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         self.setObjectName("LaserChannelTab")
         self.setStyleSheet(
             "#LaserChannelTab QLabel {color: #2f343a;}"
@@ -122,7 +122,6 @@ class _LaserChannelTab(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 4, 6, 6)
         layout.setSpacing(6)
-        layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
         sample_rate = "manual" if sample_rate_hz is None else f"{sample_rate_hz:g} Hz"
         if is_configured:
@@ -137,13 +136,34 @@ class _LaserChannelTab(QWidget):
         channel_label.setWordWrap(True)
         layout.addWidget(channel_label)
 
+        self._mode_tabs = QTabWidget(self)
+        self._mode_tabs.setDocumentMode(True)
+        self._mode_tabs.setMinimumWidth(0)
+        self._mode_tabs.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
+        layout.addWidget(self._mode_tabs, stretch=1)
+
+        pulse_page = QWidget(self._mode_tabs)
+        pulse_page_layout = QVBoxLayout(pulse_page)
+        pulse_page_layout.setContentsMargins(2, 4, 2, 2)
+        pulse_page_layout.setSpacing(5)
+        calibration_page = QWidget(self._mode_tabs)
+        calibration_page_layout = QVBoxLayout(calibration_page)
+        calibration_page_layout.setContentsMargins(2, 4, 2, 2)
+        calibration_page_layout.setSpacing(5)
+        output_page = QWidget(self._mode_tabs)
+        output_page_layout = QVBoxLayout(output_page)
+        output_page_layout.setContentsMargins(2, 4, 2, 2)
+        output_page_layout.setSpacing(5)
+        self._mode_tabs.addTab(pulse_page, "Pulse")
+        self._mode_tabs.addTab(calibration_page, "Calibration")
+        self._mode_tabs.addTab(output_page, "Output")
+
         pulse_group = QGroupBox("Pulse Train")
         pulse_layout = QGridLayout(pulse_group)
         pulse_layout.setContentsMargins(8, 4, 8, 6)
         pulse_layout.setHorizontalSpacing(6)
         pulse_layout.setVerticalSpacing(3)
-        pulse_layout.setColumnMinimumWidth(0, 82)
-        pulse_layout.setColumnMinimumWidth(2, 76)
+        pulse_layout.setColumnStretch(1, 1)
 
         self._amplitude = self._make_voltage_spinbox(channel)
         self._duration_ms = self._make_ms_spinbox(10.0)
@@ -177,31 +197,30 @@ class _LaserChannelTab(QWidget):
 
         pulse_layout.addWidget(self._form_label("Amplitude:"), 0, 0)
         pulse_layout.addWidget(self._amplitude, 0, 1)
-        pulse_layout.addWidget(self._form_label("Duration:"), 0, 2)
-        pulse_layout.addWidget(self._duration_ms, 0, 3)
-        pulse_layout.addWidget(self._form_label("Baseline:"), 1, 0)
-        pulse_layout.addWidget(self._baseline_ms, 1, 1)
-        pulse_layout.addWidget(self._form_label("Post-stim:"), 1, 2)
-        pulse_layout.addWidget(self._post_stim_ms, 1, 3)
-        pulse_layout.addWidget(self._form_label("Count:"), 2, 0)
-        pulse_layout.addWidget(self._pulse_count, 2, 1)
-        pulse_layout.addWidget(self._form_label("Frequency:"), 2, 2)
-        pulse_layout.addWidget(self._frequency_hz, 2, 3)
-        pulse_layout.addWidget(self._form_label("Trigger Mode:"), 3, 0)
-        pulse_layout.addWidget(self._trigger_mode, 3, 1)
-        pulse_layout.addWidget(self._form_label("Trigger Type:"), 3, 2)
-        pulse_layout.addWidget(self._trigger_edge, 3, 3)
-        pulse_layout.addWidget(self._form_label("Trigger Source:"), 4, 0)
-        pulse_layout.addWidget(self._trigger_source, 4, 1, 1, 3)
+        pulse_layout.addWidget(self._form_label("Duration:"), 1, 0)
+        pulse_layout.addWidget(self._duration_ms, 1, 1)
+        pulse_layout.addWidget(self._form_label("Baseline:"), 2, 0)
+        pulse_layout.addWidget(self._baseline_ms, 2, 1)
+        pulse_layout.addWidget(self._form_label("Post-stim:"), 3, 0)
+        pulse_layout.addWidget(self._post_stim_ms, 3, 1)
+        pulse_layout.addWidget(self._form_label("Count:"), 4, 0)
+        pulse_layout.addWidget(self._pulse_count, 4, 1)
+        pulse_layout.addWidget(self._form_label("Frequency:"), 5, 0)
+        pulse_layout.addWidget(self._frequency_hz, 5, 1)
+        pulse_layout.addWidget(self._form_label("Trigger Mode:"), 6, 0)
+        pulse_layout.addWidget(self._trigger_mode, 6, 1)
+        pulse_layout.addWidget(self._form_label("Trigger Type:"), 7, 0)
+        pulse_layout.addWidget(self._trigger_edge, 7, 1)
+        pulse_layout.addWidget(self._form_label("Trigger Source:"), 8, 0)
+        pulse_layout.addWidget(self._trigger_source, 8, 1)
         shutter_options = QWidget()
-        shutter_options_layout = QHBoxLayout(shutter_options)
+        shutter_options_layout = QGridLayout(shutter_options)
         shutter_options_layout.setContentsMargins(0, 0, 0, 0)
         shutter_options_layout.setSpacing(8)
-        shutter_options_layout.addWidget(self._open_shutter)
-        shutter_options_layout.addWidget(self._close_shutter)
-        shutter_options_layout.addWidget(self._enable_pmt)
-        shutter_options_layout.addStretch(1)
-        pulse_layout.addWidget(shutter_options, 5, 0, 1, 4)
+        shutter_options_layout.addWidget(self._open_shutter, 0, 0)
+        shutter_options_layout.addWidget(self._close_shutter, 0, 1)
+        shutter_options_layout.addWidget(self._enable_pmt, 1, 0)
+        pulse_layout.addWidget(shutter_options, 9, 0, 1, 2)
 
         trigger_options = QWidget()
         trigger_options_layout = QHBoxLayout(trigger_options)
@@ -210,14 +229,11 @@ class _LaserChannelTab(QWidget):
         trigger_options_layout.addWidget(self._emit_trigger)
         trigger_options_layout.addWidget(self._emit_timing_trigger)
         trigger_options_layout.addStretch(1)
-        pulse_layout.addWidget(trigger_options, 6, 0, 1, 3)
-        pulse_layout.addWidget(self._run_pulse_button, 6, 3)
-        layout.addWidget(pulse_group)
+        pulse_layout.addWidget(trigger_options, 10, 0, 1, 2)
+        pulse_layout.addWidget(self._run_pulse_button, 11, 1)
+        pulse_page_layout.addWidget(pulse_group)
 
         self._preview_plot = PGWidget()
-        self._preview_plot.setMinimumHeight(120)
-        self._preview_plot.setMaximumHeight(180)
-        self._preview_plot.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._preview_plot.clear()
         self._preview_plot.setBackground("w")
         self._preview_plot.getAxis("bottom").setLabel("Time", units="s")
@@ -227,16 +243,15 @@ class _LaserChannelTab(QWidget):
         self._preview_status = QLabel("")
         self._preview_status.setObjectName("LaserPreviewStatus")
         self._preview_status.setWordWrap(True)
-        layout.addWidget(self._preview_plot)
-        layout.addWidget(self._preview_status)
+        pulse_page_layout.addWidget(self._preview_plot, stretch=1)
+        pulse_page_layout.addWidget(self._preview_status)
 
         ramp_group = QGroupBox("Calibration Ramp")
         ramp_layout = QGridLayout(ramp_group)
         ramp_layout.setContentsMargins(8, 4, 8, 6)
         ramp_layout.setHorizontalSpacing(6)
         ramp_layout.setVerticalSpacing(3)
-        ramp_layout.setColumnMinimumWidth(0, 82)
-        ramp_layout.setColumnMinimumWidth(2, 76)
+        ramp_layout.setColumnStretch(1, 1)
 
         self._ramp_start = self._make_voltage_spinbox(channel)
         self._ramp_start.setValue(channel.minimum_command_volts)
@@ -253,12 +268,12 @@ class _LaserChannelTab(QWidget):
 
         ramp_layout.addWidget(self._form_label("Start:"), 0, 0)
         ramp_layout.addWidget(self._ramp_start, 0, 1)
-        ramp_layout.addWidget(self._form_label("Stop:"), 0, 2)
-        ramp_layout.addWidget(self._ramp_stop, 0, 3)
-        ramp_layout.addWidget(self._form_label("Steps:"), 1, 0)
-        ramp_layout.addWidget(self._ramp_steps, 1, 1)
-        ramp_layout.addWidget(self._form_label("Samples/step:"), 1, 2)
-        ramp_layout.addWidget(self._ramp_samples_per_step, 1, 3)
+        ramp_layout.addWidget(self._form_label("Stop:"), 1, 0)
+        ramp_layout.addWidget(self._ramp_stop, 1, 1)
+        ramp_layout.addWidget(self._form_label("Steps:"), 2, 0)
+        ramp_layout.addWidget(self._ramp_steps, 2, 1)
+        ramp_layout.addWidget(self._form_label("Samples/step:"), 3, 0)
+        ramp_layout.addWidget(self._ramp_samples_per_step, 3, 1)
         ramp_actions = QWidget()
         ramp_actions_layout = QHBoxLayout(ramp_actions)
         ramp_actions_layout.setContentsMargins(0, 0, 0, 0)
@@ -266,15 +281,15 @@ class _LaserChannelTab(QWidget):
         ramp_actions_layout.addWidget(self._ramp_pmt)
         ramp_actions_layout.addStretch(1)
         ramp_actions_layout.addWidget(self._run_ramp_button)
-        ramp_layout.addWidget(ramp_actions, 2, 0, 1, 4)
-        layout.addWidget(ramp_group)
+        ramp_layout.addWidget(ramp_actions, 4, 0, 1, 2)
+        calibration_page_layout.addWidget(ramp_group)
+        calibration_page_layout.addStretch(1)
 
         trace_group = QGroupBox("Output Stream")
         trace_layout = QVBoxLayout(trace_group)
         trace_layout.setContentsMargins(8, 4, 8, 6)
         trace_layout.setSpacing(4)
         self._trace_plot = PGWidget()
-        self._trace_plot.setMinimumSize(360, 220)
         self._trace_plot.setBackground("w")
         self._trace_plot.getAxis("bottom").setLabel("Time", units="s")
         self._trace_plot.getAxis("left").setLabel("Voltage", units="V")
@@ -307,13 +322,15 @@ class _LaserChannelTab(QWidget):
 
         self._trace_tabs = QTabWidget(trace_group)
         self._trace_tabs.setDocumentMode(True)
+        self._trace_tabs.setMinimumWidth(0)
+        self._trace_tabs.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
 
         self._trace_stream_page = QWidget(self._trace_tabs)
         trace_stream_layout = QVBoxLayout(self._trace_stream_page)
         trace_stream_layout.setContentsMargins(0, 4, 0, 0)
         trace_stream_layout.setSpacing(4)
-        trace_stream_layout.addWidget(self._trace_plot)
-        self._trace_legend = StreamGraphLegend(columns=3, parent=self._trace_stream_page)
+        trace_stream_layout.addWidget(self._trace_plot, stretch=1)
+        self._trace_legend = StreamGraphLegend(columns=1, parent=self._trace_stream_page)
         self._trace_legend.set_entries(
             (
                 ("Command output", _COMMAND_TRACE_COLOR, False),
@@ -322,23 +339,23 @@ class _LaserChannelTab(QWidget):
             )
         )
         trace_stream_layout.addWidget(self._trace_legend)
-        trace_actions = QHBoxLayout()
+        trace_actions = QGridLayout()
+        trace_actions.setContentsMargins(0, 0, 0, 0)
+        trace_actions.setHorizontalSpacing(5)
+        trace_actions.setVerticalSpacing(3)
         self._trace_toggle_button = QPushButton("Start Stream")
         self._trace_clear_button = QPushButton("Clear")
-        trace_actions.addWidget(QLabel("Window:"))
         self._trace_seconds = QDoubleSpinBox()
         self._trace_seconds.setDecimals(1)
         self._trace_seconds.setRange(0.1, 60.0)
         self._trace_seconds.setSingleStep(0.5)
         self._trace_seconds.setValue(self._trace_window_seconds)
         self._trace_seconds.setSuffix(" s")
-        trace_actions.addWidget(QLabel("Y min:"))
         self._trace_min_volts = QDoubleSpinBox()
         self._trace_min_volts.setDecimals(2)
         self._trace_min_volts.setRange(-1000.0, 1000.0)
         self._trace_min_volts.setValue(channel.minimum_command_volts)
         self._trace_min_volts.setSuffix(" V")
-        trace_actions.addWidget(QLabel("Y max:"))
         self._trace_max_volts = QDoubleSpinBox()
         self._trace_max_volts.setDecimals(2)
         self._trace_max_volts.setRange(-1000.0, 1000.0)
@@ -350,13 +367,27 @@ class _LaserChannelTab(QWidget):
         )
         self._trace_status = QLabel("Stopped")
         self._trace_status.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        trace_actions.addWidget(self._trace_toggle_button)
-        trace_actions.addWidget(self._trace_clear_button)
-        trace_actions.addWidget(self._trace_daq_button)
-        trace_actions.addWidget(self._trace_seconds)
-        trace_actions.addWidget(self._trace_min_volts)
-        trace_actions.addWidget(self._trace_max_volts)
-        trace_actions.addWidget(self._trace_status, stretch=1)
+        for spinbox in (
+            self._trace_seconds,
+            self._trace_min_volts,
+            self._trace_max_volts,
+        ):
+            spinbox.setMinimumWidth(0)
+            spinbox.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._trace_toggle_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._trace_clear_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._trace_daq_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        trace_actions.addWidget(self._trace_toggle_button, 0, 0)
+        trace_actions.addWidget(self._trace_clear_button, 0, 1)
+        trace_actions.addWidget(self._trace_daq_button, 1, 0, 1, 2)
+        trace_actions.addWidget(QLabel("Window:"), 2, 0)
+        trace_actions.addWidget(self._trace_seconds, 2, 1)
+        trace_actions.addWidget(QLabel("Y min:"), 3, 0)
+        trace_actions.addWidget(self._trace_min_volts, 3, 1)
+        trace_actions.addWidget(QLabel("Y max:"), 4, 0)
+        trace_actions.addWidget(self._trace_max_volts, 4, 1)
+        trace_actions.addWidget(self._trace_status, 5, 0, 1, 2)
+        trace_actions.setColumnStretch(1, 1)
         trace_stream_layout.addLayout(trace_actions)
 
         self._trace_signals_page = QWidget(self._trace_tabs)
@@ -391,7 +422,8 @@ class _LaserChannelTab(QWidget):
         ):
             candidate = self._trace_signal_candidates[key]
             physical_channel = "not configured" if candidate is None else candidate.physical_channel
-            checkbox = QCheckBox(f"{label} — {physical_channel}")
+            checkbox = QCheckBox(label)
+            checkbox.setToolTip(physical_channel)
             color_code_checkbox(checkbox, color)
             self._trace_signal_checkboxes[key] = checkbox
             trace_options_layout.addWidget(checkbox)
@@ -402,7 +434,7 @@ class _LaserChannelTab(QWidget):
         self._trace_tabs.addTab(self._trace_stream_page, "Stream")
         self._trace_tabs.addTab(self._trace_signals_page, "Signals")
         trace_layout.addWidget(self._trace_tabs)
-        layout.addWidget(trace_group)
+        output_page_layout.addWidget(trace_group, stretch=1)
 
         self._pulse_controls = (
             self._amplitude,
@@ -500,20 +532,30 @@ class _LaserChannelTab(QWidget):
                 and monitor.hardware_enabled
                 and not monitor.is_starting
             )
+            channel_tooltip = "" if candidate is None else f"{candidate.physical_channel}\n"
             if candidate is None:
                 checkbox.setToolTip("Assign this input in Edit → Edit DAQ Ports first.")
             elif not monitor.hardware_enabled:
-                checkbox.setToolTip("NI-DAQ hardware is disabled in the system configuration.")
+                checkbox.setToolTip(
+                    channel_tooltip + "NI-DAQ hardware is disabled in the system configuration."
+                )
             elif monitor.is_starting:
-                checkbox.setToolTip("Wait for the shared NI-DAQ stream to finish starting.")
+                checkbox.setToolTip(
+                    channel_tooltip + "Wait for the shared NI-DAQ stream to finish starting."
+                )
             elif selected and configured_by_name[candidate.name].physical_channel != candidate.physical_channel:
                 checkbox.setToolTip(
-                    "The saved input uses an older port mapping. Toggle this option to apply the current mapping."
+                    channel_tooltip
+                    + "The saved input uses an older port mapping. Toggle this option to apply the current mapping."
                 )
             elif monitor.is_running:
-                checkbox.setToolTip("Changing this option restarts the shared NI-DAQ input worker.")
+                checkbox.setToolTip(
+                    channel_tooltip + "Changing this option restarts the shared NI-DAQ input worker."
+                )
             else:
-                checkbox.setToolTip("Include this input in this laser's streaming graph.")
+                checkbox.setToolTip(
+                    channel_tooltip + "Include this input in this laser's streaming graph."
+                )
         has_selected_input = any(
             checkbox.isChecked()
             for checkbox in self._trace_signal_checkboxes.values()
@@ -556,7 +598,6 @@ class _LaserChannelTab(QWidget):
     def _form_label(text: str) -> QLabel:
         label = QLabel(text)
         label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        label.setMinimumWidth(74)
         return label
 
     @staticmethod
@@ -940,7 +981,7 @@ class LaserControlContent(ContentWidget):
         self._pending_signal_blocks: Deque[NidaqSignalSampleBlock] = deque(maxlen=64)
         self._pending_signal_blocks_lock = threading.Lock()
 
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         self.setObjectName("LaserControlContent")
         self.setStyleSheet(
             "#LaserControlContent QLabel {color: #2f343a;}"
@@ -972,13 +1013,13 @@ class LaserControlContent(ContentWidget):
         header_layout.addWidget(self._sample_rate_label)
 
         self._card_widget = CardWidget(title="Laser Control", header_right_layout=header_layout)
-        self._card_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._card_widget.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
 
         self._tabs = QTabWidget()
         self._tabs.setDocumentMode(True)
         self._tabs.setUsesScrollButtons(True)
         self._tabs.setMinimumWidth(0)
-        self._tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._tabs.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         self._tabs.currentChanged.connect(self._redraw_current_trace)
         self._card_widget.setContentWidget(self._tabs)
 

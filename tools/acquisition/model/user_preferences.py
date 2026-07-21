@@ -5,7 +5,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Optional, Union
 
-from PySide6.QtCore import QCoreApplication, QSettings
+from PySide6.QtCore import QByteArray, QCoreApplication, QSettings
 
 from autotrainer.core import ObservableObject
 from autotrainer.core.logging import get_verbose_logger
@@ -122,6 +122,15 @@ class UserPreferences(ObservableObject):
     def save(self):
         logger.verbose("Saving ini config to %s", self._settings.fileName())
         self._settings.sync()
+
+    def splitter_state(self, name: str) -> QByteArray:
+        value = self._settings.value(f"ui/splitters/{name}", QByteArray())
+        if isinstance(value, QByteArray):
+            return value
+        return QByteArray(value) if value else QByteArray()
+
+    def set_splitter_state(self, name: str, state: QByteArray) -> None:
+        self._settings.setValue(f"ui/splitters/{name}", state)
 
     @property
     def last_configuration(self) -> str:

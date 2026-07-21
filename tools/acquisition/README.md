@@ -18,10 +18,19 @@ application is launched through Conda.
 
 The GUI starts idle by default, so camera and DAQ configuration remain editable
 until Start is selected. Use `--start-mode acquiring` only when immediate
-startup is intentional. Its initial window is 300 pixels narrower and 300
-pixels shorter than the layout-derived size, but remains freely resizable. The
-saved live-inference setting can be overridden for one run with
-`--live-inference` or `--no-live-inference`.
+startup is intentional. The application window opens maximized by default while
+retaining its normal title bar and restore control. After restoring, it remains
+freely resizable in both width and height—even below child-panel size hints.
+Overflowing toolbar actions remain accessible from the toolbar menu, and the
+status-bar corner has a resize grip. The saved live-inference setting can be
+overridden for one run with `--live-inference` or `--no-live-inference`.
+
+All visible acquisition panel boundaries are draggable. This includes the
+camera panels, the vertical camera/analysis/hardware sections,
+Behavior/Analysis, Hardware Control/Status, and the main workspace/right-side
+tabs. Split positions are stored in the user preferences file and restored on
+the next launch. Splitter handles use deferred resize so high-rate graphs do
+not repaint continuously while a handle is being dragged.
 
 For software-only camera testing:
 
@@ -168,10 +177,14 @@ analog inputs, hardware-clocked digital input support, and two counters. Prefer
 the 6221 for buffered input streams and verify that `nidaqPorts` and
 `nidaqStream.channels` identify the same wired terminals.
 
-Each Laser Control tab includes an Output Stream area with nested **Stream** and
-**Signals** tabs. Stream contains the graph and its independent Start/Stop and
-Clear controls; Signals contains only that laser's diode-feedback and
-command-copy display options. **Start DAQ Inputs** starts the shared input worker;
+Each Laser Control channel uses compact **Pulse**, **Calibration**, and **Output**
+tabs so its controls remain usable when the right-side panel is narrow. The
+Output area has nested **Stream** and **Signals** tabs. Stream contains the graph
+and its independent Start/Stop and Clear controls; Signals contains only that
+laser's diode-feedback and command-copy display options. Physical NI-DAQ paths
+are shown in signal tooltips instead of widening the panel. Plots and controls
+shrink with the panel; use the main splitter to give them more room when desired.
+**Start DAQ Inputs** starts the shared input worker;
 the button clearly labels its shared stop action while it is running. These
 selections also persist immediately in `nidaqStream.channels`, while remaining
 absent from the main Analysis selector and plot. Manual/internal and externally
@@ -185,6 +198,11 @@ the first displayed signal is blue, the second green, followed by orange,
 purple, red, teal, magenta, and blue-gray. A compact matching legend appears
 below the main Analysis graph and below every laser Output Stream graph.
 Every legend swatch and plotted curve is solid.
+
+All Analysis and laser graphs take their physical pixel width and height from
+the containing panel. Dragging a horizontal or vertical splitter therefore
+grows or shrinks the graph itself; no graph keeps a fixed pixel height or forces
+its panel wider. This is independent of the editable seconds and voltage ranges.
 
 ## Output
 

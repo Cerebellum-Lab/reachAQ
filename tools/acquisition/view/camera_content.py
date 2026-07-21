@@ -32,12 +32,11 @@ class CameraContent(ContentWidget):
         self._text_overlay_color = Qt.GlobalColor.yellow
 
         layout = QGridLayout()
-        layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
         capture_view = self._capture_view = QCaptureView()
-        capture_view.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        capture_view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         settings = self._settings = capture_view.settings
         settings.setIsVideoCaptureEnabled(capture_model.is_enabled)

@@ -7,8 +7,8 @@ import pandas
 from PySide6 import QtCore
 from PySide6.QtCore import QTimer, Slot, Signal, Qt, QSize, QPoint, QPointF
 from PySide6.QtGui import QPixmap, QPainter, QPen, QPolygon, QPolygonF, QImage, QFont
-from PySide6.QtWidgets import QGridLayout, QHBoxLayout, QVBoxLayout, QStackedLayout, QWidget, QSizePolicy, QScrollBar, \
-    QScrollArea, QLayout, QSplitter, QTabWidget
+from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QStackedLayout, QWidget, QSizePolicy, QScrollBar, \
+    QScrollArea, QLayout, QTabWidget
 
 from autotrainer.core import AnimalSubject, CameraId, ProjectInfo
 from autotrainer.core.logging import get_verbose_logger
@@ -34,6 +34,7 @@ from tools.acquisition.view.hardware_control_content import HardwareControlConte
 from tools.acquisition.view.hardware_status_content import HardwareStatusContent
 from tools.acquisition.view.laser_control_content import LaserControlContent
 from tools.acquisition.view.protocol_content import ProtocolContent
+from tools.acquisition.view.persistent_splitter import PersistentSplitter
 from tools.acquisition.view.training_phase_content import TrainingPhaseContent
 from tools.acquisition.view.training_phase_progress_content import TrainingPhaseProgressContent
 from tools.acquisition.view.training_plan_content import TrainingPlanContent
@@ -72,11 +73,14 @@ class MainContent(ContentWidget):
         self._app_model = app_model
         self._protocol_ui_enabled = _REACHAQ_PROTOCOL_UI_ENABLED
 
+        self.setMinimumSize(0, 0)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setObjectName("MainContent")
         self.setStyleSheet("#MainContent {background-color: #f3f4f6}")
 
         self._content_widgets: List[ContentWidget] = []
+        self._preferences = app_model.preferences
 
         self.setContentsMargins(0, 0, 0, 0)
 
@@ -85,7 +89,11 @@ class MainContent(ContentWidget):
         root_layout.setContentsMargins(0, 0, 0, 0)
         root_layout.setSpacing(0)
 
-        self._main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._main_splitter = PersistentSplitter(
+            Qt.Orientation.Horizontal,
+            self._preferences,
+            "main_horizontal",
+        )
         root_layout.addWidget(self._main_splitter)
 
         left_content = self._left_content = QWidget()
@@ -94,15 +102,24 @@ class MainContent(ContentWidget):
 
         main_layout = self._main_layout = QVBoxLayout(left_content)
         main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.setSpacing(6)
+        main_layout.setSpacing(0)
+
+        self._section_splitter = PersistentSplitter(
+            Qt.Orientation.Vertical,
+            self._preferences,
+            "main_vertical",
+            left_content,
+        )
+        main_layout.addWidget(self._section_splitter)
 
         self._top_widget_manual = self._create_top_widget_manual()
-        main_layout.addWidget(self._top_widget_manual)
+        self._section_splitter.addWidget(self._top_widget_manual)
         # don't put alignment or the stretch used below won't be effective
 
         # Second row - behavior and analysis
-        mid_stacked_layout = self._mid_stacked_layout = StackedLayout()
-        main_layout.addLayout(mid_stacked_layout, stretch=1)
+        mid_stacked_widget = self._mid_stacked_widget = QWidget()
+        mid_stacked_layout = self._mid_stacked_layout = StackedLayout(mid_stacked_widget)
+        self._section_splitter.addWidget(mid_stacked_widget)
 
         self._mid_widget_manual = self._create_mid_widget_manual(app_model)
         mid_stacked_layout.addWidget(self._mid_widget_manual)
@@ -116,8 +133,7 @@ class MainContent(ContentWidget):
         end_stacked_widget = self._end_stacked_widget = QWidget()
         end_stacked_layout = self._end_stacked_layout = StackedLayout(end_stacked_widget)
 
-        end_stacked_layout.setAlignment(Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignLeft)
-        main_layout.addWidget(end_stacked_widget, alignment=Qt.AlignmentFlag.AlignBottom)
+        self._section_splitter.addWidget(end_stacked_widget)
 
         end_widget_manual = self._end_widget_manual = self._create_end_widget_manual()
         end_stacked_layout.addWidget(end_widget_manual)
@@ -158,15 +174,14 @@ class MainContent(ContentWidget):
 
         # Optional fourth row - diagnostics
         self._diagnostics_content = DiagnosticsContent(self._app_model)
-        main_layout.addWidget(self._diagnostics_content)
+        self._section_splitter.addWidget(self._diagnostics_content)
 
         self._right_side_tabs = self._create_right_side_tabs()
         self._main_splitter.addWidget(self._right_side_tabs)
-        self._main_splitter.setCollapsible(0, False)
-        self._main_splitter.setCollapsible(1, True)
         self._main_splitter.setStretchFactor(0, 1)
         self._main_splitter.setStretchFactor(1, 0)
-        self._main_splitter.setSizes([1180, 430])
+        self._main_splitter.apply_saved_or_default_sizes([1180, 430])
+        self._section_splitter.apply_saved_or_default_sizes([340, 410, 260, 120])
 
         self._frame_count = 0
         self._start = 0
@@ -201,21 +216,26 @@ class MainContent(ContentWidget):
 
     def _create_top_widget_manual(self):
         widget = QWidget()
-        widget.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         widget.setContentsMargins(4, 4, 4, 0)
-        top_layout = QGridLayout(widget)
+        top_layout = QVBoxLayout(widget)
         top_layout.setContentsMargins(4, 4, 4, 0)
-        top_layout.setSpacing(8)
-        top_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
+        top_layout.setSpacing(0)
+
+        self._camera_rows_splitter = PersistentSplitter(
+            Qt.Orientation.Vertical,
+            self._preferences,
+            "camera_rows",
+            widget,
+        )
+        top_layout.addWidget(self._camera_rows_splitter)
 
         app_model = self._app_model
         self._reach_camera_contents = []
         self._reach_camera_content_by_model = {}
         self._left_camera_content = None
         self._right_camera_content = None
-        self._top_layout = top_layout
-        self._reach_camera_grid_column_count = 0
-        self._reach_camera_grid_row_count = 0
+        self._camera_row_splitters = []
         self._rebuild_reach_camera_grid()
         self._top_camera_content = None
 
@@ -234,7 +254,6 @@ class MainContent(ContentWidget):
     def _clear_reach_camera_grid(self) -> None:
         for camera, camera_content in self._reach_camera_contents:
             del camera  # unused
-            self._top_layout.removeWidget(camera_content)
             if camera_content in self._content_widgets:
                 self._content_widgets.remove(camera_content)
             camera_content.close()
@@ -244,6 +263,10 @@ class MainContent(ContentWidget):
         self._reach_camera_content_by_model = {}
         self._left_camera_content = None
         self._right_camera_content = None
+        for splitter in self._camera_row_splitters:
+            splitter.setParent(None)
+            splitter.deleteLater()
+        self._camera_row_splitters = []
 
     def _rebuild_reach_camera_grid(self) -> None:
         self._clear_reach_camera_grid()
@@ -253,18 +276,21 @@ class MainContent(ContentWidget):
         columns = self._reach_camera_grid_columns(len(cameras))
         rows = max(1, math.ceil(len(cameras) / columns))
 
-        for column in range(max(self._reach_camera_grid_column_count, columns)):
-            self._top_layout.setColumnStretch(column, 1 if column < columns else 0)
-        for row in range(max(self._reach_camera_grid_row_count, rows)):
-            self._top_layout.setRowStretch(row, 1 if row < rows else 0)
-        self._reach_camera_grid_column_count = columns
-        self._reach_camera_grid_row_count = rows
+        for row_index in range(rows):
+            row_splitter = PersistentSplitter(
+                Qt.Orientation.Horizontal,
+                self._preferences,
+                f"camera_row_{row_index}",
+                self._camera_rows_splitter,
+            )
+            self._camera_rows_splitter.addWidget(row_splitter)
+            self._camera_row_splitters.append(row_splitter)
 
         for idx, camera in enumerate(cameras):
             camera_content = CameraContent(app_model, camera)
             camera_content.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
             camera_content.camera_view.setTitle(_camera_panel_title(camera.name))
-            self._top_layout.addWidget(camera_content, idx // columns, idx % columns)
+            self._camera_row_splitters[idx // columns].addWidget(camera_content)
             self._content_widgets.append(camera_content)
             self._reach_camera_contents.append((camera, camera_content))
             self._reach_camera_content_by_model[camera] = camera_content
@@ -273,27 +299,41 @@ class MainContent(ContentWidget):
             elif camera is app_model.right_camera:
                 self._right_camera_content = camera_content
 
+        for splitter in self._camera_row_splitters:
+            splitter.apply_saved_or_default_sizes([1] * max(1, splitter.count()))
+        self._camera_rows_splitter.apply_saved_or_default_sizes([1] * rows)
+
     def _create_mid_widget_manual(self, app_model):
         widget = QWidget()
         widget.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         widget.setContentsMargins(4, 0, 4, 0)
 
-        mid_layout = QHBoxLayout(widget)
-        mid_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        mid_layout = QVBoxLayout(widget)
         mid_layout.setContentsMargins(4, 4, 4, 0)
-        mid_layout.setSpacing(8)
+        mid_layout.setSpacing(0)
+
+        self._mid_splitter = PersistentSplitter(
+            Qt.Orientation.Horizontal,
+            self._preferences,
+            "behavior_analysis",
+            widget,
+        )
+        mid_layout.addWidget(self._mid_splitter)
 
         behavior_content = BehaviorContent(
             app_model,
             app_model.behavior,
             app_model.inference,
         )
-        mid_layout.addWidget(behavior_content)
+        behavior_content.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._mid_splitter.addWidget(behavior_content)
         self._content_widgets.append(behavior_content)
 
         self._analysis_content = AnalysisContent(app_model)
-        mid_layout.addWidget(self._analysis_content, 1)
+        self._mid_splitter.addWidget(self._analysis_content)
         self._content_widgets.append(self._analysis_content)
+
+        self._mid_splitter.apply_saved_or_default_sizes([360, 820])
 
         return widget
 
@@ -302,18 +342,29 @@ class MainContent(ContentWidget):
         widget = QWidget()
         widget.setContentsMargins(4, 0, 4, 0)
 
-        end_layout = QHBoxLayout(widget)
-        end_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        end_layout = QVBoxLayout(widget)
         end_layout.setContentsMargins(4, 4, 4, 4)
-        end_layout.setSpacing(8)
+        end_layout.setSpacing(0)
+
+        self._hardware_splitter = PersistentSplitter(
+            Qt.Orientation.Horizontal,
+            self._preferences,
+            "hardware_panels",
+            widget,
+        )
+        end_layout.addWidget(self._hardware_splitter)
 
         hardware_control_content = self._hardware_control_content = HardwareControlContent(self._app_model)
-        end_layout.addWidget(hardware_control_content)
+        hardware_control_content.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._hardware_splitter.addWidget(hardware_control_content)
         self._content_widgets.append(hardware_control_content)
 
         hardware_status_content = self._hardware_status_content = HardwareStatusContent(self._app_model)
-        end_layout.addWidget(hardware_status_content)
+        hardware_status_content.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._hardware_splitter.addWidget(hardware_status_content)
         self._content_widgets.append(hardware_status_content)
+
+        self._hardware_splitter.apply_saved_or_default_sizes([500, 680])
 
         return widget
 
@@ -325,7 +376,7 @@ class MainContent(ContentWidget):
         tabs.setObjectName("ReachAQRightSideTabs")
         tabs.setDocumentMode(True)
         tabs.setMinimumWidth(0)
-        tabs.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        tabs.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         tabs.setStyleSheet(
             "QTabWidget::pane {border: 1px solid #c9cdd3; background: #ffffff; top: -1px;}"
             "QTabBar::tab {background: #e7eaee; color: #20242a; border: 1px solid #c9cdd3; padding: 4px 10px;}"

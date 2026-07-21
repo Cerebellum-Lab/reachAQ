@@ -18,7 +18,7 @@ from PySide6.QtCore import Qt, QCoreApplication, QTimer, Signal, QSize, QKeyComb
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (QMainWindow, QStatusBar, QToolBar, QLabel, QMessageBox, QApplication,
                                QSizePolicy, QWidget, QComboBox, QLineEdit, QFileDialog, QHBoxLayout,
-                               QSpinBox, QDoubleSpinBox, QFrame, QDialog)
+                               QSpinBox, QDoubleSpinBox, QFrame, QDialog, QLayout)
 import qtawesome as qta
 
 from autotrainer.core import EventManager, Offset3DTuple, AnimalSubject, SystemConfiguration, CameraConfiguration, \
@@ -68,6 +68,7 @@ _this_dir = Path(__file__).parent.resolve()
 _TOOLBAR_ICON_COLOR = "#20242a"
 _TOOLBAR_ICON_WARNING_COLOR = "#b00020"
 _TRANSITIONAL_APP_MODE = "__transition__"
+_MINIMUM_RESIZABLE_WINDOW_SIZE = QSize(320, 240)
 
 
 def _toolbar_icon(name: str, *, color: str = _TOOLBAR_ICON_COLOR) -> QIcon:
@@ -91,6 +92,13 @@ def _make_separator():
 
 def _make_window_title(prefs):
     return f"{prefs.serial_number} - Auto Trainer - Acquisition v{app_version}"
+
+
+def _allow_bidirectional_window_resizing(window: QMainWindow) -> None:
+    """Prevent child size hints from becoming a fixed top-level resize floor."""
+    window.setMinimumSize(_MINIMUM_RESIZABLE_WINDOW_SIZE)
+    window.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+    window.layout().setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
 
 
 class MainWindow(QMainWindow):
@@ -161,6 +169,7 @@ class MainWindow(QMainWindow):
 
             self.setCentralWidget(self.main_content)
             self.centralWidget().layout().setContentsMargins(0, 0, 0, 0)
+            _allow_bidirectional_window_resizing(self)
             # self.setMaximumSize(1880, 1080)
         except Exception as err:
             app_model.on_close()
@@ -1150,6 +1159,8 @@ class MainWindow(QMainWindow):
         )
         toolbar.setFloatable(False)
         toolbar.setMovable(False)
+        toolbar.setMinimumWidth(0)
+        toolbar.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.addToolBar(toolbar)
 
         toolbar.addWidget(QLabel("System Mode:"))
@@ -1357,7 +1368,7 @@ class MainWindow(QMainWindow):
         self._status_label = QLabel("")
         bar = self._status_bar = QStatusBar(self)
         bar.addWidget(self._status_label)
-        bar.setSizeGripEnabled(False)
+        bar.setSizeGripEnabled(True)
         widget = self._status_training_widget = QWidget()
         widget.setVisible(False)
         hbox = QHBoxLayout()

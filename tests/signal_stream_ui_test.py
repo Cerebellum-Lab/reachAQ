@@ -6,7 +6,7 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtWidgets import QApplication, QSizePolicy  # noqa: E402
 
 from autotrainer.core import (  # noqa: E402
     LaserChannelConfiguration,
@@ -204,6 +204,10 @@ def test_analysis_signal_selection_requires_mapped_port_and_nidaq_enable(qapp):
         assert content._graph_seconds.suffix() == " s"
         assert content._graph_min_volts.suffix() == " V"
         assert content._graph_max_volts.suffix() == " V"
+        assert content._rolling_plot.minimumSize().isEmpty()
+        assert content._rolling_plot._plot.minimumSize().isEmpty()
+        assert content._rolling_plot._plot.sizePolicy().horizontalPolicy() == QSizePolicy.Policy.Ignored
+        assert content._rolling_plot._plot.sizePolicy().verticalPolicy() == QSizePolicy.Policy.Ignored
 
         content._graph_seconds.setValue(2.0)
         content._graph_min_volts.setValue(-1.0)
@@ -475,6 +479,10 @@ def test_laser_trace_auto_resumes_and_displays_entire_calibration_ramp(qapp):
         diode_x, diode_y = tab._trace_data["diode"]
         assert tab._trace_streaming
         assert tab._trace_toggle_button.text() == "Stop Stream"
+        assert tuple(
+            tab._mode_tabs.tabText(index)
+            for index in range(tab._mode_tabs.count())
+        ) == ("Pulse", "Calibration", "Output")
         assert tab._trace_signal_checkboxes["diode"].property("signalColor") == "#128a43"
         assert tab._trace_signal_checkboxes["copy"].property("signalColor") == "#d66b00"
         assert tuple(
@@ -484,6 +492,15 @@ def test_laser_trace_auto_resumes_and_displays_entire_calibration_ramp(qapp):
         assert tab._trace_stream_page.isAncestorOf(tab._trace_plot)
         assert tab._trace_signals_page.isAncestorOf(tab._trace_signal_checkboxes["diode"])
         assert tab._trace_signals_page.isAncestorOf(tab._trace_signal_checkboxes["copy"])
+        assert tab._trace_signal_checkboxes["diode"].text().endswith("Diode feedback")
+        assert "Dev1/ai0" not in tab._trace_signal_checkboxes["diode"].text()
+        assert tab._trace_signal_checkboxes["diode"].toolTip().startswith("Dev1/ai0\n")
+        assert tab._trace_legend._columns == 1
+        assert tab._preview_plot.minimumSize().isEmpty()
+        assert tab._trace_plot.minimumSize().isEmpty()
+        assert tab._preview_plot.sizePolicy().verticalPolicy() == QSizePolicy.Policy.Ignored
+        assert tab._trace_plot.sizePolicy().verticalPolicy() == QSizePolicy.Policy.Ignored
+        assert tab.minimumSizeHint().width() < 430
         assert tuple(entry[0] for entry in tab._trace_legend.entries) == (
             "Command output",
             "Diode feedback",
