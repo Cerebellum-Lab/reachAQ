@@ -53,12 +53,16 @@ def _camera_panel_title(camera_name: str) -> str:
     return f"{camera_name.capitalize()} Camera"
 
 
-def _visible_reach_cameras(cameras):
-    """Keep optional reach-camera panels out of the UI until enabled."""
+def _visible_reach_cameras(cameras, *, include_disabled_optional: bool = False):
+    """Show optional cameras when enabled, plus stimCam while settings are edited."""
     return tuple(
         camera
         for camera in cameras
-        if camera.camera_id in (CameraId.Left, CameraId.Right) or camera.is_enabled
+        if (
+            camera.camera_id in (CameraId.Left, CameraId.Right)
+            or camera.is_enabled
+            or (include_disabled_optional and camera.camera_id == CameraId.Camera3)
+        )
     )
 
 
@@ -81,6 +85,7 @@ class MainContent(ContentWidget):
 
         self._content_widgets: List[ContentWidget] = []
         self._preferences = app_model.preferences
+        self._is_camera_settings_editable = False
 
         self.setContentsMargins(0, 0, 0, 0)
 
@@ -253,7 +258,7 @@ class MainContent(ContentWidget):
 
     def _clear_reach_camera_grid(self) -> None:
         for camera, camera_content in self._reach_camera_contents:
-            del camera  # unused
+            camera.set_display_fcn(None)
             if camera_content in self._content_widgets:
                 self._content_widgets.remove(camera_content)
             camera_content.close()
@@ -272,7 +277,10 @@ class MainContent(ContentWidget):
         self._clear_reach_camera_grid()
 
         app_model = self._app_model
-        cameras = _visible_reach_cameras(app_model.reach_cameras)
+        cameras = _visible_reach_cameras(
+            app_model.reach_cameras,
+            include_disabled_optional=self._is_camera_settings_editable,
+        )
         columns = self._reach_camera_grid_columns(len(cameras))
         rows = max(1, math.ceil(len(cameras) / columns))
 
@@ -290,6 +298,8 @@ class MainContent(ContentWidget):
             camera_content = CameraContent(app_model, camera)
             camera_content.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
             camera_content.camera_view.setTitle(_camera_panel_title(camera.name))
+            camera_content.set_is_editable(self._is_camera_settings_editable)
+            camera.set_display_fcn(camera_content.refresh_image)
             self._camera_row_splitters[idx // columns].addWidget(camera_content)
             self._content_widgets.append(camera_content)
             self._reach_camera_contents.append((camera, camera_content))
@@ -506,6 +516,10 @@ class MainContent(ContentWidget):
 
     @invoke_method
     def set_is_editable(self, is_editable: bool):
+        is_editable = bool(is_editable)
+        if self._is_camera_settings_editable != is_editable:
+            self._is_camera_settings_editable = is_editable
+            self._rebuild_reach_camera_grid()
         for widget in self._content_widgets:
             widget.set_is_editable(is_editable)
 

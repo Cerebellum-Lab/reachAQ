@@ -41,6 +41,24 @@ cameras:
     fps: 30
     primary: 'no'
 - !CameraConfiguration
+  id: 3
+  name: stimCam
+  isEnabled: false
+  isRecordEnabled: false
+  recordMode: 1
+  recordPrebufferDuration: 0.0
+  isStillImageCaptureEnabled: false
+  stillImageCaptureInterval: 0.0
+  scheme: random
+  host: ''
+  port: 0
+  path: ''
+  params:
+    width: 300
+    height: 200
+    fps: 30
+    primary: 'no'
+- !CameraConfiguration
   id: 2
   name: web
   isEnabled: false

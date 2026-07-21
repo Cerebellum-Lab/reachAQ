@@ -115,6 +115,18 @@ def _append_unique_camera(cameras: List[CaptureCameraAttrs], name: str, url: str
     cameras.append(CaptureCameraAttrs(name=candidate, url=url))
 
 
+def _is_spinnaker_source(camera: CaptureCameraAttrs) -> bool:
+    return camera_source_binding_key(camera.url).startswith("spinnaker://")
+
+
+def camera_source_binding_key(url: str) -> str:
+    """Return the physical binding identity, excluding capture parameters."""
+    parsed = urllib.parse.urlparse(url or "")
+    if parsed.scheme.lower() == "spinnaker":
+        return f"spinnaker://{parsed.hostname or parsed.netloc}"
+    return url or ""
+
+
 class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
 
     CAMERA_PROP = "camera"
@@ -251,10 +263,17 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
         old_list = self._camera_list
         refreshed = list(create_camera_list(include_hardware=True) if camera_list is None else camera_list)
         current_source = self._camera_source
+        # Spinnaker serial bindings belong to CameraConfiguration. Discovery still
+        # verifies every serial, but the editor must not offer another camera's
+        # serial as an interchangeable source.
+        refreshed = [camera for camera in refreshed if not _is_spinnaker_source(camera)]
         if (
             current_source is not None
             and current_source.url
-            and not any(camera.url == current_source.url for camera in refreshed)
+            and (
+                _is_spinnaker_source(current_source)
+                or not any(camera.url == current_source.url for camera in refreshed)
+            )
         ):
             refreshed.insert(0, current_source)
         self._camera_list = refreshed
@@ -555,7 +574,19 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
 
         logger.debug("%s: built url=%s", conf.name, url)
 
-        existing = list(filter(lambda m: m.url == url, self._camera_list))
+        configured_spinnaker_source = (
+            conf.id in CameraId.reach_camera_ids()
+            and conf.scheme.lower() == "spinnaker"
+        )
+        if configured_spinnaker_source:
+            self._camera_list = [
+                camera
+                for camera in self._camera_list
+                if not _is_spinnaker_source(camera)
+            ]
+        existing = [] if configured_spinnaker_source else list(
+            filter(lambda m: m.url == url, self._camera_list)
+        )
 
         name = self._name or "<unnamed>"
 

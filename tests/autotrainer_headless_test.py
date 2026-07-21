@@ -22,7 +22,7 @@ from autotrainer.core import (
     NidaqSignalStreamConfiguration,
     SystemConfiguration,
 )
-from autotrainer.video import VideoRecordMode
+from autotrainer.video import CaptureCameraAttrs, VideoRecordMode
 from autotrainer.inference import GpuRuntimeStatus
 from tools.acquisition.model.app_model import AppModel
 from tools.acquisition.model.app_model_status import AppModelStatus
@@ -100,7 +100,14 @@ def test_user_preferences(settings_ini_path, user_pref, trainer_config_dir):
     assert user_pref.selected_animal == "foobar"
 
 
-def test_load_config(app_model, trainer_config_dir, animals_dir, calib_dir, system_config):
+def test_load_config(
+    app_model,
+    trainer_config_dir,
+    animals_dir,
+    calib_dir,
+    system_config,
+    config_file_path,
+):
     from tools.acquisition.view.main_content import _visible_reach_cameras
 
     res = app_model.load_configuration()
@@ -115,12 +122,23 @@ def test_load_config(app_model, trainer_config_dir, animals_dir, calib_dir, syst
         app_model.left_camera,
         app_model.right_camera,
     )
+    assert _visible_reach_cameras(
+        app_model.reach_cameras,
+        include_disabled_optional=True,
+    ) == (
+        app_model.left_camera,
+        app_model.right_camera,
+        app_model.stim_camera,
+    )
     app_model.stim_camera.is_enabled = True
     assert _visible_reach_cameras(app_model.reach_cameras) == (
         app_model.left_camera,
         app_model.right_camera,
         app_model.stim_camera,
     )
+    app_model.save_configuration()
+    saved_configuration = SystemConfiguration.load_yaml_file(config_file_path)
+    assert saved_configuration.get_camera(CameraId.Camera3).is_enabled
     assert app_model.top_camera.name == "web"
     assert app_model.output_location == system_config.persistence.output_location
     pref = app_model.preferences
@@ -145,8 +163,58 @@ def test_load_config_extra_reach_camera_slot(app_model, trainer_config_dir, syst
     loaded_camera3 = app_model.get_camera_model(CameraId.Camera3)
     assert len(app_model.reach_cameras) == 3
     assert loaded_camera3.is_enabled
-    assert loaded_camera3.name == "Camera3"
-    assert app_model.make_project_info().camera_names == ("Camera3",)
+    assert loaded_camera3.name == "stimCam"
+    assert app_model.make_project_info().camera_names == ("stimCam",)
+
+
+def test_spinnaker_camera_selectors_keep_only_their_configured_binding(
+    app_model,
+    trainer_config_dir,
+    system_config,
+):
+    serials = {
+        CameraId.Left: "24095781",
+        CameraId.Right: "24095782",
+        CameraId.Camera3: "24095783",
+    }
+    for camera in system_config.cameras:
+        if camera.id in (CameraId.Left, CameraId.Right):
+            camera.scheme = "spinnaker"
+            camera.host = serials[camera.id]
+            camera.params = {"width": 256, "height": 256, "fps": 150}
+    system_config.cameras.append(
+        CameraConfiguration(
+            id=CameraId.Camera3,
+            name="stimCam",
+            scheme="spinnaker",
+            host=serials[CameraId.Camera3],
+            params={"width": 256, "height": 256, "fps": 150},
+        )
+    )
+    system_config.save_default(trainer_config_dir)
+    assert app_model.load_configuration() is True
+
+    discovered_sources = (
+        CaptureCameraAttrs("Random Image", "random://0?width=300&height=200"),
+        *(
+            CaptureCameraAttrs(f"Spinnaker {serial}", f"spinnaker://{serial}")
+            for serial in serials.values()
+        ),
+    )
+    for camera, expected_name in (
+        (app_model.left_camera, "left"),
+        (app_model.right_camera, "right"),
+        (app_model.stim_camera, "stimCam"),
+    ):
+        camera.refresh_camera_list(discovered_sources)
+        spinnaker_options = tuple(
+            source
+            for source in camera.camera_list
+            if source.url.startswith("spinnaker://")
+        )
+        assert camera.camera_source.name == expected_name
+        assert spinnaker_options == (camera.camera_source,)
+        assert all(not source.name.startswith("Spinnaker ") for source in camera.camera_list)
 
 
 def test_load_config_without_web_camera_keeps_top_disabled(app_model, trainer_config_dir, system_config):
@@ -266,10 +334,12 @@ def test_load_config_random_camera_override(app_model, trainer_config_dir, syste
 
     assert app_model.load_configuration(random_cameras=True) is True
 
-    for cam in app_model.reach_cameras:
+    for cam in (app_model.left_camera, app_model.right_camera):
         assert cam.is_enabled
         assert cam.camera_source.url.startswith("random://")
         assert "fps=150" in cam.camera_source.url
+    assert not app_model.stim_camera.is_enabled
+    assert app_model.stim_camera.camera_source.url.startswith("random://")
     assert app_model.left_camera.is_primary
     assert not app_model.right_camera.is_primary
 

@@ -76,9 +76,12 @@ directory so test settings do not overwrite the bench config.
 Reach cameras are configured as `CameraConfiguration` entries. The left and
 right cameras are the normal two-camera reachAQ setup. A third `stimCam`
 (`id: 3`) is added as an optional, disabled camera. While disabled it is not
-shown in the camera grid or Hardware Status and is not opened or required at
-startup. When enabled, its camera selector appears as the third, far-right
-camera panel. Cameras 4-6 likewise appear only while enabled.
+shown in the normal camera grid or Hardware Status and is not opened or required
+at startup. **Edit → Edit Camera Settings** always shows the `stimCam` settings
+panel so it can be enabled or disabled there. Leaving camera-edit mode saves the
+selection and rebuilds the normal camera grid: enabled creates the third,
+far-right panel; disabled removes it. Cameras 4-6 likewise appear only while
+enabled.
 
 Enable `stimCam` by setting its `CameraConfiguration.isEnabled` value to
 `true`. Its source can then be selected from the far-right camera panel. Keep
@@ -89,7 +92,11 @@ reachAQ does not require a webcam. Leave the `web` camera absent or disabled
 unless a rig intentionally configures it.
 
 For Spinnaker cameras, put the camera serial or configured Spinnaker identifier
-in `host`:
+in `host`. The Edit Camera Settings selector keeps that configured binding under
+the logical camera name (`left`, `right`, or `stimCam`); discovered
+`Spinnaker <serial>` entries are intentionally excluded from the selector so a
+camera cannot be silently rebound to another configured position. Hardware
+Status still lists every discovered serial for connection diagnostics.
 
 ```yaml
 - !CameraConfiguration

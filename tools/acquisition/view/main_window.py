@@ -910,6 +910,7 @@ class MainWindow(QMainWindow):
         # isChecked() has already swapped to the new value by the time this is called
         if not self.edit_camera_settings_action.isChecked():
             self.main_content.set_is_editable(False)
+            self._app_model.save_configuration()
             self.run_action.setEnabled(True)
         else:
             self.main_content.set_is_editable(True)

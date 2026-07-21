@@ -119,8 +119,7 @@ def test_all_visible_main_panel_boundaries_are_splitters(qapp, app_model, monkey
             )
         )
 
-        app_model.stim_camera.is_enabled = True
-        content._rebuild_reach_camera_grid()
+        content.set_is_editable(True)
         qapp.processEvents()
         assert content._camera_rows_splitter.count() == 1
         assert content._camera_row_splitters[0].count() == 3
@@ -128,6 +127,33 @@ def test_all_visible_main_panel_boundaries_are_splitters(qapp, app_model, monkey
             "left",
             "right",
             "stimCam",
+        )
+        stim_panel = content._reach_camera_content_by_model[app_model.stim_camera]
+        assert stim_panel.camera_view._content_stack.currentIndex() == 1
+        assert not stim_panel._settings.isCaptureEnabled
+        assert app_model.stim_camera._display_update_fcn == stim_panel.refresh_image
+
+        stim_panel._settings.setIsVideoCaptureEnabled(True)
+        qapp.processEvents()
+        assert app_model.stim_camera.is_enabled
+        content.set_is_editable(False)
+        qapp.processEvents()
+        assert tuple(camera.name for camera, _panel in content._reach_camera_contents) == (
+            "left",
+            "right",
+            "stimCam",
+        )
+
+        content.set_is_editable(True)
+        qapp.processEvents()
+        stim_panel = content._reach_camera_content_by_model[app_model.stim_camera]
+        stim_panel._settings.setIsVideoCaptureEnabled(False)
+        qapp.processEvents()
+        content.set_is_editable(False)
+        qapp.processEvents()
+        assert tuple(camera.name for camera, _panel in content._reach_camera_contents) == (
+            "left",
+            "right",
         )
     finally:
         content.close()

@@ -100,7 +100,11 @@ from tools.acquisition.model.nidaq_discovery import device_name_from_channel, di
 from tools.acquisition.model.nidaq_signal_monitor_model import NidaqSignalMonitorModel
 from tools.acquisition.model.behavior_model import BehaviorModel
 from tools.acquisition.model.user_preferences import UserPreferences, get_default_animals_location
-from tools.acquisition.model.video_capture_model import VideoCaptureModel, create_camera_list
+from tools.acquisition.model.video_capture_model import (
+    VideoCaptureModel,
+    camera_source_binding_key,
+    create_camera_list,
+)
 
 logger = get_verbose_logger(__name__)
 
@@ -533,7 +537,9 @@ class AppModel(ObservableObject):
     @staticmethod
     def _ensure_optional_stim_camera(configuration: SystemConfiguration) -> None:
         """Add the standard third camera without enabling or probing it."""
-        if configuration.get_camera(CameraId.Camera3) is not None:
+        configured_stim_camera = configuration.get_camera(CameraId.Camera3)
+        if configured_stim_camera is not None:
+            configured_stim_camera.name = "stimCam"
             return
         prebuffer_duration = max(
             (
@@ -1115,7 +1121,10 @@ class AppModel(ObservableObject):
 
         try:
             camera_sources = camera_future.result()
-            source_urls = {source.url for source in camera_sources}
+            source_bindings = {
+                camera_source_binding_key(source.url)
+                for source in camera_sources
+            }
             for camera in self._cameras:
                 camera.refresh_camera_list(camera_sources)
             missing_enabled_cameras = [
@@ -1124,7 +1133,7 @@ class AppModel(ObservableObject):
                 if (
                     camera.is_enabled
                     and camera.camera_source is not None
-                    and camera.camera_source.url not in source_urls
+                    and camera_source_binding_key(camera.camera_source.url) not in source_bindings
                 )
             ]
             details.append(f"cameras {len(camera_sources)} source(s)")
