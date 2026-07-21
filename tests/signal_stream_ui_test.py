@@ -17,12 +17,18 @@ from autotrainer.core import (  # noqa: E402
     NidaqSignalStreamConfiguration,
     ObservableObject,
 )
-from autotrainer.device import LaserCalibrationRamp, LaserPulseTrain, NullLaserController  # noqa: E402
+from autotrainer.device import (  # noqa: E402
+    LaserCalibrationRamp,
+    LaserPulseTrain,
+    NidaqSignalSampleBlock,
+    NullLaserController,
+)
 from tools.acquisition.model.laser_model import LaserModel  # noqa: E402
 from tools.acquisition.model.app_model import AppModel  # noqa: E402
 from tools.acquisition.model.nidaq_signal_monitor_model import NidaqSignalMonitorModel  # noqa: E402
 from tools.acquisition.view.analysis_content import AnalysisContent  # noqa: E402
 from tools.acquisition.view.laser_control_content import _LaserChannelTab  # noqa: E402
+from tools.acquisition.view.rolling_stream_buffer import RollingStreamBuffer  # noqa: E402
 
 
 @pytest.fixture(scope="module")
@@ -106,6 +112,31 @@ def test_signal_monitor_refuses_to_start_when_nidaq_hardware_is_disabled():
     assert "hardware disabled" in monitor.status_message
 
 
+def test_configured_signal_monitor_remains_stopped_until_explicit_start():
+    monitor = NidaqSignalMonitorModel()
+    monitor._hardware_enabled = True
+    start_calls = []
+    monitor.start = lambda: start_calls.append(True)
+
+    monitor.load_configuration(_stream_configuration())
+
+    assert start_calls == []
+    assert not monitor.is_running
+    assert monitor.status_message == "NI-DAQ signal stream stopped"
+
+
+def test_numpy_stream_buffer_wraps_without_shifting_existing_window():
+    buffer = RollingStreamBuffer(5)
+    buffer.append((0, 1, 2), (10, 11, 12))
+    buffer.append((3, 4, 5, 6), (13, 14, 15, 16))
+
+    x_values, y_values = buffer.ordered()
+
+    assert x_values.tolist() == [2, 3, 4, 5, 6]
+    assert y_values.tolist() == [12, 13, 14, 15, 16]
+    assert buffer.latest_x == 6
+
+
 def test_analysis_signal_selection_requires_mapped_port_and_nidaq_enable(qapp):
     monitor = NidaqSignalMonitorModel()
     monitor._configuration = _stream_configuration()
@@ -134,7 +165,11 @@ def test_analysis_signal_selection_requires_mapped_port_and_nidaq_enable(qapp):
         assert camera_frames.property("signalColor") == "#1769e0"
         assert barcode.property("signalColor") == "#128a43"
         assert content._rolling_plot._legend.entries == (
-            ("cam_frames (logic)", (23, 105, 224), True),
+            ("cam_frames (logic)", (23, 105, 224), False),
+        )
+        assert all(
+            curve.opts["pen"].style().name == "SolidLine"
+            for curve in content._rolling_plot._curves.values()
         )
         assert content._channel_count_label.text() == "1"
         assert content._start_stop_button.isEnabled()
@@ -146,7 +181,7 @@ def test_analysis_signal_selection_requires_mapped_port_and_nidaq_enable(qapp):
         assert content._rolling_plot._legend.entries[1] == (
             "tone1 (logic)",
             (18, 138, 67),
-            True,
+            False,
         )
         content._signal_checkboxes["tone1"].setChecked(False)
         qapp.processEvents()
@@ -161,7 +196,7 @@ def test_analysis_signal_selection_requires_mapped_port_and_nidaq_enable(qapp):
         qapp.processEvents()
         assert content._signal_checkboxes["tone1"].property("signalColor") == "#1769e0"
         assert content._rolling_plot._legend.entries == (
-            ("tone1 (logic)", (23, 105, 224), True),
+            ("tone1 (logic)", (23, 105, 224), False),
         )
         content._signal_checkboxes["tone1"].setChecked(False)
         qapp.processEvents()
@@ -181,6 +216,11 @@ def test_analysis_signal_selection_requires_mapped_port_and_nidaq_enable(qapp):
         assert not content._start_stop_button.isEnabled()
         assert not content._clear_button.isEnabled()
         assert not content._signal_checkboxes["cam_frames"].isEnabled()
+
+        monitor._set_error("native NI-DAQ crash details")
+        qapp.processEvents()
+        assert "native NI-DAQ crash details" not in content._status_label.text()
+        assert content._status_label.styleSheet() == ""
     finally:
         content.on_close()
         content.deleteLater()
@@ -210,6 +250,39 @@ def test_analysis_excludes_laser_owned_inputs_from_selector_and_graph(qapp):
         assert tuple(entry[0] for entry in content._rolling_plot._legend.entries) == (
             "cam_frames (logic)",
         )
+    finally:
+        content.on_close()
+        content.deleteLater()
+
+
+def test_analysis_coalesces_sample_blocks_before_single_rolling_redraw(qapp):
+    monitor = NidaqSignalMonitorModel()
+    monitor._configuration = _stream_configuration()
+    monitor._hardware_enabled = True
+    content = AnalysisContent(_AnalysisAppStub(monitor))
+    content.show()
+    qapp.processEvents()
+    redraw_calls = []
+    original_redraw = content._rolling_plot.redraw
+    content._rolling_plot.redraw = lambda: (redraw_calls.append(True), original_redraw())
+    try:
+        for sample_index in (0, 100, 200):
+            content._sample_block_received(
+                NidaqSignalSampleBlock(
+                    wall_time=1.0,
+                    perf_time=1.0,
+                    sample_rate_hz=1000.0,
+                    sample_index=sample_index,
+                    channels=monitor.configuration.channels,
+                    values={"cam_frames": tuple(float(index % 2) for index in range(100))},
+                )
+            )
+
+        assert content._rolling_plot._buffers["cam_frames"].size == 0
+        content._flush_pending_blocks()
+
+        assert redraw_calls == [True]
+        assert content._rolling_plot._buffers["cam_frames"].size == 300
     finally:
         content.on_close()
         content.deleteLater()
@@ -287,6 +360,8 @@ def test_laser_trace_auto_resumes_and_displays_entire_calibration_ramp(qapp):
     )
     laser.trace_received += tab.append_trace
     try:
+        assert not tab._trace_streaming
+        assert tab._trace_toggle_button.text() == "Start Stream"
         tab._set_trace_streaming(False)
         points = laser.run_calibration_ramp(
             LaserCalibrationRamp(
@@ -301,7 +376,7 @@ def test_laser_trace_auto_resumes_and_displays_entire_calibration_ramp(qapp):
         command_x, command_y = tab._trace_data["command"]
         diode_x, diode_y = tab._trace_data["diode"]
         assert tab._trace_streaming
-        assert tab._trace_toggle_button.text() == "Pause Stream"
+        assert tab._trace_toggle_button.text() == "Stop Stream"
         assert tab._trace_signal_checkboxes["diode"].property("signalColor") == "#128a43"
         assert tab._trace_signal_checkboxes["copy"].property("signalColor") == "#d66b00"
         assert tuple(
@@ -315,6 +390,10 @@ def test_laser_trace_auto_resumes_and_displays_entire_calibration_ramp(qapp):
             "Command output",
             "Diode feedback",
             "Command copy",
+        )
+        assert all(
+            curve.opts["pen"].style().name == "SolidLine"
+            for curve in tab._trace_curves.values()
         )
         assert len(points) == len(command_x) == len(command_y) == 5
         assert len(diode_x) == len(diode_y) == 5

@@ -154,6 +154,12 @@ ready within 10 seconds, reachAQ remains open and displays the failure. Treat
 that message as a driver/device problem: re-run the discovery checks above and
 verify that each selected channel supports the requested input task.
 
+For camera/barcode TTL streams, use a hardware-clocked input rate of at least
+5 kHz; reachAQ defaults to 10 kHz with 500-sample reads. Digital-only tasks use
+`ctr0` on the input device to generate the sample clock. Confirm that the
+counter is not reserved by another task. The UI redraws buffered rolling
+windows at about 30 Hz; this does not reduce the hardware capture rate.
+
 ## References
 
 - [NI Ubuntu installation](https://www.ni.com/docs/en-US/bundle/ni-platform-on-linux-desktop/page/installing-ni-products-ubuntu.html)

@@ -117,6 +117,9 @@ DAQ Ports** and NI-DAQ is enabled. Stop the stream before changing main Analysis
 selections; every checkbox change is immediately saved in
 `nidaqStream.channels`. Start Stream and Clear are disabled when NI-DAQ is
 disabled, and Start Stream also requires at least one selected Analysis channel.
+Streams remain stopped when reachAQ opens. They can be started manually while
+idle; configured streams start automatically when acquisition becomes active
+and stop again when acquisition stops.
 
 NI-DAQmx task creation and reads run in an isolated worker process. The Analysis
 card stays responsive while the worker starts, and a native driver crash such as
@@ -124,6 +127,17 @@ card stays responsive while the worker starts, and a native driver crash such as
 that does not become ready within 10 seconds is stopped and reported as a
 startup timeout. Hardware initialization milestones from the worker are relayed
 to both the application log and terminal.
+
+Incoming blocks are retained in fixed-size NumPy circular buffers. Graphs drain
+those buffers on a coalesced 30 Hz display timer, so hardware sampling and CSV
+recording do not depend on paint speed. Curves are always solid lines; digital
+signals are distinguished by color and label rather than dots or dashes. Width
+and height controls below each graph change its minimum display dimensions.
+
+The default 10 kHz hardware sample rate provides ten samples across each half
+cycle of a 500 Hz square wave. Digital-only tasks use an NI counter output as
+their sample clock instead of software-timed per-sample reads. A TTL must be
+connected to the exact physical channel named in `nidaqStream.channels`.
 
 On the current PXIe-1073 / PXI-6713 setup, NI-DAQmx reports:
 
@@ -135,11 +149,13 @@ DIO: PXI1Slot4/port0/line0 through PXI1Slot4/port0/line7
 ```
 
 The 6713 can provide analog outputs and digital I/O, but it cannot provide
-analog input readback. Add a supported NI analog-input card if laser diode or
-command-copy feedback channels are required.
+analog input readback. This rig also contains a PXI-6221 (`PXI1Slot5`) with 16
+analog inputs, hardware-clocked digital input support, and two counters. Prefer
+the 6221 for buffered input streams and verify that `nidaqPorts` and
+`nidaqStream.channels` identify the same wired terminals.
 
 Each Laser Control tab includes an Output Stream area with nested **Stream** and
-**Signals** tabs. Stream contains the graph and its independent Start/Pause and
+**Signals** tabs. Stream contains the graph and its independent Start/Stop and
 Clear controls; Signals contains only that laser's diode-feedback and
 command-copy display options. **Start DAQ Inputs** starts the shared input worker;
 the button clearly labels its shared stop action while it is running. These
@@ -147,14 +163,14 @@ selections also persist immediately in `nidaqStream.channels`, while remaining
 absent from the main Analysis selector and plot. Manual/internal and externally
 triggered pulse operations append their command waveform. Selected measured
 inputs from the shared NI-DAQ stream are added to the corresponding laser
-graph. Calibration always resumes and clears the associated graph, then
-displays every returned command, diode, and command-copy ramp point without
-applying the Analysis rolling-window trim.
+graph. Calibration explicitly starts and clears the associated graph. Live
+stream traces use the same configured rolling-window duration as Analysis.
 
 Every stream option and curve uses the same high-contrast color assignment:
 the first displayed signal is blue, the second green, followed by orange,
 purple, red, teal, magenta, and blue-gray. A compact matching legend appears
 below the main Analysis graph and below every laser Output Stream graph.
+Every legend swatch and plotted curve is solid.
 
 ## Output
 
@@ -198,8 +214,11 @@ visible even when that hardware category is disabled.
   roles while idle.
 * Tools -> Calibrate Coordinate System / Make 3D calibration - run the available
   calibration workflows.
-* View -> Diagnostics / Debug - development-mode panels shown only when the
-  application is launched with development options.
+* View -> Logging - show or hide the application log. Errors are reported here,
+  in the status bar, in the launching terminal, and in the log file instead of
+  being rendered inside individual control panels.
+* View -> Debug - development-mode panel shown only when the application is
+  launched with development options.
 
 ### Camera Control
 
@@ -225,6 +244,14 @@ These records cover the GPU preflight, camera discovery and child processes,
 CAN/pellet controller, NI-DAQ discovery and tasks, and laser channels. Each slow
 operation records elapsed time so the final emitted `START` line identifies the
 initialization step that is still waiting.
+
+Some NI devices, including M-Series static digital I/O, return DAQmx status
+`-200303` because their digital lines have no internal hardware sample clock.
+The analysis stream automatically falls back to software-timed reads for a
+digital-only task and logs a warning. This mode is appropriate for operator
+visualization, but its timing is approximate and it can miss pulses shorter than
+the polling interval; use a routed hardware sample clock when edge-complete
+recording is required.
 
 See [../../linux-install-instructions.md](../../linux-install-instructions.md)
 and [../hardware/reachaq_system_configuration.example.yaml](../hardware/reachaq_system_configuration.example.yaml)

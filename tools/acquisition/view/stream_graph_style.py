@@ -73,7 +73,7 @@ class StreamGraphLegend(QWidget):
             if widget is not None:
                 widget.deleteLater()
 
-        for index, (label_text, color, dashed) in enumerate(entries):
+        for index, (label_text, color, _is_digital) in enumerate(entries):
             item_widget = QWidget(self)
             item_layout = QHBoxLayout(item_widget)
             item_layout.setContentsMargins(0, 0, 0, 0)
@@ -83,15 +83,9 @@ class StreamGraphLegend(QWidget):
             swatch.setObjectName("StreamLegendSwatch")
             swatch.setFixedSize(24, 8)
             hex_color = color_hex(color)
-            if dashed:
-                swatch.setStyleSheet(
-                    f"QFrame#StreamLegendSwatch {{ background: transparent; "
-                    f"border-top: 3px dashed {hex_color}; }}"
-                )
-            else:
-                swatch.setStyleSheet(
-                    f"QFrame#StreamLegendSwatch {{ background: {hex_color}; border: 0px; }}"
-                )
+            swatch.setStyleSheet(
+                f"QFrame#StreamLegendSwatch {{ background: {hex_color}; border: 0px; }}"
+            )
 
             label = QLabel(label_text, item_widget)
             label.setStyleSheet("color: #2f343a; font-size: 10px;")

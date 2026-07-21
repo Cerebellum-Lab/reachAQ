@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import Dict, List, Optional, Set, Tuple
+import math
+import threading
+from collections import deque
+from typing import Deque, Dict, Optional, Set, Tuple
 
+import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWidgets import (
     QCheckBox,
     QHBoxLayout,
@@ -12,6 +16,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QSpinBox,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -28,6 +33,7 @@ from tools.acquisition.view.stream_graph_style import (
     color_code_checkbox,
     stream_signal_color,
 )
+from tools.acquisition.view.rolling_stream_buffer import RollingStreamBuffer
 
 
 logger = get_verbose_logger(__name__)
@@ -54,8 +60,7 @@ class _NidaqRollingPlot(QWidget):
         self._configuration = NidaqSignalStreamConfiguration()
         self._style_signature = tuple()
         self._curves: Dict[str, object] = {}
-        self._x_values: Dict[str, List[float]] = {}
-        self._y_values: Dict[str, List[float]] = {}
+        self._buffers: Dict[str, RollingStreamBuffer] = {}
         self._latest_x = 0.0
 
     def configure(
@@ -74,27 +79,29 @@ class _NidaqRollingPlot(QWidget):
         self._style_signature = style_signature
         self._plot.clear()
         self._curves.clear()
-        self._x_values.clear()
-        self._y_values.clear()
+        self._buffers.clear()
         self._latest_x = 0.0
+        capacity = max(
+            configuration.read_chunk_size,
+            int(math.ceil(configuration.sample_rate_hz * configuration.rolling_window_seconds)),
+        )
         legend_entries = []
         for index, channel in enumerate(configuration.channels):
             color = colors_by_name.get(channel.name, stream_signal_color(index))
-            style = Qt.PenStyle.DashLine if channel.kind == "digital" else Qt.PenStyle.SolidLine
-            pen = pg.mkPen(color=color, width=2.2, style=style)
+            pen = pg.mkPen(color=color, width=2.2, style=Qt.PenStyle.SolidLine)
             display_name = f"{channel.name} ({channel.unit})"
             self._curves[channel.name] = self._plot.plot([], [], pen=pen)
-            self._x_values[channel.name] = []
-            self._y_values[channel.name] = []
-            legend_entries.append((display_name, color, channel.kind == "digital"))
+            self._buffers[channel.name] = RollingStreamBuffer(capacity)
+            legend_entries.append((display_name, color, False))
         self._legend.set_entries(legend_entries)
         self._apply_y_range(configuration.channels)
+        self._plot.getPlotItem().setDownsampling(auto=True, mode="peak")
+        self._plot.getPlotItem().setClipToView(True)
         self._plot.setXRange(0, configuration.rolling_window_seconds, padding=0)
 
     def clear(self) -> None:
         for channel_name, curve in self._curves.items():
-            self._x_values[channel_name] = []
-            self._y_values[channel_name] = []
+            self._buffers[channel_name].clear()
             curve.setData([], [])
         self._latest_x = 0.0
         self._plot.setXRange(0, self._configuration.rolling_window_seconds, padding=0)
@@ -104,23 +111,14 @@ class _NidaqRollingPlot(QWidget):
             values = block.values.get(channel.name)
             if not values:
                 continue
-            x_values = self._x_values.setdefault(channel.name, [])
-            y_values = self._y_values.setdefault(channel.name, [])
             first_sample = block.sample_index / block.sample_rate_hz
-            x_values.extend(first_sample + index / block.sample_rate_hz for index in range(len(values)))
-            y_values.extend(values)
-            self._latest_x = max(self._latest_x, x_values[-1])
+            x_values = first_sample + np.arange(len(values), dtype=np.float64) / block.sample_rate_hz
+            self._buffers[channel.name].append(x_values, values)
+            self._latest_x = max(self._latest_x, float(x_values[-1]))
 
-        cutoff = max(0.0, self._latest_x - self._configuration.rolling_window_seconds)
+    def redraw(self) -> None:
         for channel_name, curve in self._curves.items():
-            x_values = self._x_values[channel_name]
-            y_values = self._y_values[channel_name]
-            trim = 0
-            while trim < len(x_values) and x_values[trim] < cutoff:
-                trim += 1
-            if trim:
-                del x_values[:trim]
-                del y_values[:trim]
+            x_values, y_values = self._buffers[channel_name].ordered()
             curve.setData(x_values, y_values)
 
         x_min = max(0.0, self._latest_x - self._configuration.rolling_window_seconds)
@@ -149,6 +147,8 @@ class AnalysisContent(ContentWidget):
         self._signal_colors: Dict[str, Tuple[int, int, int]] = {}
         self._channel_colors_by_name: Dict[str, Tuple[int, int, int]] = {}
         self._selector_signature = None
+        self._pending_blocks: Deque[NidaqSignalSampleBlock] = deque(maxlen=64)
+        self._pending_blocks_lock = threading.Lock()
 
         header_layout = QHBoxLayout()
         header_layout.setContentsMargins(0, 0, 0, 0)
@@ -180,6 +180,7 @@ class AnalysisContent(ContentWidget):
         self._signal_layout.setSpacing(6)
         self._signal_scroll.setWidget(self._signal_widget)
         self._content_tabs.addTab(self._signal_scroll, "Signals")
+        self._content_tabs.currentChanged.connect(self._redraw_visible_stream)
         self._card_widget.setContentWidget(self._content_tabs)
 
         footer = QWidget()
@@ -188,10 +189,20 @@ class AnalysisContent(ContentWidget):
         footer_layout.setSpacing(8)
         self._start_stop_button = QPushButton("Start Stream")
         self._clear_button = QPushButton("Clear")
+        self._graph_width = QSpinBox()
+        self._graph_width.setRange(320, 2400)
+        self._graph_width.setValue(640)
+        self._graph_width.setSuffix(" px wide")
+        self._graph_height = QSpinBox()
+        self._graph_height.setRange(160, 1400)
+        self._graph_height.setValue(280)
+        self._graph_height.setSuffix(" px high")
         self._status_label = QLabel("NI-DAQ signal stream disabled")
         self._status_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         footer_layout.addWidget(self._start_stop_button)
         footer_layout.addWidget(self._clear_button)
+        footer_layout.addWidget(self._graph_width)
+        footer_layout.addWidget(self._graph_height)
         footer_layout.addWidget(self._status_label)
         self._card_widget.footer.setContent(footer)
 
@@ -207,9 +218,17 @@ class AnalysisContent(ContentWidget):
         app_model.laser.property_changed += self._laser_property_changed
         self._start_stop_button.clicked.connect(self._toggle_stream)
         self._clear_button.clicked.connect(self._rolling_plot.clear)
+        self._graph_width.valueChanged.connect(self._rolling_plot.setMinimumWidth)
+        self._graph_height.valueChanged.connect(self._rolling_plot.setMinimumHeight)
+        self._rolling_plot.setMinimumSize(self._graph_width.value(), self._graph_height.value())
+        self._plot_timer = QTimer(self)
+        self._plot_timer.setInterval(33)
+        self._plot_timer.timeout.connect(self._flush_pending_blocks)
+        self._plot_timer.start()
         self._refresh_from_model()
 
     def on_close(self):
+        self._plot_timer.stop()
         self._nidaq_signal_monitor.sample_block_received -= self._sample_block_received
         self._nidaq_signal_monitor.property_changed -= self._model_property_changed
         self._app_model.configuration_loaded_event -= self._configuration_loaded
@@ -225,11 +244,26 @@ class AnalysisContent(ContentWidget):
         self._refresh_from_model()
 
     def use_cache(self) -> None:
-        """Retained for MainContent's periodic refresh loop; stream samples arrive via model events."""
+        """Drain buffered stream samples on the application's display cadence."""
+        self._flush_pending_blocks()
 
-    @invoke_method
     def _sample_block_received(self, block: NidaqSignalSampleBlock) -> None:
-        self._rolling_plot.append(block)
+        with self._pending_blocks_lock:
+            self._pending_blocks.append(block)
+
+    def _flush_pending_blocks(self) -> None:
+        with self._pending_blocks_lock:
+            blocks = tuple(self._pending_blocks)
+            self._pending_blocks.clear()
+        if not blocks:
+            return
+        for block in blocks:
+            self._rolling_plot.append(block)
+        self._redraw_visible_stream()
+
+    def _redraw_visible_stream(self, *_args) -> None:
+        if self.isVisible() and self._content_tabs.currentWidget() is self._rolling_plot:
+            self._rolling_plot.redraw()
 
     @invoke_method
     def _model_property_changed(self, _name: str, _value, _old_value) -> None:
@@ -288,16 +322,11 @@ class AnalysisContent(ContentWidget):
             self._recording_label.setText("off" if not configuration.record_to_acquisition else "waiting")
         else:
             self._recording_label.setText(recording_path.name)
-        error_message = model.error_message
-        if error_message:
-            self._status_label.setText(error_message)
-            self._status_label.setStyleSheet("color: #b00020;")
+        if not model.hardware_enabled:
+            self._status_label.setText("NI-DAQ hardware is disabled")
         else:
-            if not model.hardware_enabled:
-                self._status_label.setText("NI-DAQ hardware is disabled")
-            else:
-                self._status_label.setText(model.status_message)
-            self._status_label.setStyleSheet("")
+            self._status_label.setText(model.status_message)
+        self._status_label.setStyleSheet("")
 
     def _rebuild_signal_selector(self) -> None:
         while self._signal_layout.count():
