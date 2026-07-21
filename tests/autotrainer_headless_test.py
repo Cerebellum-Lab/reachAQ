@@ -17,6 +17,7 @@ from autotrainer.behavior import BehaviorAlgorithm
 from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
 from autotrainer.core import SystemConfiguration, CameraConfiguration, CameraId
 from autotrainer.video import VideoRecordMode
+from autotrainer.inference import GpuRuntimeStatus
 from tools.acquisition.model.app_model import AppModel
 from tools.acquisition.model.app_model_status import AppModelStatus
 from tools.acquisition.model.user_preferences import UserPreferences
@@ -150,6 +151,58 @@ def test_start_stop(app_model, settings_ini_path):
     app_model.on_close()
     assert settings_ini_path.exists()  # but saved on close
     # ...
+
+
+def test_gpu_preflight_fails_before_cameras_and_hardware(
+    app_model,
+    system_config,
+    trainer_config_dir,
+    monkeypatch,
+):
+    system_config.inference.is_enabled = True
+    for camera in system_config.cameras:
+        if camera.id in CameraId.reach_camera_ids():
+            camera.is_enabled = True
+    system_config.save_default(trainer_config_dir)
+    assert app_model.load_configuration() is True
+
+    monkeypatch.setattr(
+        app_model.inference,
+        "check_live_inference_runtime",
+        lambda: GpuRuntimeStatus(
+            False,
+            backend="nvidia-driver",
+            error="active kernel driver is nouveau",
+        ),
+    )
+
+    def unexpected_hardware_start(*_args, **_kwargs):
+        raise AssertionError("hardware must not start after a failed GPU preflight")
+
+    monkeypatch.setattr(app_model.hardware, "connect", unexpected_hardware_start)
+    for camera in app_model.cameras:
+        monkeypatch.setattr(camera, "on_prepare_capture", unexpected_hardware_start)
+
+    assert app_model.capture_start() is False
+    assert app_model.acquisition_started is False
+
+
+def test_live_inference_override_is_not_persisted_with_other_configuration_changes(
+    app_model,
+    system_config,
+    trainer_config_dir,
+):
+    system_config.inference.is_enabled = True
+    system_config.save_default(trainer_config_dir)
+    assert app_model.load_configuration() is True
+
+    app_model.set_runtime_live_inference_override(False)
+    app_model.inference.model_location = "updated-model-location"
+
+    saved = app_model._create_configuration()
+    assert app_model.inference.is_enabled is False
+    assert saved.inference.is_enabled is True
+    assert saved.inference.pose_model_location == "updated-model-location"
 
 
 def test_cli_help():

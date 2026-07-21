@@ -54,7 +54,7 @@ from autotrainer.core.interfaces import RecordingEndingReason, CaptureAnalysisRe
 from autotrainer.core.project import ProjectInfo, ProjectDependentProtocol
 from autotrainer.core.configuration import SystemConfigurationDumper, DEFAULT_3D_CALIB_DIR_NAME
 from autotrainer.core.multiproc import no_op_timer
-from autotrainer.core.logging import get_verbose_logger, set_log_location
+from autotrainer.core.logging import get_verbose_logger, log_hardware_initialization, set_log_location
 from autotrainer.core.multiproc import get_mp_ctx, make_daemon_timer, DaemonTimer
 from autotrainer.core.pose_elements import SceneElement
 from autotrainer.core.project.project_info import DATE_TIME_FORMAT
@@ -274,6 +274,7 @@ class AppModel(ObservableObject):
         self._loaded_configuration: Optional[SystemConfiguration] = None
         self._loaded_config_dir_path = Path()
         self._loaded_configuration_has_runtime_override = False
+        self._runtime_live_inference_override: Optional[bool] = None
         self._nidaq_ports = NidaqPortConfiguration()
 
         self._output_location = PersistenceConfiguration.get_default_output_path().as_posix()
@@ -1080,25 +1081,42 @@ class AppModel(ObservableObject):
         message = "Hardware refresh: " + ", ".join(details)
         if warnings_list:
             warning_text = "; ".join(warnings_list)
-            logger.warning("%s; warnings: %s", message, warning_text)
+            log_hardware_initialization(
+                logger,
+                "WARNING | hardware refresh | %s; warnings: %s",
+                message,
+                warning_text,
+                level=logging.WARNING,
+            )
             return f"{message}; warnings: {warning_text}"
-        logger.notice(message)
+        log_hardware_initialization(logger, "READY | hardware refresh | %s", message)
         return message
 
     def _scan_can_pellet_hardware(self, warnings_list: List[str]) -> str:
         hardware = self._hardware
         if not hardware.can_enabled and not hardware.pellet_controller_enabled:
+            log_hardware_initialization(logger, "SKIP | CAN/pellet discovery | disabled")
             return "CAN/pellet not in use"
         if not hardware.can_enabled:
+            log_hardware_initialization(logger, "SKIP | CAN/pellet discovery | CAN disabled")
             return "CAN not in use"
         if not hardware.pellet_controller_enabled:
+            log_hardware_initialization(logger, "SKIP | CAN/pellet discovery | pellet controller disabled")
             return "pellet controller not in use"
         if hardware.connected:
+            log_hardware_initialization(logger, "READY | CAN/pellet discovery | already connected")
             return "CAN/pellet connected"
 
         interface = None
+        started = time.perf_counter()
         try:
             transport = CanTransportConfiguration.from_environment()
+            log_hardware_initialization(
+                logger,
+                "START | CAN/pellet discovery | transport=%s channel=%s",
+                transport.kind.value,
+                transport.channel,
+            )
             interface = CanInterface(
                 required_targets=(Target.PELLET_DEVICE,),
                 can_transport=transport,
@@ -1107,16 +1125,44 @@ class AppModel(ObservableObject):
                 warnings_list.append(
                     f"CAN transport did not open: {transport.kind.value} {transport.channel}"
                 )
-                return "CAN unavailable"
+                result = "CAN unavailable"
+                log_hardware_initialization(
+                    logger,
+                    "UNAVAILABLE | CAN/pellet discovery | result=%s elapsed=%.3fs",
+                    result,
+                    time.perf_counter() - started,
+                )
+                return result
             if not interface.are_addresses_valid():
                 warnings_list.append(
                     f"pellet CAN board not discovered on {transport.kind.value} {transport.channel}"
                 )
-                return "CAN open, pellet missing"
-            return f"CAN/pellet found {interface.pellet_address}"
+                result = "CAN open, pellet missing"
+                log_hardware_initialization(
+                    logger,
+                    "UNAVAILABLE | CAN/pellet discovery | result=%s elapsed=%.3fs",
+                    result,
+                    time.perf_counter() - started,
+                )
+                return result
+            result = f"CAN/pellet found {interface.pellet_address}"
+            log_hardware_initialization(
+                logger,
+                "READY | CAN/pellet discovery | result=%s elapsed=%.3fs",
+                result,
+                time.perf_counter() - started,
+            )
+            return result
         except Exception as exc:
             logger.exception("Hardware refresh CAN/pellet scan failed")
             warnings_list.append(f"CAN/pellet scan failed: {str(exc) or exc.__class__.__name__}")
+            log_hardware_initialization(
+                logger,
+                "FAILED | CAN/pellet discovery | elapsed=%.3fs error=%s",
+                time.perf_counter() - started,
+                str(exc) or exc.__class__.__name__,
+                level=logging.ERROR,
+            )
             return "CAN/pellet scan failed"
         finally:
             if interface is not None:
@@ -1483,6 +1529,13 @@ class AppModel(ObservableObject):
         wait_connected: bool = True,
     ) -> bool:
         """Request to start the acquisition"""
+        hardware_init_started = time.perf_counter()
+        log_hardware_initialization(
+            logger,
+            "START | acquisition hardware | target_status=%s wait_connected=%s",
+            target_status.value,
+            wait_connected,
+        )
         if target_status == AppModelStatus.IDLE:
             raise ValueError("AppModelStatus.IDLE not accepted as target for capture_start")
         with self.app_lock:
@@ -1503,6 +1556,23 @@ class AppModel(ObservableObject):
             self._acquisition_starting = True
             self._start_count += 1
             is_first_start = self._start_count == 1
+
+        if self._inference.is_enabled:
+            runtime_check = getattr(self._inference, "check_live_inference_runtime", None)
+            if callable(runtime_check):
+                gpu_status = runtime_check()
+                if not gpu_status.is_available:
+                    message = (
+                        "Live inference cannot start because a compatible TensorFlow GPU runtime was not found. "
+                        "No cameras or acquisition hardware were started. Disable Live inference in Preferences "
+                        "or launch with --no-live-inference to run without inference.\n\n"
+                        f"{gpu_status.error}"
+                    )
+                    logger.error(message)
+                    self.on_error("Live inference unavailable", message)
+                    with self.app_lock:
+                        self._acquisition_starting = False
+                    return False
 
         algo = self._behavior.algorithm
         analysis = self._analysis
@@ -1576,11 +1646,28 @@ class AppModel(ObservableObject):
         #
         synced_cameras = self._ordered_reach_cameras(enabled_only=True)  # normally/usually left cam is primary
         did_start = True
+        camera_init_started = {}
+        for camera in self._cameras:
+            if not camera.is_enabled:
+                log_hardware_initialization(
+                    logger,
+                    "SKIP | camera | name=%s disabled",
+                    camera.name,
+                )
 
         # 1) prepare synced primary camera(s)
         if did_start:
             for camera in synced_cameras:
                 if camera.is_primary and camera.is_enabled:
+                    camera_init_started[camera] = time.perf_counter()
+                    log_hardware_initialization(
+                        logger,
+                        "START | camera process | name=%s primary=true source=%s shape=%s inference_index=%s",
+                        camera.name,
+                        camera.camera_source.url,
+                        camera.shape,
+                        inference_camera_indices.get(camera),
+                    )
                     logger.info("Preparing capture on %s", camera.name)
                     inference_index = inference_camera_indices.get(camera)
                     did_start = camera.on_prepare_capture(
@@ -1598,12 +1685,28 @@ class AppModel(ObservableObject):
                         did_start = False
                         self.on_error("Camera start failed", _failed_camera_template(camera.name, camera.last_error))
                         break
+                    log_hardware_initialization(
+                        logger,
+                        "READY | camera process | name=%s status=%s elapsed=%.3fs",
+                        camera.name,
+                        camera.video_status.name,
+                        time.perf_counter() - camera_init_started[camera],
+                    )
 
         # 2) prepare synced non-primary camera(s)
         if did_start:
             time.sleep(0.5)
             for camera in synced_cameras:
                 if not camera.is_primary and camera.is_enabled:
+                    camera_init_started[camera] = time.perf_counter()
+                    log_hardware_initialization(
+                        logger,
+                        "START | camera process | name=%s primary=false source=%s shape=%s inference_index=%s",
+                        camera.name,
+                        camera.camera_source.url,
+                        camera.shape,
+                        inference_camera_indices.get(camera),
+                    )
                     logger.info("Preparing capture on %s", camera.name)
                     inference_index = inference_camera_indices.get(camera)
                     did_start = camera.on_prepare_capture(
@@ -1628,6 +1731,13 @@ class AppModel(ObservableObject):
                         self.on_error("Camera start failed", _failed_camera_template(camera.name, camera.last_error))
                         break
                     logger.verbose("%s now running", camera.name)
+                    log_hardware_initialization(
+                        logger,
+                        "READY | camera process | name=%s status=%s elapsed=%.3fs",
+                        camera.name,
+                        camera.video_status.name,
+                        time.perf_counter() - camera_init_started[camera],
+                    )
 
         # 4) trigger enable capture on synced cameras
         if did_start:
@@ -1636,6 +1746,7 @@ class AppModel(ObservableObject):
                 if not camera.is_primary and camera.is_enabled:
                     logger.info("Starting capture on %s", camera.name)
                     camera.on_capture_start()
+                    log_hardware_initialization(logger, "READY | camera capture enabled | name=%s", camera.name)
             # small delay to ensure not-primary cam(s) are waiting on primary:
             time.sleep(0.5)
             # 4.2) then on primary
@@ -1643,6 +1754,7 @@ class AppModel(ObservableObject):
                 if camera.is_primary and camera.is_enabled:
                     logger.info("Starting capture on %s", camera.name)
                     camera.on_capture_start()
+                    log_hardware_initialization(logger, "READY | camera capture enabled | name=%s", camera.name)
 
         # sleep, relatively a bit, to give more time to synced cameras to start together
         time.sleep(1.5)
@@ -1650,6 +1762,14 @@ class AppModel(ObservableObject):
         # 5) remaining non-synced camera(s)
         camera = self._top_camera
         if did_start and camera.is_enabled:
+            camera_started = time.perf_counter()
+            log_hardware_initialization(
+                logger,
+                "START | camera process | name=%s primary=false source=%s shape=%s inference_index=None",
+                camera.name,
+                camera.camera_source.url,
+                camera.shape,
+            )
             logger.info("Preparing capture on %s", camera.name)
             did_start = camera.on_prepare_capture()
             if not did_start:
@@ -1664,6 +1784,13 @@ class AppModel(ObservableObject):
                     self.on_error("Camera start failed", _failed_camera_template(camera.name, camera.last_error))
                 else:
                     camera.on_capture_start()
+                    log_hardware_initialization(
+                        logger,
+                        "READY | camera process and capture | name=%s status=%s elapsed=%.3fs",
+                        camera.name,
+                        camera.video_status.name,
+                        time.perf_counter() - camera_started,
+                    )
 
         if not did_start:
             logger.error("failed to start all subprocesses")
@@ -1674,6 +1801,7 @@ class AppModel(ObservableObject):
         # so that any movement pre-applied should be visible on camera(s).
         logger.debug("connecting hardware ...")
         hard = self._hardware
+        controller_started = time.perf_counter()
         hard.connect(self._system_message_handler.input_queue)
         # hard.set_auto_correct_motor_drift(algo.auto_correct_motors_drift)  # disabled
         if wait_connected and hard.requires_connection:
@@ -1701,6 +1829,13 @@ class AppModel(ObservableObject):
                     return False
                 time.sleep(0.05)
         logger.info("finished connecting hardware")
+        log_hardware_initialization(
+            logger,
+            "READY | hardware connection gate | required=%s connected=%s elapsed=%.3fs",
+            hard.requires_connection,
+            hard.connected,
+            time.perf_counter() - controller_started,
+        )
         #
         watchdog_mon_register = self._analysis.watchdog_monitor.register_watchdog
         watchdog_mon_register(WatchdogItems.DEVICE_READER, lambda: self._hardware.watchdog_reader_perf_c)
@@ -1716,7 +1851,9 @@ class AppModel(ObservableObject):
             watchdog_mon_register("test-watchdog", lambda t=time.perf_counter() + 180: fake_watchdog(t))
 
         # we always be/go at home on acquisition start, so:
+        log_hardware_initialization(logger, "START | pellet home command")
         self._behavior.system_machine.pellet.move_home(force=True)
+        log_hardware_initialization(logger, "QUEUED | pellet home command")
 
         # once cameras successfully started:
         self._save_project_metadata(project_info, when=datetime.now(), session=None, caller="capture_start")
@@ -1758,6 +1895,13 @@ class AppModel(ObservableObject):
         )
 
         self.check_max_pellet_loaded()
+
+        log_hardware_initialization(
+            logger,
+            "READY | acquisition hardware | status=%s elapsed=%.3fs",
+            target_status.value,
+            time.perf_counter() - hardware_init_started,
+        )
 
         return True
 
@@ -1873,6 +2017,13 @@ class AppModel(ObservableObject):
         if location is None:
             location = self.get_config_location()
 
+        config_started = time.perf_counter()
+        log_hardware_initialization(
+            logger,
+            "START | hardware configuration | path=%s random_cameras=%s",
+            location,
+            random_cameras,
+        )
         configuration: SystemConfiguration = self.get_config_from_location(location)
         if random_cameras:
             logger.notice("Using random camera override for this run")
@@ -1912,10 +2063,29 @@ class AppModel(ObservableObject):
 
         for camera, camera_config in reach_camera_configs:
             camera.load_configuration(camera_config)
+            log_hardware_initialization(
+                logger,
+                "CONFIGURED | camera | name=%s enabled=%s primary=%s source=%s shape=%s fps=%s",
+                camera.name,
+                camera_config.is_enabled,
+                camera_config.params.get("primary", "no"),
+                camera.camera_source.url,
+                camera.shape,
+                camera_config.params.get("fps"),
+            )
         self._ensure_reach_primary_camera()
 
         if (camera := configuration.get_camera(CameraId.Web)) is not None:
             self._top_camera.load_configuration(camera)
+            log_hardware_initialization(
+                logger,
+                "CONFIGURED | camera | name=%s enabled=%s primary=false source=%s shape=%s fps=%s",
+                self._top_camera.name,
+                camera.is_enabled,
+                self._top_camera.camera_source.url,
+                self._top_camera.shape,
+                camera.params.get("fps"),
+            )
 
         if prebuffer_duration > 0:
             prebuffer_scale = os.getenv("AUTOTRAINER_PREBUFFER_SCALE")
@@ -1928,7 +2098,21 @@ class AppModel(ObservableObject):
         self._behavior.algorithm.record_prebuffer_duration = prebuffer_duration
 
         self._hardware.load_config(configuration.hardware)
+        log_hardware_initialization(
+            logger,
+            "CONFIGURED | hardware flags | CAN=%s pellet_controller=%s NI-DAQ=%s tunnel_headfix=%s",
+            configuration.hardware.can_enabled,
+            configuration.hardware.pellet_controller_enabled,
+            configuration.hardware.nidaq_enabled,
+            configuration.hardware.tunnel_headfix_enabled,
+        )
         self.inference.load_configuration(configuration.inference)
+        log_hardware_initialization(
+            logger,
+            "CONFIGURED | live inference | enabled=%s model=%s",
+            configuration.inference.is_enabled,
+            configuration.inference.pose_model_location,
+        )
         self.laser.load_configuration(configuration.laser)
         self._nidaq_ports = configuration.nidaq_ports
         self.nidaq_signal_monitor.load_configuration(configuration.nidaq_stream)
@@ -1939,6 +2123,7 @@ class AppModel(ObservableObject):
         self._loaded_configuration = configuration
         self._loaded_config_dir_path = location.parent.resolve()
         self._loaded_configuration_has_runtime_override = random_cameras
+        self._runtime_live_inference_override = None
 
         # only at the end:
         self.output_location = configuration.persistence.output_location
@@ -1949,6 +2134,12 @@ class AppModel(ObservableObject):
         self._load_animals()
 
         self.configuration_loaded_event(configuration)
+
+        log_hardware_initialization(
+            logger,
+            "READY | hardware configuration | elapsed=%.3fs",
+            time.perf_counter() - config_started,
+        )
 
         return True
 
@@ -1976,12 +2167,21 @@ class AppModel(ObservableObject):
             # so we won't overwrite the (currently) bad user config file with one having all defaults.
             return
         if self._loaded_configuration_has_runtime_override:
-            logger.info("Skipping configuration save because this run used runtime camera overrides")
+            logger.info("Skipping configuration save because this run used runtime camera source overrides")
             return
         loc = self._preferences.configuration_location
         logger.info("Saving configuration to %s", loc)
         conf = self._create_configuration()
         conf.save_default(loc)
+
+    def set_runtime_live_inference_override(self, enabled: bool) -> None:
+        """Override configured live inference without persisting the CLI choice."""
+        if self._loaded_configuration is None:
+            raise RuntimeError("Cannot override live inference before configuration is loaded")
+        enabled = bool(enabled)
+        self._inference.is_enabled = enabled
+        self._runtime_live_inference_override = enabled
+        logger.notice("Runtime live inference override: enabled=%s", enabled)
 
     def update_daq_port_configuration(
         self,
@@ -2466,9 +2666,13 @@ class AppModel(ObservableObject):
         for camera in self._cameras:
             cameras.append(camera.save_configuration())
 
+        inference_configuration = self._inference.save_configuration()
+        if self._runtime_live_inference_override is not None and self._loaded_configuration is not None:
+            inference_configuration.is_enabled = self._loaded_configuration.inference.is_enabled
+
         configuration = SystemConfiguration(cameras=cameras,
                                             hardware=hardware_configuration,
-                                            inference=self._inference.save_configuration(),
+                                            inference=inference_configuration,
                                             laser=self._laser.save_configuration(),
                                             nidaq_ports=self._nidaq_ports,
                                             nidaq_stream=self._nidaq_signal_monitor.save_configuration(),

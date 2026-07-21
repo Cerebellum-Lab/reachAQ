@@ -16,11 +16,12 @@ from autotrainer.core import FixedArrayMultiQueue, ProjectInfo, EventManager, cl
     InferenceConfiguration, Offset3DTuple, ApiEventKind
 from autotrainer.core.project import ProjectDependentProtocol
 from autotrainer.core.multiproc import get_mp_ctx, pool_init
-from autotrainer.core.logging import get_verbose_logger, make_log_dict_config
+from autotrainer.core.logging import get_verbose_logger, log_hardware_initialization, make_log_dict_config
 from autotrainer.core.pose_elements import SceneElement, AllHandsParts
 
-from autotrainer.inference import PoseProcess, InferenceCommandMessageKind, InferenceStatusMessageKind, PoseAlgorithm, \
-    InferenceMode, InferenceStatus, InferenceMonitorDataMsg, detect_gpu_runtime
+from autotrainer.inference import GpuRuntimeStatus, PoseProcess, InferenceCommandMessageKind, \
+    InferenceStatusMessageKind, PoseAlgorithm, InferenceMode, InferenceStatus, \
+    InferenceMonitorDataMsg, detect_gpu_runtime
 from autotrainer.inference.pose_result_process import InferenceMonitorDataProc
 from autotrainer.inference.analysis import intersession_process, IntersessionResponse
 
@@ -82,6 +83,7 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
         self._pose_process: Optional[PoseProcess] = None
         self._is_predict_enabled = True
         self._status = InferenceStatus.stopped
+        self._gpu_runtime_status: Optional[GpuRuntimeStatus] = None
 
         self._frames_per_camera = 0
         self._frame_width = 1
@@ -245,8 +247,22 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
 
     def start(self, live_queue: FixedArrayMultiQueue) -> bool:
 
-        if not self._can_start_live_inference():
+        started = time.perf_counter()
+        log_hardware_initialization(
+            logger,
+            "START | live inference | model=%s frames_per_camera=%s shape=%s",
+            self._model_location,
+            live_queue.frames_per_camera,
+            live_queue.shape,
+        )
+
+        if not self.can_start_live_inference():
             self._set_status(InferenceStatus.stopped)
+            log_hardware_initialization(
+                logger,
+                "FAILED | live inference | GPU unavailable elapsed=%.3fs",
+                time.perf_counter() - started,
+            )
             return False
 
         if self._process_pool is None:
@@ -299,11 +315,23 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
         )
         proc.start()
 
+        log_hardware_initialization(
+            logger,
+            "READY | live inference processes started | elapsed=%.3fs",
+            time.perf_counter() - started,
+        )
+
         return True
 
-    @staticmethod
-    def _can_start_live_inference() -> bool:
-        gpu_status = detect_gpu_runtime()
+    def check_live_inference_runtime(self, *, force_refresh: bool = False) -> GpuRuntimeStatus:
+        if force_refresh or self._gpu_runtime_status is None:
+            # The configured DeepLabCut model uses the TensorFlow backend. A
+            # working PyTorch CUDA installation alone is not sufficient.
+            self._gpu_runtime_status = detect_gpu_runtime(required_backend="tensorflow")
+        return self._gpu_runtime_status
+
+    def can_start_live_inference(self) -> bool:
+        gpu_status = self.check_live_inference_runtime()
         if gpu_status.is_available:
             logger.info("Live inference GPU runtime available via %s: %s",
                         gpu_status.backend, gpu_status.devices)
