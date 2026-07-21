@@ -15,6 +15,7 @@ import threading
 import sys
 import time
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from datetime import datetime, timezone, date, timedelta
 from pathlib import Path
@@ -72,7 +73,6 @@ from autotrainer.inference.config import load_calib_stereo_params
 from autotrainer.inference.analysis.prepare_jetson_data import DEFAULT_CAM_OFFSET_FILE_NAME
 
 from autotrainer.core.capture import CaptureProcessStatus
-from autotrainer.device import CanInterface, CanTransportConfiguration, Target
 
 from autotrainer.behavior.behavior_algorithm import BehaviorAlgoProps, BehaviorAlgoStatus
 from autotrainer.behavior import IntersessionState, BehaviorAlgorithm, TrainingMode, InferenceProtocol, SystemMachine, \
@@ -94,7 +94,8 @@ from tools.acquisition.model.helpers import get_config_location
 from tools.acquisition.model.hardware_model import HardwareModel
 from tools.acquisition.model.inference_model import InferenceModel
 from tools.acquisition.model.laser_model import LaserModel
-from tools.acquisition.model.hardware_scan import HardwareScanEntry
+from autotrainer.device import CanTransportConfiguration
+from tools.acquisition.model.hardware_scan import HardwareScanEntry, scan_can_adapters, scan_gpus
 from tools.acquisition.model.nidaq_discovery import device_name_from_channel, discover_nidaq_devices
 from tools.acquisition.model.nidaq_signal_monitor_model import NidaqSignalMonitorModel
 from tools.acquisition.model.behavior_model import BehaviorModel
@@ -1056,12 +1057,30 @@ class AppModel(ObservableObject):
         if self._acquisition_started or self._status != AppModelStatus.IDLE:
             raise RuntimeError("Hardware refresh is only available while acquisition is idle")
 
+        scan_started = time.perf_counter()
         details: List[str] = []
         warnings_list: List[str] = []
         scan_results: Dict[str, HardwareScanEntry] = {}
+        try:
+            can_transport = CanTransportConfiguration.from_environment()
+            selected_can_interface = can_transport.channel
+            selected_can_backend = can_transport.kind.value
+        except Exception:
+            logger.exception("CAN transport selection is invalid")
+            selected_can_interface = None
+            selected_can_backend = None
+        executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="hardware-scan")
+        camera_future = executor.submit(create_camera_list, include_hardware=True)
+        nidaq_future = executor.submit(discover_nidaq_devices)
+        can_adapter_future = executor.submit(
+            scan_can_adapters,
+            selected_interface=selected_can_interface,
+            selected_backend=selected_can_backend,
+        )
+        gpu_future = executor.submit(scan_gpus)
 
         try:
-            camera_sources = create_camera_list(include_hardware=True)
+            camera_sources = camera_future.result()
             source_urls = {source.url for source in camera_sources}
             for camera in self._cameras:
                 camera.refresh_camera_list(camera_sources)
@@ -1080,13 +1099,13 @@ class AppModel(ObservableObject):
                 for source in camera_sources
                 if source.name or source.url
             )
-            camera_info = f"{len(camera_sources)} source(s) discovered"
+            camera_info = f"✓ {len(camera_sources)} camera source(s)"
             if source_names:
-                camera_info += ": " + ", ".join(source_names)
+                camera_info += "\n" + "\n".join(f"→ {name}" for name in source_names)
             if missing_enabled_cameras:
                 missing_text = ", ".join(missing_enabled_cameras)
                 warnings_list.append(f"configured camera(s) not currently discovered: {missing_text}")
-                camera_info += f"; missing configured: {missing_text}"
+                camera_info += f"\n! missing: {missing_text}"
             scan_results["cameras"] = HardwareScanEntry(
                 camera_info,
                 "warning" if missing_enabled_cameras or not camera_sources else "ok",
@@ -1098,16 +1117,19 @@ class AppModel(ObservableObject):
             scan_results["cameras"] = HardwareScanEntry(f"scan failed: {error_text}", "error")
 
         try:
-            nidaq_devices, nidaq_error = discover_nidaq_devices()
+            nidaq_devices, nidaq_error = nidaq_future.result()
             details.append(f"NI-DAQ {len(nidaq_devices)} device(s)")
             discovered_nidaq_names = {device.name for device in nidaq_devices}
-            nidaq_info = f"{len(nidaq_devices)} device(s) discovered"
-            if discovered_nidaq_names:
-                nidaq_info += ": " + ", ".join(sorted(discovered_nidaq_names))
+            nidaq_info = f"✓ {len(nidaq_devices)} NI-DAQ card(s)"
+            if nidaq_devices:
+                nidaq_info += "\n" + "\n".join(
+                    self._nidaq_device_summary(device)
+                    for device in nidaq_devices
+                )
             nidaq_state = "ok" if nidaq_devices else "warning"
             if nidaq_error:
                 warnings_list.append(nidaq_error)
-                nidaq_info += f"; {nidaq_error}"
+                nidaq_info += f"\n! {nidaq_error}"
                 nidaq_state = "error"
             missing_nidaq_names = tuple(
                 name
@@ -1117,7 +1139,7 @@ class AppModel(ObservableObject):
             if self._hardware.nidaq_enabled and missing_nidaq_names:
                 missing_text = ", ".join(missing_nidaq_names)
                 warnings_list.append(f"configured NI-DAQ device(s) not discovered: {missing_text}")
-                nidaq_info += f"; missing configured: {missing_text}"
+                nidaq_info += f"\n! missing: {missing_text}"
                 if nidaq_state != "error":
                     nidaq_state = "warning"
             elif self._hardware.nidaq_enabled and not nidaq_devices:
@@ -1129,11 +1151,30 @@ class AppModel(ObservableObject):
             warnings_list.append(f"NI-DAQ scan failed: {error_text}")
             scan_results["nidaq"] = HardwareScanEntry(f"scan failed: {error_text}", "error")
 
-        can_pellet_info = self._scan_can_pellet_hardware(warnings_list)
-        details.append(can_pellet_info)
-        can_pellet_state = self._scan_result_state(can_pellet_info)
-        scan_results["can"] = HardwareScanEntry(can_pellet_info, can_pellet_state)
-        scan_results["pellet"] = HardwareScanEntry(can_pellet_info, can_pellet_state)
+        try:
+            can_adapter_entry = can_adapter_future.result()
+        except Exception as exc:
+            logger.exception("Hardware refresh CAN adapter scan failed")
+            error_text = str(exc) or exc.__class__.__name__
+            can_adapter_entry = HardwareScanEntry(f"adapter scan failed: {error_text}", "error")
+            warnings_list.append(f"CAN adapter scan failed: {error_text}")
+        finally:
+            executor.shutdown(wait=True)
+        scan_results["can"] = can_adapter_entry
+        details.append(can_adapter_entry.info.splitlines()[0])
+
+        try:
+            gpu_entry = gpu_future.result()
+        except Exception as exc:
+            logger.exception("Hardware refresh GPU scan failed")
+            gpu_entry = HardwareScanEntry(f"! GPU scan failed\n→ {str(exc) or exc.__class__.__name__}", "error")
+            warnings_list.append(f"GPU scan failed: {str(exc) or exc.__class__.__name__}")
+        scan_results["gpu"] = gpu_entry
+        details.append(gpu_entry.info.splitlines()[0])
+
+        pellet_entry = self._pellet_controller_snapshot(can_adapter_entry)
+        scan_results["pellet"] = pellet_entry
+        details.append(pellet_entry.info)
 
         laser_configuration = self._laser.configuration
         if laser_configuration.backend == "disabled":
@@ -1161,7 +1202,10 @@ class AppModel(ObservableObject):
             previous_scan_results,
         )
 
-        message = "Hardware refresh: " + ", ".join(details)
+        message = (
+            f"Hardware refresh completed in {time.perf_counter() - scan_started:.2f}s: "
+            + ", ".join(details)
+        )
         if warnings_list:
             warning_text = "; ".join(warnings_list)
             log_hardware_initialization(
@@ -1175,95 +1219,30 @@ class AppModel(ObservableObject):
         log_hardware_initialization(logger, "READY | hardware refresh | %s", message)
         return message
 
-    @staticmethod
-    def _scan_result_state(result: str) -> str:
-        normalized = result.lower()
-        if "failed" in normalized:
-            return "error"
-        if "unavailable" in normalized or "missing" in normalized:
-            return "warning"
-        if "not in use" in normalized or "disabled" in normalized:
-            return "disabled"
-        return "ok"
-
-    def _scan_can_pellet_hardware(self, warnings_list: List[str]) -> str:
+    def _pellet_controller_snapshot(self, adapter: HardwareScanEntry) -> HardwareScanEntry:
         hardware = self._hardware
-        if not hardware.can_enabled and not hardware.pellet_controller_enabled:
-            log_hardware_initialization(logger, "SKIP | CAN/pellet discovery | disabled")
-            return "CAN/pellet not in use"
-        if not hardware.can_enabled:
-            log_hardware_initialization(logger, "SKIP | CAN/pellet discovery | CAN disabled")
-            return "CAN not in use"
-        if not hardware.pellet_controller_enabled:
-            log_hardware_initialization(logger, "SKIP | CAN/pellet discovery | pellet controller disabled")
-            return "pellet controller not in use"
+        if not hardware.can_enabled or not hardware.pellet_controller_enabled:
+            return HardwareScanEntry("– not in use", "disabled")
         if hardware.connected:
-            log_hardware_initialization(logger, "READY | CAN/pellet discovery | already connected")
-            return "CAN/pellet connected"
+            return HardwareScanEntry("✓ controller session connected", "ok")
+        if adapter.state != "ok":
+            return HardwareScanEntry(
+                "! not probed\n  ↳ CAN adapter not ready",
+                "warning",
+            )
+        return HardwareScanEntry(
+            "→ idle\n  ↳ controller connection starts with acquisition",
+            "idle",
+        )
 
-        interface = None
-        started = time.perf_counter()
-        try:
-            transport = CanTransportConfiguration.from_environment()
-            log_hardware_initialization(
-                logger,
-                "START | CAN/pellet discovery | transport=%s channel=%s",
-                transport.kind.value,
-                transport.channel,
-            )
-            interface = CanInterface(
-                required_targets=(Target.PELLET_DEVICE,),
-                can_transport=transport,
-            )
-            if not interface.open():
-                warnings_list.append(
-                    f"CAN transport did not open: {transport.kind.value} {transport.channel}"
-                )
-                result = "CAN unavailable"
-                log_hardware_initialization(
-                    logger,
-                    "UNAVAILABLE | CAN/pellet discovery | result=%s elapsed=%.3fs",
-                    result,
-                    time.perf_counter() - started,
-                )
-                return result
-            if not interface.are_addresses_valid():
-                warnings_list.append(
-                    f"pellet CAN board not discovered on {transport.kind.value} {transport.channel}"
-                )
-                result = "CAN open, pellet missing"
-                log_hardware_initialization(
-                    logger,
-                    "UNAVAILABLE | CAN/pellet discovery | result=%s elapsed=%.3fs",
-                    result,
-                    time.perf_counter() - started,
-                )
-                return result
-            result = f"CAN/pellet found {interface.pellet_address}"
-            log_hardware_initialization(
-                logger,
-                "READY | CAN/pellet discovery | result=%s elapsed=%.3fs",
-                result,
-                time.perf_counter() - started,
-            )
-            return result
-        except Exception as exc:
-            logger.exception("Hardware refresh CAN/pellet scan failed")
-            warnings_list.append(f"CAN/pellet scan failed: {str(exc) or exc.__class__.__name__}")
-            log_hardware_initialization(
-                logger,
-                "FAILED | CAN/pellet discovery | elapsed=%.3fs error=%s",
-                time.perf_counter() - started,
-                str(exc) or exc.__class__.__name__,
-                level=logging.ERROR,
-            )
-            return "CAN/pellet scan failed"
-        finally:
-            if interface is not None:
-                try:
-                    interface.close()
-                except Exception:
-                    logger.exception("Failed to close CAN scan interface")
+    @staticmethod
+    def _nidaq_device_summary(device) -> str:
+        identity = f"→ {device.name}"
+        if device.product_type:
+            identity += f" · {device.product_type}"
+        if device.product_number is not None:
+            identity += f" · #{device.product_number}"
+        return identity
 
     @property
     def message_handler(self) -> SystemMessageHandler:

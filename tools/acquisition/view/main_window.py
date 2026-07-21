@@ -14,7 +14,7 @@ from itertools import chain
 from pathlib import Path
 from typing import List, Optional, Dict, Tuple, Callable, Union, Literal
 
-from PySide6.QtCore import Qt, QCoreApplication, Signal, QSize, QKeyCombination
+from PySide6.QtCore import Qt, QCoreApplication, QTimer, Signal, QSize, QKeyCombination
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (QMainWindow, QStatusBar, QToolBar, QLabel, QMessageBox, QApplication,
                                QSizePolicy, QWidget, QComboBox, QLineEdit, QFileDialog, QHBoxLayout,
@@ -207,6 +207,7 @@ class MainWindow(QMainWindow):
         self._set_reset_vat_text()
         self._set_reset_cage_clean_text()
         self._set_autoclamp_evasion(analysis.autoclamp_evasion_detector)
+        QTimer.singleShot(0, self._refresh_hardware_bindings)
 
     @property
     def app_model(self) -> AppModel:
@@ -374,6 +375,10 @@ class MainWindow(QMainWindow):
             return
 
         self.refresh_hardware_action.setEnabled(False)
+        self.run_action.setEnabled(False)
+        self.animal_in_device_action.setEnabled(False)
+        self.animal_in_training_action.setEnabled(False)
+        self._app_model_status_combo.setEnabled(False)
         self._status_label.setText("Refreshing hardware...")
         self.main_content.set_hardware_refreshing(True)
         QCoreApplication.processEvents()
@@ -399,6 +404,11 @@ class MainWindow(QMainWindow):
         self.refresh_hardware_action.setEnabled(
             not self._app_model.acquisition_started and self._app_model.status == AppModelStatus.IDLE
         )
+        can_start = not self._app_model.acquisition_started and self._app_model.status == AppModelStatus.IDLE
+        self.run_action.setEnabled(can_start)
+        self.animal_in_device_action.setEnabled(can_start)
+        self.animal_in_training_action.setEnabled(can_start)
+        self._app_model_status_combo.setEnabled(can_start)
         self.statusBar().showMessage(message, 12000)
 
     def _on_system_mode_combo_changed(self, idx: int):

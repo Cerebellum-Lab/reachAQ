@@ -74,28 +74,29 @@ def create_camera_list(*, include_hardware: bool = False):
         for serial in spin_serials:
             _append_unique_camera(cameras, f"Spinnaker {serial}", f"spinnaker://{serial}")
 
-        started = time.perf_counter()
-        log_hardware_initialization(logger, "START | camera discovery | backend=opencv-usb")
-        try:
-            usb_indices = tuple(VideoManager.list_usb_cameras())
-        except Exception as exc:
+        if tuple(pathlib.Path("/dev").glob("video*")):
+            started = time.perf_counter()
+            log_hardware_initialization(logger, "START | camera discovery | backend=opencv-usb")
+            try:
+                usb_indices = tuple(VideoManager.list_usb_cameras())
+            except Exception as exc:
+                log_hardware_initialization(
+                    logger,
+                    "FAILED | camera discovery | backend=opencv-usb elapsed=%.3fs error=%s",
+                    time.perf_counter() - started,
+                    str(exc) or exc.__class__.__name__,
+                    level=logging.ERROR,
+                )
+                raise
             log_hardware_initialization(
                 logger,
-                "FAILED | camera discovery | backend=opencv-usb elapsed=%.3fs error=%s",
+                "READY | camera discovery | backend=opencv-usb count=%d elapsed=%.3fs indices=%s",
+                len(usb_indices),
                 time.perf_counter() - started,
-                str(exc) or exc.__class__.__name__,
-                level=logging.ERROR,
+                usb_indices,
             )
-            raise
-        log_hardware_initialization(
-            logger,
-            "READY | camera discovery | backend=opencv-usb count=%d elapsed=%.3fs indices=%s",
-            len(usb_indices),
-            time.perf_counter() - started,
-            usb_indices,
-        )
-        for index in usb_indices:
-            _append_unique_camera(cameras, f"USB Camera {index}", f"opencv://{index}")
+            for index in usb_indices:
+                _append_unique_camera(cameras, f"USB Camera {index}", f"opencv://{index}")
 
     return cameras
 

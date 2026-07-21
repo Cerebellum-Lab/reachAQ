@@ -1,20 +1,12 @@
 from typing import Dict, Optional, Tuple
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QGridLayout, QLabel, QVBoxLayout, QWidget
 
-from autotrainer.core import MessageHandler
-from autotrainer.core.logging import get_verbose_logger
+from autotrainer.core import CameraId
 from autotrainer.core.capture import CaptureProcessStatus
-from autotrainer.device import CanTransportConfiguration
 from autotrainer.pyside import CardWidget
 from autotrainer.pyside.content_widget import ContentWidget, invoke_method
-
-from tools.acquisition.model.laser_model import LaserModel
-from tools.acquisition.model.nidaq_signal_monitor_model import NidaqSignalMonitorModel
-
-
-logger = get_verbose_logger(__name__)
 
 
 class HardwareStatusContent(ContentWidget):
@@ -23,9 +15,6 @@ class HardwareStatusContent(ContentWidget):
         super().__init__()
 
         self._app_model = app_model
-        self._message_handler = app_model.message_handler
-        self._pellet_version = "(unknown)"
-        self._reported_can_transport_error = False
         self._enabled_labels: Dict[str, QLabel] = {}
         self._device_labels: Dict[str, QLabel] = {}
         self._info_labels: Dict[str, QLabel] = {}
@@ -48,7 +37,6 @@ class HardwareStatusContent(ContentWidget):
         )
 
         self._card_widget = CardWidget(title="Hardware Status")
-        self._message_handler.property_changed += self._model_property_changed
 
         layout = self._grid_layout = QGridLayout()
         layout.setAlignment(Qt.AlignmentFlag.AlignTop)
@@ -65,8 +53,9 @@ class HardwareStatusContent(ContentWidget):
         for key, title in (
             ("cameras", "Cameras"),
             ("nidaq", "NI-DAQ"),
-            ("can", "CAN Bus"),
-            ("pellet", "Pellet"),
+            ("can", "CAN Adapter"),
+            ("pellet", "Pellet Controller"),
+            ("gpu", "GPU"),
             ("laser", "Laser"),
         ):
             self._add_status_row(key, title)
@@ -83,17 +72,8 @@ class HardwareStatusContent(ContentWidget):
         container_layout.setSpacing(0)
         self.setLayout(container_layout)
 
-        for camera in app_model.cameras:
-            camera.property_changed += self._on_camera_property_changed
         app_model.property_changed += self._on_app_model_property_changed
-        app_model.hardware.property_changed += self._on_hardware_model_property_changed
-        app_model.laser.property_changed += self._on_laser_property_changed
-        app_model.nidaq_signal_monitor.property_changed += self._on_nidaq_property_changed
         app_model.configuration_loaded_event += self._on_configuration_loaded
-
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self._refresh_status)
-        self._timer.start(1000)
         self._refresh_status()
         self.set_hardware_refreshing(False)
 
@@ -152,10 +132,15 @@ class HardwareStatusContent(ContentWidget):
         self._refresh_daq_status()
         self._refresh_can_status()
         self._refresh_pellet_status()
+        self._refresh_gpu_status()
         self._refresh_laser_status()
 
     def _refresh_camera_status(self) -> None:
-        cameras = list(self._app_model.cameras)
+        cameras = [
+            camera
+            for camera in self._app_model.cameras
+            if camera.camera_id in (CameraId.Left, CameraId.Right, CameraId.Web) or camera.is_enabled
+        ]
         enabled_count = sum(1 for camera in cameras if camera.is_enabled)
         self._set_label_status(
             self._enabled_labels["cameras"],
@@ -163,8 +148,8 @@ class HardwareStatusContent(ContentWidget):
             "ok" if enabled_count else "disabled",
         )
         scan_info, scan_state = self._scan_info("cameras")
-        bindings = ", ".join(self._camera_binding_text(camera) for camera in cameras) or "none configured"
-        self._set_info("cameras", f"{scan_info}; bindings: {bindings}", scan_state)
+        bindings = "\n".join(f"  ↳ {self._camera_binding_text(camera)}" for camera in cameras)
+        self._set_info("cameras", f"{scan_info}\nBindings\n{bindings}", scan_state)
 
     def _refresh_daq_status(self) -> None:
         hardware = self._app_model.hardware
@@ -188,7 +173,7 @@ class HardwareStatusContent(ContentWidget):
             use_state = "disabled"
         self._set_info(
             "nidaq",
-            f"{scan_info}; configured: {configured_text}; {use_state}",
+            f"{scan_info}\n  ↳ selected: {configured_text}\n  ↳ stream: {use_state}",
             scan_state,
         )
 
@@ -202,10 +187,9 @@ class HardwareStatusContent(ContentWidget):
         )
         scan_info, scan_state = self._scan_info("can")
         if is_enabled:
-            connection_state = "connected" if hardware.connected else "idle"
-            info = f"{scan_info}; {self._can_transport_text()}; {connection_state}"
+            info = scan_info
         else:
-            info = f"{scan_info}; disabled"
+            info = f"{scan_info}\n  ↳ runtime: disabled"
         self._set_info("can", info, scan_state)
 
     def _refresh_pellet_status(self) -> None:
@@ -218,13 +202,19 @@ class HardwareStatusContent(ContentWidget):
         )
         scan_info, scan_state = self._scan_info("pellet")
         if not is_enabled:
-            self._set_info("pellet", f"{scan_info}; disabled", scan_state)
+            self._set_info("pellet", f"{scan_info}\n  ↳ runtime: disabled", scan_state)
             return
-        connection_state = "connected" if hardware.connected else "idle"
-        detail = f"{scan_info}; controller {connection_state}"
-        if self._pellet_version and self._pellet_version != "(unknown)":
-            detail = f"{detail}; fw {self._pellet_version}"
-        self._set_info("pellet", detail, scan_state)
+        self._set_info("pellet", scan_info, scan_state)
+
+    def _refresh_gpu_status(self) -> None:
+        scan_info, scan_state = self._scan_info("gpu")
+        found = scan_state == "ok"
+        self._set_label_status(
+            self._enabled_labels["gpu"],
+            self._yes_no(found),
+            scan_state,
+        )
+        self._set_info("gpu", scan_info, scan_state)
 
     def _refresh_laser_status(self) -> None:
         laser = self._app_model.laser
@@ -244,13 +234,13 @@ class HardwareStatusContent(ContentWidget):
         channel_text = "1 channel" if channel_count == 1 else f"{channel_count} channels"
         self._set_info(
             "laser",
-            f"{scan_info}; {channel_text}; {connection_state}",
+            f"{scan_info}\n  ↳ {channel_text} · {connection_state}",
             scan_state,
         )
 
     def _camera_binding_text(self, camera) -> str:
         if not camera.is_enabled:
-            return f"{camera.name}=off"
+            return f"{camera.name}: off"
         source = camera.camera_source
         source_name = source.name if source is not None and source.name else "(not bound)"
         status = camera.capture_process_status
@@ -260,7 +250,7 @@ class HardwareStatusContent(ContentWidget):
             state = "not running"
         else:
             state = "idle"
-        return f"{camera.name}={source_name} {state}"
+        return f"{camera.name}: {source_name} · {state}"
 
     def _daq_device_names(self) -> Tuple[str, ...]:
         configured_names = getattr(self._app_model, "configured_nidaq_device_names", None)
@@ -292,27 +282,7 @@ class HardwareStatusContent(ContentWidget):
         entry = scan_results.get(key)
         if entry is None:
             return "Not scanned", "idle"
-        if entry.state == "error":
-            return "Unavailable", "idle"
         return entry.info, entry.state
-
-    def _can_transport_text(self) -> str:
-        try:
-            transport = CanTransportConfiguration.from_environment()
-        except Exception as exc:
-            if not self._reported_can_transport_error:
-                logger.error("CAN transport configuration unavailable: %s", exc)
-                self._reported_can_transport_error = True
-            return "configuration unavailable"
-        self._reported_can_transport_error = False
-        parts = [transport.kind.value, transport.channel]
-        if transport.bitrate:
-            parts.append(f"{transport.bitrate} bps")
-        if transport.data_bitrate:
-            parts.append(f"data {transport.data_bitrate} bps")
-        if transport.fd:
-            parts.append("CAN-FD")
-        return " / ".join(str(part) for part in parts if part)
 
     @staticmethod
     def _device_name_from_channel(channel_name: Optional[str]) -> Optional[str]:
@@ -337,12 +307,12 @@ class HardwareStatusContent(ContentWidget):
             label.setStyleSheet("color: #1b6e3c; font-weight: 500;")
         elif state == "disabled":
             label.setStyleSheet("color: #68717d;")
+        elif state == "error":
+            label.setStyleSheet("color: #b00020; font-weight: 600;")
+        elif state == "idle":
+            label.setStyleSheet("color: #52606d;")
         else:
             label.setStyleSheet("color: #8a5a00; font-weight: 500;")
-
-    @invoke_method
-    def _on_camera_property_changed(self, _property_name: str, _value, _):
-        self._refresh_camera_status()
 
     @invoke_method
     def _on_app_model_property_changed(self, property_name: str, _value, _):
@@ -350,36 +320,5 @@ class HardwareStatusContent(ContentWidget):
             self._refresh_status()
 
     @invoke_method
-    def _on_hardware_model_property_changed(self, _property_name: str, _value, _):
-        self._refresh_can_status()
-        self._refresh_pellet_status()
-        self._refresh_daq_status()
-
-    @invoke_method
-    def _on_laser_property_changed(self, property_name: str, _value, _):
-        if property_name in (LaserModel.CONFIGURATION, LaserModel.IS_CONNECTED):
-            self._refresh_laser_status()
-
-    @invoke_method
-    def _on_nidaq_property_changed(self, property_name: str, _value, _):
-        if property_name in (
-            NidaqSignalMonitorModel.CONFIGURATION,
-            NidaqSignalMonitorModel.IS_STARTING,
-            NidaqSignalMonitorModel.IS_RUNNING,
-            NidaqSignalMonitorModel.STATUS_MESSAGE,
-        ):
-            self._refresh_daq_status()
-
-    @invoke_method
     def _on_configuration_loaded(self, _configuration):
         self._refresh_status()
-
-    @invoke_method
-    def _model_property_changed(self, property_name: str, value, _):
-        if property_name == MessageHandler.FIRMWARE_VERSION_PROPERTY:
-            version = str(value).lower()
-            if "module" in version:
-                version = version.replace("module", "").strip()
-            if "pellet" in version:
-                self._pellet_version = version.replace("pellet", "").replace(":", "").strip() or "(unknown)"
-                self._refresh_pellet_status()

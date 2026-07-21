@@ -17,6 +17,9 @@ logger = get_verbose_logger(__name__)
 @dataclasses.dataclass(frozen=True)
 class NidaqDevicePorts:
     name: str
+    product_type: str = ""
+    product_number: Optional[int] = None
+    serial_number: Optional[int] = None
     analog_outputs: Tuple[str, ...] = tuple()
     analog_inputs: Tuple[str, ...] = tuple()
     digital_outputs: Tuple[str, ...] = tuple()
@@ -84,6 +87,9 @@ def discover_nidaq_devices() -> Tuple[Tuple[NidaqDevicePorts, ...], Optional[str
     devices = tuple(
         NidaqDevicePorts(
             name=str(device["name"]),
+            product_type=str(device.get("product_type", "")),
+            product_number=device.get("product_number"),
+            serial_number=device.get("serial_number"),
             analog_outputs=tuple(device.get("analog_outputs", tuple())),
             analog_inputs=tuple(device.get("analog_inputs", tuple())),
             digital_outputs=tuple(device.get("digital_outputs", tuple())),
@@ -135,6 +141,9 @@ def _discover_nidaq_devices_direct() -> Tuple[Tuple[NidaqDevicePorts, ...], Opti
             devices.append(
                 NidaqDevicePorts(
                     name=name,
+                    product_type=str(getattr(device, "product_type", "") or ""),
+                    product_number=_optional_int(getattr(device, "product_num", None)),
+                    serial_number=_optional_int(getattr(device, "serial_num", None)),
                     analog_outputs=_channel_names(getattr(device, "ao_physical_chans", tuple())),
                     analog_inputs=_channel_names(getattr(device, "ai_physical_chans", tuple())),
                     digital_outputs=_channel_names(
@@ -185,3 +194,10 @@ def _channel_names(*collections) -> Tuple[str, ...]:
 def _last_stdout_line(stdout: str) -> str:
     lines = [line.strip() for line in stdout.splitlines() if line.strip()]
     return lines[-1] if lines else ""
+
+
+def _optional_int(value) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
