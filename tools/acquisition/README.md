@@ -18,8 +18,10 @@ application is launched through Conda.
 
 The GUI starts idle by default, so camera and DAQ configuration remain editable
 until Start is selected. Use `--start-mode acquiring` only when immediate
-startup is intentional. The saved live-inference setting can be overridden for
-one run with `--live-inference` or `--no-live-inference`.
+startup is intentional. Its initial window is 300 pixels narrower and 300
+pixels shorter than the layout-derived size, but remains freely resizable. The
+saved live-inference setting can be overridden for one run with
+`--live-inference` or `--no-live-inference`.
 
 For software-only camera testing:
 
@@ -63,8 +65,16 @@ directory so test settings do not overwrite the bench config.
 ## Cameras
 
 Reach cameras are configured as `CameraConfiguration` entries. The left and
-right cameras are the normal two-camera reachAQ setup. Cameras 3-6 appear in
-the UI only when explicitly present in the configuration.
+right cameras are the normal two-camera reachAQ setup. A third `stimCam`
+(`id: 3`) is added as an optional, disabled camera. While disabled it is not
+shown in the camera grid or Hardware Status and is not opened or required at
+startup. When enabled, its camera selector appears as the third, far-right
+camera panel. Cameras 4-6 likewise appear only while enabled.
+
+Enable `stimCam` by setting its `CameraConfiguration.isEnabled` value to
+`true`. Its source can then be selected from the far-right camera panel. Keep
+it `false` on rigs without the camera; the placeholder random source is never
+opened while the camera is disabled.
 
 reachAQ does not require a webcam. Leave the `web` camera absent or disabled
 unless a rig intentionally configures it.
@@ -129,10 +139,14 @@ startup timeout. Hardware initialization milestones from the worker are relayed
 to both the application log and terminal.
 
 Incoming blocks are retained in fixed-size NumPy circular buffers. Graphs drain
-those buffers on a coalesced 30 Hz display timer, so hardware sampling and CSV
-recording do not depend on paint speed. Curves are always solid lines; digital
-signals are distinguished by color and label rather than dots or dashes. Width
-and height controls below each graph change its minimum display dimensions.
+those buffers on a coalesced 30 Hz display timer, and a fixed total point budget
+is shared by visible curves. A peak envelope keeps narrow TTL activity visible
+without repainting every raw sample. CSV formatting runs in a separate bounded
+writer thread and reports an explicit overflow instead of throttling live
+sample delivery. Curves are always solid lines; digital signals are
+distinguished by color and label rather than dots or dashes. Controls below
+each graph set its visible time window in seconds and its minimum/maximum
+vertical range in volts.
 
 The default 10 kHz hardware sample rate provides ten samples across each half
 cycle of a 500 Hz square wave. Digital-only tasks use an NI counter output as
@@ -163,8 +177,8 @@ selections also persist immediately in `nidaqStream.channels`, while remaining
 absent from the main Analysis selector and plot. Manual/internal and externally
 triggered pulse operations append their command waveform. Selected measured
 inputs from the shared NI-DAQ stream are added to the corresponding laser
-graph. Calibration explicitly starts and clears the associated graph. Live
-stream traces use the same configured rolling-window duration as Analysis.
+graph. Calibration explicitly starts and clears the associated graph. Each live
+stream graph has its own editable time window and voltage limits.
 
 Every stream option and curve uses the same high-contrast color assignment:
 the first displayed signal is blue, the second green, followed by orange,
@@ -193,17 +207,22 @@ mkdir -p "$HOME/Documents/rawdatalocal"
 
 * System Mode - select Idle or Running. During transitions it explicitly shows
   Starting or Stopping acquisition.
-* Hardware Refresh - scan camera sources, NI-DAQ devices, CAN adapter, and
-  pellet delivery board while idle.
+* Hardware Refresh - repeat the startup scan of camera sources, NI-DAQ devices,
+  and the physical CAN adapter while idle.
 * Notes and Subject - set acquisition notes and select the current animal.
 * Training Mode and Protocol - select the active training workflow when the
   protocol UI is enabled.
 * Preferences - configure live inference and other application preferences.
 
-The Hardware Status table uses `Enabled`, `Devices`, and `Info` columns. The
-Info column preserves the latest Hardware Refresh discovery result and appends
-the current binding, stream, or connection state. Discovery results remain
-visible even when that hardware category is disabled.
+The Hardware Status table uses `Enabled`, `Devices`, and `Info` columns. A scan
+runs once when the application opens; Hardware Refresh repeats it on demand.
+The table is a stable scan snapshot and is not cleared or rewritten when
+acquisition starts. `CAN Adapter` reports the physical PCIe device, kernel
+driver, and Linux CAN interfaces separately from the `Pellet Controller`
+application session. Compact vertical detail lines show each PXI slot and card
+model/product number, the configured CAN backend/interface, and the detected
+GPU model, memory, and driver. Discovery results remain visible even when that
+hardware category is disabled.
 
 ### Menus
 
@@ -241,7 +260,7 @@ HARDWARE INIT | FAILED
 ```
 
 These records cover the GPU preflight, camera discovery and child processes,
-CAN/pellet controller, NI-DAQ discovery and tasks, and laser channels. Each slow
+CAN adapter/controller, NI-DAQ discovery and tasks, and laser channels. Each slow
 operation records elapsed time so the final emitted `START` line identifies the
 initialization step that is still waiting.
 
