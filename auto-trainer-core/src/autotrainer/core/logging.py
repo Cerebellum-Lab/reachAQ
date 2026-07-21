@@ -41,6 +41,7 @@ _root_handler = None
 
 DEFAULT_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
 MULTIPROC_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s[%(processName)s.%(process)d-%(threadName)s.%(thread_id)s] %(message)s"
+ALWAYS_CONSOLE_LOG_ATTRIBUTE = "always_console"
 
 
 # these loggers can be too verbose:
@@ -109,9 +110,38 @@ class LogConfig:
     stream: str = "sys.stdout"
 
 
+class ConsoleHandler(logging.StreamHandler):
+    """A level-filtered console handler with support for explicit progress records.
+
+    Hardware initialization can take long enough that the application otherwise
+    appears hung.  Those records need to remain visible even when the user's
+    normal terminal threshold is WARNING, while all other INFO/NOTICE records
+    should continue to respect that preference.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self._configured_level = logging.NOTSET
+        super().__init__(*args, **kwargs)
+        # Keep the handler's actual level open so both Logger.callHandlers and a
+        # QueueListener deliver tagged records to handle().
+        super().setLevel(logging.NOTSET)
+
+    def setLevel(self, level):
+        self._configured_level = logging._checkLevel(level)
+        super().setLevel(logging.NOTSET)
+
+    def filter(self, record):
+        if (
+            record.levelno < self._configured_level
+            and not getattr(record, ALWAYS_CONSOLE_LOG_ATTRIBUTE, False)
+        ):
+            return False
+        return super().filter(record)
+
+
 def make_console_handler(cfg: LogConfig):
     stream = sys.stdout
-    console_handler = logging.StreamHandler(stream=stream)
+    console_handler = ConsoleHandler(stream=stream)
     console_handler.name = "console_handler"
     console_handler.addFilter(thread_id_filter)
     fmt = ColoredPreciseTimeFormatter(
@@ -657,6 +687,26 @@ def get_verbose_logger(name: Optional[str] = None) -> VerboseLoggerWithThreadId:
         obj.__class__ = VerboseLoggerWithThreadId
     assert isinstance(obj, VerboseLoggerWithThreadId)
     return obj
+
+
+def log_hardware_initialization(
+    target_logger: logging.Logger,
+    message: str,
+    *args,
+    level: int = logging.INFO,
+    **kwargs,
+) -> None:
+    """Log a hardware-init milestone to every configured logging destination.
+
+    The record is tagged so it is always shown by :class:`ConsoleHandler`, but
+    it remains a normal logging record for the file logger, UI diagnostics, and
+    tests.  Callers should include a state such as START, READY, SKIP, or FAILED
+    in ``message`` so slow operations are easy to identify from a partial log.
+    """
+
+    extra = dict(kwargs.pop("extra", {}) or {})
+    extra[ALWAYS_CONSOLE_LOG_ATTRIBUTE] = True
+    target_logger.log(level, "HARDWARE INIT | " + message, *args, extra=extra, **kwargs)
 
 
 def get_log_file_location(*, log_base_dir: str = "", full_format: str):

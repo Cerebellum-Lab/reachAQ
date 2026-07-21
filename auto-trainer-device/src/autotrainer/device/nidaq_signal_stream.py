@@ -7,6 +7,7 @@ import time
 from typing import Dict, List, Optional, Tuple
 
 from autotrainer.core import NidaqSignalChannelConfiguration, NidaqSignalStreamConfiguration
+from autotrainer.core.logging import log_hardware_initialization
 
 
 logger = logging.getLogger(__name__)
@@ -38,7 +39,14 @@ class NidaqSignalStreamController:
             raise RuntimeError("NI-DAQ signal stream is disabled")
         if not configuration.channels:
             raise RuntimeError("NI-DAQ signal stream has no configured channels")
+        runtime_started = time.perf_counter()
+        log_hardware_initialization(logger, "START | NI-DAQmx runtime | consumer=signal-stream")
         self._nidaqmx = _load_nidaqmx()
+        log_hardware_initialization(
+            logger,
+            "READY | NI-DAQmx runtime | consumer=signal-stream elapsed=%.3fs",
+            time.perf_counter() - runtime_started,
+        )
         self._configuration = configuration
         self._analog_task: Optional[object] = None
         self._digital_task: Optional[object] = None
@@ -57,6 +65,8 @@ class NidaqSignalStreamController:
     def start(self) -> None:
         if self._is_started:
             return
+        started = time.perf_counter()
+        log_hardware_initialization(logger, "START | NI-DAQ signal tasks")
         try:
             # Start DI before AI when DI is clocked from the AI sample clock.
             if self._digital_task is not None:
@@ -64,6 +74,13 @@ class NidaqSignalStreamController:
             if self._analog_task is not None:
                 self._analog_task.start()
             self._is_started = True
+            log_hardware_initialization(
+                logger,
+                "READY | NI-DAQ signal tasks | analog=%s digital=%s elapsed=%.3fs",
+                self._analog_task is not None,
+                self._digital_task is not None,
+                time.perf_counter() - started,
+            )
         except Exception:
             self.close()
             raise
@@ -132,6 +149,14 @@ class NidaqSignalStreamController:
 
         analog_channels = cfg.analog_channels
         if analog_channels:
+            started = time.perf_counter()
+            log_hardware_initialization(
+                logger,
+                "START | NI-DAQ analog input task | channels=%s sample_rate=%s buffer=%s",
+                tuple(channel.physical_channel for channel in analog_channels),
+                cfg.sample_rate_hz,
+                buffer_size,
+            )
             self._analog_task = self._nidaqmx.Task("reachaq_signal_stream_ai")
             for channel in analog_channels:
                 kwargs = {}
@@ -145,9 +170,22 @@ class NidaqSignalStreamController:
                 sample_mode=self._nidaqmx.constants.AcquisitionType.CONTINUOUS,
                 samps_per_chan=buffer_size,
             )
+            log_hardware_initialization(
+                logger,
+                "READY | NI-DAQ analog input task | elapsed=%.3fs",
+                time.perf_counter() - started,
+            )
 
         digital_channels = cfg.digital_channels
         if digital_channels:
+            started = time.perf_counter()
+            log_hardware_initialization(
+                logger,
+                "START | NI-DAQ digital input task | channels=%s sample_rate=%s buffer=%s",
+                tuple(channel.physical_channel for channel in digital_channels),
+                cfg.sample_rate_hz,
+                buffer_size,
+            )
             self._digital_task = self._nidaqmx.Task("reachaq_signal_stream_di")
             line_grouping = self._nidaqmx.constants.LineGrouping.CHAN_PER_LINE
             for channel in digital_channels:
@@ -160,6 +198,11 @@ class NidaqSignalStreamController:
                 sample_mode=self._nidaqmx.constants.AcquisitionType.CONTINUOUS,
                 samps_per_chan=buffer_size,
                 **kwargs,
+            )
+            log_hardware_initialization(
+                logger,
+                "READY | NI-DAQ digital input task | elapsed=%.3fs",
+                time.perf_counter() - started,
             )
 
     def _analog_input_sample_clock_source(self, physical_channel: str) -> str:

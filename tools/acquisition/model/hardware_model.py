@@ -1,3 +1,4 @@
+import logging
 import math
 import re
 import threading
@@ -12,11 +13,12 @@ from autotrainer.api import ApiEventKind, ApiDetectorKind
 from autotrainer.core import (ObservableObject, SystemCommandKind, MessageHandler, AnimalSubject, Offset3DTuple,
                               get_verbose_logger, Motor, SensorAnalysis, EventManager, HardwareConfiguration,
                               get_perf_now, SystemStatusMessageKind)
+from autotrainer.core.logging import log_hardware_initialization
 from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
 from autotrainer.core.event import post_api_detector_event_content
 from autotrainer.core.message import SystemDataArgsKwargs
-from autotrainer.device import (DeviceConnectionProtocol, HAVE_CAN_DEVICE, DeviceConnection, CanDevice,
-                                StepperConfig, ServoConfig, Device, ColorLed, Target)
+from autotrainer.device import (CanTransportConfiguration, DeviceConnectionProtocol, HAVE_CAN_DEVICE,
+                                DeviceConnection, CanDevice, StepperConfig, ServoConfig, Device, ColorLed, Target)
 from autotrainer.behavior import TunnelDeviceProtocol, PelletDeviceProtocol
 
 logger = get_verbose_logger(__name__)
@@ -548,10 +550,21 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
     def connect(self, cmd_queue: Queue):
         if not self._can_enabled:
             logger.notice("Skipping hardware connection because CAN bus is disabled in configuration")
+            log_hardware_initialization(logger, "SKIP | CAN/pellet controller | CAN disabled")
             return
         if not self._pellet_controller_enabled:
             logger.notice("Skipping hardware connection because pellet controller is disabled in configuration")
+            log_hardware_initialization(logger, "SKIP | CAN/pellet controller | pellet controller disabled")
             return
+        connect_started = time.perf_counter()
+        transport = CanTransportConfiguration.from_environment()
+        log_hardware_initialization(
+            logger,
+            "START | CAN/pellet controller | transport=%s channel=%s required_target=%s",
+            transport.kind.value,
+            transport.channel,
+            Target.PELLET_DEVICE.name,
+        )
         logger.notice("%s: connect with %s", self, cmd_queue)
         self._disconnect_event.clear()
 
@@ -572,6 +585,14 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
         can_device = self._can_device = CanDevice(
             buffer_size=buffer_size,
             required_targets=(Target.PELLET_DEVICE,),
+            can_transport=transport,
+        )
+        log_hardware_initialization(
+            logger,
+            "READY | CAN adapter created | transport=%s channel=%s elapsed=%.3fs",
+            transport.kind.value,
+            transport.channel,
+            time.perf_counter() - connect_started,
         )
         self.set_device_ack_timeout(self._device_ack_timeout_delay)  # ensure it's used
         self.set_board_status_timeout(self._board_status_timeout)
@@ -579,21 +600,55 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
         can_device.property_changed += self._can_device_property_changed
 
         device_conn = self._device_conn = DeviceConnection(can_device, cmd_queue, name="can-device")
+        log_hardware_initialization(logger, "START | CAN connection worker | name=can-device")
         device_conn.request_connect()
 
         send_dev_cmd = partial(self._send_command, device_conn)
         def send_dev_ack_cmd(kind, data=None):
+            command_started = time.perf_counter()
+            log_hardware_initialization(logger, "START | pellet command | command=%s", kind.name)
             tok = str(uuid.uuid4())
-            with device_conn.await_acknowledge({tok}):
-                send_dev_cmd(kind, data, context=tok)
+            try:
+                with device_conn.await_acknowledge({tok}):
+                    send_dev_cmd(kind, data, context=tok)
+            except Exception as exc:
+                log_hardware_initialization(
+                    logger,
+                    "FAILED | pellet command | command=%s elapsed=%.3fs error=%s",
+                    kind.name,
+                    time.perf_counter() - command_started,
+                    str(exc) or exc.__class__.__name__,
+                    level=logging.ERROR,
+                )
+                raise
+            log_hardware_initialization(
+                logger,
+                "READY | pellet command acknowledged | command=%s elapsed=%.3fs",
+                kind.name,
+                time.perf_counter() - command_started,
+            )
 
         send_dev_ack_cmd(SystemCommandKind.REQUEST_VERSION)
 
         # load and set motors and move configs
         # 1)
+        config_started = time.perf_counter()
+        log_hardware_initialization(logger, "START | pellet motor configuration")
         motors_config = device_conn.load_default_motor_config()
+        log_hardware_initialization(
+            logger,
+            "READY | pellet motor configuration | elapsed=%.3fs",
+            time.perf_counter() - config_started,
+        )
         # 2)
+        config_started = time.perf_counter()
+        log_hardware_initialization(logger, "START | pellet move configuration")
         device_conn.load_default_move_config()
+        log_hardware_initialization(
+            logger,
+            "READY | pellet move configuration | elapsed=%.3fs",
+            time.perf_counter() - config_started,
+        )
         # 3)
         if self._connect_count == 1:
             logger.notice("Doing cover attach-release-detach on first connect")
@@ -609,8 +664,10 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
 
         if self._tunnel_headfix_enabled:
             send_dev_cmd(SystemCommandKind.UPDATE_SCALE_TARE)
+            log_hardware_initialization(logger, "QUEUED | startup scale tare")
         else:
             logger.debug("Skipping startup scale tare because tunnel/headfix hardware is disabled")
+            log_hardware_initialization(logger, "SKIP | startup scale tare | tunnel/headfix disabled")
 
         prev_thread = self._check_timedout_commands_thread
         if prev_thread is None or not prev_thread.is_alive():
@@ -620,6 +677,11 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
                 name="check-timedout-commands",
             )
             thread.start()
+        log_hardware_initialization(
+            logger,
+            "READY | CAN/pellet controller | elapsed=%.3fs",
+            time.perf_counter() - connect_started,
+        )
 
     def disconnect(self):
         logger.verbose("disconnecting ..")

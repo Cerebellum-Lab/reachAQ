@@ -1,12 +1,13 @@
 import copy
 import sys
+import time
 from enum import Enum
 from typing import Optional, Dict, List, Tuple, Type
 from urllib.parse import urlparse, ParseResult
 
 import cv2
 
-from autotrainer.core.logging import get_verbose_logger
+from autotrainer.core.logging import get_verbose_logger, log_hardware_initialization
 
 from .camera.camera_base import CameraBase
 from .camera.random_cam import RandomCam
@@ -49,12 +50,23 @@ class VideoManager:
     def list_usb_cameras(cls) -> List[int]:
         cameras = []
         for idx in range(6):
+            started = time.perf_counter()
+            log_hardware_initialization(logger, "START | USB camera probe | index=%d", idx)
+            available = False
             capture = cv2.VideoCapture(idx)
             if capture.isOpened():
                 ret, frame = capture.read()
-                if ret and frame is not None:
+                available = bool(ret and frame is not None)
+                if available:
                     cameras.append(idx)
                 capture.release()
+            log_hardware_initialization(
+                logger,
+                "READY | USB camera probe | index=%d available=%s elapsed=%.3fs",
+                idx,
+                available,
+                time.perf_counter() - started,
+            )
         return cameras
 
     @classmethod

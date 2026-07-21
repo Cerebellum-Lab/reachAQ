@@ -18,7 +18,14 @@ from typing import Callable, Dict, Union, Optional, List, Tuple
 import numpy
 
 from autotrainer.core import FixedArrayMultiQueue, FixedArrayQueue, ProjectInfo, SystemStatusMessageKind, get_perf_now
-from autotrainer.core.logging import get_verbose_logger, set_logger_level, make_log_dict_config, setup_logging, install_log_exception_hook
+from autotrainer.core.logging import (
+    get_verbose_logger,
+    install_log_exception_hook,
+    log_hardware_initialization,
+    make_log_dict_config,
+    set_logger_level,
+    setup_logging,
+)
 from autotrainer.core.frame_index import FrameIndexCategory
 from autotrainer.core.fixed_array_queue import BufferResult
 from autotrainer.core.video_detection import PresenceDetectionAttrs
@@ -228,6 +235,13 @@ class VideoCapture(Process):
         logger.info("%s: started running ; name=%s cam_index=%s primary=%s log_dict=%s",
                     self, self._attrs.camera.name, self._camera_idx, self._attrs.is_primary,
                     log_dict_config)
+        log_hardware_initialization(
+            logger,
+            "START | camera child process | name=%s index=%s primary=%s",
+            self._name,
+            self._camera_idx,
+            self._attrs.is_primary,
+        )
         if not self._prepare_to_run():
             return
 
@@ -262,14 +276,47 @@ class VideoCapture(Process):
                 return False
 
             try:
+                camera_started = time.perf_counter()
+                log_hardware_initialization(
+                    logger,
+                    "START | camera backend initialization | name=%s url=%s",
+                    self._name,
+                    self._camera_url,
+                )
                 camera = self._camera = VideoManager.create_camera(self._camera_url, self._name)
                 if camera is None:
                     raise RuntimeError("VideoManager returned None")
             except BaseException as err:
+                log_hardware_initialization(
+                    logger,
+                    "FAILED | camera backend initialization | name=%s elapsed=%.3fs error=%s",
+                    self._name,
+                    time.perf_counter() - camera_started,
+                    str(err) or err.__class__.__name__,
+                    level=logging.ERROR,
+                )
                 self._set_error(f"Could not create camera {self._name}: {err}")
                 return False
 
+            log_hardware_initialization(
+                logger,
+                "READY | camera backend initialization | name=%s type=%s width=%s height=%s fps=%s elapsed=%.3fs",
+                self._name,
+                camera.__class__.__name__,
+                camera.width,
+                camera.height,
+                camera.fps,
+                time.perf_counter() - camera_started,
+            )
+            prepare_started = time.perf_counter()
+            log_hardware_initialization(logger, "START | camera prepare_capture | name=%s", self._name)
             camera.prepare_capture()
+            log_hardware_initialization(
+                logger,
+                "READY | camera prepare_capture | name=%s elapsed=%.3fs",
+                self._name,
+                time.perf_counter() - prepare_started,
+            )
 
             rec_queue = queue.Queue(maxsize=128)
             # NB: we put batch per batch (of self._record_batch_size) into the queue,
@@ -302,9 +349,24 @@ class VideoCapture(Process):
                 target=self._command_handler, daemon=True, name="CommandHandler")
             thread.start()
 
+            log_hardware_initialization(
+                logger,
+                "READY | camera child process | name=%s recorder_alive=%s detection_enabled=%s",
+                self._name,
+                vid_rec.is_alive(),
+                self._video_detection is not None,
+            )
+
             return True
         except Exception as err:
             logger.exception("%s: Error during prepare to run: %s", self, err)
+            log_hardware_initialization(
+                logger,
+                "FAILED | camera child process | name=%s error=%s",
+                self._name,
+                str(err) or err.__class__.__name__,
+                level=logging.ERROR,
+            )
             self._set_error(str(err))
             return False
 

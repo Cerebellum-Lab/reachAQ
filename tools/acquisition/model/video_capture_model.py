@@ -1,4 +1,5 @@
 import ctypes
+import logging
 import math
 import multiprocessing
 import os
@@ -21,6 +22,7 @@ from autotrainer.core import clear_queue, FixedArrayQueue, FixedArrayMultiQueue,
     CameraConfiguration, CameraId, NotificationCenter, TriggerNotification, Notification, get_verbose_logger, \
     get_perf_now
 from autotrainer.core.multiproc import get_mp_ctx
+from autotrainer.core.logging import log_hardware_initialization
 from autotrainer.core.project import ProjectInfo, ProjectDependentProtocol
 from autotrainer.core.video_detection import PresenceDetectionAttrs
 from autotrainer.video import VideoCapture, VideoRecordProperties, VideoRecordMode, VideoManager, \
@@ -49,9 +51,50 @@ def create_camera_list(*, include_hardware: bool = False):
                 _append_unique_camera(cameras, parts[0].strip(), parts[1].strip())
 
     if include_hardware:
-        for serial in VideoManager.list_spin_cameras():
+        started = time.perf_counter()
+        log_hardware_initialization(logger, "START | camera discovery | backend=spinnaker")
+        try:
+            spin_serials = tuple(VideoManager.list_spin_cameras())
+        except Exception as exc:
+            log_hardware_initialization(
+                logger,
+                "FAILED | camera discovery | backend=spinnaker elapsed=%.3fs error=%s",
+                time.perf_counter() - started,
+                str(exc) or exc.__class__.__name__,
+                level=logging.ERROR,
+            )
+            raise
+        log_hardware_initialization(
+            logger,
+            "READY | camera discovery | backend=spinnaker count=%d elapsed=%.3fs serials=%s",
+            len(spin_serials),
+            time.perf_counter() - started,
+            spin_serials,
+        )
+        for serial in spin_serials:
             _append_unique_camera(cameras, f"Spinnaker {serial}", f"spinnaker://{serial}")
-        for index in VideoManager.list_usb_cameras():
+
+        started = time.perf_counter()
+        log_hardware_initialization(logger, "START | camera discovery | backend=opencv-usb")
+        try:
+            usb_indices = tuple(VideoManager.list_usb_cameras())
+        except Exception as exc:
+            log_hardware_initialization(
+                logger,
+                "FAILED | camera discovery | backend=opencv-usb elapsed=%.3fs error=%s",
+                time.perf_counter() - started,
+                str(exc) or exc.__class__.__name__,
+                level=logging.ERROR,
+            )
+            raise
+        log_hardware_initialization(
+            logger,
+            "READY | camera discovery | backend=opencv-usb count=%d elapsed=%.3fs indices=%s",
+            len(usb_indices),
+            time.perf_counter() - started,
+            usb_indices,
+        )
+        for index in usb_indices:
             _append_unique_camera(cameras, f"USB Camera {index}", f"opencv://{index}")
 
     return cameras

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
+import time
 from typing import Optional, Tuple, Union
 
 from autotrainer.core import ObservableObject
+from autotrainer.core.logging import get_verbose_logger, log_hardware_initialization
 from autotrainer.device import (
     LaserControllerProtocol,
     LaserCalibrationPoint,
@@ -16,6 +19,9 @@ from autotrainer.device import (
     NidaqLaserController,
     NullLaserController,
 )
+
+
+logger = get_verbose_logger(__name__)
 
 
 class LaserModel(ObservableObject):
@@ -50,17 +56,54 @@ class LaserModel(ObservableObject):
         self.set_controller(NidaqLaserController(configuration))
 
     def load_configuration(self, configuration: LaserSystemConfiguration) -> None:
-        if configuration.backend == "null":
-            self.configure_null(configuration)
-        elif configuration.backend == "nidaq":
-            self.configure_nidaq(configuration)
-        elif configuration.backend == "disabled":
+        backend = configuration.backend
+        if backend == "disabled":
             prev_config = self._configuration
             self.close()
             self._configuration = configuration
             self._on_property_changed(self.CONFIGURATION, configuration, prev_config)
-        else:
-            raise ValueError(f"Unsupported laser backend: {configuration.backend}")
+            log_hardware_initialization(logger, "SKIP | laser controller | backend=disabled")
+            return
+
+        started = time.perf_counter()
+        log_hardware_initialization(
+            logger,
+            "START | laser controller | backend=%s hardware_timed=%s channels=%s",
+            backend,
+            configuration.hardware_timed,
+            tuple(
+                (
+                    channel.channel_id.value,
+                    channel.analog_output,
+                    channel.diode_input,
+                    channel.shutter_output,
+                )
+                for channel in configuration.channels
+            ),
+        )
+        try:
+            if backend == "null":
+                self.configure_null(configuration)
+            elif backend == "nidaq":
+                self.configure_nidaq(configuration)
+            else:
+                raise ValueError(f"Unsupported laser backend: {backend}")
+        except Exception as exc:
+            log_hardware_initialization(
+                logger,
+                "FAILED | laser controller | backend=%s elapsed=%.3fs error=%s",
+                backend,
+                time.perf_counter() - started,
+                str(exc) or exc.__class__.__name__,
+                level=logging.ERROR,
+            )
+            raise
+        log_hardware_initialization(
+            logger,
+            "READY | laser controller | backend=%s elapsed=%.3fs",
+            backend,
+            time.perf_counter() - started,
+        )
 
     def set_configuration_offline(self, configuration: LaserSystemConfiguration) -> None:
         prev_config = self._configuration

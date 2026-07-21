@@ -3,7 +3,10 @@ from __future__ import annotations
 import dataclasses
 import logging
 import numbers
+import time
 from typing import Dict, List, Optional, Tuple, Union
+
+from autotrainer.core.logging import log_hardware_initialization
 
 from .laser import (
     LaserCalibrationPoint,
@@ -60,18 +63,41 @@ class NidaqLaserController:
     def __init__(self, configuration: LaserSystemConfiguration):
         if configuration.backend != "nidaq":
             raise ValueError("NidaqLaserController requires laser backend 'nidaq'")
+        runtime_started = time.perf_counter()
+        log_hardware_initialization(logger, "START | NI-DAQmx runtime | consumer=laser")
         self._nidaqmx = _load_nidaqmx()
+        log_hardware_initialization(
+            logger,
+            "READY | NI-DAQmx runtime | consumer=laser elapsed=%.3fs",
+            time.perf_counter() - runtime_started,
+        )
         self._configuration = configuration
         self._tasks: Dict[LaserChannelId, _NidaqLaserTasks] = {}
         self._command_volts: Dict[LaserChannelId, float] = {}
         try:
             for channel in configuration.channels:
+                channel_started = time.perf_counter()
+                log_hardware_initialization(
+                    logger,
+                    "START | NI-DAQ laser channel | id=%s AO=%s diode_AI=%s shutter_DO=%s auxiliary_DO=%s",
+                    channel.channel_id.value,
+                    channel.analog_output,
+                    channel.diode_input,
+                    channel.shutter_output,
+                    channel.auxiliary_output,
+                )
                 self._tasks[channel.channel_id] = self._create_channel_tasks(channel)
                 self._command_volts[channel.channel_id] = channel.minimum_command_volts
                 self.set_command_voltage(channel.channel_id, channel.minimum_command_volts)
                 self.set_shutter_open(channel.channel_id, False)
                 if channel.auxiliary_output is not None:
                     self.set_auxiliary_output(channel.channel_id, False)
+                log_hardware_initialization(
+                    logger,
+                    "READY | NI-DAQ laser channel | id=%s elapsed=%.3fs",
+                    channel.channel_id.value,
+                    time.perf_counter() - channel_started,
+                )
         except Exception:
             try:
                 self.close()

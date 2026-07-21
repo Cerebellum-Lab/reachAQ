@@ -2,9 +2,16 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 import subprocess
 import sys
+import time
 from typing import List, Optional, Tuple
+
+from autotrainer.core.logging import get_verbose_logger, log_hardware_initialization
+
+
+logger = get_verbose_logger(__name__)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -17,6 +24,11 @@ class NidaqDevicePorts:
 
 
 def discover_nidaq_devices() -> Tuple[Tuple[NidaqDevicePorts, ...], Optional[str]]:
+    started = time.perf_counter()
+    log_hardware_initialization(
+        logger,
+        "START | NI-DAQ discovery | isolated_process=true timeout=10s",
+    )
     command = [
         sys.executable,
         "-c",
@@ -36,7 +48,9 @@ def discover_nidaq_devices() -> Tuple[Tuple[NidaqDevicePorts, ...], Optional[str
             check=False,
         )
     except subprocess.TimeoutExpired:
-        return tuple(), "NI-DAQmx discovery timed out while probing devices."
+        error = "NI-DAQmx discovery timed out while probing devices."
+        _log_discovery_result(tuple(), error, started)
+        return tuple(), error
 
     if completed.returncode != 0:
         stderr = completed.stderr.strip()
@@ -47,19 +61,25 @@ def discover_nidaq_devices() -> Tuple[Tuple[NidaqDevicePorts, ...], Optional[str
         )
         if stderr:
             detail = f"{detail}: {stderr}"
-        return tuple(), (
+        error = (
             "NI-DAQmx discovery failed in an isolated probe process "
             f"({detail}). The NI-DAQmx native runtime may be installed but unusable in this OS environment."
         )
+        _log_discovery_result(tuple(), error, started)
+        return tuple(), error
 
     json_line = _last_stdout_line(completed.stdout)
     if not json_line:
-        return tuple(), "NI-DAQmx discovery returned no device data."
+        error = "NI-DAQmx discovery returned no device data."
+        _log_discovery_result(tuple(), error, started)
+        return tuple(), error
 
     try:
         payload = json.loads(json_line)
     except json.JSONDecodeError as exc:
-        return tuple(), f"NI-DAQmx discovery returned invalid device data: {exc}"
+        error = f"NI-DAQmx discovery returned invalid device data: {exc}"
+        _log_discovery_result(tuple(), error, started)
+        return tuple(), error
 
     devices = tuple(
         NidaqDevicePorts(
@@ -73,7 +93,27 @@ def discover_nidaq_devices() -> Tuple[Tuple[NidaqDevicePorts, ...], Optional[str
         if device.get("name")
     )
     error = payload.get("error")
-    return devices, str(error) if error else None
+    error = str(error) if error else None
+    _log_discovery_result(devices, error, started)
+    return devices, error
+
+
+def _log_discovery_result(
+    devices: Tuple[NidaqDevicePorts, ...],
+    error: Optional[str],
+    started: float,
+) -> None:
+    state = "UNAVAILABLE" if error else "READY"
+    log_hardware_initialization(
+        logger,
+        "%s | NI-DAQ discovery | count=%d devices=%s elapsed=%.3fs%s",
+        state,
+        len(devices),
+        tuple(device.name for device in devices),
+        time.perf_counter() - started,
+        "" if error is None else f" error={error}",
+        level=logging.INFO,
+    )
 
 
 def _discover_nidaq_devices_direct() -> Tuple[Tuple[NidaqDevicePorts, ...], Optional[str]]:

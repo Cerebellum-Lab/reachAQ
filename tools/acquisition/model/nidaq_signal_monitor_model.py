@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import csv
+import logging
 import threading
+import time
 from pathlib import Path
 from typing import Callable, Optional, TextIO
 
 from autotrainer.core import NidaqSignalStreamConfiguration, ObservableObject, ProjectInfo
-from autotrainer.core.logging import get_verbose_logger
+from autotrainer.core.logging import get_verbose_logger, log_hardware_initialization
 from autotrainer.core.project import ProjectDependentProtocol
 from autotrainer.device import NidaqSignalSampleBlock, NidaqSignalStreamController
 
@@ -87,6 +89,7 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
         else:
             self._set_status("NI-DAQ signal stream disabled")
             self._set_error("")
+            log_hardware_initialization(logger, "SKIP | NI-DAQ signal stream | disabled")
 
     def save_configuration(self) -> NidaqSignalStreamConfiguration:
         return self._configuration
@@ -99,12 +102,27 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
             if not configuration.is_enabled:
                 self._set_status("NI-DAQ signal stream disabled")
                 self._set_error("")
+                log_hardware_initialization(logger, "SKIP | NI-DAQ signal stream | disabled")
                 return False
+            started = time.perf_counter()
+            log_hardware_initialization(
+                logger,
+                "START | NI-DAQ signal stream | sample_rate=%s channels=%s",
+                configuration.sample_rate_hz,
+                tuple(channel.physical_channel for channel in configuration.channels),
+            )
             try:
                 controller = NidaqSignalStreamController(configuration)
                 controller.start()
             except Exception as exc:
                 logger.exception("Failed to start NI-DAQ signal stream")
+                log_hardware_initialization(
+                    logger,
+                    "FAILED | NI-DAQ signal stream | elapsed=%.3fs error=%s",
+                    time.perf_counter() - started,
+                    str(exc) or exc.__class__.__name__,
+                    level=logging.ERROR,
+                )
                 self._controller = None
                 self._set_running(False)
                 self._set_status("NI-DAQ signal stream stopped")
@@ -121,6 +139,11 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
             self._set_status("NI-DAQ signal stream running")
             self._set_running(True)
             thread.start()
+            log_hardware_initialization(
+                logger,
+                "READY | NI-DAQ signal stream | elapsed=%.3fs",
+                time.perf_counter() - started,
+            )
             return True
 
     def stop(self) -> None:
