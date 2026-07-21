@@ -294,10 +294,53 @@ class _LaserChannelTab(QWidget):
             for curve_name in self._trace_curves
         }
 
-        trace_options = QWidget(trace_group)
-        trace_options_layout = QHBoxLayout(trace_options)
+        self._trace_tabs = QTabWidget(trace_group)
+        self._trace_tabs.setDocumentMode(True)
+
+        self._trace_stream_page = QWidget(self._trace_tabs)
+        trace_stream_layout = QVBoxLayout(self._trace_stream_page)
+        trace_stream_layout.setContentsMargins(0, 4, 0, 0)
+        trace_stream_layout.setSpacing(4)
+        trace_stream_layout.addWidget(self._trace_plot)
+        self._trace_legend = StreamGraphLegend(columns=3, parent=self._trace_stream_page)
+        self._trace_legend.set_entries(
+            (
+                ("Command output", _COMMAND_TRACE_COLOR, False),
+                ("Diode feedback", _DIODE_TRACE_COLOR, False),
+                ("Command copy", _COMMAND_COPY_TRACE_COLOR, False),
+            )
+        )
+        trace_stream_layout.addWidget(self._trace_legend)
+        trace_actions = QHBoxLayout()
+        self._trace_toggle_button = QPushButton("Pause Stream")
+        self._trace_clear_button = QPushButton("Clear")
+        self._trace_daq_button = QPushButton("Start DAQ Inputs")
+        self._trace_daq_button.setToolTip(
+            "Starts or stops the shared NI-DAQ input worker used by Analysis and all laser graphs."
+        )
+        self._trace_status = QLabel("Streaming")
+        self._trace_status.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        trace_actions.addWidget(self._trace_toggle_button)
+        trace_actions.addWidget(self._trace_clear_button)
+        trace_actions.addWidget(self._trace_daq_button)
+        trace_actions.addWidget(self._trace_status, stretch=1)
+        trace_stream_layout.addLayout(trace_actions)
+
+        self._trace_signals_page = QWidget(self._trace_tabs)
+        trace_signals_layout = QVBoxLayout(self._trace_signals_page)
+        trace_signals_layout.setContentsMargins(8, 8, 8, 8)
+        trace_signals_layout.setSpacing(8)
+        trace_signals_explanation = QLabel(
+            "Choose the signals displayed in this laser's output stream. NI-DAQ inputs are "
+            "available only after their ports are assigned in Edit → Edit DAQ Ports."
+        )
+        trace_signals_explanation.setWordWrap(True)
+        trace_signals_layout.addWidget(trace_signals_explanation)
+
+        trace_options = QWidget(self._trace_signals_page)
+        trace_options_layout = QVBoxLayout(trace_options)
         trace_options_layout.setContentsMargins(0, 0, 0, 0)
-        trace_options_layout.setSpacing(10)
+        trace_options_layout.setSpacing(8)
         self._trace_command_checkbox = QCheckBox("Command output (always shown)")
         color_code_checkbox(self._trace_command_checkbox, _COMMAND_TRACE_COLOR)
         self._trace_command_checkbox.setChecked(True)
@@ -320,32 +363,12 @@ class _LaserChannelTab(QWidget):
             self._trace_signal_checkboxes[key] = checkbox
             trace_options_layout.addWidget(checkbox)
         trace_options_layout.addStretch(1)
-        trace_layout.addWidget(trace_options)
+        trace_signals_layout.addWidget(trace_options)
+        trace_signals_layout.addStretch(1)
 
-        trace_layout.addWidget(self._trace_plot)
-        self._trace_legend = StreamGraphLegend(columns=3, parent=trace_group)
-        self._trace_legend.set_entries(
-            (
-                ("Command output", _COMMAND_TRACE_COLOR, False),
-                ("Diode feedback", _DIODE_TRACE_COLOR, False),
-                ("Command copy", _COMMAND_COPY_TRACE_COLOR, False),
-            )
-        )
-        trace_layout.addWidget(self._trace_legend)
-        trace_actions = QHBoxLayout()
-        self._trace_toggle_button = QPushButton("Pause Stream")
-        self._trace_clear_button = QPushButton("Clear")
-        self._trace_daq_button = QPushButton("Start DAQ Inputs")
-        self._trace_daq_button.setToolTip(
-            "Starts or stops the shared NI-DAQ input worker used by Analysis and all laser graphs."
-        )
-        self._trace_status = QLabel("Streaming")
-        self._trace_status.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        trace_actions.addWidget(self._trace_toggle_button)
-        trace_actions.addWidget(self._trace_clear_button)
-        trace_actions.addWidget(self._trace_daq_button)
-        trace_actions.addWidget(self._trace_status, stretch=1)
-        trace_layout.addLayout(trace_actions)
+        self._trace_tabs.addTab(self._trace_stream_page, "Stream")
+        self._trace_tabs.addTab(self._trace_signals_page, "Signals")
+        trace_layout.addWidget(self._trace_tabs)
         layout.addWidget(trace_group)
 
         self._pulse_controls = (

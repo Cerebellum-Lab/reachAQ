@@ -304,6 +304,13 @@ def test_laser_trace_auto_resumes_and_displays_entire_calibration_ramp(qapp):
         assert tab._trace_toggle_button.text() == "Pause Stream"
         assert tab._trace_signal_checkboxes["diode"].property("signalColor") == "#128a43"
         assert tab._trace_signal_checkboxes["copy"].property("signalColor") == "#d66b00"
+        assert tuple(
+            tab._trace_tabs.tabText(index)
+            for index in range(tab._trace_tabs.count())
+        ) == ("Stream", "Signals")
+        assert tab._trace_stream_page.isAncestorOf(tab._trace_plot)
+        assert tab._trace_signals_page.isAncestorOf(tab._trace_signal_checkboxes["diode"])
+        assert tab._trace_signals_page.isAncestorOf(tab._trace_signal_checkboxes["copy"])
         assert tuple(entry[0] for entry in tab._trace_legend.entries) == (
             "Command output",
             "Diode feedback",

@@ -138,9 +138,10 @@ The 6713 can provide analog outputs and digital I/O, but it cannot provide
 analog input readback. Add a supported NI analog-input card if laser diode or
 command-copy feedback channels are required.
 
-Each Laser Control tab includes an Output Stream graph with independent
-Start/Pause and Clear controls plus selectors for that laser's diode feedback
-and command-copy inputs. **Start DAQ Inputs** starts the shared input worker;
+Each Laser Control tab includes an Output Stream area with nested **Stream** and
+**Signals** tabs. Stream contains the graph and its independent Start/Pause and
+Clear controls; Signals contains only that laser's diode-feedback and
+command-copy display options. **Start DAQ Inputs** starts the shared input worker;
 the button clearly labels its shared stop action while it is running. These
 selections also persist immediately in `nidaqStream.channels`, while remaining
 absent from the main Analysis selector and plot. Manual/internal and externally
