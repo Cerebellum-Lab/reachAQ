@@ -44,11 +44,14 @@ from the core logic of the applications for two reasons:
 
 * Acquisition Application
   * The local user interface for integrated camera, head fix, pellet delivery, and pose inference modules
-  * `python -m reachAQ.app --start-mode idle -c ~/Autotrainer/system_configuration.yaml`
+  * `python -m reachAQ.app -c ~/Autotrainer/system_configuration.yaml`
+    * The GUI starts idle by default. Use `--start-mode acquiring` only when immediate startup is intentional.
+    * Use `--no-live-inference` or `--live-inference` to override the saved inference setting for one run.
     * [Detailed Instructions](tools/acquisition/README.md)
     * Use `--random-cameras` to start with software-generated frames when no physical cameras are configured.
   * Headless implementation for command line only
-    * `auto-trainer-headless --start-mode idle -c ~/Autotrainer/system_configuration.yaml`
+    * `auto-trainer-headless -c ~/Autotrainer/system_configuration.yaml`
+    * Headless mode continues to start acquisition by default because it has no UI start control.
 * Tunnel Test Application
   * Standalone UI for interfacing with the tunnel hardware components
   * `python -m tools.head_fix.gui`

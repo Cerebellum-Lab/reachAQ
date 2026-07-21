@@ -491,10 +491,11 @@ Basic instead of SocketCAN.
 
 ## Optional NVIDIA GPU
 
-The application can start without a CUDA-capable GPU, but inference is usually
-much faster with NVIDIA drivers installed. Install the NVIDIA driver/CUDA stack
-that matches the target machine and the TensorFlow/Torch wheels in the Python
-environment. After installation:
+The application can run without a CUDA-capable GPU when live inference is
+disabled. Live inference requires the proprietary NVIDIA driver and a working
+TensorFlow GPU runtime; it does not fall back to CPU. Install the NVIDIA
+driver/CUDA stack that matches the target machine and the TensorFlow wheel in
+the Python environment. After installation:
 
 ```bash
 nvidia-smi
@@ -573,8 +574,8 @@ close:
 
 ```bash
 conda run -n "$REACHAQ_ENV" python -m reachAQ.app \
-  --start-mode idle \
   --random-cameras \
+  --no-live-inference \
   -c "$REACHAQ_CONFIG"
 ```
 
@@ -604,7 +605,7 @@ config.write_text(text)
 )
 PY
 conda run -n "$REACHAQ_ENV" python -m reachAQ.app \
-  --start-mode idle \
+  --no-live-inference \
   --preferences-file "$HOME/Autotrainer-random/settings.ini" \
   -c "$HOME/Autotrainer-random/system_configuration.yaml"
 ```
@@ -620,30 +621,33 @@ source tools/hardware/reachaq_hardware.env.example
 set +a
 ```
 
-Start the GUI in idle mode while validating drivers and bench wiring:
+Start the GUI while validating drivers and bench wiring. The GUI defaults to
+idle, and this example explicitly disables live inference for the run:
 
 ```bash
 conda run -n "$REACHAQ_ENV" python -m reachAQ.app \
-  --start-mode idle \
+  --no-live-inference \
   -c "$REACHAQ_CONFIG"
 ```
 
 Equivalent installed entry point:
 
 ```bash
-conda run -n "$REACHAQ_ENV" reachaq --start-mode idle -c "$REACHAQ_CONFIG"
+conda run -n "$REACHAQ_ENV" reachaq --no-live-inference -c "$REACHAQ_CONFIG"
 ```
 
 Headless mode:
 
 ```bash
 conda run -n "$REACHAQ_ENV" auto-trainer-headless \
-  --start-mode idle \
+  --no-live-inference \
   -c "$REACHAQ_CONFIG"
 ```
 
-The default start mode may begin acquisition immediately, so use
-`--start-mode idle` during bring-up.
+The GUI default is idle. Headless mode still starts acquisition immediately by
+default because it has no UI start control. Use `--start-mode acquiring` to
+request immediate GUI startup, and use `--live-inference` or
+`--no-live-inference` to override the saved inference setting for one run.
 
 Optional convenience symlinks in the repo root:
 
@@ -706,8 +710,9 @@ conda run -n "$REACHAQ_ENV" python -m pytest \
   bitrate and confirm the bus is wired/terminated before expecting traffic.
 - If the app cannot write data, create the configured output directory and
   confirm it is writable by the operator user.
-- If TensorFlow logs that CUDA/TensorRT is missing, the app can still start in
-  CPU mode, but inference may be slower.
+- If TensorFlow cannot see a CUDA GPU, disable live inference in Preferences or
+  launch with `--no-live-inference`. Live inference intentionally refuses to
+  run on CPU.
 
 ## Current Workstation Reference
 

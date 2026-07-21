@@ -10,17 +10,20 @@ Use the reachAQ entry point from the configured conda environment:
 
 ```bash
 conda run -n reachaq python -m reachAQ.app \
-  --start-mode idle \
   -c "$HOME/Autotrainer/system_configuration.yaml"
 ```
 
-Use idle mode during hardware bring-up so the app does not immediately start
-acquisition. For software-only camera testing:
+The GUI starts idle by default, so camera and DAQ configuration remain editable
+until Start is selected. Use `--start-mode acquiring` only when immediate
+startup is intentional. The saved live-inference setting can be overridden for
+one run with `--live-inference` or `--no-live-inference`.
+
+For software-only camera testing:
 
 ```bash
 conda run -n reachaq python -m reachAQ.app \
-  --start-mode idle \
   --random-cameras \
+  --no-live-inference \
   -c "$HOME/Autotrainer/system_configuration.yaml"
 ```
 
