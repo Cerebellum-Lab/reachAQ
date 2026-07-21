@@ -51,6 +51,7 @@ from tools.autotrainer_version import __version__ as app_version
 from tools.acquisition.model.app_model import AppModel
 from tools.acquisition.model.app_model_status import AppModelStatus
 from tools.acquisition.model.handle_3d_calibration import make_3d_calib
+from tools.acquisition.model.nidaq_discovery import discover_nidaq_devices
 from tools.acquisition.model.training_plan import get_plan_id
 from tools.acquisition.model.user_preferences import UserPreferences
 from tools.acquisition.view.main_content import MainContent
@@ -64,6 +65,7 @@ _this_dir = Path(__file__).parent.resolve()
 
 _TOOLBAR_ICON_COLOR = "#20242a"
 _TOOLBAR_ICON_WARNING_COLOR = "#b00020"
+_TRANSITIONAL_APP_MODE = "__transition__"
 
 
 def _toolbar_icon(name: str, *, color: str = _TOOLBAR_ICON_COLOR) -> QIcon:
@@ -93,7 +95,10 @@ class MainWindow(QMainWindow):
 
     training_mode_changed = Signal(TrainingMode)
     running_status_changed = Signal(bool)  # True == running/acquiring
+    capture_start_finished = Signal(bool)
+    capture_stop_finished = Signal()
     hardware_refresh_finished = Signal(str, bool)  # message, is_error
+    nidaq_discovery_finished = Signal(object, object)  # devices, optional error
     # todo: integrate within on_app_model_status_changed event handling
 
     def __init__(
@@ -104,6 +109,7 @@ class MainWindow(QMainWindow):
         *,
         is_dev: bool = False,
         random_cameras: bool = False,
+        live_inference: Optional[bool] = None,
     ):
         super().__init__(None)
 
@@ -123,6 +129,7 @@ class MainWindow(QMainWindow):
         self._start_capture_thread = None
         self._stop_capture_thread = None
         self._hardware_refresh_thread = None
+        self._nidaq_discovery_thread = None
 
         self.setWindowTitle(self._title)
 
@@ -169,6 +176,9 @@ class MainWindow(QMainWindow):
                                f"please check and fix following error:\n\n{err}\n\n{tb}")
             # app_model.on_close()
             # raise RuntimeError(f"Could not load config: {err}") from err
+        else:
+            if live_inference is not None:
+                app_model.set_runtime_live_inference_override(live_inference)
 
         app_model.property_changed += self._on_app_model_property_changed
         app_model.current_day_changed += self._on_day_changed
@@ -183,7 +193,10 @@ class MainWindow(QMainWindow):
         analysis.autoclamp_evasion_detector.property_changed += self._on_autoclamp_evasion_property_changed
 
         self.running_status_changed.connect(self._set_start_or_stop)
+        self.capture_start_finished.connect(self._on_capture_start_finished)
+        self.capture_stop_finished.connect(self._on_capture_stop_finished)
         self.hardware_refresh_finished.connect(self._on_hardware_refresh_finished)
+        self.nidaq_discovery_finished.connect(self._on_nidaq_discovery_finished)
         #
         self._reload_animals(self._app_model.animals)  # after all property_changed connect above
         #
@@ -216,8 +229,12 @@ class MainWindow(QMainWindow):
         #
         stopped = not started
         self.edit_camera_settings_action.setEnabled(stopped)
-        self.edit_daq_ports_action.setEnabled(stopped)
-        self.refresh_hardware_action.setEnabled(stopped and self._hardware_refresh_thread is None)
+        self.edit_daq_ports_action.setEnabled(stopped and self._nidaq_discovery_thread is None)
+        self.refresh_hardware_action.setEnabled(
+            stopped
+            and self._hardware_refresh_thread is None
+            and self._nidaq_discovery_thread is None
+        )
         self.make_3d_calib_action.setEnabled(stopped)
         #
         run_action = self.run_action
@@ -233,18 +250,84 @@ class MainWindow(QMainWindow):
             run_action.setText("Start")
             run_action.setIcon(icon)
 
+    def _set_transitional_system_mode(self, text: str) -> None:
+        combo = self._app_model_status_combo
+        combo.blockSignals(True)
+        index = combo.findData(_TRANSITIONAL_APP_MODE)
+        if index < 0:
+            combo.addItem(text, userData=_TRANSITIONAL_APP_MODE)
+            index = combo.count() - 1
+        else:
+            combo.setItemText(index, text)
+        combo.setCurrentIndex(index)
+        combo.blockSignals(False)
+
+    def _restore_system_mode(self) -> None:
+        combo = self._app_model_status_combo
+        combo.blockSignals(True)
+        transition_index = combo.findData(_TRANSITIONAL_APP_MODE)
+        if transition_index >= 0:
+            combo.removeItem(transition_index)
+        status_index = combo.findData(self._app_model.status)
+        if status_index >= 0:
+            combo.setCurrentIndex(status_index)
+        combo.blockSignals(False)
+
+    def _set_startup_message(self, message: str) -> None:
+        self._status_label.setText(message)
+        self._status_label.setStyleSheet("font-weight: 600; color: #b45309;")
+
+    def _clear_startup_message(self) -> None:
+        self._status_label.setText("")
+        self._status_label.setStyleSheet("")
+
+    def _on_capture_start_finished(self, started: bool) -> None:
+        self._start_capture_thread = None
+        self._restore_system_mode()
+        if started:
+            self._clear_startup_message()
+            self._acquisition_started = True
+        else:
+            logger.verbose("capture_start failed: %s", self._app_model.status)
+            self._status_label.setText("Startup failed")
+            self._status_label.setStyleSheet("font-weight: 600; color: #b00020;")
+            self.running_status_changed.emit(False)
+        self.run_action.setEnabled(True)
+        self.animal_in_device_action.setEnabled(True)
+        self.animal_in_training_action.setEnabled(True)
+        self._app_model_status_combo.setEnabled(True)
+
+    def _on_capture_stop_finished(self) -> None:
+        self._stop_capture_thread = None
+        self.running_status_changed.emit(False)
+        self._restore_system_mode()
+        self.run_action.setEnabled(True)
+        self.animal_in_device_action.setEnabled(True)
+        self.animal_in_training_action.setEnabled(True)
+        self._app_model_status_combo.setEnabled(True)
+        self._clear_startup_message()
+        self._acquisition_started = False
+
     def _on_capture_start_stop(self, is_toggled, *, target_status: AppModelStatus = AppModelStatus.ACQUIRING):
         app_model = self._app_model
+        if is_toggled and self.edit_camera_settings_action.isChecked():
+            self.edit_camera_settings_action.blockSignals(True)
+            self.edit_camera_settings_action.setChecked(False)
+            self.edit_camera_settings_action.blockSignals(False)
+            self.main_content.set_is_editable(False)
         self.run_action.setEnabled(False)
+        self.edit_camera_settings_action.setEnabled(False)
+        self.edit_daq_ports_action.setEnabled(False)
         self.make_3d_calib_action.setEnabled(False)
         self.refresh_hardware_action.setEnabled(False)
         self.animal_in_device_action.setEnabled(False)
         self.animal_in_training_action.setEnabled(False)
         self._app_model_status_combo.setEnabled(False)
-        self.running_status_changed.emit(is_toggled)
         if is_toggled:
+            self.running_status_changed.emit(True)
             self._check_diamond_triangle_config()
-            self._status_label.setText("Starting acquisition...")
+            self._set_transitional_system_mode("Starting acquisition...")
+            self._set_startup_message("Starting acquisition — hardware controls are temporarily unavailable...")
             def exec_start_capture(prev_thread=self._start_capture_thread):
                 if prev_thread is not None:
                     logger.verbose("joining previous start thread")
@@ -255,24 +338,13 @@ class MainWindow(QMainWindow):
                 except Exception as err:
                     logger.exception("app_model.capture_start failed: %s", err)
                     started = False
-                self._start_capture_thread = None
-                # following should normally be executed in main UI thread:
-                if started:
-                    self._status_label.setText("")
-                    self._acquisition_started = True
-                else:
-                    logger.verbose("capture_start failed: %s", app_model.status)
-                    self._status_label.setText("Startup failed")
-                    self.running_status_changed.emit(False)
-                self.run_action.setEnabled(True)
-                self.animal_in_device_action.setEnabled(True)
-                self.animal_in_training_action.setEnabled(True)
-                self._app_model_status_combo.setEnabled(True)
+                self.capture_start_finished.emit(started)
             thread = threading.Thread(target=exec_start_capture, daemon=True, name="StartAcquisition")
             self._start_capture_thread = thread
             thread.start()
         else:
-            self._status_label.setText("Stopping acquisition...")
+            self._set_transitional_system_mode("Stopping acquisition...")
+            self._set_startup_message("Stopping acquisition — waiting for hardware to close...")
             def exec_stop_capture(prev_start=self._start_capture_thread,
                                   prev_stop=self._stop_capture_thread):
                 if prev_start is not None:
@@ -282,14 +354,7 @@ class MainWindow(QMainWindow):
                     prev_stop.join()
                 logger.info("stopping subprocesses")
                 app_model.capture_stop()
-                # following should normally be executed in main UI thread:
-                self.running_status_changed.emit(False)
-                self.run_action.setEnabled(True)
-                self.animal_in_device_action.setEnabled(True)
-                self.animal_in_training_action.setEnabled(True)
-                self._app_model_status_combo.setEnabled(True)
-                self._status_label.setText("")
-                self._acquisition_started = False
+                self.capture_stop_finished.emit()
             thread = threading.Thread(target=exec_stop_capture, daemon=True, name="StopAcquisition")
             self._stop_capture_thread = thread
             thread.start()
@@ -297,6 +362,9 @@ class MainWindow(QMainWindow):
     def _refresh_hardware_bindings(self):
         if self._hardware_refresh_thread is not None and self._hardware_refresh_thread.is_alive():
             self.statusBar().showMessage("Hardware refresh already in progress", 5000)
+            return
+        if self._nidaq_discovery_thread is not None and self._nidaq_discovery_thread.is_alive():
+            self.statusBar().showMessage("NI-DAQ discovery is already in progress", 5000)
             return
         if self._app_model.acquisition_started or self._app_model.status != AppModelStatus.IDLE:
             self.statusBar().showMessage("Hardware refresh is only available while acquisition is idle", 5000)
@@ -674,7 +742,7 @@ class MainWindow(QMainWindow):
         finally:
             app_model.status = prev_status
 
-    def on_activated(self, *, target_status: AppModelStatus = AppModelStatus.ACQUIRING):
+    def on_activated(self, *, target_status: AppModelStatus = AppModelStatus.IDLE):
         logger.success("main window activated")
         self.main_content.on_activated()
         app_status = self._app_model.status
@@ -861,7 +929,53 @@ class MainWindow(QMainWindow):
         if configuration is None:
             QMessageBox.critical(self, "DAQ Port Configuration", "No system configuration is loaded.")
             return
-        dialog = NidaqPortConfigurationDialog(configuration, self)
+
+        if self._nidaq_discovery_thread is not None and self._nidaq_discovery_thread.is_alive():
+            self.statusBar().showMessage("NI-DAQ discovery is already in progress", 5000)
+            return
+
+        self.edit_daq_ports_action.setEnabled(False)
+        self.refresh_hardware_action.setEnabled(False)
+        self._set_startup_message("Discovering NI-DAQ devices...")
+
+        def discover_worker():
+            try:
+                devices, discovery_error = discover_nidaq_devices()
+            except Exception as exc:
+                logger.exception("NI-DAQ discovery failed")
+                devices = tuple()
+                discovery_error = str(exc) or exc.__class__.__name__
+            self.nidaq_discovery_finished.emit(devices, discovery_error)
+
+        thread = threading.Thread(target=discover_worker, daemon=True, name="DiscoverNidaq")
+        self._nidaq_discovery_thread = thread
+        thread.start()
+
+    def _on_nidaq_discovery_finished(self, devices, discovery_error) -> None:
+        self._nidaq_discovery_thread = None
+        if self._start_capture_thread is None:
+            self._clear_startup_message()
+        is_idle = (
+            not self._app_model.acquisition_started
+            and self._app_model.status == AppModelStatus.IDLE
+            and self._start_capture_thread is None
+        )
+        self.edit_daq_ports_action.setEnabled(is_idle)
+        self.refresh_hardware_action.setEnabled(is_idle and self._hardware_refresh_thread is None)
+        if not is_idle or self._closing:
+            self.statusBar().showMessage("NI-DAQ discovery finished; acquisition is no longer idle", 5000)
+            return
+
+        configuration = self._app_model.loaded_configuration
+        if configuration is None:
+            QMessageBox.critical(self, "DAQ Port Configuration", "No system configuration is loaded.")
+            return
+        dialog = NidaqPortConfigurationDialog(
+            configuration,
+            self,
+            devices=devices,
+            discovery_error=discovery_error,
+        )
         self._add_box_to_open_dialogs(dialog)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return

@@ -66,8 +66,14 @@ def run_acquisition(
     plugin = try_register_api_event_plugin()
 
     try:
-        window = MainWindow(app, preferences, args.configuration, is_dev=args.dev,
-                            random_cameras=args.random_cameras)
+        window = MainWindow(
+            app,
+            preferences,
+            args.configuration,
+            is_dev=args.dev,
+            random_cameras=args.random_cameras,
+            live_inference=args.live_inference,
+        )
     except:
         event_manager.close()
         BehaviorAlgorithm.close_algorithm_handler()

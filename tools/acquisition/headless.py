@@ -41,6 +41,9 @@ def _exec_main(args):
         app_model.on_close()
         return 1
 
+    if args.live_inference is not None:
+        app_model.set_runtime_live_inference_override(args.live_inference)
+
     target_status = args.start_mode
     if not app_model.capture_start(target_status=target_status):
         logger.error("failed to start capture")
@@ -87,7 +90,10 @@ def main():
 
     from tools.acquisition.args import make_autotrainer_parser
 
-    parser = make_autotrainer_parser()
+    # Headless operation still starts acquisition by default; an idle headless
+    # process has no UI from which acquisition can subsequently be started.
+    from tools.acquisition.model.app_model_status import AppModelStatus
+    parser = make_autotrainer_parser(default_start_mode=AppModelStatus.ACQUIRING)
 
     args = parser.parse_args()
 

@@ -24,13 +24,18 @@ class AutoTrainerParsedArgs:
 
     configuration: Optional[Path] = None
     preferences_file: Optional[Path] = None
-    start_mode: AppModelStatus = AppModelStatus.ACQUIRING
+    start_mode: AppModelStatus = AppModelStatus.IDLE
+    live_inference: Optional[bool] = None
     random_cameras: bool = False
     dev: bool = False
     allow_can_emulation: bool = False
 
 
-def make_autotrainer_parser(*, allow_dev_mode: bool=False):
+def make_autotrainer_parser(
+    *,
+    allow_dev_mode: bool = False,
+    default_start_mode: AppModelStatus = AppModelStatus.IDLE,
+):
     parser = argparse.ArgumentParser(
         prog="Autotrainer",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -39,7 +44,21 @@ def make_autotrainer_parser(*, allow_dev_mode: bool=False):
     parser.add_argument("--preferences-file", help="user preference ini file", default=None, type=Path)
     parser.add_argument("--start-mode", help="The desired start system mode",
                         choices=list(v.value for v in AppModelStatus), type=parse_start_mode,
-                        default=AppModelStatus.ACQUIRING)
+                        default=default_start_mode)
+    inference_group = parser.add_mutually_exclusive_group()
+    inference_group.add_argument(
+        "--live-inference",
+        dest="live_inference",
+        action="store_true",
+        default=None,
+        help="enable live inference for this run, overriding the configuration",
+    )
+    inference_group.add_argument(
+        "--no-live-inference",
+        dest="live_inference",
+        action="store_false",
+        help="disable live inference for this run, overriding the configuration",
+    )
     parser.add_argument("--random-cameras", help="use in-memory random image cameras instead of physical cameras",
                         action="store_true")
     if allow_dev_mode:

@@ -196,9 +196,12 @@ class PreferencesContent(QWidget):
         top_layout.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
 
         analysis_layout = QHBoxLayout()
-        analysis_layout.addWidget(QLabel("Live Analysis:"))
+        analysis_layout.addWidget(QLabel("Live inference:"))
         toggle = self._inference_enabled_toggle = QSwitch()
-        toggle.setToolTip("Enables real-time pose inference during live trials (mouse in tunnel).")
+        toggle.setToolTip(
+            "Enables real-time pose inference during live trials. Requires a CUDA-capable NVIDIA GPU, "
+            "the proprietary NVIDIA driver, and a working TensorFlow GPU runtime."
+        )
         toggle.setChecked(app_model.inference.is_enabled)
         def inference_enabled_state_changed(x: int):
             enabled = x != 0
