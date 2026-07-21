@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from autotrainer.core import NidaqSignalChannelConfiguration
 from autotrainer.core.logging import get_verbose_logger
 from autotrainer.device import (
     LaserCalibrationRamp,
@@ -34,6 +35,12 @@ from autotrainer.pyside import CardWidget, PGWidget
 from autotrainer.pyside.content_widget import ContentWidget, invoke_method
 from tools.acquisition.model.app_model import AppModel
 from tools.acquisition.model.laser_model import LaserModel, LaserTraceBlock
+from tools.acquisition.model.nidaq_signal_monitor_model import NidaqSignalMonitorModel
+from tools.acquisition.view.stream_graph_style import (
+    StreamGraphLegend,
+    color_code_checkbox,
+    stream_signal_color,
+)
 
 
 logger = get_verbose_logger(__name__)
@@ -42,6 +49,9 @@ _LASER_PULSE_TRAIN_COUNT = 4
 _DEFAULT_MINIMUM_COMMAND_VOLTS = 0.0
 _DEFAULT_MAXIMUM_COMMAND_VOLTS = 5.0
 _MAX_LASER_TRACE_POINTS = 100000
+_COMMAND_TRACE_COLOR = stream_signal_color(0)
+_DIODE_TRACE_COLOR = stream_signal_color(1)
+_COMMAND_COPY_TRACE_COLOR = stream_signal_color(2)
 
 
 class _LaserOperationWorker(QObject):
@@ -268,30 +278,72 @@ class _LaserChannelTab(QWidget):
         self._trace_plot.getAxis("left").setLabel("Voltage", units="V")
         self._trace_plot.getPlotItem().setDownsampling(auto=True, mode="peak")
         self._trace_plot.getPlotItem().setClipToView(True)
-        self._trace_plot.addLegend(offset=(-8, 8))
         self._trace_curves = {
             "command": self._trace_plot.plot(
-                [], [], pen=pg.mkPen(color=(30, 90, 180), width=2), name="Command"
+                [], [], pen=pg.mkPen(color=_COMMAND_TRACE_COLOR, width=2.4)
             ),
             "diode": self._trace_plot.plot(
-                [], [], pen=pg.mkPen(color=(210, 80, 70), width=1.5), name="Diode feedback"
+                [], [], pen=pg.mkPen(color=_DIODE_TRACE_COLOR, width=2.0)
             ),
             "copy": self._trace_plot.plot(
-                [], [], pen=pg.mkPen(color=(50, 150, 90), width=1.5), name="Command copy"
+                [], [], pen=pg.mkPen(color=_COMMAND_COPY_TRACE_COLOR, width=2.0)
             ),
         }
         self._trace_data = {
             curve_name: ([], [])
             for curve_name in self._trace_curves
         }
+
+        trace_options = QWidget(trace_group)
+        trace_options_layout = QHBoxLayout(trace_options)
+        trace_options_layout.setContentsMargins(0, 0, 0, 0)
+        trace_options_layout.setSpacing(10)
+        self._trace_command_checkbox = QCheckBox("Command output (always shown)")
+        color_code_checkbox(self._trace_command_checkbox, _COMMAND_TRACE_COLOR)
+        self._trace_command_checkbox.setChecked(True)
+        self._trace_command_checkbox.setEnabled(False)
+        trace_options_layout.addWidget(self._trace_command_checkbox)
+
+        self._trace_signal_candidates = {
+            "diode": self._make_trace_signal_candidate("diode"),
+            "copy": self._make_trace_signal_candidate("copy"),
+        }
+        self._trace_signal_checkboxes = {}
+        for key, label, color in (
+            ("diode", "Diode feedback", _DIODE_TRACE_COLOR),
+            ("copy", "Command copy", _COMMAND_COPY_TRACE_COLOR),
+        ):
+            candidate = self._trace_signal_candidates[key]
+            physical_channel = "not configured" if candidate is None else candidate.physical_channel
+            checkbox = QCheckBox(f"{label} — {physical_channel}")
+            color_code_checkbox(checkbox, color)
+            self._trace_signal_checkboxes[key] = checkbox
+            trace_options_layout.addWidget(checkbox)
+        trace_options_layout.addStretch(1)
+        trace_layout.addWidget(trace_options)
+
         trace_layout.addWidget(self._trace_plot)
+        self._trace_legend = StreamGraphLegend(columns=3, parent=trace_group)
+        self._trace_legend.set_entries(
+            (
+                ("Command output", _COMMAND_TRACE_COLOR, False),
+                ("Diode feedback", _DIODE_TRACE_COLOR, False),
+                ("Command copy", _COMMAND_COPY_TRACE_COLOR, False),
+            )
+        )
+        trace_layout.addWidget(self._trace_legend)
         trace_actions = QHBoxLayout()
         self._trace_toggle_button = QPushButton("Pause Stream")
         self._trace_clear_button = QPushButton("Clear")
+        self._trace_daq_button = QPushButton("Start DAQ Inputs")
+        self._trace_daq_button.setToolTip(
+            "Starts or stops the shared NI-DAQ input worker used by Analysis and all laser graphs."
+        )
         self._trace_status = QLabel("Streaming")
         self._trace_status.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         trace_actions.addWidget(self._trace_toggle_button)
         trace_actions.addWidget(self._trace_clear_button)
+        trace_actions.addWidget(self._trace_daq_button)
         trace_actions.addWidget(self._trace_status, stretch=1)
         trace_layout.addLayout(trace_actions)
         layout.addWidget(trace_group)
@@ -324,6 +376,15 @@ class _LaserChannelTab(QWidget):
         self._run_ramp_button.clicked.connect(self._run_calibration_ramp)
         self._trace_toggle_button.clicked.connect(self._toggle_trace_stream)
         self._trace_clear_button.clicked.connect(self._clear_trace)
+        self._trace_daq_button.clicked.connect(self._toggle_daq_input_stream)
+        for key, checkbox in self._trace_signal_checkboxes.items():
+            checkbox.toggled.connect(
+                lambda checked, signal_key=key: self._trace_signal_selection_changed(
+                    signal_key,
+                    checked,
+                )
+            )
+        self.refresh_signal_selections()
         self._connect_preview_signals()
         self._refresh_trigger_mode_enabled()
         self._refresh_preview()
@@ -335,6 +396,101 @@ class _LaserChannelTab(QWidget):
     @property
     def is_configured(self) -> bool:
         return self._is_configured
+
+    def _make_trace_signal_candidate(
+        self,
+        signal_key: str,
+    ) -> Optional[NidaqSignalChannelConfiguration]:
+        if not self._is_configured:
+            return None
+        laser_number = self.channel_id_value
+        if signal_key == "diode":
+            physical_channel = self._channel.diode_input
+            name = f"laser{laser_number}_diode"
+            scale = self._channel.feedback_scale
+        elif signal_key == "copy":
+            physical_channel = self._channel.command_copy_input
+            name = f"laser{laser_number}_command_copy"
+            scale = self._channel.command_copy_scale
+        else:
+            raise ValueError(f"Unknown laser trace signal: {signal_key}")
+        if not physical_channel:
+            return None
+        return NidaqSignalChannelConfiguration(
+            name=name,
+            physical_channel=physical_channel,
+            kind="analog",
+            scale=scale,
+        )
+
+    def refresh_signal_selections(self) -> None:
+        monitor = self._app_model.nidaq_signal_monitor
+        configured_by_name = {
+            channel.name: channel
+            for channel in monitor.configuration.channels
+        }
+        for key, checkbox in self._trace_signal_checkboxes.items():
+            candidate = self._trace_signal_candidates[key]
+            selected = candidate is not None and candidate.name in configured_by_name
+            checkbox.blockSignals(True)
+            checkbox.setChecked(selected)
+            checkbox.blockSignals(False)
+            checkbox.setEnabled(
+                candidate is not None
+                and monitor.hardware_enabled
+                and not monitor.is_starting
+            )
+            if candidate is None:
+                checkbox.setToolTip("Assign this input in Edit → Edit DAQ Ports first.")
+            elif not monitor.hardware_enabled:
+                checkbox.setToolTip("NI-DAQ hardware is disabled in the system configuration.")
+            elif monitor.is_starting:
+                checkbox.setToolTip("Wait for the shared NI-DAQ stream to finish starting.")
+            elif selected and configured_by_name[candidate.name].physical_channel != candidate.physical_channel:
+                checkbox.setToolTip(
+                    "The saved input uses an older port mapping. Toggle this option to apply the current mapping."
+                )
+            elif monitor.is_running:
+                checkbox.setToolTip("Changing this option restarts the shared NI-DAQ input worker.")
+            else:
+                checkbox.setToolTip("Include this input in this laser's streaming graph.")
+        has_selected_input = any(
+            checkbox.isChecked()
+            for checkbox in self._trace_signal_checkboxes.values()
+        )
+        if monitor.is_starting:
+            self._trace_daq_button.setText("Cancel DAQ Start")
+        elif monitor.is_running:
+            self._trace_daq_button.setText("Stop Shared Inputs")
+        else:
+            self._trace_daq_button.setText("Start DAQ Inputs")
+        self._trace_daq_button.setEnabled(
+            monitor.hardware_enabled
+            and (has_selected_input or monitor.is_starting or monitor.is_running)
+        )
+
+    def _trace_signal_selection_changed(self, signal_key: str, checked: bool) -> None:
+        candidate = self._trace_signal_candidates.get(signal_key)
+        if candidate is None:
+            return
+        channels = [
+            channel
+            for channel in self._app_model.nidaq_signal_monitor.configuration.channels
+            if channel.name != candidate.name
+            and channel.physical_channel != candidate.physical_channel
+        ]
+        if checked:
+            channels.append(candidate)
+        self._app_model.update_nidaq_signal_stream_channels(channels)
+        self.refresh_signal_selections()
+
+    def _toggle_daq_input_stream(self) -> None:
+        monitor = self._app_model.nidaq_signal_monitor
+        if monitor.is_running or monitor.is_starting:
+            monitor.stop()
+        else:
+            monitor.start()
+        self.refresh_signal_selections()
 
     @staticmethod
     def _form_label(text: str) -> QLabel:
@@ -750,12 +906,14 @@ class LaserControlContent(ContentWidget):
 
         app_model.laser.property_changed += self._on_laser_property_changed
         app_model.laser.trace_received += self._on_laser_trace_received
+        app_model.nidaq_signal_monitor.property_changed += self._on_nidaq_monitor_property_changed
         app_model.nidaq_signal_monitor.sample_block_received += self._on_nidaq_sample_block
         self._refresh_from_model()
 
     def on_close(self):
         self._app_model.laser.property_changed -= self._on_laser_property_changed
         self._app_model.laser.trace_received -= self._on_laser_trace_received
+        self._app_model.nidaq_signal_monitor.property_changed -= self._on_nidaq_monitor_property_changed
         self._app_model.nidaq_signal_monitor.sample_block_received -= self._on_nidaq_sample_block
 
     @invoke_method
@@ -769,6 +927,17 @@ class LaserControlContent(ContentWidget):
             if tab.channel_id_value == int(trace.channel_id):
                 tab.append_trace(trace)
                 break
+
+    @invoke_method
+    def _on_nidaq_monitor_property_changed(self, property_name: str, _value, _old_value) -> None:
+        if property_name in (
+            NidaqSignalMonitorModel.CONFIGURATION,
+            NidaqSignalMonitorModel.HARDWARE_ENABLED,
+            NidaqSignalMonitorModel.IS_STARTING,
+            NidaqSignalMonitorModel.IS_RUNNING,
+        ):
+            for tab in self._channel_tabs:
+                tab.refresh_signal_selections()
 
     @invoke_method
     def _on_nidaq_sample_block(self, block: NidaqSignalSampleBlock) -> None:

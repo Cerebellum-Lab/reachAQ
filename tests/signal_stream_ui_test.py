@@ -37,8 +37,27 @@ class _AnalysisAppStub(ObservableObject):
     def __init__(self, monitor):
         super().__init__(("configuration_loaded_event",))
         self.nidaq_signal_monitor = monitor
-        self.nidaq_ports = NidaqPortConfiguration(cam_frames="Dev1/port0/line0")
+        self.nidaq_ports = NidaqPortConfiguration(
+            cam_frames="Dev1/port0/line0",
+            tone1="Dev1/port0/line3",
+            tone2="Dev1/port0/line4",
+        )
         self.laser = LaserModel()
+        self.laser.set_configuration_offline(
+            LaserSystemConfiguration.from_channels((_laser_channel(),), backend="disabled")
+        )
+        self.signal_configuration_save_count = 0
+
+    def update_nidaq_signal_stream_channels(self, channels):
+        self.nidaq_signal_monitor.set_stream_channels(channels)
+        self.signal_configuration_save_count += 1
+
+
+class _LaserAppStub:
+    def __init__(self, laser):
+        self.laser = laser
+        self.nidaq_signal_monitor = NidaqSignalMonitorModel()
+        self.nidaq_signal_monitor._hardware_enabled = True
         self.signal_configuration_save_count = 0
 
     def update_nidaq_signal_stream_channels(self, channels):
@@ -96,19 +115,56 @@ def test_analysis_signal_selection_requires_mapped_port_and_nidaq_enable(qapp):
     try:
         camera_frames = content._signal_checkboxes["cam_frames"]
         barcode = content._signal_checkboxes["barcode"]
+        tone1 = content._signal_checkboxes["tone1"]
+        tone2 = content._signal_checkboxes["tone2"]
         assert camera_frames.isEnabled()
         assert camera_frames.isChecked()
         assert not barcode.isEnabled()
         assert not barcode.isChecked()
+        assert tone1.isEnabled()
+        assert tone2.isEnabled()
+        assert set(content._signal_checkboxes) == {
+            "cam_frames",
+            "barcode",
+            "tone1",
+            "tone2",
+            "tone3_r",
+            "tone3_l",
+        }
+        assert camera_frames.property("signalColor") == "#1769e0"
+        assert barcode.property("signalColor") == "#128a43"
+        assert content._rolling_plot._legend.entries == (
+            ("cam_frames (logic)", (23, 105, 224), True),
+        )
         assert content._channel_count_label.text() == "1"
         assert content._start_stop_button.isEnabled()
         assert content._clear_button.isEnabled()
 
-        camera_frames.setChecked(False)
+        tone1.setChecked(True)
+        qapp.processEvents()
+        assert content._signal_checkboxes["tone1"].property("signalColor") == "#128a43"
+        assert content._rolling_plot._legend.entries[1] == (
+            "tone1 (logic)",
+            (18, 138, 67),
+            True,
+        )
+        content._signal_checkboxes["tone1"].setChecked(False)
+        qapp.processEvents()
+
+        content._signal_checkboxes["cam_frames"].setChecked(False)
         qapp.processEvents()
         assert monitor.configuration.channels == tuple()
         assert not content._start_stop_button.isEnabled()
-        assert app_model.signal_configuration_save_count == 1
+        assert app_model.signal_configuration_save_count == 3
+
+        content._signal_checkboxes["tone1"].setChecked(True)
+        qapp.processEvents()
+        assert content._signal_checkboxes["tone1"].property("signalColor") == "#1769e0"
+        assert content._rolling_plot._legend.entries == (
+            ("tone1 (logic)", (23, 105, 224), True),
+        )
+        content._signal_checkboxes["tone1"].setChecked(False)
+        qapp.processEvents()
 
         content._signal_checkboxes["cam_frames"].setChecked(True)
         qapp.processEvents()
@@ -117,7 +173,7 @@ def test_analysis_signal_selection_requires_mapped_port_and_nidaq_enable(qapp):
             for channel in monitor.configuration.channels
         ) == ("Dev1/port0/line0",)
         assert content._start_stop_button.isEnabled()
-        assert app_model.signal_configuration_save_count == 2
+        assert app_model.signal_configuration_save_count == 6
 
         monitor.set_hardware_enabled(False)
         qapp.processEvents()
@@ -125,6 +181,35 @@ def test_analysis_signal_selection_requires_mapped_port_and_nidaq_enable(qapp):
         assert not content._start_stop_button.isEnabled()
         assert not content._clear_button.isEnabled()
         assert not content._signal_checkboxes["cam_frames"].isEnabled()
+    finally:
+        content.on_close()
+        content.deleteLater()
+
+
+def test_analysis_excludes_laser_owned_inputs_from_selector_and_graph(qapp):
+    laser_input = NidaqSignalChannelConfiguration(
+        name="laser1_diode",
+        physical_channel="Dev1/ai0",
+        kind="analog",
+    )
+    base = _stream_configuration()
+    monitor = NidaqSignalMonitorModel()
+    monitor._configuration = NidaqSignalStreamConfiguration(
+        channels=base.channels + (laser_input,),
+        is_enabled=True,
+    )
+    monitor._hardware_enabled = True
+    app_model = _AnalysisAppStub(monitor)
+    content = AnalysisContent(app_model)
+    try:
+        assert not any(key.startswith("laser") for key in content._signal_checkboxes)
+        assert tuple(channel.name for channel in content._display_configuration().channels) == (
+            "cam_frames",
+        )
+        assert content._channel_count_label.text() == "1"
+        assert tuple(entry[0] for entry in content._rolling_plot._legend.entries) == (
+            "cam_frames (logic)",
+        )
     finally:
         content.on_close()
         content.deleteLater()
@@ -191,8 +276,9 @@ def test_laser_trace_auto_resumes_and_displays_entire_calibration_ramp(qapp):
         sample_rate_hz=1000.0,
     )
     laser = LaserModel(NullLaserController(configuration))
+    app_model = _LaserAppStub(laser)
     tab = _LaserChannelTab(
-        type("AppStub", (), {"laser": laser})(),
+        app_model,
         channel,
         True,
         configuration.sample_rate_hz,
@@ -216,6 +302,13 @@ def test_laser_trace_auto_resumes_and_displays_entire_calibration_ramp(qapp):
         diode_x, diode_y = tab._trace_data["diode"]
         assert tab._trace_streaming
         assert tab._trace_toggle_button.text() == "Pause Stream"
+        assert tab._trace_signal_checkboxes["diode"].property("signalColor") == "#128a43"
+        assert tab._trace_signal_checkboxes["copy"].property("signalColor") == "#d66b00"
+        assert tuple(entry[0] for entry in tab._trace_legend.entries) == (
+            "Command output",
+            "Diode feedback",
+            "Command copy",
+        )
         assert len(points) == len(command_x) == len(command_y) == 5
         assert len(diode_x) == len(diode_y) == 5
         assert command_y == pytest.approx([0.0, 1.0, 2.0, 3.0, 4.0])
@@ -233,5 +326,54 @@ def test_laser_trace_auto_resumes_and_displays_entire_calibration_ramp(qapp):
         assert len(tab._trace_data["command"][0]) > 5
     finally:
         laser.trace_received -= tab.append_trace
+        app_model.nidaq_signal_monitor.close()
+        laser.close()
+        tab.deleteLater()
+
+
+def test_laser_tab_owns_and_persists_its_input_stream_options(qapp):
+    channel = _laser_channel()
+    configuration = LaserSystemConfiguration.from_channels(
+        (channel,),
+        backend="null",
+        sample_rate_hz=1000.0,
+    )
+    laser = LaserModel(NullLaserController(configuration))
+    app_model = _LaserAppStub(laser)
+    tab = _LaserChannelTab(
+        app_model,
+        channel,
+        True,
+        configuration.sample_rate_hz,
+        lambda _status, operation: operation(),
+        lambda _message, _is_error: None,
+    )
+    try:
+        diode = tab._trace_signal_checkboxes["diode"]
+        command_copy = tab._trace_signal_checkboxes["copy"]
+        assert diode.isEnabled()
+        assert command_copy.isEnabled()
+        assert not diode.isChecked()
+        assert not command_copy.isChecked()
+
+        diode.setChecked(True)
+        qapp.processEvents()
+        assert tuple(
+            (stream_channel.name, stream_channel.physical_channel)
+            for stream_channel in app_model.nidaq_signal_monitor.configuration.channels
+        ) == (("laser1_diode", "Dev1/ai0"),)
+        assert app_model.signal_configuration_save_count == 1
+        assert tab._trace_daq_button.isEnabled()
+        assert tab._trace_daq_button.text() == "Start DAQ Inputs"
+
+        command_copy.setChecked(True)
+        qapp.processEvents()
+        assert tuple(
+            stream_channel.name
+            for stream_channel in app_model.nidaq_signal_monitor.configuration.channels
+        ) == ("laser1_diode", "laser1_command_copy")
+        assert app_model.signal_configuration_save_count == 2
+    finally:
+        app_model.nidaq_signal_monitor.close()
         laser.close()
         tab.deleteLater()

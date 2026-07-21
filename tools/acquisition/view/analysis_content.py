@@ -23,21 +23,16 @@ from autotrainer.device import NidaqSignalSampleBlock
 from autotrainer.pyside import CardWidget, PGWidget
 from autotrainer.pyside.content_widget import ContentWidget, invoke_method
 from tools.acquisition.model.nidaq_signal_monitor_model import NidaqSignalMonitorModel
+from tools.acquisition.view.stream_graph_style import (
+    StreamGraphLegend,
+    color_code_checkbox,
+    stream_signal_color,
+)
 
 
 logger = get_verbose_logger(__name__)
 
 _GRAY_COLOR_TUPLE = (240, 240, 240)
-_PLOT_COLORS = (
-    (30, 90, 180),
-    (210, 80, 70),
-    (50, 150, 90),
-    (180, 120, 30),
-    (135, 85, 170),
-    (70, 160, 180),
-    (80, 80, 80),
-    (190, 70, 130),
-)
 
 
 class _NidaqRollingPlot(QWidget):
@@ -52,33 +47,47 @@ class _NidaqRollingPlot(QWidget):
         self._plot.getPlotItem().getViewBox().setBackgroundColor(_GRAY_COLOR_TUPLE)
         self._plot.getAxis("bottom").setLabel("Time (s)")
         self._plot.getAxis("left").setLabel("Signal")
-        self._legend = self._plot.addLegend(offset=(-8, 8))
-        layout.addWidget(self._plot)
+        layout.addWidget(self._plot, stretch=1)
+        self._legend = StreamGraphLegend(columns=3, parent=self)
+        layout.addWidget(self._legend)
 
         self._configuration = NidaqSignalStreamConfiguration()
+        self._style_signature = tuple()
         self._curves: Dict[str, object] = {}
         self._x_values: Dict[str, List[float]] = {}
         self._y_values: Dict[str, List[float]] = {}
         self._latest_x = 0.0
 
-    def configure(self, configuration: NidaqSignalStreamConfiguration) -> None:
-        if configuration == self._configuration:
+    def configure(
+        self,
+        configuration: NidaqSignalStreamConfiguration,
+        colors_by_name: Optional[Dict[str, Tuple[int, int, int]]] = None,
+    ) -> None:
+        colors_by_name = colors_by_name or {}
+        style_signature = tuple(
+            (channel.name, colors_by_name.get(channel.name, stream_signal_color(index)))
+            for index, channel in enumerate(configuration.channels)
+        )
+        if configuration == self._configuration and style_signature == self._style_signature:
             return
         self._configuration = configuration
+        self._style_signature = style_signature
         self._plot.clear()
-        self._legend = self._plot.addLegend(offset=(-8, 8))
         self._curves.clear()
         self._x_values.clear()
         self._y_values.clear()
         self._latest_x = 0.0
+        legend_entries = []
         for index, channel in enumerate(configuration.channels):
-            color = _PLOT_COLORS[index % len(_PLOT_COLORS)]
+            color = colors_by_name.get(channel.name, stream_signal_color(index))
             style = Qt.PenStyle.DashLine if channel.kind == "digital" else Qt.PenStyle.SolidLine
-            pen = pg.mkPen(color=color, width=1.5, style=style)
+            pen = pg.mkPen(color=color, width=2.2, style=style)
             display_name = f"{channel.name} ({channel.unit})"
-            self._curves[channel.name] = self._plot.plot([], [], pen=pen, name=display_name)
+            self._curves[channel.name] = self._plot.plot([], [], pen=pen)
             self._x_values[channel.name] = []
             self._y_values[channel.name] = []
+            legend_entries.append((display_name, color, channel.kind == "digital"))
+        self._legend.set_entries(legend_entries)
         self._apply_y_range(configuration.channels)
         self._plot.setXRange(0, configuration.rolling_window_seconds, padding=0)
 
@@ -137,6 +146,8 @@ class AnalysisContent(ContentWidget):
         self._nidaq_signal_monitor = app_model.nidaq_signal_monitor
         self._signal_checkboxes: Dict[str, QCheckBox] = {}
         self._signal_candidates: Dict[str, Optional[NidaqSignalChannelConfiguration]] = {}
+        self._signal_colors: Dict[str, Tuple[int, int, int]] = {}
+        self._channel_colors_by_name: Dict[str, Tuple[int, int, int]] = {}
         self._selector_signature = None
 
         header_layout = QHBoxLayout()
@@ -248,7 +259,7 @@ class AnalysisContent(ContentWidget):
             self._selector_signature = selector_signature
             self._rebuild_signal_selector()
         display_configuration = self._display_configuration()
-        self._rolling_plot.configure(display_configuration)
+        self._rolling_plot.configure(display_configuration, self._channel_colors_by_name)
         self._stream_state_label.setText("running" if model.is_running else "stopped")
         if not model.hardware_enabled:
             self._stream_state_label.setText("disabled")
@@ -296,6 +307,8 @@ class AnalysisContent(ContentWidget):
                 widget.deleteLater()
         self._signal_checkboxes.clear()
         self._signal_candidates.clear()
+        self._signal_colors.clear()
+        self._channel_colors_by_name.clear()
 
         configuration = self._nidaq_signal_monitor.configuration
         mapped_channels = self._mapped_physical_channels()
@@ -333,24 +346,10 @@ class AnalysisContent(ContentWidget):
         ports = self._app_model.nidaq_ports
         add_candidate("cam_frames", "Camera frames", ports.cam_frames, "digital")
         add_candidate("barcode", "Barcode", ports.barcode, "digital")
-        laser_channels = {
-            int(channel.channel_id): channel
-            for channel in self._app_model.laser.configuration.channels
-        }
-        for laser_index in range(1, 5):
-            laser_channel = laser_channels.get(laser_index)
-            add_candidate(
-                f"laser{laser_index}_diode",
-                f"Laser {laser_index} diode feedback",
-                None if laser_channel is None else laser_channel.diode_input,
-                "analog",
-            )
-            add_candidate(
-                f"laser{laser_index}_command_copy",
-                f"Laser {laser_index} command copy",
-                None if laser_channel is None else laser_channel.command_copy_input,
-                "analog",
-            )
+        add_candidate("tone1", "Tone 1", ports.tone1, "digital")
+        add_candidate("tone2", "Tone 2", ports.tone2, "digital")
+        add_candidate("tone3_r", "Tone 3 right", ports.tone3_r, "digital")
+        add_candidate("tone3_l", "Tone 3 left", ports.tone3_l, "digital")
 
         candidate_physical_channels = {
             channel.physical_channel
@@ -358,19 +357,33 @@ class AnalysisContent(ContentWidget):
             if channel is not None
         }
         for channel in configuration.channels:
-            if channel.physical_channel not in candidate_physical_channels:
+            if (
+                channel.physical_channel not in candidate_physical_channels
+                and not self._is_laser_stream_channel(channel)
+            ):
                 candidates.append((f"custom:{channel.name}", channel.name, channel))
 
         selected_physical_channels = {
             channel.physical_channel
             for channel in configuration.channels
         }
-        for key, label, channel in candidates:
+        selected_colors = {
+            channel.physical_channel: stream_signal_color(index)
+            for index, channel in enumerate(
+                channel
+                for channel in configuration.channels
+                if channel.physical_channel in mapped_channels
+                and not self._is_laser_stream_channel(channel)
+            )
+        }
+        for color_index, (key, label, channel) in enumerate(candidates):
             physical_channel = None if channel is None else channel.physical_channel
+            color = selected_colors.get(physical_channel, stream_signal_color(color_index))
             is_mapped = physical_channel in mapped_channels if physical_channel else False
             is_selected = physical_channel in selected_physical_channels if physical_channel else False
             channel_text = physical_channel or "not configured"
             checkbox = QCheckBox(f"{label} — {channel_text}")
+            color_code_checkbox(checkbox, color)
             checkbox.setChecked(is_selected)
             checkbox.setEnabled(
                 self._nidaq_signal_monitor.hardware_enabled
@@ -395,6 +408,9 @@ class AnalysisContent(ContentWidget):
                 )
             )
             self._signal_candidates[key] = channel
+            self._signal_colors[key] = color
+            if channel is not None:
+                self._channel_colors_by_name[channel.name] = color
             self._signal_checkboxes[key] = checkbox
             self._signal_layout.addWidget(checkbox)
         self._signal_layout.addStretch(1)
@@ -405,16 +421,19 @@ class AnalysisContent(ContentWidget):
             return
         channels = list(self._nidaq_signal_monitor.configuration.channels)
         if checked:
-            if not any(
-                channel.physical_channel == candidate.physical_channel
+            channels = [
+                channel
                 for channel in channels
-            ):
-                channels.append(candidate)
+                if channel.name != candidate.name
+                and channel.physical_channel != candidate.physical_channel
+            ]
+            channels.append(candidate)
         else:
             channels = [
                 channel
                 for channel in channels
-                if channel.physical_channel != candidate.physical_channel
+                if channel.name != candidate.name
+                and channel.physical_channel != candidate.physical_channel
             ]
         self._app_model.update_nidaq_signal_stream_channels(channels)
 
@@ -425,6 +444,7 @@ class AnalysisContent(ContentWidget):
             channel
             for channel in configuration.channels
             if channel.physical_channel in mapped_channels
+            and not self._is_laser_stream_channel(channel)
         )
         return dataclasses.replace(
             configuration,
@@ -451,3 +471,10 @@ class AnalysisContent(ContentWidget):
                 if value:
                     mapped.add(value)
         return mapped
+
+    @staticmethod
+    def _is_laser_stream_channel(channel: NidaqSignalChannelConfiguration) -> bool:
+        name = channel.name.lower()
+        return name.startswith("laser") and (
+            name.endswith("_diode") or name.endswith("_command_copy")
+        )
