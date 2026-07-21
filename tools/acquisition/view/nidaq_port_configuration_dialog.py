@@ -11,7 +11,6 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
-    QMessageBox,
     QScrollArea,
     QTabWidget,
     QVBoxLayout,
@@ -25,6 +24,7 @@ from autotrainer.core import (
     NidaqPortConfiguration,
     SystemConfiguration,
 )
+from autotrainer.core.logging import get_verbose_logger
 from tools.acquisition.model.nidaq_discovery import (
     NidaqDevicePorts,
     device_name_from_channel,
@@ -47,6 +47,9 @@ _LASER_ROLES: Tuple[Tuple[str, str, str], ...] = (
     ("shutter", "shutter", "do"),
     ("laser_copy", "laser_copy", "ai"),
 )
+
+
+logger = get_verbose_logger(__name__)
 
 
 class NidaqPortConfigurationDialog(QDialog):
@@ -165,7 +168,7 @@ class NidaqPortConfigurationDialog(QDialog):
             self._nidaq_ports = self._build_nidaq_port_configuration(device.name)
             self._laser_configuration = self._build_laser_configuration()
         except Exception as exc:
-            QMessageBox.critical(self, "DAQ Port Configuration", str(exc) or exc.__class__.__name__)
+            logger.error("Invalid DAQ port configuration: %s", str(exc) or exc.__class__.__name__)
             return
         super().accept()
 
@@ -185,9 +188,8 @@ class NidaqPortConfigurationDialog(QDialog):
         if device is None:
             self._set_all_combos_enabled(False)
             self._set_ok_enabled(False)
-            message = self._discovery_error or "No NI-DAQ devices were discovered."
-            self._status_label.setText(message)
-            self._status_label.setStyleSheet("color: #b00020;")
+            self._status_label.setText("NI-DAQ devices available: 0")
+            self._status_label.setStyleSheet("")
             return
 
         self._set_all_combos_enabled(True)

@@ -1,4 +1,5 @@
 import os
+import logging
 import pickle
 import random
 import shutil
@@ -58,6 +59,7 @@ from tools.acquisition.view.main_content import MainContent
 from tools.acquisition.view.nidaq_port_configuration_dialog import NidaqPortConfigurationDialog
 from tools.acquisition.view.preferences_dialog import PreferencesDialog
 from tools.acquisition.view.debug_content import DebugView
+from tools.acquisition.view.status_log_handler import StatusLogHandler
 
 logger = get_verbose_logger(__name__)
 
@@ -130,6 +132,7 @@ class MainWindow(QMainWindow):
         self._stop_capture_thread = None
         self._hardware_refresh_thread = None
         self._nidaq_discovery_thread = None
+        self._status_log_handler = None
 
         self.setWindowTitle(self._title)
 
@@ -389,7 +392,7 @@ class MainWindow(QMainWindow):
         self._hardware_refresh_thread = thread
         thread.start()
 
-    def _on_hardware_refresh_finished(self, message: str, is_error: bool):
+    def _on_hardware_refresh_finished(self, message: str, _is_error: bool):
         self._hardware_refresh_thread = None
         self._status_label.setText("")
         self.main_content.set_hardware_refreshing(False)
@@ -397,8 +400,6 @@ class MainWindow(QMainWindow):
             not self._app_model.acquisition_started and self._app_model.status == AppModelStatus.IDLE
         )
         self.statusBar().showMessage(message, 12000)
-        if is_error:
-            QMessageBox.warning(self, "Hardware Refresh", message)
 
     def _on_system_mode_combo_changed(self, idx: int):
         status = self._app_model_status_combo.itemData(idx)
@@ -527,39 +528,10 @@ class MainWindow(QMainWindow):
                 ApiEventKind.calibrationDcsFailed,
                 dict(reason="MissingData")
             )
-            self.calib_diamond_triangle_action.setEnabled(False)
-            box = QMessageBox()
-            box.setWindowTitle("Please")
-            box.setText(
-                "Could not get enough or data at all,\n"
-                "please send pellet to make triangle visible in both cameras,\n"
-                "then you can retry after.")
-            box.setIcon(QMessageBox.Icon.Critical)
-
-            self._open_dialogs.append(box)
-
-            def remove():
-                self.calib_diamond_triangle_action.setEnabled(True)
-                # logger.debug("removing dialog from self.open_dialogs")
-                try:
-                    self._open_dialogs.remove(box)
-                except ValueError:  # safer
-                    pass
-
-            retry_button = box.addButton("Retry calibration", QMessageBox.ButtonRole.AcceptRole)
-            retry_button.clicked.connect(lambda: self.on_calibrate_diamond_triangle(True))
-            retry_button.clicked.connect(remove)
-            #
-            box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole).clicked.connect(remove)
-            box.setWindowModality(Qt.WindowModality.NonModal)
-            box.setModal(False)
-
-            def close_event(event):
-                remove()
-                event.accept()
-
-            box.closeEvent = close_event
-            box.show()
+            logger.error(
+                "Coordinate-system calibration failed: insufficient data. Send the pellet so the "
+                "triangle is visible in both cameras, then retry calibration."
+            )
             return
         #
         avg_pos, stdev_pos = calculate_std_dev_manual(positions)
@@ -586,13 +558,10 @@ class MainWindow(QMainWindow):
                 noisy = True
         if noisy:
             self._post_api_event(ApiEventKind.calibrationDcsFailed, dict(reason="NoisyData"))
-            rsp = QMessageBox.warning(
-                self, "Confirmation", "The data is noisy, do you want retry longer ?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            logger.error(
+                "Coordinate-system calibration failed: captured data was too noisy; retry the "
+                "calibration with a longer, stable capture."
             )
-            if rsp == QMessageBox.StandardButton.Yes:
-                self._diamond_triangle_calib_run = self._make_diamond_triangle_calib_run(2 * DEFAULT_DIAMOND_TRIANGLE_CALIB_DURATION)
-                self.on_calibrate_diamond_triangle(True)
             return
         # success
         self._post_api_event(ApiEventKind.calibrationDcsCompleted)
@@ -799,8 +768,6 @@ class MainWindow(QMainWindow):
             logger.verbose("3d-calib thread joined, error=%s", error)
             if error is not None:
                 self._post_api_event(ApiEventKind.calibration3dFailed, dict(reason=str(error)))
-                QMessageBox.warning(self, "3D calibration failed", f"Error received: {error}",
-                                    QMessageBox.StandardButton.Ok)
                 return
             self._post_api_event(ApiEventKind.calibration3dCompleted)
             backup_path = None
@@ -870,6 +837,11 @@ class MainWindow(QMainWindow):
 
     def _finish_close(self):
         logger.info("finishing close ..")
+        status_log_handler = self._status_log_handler
+        self._status_log_handler = None
+        if status_log_handler is not None:
+            logging.getLogger().removeHandler(status_log_handler)
+            status_log_handler.close()
         self.main_content.close()
         dialogs = self._open_dialogs
         self._open_dialogs = []
@@ -927,7 +899,7 @@ class MainWindow(QMainWindow):
     def _edit_daq_ports(self):
         configuration = self._app_model.loaded_configuration
         if configuration is None:
-            QMessageBox.critical(self, "DAQ Port Configuration", "No system configuration is loaded.")
+            logger.error("DAQ port configuration unavailable: no system configuration is loaded")
             return
 
         if self._nidaq_discovery_thread is not None and self._nidaq_discovery_thread.is_alive():
@@ -968,8 +940,10 @@ class MainWindow(QMainWindow):
 
         configuration = self._app_model.loaded_configuration
         if configuration is None:
-            QMessageBox.critical(self, "DAQ Port Configuration", "No system configuration is loaded.")
+            logger.error("DAQ port configuration unavailable: no system configuration is loaded")
             return
+        if discovery_error:
+            logger.error("NI-DAQ discovery failed: %s", discovery_error)
         dialog = NidaqPortConfigurationDialog(
             configuration,
             self,
@@ -985,7 +959,7 @@ class MainWindow(QMainWindow):
                 dialog.laser_configuration,
             )
         except Exception as exc:
-            QMessageBox.critical(self, "DAQ Port Configuration", str(exc) or exc.__class__.__name__)
+            logger.exception("Failed to save DAQ port configuration: %s", exc)
             return
         self.statusBar().showMessage("DAQ port configuration saved", 5000)
 
@@ -1082,8 +1056,8 @@ class MainWindow(QMainWindow):
         action.setCheckable(True)
         action.triggered.connect(self.on_3d_calibrate)
 
-        action = self.view_diagnostics_action = QAction("Diagnostics", self)
-        action.setToolTip("Show or hide diagnostics panel")
+        action = self.view_diagnostics_action = QAction("Logging", self)
+        action.setToolTip("Show or hide the application logging panel")
         action.setCheckable(True)
         action.setChecked(self.main_content.is_diagnostics_visible)
         action.triggered.connect(self._toggle_diagnostics_view)
@@ -1146,9 +1120,9 @@ class MainWindow(QMainWindow):
         tools_menu.addAction(self.calib_diamond_triangle_action)
         tools_menu.addAction(self.make_3d_calib_action)
 
+        view_menu = menu_bar.addMenu("View")
+        view_menu.addAction(self.view_diagnostics_action)
         if self._is_dev:
-            view_menu = menu_bar.addMenu("View")
-            view_menu.addAction(self.view_diagnostics_action)
             view_menu.addAction(self.debug_action)
 
     def _configure_toolbar(self):
@@ -1389,7 +1363,12 @@ class MainWindow(QMainWindow):
         hbox.addWidget(lbl)
         bar.addPermanentWidget(widget)
         self.setStatusBar(bar)
+        status_log_handler = self._status_log_handler = StatusLogHandler(self._show_logged_error)
+        logging.getLogger().addHandler(status_log_handler)
         self._update_tunnel_headfix_visibility(self._app_model.hardware.tunnel_headfix_enabled)
+
+    def _show_logged_error(self, message: str) -> None:
+        self.statusBar().showMessage(message, 15000)
 
     def _toggle_diagnostics_view(self):
         self.main_content.set_diagnostics_visible(not self.main_content.is_diagnostics_visible)
@@ -1413,10 +1392,8 @@ class MainWindow(QMainWindow):
     def _show_message(self, title: str, message: str):
         @invoke_method
         def show_in_gui_thread(title=title, message=message):
-            dlg = QMessageBox(self)
-            dlg.setWindowTitle(title)
-            dlg.setText(message)
-            dlg.exec()
+            summary = next((line.strip() for line in message.splitlines() if line.strip()), title)
+            self.statusBar().showMessage(f"Error: {title}: {summary}", 15000)
         show_in_gui_thread()
 
     @invoke_method

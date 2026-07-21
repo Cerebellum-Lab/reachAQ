@@ -17,20 +17,15 @@ from autotrainer.behavior import BehaviorAlgorithm
 
 logger = get_verbose_logger(__name__)
 
-missing_file = "The configuration file {0} does not exist.  A default configuration will be loaded."
+missing_file = "The configuration file %s does not exist; a default configuration will be loaded"
 
 CardHeader.DEFAULT_BACKGROUND_COLOR = "#cfb87c"
 CardHeader.DEFAULT_TITLE_COLOR = "black"
 
 
 def verify_configuration(configuration: Optional[Path]):
-    from PySide6.QtWidgets import QMessageBox
-
     if configuration is not None and not configuration.exists():
-        # noinspection PyTypeChecker
-        result = QMessageBox.warning(None, "Configuration File not Found", missing_file.format(configuration),
-                                     QMessageBox.StandardButton.Ok, QMessageBox.StandardButton.Close)
-        return result == QMessageBox.StandardButton.Ok
+        logger.error(missing_file, configuration)
 
     return True
 

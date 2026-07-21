@@ -4,6 +4,7 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import QGridLayout, QLabel, QVBoxLayout, QWidget
 
 from autotrainer.core import MessageHandler
+from autotrainer.core.logging import get_verbose_logger
 from autotrainer.core.capture import CaptureProcessStatus
 from autotrainer.device import CanTransportConfiguration
 from autotrainer.pyside import CardWidget
@@ -11,6 +12,9 @@ from autotrainer.pyside.content_widget import ContentWidget, invoke_method
 
 from tools.acquisition.model.laser_model import LaserModel
 from tools.acquisition.model.nidaq_signal_monitor_model import NidaqSignalMonitorModel
+
+
+logger = get_verbose_logger(__name__)
 
 
 class HardwareStatusContent(ContentWidget):
@@ -21,6 +25,7 @@ class HardwareStatusContent(ContentWidget):
         self._app_model = app_model
         self._message_handler = app_model.message_handler
         self._pellet_version = "(unknown)"
+        self._reported_can_transport_error = False
         self._enabled_labels: Dict[str, QLabel] = {}
         self._device_labels: Dict[str, QLabel] = {}
         self._info_labels: Dict[str, QLabel] = {}
@@ -252,7 +257,7 @@ class HardwareStatusContent(ContentWidget):
         if status == CaptureProcessStatus.RUNNING:
             state = "running"
         elif status == CaptureProcessStatus.FAILED:
-            state = "failed"
+            state = "not running"
         else:
             state = "idle"
         return f"{camera.name}={source_name} {state}"
@@ -287,13 +292,19 @@ class HardwareStatusContent(ContentWidget):
         entry = scan_results.get(key)
         if entry is None:
             return "Not scanned", "idle"
+        if entry.state == "error":
+            return "Unavailable", "idle"
         return entry.info, entry.state
 
     def _can_transport_text(self) -> str:
         try:
             transport = CanTransportConfiguration.from_environment()
         except Exception as exc:
-            return f"config error: {exc}"
+            if not self._reported_can_transport_error:
+                logger.error("CAN transport configuration unavailable: %s", exc)
+                self._reported_can_transport_error = True
+            return "configuration unavailable"
+        self._reported_can_transport_error = False
         parts = [transport.kind.value, transport.channel]
         if transport.bitrate:
             parts.append(f"{transport.bitrate} bps")
@@ -324,8 +335,6 @@ class HardwareStatusContent(ContentWidget):
         label.setToolTip(text)
         if state == "ok":
             label.setStyleSheet("color: #1b6e3c; font-weight: 500;")
-        elif state == "error":
-            label.setStyleSheet("color: #b00020; font-weight: 600;")
         elif state == "disabled":
             label.setStyleSheet("color: #68717d;")
         else:
