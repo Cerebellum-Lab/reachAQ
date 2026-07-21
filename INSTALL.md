@@ -18,9 +18,15 @@ cd "$HOME/Documents/reachAQ"
 ./tools/install/reachaq-linux-install.sh
 ```
 
-If conda is absent, add `--install-miniconda`. Add `--run-tests` to execute the
-focused non-hardware suite. The script continues after individual command
-failures and prints a categorized report at the end.
+The installer accepts no options. It attempts every portable category in one
+run: Ubuntu packages, automatic Miniconda bootstrap when needed, the complete
+Python environment, TensorFlow-compatible CUDA libraries, Git LFS, CLI/import
+verification, GPU preflight, and the focused non-hardware suite. Individual
+failures do not stop later categories; a complete report is printed at the end.
+
+Install the NVIDIA kernel driver first so the automatic TensorFlow GPU preflight
+can pass. See the [NVIDIA/TensorFlow guide](docs/linux-install/nvidia-inference.md)
+for supported versions and diagnostics.
 
 Vendor drivers and rig configuration are intentionally separate. Use the
 [Linux installation map](linux-install-instructions.md) to select only the

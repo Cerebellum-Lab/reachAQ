@@ -3,8 +3,10 @@
 # Portable reachAQ Linux host setup.
 #
 # This script intentionally excludes hardware/model-specific drivers and
-# configuration (FLIR Spinnaker, NI-DAQ/PXI, PEAK CAN, NVIDIA/CUDA, and channel
-# mappings). Those remain in the focused guides under docs/linux-install/.
+# configuration (FLIR Spinnaker, NI-DAQ/PXI, PEAK CAN, NVIDIA kernel drivers,
+# and channel mappings). The single no-argument workflow installs every
+# portable component, including the TensorFlow-compatible CUDA user-space
+# runtime, and runs all tracked verification.
 #
 # Do not enable `set -e`: every step must be attempted independently and the
 # complete pass/fail/skip report must be printed at the end.
@@ -23,15 +25,6 @@ INSTALL_PYTHON=${REACHAQ_INSTALL_PYTHON:-3.8}
 INSTALL_CONFIG_DIR=${REACHAQ_INSTALL_CONFIG_DIR:-$HOME/Autotrainer}
 INSTALL_DATA_DIR=${REACHAQ_INSTALL_DATA_DIR:-$HOME/Documents/rawdatalocal}
 
-INSTALL_SYSTEM_PACKAGES=true
-INSTALL_PYTHON_ENV=true
-INSTALL_GIT_LFS=true
-INSTALL_VERIFY=true
-INSTALL_MINICONDA=false
-INSTALL_TEST_DEPS=true
-INSTALL_RUN_TESTS=false
-INSTALL_DRY_RUN=false
-
 CURRENT_CATEGORY="General"
 RESULT_NAMES=()
 RESULT_STATES=()
@@ -39,120 +32,15 @@ RESULT_DETAILS=()
 PASS_COUNT=0
 FAIL_COUNT=0
 SKIP_COUNT=0
-PLAN_COUNT=0
 REPORT_PRINTED=false
 CONDA_BIN=""
 
-usage() {
-    cat <<'EOF'
-Usage: tools/install/reachaq-linux-install.sh [options]
-
-Portable setup only; hardware-specific drivers are intentionally excluded.
-
-Paths and environment:
-  --repo PATH                 Repository root (default: detected checkout)
-  --env NAME                  Conda environment name (default: reachaq)
-  --python VERSION            Conda Python version (default: 3.8)
-  --config-dir PATH           Runtime configuration directory
-  --data-dir PATH             Acquisition output directory
-
-Optional behavior:
-  --install-miniconda         Install Miniconda under $HOME/miniconda3 if conda is absent
-  --without-test-deps         Install editable package without the test extra
-  --run-tests                 Run the focused non-hardware verification suite
-  --skip-system-packages      Do not run apt update/install
-  --skip-python-env           Do not create/update the conda environment
-  --skip-git-lfs              Do not initialize or pull Git LFS
-  --skip-verification         Do not run final import/CLI checks
-  --dry-run                   Print and report the planned steps without executing them
-  -h, --help                  Show this help
-
-Every operational step continues after failure. The final report lists all
-PASS/FAIL/SKIP results, and the script exits nonzero only after the full run if
-one or more steps failed.
-EOF
-}
-
-require_option_value() {
-    local option=$1
-    local remaining=$2
-    if [ "$remaining" -lt 2 ]; then
-        printf 'Option %s requires a value.\n\n' "$option" >&2
-        usage >&2
-        exit 2
-    fi
-}
-
-while [ "$#" -gt 0 ]; do
-    case "$1" in
-        --repo)
-            require_option_value "$1" "$#"
-            INSTALL_REPO=$2
-            shift 2
-            ;;
-        --env)
-            require_option_value "$1" "$#"
-            INSTALL_ENV=$2
-            shift 2
-            ;;
-        --python)
-            require_option_value "$1" "$#"
-            INSTALL_PYTHON=$2
-            shift 2
-            ;;
-        --config-dir)
-            require_option_value "$1" "$#"
-            INSTALL_CONFIG_DIR=$2
-            shift 2
-            ;;
-        --data-dir)
-            require_option_value "$1" "$#"
-            INSTALL_DATA_DIR=$2
-            shift 2
-            ;;
-        --install-miniconda)
-            INSTALL_MINICONDA=true
-            shift
-            ;;
-        --without-test-deps)
-            INSTALL_TEST_DEPS=false
-            shift
-            ;;
-        --run-tests)
-            INSTALL_RUN_TESTS=true
-            shift
-            ;;
-        --skip-system-packages)
-            INSTALL_SYSTEM_PACKAGES=false
-            shift
-            ;;
-        --skip-python-env)
-            INSTALL_PYTHON_ENV=false
-            shift
-            ;;
-        --skip-git-lfs)
-            INSTALL_GIT_LFS=false
-            shift
-            ;;
-        --skip-verification)
-            INSTALL_VERIFY=false
-            shift
-            ;;
-        --dry-run)
-            INSTALL_DRY_RUN=true
-            shift
-            ;;
-        -h|--help)
-            usage
-            exit 0
-            ;;
-        *)
-            printf 'Unknown option: %s\n\n' "$1" >&2
-            usage >&2
-            exit 2
-            ;;
-    esac
-done
+if [ "$#" -ne 0 ]; then
+    printf '%s\n' \
+        'reachaq-linux-install.sh does not accept arguments.' \
+        'Run it with no options; every install and verification category is attempted.' >&2
+    exit 2
+fi
 
 record_result() {
     local state=$1
@@ -165,7 +53,6 @@ record_result() {
         PASS) PASS_COUNT=$((PASS_COUNT + 1)) ;;
         FAIL) FAIL_COUNT=$((FAIL_COUNT + 1)) ;;
         SKIP) SKIP_COUNT=$((SKIP_COUNT + 1)) ;;
-        PLAN) PLAN_COUNT=$((PLAN_COUNT + 1)) ;;
     esac
 }
 
@@ -187,12 +74,6 @@ run_step() {
     shift
     printf '\n--- %s\n' "$name"
     print_command "$@"
-    if $INSTALL_DRY_RUN; then
-        record_result PLAN "$name" "dry run"
-        printf '[PLAN] %s\n' "$name"
-        return 0
-    fi
-
     "$@"
     local result=$?
     if [ "$result" -eq 0 ]; then
@@ -229,20 +110,18 @@ print_report() {
         printf '\n'
     done
     printf '%s\n' '------------------------------------------------------------'
-    printf 'PASS=%d FAIL=%d SKIP=%d PLAN=%d\n' \
-        "$PASS_COUNT" "$FAIL_COUNT" "$SKIP_COUNT" "$PLAN_COUNT"
+    printf 'PASS=%d FAIL=%d SKIP=%d\n' \
+        "$PASS_COUNT" "$FAIL_COUNT" "$SKIP_COUNT"
     printf 'Repository: %s\n' "$INSTALL_REPO"
     printf 'Conda environment: %s (Python %s)\n' "$INSTALL_ENV" "$INSTALL_PYTHON"
     printf 'Config directory: %s\n' "$INSTALL_CONFIG_DIR"
     printf 'Data directory: %s\n' "$INSTALL_DATA_DIR"
     if [ "$FAIL_COUNT" -gt 0 ]; then
         printf 'Completed with failures. Review every FAIL entry above.\n'
-    elif $INSTALL_DRY_RUN; then
-        printf 'Dry run complete; no changes were made.\n'
     else
-        printf 'Portable installation steps completed without reported failures.\n'
+        printf 'Installation and verification completed without reported failures.\n'
     fi
-    printf '%s\n' 'Hardware-specific drivers/configuration are not installed by this script.'
+    printf '%s\n' 'Hardware-specific kernel drivers/configuration are not installed by this script.'
 }
 
 on_exit() {
@@ -383,14 +262,112 @@ conda_run() {
 }
 
 install_editable_package() {
-    if $INSTALL_TEST_DEPS; then
-        conda_run python -m pip install -e "$INSTALL_REPO[test]"
-    else
-        conda_run python -m pip install -e "$INSTALL_REPO"
+    conda_run python -m pip install -e "$INSTALL_REPO[test]"
+}
+
+install_tensorflow_gpu_runtime() {
+    if [ "$(uname -m)" != "x86_64" ]; then
+        printf '%s\n' \
+            'The automated TensorFlow CUDA runtime install supports x86_64 only.' \
+            'Use the NVIDIA JetPack TensorFlow packages on Jetson/aarch64.' >&2
+        return 2
     fi
+
+    local tensorflow_version
+    tensorflow_version=$(conda_run python -c \
+        'from importlib.metadata import version; print(version("tensorflow"))') || return
+
+    # TensorFlow's tested build table specifies CUDA 11.8 and cuDNN 8.6 for
+    # TensorFlow 2.12 and 2.13. Keep this case explicit: silently installing a
+    # guessed runtime for a newer TensorFlow version is worse than a clear fail.
+    # https://www.tensorflow.org/install/source#gpu
+    case "$tensorflow_version" in
+        2.12.*|2.13.*)
+            ;;
+        *)
+            printf 'TensorFlow %s is not supported by this automated GPU runtime step.\n' \
+                "$tensorflow_version" >&2
+            printf '%s\n' \
+                'Consult https://www.tensorflow.org/install/source#gpu and install matching CUDA/cuDNN versions.' >&2
+            return 3
+            ;;
+    esac
+
+    printf 'Installing CUDA 11.8 and cuDNN 8.6 libraries for TensorFlow %s.\n' \
+        "$tensorflow_version"
+    conda_run python -m pip install \
+        'nvidia-cuda-runtime-cu11==11.8.89' \
+        'nvidia-cuda-cupti-cu11==11.8.87' \
+        'nvidia-cuda-nvrtc-cu11==11.8.89' \
+        'nvidia-cublas-cu11==11.11.3.6' \
+        'nvidia-cufft-cu11==10.9.0.58' \
+        'nvidia-curand-cu11==10.3.0.86' \
+        'nvidia-cusolver-cu11==11.4.1.48' \
+        'nvidia-cusparse-cu11==11.7.5.86' \
+        'nvidia-cudnn-cu11==8.6.0.163' || return
+
+    local nvidia_root
+    nvidia_root=$(conda_run python -c \
+        'import sysconfig; print(sysconfig.get_paths()["purelib"] + "/nvidia")') || return
+    local tensorflow_library_path
+    tensorflow_library_path="$nvidia_root/cublas/lib:$nvidia_root/cuda_cupti/lib"
+    tensorflow_library_path="$tensorflow_library_path:$nvidia_root/cuda_nvrtc/lib:$nvidia_root/cuda_runtime/lib"
+    tensorflow_library_path="$tensorflow_library_path:$nvidia_root/cudnn/lib:$nvidia_root/cufft/lib"
+    tensorflow_library_path="$tensorflow_library_path:$nvidia_root/curand/lib:$nvidia_root/cusolver/lib:$nvidia_root/cusparse/lib"
+
+    local existing_library_path
+    existing_library_path=$("$CONDA_BIN" env config vars list -n "$INSTALL_ENV" \
+        | sed -n 's/^LD_LIBRARY_PATH = //p')
+    if [ -n "$existing_library_path" ]; then
+        local preserved_library_path=""
+        local library_directory
+        local existing_library_directories=()
+        IFS=: read -r -a existing_library_directories <<< "$existing_library_path"
+        for library_directory in "${existing_library_directories[@]}"; do
+            case "$library_directory" in
+                "$nvidia_root"/*/lib)
+                    ;;
+                *)
+                    if [ -n "$preserved_library_path" ]; then
+                        preserved_library_path="$preserved_library_path:$library_directory"
+                    else
+                        preserved_library_path=$library_directory
+                    fi
+                    ;;
+            esac
+        done
+        if [ -n "$preserved_library_path" ]; then
+            tensorflow_library_path="$tensorflow_library_path:$preserved_library_path"
+        fi
+    fi
+    "$CONDA_BIN" env config vars set -n "$INSTALL_ENV" \
+        "LD_LIBRARY_PATH=$tensorflow_library_path"
+}
+
+verify_tensorflow_gpu_runtime() {
+    conda_run python - <<'PY'
+import tensorflow as tf
+from autotrainer.inference import detect_gpu_runtime
+
+status = detect_gpu_runtime(required_backend="tensorflow")
+print(status)
+if not status.is_available:
+    raise SystemExit(status.error)
+
+with tf.device("/GPU:0"):
+    result = tf.linalg.matmul(tf.ones((128, 128)), tf.ones((128, 128)))
+print("TensorFlow GPU calculation device:", result.device)
+if "GPU:0" not in result.device:
+    raise SystemExit("TensorFlow calculation did not execute on GPU:0")
+PY
 }
 
 git_lfs_install() {
+    local pre_push_hook="$INSTALL_REPO/.git/hooks/pre-push"
+    if [ -f "$pre_push_hook" ] && grep -q 'git lfs pre-push' "$pre_push_hook"; then
+        printf 'Compatible Git LFS pre-push hook is already installed.\n'
+        return 0
+    fi
     git -C "$INSTALL_REPO" lfs install --local
 }
 
@@ -433,10 +410,7 @@ run_step "Validate repository checkout" check_repo
 run_step "Create runtime directories" make_runtime_directories
 
 begin_category "Portable Ubuntu packages"
-if ! $INSTALL_SYSTEM_PACKAGES; then
-    skip_step "Update apt metadata" "disabled by --skip-system-packages"
-    skip_step "Install base packages" "disabled by --skip-system-packages"
-elif ! have_command apt-get; then
+if ! have_command apt-get; then
     skip_step "Update apt metadata" "apt-get is unavailable; install equivalent packages manually"
     skip_step "Install base packages" "apt-get is unavailable; install equivalent packages manually"
 else
@@ -445,57 +419,38 @@ else
 fi
 
 begin_category "Conda runtime"
-if ! $INSTALL_PYTHON_ENV; then
+CONDA_BIN=$(find_conda)
+if [ -z "$CONDA_BIN" ]; then
+    run_step "Install Miniconda" install_miniconda
     CONDA_BIN=$(find_conda)
-    if [ -n "$CONDA_BIN" ]; then
-        record_result PASS "Locate conda" "$CONDA_BIN"
-        printf '\n[PASS] Locate conda: %s\n' "$CONDA_BIN"
-    else
-        record_result FAIL "Locate conda" "not found; verification cannot use the requested environment"
-        printf '\n[FAIL] Locate conda: verification steps will be skipped\n' >&2
-    fi
-    skip_step "Create conda environment" "disabled by --skip-python-env"
-    skip_step "Upgrade Python packaging tools" "disabled by --skip-python-env"
-    skip_step "Install Python requirements" "disabled by --skip-python-env"
-    skip_step "Install reachAQ editable package" "disabled by --skip-python-env"
+fi
+if [ -z "$CONDA_BIN" ]; then
+    record_result FAIL "Locate conda" "not found after automatic Miniconda installation attempt"
+    printf '\n[FAIL] Locate conda: dependent steps will be skipped\n' >&2
+    skip_step "Create conda environment" "conda unavailable"
+    skip_step "Upgrade Python packaging tools" "conda unavailable"
+    skip_step "Install Python requirements" "conda unavailable"
+    skip_step "Install reachAQ editable package" "conda unavailable"
 else
-    CONDA_BIN=$(find_conda)
-    if [ -z "$CONDA_BIN" ] && $INSTALL_MINICONDA; then
-        run_step "Install Miniconda" install_miniconda
-        if $INSTALL_DRY_RUN; then
-            CONDA_BIN="$HOME/miniconda3/bin/conda"
-        else
-            CONDA_BIN=$(find_conda)
-        fi
-    elif [ -z "$CONDA_BIN" ]; then
-        record_result FAIL "Locate conda" "not found; rerun with --install-miniconda or install conda manually"
-        printf '\n[FAIL] Locate conda: executable not found; dependent steps will be skipped\n' >&2
-    else
-        record_result PASS "Locate conda" "$CONDA_BIN"
-        printf '\n[PASS] Locate conda: %s\n' "$CONDA_BIN"
-    fi
+    record_result PASS "Locate conda" "$CONDA_BIN"
+    printf '\n[PASS] Locate conda: %s\n' "$CONDA_BIN"
+    run_step "Create conda environment" ensure_conda_environment
+    run_step "Upgrade Python packaging tools" conda_run python -m pip install --upgrade pip setuptools wheel build
+    run_step "Install Python requirements" conda_run python -m pip install -r "$INSTALL_REPO/requirements.txt"
+    run_step "Install reachAQ editable package" install_editable_package
+fi
 
-    if [ -z "$CONDA_BIN" ]; then
-        skip_step "Create conda environment" "conda unavailable"
-        skip_step "Upgrade Python packaging tools" "conda unavailable"
-        skip_step "Install Python requirements" "conda unavailable"
-        skip_step "Install reachAQ editable package" "conda unavailable"
-    else
-        run_step "Create conda environment" ensure_conda_environment
-        run_step "Upgrade Python packaging tools" conda_run python -m pip install --upgrade pip setuptools wheel build
-        run_step "Install Python requirements" conda_run python -m pip install -r "$INSTALL_REPO/requirements.txt"
-        run_step "Install reachAQ editable package" install_editable_package
-    fi
+begin_category "TensorFlow GPU runtime"
+if [ -z "$CONDA_BIN" ]; then
+    skip_step "Install compatible CUDA user-space runtime" "conda unavailable"
+    skip_step "Verify TensorFlow GPU preflight" "conda unavailable"
+else
+    run_step "Install compatible CUDA user-space runtime" install_tensorflow_gpu_runtime
+    run_step "Verify TensorFlow GPU preflight" verify_tensorflow_gpu_runtime
 fi
 
 begin_category "Git LFS"
-if ! $INSTALL_GIT_LFS; then
-    skip_step "Initialize Git LFS" "disabled by --skip-git-lfs"
-    skip_step "Pull Git LFS assets" "disabled by --skip-git-lfs"
-elif $INSTALL_DRY_RUN; then
-    run_step "Initialize Git LFS" git_lfs_install
-    run_step "Pull Git LFS assets" git_lfs_pull
-elif ! have_command git; then
+if ! have_command git; then
     record_result FAIL "Locate git" "git executable not found"
     printf '\n[FAIL] Locate git: dependent Git LFS steps will be skipped\n' >&2
     skip_step "Initialize Git LFS" "git unavailable"
@@ -512,13 +467,7 @@ else
 fi
 
 begin_category "Portable verification"
-if ! $INSTALL_VERIFY; then
-    skip_step "Verify Python version" "disabled by --skip-verification"
-    skip_step "Verify Python dependencies" "disabled by --skip-verification"
-    skip_step "Verify generic imports" "disabled by --skip-verification"
-    skip_step "Verify GUI CLI" "disabled by --skip-verification"
-    skip_step "Verify headless CLI" "disabled by --skip-verification"
-elif [ -z "$CONDA_BIN" ]; then
+if [ -z "$CONDA_BIN" ]; then
     skip_step "Verify Python version" "conda unavailable"
     skip_step "Verify Python dependencies" "conda unavailable"
     skip_step "Verify generic imports" "conda unavailable"
@@ -532,16 +481,10 @@ else
     run_step "Verify headless CLI" conda_run auto-trainer-headless -h
 fi
 
-if $INSTALL_RUN_TESTS; then
-    if [ -z "$CONDA_BIN" ]; then
-        skip_step "Run focused non-hardware tests" "conda unavailable"
-    elif ! $INSTALL_TEST_DEPS; then
-        skip_step "Run focused non-hardware tests" "test dependencies disabled"
-    else
-        run_step "Run focused non-hardware tests" run_focused_tests
-    fi
+if [ -z "$CONDA_BIN" ]; then
+    skip_step "Run focused non-hardware tests" "conda unavailable"
 else
-    skip_step "Run focused non-hardware tests" "enable with --run-tests"
+    run_step "Run focused non-hardware tests" run_focused_tests
 fi
 
 print_report

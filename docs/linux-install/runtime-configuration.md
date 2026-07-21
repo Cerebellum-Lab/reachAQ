@@ -85,24 +85,12 @@ separate Preferences configuration directory.
 
 ## Verification
 
-Portable CLI/import checks are part of the tracked installer. Re-run them
-without installing packages:
+Portable CLI/import checks and the focused non-hardware suite are part of the
+tracked installer. The supported repair/verification workflow reruns every
+category:
 
 ```bash
-tools/install/reachaq-linux-install.sh \
-  --skip-system-packages \
-  --skip-python-env \
-  --skip-git-lfs
-```
-
-Run the tracked focused non-hardware suite:
-
-```bash
-tools/install/reachaq-linux-install.sh \
-  --skip-system-packages \
-  --skip-python-env \
-  --skip-git-lfs \
-  --run-tests
+tools/install/reachaq-linux-install.sh
 ```
 
 ## Diagnose startup waits

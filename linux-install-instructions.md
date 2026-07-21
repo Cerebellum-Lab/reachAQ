@@ -22,8 +22,9 @@ Complete only the hardware categories present on the target rig.
 | 4 | Rig configuration and launch | [Runtime guide](docs/linux-install/runtime-configuration.md) |
 
 The portable installer does **not** install FLIR, NI, PEAK out-of-tree, or
-NVIDIA drivers and does not select camera serials, DAQ channels, CAN bitrate, or
-an inference model.
+NVIDIA kernel drivers and does not select camera serials, DAQ channels, CAN
+bitrate, or an inference model. After a working NVIDIA driver is installed, an
+opt-in installer step can add the supported TensorFlow CUDA user-space runtime.
 
 ## 1. Clone the repository
 
@@ -50,24 +51,19 @@ The script installs general Ubuntu/Qt/build packages, creates the conda
 environment, installs Python dependencies and the editable project, initializes
 Git LFS, creates runtime directories, and runs generic verification.
 
-If conda is already installed:
+Run the installer:
 
 ```bash
 cd "$HOME/Documents/reachAQ"
 ./tools/install/reachaq-linux-install.sh
 ```
 
-If conda is not installed, explicitly allow the script to install Miniconda:
-
-```bash
-./tools/install/reachaq-linux-install.sh --install-miniconda
-```
-
-To include the focused non-hardware tests:
-
-```bash
-./tools/install/reachaq-linux-install.sh --run-tests
-```
+The script accepts no options and attempts every portable category. It
+automatically installs Miniconda when Conda is absent, includes test
+dependencies, runs the focused tests, installs the supported TensorFlow GPU
+user-space runtime, and verifies the GPU. The CUDA libraries require about 1.7
+GB and remain inside the Conda environment; the script does not change the
+kernel driver or install a system-wide CUDA toolkit.
 
 ### Installer behavior
 
@@ -77,31 +73,8 @@ To include the focused non-hardware tests:
 - A complete summary is always printed at the end.
 - The final process exit is nonzero if any step failed, after all eligible steps
   have run.
-- `--dry-run` prints the plan without changing the host.
-
-Common options:
-
-| Option | Effect |
-|---|---|
-| `--repo PATH` | Use another checkout |
-| `--env NAME` | Use another conda environment name |
-| `--python VERSION` | Select the environment Python version |
-| `--config-dir PATH` | Select the configuration directory |
-| `--data-dir PATH` | Select the acquisition output directory |
-| `--install-miniconda` | Bootstrap Miniconda only when conda is absent |
-| `--run-tests` | Run the focused 46-test non-hardware/installer suite |
-| `--without-test-deps` | Omit the Python test extra |
-| `--skip-system-packages` | Skip apt update/install |
-| `--skip-python-env` | Reuse but do not modify the conda environment |
-| `--skip-git-lfs` | Skip Git LFS initialization/pull |
-| `--skip-verification` | Skip CLI/import verification |
-| `--dry-run` | Report planned commands only |
-
-Full option help:
-
-```bash
-./tools/install/reachaq-linux-install.sh --help
-```
+- Re-running the same no-argument command is the supported repair and
+  verification workflow.
 
 ## 3. Install only applicable hardware support
 
@@ -126,8 +99,9 @@ discovery.
 
 Live inference is optional. Follow the
 [NVIDIA/TensorFlow guide](docs/linux-install/nvidia-inference.md) to replace
-`nouveau`, verify `nvidia-smi`, align CUDA/cuDNN with TensorFlow, and run the
-reachAQ preflight. Otherwise launch with `--no-live-inference`.
+`nouveau`, verify `nvidia-smi`, let the installer add compatible CUDA/cuDNN,
+and run the reachAQ preflight. Otherwise launch with
+`--no-live-inference`.
 
 ## 4. Configure and launch
 

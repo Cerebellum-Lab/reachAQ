@@ -17,48 +17,27 @@ def _run_installer(*args: str) -> subprocess.CompletedProcess:
     )
 
 
-def test_portable_installer_is_executable_and_has_help():
+def test_portable_installer_is_executable_and_rejects_options():
     assert os.access(INSTALL_SCRIPT, os.X_OK)
 
     completed = _run_installer("--help")
 
-    assert completed.returncode == 0
-    assert "Every operational step continues after failure" in completed.stdout
-    assert "--dry-run" in completed.stdout
+    assert completed.returncode == 2
+    assert "does not accept arguments" in completed.stderr
+    assert "Run it with no options" in completed.stderr
 
 
-def test_portable_installer_dry_run_reports_plan_without_changes():
-    completed = _run_installer("--dry-run", "--install-miniconda")
+def test_portable_installer_always_attempts_complete_workflow():
+    source = INSTALL_SCRIPT.read_text()
 
-    assert completed.returncode == 0
-    assert "reachAQ portable install report" in completed.stdout
-    assert "PLAN  Preflight | Validate repository checkout" in completed.stdout
-    assert "Dry run complete; no changes were made." in completed.stdout
-
-
-def test_portable_installer_continues_after_failure_and_reports_at_end(tmp_path):
-    config_dir = tmp_path / "config"
-    data_dir = tmp_path / "data"
-    completed = _run_installer(
-        "--repo",
-        str(tmp_path / "missing-repository"),
-        "--config-dir",
-        str(config_dir),
-        "--data-dir",
-        str(data_dir),
-        "--skip-system-packages",
-        "--skip-python-env",
-        "--skip-git-lfs",
-        "--skip-verification",
-    )
-
-    output = completed.stdout + completed.stderr
-    assert completed.returncode == 1
-    assert config_dir.is_dir()
-    assert data_dir.is_dir()
-    assert "FAIL  Preflight | Validate repository checkout" in output
-    assert "PASS  Preflight | Create runtime directories" in output
-    assert "Completed with failures. Review every FAIL entry above." in output
+    assert 'run_step "Install Miniconda" install_miniconda' in source
+    assert 'begin_category "TensorFlow GPU runtime"' in source
+    assert 'run_step "Verify TensorFlow GPU preflight"' in source
+    assert 'run_step "Run focused non-hardware tests"' in source
+    assert "[options]" not in source
+    assert "--skip-" not in source
+    assert "--install-tensorflow-gpu" not in source
+    assert "grep -q 'git lfs pre-push'" in source
 
 
 def test_documented_conda_application_launches_stream_terminal_output():
