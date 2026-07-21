@@ -15,7 +15,13 @@ import verboselogs
 
 from autotrainer.behavior import BehaviorAlgorithm
 from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
-from autotrainer.core import SystemConfiguration, CameraConfiguration, CameraId
+from autotrainer.core import (
+    CameraConfiguration,
+    CameraId,
+    NidaqSignalChannelConfiguration,
+    NidaqSignalStreamConfiguration,
+    SystemConfiguration,
+)
 from autotrainer.video import VideoRecordMode
 from autotrainer.inference import GpuRuntimeStatus
 from tools.acquisition.model.app_model import AppModel
@@ -151,6 +157,30 @@ def test_start_stop(app_model, settings_ini_path):
     app_model.on_close()
     assert settings_ini_path.exists()  # but saved on close
     # ...
+
+
+def test_acquisition_owns_configured_signal_stream_lifecycle(app_model, monkeypatch):
+    assert app_model.load_configuration() is True
+    monitor = app_model.nidaq_signal_monitor
+    monitor._configuration = NidaqSignalStreamConfiguration(
+        channels=(
+            NidaqSignalChannelConfiguration(
+                name="cam_frames",
+                physical_channel="Dev1/port0/line0",
+                kind="digital",
+            ),
+        ),
+        is_enabled=True,
+    )
+    calls = []
+    monkeypatch.setattr(monitor, "start", lambda: calls.append("start") or True)
+    monkeypatch.setattr(monitor, "stop", lambda: calls.append("stop"))
+
+    assert app_model.capture_start() is True
+    app_model.capture_stop()
+
+    assert calls[0] == "start"
+    assert "stop" in calls[1:]
 
 
 def test_gpu_preflight_fails_before_cameras_and_hardware(

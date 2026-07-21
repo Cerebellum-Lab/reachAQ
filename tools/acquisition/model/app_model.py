@@ -1980,6 +1980,9 @@ class AppModel(ObservableObject):
         if animal is not None:
             self._set_animal_base_positions(animal)
 
+        if self._nidaq_signal_monitor.configuration.is_enabled:
+            self._nidaq_signal_monitor.start()
+
         self._acquisition_started = True
         self.status = target_status
         self.property_changed(self.Props.ACQUISITION_RUNNING, True, False)
@@ -2017,6 +2020,7 @@ class AppModel(ObservableObject):
             self._capture_stop()
         finally:
             # always:
+            self._nidaq_signal_monitor.stop()
             # must be set before try reload training plans, given checked in it
             self._acquisition_started = False
             self._acquisition_stopping = False

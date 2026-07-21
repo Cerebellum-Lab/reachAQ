@@ -142,6 +142,7 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
         self._recording_writer: Optional[csv.writer] = None
         self._recording_path: Optional[Path] = None
         self._recording_blocked = False
+        self._recording_last_flush = 0.0
         self._is_starting = False
         self._is_running = False
         self._status_message = "NI-DAQ signal stream disabled"
@@ -195,7 +196,12 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
         self._recording_blocked = False
         self._on_property_changed(self.CONFIGURATION, configuration, prev)
         if configuration.is_enabled and self._hardware_enabled:
-            self.start()
+            self._set_status("NI-DAQ signal stream stopped")
+            self._set_error("")
+            log_hardware_initialization(
+                logger,
+                "SKIP | NI-DAQ signal stream | awaiting manual or acquisition start",
+            )
         elif configuration.is_enabled:
             self._set_status("NI-DAQ hardware disabled; signal stream stopped")
             self._set_error("")
@@ -205,7 +211,7 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
             self._set_error("")
             log_hardware_initialization(logger, "SKIP | NI-DAQ signal stream | disabled")
 
-    def set_hardware_enabled(self, enabled: bool, *, auto_start: bool = True) -> None:
+    def set_hardware_enabled(self, enabled: bool, *, auto_start: bool = False) -> None:
         enabled = bool(enabled)
         previous = self._hardware_enabled
         if enabled == previous:
@@ -390,8 +396,8 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
                         process.pid,
                     )
                 elif kind == _WORKER_SAMPLE:
-                    self._write_block(payload)
                     self.sample_block_received(payload)
+                    self._write_block(payload)
                 elif kind == _WORKER_ERROR:
                     message = str(payload)
                     if not worker_error:
@@ -481,6 +487,7 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
                 file.flush()
             self._recording_file = file
             self._recording_writer = writer
+            self._recording_last_flush = time.monotonic()
             self._set_recording_path(path)
         except Exception as exc:
             logger.exception("Failed to open NI-DAQ signal recording file")
@@ -509,7 +516,10 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
                             for channel in block.channels
                         ]
                     )
-                file.flush()
+                now = time.monotonic()
+                if now - self._recording_last_flush >= 1.0:
+                    file.flush()
+                    self._recording_last_flush = now
             except Exception as exc:
                 logger.exception("Failed to write NI-DAQ signal recording samples")
                 self._recording_blocked = True
@@ -520,6 +530,7 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
         file = self._recording_file
         self._recording_file = None
         self._recording_writer = None
+        self._recording_last_flush = 0.0
         if file is not None:
             try:
                 file.close()
