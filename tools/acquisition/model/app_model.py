@@ -285,7 +285,7 @@ class AppModel(ObservableObject):
         self._project_info: Optional[ProjectInfo] = None
         self._animal_name = ""
         self._notes = ""
-        self._left_camera = self._right_camera = None
+        self._left_camera = self._right_camera = self._stim_camera = None
         self._reach_cameras: Tuple[VideoCaptureModel, ...] = ()
 
         self._timer_daily: DaemonTimer = _daily_timer(0, self._on_daily_timer)
@@ -486,6 +486,10 @@ class AppModel(ObservableObject):
             (camera for camera in self._reach_cameras if camera.camera_id == CameraId.Right),
             None,
         )
+        self._stim_camera = next(
+            (camera for camera in self._reach_cameras if camera.camera_id == CameraId.Camera3),
+            None,
+        )
         self._cameras = [
             *self._reach_cameras,
             self._top_camera,
@@ -525,6 +529,32 @@ class AppModel(ObservableObject):
 
         self._reach_cameras = tuple(next_cameras)
         self._refresh_camera_collections()
+
+    @staticmethod
+    def _ensure_optional_stim_camera(configuration: SystemConfiguration) -> None:
+        """Add the standard third camera without enabling or probing it."""
+        if configuration.get_camera(CameraId.Camera3) is not None:
+            return
+        prebuffer_duration = max(
+            (
+                camera.record_prebuffer_duration
+                for camera in configuration.cameras
+                if camera.id in (CameraId.Left, CameraId.Right)
+            ),
+            default=0,
+        )
+        configuration.cameras.append(
+            CameraConfiguration(
+                id=CameraId.Camera3,
+                name="stimCam",
+                is_enabled=False,
+                is_record_enabled=False,
+                record_prebuffer_duration=prebuffer_duration,
+                scheme="random",
+                params={**_RANDOM_CAMERA_DEFAULT_PARAMS, "primary": "no"},
+            )
+        )
+        configuration._camera_map = {}
 
     @staticmethod
     def _make_random_camera_config(camera_id: CameraId) -> CameraConfiguration:
@@ -971,6 +1001,10 @@ class AppModel(ObservableObject):
     @property
     def right_camera(self):
         return self._right_camera
+
+    @property
+    def stim_camera(self):
+        return self._stim_camera
 
     @property
     def top_camera(self):
@@ -2105,6 +2139,7 @@ class AppModel(ObservableObject):
         if random_cameras:
             logger.notice("Using random camera override for this run")
             self._apply_random_camera_override(configuration)
+        self._ensure_optional_stim_camera(configuration)
 
         self._sync_reach_cameras_to_configuration(configuration)
 

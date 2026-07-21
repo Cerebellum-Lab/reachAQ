@@ -529,7 +529,7 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
 
     def load_configuration(self, conf: CameraConfiguration):
         self._id = conf.id
-        self._name = str(conf.id)
+        self._name = conf.name if conf.id == CameraId.Camera3 and conf.name else str(conf.id)
         self._cur_conf = conf  # keeping config on self too
         self.is_enabled = conf.is_enabled
         self.is_recording_enabled = conf.is_record_enabled

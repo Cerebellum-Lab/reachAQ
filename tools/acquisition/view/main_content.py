@@ -10,7 +10,7 @@ from PySide6.QtGui import QPixmap, QPainter, QPen, QPolygon, QPolygonF, QImage, 
 from PySide6.QtWidgets import QGridLayout, QHBoxLayout, QVBoxLayout, QStackedLayout, QWidget, QSizePolicy, QScrollBar, \
     QScrollArea, QLayout, QSplitter, QTabWidget
 
-from autotrainer.core import AnimalSubject, ProjectInfo
+from autotrainer.core import AnimalSubject, CameraId, ProjectInfo
 from autotrainer.core.logging import get_verbose_logger
 
 from autotrainer.inference import PoseResponse, PoseAlgorithm, InferenceStatus
@@ -45,9 +45,20 @@ _REACHAQ_PROTOCOL_UI_ENABLED = False
 
 
 def _camera_panel_title(camera_name: str) -> str:
+    if camera_name == "stimCam":
+        return "stimCam Camera"
     if camera_name.startswith("camera") and camera_name[6:].isdigit():
         return f"Camera {camera_name[6:]}"
     return f"{camera_name.capitalize()} Camera"
+
+
+def _visible_reach_cameras(cameras):
+    """Keep optional reach-camera panels out of the UI until enabled."""
+    return tuple(
+        camera
+        for camera in cameras
+        if camera.camera_id in (CameraId.Left, CameraId.Right) or camera.is_enabled
+    )
 
 
 class MainContent(ContentWidget):
@@ -238,7 +249,7 @@ class MainContent(ContentWidget):
         self._clear_reach_camera_grid()
 
         app_model = self._app_model
-        cameras = app_model.reach_cameras
+        cameras = _visible_reach_cameras(app_model.reach_cameras)
         columns = self._reach_camera_grid_columns(len(cameras))
         rows = max(1, math.ceil(len(cameras) / columns))
 

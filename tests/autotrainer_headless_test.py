@@ -101,12 +101,26 @@ def test_user_preferences(settings_ini_path, user_pref, trainer_config_dir):
 
 
 def test_load_config(app_model, trainer_config_dir, animals_dir, calib_dir, system_config):
+    from tools.acquisition.view.main_content import _visible_reach_cameras
+
     res = app_model.load_configuration()
     assert res is True
     assert app_model.left_camera.name == "left"
     assert app_model.right_camera.name == "right"
-    assert len(app_model.reach_cameras) == 2
-    assert app_model.get_camera_model(CameraId.Camera3) is None
+    assert len(app_model.reach_cameras) == 3
+    assert app_model.stim_camera is app_model.get_camera_model(CameraId.Camera3)
+    assert app_model.stim_camera.name == "stimCam"
+    assert not app_model.stim_camera.is_enabled
+    assert _visible_reach_cameras(app_model.reach_cameras) == (
+        app_model.left_camera,
+        app_model.right_camera,
+    )
+    app_model.stim_camera.is_enabled = True
+    assert _visible_reach_cameras(app_model.reach_cameras) == (
+        app_model.left_camera,
+        app_model.right_camera,
+        app_model.stim_camera,
+    )
     assert app_model.top_camera.name == "web"
     assert app_model.output_location == system_config.persistence.output_location
     pref = app_model.preferences
@@ -131,8 +145,8 @@ def test_load_config_extra_reach_camera_slot(app_model, trainer_config_dir, syst
     loaded_camera3 = app_model.get_camera_model(CameraId.Camera3)
     assert len(app_model.reach_cameras) == 3
     assert loaded_camera3.is_enabled
-    assert loaded_camera3.name == "camera3"
-    assert app_model.make_project_info().camera_names == ("camera3",)
+    assert loaded_camera3.name == "Camera3"
+    assert app_model.make_project_info().camera_names == ("Camera3",)
 
 
 def test_load_config_without_web_camera_keeps_top_disabled(app_model, trainer_config_dir, system_config):
@@ -269,8 +283,13 @@ def test_load_config_random_camera_override_adds_default_reach_cameras(app_model
 
     assert app_model.load_configuration(random_cameras=True) is True
 
-    assert tuple(cam.camera_id for cam in app_model.reach_cameras) == (CameraId.Left, CameraId.Right)
-    assert all(cam.is_enabled for cam in app_model.reach_cameras)
+    assert tuple(cam.camera_id for cam in app_model.reach_cameras) == (
+        CameraId.Left,
+        CameraId.Right,
+        CameraId.Camera3,
+    )
+    assert all(cam.is_enabled for cam in app_model.reach_cameras[:2])
+    assert not app_model.stim_camera.is_enabled
     assert all(cam.camera_source.url.startswith("random://") for cam in app_model.reach_cameras)
 
 
