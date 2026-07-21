@@ -26,9 +26,8 @@ be optimal.  Modifications are encouraged so long as the above objective is main
 
 The up-to-date session behavior is defined [here](https://lucid.app/lucidchart/fc67e3f9-932f-4450-bbc9-d26042e340b7/view?page=0_0).
 
-The figure below is a snapshot to give an idea of the flow.  _However, the live diagram should be following for development._
-
-![Behavior Flow](assets/MouseGYM%20Algorithm.png)
+Use the live diagram for development; the former repository snapshot is no
+longer maintained.
 
 ## Implementation Details
 

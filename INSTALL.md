@@ -35,23 +35,36 @@ tools as described in the Linux guide before expecting full hardware operation.
 Start the GUI with:
 
 ```bash
-conda run -n "$REACHAQ_ENV" python -m reachAQ.app --start-mode idle -c "$REACHAQ_CONFIG"
+conda run -n "$REACHAQ_ENV" python -m reachAQ.app -c "$REACHAQ_CONFIG"
 ```
+
+The GUI starts idle by default. Cameras, NI-DAQ, CAN, and live inference do not
+start until the operator selects Running. Use `--start-mode acquiring` only
+when immediate acquisition startup is intentional.
 
 For a software-only camera smoke test:
 
 ```bash
 conda run -n "$REACHAQ_ENV" python -m reachAQ.app \
-  --start-mode idle \
   --random-cameras \
+  --no-live-inference \
   -c "$REACHAQ_CONFIG"
 ```
 
-Headless mode remains available through:
+Headless mode remains available through the following command. Unlike the GUI,
+headless mode starts acquisition by default because it has no operator control
+that can start an idle process later.
 
 ```bash
-conda run -n "$REACHAQ_ENV" auto-trainer-headless --start-mode idle -c "$REACHAQ_CONFIG"
+conda run -n "$REACHAQ_ENV" auto-trainer-headless \
+  --no-live-inference \
+  -c "$REACHAQ_CONFIG"
 ```
+
+Omit `--no-live-inference` to honor the saved configuration, or use
+`--live-inference` to enable it for one run. Live inference requires a working
+NVIDIA driver and TensorFlow GPU runtime and intentionally does not use CPU
+fallback.
 
 ## Legacy Notes
 

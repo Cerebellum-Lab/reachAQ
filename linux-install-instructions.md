@@ -492,12 +492,23 @@ Basic instead of SocketCAN.
 ## Optional NVIDIA GPU
 
 The application can run without a CUDA-capable GPU when live inference is
-disabled. Live inference requires the proprietary NVIDIA driver and a working
+disabled. Live inference requires the NVIDIA CUDA driver stack (not `nouveau`) and a working
 TensorFlow GPU runtime; it does not fall back to CPU. Install the NVIDIA
 driver/CUDA stack that matches the target machine and the TensorFlow wheel in
-the Python environment. After installation:
+the Python environment. On Ubuntu, inspect the distribution recommendation,
+install it, and reboot before testing CUDA:
 
 ```bash
+ubuntu-drivers devices
+sudo ubuntu-drivers install
+sudo reboot
+```
+
+After reboot, the NVIDIA device must use the `nvidia` kernel driver rather than
+`nouveau`, and `nvidia-smi` must succeed:
+
+```bash
+lspci -nnk | grep -A3 -i nvidia
 nvidia-smi
 conda run -n "$REACHAQ_ENV" python - <<'PY'
 import tensorflow as tf
@@ -505,6 +516,14 @@ print("tensorflow", tf.__version__)
 print("gpus", tf.config.list_physical_devices("GPU"))
 PY
 ```
+
+Match CUDA and cuDNN to the TensorFlow version printed by the verification
+command; the package metadata permits multiple TensorFlow versions. For
+example, this workstation currently has TensorFlow 2.13.1, and TensorFlow 2.13
+was tested upstream with CUDA 11.8 and cuDNN 8.6. If `nvidia-smi` succeeds but
+TensorFlow returns an empty GPU list, align those user-space CUDA libraries
+before enabling live inference. See the
+[TensorFlow tested build configurations](https://www.tensorflow.org/install/source#gpu).
 
 On Jetson/aarch64, use NVIDIA's JetPack-compatible TensorFlow/Torch packages.
 The repo metadata pins Jetson-specific package builds separately from x86_64.
@@ -680,11 +699,16 @@ Run the focused non-hardware tests:
 
 ```bash
 conda run -n "$REACHAQ_ENV" python -m pytest \
+  auto-trainer-core/tests/logging_test.py \
   auto-trainer-device/tests/can_transport_test.py \
   auto-trainer-device/tests/laser_test.py \
+  auto-trainer-inference/tests/gpu_runtime_test.py \
+  tests/acquisition_args_test.py \
   tests/behavior_model_test.py::TestEmergency \
   tests/autotrainer_headless_test.py::test_cli_help \
   tests/autotrainer_headless_test.py::test_load_config \
+  tests/autotrainer_headless_test.py::test_gpu_preflight_fails_before_cameras_and_hardware \
+  tests/autotrainer_headless_test.py::test_live_inference_override_is_not_persisted_with_other_configuration_changes \
   tests/autotrainer_headless_test.py::test_load_config_extra_reach_camera_slot \
   tests/autotrainer_headless_test.py::test_load_config_random_camera_override \
   tests/autotrainer_headless_test.py::test_load_config_random_camera_override_adds_default_reach_cameras \
@@ -713,24 +737,38 @@ conda run -n "$REACHAQ_ENV" python -m pytest \
 - If TensorFlow cannot see a CUDA GPU, disable live inference in Preferences or
   launch with `--no-live-inference`. Live inference intentionally refuses to
   run on CPU.
+- During hardware startup, search the terminal or application log for the last
+  `HARDWARE INIT | START` record. Matching `READY`, `SKIP`, and `FAILED` records
+  include elapsed time and identify camera, CAN, NI-DAQ, laser, or GPU progress.
+- Opening Edit DAQ Ports performs NI-DAQ discovery in a background worker. The
+  UI should remain responsive and display `Discovering NI-DAQ devices...` until
+  the editor or an error result appears.
 
 ## Current Workstation Reference
 
-The machine used to build these notes was checked on 2026-07-17:
+The machine used to build these notes was last checked on 2026-07-21:
 
+- Model: Dell Precision 3660 Tower.
 - OS: Ubuntu 22.04.5 LTS, x86_64.
 - Kernel: `6.8.0-124-generic`.
 - Repo: `/home/christielab10/Documents/reachAQ`, branch `devel`.
 - Conda env: `/home/christielab10/anaconda3/envs/reachaq`.
+- TensorFlow: 2.13.1; its GPU build expects the compatible CUDA/cuDNN runtime
+  described above.
 - Spinnaker SDK runtime: 3.2.0.57 under `/opt/spinnaker`.
 - NI-DAQmx: 26.3.1 from the NI 2026 Q2 Ubuntu 22.04 repo.
 - PXI Platform Services: 26.3 from the NI 2026 Q2 Ubuntu 22.04 repo.
 - PXIe/MXI observation on 2026-07-17: `lsni -v` saw `MXI1` as an NI PCIe-8361
   and `PXIChassis1` as an NI PXIe-1073. `lspci` saw the NI PXI-6713 endpoint
   `1093:2b80` using kernel driver `niwf`, and `nilsdev` listed `PXI1Slot4`.
+- GPU observation on 2026-07-21: the NVIDIA Quadro T1000 was present at PCI
+  `01:00.0`, but the active kernel driver was `nouveau`, `nvidia-smi` was
+  unavailable, and TensorFlow/PyTorch reported no GPU acceleration. Keep live
+  inference disabled until the NVIDIA driver and TensorFlow CUDA runtime pass
+  the checks above.
 - CAN: PEAK PCIe card detected by `peak_pciefd`, exposing `can0` and `can1`.
 - Data output: `/home/christielab10/Documents/rawdatalocal`.
-- Focused verification result: `8 passed`.
+- Focused non-hardware verification on 2026-07-21: `36 passed`.
 
 ## Upstream References
 
@@ -752,5 +790,9 @@ The machine used to build these notes was checked on 2026-07-17:
   https://www.peak-system.com/fileadmin/media/linux/can-implementation.php
 - Teledyne FLIR Spinnaker SDK:
   https://prep.flir.com/products/spinnaker-sdk/
+- NVIDIA Ubuntu driver installation guide:
+  https://docs.nvidia.com/datacenter/tesla/driver-installation-guide/ubuntu.html
+- TensorFlow tested GPU build configurations:
+  https://www.tensorflow.org/install/source#gpu
 - GitHub Git LFS install notes:
   https://docs.github.com/en/repositories/working-with-files/managing-large-files/installing-git-large-file-storage

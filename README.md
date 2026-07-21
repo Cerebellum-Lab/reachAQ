@@ -47,6 +47,7 @@ from the core logic of the applications for two reasons:
   * `python -m reachAQ.app -c ~/Autotrainer/system_configuration.yaml`
     * The GUI starts idle by default. Use `--start-mode acquiring` only when immediate startup is intentional.
     * Use `--no-live-inference` or `--live-inference` to override the saved inference setting for one run.
+    * Hardware startup progress is written to the log and launching terminal as `HARDWARE INIT` records.
     * [Detailed Instructions](tools/acquisition/README.md)
     * Use `--random-cameras` to start with software-generated frames when no physical cameras are configured.
   * Headless implementation for command line only
@@ -61,40 +62,37 @@ from the core logic of the applications for two reasons:
 
 ## Scripts
 
-Most of the content in `scripts` are lightweight utilities to determine if various components of the system are working as expected.
+The `scripts` directory contains focused diagnostics and offline processing
+utilities. Run them from the repository root in the configured environment.
 
-* acquire_image.py
-  * Captures a single image frame from the camera specified by the `cameraurl`.
-* can_console.py
-  * A command line interface to the Alogus hardware.
-* capture_camera.py
-  * Captures 150 frames from the camera specified by the `cameraurl` argument to the location specified by `output`.
-* head_fix_console.py
-  * A command line interface to the Anshutz tunnel unit.  Will log data stream to a csv file.  Supports subset of device commands.
-* list_cameras.py
-  * List all cameras available in the system.
-* load_dlc_model.py
-  * Validates loading of a DLC model with the network module
-* pellet_delivery_console.py
-  * A command line interface to the Anshutz pellet delivery unit.  Supports a subset of device commands.
-* run_dlc_model.py
-  * Sends two saved files through a DLC model with the network module.
+* `scripts/acquire_image.py` - capture and display one frame from a camera URL.
+* `scripts/capture.py` - preview a camera for a selected frame count and
+  optionally record images/video.
+* `scripts/list_cameras.py` - list random, OpenCV/USB, Spinnaker, and playback
+  camera URL forms visible to the video layer.
+* `scripts/can_console.py` - interactive command interface for supported CAN
+  hardware.
+* `scripts/can_measure_counts.py` - legacy JerryCAN message-rate diagnostic.
+* `scripts/load_dlc_model.py` - load a DeepLabCut model and print its body-part
+  metadata.
+* `scripts/run_dlc_model.py` - run a DeepLabCut model against paired recorded
+  videos.
+* `scripts/analyse_monitor_output.py`, `scripts/process_headbar_pressure.py`, and
+  `scripts/process_sensor_data.py` - offline sensor and monitor analysis tools.
 
 ## Additional Tools
 
-* auto-trainer-device\tools\head_fix_server.py
-  * Mock server for the Anshutz tunnel unit for testing without the physical device
-  * `python auto-trainer-device\tools\head_fix_server.py`
-    * specify the serial port, `/dev/ttyACM1`, `COM4`, etc...
-    * specify measurement update frequency `-f 100` for 100 Hz
-    * specify random data vs. fixed `-r`
-    * specify firmware version to report `-v 3.0`
-  * whether set to random or fixed data, use the `s`, `d`, `a`, `t`, or `h` commands followed by the value to change those measurement values
-* auto-trainer-device\tools\pellet_server.py
-  * Mock server for the Anshutz pellet delivery unit for testing without the physical device
-  * `python auto-trainer-device\tools\pellet_server.py`
-    * specify the serial port, `/dev/ttyACM1`, `COM4`, etc...
-    * specify firmware version to report `-v 3
+Current hardware bring-up tools live under `tools/hardware`:
+
+* `tools/hardware/validate_can_hardware.py` - discover the pellet CAN board,
+  request status/configuration, or perform explicitly enabled motion tests.
+* `tools/hardware/validate_laser_hardware.py` - validate configured NI-DAQ laser
+  channels one controlled operation at a time.
+* `tools/hardware/reachaq-bring-up-can.sh` and the accompanying systemd files -
+  configure the reachAQ SocketCAN interfaces at boot.
+
+See [linux-install-instructions.md](linux-install-instructions.md) for the
+required safety flags and current invocation examples.
 
 
 ## Testing
@@ -109,15 +107,17 @@ by default.
 
 Tests that require the Alogus hardware are marked as `@pytest.mark.canbus` and are not run by default.
 
-PyTest is not installed with via the default installation. To enable testing use
+The test dependencies are optional. Install them from the repository root with:
 
-`pip install -e .[test]`
+```bash
+conda run -n reachaq python -m pip install -e '.[test]'
+```
 
 You also need git LFS installed & enabled in your clone repo:
 
 1. install with: `sudo apt-get install git-lfs  # or yum or brew eventually`
-2. enable in current clone repo with: `git lfs --install`
-3. `git lfs pull` and `git checkout` or similar command might be needed to fetch the current binary files.
+2. enable in current clone repo with: `git lfs install --local`
+3. fetch the repository's binary test assets with: `git lfs pull`
 
 Now, to run *all* default tests from the root directory:
 

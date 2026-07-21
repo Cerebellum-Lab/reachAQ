@@ -30,6 +30,19 @@ conda run -n reachaq python -m reachAQ.app \
 The random-camera override is in-memory for that run and does not overwrite the
 configured physical camera serials when the app closes.
 
+## Startup and Live Inference
+
+Selecting Running first shows `Starting acquisition...` and temporarily
+disables camera and DAQ editing. If live inference is enabled, its NVIDIA driver
+and TensorFlow GPU preflight runs before cameras, CAN, laser, or NI-DAQ hardware
+is started. A failed preflight leaves the application idle and reports that no
+capture hardware was started.
+
+The **Live inference** switch in Preferences controls the saved setting. The
+`--live-inference` and `--no-live-inference` command-line flags override that
+setting for one run without changing it; other configuration edits made during
+the run can still be saved. Live inference intentionally refuses CPU fallback.
+
 ## Configurations
 
 Configuration files load preset values for cameras, devices, NI-DAQ channels,
@@ -87,6 +100,10 @@ reported by the selected device. It also prevents duplicate channel assignments
 across roles. If a selected device has no analog input channels, analog-input
 roles are disabled instead of allowing an invalid assignment.
 
+Discovery runs in a background worker. While it is active, the UI displays
+`Discovering NI-DAQ devices...`; the editor opens when discovery completes or
+shows the discovery error if no usable device is returned.
+
 On the current PXIe-1073 / PXI-6713 setup, NI-DAQmx reports:
 
 ```text
@@ -119,17 +136,26 @@ mkdir -p "$HOME/Documents/rawdatalocal"
 
 ### Toolbar
 
-* Run/stop - start and stop acquisition and device interaction.
-* Edit Configuration - change editable module settings.
-* Preferences - set system-level application preferences.
-* Hardware Refresh - scan camera sources, NI-DAQ devices, CAN adapter, and pellet delivery board while idle.
-* Edit DAQ Ports - configure named NI-DAQ roles from discovered device channels.
+* System Mode - select Idle or Running. During transitions it explicitly shows
+  Starting or Stopping acquisition.
+* Hardware Refresh - scan camera sources, NI-DAQ devices, CAN adapter, and
+  pellet delivery board while idle.
+* Notes and Subject - set acquisition notes and select the current animal.
+* Training Mode and Protocol - select the active training workflow when the
+  protocol UI is enabled.
+* Preferences - configure live inference and other application preferences.
 
 ### Menus
 
-* File -> Open Configuration - open an existing configuration file.
-* File -> Save Configuration / Save As - save the current configuration.
-* View -> Diagnostics - show or hide the diagnostics panel.
+* File -> Quit - close the application through its controlled shutdown path.
+* Edit -> Edit Camera Settings - enable or disable editable camera fields while
+  idle.
+* Edit -> Edit DAQ Ports - discover NI-DAQ devices and configure named channel
+  roles while idle.
+* Tools -> Calibrate Coordinate System / Make 3D calibration - run the available
+  calibration workflows.
+* View -> Diagnostics / Debug - development-mode panels shown only when the
+  application is launched with development options.
 
 ### Camera Control
 
@@ -137,6 +163,24 @@ mkdir -p "$HOME/Documents/rawdatalocal"
 * Record Mode - `Continuous` records the full duration, `Trigger` records around trigger events.
 * Video Recording - writes frames to video files.
 * Image Capture - captures still images at a configured interval.
+
+## Startup Diagnostics
+
+Hardware initialization milestones are written to the normal log file and are
+always echoed to the launching terminal, even when the ordinary console log
+level is Warning. Search for records beginning with:
+
+```text
+HARDWARE INIT | START
+HARDWARE INIT | READY
+HARDWARE INIT | SKIP
+HARDWARE INIT | FAILED
+```
+
+These records cover the GPU preflight, camera discovery and child processes,
+CAN/pellet controller, NI-DAQ discovery and tasks, and laser channels. Each slow
+operation records elapsed time so the final emitted `START` line identifies the
+initialization step that is still waiting.
 
 See [../../linux-install-instructions.md](../../linux-install-instructions.md)
 and [../hardware/reachaq_system_configuration.example.yaml](../hardware/reachaq_system_configuration.example.yaml)
