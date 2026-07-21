@@ -29,6 +29,12 @@ def _set_combo_value(combo, value):
     combo.setCurrentIndex(index)
 
 
+def _set_device(dialog, device_name):
+    index = dialog._device_combo.findData(device_name)
+    assert index >= 0
+    dialog._device_combo.setCurrentIndex(index)
+
+
 def test_selected_daq_channel_is_removed_from_other_roles(qapp):
     device = NidaqDevicePorts(
         name="Dev1",
@@ -82,3 +88,47 @@ def test_duplicate_daq_channel_assignments_are_rejected(qapp):
 
     with pytest.raises(ValueError, match="Duplicate channel assignment"):
         dialog._validate_selected_channel_assignments(device)
+
+
+def test_laser_assignments_remain_visible_when_switching_channel_source(qapp):
+    output_device = NidaqDevicePorts(
+        name="DevOutputs",
+        analog_outputs=tuple(f"DevOutputs/ao{index}" for index in range(4)),
+    )
+    input_device = NidaqDevicePorts(
+        name="DevInputs",
+        analog_inputs=tuple(f"DevInputs/ai{index}" for index in range(4)),
+    )
+    dialog = NidaqPortConfigurationDialog(
+        SystemConfiguration(),
+        devices=(output_device, input_device),
+    )
+
+    _set_device(dialog, "DevOutputs")
+    for laser_index in range(1, 5):
+        _set_combo_value(
+            dialog._laser_combos[laser_index]["laser_out"],
+            f"DevOutputs/ao{laser_index - 1}",
+        )
+
+    _set_device(dialog, "DevInputs")
+    for laser_index in range(1, 5):
+        laser_out = dialog._laser_combos[laser_index]["laser_out"]
+        expected_output = f"DevOutputs/ao{laser_index - 1}"
+        assert laser_out.currentData() == expected_output
+        assert expected_output in _combo_values(laser_out)
+
+        _set_combo_value(
+            dialog._laser_combos[laser_index]["laser_copy"],
+            f"DevInputs/ai{laser_index - 1}",
+        )
+
+    assert "Assignments retained from other device(s): DevOutputs" in dialog._status_label.text()
+    assert not dialog._unsupported_selected_channels(input_device)
+
+    _set_device(dialog, "DevOutputs")
+    for laser_index in range(1, 5):
+        laser_copy = dialog._laser_combos[laser_index]["laser_copy"]
+        expected_copy = f"DevInputs/ai{laser_index - 1}"
+        assert laser_copy.currentData() == expected_copy
+        assert expected_copy in _combo_values(laser_copy)

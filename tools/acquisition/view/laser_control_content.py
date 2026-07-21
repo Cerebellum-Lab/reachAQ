@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Callable, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import pyqtgraph as pg
 from PySide6.QtCore import QObject, QThread, Signal, Slot, Qt
@@ -23,11 +23,17 @@ from PySide6.QtWidgets import (
 )
 
 from autotrainer.core.logging import get_verbose_logger
-from autotrainer.device import LaserCalibrationRamp, LaserChannelConfiguration, LaserChannelId, LaserPulseTrain
+from autotrainer.device import (
+    LaserCalibrationRamp,
+    LaserChannelConfiguration,
+    LaserChannelId,
+    LaserPulseTrain,
+    NidaqSignalSampleBlock,
+)
 from autotrainer.pyside import CardWidget, PGWidget
 from autotrainer.pyside.content_widget import ContentWidget, invoke_method
 from tools.acquisition.model.app_model import AppModel
-from tools.acquisition.model.laser_model import LaserModel
+from tools.acquisition.model.laser_model import LaserModel, LaserTraceBlock
 
 
 logger = get_verbose_logger(__name__)
@@ -35,6 +41,7 @@ logger = get_verbose_logger(__name__)
 _LASER_PULSE_TRAIN_COUNT = 4
 _DEFAULT_MINIMUM_COMMAND_VOLTS = 0.0
 _DEFAULT_MAXIMUM_COMMAND_VOLTS = 5.0
+_MAX_LASER_TRACE_POINTS = 100000
 
 
 class _LaserOperationWorker(QObject):
@@ -76,6 +83,8 @@ class _LaserChannelTab(QWidget):
         self._start_operation = start_operation
         self._set_parent_status = set_status
         self._controls_can_edit = True
+        self._trace_streaming = True
+        self._trace_data: Dict[str, Tuple[List[float], List[float]]] = {}
 
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setObjectName("LaserChannelTab")
@@ -247,6 +256,46 @@ class _LaserChannelTab(QWidget):
         ramp_layout.addWidget(ramp_actions, 2, 0, 1, 4)
         layout.addWidget(ramp_group)
 
+        trace_group = QGroupBox("Output Stream")
+        trace_layout = QVBoxLayout(trace_group)
+        trace_layout.setContentsMargins(8, 4, 8, 6)
+        trace_layout.setSpacing(4)
+        self._trace_plot = PGWidget()
+        self._trace_plot.setMinimumHeight(140)
+        self._trace_plot.setMaximumHeight(220)
+        self._trace_plot.setBackground("w")
+        self._trace_plot.getAxis("bottom").setLabel("Time", units="s")
+        self._trace_plot.getAxis("left").setLabel("Voltage", units="V")
+        self._trace_plot.getPlotItem().setDownsampling(auto=True, mode="peak")
+        self._trace_plot.getPlotItem().setClipToView(True)
+        self._trace_plot.addLegend(offset=(-8, 8))
+        self._trace_curves = {
+            "command": self._trace_plot.plot(
+                [], [], pen=pg.mkPen(color=(30, 90, 180), width=2), name="Command"
+            ),
+            "diode": self._trace_plot.plot(
+                [], [], pen=pg.mkPen(color=(210, 80, 70), width=1.5), name="Diode feedback"
+            ),
+            "copy": self._trace_plot.plot(
+                [], [], pen=pg.mkPen(color=(50, 150, 90), width=1.5), name="Command copy"
+            ),
+        }
+        self._trace_data = {
+            curve_name: ([], [])
+            for curve_name in self._trace_curves
+        }
+        trace_layout.addWidget(self._trace_plot)
+        trace_actions = QHBoxLayout()
+        self._trace_toggle_button = QPushButton("Pause Stream")
+        self._trace_clear_button = QPushButton("Clear")
+        self._trace_status = QLabel("Streaming")
+        self._trace_status.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        trace_actions.addWidget(self._trace_toggle_button)
+        trace_actions.addWidget(self._trace_clear_button)
+        trace_actions.addWidget(self._trace_status, stretch=1)
+        trace_layout.addLayout(trace_actions)
+        layout.addWidget(trace_group)
+
         self._pulse_controls = (
             self._amplitude,
             self._duration_ms,
@@ -273,6 +322,8 @@ class _LaserChannelTab(QWidget):
 
         self._run_pulse_button.clicked.connect(self._run_pulse)
         self._run_ramp_button.clicked.connect(self._run_calibration_ramp)
+        self._trace_toggle_button.clicked.connect(self._toggle_trace_stream)
+        self._trace_clear_button.clicked.connect(self._clear_trace)
         self._connect_preview_signals()
         self._refresh_trigger_mode_enabled()
         self._refresh_preview()
@@ -350,6 +401,110 @@ class _LaserChannelTab(QWidget):
             control.setEnabled(can_edit)
         self._run_ramp_button.setEnabled(can_run_ramp)
 
+    def append_trace(self, trace: LaserTraceBlock) -> None:
+        if int(trace.channel_id) != self.channel_id_value:
+            return
+        is_calibration = trace.source == "calibration"
+        if is_calibration:
+            self._set_trace_streaming(True)
+        if not self._trace_streaming:
+            return
+        if trace.replace:
+            self._clear_trace()
+        if not trace.x_values:
+            self._trace_status.setText("Calibration running — collecting diode feedback...")
+            return
+
+        if trace.replace:
+            x_values = list(trace.x_values)
+        else:
+            latest_values = [values[-1] for values, _samples in self._trace_data.values() if values]
+            append_offset = max(latest_values) + self._trace_gap(trace.x_values) if latest_values else 0.0
+            first_x = trace.x_values[0]
+            x_values = [append_offset + value - first_x for value in trace.x_values]
+        for curve_name, values in (
+            ("command", trace.command_volts),
+            ("diode", trace.diode_volts),
+            ("copy", trace.command_copy_volts),
+        ):
+            if not values:
+                continue
+            curve_x, curve_y = self._trace_data[curve_name]
+            curve_x.extend(x_values[: len(values)])
+            curve_y.extend(values)
+            if len(curve_x) > _MAX_LASER_TRACE_POINTS:
+                trim_count = len(curve_x) - _MAX_LASER_TRACE_POINTS
+                del curve_x[:trim_count]
+                del curve_y[:trim_count]
+            self._trace_curves[curve_name].setData(curve_x, curve_y)
+        self._trace_plot.enableAutoRange(axis="y")
+        populated_x_values = [
+            curve_x
+            for curve_x, _curve_y in self._trace_data.values()
+            if curve_x
+        ]
+        x_min = min(curve_x[0] for curve_x in populated_x_values)
+        x_max = max(curve_x[-1] for curve_x in populated_x_values)
+        if x_max <= x_min:
+            x_max = x_min + 0.001
+        self._trace_plot.setXRange(x_min, x_max, padding=0.02)
+        if is_calibration:
+            self._trace_status.setText(
+                f"Calibration complete — {len(trace.x_values)} ramp points displayed"
+            )
+        else:
+            self._trace_status.setText(f"Streaming — latest: {trace.source}")
+
+    def append_signal_block(self, block: NidaqSignalSampleBlock) -> None:
+        if not self._is_configured or not self._trace_streaming:
+            return
+        names_by_physical_channel = {
+            channel.physical_channel: channel.name
+            for channel in block.channels
+        }
+        diode_name = names_by_physical_channel.get(self._channel.diode_input)
+        copy_name = names_by_physical_channel.get(self._channel.command_copy_input)
+        diode_values = tuple(block.values.get(diode_name, tuple())) if diode_name else tuple()
+        copy_values = tuple(block.values.get(copy_name, tuple())) if copy_name else tuple()
+        sample_count = max(len(diode_values), len(copy_values))
+        if sample_count == 0:
+            return
+        self.append_trace(
+            LaserTraceBlock(
+                channel_id=self._channel.channel_id,
+                source="NI-DAQ input stream",
+                x_values=tuple(
+                    (block.sample_index + index) / block.sample_rate_hz
+                    for index in range(sample_count)
+                ),
+                diode_volts=diode_values,
+                command_copy_volts=copy_values,
+            )
+        )
+
+    def _toggle_trace_stream(self) -> None:
+        self._set_trace_streaming(not self._trace_streaming)
+
+    def _set_trace_streaming(self, is_streaming: bool) -> None:
+        self._trace_streaming = is_streaming
+        self._trace_toggle_button.setText("Pause Stream" if is_streaming else "Start Stream")
+        self._trace_status.setText("Streaming" if is_streaming else "Paused")
+
+    def _clear_trace(self) -> None:
+        for curve_name, curve in self._trace_curves.items():
+            self._trace_data[curve_name] = ([], [])
+            curve.setData([], [])
+        self._trace_status.setText("Streaming — cleared" if self._trace_streaming else "Paused — cleared")
+
+    @staticmethod
+    def _trace_gap(x_values: Tuple[float, ...]) -> float:
+        positive_steps = [
+            second - first
+            for first, second in zip(x_values, x_values[1:])
+            if second > first
+        ]
+        return min(positive_steps) if positive_steps else 0.001
+
     def _run_pulse(self) -> None:
         if not self._is_configured:
             self._set_parent_status(
@@ -391,13 +546,21 @@ class _LaserChannelTab(QWidget):
             return
 
         def operation():
-            points = self._app_model.laser.run_calibration_ramp(ramp)
-            self._app_model.laser.make_diode_power_curve(points)
-            last = points[-1]
-            return (
-                f"Ramp complete: {len(points)} points, last diode {last.diode_volts:.3f} V, "
-                "monotonic curve validated"
-            )
+            signal_monitor = self._app_model.nidaq_signal_monitor
+            restart_signal_stream = signal_monitor.is_running
+            if restart_signal_stream:
+                signal_monitor.stop()
+            try:
+                points = self._app_model.laser.run_calibration_ramp(ramp)
+                self._app_model.laser.make_diode_power_curve(points)
+                last = points[-1]
+                return (
+                    f"Ramp complete: {len(points)} points, last diode {last.diode_volts:.3f} V, "
+                    "monotonic curve validated"
+                )
+            finally:
+                if restart_signal_stream:
+                    signal_monitor.start()
 
         self._start_operation(f"Running laser {self._channel.channel_id.value} calibration ramp", operation)
 
@@ -586,12 +749,31 @@ class LaserControlContent(ContentWidget):
         self.setLayout(root_layout)
 
         app_model.laser.property_changed += self._on_laser_property_changed
+        app_model.laser.trace_received += self._on_laser_trace_received
+        app_model.nidaq_signal_monitor.sample_block_received += self._on_nidaq_sample_block
         self._refresh_from_model()
+
+    def on_close(self):
+        self._app_model.laser.property_changed -= self._on_laser_property_changed
+        self._app_model.laser.trace_received -= self._on_laser_trace_received
+        self._app_model.nidaq_signal_monitor.sample_block_received -= self._on_nidaq_sample_block
 
     @invoke_method
     def _on_laser_property_changed(self, property_name: str, _value, _old_value):
         if property_name in (LaserModel.CONFIGURATION, LaserModel.IS_CONNECTED):
             self._refresh_from_model()
+
+    @invoke_method
+    def _on_laser_trace_received(self, trace: LaserTraceBlock) -> None:
+        for tab in self._channel_tabs:
+            if tab.channel_id_value == int(trace.channel_id):
+                tab.append_trace(trace)
+                break
+
+    @invoke_method
+    def _on_nidaq_sample_block(self, block: NidaqSignalSampleBlock) -> None:
+        for tab in self._channel_tabs:
+            tab.append_signal_block(block)
 
     def _refresh_from_model(self) -> None:
         configuration = self._app_model.laser.configuration

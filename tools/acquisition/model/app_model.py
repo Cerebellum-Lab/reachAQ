@@ -94,7 +94,8 @@ from tools.acquisition.model.helpers import get_config_location
 from tools.acquisition.model.hardware_model import HardwareModel
 from tools.acquisition.model.inference_model import InferenceModel
 from tools.acquisition.model.laser_model import LaserModel
-from tools.acquisition.model.nidaq_discovery import discover_nidaq_devices
+from tools.acquisition.model.hardware_scan import HardwareScanEntry
+from tools.acquisition.model.nidaq_discovery import device_name_from_channel, discover_nidaq_devices
 from tools.acquisition.model.nidaq_signal_monitor_model import NidaqSignalMonitorModel
 from tools.acquisition.model.behavior_model import BehaviorModel
 from tools.acquisition.model.user_preferences import UserPreferences, get_default_animals_location
@@ -235,6 +236,7 @@ class AppModel(ObservableObject):
         TRAINING_PHASE = "training_plan.current_phase"
         TRAINING_PLAN_PROP = 'training_plan_prop'
         TRAINING_PHASE_PROP = 'training_phase_prop'
+        HARDWARE_SCAN_RESULTS = "hardware_scan_results"
 
     def __init__(
             self,
@@ -276,6 +278,7 @@ class AppModel(ObservableObject):
         self._loaded_configuration_has_runtime_override = False
         self._runtime_live_inference_override: Optional[bool] = None
         self._nidaq_ports = NidaqPortConfiguration()
+        self._hardware_scan_results: Dict[str, HardwareScanEntry] = {}
 
         self._output_location = PersistenceConfiguration.get_default_output_path().as_posix()
         self._project_info: Optional[ProjectInfo] = None
@@ -1019,12 +1022,43 @@ class AppModel(ObservableObject):
     def nidaq_ports(self) -> NidaqPortConfiguration:
         return self._nidaq_ports
 
+    @property
+    def hardware_scan_results(self) -> Dict[str, HardwareScanEntry]:
+        return dict(self._hardware_scan_results)
+
+    @property
+    def configured_nidaq_device_names(self) -> Tuple[str, ...]:
+        names: List[str] = []
+
+        def add_channel(channel_name: Optional[str]) -> None:
+            device_name = device_name_from_channel(channel_name)
+            if device_name and device_name not in names:
+                names.append(device_name)
+
+        if self._nidaq_ports.device_name:
+            names.append(self._nidaq_ports.device_name)
+        for field in dataclasses.fields(self._nidaq_ports):
+            if field.name != "device_name":
+                add_channel(getattr(self._nidaq_ports, field.name))
+        for channel in self._nidaq_signal_monitor.configuration.channels:
+            add_channel(channel.physical_channel)
+        for channel in self._laser.configuration.channels:
+            for physical_channel in (
+                channel.analog_output,
+                channel.diode_input,
+                channel.shutter_output,
+                channel.command_copy_input,
+            ):
+                add_channel(physical_channel)
+        return tuple(names)
+
     def refresh_hardware_bindings(self) -> str:
         if self._acquisition_started or self._status != AppModelStatus.IDLE:
             raise RuntimeError("Hardware refresh is only available while acquisition is idle")
 
         details: List[str] = []
         warnings_list: List[str] = []
+        scan_results: Dict[str, HardwareScanEntry] = {}
 
         try:
             camera_sources = create_camera_list(include_hardware=True)
@@ -1041,42 +1075,91 @@ class AppModel(ObservableObject):
                 )
             ]
             details.append(f"cameras {len(camera_sources)} source(s)")
+            source_names = tuple(
+                source.name or source.url
+                for source in camera_sources
+                if source.name or source.url
+            )
+            camera_info = f"{len(camera_sources)} source(s) discovered"
+            if source_names:
+                camera_info += ": " + ", ".join(source_names)
             if missing_enabled_cameras:
-                warnings_list.append(
-                    "configured camera(s) not currently discovered: "
-                    + ", ".join(missing_enabled_cameras)
-                )
+                missing_text = ", ".join(missing_enabled_cameras)
+                warnings_list.append(f"configured camera(s) not currently discovered: {missing_text}")
+                camera_info += f"; missing configured: {missing_text}"
+            scan_results["cameras"] = HardwareScanEntry(
+                camera_info,
+                "warning" if missing_enabled_cameras or not camera_sources else "ok",
+            )
         except Exception as exc:
             logger.exception("Hardware refresh camera scan failed")
-            warnings_list.append(f"camera scan failed: {str(exc) or exc.__class__.__name__}")
+            error_text = str(exc) or exc.__class__.__name__
+            warnings_list.append(f"camera scan failed: {error_text}")
+            scan_results["cameras"] = HardwareScanEntry(f"scan failed: {error_text}", "error")
 
         try:
             nidaq_devices, nidaq_error = discover_nidaq_devices()
             details.append(f"NI-DAQ {len(nidaq_devices)} device(s)")
+            discovered_nidaq_names = {device.name for device in nidaq_devices}
+            nidaq_info = f"{len(nidaq_devices)} device(s) discovered"
+            if discovered_nidaq_names:
+                nidaq_info += ": " + ", ".join(sorted(discovered_nidaq_names))
+            nidaq_state = "ok" if nidaq_devices else "warning"
             if nidaq_error:
                 warnings_list.append(nidaq_error)
-            configured_nidaq_device = self._nidaq_ports.device_name
-            discovered_nidaq_names = {device.name for device in nidaq_devices}
-            if (
-                self._hardware.nidaq_enabled
-                and configured_nidaq_device
-                and configured_nidaq_device not in discovered_nidaq_names
-            ):
-                warnings_list.append(f"configured NI-DAQ device not discovered: {configured_nidaq_device}")
+                nidaq_info += f"; {nidaq_error}"
+                nidaq_state = "error"
+            missing_nidaq_names = tuple(
+                name
+                for name in self.configured_nidaq_device_names
+                if name not in discovered_nidaq_names
+            )
+            if self._hardware.nidaq_enabled and missing_nidaq_names:
+                missing_text = ", ".join(missing_nidaq_names)
+                warnings_list.append(f"configured NI-DAQ device(s) not discovered: {missing_text}")
+                nidaq_info += f"; missing configured: {missing_text}"
+                if nidaq_state != "error":
+                    nidaq_state = "warning"
+            elif self._hardware.nidaq_enabled and not nidaq_devices:
+                warnings_list.append("no NI-DAQ devices discovered while NI-DAQ is enabled")
+            scan_results["nidaq"] = HardwareScanEntry(nidaq_info, nidaq_state)
         except Exception as exc:
             logger.exception("Hardware refresh NI-DAQ scan failed")
-            warnings_list.append(f"NI-DAQ scan failed: {str(exc) or exc.__class__.__name__}")
+            error_text = str(exc) or exc.__class__.__name__
+            warnings_list.append(f"NI-DAQ scan failed: {error_text}")
+            scan_results["nidaq"] = HardwareScanEntry(f"scan failed: {error_text}", "error")
 
-        details.append(self._scan_can_pellet_hardware(warnings_list))
+        can_pellet_info = self._scan_can_pellet_hardware(warnings_list)
+        details.append(can_pellet_info)
+        can_pellet_state = self._scan_result_state(can_pellet_info)
+        scan_results["can"] = HardwareScanEntry(can_pellet_info, can_pellet_state)
+        scan_results["pellet"] = HardwareScanEntry(can_pellet_info, can_pellet_state)
 
         laser_configuration = self._laser.configuration
         if laser_configuration.backend == "disabled":
             details.append("laser not in use")
+            scan_results["laser"] = HardwareScanEntry("not probed; backend disabled", "disabled")
         elif self._laser.is_connected:
             details.append(f"laser {laser_configuration.backend} connected")
+            scan_results["laser"] = HardwareScanEntry(
+                f"not probed; {laser_configuration.backend} connected",
+                "ok",
+            )
         else:
             details.append(f"laser {laser_configuration.backend} configured")
             warnings_list.append(f"laser backend {laser_configuration.backend} is configured but not connected")
+            scan_results["laser"] = HardwareScanEntry(
+                f"not probed; {laser_configuration.backend} configured but not connected",
+                "warning",
+            )
+
+        previous_scan_results = self._hardware_scan_results
+        self._hardware_scan_results = scan_results
+        self._on_property_changed(
+            self.Props.HARDWARE_SCAN_RESULTS,
+            dict(scan_results),
+            previous_scan_results,
+        )
 
         message = "Hardware refresh: " + ", ".join(details)
         if warnings_list:
@@ -1091,6 +1174,17 @@ class AppModel(ObservableObject):
             return f"{message}; warnings: {warning_text}"
         log_hardware_initialization(logger, "READY | hardware refresh | %s", message)
         return message
+
+    @staticmethod
+    def _scan_result_state(result: str) -> str:
+        normalized = result.lower()
+        if "failed" in normalized:
+            return "error"
+        if "unavailable" in normalized or "missing" in normalized:
+            return "warning"
+        if "not in use" in normalized or "disabled" in normalized:
+            return "disabled"
+        return "ok"
 
     def _scan_can_pellet_hardware(self, warnings_list: List[str]) -> str:
         hardware = self._hardware
@@ -2115,6 +2209,10 @@ class AppModel(ObservableObject):
         )
         self.laser.load_configuration(configuration.laser)
         self._nidaq_ports = configuration.nidaq_ports
+        self.nidaq_signal_monitor.set_hardware_enabled(
+            configuration.hardware.nidaq_enabled,
+            auto_start=False,
+        )
         self.nidaq_signal_monitor.load_configuration(configuration.nidaq_stream)
         self.behavior.load_configuration(configuration.behavior)
 
@@ -2195,6 +2293,14 @@ class AppModel(ObservableObject):
         self._loaded_configuration.nidaq_ports = nidaq_ports
         self._loaded_configuration.laser = laser_configuration
         self.configuration_loaded_event(self._loaded_configuration)
+        self.save_configuration()
+
+    def update_nidaq_signal_stream_channels(self, channels) -> None:
+        """Apply and immediately persist the Analysis panel signal selection."""
+        if self._loaded_configuration is None:
+            raise RuntimeError("Cannot update NI-DAQ stream channels before a system configuration is loaded")
+        self._nidaq_signal_monitor.set_stream_channels(channels)
+        self._loaded_configuration.nidaq_stream = self._nidaq_signal_monitor.save_configuration()
         self.save_configuration()
 
     def on_activated(self):

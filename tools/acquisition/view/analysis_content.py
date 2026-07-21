@@ -1,10 +1,21 @@
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+import dataclasses
+from typing import Dict, List, Optional, Set, Tuple
 
 import pyqtgraph as pg
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QSizePolicy, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
+)
 
 from autotrainer.core import NidaqSignalChannelConfiguration, NidaqSignalStreamConfiguration
 from autotrainer.core.logging import get_verbose_logger
@@ -51,6 +62,8 @@ class _NidaqRollingPlot(QWidget):
         self._latest_x = 0.0
 
     def configure(self, configuration: NidaqSignalStreamConfiguration) -> None:
+        if configuration == self._configuration:
+            return
         self._configuration = configuration
         self._plot.clear()
         self._legend = self._plot.addLegend(offset=(-8, 8))
@@ -78,20 +91,7 @@ class _NidaqRollingPlot(QWidget):
         self._plot.setXRange(0, self._configuration.rolling_window_seconds, padding=0)
 
     def append(self, block: NidaqSignalSampleBlock) -> None:
-        if tuple(block.channels) != tuple(self._configuration.channels):
-            self.configure(
-                NidaqSignalStreamConfiguration(
-                    channels=block.channels,
-                    is_enabled=self._configuration.is_enabled,
-                    sample_rate_hz=block.sample_rate_hz,
-                    read_chunk_size=self._configuration.read_chunk_size,
-                    rolling_window_seconds=self._configuration.rolling_window_seconds,
-                    record_to_acquisition=self._configuration.record_to_acquisition,
-                    output_name=self._configuration.output_name,
-                )
-            )
-
-        for channel in block.channels:
+        for channel in self._configuration.channels:
             values = block.values.get(channel.name)
             if not values:
                 continue
@@ -130,10 +130,14 @@ class _NidaqRollingPlot(QWidget):
 class AnalysisContent(ContentWidget):
     """Rolling NI-DAQ input stream display for acquisition hardware checks."""
 
-    def __init__(self, nidaq_signal_monitor: NidaqSignalMonitorModel):
+    def __init__(self, app_model):
         super().__init__()
 
-        self._nidaq_signal_monitor = nidaq_signal_monitor
+        self._app_model = app_model
+        self._nidaq_signal_monitor = app_model.nidaq_signal_monitor
+        self._signal_checkboxes: Dict[str, QCheckBox] = {}
+        self._signal_candidates: Dict[str, Optional[NidaqSignalChannelConfiguration]] = {}
+        self._selector_signature = None
 
         header_layout = QHBoxLayout()
         header_layout.setContentsMargins(0, 0, 0, 0)
@@ -153,7 +157,19 @@ class AnalysisContent(ContentWidget):
 
         self._card_widget = CardWidget(title="Analysis", header_right_layout=header_layout)
         self._rolling_plot = _NidaqRollingPlot()
-        self._card_widget.setContentWidget(self._rolling_plot)
+        self._content_tabs = QTabWidget()
+        self._content_tabs.setDocumentMode(True)
+        self._content_tabs.addTab(self._rolling_plot, "Stream")
+
+        self._signal_scroll = QScrollArea()
+        self._signal_scroll.setWidgetResizable(True)
+        self._signal_widget = QWidget()
+        self._signal_layout = QVBoxLayout(self._signal_widget)
+        self._signal_layout.setContentsMargins(8, 8, 8, 8)
+        self._signal_layout.setSpacing(6)
+        self._signal_scroll.setWidget(self._signal_widget)
+        self._content_tabs.addTab(self._signal_scroll, "Signals")
+        self._card_widget.setContentWidget(self._content_tabs)
 
         footer = QWidget()
         footer_layout = QHBoxLayout(footer)
@@ -174,8 +190,10 @@ class AnalysisContent(ContentWidget):
         layout.setSpacing(0)
         self.setLayout(layout)
 
-        nidaq_signal_monitor.sample_block_received += self._sample_block_received
-        nidaq_signal_monitor.property_changed += self._model_property_changed
+        self._nidaq_signal_monitor.sample_block_received += self._sample_block_received
+        self._nidaq_signal_monitor.property_changed += self._model_property_changed
+        app_model.configuration_loaded_event += self._configuration_loaded
+        app_model.laser.property_changed += self._laser_property_changed
         self._start_stop_button.clicked.connect(self._toggle_stream)
         self._clear_button.clicked.connect(self._rolling_plot.clear)
         self._refresh_from_model()
@@ -183,8 +201,12 @@ class AnalysisContent(ContentWidget):
     def on_close(self):
         self._nidaq_signal_monitor.sample_block_received -= self._sample_block_received
         self._nidaq_signal_monitor.property_changed -= self._model_property_changed
+        self._app_model.configuration_loaded_event -= self._configuration_loaded
+        self._app_model.laser.property_changed -= self._laser_property_changed
 
     def _toggle_stream(self) -> None:
+        if not self._nidaq_signal_monitor.hardware_enabled:
+            return
         if self._nidaq_signal_monitor.is_running:
             self._nidaq_signal_monitor.stop()
         else:
@@ -202,17 +224,52 @@ class AnalysisContent(ContentWidget):
     def _model_property_changed(self, _name: str, _value, _old_value) -> None:
         self._refresh_from_model()
 
+    @invoke_method
+    def _configuration_loaded(self, _configuration) -> None:
+        self._selector_signature = None
+        self._refresh_from_model()
+
+    @invoke_method
+    def _laser_property_changed(self, _name: str, _value, _old_value) -> None:
+        self._selector_signature = None
+        self._refresh_from_model()
+
     def _refresh_from_model(self) -> None:
         model = self._nidaq_signal_monitor
         configuration = model.configuration
-        self._rolling_plot.configure(configuration)
+        selector_signature = (
+            configuration.channels,
+            tuple(sorted(self._mapped_physical_channels())),
+            model.hardware_enabled,
+            model.is_starting,
+            model.is_running,
+        )
+        if selector_signature != self._selector_signature:
+            self._selector_signature = selector_signature
+            self._rebuild_signal_selector()
+        display_configuration = self._display_configuration()
+        self._rolling_plot.configure(display_configuration)
         self._stream_state_label.setText("running" if model.is_running else "stopped")
-        if not configuration.is_enabled:
+        if not model.hardware_enabled:
             self._stream_state_label.setText("disabled")
+        elif not configuration.is_enabled:
+            self._stream_state_label.setText("disabled")
+        elif model.is_starting:
+            self._stream_state_label.setText("starting")
         self._sample_rate_label.setText(f"{configuration.sample_rate_hz:g} Hz")
-        self._channel_count_label.setText(str(len(configuration.channels)))
-        self._start_stop_button.setText("Stop Stream" if model.is_running else "Start Stream")
-        self._start_stop_button.setEnabled(configuration.is_enabled)
+        self._channel_count_label.setText(str(len(display_configuration.channels)))
+        if model.is_starting:
+            self._start_stop_button.setText("Starting...")
+        else:
+            self._start_stop_button.setText("Stop Stream" if model.is_running else "Start Stream")
+        can_stream = (
+            model.hardware_enabled
+            and configuration.is_enabled
+            and bool(display_configuration.channels)
+            and not model.is_starting
+        )
+        self._start_stop_button.setEnabled(can_stream)
+        self._clear_button.setEnabled(model.hardware_enabled and bool(display_configuration.channels))
         recording_path = model.recording_path
         if not configuration.is_enabled or not model.is_running:
             self._recording_label.setText("off")
@@ -225,5 +282,172 @@ class AnalysisContent(ContentWidget):
             self._status_label.setText(error_message)
             self._status_label.setStyleSheet("color: #b00020;")
         else:
-            self._status_label.setText(model.status_message)
+            if not model.hardware_enabled:
+                self._status_label.setText("NI-DAQ hardware is disabled")
+            else:
+                self._status_label.setText(model.status_message)
             self._status_label.setStyleSheet("")
+
+    def _rebuild_signal_selector(self) -> None:
+        while self._signal_layout.count():
+            item = self._signal_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self._signal_checkboxes.clear()
+        self._signal_candidates.clear()
+
+        configuration = self._nidaq_signal_monitor.configuration
+        mapped_channels = self._mapped_physical_channels()
+        configured_by_physical = {
+            channel.physical_channel: channel
+            for channel in configuration.channels
+        }
+
+        explanation = QLabel(
+            "Choose the DAQ-port signals acquired and plotted by the shared NI-DAQ stream. "
+            "Unmapped signals remain disabled until assigned in Edit → Edit DAQ Ports."
+        )
+        explanation.setWordWrap(True)
+        self._signal_layout.addWidget(explanation)
+
+        candidates = []
+
+        def add_candidate(
+            key: str,
+            label: str,
+            physical_channel: Optional[str],
+            kind: str,
+        ) -> None:
+            channel = None
+            if physical_channel:
+                channel = configured_by_physical.get(physical_channel)
+                if channel is None:
+                    channel = NidaqSignalChannelConfiguration(
+                        name=key,
+                        physical_channel=physical_channel,
+                        kind=kind,
+                    )
+            candidates.append((key, label, channel))
+
+        ports = self._app_model.nidaq_ports
+        add_candidate("cam_frames", "Camera frames", ports.cam_frames, "digital")
+        add_candidate("barcode", "Barcode", ports.barcode, "digital")
+        laser_channels = {
+            int(channel.channel_id): channel
+            for channel in self._app_model.laser.configuration.channels
+        }
+        for laser_index in range(1, 5):
+            laser_channel = laser_channels.get(laser_index)
+            add_candidate(
+                f"laser{laser_index}_diode",
+                f"Laser {laser_index} diode feedback",
+                None if laser_channel is None else laser_channel.diode_input,
+                "analog",
+            )
+            add_candidate(
+                f"laser{laser_index}_command_copy",
+                f"Laser {laser_index} command copy",
+                None if laser_channel is None else laser_channel.command_copy_input,
+                "analog",
+            )
+
+        candidate_physical_channels = {
+            channel.physical_channel
+            for _key, _label, channel in candidates
+            if channel is not None
+        }
+        for channel in configuration.channels:
+            if channel.physical_channel not in candidate_physical_channels:
+                candidates.append((f"custom:{channel.name}", channel.name, channel))
+
+        selected_physical_channels = {
+            channel.physical_channel
+            for channel in configuration.channels
+        }
+        for key, label, channel in candidates:
+            physical_channel = None if channel is None else channel.physical_channel
+            is_mapped = physical_channel in mapped_channels if physical_channel else False
+            is_selected = physical_channel in selected_physical_channels if physical_channel else False
+            channel_text = physical_channel or "not configured"
+            checkbox = QCheckBox(f"{label} — {channel_text}")
+            checkbox.setChecked(is_selected)
+            checkbox.setEnabled(
+                self._nidaq_signal_monitor.hardware_enabled
+                and not self._nidaq_signal_monitor.is_starting
+                and not self._nidaq_signal_monitor.is_running
+                and (is_mapped or is_selected)
+            )
+            if not physical_channel:
+                checkbox.setToolTip("Assign this signal in Edit → Edit DAQ Ports first.")
+            elif not is_mapped:
+                checkbox.setToolTip(
+                    "This saved stream channel is no longer mapped. Uncheck it or restore its DAQ-port assignment."
+                )
+            elif not self._nidaq_signal_monitor.hardware_enabled:
+                checkbox.setToolTip("NI-DAQ hardware is disabled in the system configuration.")
+            elif self._nidaq_signal_monitor.is_starting or self._nidaq_signal_monitor.is_running:
+                checkbox.setToolTip("Stop the NI-DAQ stream before changing signal selections.")
+            checkbox.toggled.connect(
+                lambda checked, candidate_key=key: self._signal_selection_changed(
+                    candidate_key,
+                    checked,
+                )
+            )
+            self._signal_candidates[key] = channel
+            self._signal_checkboxes[key] = checkbox
+            self._signal_layout.addWidget(checkbox)
+        self._signal_layout.addStretch(1)
+
+    def _signal_selection_changed(self, candidate_key: str, checked: bool) -> None:
+        candidate = self._signal_candidates.get(candidate_key)
+        if candidate is None:
+            return
+        channels = list(self._nidaq_signal_monitor.configuration.channels)
+        if checked:
+            if not any(
+                channel.physical_channel == candidate.physical_channel
+                for channel in channels
+            ):
+                channels.append(candidate)
+        else:
+            channels = [
+                channel
+                for channel in channels
+                if channel.physical_channel != candidate.physical_channel
+            ]
+        self._app_model.update_nidaq_signal_stream_channels(channels)
+
+    def _display_configuration(self) -> NidaqSignalStreamConfiguration:
+        configuration = self._nidaq_signal_monitor.configuration
+        mapped_channels = self._mapped_physical_channels()
+        channels = tuple(
+            channel
+            for channel in configuration.channels
+            if channel.physical_channel in mapped_channels
+        )
+        return dataclasses.replace(
+            configuration,
+            channels=channels,
+            is_enabled=configuration.is_enabled and bool(channels),
+        )
+
+    def _mapped_physical_channels(self) -> Set[str]:
+        mapped = set()
+        ports = self._app_model.nidaq_ports
+        for field in dataclasses.fields(ports):
+            if field.name == "device_name":
+                continue
+            value = getattr(ports, field.name)
+            if value:
+                mapped.add(value)
+        for channel in self._app_model.laser.configuration.channels:
+            for value in (
+                channel.analog_output,
+                channel.diode_input,
+                channel.shutter_output,
+                channel.command_copy_input,
+            ):
+                if value:
+                    mapped.add(value)
+        return mapped

@@ -280,9 +280,7 @@ class MainContent(ContentWidget):
         mid_layout.addWidget(behavior_content)
         self._content_widgets.append(behavior_content)
 
-        self._analysis_content = AnalysisContent(
-            app_model.nidaq_signal_monitor,
-        )
+        self._analysis_content = AnalysisContent(app_model)
         mid_layout.addWidget(self._analysis_content, 1)
         self._content_widgets.append(self._analysis_content)
 

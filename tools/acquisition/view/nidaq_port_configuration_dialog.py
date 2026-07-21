@@ -75,7 +75,7 @@ class NidaqPortConfigurationDialog(QDialog):
         self._laser_combos: Dict[int, Dict[str, QComboBox]] = {}
         self._combo_kinds: Dict[QComboBox, str] = {}
         self._combo_role_names: Dict[QComboBox, str] = {}
-        self._missing_current_channels: List[str] = []
+        self._combo_selections: Dict[QComboBox, Optional[str]] = {}
         self._refreshing_channel_options = False
 
         root_layout = QVBoxLayout(self)
@@ -83,7 +83,7 @@ class NidaqPortConfigurationDialog(QDialog):
         root_layout.setSpacing(8)
 
         device_row = QHBoxLayout()
-        device_row.addWidget(QLabel("Device:"))
+        device_row.addWidget(QLabel("Channel source:"))
         self._device_combo = QComboBox()
         self._device_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
         for device_name in sorted(self._devices):
@@ -131,6 +131,7 @@ class NidaqPortConfigurationDialog(QDialog):
                 tab_layout.addRow(f"{label}:", combo)
             self._laser_combos[laser_index] = combos
             self._laser_tabs.addTab(tab, f"Laser {laser_index}")
+        self._load_configured_channel_selections()
         scroll_layout.addWidget(self._laser_tabs)
         scroll_layout.addStretch(1)
         scroll.setWidget(scroll_content)
@@ -190,39 +191,23 @@ class NidaqPortConfigurationDialog(QDialog):
             return
 
         self._set_all_combos_enabled(True)
-        self._missing_current_channels = []
-
-        current_ports = self._configuration.nidaq_ports
         for attr_name, _label, kind in _GENERAL_ROLES:
-            current_value = getattr(current_ports, attr_name)
-            missing = self._set_combo_options(
-                self._general_combos[attr_name],
-                self._options_for_kind(device, kind),
+            combo = self._general_combos[attr_name]
+            current_value = self._combo_selections[combo]
+            self._set_combo_options(
+                combo,
+                self._options_with_current(device, kind, current_value),
                 current_value,
             )
-            if missing is not None:
-                self._missing_current_channels.append(f"{attr_name}={missing}")
-
-        existing_channels = {
-            int(channel.channel_id): channel
-            for channel in self._configuration.laser.channels
-        }
         for laser_index, combos in self._laser_combos.items():
-            channel = existing_channels.get(laser_index)
-            current_values = {
-                "laser_out": None if channel is None else channel.analog_output,
-                "diode": None if channel is None else channel.diode_input,
-                "shutter": None if channel is None else channel.shutter_output,
-                "laser_copy": None if channel is None else channel.command_copy_input,
-            }
             for attr_name, _label, kind in _LASER_ROLES:
-                missing = self._set_combo_options(
-                    combos[attr_name],
-                    self._options_for_kind(device, kind),
-                    current_values[attr_name],
+                combo = combos[attr_name]
+                current_value = self._combo_selections[combo]
+                self._set_combo_options(
+                    combo,
+                    self._options_with_current(device, kind, current_value),
+                    current_value,
                 )
-                if missing is not None:
-                    self._missing_current_channels.append(f"laser{laser_index}.{attr_name}={missing}")
 
         self._refresh_channel_options()
         self._update_status_label()
@@ -230,12 +215,15 @@ class NidaqPortConfigurationDialog(QDialog):
     def _register_channel_combo(self, combo: QComboBox, kind: str, role_name: str) -> None:
         self._combo_kinds[combo] = kind
         self._combo_role_names[combo] = role_name
+        self._combo_selections[combo] = None
         combo.currentIndexChanged.connect(self._on_channel_combo_changed)
 
     def _on_channel_combo_changed(self, _index: int) -> None:
         if self._refreshing_channel_options:
             return
-        self._missing_current_channels = []
+        combo = self.sender()
+        if isinstance(combo, QComboBox) and combo in self._combo_selections:
+            self._combo_selections[combo] = self._combo_value(combo)
         self._refresh_channel_options()
         self._update_status_label()
 
@@ -247,12 +235,11 @@ class NidaqPortConfigurationDialog(QDialog):
         self._refreshing_channel_options = True
         try:
             for combo, kind in self._combo_kinds.items():
-                current_value = self._combo_value(combo)
+                current_value = self._combo_selections[combo]
                 used_elsewhere = {
                     value
-                    for other_combo in self._combo_kinds
+                    for other_combo, value in self._combo_selections.items()
                     if other_combo is not combo
-                    for value in (self._combo_value(other_combo),)
                     if value is not None
                 }
                 all_options = self._options_for_kind(device, kind)
@@ -261,10 +248,16 @@ class NidaqPortConfigurationDialog(QDialog):
                     for option in all_options
                     if option == current_value or option not in used_elsewhere
                 )
-                self._set_combo_options(combo, options, current_value)
-                has_selectable_channel = len(options) > 0
+                display_options = self._include_current_option(options, current_value)
+                self._set_combo_options(combo, display_options, current_value)
+                has_selectable_channel = len(display_options) > 0
                 combo.setEnabled(has_selectable_channel)
-                if len(all_options) == 0:
+                current_device_name = device_name_from_channel(current_value)
+                if current_value is not None and current_device_name != device.name:
+                    combo.setToolTip(
+                        f"Assigned to {current_value}. Select a {device.name} channel to replace it."
+                    )
+                elif len(all_options) == 0:
                     combo.setToolTip(f"The selected device has no {kind.upper()} channels.")
                 elif not has_selectable_channel:
                     combo.setToolTip(f"All {kind.upper()} channels on this device are already assigned.")
@@ -278,18 +271,27 @@ class NidaqPortConfigurationDialog(QDialog):
         if device is None:
             return
         status = (
-            f"Available channels: AO {len(device.analog_outputs)}, AI {len(device.analog_inputs)}, "
+            f"Channels available from {device.name}: "
+            f"AO {len(device.analog_outputs)}, AI {len(device.analog_inputs)}, "
             f"DO {len(device.digital_outputs)}, DI {len(device.digital_inputs)}"
         )
+        retained_device_names = sorted(
+            {
+                channel_device_name
+                for _role_name, _kind, value in self._selected_channel_entries()
+                for channel_device_name in (device_name_from_channel(value),)
+                if channel_device_name is not None and channel_device_name != device.name
+            }
+        )
+        if retained_device_names:
+            status += "\nAssignments retained from other device(s): " + ", ".join(retained_device_names)
         warnings = []
-        if self._missing_current_channels:
-            warnings.append(
-                "Configured channel(s) not available on this device: "
-                + ", ".join(self._missing_current_channels)
-            )
         unsupported = self._unsupported_selected_channels(device)
         if unsupported:
-            warnings.append("Selected channel(s) not supported by this device/type: " + ", ".join(unsupported))
+            warnings.append(
+                "Selected channel(s) not supported by a discovered device/type: "
+                + ", ".join(unsupported)
+            )
         duplicates = self._duplicate_selected_channels()
         if duplicates:
             warnings.append("Duplicate channel assignment(s): " + ", ".join(duplicates))
@@ -315,7 +317,7 @@ class NidaqPortConfigurationDialog(QDialog):
 
     def _build_nidaq_port_configuration(self, device_name: str) -> NidaqPortConfiguration:
         values = {
-            attr_name: self._combo_value(combo)
+            attr_name: self._combo_selections[combo]
             for attr_name, combo in self._general_combos.items()
         }
         return NidaqPortConfiguration(device_name=device_name, **values)
@@ -328,7 +330,7 @@ class NidaqPortConfigurationDialog(QDialog):
         channels = []
         for laser_index in range(1, 5):
             values = {
-                attr_name: self._combo_value(combo)
+                attr_name: self._combo_selections[combo]
                 for attr_name, combo in self._laser_combos[laser_index].items()
             }
             if not any(values.values()):
@@ -400,14 +402,31 @@ class NidaqPortConfigurationDialog(QDialog):
             return device.digital_inputs
         raise ValueError(f"Unsupported NI-DAQ channel kind: {kind}")
 
+    def _options_with_current(
+        self,
+        device: NidaqDevicePorts,
+        kind: str,
+        current_value: Optional[str],
+    ) -> Tuple[str, ...]:
+        return self._include_current_option(self._options_for_kind(device, kind), current_value)
+
+    @staticmethod
+    def _include_current_option(
+        options: Iterable[str],
+        current_value: Optional[str],
+    ) -> Tuple[str, ...]:
+        options = tuple(options)
+        if current_value is not None and current_value not in options:
+            return (current_value,) + options
+        return options
+
     def _set_combo_options(
         self,
         combo: QComboBox,
         options: Iterable[str],
         current_value: Optional[str],
-    ) -> Optional[str]:
+    ) -> None:
         options = tuple(options)
-        missing_current_value = current_value if current_value and current_value not in options else None
         combo.blockSignals(True)
         try:
             combo.clear()
@@ -418,7 +437,6 @@ class NidaqPortConfigurationDialog(QDialog):
             combo.setCurrentIndex(index if index >= 0 else 0)
         finally:
             combo.blockSignals(False)
-        return missing_current_value
 
     def _combo_value(self, combo: QComboBox) -> Optional[str]:
         value = combo.currentData()
@@ -430,15 +448,16 @@ class NidaqPortConfigurationDialog(QDialog):
     def _selected_channel_entries(self) -> Tuple[Tuple[str, str, str], ...]:
         entries = []
         for combo, kind in self._combo_kinds.items():
-            value = self._combo_value(combo)
+            value = self._combo_selections[combo]
             if value is not None:
                 entries.append((self._combo_role_names[combo], kind, value))
         return tuple(entries)
 
-    def _unsupported_selected_channels(self, device: NidaqDevicePorts) -> List[str]:
+    def _unsupported_selected_channels(self, _device: NidaqDevicePorts) -> List[str]:
         unsupported = []
         for role_name, kind, value in self._selected_channel_entries():
-            if value not in self._options_for_kind(device, kind):
+            channel_device = self._devices.get(device_name_from_channel(value))
+            if channel_device is None or value not in self._options_for_kind(channel_device, kind):
                 unsupported.append(f"{role_name}={value}")
         return unsupported
 
@@ -487,3 +506,23 @@ class NidaqPortConfigurationDialog(QDialog):
             if device_name in self._devices:
                 return device_name
         return None
+
+    def _load_configured_channel_selections(self) -> None:
+        ports = self._configuration.nidaq_ports
+        for attr_name, _label, _kind in _GENERAL_ROLES:
+            self._combo_selections[self._general_combos[attr_name]] = getattr(ports, attr_name)
+
+        existing_channels = {
+            int(channel.channel_id): channel
+            for channel in self._configuration.laser.channels
+        }
+        for laser_index, combos in self._laser_combos.items():
+            channel = existing_channels.get(laser_index)
+            values = {
+                "laser_out": None if channel is None else channel.analog_output,
+                "diode": None if channel is None else channel.diode_input,
+                "shutter": None if channel is None else channel.shutter_output,
+                "laser_copy": None if channel is None else channel.command_copy_input,
+            }
+            for attr_name, value in values.items():
+                self._combo_selections[combos[attr_name]] = value
