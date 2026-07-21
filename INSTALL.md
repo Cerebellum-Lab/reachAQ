@@ -9,33 +9,28 @@ Use that guide for a machine that needs to run the reachAQ application with
 Spinnaker cameras, NI-DAQmx/PXI hardware, PEAK SocketCAN, inference, and local
 data output.
 
-## Current ReachAQ Runtime
+## Portable installation
 
-The current Linux runtime convention is:
-
-```bash
-export REACHAQ_REPO="$HOME/Documents/reachAQ"
-export REACHAQ_ENV="reachaq"
-export REACHAQ_CONFIG="$HOME/Autotrainer/system_configuration.yaml"
-export REACHAQ_DATA="$HOME/Documents/rawdatalocal"
-```
-
-Create/install the Python environment from the repo root:
+From an existing checkout, run the tracked portable installer:
 
 ```bash
-conda create -y -n "$REACHAQ_ENV" python=3.8
-conda run -n "$REACHAQ_ENV" python -m pip install --upgrade pip setuptools wheel build
-conda run -n "$REACHAQ_ENV" python -m pip install -r requirements.txt
-conda run -n "$REACHAQ_ENV" python -m pip install -e '.[test]'
+cd "$HOME/Documents/reachAQ"
+./tools/install/reachaq-linux-install.sh
 ```
 
-Install the matching Spinnaker SDK and Python wheel, NI Linux drivers, and CAN
-tools as described in the Linux guide before expecting full hardware operation.
+If conda is absent, add `--install-miniconda`. Add `--run-tests` to execute the
+focused non-hardware suite. The script continues after individual command
+failures and prints a categorized report at the end.
+
+Vendor drivers and rig configuration are intentionally separate. Use the
+[Linux installation map](linux-install-instructions.md) to select only the
+FLIR, NI/PXI, PEAK CAN, and NVIDIA guides applicable to the target system.
 
 Start the GUI with:
 
 ```bash
-conda run -n "$REACHAQ_ENV" python -m reachAQ.app -c "$REACHAQ_CONFIG"
+conda run -n reachaq python -m reachAQ.app \
+  -c "$HOME/Autotrainer/system_configuration.yaml"
 ```
 
 The GUI starts idle by default. Cameras, NI-DAQ, CAN, and live inference do not
@@ -45,10 +40,10 @@ when immediate acquisition startup is intentional.
 For a software-only camera smoke test:
 
 ```bash
-conda run -n "$REACHAQ_ENV" python -m reachAQ.app \
+conda run -n reachaq python -m reachAQ.app \
   --random-cameras \
   --no-live-inference \
-  -c "$REACHAQ_CONFIG"
+  -c "$HOME/Autotrainer/system_configuration.yaml"
 ```
 
 Headless mode remains available through the following command. Unlike the GUI,
@@ -56,9 +51,9 @@ headless mode starts acquisition by default because it has no operator control
 that can start an idle process later.
 
 ```bash
-conda run -n "$REACHAQ_ENV" auto-trainer-headless \
+conda run -n reachaq auto-trainer-headless \
   --no-live-inference \
-  -c "$REACHAQ_CONFIG"
+  -c "$HOME/Autotrainer/system_configuration.yaml"
 ```
 
 Omit `--no-live-inference` to honor the saved configuration, or use

@@ -33,6 +33,11 @@ environment name is `reachaq`, the GUI entry point is `python -m reachAQ.app`,
 and local acquisition data should be configured under
 `$HOME/Documents/rawdatalocal`.
 
+Portable host setup is automated by
+[`tools/install/reachaq-linux-install.sh`](tools/install/reachaq-linux-install.sh).
+Vendor drivers and rig-specific hardware configuration remain in separate
+guides selected from the Linux installation map.
+
 ## Applications
 
 Applications currently use PySide6 for the user interface.  To the extent possible, this UI layer is isolated

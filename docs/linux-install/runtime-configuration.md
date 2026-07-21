@@ -1,0 +1,149 @@
+# Runtime configuration, launch, and verification
+
+Complete the portable install and each applicable hardware guide before using a
+physical subsystem.
+
+## Runtime paths
+
+```bash
+export REACHAQ_REPO="$HOME/Documents/reachAQ"
+export REACHAQ_ENV="reachaq"
+export REACHAQ_CONFIG="$HOME/Autotrainer/system_configuration.yaml"
+export REACHAQ_DATA="$HOME/Documents/rawdatalocal"
+mkdir -p "$(dirname "$REACHAQ_CONFIG")" "$REACHAQ_DATA"
+```
+
+Seed a configuration only when one does not already exist:
+
+```bash
+if [ ! -f "$REACHAQ_CONFIG" ]; then
+  cp "$REACHAQ_REPO/tools/hardware/reachaq_system_configuration.example.yaml" \
+    "$REACHAQ_CONFIG"
+fi
+```
+
+## Configuration checklist
+
+| Section | Required decision |
+|---|---|
+| `persistence.outputLocation` | Writable local acquisition directory |
+| `cameras` | Only physically present cameras; correct scheme/serial/shape/FPS |
+| `hardware.*Enabled` | Enable only connected, validated subsystems |
+| `inference.poseModelLocation` | Existing compatible model directory |
+| `laser.backend` | `nidaq` for validated hardware; otherwise `null`/`disabled` |
+| `laser.channels` | Real NI-DAQ aliases and wired channel roles |
+| `nidaqPorts`, `nidaqStream` | Real device alias and supported channel types |
+
+Use **Edit → Edit DAQ Ports** while idle to discover supported channel types and
+prevent duplicate assignments.
+
+## Safe first launch
+
+The GUI defaults to idle. This command also disables inference for the run, so
+no GPU preflight is required when the operator later selects Running:
+
+```bash
+cd "$REACHAQ_REPO"
+conda run -n "$REACHAQ_ENV" python -m reachAQ.app \
+  --no-live-inference \
+  -c "$REACHAQ_CONFIG"
+```
+
+Use `--start-mode acquiring` only when immediate acquisition startup is
+intentional. Headless mode has no idle operator control, so it starts
+acquisition by default:
+
+```bash
+conda run -n "$REACHAQ_ENV" auto-trainer-headless \
+  --no-live-inference \
+  -c "$REACHAQ_CONFIG"
+```
+
+When CAN hardware is enabled, source the validated rig environment first:
+
+```bash
+set -a
+source "$REACHAQ_REPO/tools/hardware/reachaq_hardware.env.example"
+set +a
+```
+
+## Software-only camera launch
+
+`--random-cameras` changes configured camera sources only in memory for that
+run; it does not overwrite physical camera serials on close:
+
+```bash
+conda run -n "$REACHAQ_ENV" python -m reachAQ.app \
+  --random-cameras \
+  --no-live-inference \
+  -c "$REACHAQ_CONFIG"
+```
+
+For a fully separate software configuration, use
+`tools/hardware/reachaq_random_camera_configuration.example.yaml` with a
+separate Preferences configuration directory.
+
+## Verification
+
+Portable CLI/import checks are part of the tracked installer. Re-run them
+without installing packages:
+
+```bash
+tools/install/reachaq-linux-install.sh \
+  --skip-system-packages \
+  --skip-python-env \
+  --skip-git-lfs
+```
+
+Run the tracked focused non-hardware suite:
+
+```bash
+tools/install/reachaq-linux-install.sh \
+  --skip-system-packages \
+  --skip-python-env \
+  --skip-git-lfs \
+  --run-tests
+```
+
+## Diagnose startup waits
+
+Hardware initialization milestones always go to the application log and
+launching terminal. Search for the last unmatched record:
+
+```text
+HARDWARE INIT | START
+HARDWARE INIT | READY
+HARDWARE INIT | SKIP
+HARDWARE INIT | FAILED
+```
+
+Each camera, CAN, NI-DAQ, laser, and GPU operation includes elapsed timing. The
+last `START` without a terminal state identifies the current wait.
+
+## Common failures
+
+| Symptom | Next check |
+|---|---|
+| Git LFS test asset error | `git -C "$REACHAQ_REPO" lfs pull` |
+| Qt xcb plugin error | `libxcb-cursor0`, `libxkbcommon-x11-0`, and display environment |
+| Cameras absent | Applicable [FLIR guide](flir-spinnaker.md) or USB enumeration |
+| NI devices absent | [NI-DAQ/PXI guide](ni-daq-pxi.md), starting at PCI/USB enumeration |
+| CAN interface down | [PEAK/SocketCAN guide](peak-socketcan.md), bitrate and termination |
+| TensorFlow reports no GPU | [NVIDIA guide](nvidia-inference.md) or `--no-live-inference` |
+| Output permission error | Configured data directory ownership and write permission |
+
+## Current workstation reference
+
+Last checked 2026-07-21:
+
+- Dell Precision 3660 Tower; Ubuntu 22.04.5 LTS, x86_64; kernel
+  `6.8.0-124-generic`.
+- Conda environment `/home/christielab10/anaconda3/envs/reachaq`, Python 3.8,
+  TensorFlow 2.13.1.
+- Spinnaker system runtime 3.2.0.57; bundled Python wheel 3.2.0.62.
+- NI-DAQmx 26.3.1 and PXI Platform Services 26.3; PXI-6713 alias
+  `PXI1Slot4`.
+- PEAK PCIe adapter on `peak_pciefd`, exposing `can0` and `can1`.
+- Quadro T1000 present but using `nouveau`; live inference unavailable.
+- Local output `/home/christielab10/Documents/rawdatalocal`.
+- Focused non-hardware/installer verification: 39 passed.
