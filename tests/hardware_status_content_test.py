@@ -49,6 +49,20 @@ class _AppModelStub(ObservableObject):
                 camera_source=CaptureCameraAttrs("Spinnaker 222", "spinnaker://222"),
                 capture_process_status=CaptureProcessStatus.UNKNOWN,
             ),
+            _ObservableStub(
+                name="stimCam",
+                camera_id=CameraId.Camera3,
+                is_enabled=False,
+                camera_source=CaptureCameraAttrs("stimCam", "spinnaker://333"),
+                capture_process_status=CaptureProcessStatus.UNKNOWN,
+            ),
+            _ObservableStub(
+                name="web",
+                camera_id=CameraId.Web,
+                is_enabled=True,
+                camera_source=CaptureCameraAttrs("USB Camera 0", "opencv://0"),
+                capture_process_status=CaptureProcessStatus.UNKNOWN,
+            ),
         )
         self.hardware = _ObservableStub(
             nidaq_enabled=False,
@@ -57,7 +71,15 @@ class _AppModelStub(ObservableObject):
             connected=False,
         )
         self.nidaq_signal_monitor = _ObservableStub(
-            configuration=SimpleNamespace(channels=tuple()),
+            configuration=SimpleNamespace(
+                channels=(
+                    SimpleNamespace(
+                        name="cam_frames",
+                        physical_channel="DevInputs/port0/line2",
+                        kind="digital",
+                    ),
+                )
+            ),
             is_starting=False,
             is_running=False,
         )
@@ -65,18 +87,32 @@ class _AppModelStub(ObservableObject):
             configuration=SimpleNamespace(backend="disabled", channels=tuple()),
             is_connected=False,
         )
-        self.nidaq_ports = SimpleNamespace(device_name="DevOutputs")
+        self.nidaq_ports = SimpleNamespace(
+            device_name="DevOutputs",
+            tone1="DevOutputs/port0/line0",
+        )
         self.configured_nidaq_device_names = ("DevOutputs", "DevInputs")
         self.hardware_scan_results = {
             "cameras": HardwareScanEntry(
-                "2 source(s) discovered: Spinnaker 111, Spinnaker 222",
+                "✓ 4 camera source(s)\n"
+                "→ Spinnaker 111\n"
+                "→ Spinnaker 222\n"
+                "→ Spinnaker 333\n"
+                "→ Random Image",
                 "ok",
             ),
             "nidaq": HardwareScanEntry(
-                "2 device(s) discovered: DevInputs, DevOutputs",
+                "✓ 2 NI-DAQ card(s)\n"
+                "→ DevInputs · PXI-6221 · #28853\n"
+                "→ DevOutputs · PXI-6713 · #11136",
                 "ok",
             ),
-            "can": HardwareScanEntry("PEAK PCIe adapter present; driver peak_pciefd; can0 UP", "ok"),
+            "can": HardwareScanEntry(
+                "✓ PEAK PCIe adapter · peak_pciefd\n"
+                "→ can0 ↑ · selected\n"
+                "  ↳ app: socketcan → can0",
+                "ok",
+            ),
             "pellet": HardwareScanEntry("Pellet controller not in use", "disabled"),
             "gpu": HardwareScanEntry("✓ 1 NVIDIA GPU\n→ GPU0 Test GPU · 4096 MiB · drv 1.0", "ok"),
             "laser": HardwareScanEntry("not probed; backend disabled", "disabled"),
@@ -86,21 +122,85 @@ class _AppModelStub(ObservableObject):
 def test_status_panel_columns_and_scan_results(qapp):
     content = HardwareStatusContent(_AppModelStub())
     try:
-        assert tuple(content._header_labels) == ("enabled", "devices", "info")
-        assert content._enabled_labels["nidaq"].text() == "No"
+        content.resize(480, 420)
+        content.show()
+        qapp.processEvents()
+        assert tuple(content._category_panels) == (
+            "cameras",
+            "nidaq",
+            "can",
+            "pellet",
+            "gpu",
+            "laser",
+        )
+        assert all(not panel.is_expanded for panel in content._category_panels.values())
+        assert all(label.isHidden() for label in content._info_labels.values())
+        assert all(panel.details_scroll.isHidden() for panel in content._category_panels.values())
+        assert content._enabled_labels["nidaq"].text() == "Disabled"
         assert content._device_labels["nidaq"].text() == "NI-DAQ"
         assert content._device_labels["can"].text() == "CAN Adapter"
-        assert "PEAK PCIe adapter present" in content._info_labels["can"].text()
+        can_info = content._category_panels["can"].details_text
+        assert "PEAK PCIe adapter | peak_pciefd" in can_info
+        assert "| connected" in can_info
+        assert "can0" in can_info and "| selected" in can_info and "| up" in can_info
+        assert "#f0f2f4" in content._category_panels["can"].header.styleSheet()
+        assert "#e8f5ec" in content._category_panels["cameras"].header.styleSheet()
 
-        nidaq_info = content._info_labels["nidaq"].text()
-        assert "2 device(s) discovered: DevInputs, DevOutputs" in nidaq_info
-        assert "selected: DevOutputs, DevInputs" in nidaq_info
-        assert nidaq_info.endswith("stream: disabled")
+        nidaq_panel = content._category_panels["nidaq"]
+        nidaq_info = nidaq_panel.details_text
+        nidaq_lines = nidaq_info.splitlines()
+        pipe_positions = tuple(index for index, char in enumerate(nidaq_lines[0]) if char == "|")
+        assert pipe_positions
+        assert all(
+            tuple(index for index, char in enumerate(line) if char == "|") == pipe_positions
+            for line in nidaq_lines[1:]
+            if not line.startswith("!")
+        )
+        assert "<b><u>" in content._info_labels["nidaq"].text()
+        assert "DevInputs" in nidaq_info and "PXI-6221 · #28853" in nidaq_info
+        assert "DevOutputs" in nidaq_info and "PXI-6713 · #11136" in nidaq_info
+        assert "input stream" in nidaq_info and "DevOutputs, DevInputs" in nidaq_info
+        assert "tone1" in nidaq_info and "DevOutputs/port0/line0" in nidaq_info
+        assert "cam_frames" in nidaq_info and "digital stream" in nidaq_info
 
-        camera_info = content._info_labels["cameras"].text()
-        assert "2 source(s) discovered" in camera_info
-        assert "left: Spinnaker 111 · idle" in camera_info
-        assert "GPU0 Test GPU" in content._info_labels["gpu"].text()
+        camera_info = content._category_panels["cameras"].details_text
+        assert "left" in camera_info and "111" in camera_info and "idle" in camera_info
+        assert "right" in camera_info and "222" in camera_info and "disabled" in camera_info
+        assert "stimCam" in camera_info and "333" in camera_info
+        assert "web" not in camera_info
+        assert "Random Image" not in camera_info
+        gpu_info = content._category_panels["gpu"].details_text
+        assert "GPU0" in gpu_info and "Test GPU · 4096 MiB · drv 1.0" in gpu_info
+
+        content._device_labels["can"].click()
+        qapp.processEvents()
+        assert content._category_panels["can"].is_expanded
+        assert not content._info_labels["can"].isHidden()
+        assert not content._category_panels["can"].details_scroll.isHidden()
+        assert content._category_panels["can"].details_scroll.maximumHeight() == 170
+
+        nidaq_panel.toggle_button.click()
+        nidaq_panel.details_scroll.setFixedSize(240, 72)
+        qapp.processEvents()
+        assert nidaq_panel.details_scroll.horizontalScrollBar().maximum() > 0
+        assert nidaq_panel.details_scroll.verticalScrollBar().maximum() > 0
+
+        content._device_labels["can"].click()
+        assert content._info_labels["can"].isHidden()
+        assert content._category_panels["can"].details_scroll.isHidden()
+    finally:
+        content.deleteLater()
+
+
+def test_enabled_category_uses_warning_color_from_scan(qapp):
+    app_model = _AppModelStub()
+    app_model.hardware.nidaq_enabled = True
+    app_model.hardware_scan_results["nidaq"] = HardwareScanEntry("DAQ partially ready", "warning")
+    content = HardwareStatusContent(app_model)
+    try:
+        assert content._enabled_labels["nidaq"].text() == "Enabled"
+        assert "#fff4d6" in content._category_panels["nidaq"].header.styleSheet()
+        assert content._info_labels["nidaq"].isHidden()
     finally:
         content.deleteLater()
 

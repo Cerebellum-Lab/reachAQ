@@ -232,15 +232,17 @@ mkdir -p "$HOME/Documents/rawdatalocal"
   protocol UI is enabled.
 * Preferences - configure live inference and other application preferences.
 
-The Hardware Status table uses `Enabled`, `Devices`, and `Info` columns. A scan
-runs once when the application opens; Hardware Refresh repeats it on demand.
-The table is a stable scan snapshot and is not cleared or rewritten when
-acquisition starts. `CAN Adapter` reports the physical PCIe device, kernel
-driver, and Linux CAN interfaces separately from the `Pellet Controller`
+Hardware Status uses one collapsible subpanel per category. Subpanels start
+collapsed and show only the category plus `Enabled` or `Disabled`; green,
+amber, red, blue-gray, and gray headers indicate ready, warning, failure, idle,
+and disabled states. Expand a category to see its scan and binding details. A
+scan runs once when the application opens; Hardware Refresh repeats it on
+demand. The result is a stable scan snapshot and is not cleared or rewritten
+when acquisition starts. `CAN Adapter` reports the physical PCIe device,
+kernel driver, and Linux CAN interfaces separately from the `Pellet Controller`
 application session. Compact vertical detail lines show each PXI slot and card
 model/product number, the configured CAN backend/interface, and the detected
-GPU model, memory, and driver. Discovery results remain visible even when that
-hardware category is disabled.
+GPU model, memory, and driver.
 
 ### Menus
 
@@ -281,6 +283,15 @@ These records cover the GPU preflight, camera discovery and child processes,
 CAN adapter/controller, NI-DAQ discovery and tasks, and laser channels. Each slow
 operation records elapsed time so the final emitted `START` line identifies the
 initialization step that is still waiting.
+
+Hardware Status categories are collapsed by default. Expanded categories use
+independently scrollable, fixed-width tables with aligned columns and a bold,
+underlined header. Camera serials, NI card models
+and named port/stream routes, CAN driver/interface selection, GPU driver/memory,
+and laser channel/timing bindings are shown per device; only actionable scan
+warnings are added below those rows. Camera rows are limited to the configured
+left, right, and optional stimCam roles; webcam and synthetic/random-image
+sources are omitted.
 
 Some NI devices, including M-Series static digital I/O, return DAQmx status
 `-200303` because their digital lines have no internal hardware sample clock.
