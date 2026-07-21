@@ -86,8 +86,8 @@ nidaqPorts: !NidaqPortConfiguration
   barcode: ''
 nidaqStream: !NidaqSignalStreamConfiguration
   isEnabled: false
-  sampleRateHz: 1000.0
-  readChunkSize: 100
+  sampleRateHz: 10000.0
+  readChunkSize: 500
   rollingWindowSeconds: 10.0
   recordToAcquisition: false
   outputName: nidaq_signals

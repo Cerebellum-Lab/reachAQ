@@ -44,8 +44,8 @@ class NidaqSignalStreamConfiguration:
 
     channels: Tuple[NidaqSignalChannelConfiguration, ...] = tuple()
     is_enabled: bool = False
-    sample_rate_hz: float = 1000.0
-    read_chunk_size: int = 100
+    sample_rate_hz: float = 10000.0
+    read_chunk_size: int = 500
     rolling_window_seconds: float = 10.0
     record_to_acquisition: bool = True
     output_name: str = "nidaq_signals"
@@ -73,8 +73,8 @@ class NidaqSignalStreamConfiguration:
         channels: Iterable[NidaqSignalChannelConfiguration],
         *,
         is_enabled: bool = False,
-        sample_rate_hz: float = 1000.0,
-        read_chunk_size: int = 100,
+        sample_rate_hz: float = 10000.0,
+        read_chunk_size: int = 500,
         rolling_window_seconds: float = 10.0,
         record_to_acquisition: bool = True,
         output_name: str = "nidaq_signals",

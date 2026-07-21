@@ -87,8 +87,8 @@ nidaqStream: !NidaqSignalStreamConfiguration
   # This monitor is for operator-visible rolling input checks and acquisition-side CSV signal copies.
   # The PXI-6713 does not provide analog inputs. Add channels only after a supported input device is present.
   isEnabled: false
-  sampleRateHz: 1000.0
-  readChunkSize: 100
+  sampleRateHz: 10000.0
+  readChunkSize: 500
   rollingWindowSeconds: 10.0
   recordToAcquisition: true
   outputName: nidaq_signals

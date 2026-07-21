@@ -50,6 +50,7 @@ class NidaqSignalStreamController:
         self._configuration = configuration
         self._analog_task: Optional[object] = None
         self._digital_task: Optional[object] = None
+        self._digital_clock_task: Optional[object] = None
         self._sample_index = 0
         self._is_started = False
         try:
@@ -73,10 +74,12 @@ class NidaqSignalStreamController:
                 self._digital_task.start()
             if self._analog_task is not None:
                 self._analog_task.start()
+            if self._digital_clock_task is not None:
+                self._digital_clock_task.start()
             self._is_started = True
             log_hardware_initialization(
                 logger,
-                "READY | NI-DAQ signal tasks | analog=%s digital=%s elapsed=%.3fs",
+                "READY | NI-DAQ signal tasks | analog=%s digital=%s digital_timing=hardware elapsed=%.3fs",
                 self._analog_task is not None,
                 self._digital_task is not None,
                 time.perf_counter() - started,
@@ -103,7 +106,10 @@ class NidaqSignalStreamController:
         if self._digital_task is not None:
             raw = self._digital_task.read(number_of_samples_per_channel=chunk_size, timeout=timeout)
             for channel, samples in zip(cfg.digital_channels, _normalize_samples(raw, len(cfg.digital_channels))):
-                values[channel.name] = tuple(_scale_sample(1.0 if bool(sample) else 0.0, channel) for sample in samples)
+                values[channel.name] = tuple(
+                    _scale_sample(1.0 if bool(sample) else 0.0, channel)
+                    for sample in samples
+                )
 
         sample_index = self._sample_index
         if values:
@@ -121,6 +127,7 @@ class NidaqSignalStreamController:
     def close(self) -> None:
         errors = []
         for name, task in (
+            ("digital sample clock", self._digital_clock_task),
             ("digital input", self._digital_task),
             ("analog input", self._analog_task),
         ):
@@ -137,6 +144,7 @@ class NidaqSignalStreamController:
                 errors.append((f"{name} close", exc))
                 logger.exception("Failed to close NI-DAQ signal stream %s task", name)
         self._digital_task = None
+        self._digital_clock_task = None
         self._analog_task = None
         self._is_started = False
         if errors:
@@ -186,13 +194,28 @@ class NidaqSignalStreamController:
                 cfg.sample_rate_hz,
                 buffer_size,
             )
-            self._digital_task = self._nidaqmx.Task("reachaq_signal_stream_di")
-            line_grouping = self._nidaqmx.constants.LineGrouping.CHAN_PER_LINE
-            for channel in digital_channels:
-                self._digital_task.di_channels.add_di_chan(channel.physical_channel, line_grouping=line_grouping)
+            self._digital_task = self._make_digital_task(digital_channels)
+            digital_device = self._device_name(digital_channels[0].physical_channel)
+            digital_devices = {
+                self._device_name(channel.physical_channel)
+                for channel in digital_channels
+            }
+            if len(digital_devices) != 1:
+                raise RuntimeError("all digital stream channels must belong to the same NI-DAQ device")
             kwargs = {}
-            if self._analog_task is not None:
+            analog_device = (
+                self._device_name(analog_channels[0].physical_channel)
+                if analog_channels
+                else None
+            )
+            if self._analog_task is not None and analog_device == digital_device:
                 kwargs["source"] = self._analog_input_sample_clock_source(analog_channels[0].physical_channel)
+            else:
+                kwargs["source"] = self._create_digital_sample_clock(
+                    digital_device,
+                    cfg.sample_rate_hz,
+                    buffer_size,
+                )
             self._digital_task.timing.cfg_samp_clk_timing(
                 rate=cfg.sample_rate_hz,
                 sample_mode=self._nidaqmx.constants.AcquisitionType.CONTINUOUS,
@@ -201,9 +224,38 @@ class NidaqSignalStreamController:
             )
             log_hardware_initialization(
                 logger,
-                "READY | NI-DAQ digital input task | elapsed=%.3fs",
+                "READY | NI-DAQ digital input task | timing=hardware source=%s elapsed=%.3fs",
+                kwargs["source"],
                 time.perf_counter() - started,
             )
+
+    def _make_digital_task(self, digital_channels) -> object:
+        task = self._nidaqmx.Task("reachaq_signal_stream_di")
+        line_grouping = self._nidaqmx.constants.LineGrouping.CHAN_PER_LINE
+        for channel in digital_channels:
+            task.di_channels.add_di_chan(channel.physical_channel, line_grouping=line_grouping)
+        return task
+
+    def _create_digital_sample_clock(
+        self,
+        device_name: str,
+        sample_rate_hz: float,
+        buffer_size: int,
+    ) -> str:
+        task = self._digital_clock_task = self._nidaqmx.Task("reachaq_signal_stream_clock")
+        task.co_channels.add_co_pulse_chan_freq(f"{device_name}/ctr0", freq=sample_rate_hz)
+        task.timing.cfg_implicit_timing(
+            sample_mode=self._nidaqmx.constants.AcquisitionType.CONTINUOUS,
+            samps_per_chan=buffer_size,
+        )
+        return f"/{device_name}/Ctr0InternalOutput"
+
+    @staticmethod
+    def _device_name(physical_channel: str) -> str:
+        parts = physical_channel.strip("/").split("/")
+        if len(parts) < 2 or not parts[0]:
+            raise RuntimeError(f"cannot infer NI-DAQ device from {physical_channel!r}")
+        return parts[0]
 
     def _analog_input_sample_clock_source(self, physical_channel: str) -> str:
         parts = physical_channel.strip("/").split("/")
