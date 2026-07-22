@@ -26,6 +26,7 @@ from autotrainer.device import (  # noqa: E402
     NullLaserController,
 )
 from tools.acquisition.model.laser_model import LaserModel  # noqa: E402
+from tools.acquisition.model.laser_plot_process import LaserPlotProcess  # noqa: E402
 from tools.acquisition.model.app_model import AppModel  # noqa: E402
 from tools.acquisition.model.nidaq_signal_monitor_model import (  # noqa: E402
     NidaqSignalMonitorModel,
@@ -137,6 +138,21 @@ def _wait_for_plot_snapshot(content, timeout=5.0):
     raise AssertionError("analysis plot process did not produce a snapshot")
 
 
+def _wait_for_laser_plot(content, channel_id=1, timeout=5.0, minimum_points=1):
+    deadline = time.monotonic() + timeout
+    tab = content._channel_tabs[channel_id - 1]
+    while time.monotonic() < deadline:
+        content._flush_laser_plots()
+        tab.redraw_trace()
+        if any(
+            len(x_values) >= minimum_points
+            for x_values, _y_values in tab._trace_data.values()
+        ):
+            return tab
+        time.sleep(0.02)
+    raise AssertionError("laser plot process did not produce a snapshot")
+
+
 def _laser_channel():
     return LaserChannelConfiguration(
         channel_id=LaserChannelId.LASER_1,
@@ -240,6 +256,70 @@ def test_signal_monitor_shared_ring_reports_source_sample_gap():
     assert snapshot.end_sample_index == 7
     assert snapshot.overrun_samples == 3
     assert destination[0, :2].tolist() == [1.0, 0.0]
+
+
+def test_laser_plot_process_bounds_raw_daq_history_outside_qt():
+    stream_channel = NidaqSignalChannelConfiguration(
+        name="laser1_diode",
+        physical_channel="Dev1/ai0",
+        kind="analog",
+        unit="V",
+    )
+    configuration = NidaqSignalStreamConfiguration(
+        channels=(stream_channel,),
+        is_enabled=True,
+        sample_rate_hz=1000.0,
+        rolling_window_seconds=10.0,
+    )
+    ring = SharedNidaqSampleRing(configuration)
+    process = LaserPlotProcess(ring)
+    destinations_x = {
+        (1, curve_name): np.empty(process.MAX_POINTS, dtype=np.float32)
+        for curve_name in process.CURVE_NAMES
+    }
+    destinations_y = {
+        (1, curve_name): np.empty(process.MAX_POINTS, dtype=np.float32)
+        for curve_name in process.CURVE_NAMES
+    }
+    try:
+        process.configure_channel(
+            1,
+            window_seconds=10.0,
+            pixel_width=300,
+            diode_name="laser1_diode",
+            copy_name=None,
+        )
+        process.set_streaming(1, True)
+        ring.write_block(NidaqSignalSampleBlock(
+            wall_time=1.0,
+            perf_time=1.0,
+            sample_rate_hz=1000.0,
+            sample_index=0,
+            channels=(stream_channel,),
+            values={
+                "laser1_diode": tuple(
+                    float((index // 25) % 2) for index in range(10_000)
+                ),
+            },
+        ))
+        deadline = time.monotonic() + 5.0
+        frame = None
+        diode_slot = process.curve_slot(1, "diode")
+        while time.monotonic() < deadline:
+            candidate = process.copy_latest_into(destinations_x, destinations_y)
+            if candidate is not None and candidate.point_counts[diode_slot]:
+                frame = candidate
+                break
+            time.sleep(0.02)
+
+        assert frame is not None
+        assert process.pid != os.getpid()
+        assert frame.point_counts[diode_slot] <= 300
+        displayed = destinations_y[(1, "diode")][:frame.point_counts[diode_slot]]
+        assert displayed.min() == 0.0
+        assert displayed.max() == 1.0
+    finally:
+        process.close()
 
 
 def test_numpy_stream_buffer_wraps_without_shifting_existing_window():
@@ -677,15 +757,8 @@ def test_laser_trace_auto_resumes_and_displays_entire_calibration_ramp(qapp):
     )
     laser = LaserModel(NullLaserController(configuration))
     app_model = _LaserAppStub(laser)
-    tab = _LaserChannelTab(
-        app_model,
-        channel,
-        True,
-        configuration.sample_rate_hz,
-        lambda _status, operation: operation(),
-        lambda _message, _is_error: None,
-    )
-    laser.trace_received += tab.append_trace
+    content = LaserControlContent(app_model)
+    tab = content._channel_tabs[0]
     try:
         assert not tab._trace_streaming
         assert tab._trace_toggle_button.text() == "Start Stream"
@@ -699,6 +772,7 @@ def test_laser_trace_auto_resumes_and_displays_entire_calibration_ramp(qapp):
                 samples_per_step=100,
             )
         )
+        _wait_for_laser_plot(content, minimum_points=5)
 
         command_x, command_y = tab._trace_data["command"]
         diode_x, diode_y = tab._trace_data["diode"]
@@ -738,6 +812,9 @@ def test_laser_trace_auto_resumes_and_displays_entire_calibration_ramp(qapp):
         assert tab._trace_seconds.suffix() == " s"
         assert tab._trace_min_volts.suffix() == " V"
         assert tab._trace_max_volts.suffix() == " V"
+        assert tab._trace_plot.getPlotItem().getViewBox().viewRange()[0] == pytest.approx(
+            [-10.0, 0.0]
+        )
         assert len(points) == len(command_x) == len(command_y) == 5
         assert len(diode_x) == len(diode_y) == 5
         assert command_y == pytest.approx([0.0, 1.0, 2.0, 3.0, 4.0])
@@ -751,13 +828,18 @@ def test_laser_trace_auto_resumes_and_displays_entire_calibration_ramp(qapp):
                 duration_ms=10.0,
             )
         )
+        deadline = time.monotonic() + 5.0
+        while len(tab._trace_data["command"][0]) <= 5 and time.monotonic() < deadline:
+            content._flush_laser_plots()
+            tab.redraw_trace()
+            time.sleep(0.02)
         assert "internal pulse" in tab._trace_status.text()
         assert len(tab._trace_data["command"][0]) > 5
     finally:
-        laser.trace_received -= tab.append_trace
+        content.on_close()
+        content.deleteLater()
         app_model.nidaq_signal_monitor.close()
         laser.close()
-        tab.deleteLater()
 
 
 def test_laser_control_reads_nidaq_samples_directly_from_shared_ring(qapp):
@@ -793,11 +875,41 @@ def test_laser_control_reads_nidaq_samples_directly_from_shared_ring(qapp):
             )
         )
 
-        content._flush_nidaq_sample_blocks()
+        _wait_for_laser_plot(content, minimum_points=3)
 
-        diode_x, diode_y = tab._trace_buffers["diode"].ordered()
-        assert diode_x.tolist() == [0.0, 0.001, 0.002]
-        assert diode_y.tolist() == [0.25, 0.5, 0.75]
+        diode_x, diode_y = tab._trace_data["diode"]
+        assert diode_x == pytest.approx([-0.002, -0.001, 0.0])
+        assert diode_y == pytest.approx([0.25, 0.5, 0.75])
+        assert content._plot_process.pid != os.getpid()
+        assert not hasattr(content._plot_process, "_block_queue")
+        assert "_trace_buffers" not in vars(tab)
+        assert tab._last_plot_frame.raw_generation == 1
+        assert "Seq 1" in content._stream_telemetry_label.text()
+        display_array_id = id(tab._trace_display_y["diode"])
+
+        app_model.nidaq_signal_monitor.sample_ring.write_block(
+            NidaqSignalSampleBlock(
+                wall_time=1.1,
+                perf_time=1.1,
+                sample_rate_hz=1000.0,
+                sample_index=3,
+                channels=(stream_channel,),
+                values={"laser1_diode": (1.0, 1.25)},
+            )
+        )
+        deadline = time.monotonic() + 5.0
+        while (
+            tab._last_plot_frame.raw_generation < 2
+            and time.monotonic() < deadline
+        ):
+            content._flush_laser_plots()
+            time.sleep(0.02)
+        assert id(tab._trace_display_y["diode"]) == display_array_id
+        assert tab._last_plot_frame.raw_generation == 2
+
+        app_model.nidaq_signal_monitor.set_display_refresh_rate(120.0)
+        content._flush_laser_plots()
+        assert content._stream_plot_timer.interval() == 8
     finally:
         content.on_close()
         content.deleteLater()
