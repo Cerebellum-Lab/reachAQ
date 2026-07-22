@@ -3,7 +3,8 @@
 Date: 2026-07-22
 Repository: `/home/christielab10/Documents/reachAQ`
 Branch: `updatespeed`
-Current HEAD: `0bee87f Move laser plotting to shared process`
+Final integration target: `devel`
+Final status: root cause fixed and hardware-verified; experimental diagnostics removed
 
 ## Goal and non-negotiable requirements
 
@@ -17,24 +18,17 @@ Important requirements established during the conversation:
 - The final Qt widget mutation must occur in a GUI process, but the GUI should consume only a bounded newest snapshot and never process a backlog.
 - Digital pulses must appear discrete/square, with correct timestamp intervals and durations—not diagonal analog-looking triangles.
 - The Analysis graph defaults to X `[-10, 0]` seconds and Y `[-0.2, 1.2]`, permits horizontal-only zoom, prevents zooming beyond the ten-second window, and includes a Live button that moves the right edge to zero while preserving horizontal zoom.
-- The user prefers testing each change before committing. Do not commit the current worktree until the user confirms behavior.
+- Changes were hardware-tested before the final categorized commits were created.
 
-## Committed work on `updatespeed`
+## Final categorized history
 
-The branch was created and the following relevant commits exist, oldest to newest:
+Before integration, the branch history was squashed by category to:
 
-- `ff1ccff Speed up live analysis visualization`
-- `319f25a Document multi-device NI-DAQ synchronization plan`
-- `913b9c8 Document DAQ stream mapping reconciliation`
-- `b549ab7 Note PXI-6713 digital timing limitations`
-- `a353ecb Document PXI-6221 buffered DI transfer issue`
-- `a0d183a Fix buffered NI digital input on Linux`
-- `93721ab Constrain analysis graph to digital signals`
-- `9d6653c Prevent stale NI visualization backlog`
-- `aca5f6f Render NI digital stream with timestamped steps`
-- `86df00d Add live-edge graph navigation`
-- `2a22246 Stream NI samples through shared memory`
-- `0bee87f Move laser plotting to shared process`
+- `3b3c22d Fix low-latency NI digital acquisition`
+- `8416326 Build timestamp-correct shared-memory signal viewer`
+- `d83b880 Move laser plotting to shared process`
+- `c388895 Prevent idle CAN polling from starving Qt`
+- `28dda6b Document NI synchronization and update-speed findings`
 
 The current committed architecture already includes a raw shared-memory NI sample ring, a dedicated Analysis plot-preparation process, shared-buffer consumption by Qt, timestamped digital steps, and similar shared-process plotting for laser-control traces.
 
@@ -71,7 +65,7 @@ Direct hardware measurements found a real delivery-cadence issue:
 - DMA delivered an excellent ~16.8 ms cadence but returned zero-filled digital channels on this Linux/PXI-6221 combination, so DMA was rejected.
 - Interrupt transfer with `di_data_xfer_req_cond = ON_BOARD_MEMORY_NOT_EMPTY` produced correct values and a stable cadence: mean/median about 16.7 ms, p95 about 16.8 ms, maximum about 17.1 ms, with no >35 ms stalls.
 
-The low-latency transfer condition and its fake-DAQ test are currently **uncommitted** in:
+The low-latency transfer condition and its fake-DAQ test were committed in:
 
 - `auto-trainer-device/src/autotrainer/device/nidaq_signal_stream.py`
 - `auto-trainer-device/tests/nidaq_signal_stream_test.py`
@@ -126,7 +120,7 @@ The original camera preview renderer used this path for every preview frame:
 
 `QImage -> RGBA conversion -> QPixmap -> QGraphicsScene -> QGraphicsView -> multisampled QOpenGLWidget`
 
-It was replaced, currently uncommitted, by a direct raster `QWidget` that caches the latest `QImage` and paints the image, pose points, text, presence marker, and reach overlay in one pass. Capture, recording, inference, and camera sampling were not changed.
+It was temporarily replaced during diagnosis by a direct raster `QWidget` that cached the latest `QImage` and painted the image, pose points, text, presence marker, and reach overlay in one pass. Capture, recording, inference, and camera sampling were not changed. This experiment did not solve the root issue and was removed before integration.
 
 An offscreen two-camera refresh-and-paint benchmark measured about 0.70 ms average and 1.34 ms maximum.
 
@@ -252,7 +246,7 @@ At the worst unfrozen point, shared-memory copying remained about 0.07 ms and `c
    Replaced with direct `PlotCurveItem` plus `ignoreBounds=True`. Real `Set` cost improved, but freezing proves the final stall continues with `Set=0` and no graph paints.
 
 9. **Camera preview QGraphics/OpenGL composition**
-   Replaced experimentally with direct raster painting. Although an offscreen benchmark and early acquisition looked faster, the 03:58 integrated run became much worse: even with plotting frozen, `MainWindow/UpdateRequest` reached about 220 ms and the GUI ran at only about 1.7 Hz. The direct-raster experiment should be reverted; it is not an acceptable fix.
+   Replaced experimentally with direct raster painting. Although an offscreen benchmark and early acquisition looked faster, the 03:58 integrated run became much worse: even with plotting frozen, `MainWindow/UpdateRequest` reached about 220 ms and the GUI ran at only about 1.7 Hz. The direct-raster experiment was reverted before integration.
 
 10. **High-rate logging flood**
     Camera code can warn on dropped frames and all child logs pass through multiprocessing logging. The current log was inspected; no obvious sustained dropped-frame warning flood was found. Logging remains a possible GIL contributor but is not yet supported by the captured log evidence.
@@ -260,9 +254,9 @@ At the worst unfrozen point, shared-memory copying remained about 0.07 ms and `c
 11. **Machine-wide CPU saturation**
     Not supported: multiple cores remain available. The main process itself approaches one full core, pointing toward its event loop/GIL rather than total system capacity.
 
-## Latest diagnostic result: application-wide Qt event profiler
+## Historical diagnostic result: application-wide Qt event profiler
 
-The newest uncommitted change subclasses `QApplication.notify()` and records Qt events taking at least 10 ms. Analysis metrics now append:
+A temporary diagnostic subclassed `QApplication.notify()` and recorded Qt events taking at least 10 ms. Analysis metrics appended:
 
 `Slow <receiver>/<event type> <maximum duration> (<count>)`
 
@@ -277,11 +271,11 @@ The profiler was tested in the 03:58:30 hardware recording. It reported two conc
 - `QGraphicsScene/MetaCall` at roughly 604–667 ms while the Analysis graph was updating.
 - `MainWindow/UpdateRequest` at roughly 220 ms while the Analysis graph was frozen.
 
-This separates the integrated failure into two GUI-thread costs: deferred PyQtGraph scene processing and top-level camera/window repainting. The diagnostic has served its purpose and should be disabled or removed from normal operation after the corrective patch so its per-event timing overhead is not retained in production.
+This appeared to separate the integrated failure into two GUI-thread costs: deferred PyQtGraph scene processing and top-level camera/window repainting. Later camera-disabled testing disproved either rendering path as the root cause. The profiler was removed before integration so its per-event timing overhead is not retained in production.
 
-## Uncommitted corrective patch after the 03:58 recording
+## Historical corrective experiment after the 03:58 recording
 
-The next corrective implementation was completed for hardware testing but intentionally not committed:
+The next corrective implementation was completed for hardware testing and later removed because it did not address the root cause:
 
 1. The application-wide `QApplication.notify()` profiler was removed from normal execution. Its diagnostic results remain documented above, but it no longer times every Qt event.
 2. The failed direct-raster camera experiment and the older camera `QGraphicsScene/QGraphicsView` stack were both replaced with a purpose-built `QOpenGLWidget` camera viewport.
@@ -320,7 +314,7 @@ Live operating-system sampling during the failed state then found the first dire
 
 **Revised conclusion:** a same-process acquisition worker is monopolizing a logical core and likely the Python GIL when cameras become active. This starves every Qt timer and explains why DAQ, queue, PyQtGraph, raster, and OpenGL changes all produced the same acquisition-only symptom. The graph and camera renderer changes are useful bounded architectures, but they cannot correct GIL starvation elsewhere in the main process.
 
-External `gdb`, `perf`, and Python-stack attachment were blocked by the host's `ptrace_scope=1` and `perf_event_paranoid=4`. A low-overhead in-process `UiContentionSampler` was therefore added:
+External `gdb`, `perf`, and Python-stack attachment were blocked by the host's `ptrace_scope=1` and `perf_event_paranoid=4`. A low-overhead in-process `UiContentionSampler` was therefore added temporarily:
 
 - samples `/proc/<pid>/task` twice per second;
 - maps the hottest native thread back to `threading.Thread`;
@@ -328,11 +322,11 @@ External `gdb`, `perf`, and Python-stack attachment were blocked by the host's `
 - excludes its own sampler thread;
 - appends `Hot <thread> <cpu>% [tid] <file>:<line> <function>` to Analysis telemetry.
 
-This is intentionally much lighter than the removed `QApplication.notify()` profiler and does not instrument Qt events or acquisition data. A synthetic busy-thread test correctly identified a known thread and source location. The next hardware restart should expose the exact acquisition loop to fix.
+This was intentionally much lighter than the removed `QApplication.notify()` profiler and did not instrument Qt events or acquisition data. A synthetic busy-thread test correctly identified a known thread and source location. The sampler was removed after `/proc` and log correlation identified the CAN thread.
 
-## Current uncommitted worktree
+## Removed experimental worktree
 
-At handoff time, these files are modified/untracked and intentionally not committed:
+During diagnosis, the following files contained temporary modifications or new diagnostics:
 
 - `auto-trainer-device/src/autotrainer/device/nidaq_signal_stream.py`
 - `auto-trainer-device/tests/nidaq_signal_stream_test.py`
@@ -344,7 +338,7 @@ At handoff time, these files are modified/untracked and intentionally not commit
 - `tools/acquisition/view/digital_opengl_plot.py` (new)
 - `tools/acquisition/view/ui_contention_sampler.py` (new diagnostic)
 
-The handoff document itself is under `temp/update_speed_handoff/` and should be staged so the temp directory is tracked, but it is not committed.
+All temporary runtime changes in this list were removed before integration. This handoff remains tracked as the investigation record.
 
 ## Verification performed
 
@@ -371,24 +365,20 @@ Live `/proc/<pid>/task` sampling during that same application run showed:
 
 The application log maps TID 417329 exactly to the `can-device` reader thread. It starts when acquisition connects the CAN hardware and was processing only about 10–13 messages/second. The source-level cause is `DeviceConnection._run_connected()`: it asks the CAN backend for a 5 ms collection period, but the installed backend returns immediately when no frame is available. The surrounding Python loop therefore spins without blocking, consumes a full logical core, and starves the Qt thread through the GIL. This explains all three key observations: idle mode is smooth, acquisition mode is slow, and both graph and camera UI cadence degrade together independent of preview rendering.
 
-A targeted uncommitted correction now measures the CAN read duration and sleeps only the unused remainder of the requested 5 ms collection interval when the read returns no messages. CAN bursts still drain immediately; only empty polling is bounded to the intended 200 Hz maximum. A regression test reproduces an always-empty immediate-return backend and verifies that the reader is throttled and disconnects normally.
+A targeted correction measures the CAN read duration and sleeps only the unused remainder of the requested 5 ms collection interval when the read returns no messages. CAN bursts still drain immediately; only empty polling is bounded to the intended 200 Hz maximum. A regression test reproduces an always-empty immediate-return backend and verifies that the reader is throttled and disconnects normally.
 
 Latest verification with the `reachaq` environment:
 
-- CAN, NI-DAQ stream, and signal-stream UI suites: **65 passed**.
+- Final CAN, NI-DAQ, signal-stream, panel, and video-model suites: **68 passed, 1 hardware-dependent test skipped**.
 - `git diff --check`: passed.
 
-## Recommended immediate next step
+## Final hardware result
 
-1. Close the currently running application, which still contains the old spinning CAN loop.
-2. Restart from the modified worktree and repeat the same idle → acquisition test with cameras disabled first.
-3. Confirm that process CPU no longer gains one fully saturated `can-device` thread and that Analysis `Timer`, `Frames`, and `Paint` stay near the monitor refresh rate.
-4. Repeat with one and then two camera previews to measure any secondary rendering cost after GIL starvation is removed.
-5. Do not commit until this source-specific fix passes the integrated hardware test.
+After restarting with the CAN correction, the user confirmed that the acquisition-only plotting latency, UI stalls, and camera/graph cadence problems were all resolved. The fix does not delay available CAN messages or CAN writes. An incoming message that arrives during an empty-read wait can incur at most 5 ms additional receive latency (about 2.5 ms average), while message bursts continue to drain without an inserted wait.
 
 ## Post-fix cleanup
 
-After the CAN idle-poll correction eliminated the acquisition slowdown in hardware testing, the later uncommitted diagnostic and rendering experiments were removed. The cleanup restored the last committed implementations of:
+After the CAN idle-poll correction eliminated the acquisition slowdown in hardware testing, the temporary diagnostic and rendering experiments were removed. The cleanup restored the stable implementations of:
 
 - the camera preview widget;
 - the Analysis PyQtGraph renderer;

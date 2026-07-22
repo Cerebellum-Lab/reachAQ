@@ -158,13 +158,17 @@ For camera/barcode TTL streams, use a hardware-clocked input rate of at least
 5 kHz; reachAQ defaults to 10 kHz and derives the runtime read size from the
 refresh rate of the screen containing the application. Digital-only tasks use
 `ctr0` on the input device to generate the sample clock. Confirm that the
-counter is not reserved by another task. The UI redraws a peak-preserving,
+counter is not reserved by another task. On Linux/PXI-6221 systems, reachAQ uses
+interrupt transfers and requests data whenever onboard memory is non-empty;
+this avoids the roughly 100 ms burst delivery seen with the default half-full
+FIFO condition while preserving correct digital values. The UI redraws a peak-preserving,
 display-bounded view at that screen's refresh rate; this visualization is never
 persisted and does not reduce the hardware capture rate. Rolling-buffer and
 per-pixel peak-envelope work runs in a dedicated plot-data process that
 publishes double-buffered shared memory, while the GUI process performs only the
-final bounded Qt curve draw. Set the graph's visible duration in seconds
-and its vertical minimum/maximum in volts with the controls beneath the graph.
+final bounded Qt curve draw. The digital graph uses fixed limits of `[-10, 0]`
+seconds and `[-0.2, 1.2]`, supports horizontal-only zoom, and provides **Live**
+to move the right edge to zero while preserving the current zoom width.
 
 ## References
 

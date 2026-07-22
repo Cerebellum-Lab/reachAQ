@@ -3,6 +3,13 @@
 Use this guide on rigs with the pellet-board CAN connection. reachAQ uses
 `python-can`; Linux SocketCAN is the preferred path for PEAK PCIe/USB adapters.
 
+The reachAQ CAN reader polls at a bounded 5 ms cadence when no frame is
+available. Some CAN backends return an empty read immediately instead of
+honoring the requested collection interval; retrying without this idle wait can
+consume a full CPU core and starve the Qt event loop. Available frames and CAN
+writes are not delayed by the idle throttle. A frame arriving just after an
+empty poll can wait at most 5 ms before being read.
+
 ## 1. Discover the adapter and interfaces
 
 ```bash
