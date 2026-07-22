@@ -222,6 +222,15 @@ class NidaqSignalStreamController:
                 samps_per_chan=buffer_size,
                 **kwargs,
             )
+            # The Linux NI-DAQmx default waits for the device FIFO to become
+            # more than half full before servicing an interrupt.  On the
+            # PXI-6221 that delivered roughly six 10 kHz chunks every 100 ms.
+            # Requesting a transfer whenever the FIFO is non-empty preserves
+            # correct interrupt-based digital values while delivering each
+            # display-sized chunk at its acquisition cadence.
+            self._digital_task.di_channels.all.di_data_xfer_req_cond = (
+                self._nidaqmx.constants.InputDataTransferCondition.ON_BOARD_MEMORY_NOT_EMPTY
+            )
             log_hardware_initialization(
                 logger,
                 "READY | NI-DAQ digital input task | timing=hardware source=%s elapsed=%.3fs",
@@ -234,6 +243,12 @@ class NidaqSignalStreamController:
         line_grouping = self._nidaqmx.constants.LineGrouping.CHAN_PER_LINE
         for channel in digital_channels:
             task.di_channels.add_di_chan(channel.physical_channel, line_grouping=line_grouping)
+        # NI-DAQmx's default DMA path returns zero-filled buffered DI samples on
+        # the Linux PXI-6221 runtime, while interrupt transfer returns the
+        # correct correlated digital states.
+        task.di_channels.all.di_data_xfer_mech = (
+            self._nidaqmx.constants.DataTransferActiveTransferMode.INTERRUPT
+        )
         return task
 
     def _create_digital_sample_clock(

@@ -22,6 +22,9 @@ class _FakeTiming:
 class _FakeDigitalChannels:
     def __init__(self, task):
         self._task = task
+        self.all = self
+        self.di_data_xfer_mech = None
+        self.di_data_xfer_req_cond = None
 
     def add_di_chan(self, physical_channel, *, line_grouping):
         self._task.channels.append((physical_channel, line_grouping))
@@ -71,6 +74,10 @@ class _FakeTask:
 class _FakeNidaqmx:
     constants = SimpleNamespace(
         AcquisitionType=SimpleNamespace(CONTINUOUS="continuous"),
+        DataTransferActiveTransferMode=SimpleNamespace(INTERRUPT="interrupt"),
+        InputDataTransferCondition=SimpleNamespace(
+            ON_BOARD_MEMORY_NOT_EMPTY="not-empty",
+        ),
         LineGrouping=SimpleNamespace(CHAN_PER_LINE="per-line"),
     )
 
@@ -113,6 +120,8 @@ def test_digital_device_uses_hardware_counter_sample_clock(monkeypatch):
         assert len(fake_nidaqmx.tasks) == 2
         digital_task, clock_task = fake_nidaqmx.tasks
         assert digital_task.timing_configuration["source"] == "/Dev1/Ctr0InternalOutput"
+        assert digital_task.di_channels.di_data_xfer_mech == "interrupt"
+        assert digital_task.di_channels.di_data_xfer_req_cond == "not-empty"
         assert clock_task.counter_configuration == ("Dev1/ctr0", 1000.0)
         assert clock_task.started
 
