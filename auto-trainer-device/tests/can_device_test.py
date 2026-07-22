@@ -32,12 +32,37 @@ from autotrainer.device.can_device import (
     default_load_pellet,
     default_send_pellet,
 )
+from autotrainer.device.device_connection import _REQUEST_DISCONNECT
 
 _expected = None
 
 def data_callback(kind: int, response):
     assert kind == _expected
     del response  # uncheck atm
+
+
+def test_device_connection_throttles_empty_reads():
+    """An idle CAN backend must not spin and starve the application's GUI thread."""
+    interface = mock.Mock()
+    interface.can_read.return_value = True
+    interface.read.return_value = []
+    interface.is_open = True
+
+    device = mock.Mock()
+    device.device_interface = interface
+    connection = DeviceConnection(device, message_queue=queue.Queue())
+    connection._collect_ms = 5
+
+    thread = threading.Thread(target=connection._run_connected)
+    thread.start()
+    time.sleep(0.055)
+    connection._cmd_queue.put((_REQUEST_DISCONNECT, None, None))
+    thread.join(1)
+
+    assert not thread.is_alive()
+    # Disconnect commands are intentionally checked every 250 ms, so include
+    # that interval while still proving this was a throttled poll, not a spin.
+    assert 2 <= interface.read.call_count <= 80
 
 
 @pytest.fixture

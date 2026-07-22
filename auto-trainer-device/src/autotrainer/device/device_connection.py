@@ -302,14 +302,28 @@ class DeviceConnection(DeviceConnectionProtocol):
     def _run_connected(self) -> bool:
         logger.info("running connected")
         t_next_cmd_queue_read = time.perf_counter()
+        idle_poll_period = max(0.001, self._collect_ms / 1000.0)
         while True:
             self._current_thread_watchdog_perf_c = time.perf_counter()
 
             # Data from the device for the device listener to process.
+            read_started = time.perf_counter()
+            messages = []
             if self._interface.can_read():
                 messages = self._interface.read(self._read_limit, collect_ms=self._collect_ms)
                 if len(messages) > 0:
                     self._device.notify_data(messages)
+
+            # Some CAN backends return immediately when no frame is available even
+            # when ``collect_ms`` is requested.  Without an explicit idle wait this
+            # loop consumes an entire CPU core and can starve the Qt thread of the
+            # GIL.  Preserve the requested collection cadence while still draining
+            # bursts without delay.
+            if not messages:
+                read_elapsed = time.perf_counter() - read_started
+                idle_wait = idle_poll_period - read_elapsed
+                if idle_wait > 0:
+                    time.sleep(idle_wait)
 
             perf_now = get_perf_now()
             if perf_now > t_next_cmd_queue_read:
