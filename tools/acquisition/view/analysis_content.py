@@ -2,16 +2,15 @@ from __future__ import annotations
 
 import dataclasses
 import math
-import threading
-from collections import deque
-from typing import Deque, Dict, Optional, Set, Tuple
+import time
+from typing import Dict, Optional, Set, Tuple
 
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import QTimer, Qt
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QCheckBox,
-    QDoubleSpinBox,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -24,21 +23,23 @@ from PySide6.QtWidgets import (
 
 from autotrainer.core import NidaqSignalChannelConfiguration, NidaqSignalStreamConfiguration
 from autotrainer.core.logging import get_verbose_logger
-from autotrainer.device import NidaqSignalSampleBlock
 from autotrainer.pyside import CardWidget, PGWidget
 from autotrainer.pyside.content_widget import ContentWidget, invoke_method
+from tools.acquisition.model.analysis_plot_process import AnalysisPlotProcess
 from tools.acquisition.model.nidaq_signal_monitor_model import NidaqSignalMonitorModel
 from tools.acquisition.view.stream_graph_style import (
     StreamGraphLegend,
     color_code_checkbox,
     stream_signal_color,
 )
-from tools.acquisition.view.rolling_stream_buffer import RollingStreamBuffer
 
 
 logger = get_verbose_logger(__name__)
 
 _GRAY_COLOR_TUPLE = (240, 240, 240)
+_DIGITAL_WINDOW_SECONDS = 10.0
+_DIGITAL_Y_MINIMUM = -0.2
+_DIGITAL_Y_MAXIMUM = 1.2
 
 
 class _NidaqRollingPlot(QWidget):
@@ -52,8 +53,20 @@ class _NidaqRollingPlot(QWidget):
         self._plot.clear()
         self._plot.setBackground("w")
         self._plot.getPlotItem().getViewBox().setBackgroundColor(_GRAY_COLOR_TUPLE)
-        self._plot.getAxis("bottom").setLabel("Time (s)")
-        self._plot.getAxis("left").setLabel("Signal")
+        self._plot.getAxis("bottom").setLabel("Time from latest sample (s)")
+        self._plot.getAxis("left").setLabel("Digital state")
+        view_box = self._plot.getPlotItem().getViewBox()
+        view_box.setMouseEnabled(x=True, y=False)
+        view_box.setMenuEnabled(False)
+        view_box.setLimits(
+            xMin=-_DIGITAL_WINDOW_SECONDS,
+            xMax=0.0,
+            maxXRange=_DIGITAL_WINDOW_SECONDS,
+            yMin=_DIGITAL_Y_MINIMUM,
+            yMax=_DIGITAL_Y_MAXIMUM,
+        )
+        self._plot.setXRange(-_DIGITAL_WINDOW_SECONDS, 0.0, padding=0)
+        self._plot.setYRange(_DIGITAL_Y_MINIMUM, _DIGITAL_Y_MAXIMUM, padding=0)
         layout.addWidget(self._plot, stretch=1)
         self._legend = StreamGraphLegend(columns=3, parent=self)
         layout.addWidget(self._legend)
@@ -61,106 +74,92 @@ class _NidaqRollingPlot(QWidget):
         self._configuration = NidaqSignalStreamConfiguration()
         self._style_signature = tuple()
         self._curves: Dict[str, object] = {}
-        self._buffers: Dict[str, RollingStreamBuffer] = {}
+        self._display_x: Dict[str, np.ndarray] = {}
+        self._display_y: Dict[str, np.ndarray] = {}
+        self._pixel_width = 1
+        self._last_frame = None
         self._latest_x = 0.0
-        self._window_seconds = self._configuration.rolling_window_seconds
-        self._voltage_range: Optional[Tuple[float, float]] = None
+        self._window_seconds = _DIGITAL_WINDOW_SECONDS
 
     def configure(
         self,
         configuration: NidaqSignalStreamConfiguration,
         colors_by_name: Optional[Dict[str, Tuple[int, int, int]]] = None,
-    ) -> None:
+    ) -> bool:
         colors_by_name = colors_by_name or {}
         style_signature = tuple(
             (channel.name, colors_by_name.get(channel.name, stream_signal_color(index)))
             for index, channel in enumerate(configuration.channels)
         )
         if configuration == self._configuration and style_signature == self._style_signature:
-            return
+            return False
         self._configuration = configuration
         self._style_signature = style_signature
         self._plot.clear()
         self._curves.clear()
-        self._buffers.clear()
+        self._display_x.clear()
+        self._display_y.clear()
         self._latest_x = 0.0
-        self._window_seconds = min(self._window_seconds, 60.0)
-        capacity = self._buffer_capacity()
         legend_entries = []
         for index, channel in enumerate(configuration.channels):
             color = colors_by_name.get(channel.name, stream_signal_color(index))
             pen = pg.mkPen(color=color, width=2.2, style=Qt.PenStyle.SolidLine)
             display_name = f"{channel.name} ({channel.unit})"
+            self._display_x[channel.name] = np.full(
+                AnalysisPlotProcess.MAX_POINTS, np.nan, dtype=np.float32,
+            )
+            self._display_y[channel.name] = np.full(
+                AnalysisPlotProcess.MAX_POINTS, np.nan, dtype=np.float32,
+            )
             self._curves[channel.name] = self._plot.plot([], [], pen=pen)
-            self._buffers[channel.name] = RollingStreamBuffer(capacity)
             legend_entries.append((display_name, color, False))
         self._legend.set_entries(legend_entries)
-        if self._voltage_range is None:
-            self._apply_y_range(configuration.channels)
-        else:
-            self._plot.setYRange(*self._voltage_range, padding=0)
         self._plot.getPlotItem().setClipToView(True)
-        self._plot.setXRange(0, self._window_seconds, padding=0)
+        return True
 
     def clear(self) -> None:
-        for channel_name, curve in self._curves.items():
-            self._buffers[channel_name].clear()
+        for curve in self._curves.values():
             curve.setData([], [])
         self._latest_x = 0.0
-        self._plot.setXRange(0, self._window_seconds, padding=0)
 
-    def append(self, block: NidaqSignalSampleBlock) -> None:
-        first_sample = block.sample_index / block.sample_rate_hz
-        sample_count = max((len(values) for values in block.values.values()), default=0)
-        x_values = first_sample + np.arange(sample_count, dtype=np.float64) / block.sample_rate_hz
-        for channel in self._configuration.channels:
-            values = block.values.get(channel.name)
-            if not values:
-                continue
-            self._buffers[channel.name].append(x_values[: len(values)], values)
-            self._latest_x = max(self._latest_x, float(x_values[len(values) - 1]))
+    def display_latest(self, plot_process: AnalysisPlotProcess) -> bool:
+        frame = plot_process.copy_latest_into(self._display_x, self._display_y)
+        if frame is None:
+            return False
+        self._pixel_width = frame.pixel_width
+        self._window_seconds = frame.window_seconds
+        self._latest_x = frame.latest_x
+        self._last_frame = frame
+        for channel_index, (channel_name, curve) in enumerate(self._curves.items()):
+            point_count = frame.point_counts[channel_index]
+            curve.setData(
+                self._display_x[channel_name][:point_count],
+                self._display_y[channel_name][:point_count],
+                skipFiniteCheck=True,
+            )
+        return True
 
-    def redraw(self) -> None:
-        total_point_limit = max(1000, min(3000, self._plot.width() * 3 // 2))
-        point_limit = max(256, total_point_limit // max(1, len(self._curves)))
-        for channel_name, curve in self._curves.items():
-            x_values, y_values = self._buffers[channel_name].ordered_for_plot(point_limit)
-            curve.setData(x_values, y_values, skipFiniteCheck=True)
+    def physical_pixel_width(self) -> int:
+        viewport = self._plot.viewport()
+        width = round(viewport.width() * viewport.devicePixelRatioF())
+        return max(1, min(AnalysisPlotProcess.MAX_PIXEL_WIDTH, width))
 
-        x_min = max(0.0, self._latest_x - self._window_seconds)
-        x_max = max(self._window_seconds, self._latest_x)
-        self._plot.setXRange(x_min, x_max, padding=0)
+    def set_pixel_width(self, pixel_width: int) -> bool:
+        pixel_width = max(1, min(AnalysisPlotProcess.MAX_PIXEL_WIDTH, int(pixel_width)))
+        if pixel_width == self._pixel_width:
+            return False
+        self._pixel_width = pixel_width
+        return True
 
-    def set_time_window(self, seconds: float) -> None:
-        seconds = max(0.1, min(60.0, float(seconds)))
-        if math.isclose(seconds, self._window_seconds):
-            return
-        self._window_seconds = seconds
-        capacity = self._buffer_capacity()
-        for buffer in self._buffers.values():
-            buffer.resize(capacity)
-        self.redraw()
-
-    def set_voltage_range(self, minimum: float, maximum: float) -> None:
-        minimum, maximum = float(minimum), float(maximum)
-        if maximum <= minimum:
-            return
-        self._voltage_range = (minimum, maximum)
-        self._plot.setYRange(minimum, maximum, padding=0)
-
-    def _buffer_capacity(self) -> int:
-        return max(
-            self._configuration.read_chunk_size,
-            int(math.ceil(self._configuration.sample_rate_hz * self._window_seconds)),
+    def go_live(self) -> None:
+        """Move the current horizontal viewport to the newest sample time."""
+        view_box = self._plot.getPlotItem().getViewBox()
+        x_minimum, x_maximum = view_box.viewRange()[0]
+        visible_seconds = min(
+            _DIGITAL_WINDOW_SECONDS,
+            max(0.001, float(x_maximum - x_minimum)),
         )
-
-    def _apply_y_range(self, channels: Tuple[NidaqSignalChannelConfiguration, ...]) -> None:
-        minimums = [channel.minimum for channel in channels if channel.minimum is not None]
-        maximums = [channel.maximum for channel in channels if channel.maximum is not None]
-        if minimums and maximums:
-            self._plot.setYRange(min(minimums), max(maximums), padding=0.05)
-        else:
-            self._plot.enableAutoRange(axis="y")
+        view_box.setXRange(-visible_seconds, 0.0, padding=0)
 
 
 class AnalysisContent(ContentWidget):
@@ -176,8 +175,10 @@ class AnalysisContent(ContentWidget):
         self._signal_colors: Dict[str, Tuple[int, int, int]] = {}
         self._channel_colors_by_name: Dict[str, Tuple[int, int, int]] = {}
         self._selector_signature = None
-        self._pending_blocks: Deque[NidaqSignalSampleBlock] = deque(maxlen=64)
-        self._pending_blocks_lock = threading.Lock()
+        self._plot_process = AnalysisPlotProcess(self._nidaq_signal_monitor.sample_ring)
+        self._display_refresh_rate_hz = 0.0
+        self._next_screen_check = 0.0
+        self._window_handle = None
 
         header_layout = QHBoxLayout()
         header_layout.setContentsMargins(0, 0, 0, 0)
@@ -191,9 +192,14 @@ class AnalysisContent(ContentWidget):
         header_layout.addWidget(QLabel("Channels:"))
         self._channel_count_label = QLabel("0")
         header_layout.addWidget(self._channel_count_label)
-        header_layout.addWidget(QLabel("Recording:"))
-        self._recording_label = QLabel("off")
-        header_layout.addWidget(self._recording_label)
+        header_layout.addWidget(QLabel("Seq:"))
+        self._sequence_label = QLabel("0")
+        header_layout.addWidget(self._sequence_label)
+        header_layout.addWidget(QLabel("Overruns:"))
+        self._overrun_label = QLabel("0")
+        header_layout.addWidget(self._overrun_label)
+        self._telemetry_label = QLabel("Latency: n/a")
+        header_layout.addWidget(self._telemetry_label)
 
         self._card_widget = CardWidget(title="Analysis", header_right_layout=header_layout)
         self._rolling_plot = _NidaqRollingPlot()
@@ -220,32 +226,15 @@ class AnalysisContent(ContentWidget):
         footer_layout.setSpacing(8)
         self._start_stop_button = QPushButton("Start Stream")
         self._clear_button = QPushButton("Clear")
-        footer_layout.addWidget(QLabel("Window:"))
-        self._graph_seconds = QDoubleSpinBox()
-        self._graph_seconds.setDecimals(1)
-        self._graph_seconds.setRange(0.1, 60.0)
-        self._graph_seconds.setSingleStep(0.5)
-        self._graph_seconds.setValue(self._nidaq_signal_monitor.configuration.rolling_window_seconds)
-        self._graph_seconds.setSuffix(" s")
-        footer_layout.addWidget(QLabel("Y min:"))
-        self._graph_min_volts = QDoubleSpinBox()
-        self._graph_min_volts.setDecimals(2)
-        self._graph_min_volts.setRange(-1000.0, 1000.0)
-        self._graph_min_volts.setValue(0.0)
-        self._graph_min_volts.setSuffix(" V")
-        footer_layout.addWidget(QLabel("Y max:"))
-        self._graph_max_volts = QDoubleSpinBox()
-        self._graph_max_volts.setDecimals(2)
-        self._graph_max_volts.setRange(-1000.0, 1000.0)
-        self._graph_max_volts.setValue(5.0)
-        self._graph_max_volts.setSuffix(" V")
+        self._live_button = QPushButton("Live")
+        self._live_button.setToolTip(
+            "Move the right edge to live time while preserving horizontal zoom"
+        )
         self._status_label = QLabel("NI-DAQ signal stream disabled")
         self._status_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         footer_layout.addWidget(self._start_stop_button)
         footer_layout.addWidget(self._clear_button)
-        footer_layout.addWidget(self._graph_seconds)
-        footer_layout.addWidget(self._graph_min_volts)
-        footer_layout.addWidget(self._graph_max_volts)
+        footer_layout.addWidget(self._live_button)
         footer_layout.addWidget(self._status_label)
         self._card_widget.footer.setContent(footer)
 
@@ -255,29 +244,68 @@ class AnalysisContent(ContentWidget):
         layout.setSpacing(0)
         self.setLayout(layout)
 
-        self._nidaq_signal_monitor.sample_block_received += self._sample_block_received
         self._nidaq_signal_monitor.property_changed += self._model_property_changed
         app_model.configuration_loaded_event += self._configuration_loaded
         app_model.laser.property_changed += self._laser_property_changed
         self._start_stop_button.clicked.connect(self._toggle_stream)
-        self._clear_button.clicked.connect(self._rolling_plot.clear)
-        self._graph_seconds.valueChanged.connect(self._apply_graph_view)
-        self._graph_min_volts.valueChanged.connect(self._apply_graph_view)
-        self._graph_max_volts.valueChanged.connect(self._apply_graph_view)
-        self._apply_graph_view()
+        self._clear_button.clicked.connect(self._clear_plot)
+        self._live_button.clicked.connect(self._rolling_plot.go_live)
         self._plot_timer = QTimer(self)
         self._plot_timer.setTimerType(Qt.TimerType.PreciseTimer)
-        self._plot_timer.setInterval(33)
         self._plot_timer.timeout.connect(self._flush_pending_blocks)
+        self._update_display_refresh_rate()
         self._plot_timer.start()
         self._refresh_from_model()
 
     def on_close(self):
         self._plot_timer.stop()
-        self._nidaq_signal_monitor.sample_block_received -= self._sample_block_received
         self._nidaq_signal_monitor.property_changed -= self._model_property_changed
         self._app_model.configuration_loaded_event -= self._configuration_loaded
         self._app_model.laser.property_changed -= self._laser_property_changed
+        self._plot_process.close()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        window_handle = self.window().windowHandle()
+        if window_handle is not None and window_handle is not self._window_handle:
+            if self._window_handle is not None:
+                try:
+                    self._window_handle.screenChanged.disconnect(self._screen_changed)
+                except (RuntimeError, TypeError):
+                    pass
+            self._window_handle = window_handle
+            window_handle.screenChanged.connect(self._screen_changed)
+        self._update_display_refresh_rate()
+
+    def _screen_changed(self, screen) -> None:
+        if screen is None:
+            self._update_display_refresh_rate()
+        else:
+            self._apply_display_refresh_rate(float(screen.refreshRate()))
+
+    def _update_display_refresh_rate(self) -> None:
+        screen = None
+        window_handle = self.window().windowHandle()
+        if window_handle is not None:
+            screen = window_handle.screen()
+        if screen is None:
+            screen = QGuiApplication.primaryScreen()
+        refresh_rate = 60.0 if screen is None else float(screen.refreshRate())
+        self._apply_display_refresh_rate(refresh_rate)
+
+    def _apply_display_refresh_rate(self, refresh_rate: float) -> None:
+        if not math.isfinite(refresh_rate) or refresh_rate < 1.0:
+            refresh_rate = 60.0
+        if math.isclose(refresh_rate, self._display_refresh_rate_hz, rel_tol=0.001):
+            return
+        self._display_refresh_rate_hz = refresh_rate
+        self._plot_timer.setInterval(max(1, int(round(1000.0 / refresh_rate))))
+        self._nidaq_signal_monitor.set_display_refresh_rate(refresh_rate)
+
+    def _sync_plot_pixel_width(self) -> None:
+        pixel_width = self._rolling_plot.physical_pixel_width()
+        if self._rolling_plot.set_pixel_width(pixel_width):
+            self._plot_process.set_pixel_width(pixel_width)
 
     def _toggle_stream(self) -> None:
         if not self._nidaq_signal_monitor.hardware_enabled:
@@ -288,41 +316,26 @@ class AnalysisContent(ContentWidget):
             self._nidaq_signal_monitor.start()
         self._refresh_from_model()
 
-    def _apply_graph_view(self, *_args) -> None:
-        self._rolling_plot.set_time_window(self._graph_seconds.value())
-        minimum = self._graph_min_volts.value()
-        maximum = self._graph_max_volts.value()
-        if maximum <= minimum:
-            changed = self.sender()
-            if changed is self._graph_min_volts:
-                self._graph_max_volts.setValue(minimum + 0.01)
-            else:
-                self._graph_min_volts.setValue(maximum - 0.01)
-            minimum = self._graph_min_volts.value()
-            maximum = self._graph_max_volts.value()
-        self._rolling_plot.set_voltage_range(minimum, maximum)
-
-    def use_cache(self) -> None:
-        """Drain buffered stream samples on the application's display cadence."""
-        self._flush_pending_blocks()
-
-    def _sample_block_received(self, block: NidaqSignalSampleBlock) -> None:
-        with self._pending_blocks_lock:
-            self._pending_blocks.append(block)
-
     def _flush_pending_blocks(self) -> None:
-        with self._pending_blocks_lock:
-            blocks = tuple(self._pending_blocks)
-            self._pending_blocks.clear()
-        if not blocks:
-            return
-        for block in blocks:
-            self._rolling_plot.append(block)
-        self._redraw_visible_stream()
+        now = time.monotonic()
+        if now >= self._next_screen_check:
+            self._next_screen_check = now + 1.0
+            self._update_display_refresh_rate()
+        self._sync_plot_pixel_width()
+        if self._rolling_plot.display_latest(self._plot_process):
+            frame = self._rolling_plot._last_frame
+            self._sequence_label.setText(str(frame.raw_generation))
+            self._overrun_label.setText(str(frame.overrun_count))
+            self._telemetry_label.setText(
+                f"Latency: {frame.source_latency_ms:.1f} ms | Gaps: {frame.gap_count}"
+            )
+
+    def _clear_plot(self) -> None:
+        self._plot_process.clear()
+        self._rolling_plot.clear()
 
     def _redraw_visible_stream(self, *_args) -> None:
-        if self.isVisible() and self._content_tabs.currentWidget() is self._rolling_plot:
-            self._rolling_plot.redraw()
+        self._flush_pending_blocks()
 
     @invoke_method
     def _model_property_changed(self, _name: str, _value, _old_value) -> None:
@@ -340,6 +353,11 @@ class AnalysisContent(ContentWidget):
 
     def _refresh_from_model(self) -> None:
         model = self._nidaq_signal_monitor
+        sample_ring = model.sample_ring
+        ring_changed = self._plot_process.raw_ring is not sample_ring
+        if ring_changed:
+            self._plot_process.close()
+            self._plot_process = AnalysisPlotProcess(sample_ring)
         configuration = model.configuration
         selector_signature = (
             configuration.channels,
@@ -352,7 +370,17 @@ class AnalysisContent(ContentWidget):
             self._selector_signature = selector_signature
             self._rebuild_signal_selector()
         display_configuration = self._display_configuration()
-        self._rolling_plot.configure(display_configuration, self._channel_colors_by_name)
+        if (
+            self._rolling_plot.configure(display_configuration, self._channel_colors_by_name)
+            or ring_changed
+        ):
+            plot_configuration = dataclasses.replace(
+                display_configuration,
+                rolling_window_seconds=_DIGITAL_WINDOW_SECONDS,
+            )
+            pixel_width = self._rolling_plot.physical_pixel_width()
+            self._rolling_plot.set_pixel_width(pixel_width)
+            self._plot_process.configure(plot_configuration, pixel_width)
         self._stream_state_label.setText("running" if model.is_running else "stopped")
         if not model.hardware_enabled:
             self._stream_state_label.setText("disabled")
@@ -374,13 +402,7 @@ class AnalysisContent(ContentWidget):
         )
         self._start_stop_button.setEnabled(can_stream)
         self._clear_button.setEnabled(model.hardware_enabled and bool(display_configuration.channels))
-        recording_path = model.recording_path
-        if not configuration.is_enabled or not model.is_running:
-            self._recording_label.setText("off")
-        elif recording_path is None:
-            self._recording_label.setText("off" if not configuration.record_to_acquisition else "waiting")
-        else:
-            self._recording_label.setText(recording_path.name)
+        self._live_button.setEnabled(bool(display_configuration.channels))
         if not model.hardware_enabled:
             self._status_label.setText("NI-DAQ hardware is disabled")
         else:

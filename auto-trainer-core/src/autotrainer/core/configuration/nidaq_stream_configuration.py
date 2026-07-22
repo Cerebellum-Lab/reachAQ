@@ -9,7 +9,7 @@ from autotrainer.core.configuration import SystemConfigurationDumper, SystemConf
 
 @dataclasses.dataclass(frozen=True)
 class NidaqSignalChannelConfiguration:
-    """One NI-DAQ input channel to display and optionally record with acquisition data."""
+    """One visualization-only NI-DAQ input channel."""
 
     name: str
     physical_channel: str
@@ -47,7 +47,9 @@ class NidaqSignalStreamConfiguration:
     sample_rate_hz: float = 10000.0
     read_chunk_size: int = 500
     rolling_window_seconds: float = 10.0
-    record_to_acquisition: bool = True
+    # Both fields are retained only so older YAML configurations continue to
+    # load. The analysis stream is visualization-only and they are ignored.
+    record_to_acquisition: bool = False
     output_name: str = "nidaq_signals"
 
     def __post_init__(self):
@@ -76,7 +78,7 @@ class NidaqSignalStreamConfiguration:
         sample_rate_hz: float = 10000.0,
         read_chunk_size: int = 500,
         rolling_window_seconds: float = 10.0,
-        record_to_acquisition: bool = True,
+        record_to_acquisition: bool = False,
         output_name: str = "nidaq_signals",
     ) -> "NidaqSignalStreamConfiguration":
         return cls(

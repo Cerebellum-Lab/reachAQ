@@ -1,8 +1,10 @@
+import dataclasses
 import os
 import time
 from types import SimpleNamespace
 
 import pytest
+import numpy as np
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -25,9 +27,15 @@ from autotrainer.device import (  # noqa: E402
 )
 from tools.acquisition.model.laser_model import LaserModel  # noqa: E402
 from tools.acquisition.model.app_model import AppModel  # noqa: E402
-from tools.acquisition.model.nidaq_signal_monitor_model import NidaqSignalMonitorModel  # noqa: E402
+from tools.acquisition.model.nidaq_signal_monitor_model import (  # noqa: E402
+    NidaqSignalMonitorModel,
+)
+from tools.acquisition.model.nidaq_sample_ring import SharedNidaqSampleRing  # noqa: E402
 from tools.acquisition.view.analysis_content import AnalysisContent  # noqa: E402
-from tools.acquisition.view.laser_control_content import _LaserChannelTab  # noqa: E402
+from tools.acquisition.view.laser_control_content import (  # noqa: E402
+    LaserControlContent,
+    _LaserChannelTab,
+)
 from tools.acquisition.view.rolling_stream_buffer import RollingStreamBuffer  # noqa: E402
 
 
@@ -71,12 +79,32 @@ class _LaserAppStub:
         self.signal_configuration_save_count += 1
 
 
-def _crashing_signal_worker(_configuration, _message_queue, _stop_event, _log_dict_config):
+def _crashing_signal_worker(
+    _configuration, _message_queue, _sample_ring, _stop_event, _log_dict_config,
+):
     os._exit(23)
 
 
-def _hanging_signal_worker(_configuration, _message_queue, stop_event, _log_dict_config):
+def _hanging_signal_worker(
+    _configuration, _message_queue, _sample_ring, stop_event, _log_dict_config,
+):
     stop_event.wait(60.0)
+
+
+def _shared_ring_signal_worker(
+    configuration, message_queue, sample_ring, stop_event, _log_dict_config,
+):
+    sample_ring.write_block(NidaqSignalSampleBlock(
+        wall_time=time.time(),
+        perf_time=time.perf_counter(),
+        sample_rate_hz=configuration.sample_rate_hz,
+        sample_index=0,
+        channels=configuration.channels,
+        values={"cam_frames": (0.0, 1.0, 0.0, 1.0)},
+    ))
+    message_queue.put(("ready", None))
+    stop_event.wait(10.0)
+    message_queue.put(("stopped", None))
 
 
 def _stream_configuration():
@@ -90,6 +118,23 @@ def _stream_configuration():
         ),
         is_enabled=True,
     )
+
+
+def _wait_for_plot_snapshot(content, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if content._rolling_plot.display_latest(content._plot_process):
+            frame = content._rolling_plot._last_frame
+            if any(
+                np.isfinite(content._rolling_plot._display_y[channel_name][:point_count]).any()
+                for channel_name, point_count in zip(
+                    content._rolling_plot._curves,
+                    frame.point_counts,
+                )
+            ):
+                return frame
+        time.sleep(0.02)
+    raise AssertionError("analysis plot process did not produce a snapshot")
 
 
 def _laser_channel():
@@ -125,6 +170,78 @@ def test_configured_signal_monitor_remains_stopped_until_explicit_start():
     assert monitor.status_message == "NI-DAQ signal stream stopped"
 
 
+def test_signal_monitor_derives_read_chunk_from_display_refresh_rate():
+    monitor = NidaqSignalMonitorModel()
+    monitor._configuration = _stream_configuration()
+
+    monitor.set_display_refresh_rate(120.0)
+
+    assert monitor.display_refresh_rate_hz == 120.0
+    assert monitor.effective_read_chunk_size == 83
+    assert monitor.configuration.read_chunk_size == 500
+
+
+def test_signal_monitor_shared_ring_preserves_samples_and_reports_overrun():
+    configuration = _stream_configuration()
+    ring = SharedNidaqSampleRing(configuration, capacity=5)
+    ring.write_block(NidaqSignalSampleBlock(
+        wall_time=1.0,
+        perf_time=1.0,
+        sample_rate_hz=10_000.0,
+        sample_index=0,
+        channels=configuration.channels,
+        values={"cam_frames": (0.0, 1.0, 0.0)},
+    ))
+    ring.write_block(NidaqSignalSampleBlock(
+        wall_time=1.1,
+        perf_time=1.1,
+        sample_rate_hz=10_000.0,
+        sample_index=3,
+        channels=configuration.channels,
+        values={"cam_frames": (1.0, 0.0, 1.0, 0.0)},
+    ))
+    destination = np.empty((1, 5), dtype=np.float32)
+
+    snapshot = ring.copy_since(0, destination)
+
+    assert snapshot.start_sample_index == 2
+    assert snapshot.end_sample_index == 7
+    assert snapshot.overrun_samples == 2
+    assert snapshot.epoch == 0
+    assert snapshot.generation == 2
+    assert destination[0, :5].tolist() == [0.0, 1.0, 0.0, 1.0, 0.0]
+
+
+def test_signal_monitor_shared_ring_reports_source_sample_gap():
+    configuration = _stream_configuration()
+    ring = SharedNidaqSampleRing(configuration, capacity=8)
+    ring.write_block(NidaqSignalSampleBlock(
+        wall_time=1.0,
+        perf_time=1.0,
+        sample_rate_hz=10_000.0,
+        sample_index=0,
+        channels=configuration.channels,
+        values={"cam_frames": (0.0, 1.0)},
+    ))
+    ring.write_block(NidaqSignalSampleBlock(
+        wall_time=1.1,
+        perf_time=1.1,
+        sample_rate_hz=10_000.0,
+        sample_index=5,
+        channels=configuration.channels,
+        values={"cam_frames": (1.0, 0.0)},
+    ))
+    destination = np.empty((1, 8), dtype=np.float32)
+
+    snapshot = ring.copy_since(2, destination)
+
+    assert snapshot.gap_count == 1
+    assert snapshot.start_sample_index == 5
+    assert snapshot.end_sample_index == 7
+    assert snapshot.overrun_samples == 3
+    assert destination[0, :2].tolist() == [1.0, 0.0]
+
+
 def test_numpy_stream_buffer_wraps_without_shifting_existing_window():
     buffer = RollingStreamBuffer(5)
     buffer.append((0, 1, 2), (10, 11, 12))
@@ -135,6 +252,13 @@ def test_numpy_stream_buffer_wraps_without_shifting_existing_window():
     assert x_values.tolist() == [2, 3, 4, 5, 6]
     assert y_values.tolist() == [12, 13, 14, 15, 16]
     assert buffer.latest_x == 6
+    reusable_y = np.empty(5)
+    assert buffer.copy_ordered_y_into(reusable_y) == 5
+    assert reusable_y.tolist() == [12, 13, 14, 15, 16]
+    reusable_x = np.empty(5)
+    assert buffer.copy_ordered_into(reusable_x, reusable_y) == 5
+    assert reusable_x.tolist() == [2, 3, 4, 5, 6]
+    assert reusable_y.tolist() == [12, 13, 14, 15, 16]
 
 
 def test_numpy_stream_buffer_peak_reduction_is_bounded_and_preserves_ttl_pulses():
@@ -201,21 +325,32 @@ def test_analysis_signal_selection_requires_mapped_port_and_nidaq_enable(qapp):
         assert content._channel_count_label.text() == "1"
         assert content._start_stop_button.isEnabled()
         assert content._clear_button.isEnabled()
-        assert content._graph_seconds.suffix() == " s"
-        assert content._graph_min_volts.suffix() == " V"
-        assert content._graph_max_volts.suffix() == " V"
+        assert content._live_button.isEnabled()
+        assert not hasattr(content, "_graph_seconds")
+        assert not hasattr(content, "_graph_min_volts")
+        assert not hasattr(content, "_graph_max_volts")
         assert content._rolling_plot.minimumSize().isEmpty()
         assert content._rolling_plot._plot.minimumSize().isEmpty()
         assert content._rolling_plot._plot.sizePolicy().horizontalPolicy() == QSizePolicy.Policy.Ignored
         assert content._rolling_plot._plot.sizePolicy().verticalPolicy() == QSizePolicy.Policy.Ignored
 
-        content._graph_seconds.setValue(2.0)
-        content._graph_min_volts.setValue(-1.0)
-        content._graph_max_volts.setValue(3.0)
-        qapp.processEvents()
-        assert content._rolling_plot._window_seconds == 2.0
-        assert content._rolling_plot._voltage_range == (-1.0, 3.0)
-        assert content._rolling_plot._buffers["cam_frames"].capacity == 20_000
+        view_box = content._rolling_plot._plot.getPlotItem().getViewBox()
+        assert view_box.state["mouseEnabled"] == [True, False]
+        assert view_box.viewRange()[0] == pytest.approx([-10.0, 0.0])
+        assert view_box.viewRange()[1] == pytest.approx([-0.2, 1.2])
+        assert view_box.state["limits"]["xLimits"] == [-10.0, 0.0]
+        assert view_box.state["limits"]["yLimits"] == [-0.2, 1.2]
+        assert view_box.state["limits"]["xRange"][1] == 10.0
+        view_box.setXRange(-5.0, 0.0, padding=0)
+        assert view_box.viewRange()[0] == pytest.approx([-5.0, 0.0])
+        assert view_box.viewRange()[1] == pytest.approx([-0.2, 1.2])
+        view_box.setXRange(-20.0, 0.0, padding=0)
+        assert view_box.viewRange()[0] == pytest.approx([-10.0, 0.0])
+        view_box.setXRange(-8.0, -3.0, padding=0)
+        content._live_button.click()
+        assert view_box.viewRange()[0] == pytest.approx([-5.0, 0.0])
+        assert view_box.viewRange()[1] == pytest.approx([-0.2, 1.2])
+        assert content._plot_process.pid != os.getpid()
 
         tone1.setChecked(True)
         qapp.processEvents()
@@ -232,6 +367,7 @@ def test_analysis_signal_selection_requires_mapped_port_and_nidaq_enable(qapp):
         qapp.processEvents()
         assert monitor.configuration.channels == tuple()
         assert not content._start_stop_button.isEnabled()
+        assert not content._live_button.isEnabled()
         assert app_model.signal_configuration_save_count == 3
 
         content._signal_checkboxes["tone1"].setChecked(True)
@@ -297,40 +433,72 @@ def test_analysis_excludes_laser_owned_inputs_from_selector_and_graph(qapp):
         content.deleteLater()
 
 
-def test_analysis_coalesces_sample_blocks_before_single_rolling_redraw(qapp):
+def test_analysis_prepares_sample_blocks_in_dedicated_process(qapp):
     monitor = NidaqSignalMonitorModel()
-    monitor._configuration = _stream_configuration()
+    monitor._configuration = dataclasses.replace(
+        _stream_configuration(), sample_rate_hz=1000.0,
+    )
     monitor._hardware_enabled = True
     content = AnalysisContent(_AnalysisAppStub(monitor))
     content.show()
     qapp.processEvents()
-    redraw_calls = []
-    original_redraw = content._rolling_plot.redraw
-    content._rolling_plot.redraw = lambda: (redraw_calls.append(True), original_redraw())
     try:
-        for sample_index in (0, 100, 200):
-            content._sample_block_received(
-                NidaqSignalSampleBlock(
-                    wall_time=1.0,
-                    perf_time=1.0,
-                    sample_rate_hz=1000.0,
-                    sample_index=sample_index,
-                    channels=monitor.configuration.channels,
-                    values={"cam_frames": tuple(float(index % 2) for index in range(100))},
-                )
+        monitor.sample_ring.write_block(
+            NidaqSignalSampleBlock(
+                wall_time=1.0,
+                perf_time=1.0,
+                sample_rate_hz=1000.0,
+                sample_index=0,
+                channels=monitor.configuration.channels,
+                values={"cam_frames": tuple(float(index % 2) for index in range(300))},
             )
+        )
 
-        assert content._rolling_plot._buffers["cam_frames"].size == 0
-        content._flush_pending_blocks()
+        snapshot = _wait_for_plot_snapshot(content)
+        assert content._plot_process.pid != os.getpid()
+        assert not hasattr(content._plot_process, "_snapshot_queue")
+        assert not hasattr(content._plot_process, "_block_queue")
+        assert "_sample_queue" not in vars(monitor)
+        displayed = content._rolling_plot._display_y["cam_frames"][:snapshot.point_counts[0]]
+        assert np.count_nonzero(np.isfinite(displayed)) == 600
+        assert snapshot.latest_x == pytest.approx(0.299)
+        display_array_id = id(content._rolling_plot._display_y["cam_frames"])
+        monitor.sample_ring.write_block(
+            NidaqSignalSampleBlock(
+                wall_time=1.1,
+                perf_time=1.1,
+                sample_rate_hz=1000.0,
+                sample_index=300,
+                channels=monitor.configuration.channels,
+                values={"cam_frames": (0.0, 1.0)},
+            )
+        )
+        _wait_for_plot_snapshot(content)
+        assert id(content._rolling_plot._display_y["cam_frames"]) == display_array_id
 
-        assert redraw_calls == [True]
-        assert content._rolling_plot._buffers["cam_frames"].size == 300
+        monitor.sample_ring.reset()
+        monitor.sample_ring.write_block(
+            NidaqSignalSampleBlock(
+                wall_time=2.0,
+                perf_time=2.0,
+                sample_rate_hz=1000.0,
+                sample_index=0,
+                channels=monitor.configuration.channels,
+                values={"cam_frames": (1.0, 1.0)},
+            )
+        )
+        restarted = _wait_for_plot_snapshot(content)
+        restarted_values = content._rolling_plot._display_y["cam_frames"][
+            :restarted.point_counts[0]
+        ]
+        assert restarted.latest_x == pytest.approx(0.001)
+        assert restarted_values.tolist() == [1.0, 1.0]
     finally:
         content.on_close()
         content.deleteLater()
 
 
-def test_analysis_redraw_sends_bounded_peak_envelope_to_qt(qapp):
+def test_analysis_redraw_sends_timestamped_square_steps_to_qt(qapp):
     monitor = NidaqSignalMonitorModel()
     monitor._configuration = _stream_configuration()
     monitor._hardware_enabled = True
@@ -338,7 +506,7 @@ def test_analysis_redraw_sends_bounded_peak_envelope_to_qt(qapp):
     try:
         values = [0.0] * 100_000
         values[50_000] = 1.0
-        content._sample_block_received(
+        monitor.sample_ring.write_block(
             NidaqSignalSampleBlock(
                 wall_time=1.0,
                 perf_time=1.0,
@@ -350,44 +518,80 @@ def test_analysis_redraw_sends_bounded_peak_envelope_to_qt(qapp):
         )
         content.show()
         qapp.processEvents()
-        content._flush_pending_blocks()
+        _wait_for_plot_snapshot(content)
 
         curve = content._rolling_plot._curves["cam_frames"]
-        assert len(curve.xData) <= 8_000
+        assert len(curve.xData) == 6
         assert curve.yData.min() == 0.0
         assert curve.yData.max() == 1.0
+        assert curve.xData[1] == curve.xData[2]
+        assert curve.xData[3] == curve.xData[4]
+        changing_segments = np.flatnonzero(np.diff(curve.yData) != 0)
+        assert np.all(np.diff(curve.xData)[changing_segments] == 0)
     finally:
         content.on_close()
         content.deleteLater()
 
 
-def test_signal_recording_writer_drains_buffered_blocks_on_close(tmp_path):
+def test_analysis_does_not_stretch_partial_history_across_full_window(qapp):
     monitor = NidaqSignalMonitorModel()
     monitor._configuration = _stream_configuration()
-    output_base = tmp_path / "nidaq_stream"
-    monitor._project = SimpleNamespace(
-        get_source_path=lambda _name: SimpleNamespace(full_path=output_base)
-    )
-    block = NidaqSignalSampleBlock(
-        wall_time=1.0,
-        perf_time=2.0,
-        sample_rate_hz=1_000.0,
-        sample_index=0,
-        channels=monitor.configuration.channels,
-        values={"cam_frames": (0.0, 1.0, 0.0)},
-    )
-
-    monitor._open_recording_file()
+    monitor._hardware_enabled = True
+    content = AnalysisContent(_AnalysisAppStub(monitor))
     try:
-        assert monitor._recording_thread is not None
-        monitor._write_block(block)
-    finally:
-        monitor._close_recording_file()
+        monitor.sample_ring.write_block(
+            NidaqSignalSampleBlock(
+                wall_time=1.0,
+                perf_time=1.0,
+                sample_rate_hz=10_000.0,
+                sample_index=0,
+                channels=monitor.configuration.channels,
+                values={"cam_frames": tuple(float((index // 100) % 2) for index in range(1000))},
+            )
+        )
+        content.show()
+        qapp.processEvents()
+        _wait_for_plot_snapshot(content)
 
-    rows = (tmp_path / "nidaq_stream.csv").read_text().splitlines()
-    assert len(rows) == 4
-    assert rows[0].endswith("sample_index,cam_frames")
-    assert rows[-1].endswith("2,0.0")
+        curve = content._rolling_plot._curves["cam_frames"]
+        assert curve.xData[0] == pytest.approx(-0.0999, abs=1e-5)
+        assert curve.xData[-1] == pytest.approx(0.0, abs=1e-6)
+        assert np.all(np.diff(curve.xData) >= 0)
+    finally:
+        content.on_close()
+        content.deleteLater()
+
+
+def test_analysis_uses_active_screen_refresh_rate_for_timer_and_chunk(qapp):
+    monitor = NidaqSignalMonitorModel()
+    monitor._configuration = _stream_configuration()
+    monitor._hardware_enabled = True
+    content = AnalysisContent(_AnalysisAppStub(monitor))
+    try:
+        content._screen_changed(SimpleNamespace(refreshRate=lambda: 120.0))
+
+        assert content._display_refresh_rate_hz == 120.0
+        assert content._plot_timer.interval() == 8
+        assert monitor.effective_read_chunk_size == 83
+    finally:
+        content.on_close()
+        content.deleteLater()
+
+
+def test_signal_monitor_has_no_analysis_stream_persistence(tmp_path):
+    monitor = NidaqSignalMonitorModel()
+    monitor._configuration = dataclasses.replace(
+        _stream_configuration(),
+        record_to_acquisition=True,
+    )
+    monitor.project = SimpleNamespace(
+        get_source_path=lambda _name: (_ for _ in ()).throw(
+            AssertionError("visualization stream must not request an output path")
+        )
+    )
+
+    assert "_open_recording_file" not in vars(type(monitor))
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_signal_monitor_contains_native_worker_failure_outside_application_process():
@@ -403,6 +607,27 @@ def test_signal_monitor_contains_native_worker_failure_outside_application_proce
     assert not monitor.is_starting
     assert not monitor.is_running
     assert "exit code 23" in monitor.error_message
+
+
+def test_signal_monitor_worker_publishes_directly_to_shared_ring():
+    monitor = NidaqSignalMonitorModel(worker_target=_shared_ring_signal_worker)
+    monitor._configuration = _stream_configuration()
+    monitor._hardware_enabled = True
+    try:
+        assert monitor.start()
+        deadline = time.monotonic() + 5.0
+        while not monitor.is_running and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        destination = np.empty((1, monitor.sample_ring.capacity), dtype=np.float32)
+        snapshot = monitor.sample_ring.copy_since(None, destination)
+
+        assert monitor.is_running
+        assert snapshot.sample_count == 4
+        assert snapshot.generation == 1
+        assert destination[0, :4].tolist() == [0.0, 1.0, 0.0, 1.0]
+    finally:
+        monitor.close()
 
 
 def test_signal_monitor_times_out_hung_runtime_without_blocking_caller():
@@ -533,6 +758,51 @@ def test_laser_trace_auto_resumes_and_displays_entire_calibration_ramp(qapp):
         app_model.nidaq_signal_monitor.close()
         laser.close()
         tab.deleteLater()
+
+
+def test_laser_control_reads_nidaq_samples_directly_from_shared_ring(qapp):
+    channel = _laser_channel()
+    configuration = LaserSystemConfiguration.from_channels(
+        (channel,), backend="null", sample_rate_hz=1000.0,
+    )
+    laser = LaserModel(NullLaserController(configuration))
+    app_model = _LaserAppStub(laser)
+    stream_channel = NidaqSignalChannelConfiguration(
+        name="laser1_diode",
+        physical_channel="Dev1/ai0",
+        kind="analog",
+        unit="V",
+    )
+    app_model.nidaq_signal_monitor._configuration = NidaqSignalStreamConfiguration(
+        channels=(stream_channel,),
+        is_enabled=True,
+        sample_rate_hz=1000.0,
+    )
+    content = LaserControlContent(app_model)
+    try:
+        tab = content._channel_tabs[0]
+        tab._set_trace_streaming(True)
+        app_model.nidaq_signal_monitor.sample_ring.write_block(
+            NidaqSignalSampleBlock(
+                wall_time=1.0,
+                perf_time=1.0,
+                sample_rate_hz=1000.0,
+                sample_index=0,
+                channels=(stream_channel,),
+                values={"laser1_diode": (0.25, 0.5, 0.75)},
+            )
+        )
+
+        content._flush_nidaq_sample_blocks()
+
+        diode_x, diode_y = tab._trace_buffers["diode"].ordered()
+        assert diode_x.tolist() == [0.0, 0.001, 0.002]
+        assert diode_y.tolist() == [0.25, 0.5, 0.75]
+    finally:
+        content.on_close()
+        content.deleteLater()
+        app_model.nidaq_signal_monitor.close()
+        laser.close()
 
 
 def test_laser_tab_owns_and_persists_its_input_stream_options(qapp):

@@ -155,12 +155,16 @@ that message as a driver/device problem: re-run the discovery checks above and
 verify that each selected channel supports the requested input task.
 
 For camera/barcode TTL streams, use a hardware-clocked input rate of at least
-5 kHz; reachAQ defaults to 10 kHz with 500-sample reads. Digital-only tasks use
+5 kHz; reachAQ defaults to 10 kHz and derives the runtime read size from the
+refresh rate of the screen containing the application. Digital-only tasks use
 `ctr0` on the input device to generate the sample clock. Confirm that the
 counter is not reserved by another task. The UI redraws a peak-preserving,
-display-bounded view of the rolling buffer at about 30 Hz; this does not reduce
-the hardware capture rate. Set the graph's visible duration in seconds and its
-vertical minimum/maximum in volts with the controls beneath the graph.
+display-bounded view at that screen's refresh rate; this visualization is never
+persisted and does not reduce the hardware capture rate. Rolling-buffer and
+per-pixel peak-envelope work runs in a dedicated plot-data process that
+publishes double-buffered shared memory, while the GUI process performs only the
+final bounded Qt curve draw. Set the graph's visible duration in seconds
+and its vertical minimum/maximum in volts with the controls beneath the graph.
 
 ## References
 

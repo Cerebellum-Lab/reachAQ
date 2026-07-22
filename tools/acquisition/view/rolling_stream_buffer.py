@@ -87,6 +87,43 @@ class RollingStreamBuffer:
             np.concatenate((self._y[start:], self._y[: self._size - split])),
         )
 
+    def copy_ordered_y_into(self, target: np.ndarray) -> int:
+        """Copy chronological Y values into a caller-owned reusable array."""
+        if target.size < self._size:
+            raise ValueError(f"target holds {target.size} values; {self._size} required")
+        if self._size == 0:
+            return 0
+        start = (self._next - self._size) % self._capacity
+        end = start + self._size
+        if end <= self._capacity:
+            target[:self._size] = self._y[start:end]
+        else:
+            split = self._capacity - start
+            target[:split] = self._y[start:]
+            target[split:self._size] = self._y[:self._size - split]
+        return self._size
+
+    def copy_ordered_into(self, x_target: np.ndarray, y_target: np.ndarray) -> int:
+        """Copy chronological X/Y values into caller-owned reusable arrays."""
+        if x_target.size < self._size or y_target.size < self._size:
+            raise ValueError(
+                f"targets hold ({x_target.size}, {y_target.size}) values; {self._size} required"
+            )
+        if self._size == 0:
+            return 0
+        start = (self._next - self._size) % self._capacity
+        end = start + self._size
+        if end <= self._capacity:
+            x_target[:self._size] = self._x[start:end]
+            y_target[:self._size] = self._y[start:end]
+        else:
+            split = self._capacity - start
+            x_target[:split] = self._x[start:]
+            x_target[split:self._size] = self._x[:self._size - split]
+            y_target[:split] = self._y[start:]
+            y_target[split:self._size] = self._y[:self._size - split]
+        return self._size
+
     def ordered_for_plot(self, max_points: int) -> Tuple[np.ndarray, np.ndarray]:
         """Return a bounded peak envelope suitable for a live plot.
 

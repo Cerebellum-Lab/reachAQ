@@ -107,8 +107,6 @@ nidaqStream: !NidaqSignalStreamConfiguration
   sampleRateHz: 10000.0
   readChunkSize: 500
   rollingWindowSeconds: 10.0
-  recordToAcquisition: false
-  outputName: nidaq_signals
   channels: []
 persistence: !PersistenceConfiguration
   outputLocation: /tmp/reachaq-random-data

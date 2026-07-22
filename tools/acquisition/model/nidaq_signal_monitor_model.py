@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-import csv
 import dataclasses
 import logging
+import math
 import queue
 import signal
 import threading
 import time
-from pathlib import Path
-from typing import Callable, Iterable, Optional, TextIO
+from typing import Iterable, Optional
 
 from autotrainer.core import (
     NidaqSignalChannelConfiguration,
@@ -24,19 +23,18 @@ from autotrainer.core.logging import (
 )
 from autotrainer.core.multiproc import get_mp_ctx
 from autotrainer.core.project import ProjectDependentProtocol
-from autotrainer.device import NidaqSignalSampleBlock, NidaqSignalStreamController
+from autotrainer.device import NidaqSignalStreamController
+from tools.acquisition.model.nidaq_sample_ring import SharedNidaqSampleRing
 
 
 logger = get_verbose_logger(__name__)
 
 
 _WORKER_READY = "ready"
-_WORKER_SAMPLE = "sample"
 _WORKER_ERROR = "error"
 _WORKER_STOPPED = "stopped"
 _WORKER_LOG = "log"
 _DEFAULT_STARTUP_TIMEOUT_SECONDS = 10.0
-_RECORDING_QUEUE_BLOCKS = 256
 
 
 def _put_worker_message(message_queue, message) -> None:
@@ -67,7 +65,13 @@ class _NidaqWorkerLogHandler(logging.Handler):
             self.handleError(record)
 
 
-def _nidaq_signal_stream_worker(configuration, message_queue, stop_event, log_dict_config) -> None:
+def _nidaq_signal_stream_worker(
+    configuration,
+    message_queue,
+    sample_ring,
+    stop_event,
+    log_dict_config,
+) -> None:
     """Own every NI-DAQmx call in a disposable process.
 
     Loading the NI Linux runtime can hang or terminate the interpreter.  Keeping
@@ -89,7 +93,7 @@ def _nidaq_signal_stream_worker(configuration, message_queue, stop_event, log_di
         while not stop_event.is_set():
             block = controller.read_chunk()
             if block.sample_count > 0:
-                _put_worker_message(message_queue, (_WORKER_SAMPLE, block))
+                sample_ring.write_block(block)
     except BaseException as exc:
         message = str(exc) or exc.__class__.__name__
         logger.exception("NI-DAQ signal stream worker failed")
@@ -105,10 +109,6 @@ def _nidaq_signal_stream_worker(configuration, message_queue, stop_event, log_di
         _put_worker_message(message_queue, (_WORKER_STOPPED, None))
 
 
-class NidaqSignalMonitorEvents:
-    sample_block_received = Callable[[NidaqSignalSampleBlock], None]
-
-
 class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
     CONFIGURATION = "configuration"
     HARDWARE_ENABLED = "hardware_enabled"
@@ -116,9 +116,6 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
     IS_RUNNING = "is_running"
     STATUS_MESSAGE = "status_message"
     ERROR_MESSAGE = "error_message"
-    RECORDING_PATH = "recording_path"
-
-    sample_block_received: NidaqSignalMonitorEvents.sample_block_received
 
     def __init__(
         self,
@@ -127,28 +124,24 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
         worker_target=_nidaq_signal_stream_worker,
         startup_timeout_seconds: float = _DEFAULT_STARTUP_TIMEOUT_SECONDS,
     ):
-        super().__init__(("sample_block_received",))
+        super().__init__()
         self._configuration = NidaqSignalStreamConfiguration()
         self._hardware_enabled = False
         self._project: Optional[ProjectInfo] = None
         self._mp_ctx = get_mp_ctx() if mp_ctx is None else mp_ctx
         self._worker_target = worker_target
         self._startup_timeout_seconds = startup_timeout_seconds
+        self._display_refresh_rate_hz = 60.0
         self._process = None
         self._message_queue = None
         self._process_stop_event = None
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.RLock()
-        self._recording_queue: Optional[queue.Queue] = None
-        self._recording_stop_event: Optional[threading.Event] = None
-        self._recording_thread: Optional[threading.Thread] = None
-        self._recording_path: Optional[Path] = None
-        self._recording_blocked = False
-        self._recording_last_flush = 0.0
         self._is_starting = False
         self._is_running = False
         self._status_message = "NI-DAQ signal stream disabled"
         self._error_message = ""
+        self._sample_ring = SharedNidaqSampleRing(self._configuration, mp_ctx=self._mp_ctx)
 
     @property
     def configuration(self) -> NidaqSignalStreamConfiguration:
@@ -166,10 +159,6 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
     def project(self, value: Optional[ProjectInfo]):
         with self._lock:
             self._project = value
-            self._recording_blocked = False
-            self._close_recording_file()
-            if self._is_running:
-                self._open_recording_file()
 
     @property
     def is_running(self) -> bool:
@@ -188,14 +177,56 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
         return self._error_message
 
     @property
-    def recording_path(self) -> Optional[Path]:
-        return self._recording_path
+    def display_refresh_rate_hz(self) -> float:
+        return self._display_refresh_rate_hz
+
+    @property
+    def sample_ring(self) -> SharedNidaqSampleRing:
+        with self._lock:
+            expected_names = tuple(channel.name for channel in self._configuration.channels)
+            required_capacity = max(
+                self._configuration.read_chunk_size * 4,
+                int(math.ceil(
+                    self._configuration.sample_rate_hz
+                    * self._configuration.rolling_window_seconds
+                )),
+            )
+            ring = self._sample_ring
+            if (
+                ring.channel_names != expected_names
+                or not math.isclose(ring.sample_rate_hz, self._configuration.sample_rate_hz)
+                or ring.capacity < required_capacity
+            ):
+                if self._process is not None:
+                    raise RuntimeError("cannot replace NI-DAQ sample ring while stream is active")
+                ring = SharedNidaqSampleRing(self._configuration, mp_ctx=self._mp_ctx)
+                self._sample_ring = ring
+            return ring
+
+    @property
+    def effective_read_chunk_size(self) -> int:
+        return max(
+            1,
+            int(round(self._configuration.sample_rate_hz / self._display_refresh_rate_hz)),
+        )
+
+    def set_display_refresh_rate(self, refresh_rate_hz: float) -> None:
+        refresh_rate_hz = float(refresh_rate_hz)
+        if not math.isfinite(refresh_rate_hz) or refresh_rate_hz < 1.0:
+            refresh_rate_hz = 60.0
+        previous_chunk_size = self.effective_read_chunk_size
+        if math.isclose(refresh_rate_hz, self._display_refresh_rate_hz, rel_tol=0.001):
+            return
+        was_active = self._is_running or self._is_starting
+        self._display_refresh_rate_hz = refresh_rate_hz
+        if was_active and self.effective_read_chunk_size != previous_chunk_size:
+            self.stop()
+            self.start()
 
     def load_configuration(self, configuration: NidaqSignalStreamConfiguration) -> None:
         self.stop()
         prev = self._configuration
         self._configuration = configuration
-        self._recording_blocked = False
         self._on_property_changed(self.CONFIGURATION, configuration, prev)
         if configuration.is_enabled and self._hardware_enabled:
             self._set_status("NI-DAQ signal stream stopped")
@@ -245,7 +276,6 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
             channels=channels,
             is_enabled=bool(channels),
         )
-        self._recording_blocked = False
         self._on_property_changed(self.CONFIGURATION, self._configuration, previous)
         self._set_error("")
         if was_running and self._hardware_enabled and channels:
@@ -259,7 +289,10 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
         with self._lock:
             if self._is_running or self._is_starting:
                 return True
-            configuration = self._configuration
+            configuration = dataclasses.replace(
+                self._configuration,
+                read_chunk_size=self.effective_read_chunk_size,
+            )
             if not self._hardware_enabled:
                 self._set_status("NI-DAQ hardware disabled; signal stream stopped")
                 self._set_error("")
@@ -280,10 +313,12 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
             try:
                 message_queue = self._mp_ctx.Queue(maxsize=16)
                 stop_event = self._mp_ctx.Event()
+                sample_ring = self.sample_ring
+                sample_ring.reset()
                 process = self._mp_ctx.Process(
                     target=self._worker_target,
                     name="nidaq-signal-stream",
-                    args=(configuration, message_queue, stop_event, None),
+                    args=(configuration, message_queue, sample_ring, stop_event, None),
                     daemon=True,
                 )
                 process.start()
@@ -308,7 +343,6 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
             self._process = process
             self._message_queue = message_queue
             self._process_stop_event = stop_event
-            self._recording_blocked = False
             self._set_error("")
             self._set_status("Starting NI-DAQ signal stream...")
             self._set_starting(True)
@@ -329,7 +363,6 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
             stop_event = self._process_stop_event
             was_starting = self._is_starting
             if process is None:
-                self._close_recording_file()
                 self._set_starting(False)
                 self._set_running(False)
                 return
@@ -373,7 +406,7 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
                     process.join(timeout=0.5)
                     break
                 try:
-                    kind, payload = message_queue.get(timeout=0.1)
+                    kind, payload = message_queue.get(timeout=0.01)
                 except queue.Empty:
                     if not process.is_alive():
                         unexpected_exit = not stop_event.is_set()
@@ -385,9 +418,7 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
                     with self._lock:
                         if process is not self._process:
                             break
-                        self._recording_blocked = False
                         self._set_error("")
-                        self._open_recording_file()
                         self._set_starting(False)
                         self._set_running(True)
                         self._set_status("NI-DAQ signal stream running")
@@ -397,9 +428,6 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
                         time.perf_counter() - started,
                         process.pid,
                     )
-                elif kind == _WORKER_SAMPLE:
-                    self.sample_block_received(payload)
-                    self._write_block(payload)
                 elif kind == _WORKER_ERROR:
                     message = str(payload)
                     if not worker_error:
@@ -459,125 +487,10 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
             self._message_queue = None
             self._process_stop_event = None
             self._thread = None
-            self._close_recording_file()
             self._set_starting(False)
             self._set_running(False)
             if self._configuration.is_enabled:
                 self._set_status("NI-DAQ signal stream stopped")
-
-    def _open_recording_file(self) -> None:
-        if not self._configuration.record_to_acquisition:
-            self._set_recording_path(None)
-            return
-        if self._recording_blocked:
-            return
-        project = self._project
-        if project is None:
-            self._set_recording_path(None)
-            return
-        file = None
-        try:
-            source = project.get_source_path(self._configuration.output_name)
-            path = Path(f"{source.full_path}.csv")
-            path.parent.mkdir(parents=True, exist_ok=True)
-            file = path.open("a", newline="")
-            writer = csv.writer(file)
-            if path.stat().st_size == 0:
-                writer.writerow(
-                    ["wall_time", "perf_time", "sample_index"]
-                    + [channel.name for channel in self._configuration.channels]
-                )
-                file.flush()
-            recording_queue = queue.Queue(maxsize=_RECORDING_QUEUE_BLOCKS)
-            stop_event = threading.Event()
-            recording_thread = threading.Thread(
-                target=self._recording_loop,
-                args=(file, writer, recording_queue, stop_event),
-                name="nidaq_signal_writer",
-                daemon=True,
-            )
-            self._recording_queue = recording_queue
-            self._recording_stop_event = stop_event
-            self._recording_thread = recording_thread
-            self._recording_last_flush = time.monotonic()
-            self._set_recording_path(path)
-            recording_thread.start()
-        except Exception as exc:
-            logger.exception("Failed to open NI-DAQ signal recording file")
-            self._recording_blocked = True
-            self._close_recording_file()
-            if file is not None and (self._recording_thread is None or self._recording_thread.ident is None):
-                file.close()
-            self._set_error(f"NI-DAQ signal recording disabled: {str(exc) or exc.__class__.__name__}")
-
-    def _write_block(self, block: NidaqSignalSampleBlock) -> None:
-        recording_queue = self._recording_queue
-        if recording_queue is None:
-            return
-        try:
-            recording_queue.put_nowait(block)
-        except queue.Full:
-            message = (
-                f"NI-DAQ signal recording stopped: writer queue exceeded "
-                f"{_RECORDING_QUEUE_BLOCKS} blocks"
-            )
-            logger.error(message)
-            self._recording_blocked = True
-            self._close_recording_file()
-            self._set_error(message)
-
-    def _recording_loop(self, file: TextIO, writer, recording_queue, stop_event) -> None:
-        try:
-            while not (stop_event.is_set() and recording_queue.empty()):
-                try:
-                    block = recording_queue.get(timeout=0.1)
-                except queue.Empty:
-                    continue
-                rows = (
-                    [
-                        block.wall_time + sample_offset / block.sample_rate_hz,
-                        block.perf_time + sample_offset / block.sample_rate_hz,
-                        block.sample_index + sample_offset,
-                    ]
-                    + [
-                        block.values.get(channel.name, ())[sample_offset]
-                        if sample_offset < len(block.values.get(channel.name, ()))
-                        else ""
-                        for channel in block.channels
-                    ]
-                    for sample_offset in range(block.sample_count)
-                )
-                writer.writerows(rows)
-                now = time.monotonic()
-                if now - self._recording_last_flush >= 1.0:
-                    file.flush()
-                    self._recording_last_flush = now
-        except Exception as exc:
-            logger.exception("Failed to write NI-DAQ signal recording samples")
-            self._recording_blocked = True
-            self._close_recording_file()
-            self._set_error(f"NI-DAQ signal recording stopped: {str(exc) or exc.__class__.__name__}")
-        finally:
-            try:
-                file.close()
-            except Exception as exc:
-                logger.exception("Failed to close NI-DAQ signal recording file")
-                self._set_error(str(exc) or exc.__class__.__name__)
-
-    def _close_recording_file(self) -> None:
-        stop_event = self._recording_stop_event
-        thread = self._recording_thread
-        self._recording_queue = None
-        self._recording_stop_event = None
-        self._recording_thread = None
-        self._recording_last_flush = 0.0
-        self._set_recording_path(None)
-        if stop_event is not None:
-            stop_event.set()
-        if thread is not None and thread.ident is not None and thread is not threading.current_thread():
-            thread.join(timeout=2.0)
-            if thread.is_alive():
-                logger.warning("NI-DAQ signal recording writer is still draining buffered samples")
 
     def _set_running(self, value: bool) -> None:
         prev, self._is_running = self._is_running, value
@@ -594,7 +507,3 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
     def _set_error(self, value: str) -> None:
         prev, self._error_message = self._error_message, value
         self._on_property_changed(self.ERROR_MESSAGE, value, prev)
-
-    def _set_recording_path(self, value: Optional[Path]) -> None:
-        prev, self._recording_path = self._recording_path, value
-        self._on_property_changed(self.RECORDING_PATH, value, prev)

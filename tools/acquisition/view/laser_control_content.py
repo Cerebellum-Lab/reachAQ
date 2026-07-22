@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import threading
-from collections import deque
-from typing import Callable, Deque, Dict, List, Optional, Tuple
+import time
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pyqtgraph as pg
@@ -978,8 +977,13 @@ class LaserControlContent(ContentWidget):
         self._operation_thread: Optional[QThread] = None
         self._operation_worker: Optional[_LaserOperationWorker] = None
         self._channel_tabs: Tuple[_LaserChannelTab, ...] = tuple()
-        self._pending_signal_blocks: Deque[NidaqSignalSampleBlock] = deque(maxlen=64)
-        self._pending_signal_blocks_lock = threading.Lock()
+        self._signal_ring = app_model.nidaq_signal_monitor.sample_ring
+        self._signal_ring_scratch = np.empty(
+            (self._signal_ring.channel_count, self._signal_ring.capacity),
+            dtype=np.float32,
+        )
+        self._signal_sample_index = self._signal_ring.current_end_sample_index()
+        self._signal_epoch = None
 
         self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         self.setObjectName("LaserControlContent")
@@ -1045,7 +1049,6 @@ class LaserControlContent(ContentWidget):
         app_model.laser.property_changed += self._on_laser_property_changed
         app_model.laser.trace_received += self._on_laser_trace_received
         app_model.nidaq_signal_monitor.property_changed += self._on_nidaq_monitor_property_changed
-        app_model.nidaq_signal_monitor.sample_block_received += self._on_nidaq_sample_block
         self._stream_plot_timer = QTimer(self)
         self._stream_plot_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._stream_plot_timer.setInterval(33)
@@ -1058,7 +1061,6 @@ class LaserControlContent(ContentWidget):
         self._app_model.laser.property_changed -= self._on_laser_property_changed
         self._app_model.laser.trace_received -= self._on_laser_trace_received
         self._app_model.nidaq_signal_monitor.property_changed -= self._on_nidaq_monitor_property_changed
-        self._app_model.nidaq_signal_monitor.sample_block_received -= self._on_nidaq_sample_block
 
     @invoke_method
     def _on_laser_property_changed(self, property_name: str, _value, _old_value):
@@ -1083,21 +1085,50 @@ class LaserControlContent(ContentWidget):
             for tab in self._channel_tabs:
                 tab.refresh_signal_selections()
 
-    def _on_nidaq_sample_block(self, block: NidaqSignalSampleBlock) -> None:
-        with self._pending_signal_blocks_lock:
-            self._pending_signal_blocks.append(block)
-
     def _flush_nidaq_sample_blocks(self) -> None:
-        with self._pending_signal_blocks_lock:
-            blocks = tuple(self._pending_signal_blocks)
-            self._pending_signal_blocks.clear()
-        if not blocks:
+        ring = self._app_model.nidaq_signal_monitor.sample_ring
+        if ring is not self._signal_ring:
+            self._signal_ring = ring
+            self._signal_ring_scratch = np.empty(
+                (ring.channel_count, ring.capacity), dtype=np.float32,
+            )
+            self._signal_sample_index = ring.current_end_sample_index()
+            self._signal_epoch = None
+        sample_read = ring.copy_since(
+            self._signal_sample_index,
+            self._signal_ring_scratch,
+        )
+        if sample_read is None:
             return
+        if self._signal_epoch is not None and sample_read.epoch != self._signal_epoch:
+            self._signal_epoch = sample_read.epoch
+            self._signal_sample_index = None
+            return
+        self._signal_epoch = sample_read.epoch
+        self._signal_sample_index = sample_read.end_sample_index
+        if not sample_read.sample_count:
+            return
+        channels = self._app_model.nidaq_signal_monitor.configuration.channels
+        block = NidaqSignalSampleBlock(
+            wall_time=sample_read.source_wall_time,
+            perf_time=time.perf_counter(),
+            sample_rate_hz=sample_read.sample_rate_hz,
+            sample_index=sample_read.start_sample_index,
+            channels=channels,
+            values={
+                channel.name: tuple(
+                    float(value)
+                    for value in self._signal_ring_scratch[
+                        channel_index, :sample_read.sample_count
+                    ]
+                )
+                for channel_index, channel in enumerate(channels)
+            },
+        )
         updated_tabs = set()
-        for block in blocks:
-            for tab in self._channel_tabs:
-                if tab.append_signal_block(block, redraw=False):
-                    updated_tabs.add(tab)
+        for tab in self._channel_tabs:
+            if tab.append_signal_block(block, redraw=False):
+                updated_tabs.add(tab)
         current_tab = self._tabs.currentWidget()
         if self.isVisible() and current_tab in updated_tabs:
             current_tab.redraw_trace()

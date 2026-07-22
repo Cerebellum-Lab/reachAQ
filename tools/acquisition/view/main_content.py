@@ -1,4 +1,5 @@
 import math
+import threading
 import time
 from typing import Tuple, Optional, List
 
@@ -196,6 +197,8 @@ class MainContent(ContentWidget):
 
         self._prev_parts_3d_loc = {}
         self._next_parts_3d_loc_report = time.perf_counter()
+        self._pending_pose_response = None
+        self._pending_pose_lock = threading.Lock()
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self.update_image)
@@ -482,6 +485,7 @@ class MainContent(ContentWidget):
 
     @Slot()
     def update_image(self):
+        self._flush_pending_pose()
         model = self._app_model
         for camera, camera_content in self._reach_camera_contents:
             if camera.is_enabled:
@@ -489,9 +493,26 @@ class MainContent(ContentWidget):
         if model.top_camera.is_enabled:
             if self._top_camera_content is not None:
                 self._top_camera_content.update_image()
-        self._analysis_content.use_cache()
 
     def refresh_pose(self, response: PoseResponse):
+        """Cache only the newest inference result until the next display tick.
+
+        Live inference can produce pose results much faster than Qt renders the
+        camera panels.  Dispatching every result to every camera creates an
+        unbounded queue of UI-thread calls and delays unrelated timers, including
+        the live analysis plot.  The intermediate poses are never displayed, so
+        retain just the newest result and consume it at the configured live-feed
+        refresh rate.
+        """
+        with self._pending_pose_lock:
+            self._pending_pose_response = response
+
+    def _flush_pending_pose(self):
+        with self._pending_pose_lock:
+            response = self._pending_pose_response
+            self._pending_pose_response = None
+        if response is None:
+            return
         for idx, camera in enumerate(self._app_model.inference_cameras):
             camera_content = self._reach_camera_content_by_model.get(camera)
             if camera_content is not None and camera.is_enabled and idx < len(response.locations):

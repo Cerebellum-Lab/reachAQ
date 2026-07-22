@@ -6,6 +6,7 @@ import pytest
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget
 
+from autotrainer.inference import PoseLocation, PoseResponse
 from autotrainer.pyside import PGWidget
 from autotrainer.pyside.content_widget import ContentWidget
 from tools.acquisition.view import main_content as main_content_module
@@ -155,6 +156,41 @@ def test_all_visible_main_panel_boundaries_are_splitters(qapp, app_model, monkey
             "left",
             "right",
         )
+    finally:
+        content.close()
+        content.deleteLater()
+
+
+def test_main_content_coalesces_pose_bursts_at_display_rate(qapp, app_model, monkeypatch):
+    class _BehaviorPanelStub(ContentWidget):
+        def __init__(self, *_args, **_kwargs):
+            super().__init__()
+
+    monkeypatch.setattr(main_content_module, "BehaviorContent", _BehaviorPanelStub)
+    assert app_model.load_configuration() is True
+    app_model.left_camera.is_enabled = True
+    app_model._inference_cameras = (app_model.left_camera,)
+    content = MainContent(app_model)
+    content._timer.stop()
+    try:
+        inference_camera = app_model.inference_cameras[0]
+        camera_panel = content._reach_camera_content_by_model[inference_camera]
+        first = PoseResponse(
+            sequence=1,
+            locations=[{"nose": PoseLocation(1, 10.0, 20.0)}],
+        )
+        newest = PoseResponse(
+            sequence=2,
+            locations=[{"nose": PoseLocation(2, 30.0, 40.0)}],
+        )
+
+        content.refresh_pose(first)
+        content.refresh_pose(newest)
+
+        assert camera_panel.camera_view._next_frame_points == {}
+        content.update_image()
+        assert camera_panel.camera_view._next_frame_points == newest.locations[0]
+        assert content._pending_pose_response is None
     finally:
         content.close()
         content.deleteLater()

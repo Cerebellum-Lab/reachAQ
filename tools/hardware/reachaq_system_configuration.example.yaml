@@ -107,14 +107,12 @@ nidaqPorts: !NidaqPortConfiguration
   camFrames: PXI1Slot4/port0/line4
   barcode: PXI1Slot4/port0/line5
 nidaqStream: !NidaqSignalStreamConfiguration
-  # This monitor is for operator-visible rolling input checks and acquisition-side CSV signal copies.
+  # This monitor is an operator-visible rolling input check. It is never persisted.
   # The PXI-6713 does not provide analog inputs. Add channels only after a supported input device is present.
   isEnabled: false
   sampleRateHz: 10000.0
   readChunkSize: 500
   rollingWindowSeconds: 10.0
-  recordToAcquisition: true
-  outputName: nidaq_signals
   channels: []
 behavior: !BehaviorConfiguration
   pelletDelivery: !PelletDeliveryConfiguration

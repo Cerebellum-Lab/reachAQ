@@ -154,18 +154,26 @@ that does not become ready within 10 seconds is stopped and reported as a
 startup timeout. Hardware initialization milestones from the worker are relayed
 to both the application log and terminal.
 
-Incoming blocks are retained in fixed-size NumPy circular buffers. Graphs drain
-those buffers on a coalesced 30 Hz display timer, and a fixed total point budget
-is shared by visible curves. A peak envelope keeps narrow TTL activity visible
-without repainting every raw sample. CSV formatting runs in a separate bounded
-writer thread and reports an explicit overflow instead of throttling live
-sample delivery. Curves are always solid lines; digital signals are
+The Analysis graph is visualization-only and never writes CSV or any other
+acquisition output. Incoming blocks, fixed-size NumPy circular buffers, and
+pixel-aligned peak-envelope reduction run in a dedicated plot-data process. The
+process publishes alternating fixed-size `float32` shared-memory buffers; no
+plot arrays are serialized through a multiprocessing queue. The GUI timer uses
+the refresh rate reported by the screen containing the application, consumes
+only the newest completed shared buffer, and performs the final Qt curve draw.
+Qt widgets themselves remain in the GUI process. Each curve contains exactly
+one minimum/maximum pair per physical graph pixel so narrow TTL activity remains
+visible without repainting every raw sample.
+Curves are always solid lines; digital signals are
 distinguished by color and label rather than dots or dashes. Controls below
 each graph set its visible time window in seconds and its minimum/maximum
 vertical range in volts.
 
 The default 10 kHz hardware sample rate provides ten samples across each half
-cycle of a 500 Hz square wave. Digital-only tasks use an NI counter output as
+cycle of a 500 Hz square wave. At runtime, the NI read chunk is derived from the
+active screen rate (`sample rate / refresh rate`), so one new block is normally
+available per display refresh. The configured `readChunkSize` remains a
+backward-compatible fallback rather than the live display cadence. Digital-only tasks use an NI counter output as
 their sample clock instead of software-timed per-sample reads. A TTL must be
 connected to the exact physical channel named in `nidaqStream.channels`.
 
