@@ -294,6 +294,7 @@ class MainWindow(QMainWindow):
         self._status_label.setText("")
         self._status_label.setStyleSheet("")
 
+    @invoke_method
     def _on_capture_start_finished(self, started: bool) -> None:
         self._start_capture_thread = None
         self._restore_system_mode()
@@ -310,6 +311,7 @@ class MainWindow(QMainWindow):
         self.animal_in_training_action.setEnabled(True)
         self._app_model_status_combo.setEnabled(True)
 
+    @invoke_method
     def _on_capture_stop_finished(self) -> None:
         self._stop_capture_thread = None
         self.running_status_changed.emit(False)
@@ -406,6 +408,7 @@ class MainWindow(QMainWindow):
         self._hardware_refresh_thread = thread
         thread.start()
 
+    @invoke_method
     def _on_hardware_refresh_finished(self, message: str, _is_error: bool):
         self._hardware_refresh_thread = None
         self._status_label.setText("")
@@ -943,6 +946,7 @@ class MainWindow(QMainWindow):
         self._nidaq_discovery_thread = thread
         thread.start()
 
+    @invoke_method
     def _on_nidaq_discovery_finished(self, devices, discovery_error) -> None:
         self._nidaq_discovery_thread = None
         if self._start_capture_thread is None:

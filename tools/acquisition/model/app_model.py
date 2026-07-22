@@ -447,6 +447,11 @@ class AppModel(ObservableObject):
         analysis.watchdog_monitor.property_changed += self._on_watchdog_property_changed
         analysis.autoclamp_evasion_detector.property_changed += self._on_autoclamp_evasion_property_changed
 
+        # Establish the default project before publishing startup status. This
+        # gives the event-file plugin a valid destination and also prevents a
+        # configuration using the default output root from reopening the log.
+        self.project = self.make_project_info()
+
         self._timer_one_minute_repeat = no_op_timer
 
         def one_minute_timer_handle_and_reschedule():

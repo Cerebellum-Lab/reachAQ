@@ -711,7 +711,7 @@ def log_hardware_initialization(
 
 def get_log_file_location(*, log_base_dir: str = "", full_format: str):
     if not log_base_dir:
-        log_base_dir = Path.home().joinpath("Documents/RawDataLocal")
+        log_base_dir = Path.home().joinpath("Documents/rawdatalocal")
     else:
         log_base_dir = Path(log_base_dir)
 

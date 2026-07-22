@@ -10,7 +10,7 @@ from autotrainer.core import make_camelize_representer, make_decamelize_construc
 @dataclass
 class PersistenceConfiguration:
 
-    DEFAULT_OUTPUT_PATH: ClassVar[Path] = Path("~/Documents/RawDataLocal")  # must use .expanduser() on it
+    DEFAULT_OUTPUT_PATH: ClassVar[Path] = Path("~/Documents/rawdatalocal")  # must use .expanduser() on it
 
     output_location: str = DEFAULT_OUTPUT_PATH.expanduser().as_posix()
 
