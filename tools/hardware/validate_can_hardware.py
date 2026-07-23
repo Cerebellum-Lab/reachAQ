@@ -13,7 +13,12 @@ for _path in (
     sys.path.insert(0, str(_REPO_ROOT / _path))
 
 from autotrainer.core import Motor
-from autotrainer.device import CanInterface, CanTransportConfiguration, Target
+from autotrainer.device import (
+    CanInterface,
+    CanTransportConfiguration,
+    MotorConfigurationFile,
+    Target,
+)
 
 
 def main() -> int:
@@ -58,6 +63,19 @@ def main() -> int:
                 raise RuntimeError(f"motor configuration request failed for {motor}")
             _listen(interface, args.listen_seconds)
             return 0
+        if args.action == "write-motor-config":
+            _require_config_write_allowed(args)
+            motor = _motor_from_name(args.motor)
+            config_path = args.motor_config.expanduser()
+            if not config_path.is_file():
+                raise RuntimeError(f"motor configuration file does not exist: {config_path}")
+            config = _motor_config_from_file(config_path, motor)
+            print(f"writing {motor.name} configuration from {config_path}: {config!r}")
+            _require_success(interface.set_motor_configuration(motor, config), args.action)
+            if not interface.request_motor_config(motor):
+                raise RuntimeError(f"motor configuration readback request failed for {motor}")
+            _listen(interface, args.listen_seconds)
+            return 0
 
         _require_motion_allowed(args)
         if args.action == "set-x":
@@ -100,6 +118,7 @@ def _parse_args() -> argparse.Namespace:
             "version",
             "listen",
             "request-motor-config",
+            "write-motor-config",
             "set-x",
             "set-y",
             "set-z",
@@ -111,6 +130,17 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--listen-seconds", type=float, default=2.0)
     parser.add_argument("--allow-motion", action="store_true", help="Required for any command that can move hardware.")
+    parser.add_argument(
+        "--allow-config-write",
+        action="store_true",
+        help="Required to write a motor configuration to the board; this action does not move hardware.",
+    )
+    parser.add_argument(
+        "--motor-config",
+        type=Path,
+        default=Path("~/Autotrainer/motor_config.yaml"),
+        help="Motor configuration YAML used by write-motor-config.",
+    )
     parser.add_argument("--position", type=float, default=0.0, help="Position for set/move actions.")
     parser.add_argument("--relative", action="store_true", help="Use relative movement for set-x/set-y/set-z.")
     parser.add_argument("--motor", choices=("x", "y", "z", "load", "cover"), default="x")
@@ -143,6 +173,31 @@ def _motor_from_name(name: str) -> Motor:
     if name == "cover":
         return Motor.PELLET_COVER_SERVO
     raise ValueError(f"Unhandled motor name: {name}")
+
+
+def _motor_config_from_file(path: Path, motor: Motor):
+    configurations = MotorConfigurationFile.from_file(path)
+    by_motor = {
+        configured_motor: config
+        for configured_motor, config in (
+            configurations.x_config,
+            configurations.y_config,
+            configurations.z_config,
+            configurations.load_config,
+            configurations.cover_config,
+        )
+    }
+    try:
+        return by_motor[motor]
+    except KeyError as exc:
+        raise ValueError(f"No pellet motor configuration available for {motor}") from exc
+
+
+def _require_config_write_allowed(args: argparse.Namespace) -> None:
+    if not args.allow_config_write:
+        raise RuntimeError(
+            "write-motor-config changes board configuration; rerun with --allow-config-write after reviewing the file"
+        )
 
 
 def _require_motion_allowed(args: argparse.Namespace) -> None:
