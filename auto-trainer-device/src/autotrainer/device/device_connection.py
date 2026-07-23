@@ -221,6 +221,8 @@ class DeviceConnection(DeviceConnectionProtocol):
             data.gate_config,
             data.tunnel_fan_config,
         ):
+            if not self._motor_configuration_is_required(conf[0]):
+                continue
             with self.await_acknowledge(tokens, timeout=3):
                 send(conf)
 

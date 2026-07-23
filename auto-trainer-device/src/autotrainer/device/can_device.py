@@ -286,6 +286,15 @@ class CanDevice(Device):
     def is_target_required(self, target: Target) -> bool:
         return target in self._required_targets
 
+    def is_motor_required(self, motor: Motor) -> bool:
+        if self._required_targets == (Target.PELLET_DEVICE,) and motor in {
+            Motor.TUNNEL_MAGNET_SERVO,
+            Motor.TUNNEL_GATE_SERVO,
+            Motor.TUNNEL_FAN_SERVO,
+        }:
+            return False
+        return self.is_target_required(target_of_motor(motor))
+
     def _make_device_interface(self, force_emulation: bool) -> Union[CanInterface, EmulationInterface]:
         transport = self._can_transport_configuration
         if force_emulation or transport.kind == CanTransportKind.EMULATION:

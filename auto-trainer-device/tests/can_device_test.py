@@ -1,3 +1,4 @@
+import contextlib
 import logging
 import math
 import queue
@@ -26,6 +27,7 @@ from autotrainer.device import (
     StepperConfig,
     MotorSteps,
     DeviceConnection,
+    MotorConfigurationFile,
 )
 from autotrainer.device.can_device import (
     default_move_retract,
@@ -63,6 +65,38 @@ def test_device_connection_throttles_empty_reads():
     # Disconnect commands are intentionally checked every 250 ms, so include
     # that interval while still proving this was a throttled poll, not a spin.
     assert 2 <= interface.read.call_count <= 80
+
+
+def test_pellet_only_connection_skips_unused_motor_configurations():
+    device = CanDevice(
+        api=DeviceApi(message_callback=data_callback),
+        force_emulation=True,
+        required_targets=(Target.PELLET_DEVICE,),
+    )
+    connection = DeviceConnection(device, message_queue=queue.Queue())
+    connection.send_message = mock.Mock()
+
+    @contextlib.contextmanager
+    def no_wait(*args, **kwargs):
+        yield
+
+    connection.await_acknowledge = no_wait
+    connection.use_motor_configurations(MotorConfigurationFile())
+
+    configured_motors = {
+        call.args[1][0]
+        for call in connection.send_message.call_args_list
+    }
+    assert Motor.TUNNEL_MAGNET_SERVO not in configured_motors
+    assert Motor.TUNNEL_GATE_SERVO not in configured_motors
+    assert Motor.TUNNEL_FAN_SERVO not in configured_motors
+    assert {
+        Motor.PELLET_X_MOTOR,
+        Motor.PELLET_Y_MOTOR,
+        Motor.PELLET_Z_MOTOR,
+        Motor.PELLET_LOAD_SERVO,
+        Motor.PELLET_COVER_SERVO,
+    } <= configured_motors
 
 
 @pytest.fixture
