@@ -8,6 +8,7 @@ REACHAQ_CAN_TXQUEUELEN=1000
 REACHAQ_CAN_WAIT_SECONDS=30
 REACHAQ_CAN_DRIVER=peak_pciefd
 
-# Classic CAN is expected for the current reachAQ PEAK PCIe setup.
-REACHAQ_CAN_FD=false
-# REACHAQ_CAN_DBITRATE=2000000
+# The custom-board JerryCAN firmware uses CAN FD with bit-rate switching:
+# 1 Mbit/s arbitration and 5 Mbit/s data.
+REACHAQ_CAN_FD=true
+REACHAQ_CAN_DBITRATE=5000000

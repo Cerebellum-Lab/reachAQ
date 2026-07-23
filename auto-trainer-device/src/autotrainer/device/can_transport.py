@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import enum
 import os
+import platform
 from typing import Any, Mapping, Optional, Protocol, Union
 
 
@@ -43,6 +44,8 @@ class CanTransportConfiguration:
             raise ValueError("bitrate must be positive when provided")
         if self.data_bitrate is not None and self.data_bitrate <= 0:
             raise ValueError("data_bitrate must be positive when provided")
+        if self.data_bitrate is not None and not self.fd:
+            raise ValueError("data_bitrate requires CAN FD to be enabled")
         if self.receive_timeout_seconds < 0:
             raise ValueError("receive_timeout_seconds must be non-negative")
 
@@ -60,6 +63,10 @@ class CanTransportConfiguration:
         kind = env.get(f"{prefix}TRANSPORT", env.get(f"{prefix}TYPE"))
         if kind:
             values["kind"] = kind
+        elif platform.system() == "Linux" and platform.machine() not in {"aarch64", "arm64"}:
+            # PEAK PCIe adapters on Linux use the in-kernel SocketCAN network
+            # device. Keep the legacy pyjerrycan default for Jetson/aarch64.
+            values["kind"] = CanTransportKind.SOCKETCAN
         for env_name, field_name in (
             ("CHANNEL", "channel"),
             ("BITRATE", "bitrate"),
@@ -70,6 +77,16 @@ class CanTransportConfiguration:
             value = env.get(f"{prefix}{env_name}")
             if value is not None:
                 values[field_name] = _parse_environment_value(field_name, value)
+
+        selected_kind = normalize_can_transport_kind(
+            values.get("kind", CanTransportKind.PYJERRYCAN)
+        )
+        if selected_kind == CanTransportKind.SOCKETCAN:
+            # The custom-board JerryCAN firmware uses CAN FD payloads with
+            # bit-rate switching: 1 Mbit/s arbitration and 5 Mbit/s data.
+            values.setdefault("bitrate", 1_000_000)
+            values.setdefault("data_bitrate", 5_000_000)
+            values.setdefault("fd", True)
         return cls.from_mapping(values)
 
     @property

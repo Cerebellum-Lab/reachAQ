@@ -394,6 +394,7 @@ class CanInterface(DeviceInterface):
         """
         super().__init__()
         self._required_targets = tuple(required_targets or (Target.PELLET_DEVICE, Target.MAGNET_DEVICE))
+        self._pellet_only_runtime = self._required_targets == (Target.PELLET_DEVICE,)
         self._can_transport = can_transport or CanTransportConfiguration()
         if self._can_transport.uses_linux_can_stack:
             self._jerrycan_msg_cls = socketcan_jerrycan.JerryCANMsg
@@ -429,10 +430,13 @@ class CanInterface(DeviceInterface):
             for motor in Motor
             if motor in _magnet_board_motors
         }
+        pellet_status_motors = _pellet_board_motors
+        if self._pellet_only_runtime:
+            pellet_status_motors = pellet_status_motors - {Motor.TUNNEL_GATE_SERVO}
         self._pellet_board_last_status_perf_c = {
             motor: -math.inf
             for motor in Motor
-            if motor in _pellet_board_motors
+            if motor in pellet_status_motors
         }
 
         self._pellet_addr: Optional[int] = None
@@ -474,7 +478,7 @@ class CanInterface(DeviceInterface):
                 time_remaining_ms=msg.tone.duration_ms,
                 frequency_hz=msg.tone.frequency_hz
             ),
-            cmd_type.ANALOG_OUT: self._translate_analog_out,
+            cmd_type.ANALOG_OUT: no_op if self._pellet_only_runtime else self._translate_analog_out,
             cmd_type.LOAD_CELL_READ: lambda msg: LoadCellReading(
                 target=_addr2tgt(msg.dst_id),
                 load=self.round_float(float(msg.load_cell_read.load_mv) / 1000.0 * self.load_cell_factor),
@@ -483,7 +487,7 @@ class CanInterface(DeviceInterface):
                 target=_addr2tgt(msg.dst_id),
                 pressure=self.round_float(float(msg.pressure_read.pressure)),
             ),
-            cmd_type.RGB_LED: lambda msg: ColorLed(
+            cmd_type.RGB_LED: no_op if self._pellet_only_runtime else lambda msg: ColorLed(
                 target=_addr2tgt(msg.dst_id),
                 red=msg.rgb_led.red,
                 green=msg.rgb_led.green,
@@ -868,6 +872,10 @@ class CanInterface(DeviceInterface):
                     break
             logger.notice("pellet_address=%s magnet_address=%s ; flushed %s",
                         self.pellet_address, self.magnet_address, tot_flushed)
+            if not self.are_addresses_valid():
+                self._jc.Close()
+                self._is_open = False
+                return False
             self._query_configuration()
         return self._is_open
 
@@ -1992,6 +2000,8 @@ class CanInterface(DeviceInterface):
         target = _addr2tgt(message.dst_id)
         motor = _id_to_motor(target, True, message.servo_status.motor_id)
         if motor == Motor.NONE:
+            return None
+        if self._pellet_only_runtime and motor == Motor.TUNNEL_GATE_SERVO:
             return None
         self._handle_motor_status_age(motor)
         return ServoStatus(target, motor, self.round_float(message.servo_status.position))

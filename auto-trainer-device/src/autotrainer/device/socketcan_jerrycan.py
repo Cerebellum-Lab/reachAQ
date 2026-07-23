@@ -3,14 +3,19 @@ from __future__ import annotations
 import dataclasses
 import enum
 import errno
+import logging
 import struct
 import time
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 from .can_transport import CanTransportConfiguration, CanTransportKind
 
 
 JERRYCAN_ACTUAL_PAYLOAD_SIZE = 64
+CAN_FD_MTU = 72
+
+logger = logging.getLogger(__name__)
 
 
 class JerryCANCmdType(enum.IntEnum):
@@ -357,6 +362,25 @@ def encode_can_id(message_type: JerryCANCmdType, dst_id: int) -> int:
     return ((int(message_type) & 0x3F) << 5) | (dst_id & 0x1F)
 
 
+def _jerrycan_filters():
+    """Kernel-friendly filters for standard JerryCAN command identifiers."""
+    return [
+        {
+            "can_id": int(message_type) << 5,
+            "can_mask": 0x7E0,
+            "extended": False,
+        }
+        for message_type in JerryCANCmdType
+    ]
+
+
+def _socketcan_mtu(channel: str) -> Optional[int]:
+    try:
+        return int(Path("/sys/class/net", channel, "mtu").read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
 def _pack_stepper_move(command: StepperMoveCommand) -> bytes:
     flags = (command.motor_id & 0x03)
     flags |= (1 if command.save else 0) << 2
@@ -564,22 +588,55 @@ class SocketCanJerryCAN:
             import can
         except ModuleNotFoundError:
             return -errno.ENODEV
+        transport_kind = self.configuration.kind
         interface = {
             CanTransportKind.SOCKETCAN: "socketcan",
             CanTransportKind.PCAN_BASIC: "pcan",
-        }[self.configuration.kind]
-        kwargs = {"interface": interface, "channel": self.configuration.channel}
-        if self.configuration.bitrate is not None:
-            kwargs["bitrate"] = self.configuration.bitrate
-        if self.configuration.data_bitrate is not None:
-            kwargs["data_bitrate"] = self.configuration.data_bitrate
+        }[transport_kind]
+        kwargs = {
+            "interface": interface,
+            "channel": self.configuration.channel,
+            "can_filters": _jerrycan_filters(),
+        }
         if self.configuration.fd or self.configuration.data_bitrate is not None:
             kwargs["fd"] = True
+        if transport_kind == CanTransportKind.SOCKETCAN:
+            # SocketCAN bit timing belongs to the network device and must be
+            # configured with ip/netlink before the application opens it.
+            kwargs["ignore_rx_error_frames"] = True
+            if self.configuration.fd:
+                mtu = _socketcan_mtu(self.configuration.channel)
+                if mtu is not None and mtu < CAN_FD_MTU:
+                    logger.error(
+                        "SocketCAN channel %s has MTU %s; JerryCAN requires CAN FD MTU %s. "
+                        "Configure the interface with 'fd on' before launching reachAQ.",
+                        self.configuration.channel,
+                        mtu,
+                        CAN_FD_MTU,
+                    )
+                    return -errno.EPROTONOSUPPORT
+        else:
+            # PCAN-Basic owns adapter initialization, unlike SocketCAN.
+            if self.configuration.bitrate is not None:
+                kwargs["bitrate"] = self.configuration.bitrate
+            if self.configuration.data_bitrate is not None:
+                kwargs["data_bitrate"] = self.configuration.data_bitrate
         try:
             self._bus = can.Bus(**kwargs)
         except OSError as exc:
+            logger.error(
+                "Could not open CAN transport=%s channel=%s: %s",
+                transport_kind.value,
+                self.configuration.channel,
+                exc,
+            )
             return -getattr(exc, "errno", errno.EIO)
         except Exception:
+            logger.exception(
+                "Could not open CAN transport=%s channel=%s",
+                transport_kind.value,
+                self.configuration.channel,
+            )
             return -errno.EIO
         return 0
 
@@ -594,6 +651,12 @@ class SocketCanJerryCAN:
         if self._bus is None:
             return -errno.ENOTCONN
         can_id, payload = encode_frame(msg, dst_id)
+        if len(payload) > 8 and not self.configuration.fd:
+            logger.error(
+                "Refusing %s-byte JerryCAN payload because CAN FD is disabled",
+                len(payload),
+            )
+            return -errno.EMSGSIZE
         try:
             import can
             message = can.Message(
@@ -601,6 +664,7 @@ class SocketCanJerryCAN:
                 data=payload,
                 is_extended_id=False,
                 is_fd=self.configuration.fd or len(payload) > 8,
+                bitrate_switch=self.configuration.fd,
             )
             self._bus.send(message)
         except OSError as exc:
@@ -622,11 +686,40 @@ class SocketCanJerryCAN:
         while True:
             raw_message = self._bus.recv(timeout=timeout)
             if raw_message is not None:
-                timestamp_ns = int(raw_message.timestamp * 1e9) if raw_message.timestamp is not None else None
-                messages.append(decode_frame(raw_message.arbitration_id, bytes(raw_message.data),
-                                             timestamp_ns=timestamp_ns))
-                if 0 < max_count <= len(messages):
-                    break
+                if (
+                    raw_message.is_error_frame
+                    or raw_message.is_remote_frame
+                    or raw_message.is_extended_id
+                ):
+                    logger.warning(
+                        "Ignoring unsupported CAN frame id=%#x error=%s remote=%s extended=%s",
+                        raw_message.arbitration_id,
+                        raw_message.is_error_frame,
+                        raw_message.is_remote_frame,
+                        raw_message.is_extended_id,
+                    )
+                else:
+                    timestamp_ns = (
+                        int(raw_message.timestamp * 1e9)
+                        if raw_message.timestamp is not None
+                        else None
+                    )
+                    try:
+                        decoded = decode_frame(
+                            raw_message.arbitration_id,
+                            bytes(raw_message.data),
+                            timestamp_ns=timestamp_ns,
+                        )
+                    except (IndexError, struct.error, ValueError):
+                        logger.warning(
+                            "Ignoring malformed or non-JerryCAN frame id=%#x length=%s",
+                            raw_message.arbitration_id,
+                            len(raw_message.data),
+                        )
+                    else:
+                        messages.append(decoded)
+                        if 0 < max_count <= len(messages):
+                            break
             if collect_ms == 0 or time.perf_counter() > end:
                 break
         return messages

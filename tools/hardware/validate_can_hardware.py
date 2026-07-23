@@ -85,8 +85,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--transport", choices=("socketcan", "pcan_basic"), default="socketcan")
     parser.add_argument("--channel", default="can0")
     parser.add_argument("--bitrate", type=int, default=1000000)
-    parser.add_argument("--data-bitrate", type=int, default=None)
-    parser.add_argument("--fd", action="store_true")
+    parser.add_argument("--data-bitrate", type=int, default=5000000)
+    parser.add_argument(
+        "--fd",
+        action="store_true",
+        default=True,
+        help="Use CAN FD (required by JerryCAN; enabled by default).",
+    )
     parser.add_argument("--receive-timeout-seconds", type=float, default=0.0)
     parser.add_argument(
         "--action",
@@ -155,4 +160,4 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
-        raise
+        raise SystemExit(1)

@@ -24,16 +24,26 @@ The current PEAK PCIe card uses the in-kernel `peak_pciefd` driver and exposes
 
 ## 2. Bring up a confirmed bus
 
-Confirm the bench bitrate and termination before sending traffic. The current
-pellet bus uses 1 Mbit/s:
+Confirm the bench bitrate and termination before sending traffic. The
+custom-board JerryCAN firmware uses CAN FD with bit-rate switching: 1 Mbit/s
+for arbitration and 5 Mbit/s for the data phase:
 
 ```bash
 sudo ip link set can0 down || true
-sudo ip link set can0 type can bitrate 1000000 restart-ms 100
+sudo ip link set can0 type can \
+  bitrate 1000000 \
+  dbitrate 5000000 \
+  fd on \
+  restart-ms 100
 sudo ip link set can0 txqueuelen 1000
 sudo ip link set can0 up
 ip -details link show can0
 ```
+
+The verification output must include `mtu 72`, `<FD>`, and
+`dbitrate 5000000`. An interface showing `mtu 16` is in Classical CAN mode and
+cannot carry JerryCAN configuration, movement, status, audio, or bootloader
+frames.
 
 ## 3. Install the tracked boot service
 

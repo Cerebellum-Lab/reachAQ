@@ -232,7 +232,7 @@ class CanDevice(Device):
         self._last_pellet_pos = Offset3DTuple(math.nan, math.nan, math.nan)
         self._last_send_pos = Offset3DTuple(math.nan, math.nan, math.nan)
 
-        if not HAVE_CAN_DEVICE:
+        if isinstance(self._interface, EmulationInterface):
             logger.warning(
                 "Alogus hardware or hardware support not found. Using emulation interface.")
 
