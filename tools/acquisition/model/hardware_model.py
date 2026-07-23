@@ -121,6 +121,8 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
         self._cover_arm_position: float = math.nan
         self._load_arm_position: float = math.nan
 
+        self._pellet_version = ""
+        self._tunnel_version = ""
         self._color_led: Optional[ColorLed] = None
 
         self._device_ack_timeout_engaged = False
@@ -284,6 +286,14 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
     @property
     def color_led(self) -> Optional[ColorLed]:
         return self._color_led
+
+    @property
+    def pellet_version(self) -> str:
+        return self._pellet_version
+
+    @property
+    def tunnel_version(self) -> str:
+        return self._tunnel_version
 
     @property
     def front_door_open(self):
@@ -695,8 +705,10 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
         if can_dev is not None:
             can_dev.property_changed -= self._can_device_property_changed
             self._can_device = None
-        self._on_property_changed(self.TUNNEL_VERSION_PROPERTY, "", None)
-        self._on_property_changed(self.PELLET_VERSION_PROPERTY, "", None)
+        prev, self._tunnel_version = self._tunnel_version, ""
+        self._on_property_changed(self.TUNNEL_VERSION_PROPERTY, "", prev)
+        prev, self._pellet_version = self._pellet_version, ""
+        self._on_property_changed(self.PELLET_VERSION_PROPERTY, "", prev)
         prev_thread = self._check_timedout_commands_thread
         if prev_thread is not None:
             logger.debug("joining checktimedout commands thread")
@@ -803,13 +815,16 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
                 version = version.replace("module", "").strip()
             if version.find("pellet") != -1:
                 clean_v = _reg_pellet_version_clean.sub("", version).strip()
-                self._on_property_changed(self.PELLET_VERSION_PROPERTY, clean_v, old_value)
+                prev, self._pellet_version = self._pellet_version, clean_v
+                self._on_property_changed(self.PELLET_VERSION_PROPERTY, clean_v, prev)
             elif version.find("magnet") != -1:
                 clean_v = _reg_magnet_version_clean.sub("", version).strip()
-                self._on_property_changed(self.TUNNEL_VERSION_PROPERTY, clean_v, old_value)
+                prev, self._tunnel_version = self._tunnel_version, clean_v
+                self._on_property_changed(self.TUNNEL_VERSION_PROPERTY, clean_v, prev)
             elif version.find("tunnel") != -1:
                 clean_v = _reg_tunnel_version_clean.sub("", version).strip()
-                self._on_property_changed(self.TUNNEL_VERSION_PROPERTY, clean_v, old_value)
+                prev, self._tunnel_version = self._tunnel_version, clean_v
+                self._on_property_changed(self.TUNNEL_VERSION_PROPERTY, clean_v, prev)
 
         elif name == props.COLOR_LED:
             self._color_led = value

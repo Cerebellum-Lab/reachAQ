@@ -191,6 +191,7 @@ class HardwareStatusContent(ContentWidget):
 
         app_model.property_changed += self._on_app_model_property_changed
         app_model.configuration_loaded_event += self._on_configuration_loaded
+        app_model.hardware.property_changed += self._on_hardware_model_property_changed
         self._refresh_status()
         self.set_hardware_refreshing(False)
 
@@ -295,6 +296,14 @@ class HardwareStatusContent(ContentWidget):
         else:
             state = scan_state
         rows = [("pellet", self._pellet_binding(), state)]
+        version = getattr(hardware, "pellet_version", "")
+        rows.append(
+            (
+                "firmware",
+                f"Pellet: {version}" if version else "unknown",
+                "reported" if version else "unknown",
+            )
+        )
         self._set_info(
             "pellet",
             self._format_device_rows(rows, self._scan_notes(scan_info)),
@@ -566,6 +575,11 @@ class HardwareStatusContent(ContentWidget):
     def _on_app_model_property_changed(self, property_name: str, _value, _):
         if property_name == "hardware_scan_results":
             self._refresh_status()
+
+    @invoke_method
+    def _on_hardware_model_property_changed(self, property_name: str, _value, _):
+        if property_name == "pellet_version":
+            self._refresh_pellet_status()
 
     @invoke_method
     def _on_configuration_loaded(self, _configuration):

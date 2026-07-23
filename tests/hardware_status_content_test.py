@@ -69,6 +69,7 @@ class _AppModelStub(ObservableObject):
             can_enabled=False,
             pellet_controller_enabled=False,
             connected=False,
+            pellet_version="",
         )
         self.nidaq_signal_monitor = _ObservableStub(
             configuration=SimpleNamespace(
@@ -171,6 +172,8 @@ def test_status_panel_columns_and_scan_results(qapp):
         assert "Random Image" not in camera_info
         gpu_info = content._category_panels["gpu"].details_text
         assert "GPU0" in gpu_info and "Test GPU · 4096 MiB · drv 1.0" in gpu_info
+        pellet_info = content._category_panels["pellet"].details_text
+        assert "firmware" in pellet_info and "unknown" in pellet_info
 
         content._device_labels["can"].click()
         qapp.processEvents()
@@ -190,6 +193,35 @@ def test_status_panel_columns_and_scan_results(qapp):
         assert content._category_panels["can"].details_scroll.isHidden()
     finally:
         content.deleteLater()
+
+
+def test_pellet_firmware_version_updates_hardware_status(qapp):
+    app_model = _AppModelStub()
+    app_model.hardware.pellet_controller_enabled = True
+    content = HardwareStatusContent(app_model)
+    try:
+        app_model.hardware.pellet_version = "1.2.5"
+        app_model.hardware.property_changed("pellet_version", "1.2.5", "")
+        qapp.processEvents()
+
+        pellet_info = content._category_panels["pellet"].details_text
+        assert "firmware" in pellet_info
+        assert "Pellet: 1.2.5" in pellet_info
+        assert "reported" in pellet_info
+    finally:
+        content.deleteLater()
+
+
+def test_hardware_model_persists_reported_pellet_version(app_model):
+    hardware = app_model.hardware
+
+    hardware._message_handler_property_changed(
+        app_model.message_handler.FIRMWARE_VERSION_PROPERTY,
+        "Pellet: 1.2.5",
+        None,
+    )
+
+    assert hardware.pellet_version == "1.2.5"
 
 
 def test_enabled_category_uses_warning_color_from_scan(qapp):
