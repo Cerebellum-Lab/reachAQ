@@ -134,6 +134,23 @@ class DeviceConnection(DeviceConnectionProtocol):
         if self._cmd_queue is not None:
             self._cmd_queue.put((_REQUEST_CONNECT, None, None))
 
+    def wait_connected(self, *, timeout: float = 3):
+        """Wait for a requested connection without consuming command timeout."""
+        started = time.perf_counter()
+        deadline = started + timeout
+        while not self._device.connected:
+            thread = self._current_thread
+            if thread is not None and not thread.is_alive():
+                raise RuntimeError(
+                    f"device connection failed after {time.perf_counter() - started:.3f}s: "
+                    "connection worker stopped before device.connected"
+                )
+            if time.perf_counter() >= deadline:
+                raise TimeoutError(
+                    f"device connection timeout after {timeout:.3f}s waiting for device.connected"
+                )
+            time.sleep(0.01)
+
     def request_disconnect(self):
         """
         Sends a disconnect request to the device connection queue.  It is framed as a request because the device may not
@@ -170,8 +187,8 @@ class DeviceConnection(DeviceConnectionProtocol):
             while len(tokens) > 0:
                 if time.perf_counter() > perf_timeout:
                     if raise_on_timeout:
-                        raise RuntimeError(f"timeout waiting tokens acknowledge: {tokens}")
-                    logger.warning("timeout waiting tokens acknowledge, but continuing. tokens: %s", tokens)
+                        raise RuntimeError(f"command timeout waiting for acknowledge tokens: {tokens}")
+                    logger.warning("command timeout waiting for acknowledge tokens, but continuing: %s", tokens)
                     break
                 time.sleep(0.001)
             if len(tokens) == 0:

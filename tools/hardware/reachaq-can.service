@@ -10,6 +10,7 @@ Before=network.target
 Type=oneshot
 EnvironmentFile=-/etc/default/reachaq-can
 ExecStart=/usr/local/sbin/reachaq-bring-up-can
+ExecStop=/usr/local/sbin/reachaq-bring-down-can
 RemainAfterExit=yes
 
 [Install]

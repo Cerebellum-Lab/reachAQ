@@ -6,6 +6,7 @@ import subprocess
 import sys
 import threading
 import time
+from unittest import mock
 
 import pytest
 
@@ -80,6 +81,7 @@ def app_model(
     # for now:
     monkeypatch.setattr(BehaviorAlgorithm, "_no_handler_thread", True)
     assert BehaviorAlgorithm._no_handler_thread is True  # to be safe to start with
+    monkeypatch.setenv("AUTOTRAINER_CAN_TRANSPORT", "emulation")
     #
     app = AppModel(user_pref, calib_dir=calib_dir)
     try:
@@ -299,6 +301,52 @@ def test_gpu_preflight_fails_before_cameras_and_hardware(
     assert app_model.acquisition_started is False
 
 
+def test_hardware_start_failure_performs_can_safety_shutdown(
+    app_model,
+    monkeypatch,
+):
+    assert app_model.load_configuration() is True
+    failure = RuntimeError("connection timeout")
+    monkeypatch.setattr(app_model.hardware, "connect", mock.Mock(side_effect=failure))
+    safety_shutdown = mock.Mock()
+    monkeypatch.setattr(app_model.hardware, "safety_shutdown", safety_shutdown)
+
+    with pytest.raises(RuntimeError, match="connection timeout"):
+        app_model.capture_start()
+
+    safety_shutdown.assert_any_call(
+        "acquisition start failure: connection timeout",
+        wait=True,
+    )
+    assert app_model.acquisition_started is False
+    assert app_model._acquisition_starting is False
+
+
+def test_periodic_command_producers_stop_before_safety_shutdown():
+    events = []
+    app_model = object.__new__(AppModel)
+    app_model._closing_event = threading.Event()
+    app_model._timer_one_minute_repeat = mock.Mock(
+        cancel=lambda: events.append("cancel-minute"),
+    )
+    app_model._timer_daily = mock.Mock(
+        cancel=lambda: events.append("cancel-daily"),
+    )
+    app_model._hardware = mock.Mock()
+    app_model._hardware.safety_shutdown.side_effect = (
+        lambda *_args, **_kwargs: events.append("safety-shutdown")
+    )
+
+    app_model._request_safety_shutdown("application close", wait=True)
+
+    assert app_model._closing_event.is_set()
+    assert events == ["cancel-minute", "cancel-daily", "safety-shutdown"]
+    app_model._hardware.safety_shutdown.assert_called_once_with(
+        "application close",
+        wait=True,
+    )
+
+
 def test_live_inference_override_is_not_persisted_with_other_configuration_changes(
     app_model,
     system_config,
@@ -375,6 +423,7 @@ def test_launch_cli(system_config, config_file_path, user_pref, calib_dir, diamo
     env = os.environ.copy()
     env['AUTOTRAINER_DIAMOND_TRIANGLE_CONFIG'] = diamond_config_path.as_posix()  # same for this !
     env['AUTOTRAINER_FORCE_CAN_EMULATION_IFACE'] = "1"
+    env['AUTOTRAINER_CAN_TRANSPORT'] = "emulation"
     proc = subprocess.Popen([
         sys.executable,
         "-m", "tools.acquisition.headless",

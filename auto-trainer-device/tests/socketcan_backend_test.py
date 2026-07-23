@@ -1,6 +1,9 @@
 import errno
 import sys
 import types
+from unittest import mock
+
+import pytest
 
 from autotrainer.device import (
     AnalogOutput,
@@ -37,6 +40,18 @@ class FakeBus:
 
     def shutdown(self):
         self.shutdown_called = True
+
+
+def test_close_marks_interface_closed_even_if_backend_close_fails():
+    interface = object.__new__(CanInterface)
+    interface._is_open = True
+    interface._jc = mock.Mock()
+    interface._jc.Close.side_effect = RuntimeError("close failed")
+
+    with pytest.raises(RuntimeError, match="close failed"):
+        interface.close()
+
+    assert interface.is_open is False
 
 
 def _raw_message(

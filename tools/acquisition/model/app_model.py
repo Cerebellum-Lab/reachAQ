@@ -55,7 +55,13 @@ from autotrainer.core.interfaces import RecordingEndingReason, CaptureAnalysisRe
 from autotrainer.core.project import ProjectInfo, ProjectDependentProtocol
 from autotrainer.core.configuration import SystemConfigurationDumper, DEFAULT_3D_CALIB_DIR_NAME
 from autotrainer.core.multiproc import no_op_timer
-from autotrainer.core.logging import get_verbose_logger, log_hardware_initialization, set_log_location
+from autotrainer.core.logging import (
+    get_verbose_logger,
+    log_hardware_initialization,
+    register_fatal_exception_callback,
+    set_log_location,
+    unregister_fatal_exception_callback,
+)
 from autotrainer.core.multiproc import get_mp_ctx, make_daemon_timer, DaemonTimer
 from autotrainer.core.pose_elements import SceneElement
 from autotrainer.core.project.project_info import DATE_TIME_FORMAT
@@ -305,6 +311,7 @@ class AppModel(ObservableObject):
         self._acquisition_starting = False
         self._acquisition_started = False
         self._acquisition_stopping = False
+        self._closing_event = threading.Event()
         self._reload_plans_needed = False
         self._prev_diamond_coord: Offset3DTuple = Offset3DTuple(math.nan, math.nan, math.nan)
         self._prev_raw_diamond_coord: Offset3DTuple = Offset3DTuple(math.nan, math.nan, math.nan)
@@ -455,14 +462,19 @@ class AppModel(ObservableObject):
         self._timer_one_minute_repeat = no_op_timer
 
         def one_minute_timer_handle_and_reschedule():
+            if self._closing_event.is_set():
+                return
             self._update_led_color()
             self._send_api_system_status()
+            if self._closing_event.is_set():
+                return
             delay = 60
             timer = self._timer_one_minute_repeat = make_daemon_timer(delay, one_minute_timer_handle_and_reschedule)
             timer.start()
             logger.verbose("Scheduled send_system_status in %.1f seconds", delay)
 
         one_minute_timer_handle_and_reschedule()
+        register_fatal_exception_callback(self._on_fatal_exception)
 
     def _make_reach_camera_model(self, camera_id: CameraId, camera_index: int) -> VideoCaptureModel:
         return VideoCaptureModel(
@@ -1923,7 +1935,19 @@ class AppModel(ObservableObject):
         logger.debug("connecting hardware ...")
         hard = self._hardware
         controller_started = time.perf_counter()
-        hard.connect(self._system_message_handler.input_queue)
+        try:
+            hard.connect(self._system_message_handler.input_queue)
+        except Exception as exc:
+            logger.exception("Acquisition hardware start failed; performing CAN safety shutdown")
+            hard.safety_shutdown(
+                f"acquisition start failure: {str(exc) or exc.__class__.__name__}",
+                wait=True,
+            )
+            try:
+                self.capture_stop(force=True)
+            except Exception:
+                logger.exception("Acquisition cleanup failed after CAN safety shutdown")
+            raise
         # hard.set_auto_correct_motor_drift(algo.auto_correct_motors_drift)  # disabled
         if wait_connected and hard.requires_connection:
             timeout = 3
@@ -2362,15 +2386,24 @@ class AppModel(ObservableObject):
         logger.notice("Created daily timer in %.1f seconds ; today=%s", delay, today)
         self._analysis.start()
 
-    def on_close(self):
-        logger.debug("AppModel.on_close")
-
+    def _stop_periodic_timers(self):
+        self._closing_event.set()
         for timer in (
                 self._timer_one_minute_repeat,
                 self._timer_daily,
         ):
             logger.debug("stopping timer %s", timer)
             timer.cancel()
+
+    def _request_safety_shutdown(self, reason: str, *, wait: bool) -> None:
+        self._stop_periodic_timers()
+        self._hardware.safety_shutdown(reason, wait=wait)
+
+    def on_close(self):
+        logger.debug("AppModel.on_close")
+        # Stop command producers first so none can race with CAN teardown or
+        # reschedule themselves after their current timer is cancelled.
+        self._request_safety_shutdown("application close", wait=True)
 
         self._analysis.stop()
 
@@ -2426,6 +2459,13 @@ class AppModel(ObservableObject):
 
         self._preferences.save()
         self.save_configuration()
+        unregister_fatal_exception_callback(self._on_fatal_exception)
+
+    def _on_fatal_exception(self, source: str, exception: BaseException) -> None:
+        self._request_safety_shutdown(
+            f"{source}: {exception}",
+            wait=False,
+        )
 
     def _load_animals(self):
         animals = []

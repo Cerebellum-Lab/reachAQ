@@ -883,8 +883,11 @@ class CanInterface(DeviceInterface):
         """
         Close the interface (CANbus) connection
         """
-        if self._is_open:
-            self._jc.Close()
+        try:
+            if self._is_open:
+                self._jc.Close()
+        finally:
+            self._is_open = False
 
     def can_read(self) -> bool:
         """

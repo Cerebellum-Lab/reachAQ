@@ -1,0 +1,3 @@
+# Install as /etc/sudoers.d/reachaq-can-reset with mode 0440.
+# Members of the reachaq group may run only this root-owned CAN reset helper.
+%reachaq ALL=(root) NOPASSWD: /usr/local/sbin/reachaq-reset-can

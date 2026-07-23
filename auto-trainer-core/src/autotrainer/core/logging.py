@@ -37,6 +37,8 @@ _queue_listener: Optional[logging.handlers.QueueListener] = None
 _queue_handler: Optional[logging.Handler] = None
 _console_handler: Optional[logging.StreamHandler] = None
 _root_handler = None
+_fatal_exception_callbacks = []
+_fatal_exception_callbacks_lock = threading.Lock()
 
 
 DEFAULT_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
@@ -306,10 +308,34 @@ class LogQueueListenerProc(Process):
 def main_exception_hook(exc_type, exc_value, exc_traceback):
     logger.exception("Fatal unhandled main-thread exception: %s",
                      exc_value, exc_info=(exc_type, exc_value, exc_traceback))
+    _notify_fatal_exception("main-thread exception", exc_value)
 
 
 def thread_exception_hook(arg):
     logger.exception("Fatal unhandled thread exception: %s", arg.exc_value)
+    _notify_fatal_exception(f"thread exception ({arg.thread.name})", arg.exc_value)
+
+
+def register_fatal_exception_callback(callback):
+    with _fatal_exception_callbacks_lock:
+        if callback not in _fatal_exception_callbacks:
+            _fatal_exception_callbacks.append(callback)
+
+
+def unregister_fatal_exception_callback(callback):
+    with _fatal_exception_callbacks_lock:
+        if callback in _fatal_exception_callbacks:
+            _fatal_exception_callbacks.remove(callback)
+
+
+def _notify_fatal_exception(source, exception):
+    with _fatal_exception_callbacks_lock:
+        callbacks = tuple(_fatal_exception_callbacks)
+    for callback in callbacks:
+        try:
+            callback(source, exception)
+        except Exception:
+            logger.exception("Fatal-exception safety callback failed")
 
 
 def install_log_exception_hook():

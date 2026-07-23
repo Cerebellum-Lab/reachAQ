@@ -42,6 +42,10 @@ class DeviceConnectionProtocol(Protocol):
         """Request the connection to the physical device to be established"""
         raise NotImplementedError
 
+    def wait_connected(self, *, timeout: float = 3):
+        """Wait until the requested device connection is ready."""
+        raise NotImplementedError
+
     def request_disconnect(self):
         """Request disconnection from the physical device"""
         raise NotImplementedError

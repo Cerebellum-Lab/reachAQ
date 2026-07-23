@@ -67,6 +67,31 @@ source "$REACHAQ_REPO/tools/hardware/reachaq_hardware.env.example"
 set +a
 ```
 
+The boot service and application use different variable namespaces:
+
+- `/etc/default/reachaq-can` supplies `REACHAQ_CAN_*` values to
+  `reachaq-can.service`, which configures and brings up the Linux interface.
+- The launching process supplies `AUTOTRAINER_CAN_*` values to reachAQ, which
+  opens the already-active interface.
+
+The service does not export its values into user applications. Source the
+application environment in the same shell that launches reachAQ, or configure
+equivalent values in the desktop/service launcher. The service interface and
+application channel must match:
+
+```bash
+. /etc/default/reachaq-can
+test "$AUTOTRAINER_CAN_CHANNEL" = "$REACHAQ_CAN_INTERFACE"
+systemctl is-enabled reachaq-can.service
+systemctl is-active reachaq-can.service
+ip -details link show "$AUTOTRAINER_CAN_CHANNEL"
+```
+
+For the current JerryCAN board, expect `can0`, `mtu 72`, CAN FD,
+1 Mbit/s arbitration, and 5 Mbit/s data. See the
+[PEAK/SocketCAN guide](peak-socketcan.md) for installation, termination,
+permissions, reset behavior, and safe validation.
+
 ## Software-only camera launch
 
 `--random-cameras` changes configured camera sources only in memory for that
@@ -121,6 +146,8 @@ record until reachAQ exits.
 | Cameras absent | Applicable [FLIR guide](flir-spinnaker.md) or USB enumeration |
 | NI devices absent | [NI-DAQ/PXI guide](ni-daq-pxi.md), starting at PCI/USB enumeration |
 | CAN interface down | [PEAK/SocketCAN guide](peak-socketcan.md), bitrate and termination |
+| CAN reset asks for a password | Activate the `reachaq` login group by logging out/in, then verify the narrow `sudo -n` permission |
+| CAN RX continues but startup ACK times out | Preserve the application log; this is an application startup/ACK path issue rather than proof of a dead bus |
 | TensorFlow reports no GPU | [NVIDIA guide](nvidia-inference.md) or `--no-live-inference` |
 | Output permission error | Configured data directory ownership and write permission |
 

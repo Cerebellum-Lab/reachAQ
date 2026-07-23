@@ -33,6 +33,7 @@ from autotrainer.device.can_device import (
     default_move_retract,
     default_load_pellet,
     default_send_pellet,
+    _shutdown_requested,
 )
 from autotrainer.device.device_connection import _REQUEST_DISCONNECT
 
@@ -97,6 +98,133 @@ def test_pellet_only_connection_skips_unused_motor_configurations():
         Motor.PELLET_LOAD_SERVO,
         Motor.PELLET_COVER_SERVO,
     } <= configured_motors
+
+
+def test_disconnect_discards_pending_and_retry_state():
+    device = CanDevice(
+        api=DeviceApi(message_callback=data_callback),
+        force_emulation=True,
+        required_targets=(Target.PELLET_DEVICE,),
+    )
+    device._commands_queue.put((SystemCommandKind.SET_X, 1, "queued"))
+    device._compound_movement = [{"x": 1}]
+    device._prev_command = ("retry", 1, "cached")
+    board = device._boards_pending_ctx[Target.PELLET_DEVICE]
+    board.ctx = "pending"
+    board.kind = SystemCommandKind.SET_X
+    board.uuid = 42
+    board.prev_command = ("retry", 1, "pending")
+    board.compound_steps = [{"x": 2}]
+    board.repeated_command_count = 2
+
+    device.disconnect()
+    device.disconnect()
+
+    assert device._commands_queue.empty()
+    assert device._compound_movement is None
+    assert device._prev_command is None
+    assert board.ctx is None
+    assert board.kind is None
+    assert board.uuid is None
+    assert board.prev_command is None
+    assert board.compound_steps is None
+    assert board.repeated_command_count == 0
+
+    device.notify_message(SystemCommandKind.SET_X, 2, "after-shutdown")
+    assert device._commands_queue.empty()
+
+
+def test_command_queued_immediately_before_connect_survives_startup():
+    token = "queued-before-connect"
+    acknowledged = threading.Event()
+
+    def callback(kind, data):
+        if kind == SystemStatusMessageKind.ACKNOWLEDGE and data[0] == token:
+            acknowledged.set()
+
+    device = CanDevice(
+        api=DeviceApi(message_callback=callback),
+        force_emulation=True,
+        required_targets=(Target.PELLET_DEVICE,),
+    )
+    device.device_interface.open()
+    device.notify_message(SystemCommandKind.REQUEST_VERSION, None, context=token)
+
+    try:
+        device.connect()
+        assert acknowledged.wait(1), "pre-connect command was discarded during startup"
+    finally:
+        device.disconnect()
+        device.device_interface.close()
+
+
+def test_wait_connected_reports_connection_timeout_separately():
+    device = mock.Mock()
+    device.device_interface = mock.Mock()
+    device.connected = False
+    connection = DeviceConnection(device, message_queue=queue.Queue())
+
+    with pytest.raises(TimeoutError, match="device connection timeout"):
+        connection.wait_connected(timeout=0)
+
+
+def test_await_acknowledge_reports_command_timeout_separately():
+    device = mock.Mock()
+    device.device_interface = mock.Mock()
+    connection = DeviceConnection(device, message_queue=queue.Queue())
+
+    with pytest.raises(RuntimeError, match="command timeout"):
+        with connection.await_acknowledge({"not-acknowledged"}, timeout=0):
+            pass
+
+
+def test_command_handler_failure_requests_safety_shutdown():
+    shutdown = mock.Mock()
+    device = CanDevice(
+        api=DeviceApi(message_callback=data_callback),
+        force_emulation=True,
+        required_targets=(Target.PELLET_DEVICE,),
+        shutdown_callback=shutdown,
+    )
+    device._CanDevice__command_handler = mock.Mock(side_effect=RuntimeError("ack exhausted"))
+
+    with pytest.raises(RuntimeError, match="ack exhausted"):
+        device._command_handler()
+
+    shutdown.assert_called_once()
+    assert "ack exhausted" in shutdown.call_args.args[0]
+
+
+def test_disconnect_waits_for_inflight_send_and_rejects_following_send():
+    device = CanDevice(
+        api=DeviceApi(message_callback=data_callback),
+        force_emulation=True,
+        required_targets=(Target.PELLET_DEVICE,),
+    )
+    entered = threading.Event()
+    release = threading.Event()
+
+    def inflight():
+        entered.set()
+        release.wait(1)
+        return True
+
+    command_thread = threading.Thread(target=device._execute_if_active, args=(inflight,))
+    command_thread.start()
+    assert entered.wait(1)
+
+    shutdown_thread = threading.Thread(target=device.disconnect)
+    shutdown_thread.start()
+    assert device._want_exit.wait(1)
+    assert shutdown_thread.is_alive()
+
+    release.set()
+    command_thread.join(1)
+    shutdown_thread.join(1)
+
+    assert not command_thread.is_alive()
+    assert not shutdown_thread.is_alive()
+    assert device._execute_if_active(lambda: True) is _shutdown_requested
 
 
 @pytest.fixture

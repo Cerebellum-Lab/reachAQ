@@ -25,6 +25,9 @@ The portable installer does **not** install FLIR, NI, PEAK out-of-tree, or
 NVIDIA kernel drivers and does not select camera serials, DAQ channels, CAN
 bitrate, or an inference model. After a working NVIDIA driver is installed, an
 opt-in installer step can add the supported TensorFlow CUDA user-space runtime.
+It installs the portable `can-utils` and `iproute2` packages, but it does not
+install or enable `reachaq-can.service`; that service is intentionally a
+separate, reviewed hardware step.
 
 ## 1. Clone the repository
 
@@ -92,8 +95,23 @@ aliases, and channel limitations.
 ### PEAK CAN / pellet controller
 
 Follow the [PEAK SocketCAN guide](docs/linux-install/peak-socketcan.md) to verify
-the adapter, bitrate, bus state, tracked boot service, and pellet-board
-discovery.
+the adapter and bitrate, install and enable the tracked boot service, verify
+that `can0` is automatically `UP` after reboot, install the narrowly privileged
+reset helper, and test pellet-board discovery.
+
+That guide installs these root-owned system artifacts:
+
+- `/usr/local/sbin/reachaq-bring-up-can`
+- `/usr/local/sbin/reachaq-bring-down-can`
+- `/usr/local/sbin/reachaq-reset-can`
+- `/etc/default/reachaq-can`
+- `/etc/systemd/system/reachaq-can.service`
+- `/etc/sudoers.d/reachaq-can-reset`
+
+Adding the operator to the `reachaq` group requires a full logout/login before
+the application can use its non-interactive safety reset. The service
+configuration and application environment are separate; make
+`REACHAQ_CAN_INTERFACE` and `AUTOTRAINER_CAN_CHANNEL` select the same channel.
 
 ### NVIDIA live inference
 
@@ -134,6 +152,14 @@ operator selects Running.
 - [ ] FLIR cameras, if used, appear as `spinnaker://` sources.
 - [ ] NI devices, if used, appear in `nilsdev` and Python `nidaqmx` discovery.
 - [ ] CAN interfaces, if used, are `UP` with the confirmed bitrate and board.
+- [ ] `reachaq-can.service` is `enabled` and `active`, and `can0` comes back
+  `UP` after a reboot without launching reachAQ.
+- [ ] `id -nG` lists `reachaq`, and the reset-helper `sudo -n -l` check
+  succeeds without prompting.
+- [ ] Root-owned installed CAN files match the reviewed repository versions;
+  `/etc/default/reachaq-can` retains any intentional rig-specific values.
+- [ ] The application `AUTOTRAINER_CAN_CHANNEL` matches service
+  `REACHAQ_CAN_INTERFACE`.
 - [ ] TensorFlow, if inference is enabled, reports a GPU and passes preflight.
 - [ ] Configuration contains real serials, aliases, channels, paths, and model.
 - [ ] Output directory exists and is writable by the operator.

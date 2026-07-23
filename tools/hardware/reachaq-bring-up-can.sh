@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-interfaces="${REACHAQ_CAN_INTERFACES:-can0 can1}"
+interface="${REACHAQ_CAN_INTERFACE:-can0}"
 bitrate="${REACHAQ_CAN_BITRATE:-${AUTOTRAINER_CAN_BITRATE:-1000000}}"
 restart_ms="${REACHAQ_CAN_RESTART_MS:-100}"
 txqueuelen="${REACHAQ_CAN_TXQUEUELEN:-1000}"
@@ -31,16 +31,14 @@ wait_for_interface() {
   done
 }
 
-for dev in $interfaces; do
-  wait_for_interface "$dev"
+wait_for_interface "$interface"
 
-  ip link set "$dev" down >/dev/null 2>&1 || true
-  if [[ "$can_fd" == "true" || "$can_fd" == "1" || "$can_fd" == "yes" ]]; then
-    ip link set "$dev" type can bitrate "$bitrate" dbitrate "$dbitrate" fd on restart-ms "$restart_ms"
-  else
-    ip link set "$dev" type can bitrate "$bitrate" restart-ms "$restart_ms"
-  fi
-  ip link set "$dev" txqueuelen "$txqueuelen"
-  ip link set "$dev" up
-  ip -details -brief link show "$dev"
-done
+ip link set "$interface" down >/dev/null 2>&1 || true
+if [[ "$can_fd" == "true" || "$can_fd" == "1" || "$can_fd" == "yes" ]]; then
+  ip link set "$interface" type can bitrate "$bitrate" dbitrate "$dbitrate" fd on restart-ms "$restart_ms"
+else
+  ip link set "$interface" type can bitrate "$bitrate" restart-ms "$restart_ms"
+fi
+ip link set "$interface" txqueuelen "$txqueuelen"
+ip link set "$interface" up
+ip -details -brief link show "$interface"

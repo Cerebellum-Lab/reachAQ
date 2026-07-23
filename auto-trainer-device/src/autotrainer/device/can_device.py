@@ -15,7 +15,7 @@ import queue
 import threading
 import time
 from functools import partial
-from typing import Iterable, Tuple, Union, SupportsInt, List, Optional, Any, cast, Dict
+from typing import Callable, Iterable, Tuple, Union, SupportsInt, List, Optional, Any, cast, Dict
 
 from autotrainer.core import Offset3DTuple, get_perf_now, Motor
 from autotrainer.core.logging import get_verbose_logger
@@ -93,6 +93,7 @@ _next_compound = _Sentinel(role="next_compound")
 # for eventual retry when uuid ack timeout:
 _retry_compound = _Sentinel(role="retry_compound")
 _retry_full = _Sentinel(role="retry_full")
+_shutdown_requested = _Sentinel(role="shutdown_requested")
 
 
 def _no_op():
@@ -193,7 +194,8 @@ class CanDevice(Device):
 
     def __init__(self, api: Optional[DeviceApi] = None, buffer_size: int = 50, force_emulation: bool = False,
                  *, can_transport: Optional[CanTransportConfiguration] = None,
-                 required_targets: Optional[Iterable[Target]] = None):
+                 required_targets: Optional[Iterable[Target]] = None,
+                 shutdown_callback: Optional[Callable[[str], None]] = None):
         """
         Initialize the CANbus device interface.
 
@@ -211,6 +213,9 @@ class CanDevice(Device):
         super().__init__(self._interface, api)
 
         self._want_exit = threading.Event()
+        self._disconnect_lock = threading.Lock()
+        self._command_execution_lock = threading.Lock()
+        self._shutdown_callback = shutdown_callback
 
         self._measurement_buffer_count = buffer_size
         self._measurements: List[HeadFixMeasurement] = []
@@ -593,11 +598,20 @@ class CanDevice(Device):
         return self._commands_handler_watchdog_perf_c
 
     def _put_to_cmd_queue(self, obj):
+        if self._want_exit.is_set():
+            logger.warning("Ignoring CAN command while device is shutting down")
+            return
         cmd_thread = self._commands_handler_thread
         # cmd thread is started on connect()
         if cmd_thread is not None and not cmd_thread.is_alive():
             raise RuntimeError("CAN command handler thread not anymore alive: %s", cmd_thread)
         self._commands_queue.put(obj)
+
+    def _execute_if_active(self, func, *args, **kwargs):
+        with self._command_execution_lock:
+            if self._want_exit.is_set():
+                return _shutdown_requested
+            return func(*args, **kwargs)
 
     def _check_tunnel_pellet_status_age(self):
         logger.verbose("running")
@@ -624,6 +638,12 @@ class CanDevice(Device):
             self.__command_handler()
         except BaseException as err:
             logger.exception("command handler crashed: %s", err)
+            callback = self._shutdown_callback
+            if callback is not None:
+                try:
+                    callback(f"CAN command handler failure: {err}")
+                except Exception:
+                    logger.exception("Failed to request CAN safety shutdown")
             raise
 
     def __command_handler(self):
@@ -664,6 +684,9 @@ class CanDevice(Device):
 
         p_before_loop = get_perf_now()
         while True:
+            if self._want_exit.is_set():
+                logger.verbose("CAN shutdown requested, exiting command loop")
+                break
             if has_read_from_queue:
                 input_q.task_done()
                 has_read_from_queue = False
@@ -827,6 +850,9 @@ class CanDevice(Device):
                     continue
             # start processing of cur_commands[0]
             cur_commands.pop(0)  # (kind, data, ctx, perf_c) will be pushed back if command need to eventually retry
+            if self._want_exit.is_set():
+                logger.verbose("Discarding CAN command because shutdown was requested")
+                break
             #
             # execute command
             logger.verbose("executing command kind: %s with ctx=%s ; target_board: ctx=%s",
@@ -849,7 +875,8 @@ class CanDevice(Device):
                 kind, steps = data
                 target_board.kind = kind
                 target_board.compound_steps = steps
-                perform_next_compound(target_board, steps)
+                if self._execute_if_active(perform_next_compound, target_board, steps) is _shutdown_requested:
+                    break
 
             elif kind is _uuid_ack:
                 assert found_board_with_uuid_ack is not None
@@ -869,7 +896,8 @@ class CanDevice(Device):
                     if found_board_with_uuid_ack is not target_board:
                         found_board_with_uuid_ack.ctx = None
                         found_board_with_uuid_ack.kind = None
-                    perform_next_compound(target_board, steps)
+                    if self._execute_if_active(perform_next_compound, target_board, steps) is _shutdown_requested:
+                        break
                 else:
                     assert target_board is found_board_with_uuid_ack
 
@@ -885,16 +913,23 @@ class CanDevice(Device):
                 for _ in range(self.default_command_write_failed_repeat_count):
                     logger.debug("executing cmd %s with ctx %s", kind, ctx)
                     if isinstance(data, SystemDataArgsKwargs):
-                        success = handler(*data.args, **data.kwargs)
+                        result = self._execute_if_active(handler, *data.args, **data.kwargs)
                     else:
-                        success = handler(data)
+                        result = self._execute_if_active(handler, data)
+                    if result is _shutdown_requested:
+                        break
+                    success = result
                     if success:
                         break
                     logger.error("Failed sending %s to bus", kind)
+                if self._want_exit.is_set():
+                    break
                 if not success:
                     raise RuntimeError(f"Failed writing too many consecutive times to the device/bus. kind={kind} ctx={ctx}")
                 target_board.kind = kind  # only used for debug/log
             # end possible handling cases
+            if self._want_exit.is_set():
+                break
             #
             # get CAN uuid after, to distinguish both cases (with or without uuid used):
             after_uuid = self._interface.uuid()
@@ -986,12 +1021,12 @@ class CanDevice(Device):
     def connect(self):
         # only start the command handler thread on connect,
         # which means we have already obtained the addr of desired devices.
-        self._want_exit.clear()
-        self._prev_command_timeout = self.default_command_ack_timeout_duration
         if self._commands_handler_thread is not None:
             logger.verbose("CAN command Handler thread already alive")
             self.disconnect()
 
+        self._want_exit.clear()
+        self._prev_command_timeout = self.default_command_ack_timeout_duration
         self._clear_caches()
         self._init_default_move_configs()
 
@@ -1009,23 +1044,59 @@ class CanDevice(Device):
             thread.start()
             self._tunnel_pellet_status_check_thread = thread
 
+    def _clear_pending_commands(self):
+        cmd_queue = self._commands_queue
+        while True:
+            try:
+                cmd_queue.get_nowait()
+            except queue.Empty:
+                break
+            else:
+                cmd_queue.task_done()
+
+        self._compound_movement = None
+        self._prev_command = None
+        self._prev_command_is_relative = False
+        self._prev_command_timeout = self.default_command_ack_timeout_duration
+        for board in self._boards_pending_ctx.values():
+            board.ctx = None
+            board.kind = None
+            board.uuid = None
+            board.uuid_ack_perf_c = -math.inf
+            board.skip_uuid_ack_perf_c = False
+            board.ack_perf_timeout = math.inf
+            board.prev_command = None
+            board.prev_command_relative = False
+            board.uuid_ack_timeout_engaged = False
+            board.repeated_command_count = 0
+            board.compound_steps = None
+
     def disconnect(self):
-        self._want_exit.set()
-        cmd_thread, cmd_queue = self._commands_handler_thread, self._commands_queue
-        if cmd_thread is not None:
-            if cmd_thread.is_alive():
-                cmd_queue.put(None)
-            cmd_thread.join(3)
-            if cmd_thread.is_alive():
-                logger.warning("CanCommand handler thread still alive: %s", cmd_thread)
-            self._commands_handler_thread = None
-            # cmd_queue.join()  # not totally necessary here
-        thread = self._tunnel_pellet_status_check_thread
-        if thread is not None:
-            thread.join(3)
-            if thread.is_alive():
-                logger.warning("PelletTunnel check thread still alive")
-            self._tunnel_pellet_status_check_thread = None
+        with self._disconnect_lock:
+            self._want_exit.set()
+            with self._command_execution_lock:
+                pass
+            self._clear_pending_commands()
+
+            cmd_thread, cmd_queue = self._commands_handler_thread, self._commands_queue
+            if cmd_thread is not None:
+                if cmd_thread.is_alive():
+                    cmd_queue.put(None)
+                if cmd_thread is not threading.current_thread():
+                    cmd_thread.join(3)
+                if cmd_thread.is_alive() and cmd_thread is not threading.current_thread():
+                    logger.warning("CanCommand handler thread still alive: %s", cmd_thread)
+                self._commands_handler_thread = None
+
+            thread = self._tunnel_pellet_status_check_thread
+            if thread is not None:
+                if thread is not threading.current_thread():
+                    thread.join(3)
+                if thread.is_alive() and thread is not threading.current_thread():
+                    logger.warning("PelletTunnel check thread still alive")
+                self._tunnel_pellet_status_check_thread = None
+
+            self._clear_pending_commands()
 
     def _start_sequence(self, movements: MotorSteps) -> bool:
         """

@@ -1,6 +1,8 @@
 import logging
 import math
+import os
 import re
+import subprocess
 import threading
 import time
 import uuid
@@ -17,7 +19,7 @@ from autotrainer.core.logging import log_hardware_initialization
 from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
 from autotrainer.core.event import post_api_detector_event_content
 from autotrainer.core.message import SystemDataArgsKwargs
-from autotrainer.device import (CanTransportConfiguration, DeviceConnectionProtocol, HAVE_CAN_DEVICE,
+from autotrainer.device import (CanTransportConfiguration, CanTransportKind, DeviceConnectionProtocol, HAVE_CAN_DEVICE,
                                 DeviceConnection, CanDevice, StepperConfig, ServoConfig, Device, ColorLed, Target)
 from autotrainer.behavior import TunnelDeviceProtocol, PelletDeviceProtocol
 
@@ -78,6 +80,9 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
         super().__init__()
 
         self._lock = threading.RLock()  # **required** re-entrant lock !!
+        self._safety_shutdown_lock = threading.Lock()
+        self._safety_shutdown_started = False
+        self._safety_shutdown_thread: Optional[threading.Thread] = None
         self._connect_count = 0
 
         self._event_manager = EventManager.default()
@@ -581,7 +586,10 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
         prev_device = self._device_conn
         if prev_device is not None:
             logger.warning("auto-disconnecting from device before (re-)connect")
-            self.disconnect()
+            self._disconnect_transport()
+        with self._safety_shutdown_lock:
+            self._safety_shutdown_started = False
+            self._safety_shutdown_thread = None
 
         self._connect_count += 1
         self._last_motor_coordinates = \
@@ -596,6 +604,7 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
             buffer_size=buffer_size,
             required_targets=(Target.PELLET_DEVICE,),
             can_transport=transport,
+            shutdown_callback=lambda reason: self.safety_shutdown(reason, wait=False),
         )
         log_hardware_initialization(
             logger,
@@ -612,6 +621,29 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
         device_conn = self._device_conn = DeviceConnection(can_device, cmd_queue, name="can-device")
         log_hardware_initialization(logger, "START | CAN connection worker | name=can-device")
         device_conn.request_connect()
+        connection_started = time.perf_counter()
+        connection_timeout = 3.0
+        log_hardware_initialization(
+            logger,
+            "START | CAN connection readiness | timeout=%.1fs",
+            connection_timeout,
+        )
+        try:
+            device_conn.wait_connected(timeout=connection_timeout)
+        except Exception as exc:
+            log_hardware_initialization(
+                logger,
+                "FAILED | CAN connection readiness | elapsed=%.3fs error=%s",
+                time.perf_counter() - connection_started,
+                str(exc) or exc.__class__.__name__,
+                level=logging.ERROR,
+            )
+            raise
+        log_hardware_initialization(
+            logger,
+            "READY | CAN connection readiness | elapsed=%.3fs",
+            time.perf_counter() - connection_started,
+        )
 
         send_dev_cmd = partial(self._send_command, device_conn)
         def send_dev_ack_cmd(kind, data=None):
@@ -619,7 +651,10 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
             log_hardware_initialization(logger, "START | pellet command | command=%s", kind.name)
             tok = str(uuid.uuid4())
             try:
-                with device_conn.await_acknowledge({tok}):
+                with device_conn.await_acknowledge(
+                    {tok},
+                    timeout=can_device.default_command_ack_timeout_duration,
+                ):
                     send_dev_cmd(kind, data, context=tok)
             except Exception as exc:
                 log_hardware_initialization(
@@ -693,9 +728,11 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
             time.perf_counter() - connect_started,
         )
 
-    def disconnect(self):
+    def _disconnect_transport(self):
         logger.verbose("disconnecting ..")
         self._disconnect_event.set()
+        with self._lock:
+            self._pending_tokens.clear()
         can_dev = self._can_device
         dev = self._device_conn
         if dev is not None:
@@ -713,7 +750,77 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
         if prev_thread is not None:
             logger.debug("joining checktimedout commands thread")
             prev_thread.join()
+        with self._lock:
+            self._pending_tokens.clear()
+        self._refresh_cmd_in_progress([])
         self._device_stream_started = False
+
+    def _reset_socketcan(self, transport: Optional[CanTransportConfiguration]) -> None:
+        if transport is None:
+            return
+        if transport.kind != CanTransportKind.SOCKETCAN:
+            return
+
+        helper = "/usr/local/sbin/reachaq-reset-can"
+        command = [helper] if os.geteuid() == 0 else ["sudo", "-n", helper]
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            logger.error("Could not reset SocketCAN after safety shutdown: %s", exc)
+            return
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or completed.stdout.strip() or f"exit {completed.returncode}"
+            logger.error("SocketCAN safety reset failed: %s", detail)
+        else:
+            logger.notice("SocketCAN safety reset completed")
+
+    def _run_safety_shutdown(self, reason: str) -> None:
+        logger.critical("Starting CAN safety shutdown: %s", reason)
+        can_dev = self._can_device
+        if can_dev is not None:
+            transport = can_dev.can_transport_configuration
+        else:
+            try:
+                transport = CanTransportConfiguration.from_environment()
+            except Exception:
+                logger.exception("Could not determine CAN transport for safety reset")
+                transport = None
+        try:
+            self._disconnect_transport()
+        except Exception:
+            logger.exception("Failed to close CAN transport during safety shutdown")
+        finally:
+            self._reset_socketcan(transport)
+        logger.notice("CAN safety shutdown finished")
+
+    def safety_shutdown(self, reason: str, *, wait: bool = True) -> None:
+        """Stop hardware once, discard commands, and flush the SocketCAN link."""
+        with self._safety_shutdown_lock:
+            thread = self._safety_shutdown_thread
+            if not self._safety_shutdown_started:
+                self._safety_shutdown_started = True
+                thread = threading.Thread(
+                    target=self._run_safety_shutdown,
+                    args=(reason,),
+                    name="CanSafetyShutdown",
+                    daemon=False,
+                )
+                self._safety_shutdown_thread = thread
+                thread.start()
+
+        if wait and thread is not None and thread is not threading.current_thread():
+            thread.join(20)
+            if thread.is_alive():
+                logger.error("CAN safety shutdown did not finish within 20 seconds")
+
+    def disconnect(self):
+        self.safety_shutdown("hardware disconnect")
 
     def _can_device_property_changed(self, name: str, value, prev_value):
         logger.debug("_device_property_changed: %s : %s -> %s", name, prev_value, value)
@@ -858,9 +965,13 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
                       cmd: SystemCommandKind,
                       data=None,
                       context=None) -> bool:
-        if device is not None:
-            device.send_message(cmd, data, context)
-            return True
+        with self._safety_shutdown_lock:
+            if self._safety_shutdown_started:
+                logger.warning("Ignoring %s because CAN safety shutdown is active", cmd)
+                return False
+            if device is not None:
+                device.send_message(cmd, data, context)
+                return True
         return False
 
     def set_motors_drift(self, drift: Offset3DTuple):
