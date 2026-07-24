@@ -87,6 +87,14 @@ systemctl is-active reachaq-can.service
 ip -details link show "$AUTOTRAINER_CAN_CHANNEL"
 ```
 
+The hardware profile defaults to `alogus` independently of which Python CAN
+library is installed. The rig environment sets
+`AUTOTRAINER_HARDWARE_VERSION=alogus` explicitly. A legacy Anschutz runtime
+must opt in with `AUTOTRAINER_HARDWARE_VERSION=anschutz`; unknown values are
+rejected rather than silently selecting another profile. Emulation is selected
+separately with `AUTOTRAINER_CAN_TRANSPORT=emulation` and still uses the Alogus
+profile.
+
 For the current JerryCAN board, expect `can0`, `mtu 72`, CAN FD,
 1 Mbit/s arbitration, and 5 Mbit/s data. See the
 [PEAK/SocketCAN guide](peak-socketcan.md) for installation, termination,

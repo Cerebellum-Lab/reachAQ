@@ -1,6 +1,11 @@
 import importlib.util
+from typing import Optional, Union
 
-from .hardware_version import HardwareVersion, default_determine_hardware_version
+from .hardware_version import (
+    HardwareVersion,
+    default_determine_hardware_version,
+    normalize_hardware_version,
+)
 
 _spec_api = importlib.util.find_spec("autotrainer.api")
 
@@ -14,7 +19,7 @@ class EnvironmentProvider:
     application and would otherwise require repeatedly passing some instance of the information down a large
     hierarchy or similar.
     """
-    _hardware_version = default_determine_hardware_version()
+    _hardware_version_override: Optional[HardwareVersion] = None
 
     _allow_can_emulation = False
 
@@ -22,7 +27,19 @@ class EnvironmentProvider:
 
     @staticmethod
     def hardware_version() -> HardwareVersion:
-        return EnvironmentProvider._hardware_version
+        override = EnvironmentProvider._hardware_version_override
+        if override is not None:
+            return override
+        return default_determine_hardware_version()
+
+    @staticmethod
+    def set_hardware_version(
+        value: Optional[Union[HardwareVersion, str, int]],
+    ) -> None:
+        """Set an explicit runtime profile, or clear it with ``None``."""
+        EnvironmentProvider._hardware_version_override = (
+            None if value is None else normalize_hardware_version(value)
+        )
 
     @staticmethod
     def allow_can_emulation() -> bool:

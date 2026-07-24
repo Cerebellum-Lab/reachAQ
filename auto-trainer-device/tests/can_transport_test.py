@@ -3,6 +3,7 @@ import logging
 import pytest
 
 from autotrainer.device import can_transport
+from autotrainer.device import can_device
 from autotrainer.device import (
     CanDevice,
     CanTransportConfiguration,
@@ -132,3 +133,49 @@ def test_can_device_accepts_pellet_only_required_targets():
     assert device.required_targets == (Target.PELLET_DEVICE,)
     assert device.is_target_required(Target.PELLET_DEVICE)
     assert not device.is_target_required(Target.MAGNET_DEVICE)
+
+
+@pytest.mark.parametrize(
+    ("have_pyjerrycan", "transport_kind", "force_emulation", "expected_interface"),
+    (
+        (False, CanTransportKind.SOCKETCAN, False, "can"),
+        (True, CanTransportKind.SOCKETCAN, False, "can"),
+        (True, CanTransportKind.PYJERRYCAN, False, "can"),
+        (False, CanTransportKind.PYJERRYCAN, False, "emulation"),
+        (False, CanTransportKind.EMULATION, False, "emulation"),
+        (True, CanTransportKind.PYJERRYCAN, True, "emulation"),
+        (True, CanTransportKind.SOCKETCAN, True, "emulation"),
+    ),
+)
+def test_can_device_interface_selection_matrix(
+    monkeypatch,
+    have_pyjerrycan,
+    transport_kind,
+    force_emulation,
+    expected_interface,
+):
+    created = []
+
+    class FakeCanInterface:
+        def __init__(self, **kwargs):
+            created.append(("can", kwargs))
+
+    class FakeEmulationInterface:
+        def __init__(self):
+            created.append(("emulation", {}))
+
+    monkeypatch.setattr(can_device, "HAVE_CAN_DEVICE", have_pyjerrycan)
+    monkeypatch.setattr(can_device, "CanInterface", FakeCanInterface)
+    monkeypatch.setattr(can_device, "EmulationInterface", FakeEmulationInterface)
+
+    device = object.__new__(CanDevice)
+    device._can_transport_configuration = CanTransportConfiguration(kind=transport_kind)
+    device._required_targets = (Target.PELLET_DEVICE,)
+
+    interface = device._make_device_interface(force_emulation)
+
+    assert created[0][0] == expected_interface
+    if expected_interface == "can":
+        assert isinstance(interface, FakeCanInterface)
+    else:
+        assert isinstance(interface, FakeEmulationInterface)
