@@ -1,3 +1,4 @@
+import math
 from typing import Optional, Callable
 from functools import partial
 
@@ -36,6 +37,20 @@ _alogus_travel_limits = {
     "y": (0, 35),
     "z": (0, 35),
 }
+
+
+def _format_motor_feedback_value(value: float) -> str:
+    if not math.isfinite(value):
+        return "—"
+    formatted = f"{value:.1f}"
+    if formatted == "-0.0":
+        formatted = "0.0"
+    return formatted.replace("-", "−", 1)
+
+
+def _format_motor_feedback(status: str, position: Offset3DTuple) -> str:
+    x, y, z = (_format_motor_feedback_value(value) for value in position)
+    return f"• {status} •   X {x} | Y {y} | Z {z} mm"
 
 
 class HardwareControlContent(ContentWidget):
@@ -184,9 +199,15 @@ class HardwareControlContent(ContentWidget):
         self._y_pos, self._y_set_button, self._y_range_label = add_coord('y')
         self._z_pos, self._z_set_button, self._z_range_label = add_coord('z')
 
+        self._motor_feedback_label = QLabel()
+        self._motor_feedback_label.setObjectName("motorFeedbackLabel")
+        self._motor_feedback_label.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        sub_layout.addWidget(self._motor_feedback_label, row, col, 1, 4)
+
         layout.addLayout(sub_layout, 1, 2, alignment=Qt.AlignmentFlag.AlignTop)
 
         self._set_pos_limits()
+        self._update_motor_feedback()
 
         #
 
@@ -333,6 +354,31 @@ class HardwareControlContent(ContentWidget):
     def _update_head_magnet_position(self):
         self._hardware_model.update_head_magnet_intensity(self._head_magnet_position_spinbox.value())
 
+    def _update_motor_feedback(self):
+        position = self._hardware_model.last_position
+        if position is None:
+            position = Offset3DTuple(math.nan, math.nan, math.nan)
+
+        config = self._app_model.behavior.algorithm.diamond_triangle_config
+        if config is not None and config.fully_valid:
+            position = config.motor_to_diamond(position)
+
+        if not self._hardware_model.pellet_version:
+            status = "DISCONNECTED"
+            color = "#6b7280"
+        elif self._hardware_model.pellet_status_timeout_engaged:
+            status = "STALE"
+            color = "#9a6700"
+        elif all(math.isfinite(value) for value in position):
+            status = "LIVE"
+            color = "#1a7f37"
+        else:
+            status = "STALE"
+            color = "#9a6700"
+
+        self._motor_feedback_label.setText(_format_motor_feedback(status, position))
+        self._motor_feedback_label.setStyleSheet(f"color: {color};")
+
     def _update_title(self, value: str):
         if value:
             if value.find("emulator") != -1:
@@ -386,6 +432,13 @@ class HardwareControlContent(ContentWidget):
                 self._pellet_version.setText("(unknown version)")
                 self.setEnabled(False)
                 self.command_changed.emit("None")
+            self._update_motor_feedback()
+
+        elif property_name in {
+            HardwareModel.POS_XYZ,
+            HardwareModel.DEVICE_PELLET_STATUS_TIMEOUT_ENGAGED,
+        }:
+            self._update_motor_feedback()
 
         elif property_name == HardwareModel.PENDING_COMMAND_PROPERTY:
             if value is not None:
@@ -401,3 +454,4 @@ class HardwareControlContent(ContentWidget):
             # force execute set-selected-animal
             self.set_selected_animal(self._app_model.selected_animal)
             # this will set as desired the UI elements.
+            self._update_motor_feedback()

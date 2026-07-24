@@ -595,6 +595,7 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
         self._last_motor_coordinates = \
         self._last_requested_set_coordinates = \
         self._last_motor_send_coordinates = _nans_offset3dTuple
+        self._device_pellet_status_timeout_engaged = False
 
         # This is specific to wanting to be able to test UI changes w/the emulation interface, which is not
         # configured to generate messages as frequently as the real device.
