@@ -122,6 +122,13 @@ Status still lists every discovered serial for connection diagnostics.
 
 The matching right camera should use its own serial and `primary: 'no'`.
 
+The two-camera Spinnaker path is hardware synchronized: the primary camera
+drives a GPIO signal and the secondary waits for that signal before producing
+frames. A discovered secondary camera can therefore be connected yet show no
+preview when the trigger path is absent or invalid. See
+[FLIR Spinnaker camera setup](../../docs/linux-install/flir-spinnaker.md#work-in-progress-right-camera-preview-timeout)
+for the current right-camera timeout investigation and isolation procedure.
+
 ## NI-DAQ Ports
 
 The DAQ port editor discovers devices through NI-DAQmx. The channel-source
