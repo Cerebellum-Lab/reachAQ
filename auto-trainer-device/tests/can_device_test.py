@@ -134,6 +134,26 @@ def test_disconnect_discards_pending_and_retry_state():
     assert device._commands_queue.empty()
 
 
+def test_compound_move_keeps_configured_motor_coordinate_unchanged():
+    """UI-only coordinate changes must not reinterpret move_config values."""
+    device = CanDevice(
+        api=DeviceApi(message_callback=data_callback),
+        force_emulation=True,
+        required_targets=(Target.PELLET_DEVICE,),
+    )
+    device.device_interface.move_motor_x = mock.Mock(return_value=True)
+    steps = [{"x": 25}]
+    board = device._boards_pending_ctx[Target.PELLET_DEVICE]
+
+    assert device._perform_next_compound_step(board, steps)
+
+    device.device_interface.move_motor_x.assert_called_once_with(
+        25,
+        save_as_fixed=False,
+    )
+    assert steps == []
+
+
 def test_command_queued_immediately_before_connect_survives_startup():
     token = "queued-before-connect"
     acknowledged = threading.Event()
