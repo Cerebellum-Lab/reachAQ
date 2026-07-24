@@ -1,5 +1,6 @@
 import os
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 
@@ -12,6 +13,7 @@ from autotrainer.core.capture import CaptureProcessStatus  # noqa: E402
 from autotrainer.video import CaptureCameraAttrs  # noqa: E402
 from tools.acquisition.model.hardware_scan import HardwareScanEntry, scan_can_adapters, scan_gpus  # noqa: E402
 from tools.acquisition.model.nidaq_discovery import NidaqDevicePorts  # noqa: E402
+from tools.acquisition.model.app_model import AppModel  # noqa: E402
 from tools.acquisition.view.hardware_status_content import HardwareStatusContent  # noqa: E402
 
 
@@ -70,6 +72,7 @@ class _AppModelStub(ObservableObject):
             pellet_controller_enabled=False,
             connected=False,
             pellet_version="",
+            pellet_status_timeout_engaged=False,
         )
         self.nidaq_signal_monitor = _ObservableStub(
             configuration=SimpleNamespace(
@@ -212,6 +215,47 @@ def test_pellet_firmware_version_updates_hardware_status(qapp):
         content.deleteLater()
 
 
+@pytest.mark.parametrize(
+    "connected,scan_entry,expected_color,expected_status",
+    (
+        (
+            True,
+            HardwareScanEntry("✓ controller session connected", "ok"),
+            "#e8f5ec",
+            "connected",
+        ),
+        (
+            False,
+            HardwareScanEntry(
+                "! controller connection failed\n→ connection timeout",
+                "error",
+            ),
+            "#fdebec",
+            "connection failed",
+        ),
+    ),
+)
+def test_pellet_connection_outcome_controls_status_color(
+    qapp,
+    connected,
+    scan_entry,
+    expected_color,
+    expected_status,
+):
+    app_model = _AppModelStub()
+    app_model.hardware.can_enabled = True
+    app_model.hardware.pellet_controller_enabled = True
+    app_model.hardware.connected = connected
+    app_model.hardware_scan_results["pellet"] = scan_entry
+    content = HardwareStatusContent(app_model)
+    try:
+        panel = content._category_panels["pellet"]
+        assert expected_color in panel.header.styleSheet()
+        assert expected_status in panel.details_text
+    finally:
+        content.deleteLater()
+
+
 def test_hardware_model_persists_reported_pellet_version(app_model):
     hardware = app_model.hardware
 
@@ -273,9 +317,21 @@ def test_hardware_refresh_publishes_discovered_devices(app_model, monkeypatch):
         "scan_gpus",
         lambda: HardwareScanEntry("✓ 1 NVIDIA GPU\n→ GPU0 Test GPU", "ok"),
     )
+    initialize_pellet = mock.Mock(
+        return_value=HardwareScanEntry(
+            "✓ controller session connected · firmware 1.2.5",
+            "ok",
+        )
+    )
+    monkeypatch.setattr(
+        app_model,
+        "_initialize_pellet_controller_for_refresh",
+        initialize_pellet,
+    )
 
     app_model.refresh_hardware_bindings()
 
+    initialize_pellet.assert_called_once_with()
     results = app_model.hardware_scan_results
     assert set(results) == {"cameras", "nidaq", "can", "pellet", "gpu", "laser"}
     assert "Spinnaker 111" in results["cameras"].info
@@ -286,8 +342,62 @@ def test_hardware_refresh_publishes_discovered_devices(app_model, monkeypatch):
     assert "DevInputs · PXI-6221 · #28853" in results["nidaq"].info
     assert results["nidaq"].state == "ok"
     assert "can0 ↑ · selected" in results["can"].info
-    assert "connection starts with acquisition" in results["pellet"].info
+    assert "controller session connected" in results["pellet"].info
+    assert results["pellet"].state == "ok"
     assert results["gpu"].state == "ok"
+
+
+def test_startup_refresh_initializes_pellet_controller():
+    command_queue = object()
+    hardware = SimpleNamespace(
+        can_enabled=True,
+        pellet_controller_enabled=True,
+        connected=False,
+        pellet_version="",
+        safety_shutdown=mock.Mock(),
+    )
+
+    def connect(received_queue):
+        assert received_queue is command_queue
+        hardware.connected = True
+        hardware.pellet_version = "1.2.5"
+
+    hardware.connect = mock.Mock(side_effect=connect)
+    app_model = object.__new__(AppModel)
+    app_model._hardware = hardware
+    app_model._system_message_handler = SimpleNamespace(input_queue=command_queue)
+
+    result = app_model._initialize_pellet_controller_for_refresh()
+    app_model._ensure_pellet_controller_connected()
+
+    hardware.connect.assert_called_once_with(command_queue)
+    hardware.safety_shutdown.assert_not_called()
+    assert result.state == "ok"
+    assert "firmware 1.2.5" in result.info
+
+
+def test_startup_refresh_reports_and_cleans_up_pellet_connection_failure():
+    hardware = SimpleNamespace(
+        can_enabled=True,
+        pellet_controller_enabled=True,
+        connected=False,
+        pellet_version="",
+        connect=mock.Mock(side_effect=TimeoutError("connection timeout")),
+        safety_shutdown=mock.Mock(),
+    )
+    app_model = object.__new__(AppModel)
+    app_model._hardware = hardware
+    app_model._system_message_handler = SimpleNamespace(input_queue=object())
+
+    result = app_model._initialize_pellet_controller_for_refresh()
+
+    assert result.state == "error"
+    assert "connection failed" in result.info
+    assert "connection timeout" in result.info
+    hardware.safety_shutdown.assert_called_once_with(
+        "startup hardware refresh failure: connection timeout",
+        wait=True,
+    )
 
 
 def test_acquisition_state_changes_do_not_replace_scan_snapshot(qapp):

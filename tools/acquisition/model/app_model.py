@@ -1232,9 +1232,14 @@ class AppModel(ObservableObject):
         scan_results["gpu"] = gpu_entry
         details.append(gpu_entry.info.splitlines()[0])
 
-        pellet_entry = self._pellet_controller_snapshot(can_adapter_entry)
+        pellet_entry = self._initialize_pellet_controller_for_refresh()
         scan_results["pellet"] = pellet_entry
-        details.append(pellet_entry.info)
+        details.append(pellet_entry.info.splitlines()[0])
+        if pellet_entry.state == "error":
+            warnings_list.append(
+                f"pellet controller initialization failed: "
+                f"{pellet_entry.info.splitlines()[-1].lstrip('→ ').strip()}"
+            )
 
         laser_configuration = self._laser.configuration
         if laser_configuration.backend == "disabled":
@@ -1279,20 +1284,39 @@ class AppModel(ObservableObject):
         log_hardware_initialization(logger, "READY | hardware refresh | %s", message)
         return message
 
-    def _pellet_controller_snapshot(self, adapter: HardwareScanEntry) -> HardwareScanEntry:
+    def _ensure_pellet_controller_connected(self) -> None:
+        if self._hardware.connected:
+            return
+        self._hardware.connect(self._system_message_handler.input_queue)
+
+    def _initialize_pellet_controller_for_refresh(self) -> HardwareScanEntry:
         hardware = self._hardware
         if not hardware.can_enabled or not hardware.pellet_controller_enabled:
             return HardwareScanEntry("– not in use", "disabled")
-        if hardware.connected:
-            return HardwareScanEntry("✓ controller session connected", "ok")
-        if adapter.state != "ok":
+        try:
+            self._ensure_pellet_controller_connected()
+            if not hardware.connected:
+                raise RuntimeError("controller did not report a connected session")
+        except Exception as exc:
+            error_text = str(exc) or exc.__class__.__name__
+            logger.exception("Pellet controller initialization during hardware refresh failed")
+            try:
+                hardware.safety_shutdown(
+                    f"startup hardware refresh failure: {error_text}",
+                    wait=True,
+                )
+            except Exception:
+                logger.exception("Pellet controller cleanup after refresh failure failed")
             return HardwareScanEntry(
-                "! not probed\n  ↳ CAN adapter not ready",
-                "warning",
+                f"! controller connection failed\n→ {error_text}",
+                "error",
             )
+
+        version = hardware.pellet_version
+        version_text = f" · firmware {version}" if version else ""
         return HardwareScanEntry(
-            "→ idle\n  ↳ controller connection starts with acquisition",
-            "idle",
+            f"✓ controller session connected{version_text}",
+            "ok",
         )
 
     @staticmethod
@@ -1936,7 +1960,7 @@ class AppModel(ObservableObject):
         hard = self._hardware
         controller_started = time.perf_counter()
         try:
-            hard.connect(self._system_message_handler.input_queue)
+            self._ensure_pellet_controller_connected()
         except Exception as exc:
             logger.exception("Acquisition hardware start failed; performing CAN safety shutdown")
             hard.safety_shutdown(

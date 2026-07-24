@@ -248,7 +248,8 @@ mkdir -p "$HOME/Documents/rawdatalocal"
 * System Mode - select Idle or Running. During transitions it explicitly shows
   Starting or Stopping acquisition.
 * Hardware Refresh - repeat the startup scan of camera sources, NI-DAQ devices,
-  and the physical CAN adapter while idle.
+  and the physical CAN adapter while idle, and establish the CAN/pellet
+  controller session.
 * Notes and Subject - set acquisition notes and select the current animal.
 * Training Mode and Protocol - select the active training workflow when the
   protocol UI is enabled.
@@ -259,10 +260,14 @@ collapsed and show only the category plus `Enabled` or `Disabled`; green,
 amber, red, blue-gray, and gray headers indicate ready, warning, failure, idle,
 and disabled states. Expand a category to see its scan and binding details. A
 scan runs once when the application opens; Hardware Refresh repeats it on
-demand. The result is a stable scan snapshot and is not cleared or rewritten
-when acquisition starts. `CAN Adapter` reports the physical PCIe device,
+demand. A successful scan leaves the pellet controller connected so
+acquisition can reuse the initialized session. The result is a stable scan
+snapshot and is not cleared or rewritten when acquisition starts. `CAN Adapter`
+reports the physical PCIe device,
 kernel driver, and Linux CAN interfaces separately from the `Pellet Controller`
-application session. Compact vertical detail lines show each PXI slot and card
+application session. Pellet Controller is green when its session is connected
+and red when initialization fails or its connection is lost. Compact vertical
+detail lines show each PXI slot and card
 model/product number, the configured CAN backend/interface, and the detected
 GPU model, memory, and driver.
 

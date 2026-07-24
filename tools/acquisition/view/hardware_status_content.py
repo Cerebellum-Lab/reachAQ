@@ -283,18 +283,27 @@ class HardwareStatusContent(ContentWidget):
     def _refresh_pellet_status(self) -> None:
         hardware = self._app_model.hardware
         is_enabled = hardware.pellet_controller_enabled
-        self._set_enabled("pellet", is_enabled)
-        scan_info, scan_state = self._scan_info("pellet")
+        scan_info, _ = self._scan_info("pellet")
+        is_connected = bool(getattr(hardware, "connected", False))
+        has_timed_out = bool(
+            getattr(hardware, "pellet_status_timeout_engaged", False)
+        )
         if not is_enabled:
             state = "disabled"
+            panel_state = "disabled"
         elif scan_info == "Not scanned":
             state = "not scanned"
-        elif "connected" in scan_info.lower():
+            panel_state = "idle"
+        elif has_timed_out:
+            state = "connection lost"
+            panel_state = "error"
+        elif is_connected:
             state = "connected"
-        elif "idle" in scan_info.lower():
-            state = "idle"
+            panel_state = "ok"
         else:
-            state = scan_state
+            state = "connection failed"
+            panel_state = "error"
+        self._set_enabled("pellet", is_enabled, panel_state)
         rows = [("pellet", self._pellet_binding(), state)]
         version = getattr(hardware, "pellet_version", "")
         rows.append(
@@ -307,7 +316,7 @@ class HardwareStatusContent(ContentWidget):
         self._set_info(
             "pellet",
             self._format_device_rows(rows, self._scan_notes(scan_info)),
-            scan_state,
+            panel_state,
         )
 
     def _refresh_gpu_status(self) -> None:
@@ -578,7 +587,12 @@ class HardwareStatusContent(ContentWidget):
 
     @invoke_method
     def _on_hardware_model_property_changed(self, property_name: str, _value, _):
-        if property_name == "pellet_version":
+        if property_name in {
+            "pellet_version",
+            "device_pellet_status_timeout_engaged",
+            "can_enabled",
+            "pellet_controller_enabled",
+        }:
             self._refresh_pellet_status()
 
     @invoke_method
