@@ -182,6 +182,9 @@ pixi.toml
 
 software
 
+# Local planning and handoff artifacts
+/temp/
+
 
 # test related:
 auto-trainer-inference/tests/data/20251015/agx001/trial015/20251015_agx001_trial015_centered3D.h5
