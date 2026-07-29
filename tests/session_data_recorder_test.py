@@ -87,6 +87,29 @@ def test_structured_device_ledger_captures_decoded_input_and_output():
         recorder.close()
 
 
+def test_device_events_are_buffered_before_record_is_armed():
+    handler = _EventSource("decoded_message_received")
+    laser = _EventSource("trace_received")
+    recorder = SessionDataRecorder(
+        _EventSource(),
+        object(),
+        laser,
+        system_message_handler=handler,
+    )
+    try:
+        handler.decoded_message_received(
+            SystemStatusMessageKind.STIMULUS_INPUTS,
+            {"tone1": True},
+            10.0,
+            100.0,
+        )
+
+        assert len(recorder._device_rows) == 1
+        assert recorder._device_rows[0][3] == "STIMULUS_INPUTS"
+    finally:
+        recorder.close()
+
+
 def test_laser_output_state_is_preserved_as_a_structured_event():
     analysis = _EventSource()
     laser = _EventSource("trace_received")
@@ -326,3 +349,39 @@ def test_missing_cam_frames_is_explicitly_host_estimated():
     assert alignment["status"] == "host_estimated"
     assert alignment["confidence"] == "host_estimated"
     assert alignment["matchedSampleIndex"] == 1
+
+
+def test_device_event_overrun_marks_session_incomplete(tmp_path):
+    project = ProjectInfo(
+        root=str(tmp_path),
+        device_id="test",
+        when=datetime(2026, 1, 2, 3, 4, 5),
+        session=4,
+    )
+
+    result = SessionDataRecorder._write_session(
+        project,
+        10.0,
+        100.0,
+        11.0,
+        (),
+        (),
+        (),
+        (),
+        device_event_overruns=3,
+    )
+
+    assert result["sessionComplete"] is False
+    assert "overran by 3 event(s)" in result["incompleteReasons"][0]
+    alignment = json.loads(
+        (
+            tmp_path
+            / "20260102"
+            / "test"
+            / "trial004"
+            / "streams"
+            / "alignment.json"
+        ).read_text()
+    )
+    assert alignment["sessionComplete"] is False
+    assert alignment["deviceEventOverruns"] == 3

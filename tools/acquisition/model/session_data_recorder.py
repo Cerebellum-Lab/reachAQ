@@ -60,6 +60,7 @@ class SessionDataRecorder:
         self._device_rows = deque(maxlen=device_event_capacity)
         self._device_event_capacity = int(device_event_capacity)
         self._device_event_overruns = 0
+        self._device_events_since_start = 0
         self._laser_rows = []
         self._log_rows = []
         self._nidaq_chunks = []
@@ -88,8 +89,7 @@ class SessionDataRecorder:
             # Keep this object reference so the recorder follows that atomic
             # session assignment without racing the first camera frame.
             self._project = project
-            self._device_rows = deque(maxlen=self._device_event_capacity)
-            self._device_event_overruns = 0
+            self._device_events_since_start = 0
             self._laser_rows = []
             self._log_rows = []
             self._nidaq_chunks = []
@@ -120,6 +120,11 @@ class SessionDataRecorder:
             self._start_perf = float(perf_time)
             self._start_wall = float(wall_time)
             self._boundary = boundary
+            self._device_events_since_start = sum(
+                1
+                for row in self._device_rows
+                if row[0] >= self._start_perf
+            )
 
     def stop(self, end_perf: float):
         self._stop_nidaq_thread()
@@ -135,7 +140,10 @@ class SessionDataRecorder:
             if boundary is not None:
                 boundary = boundary.with_end(end_perf)
             device_rows = tuple(self._device_rows)
-            device_event_overruns = self._device_event_overruns
+            device_event_overruns = max(
+                0,
+                self._device_events_since_start - self._device_event_capacity,
+            )
             laser_rows = tuple(self._laser_rows)
             log_rows = tuple(self._log_rows)
             nidaq_chunks = tuple(self._nidaq_chunks)
@@ -169,6 +177,8 @@ class SessionDataRecorder:
         if self._hardware_model is not None:
             self._hardware_model.device_event -= self._on_hardware_device_event
         logging.getLogger().removeHandler(self._log_handler)
+        with self._lock:
+            self._device_rows.clear()
 
     def add_log(self, perf_time: float, wall_time: float, message: str) -> None:
         with self._lock:
@@ -192,8 +202,7 @@ class SessionDataRecorder:
         self._start_perf = None
         self._start_wall = None
         self._boundary = None
-        self._device_rows = deque(maxlen=self._device_event_capacity)
-        self._device_event_overruns = 0
+        self._device_events_since_start = 0
         self._laser_rows = []
         self._log_rows = []
         self._nidaq_chunks = []
@@ -253,10 +262,13 @@ class SessionDataRecorder:
         device_index = getattr(data, "index", None)
         payload_json = self._payload_json(data)
         with self._lock:
-            if not self._armed:
-                return
             if len(self._device_rows) == self._device_rows.maxlen:
                 self._device_event_overruns += 1
+            if (
+                self._start_perf is not None
+                and float(perf_time) >= self._start_perf
+            ):
+                self._device_events_since_start += 1
             self._device_rows.append((
                 float(perf_time),
                 float(wall_time),
@@ -558,6 +570,11 @@ class SessionDataRecorder:
             nidaq_chunks,
             timing_plan,
         )
+        incomplete_reasons = []
+        if device_event_overruns:
+            incomplete_reasons.append(
+                f"decoded device event ring overran by {device_event_overruns} event(s)"
+            )
         alignment = {
             "schemaVersion": 1,
             "canonicalBoundary": {
@@ -608,6 +625,8 @@ class SessionDataRecorder:
                 None if timing_plan is None else dataclasses.asdict(timing_plan)
             ),
             "deviceEventOverruns": int(device_event_overruns),
+            "sessionComplete": not incomplete_reasons,
+            "incompleteReasons": incomplete_reasons,
             "enabledSources": list(source_manifest),
             "cameraNidaqAlignment": camera_nidaq_alignment,
             "toneConfirmation": tone_confirmation,
@@ -619,6 +638,8 @@ class SessionDataRecorder:
             "cameraNidaqAlignment": camera_nidaq_alignment,
             "toneConfirmation": tone_confirmation,
             "deviceEventOverruns": int(device_event_overruns),
+            "sessionComplete": not incomplete_reasons,
+            "incompleteReasons": tuple(incomplete_reasons),
         }
 
     @staticmethod
