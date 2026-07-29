@@ -641,6 +641,10 @@ class InferenceMonitorDataProc(multiprocessing.Process):
                     #
                     logger.debug("setting stop_recorded event")
                     self._stop_recorded.set()  # this is for the feeder thread to know when it can open the data files
+                    self._send_msg(
+                        InferenceMonitorDataMsg.LIVE_RECORDING_CLOSED,
+                        cur_local_prj,
+                    )
 
             cnt_data_received += 1
 
@@ -823,4 +827,3 @@ class InferenceMonitorDataProc(multiprocessing.Process):
                                  mode, type(pose_data), err)
 
         # end while self._is_running
-

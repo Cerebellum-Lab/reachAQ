@@ -78,6 +78,8 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
 
         self._data_monitor_watchdog_perf_c = mp_ctx.Value(ctypes.c_double, math.nan)
         self._data_monitor_proc: Optional[InferenceMonitorDataProc] = None
+        self._live_recording_closed_event = threading.Event()
+        self._live_recording_closed_session_id: Optional[str] = None
 
         self._pose_process_watchdog_perf_c = mp_ctx.Value(ctypes.c_double, math.nan)
         self._pose_process: Optional[PoseProcess] = None
@@ -467,6 +469,28 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
     def send_message(self, kind: InferenceCommandMessageKind, context: Any = None):
         self._send_message(kind, context)
 
+    def prepare_session_recording(self, project: ProjectInfo) -> None:
+        """Reset the pose-writer acknowledgement before camera recording starts."""
+        self._live_recording_closed_session_id = None
+        self._live_recording_closed_event.clear()
+
+    def wait_session_pose_closed(self, project: ProjectInfo, *, timeout: float = 10.0) -> bool:
+        """Wait until live pose/frame-index files for ``project`` have closed."""
+        if not self._is_enabled:
+            return True
+        expected_session_id = project.short_id
+        deadline = time.perf_counter() + timeout
+        while True:
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                return False
+            if not self._live_recording_closed_event.wait(min(0.1, remaining)):
+                continue
+            if self._live_recording_closed_session_id == expected_session_id:
+                return True
+            # A stale acknowledgement must not release a later session.
+            self._live_recording_closed_event.clear()
+
     def _send_message(self, kind: InferenceCommandMessageKind, context: Any = None):
         cmd_queue = self._cmd_queue
         # logger.debug("sending command msg %s qsize=%s", kind, cmd_queue.qsize())
@@ -534,6 +558,11 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
                 self.pose_response_ready(response)
             except Exception as err:
                 logger.exception("pose_response_ready event callback failed: %s", err)
+
+        elif msg is InferenceMonitorDataMsg.LIVE_RECORDING_CLOSED:
+            project = args[0]
+            self._live_recording_closed_session_id = project.short_id
+            self._live_recording_closed_event.set()
 
         elif msg is InferenceMonitorDataMsg.INTERSESSION_SEGMENTATION_FINISHED:
             self._cb_on_intersession_segmentation_finished(*args, **kwargs)
