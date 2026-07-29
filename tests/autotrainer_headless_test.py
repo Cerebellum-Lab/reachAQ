@@ -27,6 +27,10 @@ from autotrainer.video import CaptureCameraAttrs, VideoRecordMode
 from autotrainer.inference import GpuRuntimeStatus
 from tools.acquisition.model.app_model import AppModel
 from tools.acquisition.model.app_model_status import AppModelStatus
+from tools.acquisition.model.subsystem_status import (
+    SubsystemId,
+    SubsystemState,
+)
 from tools.acquisition.model.user_preferences import UserPreferences
 
 
@@ -153,6 +157,7 @@ def test_load_config_extra_reach_camera_slot(app_model, trainer_config_dir, syst
         id=CameraId.Camera3,
         name=CameraId.Camera3.name,
         is_enabled=True,
+        is_record_enabled=True,
         params=dict(width=300, height=200),
         scheme="random",
         record_prebuffer_duration=0,
@@ -256,6 +261,7 @@ def test_acquisition_owns_configured_signal_stream_lifecycle(app_model, monkeypa
         ),
         is_enabled=True,
     )
+    monitor.set_hardware_enabled(True)
     calls = []
     monkeypatch.setattr(monitor, "start", lambda: calls.append("start") or True)
     monkeypatch.setattr(monitor, "stop", lambda: calls.append("stop"))
@@ -267,7 +273,7 @@ def test_acquisition_owns_configured_signal_stream_lifecycle(app_model, monkeypa
     assert "stop" in calls[1:]
 
 
-def test_gpu_preflight_fails_before_cameras_and_hardware(
+def test_gpu_preflight_failure_does_not_block_cameras_and_hardware(
     app_model,
     system_config,
     trainer_config_dir,
@@ -290,15 +296,24 @@ def test_gpu_preflight_fails_before_cameras_and_hardware(
         ),
     )
 
-    def unexpected_hardware_start(*_args, **_kwargs):
-        raise AssertionError("hardware must not start after a failed GPU preflight")
+    start_reach = mock.Mock(return_value=True)
+    start_can = mock.Mock(return_value=False)
+    monkeypatch.setattr(app_model, "_start_reach_camera_domains", start_reach)
+    monkeypatch.setattr(
+        app_model,
+        "_start_top_camera_domain",
+        mock.Mock(return_value=False),
+    )
+    monkeypatch.setattr(app_model, "_start_can_domain", start_can)
 
-    monkeypatch.setattr(app_model.hardware, "connect", unexpected_hardware_start)
-    for camera in app_model.cameras:
-        monkeypatch.setattr(camera, "on_prepare_capture", unexpected_hardware_start)
+    assert app_model.capture_start() is True
 
-    assert app_model.capture_start() is False
-    assert app_model.acquisition_started is False
+    start_reach.assert_called_once()
+    start_can.assert_called_once_with(wait_connected=True)
+    assert app_model.acquisition_started is True
+    inference = app_model.subsystem_statuses[SubsystemId.LIVE_INFERENCE.value]
+    assert inference.state is SubsystemState.FAILED
+    assert "nouveau" in inference.error
 
 
 def test_hardware_start_failure_performs_can_safety_shutdown(
@@ -311,14 +326,16 @@ def test_hardware_start_failure_performs_can_safety_shutdown(
     safety_shutdown = mock.Mock()
     monkeypatch.setattr(app_model.hardware, "safety_shutdown", safety_shutdown)
 
-    with pytest.raises(RuntimeError, match="connection timeout"):
-        app_model.capture_start()
+    assert app_model.capture_start() is True
 
     safety_shutdown.assert_any_call(
-        "acquisition start failure: connection timeout",
+        "CAN/pellet initialization failure: connection timeout",
         wait=True,
     )
-    assert app_model.acquisition_started is False
+    can_status = app_model.subsystem_statuses[SubsystemId.CAN_PELLET.value]
+    assert can_status.state is SubsystemState.FAILED
+    assert can_status.error == "connection timeout"
+    assert app_model.acquisition_started is True
     assert app_model._acquisition_starting is False
 
 
