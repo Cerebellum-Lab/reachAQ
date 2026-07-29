@@ -806,7 +806,8 @@ class VideoCapture(Process):
                         if msg_q is not None:
                             msg_q.put((SystemStatusMessageKind.CAMERA_STATUS_CHANGE,
                                        (self._camera_idx, CaptureProcessStatus.RECORDING,
-                                        first_frame_p_now, first_frame_when, first_frame_time)))
+                                        first_frame_p_now, first_frame_when,
+                                        first_frame_time, first_frame_id)))
 
                 elif not is_record_active and record_start_stop_frame_idx is not None:
                     secondary_acquire()

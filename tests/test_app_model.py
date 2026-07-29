@@ -1,4 +1,5 @@
 import math
+import json
 from pathlib import Path
 from unittest import mock
 
@@ -9,6 +10,7 @@ from autotrainer.core.configuration.persistence_configuration import Persistence
 from autotrainer.behavior.behavior_algorithm import BehaviorAlgoStatus
 from tools.acquisition.model.app_model import app_status_to_api_app_mode, app_status_to_behavior_algo_status
 from tools.acquisition.model.app_model_status import AppModelStatus, SessionRecordingStatus
+from tools.acquisition.model.session_boundary import SessionBoundary
 
 from autotrainer.api import ApiApplicationMode
 
@@ -149,6 +151,14 @@ def test_abort_removes_whole_session_and_resets_counts(app_model):
 
 def test_stop_finishes_auxiliary_data_after_raw_writers_close(app_model):
     app_model._pending_session_end_perf = 12.5
+    app_model._session_boundary = SessionBoundary(
+        session_id=app_model.project.short_id,
+        primary_camera="left",
+        primary_frame_id=42,
+        start_perf_time=10.0,
+        start_wall_time=100.0,
+        camera_when=1_000_000.0,
+    )
     app_model._session_analysis_finished = False
     app_model._set_session_recording_status(SessionRecordingStatus.STOPPING)
 
@@ -165,6 +175,37 @@ def test_stop_finishes_auxiliary_data_after_raw_writers_close(app_model):
         caller="raw_writers_closed",
     )
     assert app_model.session_recording_status is SessionRecordingStatus.ANALYZING
+
+
+def test_final_metadata_uses_canonical_boundary_not_stale_project_timestamp(
+    app_model,
+    tmp_path,
+):
+    project = app_model.project.to_local_value()
+    project.start_record_timestamp = math.nan
+    app_model._session_boundary = SessionBoundary(
+        session_id=project.short_id,
+        primary_camera="left",
+        primary_frame_id=42,
+        start_perf_time=10.0,
+        start_wall_time=1_800_000_000.25,
+        camera_when=1_000_000.0,
+        end_perf_time=12.0,
+        end_wall_time=1_800_000_002.25,
+    )
+    output = tmp_path / "metadata"
+
+    app_model._save_metadata(
+        project,
+        project.when,
+        str(output),
+        project.session,
+    )
+
+    saved = json.loads(output.with_suffix(".json").read_text())
+    assert saved["start_record_timestamp"] == 1_800_000_000.25
+    assert saved["sessionBoundary"]["startWallTime"] == 1_800_000_000.25
+    assert saved["sessionBoundary"]["endPerfTime"] == 12.0
 
 
 def test_record_start_timeout_aborts_partial_session(app_model):

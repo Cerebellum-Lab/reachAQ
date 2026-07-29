@@ -108,6 +108,7 @@ from tools.acquisition.model.nidaq_discovery import device_name_from_channel, di
 from tools.acquisition.model.nidaq_channel_plan import build_nidaq_acquisition_configuration
 from tools.acquisition.model.nidaq_signal_monitor_model import NidaqSignalMonitorModel
 from tools.acquisition.model.session_data_recorder import SessionDataRecorder
+from tools.acquisition.model.session_boundary import SessionBoundary
 from tools.acquisition.model.behavior_model import BehaviorModel
 from tools.acquisition.model.user_preferences import UserPreferences, get_default_animals_location
 from tools.acquisition.model.video_capture_model import (
@@ -321,6 +322,7 @@ class AppModel(ObservableObject):
         self._session_analysis_started_perf: Optional[float] = None
         self._session_analysis_duration_seconds: Optional[float] = None
         self._pending_session_end_perf: Optional[float] = None
+        self._session_boundary: Optional[SessionBoundary] = None
         self._aborting_project: Optional[ProjectInfo] = None
         self._aborted_session_ids = set()
         self._abort_had_recording_started = False
@@ -733,6 +735,7 @@ class AppModel(ObservableObject):
         self._session_analysis_started_perf = None
         self._session_analysis_duration_seconds = None
         self._pending_session_end_perf = None
+        self._session_boundary = None
         self._abort_had_recording_started = False
         self._set_session_recording_status(SessionRecordingStatus.ARMING)
         project = self._project_info
@@ -1138,6 +1141,24 @@ class AppModel(ObservableObject):
                     project = self._project_info
                     if project is not None:
                         project.start_record_timestamp = first_frame_time
+                        primary = next(
+                            camera
+                            for camera in self._cameras
+                            if camera.camera_index == cam_idx
+                        )
+                        first_frame_id = (
+                            int(r_args[0])
+                            if r_args
+                            else int(self._cams_synced_frame_index.value)
+                        )
+                        self._session_boundary = SessionBoundary(
+                            session_id=project.short_id,
+                            primary_camera=primary.name,
+                            primary_frame_id=first_frame_id,
+                            start_perf_time=float(first_frame_perf),
+                            start_wall_time=float(first_frame_time),
+                            camera_when=float(first_frame_when),
+                        )
                     self._session_data_recorder.commit_start(first_frame_perf, first_frame_time)
                     self._record_start_timer.cancel()
                     self._record_start_timer = no_op_timer
@@ -2965,6 +2986,13 @@ class AppModel(ObservableObject):
         if end_perf is None:
             end_perf = get_perf_now()
             logger.warning("Primary camera did not report a final recorded-frame timestamp")
+        boundary = self._session_boundary
+        if boundary is None or boundary.session_id != project.short_id:
+            raise RuntimeError(
+                f"Missing canonical recording boundary for {project.short_id}"
+            )
+        self._session_boundary = boundary.with_end(end_perf)
+        project.start_record_timestamp = self._session_boundary.start_wall_time
         try:
             self._session_data_recorder.stop(end_perf)
         except Exception as err:
@@ -3019,6 +3047,7 @@ class AppModel(ObservableObject):
             self._behavior.algorithm.reset_session_counts()
             self._session_data_recorder.abort()
             self._pending_session_end_perf = None
+            self._session_boundary = None
             self._session_analysis_finished = True
             self._session_analysis_started_perf = None
             self._session_analysis_duration_seconds = None
@@ -3275,15 +3304,30 @@ class AppModel(ObservableObject):
         )
         if session is not None and session < 0:
             session = project_info.session  # ensure use this one
+        if caller in {"raw_writers_closed", "session_analysis_ended"}:
+            boundary = self._session_boundary
+            if boundary is None or boundary.session_id != project_info.short_id:
+                raise RuntimeError(
+                    f"Cannot finalize {project_info.short_id} without a canonical "
+                    "recording boundary"
+                )
         self._save_metadata(project_info, when, file_name, session)
 
     def _save_metadata(self, project: ProjectInfo, when: datetime, file_name: str, session: Optional[int] = -1):
         when_as_utc = when.astimezone(timezone.utc)
+        boundary = self._session_boundary
+        if boundary is not None and boundary.session_id == project.short_id:
+            start_record_timestamp = boundary.start_wall_time
+            session_boundary = boundary.to_metadata()
+        else:
+            start_record_timestamp = project.start_record_timestamp
+            session_boundary = None
         info: Dict[str, Any] = {
             "date": when.strftime("%Y%m%d_%H%M%S"),
             "created": when.timestamp(),
             "createdUtc": when_as_utc.timestamp(),  # same than created
-            "start_record_timestamp": project.start_record_timestamp,
+            "start_record_timestamp": start_record_timestamp,
+            "sessionBoundary": session_boundary,
             "serialNumber": self._preferences.serial_number or "",
             "appVersion": self._app_version,
             "animalName": self.animal_name,
