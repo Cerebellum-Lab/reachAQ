@@ -256,6 +256,25 @@ unknown_attribute: 42
         SystemConfiguration.load_yaml(io.StringIO(config_text))
 
 
+def test_version_56_drops_removed_pellet_limit_fields():
+    config_text = """
+!SystemConfiguration
+version: 56
+behavior: !BehaviorConfiguration
+  pelletDelivery: !PelletDeliveryConfiguration
+    isEnabled: true
+    maxPelletsPerSession: 20
+    maxPelletsPerDay: 100
+"""
+
+    cfg = SystemConfiguration.load_yaml(io.StringIO(config_text))
+
+    assert cfg.version == 56
+    assert cfg.behavior.pellet_delivery.is_enabled is True
+    assert not hasattr(cfg.behavior.pellet_delivery, "max_pellets_per_session")
+    assert not hasattr(cfg.behavior.pellet_delivery, "max_pellets_per_day")
+
+
 def test_higher_version_drop_unknown_config_items():
     config_text = f"""
 !SystemConfiguration

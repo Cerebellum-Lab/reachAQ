@@ -2,7 +2,7 @@
 # Use this when you want the app to start without physical camera hardware.
 
 !SystemConfiguration
-version: 56
+version: 57
 cameras:
 - !CameraConfiguration
   id: 0
