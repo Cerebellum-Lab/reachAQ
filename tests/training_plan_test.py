@@ -24,7 +24,7 @@ from tools.acquisition.model.app_model import AppModel
 from tools.acquisition.model.app_model_status import AppModelStatus
 from tools.acquisition.model.inference_model import InferenceModel
 from tools.acquisition.model.training_plan import get_plan_id
-from top_fixtures import MockSystemMachine, FifoExitStack
+from top_fixtures import MockSystemMachine
 
 this_dir = Path(__file__).parent.resolve()
 
@@ -210,9 +210,9 @@ class TestTrainingPlan(BaseTrainingPlan):
         assert "Received processed shift xyz: (0, 3.0, -1.2)" in caplog.text, \
             "should be the some avg/mean of the 2 previous sessions, with limits applied"
 
-        assert algo.pellet_consumed_total == sum(r.food_consumed for r in results)
-        assert algo.successful_reaches_total == sum(r.successful_reaches for r in results)
-        assert algo.pellets_presented_total == nb_session
+        assert algo.pellets_consumed == results[-1].food_consumed
+        assert algo.successful_reaches == results[-1].successful_reaches
+        assert algo.pellets_presented == 1
 
         prev_phase = plan.current_phase
         #
@@ -255,11 +255,14 @@ class TestTrainingPlan(BaseTrainingPlan):
         self.mock_pose_response(pellet_seen=True)
         self.mock_pellet_ack(until_none=True)
         #
-        # self._load_cell.is_engaged = True
-        self.start_session_in_tunnel(set_recording_status=True)
+        if machine.tunnel_headfix_enabled:
+            self.start_session_in_tunnel(set_recording_status=True)
+        else:
+            assert algo.start_session(reason="manual")
+            algo.set_capture_status(CaptureProcessStatus.RECORDING)
         self.mock_pellet_ack(until_none=True)
         #
-        assert machine.state == SystemState.tunnel
+        assert machine.state in {SystemState.cage, SystemState.tunnel}
         self.mock_pose_response(pellet_seen=True)
         self.mock_pellet_ack(until_none=True)
         assert algo.pellet_recently_seen
@@ -302,7 +305,10 @@ class TestTrainingPlan(BaseTrainingPlan):
             stack.enter_context(self.mock_perform_segmentation())
             stack.enter_context(self.mock_perform_detection())
             assert pellet_m.state == PelletState.monitoring  # still
-            self._load_cell.is_engaged = False  # exit tunnel
+            if machine.state == SystemState.tunnel:
+                self.exit_tunnel()
+            else:
+                algo.end_capture_session()
             assert not algo.is_in_session
             assert algo.system_state == SystemState.intersession
             assert algo.intersession_state == IntersessionState.segmentation
@@ -330,47 +336,3 @@ class TestTrainingPlan(BaseTrainingPlan):
         assert machine.state == SystemState.cage  # still ofc.
 
         self.increment_perf_now(1)
-
-
-@pytest.mark.xfail(True, reason="todo: smth blocking..")  # TODO
-class TestWithBatch(BaseTrainingPlan):
-
-    def test_plan_gets_batch_events(self, app_model, user_pref, machine, caplog):
-        algo = self.algo
-        algo.batch_session_recording_config.enabled = True
-        max_batch_size = algo.batch_session_recording_config.maximum_batch_size = 3
-        algo.update_pellet_seen(True)
-
-        self.ack_pending_tokens()
-
-        self.start_session_in_tunnel()
-
-        assert algo.is_in_session
-
-        def fake_mouse_eat_pellet():
-            logger.info("before pellet_seen=False")
-            self.mock_pose_response(pellet_seen=False, mouse_seen=True)
-            self.increment_perf_now(algo.pellet_missing_time)
-            self.mock_pose_response(pellet_seen=False, mouse_seen=True)
-            assert self.pellet.state == PelletState.loading
-            # self.mock_pellet_ack(until_none=True)
-            logger.info("acked pellet_seen=False")
-            self.mock_pose_response(pellet_seen=True, mouse_seen=True)
-            self.mock_pellet_ack(until_none=True)
-            self.ack_pending_tokens()
-            logger.info("after pellet_seen=True")
-
-        def conc(ix):
-            logger.info("concurrent %s", ix)
-
-        with FifoExitStack() as stack:
-            for idx in range(max_batch_size):
-                assert machine.state == SystemState.tunnel
-                self.mock_pose_response(pellet_seen=True, mouse_seen=True)
-                assert algo.is_in_session
-                stack.enter_context(self.mock_intersession_analysis(
-                    concurrent_func=lambda i=idx: conc(i)
-                ))
-                fake_mouse_eat_pellet()
-            self.exit_tunnel()
-        logger.info("all done")

@@ -27,6 +27,7 @@ from autotrainer.device import MotorConfigurationFile, CompoundMovements
 from autotrainer.inference.analysis import IntersessionResponse
 
 from autotrainer.core.capture import CaptureProcessStatus
+from autotrainer.core.interfaces import RecordingEndingReason
 from autotrainer.inference import PoseAlgorithm, PoseResponse, InferenceStatus
 
 from autotrainer.behavior import TunnelDeviceProtocol, SystemMachine, PelletDeviceProtocol, BehaviorAlgorithm, \
@@ -393,7 +394,6 @@ class MockSystemMachine:
     def _init(self, machine: SystemMachine):
         self._machine: SystemMachine = machine
         self.project = machine.project
-        self._load_cell = machine._analysis.load_cell_monitor  # noqa
         # register state_changed (and system_state_changed for algo at end) transition recorder,
         # so that can be used to ensure/assert that the given states have passed through all the desired values,
         # and in any desired specific order - or not.
@@ -455,10 +455,8 @@ class MockSystemMachine:
         algo = self.algo
         assert not algo.is_in_session
         assert self._machine.state == SystemState.cage
-        self.make_load_cell_active()
-        self.sensor_analysis.load_cell_monitor.is_engaged = True
         self._machine.enter_tunnel(reason="manual")
-        # algo.start_session(reason="manual")
+        algo.start_session(reason="manual")
         if set_recording_status:
             algo.set_capture_status(CaptureProcessStatus.RECORDING)
         # assert algo.is_in_session
@@ -466,12 +464,9 @@ class MockSystemMachine:
 
     def exit_tunnel(self):
         assert self._machine.state != SystemState.cage
-        load_cell = self.sensor_analysis.load_cell_monitor
-        if load_cell.is_engaged:
-            logger.info("exiting tunnel with load-cell")
-            load_cell.is_engaged = False
-        else:
-            logger.info("exiting tunnel with manual")
+        if self.algo.is_in_session:
+            self.algo.end_capture_session(reason=RecordingEndingReason.MANUAL_STOP)
+        if self._machine.state == SystemState.tunnel:
             self._machine.exit_tunnel(reason="manual")
 
     @contextlib.contextmanager
@@ -600,25 +595,6 @@ class MockSystemMachine:
         # make sure we are beyond the required pellet missing time:
         self.increment_perf_now(self._machine.algorithm.pellet_missing_time + 1e-9)
         self.mock_pose_response(pellet_seen=False, mouse_seen=mouse_seen)
-
-    def make_load_cell_active(self):
-        # NB: this could be moved to auto-trainer-core (where load_cell_monitor is defined),
-        # so to be reused by auto-trainer-core/tests dedicated to load cell monitor.
-        batch_count = self._load_cell._engaged_batch_count
-        for _ in range(2 * batch_count):
-            self.increment_perf_now(self._load_cell.config.threshold_duration / batch_count + 0.001)
-            p_now = self.get_current_perf_now()
-            self._load_cell.update(
-                self._load_cell.config.weight_active_threshold + 0.001, time.time(), int(p_now * 1e9)
-            )
-
-    def make_load_cell_inactive(self):
-        batch_count = self._load_cell._engaged_batch_count
-        for _ in range(3 * batch_count):
-            self.increment_perf_now(self._load_cell.config.min_post_event_hold_duration / batch_count + 0.001)
-            p_now = self.get_current_perf_now()
-            self._load_cell.update(
-                self._load_cell.config.weight_inactive_threshold - 0.001, time.time(), int(p_now * 1e9))
 
     def make_recording_aged_enough(self):
         algo = self._machine.algorithm

@@ -105,7 +105,8 @@ Status still lists every discovered serial for connection diagnostics.
   isEnabled: true
   isRecordEnabled: true
   recordMode: 1
-  recordPrebufferDuration: 1.0
+  # Manual recordings begin at the first frame after Record; prebuffer is disabled.
+  recordPrebufferDuration: 0
   scheme: spinnaker
   host: '24152533'
   port: 0
