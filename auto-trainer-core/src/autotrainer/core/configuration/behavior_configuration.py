@@ -71,14 +71,6 @@ class ShiftXYZHandlerConfig:
 
 
 @dataclass
-class AutoCloseGateOnIntersessionConfiguration:
-
-    enabled: bool = False  # enabled/disabled
-    session_min_duration: float = 5  # do not try close gate if session duration shorter than this
-    delay_after_cage_enter: float = 2.5  # only close gate once this delay since cage enter has elapsed
-
-
-@dataclass
 class HomeOnExcessiveDriftDistanceConfiguration:
     """Execute, when in monitoring (should equal to be in deliver position), home to reset motors if measured drift distance is higher than threshold"""
 
@@ -122,8 +114,6 @@ class PelletDeliveryConfiguration:
     is_intersession_analysis_enabled: bool = False
     is_intersession_pellet_shift_enabled: bool = True
 
-    max_pellets_per_session: int = 10  # actually unused
-    max_pellets_per_day: int = 50  # actually unused
     max_pellet_missing_seconds: float = 1.0  # how long to wait before load pellet when pellet missing/not seen
     # this help ensure we don't execute a load pellet if we get an incorrect pose_result with pellet seen == False,
     # which can happen eventually (missed inference detection basically).
@@ -210,7 +200,6 @@ class _BehaviorConfiguration:
     emergency_alarm: EmergencyAlarmConfiguration = field(default_factory=EmergencyAlarmConfiguration)
     topcam_presence_detection: PresenceDetectionConfig = field(default_factory=PresenceDetectionConfig)
     auto_tunnel_sweep: AutoTunnelSweepConfiguration = field(default_factory=AutoTunnelSweepConfiguration)
-    auto_close_gate_on_intersession: AutoCloseGateOnIntersessionConfiguration = field(default_factory=AutoCloseGateOnIntersessionConfiguration)
     home_on_excessive_drift_distance: HomeOnExcessiveDriftDistanceConfiguration = field(default_factory=HomeOnExcessiveDriftDistanceConfiguration)
     cage_cleaning: CageCleaningConfig = field(default_factory=CageCleaningConfig)
     autoclamp_evasion_detector: AutoClampEvasionDetectorConfig = field(default_factory=AutoClampEvasionDetectorConfig)
@@ -235,6 +224,9 @@ class _BehaviorConfiguration:
     @classmethod
     def from_version_one(cls, content: Dict):
         headclamp = content.get("head_clamp", {})
+        pellet_delivery = dict(content.get("pellet_delivery", {}))
+        pellet_delivery.pop("max_pellets_per_session", None)
+        pellet_delivery.pop("max_pellets_per_day", None)
         headclamp.pop('max_baseline_intensity')
         headclamp.pop('baseline_intensity_increment')
         baseline = headclamp.pop('min_baseline_intensity')
@@ -243,7 +235,7 @@ class _BehaviorConfiguration:
         return cls(
             headbar_pressure=HeadbarPressureConfiguration(**content.get("headbar_pressure", {})),
             head_clamp=HeadClampConfiguration(**headclamp),
-            pellet_delivery=PelletDeliveryConfiguration(**content.get("pellet_delivery", {})),
+            pellet_delivery=PelletDeliveryConfiguration(**pellet_delivery),
         )
 
 
@@ -256,13 +248,18 @@ class BehaviorConfiguration(_BehaviorConfiguration):
                  mouse_presence=None,  # temporarily to be back-compatible with previous
                  auto_end_session=None,
                  batch_session_recording=None,
+                 auto_close_gate_on_intersession=None,
                  load_cell=None,
                  auto_tare=None,
                  **kwargs):
         if mouse_presence is not None:
             logger.notice("Dropping previous mouse_presence config, new default one will be used. dropped entry: %s",
                           mouse_presence)
-        if auto_end_session is not None or batch_session_recording is not None:
+        if (
+            auto_end_session is not None
+            or batch_session_recording is not None
+            or auto_close_gate_on_intersession is not None
+        ):
             logger.notice("Dropping obsolete automatic recording trigger configuration")
         if load_cell is not None or auto_tare is not None:
             logger.notice("Dropping obsolete weight-sensor configuration")
@@ -281,7 +278,6 @@ _tag_2_cls = dict(
     PresenceDetectionConfiguration=PresenceDetectionConfig,
     ExternalDoorsMonitorConfiguration=ExternalDoorsAlarmConfig,
     AutoTunnelSweepConfiguration=AutoTunnelSweepConfiguration,
-    AutoCloseGateOnIntersessionConfiguration=AutoCloseGateOnIntersessionConfiguration,
     HomeOnExcessiveDriftDistance=HomeOnExcessiveDriftDistanceConfiguration,  # missed Configuration suffix
     # ShiftXYZTarget="ShiftXYZTarget",  # replaced by Offset3dTuple.
     ShiftXYZHandlerConfiguration=ShiftXYZHandlerConfig,
@@ -325,6 +321,10 @@ def add_behavior_configuration_constructors(safe_loader: Type[yaml.SafeLoader]):
     )
     safe_loader.add_constructor(
         "!BatchSessionRecordingConfiguration",
+        obsolete_recording_trigger,
+    )
+    safe_loader.add_constructor(
+        "!AutoCloseGateOnIntersessionConfiguration",
         obsolete_recording_trigger,
     )
     safe_loader.add_constructor(

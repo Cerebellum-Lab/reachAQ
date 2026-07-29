@@ -228,16 +228,6 @@ class TunnelHardwareProtocol(Protocol):
 
 #
 
-class BatchAnalysisStartingEvent:
-    def __call__(self, *, batch_len: int):
-        """When a session batch analysis starts"""
-
-
-class BatchAnalysisEndingEvent:
-    def __call__(self, *, failed_count: int):
-        """When a session batch analysis is finished"""
-
-
 class BehaviorAlgoEvents:
     """Define the behavior algo events and their signature"""
     # NB: *assigned/defined* here,
@@ -248,9 +238,6 @@ class BehaviorAlgoEvents:
     session_capture_ending = EventHandler[Callable[[RecordingEndingReason], None]]
 
     session_processing_starting = EventHandler[Callable[[], None]]
-
-    batch_analysis_starting = EventHandler[BatchAnalysisStartingEvent]
-    batch_analysis_ending = EventHandler[BatchAnalysisEndingEvent]
 
     session_ending = EventHandler[Callable[[ProjectInfo, CaptureAnalysisResult], None]]
 
