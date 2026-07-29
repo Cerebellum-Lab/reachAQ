@@ -298,6 +298,24 @@ def test_reach_secondaries_are_armed_before_primary_first_frame_validation(
     assert events.index("arm:primary") < events.index("frame:secondary")
 
 
+def test_standalone_camera_role_is_restored_for_synchronized_capture(app_model):
+    primary, secondary = app_model.reach_cameras[:2]
+    primary._configured_is_primary = True
+    secondary._configured_is_primary = False
+    primary.is_enabled = False
+    secondary.is_enabled = True
+
+    app_model._ensure_reach_primary_camera()
+
+    assert secondary.is_primary
+
+    primary.is_enabled = True
+    app_model._ensure_reach_primary_camera()
+
+    assert primary.is_primary
+    assert not secondary.is_primary
+
+
 def test_can_start_failure_is_scoped_to_can_domain(app_model):
     app_model.hardware._can_enabled = True
     app_model.hardware._pellet_controller_enabled = True

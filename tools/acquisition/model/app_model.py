@@ -1091,8 +1091,11 @@ class AppModel(ObservableObject):
             camera for camera in self._reach_cameras
             if camera.is_enabled
         ]
-        if len(enabled_cameras) > 0 and not any(camera.is_primary for camera in enabled_cameras):
+        if len(enabled_cameras) == 1:
             enabled_cameras[0].set_runtime_primary(True)
+            return
+        for camera in enabled_cameras:
+            camera.set_runtime_primary(camera.configured_is_primary)
 
     @staticmethod
     def _camera_timing_field_name(camera: VideoCaptureModel) -> str:

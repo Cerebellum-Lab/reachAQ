@@ -197,6 +197,7 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
         self._cur_conf: CameraConfiguration = CameraConfiguration()
         self._is_enabled = True
         self._is_primary = False
+        self._configured_is_primary = False
 
         self._record_mode = VideoRecordMode.TRIGGER
         self._is_recording_enabled = False
@@ -358,8 +359,31 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
     def is_primary(self) -> bool:
         return self._is_primary
 
+    @property
+    def configured_is_primary(self) -> bool:
+        return self._configured_is_primary
+
     def set_runtime_primary(self, is_primary: bool) -> None:
         self._is_primary = is_primary
+
+    def _runtime_camera_url(self) -> str:
+        """Apply the effective capture role without mutating saved configuration."""
+        camera_url = self._camera_source.url
+        parsed = urllib.parse.urlsplit(camera_url)
+        if parsed.scheme.lower() != "spinnaker":
+            return camera_url
+        query = [
+            (name, value)
+            for name, value in urllib.parse.parse_qsl(
+                parsed.query,
+                keep_blank_values=True,
+            )
+            if name.lower() not in {"primary", "secondary"}
+        ]
+        query.append(("primary", "yes" if self._is_primary else "no"))
+        return urllib.parse.urlunsplit(
+            parsed._replace(query=urllib.parse.urlencode(query))
+        )
 
     @property
     def shape(self) -> Tuple[int, int]:
@@ -458,10 +482,11 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
         self._video_reader_initialize()
 
         if self._camera_source is not None:
-            if "?" in self._camera_source.url:
-                url = self._camera_source.url + f"&name={self._name}"
+            camera_url = self._runtime_camera_url()
+            if "?" in camera_url:
+                url = camera_url + f"&name={self._name}"
             else:
-                url = self._camera_source.url + f"?name={self._name}"
+                url = camera_url + f"?name={self._name}"
 
             camera = CaptureCameraAttrs(name=self._name, url=url)
 
@@ -568,7 +593,12 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
         self.is_still_capture_enabled = conf.is_still_image_capture_enabled
         self.still_image_capture_interval = conf.still_image_capture_interval
         raw_primary = conf.params.get("primary") or "false"
-        self._is_primary = raw_primary.lower() in {"yes", "true", "1", "on"} if isinstance(raw_primary, str) else raw_primary is True
+        self._configured_is_primary = (
+            raw_primary.lower() in {"yes", "true", "1", "on"}
+            if isinstance(raw_primary, str)
+            else raw_primary is True
+        )
+        self._is_primary = self._configured_is_primary
 
         url = f"{conf.scheme}://{conf.host}"
 
