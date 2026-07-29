@@ -21,12 +21,27 @@ class SharedSampleRead:
     generation: int
     source_perf_time: float
     source_wall_time: float
+    epoch_start_sample_index: int
+    epoch_start_perf_time: float
+    epoch_start_wall_time: float
     overrun_samples: int
     gap_count: int
 
     @property
     def sample_count(self) -> int:
         return self.end_sample_index - self.start_sample_index
+
+    def perf_times(self, sample_indices: np.ndarray) -> np.ndarray:
+        return self.epoch_start_perf_time + (
+            np.asarray(sample_indices, dtype=np.float64)
+            - self.epoch_start_sample_index
+        ) / self.sample_rate_hz
+
+    def wall_times(self, sample_indices: np.ndarray) -> np.ndarray:
+        return self.epoch_start_wall_time + (
+            np.asarray(sample_indices, dtype=np.float64)
+            - self.epoch_start_sample_index
+        ) / self.sample_rate_hz
 
 
 class SharedNidaqSampleRing:
@@ -68,6 +83,9 @@ class SharedNidaqSampleRing:
         self._valid_sample_count = self._mp_ctx.RawValue("Q", 0)
         self._source_perf_time = self._mp_ctx.RawValue("d", 0.0)
         self._source_wall_time = self._mp_ctx.RawValue("d", 0.0)
+        self._epoch_start_sample_index = self._mp_ctx.RawValue("q", 0)
+        self._epoch_start_perf_time = self._mp_ctx.RawValue("d", 0.0)
+        self._epoch_start_wall_time = self._mp_ctx.RawValue("d", 0.0)
         self._gap_count = self._mp_ctx.RawValue("Q", 0)
         self._values_view = None
 
@@ -102,6 +120,9 @@ class SharedNidaqSampleRing:
         self._valid_sample_count.value = 0
         self._source_perf_time.value = 0.0
         self._source_wall_time.value = 0.0
+        self._epoch_start_sample_index.value = 0
+        self._epoch_start_perf_time.value = 0.0
+        self._epoch_start_wall_time.value = 0.0
         self._gap_count.value = 0
         self._epoch.value += 1
         self._generation.value = 0
@@ -131,6 +152,10 @@ class SharedNidaqSampleRing:
             if previous_valid and int(block.sample_index) != previous_end:
                 self._gap_count.value += 1
                 previous_valid = 0
+                self._epoch.value += 1
+                self._set_epoch_anchor(block)
+            elif previous_valid == 0:
+                self._set_epoch_anchor(block)
 
             position = start_sample_index % self.capacity
             first_count = min(write_count, self.capacity - position)
@@ -162,8 +187,8 @@ class SharedNidaqSampleRing:
                 self.capacity,
                 write_count if previous_valid == 0 else previous_valid + write_count,
             )
-            self._source_perf_time.value = time.perf_counter()
-            self._source_wall_time.value = time.time()
+            self._source_perf_time.value = float(block.perf_time)
+            self._source_wall_time.value = float(block.wall_time)
             self._generation.value += 1
         except BaseException:
             self._valid_sample_count.value = 0
@@ -206,6 +231,9 @@ class SharedNidaqSampleRing:
         epoch = int(self._epoch.value)
         source_perf_time = float(self._source_perf_time.value)
         source_wall_time = float(self._source_wall_time.value)
+        epoch_start_sample_index = int(self._epoch_start_sample_index.value)
+        epoch_start_perf_time = float(self._epoch_start_perf_time.value)
+        epoch_start_wall_time = float(self._epoch_start_wall_time.value)
         gap_count = int(self._gap_count.value)
         sequence_after = int(self._write_sequence.value)
         if sequence_before != sequence_after or sequence_after & 1:
@@ -218,6 +246,9 @@ class SharedNidaqSampleRing:
             generation=generation,
             source_perf_time=source_perf_time,
             source_wall_time=source_wall_time,
+            epoch_start_sample_index=epoch_start_sample_index,
+            epoch_start_perf_time=epoch_start_perf_time,
+            epoch_start_wall_time=epoch_start_wall_time,
             overrun_samples=overrun_samples,
             gap_count=gap_count,
         )
@@ -230,3 +261,21 @@ class SharedNidaqSampleRing:
             end_sample_index = int(self._end_sample_index.value)
             if sequence_before == int(self._write_sequence.value):
                 return end_sample_index
+
+    def _set_epoch_anchor(self, block: NidaqSignalSampleBlock) -> None:
+        sample_index = int(block.sample_index)
+        count = block.sample_count
+        if block.epoch_perf_time is not None and block.epoch_wall_time is not None:
+            anchor_sample_index = 0
+            anchor_perf_time = float(block.epoch_perf_time)
+            anchor_wall_time = float(block.epoch_wall_time)
+        else:
+            # Compatibility fallback for producers that predate the explicit
+            # task-start anchor. It is used once per epoch, never once per block.
+            anchor_sample_index = sample_index
+            newest_offset = max(0, count - 1) / self.sample_rate_hz
+            anchor_perf_time = float(block.perf_time) - newest_offset
+            anchor_wall_time = float(block.wall_time) - newest_offset
+        self._epoch_start_sample_index.value = anchor_sample_index
+        self._epoch_start_perf_time.value = anchor_perf_time
+        self._epoch_start_wall_time.value = anchor_wall_time

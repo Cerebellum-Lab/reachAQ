@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import dataclasses
 import json
 import logging
 import math
@@ -106,6 +107,7 @@ class SessionDataRecorder:
             laser_rows = tuple(self._laser_rows)
             log_rows = tuple(self._log_rows)
             nidaq_chunks = tuple(self._nidaq_chunks)
+            timing_plan = self._nidaq_monitor.timing_plan
             self._clear_locked()
         self._write_session(
             project,
@@ -116,6 +118,7 @@ class SessionDataRecorder:
             laser_rows,
             log_rows,
             nidaq_chunks,
+            timing_plan,
         )
 
     def abort(self) -> None:
@@ -228,13 +231,11 @@ class SessionDataRecorder:
                 read.end_sample_index,
                 dtype=np.int64,
             )
-            # source_perf_time/source_wall_time are stamped when the block is
-            # published. Reconstruct each sample working backward from its end.
-            sample_lag = (
-                read.end_sample_index - 1 - indices
-            ) / read.sample_rate_hz
-            perf_times = read.source_perf_time - sample_lag
-            wall_times = read.source_wall_time - sample_lag
+            # One task-start anchor defines the whole hardware epoch. Block
+            # publication timestamps remain diagnostics and never re-anchor the
+            # sample timeline.
+            perf_times = read.perf_times(indices)
+            wall_times = read.wall_times(indices)
             with self._lock:
                 if self._armed:
                     self._nidaq_chunks.append((
@@ -247,6 +248,8 @@ class SessionDataRecorder:
                         read.epoch,
                         read.gap_count,
                         read.overrun_samples,
+                        read.source_perf_time,
+                        read.source_wall_time,
                     ))
         except Exception:
             logging.getLogger(__name__).exception("Unable to collect NI-DAQ session samples")
@@ -271,6 +274,7 @@ class SessionDataRecorder:
         laser_rows,
         log_rows,
         nidaq_chunks,
+        timing_plan=None,
     ) -> None:
         session_dir = Path(project.get_session_path().location)
         streams_dir = session_dir / "streams"
@@ -328,6 +332,7 @@ class SessionDataRecorder:
             start_wall,
             end_perf,
             nidaq_chunks,
+            timing_plan,
         )
         alignment = {
             "schemaVersion": 1,
@@ -365,6 +370,9 @@ class SessionDataRecorder:
                     "time.perf_counter",
                 ),
             },
+            "nidaqTiming": (
+                None if timing_plan is None else dataclasses.asdict(timing_plan)
+            ),
         }
         with (streams_dir / "alignment.json").open("w", encoding="utf-8") as stream:
             json.dump(alignment, stream, indent=2)
@@ -397,10 +405,35 @@ class SessionDataRecorder:
             writer.writerows(rows)
 
     @staticmethod
-    def _write_nidaq(path, start_perf, start_wall, end_perf, chunks) -> None:
+    def _write_nidaq(
+        path,
+        start_perf,
+        start_wall,
+        end_perf,
+        chunks,
+        timing_plan=None,
+    ) -> None:
         channel_names = next((chunk[4] for chunk in chunks if chunk[4]), tuple())
         selected = []
-        for indices, perf, wall, values, names, rate, epoch, gaps, overrun in chunks:
+        for chunk in chunks:
+            (
+                indices,
+                perf,
+                wall,
+                values,
+                names,
+                rate,
+                epoch,
+                gaps,
+                overrun,
+                *observation,
+            ) = chunk
+            observation_perf = (
+                float(observation[0]) if len(observation) > 0 else math.nan
+            )
+            observation_wall = (
+                float(observation[1]) if len(observation) > 1 else math.nan
+            )
             mask = (perf >= start_perf) & (perf <= end_perf)
             if np.any(mask):
                 selected.append((
@@ -412,6 +445,17 @@ class SessionDataRecorder:
                     epoch,
                     gaps,
                     overrun,
+                    np.full(np.count_nonzero(mask), epoch, dtype=np.uint64),
+                    np.full(
+                        np.count_nonzero(mask),
+                        observation_perf,
+                        dtype=np.float64,
+                    ),
+                    np.full(
+                        np.count_nonzero(mask),
+                        observation_wall,
+                        dtype=np.float64,
+                    ),
                 ))
         with h5py.File(path, "w") as output:
             output.attrs["recording_start_perf"] = start_perf
@@ -420,10 +464,23 @@ class SessionDataRecorder:
             output.attrs["alignment"] = "first sample at or after primary camera first frame"
             output.attrs["source_clock"] = "NI-DAQ ring reconstructed on time.perf_counter"
             output.attrs["channel_names"] = channel_names
+            output.attrs["timing_plan_json"] = json.dumps(
+                None if timing_plan is None else dataclasses.asdict(timing_plan),
+                sort_keys=True,
+            )
             if not selected:
                 output.create_dataset("sample_index", data=np.empty(0, dtype=np.int64))
                 output.create_dataset("perf_time", data=np.empty(0, dtype=np.float64))
                 output.create_dataset("offset_seconds", data=np.empty(0, dtype=np.float64))
+                output.create_dataset("epoch", data=np.empty(0, dtype=np.uint64))
+                output.create_dataset(
+                    "block_observation_perf_time",
+                    data=np.empty(0, dtype=np.float64),
+                )
+                output.create_dataset(
+                    "block_observation_wall_time",
+                    data=np.empty(0, dtype=np.float64),
+                )
                 output.create_dataset(
                     "values",
                     data=np.empty((len(channel_names), 0), dtype=np.float32),
@@ -432,9 +489,31 @@ class SessionDataRecorder:
             indices = np.concatenate([item[0] for item in selected])
             perf = np.concatenate([item[1] for item in selected])
             values = np.concatenate([item[3] for item in selected], axis=1)
+            epochs = np.concatenate([item[8] for item in selected])
+            observation_perf = np.concatenate([item[9] for item in selected])
+            observation_wall = np.concatenate([item[10] for item in selected])
+            if indices.size > 1 and not np.all(np.diff(indices) == 1):
+                raise RuntimeError(
+                    "NI-DAQ session sample indices are not strictly consecutive"
+                )
+            if perf.size > 1 and not np.all(np.diff(perf) > 0):
+                raise RuntimeError(
+                    "NI-DAQ session timestamps are not strictly increasing"
+                )
             output.create_dataset("sample_index", data=indices, compression="gzip")
             output.create_dataset("perf_time", data=perf, compression="gzip")
             output.create_dataset("offset_seconds", data=perf - start_perf, compression="gzip")
+            output.create_dataset("epoch", data=epochs, compression="gzip")
+            output.create_dataset(
+                "block_observation_perf_time",
+                data=observation_perf,
+                compression="gzip",
+            )
+            output.create_dataset(
+                "block_observation_wall_time",
+                data=observation_wall,
+                compression="gzip",
+            )
             output.create_dataset(
                 "wall_time",
                 data=start_wall + (perf - start_perf),
