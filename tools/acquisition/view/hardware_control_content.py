@@ -154,12 +154,6 @@ class HardwareControlContent(ContentWidget):
         self._head_magnet_row_label = QLabel("Head magnet intensity (%):")
         form_layout.addRow(self._head_magnet_row_label, right_layout)
 
-        button = self._tare_button = QPushButton("Tare")
-        add_cmd_widget(button)
-        button.clicked.connect(lambda: log_hardware_cmd(self._hardware_model.tare_load_cell))
-        self._load_cell_row_label = QLabel("Load cell:")
-        form_layout.addRow(self._load_cell_row_label, self._tare_button)
-
         layout.addLayout(form_layout, 1, 0)
 
         def set_xyz(coord: str):
@@ -387,8 +381,6 @@ class HardwareControlContent(ContentWidget):
             self._head_magnet_row_label,
             self._head_magnet_position_spinbox,
             self._head_magnet_move_button,
-            self._load_cell_row_label,
-            self._tare_button,
         ):
             widget.setVisible(is_enabled)
 

@@ -34,13 +34,13 @@ class JerryCANCmdType(enum.IntEnum):
     GPIO_WRITE = 0x0B
     TONE = 0x0C
     ANALOG_OUT = 0x0D
-    LOAD_CELL_READ = 0x0E
+    RESERVED_0E = 0x0E
     DOOR_SENSOR = 0x0F
     AUDIO_MAGNITUDE_DATA_BEGIN = 0x10
     AUDIO_MAGNITUDE_DATA_CONT = 0x11
     AUDIO_MAGNITUDE_DATA_END = 0x12
     RGB_LED = 0x13
-    LOAD_CELL_TARE = 0x14
+    RESERVED_14 = 0x14
     STEPPER_STATUS = 0x16
     SERVO_STATUS = 0x17
     BOOTLOADER_COMMAND = 0x18
@@ -178,12 +178,6 @@ class AnalogOut:
 
 
 @dataclasses.dataclass
-class LoadCellRead:
-    instance: int = 0
-    load_mv: float = 0.0
-
-
-@dataclasses.dataclass
 class Doors:
     door1: int = 0
     door2: int = 0
@@ -206,11 +200,6 @@ class AudioDataCmd:
 @dataclasses.dataclass
 class AudioData:
     magnitudes: List[float] = dataclasses.field(default_factory=lambda: [0.0] * 16)
-
-
-@dataclasses.dataclass
-class LoadCellTare:
-    instance: int = 0
 
 
 @dataclasses.dataclass
@@ -304,8 +293,6 @@ class JerryCANMsg:
         self.gpio_write = GPIOWrite()
         self.tone = Tone()
         self.analog_out = AnalogOut()
-        self.load_cell_read = LoadCellRead()
-        self.load_cell_tare = LoadCellTare()
         self.rgb_led = RGBLED()
         self.doors = Doors()
         self.audio_data_cmd = AudioDataCmd()
@@ -338,11 +325,11 @@ _PAYLOAD_SIZES = {
     JerryCANCmdType.GPIO_WRITE: 4,
     JerryCANCmdType.TONE: 5,
     JerryCANCmdType.ANALOG_OUT: 3,
-    JerryCANCmdType.LOAD_CELL_READ: 5,
+    JerryCANCmdType.RESERVED_0E: 5,
     JerryCANCmdType.AUDIO_MAGNITUDE_DATA_BEGIN: 4,
     JerryCANCmdType.AUDIO_MAGNITUDE_DATA_CONT: 64,
     JerryCANCmdType.AUDIO_MAGNITUDE_DATA_END: 4,
-    JerryCANCmdType.LOAD_CELL_TARE: 1,
+    JerryCANCmdType.RESERVED_14: 1,
     JerryCANCmdType.RGB_LED: 3,
     JerryCANCmdType.DOOR_SENSOR: 1,
     JerryCANCmdType.BOOTLOADER_COMMAND: 1,
@@ -457,8 +444,6 @@ def _pack_payload(message: JerryCANMsg) -> bytes:
                            int(message.tone.duration_ms))
     if message_type == JerryCANCmdType.ANALOG_OUT:
         return struct.pack("<BH", int(message.analog_out.instance), int(message.analog_out.value_mv))
-    if message_type == JerryCANCmdType.LOAD_CELL_TARE:
-        return struct.pack("<B", int(message.load_cell_tare.instance))
     if message_type == JerryCANCmdType.RGB_LED:
         return struct.pack("<BBB", int(message.rgb_led.red), int(message.rgb_led.green),
                            int(message.rgb_led.blue))
@@ -545,8 +530,6 @@ def _unpack_payload(message: JerryCANMsg, payload: bytes) -> None:
         message.tone.instance, message.tone.frequency_hz, message.tone.duration_ms = struct.unpack("<BHH", payload)
     elif message_type == JerryCANCmdType.ANALOG_OUT:
         message.analog_out.instance, message.analog_out.value_mv = struct.unpack("<BH", payload)
-    elif message_type == JerryCANCmdType.LOAD_CELL_READ:
-        message.load_cell_read.instance, message.load_cell_read.load_mv = struct.unpack("<Bf", payload)
     elif message_type == JerryCANCmdType.PRESSURE_READ:
         message.pressure_read.instance, message.pressure_read.pressure = struct.unpack("<BI", payload)
     elif message_type == JerryCANCmdType.RGB_LED:
@@ -845,13 +828,6 @@ class SocketCanJerryCAN:
         msg.type = JerryCANCmdType.ANALOG_OUT
         msg.uuid = uuid
         msg.analog_out = AnalogOut(instance, value_mv)
-        return self.SendMessage(msg, dst_id)
-
-    def LoadCellTare(self, dst_id: int, instance: int, uuid: int) -> int:
-        msg = JerryCANMsg()
-        msg.type = JerryCANCmdType.LOAD_CELL_TARE
-        msg.uuid = uuid
-        msg.load_cell_tare = LoadCellTare(instance)
         return self.SendMessage(msg, dst_id)
 
     def RGBLEDWrite(self, dst_id: int, red: int, green: int, blue: int, uuid: int) -> int:

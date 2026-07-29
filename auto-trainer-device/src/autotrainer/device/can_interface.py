@@ -52,7 +52,6 @@ from .device_interface import (
     AudioData,
     DoorData,
     Heartbeat,
-    LoadCellReading,
     PressureReading,
     Motor,
     DigitalOutputs,
@@ -456,8 +455,6 @@ class CanInterface(DeviceInterface):
 
         self._audio = AudioData()
 
-        self._load_cell_factor = 21053.0
-
         no_op = lambda msg: None
 
         self._last_positions = Offset3DTuple.get_nan()
@@ -479,10 +476,7 @@ class CanInterface(DeviceInterface):
                 frequency_hz=msg.tone.frequency_hz
             ),
             cmd_type.ANALOG_OUT: no_op if self._pellet_only_runtime else self._translate_analog_out,
-            cmd_type.LOAD_CELL_READ: lambda msg: LoadCellReading(
-                target=_addr2tgt(msg.dst_id),
-                load=self.round_float(float(msg.load_cell_read.load_mv) / 1000.0 * self.load_cell_factor),
-            ),
+            cmd_type.RESERVED_0E: no_op,
             cmd_type.PRESSURE_READ: lambda msg: PressureReading(
                 target=_addr2tgt(msg.dst_id),
                 pressure=self.round_float(float(msg.pressure_read.pressure)),
@@ -749,14 +743,6 @@ class CanInterface(DeviceInterface):
         """
         self._magnet_addr = addr
         logger.info(f"magnet module located at {self._magnet_addr}")
-
-    @property
-    def load_cell_factor(self):
-        return self._load_cell_factor
-
-    @load_cell_factor.setter
-    def load_cell_factor(self, factor: float):
-        self._load_cell_factor = factor
 
     def are_addresses_valid(self) -> bool:
         """
@@ -1165,19 +1151,6 @@ class CanInterface(DeviceInterface):
         uuid = CanInterface.next_uuid()
         res = self._jc.Delay(addr, int(delay_sec * 1000), uuid)
         logger.debug("Delay addr=%s res=%s uuid=%s", addr, res, uuid)
-        return res == 0
-
-    def tare_load_cell(self) -> bool:
-        """
-        Tare the load cell so the current reading is 0.
-
-        Returns:
-            bool: True if successful else False
-        """
-        addr = self._tgt2addr(Target.MAGNET_DEVICE)
-        uuid = self.next_uuid()
-        res = self._jc.LoadCellTare(addr, 0, uuid)
-        logger.debug("LoadCellTare addr=%s res=%s uuid=%s", addr, res, uuid)
         return res == 0
 
     def move_servo_motor(self, motor: Motor, position: Union[float, Tuple[float, float]]):

@@ -37,7 +37,6 @@ from .device_interface import (
     AnalogOutputs,
     AudioData,
     DoorData,
-    LoadCellReading,
     PressureReading,
     Motor,
     DigitalOutputs,
@@ -317,12 +316,6 @@ class CanDevice(Device):
         self._close_tunnel_gate = default_close_gate()
         self._move_retract = default_move_retract()
 
-    def _handle_update_scale_tare(self):
-        if not self.is_target_required(Target.MAGNET_DEVICE):
-            logger.debug("Skipping scale tare because magnet/headfix CAN target is not required")
-            return True
-        return self._interface.tare_load_cell()
-
     def _clear_caches(self):
         for cache in (
             self._previous_stepper_status_pos_perf_c,
@@ -477,7 +470,6 @@ class CanDevice(Device):
 
             SystemCommandKind.SET_MOVE_RETRACT_PROCEDURE: set_move_retract_proc,
 
-            SystemCommandKind.UPDATE_SCALE_TARE: lambda _: self._handle_update_scale_tare(),
 
             SystemCommandKind.SET_DIGITAL_OUTPUT:
                 lambda data: self._interface.set_digital_output(DigitalOutputs(data[0]), data[1]),
@@ -506,9 +498,6 @@ class CanDevice(Device):
         }
 
         # Initialize data / response handlers lookup table
-
-        def set_current_pressure(m):
-            self._current_pressure = m.pressure
 
         def set_current_temp_humidity(m):
             self._current_temperature = m.temperature_c
@@ -563,8 +552,7 @@ class CanDevice(Device):
             ColorLed: handle_color_led,
             AnalogOutput: _no_op_handler,
 
-            LoadCellReading: self._handle_load_cell_reading,
-            PressureReading: set_current_pressure,
+            PressureReading: self._handle_pressure_reading,
             SensorStatus: set_current_temp_humidity,
 
             MagnetDigitalInputs: set_current_digital,
@@ -1179,8 +1167,6 @@ class CanDevice(Device):
         elif kind is _retry_full:
             kind, data = data
             return self._find_command_next_board_target(kind, data)
-        elif kind == SystemCommandKind.UPDATE_SCALE_TARE:
-            return Target.MAGNET_DEVICE if self.is_target_required(Target.MAGNET_DEVICE) else None
         elif kind in {
             SystemCommandKind.SET_DIGITAL_OUTPUT,
             SystemCommandKind.SET_ANALOG_OUTPUT,
@@ -1313,17 +1299,12 @@ class CanDevice(Device):
             else:
                 logger.warning("Unhandled data type: %s", type(message))
 
-    def _handle_load_cell_reading(self, message):
-        """
-        Handle a load cell reading message.
-
-        Args:
-            message: The LoadCellReading message
-        """
+    def _handle_pressure_reading(self, message: PressureReading):
+        """Build measurement batches from the pressure sample clock."""
+        self._current_pressure = message.pressure
         measurement = HeadFixMeasurement(
             when=message.timestamp_ns / 1e9,
             timestamp=message.index,
-            weight=message.load,
             switch=self._current_digital,
             pressure=self._current_pressure,
             temperature=self._current_temperature,

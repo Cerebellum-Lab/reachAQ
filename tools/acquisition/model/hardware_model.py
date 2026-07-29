@@ -379,12 +379,6 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
             return None
         return self._send_with_token(self._device_conn, SystemCommandKind.CLOSE_TUNNEL_GATE)
 
-    def tare_load_cell(self) -> Optional[UUID]:
-        if not self._tunnel_headfix_enabled:
-            logger.debug("Skipping load-cell tare command because tunnel/headfix hardware is disabled")
-            return None
-        return self._send_with_token(self._device_conn, SystemCommandKind.UPDATE_SCALE_TARE)
-
     def _set_axis(self, value: float, *, absolute: bool = True,
                   system_set_cmd: SystemCommandKind, coord_idx: int, sender: str="NA") -> Optional[UUID]:
         coord = "xyz"[coord_idx]
@@ -707,13 +701,6 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
         send_dev_ack_cmd(SystemCommandKind.STREAM_START)
         logger.success("STREAM_START acknowledged")
         self._device_stream_started = True
-
-        if self._tunnel_headfix_enabled:
-            send_dev_cmd(SystemCommandKind.UPDATE_SCALE_TARE)
-            log_hardware_initialization(logger, "QUEUED | startup scale tare")
-        else:
-            logger.debug("Skipping startup scale tare because tunnel/headfix hardware is disabled")
-            log_hardware_initialization(logger, "SKIP | startup scale tare | tunnel/headfix disabled")
 
         prev_thread = self._check_timedout_commands_thread
         if prev_thread is None or not prev_thread.is_alive():

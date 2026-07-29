@@ -7,7 +7,7 @@ from PySide6.QtCore import Qt, Signal, QTimer, Slot
 from PySide6.QtWidgets import (QWidget, QGridLayout, QHBoxLayout, QPushButton, QLabel, QSpinBox,
                                QCheckBox, QLineEdit, QFileDialog, QPlainTextEdit, QVBoxLayout, QDoubleSpinBox)
 
-from autotrainer.core import PerfMonitor, LoadCellMonitor, ProjectInfo, MessageHandler
+from autotrainer.core import PerfMonitor, ProjectInfo, MessageHandler
 from autotrainer.core.message import Motor
 from autotrainer.device import is_servo
 from autotrainer.model import EnvironmentProvider, HardwareVersion
@@ -89,7 +89,6 @@ class MainContent(QWidget):
         self._model.message_handler.measurement_callback = self._measurements_received
         self._model.message_handler.audio_callback = self._audio_spectrum_received
         self._model.analysis.property_changed += self._analysis_property_changed
-        self._model.analysis.load_cell_monitor.property_changed += self._load_cell_monitor_property_changed
 
     def set_diagnostics_visible(self, is_visible: bool):
         self._diagnostics_panel.setVisible(is_visible)
@@ -272,10 +271,6 @@ class MainContent(QWidget):
         plot_layout = QGridLayout()
         plot_layout.setContentsMargins(8, 0, 8, 0)
 
-        self._load_cell_plot, widget = self._create_plot_widget("Load Cell (g)")
-        # self._load_cell_plot.setYRange(-1.0, 70)
-        plot_layout.addWidget(widget, 0, 0)
-
         self._headbar_pressure_plot, widget = self._create_plot_widget("Head Bar Pressure (cnts)")
         # self._headbar_pressure_plot.setYRange(-1.0, 1024)
         plot_layout.addWidget(widget, 0, 1)
@@ -379,21 +374,8 @@ class MainContent(QWidget):
     def _on_motor_selected(self, motor: Motor):
         self._model.get_config(motor)
 
-    def _load_cell_monitor_property_changed(self, name, value, _):
-        if name == "is_load_cell_engaged":
-            if value:
-                self._load_cell_plot.getPlotItem().getViewBox().setBackgroundColor((0, 250, 154))
-            else:
-                self._load_cell_plot.getPlotItem().getViewBox().setBackgroundColor((220, 220, 220))
-
     def _analysis_property_changed(self, name, value, _):
-        if name == LoadCellMonitor.IS_ENGAGED_PROPERTY:
-            if value:
-                self._head_contact_plot.getPlotItem().getViewBox().setBackgroundColor((0, 250, 154))
-            else:
-                self._head_contact_plot.getPlotItem().getViewBox().setBackgroundColor(
-                    (220, 220, 220))
-        elif name == "is_force_detector_engaged":
+        if name == "is_force_detector_engaged":
             if value:
                 self._headbar_pressure_plot.getPlotItem().getViewBox().setBackgroundColor(
                     (0, 250, 154))
@@ -402,12 +384,11 @@ class MainContent(QWidget):
                     (220, 220, 220))
 
     def _measurements_received(self, measurements):
-        # weights, switch, pressure, temperature, humidity
-        self._load_cell_plot.cache_data(measurements[0])
-        self._head_contact_plot.cache_data(measurements[1])
-        self._headbar_pressure_plot.cache_data(measurements[2])
-        self._temperature_plot.cache_data(measurements[3])
-        self._humidity_plot.cache_data(measurements[4])
+        # switch, pressure, temperature, humidity
+        self._head_contact_plot.cache_data(measurements[0])
+        self._headbar_pressure_plot.cache_data(measurements[1])
+        self._temperature_plot.cache_data(measurements[2])
+        self._humidity_plot.cache_data(measurements[3])
 
         self._perf_monitor.add_cycles(len(measurements[0]))
 

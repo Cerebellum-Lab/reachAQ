@@ -95,7 +95,6 @@ def monitor_message_queue(msg_queue):
             if print_status is StatusType.SENSORS:
                 d = data[0]
                 print(f"- Head Detect:        {d.switch}")
-                print(f"- Load Weight (g):    {d.weight:.3f}")
                 print(f"- Pressure (0..1024): {d.pressure:.3f}")
                 print(f"- Temperature (F):    {d.temperature:.1f}")
                 print(f"- Humidity (%):       {d.humidity:.1f}")
@@ -107,8 +106,7 @@ def monitor_message_queue(msg_queue):
             if output_fd is not None:
                 for d in data:
                     output_fd.write(
-                        f"{d.when}, {d.timestamp}, {d.weight}, "
-                        f" {d.switch},"
+                        f"{d.when}, {d.timestamp}, {d.switch},"
                         f" {d.pressure},"
                         f" {d.temperature}, {d.humidity}\n")
 
@@ -371,8 +369,6 @@ def run_monitor():
     device_connection.load_default_motor_config()
     device_connection.load_default_move_config()
 
-    device_connection.send_message(SystemCommandKind.UPDATE_SCALE_TARE)
-
     last_command = ""
 
     while True:
@@ -417,7 +413,6 @@ def run_monitor():
             # 'p' - pellet move commands
             # 'r' - RGB LED
             # 's' - System status
-            # 't' - Tare scales
             # 'v' - version
             # 'x' - x motor
             # 'y' - y motor
@@ -474,9 +469,6 @@ def run_monitor():
 
                 elif cmd == 's' or cmd == 'status':
                     print_status = StatusType.SENSORS
-
-                elif cmd == 't' or cmd == 'tare':
-                    device_connection.send_message(SystemCommandKind.UPDATE_SCALE_TARE, context="tare")
 
                 elif cmd == 'v' or cmd == 'version':
                     device_connection.send_message(SystemCommandKind.REQUEST_VERSION)
@@ -738,8 +730,6 @@ def print_help():
           " ::Set RGB LED. Values in %")
     print("s[tatus]                           "
           " ::Show Status")
-    print("t[are]                             "
-          " ::Tare Load Cell/Pressure Sensors")
     print("open_gate                          "
           " ::Open tunnel gate")
     print("close_gate                         "

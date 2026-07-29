@@ -345,11 +345,6 @@ class AnalogOutput(Source):
 
 
 @dataclass
-class LoadCellReading(Source):
-    load: float = 0
-
-
-@dataclass
 class PressureReading(Source):
     pressure: float = 0
 

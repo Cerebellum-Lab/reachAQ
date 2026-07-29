@@ -25,7 +25,6 @@ class AppModel(ObservableObject):
 
         self._analysis = self._message_handler.analysis
         self._analysis.interval = ProjectInterval.HOUR
-        self._analysis.load_cell_tare_monitor.tare_callback = self.tare
 
         self._is_connected = False
 
@@ -138,14 +137,6 @@ class AppModel(ObservableObject):
         if self._device_connection is not None:
             self._device_connection.send_message(SystemCommandKind.READ_MOTOR_CONFIGURATION, motor,
                                                  context="get motor cfg")
-
-    def tare(self, *, force: bool=False) -> bool:
-        if self._device_connection is not None:
-            self._device_connection.send_message(SystemCommandKind.UPDATE_SCALE_TARE,
-                                                 context="tare")
-        else:
-            logger.warning("attempt to tare when device thread is not initialized")
-        return True
 
     def set_stream_enabled(self, enable: bool):
         if enable:

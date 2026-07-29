@@ -12,7 +12,7 @@ from autotrainer.core.logging import get_verbose_logger
 from .device_interface import (DeviceInterface, ServoConfig, StepperConfig,
                                StepperStatus, ServoStatus, Target, DigitalOutputs,
                                Motor, AnalogOutputs, SensorStatus, MagnetDigitalInputs,
-                               AudioData, PressureReading, LoadCellReading, Version,
+                               AudioData, PressureReading, Version,
                                PelletDigitalInputs, DoorData, Acknowledge, ColorLed
                                )
 from .can_interface import motor_to_str
@@ -236,7 +236,6 @@ class EmulationInterface(DeviceInterface):
         if perf_now - self._last_data_message > _DATA_MESSAGE_INTERVAL:
             self._last_data_message = perf_now
             messages.append(PressureReading(pressure=512 + uniform(-10, 10), ))
-            messages.append(LoadCellReading(load=uniform(0, 20)))
 
         return messages
 
@@ -278,12 +277,6 @@ class EmulationInterface(DeviceInterface):
         if self._is_open:
             logger.info(f"Set motor configuration %s", motor)
             self._configs[motor] = config
-            self._messages.append(Acknowledge(uuid=EmulationInterface.next_uuid()))
-        return self._is_open
-
-    def tare_load_cell(self) -> bool:
-        if self._is_open:
-            logger.info(f"tare load cell")
             self._messages.append(Acknowledge(uuid=EmulationInterface.next_uuid()))
         return self._is_open
 

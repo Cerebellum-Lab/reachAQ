@@ -27,6 +27,7 @@ dependencies = [
     # NB: prefer to set dependencies version specifier(s) in this pyproject dependencies:
 
     'setuptools-scm >= 9.2.2, < 10',  # to allow get version from git when in editable mode,
+    'h5py >= 3.8, < 4',
     # without requiring to `pip install -e .` everytime you checkout something.
 
     'importlib-resources; python_version < "3.10"',
