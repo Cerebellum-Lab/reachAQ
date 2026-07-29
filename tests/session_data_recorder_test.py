@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import h5py
 import numpy as np
+import pytest
 
 from autotrainer.core import (
     ObservableObject,
@@ -13,6 +14,7 @@ from autotrainer.core import (
     SystemStatusMessageKind,
 )
 from tools.acquisition.model import session_data_recorder
+from tools.acquisition.model.session_boundary import SessionBoundary
 from tools.acquisition.model.session_data_recorder import SessionDataRecorder
 
 
@@ -214,3 +216,113 @@ def test_empty_session_streams_still_have_alignment_metadata(tmp_path):
         assert output["sample_index"].size == 0
         assert output.attrs["recording_start_perf"] == 20.0
         assert output.attrs["recording_end_perf"] == 21.0
+
+
+def test_camera_and_tone_edges_are_correlated_on_nidaq_timeline(tmp_path):
+    project = ProjectInfo(
+        root=str(tmp_path),
+        device_id="test",
+        when=datetime(2026, 1, 2, 3, 4, 5),
+        session=3,
+    )
+    sample_rate = 1000.0
+    indices = np.arange(100, 108, dtype=np.int64)
+    perf = 9.999 + np.arange(8, dtype=np.float64) / sample_rate
+    chunk = (
+        indices,
+        perf,
+        100.0 + (perf - 10.0),
+        np.array(
+            (
+                (0, 1, 0, 0, 0, 0, 0, 0),
+                (0, 0, 0, 0, 1, 1, 0, 0),
+            ),
+            dtype=np.float32,
+        ),
+        ("cam_frames", "tone1"),
+        sample_rate,
+        1,
+        0,
+        0,
+    )
+    boundary = SessionBoundary(
+        session_id=project.short_id,
+        primary_camera="left",
+        primary_frame_id=42,
+        start_perf_time=10.0,
+        start_wall_time=100.0,
+        camera_when=1_000_000.0,
+    )
+    device_rows = (
+        (
+            10.0025,
+            100.0025,
+            "inbound",
+            "STIMULUS_INPUTS",
+            "PELLET_DEVICE",
+            "status-1",
+            None,
+            None,
+            json.dumps({"tone1": True}),
+        ),
+    )
+
+    result = SessionDataRecorder._write_session(
+        project,
+        10.0,
+        100.0,
+        10.006,
+        device_rows,
+        (),
+        (),
+        (chunk,),
+        boundary=boundary,
+    )
+
+    camera = result["cameraNidaqAlignment"]
+    assert camera["status"] == "matched"
+    assert camera["confidence"] == "hardware_edge"
+    assert camera["matchedSampleIndex"] == 101
+    assert camera["signedOffsetSeconds"] == 0.0
+    tone = result["toneConfirmation"]
+    assert tone["status"] == "complete"
+    assert tone["matched"][0]["channel"] == "tone1"
+    assert tone["matched"][0]["sampleIndex"] == 104
+    assert tone["matched"][0]["latencySeconds"] == pytest.approx(0.0005)
+
+    alignment = json.loads(
+        (
+            tmp_path
+            / "20260102"
+            / "test"
+            / "trial003"
+            / "streams"
+            / "alignment.json"
+        ).read_text()
+    )
+    assert alignment["canonicalBoundary"]["primaryFrameId"] == 42
+    assert alignment["canonicalBoundary"]["nidaqSampleIndex"] == 101
+
+
+def test_missing_cam_frames_is_explicitly_host_estimated():
+    chunk = (
+        np.arange(3, dtype=np.int64),
+        np.array((9.999, 10.0, 10.001)),
+        np.array((99.999, 100.0, 100.001)),
+        np.zeros((1, 3), dtype=np.float32),
+        ("barcode",),
+        1000.0,
+        1,
+        0,
+        0,
+    )
+
+    alignment = SessionDataRecorder._match_camera_nidaq_edge(
+        None,
+        10.0,
+        (chunk,),
+    )
+
+    assert alignment["status"] == "host_estimated"
+    assert alignment["confidence"] == "host_estimated"
+    assert alignment["matchedSampleIndex"] == 1

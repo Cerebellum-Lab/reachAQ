@@ -1287,7 +1287,11 @@ class AppModel(ObservableObject):
                             start_wall_time=float(first_frame_time),
                             camera_when=float(first_frame_when),
                         )
-                    self._session_data_recorder.commit_start(first_frame_perf, first_frame_time)
+                    self._session_data_recorder.commit_start(
+                        first_frame_perf,
+                        first_frame_time,
+                        boundary=self._session_boundary,
+                    )
                     self._record_start_timer.cancel()
                     self._record_start_timer = no_op_timer
                     self._abort_had_recording_started = True
@@ -4131,7 +4135,23 @@ class AppModel(ObservableObject):
         self._session_boundary = boundary.with_end(end_perf)
         project.start_record_timestamp = self._session_boundary.start_wall_time
         try:
-            self._session_data_recorder.stop(end_perf)
+            stream_result = self._session_data_recorder.stop(end_perf)
+            camera_alignment = (
+                None
+                if not isinstance(stream_result, dict)
+                else stream_result.get("cameraNidaqAlignment")
+            )
+            matched_sample_index = (
+                None
+                if camera_alignment is None
+                else camera_alignment.get("matchedSampleIndex")
+            )
+            if matched_sample_index is not None:
+                self._session_boundary = (
+                    self._session_boundary.with_nidaq_sample_index(
+                        matched_sample_index
+                    )
+                )
         except Exception as err:
             logger.exception("Failed to save session auxiliary streams: %s", err)
             self.on_error("Session stream save failed", str(err))

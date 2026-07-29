@@ -17,6 +17,7 @@ import h5py
 import numpy as np
 
 from autotrainer.core import ProjectInfo
+from tools.acquisition.model.session_boundary import SessionBoundary
 
 
 class _SessionLogHandler(logging.Handler):
@@ -55,6 +56,7 @@ class SessionDataRecorder:
         self._project: Optional[ProjectInfo] = None
         self._start_perf: Optional[float] = None
         self._start_wall: Optional[float] = None
+        self._boundary: Optional[SessionBoundary] = None
         self._device_rows = deque(maxlen=device_event_capacity)
         self._device_event_capacity = int(device_event_capacity)
         self._device_event_overruns = 0
@@ -95,6 +97,7 @@ class SessionDataRecorder:
             self._source_manifest = tuple(source_manifest)
             self._start_perf = None
             self._start_wall = None
+            self._boundary = None
             self._nidaq_stop.clear()
         thread = threading.Thread(
             target=self._poll_nidaq,
@@ -104,23 +107,33 @@ class SessionDataRecorder:
         self._nidaq_thread = thread
         thread.start()
 
-    def commit_start(self, perf_time: float, wall_time: float) -> None:
+    def commit_start(
+        self,
+        perf_time: float,
+        wall_time: float,
+        *,
+        boundary: Optional[SessionBoundary] = None,
+    ) -> None:
         with self._lock:
             if not self._armed:
                 return
             self._start_perf = float(perf_time)
             self._start_wall = float(wall_time)
+            self._boundary = boundary
 
-    def stop(self, end_perf: float) -> None:
+    def stop(self, end_perf: float):
         self._stop_nidaq_thread()
         with self._lock:
             if not self._armed or self._project is None or self._start_perf is None:
                 self._clear_locked()
-                return
+                return None
             project = self._project
             start_perf = self._start_perf
             start_wall = self._start_wall
             end_perf = max(start_perf, float(end_perf))
+            boundary = self._boundary
+            if boundary is not None:
+                boundary = boundary.with_end(end_perf)
             device_rows = tuple(self._device_rows)
             device_event_overruns = self._device_event_overruns
             laser_rows = tuple(self._laser_rows)
@@ -129,7 +142,7 @@ class SessionDataRecorder:
             timing_plan = self._nidaq_monitor.timing_plan
             source_manifest = self._source_manifest
             self._clear_locked()
-        self._write_session(
+        return self._write_session(
             project,
             start_perf,
             start_wall,
@@ -141,6 +154,7 @@ class SessionDataRecorder:
             timing_plan,
             device_event_overruns=device_event_overruns,
             source_manifest=source_manifest,
+            boundary=boundary,
         )
 
     def abort(self) -> None:
@@ -177,6 +191,7 @@ class SessionDataRecorder:
         self._project = None
         self._start_perf = None
         self._start_wall = None
+        self._boundary = None
         self._device_rows = deque(maxlen=self._device_event_capacity)
         self._device_event_overruns = 0
         self._laser_rows = []
@@ -412,7 +427,8 @@ class SessionDataRecorder:
         *,
         device_event_overruns=0,
         source_manifest=(),
-    ) -> None:
+        boundary: Optional[SessionBoundary] = None,
+    ):
         session_dir = Path(project.get_session_path().location)
         streams_dir = session_dir / "streams"
         logs_dir = session_dir / "logs"
@@ -437,6 +453,15 @@ class SessionDataRecorder:
             for chunk in nidaq_chunks
             for sample_perf in chunk[1]
             if start_perf <= sample_perf <= end_perf
+        )
+        camera_nidaq_alignment = SessionDataRecorder._match_camera_nidaq_edge(
+            boundary,
+            start_perf,
+            nidaq_chunks,
+        )
+        tone_confirmation = SessionDataRecorder._correlate_tone_confirmations(
+            device_rows,
+            nidaq_chunks,
         )
 
         SessionDataRecorder._write_csv(
@@ -542,6 +567,16 @@ class SessionDataRecorder:
                 "endPerfTime": end_perf,
                 "startWallTime": start_wall,
                 "endWallTime": start_wall + (end_perf - start_perf),
+                "primaryCamera": (
+                    None if boundary is None else boundary.primary_camera
+                ),
+                "primaryFrameId": (
+                    None if boundary is None else boundary.primary_frame_id
+                ),
+                "cameraWhen": None if boundary is None else boundary.camera_when,
+                "nidaqSampleIndex": camera_nidaq_alignment.get(
+                    "matchedSampleIndex"
+                ),
             },
             "streams": {
                 "nidaq": SessionDataRecorder._alignment_entry(
@@ -574,10 +609,276 @@ class SessionDataRecorder:
             ),
             "deviceEventOverruns": int(device_event_overruns),
             "enabledSources": list(source_manifest),
+            "cameraNidaqAlignment": camera_nidaq_alignment,
+            "toneConfirmation": tone_confirmation,
         }
         with (streams_dir / "alignment.json").open("w", encoding="utf-8") as stream:
             json.dump(alignment, stream, indent=2)
             stream.write("\n")
+        return {
+            "cameraNidaqAlignment": camera_nidaq_alignment,
+            "toneConfirmation": tone_confirmation,
+            "deviceEventOverruns": int(device_event_overruns),
+        }
+
+    @staticmethod
+    def _nidaq_arrays(chunks):
+        names = next((tuple(chunk[4]) for chunk in chunks if chunk[4]), tuple())
+        selected = tuple(
+            (chunk[0], chunk[1], chunk[3])
+            for chunk in chunks
+            if len(chunk[0]) and len(chunk[1])
+        )
+        if not selected:
+            return (
+                names,
+                np.empty(0, dtype=np.int64),
+                np.empty(0, dtype=np.float64),
+                np.empty((len(names), 0), dtype=np.float32),
+                None,
+            )
+        rate = float(next(chunk[5] for chunk in chunks if len(chunk[0])))
+        return (
+            names,
+            np.concatenate([item[0] for item in selected]),
+            np.concatenate([item[1] for item in selected]),
+            np.concatenate([item[2] for item in selected], axis=1),
+            rate,
+        )
+
+    @staticmethod
+    def _rising_edge_positions(values: np.ndarray) -> np.ndarray:
+        values = np.asarray(values, dtype=np.float64)
+        if values.size == 0:
+            return np.empty(0, dtype=np.int64)
+        high = np.isfinite(values) & (values > 0.5)
+        return np.flatnonzero(high & np.concatenate(([False], ~high[:-1])))
+
+    @staticmethod
+    def _match_camera_nidaq_edge(boundary, start_perf, chunks) -> dict:
+        names, indices, perf, values, rate = SessionDataRecorder._nidaq_arrays(
+            chunks
+        )
+        resolution = None if rate is None else 1.0 / rate
+        base = {
+            "cameraFrameId": (
+                None if boundary is None else boundary.primary_frame_id
+            ),
+            "cameraPerfTime": float(start_perf),
+            "cameraTimestamp": (
+                None if boundary is None else boundary.camera_when
+            ),
+            "channel": "cam_frames",
+            "matchedSampleIndex": None,
+            "matchedNidaqPerfTime": None,
+            "signedOffsetSeconds": None,
+            "resolutionSeconds": resolution,
+            "ambiguitySeconds": None,
+        }
+        if indices.size == 0 or rate is None:
+            return {
+                **base,
+                "status": "unavailable",
+                "confidence": "none",
+                "reason": "No NI-DAQ samples were saved for the session",
+            }
+        if "cam_frames" not in names:
+            nearest = int(np.argmin(np.abs(perf - start_perf)))
+            return {
+                **base,
+                "status": "host_estimated",
+                "confidence": "host_estimated",
+                "matchedSampleIndex": int(indices[nearest]),
+                "matchedNidaqPerfTime": float(perf[nearest]),
+                "signedOffsetSeconds": float(perf[nearest] - start_perf),
+                "reason": (
+                    "cam_frames was not configured; alignment uses the "
+                    "single NI-DAQ epoch anchor"
+                ),
+            }
+
+        channel_values = values[names.index("cam_frames")]
+        edge_positions = SessionDataRecorder._rising_edge_positions(
+            channel_values
+        )
+        if edge_positions.size == 0:
+            return {
+                **base,
+                "status": "unmatched",
+                "confidence": "none",
+                "reason": "cam_frames contained no rising edge",
+            }
+        distances = np.abs(perf[edge_positions] - start_perf)
+        order = np.argsort(distances)
+        best_position = int(edge_positions[order[0]])
+        second_distance = (
+            None if order.size < 2 else float(distances[order[1]])
+        )
+        edge_intervals = np.diff(perf[edge_positions])
+        half_frame_period = (
+            0.05
+            if edge_intervals.size == 0
+            else max(2.0 / rate, float(np.median(edge_intervals)) / 2.0)
+        )
+        best_distance = float(distances[order[0]])
+        if best_distance > half_frame_period:
+            return {
+                **base,
+                "status": "unmatched",
+                "confidence": "none",
+                "reason": (
+                    "Nearest cam_frames edge was outside half of the "
+                    "observed frame period"
+                ),
+                "ambiguitySeconds": second_distance,
+            }
+        ambiguity = (
+            None
+            if second_distance is None
+            else second_distance - best_distance
+        )
+        is_ambiguous = ambiguity is not None and ambiguity <= 1.0 / rate
+        return {
+            **base,
+            "status": "matched",
+            "confidence": (
+                "ambiguous_hardware_edge"
+                if is_ambiguous
+                else "hardware_edge"
+            ),
+            "matchedSampleIndex": int(indices[best_position]),
+            "matchedNidaqPerfTime": float(perf[best_position]),
+            "signedOffsetSeconds": float(perf[best_position] - start_perf),
+            "ambiguitySeconds": ambiguity,
+            "reason": (
+                "Nearest rising cam_frames edge on the NI-DAQ sample timeline"
+            ),
+        }
+
+    @staticmethod
+    def _correlate_tone_confirmations(device_rows, chunks) -> dict:
+        names, indices, perf, values, rate = SessionDataRecorder._nidaq_arrays(
+            chunks
+        )
+        tone_channels = tuple(
+            name
+            for name in ("tone1", "tone2", "tone3_r", "tone3_l")
+            if name in names
+        )
+        edges = {
+            channel: [
+                {
+                    "sampleIndex": int(indices[position]),
+                    "perfTime": float(perf[position]),
+                }
+                for position in SessionDataRecorder._rising_edge_positions(
+                    values[names.index(channel)]
+                )
+            ]
+            for channel in tone_channels
+        }
+        events = []
+        previous_states = {channel: False for channel in tone_channels}
+        for row in sorted(device_rows, key=lambda item: item[0]):
+            perf_time, _, direction, kind, target, context, _, _, payload = row
+            try:
+                decoded = json.loads(payload)
+            except (TypeError, json.JSONDecodeError):
+                decoded = None
+            if kind == "STIMULUS_INPUTS" and isinstance(decoded, dict):
+                for channel in tone_channels:
+                    if channel not in decoded:
+                        continue
+                    state = bool(decoded[channel])
+                    if state and not previous_states[channel]:
+                        events.append({
+                            "channel": channel,
+                            "eventPerfTime": float(perf_time),
+                            "direction": direction,
+                            "kind": kind,
+                            "target": target,
+                            "context": context,
+                        })
+                    previous_states[channel] = state
+            elif kind == "PLAY_TONE":
+                events.append({
+                    "channel": None,
+                    "eventPerfTime": float(perf_time),
+                    "direction": direction,
+                    "kind": kind,
+                    "target": target,
+                    "context": context,
+                    "payload": decoded,
+                })
+
+        claimed = {channel: set() for channel in tone_channels}
+        matched = []
+        unmatched = []
+        for event in events:
+            channel = event["channel"]
+            if channel is None:
+                unmatched.append({
+                    **event,
+                    "reason": "PLAY_TONE does not identify a confirmation line",
+                })
+                continue
+            candidates = [
+                (edge_index, edge)
+                for edge_index, edge in enumerate(edges[channel])
+                if edge_index not in claimed[channel]
+            ]
+            if not candidates:
+                unmatched.append({
+                    **event,
+                    "reason": f"{channel} contained no unclaimed rising edge",
+                })
+                continue
+            edge_index, edge = min(
+                candidates,
+                key=lambda item: abs(
+                    item[1]["perfTime"] - event["eventPerfTime"]
+                ),
+            )
+            latency = edge["perfTime"] - event["eventPerfTime"]
+            if abs(latency) > 0.25:
+                unmatched.append({
+                    **event,
+                    "nearestEdgePerfTime": edge["perfTime"],
+                    "reason": "Nearest electrical edge was more than 250 ms away",
+                })
+                continue
+            claimed[channel].add(edge_index)
+            matched.append({
+                **event,
+                "sampleIndex": edge["sampleIndex"],
+                "edgePerfTime": edge["perfTime"],
+                "latencySeconds": latency,
+                "resolutionSeconds": None if rate is None else 1.0 / rate,
+            })
+
+        unmatched_edges = [
+            {
+                "channel": channel,
+                **edge,
+            }
+            for channel in tone_channels
+            for edge_index, edge in enumerate(edges[channel])
+            if edge_index not in claimed[channel]
+        ]
+        return {
+            "status": (
+                "unavailable"
+                if not tone_channels
+                else "complete"
+                if not unmatched and not unmatched_edges
+                else "partial"
+            ),
+            "channels": list(tone_channels),
+            "matched": matched,
+            "unmatchedEvents": unmatched,
+            "unmatchedEdges": unmatched_edges,
+            "resolutionSeconds": None if rate is None else 1.0 / rate,
+        }
 
     @staticmethod
     def _alignment_entry(path, perf_times, start_perf, clock):
