@@ -2133,8 +2133,28 @@ class AppModel(ObservableObject):
                     camera.on_capture_start()
                     log_hardware_initialization(logger, "READY | camera capture enabled | name=%s", camera.name)
 
-        # sleep, relatively a bit, to give more time to synced cameras to start together
-        time.sleep(1.5)
+        # A RUNNING capture process only means that its camera backend and worker
+        # threads initialized. Do not expose acquisition as ready until every
+        # enabled synchronized camera has delivered a real frame. This also
+        # catches a missing primary-to-secondary hardware trigger before Record
+        # can initialize a session.
+        if did_start:
+            first_frame_deadline = time.perf_counter() + 5
+            for camera in synced_cameras:
+                remaining = max(0, first_frame_deadline - time.perf_counter())
+                if not camera.wait_for_first_frame(timeout=remaining):
+                    did_start = False
+                    self.on_error(
+                        "Camera capture failed",
+                        _failed_camera_template(camera.name, camera.last_error),
+                    )
+                    break
+                log_hardware_initialization(
+                    logger,
+                    "READY | camera first frame | name=%s frame=%s",
+                    camera.name,
+                    camera.last_captured_frame_index,
+                )
 
         # 5) remaining non-synced camera(s)
         camera = self._top_camera
@@ -2161,13 +2181,21 @@ class AppModel(ObservableObject):
                     self.on_error("Camera start failed", _failed_camera_template(camera.name, camera.last_error))
                 else:
                     camera.on_capture_start()
-                    log_hardware_initialization(
-                        logger,
-                        "READY | camera process and capture | name=%s status=%s elapsed=%.3fs",
-                        camera.name,
-                        camera.video_status.name,
-                        time.perf_counter() - camera_started,
-                    )
+                    if not camera.wait_for_first_frame(timeout=5):
+                        did_start = False
+                        self.on_error(
+                            "Camera capture failed",
+                            _failed_camera_template(camera.name, camera.last_error),
+                        )
+                    else:
+                        log_hardware_initialization(
+                            logger,
+                            "READY | camera process and capture | name=%s status=%s frame=%s elapsed=%.3fs",
+                            camera.name,
+                            camera.video_status.name,
+                            camera.last_captured_frame_index,
+                            time.perf_counter() - camera_started,
+                        )
 
         if not did_start:
             logger.error("failed to start all subprocesses")

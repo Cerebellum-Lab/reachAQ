@@ -113,7 +113,7 @@ class CaptureAttrs:
     image_queue: Optional[Union[queue.Queue, FixedArrayQueue]]
     """Queue for camera frame output"""
 
-    frame: Synchronized[int]  # actually unused
+    frame: Synchronized[int]
     """Current frame index - value is read-only to callers"""
 
     camera: CaptureCameraAttrs
@@ -610,10 +610,8 @@ class VideoCapture(Process):
                 is_record_active = self._is_record_active
                 # secondary cam reads this value from the primary cam shared flag below.
 
-            perf_now = time.perf_counter()
-            set_watchdog(perf_now)
-
             if not self._is_capturing:
+                set_watchdog(time.perf_counter())
                 if record_start_stop_frame_idx is not None:
                     synced_frame_idx = cam_frame_id  # ensure immediate stop
                     perform_stop_recording(force=True)
@@ -657,6 +655,11 @@ class VideoCapture(Process):
                 perf_now = time.perf_counter()
 
                 cam_frame_id = camera.frame_id
+                attrs.frame.value = cam_frame_id
+                # A camera watchdog measures delivery of real frames. Updating it
+                # before a blocking capture attempt can make retry activity look
+                # healthy even when the camera is no longer producing frames.
+                set_watchdog(perf_now)
                 # NB: the frame 'when' can be in different clock than what we can assume,
                 # using time.time() and .perf_counter() for precision :
                 frame_perf_c = camera.frame_perf_c

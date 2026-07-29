@@ -333,13 +333,19 @@ class SpinCam(CameraBase):
         self._camera = None
 
     def _capture(self):
-        p_timeout = time.perf_counter() + 15  # eventual todo: allow config
+        # Keep the backend timeout below the application camera watchdog. A
+        # fifteen-second block made capture shutdown lag well behind the
+        # five-second watchdog after a trigger/camera failure.
+        capture_timeout = 4
+        p_timeout = time.perf_counter() + capture_timeout
         try_count = 0
         t_prev_after = p_prev_after = -math.inf
         while True:
             try_count += 1
             if time.perf_counter() > p_timeout:
-                raise RuntimeError("Failed capture a frame in time")
+                raise RuntimeError(
+                    f"Failed to capture a frame within {capture_timeout} seconds"
+                )
             t_before = time.time()
             p_before = time.perf_counter()
             try:

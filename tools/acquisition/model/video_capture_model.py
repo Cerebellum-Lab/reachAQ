@@ -188,7 +188,7 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
         self._msg_queue = msg_queue  # for sending "status" message(s) to main process
         self._video_command_queue = mp_ctx.Queue(maxsize=64)
         self._video_status = mp_ctx.Value(ctypes.c_int, CaptureProcessStatus.UNKNOWN)
-        self._video_frame_index = mp_ctx.Value(ctypes.c_int64, -1)  # actually unused
+        self._video_frame_index = mp_ctx.Value(ctypes.c_int64, -1)
         self._video_image_queue: Optional[FixedArrayQueue] = None
         self._errors: SynchronizedString = mp_ctx.Array(ctypes.c_char, bytes(512))
         self._watchdog_capture_perf_c = mp_ctx.Value(ctypes.c_double, math.nan)
@@ -242,6 +242,10 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
         if proc is None:
             return math.nan
         return self._watchdog_capture_perf_c.value
+
+    @property
+    def last_captured_frame_index(self) -> int:
+        return self._video_frame_index.value
 
     @property
     def capture_process_status(self) -> CaptureProcessStatus:
@@ -440,6 +444,7 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
         if not self._is_enabled:
             return True
         self._frame_count = 0
+        self._video_frame_index.value = -1
 
         # before everything below, particularly video_reader
         self._video_image_queue = None if self._shape is None else FixedArrayQueue(
@@ -656,6 +661,27 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
                 self._last_error = self._errors.value.decode()
                 logger.error("<%s> failed to receive %s acknowledgement ; current=%s",
                              self._name, expected, cur_status)
+                return False
+            time.sleep(0.001)
+        return True
+
+    def wait_for_first_frame(self, *, timeout: float) -> bool:
+        """Wait until the capture child has delivered an actual camera frame."""
+        perf_timeout = time.perf_counter() + timeout
+        logger.debug("<%s> waiting for first captured frame", self._name)
+        while self._video_frame_index.value < 0:
+            status = CaptureProcessStatus(self._video_status.value)
+            if status in (CaptureProcessStatus.FAILED, CaptureProcessStatus.TERMINATED):
+                self._last_error = self._errors.value.decode() or (
+                    f"capture process entered {status.name} before delivering a frame"
+                )
+                return False
+            if time.perf_counter() > perf_timeout:
+                self._last_error = (
+                    f"camera did not deliver a frame within {timeout:g} seconds; "
+                    "check the camera connection and hardware trigger"
+                )
+                logger.error("<%s> %s", self._name, self._last_error)
                 return False
             time.sleep(0.001)
         return True

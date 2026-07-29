@@ -32,6 +32,8 @@ def test_with_prebuffer(
     assert video_capture_model.on_prepare_capture() is True
     video_capture_model.on_capture_start()
     assert video_capture_model.wait_for_capture_status(CaptureProcessStatus.RUNNING, timeout=5) is True
+    assert video_capture_model.wait_for_first_frame(timeout=5) is True
+    assert video_capture_model.last_captured_frame_index >= 0
     time.sleep(prebuffer_duration + 0.5)  # ensure prebuffer is filled enough
     video_capture_model.on_trigger_recording(True)
     time.sleep(record_duration)
@@ -97,6 +99,8 @@ def test_with_primary_secondary(
     video_capture_model2.on_capture_start()
     assert video_capture_model.wait_for_capture_status(CaptureProcessStatus.RUNNING, timeout=5) is True
     assert video_capture_model2.wait_for_capture_status(CaptureProcessStatus.RUNNING, timeout=5) is True
+    assert video_capture_model.wait_for_first_frame(timeout=5) is True
+    assert video_capture_model2.wait_for_first_frame(timeout=5) is True
     time.sleep(conf.record_prebuffer_duration + 0.5)  # ensure prebuffer is filled enough
     received_msgs = []
     get_all_msgs_into(msg_q, received_msgs)

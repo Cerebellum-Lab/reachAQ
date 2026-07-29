@@ -26,3 +26,14 @@ def test_video_capture_invalid_camera(video_capture):
     assert wait_for_status(video_capture._status, CaptureProcessStatus.FAILED, timeout=4)
 
     assert len(video_capture._errors.value.decode()) > 0
+
+
+def test_video_capture_model_requires_a_real_first_frame(video_capture_model):
+    video_capture_model._video_status.value = CaptureProcessStatus.RUNNING
+    video_capture_model._video_frame_index.value = -1
+
+    assert video_capture_model.wait_for_first_frame(timeout=0.001) is False
+    assert "did not deliver a frame" in video_capture_model.last_error
+
+    video_capture_model._video_frame_index.value = 0
+    assert video_capture_model.wait_for_first_frame(timeout=0.001) is True
