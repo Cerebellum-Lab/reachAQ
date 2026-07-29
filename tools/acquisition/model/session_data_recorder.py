@@ -607,6 +607,7 @@ class SessionDataRecorder:
             source_manifest,
             {} if source_results is None else source_results,
             start_perf=start_perf,
+            end_perf=end_perf,
             device_perf=tuple(row[0] for row in device_rows),
             laser_perf=tuple(row[0] for row in laser_rows),
             log_perf=tuple(row[0] for row in log_rows),
@@ -713,6 +714,7 @@ class SessionDataRecorder:
         source_results,
         *,
         start_perf,
+        end_perf,
         device_perf,
         laser_perf,
         log_perf,
@@ -783,6 +785,13 @@ class SessionDataRecorder:
 
             failure = result.get("failure", "")
             source["sampleCount"] = int(sample_count or 0)
+            if (
+                (source_id.startswith("camera.") or source_id == "pose")
+                and source["sampleCount"] > 0
+                and not perf_times
+            ):
+                perf_times = (float(start_perf), float(end_perf))
+                source["timingSource"] = "canonical_camera_boundary"
             source["firstOffsetSeconds"] = (
                 None
                 if not perf_times

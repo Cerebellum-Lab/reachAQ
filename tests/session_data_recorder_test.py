@@ -470,6 +470,12 @@ def test_enabled_source_manifest_contains_final_paths_counts_and_health(
     }
     assert manifest["camera.left"]["path"] == "trial005_left.mp4"
     assert manifest["camera.left"]["sampleCount"] == 3
+    assert manifest["camera.left"]["firstOffsetSeconds"] == 0.0
+    assert manifest["camera.left"]["lastOffsetSeconds"] == pytest.approx(0.002)
+    assert (
+        manifest["camera.left"]["timingSource"]
+        == "canonical_camera_boundary"
+    )
     assert manifest["camera.left"]["persistenceStatus"] == "written"
     assert manifest["nidaq.barcode"]["sampleCount"] == 3
     assert manifest["nidaq.barcode"]["firstOffsetSeconds"] == 0.0
