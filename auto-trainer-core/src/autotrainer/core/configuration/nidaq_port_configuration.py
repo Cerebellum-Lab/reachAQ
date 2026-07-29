@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import ClassVar, Optional
+from typing import ClassVar, Optional, Tuple
 
 from autotrainer.core import make_camelize_representer, make_decamelize_constructor
 from autotrainer.core.configuration import SystemConfigurationDumper, SystemConfigurationLoader
@@ -59,6 +59,37 @@ class NidaqTimingConfiguration:
             value = getattr(self, name)
             if isinstance(value, str):
                 object.__setattr__(self, name, value.strip() or None)
+
+
+@dataclasses.dataclass(frozen=True)
+class NidaqTimingRoute:
+    signal: str
+    source: str
+    destinations: Tuple[str, ...] = tuple()
+
+
+@dataclasses.dataclass(frozen=True)
+class NidaqTimingPlan:
+    """Validated immutable timing plan passed into the NI-DAQ worker."""
+
+    requested_mode: str
+    resolved_mode: str
+    is_valid: bool
+    master_device: Optional[str] = None
+    slave_devices: Tuple[str, ...] = tuple()
+    reference_clock_source: Optional[str] = None
+    reference_clock_rate_hz: Optional[float] = None
+    sample_clock_source: Optional[str] = None
+    start_trigger_source: Optional[str] = None
+    routes: Tuple[NidaqTimingRoute, ...] = tuple()
+    task_start_order: Tuple[str, ...] = tuple()
+    synchronization_quality: str = "unresolved"
+    reason: str = ""
+
+    def __post_init__(self):
+        object.__setattr__(self, "slave_devices", tuple(self.slave_devices))
+        object.__setattr__(self, "routes", tuple(self.routes))
+        object.__setattr__(self, "task_start_order", tuple(self.task_start_order))
 
 
 @dataclasses.dataclass(frozen=True)

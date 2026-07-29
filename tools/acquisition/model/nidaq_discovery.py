@@ -24,6 +24,11 @@ class NidaqDevicePorts:
     analog_inputs: Tuple[str, ...] = tuple()
     digital_outputs: Tuple[str, ...] = tuple()
     digital_inputs: Tuple[str, ...] = tuple()
+    bus_type: str = ""
+    pxi_chassis_number: Optional[int] = None
+    terminals: Tuple[str, ...] = tuple()
+    analog_output_sample_clock_supported: bool = False
+    digital_trigger_supported: bool = False
 
 
 def discover_nidaq_devices() -> Tuple[Tuple[NidaqDevicePorts, ...], Optional[str]]:
@@ -94,6 +99,15 @@ def discover_nidaq_devices() -> Tuple[Tuple[NidaqDevicePorts, ...], Optional[str
             analog_inputs=tuple(device.get("analog_inputs", tuple())),
             digital_outputs=tuple(device.get("digital_outputs", tuple())),
             digital_inputs=tuple(device.get("digital_inputs", tuple())),
+            bus_type=str(device.get("bus_type", "")),
+            pxi_chassis_number=device.get("pxi_chassis_number"),
+            terminals=tuple(device.get("terminals", tuple())),
+            analog_output_sample_clock_supported=bool(
+                device.get("analog_output_sample_clock_supported", False)
+            ),
+            digital_trigger_supported=bool(
+                device.get("digital_trigger_supported", False)
+            ),
         )
         for device in payload.get("devices", tuple())
         if device.get("name")
@@ -153,6 +167,20 @@ def _discover_nidaq_devices_direct() -> Tuple[Tuple[NidaqDevicePorts, ...], Opti
                     digital_inputs=_channel_names(
                         getattr(device, "di_lines", tuple()),
                         getattr(device, "di_physical_chans", tuple()),
+                    ),
+                    bus_type=str(getattr(device, "bus_type", "") or ""),
+                    pxi_chassis_number=_optional_int(
+                        getattr(device, "pxi_chassis_num", None)
+                    ),
+                    terminals=tuple(
+                        str(terminal)
+                        for terminal in (getattr(device, "terminals", tuple()) or tuple())
+                    ),
+                    analog_output_sample_clock_supported=bool(
+                        getattr(device, "ao_samp_clk_supported", False)
+                    ),
+                    digital_trigger_supported=bool(
+                        getattr(device, "dig_trig_supported", False)
                     ),
                 )
             )

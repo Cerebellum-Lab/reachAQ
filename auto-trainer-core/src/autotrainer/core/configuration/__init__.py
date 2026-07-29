@@ -115,6 +115,8 @@ from .nidaq_port_configuration import (
     NidaqDeviceIdentity,
     NidaqPortConfiguration,
     NidaqTimingConfiguration,
+    NidaqTimingPlan,
+    NidaqTimingRoute,
 )
 from .nidaq_stream_configuration import NidaqSignalChannelConfiguration, NidaqSignalStreamConfiguration
 from .persistence_configuration import PersistenceConfiguration

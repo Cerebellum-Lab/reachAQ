@@ -6,7 +6,12 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from autotrainer.core import NidaqPortConfiguration, SystemConfiguration  # noqa: E402
+from autotrainer.core import (  # noqa: E402
+    NidaqDeviceIdentity,
+    NidaqPortConfiguration,
+    NidaqTimingConfiguration,
+    SystemConfiguration,
+)
 from tools.acquisition.model.nidaq_discovery import NidaqDevicePorts  # noqa: E402
 from tools.acquisition.view.nidaq_port_configuration_dialog import NidaqPortConfigurationDialog  # noqa: E402
 
@@ -131,3 +136,59 @@ def test_laser_assignments_remain_visible_when_switching_channel_source(qapp):
         expected_copy = f"DevInputs/ai{laser_index - 1}"
         assert laser_copy.currentData() == expected_copy
         assert expected_copy in _combo_values(laser_copy)
+
+
+def test_timing_master_is_portable_identity_and_only_enabled_for_multi_device(qapp):
+    config = SystemConfiguration()
+    config.nidaq_ports = NidaqPortConfiguration(
+        cam_frames="Acquire/port0/line0",
+        tone1="Confirm/port0/line0",
+        timing=NidaqTimingConfiguration(
+            timing_master=NidaqDeviceIdentity(
+                logical_name="acquisition",
+                runtime_name="Acquire",
+                product_type="InputModel",
+                serial_number=100,
+            ),
+        ),
+    )
+    devices = (
+        NidaqDevicePorts(
+            name="Acquire",
+            product_type="InputModel",
+            serial_number=100,
+            digital_inputs=("Acquire/port0/line0",),
+        ),
+        NidaqDevicePorts(
+            name="Confirm",
+            product_type="OtherModel",
+            serial_number=200,
+            digital_inputs=("Confirm/port0/line0",),
+        ),
+    )
+
+    dialog = NidaqPortConfigurationDialog(config, devices=devices)
+
+    assert dialog._timing_master_combo.isEnabled()
+    selected = dialog._timing_master_combo.currentData()
+    assert selected.serial_number == 100
+    assert selected.runtime_name == "Acquire"
+    built = dialog._build_timing_configuration()
+    assert built.timing_master.serial_number == 100
+
+
+def test_external_timing_mode_exposes_route_overrides(qapp):
+    device = NidaqDevicePorts(
+        name="Dev1",
+        analog_inputs=("Dev1/ai0",),
+    )
+    dialog = NidaqPortConfigurationDialog(SystemConfiguration(), devices=(device,))
+
+    dialog._sync_mode_combo.setCurrentIndex(
+        dialog._sync_mode_combo.findData("external")
+    )
+
+    assert dialog._reference_clock_edit.isEnabled()
+    assert dialog._start_trigger_edit.isEnabled()
+    assert dialog._sample_clock_edit.isEnabled()
+    assert not dialog._timing_master_combo.isEnabled()

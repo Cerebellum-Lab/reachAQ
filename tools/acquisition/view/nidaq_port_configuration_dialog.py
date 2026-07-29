@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QScrollArea,
     QTabWidget,
     QVBoxLayout,
@@ -21,7 +22,9 @@ from autotrainer.core import (
     LaserChannelConfiguration,
     LaserChannelId,
     LaserSystemConfiguration,
+    NidaqDeviceIdentity,
     NidaqPortConfiguration,
+    NidaqTimingConfiguration,
     SystemConfiguration,
 )
 from autotrainer.core.logging import get_verbose_logger
@@ -74,6 +77,7 @@ class NidaqPortConfigurationDialog(QDialog):
         self._discovery_error = discovery_error
         self._nidaq_ports = configuration.nidaq_ports
         self._laser_configuration = configuration.laser
+        self._timing_configuration = configuration.nidaq_ports.timing
         self._general_combos: Dict[str, QComboBox] = {}
         self._laser_combos: Dict[int, Dict[str, QComboBox]] = {}
         self._combo_kinds: Dict[QComboBox, str] = {}
@@ -97,6 +101,46 @@ class NidaqPortConfigurationDialog(QDialog):
         self._status_label = QLabel()
         self._status_label.setWordWrap(True)
         root_layout.addWidget(self._status_label)
+
+        timing_group = QGroupBox("Timing and synchronization")
+        timing_layout = QFormLayout(timing_group)
+        self._sync_mode_combo = QComboBox()
+        for label, value in (
+            ("Automatic (recommended)", "auto"),
+            ("PXI/backplane", "backplane"),
+            ("External clock/trigger", "external"),
+            ("Independent (diagnostic only)", "independent"),
+        ):
+            self._sync_mode_combo.addItem(label, value)
+        timing_layout.addRow("Synchronization:", self._sync_mode_combo)
+        self._timing_master_combo = QComboBox()
+        self._timing_master_combo.addItem("Automatic (recommended)", None)
+        for device in sorted(self._devices.values(), key=lambda item: item.name):
+            identity = self._device_identity(device)
+            detail = device.product_type or "unknown model"
+            if device.serial_number is not None:
+                detail += f", serial {device.serial_number}"
+            self._timing_master_combo.addItem(
+                f"{device.name} — {detail}",
+                identity,
+            )
+        timing_layout.addRow("Timing master:", self._timing_master_combo)
+        self._reference_clock_edit = QLineEdit(
+            self._timing_configuration.reference_clock_source or ""
+        )
+        self._start_trigger_edit = QLineEdit(
+            self._timing_configuration.start_trigger_source or ""
+        )
+        self._sample_clock_edit = QLineEdit(
+            self._timing_configuration.sample_clock_source or ""
+        )
+        timing_layout.addRow("Reference clock override:", self._reference_clock_edit)
+        timing_layout.addRow("Start trigger override:", self._start_trigger_edit)
+        timing_layout.addRow("Sample clock override:", self._sample_clock_edit)
+        self._timing_status_label = QLabel()
+        self._timing_status_label.setWordWrap(True)
+        timing_layout.addRow(self._timing_status_label)
+        root_layout.addWidget(timing_group)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -148,8 +192,20 @@ class NidaqPortConfigurationDialog(QDialog):
         root_layout.addWidget(self._buttons)
 
         self._device_combo.currentTextChanged.connect(self._populate_port_combos)
+        self._sync_mode_combo.currentIndexChanged.connect(
+            self._update_timing_controls
+        )
+        self._timing_master_combo.currentIndexChanged.connect(
+            self._update_timing_controls
+        )
+        sync_index = self._sync_mode_combo.findData(
+            self._timing_configuration.sync_mode
+        )
+        self._sync_mode_combo.setCurrentIndex(max(0, sync_index))
+        self._select_configured_timing_master()
         self._select_initial_device()
         self._populate_port_combos()
+        self._update_timing_controls()
 
     @property
     def nidaq_ports(self) -> NidaqPortConfiguration:
@@ -159,12 +215,17 @@ class NidaqPortConfigurationDialog(QDialog):
     def laser_configuration(self) -> LaserSystemConfiguration:
         return self._laser_configuration
 
+    @property
+    def timing_configuration(self) -> NidaqTimingConfiguration:
+        return self._timing_configuration
+
     def accept(self) -> None:
         try:
             device = self._selected_device()
             if device is None:
                 raise RuntimeError("No NI-DAQ device is available for port configuration")
             self._validate_selected_channel_assignments(device)
+            self._timing_configuration = self._build_timing_configuration()
             self._nidaq_ports = self._build_nidaq_port_configuration(device.name)
             self._laser_configuration = self._build_laser_configuration()
         except Exception as exc:
@@ -228,6 +289,7 @@ class NidaqPortConfigurationDialog(QDialog):
             self._combo_selections[combo] = self._combo_value(combo)
         self._refresh_channel_options()
         self._update_status_label()
+        self._update_timing_controls()
 
     def _refresh_channel_options(self) -> None:
         device = self._selected_device()
@@ -324,9 +386,92 @@ class NidaqPortConfigurationDialog(QDialog):
         }
         return NidaqPortConfiguration(
             device_name=device_name,
-            timing=self._configuration.nidaq_ports.timing,
+            timing=self._timing_configuration,
             **values,
         )
+
+    def _build_timing_configuration(self) -> NidaqTimingConfiguration:
+        return NidaqTimingConfiguration(
+            sync_mode=self._sync_mode_combo.currentData(),
+            timing_master=self._timing_master_combo.currentData(),
+            require_hardware_synchronization=True,
+            reference_clock_source=self._optional_text(self._reference_clock_edit),
+            start_trigger_source=self._optional_text(self._start_trigger_edit),
+            sample_clock_source=self._optional_text(self._sample_clock_edit),
+        )
+
+    def _select_configured_timing_master(self) -> None:
+        configured = self._timing_configuration.timing_master
+        if configured is None:
+            self._timing_master_combo.setCurrentIndex(0)
+            return
+        for index in range(1, self._timing_master_combo.count()):
+            candidate = self._timing_master_combo.itemData(index)
+            if not isinstance(candidate, NidaqDeviceIdentity):
+                continue
+            if (
+                configured.serial_number is not None
+                and configured.serial_number == candidate.serial_number
+                and (
+                    configured.product_type is None
+                    or configured.product_type == candidate.product_type
+                )
+            ) or (
+                configured.serial_number is None
+                and configured.runtime_name == candidate.runtime_name
+            ):
+                self._timing_master_combo.setCurrentIndex(index)
+                return
+
+    def _update_timing_controls(self, *_args) -> None:
+        mode = self._sync_mode_combo.currentData()
+        is_external = mode == "external"
+        for edit in (
+            self._reference_clock_edit,
+            self._start_trigger_edit,
+            self._sample_clock_edit,
+        ):
+            edit.setEnabled(is_external)
+        selected_devices = {
+            device_name_from_channel(value)
+            for _role, _kind, value in self._selected_channel_entries()
+            if device_name_from_channel(value)
+        }
+        self._timing_master_combo.setEnabled(len(selected_devices) > 1)
+        if len(selected_devices) <= 1:
+            explanation = (
+                "One active NI-DAQ device: all sampled channels share its "
+                "hardware timeline."
+            )
+        elif mode == "independent":
+            explanation = (
+                "Independent clocks are diagnostic-only and block aligned "
+                "session recording."
+            )
+        elif mode == "external":
+            explanation = (
+                "External mode requires validated sample-clock and start-trigger "
+                "wiring on every participating rig."
+            )
+        else:
+            explanation = (
+                "The runtime discovers compatible routes, arms slaves first, "
+                "and starts the resolved master last."
+            )
+        self._timing_status_label.setText(explanation)
+
+    @staticmethod
+    def _device_identity(device: NidaqDevicePorts) -> NidaqDeviceIdentity:
+        return NidaqDeviceIdentity(
+            logical_name=device.name,
+            runtime_name=device.name,
+            product_type=device.product_type or None,
+            serial_number=device.serial_number,
+        )
+
+    @staticmethod
+    def _optional_text(edit: QLineEdit) -> Optional[str]:
+        return edit.text().strip() or None
 
     def _build_laser_configuration(self) -> LaserSystemConfiguration:
         existing = {
