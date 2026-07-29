@@ -83,6 +83,7 @@ class NidaqTimingPlan:
     start_trigger_source: Optional[str] = None
     routes: Tuple[NidaqTimingRoute, ...] = tuple()
     task_start_order: Tuple[str, ...] = tuple()
+    resolved_devices: Tuple[NidaqDeviceIdentity, ...] = tuple()
     synchronization_quality: str = "unresolved"
     reason: str = ""
 
@@ -90,6 +91,11 @@ class NidaqTimingPlan:
         object.__setattr__(self, "slave_devices", tuple(self.slave_devices))
         object.__setattr__(self, "routes", tuple(self.routes))
         object.__setattr__(self, "task_start_order", tuple(self.task_start_order))
+        object.__setattr__(
+            self,
+            "resolved_devices",
+            tuple(self.resolved_devices),
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -103,6 +109,7 @@ class NidaqPortConfiguration:
     tone3_l: Optional[str] = None
     cam_frames: Optional[str] = None
     barcode: Optional[str] = None
+    device_identities: Tuple[NidaqDeviceIdentity, ...] = tuple()
     timing: NidaqTimingConfiguration = dataclasses.field(
         default_factory=NidaqTimingConfiguration,
     )
@@ -113,6 +120,11 @@ class NidaqPortConfiguration:
             if isinstance(value, str):
                 value = value.strip() or None
                 object.__setattr__(self, field.name, value)
+        object.__setattr__(
+            self,
+            "device_identities",
+            tuple(self.device_identities),
+        )
 
 
 for _tag, _cls in (

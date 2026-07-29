@@ -24,11 +24,16 @@ class NidaqDevicePorts:
     analog_inputs: Tuple[str, ...] = tuple()
     digital_outputs: Tuple[str, ...] = tuple()
     digital_inputs: Tuple[str, ...] = tuple()
+    counter_outputs: Tuple[str, ...] = tuple()
+    counter_inputs: Tuple[str, ...] = tuple()
     bus_type: str = ""
     pxi_chassis_number: Optional[int] = None
     terminals: Tuple[str, ...] = tuple()
-    analog_output_sample_clock_supported: bool = False
-    digital_trigger_supported: bool = False
+    analog_output_sample_clock_supported: Optional[bool] = None
+    digital_trigger_supported: Optional[bool] = None
+    analog_input_max_single_channel_rate: Optional[float] = None
+    analog_input_max_multi_channel_rate: Optional[float] = None
+    analog_output_max_rate: Optional[float] = None
 
 
 def discover_nidaq_devices() -> Tuple[Tuple[NidaqDevicePorts, ...], Optional[str]]:
@@ -99,14 +104,25 @@ def discover_nidaq_devices() -> Tuple[Tuple[NidaqDevicePorts, ...], Optional[str
             analog_inputs=tuple(device.get("analog_inputs", tuple())),
             digital_outputs=tuple(device.get("digital_outputs", tuple())),
             digital_inputs=tuple(device.get("digital_inputs", tuple())),
+            counter_outputs=tuple(device.get("counter_outputs", tuple())),
+            counter_inputs=tuple(device.get("counter_inputs", tuple())),
             bus_type=str(device.get("bus_type", "")),
             pxi_chassis_number=device.get("pxi_chassis_number"),
             terminals=tuple(device.get("terminals", tuple())),
-            analog_output_sample_clock_supported=bool(
-                device.get("analog_output_sample_clock_supported", False)
+            analog_output_sample_clock_supported=_optional_bool(
+                device.get("analog_output_sample_clock_supported")
             ),
-            digital_trigger_supported=bool(
-                device.get("digital_trigger_supported", False)
+            digital_trigger_supported=_optional_bool(
+                device.get("digital_trigger_supported")
+            ),
+            analog_input_max_single_channel_rate=_optional_float(
+                device.get("analog_input_max_single_channel_rate")
+            ),
+            analog_input_max_multi_channel_rate=_optional_float(
+                device.get("analog_input_max_multi_channel_rate")
+            ),
+            analog_output_max_rate=_optional_float(
+                device.get("analog_output_max_rate")
             ),
         )
         for device in payload.get("devices", tuple())
@@ -168,6 +184,12 @@ def _discover_nidaq_devices_direct() -> Tuple[Tuple[NidaqDevicePorts, ...], Opti
                         getattr(device, "di_lines", tuple()),
                         getattr(device, "di_physical_chans", tuple()),
                     ),
+                    counter_outputs=_channel_names(
+                        getattr(device, "co_physical_chans", tuple()),
+                    ),
+                    counter_inputs=_channel_names(
+                        getattr(device, "ci_physical_chans", tuple()),
+                    ),
                     bus_type=str(getattr(device, "bus_type", "") or ""),
                     pxi_chassis_number=_optional_int(
                         getattr(device, "pxi_chassis_num", None)
@@ -176,11 +198,20 @@ def _discover_nidaq_devices_direct() -> Tuple[Tuple[NidaqDevicePorts, ...], Opti
                         str(terminal)
                         for terminal in (getattr(device, "terminals", tuple()) or tuple())
                     ),
-                    analog_output_sample_clock_supported=bool(
-                        getattr(device, "ao_samp_clk_supported", False)
+                    analog_output_sample_clock_supported=_optional_bool(
+                        getattr(device, "ao_samp_clk_supported", None)
                     ),
-                    digital_trigger_supported=bool(
-                        getattr(device, "dig_trig_supported", False)
+                    digital_trigger_supported=_optional_bool(
+                        getattr(device, "dig_trig_supported", None)
+                    ),
+                    analog_input_max_single_channel_rate=_optional_float(
+                        getattr(device, "ai_max_single_chan_rate", None)
+                    ),
+                    analog_input_max_multi_channel_rate=_optional_float(
+                        getattr(device, "ai_max_multi_chan_rate", None)
+                    ),
+                    analog_output_max_rate=_optional_float(
+                        getattr(device, "ao_max_rate", None)
                     ),
                 )
             )
@@ -229,3 +260,16 @@ def _optional_int(value) -> Optional[int]:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _optional_float(value) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_bool(value) -> Optional[bool]:
+    if value is None:
+        return None
+    return bool(value)
