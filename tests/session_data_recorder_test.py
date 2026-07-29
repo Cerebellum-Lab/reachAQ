@@ -71,10 +71,16 @@ def test_structured_device_ledger_captures_decoded_input_and_output():
             10.1,
             100.1,
         )
+        handler.decoded_message_received(
+            SystemStatusMessageKind.ACKNOWLEDGE,
+            ("token-1", 10.15),
+            10.2,
+            100.2,
+        )
 
         rows = tuple(recorder._device_rows)
 
-        assert len(rows) == 2
+        assert len(rows) == 3
         assert rows[0][2:5] == ("inbound", "STIMULUS_INPUTS", "")
         assert json.loads(rows[0][-1]) == {"tone1": True}
         assert rows[1][2:6] == (
@@ -84,6 +90,12 @@ def test_structured_device_ledger_captures_decoded_input_and_output():
             "token-1",
         )
         assert json.loads(rows[1][-1]) == [7000, 100]
+        assert rows[2][2:6] == (
+            "inbound",
+            "ACKNOWLEDGE",
+            "",
+            "token-1",
+        )
     finally:
         recorder.close()
 

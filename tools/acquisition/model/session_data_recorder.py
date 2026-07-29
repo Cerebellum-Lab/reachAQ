@@ -240,13 +240,20 @@ class SessionDataRecorder:
         perf_time: float,
         wall_time: float,
     ) -> None:
+        context = None
+        if (
+            getattr(kind, "name", None) == "ACKNOWLEDGE"
+            and isinstance(data, (tuple, list))
+            and data
+        ):
+            context = data[0]
         self._append_device_event(
             perf_time,
             wall_time,
             "inbound",
             kind,
             data,
-            None,
+            context,
             None,
         )
 
