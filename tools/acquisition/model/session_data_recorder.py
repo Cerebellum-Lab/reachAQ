@@ -68,6 +68,7 @@ class SessionDataRecorder:
         self._nidaq_stop = threading.Event()
         self._nidaq_thread: Optional[threading.Thread] = None
         self._source_manifest = ()
+        self._source_results = {}
 
         self._system_message_handler = system_message_handler
         self._hardware_model = hardware_model
@@ -95,6 +96,7 @@ class SessionDataRecorder:
             self._nidaq_chunks = []
             self._nidaq_last_index = None
             self._source_manifest = tuple(source_manifest)
+            self._source_results = {}
             self._start_perf = None
             self._start_wall = None
             self._boundary = None
@@ -149,6 +151,7 @@ class SessionDataRecorder:
             nidaq_chunks = tuple(self._nidaq_chunks)
             timing_plan = self._nidaq_monitor.timing_plan
             source_manifest = self._source_manifest
+            source_results = dict(self._source_results)
             self._clear_locked()
         return self._write_session(
             project,
@@ -162,6 +165,7 @@ class SessionDataRecorder:
             timing_plan,
             device_event_overruns=device_event_overruns,
             source_manifest=source_manifest,
+            source_results=source_results,
             boundary=boundary,
         )
 
@@ -196,6 +200,25 @@ class SessionDataRecorder:
                 message,
             ))
 
+    def set_source_result(
+        self,
+        source_id: str,
+        *,
+        sample_count: Optional[int] = None,
+        path: Optional[str] = None,
+        failure: str = "",
+    ) -> None:
+        with self._lock:
+            if not self._armed:
+                return
+            self._source_results[str(source_id)] = {
+                "sampleCount": (
+                    None if sample_count is None else int(sample_count)
+                ),
+                "path": path,
+                "failure": str(failure or ""),
+            }
+
     def _clear_locked(self) -> None:
         self._armed = False
         self._project = None
@@ -208,6 +231,7 @@ class SessionDataRecorder:
         self._nidaq_chunks = []
         self._nidaq_last_index = None
         self._source_manifest = ()
+        self._source_results = {}
 
     def _on_device_message(
         self,
@@ -439,6 +463,7 @@ class SessionDataRecorder:
         *,
         device_event_overruns=0,
         source_manifest=(),
+        source_results=None,
         boundary: Optional[SessionBoundary] = None,
     ):
         session_dir = Path(project.get_session_path().location)
@@ -570,11 +595,42 @@ class SessionDataRecorder:
             nidaq_chunks,
             timing_plan,
         )
+        finalized_sources = SessionDataRecorder._finalize_source_manifest(
+            session_dir,
+            source_manifest,
+            {} if source_results is None else source_results,
+            start_perf=start_perf,
+            device_perf=tuple(row[0] for row in device_rows),
+            laser_perf=tuple(row[0] for row in laser_rows),
+            log_perf=tuple(row[0] for row in log_rows),
+            nidaq_perf=nidaq_perf,
+            nidaq_chunks=nidaq_chunks,
+            device_event_overruns=device_event_overruns,
+        )
         incomplete_reasons = []
         if device_event_overruns:
             incomplete_reasons.append(
                 f"decoded device event ring overran by {device_event_overruns} event(s)"
             )
+        for source in finalized_sources:
+            source_id = source.get("id", "unknown")
+            if source["persistenceStatus"] != "written":
+                incomplete_reasons.append(
+                    f"{source_id} persistence {source['persistenceStatus']}"
+                    + (
+                        ""
+                        if not source.get("failure")
+                        else f": {source['failure']}"
+                    )
+                )
+            if source["gapCount"]:
+                incomplete_reasons.append(
+                    f"{source_id} reported {source['gapCount']} acquisition gap(s)"
+                )
+            if source["overrunCount"]:
+                incomplete_reasons.append(
+                    f"{source_id} overran by {source['overrunCount']} sample/event(s)"
+                )
         alignment = {
             "schemaVersion": 1,
             "canonicalBoundary": {
@@ -627,7 +683,7 @@ class SessionDataRecorder:
             "deviceEventOverruns": int(device_event_overruns),
             "sessionComplete": not incomplete_reasons,
             "incompleteReasons": incomplete_reasons,
-            "enabledSources": list(source_manifest),
+            "enabledSources": finalized_sources,
             "cameraNidaqAlignment": camera_nidaq_alignment,
             "toneConfirmation": tone_confirmation,
         }
@@ -640,7 +696,124 @@ class SessionDataRecorder:
             "deviceEventOverruns": int(device_event_overruns),
             "sessionComplete": not incomplete_reasons,
             "incompleteReasons": tuple(incomplete_reasons),
+            "enabledSources": finalized_sources,
         }
+
+    @staticmethod
+    def _finalize_source_manifest(
+        session_dir,
+        source_manifest,
+        source_results,
+        *,
+        start_perf,
+        device_perf,
+        laser_perf,
+        log_perf,
+        nidaq_perf,
+        nidaq_chunks,
+        device_event_overruns,
+    ):
+        gap_count = max(
+            (int(chunk[7]) for chunk in nidaq_chunks),
+            default=0,
+        )
+        nidaq_overruns = sum(
+            int(chunk[8]) for chunk in nidaq_chunks
+        )
+        stream_stats = {
+            "device": (
+                device_perf,
+                int(device_event_overruns),
+                0,
+            ),
+            "laser_outputs": (laser_perf, 0, 0),
+            "session_logs": (log_perf, 0, 0),
+        }
+        finalized = []
+        for raw_source in source_manifest:
+            source = dict(raw_source)
+            source_id = str(source.get("id", ""))
+            result = source_results.get(source_id, {})
+            perf_times = ()
+            overrun_count = 0
+            source_gap_count = 0
+            if source_id.startswith("nidaq."):
+                perf_times = nidaq_perf
+                overrun_count = nidaq_overruns
+                source_gap_count = gap_count
+            elif source_id in stream_stats:
+                (
+                    perf_times,
+                    overrun_count,
+                    source_gap_count,
+                ) = stream_stats[source_id]
+
+            if source_id == "pose":
+                pose_paths = sorted(session_dir.glob("*_raw2D_live.h5"))
+                source["paths"] = [
+                    path.relative_to(session_dir).as_posix()
+                    for path in pose_paths
+                ]
+                sample_count = sum(
+                    SessionDataRecorder._h5_primary_row_count(path)
+                    for path in pose_paths
+                )
+                path_exists = bool(pose_paths)
+            else:
+                result_path = result.get("path")
+                if result_path:
+                    source["path"] = result_path
+                path_text = source.get("path")
+                path = (
+                    None
+                    if not path_text
+                    else session_dir / str(path_text)
+                )
+                path_exists = path is not None and path.exists()
+                sample_count = result.get("sampleCount")
+                if sample_count is None:
+                    sample_count = len(perf_times)
+
+            failure = result.get("failure", "")
+            source["sampleCount"] = int(sample_count or 0)
+            source["firstOffsetSeconds"] = (
+                None
+                if not perf_times
+                else float(perf_times[0] - start_perf)
+            )
+            source["lastOffsetSeconds"] = (
+                None
+                if not perf_times
+                else float(perf_times[-1] - start_perf)
+            )
+            source["gapCount"] = int(source_gap_count)
+            source["overrunCount"] = int(overrun_count)
+            source["failure"] = failure or None
+            source["persistenceStatus"] = (
+                "failed"
+                if failure
+                else "written"
+                if path_exists
+                else "missing"
+            )
+            finalized.append(source)
+        return finalized
+
+    @staticmethod
+    def _h5_primary_row_count(path: Path) -> int:
+        try:
+            with h5py.File(path, "r") as stream:
+                counts = []
+                stream.visititems(
+                    lambda _name, item: (
+                        counts.append(int(item.shape[0]))
+                        if isinstance(item, h5py.Dataset) and item.shape
+                        else None
+                    )
+                )
+                return max(counts, default=0)
+        except (OSError, ValueError):
+            return 0
 
     @staticmethod
     def _nidaq_arrays(chunks):

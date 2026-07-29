@@ -1,6 +1,7 @@
 import csv
 import json
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 
 import h5py
@@ -385,3 +386,82 @@ def test_device_event_overrun_marks_session_incomplete(tmp_path):
     )
     assert alignment["sessionComplete"] is False
     assert alignment["deviceEventOverruns"] == 3
+
+
+def test_enabled_source_manifest_contains_final_paths_counts_and_health(
+    tmp_path,
+):
+    project = ProjectInfo(
+        root=str(tmp_path),
+        device_id="test",
+        when=datetime(2026, 1, 2, 3, 4, 5),
+        session=5,
+    )
+    session_dir = Path(project.get_session_path().location)
+    session_dir.mkdir(parents=True, exist_ok=True)
+    camera_path = session_dir / "trial005_left.mp4"
+    camera_path.touch()
+    chunk = (
+        np.arange(3, dtype=np.int64),
+        np.array((10.0, 10.001, 10.002)),
+        np.array((100.0, 100.001, 100.002)),
+        np.zeros((1, 3), dtype=np.float32),
+        ("barcode",),
+        1000.0,
+        1,
+        2,
+        4,
+    )
+    sources = (
+        {
+            "id": "camera.left",
+            "kind": "camera",
+            "path": "placeholder",
+            "runtimeState": "ready",
+        },
+        {
+            "id": "nidaq.barcode",
+            "kind": "nidaq_digital",
+            "path": "streams/nidaq.h5",
+            "runtimeState": "ready",
+        },
+        {
+            "id": "device",
+            "kind": "decoded_can_and_device_events",
+            "path": "streams/device.csv",
+            "runtimeState": "ready",
+        },
+    )
+
+    result = SessionDataRecorder._write_session(
+        project,
+        10.0,
+        100.0,
+        10.002,
+        (),
+        (),
+        (),
+        (chunk,),
+        source_manifest=sources,
+        source_results={
+            "camera.left": {
+                "sampleCount": 3,
+                "path": camera_path.relative_to(session_dir).as_posix(),
+                "failure": "",
+            },
+        },
+    )
+
+    manifest = {
+        source["id"]: source
+        for source in result["enabledSources"]
+    }
+    assert manifest["camera.left"]["path"] == "trial005_left.mp4"
+    assert manifest["camera.left"]["sampleCount"] == 3
+    assert manifest["camera.left"]["persistenceStatus"] == "written"
+    assert manifest["nidaq.barcode"]["sampleCount"] == 3
+    assert manifest["nidaq.barcode"]["firstOffsetSeconds"] == 0.0
+    assert manifest["nidaq.barcode"]["gapCount"] == 2
+    assert manifest["nidaq.barcode"]["overrunCount"] == 4
+    assert manifest["device"]["sampleCount"] == 0
+    assert manifest["device"]["persistenceStatus"] == "written"

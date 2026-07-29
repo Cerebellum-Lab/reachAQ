@@ -1329,6 +1329,22 @@ class AppModel(ObservableObject):
                 cams_closed_finished[cam_idx] = (project, frames_written)
                 if all(cam.camera_index in cams_closed_finished for cam in recording_cams):
                     project = cams_closed_finished[recording_cams[0].camera_index][0]
+                    session_dir = Path(project.get_session_path().location)
+                    for camera in recording_cams:
+                        camera_project, camera_frames = cams_closed_finished[
+                            camera.camera_index
+                        ]
+                        video_path, _, _ = camera_project.get_video_path(
+                            camera.name,
+                            allow_overwrite=True,
+                        )
+                        self._session_data_recorder.set_source_result(
+                            f"camera.{camera.name}",
+                            sample_count=camera_frames,
+                            path=Path(video_path).relative_to(
+                                session_dir
+                            ).as_posix(),
+                        )
                     monitored_cams = tuple(
                         camera for camera in recording_cams
                         if camera in self._reach_cameras
@@ -1359,6 +1375,10 @@ class AppModel(ObservableObject):
                         )
                         logger.error(message)
                         self.on_error("Pose writer close timeout", message)
+                        self._session_data_recorder.set_source_result(
+                            "pose",
+                            failure=message,
+                        )
                     if self._session_recording_status == SessionRecordingStatus.ABORTING:
                         self._finish_abort_recording()
                     elif self._session_recording_status == SessionRecordingStatus.STOPPING:
