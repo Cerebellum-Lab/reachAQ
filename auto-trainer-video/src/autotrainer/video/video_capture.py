@@ -412,6 +412,8 @@ class VideoCapture(Process):
         synced_frame_idx: Optional[int] = None
         msg_q = attrs.msg_queue  # message queue to main process
         record_start_stop_frame_idx: Optional[int] = None
+        last_recorded_frame_id = -1
+        last_recorded_frame_perf = math.nan
         next_t_image_q = time.perf_counter()
         img_q = self._image_queue  # image queue to main/GUI process view
         record_q_list = self._record_queue_list
@@ -508,7 +510,7 @@ class VideoCapture(Process):
 
         def perform_stop_recording(force: bool=False):
             nonlocal record_start_stop_frame_idx, synced_frame_idx, record_q_list
-            nonlocal cnt_net_q_put
+            nonlocal cnt_net_q_put, last_recorded_frame_id, last_recorded_frame_perf
             if force:
                 synced_frame_idx = cam_frame_id
             if cam_frame_id >= synced_frame_idx:
@@ -525,12 +527,18 @@ class VideoCapture(Process):
             if idx >= 0:
                 logger.debug("cutted record_q_list at %s, len=%s", idx, len(record_q_list))
                 del record_q_list[idx:]
+            final_frame_id = last_recorded_frame_id
+            final_frame_perf = last_recorded_frame_perf
             if len(record_q_list) > 0:
+                final_frame_id = record_q_list[-1][0]
+                final_frame_perf = record_q_list[-1][3]
                 rec_q_put(record_q_list)
                 record_q_list = self._record_queue_list = []
             if cam_frame_id <= synced_frame_idx:
                 # don't miss this one too
                 rec_q_put([(cam_frame_id, frame, when, frame_perf_c)])
+                final_frame_id = cam_frame_id
+                final_frame_perf = frame_perf_c
             rec_q_put([])  # empty list is mark for EOR for recorder thread
 
             synced_frame_idx = None  # don't forget now.
@@ -554,7 +562,8 @@ class VideoCapture(Process):
 
             if msg_q is not None:
                 msg_q.put((SystemStatusMessageKind.CAMERA_STATUS_CHANGE,
-                           (self._camera_idx, CaptureProcessStatus.RUNNING)))
+                           (self._camera_idx, CaptureProcessStatus.RUNNING,
+                            final_frame_perf, final_frame_id)))
 
         logger.notice("starting capture loop ..")
         self._set_status(CaptureProcessStatus.RUNNING)
@@ -750,8 +759,12 @@ class VideoCapture(Process):
                             rec_q_put(
                                 [(fix, f, fw, p) for f, fw, _, p, fix in frames_prebuffer_list]
                             )
+                            last_recorded_frame_id = frames_prebuffer_list[-1][-1]
+                            last_recorded_frame_perf = frames_prebuffer_list[-1][3]
                             frames_prebuffer_list = []  # thread safety, don't use .clear()
                         rec_q_put([(cam_frame_id, frame, when, frame_perf_c)])  # thread queue
+                        last_recorded_frame_id = cam_frame_id
+                        last_recorded_frame_perf = frame_perf_c
                         record_q_list = (
                             self._record_queue_list
                         ) = []  # ensure we (re)start clean
@@ -784,6 +797,8 @@ class VideoCapture(Process):
                             for idx1 in range(1, count_missed_frames + 1)
                         )
                     record_q_list.append((cam_frame_id, frame, when, frame_perf_c))
+                    last_recorded_frame_id = cam_frame_id
+                    last_recorded_frame_perf = frame_perf_c
                     if len(record_q_list) >= self._record_batch_size:
                         rec_q_put(record_q_list)
                         record_q_list = self._record_queue_list = []
