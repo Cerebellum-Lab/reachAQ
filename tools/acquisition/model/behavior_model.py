@@ -78,7 +78,6 @@ class BehaviorModel(ObservableObject, ProjectDependentProtocol):
         logger.info("Disabling tunnel/headfix-dependent behavior because the hardware is disabled")
         algo.head_fixation_enabled = False
         algo.active_config.head_clamp.enabled = False
-        algo.auto_close_gate_on_intersession_config.enabled = False
         analysis.auto_tunnel_sweep_monitor.config.enabled = False
         analysis.auto_tunnel_sweep_monitor.stop()
 
@@ -110,8 +109,6 @@ class BehaviorModel(ObservableObject, ProjectDependentProtocol):
         system_m.algorithm.load_configuration(config)
         analysis = self._analysis
         analysis.headbar_pressure_monitor.config = config.headbar_pressure
-        analysis.load_cell_monitor.load_configuration(config.load_cell)
-        analysis.load_cell_tare_monitor.config = config.auto_tare
         analysis.audio_thrashing_monitor.config = config.audio
         analysis.auto_tunnel_sweep_monitor.config = config.auto_tunnel_sweep
         analysis.autoclamp_evasion_detector.config = config.autoclamp_evasion_detector
@@ -135,8 +132,6 @@ class BehaviorModel(ObservableObject, ProjectDependentProtocol):
         analysis = self._analysis
 
         # NB: monitors/detectors configuration:
-        config.load_cell = analysis.load_cell_monitor.save_configuration()
-        config.auto_tare = analysis.load_cell_tare_monitor.save_configuration()
         config.headbar_pressure = analysis.headbar_pressure_monitor.config
         config.audio = analysis.audio_thrashing_monitor.config
 
