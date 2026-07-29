@@ -2912,22 +2912,25 @@ class AppModel(ObservableObject):
             self._start_count += 1
             is_first_start = self._start_count == 1
 
+        inference_preflight_error = None
         if self._inference.is_enabled:
             runtime_check = getattr(self._inference, "check_live_inference_runtime", None)
             if callable(runtime_check):
                 gpu_status = runtime_check()
                 if not gpu_status.is_available:
-                    message = (
+                    inference_preflight_error = (
                         "Live inference cannot start because a compatible TensorFlow GPU runtime was not found. "
-                        "No cameras or acquisition hardware were started. Disable Live inference in Preferences "
-                        "or launch with --no-live-inference to run without inference.\n\n"
+                        "Cameras and independent hardware will continue without live inference. "
+                        "Disable Live inference in Preferences or launch with --no-live-inference "
+                        "to suppress this failure.\n\n"
                         f"{gpu_status.error}"
                     )
-                    logger.error(message)
-                    self.on_error("Live inference unavailable", message)
-                    with self.app_lock:
-                        self._acquisition_starting = False
-                    return False
+                    logger.error(inference_preflight_error)
+                    self._set_subsystem_status(
+                        SubsystemId.LIVE_INFERENCE,
+                        SubsystemState.FAILED,
+                        error=inference_preflight_error,
+                    )
 
         algo = self._behavior.algorithm
         analysis = self._analysis
@@ -2949,7 +2952,7 @@ class AppModel(ObservableObject):
         self._inference_cameras = ()
         inference_camera_indices = {}
 
-        if self._inference.is_enabled:
+        if self._inference.is_enabled and inference_preflight_error is None:
             inference_cameras = self._ordered_reach_cameras(enabled_only=True)
             inference_error = None
             if len(inference_cameras) < 2:
@@ -2991,253 +2994,43 @@ class AppModel(ObservableObject):
             else:
                 logger.error(inference_error)
                 self.on_error("Inference configuration error", inference_error)
-                self.project = None
-                with self.app_lock:
-                    self._acquisition_starting = False
-                return False
+                self._set_subsystem_status(
+                    SubsystemId.LIVE_INFERENCE,
+                    SubsystemState.FAILED,
+                    error=inference_error,
+                )
+                inference_preflight_error = inference_error
         else:
             self._inference_queue = None
 
-        #
-        synced_cameras = self._ordered_reach_cameras(enabled_only=True)  # normally/usually left cam is primary
-        did_start = True
-        camera_init_started = {}
-        for camera in self._cameras:
-            if not camera.is_enabled:
-                log_hardware_initialization(
-                    logger,
-                    "SKIP | camera | name=%s disabled",
-                    camera.name,
-                )
-
-        # 1) prepare synced primary camera(s)
-        if did_start:
-            for camera in synced_cameras:
-                if camera.is_primary and camera.is_enabled:
-                    camera_init_started[camera] = time.perf_counter()
-                    log_hardware_initialization(
-                        logger,
-                        "START | camera process | name=%s primary=true source=%s shape=%s inference_index=%s",
-                        camera.name,
-                        camera.camera_source.url,
-                        camera.shape,
-                        inference_camera_indices.get(camera),
-                    )
-                    logger.info("Preparing capture on %s", camera.name)
-                    inference_index = inference_camera_indices.get(camera)
-                    did_start = camera.on_prepare_capture(
-                        self._inference_queue if inference_index is not None else None,
-                        inference_index=inference_index,
-                    )
-                    if not did_start:
-                        self.on_error("Camera Process Failed",
-                                      _failed_camera_template(camera.name, camera.last_error))
-                        break
-                    # 1.1) wait it's running or failed
-                    if (
-                        not camera.wait_for_capture_status((CaptureProcessStatus.RUNNING, CaptureProcessStatus.FAILED), timeout=5)
-                    ) or camera.video_status != CaptureProcessStatus.RUNNING:
-                        did_start = False
-                        self.on_error("Camera start failed", _failed_camera_template(camera.name, camera.last_error))
-                        break
-                    log_hardware_initialization(
-                        logger,
-                        "READY | camera process | name=%s status=%s elapsed=%.3fs",
-                        camera.name,
-                        camera.video_status.name,
-                        time.perf_counter() - camera_init_started[camera],
-                    )
-
-        # 2) prepare synced non-primary camera(s)
-        if did_start:
-            time.sleep(0.5)
-            for camera in synced_cameras:
-                if not camera.is_primary and camera.is_enabled:
-                    camera_init_started[camera] = time.perf_counter()
-                    log_hardware_initialization(
-                        logger,
-                        "START | camera process | name=%s primary=false source=%s shape=%s inference_index=%s",
-                        camera.name,
-                        camera.camera_source.url,
-                        camera.shape,
-                        inference_camera_indices.get(camera),
-                    )
-                    logger.info("Preparing capture on %s", camera.name)
-                    inference_index = inference_camera_indices.get(camera)
-                    did_start = camera.on_prepare_capture(
-                        self._inference_queue if inference_index is not None else None,
-                        inference_index=inference_index,
-                    )
-                    if not did_start:
-                        self.on_error("Camera Process Failed",
-                                      _failed_camera_template(camera.name, camera.last_error))
-                        break
-
-        # 3) wait all synced cameras are running
-        if did_start:
-            p_before = time.perf_counter()
-            p_timeout = p_before + 10
-            for camera in synced_cameras:
-                p_now = time.perf_counter()
-                if not camera.is_primary and camera.is_enabled:
-                    if (not camera.wait_for_capture_status((CaptureProcessStatus.RUNNING, CaptureProcessStatus.FAILED), timeout=p_timeout - p_now)
-                        or camera.video_status != CaptureProcessStatus.RUNNING):
-                        did_start = False
-                        self.on_error("Camera start failed", _failed_camera_template(camera.name, camera.last_error))
-                        break
-                    logger.verbose("%s now running", camera.name)
-                    log_hardware_initialization(
-                        logger,
-                        "READY | camera process | name=%s status=%s elapsed=%.3fs",
-                        camera.name,
-                        camera.video_status.name,
-                        time.perf_counter() - camera_init_started[camera],
-                    )
-
-        # 4) trigger enable capture on synced cameras
-        if did_start:
-            # 4.1) first on non-primary
-            for camera in synced_cameras:
-                if not camera.is_primary and camera.is_enabled:
-                    logger.info("Starting capture on %s", camera.name)
-                    camera.on_capture_start()
-                    log_hardware_initialization(logger, "READY | camera capture enabled | name=%s", camera.name)
-            # small delay to ensure not-primary cam(s) are waiting on primary:
-            time.sleep(0.5)
-            # 4.2) then on primary
-            for camera in synced_cameras:
-                if camera.is_primary and camera.is_enabled:
-                    logger.info("Starting capture on %s", camera.name)
-                    camera.on_capture_start()
-                    log_hardware_initialization(logger, "READY | camera capture enabled | name=%s", camera.name)
-
-        # A RUNNING capture process only means that its camera backend and worker
-        # threads initialized. Do not expose acquisition as ready until every
-        # enabled synchronized camera has delivered a real frame. This also
-        # catches a missing primary-to-secondary hardware trigger before Record
-        # can initialize a session.
-        if did_start:
-            first_frame_deadline = time.perf_counter() + 5
-            for camera in synced_cameras:
-                remaining = max(0, first_frame_deadline - time.perf_counter())
-                if not camera.wait_for_first_frame(timeout=remaining):
-                    did_start = False
-                    self.on_error(
-                        "Camera capture failed",
-                        _failed_camera_template(camera.name, camera.last_error),
-                    )
-                    break
-                log_hardware_initialization(
-                    logger,
-                    "READY | camera first frame | name=%s frame=%s",
-                    camera.name,
-                    camera.last_captured_frame_index,
-                )
-
-        # 5) remaining non-synced camera(s)
-        camera = self._top_camera
-        if did_start and camera.is_enabled:
-            camera_started = time.perf_counter()
-            log_hardware_initialization(
-                logger,
-                "START | camera process | name=%s primary=false source=%s shape=%s inference_index=None",
-                camera.name,
-                camera.camera_source.url,
-                camera.shape,
-            )
-            logger.info("Preparing capture on %s", camera.name)
-            did_start = camera.on_prepare_capture()
-            if not did_start:
-                self.on_error("Camera Process Failed",
-                              _failed_camera_template(camera.name, camera.last_error))
-            else:
-                if (
-                    not camera.wait_for_capture_status((CaptureProcessStatus.RUNNING, CaptureProcessStatus.FAILED), timeout=5)
-                    or camera.video_status != CaptureProcessStatus.RUNNING
-                ):
-                    did_start = False
-                    self.on_error("Camera start failed", _failed_camera_template(camera.name, camera.last_error))
-                else:
-                    camera.on_capture_start()
-                    if not camera.wait_for_first_frame(timeout=5):
-                        did_start = False
-                        self.on_error(
-                            "Camera capture failed",
-                            _failed_camera_template(camera.name, camera.last_error),
-                        )
-                    else:
-                        log_hardware_initialization(
-                            logger,
-                            "READY | camera process and capture | name=%s status=%s frame=%s elapsed=%.3fs",
-                            camera.name,
-                            camera.video_status.name,
-                            camera.last_captured_frame_index,
-                            time.perf_counter() - camera_started,
-                        )
-
-        if not did_start:
-            logger.error("failed to start all subprocesses")
-            self.capture_stop(force=True)
-            return False
-
-        # Connect "hardware" (motors/steppers/etc..) after cameras are setup/running,
-        # so that any movement pre-applied should be visible on camera(s).
-        logger.debug("connecting hardware ...")
-        hard = self._hardware
-        controller_started = time.perf_counter()
-        try:
-            self._ensure_pellet_controller_connected()
-        except Exception as exc:
-            logger.exception("Acquisition hardware start failed; performing CAN safety shutdown")
-            hard.safety_shutdown(
-                f"acquisition start failure: {str(exc) or exc.__class__.__name__}",
-                wait=True,
-            )
-            try:
-                self.capture_stop(force=True)
-            except Exception:
-                logger.exception("Acquisition cleanup failed after CAN safety shutdown")
-            raise
-        # hard.set_auto_correct_motor_drift(algo.auto_correct_motors_drift)  # disabled
-        if wait_connected and hard.requires_connection:
-            timeout = 3
-            # full establishement of connection to/from device should be very fast actually, but not immediate,
-            # so this timeout.
-            p_end = time.perf_counter() + timeout
-            while True:
-                for tok in hard.pending_tokens:
-                    p0 = time.perf_counter()
-                    try:
-                        hard.wait_pending_command_acked(tok, timeout=timeout)
-                    except Exception as err:
-                        logger.error("pending token %s not acked: %s", tok, err)
-                        self.capture_stop(force=True)
-                        return False
-                    timeout -= time.perf_counter() - p0
-                break
-            while True:
-                if hard.connected:
-                    break
-                if time.perf_counter() > p_end:
-                    logger.error("timeout waiting hardware connected")
-                    self.capture_stop(force=True)
-                    return False
-                time.sleep(0.05)
-        logger.info("finished connecting hardware")
-        log_hardware_initialization(
-            logger,
-            "READY | hardware connection gate | required=%s connected=%s elapsed=%.3fs",
-            hard.requires_connection,
-            hard.connected,
-            time.perf_counter() - controller_started,
+        reach_synchronization_ready = self._start_reach_camera_domains(
+            inference_camera_indices,
         )
-        #
+        self._start_top_camera_domain()
+
+        # Each hardware domain starts and fails independently. Readiness is
+        # aggregated only when Record is requested.
+        can_ready = self._start_can_domain(wait_connected=wait_connected)
+        self._start_nidaq_domain()
+        self._start_laser_domain()
+        self._validate_session_logs_domain()
+
         watchdog_mon_register = self._analysis.watchdog_monitor.register_watchdog
-        watchdog_mon_register(WatchdogItems.DEVICE_READER, lambda: self._hardware.watchdog_reader_perf_c)
-        watchdog_mon_register(WatchdogItems.DEVICE_WRITER, lambda: self._hardware.watchdog_writer_perf_c)
+        if can_ready:
+            watchdog_mon_register(
+                WatchdogItems.DEVICE_READER,
+                lambda: self._hardware.watchdog_reader_perf_c,
+            )
+            watchdog_mon_register(
+                WatchdogItems.DEVICE_WRITER,
+                lambda: self._hardware.watchdog_writer_perf_c,
+            )
 
         for cam in self._cameras:
-            if cam.is_enabled:
+            status = self._subsystem_status_registry.get(
+                SubsystemId.camera(cam.name)
+            )
+            if status is not None and status.is_ready:
                 watchdog_mon_register(f"camera.{cam.name}", lambda cam=cam: cam.watchdog_capture_perf_c)
 
         if __debug__ and os.getenv("_AUTOTRAINER_TEST_WATCHDOG") == "1":
@@ -3245,21 +3038,37 @@ class AppModel(ObservableObject):
                 return t_end
             watchdog_mon_register("test-watchdog", lambda t=time.perf_counter() + 180: fake_watchdog(t))
 
-        # we always be/go at home on acquisition start, so:
-        log_hardware_initialization(logger, "START | pellet home command")
-        self._behavior.system_machine.pellet.move_home(force=True)
-        log_hardware_initialization(logger, "QUEUED | pellet home command")
+        if can_ready:
+            # We always begin at home when the pellet controller is available.
+            log_hardware_initialization(logger, "START | pellet home command")
+            try:
+                self._behavior.system_machine.pellet.move_home(force=True)
+            except Exception as exc:
+                error = str(exc) or exc.__class__.__name__
+                logger.exception("Pellet home command failed")
+                self._set_subsystem_status(
+                    SubsystemId.CAN_PELLET,
+                    SubsystemState.FAILED,
+                    error=error,
+                )
+                try:
+                    self._hardware.safety_shutdown(
+                        f"pellet home failure: {error}",
+                        wait=True,
+                    )
+                except Exception:
+                    logger.exception("CAN safety shutdown failed after pellet home error")
+            else:
+                log_hardware_initialization(logger, "QUEUED | pellet home command")
 
         # once cameras successfully started:
         self._save_project_metadata(project_info, when=datetime.now(), session=None, caller="capture_start")
         #
-        # Start inference & hardware AFTER cameras started, so we can see the initial eventual motor move.
-        if self._inference.is_enabled:
-            logger.info("Starting inference ..")
-            if not self._inference.start(self._inference_queue):
-                logger.error("Inference did not start; stopping capture")
-                self.capture_stop(force=True)
-                return False
+        # Start inference only after the required reach camera topology is ready.
+        if self._start_inference_domain(
+            reach_synchronization_ready=reach_synchronization_ready,
+            preflight_error=inference_preflight_error,
+        ):
             watchdog_mon_register(WatchdogItems.POSE_DATA_MONITOR_PROC,
                                   lambda: self._inference.watchdog_monitor_data_proc_perf_c)
 
@@ -3281,10 +3090,8 @@ class AppModel(ObservableObject):
         if animal is not None:
             self._set_animal_base_positions(animal)
 
-        if self._nidaq_signal_monitor.configuration.is_enabled:
-            self._nidaq_signal_monitor.start()
-
         self._acquisition_started = True
+        self._acquisition_starting = False
         self.status = target_status
         self.property_changed(self.Props.ACQUISITION_RUNNING, True, False)
         self._event_manager.post_event_content(
@@ -3532,7 +3339,9 @@ class AppModel(ObservableObject):
             configuration.inference.is_enabled,
             configuration.inference.pose_model_location,
         )
-        self.laser.load_configuration(configuration.laser)
+        # Configuration loading must remain side-effect free. The laser controller
+        # is opened as its own acquisition domain in capture_start().
+        self.laser.set_configuration_offline(configuration.laser)
         self._nidaq_ports = configuration.nidaq_ports
         self.nidaq_signal_monitor.set_hardware_enabled(
             configuration.hardware.nidaq_enabled,
