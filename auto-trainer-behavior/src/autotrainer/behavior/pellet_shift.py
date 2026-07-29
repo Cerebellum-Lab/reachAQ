@@ -124,7 +124,6 @@ class ShiftXYZHandler(ObservableObject):
         self._processed_shift_handler: ProcessedShiftXYZCallbackHandlerT = None
         self._last_shift_xyz = Offset3DTuple.get_nan()
         self._last_processed_shift_xyz = Offset3DTuple.get_nan()
-        self._batch_has_tongue_eaten = False
         self._new_shift_y_limit: Optional[float] = None
         self._result_handler: ShiftXYZBaseHandler = ShiftXYZBufferHandler(config=ShiftXYZBufferHandlerConfig())
         # set config again, to ensure result_handler will be correct one
@@ -143,7 +142,6 @@ class ShiftXYZHandler(ObservableObject):
 
     def reset(self):
         self._result_handler.reset()
-        self._batch_has_tongue_eaten = False
         self._new_shift_y_limit = None
         self.last_processed_shift_xyz = self.last_shift_xyz = Offset3DTuple.get_nan()
 
@@ -187,9 +185,6 @@ class ShiftXYZHandler(ObservableObject):
         project: ProjectInfo,
         trial_result: IntersessionResponse,
         *,
-        is_batch: bool = False,
-        is_first: bool = True,
-        is_last: bool = True,
         reduce_method=mean_method,
     ):
         algo = self._algo
@@ -198,15 +193,6 @@ class ShiftXYZHandler(ObservableObject):
             prev_y_limit = algo.pellet_shift_y_limit
         else:
             prev_y_limit = self._new_shift_y_limit
-
-        if is_batch:
-            if is_first:
-                logger.info("Received first (batch) trial")
-                self._batch_has_tongue_eaten = False
-            if is_last:
-                logger.info("Received last batch trial")
-        else:
-            assert is_first and is_last
 
         send_pos = project.dcs_send_position
         if send_pos is None:
@@ -218,13 +204,11 @@ class ShiftXYZHandler(ObservableObject):
             for evt in trial_result.other_events:
                 if evt.outcome == ReachEventOutcome.EATEN and evt.method == ReachEventMethod.TONGUE:
                     tongue_eaten = True
-                    if is_batch:
-                        self._batch_has_tongue_eaten = True
                     break
 
         handler = self._result_handler
 
-        if not tongue_eaten and not self._batch_has_tongue_eaten:
+        if not tongue_eaten:
             # "normal" case
             trial_shift = handler.make_shift_from_rh_list(trial_result.rh_max_vp_list,
                                                           reduce_method=reduce_method)
@@ -255,19 +239,13 @@ class ShiftXYZHandler(ObservableObject):
         else:
             trial_shift = processed_shift = None
         #
-        tongue_eaten = tongue_eaten or self._batch_has_tongue_eaten
-        if is_last:
-            if tongue_eaten:
-                processed_shift = cfg.tongue_eaten_shift
-            if self._batch_has_tongue_eaten:
-                handler.reset()  # always at end of batch
-                self._batch_has_tongue_eaten = False  # always,
-                    # even though not necessary given it's also set to False at batch start.
-            new_y_limit = self._new_shift_y_limit
-            if new_y_limit is not None:
-                logger.notice("Setting new pellet_shift_y_limit: %s", new_y_limit)
-                algo.pellet_shift_y_limit = new_y_limit
-                self._new_shift_y_limit = None
+        if tongue_eaten:
+            processed_shift = cfg.tongue_eaten_shift
+        new_y_limit = self._new_shift_y_limit
+        if new_y_limit is not None:
+            logger.notice("Setting new pellet_shift_y_limit: %s", new_y_limit)
+            algo.pellet_shift_y_limit = new_y_limit
+            self._new_shift_y_limit = None
         #
         if trial_shift is not None:
             self.last_shift_xyz = trial_shift
@@ -280,7 +258,7 @@ class ShiftXYZHandler(ObservableObject):
                     source=ApiPelletShiftSource.TONGUE_EATEN if tongue_eaten
                            else ApiPelletShiftSource.REACH_FAILURES,
                     shift=dict(x=processed_shift.x, y=processed_shift.y, z=processed_shift.z),
-                    deferred=not is_last,
+                    deferred=False,
                 )
             )
             if func is None:

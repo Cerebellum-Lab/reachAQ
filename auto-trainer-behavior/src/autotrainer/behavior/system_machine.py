@@ -1,7 +1,7 @@
 import dataclasses
 import math
 from functools import partial
-from typing import Optional, List
+from typing import Optional
 
 from transitions import Machine
 
@@ -79,15 +79,7 @@ class SystemMachine(StateMachine):
             project_info = ProjectInfo()
         project_info: ProjectInfo
         self._project_info = project_info
-        #
-        self._next_shift_xyz_to_apply: Optional[Offset3DTuple] = None
-        self._batch_project_sessions_start_list: List[ProjectInfo] = []
-        self._batch_project_sessions_list: List[ProjectInfo] = []
-        self._batch_processing_in_progress: bool = False
-        self._batch_project_sessions_finished: int = 0
-        self._batch_current_trial_index: int = 0  # 0 -> #trials-in-batch - 1
-        self._batch_failed_count: int = 0
-        self._batch_sessions_total_duration: float = 0
+        self._aborted_session_ids = set()
         #
         # todo: should probably make/use a state "Machine" for AutoClamp itself
         self._auto_clamp_in_progress = False
@@ -247,59 +239,22 @@ class SystemMachine(StateMachine):
 
     def after_exit_tunnel(self, *, reason: str = "NA"):
         logger.verbose("after_exit_tunnel: %s", reason)
-        algo = self._algorithm
-        with algo.set_allow_reentrant(True):
+        with self._algorithm.set_allow_reentrant(True):
             self._execute_disengage_auto_clamp_if_in_progress()
         self._event_manager.post_event_content(ApiEventKind.tunnelExit)
-        if not algo.is_in_session:
-            batch_projects = self._batch_project_sessions_list
-            if len(batch_projects) > 0:
-                if self._intersession.state != IntersessionState.idle:
-                    # this can happen is a batch-list is in processing, for instance
-                    logger.verbose("exit_tunnel but intersession state=%s, doing nothing. n_batch_trials=%s",
-                                   self._intersession.state, len(batch_projects))
-                else:
-                    prj = batch_projects[0]
-                    with algo.set_allow_reentrant(True):
-                        self.enter_intersession(prj, reason="exit-tunnel-with-sessions-batch-list")
 
     def after_enter_intersession(self, project_info: ProjectInfo, *, reason="NA"):
         algo = self._algorithm
         intersession = self._intersession
         inference = self._inference
-        batch_list = self._batch_project_sessions_list
-        logger.verbose("enter_intersession: reason=%s, n_batch=%s, in-session=%s",
-                       reason, len(batch_list), algo.is_in_session)
-
-        if len(batch_list) > 0:
-            # set intersession and inference current project to the one from the batch:
-            logger.verbose("setting project_info to intersession and inference")
-            inference.project = project_info
-            wait_stop_recorded = len(batch_list) == 1 and project_info == self._project_info
-            # only wait stop_recorded if batch_list len is 1, and it's currently set/activated self._projet_info
-            # otherwise it's not needed.
-
-            if not self._batch_processing_in_progress:
-                self._batch_processing_in_progress = True
-                self._batch_project_sessions_start_list = batch_list.copy()
-                self._batch_current_trial_index = 0
-                self._batch_failed_count = 0
-                self._batch_project_sessions_finished = 0
-                logger.info("Starting batch analysis with %s trials", len(batch_list))
-                algo.batch_analysis_starting(batch_len=len(batch_list))
-                self._event_manager.post_event_content(
-                    ApiEventKind.batchAnalysisStarted, data=dict(count=len(batch_list))
-                )
-        else:
-            self._batch_project_sessions_start_list = []
-            self._batch_project_sessions_finished = 0
-            wait_stop_recorded = True
+        logger.verbose("enter_intersession: reason=%s, in-session=%s",
+                       reason, algo.is_in_session)
 
         logger.info("processing session project %s", project_info)
         algo.session_processing_starting()
         with algo.set_allow_reentrant(True):
             intersession.perform_segmentation(project_info)
-        self._inference.send_message(InferenceCommandMessageKind.ProcessOffline, (project_info, wait_stop_recorded))
+        inference.send_message(InferenceCommandMessageKind.ProcessOffline, (project_info, True))
         # pellet machine can react to system-state == intersession,
         # which is here the case (def *after*_enter_intersession):
         with algo.set_allow_reentrant(True):
@@ -326,6 +281,7 @@ class SystemMachine(StateMachine):
     @BehaviorAlgorithm.relay_func(wait=False)
     def _on_session_capture_started(self):
         project = self._project_info
+        self._aborted_session_ids.discard(project.short_id)
         dcs_send_pos = self._pellet_device.last_dcs_set_position
         if dcs_send_pos is None:
             logger.warning("current dcs_send_pos None (DCS), diamond-triangle not calibrated?")
@@ -334,9 +290,7 @@ class SystemMachine(StateMachine):
         pellet_m = self._pellet_machine
         logger.verbose("session_capture_started: dcs_send_pos=%s prj.when=%s",
                        dcs_send_pos, project.when)
-        # ensure inference has the correct project info,
-        # this is required for session batch processing.
-        #  EDIT: maybe not anymore since we added project_info as argument to intersession state trigger functions..
+        # Ensure inference has the current session identity.
         project.send_position = self._pellet_device.last_set_position
         project.dcs_send_position = dcs_send_pos
         logger.info("Associated dcs_send_pos=%s with project", dcs_send_pos)
@@ -345,14 +299,11 @@ class SystemMachine(StateMachine):
         self._inference.project = project
     @BehaviorAlgorithm.relay_func(wait=False)
     def on_session_capture_ended(self, reason: RecordingEndingReason):
-        p_now = get_perf_now()
-        self._batch_sessions_total_duration += p_now - self._session_started_perf_c
         cur_project = self._project_info.to_local_value()
         logger.verbose("capture_ended: project=%s", cur_project)
         algo = self._algorithm
         if reason == RecordingEndingReason.MANUAL_ABORT:
-            self._batch_project_sessions_list.clear()
-            self._batch_project_sessions_start_list.clear()
+            self._aborted_session_ids.add(cur_project.short_id)
             self._inference.send_message(InferenceCommandMessageKind.SetOfflineToLive)
             return
         if not algo.active_config.pellet_delivery.retract_enabled:
@@ -377,7 +328,6 @@ class SystemMachine(StateMachine):
             algo.intersession_enabled, algo.session_mouse_seen,
             can_perform_analysis,
         )
-        self._batch_project_sessions_finished = 0
         if can_perform_analysis:
             with algo.set_allow_reentrant(True):
                 self.enter_intersession(cur_project, reason="capture-ended-and-can-perform-analysis")
@@ -389,50 +339,18 @@ class SystemMachine(StateMachine):
 
     @BehaviorAlgorithm.relay_func(wait=False)
     def _on_intersession_analysis_ended(self, project: ProjectInfo, result: CaptureAnalysisResult):
+        if project.short_id in self._aborted_session_ids:
+            logger.info("Ignoring analysis completion for aborted %s", project.short_id)
+            return
         logger.verbose("intersession ended: trial=%s result=%s", project.short_id, result)
-        cur_batch = self._batch_project_sessions_list
-        if result == CaptureAnalysisResult.ANALYSIS_FAILED:
-            self._batch_failed_count += 1
         algo = self._algorithm
-        if len(cur_batch) > 0:
-            self._batch_project_sessions_finished += 1
-            del cur_batch[0]
-            if len(cur_batch) > 0:  #  and not self._algorithm.algo_paused:
-                # continue remaining session(s) in batch in all cases
-                self._batch_current_trial_index += 1
-                with algo.set_allow_reentrant(True):
-                    self.reenter_intersession(cur_batch[0], reason="reenter-batch-session")
-                return
-            finished_batch = True
-            shift_xyz = self._next_shift_xyz_to_apply
-            if shift_xyz is not None:
-                self._next_shift_xyz_to_apply = None
-                self._apply_processed_shift_xyz(shift_xyz)
-            self._batch_processing_in_progress = False
-            self._batch_sessions_total_duration = 0
-            logger.info("batch analysis ending, failed=%s", self._batch_failed_count)
-            # force inference project-info back to current/live one:
-            self._inference.project = self._project_info
-            algo.batch_analysis_ending(failed_count=self._batch_failed_count)
-        else:
-            finished_batch = False
-
-        if finished_batch:
-            self._event_manager.post_event_content(
-                ApiEventKind.batchAnalysisEnded,
-                data=dict(failed_count=self._batch_failed_count))
-
         with algo.set_allow_reentrant(True):
             self.exit_intersession()
 
     @BehaviorAlgorithm.relay_func(wait=False)
     def _on_inference_segmentation_finished(self, project: ProjectInfo, success: bool, *, error: str="NA"):
         logger.verbose("got inference segmentation finished: %s ; err=%s prj=%s", success, error, project)
-        inference = self._inference
-        cur_batch_list = self._batch_project_sessions_list
-        logger.debug("remaining batch trials list size: %s", len(cur_batch_list))
-        if len(cur_batch_list) <= 1:
-            inference.send_message(InferenceCommandMessageKind.SetOfflineToLive)
+        self._inference.send_message(InferenceCommandMessageKind.SetOfflineToLive)
 
     @BehaviorAlgorithm.relay_func(wait=False)
     def _on_headbar_pressure_monitor_property_changed(self, name: str, value, _):
@@ -886,19 +804,18 @@ class SystemMachine(StateMachine):
 
     @BehaviorAlgorithm.relay_func(wait=False)
     def _on_detection_result_ready(self, prj: ProjectInfo, res: IntersessionResponse):
+        if prj.short_id in self._aborted_session_ids:
+            logger.info("Ignoring detection result for aborted %s", prj.short_id)
+            return
+        if prj.short_id != self._project_info.short_id:
+            logger.warning(
+                "Ignoring detection result for non-current session %s (current=%s)",
+                prj.short_id,
+                self._project_info.short_id,
+            )
+            return
         logger.success("Intersession analysis result: prj=%s result=%s", prj, res)
-        #
-        start_list = self._batch_project_sessions_start_list
-        if len(start_list) > 0:
-            is_batch = True
-            is_first = prj == start_list[0]
-            is_last = prj == start_list[-1]
-        else:
-            is_batch = False
-            is_first = is_last = True
-        #
-        self._shift_xyz_handler.put_intersession_response(prj, res,
-                                                          is_first=is_first, is_last=is_last, is_batch=is_batch)
+        self._shift_xyz_handler.put_intersession_response(prj, res)
         #
         algo = self._algorithm
         algo.set_previous_intersession_analysis_rsp(prj, res)
@@ -916,13 +833,6 @@ class SystemMachine(StateMachine):
 
     def _handle_processed_shift_xyz(self, project: ProjectInfo, shift: Offset3DTuple):
         logger.success("Received processed shift xyz: %s ; project=%s", shift.round(1), project)
-        if len(self._batch_project_sessions_list) > 0:
-            self._next_shift_xyz_to_apply = shift
-            return
-        if __debug__:
-            start_batch_list = self._batch_project_sessions_start_list
-            if len(start_batch_list) > 0:
-                assert project == start_batch_list[-1]
         self._apply_processed_shift_xyz(shift)
 
     def _apply_processed_shift_xyz(self, shift: Offset3DTuple):

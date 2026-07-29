@@ -28,8 +28,7 @@ from autotrainer.core.multiproc import make_daemon_timer, no_op_timer
 from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
 from autotrainer.core.reach_event import ReachEvent
 from autotrainer.core.configuration.behavior_configuration import PelletDeliveryConfiguration, HeadClampConfiguration, \
-    BehaviorConfiguration, AutoCloseGateOnIntersessionConfiguration, \
-    HomeOnExcessiveDriftDistanceConfiguration, \
+    BehaviorConfiguration, HomeOnExcessiveDriftDistanceConfiguration, \
     PelletUncoverConfiguration
 from autotrainer.core.video_detection import PresenceDetectionAttrs
 from autotrainer.core.pose_elements import ScenePartsPresenceContext, SceneElement
@@ -178,10 +177,8 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
     session_starting: BehaviorAlgoEvents.session_starting
     session_capture_ending: BehaviorAlgoEvents.session_capture_ending
 
-    batch_analysis_starting: BehaviorAlgoEvents.batch_analysis_starting
     session_processing_starting: BehaviorAlgoEvents.session_processing_starting
     session_ending: BehaviorAlgoEvents.session_ending
-    batch_analysis_ending: BehaviorAlgoEvents.batch_analysis_ending
 
     cover_servo_status_changed: BehaviorAlgoEvents.cover_servo_status_changed  # unused
 
@@ -581,10 +578,6 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
     @property
     def is_in_session_age(self) -> float:
         return get_perf_now() - self._session_started_perf_c
-
-    @property
-    def auto_close_gate_on_intersession_config(self) -> AutoCloseGateOnIntersessionConfiguration:
-        return self._active_config.auto_close_gate_on_intersession
 
     @property
     def pellet_delivery_enabled(self) -> bool:
@@ -1271,11 +1264,9 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
         # reset per session or per tunnel entrance (which can have multiple "sessions" when a pellet is dropped).
         # if not self.pellet_cover_enabled:
         #    if self.system_state == SystemState.tunnel:
-        #        return self.session_pellet_count <= self.limits.max_pellets_per_session
         #    else:
         #        return True
         #
-        # return self._is_in_session and self.session_pellet_count <= self.limits.max_pellets_per_session
 
     def can_retract_pellet(self, *, pellet_state: PelletState) -> bool:
         if self._algo_paused or self._status not in {
