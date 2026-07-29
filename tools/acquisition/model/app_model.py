@@ -350,6 +350,7 @@ class AppModel(ObservableObject):
         # this is used to sync the start record frame of all reach cameras:
         self._cams_record_enabled = mp_ctx.Value(ctypes.c_bool, False)
         self._cams_synced_frame_index = mp_ctx.Value(ctypes.c_int64, -1)
+        self._cams_record_start_perf = mp_ctx.Value(ctypes.c_double, math.nan)
 
         self._record_stop_sema = mp_ctx.Semaphore(0)
         # and this is used to notify the end of recording from the reach-camera video_record threads to the offline one,
@@ -366,7 +367,9 @@ class AppModel(ObservableObject):
         self._top_camera_presence_detection = PresenceDetectionAttrs()
         self._top_camera = VideoCaptureModel("web", self._preferences, -1,
                                              presence_detection=self._top_camera_presence_detection,
-                                             msg_queue=None,  # not interested to webcam status for now.
+                                             msg_queue=self._multiproc_msg_queue,
+                                             record_start_perf=self._cams_record_start_perf,
+                                             align_record_start_perf=True,
                                              cam_id=CameraId.Web)
         self._top_camera.is_enabled = False
 
@@ -503,6 +506,7 @@ class AppModel(ObservableObject):
             cam_id=camera_id,
             synced_cam_frame_index=self._cams_synced_frame_index,
             synced_cam_recording=self._cams_record_enabled,
+            record_start_perf=self._cams_record_start_perf,
             record_stop_sema=self._record_stop_sema,
         )
 
@@ -704,8 +708,20 @@ class AppModel(ObservableObject):
         if not self._acquisition_started or self._status == AppModelStatus.IDLE:
             self.on_error("Recording unavailable", "Set System Mode to Running before recording.")
             return False
-        if not self._get_monitored_cams():
+        monitored_cams = self._get_monitored_cams()
+        if not monitored_cams:
             self.on_error("Recording unavailable", "Enable at least one recording camera before recording.")
+            return False
+        non_recording_cams = tuple(
+            camera.name for camera in monitored_cams
+            if not camera.is_recording_enabled
+        )
+        if non_recording_cams:
+            self.on_error(
+                "Recording unavailable",
+                "Enable video recording for every enabled reach camera before recording: "
+                + ", ".join(non_recording_cams),
+            )
             return False
         if self._session_recording_status != SessionRecordingStatus.READY:
             logger.warning("start_recording refused while %s", self._session_recording_status.value)
@@ -807,7 +823,7 @@ class AppModel(ObservableObject):
             and not self._abort_had_recording_started
             and all(
                 camera.video_status != CaptureProcessStatus.RECORDING
-                for camera in self._get_monitored_cams()
+                for camera in self._get_recording_cams()
             )
         ):
             self._finish_abort_recording()
@@ -1055,10 +1071,23 @@ class AppModel(ObservableObject):
                     d[f"frame_present_{camera_field_name}"] = 1 if math.isfinite(camera_frame_when) else 0
                 dw.writerow(d)
         logger.info("Written %s entries into %s", len(df_main_cam), timing_path)
-        self._remove_timestamps_txt_files(project)
+        self._remove_timestamps_txt_files(project, cams)
 
     def _get_monitored_cams(self):
         return self._ordered_reach_cameras(enabled_only=True)
+
+    def _get_recording_cams(self) -> Tuple[VideoCaptureModel, ...]:
+        """Return every enabled camera expected to acknowledge this session."""
+        return (
+            *(
+                camera for camera in self._get_monitored_cams()
+                if camera.is_recording_enabled
+            ),
+            *(
+                camera for camera in (self._top_camera,)
+                if camera.is_enabled and camera.is_recording_enabled
+            ),
+        )
 
     def _handle_proc_msg_queue(self):
         proc_msg_q = self._multiproc_msg_queue
@@ -1138,18 +1167,42 @@ class AppModel(ObservableObject):
             cam_idx, frames_written, project, *r_args = args
             if project is None:
                 return
-            monitored_cams = self._get_monitored_cams()
-            monitored_cam_indices = tuple(cam.camera_index for cam in monitored_cams)
-            if cam_idx in monitored_cam_indices:
+            recording_cams = self._get_recording_cams()
+            recording_cam_indices = tuple(cam.camera_index for cam in recording_cams)
+            if cam_idx in recording_cam_indices:
                 cams_closed_finished[cam_idx] = (project, frames_written)
-                if all(cam.camera_index in cams_closed_finished for cam in monitored_cams):
-                    project = cams_closed_finished[monitored_cams[0].camera_index][0]
+                if all(cam.camera_index in cams_closed_finished for cam in recording_cams):
+                    project = cams_closed_finished[recording_cams[0].camera_index][0]
+                    monitored_cams = tuple(
+                        camera for camera in recording_cams
+                        if camera in self._reach_cameras
+                    )
                     try:
                         self._merge_camera_timestamp_files(project, monitored_cams)
                     except Exception as err:
                         logger.exception("Failed to merge camera timestamps: %s", err)
                         self.on_error("Camera timestamp merge failed", str(err))
                     cams_closed_finished.clear()  # now clear
+                    wait_pose_closed = getattr(
+                        type(self._inference),
+                        "wait_session_pose_closed",
+                        None,
+                    )
+                    if (
+                        wait_pose_closed is not None
+                        and self._abort_had_recording_started
+                        and not wait_pose_closed(
+                            self._inference,
+                            project,
+                            timeout=10.0,
+                        )
+                    ):
+                        message = (
+                            "Timed out waiting for live pose files to close for "
+                            f"{project.short_id}; continuing writer finalization."
+                        )
+                        logger.error(message)
+                        self.on_error("Pose writer close timeout", message)
                     if self._session_recording_status == SessionRecordingStatus.ABORTING:
                         self._finish_abort_recording()
                     elif self._session_recording_status == SessionRecordingStatus.STOPPING:
@@ -2430,6 +2483,20 @@ class AppModel(ObservableObject):
         self._ensure_reach_primary_camera()
 
         if (camera := configuration.get_camera(CameraId.Web)) is not None:
+            if camera.record_mode != VideoRecordMode.TRIGGER:
+                logger.warning(
+                    "Ignoring continuous camera mode for manual recording: %s=%s",
+                    self._top_camera.name,
+                    camera.record_mode,
+                )
+            camera.record_mode = VideoRecordMode.TRIGGER
+            if camera.record_prebuffer_duration != 0:
+                logger.warning(
+                    "Ignoring camera prebuffer for manual recording alignment: %s=%s",
+                    self._top_camera.name,
+                    camera.record_prebuffer_duration,
+                )
+            camera.record_prebuffer_duration = 0
             self._top_camera.load_configuration(camera)
             log_hardware_initialization(
                 logger,
@@ -2783,11 +2850,19 @@ class AppModel(ObservableObject):
             self._update_status_text_overlay()
 
     def _on_session_starting_before_record_start(self):
+        self._cams_record_start_perf.value = math.nan
         drained = 0
         while self._record_stop_sema.acquire(block=False):
             drained += 1
         if drained:
             logger.verbose("drained record_stop_sema by %s", drained)
+        prepare_pose = getattr(
+            type(self._inference),
+            "prepare_session_recording",
+            None,
+        )
+        if prepare_pose is not None:
+            prepare_pose(self._inference, self._project_info)
 
     def _on_session_capture_ended(self, reason: RecordingEndingReason):
         logger.debug("session capture trigger ended: %s", reason)
@@ -2877,9 +2952,13 @@ class AppModel(ObservableObject):
             self._aborting_project = None
             self._set_session_recording_status(SessionRecordingStatus.READY)
 
-    def _remove_timestamps_txt_files(self, project: ProjectInfo):
+    def _remove_timestamps_txt_files(
+        self,
+        project: ProjectInfo,
+        cameras: Optional[Tuple[VideoCaptureModel, ...]] = None,
+    ):
         removed = []
-        for cam in self._cameras:
+        for cam in self._cameras if cameras is None else cameras:
             _, ts_file, _ = project.get_video_path(cam.name, allow_overwrite=True)
             ts_file = Path(ts_file)
             if ts_file.exists():

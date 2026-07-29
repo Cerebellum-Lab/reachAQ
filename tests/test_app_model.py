@@ -1,9 +1,10 @@
+import math
 from pathlib import Path
 from unittest import mock
 
 import pytest
 
-from autotrainer.core import EventManager
+from autotrainer.core import EventManager, SystemStatusMessageKind
 from autotrainer.core.configuration.persistence_configuration import PersistenceConfiguration
 from autotrainer.behavior.behavior_algorithm import BehaviorAlgoStatus
 from tools.acquisition.model.app_model import app_status_to_api_app_mode, app_status_to_behavior_algo_status
@@ -30,10 +31,84 @@ class TestStatus:
 
 
 def test_it_drain_record_stop_sema_on_session_recording_start(app_model):
+    app_model._cams_record_start_perf.value = 123.0
     app_model._record_stop_sema.release()
     app_model._record_stop_sema.release()
     app_model.behavior.algorithm.start_session(reason="manual")
     assert app_model._record_stop_sema.acquire(block=False) is False, "cannot acquire after: it should be back to 0"
+    assert math.isnan(app_model._cams_record_start_perf.value)
+
+
+def test_recording_camera_set_includes_recordable_top_camera(app_model):
+    for camera in app_model.reach_cameras:
+        camera.is_enabled = True
+        camera.is_recording_enabled = True
+    app_model.top_camera.is_enabled = True
+    app_model.top_camera.is_recording_enabled = True
+
+    assert app_model._get_recording_cams() == (
+        *app_model._ordered_reach_cameras(enabled_only=True),
+        app_model.top_camera,
+    )
+
+
+def test_writer_finalization_waits_for_top_camera_and_pose(app_model):
+    for camera in app_model.reach_cameras:
+        camera.is_enabled = True
+        camera.is_recording_enabled = True
+    app_model.top_camera.is_enabled = True
+    app_model.top_camera.is_recording_enabled = True
+    recording_cameras = app_model._get_recording_cams()
+
+    class InferenceWithPoseWriterAck:
+        def __init__(self):
+            self.waited_for = []
+
+        def wait_session_pose_closed(self, project, *, timeout):
+            self.waited_for.append((project.short_id, timeout))
+            return True
+
+    inference = InferenceWithPoseWriterAck()
+    previous_inference = app_model._inference
+    app_model._inference = inference
+    app_model._abort_had_recording_started = True
+    app_model._set_session_recording_status(SessionRecordingStatus.STOPPING)
+    camera_closures = {}
+    try:
+        with mock.patch.object(
+            app_model,
+            "_merge_camera_timestamp_files",
+        ) as merge, mock.patch.object(
+            app_model,
+            "_complete_stopped_recording",
+        ) as complete:
+            for camera in recording_cameras[:-1]:
+                app_model._handle_proc_msg(
+                    (
+                        SystemStatusMessageKind.CAMERA_RECORDING_CLOSED_FINISHED,
+                        (camera.camera_index, 10, app_model.project),
+                    ),
+                    cams_closed_finished=camera_closures,
+                )
+                complete.assert_not_called()
+
+            camera = recording_cameras[-1]
+            app_model._handle_proc_msg(
+                (
+                    SystemStatusMessageKind.CAMERA_RECORDING_CLOSED_FINISHED,
+                    (camera.camera_index, 10, app_model.project),
+                ),
+                cams_closed_finished=camera_closures,
+            )
+
+        merge.assert_called_once_with(
+            app_model.project,
+            tuple(camera for camera in recording_cameras if camera in app_model.reach_cameras),
+        )
+        assert inference.waited_for == [(app_model.project.short_id, 10.0)]
+        complete.assert_called_once_with(app_model.project)
+    finally:
+        app_model._inference = previous_inference
 
 
 def test_startup_project_exists_before_periodic_status_is_published(app_model):
