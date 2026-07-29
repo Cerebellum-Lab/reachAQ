@@ -24,7 +24,6 @@ import qtawesome as qta
 from autotrainer.core import EventManager, Offset3DTuple, AnimalSubject, SystemConfiguration, CameraConfiguration, \
     calculate_std_dev_manual, ProjectInfo, get_perf_now
 from autotrainer.core.analysis.autoclamp_evasion_detector import AutoClampEvasionDetector
-from autotrainer.core.animal.animal_subject import AnimalPelletCounts
 from autotrainer.core.capture import CaptureProcessStatus
 from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
 from autotrainer.core.logging import get_console_handler, get_verbose_logger
@@ -50,7 +49,7 @@ from autotrainer.pyside.xyz_label import XYZQLabel
 
 from tools.autotrainer_version import __version__ as app_version
 from tools.acquisition.model.app_model import AppModel
-from tools.acquisition.model.app_model_status import AppModelStatus
+from tools.acquisition.model.app_model_status import AppModelStatus, SessionRecordingStatus
 from tools.acquisition.model.handle_3d_calibration import make_3d_calib
 from tools.acquisition.model.nidaq_discovery import discover_nidaq_devices
 from tools.acquisition.model.training_plan import get_plan_id
@@ -163,6 +162,7 @@ class MainWindow(QMainWindow):
             self.main_content = MainContent(app_model)
 
             self._create_actions()
+            self.main_content.set_hardware_refresh_action(self.refresh_hardware_action)
             self._configure_menubar()
             self._configure_statusbar()
             self._configure_toolbar()
@@ -1090,10 +1090,6 @@ class MainWindow(QMainWindow):
         action.setCheckable(True)
         action.triggered.connect(self._toggle_debug_view)
 
-        action = self.load_cell_trigger_action = QAction("Load Cell", self)
-        action.setCheckable(True)
-        action.triggered.connect(self._internal_simulate_trigger_load_cell)
-
         action = self.force_headbar_detector_action = QAction("HeadBar", self)
         action.setCheckable(True)
         action.triggered.connect(self._internal_set_force_headbar_detector)
@@ -1113,10 +1109,6 @@ class MainWindow(QMainWindow):
 
         action = self.preferences_action = QAction(_toolbar_icon("fa5s.cog"), "Preferences", self)
         action.triggered.connect(self._show_preferences)
-
-        tooltip = "Reset pellet and reach counts for this animal"
-        action = self._reset_animal_pellet_counts_action = QAction(_toolbar_icon("fa5s.sync"), tooltip, self)
-        action.triggered.connect(self._reset_animal_pellet_counts)
 
         action = self.quit_action = QAction("Quit")
         action.setShortcut(QKeyCombination(Qt.Modifier.CTRL, Qt.Key.Key_Q))
@@ -1176,7 +1168,6 @@ class MainWindow(QMainWindow):
         combo.addItem("Running", userData=AppModelStatus.ACQUIRING)
         combo.currentIndexChanged.connect(self._on_system_mode_combo_changed)
         toolbar.addWidget(combo)
-        toolbar.addAction(self.refresh_hardware_action)
         # toolbar.addAction(self.run_action)
         # toolbar.addAction(self.animal_in_device_action)
         # toolbar.addAction(self.animal_in_training_action)
@@ -1207,8 +1198,6 @@ class MainWindow(QMainWindow):
         combo.currentIndexChanged.connect(self._animal_changed)
         combo.lineEdit().editingFinished.connect(self._add_animal)
         toolbar.addWidget(combo)
-
-        toolbar.addAction(self._reset_animal_pellet_counts_action)
 
         toolbar.addSeparator()
 
@@ -1297,7 +1286,6 @@ class MainWindow(QMainWindow):
             self.addToolBar(toolbar)
             toolbar.setFloatable(False)
             toolbar.setMovable(False)
-            toolbar.addAction(self.load_cell_trigger_action)
             toolbar.addAction(self.force_headbar_detector_action)
             toolbar.addAction(self.pellet_seen_action)
             toolbar.addAction(self.mouse_seen_action)
@@ -1360,7 +1348,6 @@ class MainWindow(QMainWindow):
 
     def _update_tunnel_headfix_visibility(self, is_enabled: bool):
         for action in (
-            self.load_cell_trigger_action,
             self.force_headbar_detector_action,
         ):
             if not is_enabled and action.isChecked():
@@ -1427,8 +1414,6 @@ class MainWindow(QMainWindow):
         prefs = self._preferences
         if name == prefs.LOG_LEVEL:
             self._update_log_level(value)
-        elif name == prefs.REMOVE_RAW_DATA_WHEN_INACTIVE_SESSION:
-            self._app_model.behavior.algorithm.clean_raw_data_on_inactive_session = value
         elif name == prefs.PELLET_LOAD_COUNT_TOTAL:
             self._set_reset_vat_text()
         elif name == prefs.SERIAL_NUMBER:
@@ -1452,15 +1437,9 @@ class MainWindow(QMainWindow):
         time.sleep(1.5)
         return fake_result
 
-    def _internal_simulate_trigger_load_cell(self):
-        if not self._app_model.hardware.tunnel_headfix_enabled:
-            logger.warning("Blocked internal load-cell simulation: tunnel/headfix hardware is disabled")
-            self.load_cell_trigger_action.setChecked(False)
-            return
-        is_checked = self.load_cell_trigger_action.isChecked()
+    def _prepare_simulated_analysis_result(self):
         app_model = self._app_model
-        load_cell_monitor = app_model.analysis.load_cell_monitor
-        if not is_checked and self.analysis_results_action.isChecked():
+        if self.analysis_results_action.isChecked():
             logger.verbose("Patching intersession segmentation and detection with simulate")
             inference = app_model.inference
             inference._feed_intersession_analysis_execute = self._simulate_intersession_segmentation
@@ -1474,7 +1453,6 @@ class MainWindow(QMainWindow):
                 rh_max_vp_list=[Offset3DTuple(x, y, z)]
             )
             inference._intersession_process_execute = partial(self._simulate_intersession_process, fake_result=res)
-        load_cell_monitor.force_engaged(is_checked)
 
     def _internal_set_force_headbar_detector(self):
         if not self._app_model.hardware.tunnel_headfix_enabled:
@@ -1537,7 +1515,7 @@ class MainWindow(QMainWindow):
                 return
             set_headfix = False
             print("starting new simulate session")
-            self.load_cell_trigger_action.trigger()
+            app.start_recording()
             do_sleep()
             t_end = time.perf_counter() + 10
             while algo.capture_status != CaptureProcessStatus.RECORDING:
@@ -1623,7 +1601,8 @@ class MainWindow(QMainWindow):
                 #     break
                 do_sleep()
             #
-            self.load_cell_trigger_action.trigger()
+            self._prepare_simulated_analysis_result()
+            app.stop_recording()
             time.sleep(2)
             while infe.status != InferenceStatus.live:
                 if infe.status in {InferenceStatus.stopped, InferenceStatus.stopping}:
@@ -1775,6 +1754,24 @@ class MainWindow(QMainWindow):
             self.blockSignals(False)
 
             self.main_content.set_is_capture_active(value != AppModelStatus.IDLE)
+
+        elif name == props.SESSION_RECORDING_STATUS:
+            if value == SessionRecordingStatus.READY:
+                self._on_app_model_property_changed(
+                    props.STATUS,
+                    app_model.status,
+                    app_model.status,
+                )
+            else:
+                for item in (
+                    self._app_model_status_combo,
+                    self.run_action,
+                    self.animal_in_device_action,
+                    self.animal_in_training_action,
+                    self.calib_diamond_triangle_action,
+                    self.make_3d_calib_action,
+                ):
+                    item.setEnabled(False)
 
         elif name == props.ANIMALS:
             self._reload_animals(value)
@@ -1984,20 +1981,3 @@ class MainWindow(QMainWindow):
             self._open_dialogs.remove(msg_box)
         except ValueError:
             pass
-
-    def _reset_animal_pellet_counts(self):
-        app_model = self._app_model
-        # apply it to the algo,
-        # so that event/change listeners will get reset too
-        algo = app_model.behavior.algorithm
-        algo.pellets_presented_day = algo.pellets_presented_total = 0
-        algo.successful_reaches_day = algo.successful_reaches_total = 0
-        algo.pellet_reaches_day = algo.pellet_reaches_total = 0
-        algo.pellet_consumed_day = algo.pellet_consumed_total = 0
-        # but animal isn't synced with that, so:
-        selected = self._app_model.selected_animal
-        if selected is not None:
-            selected.pellet_counts_day = AnimalPelletCounts()
-            selected.pellet_counts_total = AnimalPelletCounts()
-            self._app_model._save_animal_metadata(selected, sender="reset_animal_counts",
-                                                  backup_previous=True)

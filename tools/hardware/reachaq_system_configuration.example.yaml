@@ -13,7 +13,7 @@ cameras:
   isEnabled: true
   isRecordEnabled: true
   recordMode: 1
-  recordPrebufferDuration: 1.0
+  recordPrebufferDuration: 0.0
   isStillImageCaptureEnabled: false
   stillImageCaptureInterval: 0.0
   scheme: spinnaker
@@ -36,7 +36,7 @@ cameras:
   isEnabled: true
   isRecordEnabled: true
   recordMode: 1
-  recordPrebufferDuration: 1.0
+  recordPrebufferDuration: 0.0
   isStillImageCaptureEnabled: false
   stillImageCaptureInterval: 0.0
   scheme: spinnaker
@@ -59,7 +59,7 @@ cameras:
   isEnabled: false
   isRecordEnabled: false
   recordMode: 1
-  recordPrebufferDuration: 1.0
+  recordPrebufferDuration: 0.0
   isStillImageCaptureEnabled: false
   stillImageCaptureInterval: 0.0
   scheme: spinnaker
@@ -131,16 +131,6 @@ behavior: !BehaviorConfiguration
   headbarPressure: !HeadbarPressureConfiguration
     threshold: 20
     duration: 0.5
-  autoTare: !LoadCellAutoTareConfiguration
-    threshold: 0.1
-    rangeThreshold: 0.75
-    duration: 2.0
-  loadCell: !LoadCellConfiguration
-    weightActiveThreshold: 15.0
-    weightInactiveThreshold: 2.0
-    thresholdDuration: 0.25
-    minEventDuration: 3.0
-    minPostEventHoldDuration: 6.0
 persistence: !PersistenceConfiguration
   outputLocation: /home/<USER>/Documents/rawdatalocal
 watchdog: !WatchdogConfig

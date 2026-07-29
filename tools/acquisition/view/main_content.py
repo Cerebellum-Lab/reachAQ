@@ -384,6 +384,9 @@ class MainContent(ContentWidget):
     def set_hardware_refreshing(self, is_refreshing: bool):
         self._hardware_status_content.set_hardware_refreshing(is_refreshing)
 
+    def set_hardware_refresh_action(self, action):
+        self._hardware_status_content.set_refresh_action(action)
+
     def _create_right_side_tabs(self):
         tabs = QTabWidget()
         tabs.setObjectName("ReachAQRightSideTabs")

@@ -157,7 +157,14 @@ class HardwareStatusContent(ContentWidget):
         self.setObjectName("HardwareStatusContent")
         self.setStyleSheet("#HardwareStatusContent QLabel {color: #2f343a;}")
 
-        self._card_widget = CardWidget(title="Hardware Status")
+        self._refresh_button = QToolButton(self)
+        self._refresh_button.setAutoRaise(True)
+        self._refresh_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        self._refresh_button.setVisible(False)
+        self._card_widget = CardWidget(
+            title="Hardware Status",
+            header_right_layout=self._refresh_button,
+        )
 
         layout = self._category_layout = QVBoxLayout()
         layout.setAlignment(Qt.AlignmentFlag.AlignTop)
@@ -194,6 +201,10 @@ class HardwareStatusContent(ContentWidget):
         app_model.hardware.property_changed += self._on_hardware_model_property_changed
         self._refresh_status()
         self.set_hardware_refreshing(False)
+
+    def set_refresh_action(self, action) -> None:
+        self._refresh_button.setDefaultAction(action)
+        self._refresh_button.setVisible(True)
 
     def _add_status_row(self, key: str, title: str) -> None:
         panel = _CollapsibleHardwareCategory(title)

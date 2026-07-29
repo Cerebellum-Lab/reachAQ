@@ -178,10 +178,8 @@ class PreferencesContent(QWidget):
         if not tunnel_headfix_enabled:
             algo.head_fixation_enabled = False
             algo.active_config.head_clamp.enabled = False
-            algo.auto_close_gate_on_intersession_config.enabled = False
             analysis.auto_tunnel_sweep_monitor.config.enabled = False
             analysis.auto_tunnel_sweep_monitor.stop()
-            algo.batch_session_recording_config.enabled = False
 
         states_refresh = []
         add_enabled_state = states_refresh.append
@@ -485,44 +483,6 @@ class PreferencesContent(QWidget):
         left_grid_layout.addWidget(spinbox, cur_row, cur_col + 1)
         cur_row += 1
         #
-        auto_close_start_row = cur_row
-        left_grid_layout.addWidget(QLabel("<b>Auto-close gate during intertrial analysis:</b>"), cur_row, cur_col)
-        auto_close_gate_cfg = algo.auto_close_gate_on_intersession_config
-        toggle = QSwitch()
-        toggle.setChecked(auto_close_gate_cfg.enabled)
-        def toggle_changed(value):
-            enabled = value != 0
-            algo.auto_close_gate_on_intersession_config.enabled = enabled
-            refresh_enabled_states()
-        toggle.stateChanged.connect(toggle_changed)
-        left_grid_layout.addWidget(toggle, cur_row, cur_col + 1)
-        cur_row += 1
-
-        left_grid_layout.addWidget(QLabel("trial minimum duration (sec.):"), cur_row, cur_col)
-        spinbox = QDoubleSpinBox()
-        add_enabled_state(lambda s=spinbox, t=toggle: s.setEnabled(t.isChecked()))
-        spinbox.setRange(0, max(1_000_000., auto_close_gate_cfg.session_min_duration))
-        spinbox.setDecimals(1)
-        spinbox.setValue(auto_close_gate_cfg.session_min_duration)
-        def spinbox_value_changed(value):
-            auto_close_gate_cfg.session_min_duration = value
-        spinbox.valueChanged.connect(spinbox_value_changed)
-        left_grid_layout.addWidget(spinbox, cur_row, cur_col + 1)
-        cur_row += 1
-
-        left_grid_layout.addWidget(QLabel("delay after cage enter to close (sec.):"), cur_row, cur_col)
-        spinbox = QDoubleSpinBox()
-        add_enabled_state(lambda s=spinbox, t=toggle: s.setEnabled(t.isChecked()))
-        spinbox.setRange(0, _DELAY_OR_DURATION_MAX_VALUE)
-        spinbox.setDecimals(1)
-        spinbox.setValue(auto_close_gate_cfg.delay_after_cage_enter)
-        def spinbox_value_changed(value):
-            auto_close_gate_cfg.delay_after_cage_enter = value
-        spinbox.valueChanged.connect(spinbox_value_changed)
-        left_grid_layout.addWidget(spinbox, cur_row, cur_col + 1)
-        cur_row += 1
-        tunnel_headfix_left_rows.extend(range(auto_close_start_row, cur_row))
-
         # right part:
         right_grid_layout = QGridLayout()
         right_grid_layout.setContentsMargins(2, 6, 0, 0)
@@ -568,9 +528,9 @@ class PreferencesContent(QWidget):
         spinbox.setMinimum(0)
         spinbox.setMaximum(1023)
         spinbox.setWrapping(False)
-        spinbox.setValue(analysis.headbar_pressure_monitor.load_cell_engaged_threshold)
+        spinbox.setValue(analysis.headbar_pressure_monitor.engaged_threshold)
         def update_headbar_pressure_threshold(value):
-            analysis.headbar_pressure_monitor.load_cell_engaged_threshold = value
+            analysis.headbar_pressure_monitor.engaged_threshold = value
         spinbox.valueChanged.connect(update_headbar_pressure_threshold)
         spinbox.setToolTip("A value that adjusts the sensitivity of the headbar detector for it to be considered engaged.")
         right_grid_layout.addWidget(spinbox, cur_row, cur_col + 1)
@@ -818,27 +778,6 @@ class PreferencesContent(QWidget):
         right_grid_layout.addWidget(spinbox, cur_row, cur_col + 1)
         cur_row += 1
         #
-        right_grid_layout.addWidget(QLabel("<b>Batch trials while in tunnel:</b>"), cur_row, cur_col)
-        toggle = QSwitch()
-        toggle.setChecked(algo.batch_session_recording_config.enabled)
-        right_grid_layout.addWidget(toggle, cur_row, cur_col + 1)
-        def batch_session_toggled(x: int):
-            enabled = x != 0
-            algo.batch_session_recording_config.enabled = enabled
-            refresh_enabled_states()
-        toggle.stateChanged.connect(batch_session_toggled)
-        cur_row += 1
-        right_grid_layout.addWidget(QLabel("Maximum trials per batch"), cur_row, cur_col)
-        spinbox = QSpinBox()
-        add_enabled_state(lambda s=spinbox, t=toggle: s.setEnabled(t.isChecked()))
-        spinbox.setToolTip("0 for unlimited")
-        spinbox.setRange(0, 1_000)
-        spinbox.setValue(algo.batch_session_recording_config.maximum_batch_size)
-        def max_sess_per_batch_changed(value):
-            algo.batch_session_recording_config.maximum_batch_size = value
-        spinbox.valueChanged.connect(max_sess_per_batch_changed)
-        right_grid_layout.addWidget(spinbox, cur_row, cur_col + 1)
-        #
         # to enable/disable the inference dependant sub-widgets:
         refresh_enabled_states()
 
@@ -914,13 +853,6 @@ class PreferencesContent(QWidget):
         # form_layout.addRow(ATSeparator())
         # form_layout.addRow(QWidget())
 
-        self._checkbox_remove_raw_data_inactive_session = QCheckBox()
-        self._checkbox_remove_raw_data_inactive_session.setChecked(
-            self._preferences.remove_raw_data_when_inactive_session)
-        self._checkbox_remove_raw_data_inactive_session.stateChanged.connect(
-            self._remove_raw_data_when_inactive_session_changed)
-        form_layout.addRow("Remove saved videos when animal not seen:", self._checkbox_remove_raw_data_inactive_session)
-
         tab = QWidget(None)
         tab.setLayout(form_layout)
 
@@ -948,9 +880,6 @@ class PreferencesContent(QWidget):
 
     def _log_location_changed(self, value: str):
         self._preferences.log_location = value
-
-    def _remove_raw_data_when_inactive_session_changed(self, value: bool):
-        self._preferences.remove_raw_data_when_inactive_session = value
 
     def _browse_for_location(self, which: str):
         if which == "animal":
