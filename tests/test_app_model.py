@@ -1,4 +1,5 @@
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -69,3 +70,34 @@ def test_abort_removes_whole_session_and_resets_counts(app_model):
     assert algorithm.pellets_consumed == 0
     assert algorithm.pellet_reaches == 0
     assert algorithm.successful_reaches == 0
+
+
+def test_stop_finishes_auxiliary_data_after_raw_writers_close(app_model):
+    app_model._pending_session_end_perf = 12.5
+    app_model._session_analysis_finished = False
+    app_model._set_session_recording_status(SessionRecordingStatus.STOPPING)
+
+    with mock.patch.object(
+        app_model._session_data_recorder, "stop"
+    ) as stop, mock.patch.object(
+        app_model, "_save_project_metadata"
+    ) as save_metadata:
+        app_model._complete_stopped_recording(app_model.project)
+
+    stop.assert_called_once_with(12.5)
+    save_metadata.assert_called_once_with(
+        app_model.project,
+        caller="raw_writers_closed",
+    )
+    assert app_model.session_recording_status is SessionRecordingStatus.ANALYZING
+
+
+def test_record_start_timeout_aborts_partial_session(app_model):
+    app_model._set_session_recording_status(SessionRecordingStatus.ARMING)
+    with mock.patch.object(app_model, "on_error") as on_error, mock.patch.object(
+        app_model, "abort_recording"
+    ) as abort:
+        app_model._record_start_timed_out()
+
+    on_error.assert_called_once()
+    abort.assert_called_once_with()

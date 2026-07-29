@@ -67,6 +67,7 @@ from autotrainer.core.multiproc import get_mp_ctx, make_daemon_timer, DaemonTime
 from autotrainer.core.pose_elements import SceneElement
 from autotrainer.core.project.project_info import DATE_TIME_FORMAT
 from autotrainer.core.video_detection import PresenceDetectionAttrs
+from autotrainer.video import VideoRecordMode
 
 from autotrainer.inference import (
     PoseAlgorithm,
@@ -316,10 +317,14 @@ class AppModel(ObservableObject):
         self._acquisition_stopping = False
         self._session_recording_status = SessionRecordingStatus.READY
         self._session_analysis_finished = True
+        self._session_analysis_started_perf: Optional[float] = None
+        self._session_analysis_duration_seconds: Optional[float] = None
+        self._pending_session_end_perf: Optional[float] = None
         self._aborting_project: Optional[ProjectInfo] = None
         self._aborted_session_ids = set()
         self._abort_had_recording_started = False
         self._abort_cleanup_timer = no_op_timer
+        self._record_start_timer = no_op_timer
         self._closing_event = threading.Event()
         self._reload_plans_needed = False
         self._prev_diamond_coord: Offset3DTuple = Offset3DTuple(math.nan, math.nan, math.nan)
@@ -462,7 +467,6 @@ class AppModel(ObservableObject):
         intersession.events.property_changed += self._on_intersession_property_changed
 
         pellet_m = system_machine.pellet
-        pellet_m.events.pellet_loaded += self._on_pellet_loaded
         pellet_m.events.pellet_sent += self._on_pellet_sent
 
         analysis.watchdog_monitor.property_changed += self._on_watchdog_property_changed
@@ -676,9 +680,6 @@ class AppModel(ObservableObject):
         logger.verbose("Created new daily timer in %.1f seconds ; today=%s", delay, new_day)
         self.current_day_changed(new_day)
 
-    def check_max_pellet_loaded(self):
-        return None
-
     @property
     def app_lock(self) -> threading.RLock:
         return self._behavior.algorithm.thread_lock
@@ -710,6 +711,9 @@ class AppModel(ObservableObject):
             logger.warning("start_recording refused while %s", self._session_recording_status.value)
             return False
         self._session_analysis_finished = False
+        self._session_analysis_started_perf = None
+        self._session_analysis_duration_seconds = None
+        self._pending_session_end_perf = None
         self._abort_had_recording_started = False
         self._set_session_recording_status(SessionRecordingStatus.ARMING)
         project = self._project_info
@@ -729,7 +733,26 @@ class AppModel(ObservableObject):
             self._session_data_recorder.abort()
             self._set_session_recording_status(SessionRecordingStatus.READY)
             return False
+        self._aborted_session_ids.discard(project.short_id)
+        if self._session_recording_status == SessionRecordingStatus.ARMING:
+            self._record_start_timer.cancel()
+            self._record_start_timer = make_daemon_timer(
+                10.0,
+                self._record_start_timed_out,
+            )
+            self._record_start_timer.start()
         return True
+
+    def _record_start_timed_out(self) -> None:
+        if self._session_recording_status != SessionRecordingStatus.ARMING:
+            return
+        logger.error("Timed out waiting for the primary camera to begin recording")
+        self.on_error(
+            "Recording failed",
+            "The primary camera did not begin recording within 10 seconds. "
+            "The partial session will be aborted.",
+        )
+        self.abort_recording()
 
     def stop_recording(self) -> bool:
         if self._session_recording_status != SessionRecordingStatus.RECORDING:
@@ -758,6 +781,9 @@ class AppModel(ObservableObject):
         self._aborting_project = project.to_local_value()
         self._aborted_session_ids.add(self._aborting_project.short_id)
         self._session_data_recorder.abort()
+        self._pending_session_end_perf = None
+        self._record_start_timer.cancel()
+        self._record_start_timer = no_op_timer
         self._set_session_recording_status(SessionRecordingStatus.ABORTING)
         stopped = self._behavior.algorithm.end_capture_session(
             reason=RecordingEndingReason.MANUAL_ABORT,
@@ -1081,6 +1107,8 @@ class AppModel(ObservableObject):
                     if project is not None:
                         project.start_record_timestamp = first_frame_time
                     self._session_data_recorder.commit_start(first_frame_perf, first_frame_time)
+                    self._record_start_timer.cancel()
+                    self._record_start_timer = no_op_timer
                     self._abort_had_recording_started = True
                     logger.info(
                         "received RECORDING: frame-0 time=%.3f perf_c=%.3f now=%.3f",
@@ -1095,16 +1123,9 @@ class AppModel(ObservableObject):
                 algo.set_capture_status(new_status, perf_now=p_now)
                 if new_status == CaptureProcessStatus.RUNNING:
                     if self._session_recording_status == SessionRecordingStatus.STOPPING:
-                        end_perf = r_args[0] if r_args else get_perf_now()
-                        try:
-                            self._session_data_recorder.stop(end_perf)
-                        except Exception as err:
-                            logger.exception("Failed to save session auxiliary streams: %s", err)
-                            self.on_error("Session stream save failed", str(err))
-                        if self._session_analysis_finished:
-                            self._set_session_recording_status(SessionRecordingStatus.READY)
-                        else:
-                            self._set_session_recording_status(SessionRecordingStatus.ANALYZING)
+                        self._pending_session_end_perf = (
+                            r_args[0] if r_args else get_perf_now()
+                        )
                     elif (
                         self._session_recording_status == SessionRecordingStatus.ABORTING
                         and not self._abort_had_recording_started
@@ -1123,10 +1144,16 @@ class AppModel(ObservableObject):
                 cams_closed_finished[cam_idx] = (project, frames_written)
                 if all(cam.camera_index in cams_closed_finished for cam in monitored_cams):
                     project = cams_closed_finished[monitored_cams[0].camera_index][0]
-                    self._merge_camera_timestamp_files(project, monitored_cams)
+                    try:
+                        self._merge_camera_timestamp_files(project, monitored_cams)
+                    except Exception as err:
+                        logger.exception("Failed to merge camera timestamps: %s", err)
+                        self.on_error("Camera timestamp merge failed", str(err))
                     cams_closed_finished.clear()  # now clear
                     if self._session_recording_status == SessionRecordingStatus.ABORTING:
                         self._finish_abort_recording()
+                    elif self._session_recording_status == SessionRecordingStatus.STOPPING:
+                        self._complete_stopped_recording(project)
         else:
             logger.warning("unhandled command: %s raw=%s", cmd, raw)
 
@@ -2206,8 +2233,6 @@ class AppModel(ObservableObject):
             dict(mode=app_status_to_api_app_mode(target_status))
         )
 
-        self.check_max_pellet_loaded()
-
         log_hardware_initialization(
             logger,
             "READY | acquisition hardware | status=%s elapsed=%.3fs",
@@ -2375,6 +2400,13 @@ class AppModel(ObservableObject):
         self._behavior.system_machine.intersession.frame_rate = frame_rate
 
         for camera, camera_config in reach_camera_configs:
+            if camera_config.record_mode != VideoRecordMode.TRIGGER:
+                logger.warning(
+                    "Ignoring continuous camera mode for manual recording: %s=%s",
+                    camera.name,
+                    camera_config.record_mode,
+                )
+            camera_config.record_mode = VideoRecordMode.TRIGGER
             if camera_config.record_prebuffer_duration != 0:
                 logger.warning(
                     "Ignoring camera prebuffer for manual recording alignment: %s=%s",
@@ -2719,8 +2751,6 @@ class AppModel(ObservableObject):
                 if animal.name == value:
                     self.selected_animal = animal
                     break
-        elif name == prefs.PELLET_LOAD_COUNT_TOTAL:
-            self.check_max_pellet_loaded()
         elif name == prefs.CAGE_CLEAN_PREVIOUS_DAY:
             self._refresh_cage_clean_data()
 
@@ -2760,25 +2790,49 @@ class AppModel(ObservableObject):
             logger.verbose("drained record_stop_sema by %s", drained)
 
     def _on_session_capture_ended(self, reason: RecordingEndingReason):
-        if reason == RecordingEndingReason.MANUAL_ABORT:
-            return
-        project = self._project_info
-        if project is not None:
-            self._save_project_metadata(project, caller="session_capture_ended")
-        # self._behavior.system_machine.on_session_capture_ended(reason)
-        # NB: had to keep in system_machine for many tests.
-        # is ok as long as the project isn't modified in system_machine.on_session_capture_ended()
+        logger.debug("session capture trigger ended: %s", reason)
 
     def _on_session_ending(self, project: ProjectInfo, result: CaptureAnalysisResult):
         if project.short_id in self._aborted_session_ids:
             logger.info("ignoring session-ending callback for aborted %s", project.short_id)
             return
         self._session_analysis_finished = True
-        self._save_project_metadata(project, caller="session_analysis_ended")
         if self._session_recording_status == SessionRecordingStatus.ANALYZING:
+            if self._session_analysis_started_perf is not None:
+                self._session_analysis_duration_seconds = (
+                    time.perf_counter() - self._session_analysis_started_perf
+                )
+                logger.info(
+                    "Session analysis finished in %.3f seconds: %s",
+                    self._session_analysis_duration_seconds,
+                    project.short_id,
+                )
             self._set_session_recording_status(SessionRecordingStatus.READY)
+            self._save_project_metadata(project, caller="session_analysis_ended")
+
+    def _complete_stopped_recording(self, project: ProjectInfo) -> None:
+        end_perf = self._pending_session_end_perf
+        self._pending_session_end_perf = None
+        if end_perf is None:
+            end_perf = get_perf_now()
+            logger.warning("Primary camera did not report a final recorded-frame timestamp")
+        try:
+            self._session_data_recorder.stop(end_perf)
+        except Exception as err:
+            logger.exception("Failed to save session auxiliary streams: %s", err)
+            self.on_error("Session stream save failed", str(err))
+        if self._session_analysis_finished:
+            if self._session_analysis_duration_seconds is None:
+                self._session_analysis_duration_seconds = 0.0
+            self._set_session_recording_status(SessionRecordingStatus.READY)
+        else:
+            self._session_analysis_started_perf = time.perf_counter()
+            self._set_session_recording_status(SessionRecordingStatus.ANALYZING)
+        self._save_project_metadata(project, caller="raw_writers_closed")
 
     def _finish_abort_recording(self) -> None:
+        self._record_start_timer.cancel()
+        self._record_start_timer = no_op_timer
         self._abort_cleanup_timer.cancel()
         self._abort_cleanup_timer = no_op_timer
         project = self._aborting_project
@@ -2815,7 +2869,10 @@ class AppModel(ObservableObject):
         finally:
             self._behavior.algorithm.reset_session_counts()
             self._session_data_recorder.abort()
+            self._pending_session_end_perf = None
             self._session_analysis_finished = True
+            self._session_analysis_started_perf = None
+            self._session_analysis_duration_seconds = None
             self._abort_had_recording_started = False
             self._aborting_project = None
             self._set_session_recording_status(SessionRecordingStatus.READY)
@@ -3089,6 +3146,7 @@ class AppModel(ObservableObject):
                 "consumed": self._behavior.algorithm.pellets_consumed,
             },
             "recordingStatus": self._session_recording_status.value,
+            "analysisDurationSeconds": self._session_analysis_duration_seconds,
             "configuration": None,
         }
 
@@ -3332,14 +3390,6 @@ class AppModel(ObservableObject):
     #
 
     # pellet machine events
-
-    def _on_pellet_loaded(self):
-        prefs = self._preferences
-        prefs.pellet_load_count_total += 1
-        prefs.pellet_load_count_day += 1
-        prefs.save()  # always
-        #
-        self.check_max_pellet_loaded()
 
     def _on_pellet_sent(self, *, perf_c: Optional[float]=None):
         algo = self._behavior.algorithm

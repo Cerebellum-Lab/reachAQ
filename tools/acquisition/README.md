@@ -290,9 +290,28 @@ GPU model, memory, and driver.
 ### Camera Control
 
 * Video Capture - starts capture only when the camera is enabled.
-* Record Mode - `Continuous` records the full duration, `Trigger` records around trigger events.
-* Video Recording - writes frames to video files.
+* Video Recording - includes the camera in manually started sessions.
 * Image Capture - captures still images at a configured interval.
+
+Normal acquisition always uses triggered recording. Selecting System Mode
+`Running` starts acquisition and preview without writing session video. Use
+`Record` in the Behavior panel to initialize a session and begin writing,
+`Stop` to retain it and run analysis, or `Abort` to discard the entire session.
+Record remains unavailable until analysis for the stopped session finishes.
+
+Session-aligned auxiliary files are stored beneath the matching `trialNNN`
+directory:
+
+```text
+streams/nidaq.h5
+streams/device.csv
+streams/laser.csv
+streams/alignment.json
+logs/session.log
+```
+
+`alignment.json` records the primary-camera start/end boundary and the first
+and last saved timestamps and offsets for every auxiliary stream.
 
 ## Startup Diagnostics
 

@@ -21,6 +21,9 @@ def system_config(trainer_config_dir, tmp_path):
     # mostly ~all default params are good, but we need:
     config.behavior.pellet_delivery.is_enabled = True
     config.behavior.pellet_delivery.is_intersession_analysis_enabled = True
+    # Application tests use the mock device stack and must not depend on the
+    # host SocketCAN interface being up.
+    config.hardware.can_enabled = False
     for cam_member in (CameraId.Left, CameraId.Right, CameraId.Web):
         params = dict(width=300, height=200)
         cam = CameraConfiguration(name=cam_member.name, params=params)
