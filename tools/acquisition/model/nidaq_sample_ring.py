@@ -163,7 +163,7 @@ class SharedNidaqSampleRing:
                 write_count if previous_valid == 0 else previous_valid + write_count,
             )
             self._source_perf_time.value = time.perf_counter()
-            self._source_wall_time.value = float(block.wall_time)
+            self._source_wall_time.value = time.time()
             self._generation.value += 1
         except BaseException:
             self._valid_sample_count.value = 0

@@ -1,4 +1,5 @@
 import csv
+import json
 from datetime import datetime
 
 import h5py
@@ -72,3 +73,44 @@ def test_session_outputs_are_clipped_to_camera_boundaries(tmp_path):
     assert "inside" in text
     assert "before" not in text
     assert "after" not in text
+
+    alignment = json.loads(
+        (session_dir / "streams" / "alignment.json").read_text()
+    )
+    assert alignment["canonicalBoundary"]["startPerfTime"] == start_perf
+    assert alignment["canonicalBoundary"]["endPerfTime"] == end_perf
+    assert alignment["streams"]["nidaq"]["sampleCount"] == 2
+    assert alignment["streams"]["nidaq"]["firstOffsetSeconds"] == 0.0
+    assert alignment["streams"]["device"]["sampleCount"] == 1
+    assert alignment["streams"]["laser"]["lastOffsetSeconds"] == 1.0
+    assert alignment["streams"]["logs"]["sampleCount"] == 1
+
+
+def test_empty_session_streams_still_have_alignment_metadata(tmp_path):
+    project = ProjectInfo(
+        root=str(tmp_path),
+        device_id="test",
+        when=datetime(2026, 1, 2, 3, 4, 5),
+        session=2,
+    )
+    SessionDataRecorder._write_session(
+        project,
+        20.0,
+        200.0,
+        21.0,
+        (),
+        (),
+        (),
+        (),
+    )
+
+    streams = tmp_path / "20260102" / "test" / "trial002" / "streams"
+    alignment = json.loads((streams / "alignment.json").read_text())
+    for stream in alignment["streams"].values():
+        assert stream["sampleCount"] == 0
+        assert stream["firstPerfTime"] is None
+        assert stream["lastPerfTime"] is None
+    with h5py.File(streams / "nidaq.h5") as output:
+        assert output["sample_index"].size == 0
+        assert output.attrs["recording_start_perf"] == 20.0
+        assert output.attrs["recording_end_perf"] == 21.0

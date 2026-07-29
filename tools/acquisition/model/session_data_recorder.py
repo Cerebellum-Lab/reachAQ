@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import logging
 import math
 import threading
@@ -229,7 +230,9 @@ class SessionDataRecorder:
             )
             # source_perf_time/source_wall_time are stamped when the block is
             # published. Reconstruct each sample working backward from its end.
-            sample_lag = (read.end_sample_index - indices) / read.sample_rate_hz
+            sample_lag = (
+                read.end_sample_index - 1 - indices
+            ) / read.sample_rate_hz
             perf_times = read.source_perf_time - sample_lag
             wall_times = read.source_wall_time - sample_lag
             with self._lock:
@@ -275,6 +278,22 @@ class SessionDataRecorder:
         streams_dir.mkdir(parents=True, exist_ok=True)
         logs_dir.mkdir(parents=True, exist_ok=True)
 
+        device_rows = tuple(
+            row for row in device_rows if start_perf <= row[0] <= end_perf
+        )
+        laser_rows = tuple(
+            row for row in laser_rows if start_perf <= row[0] <= end_perf
+        )
+        log_rows = tuple(
+            row for row in log_rows if start_perf <= row[0] <= end_perf
+        )
+        nidaq_perf = tuple(
+            float(sample_perf)
+            for chunk in nidaq_chunks
+            for sample_perf in chunk[1]
+            if start_perf <= sample_perf <= end_perf
+        )
+
         SessionDataRecorder._write_csv(
             streams_dir / "device.csv",
             ("perf_time", "offset_seconds", "wall_time", "switch", "pressure",
@@ -282,7 +301,6 @@ class SessionDataRecorder:
             (
                 (perf, perf - start_perf, wall, switch, pressure, temperature, humidity)
                 for perf, wall, switch, pressure, temperature, humidity in device_rows
-                if start_perf <= perf <= end_perf
             ),
         )
         SessionDataRecorder._write_csv(
@@ -292,7 +310,6 @@ class SessionDataRecorder:
             (
                 (perf, perf - start_perf, wall, event, channel, source, command, diode, copy)
                 for perf, wall, event, channel, source, command, diode, copy in laser_rows
-                if start_perf <= perf <= end_perf
             ),
         )
 
@@ -303,8 +320,7 @@ class SessionDataRecorder:
                 f"recording_end_perf={end_perf:.9f}\n"
             )
             for perf, _, message in log_rows:
-                if start_perf <= perf <= end_perf:
-                    stream.write(f"[+{perf - start_perf:.6f}s] {message}\n")
+                stream.write(f"[+{perf - start_perf:.6f}s] {message}\n")
 
         SessionDataRecorder._write_nidaq(
             streams_dir / "nidaq.h5",
@@ -313,6 +329,65 @@ class SessionDataRecorder:
             end_perf,
             nidaq_chunks,
         )
+        alignment = {
+            "schemaVersion": 1,
+            "canonicalBoundary": {
+                "source": "primary_camera_recorded_frames",
+                "clock": "time.perf_counter",
+                "startPerfTime": start_perf,
+                "endPerfTime": end_perf,
+                "startWallTime": start_wall,
+                "endWallTime": start_wall + (end_perf - start_perf),
+            },
+            "streams": {
+                "nidaq": SessionDataRecorder._alignment_entry(
+                    "nidaq.h5",
+                    nidaq_perf,
+                    start_perf,
+                    "NI-DAQ ring reconstructed on time.perf_counter",
+                ),
+                "device": SessionDataRecorder._alignment_entry(
+                    "device.csv",
+                    tuple(row[0] for row in device_rows),
+                    start_perf,
+                    "device monotonic timestamp",
+                ),
+                "laser": SessionDataRecorder._alignment_entry(
+                    "laser.csv",
+                    tuple(row[0] for row in laser_rows),
+                    start_perf,
+                    "time.perf_counter",
+                ),
+                "logs": SessionDataRecorder._alignment_entry(
+                    "../logs/session.log",
+                    tuple(row[0] for row in log_rows),
+                    start_perf,
+                    "time.perf_counter",
+                ),
+            },
+        }
+        with (streams_dir / "alignment.json").open("w", encoding="utf-8") as stream:
+            json.dump(alignment, stream, indent=2)
+            stream.write("\n")
+
+    @staticmethod
+    def _alignment_entry(path, perf_times, start_perf, clock):
+        if perf_times:
+            first_perf = float(perf_times[0])
+            last_perf = float(perf_times[-1])
+            first_offset = first_perf - start_perf
+            last_offset = last_perf - start_perf
+        else:
+            first_perf = last_perf = first_offset = last_offset = None
+        return {
+            "path": path,
+            "clock": clock,
+            "sampleCount": len(perf_times),
+            "firstPerfTime": first_perf,
+            "lastPerfTime": last_perf,
+            "firstOffsetSeconds": first_offset,
+            "lastOffsetSeconds": last_offset,
+        }
 
     @staticmethod
     def _write_csv(path: Path, header, rows) -> None:
@@ -343,6 +418,7 @@ class SessionDataRecorder:
             output.attrs["recording_start_wall"] = start_wall
             output.attrs["recording_end_perf"] = end_perf
             output.attrs["alignment"] = "first sample at or after primary camera first frame"
+            output.attrs["source_clock"] = "NI-DAQ ring reconstructed on time.perf_counter"
             output.attrs["channel_names"] = channel_names
             if not selected:
                 output.create_dataset("sample_index", data=np.empty(0, dtype=np.int64))
@@ -365,6 +441,10 @@ class SessionDataRecorder:
                 compression="gzip",
             )
             output.create_dataset("values", data=values, compression="gzip")
+            output.attrs["first_perf_time"] = perf[0]
+            output.attrs["last_perf_time"] = perf[-1]
+            output.attrs["first_offset_seconds"] = perf[0] - start_perf
+            output.attrs["last_offset_seconds"] = perf[-1] - start_perf
             output.attrs["sample_rate_hz"] = selected[0][4]
             output.attrs["epoch"] = selected[-1][5]
             output.attrs["gap_count"] = selected[-1][6]
