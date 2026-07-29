@@ -74,7 +74,9 @@ class MessageHandler(ObservableObject):
     ack_received: AckReceivedHandlerT
 
     def __init__(self, input_queue: Queue, name: str = "message-handler", event_names=()):
-        super().__init__(event_names=event_names + ("ack_received",))
+        super().__init__(
+            event_names=event_names + ("ack_received", "decoded_message_received"),
+        )
         self._input_queue = input_queue
         self._name = name
         self._current_thread = None
@@ -120,6 +122,18 @@ class MessageHandler(ObservableObject):
                 task_done()
                 break
             #
+            try:
+                self.decoded_message_received(
+                    msg,
+                    data,
+                    time.perf_counter(),
+                    time.time(),
+                )
+            except Exception as err:
+                logger.exception(
+                    "Error during decoded_message_received callback: %s",
+                    err,
+                )
             if msg == SystemStatusMessageKind.ACKNOWLEDGE:
                 tok, perf_c = data
                 try:

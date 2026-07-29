@@ -77,7 +77,7 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
         message_handler: MessageHandler,
         sensor_analysis: SensorAnalysis,
     ):
-        super().__init__()
+        super().__init__(event_names=("device_event",))
 
         self._lock = threading.RLock()  # **required** re-entrant lock !!
         self._safety_shutdown_lock = threading.Lock()
@@ -566,6 +566,7 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
             log_hardware_initialization(logger, "SKIP | CAN/pellet controller | pellet controller disabled")
             return
         connect_started = time.perf_counter()
+        self._emit_device_event("state", "connect_start")
         transport = CanTransportConfiguration.from_environment()
         log_hardware_initialization(
             logger,
@@ -608,6 +609,7 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
             transport.channel,
             time.perf_counter() - connect_started,
         )
+        self._emit_device_event("state", "connected")
         self.set_device_ack_timeout(self._device_ack_timeout_delay)  # ensure it's used
         self.set_board_status_timeout(self._board_status_timeout)
 
@@ -718,6 +720,7 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
 
     def _disconnect_transport(self):
         logger.verbose("disconnecting ..")
+        self._emit_device_event("state", "disconnect_start")
         self._disconnect_event.set()
         with self._lock:
             self._pending_tokens.clear()
@@ -742,6 +745,7 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
             self._pending_tokens.clear()
         self._refresh_cmd_in_progress([])
         self._device_stream_started = False
+        self._emit_device_event("state", "disconnected")
 
     def _reset_socketcan(self, transport: Optional[CanTransportConfiguration]) -> None:
         if transport is None:
@@ -770,6 +774,11 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
 
     def _run_safety_shutdown(self, reason: str) -> None:
         logger.critical("Starting CAN safety shutdown: %s", reason)
+        self._emit_device_event(
+            "state",
+            "safety_shutdown_start",
+            data={"reason": reason},
+        )
         can_dev = self._can_device
         if can_dev is not None:
             transport = can_dev.can_transport_configuration
@@ -786,6 +795,11 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
         finally:
             self._reset_socketcan(transport)
         logger.notice("CAN safety shutdown finished")
+        self._emit_device_event(
+            "state",
+            "safety_shutdown_finished",
+            data={"reason": reason},
+        )
 
     def safety_shutdown(self, reason: str, *, wait: bool = True) -> None:
         """Stop hardware once, discard commands, and flush the SocketCAN link."""
@@ -958,29 +972,65 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
                 logger.warning("Ignoring %s because CAN safety shutdown is active", cmd)
                 return False
             if device is not None:
+                self._emit_device_event(
+                    "outbound",
+                    cmd,
+                    data=data,
+                    context=context,
+                )
                 device.send_message(cmd, data, context)
                 return True
         return False
+
+    def _emit_device_event(
+        self,
+        direction,
+        kind,
+        *,
+        data=None,
+        context=None,
+        target=None,
+    ) -> None:
+        try:
+            self.device_event(
+                direction,
+                kind,
+                data,
+                context,
+                target,
+                time.perf_counter(),
+                time.time(),
+            )
+        except Exception:
+            logger.exception("Unable to publish structured device event")
 
     def set_motors_drift(self, drift: Offset3DTuple):
         """Apply the pellet motor drift"""
         dev = self._device_conn
         if dev is None:
             return
-        dev.send_message(SystemCommandKind.SET_MOTOR_DRIFT, drift)
+        self._send_command(dev, SystemCommandKind.SET_MOTOR_DRIFT, drift)
         # this ensure the next send_to_fixed_pos command will get the corrected position:
         for cmd_kind in (SystemCommandKind.SET_X, SystemCommandKind.SET_Y, SystemCommandKind.SET_Z):
-            dev.send_message(cmd_kind, SystemDataArgsKwargs(0, relative=True))
+            self._send_command(
+                dev,
+                cmd_kind,
+                SystemDataArgsKwargs(0, relative=True),
+            )
 
     def set_auto_correct_motor_drift(self, enabled: bool):
         dev = self._device_conn
         if dev is None:
             return
-        dev.send_message(SystemCommandKind.SET_AUTO_CORRECT_DRIFT, enabled)
+        self._send_command(dev, SystemCommandKind.SET_AUTO_CORRECT_DRIFT, enabled)
         if not enabled:
             logger.verbose("Doing SET_X/Y/Z relative=0 to clear possible motors drift")
             for cmd_kind in (SystemCommandKind.SET_X, SystemCommandKind.SET_Y, SystemCommandKind.SET_Z):
-                dev.send_message(cmd_kind, SystemDataArgsKwargs(0, relative=True))
+                self._send_command(
+                    dev,
+                    cmd_kind,
+                    SystemDataArgsKwargs(0, relative=True),
+                )
 
     def _refresh_cmd_in_progress(self, commands_tuple: List[Tuple[SystemCommandKind, float]]):
         if len(commands_tuple) == 0:

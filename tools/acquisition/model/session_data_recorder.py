@@ -7,8 +7,11 @@ import logging
 import math
 import threading
 import time
+from collections import deque
+from enum import Enum
 from pathlib import Path
 from typing import Iterable, Optional
+from uuid import UUID
 
 import h5py
 import numpy as np
@@ -38,7 +41,16 @@ class _SessionLogHandler(logging.Handler):
 class SessionDataRecorder:
     """Capture auxiliary streams against the recorded primary-camera boundary."""
 
-    def __init__(self, analysis, nidaq_monitor, laser_model):
+    def __init__(
+        self,
+        analysis,
+        nidaq_monitor,
+        laser_model,
+        *,
+        system_message_handler=None,
+        hardware_model=None,
+        device_event_capacity: int = 100_000,
+    ):
         self._analysis = analysis
         self._nidaq_monitor = nidaq_monitor
         self._laser_model = laser_model
@@ -47,7 +59,9 @@ class SessionDataRecorder:
         self._project: Optional[ProjectInfo] = None
         self._start_perf: Optional[float] = None
         self._start_wall: Optional[float] = None
-        self._device_rows = []
+        self._device_rows = deque(maxlen=device_event_capacity)
+        self._device_event_capacity = int(device_event_capacity)
+        self._device_event_overruns = 0
         self._laser_rows = []
         self._log_rows = []
         self._nidaq_chunks = []
@@ -55,7 +69,12 @@ class SessionDataRecorder:
         self._nidaq_stop = threading.Event()
         self._nidaq_thread: Optional[threading.Thread] = None
 
-        analysis.measurements_sampled += self._on_measurements
+        self._system_message_handler = system_message_handler
+        self._hardware_model = hardware_model
+        if system_message_handler is not None:
+            system_message_handler.decoded_message_received += self._on_device_message
+        if hardware_model is not None:
+            hardware_model.device_event += self._on_hardware_device_event
         laser_model.trace_received += self._on_laser_trace
         laser_model.property_changed += self._on_laser_property_changed
         self._log_handler = _SessionLogHandler(self)
@@ -70,7 +89,8 @@ class SessionDataRecorder:
             # Keep this object reference so the recorder follows that atomic
             # session assignment without racing the first camera frame.
             self._project = project
-            self._device_rows = []
+            self._device_rows = deque(maxlen=self._device_event_capacity)
+            self._device_event_overruns = 0
             self._laser_rows = []
             self._log_rows = []
             self._nidaq_chunks = []
@@ -104,6 +124,7 @@ class SessionDataRecorder:
             start_wall = self._start_wall
             end_perf = max(start_perf, float(end_perf))
             device_rows = tuple(self._device_rows)
+            device_event_overruns = self._device_event_overruns
             laser_rows = tuple(self._laser_rows)
             log_rows = tuple(self._log_rows)
             nidaq_chunks = tuple(self._nidaq_chunks)
@@ -119,6 +140,7 @@ class SessionDataRecorder:
             log_rows,
             nidaq_chunks,
             timing_plan,
+            device_event_overruns=device_event_overruns,
         )
 
     def abort(self) -> None:
@@ -128,6 +150,10 @@ class SessionDataRecorder:
 
     def close(self) -> None:
         self.abort()
+        if self._system_message_handler is not None:
+            self._system_message_handler.decoded_message_received -= self._on_device_message
+        if self._hardware_model is not None:
+            self._hardware_model.device_event -= self._on_hardware_device_event
         logging.getLogger().removeHandler(self._log_handler)
 
     def add_log(self, perf_time: float, wall_time: float, message: str) -> None:
@@ -140,25 +166,117 @@ class SessionDataRecorder:
         self._project = None
         self._start_perf = None
         self._start_wall = None
-        self._device_rows = []
+        self._device_rows = deque(maxlen=self._device_event_capacity)
+        self._device_event_overruns = 0
         self._laser_rows = []
         self._log_rows = []
         self._nidaq_chunks = []
         self._nidaq_last_index = None
 
-    def _on_measurements(self, measurements: Iterable) -> None:
+    def _on_device_message(
+        self,
+        kind,
+        data,
+        perf_time: float,
+        wall_time: float,
+    ) -> None:
+        self._append_device_event(
+            perf_time,
+            wall_time,
+            "inbound",
+            kind,
+            data,
+            None,
+            None,
+        )
+
+    def _on_hardware_device_event(
+        self,
+        direction,
+        kind,
+        data,
+        context,
+        target,
+        perf_time,
+        wall_time,
+    ) -> None:
+        self._append_device_event(
+            perf_time,
+            wall_time,
+            direction,
+            kind,
+            data,
+            context,
+            target,
+        )
+
+    def _append_device_event(
+        self,
+        perf_time,
+        wall_time,
+        direction,
+        kind,
+        data,
+        context,
+        target,
+    ) -> None:
+        kind_name = kind.name if isinstance(kind, Enum) else str(kind)
+        target_name = target.name if isinstance(target, Enum) else target
+        device_timestamp = getattr(data, "timestamp", None)
+        device_index = getattr(data, "index", None)
+        payload_json = self._payload_json(data)
         with self._lock:
             if not self._armed:
                 return
-            for sample in measurements:
-                self._device_rows.append((
-                    float(sample.timestamp) / 1e9,
-                    float(sample.when),
-                    int(bool(sample.switch)),
-                    float(sample.pressure),
-                    float(sample.temperature),
-                    float(sample.humidity),
-                ))
+            if len(self._device_rows) == self._device_rows.maxlen:
+                self._device_event_overruns += 1
+            self._device_rows.append((
+                float(perf_time),
+                float(wall_time),
+                str(direction),
+                kind_name,
+                "" if target_name is None else str(target_name),
+                "" if context is None else str(context),
+                device_timestamp,
+                device_index,
+                payload_json,
+            ))
+
+    @classmethod
+    def _payload_json(cls, value) -> str:
+        return json.dumps(
+            cls._json_safe(value),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    @classmethod
+    def _json_safe(cls, value):
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, Enum):
+            return value.name
+        if isinstance(value, UUID):
+            return str(value)
+        if dataclasses.is_dataclass(value):
+            return {
+                field.name: cls._json_safe(getattr(value, field.name))
+                for field in dataclasses.fields(value)
+            }
+        if isinstance(value, dict):
+            return {
+                str(key): cls._json_safe(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple, set)):
+            return [cls._json_safe(item) for item in value]
+        if hasattr(value, "__dict__"):
+            return {
+                str(key): cls._json_safe(item)
+                for key, item in vars(value).items()
+                if not str(key).startswith("_")
+            }
+        return str(value)
 
     def _on_laser_trace(self, trace) -> None:
         perf_time = time.perf_counter()
@@ -275,6 +393,8 @@ class SessionDataRecorder:
         log_rows,
         nidaq_chunks,
         timing_plan=None,
+        *,
+        device_event_overruns=0,
     ) -> None:
         session_dir = Path(project.get_session_path().location)
         streams_dir = session_dir / "streams"
@@ -284,6 +404,10 @@ class SessionDataRecorder:
 
         device_rows = tuple(
             row for row in device_rows if start_perf <= row[0] <= end_perf
+        )
+        device_rows = tuple(
+            SessionDataRecorder._normalize_device_row(row)
+            for row in device_rows
         )
         laser_rows = tuple(
             row for row in laser_rows if start_perf <= row[0] <= end_perf
@@ -300,11 +424,42 @@ class SessionDataRecorder:
 
         SessionDataRecorder._write_csv(
             streams_dir / "device.csv",
-            ("perf_time", "offset_seconds", "wall_time", "switch", "pressure",
-             "temperature", "humidity"),
             (
-                (perf, perf - start_perf, wall, switch, pressure, temperature, humidity)
-                for perf, wall, switch, pressure, temperature, humidity in device_rows
+                "perf_time",
+                "offset_seconds",
+                "wall_time",
+                "direction",
+                "kind",
+                "target",
+                "context",
+                "device_timestamp",
+                "device_index",
+                "payload_json",
+            ),
+            (
+                (
+                    perf,
+                    perf - start_perf,
+                    wall,
+                    direction,
+                    kind,
+                    target,
+                    context,
+                    device_timestamp,
+                    device_index,
+                    payload,
+                )
+                for (
+                    perf,
+                    wall,
+                    direction,
+                    kind,
+                    target,
+                    context,
+                    device_timestamp,
+                    device_index,
+                    payload,
+                ) in device_rows
             ),
         )
         SessionDataRecorder._write_csv(
@@ -373,6 +528,7 @@ class SessionDataRecorder:
             "nidaqTiming": (
                 None if timing_plan is None else dataclasses.asdict(timing_plan)
             ),
+            "deviceEventOverruns": int(device_event_overruns),
         }
         with (streams_dir / "alignment.json").open("w", encoding="utf-8") as stream:
             json.dump(alignment, stream, indent=2)
@@ -396,6 +552,30 @@ class SessionDataRecorder:
             "firstOffsetSeconds": first_offset,
             "lastOffsetSeconds": last_offset,
         }
+
+    @staticmethod
+    def _normalize_device_row(row):
+        if len(row) == 9:
+            return row
+        if len(row) == 6:
+            perf, wall, switch, pressure, temperature, humidity = row
+            return (
+                perf,
+                wall,
+                "inbound",
+                "MEASUREMENT_SAMPLE",
+                "",
+                "",
+                None,
+                None,
+                SessionDataRecorder._payload_json({
+                    "switch": switch,
+                    "pressure": pressure,
+                    "temperature": temperature,
+                    "humidity": humidity,
+                }),
+            )
+        raise ValueError(f"Unsupported structured device row with {len(row)} fields")
 
     @staticmethod
     def _write_csv(path: Path, header, rows) -> None:

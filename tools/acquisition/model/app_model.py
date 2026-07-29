@@ -406,6 +406,8 @@ class AppModel(ObservableObject):
             analysis,
             self._nidaq_signal_monitor,
             self._laser,
+            system_message_handler=self._system_message_handler,
+            hardware_model=self._hardware,
         )
 
         self._inference_queue = None

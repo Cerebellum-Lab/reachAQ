@@ -5,8 +5,66 @@ from datetime import datetime
 import h5py
 import numpy as np
 
-from autotrainer.core import ProjectInfo
+from autotrainer.core import (
+    ObservableObject,
+    ProjectInfo,
+    SystemCommandKind,
+    SystemStatusMessageKind,
+)
 from tools.acquisition.model.session_data_recorder import SessionDataRecorder
+
+
+class _EventSource(ObservableObject):
+    LAST_FEEDBACK_SAMPLE = "last_feedback_sample"
+
+    def __init__(self, *event_names):
+        super().__init__(event_names)
+
+
+def test_structured_device_ledger_captures_decoded_input_and_output():
+    analysis = _EventSource()
+    handler = _EventSource("decoded_message_received")
+    hardware = _EventSource("device_event")
+    laser = _EventSource("trace_received")
+    recorder = SessionDataRecorder(
+        analysis,
+        object(),
+        laser,
+        system_message_handler=handler,
+        hardware_model=hardware,
+    )
+    recorder._armed = True
+    try:
+        handler.decoded_message_received(
+            SystemStatusMessageKind.STIMULUS_INPUTS,
+            {"tone1": True},
+            10.0,
+            100.0,
+        )
+        hardware.device_event(
+            "outbound",
+            SystemCommandKind.PLAY_TONE,
+            (7000, 100),
+            "token-1",
+            "PELLET_DEVICE",
+            10.1,
+            100.1,
+        )
+
+        rows = tuple(recorder._device_rows)
+
+        assert len(rows) == 2
+        assert rows[0][2:5] == ("inbound", "STIMULUS_INPUTS", "")
+        assert json.loads(rows[0][-1]) == {"tone1": True}
+        assert rows[1][2:6] == (
+            "outbound",
+            "PLAY_TONE",
+            "PELLET_DEVICE",
+            "token-1",
+        )
+        assert json.loads(rows[1][-1]) == [7000, 100]
+    finally:
+        recorder.close()
 
 
 def test_session_outputs_are_clipped_to_camera_boundaries(tmp_path):
@@ -56,7 +114,9 @@ def test_session_outputs_are_clipped_to_camera_boundaries(tmp_path):
         rows = list(csv.DictReader(stream))
     assert len(rows) == 1
     assert float(rows[0]["offset_seconds"]) == 0.0
-    assert rows[0]["switch"] == "1"
+    assert rows[0]["direction"] == "inbound"
+    assert rows[0]["kind"] == "MEASUREMENT_SAMPLE"
+    assert json.loads(rows[0]["payload_json"])["switch"] == 1
 
     with (session_dir / "streams" / "laser.csv").open(newline="") as stream:
         rows = list(csv.DictReader(stream))
