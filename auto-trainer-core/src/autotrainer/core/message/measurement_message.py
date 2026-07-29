@@ -30,11 +30,6 @@ class MeasurementMessageProtocol(Protocol):
         pass
 
     @property
-    def weight(self) -> float:
-        """The load cell value in grams."""
-        pass
-
-    @property
     def pressure(self) -> float:
         """The force detector value in the range of [0, 1024]"""
         pass

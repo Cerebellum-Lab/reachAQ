@@ -1,5 +1,4 @@
 import dataclasses
-import datetime
 import json
 import os
 import uuid
@@ -14,9 +13,6 @@ from autotrainer.api.api_system_status import ApiAnimalStatus, ApiReachStatus
 from .. import Offset3DTuple, get_verbose_logger
 
 logger = get_verbose_logger(__name__)
-
-
-_date_format = "%Y%m%d"
 
 
 @dataclass
@@ -48,18 +44,10 @@ class AnimalTraining:
 
 
 @dataclass
-class AnimalPelletCounts:
-    presented: int = 0   # == successfully sent/delivered to the animal
-    reaches: int = 0
-    success_reaches: int = 0
-    consumed: int = 0
-
-
-@dataclass
 class _AnimalSubject:
     """A subject in an animal experiment."""
 
-    version: int = 3
+    version: int = 4
 
     name: str = ""
     id: str = None   # handled in post_init
@@ -70,10 +58,6 @@ class _AnimalSubject:
     pellet_z: float = 0
 
     training: AnimalTraining = dataclasses.field(default_factory=AnimalTraining)
-
-    pellet_counts_day_date: datetime.date = dataclasses.field(default_factory=datetime.date.today)
-    pellet_counts_day: AnimalPelletCounts = dataclasses.field(default_factory=AnimalPelletCounts)
-    pellet_counts_total: AnimalPelletCounts = dataclasses.field(default_factory=AnimalPelletCounts)
 
     target_y_limit: Optional[float] = None  # in DCS
 
@@ -135,13 +119,11 @@ class AnimalSubject(_AnimalSubject):
                     src = pellet_dcs
                 pellet_x, pellet_y, pellet_z = src['x'], src['y'], src['z']
                 training = data.pop('training')
-                pellet_counts_day_dct = data.pop("pelletCountsDay", {})
-                pellet_counts_total_dct = data.pop("pelletCountsTotal", {})
-                count_day_date_str: Optional[str] = data.pop('pelletCountsDayDate', None)
-                if count_day_date_str is None:
-                    pellet_counts_day_date = datetime.date.today()
-                else:
-                    pellet_counts_day_date = datetime.datetime.strptime(count_day_date_str, _date_format).date()
+                # Removed in v4. Continue accepting v3 animal files without
+                # carrying accumulated day/lifetime counts into the new model.
+                data.pop("pelletCountsDay", None)
+                data.pop("pelletCountsTotal", None)
+                data.pop("pelletCountsDayDate", None)
                 autoclamp_evasion_pellets_consumed = data.pop("autoclampEvasionPelletsConsumed", 0)
                 animal = cls(
                     id=data.pop('id'),
@@ -155,9 +137,6 @@ class AnimalSubject(_AnimalSubject):
                         current_protocol=training.pop('currentProtocol'),
                         protocols=training.pop('protocols'),
                     ),
-                    pellet_counts_day_date=pellet_counts_day_date,
-                    pellet_counts_day=AnimalPelletCounts(**pellet_counts_day_dct),
-                    pellet_counts_total=AnimalPelletCounts(**pellet_counts_total_dct),
                     autoclamp_evasion_pellets_consumed=autoclamp_evasion_pellets_consumed,
                 )
             except Exception as err:
@@ -179,18 +158,11 @@ class AnimalSubject(_AnimalSubject):
             dcs_send_y=self.pellet_y,
             dcs_send_z=self.pellet_z,
             target_y_limit=self.target_y_limit,
-            reach_status_total=ApiReachStatus(
-                pellets_presented=self.pellet_counts_total.presented,
-                pellets_consumed=self.pellet_counts_total.consumed,
-                reaches=self.pellet_counts_total.reaches,
-                successful_reaches=self.pellet_counts_total.success_reaches
-            ),
-            reach_status_day=ApiReachStatus(
-                pellets_presented=self.pellet_counts_day.presented,
-                pellets_consumed=self.pellet_counts_day.consumed,
-                reaches=self.pellet_counts_day.reaches,
-                successful_reaches=self.pellet_counts_day.success_reaches
-            )
+            # Keep the public API schema intact while retiring persisted
+            # day/lifetime counters. Session counts are reported in the
+            # system behavior status instead.
+            reach_status_total=ApiReachStatus(),
+            reach_status_day=ApiReachStatus(),
         )
 
     def to_file(self, file_path: Path):
@@ -211,9 +183,6 @@ class AnimalSubject(_AnimalSubject):
                 'protocols': self.training.protocols,
             },
             "targetYLimit": self.target_y_limit,
-            "pelletCountsDayDate": self.pellet_counts_day_date.strftime(_date_format),
-            "pelletCountsDay": dataclasses.asdict(self.pellet_counts_day),
-            "pelletCountsTotal": dataclasses.asdict(self.pellet_counts_total),
             "autoclampEvasionPelletsConsumed": self.autoclamp_evasion_pellets_consumed,
         }
         xyz = Offset3DTuple(self.pellet_x, self.pellet_y, self.pellet_z)
@@ -222,15 +191,3 @@ class AnimalSubject(_AnimalSubject):
         with NamedTemporaryFile("w", delete=False, dir=file_path.parent) as fh:
             json.dump(data, fh, indent=4)
         os.replace(fh.name, file_path)
-
-    def check_today_date(self) -> bool:
-        """Return True if changed"""
-        today = datetime.date.today()
-        prev = self.pellet_counts_day_date
-        if prev != today:
-            logger.debug("today (%s) != animal prev day date (%s), resetting day counts to 0",
-                         today, prev)
-            self.pellet_counts_day_date = today
-            self.pellet_counts_day = AnimalPelletCounts()
-            return True
-        return False

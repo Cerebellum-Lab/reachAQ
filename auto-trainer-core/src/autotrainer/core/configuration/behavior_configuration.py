@@ -12,13 +12,11 @@ from .animal_presence_configuration import GlobalAnimalPresenceConfig
 from .autoclamp_evasion_config import AutoClampEvasionDetectorConfig
 from .external_doors_monitor_configuration import ExternalDoorsAlarmConfig
 from .presence_detection_configuration import PresenceDetectionConfig
-from .presence_in_cage_config import PresenceInCageAlarmConfig
 from .system_fault_config import SystemFaultConfig
 from .system_maintenance_config import SystemMaintenanceConfig
 from .. import build_kwargs_apply_mapping, make_camelize_representer, make_decamelize_constructor, Offset3DTuple
 
 from .headbar_pressure_config import HeadbarPressureConfiguration
-from .load_cell_config import LoadCellConfiguration, LoadCellAutoTareConfiguration
 from .audio_thrash_config import AudioSpectrumThrashMonitorConfig
 from .alarm_configuration import EmergencyAlarmConfiguration
 from .tunnel_sweep_config import AutoTunnelSweepConfiguration
@@ -188,28 +186,6 @@ class HeadClampConfiguration:
         ))
 
 
-@dataclasses.dataclass
-class AutoEndSessionConfiguration:
-    # enabled: bool = True
-
-    no_activity_delay_minutes: int = 1
-    """This is only for the Nose part. If it's not seen that much duration consecutively, 
-     then also auto-end session"""
-
-    animal_tunnel_no_activity_delay: float = 10  # seconds
-    """Delay without tunnel animal activity (== any animal part seen *and* low load-cell variance)
-     which triggers auto-end session"""
-
-
-@dataclasses.dataclass
-class BatchSessionRecordingConfiguration:
-
-    enabled: bool = False
-
-    maximum_batch_size: int = 0
-    """If 0: no max batch size, otherwise, once batch is over the size: force batch session processing"""
-
-
 @dataclass
 class CageCleaningConfig:
 
@@ -229,15 +205,11 @@ class _BehaviorConfiguration:
     pellet_uncover: PelletUncoverConfiguration = field(default_factory=PelletUncoverConfiguration)
     shift_xyz_handler: ShiftXYZHandlerConfig = field(default_factory=ShiftXYZHandlerConfig)
     head_clamp: HeadClampConfiguration = field(default_factory=HeadClampConfiguration)
-    load_cell: LoadCellConfiguration = field(default_factory=LoadCellConfiguration)
     headbar_pressure: HeadbarPressureConfiguration = field(default_factory=HeadbarPressureConfiguration)
-    auto_tare: LoadCellAutoTareConfiguration = field(default_factory=LoadCellAutoTareConfiguration)
     audio: AudioSpectrumThrashMonitorConfig = field(default_factory=AudioSpectrumThrashMonitorConfig)
     emergency_alarm: EmergencyAlarmConfiguration = field(default_factory=EmergencyAlarmConfiguration)
     topcam_presence_detection: PresenceDetectionConfig = field(default_factory=PresenceDetectionConfig)
-    auto_end_session: AutoEndSessionConfiguration = field(default_factory=AutoEndSessionConfiguration)
     auto_tunnel_sweep: AutoTunnelSweepConfiguration = field(default_factory=AutoTunnelSweepConfiguration)
-    batch_session_recording: BatchSessionRecordingConfiguration = field(default_factory=BatchSessionRecordingConfiguration)
     auto_close_gate_on_intersession: AutoCloseGateOnIntersessionConfiguration = field(default_factory=AutoCloseGateOnIntersessionConfiguration)
     home_on_excessive_drift_distance: HomeOnExcessiveDriftDistanceConfiguration = field(default_factory=HomeOnExcessiveDriftDistanceConfiguration)
     cage_cleaning: CageCleaningConfig = field(default_factory=CageCleaningConfig)
@@ -249,15 +221,10 @@ class _BehaviorConfiguration:
         configuration = cls()
 
         if "head_fix" in content:
-            if "load_cell" in content["head_fix"]:
-                configuration.load_cell = LoadCellConfiguration.from_version_zero(content["head_fix"]["load_cell"])
             if "headbar_pressure" in content["head_fix"]:
                 configuration.headbar_pressure = HeadbarPressureConfiguration.from_version_zero(
                     content["head_fix"]["headbar_pressure"]
                 )
-            if "auto_tare" in content["head_fix"]:
-                configuration.auto_tare = LoadCellAutoTareConfiguration.from_version_zero(
-                    content["head_fix"]["auto_tare"])
 
         if "behavior" in content:
             configuration.head_clamp = HeadClampConfiguration.from_version_zero(content["behavior"])
@@ -274,9 +241,7 @@ class _BehaviorConfiguration:
         if baseline is not None:
             headclamp['baseline_intensity'] = baseline
         return cls(
-            load_cell=LoadCellConfiguration.from_version_one(content.get("load_cell", {})),
             headbar_pressure=HeadbarPressureConfiguration(**content.get("headbar_pressure", {})),
-            auto_tare=LoadCellAutoTareConfiguration(**content.get("auto_tare", {})),
             head_clamp=HeadClampConfiguration(**headclamp),
             pellet_delivery=PelletDeliveryConfiguration(**content.get("pellet_delivery", {})),
         )
@@ -289,29 +254,33 @@ class BehaviorConfiguration(_BehaviorConfiguration):
     def __init__(self,
                  *,
                  mouse_presence=None,  # temporarily to be back-compatible with previous
+                 auto_end_session=None,
+                 batch_session_recording=None,
+                 load_cell=None,
+                 auto_tare=None,
                  **kwargs):
         if mouse_presence is not None:
             logger.notice("Dropping previous mouse_presence config, new default one will be used. dropped entry: %s",
                           mouse_presence)
+        if auto_end_session is not None or batch_session_recording is not None:
+            logger.notice("Dropping obsolete automatic recording trigger configuration")
+        if load_cell is not None or auto_tare is not None:
+            logger.notice("Dropping obsolete weight-sensor configuration")
         super().__init__(**kwargs)
 
 
 _tag_2_cls = dict(
     PelletDeliveryConfiguration=PelletDeliveryConfiguration,
     PelletUncoverConfiguration=PelletUncoverConfiguration,
-    LoadCellConfiguration=LoadCellConfiguration,
     HeadClampConfiguration=HeadClampConfiguration,
     HeadbarPressureConfiguration=HeadbarPressureConfiguration,
-    LoadCellAutoTareConfiguration=LoadCellAutoTareConfiguration,
     BehaviorConfiguration=BehaviorConfiguration,
     AudioMonitorConfiguration=AudioSpectrumThrashMonitorConfig,
     AnimalPresenceConfiguration=GlobalAnimalPresenceConfig,
     EmergencyAlarmConfiguration=EmergencyAlarmConfiguration,
     PresenceDetectionConfiguration=PresenceDetectionConfig,
     ExternalDoorsMonitorConfiguration=ExternalDoorsAlarmConfig,
-    AutoEndSessionConfiguration=AutoEndSessionConfiguration,
     AutoTunnelSweepConfiguration=AutoTunnelSweepConfiguration,
-    BatchSessionRecordingConfiguration=BatchSessionRecordingConfiguration,
     AutoCloseGateOnIntersessionConfiguration=AutoCloseGateOnIntersessionConfiguration,
     HomeOnExcessiveDriftDistance=HomeOnExcessiveDriftDistanceConfiguration,  # missed Configuration suffix
     # ShiftXYZTarget="ShiftXYZTarget",  # replaced by Offset3dTuple.
@@ -321,7 +290,6 @@ _tag_2_cls = dict(
     SystemFaultConfig=SystemFaultConfig,
     CageCleaningConfig=CageCleaningConfig,
     AnimalThrashAlarmConfig=AnimalThrashAlarmConfig,
-    PresenceInCageAlarmConfig=PresenceInCageAlarmConfig,
     DeviceCommAlarmConfig=DeviceCommAlarmConfig,
     LEDAlarmConfig=LEDAlarmConfig,
 )
@@ -348,6 +316,25 @@ def add_behavior_configuration_constructors(safe_loader: Type[yaml.SafeLoader]):
     for tag, cls in _tag_2_cls.items():
         add(cls, tag)
 
+    def obsolete_recording_trigger(loader, node):
+        return loader.construct_mapping(node, deep=True)
+
+    safe_loader.add_constructor(
+        "!AutoEndSessionConfiguration",
+        obsolete_recording_trigger,
+    )
+    safe_loader.add_constructor(
+        "!BatchSessionRecordingConfiguration",
+        obsolete_recording_trigger,
+    )
+    safe_loader.add_constructor(
+        "!LoadCellConfiguration",
+        obsolete_recording_trigger,
+    )
+    safe_loader.add_constructor(
+        "!LoadCellAutoTareConfiguration",
+        obsolete_recording_trigger,
+    )
     add(GlobalAnimalPresenceConfig, "MousePresenceConfiguration")
     # keeping temporarily MousePresenceConfiguration, was renamed to AnimalPresenceConfiguration. Back-compatibility.
     # todo: remove some when later.

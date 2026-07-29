@@ -21,7 +21,7 @@ class HardwareConfiguration:
     """Enable NI-DAQ hardware for this rig."""
 
     tunnel_headfix_enabled: bool = False
-    """Enable tunnel gate, head magnet, load-cell tare, and tunnel fan commands."""
+    """Enable tunnel gate, head magnet, and tunnel fan commands."""
 
     min_ack_timeout: Optional[float] = None  # min device-ack-timeout
     """CAN uuid ACK timeout, if not set here then default code value of 3s is used."""

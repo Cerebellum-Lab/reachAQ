@@ -22,6 +22,8 @@ class CoverServoStatus(int, enum.Enum):
 class RecordingEndingReason(str, enum.Enum):
 
     NA = "NA"
+    MANUAL_STOP = "ManualStop"
+    MANUAL_ABORT = "ManualAbort"
     ALGO_PAUSED = "AlgoPaused"
     EXIT_TUNNEL = "ExitTunnel"
     PELLET_LOADING = "PelletLoading"
@@ -219,14 +221,6 @@ class TunnelHardwareProtocol(Protocol):
     def close_tunnel_gate(self) -> Optional[UUID]:
         """
         Request the tunnel gate to close.
-
-        Returns:
-            A token to expect from the device message handler when the request is complete.
-        """
-
-    def tare_load_cell(self) -> Optional[UUID]:
-        """
-        Request the load cell perform a tare operation.
 
         Returns:
             A token to expect from the device message handler when the request is complete.

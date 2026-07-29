@@ -21,7 +21,6 @@ class SystemCommandKind(IntEnum):
 
     # Actions nominally considered part of the tunnel/head fixation unit (magnet module in some nomenclature).
     MOVE_MAGNET_SERVO = 101
-    UPDATE_SCALE_TARE = 102
     OPEN_TUNNEL_GATE = 103
     CLOSE_TUNNEL_GATE = 104
 

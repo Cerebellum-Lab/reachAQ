@@ -7,7 +7,6 @@ from autotrainer.core.configuration.animal_presence_configuration import GlobalA
 from autotrainer.core.configuration.autoclamp_evasion_config import AnimalEvasionAlarmConfig
 from autotrainer.core.configuration.detector import DetectorConfig
 from autotrainer.core.configuration.external_doors_monitor_configuration import ExternalDoorsAlarmConfig
-from autotrainer.core.configuration.presence_in_cage_config import PresenceInCageAlarmConfig
 from autotrainer.core.configuration.system_fault_config import SystemFaultConfig
 from autotrainer.core.configuration.system_maintenance_config import SystemMaintenanceConfig
 
@@ -19,7 +18,6 @@ class EmergencyAlarmConfiguration(DetectorConfig):
     animal_thrashing: AnimalThrashAlarmConfig = field(default_factory=AnimalThrashAlarmConfig)
 
     # 2nd possible alarm condition
-    presence_in_cage: PresenceInCageAlarmConfig = field(default_factory=PresenceInCageAlarmConfig)
 
     # 3rd
     external_doors: ExternalDoorsAlarmConfig = field(default_factory=ExternalDoorsAlarmConfig)
