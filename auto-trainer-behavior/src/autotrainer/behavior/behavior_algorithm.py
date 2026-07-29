@@ -10,7 +10,7 @@ import math
 import queue
 import threading
 import time
-from datetime import datetime, date
+from datetime import datetime
 from functools import partial
 from pathlib import Path
 from typing import Optional, Tuple, ClassVar, Any, Dict, Deque, List
@@ -28,8 +28,8 @@ from autotrainer.core.multiproc import make_daemon_timer, no_op_timer
 from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
 from autotrainer.core.reach_event import ReachEvent
 from autotrainer.core.configuration.behavior_configuration import PelletDeliveryConfiguration, HeadClampConfiguration, \
-    BehaviorConfiguration, AutoCloseGateOnIntersessionConfiguration, AutoEndSessionConfiguration, \
-    BatchSessionRecordingConfiguration, HomeOnExcessiveDriftDistanceConfiguration, \
+    BehaviorConfiguration, AutoCloseGateOnIntersessionConfiguration, \
+    HomeOnExcessiveDriftDistanceConfiguration, \
     PelletUncoverConfiguration
 from autotrainer.core.video_detection import PresenceDetectionAttrs
 from autotrainer.core.pose_elements import ScenePartsPresenceContext, SceneElement
@@ -95,14 +95,10 @@ class BehaviorAlgoProps(str, enum.Enum):
     # runtime context:
     PELLET_SHIFT_Y_LIMIT = 'pellet_shift_y_limit'
 
-    DAY_PELLET_COUNT = 'day_pellet_count'  # consumed
-    TOTAL_PELLET_COUNT = 'total_pellet_count'  # consumed
-    DAY_PELLET_PRESENTED = 'day_pellet_presented'
-    TOTAL_PELLET_PRESENTED = 'total_pellet_presented'
-    DAY_PELLET_REACHES = 'day_pellet_reaches'
-    TOTAL_PELLET_REACHES = 'total_pellet_reaches'
-    DAY_SUCCESSFUL_REACHES = 'day_successful_reaches'
-    TOTAL_SUCCESSFUL_REACHES = 'total_successful_reaches'
+    SESSION_PELLETS_CONSUMED = 'session_pellets_consumed'
+    SESSION_PELLETS_PRESENTED = 'session_pellets_presented'
+    SESSION_REACHES = 'session_reaches'
+    SESSION_SUCCESSFUL_REACHES = 'session_successful_reaches'
 
     INTERSESSION_ENABLED = 'intersession_enabled'  # config
     # INTERSESSION_PELLET_SHIFT_ENABLED = 'intersession_pellet_shift_enabled'
@@ -224,7 +220,6 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
         self._autoclamp_in_progress = False
         self._autoclamp_engaged_perf_c = -math.inf
 
-        self._clean_raw_data_on_inactive_session = False  # NB: not saved in config
 
         self._parts_pres_ctx_any_cam = ScenePartsPresenceContext()
         self._parts_pres_ctx_all_cams = ScenePartsPresenceContext()
@@ -265,15 +260,10 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
 
         self._session_pellet_loaded_count = 0  # loaded
 
-        self._pellet_counts_day_date = date.today()
-        self._pellets_consumed_day = 0  # consumed
-        self._pellets_consumed_total = 0  # consumed
-        self._pellets_presented_day: int = 0
-        self._pellets_presented_total: int = 0
-        self._reaches_day: int = 0
-        self._reaches_total: int = 0
-        self._successful_reaches_day: int = 0
-        self._successful_reaches_total: int = 0
+        self._pellets_consumed = 0
+        self._pellets_presented = 0
+        self._reaches = 0
+        self._successful_reaches = 0
 
         self._previous_intersession_analysis_rsp: Optional[Tuple[ProjectInfo, IntersessionResponse]] = None
 
@@ -698,14 +688,6 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
             self._event_manager.post_event_content(ApiEventKind.autoClampEnabledChanged, data=dict(is_enabled=value))
             self._on_property_changed(BehaviorAlgoProps.HEAD_FIXATION_ENABLED, value, prev)
 
-    @property
-    def clean_raw_data_on_inactive_session(self):
-        return self._clean_raw_data_on_inactive_session
-
-    @clean_raw_data_on_inactive_session.setter
-    def clean_raw_data_on_inactive_session(self, value):
-        self._clean_raw_data_on_inactive_session = value
-
     # auto/head clamp
 
     @property
@@ -897,34 +879,14 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
 
     # counts
 
-    def _check_pellet_counts_day_date(self):
-        today = date.today()
-        if today != self._pellet_counts_day_date:
-            logger.verbose("resetting pellet day counts to 0")
-            self._pellet_counts_day_date = today
-            self.pellets_presented_day = 0
-            self.pellet_reaches_day = 0
-            self.pellet_consumed_day = 0
-            self.successful_reaches_day = 0
-
     @property
-    def pellet_consumed_day(self) -> int:
-        self._check_pellet_counts_day_date()
-        return self._pellets_consumed_day
+    def pellets_consumed(self) -> int:
+        return self._pellets_consumed
 
-    @pellet_consumed_day.setter
-    def pellet_consumed_day(self, value: int):
-        prev_value, self._pellets_consumed_day = self._pellets_consumed_day, value
-        self._on_property_changed(BehaviorAlgoProps.DAY_PELLET_COUNT, value, prev_value)
-
-    @property
-    def pellet_consumed_total(self) -> int:
-        return self._pellets_consumed_total
-
-    @pellet_consumed_total.setter
-    def pellet_consumed_total(self, value: int):
-        prev, self._pellets_consumed_total = self._pellets_consumed_total, value
-        self._on_property_changed(BehaviorAlgoProps.TOTAL_PELLET_COUNT, value, prev)
+    @pellets_consumed.setter
+    def pellets_consumed(self, value: int):
+        prev, self._pellets_consumed = self._pellets_consumed, int(value)
+        self._on_property_changed(BehaviorAlgoProps.SESSION_PELLETS_CONSUMED, self._pellets_consumed, prev)
 
     @property
     def session_pellet_loaded_count(self) -> int:
@@ -936,109 +898,69 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
         self._on_property_changed(BehaviorAlgoProps.SESSION_PELLET_COUNT, value, prev)  # property unused
 
     def increase_pellets_consumed(self, increment: int = 1):
-        self.pellet_consumed_day += increment
-        self.pellet_consumed_total += increment
+        self.pellets_consumed += increment
         if increment:
             self.pellets_consumed_evt(increment)
             self._event_manager.post_event_content(
                 ApiEventKind.pelletConsumedCountChanged,
-                data=dict(change=increment, count=self._pellets_consumed_total))
-            self._event_manager.post_event_content(
-                ApiEventKind.dayPelletConsumedCountChanged,
-                data=dict(change=increment, count=self._pellets_consumed_day))
+                data=dict(change=increment, count=self._pellets_consumed))
 
     @property
-    def pellets_presented_day(self):
-        self._check_pellet_counts_day_date()
-        return self._pellets_presented_day
+    def pellets_presented(self) -> int:
+        return self._pellets_presented
 
-    @pellets_presented_day.setter
-    def pellets_presented_day(self, value):
-        prev, self._pellets_presented_day = self._pellets_presented_day, value
-        self._on_property_changed(BehaviorAlgoProps.DAY_PELLET_PRESENTED, value, prev)
-
-    @property
-    def pellets_presented_total(self):
-        return self._pellets_presented_total
-
-    @pellets_presented_total.setter
-    def pellets_presented_total(self, value):
-        prev, self._pellets_presented_total = self._pellets_presented_total, value
-        self._on_property_changed(BehaviorAlgoProps.TOTAL_PELLET_PRESENTED, value, prev)
+    @pellets_presented.setter
+    def pellets_presented(self, value: int):
+        prev, self._pellets_presented = self._pellets_presented, int(value)
+        self._on_property_changed(BehaviorAlgoProps.SESSION_PELLETS_PRESENTED, self._pellets_presented, prev)
 
     def increase_pellets_presented(self, increment: int = 1):
-        self.pellets_presented_day += increment
-        self.pellets_presented_total += increment
+        self.pellets_presented += increment
         if increment:
             self.pellets_presented_evt(increment)
             self._event_manager.post_event_content(
                 ApiEventKind.pelletPresentedCountChanged,
-                data=dict(change=increment, count=self._pellets_presented_total))
-            self._event_manager.post_event_content(
-                ApiEventKind.dayPelletPresentedCountChanged,
-                data=dict(change=increment, count=self._pellets_presented_day))
+                data=dict(change=increment, count=self._pellets_presented))
 
     @property
-    def pellet_reaches_day(self):
-        self._check_pellet_counts_day_date()
-        return self._reaches_day
+    def pellet_reaches(self) -> int:
+        return self._reaches
 
-    @pellet_reaches_day.setter
-    def pellet_reaches_day(self, value):
-        prev, self._reaches_day = self._reaches_day, value
-        self._on_property_changed(BehaviorAlgoProps.DAY_PELLET_REACHES, value, prev)
-
-    @property
-    def pellet_reaches_total(self):
-        return self._reaches_total
-
-    @pellet_reaches_total.setter
-    def pellet_reaches_total(self, value):
-        prev, self._reaches_total = self._reaches_total, value
-        self._on_property_changed(BehaviorAlgoProps.TOTAL_PELLET_REACHES, value, prev)
+    @pellet_reaches.setter
+    def pellet_reaches(self, value: int):
+        prev, self._reaches = self._reaches, int(value)
+        self._on_property_changed(BehaviorAlgoProps.SESSION_REACHES, self._reaches, prev)
 
     def increase_pellet_total_reaches(self, increment: int = 1):
-        self.pellet_reaches_day += increment
-        self.pellet_reaches_total += increment
+        self.pellet_reaches += increment
         if increment:
             self.total_reaches_evt(increment)
             self._event_manager.post_event_content(
                 ApiEventKind.reachCountChanged,
-                data=dict(change=increment, count=self._reaches_total))
-            self._event_manager.post_event_content(
-                ApiEventKind.dayReachCountChanged,
-                data=dict(change=increment, count=self._reaches_day))
+                data=dict(change=increment, count=self._reaches))
 
     @property
-    def successful_reaches_day(self):
-        self._check_pellet_counts_day_date()
-        return self._successful_reaches_day
+    def successful_reaches(self) -> int:
+        return self._successful_reaches
 
-    @successful_reaches_day.setter
-    def successful_reaches_day(self, value):
-        prev, self._successful_reaches_day = self._successful_reaches_day, value
-        self._on_property_changed(BehaviorAlgoProps.DAY_SUCCESSFUL_REACHES, value, prev)
-
-    @property
-    def successful_reaches_total(self):
-        return self._successful_reaches_total
-
-    @successful_reaches_total.setter
-    def successful_reaches_total(self, value):
-        prev, self._successful_reaches_total = self._successful_reaches_total, value
-        self._on_property_changed(BehaviorAlgoProps.TOTAL_SUCCESSFUL_REACHES, value, prev)
+    @successful_reaches.setter
+    def successful_reaches(self, value: int):
+        prev, self._successful_reaches = self._successful_reaches, int(value)
+        self._on_property_changed(BehaviorAlgoProps.SESSION_SUCCESSFUL_REACHES, self._successful_reaches, prev)
 
     def increase_successful_reaches(self, increment: int = 1):
-        self.successful_reaches_day += increment
-        self.successful_reaches_total += increment
+        self.successful_reaches += increment
         if increment:
             self.successful_reaches_evt(increment)
             self._event_manager.post_event_content(
                 ApiEventKind.successfulReachesCountChanged,
-                data=dict(change=increment, count=self._successful_reaches_total))
-            self._event_manager.post_event_content(
-                ApiEventKind.daySuccessfulReachesCountChanged,
-                data=dict(change=increment, count=self._successful_reaches_day))
+                data=dict(change=increment, count=self._successful_reaches))
+
+    def reset_session_counts(self):
+        self.pellets_presented = 0
+        self.pellet_reaches = 0
+        self.successful_reaches = 0
+        self.pellets_consumed = 0
     #
 
     @property
@@ -1082,14 +1004,6 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
     #
 
     @property
-    def auto_end_session_config(self) -> AutoEndSessionConfiguration:
-        return self._active_config.auto_end_session
-
-    @property
-    def batch_session_recording_config(self) -> BatchSessionRecordingConfiguration:
-        return self._active_config.batch_session_recording
-
-    @property
     def auto_correct_motors_drift(self) -> bool:
         return self._active_config.pellet_delivery.auto_correct_motors_drift
 
@@ -1131,6 +1045,7 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
         self._session_started_perf_c = get_perf_now()
         self._start_session_reason = reason
         self.reset_session_pellet_count()
+        self.reset_session_counts()
 
         project.calculate_next_session_index()
         self._event_manager.post_event_content(
@@ -1171,7 +1086,12 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
         p_now = get_perf_now()
         sess_duration = p_now - self._session_started_perf_c
         miss_delay = self._sess_min_duration - sess_duration
-        if miss_delay > 0 and reason != RecordingEndingReason.ALGO_PAUSED:
+        immediate_reasons = {
+            RecordingEndingReason.ALGO_PAUSED,
+            RecordingEndingReason.MANUAL_STOP,
+            RecordingEndingReason.MANUAL_ABORT,
+        }
+        if miss_delay > 0 and reason not in immediate_reasons:
             logger.verbose("current trial record too short, delaying end_capture_session of %.1f",
                            miss_delay)
             timer = self._timer_end_capture_session = make_daemon_timer(
@@ -1594,30 +1514,11 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
             data=dict(trial_reach_events=res.reach_events, trial_id=project.session))
 
     def reset_selected_animal_counts(self, animal: Optional[AnimalSubject]):
-        logger.verbose("Resetting counts for animal change to %s", animal)
+        logger.verbose("Updating animal-dependent behavior context for %s", animal)
         if animal is None:
             self.pellet_shift_y_limit = None
-            self.pellets_presented_day = \
-            self.pellet_reaches_day = \
-            self.pellet_consumed_day = \
-            self.successful_reaches_day = 0
-            self.pellets_presented_total = \
-            self.pellet_reaches_total = \
-            self.pellet_consumed_total = \
-            self.successful_reaches_total = 0
             return
         self.pellet_shift_y_limit = animal.target_y_limit
-        day_counts = animal.pellet_counts_day
-        self.pellets_presented_day = day_counts.presented
-        self.pellet_consumed_day = day_counts.consumed
-        self.pellet_reaches_day = day_counts.reaches
-        self.successful_reaches_day = day_counts.success_reaches
-        #
-        total_counts = animal.pellet_counts_total
-        self.pellets_presented_total = total_counts.presented
-        self.pellet_consumed_total = total_counts.consumed
-        self.pellet_reaches_total = total_counts.reaches
-        self.successful_reaches_total = total_counts.success_reaches
 
     @staticmethod
     def close_algorithm_handler(*, timeout: float=3):
