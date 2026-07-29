@@ -213,6 +213,79 @@ def test_final_metadata_uses_canonical_boundary_not_stale_project_timestamp(
     assert saved["sessionBoundary"]["endPerfTime"] == 12.0
 
 
+def test_metadata_pair_is_not_replaced_when_yaml_serialization_fails(
+    app_model,
+    tmp_path,
+):
+    project = app_model.project.to_local_value()
+    output = tmp_path / "metadata"
+    json_path = output.with_suffix(".json")
+    yaml_path = output.with_suffix(".yaml")
+    json_path.write_text("previous json")
+    yaml_path.write_text("previous yaml")
+
+    with mock.patch(
+        "tools.acquisition.model.app_model.yaml.dump",
+        side_effect=RuntimeError("serialization failed"),
+    ):
+        with pytest.raises(RuntimeError, match="serialization failed"):
+            app_model._save_metadata(
+                project,
+                project.when,
+                str(output),
+                project.session,
+            )
+
+    assert json_path.read_text() == "previous json"
+    assert yaml_path.read_text() == "previous yaml"
+    assert not (tmp_path / "metadata.json.tmp").exists()
+    assert not (tmp_path / "metadata.yaml.tmp").exists()
+
+
+def test_incomplete_auxiliary_streams_are_not_reported_as_fully_saved(
+    app_model,
+):
+    app_model._pending_session_end_perf = 12.0
+    app_model._session_boundary = SessionBoundary(
+        session_id=app_model.project.short_id,
+        primary_camera="left",
+        primary_frame_id=42,
+        start_perf_time=10.0,
+        start_wall_time=100.0,
+        camera_when=1_000_000.0,
+    )
+    app_model._session_analysis_finished = True
+    result = {
+        "sessionComplete": False,
+        "incompleteReasons": ("nidaq.barcode reported 1 acquisition gap(s)",),
+        "enabledSources": ({"id": "nidaq.barcode", "sampleCount": 10},),
+        "cameraNidaqAlignment": {"matchedSampleIndex": 100},
+    }
+
+    with mock.patch.object(
+        app_model._session_data_recorder,
+        "stop",
+        return_value=result,
+    ), mock.patch.object(
+        app_model,
+        "_save_project_metadata",
+    ), mock.patch.object(
+        app_model,
+        "on_error",
+    ) as on_error:
+        app_model._complete_stopped_recording(app_model.project)
+
+    assert app_model._session_data_complete is False
+    assert app_model._session_enabled_sources == result["enabledSources"]
+    assert app_model._session_boundary.nidaq_sample_index == 100
+    assert (
+        app_model.subsystem_statuses[SubsystemId.OFFLINE_ANALYSIS.value].state
+        is SubsystemState.FAILED
+    )
+    assert app_model.session_recording_status is SessionRecordingStatus.READY
+    on_error.assert_called_once()
+
+
 def test_record_start_timeout_aborts_partial_session(app_model):
     app_model._set_session_recording_status(SessionRecordingStatus.ARMING)
     with mock.patch.object(app_model, "on_error") as on_error, mock.patch.object(

@@ -339,6 +339,9 @@ class AppModel(ObservableObject):
         self._pending_session_end_perf: Optional[float] = None
         self._session_boundary: Optional[SessionBoundary] = None
         self._session_hardware_status_at_record: Optional[dict] = None
+        self._session_data_complete = True
+        self._session_data_errors: Tuple[str, ...] = ()
+        self._session_enabled_sources: Tuple[dict, ...] = ()
         self._aborting_project: Optional[ProjectInfo] = None
         self._aborted_session_ids = set()
         self._abort_had_recording_started = False
@@ -785,6 +788,9 @@ class AppModel(ObservableObject):
         )
         self._pending_session_end_perf = None
         self._session_boundary = None
+        self._session_data_complete = True
+        self._session_data_errors = ()
+        self._session_enabled_sources = ()
         self._session_hardware_status_at_record = (
             self._subsystem_status_registry.snapshot()
         )
@@ -1136,6 +1142,17 @@ class AppModel(ObservableObject):
             logger.warning("_merge_camera_timestamp_files: empty df for main cam")
             return
         main_cam_first_frame_id = df_main_cam["frame_id"][0]
+        boundary = self._session_boundary
+        if (
+            boundary is not None
+            and boundary.session_id == project.short_id
+            and int(main_cam_first_frame_id) != boundary.primary_frame_id
+        ):
+            raise RuntimeError(
+                "Merged primary camera timing begins at frame "
+                f"{int(main_cam_first_frame_id)}, expected canonical frame "
+                f"{boundary.primary_frame_id}"
+            )
         for idx_df, df in enumerate(data[1:], start=1):
             df: pandas.DataFrame
             if len(df) == 0:
@@ -4195,13 +4212,41 @@ class AppModel(ObservableObject):
                     self._session_analysis_duration_seconds,
                     project.short_id,
                 )
-            self._set_subsystem_status(
-                SubsystemId.OFFLINE_ANALYSIS,
-                SubsystemState.READY,
-                reason="offline analysis completed",
-            )
-            self._set_session_recording_status(SessionRecordingStatus.READY)
-            self._save_project_metadata(project, caller="session_analysis_ended")
+            try:
+                self._save_project_metadata(
+                    project,
+                    caller="session_analysis_ended",
+                )
+            except Exception as exc:
+                self._set_subsystem_status(
+                    SubsystemId.OFFLINE_ANALYSIS,
+                    SubsystemState.FAILED,
+                    error=f"final metadata save failed: {exc}",
+                )
+                raise
+            else:
+                self._set_subsystem_status(
+                    SubsystemId.OFFLINE_ANALYSIS,
+                    (
+                        SubsystemState.READY
+                        if self._session_data_complete
+                        else SubsystemState.FAILED
+                    ),
+                    reason=(
+                        "offline analysis completed"
+                        if self._session_data_complete
+                        else "analysis completed; session data is incomplete"
+                    ),
+                    error=(
+                        ""
+                        if self._session_data_complete
+                        else "; ".join(self._session_data_errors)
+                    ),
+                )
+            finally:
+                self._set_session_recording_status(
+                    SessionRecordingStatus.READY
+                )
 
     def _complete_stopped_recording(self, project: ProjectInfo) -> None:
         end_perf = self._pending_session_end_perf
@@ -4234,18 +4279,51 @@ class AppModel(ObservableObject):
                         matched_sample_index
                     )
                 )
+            if isinstance(stream_result, dict):
+                self._session_data_complete = bool(
+                    stream_result.get("sessionComplete", True)
+                )
+                self._session_data_errors = tuple(
+                    stream_result.get("incompleteReasons", ())
+                )
+                self._session_enabled_sources = tuple(
+                    stream_result.get("enabledSources", ())
+                )
+                if not self._session_data_complete:
+                    message = (
+                        "Session auxiliary data is incomplete: "
+                        + "; ".join(self._session_data_errors)
+                    )
+                    logger.error(message)
+                    self.on_error("Session data incomplete", message)
         except Exception as err:
             logger.exception("Failed to save session auxiliary streams: %s", err)
             self.on_error("Session stream save failed", str(err))
+            self._session_data_complete = False
+            self._session_data_errors = (
+                f"auxiliary stream save failed: {err}",
+            )
         if self._session_analysis_finished:
             if self._session_analysis_duration_seconds is None:
                 self._session_analysis_duration_seconds = 0.0
             self._set_subsystem_status(
                 SubsystemId.OFFLINE_ANALYSIS,
-                SubsystemState.READY,
-                reason="offline analysis completed",
+                (
+                    SubsystemState.READY
+                    if self._session_data_complete
+                    else SubsystemState.FAILED
+                ),
+                reason=(
+                    "offline analysis completed"
+                    if self._session_data_complete
+                    else "analysis completed; session data is incomplete"
+                ),
+                error=(
+                    ""
+                    if self._session_data_complete
+                    else "; ".join(self._session_data_errors)
+                ),
             )
-            self._set_session_recording_status(SessionRecordingStatus.READY)
         else:
             self._session_analysis_started_perf = time.perf_counter()
             self._begin_subsystem_start(
@@ -4253,7 +4331,28 @@ class AppModel(ObservableObject):
                 reason="analyzing stopped session",
             )
             self._set_session_recording_status(SessionRecordingStatus.ANALYZING)
-        self._save_project_metadata(project, caller="raw_writers_closed")
+        try:
+            self._save_project_metadata(
+                project,
+                caller="raw_writers_closed",
+            )
+        except Exception as exc:
+            self._session_data_complete = False
+            self._session_data_errors = (
+                *self._session_data_errors,
+                f"metadata save failed: {exc}",
+            )
+            self._set_subsystem_status(
+                SubsystemId.OFFLINE_ANALYSIS,
+                SubsystemState.FAILED,
+                error=f"metadata save failed: {exc}",
+            )
+            raise
+        finally:
+            if self._session_analysis_finished:
+                self._set_session_recording_status(
+                    SessionRecordingStatus.READY
+                )
 
     def _finish_abort_recording(self) -> None:
         self._record_start_timer.cancel()
@@ -4296,6 +4395,9 @@ class AppModel(ObservableObject):
             self._session_data_recorder.abort()
             self._pending_session_end_perf = None
             self._session_boundary = None
+            self._session_data_complete = True
+            self._session_data_errors = ()
+            self._session_enabled_sources = ()
             self._session_analysis_finished = True
             self._session_analysis_started_perf = None
             self._session_analysis_duration_seconds = None
@@ -4584,6 +4686,35 @@ class AppModel(ObservableObject):
                     f"Cannot finalize {project_info.short_id} without a canonical "
                     "recording boundary"
                 )
+            if not (
+                math.isfinite(boundary.start_perf_time)
+                and math.isfinite(boundary.start_wall_time)
+            ):
+                raise RuntimeError(
+                    f"Cannot finalize {project_info.short_id} with a non-finite "
+                    "recording boundary"
+                )
+            alignment_path = Path(
+                project_info.get_session_path().location
+            ) / "streams" / "alignment.json"
+            if not alignment_path.is_file():
+                raise RuntimeError(
+                    f"Cannot finalize {project_info.short_id}: "
+                    "streams/alignment.json is missing"
+                )
+            with alignment_path.open(encoding="utf-8") as stream:
+                alignment = json.load(stream)
+            alignment_boundary = alignment.get("canonicalBoundary", {})
+            if (
+                alignment_boundary.get("startPerfTime")
+                != boundary.start_perf_time
+                or alignment_boundary.get("startWallTime")
+                != boundary.start_wall_time
+            ):
+                raise RuntimeError(
+                    f"Cannot finalize {project_info.short_id}: canonical "
+                    "boundary differs from streams/alignment.json"
+                )
         self._save_metadata(project_info, when, file_name, session)
 
     def _save_metadata(self, project: ProjectInfo, when: datetime, file_name: str, session: Optional[int] = -1):
@@ -4616,6 +4747,9 @@ class AppModel(ObservableObject):
                 "consumed": self._behavior.algorithm.pellets_consumed,
             },
             "recordingStatus": self._session_recording_status.value,
+            "sessionDataComplete": self._session_data_complete,
+            "sessionDataErrors": list(self._session_data_errors),
+            "enabledSources": list(self._session_enabled_sources),
             "analysisDurationSeconds": self._session_analysis_duration_seconds,
             "hardwareConfigured": {
                 "canEnabled": self._hardware.can_enabled,
@@ -4640,13 +4774,28 @@ class AppModel(ObservableObject):
 
         out = info.copy()
         out["configuration"] = asdict(configuration)
-        with open(file_name + ".json", "w") as file:
-            json.dump(out, file, cls=SystemConfigurationJSONEncoder)
+        json_path = Path(file_name + ".json")
+        yaml_path = Path(file_name + ".yaml")
+        json_temp = json_path.with_name(json_path.name + ".tmp")
+        yaml_temp = yaml_path.with_name(yaml_path.name + ".tmp")
+        try:
+            with json_temp.open("w", encoding="utf-8") as file:
+                json.dump(out, file, cls=SystemConfigurationJSONEncoder)
 
-        out = info.copy()
-        out["configuration"] = configuration
-        with open(file_name + ".yaml", "w") as file:
-            yaml.dump(out, file, Dumper=SystemConfigurationDumper, sort_keys=False)
+            out = info.copy()
+            out["configuration"] = configuration
+            with yaml_temp.open("w", encoding="utf-8") as file:
+                yaml.dump(
+                    out,
+                    file,
+                    Dumper=SystemConfigurationDumper,
+                    sort_keys=False,
+                )
+            os.replace(json_temp, json_path)
+            os.replace(yaml_temp, yaml_path)
+        finally:
+            json_temp.unlink(missing_ok=True)
+            yaml_temp.unlink(missing_ok=True)
 
     #
 
