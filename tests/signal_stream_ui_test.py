@@ -35,6 +35,7 @@ from tools.acquisition.model.nidaq_sample_ring import SharedNidaqSampleRing  # n
 from tools.acquisition.model.nidaq_channel_plan import (  # noqa: E402
     build_nidaq_acquisition_configuration,
 )
+from tools.acquisition.model.nidaq_discovery import NidaqDevicePorts  # noqa: E402
 from tools.acquisition.view.analysis_content import AnalysisContent  # noqa: E402
 from tools.acquisition.view.laser_control_content import (  # noqa: E402
     LaserControlContent,
@@ -100,19 +101,19 @@ class _LaserAppStub:
 
 
 def _crashing_signal_worker(
-    _configuration, _message_queue, _sample_ring, _stop_event, _log_dict_config,
+    _configuration, _timing_plan, _message_queue, _sample_ring, _stop_event, _log_dict_config,
 ):
     os._exit(23)
 
 
 def _hanging_signal_worker(
-    _configuration, _message_queue, _sample_ring, stop_event, _log_dict_config,
+    _configuration, _timing_plan, _message_queue, _sample_ring, stop_event, _log_dict_config,
 ):
     stop_event.wait(60.0)
 
 
 def _shared_ring_signal_worker(
-    configuration, message_queue, sample_ring, stop_event, _log_dict_config,
+    configuration, _timing_plan, message_queue, sample_ring, stop_event, _log_dict_config,
 ):
     sample_ring.write_block(NidaqSignalSampleBlock(
         wall_time=time.time(),
@@ -138,6 +139,10 @@ def _stream_configuration():
         ),
         is_enabled=True,
     )
+
+
+def _discover_dev1():
+    return (NidaqDevicePorts(name="Dev1"),), None
 
 
 def _wait_for_plot_snapshot(content, timeout=5.0):
@@ -696,7 +701,10 @@ def test_signal_monitor_has_no_analysis_stream_persistence(tmp_path):
 
 
 def test_signal_monitor_contains_native_worker_failure_outside_application_process():
-    monitor = NidaqSignalMonitorModel(worker_target=_crashing_signal_worker)
+    monitor = NidaqSignalMonitorModel(
+        worker_target=_crashing_signal_worker,
+        device_discovery=_discover_dev1,
+    )
     monitor._configuration = _stream_configuration()
     monitor._hardware_enabled = True
 
@@ -711,7 +719,10 @@ def test_signal_monitor_contains_native_worker_failure_outside_application_proce
 
 
 def test_signal_monitor_worker_publishes_directly_to_shared_ring():
-    monitor = NidaqSignalMonitorModel(worker_target=_shared_ring_signal_worker)
+    monitor = NidaqSignalMonitorModel(
+        worker_target=_shared_ring_signal_worker,
+        device_discovery=_discover_dev1,
+    )
     monitor._configuration = _stream_configuration()
     monitor._hardware_enabled = True
     try:
@@ -734,6 +745,7 @@ def test_signal_monitor_worker_publishes_directly_to_shared_ring():
 def test_signal_monitor_times_out_hung_runtime_without_blocking_caller():
     monitor = NidaqSignalMonitorModel(
         worker_target=_hanging_signal_worker,
+        device_discovery=_discover_dev1,
         startup_timeout_seconds=0.2,
     )
     monitor._configuration = _stream_configuration()

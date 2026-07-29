@@ -2563,6 +2563,18 @@ class AppModel(ObservableObject):
             configuration.hardware.nidaq_enabled,
             auto_start=False,
         )
+        hardware_timed_output_devices = tuple(
+            dict.fromkeys(
+                device_name
+                for channel in configuration.laser.channels
+                for device_name in (device_name_from_channel(channel.analog_output),)
+                if configuration.laser.hardware_timed and device_name is not None
+            )
+        )
+        self.nidaq_signal_monitor.configure_timing(
+            configuration.nidaq_ports.timing,
+            hardware_timed_output_devices=hardware_timed_output_devices,
+        )
         nidaq_acquisition = build_nidaq_acquisition_configuration(
             configuration.nidaq_stream,
             configuration.nidaq_ports,
@@ -2654,6 +2666,18 @@ class AppModel(ObservableObject):
             laser_configuration,
         )
         self._nidaq_signal_monitor.load_configuration(acquisition)
+        hardware_timed_output_devices = tuple(
+            dict.fromkeys(
+                device_name
+                for channel in laser_configuration.channels
+                for device_name in (device_name_from_channel(channel.analog_output),)
+                if laser_configuration.hardware_timed and device_name is not None
+            )
+        )
+        self._nidaq_signal_monitor.configure_timing(
+            nidaq_ports.timing,
+            hardware_timed_output_devices=hardware_timed_output_devices,
+        )
         self._loaded_configuration.nidaq_stream = acquisition
         self.configuration_loaded_event(self._loaded_configuration)
         self.save_configuration()

@@ -12,6 +12,8 @@ from typing import Iterable, Optional
 from autotrainer.core import (
     NidaqSignalChannelConfiguration,
     NidaqSignalStreamConfiguration,
+    NidaqTimingConfiguration,
+    NidaqTimingPlan,
     ObservableObject,
     ProjectInfo,
 )
@@ -26,6 +28,8 @@ from autotrainer.core.project import ProjectDependentProtocol
 from autotrainer.device import NidaqSignalStreamController
 from tools.acquisition.model.nidaq_sample_ring import SharedNidaqSampleRing
 from tools.acquisition.model.nidaq_channel_plan import with_display_channels
+from tools.acquisition.model.nidaq_discovery import discover_nidaq_devices
+from tools.acquisition.model.nidaq_timing import build_nidaq_timing_plan
 
 
 logger = get_verbose_logger(__name__)
@@ -68,6 +72,7 @@ class _NidaqWorkerLogHandler(logging.Handler):
 
 def _nidaq_signal_stream_worker(
     configuration,
+    timing_plan,
     message_queue,
     sample_ring,
     stop_event,
@@ -88,7 +93,10 @@ def _nidaq_signal_stream_worker(
 
     controller = None
     try:
-        controller = NidaqSignalStreamController(configuration)
+        controller = NidaqSignalStreamController(
+            configuration,
+            timing_plan=timing_plan,
+        )
         controller.start()
         _put_worker_message(message_queue, (_WORKER_READY, None))
         while not stop_event.is_set():
@@ -117,12 +125,14 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
     IS_RUNNING = "is_running"
     STATUS_MESSAGE = "status_message"
     ERROR_MESSAGE = "error_message"
+    TIMING_PLAN = "timing_plan"
 
     def __init__(
         self,
         *,
         mp_ctx=None,
         worker_target=_nidaq_signal_stream_worker,
+        device_discovery=discover_nidaq_devices,
         startup_timeout_seconds: float = _DEFAULT_STARTUP_TIMEOUT_SECONDS,
     ):
         super().__init__()
@@ -131,6 +141,7 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
         self._project: Optional[ProjectInfo] = None
         self._mp_ctx = get_mp_ctx() if mp_ctx is None else mp_ctx
         self._worker_target = worker_target
+        self._device_discovery = device_discovery
         self._startup_timeout_seconds = startup_timeout_seconds
         self._display_refresh_rate_hz = 60.0
         self._process = None
@@ -142,6 +153,9 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
         self._is_running = False
         self._status_message = "NI-DAQ signal stream disabled"
         self._error_message = ""
+        self._timing_configuration = NidaqTimingConfiguration()
+        self._hardware_timed_output_devices = tuple()
+        self._timing_plan: Optional[NidaqTimingPlan] = None
         self._sample_ring = SharedNidaqSampleRing(self._configuration, mp_ctx=self._mp_ctx)
 
     @property
@@ -176,6 +190,10 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
     @property
     def error_message(self) -> str:
         return self._error_message
+
+    @property
+    def timing_plan(self) -> Optional[NidaqTimingPlan]:
+        return self._timing_plan
 
     @property
     def display_refresh_rate_hz(self) -> float:
@@ -262,6 +280,20 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
     def save_configuration(self) -> NidaqSignalStreamConfiguration:
         return self._configuration
 
+    def configure_timing(
+        self,
+        configuration: NidaqTimingConfiguration,
+        *,
+        hardware_timed_output_devices: Iterable[str] = tuple(),
+    ) -> None:
+        if self._is_running or self._is_starting:
+            raise RuntimeError("cannot change NI-DAQ timing while acquisition is active")
+        self._timing_configuration = configuration
+        self._hardware_timed_output_devices = tuple(dict.fromkeys(
+            str(device) for device in hardware_timed_output_devices if device
+        ))
+        self._set_timing_plan(None)
+
     def set_stream_channels(
         self,
         channels: Iterable[NidaqSignalChannelConfiguration],
@@ -320,6 +352,18 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
                 tuple(channel.physical_channel for channel in configuration.channels),
             )
             try:
+                devices, discovery_error = self._device_discovery()
+                if discovery_error:
+                    raise RuntimeError(discovery_error)
+                timing_plan = build_nidaq_timing_plan(
+                    configuration,
+                    self._timing_configuration,
+                    devices,
+                    hardware_timed_output_devices=self._hardware_timed_output_devices,
+                )
+                self._set_timing_plan(timing_plan)
+                if not timing_plan.is_valid:
+                    raise RuntimeError(timing_plan.reason)
                 message_queue = self._mp_ctx.Queue(maxsize=16)
                 stop_event = self._mp_ctx.Event()
                 sample_ring = self.sample_ring
@@ -327,7 +371,14 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
                 process = self._mp_ctx.Process(
                     target=self._worker_target,
                     name="nidaq-signal-stream",
-                    args=(configuration, message_queue, sample_ring, stop_event, None),
+                    args=(
+                        configuration,
+                        timing_plan,
+                        message_queue,
+                        sample_ring,
+                        stop_event,
+                        None,
+                    ),
                     daemon=True,
                 )
                 process.start()
@@ -516,3 +567,7 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
     def _set_error(self, value: str) -> None:
         prev, self._error_message = self._error_message, value
         self._on_property_changed(self.ERROR_MESSAGE, value, prev)
+
+    def _set_timing_plan(self, value: Optional[NidaqTimingPlan]) -> None:
+        previous, self._timing_plan = self._timing_plan, value
+        self._on_property_changed(self.TIMING_PLAN, value, previous)
