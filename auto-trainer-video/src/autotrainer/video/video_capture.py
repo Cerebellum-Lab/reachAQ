@@ -131,6 +131,12 @@ class CaptureAttrs:
     synced_cam_frame_index: Optional[Synchronized[int]] = None
     """Multiprocessing int value for communicating synced frame index between cameras"""
 
+    record_start_perf: Optional[Synchronized[float]] = None
+    """Canonical primary-camera recording start on the perf-counter clock."""
+
+    align_record_start_perf: bool = False
+    """Delay this unsynchronized camera until its first frame at/after record_start_perf."""
+
     inference: Optional[CaptureInferenceAttrs] = None
     """Inference attributes for the capture process (optional)"""
 
@@ -406,6 +412,8 @@ class VideoCapture(Process):
         when_secs = math.nan
         attrs = self._attrs
         is_primary = attrs.is_primary
+        record_start_perf = attrs.record_start_perf
+        align_record_start_perf = attrs.align_record_start_perf
         frame_period = 1 / camera.fps
         prim_cam_record_enabled = attrs.synced_cam_record_enabled
         prim_cam_synced_frame_idx = attrs.synced_cam_frame_index
@@ -616,7 +624,21 @@ class VideoCapture(Process):
             try:
                 # this eventually set/unset recording enabled on the primary cam, or on non-synced cam(s):
                 # + 1 because next frame will have that frame_id
-                if is_record_active and record_start_stop_frame_idx is None and synced_frame_idx is None:
+                if (
+                    is_record_active
+                    and record_start_stop_frame_idx is None
+                    and synced_frame_idx is None
+                    and (
+                        not align_record_start_perf
+                        or record_start_perf is None
+                        or (
+                            math.isfinite(record_start_perf.value)
+                            and isinstance(prev_frame_perf_now, (int, float))
+                            and math.isfinite(prev_frame_perf_now)
+                            and prev_frame_perf_now >= record_start_perf.value
+                        )
+                    )
+                ):
                     # prev_frame_id is normally a valid acquired frame,
                     # which should always allow to have one valid for start-recording, even in case of heavy drops.
                     primary_acquire(prev_frame_id, enabled=True)
@@ -755,6 +777,12 @@ class VideoCapture(Process):
                         self._record.first_frame_id = first_frame_id
                         self._record.first_frame_time = first_frame_time
                         #
+                        if (
+                            is_primary
+                            and not align_record_start_perf
+                            and record_start_perf is not None
+                        ):
+                            record_start_perf.value = first_frame_p_now
                         if len(frames_prebuffer_list) > 0:
                             rec_q_put(
                                 [(fix, f, fw, p) for f, fw, _, p, fix in frames_prebuffer_list]

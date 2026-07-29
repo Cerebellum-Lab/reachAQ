@@ -153,6 +153,8 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
         presence_detection: Optional[PresenceDetectionAttrs] = None,
         synced_cam_recording: Optional[Synchronized] = None,
         synced_cam_frame_index: Optional[Synchronized] = None,
+        record_start_perf: Optional[Synchronized] = None,
+        align_record_start_perf: bool = False,
         record_stop_sema: Optional[SemaphoreType] = None,
     ):
         super().__init__()
@@ -171,6 +173,8 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
         self._presence_detection = presence_detection
         self._synced_cam_recording = synced_cam_recording
         self._synced_cam_frame_index = synced_cam_frame_index
+        self._record_start_perf = record_start_perf
+        self._align_record_start_perf = align_record_start_perf
         self._record_stop_sema = record_stop_sema
 
         self._camera_source: CaptureCameraAttrs = CaptureCameraAttrs(name="", url="")
@@ -477,6 +481,8 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
                 watchdog_perf_c=self._watchdog_capture_perf_c,
                 synced_cam_record_enabled=self._synced_cam_recording,
                 synced_cam_frame_index=self._synced_cam_frame_index,
+                record_start_perf=self._record_start_perf,
+                align_record_start_perf=self._align_record_start_perf,
                 record_stop_sema=self._record_stop_sema,
             )
 

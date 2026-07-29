@@ -177,9 +177,9 @@ class VideoRecord(Thread):
                 if len(queue_list) == 0:
                     # Indicator for trigger disabled
                     self._close_writers()
+                    closed_frames_written = tot_written
                     logger.info("Closed video file: tot frames written: %s ; last_perf_now=%s",
-                                tot_written, prev_perf_now)
-                    tot_written = 0
+                                closed_frames_written, prev_perf_now)
                     if record_stop_sema is not None:
                         record_stop_sema.release()
                         logger.verbose("released record_stop_sema: %s", record_stop_sema)
@@ -187,8 +187,9 @@ class VideoRecord(Thread):
                         # allows main process to know when it can merge the cameras timestamp files.
                         msg_queue.put((
                             SystemStatusMessageKind.CAMERA_RECORDING_CLOSED_FINISHED, (
-                                self._cam_idx, tot_written, self._prepared_project,
+                                self._cam_idx, closed_frames_written, self._prepared_project,
                         )))
+                    tot_written = 0
                     continue
 
                 for frame_id, frame, frame_when, frame_perf_now in queue_list:
