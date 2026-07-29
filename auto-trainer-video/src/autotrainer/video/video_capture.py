@@ -851,8 +851,10 @@ class VideoCapture(Process):
 
             except Exception as err:
                 logger.exception("Error during capture loop: %s", err)
-                if save_err is not None:
+                if save_err is None:
                     save_err = str(err)
+                    if self._errors:
+                        self._errors.value = save_err[:len(self._errors)].encode()
                 fault_count += 1
             else:
                 save_err = None

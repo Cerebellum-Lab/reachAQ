@@ -190,7 +190,7 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
         self._video_status = mp_ctx.Value(ctypes.c_int, CaptureProcessStatus.UNKNOWN)
         self._video_frame_index = mp_ctx.Value(ctypes.c_int64, -1)
         self._video_image_queue: Optional[FixedArrayQueue] = None
-        self._errors: SynchronizedString = mp_ctx.Array(ctypes.c_char, bytes(512))
+        self._errors: SynchronizedString = mp_ctx.Array(ctypes.c_char, bytes(4096))
         self._watchdog_capture_perf_c = mp_ctx.Value(ctypes.c_double, math.nan)
         self._shape = None
 
@@ -445,6 +445,7 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
             return True
         self._frame_count = 0
         self._video_frame_index.value = -1
+        self._errors.value = b""
 
         # before everything below, particularly video_reader
         self._video_image_queue = None if self._shape is None else FixedArrayQueue(
@@ -677,10 +678,13 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
                 )
                 return False
             if time.perf_counter() > perf_timeout:
+                first_capture_error = self._errors.value.decode()
                 self._last_error = (
                     f"camera did not deliver a frame within {timeout:g} seconds; "
                     "check the camera connection and hardware trigger"
                 )
+                if first_capture_error:
+                    self._last_error += f"; first capture error: {first_capture_error}"
                 logger.error("<%s> %s", self._name, self._last_error)
                 return False
             time.sleep(0.001)

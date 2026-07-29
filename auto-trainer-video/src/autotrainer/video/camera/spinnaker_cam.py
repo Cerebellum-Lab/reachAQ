@@ -339,12 +339,51 @@ class SpinCam(CameraBase):
         capture_timeout = 4
         p_timeout = time.perf_counter() + capture_timeout
         try_count = 0
+        exception_count = 0
+        timeout_exception_count = 0
+        incomplete_count = 0
+        first_exception = None
+        first_non_timeout_exception = None
+        first_incomplete = None
         t_prev_after = p_prev_after = -math.inf
         while True:
             try_count += 1
             if time.perf_counter() > p_timeout:
+                role = "primary" if self._is_primary else "secondary"
+                node_values = self._effective_trigger_node_values()
+                if first_non_timeout_exception is not None:
+                    failure_hint = "non_timeout_spinnaker_error"
+                elif first_incomplete is not None:
+                    failure_hint = "incomplete_images_received"
+                else:
+                    failure_hint = "only_polling_timeouts_no_complete_images"
+                details = [
+                    f"camera={self._name}",
+                    f"serial={self._serial_number}",
+                    f"role={role}",
+                    f"attempts={try_count - 1}",
+                    f"failure_hint={failure_hint}",
+                    f"effective_nodes=[{node_values}]",
+                ]
+                if first_exception is not None:
+                    details.append(
+                        f"spinnaker_exceptions={exception_count} "
+                        f"timeout_exceptions={timeout_exception_count} "
+                        f"first_spinnaker_exception=[{first_exception}]"
+                    )
+                if first_non_timeout_exception is not None:
+                    details.append(
+                        "first_non_timeout_spinnaker_exception="
+                        f"[{first_non_timeout_exception}]"
+                    )
+                if first_incomplete is not None:
+                    details.append(
+                        f"incomplete_images={incomplete_count} "
+                        f"first_incomplete_image=[{first_incomplete}]"
+                    )
                 raise RuntimeError(
-                    f"Failed to capture a frame within {capture_timeout} seconds"
+                    f"Failed to capture a frame within {capture_timeout} seconds; "
+                    + "; ".join(details)
                 )
             t_before = time.time()
             p_before = time.perf_counter()
@@ -352,11 +391,21 @@ class SpinCam(CameraBase):
                 image_result = self._camera.GetNextImage(1)  # 1 millisecond timeout
                 p_after = time.perf_counter()
                 t_after = time.time()
-            except PySpin.SpinnakerException:
+            except PySpin.SpinnakerException as err:
+                exception_count += 1
+                if first_exception is None:
+                    first_exception = self._format_spinnaker_exception(err)
+                if getattr(err, "errorcode", None) == PySpin.SPINNAKER_ERR_TIMEOUT:
+                    timeout_exception_count += 1
+                elif first_non_timeout_exception is None:
+                    first_non_timeout_exception = self._format_spinnaker_exception(err)
                 t_prev_after = t_before
                 p_prev_after = p_before
                 continue
             if image_result.IsIncomplete():
+                incomplete_count += 1
+                if first_incomplete is None:
+                    first_incomplete = self._format_incomplete_image(image_result)
                 image_result.Release()
                 t_prev_after = t_after
                 p_prev_after = p_after
@@ -390,6 +439,72 @@ class SpinCam(CameraBase):
                     self._consecutive_late_acquire = 0
             return image_result, frame_when, estimated_frame_perf_c, estimated_frame_time
         # end while True.
+
+    @staticmethod
+    def _format_spinnaker_exception(err: PySpin.SpinnakerException) -> str:
+        message = str(err).strip() or getattr(err, "message", "") or err.__class__.__name__
+        parts = [f"code={getattr(err, 'errorcode', 'unknown')}", f"message={message}"]
+        full_message = str(getattr(err, "fullmessage", "") or "").strip()
+        if full_message and full_message != message:
+            parts.append(f"full_message={full_message}")
+        return " ".join(parts)
+
+    @staticmethod
+    def _format_incomplete_image(image_result) -> str:
+        try:
+            status = image_result.GetImageStatus()
+        except Exception as err:
+            return f"status_unavailable={err}"
+        try:
+            description = PySpin.Image_GetImageStatusDescription(status)
+        except Exception as err:
+            description = f"description unavailable: {err}"
+        return f"status={status} description={description}"
+
+    @staticmethod
+    def _read_node_value(node) -> str:
+        if node is None:
+            return "<unavailable>"
+        try:
+            get_current_entry = getattr(node, "GetCurrentEntry", None)
+            if callable(get_current_entry):
+                entry = get_current_entry()
+                if entry is not None:
+                    get_symbolic = getattr(entry, "GetSymbolic", None)
+                    if callable(get_symbolic):
+                        return str(get_symbolic())
+            get_value = getattr(node, "GetValue", None)
+            if callable(get_value):
+                return str(get_value())
+            return "<unreadable>"
+        except Exception as err:
+            return f"<unreadable:{err.__class__.__name__}>"
+
+    def _effective_trigger_node_values(self) -> str:
+        """Return best-effort diagnostics without changing camera node state."""
+        camera = self._camera
+        node_names = (
+            "AcquisitionMode",
+            "AcquisitionFrameRateEnable",
+            "TriggerMode",
+            "TriggerSelector",
+            "TriggerSource",
+            "TriggerActivation",
+            "TriggerOverlap",
+        )
+        if self._is_primary:
+            node_names += (
+                "LineSelector",
+                "LineSource",
+                "LineInverter",
+                "CounterSelector",
+                "CounterEventSource",
+                "CounterTriggerSource",
+            )
+        return ", ".join(
+            f"{name}={self._read_node_value(getattr(camera, name, None))}"
+            for name in node_names
+        )
 
     def capture(self) -> Tuple[numpy.ndarray, int]:
         first_capture = False
