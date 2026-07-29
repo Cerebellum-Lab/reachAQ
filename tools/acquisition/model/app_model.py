@@ -3159,46 +3159,166 @@ class AppModel(ObservableObject):
             self.property_changed(self.Props.ACQUISITION_RUNNING, False, True)
 
     def _capture_stop(self):
-
-        tok = self._hardware.set_color_led(0, 0, 0)
-        self._hardware.wait_pending_command_acked(tok, timeout=2, raise_on_timeout=False)
-
         self._detach_training_plan()  # always
 
         watchdog_mon_unregister = self._analysis.watchdog_monitor.unregister_watchdog
         for item in WatchdogItems:
             watchdog_mon_unregister(item)
 
+        can_status = self._subsystem_status_registry.get(SubsystemId.CAN_PELLET)
+        if can_status is not None and can_status.state is SubsystemState.READY:
+            self._set_subsystem_status(
+                SubsystemId.CAN_PELLET,
+                SubsystemState.STOPPING,
+                reason="stopping CAN/pellet controller",
+            )
+            try:
+                tok = self._hardware.set_color_led(0, 0, 0)
+                self._hardware.wait_pending_command_acked(
+                    tok,
+                    timeout=2,
+                    raise_on_timeout=False,
+                )
+            except Exception:
+                logger.exception("Failed to turn off pellet controller LED")
+
+        self._set_subsystem_status(
+            SubsystemId.LIVE_INFERENCE,
+            SubsystemState.STOPPING,
+            reason="stopping live inference",
+        )
         try:
-            self._laser.close_all_shutters()
+            self._inference.stop()
+        except Exception:
+            logger.exception("Failed to stop live inference")
+        self._set_subsystem_status(
+            SubsystemId.LIVE_INFERENCE,
+            (
+                SubsystemState.DISABLED
+                if not self._inference.is_enabled
+                else SubsystemState.STOPPED
+            ),
+            reason="live inference stopped",
+        )
+
+        self._set_subsystem_status(
+            SubsystemId.LASER,
+            SubsystemState.STOPPING,
+            reason="closing laser controller",
+        )
+        try:
+            self._laser.close()
         except Exception as err:
-            logger.exception("Failed to close laser shutters during capture stop: %s", err)
-        self._inference.stop()
-        self._hardware.disconnect()
+            logger.exception("Failed to close laser controller during capture stop: %s", err)
+        self._set_subsystem_status(
+            SubsystemId.LASER,
+            (
+                SubsystemState.DISABLED
+                if self._laser.configuration.backend == "disabled"
+                else SubsystemState.STOPPED
+            ),
+            reason="laser controller stopped",
+        )
+
+        self._set_subsystem_status(
+            SubsystemId.NIDAQ_STREAM,
+            SubsystemState.STOPPING,
+            reason="stopping NI-DAQ stream",
+        )
+        try:
+            self._nidaq_signal_monitor.stop()
+        except Exception:
+            logger.exception("Failed to stop NI-DAQ stream")
+        self._set_subsystem_status(
+            SubsystemId.NIDAQ_STREAM,
+            (
+                SubsystemState.DISABLED
+                if not (
+                    self._nidaq_signal_monitor.hardware_enabled
+                    and self._nidaq_signal_monitor.configuration.is_enabled
+                )
+                else SubsystemState.STOPPED
+            ),
+            reason="NI-DAQ stream stopped",
+        )
+
+        try:
+            self._hardware.disconnect()
+        except Exception:
+            logger.exception("Failed to disconnect CAN/pellet controller")
+        self._set_subsystem_status(
+            SubsystemId.CAN_PELLET,
+            (
+                SubsystemState.DISABLED
+                if not self._hardware.requires_connection
+                else SubsystemState.STOPPED
+            ),
+            reason="CAN/pellet controller stopped",
+        )
 
         for camera in self._cameras:
             watchdog_mon_unregister(f"camera.{camera.name}")
-
-            if not camera.is_primary:
+            if camera.is_enabled and not camera.is_primary:
                 logger.verbose("notifying end to %s", camera.name)
-                camera.on_capture_notify_end()
+                try:
+                    camera.on_capture_notify_end()
+                except Exception:
+                    logger.exception("Failed to notify camera %s to end", camera.name)
 
         time.sleep(0.01)
 
         for camera in self._cameras:
-            if camera.is_primary:
+            if camera.is_enabled and camera.is_primary:
                 logger.verbose("notifying end to %s", camera.name)
-                camera.on_capture_notify_end()
+                try:
+                    camera.on_capture_notify_end()
+                except Exception:
+                    logger.exception("Failed to notify camera %s to end", camera.name)
 
         for camera in self._cameras:
-            if not camera.is_primary:
+            if camera.is_enabled and not camera.is_primary:
                 logger.verbose("stopping capture to %s", camera.name)
-                camera.on_capture_stop()
+                try:
+                    camera.on_capture_stop()
+                except Exception:
+                    logger.exception("Failed to stop camera %s", camera.name)
 
         for camera in self._cameras:
-            if camera.is_primary:
+            if camera.is_enabled and camera.is_primary:
                 logger.verbose("stopping capture to %s", camera.name)
-                camera.on_capture_stop()
+                try:
+                    camera.on_capture_stop()
+                except Exception:
+                    logger.exception("Failed to stop camera %s", camera.name)
+
+        for camera in self._cameras:
+            self._set_subsystem_status(
+                SubsystemId.camera(camera.name),
+                (
+                    SubsystemState.STOPPED
+                    if camera.is_enabled
+                    else SubsystemState.DISABLED
+                ),
+                reason="camera stopped" if camera.is_enabled else "camera disabled",
+            )
+        self._set_subsystem_status(
+            SubsystemId.REACH_SYNCHRONIZATION,
+            (
+                SubsystemState.STOPPED
+                if any(camera.is_enabled for camera in self._reach_cameras)
+                else SubsystemState.DISABLED
+            ),
+            reason="reach camera synchronization stopped",
+        )
+        self._set_subsystem_status(
+            SubsystemId.TOP_CAPTURE,
+            (
+                SubsystemState.STOPPED
+                if self._top_camera.is_enabled
+                else SubsystemState.DISABLED
+            ),
+            reason="top camera stopped",
+        )
 
     def set_log_location(self, location: Optional[Path] = None):
         if location is None:
