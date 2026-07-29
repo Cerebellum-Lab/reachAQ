@@ -29,11 +29,7 @@ class _SessionLogHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
-            self._recorder.add_log(
-                time.perf_counter(),
-                record.created,
-                self.format(record),
-            )
+            self._recorder.add_current_log(record.created, self.format(record))
         except Exception:
             self.handleError(record)
 
@@ -164,6 +160,17 @@ class SessionDataRecorder:
         with self._lock:
             if self._armed:
                 self._log_rows.append((float(perf_time), float(wall_time), message))
+
+    def add_current_log(self, wall_time: float, message: str) -> None:
+        """Timestamp a log only when a session is actively collecting it."""
+        with self._lock:
+            if not self._armed:
+                return
+            self._log_rows.append((
+                time.perf_counter(),
+                float(wall_time),
+                message,
+            ))
 
     def _clear_locked(self) -> None:
         self._armed = False

@@ -12,6 +12,7 @@ from autotrainer.core import (
     SystemCommandKind,
     SystemStatusMessageKind,
 )
+from tools.acquisition.model import session_data_recorder
 from tools.acquisition.model.session_data_recorder import SessionDataRecorder
 
 
@@ -20,6 +21,22 @@ class _EventSource(ObservableObject):
 
     def __init__(self, *event_names):
         super().__init__(event_names)
+
+
+def test_inactive_session_log_handler_does_not_consume_the_runtime_clock(
+    monkeypatch,
+):
+    laser = _EventSource("trace_received")
+    recorder = SessionDataRecorder(_EventSource(), object(), laser)
+    monkeypatch.setattr(
+        session_data_recorder.time,
+        "perf_counter",
+        lambda: (_ for _ in ()).throw(AssertionError("clock must not be read")),
+    )
+    try:
+        recorder.add_current_log(100.0, "outside a recording")
+    finally:
+        recorder.close()
 
 
 def test_structured_device_ledger_captures_decoded_input_and_output():
