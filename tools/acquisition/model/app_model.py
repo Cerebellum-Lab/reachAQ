@@ -2746,6 +2746,41 @@ class AppModel(ObservableObject):
         )
         return True
 
+    def _log_acquisition_startup_summary(self) -> None:
+        statuses = self._subsystem_status_registry.statuses
+        for subsystem_id, status in statuses.items():
+            detail = status.error or status.reason or "no detail"
+            log_hardware_initialization(
+                logger,
+                "SUMMARY | %s | state=%s detail=%s",
+                subsystem_id,
+                status.state.value,
+                detail,
+            )
+
+        failed_cameras = tuple(
+            subsystem_id
+            for subsystem_id, status in statuses.items()
+            if subsystem_id.startswith("camera.")
+            and status.state in {SubsystemState.FAILED, SubsystemState.BLOCKED}
+        )
+        nidaq_status = statuses.get(SubsystemId.NIDAQ_STREAM.value)
+        if (
+            failed_cameras
+            and nidaq_status is not None
+            and nidaq_status.state in {SubsystemState.FAILED, SubsystemState.BLOCKED}
+        ):
+            log_hardware_initialization(
+                logger,
+                "CORRELATION | camera failure(s)=%s and NI-DAQ=%s occurred "
+                "during the same startup. They may share a physical power, "
+                "timing, trigger, or ground dependency; NI-DAQ software "
+                "initialization does not trigger the cameras.",
+                ",".join(failed_cameras),
+                nidaq_status.state.value,
+                level=logging.WARNING,
+            )
+
     def retry_failed_subsystems(self) -> str:
         """Retry failed acquisition domains without disturbing healthy domains."""
         if not self._acquisition_started:
@@ -3111,6 +3146,7 @@ class AppModel(ObservableObject):
             dict(mode=app_status_to_api_app_mode(target_status))
         )
 
+        self._log_acquisition_startup_summary()
         log_hardware_initialization(
             logger,
             "READY | acquisition hardware | status=%s elapsed=%.3fs",

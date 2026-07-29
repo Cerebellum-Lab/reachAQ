@@ -264,6 +264,30 @@ def test_required_runtime_loss_aborts_session_without_stopping_acquisition(
     assert app_model.acquisition_started
 
 
+def test_startup_summary_correlates_camera_and_nidaq_without_claiming_cause(
+    app_model,
+    caplog,
+):
+    app_model._set_subsystem_status(
+        SubsystemId.camera("right"),
+        SubsystemState.FAILED,
+        error="no frame received from hardware-triggered camera",
+    )
+    app_model._set_subsystem_status(
+        SubsystemId.NIDAQ_STREAM,
+        SubsystemState.FAILED,
+        error="configured chassis is unavailable",
+    )
+
+    with caplog.at_level("INFO"):
+        app_model._log_acquisition_startup_summary()
+
+    assert "SUMMARY | camera.right | state=failed" in caplog.text
+    assert "SUMMARY | nidaq_stream | state=failed" in caplog.text
+    assert "may share a physical power, timing, trigger, or ground dependency" in caplog.text
+    assert "NI-DAQ software initialization does not trigger the cameras" in caplog.text
+
+
 def test_reach_secondaries_are_armed_before_primary_first_frame_validation(
     app_model,
 ):
