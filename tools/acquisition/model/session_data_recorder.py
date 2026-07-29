@@ -68,6 +68,7 @@ class SessionDataRecorder:
         self._nidaq_last_index = None
         self._nidaq_stop = threading.Event()
         self._nidaq_thread: Optional[threading.Thread] = None
+        self._source_manifest = ()
 
         self._system_message_handler = system_message_handler
         self._hardware_model = hardware_model
@@ -80,7 +81,7 @@ class SessionDataRecorder:
         self._log_handler = _SessionLogHandler(self)
         logging.getLogger().addHandler(self._log_handler)
 
-    def arm(self, project: ProjectInfo) -> None:
+    def arm(self, project: ProjectInfo, *, source_manifest=()) -> None:
         self.abort()
         with self._lock:
             self._armed = True
@@ -95,6 +96,7 @@ class SessionDataRecorder:
             self._log_rows = []
             self._nidaq_chunks = []
             self._nidaq_last_index = None
+            self._source_manifest = tuple(source_manifest)
             self._start_perf = None
             self._start_wall = None
             self._nidaq_stop.clear()
@@ -129,6 +131,7 @@ class SessionDataRecorder:
             log_rows = tuple(self._log_rows)
             nidaq_chunks = tuple(self._nidaq_chunks)
             timing_plan = self._nidaq_monitor.timing_plan
+            source_manifest = self._source_manifest
             self._clear_locked()
         self._write_session(
             project,
@@ -141,6 +144,7 @@ class SessionDataRecorder:
             nidaq_chunks,
             timing_plan,
             device_event_overruns=device_event_overruns,
+            source_manifest=source_manifest,
         )
 
     def abort(self) -> None:
@@ -172,6 +176,7 @@ class SessionDataRecorder:
         self._log_rows = []
         self._nidaq_chunks = []
         self._nidaq_last_index = None
+        self._source_manifest = ()
 
     def _on_device_message(
         self,
@@ -303,6 +308,8 @@ class SessionDataRecorder:
                     self._value_at(trace.command_volts, index),
                     self._value_at(trace.diode_volts, index),
                     self._value_at(trace.command_copy_volts, index),
+                    trace.output_name,
+                    trace.output_value,
                 ))
 
     def _on_laser_property_changed(self, name, value, _) -> None:
@@ -319,6 +326,8 @@ class SessionDataRecorder:
                     value.command_volts,
                     value.diode_volts,
                     value.command_copy_volts,
+                    "",
+                    None,
                 ))
 
     @staticmethod
@@ -395,6 +404,7 @@ class SessionDataRecorder:
         timing_plan=None,
         *,
         device_event_overruns=0,
+        source_manifest=(),
     ) -> None:
         session_dir = Path(project.get_session_path().location)
         streams_dir = session_dir / "streams"
@@ -465,10 +475,37 @@ class SessionDataRecorder:
         SessionDataRecorder._write_csv(
             streams_dir / "laser.csv",
             ("perf_time", "offset_seconds", "wall_time", "event", "channel", "source",
-             "command_volts", "diode_volts", "command_copy_volts"),
+             "command_volts", "diode_volts", "command_copy_volts", "output_name",
+             "output_value"),
             (
-                (perf, perf - start_perf, wall, event, channel, source, command, diode, copy)
-                for perf, wall, event, channel, source, command, diode, copy in laser_rows
+                (
+                    perf,
+                    perf - start_perf,
+                    wall,
+                    event,
+                    channel,
+                    source,
+                    command,
+                    diode,
+                    copy,
+                    output_name,
+                    output_value,
+                )
+                for (
+                    perf,
+                    wall,
+                    event,
+                    channel,
+                    source,
+                    command,
+                    diode,
+                    copy,
+                    output_name,
+                    output_value,
+                ) in (
+                    SessionDataRecorder._normalize_laser_row(row)
+                    for row in laser_rows
+                )
             ),
         )
 
@@ -529,6 +566,7 @@ class SessionDataRecorder:
                 None if timing_plan is None else dataclasses.asdict(timing_plan)
             ),
             "deviceEventOverruns": int(device_event_overruns),
+            "enabledSources": list(source_manifest),
         }
         with (streams_dir / "alignment.json").open("w", encoding="utf-8") as stream:
             json.dump(alignment, stream, indent=2)
@@ -576,6 +614,14 @@ class SessionDataRecorder:
                 }),
             )
         raise ValueError(f"Unsupported structured device row with {len(row)} fields")
+
+    @staticmethod
+    def _normalize_laser_row(row):
+        if len(row) == 10:
+            return row
+        if len(row) == 8:
+            return (*row, "", None)
+        raise ValueError(f"Unsupported laser event row with {len(row)} fields")
 
     @staticmethod
     def _write_csv(path: Path, header, rows) -> None:

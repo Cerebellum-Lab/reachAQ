@@ -1,10 +1,12 @@
 import pytest
+from types import SimpleNamespace
 
 from autotrainer.device import (
     LaserChannelConfiguration,
     LaserChannelId,
     LaserPulseTrain,
     LaserSystemConfiguration,
+    NidaqLaserController,
     NullLaserController,
 )
 
@@ -108,3 +110,43 @@ def test_null_laser_controller_runs_pulse_train():
 
     assert controller.read_diode_voltage(LaserChannelId.LASER_1) == 0.0
     assert not controller.is_shutter_open(LaserChannelId.LASER_1)
+
+
+def test_nidaq_laser_uses_shared_scaled_feedback_without_reserving_ai_tasks():
+    channel = make_channel()
+    configuration = LaserSystemConfiguration.from_channels(
+        [channel],
+        backend="nidaq",
+        hardware_timed=True,
+        sample_rate_hz=1000.0,
+    )
+    created_tasks = []
+
+    class FakeTask:
+        def __init__(self, name):
+            self.name = name
+            self.ai_channels = SimpleNamespace(
+                add_ai_voltage_chan=lambda *_args, **_kwargs: None,
+            )
+            self.do_channels = SimpleNamespace(
+                add_do_chan=lambda *_args, **_kwargs: None,
+            )
+            created_tasks.append(name)
+
+    values = {"Dev1/ai0": 1.25, "Dev1/ai1": 2.5}
+    controller = object.__new__(NidaqLaserController)
+    controller._configuration = configuration
+    controller._feedback_reader = values.__getitem__
+    controller._nidaqmx = SimpleNamespace(Task=FakeTask)
+    controller._command_volts = {LaserChannelId.LASER_1: 0.75}
+    tasks = controller._create_channel_tasks(channel)
+    controller._tasks = {LaserChannelId.LASER_1: tasks}
+
+    sample = controller.read_feedback_sample(LaserChannelId.LASER_1)
+
+    assert tasks.diode_input is None
+    assert tasks.command_copy_input is None
+    assert not any(name.endswith("_ai") for name in created_tasks)
+    assert sample.command_volts == 0.75
+    assert sample.diode_volts == 1.25
+    assert sample.command_copy_volts == 2.5

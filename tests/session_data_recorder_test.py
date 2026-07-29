@@ -1,6 +1,7 @@
 import csv
 import json
 from datetime import datetime
+from types import SimpleNamespace
 
 import h5py
 import numpy as np
@@ -63,6 +64,28 @@ def test_structured_device_ledger_captures_decoded_input_and_output():
             "token-1",
         )
         assert json.loads(rows[1][-1]) == [7000, 100]
+    finally:
+        recorder.close()
+
+
+def test_laser_output_state_is_preserved_as_a_structured_event():
+    analysis = _EventSource()
+    laser = _EventSource("trace_received")
+    recorder = SessionDataRecorder(analysis, object(), laser)
+    recorder._armed = True
+    try:
+        laser.trace_received(SimpleNamespace(
+            x_values=(0.0,),
+            command_volts=(),
+            diode_volts=(),
+            command_copy_volts=(),
+            channel_id=SimpleNamespace(value=1),
+            source="output state",
+            output_name="shutter_open",
+            output_value=1.0,
+        ))
+
+        assert recorder._laser_rows[0][-2:] == ("shutter_open", 1.0)
     finally:
         recorder.close()
 

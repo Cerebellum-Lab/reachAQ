@@ -4,7 +4,7 @@ import dataclasses
 import logging
 import numbers
 import time
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 from autotrainer.core.logging import log_hardware_initialization
 
@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 @dataclasses.dataclass
 class _NidaqLaserTasks:
     analog_output: Optional[object]
-    diode_input: object
+    diode_input: Optional[object]
     command_copy_input: Optional[object]
     shutter_output: object
     auxiliary_output: Optional[object]
@@ -60,7 +60,12 @@ class NidaqLaserController:
     the same physical output channel.
     """
 
-    def __init__(self, configuration: LaserSystemConfiguration):
+    def __init__(
+        self,
+        configuration: LaserSystemConfiguration,
+        *,
+        feedback_reader: Optional[Callable[[str], float]] = None,
+    ):
         if configuration.backend != "nidaq":
             raise ValueError("NidaqLaserController requires laser backend 'nidaq'")
         runtime_started = time.perf_counter()
@@ -72,6 +77,7 @@ class NidaqLaserController:
             time.perf_counter() - runtime_started,
         )
         self._configuration = configuration
+        self._feedback_reader = feedback_reader
         self._tasks: Dict[LaserChannelId, _NidaqLaserTasks] = {}
         self._command_volts: Dict[LaserChannelId, float] = {}
         try:
@@ -135,6 +141,8 @@ class NidaqLaserController:
 
     def read_diode_voltage(self, channel_id: Union[LaserChannelId, int]) -> float:
         channel = self._configuration.get_channel(channel_id)
+        if self._feedback_reader is not None:
+            return float(self._feedback_reader(channel.diode_input))
         raw = self._tasks[channel.channel_id].diode_input.read()
         return float(raw) * channel.feedback_scale
 
@@ -308,6 +316,11 @@ class NidaqLaserController:
             )
 
     def run_calibration_ramp(self, ramp: LaserCalibrationRamp) -> Tuple[LaserCalibrationPoint, ...]:
+        if self._feedback_reader is not None:
+            raise RuntimeError(
+                "Laser calibration is unavailable while the shared NI-DAQ input "
+                "stream owns the feedback channels"
+            )
         if not self._configuration.hardware_timed:
             raise RuntimeError("Hardware-timed laser calibration ramps require laser configuration hardware_timed=True")
         channel = self._configuration.get_channel(ramp.channel_id)
@@ -526,11 +539,13 @@ class NidaqLaserController:
         analog_output = None
         if not self._configuration.hardware_timed:
             analog_output = self._create_analog_output_task(channel, f"laser_{channel.channel_id.value}_ao")
-        diode_input = self._nidaqmx.Task(f"laser_{channel.channel_id.value}_ai")
-        diode_input.ai_channels.add_ai_voltage_chan(channel.diode_input)
+        diode_input = None
+        if self._feedback_reader is None:
+            diode_input = self._nidaqmx.Task(f"laser_{channel.channel_id.value}_ai")
+            diode_input.ai_channels.add_ai_voltage_chan(channel.diode_input)
 
         command_copy_input = None
-        if channel.command_copy_input:
+        if channel.command_copy_input and self._feedback_reader is None:
             command_copy_input = self._nidaqmx.Task(f"laser_{channel.channel_id.value}_command_copy_ai")
             command_copy_input.ai_channels.add_ai_voltage_chan(channel.command_copy_input)
 
@@ -629,6 +644,10 @@ class NidaqLaserController:
 
     def _read_optional_command_copy_voltage(self, channel_id: Union[LaserChannelId, int]) -> Optional[float]:
         channel = self._configuration.get_channel(channel_id)
+        if channel.command_copy_input is None:
+            return None
+        if self._feedback_reader is not None:
+            return float(self._feedback_reader(channel.command_copy_input))
         task = self._tasks[channel.channel_id].command_copy_input
         if task is None:
             return None

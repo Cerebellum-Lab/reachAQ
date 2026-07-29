@@ -34,6 +34,8 @@ class LaserTraceBlock:
     command_volts: Tuple[float, ...] = tuple()
     diode_volts: Tuple[float, ...] = tuple()
     command_copy_volts: Tuple[float, ...] = tuple()
+    output_name: str = ""
+    output_value: Optional[float] = None
     replace: bool = False
 
 
@@ -70,10 +72,25 @@ class LaserModel(ObservableObject):
     def configure_null(self, configuration: LaserSystemConfiguration) -> None:
         self.set_controller(NullLaserController(configuration))
 
-    def configure_nidaq(self, configuration: LaserSystemConfiguration) -> None:
-        self.set_controller(NidaqLaserController(configuration))
+    def configure_nidaq(
+        self,
+        configuration: LaserSystemConfiguration,
+        *,
+        feedback_reader: Optional[Callable[[str], float]] = None,
+    ) -> None:
+        self.set_controller(
+            NidaqLaserController(
+                configuration,
+                feedback_reader=feedback_reader,
+            )
+        )
 
-    def load_configuration(self, configuration: LaserSystemConfiguration) -> None:
+    def load_configuration(
+        self,
+        configuration: LaserSystemConfiguration,
+        *,
+        feedback_reader: Optional[Callable[[str], float]] = None,
+    ) -> None:
         backend = configuration.backend
         if backend == "disabled":
             prev_config = self._configuration
@@ -103,7 +120,10 @@ class LaserModel(ObservableObject):
             if backend == "null":
                 self.configure_null(configuration)
             elif backend == "nidaq":
-                self.configure_nidaq(configuration)
+                self.configure_nidaq(
+                    configuration,
+                    feedback_reader=feedback_reader,
+                )
             else:
                 raise ValueError(f"Unsupported laser backend: {backend}")
         except Exception as exc:
@@ -154,9 +174,25 @@ class LaserModel(ObservableObject):
 
     def set_shutter_open(self, channel_id: Union[LaserChannelId, int], is_open: bool) -> None:
         self._require_controller().set_shutter_open(channel_id, is_open)
+        self.trace_received(
+            LaserTraceBlock(
+                channel_id=LaserChannelId(int(channel_id)),
+                source="output state",
+                output_name="shutter_open",
+                output_value=float(bool(is_open)),
+            )
+        )
 
     def set_auxiliary_output(self, channel_id: Union[LaserChannelId, int], enabled: bool) -> None:
         self._require_controller().set_auxiliary_output(channel_id, enabled)
+        self.trace_received(
+            LaserTraceBlock(
+                channel_id=LaserChannelId(int(channel_id)),
+                source="output state",
+                output_name="auxiliary_enabled",
+                output_value=float(bool(enabled)),
+            )
+        )
 
     def read_feedback_sample(self, channel_id: Union[LaserChannelId, int]) -> LaserFeedbackSample:
         sample = self._require_controller().read_feedback_sample(channel_id)
