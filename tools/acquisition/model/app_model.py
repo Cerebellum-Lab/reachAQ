@@ -109,6 +109,12 @@ from tools.acquisition.model.nidaq_channel_plan import build_nidaq_acquisition_c
 from tools.acquisition.model.nidaq_signal_monitor_model import NidaqSignalMonitorModel
 from tools.acquisition.model.session_data_recorder import SessionDataRecorder
 from tools.acquisition.model.session_boundary import SessionBoundary
+from tools.acquisition.model.subsystem_status import (
+    SubsystemId,
+    SubsystemState,
+    SubsystemStatus,
+    SubsystemStatusRegistry,
+)
 from tools.acquisition.model.behavior_model import BehaviorModel
 from tools.acquisition.model.user_preferences import UserPreferences, get_default_animals_location
 from tools.acquisition.model.video_capture_model import (
@@ -254,6 +260,8 @@ class AppModel(ObservableObject):
         TRAINING_PHASE_PROP = 'training_phase_prop'
         HARDWARE_SCAN_RESULTS = "hardware_scan_results"
         SESSION_RECORDING_STATUS = "session_recording_status"
+        SUBSYSTEM_STATUSES = "subsystem_statuses"
+        RECORDING_BLOCKERS = "recording_blockers"
 
     def __init__(
             self,
@@ -296,6 +304,8 @@ class AppModel(ObservableObject):
         self._runtime_live_inference_override: Optional[bool] = None
         self._nidaq_ports = NidaqPortConfiguration()
         self._hardware_scan_results: Dict[str, HardwareScanEntry] = {}
+        self._subsystem_status_registry = SubsystemStatusRegistry()
+        self._subsystem_status_lock = threading.RLock()
 
         self._output_location = PersistenceConfiguration.get_default_output_path().as_posix()
         self._project_info: Optional[ProjectInfo] = None
@@ -323,6 +333,7 @@ class AppModel(ObservableObject):
         self._session_analysis_duration_seconds: Optional[float] = None
         self._pending_session_end_perf: Optional[float] = None
         self._session_boundary: Optional[SessionBoundary] = None
+        self._session_hardware_status_at_record: Optional[dict] = None
         self._aborting_project: Optional[ProjectInfo] = None
         self._aborted_session_ids = set()
         self._abort_had_recording_started = False
@@ -384,6 +395,17 @@ class AppModel(ObservableObject):
             camera.camera_id: camera
             for camera in self._cameras
         }
+        for camera in self._cameras:
+            self._subsystem_status_registry.ensure(
+                SubsystemId.camera(camera.name),
+                state=SubsystemState.DISABLED,
+                reason="camera disabled",
+            )
+        for subsystem_id in SubsystemId:
+            self._subsystem_status_registry.ensure(
+                subsystem_id,
+                state=SubsystemState.DISABLED,
+            )
 
         self._system_message_queue = queue.Queue()  # only dedicated to CAN bus messages reading/handling
 
@@ -708,41 +730,60 @@ class AppModel(ObservableObject):
         self._session_recording_status = status
         logger.info("session recording status: %s -> %s", previous.value, status.value)
         self.property_changed(self.Props.SESSION_RECORDING_STATUS, status, previous)
+        self.property_changed(
+            self.Props.RECORDING_BLOCKERS,
+            self.recording_blockers,
+            None,
+        )
 
     def start_recording(self) -> bool:
         if not self._acquisition_started or self._status == AppModelStatus.IDLE:
             self.on_error("Recording unavailable", "Set System Mode to Running before recording.")
             return False
-        monitored_cams = self._get_monitored_cams()
-        if not monitored_cams:
-            self.on_error("Recording unavailable", "Enable at least one recording camera before recording.")
-            return False
-        non_recording_cams = tuple(
-            camera.name for camera in monitored_cams
-            if not camera.is_recording_enabled
+        recording_reach_cams = tuple(
+            camera
+            for camera in self._get_monitored_cams()
+            if camera.is_recording_enabled
         )
-        if non_recording_cams:
+        if not recording_reach_cams:
             self.on_error(
                 "Recording unavailable",
-                "Enable video recording for every enabled reach camera before recording: "
-                + ", ".join(non_recording_cams),
+                "Enable recording for at least one reach camera.",
             )
             return False
         if self._session_recording_status != SessionRecordingStatus.READY:
             logger.warning("start_recording refused while %s", self._session_recording_status.value)
+            return False
+        blockers = tuple(
+            blocker
+            for blocker in self.recording_blockers
+            if blocker != "System Mode is not running"
+        )
+        if blockers:
+            self.on_error(
+                "Recording unavailable",
+                "Required session streams are not ready:\n"
+                + "\n".join(f"- {blocker}" for blocker in blockers),
+            )
             return False
         self._session_analysis_finished = False
         self._session_analysis_started_perf = None
         self._session_analysis_duration_seconds = None
         self._pending_session_end_perf = None
         self._session_boundary = None
+        self._session_hardware_status_at_record = (
+            self._subsystem_status_registry.snapshot()
+        )
         self._abort_had_recording_started = False
         self._set_session_recording_status(SessionRecordingStatus.ARMING)
         project = self._project_info
         if project is None:
             self._set_session_recording_status(SessionRecordingStatus.READY)
             return False
-        self._session_data_recorder.arm(project)
+        self._session_data_recorder.arm(
+            project,
+            source_manifest=self._build_session_source_manifest(),
+        )
         try:
             started = self._behavior.algorithm.start_session(reason="manual_record")
         except Exception as err:
@@ -764,6 +805,68 @@ class AppModel(ObservableObject):
             )
             self._record_start_timer.start()
         return True
+
+    def _build_session_source_manifest(self) -> Tuple[dict, ...]:
+        def runtime_state(subsystem_id) -> str:
+            status = self._subsystem_status_registry.get(subsystem_id)
+            return "unknown" if status is None else status.state.value
+
+        sources = [
+            {
+                "id": f"camera.{camera.name}",
+                "kind": "camera",
+                "binding": (
+                    ""
+                    if camera.camera_source is None
+                    else camera.camera_source.url
+                ),
+                "path": f"video/{camera.name}",
+                "runtimeState": runtime_state(SubsystemId.camera(camera.name)),
+            }
+            for camera in self._get_recording_cams()
+        ]
+        if self._inference.is_enabled:
+            sources.append({
+                "id": "pose",
+                "kind": "pose",
+                "path": "pose",
+                "runtimeState": runtime_state(SubsystemId.LIVE_INFERENCE),
+            })
+        if (
+            self._nidaq_signal_monitor.hardware_enabled
+            and self._nidaq_signal_monitor.configuration.is_enabled
+        ):
+            sources.extend(
+                {
+                    "id": f"nidaq.{channel.name}",
+                    "kind": f"nidaq_{channel.kind}",
+                    "binding": channel.physical_channel,
+                    "path": "streams/nidaq.h5",
+                    "runtimeState": runtime_state(SubsystemId.NIDAQ_STREAM),
+                }
+                for channel in self._nidaq_signal_monitor.configuration.channels
+            )
+        if self._hardware.requires_connection:
+            sources.append({
+                "id": "device",
+                "kind": "decoded_can_and_device_events",
+                "path": "streams/device.csv",
+                "runtimeState": runtime_state(SubsystemId.CAN_PELLET),
+            })
+        if self._laser.configuration.backend != "disabled":
+            sources.append({
+                "id": "laser_outputs",
+                "kind": "laser_commands_and_states",
+                "path": "streams/laser.csv",
+                "runtimeState": runtime_state(SubsystemId.LASER),
+            })
+        sources.append({
+            "id": "session_logs",
+            "kind": "logs",
+            "path": "logs/session.log",
+            "runtimeState": runtime_state(SubsystemId.SESSION_LOGS),
+        })
+        return tuple(sources)
 
     def _record_start_timed_out(self) -> None:
         if self._session_recording_status != SessionRecordingStatus.ARMING:
@@ -957,6 +1060,12 @@ class AppModel(ObservableObject):
         )
         return 0
 
+    def _identify_session_reference_cam_idx(self):
+        for camera in self._ordered_reach_cameras(enabled_only=True):
+            if camera.is_recording_enabled:
+                return camera.camera_index
+        return self._identify_primary_main_cam_idx()
+
     def _ordered_reach_cameras(self, *, enabled_only: bool = False) -> Tuple[VideoCaptureModel, ...]:
         cameras = [
             camera for camera in self._reach_cameras
@@ -1134,7 +1243,13 @@ class AppModel(ObservableObject):
         algo = self._behavior.algorithm
         if cmd == SystemStatusMessageKind.CAMERA_STATUS_CHANGE:
             cam_idx, new_status, *r_args = args
-            if cam_idx == self._identify_primary_main_cam_idx():
+            reference_cam_idx = (
+                self._identify_session_reference_cam_idx()
+                if self._session_recording_status
+                is not SessionRecordingStatus.READY
+                else self._identify_primary_main_cam_idx()
+            )
+            if cam_idx == reference_cam_idx:
                 if new_status == CaptureProcessStatus.RECORDING:
                     first_frame_perf, first_frame_when, first_frame_time, *r_args = r_args
                     p_now = first_frame_perf
@@ -1327,6 +1442,163 @@ class AppModel(ObservableObject):
     @property
     def hardware_scan_results(self) -> Dict[str, HardwareScanEntry]:
         return dict(self._hardware_scan_results)
+
+    @property
+    def subsystem_statuses(self) -> Dict[str, SubsystemStatus]:
+        return dict(self._subsystem_status_registry.statuses)
+
+    @property
+    def recording_blockers(self) -> Tuple[str, ...]:
+        blockers = list(self._subsystem_status_registry.recording_blockers())
+        if self._session_recording_status is not SessionRecordingStatus.READY:
+            blockers.append(
+                f"recording state: {self._session_recording_status.value}"
+            )
+        if not self._acquisition_started:
+            blockers.append("System Mode is not running")
+        return tuple(blockers)
+
+    def _set_subsystem_status(
+        self,
+        subsystem_id,
+        state: SubsystemState,
+        *,
+        reason: str = "",
+        error: str = "",
+        required_for_recording: Optional[bool] = None,
+        generation: Optional[int] = None,
+    ) -> SubsystemStatus:
+        with self._subsystem_status_lock:
+            previous_statuses = self._subsystem_status_registry.statuses
+            status, _ = self._subsystem_status_registry.transition(
+                subsystem_id,
+                state,
+                reason=reason,
+                error=error,
+                required_for_recording=required_for_recording,
+                generation=generation,
+            )
+            current_statuses = self._subsystem_status_registry.statuses
+        self.property_changed(
+            self.Props.SUBSYSTEM_STATUSES,
+            current_statuses,
+            previous_statuses,
+        )
+        self.property_changed(
+            self.Props.RECORDING_BLOCKERS,
+            self.recording_blockers,
+            None,
+        )
+        return status
+
+    def _begin_subsystem_start(
+        self,
+        subsystem_id,
+        *,
+        required_for_recording: Optional[bool] = None,
+        reason: str = "",
+    ) -> int:
+        with self._subsystem_status_lock:
+            previous_statuses = self._subsystem_status_registry.statuses
+            status, _ = self._subsystem_status_registry.begin_retry(
+                subsystem_id,
+                required_for_recording=required_for_recording,
+                reason=reason,
+            )
+            current_statuses = self._subsystem_status_registry.statuses
+        self.property_changed(
+            self.Props.SUBSYSTEM_STATUSES,
+            current_statuses,
+            previous_statuses,
+        )
+        return status.generation
+
+    def _configure_subsystem_intent(
+        self,
+        configuration: SystemConfiguration,
+    ) -> None:
+        enabled_reach = tuple(
+            camera for camera in self._reach_cameras if camera.is_enabled
+        )
+        multi_reach = len(enabled_reach) > 1
+        for camera in self._cameras:
+            required = bool(
+                camera.is_enabled
+                and (
+                    camera.is_recording_enabled
+                    or (camera in self._reach_cameras and multi_reach)
+                )
+            )
+            self._set_subsystem_status(
+                SubsystemId.camera(camera.name),
+                (
+                    SubsystemState.STOPPED
+                    if camera.is_enabled
+                    else SubsystemState.DISABLED
+                ),
+                reason=(
+                    "configured; not started"
+                    if camera.is_enabled
+                    else "camera disabled"
+                ),
+                required_for_recording=required,
+            )
+        self._set_subsystem_status(
+            SubsystemId.REACH_SYNCHRONIZATION,
+            (
+                SubsystemState.STOPPED
+                if enabled_reach
+                else SubsystemState.DISABLED
+            ),
+            reason="configured; not validated" if enabled_reach else "no reach cameras",
+            required_for_recording=bool(
+                multi_reach
+                or any(camera.is_recording_enabled for camera in enabled_reach)
+            ),
+        )
+        intent = (
+            (
+                SubsystemId.LIVE_INFERENCE,
+                configuration.inference.is_enabled,
+                configuration.inference.is_enabled,
+            ),
+            (
+                SubsystemId.CAN_PELLET,
+                self._hardware.requires_connection,
+                self._hardware.requires_connection,
+            ),
+            (
+                SubsystemId.NIDAQ_STREAM,
+                configuration.hardware.nidaq_enabled
+                and configuration.nidaq_stream.is_enabled,
+                configuration.hardware.nidaq_enabled
+                and configuration.nidaq_stream.is_enabled,
+            ),
+            (
+                SubsystemId.LASER,
+                configuration.laser.backend != "disabled",
+                configuration.laser.backend != "disabled",
+            ),
+        )
+        for subsystem_id, enabled, required in intent:
+            self._set_subsystem_status(
+                subsystem_id,
+                SubsystemState.STOPPED if enabled else SubsystemState.DISABLED,
+                reason="configured; not started" if enabled else "disabled",
+                required_for_recording=required,
+            )
+        self._set_subsystem_status(
+            SubsystemId.SESSION_LOGS,
+            SubsystemState.STOPPED,
+            reason="not validated",
+            required_for_recording=True,
+        )
+        self._set_subsystem_status(
+            SubsystemId.OFFLINE_ANALYSIS,
+            SubsystemState.DISABLED,
+            reason="no stopped session pending",
+            required_for_recording=False,
+        )
 
     @property
     def configured_nidaq_device_names(self) -> Tuple[str, ...]:
@@ -1894,9 +2166,11 @@ class AppModel(ObservableObject):
         return animal
 
     def make_project_info(self) -> ProjectInfo:
-        camera_names = tuple(camera.name for camera in self._reach_cameras if camera.is_enabled)
-        if len(camera_names) == 0:
-            camera_names = tuple(camera.name for camera in self._reach_cameras[:2])
+        camera_names = tuple(
+            camera.name
+            for camera in self._reach_cameras
+            if camera.is_enabled and camera.is_recording_enabled
+        )
         left = camera_names[0] if len(camera_names) > 0 else ""
         right = camera_names[1] if len(camera_names) > 1 else ""
         return ProjectInfo(
@@ -2616,6 +2890,7 @@ class AppModel(ObservableObject):
 
         # only at the end:
         self.output_location = configuration.persistence.output_location
+        self._configure_subsystem_intent(configuration)
 
         self.reload_training_plans(reraise_on_error=True)
 
@@ -3344,6 +3619,22 @@ class AppModel(ObservableObject):
             },
             "recordingStatus": self._session_recording_status.value,
             "analysisDurationSeconds": self._session_analysis_duration_seconds,
+            "hardwareConfigured": {
+                "canEnabled": self._hardware.can_enabled,
+                "pelletControllerEnabled": self._hardware.pellet_controller_enabled,
+                "nidaqEnabled": self._hardware.nidaq_enabled,
+                "laserBackend": self._laser.configuration.backend,
+                "liveInferenceEnabled": self._inference.is_enabled,
+                "cameras": {
+                    camera.name: {
+                        "previewEnabled": camera.is_enabled,
+                        "recordEnabled": camera.is_recording_enabled,
+                    }
+                    for camera in self._cameras
+                },
+            },
+            "hardwareRuntime": self._subsystem_status_registry.snapshot(),
+            "hardwareRuntimeAtRecord": self._session_hardware_status_at_record,
             "configuration": None,
         }
 
