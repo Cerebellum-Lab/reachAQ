@@ -13,7 +13,6 @@ from autotrainer.core import (
     Offset3DTuple,
 )
 from autotrainer.core.configuration.device_comm_alarm_config import DeviceCommAlarmConfig
-from autotrainer.core.configuration.load_cell_config import LoadCellConfiguration
 from autotrainer.core.configuration.audio_thrash_config import AudioSpectrumThrashMonitorConfig
 from autotrainer.core.configuration import (
     SystemConfigurationDumper,
@@ -125,27 +124,7 @@ v0_expected_result_config = {
             "auto_clamp_release_load_count": HeadClampConfiguration.auto_clamp_release_load_count,
             "before_reengage_delay": HeadClampConfiguration.before_reengage_delay,
         },
-        "load_cell": {
-            "weight_active_threshold": 10,
-            "weight_inactive_threshold": 2,
-            "threshold_duration": 0.2,
-            "min_event_duration": 4.0,
-            "min_post_event_hold_duration": 3.0,
-            "thrashing_var_weight_threshold_min": 20,
-            "thrashing_var_weight_threshold_max": 30,
-            "thrashing_var_min_delay": 0.05,
-            "thrashing_var_max_delay": 0.2,
-            "thrashing_min_ptp_change_count": 3,
-            "weight_min_filter": LoadCellConfiguration.weight_min_filter,
-            "weight_max_filter": LoadCellConfiguration.weight_max_filter,
-        },
         "headbar_pressure": {"threshold": 10, "duration": 1.5},
-        "auto_tare": {
-            "threshold": 1.1,
-            "range_threshold": 1.75,
-            "duration": 1.0,
-            "sample_rate": 100,
-        },
     },
     "persistence": {"output_location": "/home/autotrainer/output"},
 }
@@ -195,21 +174,7 @@ def test_load_version_1():
     path = fixtures_path.joinpath("v1_config.yaml")
     with path.open() as fh:
         config = SystemConfiguration.load_yaml(fh)
-    exp_load_cell = copy.deepcopy(v0_expected_result_config['behavior']['load_cell'])
-    exp_load_cell.update({
-        'min_event_duration': 3.0,
-            'min_post_event_hold_duration': 6.0,
-            'thrashing_min_ptp_change_count': 3,
-            'thrashing_var_max_delay': 0.2,
-            'thrashing_var_min_delay': 0.05,
-            'thrashing_var_weight_threshold_max': 30,
-            'thrashing_var_weight_threshold_min': 20,
-            'threshold_duration': 0.25,
-            'weight_active_threshold': 15.0,
-            'weight_inactive_threshold': 2,
-    })
     expected_behavior = copy.deepcopy(behavior_default_config_dict)
-    expected_behavior["load_cell"] = exp_load_cell
     expected_behavior["pellet_delivery"].update({
                 'is_enabled': False,
                 'is_intersession_analysis_enabled': True,

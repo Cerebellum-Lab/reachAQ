@@ -9,7 +9,7 @@ pytestmark = pytest.mark.canbus
 
 from autotrainer.device import (CanInterface, Target, Motor, Heartbeat, ServoConfig, StepperConfig,
                                 DigitalOutputs, PelletDigitalInputs, Tone,
-                                AnalogOutputs, AnalogOutput, LoadCellReading,
+                                AnalogOutputs, AnalogOutput,
                                 ColorLed, AudioData, DoorData, ServoStatus, StepperStatus,
                                 SensorStatus, target_of_motor, is_servo)
 
@@ -198,13 +198,6 @@ def test_analog_out(interface: CanInterface, value_mv: int):
 
     aout = _get_response(interface, AnalogOutput, Target.PELLET_DEVICE, sleep=1.0)
     assert aout.status_out_mv == value_mv, f"Failed to set analog output"
-
-
-def test_tare_load_cell(interface: CanInterface):
-    assert interface.tare_load_cell();
-
-    loadcell = _get_response(interface, LoadCellReading, Target.MAGNET_DEVICE, sleep=2.0)
-    assert abs(loadcell.load) <= 0.1, f"Failed to tare load cell"
 
 
 @pytest.mark.parametrize("red, green, blue", [

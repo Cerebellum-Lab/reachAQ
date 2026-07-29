@@ -16,7 +16,6 @@ from autotrainer.device import (
     CanDevice,
     DeviceApi,
     Target,
-    LoadCellReading,
     PressureReading,
     SensorStatus,
     MagnetDigitalInputs,
@@ -310,7 +309,6 @@ def device(expected_tok_event, expected_tok, tokens_acked) -> CanDevice:  # noqa
 
 @pytest.mark.parametrize("kind, tag, data", [
     (SystemCommandKind.REQUEST_VERSION, 101, None),
-    (SystemCommandKind.UPDATE_SCALE_TARE, 102, None),
     (SystemCommandKind.SET_X, 103, 10),
     (SystemCommandKind.SET_Y, 104, 15),
     (SystemCommandKind.SET_Z, 105, 20),
@@ -339,7 +337,6 @@ def test_notify_command(device, kind, tag, data):
 
 
 @pytest.mark.parametrize("data, kind", [
-    (LoadCellReading(target=Target.MAGNET_DEVICE, load=13), None),
     (PressureReading(Target.MAGNET_DEVICE, pressure=14), None),
     (SensorStatus(Target.PELLET_DEVICE, temperature_c=27.3, humidity_percent=64.2), None),
     (MagnetDigitalInputs(Target.MAGNET_DEVICE, continuity_0=False, continuity_1=True), None),
