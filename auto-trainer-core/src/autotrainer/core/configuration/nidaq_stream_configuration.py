@@ -40,7 +40,7 @@ class NidaqSignalChannelConfiguration:
 
 @dataclasses.dataclass(frozen=True)
 class NidaqSignalStreamConfiguration:
-    """Continuous NI-DAQ input stream shown in the acquisition Analysis panel."""
+    """Continuous NI-DAQ acquisition stream and independent display selection."""
 
     channels: Tuple[NidaqSignalChannelConfiguration, ...] = tuple()
     is_enabled: bool = False
@@ -51,10 +51,19 @@ class NidaqSignalStreamConfiguration:
     # load. The analysis stream is visualization-only and they are ignored.
     record_to_acquisition: bool = False
     output_name: str = "nidaq_signals"
+    # None identifies legacy configuration and adopts all acquisition channels as
+    # the initial display selection. An empty tuple intentionally plots nothing.
+    display_channels: Optional[Tuple[str, ...]] = None
 
     def __post_init__(self):
         channels = tuple(self.channels)
         object.__setattr__(self, "channels", channels)
+        display_channels = self.display_channels
+        if display_channels is None:
+            display_channels = tuple(channel.name for channel in channels)
+        else:
+            display_channels = tuple(display_channels)
+        object.__setattr__(self, "display_channels", display_channels)
         if self.sample_rate_hz <= 0:
             raise ValueError("NI-DAQ stream sample_rate_hz must be positive")
         if self.read_chunk_size <= 0:
@@ -66,6 +75,12 @@ class NidaqSignalStreamConfiguration:
         names = tuple(channel.name for channel in channels)
         if len(set(names)) != len(names):
             raise ValueError("NI-DAQ stream channel names must be unique")
+        unknown_display_channels = sorted(set(display_channels) - set(names))
+        if unknown_display_channels:
+            raise ValueError(
+                "NI-DAQ display channels are not present in the acquisition plan: "
+                + ", ".join(unknown_display_channels)
+            )
         if not self.output_name:
             raise ValueError("NI-DAQ stream output_name must be provided")
 
@@ -80,6 +95,7 @@ class NidaqSignalStreamConfiguration:
         rolling_window_seconds: float = 10.0,
         record_to_acquisition: bool = False,
         output_name: str = "nidaq_signals",
+        display_channels: Optional[Iterable[str]] = None,
     ) -> "NidaqSignalStreamConfiguration":
         return cls(
             tuple(channels),
@@ -89,6 +105,9 @@ class NidaqSignalStreamConfiguration:
             rolling_window_seconds=rolling_window_seconds,
             record_to_acquisition=record_to_acquisition,
             output_name=output_name,
+            display_channels=(
+                None if display_channels is None else tuple(display_channels)
+            ),
         )
 
     @property

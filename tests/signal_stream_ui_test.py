@@ -32,6 +32,9 @@ from tools.acquisition.model.nidaq_signal_monitor_model import (  # noqa: E402
     NidaqSignalMonitorModel,
 )
 from tools.acquisition.model.nidaq_sample_ring import SharedNidaqSampleRing  # noqa: E402
+from tools.acquisition.model.nidaq_channel_plan import (  # noqa: E402
+    build_nidaq_acquisition_configuration,
+)
 from tools.acquisition.view.analysis_content import AnalysisContent  # noqa: E402
 from tools.acquisition.view.laser_control_content import (  # noqa: E402
     LaserControlContent,
@@ -61,10 +64,18 @@ class _AnalysisAppStub(ObservableObject):
         self.laser.set_configuration_offline(
             LaserSystemConfiguration.from_channels((_laser_channel(),), backend="disabled")
         )
+        monitor._configuration = build_nidaq_acquisition_configuration(
+            monitor.configuration,
+            self.nidaq_ports,
+            self.laser.configuration,
+        )
         self.signal_configuration_save_count = 0
 
     def update_nidaq_signal_stream_channels(self, channels):
-        self.nidaq_signal_monitor.set_stream_channels(channels)
+        self.nidaq_signal_monitor.set_display_channels(
+            channel.name if hasattr(channel, "name") else channel
+            for channel in channels
+        )
         self.signal_configuration_save_count += 1
 
 
@@ -73,10 +84,18 @@ class _LaserAppStub:
         self.laser = laser
         self.nidaq_signal_monitor = NidaqSignalMonitorModel()
         self.nidaq_signal_monitor._hardware_enabled = True
+        self.nidaq_signal_monitor._configuration = build_nidaq_acquisition_configuration(
+            self.nidaq_signal_monitor.configuration,
+            NidaqPortConfiguration(),
+            laser.configuration,
+        )
         self.signal_configuration_save_count = 0
 
     def update_nidaq_signal_stream_channels(self, channels):
-        self.nidaq_signal_monitor.set_stream_channels(channels)
+        self.nidaq_signal_monitor.set_display_channels(
+            channel.name if hasattr(channel, "name") else channel
+            for channel in channels
+        )
         self.signal_configuration_save_count += 1
 
 
@@ -445,26 +464,28 @@ def test_analysis_signal_selection_requires_mapped_port_and_nidaq_enable(qapp):
 
         content._signal_checkboxes["cam_frames"].setChecked(False)
         qapp.processEvents()
-        assert monitor.configuration.channels == tuple()
+        assert monitor.configuration.display_channels == tuple()
+        assert tuple(channel.name for channel in monitor.configuration.channels) == (
+            "cam_frames",
+            "tone1",
+            "tone2",
+        )
         assert not content._start_stop_button.isEnabled()
         assert not content._live_button.isEnabled()
         assert app_model.signal_configuration_save_count == 3
 
         content._signal_checkboxes["tone1"].setChecked(True)
         qapp.processEvents()
-        assert content._signal_checkboxes["tone1"].property("signalColor") == "#1769e0"
+        assert content._signal_checkboxes["tone1"].property("signalColor") == "#128a43"
         assert content._rolling_plot._legend.entries == (
-            ("tone1 (logic)", (23, 105, 224), False),
+            ("tone1 (logic)", (18, 138, 67), False),
         )
         content._signal_checkboxes["tone1"].setChecked(False)
         qapp.processEvents()
 
         content._signal_checkboxes["cam_frames"].setChecked(True)
         qapp.processEvents()
-        assert tuple(
-            channel.physical_channel
-            for channel in monitor.configuration.channels
-        ) == ("Dev1/port0/line0",)
+        assert monitor.configuration.display_channels == ("cam_frames",)
         assert content._start_stop_button.isEnabled()
         assert app_model.signal_configuration_save_count == 6
 
@@ -733,6 +754,7 @@ def test_signal_monitor_times_out_hung_runtime_without_blocking_caller():
 
 def test_app_model_persists_analysis_signal_selection_to_loaded_configuration():
     monitor = NidaqSignalMonitorModel()
+    monitor._configuration = _stream_configuration()
     app_model = object.__new__(AppModel)
     app_model._nidaq_signal_monitor = monitor
     app_model._loaded_configuration = SimpleNamespace(nidaq_stream=None)
@@ -740,10 +762,11 @@ def test_app_model_persists_analysis_signal_selection_to_loaded_configuration():
     app_model.save_configuration = lambda: save_calls.append(True)
 
     channels = _stream_configuration().channels
-    app_model.update_nidaq_signal_stream_channels(channels)
+    app_model.update_nidaq_signal_stream_channels(())
 
     assert monitor.configuration.channels == channels
     assert monitor.configuration.is_enabled
+    assert monitor.configuration.display_channels == ()
     assert app_model._loaded_configuration.nidaq_stream == monitor.configuration
     assert save_calls == [True]
 
@@ -944,20 +967,22 @@ def test_laser_tab_owns_and_persists_its_input_stream_options(qapp):
 
         diode.setChecked(True)
         qapp.processEvents()
-        assert tuple(
+        monitor_configuration = app_model.nidaq_signal_monitor.configuration
+        assert ("laser1_diode", "Dev1/ai0") in tuple(
             (stream_channel.name, stream_channel.physical_channel)
-            for stream_channel in app_model.nidaq_signal_monitor.configuration.channels
-        ) == (("laser1_diode", "Dev1/ai0"),)
+            for stream_channel in monitor_configuration.channels
+        )
+        assert monitor_configuration.display_channels == ("laser1_diode",)
         assert app_model.signal_configuration_save_count == 1
         assert tab._trace_daq_button.isEnabled()
         assert tab._trace_daq_button.text() == "Start DAQ Inputs"
 
         command_copy.setChecked(True)
         qapp.processEvents()
-        assert tuple(
-            stream_channel.name
-            for stream_channel in app_model.nidaq_signal_monitor.configuration.channels
-        ) == ("laser1_diode", "laser1_command_copy")
+        assert app_model.nidaq_signal_monitor.configuration.display_channels == (
+            "laser1_diode",
+            "laser1_command_copy",
+        )
         assert app_model.signal_configuration_save_count == 2
     finally:
         app_model.nidaq_signal_monitor.close()

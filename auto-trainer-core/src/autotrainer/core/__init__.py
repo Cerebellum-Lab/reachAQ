@@ -304,7 +304,7 @@ from .perf_monitor import PerfMonitor
 from .queue_util import clear_queue
 from .notification import NotificationCenter, Notification, TriggerNotification, post_trigger_enable
 from .configuration import HardwareConfiguration, InferenceConfiguration, LaserChannelConfiguration, LaserChannelId, \
-    LaserSystemConfiguration, NidaqPortConfiguration, NidaqSignalChannelConfiguration, NidaqSignalStreamConfiguration, \
+    LaserSystemConfiguration, NidaqDeviceIdentity, NidaqPortConfiguration, NidaqTimingConfiguration, NidaqSignalChannelConfiguration, NidaqSignalStreamConfiguration, \
     PersistenceConfiguration, normalize_laser_channel_id
 
 from .message import MotorConfigurations, Motor

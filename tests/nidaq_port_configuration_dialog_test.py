@@ -38,7 +38,6 @@ def _set_device(dialog, device_name):
 def test_selected_daq_channel_is_removed_from_other_roles(qapp):
     device = NidaqDevicePorts(
         name="Dev1",
-        digital_outputs=("Dev1/port0/line0", "Dev1/port0/line1"),
         digital_inputs=("Dev1/port0/line0", "Dev1/port0/line1"),
     )
     dialog = NidaqPortConfigurationDialog(SystemConfiguration(), devices=(device,))
@@ -82,7 +81,7 @@ def test_duplicate_daq_channel_assignments_are_rejected(qapp):
     )
     device = NidaqDevicePorts(
         name="Dev1",
-        digital_outputs=("Dev1/port0/line0", "Dev1/port0/line1"),
+        digital_inputs=("Dev1/port0/line0", "Dev1/port0/line1"),
     )
     dialog = NidaqPortConfigurationDialog(config, devices=(device,))
 

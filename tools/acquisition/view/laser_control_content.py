@@ -521,9 +521,10 @@ class _LaserChannelTab(QWidget):
             channel.name: channel
             for channel in monitor.configuration.channels
         }
+        displayed_names = set(monitor.configuration.display_channels)
         for key, checkbox in self._trace_signal_checkboxes.items():
             candidate = self._trace_signal_candidates[key]
-            selected = candidate is not None and candidate.name in configured_by_name
+            selected = candidate is not None and candidate.name in displayed_names
             checkbox.blockSignals(True)
             checkbox.setChecked(selected)
             checkbox.blockSignals(False)
@@ -575,15 +576,15 @@ class _LaserChannelTab(QWidget):
         candidate = self._trace_signal_candidates.get(signal_key)
         if candidate is None:
             return
-        channels = [
-            channel
-            for channel in self._app_model.nidaq_signal_monitor.configuration.channels
-            if channel.name != candidate.name
-            and channel.physical_channel != candidate.physical_channel
+        configuration = self._app_model.nidaq_signal_monitor.configuration
+        channel_names = [
+            name
+            for name in configuration.display_channels
+            if name != candidate.name
         ]
         if checked:
-            channels.append(candidate)
-        self._app_model.update_nidaq_signal_stream_channels(channels)
+            channel_names.append(candidate.name)
+        self._app_model.update_nidaq_signal_stream_channels(channel_names)
         self.refresh_signal_selections()
 
     def _toggle_daq_input_stream(self) -> None:

@@ -25,6 +25,7 @@ from autotrainer.core.multiproc import get_mp_ctx
 from autotrainer.core.project import ProjectDependentProtocol
 from autotrainer.device import NidaqSignalStreamController
 from tools.acquisition.model.nidaq_sample_ring import SharedNidaqSampleRing
+from tools.acquisition.model.nidaq_channel_plan import with_display_channels
 
 
 logger = get_verbose_logger(__name__)
@@ -284,6 +285,14 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
             self._set_status("NI-DAQ signal stream has no selected signals")
         else:
             self._set_status("NI-DAQ signal stream stopped")
+
+    def set_display_channels(self, channel_names: Iterable[str]) -> None:
+        previous = self._configuration
+        configuration = with_display_channels(previous, channel_names)
+        if configuration == previous:
+            return
+        self._configuration = configuration
+        self._on_property_changed(self.CONFIGURATION, configuration, previous)
 
     def start(self) -> bool:
         with self._lock:

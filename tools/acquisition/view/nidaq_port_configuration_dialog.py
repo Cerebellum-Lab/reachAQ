@@ -33,10 +33,10 @@ from tools.acquisition.model.nidaq_discovery import (
 
 
 _GENERAL_ROLES: Tuple[Tuple[str, str, str], ...] = (
-    ("tone1", "tone1", "do"),
-    ("tone2", "tone2", "do"),
-    ("tone3_r", "tone3R", "do"),
-    ("tone3_l", "tone3L", "do"),
+    ("tone1", "tone1 confirmation", "di"),
+    ("tone2", "tone2 confirmation", "di"),
+    ("tone3_r", "tone3R confirmation", "di"),
+    ("tone3_l", "tone3L confirmation", "di"),
     ("cam_frames", "cam_frames", "di"),
     ("barcode", "barcode", "di"),
 )
@@ -322,7 +322,11 @@ class NidaqPortConfigurationDialog(QDialog):
             attr_name: self._combo_selections[combo]
             for attr_name, combo in self._general_combos.items()
         }
-        return NidaqPortConfiguration(device_name=device_name, **values)
+        return NidaqPortConfiguration(
+            device_name=device_name,
+            timing=self._configuration.nidaq_ports.timing,
+            **values,
+        )
 
     def _build_laser_configuration(self) -> LaserSystemConfiguration:
         existing = {

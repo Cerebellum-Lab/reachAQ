@@ -428,8 +428,8 @@ class AnalysisContent(ContentWidget):
         }
 
         explanation = QLabel(
-            "Choose the DAQ-port signals acquired and plotted by the shared NI-DAQ stream. "
-            "Unmapped signals remain disabled until assigned in Edit → Edit DAQ Ports."
+            "Choose which acquired DAQ signals are plotted. Every mapped input is "
+            "always acquired and recorded, whether or not it is selected here."
         )
         explanation.setWordWrap(True)
         self._signal_layout.addWidget(explanation)
@@ -473,10 +473,7 @@ class AnalysisContent(ContentWidget):
             ):
                 candidates.append((f"custom:{channel.name}", channel.name, channel))
 
-        selected_physical_channels = {
-            channel.physical_channel
-            for channel in configuration.channels
-        }
+        selected_channel_names = set(configuration.display_channels)
         selected_colors = {
             channel.physical_channel: stream_signal_color(index)
             for index, channel in enumerate(
@@ -490,7 +487,7 @@ class AnalysisContent(ContentWidget):
             physical_channel = None if channel is None else channel.physical_channel
             color = selected_colors.get(physical_channel, stream_signal_color(color_index))
             is_mapped = physical_channel in mapped_channels if physical_channel else False
-            is_selected = physical_channel in selected_physical_channels if physical_channel else False
+            is_selected = channel.name in selected_channel_names if channel is not None else False
             channel_text = physical_channel or "not configured"
             checkbox = QCheckBox(f"{label} — {channel_text}")
             color_code_checkbox(checkbox, color)
@@ -529,23 +526,18 @@ class AnalysisContent(ContentWidget):
         candidate = self._signal_candidates.get(candidate_key)
         if candidate is None:
             return
-        channels = list(self._nidaq_signal_monitor.configuration.channels)
+        configuration = self._nidaq_signal_monitor.configuration
+        selected_names = list(configuration.display_channels)
         if checked:
-            channels = [
-                channel
-                for channel in channels
-                if channel.name != candidate.name
-                and channel.physical_channel != candidate.physical_channel
+            selected_names = [
+                name for name in selected_names if name != candidate.name
             ]
-            channels.append(candidate)
+            selected_names.append(candidate.name)
         else:
-            channels = [
-                channel
-                for channel in channels
-                if channel.name != candidate.name
-                and channel.physical_channel != candidate.physical_channel
+            selected_names = [
+                name for name in selected_names if name != candidate.name
             ]
-        self._app_model.update_nidaq_signal_stream_channels(channels)
+        self._app_model.update_nidaq_signal_stream_channels(selected_names)
 
     def _display_configuration(self) -> NidaqSignalStreamConfiguration:
         configuration = self._nidaq_signal_monitor.configuration
@@ -555,10 +547,12 @@ class AnalysisContent(ContentWidget):
             for channel in configuration.channels
             if channel.physical_channel in mapped_channels
             and not self._is_laser_stream_channel(channel)
+            and channel.name in configuration.display_channels
         )
         return dataclasses.replace(
             configuration,
             channels=channels,
+            display_channels=tuple(channel.name for channel in channels),
             is_enabled=configuration.is_enabled and bool(channels),
         )
 
@@ -566,7 +560,7 @@ class AnalysisContent(ContentWidget):
         mapped = set()
         ports = self._app_model.nidaq_ports
         for field in dataclasses.fields(ports):
-            if field.name == "device_name":
+            if field.name in {"device_name", "timing"}:
                 continue
             value = getattr(ports, field.name)
             if value:

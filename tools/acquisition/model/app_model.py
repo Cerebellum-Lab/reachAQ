@@ -105,6 +105,7 @@ from tools.acquisition.model.laser_model import LaserModel
 from autotrainer.device import CanTransportConfiguration
 from tools.acquisition.model.hardware_scan import HardwareScanEntry, scan_can_adapters, scan_gpus
 from tools.acquisition.model.nidaq_discovery import device_name_from_channel, discover_nidaq_devices
+from tools.acquisition.model.nidaq_channel_plan import build_nidaq_acquisition_configuration
 from tools.acquisition.model.nidaq_signal_monitor_model import NidaqSignalMonitorModel
 from tools.acquisition.model.session_data_recorder import SessionDataRecorder
 from tools.acquisition.model.behavior_model import BehaviorModel
@@ -1317,7 +1318,9 @@ class AppModel(ObservableObject):
             names.append(self._nidaq_ports.device_name)
         for field in dataclasses.fields(self._nidaq_ports):
             if field.name != "device_name":
-                add_channel(getattr(self._nidaq_ports, field.name))
+                value = getattr(self._nidaq_ports, field.name)
+                if isinstance(value, str):
+                    add_channel(value)
         for channel in self._nidaq_signal_monitor.configuration.channels:
             add_channel(channel.physical_channel)
         for channel in self._laser.configuration.channels:
@@ -2560,7 +2563,13 @@ class AppModel(ObservableObject):
             configuration.hardware.nidaq_enabled,
             auto_start=False,
         )
-        self.nidaq_signal_monitor.load_configuration(configuration.nidaq_stream)
+        nidaq_acquisition = build_nidaq_acquisition_configuration(
+            configuration.nidaq_stream,
+            configuration.nidaq_ports,
+            configuration.laser,
+        )
+        configuration.nidaq_stream = nidaq_acquisition
+        self.nidaq_signal_monitor.load_configuration(nidaq_acquisition)
         self.behavior.load_configuration(configuration.behavior)
 
         self._analysis.watchdog_monitor.config = configuration.watchdog
@@ -2639,14 +2648,25 @@ class AppModel(ObservableObject):
         self._laser.set_configuration_offline(laser_configuration)
         self._loaded_configuration.nidaq_ports = nidaq_ports
         self._loaded_configuration.laser = laser_configuration
+        acquisition = build_nidaq_acquisition_configuration(
+            self._nidaq_signal_monitor.configuration,
+            nidaq_ports,
+            laser_configuration,
+        )
+        self._nidaq_signal_monitor.load_configuration(acquisition)
+        self._loaded_configuration.nidaq_stream = acquisition
         self.configuration_loaded_event(self._loaded_configuration)
         self.save_configuration()
 
     def update_nidaq_signal_stream_channels(self, channels) -> None:
-        """Apply and immediately persist the Analysis panel signal selection."""
+        """Apply and persist plot selection without changing DAQ acquisition."""
         if self._loaded_configuration is None:
             raise RuntimeError("Cannot update NI-DAQ stream channels before a system configuration is loaded")
-        self._nidaq_signal_monitor.set_stream_channels(channels)
+        channel_names = tuple(
+            channel.name if hasattr(channel, "name") else str(channel)
+            for channel in channels
+        )
+        self._nidaq_signal_monitor.set_display_channels(channel_names)
         self._loaded_configuration.nidaq_stream = self._nidaq_signal_monitor.save_configuration()
         self.save_configuration()
 

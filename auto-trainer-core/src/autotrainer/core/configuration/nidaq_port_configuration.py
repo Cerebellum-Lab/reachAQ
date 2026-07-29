@@ -1,10 +1,64 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import Optional
+from typing import ClassVar, Optional
 
 from autotrainer.core import make_camelize_representer, make_decamelize_constructor
 from autotrainer.core.configuration import SystemConfigurationDumper, SystemConfigurationLoader
+
+
+@dataclasses.dataclass(frozen=True)
+class NidaqDeviceIdentity:
+    """Portable identity for one configured NI-DAQ timing role."""
+
+    logical_name: str
+    runtime_name: Optional[str] = None
+    product_type: Optional[str] = None
+    serial_number: Optional[int] = None
+
+    def __post_init__(self):
+        if not self.logical_name.strip():
+            raise ValueError("NI-DAQ logical device name must be provided")
+        for name in ("logical_name", "runtime_name", "product_type"):
+            value = getattr(self, name)
+            if isinstance(value, str):
+                object.__setattr__(self, name, value.strip() or None)
+
+
+@dataclasses.dataclass(frozen=True)
+class NidaqTimingConfiguration:
+    """Requested timing policy; resolved physical routes are runtime metadata."""
+
+    VALID_SYNC_MODES: ClassVar[tuple[str, ...]] = (
+        "auto",
+        "backplane",
+        "external",
+        "independent",
+    )
+
+    sync_mode: str = "auto"
+    timing_master: Optional[NidaqDeviceIdentity] = None
+    require_hardware_synchronization: bool = True
+    reference_clock_source: Optional[str] = None
+    start_trigger_source: Optional[str] = None
+    sample_clock_source: Optional[str] = None
+
+    def __post_init__(self):
+        sync_mode = self.sync_mode.strip().lower()
+        if sync_mode not in self.VALID_SYNC_MODES:
+            raise ValueError(
+                "NI-DAQ sync_mode must be one of: "
+                + ", ".join(self.VALID_SYNC_MODES)
+            )
+        object.__setattr__(self, "sync_mode", sync_mode)
+        for name in (
+            "reference_clock_source",
+            "start_trigger_source",
+            "sample_clock_source",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, str):
+                object.__setattr__(self, name, value.strip() or None)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -18,6 +72,9 @@ class NidaqPortConfiguration:
     tone3_l: Optional[str] = None
     cam_frames: Optional[str] = None
     barcode: Optional[str] = None
+    timing: NidaqTimingConfiguration = dataclasses.field(
+        default_factory=NidaqTimingConfiguration,
+    )
 
     def __post_init__(self):
         for field in dataclasses.fields(self):
@@ -27,11 +84,16 @@ class NidaqPortConfiguration:
                 object.__setattr__(self, field.name, value)
 
 
-SystemConfigurationDumper.add_representer(
-    NidaqPortConfiguration,
-    make_camelize_representer("!NidaqPortConfiguration"),
-)
-SystemConfigurationLoader.add_constructor(
-    "!NidaqPortConfiguration",
-    make_decamelize_constructor(NidaqPortConfiguration),
-)
+for _tag, _cls in (
+    ("NidaqDeviceIdentity", NidaqDeviceIdentity),
+    ("NidaqTimingConfiguration", NidaqTimingConfiguration),
+    ("NidaqPortConfiguration", NidaqPortConfiguration),
+):
+    SystemConfigurationDumper.add_representer(
+        _cls,
+        make_camelize_representer(f"!{_tag}"),
+    )
+    SystemConfigurationLoader.add_constructor(
+        f"!{_tag}",
+        make_decamelize_constructor(_cls),
+    )
