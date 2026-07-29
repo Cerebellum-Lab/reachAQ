@@ -48,7 +48,6 @@ def test_cover_or_release_pellet_on_load_pellet(mock_system, machine, cover_enab
     assert algo.session_pellet_loaded_count == 0
     mock_system.mock_pellet_ack()  # ack the load
     assert algo.session_pellet_loaded_count == 1  # here it is !
-    # mock_system.make_load_cell_active()
     mock_system.start_session_in_tunnel(set_recording_status=True)
     assert algo.session_pellet_loaded_count == 0  # back to 0 given new session/trial
     mock_system.mock_pose_response(pellet_seen=True)
@@ -135,7 +134,6 @@ def test_send_pellet_after_load_when_triangle_not_seen(mock_system, machine, cov
 
 def test_uncover_when_record_aged_enough_with_no_pellet_hand_uncover_distance(mock_system, machine):
     pellet_m = machine.pellet
-    load_cell = machine._analysis.load_cell_monitor
     algo = machine.algorithm
     algo.pellet_cover_enabled = True
     uncov_cfg = algo.active_config.pellet_uncover
@@ -149,7 +147,7 @@ def test_uncover_when_record_aged_enough_with_no_pellet_hand_uncover_distance(mo
     assert pellet_m.state == PelletState.monitoring
     assert not algo.is_in_session
 
-    load_cell.is_engaged = True
+    algo.start_session(reason="manual")
     assert algo.is_in_session
     assert mock_system.pellet_state_trans == []
 
@@ -180,11 +178,10 @@ def test_uncover_when_hands_near_pellet_after_recording_aged_enough(mock_system,
     uncov_cfg = algo.active_config.pellet_uncover
     uncov_cfg.min_y_dcs = 5
     uncov_cfg.trigger_delay = 2.5
-    load_cell = machine._analysis.load_cell_monitor
     algo.update_pellet_seen(True)
     algo.update_triangle_seen(True)
     pellet_m._covered_state = True  # fake already covered to simplify test
-    load_cell.is_engaged = True
+    algo.start_session(reason="manual")
     assert algo.is_in_session
     #
     mock_system.make_recording_aged_enough()

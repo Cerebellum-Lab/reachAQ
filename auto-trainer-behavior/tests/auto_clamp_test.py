@@ -50,7 +50,7 @@ class _AutoClampTestCase(MockSystemMachine):
             assert machine.intersession.state == IntersessionState.idle
             with caplog.at_level(logging.INFO):
                 self.headbar_pressure.is_engaged = True
-            machine.exit_tunnel()
+            self.exit_tunnel()
             assert machine.state == SystemState.intersession
             assert machine.intersession.state == IntersessionState.segmentation
 
@@ -94,7 +94,6 @@ class TestEnabled(_AutoClampTestCase):
         self.algo.head_fixation_enabled = True
         self.algo.head_clamp_config.prerelease_duration = 0  # this disables the prerelease
         self.algo.auto_clamp_release_tone_delay = 0  # this skip an extra timer overhead
-        machine._delay_timer_consider_end_session = 0  # TODO: use some config
 
     def test_when_not_in_session(self, machine, caplog):
         algo = machine.algorithm
@@ -103,7 +102,7 @@ class TestEnabled(_AutoClampTestCase):
         assert algo.system_state != SystemState.tunnel
         with caplog.at_level(logging.INFO):
             pressure_monitor.is_engaged = True
-        assert "auto-clamp: load-cell not engaged (no action taken)" in caplog.text
+        assert "auto-clamp: algo not in-session (no action taken)" in caplog.text
 
     def test_when_intersession_with_exit_tunnel(self, machine, caplog):
         super().test_when_intersession_with_exit_tunnel(machine, caplog)  # same
@@ -193,7 +192,7 @@ class TestEnabled(_AutoClampTestCase):
         self.start_session_in_tunnel()
         assert machine.state == SystemState.tunnel
         assert self.update_magnet_mock.call_args_list == []
-        machine.exit_tunnel()
+        self.exit_tunnel()
         assert machine.state == SystemState.cage
         assert self.update_magnet_mock.call_args_list == []
         assert self.pellet_dev.play_tone.call_args_list == []
@@ -281,14 +280,12 @@ class TestEnabled(_AutoClampTestCase):
     def test_not_trigger_when_in_intersession(self, caplog):
         algo = self.algo
         algo.intersession_enabled = True
-        algo.batch_session_recording_config.maximum_batch_size = 1
         algo.head_fixation_enabled = False
         self.start_session_in_tunnel(engage_headbar=False)
         with self.mock_intersession_analysis():
             # algo.update_mouse_seen(True)  # ensure analysis will run
             self.mock_pose_response(pellet_seen=True, mouse_seen=True)
-            self.pellet.load_pellet(force=True)  # force load-pellet to trigger end-capture -> intersession
-            self.mock_pellet_ack(until_none=True)
+            self.exit_tunnel()
             assert self._machine.state == SystemState.intersession
             algo.head_fixation_enabled = True
             with caplog.at_level(logging.DEBUG):

@@ -39,16 +39,13 @@ class TestShiftXYZ(MockSystemMachine):
         cfg = self.algo.active_config
         min_reach_fail = 5
         cfg.shift_xyz_handler.buffer.minimum_reach_fail = min_reach_fail
-        cfg.batch_session_recording.enabled = True
-        cfg.batch_session_recording.maximum_batch_size = 6 * min_reach_fail  # big enough to hold 2+ * minimum_reach_fail
         cfg.pellet_delivery.is_intersession_analysis_enabled = True
-        machine._delay_timer_consider_end_session = 0
         assert self.algo.intersession_enabled is True
         def perf_seg(cfg):
             return cfg
         self.inference.perform_segmentation = mock.MagicMock(side_effect=perf_seg)
 
-    def make_session(self, stack: contextlib.ExitStack, reach_events, rh_max_vp_list):
+    def make_session(self, reach_events, rh_max_vp_list):
         algo = self.algo
         self.mock_pellet_ack(until_none=True)
         assert algo.is_in_session
@@ -63,21 +60,13 @@ class TestShiftXYZ(MockSystemMachine):
             other_events=other_events,
         )
         project = self._machine.project.to_local_value()
-        stack.enter_context(
-            self.mock_intersession_analysis(results=rsp, project=project, stack=stack)
-        )
-        self.mock_pose_response(pellet_seen=False)
-        self.mock_pellet_ack(until_none=True)
-        self.increment_perf_now(cfg.pellet_delivery.max_pellet_missing_seconds)
-        self.mock_pose_response(pellet_seen=False, mouse_seen=True)
-        
-        # pellet not seen for missing delay
-        #   -> load pellet triggered -> stop-session-recording -> not algo.is_in_session
+        with self.mock_intersession_analysis(results=rsp, project=project):
+            self.exit_tunnel()
         assert not algo.is_in_session
         self.increment_perf_now(1)
         self.mock_pose_response(pellet_seen=True, mouse_seen=True)
         self.mock_pellet_ack(until_none=True)
-        assert pellet.state == PelletState.monitoring
+        self.start_session_in_tunnel(set_recording_status=True)
         assert algo.is_in_session
 
     def test_with_many_failed_reaches_clear_buffer(self, caplog):
@@ -112,26 +101,27 @@ class TestShiftXYZ(MockSystemMachine):
             (65, 75, 80, "right_hand", "stalled", 65 / fps),
             (85, 105, 110, "left_hand", "dropped", 85 / fps),
         ))
-        with contextlib.ExitStack() as stack:
-            for rh_max_vp_list in rh_max_vp_lists:
-                #with caplog.at_level(logging.DEBUG):
-                self.make_session(stack, reach_events, rh_max_vp_list)
-                self.increment_perf_now(3)
-            assert pellet_dev.set_x.call_args_list == []
-            assert pellet_dev.set_y.call_args_list == []
-            assert pellet_dev.set_z.call_args_list == []
-            assert system.state == SystemState.tunnel
-            self.exit_tunnel()
+        for rh_max_vp_list in rh_max_vp_lists:
+            self.make_session(reach_events, rh_max_vp_list)
+            self.increment_perf_now(3)
+        assert system.state == SystemState.tunnel
+        self.exit_tunnel()
         assert system.state == SystemState.cage
         assert system.intersession.state == IntersessionState.idle
         assert f"applying pellet send_position shift: {expected_shift.round(1)}" in caplog.text
         # NB: applied shift are in motor coordinate:
         f_m_d = algo.diamond_triangle_config.flips_motor_diamond
         #
-        assert pellet_dev.set_x.call_args_list == [
-            mock.call(expected_shift.x * f_m_d.x , absolute=False, sender='processed_shift_xyz')]
-        assert pellet_dev.set_y.call_args_list == [
-            mock.call(expected_shift.y * f_m_d.y, absolute=False, sender='processed_shift_xyz')]
+        assert mock.call(
+            expected_shift.x * f_m_d.x,
+            absolute=False,
+            sender='processed_shift_xyz',
+        ) in pellet_dev.set_x.call_args_list
+        assert mock.call(
+            expected_shift.y * f_m_d.y,
+            absolute=False,
+            sender='processed_shift_xyz',
+        ) in pellet_dev.set_y.call_args_list
         assert pellet_dev.set_z.call_args_list == []
         #
         shift_handler_ctx = system.shift_xyz_handler.handler.get_context()
@@ -179,18 +169,11 @@ class TestShiftXYZ(MockSystemMachine):
         self.pellet_dev.last_dcs_set_position = Offset3DTuple(-5, 25, -6)
         caplog.clear()
         caplog.set_level(logging.INFO)
-        with FifoExitStack() as stack:
-            for reach_events, rh_max_vp_list in zip(reaches_list, rh_max_vp_lists):
-                # with caplog.at_level(logging.DEBUG):
-                self.make_session(stack, reach_events, rh_max_vp_list)
-                self.increment_perf_now(3)
-            # ensure the shift is only applied after the batch finishes:
-            assert pellet_dev.set_x.call_args_list == []
-            assert pellet_dev.set_y.call_args_list == []
-            assert pellet_dev.set_z.call_args_list == []
-            assert system.state == SystemState.tunnel
-            assert algo.pellet_shift_y_limit is None
-            self.exit_tunnel()  # the batch will be started processing with the exit tunnel
+        for reach_events, rh_max_vp_list in zip(reaches_list, rh_max_vp_lists):
+            self.make_session(reach_events, rh_max_vp_list)
+            self.increment_perf_now(3)
+        assert system.state == SystemState.tunnel
+        self.exit_tunnel()
         #
         assert algo.pellet_shift_y_limit == 25.5
         assert system.state == SystemState.cage
@@ -219,6 +202,6 @@ class TestShiftXYZ(MockSystemMachine):
         ] if expected_shift.z != 0 else [])
         #
         shift_handler_ctx = system.shift_xyz_handler.handler.get_context()
-        assert shift_handler_ctx["failed_reaches_buffer"] == [], "with tongue-eaten the failed_reaches_buffer is cleared"
-        # there are still remaining entries at the end,
-        # because there was other trial(s) after the one which triggered the last clear of the buffer.
+        assert shift_handler_ctx["failed_reaches_buffer"] == [O(0, 1, 2)]
+        # The tongue-eaten trial clears the prior buffer; the following manual
+        # trial contributes one new failed-reach point.

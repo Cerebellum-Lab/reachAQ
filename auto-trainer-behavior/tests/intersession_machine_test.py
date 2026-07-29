@@ -83,37 +83,27 @@ def test_intersession_increase_algo_counts(mock_system):
     )
     with mock_system.mock_intersession_analysis(results=res):
         mock_system.exit_tunnel()
-    assert algo.pellets_presented_day == algo.pellets_presented_total == 0  # NB: this now accounts for pellet-sent event
-    assert algo.pellet_reaches_day == algo.pellet_reaches_total == 3
-    assert algo.pellet_consumed_day == algo.pellet_consumed_total == 2
-    assert algo.successful_reaches_day == algo.successful_reaches_total == 1
+    assert algo.pellets_presented == 0  # pellet-sent owns this count
+    assert algo.pellet_reaches == 3
+    assert algo.pellets_consumed == 2
+    assert algo.successful_reaches == 1
 
 
 def test_exit_tunnel_when_analysis_ongoing(mock_system, machine, caplog):
     algo = mock_system.algo
     algo.intersession_enabled = True
-    machine._delay_timer_consider_end_session = 0  # simpler test
-    #
-    after_exit_tunnel_msg = "after_exit_tunnel: load_cell_disengaged_intersession_in_progress"
-
-    def perform_exit_tunnel():
+    def verify_analysis_blocks_exit():
         assert machine.state == SystemState.intersession
         mock_system.exit_tunnel()
         assert machine.state == SystemState.intersession
-        assert after_exit_tunnel_msg in caplog.text
 
     mock_system.start_session_in_tunnel()
     mock_system.mock_pose_response(pellet_seen=True, mouse_seen=True, triangle_seen=True)
 
     with caplog.at_level(logging.DEBUG):
-        with mock_system.mock_intersession_analysis(concurrent_func=perform_exit_tunnel):
+        with mock_system.mock_intersession_analysis(concurrent_func=verify_analysis_blocks_exit):
             assert machine.state == SystemState.tunnel
-            mock_system.mock_pose_response(pellet_seen=False, mouse_seen=True, triangle_seen=True)
-            mock_system.mock_pellet_ack(until_none=True)
-            mock_system.increment_perf_now(algo.pellet_missing_time)
-            mock_system.mock_pose_response(pellet_seen=False, mouse_seen=True, triangle_seen=True)
+            mock_system.exit_tunnel()
             assert machine.state == SystemState.intersession
-            assert after_exit_tunnel_msg not in caplog.text
 
     assert machine.state == SystemState.cage, "Must be back in cage after end intersession analysis"
-    assert after_exit_tunnel_msg in caplog.text

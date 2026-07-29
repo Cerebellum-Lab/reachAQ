@@ -92,7 +92,7 @@ class TestHomeOnExcessiveDrift(MockSystemMachine):
         cfg = self.algo.home_on_excessive_drift_distance_config
         cfg.enabled = enabled
         cfg.min_samples = min_samples
-        self.make_load_cell_active()
+        self.algo.start_session(reason="manual")
         self.mock_pellet_ack(until_none=True)
         diam_cfg = self.algo.diamond_triangle_config
         dist_thresh = cfg.excessive_distance_threshold
@@ -131,5 +131,5 @@ class TestHomeOnExcessiveDrift(MockSystemMachine):
         assert algo.is_in_session
         self._execute_pose_responses(rsp, min_samples)
         assert self.pellet_dev.send_home.call_args_list == [mock.call()], "pellet.send_home() should have been called"
-        assert not algo.is_in_session, "capture session should have been ended"
-        assert ended_reasons == [RecordingEndingReason.MOTOR_DRIFT_HOMING]
+        assert algo.is_in_session, "manual recording must not be stopped by drift handling"
+        assert ended_reasons == []
