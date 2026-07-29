@@ -147,6 +147,12 @@ class SubsystemStatusRegistry:
                 subsystem_id=subsystem_id,
                 state=SubsystemState.STOPPED,
             )
+        generation = kwargs.get("generation")
+        if (
+            generation is not None
+            and int(generation) < previous.generation
+        ):
+            return previous, previous
         status = previous.transition(state, **kwargs)
         self._statuses[subsystem_id] = status
         return status, previous

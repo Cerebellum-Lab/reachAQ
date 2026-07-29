@@ -52,6 +52,24 @@ def test_recording_blockers_include_only_required_unready_domains():
     )
 
 
+def test_stale_worker_generation_cannot_overwrite_retry_state():
+    registry = SubsystemStatusRegistry()
+    first, _ = registry.begin_retry(SubsystemId.NIDAQ_STREAM)
+    second, _ = registry.begin_retry(SubsystemId.NIDAQ_STREAM)
+
+    stale, _ = registry.transition(
+        SubsystemId.NIDAQ_STREAM,
+        SubsystemState.FAILED,
+        generation=first.generation,
+        error="late worker failure",
+    )
+
+    assert second.generation == 2
+    assert stale is second
+    assert registry.get(SubsystemId.NIDAQ_STREAM) is second
+    assert registry.get(SubsystemId.NIDAQ_STREAM).state is SubsystemState.STARTING
+
+
 def test_snapshot_serializes_enum_state_and_dynamic_camera_id():
     registry = SubsystemStatusRegistry()
     camera_id = SubsystemId.camera("left")
