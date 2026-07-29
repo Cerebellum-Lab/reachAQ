@@ -268,8 +268,16 @@ class BehaviorContent(ContentWidget):
     def _update_recording_controls(self, status: SessionRecordingStatus):
         self._recording_status_label.setText(status.value.capitalize())
         acquisition_ready = self._app_model.acquisition_started
+        blockers = self._app_model.recording_blockers
         self._record_button.setEnabled(
-            acquisition_ready and status == SessionRecordingStatus.READY
+            acquisition_ready
+            and status == SessionRecordingStatus.READY
+            and not blockers
+        )
+        self._record_button.setToolTip(
+            ""
+            if not blockers
+            else "Record unavailable:\n" + "\n".join(blockers)
         )
         self._stop_button.setEnabled(status == SessionRecordingStatus.RECORDING)
         self._abort_button.setEnabled(status in {
@@ -284,6 +292,8 @@ class BehaviorContent(ContentWidget):
         elif name in {
             self._app_model.Props.STATUS,
             self._app_model.Props.ACQUISITION_RUNNING,
+            self._app_model.Props.RECORDING_BLOCKERS,
+            self._app_model.Props.SUBSYSTEM_STATUSES,
         }:
             self._update_recording_controls(self._app_model.session_recording_status)
 

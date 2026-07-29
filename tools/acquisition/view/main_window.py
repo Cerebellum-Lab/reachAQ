@@ -52,6 +52,7 @@ from tools.acquisition.model.app_model import AppModel
 from tools.acquisition.model.app_model_status import AppModelStatus, SessionRecordingStatus
 from tools.acquisition.model.handle_3d_calibration import make_3d_calib
 from tools.acquisition.model.nidaq_discovery import discover_nidaq_devices
+from tools.acquisition.model.subsystem_status import SubsystemState
 from tools.acquisition.model.training_plan import get_plan_id
 from tools.acquisition.model.user_preferences import UserPreferences
 from tools.acquisition.view.main_content import MainContent
@@ -243,7 +244,11 @@ class MainWindow(QMainWindow):
         self.edit_camera_settings_action.setEnabled(stopped)
         self.edit_daq_ports_action.setEnabled(stopped and self._nidaq_discovery_thread is None)
         self.refresh_hardware_action.setEnabled(
-            stopped
+            (
+                stopped
+                or self._app_model.session_recording_status
+                is SessionRecordingStatus.READY
+            )
             and self._hardware_refresh_thread is None
             and self._nidaq_discovery_thread is None
         )
@@ -293,13 +298,33 @@ class MainWindow(QMainWindow):
         self._status_label.setText("")
         self._status_label.setStyleSheet("")
 
+    def _update_runtime_health_label(self) -> None:
+        if not self._app_model.acquisition_started:
+            return
+        degraded = tuple(
+            status
+            for status in self._app_model.subsystem_statuses.values()
+            if status.state in {SubsystemState.FAILED, SubsystemState.BLOCKED}
+        )
+        if degraded:
+            self._status_label.setText("Running (degraded)")
+            self._status_label.setStyleSheet(
+                "font-weight: 600; color: #b45309;"
+            )
+            self._status_label.setToolTip("\n".join(
+                f"{status.subsystem_id}: {status.error or status.reason}"
+                for status in degraded
+            ))
+        else:
+            self._clear_startup_message()
+
     @invoke_method
     def _on_capture_start_finished(self, started: bool) -> None:
         self._start_capture_thread = None
         self._restore_system_mode()
         if started:
-            self._clear_startup_message()
             self._acquisition_started = True
+            self._update_runtime_health_label()
         else:
             logger.verbose("capture_start failed: %s", self._app_model.status)
             self._status_label.setText("Startup failed")
@@ -380,22 +405,40 @@ class MainWindow(QMainWindow):
         if self._nidaq_discovery_thread is not None and self._nidaq_discovery_thread.is_alive():
             self.statusBar().showMessage("NI-DAQ discovery is already in progress", 5000)
             return
-        if self._app_model.acquisition_started or self._app_model.status != AppModelStatus.IDLE:
-            self.statusBar().showMessage("Hardware refresh is only available while acquisition is idle", 5000)
+        retry_running = self._app_model.acquisition_started
+        if (
+            retry_running
+            and self._app_model.session_recording_status
+            is not SessionRecordingStatus.READY
+        ):
+            self.statusBar().showMessage(
+                "Hardware retry is unavailable during recording or analysis",
+                5000,
+            )
+            return
+        if not retry_running and self._app_model.status != AppModelStatus.IDLE:
+            self.statusBar().showMessage("Hardware refresh is unavailable while System Mode is changing", 5000)
             return
 
         self.refresh_hardware_action.setEnabled(False)
-        self.run_action.setEnabled(False)
-        self.animal_in_device_action.setEnabled(False)
-        self.animal_in_training_action.setEnabled(False)
-        self._app_model_status_combo.setEnabled(False)
-        self._status_label.setText("Refreshing hardware...")
+        if not retry_running:
+            self.run_action.setEnabled(False)
+            self.animal_in_device_action.setEnabled(False)
+            self.animal_in_training_action.setEnabled(False)
+            self._app_model_status_combo.setEnabled(False)
+        self._status_label.setText(
+            "Retrying failed hardware..." if retry_running else "Refreshing hardware..."
+        )
         self.main_content.set_hardware_refreshing(True)
         QCoreApplication.processEvents()
 
         def refresh_worker():
             try:
-                message = self._app_model.refresh_hardware_bindings()
+                message = (
+                    self._app_model.retry_failed_subsystems()
+                    if retry_running
+                    else self._app_model.refresh_hardware_bindings()
+                )
                 is_error = False
             except Exception as exc:
                 logger.exception("Hardware refresh failed")
@@ -413,7 +456,17 @@ class MainWindow(QMainWindow):
         self._status_label.setText("")
         self.main_content.set_hardware_refreshing(False)
         self.refresh_hardware_action.setEnabled(
-            not self._app_model.acquisition_started and self._app_model.status == AppModelStatus.IDLE
+            (
+                (
+                    not self._app_model.acquisition_started
+                    and self._app_model.status == AppModelStatus.IDLE
+                )
+                or (
+                    self._app_model.acquisition_started
+                    and self._app_model.session_recording_status
+                    is SessionRecordingStatus.READY
+                )
+            )
         )
         can_start = not self._app_model.acquisition_started and self._app_model.status == AppModelStatus.IDLE
         self.run_action.setEnabled(can_start)
@@ -1011,7 +1064,7 @@ class MainWindow(QMainWindow):
 
         action = self.refresh_hardware_action = QAction(_toolbar_icon("fa5s.sync"), "Refresh Hardware", self)
         action.setToolTip(
-            "Scan camera sources, NI-DAQ devices, CAN adapter, and pellet delivery board while acquisition is idle"
+            "Scan hardware while idle, or retry failed subsystems while System Mode is running"
         )
         action.triggered.connect(self._refresh_hardware_bindings)
 
@@ -1727,8 +1780,17 @@ class MainWindow(QMainWindow):
                 logger.warning("unhandled app model status: %s", value)
 
             self.refresh_hardware_action.setEnabled(
-                value is AppModelStatus.IDLE
-                and not app_model.acquisition_started
+                (
+                    (
+                        value is AppModelStatus.IDLE
+                        and not app_model.acquisition_started
+                    )
+                    or (
+                        app_model.acquisition_started
+                        and app_model.session_recording_status
+                        is SessionRecordingStatus.READY
+                    )
+                )
                 and self._hardware_refresh_thread is None
             )
             self.blockSignals(False)
@@ -1746,12 +1808,17 @@ class MainWindow(QMainWindow):
                 for item in (
                     self._app_model_status_combo,
                     self.run_action,
+                    self.refresh_hardware_action,
                     self.animal_in_device_action,
                     self.animal_in_training_action,
                     self.calib_diamond_triangle_action,
                     self.make_3d_calib_action,
                 ):
                     item.setEnabled(False)
+
+        elif name == props.SUBSYSTEM_STATUSES:
+            if self._start_capture_thread is None:
+                self._update_runtime_health_label()
 
         elif name == props.ANIMALS:
             self._reload_animals(value)

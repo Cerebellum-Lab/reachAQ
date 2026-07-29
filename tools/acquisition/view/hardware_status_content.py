@@ -19,6 +19,7 @@ from autotrainer.core import CameraId
 from autotrainer.core.capture import CaptureProcessStatus
 from autotrainer.pyside import CardWidget
 from autotrainer.pyside.content_widget import ContentWidget, invoke_method
+from tools.acquisition.model.subsystem_status import SubsystemId, SubsystemState
 
 
 class _CollapsibleHardwareCategory(QWidget):
@@ -236,6 +237,10 @@ class HardwareStatusContent(ContentWidget):
         self._set_enabled("cameras", enabled_count > 0)
         scan_info, scan_state = self._scan_info("cameras")
         rows = [self._camera_status_row(camera, scan_info, scan_state) for camera in cameras]
+        rows.append(self._subsystem_status_row(
+            SubsystemId.REACH_SYNCHRONIZATION,
+            "reach synchronization",
+        ))
         self._set_info(
             "cameras",
             self._format_device_rows(rows, self._scan_notes(scan_info)),
@@ -268,6 +273,10 @@ class HardwareStatusContent(ContentWidget):
                 discovered_rows.append((name, "configured", state))
         stream_binding = ", ".join(configured_names) if configured_names else "no binding"
         discovered_rows.append(("input stream", stream_binding, use_state))
+        discovered_rows.append(self._subsystem_status_row(
+            SubsystemId.NIDAQ_STREAM,
+            "runtime",
+        ))
         discovered_rows.extend(self._daq_binding_rows())
         self._set_info(
             "nidaq",
@@ -285,6 +294,7 @@ class HardwareStatusContent(ContentWidget):
             state = "not scanned" if scan_info == "Not scanned" else scan_state
             rows = [("adapter", self._single_line(scan_info), state)]
         rows.append(("runtime", self._can_binding(), "enabled" if is_enabled else "disabled"))
+        rows.append(self._subsystem_status_row(SubsystemId.CAN_PELLET, "health"))
         self._set_info(
             "can",
             self._format_device_rows(rows, self._scan_notes(scan_info)),
@@ -316,6 +326,7 @@ class HardwareStatusContent(ContentWidget):
             panel_state = "error"
         self._set_enabled("pellet", is_enabled, panel_state)
         rows = [("pellet", self._pellet_binding(), state)]
+        rows.append(self._subsystem_status_row(SubsystemId.CAN_PELLET, "health"))
         version = getattr(hardware, "pellet_version", "")
         rows.append(
             (
@@ -364,6 +375,7 @@ class HardwareStatusContent(ContentWidget):
             timing = "hardware" if configuration.hardware_timed else "software"
             rate = "manual" if configuration.sample_rate_hz is None else f"{configuration.sample_rate_hz:g} Hz"
             rows.append(("timing", f"{timing} · {rate}", connection_state))
+        rows.append(self._subsystem_status_row(SubsystemId.LASER, "runtime"))
         self._set_info(
             "laser",
             self._format_device_rows(rows, self._scan_notes(scan_info)),
@@ -385,6 +397,27 @@ class HardwareStatusContent(ContentWidget):
         else:
             state = "idle"
         return camera.name, self._camera_binding(camera), state
+
+    def _subsystem_status_row(self, subsystem_id, label: str) -> Tuple[str, str, str]:
+        key = subsystem_id.value if isinstance(subsystem_id, SubsystemId) else str(subsystem_id)
+        try:
+            statuses = object.__getattribute__(self._app_model, "subsystem_statuses")
+        except (AttributeError, TypeError):
+            statuses = {}
+        status = statuses.get(key)
+        if status is None:
+            return label, "status unavailable", "idle"
+        detail = status.error or status.reason or status.state.value
+        state = {
+            SubsystemState.READY: "ready",
+            SubsystemState.STARTING: "starting",
+            SubsystemState.STOPPING: "stopping",
+            SubsystemState.FAILED: "failed",
+            SubsystemState.BLOCKED: "blocked",
+            SubsystemState.DISABLED: "disabled",
+            SubsystemState.STOPPED: "stopped",
+        }[status.state]
+        return label, detail, state
 
     @staticmethod
     def _camera_binding(camera) -> str:
@@ -593,7 +626,10 @@ class HardwareStatusContent(ContentWidget):
 
     @invoke_method
     def _on_app_model_property_changed(self, property_name: str, _value, _):
-        if property_name == "hardware_scan_results":
+        if property_name in {
+            "hardware_scan_results",
+            "subsystem_statuses",
+        }:
             self._refresh_status()
 
     @invoke_method
