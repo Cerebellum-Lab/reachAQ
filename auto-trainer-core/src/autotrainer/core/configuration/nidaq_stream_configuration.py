@@ -9,7 +9,7 @@ from autotrainer.core.configuration import SystemConfigurationDumper, SystemConf
 
 @dataclasses.dataclass(frozen=True)
 class NidaqSignalChannelConfiguration:
-    """One visualization-only NI-DAQ input channel."""
+    """One continuously acquired NI-DAQ input channel."""
 
     name: str
     physical_channel: str
@@ -48,7 +48,8 @@ class NidaqSignalStreamConfiguration:
     read_chunk_size: int = 500
     rolling_window_seconds: float = 10.0
     # Both fields are retained only so older YAML configurations continue to
-    # load. The analysis stream is visualization-only and they are ignored.
+    # load. Persistence now follows the complete acquisition channel set and
+    # these legacy recording controls are ignored.
     record_to_acquisition: bool = False
     output_name: str = "nidaq_signals"
     # None identifies legacy configuration and adopts all acquisition channels as
