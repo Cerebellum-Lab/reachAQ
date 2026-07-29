@@ -6,7 +6,6 @@ from typing import List
 class HeadFixMeasurement:
     when: float = 0   # realtime timestamp, i.e: "UNIX" timestamp, in float seconds as normally.
     timestamp: int = 0  # perf counter timestamp, in integer nanoseconds
-    weight: float = 0
     switch: bool = False
     pressure: float = 0
     temperature: float = 0

@@ -26,7 +26,7 @@ class HeadbarPressureMonitor(BaseDetector[HeadbarPressureConfiguration]):
 
         self._sample_rate = 100
 
-        self.load_cell_engaged_threshold: float = 30
+        self.engaged_threshold: float = 30
         self.duration: float = 0.25
 
         self._values = numpy.empty((1, 0))
@@ -56,11 +56,11 @@ class HeadbarPressureMonitor(BaseDetector[HeadbarPressureConfiguration]):
         self._rebuild_buffers()
 
     @property
-    def load_cell_engaged_threshold(self) -> float:
+    def engaged_threshold(self) -> float:
         return self._config.threshold
 
-    @load_cell_engaged_threshold.setter
-    def load_cell_engaged_threshold(self, value: float) -> None:
+    @engaged_threshold.setter
+    def engaged_threshold(self, value: float) -> None:
         cfg = self._config
         prev, cfg.threshold = cfg.threshold, value
         # self._on_property_changed("threshold", value, prev)  # unused

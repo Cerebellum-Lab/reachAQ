@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import csv
-import math
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, List, Tuple, IO
+from typing import Optional, List, Tuple, IO, Callable
 
 import numpy
 
@@ -18,14 +17,11 @@ from .animal_evasion_alarm import AnimalEvasionAlarm
 from .animal_thrash_alarm import AnimalThrashAlarm
 from .autoclamp_evasion_detector import AutoClampEvasionDetector
 from .device_comm_alarm import DeviceCommAlarm
-from .presence_in_cage_alarm import PresenceInCageAlarm
 from .watchdog_monitor import WatchdogMonitor
 from ..message.audio_spectrum_message import AudioSpectrumMessage
 from .head_fix_measurement import HeadFixMeasurement
 from .audio_spectrum_monitor import AudioSpectrumThrashMonitor
 from .headbar_pressure_monitor import HeadbarPressureMonitor
-from .load_cell_monitor import LoadCellMonitor
-from .load_cell_tare_monitor import LoadCellTareMonitor
 from .alarm_monitor import EmergencyAlarmMonitor
 from .global_animal_presence_monitor import GlobalAnimalPresenceAlarm
 from .external_doors_monitor import ExternalDoorsAlarm
@@ -47,16 +43,16 @@ def _disable_alarm_config(config):
 
 # TODO: Separate true analysis from data recording to file(s) for post-analysis.
 class SensorAnalysis(ObservableObject):
+    measurements_sampled: Callable[[List], None]
 
     def __init__(self, *, topcam_presence: Optional[PresenceDetectionAttrs] = None):
-        super().__init__()
+        super().__init__(("measurements_sampled",))
 
         self._project_info: Optional[ProjectInfo] = None
         self._interval = ProjectInterval.HOUR
         self._have_new_project_audio = True
         self._have_new_project_record_data = True
         # NB: need one have_new_project bool for each file
-        self._filter_invalid_weight_started = False
 
         # The "monitor" CSV file with the bulk of the sensor data.
         self._record_file = None
@@ -68,9 +64,6 @@ class SensorAnalysis(ObservableObject):
         self._current_audio_record_interval = -1
         self._audio_had_write_error = False
 
-        self._is_load_cell_engaged = False
-        self._load_cell_monitor = LoadCellMonitor()
-
         # The analog pressure sensor on the headbar.
         self._is_headbar_pressure_engaged = False
         self._headbar_pressure_monitor = HeadbarPressureMonitor()
@@ -78,13 +71,9 @@ class SensorAnalysis(ObservableObject):
         # The digital i/o switch on the headbar.
         self._is_headbar_switch_engaged = False
 
-        self._tare_detector = LoadCellTareMonitor()
-        self._tare_callback = None
-
         self._audio_thrashing_monitor = AudioSpectrumThrashMonitor()
 
         self._global_animal_presence_alarm = GlobalAnimalPresenceAlarm(
-            load_cell_monitor=self._load_cell_monitor,
             topcam_presence=topcam_presence,
         )
 
@@ -103,19 +92,12 @@ class SensorAnalysis(ObservableObject):
         self._system_fault_alarm = SystemFaultAlarm(watchdog_monitor=self._watchdog_monitor)
 
         self._animal_thrash_alarm = AnimalThrashAlarm(
-            load_cell_detector=self._load_cell_monitor,
             audio_thrash_detector=self._audio_thrashing_monitor,
-        )
-
-        self._presence_in_cage_alarm = PresenceInCageAlarm(
-            load_cell_monitor=self._load_cell_monitor,
-            topcam_presence_attrs=topcam_presence,
         )
 
         self._alarm_monitor = EmergencyAlarmMonitor()
 
         self._autoclamp_evasion_detector = AutoClampEvasionDetector(
-            loadcell_detector=self._load_cell_monitor,
             headbar_detector=self._headbar_pressure_monitor,
         )
         self._animal_evasion_alarm = AnimalEvasionAlarm()
@@ -129,13 +111,10 @@ class SensorAnalysis(ObservableObject):
             self._system_fault_alarm,
             self._external_doors_alarm,
             self._global_animal_presence_alarm,
-            self._presence_in_cage_alarm,
             self._device_comm_alarm,
         ]
 
         self._detectors = [
-            self._load_cell_monitor,
-            self._tare_detector,
             self._audio_thrashing_monitor,
             self._pellet_misplaced_monitor,
             self._auto_tunnel_sweep_monitor,
@@ -200,16 +179,8 @@ class SensorAnalysis(ObservableObject):
         self._interval = value
 
     @property
-    def load_cell_monitor(self) -> LoadCellMonitor:
-        return self._load_cell_monitor
-
-    @property
     def headbar_pressure_monitor(self) -> HeadbarPressureMonitor:
         return self._headbar_pressure_monitor
-
-    @property
-    def load_cell_tare_monitor(self) -> LoadCellTareMonitor:
-        return self._tare_detector
 
     @property
     def audio_thrashing_monitor(self) -> AudioSpectrumThrashMonitor:
@@ -222,10 +193,6 @@ class SensorAnalysis(ObservableObject):
     @property
     def emergency_alarm_monitor(self) -> EmergencyAlarmMonitor:
         return self._alarm_monitor
-
-    @property
-    def presence_in_cage_alarm(self) -> PresenceInCageAlarm:
-        return self._presence_in_cage_alarm
 
     @property
     def global_animal_presence_alarm(self) -> GlobalAnimalPresenceAlarm:
@@ -282,10 +249,11 @@ class SensorAnalysis(ObservableObject):
     def measurements_received(
         self,
         measurements: List[HeadFixMeasurement]
-    ) -> Tuple[List[float], List[bool], List[float], List[float], List[float]] :
-        """Return weight_vals, switch_vals, pressure_vals, temperature_vals, humidity_vals"""
+    ) -> Tuple[List[bool], List[float], List[float], List[float]]:
+        """Return switch, pressure, temperature, and humidity values."""
         if len(measurements) == 0:
             raise RuntimeError("Expected non-empty measurements list")
+        self.measurements_sampled(measurements)
 
         switch_vals: List[bool] = []
         pressure_vals: List[float] = []
@@ -304,12 +272,6 @@ class SensorAnalysis(ObservableObject):
             self._update_record_file()
         fh = self._record_file
         #
-        load_cell_mon = self._load_cell_monitor
-        # Load cell monitor. and Auto-Tare monitor
-        weight_vals: List[float] = []
-        filtered_weight_vals: List[float] = []
-        load_cell_cfg = load_cell_mon.config
-
         for m in measurements:
             switch_vals.append(m.switch)
             pressure_vals.append(m.pressure)
@@ -320,33 +282,13 @@ class SensorAnalysis(ObservableObject):
             if fh is not None:
                 try:
                     fh.write(
-                        f"{m.when}, {m.timestamp}, {m.weight}, {int(m.switch)}, {m.pressure}, "
-                        f"{m.temperature}, {m.humidity}, {int(load_cell_mon.is_engaged)}\n")
+                        f"{m.when}, {m.timestamp}, {int(m.switch)}, {m.pressure}, "
+                        f"{m.temperature}, {m.humidity}\n")
                 except Exception as err:
                     # This could be too much if something major is wrong.  Just output once per file rotation.
                     if not self._had_write_error:
                         logger.exception("<sensor-analysis>: unable to write: %s", err)
                         self._had_write_error = True
-            value = m.weight
-            weight_vals.append(value)
-            if not (load_cell_cfg.weight_min_filter < value < load_cell_cfg.weight_max_filter):
-                filtered_weight_vals.append(math.nan)
-                if not self._filter_invalid_weight_started:
-                    self._filter_invalid_weight_started = True
-                    logger.verbose(
-                        "starting filter value outside accepted range: %s", value
-                    )
-                continue
-            if self._filter_invalid_weight_started:
-                logger.verbose("finished filter value outside accepted range: %s", value)
-                self._filter_invalid_weight_started = False
-            #
-            filtered_weight_vals.append(value)
-            load_cell_mon.update(value, m.when, m.timestamp)
-
-        # (Auto-)tare detection.
-        self._tare_detector.update(filtered_weight_vals)
-
         # Headbar analog pressure monitor.
         first_measure = measurements[0]
         self._headbar_pressure_monitor.update(pressure_vals, first_measure.when, first_measure.timestamp)
@@ -357,7 +299,7 @@ class SensorAnalysis(ObservableObject):
         # Performance monitoring.
         self._perf_monitor.add_cycles(len(measurements))
 
-        return weight_vals, switch_vals, pressure_vals, temperature_vals, humidity_vals
+        return switch_vals, pressure_vals, temperature_vals, humidity_vals
 
     def audio_spectrum_received(self, spectrum: AudioSpectrumMessage):
         if spectrum is None or not spectrum.magnitudes:
@@ -415,7 +357,7 @@ class SensorAnalysis(ObservableObject):
             file_existed = dest_path.exists()
             fh = dest_path.open("a")
             if not file_existed:
-                fh.write("Time, Index, Weight, Switch, Pressure, Temperature, Humidity, LoadCellEngaged\n")
+                fh.write("Time, Index, Switch, Pressure, Temperature, Humidity\n")
                 fh.flush()
             self._current_record_interval = interval_file_info.current_interval
             self._had_write_error = False

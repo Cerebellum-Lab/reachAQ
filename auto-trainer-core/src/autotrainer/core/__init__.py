@@ -314,7 +314,7 @@ from .configuration import SystemConfiguration, BehaviorConfiguration, CameraCon
 
 from .message import MessageHandler, SystemMessageHandler
 from .analysis import SensorAnalysis, MeasurementData, AudioSpectrumData
-from .analysis import LoadCellMonitor, HeadbarPressureMonitor
+from .analysis import HeadbarPressureMonitor
 
 from .event.api_event_kind import ApiEventKind
 from .event.event_info import EventInfo

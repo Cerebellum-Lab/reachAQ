@@ -3,7 +3,6 @@ from typing import Optional
 from autotrainer.api import ApiDetectorKind
 
 from autotrainer.core.analysis.detector import BaseDetector
-from autotrainer.core.analysis.load_cell_monitor import LoadCellMonitor
 from autotrainer.core.analysis.headbar_pressure_monitor import HeadbarPressureMonitor
 from autotrainer.core.configuration.autoclamp_evasion_config import AutoClampEvasionDetectorConfig
 
@@ -15,9 +14,8 @@ class AutoClampEvasionDetector(BaseDetector[AutoClampEvasionDetectorConfig]):
     config_cls = AutoClampEvasionDetectorConfig
     detector_api_kind = ApiDetectorKind.animalAutoClampEvasion
 
-    def __init__(self, *, loadcell_detector: LoadCellMonitor, headbar_detector: HeadbarPressureMonitor):
+    def __init__(self, *, headbar_detector: HeadbarPressureMonitor):
         super().__init__()
-        self._loadcell_detector = loadcell_detector
         self._headbar_detector = headbar_detector
         self._pellets_consumed_count: int = 0
         self._autoclamp_enabled = False
@@ -33,7 +31,6 @@ class AutoClampEvasionDetector(BaseDetector[AutoClampEvasionDetectorConfig]):
     def increment_pellets_consumed(self, inc: int = 1):
         if (
                 self._autoclamp_enabled
-            and self._loadcell_detector.is_engaged
             and not self._headbar_detector.is_engaged
             and not self._autoclamp_in_progress
         ):

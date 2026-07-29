@@ -16,7 +16,6 @@ class MeasurementData(MeasurementMessageProtocol):
     """
     when_val: float
     index_val: int
-    weight_val: float
     pressure_val: int
     temperature_val: float
     humidity_val: float
@@ -33,10 +32,6 @@ class MeasurementData(MeasurementMessageProtocol):
     @property
     def index(self) -> int:
         return self.index_val
-
-    @property
-    def weight(self) -> float:
-        return self.weight_val
 
     @property
     def pressure(self) -> int:
@@ -69,11 +64,17 @@ class MeasurementData(MeasurementMessageProtocol):
                 if line[0] == "Time":
                     continue
 
-                measurement = cls(when_val=float(line[0]), index_val=int(float(line[1])),
-                                  weight_val=float(line[2]),
-                                  head_contact_val=int(line[3]) == 1, pressure_val=int(line[4]),
-                                  temperature_val=float(line[5]),
-                                  humidity_val=float(line[6]))
+                # Legacy monitor files included a load-cell column between
+                # Index and Switch. It is intentionally ignored.
+                value_offset = 1 if len(line) >= 7 else 0
+                measurement = cls(
+                    when_val=float(line[0]),
+                    index_val=int(float(line[1])),
+                    head_contact_val=int(line[2 + value_offset]) == 1,
+                    pressure_val=int(line[3 + value_offset]),
+                    temperature_val=float(line[4 + value_offset]),
+                    humidity_val=float(line[5 + value_offset]),
+                )
 
                 measurements.append(measurement)
 
