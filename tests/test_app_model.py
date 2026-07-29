@@ -6,11 +6,16 @@ from unittest import mock
 import pytest
 
 from autotrainer.core import EventManager, SystemStatusMessageKind
+from autotrainer.core.capture import CaptureProcessStatus
 from autotrainer.core.configuration.persistence_configuration import PersistenceConfiguration
 from autotrainer.behavior.behavior_algorithm import BehaviorAlgoStatus
 from tools.acquisition.model.app_model import app_status_to_api_app_mode, app_status_to_behavior_algo_status
 from tools.acquisition.model.app_model_status import AppModelStatus, SessionRecordingStatus
 from tools.acquisition.model.session_boundary import SessionBoundary
+from tools.acquisition.model.subsystem_status import (
+    SubsystemId,
+    SubsystemState,
+)
 
 from autotrainer.api import ApiApplicationMode
 
@@ -217,3 +222,100 @@ def test_record_start_timeout_aborts_partial_session(app_model):
 
     on_error.assert_called_once()
     abort.assert_called_once_with()
+
+
+def test_required_failed_subsystem_is_exposed_as_recording_blocker(app_model):
+    app_model._acquisition_started = True
+    app_model._set_subsystem_status(
+        SubsystemId.NIDAQ_STREAM,
+        SubsystemState.FAILED,
+        required_for_recording=True,
+        error="configured input device unavailable",
+    )
+
+    assert app_model.recording_blockers == (
+        "nidaq_stream: configured input device unavailable",
+    )
+
+
+def test_required_runtime_loss_aborts_session_without_stopping_acquisition(
+    app_model,
+):
+    app_model._acquisition_started = True
+    app_model._set_subsystem_status(
+        SubsystemId.NIDAQ_STREAM,
+        SubsystemState.READY,
+        required_for_recording=True,
+    )
+    app_model._set_session_recording_status(SessionRecordingStatus.RECORDING)
+
+    with mock.patch.object(app_model, "abort_recording") as abort:
+        app_model._set_subsystem_status(
+            SubsystemId.NIDAQ_STREAM,
+            SubsystemState.FAILED,
+            error="worker stopped",
+        )
+        app_model._abort_recording_for_required_subsystem(
+            SubsystemId.NIDAQ_STREAM,
+            "worker stopped",
+        )
+
+    abort.assert_called_once_with()
+    assert app_model.acquisition_started
+
+
+def test_reach_secondaries_are_armed_before_primary_first_frame_validation(
+    app_model,
+):
+    events = []
+
+    def camera(name, *, is_primary):
+        result = mock.Mock()
+        result.name = name
+        result.is_primary = is_primary
+        result.last_error = ""
+        result.last_captured_frame_index = 0
+        result.video_status = CaptureProcessStatus.RUNNING
+        result.on_prepare_capture.side_effect = (
+            lambda *_args, **_kwargs: events.append(f"prepare:{name}") or True
+        )
+        result.wait_for_capture_status.return_value = True
+        result.on_capture_start.side_effect = (
+            lambda: events.append(f"arm:{name}")
+        )
+        result.wait_for_first_frame.side_effect = (
+            lambda **_kwargs: events.append(f"frame:{name}") or True
+        )
+        return result
+
+    primary = camera("primary", is_primary=True)
+    secondary = camera("secondary", is_primary=False)
+    app_model._ordered_reach_cameras = lambda **_kwargs: (primary, secondary)
+    app_model._inference_queue = None
+
+    assert app_model._start_reach_camera_domains({})
+    assert events.index("arm:secondary") < events.index("arm:primary")
+    assert events.index("arm:primary") < events.index("frame:secondary")
+
+
+def test_can_start_failure_is_scoped_to_can_domain(app_model):
+    app_model.hardware._can_enabled = True
+    app_model.hardware._pellet_controller_enabled = True
+
+    with mock.patch.object(
+        app_model,
+        "_ensure_pellet_controller_connected",
+        side_effect=RuntimeError("PXI/CAN interface unavailable"),
+    ):
+        with mock.patch.object(
+            app_model.hardware,
+            "safety_shutdown",
+        ) as safety_shutdown:
+            with mock.patch.object(app_model, "capture_stop") as capture_stop:
+                assert not app_model._start_can_domain(wait_connected=True)
+
+    status = app_model.subsystem_statuses[SubsystemId.CAN_PELLET.value]
+    assert status.state is SubsystemState.FAILED
+    assert "PXI/CAN interface unavailable" in status.error
+    safety_shutdown.assert_called_once()
+    capture_stop.assert_not_called()

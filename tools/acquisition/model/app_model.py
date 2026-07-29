@@ -482,6 +482,10 @@ class AppModel(ObservableObject):
         self._rpc_service: Optional[RpcService] = None
 
         self._hardware.property_changed += self._on_hardware_property_changed
+        self._nidaq_signal_monitor.property_changed += (
+            self._on_nidaq_monitor_property_changed
+        )
+        self._laser.property_changed += self._on_laser_runtime_property_changed
         inference.property_changed += self._on_inference_property_changed
         inference.pose_response_ready += self._on_pose_response_ready
         inference.detection_result_ready += self._on_detection_result_ready
@@ -3807,12 +3811,196 @@ class AppModel(ObservableObject):
     def _on_watchdog_property_changed(self, name, value, old_value):
         wd_mon = self._analysis.watchdog_monitor
         if name == wd_mon.IS_ENGAGED:
-            engaged_d = wd_mon.engaged_watchdogs
-            if value and not old_value:  # watchd.is_engaged:
-                self.on_error("Watchdog timeout",
-                              f"Fatal error: element(s) timedout:\n\n"
-                              f"{engaged_d}\n\n"
-                              f"Application shall be restarted fully.")
+            if value:
+                for watchdog_id in wd_mon.engaged_watchdogs:
+                    self._handle_watchdog_timeout(watchdog_id)
+
+    def _handle_watchdog_timeout(self, watchdog_id) -> None:
+        watchdog_key = (
+            watchdog_id.value
+            if isinstance(watchdog_id, enum.Enum)
+            else str(watchdog_id)
+        )
+        error = f"watchdog timed out: {watchdog_key}"
+        if watchdog_key.startswith("camera."):
+            camera_name = watchdog_key.partition(".")[2]
+            camera = next(
+                (item for item in self._cameras if item.name == camera_name),
+                None,
+            )
+            if camera is None:
+                logger.error("Unknown camera watchdog timed out: %s", watchdog_key)
+                return
+            try:
+                camera.on_capture_stop()
+            except Exception:
+                logger.exception("Failed to stop timed-out camera %s", camera_name)
+            self._analysis.watchdog_monitor.unregister_watchdog(watchdog_key)
+            root_error = camera.last_error or error
+            self._set_subsystem_status(
+                SubsystemId.camera(camera_name),
+                SubsystemState.FAILED,
+                error=root_error,
+            )
+            if camera in self._reach_cameras:
+                if camera.is_primary:
+                    for secondary in self._reach_cameras:
+                        if not secondary.is_enabled or secondary is camera:
+                            continue
+                        try:
+                            secondary.on_capture_stop()
+                        except Exception:
+                            logger.exception(
+                                "Failed to suspend secondary camera %s",
+                                secondary.name,
+                            )
+                        self._analysis.watchdog_monitor.unregister_watchdog(
+                            f"camera.{secondary.name}"
+                        )
+                        self._set_subsystem_status(
+                            SubsystemId.camera(secondary.name),
+                            SubsystemState.BLOCKED,
+                            reason="primary trigger unavailable",
+                        )
+                self._set_subsystem_status(
+                    SubsystemId.REACH_SYNCHRONIZATION,
+                    SubsystemState.FAILED,
+                    error=(
+                        f"reach camera unavailable: {camera_name}; {root_error}"
+                    ),
+                )
+                try:
+                    self._inference.stop()
+                except Exception:
+                    logger.exception("Failed to stop inference after camera timeout")
+                self._set_subsystem_status(
+                    SubsystemId.LIVE_INFERENCE,
+                    SubsystemState.BLOCKED,
+                    reason=f"reach camera unavailable: {camera_name}",
+                )
+            else:
+                self._set_subsystem_status(
+                    SubsystemId.TOP_CAPTURE,
+                    SubsystemState.FAILED,
+                    error=root_error,
+                )
+            self._abort_recording_for_required_subsystem(
+                SubsystemId.camera(camera_name),
+                root_error,
+            )
+        elif watchdog_key in {
+            WatchdogItems.DEVICE_READER.value,
+            WatchdogItems.DEVICE_WRITER.value,
+        }:
+            try:
+                self._hardware.safety_shutdown(error, wait=False)
+            except Exception:
+                logger.exception("CAN safety shutdown failed after watchdog timeout")
+            self._analysis.watchdog_monitor.unregister_watchdog(watchdog_id)
+            self._set_subsystem_status(
+                SubsystemId.CAN_PELLET,
+                SubsystemState.FAILED,
+                error=error,
+            )
+            self._abort_recording_for_required_subsystem(
+                SubsystemId.CAN_PELLET,
+                error,
+            )
+        elif watchdog_key in {
+            WatchdogItems.POSE_PROCESS.value,
+            WatchdogItems.POSE_DATA_MONITOR_PROC.value,
+        }:
+            try:
+                self._inference.stop()
+            except Exception:
+                logger.exception("Failed to stop inference after watchdog timeout")
+            self._analysis.watchdog_monitor.unregister_watchdog(watchdog_id)
+            self._set_subsystem_status(
+                SubsystemId.LIVE_INFERENCE,
+                SubsystemState.FAILED,
+                error=error,
+            )
+            self._abort_recording_for_required_subsystem(
+                SubsystemId.LIVE_INFERENCE,
+                error,
+            )
+        else:
+            logger.error("Unowned watchdog timed out: %s", watchdog_key)
+            return
+        self.on_error(
+            "Hardware subsystem failure",
+            f"{error}. Unrelated hardware remains running; Record is blocked "
+            "until the required subsystem is ready.",
+        )
+
+    def _on_nidaq_monitor_property_changed(self, name, value, _old_value):
+        monitor = self._nidaq_signal_monitor
+        if name == monitor.IS_STARTING and value:
+            self._begin_subsystem_start(SubsystemId.NIDAQ_STREAM)
+        elif name == monitor.IS_RUNNING:
+            if value:
+                self._set_subsystem_status(
+                    SubsystemId.NIDAQ_STREAM,
+                    SubsystemState.READY,
+                    reason="NI-DAQ tasks running",
+                )
+            elif (
+                monitor.configuration.is_enabled
+                and monitor.hardware_enabled
+                and not monitor.error_message
+            ):
+                self._set_subsystem_status(
+                    SubsystemId.NIDAQ_STREAM,
+                    SubsystemState.STOPPED,
+                    reason="NI-DAQ stream stopped",
+                )
+        elif name == monitor.ERROR_MESSAGE and value:
+            self._set_subsystem_status(
+                SubsystemId.NIDAQ_STREAM,
+                SubsystemState.FAILED,
+                error=str(value),
+            )
+            self._abort_recording_for_required_subsystem(
+                SubsystemId.NIDAQ_STREAM,
+                str(value),
+            )
+
+    def _on_laser_runtime_property_changed(self, name, value, _old_value):
+        if name != self._laser.IS_CONNECTED:
+            return
+        if value:
+            self._set_subsystem_status(
+                SubsystemId.LASER,
+                SubsystemState.READY,
+                reason="laser controller connected",
+            )
+        elif self._laser.configuration.backend != "disabled":
+            self._set_subsystem_status(
+                SubsystemId.LASER,
+                SubsystemState.STOPPED,
+                reason="laser controller disconnected",
+            )
+
+    def _abort_recording_for_required_subsystem(
+        self,
+        subsystem_id,
+        reason: str,
+    ) -> None:
+        status = self._subsystem_status_registry.get(subsystem_id)
+        if (
+            status is not None
+            and status.required_for_recording
+            and self._session_recording_status in {
+                SessionRecordingStatus.ARMING,
+                SessionRecordingStatus.RECORDING,
+            }
+        ):
+            logger.error(
+                "Required subsystem %s failed during recording: %s; aborting session",
+                status.subsystem_id,
+                reason,
+            )
+            self.abort_recording()
 
     def _on_autoclamp_evasion_property_changed(self, name, value, _):
         det = self._analysis.autoclamp_evasion_detector
