@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Optional, List, Dict, Callable, Any, Union, ClassVar, Protocol, Tuple
 
 import pandas
+import numpy as np
 import yaml
 
 from autotrainer.api import ApiSystemStatus, ApiDetectorKind, ApiProjectStatus, \
@@ -2198,6 +2199,683 @@ class AppModel(ObservableObject):
         warnings.warn(f"{self.__class__.__name__}.on_capture_stop is renamed to capture_stop. please update",
                       PendingDeprecationWarning, stacklevel=2)
         return self.capture_stop(**kwargs)
+
+    def _prepare_camera_domain(
+        self,
+        camera: VideoCaptureModel,
+        inference_queue,
+        inference_index: Optional[int],
+    ) -> bool:
+        subsystem_id = SubsystemId.camera(camera.name)
+        generation = self._begin_subsystem_start(
+            subsystem_id,
+            reason="starting camera process",
+        )
+        started = time.perf_counter()
+        try:
+            did_start = camera.on_prepare_capture(
+                inference_queue,
+                inference_index=inference_index,
+            )
+            if not did_start:
+                raise RuntimeError(camera.last_error or "camera process did not start")
+            if (
+                not camera.wait_for_capture_status(
+                    (CaptureProcessStatus.RUNNING, CaptureProcessStatus.FAILED),
+                    timeout=5,
+                )
+                or camera.video_status != CaptureProcessStatus.RUNNING
+            ):
+                raise RuntimeError(camera.last_error or "camera process did not become ready")
+        except Exception as exc:
+            try:
+                camera.on_capture_stop()
+            except Exception:
+                logger.exception("Failed to clean up camera %s", camera.name)
+            self._set_subsystem_status(
+                subsystem_id,
+                SubsystemState.FAILED,
+                error=str(exc) or exc.__class__.__name__,
+                generation=generation,
+            )
+            logger.exception("Camera %s initialization failed", camera.name)
+            return False
+        log_hardware_initialization(
+            logger,
+            "READY | camera process | name=%s status=%s elapsed=%.3fs",
+            camera.name,
+            camera.video_status.name,
+            time.perf_counter() - started,
+        )
+        return True
+
+    def _enable_camera_capture_domain(
+        self,
+        camera: VideoCaptureModel,
+        generation: int,
+        *,
+        wait_for_first_frame: bool = True,
+    ) -> bool:
+        subsystem_id = SubsystemId.camera(camera.name)
+        try:
+            camera.on_capture_start()
+            if not wait_for_first_frame:
+                return True
+        except Exception as exc:
+            try:
+                camera.on_capture_stop()
+            except Exception:
+                logger.exception("Failed to stop camera %s after capture failure", camera.name)
+            self._set_subsystem_status(
+                subsystem_id,
+                SubsystemState.FAILED,
+                error=str(exc) or exc.__class__.__name__,
+                generation=generation,
+            )
+            logger.exception("Camera %s capture failed", camera.name)
+            return False
+        return self._wait_camera_first_frame_domain(camera, generation)
+
+    def _wait_camera_first_frame_domain(
+        self,
+        camera: VideoCaptureModel,
+        generation: int,
+    ) -> bool:
+        subsystem_id = SubsystemId.camera(camera.name)
+        try:
+            if not camera.wait_for_first_frame(timeout=5):
+                raise RuntimeError(camera.last_error or "camera delivered no frame")
+        except Exception as exc:
+            try:
+                camera.on_capture_stop()
+            except Exception:
+                logger.exception("Failed to stop camera %s after capture failure", camera.name)
+            self._set_subsystem_status(
+                subsystem_id,
+                SubsystemState.FAILED,
+                error=str(exc) or exc.__class__.__name__,
+                generation=generation,
+            )
+            logger.exception("Camera %s first-frame validation failed", camera.name)
+            return False
+        self._set_subsystem_status(
+            subsystem_id,
+            SubsystemState.READY,
+            reason=f"first frame {camera.last_captured_frame_index}",
+            generation=generation,
+        )
+        return True
+
+    def _start_reach_camera_domains(
+        self,
+        inference_camera_indices,
+    ) -> bool:
+        cameras = self._ordered_reach_cameras(enabled_only=True)
+        if not cameras:
+            self._set_subsystem_status(
+                SubsystemId.REACH_SYNCHRONIZATION,
+                SubsystemState.DISABLED,
+                reason="no enabled reach cameras",
+            )
+            return False
+        configured_primaries = tuple(
+            camera for camera in cameras if camera.is_primary
+        )
+        topology_error = (
+            None
+            if len(cameras) == 1 or len(configured_primaries) == 1
+            else (
+                "multiple enabled reach cameras require exactly one primary; "
+                f"found {len(configured_primaries)}"
+            )
+        )
+        primary = cameras[0]
+        prepared = {}
+        generation = self._begin_subsystem_start(
+            SubsystemId.REACH_SYNCHRONIZATION,
+            reason="validating reach camera topology",
+        )
+        primary_index = inference_camera_indices.get(primary)
+        primary_ready = self._prepare_camera_domain(
+            primary,
+            self._inference_queue if primary_index is not None else None,
+            primary_index,
+        )
+        if not primary_ready:
+            for secondary in cameras[1:]:
+                self._set_subsystem_status(
+                    SubsystemId.camera(secondary.name),
+                    SubsystemState.BLOCKED,
+                    reason="primary trigger unavailable",
+                )
+            self._set_subsystem_status(
+                SubsystemId.REACH_SYNCHRONIZATION,
+                SubsystemState.FAILED,
+                error=f"primary camera {primary.name} unavailable",
+                generation=generation,
+            )
+            return False
+        prepared[primary] = self._subsystem_status_registry.get(
+            SubsystemId.camera(primary.name)
+        ).generation
+
+        for secondary in cameras[1:]:
+            time.sleep(0.5)
+            inference_index = inference_camera_indices.get(secondary)
+            if self._prepare_camera_domain(
+                secondary,
+                self._inference_queue if inference_index is not None else None,
+                inference_index,
+            ):
+                prepared[secondary] = self._subsystem_status_registry.get(
+                    SubsystemId.camera(secondary.name)
+                ).generation
+
+        # Triggered secondaries must be armed before the primary emits edges.
+        for secondary in cameras[1:]:
+            if secondary in prepared and not self._enable_camera_capture_domain(
+                    secondary,
+                    prepared[secondary],
+                    wait_for_first_frame=False,
+            ):
+                prepared.pop(secondary)
+        primary_capture_started = self._enable_camera_capture_domain(
+            primary,
+            prepared[primary],
+            wait_for_first_frame=False,
+        )
+        primary_capture_ready = (
+            primary_capture_started
+            and self._wait_camera_first_frame_domain(primary, prepared[primary])
+        )
+        for secondary in cameras[1:]:
+            if secondary in prepared:
+                self._wait_camera_first_frame_domain(
+                    secondary,
+                    prepared[secondary],
+                )
+        all_ready = topology_error is None and primary_capture_ready and all(
+            (
+                status := self._subsystem_status_registry.get(
+                    SubsystemId.camera(camera.name)
+                )
+            ) is not None
+            and status.is_ready
+            for camera in cameras
+        )
+        self._set_subsystem_status(
+            SubsystemId.REACH_SYNCHRONIZATION,
+            SubsystemState.READY if all_ready else SubsystemState.FAILED,
+            reason=(
+                "standalone camera ready"
+                if all_ready and len(cameras) == 1
+                else "all enabled reach cameras synchronized"
+                if all_ready
+                else topology_error or "one or more enabled reach cameras unavailable"
+            ),
+            error="" if all_ready else topology_error or "reach synchronization incomplete",
+            generation=generation,
+        )
+        return all_ready
+
+    def _start_top_camera_domain(self) -> bool:
+        camera = self._top_camera
+        if not camera.is_enabled:
+            self._set_subsystem_status(
+                SubsystemId.TOP_CAPTURE,
+                SubsystemState.DISABLED,
+                reason="top camera disabled",
+            )
+            return False
+        generation = self._begin_subsystem_start(
+            SubsystemId.TOP_CAPTURE,
+            reason="starting top camera",
+        )
+        if not self._prepare_camera_domain(camera, None, None):
+            status = self._subsystem_status_registry.get(
+                SubsystemId.camera(camera.name)
+            )
+            self._set_subsystem_status(
+                SubsystemId.TOP_CAPTURE,
+                SubsystemState.FAILED,
+                error="" if status is None else status.error,
+                generation=generation,
+            )
+            return False
+        camera_generation = self._subsystem_status_registry.get(
+            SubsystemId.camera(camera.name)
+        ).generation
+        ready = self._enable_camera_capture_domain(camera, camera_generation)
+        self._set_subsystem_status(
+            SubsystemId.TOP_CAPTURE,
+            SubsystemState.READY if ready else SubsystemState.FAILED,
+            reason="top camera preview ready" if ready else "",
+            error="" if ready else camera.last_error,
+            generation=generation,
+        )
+        return ready
+
+    def _start_can_domain(self, *, wait_connected: bool) -> bool:
+        hard = self._hardware
+        if not hard.requires_connection:
+            self._set_subsystem_status(
+                SubsystemId.CAN_PELLET,
+                SubsystemState.DISABLED,
+                reason="CAN/pellet controller disabled",
+            )
+            return False
+        generation = self._begin_subsystem_start(
+            SubsystemId.CAN_PELLET,
+            reason="connecting CAN/pellet controller",
+        )
+        started = time.perf_counter()
+        try:
+            self._ensure_pellet_controller_connected()
+            if wait_connected:
+                deadline = time.perf_counter() + 3.0
+                for token in tuple(hard.pending_tokens):
+                    remaining = deadline - time.perf_counter()
+                    if remaining <= 0:
+                        raise TimeoutError("timed out waiting for pending CAN command")
+                    hard.wait_pending_command_acked(token, timeout=remaining)
+                while not hard.connected:
+                    if time.perf_counter() >= deadline:
+                        raise TimeoutError("timed out waiting for CAN hardware connection")
+                    time.sleep(0.05)
+        except Exception as exc:
+            error = str(exc) or exc.__class__.__name__
+            logger.exception("CAN/pellet initialization failed")
+            try:
+                hard.safety_shutdown(
+                    f"CAN/pellet initialization failure: {error}",
+                    wait=True,
+                )
+            except Exception:
+                logger.exception("CAN safety shutdown failed")
+            self._set_subsystem_status(
+                SubsystemId.CAN_PELLET,
+                SubsystemState.FAILED,
+                error=error,
+                generation=generation,
+            )
+            return False
+        self._set_subsystem_status(
+            SubsystemId.CAN_PELLET,
+            SubsystemState.READY,
+            reason="CAN/pellet controller connected",
+            generation=generation,
+        )
+        log_hardware_initialization(
+            logger,
+            "READY | CAN/pellet controller | connected=%s elapsed=%.3fs",
+            hard.connected,
+            time.perf_counter() - started,
+        )
+        return True
+
+    def _start_nidaq_domain(self, *, timeout: float = 12.0) -> bool:
+        monitor = self._nidaq_signal_monitor
+        if not (monitor.hardware_enabled and monitor.configuration.is_enabled):
+            self._set_subsystem_status(
+                SubsystemId.NIDAQ_STREAM,
+                SubsystemState.DISABLED,
+                reason="NI-DAQ stream disabled",
+            )
+            return False
+        generation = self._begin_subsystem_start(
+            SubsystemId.NIDAQ_STREAM,
+            reason="starting synchronized NI-DAQ tasks",
+        )
+        try:
+            if not monitor.start():
+                raise RuntimeError(
+                    monitor.error_message or "NI-DAQ stream did not start"
+                )
+            deadline = time.perf_counter() + timeout
+            while monitor.is_starting and time.perf_counter() < deadline:
+                time.sleep(0.02)
+            if not monitor.is_running:
+                raise RuntimeError(
+                    monitor.error_message
+                    or f"NI-DAQ stream was not ready within {timeout:g} seconds"
+                )
+        except Exception as exc:
+            error = str(exc) or exc.__class__.__name__
+            logger.exception("NI-DAQ initialization failed")
+            monitor.stop()
+            self._set_subsystem_status(
+                SubsystemId.NIDAQ_STREAM,
+                SubsystemState.FAILED,
+                error=error,
+                generation=generation,
+            )
+            return False
+        timing_plan = monitor.timing_plan
+        if (
+            timing_plan is not None
+            and timing_plan.resolved_mode == "independent"
+            and len(timing_plan.task_start_order) > 1
+        ):
+            self._set_subsystem_status(
+                SubsystemId.NIDAQ_STREAM,
+                SubsystemState.BLOCKED,
+                reason=(
+                    "NI-DAQ diagnostic preview is running with independent device "
+                    "clocks; deterministic session recording is unavailable"
+                ),
+                generation=generation,
+            )
+            return False
+        self._set_subsystem_status(
+            SubsystemId.NIDAQ_STREAM,
+            SubsystemState.READY,
+            reason="synchronized NI-DAQ tasks running",
+            generation=generation,
+        )
+        return True
+
+    def _start_laser_domain(self) -> bool:
+        configuration = self._laser.configuration
+        if configuration.backend == "disabled":
+            self._set_subsystem_status(
+                SubsystemId.LASER,
+                SubsystemState.DISABLED,
+                reason="laser disabled",
+            )
+            return False
+        generation = self._begin_subsystem_start(
+            SubsystemId.LASER,
+            reason="opening laser controller",
+        )
+        try:
+            feedback_reader = (
+                self._read_nidaq_feedback_channel
+                if (
+                    configuration.backend == "nidaq"
+                    and self._nidaq_signal_monitor.is_running
+                )
+                else None
+            )
+            self._laser.load_configuration(
+                configuration,
+                feedback_reader=feedback_reader,
+            )
+        except Exception as exc:
+            error = str(exc) or exc.__class__.__name__
+            logger.exception("Laser initialization failed")
+            try:
+                self._laser.close()
+            except Exception:
+                logger.exception("Laser cleanup failed")
+            self._set_subsystem_status(
+                SubsystemId.LASER,
+                SubsystemState.FAILED,
+                error=error,
+                generation=generation,
+            )
+            return False
+        self._set_subsystem_status(
+            SubsystemId.LASER,
+            SubsystemState.READY,
+            reason="laser controller connected",
+            generation=generation,
+        )
+        return True
+
+    def _read_nidaq_feedback_channel(self, physical_channel: str) -> float:
+        monitor = self._nidaq_signal_monitor
+        if not monitor.is_running:
+            raise RuntimeError("shared NI-DAQ input stream is not running")
+        configuration = monitor.configuration
+        channel_index = next(
+            (
+                index
+                for index, channel in enumerate(configuration.channels)
+                if channel.physical_channel == physical_channel
+            ),
+            None,
+        )
+        if channel_index is None:
+            raise KeyError(
+                f"NI-DAQ input channel is not in the acquisition plan: {physical_channel}"
+            )
+        ring = monitor.sample_ring
+        scratch = np.empty(
+            (max(1, len(ring.channel_names)), 1),
+            dtype=np.float32,
+        )
+        for _ in range(5):
+            end_sample_index = ring.current_end_sample_index()
+            if end_sample_index <= 0:
+                break
+            read = ring.copy_since(end_sample_index - 1, scratch)
+            if read is not None and read.sample_count == 1:
+                return float(scratch[channel_index, 0])
+        raise RuntimeError(
+            f"No current NI-DAQ feedback sample is available for {physical_channel}"
+        )
+
+    def _start_inference_domain(
+        self,
+        *,
+        reach_synchronization_ready: bool,
+        preflight_error: Optional[str],
+    ) -> bool:
+        if not self._inference.is_enabled:
+            self._set_subsystem_status(
+                SubsystemId.LIVE_INFERENCE,
+                SubsystemState.DISABLED,
+                reason="live inference disabled",
+            )
+            return False
+        if preflight_error:
+            return False
+        if not reach_synchronization_ready:
+            self._set_subsystem_status(
+                SubsystemId.LIVE_INFERENCE,
+                SubsystemState.BLOCKED,
+                reason="enabled reach camera synchronization is not ready",
+            )
+            return False
+        generation = self._begin_subsystem_start(
+            SubsystemId.LIVE_INFERENCE,
+            reason="starting live inference",
+        )
+        try:
+            if not self._inference.start(self._inference_queue):
+                raise RuntimeError("live inference process did not start")
+        except Exception as exc:
+            error = str(exc) or exc.__class__.__name__
+            logger.exception("Live inference initialization failed")
+            try:
+                self._inference.stop()
+            except Exception:
+                logger.exception("Live inference cleanup failed")
+            self._set_subsystem_status(
+                SubsystemId.LIVE_INFERENCE,
+                SubsystemState.FAILED,
+                error=error,
+                generation=generation,
+            )
+            return False
+        self._set_subsystem_status(
+            SubsystemId.LIVE_INFERENCE,
+            SubsystemState.READY,
+            reason="live inference running",
+            generation=generation,
+        )
+        return True
+
+    def _validate_session_logs_domain(self) -> bool:
+        generation = self._begin_subsystem_start(
+            SubsystemId.SESSION_LOGS,
+            reason="validating session output location",
+        )
+        try:
+            output_location = Path(self._output_location).expanduser()
+            output_location.mkdir(parents=True, exist_ok=True)
+            if not os.access(output_location, os.W_OK):
+                raise PermissionError(f"session output is not writable: {output_location}")
+        except Exception as exc:
+            error = str(exc) or exc.__class__.__name__
+            logger.exception("Session output validation failed")
+            self._set_subsystem_status(
+                SubsystemId.SESSION_LOGS,
+                SubsystemState.FAILED,
+                error=error,
+                generation=generation,
+            )
+            return False
+        self._set_subsystem_status(
+            SubsystemId.SESSION_LOGS,
+            SubsystemState.READY,
+            reason=f"session output writable: {output_location}",
+            generation=generation,
+        )
+        return True
+
+    def retry_failed_subsystems(self) -> str:
+        """Retry failed acquisition domains without disturbing healthy domains."""
+        if not self._acquisition_started:
+            raise RuntimeError("Subsystem retry requires System Mode to be running")
+        if self._session_recording_status is not SessionRecordingStatus.READY:
+            raise RuntimeError("Subsystem retry is unavailable during recording or analysis")
+
+        failed = {
+            subsystem_id
+            for subsystem_id, status in self._subsystem_status_registry.statuses.items()
+            if status.state in {SubsystemState.FAILED, SubsystemState.BLOCKED}
+        }
+        retried = []
+        reach_failed = any(
+            subsystem_id == SubsystemId.REACH_SYNCHRONIZATION.value
+            or subsystem_id.startswith("camera.")
+            and any(
+                subsystem_id == SubsystemId.camera(camera.name)
+                for camera in self._reach_cameras
+            )
+            for subsystem_id in failed
+        )
+        if reach_failed:
+            if self._retry_reach_camera_domains():
+                retried.append("reach cameras")
+        if SubsystemId.TOP_CAPTURE.value in failed or (
+            SubsystemId.camera(self._top_camera.name) in failed
+        ):
+            if self._start_top_camera_domain():
+                retried.append("top camera")
+        if SubsystemId.CAN_PELLET.value in failed:
+            if self._start_can_domain(wait_connected=True):
+                retried.append("CAN/pellet")
+        if SubsystemId.NIDAQ_STREAM.value in failed:
+            if self._start_nidaq_domain():
+                retried.append("NI-DAQ")
+        if SubsystemId.LASER.value in failed:
+            if self._start_laser_domain():
+                retried.append("laser")
+        if SubsystemId.SESSION_LOGS.value in failed:
+            if self._validate_session_logs_domain():
+                retried.append("session output")
+
+        synchronization = self._subsystem_status_registry.get(
+            SubsystemId.REACH_SYNCHRONIZATION
+        )
+        inference = self._subsystem_status_registry.get(SubsystemId.LIVE_INFERENCE)
+        if (
+            self._inference.is_enabled
+            and synchronization is not None
+            and synchronization.is_ready
+            and (inference is None or not inference.is_ready)
+            and self._start_inference_domain(
+                reach_synchronization_ready=True,
+                preflight_error=None,
+            )
+        ):
+            retried.append("live inference")
+        remaining = self._subsystem_status_registry.recording_blockers()
+        if remaining:
+            return (
+                f"Retried {', '.join(retried) if retried else 'failed subsystems'}; "
+                f"Record remains blocked: {'; '.join(remaining)}"
+            )
+        return (
+            f"Ready after retry: {', '.join(retried)}"
+            if retried
+            else "All required subsystems are already ready"
+        )
+
+    def _retry_reach_camera_domains(self) -> bool:
+        cameras = self._ordered_reach_cameras(enabled_only=True)
+        if not cameras:
+            return False
+        primary = cameras[0]
+        primary_status = self._subsystem_status_registry.get(
+            SubsystemId.camera(primary.name)
+        )
+        inference_indices = {
+            camera: index
+            for index, camera in enumerate(self._inference_cameras)
+        }
+        if primary_status is None or not primary_status.is_ready:
+            # Secondaries depend on the primary trigger, so this is the one retry
+            # case where the complete reach-camera synchronization domain restarts.
+            for camera in cameras:
+                try:
+                    camera.on_capture_stop()
+                except Exception:
+                    logger.exception("Failed to reset reach camera %s", camera.name)
+            return self._start_reach_camera_domains(inference_indices)
+
+        generation = self._begin_subsystem_start(
+            SubsystemId.REACH_SYNCHRONIZATION,
+            reason="retrying unavailable secondary cameras",
+        )
+        for secondary in cameras[1:]:
+            status = self._subsystem_status_registry.get(
+                SubsystemId.camera(secondary.name)
+            )
+            if status is not None and status.is_ready:
+                continue
+            inference_index = inference_indices.get(secondary)
+            if not self._prepare_camera_domain(
+                secondary,
+                self._inference_queue if inference_index is not None else None,
+                inference_index,
+            ):
+                continue
+            camera_generation = self._subsystem_status_registry.get(
+                SubsystemId.camera(secondary.name)
+            ).generation
+            if self._enable_camera_capture_domain(
+                secondary,
+                camera_generation,
+                wait_for_first_frame=False,
+            ):
+                self._wait_camera_first_frame_domain(
+                    secondary,
+                    camera_generation,
+                )
+        all_ready = all(
+            (
+                status := self._subsystem_status_registry.get(
+                    SubsystemId.camera(camera.name)
+                )
+            ) is not None
+            and status.is_ready
+            for camera in cameras
+        )
+        self._set_subsystem_status(
+            SubsystemId.REACH_SYNCHRONIZATION,
+            SubsystemState.READY if all_ready else SubsystemState.FAILED,
+            reason=(
+                "all enabled reach cameras synchronized"
+                if all_ready
+                else "one or more enabled reach cameras unavailable"
+            ),
+            error="" if all_ready else "reach synchronization incomplete",
+            generation=generation,
+        )
+        return all_ready
 
     def capture_start(
         self,
