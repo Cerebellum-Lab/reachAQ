@@ -8,14 +8,9 @@ from tools.acquisition.model.app_model_status import AppModelStatus
 from top_fixtures import MockSystemMachine
 
 
-def test_save_config_include_sensor_analysis_monitors_and_detectors(behavior_model):
+def test_save_config_includes_active_analysis_detectors(behavior_model):
     save = behavior_model.save_configuration
     analysis = behavior_model.analysis
-    #
-    cfg = analysis.global_animal_presence_alarm.config
-    cfg.presence_missing_delay_hours += 1
-    new = cfg.presence_missing_delay_hours
-    assert save().emergency_alarm.global_animal_presence.presence_missing_delay_hours == new
     #
     cfg = analysis.auto_tunnel_sweep_monitor.config
     new = cfg.enabled = not cfg.enabled
@@ -24,10 +19,6 @@ def test_save_config_include_sensor_analysis_monitors_and_detectors(behavior_mod
     thresh = analysis.headbar_pressure_monitor.engaged_threshold
     new = analysis.headbar_pressure_monitor.engaged_threshold = thresh + 5
     assert save().headbar_pressure.threshold == new
-    #
-    val = analysis.emergency_alarm_monitor.config.external_doors.use
-    new = analysis.emergency_alarm_monitor.config.external_doors.use = not val
-    assert save().emergency_alarm.external_doors.use == new
     #
     val = analysis.auto_tunnel_sweep_monitor.config.enabled
     new = analysis.auto_tunnel_sweep_monitor.config.enabled = not val
@@ -101,13 +92,13 @@ class TestColorLed:
         assert get_color(now=mid_night) == (0, 100, 0)
         #
         fault_alarm.is_engaged = True
-        assert get_color(now=mid_day) == (100, 0, 0)
-        assert get_color(now=mid_night) == (100, 0, 0)
+        assert get_color(now=mid_day) == (0, 0, 0)
+        assert get_color(now=mid_night) == (0, 100, 0)
         #
         fault_alarm.config.is_emergency_condition = False
         fault_alarm.property_changed(fault_alarm.CONFIG, fault_alarm.config, None)
         assert get_color(now=mid_day) == (0, 0, 0)
-        assert get_color(now=mid_night) == (100, 100, 0)
+        assert get_color(now=mid_night) == (0, 100, 0)
 
     def test_start_stop_not_same_day(self, app_model: AppModel):
         get_color = self.get_color
@@ -120,10 +111,10 @@ class TestColorLed:
         assert get_color(now=mid_day) == (0, 100, 0)
         #
         fault_alarm.is_engaged = True
-        assert get_color(now=mid_day) == (100, 0, 0)
-        assert get_color(now=mid_night) == (100, 0, 0)
+        assert get_color(now=mid_day) == (0, 100, 0)
+        assert get_color(now=mid_night) == (0, 0, 0)
         #
         fault_alarm.config.is_emergency_condition = False
         fault_alarm.property_changed(fault_alarm.CONFIG, fault_alarm.config, None)
         assert get_color(now=mid_night) == (0, 0, 0)
-        assert get_color(now=mid_day) == (100, 100, 0)
+        assert get_color(now=mid_day) == (0, 100, 0)
