@@ -6,6 +6,10 @@ from autotrainer.core import (
 )
 from tools.acquisition.model.nidaq_discovery import NidaqDevicePorts
 from tools.acquisition.model.nidaq_timing import build_nidaq_timing_plan
+from tools.acquisition.model.nidaq_timing import (
+    resolve_nidaq_device_aliases,
+    resolve_nidaq_stream_configuration,
+)
 
 
 def _stream(*channels):
@@ -25,6 +29,9 @@ def _pxi(name, serial):
         serial_number=serial,
         bus_type="PXI",
         pxi_chassis_number=1,
+        analog_inputs=(f"{name}/ai0",),
+        digital_inputs=(f"{name}/port0/line0",),
+        counter_outputs=(f"{name}/ctr0",),
         analog_output_sample_clock_supported=True,
         digital_trigger_supported=True,
     )
@@ -168,3 +175,108 @@ def test_independent_mode_is_diagnostic_only_when_alignment_is_required():
     assert not plan.is_valid
     assert plan.resolved_mode == "independent"
     assert plan.synchronization_quality == "independent_host_estimated"
+
+
+def test_channel_alias_resolves_by_stable_device_identity():
+    configuration = _stream(
+        ("cam_frames", "OldAlias/port0/line0", "digital"),
+    )
+    devices = (
+        NidaqDevicePorts(
+            name="RenamedDevice",
+            product_type="InputModel",
+            serial_number=123,
+            digital_inputs=("RenamedDevice/port0/line0",),
+        ),
+    )
+    aliases = resolve_nidaq_device_aliases(
+        (
+            NidaqDeviceIdentity(
+                logical_name="acquisition",
+                runtime_name="OldAlias",
+                product_type="InputModel",
+                serial_number=123,
+            ),
+        ),
+        devices,
+    )
+
+    resolved = resolve_nidaq_stream_configuration(
+        configuration,
+        aliases,
+    )
+
+    assert aliases["OldAlias"] == "RenamedDevice"
+    assert (
+        resolved.channels[0].physical_channel
+        == "RenamedDevice/port0/line0"
+    )
+
+
+def test_discovered_channel_and_rate_capabilities_are_validated():
+    missing_channel = build_nidaq_timing_plan(
+        _stream(("feedback", "Acquire/ai1", "analog")),
+        NidaqTimingConfiguration(),
+        (
+            NidaqDevicePorts(
+                name="Acquire",
+                analog_inputs=("Acquire/ai0",),
+            ),
+        ),
+    )
+    excessive_rate = build_nidaq_timing_plan(
+        NidaqSignalStreamConfiguration(
+            channels=(
+                NidaqSignalChannelConfiguration(
+                    "feedback",
+                    "Acquire/ai0",
+                    "analog",
+                ),
+            ),
+            is_enabled=True,
+            sample_rate_hz=20_000,
+        ),
+        NidaqTimingConfiguration(),
+        (
+            NidaqDevicePorts(
+                name="Acquire",
+                analog_inputs=("Acquire/ai0",),
+                analog_input_max_single_channel_rate=10_000,
+            ),
+        ),
+    )
+
+    assert not missing_channel.is_valid
+    assert "is not available" in missing_channel.reason
+    assert not excessive_rate.is_valid
+    assert "exceeds" in excessive_rate.reason
+
+
+def test_explicit_route_must_be_present_when_terminals_are_discovered():
+    plan = build_nidaq_timing_plan(
+        _stream(
+            ("first", "DevA/ai0", "analog"),
+            ("second", "DevB/ai0", "analog"),
+        ),
+        NidaqTimingConfiguration(
+            sync_mode="external",
+            start_trigger_source="/DevA/PFI7",
+            sample_clock_source="/DevA/PFI1",
+        ),
+        (
+            NidaqDevicePorts(
+                name="DevA",
+                bus_type="USB",
+                analog_inputs=("DevA/ai0",),
+                terminals=("/DevA/PFI0", "/DevA/PFI1"),
+            ),
+            NidaqDevicePorts(
+                name="DevB",
+                bus_type="USB",
+                analog_inputs=("DevB/ai0",),
+            ),
+        ),
+    )
+
+    assert not plan.is_valid
+    assert "/DevA/PFI7" in plan.reason

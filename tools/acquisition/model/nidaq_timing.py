@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from typing import Iterable, Mapping, Optional, Sequence
 
 from autotrainer.core import (
@@ -43,6 +44,12 @@ def build_nidaq_timing_plan(
         )
     if not active_devices:
         return _invalid_plan(timing, "No hardware-timed NI-DAQ tasks are configured")
+    channel_error = _validate_channels_and_rates(
+        configuration,
+        discovered,
+    )
+    if channel_error:
+        return _invalid_plan(timing, channel_error)
 
     try:
         master = _select_master(
@@ -57,6 +64,10 @@ def build_nidaq_timing_plan(
 
     slaves = tuple(device for device in active_devices if device != master)
     task_start_order = (*slaves, master)
+    resolved_devices = _resolved_device_identities(
+        active_devices,
+        discovered,
+    )
     if not slaves:
         return NidaqTimingPlan(
             requested_mode=timing.sync_mode,
@@ -64,6 +75,7 @@ def build_nidaq_timing_plan(
             is_valid=True,
             master_device=master,
             task_start_order=task_start_order,
+            resolved_devices=resolved_devices,
             synchronization_quality="hardware_same_device",
             reason="All sampled tasks use one NI-DAQ device",
         )
@@ -77,6 +89,7 @@ def build_nidaq_timing_plan(
             master_device=master,
             slave_devices=slaves,
             task_start_order=task_start_order,
+            resolved_devices=resolved_devices,
             synchronization_quality="independent_host_estimated",
             reason=(
                 "Independent device clocks are diagnostic-only"
@@ -93,6 +106,17 @@ def build_nidaq_timing_plan(
             timing,
             "Backplane synchronization requested, but active devices do not "
             "share a discoverable PXI chassis",
+            master=master,
+            slaves=slaves,
+        )
+    if common_pxi_backplane and any(
+        device.digital_trigger_supported is False
+        for device in active_capabilities
+    ):
+        return _invalid_plan(
+            timing,
+            "Backplane synchronization requires digital trigger support on "
+            "every active NI-DAQ device",
             master=master,
             slaves=slaves,
         )
@@ -132,21 +156,47 @@ def build_nidaq_timing_plan(
         resolved_mode = "backplane"
         quality = "hardware_backplane"
 
+    unavailable_terminal = next(
+        (
+            terminal
+            for terminal in (
+                reference_clock,
+                start_trigger,
+                sample_clock,
+            )
+            if terminal
+            and not _terminal_is_discoverable(
+                terminal,
+                active_capabilities,
+                allow_pxi_clock=common_pxi_backplane,
+            )
+        ),
+        None,
+    )
+    if unavailable_terminal is not None:
+        return _invalid_plan(
+            timing,
+            f"Configured NI-DAQ timing terminal is not exposed by discovery: "
+            f"{unavailable_terminal}",
+            master=master,
+            slaves=slaves,
+        )
+
     routes = (
         NidaqTimingRoute(
             "reference_clock",
             reference_clock or "",
-            tuple(f"{slave}:reference_clock" for slave in slaves),
+            tuple(f"/{slave}/ReferenceClock" for slave in slaves),
         ),
         NidaqTimingRoute(
             "start_trigger",
             start_trigger or "",
-            tuple(f"{slave}:start_trigger" for slave in slaves),
+            tuple(f"/{slave}/StartTrigger" for slave in slaves),
         ),
         NidaqTimingRoute(
             "sample_clock",
             sample_clock or "",
-            tuple(f"{slave}:sample_clock" for slave in slaves),
+            tuple(f"/{slave}/SampleClock" for slave in slaves),
         ),
     )
     return NidaqTimingPlan(
@@ -161,6 +211,7 @@ def build_nidaq_timing_plan(
         start_trigger_source=start_trigger,
         routes=routes,
         task_start_order=task_start_order,
+        resolved_devices=resolved_devices,
         synchronization_quality=quality,
         reason=(
             "Resolved shared PXI reference/start/sample timing"
@@ -203,12 +254,29 @@ def _select_master(
                 f"Timing master {override.logical_name!r} did not resolve to "
                 "exactly one active device with the configured identity"
             )
-        return active_candidates[0].name
+        selected = active_candidates[0].name
+        if not _device_can_master(
+            selected,
+            configuration,
+            discovered[selected],
+        ):
+            raise ValueError(
+                f"Timing master {override.logical_name!r} cannot export a "
+                "sample clock for the configured task topology"
+            )
+        return selected
 
     for channel in configuration.channels:
         if channel.name == "cam_frames":
             device = device_name_from_channel(channel.physical_channel)
-            if device in active_devices:
+            if (
+                device in active_devices
+                and _device_can_master(
+                    device,
+                    configuration,
+                    discovered[device],
+                )
+            ):
                 return device
     if input_devices:
         analog_device = next(
@@ -219,8 +287,85 @@ def _select_master(
             ),
             None,
         )
-        return analog_device or input_devices[0]
-    return sorted(active_devices)[0]
+        if analog_device:
+            return analog_device
+    compatible = tuple(
+        device
+        for device in active_devices
+        if _device_can_master(
+            device,
+            configuration,
+            discovered[device],
+        )
+    )
+    if not compatible:
+        raise ValueError(
+            "No active NI-DAQ device can export the sample clock required by "
+            "the configured task topology"
+        )
+    return sorted(compatible)[0]
+
+
+def resolve_nidaq_device_aliases(
+    identities: Sequence[NidaqDeviceIdentity],
+    devices: Sequence[NidaqDevicePorts],
+) -> Mapping[str, str]:
+    aliases = {}
+    for identity in identities:
+        candidates = tuple(
+            device
+            for device in devices
+            if (
+                identity.serial_number is None
+                or device.serial_number == identity.serial_number
+            )
+            and (
+                identity.product_type is None
+                or device.product_type == identity.product_type
+            )
+            and (
+                identity.serial_number is not None
+                or identity.runtime_name is None
+                or device.name == identity.runtime_name
+            )
+        )
+        if len(candidates) != 1:
+            raise ValueError(
+                f"Configured NI-DAQ device {identity.logical_name!r} did not "
+                "resolve to exactly one discovered device with the expected "
+                "model/serial identity"
+            )
+        runtime_name = candidates[0].name
+        aliases[identity.logical_name] = runtime_name
+        if identity.runtime_name:
+            aliases[identity.runtime_name] = runtime_name
+    return aliases
+
+
+def resolve_nidaq_stream_configuration(
+    configuration: NidaqSignalStreamConfiguration,
+    aliases: Mapping[str, str],
+) -> NidaqSignalStreamConfiguration:
+    channels = tuple(
+        dataclasses.replace(
+            channel,
+            physical_channel=remap_nidaq_physical_channel(
+                channel.physical_channel,
+                aliases,
+            ),
+        )
+        for channel in configuration.channels
+    )
+    return dataclasses.replace(configuration, channels=channels)
+
+
+def resolve_nidaq_device_names(
+    names: Iterable[str],
+    aliases: Mapping[str, str],
+) -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(aliases.get(str(name), str(name)) for name in names)
+    )
 
 
 def _has_common_pxi_backplane(
@@ -232,6 +377,126 @@ def _has_common_pxi_backplane(
         return False
     chassis = {device.pxi_chassis_number for device in devices}
     return len(chassis) == 1 and None not in chassis
+
+
+def _validate_channels_and_rates(configuration, discovered) -> Optional[str]:
+    analog_counts = {}
+    for channel in configuration.channels:
+        device_name = device_name_from_channel(channel.physical_channel)
+        device = discovered.get(device_name)
+        if device is None:
+            continue
+        normalized = channel.physical_channel.strip("/")
+        if channel.kind == "analog":
+            available = {
+                name.strip("/")
+                for name in device.analog_inputs
+            }
+            if available and normalized not in available:
+                return (
+                    f"Configured analog input {channel.physical_channel} is not "
+                    f"available on {device_name}"
+                )
+            analog_counts[device_name] = analog_counts.get(device_name, 0) + 1
+        else:
+            available = {
+                name.strip("/")
+                for name in device.digital_inputs
+            }
+            if available and normalized not in available:
+                return (
+                    f"Configured digital input {channel.physical_channel} is not "
+                    f"available on {device_name}"
+                )
+    for device_name, channel_count in analog_counts.items():
+        device = discovered[device_name]
+        maximum = (
+            device.analog_input_max_single_channel_rate
+            if channel_count == 1
+            else device.analog_input_max_multi_channel_rate
+        )
+        if maximum is not None and configuration.sample_rate_hz > maximum:
+            return (
+                f"Configured sample rate {configuration.sample_rate_hz:g} Hz "
+                f"exceeds {device_name} capability {maximum:g} Hz"
+            )
+    return None
+
+
+def _resolved_device_identities(active_devices, discovered):
+    return tuple(
+        NidaqDeviceIdentity(
+            logical_name=name,
+            runtime_name=name,
+            product_type=discovered[name].product_type or None,
+            serial_number=discovered[name].serial_number,
+        )
+        for name in active_devices
+    )
+
+
+def _device_can_master(device_name, configuration, device) -> bool:
+    has_analog_input = any(
+        channel.kind == "analog"
+        and device_name_from_channel(channel.physical_channel) == device_name
+        for channel in configuration.channels
+    )
+    if has_analog_input:
+        return True
+    has_digital_input = any(
+        channel.kind == "digital"
+        and device_name_from_channel(channel.physical_channel) == device_name
+        for channel in configuration.channels
+    )
+    if has_digital_input:
+        if device.counter_outputs:
+            return True
+        # Some simulated/older discovery providers do not expose counter
+        # capability. Let task construction be the final validation only when
+        # the capability inventory is entirely absent.
+        return not (
+            device.analog_inputs
+            or device.analog_outputs
+            or device.digital_inputs
+            or device.digital_outputs
+            or device.counter_inputs
+        )
+    return device.analog_output_sample_clock_supported is True
+
+
+def _terminal_is_discoverable(
+    terminal: str,
+    devices: Sequence[NidaqDevicePorts],
+    *,
+    allow_pxi_clock: bool,
+) -> bool:
+    normalized = terminal.strip().lower()
+    if normalized in {"pxi_clk10", "pxiclk10", "/pxi_clk10", "/pxiclk10"}:
+        return allow_pxi_clock
+    device_name = device_name_from_channel(terminal)
+    if device_name is None:
+        return True
+    device = next(
+        (candidate for candidate in devices if candidate.name == device_name),
+        None,
+    )
+    if device is None or not device.terminals:
+        return True
+    available = {item.strip("/").lower() for item in device.terminals}
+    return terminal.strip("/").lower() in available
+
+
+def remap_nidaq_physical_channel(
+    physical_channel: str,
+    aliases: Mapping[str, str],
+) -> str:
+    leading_slash = physical_channel.startswith("/")
+    parts = physical_channel.strip("/").split("/", 1)
+    if len(parts) != 2:
+        return physical_channel
+    mapped = aliases.get(parts[0], parts[0])
+    result = f"{mapped}/{parts[1]}"
+    return f"/{result}" if leading_slash else result
 
 
 def _invalid_plan(
