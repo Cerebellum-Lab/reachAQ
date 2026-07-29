@@ -27,7 +27,8 @@ class QCaptureSettings(QWidget):
         self._isCaptureEnabled.stateChanged.connect(self._is_capture_enabled_changed)
         layout.addWidget(self._isCaptureEnabled, 0, 1)
 
-        layout.addWidget(QLabel("Record Mode:"), 1, 0)
+        self._record_mode_label = QLabel("Record Mode:")
+        layout.addWidget(self._record_mode_label, 1, 0)
         self._record_mode = QComboBox()
         self._record_mode.setMaximumWidth(140)
         self._record_mode.addItem("Continuous")
@@ -105,6 +106,10 @@ class QCaptureSettings(QWidget):
             self._record_mode.setCurrentIndex(-1)
         else:
             self._record_mode.setCurrentIndex(mode)
+
+    def setRecordModeVisible(self, visible: bool) -> None:
+        self._record_mode_label.setVisible(visible)
+        self._record_mode.setVisible(visible)
 
     def setStillImageCaptureEnabled(self, b: bool) -> None:
         self._isStillImageCaptureEnabled.setChecked(b)

@@ -39,9 +39,11 @@ class CameraContent(ContentWidget):
         capture_view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         settings = self._settings = capture_view.settings
+        capture_model.record_mode = VideoRecordMode.TRIGGER
         settings.setIsVideoCaptureEnabled(capture_model.is_enabled)
         settings.setIsVideoRecordEnabled(capture_model.is_recording_enabled)
-        settings.setRecordMode(capture_model.record_mode)
+        settings.setRecordMode(VideoRecordMode.TRIGGER)
+        settings.setRecordModeVisible(False)
         settings.setStillImageCaptureEnabled(capture_model.is_still_capture_enabled)
         settings.setStillImageCaptureInterval(capture_model.still_image_capture_interval)
 
@@ -110,8 +112,7 @@ class CameraContent(ContentWidget):
 
     def _recording_enabled_changed(self, is_enabled):
         self._model.is_recording_enabled = is_enabled
-        self._model.record_mode = VideoRecordMode.TRIGGER if \
-            self._settings.isTriggerRecordMode else VideoRecordMode.CONTINUOUS
+        self._model.record_mode = VideoRecordMode.TRIGGER
 
     def _is_still_image_capture_enabled_changed(self, is_enabled):
         self._model.is_still_capture_enabled = is_enabled

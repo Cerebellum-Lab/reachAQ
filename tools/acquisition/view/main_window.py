@@ -213,7 +213,6 @@ class MainWindow(QMainWindow):
         self._reload_animals(self._app_model.animals)  # after all property_changed connect above
         #
         # then after everything:
-        self._set_reset_vat_text()
         self._set_reset_cage_clean_text()
         self._set_autoclamp_evasion(analysis.autoclamp_evasion_detector)
         QTimer.singleShot(0, self._refresh_hardware_bindings)
@@ -472,11 +471,6 @@ class MainWindow(QMainWindow):
             return
         prj, rsp = raw
         self.main_content.show_analysis_reach_events(prj)
-
-    def on_reset_pellet_loaded_count(self):
-        prefs = self._preferences
-        prefs.pellet_load_count_total = prefs.pellet_load_count_day = 0
-        self._app_model.check_max_pellet_loaded()
 
     def on_reset_cage_clean(self):
         prefs = self._preferences
@@ -992,14 +986,6 @@ class MainWindow(QMainWindow):
         self._add_box_to_open_dialogs(dialog)
         dialog.exec()
 
-    def _set_reset_vat_text(self):
-        prefs = self._preferences
-        txt = (
-            f"Reset vat pellet count (vat refilled)\n"
-            f"{prefs.pellet_load_count_total} pellets presented since refill"
-        )
-        self._reset_pellet_loaded_count_action.setToolTip(txt)
-
     def _set_reset_cage_clean_text(self):
         self._reset_cage_clean_action.setToolTip("Mark the cage as cleaned.")
 
@@ -1047,9 +1033,6 @@ class MainWindow(QMainWindow):
         action.setCheckable(True)
         action.setEnabled(False)  # comment me to be able to show 20260205_agx001_trial011 on start
         action.triggered.connect(self.on_show_reach_event)
-
-        action = self._reset_pellet_loaded_count_action = QAction(_toolbar_icon("fa5s.fill"), "Reset Pellet VAT Load Count", self)
-        action.triggered.connect(self.on_reset_pellet_loaded_count)
 
         action = self._reset_cage_clean_action = QAction(_toolbar_icon("fa5s.broom"), "Reset Cage Clean", self)
         action.triggered.connect(self.on_reset_cage_clean)
@@ -1174,7 +1157,6 @@ class MainWindow(QMainWindow):
         toolbar.addSeparator()
 
         toolbar.addAction(self.show_reach_event_action)
-        toolbar.addAction(self._reset_pellet_loaded_count_action)
         toolbar.addAction(self._reset_autoclamp_evasion_action)
 
         spacer = QWidget()
@@ -1414,8 +1396,6 @@ class MainWindow(QMainWindow):
         prefs = self._preferences
         if name == prefs.LOG_LEVEL:
             self._update_log_level(value)
-        elif name == prefs.PELLET_LOAD_COUNT_TOTAL:
-            self._set_reset_vat_text()
         elif name == prefs.SERIAL_NUMBER:
             self._title = _make_window_title(prefs)
             self.setWindowTitle(self._title)

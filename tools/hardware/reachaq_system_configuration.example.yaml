@@ -119,8 +119,6 @@ behavior: !BehaviorConfiguration
     isEnabled: false
     isPelletCoverEnabled: true
     isIntersessionAnalysisEnabled: true
-    maxPelletsPerSession: 10
-    maxPelletsPerDay: 75
     maxPelletMissingSeconds: 15.0
   headClamp: !HeadClampConfiguration
     enabled: false

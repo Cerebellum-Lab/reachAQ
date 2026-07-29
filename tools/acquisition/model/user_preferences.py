@@ -38,8 +38,6 @@ class UserPreferences(ObservableObject):
     PELLET_PORT = "pellet_port"
     TUNNEL_PORT = "tunnel_port"
     MEASUREMENT_GRAPH = "measurement_graph"
-    PELLET_LOAD_COUNT_TOTAL = "pellet_load_count_total"
-    PELLET_LOAD_COUNT_DAY = "pellet_load_count_day"
     CAGE_CLEAN_PREVIOUS_DAY = "cage_clean_previous_day"
 
     def __init__(self, *, settings_file_path: Optional[Path] = None):
@@ -82,18 +80,8 @@ class UserPreferences(ObservableObject):
         self._log_location: str = settings.value("system/log_location", "")  # noqa
         self._log_level: int = settings.value("system/log_level", logging.WARNING, int)  # noqa
 
-        self._pellet_load_count_total: int = settings.value("system/pellet_load_count_total", 0, int)  # noqa
-        self._pellet_load_count_day: int = settings.value("system/pellet_load_count_day", 0, int)  # noqa
-        today = self._cur_day = date.today()
+        today = date.today()
         today_str = today.strftime(_date_format)
-        prev_pellet_day = settings.value("system/pellet_load_count_day_date", "", str)
-        if today_str != prev_pellet_day:
-            logger.verbose("auto-setting pellet_load_count_day to 0 given previous day != today: %r",
-                           prev_pellet_day)
-            self._pellet_load_count_day = 0
-            settings.setValue("system/pellet_load_count_day", 0)
-            settings.setValue("system/pellet_load_count_day_date", today_str)
-
         cage_clean_prev_day_str = settings.value("system/cage_clean_previous_day", "", str)
         if cage_clean_prev_day_str != "":
             try:
@@ -237,35 +225,6 @@ class UserPreferences(ObservableObject):
         prev, self._measurement_graph = self._measurement_graph, value
         self._settings.setValue("ui/measurement_graph", value)
         self._on_property_changed(self.MEASUREMENT_GRAPH, value, prev)
-
-    @property
-    def pellet_load_count_total(self) -> int:
-        return self._pellet_load_count_total
-
-    @pellet_load_count_total.setter
-    def pellet_load_count_total(self, value: int):
-        prev, self._pellet_load_count_total = self._pellet_load_count_total, value
-        self._settings.setValue("system/pellet_load_count_total", value)
-        self._on_property_changed(self.PELLET_LOAD_COUNT_TOTAL, value, prev)
-
-    @property
-    def pellet_load_count_day(self) -> int:
-        today = date.today()
-        if today != self._cur_day:
-            self._cur_day = today
-            self.pellet_load_count_day = 0
-            self._settings.setValue("system/pellet_load_count_day_date", today.strftime(_date_format))
-        return self._pellet_load_count_day
-
-    @pellet_load_count_day.setter
-    def pellet_load_count_day(self, value: int):
-        today = date.today()
-        if today != self._cur_day:
-            self._cur_day = today
-            self._settings.setValue("system/pellet_load_count_day_date", today.strftime(_date_format))
-        prev, self._pellet_load_count_day = self._pellet_load_count_day, value
-        self._settings.setValue("system/pellet_load_count_day", value)
-        self._on_property_changed(self.PELLET_LOAD_COUNT_DAY, value, prev)
 
     @property
     def cage_clean_previous_day(self) -> date:

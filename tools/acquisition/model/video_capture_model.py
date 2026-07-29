@@ -194,7 +194,7 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
         self._is_enabled = True
         self._is_primary = False
 
-        self._record_mode = VideoRecordMode.CONTINUOUS
+        self._record_mode = VideoRecordMode.TRIGGER
         self._is_recording_enabled = False
         self._record_rotate_interval = 3600
         self._is_still_capture_enabled = False
