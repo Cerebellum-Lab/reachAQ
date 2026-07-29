@@ -774,6 +774,11 @@ class AppModel(ObservableObject):
         self._session_analysis_finished = False
         self._session_analysis_started_perf = None
         self._session_analysis_duration_seconds = None
+        self._set_subsystem_status(
+            SubsystemId.OFFLINE_ANALYSIS,
+            SubsystemState.DISABLED,
+            reason="recording active; no stopped session pending",
+        )
         self._pending_session_end_perf = None
         self._session_boundary = None
         self._session_hardware_status_at_record = (
@@ -3975,11 +3980,29 @@ class AppModel(ObservableObject):
                 reason="laser controller connected",
             )
         elif self._laser.configuration.backend != "disabled":
-            self._set_subsystem_status(
-                SubsystemId.LASER,
-                SubsystemState.STOPPED,
-                reason="laser controller disconnected",
-            )
+            current = self._subsystem_status_registry.get(SubsystemId.LASER)
+            if (
+                self._acquisition_started
+                and not self._acquisition_stopping
+                and current is not None
+                and current.state is SubsystemState.READY
+            ):
+                reason = "laser controller disconnected unexpectedly"
+                self._set_subsystem_status(
+                    SubsystemId.LASER,
+                    SubsystemState.FAILED,
+                    error=reason,
+                )
+                self._abort_recording_for_required_subsystem(
+                    SubsystemId.LASER,
+                    reason,
+                )
+            else:
+                self._set_subsystem_status(
+                    SubsystemId.LASER,
+                    SubsystemState.STOPPED,
+                    reason="laser controller disconnected",
+                )
 
     def _abort_recording_for_required_subsystem(
         self,
@@ -4047,6 +4070,11 @@ class AppModel(ObservableObject):
                     self._session_analysis_duration_seconds,
                     project.short_id,
                 )
+            self._set_subsystem_status(
+                SubsystemId.OFFLINE_ANALYSIS,
+                SubsystemState.READY,
+                reason="offline analysis completed",
+            )
             self._set_session_recording_status(SessionRecordingStatus.READY)
             self._save_project_metadata(project, caller="session_analysis_ended")
 
@@ -4071,9 +4099,18 @@ class AppModel(ObservableObject):
         if self._session_analysis_finished:
             if self._session_analysis_duration_seconds is None:
                 self._session_analysis_duration_seconds = 0.0
+            self._set_subsystem_status(
+                SubsystemId.OFFLINE_ANALYSIS,
+                SubsystemState.READY,
+                reason="offline analysis completed",
+            )
             self._set_session_recording_status(SessionRecordingStatus.READY)
         else:
             self._session_analysis_started_perf = time.perf_counter()
+            self._begin_subsystem_start(
+                SubsystemId.OFFLINE_ANALYSIS,
+                reason="analyzing stopped session",
+            )
             self._set_session_recording_status(SessionRecordingStatus.ANALYZING)
         self._save_project_metadata(project, caller="raw_writers_closed")
 
@@ -4121,6 +4158,11 @@ class AppModel(ObservableObject):
             self._session_analysis_finished = True
             self._session_analysis_started_perf = None
             self._session_analysis_duration_seconds = None
+            self._set_subsystem_status(
+                SubsystemId.OFFLINE_ANALYSIS,
+                SubsystemState.DISABLED,
+                reason="aborted session has no offline analysis",
+            )
             self._abort_had_recording_started = False
             self._aborting_project = None
             self._set_session_recording_status(SessionRecordingStatus.READY)
@@ -4214,6 +4256,26 @@ class AppModel(ObservableObject):
             new_is_live = value == InferenceStatus.live
             if new_is_live:
                 self._p_inference_live_begin = time.perf_counter()
+            elif value == InferenceStatus.stopped:
+                current = self._subsystem_status_registry.get(
+                    SubsystemId.LIVE_INFERENCE
+                )
+                if (
+                    self._acquisition_started
+                    and not self._acquisition_stopping
+                    and current is not None
+                    and current.state is SubsystemState.READY
+                ):
+                    reason = "live inference stopped unexpectedly"
+                    self._set_subsystem_status(
+                        SubsystemId.LIVE_INFERENCE,
+                        SubsystemState.FAILED,
+                        error=reason,
+                    )
+                    self._abort_recording_for_required_subsystem(
+                        SubsystemId.LIVE_INFERENCE,
+                        reason,
+                    )
 
             if new_is_live or value == InferenceStatus.intersession:
                 self._analysis.watchdog_monitor.register_watchdog(
