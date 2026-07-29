@@ -12,9 +12,9 @@ from autotrainer.pyside import CardWidget, QSwitch
 from autotrainer.pyside.StackedContent import StackedLayout
 from autotrainer.pyside.content_widget import ContentWidget, invoke_method
 from autotrainer.pyside.xyz_label import XYZQLabel
-from autotrainer.pyside.DayTotalCount import DailyAndTotalCountsLabel
 
 from tools.acquisition.model.app_model import AppModel
+from tools.acquisition.model.app_model_status import SessionRecordingStatus
 from tools.acquisition.model.inference_model import InferenceModel
 from tools.acquisition.model.behavior_model import BehaviorModel
 from tools.acquisition.model.hardware_model import HardwareModel
@@ -42,8 +42,53 @@ class BehaviorContent(ContentWidget):
         self._inference_model = inference_model
         self._analysis = behavior_model.analysis
 
+        header_right_layout = QHBoxLayout()
+        header_right_layout.setContentsMargins(0, 0, 0, 0)
+        header_right_layout.setSpacing(8)
+        self._recording_status_label = QLabel("")
+        self._recording_status_label.setStyleSheet("font-weight: 600;")
+        header_right_layout.addWidget(self._recording_status_label)
         self._inference_status = QLabel("")
-        card = self._card_widget = CardWidget(title="Behavior", header_right_layout=self._inference_status)
+        header_right_layout.addWidget(self._inference_status)
+        card = self._card_widget = CardWidget(title="Behavior", header_right_layout=header_right_layout)
+
+        controls_layout = QHBoxLayout()
+        controls_layout.setContentsMargins(4, 4, 4, 0)
+        controls_layout.setSpacing(6)
+        self._record_button = QPushButton("Record")
+        self._record_button.clicked.connect(self._app_model.start_recording)
+        controls_layout.addWidget(self._record_button)
+        self._stop_button = QPushButton("Stop")
+        self._stop_button.clicked.connect(self._app_model.stop_recording)
+        controls_layout.addWidget(self._stop_button)
+        self._abort_button = QPushButton("Abort")
+        self._abort_button.clicked.connect(self._app_model.abort_recording)
+        controls_layout.addWidget(self._abort_button)
+        controls_layout.addStretch(1)
+
+        counts_layout = QGridLayout()
+        counts_layout.setContentsMargins(4, 2, 4, 4)
+        counts_layout.setHorizontalSpacing(6)
+        for column, (title, attr, initial) in enumerate((
+            ("Reaches", "_pellet_reaches_label", algo.pellet_reaches),
+            ("Presented", "_pellets_presented_label", algo.pellets_presented),
+            ("Success", "_successful_reaches_label", algo.successful_reaches),
+            ("Consumed", "_pellets_consumed_label", algo.pellets_consumed),
+        )):
+            widget = QWidget()
+            widget_layout = QHBoxLayout(widget)
+            widget_layout.setContentsMargins(6, 2, 6, 2)
+            widget_layout.setSpacing(5)
+            title_label = QLabel(f"{title}:")
+            title_label.setStyleSheet("font-weight: 600;")
+            widget_layout.addWidget(title_label)
+            value_label = QLabel(str(initial))
+            value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            value_label.setMinimumWidth(24)
+            widget_layout.addWidget(value_label)
+            widget.setStyleSheet("background: #f5f6f8; border-radius: 3px;")
+            counts_layout.addWidget(widget, 0, column)
+            setattr(self, attr, value_label)
 
         hbox_main_layout = QHBoxLayout()
         hbox_main_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
@@ -78,11 +123,6 @@ class BehaviorContent(ContentWidget):
         # allows to not have the behavior content constantly resize on width when any of the states below changes
         left_layout.setColumnMinimumWidth(1, 90)
         # left_layout.setColumnStretch(1, 1)
-
-        left_layout.addWidget(QLabel("System:"), left_cur_row, 0)
-        label = self._system_machine_state_label = QLabel(self._behavior_model.system_machine.state)
-        left_layout.addWidget(label, left_cur_row, 1, alignment=Qt.AlignmentFlag.AlignLeft)
-        left_cur_row += 1
 
         left_layout.addWidget(QLabel("Pellet:"), left_cur_row, 0)
         label = self._pellet_machine_state_label = QLabel(self._behavior_model.system_machine.pellet.state)
@@ -126,39 +166,11 @@ class BehaviorContent(ContentWidget):
         #
 
         right_cur_row = 0
-        label = QLabel("<b>Pellet Counts</b>")
-        right_layout.addWidget(label, right_cur_row, 0)
-        label = QLabel("<b>day / total</b>")
-        right_layout.addWidget(label, right_cur_row, 1)
-        right_cur_row += 1
-
-        right_layout.addWidget(QLabel("Presented:"), right_cur_row, 0)
-        self._pellets_presented_label = DailyAndTotalCountsLabel(day=algo.pellets_presented_day, total=algo.pellets_presented_day)
-        right_layout.addWidget(self._pellets_presented_label, right_cur_row, 1)
-        right_cur_row += 1
-
-        right_layout.addWidget(QLabel("Reaches:"), right_cur_row, 0)
-        label = self._pellet_reaches_label = DailyAndTotalCountsLabel(day=algo.pellet_reaches_day,
-                                                                      total=algo.pellet_reaches_total)
-        right_layout.addWidget(label, right_cur_row, 1)
-        right_cur_row += 1
-
-        right_layout.addWidget(QLabel("Success:"), right_cur_row, 0)
-        label = self._successful_reaches_label = DailyAndTotalCountsLabel(day=algo.successful_reaches_day,
-                                                                          total=algo.successful_reaches_total)
-        right_layout.addWidget(label, right_cur_row, 1)
-        right_cur_row += 1
-
-        right_layout.addWidget(QLabel("Consumed:"), right_cur_row, 0)
-        self._pellets_consumed_label = DailyAndTotalCountsLabel(day=algo.pellet_consumed_day, total=algo.pellet_consumed_total)
-        right_layout.addWidget(self._pellets_consumed_label, right_cur_row, 1)
-        right_cur_row += 1
-
         label = QLabel("<b>Pellet Shift XYZ</b>")
-        label.setContentsMargins(0, 8, 0, 4)
+        label.setContentsMargins(0, 0, 0, 4)
         right_layout.addWidget(label, right_cur_row, 0)
         label = QLabel("<b>mm</b>")
-        label.setContentsMargins(0, 8, 0, 4)
+        label.setContentsMargins(0, 0, 0, 4)
         right_layout.addWidget(label, right_cur_row, 1)
         right_cur_row += 1
 
@@ -188,7 +200,12 @@ class BehaviorContent(ContentWidget):
         content = QWidget()
         content.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Expanding)
         content.setContentsMargins(4, 4, 4, 4)
-        content.setLayout(hbox_main_layout)
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(2)
+        content_layout.addLayout(controls_layout)
+        content_layout.addLayout(counts_layout)
+        content_layout.addLayout(hbox_main_layout)
 
         card.setContentWidget(content)
 
@@ -232,20 +249,43 @@ class BehaviorContent(ContentWidget):
         app_model.hardware.property_changed += self._hardware_model_property_changed
         system_machine.shift_xyz_handler.property_changed += self._shift_xyz_property_changed
 
-        system_machine.events.state_changed += lambda old, new: self._system_machine_state_label.setText(new)
         pellet_machine.events.state_changed += lambda old, new: self._pellet_machine_state_label.setText(new)
         intersession_machine.events.state_changed += lambda old, new: self._intersession_state_label.setText(new)
 
         algo.property_changed += self._algorithm_property_changed
+        app_model.property_changed += self._app_model_property_changed
         self.status_changed.connect(self._inference_status.setText)
         self.set_is_editable(False)
         self._update_tunnel_headfix_visibility(app_model.hardware.tunnel_headfix_enabled)
+        self._update_recording_controls(app_model.session_recording_status)
 
     def set_is_editable(self, is_editable: bool):
         self._stack_layout.setCurrentIndex(1 if is_editable else 0)
 
     def set_is_capture_active(self, is_active: bool):
-        pass
+        self._update_recording_controls(self._app_model.session_recording_status)
+
+    def _update_recording_controls(self, status: SessionRecordingStatus):
+        self._recording_status_label.setText(status.value.capitalize())
+        acquisition_ready = self._app_model.acquisition_started
+        self._record_button.setEnabled(
+            acquisition_ready and status == SessionRecordingStatus.READY
+        )
+        self._stop_button.setEnabled(status == SessionRecordingStatus.RECORDING)
+        self._abort_button.setEnabled(status in {
+            SessionRecordingStatus.ARMING,
+            SessionRecordingStatus.RECORDING,
+        })
+
+    @invoke_method
+    def _app_model_property_changed(self, name, value, _):
+        if name == self._app_model.Props.SESSION_RECORDING_STATUS:
+            self._update_recording_controls(value)
+        elif name in {
+            self._app_model.Props.STATUS,
+            self._app_model.Props.ACQUISITION_RUNNING,
+        }:
+            self._update_recording_controls(self._app_model.session_recording_status)
 
     def _intersession_toggle_state_changed(self, x: int):
         self._behavior_model.algorithm.intersession_enabled = x != 0
@@ -286,29 +326,17 @@ class BehaviorContent(ContentWidget):
         elif name == props.HEAD_FIXATION_ENABLED:
             self._head_fixation_toggle.setChecked(value)
 
-        elif name == props.DAY_PELLET_COUNT:
-            self._pellets_consumed_label.update_values(day=value)
+        elif name == props.SESSION_PELLETS_CONSUMED:
+            self._pellets_consumed_label.setText(str(value))
 
-        elif name == props.TOTAL_PELLET_COUNT:
-            self._pellets_consumed_label.update_values(total=value)
+        elif name == props.SESSION_PELLETS_PRESENTED:
+            self._pellets_presented_label.setText(str(value))
 
-        elif name == props.DAY_PELLET_PRESENTED:
-            self._pellets_presented_label.update_values(day=value)
+        elif name == props.SESSION_REACHES:
+            self._pellet_reaches_label.setText(str(value))
 
-        elif name == props.TOTAL_PELLET_PRESENTED:
-            self._pellets_presented_label.update_values(total=value)
-
-        elif name == props.DAY_PELLET_REACHES:
-            self._pellet_reaches_label.update_values(day=value)
-
-        elif name == props.TOTAL_PELLET_REACHES:
-            self._pellet_reaches_label.update_values(total=value)
-
-        elif name == props.DAY_SUCCESSFUL_REACHES:
-            self._successful_reaches_label.update_values(day=value)
-
-        elif name == props.TOTAL_SUCCESSFUL_REACHES:
-            self._successful_reaches_label.update_values(total=value)
+        elif name == props.SESSION_SUCCESSFUL_REACHES:
+            self._successful_reaches_label.setText(str(value))
 
     @invoke_method
     def _inference_model_property_changed(self, name, value, _):
