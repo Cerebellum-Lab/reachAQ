@@ -90,6 +90,7 @@ class LaserModel(ObservableObject):
         configuration: LaserSystemConfiguration,
         *,
         feedback_reader: Optional[Callable[[str], float]] = None,
+        persisted_configuration: Optional[LaserSystemConfiguration] = None,
     ) -> None:
         backend = configuration.backend
         if backend == "disabled":
@@ -142,6 +143,17 @@ class LaserModel(ObservableObject):
             backend,
             time.perf_counter() - started,
         )
+        if (
+            persisted_configuration is not None
+            and persisted_configuration != configuration
+        ):
+            runtime_configuration = self._configuration
+            self._configuration = persisted_configuration
+            self._on_property_changed(
+                self.CONFIGURATION,
+                persisted_configuration,
+                runtime_configuration,
+            )
 
     def set_configuration_offline(self, configuration: LaserSystemConfiguration) -> None:
         prev_config = self._configuration

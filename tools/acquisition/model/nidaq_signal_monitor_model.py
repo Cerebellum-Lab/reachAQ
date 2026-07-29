@@ -12,6 +12,7 @@ from typing import Iterable, Optional
 from autotrainer.core import (
     NidaqSignalChannelConfiguration,
     NidaqSignalStreamConfiguration,
+    NidaqDeviceIdentity,
     NidaqTimingConfiguration,
     NidaqTimingPlan,
     ObservableObject,
@@ -30,6 +31,11 @@ from tools.acquisition.model.nidaq_sample_ring import SharedNidaqSampleRing
 from tools.acquisition.model.nidaq_channel_plan import with_display_channels
 from tools.acquisition.model.nidaq_discovery import discover_nidaq_devices
 from tools.acquisition.model.nidaq_timing import build_nidaq_timing_plan
+from tools.acquisition.model.nidaq_timing import (
+    resolve_nidaq_device_aliases,
+    resolve_nidaq_device_names,
+    resolve_nidaq_stream_configuration,
+)
 
 
 logger = get_verbose_logger(__name__)
@@ -155,6 +161,8 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
         self._error_message = ""
         self._timing_configuration = NidaqTimingConfiguration()
         self._hardware_timed_output_devices = tuple()
+        self._device_identities: tuple[NidaqDeviceIdentity, ...] = tuple()
+        self._runtime_device_aliases = {}
         self._timing_plan: Optional[NidaqTimingPlan] = None
         self._sample_ring = SharedNidaqSampleRing(self._configuration, mp_ctx=self._mp_ctx)
 
@@ -194,6 +202,10 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
     @property
     def timing_plan(self) -> Optional[NidaqTimingPlan]:
         return self._timing_plan
+
+    @property
+    def runtime_device_aliases(self):
+        return dict(self._runtime_device_aliases)
 
     @property
     def display_refresh_rate_hz(self) -> float:
@@ -285,6 +297,7 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
         configuration: NidaqTimingConfiguration,
         *,
         hardware_timed_output_devices: Iterable[str] = tuple(),
+        device_identities: Iterable[NidaqDeviceIdentity] = tuple(),
     ) -> None:
         if self._is_running or self._is_starting:
             raise RuntimeError("cannot change NI-DAQ timing while acquisition is active")
@@ -292,6 +305,8 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
         self._hardware_timed_output_devices = tuple(dict.fromkeys(
             str(device) for device in hardware_timed_output_devices if device
         ))
+        self._device_identities = tuple(device_identities)
+        self._runtime_device_aliases = {}
         self._set_timing_plan(None)
 
     def set_stream_channels(
@@ -355,15 +370,28 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
                 devices, discovery_error = self._device_discovery()
                 if discovery_error:
                     raise RuntimeError(discovery_error)
+                aliases = resolve_nidaq_device_aliases(
+                    self._device_identities,
+                    devices,
+                )
+                configuration = resolve_nidaq_stream_configuration(
+                    configuration,
+                    aliases,
+                )
+                hardware_timed_output_devices = resolve_nidaq_device_names(
+                    self._hardware_timed_output_devices,
+                    aliases,
+                )
                 timing_plan = build_nidaq_timing_plan(
                     configuration,
                     self._timing_configuration,
                     devices,
-                    hardware_timed_output_devices=self._hardware_timed_output_devices,
+                    hardware_timed_output_devices=hardware_timed_output_devices,
                 )
                 self._set_timing_plan(timing_plan)
                 if not timing_plan.is_valid:
                     raise RuntimeError(timing_plan.reason)
+                self._runtime_device_aliases = dict(aliases)
                 message_queue = self._mp_ctx.Queue(maxsize=16)
                 stop_event = self._mp_ctx.Event()
                 sample_ring = self.sample_ring

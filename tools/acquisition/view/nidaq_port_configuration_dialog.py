@@ -116,6 +116,8 @@ class NidaqPortConfigurationDialog(QDialog):
         self._timing_master_combo = QComboBox()
         self._timing_master_combo.addItem("Automatic (recommended)", None)
         for device in sorted(self._devices.values(), key=lambda item: item.name):
+            if not self._can_be_timing_master(device):
+                continue
             identity = self._device_identity(device)
             detail = device.product_type or "unknown model"
             if device.serial_number is not None:
@@ -384,8 +386,18 @@ class NidaqPortConfigurationDialog(QDialog):
             attr_name: self._combo_selections[combo]
             for attr_name, combo in self._general_combos.items()
         }
+        selected_device_names = tuple(dict.fromkeys(
+            device_name_from_channel(value)
+            for _role, _kind, value in self._selected_channel_entries()
+            if device_name_from_channel(value)
+        ))
         return NidaqPortConfiguration(
             device_name=device_name,
+            device_identities=tuple(
+                self._device_identity(self._devices[name])
+                for name in selected_device_names
+                if name in self._devices
+            ),
             timing=self._timing_configuration,
             **values,
         )
@@ -467,6 +479,17 @@ class NidaqPortConfigurationDialog(QDialog):
             runtime_name=device.name,
             product_type=device.product_type or None,
             serial_number=device.serial_number,
+        )
+
+    @staticmethod
+    def _can_be_timing_master(device: NidaqDevicePorts) -> bool:
+        return bool(
+            device.analog_inputs
+            or device.counter_outputs
+            or (
+                device.analog_outputs
+                and device.analog_output_sample_clock_supported is not False
+            )
         )
 
     @staticmethod

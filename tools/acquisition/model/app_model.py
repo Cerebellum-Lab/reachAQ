@@ -108,6 +108,10 @@ from tools.acquisition.model.hardware_scan import HardwareScanEntry, scan_can_ad
 from tools.acquisition.model.nidaq_discovery import device_name_from_channel, discover_nidaq_devices
 from tools.acquisition.model.nidaq_channel_plan import build_nidaq_acquisition_configuration
 from tools.acquisition.model.nidaq_signal_monitor_model import NidaqSignalMonitorModel
+from tools.acquisition.model.nidaq_timing import (
+    remap_nidaq_physical_channel,
+    resolve_nidaq_device_aliases,
+)
 from tools.acquisition.model.session_data_recorder import SessionDataRecorder
 from tools.acquisition.model.session_boundary import SessionBoundary
 from tools.acquisition.model.subsystem_status import (
@@ -2624,6 +2628,24 @@ class AppModel(ObservableObject):
             reason="opening laser controller",
         )
         try:
+            runtime_configuration = configuration
+            if (
+                configuration.backend == "nidaq"
+                and self._nidaq_ports.device_identities
+            ):
+                aliases = self._nidaq_signal_monitor.runtime_device_aliases
+                if not aliases:
+                    devices, discovery_error = discover_nidaq_devices()
+                    if discovery_error:
+                        raise RuntimeError(discovery_error)
+                    aliases = resolve_nidaq_device_aliases(
+                        self._nidaq_ports.device_identities,
+                        devices,
+                    )
+                runtime_configuration = self._remap_laser_configuration(
+                    configuration,
+                    aliases,
+                )
             feedback_reader = (
                 self._read_nidaq_feedback_channel
                 if (
@@ -2633,8 +2655,9 @@ class AppModel(ObservableObject):
                 else None
             )
             self._laser.load_configuration(
-                configuration,
+                runtime_configuration,
                 feedback_reader=feedback_reader,
+                persisted_configuration=configuration,
             )
         except Exception as exc:
             error = str(exc) or exc.__class__.__name__
@@ -2658,6 +2681,40 @@ class AppModel(ObservableObject):
         )
         return True
 
+    @staticmethod
+    def _remap_laser_configuration(configuration, aliases):
+        def remap(value):
+            return (
+                None
+                if value is None
+                else remap_nidaq_physical_channel(value, aliases)
+            )
+
+        return dataclasses.replace(
+            configuration,
+            channels=tuple(
+                dataclasses.replace(
+                    channel,
+                    analog_output=remap(channel.analog_output),
+                    diode_input=remap(channel.diode_input),
+                    shutter_output=remap(channel.shutter_output),
+                    auxiliary_output=remap(channel.auxiliary_output),
+                    command_copy_input=remap(channel.command_copy_input),
+                    trigger_source=remap(channel.trigger_source),
+                    trigger_output=remap(channel.trigger_output),
+                    timing_trigger_output=remap(
+                        channel.timing_trigger_output
+                    ),
+                )
+                for channel in configuration.channels
+            ),
+            pmt_shutter_output=remap(configuration.pmt_shutter_output),
+            trigger_listener_inputs=tuple(
+                remap(value)
+                for value in configuration.trigger_listener_inputs
+            ),
+        )
+
     def _read_nidaq_feedback_channel(self, physical_channel: str) -> float:
         monitor = self._nidaq_signal_monitor
         if not monitor.is_running:
@@ -2667,7 +2724,10 @@ class AppModel(ObservableObject):
             (
                 index
                 for index, channel in enumerate(configuration.channels)
-                if channel.physical_channel == physical_channel
+                if remap_nidaq_physical_channel(
+                    channel.physical_channel,
+                    monitor.runtime_device_aliases,
+                ) == physical_channel
             ),
             None,
         )
@@ -3550,6 +3610,7 @@ class AppModel(ObservableObject):
         self.nidaq_signal_monitor.configure_timing(
             configuration.nidaq_ports.timing,
             hardware_timed_output_devices=hardware_timed_output_devices,
+            device_identities=configuration.nidaq_ports.device_identities,
         )
         nidaq_acquisition = build_nidaq_acquisition_configuration(
             configuration.nidaq_stream,
@@ -3654,6 +3715,7 @@ class AppModel(ObservableObject):
         self._nidaq_signal_monitor.configure_timing(
             nidaq_ports.timing,
             hardware_timed_output_devices=hardware_timed_output_devices,
+            device_identities=nidaq_ports.device_identities,
         )
         self._loaded_configuration.nidaq_stream = acquisition
         self.configuration_loaded_event(self._loaded_configuration)

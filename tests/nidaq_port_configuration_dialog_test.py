@@ -158,12 +158,14 @@ def test_timing_master_is_portable_identity_and_only_enabled_for_multi_device(qa
             product_type="InputModel",
             serial_number=100,
             digital_inputs=("Acquire/port0/line0",),
+            counter_outputs=("Acquire/ctr0",),
         ),
         NidaqDevicePorts(
             name="Confirm",
             product_type="OtherModel",
             serial_number=200,
             digital_inputs=("Confirm/port0/line0",),
+            counter_outputs=("Confirm/ctr0",),
         ),
     )
 
@@ -175,6 +177,11 @@ def test_timing_master_is_portable_identity_and_only_enabled_for_multi_device(qa
     assert selected.runtime_name == "Acquire"
     built = dialog._build_timing_configuration()
     assert built.timing_master.serial_number == 100
+    ports = dialog._build_nidaq_port_configuration("Acquire")
+    assert {
+        identity.serial_number
+        for identity in ports.device_identities
+    } == {100, 200}
 
 
 def test_external_timing_mode_exposes_route_overrides(qapp):
