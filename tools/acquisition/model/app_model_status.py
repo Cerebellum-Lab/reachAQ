@@ -8,3 +8,12 @@ class AppModelStatus(str, enum.Enum):
     ANIMAL_IN_TRAINING = "animal_in_training"  # this is ANIMAL_IN_DEVICE with training behavior algo **enabled**
     CALIBRATION_3D = "calibration_3d"  # executing calib 3d
     CALIBRATION_DCS = "calibration_dcs"  # executing calib dcs
+
+
+class SessionRecordingStatus(str, enum.Enum):
+    READY = "ready"
+    ARMING = "arming"
+    RECORDING = "recording"
+    STOPPING = "stopping"
+    ANALYZING = "analyzing"
+    ABORTING = "aborting"
