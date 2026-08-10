@@ -57,9 +57,3 @@ class SystemCommandKind(IntEnum):
     SET_RGB_LED = 302
     SET_DIGITAL_OUTPUT = 303
     SET_ANALOG_OUTPUT = 304
-
-    # Not deprecated so long as the original hardware is supported, but a bit esoteric.  It is not necessary for
-    # new hardware to support them or for new application/scripts to support them.
-    RAW_COMMAND = 1001  # TODO only used at command line for original hardware.  Remove eventually.
-    STREAM_START = 1003  # TODO n/a new hardware, but required for original.
-    STREAM_STOP = 1004  # TODO n/a new hardware, but required for original.

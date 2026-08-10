@@ -76,7 +76,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         self._can_device: Optional[CanDevice] = None
         self._device_uuid_ack_timeout_engaged = False
         self._device_pellet_status_timeout_engaged = False
-        self._device_stream_started = False
+        self._device_initialization_complete = False
         self._can_enabled = True
         self._pellet_controller_enabled = True
         self._nidaq_enabled = False
@@ -583,9 +583,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             send_dev_ack_cmd(SystemCommandKind.WRITE_MOTOR_CONFIGURATION, motors_config.cover_config)
             # also need to re-apply the config
 
-        send_dev_ack_cmd(SystemCommandKind.STREAM_START)
-        logger.success("STREAM_START acknowledged")
-        self._device_stream_started = True
+        self._device_initialization_complete = True
 
         prev_thread = self._check_timedout_commands_thread
         if prev_thread is None or not prev_thread.is_alive():
@@ -625,7 +623,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         with self._lock:
             self._pending_tokens.clear()
         self._refresh_cmd_in_progress([])
-        self._device_stream_started = False
+        self._device_initialization_complete = False
         self._emit_device_event("state", "disconnected")
 
     def _reset_socketcan(self, transport: Optional[CanTransportConfiguration]) -> None:
@@ -880,7 +878,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             commands_in_prog = list(self._pending_tokens.values())
         if popped is None:
             # this can happen at device connection
-            (logger.debug if not self._device_stream_started else logger.warning)(
+            (logger.debug if not self._device_initialization_complete else logger.warning)(
                 "Received unexpected ack token: %s", token)
         else:
             self._refresh_cmd_in_progress(commands_in_prog)

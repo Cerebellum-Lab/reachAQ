@@ -431,9 +431,6 @@ class CanDevice(Device):
             SystemCommandKind.SERVO_ATTACH: self._interface.servo_attach,
             SystemCommandKind.SERVO_DETACH: self._interface.servo_detach,
 
-            # No-op handlers
-            SystemCommandKind.STREAM_START: _no_op_handler,
-            SystemCommandKind.STREAM_STOP: _no_op_handler,
         }
 
         # Initialize data / response handlers lookup table
@@ -1097,9 +1094,6 @@ class CanDevice(Device):
             return data
         elif kind == SystemCommandKind.REQUEST_VERSION:
             # It does not use uuid, so there is no single board pending context to track.
-            return None
-        elif kind in {SystemCommandKind.STREAM_START, SystemCommandKind.STREAM_STOP}:
-            # is no CAN operation
             return None
         elif kind in {
             SystemCommandKind.SET_LOAD_PELLET_PROCEDURE,
