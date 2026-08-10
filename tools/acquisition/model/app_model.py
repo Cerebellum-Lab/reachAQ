@@ -50,7 +50,6 @@ from autotrainer.core import (
     get_perf_now,
 )
 from autotrainer.core import AnimalSubject, FixedArrayMultiQueue
-from autotrainer.core.configuration.behavior_configuration import CageCleaningConfig
 from autotrainer.core.configuration.json_compat import SystemConfigurationJSONEncoder
 from autotrainer.core.interfaces import RecordingEndingReason, CaptureAnalysisResult
 from autotrainer.core.project import ProjectInfo, ProjectDependentProtocol
@@ -2019,14 +2018,6 @@ class AppModel(ObservableObject):
                 return animal
         return None
 
-    def get_days_before_cage_clean(self) -> int:
-        pref = self._preferences
-        cfg = self._behavior.algorithm.active_config.cage_cleaning
-        return (
-            cfg.clean_days_interval
-            - (date.today() - pref.cage_clean_previous_day).days
-        )
-
     @property
     def selected_animal(self) -> Optional[AnimalSubject]:
         return self._selected_animal
@@ -3953,9 +3944,6 @@ class AppModel(ObservableObject):
             #   pellet_m.send_pellet(force=True)
             # yet, it will be done by pellet-machine automatically if/when status goes to animal-in-training
 
-    def _refresh_cage_clean_data(self):
-        return None
-
     def _on_preferences_property_changed(self, name: str, value, old_value):
         prefs = UserPreferences
         if name == prefs.SELECTED_ANIMAL:
@@ -3963,8 +3951,6 @@ class AppModel(ObservableObject):
                 if animal.name == value:
                     self.selected_animal = animal
                     break
-        elif name == prefs.CAGE_CLEAN_PREVIOUS_DAY:
-            self._refresh_cage_clean_data()
 
     def _update_led_color(self):
         color = self._behavior.get_led_color()
@@ -4489,9 +4475,6 @@ class AppModel(ObservableObject):
                 self._save_animal_metadata(animal, sender="pellet_shift_y_limit")
                 self._event_manager.post_event_content(
                     ApiEventKind.animalUpdated, animal.to_api_status())
-
-        elif name == props.CAGE_CLEAN_CONFIG:
-            self._refresh_cage_clean_data()
 
     def _on_hardware_property_changed(self, name: str, value, _):
         animal = self._selected_animal
