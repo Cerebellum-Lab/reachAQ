@@ -161,15 +161,6 @@ behavior: !BehaviorConfiguration
     isPelletCoverEnabled: true
     isIntersessionAnalysisEnabled: true
     maxPelletMissingSeconds: 15.0
-  headClamp: !HeadClampConfiguration
-    enabled: false
-    baselineIntensity: 0.0
-    autoClampIntensity: 100
-    autoClampReleaseToneFreq: 7000
-    autoClampReleaseToneDelay: 0.1
-  headbarPressure: !HeadbarPressureConfiguration
-    threshold: 20
-    duration: 0.5
 persistence: !PersistenceConfiguration
   outputLocation: /home/<USER>/Documents/rawdatalocal
 watchdog: !WatchdogConfig

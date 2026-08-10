@@ -253,8 +253,6 @@ class PreferencesContent(QWidget):
                 self._deliver_pellet_toggle.isEnabled()
                 and self._deliver_pellet_toggle.isChecked()
                 and algo.active_config.pellet_delivery.retract_enabled
-                and (not algo.active_config.head_clamp.enabled
-                     or not algo.active_config.head_clamp.wait_engaged_before_send_pellet)
             ))
         def on_pellet_send_delay_changed(value: float):
             algo.active_config.pellet_delivery.pellet_send_wait_delay = value
@@ -281,8 +279,7 @@ class PreferencesContent(QWidget):
         left_grid_layout.addWidget(QLabel("<b>Cover Pellets:</b>"), cur_row, cur_col)
         toggle = self._pellet_cover_toggle = QSwitch()
         toggle.setToolTip(
-            "Covers the pellet when the mouse is not in the tunnel. "
-            "Release then generates a tone when the tunnel is entered.")
+            "Cover pellets until the configured hand-position release condition is met.")
         add_enabled_state(lambda: self._pellet_cover_toggle.setEnabled(
             self._deliver_pellet_toggle.isEnabled() and self._deliver_pellet_toggle.isChecked()
         ))

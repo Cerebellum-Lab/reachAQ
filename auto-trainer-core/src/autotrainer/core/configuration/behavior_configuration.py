@@ -1,14 +1,10 @@
 import dataclasses
 from dataclasses import dataclass, field
-from typing import Type, Optional, Dict
-from typing_extensions import Self
+from typing import Type, Optional
 
 import yaml
 
-from autotrainer.core.logging import get_verbose_logger
-from .. import build_kwargs_apply_mapping, make_camelize_representer, make_decamelize_constructor, Offset3DTuple
-
-logger = get_verbose_logger(__name__)
+from .. import make_camelize_representer, make_decamelize_constructor, Offset3DTuple
 
 
 @dataclasses.dataclass
@@ -87,7 +83,7 @@ class PelletDeliveryConfiguration:
     """When disabled no automatic behavior movement will be peformed, but eventually on application start"""
 
     pellet_send_wait_delay: float = 1
-    """In seconds, how long to wait before send_pellet when autoclamp disabled"""
+    """Seconds after recording starts before an automatic pellet send."""
 
     is_pellet_cover_enabled: bool = False
     """If enabled: cover pellet when session starts, and wait uncover condition"""
@@ -109,15 +105,6 @@ class PelletDeliveryConfiguration:
     """If enabled then a triangle-pellet too far distance also trigger a load-pellet"""
     triangle_pellet_expected_distance: float = 5  # mm
     triangle_pellet_diff_too_far_threshold: float = 1  # mm
-
-    @classmethod
-    def from_version_zero(cls, content: dict) -> Self:
-        return cls(**build_kwargs_apply_mapping(content, (
-            *(f.name for f in dataclasses.fields(cls)),
-            ('is_enabled', 'is_deliver_pellet_enabled'),
-            ('is_pellet_cover_enabled', 'is_cover_pellet_enabled'),
-        ), skip_remaining=True))
-
 
 @dataclass
 class SessionControlConfiguration:
@@ -180,83 +167,12 @@ class SessionControlConfiguration:
 
 
 @dataclass
-class _BehaviorConfiguration:
+class BehaviorConfiguration:
     pellet_delivery: PelletDeliveryConfiguration = field(default_factory=PelletDeliveryConfiguration)
     session_control: SessionControlConfiguration = field(default_factory=SessionControlConfiguration)
     pellet_uncover: PelletUncoverConfiguration = field(default_factory=PelletUncoverConfiguration)
     shift_xyz_handler: ShiftXYZHandlerConfig = field(default_factory=ShiftXYZHandlerConfig)
     home_on_excessive_drift_distance: HomeOnExcessiveDriftDistanceConfiguration = field(default_factory=HomeOnExcessiveDriftDistanceConfiguration)
-
-    @classmethod
-    def from_version_zero(cls, content: Dict) -> Self:
-        configuration = cls()
-
-        if "behavior" in content:
-            configuration.pellet_delivery = PelletDeliveryConfiguration.from_version_zero(content["behavior"])
-
-        return configuration
-
-    @classmethod
-    def from_version_one(cls, content: Dict):
-        pellet_delivery = dict(content.get("pellet_delivery", {}))
-        pellet_delivery.pop("max_pellets_per_session", None)
-        pellet_delivery.pop("max_pellets_per_day", None)
-        return cls(
-            pellet_delivery=PelletDeliveryConfiguration(**pellet_delivery),
-        )
-
-
-@dataclasses.dataclass
-class BehaviorConfiguration(_BehaviorConfiguration):
-    # NB: having to subclass _BehaviorConfiguration dataclass type to allow to customize init signature (and body):
-
-    def __init__(self,
-                 *,
-                 mouse_presence=None,  # temporarily to be back-compatible with previous
-                 auto_end_session=None,
-                 batch_session_recording=None,
-                 auto_close_gate_on_intersession=None,
-                 load_cell=None,
-                 auto_tare=None,
-                 topcam_presence_detection=None,
-                 head_clamp=None,
-                 headbar_pressure=None,
-                 audio=None,
-                 emergency_alarm=None,
-                 auto_tunnel_sweep=None,
-                 cage_cleaning=None,
-                 autoclamp_evasion_detector=None,
-                 led_alarm=None,
-                 **kwargs):
-        if mouse_presence is not None:
-            logger.notice("Dropping previous mouse_presence config, new default one will be used. dropped entry: %s",
-                          mouse_presence)
-        if (
-            auto_end_session is not None
-            or batch_session_recording is not None
-            or auto_close_gate_on_intersession is not None
-        ):
-            logger.notice("Dropping obsolete automatic recording trigger configuration")
-        if load_cell is not None or auto_tare is not None:
-            logger.notice("Dropping obsolete weight-sensor configuration")
-        if topcam_presence_detection is not None:
-            logger.notice("Dropping obsolete top-camera presence configuration")
-        retired = {
-            "head_clamp": head_clamp,
-            "headbar_pressure": headbar_pressure,
-            "audio": audio,
-            "emergency_alarm": emergency_alarm,
-            "auto_tunnel_sweep": auto_tunnel_sweep,
-            "cage_cleaning": cage_cleaning,
-            "autoclamp_evasion_detector": autoclamp_evasion_detector,
-            "led_alarm": led_alarm,
-        }
-        if any(value is not None for value in retired.values()):
-            logger.notice(
-                "Dropping retired behavior configuration: %s",
-                sorted(key for key, value in retired.items() if value is not None),
-            )
-        super().__init__(**kwargs)
 
 
 _tag_2_cls = dict(
@@ -291,32 +207,3 @@ def add_behavior_configuration_constructors(safe_loader: Type[yaml.SafeLoader]):
 
     for tag, cls in _tag_2_cls.items():
         add(cls, tag)
-
-    def obsolete_recording_trigger(loader, node):
-        return loader.construct_mapping(node, deep=True)
-
-    for tag in (
-        "AutoEndSessionConfiguration",
-        "BatchSessionRecordingConfiguration",
-        "AutoCloseGateOnIntersessionConfiguration",
-        "LoadCellConfiguration",
-        "LoadCellAutoTareConfiguration",
-        "HeadClampConfiguration",
-        "AlarmDetectorConfig",
-        "AnimalEvasionAlarmConfig",
-        "AutoClampEvasionDetectorConfig",
-        "HeadbarPressureConfiguration",
-        "AudioMonitorConfiguration",
-        "AnimalPresenceConfiguration",
-        "MousePresenceConfiguration",
-        "EmergencyAlarmConfiguration",
-        "ExternalDoorsMonitorConfiguration",
-        "AutoTunnelSweepConfiguration",
-        "SystemMaintenanceConfig",
-        "SystemFaultConfig",
-        "CageCleaningConfig",
-        "AnimalThrashAlarmConfig",
-        "DeviceCommAlarmConfig",
-        "LEDAlarmConfig",
-    ):
-        safe_loader.add_constructor(f"!{tag}", obsolete_recording_trigger)
