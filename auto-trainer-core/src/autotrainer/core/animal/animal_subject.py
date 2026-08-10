@@ -1,4 +1,5 @@
 import dataclasses
+import datetime as dt
 import json
 import os
 import uuid
@@ -7,6 +8,8 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Optional, Dict, Any, List, Type
 from typing_extensions import Self
+
+from .external_metadata import ExternalIdentity, ExternalMetadataSnapshot
 
 from .. import Offset3DTuple, get_verbose_logger
 
@@ -45,7 +48,7 @@ class AnimalTraining:
 class _AnimalSubject:
     """A subject in an animal experiment."""
 
-    version: int = 5
+    version: int = 6
 
     name: str = ""
     id: str = None   # handled in post_init
@@ -59,6 +62,9 @@ class _AnimalSubject:
 
     target_y_limit: Optional[float] = None  # in DCS
 
+    external_identity: Optional[ExternalIdentity] = None
+    external_metadata: Optional[ExternalMetadataSnapshot] = None
+
     _legacy_v4_path: Optional[Path] = dataclasses.field(
         default=None,
         init=False,
@@ -66,6 +72,13 @@ class _AnimalSubject:
         compare=False,
     )
     _legacy_v4_content: Optional[bytes] = dataclasses.field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+
+    _legacy_version: Optional[int] = dataclasses.field(
         default=None,
         init=False,
         repr=False,
@@ -157,6 +170,19 @@ class AnimalSubject(_AnimalSubject):
         )
 
     @classmethod
+    def _from_v6(cls, data: Dict[str, Any]) -> Self:
+        animal = cls._from_v5(data)
+        identity = data.get("externalIdentity")
+        metadata = data.get("externalMetadata")
+        animal.external_identity = (
+            None if identity is None else ExternalIdentity.from_dict(identity)
+        )
+        animal.external_metadata = (
+            None if metadata is None else ExternalMetadataSnapshot.from_dict(metadata)
+        )
+        return animal
+
+    @classmethod
     def from_file(cls: Type[Self], file_path: Path) -> Optional[Self]:
         original = file_path.read_bytes()
         data = json.loads(original)
@@ -167,16 +193,23 @@ class AnimalSubject(_AnimalSubject):
             animal = cls._from_v4(data)
             animal._legacy_v4_path = file_path.resolve()
             animal._legacy_v4_content = original
+            animal._legacy_version = 4
             logger.notice(
-                "Loaded animal v4 for one-way migration to v5; protocol "
+                "Loaded animal v4 for one-way migration to v6; protocol "
                 "recording-count progress was reset"
             )
-        elif file_version == cls.version:
+        elif file_version == 5:
             animal = cls._from_v5(data)
+            animal._legacy_v4_path = file_path.resolve()
+            animal._legacy_v4_content = original
+            animal._legacy_version = 5
+            logger.notice("Loaded animal v5 for one-way migration to v6")
+        elif file_version == cls.version:
+            animal = cls._from_v6(data)
         else:
             raise ValueError(
                 f"Unsupported animal schema version {file_version!r} in "
-                f"{file_path}; only v4 migration and v5 are supported"
+                f"{file_path}; only v4/v5 migration and v6 are supported"
             )
 
         logger.debug("loaded animal id=%r name=%r pellet=%s is_dcs=%s current_protocol=%s",
@@ -202,6 +235,54 @@ class AnimalSubject(_AnimalSubject):
             "selectedProtocol": self.training.current_protocol,
         }
 
+    def session_snapshot(self, *, snapshot_utc: Optional[str] = None) -> Dict[str, Any]:
+        if snapshot_utc is None:
+            snapshot_utc = (
+                dt.datetime.now(dt.timezone.utc)
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
+        identity = self.external_identity
+        metadata = self.external_metadata
+        return {
+            "reachaqId": self.id,
+            "name": self.name,
+            "externalIdentity": (
+                None
+                if identity is None
+                else {
+                    **identity.to_dict(),
+                    "rfid": None if metadata is None else metadata.rfid,
+                }
+            ),
+            "metadata": (
+                None
+                if metadata is None
+                else {
+                    "physicalTag": metadata.physical_tag,
+                    "sex": metadata.sex,
+                    "dateOfBirth": metadata.date_of_birth,
+                    "strain": metadata.strain,
+                    "genotype": list(metadata.genotype),
+                    "cage": metadata.cage,
+                    "protocol": metadata.protocol,
+                    "state": metadata.state,
+                }
+            ),
+            "provenance": {
+                "registryImportId": (
+                    None if metadata is None else metadata.registry_import_id
+                ),
+                "sourceFileSha256": (
+                    None if metadata is None else metadata.source_file_sha256
+                ),
+                "sourceRecordHash": None if metadata is None else metadata.source_hash,
+                "importedUtc": None if metadata is None else metadata.imported_utc,
+                "snapshotUtc": snapshot_utc,
+            },
+        }
+
     def to_file(self, file_path: Path):
         data = {
             "version": self.version,
@@ -225,6 +306,16 @@ class AnimalSubject(_AnimalSubject):
             "limits": {
                 "targetY": self.target_y_limit,
             },
+            "externalIdentity": (
+                None
+                if self.external_identity is None
+                else self.external_identity.to_dict()
+            ),
+            "externalMetadata": (
+                None
+                if self.external_metadata is None
+                else self.external_metadata.to_dict()
+            ),
         }
         xyz = Offset3DTuple(self.pellet_x, self.pellet_y, self.pellet_z)
         logger.debug("Saving %s to %s ; xyz=%s", self.name, file_path.as_posix(), xyz.humanize())
@@ -233,7 +324,10 @@ class AnimalSubject(_AnimalSubject):
             self._legacy_v4_content is not None
             and self._legacy_v4_path == file_path.resolve()
         ):
-            backup_path = file_path.with_suffix(file_path.suffix + ".v4-backup")
+            legacy_version = self._legacy_version or 4
+            backup_path = file_path.with_suffix(
+                file_path.suffix + f".v{legacy_version}-backup"
+            )
             if not backup_path.exists():
                 with NamedTemporaryFile(
                     "wb",
@@ -247,3 +341,4 @@ class AnimalSubject(_AnimalSubject):
         os.replace(fh.name, file_path)
         self._legacy_v4_path = None
         self._legacy_v4_content = None
+        self._legacy_version = None

@@ -298,7 +298,14 @@ from .fixed_array_multiqueue import FixedArrayMultiQueue
 from .fixed_array_queue import FixedArrayQueue
 
 from .project import ProjectInfo, ProjectInterval
-from .animal import AnimalSubject
+from .animal import (
+    AnimalSubject,
+    ExternalAnimalRecord,
+    ExternalIdentity,
+    ExternalMetadataSnapshot,
+    NormalizedAnimalBatch,
+    normalize_rfid,
+)
 
 from .perf_monitor import PerfMonitor
 from .queue_util import clear_queue
