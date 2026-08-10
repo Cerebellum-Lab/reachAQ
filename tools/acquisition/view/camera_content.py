@@ -67,7 +67,6 @@ class CameraContent(ContentWidget):
 
         # Swap because model shape is row x col == height x width
         capture_view.setShape(capture_model.shape[1], capture_model.shape[0])
-        capture_view.set_presence_detection(capture_model.presence_detection)
 
     def __repr__(self):
         return f"{self.__class__.__name__}(name={self._model.name!r})"

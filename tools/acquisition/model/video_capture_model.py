@@ -24,7 +24,6 @@ from autotrainer.core import clear_queue, FixedArrayQueue, FixedArrayMultiQueue,
 from autotrainer.core.multiproc import get_mp_ctx
 from autotrainer.core.logging import log_hardware_initialization
 from autotrainer.core.project import ProjectInfo, ProjectDependentProtocol
-from autotrainer.core.video_detection import PresenceDetectionAttrs
 from autotrainer.video import VideoCapture, VideoRecordProperties, VideoRecordMode, VideoManager, \
     VideoReader, CaptureCommandKind, CaptureCameraAttrs, CaptureInferenceAttrs, CaptureAttrs
 from autotrainer.core.capture import CaptureProcessStatus
@@ -126,7 +125,6 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
         cam_id: CameraId = CameraId.Left,
         mp_ctx: Optional[BaseContext] = None,
         msg_queue: Optional[multiprocessing.Queue] = None,
-        presence_detection: Optional[PresenceDetectionAttrs] = None,
         synced_cam_recording: Optional[Synchronized] = None,
         synced_cam_frame_index: Optional[Synchronized] = None,
         record_start_perf: Optional[Synchronized] = None,
@@ -146,7 +144,6 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
         self._name = name
         self._preferences = preferences
         self._camera_index = camera_index
-        self._presence_detection = presence_detection
         self._synced_cam_recording = synced_cam_recording
         self._synced_cam_frame_index = synced_cam_frame_index
         self._record_start_perf = record_start_perf
@@ -384,10 +381,6 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
         return self._last_error
 
     @property
-    def presence_detection(self) -> PresenceDetectionAttrs:
-        return self._presence_detection
-
-    @property
     def display_dots_detection(self):
         return self._display_dots_detection
 
@@ -481,7 +474,6 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
                 camera_index=self._camera_index,
                 inference=inference,
                 errors=self._errors,
-                presence_detection_attrs=self._presence_detection,
                 is_primary=self._is_primary,
                 msg_queue=self._msg_queue,
                 record_prebuffer_duration=self._cur_conf.record_prebuffer_duration,

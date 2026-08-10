@@ -2,15 +2,13 @@ import os
 from typing import Dict, Optional, Tuple
 
 from PySide6.QtCore import Qt, QPoint
-from PySide6.QtGui import QImage, QSurfaceFormat, QBrush, QPixmap, QPen, QPainter, QFont
+from PySide6.QtGui import QImage, QSurfaceFormat, QPixmap, QPen, QPainter, QFont
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import QWidget, QGraphicsView, QGraphicsScene, QHBoxLayout, QGraphicsPixmapItem, \
     QGraphicsEllipseItem, QGraphicsItem
 
 from autotrainer.core.logging import get_verbose_logger
 from autotrainer.core.pose_elements import SceneElement
-from autotrainer.core.video_detection import PresenceDetectionAttrs
-
 from autotrainer.inference import PoseLocation
 
 
@@ -123,7 +121,6 @@ class QGLImageView(QWidget):
         *,
         text_overlay: Optional[str] = None,
         text_color: Qt.GlobalColor = Qt.GlobalColor.yellow,
-        presence_detection: Optional[PresenceDetectionAttrs],
     ):
         # retain a ref the used image to keep it alive after calling function also return
         self._cur_image = image
@@ -135,14 +132,6 @@ class QGLImageView(QWidget):
             painter.setPen(text_color)
             with painter:
                 painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter, text_overlay)
-
-        if presence_detection is not None:
-            painter = QPainter(pixmap)
-            color = Qt.GlobalColor.green if presence_detection.presence_detected else Qt.GlobalColor.red
-            brush = QBrush(color)
-            painter.setBrush(brush)
-            with painter:
-                painter.drawEllipse(5, 5, 15, 15)  # radius, radius, x, y (center)
 
         if self._pixmap is None:
             self._pixmap = QGraphicsPixmapItem(pixmap)

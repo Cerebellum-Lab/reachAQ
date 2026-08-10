@@ -28,8 +28,6 @@ from autotrainer.core.logging import (
 )
 from autotrainer.core.frame_index import FrameIndexCategory
 from autotrainer.core.fixed_array_queue import BufferResult
-from autotrainer.core.video_detection import PresenceDetectionAttrs
-from autotrainer.video.video_detection import VideoDetection
 from autotrainer.core.capture import CaptureProcessStatus
 from .camera.camera_base import CameraBase
 
@@ -143,9 +141,6 @@ class CaptureAttrs:
     fps_image_queue: Optional[float] = 15
     """Desired write FPS for the image_queue, if None then default to capture FPS"""
 
-    presence_detection_attrs: Optional[PresenceDetectionAttrs] = None
-    """Optional Presence detection"""
-
     is_primary: bool = False
 
     msg_queue: Optional[multiprocessing.Queue] = None
@@ -214,9 +209,6 @@ class VideoCapture(Process):
         self._record_queue_list: List[
                   # frame_id , frame, frame_when, frame_perf
             Tuple[int, numpy.ndarray, float, float]] = []
-
-        self._detection_attrs = attrs.presence_detection_attrs
-        self._video_detection: Optional[VideoDetection] = None
 
         self._command_handlers: Dict[CaptureCommandKind, Callable] = {
             CaptureCommandKind.TERMINATE: self._user_terminate,
@@ -341,15 +333,6 @@ class VideoCapture(Process):
             )
             vid_rec.start()
 
-            det_attrs = self._attrs.presence_detection_attrs
-            if project is None or det_attrs is None:
-                self._video_detection = None
-            else:
-                vid_det = self._video_detection = VideoDetection(project, det_attrs)
-                vid_det.start()
-
-            logger.verbose("%s: video_detection: %s", self._name, self._video_detection)
-
             # only start command handler thread after others before, given it's checking alive of them.
             thread = self._command_thread = threading.Thread(
                 target=self._command_handler, daemon=True, name="CommandHandler")
@@ -357,10 +340,9 @@ class VideoCapture(Process):
 
             log_hardware_initialization(
                 logger,
-                "READY | camera child process | name=%s recorder_alive=%s detection_enabled=%s",
+                "READY | camera child process | name=%s recorder_alive=%s",
                 self._name,
                 vid_rec.is_alive(),
-                self._video_detection is not None,
             )
 
             return True
@@ -383,12 +365,6 @@ class VideoCapture(Process):
                 logger.warning("VideoRecord not alive, terminating")
                 self._user_terminate()
                 self._set_error("video_record thread dead")
-                break
-            vid_det = self._video_detection
-            if vid_det is not None and not vid_det.is_alive():
-                logger.warning("Video Detection not alive, terminating")
-                self._user_terminate()
-                self._set_error("video_detection thread dead")
                 break
             try:
                 raw = self._command_queue.get(timeout=1)
@@ -444,7 +420,6 @@ class VideoCapture(Process):
             # although is same than self._camera_idx
         image_queue_delay = self._image_queue_frame_delay
         empty_frame = numpy.zeros((camera.height, camera.width), dtype=numpy.uint8)
-        vid_detection = self._video_detection
         p_prev_watchdog = -math.inf
         if attrs.watchdog_perf_c is not None:
             def set_watchdog(value):
@@ -844,8 +819,6 @@ class VideoCapture(Process):
                     if net_q_put(frame, net_q_idx, frame_idx_cat, block=False) == BufferResult.Ok:
                         cnt_net_q_put += 1
 
-                if vid_detection is not None:
-                    vid_detection.update_frame(when, frame, frame_perf_c)
 
                 # if not (is_record_active and record_start_stop_frame_idx is not None) and attrs.record_prebuffer_duration > 0:
                 update_frames_prebuffer(frame, when, frame_time, frame_perf_c, cam_frame_id)
@@ -879,13 +852,6 @@ class VideoCapture(Process):
                 logger.debug("joining record thread")
                 vid_rec.join()
                 self._record = None
-
-            video_detection = self._video_detection
-            if video_detection is not None:
-                video_detection.cancel()
-                logger.debug("joining video-detection thread")
-                video_detection.join()
-                self._video_detection = None
 
             logger.debug("joining command thread")
             thread = self._command_thread

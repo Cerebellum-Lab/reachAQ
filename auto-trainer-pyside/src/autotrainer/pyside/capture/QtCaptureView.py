@@ -9,8 +9,6 @@ from PySide6.QtGui import QImage, QPainter, QTextDocument
 from PySide6.QtWidgets import QWidget, QLabel, QComboBox, QHBoxLayout, QVBoxLayout, QStackedLayout, QSizePolicy
 
 from autotrainer.core.logging import get_verbose_logger
-from autotrainer.core.video_detection import PresenceDetectionAttrs
-
 from autotrainer.inference import PoseLocation
 
 from autotrainer.pyside.CardWidget import CardWidget
@@ -50,7 +48,6 @@ class QCaptureView(QWidget):
         self._next_frame_points: Dict[str, PoseLocation] = {}
         self._are_points_dirty = False
         self._display_dots_detection = True
-        self._presence_detection: Optional[PresenceDetectionAttrs] = None
 
         # Header
         self._camera = QComboBox()
@@ -140,9 +137,6 @@ class QCaptureView(QWidget):
     @property
     def image_view(self) -> QGLImageView:
         return self._image
-
-    def set_presence_detection(self, detection: Optional[PresenceDetectionAttrs]):
-        self._presence_detection = detection
 
     def set_text_overlay(self, value: Optional[str], color: Qt.GlobalColor = Qt.GlobalColor.yellow):
         logger.debug("got new text overlay: %r", value)
@@ -234,7 +228,6 @@ class QCaptureView(QWidget):
             image,
             text_overlay=self._text_overlay,
             text_color=self._text_color,
-            presence_detection=self._presence_detection,
         )
         self._is_frame_dirty = False
 
