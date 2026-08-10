@@ -1148,20 +1148,9 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
     def update_parts_seen(self, pose_rsp: PoseResponse):
         any_ctx = self._parts_pres_ctx_any_cam
         all_ctx = self._parts_pres_ctx_all_cams
-        get_seen = all_ctx.get_part_seen
-        need_api_post = (
-            [SceneElement.R_Hand, ApiEventKind.trialRightHandSeen, get_seen(SceneElement.R_Hand)],
-            [SceneElement.Pellet, ApiEventKind.trialPelletSeen, get_seen(SceneElement.Pellet)],
-        )
-        #
         update_scene_elements_context_from_pose(any_ctx, all_ctx, pose_rsp)
         # little special case for mouse:
         self.update_mouse_seen(pose_rsp.mouse_seen, perf_now=pose_rsp.perf_c)
-        #
-        post = self._event_manager.post_event_content
-        for part, evt, prev_seen in need_api_post:
-            if prev_seen != get_seen(part):
-                post(evt)
 
     def update_pellet_seen(self, seen: bool = True):
         self.update_part_seen(SceneElement.Pellet, seen, perf_now=get_perf_now())
@@ -1192,7 +1181,6 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
                 logger.verbose("Session mouse seen")
                 # property currently unused:
                 self._on_property_changed(BehaviorAlgoProps.SESSION_MOUSE_SEEN, True, False)
-                self._event_manager.post_event_content(ApiEventKind.trialAnimalSeen)
 
     @property
     def mouse_last_seen_age(self) -> float:

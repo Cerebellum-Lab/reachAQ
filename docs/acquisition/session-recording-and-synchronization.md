@@ -260,9 +260,9 @@ written with non-standard `NaN` tokens.
 The retained `auto-trainer-api` 0.9.22 status object still requires empty alarm
 and tunnel-shaped fields and a legacy training-mode value. ReachAQ fills those
 fields only as compatibility placeholders; they do not correspond to runtime
-subsystems. Old API recording-boundary `trialStarted`, `trialCaptureEnded`,
-`trialEnded`, and aggregate `trialReachEvents` events are no longer emitted
-because a recording is a session, not a pellet trial.
+subsystems. Old recording-scoped API events with `trial...` names are no longer
+emitted because a recording is a session, not a pellet trial. Session metadata,
+analysis outputs, and the pellet-trial ledger are the authoritative replacements.
 
 Camera/NI matching uses the nearest `cam_frames` transition within half the
 observed frame period and records whether it was rising or falling. The current

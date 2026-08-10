@@ -423,8 +423,6 @@ class SystemMachine(StateMachine):
         ):
             logger.debug("set first pellet presentation offset=%.3f", t_rel_start)
             project.first_pellet_presentation_offset = t_rel_start
-            self._event_manager.post_event_content(
-                ApiEventKind.trialPelletPresented, data=dict(trial_id=project.session))
 
     @BehaviorAlgorithm.relay_func(wait=False)
     def _on_algorithm_property_changed(self, name: str, new_value, old_value):

@@ -232,9 +232,10 @@ available through the existing API concepts. The pinned external
 tunnel, and magnet-shaped status fields. ReachAQ reports derived/empty/NaN
 placeholders only to satisfy that constructor; it has no corresponding runtime.
 
-Emergency commands are unhandled, and recording/post-session boundaries no
-longer emit the old `trialStarted`, `trialCaptureEnded`, `trialEnded`, or
-aggregate `trialReachEvents` events. API clients must use recording
-state/session metadata and analysis outputs for session lifecycle/results, and
-the persisted trial ledger for pellet-trial accounting, until a new
-session-aware API schema replaces 0.9.22.
+Emergency commands are unhandled. ReachAQ no longer emits the old
+recording-scoped `trialStarted`, `trialCaptureEnded`, `trialEnded`,
+`trialReachEvents`, `trialPelletPresented`, `trialPelletSeen`,
+`trialRightHandSeen`, or `trialAnimalSeen` events. API clients must use
+recording state/session metadata and analysis outputs for session
+lifecycle/results, and the persisted trial ledger for pellet-trial accounting,
+until a new session-aware API schema replaces 0.9.22.
