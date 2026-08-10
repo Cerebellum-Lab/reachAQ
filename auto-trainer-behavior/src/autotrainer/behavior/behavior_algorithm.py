@@ -1351,9 +1351,6 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
 
     def set_previous_intersession_analysis_rsp(self, project: ProjectInfo, res: IntersessionResponse):
         self._previous_intersession_analysis_rsp = (project, res)
-        self._event_manager.post_event_content(
-            ApiEventKind.trialReachEvents,
-            data=dict(trial_reach_events=res.reach_events, trial_id=project.session))
 
     def reset_selected_animal_counts(self, animal: Optional[AnimalSubject]):
         logger.verbose("Updating animal-dependent behavior context for %s", animal)
