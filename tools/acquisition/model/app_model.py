@@ -401,7 +401,6 @@ class AppModel(ObservableObject):
         self._record_stop_sema = mp_ctx.Semaphore(0)
         # and this is used to notify the end of recording from the reach-camera video_record threads to the offline one,
         # so that the later doesn't try to open the video files, before they are finished written to and closed.
-        # Preventing the opencv lib to emit warning on stderr.
 
         self._reach_cameras = tuple(
             self._make_reach_camera_model(camera_id, camera_index)
