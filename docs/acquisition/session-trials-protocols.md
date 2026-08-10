@@ -78,7 +78,8 @@ The trial-limit count basis is independently configurable:
 | Scored trials | `scored` |
 
 Configured behavioral outcomes may be included or excluded from completed and
-scored counts. Hardware errors cannot be included. Counts are derived from the
+scored counts through the plain-language **Counted outcomes** checkboxes in
+Preferences. Hardware errors cannot be included. Counts are derived from the
 ledger rather than maintained as a second independent source of truth.
 
 ## Trial persistence

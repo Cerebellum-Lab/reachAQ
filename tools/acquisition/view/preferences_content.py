@@ -17,6 +17,7 @@ from autotrainer.behavior.pellet_trial import (
     AttemptAssignmentPolicy,
     RetrySettingsPolicy,
     TrialCountBasis,
+    TrialOutcome,
 )
 from autotrainer.core.logging import get_verbose_logger
 from autotrainer.pyside import QSwitch
@@ -544,6 +545,44 @@ class PreferencesContent(QWidget):
         )
         form.addRow("Trial-limit count:", count_basis)
 
+        counted_outcomes = QWidget()
+        counted_outcomes_layout = QHBoxLayout(counted_outcomes)
+        counted_outcomes_layout.setContentsMargins(0, 0, 0, 0)
+        counted_outcomes_layout.setSpacing(8)
+
+        def set_counted_outcome(outcome: TrialOutcome, enabled: bool) -> None:
+            selected = set(config.counted_trial_outcomes)
+            if enabled:
+                selected.add(outcome.value)
+            else:
+                selected.discard(outcome.value)
+            config.counted_trial_outcomes = tuple(
+                candidate.value
+                for candidate in TrialOutcome
+                if candidate.value in selected
+                and candidate is not TrialOutcome.HARDWARE_ERROR
+                and candidate is not TrialOutcome.PENDING_ANALYSIS
+            )
+
+        for outcome, display_name in (
+            (TrialOutcome.SUCCESS, "Success"),
+            (TrialOutcome.FAILURE, "Failed reach"),
+            (TrialOutcome.PELLET_MISSING, "Pellet missing"),
+            (TrialOutcome.INCOMPLETE, "Incomplete trial"),
+            (TrialOutcome.ABORTED, "Aborted trial"),
+        ):
+            checkbox = QCheckBox(display_name)
+            checkbox.setChecked(outcome.value in config.counted_trial_outcomes)
+            checkbox.toggled.connect(
+                lambda checked, item=outcome: set_counted_outcome(
+                    item,
+                    checked,
+                )
+            )
+            counted_outcomes_layout.addWidget(checkbox)
+        counted_outcomes_layout.addStretch(1)
+        form.addRow("Counted outcomes:", counted_outcomes)
+
         duration_limit = QDoubleSpinBox()
         duration_limit.setRange(0, _DELAY_OR_DURATION_MAX_VALUE)
         duration_limit.setDecimals(1)
@@ -602,7 +641,10 @@ class PreferencesContent(QWidget):
         )
         form.addRow("Finish-current-trial timeout:", drain_timeout)
 
-        apply_size_policy(group, (QSwitch, QSpinBox, QDoubleSpinBox))
+        apply_size_policy(
+            group,
+            (QSwitch, QCheckBox, QSpinBox, QDoubleSpinBox),
+        )
         return group
 
     def _create_advanced_tab(self):
