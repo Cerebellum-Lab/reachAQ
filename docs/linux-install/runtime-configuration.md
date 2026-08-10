@@ -62,7 +62,7 @@ conda run --no-capture-output -n "$REACHAQ_ENV" python -m reachAQ.app \
   -c "$REACHAQ_CONFIG"
 ```
 
-Use `--start-mode acquiring` only when immediate acquisition startup is
+Use `--start-mode running` only when immediate acquisition startup is
 intentional. Headless mode has no idle operator control, so it starts
 acquisition by default:
 

@@ -17,7 +17,7 @@ The `--no-capture-output` option is required for live terminal logging when the
 application is launched through Conda.
 
 The GUI starts idle by default, so camera and DAQ configuration remain editable
-until Start is selected. Use `--start-mode acquiring` only when immediate
+until Start is selected. Use `--start-mode running` only when immediate
 startup is intentional. The application window opens maximized by default while
 retaining its normal title bar and restore control. After restoring, it remains
 freely resizable in both width and height—even below child-panel size hints.

@@ -50,7 +50,7 @@ from the core logic of the applications for two reasons:
   * The local user interface for integrated camera, pellet delivery, NI-DAQ,
     laser, and pose-inference modules
   * `python -m reachAQ.app -c ~/Autotrainer/system_configuration.yaml`
-    * The GUI starts idle by default. Use `--start-mode acquiring` only when immediate startup is intentional.
+    * The GUI starts idle by default. Use `--start-mode running` only when immediate startup is intentional.
     * Use `--no-live-inference` or `--live-inference` to override the saved inference setting for one run.
     * Hardware startup progress is written to the log and launching terminal as `HARDWARE INIT` records.
     * [Detailed Instructions](tools/acquisition/README.md)

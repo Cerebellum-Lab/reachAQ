@@ -43,7 +43,7 @@ Keep `--no-capture-output` in long-running launch commands. Without it, Conda
 buffers stdout/stderr and terminal logs may not appear until the app exits.
 
 The GUI starts idle by default. Cameras, NI-DAQ, CAN, and live inference do not
-start until the operator selects Running. Use `--start-mode acquiring` only
+start until the operator selects Running. Use `--start-mode running` only
 when immediate acquisition startup is intentional.
 
 For a software-only camera smoke test:
