@@ -32,7 +32,6 @@ class UserPreferences(ObservableObject):
     SELECTED_ANIMAL = "selected_animal"
     ANIMAL_LOCATION = "animal_location"
     PELLET_PORT = "pellet_port"
-    TUNNEL_PORT = "tunnel_port"
     MEASUREMENT_GRAPH = "measurement_graph"
 
     def __init__(self, *, settings_file_path: Optional[Path] = None):
@@ -81,7 +80,6 @@ class UserPreferences(ObservableObject):
         # Transient values that may come from individual configuration files, but are conveniently accessed from
         # the user preferences.
 
-        self._tunnel_port = None
         self._pellet_port = None
 
     def save(self):
@@ -186,15 +184,6 @@ class UserPreferences(ObservableObject):
     def pellet_port(self, value: str):
         prev, self._pellet_port = self._pellet_port, value
         self._on_property_changed(self.PELLET_PORT, value, prev)
-
-    @property
-    def tunnel_port(self) -> str:
-        return self._tunnel_port
-
-    @tunnel_port.setter
-    def tunnel_port(self, value: str):
-        prev, self._tunnel_port = self._tunnel_port, value
-        self._on_property_changed(self.TUNNEL_PORT, value, prev)
 
     @property
     def measurement_graph(self) -> str:
