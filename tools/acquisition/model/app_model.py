@@ -2288,14 +2288,10 @@ class AppModel(ObservableObject):
             for camera in self._reach_cameras
             if camera.is_enabled and camera.is_recording_enabled
         )
-        left = camera_names[0] if len(camera_names) > 0 else ""
-        right = camera_names[1] if len(camera_names) > 1 else ""
         return ProjectInfo(
             root=self._output_location,
             device_id=self._preferences.serial_number,
             ensure_exists=True,
-            camera_1=left,
-            camera_2=right,
             camera_names=camera_names,
             mp_manager=self._mp_manager,  # required,
             # so to have shared values that can be put to multiprocess queue.

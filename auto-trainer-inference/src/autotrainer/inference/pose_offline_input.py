@@ -24,7 +24,7 @@ logger = get_verbose_logger(__name__)
 
 
 def _get_project_camera_names(project: ProjectInfo) -> Tuple[str, ...]:
-    return tuple(project.camera_names) or (project.camera_1, project.camera_2)
+    return tuple(project.camera_names)
 
 
 class InferenceIncorrectStatus(RuntimeError):

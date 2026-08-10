@@ -291,8 +291,7 @@ agx001_20260205_11_project_info = ProjectInfo(
     device_id="agx001",
     session=11,
     when=datetime(2026, 2, 5),
-    camera_1="left",
-    camera_2="right",
+    camera_names=("left", "right"),
 )
 
 

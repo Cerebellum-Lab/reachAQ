@@ -76,8 +76,8 @@ def segment_reaches(
 
     # Extract relevant video paths in order
     videoOrder = [
-        project_info.camera_1,  # supposed to be primary camera
-        project_info.camera_2,  # secondary
+        project_info.camera_names[0],  # primary camera
+        project_info.camera_names[1],  # secondary camera
     ]
     video_paths = [video for key in videoOrder for video in videoList if key in video]
     if not video_paths:

@@ -58,11 +58,9 @@ def test_explicit_session(root):
     assert session_source.session_index == 12
 
 
-def test_camera_names_preserve_legacy_camera_fields(root):
+def test_camera_names_round_trip_to_local_value(root):
     info = ProjectInfo(root=root, camera_names=("left", "right", "camera3"))
 
-    assert info.camera_1 == "left"
-    assert info.camera_2 == "right"
     assert info.camera_names == ("left", "right", "camera3")
     assert info.to_local_value().camera_names == info.camera_names
 

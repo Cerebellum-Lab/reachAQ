@@ -113,8 +113,6 @@ class _ProjectInfo:
         convert_to=lambda v: v.timestamp(),
     )
     ensure_exists: bool = False
-    camera_1: str = ""
-    camera_2: str = ""
     camera_names: Tuple[str, ...] = ()
     _session: Union[Synchronized[ctypes.c_uint32], RawValueHolder] = None
     session: ClassVar[int] = ValueHolderDescriptor()  # noqa
@@ -136,8 +134,6 @@ class ProjectInfo(_ProjectInfo):
         device_id: str = _ProjectInfo.device_id,
         when: Optional[datetime] = None,
         ensure_exists: bool = _ProjectInfo.ensure_exists,
-        camera_1: str = _ProjectInfo.camera_1,
-        camera_2: str = _ProjectInfo.camera_2,
         camera_names: Optional[Sequence[str]] = None,
         session: Optional[int] = None,
         send_position: Optional[Offset3DTuple] = _ProjectInfo.send_position,
@@ -177,17 +173,7 @@ class ProjectInfo(_ProjectInfo):
         self._when = _when
         self._session = _session
         self.ensure_exists = ensure_exists
-        if camera_names is None:
-            camera_names = tuple(name for name in (camera_1, camera_2) if name)
-        else:
-            camera_names = tuple(camera_names)
-            if len(camera_names) > 0 and not camera_1:
-                camera_1 = camera_names[0]
-            if len(camera_names) > 1 and not camera_2:
-                camera_2 = camera_names[1]
-        self.camera_1 = camera_1
-        self.camera_2 = camera_2
-        self.camera_names = tuple(camera_names)
+        self.camera_names = tuple(camera_names or ())
         self.send_position = send_position
         self.dcs_send_position = dcs_send_position
         self.start_record_timestamp = start_record_timestamp
@@ -210,8 +196,6 @@ class ProjectInfo(_ProjectInfo):
                 self.root == other.root
                 and self.device_id == other.device_id
                 and self.when == other.when
-                and self.camera_1 == other.camera_1
-                and self.camera_2 == other.camera_2
                 and self.camera_names == other.camera_names
                 and self.session == other.session
             )

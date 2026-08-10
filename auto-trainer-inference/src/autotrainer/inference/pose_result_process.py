@@ -42,7 +42,7 @@ LIVE_WORKERS_RENEW_TIMER_DELAY = float(os.getenv("AUTOTRAINER_LIVE_WORKERS_RENEW
 
 
 def _get_project_camera_names(project: ProjectInfo) -> Tuple[str, ...]:
-    return tuple(project.camera_names) or (project.camera_1, project.camera_2)
+    return tuple(project.camera_names)
 
 
 # even better is to use __debug__ and use "python -O ..."
