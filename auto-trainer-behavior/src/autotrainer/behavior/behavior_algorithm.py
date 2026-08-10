@@ -923,9 +923,6 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
 
         self.session_starting()
 
-        self._event_manager.post_event_content(
-            ApiEventKind.trialStarted, data=dict(trial_id=project.session, reason=reason))
-
         return True
 
     def end_capture_session(self, *, reason: RecordingEndingReason = RecordingEndingReason.NA):
@@ -963,8 +960,6 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
         # but must be at least before self.session_ending() here after, given test_covered_load_cycle rely on that atm.
         self._stop_session_reason = reason
         post_trigger_enable(self, False)  # tells cameras processes to stop recording - ASYNC
-        self._event_manager.post_event_content(
-            ApiEventKind.trialCaptureEnded, data=dict(trial_id=self._project_info.session, reason=reason))
         with self.set_allow_reentrant(True):
             self.session_capture_ending(reason)
         self.get_diamond_triangle_drifts(show_log=True)  # convenience to log current values
@@ -975,8 +970,6 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
         But this is still called from system machine when analysis is delayed.
         """
         logger.notice("session processing end: %s ; project=%s", result, project)
-        self._event_manager.post_event_content(
-            ApiEventKind.trialEnded, data=dict(result=result))
         self.session_ending(project, result)
 
     def reset_session_pellet_count(self):
