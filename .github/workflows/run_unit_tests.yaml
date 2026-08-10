@@ -4,11 +4,13 @@ on:
     branches:
       - main
       - develop
+      - devel
       - github-actions
   pull_request:
     branches:
       - main
       - develop
+      - devel
   workflow_dispatch:
     inputs:
       pytest_extra_args:

@@ -3,8 +3,10 @@ on:
   pull_request:
     types: [closed]
     branches:
-      - main
       - develop
+concurrency:
+  group: reachaq-develop-release-tag
+  cancel-in-progress: false
 permissions:
   contents: write
 jobs:
@@ -22,6 +24,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          git fetch --force --tags origin
 
           # Find the most recent tagged commit (by commit date) whose tags look like vMAJOR.MINOR.PATCH.
           latest_tagged_commit=$(
