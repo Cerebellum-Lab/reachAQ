@@ -11,10 +11,15 @@ from PySide6 import QtCore
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QWidget, QFormLayout, QLineEdit, QComboBox, QLabel, QHBoxLayout, QPushButton,
                                QFileDialog, QTabWidget, QVBoxLayout, QCheckBox, QDoubleSpinBox, QSpinBox, QGridLayout,
-                               QLayout, QSizePolicy)
+                               QLayout, QSizePolicy, QGroupBox)
 
 from autotrainer.core.configuration.behavior_configuration import HeadClampConfiguration, PelletDeliveryConfiguration, \
     HeadClampReleaseMode
+from autotrainer.behavior.pellet_trial import (
+    AttemptAssignmentPolicy,
+    RetrySettingsPolicy,
+    TrialCountBasis,
+)
 from autotrainer.core.logging import get_verbose_logger
 from autotrainer.pyside import QSwitch
 
@@ -189,6 +194,7 @@ class PreferencesContent(QWidget):
 
         main_layout = QVBoxLayout()
         main_layout.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        main_layout.addWidget(self._create_session_control_group(algo))
 
         top_layout = QVBoxLayout()
         top_layout.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
@@ -799,6 +805,130 @@ class PreferencesContent(QWidget):
         apply_size_policy(tab, (QSwitch, QSpinBox, QDoubleSpinBox))
 
         return tab
+
+    def _create_session_control_group(self, algo):
+        """Build the operator-facing controls for continuous recording sessions."""
+        config = algo.active_config.session_control
+        group = QGroupBox("Recording session")
+        form = QFormLayout(group)
+
+        automatic_cycles = QSwitch()
+        automatic_cycles.setChecked(config.automatic_pellet_cycles_enabled)
+        automatic_cycles.setToolTip(
+            "Automatically repeat pellet delivery trials while recording."
+        )
+        automatic_cycles.stateChanged.connect(
+            lambda value: setattr(
+                config,
+                "automatic_pellet_cycles_enabled",
+                value != 0,
+            )
+        )
+        form.addRow("Automatic pellet cycles:", automatic_cycles)
+
+        attempt_policy = QComboBox()
+        for policy in AttemptAssignmentPolicy:
+            attempt_policy.addItem(policy.display_name, policy.value)
+        attempt_policy.setCurrentIndex(
+            attempt_policy.findData(config.attempt_assignment)
+        )
+        attempt_policy.currentIndexChanged.connect(
+            lambda _index: setattr(
+                config,
+                "attempt_assignment",
+                attempt_policy.currentData(),
+            )
+        )
+        form.addRow("Failed-attempt handling:", attempt_policy)
+
+        retry_settings = QComboBox()
+        for policy in RetrySettingsPolicy:
+            retry_settings.addItem(policy.display_name, policy.value)
+        retry_settings.setCurrentIndex(
+            retry_settings.findData(config.retry_settings)
+        )
+        retry_settings.currentIndexChanged.connect(
+            lambda _index: setattr(
+                config,
+                "retry_settings",
+                retry_settings.currentData(),
+            )
+        )
+        form.addRow("Retry settings:", retry_settings)
+
+        count_basis = QComboBox()
+        for basis in TrialCountBasis:
+            count_basis.addItem(basis.display_name, basis.value)
+        count_basis.setCurrentIndex(count_basis.findData(config.trial_count_basis))
+        count_basis.currentIndexChanged.connect(
+            lambda _index: setattr(
+                config,
+                "trial_count_basis",
+                count_basis.currentData(),
+            )
+        )
+        form.addRow("Trial-limit count:", count_basis)
+
+        duration_limit = QDoubleSpinBox()
+        duration_limit.setRange(0, _DELAY_OR_DURATION_MAX_VALUE)
+        duration_limit.setDecimals(1)
+        duration_limit.setSingleStep(10)
+        duration_limit.setSpecialValueText("No limit")
+        duration_limit.setSuffix(" s")
+        duration_limit.setValue(config.duration_limit_seconds or 0)
+        duration_limit.valueChanged.connect(
+            lambda value: setattr(
+                config,
+                "duration_limit_seconds",
+                value if value > 0 else None,
+            )
+        )
+        form.addRow("Stop after duration:", duration_limit)
+
+        trial_limit = QSpinBox()
+        trial_limit.setRange(0, 999_999)
+        trial_limit.setSpecialValueText("No limit")
+        trial_limit.setValue(config.trial_limit or 0)
+        trial_limit.valueChanged.connect(
+            lambda value: setattr(
+                config,
+                "trial_limit",
+                value if value > 0 else None,
+            )
+        )
+        form.addRow("Stop after trial count:", trial_limit)
+
+        stop_on_protocol = QSwitch()
+        stop_on_protocol.setChecked(config.stop_on_protocol_complete)
+        stop_on_protocol.stateChanged.connect(
+            lambda value: setattr(
+                config,
+                "stop_on_protocol_complete",
+                value != 0,
+            )
+        )
+        form.addRow("Stop when protocol finishes:", stop_on_protocol)
+
+        drain_timeout = QDoubleSpinBox()
+        drain_timeout.setRange(1, 300)
+        drain_timeout.setDecimals(1)
+        drain_timeout.setSuffix(" s")
+        drain_timeout.setToolTip(
+            "Maximum time to finish the active pellet trial after an automatic "
+            "stop condition. Only expiry of this timer is an error."
+        )
+        drain_timeout.setValue(config.stop_drain_timeout_seconds)
+        drain_timeout.valueChanged.connect(
+            lambda value: setattr(
+                config,
+                "stop_drain_timeout_seconds",
+                value,
+            )
+        )
+        form.addRow("Finish-current-trial timeout:", drain_timeout)
+
+        apply_size_policy(group, (QSwitch, QSpinBox, QDoubleSpinBox))
+        return group
 
     def _create_advanced_tab(self):
         combo_log_level = self._log_level_combobox = QComboBox(None)
