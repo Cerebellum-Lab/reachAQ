@@ -826,6 +826,23 @@ class PreferencesContent(QWidget):
         )
         form.addRow("Automatic pellet cycles:", automatic_cycles)
 
+        automatic_protocol = QSwitch()
+        automatic_protocol.setChecked(
+            config.automatic_protocol_advance_enabled
+        )
+        automatic_protocol.setToolTip(
+            "Automatically advance or fall back when the selected protocol's "
+            "trial criteria are met."
+        )
+        automatic_protocol.stateChanged.connect(
+            lambda value: setattr(
+                config,
+                "automatic_protocol_advance_enabled",
+                value != 0,
+            )
+        )
+        form.addRow("Automatic protocol advance:", automatic_protocol)
+
         attempt_policy = QComboBox()
         for policy in AttemptAssignmentPolicy:
             attempt_policy.addItem(policy.display_name, policy.value)

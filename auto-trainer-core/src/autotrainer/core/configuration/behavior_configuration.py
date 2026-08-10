@@ -139,6 +139,7 @@ class SessionControlConfiguration:
     """Continuous recording and pellet-trial policy exposed to operators."""
 
     automatic_pellet_cycles_enabled: bool = False
+    automatic_protocol_advance_enabled: bool = False
     attempt_assignment: str = "retry_within_trial"
     retry_settings: str = "reuse"
     trial_count_basis: str = "completed"

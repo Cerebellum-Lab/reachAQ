@@ -15,6 +15,7 @@ def test_defaults_use_grouped_attempts_and_fifteen_second_drain():
     configuration = SessionControlConfiguration()
 
     assert configuration.attempt_assignment == "retry_within_trial"
+    assert configuration.automatic_protocol_advance_enabled is False
     assert configuration.trial_count_basis == "completed"
     assert configuration.stop_drain_timeout_seconds == 15.0
     assert configuration.duration_limit_seconds is None
@@ -25,6 +26,7 @@ def test_session_control_round_trips_with_system_configuration():
     configuration = SystemConfiguration()
     configuration.behavior.session_control = SessionControlConfiguration(
         automatic_pellet_cycles_enabled=True,
+        automatic_protocol_advance_enabled=True,
         attempt_assignment="successful_presentations_only",
         retry_settings="resample",
         trial_count_basis="presented",
