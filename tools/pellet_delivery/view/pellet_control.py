@@ -12,7 +12,6 @@ from autotrainer.core.logging import get_verbose_logger
 from autotrainer.core.message import Motor
 from autotrainer.device import is_servo
 from autotrainer.device.coordinate_system import CoordinateSystem, COORDINATE_SYSTEMS
-from autotrainer.model import HardwareVersion, EnvironmentProvider
 from autotrainer.pyside import Separator, CardWidget
 
 from tools.pellet_delivery.model.app_model import AppModel
@@ -123,15 +122,13 @@ class PelletControl(QWidget):
         folder_icon = qta.icon('fa5s.folder-open')
         self._move_file_button.setIcon(folder_icon)
         self._move_file_button.clicked.connect(lambda: self._load_move_file())
-        if EnvironmentProvider.hardware_version() != HardwareVersion.ANSHUTZ:
-            b_layout.addWidget(self._move_file_button)
+        b_layout.addWidget(self._move_file_button)
 
         self._config_button = QPushButton("")
         gear_icon = qta.icon('fa5s.cog')  # Font Awesome 5 Solid cog icon
         self._config_button.setIcon(gear_icon)
         self._config_button.clicked.connect(lambda: self._update_config())
-        if EnvironmentProvider.hardware_version() != HardwareVersion.ANSHUTZ:
-            b_layout.addWidget(self._config_button)
+        b_layout.addWidget(self._config_button)
 
         return b_layout
 
@@ -139,17 +136,11 @@ class PelletControl(QWidget):
         s_layout = QHBoxLayout()
         s_layout.setContentsMargins(2, 2, 2, 2)
 
-        is_legacy = EnvironmentProvider.hardware_version() == HardwareVersion.ANSHUTZ
-        is_legacy = False  # temporary
-
         # NB: following X/Y/Z pos labels text are anyway reset after/below when we set the coordinate system
         p_layout, self._x_pos, moveButton, setButton, self._x_label = add_position("X", -10, 10)
         moveButton.clicked.connect(self._move_x)
         setButton.clicked.connect(self._set_x)
         s_layout.addLayout(p_layout)
-
-        if is_legacy:
-            moveButton.setVisible(False)
 
         s_layout.addStretch(1)
 

@@ -219,7 +219,7 @@ class CanDevice(Device):
 
         if isinstance(self._interface, EmulationInterface):
             logger.warning(
-                "Alogus hardware or hardware support not found. Using emulation interface.")
+                "Pellet-board hardware or transport support not found. Using emulation interface.")
 
         self._motor_configs: Dict[Motor, Union[StepperConfig, ServoConfig]] = {}
         # ensure we have config for these steppers/servos, even if empty/default:

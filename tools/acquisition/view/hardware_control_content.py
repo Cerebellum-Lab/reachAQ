@@ -10,8 +10,6 @@ from autotrainer.behavior.behavior_algorithm import BehaviorAlgoProps
 from autotrainer.core import AnimalSubject, Offset3DTuple
 from autotrainer.core.logging import get_verbose_logger
 
-from autotrainer.model import EnvironmentProvider
-
 from autotrainer.pyside import CardWidget
 from autotrainer.pyside.StackedContent import StackedLayout
 from autotrainer.pyside.content_widget import ContentWidget, invoke_method
@@ -329,9 +327,9 @@ class HardwareControlContent(ContentWidget):
     def _update_title(self, value: str):
         if value:
             if value.find("emulator") != -1:
-                self._card_widget.header.setTitle("Hardware Control: Alogus Emulation")
+                self._card_widget.header.setTitle("Hardware Control: Pellet Board Emulation")
             else:
-                self._card_widget.header.setTitle(f"Hardware Control: {EnvironmentProvider.hardware_version()}")
+                self._card_widget.header.setTitle("Hardware Control: Pellet Board")
         else:
             self._card_widget.header.setTitle("Hardware Control")
 

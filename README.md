@@ -118,7 +118,7 @@ tests for high-level functionality in the applications and that combine elements
 Tests that are longer or require additional configuration are marked as `@pytest.mark.functional` and are not run
 by default.
 
-Tests that require the Alogus hardware are marked as `@pytest.mark.canbus` and are not run by default.
+Tests that require the physical pellet board are marked as `@pytest.mark.canbus` and are not run by default.
 
 The test dependencies are optional. Install them from the repository root with:
 

@@ -10,7 +10,6 @@ from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 
 from autotrainer.core import Offset3DTuple  # noqa: E402
-from autotrainer.model import EnvironmentProvider, HardwareVersion  # noqa: E402
 from tools.acquisition.model.hardware_model import HardwareModel  # noqa: E402
 from tools.acquisition.view.hardware_control_content import (  # noqa: E402
     HardwareControlContent,
@@ -30,18 +29,13 @@ def qapp():
 def test_hardware_control_uses_home_relative_zero_to_35_range(
     qapp,
     app_model,
-    monkeypatch,
 ):
-    monkeypatch.delenv("AUTOTRAINER_HARDWARE_VERSION", raising=False)
-    EnvironmentProvider.set_hardware_version(None)
-    assert EnvironmentProvider.hardware_version() == HardwareVersion.ALOGUS_V1
     content = HardwareControlContent(app_model)
     try:
         for spinbox in (content._x_pos, content._y_pos, content._z_pos):
             assert spinbox.minimum() == pytest.approx(0)
             assert spinbox.maximum() == pytest.approx(35)
     finally:
-        EnvironmentProvider.set_hardware_version(None)
         content.deleteLater()
         qapp.processEvents()
 

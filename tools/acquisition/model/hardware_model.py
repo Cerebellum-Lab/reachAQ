@@ -87,10 +87,8 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         message_handler.ack_received += self._ack_received
 
         self._dcs_config: Optional[DiamondTriangleOffsetConfig] = None
-        # Support for relative x, y, z movements and whether they are persistent as the Send position various between
-        # hardware implementations. One the Alogus hardware is used exclusively, it should be possible to remove these
-        # and rely on SET_X/Y/Z commands with the extra arguments that support relative and/or movements that should
-        # not affect the Send position.
+        # Cache physical and requested coordinates separately so relative moves
+        # cannot silently overwrite the saved pellet-send position.
         self._last_motor_coordinates = _nans_offset3dTuple
         # what the motors report they've been SET (with possible drift corrected):
         self._last_motor_send_coordinates = _nans_offset3dTuple

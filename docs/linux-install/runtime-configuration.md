@@ -100,13 +100,10 @@ systemctl is-active reachaq-can.service
 ip -details link show "$AUTOTRAINER_CAN_CHANNEL"
 ```
 
-The hardware profile defaults to `alogus` independently of which Python CAN
-library is installed. The rig environment sets
-`AUTOTRAINER_HARDWARE_VERSION=alogus` explicitly. A legacy Anschutz runtime
-must opt in with `AUTOTRAINER_HARDWARE_VERSION=anschutz`; unknown values are
-rejected rather than silently selecting another profile. Emulation is selected
-separately with `AUTOTRAINER_CAN_TRANSPORT=emulation` and still uses the Alogus
-profile.
+The retired Anschutz hardware profile has been removed. ReachAQ targets the
+pellet board through the selected JerryCAN, SocketCAN, or emulation transport;
+transport selection does not change the pellet-board command model. Use
+`AUTOTRAINER_CAN_TRANSPORT=emulation` only for software testing.
 
 ## Pellet motor coordinates
 

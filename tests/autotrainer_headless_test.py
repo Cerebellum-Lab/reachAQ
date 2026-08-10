@@ -488,7 +488,7 @@ def test_launch_cli(system_config, config_file_path, user_pref, calib_dir, diamo
 
     assert_is_present(f"Loading diamond-triangle file {diamond_config_path.as_posix()!r}")
     assert_is_present(f"Using setting ini file: {settings_ini_path.as_posix()!r}")
-    assert_is_present("Alogus hardware or hardware support not found. Using emulation interface.")
+    assert_is_present("Pellet-board hardware or transport support not found. Using emulation interface.")
     assert_is_present(f"Writing to {config_file_path.as_posix()!r}")
     #
     # etc...
