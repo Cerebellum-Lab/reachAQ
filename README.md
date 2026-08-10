@@ -83,8 +83,6 @@ utilities. Run them from the repository root in the configured environment.
   metadata.
 * `scripts/run_dlc_model.py` - run a DeepLabCut model against paired recorded
   videos.
-* `scripts/analyse_monitor_output.py`, `scripts/process_headbar_pressure.py`, and
-  `scripts/process_sensor_data.py` - offline sensor and monitor analysis tools.
 
 ## Additional Tools
 
