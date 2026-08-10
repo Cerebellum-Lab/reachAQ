@@ -15,7 +15,7 @@ from autotrainer.inference import PoseResponse, PoseLocation
 from top_fixtures import MockSystemMachine
 
 
-from autotrainer.core import HeadbarPressureMonitor, get_perf_now, Offset3DTuple
+from autotrainer.core import Offset3DTuple
 from autotrainer.core import Notification, TriggerNotification, NotificationCenter
 
 from autotrainer.behavior import IntersessionState

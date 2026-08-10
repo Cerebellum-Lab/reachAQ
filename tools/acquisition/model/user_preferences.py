@@ -1,7 +1,6 @@
 import logging
 import platform
 import sys
-from datetime import date, datetime
 from pathlib import Path
 from typing import Optional, Union
 
@@ -23,9 +22,6 @@ def get_default_animals_location(default_config_location: Path) -> Path:
     return default_config_location.joinpath("animals")
 
 
-_date_format = "%Y%m%d"
-
-
 class UserPreferences(ObservableObject):
 
     CONFIGURATION_LOCATION = "configuration_location"
@@ -38,7 +34,6 @@ class UserPreferences(ObservableObject):
     PELLET_PORT = "pellet_port"
     TUNNEL_PORT = "tunnel_port"
     MEASUREMENT_GRAPH = "measurement_graph"
-    CAGE_CLEAN_PREVIOUS_DAY = "cage_clean_previous_day"
 
     def __init__(self, *, settings_file_path: Optional[Path] = None):
         super().__init__()
@@ -79,21 +74,6 @@ class UserPreferences(ObservableObject):
 
         self._log_location: str = settings.value("system/log_location", "")  # noqa
         self._log_level: int = settings.value("system/log_level", logging.WARNING, int)  # noqa
-
-        today = date.today()
-        today_str = today.strftime(_date_format)
-        cage_clean_prev_day_str = settings.value("system/cage_clean_previous_day", "", str)
-        if cage_clean_prev_day_str != "":
-            try:
-                cage_clean_prev_day = datetime.strptime(cage_clean_prev_day_str, _date_format).date()
-            except Exception:
-                logger.verbose("Invalid date for cage_clean_previous_day: %s ; corrected to today", cage_clean_prev_day_str)
-                cage_clean_prev_day = today
-                settings.setValue("system/cage_clean_previous_day", today_str)
-        else:
-            cage_clean_prev_day = today
-            settings.setValue("system/cage_clean_previous_day", today_str)
-        self._cage_clean_prev_day = cage_clean_prev_day
 
         self._live_feed_refresh_rate: int = settings.value("display/refresh_rate", 15, int)  # noqa
         self._measurement_graph: str = settings.value("ui/measurement_graph", "")  # noqa
@@ -225,13 +205,3 @@ class UserPreferences(ObservableObject):
         prev, self._measurement_graph = self._measurement_graph, value
         self._settings.setValue("ui/measurement_graph", value)
         self._on_property_changed(self.MEASUREMENT_GRAPH, value, prev)
-
-    @property
-    def cage_clean_previous_day(self) -> date:
-        return self._cage_clean_prev_day
-
-    @cage_clean_previous_day.setter
-    def cage_clean_previous_day(self, value: date):
-        prev, self._cage_clean_prev_day = self._cage_clean_prev_day, value
-        self._settings.setValue("system/cage_clean_previous_day", value.strftime(_date_format))
-        self._on_property_changed(self.CAGE_CLEAN_PREVIOUS_DAY, value, prev)

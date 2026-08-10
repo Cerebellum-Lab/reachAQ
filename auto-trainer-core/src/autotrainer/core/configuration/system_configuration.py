@@ -13,8 +13,6 @@ import humps
 
 from autotrainer.core.logging import get_verbose_logger
 from . import GenericSafeLoader, SystemConfigurationLoader, SystemConfigurationDumper, SystemConfigurationSafeLoader
-from .alarm_detector import AlarmDetectorConfig
-from .autoclamp_evasion_config import AnimalEvasionAlarmConfig, AutoClampEvasionDetectorConfig
 from .watchdog_config import WatchdogConfig
 from .. import make_camelize_representer, make_decamelize_constructor
 from .behavior_configuration import BehaviorConfiguration, add_behavior_configuration_representers, \
@@ -230,9 +228,6 @@ _tag_2_cls = dict(
     NidaqSignalChannelConfiguration=NidaqSignalChannelConfiguration,
     NidaqSignalStreamConfiguration=NidaqSignalStreamConfiguration,
     WatchdogConfig=WatchdogConfig,
-    AlarmDetectorConfig=AlarmDetectorConfig,
-    AnimalEvasionAlarmConfig=AnimalEvasionAlarmConfig,
-    AutoClampEvasionDetectorConfig=AutoClampEvasionDetectorConfig,
     PersistenceConfiguration=PersistenceConfiguration,
 )
 

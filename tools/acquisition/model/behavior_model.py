@@ -1,6 +1,5 @@
 import dataclasses
-from datetime import datetime
-from typing import Optional, Callable
+from typing import Optional
 
 from autotrainer.behavior import SystemMachine, InferenceProtocol, BehaviorAlgorithm, SystemState, IntersessionState
 from autotrainer.core import (ObservableObject, ProjectInfo, BehaviorConfiguration,
@@ -21,13 +20,8 @@ class BehaviorModel(ObservableObject, ProjectDependentProtocol):
     aspects of the behavior system that are specific to the application.  General behavior functionality should be
     located in the module.
 
-    Emergency stopped/resumed events are retained for compatibility with upstream code, but reachAQ disables alarm-driven
-    emergency behavior and rejects direct emergency-stop/resume requests explicitly.
+    Alarm and emergency behavior are intentionally outside the ReachAQ runtime.
     """
-
-    # events type hint
-    emergency_stopped: Callable[[str], None]
-    emergency_resumed: Callable[[str], None]
 
     def __init__(
         self,
@@ -38,7 +32,7 @@ class BehaviorModel(ObservableObject, ProjectDependentProtocol):
         *,
         system_machine: Optional[SystemMachine] = None,
     ):
-        super().__init__(("emergency_stopped", "emergency_resumed"))
+        super().__init__()
 
         self._project: Optional[ProjectInfo] = None
 
@@ -52,8 +46,6 @@ class BehaviorModel(ObservableObject, ProjectDependentProtocol):
             )
         self._system_machine: SystemMachine = system_machine
         self._hardware_model = hardware_model
-        #
-        self._source_emergency: Optional[str] = None
         #
         # system_machine.pellet.events.state_changed += lambda old_val, new_val: self._on_property_changed(
         #     f"pellet.{StateMachine.Properties.STATE_PROPERTY}", new_val, old_val)
@@ -127,37 +119,6 @@ class BehaviorModel(ObservableObject, ProjectDependentProtocol):
             post_api_event_content(ApiEventKind.headfixBaselineChanged,
                                    data=dict(baseline=head_magnet_intensity))
 
-    @property
-    def source_emergency(self) -> Optional[str]:
-        return self._source_emergency
-
-    @BehaviorAlgorithm.relay_func()
-    def emergency_stop(self, source: str):
-        raise RuntimeError(
-            f"Emergency stop is disabled in reachAQ; request source={source!r}. "
-            "Use stop acquisition for controlled shutdown."
-        )
-
-    @BehaviorAlgorithm.relay_func()
-    def emergency_resume(self, source: str):
-        raise RuntimeError(
-            f"Emergency resume is disabled in reachAQ; request source={source!r}. "
-            "No emergency pause state is maintained."
-        )
-
-    def get_led_color(self, *, now: Optional[datetime]=None):
-        if now is None:
-            now = datetime.now()
-        algo = self._system_machine.algorithm
-        cfg_led = algo.active_config.led_alarm
-        color = (0, 100, 0)
-        cur_time = now.time()
-        start, stop = cfg_led.start_ignore_hour, cfg_led.stop_ignore_hour
-        in_ignore_window = (
-            (start <= cur_time <= stop)
-            if start < stop
-            else (cur_time >= start or cur_time <= stop)
-        )
-        if in_ignore_window:
-            color = (0, 0, 0)
-        return color
+    def get_led_color(self):
+        """Use a steady green pellet-board indicator while acquisition runs."""
+        return (0, 100, 0)

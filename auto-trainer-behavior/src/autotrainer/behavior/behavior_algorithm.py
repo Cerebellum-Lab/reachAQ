@@ -27,7 +27,7 @@ from autotrainer.core.logging import get_verbose_logger
 from autotrainer.core.multiproc import make_daemon_timer, no_op_timer
 from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
 from autotrainer.core.reach_event import ReachEvent
-from autotrainer.core.configuration.behavior_configuration import PelletDeliveryConfiguration, HeadClampConfiguration, \
+from autotrainer.core.configuration.behavior_configuration import PelletDeliveryConfiguration, \
     BehaviorConfiguration, HomeOnExcessiveDriftDistanceConfiguration, \
     PelletUncoverConfiguration
 from autotrainer.core.pose_elements import ScenePartsPresenceContext, SceneElement
@@ -86,10 +86,6 @@ class BehaviorAlgoProps(str, enum.Enum):
 
     ALGO_PAUSED = 'algo_paused'
 
-    # head-clamp / auto-clamp related:
-    BASELINE_INTENSITY = 'baseline_intensity'
-    HEAD_FIXATION_ENABLED = 'head_fixation_enabled'  # this is head-clamp
-
     # runtime context:
     PELLET_SHIFT_Y_LIMIT = 'pellet_shift_y_limit'
 
@@ -127,7 +123,6 @@ class BehaviorAlgoProps(str, enum.Enum):
     # PELLET_HANDS_DISTANCE = 'pellet_hands_min_distance'  # unused
 
     DIAMOND_TRIANGLE_CONFIG = 'diamond_triangle_config'
-    CAGE_CLEAN_CONFIG = 'cage_clean_config'
 
 
 #
@@ -211,17 +206,8 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
         self._active_config = BehaviorConfiguration()
         self._loaded_config: Optional[BehaviorConfiguration] = None
 
-        self._head_fixation_enabled = False
-        self._autoclamp_in_progress = False
-        self._autoclamp_engaged_perf_c = -math.inf
-
-
         self._parts_pres_ctx_any_cam = ScenePartsPresenceContext()
         self._parts_pres_ctx_all_cams = ScenePartsPresenceContext()
-
-        # now using self._active_config.head_clamp mainly,
-        # and also:
-        self._baseline_intensity = self._active_config.head_clamp.baseline_intensity
 
         # NB: not saved in config:
         self._sess_min_duration = 1.5  # could add to config
@@ -656,118 +642,6 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
         # self._on_property_changed(BehaviorAlgoProps.INTERSESSION_PELLET_SHIFT_ENABLED, value, prev)
 
     @property
-    def head_fixation_enabled(self) -> bool:
-        """head fixation == autoclamp"""
-        # NB: not saved in config
-        return self._head_fixation_enabled
-
-    @head_fixation_enabled.setter
-    def head_fixation_enabled(self, value: bool):
-        # NB: not saved in config
-        prev, self._head_fixation_enabled = self._head_fixation_enabled, value
-        if value != prev:
-            logger.info("auto-clamp enabled changed to: %s", self._head_fixation_enabled)
-            self._event_manager.post_event_content(ApiEventKind.autoClampEnabledChanged, data=dict(is_enabled=value))
-            self._on_property_changed(BehaviorAlgoProps.HEAD_FIXATION_ENABLED, value, prev)
-
-    # auto/head clamp
-
-    @property
-    def autoclamp_in_progress(self) -> bool:
-        return self._autoclamp_in_progress
-
-    @autoclamp_in_progress.setter
-    def autoclamp_in_progress(self, value: bool):
-        self._autoclamp_in_progress = value
-        if value:
-            self._autoclamp_engaged_perf_c = get_perf_now()
-
-    @property
-    def baseline_intensity(self) -> float:
-        """Head magnet "baseline" intensity ; set from animal/subject"""
-        return self._baseline_intensity
-
-    @baseline_intensity.setter
-    def baseline_intensity(self, value: float):
-        prev, self._baseline_intensity = self._baseline_intensity, value
-        self._on_property_changed(BehaviorAlgoProps.BASELINE_INTENSITY, value, prev)
-
-    @property
-    def head_clamp_config(self) -> HeadClampConfiguration:
-        """The whole HeadClamp config, can be modified in place,
-        although no event/change cb, if any is configured on behavior algo, will be emitted in that case"""
-        return self._active_config.head_clamp
-
-    @property
-    def auto_clamp_intensity(self) -> float:
-        return self._active_config.head_clamp.auto_clamp_intensity
-
-    @auto_clamp_intensity.setter
-    def auto_clamp_intensity(self, value: float):
-        cfg = self._active_config.head_clamp
-        prev, cfg.auto_clamp_intensity = cfg.auto_clamp_intensity, value
-        if value != prev:
-            # prop unused
-            #     self._on_property_changed(BehaviorAlgoProps.AUTO_CLAMP_INTENSITY, value, prev)
-            self._event_manager.post_event_content(
-                ApiEventKind.autoClampIntensityChanged, data=dict(intensity=value))
-
-    @property
-    def auto_clamp_release_tone_freq(self) -> int:
-        """Frequency of the tone played when auto-clamp is released in Hz"""
-        return self._active_config.head_clamp.auto_clamp_release_tone_freq
-
-    @auto_clamp_release_tone_freq.setter
-    def auto_clamp_release_tone_freq(self, value: int):
-        cfg = self._active_config.head_clamp
-        prev, cfg.auto_clamp_release_tone_freq = cfg.auto_clamp_release_tone_freq, value
-        if value != prev:
-            # prop unused
-            # self._on_property_changed("auto_clamp_release_tone_freq", value, prev)
-            self._event_manager.post_event_content(ApiEventKind.autoClampReleaseToneFreqChanged,
-                                                   data=dict(frequency=value))
-
-    @property
-    def auto_clamp_release_tone_delay(self) -> float:
-        return self._active_config.head_clamp.auto_clamp_release_tone_delay
-
-    @auto_clamp_release_tone_delay.setter
-    def auto_clamp_release_tone_delay(self, value: float):
-        cfg = self._active_config.head_clamp
-        prev, cfg.auto_clamp_release_tone_delay = cfg.auto_clamp_release_tone_delay, value
-        if value != prev:
-            # prop unused
-            # self._on_property_changed("auto_clamp_release_tone_delay", value, prev)
-            self._event_manager.post_event_content(ApiEventKind.autoClampReleaseDelayChanged,
-                                                   data=dict(delay=value))
-
-    @property
-    def auto_clamp_release_load_count(self) -> int:
-        return self._active_config.head_clamp.auto_clamp_release_load_count
-
-    @auto_clamp_release_load_count.setter
-    def auto_clamp_release_load_count(self, value: int):
-        self._active_config.head_clamp.auto_clamp_release_load_count = value
-
-    @property
-    def auto_clamp_no_activity_release_delay(self):
-        return self._active_config.head_clamp.auto_clamp_no_activity_release_delay
-
-    @auto_clamp_no_activity_release_delay.setter
-    def auto_clamp_no_activity_release_delay(self, value):
-        self._active_config.head_clamp.auto_clamp_no_activity_release_delay = value
-
-    @property
-    def auto_clamp_before_reengage_delay(self) -> float:
-        return self._active_config.head_clamp.before_reengage_delay
-
-    @auto_clamp_before_reengage_delay.setter
-    def auto_clamp_before_reengage_delay(self, value):
-        self._active_config.head_clamp.before_reengage_delay = value
-
-    #
-
-    @property
     def record_prebuffer_duration(self) -> float:
         return self._recording_prebuffer_duration
 
@@ -1144,14 +1018,9 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
         if not cfg.pellet_delivery.is_enabled:
             return False
         if not cfg.pellet_delivery.retract_enabled:
-            if self._system_state in {SystemState.cage, SystemState.tunnel}:
-                if self.is_pellet_recently_seen(use_any_cam=True):
-                    return True
-                return False
+            return self.is_pellet_recently_seen(use_any_cam=True)
         if not (self._is_in_session and self._capture_status == CaptureProcessStatus.RECORDING):
             return False
-        if self._head_fixation_enabled and cfg.head_clamp.wait_engaged_before_send_pellet:
-            return self._autoclamp_in_progress
         t_since_rec_started = get_perf_now() - self._recording_start_perf_c
         prebuffer_duration = self._recording_prebuffer_duration
         if math.isfinite(prebuffer_duration):
@@ -1263,10 +1132,7 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
         #
 
     def can_retract_pellet(self, *, pellet_state: PelletState) -> bool:
-        if self._algo_paused or self._status not in {
-            BehaviorAlgoStatus.ANIMAL_IN_DEVICE,
-            BehaviorAlgoStatus.ANIMAL_IN_TRAINING,
-        } or pellet_state in {
+        if self._algo_paused or pellet_state in {
             # PelletState.home,  # not sure
             PelletState.retract,  # prevent executing the command again and again and..
         }:
@@ -1275,8 +1141,6 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
             return self._system_state == SystemState.intersession
         if not self._is_in_session:
             return True
-        if self._head_fixation_enabled and self._active_config.head_clamp.wait_engaged_before_send_pellet:
-            return not self._autoclamp_in_progress
         return False
 
     def can_perform_intersession_analysis(self):
@@ -1388,8 +1252,6 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
                 # use 50% more, in case of:
                 maxlen=int(1.5 * config.home_on_excessive_drift_distance.min_samples))
         self._load_pellet_cfg(config.pellet_delivery)
-        self.head_fixation_enabled = config.head_clamp.enabled
-        self.baseline_intensity = config.head_clamp.baseline_intensity
         self.reload_diamond_triangle_config()
         self._active_config = config  # set it as new active one only at the end,
         #   so that possible on_property_changed event can be relayed if some changed.

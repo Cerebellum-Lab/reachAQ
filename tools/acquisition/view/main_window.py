@@ -8,7 +8,7 @@ import threading
 import time
 import math
 import traceback
-from datetime import datetime, date
+from datetime import datetime
 from functools import partial
 from itertools import chain
 from pathlib import Path
@@ -193,7 +193,6 @@ class MainWindow(QMainWindow):
                 app_model.set_runtime_live_inference_override(live_inference)
 
         app_model.property_changed += self._on_app_model_property_changed
-        app_model.current_day_changed += self._on_day_changed
         app_model.hardware.property_changed += self._on_hardware_property_changed
         app_model.inference.property_changed += self._on_inference_property_changed
         app_model.inference.detection_result_ready += self._on_inference_analysis_result_ready
@@ -210,7 +209,6 @@ class MainWindow(QMainWindow):
         self._reload_animals(self._app_model.animals)  # after all property_changed connect above
         #
         # then after everything:
-        self._set_reset_cage_clean_text()
         QTimer.singleShot(0, self._refresh_hardware_bindings)
 
     @property
@@ -519,12 +517,6 @@ class MainWindow(QMainWindow):
             return
         prj, rsp = raw
         self.main_content.show_analysis_reach_events(prj)
-
-    def on_reset_cage_clean(self):
-        prefs = self._preferences
-        prefs.cage_clean_previous_day = date.today()
-        prefs.save()
-        self._set_reset_cage_clean_text()
 
     def _check_target_next_or_previous_plan_phase(
         self,
@@ -1031,9 +1023,6 @@ class MainWindow(QMainWindow):
         self._add_box_to_open_dialogs(dialog)
         dialog.exec()
 
-    def _set_reset_cage_clean_text(self):
-        self._reset_cage_clean_action.setToolTip("Mark the cage as cleaned.")
-
     def _create_actions(self):
         action = self.edit_camera_settings_action = QAction(_toolbar_icon("fa5s.edit"), "Edit Camera Settings", self)
         action.setToolTip("Edit Camera Settings")
@@ -1069,9 +1058,6 @@ class MainWindow(QMainWindow):
         action.setCheckable(True)
         action.setEnabled(False)
         action.triggered.connect(self.on_show_reach_event)
-
-        action = self._reset_cage_clean_action = QAction(_toolbar_icon("fa5s.broom"), "Reset Cage Clean", self)
-        action.triggered.connect(self.on_reset_cage_clean)
 
         action = self.next_training_phase_action = QAction(_toolbar_icon("fa5s.arrow-alt-circle-right"), "Next Phase", self)
         action.setVisible(False)
@@ -1653,10 +1639,6 @@ class MainWindow(QMainWindow):
             action.setEnabled(can_do)
 
     @invoke_method
-    def _on_day_changed(self, day: date):
-        self._set_reset_cage_clean_text()
-
-    @invoke_method
     def _on_app_model_property_changed(self, name: str, value, prev_value):
         app_model = self._app_model
         props = app_model.Props
@@ -1884,12 +1866,6 @@ class MainWindow(QMainWindow):
             self._status_label_send_pos.update_coordinate(hard.last_dcs_set_position)
         elif property_name == hard.TUNNEL_HEADFIX_ENABLED:
             self._update_tunnel_headfix_visibility(value)
-
-    @invoke_method
-    def _on_behavior_algo_property_changed(self, name: str, value, _):
-        props = BehaviorAlgoProps
-        if name == props.CAGE_CLEAN_CONFIG:
-            self._set_reset_cage_clean_text()
 
     @invoke_method
     def _set_training_plans(self, plans: List[PlanInfo]):

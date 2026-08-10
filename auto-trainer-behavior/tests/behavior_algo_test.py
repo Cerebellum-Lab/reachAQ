@@ -34,19 +34,6 @@ def test_project_info(algo):
     assert algo.project is new_prj
 
 
-def test_auto_clamp_release_tone_freq(algo):
-    prev = algo.auto_clamp_release_tone_freq
-    assert prev \
-            == algo.auto_clamp_release_tone_freq \
-            == algo.head_clamp_config.auto_clamp_release_tone_freq \
-            == algo.active_config.head_clamp.auto_clamp_release_tone_freq
-    algo.auto_clamp_release_tone_freq += 42
-    assert prev + 42 \
-           == algo.auto_clamp_release_tone_freq \
-           == algo.head_clamp_config.auto_clamp_release_tone_freq \
-           == algo.active_config.head_clamp.auto_clamp_release_tone_freq
-
-
 def test_cover_servo_status(algo):
     assert algo.cover_servo_status is CoverServoStatus.OK
     assert not algo.cover_servo_status.is_error
@@ -98,25 +85,6 @@ def test_pellet_missing_time(algo):
            == algo.pellet_missing_time \
            == algo.pellet_delivery_config.max_pellet_missing_seconds \
            == algo.active_config.pellet_delivery.max_pellet_missing_seconds
-
-
-def test_auto_clamp_intensity(algo):
-    prev = algo.auto_clamp_intensity
-    assert prev \
-           == algo.auto_clamp_intensity \
-           == algo.head_clamp_config.auto_clamp_intensity \
-           == algo.active_config.head_clamp.auto_clamp_intensity
-    algo.auto_clamp_intensity += 5
-    assert prev + 5 \
-           == algo.auto_clamp_intensity \
-           == algo.head_clamp_config.auto_clamp_intensity \
-           == algo.active_config.head_clamp.auto_clamp_intensity
-
-
-def test_auto_clamp_before_reengage_delay(algo):
-    prev = algo.auto_clamp_before_reengage_delay
-    algo.auto_clamp_before_reengage_delay += 5
-    assert prev + 5 == algo.auto_clamp_before_reengage_delay == algo.active_config.head_clamp.before_reengage_delay
 
 
 def test_default_diamond_triangle_offset_config_path(algo):
@@ -189,12 +157,12 @@ def test_set_put_func_call_mode(algo):
 def test_reset_config(algo, count):
     algo.reset_configuration()
     config = BehaviorConfiguration()
-    config.head_clamp.auto_clamp_release_load_count = count
+    config.pellet_delivery.max_pellet_missing_seconds = count
     algo.load_configuration(config)
-    assert algo.auto_clamp_release_load_count == count
-    algo.auto_clamp_release_load_count = 2 * count
+    assert algo.pellet_missing_time == count
+    algo.pellet_missing_time = 2 * count
     algo.reset_configuration()
-    assert algo.auto_clamp_release_load_count == count
+    assert algo.pellet_missing_time == count
 
 
 def test_start_twice_session_fails(algo):
