@@ -1083,6 +1083,10 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
             RecordingEndingReason.ALGO_PAUSED,
             RecordingEndingReason.MANUAL_STOP,
             RecordingEndingReason.MANUAL_ABORT,
+            RecordingEndingReason.DURATION_LIMIT,
+            RecordingEndingReason.TRIAL_LIMIT,
+            RecordingEndingReason.PROTOCOL_COMPLETE,
+            RecordingEndingReason.STOP_DRAIN_TIMEOUT,
         }
         if miss_delay > 0 and reason not in immediate_reasons:
             logger.verbose("current trial record too short, delaying end_capture_session of %.1f",

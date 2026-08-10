@@ -126,6 +126,13 @@ from tools.acquisition.model.nidaq_timing import (
 )
 from tools.acquisition.model.session_data_recorder import SessionDataRecorder
 from tools.acquisition.model.session_boundary import SessionBoundary
+from tools.acquisition.model.session_stop_policy import (
+    SessionStopConfiguration,
+    SessionStopDecision,
+    SessionStopEvaluation,
+    SessionStopPolicy,
+    SessionStopReason,
+)
 from tools.acquisition.model.subsystem_status import (
     SubsystemId,
     SubsystemState,
@@ -355,6 +362,10 @@ class AppModel(ObservableObject):
         self._session_data_errors: Tuple[str, ...] = ()
         self._session_enabled_sources: Tuple[dict, ...] = ()
         self._trial_ledger: Optional[PelletTrialLedger] = None
+        self._session_stop_policy: Optional[SessionStopPolicy] = None
+        self._session_stop_evaluation: Optional[SessionStopEvaluation] = None
+        self._automatic_stop_timer = no_op_timer
+        self._stop_drain_timer = no_op_timer
         self._aborting_project: Optional[ProjectInfo] = None
         self._aborted_session_ids = set()
         self._abort_had_recording_started = False
@@ -522,6 +533,7 @@ class AppModel(ObservableObject):
         intersession.events.property_changed += self._on_intersession_property_changed
 
         pellet_m = system_machine.pellet
+        pellet_m.events.pellet_loading += self._on_pellet_loading_for_trial
         pellet_m.events.pellet_sending += self._on_pellet_sending
         pellet_m.events.pellet_sent += self._on_pellet_sent
 
@@ -919,18 +931,113 @@ class AppModel(ObservableObject):
         )
         self.abort_recording()
 
-    def stop_recording(self) -> bool:
+    def _start_automatic_stop_policy(self, start_perf_time: float) -> None:
+        policy = self._session_stop_policy
+        if policy is None:
+            return
+        policy.start(start_perf_time)
+        duration = policy.configuration.duration_seconds
+        if duration is not None:
+            self._automatic_stop_timer.cancel()
+            self._automatic_stop_timer = make_daemon_timer(
+                duration,
+                self._evaluate_automatic_stop_policy,
+            )
+            self._automatic_stop_timer.start()
+
+    def _cancel_automatic_stop_timers(self) -> None:
+        for timer in (self._automatic_stop_timer, self._stop_drain_timer):
+            if not timer.finished.is_set():
+                timer.cancel()
+        self._automatic_stop_timer = no_op_timer
+        self._stop_drain_timer = no_op_timer
+
+    def _evaluate_automatic_stop_policy(
+        self,
+        *,
+        protocol_complete: bool = False,
+    ) -> Optional[SessionStopEvaluation]:
+        policy = self._session_stop_policy
+        if (
+            policy is None
+            or not policy.is_started
+            or self._session_recording_status is not SessionRecordingStatus.RECORDING
+        ):
+            return None
+        ledger = self._trial_ledger
+        evaluation = policy.evaluate(
+            get_perf_now(),
+            trial_count=0 if ledger is None else ledger.count(),
+            protocol_complete=protocol_complete,
+            trial_active=(ledger is not None and ledger.active_attempt is not None),
+        )
+        self._session_stop_evaluation = evaluation
+        if evaluation.decision is SessionStopDecision.NONE:
+            return evaluation
+        if evaluation.decision is SessionStopDecision.FINISH_ACTIVE_TRIAL:
+            if self._stop_drain_timer is no_op_timer:
+                self._stop_drain_timer = make_daemon_timer(
+                    policy.configuration.drain_timeout_seconds,
+                    self._evaluate_automatic_stop_policy,
+                )
+                self._stop_drain_timer.start()
+            logger.info(
+                "automatic session stop requested; finishing active trial: %s",
+                evaluation.reason,
+            )
+            return evaluation
+        if evaluation.decision is SessionStopDecision.TIMEOUT_ERROR:
+            now_perf = get_perf_now()
+            if ledger is not None and ledger.active_attempt is not None:
+                ledger.finalize(
+                    TrialOutcome.INCOMPLETE,
+                    now_perf,
+                    time.time(),
+                    error=(
+                        "active trial did not finish within the configured "
+                        "stop drain timeout"
+                    ),
+                )
+            message = (
+                "Active pellet trial did not finish within "
+                f"{policy.configuration.drain_timeout_seconds:g} seconds"
+            )
+            logger.error(message)
+            self.on_error("Automatic recording stop timeout", message)
+        self._stop_recording_with_reason(evaluation.reason, evaluation.decision)
+        return evaluation
+
+    def _stop_recording_with_reason(
+        self,
+        reason: Optional[SessionStopReason],
+        decision: SessionStopDecision = SessionStopDecision.STOP,
+    ) -> bool:
+        ending_reason = {
+            SessionStopReason.DURATION_LIMIT: RecordingEndingReason.DURATION_LIMIT,
+            SessionStopReason.TRIAL_LIMIT: RecordingEndingReason.TRIAL_LIMIT,
+            SessionStopReason.PROTOCOL_COMPLETE: RecordingEndingReason.PROTOCOL_COMPLETE,
+        }.get(reason, RecordingEndingReason.STOP_DRAIN_TIMEOUT)
+        if decision is SessionStopDecision.TIMEOUT_ERROR:
+            ending_reason = RecordingEndingReason.STOP_DRAIN_TIMEOUT
+        return self._stop_recording(ending_reason)
+
+    def _stop_recording(self, reason: RecordingEndingReason) -> bool:
         if self._session_recording_status != SessionRecordingStatus.RECORDING:
-            logger.warning("stop_recording refused while %s", self._session_recording_status.value)
+            logger.warning(
+                "stop_recording refused while %s",
+                self._session_recording_status.value,
+            )
             return False
+        self._cancel_automatic_stop_timers()
         self._session_analysis_finished = False
         self._set_session_recording_status(SessionRecordingStatus.STOPPING)
-        stopped = self._behavior.algorithm.end_capture_session(
-            reason=RecordingEndingReason.MANUAL_STOP,
-        )
+        stopped = self._behavior.algorithm.end_capture_session(reason=reason)
         if not stopped:
             self._set_session_recording_status(SessionRecordingStatus.RECORDING)
         return bool(stopped)
+
+    def stop_recording(self) -> bool:
+        return self._stop_recording(RecordingEndingReason.MANUAL_STOP)
 
     def abort_recording(self) -> bool:
         previous_status = self._session_recording_status
@@ -946,6 +1053,7 @@ class AppModel(ObservableObject):
         self._aborting_project = project.to_local_value()
         self._aborted_session_ids.add(self._aborting_project.short_id)
         self._session_data_recorder.abort()
+        self._cancel_automatic_stop_timers()
         self._pending_session_end_perf = None
         self._record_start_timer.cancel()
         self._record_start_timer = no_op_timer
@@ -1344,6 +1452,7 @@ class AppModel(ObservableObject):
                     )
                     if self._session_recording_status == SessionRecordingStatus.ARMING:
                         self._set_session_recording_status(SessionRecordingStatus.RECORDING)
+                        self._start_automatic_stop_policy(first_frame_perf)
                 else:
                     p_now = get_perf_now()
                 algo.set_capture_status(new_status, perf_now=p_now)
@@ -4219,6 +4328,20 @@ class AppModel(ObservableObject):
                 ),
             ),
         )
+        self._cancel_automatic_stop_timers()
+        self._session_stop_policy = SessionStopPolicy(
+            SessionStopConfiguration(
+                duration_seconds=session_config.duration_limit_seconds,
+                trial_limit=session_config.trial_limit,
+                stop_on_protocol_complete=(
+                    session_config.stop_on_protocol_complete
+                ),
+                drain_timeout_seconds=(
+                    session_config.stop_drain_timeout_seconds
+                ),
+            ),
+        )
+        self._session_stop_evaluation = None
         self._cams_record_start_perf.value = math.nan
         drained = 0
         while self._record_stop_sema.acquire(block=False):
@@ -4807,6 +4930,37 @@ class AppModel(ObservableObject):
                 if self._trial_ledger is None
                 else self._trial_ledger.summary()
             ),
+            "sessionStopPolicy": (
+                None
+                if self._session_stop_policy is None
+                else dataclasses.asdict(
+                    self._session_stop_policy.configuration
+                )
+            ),
+            "sessionStopResult": (
+                None
+                if self._session_stop_evaluation is None
+                else {
+                    "decision": self._session_stop_evaluation.decision.value,
+                    "reason": (
+                        None
+                        if self._session_stop_evaluation.reason is None
+                        else self._session_stop_evaluation.reason.value
+                    ),
+                    "triggeredReasons": [
+                        reason.value
+                        for reason in (
+                            self._session_stop_evaluation.triggered_reasons
+                        )
+                    ],
+                    "requestedPerfTime": (
+                        self._session_stop_evaluation.requested_perf_time
+                    ),
+                    "timeoutSeconds": (
+                        self._session_stop_evaluation.timeout_seconds
+                    ),
+                }
+            ),
             "hardwareConfigured": {
                 "canEnabled": self._hardware.can_enabled,
                 "pelletControllerEnabled": self._hardware.pellet_controller_enabled,
@@ -5082,6 +5236,14 @@ class AppModel(ObservableObject):
 
     # pellet machine events
 
+    def _on_pellet_loading_for_trial(self):
+        ledger = self._trial_ledger
+        if ledger is None or ledger.active_attempt is None:
+            return
+        now_perf = get_perf_now()
+        ledger.close_active_for_analysis(now_perf, time.time())
+        self._evaluate_automatic_stop_policy()
+
     def _on_pellet_sending(self, *, perf_c: float, context: str):
         ledger = self._trial_ledger
         algo = self._behavior.algorithm
@@ -5131,3 +5293,4 @@ class AppModel(ObservableObject):
                     time.time(),
                 )
             algo.increase_pellets_presented(1)
+            self._evaluate_automatic_stop_policy()

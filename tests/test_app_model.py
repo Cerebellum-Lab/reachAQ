@@ -19,6 +19,12 @@ from autotrainer.behavior.pellet_trial import PelletTrialLedger, TrialOutcome
 from tools.acquisition.model.app_model import app_status_to_api_app_mode, app_status_to_behavior_algo_status
 from tools.acquisition.model.app_model_status import AppModelStatus, SessionRecordingStatus
 from tools.acquisition.model.session_boundary import SessionBoundary
+from tools.acquisition.model.session_stop_policy import (
+    SessionStopConfiguration,
+    SessionStopDecision,
+    SessionStopPolicy,
+    SessionStopReason,
+)
 from tools.acquisition.model.subsystem_status import (
     SubsystemId,
     SubsystemState,
@@ -225,6 +231,50 @@ def test_mismatched_pellet_ack_does_not_present_or_count_trial(app_model):
 
     assert not app_model._trial_ledger.active_attempt.is_presented
     assert algorithm.pellets_presented == 0
+
+
+def test_automatic_stop_finishes_active_trial_normally_before_stopping(
+    app_model,
+    monkeypatch,
+):
+    ledger = PelletTrialLedger(app_model.project.short_id)
+    ledger.begin_send(5.0, 105.0, operation_id="send-1")
+    ledger.acknowledge_presentation(5.1, 105.1)
+    policy = SessionStopPolicy(
+        SessionStopConfiguration(
+            duration_seconds=10,
+            drain_timeout_seconds=15,
+        ),
+    )
+    policy.start(0.0)
+    app_model._trial_ledger = ledger
+    app_model._session_stop_policy = policy
+    app_model._set_session_recording_status(SessionRecordingStatus.RECORDING)
+    now = iter((10.0, 11.0, 11.0))
+    monkeypatch.setattr(
+        "tools.acquisition.model.app_model.get_perf_now",
+        lambda: next(now),
+    )
+
+    try:
+        with mock.patch.object(app_model, "on_error") as on_error, mock.patch.object(
+            app_model,
+            "_stop_recording_with_reason",
+        ) as stop:
+            draining = app_model._evaluate_automatic_stop_policy()
+            app_model._on_pellet_loading_for_trial()
+
+        assert draining.decision is SessionStopDecision.FINISH_ACTIVE_TRIAL
+        assert not draining.is_error
+        on_error.assert_not_called()
+        stop.assert_called_once_with(
+            SessionStopReason.DURATION_LIMIT,
+            SessionStopDecision.STOP,
+        )
+        assert ledger.active_attempt is None
+        assert ledger.summary()["trials_completed"] == 1
+    finally:
+        app_model._cancel_automatic_stop_timers()
 
 
 def test_abort_removes_whole_session_and_resets_counts(app_model):

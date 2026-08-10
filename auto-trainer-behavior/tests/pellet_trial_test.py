@@ -153,7 +153,7 @@ def test_capture_window_can_close_before_offline_outcome_is_known():
     assert not pending.is_finalized
     assert ledger.summary()["pending_analysis_attempts"] == 1
     assert ledger.count(TrialCountBasis.PRESENTED) == 1
-    assert ledger.count(TrialCountBasis.COMPLETED) == 0
+    assert ledger.count(TrialCountBasis.COMPLETED) == 1
 
     final = ledger.finalize_pending(
         1,

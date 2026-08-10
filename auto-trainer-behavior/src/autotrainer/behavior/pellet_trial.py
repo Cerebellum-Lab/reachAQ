@@ -381,7 +381,10 @@ class PelletTrialLedger:
             elif basis is TrialCountBasis.COMPLETED:
                 qualifies = any(
                     attempt.logical_trial_complete
-                    and attempt.outcome in self.configuration.counted_outcomes
+                    and (
+                        attempt.outcome is TrialOutcome.PENDING_ANALYSIS
+                        or attempt.outcome in self.configuration.counted_outcomes
+                    )
                     for attempt in non_hardware
                 )
             else:
