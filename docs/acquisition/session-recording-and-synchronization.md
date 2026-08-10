@@ -251,8 +251,11 @@ diagnosed.
 Final session JSON/YAML additionally records `sessionCounts`,
 `sessionDataComplete`, `sessionDataErrors`, `hardwareConfigured`,
 `hardwareRuntimeAtRecord`, `hardwareRuntime`, recording state, and analysis
-duration. Non-finite values are normalized to JSON/YAML null; finalized metadata
-is never written with non-standard `NaN` tokens.
+duration. `recordingStopReason` records the actual manual or automatic terminal
+reason, while `recordingDurationSeconds` and
+`sessionBoundary.durationSeconds` record the final camera-bounded duration.
+Non-finite values are normalized to JSON/YAML null; finalized metadata is never
+written with non-standard `NaN` tokens.
 
 The retained `auto-trainer-api` 0.9.22 status object still requires empty alarm
 and tunnel-shaped fields and a legacy training-mode value. ReachAQ fills those

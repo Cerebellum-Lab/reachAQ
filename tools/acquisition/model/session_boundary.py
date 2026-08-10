@@ -31,6 +31,11 @@ class SessionBoundary:
         return dataclasses.replace(self, nidaq_sample_index=int(sample_index))
 
     def to_metadata(self) -> dict:
+        duration = (
+            None
+            if self.end_perf_time is None
+            else max(0.0, self.end_perf_time - self.start_perf_time)
+        )
         return {
             "sessionId": self.session_id,
             "source": "primary_camera_recorded_frames",
@@ -41,5 +46,6 @@ class SessionBoundary:
             "cameraWhen": self.camera_when,
             "endPerfTime": self.end_perf_time,
             "endWallTime": self.end_wall_time,
+            "durationSeconds": duration,
             "nidaqSampleIndex": self.nidaq_sample_index,
         }

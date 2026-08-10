@@ -364,6 +364,7 @@ class AppModel(ObservableObject):
         self._trial_ledger: Optional[PelletTrialLedger] = None
         self._session_stop_policy: Optional[SessionStopPolicy] = None
         self._session_stop_evaluation: Optional[SessionStopEvaluation] = None
+        self._recording_ending_reason = RecordingEndingReason.NA
         self._automatic_stop_timer = no_op_timer
         self._stop_drain_timer = no_op_timer
         self._aborting_project: Optional[ProjectInfo] = None
@@ -4180,6 +4181,7 @@ class AppModel(ObservableObject):
             ),
         )
         self._session_stop_evaluation = None
+        self._recording_ending_reason = RecordingEndingReason.NA
         self._cams_record_start_perf.value = math.nan
         drained = 0
         while self._record_stop_sema.acquire(block=False):
@@ -4195,6 +4197,7 @@ class AppModel(ObservableObject):
             prepare_pose(self._inference, self._project_info)
 
     def _on_session_capture_ended(self, reason: RecordingEndingReason):
+        self._recording_ending_reason = RecordingEndingReason(reason)
         logger.debug("session capture trigger ended: %s", reason)
 
     def _on_session_ending(self, project: ProjectInfo, result: CaptureAnalysisResult):
@@ -4726,6 +4729,11 @@ class AppModel(ObservableObject):
         else:
             start_record_timestamp = project.start_record_timestamp
             session_boundary = None
+        recording_duration = (
+            None
+            if boundary is None or boundary.end_perf_time is None
+            else max(0.0, boundary.end_perf_time - boundary.start_perf_time)
+        )
         info: Dict[str, Any] = {
             "date": when.strftime("%Y%m%d_%H%M%S"),
             "created": when.timestamp(),
@@ -4747,6 +4755,12 @@ class AppModel(ObservableObject):
                 "consumed": self._behavior.algorithm.pellets_consumed,
             },
             "recordingStatus": self._session_recording_status.value,
+            "recordingStopReason": (
+                None
+                if self._recording_ending_reason is RecordingEndingReason.NA
+                else self._recording_ending_reason.value
+            ),
+            "recordingDurationSeconds": recording_duration,
             "sessionDataComplete": self._session_data_complete,
             "sessionDataErrors": list(self._session_data_errors),
             "enabledSources": list(self._session_enabled_sources),

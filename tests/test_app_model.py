@@ -12,6 +12,7 @@ from autotrainer.core import (
     NidaqSignalStreamConfiguration,
     SystemStatusMessageKind,
 )
+from autotrainer.core.interfaces import RecordingEndingReason
 from autotrainer.core.capture import CaptureProcessStatus
 from autotrainer.core.configuration.persistence_configuration import PersistenceConfiguration
 from autotrainer.behavior.behavior_algorithm import BehaviorAlgoStatus
@@ -455,6 +456,7 @@ def test_final_metadata_uses_canonical_boundary_not_stale_project_timestamp(
         end_perf_time=12.0,
         end_wall_time=1_800_000_002.25,
     )
+    app_model._on_session_capture_ended(RecordingEndingReason.MANUAL_STOP)
     output = tmp_path / "metadata"
 
     app_model._save_metadata(
@@ -472,6 +474,9 @@ def test_final_metadata_uses_canonical_boundary_not_stale_project_timestamp(
     assert ".nan" not in output.with_suffix(".yaml").read_text().lower()
     assert saved["sessionBoundary"]["startWallTime"] == 1_800_000_000.25
     assert saved["sessionBoundary"]["endPerfTime"] == 12.0
+    assert saved["sessionBoundary"]["durationSeconds"] == 2.0
+    assert saved["recordingDurationSeconds"] == 2.0
+    assert saved["recordingStopReason"] == "ManualStop"
 
 
 def test_metadata_pair_is_not_replaced_when_yaml_serialization_fails(
