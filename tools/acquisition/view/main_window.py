@@ -57,6 +57,7 @@ from tools.acquisition.model.user_preferences import UserPreferences
 from tools.acquisition.view.main_content import MainContent
 from tools.acquisition.view.nidaq_port_configuration_dialog import NidaqPortConfigurationDialog
 from tools.acquisition.view.preferences_dialog import PreferencesDialog
+from tools.acquisition.view.animal_metadata_dialog import AnimalMetadataDialog
 from tools.acquisition.view.debug_content import DebugView
 from tools.acquisition.view.status_log_handler import StatusLogHandler
 
@@ -983,7 +984,18 @@ class MainWindow(QMainWindow):
         self._add_box_to_open_dialogs(dialog)
         dialog.exec()
 
+    def _show_animal_metadata(self):
+        dialog = AnimalMetadataDialog(self._app_model, self)
+        self._add_box_to_open_dialogs(dialog)
+        dialog.exec()
+
     def _create_actions(self):
+        action = self.animal_metadata_action = QAction(
+            _toolbar_icon("fa5s.id-card"), "RFID links…", self
+        )
+        action.setToolTip("Manually link or reconcile reachAQ and SoftMouse animals")
+        action.triggered.connect(self._show_animal_metadata)
+
         action = self.edit_camera_settings_action = QAction(_toolbar_icon("fa5s.edit"), "Edit Camera Settings", self)
         action.setToolTip("Edit Camera Settings")
         action.setCheckable(True)
@@ -1143,6 +1155,11 @@ class MainWindow(QMainWindow):
         combo.currentIndexChanged.connect(self._animal_changed)
         combo.lineEdit().editingFinished.connect(self._add_animal)
         toolbar.addWidget(combo)
+
+        self._rfid_status_label = QLabel("RFID: disabled")
+        self._rfid_status_label.setContentsMargins(8, 0, 8, 0)
+        toolbar.addWidget(self._rfid_status_label)
+        toolbar.addAction(self.animal_metadata_action)
 
         toolbar.addSeparator()
 
@@ -1586,6 +1603,40 @@ class MainWindow(QMainWindow):
             if self._start_capture_thread is None:
                 self._update_runtime_health_label()
 
+        elif name == props.RFID_READER_STATUS:
+            state = getattr(getattr(value, "state", None), "value", "disabled")
+            reason = getattr(value, "reason", "")
+            self._rfid_status_label.setText(f"RFID: {state}")
+            self._rfid_status_label.setToolTip(reason)
+            self._rfid_status_label.setStyleSheet(
+                "" if state in {"ready", "stopped", "disabled"} else "color: #b36b00;"
+            )
+
+        elif name == props.RFID_SCAN_RESULT:
+            kind = getattr(getattr(value, "kind", None), "value", "unknown")
+            animal = getattr(value, "animal", None)
+            rfid = getattr(value, "rfid", "")
+            if animal is not None:
+                self._rfid_status_label.setText(f"RFID: {animal.name}")
+                self._rfid_status_label.setStyleSheet("color: #217a3c;")
+                self._rfid_status_label.setToolTip(
+                    f"{kind.replace('_', ' ')} · {rfid}"
+                    + (
+                        f"\n{getattr(value, 'message', '')}"
+                        if getattr(value, "message", "")
+                        else ""
+                    )
+                )
+            else:
+                self._rfid_status_label.setText(
+                    f"RFID: {kind.replace('_', ' ')}"
+                )
+                self._rfid_status_label.setStyleSheet("color: #a33;")
+                self._rfid_status_label.setToolTip(
+                    (getattr(value, "message", "") + "\n" if getattr(value, "message", "") else "")
+                    + f"Tag: {rfid}\nUse Animal metadata > Refresh now or manual linking."
+                )
+
         elif name == props.ANIMALS:
             self._reload_animals(value)
 
@@ -1596,7 +1647,7 @@ class MainWindow(QMainWindow):
                 animal_dropdown.setCurrentIndex(0)
             else:
                 assert isinstance(value, AnimalSubject)
-                index = animal_dropdown.findText(value.name)
+                index = animal_dropdown.findData(value.id)
                 if index != -1:
                     animal_dropdown.setCurrentIndex(index)
                 else:
@@ -1632,9 +1683,9 @@ class MainWindow(QMainWindow):
         # get current selected animal before adding them,
         # given when adding that's modifying the currently selected one too,
         # which reset the preference selected to that one...
-        find_animal_name = (
+        find_animal_id = (
             self._preferences.selected_animal if self._app_model.selected_animal is None
-            else self._app_model.selected_animal.name
+            else self._app_model.selected_animal.id
         )
 
         # prevent on_animal_changed event:
@@ -1647,8 +1698,11 @@ class MainWindow(QMainWindow):
         combo.blockSignals(False)
 
         # we set the good one here:
-        if find_animal_name is not None:
-            index = combo.findText(find_animal_name)
+        if find_animal_id is not None:
+            index = combo.findData(find_animal_id)
+            if index == -1:
+                # One-release compatibility with name-based preferences.
+                index = combo.findText(find_animal_id)
             if index != -1:
                 combo.setCurrentIndex(index)
         else:

@@ -23,6 +23,7 @@ from autotrainer.core.logging import get_verbose_logger
 from autotrainer.pyside import QSwitch
 
 from tools.acquisition.model.app_model import AppModel
+from tools.acquisition.model.app_model_status import SessionRecordingStatus
 from tools.acquisition.model.user_preferences import UserPreferences
 
 logger = get_verbose_logger(__name__)
@@ -61,6 +62,9 @@ class PreferencesContent(QWidget):
 
         self._behavior_tab = self._create_behavior_tab()
         tabs.addTab(self._behavior_tab, "Behavior")
+
+        self._animal_metadata_tab = self._create_animal_metadata_tab()
+        tabs.addTab(self._animal_metadata_tab, "Animal metadata")
 
         self._advanced_tab = self._create_advanced_tab()
         tabs.addTab(self._advanced_tab, "Advanced")
@@ -466,6 +470,171 @@ class PreferencesContent(QWidget):
         tab.setLayout(main_layout)
         apply_size_policy(tab, (QSwitch, QSpinBox, QDoubleSpinBox))
         return tab
+
+    def _create_animal_metadata_tab(self):
+        form = QFormLayout(None)
+        form.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+
+        manifest_layout = QHBoxLayout()
+        self._softmouse_manifest_edit = QLineEdit()
+        self._softmouse_manifest_edit.setText(
+            self._preferences.softmouse_manifest_path
+        )
+        self._softmouse_manifest_edit.textChanged.connect(
+            lambda value: setattr(
+                self._preferences, "softmouse_manifest_path", value
+            )
+        )
+        manifest_layout.addWidget(self._softmouse_manifest_edit)
+        browse = QPushButton("Select…")
+        browse.clicked.connect(self._browse_for_softmouse_manifest)
+        manifest_layout.addWidget(browse)
+        form.addRow("Publication manifest:", manifest_layout)
+
+        external = QLineEdit("Physical Tag")
+        external.setReadOnly(True)
+        form.addRow("Permanent external ID:", external)
+        rfid = QLineEdit("Alt. ID")
+        rfid.setReadOnly(True)
+        form.addRow("RFID field:", rfid)
+
+        name_field = self._softmouse_name_field = QComboBox()
+        name_field.setEditable(True)
+        for header in (
+            "Physical Tag",
+            "Alt. ID",
+            "Cage Tag",
+            "Comment",
+        ):
+            name_field.addItem(header)
+        current = self._preferences.softmouse_name_column
+        index = name_field.findText(current)
+        if index < 0:
+            name_field.addItem(current)
+            index = name_field.findText(current)
+        name_field.setCurrentIndex(index)
+        name_field.currentTextChanged.connect(
+            lambda value: setattr(self._preferences, "softmouse_name_column", value)
+        )
+        form.addRow("New-animal name field:", name_field)
+
+        self._rfid_enabled = QCheckBox("Enable USB RFID reader")
+        self._rfid_enabled.setChecked(self._preferences.rfid_reader_enabled)
+        self._rfid_enabled.toggled.connect(
+            lambda value: setattr(self._preferences, "rfid_reader_enabled", value)
+        )
+        form.addRow("", self._rfid_enabled)
+        self._rfid_device_edit = QLineEdit(self._preferences.rfid_device)
+        self._rfid_device_edit.textChanged.connect(
+            lambda value: setattr(self._preferences, "rfid_device", value)
+        )
+        form.addRow("RFID serial device:", self._rfid_device_edit)
+
+        nightly = QCheckBox("Refresh local cache at midnight")
+        nightly.setChecked(self._preferences.softmouse_nightly_refresh)
+        nightly.toggled.connect(
+            lambda value: setattr(
+                self._preferences, "softmouse_nightly_refresh", value
+            )
+        )
+        form.addRow("", nightly)
+
+        buttons = QHBoxLayout()
+        apply_button = QPushButton("Apply reader settings")
+        apply_button.clicked.connect(self._apply_animal_metadata_preferences)
+        buttons.addWidget(apply_button)
+        self._softmouse_refresh_button = QPushButton("Refresh now")
+        self._softmouse_refresh_button.clicked.connect(self._refresh_animal_metadata)
+        buttons.addWidget(self._softmouse_refresh_button)
+        form.addRow("", buttons)
+
+        self._softmouse_status = QLabel(self._app_model.animal_metadata_status)
+        self._softmouse_status.setWordWrap(True)
+        form.addRow("Status:", self._softmouse_status)
+        self._softmouse_counts = QLabel("No import preview available")
+        self._softmouse_counts.setWordWrap(True)
+        form.addRow("Rows:", self._softmouse_counts)
+        self._softmouse_mapped_columns = QLabel("—")
+        self._softmouse_mapped_columns.setWordWrap(True)
+        form.addRow("Mapped columns:", self._softmouse_mapped_columns)
+        self._softmouse_ignored_columns = QLabel("—")
+        self._softmouse_ignored_columns.setWordWrap(True)
+        form.addRow("Other columns:", self._softmouse_ignored_columns)
+        note = QLabel(
+            "Imports are complete/unfiltered snapshots. Rows without RFID and "
+            "animals whose State is Ended are intentionally excluded."
+        )
+        note.setWordWrap(True)
+        form.addRow("", note)
+
+        def model_changed(name, value, _old):
+            if name == self._app_model.Props.ANIMAL_METADATA_STATUS:
+                self._softmouse_status.setText(value)
+            elif name == self._app_model.Props.ANIMAL_METADATA_PREVIEW:
+                self._show_animal_metadata_preview(value)
+            elif name == self._app_model.Props.SESSION_RECORDING_STATUS:
+                self._softmouse_refresh_button.setEnabled(
+                    value is SessionRecordingStatus.READY
+                )
+
+        self._app_model.property_changed += model_changed
+        self._softmouse_refresh_button.setEnabled(
+            self._app_model.session_recording_status is SessionRecordingStatus.READY
+        )
+        tab = QWidget(None)
+        tab.setLayout(form)
+        def unsubscribe(*_args):
+            try:
+                self._app_model.property_changed -= model_changed
+            except (KeyError, ValueError):
+                pass
+        tab.destroyed.connect(unsubscribe)
+        if self._app_model.animal_metadata_preview is not None:
+            self._show_animal_metadata_preview(
+                self._app_model.animal_metadata_preview
+            )
+        return tab
+
+    def _show_animal_metadata_preview(self, preview):
+        batch = preview.batch
+        self._softmouse_counts.setText(
+            f"{batch.total_source_rows} total · {batch.accepted_rows} tagged · "
+            f"{batch.ignored_missing_rfid_rows} without RFID · "
+            f"{batch.ignored_ended_rows} ended"
+        )
+        self._softmouse_mapped_columns.setText(
+            ", ".join(preview.mapped_columns) or "—"
+        )
+        self._softmouse_ignored_columns.setText(
+            ", ".join(preview.ignored_columns) or "—"
+        )
+        for header in preview.source_headers:
+            if header and self._softmouse_name_field.findText(header) < 0:
+                self._softmouse_name_field.addItem(header)
+
+    def _browse_for_softmouse_manifest(self):
+        current = self._softmouse_manifest_edit.text()
+        filename, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select SoftMouse publication manifest",
+            current,
+            "JSON manifests (*.json)",
+        )
+        if filename:
+            self._softmouse_manifest_edit.setText(filename)
+
+    def _apply_animal_metadata_preferences(self):
+        try:
+            self._app_model.apply_animal_metadata_preferences()
+        except Exception as exc:
+            self._softmouse_status.setText(f"Configuration failed: {exc}")
+
+    def _refresh_animal_metadata(self):
+        try:
+            self._app_model.apply_animal_metadata_preferences()
+            self._app_model.refresh_animal_metadata()
+        except Exception as exc:
+            self._softmouse_status.setText(f"Refresh failed: {exc}")
 
     def _create_session_control_group(self, algo):
         """Build the operator-facing controls for continuous recording sessions."""
