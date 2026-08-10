@@ -32,10 +32,16 @@ fi
 | `inference.poseModelLocation` | Existing compatible model directory |
 | `laser.backend` | `nidaq` for validated hardware; otherwise `null`/`disabled` |
 | `laser.channels` | Real NI-DAQ aliases and wired channel roles |
-| `nidaqPorts`, `nidaqStream` | Real device alias and supported channel types |
+| `nidaqPorts`, `nidaqStream` | Real device identity, supported channel types, timing policy, and independent plot selection |
 
 Use **Edit → Edit DAQ Ports** while idle to discover supported channel types and
-prevent duplicate assignments.
+prevent duplicate assignments. Saving from the dialog also records stable
+product/serial identities and validates timing-master capability. All mapped and
+custom NI-DAQ inputs are recorded when NI-DAQ is enabled; plotting only the
+subset in `displayChannels` does not change persistence.
+
+See [Session recording, synchronization, and hardware isolation](../acquisition/session-recording-and-synchronization.md)
+before commissioning Record/Stop/Abort or a multi-device timing topology.
 
 ## Safe first launch
 
@@ -141,6 +147,12 @@ HARDWARE INIT | FAILED
 Each camera, CAN, NI-DAQ, laser, and GPU operation includes elapsed timing. The
 last `START` without a terminal state identifies the current wait.
 
+Initialization results are independent. A failed NI-DAQ, laser, CAN, camera, or
+inference domain does not tear down unrelated healthy domains. Instead, the
+failed required source is listed as a recording blocker. The refresh icon at the
+far right of the Hardware Status title bar refreshes discovery while idle and
+retries failed domains while Running and Ready.
+
 The documented launch commands use `conda run --no-capture-output`. Do not omit
 that option: default `conda run` captures the stream and can hide every terminal
 record until reachAQ exits.
@@ -151,8 +163,9 @@ record until reachAQ exits.
 |---|---|
 | Git LFS test asset error | `git -C "$REACHAQ_REPO" lfs pull` |
 | Qt xcb plugin error | `libxcb-cursor0`, `libxkbcommon-x11-0`, and display environment |
-| Cameras absent | Applicable [FLIR guide](flir-spinnaker.md) or USB enumeration |
+| Cameras absent or no first frame | Applicable [FLIR guide](flir-spinnaker.md), effective trigger-node diagnostics, physical trigger/power/ground path |
 | NI devices absent | [NI-DAQ/PXI guide](ni-daq-pxi.md), starting at PCI/USB enumeration |
+| PXI off and camera timeout occur together | Treat as correlated until wiring is checked; NI-DAQ software initialization does not trigger cameras |
 | CAN interface down | [PEAK/SocketCAN guide](peak-socketcan.md), bitrate and termination |
 | CAN reset asks for a password | Activate the `reachaq` login group by logging out/in, then verify the narrow `sudo -n` permission |
 | CAN RX continues but startup ACK times out | Preserve the application log; this is an application startup/ACK path issue rather than proof of a dead bus |
@@ -161,16 +174,17 @@ record until reachAQ exits.
 
 ## Current workstation reference
 
-Last checked 2026-07-21:
+Last documentation update 2026-08-10:
 
 - Dell Precision 3660 Tower; Ubuntu 22.04.5 LTS, x86_64; kernel
   `6.8.0-124-generic`.
 - Conda environment `/home/christielab10/anaconda3/envs/reachaq`, Python 3.8,
   TensorFlow 2.13.1.
 - Spinnaker system runtime 3.2.0.57; bundled Python wheel 3.2.0.62.
-- NI-DAQmx 26.3.1 and PXI Platform Services 26.3; PXI-6713 alias
-  `PXI1Slot4`.
+- NI-DAQmx 26.3.1 and PXI Platform Services 26.3; configured PXI-6713 output
+  alias `PXI1Slot4` and PXI-6221 sampled-input alias `PXI1Slot5`.
 - PEAK PCIe adapter on `peak_pciefd`, exposing `can0` and `can1`.
 - Quadro T1000 present but using `nouveau`; live inference unavailable.
 - Local output `/home/christielab10/Documents/rawdatalocal`.
-- Focused non-hardware/installer verification: 52 passed.
+- `nidaq-sync` default software suite at implementation verification: 606
+  passed, 45 skipped, 1 xpassed.

@@ -54,6 +54,7 @@ from the core logic of the applications for two reasons:
     * Use `--no-live-inference` or `--live-inference` to override the saved inference setting for one run.
     * Hardware startup progress is written to the log and launching terminal as `HARDWARE INIT` records.
     * [Detailed Instructions](tools/acquisition/README.md)
+    * [Session recording, synchronization, persistence, and hardware isolation](docs/acquisition/session-recording-and-synchronization.md)
     * Use `--random-cameras` to start with software-generated frames when no physical cameras are configured.
   * Headless implementation for command line only
     * `auto-trainer-headless -c ~/Autotrainer/system_configuration.yaml`

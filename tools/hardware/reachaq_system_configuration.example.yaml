@@ -2,7 +2,9 @@
 # Replace camera serials, NI-DAQ device/channel names, model paths, and voltage limits with the bench rig values.
 # CAN transport is configured through reachaq_hardware.env.example because the current CAN runtime reads environment.
 # stimCam is explicitly present but disabled; Cameras 4-6 and web are omitted.
-# The current PXIe-1073/PXI-6713 rig is expected to appear as PXI1Slot4 with AO 0-7, no AI, and port0/line0-7 DIO.
+# The documented PXIe-1073 rig uses PXI1Slot5 (PXI-6221) for sampled inputs
+# and PXI1Slot4 (PXI-6713) for laser analog outputs. Discover every target rig;
+# aliases, serials, capabilities, and valid routes are not universal defaults.
 
 !SystemConfiguration
 version: 57
@@ -99,21 +101,63 @@ laser: !LaserSystemConfiguration
   triggerListenerInputs: []
   channels: []
 nidaqPorts: !NidaqPortConfiguration
-  deviceName: PXI1Slot4
-  tone1: PXI1Slot4/port0/line0
-  tone2: PXI1Slot4/port0/line1
-  tone3R: PXI1Slot4/port0/line2
-  tone3L: PXI1Slot4/port0/line3
-  camFrames: PXI1Slot4/port0/line4
-  barcode: PXI1Slot4/port0/line5
+  deviceName: PXI1Slot5
+  tone1: PXI1Slot5/port0/line0
+  tone2: PXI1Slot5/port0/line1
+  tone3R: PXI1Slot5/port0/line2
+  tone3L: PXI1Slot5/port0/line3
+  camFrames: PXI1Slot5/port0/line4
+  barcode: PXI1Slot5/port0/line5
+  # Saving through Edit DAQ Ports fills productType and serialNumber from
+  # discovery. Do not copy a serial number from another rig.
+  deviceIdentities:
+  - !NidaqDeviceIdentity
+    logicalName: acquisition-input
+    runtimeName: PXI1Slot5
+    productType: null
+    serialNumber: null
+  timing: !NidaqTimingConfiguration
+    syncMode: auto
+    timingMaster: null
+    requireHardwareSynchronization: true
+    referenceClockSource: null
+    startTriggerSource: null
+    sampleClockSource: null
 nidaqStream: !NidaqSignalStreamConfiguration
-  # This monitor is an operator-visible rolling input check. It is never persisted.
-  # The PXI-6713 does not provide analog inputs. Add channels only after a supported input device is present.
-  isEnabled: false
+  # Every channel is continuously acquired and persisted during Record. The
+  # display selection below controls plots only.
+  isEnabled: true
   sampleRateHz: 10000.0
   readChunkSize: 500
   rollingWindowSeconds: 10.0
-  channels: []
+  channels:
+  - !NidaqSignalChannelConfiguration
+    name: tone1
+    physicalChannel: PXI1Slot5/port0/line0
+    kind: digital
+  - !NidaqSignalChannelConfiguration
+    name: tone2
+    physicalChannel: PXI1Slot5/port0/line1
+    kind: digital
+  - !NidaqSignalChannelConfiguration
+    name: tone3_r
+    physicalChannel: PXI1Slot5/port0/line2
+    kind: digital
+  - !NidaqSignalChannelConfiguration
+    name: tone3_l
+    physicalChannel: PXI1Slot5/port0/line3
+    kind: digital
+  - !NidaqSignalChannelConfiguration
+    name: cam_frames
+    physicalChannel: PXI1Slot5/port0/line4
+    kind: digital
+  - !NidaqSignalChannelConfiguration
+    name: barcode
+    physicalChannel: PXI1Slot5/port0/line5
+    kind: digital
+  displayChannels:
+  - cam_frames
+  - barcode
 behavior: !BehaviorConfiguration
   pelletDelivery: !PelletDeliveryConfiguration
     isEnabled: false

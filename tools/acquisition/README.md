@@ -48,9 +48,11 @@ configured physical camera serials when the app closes.
 
 Selecting Running first shows `Starting acquisition...` and temporarily
 disables camera and DAQ editing. If live inference is enabled, its NVIDIA driver
-and TensorFlow GPU preflight runs before cameras, CAN, laser, or NI-DAQ hardware
-is started. A failed preflight leaves the application idle and reports that no
-capture hardware was started.
+and TensorFlow GPU preflight is reported as the live-inference domain. A failed
+preflight prevents inference from starting but does not prevent independent
+camera, CAN, laser, or NI-DAQ initialization. Each domain reports its own Ready,
+Blocked, Failed, or Disabled state. Record remains unavailable until every
+configured source required for persistence is Ready.
 
 The **Live inference** switch in Preferences controls the saved setting. The
 `--live-inference` and `--no-live-inference` command-line flags override that
@@ -148,8 +150,9 @@ frame, barcode, Tone 1, Tone 2, Tone 3 right, and Tone 3 left inputs. Laser
 signals are intentionally excluded from this card. A checkbox becomes
 selectable only after that signal has a physical assignment in **Edit → Edit
 DAQ Ports** and NI-DAQ is enabled. Stop the stream before changing main Analysis
-selections; every checkbox change is immediately saved in
-`nidaqStream.channels`. Start Stream and Clear are disabled when NI-DAQ is
+selections; every checkbox change is immediately saved as the
+`nidaqStream.displayChannels` plot selection. It never changes the complete
+acquisition channel plan. Start Stream and Clear are disabled when NI-DAQ is
 disabled, and Start Stream also requires at least one selected Analysis channel.
 Streams remain stopped when reachAQ opens. They can be started manually while
 idle; configured streams start automatically when acquisition becomes active
@@ -162,8 +165,11 @@ that does not become ready within 10 seconds is stopped and reported as a
 startup timeout. Hardware initialization milestones from the worker are relayed
 to both the application log and terminal.
 
-The Analysis graph is visualization-only and never writes CSV or any other
-acquisition output. Incoming blocks, fixed-size NumPy circular buffers, and
+The Analysis graph is visualization-only, but its checkbox selection does not
+control acquisition or persistence. While NI-DAQ is enabled, every mapped and
+custom acquisition channel is sampled continuously and saved to
+`streams/nidaq.h5` during a recording, even when it is not plotted. Incoming
+blocks, fixed-size NumPy circular buffers, and
 pixel-aligned peak-envelope reduction run in a dedicated plot-data process. The
 process publishes alternating fixed-size `float32` shared-memory buffers; no
 plot arrays are serialized through a multiprocessing queue. The GUI timer uses
@@ -209,7 +215,7 @@ are shown in signal tooltips instead of widening the panel. Plots and controls
 shrink with the panel; use the main splitter to give them more room when desired.
 **Start DAQ Inputs** starts the shared input worker;
 the button clearly labels its shared stop action while it is running. These
-selections also persist immediately in `nidaqStream.channels`, while remaining
+selections also persist immediately in `nidaqStream.displayChannels`, while remaining
 absent from the main Analysis selector and plot. Manual/internal and externally
 triggered pulse operations append their command waveform. Selected measured
 inputs from the shared NI-DAQ stream are added to the corresponding laser
@@ -248,9 +254,6 @@ mkdir -p "$HOME/Documents/rawdatalocal"
 
 * System Mode - select Idle or Running. During transitions it explicitly shows
   Starting or Stopping acquisition.
-* Hardware Refresh - repeat the startup scan of camera sources, NI-DAQ devices,
-  and the physical CAN adapter while idle, and establish the CAN/pellet
-  controller session.
 * Notes and Subject - set acquisition notes and select the current animal.
 * Training Mode and Protocol - select the active training workflow when the
   protocol UI is enabled.
@@ -271,6 +274,11 @@ and red when initialization fails or its connection is lost. Compact vertical
 detail lines show each PXI slot and card
 model/product number, the configured CAN backend/interface, and the detected
 GPU model, memory, and driver.
+
+The Hardware Refresh icon is at the far right of the Hardware Status title bar.
+While idle it repeats discovery and refreshes bindings. While System Mode is
+Running and no recording or analysis is active, it retries failed subsystems
+without restarting healthy domains.
 
 ### Menus
 
@@ -298,6 +306,10 @@ Normal acquisition always uses triggered recording. Selecting System Mode
 `Record` in the Behavior panel to initialize a session and begin writing,
 `Stop` to retain it and run analysis, or `Abort` to discard the entire session.
 Record remains unavailable until analysis for the stopped session finishes.
+Presented, Reaches, Success, and Consumed are session-only counts: they reset on
+Record, remain visible after Stop, and reset to zero after Abort. The old System
+state display, day/total counters, load-cell UI, and load-cell recording triggers
+have been removed.
 
 Session-aligned auxiliary files are stored beneath the matching `trialNNN`
 directory:
@@ -311,7 +323,15 @@ logs/session.log
 ```
 
 `alignment.json` records the primary-camera start/end boundary and the first
-and last saved timestamps and offsets for every auxiliary stream.
+and last saved timestamps and offsets for every auxiliary stream. It also
+records NI-DAQ topology, camera/NI edge matching, device-tone/NI confirmation,
+enabled-source paths and counts, gaps, overruns, failures, and session
+completeness. Final JSON/YAML metadata must contain the same finite canonical
+camera boundary before a session is reported as fully saved.
+
+See [Session recording, synchronization, and hardware isolation](../../docs/acquisition/session-recording-and-synchronization.md)
+for the complete state, persistence, timing, metadata, failure, and verification
+contract.
 
 ## Startup Diagnostics
 

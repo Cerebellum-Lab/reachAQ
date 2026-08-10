@@ -73,12 +73,12 @@ for device in devices:
 PY
 ```
 
-## PXIe-1073 / NI 6713 over MXI
+## PXIe-1073 / PXI cards over MXI
 
 This path is PCI/PXI, not USB. Cold-start it in this order:
 
 1. Power down the computer and PXIe-1073.
-2. Seat the NI 6713 and MXI cards/cable.
+2. Seat the configured NI cards and MXI cards/cable.
 3. Power on the PXIe chassis first and wait for its link LEDs.
 4. Boot the computer with the chassis already powered.
 5. Verify PCIe enumeration before testing NI-DAQmx.
@@ -99,7 +99,8 @@ Expected progression:
 1. `lspci` shows the MXI/PLX bridge chain and NI vendor ID `1093` endpoint.
 2. `lsni -v` shows the MXI link and chassis.
 3. `nipxiconfig` reports PXI/PXIe system information.
-4. `nilsdev` lists a DAQmx alias such as `PXI1Slot4`.
+4. `nilsdev` lists the configured DAQmx aliases, such as `PXI1Slot4` and
+   `PXI1Slot5` on the documented rig.
 
 If the kernel reports `No bus number available for hot-added bridge`, cold boot
 again and inspect BIOS options for PCIe pre-boot enumeration, hotplug, Above 4G
@@ -133,8 +134,13 @@ Counters: PXI1Slot4/ctr0, PXI1Slot4/ctr1, PXI1Slot4/freqout
 ```
 
 The 6713 supplies analog output, digital I/O, and counters, but no analog input.
-Laser `diodeInput` or `commandCopyInput` feedback therefore requires a separate
-supported analog-input device or a disabled/adjusted feedback path.
+The documented rig also has a PXI-6221 at `PXI1Slot5`; it supplies the sampled
+analog feedback inputs, hardware-clocked digital inputs, and counters used by
+the acquisition timeline. Laser `diodeInput` and `commandCopyInput` therefore
+belong on the 6221 (or another discovered analog-input device), while laser
+analog commands can remain on the 6713. Digital and analog inputs may share the
+6221 task; a future hardware-timed 6713 output task must join the validated
+multi-device timing topology described below.
 
 Validate configured laser tasks only after confirming the real wiring:
 
@@ -147,7 +153,10 @@ conda run -n reachaq python tools/hardware/validate_laser_hardware.py \
 
 Main Analysis camera/barcode/tone selections and the diode/command-copy
 selections owned by each Laser Control tab are saved immediately under
-`nidaqStream.channels`. Stream task creation happens in an isolated child
+`nidaqStream.displayChannels`. Plot visibility does not change acquisition:
+every mapped camera-frame, barcode, tone, laser-feedback, and custom input is
+included in the recording task and saved to `streams/nidaq.h5`. Stream task
+creation happens in an isolated child
 process because a broken or incompatible NI-DAQmx native runtime can terminate
 the Python interpreter. If the worker exits with `SIGSEGV` or does not become
 ready within 10 seconds, reachAQ remains open and displays the failure. Treat
@@ -169,6 +178,50 @@ publishes double-buffered shared memory, while the GUI process performs only the
 final bounded Qt curve draw. The digital graph uses fixed limits of `[-10, 0]`
 seconds and `[-0.2, 1.2]`, supports horizontal-only zoom, and provides **Live**
 to move the right edge to zero while preserving the current zoom width.
+
+## Device identity and timing configuration
+
+The DAQ Ports dialog stores the discovered product and serial identity for each
+selected device. The configured logical binding can therefore follow the same
+physical card if NI-DAQmx later changes its runtime alias. Missing, substituted,
+ambiguous, and serial-mismatched devices fail validation instead of silently
+binding to another card.
+
+Discovery also records AI/AO/DI/DO channels, counters, terminals, maximum rates,
+timed analog-output support, digital-trigger support, bus type, and PXI chassis.
+The timing planner validates every active channel, requested rate, manual timing
+master, and explicit route before task startup.
+
+Timing policy belongs under `nidaqPorts.timing`:
+
+```yaml
+timing: !NidaqTimingConfiguration
+  syncMode: auto
+  timingMaster: null
+  requireHardwareSynchronization: true
+  referenceClockSource: null
+  startTriggerSource: null
+  sampleClockSource: null
+```
+
+`auto` uses one device when possible, otherwise a discovered common PXI
+backplane, otherwise requires explicit external start/sample routes. `backplane`
+requires a common PXI chassis. `external` requires configured trigger and sample
+clock terminals. `independent` is diagnostic-only when hardware synchronization
+is required and blocks aligned recording across multiple devices.
+
+The optional master is a device/task role, not a port flag. Automatic selection
+prefers the device that owns the canonical sampled inputs. On compatible PXI
+hardware, reachAQ uses `PXI_CLK10`, a shared start trigger, and a routed master
+sample clock; slave tasks arm before the master. The same plan supports a future
+hardware-timed laser AO slave. Do not copy the current rig's slot names or routes
+to another rig without discovery and validation.
+
+Requested and resolved timing, device identities, task ordering, routes, and
+synchronization quality are saved in each trial's
+`streams/alignment.json`. See
+[Session recording, synchronization, and hardware isolation](../acquisition/session-recording-and-synchronization.md)
+for the complete persistence schema and physical acceptance procedure.
 
 ## References
 
