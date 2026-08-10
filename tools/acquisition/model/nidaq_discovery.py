@@ -155,7 +155,7 @@ def _log_discovery_result(
 def _discover_nidaq_devices_direct() -> Tuple[Tuple[NidaqDevicePorts, ...], Optional[str]]:
     try:
         from nidaqmx.system import System
-        from nidaqmx.errors import DaqNotFoundError
+        from nidaqmx.errors import DaqError, DaqNotFoundError
     except ModuleNotFoundError:
         return tuple(), (
             "NI-DAQmx discovery is unavailable because the nidaqmx Python package is not installed."
@@ -199,19 +199,19 @@ def _discover_nidaq_devices_direct() -> Tuple[Tuple[NidaqDevicePorts, ...], Opti
                         for terminal in (getattr(device, "terminals", tuple()) or tuple())
                     ),
                     analog_output_sample_clock_supported=_optional_bool(
-                        getattr(device, "ao_samp_clk_supported", None)
+                        _optional_device_property(device, "ao_samp_clk_supported", DaqError)
                     ),
                     digital_trigger_supported=_optional_bool(
-                        getattr(device, "dig_trig_supported", None)
+                        _optional_device_property(device, "dig_trig_supported", DaqError)
                     ),
                     analog_input_max_single_channel_rate=_optional_float(
-                        getattr(device, "ai_max_single_chan_rate", None)
+                        _optional_device_property(device, "ai_max_single_chan_rate", DaqError)
                     ),
                     analog_input_max_multi_channel_rate=_optional_float(
-                        getattr(device, "ai_max_multi_chan_rate", None)
+                        _optional_device_property(device, "ai_max_multi_chan_rate", DaqError)
                     ),
                     analog_output_max_rate=_optional_float(
-                        getattr(device, "ao_max_rate", None)
+                        _optional_device_property(device, "ao_max_rate", DaqError)
                     ),
                 )
             )
@@ -273,3 +273,12 @@ def _optional_bool(value) -> Optional[bool]:
     if value is None:
         return None
     return bool(value)
+
+
+def _optional_device_property(device, attribute_name: str, daq_error_type):
+    try:
+        return getattr(device, attribute_name, None)
+    except daq_error_type as exc:
+        if getattr(exc, "error_code", None) == -200197:
+            return None
+        raise
