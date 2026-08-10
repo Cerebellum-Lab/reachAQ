@@ -245,8 +245,6 @@ class MainContent(ContentWidget):
         self._right_camera_content = None
         self._camera_row_splitters = []
         self._rebuild_reach_camera_grid()
-        self._top_camera_content = None
-
         return widget
 
     @staticmethod
@@ -489,13 +487,9 @@ class MainContent(ContentWidget):
     @Slot()
     def update_image(self):
         self._flush_pending_pose()
-        model = self._app_model
         for camera, camera_content in self._reach_camera_contents:
             if camera.is_enabled:
                 camera_content.update_image()
-        if model.top_camera.is_enabled:
-            if self._top_camera_content is not None:
-                self._top_camera_content.update_image()
 
     def refresh_pose(self, response: PoseResponse):
         """Cache only the newest inference result until the next display tick.
@@ -559,9 +553,6 @@ class MainContent(ContentWidget):
 
         for camera, camera_content in self._reach_camera_contents:
             camera.set_display_fcn(camera_content.refresh_image)
-        if self._top_camera_content is not None:
-            self._app_model.top_camera.set_display_fcn(self._top_camera_content.refresh_image)
-
         for widget in self._content_widgets:
             widget.on_activated()
 

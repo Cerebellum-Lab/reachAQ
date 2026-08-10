@@ -67,7 +67,6 @@ from autotrainer.core.logging import (
 from autotrainer.core.multiproc import get_mp_ctx, make_daemon_timer, DaemonTimer
 from autotrainer.core.pose_elements import SceneElement
 from autotrainer.core.project.project_info import DATE_TIME_FORMAT
-from autotrainer.core.video_detection import PresenceDetectionAttrs
 from autotrainer.video import VideoRecordMode
 
 from autotrainer.inference import (
@@ -411,19 +410,7 @@ class AppModel(ObservableObject):
         self._left_camera = self._reach_cameras[0]
         self._right_camera = self._reach_cameras[1]
 
-        self._top_camera_presence_detection = PresenceDetectionAttrs()
-        self._top_camera = VideoCaptureModel("web", self._preferences, -1,
-                                             presence_detection=self._top_camera_presence_detection,
-                                             msg_queue=self._multiproc_msg_queue,
-                                             record_start_perf=self._cams_record_start_perf,
-                                             align_record_start_perf=True,
-                                             cam_id=CameraId.Web)
-        self._top_camera.is_enabled = False
-
-        self._cameras = [  # must respect camera_idx order
-            *self._reach_cameras,
-            self._top_camera,
-        ]
+        self._cameras = list(self._reach_cameras)
         self._camera_by_id = {
             camera.camera_id: camera
             for camera in self._cameras
@@ -443,9 +430,7 @@ class AppModel(ObservableObject):
         self._system_message_queue = queue.Queue()  # only dedicated to CAN bus messages reading/handling
 
         if sensor_analysis is None:
-            sensor_analysis = SensorAnalysis(
-                topcam_presence=self._top_camera_presence_detection
-            )
+            sensor_analysis = SensorAnalysis()
         analysis = self._analysis = sensor_analysis
         del sensor_analysis  # using "analysis" instead
         #
@@ -490,14 +475,12 @@ class AppModel(ObservableObject):
 
         behavior_model = self._behavior = BehaviorModel(
             self._system_message_handler, self._analysis, self._hardware, self._inference,
-            topcam_presence=self._top_camera_presence_detection,
             system_machine=system_machine,
         )
         system_machine = behavior_model.system_machine  # ensure same
 
         self._models: List[ProjectDependentProtocol] = [
             *self._reach_cameras,
-            self._top_camera,
             self._inference,
             self._behavior,
             self._nidaq_signal_monitor,
@@ -603,17 +586,13 @@ class AppModel(ObservableObject):
             (camera for camera in self._reach_cameras if camera.camera_id == CameraId.Camera3),
             None,
         )
-        self._cameras = [
-            *self._reach_cameras,
-            self._top_camera,
-        ]
+        self._cameras = list(self._reach_cameras)
         self._camera_by_id = {
             camera.camera_id: camera
             for camera in self._cameras
         }
         self._models = [
             *self._reach_cameras,
-            self._top_camera,
             self._inference,
             self._behavior,
             self._nidaq_signal_monitor,
@@ -719,7 +698,7 @@ class AppModel(ObservableObject):
                 camera_config.is_enabled = True
 
         for camera_config in configuration.cameras:
-            if camera_config.id in reach_ids or camera_config.id == CameraId.Web:
+            if camera_config.id in reach_ids:
                 cls._configure_camera_as_random(camera_config)
 
         configuration._camera_map = {}
@@ -1134,8 +1113,6 @@ class AppModel(ObservableObject):
         self.property_changed(self.Props.STATUS, status, prev)
         is_from_start = status in {AppModelStatus.ACQUIRING, AppModelStatus.IDLE}
         for cam in self._cameras:
-            if status == AppModelStatus.ANIMAL_IN_DEVICE:
-                is_from_start = cam != self._top_camera
             # NB: using is_triggered=None to ensure same state is kept in process side,
             # see: VideoRecord._disable_record()
             cam.on_trigger_recording(False, is_triggered=None, is_from_start=is_from_start)
@@ -1361,15 +1338,9 @@ class AppModel(ObservableObject):
 
     def _get_recording_cams(self) -> Tuple[VideoCaptureModel, ...]:
         """Return every enabled camera expected to acknowledge this session."""
-        return (
-            *(
-                camera for camera in self._get_monitored_cams()
-                if camera.is_recording_enabled
-            ),
-            *(
-                camera for camera in (self._top_camera,)
-                if camera.is_enabled and camera.is_recording_enabled
-            ),
+        return tuple(
+            camera for camera in self._get_monitored_cams()
+            if camera.is_recording_enabled
         )
 
     def _handle_proc_msg_queue(self):
@@ -1582,10 +1553,6 @@ class AppModel(ObservableObject):
         return self._stim_camera
 
     @property
-    def top_camera(self):
-        return self._top_camera
-
-    @property
     def cameras(self) -> Tuple[VideoCaptureModel, ...]:
         return tuple(self._cameras)
 
@@ -1599,10 +1566,6 @@ class AppModel(ObservableObject):
 
     def get_camera_model(self, camera_id: CameraId) -> Optional[VideoCaptureModel]:
         return self._camera_by_id.get(camera_id)
-
-    @property
-    def top_camera_presence_detection(self):
-        return self._behavior.algorithm.top_camera_presence_detection
 
     @property
     def behavior(self) -> BehaviorModel:
@@ -2617,43 +2580,6 @@ class AppModel(ObservableObject):
         )
         return all_ready
 
-    def _start_top_camera_domain(self) -> bool:
-        camera = self._top_camera
-        if not camera.is_enabled:
-            self._set_subsystem_status(
-                SubsystemId.TOP_CAPTURE,
-                SubsystemState.DISABLED,
-                reason="top camera disabled",
-            )
-            return False
-        generation = self._begin_subsystem_start(
-            SubsystemId.TOP_CAPTURE,
-            reason="starting top camera",
-        )
-        if not self._prepare_camera_domain(camera, None, None):
-            status = self._subsystem_status_registry.get(
-                SubsystemId.camera(camera.name)
-            )
-            self._set_subsystem_status(
-                SubsystemId.TOP_CAPTURE,
-                SubsystemState.FAILED,
-                error="" if status is None else status.error,
-                generation=generation,
-            )
-            return False
-        camera_generation = self._subsystem_status_registry.get(
-            SubsystemId.camera(camera.name)
-        ).generation
-        ready = self._enable_camera_capture_domain(camera, camera_generation)
-        self._set_subsystem_status(
-            SubsystemId.TOP_CAPTURE,
-            SubsystemState.READY if ready else SubsystemState.FAILED,
-            reason="top camera preview ready" if ready else "",
-            error="" if ready else camera.last_error,
-            generation=generation,
-        )
-        return ready
-
     def _start_can_domain(self, *, wait_connected: bool) -> bool:
         hard = self._hardware
         if not hard.requires_connection:
@@ -3049,11 +2975,6 @@ class AppModel(ObservableObject):
         if reach_failed:
             if self._retry_reach_camera_domains():
                 retried.append("reach cameras")
-        if SubsystemId.TOP_CAPTURE.value in failed or (
-            SubsystemId.camera(self._top_camera.name) in failed
-        ):
-            if self._start_top_camera_domain():
-                retried.append("top camera")
         if SubsystemId.CAN_PELLET.value in failed:
             if self._start_can_domain(wait_connected=True):
                 retried.append("CAN/pellet")
@@ -3296,8 +3217,6 @@ class AppModel(ObservableObject):
         reach_synchronization_ready = self._start_reach_camera_domains(
             inference_camera_indices,
         )
-        self._start_top_camera_domain()
-
         # Each hardware domain starts and fails independently. Readiness is
         # aggregated only when Record is requested.
         can_ready = self._start_can_domain(wait_connected=wait_connected)
@@ -3601,15 +3520,6 @@ class AppModel(ObservableObject):
             ),
             reason="reach camera synchronization stopped",
         )
-        self._set_subsystem_status(
-            SubsystemId.TOP_CAPTURE,
-            (
-                SubsystemState.STOPPED
-                if self._top_camera.is_enabled
-                else SubsystemState.DISABLED
-            ),
-            reason="top camera stopped",
-        )
 
     def set_log_location(self, location: Optional[Path] = None):
         if location is None:
@@ -3705,32 +3615,6 @@ class AppModel(ObservableObject):
                 camera_config.params.get("fps"),
             )
         self._ensure_reach_primary_camera()
-
-        if (camera := configuration.get_camera(CameraId.Web)) is not None:
-            if camera.record_mode != VideoRecordMode.TRIGGER:
-                logger.warning(
-                    "Ignoring continuous camera mode for manual recording: %s=%s",
-                    self._top_camera.name,
-                    camera.record_mode,
-                )
-            camera.record_mode = VideoRecordMode.TRIGGER
-            if camera.record_prebuffer_duration != 0:
-                logger.warning(
-                    "Ignoring camera prebuffer for manual recording alignment: %s=%s",
-                    self._top_camera.name,
-                    camera.record_prebuffer_duration,
-                )
-            camera.record_prebuffer_duration = 0
-            self._top_camera.load_configuration(camera)
-            log_hardware_initialization(
-                logger,
-                "CONFIGURED | camera | name=%s enabled=%s primary=false source=%s shape=%s fps=%s",
-                self._top_camera.name,
-                camera.is_enabled,
-                self._top_camera.camera_source.url,
-                self._top_camera.shape,
-                camera.params.get("fps"),
-            )
 
         self._behavior.algorithm.record_prebuffer_duration = 0
 
@@ -4168,11 +4052,7 @@ class AppModel(ObservableObject):
                     reason=f"reach camera unavailable: {camera_name}",
                 )
             else:
-                self._set_subsystem_status(
-                    SubsystemId.TOP_CAPTURE,
-                    SubsystemState.FAILED,
-                    error=root_error,
-                )
+                logger.error("Unknown camera watchdog failed: %s", camera_name)
             self._abort_recording_for_required_subsystem(
                 SubsystemId.camera(camera_name),
                 root_error,

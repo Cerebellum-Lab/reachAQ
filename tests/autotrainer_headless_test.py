@@ -145,7 +145,6 @@ def test_load_config(
     app_model.save_configuration()
     saved_configuration = SystemConfiguration.load_yaml_file(config_file_path)
     assert saved_configuration.get_camera(CameraId.Camera3).is_enabled
-    assert app_model.top_camera.name == "web"
     assert app_model.output_location == system_config.persistence.output_location
     pref = app_model.preferences
     assert Path(pref.animal_location) == animals_dir
@@ -224,7 +223,7 @@ def test_spinnaker_camera_selectors_keep_only_their_configured_binding(
         assert all(not source.name.startswith("Spinnaker ") for source in camera.camera_list)
 
 
-def test_load_config_without_web_camera_keeps_top_disabled(app_model, trainer_config_dir, system_config):
+def test_load_config_ignores_retired_web_camera(app_model, trainer_config_dir, system_config):
     system_config.cameras = [
         cam for cam in system_config.cameras
         if cam.id != CameraId.Web
@@ -233,8 +232,7 @@ def test_load_config_without_web_camera_keeps_top_disabled(app_model, trainer_co
 
     assert app_model.load_configuration() is True
 
-    assert app_model.top_camera.name == "web"
-    assert not app_model.top_camera.is_enabled
+    assert app_model.get_camera_model(CameraId.Web) is None
 
 
 def test_start_stop(app_model, settings_ini_path):
@@ -299,11 +297,6 @@ def test_gpu_preflight_failure_does_not_block_cameras_and_hardware(
     start_reach = mock.Mock(return_value=True)
     start_can = mock.Mock(return_value=False)
     monkeypatch.setattr(app_model, "_start_reach_camera_domains", start_reach)
-    monkeypatch.setattr(
-        app_model,
-        "_start_top_camera_domain",
-        mock.Mock(return_value=False),
-    )
     monkeypatch.setattr(app_model, "_start_can_domain", start_can)
 
     assert app_model.capture_start() is True

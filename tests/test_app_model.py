@@ -59,25 +59,19 @@ def test_it_drain_record_stop_sema_on_session_recording_start(app_model):
     assert math.isnan(app_model._cams_record_start_perf.value)
 
 
-def test_recording_camera_set_includes_recordable_top_camera(app_model):
+def test_recording_camera_set_includes_all_recordable_reach_cameras(app_model):
     for camera in app_model.reach_cameras:
         camera.is_enabled = True
         camera.is_recording_enabled = True
-    app_model.top_camera.is_enabled = True
-    app_model.top_camera.is_recording_enabled = True
-
-    assert app_model._get_recording_cams() == (
-        *app_model._ordered_reach_cameras(enabled_only=True),
-        app_model.top_camera,
+    assert app_model._get_recording_cams() == app_model._ordered_reach_cameras(
+        enabled_only=True,
     )
 
 
-def test_writer_finalization_waits_for_top_camera_and_pose(app_model):
+def test_writer_finalization_waits_for_all_reach_cameras_and_pose(app_model):
     for camera in app_model.reach_cameras:
         camera.is_enabled = True
         camera.is_recording_enabled = True
-    app_model.top_camera.is_enabled = True
-    app_model.top_camera.is_recording_enabled = True
     recording_cameras = app_model._get_recording_cams()
 
     class InferenceWithPoseWriterAck:
