@@ -277,6 +277,34 @@ def test_automatic_stop_finishes_active_trial_normally_before_stopping(
         app_model._cancel_automatic_stop_timers()
 
 
+def test_pellet_cycle_completion_finishes_trial_before_automatic_stop(
+    app_model,
+):
+    ledger = PelletTrialLedger(app_model.project.short_id)
+    ledger.begin_send(5.0, 105.0, operation_id="send-1")
+    ledger.acknowledge_presentation(5.1, 105.1)
+    policy = SessionStopPolicy(
+        SessionStopConfiguration(trial_limit=1),
+    )
+    policy.start(0.0)
+    app_model._trial_ledger = ledger
+    app_model._session_stop_policy = policy
+    app_model._set_session_recording_status(SessionRecordingStatus.RECORDING)
+
+    with mock.patch.object(
+        app_model,
+        "_stop_recording_with_reason",
+    ) as stop:
+        app_model._on_pellet_cycle_completed(perf_c=6.0)
+
+    stop.assert_called_once_with(
+        SessionStopReason.TRIAL_LIMIT,
+        SessionStopDecision.STOP,
+    )
+    assert ledger.active_attempt is None
+    assert ledger.summary()["trials_completed"] == 1
+
+
 def test_abort_removes_whole_session_and_resets_counts(app_model):
     project = app_model.project
     project.session = 1

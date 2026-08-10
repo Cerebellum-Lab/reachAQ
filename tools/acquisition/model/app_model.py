@@ -534,6 +534,7 @@ class AppModel(ObservableObject):
 
         pellet_m = system_machine.pellet
         pellet_m.events.pellet_loading += self._on_pellet_loading_for_trial
+        pellet_m.events.pellet_cycle_completed += self._on_pellet_cycle_completed
         pellet_m.events.pellet_sending += self._on_pellet_sending
         pellet_m.events.pellet_sent += self._on_pellet_sent
 
@@ -975,6 +976,7 @@ class AppModel(ObservableObject):
         if evaluation.decision is SessionStopDecision.NONE:
             return evaluation
         if evaluation.decision is SessionStopDecision.FINISH_ACTIVE_TRIAL:
+            self._behavior.algorithm.pellet_automation_stop_requested = True
             if self._stop_drain_timer is no_op_timer:
                 self._stop_drain_timer = make_daemon_timer(
                     policy.configuration.drain_timeout_seconds,
@@ -5242,6 +5244,13 @@ class AppModel(ObservableObject):
             return
         now_perf = get_perf_now()
         ledger.close_active_for_analysis(now_perf, time.time())
+        self._evaluate_automatic_stop_policy()
+
+    def _on_pellet_cycle_completed(self, *, perf_c: float):
+        ledger = self._trial_ledger
+        if ledger is None or ledger.active_attempt is None:
+            return
+        ledger.close_active_for_analysis(perf_c, time.time())
         self._evaluate_automatic_stop_policy()
 
     def _on_pellet_sending(self, *, perf_c: float, context: str):

@@ -237,6 +237,7 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
         self._session_started_perf_c = -math.inf
         self._start_session_reason = "NA"
         self._stop_session_reason = RecordingEndingReason.NA
+        self._pellet_automation_stop_requested = False
         self._timer_end_capture_session = no_op_timer
         self._prev_can_load_pellet_log_refuse_perf_c = -math.inf
 
@@ -1035,6 +1036,7 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
 
         logger.success("%s: starting new session recording ...", reason)
         self._is_in_session = True
+        self._pellet_automation_stop_requested = False
         self._session_started_perf_c = get_perf_now()
         self._start_session_reason = reason
         self.reset_session_pellet_count()
@@ -1148,7 +1150,7 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
     #
 
     def can_send_pellet(self):
-        if self._algo_paused or self._status is not BehaviorAlgoStatus.ANIMAL_IN_TRAINING:
+        if self._algo_paused or not self._pellet_automation_enabled_for_session():
             return False
         cfg = self._active_config
         if not cfg.pellet_delivery.is_enabled:
@@ -1213,7 +1215,7 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
     ) -> bool:
         """Say if a pellet can and must be loaded"""
         # is more has_to_load_pellet()
-        if self._status is not BehaviorAlgoStatus.ANIMAL_IN_TRAINING:
+        if not self._pellet_automation_enabled_for_session():
             return False
         cfg = self._active_config.pellet_delivery
         if not cfg.is_enabled or self._algo_paused:
@@ -1236,7 +1238,7 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
 
     def can_cover_pellet(self) -> bool:
         """Say if cover-pellet is enabled"""
-        if self._status is not BehaviorAlgoStatus.ANIMAL_IN_TRAINING:
+        if not self._pellet_automation_enabled_for_session():
             return False
         cfg = self._active_config.pellet_delivery
         return cfg.is_enabled and cfg.is_pellet_cover_enabled and not self._algo_paused
@@ -1244,7 +1246,7 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
     def can_release_pellet(self, *, pellet_state: PelletState = PelletState.monitoring) -> bool:
         """Say if algo should release pellet"""
         # self._check_date()
-        if self._status is not BehaviorAlgoStatus.ANIMAL_IN_TRAINING:
+        if not self._pellet_automation_enabled_for_session():
             return False
         if self._algo_paused:
             return False
@@ -1291,6 +1293,25 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
 
     def can_perform_intersession_analysis(self):
         return self._active_config.pellet_delivery.is_intersession_analysis_enabled and self._session_mouse_seen
+
+    @property
+    def pellet_automation_stop_requested(self) -> bool:
+        return self._pellet_automation_stop_requested
+
+    @pellet_automation_stop_requested.setter
+    def pellet_automation_stop_requested(self, value: bool) -> None:
+        self._pellet_automation_stop_requested = bool(value)
+
+    def _pellet_automation_enabled_for_session(self) -> bool:
+        configured = (
+            self._active_config.session_control.automatic_pellet_cycles_enabled
+            and self._is_in_session
+            and self._capture_status == CaptureProcessStatus.RECORDING
+        )
+        legacy_training = self._status is BehaviorAlgoStatus.ANIMAL_IN_TRAINING
+        return not self._pellet_automation_stop_requested and (
+            configured or legacy_training
+        )
 
     #
 

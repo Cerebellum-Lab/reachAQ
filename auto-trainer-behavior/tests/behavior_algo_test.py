@@ -242,6 +242,23 @@ def test_delivery_disabled_defaults(algo):
     assert algo.can_send_pellet() is True
 
 
+def test_recorded_session_can_enable_pellet_cycles_without_training_mode(algo):
+    algo.status = BehaviorAlgoStatus.ACQUIRING
+    algo.active_config.session_control.automatic_pellet_cycles_enabled = True
+    algo.update_triangle_seen(True)
+
+    assert algo.can_load_pellet() is False
+    assert algo.start_session(reason="manual") is True
+    assert algo.can_load_pellet() is False
+
+    algo.set_capture_status(CaptureProcessStatus.RECORDING)
+    assert algo.can_load_pellet() is True
+
+    algo.pellet_automation_stop_requested = True
+    assert algo.can_load_pellet() is False
+    assert algo.can_send_pellet() is False
+
+
 def test_algo_paused(algo):
     algo.algo_paused = True
     assert algo.can_send_pellet() is False

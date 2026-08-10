@@ -50,6 +50,11 @@ class PelletReleasedEventT(Protocol):
         """Pellet Released event signature"""
 
 
+class PelletCycleCompletedEventT(Protocol):
+    def __call__(self, *, perf_c: float):
+        """Pellet became missing after presentation without starting a retry."""
+
+
 class PelletMachineEvents(StateMachineEvents):
 
     pellet_loading: Callable[[], None]  # when a load-pellet is started executing
@@ -58,6 +63,7 @@ class PelletMachineEvents(StateMachineEvents):
     pellet_sent: PelletSentEventT  # when a send-pellet is finished executing
     pellet_load_failed: PelletLoadFailedEventT
     pellet_released: PelletReleasedEventT
+    pellet_cycle_completed: PelletCycleCompletedEventT
 
 
 class PelletDeviceCommandFailed(RuntimeError):
@@ -492,6 +498,10 @@ class PelletMachine(StateMachine):
         elif cur_state == PelletState.monitoring:
             if not can_use_command:
                 return
+            if algo.would_load_pellet(pellet_state=cur_state):
+                self.events.pellet_cycle_completed(perf_c=perf_now)
+                if algo.pellet_automation_stop_requested:
+                    return
             if self.can_load_pellet():
                 reason = "can_load_pellet_when_monitoring"
                 action = partial(self.load_pellet, reason=reason)
