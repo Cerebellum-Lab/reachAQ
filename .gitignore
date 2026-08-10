@@ -186,31 +186,12 @@ software
 /temp/
 
 
-# test related:
-auto-trainer-inference/tests/data/20251015/agx001/trial015/20251015_agx001_trial015_centered3D.h5
-auto-trainer-inference/tests/data/20251015/agx001/trial015/20251015_agx001_trial015_eventSegmentation.pickle
-auto-trainer-inference/tests/data/20251015/agx001/trial015/20251015_agx001_trial015_left_filtered2D.h5
-auto-trainer-inference/tests/data/20251015/agx001/trial015/20251015_agx001_trial015_pelletHistory.pickle
-auto-trainer-inference/tests/data/20251015/agx001/trial015/20251015_agx001_trial015_reach_events.h5
-auto-trainer-inference/tests/data/20251015/agx001/trial015/20251015_agx001_trial015_right_filtered2D.h5
-auto-trainer-inference/tests/data/20260205/agx001/trial011/20260205_agx001_trial011_centered3D.h5
-auto-trainer-inference/tests/data/20260205/agx001/trial011/20260205_agx001_trial011_eventSegmentation.pickle
-auto-trainer-inference/tests/data/20260205/agx001/trial011/20260205_agx001_trial011_left_filtered2D.h5
-auto-trainer-inference/tests/data/20260205/agx001/trial011/20260205_agx001_trial011_pelletHistory.pickle
-auto-trainer-inference/tests/data/20260205/agx001/trial011/20260205_agx001_trial011_reach_events.h5
-auto-trainer-inference/tests/data/20260205/agx001/trial011/20260205_agx001_trial011_right_filtered2D.h5
-auto-trainer-inference/tests/fp-and-xp-not-same/20250623/agx001/trial002/20250623_agx001_trial002_centered3D.h5
-auto-trainer-inference/tests/fp-and-xp-not-same/20250623/agx001/trial002/20250623_agx001_trial002_eventSegmentation.pickle
-auto-trainer-inference/tests/fp-and-xp-not-same/20250623/agx001/trial002/20250623_agx001_trial002_left_filtered2D.h5
-auto-trainer-inference/tests/fp-and-xp-not-same/20250623/agx001/trial002/20250623_agx001_trial002_pelletHistory.pickle
-auto-trainer-inference/tests/fp-and-xp-not-same/20250623/agx001/trial002/20250623_agx001_trial002_reach_events.h5
-auto-trainer-inference/tests/fp-and-xp-not-same/20250623/agx001/trial002/20250623_agx001_trial002_right_filtered2D.h5
-auto-trainer-inference/tests/index_error/20250806/agx001/trial059/20250806_agx001_trial059_centered3D.h5
-auto-trainer-inference/tests/index_error/20250806/agx001/trial059/20250806_agx001_trial059_eventSegmentation.pickle
-auto-trainer-inference/tests/index_error/20250806/agx001/trial059/20250806_agx001_trial059_left_filtered2D.h5
-auto-trainer-inference/tests/index_error/20250806/agx001/trial059/20250806_agx001_trial059_pelletHistory.pickle
-auto-trainer-inference/tests/index_error/20250806/agx001/trial059/20250806_agx001_trial059_reach_events.h5
-auto-trainer-inference/tests/index_error/20250806/agx001/trial059/20250806_agx001_trial059_right_filtered2D.h5
+# Derived inference-test outputs (source videos/raw pose data remain tracked):
+auto-trainer-inference/tests/**/*_centered3D.h5
+auto-trainer-inference/tests/**/*_eventSegmentation.pickle
+auto-trainer-inference/tests/**/*_filtered2D.h5
+auto-trainer-inference/tests/**/*_pelletHistory.pickle
+auto-trainer-inference/tests/**/*_reach_events.h5
 
 # Pyright LSP config (machine-specific conda env path)
 pyrightconfig.json

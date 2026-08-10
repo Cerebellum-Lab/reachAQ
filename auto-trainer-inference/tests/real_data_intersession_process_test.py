@@ -180,6 +180,7 @@ def test_fp_and_xp_not_same(project_info, caplog):
     project_info.root = this_dir.joinpath("fp-and-xp-not-same").as_posix()
     project_info.device_id = "agx001"
     project_info.when = datetime(2025, 6, 23)
+    project_info.camera_names = ("left", "right")
     caplog.set_level(verboselogs.VERBOSE)
     res = intersession_process(
         project_info,
@@ -204,6 +205,7 @@ def test_agx001_20250806_59(project_info, caplog):
     project_info.root = this_dir.joinpath("index_error").as_posix()
     project_info.device_id = "agx001"
     project_info.when = datetime(2025, 8, 6)
+    project_info.camera_names = ("left", "right")
     caplog.set_level(verboselogs.VERBOSE)
     # with pytest.raises(IndexError, match="fp and xp are not of the same length"):
     # previously was raising an index error, but is now fixed.
@@ -254,6 +256,7 @@ def agx001_20251015_15(project_info):
     project_info.session = 15
     project_info.device_id = "agx001"
     project_info.when = datetime(2025, 10, 15)
+    project_info.camera_names = ("left", "right")
     return project_info
 
 
