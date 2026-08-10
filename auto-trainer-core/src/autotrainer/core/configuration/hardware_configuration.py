@@ -7,9 +7,8 @@ from typing_extensions import Self
 from autotrainer.core import make_camelize_representer, make_decamelize_constructor
 
 
-@dataclass
+@dataclass(init=False)
 class HardwareConfiguration:
-    tunnel_identifier: str = ""
     pellet_identifier: str = ""
     can_enabled: bool = True
     """Enable CAN bus hardware connection attempts."""
@@ -20,9 +19,6 @@ class HardwareConfiguration:
     nidaq_enabled: bool = False
     """Enable NI-DAQ hardware for this rig."""
 
-    tunnel_headfix_enabled: bool = False
-    """Enable tunnel gate, head magnet, and tunnel fan commands."""
-
     min_ack_timeout: Optional[float] = None  # min device-ack-timeout
     """CAN uuid ACK timeout, if not set here then default code value of 3s is used."""
 
@@ -31,16 +27,33 @@ class HardwareConfiguration:
     If not set here then default code value of 15s is used.
     """
 
+    def __init__(
+        self,
+        pellet_identifier: str = "",
+        can_enabled: bool = True,
+        pellet_controller_enabled: bool = True,
+        nidaq_enabled: bool = False,
+        min_ack_timeout: Optional[float] = None,
+        board_status_timeout: Optional[float] = None,
+        *,
+        tunnel_identifier=None,
+        tunnel_headfix_enabled=None,
+    ):
+        # Old rig files may still contain tunnel keys. They are accepted once,
+        # discarded, and omitted from all newly written configurations.
+        self.pellet_identifier = pellet_identifier
+        self.can_enabled = can_enabled
+        self.pellet_controller_enabled = pellet_controller_enabled
+        self.nidaq_enabled = nidaq_enabled
+        self.min_ack_timeout = min_ack_timeout
+        self.board_status_timeout = board_status_timeout
+
     @classmethod
     def from_version_zero(cls, content: dict) -> Self:
         configuration = cls()
-
-        if "head_fix" in content:
-            configuration.tunnel_identifier = content["head_fix"].get("port", "")
-            configuration.tunnel_headfix_enabled = bool(configuration.tunnel_identifier)
         if "pellet_delivery" in content:
             configuration.pellet_identifier = content["pellet_delivery"].get("port", "")
             configuration.pellet_controller_enabled = bool(configuration.pellet_identifier)
-        configuration.can_enabled = bool(configuration.tunnel_identifier or configuration.pellet_identifier)
+        configuration.can_enabled = bool(configuration.pellet_identifier)
 
         return configuration

@@ -492,14 +492,7 @@ class HardwareStatusContent(ContentWidget):
         hardware = getattr(configuration, "hardware", None)
         if hardware is None:
             return "configured transport"
-        identifiers = tuple(
-            dict.fromkeys(
-                value
-                for value in (hardware.tunnel_identifier, hardware.pellet_identifier)
-                if value
-            )
-        )
-        return ", ".join(identifiers) if identifiers else "configured transport"
+        return hardware.pellet_identifier or "configured transport"
 
     def _pellet_binding(self) -> str:
         configuration = self._loaded_configuration()

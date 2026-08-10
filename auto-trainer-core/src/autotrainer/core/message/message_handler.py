@@ -37,15 +37,11 @@ class MessageHandler(ObservableObject):
 
     The second is to insulate downstream consumers from any specifics of the hardware implementation such as how
     commands are acknowledged, what capabilities different versions of the hardware may have, etc.  Subclasses for
-    elements such as pellet delivery, tunnel behavior, and sensor measurements present properties (with change
+    elements such as pellet delivery present properties (with change
     notification), callbacks, and other means of making the data available in a consistent format that downstream
     consumers care about rather than as specifically implemented the hardware.
     """
     FIRMWARE_VERSION_PROPERTY = "firmware_version"
-
-    HEAD_MAGNET_INTENSITY_PROPERTY = "head_magnet_intensity"
-    HEAD_GATE_PROPERTY = "gate_angle"
-    TUNNEL_GATE_OPEN_STATUS = "tunnel_gate_open_status"
 
     DEVICE_X_PROPERTY = "device_x"
     DEVICE_Y_PROPERTY = "device_y"
@@ -57,13 +53,6 @@ class MessageHandler(ObservableObject):
 
     LOAD_ARM_ANGLE_PROPERTY = "load_angle"
     COVER_ARM_ANGLE_PROPERTY = "cover_angle"
-    TUNNEL_FAN_PROPERTY = "tunnel_fan"
-
-    FRONT_DOOR_PROPERTY = "front_door"
-    DRAWER_DOOR_PROPERTY = "drawer_door"
-    SPARE_DOOR_PROPERTY = "spare_door"
-    EXT_BUTTON_PROPERTY = "ext_button"
-
     STIMULI_PROPERTY = "stimuli"
     CONFIG_PROPERTY = "config"
 

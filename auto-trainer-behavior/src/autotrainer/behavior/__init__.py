@@ -74,4 +74,3 @@ from .behavior_algorithm import BehaviorAlgorithm
 
 from .system_machine import SystemMachine
 from .system_machine_state import SystemState
-from .tunnel_device_protocol import TunnelDeviceProtocol

@@ -108,17 +108,6 @@ class BehaviorModel(ObservableObject, ProjectDependentProtocol):
         # which further prevent everything after.
         # todo: try have intersession stop "normally" too
 
-    def use_current_head_magnet_position_as_baseline(self):
-        head_magnet_intensity = self._hardware_model.head_magnet_intensity
-        if head_magnet_intensity is not None:
-            algo = self._system_machine.algorithm
-            algo.baseline_intensity = head_magnet_intensity
-            # NB: behavior_algo.baseline_intensity is currently not connected to config value,
-            # but we want save it here:
-            algo.active_config.head_clamp.baseline_intensity = head_magnet_intensity
-            post_api_event_content(ApiEventKind.headfixBaselineChanged,
-                                   data=dict(baseline=head_magnet_intensity))
-
     def get_led_color(self):
         """Use a steady green pellet-board indicator while acquisition runs."""
         return (0, 100, 0)

@@ -31,7 +31,7 @@ from autotrainer.core.capture import CaptureProcessStatus
 from autotrainer.core.interfaces import RecordingEndingReason
 from autotrainer.inference import PoseAlgorithm, PoseResponse, InferenceStatus
 
-from autotrainer.behavior import TunnelDeviceProtocol, SystemMachine, PelletDeviceProtocol, BehaviorAlgorithm, \
+from autotrainer.behavior import SystemMachine, PelletDeviceProtocol, BehaviorAlgorithm, \
     InferenceProtocol, SystemState
 from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
 from autotrainer.behavior.pellet import PelletState
@@ -235,11 +235,6 @@ def _disable_timers():
 
 
 @pytest.fixture
-def tunnel_device() -> TunnelDeviceProtocol:
-    return mock.create_autospec(TunnelDeviceProtocol)
-
-
-@pytest.fixture
 def pellet_device() -> PelletDeviceProtocol:
     return mock.create_autospec(PelletDeviceProtocol)
 
@@ -440,10 +435,6 @@ class MockSystemMachine:
     @property
     def msg_handler(self) -> MessageHandler:
         return self._machine._msg_handler
-
-    @property
-    def tunnel_dev(self) -> Union[mock.MagicMock, TunnelDeviceProtocol]:
-        return self._machine._tunnel_device
 
     @property
     def pellet_dev(self) -> Union[mock.MagicMock, PelletDeviceProtocol]:

@@ -1119,14 +1119,6 @@ class AppModel(ObservableObject):
             self._analysis.restart()
         # reload training plans:
         self.reload_training_plans()
-        if status == AppModelStatus.ANIMAL_IN_TRAINING:
-            # NB: need to be after set of algo_status
-            # self._behavior.system_machine.pellet.send_pellet()
-            # send_pellet most likely not needed anymore. since pellet_machine takes care of it.
-            self._hardware.open_tunnel_gate()
-        else:
-            self._hardware.close_tunnel_gate()
-        #
         status_file_path = self.status_file_path.expanduser()
         status_file_path.parent.mkdir(parents=True, exist_ok=True)
         if status == AppModelStatus.IDLE:
@@ -3603,11 +3595,10 @@ class AppModel(ObservableObject):
         self._hardware.load_config(configuration.hardware)
         log_hardware_initialization(
             logger,
-            "CONFIGURED | hardware flags | CAN=%s pellet_controller=%s NI-DAQ=%s tunnel_headfix=%s",
+            "CONFIGURED | hardware flags | CAN=%s pellet_controller=%s NI-DAQ=%s",
             configuration.hardware.can_enabled,
             configuration.hardware.pellet_controller_enabled,
             configuration.hardware.nidaq_enabled,
-            configuration.hardware.tunnel_headfix_enabled,
         )
         self.inference.load_configuration(configuration.inference)
         log_hardware_initialization(
@@ -4660,15 +4651,13 @@ class AppModel(ObservableObject):
         loaded_hardware = (
             self._loaded_configuration.hardware
             if self._loaded_configuration is not None
-            else HardwareConfiguration(tunnel_identifier="CAN", pellet_identifier="CAN", tunnel_headfix_enabled=False)
+            else HardwareConfiguration(pellet_identifier="CAN")
         )
         hardware_configuration = HardwareConfiguration(
-            tunnel_identifier=loaded_hardware.tunnel_identifier,
             pellet_identifier=loaded_hardware.pellet_identifier,
             can_enabled=self._hardware.can_enabled,
             pellet_controller_enabled=self._hardware.pellet_controller_enabled,
             nidaq_enabled=self._hardware.nidaq_enabled,
-            tunnel_headfix_enabled=self._hardware.tunnel_headfix_enabled,
             min_ack_timeout=loaded_hardware.min_ack_timeout,
             board_status_timeout=loaded_hardware.board_status_timeout,
         )
@@ -5016,15 +5005,9 @@ class AppModel(ObservableObject):
         hard = self._hardware
         algo = self._behavior.algorithm
         analysis = self._behavior.analysis
-        tunnel_headfix_enabled = hard.tunnel_headfix_enabled
-        magnet_intensity = hard.head_magnet_intensity
         project = self._project_info
         if project is None:
             project = self.make_project_info()
-        if not tunnel_headfix_enabled:
-            magnet_intensity = math.nan
-        if magnet_intensity is None:
-            magnet_intensity = math.nan
         misplaced_mon = analysis.pellet_misplaced_monitor
         animal = self._selected_animal
 
@@ -5073,11 +5056,11 @@ class AppModel(ObservableObject):
                 barrier_arm=hard.cover_arm_position,
             ),
             tunnel_device=ApiTunnelDeviceStatus(
-                magnet_intensity=magnet_intensity,
-                gate_open=hard.tunnel_gate_open_status if tunnel_headfix_enabled else False,
+                magnet_intensity=math.nan,
+                gate_open=False,
             ),
             behavior=ApiBehaviorStatus(
-                baseline_magnet_intensity=algo.baseline_intensity if tunnel_headfix_enabled else math.nan,
+                baseline_magnet_intensity=math.nan,
                 reaches=reach_status,
             )
         )

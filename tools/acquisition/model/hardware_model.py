@@ -21,7 +21,7 @@ from autotrainer.core.event import post_api_detector_event_content
 from autotrainer.core.message import SystemDataArgsKwargs
 from autotrainer.device import (CanTransportConfiguration, CanTransportKind, DeviceConnectionProtocol, HAVE_CAN_DEVICE,
                                 DeviceConnection, CanDevice, StepperConfig, ServoConfig, Device, ColorLed, Target)
-from autotrainer.behavior import TunnelDeviceProtocol, PelletDeviceProtocol
+from autotrainer.behavior import PelletDeviceProtocol
 
 logger = get_verbose_logger(__name__)
 
@@ -29,16 +29,10 @@ _nans_offset3dTuple = Offset3DTuple.get_nan()
 
 
 _reg_pellet_version_clean = re.compile("pellet ?:? *")
-_reg_tunnel_version_clean = re.compile("tunnel ?:? *")
-_reg_magnet_version_clean = re.compile("magnet ?:? *")
+class HardwareModel(ObservableObject, PelletDeviceProtocol):
 
-
-class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol):
-
-    TUNNEL_VERSION_PROPERTY = "tunnel_version"
     PELLET_VERSION_PROPERTY = "pellet_version"
 
-    TUNNEL_IDENTIFIER_PROPERTY = "tunnel_identifier"
     PELLET_IDENTIFIER_PROPERTY = "pellet_identifier"
     CAN_ENABLED = "can_enabled"
     PELLET_CONTROLLER_ENABLED = "pellet_controller_enabled"
@@ -46,12 +40,8 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
 
     PENDING_COMMAND_PROPERTY = "pending_command"
 
-    FRONT_DOOR_PROPERTY = "front_door"
-    SLIDE_DOOR_PROPERTY = "slide_door"
-
     DEVICE_ACK_TIMEOUT_ENGAGED = "device_ack_timeout_engaged"
     DEVICE_PELLET_STATUS_TIMEOUT_ENGAGED = "device_pellet_status_timeout_engaged"
-    DEVICE_TUNNEL_STATUS_TIMEOUT_ENGAGED = "device_tunnel_status_timeout_engaged"
 
     # POS_X = "pos_x"
     # POS_Y = "pos_y"
@@ -66,11 +56,6 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
     SET_X = "set_x"
     SET_Y = "set_y"
     SET_Z = "set_z"
-
-    HEAD_MAGNET_INTENSITY = "head_magnet_intensity"
-    TUNNEL_GATE_POSITION = "tunnel_gate_position"
-    TUNNEL_GATE_OPEN_STATUS = "tunnel_gate_open_status"
-    TUNNEL_HEADFIX_ENABLED = "tunnel_headfix_enabled"
 
     def __init__(
         self,
@@ -91,21 +76,15 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
         self._can_device: Optional[CanDevice] = None
         self._device_uuid_ack_timeout_engaged = False
         self._device_pellet_status_timeout_engaged = False
-        self._device_tunnel_status_timeout_engaged = False
         self._device_stream_started = False
         self._can_enabled = True
         self._pellet_controller_enabled = True
         self._nidaq_enabled = False
-        self._tunnel_headfix_enabled = False
 
         self._pending_tokens: Dict[UUID, Tuple[SystemCommandKind, float]] = {}
 
         message_handler.property_changed += self._message_handler_property_changed
         message_handler.ack_received += self._ack_received
-
-        self._head_magnet_position: Optional[float] = None
-        self._tunnel_gate_position: float = math.nan
-        self._tunnel_gate_open_status: bool = False
 
         self._dcs_config: Optional[DiamondTriangleOffsetConfig] = None
         # Support for relative x, y, z movements and whether they are persistent as the Send position various between
@@ -118,14 +97,10 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
         # What we've SET as coordinates:
         self._last_requested_set_coordinates: Offset3DTuple = _nans_offset3dTuple
 
-        self._front_door_open: bool = False
-        self._slide_door_open: bool = False
-
         self._cover_arm_position: float = math.nan
         self._load_arm_position: float = math.nan
 
         self._pellet_version = ""
-        self._tunnel_version = ""
         self._color_led: Optional[ColorLed] = None
 
         self._device_ack_timeout_engaged = False
@@ -235,10 +210,6 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
     def pellet_status_timeout_engaged(self) -> bool:
         return self._device_pellet_status_timeout_engaged
 
-    @property
-    def tunnel_status_timeout_engaged(self) -> bool:
-        return self._device_tunnel_status_timeout_engaged
-
     @device_ack_timeout_engaged.setter
     def device_ack_timeout_engaged(self, value):
         prev, self._device_ack_timeout_engaged = self._device_ack_timeout_engaged, value
@@ -295,41 +266,6 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
         return self._pellet_version
 
     @property
-    def tunnel_version(self) -> str:
-        return self._tunnel_version
-
-    @property
-    def front_door_open(self):
-        return self._front_door_open
-
-    @front_door_open.setter
-    def front_door_open(self, value: bool):
-        prev, self._front_door_open = self._front_door_open, value
-        self._on_property_changed(HardwareModel.FRONT_DOOR_PROPERTY, value, prev)
-
-    @property
-    def slide_door_open(self):
-        return self._slide_door_open
-
-    @slide_door_open.setter
-    def slide_door_open(self, value: bool):
-        prev, self._slide_door_open = self._slide_door_open, value
-        self._on_property_changed(HardwareModel.SLIDE_DOOR_PROPERTY, value, prev)
-
-    @property
-    def head_magnet_intensity(self) -> Optional[float]:
-        """
-        This value is stored because there are other operations that depend on the current magnet intensity.  In most
-        other cases, the only action is to update the UI with the current value.
-        :return intensity in percent:
-        """
-        return self._head_magnet_position
-
-    @property
-    def tunnel_headfix_enabled(self) -> bool:
-        return self._tunnel_headfix_enabled
-
-    @property
     def can_enabled(self) -> bool:
         return self._can_enabled
 
@@ -344,38 +280,6 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
     @property
     def requires_connection(self) -> bool:
         return self._can_enabled and self._pellet_controller_enabled
-
-    def update_head_magnet_intensity(self, value: Optional[float]) -> Optional[UUID]:
-        if not self._tunnel_headfix_enabled:
-            logger.debug("Skipping head magnet command because tunnel/headfix hardware is disabled")
-            return None
-        if value is None:  # caller should not call instead eventually
-            return
-        if isinstance(value, str):
-            value = float(value)
-        if value != self._head_magnet_position:
-            logger.verbose("sending move magnet to %.3f", value)
-            # self._head_magnet_position = value  # this is set from reading the hardware status
-            return self._send_with_token(self._device_conn, SystemCommandKind.MOVE_MAGNET_SERVO,
-                                         value)
-        logger.debug("head magnet currently already at pos %.3f", value)
-        return None
-
-    @property
-    def tunnel_gate_open_status(self) -> bool:
-        return self._tunnel_gate_open_status
-
-    def open_tunnel_gate(self) -> Optional[UUID]:
-        if not self._tunnel_headfix_enabled:
-            logger.debug("Skipping open tunnel gate command because tunnel/headfix hardware is disabled")
-            return None
-        return self._send_with_token(self._device_conn, SystemCommandKind.OPEN_TUNNEL_GATE)
-
-    def close_tunnel_gate(self) -> Optional[UUID]:
-        if not self._tunnel_headfix_enabled:
-            logger.debug("Skipping close tunnel gate command because tunnel/headfix hardware is disabled")
-            return None
-        return self._send_with_token(self._device_conn, SystemCommandKind.CLOSE_TUNNEL_GATE)
 
     def _set_axis(self, value: float, *, absolute: bool = True,
                   system_set_cmd: SystemCommandKind, coord_idx: int, sender: str="NA") -> Optional[UUID]:
@@ -490,18 +394,6 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
     def delay(self, amount: float) -> Optional[UUID]:
         return self._send_with_token(self._device_conn, SystemCommandKind.DELAY, amount)
 
-    def set_tunnel_fan_on(self) -> Optional[UUID]:
-        if not self._tunnel_headfix_enabled:
-            logger.debug("Skipping tunnel fan command because tunnel/headfix hardware is disabled")
-            return None
-        return self._send_with_token(self._device_conn, SystemCommandKind.TUNNEL_FAN_ON)
-
-    def set_tunnel_fan_off(self) -> Optional[UUID]:
-        if not self._tunnel_headfix_enabled:
-            logger.debug("Skipping tunnel fan command because tunnel/headfix hardware is disabled")
-            return None
-        return self._send_with_token(self._device_conn, SystemCommandKind.TUNNEL_FAN_OFF)
-
     def set_color_led(self, r: int, g: int, b: int):
         """0 -> 100"""
         return self._send_with_token(self._device_conn, SystemCommandKind.SET_RGB_LED, (r, g, b))
@@ -514,11 +406,6 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
             config.pellet_controller_enabled,
         )
         self._set_boolean_config(self.NIDAQ_ENABLED, "_nidaq_enabled", config.nidaq_enabled)
-        self._set_boolean_config(
-            self.TUNNEL_HEADFIX_ENABLED,
-            "_tunnel_headfix_enabled",
-            config.tunnel_headfix_enabled,
-        )
         self.set_device_ack_timeout(config.min_ack_timeout)
         self.set_board_status_timeout(config.board_status_timeout)
 
@@ -731,8 +618,6 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
         if can_dev is not None:
             can_dev.property_changed -= self._can_device_property_changed
             self._can_device = None
-        prev, self._tunnel_version = self._tunnel_version, ""
-        self._on_property_changed(self.TUNNEL_VERSION_PROPERTY, "", prev)
         prev, self._pellet_version = self._pellet_version, ""
         self._on_property_changed(self.PELLET_VERSION_PROPERTY, "", prev)
         prev_thread = self._check_timedout_commands_thread
@@ -840,48 +725,16 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
             self._device_pellet_status_timeout_engaged = value
             self.property_changed(self.DEVICE_PELLET_STATUS_TIMEOUT_ENGAGED, value, prev_value)
             is_dev_comm_err_possible = True
-        elif name == props.TUNNEL_STATUS_TIMEOUT_ENGAGED:
-            if not self._tunnel_headfix_enabled:
-                logger.debug("Ignoring tunnel status timeout because tunnel/headfix hardware is disabled")
-                return
-            post_api_detector_event_content(
-                self._event_manager,
-                ApiDetectorKind.tunnelStatusMessageInterruption,
-                value,
-                True,
-            )
-            self._device_tunnel_status_timeout_engaged = value
-            self.property_changed(self.DEVICE_TUNNEL_STATUS_TIMEOUT_ENGAGED, value, prev_value)
-            is_dev_comm_err_possible = True
         #
         if is_dev_comm_err_possible:
             engaged = any((
                 self._device_uuid_ack_timeout_engaged,
-                self._device_tunnel_status_timeout_engaged,
                 self._device_pellet_status_timeout_engaged,
             ))
 
     def _message_handler_property_changed(self, name: str, value, old_value):
         props = MessageHandler
-        if not self._tunnel_headfix_enabled and name in {
-            props.HEAD_MAGNET_INTENSITY_PROPERTY,
-            props.HEAD_GATE_PROPERTY,
-            props.TUNNEL_GATE_OPEN_STATUS,
-        }:
-            return
-        if name == props.HEAD_MAGNET_INTENSITY_PROPERTY:
-            prev, self._head_magnet_position = self._head_magnet_position, value
-            self._on_property_changed(self.HEAD_MAGNET_INTENSITY, value, prev)
-
-        elif name == props.HEAD_GATE_PROPERTY:
-            # logger.verbose("HEAD_GATE_PROPERTY: %s ; old=%s", value, old_value)
-            prev, self._tunnel_gate_position = self._tunnel_gate_position, value
-            self._on_property_changed(self.TUNNEL_GATE_POSITION, value, prev)
-
-        elif name == props.TUNNEL_GATE_OPEN_STATUS:
-            prev, self._tunnel_gate_open_status = self._tunnel_gate_open_status, value
-
-        elif name == props.STEPPER_X_PROPERTY:
+        if name == props.STEPPER_X_PROPERTY:
             prev = self._last_motor_coordinates
             new = prev.replace(x=value.position)
             self._last_motor_coordinates = new
@@ -902,12 +755,6 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
             self.send_z = value.send_position
             self._on_property_changed(self.POS_XYZ, new, prev)
 
-        elif name == props.FRONT_DOOR_PROPERTY:
-            self.front_door_open = value
-
-        elif name == props.DRAWER_DOOR_PROPERTY:
-            self.slide_door_open = value
-
         elif name == props.COVER_ARM_ANGLE_PROPERTY:
             self._cover_arm_position = value
 
@@ -922,15 +769,6 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
                 clean_v = _reg_pellet_version_clean.sub("", version).strip()
                 prev, self._pellet_version = self._pellet_version, clean_v
                 self._on_property_changed(self.PELLET_VERSION_PROPERTY, clean_v, prev)
-            elif version.find("magnet") != -1:
-                clean_v = _reg_magnet_version_clean.sub("", version).strip()
-                prev, self._tunnel_version = self._tunnel_version, clean_v
-                self._on_property_changed(self.TUNNEL_VERSION_PROPERTY, clean_v, prev)
-            elif version.find("tunnel") != -1:
-                clean_v = _reg_tunnel_version_clean.sub("", version).strip()
-                prev, self._tunnel_version = self._tunnel_version, clean_v
-                self._on_property_changed(self.TUNNEL_VERSION_PROPERTY, clean_v, prev)
-
         elif name == props.COLOR_LED:
             self._color_led = value
 

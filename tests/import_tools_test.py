@@ -11,9 +11,5 @@ def test_we_can_import_headless():
     from tools.acquisition import headless
 
 
-def test_we_can_import_head_fix_window():
-    from tools.head_fix.view import main_window
-
-
 def test_we_can_import_pellet_delivery_window():
     from tools.pellet_delivery.view import main_window

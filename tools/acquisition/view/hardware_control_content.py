@@ -4,7 +4,7 @@ from functools import partial
 
 from PySide6.QtCore import Signal, Qt
 from PySide6.QtWidgets import (QLabel, QSpinBox, QWidget, QPushButton, QVBoxLayout, QHBoxLayout, QGridLayout,
-                               QFormLayout, QDoubleSpinBox)
+                               QDoubleSpinBox)
 
 from autotrainer.behavior.behavior_algorithm import BehaviorAlgoProps
 from autotrainer.core import AnimalSubject, Offset3DTuple
@@ -100,11 +100,6 @@ class HardwareControlContent(ContentWidget):
         layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight)
         layout.setSpacing(8)
 
-        self._tunnel_version_label = QLabel("Tunnel:")
-        layout.addWidget(self._tunnel_version_label)
-        self._tunnel_version = QLabel("(unknown version)")
-        layout.addWidget(self._tunnel_version)
-
         layout.addWidget(QLabel("Pellet:"))
         self._pellet_version = QLabel("(unknown version)")
         layout.addWidget(self._pellet_version)
@@ -118,43 +113,14 @@ class HardwareControlContent(ContentWidget):
         layout.setVerticalSpacing(4)
         layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
 
-        label = self._tunnel_section_label = QLabel("<b>Tunnel</b>")
-        label.setAlignment(Qt.AlignCenter)
-        layout.addWidget(label, 0, 0)
         label = QLabel("<b>Pellet Release Location (mm)</b>")
         label.setAlignment(Qt.AlignCenter)
-        layout.addWidget(label, 0, 2)
+        layout.addWidget(label, 0, 0)
 
         label = QLabel("<b>Compound Move</b>")
         label.setAlignment(Qt.AlignCenter)
         label.setContentsMargins(0, 0, 0, 4)  # ensure small margin below
         layout.addWidget(label, 0, 4)
-
-        form_layout = QFormLayout()
-        form_layout.setContentsMargins(0, 4, 0, 0)
-        form_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-        form_layout.setHorizontalSpacing(8)
-        form_layout.setVerticalSpacing(4)
-
-        spinbox = self._head_magnet_position_spinbox = QSpinBox()
-        add_cmd_widget(spinbox)
-        spinbox.setValue(0)
-        spinbox.setMaximum(100)
-        spinbox.setWrapping(False)
-        button = self._head_magnet_move_button = QPushButton("Move")
-        add_cmd_widget(button)
-        def head_magnet_intensity_updated():
-            self._hardware_model.update_head_magnet_intensity(self._head_magnet_position_spinbox.value())
-        button.clicked.connect(lambda: log_hardware_cmd(head_magnet_intensity_updated))
-
-        right_layout = QHBoxLayout()
-        right_layout.setSpacing(4)
-        right_layout.addWidget(self._head_magnet_position_spinbox)
-        right_layout.addWidget(self._head_magnet_move_button)
-        self._head_magnet_row_label = QLabel("Head magnet intensity (%):")
-        form_layout.addRow(self._head_magnet_row_label, right_layout)
-
-        layout.addLayout(form_layout, 1, 0)
 
         def set_xyz(coord: str):
             value = getattr(self, f"_{coord}_pos").value()
@@ -295,7 +261,6 @@ class HardwareControlContent(ContentWidget):
         app_model.behavior.algorithm.property_changed += self._on_algo_property_changed
         app_model.property_changed += self._on_app_model_property_changed
         self._hardware_model.property_changed += self._on_hardware_model_property_changed
-        self._update_tunnel_headfix_visibility(self._hardware_model.tunnel_headfix_enabled)
 
     @invoke_method
     def set_is_capture_active(self, is_active: bool):
@@ -331,9 +296,6 @@ class HardwareControlContent(ContentWidget):
             widget.blockSignals(False)
 
         self.update()
-
-    def _update_head_magnet_position(self):
-        self._hardware_model.update_head_magnet_intensity(self._head_magnet_position_spinbox.value())
 
     def _update_motor_feedback(self):
         position = self._hardware_model.last_position
@@ -373,17 +335,6 @@ class HardwareControlContent(ContentWidget):
         else:
             self._card_widget.header.setTitle("Hardware Control")
 
-    def _update_tunnel_headfix_visibility(self, is_enabled: bool):
-        for widget in (
-            self._tunnel_version_label,
-            self._tunnel_version,
-            self._tunnel_section_label,
-            self._head_magnet_row_label,
-            self._head_magnet_position_spinbox,
-            self._head_magnet_move_button,
-        ):
-            widget.setVisible(is_enabled)
-
     def set_commands_enabled(self, enabled: bool = True):
         for widget in self._commands_widgets:
             widget.setEnabled(enabled)
@@ -396,17 +347,7 @@ class HardwareControlContent(ContentWidget):
 
     @invoke_method
     def _on_hardware_model_property_changed(self, property_name: str, value, _):
-        if property_name == HardwareModel.TUNNEL_VERSION_PROPERTY:
-            self._update_title(value)
-            if value:
-                self._tunnel_version.setText(value.replace("emulator", "").strip())
-            else:
-                self._tunnel_version.setText("(unknown version)")
-
-        elif property_name == HardwareModel.TUNNEL_HEADFIX_ENABLED:
-            self._update_tunnel_headfix_visibility(value)
-
-        elif property_name == HardwareModel.PELLET_VERSION_PROPERTY:
+        if property_name == HardwareModel.PELLET_VERSION_PROPERTY:
             self._update_title(value)
             if value:
                 self._pellet_version.setText(value.replace("emulator", "").strip())

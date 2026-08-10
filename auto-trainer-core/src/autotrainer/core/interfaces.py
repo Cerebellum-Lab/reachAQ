@@ -184,51 +184,14 @@ class PelletHardwareProtocol(Protocol):
     def set_auto_correct_motor_drift(self, enabled: bool):
         """Set autocorrect motor drift"""
 
-    def set_tunnel_fan_on(self) -> Optional[UUID]:
-        """Turn ON tunnel FAN"""
-
-    def set_tunnel_fan_off(self) -> Optional[UUID]:
-        """Turn OFF tunnel FAN"""
-
 
 class TunnelHardwareProtocol(Protocol):
+    """Empty compatibility type for the installed training package.
+
+    ReachAQ no longer implements or supplies tunnel/head-fix hardware. The
+    external training package still imports this type while accepting ``None``
+    for the corresponding attachment.
     """
-    Defines the expected set of commands and properties from the tunnel device that are used as part of the
-    behavior algorithm and state machine.
-    """
-
-    @property
-    def head_magnet_intensity(self) -> Optional[float]:
-        """
-        Return the current head magnet position.
-        """
-
-    def update_head_magnet_intensity(self, position: float) -> Optional[UUID]:
-        """
-        Request an update to the head magnet position.
-
-        Args:
-            position: The % position [0, 100] to set the head magnet.
-
-        Returns:
-            A token to expect from the device message handler when the request is complete.
-        """
-
-    def open_tunnel_gate(self) -> Optional[UUID]:
-        """
-        Request the tunnel gate to open.
-
-        Returns:
-            A token to expect from the device message handler when the request is complete.
-        """
-
-    def close_tunnel_gate(self) -> Optional[UUID]:
-        """
-        Request the tunnel gate to close.
-
-        Returns:
-            A token to expect from the device message handler when the request is complete.
-        """
 
 #
 
@@ -278,27 +241,6 @@ class BehaviorAlgorithmProtocol(ObservableObjectProtocol, Protocol):
     def pellet_hands_min_distance(self) -> float: ...
     @pellet_hands_min_distance.setter
     def pellet_hands_min_distance(self, value: float): ...
-
-    # autoclamp / headfix:
-    @property
-    def head_fixation_enabled(self) -> bool: ...
-    @head_fixation_enabled.setter
-    def head_fixation_enabled(self, value: bool): ...
-
-    @property
-    def auto_clamp_no_activity_release_delay(self) -> float: ...
-    @auto_clamp_no_activity_release_delay.setter
-    def auto_clamp_no_activity_release_delay(self, value: float): ...
-
-    @property
-    def auto_clamp_release_load_count(self) -> int: ...
-    @auto_clamp_release_load_count.setter
-    def auto_clamp_release_load_count(self, value: int): ...
-
-    @property
-    def baseline_intensity(self) -> float: ...
-    @baseline_intensity.setter
-    def baseline_intensity(self, value: float): ...
 
     @property
     def trial_reaches(self) -> List[ReachEvent]:

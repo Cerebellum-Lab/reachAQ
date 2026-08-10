@@ -1091,10 +1091,6 @@ class MainWindow(QMainWindow):
         action.setCheckable(True)
         action.triggered.connect(self._toggle_debug_view)
 
-        action = self.force_headbar_detector_action = QAction("HeadBar", self)
-        action.setCheckable(True)
-        action.triggered.connect(self._internal_set_force_headbar_detector)
-
         action = self.pellet_seen_action = QAction("Pellet Seen", self)
         action.triggered.connect(self._internal_set_pellet_seen)
 
@@ -1344,16 +1340,6 @@ class MainWindow(QMainWindow):
             # plus:
             toolbar.setMaximumHeight(toolbar.minimumSizeHint().height())
 
-    def _update_tunnel_headfix_visibility(self, is_enabled: bool):
-        for action in (
-            self.force_headbar_detector_action,
-        ):
-            if not is_enabled and action.isChecked():
-                action.setChecked(False)
-            action.setVisible(is_enabled)
-        self._status_label_magnet_intensity.setVisible(is_enabled)
-        self.calib_diamond_triangle_action.setVisible(is_enabled)
-
     def _configure_statusbar(self):
         self._status_label = QLabel("")
         bar = self._status_bar = QStatusBar(self)
@@ -1369,14 +1355,10 @@ class MainWindow(QMainWindow):
         hbox.addWidget(_make_separator())
         lbl = self._status_label_send_pos = XYZQLabel(prefix="Send: ", sep=", ", tail=" mm")
         hbox.addWidget(lbl)
-        hbox.addWidget(_make_separator())
-        lbl = self._status_label_magnet_intensity = QLabel("Magnet: N/A")
-        hbox.addWidget(lbl)
         bar.addPermanentWidget(widget)
         self.setStatusBar(bar)
         status_log_handler = self._status_log_handler = StatusLogHandler(self._show_logged_error)
         logging.getLogger().addHandler(status_log_handler)
-        self._update_tunnel_headfix_visibility(self._app_model.hardware.tunnel_headfix_enabled)
 
     def _show_logged_error(self, message: str) -> None:
         self.statusBar().showMessage(message, 15000)
@@ -1450,10 +1432,6 @@ class MainWindow(QMainWindow):
             )
             inference._intersession_process_execute = partial(self._simulate_intersession_process, fake_result=res)
 
-    def _internal_set_force_headbar_detector(self):
-        logger.warning("Headbar detector simulation is not available in reachAQ")
-        self.force_headbar_detector_action.setChecked(False)
-
     def _internal_set_pellet_seen(self):
         self._app_model.behavior.algorithm.update_pellet_seen(True)
 
@@ -1492,7 +1470,6 @@ class MainWindow(QMainWindow):
         sess_sleep: float = 0.5,
         rand_mouse_seen: float = 1,
         rand_hands_near_pellet: float = 1,
-        rand_headfix_trigger = 0.5,
         wait_released: bool=True,
         print: Callable[[str], None] = lambda s: logger.info(s),  # for interactive logs output
     ):
@@ -1505,7 +1482,6 @@ class MainWindow(QMainWindow):
         for sess_idx in range(n_sessions):
             if algo.status != BehaviorAlgoStatus.ANIMAL_IN_TRAINING:
                 return
-            set_headfix = False
             print("starting new simulate session")
             app.start_recording()
             do_sleep()
@@ -1516,25 +1492,9 @@ class MainWindow(QMainWindow):
                     print(f"awaited RECORDING but is still {algo.capture_status}")
                     break
             for idx in range(n_trials):
-                set_headfix = False
-                if random.random() <= rand_headfix_trigger:
-                    # self.force_headbar_detector_action.setChecked(True)
-                    set_headfix = True
-                    do_sleep()
-                    for _ in range(random.randint(1, 3)):
-                        print("setting headfix trigger")
-                        # self.force_headbar_detector_action.toggle()
-                        self.force_headbar_detector_action.trigger()
-                        for _ in range(2):
-                            do_sleep()
-                            algo.update_mouse_seen()
-                        do_sleep()
                 print("wait monitoring")
                 t_end = time.perf_counter() + 15
                 while pellet_m.state != PelletState.monitoring:
-                    if algo.head_fixation_enabled:
-                        # new autoclamp
-                        break
                     if algo.status != BehaviorAlgoStatus.ANIMAL_IN_TRAINING:
                         return
                     time.sleep(0.1)
@@ -1548,21 +1508,11 @@ class MainWindow(QMainWindow):
                     print("setting mouse seen")
                     algo.update_mouse_seen()
                     do_sleep()
-                else:
-                    set_headfix = False
                 if random.random() <= rand_hands_near_pellet:
                     print("setting mouse near pellet")
                     self.mouse_near_pellet_action.toggle()
                     self.mouse_near_pellet_action.trigger()
                     do_sleep()
-                if set_headfix:
-                    for _ in range(2):
-                        # self.force_headbar_detector_action.toggle()
-                        self.force_headbar_detector_action.trigger()
-                        for _ in range(2):
-                            do_sleep()
-                            algo.update_mouse_seen()
-                        do_sleep()
                 if wait_released:
                     print("waiting released")
                     t_end = time.perf_counter() + 3
@@ -1857,15 +1807,9 @@ class MainWindow(QMainWindow):
     @invoke_method
     def _on_hardware_property_changed(self, property_name: str, value, _):
         hard = self._app_model.hardware
-        if property_name == hard.HEAD_MAGNET_INTENSITY:
-            if value is None:
-                value = math.nan
-            self._status_label_magnet_intensity.setText(f"Magnet: {value:.1f}%")
-        elif property_name in {hard.POS_XYZ, hard.SEND_X, hard.SEND_Y, hard.SEND_Z}:
+        if property_name in {hard.POS_XYZ, hard.SEND_X, hard.SEND_Y, hard.SEND_Z}:
             self._status_label_pos.update_coordinate(hard.last_dcs_position)
             self._status_label_send_pos.update_coordinate(hard.last_dcs_set_position)
-        elif property_name == hard.TUNNEL_HEADFIX_ENABLED:
-            self._update_tunnel_headfix_visibility(value)
 
     @invoke_method
     def _set_training_plans(self, plans: List[PlanInfo]):
