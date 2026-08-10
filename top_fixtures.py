@@ -49,6 +49,17 @@ repo_root_tests_subdir = repo_root_dir.joinpath("tests")
 fake_perf_now = 0  # used to control time.perf_counter() in BehaviorAlgo/SystemMachine/PelletMachine/Intersession
 
 
+@pytest.fixture(autouse=True)
+def isolate_host_can(monkeypatch):
+    """Never let an automated test control the workstation's SocketCAN link."""
+    monkeypatch.setenv("AUTOTRAINER_CAN_TRANSPORT", "emulation")
+    monkeypatch.setattr(
+        HardwareModel,
+        "_reset_socketcan",
+        lambda self, transport: None,
+    )
+
+
 def simulate_get_perf_now():
     global fake_perf_now
     fake_perf_now += 1e-9  # convenience, so that any call to it will get a different value than the previous

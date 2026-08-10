@@ -6,6 +6,7 @@ from autotrainer.behavior import BehaviorAlgorithm
 from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
 from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
 from autotrainer.core import SystemConfiguration, CameraConfiguration, CameraId
+from autotrainer.core.logging import unregister_fatal_exception_callback
 from autotrainer.device import MotorConfigurationFile, CompoundMovements
 
 from tools.acquisition.model.app_model import AppModel
@@ -61,4 +62,11 @@ def app_model(mock_system, user_pref, calib_dir, diamond_config_path, system_con
         system_message_handler=fake_system_msg_handler,
         calib_dir=calib_dir,
     )
-    return app
+    try:
+        yield app
+    finally:
+        # Most tests use mocked worker lifecycles and cannot safely call the
+        # full AppModel.on_close(). Still unregister the process-global fatal
+        # callback so one later test exception cannot fan out across every
+        # AppModel created earlier in the pytest process.
+        unregister_fatal_exception_callback(app._on_fatal_exception)

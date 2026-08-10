@@ -1,8 +1,18 @@
 import threading
+import os
 from unittest import mock
 
 from autotrainer.core import SystemCommandKind
+from autotrainer.device import CanTransportConfiguration, CanTransportKind
 from tools.acquisition.model.hardware_model import HardwareModel
+
+
+def test_test_harness_forces_can_emulation():
+    assert os.environ["AUTOTRAINER_CAN_TRANSPORT"] == "emulation"
+    assert (
+        CanTransportConfiguration.from_environment().kind
+        is CanTransportKind.EMULATION
+    )
 
 
 def test_safety_shutdown_is_idempotent_and_disconnects_before_reset():
