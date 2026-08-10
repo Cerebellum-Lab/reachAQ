@@ -29,10 +29,6 @@ class RecordingEndingReason(str, enum.Enum):
     PROTOCOL_COMPLETE = "ProtocolComplete"
     STOP_DRAIN_TIMEOUT = "StopDrainTimeout"
     ALGO_PAUSED = "AlgoPaused"
-    EXIT_TUNNEL = "ExitTunnel"
-    PELLET_LOADING = "PelletLoading"
-    MISSING_ANIMAL_ACTIVITY_TIMEOUT = "MissingAnimalActivityTimeout"
-    MOTOR_DRIFT_HOMING = "MotorDriftHoming"
 
 
 class CaptureAnalysisResult(str, enum.Enum):
@@ -256,13 +252,13 @@ class BehaviorAlgorithmProtocol(ObservableObjectProtocol, Protocol):
     session_starting_before_record_start: BehaviorAlgoEvents.session_starting_before_record_start
 
     session_starting: BehaviorAlgoEvents.session_starting
-    """Emitted when a new trial recording starts"""
+    """Emitted when a new recording session starts"""
 
     session_capture_ending: BehaviorAlgoEvents.session_capture_ending
-    """Emitted when a new trial recording ends"""
+    """Emitted when recording for the current session ends"""
 
     session_ending: BehaviorAlgoEvents.session_ending
-    """Emitted when a trial "full session" ended, this can have analysis processed or not"""
+    """Emitted when a session and its optional post-session analysis have ended"""
 
     pellets_presented_evt: BehaviorAlgoEvents.pellets_presented_evt
     """When a pellet is "presented" ; i.e: when it's arrived at deliver/send position"""

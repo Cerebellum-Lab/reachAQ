@@ -794,7 +794,7 @@ class CanInterface(DeviceInterface):
 
         Args:
             typeof: Class name to look for
-            target: Source target (Pellet or Magnet)
+            target: Source board target
             motor: Optional motor to check against too
             timeout: Maximum time to wait (sec). Default=2.0
         """

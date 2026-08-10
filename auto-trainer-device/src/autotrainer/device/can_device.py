@@ -922,7 +922,7 @@ class CanDevice(Device):
         self._commands_handler_thread = thread  # only assign after start
         thread = self._pellet_status_check_thread
         if thread is not None and thread.is_alive():
-            logger.debug("TunnelPelletStatus check thread already alive")
+            logger.debug("PelletStatus check thread already alive")
         else:
             thread = threading.Thread(target=self._check_pellet_status_age, name="CheckPelletStatus", daemon=True)
             thread.start()

@@ -175,7 +175,7 @@ class PreferencesContent(QWidget):
         analysis_layout.addWidget(QLabel("Live inference:"))
         toggle = self._inference_enabled_toggle = QSwitch()
         toggle.setToolTip(
-            "Enables real-time pose inference during live trials. Requires a CUDA-capable NVIDIA GPU, "
+            "Enables real-time pose inference during live preview and recording sessions. Requires a CUDA-capable NVIDIA GPU, "
             "the proprietary NVIDIA driver, and a working TensorFlow GPU runtime."
         )
         toggle.setChecked(app_model.inference.is_enabled)
@@ -327,9 +327,9 @@ class PreferencesContent(QWidget):
         cur_row += 1
         #
         shift_xyz_cfg = algo.active_config.shift_xyz_handler
-        left_grid_layout.addWidget(QLabel("<b>Intertrial Pellet Shift:</b>"), cur_row, cur_col)
+        left_grid_layout.addWidget(QLabel("<b>Post-session Pellet Shift:</b>"), cur_row, cur_col)
         toggle = self._intersession_pellet_shift_toggle = QSwitch()
-        toggle.setToolTip("Enables adjustment of the pellet delivery position based on post trial reach analysis.")
+        toggle.setToolTip("Adjust the next session's pellet delivery position from post-session reach analysis.")
         add_enabled_state(lambda t=toggle: t.setEnabled(self._inference_enabled_toggle.isChecked()))
         toggle.setChecked(algo.intersession_pellet_shift_enabled)
         def allow_intersession_shift_toggle_state_changed(x: int):

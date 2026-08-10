@@ -64,7 +64,6 @@ class DebugView(QDialog):
             "n_trials=1, "
             "rand_mouse_seen=1, "
             "rand_hands_near_pellet=1, "
-            "rand_headfix_trigger=0.75, "
             "print=print,"
             ")\n"
         ))

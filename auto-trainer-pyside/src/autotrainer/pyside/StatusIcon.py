@@ -48,13 +48,3 @@ class StatusIcon(QLabel):
             (self._on if in_use else self._on_disabled) if status
             else (self._off if in_use else self._off_disabled)
         )
-
-    @staticmethod
-    def alarmIcon(size: int = 18, parent=None, name: str="NA"):
-        return StatusIcon(on_icon='fa5s.bell', off_icon='fa5s.bell', on_color='red', off_color='gray', size=size,
-                          parent=parent, name=name)
-
-    @staticmethod
-    def doorIcon(size: int = 18, parent=None, name: str="NA"):
-        return StatusIcon(on_icon='fa5s.door-open', off_icon='fa5s.door-closed', on_color='red', off_color='black',
-                          size=size, parent=parent, name=name)

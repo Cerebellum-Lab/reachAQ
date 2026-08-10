@@ -1024,7 +1024,7 @@ class MainWindow(QMainWindow):
         self._diamond_triangle_calib_run = None
         self._timer_calibrate_diamond_triangle = no_op_timer
         action = self.calib_diamond_triangle_action = QAction(_toolbar_icon("fa5s.crosshairs"), "Calibrate Coordinate System", self)
-        action.setToolTip("Calibrate the relative offset between the pellet delivery spoon and the tunnel")
+        action.setToolTip("Calibrate the pellet delivery coordinate system from the diamond and triangle references")
         action.setCheckable(True)
         action.triggered.connect(self.on_calibrate_diamond_triangle)
         action.setEnabled(False)

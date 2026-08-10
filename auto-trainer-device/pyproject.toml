@@ -21,7 +21,7 @@ dependencies = [
 
     'pyyaml >= 6.0.2, < 7',
 
-    # CAN communication with pellet/tunnel boards:
+    # CAN communication with the pellet board:
     'pyjerrycan >= 1.2.5, < 2 ; platform_machine == "aarch64"',
     'python-can >= 4.5, < 5 ; platform_system == "Linux"',
 
