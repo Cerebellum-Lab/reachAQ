@@ -134,6 +134,65 @@ class PelletDeliveryConfiguration:
         ), skip_remaining=True))
 
 
+@dataclass
+class SessionControlConfiguration:
+    """Continuous recording and pellet-trial policy exposed to operators."""
+
+    automatic_pellet_cycles_enabled: bool = False
+    attempt_assignment: str = "retry_within_trial"
+    retry_settings: str = "reuse"
+    trial_count_basis: str = "completed"
+    counted_trial_outcomes: tuple = (
+        "success",
+        "failure",
+        "pellet_missing",
+    )
+    duration_limit_seconds: Optional[float] = None
+    trial_limit: Optional[int] = None
+    stop_on_protocol_complete: bool = False
+    stop_drain_timeout_seconds: float = 15.0
+
+    ATTEMPT_ASSIGNMENTS = (
+        "retry_within_trial",
+        "every_attempt_is_trial",
+        "successful_presentations_only",
+    )
+    RETRY_SETTINGS = ("reuse", "resample")
+    TRIAL_COUNT_BASES = ("started", "presented", "completed", "scored")
+    TRIAL_OUTCOMES = (
+        "success",
+        "failure",
+        "pellet_missing",
+        "incomplete",
+        "aborted",
+    )
+
+    def __post_init__(self):
+        self.counted_trial_outcomes = tuple(self.counted_trial_outcomes)
+        if self.attempt_assignment not in self.ATTEMPT_ASSIGNMENTS:
+            raise ValueError(
+                "Unknown attempt assignment policy: "
+                f"{self.attempt_assignment}"
+            )
+        if self.retry_settings not in self.RETRY_SETTINGS:
+            raise ValueError(f"Unknown retry settings policy: {self.retry_settings}")
+        if self.trial_count_basis not in self.TRIAL_COUNT_BASES:
+            raise ValueError(f"Unknown trial count basis: {self.trial_count_basis}")
+        unknown_outcomes = sorted(
+            set(self.counted_trial_outcomes) - set(self.TRIAL_OUTCOMES)
+        )
+        if unknown_outcomes:
+            raise ValueError(
+                "Unknown counted trial outcome(s): " + ", ".join(unknown_outcomes)
+            )
+        if self.duration_limit_seconds is not None and self.duration_limit_seconds <= 0:
+            raise ValueError("Recording duration limit must be positive")
+        if self.trial_limit is not None and self.trial_limit <= 0:
+            raise ValueError("Trial target must be positive")
+        if self.stop_drain_timeout_seconds <= 0:
+            raise ValueError("Stop drain timeout must be positive")
+
+
 class HeadClampReleaseMode(str, enum.Enum):
     ACTIVITY = "Activity"
     FIXED_DURATION = "Fixed duration"
@@ -192,6 +251,7 @@ class LEDAlarmConfig:
 @dataclass
 class _BehaviorConfiguration:
     pellet_delivery: PelletDeliveryConfiguration = field(default_factory=PelletDeliveryConfiguration)
+    session_control: SessionControlConfiguration = field(default_factory=SessionControlConfiguration)
     pellet_uncover: PelletUncoverConfiguration = field(default_factory=PelletUncoverConfiguration)
     shift_xyz_handler: ShiftXYZHandlerConfig = field(default_factory=ShiftXYZHandlerConfig)
     head_clamp: HeadClampConfiguration = field(default_factory=HeadClampConfiguration)
@@ -268,6 +328,7 @@ class BehaviorConfiguration(_BehaviorConfiguration):
 
 _tag_2_cls = dict(
     PelletDeliveryConfiguration=PelletDeliveryConfiguration,
+    SessionControlConfiguration=SessionControlConfiguration,
     PelletUncoverConfiguration=PelletUncoverConfiguration,
     HeadClampConfiguration=HeadClampConfiguration,
     HeadbarPressureConfiguration=HeadbarPressureConfiguration,

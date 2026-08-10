@@ -105,7 +105,11 @@ SystemConfigurationDumper.add_representer(Offset3DTuple, repr_offset3d_tuple)
 # above must be before below
 
 
-from .behavior_configuration import BehaviorConfiguration, ShiftXYZTarget
+from .behavior_configuration import (
+    BehaviorConfiguration,
+    SessionControlConfiguration,
+    ShiftXYZTarget,
+)
 from .camera_configuration import CameraConfiguration, CameraId
 from .hardware_configuration import HardwareConfiguration
 from .inference_configuration import InferenceConfiguration
