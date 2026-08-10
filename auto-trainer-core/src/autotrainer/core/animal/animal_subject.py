@@ -47,7 +47,7 @@ class AnimalTraining:
 class _AnimalSubject:
     """A subject in an animal experiment."""
 
-    version: int = 4
+    version: int = 5
 
     name: str = ""
     id: str = None   # handled in post_init
@@ -63,24 +63,24 @@ class _AnimalSubject:
 
     autoclamp_evasion_pellets_consumed: int = 0
 
+    _legacy_v4_path: Optional[Path] = dataclasses.field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _legacy_v4_content: Optional[bytes] = dataclasses.field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+
     def __post_init__(self):
         if self.id is None:
             self.id = str(uuid.uuid4())
         if not self.name:
             self.name = f"Mouse-{self.id}"
-
-    @classmethod
-    def _load_old_format(cls, data: Dict[str, Any]) -> Self:
-        kw = {}
-        if "name" in data:
-            kw['name'] = data["name"]
-        animal = cls(**kw)
-        if "pellet_x" in data and "pellet_y" in data and "pellet_z" in data:
-            animal.pellet_x = data["pellet_x"]
-            animal.pellet_y = data["pellet_y"]
-            animal.pellet_z = data["pellet_z"]
-        return animal
-
 
 @dataclass
 class AnimalSubject(_AnimalSubject):
@@ -92,56 +92,101 @@ class AnimalSubject(_AnimalSubject):
     def __repr__(self):
         return f"{self.__class__.__name__}(name={self.name!r}, id={self.id!r})"
 
+    @staticmethod
+    def _rename_progress_count(value, *, to_persisted: bool):
+        if isinstance(value, list):
+            return [
+                AnimalSubject._rename_progress_count(
+                    item,
+                    to_persisted=to_persisted,
+                )
+                for item in value
+            ]
+        if not isinstance(value, dict):
+            return value
+        source = "session_count" if to_persisted else "trial_count"
+        target = "trial_count" if to_persisted else "session_count"
+        return {
+            (target if key == source else key): AnimalSubject._rename_progress_count(
+                item,
+                to_persisted=to_persisted,
+            )
+            for key, item in value.items()
+        }
+
+    @classmethod
+    def _from_v4(cls, data: Dict[str, Any]) -> Self:
+        if "id" not in data:
+            raise ValueError("Animal v4 requires an id; older no-id files are unsupported")
+        reach = data.get("reach")
+        if not isinstance(reach, dict):
+            raise ValueError("Animal v4 requires reach coordinates")
+        pellet_dcs = reach.get("pelletDcs")
+        position = pellet_dcs or reach.get("pelletDevice")
+        if not isinstance(position, dict):
+            raise ValueError("Animal v4 requires pelletDcs or pelletDevice coordinates")
+        training = data.get("training") or {}
+        # Recording-count progress cannot be converted to pellet-trial progress.
+        return cls(
+            id=data["id"],
+            name=data["name"],
+            is_pellet_dcs=pellet_dcs is not None,
+            target_y_limit=data.get("targetYLimit"),
+            pellet_x=position["x"],
+            pellet_y=position["y"],
+            pellet_z=position["z"],
+            training=AnimalTraining(
+                current_protocol=training.get("currentProtocol"),
+                protocols=[],
+            ),
+        )
+
+    @classmethod
+    def _from_v5(cls, data: Dict[str, Any]) -> Self:
+        pellet = data["pellet"]
+        position = pellet["position"]
+        training = data.get("training") or {}
+        limits = data.get("limits") or {}
+        protocol_progress = cls._rename_progress_count(
+            training.get("protocolProgress", []),
+            to_persisted=False,
+        )
+        return cls(
+            id=data["id"],
+            name=data["name"],
+            is_pellet_dcs=pellet["coordinateSpace"] == "dcs",
+            target_y_limit=limits.get("targetY"),
+            pellet_x=position["x"],
+            pellet_y=position["y"],
+            pellet_z=position["z"],
+            training=AnimalTraining(
+                current_protocol=training.get("selectedProtocol"),
+                protocols=protocol_progress,
+            ),
+        )
+
     @classmethod
     def from_file(cls: Type[Self], file_path: Path) -> Optional[Self]:
-        with file_path.open("r") as file:
-            try:
-                data = json.load(file)
-                if not isinstance(data, dict):
-                    if not data:
-                        # assuming empty file
-                        return cls()
-                    raise ValueError(f"Invalid file format in {file_path} ; not a dict: %s", type(data))
-                file_version = data.get("version", None)
-                if file_version is None or file_version != AnimalSubject.version:
-                    logger.notice("Loaded animal version %s vs current Animal version %s",
-                                   file_version, AnimalSubject.version)
-                if "id" not in data:
-                    # old format
-                    return cls._load_old_format(data)
-                # new "id" format:
-                reach = data.pop('reach')
-                pellet_dev = reach.pop('pelletDevice', None)
-                pellet_dcs = reach.pop('pelletDcs', None)
-                if pellet_dcs is None:
-                    src = pellet_dev
-                else:
-                    src = pellet_dcs
-                pellet_x, pellet_y, pellet_z = src['x'], src['y'], src['z']
-                training = data.pop('training')
-                # Removed in v4. Continue accepting v3 animal files without
-                # carrying accumulated day/lifetime counts into the new model.
-                data.pop("pelletCountsDay", None)
-                data.pop("pelletCountsTotal", None)
-                data.pop("pelletCountsDayDate", None)
-                autoclamp_evasion_pellets_consumed = data.pop("autoclampEvasionPelletsConsumed", 0)
-                animal = cls(
-                    id=data.pop('id'),
-                    name=data.pop('name'),
-                    is_pellet_dcs=pellet_dcs is not None,
-                    target_y_limit=data.pop('targetYLimit', None),
-                    pellet_x=pellet_x,
-                    pellet_y=pellet_y,
-                    pellet_z=pellet_z,
-                    training=AnimalTraining(
-                        current_protocol=training.pop('currentProtocol'),
-                        protocols=training.pop('protocols'),
-                    ),
-                    autoclamp_evasion_pellets_consumed=autoclamp_evasion_pellets_consumed,
-                )
-            except Exception as err:
-                logger.error("Error loading animal subject from %s: %s", file_path, err)
-                return None
+        original = file_path.read_bytes()
+        data = json.loads(original)
+        if not isinstance(data, dict):
+            raise ValueError(f"Invalid animal file {file_path}: expected an object")
+        file_version = data.get("version")
+        if file_version == 4:
+            animal = cls._from_v4(data)
+            animal._legacy_v4_path = file_path.resolve()
+            animal._legacy_v4_content = original
+            logger.notice(
+                "Loaded animal v4 for one-way migration to v5; protocol "
+                "recording-count progress was reset"
+            )
+        elif file_version == cls.version:
+            animal = cls._from_v5(data)
+        else:
+            raise ValueError(
+                f"Unsupported animal schema version {file_version!r} in "
+                f"{file_path}; only v4 migration and v5 are supported"
+            )
 
         logger.debug("loaded animal id=%r name=%r pellet=%s is_dcs=%s current_protocol=%s",
                      animal.id, animal.name,
@@ -166,28 +211,47 @@ class AnimalSubject(_AnimalSubject):
         )
 
     def to_file(self, file_path: Path):
-        reach: Dict[str, Any] = {}
-        key = "pelletDcs" if self.is_pellet_dcs else "pelletDevice"
-        reach[key] = {
-            'x': self.pellet_x,
-            'y': self.pellet_y,
-            'z': self.pellet_z,
-        }
         data = {
             "version": self.version,
             "id": self.id,
             "name": self.name,
-            "reach": reach,
-            "training": {
-                'currentProtocol': self.training.current_protocol,
-                'protocols': self.training.protocols,
+            "pellet": {
+                "coordinateSpace": "dcs" if self.is_pellet_dcs else "device",
+                "position": {
+                    "x": self.pellet_x,
+                    "y": self.pellet_y,
+                    "z": self.pellet_z,
+                },
             },
-            "targetYLimit": self.target_y_limit,
-            "autoclampEvasionPelletsConsumed": self.autoclamp_evasion_pellets_consumed,
+            "training": {
+                "selectedProtocol": self.training.current_protocol,
+                "protocolProgress": self._rename_progress_count(
+                    self.training.protocols,
+                    to_persisted=True,
+                ),
+            },
+            "limits": {
+                "targetY": self.target_y_limit,
+            },
         }
         xyz = Offset3DTuple(self.pellet_x, self.pellet_y, self.pellet_z)
         logger.debug("Saving %s to %s ; xyz=%s", self.name, file_path.as_posix(), xyz.humanize())
         file_path.parent.mkdir(parents=True, exist_ok=True)
+        if (
+            self._legacy_v4_content is not None
+            and self._legacy_v4_path == file_path.resolve()
+        ):
+            backup_path = file_path.with_suffix(file_path.suffix + ".v4-backup")
+            if not backup_path.exists():
+                with NamedTemporaryFile(
+                    "wb",
+                    delete=False,
+                    dir=file_path.parent,
+                ) as backup:
+                    backup.write(self._legacy_v4_content)
+                os.replace(backup.name, backup_path)
         with NamedTemporaryFile("w", delete=False, dir=file_path.parent) as fh:
             json.dump(data, fh, indent=4)
         os.replace(fh.name, file_path)
+        self._legacy_v4_path = None
+        self._legacy_v4_content = None
