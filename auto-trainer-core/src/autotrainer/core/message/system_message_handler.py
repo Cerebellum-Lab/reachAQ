@@ -2,9 +2,7 @@ import functools
 import logging
 import threading
 from queue import Queue
-from typing import Callable, List, Tuple, Optional
-
-from ..analysis.sensor_analysis import SensorAnalysis
+from typing import Callable, List, Tuple
 
 from .message_handler import MessageHandler
 from .system_status_message import SystemStatusMessageKind
@@ -14,13 +12,11 @@ logger = logging.getLogger(__name__)
 
 class SystemMessageHandler(MessageHandler):
 
-    def __init__(self, input_queue: Queue, *, sensor_analysis: Optional[SensorAnalysis] = None):
+    def __init__(self, input_queue: Queue):
         super().__init__(input_queue, name="system-message-handler")
 
         self._measurement_callback = None
         self._audio_callback = None
-
-        self._analysis = SensorAnalysis() if sensor_analysis is None else sensor_analysis
 
     @property
     def measurement_callback(self):
@@ -41,22 +37,16 @@ class SystemMessageHandler(MessageHandler):
             logger.info("Replacing audio callback %s with %s", prev, audio_callback)
         self._audio_callback = audio_callback
 
-    @property
-    def analysis(self):
-        return self._analysis
-
     def message_received(self, msg, data):
         # TODO: These are treated as if the property has changed.  If the number of event listeners increases or their
         #  behaviors are complex and do not check for change themselves, this could become a bottleneck.  This could be
         #  updated to store previous values and only notify listeners on change, like a typical ObservableObject
         #  implementation.  Keeping things simple for the time being.
         if msg == SystemStatusMessageKind.MEASUREMENT or msg == SystemStatusMessageKind.MEASUREMENTS:
-            measures = self._analysis.measurements_received(data)
-            if self._measurement_callback is not None and len(measures) > 0:
-                self._measurement_callback(measures)
+            if self._measurement_callback is not None and len(data) > 0:
+                self._measurement_callback(data)
 
         elif msg == SystemStatusMessageKind.AUDIO_SPECTRUM:
-            self._analysis.audio_spectrum_received(data)
             if self._audio_callback is not None:
                 self._audio_callback(data.magnitudes)
 
@@ -100,15 +90,9 @@ class SystemMessageHandler(MessageHandler):
             self.property_changed(MessageHandler.TUNNEL_FAN_PROPERTY, data, None)
 
         elif msg == SystemStatusMessageKind.FRONT_DOOR:
-            # directly update related monitor, hopefully is very fast
-            if self._analysis.alarms:
-                self._analysis.external_doors_alarm.update_door_state(msg, data)
             self.property_changed(MessageHandler.FRONT_DOOR_PROPERTY, data, None)
 
         elif msg == SystemStatusMessageKind.DRAWER_DOOR:
-            # directly update related monitor, hopefully is very fast
-            if self._analysis.alarms:
-                self._analysis.external_doors_alarm.update_door_state(msg, data)
             self.property_changed(MessageHandler.DRAWER_DOOR_PROPERTY, data, None)
 
         elif msg == SystemStatusMessageKind.SPARE_DOOR:

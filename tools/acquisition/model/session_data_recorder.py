@@ -40,7 +40,6 @@ class SessionDataRecorder:
 
     def __init__(
         self,
-        analysis,
         nidaq_monitor,
         laser_model,
         *,
@@ -48,7 +47,6 @@ class SessionDataRecorder:
         hardware_model=None,
         device_event_capacity: int = 100_000,
     ):
-        self._analysis = analysis
         self._nidaq_monitor = nidaq_monitor
         self._laser_model = laser_model
         self._lock = threading.RLock()

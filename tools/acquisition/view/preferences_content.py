@@ -177,14 +177,8 @@ class PreferencesContent(QWidget):
     def _create_behavior_tab(self):
         app_model = self._app_model
         behavior = app_model.behavior
-        analysis = behavior.analysis
         algo = behavior.algorithm
-        tunnel_headfix_enabled = app_model.hardware.tunnel_headfix_enabled
-        if not tunnel_headfix_enabled:
-            algo.head_fixation_enabled = False
-            algo.active_config.head_clamp.enabled = False
-            analysis.auto_tunnel_sweep_monitor.config.enabled = False
-            analysis.auto_tunnel_sweep_monitor.stop()
+        tunnel_headfix_enabled = False
 
         states_refresh = []
         add_enabled_state = states_refresh.append
@@ -489,6 +483,16 @@ class PreferencesContent(QWidget):
         left_grid_layout.addWidget(spinbox, cur_row, cur_col + 1)
         cur_row += 1
         #
+        # Tunnel/head-fix controls were removed from reachAQ. Keep this page
+        # focused on pellet automation, inference, and calibration behavior.
+        refresh_enabled_states()
+        grids_hbox_layout.addLayout(left_grid_layout)
+        main_layout.addLayout(grids_hbox_layout)
+        tab = QWidget()
+        tab.setLayout(main_layout)
+        apply_size_policy(tab, (QSwitch, QSpinBox, QDoubleSpinBox))
+        return tab
+
         # right part:
         right_grid_layout = QGridLayout()
         right_grid_layout.setContentsMargins(2, 6, 0, 0)

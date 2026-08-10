@@ -30,7 +30,7 @@ def test_inactive_session_log_handler_does_not_consume_the_runtime_clock(
     monkeypatch,
 ):
     laser = _EventSource("trace_received")
-    recorder = SessionDataRecorder(_EventSource(), object(), laser)
+    recorder = SessionDataRecorder(object(), laser)
     monkeypatch.setattr(
         session_data_recorder.time,
         "perf_counter",
@@ -43,12 +43,10 @@ def test_inactive_session_log_handler_does_not_consume_the_runtime_clock(
 
 
 def test_structured_device_ledger_captures_decoded_input_and_output():
-    analysis = _EventSource()
     handler = _EventSource("decoded_message_received")
     hardware = _EventSource("device_event")
     laser = _EventSource("trace_received")
     recorder = SessionDataRecorder(
-        analysis,
         object(),
         laser,
         system_message_handler=handler,
@@ -104,7 +102,6 @@ def test_device_events_are_buffered_before_record_is_armed():
     handler = _EventSource("decoded_message_received")
     laser = _EventSource("trace_received")
     recorder = SessionDataRecorder(
-        _EventSource(),
         object(),
         laser,
         system_message_handler=handler,
@@ -124,9 +121,8 @@ def test_device_events_are_buffered_before_record_is_armed():
 
 
 def test_laser_output_state_is_preserved_as_a_structured_event():
-    analysis = _EventSource()
     laser = _EventSource("trace_received")
-    recorder = SessionDataRecorder(analysis, object(), laser)
+    recorder = SessionDataRecorder(object(), laser)
     recorder._armed = True
     try:
         laser.trace_received(SimpleNamespace(

@@ -21,7 +21,8 @@ import verboselogs
 import autotrainer.core
 from autotrainer.behavior.behavior_algorithm import BehaviorAlgoStatus
 
-from autotrainer.core import EventManager, SensorAnalysis, MessageHandler, SystemMessageHandler, ProjectInfo
+from autotrainer.core import EventManager, MessageHandler, SystemMessageHandler, ProjectInfo
+from autotrainer.core.analysis import ReachAnalysis
 from autotrainer.core.multiproc import make_daemon_timer, DaemonTimer
 from autotrainer.device import MotorConfigurationFile, CompoundMovements
 from autotrainer.inference.analysis import IntersessionResponse
@@ -287,8 +288,8 @@ def system_msg_queue():
 
 
 @pytest.fixture
-def sensor_analysis(mock_get_perf_now) -> SensorAnalysis:
-    s = SensorAnalysis()
+def sensor_analysis(mock_get_perf_now) -> ReachAnalysis:
+    s = ReachAnalysis()
     try:
         yield s
     finally:
@@ -298,7 +299,7 @@ def sensor_analysis(mock_get_perf_now) -> SensorAnalysis:
 @pytest.fixture
 def system_msg_handler(system_msg_queue, sensor_analysis):
     # Unused
-    handler = SystemMessageHandler(system_msg_queue, sensor_analysis=sensor_analysis)
+    handler = SystemMessageHandler(system_msg_queue)
     handler.start()
     try:
         yield handler
@@ -321,8 +322,8 @@ class FakeMsgQueue:
 
 class FakeSystemMsgHandler(SystemMessageHandler):
 
-    def __init__(self, input_queue, *, sensor_analysis):
-        super().__init__(input_queue, sensor_analysis=sensor_analysis)
+    def __init__(self, input_queue):
+        super().__init__(input_queue)
 
     def start(self):
         pass
@@ -341,11 +342,11 @@ def fake_msg_queue():
 
 @pytest.fixture
 def fake_system_msg_handler(fake_msg_queue, sensor_analysis):
-    return FakeSystemMsgHandler(fake_msg_queue, sensor_analysis=sensor_analysis)
+    return FakeSystemMsgHandler(fake_msg_queue)
 
 
 @pytest.fixture
-def machine(project_info, tunnel_device, pellet_device, inference, sensor_analysis, monkeypatch, mock_get_perf_now, fake_system_msg_handler) -> SystemMachine:
+def machine(project_info, pellet_device, inference, sensor_analysis, monkeypatch, mock_get_perf_now, fake_system_msg_handler) -> SystemMachine:
     # Disable algo handler thread
     assert BehaviorAlgorithm._no_handler_thread is False
     monkeypatch.setattr(BehaviorAlgorithm, "_no_handler_thread", True)
@@ -356,7 +357,6 @@ def machine(project_info, tunnel_device, pellet_device, inference, sensor_analys
     inference.project = project_info
     #
     machine = SystemMachine(
-        tunnel_device=tunnel_device,
         pellet_device=pellet_device,
         analysis=sensor_analysis,
         inference=inference,
@@ -615,7 +615,7 @@ def mock_system(machine) -> MockSystemMachine:
 
 @pytest.fixture
 def hardware_model(fake_system_msg_handler, sensor_analysis) -> HardwareModel:
-    return HardwareModel(fake_system_msg_handler, sensor_analysis=sensor_analysis)
+    return HardwareModel(fake_system_msg_handler)
 
 
 @pytest.fixture

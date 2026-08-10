@@ -1,23 +1,17 @@
-import dataclasses
 import math
-from functools import partial
 from typing import Optional
 
 from transitions import Machine
 
 from autotrainer.api import ApiEventKind
 
-from autotrainer.core import (ProjectInfo, SensorAnalysis, Offset3DTuple,
-                              HeadbarPressureMonitor, transitions_allow_functions, SystemMessageHandler, get_perf_now)
+from autotrainer.core import (ProjectInfo, Offset3DTuple,
+                              transitions_allow_functions, SystemMessageHandler, get_perf_now)
+from autotrainer.core.analysis import ReachAnalysis
 from autotrainer.core.logging import get_verbose_logger
 from autotrainer.core.interfaces import (CaptureAnalysisResult, RecordingEndingReason)
 from autotrainer.core.pose_elements import SceneElement, AllHandsParts
-from autotrainer.core.multiproc import make_daemon_timer, no_op_timer
-from autotrainer.core.analysis.detector import BaseDetector
 from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
-from autotrainer.core.configuration.behavior_configuration import (
-    HeadClampReleaseMode,
-)
 
 from autotrainer.inference import PoseResponse, InferenceCommandMessageKind
 from autotrainer.inference.analysis import IntersessionResponse
@@ -31,17 +25,8 @@ from .pellet_device_protocol import PelletDeviceProtocol
 from .pellet_shift import ShiftXYZHandler
 from .state_machine import StateMachine
 from .system_machine_state import SystemState
-from .tunnel_device_protocol import TunnelDeviceProtocol
 
 logger = get_verbose_logger(__name__)
-
-# NB: this is to ensure we can patch the exact desired one (and only that one) from tests:
-_auto_clamp_release_timer = make_daemon_timer
-_check_missing_timer = make_daemon_timer
-_consider_disengage_autoclamp_timer = make_daemon_timer
-
-#
-
 
 class SystemMachine(StateMachine):
 
@@ -52,13 +37,11 @@ class SystemMachine(StateMachine):
     def __init__(self,
                  *,
                  msg_handler: SystemMessageHandler,
-                 analysis: SensorAnalysis,
-                 tunnel_device: TunnelDeviceProtocol,
+                 analysis: ReachAnalysis,
                  pellet_device: PelletDeviceProtocol,
                  inference: InferenceProtocol,
                  algorithm: Optional[BehaviorAlgorithm] = None,
                  project_info: Optional[ProjectInfo] = None,
-                 tunnel_headfix_enabled: bool = True,
                  ):
 
         initial_state = SystemState.cage
@@ -79,14 +62,6 @@ class SystemMachine(StateMachine):
         self._project_info = project_info
         self._aborted_session_ids = set()
         #
-        # todo: should probably make/use a state "Machine" for AutoClamp itself
-        self._auto_clamp_in_progress = False
-        self._auto_clamp_disengage_in_progress = False
-        self._timer_auto_clamp_evaluate = no_op_timer
-        self._timer_auto_clamp_disengage = no_op_timer
-        self._disengage_auto_clamp_load_count = 0
-        self._last_disengage_autoclamp_perf_c = -math.inf
-
         self._is_handling_diamond_triangle = False
 
         self._enter_tunnel_pellet_seen = False
@@ -94,8 +69,6 @@ class SystemMachine(StateMachine):
         self._session_started_perf_c = -math.inf
 
         self._pellet_device = pellet_device
-        self._tunnel_device = tunnel_device
-        self._tunnel_headfix_enabled = tunnel_headfix_enabled
         self._msg_handler = msg_handler
 
         algo = self._algorithm = BehaviorAlgorithm(
@@ -120,13 +93,7 @@ class SystemMachine(StateMachine):
 
         self._analysis = analysis
         if analysis is not None:
-            analysis.headbar_pressure_monitor.property_changed += self._on_headbar_pressure_monitor_property_changed
-            analysis.auto_tunnel_sweep_monitor.property_changed += self._on_auto_tunnel_sweep_property_changed
-            # analysis.pellet_misplaced_monitor.dcs_config = algo.diamond_triangle_config
-            #   handled by property changed.
-            # set current configs from monitors:
-            algo.active_config.auto_tunnel_sweep = analysis.auto_tunnel_sweep_monitor.config
-            # analysis.pellet_misplaced_monitor.config  # not in system config for now
+            analysis.pellet_misplaced_monitor.dcs_config = algo.diamond_triangle_config
 
         self._inference = inference
         inference.pose_response_ready += self._on_pose_changed
@@ -153,17 +120,10 @@ class SystemMachine(StateMachine):
         intersession_machine.events.state_changed += self._on_intersession_state_changed
 
     def cancel_timers(self):
-        for timer in (
-            self._timer_auto_clamp_disengage,
-            self._timer_auto_clamp_evaluate,
-        ):
-            if not timer.finished.is_set():
-                logger.debug("cancelling timer %s", timer)
-                timer.cancel()
-        self._timer_auto_clamp_disengage = no_op_timer
+        """Compatibility hook; ReachAQ has no head-fix timers."""
 
     @property
-    def analysis(self) -> SensorAnalysis:
+    def analysis(self) -> ReachAnalysis:
         return self._analysis
 
     @property
@@ -177,20 +137,6 @@ class SystemMachine(StateMachine):
     @property
     def intersession(self) -> IntersessionMachine:
         return self._intersession
-
-    @property
-    def tunnel_headfix_enabled(self) -> bool:
-        return self._tunnel_headfix_enabled
-
-    @tunnel_headfix_enabled.setter
-    def tunnel_headfix_enabled(self, value: bool):
-        prev, self._tunnel_headfix_enabled = self._tunnel_headfix_enabled, value
-        if prev != value:
-            logger.info("tunnel/headfix behavior enabled changed to: %s", value)
-        if not value:
-            self._timer_auto_clamp_evaluate.cancel()
-            self._timer_auto_clamp_disengage.cancel()
-            self._autoclamp_set_in_progress(False)
 
     @property
     def project(self) -> ProjectInfo:
@@ -209,36 +155,22 @@ class SystemMachine(StateMachine):
         return self._shift_xyz_handler
 
     def can_enter_tunnel(self, *, reason: str = "NA") -> bool:
-        if self._tunnel_headfix_enabled:
-            return True
-        logger.warning("Blocked enter_tunnel(%s): tunnel/headfix hardware is disabled", reason)
-        return False
+        return True
 
     def can_exit_intersession_to_tunnel(self) -> bool:
-        if self._tunnel_headfix_enabled:
-            return True
-        logger.warning("Blocked exit_intersession_to_tunnel: tunnel/headfix hardware is disabled")
-        return False
+        return True
 
     def before_enter_tunnel(self, *, reason: str = "NA"):
         pellet_state = self._pellet_machine.state
         self._enter_tunnel_pellet_seen = self._algorithm.pellet_recently_seen
-        logger.debug("before_enter_tunnel: reason=%s state=%s pellet_state=%s pellet_recently_seen=%s",
-                     reason, self._state, pellet_state, self._enter_tunnel_pellet_seen)
-        if self._state == SystemState.cage:
-            self._event_manager.post_event_content(ApiEventKind.tunnelEnter)
-            # always when enter tunnel, but only if was in cage before.
-            self._execute_disengage_auto_clamp_if_in_progress()
+        logger.debug("starting pellet-ready state: reason=%s state=%s pellet_state=%s",
+                     reason, self._state, pellet_state)
 
     def after_enter_tunnel(self, *, reason: str = "NA"):
-        if self._analysis is not None:
-            self._evaluate_auto_clamp(caller="after_enter_tunnel")
+        return None
 
     def after_exit_tunnel(self, *, reason: str = "NA"):
-        logger.verbose("after_exit_tunnel: %s", reason)
-        with self._algorithm.set_allow_reentrant(True):
-            self._execute_disengage_auto_clamp_if_in_progress()
-        self._event_manager.post_event_content(ApiEventKind.tunnelExit)
+        logger.verbose("leaving pellet-ready state: %s", reason)
 
     def after_enter_intersession(self, project_info: ProjectInfo, *, reason="NA"):
         algo = self._algorithm
@@ -258,13 +190,6 @@ class SystemMachine(StateMachine):
             self._pellet_machine.environment_changed()
 
     def after_exit_intersession(self):
-        if not self._tunnel_headfix_enabled:
-            with self._algorithm.set_allow_reentrant(True):
-                self.exit_intersession_to_cage()
-            return
-        # Return to cage; the operator owns the next recording lifecycle.
-        self._tunnel_device.open_tunnel_gate()
-        self._execute_disengage_auto_clamp_if_in_progress()
         with self._algorithm.set_allow_reentrant(True):
             self.exit_intersession_to_cage()
 
@@ -348,71 +273,6 @@ class SystemMachine(StateMachine):
     def _on_inference_segmentation_finished(self, project: ProjectInfo, success: bool, *, error: str="NA"):
         logger.verbose("got inference segmentation finished: %s ; err=%s prj=%s", success, error, project)
         self._inference.send_message(InferenceCommandMessageKind.SetOfflineToLive)
-
-    @BehaviorAlgorithm.relay_func(wait=False)
-    def _on_headbar_pressure_monitor_property_changed(self, name: str, value, _):
-        if not self._tunnel_headfix_enabled:
-            return
-        if name == HeadbarPressureMonitor.IS_ENGAGED_PROPERTY:
-            self._event_manager.post_event_content(
-                ApiEventKind.headFixationForceDetectorChanged, data=dict(is_enabled=value))
-            if value:
-                self._evaluate_auto_clamp(caller="headbar_pressure_on")
-
-    @BehaviorAlgorithm.relay_func(wait=False)
-    def _evaluate_auto_clamp(self, *, caller: str="NA"):
-        if not self._tunnel_headfix_enabled:
-            logger.debug("auto-clamp skipped because tunnel/headfix hardware is disabled")
-            return
-        algo = self._algorithm
-        if algo.algo_paused:
-            logger.debug("auto_clamp: algo-paused, skipping evaluate")
-            return
-        if self._auto_clamp_in_progress:
-            logger.debug("auto_clamp already in progress")
-            return
-        is_headbar_pressure_engaged = self._analysis.headbar_pressure_monitor.is_engaged
-        if not algo.head_fixation_enabled:
-            logger.info("auto-clamp: disabled (no action taken)")
-            return
-        if self._intersession.state != IntersessionState.idle:
-            logger.info("auto-clamp: intersession not idle (no action taken)")
-            return
-        if not algo.is_in_session:
-            logger.info("auto-clamp: algo not in-session (no action taken)")
-            return
-        if not is_headbar_pressure_engaged:
-            logger.info("auto-clamp: detector not engaged (no action taken)")
-            return
-        self._timer_auto_clamp_evaluate.cancel()
-        p_now = get_perf_now()
-        cfg = algo.active_config.head_clamp
-        disengage_age = p_now - self._last_disengage_autoclamp_perf_c
-        remains = cfg.before_reengage_delay - disengage_age
-        if remains > 0:
-            logger.verbose("delaying evaluate auto-clamp in %.1fs due to recent disengage ; age=%.1fs",
-                         remains, disengage_age)
-            timer = make_daemon_timer(remains, partial(self._evaluate_auto_clamp, caller="timer"))
-            self._timer_auto_clamp_evaluate = timer
-            timer.start()
-            return
-        intensity = cfg.auto_clamp_intensity
-        logger.info("auto-clamp setting position to %s ; caller=%s", intensity, caller)
-        self._autoclamp_set_in_progress(True)
-        self._update_magnet_position(intensity)
-        self._event_manager.post_event_content(ApiEventKind.autoClampEngaged, data=dict(intensity=intensity))
-        self._disengage_auto_clamp_load_count = 0
-        self._timer_auto_clamp_disengage.cancel()  # in case of
-        if cfg.release_mode == HeadClampReleaseMode.ACTIVITY:
-            t_delay = cfg.auto_clamp_no_activity_release_delay
-        else:
-            t_delay = cfg.fixed_duration_release_delay
-        if t_delay > 0:
-            logger.debug("starting new timer for disengage_auto_clamp in %.2f seconds", t_delay)
-            new_timer = self._timer_auto_clamp_disengage = _consider_disengage_autoclamp_timer(
-                t_delay, self._disengage_auto_clamp,
-            )
-            new_timer.start()
 
     def _evaluate_home_on_excessive_drift(self):
         # might be todo: convert to a detector
@@ -579,83 +439,6 @@ class SystemMachine(StateMachine):
         self._handle_pellet_uncover(response)
         self._pellet_machine.pellet_seen(response.pellet_seen)
 
-    # AUTO-CLAMP / HEAD-BAR
-
-    def _autoclamp_set_in_progress(self, prog: bool):
-        self._auto_clamp_in_progress = prog
-        self._algorithm.autoclamp_in_progress = prog
-        det = self._analysis.autoclamp_evasion_detector
-        det.autoclamp_in_progress = prog
-
-    @BehaviorAlgorithm.relay_func(wait=False)
-    def _execute_disengage_auto_clamp_if_in_progress(self):
-        self._timer_auto_clamp_evaluate.cancel()  # in case of
-        self._timer_auto_clamp_disengage.cancel()  # better needed
-        if not self._auto_clamp_in_progress:
-            return
-        baseline_intensity = self._algorithm.baseline_intensity
-        logger.info("Disengaging auto-clamp to intensity %s", baseline_intensity)
-        self._last_disengage_autoclamp_perf_c = get_perf_now()
-        self._update_magnet_position(baseline_intensity)
-        self._event_manager.post_event_content(ApiEventKind.autoClampDisengaged, data=dict(intensity=baseline_intensity))
-        self._autoclamp_set_in_progress(False)
-        self._auto_clamp_disengage_in_progress = False
-        with self._algorithm.set_allow_reentrant(True):
-            self._pellet_machine.environment_changed()
-
-    @BehaviorAlgorithm.relay_func(wait=False)
-    def _pre_disengage_auto_clamp(self):
-        clamp_cfg = self._algorithm.head_clamp_config
-        self._timer_auto_clamp_evaluate.cancel()  # not sure that we want this one
-        self._timer_auto_clamp_disengage.cancel()  # ensure no other disengage timer remain
-        pre_duration = clamp_cfg.prerelease_duration
-        if pre_duration > 0:
-            intensity = clamp_cfg.prerelease_intensity
-            logger.verbose("setting head-clamp to pre-release intensity %s", intensity)
-            self._update_magnet_position(intensity)
-            self._event_manager.post_event_content(ApiEventKind.autoClampPreDisengage, data=dict(intensity=intensity))
-            logger.debug("started timer for really disengage auto-clamp in %.1fs", pre_duration)
-            timer = self._timer_auto_clamp_disengage = _auto_clamp_release_timer(
-                pre_duration, self._execute_disengage_auto_clamp_if_in_progress
-            )
-            timer.start()
-        else:
-            self._execute_disengage_auto_clamp_if_in_progress()
-
-    @BehaviorAlgorithm.relay_func(wait=False)
-    def _disengage_auto_clamp(self):
-        if not self._auto_clamp_in_progress:
-            logger.debug("skipping disengage auto-clamp if not in progress")
-            return
-        if self._auto_clamp_disengage_in_progress:
-            logger.debug("skipping new disengage while disengage already in progress")
-            return
-        self._auto_clamp_disengage_in_progress = True
-        logger.info("auto-clamp: starting disengage procedure..")
-        self._timer_auto_clamp_evaluate.cancel()  # no sure about this one
-        self._timer_auto_clamp_disengage.cancel()
-        pellet_dev = self._pellet_device
-        algo = self._algorithm
-        clamp_cfg = algo.head_clamp_config
-        if algo.is_in_session:
-            freq = clamp_cfg.auto_clamp_release_tone_freq
-            logger.debug("sending tone (freq=%s) to indicate auto-clamp disengaging", freq)
-            pellet_dev.play_tone(freq, 0.5)
-            self._event_manager.post_event_content(ApiEventKind.autoClampPlayReleaseTone,
-                                                   data=dict(frequency=freq, duration=0.5))
-        after_tone_delay = algo.auto_clamp_release_tone_delay
-        if after_tone_delay > 0:
-            logger.debug(
-                "changing magnet to baseline intensity in %.2f seconds", after_tone_delay)
-            timer = self._timer_auto_clamp_disengage = _auto_clamp_release_timer(
-                after_tone_delay,
-                self._pre_disengage_auto_clamp,
-            )
-            timer.start()
-        else:
-            with BehaviorAlgorithm.set_allow_reentrant(True):
-                self._pre_disengage_auto_clamp()
-
     def _set_pellet_delivered_presented(self, project: ProjectInfo, t_rel_start: float):
         if not math.isfinite(project.t_pellet_delivered):
             logger.debug("set project.t_pellet_delivered=%.3f", t_rel_start)
@@ -673,64 +456,27 @@ class SystemMachine(StateMachine):
 
     @BehaviorAlgorithm.relay_func(wait=False)
     def _on_algorithm_property_changed(self, name: str, new_value, old_value):
-        # Always back off to the baseline intensity when auto-clamp is disabled.
         pellet_dev = self._pellet_device
         props = BehaviorAlgoProps
-        #
-        if name == props.HEAD_FIXATION_ENABLED:
-            if not new_value:
-                logger.debug("auto-clamp disabled (backing off to baseline intensity)")
-                if self._tunnel_headfix_enabled:
-                    self._disengage_auto_clamp()
-                # todo: don't we want : self._execute_disengage_auto_clamp() ?
 
-        elif name == props.AUTO_CORRECT_MOTOR_DRIFT:
+        if name == props.AUTO_CORRECT_MOTOR_DRIFT:
             pellet_dev.set_auto_correct_motor_drift(new_value)
 
         elif name == props.ALGO_PAUSED:
             algo = self._algorithm
-            tunnel_dev = self._tunnel_device
             self.cancel_timers()
-            # don't leave in-progress:
-            if self._auto_clamp_in_progress:
-                with algo.set_allow_reentrant(True):
-                    self._execute_disengage_auto_clamp_if_in_progress()
             if new_value:
                 if algo.status != BehaviorAlgoStatus.IDLE:
                     with algo.set_allow_reentrant(True):
-                        action_funcs = [lambda: self._pellet_machine.move_home(force=True)]
-                        if self._tunnel_headfix_enabled:
-                            action_funcs[:0] = [
-                                tunnel_dev.open_tunnel_gate,
-                                lambda: self._update_magnet_position(0),
-                            ]
-                        for action_func in action_funcs:
-                            try:
-                                action_func()
-                            except Exception as err:
-                                logger.warning("%s failed: %s, but continuing", action_func, err)
-            else:
-                if algo.status != BehaviorAlgoStatus.IDLE:
-                    if self._tunnel_headfix_enabled:
-                        tunnel_dev.open_tunnel_gate()
-                        self._update_magnet_position(algo.baseline_intensity)
-                # Pellet-machine resumes its current operation from live conditions.
+                        try:
+                            self._pellet_machine.move_home(force=True)
+                        except Exception as err:
+                            logger.warning("pellet home failed while pausing: %s", err)
 
         elif name == props.DIAMOND_TRIANGLE_CONFIG:
             self._analysis.pellet_misplaced_monitor.dcs_config = new_value
 
-    def _on_auto_tunnel_sweep_property_changed(self, name, value, _):
-        if not self._tunnel_headfix_enabled:
-            return
-        if name == BaseDetector.IS_ENGAGED:
-            if value:
-                self._pellet_device.set_tunnel_fan_on()
-            else:
-                self._pellet_device.set_tunnel_fan_off()
-
     def _on_pellet_loading(self):
-        algo = self._algorithm
-        analysis = self._analysis
         p_now = get_perf_now()
 
         # ensure this new loading was preceded by a successful pellet_loaded:
@@ -743,26 +489,16 @@ class SystemMachine(StateMachine):
                     consumed, self._last_pellet_loaded_perf_c, self._last_pellet_loading_perf_c,
                     self._last_pellet_failed_loaded_perf_c)
         self._last_pellet_loading_perf_c = p_now
-        if consumed and self._tunnel_headfix_enabled:
-            analysis.autoclamp_evasion_detector.increment_pellets_consumed()
-
-        clamp_cfg = algo.active_config.head_clamp
-        self._disengage_auto_clamp_load_count += 1
-        if self._tunnel_headfix_enabled and clamp_cfg.release_mode == HeadClampReleaseMode.ACTIVITY:
-            if self._disengage_auto_clamp_load_count >= clamp_cfg.auto_clamp_release_load_count:
-                self._disengage_auto_clamp()
 
     def _on_pellet_loaded(self):
         p_now = get_perf_now()
         self._last_pellet_loaded_perf_c = p_now
         logger.verbose("received pellet_loaded p_now=%.4f", self._last_pellet_loaded_perf_c)
         self._algorithm.pellet_loaded()
-        self._analysis.system_maintenance_alarm.update_failed_pellet_load(consecutive=0)
 
     def _on_pellet_load_failed(self, *, consecutive: int):
         logger.verbose("received pellet_load_failed consecutive=%s", consecutive)
         self._last_pellet_failed_loaded_perf_c = get_perf_now()
-        self._analysis.system_maintenance_alarm.update_failed_pellet_load(consecutive=consecutive)
 
     def _on_pellet_state_changed(self, old_value, new_value):
         logger.verbose("pellet_state_changed: %s -> %s", old_value, new_value)
@@ -794,12 +530,6 @@ class SystemMachine(StateMachine):
             perf_c, algo.is_in_session, self._session_started_perf_c, project)
         if algo.is_in_session:
             self._set_pellet_delivered_presented(project, perf_c - algo.recording_start_perf_c)
-
-    def _update_magnet_position(self, position: float):
-        if not self._tunnel_headfix_enabled:
-            logger.debug("Skipping head magnet update because tunnel/headfix hardware is disabled")
-            return
-        self._tunnel_device.update_head_magnet_intensity(position)
 
     def _on_intersession_state_changed(self, old, new):
         self._algorithm.intersession_state = new

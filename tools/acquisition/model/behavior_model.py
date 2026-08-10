@@ -3,8 +3,9 @@ from datetime import datetime
 from typing import Optional, Callable
 
 from autotrainer.behavior import SystemMachine, InferenceProtocol, BehaviorAlgorithm, SystemState, IntersessionState
-from autotrainer.core import (ObservableObject, ProjectInfo, SensorAnalysis, BehaviorConfiguration,
+from autotrainer.core import (ObservableObject, ProjectInfo, BehaviorConfiguration,
                               SystemMessageHandler, ApiEventKind)
+from autotrainer.core.analysis import ReachAnalysis
 from autotrainer.core.event import post_api_event_content
 from autotrainer.core.logging import get_verbose_logger
 from tools.acquisition.model.hardware_model import HardwareModel
@@ -31,7 +32,7 @@ class BehaviorModel(ObservableObject, ProjectDependentProtocol):
     def __init__(
         self,
         msg_handler: SystemMessageHandler,
-        analysis: SensorAnalysis,
+        analysis: ReachAnalysis,
         hardware_model: HardwareModel,
         inference: InferenceProtocol,
         *,
@@ -46,10 +47,8 @@ class BehaviorModel(ObservableObject, ProjectDependentProtocol):
             system_machine = SystemMachine(
                 msg_handler=msg_handler,
                 analysis=analysis,
-                tunnel_device=hardware_model,
                 pellet_device=hardware_model,
                 inference=inference,
-                tunnel_headfix_enabled=hardware_model.tunnel_headfix_enabled,
             )
         self._system_machine: SystemMachine = system_machine
         self._hardware_model = hardware_model
@@ -60,26 +59,8 @@ class BehaviorModel(ObservableObject, ProjectDependentProtocol):
         #     f"pellet.{StateMachine.Properties.STATE_PROPERTY}", new_val, old_val)
         # actually unused event (pellet.state)
 
-        hardware_model.property_changed += self._hardware_model_property_changed
-
-    @BehaviorAlgorithm.relay_func(wait=False)
-    def _hardware_model_property_changed(self, name, value, _):
-        if name == HardwareModel.TUNNEL_HEADFIX_ENABLED:
-            self._system_machine.tunnel_headfix_enabled = value
-            if not value:
-                self._disable_tunnel_headfix_behavior()
-
-    def _disable_tunnel_headfix_behavior(self):
-        analysis = self._analysis
-        algo = self._system_machine.algorithm
-        logger.info("Disabling tunnel/headfix-dependent behavior because the hardware is disabled")
-        algo.head_fixation_enabled = False
-        algo.active_config.head_clamp.enabled = False
-        analysis.auto_tunnel_sweep_monitor.config.enabled = False
-        analysis.auto_tunnel_sweep_monitor.stop()
-
     @property
-    def analysis(self) -> SensorAnalysis:
+    def analysis(self) -> ReachAnalysis:
         return self._analysis
 
     @property
@@ -104,14 +85,6 @@ class BehaviorModel(ObservableObject, ProjectDependentProtocol):
         system_m = self._system_machine
         system_m.shift_xyz_handler.set_config(config.shift_xyz_handler)
         system_m.algorithm.load_configuration(config)
-        analysis = self._analysis
-        analysis.headbar_pressure_monitor.config = config.headbar_pressure
-        analysis.audio_thrashing_monitor.config = config.audio
-        analysis.auto_tunnel_sweep_monitor.config = config.auto_tunnel_sweep
-        analysis.autoclamp_evasion_detector.config = config.autoclamp_evasion_detector
-        system_m.tunnel_headfix_enabled = self._hardware_model.tunnel_headfix_enabled
-        if not self._hardware_model.tunnel_headfix_enabled:
-            self._disable_tunnel_headfix_behavior()
 
     def save_configuration(self) -> BehaviorConfiguration:
         algo = self._system_machine.algorithm
@@ -125,14 +98,6 @@ class BehaviorModel(ObservableObject, ProjectDependentProtocol):
 
         config = ConfigWrap()
         created = True
-
-        analysis = self._analysis
-
-        # NB: monitors/detectors configuration:
-        config.headbar_pressure = analysis.headbar_pressure_monitor.config
-        config.audio = analysis.audio_thrashing_monitor.config
-
-        config.autoclamp_evasion_detector = analysis.autoclamp_evasion_detector.config
 
         config = dataclasses.replace(algo.active_config, **assigned)
         orig_fields = {f.name for f in dataclasses.fields(config)}

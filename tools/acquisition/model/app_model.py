@@ -46,7 +46,6 @@ from autotrainer.core import (
     NotificationCenter,
     TriggerNotification,
     SystemStatusMessageKind,
-    SensorAnalysis,
     Offset3DTuple,
     get_perf_now,
 )
@@ -64,6 +63,7 @@ from autotrainer.core.logging import (
     set_log_location,
     unregister_fatal_exception_callback,
 )
+from autotrainer.core.analysis import ReachAnalysis
 from autotrainer.core.multiproc import get_mp_ctx, make_daemon_timer, DaemonTimer
 from autotrainer.core.pose_elements import SceneElement
 from autotrainer.core.project.project_info import DATE_TIME_FORMAT
@@ -293,7 +293,7 @@ class AppModel(ObservableObject):
             *,
             config_file: Optional[Path] = None,
             calib_dir: Optional[Path] = None,
-            sensor_analysis: Optional[SensorAnalysis] = None,
+            sensor_analysis: Optional[ReachAnalysis] = None,
             inference_model: Optional[InferenceProtocol] = None,
             system_message_handler: Optional[SystemMessageHandler] = None,
             system_machine: Optional[SystemMachine] = None,
@@ -430,22 +430,19 @@ class AppModel(ObservableObject):
         self._system_message_queue = queue.Queue()  # only dedicated to CAN bus messages reading/handling
 
         if sensor_analysis is None:
-            sensor_analysis = SensorAnalysis()
+            sensor_analysis = ReachAnalysis()
         analysis = self._analysis = sensor_analysis
         del sensor_analysis  # using "analysis" instead
         #
         if system_message_handler is None:
-            system_message_handler = SystemMessageHandler(self._system_message_queue, sensor_analysis=analysis)
+            system_message_handler = SystemMessageHandler(self._system_message_queue)
         self._system_message_handler = system_message_handler
-        assert self._system_message_handler.analysis is analysis, \
-            "something very wrong: sensor_analysis different in system_message_handler"
         self._system_message_handler.start()
 
-        self._hardware = HardwareModel(self._system_message_handler, sensor_analysis=analysis)
+        self._hardware = HardwareModel(self._system_message_handler)
         self._laser = LaserModel()
         self._nidaq_signal_monitor = NidaqSignalMonitorModel()
         self._session_data_recorder = SessionDataRecorder(
-            analysis,
             self._nidaq_signal_monitor,
             self._laser,
             system_message_handler=self._system_message_handler,
@@ -526,7 +523,6 @@ class AppModel(ObservableObject):
         pellet_m.events.pellet_sent += self._on_pellet_sent
 
         analysis.watchdog_monitor.property_changed += self._on_watchdog_property_changed
-        analysis.autoclamp_evasion_detector.property_changed += self._on_autoclamp_evasion_property_changed
 
         # Establish the default project before publishing startup status. This
         # gives the event-file plugin a valid destination and also prevents a
@@ -2069,11 +2065,6 @@ class AppModel(ObservableObject):
             else:
                 self.training_plan = self.get_training_plan_by_id(animal.training.current_protocol)
         self._preferences.selected_animal = "" if animal is None else animal.name
-        analysis = self._behavior.analysis
-        analysis.autoclamp_evasion_detector.pellets_consumed = (
-            0 if animal is None
-            else animal.autoclamp_evasion_pellets_consumed
-        )
         self._on_property_changed(self.Props.SELECTED_ANIMAL, animal, prev)
         self._event_manager.post_event_content(
             ApiEventKind.animalSelected, None if animal is None else animal.to_api_status())
@@ -4189,14 +4180,6 @@ class AppModel(ObservableObject):
             )
             self.abort_recording()
 
-    def _on_autoclamp_evasion_property_changed(self, name, value, _):
-        det = self._analysis.autoclamp_evasion_detector
-        animal = self._selected_animal
-        if name == det.PELLETS_CONSUMED:
-            if animal is not None and value != animal.autoclamp_evasion_pellets_consumed:
-                animal.autoclamp_evasion_pellets_consumed = value
-                self._save_animal_metadata(animal, sender="autoclamp_evasion_pellets_consumed")
-
     def _on_intersession_property_changed(self, name, value, _):
         if name == IntersessionMachine.Properties.STATE_PROPERTY:
             self._update_status_text_overlay()
@@ -4509,14 +4492,6 @@ class AppModel(ObservableObject):
 
         elif name == props.CAGE_CLEAN_CONFIG:
             self._refresh_cage_clean_data()
-
-        elif name == props.HEAD_FIXATION_ENABLED:
-            det = self._behavior.analysis.autoclamp_evasion_detector
-            if value and not old_value:
-                det.pellets_consumed = 0
-                # we monitor the detector pellets_consumed property,
-                # and update it in selected animal.
-            det.autoclamp_enabled = value
 
     def _on_hardware_property_changed(self, name: str, value, _):
         animal = self._selected_animal

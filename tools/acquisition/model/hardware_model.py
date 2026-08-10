@@ -13,7 +13,7 @@ from typing import Optional, Tuple, Dict, Union, List
 
 from autotrainer.api import ApiEventKind, ApiDetectorKind
 from autotrainer.core import (ObservableObject, SystemCommandKind, MessageHandler, AnimalSubject, Offset3DTuple,
-                              get_verbose_logger, Motor, SensorAnalysis, EventManager, HardwareConfiguration,
+                              get_verbose_logger, Motor, EventManager, HardwareConfiguration,
                               get_perf_now, SystemStatusMessageKind)
 from autotrainer.core.logging import log_hardware_initialization
 from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
@@ -75,7 +75,6 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
     def __init__(
         self,
         message_handler: MessageHandler,
-        sensor_analysis: SensorAnalysis,
     ):
         super().__init__(event_names=("device_event",))
 
@@ -90,7 +89,6 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
         self._device_ack_timeout_delay: Optional[float] = None
         self._device_conn: Optional[DeviceConnectionProtocol] = None
         self._can_device: Optional[CanDevice] = None
-        self._sensor_analysis = sensor_analysis
         self._device_uuid_ack_timeout_engaged = False
         self._device_pellet_status_timeout_engaged = False
         self._device_tunnel_status_timeout_engaged = False
@@ -862,8 +860,6 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
                 self._device_tunnel_status_timeout_engaged,
                 self._device_pellet_status_timeout_engaged,
             ))
-            if self._sensor_analysis.alarms:
-                self._sensor_analysis.device_comm_alarm.is_engaged = engaged
 
     def _message_handler_property_changed(self, name: str, value, old_value):
         props = MessageHandler

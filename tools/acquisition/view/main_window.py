@@ -23,7 +23,6 @@ import qtawesome as qta
 
 from autotrainer.core import EventManager, Offset3DTuple, AnimalSubject, SystemConfiguration, CameraConfiguration, \
     calculate_std_dev_manual, ProjectInfo, get_perf_now
-from autotrainer.core.analysis.autoclamp_evasion_detector import AutoClampEvasionDetector
 from autotrainer.core.capture import CaptureProcessStatus
 from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
 from autotrainer.core.logging import get_console_handler, get_verbose_logger
@@ -202,9 +201,6 @@ class MainWindow(QMainWindow):
 
         user_preferences.property_changed += self._on_preferences_property_changed
 
-        analysis = app_model.analysis
-        analysis.autoclamp_evasion_detector.property_changed += self._on_autoclamp_evasion_property_changed
-
         self.running_status_changed.connect(self._set_start_or_stop)
         self.capture_start_finished.connect(self._on_capture_start_finished)
         self.capture_stop_finished.connect(self._on_capture_stop_finished)
@@ -215,7 +211,6 @@ class MainWindow(QMainWindow):
         #
         # then after everything:
         self._set_reset_cage_clean_text()
-        self._set_autoclamp_evasion(analysis.autoclamp_evasion_detector)
         QTimer.singleShot(0, self._refresh_hardware_bindings)
 
     @property
@@ -530,9 +525,6 @@ class MainWindow(QMainWindow):
         prefs.cage_clean_previous_day = date.today()
         prefs.save()
         self._set_reset_cage_clean_text()
-
-    def on_reset_autoclamp_evasion(self):
-        self._app_model.analysis.autoclamp_evasion_detector.pellets_consumed = 0
 
     def _check_target_next_or_previous_plan_phase(
         self,
@@ -1042,15 +1034,6 @@ class MainWindow(QMainWindow):
     def _set_reset_cage_clean_text(self):
         self._reset_cage_clean_action.setToolTip("Mark the cage as cleaned.")
 
-    def _set_autoclamp_evasion(self, det: AutoClampEvasionDetector):
-        if not self._app_model.hardware.tunnel_headfix_enabled:
-            self._reset_autoclamp_evasion_action.setVisible(False)
-            return
-        det = self._app_model.analysis.autoclamp_evasion_detector
-        action = self._reset_autoclamp_evasion_action
-        action.setVisible(det.is_engaged or os.getenv("AUTOTRAINER_SHOW_AUTOCLAMP_EVASION") == "1")
-        action.setToolTip(f"Reset AutoClamp Evasion\n{det.pellets_consumed} out of {det.config.pellets_consumed_trigger}")
-
     def _create_actions(self):
         action = self.edit_camera_settings_action = QAction(_toolbar_icon("fa5s.edit"), "Edit Camera Settings", self)
         action.setToolTip("Edit Camera Settings")
@@ -1089,10 +1072,6 @@ class MainWindow(QMainWindow):
 
         action = self._reset_cage_clean_action = QAction(_toolbar_icon("fa5s.broom"), "Reset Cage Clean", self)
         action.triggered.connect(self.on_reset_cage_clean)
-
-        action = self._reset_autoclamp_evasion_action = QAction(_toolbar_icon("ei.vimeo"), "Reset AutoClamp Evasion", self)
-        action.setVisible(False)
-        action.triggered.connect(self.on_reset_autoclamp_evasion)
 
         action = self.next_training_phase_action = QAction(_toolbar_icon("fa5s.arrow-alt-circle-right"), "Next Phase", self)
         action.setVisible(False)
@@ -1210,7 +1189,6 @@ class MainWindow(QMainWindow):
         toolbar.addSeparator()
 
         toolbar.addAction(self.show_reach_event_action)
-        toolbar.addAction(self._reset_autoclamp_evasion_action)
 
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -1321,7 +1299,6 @@ class MainWindow(QMainWindow):
             self.addToolBar(toolbar)
             toolbar.setFloatable(False)
             toolbar.setMovable(False)
-            toolbar.addAction(self.force_headbar_detector_action)
             toolbar.addAction(self.pellet_seen_action)
             toolbar.addAction(self.mouse_seen_action)
             toolbar.addAction(self.mouse_near_pellet_action)
@@ -1488,12 +1465,8 @@ class MainWindow(QMainWindow):
             inference._intersession_process_execute = partial(self._simulate_intersession_process, fake_result=res)
 
     def _internal_set_force_headbar_detector(self):
-        if not self._app_model.hardware.tunnel_headfix_enabled:
-            logger.warning("Blocked internal headbar detector simulation: tunnel/headfix hardware is disabled")
-            self.force_headbar_detector_action.setChecked(False)
-            return
-        new_value = self.force_headbar_detector_action.isChecked()
-        self._app_model.analysis.headbar_pressure_monitor.force_engaged(new_value)
+        logger.warning("Headbar detector simulation is not available in reachAQ")
+        self.force_headbar_detector_action.setChecked(False)
 
     def _internal_set_pellet_seen(self):
         self._app_model.behavior.algorithm.update_pellet_seen(True)
@@ -1917,12 +1890,6 @@ class MainWindow(QMainWindow):
         props = BehaviorAlgoProps
         if name == props.CAGE_CLEAN_CONFIG:
             self._set_reset_cage_clean_text()
-
-    @invoke_method
-    def _on_autoclamp_evasion_property_changed(self, name: str, value, _):
-        det = self._app_model.analysis.autoclamp_evasion_detector
-        # if name in (det.IS_ENGAGED, det.CONFIG, det.PELLETS_CONSUMED):
-        self._set_autoclamp_evasion(det)
 
     @invoke_method
     def _set_training_plans(self, plans: List[PlanInfo]):

@@ -2,7 +2,7 @@ import os
 from typing import Dict, Optional, Tuple
 
 from PySide6.QtCore import Qt, QPoint
-from PySide6.QtGui import QImage, QSurfaceFormat, QPixmap, QPen, QPainter, QFont
+from PySide6.QtGui import QImage, QSurfaceFormat, QBrush, QPixmap, QPen, QPainter, QFont
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import QWidget, QGraphicsView, QGraphicsScene, QHBoxLayout, QGraphicsPixmapItem, \
     QGraphicsEllipseItem, QGraphicsItem
