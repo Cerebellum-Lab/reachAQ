@@ -61,8 +61,6 @@ class _AnimalSubject:
 
     target_y_limit: Optional[float] = None  # in DCS
 
-    autoclamp_evasion_pellets_consumed: int = 0
-
     _legacy_v4_path: Optional[Path] = dataclasses.field(
         default=None,
         init=False,

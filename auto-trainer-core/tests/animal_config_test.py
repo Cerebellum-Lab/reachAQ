@@ -21,10 +21,7 @@ def test_save_load(tmp_path):
     assert animal == animal2
     # also ensure for change to any attribute:
     for k, v in animal.__dict__.items():
-        if k in {
-            "version",  # forced on write
-            "autoclamp_evasion_pellets_consumed",  # retired, never persisted
-        }:
+        if k == "version":  # forced on write
             continue
         if isinstance(v, bool):
             v = not v
