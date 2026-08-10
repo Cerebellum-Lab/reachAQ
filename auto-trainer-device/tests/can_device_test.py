@@ -13,6 +13,8 @@ from autotrainer.core import RawValueHolder
 
 from autotrainer.core.message import SystemStatusMessageKind, SystemCommandKind
 from autotrainer.device import (
+    CanFailure,
+    CanFailureKind,
     CanDevice,
     DeviceApi,
     Target,
@@ -206,6 +208,53 @@ def test_command_handler_failure_requests_safety_shutdown():
 
     shutdown.assert_called_once()
     assert "ack exhausted" in shutdown.call_args.args[0]
+
+
+def test_command_handler_reports_structured_terminal_failure():
+    reported = []
+    device = CanDevice(
+        api=DeviceApi(message_callback=data_callback),
+        force_emulation=True,
+        required_targets=(Target.PELLET_DEVICE,),
+        failure_callback=reported.append,
+    )
+    failure = CanFailure(
+        CanFailureKind.ACKNOWLEDGEMENT_TIMEOUT,
+        "send acknowledgement timed out",
+        command=SystemCommandKind.SEND_PELLET,
+        context="send-1",
+    )
+    error = RuntimeError(failure.error)
+    error.can_failure = failure
+    device._CanDevice__command_handler = mock.Mock(side_effect=error)
+
+    with pytest.raises(RuntimeError, match="acknowledgement timed out"):
+        device._command_handler()
+
+    assert reported == [failure]
+
+
+def test_device_connection_reports_reader_transport_failure():
+    reported = []
+    interface = mock.Mock()
+    interface.is_open = True
+    device = mock.Mock()
+    device.device_interface = interface
+    connection = DeviceConnection(
+        device,
+        message_queue=queue.Queue(),
+        failure_callback=reported.append,
+    )
+    connection._run_unconnected = mock.Mock(return_value=True)
+    connection._run_connected = mock.Mock(side_effect=OSError("CAN adapter lost"))
+
+    connection._run()
+
+    assert len(reported) == 1
+    assert reported[0].kind is CanFailureKind.TRANSPORT
+    assert reported[0].error == "CAN adapter lost"
+    device.disconnect.assert_called_once_with()
+    interface.close.assert_called_once_with()
 
 
 def test_disconnect_waits_for_inflight_send_and_rejects_following_send():

@@ -20,6 +20,7 @@ from autotrainer.core.event import post_api_event_content
 
 import autotrainer.device
 from .can_device import HAVE_CAN_DEVICE
+from .can_failure import CanFailure, CanFailureKind
 from .device import Device
 from .device_api import DeviceApi
 from .device_interface import DeviceInterface, ServoConfig, StepperConfig
@@ -52,7 +53,8 @@ class DeviceConnection(DeviceConnectionProtocol):
                  device: Device,
                  message_queue: Queue,
                  message_callback: Callable[[int, object], None] = None,
-                 name="device-connection"):
+                 name="device-connection",
+                 failure_callback: Optional[Callable[[CanFailure], None]] = None):
 
         super().__init__()
 
@@ -70,6 +72,7 @@ class DeviceConnection(DeviceConnectionProtocol):
         self._device.api = self._api
 
         self._name = name
+        self._failure_callback = failure_callback
 
         self._read_limit: int = 50 if HAVE_CAN_DEVICE else 2000
         self._collect_ms: int = 5  # so freq == 200 Hz
@@ -269,12 +272,30 @@ class DeviceConnection(DeviceConnectionProtocol):
     def _run(self) -> None:
         logger.debug(f"<{self._name}> thread started")
 
-        while True:
-            if not self._run_unconnected():
-                break
+        try:
+            while True:
+                if not self._run_unconnected():
+                    break
 
-            if not self._run_connected():
-                break
+                if not self._run_connected():
+                    break
+        except BaseException as err:
+            logger.exception("<%s> CAN transport worker failed: %s", self._name, err)
+            callback = self._failure_callback
+            if callback is not None:
+                try:
+                    callback(CanFailure(
+                        CanFailureKind.TRANSPORT,
+                        str(err) or err.__class__.__name__,
+                    ))
+                except Exception:
+                    logger.exception("Failed to report CAN transport failure")
+        finally:
+            if self._interface.is_open:
+                try:
+                    self._device.disconnect()
+                finally:
+                    self._interface.close()
 
         logger.debug(f"<{self._name}> thread terminated")
 

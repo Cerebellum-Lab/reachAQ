@@ -11,12 +11,18 @@ from autotrainer.core import (
     NidaqSignalChannelConfiguration,
     NidaqSignalStreamConfiguration,
     SystemStatusMessageKind,
+    SystemCommandKind,
 )
 from autotrainer.core.interfaces import RecordingEndingReason
 from autotrainer.core.capture import CaptureProcessStatus
 from autotrainer.core.configuration.persistence_configuration import PersistenceConfiguration
 from autotrainer.behavior.behavior_algorithm import BehaviorAlgoStatus
-from autotrainer.behavior.pellet_trial import PelletTrialLedger, TrialOutcome
+from autotrainer.behavior.pellet_trial import (
+    HardwareErrorKind,
+    PelletTrialLedger,
+    TrialOutcome,
+)
+from autotrainer.device import CanFailure, CanFailureKind
 from tools.acquisition.model.app_model import (
     app_status_to_api_app_mode,
     app_status_to_behavior_algo_status,
@@ -269,6 +275,50 @@ def test_mismatched_pellet_ack_does_not_present_or_count_trial(app_model):
 
     assert not app_model._trial_ledger.active_attempt.is_presented
     assert algorithm.pellets_presented == 0
+
+
+def test_ack_timeout_finalizes_attempt_and_runtime_retry_uses_same_trial(app_model):
+    algorithm = app_model.behavior.algorithm
+    assert algorithm.start_session(reason="hardware-error-test")
+    app_model._on_pellet_sending(perf_c=10.0, context="send-1")
+
+    app_model._on_hardware_command_failed(CanFailure(
+        CanFailureKind.ACKNOWLEDGEMENT_TIMEOUT,
+        "pellet send acknowledgement timed out",
+        command=SystemCommandKind.SEND_PELLET,
+        context="send-1",
+        perf_time=10.5,
+        wall_time=110.5,
+    ))
+
+    failed = app_model._trial_ledger.attempts[0]
+    assert failed.attempt_label == "1.1"
+    assert failed.outcome is TrialOutcome.HARDWARE_ERROR
+    assert failed.hardware_error_kind is HardwareErrorKind.ACKNOWLEDGEMENT_TIMEOUT
+    assert app_model._trial_ledger.count() == 0
+
+    app_model._on_pellet_sending(perf_c=11.0, context="send-2")
+    assert app_model._trial_ledger.active_attempt.attempt_label == "1.2"
+
+
+def test_failed_send_dispatch_is_persisted_without_counting_trial(app_model):
+    algorithm = app_model.behavior.algorithm
+    assert algorithm.start_session(reason="dispatch-error-test")
+
+    app_model._on_hardware_command_failed(CanFailure(
+        CanFailureKind.COMMAND,
+        "command could not be queued",
+        command=SystemCommandKind.SEND_PELLET,
+        context="send-rejected",
+        perf_time=10.0,
+        wall_time=110.0,
+    ))
+
+    failed = app_model._trial_ledger.attempts[0]
+    assert failed.operation_id == "send-rejected"
+    assert failed.hardware_error_kind is HardwareErrorKind.MOTOR_FAILURE
+    assert app_model._trial_ledger.summary()["hardware_errors"] == 1
+    assert app_model._trial_ledger.count() == 0
 
 
 def test_automatic_stop_finishes_active_trial_normally_before_stopping(

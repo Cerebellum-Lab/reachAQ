@@ -20,7 +20,8 @@ from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
 from autotrainer.core.event import post_api_detector_event_content
 from autotrainer.core.message import SystemDataArgsKwargs
 from autotrainer.device import (CanTransportConfiguration, CanTransportKind, DeviceConnectionProtocol, HAVE_CAN_DEVICE,
-                                DeviceConnection, CanDevice, StepperConfig, ServoConfig, Device, ColorLed, Target)
+                                DeviceConnection, CanDevice, CanFailure, CanFailureKind,
+                                StepperConfig, ServoConfig, Device, ColorLed, Target)
 from autotrainer.behavior import PelletDeviceProtocol
 
 logger = get_verbose_logger(__name__)
@@ -61,7 +62,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         self,
         message_handler: MessageHandler,
     ):
-        super().__init__(event_names=("device_event",))
+        super().__init__(event_names=("device_event", "command_failed"))
 
         self._lock = threading.RLock()  # **required** re-entrant lock !!
         self._safety_shutdown_lock = threading.Lock()
@@ -484,6 +485,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             required_targets=(Target.PELLET_DEVICE,),
             can_transport=transport,
             shutdown_callback=lambda reason: self.safety_shutdown(reason, wait=False),
+            failure_callback=self._on_can_failure,
         )
         log_hardware_initialization(
             logger,
@@ -498,7 +500,12 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
 
         can_device.property_changed += self._can_device_property_changed
 
-        device_conn = self._device_conn = DeviceConnection(can_device, cmd_queue, name="can-device")
+        device_conn = self._device_conn = DeviceConnection(
+            can_device,
+            cmd_queue,
+            name="can-device",
+            failure_callback=self._on_can_failure,
+        )
         log_hardware_initialization(logger, "START | CAN connection worker | name=can-device")
         device_conn.request_connect()
         connection_started = time.perf_counter()
@@ -780,6 +787,20 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             self._refresh_cmd_in_progress(commands_tuple)
         return tok
 
+    def _on_can_failure(self, failure: CanFailure) -> None:
+        logger.error(
+            "Terminal CAN failure: kind=%s command=%s context=%s error=%s",
+            failure.kind.value,
+            failure.command,
+            failure.context,
+            failure.error,
+        )
+        self.command_failed(failure)
+        self.safety_shutdown(
+            f"CAN {failure.kind.value}: {failure.error}",
+            wait=False,
+        )
+
     def __send_with_token(self, device: DeviceConnectionProtocol, cmd: SystemCommandKind, data=None) -> Optional[UUID]:
         token = uuid4()
         perf_now = get_perf_now()
@@ -789,6 +810,13 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             return token
         else:
             logger.verbose("send_command failed, device not setup yet: cmd=%s token=%s", cmd, token)
+            self._on_can_failure(CanFailure(
+                kind=CanFailureKind.COMMAND,
+                error=f"Command {cmd.name} could not be queued",
+                command=cmd,
+                context=str(token),
+                perf_time=perf_now,
+            ))
             return None
 
     # noinspection PyMethodMayBeStatic

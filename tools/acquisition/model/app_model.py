@@ -45,6 +45,7 @@ from autotrainer.core import (
     Notification,
     NotificationCenter,
     TriggerNotification,
+    SystemCommandKind,
     SystemStatusMessageKind,
     Offset3DTuple,
     get_perf_now,
@@ -88,6 +89,7 @@ from autotrainer.behavior import (
     InferenceProtocol,
     IntersessionMachine,
     IntersessionState,
+    HardwareErrorKind,
     PelletTrialLedger,
     RetrySettingsPolicy,
     SystemMachine,
@@ -112,7 +114,7 @@ from tools.acquisition.model.helpers import get_config_location
 from tools.acquisition.model.hardware_model import HardwareModel
 from tools.acquisition.model.inference_model import InferenceModel
 from tools.acquisition.model.laser_model import LaserModel
-from autotrainer.device import CanTransportConfiguration
+from autotrainer.device import CanFailure, CanFailureKind, CanTransportConfiguration
 from tools.acquisition.model.hardware_scan import HardwareScanEntry, scan_can_adapters, scan_gpus
 from tools.acquisition.model.nidaq_discovery import device_name_from_channel, discover_nidaq_devices
 from tools.acquisition.model.nidaq_channel_plan import build_nidaq_acquisition_configuration
@@ -496,6 +498,7 @@ class AppModel(ObservableObject):
         self._rpc_service: Optional[RpcService] = None
 
         self._hardware.property_changed += self._on_hardware_property_changed
+        self._hardware.command_failed += self._on_hardware_command_failed
         self._nidaq_signal_monitor.property_changed += (
             self._on_nidaq_monitor_property_changed
         )
@@ -5139,6 +5142,68 @@ class AppModel(ObservableObject):
             ledger.session_id,
             attempt.attempt_label,
             context,
+        )
+
+    def _on_hardware_command_failed(self, failure: CanFailure) -> None:
+        """Finalize the matching physical pellet attempt as a hardware error."""
+        ledger = self._trial_ledger
+        attempt = None if ledger is None else ledger.active_attempt
+        if (
+            attempt is None
+            and ledger is not None
+            and self._behavior.algorithm.is_in_session
+            and failure.command is SystemCommandKind.SEND_PELLET
+        ):
+            attempt = ledger.begin_send(
+                failure.perf_time,
+                failure.wall_time,
+                operation_id=failure.context,
+            )
+        if attempt is None:
+            return
+        if (
+            failure.context is not None
+            and failure.context != attempt.operation_id
+        ):
+            logger.info(
+                "CAN failure does not match active pellet attempt: "
+                "active=%s failure_context=%s",
+                attempt.operation_id,
+                failure.context,
+            )
+            return
+
+        if failure.kind is CanFailureKind.ACKNOWLEDGEMENT_TIMEOUT:
+            kind = HardwareErrorKind.ACKNOWLEDGEMENT_TIMEOUT
+        elif failure.kind is CanFailureKind.TRANSPORT:
+            kind = HardwareErrorKind.TRANSPORT_FAILURE
+        else:
+            command = failure.command
+            is_motor_command = (
+                isinstance(command, SystemCommandKind)
+                and 200 <= int(command) < 300
+            )
+            kind = (
+                HardwareErrorKind.MOTOR_FAILURE
+                if is_motor_command
+                else HardwareErrorKind.COMMAND_FAILURE
+            )
+
+        finalized = ledger.finalize_hardware_error(
+            kind,
+            failure.perf_time,
+            failure.wall_time,
+            error=failure.error,
+        )
+        self._protocol_runner.cancel_active_trial()
+        logger.error(
+            "pellet attempt %s finalized as %s: %s",
+            finalized.attempt_label,
+            kind.value,
+            failure.error,
+        )
+        self._evaluate_automatic_stop_policy(
+            protocol_complete=self._protocol_runner.protocol_complete,
         )
 
     def _on_pellet_sent(

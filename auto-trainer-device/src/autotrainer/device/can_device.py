@@ -29,6 +29,7 @@ from .emulation_interface import EmulationInterface
 from .device_api import DeviceApi
 from .can_interface import CanInterface, Target, target_of_motor
 from .can_transport import CanTransportConfiguration, CanTransportKind
+from .can_failure import CanFailure, CanFailureKind
 from .device_interface import (
     Acknowledge,
     AnalogOutput,
@@ -184,7 +185,8 @@ class CanDevice(Device):
     def __init__(self, api: Optional[DeviceApi] = None, buffer_size: int = 50, force_emulation: bool = False,
                  *, can_transport: Optional[CanTransportConfiguration] = None,
                  required_targets: Optional[Iterable[Target]] = None,
-                 shutdown_callback: Optional[Callable[[str], None]] = None):
+                 shutdown_callback: Optional[Callable[[str], None]] = None,
+                 failure_callback: Optional[Callable[[CanFailure], None]] = None):
         """
         Initialize the CANbus device interface.
 
@@ -205,6 +207,7 @@ class CanDevice(Device):
         self._disconnect_lock = threading.Lock()
         self._command_execution_lock = threading.Lock()
         self._shutdown_callback = shutdown_callback
+        self._failure_callback = failure_callback
 
         self._init_default_move_configs()
         self._compound_movement: Optional[List[Dict[str, Any]]] = None
@@ -519,6 +522,18 @@ class CanDevice(Device):
             self.__command_handler()
         except BaseException as err:
             logger.exception("command handler crashed: %s", err)
+            failure = getattr(err, "can_failure", None)
+            if failure is None:
+                failure = CanFailure(
+                    CanFailureKind.COMMAND,
+                    str(err) or err.__class__.__name__,
+                )
+            callback = self._failure_callback
+            if callback is not None:
+                try:
+                    callback(failure)
+                except Exception:
+                    logger.exception("Failed to report terminal CAN failure")
             callback = self._shutdown_callback
             if callback is not None:
                 try:
@@ -673,14 +688,28 @@ class CanDevice(Device):
                     self.property_changed(self.UUID_ACK_TIMEOUT_ENGAGED, True, before)
                 board_ctx.repeated_command_count += 1
                 if board_ctx.repeated_command_count >= self.default_command_ack_timeout_repeat_count:
-                    raise RuntimeError(
+                    err = RuntimeError(
                         f"Reached default_command_ack_timeout_repeat_count {board_ctx.repeated_command_count} on board {target}"
                     )
+                    err.can_failure = CanFailure(
+                        CanFailureKind.ACKNOWLEDGEMENT_TIMEOUT,
+                        str(err),
+                        command=board_ctx.kind,
+                        context=None if board_ctx.ctx is None else str(board_ctx.ctx),
+                    )
+                    raise err
                 if board_ctx.prev_command_relative:
                     # TODO: should/could simply continue, probably, although surely only for retract command
-                    raise RuntimeError(
+                    err = RuntimeError(
                         f"Command {board_ctx.prev_command} uuid ack timed out ; refusing retry given relative."
                     )
+                    err.can_failure = CanFailure(
+                        CanFailureKind.ACKNOWLEDGEMENT_TIMEOUT,
+                        str(err),
+                        command=board_ctx.kind,
+                        context=None if board_ctx.ctx is None else str(board_ctx.ctx),
+                    )
+                    raise err
                 retrying_board = target
                 cur_commands.insert(0, board_ctx.prev_command)
                 board_ctx.prev_command = None
@@ -806,7 +835,14 @@ class CanDevice(Device):
                 if self._want_exit.is_set():
                     break
                 if not success:
-                    raise RuntimeError(f"Failed writing too many consecutive times to the device/bus. kind={kind} ctx={ctx}")
+                    err = RuntimeError(f"Failed writing too many consecutive times to the device/bus. kind={kind} ctx={ctx}")
+                    err.can_failure = CanFailure(
+                        CanFailureKind.TRANSPORT,
+                        str(err),
+                        command=kind,
+                        context=None if ctx is None else str(ctx),
+                    )
+                    raise err
                 target_board.kind = kind  # only used for debug/log
             # end possible handling cases
             if self._want_exit.is_set():
