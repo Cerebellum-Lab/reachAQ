@@ -11,7 +11,6 @@ from autotrainer.core.logging import get_verbose_logger
 from autotrainer.core.project import ProjectInfo, ProjectInterval
 from autotrainer.core.perf_monitor import PerfMonitor
 from autotrainer.core.observable_object import ObservableObject
-from autotrainer.core.video_detection import PresenceDetectionAttrs
 from .alarm_detector import AlarmDetector
 from .animal_evasion_alarm import AnimalEvasionAlarm
 from .animal_thrash_alarm import AnimalThrashAlarm
@@ -23,7 +22,6 @@ from .head_fix_measurement import HeadFixMeasurement
 from .audio_spectrum_monitor import AudioSpectrumThrashMonitor
 from .headbar_pressure_monitor import HeadbarPressureMonitor
 from .alarm_monitor import EmergencyAlarmMonitor
-from .global_animal_presence_monitor import GlobalAnimalPresenceAlarm
 from .external_doors_monitor import ExternalDoorsAlarm
 from .pellet_position_monitor import PelletMisplacedDetector
 from ..configuration.pellet_misplaced_config import PelletMisplacedDetectorConfiguration
@@ -45,7 +43,7 @@ def _disable_alarm_config(config):
 class SensorAnalysis(ObservableObject):
     measurements_sampled: Callable[[List], None]
 
-    def __init__(self, *, topcam_presence: Optional[PresenceDetectionAttrs] = None):
+    def __init__(self):
         super().__init__(("measurements_sampled",))
 
         self._project_info: Optional[ProjectInfo] = None
@@ -72,10 +70,6 @@ class SensorAnalysis(ObservableObject):
         self._is_headbar_switch_engaged = False
 
         self._audio_thrashing_monitor = AudioSpectrumThrashMonitor()
-
-        self._global_animal_presence_alarm = GlobalAnimalPresenceAlarm(
-            topcam_presence=topcam_presence,
-        )
 
         self._external_doors_alarm = ExternalDoorsAlarm()
 
@@ -110,7 +104,6 @@ class SensorAnalysis(ObservableObject):
             self._system_maintenance_alarm,
             self._system_fault_alarm,
             self._external_doors_alarm,
-            self._global_animal_presence_alarm,
             self._device_comm_alarm,
         ]
 
@@ -193,10 +186,6 @@ class SensorAnalysis(ObservableObject):
     @property
     def emergency_alarm_monitor(self) -> EmergencyAlarmMonitor:
         return self._alarm_monitor
-
-    @property
-    def global_animal_presence_alarm(self) -> GlobalAnimalPresenceAlarm:
-        return self._global_animal_presence_alarm
 
     @property
     def external_doors_alarm(self) -> ExternalDoorsAlarm:

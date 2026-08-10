@@ -7,7 +7,6 @@ from autotrainer.core import (ObservableObject, ProjectInfo, SensorAnalysis, Beh
                               SystemMessageHandler, ApiEventKind)
 from autotrainer.core.event import post_api_event_content
 from autotrainer.core.logging import get_verbose_logger
-from autotrainer.core.video_detection import PresenceDetectionAttrs
 from tools.acquisition.model.hardware_model import HardwareModel
 
 from autotrainer.core.project import ProjectDependentProtocol
@@ -36,7 +35,6 @@ class BehaviorModel(ObservableObject, ProjectDependentProtocol):
         hardware_model: HardwareModel,
         inference: InferenceProtocol,
         *,
-        topcam_presence: Optional[PresenceDetectionAttrs] = None,
         system_machine: Optional[SystemMachine] = None,
     ):
         super().__init__(("emergency_stopped", "emergency_resumed"))
@@ -51,7 +49,6 @@ class BehaviorModel(ObservableObject, ProjectDependentProtocol):
                 tunnel_device=hardware_model,
                 pellet_device=hardware_model,
                 inference=inference,
-                topcam_presence=topcam_presence,
                 tunnel_headfix_enabled=hardware_model.tunnel_headfix_enabled,
             )
         self._system_machine: SystemMachine = system_machine
@@ -135,8 +132,6 @@ class BehaviorModel(ObservableObject, ProjectDependentProtocol):
         config.headbar_pressure = analysis.headbar_pressure_monitor.config
         config.audio = analysis.audio_thrashing_monitor.config
 
-        top_cam = algo.top_camera_presence_detection
-        config.topcam_presence_detection = None if top_cam is None else top_cam.to_config()
         config.autoclamp_evasion_detector = analysis.autoclamp_evasion_detector.config
 
         config = dataclasses.replace(algo.active_config, **assigned)

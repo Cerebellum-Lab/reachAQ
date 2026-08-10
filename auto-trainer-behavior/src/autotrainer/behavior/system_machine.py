@@ -13,7 +13,6 @@ from autotrainer.core.logging import get_verbose_logger
 from autotrainer.core.interfaces import (CaptureAnalysisResult, RecordingEndingReason)
 from autotrainer.core.pose_elements import SceneElement, AllHandsParts
 from autotrainer.core.multiproc import make_daemon_timer, no_op_timer
-from autotrainer.core.video_detection import PresenceDetectionAttrs
 from autotrainer.core.analysis.detector import BaseDetector
 from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
 from autotrainer.core.configuration.behavior_configuration import (
@@ -59,7 +58,6 @@ class SystemMachine(StateMachine):
                  inference: InferenceProtocol,
                  algorithm: Optional[BehaviorAlgorithm] = None,
                  project_info: Optional[ProjectInfo] = None,
-                 topcam_presence: Optional[PresenceDetectionAttrs] = None,
                  tunnel_headfix_enabled: bool = True,
                  ):
 
@@ -102,7 +100,6 @@ class SystemMachine(StateMachine):
 
         algo = self._algorithm = BehaviorAlgorithm(
             project_info=project_info,
-            topcam_presence=topcam_presence,
         ) if algorithm is None else algorithm
         del algorithm  # using algo
 

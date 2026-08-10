@@ -10,7 +10,6 @@ from unittest import mock
 import pytest
 
 from autotrainer.core.pose_elements import SceneElement
-from autotrainer.core.video_detection import PresenceDetectionAttrs
 from autotrainer.inference import PoseResponse, PoseLocation
 
 from top_fixtures import MockSystemMachine

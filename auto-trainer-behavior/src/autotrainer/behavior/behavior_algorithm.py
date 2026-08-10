@@ -30,7 +30,6 @@ from autotrainer.core.reach_event import ReachEvent
 from autotrainer.core.configuration.behavior_configuration import PelletDeliveryConfiguration, HeadClampConfiguration, \
     BehaviorConfiguration, HomeOnExcessiveDriftDistanceConfiguration, \
     PelletUncoverConfiguration
-from autotrainer.core.video_detection import PresenceDetectionAttrs
 from autotrainer.core.pose_elements import ScenePartsPresenceContext, SceneElement
 from autotrainer.core.capture import CaptureProcessStatus
 from autotrainer.core.interfaces import CaptureAnalysisResult, RecordingEndingReason, BehaviorAlgorithmProtocol, \
@@ -200,7 +199,6 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
         *,
         project_info: Optional[ProjectInfo] = None,
         diamond_triangle_offset_config_path: Optional[Path] = None,
-        topcam_presence: Optional[PresenceDetectionAttrs] = None,
     ):
         super().__init__(event_names=tuple(attr for attr in dir(BehaviorAlgoEvents) if not attr.startswith('_')))
 
@@ -266,8 +264,6 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
         self._previous_intersession_analysis_rsp: Optional[Tuple[ProjectInfo, IntersessionResponse]] = None
 
         self._cover_servo_status = CoverServoStatus.OK
-
-        self._topcam_presence: Optional[PresenceDetectionAttrs] = topcam_presence
 
         if diamond_triangle_offset_config_path is None:
             diamond_triangle_offset_config_path = DiamondTriangleOffsetConfig.DEFAULT_CONFIG_PATH
@@ -518,14 +514,6 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
         if value and not prev:
             self._algo_paused_perf_t = get_perf_now()
         self._on_property_changed(BehaviorAlgoProps.ALGO_PAUSED, value, prev)
-
-    @property
-    def top_camera_presence_detection(self) -> Optional[PresenceDetectionAttrs]:
-        return self._topcam_presence
-
-    @top_camera_presence_detection.setter
-    def top_camera_presence_detection(self, value: Optional[PresenceDetectionAttrs]):
-        self._topcam_presence = value
 
     @property
     def system_state(self) -> SystemState:
@@ -1400,8 +1388,6 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
                 # use 50% more, in case of:
                 maxlen=int(1.5 * config.home_on_excessive_drift_distance.min_samples))
         self._load_pellet_cfg(config.pellet_delivery)
-        if self._topcam_presence is not None:
-            self._topcam_presence.load_config(config.topcam_presence_detection)
         self.head_fixation_enabled = config.head_clamp.enabled
         self.baseline_intensity = config.head_clamp.baseline_intensity
         self.reload_diamond_triangle_config()

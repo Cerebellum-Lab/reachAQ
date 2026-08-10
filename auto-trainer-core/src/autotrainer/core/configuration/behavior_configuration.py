@@ -11,7 +11,6 @@ from autotrainer.core.logging import get_verbose_logger
 from .animal_presence_configuration import GlobalAnimalPresenceConfig
 from .autoclamp_evasion_config import AutoClampEvasionDetectorConfig
 from .external_doors_monitor_configuration import ExternalDoorsAlarmConfig
-from .presence_detection_configuration import PresenceDetectionConfig
 from .system_fault_config import SystemFaultConfig
 from .system_maintenance_config import SystemMaintenanceConfig
 from .. import build_kwargs_apply_mapping, make_camelize_representer, make_decamelize_constructor, Offset3DTuple
@@ -259,7 +258,6 @@ class _BehaviorConfiguration:
     headbar_pressure: HeadbarPressureConfiguration = field(default_factory=HeadbarPressureConfiguration)
     audio: AudioSpectrumThrashMonitorConfig = field(default_factory=AudioSpectrumThrashMonitorConfig)
     emergency_alarm: EmergencyAlarmConfiguration = field(default_factory=EmergencyAlarmConfiguration)
-    topcam_presence_detection: PresenceDetectionConfig = field(default_factory=PresenceDetectionConfig)
     auto_tunnel_sweep: AutoTunnelSweepConfiguration = field(default_factory=AutoTunnelSweepConfiguration)
     home_on_excessive_drift_distance: HomeOnExcessiveDriftDistanceConfiguration = field(default_factory=HomeOnExcessiveDriftDistanceConfiguration)
     cage_cleaning: CageCleaningConfig = field(default_factory=CageCleaningConfig)
@@ -312,6 +310,7 @@ class BehaviorConfiguration(_BehaviorConfiguration):
                  auto_close_gate_on_intersession=None,
                  load_cell=None,
                  auto_tare=None,
+                 topcam_presence_detection=None,
                  **kwargs):
         if mouse_presence is not None:
             logger.notice("Dropping previous mouse_presence config, new default one will be used. dropped entry: %s",
@@ -324,6 +323,8 @@ class BehaviorConfiguration(_BehaviorConfiguration):
             logger.notice("Dropping obsolete automatic recording trigger configuration")
         if load_cell is not None or auto_tare is not None:
             logger.notice("Dropping obsolete weight-sensor configuration")
+        if topcam_presence_detection is not None:
+            logger.notice("Dropping obsolete top-camera presence configuration")
         super().__init__(**kwargs)
 
 
@@ -337,7 +338,6 @@ _tag_2_cls = dict(
     AudioMonitorConfiguration=AudioSpectrumThrashMonitorConfig,
     AnimalPresenceConfiguration=GlobalAnimalPresenceConfig,
     EmergencyAlarmConfiguration=EmergencyAlarmConfiguration,
-    PresenceDetectionConfiguration=PresenceDetectionConfig,
     ExternalDoorsMonitorConfiguration=ExternalDoorsAlarmConfig,
     AutoTunnelSweepConfiguration=AutoTunnelSweepConfiguration,
     HomeOnExcessiveDriftDistance=HomeOnExcessiveDriftDistanceConfiguration,  # missed Configuration suffix
