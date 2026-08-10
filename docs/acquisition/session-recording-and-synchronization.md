@@ -48,11 +48,13 @@ The Behavior panel owns the session controls:
 |---|---|---|
 | **Record** | System Mode is Running, recording state is Ready, and every required source is Ready | Creates a session and begins the existing camera/video-writing path |
 | **Stop** | Recording | Selects the final synchronized camera boundary, closes all writers, retains the session, and runs offline analysis |
-| **Abort** | Arming or Recording | Closes writers, cancels session analysis, deletes the entire session directory, and resets session counts |
+| **Abort** | Arming, Recording, or Analyzing | Closes writers or terminates active analysis, deletes the entire session directory, resets session counts, and restores live inference when enabled |
 
 The recording state progresses through `Ready`, `Arming`, `Recording`,
 `Stopping`, and `Analyzing`. Record stays disabled until analysis for a stopped
-session finishes. Analysis is never started for an aborted session.
+session finishes. Analysis is never started for a session aborted during
+capture; if Abort is selected during analysis, the analysis worker pool is
+terminated before the session directory is removed.
 
 The four Behavior counters are session-scoped: Presented, Reaches, Success, and
 Consumed. They reset when Record is pressed, remain visible after Stop and

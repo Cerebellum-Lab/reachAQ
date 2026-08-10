@@ -308,7 +308,8 @@ without restarting healthy domains.
 Normal acquisition always uses triggered recording. Selecting System Mode
 `Running` starts acquisition and preview without writing session video. Use
 `Record` in the Behavior panel to initialize a session and begin writing,
-`Stop` to retain it and run analysis, or `Abort` to discard the entire session.
+`Stop` to retain it and run analysis, or `Abort` to discard the entire session,
+including while post-session analysis is running.
 Record remains unavailable until analysis for the stopped session finishes.
 Presented, Reaches, Success, and Consumed are session-only counts: they reset on
 Record, remain visible after Stop, and reset to zero after Abort. The old System

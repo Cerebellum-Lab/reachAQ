@@ -374,6 +374,50 @@ def test_abort_removes_whole_session_and_resets_counts(app_model):
     assert algorithm.successful_reaches == 0
 
 
+def test_abort_during_analysis_cancels_analysis_and_removes_session(
+    app_model,
+):
+    project = app_model.project
+    project.session = 1
+    session_path = Path(project.get_session_path().location)
+    analysis_file = session_path / "analysis" / "partial.h5"
+    analysis_file.parent.mkdir(parents=True, exist_ok=True)
+    analysis_file.write_text("partial analysis")
+    app_model.behavior.algorithm.increase_pellets_presented(2)
+    app_model._session_analysis_finished = False
+    app_model._acquisition_started = True
+    app_model._set_subsystem_status(
+        SubsystemId.REACH_SYNCHRONIZATION,
+        SubsystemState.READY,
+    )
+    app_model._set_session_recording_status(SessionRecordingStatus.ANALYZING)
+
+    with mock.patch.object(
+        type(app_model._inference),
+        "is_enabled",
+        new_callable=mock.PropertyMock,
+        return_value=True,
+    ), mock.patch.object(app_model._inference, "stop") as stop, mock.patch.object(
+        app_model.behavior,
+        "on_prepare_capture",
+    ) as reset_behavior, mock.patch.object(
+        app_model,
+        "_start_inference_domain",
+    ) as restart_inference:
+        assert app_model.abort_recording()
+
+    stop.assert_called_once_with()
+    reset_behavior.assert_called_once_with()
+    restart_inference.assert_called_once_with(
+        reach_synchronization_ready=True,
+        preflight_error=None,
+    )
+    assert not session_path.exists()
+    assert project.session == 0
+    assert app_model.behavior.algorithm.pellets_presented == 0
+    assert app_model.session_recording_status is SessionRecordingStatus.READY
+
+
 def test_stop_finishes_auxiliary_data_after_raw_writers_close(app_model):
     app_model._pending_session_end_perf = 12.5
     app_model._session_boundary = SessionBoundary(

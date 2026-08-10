@@ -240,6 +240,7 @@ class BehaviorContent(ContentWidget):
         self._abort_button.setEnabled(status in {
             SessionRecordingStatus.ARMING,
             SessionRecordingStatus.RECORDING,
+            SessionRecordingStatus.ANALYZING,
         })
 
     @invoke_method

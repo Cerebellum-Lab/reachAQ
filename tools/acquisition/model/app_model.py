@@ -1024,6 +1024,7 @@ class AppModel(ObservableObject):
         if previous_status not in {
             SessionRecordingStatus.ARMING,
             SessionRecordingStatus.RECORDING,
+            SessionRecordingStatus.ANALYZING,
         }:
             logger.warning("abort_recording refused while %s", self._session_recording_status.value)
             return False
@@ -1038,6 +1039,38 @@ class AppModel(ObservableObject):
         self._record_start_timer.cancel()
         self._record_start_timer = no_op_timer
         self._set_session_recording_status(SessionRecordingStatus.ABORTING)
+        if previous_status is SessionRecordingStatus.ANALYZING:
+            logger.notice(
+                "Cancelling post-session analysis before deleting %s",
+                self._aborting_project.short_id,
+            )
+            try:
+                self._inference.stop()
+            except Exception as err:
+                logger.exception("Failed to stop post-session analysis")
+                self.on_error("Analysis cancellation failed", str(err))
+                self._set_session_recording_status(previous_status)
+                self._aborted_session_ids.discard(
+                    self._aborting_project.short_id
+                )
+                self._aborting_project = None
+                return False
+            self._behavior.on_prepare_capture()
+            self._finish_abort_recording()
+            synchronization = self._subsystem_status_registry.get(
+                SubsystemId.REACH_SYNCHRONIZATION
+            )
+            if (
+                self._acquisition_started
+                and self._inference.is_enabled
+                and synchronization is not None
+                and synchronization.is_ready
+            ):
+                self._start_inference_domain(
+                    reach_synchronization_ready=True,
+                    preflight_error=None,
+                )
+            return True
         stopped = self._behavior.algorithm.end_capture_session(
             reason=RecordingEndingReason.MANUAL_ABORT,
         )
