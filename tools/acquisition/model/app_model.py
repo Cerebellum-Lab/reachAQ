@@ -4933,24 +4933,6 @@ class AppModel(ObservableObject):
         elif cmd == ApiCommand.STOP_ACQUISITION:
             return self._handle_rpc_async_command(request, self.capture_stop)
 
-        elif cmd == ApiCommand.EMERGENCY_STOP:
-            return ApiCommandRequestResponse(
-                result=ApiCommandRequestResult.FAILED,
-                nonce=request.nonce,
-                command=cmd,
-                error_code=ApiCommandRequestErrorKind.COMMAND_ERROR,
-                error_message="Emergency stop is disabled in reachAQ; use STOP_ACQUISITION for controlled shutdown.",
-            )
-
-        elif cmd == ApiCommand.EMERGENCY_RESUME:
-            return ApiCommandRequestResponse(
-                result=ApiCommandRequestResult.FAILED,
-                nonce=request.nonce,
-                command=cmd,
-                error_code=ApiCommandRequestErrorKind.COMMAND_ERROR,
-                error_message="Emergency resume is disabled in reachAQ; no emergency pause state is maintained.",
-            )
-
         elif cmd == ApiCommand.USER_DEFINED:
             logger.verbose("TODO")
 
@@ -5010,7 +4992,10 @@ class AppModel(ObservableObject):
             ),
         ]
 
-        alarms = []
+        # auto-trainer-api 0.9.22 requires alarm/tunnel-shaped fields in its
+        # status payload. They are compatibility-only placeholders: ReachAQ
+        # has no corresponding alarm, emergency, tunnel, or magnet runtime.
+        legacy_api_alarms = []
 
         dcs_pos_xyz = hard.last_dcs_position
         dcs_send_xyz = hard.last_dcs_set_position
@@ -5035,7 +5020,7 @@ class AppModel(ObservableObject):
                 session_index=project.session,
             ),
             detectors=detectors,
-            alarms=alarms,
+            alarms=legacy_api_alarms,
             pellet_device=ApiPelletDeviceStatus(
                 dcs_x=dcs_pos_xyz.x,
                 dcs_y=dcs_pos_xyz.y,

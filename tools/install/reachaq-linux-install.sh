@@ -389,7 +389,6 @@ run_focused_tests() {
             auto-trainer-device/tests/laser_test.py \
             auto-trainer-inference/tests/gpu_runtime_test.py \
             tests/acquisition_args_test.py \
-            tests/behavior_model_test.py::TestEmergency \
             tests/autotrainer_headless_test.py::test_cli_help \
             tests/autotrainer_headless_test.py::test_load_config \
             tests/autotrainer_headless_test.py::test_gpu_preflight_fails_before_cameras_and_hardware \
