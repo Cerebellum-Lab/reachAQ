@@ -26,7 +26,7 @@ def test_cover_or_release_pellet_on_load_pellet(mock_system, machine, cover_enab
     algo.update_pellet_seen(True)
     algo.update_triangle_seen(True)
 
-    assert machine.state == SystemState.cage
+    assert machine.state == SystemState.ready
     assert not algo.is_in_session
     assert algo.pellet_recently_seen
     # assert pellet_m.state == PelletState.monitoring
@@ -48,7 +48,7 @@ def test_cover_or_release_pellet_on_load_pellet(mock_system, machine, cover_enab
     assert algo.session_pellet_loaded_count == 0
     mock_system.mock_pellet_ack()  # ack the load
     assert algo.session_pellet_loaded_count == 1  # here it is !
-    mock_system.start_session_in_tunnel(set_recording_status=True)
+    mock_system.start_recording_session(set_recording_status=True)
     assert algo.session_pellet_loaded_count == 0  # back to 0 given new session/trial
     mock_system.mock_pose_response(pellet_seen=True)
     mock_system.mock_pellet_ack()  # ack the retract
@@ -88,10 +88,10 @@ def test_send_pellet_after_load_when_triangle_not_seen(mock_system, machine, cov
     algo.update_pellet_seen(True)
     algo.update_triangle_seen(True)
 
-    assert machine.state == SystemState.cage
+    assert machine.state == SystemState.ready
     assert not algo.is_in_session
     assert algo.pellet_recently_seen
-    # Send a pose response with pellet not seen which should trigger a load/cover cycle while out of tunnel.
+    # A missing pellet should trigger a load/cover cycle while no session is recording.
     mock_system.mock_pose_response(pellet_seen=False, triangle_seen=True)
     mock_system.mock_pellet_ack(until_none=True)
     assert algo.session_pellet_loaded_count == 0
@@ -258,7 +258,7 @@ def test_move_home(machine, mock_system):
     assert pellet_m._api_status_token is not None
     assert pellet_m.state == PelletState.home
     mock_system.mock_pellet_ack()
-    mock_system.start_session_in_tunnel(set_recording_status=True)
+    mock_system.start_recording_session(set_recording_status=True)
     assert algo.is_in_session
     mock_system.mock_pellet_ack()
     mock_system.mock_pose_response(pellet_seen=True)

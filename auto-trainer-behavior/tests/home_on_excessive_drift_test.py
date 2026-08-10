@@ -63,7 +63,7 @@ class TestHomeOnExcessiveDrift(MockSystemMachine):
     def _make_to_monitoring(self):
         self.mock_pose_response(pellet_seen=True)
         self.mock_pellet_ack(until_none=True)
-        self.start_session_in_tunnel(set_recording_status=True)
+        self.start_recording_session(set_recording_status=True)
         self.mock_pose_response(pellet_seen=True)
         self.mock_pellet_ack(until_none=True)
 
@@ -125,7 +125,7 @@ class TestHomeOnExcessiveDrift(MockSystemMachine):
         # algo.update_pellet_seen(True)
         algo.active_config.pellet_delivery.pellet_send_wait_delay = 0
         algo.record_prebuffer_duration = 0
-        self.start_session_in_tunnel(set_recording_status=True)
+        self.start_recording_session(set_recording_status=True)
         self.mock_pellet_ack(until_none=True)
         assert algo.is_in_session
         self._execute_pose_responses(rsp, min_samples)

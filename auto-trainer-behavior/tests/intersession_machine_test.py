@@ -72,7 +72,7 @@ def test_intersession_increase_algo_counts(mock_system):
     algo = mock_system.algo
     algo.intersession_enabled = True
     mock_system.mock_pose_response(pellet_seen=True)
-    mock_system.start_session_in_tunnel(set_recording_status=True)
+    mock_system.start_recording_session(set_recording_status=True)
     assert algo.is_in_session
     algo.update_mouse_seen(True)
     res = IntersessionResponse(
@@ -82,28 +82,28 @@ def test_intersession_increase_algo_counts(mock_system):
         successful_reaches=1,
     )
     with mock_system.mock_intersession_analysis(results=res):
-        mock_system.exit_tunnel()
+        mock_system.stop_recording_session()
     assert algo.pellets_presented == 0  # pellet-sent owns this count
     assert algo.pellet_reaches == 3
     assert algo.pellets_consumed == 2
     assert algo.successful_reaches == 1
 
 
-def test_exit_tunnel_when_analysis_ongoing(mock_system, machine, caplog):
+def test_stop_recording_session_when_analysis_ongoing(mock_system, machine, caplog):
     algo = mock_system.algo
     algo.intersession_enabled = True
     def verify_analysis_blocks_exit():
         assert machine.state == SystemState.intersession
-        mock_system.exit_tunnel()
+        mock_system.stop_recording_session()
         assert machine.state == SystemState.intersession
 
-    mock_system.start_session_in_tunnel()
+    mock_system.start_recording_session()
     mock_system.mock_pose_response(pellet_seen=True, mouse_seen=True, triangle_seen=True)
 
     with caplog.at_level(logging.DEBUG):
         with mock_system.mock_intersession_analysis(concurrent_func=verify_analysis_blocks_exit):
-            assert machine.state == SystemState.tunnel
-            mock_system.exit_tunnel()
+            assert machine.state == SystemState.ready
+            mock_system.stop_recording_session()
             assert machine.state == SystemState.intersession
 
-    assert machine.state == SystemState.cage, "Must be back in cage after end intersession analysis"
+    assert machine.state == SystemState.ready, "Must be ready after intersession analysis"

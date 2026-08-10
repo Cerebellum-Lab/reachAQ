@@ -61,12 +61,12 @@ class TestShiftXYZ(MockSystemMachine):
         )
         project = self._machine.project.to_local_value()
         with self.mock_intersession_analysis(results=rsp, project=project):
-            self.exit_tunnel()
+            self.stop_recording_session()
         assert not algo.is_in_session
         self.increment_perf_now(1)
         self.mock_pose_response(pellet_seen=True, mouse_seen=True)
         self.mock_pellet_ack(until_none=True)
-        self.start_session_in_tunnel(set_recording_status=True)
+        self.start_recording_session(set_recording_status=True)
         assert algo.is_in_session
 
     def test_with_many_failed_reaches_clear_buffer(self, caplog):
@@ -92,7 +92,7 @@ class TestShiftXYZ(MockSystemMachine):
         expected_shift = Offset3DTuple(-2.0375, 3.4875, 0)
         self.pellet_dev.last_dcs_set_position = Offset3DTuple(-5, 25, -6)
         self.mock_pose_response(pellet_seen=True)
-        self.start_session_in_tunnel(set_recording_status=True)
+        self.start_recording_session(set_recording_status=True)
         self.mock_pellet_ack(until_none=True)
         caplog.clear()
         caplog.set_level(logging.INFO)
@@ -104,9 +104,9 @@ class TestShiftXYZ(MockSystemMachine):
         for rh_max_vp_list in rh_max_vp_lists:
             self.make_session(reach_events, rh_max_vp_list)
             self.increment_perf_now(3)
-        assert system.state == SystemState.tunnel
-        self.exit_tunnel()
-        assert system.state == SystemState.cage
+        assert system.state == SystemState.ready
+        self.stop_recording_session()
+        assert system.state == SystemState.ready
         assert system.intersession.state == IntersessionState.idle
         assert f"applying pellet send_position shift: {expected_shift.round(1)}" in caplog.text
         # NB: applied shift are in motor coordinate:
@@ -163,7 +163,7 @@ class TestShiftXYZ(MockSystemMachine):
         #
         expected_shift = Offset3DTuple(0, 0.5, 0)
         self.mock_pose_response(pellet_seen=True)
-        self.start_session_in_tunnel(set_recording_status=True)
+        self.start_recording_session(set_recording_status=True)
         self.mock_pellet_ack(until_none=True)
 
         self.pellet_dev.last_dcs_set_position = Offset3DTuple(-5, 25, -6)
@@ -172,11 +172,11 @@ class TestShiftXYZ(MockSystemMachine):
         for reach_events, rh_max_vp_list in zip(reaches_list, rh_max_vp_lists):
             self.make_session(reach_events, rh_max_vp_list)
             self.increment_perf_now(3)
-        assert system.state == SystemState.tunnel
-        self.exit_tunnel()
+        assert system.state == SystemState.ready
+        self.stop_recording_session()
         #
         assert algo.pellet_shift_y_limit == 25.5
-        assert system.state == SystemState.cage
+        assert system.state == SystemState.ready
         assert system.intersession.state == IntersessionState.idle
         assert (
             f"applying pellet send_position shift: {expected_shift.round(1)}"

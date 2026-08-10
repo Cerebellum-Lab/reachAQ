@@ -44,7 +44,7 @@ class SystemMachine(StateMachine):
                  project_info: Optional[ProjectInfo] = None,
                  ):
 
-        initial_state = SystemState.cage
+        initial_state = SystemState.ready
         super().__init__(initial_state=initial_state)
 
         self.machine = Machine(
@@ -63,8 +63,6 @@ class SystemMachine(StateMachine):
         self._aborted_session_ids = set()
         #
         self._is_handling_diamond_triangle = False
-
-        self._enter_tunnel_pellet_seen = False
 
         self._session_started_perf_c = -math.inf
 
@@ -119,9 +117,6 @@ class SystemMachine(StateMachine):
         intersession_machine.events.on_analysis_ended += self._on_intersession_analysis_ended
         intersession_machine.events.state_changed += self._on_intersession_state_changed
 
-    def cancel_timers(self):
-        """Compatibility hook; ReachAQ has no head-fix timers."""
-
     @property
     def analysis(self) -> ReachAnalysis:
         return self._analysis
@@ -154,24 +149,6 @@ class SystemMachine(StateMachine):
     def shift_xyz_handler(self) -> ShiftXYZHandler:
         return self._shift_xyz_handler
 
-    def can_enter_tunnel(self, *, reason: str = "NA") -> bool:
-        return True
-
-    def can_exit_intersession_to_tunnel(self) -> bool:
-        return True
-
-    def before_enter_tunnel(self, *, reason: str = "NA"):
-        pellet_state = self._pellet_machine.state
-        self._enter_tunnel_pellet_seen = self._algorithm.pellet_recently_seen
-        logger.debug("starting pellet-ready state: reason=%s state=%s pellet_state=%s",
-                     reason, self._state, pellet_state)
-
-    def after_enter_tunnel(self, *, reason: str = "NA"):
-        return None
-
-    def after_exit_tunnel(self, *, reason: str = "NA"):
-        logger.verbose("leaving pellet-ready state: %s", reason)
-
     def after_enter_intersession(self, project_info: ProjectInfo, *, reason="NA"):
         algo = self._algorithm
         intersession = self._intersession
@@ -191,14 +168,11 @@ class SystemMachine(StateMachine):
 
     def after_exit_intersession(self):
         with self._algorithm.set_allow_reentrant(True):
-            self.exit_intersession_to_cage()
+            self.exit_intersession_to_ready()
 
-    def after_exit_intersession_to_cage(self):
+    def after_exit_intersession_to_ready(self):
         # ensure pellet goes back where necessary:
-        self._pellet_machine.environment_changed(caller="exit_intersession_to_cage")
-
-    def after_exit_intersession_to_tunnel(self):
-        self.enter_tunnel(reason="exit_intersession_to_tunnel")
+        self._pellet_machine.environment_changed(caller="exit_intersession_to_ready")
 
     @BehaviorAlgorithm.relay_func(wait=False)
     def _on_session_capture_started(self):
@@ -304,9 +278,7 @@ class SystemMachine(StateMachine):
             return
         algo = self._algorithm
         if (
-            # self._state == SystemState.tunnel
-            # TODO: we could also decide to check in SystemState.cage as well,
-            #  as far as we can ensure pellet is at deliver/send position
+            # Ensure the pellet is at the delivery position.
             self._pellet_machine.state == PelletState.monitoring
             and self._pellet_machine.can_use_pellet_command()
         ):
@@ -604,18 +576,6 @@ class SystemMachine(StateMachine):
     def may_trigger(self):
         """Trigger"""
 
-    def enter_tunnel(self, *, reason: str = "NA"):
-        """Enter tunnel"""
-
-    def may_enter_tunnel(self):
-        """Enter tunnel"""
-
-    def exit_tunnel(self, *, reason: str = "NA"):
-        """Exit tunnel"""
-
-    def may_exit_tunnel(self):
-        """Exit tunnel"""
-
     def enter_intersession(self, project_info: ProjectInfo, *, reason: str="NA"):
         """Enter intersession"""
 
@@ -631,26 +591,17 @@ class SystemMachine(StateMachine):
     def exit_intersession(self):
         """Exit intersession"""
 
-    def exit_intersession_to_tunnel(self):
-        """Exit intersession"""
-
-    def exit_intersession_to_cage(self):
+    def exit_intersession_to_ready(self):
         """Exit intersession"""
 
     def may_exit_intersession(self):
         """Exit intersession"""
 
-    def may_exit_intersession_to_tunnel(self):
+    def may_exit_intersession_to_ready(self):
         """Exit intersession"""
 
-    def may_exit_intersession_to_cage(self):
-        """Exit intersession"""
-
-    def is_cage(self):
-        """Is cage"""
-
-    def is_tunnel(self):
-        """Is tunnel"""
+    def is_ready(self):
+        """Is ready"""
 
     def is_intersession(self):
         """Is intersession"""
@@ -658,24 +609,8 @@ class SystemMachine(StateMachine):
 
     transitions = transitions_allow_functions([
         dict(
-            trigger=enter_tunnel,
-            source=[SystemState.cage, SystemState.tunnel],
-            dest=SystemState.tunnel,
-            conditions=can_enter_tunnel,
-            before=before_enter_tunnel,
-            after=after_enter_tunnel,
-        ),
-
-        dict(
-            trigger=exit_tunnel,
-            source=SystemState.tunnel,
-            dest=SystemState.cage,
-            after=after_exit_tunnel,
-        ),
-
-        dict(
             trigger=enter_intersession,
-            source=(SystemState.cage, SystemState.tunnel),
+            source=SystemState.ready,
             dest=SystemState.intersession,
             after=after_enter_intersession,
         ),
@@ -695,15 +630,8 @@ class SystemMachine(StateMachine):
         ),
 
         dict(
-            trigger=exit_intersession_to_tunnel,
-            source=SystemState.intersession,
-            dest=SystemState.tunnel,
-            conditions=can_exit_intersession_to_tunnel,
-            after=after_exit_intersession_to_tunnel,
-        ),
-        dict(
-            trigger=exit_intersession_to_cage,
-            source=SystemState.intersession, dest=SystemState.cage,
-            after=after_exit_intersession_to_cage,
+            trigger=exit_intersession_to_ready,
+            source=SystemState.intersession, dest=SystemState.ready,
+            after=after_exit_intersession_to_ready,
         )
     ])

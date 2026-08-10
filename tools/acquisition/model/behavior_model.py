@@ -101,7 +101,7 @@ class BehaviorModel(ObservableObject, ProjectDependentProtocol):
 
     def on_prepare_capture(self):
         self._system_machine.project = self._project
-        self._system_machine.state = SystemState.cage  # forced,
+        self._system_machine.state = SystemState.ready  # forced,
         self._system_machine.intersession.state = IntersessionState.idle
         # if acquisition is/was stopped during an intersession analysis,
         # then it's left on intersession+(segmentation | detection) state..

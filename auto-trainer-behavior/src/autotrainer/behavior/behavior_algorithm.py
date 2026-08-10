@@ -233,7 +233,7 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
 
         self._uncover_ctx = PelletUncoverContext()
 
-        self._system_state = SystemState.cage
+        self._system_state = SystemState.ready
         self._intersession_state = IntersessionState.idle
         self._capture_status = CaptureProcessStatus.UNKNOWN
         self._recording_start_perf_c = math.nan
@@ -1050,9 +1050,7 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
         if pellet_missing:
             # logger.verbose("BehaviorAlgo.can_load_pellet: pellet missing")
             return True
-        # NB: todo: pellet_too_far should probably not immediately trigger a load-pellet...
-        # first a tunnel FAN can be executed..
-        # then maybe normal pellet-load (with pellet fully mussing) will be triggered
+        # A distance failure is treated like a missing pellet and triggers reload.
         pellet_too_far = (
             (delivery_cfg is None or delivery_cfg.use_triangle_pellet_distance_too_far)
              and pellet_state == PelletState.monitoring
@@ -1121,15 +1119,6 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
                 )
             return False
         return True
-
-        # TODO: Covering for session counts is on hold due to a) not knowing actual consumed, only load cycles (
-        # determining consumed happens during intersession) and b) need to determine whether said limit should
-        # reset per session or per tunnel entrance (which can have multiple "sessions" when a pellet is dropped).
-        # if not self.pellet_cover_enabled:
-        #    if self.system_state == SystemState.tunnel:
-        #    else:
-        #        return True
-        #
 
     def can_retract_pellet(self, *, pellet_state: PelletState) -> bool:
         if self._algo_paused or pellet_state in {

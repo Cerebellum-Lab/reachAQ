@@ -27,7 +27,7 @@ from autotrainer.behavior.pellet.pellet_machine import PelletMachine
 from autotrainer.inference.analysis import IntersessionResponse
 
 
-def test_enter_exit_tunnel(mock_system, machine):
+def test_start_stop_recording_session(mock_system, machine):
     algo = machine.algorithm
 
     # Observe for video capture being triggered.
@@ -43,7 +43,7 @@ def test_enter_exit_tunnel(mock_system, machine):
     assert algo.intersession_enabled is False
 
     # Defaults
-    assert machine.state == SystemState.cage
+    assert machine.state == SystemState.ready
     assert algo.is_in_session is False
     assert not algo.pellet_recently_seen
     algo.update_pellet_seen(True)
@@ -51,34 +51,31 @@ def test_enter_exit_tunnel(mock_system, machine):
     assert is_capture_triggered is False
 
     # Manual Record owns session start.
-    mock_system.start_session_in_tunnel()
+    mock_system.start_recording_session()
 
     assert algo.is_in_session is True
     assert is_capture_triggered is True
-    assert machine.state == SystemState.tunnel
+    assert machine.state == SystemState.ready
 
-    mock_system.exit_tunnel()
+    mock_system.stop_recording_session()
 
-    assert machine.state == SystemState.cage
+    assert machine.state == SystemState.ready
     assert algo.is_in_session is False
     assert is_capture_triggered is False
-    assert mock_system.machine_state_trans == [
-        SystemState.tunnel,
-        SystemState.cage,
-    ]
+    assert mock_system.machine_state_trans == []
 
 
 def test_manual_session_does_not_require_pellet(mock_system, machine: SystemMachine):
     algo = machine.algorithm
     assert not algo.pellet_recently_seen
 
-    mock_system.start_session_in_tunnel(set_recording_status=True)
+    mock_system.start_recording_session(set_recording_status=True)
 
     assert algo.is_in_session
-    assert machine.state == SystemState.tunnel
-    mock_system.exit_tunnel()
+    assert machine.state == SystemState.ready
+    mock_system.stop_recording_session()
     assert not algo.is_in_session
-    assert machine.state == SystemState.cage
+    assert machine.state == SystemState.ready
 
 
 def test_intersession_enabled(mock_system, machine):
@@ -93,7 +90,7 @@ def test_intersession_enabled(mock_system, machine):
     algo.intersession_enabled = True
     algo.pellet_cover_enabled = True
 
-    assert machine.state == SystemState.cage
+    assert machine.state == SystemState.ready
     assert algo.system_state == machine.state
     assert pellet_m.state == PelletState.monitoring
 
@@ -108,11 +105,11 @@ def test_intersession_enabled(mock_system, machine):
     assert pellet_m._api_status_token is not None  # but we wait the cover ack
     mock_system.mock_pellet_ack()
     
-    mock_system.start_session_in_tunnel(set_recording_status=True)  # this trigger a start session recording
+    mock_system.start_recording_session(set_recording_status=True)  # this trigger a start session recording
 
     assert algo.is_in_session
     assert pellet_m.state == PelletState.retract
-    assert machine.state == SystemState.tunnel
+    assert machine.state == SystemState.ready
     assert algo.system_state == machine.state
     mock_system.mock_pellet_ack(until_none=True)
     assert pellet_m.state == PelletState.retract
@@ -123,15 +120,12 @@ def test_intersession_enabled(mock_system, machine):
     assert pellet_m.state == PelletState.monitoring
 
     with mock_system.mock_perform_segmentation():
-        mock_system.exit_tunnel()
+        mock_system.stop_recording_session()
 
     assert algo.intersession_state == IntersessionState.segmentation
     assert machine.state == SystemState.intersession
     assert algo.system_state == machine.state
-    assert mock_system.machine_state_trans == [
-        SystemState.tunnel,
-        SystemState.intersession,
-    ]
+    assert mock_system.machine_state_trans == [SystemState.intersession]
     assert mock_system.pellet_state_trans == [
         PelletState.sending,
         PelletState.monitoring,
@@ -210,7 +204,7 @@ class TestSessionProcessingEnding(MockSystemMachine):
         assert processing_ended_count == 1
 
     @pytest.mark.parametrize("detection_success", [False, True])
-    @pytest.mark.parametrize("system_state", [SystemState.cage, SystemState.tunnel])
+    @pytest.mark.parametrize("system_state", [SystemState.ready])
     def test_when_intersession_mouse_seen(self, machine, detection_success, system_state):
         processing_ended_count = 0
         def processing_ended(prj, status):
@@ -271,11 +265,11 @@ def test_handle_diamond_triangle_offset_full(mock_system, machine):
     algo = machine.algorithm
     algo.reload_diamond_triangle_config()  # ensure it's loaded
     mock_system.mock_pose_response(pellet_seen=True)
-    mock_system.start_session_in_tunnel(set_recording_status=True)
+    mock_system.start_recording_session(set_recording_status=True)
     mock_system.mock_pellet_ack(until_none=True)
     pellet_m = machine.pellet
     diamond_cfg = machine.algorithm.diamond_triangle_config
-    assert machine.state == SystemState.tunnel
+    assert machine.state == SystemState.ready
     assert pellet_m.state == PelletState.monitoring
     assert pellet_m.can_use_pellet_command()
     #

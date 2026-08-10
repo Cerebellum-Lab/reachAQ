@@ -442,23 +442,19 @@ class MockSystemMachine:
 
     #
 
-    def start_session_in_tunnel(self, set_recording_status: bool = False):
+    def start_recording_session(self, set_recording_status: bool = False):
         algo = self.algo
         assert not algo.is_in_session
-        assert self._machine.state == SystemState.cage
-        self._machine.enter_tunnel(reason="manual")
+        assert self._machine.state == SystemState.ready
         algo.start_session(reason="manual")
         if set_recording_status:
             algo.set_capture_status(CaptureProcessStatus.RECORDING)
         # assert algo.is_in_session
-        assert self._machine.state == SystemState.tunnel
+        assert self._machine.state == SystemState.ready
 
-    def exit_tunnel(self):
-        assert self._machine.state != SystemState.cage
+    def stop_recording_session(self):
         if self.algo.is_in_session:
             self.algo.end_capture_session(reason=RecordingEndingReason.MANUAL_STOP)
-        if self._machine.state == SystemState.tunnel:
-            self._machine.exit_tunnel(reason="manual")
 
     @contextlib.contextmanager
     def patch_timer(self, place, new=None) -> ContextManager[Union[mock.MagicMock, DaemonTimer]]:  # noqa
