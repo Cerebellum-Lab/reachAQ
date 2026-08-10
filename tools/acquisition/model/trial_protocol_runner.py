@@ -101,9 +101,17 @@ class TrialProtocolRunner:
         """Count and evaluate one non-hardware pellet trial exactly once."""
         if self._active_attempt_label != str(attempt_label):
             return False
+        self._active_attempt_label = None
+        return self.record_trial_outcome(attempt_label, outcome)
+
+    def record_trial_outcome(
+        self,
+        attempt_label: str,
+        outcome: TrialOutcome,
+    ) -> bool:
+        """Apply one finalized pellet-trial result after session analysis."""
         plan = self._plan
         phase = None if plan is None else plan.current_phase
-        self._active_attempt_label = None
         if phase is None:
             return False
 

@@ -233,6 +233,38 @@ class SessionDataRecorder:
             self._trial_records = tuple(dict(record) for record in records)
             self._trial_summary = dict(summary)
 
+    @staticmethod
+    def update_persisted_trial_ledger(project, records, summary) -> None:
+        """Atomically replace the post-analysis trial ledger and summary."""
+        streams_dir = Path(project.get_session_path().location) / "streams"
+        alignment_path = streams_dir / "alignment.json"
+        with alignment_path.open("r", encoding="utf-8") as stream:
+            alignment = json.load(stream)
+        boundary = alignment["canonicalBoundary"]
+        start_perf = float(boundary["startPerfTime"])
+        end_perf = float(boundary["endPerfTime"])
+        records = tuple(
+            dict(record)
+            for record in records
+            if start_perf <= float(record["send_perf_time"]) <= end_perf
+        )
+        for record in records:
+            record["send_offset_seconds"] = (
+                float(record["send_perf_time"]) - start_perf
+            )
+
+        trial_path = streams_dir / "trials.jsonl"
+        trial_tmp = trial_path.with_suffix(".jsonl.tmp")
+        SessionDataRecorder._write_json_lines(trial_tmp, records)
+        trial_tmp.replace(trial_path)
+
+        summary_path = streams_dir / "trial_summary.json"
+        summary_tmp = summary_path.with_suffix(".json.tmp")
+        with summary_tmp.open("w", encoding="utf-8") as stream:
+            json.dump(dict(summary), stream, indent=2)
+            stream.write("\n")
+        summary_tmp.replace(summary_path)
+
     def _clear_locked(self) -> None:
         self._armed = False
         self._project = None

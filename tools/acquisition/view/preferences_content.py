@@ -535,6 +535,16 @@ class PreferencesContent(QWidget):
         count_basis = QComboBox()
         for basis in TrialCountBasis:
             count_basis.addItem(basis.display_name, basis.value)
+            if basis is TrialCountBasis.SCORED:
+                index = count_basis.count() - 1
+                item = count_basis.model().item(index)
+                item.setEnabled(False)
+                count_basis.setItemData(
+                    index,
+                    "Scored outcomes are calculated after recording stops, so "
+                    "they cannot be used as an active-session stop threshold.",
+                    Qt.ToolTipRole,
+                )
         count_basis.setCurrentIndex(count_basis.findData(config.trial_count_basis))
         count_basis.currentIndexChanged.connect(
             lambda _index: setattr(

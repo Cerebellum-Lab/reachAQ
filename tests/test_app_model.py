@@ -16,6 +16,8 @@ from autotrainer.core import (
 from autotrainer.core.interfaces import RecordingEndingReason
 from autotrainer.core.capture import CaptureProcessStatus
 from autotrainer.core.configuration.persistence_configuration import PersistenceConfiguration
+from autotrainer.core.reach_event import ReachEvent, ReachEventMethod, ReachEventOutcome
+from autotrainer.inference.analysis import IntersessionResponse
 from autotrainer.behavior.behavior_algorithm import BehaviorAlgoStatus
 from autotrainer.behavior.pellet_trial import (
     HardwareErrorKind,
@@ -93,6 +95,17 @@ def test_automatic_protocol_advance_updates_live_runner(app_model):
     session_control = app_model.behavior.algorithm.active_config.session_control
     assert session_control.automatic_protocol_advance_enabled is True
     assert app_model._protocol_runner.automatic_advance is True
+
+
+def test_scored_trial_limit_is_blocked_until_online_scoring_exists(app_model):
+    control = app_model.behavior.algorithm.active_config.session_control
+    control.trial_limit = 5
+    control.trial_count_basis = "scored"
+
+    assert any(
+        "Scored trials are available after analysis" in blocker
+        for blocker in app_model.recording_blockers
+    )
 
 
 def test_it_drain_record_stop_sema_on_session_recording_start(app_model):
@@ -394,7 +407,77 @@ def test_pellet_cycle_completion_finishes_trial_before_automatic_stop(
     )
     assert ledger.active_attempt is None
     assert ledger.summary()["trials_completed"] == 1
-    finish_trial.assert_called_once_with("1.1", TrialOutcome.PENDING_ANALYSIS)
+    # Protocol progress waits for the per-attempt offline outcome.
+    finish_trial.assert_not_called()
+
+
+def test_post_session_analysis_finalizes_attempts_persists_and_syncs_counts(
+    app_model,
+):
+    project = app_model.project
+    ledger = PelletTrialLedger(project.short_id)
+    ledger.begin_send(100.5, 1000.5, operation_id="send-1")
+    ledger.acknowledge_presentation(100.55, 1000.55)
+    ledger.close_active_for_analysis(101.5, 1001.5)
+    app_model._trial_ledger = ledger
+    app_model._session_boundary = SessionBoundary(
+        session_id=project.short_id,
+        primary_camera="left",
+        primary_frame_id=0,
+        start_perf_time=100.0,
+        start_wall_time=1000.0,
+        camera_when=500.0,
+        end_perf_time=102.0,
+    )
+    primary = app_model._ordered_reach_cameras(enabled_only=True)[0]
+    primary.active_config.params["fps"] = 150
+    fps = 150.0
+    result = IntersessionResponse(
+        reach_events=[ReachEvent(
+            init=int(0.75 * fps),
+            end=int(0.9 * fps),
+            method=ReachEventMethod.RIGHT_HAND,
+            outcome=ReachEventOutcome.EATEN,
+        )],
+        food_consumed=1,
+        successful_reaches=1,
+        total_reaches=1,
+    )
+
+    with mock.patch.object(
+        app_model,
+        "_read_trial_stream_references",
+        return_value=(
+            ({"eventPerfTime": 100.8, "channel": "tone1"},),
+            ({"perf_time": 100.9, "channel": "left"},),
+        ),
+    ), mock.patch.object(
+        app_model._session_data_recorder,
+        "update_persisted_trial_ledger",
+    ) as update, mock.patch.object(
+        app_model._protocol_runner,
+        "record_trial_outcome",
+    ) as protocol_outcome:
+        app_model._on_detection_result_ready(project, result)
+
+    attempt = ledger.attempts[0]
+    assert attempt.outcome is TrialOutcome.SUCCESS
+    assert attempt.reach_count == 1
+    assert attempt.success_count == 1
+    assert attempt.consumption_count == 1
+    assert attempt.tone_references[0]["channel"] == "tone1"
+    assert attempt.laser_references[0]["channel"] == "left"
+    assert ledger.summary()["pending_analysis_attempts"] == 0
+    assert app_model.behavior.algorithm.pellet_reaches == 1
+    assert app_model.behavior.algorithm.pellets_presented == 1
+    assert app_model.behavior.algorithm.successful_reaches == 1
+    assert app_model.behavior.algorithm.pellets_consumed == 1
+    protocol_outcome.assert_called_once_with("1.1", TrialOutcome.SUCCESS)
+    update.assert_called_once_with(
+        project,
+        ledger.to_records(),
+        ledger.summary(),
+    )
 
 
 def test_abort_removes_whole_session_and_resets_counts(app_model):

@@ -590,3 +590,55 @@ def test_trial_ledger_is_written_on_the_canonical_session_timeline(tmp_path):
     assert trial_source["id"] == "trials"
     assert trial_source["sampleCount"] == 1
     assert trial_source["persistenceStatus"] == "written"
+
+
+def test_post_analysis_trial_ledger_replaces_pending_records_atomically(tmp_path):
+    project = ProjectInfo(
+        root=str(tmp_path),
+        device_id="test",
+        when=datetime(2026, 1, 2, 3, 4, 5),
+        session=7,
+    )
+    SessionDataRecorder._write_session(
+        project,
+        10.0,
+        100.0,
+        12.0,
+        (), (), (), (),
+        trial_records=({
+            "session_id": project.short_id,
+            "operation_id": "send-1",
+            "trial_id": 1,
+            "attempt_id": 1,
+            "attempt_label": "1.1",
+            "send_perf_time": 10.25,
+            "outcome": "pending_analysis",
+        },),
+        trial_summary={"pending_analysis_attempts": 1},
+    )
+
+    SessionDataRecorder.update_persisted_trial_ledger(
+        project,
+        ({
+            "session_id": project.short_id,
+            "operation_id": "send-1",
+            "trial_id": 1,
+            "attempt_id": 1,
+            "attempt_label": "1.1",
+            "send_perf_time": 10.25,
+            "outcome": "success",
+            "reach_count": 1,
+        },),
+        {"pending_analysis_attempts": 0, "scored_trials": 1},
+    )
+
+    streams = tmp_path / "20260102" / "test" / "session007" / "streams"
+    record = json.loads((streams / "trials.jsonl").read_text().strip())
+    assert record["outcome"] == "success"
+    assert record["reach_count"] == 1
+    assert record["send_offset_seconds"] == 0.25
+    assert json.loads((streams / "trial_summary.json").read_text()) == {
+        "pending_analysis_attempts": 0,
+        "scored_trials": 1,
+    }
+    assert not tuple(streams.glob("*.tmp"))

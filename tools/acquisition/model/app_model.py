@@ -1624,6 +1624,15 @@ class AppModel(ObservableObject):
     @property
     def recording_blockers(self) -> Tuple[str, ...]:
         blockers = list(self._subsystem_status_registry.recording_blockers())
+        session_control = self._behavior.algorithm.active_config.session_control
+        if (
+            session_control.trial_limit is not None
+            and session_control.trial_count_basis == TrialCountBasis.SCORED.value
+        ):
+            blockers.append(
+                "Scored trials are available after analysis and cannot stop "
+                "the active recording; choose another trial-limit count"
+            )
         if self._protocol_runner.protocol_complete:
             blockers.append("Selected protocol is complete")
         if self._session_recording_status is not SessionRecordingStatus.READY:
@@ -4628,9 +4637,88 @@ class AppModel(ObservableObject):
         if project.short_id in self._aborted_session_ids:
             logger.info("ignoring analysis result for aborted session %s", project.short_id)
             return
-        # SystemMachine applies this result to the session-only behavior counts.
-        # Final project metadata is written by _on_session_ending after all
-        # analysis callbacks for this session have completed.
+        ledger = self._trial_ledger
+        boundary = self._session_boundary
+        if (
+            ledger is None
+            or boundary is None
+            or boundary.session_id != project.short_id
+        ):
+            return
+        primary = self._ordered_reach_cameras(enabled_only=True)[0]
+        frame_rate = primary.active_config.params.get("fps")
+        if frame_rate is None:
+            frame_rate = self._behavior.system_machine.intersession.frame_rate
+        if frame_rate is None:
+            raise RuntimeError(
+                "Cannot reconcile pellet attempts without the analyzed camera frame rate"
+            )
+        frame_rate = float(frame_rate)
+        tone_references, laser_references = self._read_trial_stream_references(
+            project
+        )
+        finalized = ledger.reconcile_analysis(
+            result,
+            recording_start_perf_time=boundary.start_perf_time,
+            frame_rate=frame_rate,
+            finalized_perf_time=(
+                boundary.end_perf_time
+                if boundary.end_perf_time is not None
+                else get_perf_now()
+            ),
+            finalized_wall_time=(
+                boundary.end_wall_time
+                if boundary.end_wall_time is not None
+                else time.time()
+            ),
+            tone_references=tone_references,
+            laser_references=laser_references,
+        )
+        for attempt in finalized:
+            if attempt.logical_trial_complete:
+                self._protocol_runner.record_trial_outcome(
+                    attempt.attempt_label,
+                    attempt.outcome,
+                )
+        self._sync_session_counts_from_results(ledger)
+        self._session_data_recorder.update_persisted_trial_ledger(
+            project,
+            ledger.to_records(),
+            ledger.summary(),
+        )
+
+    @staticmethod
+    def _read_trial_stream_references(project):
+        streams = Path(project.get_session_path().location) / "streams"
+        tone_references = []
+        alignment_path = streams / "alignment.json"
+        if alignment_path.exists():
+            with alignment_path.open("r", encoding="utf-8") as stream:
+                tone = json.load(stream).get("toneConfirmation") or {}
+            tone_references.extend(tone.get("matched", ()))
+            tone_references.extend(tone.get("unmatchedEvents", ()))
+
+        laser_references = []
+        laser_path = streams / "laser.csv"
+        if laser_path.exists():
+            with laser_path.open("r", encoding="utf-8", newline="") as stream:
+                for row in csv.DictReader(stream):
+                    if row.get("perf_time"):
+                        row["perf_time"] = float(row["perf_time"])
+                    laser_references.append(row)
+        return tuple(tone_references), tuple(laser_references)
+
+    def _sync_session_counts_from_results(
+        self,
+        ledger: PelletTrialLedger,
+    ) -> None:
+        """Project the four UI values from one reconciled session result."""
+        algo = self._behavior.algorithm
+        summary = ledger.summary()
+        algo.pellet_reaches = summary["reaches"]
+        algo.pellets_presented = summary["pellets_presented"]
+        algo.successful_reaches = summary["successful_reaches"]
+        algo.pellets_consumed = summary["pellets_consumed"]
 
     def _on_training_plan_property_changed(self, name, value, _):
         logger.debug("plan prop: %s -> %s", name, value)
@@ -5103,16 +5191,21 @@ class AppModel(ObservableObject):
         )
         self._evaluate_automatic_stop_policy(protocol_complete=True)
 
-    def _finish_active_pellet_trial(self, perf_c: float) -> None:
+    def _finish_active_pellet_trial(
+        self,
+        perf_c: float,
+        *,
+        retry: bool = False,
+    ) -> None:
         ledger = self._trial_ledger
         if ledger is None or ledger.active_attempt is None:
             return
-        attempt = ledger.close_active_for_analysis(perf_c, time.time())
-        if attempt.is_presented:
-            self._protocol_runner.finish_trial(
-                attempt.attempt_label,
-                attempt.outcome,
-            )
+        ledger.close_active_for_analysis(
+            perf_c,
+            time.time(),
+            retry=retry,
+        )
+        self._protocol_runner.cancel_active_trial()
         self._evaluate_automatic_stop_policy(
             protocol_complete=self._protocol_runner.protocol_complete,
         )
@@ -5132,10 +5225,15 @@ class AppModel(ObservableObject):
         active = ledger.active_attempt
         if active is not None:
             ledger.close_active_for_analysis(perf_c, wall_time)
+        shift = self._behavior.system_machine.shift_xyz_handler
         attempt = ledger.begin_send(
             perf_c,
             wall_time,
             operation_id=context,
+            pellet_position=self._offset_record(self._hardware.last_dcs_set_position),
+            planned_shift=self._offset_record(shift.last_shift_xyz),
+            applied_shift=self._offset_record(shift.last_processed_shift_xyz),
+            protocol_context=self._current_trial_protocol_context(),
         )
         logger.info(
             "pellet trial attempt started: session=%s attempt=%s context=%s",
@@ -5234,7 +5332,27 @@ class AppModel(ObservableObject):
                     time.time(),
                 )
                 self._protocol_runner.begin_trial(attempt.attempt_label)
-            algo.increase_pellets_presented(1)
+            if ledger is not None:
+                algo.pellets_presented = ledger.count(TrialCountBasis.PRESENTED)
             self._evaluate_automatic_stop_policy(
                 protocol_complete=self._protocol_runner.protocol_complete,
             )
+
+    @staticmethod
+    def _offset_record(value):
+        if value is None:
+            return None
+        result = {}
+        for name in ("x", "y", "z"):
+            item = float(getattr(value, name))
+            result[name] = item if math.isfinite(item) else None
+        return result
+
+    def _current_trial_protocol_context(self):
+        plan = self._attached_plan
+        phase = None if plan is None else plan.current_phase
+        return {
+            "protocol_id": None if plan is None else plan.plan_id,
+            "phase_id": None if phase is None else phase.phase_id,
+            "automatic_advance": self._protocol_runner.automatic_advance,
+        }

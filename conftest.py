@@ -1,4 +1,24 @@
+import sys
+from pathlib import Path
+
 import pytest
+
+
+_REPO_ROOT = Path(__file__).resolve().parent
+for _source_dir in reversed((
+    _REPO_ROOT,
+    _REPO_ROOT / "auto-trainer-behavior" / "src",
+    _REPO_ROOT / "auto-trainer-core" / "src",
+    _REPO_ROOT / "auto-trainer-device" / "src",
+    _REPO_ROOT / "auto-trainer-inference" / "src",
+    _REPO_ROOT / "auto-trainer-model" / "src",
+    _REPO_ROOT / "auto-trainer-pyside" / "src",
+    _REPO_ROOT / "auto-trainer-video" / "src",
+)):
+    _source_text = str(_source_dir)
+    if _source_text in sys.path:
+        sys.path.remove(_source_text)
+    sys.path.insert(0, _source_text)
 
 
 pytest_plugins = [

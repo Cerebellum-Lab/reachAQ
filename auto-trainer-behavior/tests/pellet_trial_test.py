@@ -1,4 +1,11 @@
 import pytest
+from types import SimpleNamespace
+
+from autotrainer.core.reach_event import (
+    ReachEvent,
+    ReachEventMethod,
+    ReachEventOutcome,
+)
 
 from autotrainer.behavior.pellet_trial import (
     AttemptAssignmentPolicy,
@@ -46,6 +53,12 @@ def test_hardware_error_retries_same_logical_trial_and_never_counts():
         "trials_completed": 0,
         "scored_trials": 0,
         "configured_trial_count": 0,
+        "reaches": 0,
+        "successful_reaches": 0,
+        "pellets_consumed": 0,
+        "unassigned_reaches": 0,
+        "unassigned_successful_reaches": 0,
+        "unassigned_pellets_consumed": 0,
     }
 
     retry = ledger.begin_send(10.2, 100.2, operation_id="send-2")
@@ -173,3 +186,104 @@ def test_capture_window_can_close_before_offline_outcome_is_known():
             2.1,
             12.1,
         )
+
+
+def test_runtime_behavioral_retry_reserves_next_attempt_label_before_analysis():
+    ledger = PelletTrialLedger("session001")
+    ledger.begin_send(1.0, 11.0)
+    ledger.acknowledge_presentation(1.1, 11.1)
+    first = ledger.close_active_for_analysis(2.0, 12.0, retry=True)
+    second = ledger.begin_send(2.1, 12.1)
+
+    assert first.attempt_label == "1.1"
+    assert not first.logical_trial_complete
+    assert second.attempt_label == "1.2"
+
+
+def test_analysis_fields_are_persisted_on_pending_attempt():
+    ledger = PelletTrialLedger("session001")
+    ledger.begin_send(
+        1.0,
+        11.0,
+        pellet_position={"x": 1.0, "y": 2.0, "z": 3.0},
+        planned_shift={"x": 0.1, "y": 0.2, "z": 0.3},
+        applied_shift={"x": 0.0, "y": 0.2, "z": 0.0},
+        protocol_context={"protocol_id": "reach", "phase_id": "phase-1"},
+    )
+    ledger.acknowledge_presentation(1.1, 11.1)
+    ledger.close_active_for_analysis(2.0, 12.0)
+
+    final = ledger.finalize_pending(
+        1,
+        1,
+        TrialOutcome.SUCCESS,
+        2.5,
+        12.5,
+        reach_count=2,
+        success_count=1,
+        consumption_count=1,
+        reach_event_indices=(3, 4),
+        tone_references=({"context": "tone-1"},),
+        laser_references=({"channel": "left"},),
+    )
+
+    assert final.reach_count == 2
+    assert final.success_count == 1
+    assert final.consumption_count == 1
+    record = ledger.to_records()[0]
+    assert record["pellet_position"] == {"x": 1.0, "y": 2.0, "z": 3.0}
+    assert record["protocol_context"]["phase_id"] == "phase-1"
+    assert record["reach_event_indices"] == (3, 4)
+
+
+def test_session_frame_analysis_is_reconciled_to_attempt_windows_once():
+    ledger = PelletTrialLedger("session001")
+    ledger.begin_send(101.0, 1001.0, operation_id="send-1")
+    ledger.acknowledge_presentation(101.1, 1001.1)
+    ledger.close_active_for_analysis(103.0, 1003.0, retry=True)
+    ledger.begin_send(103.0, 1003.0, operation_id="send-2")
+    ledger.acknowledge_presentation(103.1, 1003.1)
+    ledger.close_active_for_analysis(105.0, 1005.0)
+    result = SimpleNamespace(
+        reach_events=(
+            ReachEvent(
+                init=150,
+                end=165,
+                method=ReachEventMethod.RIGHT_HAND,
+                outcome=ReachEventOutcome.MISSED,
+            ),
+            ReachEvent(
+                init=600,
+                end=620,
+                method=ReachEventMethod.RIGHT_HAND,
+                outcome=ReachEventOutcome.EATEN,
+            ),
+        ),
+        other_events=(),
+        total_reaches=2,
+        successful_reaches=1,
+        food_consumed=1,
+    )
+
+    finalized = ledger.reconcile_analysis(
+        result,
+        recording_start_perf_time=100.0,
+        frame_rate=150.0,
+        finalized_perf_time=106.0,
+        finalized_wall_time=1006.0,
+        tone_references=({"eventPerfTime": 101.5, "channel": "tone1"},),
+        laser_references=({"perf_time": 103.5, "channel": "left"},),
+    )
+
+    assert [attempt.attempt_label for attempt in finalized] == ["1.1", "1.2"]
+    assert finalized[0].outcome is TrialOutcome.FAILURE
+    assert finalized[0].reach_event_indices == (0,)
+    assert finalized[0].tone_references[0]["channel"] == "tone1"
+    assert finalized[1].outcome is TrialOutcome.SUCCESS
+    assert finalized[1].reach_event_indices == (1,)
+    assert finalized[1].laser_references[0]["channel"] == "left"
+    assert ledger.summary()["scored_trials"] == 1
+    assert ledger.summary()["reaches"] == 2
+    assert ledger.summary()["unassigned_reaches"] == 0
+    with pytest.raises(RuntimeError, match="not pending analysis"):
+        ledger.finalize_pending(1, 1, TrialOutcome.SUCCESS, 107.0, 1007.0)
