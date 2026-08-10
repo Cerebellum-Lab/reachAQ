@@ -4386,7 +4386,7 @@ class AppModel(ObservableObject):
                 ) from err
             if session_path.parent != day_path:
                 raise RuntimeError(
-                    f"Resolved session path is not a direct trial directory: {session_path}"
+                    f"Resolved session path is not a direct session directory: {session_path}"
                 )
             if session_path.name != f"session{project.session:03}":
                 raise RuntimeError(
@@ -4548,7 +4548,7 @@ class AppModel(ObservableObject):
             # nothing we can do
             return
         # maybe todo: make these configurable:
-        min_check_delay = 5  # seconds ; if no valid check/measure within this delay -> error + emergency
+        min_check_delay = 5  # seconds before reporting an invalid/missing measurement
         delay_inference_begin = 3  # seconds ; wait inference started for that duration before consider min_check_delay
         max_dist_diff = 5  # mm ; if distance between obtained & expected above that -> invalid measure
         #

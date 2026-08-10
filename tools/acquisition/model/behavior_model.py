@@ -20,7 +20,8 @@ class BehaviorModel(ObservableObject, ProjectDependentProtocol):
     aspects of the behavior system that are specific to the application.  General behavior functionality should be
     located in the module.
 
-    Alarm and emergency behavior are intentionally outside the ReachAQ runtime.
+    Retired AutoTrainer alarm, emergency, and tunnel behavior is not part of
+    this model.
     """
 
     def __init__(

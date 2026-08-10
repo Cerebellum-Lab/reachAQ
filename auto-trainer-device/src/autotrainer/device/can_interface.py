@@ -1480,10 +1480,6 @@ class CanInterface(DeviceInterface):
                 break
         return rc == 0
 
-    # NOTE: E-Stop is not implemented in the target
-    # def emergency_stop(self) -> bool:
-    #  return self.is_open and self._jc.EStop() == 0
-
     @staticmethod
     def _assign_timestamp_ns(message):
         return time.time_ns()

@@ -284,7 +284,6 @@ def device_conn(device):
 def device(expected_tok_event, expected_tok, tokens_acked) -> CanDevice:  # noqa
     device = CanDevice(api=DeviceApi(message_callback=data_callback), force_emulation=True)
     # unneeded, at least with emulation iface:
-    # device._interface.magnet_address = 0x40
     # device._interface.pellet_address = 0x01
     # device.notify_message(_REQUEST_CONNECT)
     device.api.message_callback = partial(

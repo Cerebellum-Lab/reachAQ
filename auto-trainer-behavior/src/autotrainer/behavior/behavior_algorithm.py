@@ -878,7 +878,7 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
     #
 
     def start_session(self, *, reason: str = "NA"):
-        """Start a session/trial recording"""
+        """Start a recording session."""
         with self._thread_lock:
             return self._start_session(reason=reason)
 
