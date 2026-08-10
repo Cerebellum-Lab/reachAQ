@@ -57,6 +57,16 @@ class TrainingMode(str, enum.Enum):  # todo: eventually find better place
 # Protocol first (less strict)
 from .inference_protocol import InferenceProtocol
 from .pellet_device_protocol import PelletDeviceProtocol
+from .pellet_trial import (
+    AttemptAssignmentPolicy,
+    HardwareErrorKind,
+    PelletTrialAttempt,
+    PelletTrialLedger,
+    RetrySettingsPolicy,
+    TrialAccountingConfiguration,
+    TrialCountBasis,
+    TrialOutcome,
+)
 
 from .intersession import IntersessionState
 from .intersession.intersession_machine import IntersessionMachine
