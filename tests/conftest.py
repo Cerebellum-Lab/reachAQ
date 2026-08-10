@@ -56,7 +56,7 @@ def app_model(mock_system, user_pref, calib_dir, diamond_config_path, system_con
     app = AppModel(
         user_pref,
         system_machine=mock_system.system_machine,
-        sensor_analysis=mock_system.sensor_analysis,
+        analysis=mock_system.sensor_analysis,
         inference_model=mock_system.inference,
         system_message_handler=fake_system_msg_handler,
         calib_dir=calib_dir,

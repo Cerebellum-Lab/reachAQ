@@ -294,7 +294,7 @@ class AppModel(ObservableObject):
             *,
             config_file: Optional[Path] = None,
             calib_dir: Optional[Path] = None,
-            sensor_analysis: Optional[ReachAnalysis] = None,
+            analysis: Optional[ReachAnalysis] = None,
             inference_model: Optional[InferenceProtocol] = None,
             system_message_handler: Optional[SystemMessageHandler] = None,
             system_machine: Optional[SystemMachine] = None,
@@ -429,10 +429,9 @@ class AppModel(ObservableObject):
 
         self._system_message_queue = queue.Queue()  # only dedicated to CAN bus messages reading/handling
 
-        if sensor_analysis is None:
-            sensor_analysis = ReachAnalysis()
-        analysis = self._analysis = sensor_analysis
-        del sensor_analysis  # using "analysis" instead
+        if analysis is None:
+            analysis = ReachAnalysis()
+        self._analysis = analysis
         #
         if system_message_handler is None:
             system_message_handler = SystemMessageHandler(self._system_message_queue)
