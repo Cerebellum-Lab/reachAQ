@@ -1,18 +1,14 @@
 import copy
 import sys
-import time
 from enum import Enum
 from typing import Optional, Dict, List, Tuple, Type
 from urllib.parse import urlparse, ParseResult
 
-import cv2
-
-from autotrainer.core.logging import get_verbose_logger, log_hardware_initialization
+from autotrainer.core.logging import get_verbose_logger
 
 from .camera.camera_base import CameraBase
 from .camera.random_cam import RandomCam
 from .camera.playback_cam import PlaybackCam
-from .camera.opencv_cam import OpenCVCam
 
 logger = get_verbose_logger(__name__)
 
@@ -41,33 +37,9 @@ class CameraKind(str, Enum):
     Random = "random"
     Playback = "playback"
     Spinnaker = "spinnaker"
-    OpenCV = "opencv"
 
 
 class VideoManager:
-
-    @classmethod
-    def list_usb_cameras(cls) -> List[int]:
-        cameras = []
-        for idx in range(6):
-            started = time.perf_counter()
-            log_hardware_initialization(logger, "START | USB camera probe | index=%d", idx)
-            available = False
-            capture = cv2.VideoCapture(idx)
-            if capture.isOpened():
-                ret, frame = capture.read()
-                available = bool(ret and frame is not None)
-                if available:
-                    cameras.append(idx)
-                capture.release()
-            log_hardware_initialization(
-                logger,
-                "READY | USB camera probe | index=%d available=%s elapsed=%.3fs",
-                idx,
-                available,
-                time.perf_counter() - started,
-            )
-        return cameras
 
     @classmethod
     def list_spin_cameras(cls) -> List[str]:
@@ -88,7 +60,6 @@ class VideoManager:
             return _get_spincam_cls()
         cam_cls = {
             CameraKind.Random: RandomCam,
-            CameraKind.OpenCV: OpenCVCam,
             CameraKind.Playback: PlaybackCam,
         }.get(cam_kind, None)
         if cam_cls is None:
@@ -117,8 +88,6 @@ class VideoManager:
             camera = cls.get_spin_camera(parsed.hostname, name)
         elif parsed.scheme == CameraKind.Playback:
             camera = PlaybackCam(parsed.path, name)
-        elif parsed.scheme == CameraKind.OpenCV:
-            camera = OpenCVCam(int(parsed.hostname), name)
         else:
             logger.warning("No such cam scheme: %s", parsed.scheme)
             return None
