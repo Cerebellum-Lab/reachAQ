@@ -10,8 +10,8 @@ pytestmark = pytest.mark.canbus
 from autotrainer.device import (CanInterface, Target, Motor, Heartbeat, ServoConfig, StepperConfig,
                                 DigitalOutputs, PelletDigitalInputs, Tone,
                                 AnalogOutputs, AnalogOutput,
-                                ColorLed, AudioData, DoorData, ServoStatus, StepperStatus,
-                                SensorStatus, target_of_motor, is_servo)
+                                ColorLed, ServoStatus, StepperStatus,
+                                target_of_motor, is_servo)
 
 
 @pytest.fixture(scope="module")
@@ -49,7 +49,6 @@ def test_simple_fixture(interface):
 
 @pytest.mark.parametrize("target", [
     Target.PELLET_DEVICE,
-    Target.MAGNET_DEVICE
 ])
 def test_heartbeat(interface: CanInterface, target: Target):
     print(f"DEBUG: test_heartbeat called with interface={interface}")
@@ -77,8 +76,6 @@ def _read_config(interface: CanInterface, motor: Motor):
 
 
 @pytest.mark.parametrize("motor", [
-    Motor.TUNNEL_MAGNET_SERVO,
-    Motor.TUNNEL_GATE_SERVO,
     Motor.PELLET_X_MOTOR,
     Motor.PELLET_Y_MOTOR,
     Motor.PELLET_Z_MOTOR,
@@ -90,8 +87,6 @@ def test_read_config(interface: CanInterface, motor: Motor):
 
 
 @pytest.mark.parametrize("motor", [
-    Motor.TUNNEL_MAGNET_SERVO,
-    Motor.TUNNEL_GATE_SERVO,
     Motor.PELLET_LOAD_SERVO,
     Motor.PELLET_COVER_SERVO,
 ])
@@ -213,12 +208,8 @@ def test_color_led(interface: CanInterface, red: int, green: int, blue: int):
 
 
 @pytest.mark.parametrize("type_of, target", [
-    (AudioData, Target.MAGNET_DEVICE),
-    (DoorData, Target.PELLET_DEVICE),
     (ServoStatus, Target.PELLET_DEVICE),
-    (ServoStatus, Target.MAGNET_DEVICE),
     (StepperStatus, Target.PELLET_DEVICE),
-    (SensorStatus, Target.MAGNET_DEVICE),
 ])
 def test_streaming_data(interface: CanInterface, type_of, target):
     _get_response(interface, type_of, target)

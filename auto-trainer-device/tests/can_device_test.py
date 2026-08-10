@@ -16,9 +16,6 @@ from autotrainer.device import (
     CanDevice,
     DeviceApi,
     Target,
-    PressureReading,
-    SensorStatus,
-    MagnetDigitalInputs,
     Motor,
     StepperStatus,
     ServoStatus,
@@ -87,9 +84,6 @@ def test_pellet_only_connection_skips_unused_motor_configurations():
         call.args[1][0]
         for call in connection.send_message.call_args_list
     }
-    assert Motor.TUNNEL_MAGNET_SERVO not in configured_motors
-    assert Motor.TUNNEL_GATE_SERVO not in configured_motors
-    assert Motor.TUNNEL_FAN_SERVO not in configured_motors
     assert {
         Motor.PELLET_X_MOTOR,
         Motor.PELLET_Y_MOTOR,
@@ -315,8 +309,6 @@ def device(expected_tok_event, expected_tok, tokens_acked) -> CanDevice:  # noqa
     (SystemCommandKind.MOVE_X, 106, 10),
     (SystemCommandKind.MOVE_Y, 106, 15),
     (SystemCommandKind.MOVE_Z, 108, 20),
-    (SystemCommandKind.MOVE_MAGNET_SERVO, 109, 25),
-    (SystemCommandKind.MOVE_GATE_SERVO, 110, 30),
     (SystemCommandKind.MOVE_LOAD_SERVO, 111, 35),
     (SystemCommandKind.MOVE_COVER_SERVO, 112, 40),
     (SystemCommandKind.SEND_HOME, 113, None),
@@ -337,14 +329,11 @@ def test_notify_command(device, kind, tag, data):
 
 
 @pytest.mark.parametrize("data, kind", [
-    (PressureReading(Target.MAGNET_DEVICE, pressure=14), None),
-    (SensorStatus(Target.PELLET_DEVICE, temperature_c=27.3, humidity_percent=64.2), None),
-    (MagnetDigitalInputs(Target.MAGNET_DEVICE, continuity_0=False, continuity_1=True), None),
     (StepperStatus(Target.PELLET_DEVICE, Motor.PELLET_X_MOTOR, 10, 2.0, False),
      SystemStatusMessageKind.PELLET_MOTOR_X),
     (ServoStatus(Target.PELLET_DEVICE, Motor.PELLET_LOAD_SERVO, 40),
      SystemStatusMessageKind.PELLET_LOAD),
-    (ServoConfig(Target.MAGNET_DEVICE, Motor.PELLET_X_MOTOR, 0, 0, 0, 0, 0, 0),
+    (ServoConfig(Target.PELLET_DEVICE, Motor.PELLET_LOAD_SERVO, 0, 0, 0, 0, 0, 0),
      SystemStatusMessageKind.MOTOR_CONFIGURATION),
     (StepperConfig(Target.PELLET_DEVICE, Motor.PELLET_X_MOTOR, 0, 0, 0, 0, False),
      SystemStatusMessageKind.MOTOR_CONFIGURATION),

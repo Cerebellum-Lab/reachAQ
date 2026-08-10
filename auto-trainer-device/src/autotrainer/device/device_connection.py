@@ -233,10 +233,7 @@ class DeviceConnection(DeviceConnectionProtocol):
             data.y_config,
             data.z_config,
             data.load_config,
-            data.magnet_config,
             data.cover_config,
-            data.gate_config,
-            data.tunnel_fan_config,
         ):
             if not self._motor_configuration_is_required(conf[0]):
                 continue

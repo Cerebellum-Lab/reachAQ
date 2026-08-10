@@ -19,11 +19,6 @@ class SystemCommandKind(IntEnum):
 
     BOARD_REBOOT = 10
 
-    # Actions nominally considered part of the tunnel/head fixation unit (magnet module in some nomenclature).
-    MOVE_MAGNET_SERVO = 101
-    OPEN_TUNNEL_GATE = 103
-    CLOSE_TUNNEL_GATE = 104
-
     # Actions nominally considered part of the pellet delivery unit.
     READ_MOTOR_CONFIGURATION = 201
     WRITE_MOTOR_CONFIGURATION = 202
@@ -47,8 +42,6 @@ class SystemCommandKind(IntEnum):
     MOVE_X = 220  # moves X, only
     MOVE_Y = 221  # moves Y, only
     MOVE_Z = 222  # moves Z, only
-    MOVE_GATE_SERVO = 223
-
     SEND_RETRACT = 224  # make y - 15, or 0 if lower.
 
     SET_MOTOR_DRIFT = 225
@@ -56,10 +49,6 @@ class SystemCommandKind(IntEnum):
 
     SERVO_ATTACH = 227
     SERVO_DETACH = 228
-
-    TUNNEL_FAN_ON = 229
-    TUNNEL_FAN_OFF = 230
-    TUNNEL_FAN_SET = 231
 
     SET_MOVE_RETRACT_PROCEDURE = 232
 
@@ -72,6 +61,5 @@ class SystemCommandKind(IntEnum):
     # Not deprecated so long as the original hardware is supported, but a bit esoteric.  It is not necessary for
     # new hardware to support them or for new application/scripts to support them.
     RAW_COMMAND = 1001  # TODO only used at command line for original hardware.  Remove eventually.
-    SETTINGS = 1002  # TODO Specific to original hardware head fix unit and not used in user apps.  Remove eventually.
     STREAM_START = 1003  # TODO n/a new hardware, but required for original.
     STREAM_STOP = 1004  # TODO n/a new hardware, but required for original.

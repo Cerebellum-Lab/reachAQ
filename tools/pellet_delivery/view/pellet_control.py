@@ -119,17 +119,6 @@ class PelletControl(QWidget):
 
         b_layout.addStretch(1)
 
-        button = self._tunnel_fan_button = QPushButton("Tunnel-Fan")
-        button.setCheckable(True)
-        def tunnel_fan_clicked(triggered):
-            iface = self._app_model
-            if triggered:
-                iface.set_tunnel_fan_on()
-            else:
-                iface.set_tunnel_fan_off()
-        button.clicked.connect(tunnel_fan_clicked)
-        b_layout.addWidget(button)
-
         self._move_file_button = QPushButton("")
         folder_icon = qta.icon('fa5s.folder-open')
         self._move_file_button.setIcon(folder_icon)

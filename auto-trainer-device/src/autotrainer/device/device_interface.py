@@ -3,7 +3,7 @@ Interface classes that define the capabilities of the mouse gym hardware in a wa
 that hardware can be swapped or emulated.
 
 There is a set of enumerations that define entities of the hardware:
-+ Target - Either the Pellet or Magnet module
++ Target - Pellet module
 + Motor - Motor that can be controlled
 + DigitalOutputs - Set of available digital outputs
 + AnalogOutputs - Set of available analog outputs
@@ -39,7 +39,6 @@ _map_idx_motors = {
 class Target(IntEnum):
     """Target is also known as board"""
     PELLET_DEVICE = 0
-    MAGNET_DEVICE = 1
 
 
 class DigitalOutputs(IntEnum):
@@ -77,12 +76,6 @@ class MotorSource(Source):
 @dataclass
 class Heartbeat(Source):
     unused: bool = False
-
-
-@dataclass
-class MagnetDigitalInputs(Source):
-    continuity_0: bool = False
-    continuity_1: bool = False
 
 
 @dataclass
@@ -345,11 +338,6 @@ class AnalogOutput(Source):
 
 
 @dataclass
-class PressureReading(Source):
-    pressure: float = 0
-
-
-@dataclass
 class ColorLed(Source):
     """As integer % [0, 100] value"""
 
@@ -359,31 +347,8 @@ class ColorLed(Source):
 
 
 @dataclass
-class AudioData(Source):
-    packet_id: int = 0
-    when: float = 0  # real-time unix timestamp, also in Source (Source.timestamp_ns, so as ns actually)
-    # but keeping here for now, this could become a property, eventually with setter.
-    index: int = 0  # also in Source now, keeping also for now, as it allows to pass in constructor/init
-    magnitudes: List[float] = dataclasses.field(default_factory=list)
-
-
-@dataclass
-class DoorData(Source):
-    door1: bool = False
-    door2: bool = False
-    door3: bool = False
-    ext_button: bool = False
-
-
-@dataclass
 class Status(Source):
     unused: bool = True
-
-
-@dataclass
-class SensorStatus(Source):
-    temperature_c: float = 0
-    humidity_percent: float = 0
 
 
 @dataclass
@@ -422,7 +387,6 @@ class DeviceInterface:
         self._active_motors_drift = _zero_position
         self._max_motor_drift_error_threshold = 2  # mm
         self._motors_drift_error = [False, False, False]
-        self._tunnel_status_perf_c = -math.inf
         self._pellet_status_perf_c = -math.inf
 
     @classmethod
@@ -601,12 +565,6 @@ class DeviceInterface:
     def servo_detach(self, motor: Motor):
         raise NotImplementedError
 
-    def set_tunnel_fan_on(self) -> bool:
-        raise NotImplementedError
-
-    def set_tunnel_fan_off(self) -> bool:
-        raise NotImplementedError
-
     @property
     def pellet_status_perf_c(self) -> float:
         return self._pellet_status_perf_c
@@ -615,10 +573,3 @@ class DeviceInterface:
     def pellet_status_perf_c(self, value):
         self._pellet_status_perf_c = value
 
-    @property
-    def tunnel_status_perf_c(self) -> float:
-        return self._tunnel_status_perf_c
-
-    @tunnel_status_perf_c.setter
-    def tunnel_status_perf_c(self, value):
-        self._tunnel_status_perf_c = value

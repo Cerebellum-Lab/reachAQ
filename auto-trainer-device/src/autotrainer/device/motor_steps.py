@@ -57,13 +57,6 @@ class CompoundMovementDataSet(Protocol):
     @property
     def release_pellet(self) -> MotorSteps: ...
 
-    # NB: open|close_tunnel_gate unused:
-    @property
-    def open_tunnel_gate(self) -> MotorSteps: ...
-
-    @property
-    def close_tunnel_gate(self) -> MotorSteps: ...
-
     @property
     def move_retract(self) -> MotorSteps:
         """The move retract"""

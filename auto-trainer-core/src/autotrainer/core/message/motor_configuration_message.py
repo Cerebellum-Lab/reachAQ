@@ -8,14 +8,11 @@ class Motor(IntEnum):
     """
 
     NONE = 0
-    TUNNEL_MAGNET_SERVO = 1
     PELLET_X_MOTOR = 2
     PELLET_Y_MOTOR = 3
     PELLET_Z_MOTOR = 4
     PELLET_COVER_SERVO = 5
     PELLET_LOAD_SERVO = 6
-    TUNNEL_GATE_SERVO = 7
-    TUNNEL_FAN_SERVO = 8
     DELAY = 9
     TONE = 10
 
@@ -103,14 +100,6 @@ class MotorConfigurations(Protocol):
     """
 
     @property
-    def magnet_config(self) -> Tuple[Motor, ServoConfigMessage]:
-        """The magnet config"""
-
-    @property
-    def gate_config(self) -> Tuple[Motor, ServoConfigMessage]:
-        """The gate config"""
-
-    @property
     def load_config(self) -> Tuple[Motor, ServoConfigMessage]:
         """The pellet-load config"""
 
@@ -129,7 +118,3 @@ class MotorConfigurations(Protocol):
     @property
     def z_config(self) -> Tuple[Motor, StepperConfigMessage]:
         """The pellet stepper Z motor & config"""
-
-    @property
-    def tunnel_fan_config(self) -> Tuple[Motor, ServoConfigMessage]:
-        """The tunnel-fan motor & config"""

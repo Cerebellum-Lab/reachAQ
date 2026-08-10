@@ -38,12 +38,7 @@ get_input = True
 
 
 class StatusType(IntEnum):
-    FRONT_DOOR = 1
-    DRAWER_DOOR = 2
-    SPARE_DOOR = 3
-    EXT_BUTTON = 4
-    SENSORS = 5
-    STIMULUS = 6
+    STIMULUS = 1
 
 
 def monitor_message_queue(msg_queue):
@@ -91,37 +86,6 @@ def monitor_message_queue(msg_queue):
             print(data)
             get_input = True
 
-        elif kind == SystemStatusMessageKind.MEASUREMENTS:
-            if print_status is StatusType.SENSORS:
-                d = data[0]
-                print(f"- Head Detect:        {d.switch}")
-                print(f"- Pressure (0..1024): {d.pressure:.3f}")
-                print(f"- Temperature (F):    {d.temperature:.1f}")
-                print(f"- Humidity (%):       {d.humidity:.1f}")
-                print_status = StatusType.DRAWER_DOOR
-
-            if perf_start is None:
-                perf_start = time.perf_counter_ns()
-
-            if output_fd is not None:
-                for d in data:
-                    output_fd.write(
-                        f"{d.when}, {d.timestamp}, {d.switch},"
-                        f" {d.pressure},"
-                        f" {d.temperature}, {d.humidity}\n")
-
-            measurement_count += len(data)
-
-            if measurement_count > next_heartbeat:
-                if perf_print:
-                    logger.info(
-                        f"{measurement_count} samples at {(1.0e9 * measurement_count) / (time.perf_counter_ns() - perf_start)} samples/s")
-                next_heartbeat += 500
-
-            if 0 < perf_count <= measurement_count:
-                perf_end = time.perf_counter_ns()
-                break
-
         elif kind == SystemStatusMessageKind.MOTOR_CONFIGURATION:
             if isinstance(data, ServoConfig):
                 print(
@@ -152,9 +116,6 @@ def monitor_message_queue(msg_queue):
         elif (kind, print_motor_status) in (
             (SystemStatusMessageKind.PELLET_COVER, Motor.PELLET_COVER_SERVO),
             (SystemStatusMessageKind.PELLET_LOAD, Motor.PELLET_LOAD_SERVO),
-            (SystemStatusMessageKind.HEAD_MAGNET, Motor.TUNNEL_MAGNET_SERVO),
-            (SystemStatusMessageKind.TUNNEL_GATE_SERVO, Motor.TUNNEL_GATE_SERVO),
-            (SystemStatusMessageKind.TUNNEL_FAN, Motor.TUNNEL_FAN_SERVO),
         ):
             # TODO deliver full packet. See can_device at or around line 328
             # assert isinstance(data, ServoStatus)
@@ -183,26 +144,6 @@ def monitor_message_queue(msg_queue):
             print_motor_status = Motor.NONE
             get_input = True
 
-        elif kind == SystemStatusMessageKind.DRAWER_DOOR:
-            if print_status is StatusType.DRAWER_DOOR:
-                print(f"- Drawer Door:     {'Open' if data else 'Closed'}")
-                print_status = StatusType.FRONT_DOOR
-
-        elif kind == SystemStatusMessageKind.FRONT_DOOR:
-            if print_status is StatusType.FRONT_DOOR:
-                print(f"- Front Door:      {'Open' if data else 'Closed'}")
-                print_status = StatusType.SPARE_DOOR
-
-        elif kind == SystemStatusMessageKind.SPARE_DOOR:
-            if print_status is StatusType.SPARE_DOOR:
-                print(f"- Spare Door:      {'Open' if data else 'Closed'}")
-                print_status = StatusType.EXT_BUTTON
-
-        elif kind == SystemStatusMessageKind.EXT_BUTTON:
-            if print_status is StatusType.EXT_BUTTON:
-                print(f"- Ext Button:      {'Pressed' if data else 'Released'}")
-                print_status = StatusType.STIMULUS
-
         elif kind == SystemStatusMessageKind.STIMULUS_INPUTS:
             if print_status is StatusType.STIMULUS:
                 for i in range(4):
@@ -229,12 +170,6 @@ def str_to_motor(motor_name: str):
         return Motor.PELLET_LOAD_SERVO
     elif motor_name == 'cover' or motor_name == 'c':
         return Motor.PELLET_COVER_SERVO
-    elif motor_name == 'magnet' or motor_name == 'm':
-        return Motor.TUNNEL_MAGNET_SERVO
-    elif motor_name == 'gate' or motor_name == 'g':
-        return Motor.TUNNEL_GATE_SERVO
-    elif motor_name in {'fan', 'tunnel_fan'}:
-        return Motor.TUNNEL_FAN_SERVO
     else:
         return None
 
@@ -404,11 +339,9 @@ def run_monitor():
             # 'c' - cover servo
             # 'd' - delay (sec)
             # 'f' - load-from-files
-            # 'g' - gate servo
             # 'h' - home stepper
             # 'k' - stepper known position
             # 'l' - load servo
-            # 'm' - magnet servo
             # 'o' - set output
             # 'p' - pellet move commands
             # 'r' - RGB LED
@@ -468,30 +401,16 @@ def run_monitor():
                                                context="rgb")
 
                 elif cmd == 's' or cmd == 'status':
-                    print_status = StatusType.SENSORS
+                    print_status = StatusType.STIMULUS
 
                 elif cmd == 'v' or cmd == 'version':
                     device_connection.send_message(SystemCommandKind.REQUEST_VERSION)
 
-                elif cmd in ('fan_on', 'tunnel_fan_on'):
-                    device_connection.send_message(SystemCommandKind.TUNNEL_FAN_ON, context="fan_on")
-
-                elif cmd in ('fan_off', 'tunnel_fan_off'):
-                    device_connection.send_message(SystemCommandKind.TUNNEL_FAN_OFF, context="fan_off")
-
-                elif cmd == 'open_gate':
-                    device_connection.send_message(SystemCommandKind.OPEN_TUNNEL_GATE, context="open_gate")
-
-                elif cmd == 'close_gate':
-                    device_connection.send_message(SystemCommandKind.CLOSE_TUNNEL_GATE, context="close_gate")
-
                 elif cmd == 'board_reboot':
                     if len(params) != 1:
-                        logger.warning("expected 1 board target name (magnet or pellet)")
+                        logger.warning("expected board target name: pellet")
                         continue
-                    if params[0] == "magnet":
-                        tgt = Target.MAGNET_DEVICE
-                    elif params[0] == "pellet":
+                    if params[0] == "pellet":
                         tgt = Target.PELLET_DEVICE
                     else:
                         logger.error("unknown target board: %s", params[0])
@@ -551,11 +470,8 @@ motor_to_move_command = {
     Motor.PELLET_X_MOTOR: SystemCommandKind.MOVE_X,
     Motor.PELLET_Y_MOTOR: SystemCommandKind.MOVE_Y,
     Motor.PELLET_Z_MOTOR: SystemCommandKind.MOVE_Z,
-    Motor.TUNNEL_MAGNET_SERVO: SystemCommandKind.MOVE_MAGNET_SERVO,
-    Motor.TUNNEL_GATE_SERVO: SystemCommandKind.MOVE_GATE_SERVO,
     Motor.PELLET_COVER_SERVO: SystemCommandKind.MOVE_COVER_SERVO,
     Motor.PELLET_LOAD_SERVO: SystemCommandKind.MOVE_LOAD_SERVO,
-    # Motor.TUNNEL_FAN_SERVO: SystemCommandKind.TUNNEL_FAN_SET,  # digital io
 }
 
 
@@ -693,7 +609,7 @@ def print_help():
           " ::Write Configuration")
     print("<motor> trip <cnt>                 "
           " ::<cnt> Round trips")
-    print("<motor> is one of: x, y, z, l[oad], c[over], m[agnet], g[ate], fan/tunnel_fan")
+    print("<motor> is one of: x, y, z, l[oad], c[over]")
     print()
     print("<servo> attach/detach              "
           " ::Attach or Detach from a servo")
@@ -730,16 +646,8 @@ def print_help():
           " ::Set RGB LED. Values in %")
     print("s[tatus]                           "
           " ::Show Status")
-    print("open_gate                          "
-          " ::Open tunnel gate")
-    print("close_gate                         "
-          " ::Close tunnel gate")
-    print("fan_on                             "
-          " ::Set tunnel fan ON")
-    print("fan_off                            "
-          " ::Set tunnel fan OFF")
     print("board_reboot <board>               "
-          " ::Reboot the given board, either magnet or pellet")
+          " ::Reboot the pellet board")
     print("v[ersion]                          "
           " ::Version")
     print("logger [<name>] <level>            "

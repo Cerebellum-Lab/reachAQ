@@ -16,9 +16,7 @@ class Device(ObservableObject):
 
     UUID_ACK_TIMEOUT_ENGAGED = "uuid_ack_timeout_engaged"
     PELLET_UUID_ACK_TIMEOUT_ENGAGED = "pellet_uuid_ack_timeout_engaged"  # actually unused
-    MAGNET_UUID_ACK_TIMEOUT_ENGAGED = "magnet_uuid_ack_timeout_engaged"  # actually unused
     PELLET_STATUS_TIMEOUT_ENGAGED = "pellet_status_timeout_engaged"
-    TUNNEL_STATUS_TIMEOUT_ENGAGED = "tunnel_status_timeout_engaged"
 
     def __init__(
         self,
@@ -30,7 +28,6 @@ class Device(ObservableObject):
         super().__init__(event_names=event_names)
         self._api = api
         self._interface = dev_interface
-        self._tunnel_status_timeout_engaged = False
         self._pellet_status_timeout_engaged = False
 
     @property
@@ -84,17 +81,6 @@ class Device(ObservableObject):
     @property
     def device_interface(self) -> DeviceInterface:
         return self._interface
-
-    @property
-    def tunnel_status_timeout_engaged(self) -> bool:
-        return self._tunnel_status_timeout_engaged
-
-    @tunnel_status_timeout_engaged.setter
-    def tunnel_status_timeout_engaged(self, value):
-        prev, self._tunnel_status_timeout_engaged = self._tunnel_status_timeout_engaged, value
-        if prev != value:
-            logger.verbose("tunnel_status_timeout=%s", value)
-        self._on_property_changed(self.TUNNEL_STATUS_TIMEOUT_ENGAGED, value, prev)
 
     @property
     def pellet_status_timeout_engaged(self) -> bool:

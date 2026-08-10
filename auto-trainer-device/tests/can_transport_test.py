@@ -132,7 +132,6 @@ def test_can_device_accepts_pellet_only_required_targets():
 
     assert device.required_targets == (Target.PELLET_DEVICE,)
     assert device.is_target_required(Target.PELLET_DEVICE)
-    assert not device.is_target_required(Target.MAGNET_DEVICE)
 
 
 @pytest.mark.parametrize(

@@ -136,7 +136,7 @@ def test_receive_ignores_unsupported_and_malformed_frames():
     assert messages[0].dst_id == 0x01
 
 
-def test_pellet_only_runtime_ignores_unused_status_messages():
+def test_pellet_runtime_retains_pellet_board_status_messages():
     interface = CanInterface(
         required_targets=(Target.PELLET_DEVICE,),
         can_transport=CanTransportConfiguration(kind="socketcan", fd=True),
@@ -149,8 +149,8 @@ def test_pellet_only_runtime_ignores_unused_status_messages():
     rgb.type = JerryCANCmdType.RGB_LED
     rgb.dst_id = 0
 
-    assert interface._translate(analog) is None
-    assert interface._translate(rgb) is None
+    assert isinstance(interface._translate(analog), AnalogOutput)
+    assert isinstance(interface._translate(rgb), ColorLed)
 
     retained_motors = []
     for motor_id in range(3):
@@ -166,31 +166,6 @@ def test_pellet_only_runtime_ignores_unused_status_messages():
         Motor.PELLET_COVER_SERVO,
         Motor.PELLET_LOAD_SERVO,
     ]
-    assert Motor.TUNNEL_GATE_SERVO not in interface._pellet_board_last_status_perf_c
-
-
-def test_full_runtime_retains_auxiliary_status_messages():
-    interface = CanInterface(
-        required_targets=(Target.PELLET_DEVICE, Target.MAGNET_DEVICE),
-        can_transport=CanTransportConfiguration(kind="socketcan", fd=True),
-    )
-
-    analog = JerryCANMsg()
-    analog.type = JerryCANCmdType.ANALOG_OUT
-    analog.dst_id = 0
-    rgb = JerryCANMsg()
-    rgb.type = JerryCANCmdType.RGB_LED
-    rgb.dst_id = 0
-    gate = JerryCANMsg()
-    gate.type = JerryCANCmdType.SERVO_STATUS
-    gate.dst_id = 0
-    gate.servo_status.motor_id = 2
-
-    assert isinstance(interface._translate(analog), AnalogOutput)
-    assert isinstance(interface._translate(rgb), ColorLed)
-    translated_gate = interface._translate(gate)
-    assert isinstance(translated_gate, ServoStatus)
-    assert translated_gate.motor == Motor.TUNNEL_GATE_SERVO
 
 
 def test_send_refuses_large_jerrycan_payload_without_fd():

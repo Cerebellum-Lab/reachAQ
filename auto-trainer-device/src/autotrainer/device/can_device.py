@@ -33,19 +33,14 @@ from .device_interface import (
     Acknowledge,
     AnalogOutput,
     AnalogOutputs,
-    AudioData,
-    DoorData,
-    PressureReading,
     Motor,
     DigitalOutputs,
     Status,
     Tone,
     ColorLed,
-    MagnetDigitalInputs,
     PelletDigitalInputs,
     ServoConfig,
     StepperConfig,
-    SensorStatus,
     ServoStatus,
     StepperStatus,
     Version,
@@ -173,9 +168,6 @@ class CanDevice(Device):
         Motor.PELLET_Z_MOTOR: SystemStatusMessageKind.PELLET_MOTOR_Z,
         Motor.PELLET_LOAD_SERVO: SystemStatusMessageKind.PELLET_LOAD,
         Motor.PELLET_COVER_SERVO: SystemStatusMessageKind.PELLET_COVER,
-        Motor.TUNNEL_MAGNET_SERVO: SystemStatusMessageKind.HEAD_MAGNET,
-        Motor.TUNNEL_GATE_SERVO: SystemStatusMessageKind.TUNNEL_GATE_SERVO,
-        Motor.TUNNEL_FAN_SERVO: SystemStatusMessageKind.TUNNEL_FAN,
     }
 
     _motor_to_coordinate_char = {
@@ -204,7 +196,7 @@ class CanDevice(Device):
             required_targets: CAN boards that must be present for this runtime.
         """
         self._can_transport_configuration = can_transport or CanTransportConfiguration.from_environment()
-        self._required_targets = tuple(required_targets or (Target.PELLET_DEVICE, Target.MAGNET_DEVICE))
+        self._required_targets = tuple(required_targets or (Target.PELLET_DEVICE,))
         self._interface: Union[CanInterface, EmulationInterface] = self._make_device_interface(force_emulation)
 
         super().__init__(self._interface, api)
@@ -233,8 +225,7 @@ class CanDevice(Device):
         # ensure we have config for these steppers/servos, even if empty/default:
         for m in {Motor.PELLET_X_MOTOR, Motor.PELLET_Y_MOTOR, Motor.PELLET_Z_MOTOR}:
             self._motor_configs[m] = StepperConfig()
-        for m in {Motor.TUNNEL_GATE_SERVO, Motor.TUNNEL_FAN_SERVO, Motor.TUNNEL_MAGNET_SERVO,
-                  Motor.PELLET_COVER_SERVO, Motor.PELLET_LOAD_SERVO}:
+        for m in {Motor.PELLET_COVER_SERVO, Motor.PELLET_LOAD_SERVO}:
             self._motor_configs[m] = ServoConfig()
         # NB: these are the config possibly written/set to the motors.
         # Not the config reported by the motor themselves.
@@ -248,11 +239,10 @@ class CanDevice(Device):
         self._commands_queue = queue.Queue()
         self._commands_handler_thread: Optional[threading.Thread] = None
         self._commands_handler_watchdog_perf_c = math.nan
-        self._tunnel_pellet_status_check_thread: Optional[threading.Thread] = None
+        self._pellet_status_check_thread: Optional[threading.Thread] = None
         # internal data cache:
         self._previous_stepper_status_pos_perf_c: MotorStatusCacheT = {}  # (None, -math.inf)
         self._previous_servo_status_pos_perf_c: MotorStatusCacheT = {}  # (None, -math.inf)
-        self._prev_tunnel_gate_open_perf_c: Tuple[bool, float] = (None, -math.inf)
 
         self._boards_pending_ctx: Dict[Target, _BoardPendingContext] = {
             None: _BoardPendingContext(
@@ -261,10 +251,6 @@ class CanDevice(Device):
             Target.PELLET_DEVICE: _BoardPendingContext(
                 target=Target.PELLET_DEVICE,
                 uuid_ack_timeout_engaged_property_name=self.PELLET_UUID_ACK_TIMEOUT_ENGAGED,
-            ),
-            Target.MAGNET_DEVICE: _BoardPendingContext(
-                target=Target.MAGNET_DEVICE,
-                uuid_ack_timeout_engaged_property_name=self.MAGNET_UUID_ACK_TIMEOUT_ENGAGED,
             ),
         }
 
@@ -280,12 +266,6 @@ class CanDevice(Device):
         return target in self._required_targets
 
     def is_motor_required(self, motor: Motor) -> bool:
-        if self._required_targets == (Target.PELLET_DEVICE,) and motor in {
-            Motor.TUNNEL_MAGNET_SERVO,
-            Motor.TUNNEL_GATE_SERVO,
-            Motor.TUNNEL_FAN_SERVO,
-        }:
-            return False
         return self.is_target_required(target_of_motor(motor))
 
     def _make_device_interface(self, force_emulation: bool) -> Union[CanInterface, EmulationInterface]:
@@ -301,8 +281,6 @@ class CanDevice(Device):
         self._send_pellet = default_send_pellet()
         self._cover_pellet = default_cover_pellet()
         self._release_pellet = default_release_pellet()
-        self._open_tunnel_gate = default_open_gate()
-        self._close_tunnel_gate = default_close_gate()
         self._move_retract = default_move_retract()
 
     def _clear_caches(self):
@@ -311,24 +289,12 @@ class CanDevice(Device):
             self._previous_servo_status_pos_perf_c,
         ):
             cache.clear()
-        self._prev_tunnel_gate_open_perf_c = (None, -math.inf)
 
     def _init_handlers(self):
 
         def handle_servo_move(motor: Motor, position):
             steps = self._make_servo_move_steps(motor, position)
             return self._start_sequence(MotorSteps(f"move_servo_{motor.name}", steps))
-
-        def handle_servo_sequence(motor: Motor, sequence: MotorSteps):
-            step, steps = self._make_servo_steps(motor)
-            for sub_step in sequence.steps:
-                sub_step.update(step)  # eventual uuid_ack_timeout
-            if len(steps) > 1:  # attach/detach
-                step_idx = steps.index(step)
-                steps[step_idx:-1] = sequence.steps
-            else:
-                steps = sequence.steps
-            return self._start_sequence(MotorSteps(f"{motor.name}_{sequence.name}", steps))
 
         def set_load_pellet_proc(proc):
             if isinstance(proc, MotorSteps) and not proc.is_empty:
@@ -380,13 +346,9 @@ class CanDevice(Device):
 
             SystemCommandKind.BOARD_REBOOT: self._interface.board_reboot,
 
-            SystemCommandKind.MOVE_MAGNET_SERVO: partial(handle_servo_move, Motor.TUNNEL_MAGNET_SERVO),
-
             SystemCommandKind.MOVE_LOAD_SERVO: partial(handle_servo_move, Motor.PELLET_LOAD_SERVO),
 
             SystemCommandKind.MOVE_COVER_SERVO: partial(handle_servo_move, Motor.PELLET_COVER_SERVO),
-
-            SystemCommandKind.MOVE_GATE_SERVO: partial(handle_servo_move, Motor.TUNNEL_GATE_SERVO),
 
             SystemCommandKind.SET_X: partial(apply_set_or_move, self._interface.set_motor_x, None),
 
@@ -430,18 +392,6 @@ class CanDevice(Device):
             SystemCommandKind.COVER_PELLET: lambda _: self._start_sequence(self._cover_pellet),
 
             SystemCommandKind.SEND_RETRACT: lambda _: self._start_sequence(self._move_retract),
-
-            # on the other side we don't have "predefined" for open/close gate:
-            SystemCommandKind.OPEN_TUNNEL_GATE: lambda _: handle_servo_sequence(Motor.TUNNEL_GATE_SERVO, self._open_tunnel_gate),
-            SystemCommandKind.CLOSE_TUNNEL_GATE: lambda _: handle_servo_sequence(Motor.TUNNEL_GATE_SERVO, self._close_tunnel_gate),
-
-            SystemCommandKind.TUNNEL_FAN_ON: \
-                lambda _: self._interface.set_digital_output(DigitalOutputs(1), True),
-            SystemCommandKind.TUNNEL_FAN_OFF:
-                lambda _: self._interface.set_digital_output(DigitalOutputs(1), False),
-
-            # digital only allow 2 "position"
-            # SystemCommandKind.TUNNEL_FAN_SET: partial(handle_servo_move, Motor.TUNNEL_FAN_SERVO),
 
             SystemCommandKind.DELAY: self._interface.delay,
 
@@ -504,20 +454,6 @@ class CanDevice(Device):
                 previous_stimuli_data_perf_c = (new_data, p_now)
                 self._api.send_message(SystemStatusMessageKind.STIMULUS_INPUTS, new_data)
 
-        previous_door_data_perf_c = (None, -math.inf)
-        def handle_door_msg(m: DoorData):
-            nonlocal previous_door_data_perf_c
-            new_data = (m.door1, m.door2, m.door3, m.ext_button)
-            p_now = get_perf_now()
-            prev_data, prev_perf_c = previous_door_data_perf_c
-            if new_data != prev_data or p_now - prev_perf_c > self.same_data_refresh_delay:
-                previous_door_data_perf_c = (new_data, p_now)
-                send_msg = self._api.send_message
-                send_msg(SystemStatusMessageKind.FRONT_DOOR, m.door1 != 0),
-                send_msg(SystemStatusMessageKind.DRAWER_DOOR, m.door2 != 0),
-                send_msg(SystemStatusMessageKind.SPARE_DOOR, m.door3 != 0),
-                send_msg(SystemStatusMessageKind.EXT_BUTTON, m.ext_button != 0)
-
         prev_color_led = (None, -math.inf)
         def handle_color_led(m: ColorLed):
             nonlocal prev_color_led
@@ -534,13 +470,7 @@ class CanDevice(Device):
             ColorLed: handle_color_led,
             AnalogOutput: _no_op_handler,
 
-            PressureReading: _no_op_handler,
-            SensorStatus: _no_op_handler,
-            MagnetDigitalInputs: _no_op_handler,
-
             PelletDigitalInputs: handle_stimuli_msg,
-
-            AudioData: _no_op_handler,
 
             StepperStatus: self._report_stepper_status,
 
@@ -551,8 +481,6 @@ class CanDevice(Device):
 
             Version: lambda message: \
                 self._api.send_message(SystemStatusMessageKind.FIRMWARE_VERSION, message.version),
-
-            DoorData: handle_door_msg,
 
             Acknowledge: self._handle_ack,
         }
@@ -577,24 +505,16 @@ class CanDevice(Device):
                 return _shutdown_requested
             return func(*args, **kwargs)
 
-    def _check_tunnel_pellet_status_age(self):
+    def _check_pellet_status_age(self):
         logger.verbose("running")
         while not self._want_exit.wait(1):  # no need check more often
             p_now = get_perf_now()
             boards_timeout = self.default_board_status_timeout_delay  # re-read
             pellet_age = p_now - self._interface.pellet_status_perf_c
-            tunnel_age = p_now - self._interface.tunnel_status_perf_c
             check_pellet = self.is_target_required(Target.PELLET_DEVICE)
-            check_tunnel = self.is_target_required(Target.MAGNET_DEVICE)
-            ages = []
-            if check_pellet:
-                ages.append(pellet_age)
-            if check_tunnel:
-                ages.append(tunnel_age)
-            if any(age > boards_timeout / 2 for age in ages):
-                logger.verbose("pellet_status_age=%.1f tunnel_status_age=%.1f", pellet_age, tunnel_age)
+            if check_pellet and pellet_age > boards_timeout / 2:
+                logger.verbose("pellet_status_age=%.1f", pellet_age)
             self.pellet_status_timeout_engaged = check_pellet and pellet_age > boards_timeout
-            self.tunnel_status_timeout_engaged = check_tunnel and tunnel_age > boards_timeout
         logger.verbose("exiting")
 
     def _command_handler(self):
@@ -1000,13 +920,13 @@ class CanDevice(Device):
             target=self._command_handler, name="CanCommandHandler", daemon=True)
         thread.start()
         self._commands_handler_thread = thread  # only assign after start
-        thread = self._tunnel_pellet_status_check_thread
+        thread = self._pellet_status_check_thread
         if thread is not None and thread.is_alive():
             logger.debug("TunnelPelletStatus check thread already alive")
         else:
-            thread = threading.Thread(target=self._check_tunnel_pellet_status_age, name="CheckTunnelPelletStatus", daemon=True)
+            thread = threading.Thread(target=self._check_pellet_status_age, name="CheckPelletStatus", daemon=True)
             thread.start()
-            self._tunnel_pellet_status_check_thread = thread
+            self._pellet_status_check_thread = thread
 
     def _clear_pending_commands(self):
         cmd_queue = self._commands_queue
@@ -1052,13 +972,13 @@ class CanDevice(Device):
                     logger.warning("CanCommand handler thread still alive: %s", cmd_thread)
                 self._commands_handler_thread = None
 
-            thread = self._tunnel_pellet_status_check_thread
+            thread = self._pellet_status_check_thread
             if thread is not None:
                 if thread is not threading.current_thread():
                     thread.join(3)
                 if thread.is_alive() and thread is not threading.current_thread():
-                    logger.warning("PelletTunnel check thread still alive")
-                self._tunnel_pellet_status_check_thread = None
+                    logger.warning("Pellet status check thread still alive")
+                self._pellet_status_check_thread = None
 
             self._clear_pending_commands()
 
@@ -1088,10 +1008,6 @@ class CanDevice(Device):
             motor = Motor.PELLET_LOAD_SERVO
         elif 'barrier_arm' in step:
             motor = Motor.PELLET_COVER_SERVO
-        elif 'gate' in step:
-            motor = Motor.TUNNEL_GATE_SERVO
-        elif 'magnet' in step:
-            motor = Motor.TUNNEL_MAGNET_SERVO
         elif '_servo_move' in step:
             motor = step['_servo_move'][0]
         elif '_servo_max_pos' in step:
@@ -1165,19 +1081,6 @@ class CanDevice(Device):
             SystemCommandKind.SEND_FIXED_XYZ,
         }:
             return Target.PELLET_DEVICE
-        elif kind == SystemCommandKind.MOVE_MAGNET_SERVO:
-            motor = Motor.TUNNEL_MAGNET_SERVO
-        elif kind in {
-            SystemCommandKind.TUNNEL_FAN_ON,
-            SystemCommandKind.TUNNEL_FAN_OFF,
-        }:
-            motor = Motor.TUNNEL_FAN_SERVO
-        elif kind in {
-            SystemCommandKind.MOVE_GATE_SERVO,
-            SystemCommandKind.OPEN_TUNNEL_GATE,
-            SystemCommandKind.CLOSE_TUNNEL_GATE,
-        }:
-            motor = Motor.TUNNEL_GATE_SERVO
         elif kind == SystemCommandKind.DELAY:
             motor = Motor.DELAY
         elif kind == SystemCommandKind.PLAY_TONE:
@@ -1326,14 +1229,6 @@ class CanDevice(Device):
         if prev_data != position or perf_now - prev_perf_c > self.same_data_refresh_delay:
             self._previous_servo_status_pos_perf_c[kind] = (position, perf_now)
             api.send_message(kind, position)
-        if motor == Motor.TUNNEL_GATE_SERVO:
-            gate_cfg = self._motor_configs[motor]
-            new_open = math.isclose(position, gate_cfg.minimum_position, abs_tol=0.5)
-            prev_open, prev_perf_c = self._prev_tunnel_gate_open_perf_c
-            if new_open != prev_open or perf_now - prev_perf_c > self.same_data_refresh_delay:
-                self._prev_tunnel_gate_open_perf_c = (new_open, perf_now)
-                api.send_message(SystemStatusMessageKind.TUNNEL_GATE_OPEN_STATUS, new_open)
-
     #
 
     def _make_servo_steps(self, motor: Motor) -> Tuple[Dict, List[Dict]]:
@@ -1455,16 +1350,6 @@ class CanDevice(Device):
         elif 'barrier_arm' in step:
             motor = Motor.PELLET_COVER_SERVO
             location = _to_tuple(step['barrier_arm'])
-            success = self._handle_servo_move_compound(compound_movements, motor, location)
-
-        elif 'magnet' in step:
-            motor = Motor.TUNNEL_MAGNET_SERVO
-            location = _to_tuple(step['magnet'])
-            success = self._handle_servo_move_compound(compound_movements, motor, location)
-
-        elif 'gate' in step:
-            motor = Motor.TUNNEL_GATE_SERVO
-            location = _to_tuple(step['gate'])
             success = self._handle_servo_move_compound(compound_movements, motor, location)
 
         # _servo_max_pos / _servo_max_pos are internal and should not be used from outside.
@@ -1655,26 +1540,6 @@ def default_release_pellet() -> MotorSteps:
                           {'predefined': 'release'},
                       ]
                       )
-
-
-def default_open_gate() -> MotorSteps:
-    """
-    Create the default motor step sequence for open gate.
-
-    Returns:
-        A MotorSteps object containing the open gate sequence
-    """
-    return MotorSteps("open_gate", [{'_servo_min_pos': Motor.TUNNEL_GATE_SERVO}])
-
-
-def default_close_gate() -> MotorSteps:
-    """
-    Create the default motor step sequence for close gate.
-
-    Returns:
-        A MotorSteps object containing the close gate sequence
-    """
-    return MotorSteps("close_gate", [{'_servo_max_pos': Motor.TUNNEL_GATE_SERVO}])
 
 
 def default_move_retract() -> MotorSteps:

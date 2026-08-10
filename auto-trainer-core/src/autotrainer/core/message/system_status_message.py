@@ -40,12 +40,6 @@ class SystemStatusMessageKind(IntEnum):
     PELLET_COVER = 205
     """Pellet cover arm servo position"""
 
-    HEAD_MAGNET = 206
-    """Tunnel head magnet servo position"""
-
-    TUNNEL_GATE_SERVO = 207
-    """Tunnel gate servo position"""
-
     PELLET_X = 208
     """Pellet X motor position as a float."""
 
@@ -55,46 +49,19 @@ class SystemStatusMessageKind(IntEnum):
     PELLET_Z = 210
     """Pellet Z motor position as a float."""
 
-    FRONT_DOOR = 301
-    """Message will contain front door status as True (open) or False (closed)."""
-
-    DRAWER_DOOR = 302
-    """Message will contain drawer door status as True (open) or False (closed)."""
-
-    SPARE_DOOR = 303
-    """Message will contain spare door status as True (open) or False (closed)."""
-
-    EXT_BUTTON = 304
-    """Message will contain external button status as True (pressed) or False (released)"""
-
     STIMULUS_INPUTS = 305
     """Message will contain a list of 4 states as True/False"""
-
-    TUNNEL_FAN = 220
-    """Tunnel Fan will contain the tunnel fan status as a ServoStatusMessage"""
-
-    MEASUREMENTS = 401
-    """Message will contain a list of MeasurementMessage objects."""
-
-    AUDIO_SPECTRUM = 402
-    """Message will contain the audio spectrum data as an array list of float values."""
 
     COLOR_LED = 403
     """Message is the original ColorLed message"""
 
     MOTOR_CONFIGURATION = 501
 
-    TUNNEL_GATE_OPEN_STATUS = 600
-    """Open status: True for opened, closed otherwise"""
-
     CAMERA_STATUS_CHANGE = 1001
 
     CAMERA_RECORDING_CLOSED_FINISHED = 1002  # current associated args is (cam_idx, tot_frames_written, project_info)
     """Sent when camera recording files are closed by record thread"""
 
-    MEASUREMENT = -101
-    """This value is deprecated.  Use MEASUREMENTS if the object you are passing with this identifier conforms to the
-    MeasurementMessage protocol."""
 
 
 class StepperStatusMessage(Protocol):

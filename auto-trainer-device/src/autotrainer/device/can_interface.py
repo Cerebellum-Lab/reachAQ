@@ -49,10 +49,7 @@ from .device_interface import (
     Acknowledge,
     AnalogOutput,
     AnalogOutputs,
-    AudioData,
-    DoorData,
     Heartbeat,
-    PressureReading,
     Motor,
     DigitalOutputs,
     Source,
@@ -60,12 +57,10 @@ from .device_interface import (
     Target,
     Tone,
     ColorLed,
-    MagnetDigitalInputs,
     MotorSource,
     PelletDigitalInputs,
     ServoConfig,
     StepperConfig,
-    SensorStatus,
     ServoStatus,
     StepperStatus,
     Version,
@@ -101,19 +96,6 @@ def _is_pellet_by_addr(addr: int) -> bool:
     return addr & 0xC == 0
 
 
-def _is_magnet_by_addr(addr: int) -> bool:
-    """
-    Pellet device CAN address board type is 4 (bits 2 and 3)
-
-    Args:
-        addr: Physical CAN address
-
-    Returns:
-        bool: True if the address is associated with a manget/head device
-    """
-    return addr & 0xC == 0x04
-
-
 def _addr2tgt(addr: int) -> Target:
     """
     Convert a CANbus address to a target
@@ -122,12 +104,10 @@ def _addr2tgt(addr: int) -> Target:
         addr: Physical CAN address
 
     Returns:
-        Target: Either PELLET_DEVICE or MAGNET_DEVICE
+        Target: PELLET_DEVICE
     """
     if _is_pellet_by_addr(addr):
         return Target.PELLET_DEVICE
-    elif _is_magnet_by_addr(addr):
-        return Target.MAGNET_DEVICE
     raise RuntimeError(f"unknown addr for _addr2tgt: {addr}")
 
 
@@ -141,10 +121,7 @@ def target_to_str(target: Target) -> str:
     """
     if target == Target.PELLET_DEVICE:
         return "Pellet"
-    elif target == Target.MAGNET_DEVICE:
-        return "Magnet"
-    else:
-        return "Unknown"
+    return "Unknown"
 
 
 _MOTOR_TO_STR_MAP = {
@@ -154,9 +131,6 @@ _MOTOR_TO_STR_MAP = {
     Motor.PELLET_LOAD_SERVO: "Load",
     Motor.PELLET_COVER_SERVO: "Cover",
 
-    Motor.TUNNEL_MAGNET_SERVO: "Magnet",
-    Motor.TUNNEL_GATE_SERVO: "Gate",
-    Motor.TUNNEL_FAN_SERVO: "Fan",
 }
 
 
@@ -172,10 +146,6 @@ def motor_to_str(motor: Motor) -> str:
 
 
 class MotorInstance(IntEnum):
-    TUNNEL_MAGNET_SERVO_ID = 0
-    TUNNEL_FAN_SERVO_ID = 1
-    TUNNEL_GATE_SERVO_ID = 2
-
     PELLET_X_MOTOR_ID = 0
     PELLET_Y_MOTOR_ID = 1
     PELLET_Z_MOTOR_ID = 2
@@ -188,11 +158,8 @@ _MOTOR_TO_ID_MAP = {
     Motor.PELLET_X_MOTOR: MotorInstance.PELLET_X_MOTOR_ID,
     Motor.PELLET_Y_MOTOR: MotorInstance.PELLET_Y_MOTOR_ID,
     Motor.PELLET_Z_MOTOR: MotorInstance.PELLET_Z_MOTOR_ID,
-    Motor.TUNNEL_MAGNET_SERVO: MotorInstance.TUNNEL_MAGNET_SERVO_ID,
-    Motor.TUNNEL_GATE_SERVO: MotorInstance.TUNNEL_GATE_SERVO_ID,
     Motor.PELLET_LOAD_SERVO: MotorInstance.PELLET_LOAD_SERVO_ID,
     Motor.PELLET_COVER_SERVO: MotorInstance.PELLET_COVER_SERVO_ID,
-    Motor.TUNNEL_FAN_SERVO: MotorInstance.TUNNEL_FAN_SERVO_ID,
 }
 
 def _motor_to_id(motor: Motor) -> int:
@@ -226,10 +193,6 @@ def _motor_to_axis_idx(
 
 
 _servo_motors = {
-    Motor.TUNNEL_MAGNET_SERVO,
-    Motor.TUNNEL_GATE_SERVO,
-    Motor.TUNNEL_FAN_SERVO,  # for config
-
     Motor.PELLET_LOAD_SERVO,
     Motor.PELLET_COVER_SERVO,
 }
@@ -262,26 +225,11 @@ def is_stepper(motor: Motor) -> bool:
 _pellet_board_motors = {
     Motor.PELLET_X_MOTOR, Motor.PELLET_Y_MOTOR, Motor.PELLET_Z_MOTOR,
     Motor.PELLET_LOAD_SERVO, Motor.PELLET_COVER_SERVO,
-
-    Motor.TUNNEL_GATE_SERVO,
-}
-
-_magnet_board_motors = {
-    # Motor.TUNNEL_GATE_SERVO,  NB: moved to pellet-board because breaking the audio stream
-    Motor.TUNNEL_MAGNET_SERVO,
-    Motor.TUNNEL_FAN_SERVO,  # NB: it's handled as GPIO with hardcoded address of pellet-device
-}
-
-
-_magnet_servo_2_motor = {
-    MotorInstance.TUNNEL_MAGNET_SERVO_ID: Motor.TUNNEL_MAGNET_SERVO,
-    MotorInstance.TUNNEL_FAN_SERVO_ID: Motor.TUNNEL_FAN_SERVO,
 }
 
 _pellet_servo_2_motor = {
     MotorInstance.PELLET_COVER_SERVO_ID: Motor.PELLET_COVER_SERVO,
     MotorInstance.PELLET_LOAD_SERVO_ID: Motor.PELLET_LOAD_SERVO,
-    MotorInstance.TUNNEL_GATE_SERVO_ID: Motor.TUNNEL_GATE_SERVO,
 }
 
 _pellet_stepper_2_motor = {
@@ -299,8 +247,6 @@ def target_of_motor(motor: Motor) -> Target:
     Returns:
         Target: the hardware target that the motor resides on
     """
-    if motor in _magnet_board_motors:
-        return Target.MAGNET_DEVICE
     if motor in _pellet_board_motors or motor in {Motor.DELAY, Motor.TONE}:
         return Target.PELLET_DEVICE
     raise ValueError(f"Unhandled motor for target_of_motor: {motor!r}")
@@ -319,15 +265,11 @@ def _id_to_motor(target: Target, isa_servo: bool, motor_id: int) -> Motor:
         Motor: associated Motor identifier
     """
     motor = Motor.NONE
-    if target == Target.MAGNET_DEVICE:
-        if isa_servo:
-            motor = _magnet_servo_2_motor.get(motor_id, motor)
+    assert target == Target.PELLET_DEVICE
+    if isa_servo:
+        motor = _pellet_servo_2_motor.get(motor_id, motor)
     else:
-        assert target == Target.PELLET_DEVICE
-        if isa_servo:
-            motor = _pellet_servo_2_motor.get(motor_id, motor)
-        else:
-            motor = _pellet_stepper_2_motor.get(motor_id, motor)
+        motor = _pellet_stepper_2_motor.get(motor_id, motor)
 
     if motor == Motor.NONE:
         logger.warning("Unknown motor id for target: target=%s isa_servo=%s motor_id=%s",
@@ -388,12 +330,11 @@ class CanInterface(DeviceInterface):
         Creates default Configurations for motors. Expected to be updated during
         the connection protocol.
 
-        Sets known pellet and magnet address to None. Expected to be updated during
+        Sets the known pellet address to None. Expected to be updated during
         the connection protocol.
         """
         super().__init__()
-        self._required_targets = tuple(required_targets or (Target.PELLET_DEVICE, Target.MAGNET_DEVICE))
-        self._pellet_only_runtime = self._required_targets == (Target.PELLET_DEVICE,)
+        self._required_targets = tuple(required_targets or (Target.PELLET_DEVICE,))
         self._can_transport = can_transport or CanTransportConfiguration()
         if self._can_transport.uses_linux_can_stack:
             self._jerrycan_msg_cls = socketcan_jerrycan.JerryCANMsg
@@ -424,36 +365,22 @@ class CanInterface(DeviceInterface):
         self._is_open = False
 
         self._next_status_log_perf_c = -math.inf
-        self._magnet_board_last_status_perf_c = {
-            motor: -math.inf
-            for motor in Motor
-            if motor in _magnet_board_motors
-        }
-        pellet_status_motors = _pellet_board_motors
-        if self._pellet_only_runtime:
-            pellet_status_motors = pellet_status_motors - {Motor.TUNNEL_GATE_SERVO}
         self._pellet_board_last_status_perf_c = {
             motor: -math.inf
             for motor in Motor
-            if motor in pellet_status_motors
+            if motor in _pellet_board_motors
         }
 
         self._pellet_addr: Optional[int] = None
-        self._magnet_addr: Optional[int] = None
 
         self._servo_configs = {}
-        self.magnet_config = ServoConfig()
-        self.gate_config = ServoConfig()
         self.load_config = ServoConfig()
         self.cover_config = ServoConfig()
-        self.tunnel_fan_config = ServoConfig()
 
         self._motor_configs = {}
         self.x_config = StepperConfig()
         self.y_config = StepperConfig()
         self.z_config = StepperConfig()
-
-        self._audio = AudioData()
 
         no_op = lambda msg: None
 
@@ -461,7 +388,7 @@ class CanInterface(DeviceInterface):
         self._prev_send_pos = Offset3DTuple.get_nan()
 
         self._last_gpio_status_perf: Dict[int, Tuple[
-            Union[PelletDigitalInputs, MagnetDigitalInputs], int]] = {}
+            PelletDigitalInputs, int]] = {}
 
         # Simple handlers implemented as lambdas
         cmd_type = self._jerrycan_cmd_type
@@ -475,29 +402,22 @@ class CanInterface(DeviceInterface):
                 time_remaining_ms=msg.tone.duration_ms,
                 frequency_hz=msg.tone.frequency_hz
             ),
-            cmd_type.ANALOG_OUT: no_op if self._pellet_only_runtime else self._translate_analog_out,
+            cmd_type.ANALOG_OUT: self._translate_analog_out,
             cmd_type.RESERVED_0E: no_op,
-            cmd_type.PRESSURE_READ: lambda msg: PressureReading(
-                target=_addr2tgt(msg.dst_id),
-                pressure=self.round_float(float(msg.pressure_read.pressure)),
-            ),
-            cmd_type.RGB_LED: no_op if self._pellet_only_runtime else lambda msg: ColorLed(
+            cmd_type.PRESSURE_READ: no_op,
+            cmd_type.RGB_LED: lambda msg: ColorLed(
                 target=_addr2tgt(msg.dst_id),
                 red=msg.rgb_led.red,
                 green=msg.rgb_led.green,
                 blue=msg.rgb_led.blue
             ),
-            cmd_type.AUDIO_MAGNITUDE_DATA_BEGIN: self._handle_audio_begin,
-            cmd_type.AUDIO_MAGNITUDE_DATA_CONT: self._handle_audio_cont,
-            cmd_type.AUDIO_MAGNITUDE_DATA_END: self._handle_audio_end,
-            cmd_type.DOOR_SENSOR: self._translate_door_sensor,
+            cmd_type.AUDIO_MAGNITUDE_DATA_BEGIN: no_op,
+            cmd_type.AUDIO_MAGNITUDE_DATA_CONT: no_op,
+            cmd_type.AUDIO_MAGNITUDE_DATA_END: no_op,
+            cmd_type.DOOR_SENSOR: no_op,
             cmd_type.SERVO_STATUS: self._translate_servo_status,
             cmd_type.STEPPER_STATUS: self._handle_stepper_status,
-            cmd_type.TEMP_HUM_READ: lambda msg: SensorStatus(
-                target=_addr2tgt(msg.dst_id),
-                temperature_c=self.round_float(float(msg.temp_hum_read.temperature) / 100.0),
-                humidity_percent=self.round_float(float(msg.temp_hum_read.humidity) / 100.0),
-            ),
+            cmd_type.TEMP_HUM_READ: no_op,
             cmd_type.ACKNOWLEDGE: lambda msg: Acknowledge(uuid=msg.uuid),
             # no-op handlers, to silence the warning if unknown message type
             cmd_type.STEPPER_HOME: no_op,
@@ -522,10 +442,10 @@ class CanInterface(DeviceInterface):
         p_now = motor_p_now = get_perf_now()
         if p_now > self._next_status_log_perf_c:
             self._next_status_log_perf_c = p_now + 15
-            for vals in (self._pellet_board_last_status_perf_c, self._magnet_board_last_status_perf_c):
-                logger.verbose("motor status age: %s",
-                    ' '.join(f"{k.name}={p_now - v:.6f}s"
-                    for k, v in sorted(vals.items(), key=lambda i: i[1])))
+            vals = self._pellet_board_last_status_perf_c
+            logger.verbose("motor status age: %s",
+                ' '.join(f"{k.name}={p_now - v:.6f}s"
+                for k, v in sorted(vals.items(), key=lambda i: i[1])))
         if __debug__:
             try:
                 fake_age = self.__allow_fake_status_time(motor)
@@ -539,12 +459,6 @@ class CanInterface(DeviceInterface):
             # use the oldest for the "global" pellet status perf_c
             oldest = min(vals.values())
             self.pellet_status_perf_c = oldest
-        elif motor in _magnet_board_motors:
-            vals = self._magnet_board_last_status_perf_c
-            vals[motor] = motor_p_now
-            # use the oldest for the "global" tunnel status perf_c
-            oldest = min(vals.values())
-            self.tunnel_status_perf_c = oldest
         else:
             return
         for m, p in vals.items():
@@ -567,44 +481,6 @@ class CanInterface(DeviceInterface):
         config.motor = motor
         config.target = target_of_motor(motor)
         self._servo_configs[motor] = config
-
-    @property
-    def magnet_config(self):
-        """
-        Returns:
-            Handle to the magnet servo configuration
-        """
-        return self._magnet_config
-
-    @magnet_config.setter
-    def magnet_config(self, config: ServoConfig):
-        """
-        Updates the magnet servo configuration (local copy)
-
-        Args:
-            config: new configuration
-        """
-        self._magnet_config = config
-        self._set_servo_config(Motor.TUNNEL_MAGNET_SERVO, config)
-
-    @property
-    def gate_config(self):
-        """
-        Returns:
-            Handle to the gate servo configuration
-        """
-        return self._gate_config
-
-    @gate_config.setter
-    def gate_config(self, config: ServoConfig):
-        """
-        Updates the gate servo configuration (local copy)
-
-        Args:
-            config: new configuration
-        """
-        self._gate_config = config
-        self._set_servo_config(Motor.TUNNEL_GATE_SERVO, config)
 
     @property
     def load_config(self):
@@ -704,15 +580,6 @@ class CanInterface(DeviceInterface):
         self._set_motor_config(Motor.PELLET_Z_MOTOR, config)
 
     @property
-    def tunnel_fan_config(self) -> ServoConfig:
-        return self._tunnel_fan_config
-
-    @tunnel_fan_config.setter
-    def tunnel_fan_config(self, config: ServoConfig):
-        self._tunnel_fan_config = config
-        self._set_servo_config(Motor.TUNNEL_FAN_SERVO, config)
-
-    @property
     def pellet_address(self):
         return self._pellet_addr
 
@@ -727,22 +594,6 @@ class CanInterface(DeviceInterface):
         """
         self._pellet_addr = addr
         logger.info(f"pellet module located at {self._pellet_addr}")
-
-    @property
-    def magnet_address(self):
-        return self._magnet_addr
-
-    @magnet_address.setter
-    def magnet_address(self, addr: int):
-        """
-        Set the magnet CAN address. Used primarily for testing, as after data is received
-        from the device(s), the address for each target will be updated automatically.
-
-        Args:
-            addr: Magnet CAN address
-        """
-        self._magnet_addr = addr
-        logger.info(f"magnet module located at {self._magnet_addr}")
 
     def are_addresses_valid(self) -> bool:
         """
@@ -761,8 +612,6 @@ class CanInterface(DeviceInterface):
     def _has_address(self, target: Target) -> bool:
         if target == Target.PELLET_DEVICE:
             return self.pellet_address is not None
-        if target == Target.MAGNET_DEVICE:
-            return self.magnet_address is not None
         raise ValueError(f"Unhandled target: {target}")
 
     def _missing_required_targets(self) -> Tuple[Target, ...]:
@@ -778,8 +627,6 @@ class CanInterface(DeviceInterface):
         """
         if target == Target.PELLET_DEVICE:
             dst = self.pellet_address
-        elif target == Target.MAGNET_DEVICE:
-            dst = self.magnet_address
         else:
             raise ValueError(f"Unhandled target: {target}")
         if dst is None:
@@ -788,17 +635,13 @@ class CanInterface(DeviceInterface):
 
     def _assign_address(self, message):
         """
-        Assign the pellet or magnet CANbus address based on an incoming message. Each
-        target address is set only once.
+        Assign the pellet CANbus address based on an incoming message.
 
         Args:
             message: Jerrycan message
         """
         if self.pellet_address is None and _is_pellet_by_addr(message.dst_id):
             self.pellet_address = message.dst_id
-
-        if self.magnet_address is None and _is_magnet_by_addr(message.dst_id):
-            self.magnet_address = message.dst_id
 
     @property
     def is_open(self) -> bool:
@@ -833,9 +676,8 @@ class CanInterface(DeviceInterface):
         self._cnt_none = 0
 
         p_now = get_perf_now()
-        for dct in (self._pellet_board_last_status_perf_c, self._magnet_board_last_status_perf_c):
-            for m in dct:
-                dct[m] = p_now
+        for m in self._pellet_board_last_status_perf_c:
+            self._pellet_board_last_status_perf_c[m] = p_now
 
         if self._is_open:
             tot_flushed = 0
@@ -856,8 +698,8 @@ class CanInterface(DeviceInterface):
                                     "needs to match the attached hardware.",
                                     self._missing_required_targets())
                     break
-            logger.notice("pellet_address=%s magnet_address=%s ; flushed %s",
-                        self.pellet_address, self.magnet_address, tot_flushed)
+            logger.notice("pellet_address=%s ; flushed %s",
+                        self.pellet_address, tot_flushed)
             if not self.are_addresses_valid():
                 self._jc.Close()
                 self._is_open = False
@@ -1002,12 +844,6 @@ class CanInterface(DeviceInterface):
                 config = self.cover_config
             elif motor == Motor.PELLET_LOAD_SERVO:
                 config = self.load_config
-            elif motor == Motor.TUNNEL_MAGNET_SERVO:
-                config = self.magnet_config
-            elif motor == Motor.TUNNEL_GATE_SERVO:
-                config = self.gate_config
-            elif motor == Motor.TUNNEL_FAN_SERVO:
-                config = self.tunnel_fan_config
             else:
                 logger.warning("Unknown motor servo config requested: motor=%s", motor)
                 config = ServoConfig()
@@ -1044,17 +880,7 @@ class CanInterface(DeviceInterface):
 
         config.motor = motor
 
-        if motor == Motor.TUNNEL_MAGNET_SERVO:
-            self.magnet_config = config
-            if write_to_remote:
-                rc = self._write_servo_config(self.magnet_config)
-
-        elif motor == Motor.TUNNEL_GATE_SERVO:
-            self.gate_config = config
-            if write_to_remote:
-                rc = self._write_servo_config(self.gate_config)
-
-        elif motor == Motor.PELLET_X_MOTOR:
+        if motor == Motor.PELLET_X_MOTOR:
             self.x_config = config
             if write_to_remote:
                 rc = self._write_stepper_config(self.x_config)
@@ -1078,11 +904,6 @@ class CanInterface(DeviceInterface):
             self.load_config = config
             if write_to_remote:
                 rc = self._write_servo_config(self.load_config)
-
-        elif motor == Motor.TUNNEL_FAN_SERVO:
-            self.tunnel_fan_config = config
-            if write_to_remote:
-                rc = self._write_servo_config(config)
 
         else:
             logger.error("Unhandled motor for set config: %s", motor)
@@ -1131,11 +952,6 @@ class CanInterface(DeviceInterface):
         query(Motor.PELLET_Z_MOTOR, StepperConfig)
         query(Motor.PELLET_LOAD_SERVO, ServoConfig)
         query(Motor.PELLET_COVER_SERVO, ServoConfig)
-        if not self.is_target_required(Target.MAGNET_DEVICE):
-            return
-        query(Motor.TUNNEL_MAGNET_SERVO, ServoConfig)
-        query(Motor.TUNNEL_GATE_SERVO, ServoConfig)
-        query(Motor.TUNNEL_FAN_SERVO, ServoConfig)
 
     def delay(self, delay_sec) -> bool:
         """
@@ -1303,30 +1119,6 @@ class CanInterface(DeviceInterface):
         )
         logger.debug("%s: StepperMove res=%s uuid=%s", motor, res, uuid)
         return res == 0
-
-    def move_magnet_servo(self, position) -> bool:
-        """
-        Move the magnet motor
-
-        Args:
-            position: Either a position (float) or a (position, rate (%)) pair
-
-        Returns:
-            bool: True if successful else False
-        """
-        return self._move_servo_motor(Motor.TUNNEL_MAGNET_SERVO, position, self.magnet_config)
-
-    def move_gate_servo(self, position) -> bool:
-        """
-        Move the gate motor
-
-        Args:
-            position: Either a position (float) or a (position, rate (%)) pair
-
-        Returns:
-            bool: True if successful else False
-        """
-        return self._move_servo_motor(Motor.TUNNEL_GATE_SERVO, position, self.gate_config)
 
     def set_motor_x(self, position: float, *, relative: bool = False) -> bool:
         # NB: SET == saved-as-fixed:
@@ -1811,7 +1603,7 @@ class CanInterface(DeviceInterface):
 
         return config
 
-    def _translate_gpio(self, message) -> Union[MagnetDigitalInputs, PelletDigitalInputs]:
+    def _translate_gpio(self, message) -> Optional[PelletDigitalInputs]:
         """
         Translate GPIO read response messages.
 
@@ -1819,19 +1611,11 @@ class CanInterface(DeviceInterface):
             message: JerryCANMsg with GPIO state data
 
         Returns:
-            MagnetDigitalInputs or PelletDigitalInputs depending on the source address
+            PelletDigitalInputs for the pellet board, otherwise None
         """
         prev = self._last_gpio_status_perf.get(message.dst_id, None)
         state = message.gpio_read.state
-        if _is_magnet_by_addr(message.dst_id):
-            tgt = Target.MAGNET_DEVICE
-            digital_inputs = MagnetDigitalInputs(
-                target=_addr2tgt(message.dst_id),
-                continuity_0=bool(state & 0x10),
-                continuity_1=bool(state & 0x20),
-            )
-
-        elif _is_pellet_by_addr(message.dst_id):
+        if _is_pellet_by_addr(message.dst_id):
             tgt = Target.PELLET_DEVICE
             digital_inputs = PelletDigitalInputs(
                 target=_addr2tgt(message.dst_id),
@@ -1870,99 +1654,6 @@ class CanInterface(DeviceInterface):
             )
         return None
 
-    def _handle_audio_begin(self, message) -> None:
-        """
-        Handle the beginning of audio magnitude data stream.
-        This method updates internal state but doesn't return data.
-
-        Args:
-            message: JerryCANMsg with beginning of audio data
-        """
-        cur_audio = self._audio
-        cur_audio.magnitudes.clear()
-        cur_audio.target = _addr2tgt(message.dst_id)
-        cur_audio.packet_id = message.audio_data_cmd.stream_id
-        # NB: kind of duplicate:
-        cur_audio.when = self._get_timestamp_ns(message) / 1e9
-        # when : timestamp_ns is already applied in self._translate() method
-        # But really duplicate:
-        # self._audio.index = self._get_index(message)
-        # index now already applied in self._translate() too
-        return None
-
-    def _handle_audio_cont(self, message) -> None:
-        """
-        Handle continuation of audio magnitude data stream.
-        This method updates internal state but doesn't return data.
-
-        Args:
-            message: JerryCANMsg with continued audio data
-        """
-        cur_audio = self._audio
-        if cur_audio.packet_id != 0 and cur_audio.target == _addr2tgt(message.dst_id):
-            cur_audio.magnitudes.extend(message.audio_data.magnitudes)
-        else:
-            logger.warning("Unknown audio cont: target=%s cur=%s magnitudes=%s",
-                           _addr2tgt(message.dst_id), cur_audio.target, message.audio_data.magnitudes)
-        return None
-
-    def _handle_audio_end(self, message) -> Optional[AudioData]:
-        """
-        Handle the end of audio magnitude data stream.
-
-        Args:
-            message: JerryCANMsg with end of audio data marker
-
-        Returns:
-            AudioData object if a complete packet was received, None otherwise
-        """
-
-        cur_audio = self._audio
-        if message.audio_data_cmd.stream_id == cur_audio.packet_id:
-            if len(cur_audio.magnitudes) != 64:
-                logger.debug("missing or unexpected extra audio data, got %s, awaited 64 ; data skipped",
-                             len(cur_audio.magnitudes))
-                a = None
-            else:
-                # todo: could use copy.deepcopy for faster creation probably:
-                a = AudioData(
-                    target=cur_audio.target,
-                    when=cur_audio.when,
-                    index=cur_audio.index,
-                    magnitudes=cur_audio.magnitudes,
-                    packet_id=cur_audio.packet_id,
-                )
-        else:
-            logger.warning("Got unknown or unexpected audio end: packet_id=%s cur=%s",
-                           message.audio_data_cmd.stream_id, cur_audio.packet_id)
-            a = None
-
-        # Reset the audio buffer state
-        cur_audio.magnitudes = []
-        cur_audio.packet_id = 0
-
-        return a
-
-    @staticmethod
-    def _translate_door_sensor(message) -> DoorData:
-        """
-        Translate door sensor response messages.
-
-        Args:
-            message: JerryCANMsg with door sensor data
-
-        Returns:
-            DoorData object with state information
-        """
-        return DoorData(
-            target=_addr2tgt(message.dst_id),
-            # Reported state is inverse of requested state
-            door1=message.doors.door1,
-            door2=message.doors.door2,
-            door3=message.doors.door3,
-            ext_button=message.doors.ext_button,
-        )
-
     def _translate_servo_status(self, message) -> Optional[ServoStatus]:
         """
         Translate servo status response messages.
@@ -1976,8 +1667,6 @@ class CanInterface(DeviceInterface):
         target = _addr2tgt(message.dst_id)
         motor = _id_to_motor(target, True, message.servo_status.motor_id)
         if motor == Motor.NONE:
-            return None
-        if self._pellet_only_runtime and motor == Motor.TUNNEL_GATE_SERVO:
             return None
         self._handle_motor_status_age(motor)
         return ServoStatus(target, motor, self.round_float(message.servo_status.position))

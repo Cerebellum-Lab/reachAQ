@@ -411,8 +411,3 @@ class AppModel(ObservableObject):
         if self._device_connection is not None:
             self._device_connection.send_message(message, data, context)
 
-    def set_tunnel_fan_on(self):
-        return self._send_command(SystemCommandKind.TUNNEL_FAN_ON, context=uuid.uuid4())
-
-    def set_tunnel_fan_off(self):
-        return self._send_command(SystemCommandKind.TUNNEL_FAN_OFF, context=uuid.uuid4())
