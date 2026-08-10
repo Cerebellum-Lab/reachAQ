@@ -810,13 +810,14 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             return token
         else:
             logger.verbose("send_command failed, device not setup yet: cmd=%s token=%s", cmd, token)
-            self._on_can_failure(CanFailure(
-                kind=CanFailureKind.COMMAND,
-                error=f"Command {cmd.name} could not be queued",
-                command=cmd,
-                context=str(token),
-                perf_time=perf_now,
-            ))
+            if cmd is SystemCommandKind.SEND_PELLET:
+                self._on_can_failure(CanFailure(
+                    kind=CanFailureKind.COMMAND,
+                    error=f"Command {cmd.name} could not be queued",
+                    command=cmd,
+                    context=str(token),
+                    perf_time=perf_now,
+                ))
             return None
 
     # noinspection PyMethodMayBeStatic
