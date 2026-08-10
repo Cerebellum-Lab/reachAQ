@@ -14,6 +14,7 @@ from autotrainer.core import (  # noqa: E402
     LaserChannelConfiguration,
     LaserChannelId,
     LaserSystemConfiguration,
+    NidaqDeviceIdentity,
     NidaqPortConfiguration,
     NidaqSignalChannelConfiguration,
     NidaqSignalStreamConfiguration,
@@ -60,6 +61,14 @@ class _AnalysisAppStub(ObservableObject):
             cam_frames="Dev1/port0/line0",
             tone1="Dev1/port0/line3",
             tone2="Dev1/port0/line4",
+            device_identities=(
+                NidaqDeviceIdentity(
+                    logical_name="input-device",
+                    runtime_name="Dev1",
+                    product_type="Test Device",
+                    serial_number=123,
+                ),
+            ),
         )
         self.laser = LaserModel()
         self.laser.set_configuration_offline(

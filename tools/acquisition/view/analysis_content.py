@@ -559,10 +559,15 @@ class AnalysisContent(ContentWidget):
     def _mapped_physical_channels(self) -> Set[str]:
         mapped = set()
         ports = self._app_model.nidaq_ports
-        for field in dataclasses.fields(ports):
-            if field.name in {"device_name", "timing"}:
-                continue
-            value = getattr(ports, field.name)
+        for field_name in (
+            "tone1",
+            "tone2",
+            "tone3_r",
+            "tone3_l",
+            "cam_frames",
+            "barcode",
+        ):
+            value = getattr(ports, field_name)
             if value:
                 mapped.add(value)
         for channel in self._app_model.laser.configuration.channels:
