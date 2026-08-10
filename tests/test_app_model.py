@@ -209,10 +209,14 @@ def test_pellet_send_and_ack_create_session_trial_attempt(app_model):
         perf_c=10.0,
         context="send-context",
     )
-    app_model._on_pellet_sent(
-        perf_c=10.25,
-        context="send-context",
-    )
+    with mock.patch.object(
+        app_model._protocol_runner,
+        "begin_trial",
+    ) as begin_trial:
+        app_model._on_pellet_sent(
+            perf_c=10.25,
+            context="send-context",
+        )
 
     attempt = app_model._trial_ledger.active_attempt
     assert attempt.attempt_label == "1.1"
@@ -220,6 +224,7 @@ def test_pellet_send_and_ack_create_session_trial_attempt(app_model):
     assert attempt.send_perf_time == 10.0
     assert attempt.send_ack_perf_time == 10.25
     assert app_model._trial_ledger.summary()["pellets_presented"] == 1
+    begin_trial.assert_called_once_with("1.1")
 
 
 def test_mismatched_pellet_ack_does_not_present_or_count_trial(app_model):
@@ -294,7 +299,10 @@ def test_pellet_cycle_completion_finishes_trial_before_automatic_stop(
     with mock.patch.object(
         app_model,
         "_stop_recording_with_reason",
-    ) as stop:
+    ) as stop, mock.patch.object(
+        app_model._protocol_runner,
+        "finish_trial",
+    ) as finish_trial:
         app_model._on_pellet_cycle_completed(perf_c=6.0)
 
     stop.assert_called_once_with(
@@ -303,6 +311,7 @@ def test_pellet_cycle_completion_finishes_trial_before_automatic_stop(
     )
     assert ledger.active_attempt is None
     assert ledger.summary()["trials_completed"] == 1
+    finish_trial.assert_called_once_with("1.1", TrialOutcome.PENDING_ANALYSIS)
 
 
 def test_abort_removes_whole_session_and_resets_counts(app_model):

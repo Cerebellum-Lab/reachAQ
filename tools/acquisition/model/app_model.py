@@ -139,6 +139,7 @@ from tools.acquisition.model.subsystem_status import (
     SubsystemStatus,
     SubsystemStatusRegistry,
 )
+from tools.acquisition.model.trial_protocol_runner import TrialProtocolRunner
 from tools.acquisition.model.behavior_model import BehaviorModel
 from tools.acquisition.model.user_preferences import UserPreferences, get_default_animals_location
 from tools.acquisition.model.video_capture_model import (
@@ -509,6 +510,9 @@ class AppModel(ObservableObject):
         self._attached_plan: Optional[TrainingPlan] = None
         self._attached_phase: Optional[TrainingPhase] = None
         self._attached_animal: Optional[AnimalSubject] = None
+        self._protocol_runner = TrialProtocolRunner(
+            on_protocol_complete=self._on_trial_protocol_complete,
+        )
 
         self._rpc_service: Optional[RpcService] = None
 
@@ -1639,6 +1643,8 @@ class AppModel(ObservableObject):
     @property
     def recording_blockers(self) -> Tuple[str, ...]:
         blockers = list(self._subsystem_status_registry.recording_blockers())
+        if self._protocol_runner.protocol_complete:
+            blockers.append("Selected protocol is complete")
         if self._session_recording_status is not SessionRecordingStatus.READY:
             blockers.append(
                 f"recording state: {self._session_recording_status.value}"
@@ -2278,12 +2284,14 @@ class AppModel(ObservableObject):
             if load_result != LoadProgressResult.OK:
                 return False
 
-        is_auto = self._training_mode == TrainingMode.AUTOMATIC
+        session_control = algo.active_config.session_control
+        is_auto = session_control.automatic_protocol_advance_enabled
         logger.success("Animal %s: attaching auto=%s to plan %s (%s) ..",
                        animal.name, is_auto, plan.plan_id, hex(id(plan)))
         plan.is_automatic = is_auto
-        pellet_dev = tunnel_dev = self._hardware
-        plan.attach(algo, pellet_dev, tunnel_dev)
+        pellet_dev = self._hardware
+        self._protocol_runner.automatic_advance = is_auto
+        self._protocol_runner.attach(plan, algo, pellet_dev)
         self._attached_plan = plan
         self._attached_animal = animal
         plan.property_changed += self._on_training_plan_property_changed  # first, to be sure get everything
@@ -2309,7 +2317,10 @@ class AppModel(ObservableObject):
         animal = self._attached_animal
         assert isinstance(animal, AnimalSubject)
         logger.notice("%s: detaching from plan %s (%s)", animal.name, plan.plan_id, hex(id(plan)))
-        plan.detach()
+        if self._protocol_runner.plan is plan:
+            self._protocol_runner.detach()
+        else:
+            plan.detach()
         self._attached_plan = None
         self._attached_animal = None
         prog = plan.serialize_progress()
@@ -5238,20 +5249,34 @@ class AppModel(ObservableObject):
 
     # pellet machine events
 
-    def _on_pellet_loading_for_trial(self):
+    def _on_trial_protocol_complete(self) -> None:
+        logger.success("Selected pellet-trial protocol is complete")
+        self.property_changed(
+            self.Props.RECORDING_BLOCKERS,
+            self.recording_blockers,
+            None,
+        )
+        self._evaluate_automatic_stop_policy(protocol_complete=True)
+
+    def _finish_active_pellet_trial(self, perf_c: float) -> None:
         ledger = self._trial_ledger
         if ledger is None or ledger.active_attempt is None:
             return
-        now_perf = get_perf_now()
-        ledger.close_active_for_analysis(now_perf, time.time())
-        self._evaluate_automatic_stop_policy()
+        attempt = ledger.close_active_for_analysis(perf_c, time.time())
+        if attempt.is_presented:
+            self._protocol_runner.finish_trial(
+                attempt.attempt_label,
+                attempt.outcome,
+            )
+        self._evaluate_automatic_stop_policy(
+            protocol_complete=self._protocol_runner.protocol_complete,
+        )
+
+    def _on_pellet_loading_for_trial(self):
+        self._finish_active_pellet_trial(get_perf_now())
 
     def _on_pellet_cycle_completed(self, *, perf_c: float):
-        ledger = self._trial_ledger
-        if ledger is None or ledger.active_attempt is None:
-            return
-        ledger.close_active_for_analysis(perf_c, time.time())
-        self._evaluate_automatic_stop_policy()
+        self._finish_active_pellet_trial(perf_c)
 
     def _on_pellet_sending(self, *, perf_c: float, context: str):
         ledger = self._trial_ledger
@@ -5297,9 +5322,12 @@ class AppModel(ObservableObject):
                         context,
                     )
                     return
-                ledger.acknowledge_presentation(
+                attempt = ledger.acknowledge_presentation(
                     get_perf_now() if perf_c is None else perf_c,
                     time.time(),
                 )
+                self._protocol_runner.begin_trial(attempt.attempt_label)
             algo.increase_pellets_presented(1)
-            self._evaluate_automatic_stop_policy()
+            self._evaluate_automatic_stop_policy(
+                protocol_complete=self._protocol_runner.protocol_complete,
+            )
