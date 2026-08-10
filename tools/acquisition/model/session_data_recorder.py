@@ -865,6 +865,15 @@ class SessionDataRecorder:
         return np.flatnonzero(high & np.concatenate(([False], ~high[:-1])))
 
     @staticmethod
+    def _transition_positions(values: np.ndarray) -> np.ndarray:
+        """Return observed digital transitions, excluding the initial state."""
+        values = np.asarray(values, dtype=np.float64)
+        if values.size < 2:
+            return np.empty(0, dtype=np.int64)
+        high = np.isfinite(values) & (values > 0.5)
+        return np.flatnonzero(high[1:] != high[:-1]) + 1
+
+    @staticmethod
     def _match_camera_nidaq_edge(boundary, start_perf, chunks) -> dict:
         names, indices, perf, values, rate = SessionDataRecorder._nidaq_arrays(
             chunks
@@ -884,6 +893,7 @@ class SessionDataRecorder:
             "signedOffsetSeconds": None,
             "resolutionSeconds": resolution,
             "ambiguitySeconds": None,
+            "edgePolarity": None,
         }
         if indices.size == 0 or rate is None:
             return {
@@ -908,7 +918,7 @@ class SessionDataRecorder:
             }
 
         channel_values = values[names.index("cam_frames")]
-        edge_positions = SessionDataRecorder._rising_edge_positions(
+        edge_positions = SessionDataRecorder._transition_positions(
             channel_values
         )
         if edge_positions.size == 0:
@@ -916,7 +926,7 @@ class SessionDataRecorder:
                 **base,
                 "status": "unmatched",
                 "confidence": "none",
-                "reason": "cam_frames contained no rising edge",
+                "reason": "cam_frames contained no observed transition",
             }
         distances = np.abs(perf[edge_positions] - start_perf)
         order = np.argsort(distances)
@@ -960,8 +970,11 @@ class SessionDataRecorder:
             "matchedNidaqPerfTime": float(perf[best_position]),
             "signedOffsetSeconds": float(perf[best_position] - start_perf),
             "ambiguitySeconds": ambiguity,
+            "edgePolarity": (
+                "rising" if channel_values[best_position] > 0.5 else "falling"
+            ),
             "reason": (
-                "Nearest rising cam_frames edge on the NI-DAQ sample timeline"
+                "Nearest cam_frames transition on the NI-DAQ sample timeline"
             ),
         }
 

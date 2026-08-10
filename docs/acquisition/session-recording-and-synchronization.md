@@ -236,9 +236,11 @@ Final trial JSON/YAML additionally records `sessionCounts`,
 `hardwareRuntimeAtRecord`, `hardwareRuntime`, recording state, and analysis
 duration.
 
-Camera/NI matching uses the nearest `cam_frames` rising edge within half the
-observed frame period. It reports `host_estimated` when the line is not
-configured, and `unmatched` when no plausible edge exists. Tone matching pairs
+Camera/NI matching uses the nearest `cam_frames` transition within half the
+observed frame period and records whether it was rising or falling. The current
+camera output is a square wave whose alternating peaks and troughs each identify
+one frame. Alignment reports `host_estimated` when the line is not configured,
+and `unmatched` when no plausible transition exists. Tone matching pairs
 decoded per-line stimulus rises with unclaimed NI-DAQ rises within 250 ms.
 Generic `PLAY_TONE` commands remain explicitly unmatched when the decoded
 command does not identify a physical confirmation line.

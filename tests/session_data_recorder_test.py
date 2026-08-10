@@ -320,6 +320,7 @@ def test_camera_and_tone_edges_are_correlated_on_nidaq_timeline(tmp_path):
     assert camera["confidence"] == "hardware_edge"
     assert camera["matchedSampleIndex"] == 101
     assert camera["signedOffsetSeconds"] == 0.0
+    assert camera["edgePolarity"] == "rising"
     tone = result["toneConfirmation"]
     assert tone["status"] == "complete"
     assert tone["matched"][0]["channel"] == "tone1"
@@ -338,6 +339,43 @@ def test_camera_and_tone_edges_are_correlated_on_nidaq_timeline(tmp_path):
     )
     assert alignment["canonicalBoundary"]["primaryFrameId"] == 42
     assert alignment["canonicalBoundary"]["nidaqSampleIndex"] == 101
+
+
+def test_camera_alignment_matches_falling_square_wave_transition():
+    sample_rate = 1000.0
+    indices = np.arange(200, 207, dtype=np.int64)
+    perf = 19.998 + np.arange(7, dtype=np.float64) / sample_rate
+    chunk = (
+        indices,
+        perf,
+        200.0 + (perf - 20.0),
+        np.array(((1, 1, 0, 0, 1, 1, 0),), dtype=np.float32),
+        ("cam_frames",),
+        sample_rate,
+        2,
+        0,
+        0,
+    )
+    boundary = SessionBoundary(
+        session_id="trial-square-wave",
+        primary_camera="left",
+        primary_frame_id=44,
+        start_perf_time=20.0,
+        start_wall_time=200.0,
+        camera_when=2_000_000.0,
+    )
+
+    alignment = SessionDataRecorder._match_camera_nidaq_edge(
+        boundary,
+        20.0,
+        (chunk,),
+    )
+
+    assert alignment["status"] == "matched"
+    assert alignment["confidence"] == "hardware_edge"
+    assert alignment["matchedSampleIndex"] == 202
+    assert alignment["signedOffsetSeconds"] == 0.0
+    assert alignment["edgePolarity"] == "falling"
 
 
 def test_missing_cam_frames_is_explicitly_host_estimated():
