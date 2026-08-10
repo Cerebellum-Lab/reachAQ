@@ -58,13 +58,6 @@ class _AppModelStub(ObservableObject):
                 camera_source=CaptureCameraAttrs("stimCam", "spinnaker://333"),
                 capture_process_status=CaptureProcessStatus.UNKNOWN,
             ),
-            _ObservableStub(
-                name="web",
-                camera_id=CameraId.Web,
-                is_enabled=True,
-                camera_source=CaptureCameraAttrs("USB Camera 0", "opencv://0"),
-                capture_process_status=CaptureProcessStatus.UNKNOWN,
-            ),
         )
         self.hardware = _ObservableStub(
             nidaq_enabled=False,

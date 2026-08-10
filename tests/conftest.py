@@ -24,7 +24,7 @@ def system_config(trainer_config_dir, tmp_path):
     # Application tests use the mock device stack and must not depend on the
     # host SocketCAN interface being up.
     config.hardware.can_enabled = False
-    for cam_member in (CameraId.Left, CameraId.Right, CameraId.Web):
+    for cam_member in (CameraId.Left, CameraId.Right, CameraId.Camera3):
         params = dict(width=300, height=200)
         cam = CameraConfiguration(name=cam_member.name, params=params)
         cam.record_prebuffer_duration = 0

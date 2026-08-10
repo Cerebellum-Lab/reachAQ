@@ -1,6 +1,4 @@
-import dataclasses
 import io
-from pathlib import Path
 
 import pytest
 import yaml
@@ -27,7 +25,7 @@ unknown_attribute: 42
         SystemConfiguration.load_yaml(io.StringIO(config_text))
 
 
-def test_version_56_drops_removed_pellet_limit_fields():
+def test_older_version_is_rejected():
     config_text = """
 !SystemConfiguration
 version: 56
@@ -38,15 +36,11 @@ behavior: !BehaviorConfiguration
     maxPelletsPerDay: 100
 """
 
-    cfg = SystemConfiguration.load_yaml(io.StringIO(config_text))
-
-    assert cfg.version == 56
-    assert cfg.behavior.pellet_delivery.is_enabled is True
-    assert not hasattr(cfg.behavior.pellet_delivery, "max_pellets_per_session")
-    assert not hasattr(cfg.behavior.pellet_delivery, "max_pellets_per_day")
+    with pytest.raises(ValueError, match="requires version"):
+        SystemConfiguration.load_yaml(io.StringIO(config_text))
 
 
-def test_higher_version_drop_unknown_config_items():
+def test_higher_version_is_rejected():
     config_text = f"""
 !SystemConfiguration
 version: {SystemConfiguration.version + 1}
@@ -55,16 +49,11 @@ persistence: !PersistenceConfiguration
   outputLocation: /output_location_path
   another_unknown_attribute: foobar
 """
-    cfg = SystemConfiguration.load_yaml(io.StringIO(config_text))
-    assert isinstance(cfg, SystemConfiguration)
-    expected_result = dataclasses.asdict(SystemConfiguration())
-    # apart the version and persistence.output_location, these are all the defaults values
-    expected_result["version"] = SystemConfiguration.version + 1
-    expected_result["persistence"]["output_location"] = "/output_location_path"
-    assert dataclasses.asdict(cfg) == expected_result
+    with pytest.raises(ValueError, match="requires version"):
+        SystemConfiguration.load_yaml(io.StringIO(config_text))
 
 
-def test_safe_loader_ignore_unknown_tags():
+def test_unknown_tags_in_unsupported_version_are_rejected_by_version():
     config_text = f"""
     !SystemConfiguration
     version: {SystemConfiguration.version + 1}
@@ -74,12 +63,8 @@ def test_safe_loader_ignore_unknown_tags():
     - !second_unknown_tag
       param1: anything
     """
-    cfg = SystemConfiguration.load_yaml(io.StringIO(config_text))
-    assert isinstance(cfg, SystemConfiguration)
-    expected_result = dataclasses.asdict(SystemConfiguration())
-    # apart the version, these are all the defaults values
-    expected_result["version"] = SystemConfiguration.version + 1
-    assert dataclasses.asdict(cfg) == expected_result
+    with pytest.raises(ValueError, match="requires version"):
+        SystemConfiguration.load_yaml(io.StringIO(config_text))
 
 
 def test_save_file_without_specify_save_type_fails():

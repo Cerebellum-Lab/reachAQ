@@ -340,18 +340,6 @@ class ProjectInfo(_ProjectInfo):
                                 os.path.join(audio_path.location, f"{audio_path.prefix}.{ext}"),
                                 audio_path.interval)
 
-    def get_webcam_presence_file(
-        self,
-        name: str = "cage",
-        ext: str = "csv",
-        interval: ProjectInterval = ProjectInterval.HOUR,
-        when: Optional[datetime] = None,
-    ) -> IntervalFileInfo:
-        web_path = self.get_interval_path(name, interval, when=when)
-        return IntervalFileInfo(web_path.location,
-                                os.path.join(web_path.location, f"{web_path.prefix}.{ext}"),
-                                web_path.interval)
-
     def get_video_path(
         self,
         name: str = "",

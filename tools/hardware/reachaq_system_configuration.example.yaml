@@ -1,7 +1,7 @@
 # reachAQ Dell/Ubuntu system configuration example.
 # Replace camera serials, NI-DAQ device/channel names, model paths, and voltage limits with the bench rig values.
 # CAN transport is configured through reachaq_hardware.env.example because the current CAN runtime reads environment.
-# stimCam is explicitly present but disabled; Cameras 4-6 and web are omitted.
+# stimCam is explicitly present but disabled; Cameras 4-6 are omitted.
 # The documented PXIe-1073 rig uses PXI1Slot5 (PXI-6221) for sampled inputs
 # and PXI1Slot4 (PXI-6713) for laser analog outputs. Discover every target rig;
 # aliases, serials, capabilities, and valid routes are not universal defaults.
@@ -79,18 +79,15 @@ cameras:
     gamma: 0.7
     primary: 'no'
 hardware: !HardwareConfiguration
-  tunnelIdentifier: ''
   pelletIdentifier: CAN
   canEnabled: true
   pelletControllerEnabled: true
   nidaqEnabled: true
-  tunnelHeadfixEnabled: false
   minAckTimeout: 3.0
   boardStatusTimeout: 15.0
 inference: !InferenceConfiguration
   poseModelLocation: /opt/reachaq/models/reach_pose_model
   isEnabled: true
-  intersessionWaitTime: 2.0
 laser: !LaserSystemConfiguration
   # The PXI-6713 has analog outputs but no analog inputs. Keep laser feedback disabled
   # until a supported analog-input device is configured for diode/command-copy inputs.

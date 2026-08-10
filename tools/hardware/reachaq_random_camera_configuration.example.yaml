@@ -58,30 +58,11 @@ cameras:
     height: 200
     fps: 30
     primary: 'no'
-- !CameraConfiguration
-  id: 2
-  name: web
-  isEnabled: false
-  isRecordEnabled: false
-  recordMode: 0
-  recordPrebufferDuration: 0.0
-  isStillImageCaptureEnabled: false
-  stillImageCaptureInterval: 0.0
-  scheme: random
-  host: ''
-  port: 0
-  path: ''
-  params:
-    width: 300
-    height: 200
-    fps: 15
 hardware: !HardwareConfiguration
-  tunnelIdentifier: ''
   pelletIdentifier: ''
   canEnabled: false
   pelletControllerEnabled: false
   nidaqEnabled: false
-  tunnelHeadfixEnabled: false
   minAckTimeout: 3.0
   boardStatusTimeout: 15.0
 inference: !InferenceConfiguration

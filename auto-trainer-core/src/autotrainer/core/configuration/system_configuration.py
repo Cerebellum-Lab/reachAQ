@@ -1,18 +1,14 @@
 from __future__ import annotations
 
 import json
-import shutil
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Dict, Optional, Union, ClassVar, TextIO, Type, Any
 from typing_extensions import Self
 import yaml
 
-import humps
-
 from autotrainer.core.logging import get_verbose_logger
-from . import GenericSafeLoader, SystemConfigurationLoader, SystemConfigurationDumper, SystemConfigurationSafeLoader
+from . import GenericSafeLoader, SystemConfigurationLoader, SystemConfigurationDumper
 from .watchdog_config import WatchdogConfig
 from .. import make_camelize_representer, make_decamelize_constructor
 from .behavior_configuration import BehaviorConfiguration, add_behavior_configuration_representers, \
@@ -24,7 +20,6 @@ from .laser_configuration import LaserChannelConfiguration, LaserSystemConfigura
 from .nidaq_port_configuration import NidaqPortConfiguration
 from .nidaq_stream_configuration import NidaqSignalChannelConfiguration, NidaqSignalStreamConfiguration
 from .persistence_configuration import PersistenceConfiguration
-from ..project.project_info import DATE_FORMAT, TIME_FORMAT
 
 logger = get_verbose_logger(__name__)
 
@@ -65,38 +60,12 @@ class SystemConfiguration:
         raw_content: Dict[str, Any] = yaml.load(data, GenericSafeLoader)
         data.seek(0)
         version = raw_content.get("version", 0)
-        if version == SystemConfiguration.version:
-            # easy case
-            configuration: Self = yaml.load(data, SystemConfigurationLoader)
-        elif version < SystemConfiguration.version:
-            content = humps.decamelize(raw_content)
-            configuration = cls()
-            if version == 0:
-                configuration._deserialize_version_zero(content)
-            elif version == 1:
-                configuration._deserialize_version_one(content)
-            else:
-                configuration: Self = yaml.load(data, SystemConfigurationSafeLoader)
-        else:
-            assert version > SystemConfiguration.version
-            logger.warning("Loading configuration version %s while SystemConfiguration.version == %s, "
-                           "only considering known config attributes/properties.",
-                           version, SystemConfiguration.version)
-            configuration: Self = yaml.load(data, SystemConfigurationSafeLoader)
-
-        if version != SystemConfiguration.version and file_path is not None:
-            now = datetime.now()
-            now_str = now.strftime(f"{DATE_FORMAT}_{TIME_FORMAT}")
-            new_p = file_path.parent.joinpath(
-                f"{file_path.stem}_v{version}_{now_str}{file_path.suffix}")
-            logger.notice("Detected config version change/mismatch, saving old config to %s,"
-                          " and replacing with new after.", new_p)
-            shutil.copy2(file_path, new_p)
-            configuration.version = SystemConfiguration.version
-            # and save new one over previous:
-            configuration.save_file(file_path.with_suffix(""), as_yaml=True)
-
-        return configuration
+        if version != SystemConfiguration.version:
+            raise ValueError(
+                f"Unsupported system configuration version {version}; "
+                f"reachAQ requires version {SystemConfiguration.version}"
+            )
+        return yaml.load(data, SystemConfigurationLoader)
 
     @classmethod
     def load_yaml_file(cls: Type[Self], path: Union[Path, str], *, save_backup: bool = False) -> Self:
@@ -153,65 +122,6 @@ class SystemConfiguration:
                 self._camera_map[camera.id] = camera
 
         return self._camera_map.get(camera_id, None)
-
-    def _deserialize_version_zero(self, content: Dict):
-        self.cameras.clear()
-
-        self._try_append_version_zero_camera("camera1", content)
-        self._try_append_version_zero_camera("camera2", content)
-        self._try_append_version_zero_camera("camera3", content)
-
-        self.hardware = HardwareConfiguration.from_version_zero(content)
-
-        # Typo from earlier version of the file.
-        self.inference = InferenceConfiguration.from_version_zero(content.get("pellet", {}))
-
-        self.behavior = BehaviorConfiguration.from_version_zero(content)
-        self.persistence = PersistenceConfiguration.from_version_zero(content)
-
-    def _try_append_version_zero_camera(self, entry: str, content: Dict) -> bool:
-        if entry in content:
-            camera = CameraConfiguration.from_version_zero(entry, content[entry])
-            if camera is not None:
-                self.cameras.append(camera)
-                return True
-
-        return False
-
-    def _deserialize_version_one(self, content: Dict):
-        self.cameras = [
-            CameraConfiguration(**kw)
-            for kw in content.get("cameras", [])
-        ]
-        self.hardware = HardwareConfiguration(**content.get("hardware", {}))
-        self.inference = InferenceConfiguration(**content.get("inference", {}))
-        self.laser = LaserSystemConfiguration(**self._deserialize_laser_configuration(content.get("laser", {})))
-        self.nidaq_ports = NidaqPortConfiguration(**content.get("nidaq_ports", {}))
-        self.behavior = BehaviorConfiguration.from_version_one(content.get("behavior", {}))
-        self.persistence = PersistenceConfiguration(**content.get("persistence", {}))
-
-    @staticmethod
-    def _deserialize_laser_configuration(content: Dict) -> Dict:
-        laser = dict(content or {})
-        channels = []
-        for channel in laser.get("channels", []):
-            if isinstance(channel, LaserChannelConfiguration):
-                channels.append(channel)
-                continue
-            channel = dict(channel)
-            if "command_copy_input" not in channel and "command_monitor_input" in channel:
-                channel["command_copy_input"] = channel.pop("command_monitor_input")
-            else:
-                channel.pop("command_monitor_input", None)
-            if "command_copy_scale" not in channel and "command_monitor_scale" in channel:
-                channel["command_copy_scale"] = channel.pop("command_monitor_scale")
-            else:
-                channel.pop("command_monitor_scale", None)
-            channel.pop("command_copy_output", None)
-            channels.append(LaserChannelConfiguration(**channel))
-        laser["channels"] = tuple(channels)
-        return laser
-
 
 #
 

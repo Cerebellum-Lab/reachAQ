@@ -46,7 +46,7 @@ def remove_ansi_escape_sequences(s):
 @pytest.fixture
 def system_config(trainer_config_dir, tmp_path):
     config = SystemConfiguration()
-    for cam_member in (CameraId.Left, CameraId.Right, CameraId.Web):
+    for cam_member in (CameraId.Left, CameraId.Right, CameraId.Camera3):
         params = dict(width=300, height=200, primary="yes" if cam_member is CameraId.Left else "no")
         cam = CameraConfiguration(name=cam_member.name, params=params, is_enabled=False, is_record_enabled=False)
         cam.scheme = "random"
@@ -221,18 +221,6 @@ def test_spinnaker_camera_selectors_keep_only_their_configured_binding(
         assert camera.camera_source.name == expected_name
         assert spinnaker_options == (camera.camera_source,)
         assert all(not source.name.startswith("Spinnaker ") for source in camera.camera_list)
-
-
-def test_load_config_ignores_retired_web_camera(app_model, trainer_config_dir, system_config):
-    system_config.cameras = [
-        cam for cam in system_config.cameras
-        if cam.id != CameraId.Web
-    ]
-    system_config.save_default(trainer_config_dir)
-
-    assert app_model.load_configuration() is True
-
-    assert app_model.get_camera_model(CameraId.Web) is None
 
 
 def test_start_stop(app_model, settings_ini_path):
