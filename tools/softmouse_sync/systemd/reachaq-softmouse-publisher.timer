@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the reachAQ SoftMouse publisher nightly
+
+[Timer]
+OnCalendar=*-*-* 00:00:00 America/Denver
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

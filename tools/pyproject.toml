@@ -28,6 +28,10 @@ dependencies = [
 
     'setuptools-scm >= 9.2.2, < 10',  # to allow get version from git when in editable mode,
     'h5py >= 3.8, < 4',
+    'openpyxl >= 3.1, < 4',
+    'requests >= 2.32, < 3',
+    'keyring >= 24, < 25; python_version < "3.9"',
+    'keyring >= 25, < 26; python_version >= "3.9"',
     # without requiring to `pip install -e .` everytime you checkout something.
 
     'importlib-resources; python_version < "3.10"',
@@ -38,7 +42,8 @@ dependencies = [
 # following are currently in top level pyproject.toml :
 # not sure if keep in top-level or move here yet...
 
-#[project.scripts]
+[project.scripts]
+reachaq-softmouse-publish = "tools.softmouse_sync.cli:main"
 #auto-trainer-local = "tools.acquisition.gui:main"
 #auto-trainer-headless = "tools.acquisition.headless:main"
 ## etc... but is same than:

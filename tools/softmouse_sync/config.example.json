@@ -1,0 +1,30 @@
+{
+  "publicationDirectory": "/mnt/isilon/Data/BR/SoftMouse",
+  "https": {
+    "base_url": "https://YOUR-SOFTMOUSE-HOST/",
+    "login_path": "login.do",
+    "export_start_path": "REPLACE_FROM_REDACTED_CAPTURE",
+    "download_path_template": "export/downLoadFile?taskid={task_id}",
+    "csrf_field": "REPLACE_WITH_LOGIN_FORM_TOKEN_FIELD",
+    "login_username_field": "username",
+    "login_password_field": "password",
+    "export_start_method": "POST",
+    "export_parameters": {},
+    "task_id_json_path": ["taskid"],
+    "authentication_check_path": "REPLACE_WITH_AUTHENTICATED_ANIMAL_LIST_PATH",
+    "authenticated_page_marker": "REPLACE_WITH_STABLE_AUTHENTICATED_PAGE_TEXT",
+    "expected_colony_marker": "REPLACE_WITH_EXPECTED_COLONY_TEXT",
+    "export_suffix": ".xlsx"
+  },
+  "mapping": {
+    "sheet_name": "Animal List",
+    "external_identity_column": "Physical Tag",
+    "rfid_column": "Alt. ID",
+    "new_animal_name_column": "Physical Tag",
+    "state_column": "State"
+  },
+  "guardrails": {
+    "minimum_source_rows": 1,
+    "maximum_fractional_row_drop": 0.35
+  }
+}
