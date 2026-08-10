@@ -6,7 +6,6 @@
 * [reachAQ Linux install guide](linux-install-instructions.md)
 * [Applications](#applications)
   * [Acquisition](#acquisition-application)
-  * [Tunnel Test](#tunnel-test-application)
   * [Pellet Delivery Test](#pellet-delivery-test-application)
 * [Scripts](#scripts)
 * [Additional Tools](#additional-tools)
@@ -59,9 +58,6 @@ from the core logic of the applications for two reasons:
   * Headless implementation for command line only
     * `auto-trainer-headless -c ~/Autotrainer/system_configuration.yaml`
     * Headless mode continues to start acquisition by default because it has no UI start control.
-* Tunnel Test Application
-  * Standalone UI for interfacing with the tunnel hardware components
-  * `python -m tools.head_fix.gui`
 * Pellet Delivery Test Application
   * Standalone UI for interfacing with the pellet delivery system
   * `python -m tools.pellet_delivery.gui`
