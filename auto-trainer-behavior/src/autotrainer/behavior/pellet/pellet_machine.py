@@ -31,8 +31,18 @@ class PelletLoadFailedEventT(Protocol):
 
 
 class PelletSentEventT(Protocol):
-    def __call__(self, *, perf_c: Optional[float]=None):
+    def __call__(
+        self,
+        *,
+        perf_c: Optional[float] = None,
+        context: Optional[str] = None,
+    ):
         """Pellet Sent event signature"""
+
+
+class PelletSendingEventT(Protocol):
+    def __call__(self, *, perf_c: float, context: str):
+        """Pellet send dispatch event signature."""
 
 
 class PelletReleasedEventT(Protocol):
@@ -43,7 +53,7 @@ class PelletReleasedEventT(Protocol):
 class PelletMachineEvents(StateMachineEvents):
 
     pellet_loading: Callable[[], None]  # when a load-pellet is started executing
-    pellet_sending: Callable[[], None]  # now unused
+    pellet_sending: PelletSendingEventT
     pellet_loaded: Callable[[], None]  # when a load-pellet is finished executing AND a pellet is seen on it
     pellet_sent: PelletSentEventT  # when a send-pellet is finished executing
     pellet_load_failed: PelletLoadFailedEventT
@@ -173,7 +183,10 @@ class PelletMachine(StateMachine):
             raise PelletDeviceCommandFailed
         self._token_pellet_send = self._api_status_token = token
         self._send_begin_perf_c = get_perf_now()
-        self.events.pellet_sending()
+        self.events.pellet_sending(
+            perf_c=self._send_begin_perf_c,
+            context=str(token),
+        )
         self.post_event_content(ApiEventKind.pelletSendBegin, data=dict(context=token))
 
     def _before_cover_pellet(self, *, force: bool=False):
@@ -274,7 +287,7 @@ class PelletMachine(StateMachine):
             self._send_end_perf_c = perf_now
             self._token_pellet_send = None
             api_evt = ApiEventKind.pelletSendEnd
-            self.events.pellet_sent(perf_c=perf_now)
+            self.events.pellet_sent(perf_c=perf_now, context=str(token))
 
         elif token == self._token_pellet_load:
             self._token_pellet_load = None

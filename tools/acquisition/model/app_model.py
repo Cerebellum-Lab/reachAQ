@@ -84,8 +84,20 @@ from autotrainer.inference.analysis.prepare_jetson_data import DEFAULT_CAM_OFFSE
 from autotrainer.core.capture import CaptureProcessStatus
 
 from autotrainer.behavior.behavior_algorithm import BehaviorAlgoProps, BehaviorAlgoStatus
-from autotrainer.behavior import IntersessionState, BehaviorAlgorithm, TrainingMode, InferenceProtocol, SystemMachine, \
-    IntersessionMachine
+from autotrainer.behavior import (
+    AttemptAssignmentPolicy,
+    BehaviorAlgorithm,
+    InferenceProtocol,
+    IntersessionMachine,
+    IntersessionState,
+    PelletTrialLedger,
+    RetrySettingsPolicy,
+    SystemMachine,
+    TrainingMode,
+    TrialAccountingConfiguration,
+    TrialCountBasis,
+    TrialOutcome,
+)
 
 from autotrainer.training import TrainingPlan, TrainingPhase, PlanRepository, PlanInfo, LoadProgressResult
 
@@ -342,6 +354,7 @@ class AppModel(ObservableObject):
         self._session_data_complete = True
         self._session_data_errors: Tuple[str, ...] = ()
         self._session_enabled_sources: Tuple[dict, ...] = ()
+        self._trial_ledger: Optional[PelletTrialLedger] = None
         self._aborting_project: Optional[ProjectInfo] = None
         self._aborted_session_ids = set()
         self._abort_had_recording_started = False
@@ -509,6 +522,7 @@ class AppModel(ObservableObject):
         intersession.events.property_changed += self._on_intersession_property_changed
 
         pellet_m = system_machine.pellet
+        pellet_m.events.pellet_sending += self._on_pellet_sending
         pellet_m.events.pellet_sent += self._on_pellet_sent
 
         analysis.watchdog_monitor.property_changed += self._on_watchdog_property_changed
@@ -885,6 +899,12 @@ class AppModel(ObservableObject):
             "kind": "logs",
             "path": "logs/session.log",
             "runtimeState": runtime_state(SubsystemId.SESSION_LOGS),
+        })
+        sources.append({
+            "id": "trials",
+            "kind": "pellet_trial_ledger",
+            "path": "streams/trials.jsonl",
+            "runtimeState": "ready",
         })
         return tuple(sources)
 
@@ -4180,6 +4200,25 @@ class AppModel(ObservableObject):
             self._update_status_text_overlay()
 
     def _on_session_starting_before_record_start(self):
+        session_config = self._behavior.algorithm.active_config.session_control
+        self._trial_ledger = PelletTrialLedger(
+            self._project_info.short_id,
+            TrialAccountingConfiguration(
+                assignment_policy=AttemptAssignmentPolicy(
+                    session_config.attempt_assignment
+                ),
+                retry_settings_policy=RetrySettingsPolicy(
+                    session_config.retry_settings
+                ),
+                count_basis=TrialCountBasis(
+                    session_config.trial_count_basis
+                ),
+                counted_outcomes=frozenset(
+                    TrialOutcome(outcome)
+                    for outcome in session_config.counted_trial_outcomes
+                ),
+            ),
+        )
         self._cams_record_start_perf.value = math.nan
         drained = 0
         while self._record_stop_sema.acquire(block=False):
@@ -4262,6 +4301,17 @@ class AppModel(ObservableObject):
         self._session_boundary = boundary.with_end(end_perf)
         project.start_record_timestamp = self._session_boundary.start_wall_time
         try:
+            trial_ledger = self._trial_ledger
+            if trial_ledger is not None:
+                if trial_ledger.active_attempt is not None:
+                    trial_ledger.close_active_for_analysis(
+                        end_perf,
+                        self._session_boundary.end_wall_time,
+                    )
+                self._session_data_recorder.set_trial_ledger(
+                    trial_ledger.to_records(),
+                    trial_ledger.summary(),
+                )
             stream_result = self._session_data_recorder.stop(end_perf)
             camera_alignment = (
                 None
@@ -4398,6 +4448,7 @@ class AppModel(ObservableObject):
             self._session_data_complete = True
             self._session_data_errors = ()
             self._session_enabled_sources = ()
+            self._trial_ledger = None
             self._session_analysis_finished = True
             self._session_analysis_started_perf = None
             self._session_analysis_duration_seconds = None
@@ -4751,6 +4802,11 @@ class AppModel(ObservableObject):
             "sessionDataErrors": list(self._session_data_errors),
             "enabledSources": list(self._session_enabled_sources),
             "analysisDurationSeconds": self._session_analysis_duration_seconds,
+            "trialSummary": (
+                None
+                if self._trial_ledger is None
+                else self._trial_ledger.summary()
+            ),
             "hardwareConfigured": {
                 "canEnabled": self._hardware.can_enabled,
                 "pelletControllerEnabled": self._hardware.pellet_controller_enabled,
@@ -5026,9 +5082,52 @@ class AppModel(ObservableObject):
 
     # pellet machine events
 
-    def _on_pellet_sent(self, *, perf_c: Optional[float]=None):
+    def _on_pellet_sending(self, *, perf_c: float, context: str):
+        ledger = self._trial_ledger
+        algo = self._behavior.algorithm
+        if ledger is None or not algo.is_in_session:
+            return
+        wall_time = time.time()
+        active = ledger.active_attempt
+        if active is not None:
+            ledger.close_active_for_analysis(perf_c, wall_time)
+        attempt = ledger.begin_send(
+            perf_c,
+            wall_time,
+            operation_id=context,
+        )
+        logger.info(
+            "pellet trial attempt started: session=%s attempt=%s context=%s",
+            ledger.session_id,
+            attempt.attempt_label,
+            context,
+        )
+
+    def _on_pellet_sent(
+        self,
+        *,
+        perf_c: Optional[float] = None,
+        context: Optional[str] = None,
+    ):
         algo = self._behavior.algorithm
         logger.debug("on_pellet_sent: recording=%s in_session=%s",
                      self._session_recording_status, algo.is_in_session)
         if algo.is_in_session:
+            ledger = self._trial_ledger
+            if ledger is not None and ledger.active_attempt is not None:
+                if (
+                    context is not None
+                    and ledger.active_attempt.operation_id != context
+                ):
+                    logger.error(
+                        "Ignoring pellet presentation acknowledgement with mismatched "
+                        "context: active=%s received=%s",
+                        ledger.active_attempt.operation_id,
+                        context,
+                    )
+                    return
+                ledger.acknowledge_presentation(
+                    get_perf_now() if perf_c is None else perf_c,
+                    time.time(),
+                )
             algo.increase_pellets_presented(1)

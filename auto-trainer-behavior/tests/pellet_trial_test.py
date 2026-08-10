@@ -40,6 +40,7 @@ def test_hardware_error_retries_same_logical_trial_and_never_counts():
         "physical_attempts": 1,
         "hardware_errors": 1,
         "incomplete_attempts": 0,
+        "pending_analysis_attempts": 0,
         "trials_started": 0,
         "pellets_presented": 0,
         "trials_completed": 0,
@@ -139,3 +140,36 @@ def test_attempt_can_only_be_acknowledged_and_finalized_once():
     ledger.finalize(TrialOutcome.SUCCESS, 2.0, 12.0)
     with pytest.raises(RuntimeError, match="No pellet-send attempt"):
         ledger.finalize(TrialOutcome.SUCCESS, 2.1, 12.1)
+
+
+def test_capture_window_can_close_before_offline_outcome_is_known():
+    ledger = PelletTrialLedger("session001")
+    ledger.begin_send(1.0, 11.0)
+    ledger.acknowledge_presentation(1.1, 11.1)
+
+    pending = ledger.close_active_for_analysis(2.0, 12.0)
+
+    assert pending.outcome is TrialOutcome.PENDING_ANALYSIS
+    assert not pending.is_finalized
+    assert ledger.summary()["pending_analysis_attempts"] == 1
+    assert ledger.count(TrialCountBasis.PRESENTED) == 1
+    assert ledger.count(TrialCountBasis.COMPLETED) == 0
+
+    final = ledger.finalize_pending(
+        1,
+        1,
+        TrialOutcome.SUCCESS,
+        2.0,
+        12.0,
+    )
+    assert final.is_finalized
+    assert ledger.summary()["pending_analysis_attempts"] == 0
+    assert ledger.count(TrialCountBasis.COMPLETED) == 1
+    with pytest.raises(RuntimeError, match="not pending analysis"):
+        ledger.finalize_pending(
+            1,
+            1,
+            TrialOutcome.FAILURE,
+            2.1,
+            12.1,
+        )

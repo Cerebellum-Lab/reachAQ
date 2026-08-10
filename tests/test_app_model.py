@@ -15,6 +15,7 @@ from autotrainer.core import (
 from autotrainer.core.capture import CaptureProcessStatus
 from autotrainer.core.configuration.persistence_configuration import PersistenceConfiguration
 from autotrainer.behavior.behavior_algorithm import BehaviorAlgoStatus
+from autotrainer.behavior.pellet_trial import PelletTrialLedger, TrialOutcome
 from tools.acquisition.model.app_model import app_status_to_api_app_mode, app_status_to_behavior_algo_status
 from tools.acquisition.model.app_model_status import AppModelStatus, SessionRecordingStatus
 from tools.acquisition.model.session_boundary import SessionBoundary
@@ -186,10 +187,44 @@ def test_session_manifest_includes_enabled_streams_independent_of_plot_selection
         "device",
         "laser_outputs",
         "session_logs",
+        "trials",
     )
     assert manifest["nidaq.barcode"]["binding"] == "InputCard/port0/line1"
     assert manifest["nidaq.tone1"]["path"] == "streams/nidaq.h5"
     assert manifest["nidaq.laser_feedback"]["kind"] == "nidaq_analog"
+
+
+def test_pellet_send_and_ack_create_session_trial_attempt(app_model):
+    algorithm = app_model.behavior.algorithm
+    assert algorithm.start_session(reason="trial-ledger-test")
+    assert app_model._trial_ledger is not None
+
+    app_model._on_pellet_sending(
+        perf_c=10.0,
+        context="send-context",
+    )
+    app_model._on_pellet_sent(
+        perf_c=10.25,
+        context="send-context",
+    )
+
+    attempt = app_model._trial_ledger.active_attempt
+    assert attempt.attempt_label == "1.1"
+    assert attempt.operation_id == "send-context"
+    assert attempt.send_perf_time == 10.0
+    assert attempt.send_ack_perf_time == 10.25
+    assert app_model._trial_ledger.summary()["pellets_presented"] == 1
+
+
+def test_mismatched_pellet_ack_does_not_present_or_count_trial(app_model):
+    algorithm = app_model.behavior.algorithm
+    assert algorithm.start_session(reason="trial-ledger-test")
+    app_model._on_pellet_sending(perf_c=10.0, context="expected")
+
+    app_model._on_pellet_sent(perf_c=10.25, context="stale")
+
+    assert not app_model._trial_ledger.active_attempt.is_presented
+    assert algorithm.pellets_presented == 0
 
 
 def test_abort_removes_whole_session_and_resets_counts(app_model):
@@ -245,6 +280,44 @@ def test_stop_finishes_auxiliary_data_after_raw_writers_close(app_model):
         caller="raw_writers_closed",
     )
     assert app_model.session_recording_status is SessionRecordingStatus.ANALYZING
+
+
+def test_stop_snapshots_trial_ledger_with_pending_analysis_outcome(app_model):
+    app_model._pending_session_end_perf = 12.5
+    app_model._session_boundary = SessionBoundary(
+        session_id=app_model.project.short_id,
+        primary_camera="left",
+        primary_frame_id=42,
+        start_perf_time=10.0,
+        start_wall_time=100.0,
+        camera_when=1_000_000.0,
+    )
+    ledger = PelletTrialLedger(app_model.project.short_id)
+    ledger.begin_send(10.5, 100.5, operation_id="send-1")
+    ledger.acknowledge_presentation(10.75, 100.75)
+    app_model._trial_ledger = ledger
+    app_model._session_analysis_finished = False
+    app_model._set_session_recording_status(SessionRecordingStatus.STOPPING)
+
+    with mock.patch.object(
+        app_model._session_data_recorder,
+        "set_trial_ledger",
+    ) as set_trial_ledger, mock.patch.object(
+        app_model._session_data_recorder,
+        "stop",
+    ), mock.patch.object(
+        app_model,
+        "_save_project_metadata",
+    ):
+        app_model._complete_stopped_recording(app_model.project)
+
+    attempt = ledger.attempts[0]
+    assert attempt.outcome is TrialOutcome.PENDING_ANALYSIS
+    assert attempt.capture_end_perf_time == 12.5
+    set_trial_ledger.assert_called_once_with(
+        ledger.to_records(),
+        ledger.summary(),
+    )
 
 
 def test_final_metadata_uses_canonical_boundary_not_stale_project_timestamp(

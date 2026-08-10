@@ -56,6 +56,7 @@ class TrialCountBasis(str, enum.Enum):
 
 
 class TrialOutcome(str, enum.Enum):
+    PENDING_ANALYSIS = "pending_analysis"
     SUCCESS = "success"
     FAILURE = "failure"
     PELLET_MISSING = "pellet_missing"
@@ -109,6 +110,8 @@ class PelletTrialAttempt:
     send_ack_wall_time: Optional[float] = None
     finalized_perf_time: Optional[float] = None
     finalized_wall_time: Optional[float] = None
+    capture_end_perf_time: Optional[float] = None
+    capture_end_wall_time: Optional[float] = None
     outcome: Optional[TrialOutcome] = None
     hardware_error_kind: Optional[HardwareErrorKind] = None
     error: str = ""
@@ -121,7 +124,7 @@ class PelletTrialAttempt:
 
     @property
     def is_finalized(self) -> bool:
-        return self.outcome is not None
+        return self.outcome not in {None, TrialOutcome.PENDING_ANALYSIS}
 
     @property
     def attempt_label(self) -> str:
@@ -280,6 +283,56 @@ class PelletTrialLedger:
             self._retry_attempt_id = finalized.attempt_id
         return finalized
 
+    def close_active_for_analysis(
+        self,
+        perf_time: float,
+        wall_time: float,
+    ) -> PelletTrialAttempt:
+        """Close the capture window without inventing a behavioral outcome."""
+        attempt = self._require_active()
+        if attempt.outcome is not None:
+            raise RuntimeError(f"Attempt {attempt.attempt_label} is already closed")
+        closed = self._replace_active(
+            capture_end_perf_time=float(perf_time),
+            capture_end_wall_time=float(wall_time),
+            outcome=TrialOutcome.PENDING_ANALYSIS,
+            logical_trial_complete=True,
+        )
+        self._active_index = None
+        return closed
+
+    def finalize_pending(
+        self,
+        trial_id: int,
+        attempt_id: int,
+        outcome: TrialOutcome,
+        perf_time: float,
+        wall_time: float,
+        *,
+        error: str = "",
+    ) -> PelletTrialAttempt:
+        """Apply one offline-analysis result to a provisionally closed attempt."""
+        outcome = TrialOutcome(outcome)
+        if outcome in {TrialOutcome.PENDING_ANALYSIS, TrialOutcome.HARDWARE_ERROR}:
+            raise ValueError("Pending attempts require a behavioral terminal outcome")
+        for index, attempt in enumerate(self._attempts):
+            if attempt.trial_id != int(trial_id) or attempt.attempt_id != int(attempt_id):
+                continue
+            if attempt.outcome is not TrialOutcome.PENDING_ANALYSIS:
+                raise RuntimeError(
+                    f"Attempt {attempt.attempt_label} is not pending analysis"
+                )
+            finalized = dataclasses.replace(
+                attempt,
+                finalized_perf_time=float(perf_time),
+                finalized_wall_time=float(wall_time),
+                outcome=outcome,
+                error=str(error or ""),
+            )
+            self._attempts[index] = finalized
+            return finalized
+        raise KeyError(f"Unknown trial attempt {trial_id}.{attempt_id}")
+
     def finalize_hardware_error(
         self,
         kind: HardwareErrorKind,
@@ -351,6 +404,10 @@ class PelletTrialLedger:
             ),
             "incomplete_attempts": sum(
                 attempt.outcome in {TrialOutcome.INCOMPLETE, TrialOutcome.ABORTED}
+                for attempt in self._attempts
+            ),
+            "pending_analysis_attempts": sum(
+                attempt.outcome is TrialOutcome.PENDING_ANALYSIS
                 for attempt in self._attempts
             ),
             "trials_started": self.count(TrialCountBasis.STARTED),

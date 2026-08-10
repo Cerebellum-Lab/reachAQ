@@ -774,7 +774,12 @@ class SystemMachine(StateMachine):
             if algo.is_in_session:
                 algo.pellet_uncover_context.has_released = True
 
-    def _on_pellet_sent(self, *, perf_c: float):
+    def _on_pellet_sent(
+        self,
+        *,
+        perf_c: float,
+        context: Optional[str] = None,
+    ):
         if self._algorithm.is_in_session:
             project = self._project_info
             if not math.isfinite(project.t_pellet_delivered):
