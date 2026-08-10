@@ -82,11 +82,6 @@ class _AnimalSubject:
 
 @dataclass
 class AnimalSubject(_AnimalSubject):
-
-    def __init__(self, **kwargs):
-        kwargs.pop("baseline_magnet_intensity", None)
-        super().__init__(**kwargs)
-
     def __repr__(self):
         return f"{self.__class__.__name__}(name={self.name!r}, id={self.id!r})"
 
