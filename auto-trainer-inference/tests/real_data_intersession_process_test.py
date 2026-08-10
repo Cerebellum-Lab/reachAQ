@@ -38,7 +38,8 @@ AEF = AlmostEqualFloat
 
 
 def _init_t_presented_released(self: ProjectInfo):
-    self.t_pellet_delivered = self.t_pellet_presented = 0
+    self.first_pellet_delivery_offset = 0
+    self.first_pellet_presentation_offset = 0
 
 
 class _ProjectInfo(ProjectInfo):

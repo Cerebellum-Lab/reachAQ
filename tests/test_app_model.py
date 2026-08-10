@@ -466,6 +466,10 @@ def test_final_metadata_uses_canonical_boundary_not_stale_project_timestamp(
 
     saved = json.loads(output.with_suffix(".json").read_text())
     assert saved["start_record_timestamp"] == 1_800_000_000.25
+    assert saved["firstPelletDeliveryOffsetSeconds"] is None
+    assert saved["firstPelletPresentationOffsetSeconds"] is None
+    assert "NaN" not in output.with_suffix(".json").read_text()
+    assert ".nan" not in output.with_suffix(".yaml").read_text().lower()
     assert saved["sessionBoundary"]["startWallTime"] == 1_800_000_000.25
     assert saved["sessionBoundary"]["endPerfTime"] == 12.0
 

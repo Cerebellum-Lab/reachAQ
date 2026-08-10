@@ -191,7 +191,7 @@ class SystemMachine(StateMachine):
         project.dcs_send_position = dcs_send_pos
         logger.info("Associated dcs_send_pos=%s with project", dcs_send_pos)
         if pellet_m.state == PelletState.monitoring and pellet_recent_seen:
-            self._set_pellet_delivered_presented(project, 0)
+            self._set_first_pellet_boundaries(project, 0)
         self._inference.project = project
     @BehaviorAlgorithm.relay_func(wait=False)
     def on_session_capture_ended(self, reason: RecordingEndingReason):
@@ -339,7 +339,7 @@ class SystemMachine(StateMachine):
         pellet_m = self._pellet_machine
         if pellet_m.covered_state is False:  # already uncovered/released
             return
-        if not math.isfinite(project.t_pellet_delivered):  # wait pellet is delivered
+        if not math.isfinite(project.first_pellet_delivery_offset):
             return
         uncov_cfg = active_cfg.pellet_uncover
         min_y = math.inf
@@ -411,18 +411,18 @@ class SystemMachine(StateMachine):
         self._handle_pellet_uncover(response)
         self._pellet_machine.pellet_seen(response.pellet_seen)
 
-    def _set_pellet_delivered_presented(self, project: ProjectInfo, t_rel_start: float):
-        if not math.isfinite(project.t_pellet_delivered):
-            logger.debug("set project.t_pellet_delivered=%.3f", t_rel_start)
-            project.t_pellet_delivered = t_rel_start
+    def _set_first_pellet_boundaries(self, project: ProjectInfo, t_rel_start: float):
+        if not math.isfinite(project.first_pellet_delivery_offset):
+            logger.debug("set first pellet delivery offset=%.3f", t_rel_start)
+            project.first_pellet_delivery_offset = t_rel_start
         #
         if (
-            math.isfinite(project.t_pellet_delivered)
-            and not math.isfinite(project.t_pellet_presented)
+            math.isfinite(project.first_pellet_delivery_offset)
+            and not math.isfinite(project.first_pellet_presentation_offset)
             and self._pellet_machine.covered_state is False
         ):
-            logger.debug("set project.t_pellet_presented=%.3f", t_rel_start)
-            project.t_pellet_presented = t_rel_start
+            logger.debug("set first pellet presentation offset=%.3f", t_rel_start)
+            project.first_pellet_presentation_offset = t_rel_start
             self._event_manager.post_event_content(
                 ApiEventKind.trialPelletPresented, data=dict(trial_id=project.session))
 
@@ -486,9 +486,9 @@ class SystemMachine(StateMachine):
     ):
         if self._algorithm.is_in_session:
             project = self._project_info
-            if not math.isfinite(project.t_pellet_delivered):
+            if not math.isfinite(project.first_pellet_delivery_offset):
                 t_delivered = perf_c - self._algorithm.recording_start_perf_c
-                self._set_pellet_delivered_presented(project, t_delivered)
+                self._set_first_pellet_boundaries(project, t_delivered)
 
     def _on_pellet_released(self, *, perf_c: float):
         project = self._project_info
@@ -500,7 +500,7 @@ class SystemMachine(StateMachine):
             "_on_pellet_released: perf_c=%.2f in_session=%s sess_started=%.2f project=%s",
             perf_c, algo.is_in_session, self._session_started_perf_c, project)
         if algo.is_in_session:
-            self._set_pellet_delivered_presented(project, perf_c - algo.recording_start_perf_c)
+            self._set_first_pellet_boundaries(project, perf_c - algo.recording_start_perf_c)
 
     def _on_intersession_state_changed(self, old, new):
         self._algorithm.intersession_state = new

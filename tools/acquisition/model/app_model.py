@@ -147,6 +147,23 @@ from tools.acquisition.model.video_capture_model import (
 
 logger = get_verbose_logger(__name__)
 
+
+def _metadata_without_nonfinite_numbers(value):
+    """Replace NaN/Infinity recursively so JSON and YAML stay portable."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {
+            key: _metadata_without_nonfinite_numbers(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [
+            _metadata_without_nonfinite_numbers(item)
+            for item in value
+        ]
+    return value
+
 # allow be patched from tests
 _daily_timer = make_daemon_timer
 
@@ -4722,8 +4739,8 @@ class AppModel(ObservableObject):
             "notes": self.notes or "",
             "cameraNames": list(project.camera_names),
             "session": session,
-            "t_pellet_delivered": project.t_pellet_delivered,
-            "t_pellet_presented": project.t_pellet_presented,
+            "firstPelletDeliveryOffsetSeconds": project.first_pellet_delivery_offset,
+            "firstPelletPresentationOffsetSeconds": project.first_pellet_presentation_offset,
             "sessionCounts": {
                 "presented": self._behavior.algorithm.pellets_presented,
                 "reaches": self._behavior.algorithm.pellet_reaches,
@@ -4794,16 +4811,20 @@ class AppModel(ObservableObject):
 
         out = info.copy()
         out["configuration"] = asdict(configuration)
+        out = _metadata_without_nonfinite_numbers(out)
         json_path = Path(file_name + ".json")
         yaml_path = Path(file_name + ".yaml")
         json_temp = json_path.with_name(json_path.name + ".tmp")
         yaml_temp = yaml_path.with_name(yaml_path.name + ".tmp")
         try:
             with json_temp.open("w", encoding="utf-8") as file:
-                json.dump(out, file, cls=SystemConfigurationJSONEncoder)
+                json.dump(
+                    out,
+                    file,
+                    cls=SystemConfigurationJSONEncoder,
+                    allow_nan=False,
+                )
 
-            out = info.copy()
-            out["configuration"] = configuration
             with yaml_temp.open("w", encoding="utf-8") as file:
                 yaml.dump(
                     out,

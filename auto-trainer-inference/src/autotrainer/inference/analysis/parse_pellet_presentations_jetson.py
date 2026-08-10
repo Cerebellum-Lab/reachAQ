@@ -225,8 +225,8 @@ def segment_reaches_f1(
         df_3d.loc[:, (bp, 'speed')] = speed_vec_filt
 
     df_3d_pellet = df_3d["Pellet"]
-    t_delivered = project.get_t_pellet_delivered_or_default()
-    t_presented = project.get_t_pellet_presented_or_default()
+    t_delivered = project.get_first_pellet_delivery_offset()
+    t_presented = project.get_first_pellet_presentation_offset()
     f_delivered = int(t_delivered * frame_rate)
     f_presented = int(t_presented * frame_rate)
 
@@ -372,7 +372,10 @@ def segment_reaches_f2(
                         if testA and testB:
                             if debug >= 2:
                                 logger.debug('reach began at frame %d!', frame)
-                            delay_since_presented = frame / fps - project.t_pellet_presented
+                            delay_since_presented = (
+                                frame / fps
+                                - project.first_pellet_presentation_offset
+                            )
                             reach_dict = {
                                 'init': frame,
                                 'max': None,

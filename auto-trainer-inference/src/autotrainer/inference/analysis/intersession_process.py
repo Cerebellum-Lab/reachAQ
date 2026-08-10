@@ -82,7 +82,10 @@ def intersession_process(
             max=-1,
             method=d['method'],
             outcome=d['outcome'],
-            delay_since_presented=d['placed'] / frame_rate - project.get_t_pellet_presented_or_default(),
+            delay_since_presented=(
+                d['placed'] / frame_rate
+                - project.get_first_pellet_presentation_offset()
+            ),
         ) for d in results_dict["other_events"]
     ]
     return IntersessionResponse(**results_dict)

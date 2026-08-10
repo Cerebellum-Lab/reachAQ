@@ -119,8 +119,8 @@ class _ProjectInfo:
     send_position: Optional[Offset3DTuple] = None
     dcs_send_position: Optional[Offset3DTuple] = None
     start_record_timestamp: float = math.nan  # regular unix timestamp, in seconds
-    t_pellet_delivered: float = math.nan  # in seconds (zero-based on start_recording)
-    t_pellet_presented: float = math.nan
+    first_pellet_delivery_offset: float = math.nan
+    first_pellet_presentation_offset: float = math.nan
 
 
 @dataclass
@@ -139,8 +139,8 @@ class ProjectInfo(_ProjectInfo):
         send_position: Optional[Offset3DTuple] = _ProjectInfo.send_position,
         dcs_send_position: Optional[Offset3DTuple] = _ProjectInfo.dcs_send_position,
         start_record_timestamp: float = _ProjectInfo.start_record_timestamp,
-        t_pellet_delivered: float = _ProjectInfo.t_pellet_delivered,
-        t_pellet_presented: float = _ProjectInfo.t_pellet_presented,
+        first_pellet_delivery_offset: float = _ProjectInfo.first_pellet_delivery_offset,
+        first_pellet_presentation_offset: float = _ProjectInfo.first_pellet_presentation_offset,
         #
         mp_manager: Optional[multiprocessing.managers.BaseManager]=None,
     ):
@@ -177,8 +177,8 @@ class ProjectInfo(_ProjectInfo):
         self.send_position = send_position
         self.dcs_send_position = dcs_send_position
         self.start_record_timestamp = start_record_timestamp
-        self.t_pellet_delivered = t_pellet_delivered
-        self.t_pellet_presented = t_pellet_presented
+        self.first_pellet_delivery_offset = first_pellet_delivery_offset
+        self.first_pellet_presentation_offset = first_pellet_presentation_offset
 
     @property
     def short_id(self) -> str:
@@ -217,13 +217,13 @@ class ProjectInfo(_ProjectInfo):
     def is_valid(self):
         return self.root is not None and len(self.root) > 0
 
-    def get_t_pellet_delivered_or_default(self, *, default: float=0.) -> float:
-        t = self.t_pellet_delivered
+    def get_first_pellet_delivery_offset(self, *, default: float=0.) -> float:
+        t = self.first_pellet_delivery_offset
         return t if math.isfinite(t) else default
 
-    def get_t_pellet_presented_or_default(self, *, default: float=0.):
-        t = self.t_pellet_presented
-        return t if math.isfinite(t) else self.get_t_pellet_delivered_or_default(default=default)
+    def get_first_pellet_presentation_offset(self, *, default: float=0.):
+        t = self.first_pellet_presentation_offset
+        return t if math.isfinite(t) else self.get_first_pellet_delivery_offset(default=default)
 
     def get_day_path(self, skip_ensure: bool = False, when: Optional[datetime]=None) -> Tuple[str, str]:
         """Get the location and related datetime for given arguments. If when is None then self.when is used."""
@@ -387,7 +387,9 @@ class ProjectInfo(_ProjectInfo):
         with self:
             self.when = when  # noqa
             self.session = session  # noqa
-            self.start_record_timestamp = self.t_pellet_delivered = self.t_pellet_presented = math.nan
+            self.start_record_timestamp = math.nan
+            self.first_pellet_delivery_offset = math.nan
+            self.first_pellet_presentation_offset = math.nan
 
     def _calculate_next_session_index(self, when: Optional[datetime] = None):
         """Calculate the next session index & date and store it locally"""

@@ -152,7 +152,7 @@ def test_uncover_when_record_aged_enough_with_no_pellet_hand_uncover_distance(mo
     assert mock_system.pellet_state_trans == []
 
     mock_system.make_recording_aged_enough()
-    algo.project.t_pellet_delivered = 0
+    algo.project.first_pellet_delivery_offset = 0
 
     uncov_ctx = algo.uncover_context
     uncov_ctx.y_dcs_valid = True
