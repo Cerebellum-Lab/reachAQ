@@ -91,7 +91,6 @@ from autotrainer.behavior import (
     PelletTrialLedger,
     RetrySettingsPolicy,
     SystemMachine,
-    TrainingMode,
     TrialAccountingConfiguration,
     TrialCountBasis,
     TrialOutcome,
@@ -204,13 +203,18 @@ _to_behavior_algo_status = {
 }
 
 
-def training_mode_to_api_training_mode(mode: TrainingMode) -> ApiTrainingMode:
-    try:
-        member = getattr(ApiTrainingMode, mode.name)
-        assert isinstance(member, ApiTrainingMode)
-        return member
-    except AttributeError:
-        return ApiTrainingMode.UNDEFINED
+def protocol_state_to_api_training_mode(
+    plan: Optional[TrainingPlan],
+    *,
+    automatic_advance: bool,
+) -> ApiTrainingMode:
+    """Translate the simplified protocol state for the legacy status API."""
+    name = (
+        "MANUAL"
+        if plan is None
+        else "AUTOMATIC" if automatic_advance else "MANUAL_WITH_PROTOCOL"
+    )
+    return getattr(ApiTrainingMode, name, ApiTrainingMode.UNDEFINED)
 
 
 class TrainingPlanDeserializedEvent(Protocol):
@@ -257,7 +261,6 @@ class AppModel(ObservableObject):
         OUTPUT_LOCATION = "output_location"
         ANIMAL_NAME = "animal_name"
         NOTES = "notes"
-        TRAINING_MODE = 'training_mode'
         TRAINING_PLAN = "training_plan"
         TRAINING_PLANS = 'training_plans'
         TRAINING_PHASE = "training_plan.current_phase"
@@ -326,7 +329,6 @@ class AppModel(ObservableObject):
         self.set_log_location()
 
         self._plan_repo = PlanRepository()
-        self._training_mode = TrainingMode.MANUAL
         self._training_plan: Optional[TrainingPlan] = None
         self._training_plan_animal: Optional[AnimalSubject] = None
         self._acquisition_starting = False
@@ -2019,11 +2021,10 @@ class AppModel(ObservableObject):
                 animal.is_pellet_dcs = False
                 animal.pellet_x = animal.pellet_y = animal.pellet_z = 0
             algo.reset_selected_animal_counts(animal)
-            if self._training_mode == TrainingMode.MANUAL:
-                # only set animal base position if manual training mode
-                self._set_animal_base_positions(animal)
-            else:
-                self.training_plan = self.get_training_plan_by_id(animal.training.current_protocol)
+            self._set_animal_base_positions(animal)
+            self.training_plan = self.get_training_plan_by_id(
+                animal.training.current_protocol
+            )
         self._preferences.selected_animal = "" if animal is None else animal.name
         self._on_property_changed(self.Props.SELECTED_ANIMAL, animal, prev)
         self._event_manager.post_event_content(
@@ -2031,36 +2032,35 @@ class AppModel(ObservableObject):
         logger.success("Switched to animal %s", animal)
 
     @property
-    def training_mode(self):
-        return self._training_mode
-
-    @training_mode.setter
-    def training_mode(self, mode: TrainingMode):
-        prev, self._training_mode = self._training_mode, mode
-        if prev == mode:
-            return
-        if mode == TrainingMode.MANUAL:
-            self._detach_training_plan()
-        else:
-            animal = self._selected_animal
-            if animal is None:  # animal might be not active/created yet
-                self._detach_training_plan()
-            else:
-                attached = self._attached_plan
-                if attached is not None:
-                    is_auto = mode == TrainingMode.AUTOMATIC
-                    logger.info("Updating plan is_automatic to %s", is_auto)
-                    attached.is_automatic = is_auto
-                else:
-                    # this will also attach to it (given current mode != manual):
-                    self.training_plan = self.get_training_plan_by_id(animal.training.current_protocol)
-        self._on_property_changed(self.Props.TRAINING_MODE, mode, prev)
-        self._event_manager.post_event_content(
-            ApiEventKind.trainingModeChanged, dict(training_mode=mode))
-
-    @property
     def attached_plan(self) -> Optional[TrainingPlan]:
         return self._attached_plan
+
+    def _derived_api_training_mode(self) -> ApiTrainingMode:
+        return protocol_state_to_api_training_mode(
+            self._attached_plan,
+            automatic_advance=(
+                self._behavior.algorithm.active_config.session_control
+                .automatic_protocol_advance_enabled
+            ),
+        )
+
+    def set_automatic_protocol_advance_enabled(self, enabled: bool) -> None:
+        """Apply protocol advancement consistently to config and live runner."""
+        enabled = bool(enabled)
+        session_control = self._behavior.algorithm.active_config.session_control
+        session_control.automatic_protocol_advance_enabled = enabled
+        self._protocol_runner.automatic_advance = enabled
+        if self._attached_plan is not None:
+            self._attached_plan.is_automatic = enabled
+            self._on_property_changed(
+                self.Props.TRAINING_PLAN_PROP,
+                self._attached_plan,
+                self._attached_plan,
+            )
+        self._event_manager.post_event_content(
+            ApiEventKind.trainingModeChanged,
+            dict(training_mode=self._derived_api_training_mode()),
+        )
 
     @property
     def training_plan(self) -> Optional[TrainingPlan]:
@@ -2086,12 +2086,15 @@ class AppModel(ObservableObject):
         if plan is None:
             self._detach_training_plan()  # always
         elif animal is not None:
-            if self._training_mode != TrainingMode.MANUAL:
-                if self._attach_training_plan(plan, force_update=force_update) is False:
-                    return
+            if self._attach_training_plan(plan, force_update=force_update) is False:
+                return
         self._on_property_changed(self.Props.TRAINING_PLAN, plan, prev)
         self._event_manager.post_event_content(
             ApiEventKind.trainingPlanLoad, {'training_plan_id': None if plan is None else plan.plan_id})
+        self._event_manager.post_event_content(
+            ApiEventKind.trainingModeChanged,
+            dict(training_mode=self._derived_api_training_mode()),
+        )
 
     @property
     def output_location(self) -> str:
@@ -3240,12 +3243,7 @@ class AppModel(ObservableObject):
             None if (animal is None or animal.training.current_protocol is None)
             else self.get_training_plan_by_id(animal.training.current_protocol)
         )
-        if self._training_mode == TrainingMode.MANUAL or animal is None:
-            # logger.notice("training mode is MANUAL or animal is none")
-            # forcing manual so:
-            self.training_mode = TrainingMode.MANUAL
-        else:
-            self.training_plan = plan
+        self.training_plan = plan if animal is not None else None
 
         if animal is not None:
             self._set_animal_base_positions(animal)
@@ -4446,8 +4444,9 @@ class AppModel(ObservableObject):
         animal = self._selected_animal
         hard = self._hardware
         if animal is not None and name in {hard.SET_X, hard.SET_Y, hard.SET_Z}:
-            # only when manual:
-            if self._training_mode != TrainingMode.MANUAL:
+            # Protocol actions temporarily move the motors without redefining
+            # the animal's manually configured base position.
+            if self._attached_plan is not None:
                 return
             coord = name[-1]
             coord_idx = "xyz".index(coord)
@@ -5012,7 +5011,7 @@ class AppModel(ObservableObject):
 
         system_status = ApiSystemStatus(
             application_mode=app_status_to_api_app_mode(self._status),
-            training_mode=training_mode_to_api_training_mode(self._training_mode),
+            training_mode=self._derived_api_training_mode(),
             animal=None if animal is None else animal.to_api_status(),
             project=ApiProjectStatus(
                 day_path=project.get_day_path()[0],

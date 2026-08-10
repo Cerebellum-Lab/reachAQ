@@ -498,10 +498,8 @@ class PreferencesContent(QWidget):
             "trial criteria are met."
         )
         automatic_protocol.stateChanged.connect(
-            lambda value: setattr(
-                config,
-                "automatic_protocol_advance_enabled",
-                value != 0,
+            lambda value: self._app_model.set_automatic_protocol_advance_enabled(
+                value != 0
             )
         )
         form.addRow("Automatic protocol advance:", automatic_protocol)

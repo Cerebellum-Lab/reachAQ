@@ -16,7 +16,6 @@ from autotrainer.core.logging import get_verbose_logger
 
 from autotrainer.inference import PoseResponse, PoseAlgorithm, InferenceStatus
 
-from autotrainer.behavior import TrainingMode
 from autotrainer.behavior.behavior_algorithm import BehaviorAlgoProps
 from autotrainer.inference.analysis import IntersessionResponse
 
@@ -69,7 +68,6 @@ def _visible_reach_cameras(cameras, *, include_disabled_optional: bool = False):
 
 class MainContent(ContentWidget):
 
-    training_mode_changed = Signal(TrainingMode)
     training_plan_changed = Signal(TrainingPlan)
 
     def __init__(self, app_model: AppModel):
@@ -214,7 +212,6 @@ class MainContent(ContentWidget):
         inference.pose_response_ready += self.refresh_pose
         #
         # app_model.behavior.algorithm.property_changed += self._behavior_algo_property_changed
-        self.training_mode_changed.connect(self._update_training_mode)
         self.training_plan_changed.connect(self._update_training_plan)
 
     @property
@@ -446,25 +443,16 @@ class MainContent(ContentWidget):
         right_layout.addWidget(content)
         return widget
 
-    def _update_training_mode(self, training_mode: TrainingMode):
-        logger.verbose("updating training mode to %s", training_mode)
+    def _update_training_plan(self, plan: Optional[TrainingPlan]):
         if not self._protocol_ui_enabled:
-            self._mid_stacked_layout.setCurrentWidget(self._mid_widget_manual)
-            self._end_stacked_layout.setCurrentWidget(self._end_widget_manual)
-            self.update()
             return
-        if training_mode == TrainingMode.MANUAL:
+        logger.debug("setting plan to %s (%s)", plan, hex(id(plan)))
+        if plan is None:
             self._mid_stacked_layout.setCurrentWidget(self._mid_widget_manual)
             self._end_stacked_layout.setCurrentWidget(self._end_widget_manual)
         else:
             self._mid_stacked_layout.setCurrentWidget(self._protocol_phase_progress_widget)
             self._end_stacked_layout.setCurrentWidget(self._protocol_phase_end_widget)
-        self.update()
-
-    def _update_training_plan(self, plan: Optional[TrainingPlan]):
-        if not self._protocol_ui_enabled:
-            return
-        logger.debug("setting plan to %s (%s)", plan, hex(id(plan)))
         self._training_phase_content.set_training_phase(
             None if plan is None else plan.current_phase,
             force_refresh=True,
@@ -672,8 +660,6 @@ class MainContent(ContentWidget):
         if name == props.SELECTED_ANIMAL:
             self._hardware_control_content.set_selected_animal(value)
             self.training_plan_changed.emit(app_model.training_plan)  # ensure it's refreshed too
-        elif name == props.TRAINING_MODE:
-            self.training_mode_changed.emit(value)
         elif name == props.TRAINING_PLAN:
             assert isinstance(value, (type(None), TrainingPlan))
             self.training_plan_changed.emit(value)

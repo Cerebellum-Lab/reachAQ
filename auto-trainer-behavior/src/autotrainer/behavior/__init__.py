@@ -1,4 +1,3 @@
-import enum
 from dataclasses import dataclass
 from typing import Protocol, Optional
 
@@ -46,12 +45,6 @@ class IntersessionBlock:
 @dataclass
 class IntersessionDetection:
     configuration: DetectionConfiguration
-
-
-class TrainingMode(str, enum.Enum):  # todo: eventually find better place
-    MANUAL = "Manual"
-    MANUAL_WITH_PROTOCOL = "Manual with Protocol"
-    AUTOMATIC = "Automatic"
 
 
 # Protocol first (less strict)

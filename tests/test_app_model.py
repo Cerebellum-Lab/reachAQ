@@ -16,7 +16,11 @@ from autotrainer.core.capture import CaptureProcessStatus
 from autotrainer.core.configuration.persistence_configuration import PersistenceConfiguration
 from autotrainer.behavior.behavior_algorithm import BehaviorAlgoStatus
 from autotrainer.behavior.pellet_trial import PelletTrialLedger, TrialOutcome
-from tools.acquisition.model.app_model import app_status_to_api_app_mode, app_status_to_behavior_algo_status
+from tools.acquisition.model.app_model import (
+    app_status_to_api_app_mode,
+    app_status_to_behavior_algo_status,
+    protocol_state_to_api_training_mode,
+)
 from tools.acquisition.model.app_model_status import AppModelStatus, SessionRecordingStatus
 from tools.acquisition.model.session_boundary import SessionBoundary
 from tools.acquisition.model.session_stop_policy import (
@@ -30,7 +34,7 @@ from tools.acquisition.model.subsystem_status import (
     SubsystemState,
 )
 
-from autotrainer.api import ApiApplicationMode
+from autotrainer.api import ApiApplicationMode, ApiTrainingMode
 
 
 class TestStatus:
@@ -53,6 +57,35 @@ class TestStatus:
                 else BehaviorAlgoStatus.IDLE
             )
             assert algo_status is expected
+
+
+@pytest.mark.parametrize(
+    ("has_plan", "automatic", "expected"),
+    (
+        (False, False, ApiTrainingMode.MANUAL),
+        (False, True, ApiTrainingMode.MANUAL),
+        (True, False, ApiTrainingMode.MANUAL_WITH_PROTOCOL),
+        (True, True, ApiTrainingMode.AUTOMATIC),
+    ),
+)
+def test_api_training_mode_is_derived_from_protocol_state(
+    has_plan,
+    automatic,
+    expected,
+):
+    plan = SimpleNamespace() if has_plan else None
+    assert protocol_state_to_api_training_mode(
+        plan,
+        automatic_advance=automatic,
+    ) is expected
+
+
+def test_automatic_protocol_advance_updates_live_runner(app_model):
+    app_model.set_automatic_protocol_advance_enabled(True)
+
+    session_control = app_model.behavior.algorithm.active_config.session_control
+    assert session_control.automatic_protocol_advance_enabled is True
+    assert app_model._protocol_runner.automatic_advance is True
 
 
 def test_it_drain_record_stop_sema_on_session_recording_start(app_model):

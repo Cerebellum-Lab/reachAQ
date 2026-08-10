@@ -36,7 +36,7 @@ from autotrainer.inference import InferenceStatus, PoseResponse
 from autotrainer.inference.analysis import IntersessionResponse
 from autotrainer.inference.analysis.prepare_jetson_data import DEFAULT_CAM_OFFSET_FILE_NAME, make_cam_offsets_dict
 
-from autotrainer.behavior import TrainingMode, SystemState
+from autotrainer.behavior import SystemState
 from autotrainer.behavior.behavior_algorithm import BehaviorAlgoStatus, BehaviorAlgoProps
 from autotrainer.behavior.pellet import PelletState
 
@@ -102,7 +102,6 @@ def _allow_bidirectional_window_resizing(window: QMainWindow) -> None:
 
 class MainWindow(QMainWindow):
 
-    training_mode_changed = Signal(TrainingMode)
     running_status_changed = Signal(bool)  # True == running/acquiring
     capture_start_finished = Signal(bool)
     capture_stop_finished = Signal()
@@ -1147,20 +1146,6 @@ class MainWindow(QMainWindow):
 
         toolbar.addSeparator()
 
-        combo = self._training_mode_combo = QComboBox()
-        combo.setDuplicatesEnabled(False)
-        for mode in TrainingMode:
-            combo.addItem(mode.value,
-                          (mode,)  # userData: encapsulated in a tuple,
-                          # otherwise pyside drops the enum member and only keep the value string.
-                          # this is because it's a typed str-subclass enum.
-                          )
-
-        def training_mode_index_changed(_):
-            selected_mode = self._training_mode_combo.currentData()[0]  # unpack from tuple, see above.
-            app_model.training_mode = selected_mode
-        combo.currentIndexChanged.connect(training_mode_index_changed)
-
         combo = self._training_plan_combo = QComboBox()
 
         def training_plan_index_changed(_):
@@ -1173,11 +1158,6 @@ class MainWindow(QMainWindow):
         self._widget_training_plan_action = None
 
         if self.main_content.protocol_ui_enabled:
-            label = QLabel("Training Mode:")
-            label.setContentsMargins(8, 0, 0, 0)
-            toolbar.addWidget(label)
-            toolbar.addWidget(self._training_mode_combo)
-
             label = QLabel("Protocol:")
             label.setContentsMargins(8, 0, 0, 0)
             widget = QWidget()
@@ -1189,27 +1169,7 @@ class MainWindow(QMainWindow):
 
             toolbar.addAction(self.previous_training_phase_action)
             toolbar.addAction(self.next_training_phase_action)
-
-            def update_training_mode(training_mode: TrainingMode):
-                logger.debug("Updating training_mode to %s", training_mode)
-                is_non_manual = training_mode != TrainingMode.MANUAL
-                self._widget_training_plan_action.setVisible(is_non_manual)
-                self._status_training_widget.setVisible(is_non_manual)
-                animal = app_model.selected_animal
-                plan_id = None if animal is None else animal.training.current_protocol
-                training_plan_idx = self._training_plan_index_by_plan_id.get(plan_id, -1)
-                self._training_plan_combo.blockSignals(True)
-                self._training_plan_combo.setCurrentIndex(training_plan_idx)
-                self._training_plan_combo.blockSignals(False)
-                # self.main_content.training_plan_changed.emit(self._app_model.training_plan)
-                self._app_model.training_mode = training_mode
-                self._refresh_prev_next_phases()
-
-            update_training_mode(self._app_model.training_mode)
-            self.training_mode_changed.connect(update_training_mode)
         else:
-            self._training_mode_combo.setCurrentIndex(self._training_mode_combo.findText(TrainingMode.MANUAL.value))
-            app_model.training_mode = TrainingMode.MANUAL
             self._status_training_widget.setVisible(False)
 
         toolbar.addSeparator()
@@ -1526,7 +1486,7 @@ class MainWindow(QMainWindow):
             self.next_training_phase_action.setVisible(False)
             return
         attached = self._app_model.attached_plan
-        if attached is None or self._app_model.training_mode != TrainingMode.MANUAL_WITH_PROTOCOL:
+        if attached is None or attached.is_automatic:
             self.previous_training_phase_action.setVisible(False)
             self.next_training_phase_action.setVisible(False)
             return
@@ -1566,7 +1526,6 @@ class MainWindow(QMainWindow):
                     self.make_3d_calib_action,
                     self.run_action,
                     self._animal_dropdown_combo,
-                    self._training_mode_combo,
                     self._training_plan_combo,
                 ):
                     item.setEnabled(True)
@@ -1574,12 +1533,11 @@ class MainWindow(QMainWindow):
             elif value is AppModelStatus.RUNNING:
                 self.calib_diamond_triangle_action.setEnabled(valid_dcs)
                 self.calib_diamond_triangle_action.setChecked(False)
-                for item in (self._animal_dropdown_combo, self._training_mode_combo, self._training_plan_combo):
+                for item in (self._animal_dropdown_combo, self._training_plan_combo):
                     item.setEnabled(True)
 
             elif value in {AppModelStatus.CALIBRATION_3D, AppModelStatus.CALIBRATION_DCS}:
                 for item in (
-                    self._training_mode_combo,
                     self._training_plan_combo,
                     self._animal_dropdown_combo,
                     self.calib_diamond_triangle_action,
@@ -1648,9 +1606,6 @@ class MainWindow(QMainWindow):
             animal_dropdown.blockSignals(False)
             self._refresh_prev_next_phases()
 
-        elif name == props.TRAINING_MODE:
-            self.training_mode_changed.emit(value)
-
         elif name == props.TRAINING_PLAN:
             if value is not None:
                 assert isinstance(value, TrainingPlan)
@@ -1661,6 +1616,9 @@ class MainWindow(QMainWindow):
             self._training_plan_combo.blockSignals(True)
             self._training_plan_combo.setCurrentIndex(index)
             self._training_plan_combo.blockSignals(False)
+            self._status_training_widget.setVisible(
+                self.main_content.protocol_ui_enabled and value is not None
+            )
             self._refresh_prev_next_phases()
 
         elif name == props.TRAINING_PLANS:
@@ -1721,10 +1679,10 @@ class MainWindow(QMainWindow):
         combo.blockSignals(True)
         combo.clear()
         has_some = len(plans) > 0
-        empty_txt = "" if has_some else " " * 64
+        empty_txt = "Manual pellet control"
         tooltip_txt = (
-            "Select a training protocol" if has_some
-            else "There are no training protocols in the Autotrainer folder"
+            "Use the pellet controls without a protocol" if has_some
+            else "Manual pellet control (no protocols are configured)"
         )
         combo_indices_map: Dict[Optional[str], int]
         combo_indices_map = self._training_plan_index_by_plan_id = {
@@ -1743,6 +1701,7 @@ class MainWindow(QMainWindow):
             combo.blockSignals(True)  # required to not induce loop
             combo.setCurrentIndex(len(plans))
             combo.blockSignals(False)  # required to not induce loop
+            self._status_training_widget.setVisible(False)
             return
         plan_id = animal.training.current_protocol
         combo.blockSignals(True)  # required to not induce loop
@@ -1756,6 +1715,10 @@ class MainWindow(QMainWindow):
             else:
                 combo.setCurrentIndex(plan_combo_index)
         combo.blockSignals(False)  # required to not induce loop
+        self._status_training_widget.setVisible(
+            self.main_content.protocol_ui_enabled
+            and app_model.training_plan is not None
+        )
 
     @invoke_method
     def _on_app_model_configuration_loaded(self, config):
