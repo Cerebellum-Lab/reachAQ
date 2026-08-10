@@ -64,7 +64,7 @@ class IntervalSource(NamedTuple):
 class SessionSource(NamedTuple):
     location: str
     prefix: str
-    session_index: int  # trial index
+    session_index: int
 
 
 class IntervalFileInfo(NamedTuple):
@@ -281,7 +281,7 @@ class ProjectInfo(_ProjectInfo):
         (location, today) = self.get_day_path(True, when=when)
         if session < 0:
             session = self.session
-        session_str = f"trial{session:03}"
+        session_str = f"session{session:03}"
         location = os.path.join(location, session_str)
         if not skip_ensure and self.ensure_exists:
             _ensure_location(location)
@@ -307,7 +307,7 @@ class ProjectInfo(_ProjectInfo):
 
     def get_metadata_file(self, session: Optional[int] = -1, when: Optional[datetime] = None) -> str:
         """Returns the metadata file path,
-            if session is None it's non-trial based.
+            if session is None it's not scoped to a recording session.
             if < -1 then self.session is used
         """
         when: datetime = self._get_when_or_now(when)
@@ -458,7 +458,11 @@ class ProjectInfo(_ProjectInfo):
                 return
 
         # slower code way
-        session_dirs = [x.name[-3:] for x in path.iterdir() if x.is_dir() and "trial" in x.name]
+        session_dirs = [
+            x.name[len("session"):]
+            for x in path.iterdir()
+            if x.is_dir() and x.name.startswith("session")
+        ]
 
         def int_map_fcn(value: str):
             try:

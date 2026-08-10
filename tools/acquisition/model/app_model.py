@@ -1254,7 +1254,7 @@ class AppModel(ObservableObject):
         data = []
         prim_cam = cams[0]  # primary
         main_fps = prim_cam.active_config.params.get('fps', math.nan)
-        logger.info("Merging camera timestamps files for trial%03d into %s (fps=%s)",
+        logger.info("Merging camera timestamp files for session%03d into %s (fps=%s)",
                     project.session, timing_path, main_fps)
         txt_files = []
         if not isinstance(main_fps, (int, float)) or main_fps == 0 or not math.isfinite(main_fps):
@@ -4563,7 +4563,7 @@ class AppModel(ObservableObject):
                 raise RuntimeError(
                     f"Resolved session path is not a direct trial directory: {session_path}"
                 )
-            if session_path.name != f"trial{project.session:03}":
+            if session_path.name != f"session{project.session:03}":
                 raise RuntimeError(
                     f"Resolved session directory has an unexpected name: {session_path.name}"
                 )

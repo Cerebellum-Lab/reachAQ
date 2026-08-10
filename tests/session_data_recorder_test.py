@@ -187,7 +187,7 @@ def test_session_outputs_are_clipped_to_camera_boundaries(tmp_path):
         (nidaq_chunk,),
     )
 
-    session_dir = tmp_path / "20260102" / "test" / "trial001"
+    session_dir = tmp_path / "20260102" / "test" / "session001"
     with (session_dir / "streams" / "device.csv").open(newline="") as stream:
         rows = list(csv.DictReader(stream))
     assert len(rows) == 1
@@ -242,7 +242,7 @@ def test_empty_session_streams_still_have_alignment_metadata(tmp_path):
         (),
     )
 
-    streams = tmp_path / "20260102" / "test" / "trial002" / "streams"
+    streams = tmp_path / "20260102" / "test" / "session002" / "streams"
     alignment = json.loads((streams / "alignment.json").read_text())
     for stream in alignment["streams"].values():
         assert stream["sampleCount"] == 0
@@ -332,7 +332,7 @@ def test_camera_and_tone_edges_are_correlated_on_nidaq_timeline(tmp_path):
             tmp_path
             / "20260102"
             / "test"
-            / "trial003"
+            / "session003"
             / "streams"
             / "alignment.json"
         ).read_text()
@@ -429,7 +429,7 @@ def test_device_event_overrun_marks_session_incomplete(tmp_path):
             tmp_path
             / "20260102"
             / "test"
-            / "trial004"
+            / "session004"
             / "streams"
             / "alignment.json"
         ).read_text()
@@ -449,7 +449,7 @@ def test_enabled_source_manifest_contains_final_paths_counts_and_health(
     )
     session_dir = Path(project.get_session_path().location)
     session_dir.mkdir(parents=True, exist_ok=True)
-    camera_path = session_dir / "trial005_left.mp4"
+    camera_path = session_dir / "session005_left.mp4"
     camera_path.touch()
     chunk = (
         np.arange(3, dtype=np.int64),
@@ -506,7 +506,7 @@ def test_enabled_source_manifest_contains_final_paths_counts_and_health(
         source["id"]: source
         for source in result["enabledSources"]
     }
-    assert manifest["camera.left"]["path"] == "trial005_left.mp4"
+    assert manifest["camera.left"]["path"] == "session005_left.mp4"
     assert manifest["camera.left"]["sampleCount"] == 3
     assert manifest["camera.left"]["firstOffsetSeconds"] == 0.0
     assert manifest["camera.left"]["lastOffsetSeconds"] == pytest.approx(0.002)
@@ -577,7 +577,7 @@ def test_trial_ledger_is_written_on_the_canonical_session_timeline(tmp_path):
         trial_summary=summary,
     )
 
-    streams = tmp_path / "20260102" / "test" / "trial006" / "streams"
+    streams = tmp_path / "20260102" / "test" / "session006" / "streams"
     written = tuple(
         json.loads(line)
         for line in (streams / "trials.jsonl").read_text().splitlines()

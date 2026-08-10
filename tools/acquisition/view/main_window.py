@@ -1084,7 +1084,7 @@ class MainWindow(QMainWindow):
 
         action = self.show_reach_event_action = QAction(_toolbar_icon("fa5s.bezier-curve"), "Show Previous Reach", self)
         action.setCheckable(True)
-        action.setEnabled(False)  # comment me to be able to show 20260205_agx001_trial011 on start
+        action.setEnabled(False)
         action.triggered.connect(self.on_show_reach_event)
 
         action = self._reset_cage_clean_action = QAction(_toolbar_icon("fa5s.broom"), "Reset Cage Clean", self)
