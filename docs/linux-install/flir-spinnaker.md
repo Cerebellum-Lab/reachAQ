@@ -16,7 +16,7 @@ export REACHAQ_ENV="reachaq"
 reachAQ currently includes Spinnaker Python 3.2.0.62 wheels for CPython 3.8:
 
 ```bash
-ls "$REACHAQ_REPO"/library/spinnaker_python-*-linux_*.whl
+find "$REACHAQ_REPO/vendor/spinnaker/linux" -name 'spinnaker_python-*.whl'
 ```
 
 ## 1. Install the matching system SDK
@@ -56,14 +56,14 @@ x86_64 Ubuntu with the bundled CPython 3.8 wheel:
 
 ```bash
 conda run -n "$REACHAQ_ENV" python -m pip install \
-  "$REACHAQ_REPO/library/spinnaker_python-3.2.0.62-cp38-cp38-linux_x86_64.whl"
+  "$REACHAQ_REPO/vendor/spinnaker/linux/x86_64/spinnaker_python-3.2.0.62-cp38-cp38-linux_x86_64.whl"
 ```
 
 Jetson/aarch64 requires the corresponding aarch64 system SDK and wheel:
 
 ```bash
 conda run -n "$REACHAQ_ENV" python -m pip install \
-  "$REACHAQ_REPO/library/spinnaker_python-3.2.0.62-cp38-cp38-linux_aarch64.whl"
+  "$REACHAQ_REPO/vendor/spinnaker/linux/aarch64/spinnaker_python-3.2.0.62-cp38-cp38-linux_aarch64.whl"
 ```
 
 ## 4. Verify the complete camera path

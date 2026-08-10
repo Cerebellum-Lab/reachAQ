@@ -28,12 +28,6 @@ test = [
     "coverage-enable-subprocess ~= 1.0",
 ]
 
-# can probably be removed
-old_platform = [
-    'pyserial == 3.5',
-]
-
-
 [project.scripts]
 auto-trainer-local = "tools.acquisition.gui:main"
 auto-trainer-headless = "tools.acquisition.headless:main"

@@ -3,6 +3,13 @@
 Complete the portable install and each applicable hardware guide before using a
 physical subsystem.
 
+Bundled Spinnaker Python artifacts are organized under `vendor/spinnaker` by
+operating system and architecture. `tools.platform_support` resolves Linux
+x86-64, Linux aarch64, and the retained Windows x86-64 artifact from the shared
+manifest. Windows hardware operation is not qualified by this repository; the
+artifact and platform-neutral interfaces are retained to avoid an architectural
+rewrite if that deployment is needed later.
+
 ## Runtime paths
 
 ```bash
@@ -100,6 +107,20 @@ must opt in with `AUTOTRAINER_HARDWARE_VERSION=anschutz`; unknown values are
 rejected rather than silently selecting another profile. Emulation is selected
 separately with `AUTOTRAINER_CAN_TRANSPORT=emulation` and still uses the Alogus
 profile.
+
+## Pellet motor coordinates
+
+The validated rig configuration uses `steps_per_revolution: 24.0` and
+`microsteps: 8` for X, Y, and Z. Limit orientation is X=1, Y=0, Z=1. Retain the
+established `max_vel: 120`, `max_acc: 600`, and `home_vel: 30` unless the
+physical motor or rail changes.
+
+The Hardware Control panel presents board coordinates from 0.0 mm at the home
+switch to 35.0 mm at the far end. `flip_limit_orientation` changes the
+electrical homing direction, not this coordinate convention. Existing
+`move_config.yaml` values remain board coordinates; for example an X value of
+25 still commands X to 25 mm. The LIVE line reports current feedback and its
+freshness, while SET reports the saved send position in the same coordinates.
 
 For the current JerryCAN board, expect `can0`, `mtu 72`, CAN FD,
 1 Mbit/s arbitration, and 5 Mbit/s data. See the
