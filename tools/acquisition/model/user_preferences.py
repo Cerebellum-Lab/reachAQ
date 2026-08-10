@@ -33,6 +33,11 @@ class UserPreferences(ObservableObject):
     ANIMAL_LOCATION = "animal_location"
     PELLET_PORT = "pellet_port"
     MEASUREMENT_GRAPH = "measurement_graph"
+    SOFTMOUSE_MANIFEST_PATH = "softmouse_manifest_path"
+    SOFTMOUSE_NAME_COLUMN = "softmouse_name_column"
+    SOFTMOUSE_NIGHTLY_REFRESH = "softmouse_nightly_refresh"
+    RFID_READER_ENABLED = "rfid_reader_enabled"
+    RFID_DEVICE = "rfid_device"
 
     def __init__(self, *, settings_file_path: Optional[Path] = None):
         super().__init__()
@@ -76,6 +81,24 @@ class UserPreferences(ObservableObject):
 
         self._live_feed_refresh_rate: int = settings.value("display/refresh_rate", 15, int)  # noqa
         self._measurement_graph: str = settings.value("ui/measurement_graph", "")  # noqa
+
+        self._softmouse_manifest_path: str = settings.value(
+            "softmouse/manifest_path", "", str
+        )
+        self._softmouse_name_column: str = settings.value(
+            "softmouse/new_animal_name_column", "Physical Tag", str
+        )
+        self._softmouse_nightly_refresh: bool = settings.value(
+            "softmouse/nightly_refresh", True, bool
+        )
+        self._rfid_reader_enabled: bool = settings.value(
+            "rfid/enabled", False, bool
+        )
+        self._rfid_device: str = settings.value(
+            "rfid/device",
+            "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_BG01OZ68-if00-port0",
+            str,
+        )
 
         # Transient values that may come from individual configuration files, but are conveniently accessed from
         # the user preferences.
@@ -194,3 +217,56 @@ class UserPreferences(ObservableObject):
         prev, self._measurement_graph = self._measurement_graph, value
         self._settings.setValue("ui/measurement_graph", value)
         self._on_property_changed(self.MEASUREMENT_GRAPH, value, prev)
+
+    @property
+    def softmouse_manifest_path(self) -> str:
+        return self._softmouse_manifest_path
+
+    @softmouse_manifest_path.setter
+    def softmouse_manifest_path(self, value: str) -> None:
+        prev, self._softmouse_manifest_path = self._softmouse_manifest_path, value.strip()
+        self._settings.setValue("softmouse/manifest_path", self._softmouse_manifest_path)
+        self._on_property_changed(self.SOFTMOUSE_MANIFEST_PATH, self._softmouse_manifest_path, prev)
+
+    @property
+    def softmouse_name_column(self) -> str:
+        return self._softmouse_name_column
+
+    @softmouse_name_column.setter
+    def softmouse_name_column(self, value: str) -> None:
+        value = value.strip() or "Physical Tag"
+        prev, self._softmouse_name_column = self._softmouse_name_column, value
+        self._settings.setValue("softmouse/new_animal_name_column", value)
+        self._on_property_changed(self.SOFTMOUSE_NAME_COLUMN, value, prev)
+
+    @property
+    def softmouse_nightly_refresh(self) -> bool:
+        return self._softmouse_nightly_refresh
+
+    @softmouse_nightly_refresh.setter
+    def softmouse_nightly_refresh(self, value: bool) -> None:
+        value = bool(value)
+        prev, self._softmouse_nightly_refresh = self._softmouse_nightly_refresh, value
+        self._settings.setValue("softmouse/nightly_refresh", value)
+        self._on_property_changed(self.SOFTMOUSE_NIGHTLY_REFRESH, value, prev)
+
+    @property
+    def rfid_reader_enabled(self) -> bool:
+        return self._rfid_reader_enabled
+
+    @rfid_reader_enabled.setter
+    def rfid_reader_enabled(self, value: bool) -> None:
+        value = bool(value)
+        prev, self._rfid_reader_enabled = self._rfid_reader_enabled, value
+        self._settings.setValue("rfid/enabled", value)
+        self._on_property_changed(self.RFID_READER_ENABLED, value, prev)
+
+    @property
+    def rfid_device(self) -> str:
+        return self._rfid_device
+
+    @rfid_device.setter
+    def rfid_device(self, value: str) -> None:
+        prev, self._rfid_device = self._rfid_device, value.strip()
+        self._settings.setValue("rfid/device", self._rfid_device)
+        self._on_property_changed(self.RFID_DEVICE, self._rfid_device, prev)

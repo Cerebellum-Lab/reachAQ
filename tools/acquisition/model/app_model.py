@@ -48,7 +48,12 @@ from autotrainer.core import (
     Offset3DTuple,
     get_perf_now,
 )
-from autotrainer.core import AnimalSubject, FixedArrayMultiQueue
+from autotrainer.core import (
+    AnimalSubject,
+    ExternalAnimalRecord,
+    ExternalIdentity,
+    FixedArrayMultiQueue,
+)
 from autotrainer.core.configuration.json_compat import SystemConfigurationJSONEncoder
 from autotrainer.core.interfaces import RecordingEndingReason, CaptureAnalysisResult
 from autotrainer.core.project import ProjectInfo, ProjectDependentProtocol
@@ -130,6 +135,21 @@ from tools.acquisition.model.nidaq_signal_monitor_model import NidaqSignalMonito
 from tools.acquisition.model.nidaq_timing import (
     remap_nidaq_physical_channel,
     resolve_nidaq_device_aliases,
+)
+from tools.acquisition.model.rfid_resolution import (
+    RfidResolution,
+    RfidResolutionKind,
+)
+from tools.acquisition.model.animal_metadata_sync import AnimalMetadataSyncService
+from tools.acquisition.model.animal_reconciliation import (
+    AnimalReconciliationChoices,
+    reconcile_animals,
+)
+from tools.acquisition.model.animal_registry import AnimalRegistry
+from tools.acquisition.model.rfid_metadata_controller import RfidMetadataController
+from tools.acquisition.model.softmouse_spreadsheet_source import (
+    SoftMouseMappingProfile,
+    SoftMouseSpreadsheetSource,
 )
 from tools.acquisition.model.session_data_recorder import SessionDataRecorder
 from tools.acquisition.model.session_boundary import SessionBoundary
@@ -296,6 +316,10 @@ class AppModel(ObservableObject):
         SESSION_RECORDING_STATUS = "session_recording_status"
         SUBSYSTEM_STATUSES = "subsystem_statuses"
         RECORDING_BLOCKERS = "recording_blockers"
+        ANIMAL_METADATA_STATUS = "animal_metadata_status"
+        RFID_READER_STATUS = "rfid_reader_status"
+        RFID_SCAN_RESULT = "rfid_scan_result"
+        ANIMAL_METADATA_PREVIEW = "animal_metadata_preview"
 
     def __init__(
             self,
@@ -474,6 +498,16 @@ class AppModel(ObservableObject):
 
         self._animals: List[AnimalSubject] = []
         self._animal_by_id: Dict[str, AnimalSubject] = {}
+        self._animal_by_external_key: Dict[Tuple[str, str, str], AnimalSubject] = {}
+        self._external_link_conflicts = set()
+        self._animal_registry = None
+        self._animal_metadata_sync = None
+        self._rfid_metadata_controller = None
+        self._animal_metadata_status = "Not configured"
+        self._animal_metadata_preview = None
+        self._rfid_reader_status = None
+        self._rfid_scan_result = None
+        self._animal_metadata_refresh_thread = None
 
         self._selected_animal: Optional[AnimalSubject] = None
         self._attached_plan: Optional[TrainingPlan] = None
@@ -723,6 +757,11 @@ class AppModel(ObservableObject):
         timer.start()
         logger.verbose("Created new daily timer in %.1f seconds ; today=%s", delay, new_day)
         self.current_day_changed(new_day)
+        if (
+            getattr(self._preferences, "softmouse_nightly_refresh", False)
+            and self._animal_metadata_sync is not None
+        ):
+            self._request_animal_metadata_catchup()
 
     @property
     def app_lock(self) -> threading.RLock:
@@ -789,7 +828,12 @@ class AppModel(ObservableObject):
             )
             return False
         self._recording_session.prepare_record(
-            self._acquisition.subsystems.snapshot()
+            self._acquisition.subsystems.snapshot(),
+            animal_snapshot=(
+                None
+                if self._selected_animal is None
+                else self._selected_animal.session_snapshot()
+            ),
         )
         self._set_subsystem_status(
             SubsystemId.OFFLINE_ANALYSIS,
@@ -2036,13 +2080,510 @@ class AppModel(ObservableObject):
     @animals.setter
     def animals(self, value: List[AnimalSubject]):
         prev, self._animals = self._animals, value
+        self._rebuild_animal_indexes()
         self._on_property_changed(self.Props.ANIMALS, value, prev)
 
     def get_animal_by_id(self, animal_id) -> Optional[AnimalSubject]:
+        return self._animal_by_id.get(animal_id)
+
+    def get_animal_by_external_identity(
+        self, identity: ExternalIdentity
+    ) -> Optional[AnimalSubject]:
+        if identity.key in self._external_link_conflicts:
+            return None
+        return self._animal_by_external_key.get(identity.key)
+
+    @property
+    def external_link_conflicts(self):
+        return frozenset(self._external_link_conflicts)
+
+    @property
+    def animal_metadata_status(self) -> str:
+        return self._animal_metadata_status
+
+    @property
+    def animal_metadata_preview(self):
+        return self._animal_metadata_preview
+
+    def _set_animal_metadata_status(self, value: str) -> None:
+        previous, self._animal_metadata_status = self._animal_metadata_status, value
+        if value != previous:
+            self._on_property_changed(
+                self.Props.ANIMAL_METADATA_STATUS, value, previous
+            )
+
+    def _configure_animal_metadata_services(self) -> None:
+        controller = self._rfid_metadata_controller
+        if controller is not None:
+            controller.stop()
+        self._animal_registry = None
+        self._animal_metadata_sync = None
+        self._rfid_metadata_controller = None
+        manifest_value = getattr(self._preferences, "softmouse_manifest_path", "")
+        reader_enabled = getattr(self._preferences, "rfid_reader_enabled", False)
+        if not manifest_value and not reader_enabled:
+            self._set_animal_metadata_status("Not configured")
+            self._set_subsystem_status(
+                SubsystemId.ANIMAL_REGISTRY,
+                SubsystemState.DISABLED,
+                reason="SoftMouse/RFID not configured",
+                required_for_recording=False,
+            )
+            self._set_subsystem_status(
+                SubsystemId.RFID_READER,
+                SubsystemState.DISABLED,
+                reason="RFID reader disabled",
+                required_for_recording=False,
+            )
+            return
+        cache_directory = Path(self._preferences.configuration_location) / "softmouse"
+        try:
+            registry = self._animal_registry = AnimalRegistry(
+                cache_directory / "animal-registry.sqlite3"
+            )
+        except Exception as exc:
+            self._set_animal_metadata_status(f"Registry unavailable: {exc}")
+            self._set_subsystem_status(
+                SubsystemId.ANIMAL_REGISTRY,
+                SubsystemState.FAILED,
+                error=str(exc),
+                required_for_recording=False,
+            )
+            self._set_subsystem_status(
+                SubsystemId.RFID_READER,
+                SubsystemState.DISABLED,
+                reason="local registry unavailable",
+                required_for_recording=False,
+            )
+            return
+        registry_reason = "local cache ready"
+        if registry.recovered_corrupt_path is not None:
+            registry_reason = (
+                "rebuilt corrupt cache; backup: "
+                f"{registry.recovered_corrupt_path.name}"
+            )
+        self._set_subsystem_status(
+            SubsystemId.ANIMAL_REGISTRY,
+            SubsystemState.READY,
+            reason=registry_reason,
+            required_for_recording=False,
+        )
+        if manifest_value:
+            profile = SoftMouseMappingProfile(
+                new_animal_name_column=getattr(
+                    self._preferences, "softmouse_name_column", "Physical Tag"
+                )
+            )
+            self._animal_metadata_sync = AnimalMetadataSyncService(
+                manifest_path=Path(manifest_value),
+                local_staging_directory=cache_directory / "source",
+                source=SoftMouseSpreadsheetSource(profile),
+                registry=registry,
+                can_refresh=lambda: (
+                    self.session_recording_status is SessionRecordingStatus.READY
+                ),
+            )
+        if reader_enabled:
+            self._rfid_metadata_controller = RfidMetadataController(
+                app_model=self,
+                registry=registry,
+                device=getattr(self._preferences, "rfid_device", ""),
+            )
+            self._set_subsystem_status(
+                SubsystemId.RFID_READER,
+                SubsystemState.STOPPED,
+                reason="configured; not started",
+                required_for_recording=False,
+            )
+        else:
+            self._set_subsystem_status(
+                SubsystemId.RFID_READER,
+                SubsystemState.DISABLED,
+                reason="RFID reader disabled",
+                required_for_recording=False,
+            )
+        previous = registry.last_complete_import()
+        if previous is None:
+            self._set_animal_metadata_status("Ready; no export imported yet")
+        else:
+            self._set_animal_metadata_status(
+                f"Cache has {previous['accepted_rows']} tagged animals; "
+                f"last refresh {previous['imported_utc']}; "
+                f"source {previous['source_file_sha256'][:12]}"
+            )
+
+    def refresh_animal_metadata(self):
+        service = self._animal_metadata_sync
+        if service is None:
+            raise RuntimeError("Configure a SoftMouse publication manifest first")
+        self._set_animal_metadata_status("Refreshing…")
+        self._set_subsystem_status(
+            SubsystemId.ANIMAL_REGISTRY,
+            SubsystemState.STARTING,
+            reason="refreshing SoftMouse cache",
+            required_for_recording=False,
+        )
+        try:
+            result = service.refresh_now()
+        except Exception as exc:
+            self._set_animal_metadata_status(f"Refresh failed: {exc}")
+            self._set_subsystem_status(
+                SubsystemId.ANIMAL_REGISTRY,
+                SubsystemState.FAILED,
+                error=str(exc),
+                required_for_recording=False,
+            )
+            raise
+        batch = result.preview.batch
+        status = (
+            f"Imported {batch.accepted_rows} tagged animals; "
+            f"ignored {batch.ignored_missing_rfid_rows} without RFID and "
+            f"{batch.ignored_ended_rows} ended"
+        )
+        if result.registry_result.unchanged:
+            status = "Already current; " + status
+        status += (
+            f"; source {batch.source_file_sha256[:12]}; "
+            f"refreshed {batch.imported_utc}"
+        )
+        self._set_animal_metadata_status(status)
+        previous_preview, self._animal_metadata_preview = (
+            self._animal_metadata_preview,
+            result.preview,
+        )
+        self._on_property_changed(
+            self.Props.ANIMAL_METADATA_PREVIEW,
+            result.preview,
+            previous_preview,
+        )
+        self._set_subsystem_status(
+            SubsystemId.ANIMAL_REGISTRY,
+            SubsystemState.READY,
+            reason=status,
+            required_for_recording=False,
+        )
+        return result
+
+    def _run_animal_metadata_catchup(self) -> None:
+        service = self._animal_metadata_sync
+        if service is None or self._closing_event.is_set():
+            return
+        try:
+            if service.refresh_due():
+                self.refresh_animal_metadata()
+        except Exception as exc:
+            logger.warning("Scheduled SoftMouse catch-up refresh failed: %s", exc)
+
+    def _request_animal_metadata_catchup(self) -> None:
+        thread = self._animal_metadata_refresh_thread
+        if thread is not None and thread.is_alive():
+            return
+        thread = self._animal_metadata_refresh_thread = threading.Thread(
+            target=self._run_animal_metadata_catchup,
+            name="softmouse-cache-refresh",
+            daemon=True,
+        )
+        thread.start()
+
+    def apply_animal_metadata_preferences(self) -> None:
+        self._configure_animal_metadata_services()
+        if self._rfid_metadata_controller is not None:
+            self._rfid_metadata_controller.start()
+
+    def current_external_animal_records(self):
+        if self._animal_registry is None:
+            return ()
+        return tuple(self._animal_registry.list_current_records())
+
+    def manually_link_animal(self, animal_id: str, record: ExternalAnimalRecord) -> None:
+        animal = self.get_animal_by_id(animal_id)
+        if animal is None:
+            raise ValueError(f"Unknown reachAQ animal UUID {animal_id!r}")
+        ledger = (
+            None
+            if self._animal_registry is None
+            else self._animal_registry.last_complete_import()
+        )
+        self.link_animal_to_external_record(
+            animal,
+            record,
+            registry_import_id=None if ledger is None else ledger["import_id"],
+            source_file_sha256=(
+                None if ledger is None else ledger["source_file_sha256"]
+            ),
+            imported_utc=None if ledger is None else ledger["imported_utc"],
+        )
+
+    def _rebuild_animal_indexes(self) -> None:
+        self._animal_by_id = {animal.id: animal for animal in self._animals}
+        self._animal_by_external_key = {}
+        self._external_link_conflicts = set()
         for animal in self._animals:
-            if animal.id == animal_id:
-                return animal
-        return None
+            identity = animal.external_identity
+            if identity is None:
+                continue
+            previous = self._animal_by_external_key.get(identity.key)
+            if previous is not None and previous.id != animal.id:
+                self._external_link_conflicts.add(identity.key)
+                self._animal_by_external_key.pop(identity.key, None)
+            elif identity.key not in self._external_link_conflicts:
+                self._animal_by_external_key[identity.key] = animal
+
+    def link_animal_to_external_record(
+        self,
+        animal: AnimalSubject,
+        record: ExternalAnimalRecord,
+        *,
+        registry_import_id: Optional[str] = None,
+        source_file_sha256: Optional[str] = None,
+        imported_utc: Optional[str] = None,
+    ) -> None:
+        if self.session_recording_status is not SessionRecordingStatus.READY:
+            raise RuntimeError("Animal links cannot change while a session is active")
+        linked = self.get_animal_by_external_identity(record.identity)
+        if linked is not None and linked.id != animal.id:
+            raise ValueError(
+                f"{record.identity.subject_id!r} is already linked to {linked.name!r}"
+            )
+        old_identity = animal.external_identity
+        old_metadata = animal.external_metadata
+        animal.external_identity = record.identity
+        animal.external_metadata = record.metadata_snapshot(
+            registry_import_id=registry_import_id,
+            source_file_sha256=source_file_sha256,
+            imported_utc=imported_utc,
+        )
+        try:
+            self._save_animal_metadata(animal, sender="external-link")
+        except Exception:
+            animal.external_identity = old_identity
+            animal.external_metadata = old_metadata
+            self._rebuild_animal_indexes()
+            raise
+        self._rebuild_animal_indexes()
+
+    def resolve_external_record(
+        self,
+        record: Optional[ExternalAnimalRecord],
+        *,
+        scanned_rfid: str,
+        registry_import_id: Optional[str] = None,
+        source_file_sha256: Optional[str] = None,
+        imported_utc: Optional[str] = None,
+        cache_stale: bool = False,
+    ) -> RfidResolution:
+        if self.session_recording_status is not SessionRecordingStatus.READY:
+            return RfidResolution(
+                RfidResolutionKind.BUSY,
+                scanned_rfid,
+                record=record,
+                message="RFID selection is disabled while a session is active",
+            )
+        if record is None:
+            return RfidResolution(
+                RfidResolutionKind.UNKNOWN_RFID,
+                scanned_rfid,
+                message=(
+                    "RFID is unknown and the local cache is stale; refresh before linking"
+                    if cache_stale
+                    else "RFID is not present in the current local cache"
+                ),
+            )
+        if record.identity.key in self._external_link_conflicts:
+            return RfidResolution(
+                RfidResolutionKind.LINK_CONFLICT,
+                scanned_rfid,
+                record=record,
+                message="Multiple local animals have this external identity",
+            )
+        animal = self.get_animal_by_external_identity(record.identity)
+        created = False
+        if animal is None:
+            if not record.new_animal_name_candidate:
+                return RfidResolution(
+                    RfidResolutionKind.NEEDS_NAME,
+                    scanned_rfid,
+                    record=record,
+                    message="The selected SoftMouse name field is empty",
+                )
+            # Equal names never imply identity. External scans always create a
+            # distinct UUID unless the permanent external key is already linked.
+            animal = AnimalSubject(name=record.new_animal_name_candidate)
+            self._animals.append(animal)
+            self._rebuild_animal_indexes()
+            created = True
+        try:
+            self.link_animal_to_external_record(
+                animal,
+                record,
+                registry_import_id=registry_import_id,
+                source_file_sha256=source_file_sha256,
+                imported_utc=imported_utc,
+            )
+        except Exception:
+            if created:
+                self._animals.remove(animal)
+                self._rebuild_animal_indexes()
+            raise
+        if created:
+            self.animals = list(self._animals)
+            self._event_manager.post_event_content(
+                ApiEventKind.animalCreated, animal.to_api_status()
+            )
+        self.selected_animal = animal
+        return RfidResolution(
+            (
+                RfidResolutionKind.CREATED_AND_SELECTED
+                if created
+                else RfidResolutionKind.SELECTED
+            ),
+            scanned_rfid,
+            record=record,
+            animal=animal,
+            message=("Selected using a stale local cache" if cache_stale else ""),
+        )
+
+    @property
+    def rfid_reader_status(self):
+        return self._rfid_reader_status
+
+    @property
+    def rfid_scan_result(self):
+        return self._rfid_scan_result
+
+    def set_rfid_reader_status(self, status) -> None:
+        previous, self._rfid_reader_status = self._rfid_reader_status, status
+        self._on_property_changed(self.Props.RFID_READER_STATUS, status, previous)
+        state_value = getattr(getattr(status, "state", None), "value", "failed")
+        state = {
+            "ready": SubsystemState.READY,
+            "connecting": SubsystemState.STARTING,
+            "reconnecting": SubsystemState.STARTING,
+            "stopped": SubsystemState.STOPPED,
+            "failed": SubsystemState.FAILED,
+        }.get(state_value, SubsystemState.FAILED)
+        self._set_subsystem_status(
+            SubsystemId.RFID_READER,
+            state,
+            reason=getattr(status, "reason", "") or state_value,
+            error=(getattr(status, "reason", "") if state is SubsystemState.FAILED else ""),
+            required_for_recording=False,
+        )
+
+    def handle_rfid_scan(self, record, **kwargs) -> RfidResolution:
+        result = self.resolve_external_record(record, **kwargs)
+        previous, self._rfid_scan_result = self._rfid_scan_result, result
+        self._on_property_changed(self.Props.RFID_SCAN_RESULT, result, previous)
+        return result
+
+    def condense_animals(
+        self,
+        survivor_id: str,
+        loser_id: str,
+        choices: AnimalReconciliationChoices,
+    ) -> AnimalSubject:
+        """Condense two local records with explicit field-group decisions.
+
+        Both original JSON files are preserved as backups and the losing UUID
+        receives a redirect record. Session directories are never inspected or
+        rewritten.
+        """
+        if self.session_recording_status is not SessionRecordingStatus.READY:
+            raise RuntimeError("Animals cannot be reconciled while a session is active")
+        survivor = self.get_animal_by_id(survivor_id)
+        loser = self.get_animal_by_id(loser_id)
+        if survivor is None or loser is None:
+            raise ValueError("Both survivor and losing UUIDs must be current animals")
+        merged = reconcile_animals(survivor, loser, choices)
+        animal_directory = Path(self._preferences.animal_location)
+        animal_directory.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        survivor_path = animal_directory / f"{survivor.id}.json"
+        loser_path = animal_directory / f"{loser.id}.json"
+        if not survivor_path.is_file() or not loser_path.is_file():
+            raise FileNotFoundError(
+                "Both animal JSON files must exist before they can be condensed"
+            )
+
+        backups = {}
+        for label, path in (("survivor", survivor_path), ("loser", loser_path)):
+            backup = animal_directory / (
+                f"{path.stem}.{timestamp}.{label}.merge-backup"
+            )
+            shutil.copy2(path, backup)
+            backups[path] = backup
+
+        selected_participant = (
+            self._selected_animal
+            if self._selected_animal is not None
+            and self._selected_animal.id in {
+                survivor.id,
+                loser.id,
+            }
+            else None
+        )
+        if selected_participant is not None:
+            # Deselect before moving the losing file: the selection setter saves
+            # the outgoing animal and would otherwise recreate that file.
+            self.selected_animal = None
+
+        archived_loser = animal_directory / (
+            f"{loser.id}.{timestamp}.merged-animal-backup"
+        )
+        redirect_path = animal_directory / f"{loser.id}.merged-redirect"
+        if redirect_path.exists():
+            if selected_participant is not None:
+                self.selected_animal = selected_participant
+            raise FileExistsError(
+                f"A merge redirect already exists for losing UUID {loser.id}"
+            )
+        staged_survivor = survivor_path.with_name(
+            f".{survivor_path.name}.{timestamp}.merge-stage"
+        )
+        temporary_redirect = redirect_path.with_name(
+            f".{redirect_path.name}.{timestamp}.tmp"
+        )
+        redirect = {
+            "schemaVersion": 1,
+            "mergedUtc": timestamp,
+            "losingReachaqId": loser.id,
+            "survivingReachaqId": survivor.id,
+            "fieldSources": choices.to_dict(),
+        }
+        merged.to_file(staged_survivor)
+        temporary_redirect.write_text(
+            json.dumps(redirect, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+        try:
+            os.replace(staged_survivor, survivor_path)
+            os.replace(loser_path, archived_loser)
+            os.replace(temporary_redirect, redirect_path)
+        except Exception:
+            # Restore both authoritative JSON files from the pre-merge copies.
+            # Each restore is itself staged so readers never see partial JSON.
+            for original, backup in backups.items():
+                restore_stage = original.with_name(
+                    f".{original.name}.{timestamp}.restore-stage"
+                )
+                shutil.copy2(backup, restore_stage)
+                os.replace(restore_stage, original)
+            redirect_path.unlink(missing_ok=True)
+            staged_survivor.unlink(missing_ok=True)
+            temporary_redirect.unlink(missing_ok=True)
+            if selected_participant is not None:
+                self.selected_animal = selected_participant
+            raise
+
+        self.animals = [
+            merged if animal.id == survivor.id else animal
+            for animal in self._animals
+            if animal.id != loser.id
+        ]
+        if selected_participant is not None:
+            self.selected_animal = merged
+        return merged
 
     @property
     def selected_animal(self) -> Optional[AnimalSubject]:
@@ -2080,7 +2621,7 @@ class AppModel(ObservableObject):
             self.training_plan = self.get_training_plan_by_id(
                 animal.training.current_protocol
             )
-        self._preferences.selected_animal = "" if animal is None else animal.name
+        self._preferences.selected_animal = "" if animal is None else animal.id
         self._on_property_changed(self.Props.SELECTED_ANIMAL, animal, prev)
         self._event_manager.post_event_content(
             ApiEventKind.animalSelected, None if animal is None else animal.to_api_status())
@@ -3670,6 +4211,7 @@ class AppModel(ObservableObject):
 
         # and:
         self._load_animals()
+        self._configure_animal_metadata_services()
 
         self.configuration_loaded_event(configuration)
 
@@ -3793,6 +4335,10 @@ class AppModel(ObservableObject):
         timer.start()
         logger.notice("Created daily timer in %.1f seconds ; today=%s", delay, today)
         self._analysis.start()
+        if self._rfid_metadata_controller is not None:
+            self._rfid_metadata_controller.start()
+        if getattr(self._preferences, "softmouse_nightly_refresh", False):
+            self._request_animal_metadata_catchup()
 
     def _stop_periodic_timers(self):
         self._closing_event.set()
@@ -3811,6 +4357,12 @@ class AppModel(ObservableObject):
         # Stop command producers first so none can race with CAN teardown or
         # reschedule themselves after their current timer is cancelled.
         self._prepare_application_shutdown()
+
+        if self._rfid_metadata_controller is not None:
+            self._rfid_metadata_controller.stop()
+        metadata_thread = self._animal_metadata_refresh_thread
+        if metadata_thread is not None and metadata_thread.is_alive():
+            metadata_thread.join(5)
 
         self._session_data_recorder.close()
         self._analysis.stop()
@@ -3892,15 +4444,51 @@ class AppModel(ObservableObject):
                 if animal is not None
             }
 
-            animals = sorted(animals.values(), key=lambda a: a.name)
+            loaded_by_path = animals
+            paths_by_id = {}
+            for source_path, animal in loaded_by_path.items():
+                previous_path = paths_by_id.get(animal.id)
+                if previous_path is not None:
+                    raise ValueError(
+                        "Duplicate reachAQ animal UUID "
+                        f"{animal.id!r} in {previous_path.name!r} and "
+                        f"{source_path.name!r}; remove or archive one copy"
+                    )
+                paths_by_id[animal.id] = source_path
+            animals = sorted(loaded_by_path.values(), key=lambda a: a.name)
+
+            # New persistence is UUID-addressed so duplicate display names are
+            # safe. Preserve a recoverable copy of every legacy name-based file.
+            for source_path, animal in loaded_by_path.items():
+                destination = animals_dir_path / f"{animal.id}.json"
+                if source_path == destination:
+                    continue
+                if destination.exists():
+                    raise ValueError(
+                        f"Cannot migrate {source_path.name!r}: canonical path "
+                        f"{destination.name!r} already exists"
+                    )
+                backup = source_path.with_suffix(source_path.suffix + ".legacy-name-backup")
+                if backup.exists():
+                    backup = source_path.with_suffix(
+                        source_path.suffix
+                        + datetime.now(timezone.utc).strftime(
+                            ".%Y%m%dT%H%M%S%fZ.legacy-name-backup"
+                        )
+                    )
+                os.replace(source_path, backup)
+                try:
+                    animal.to_file(destination)
+                except Exception:
+                    os.replace(backup, source_path)
+                    raise
 
         pref_animal = self._preferences.selected_animal
+        self.animals = animals
         for animal in animals:
-            if pref_animal == animal.name:
+            if pref_animal in {animal.id, animal.name}:
                 self.selected_animal = animal
                 break
-
-        self.animals = animals
 
     def _update_status_text_overlay(self):
         parts = []
@@ -3958,7 +4546,7 @@ class AppModel(ObservableObject):
         prefs = UserPreferences
         if name == prefs.SELECTED_ANIMAL:
             for animal in self._animals:
-                if animal.name == value:
+                if value in {animal.id, animal.name}:
                     self.selected_animal = animal
                     break
 
@@ -4734,7 +5322,7 @@ class AppModel(ObservableObject):
             if prev_animal.id == animal.id:
                 prev_animals[idx] = animal
                 break
-        dst = Path(self._preferences.animal_location).joinpath(f"{animal.name}.json")
+        dst = Path(self._preferences.animal_location).joinpath(f"{animal.id}.json")
         logger.verbose("Saving %s to %s ; sender=%s", animal, dst, sender)
         if backup_previous and dst.exists():
             now = datetime.now()
@@ -4848,6 +5436,7 @@ class AppModel(ObservableObject):
             "serialNumber": self._preferences.serial_number or "",
             "appVersion": self._app_version,
             "animalName": self.animal_name,
+            "animal": self._recording_session.animal_snapshot,
             "notes": self.notes or "",
             "cameraNames": list(project.camera_names),
             "session": session,

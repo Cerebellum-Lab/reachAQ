@@ -25,6 +25,7 @@ class RecordingSessionController:
     pending_end_perf: Optional[float] = None
     boundary: Optional[SessionBoundary] = None
     hardware_status_at_record: Optional[dict] = None
+    animal_snapshot: Optional[dict] = None
     data_complete: bool = True
     data_errors: Tuple[str, ...] = ()
     enabled_sources: Tuple[dict, ...] = ()
@@ -34,13 +35,19 @@ class RecordingSessionController:
         self.status = SessionRecordingStatus(status)
         return previous
 
-    def prepare_record(self, hardware_status: dict) -> None:
+    def prepare_record(
+        self,
+        hardware_status: dict,
+        *,
+        animal_snapshot: Optional[dict] = None,
+    ) -> None:
         self.analysis_finished = False
         self.analysis_started_perf = None
         self.analysis_duration_seconds = None
         self.pending_end_perf = None
         self.boundary = None
         self.hardware_status_at_record = hardware_status
+        self.animal_snapshot = animal_snapshot
         self.data_complete = True
         self.data_errors = ()
         self.enabled_sources = ()
@@ -63,3 +70,4 @@ class RecordingSessionController:
         self.analysis_finished = True
         self.analysis_started_perf = None
         self.analysis_duration_seconds = None
+        self.animal_snapshot = None

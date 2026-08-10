@@ -19,6 +19,8 @@ class SubsystemId(str, enum.Enum):
     LASER = "laser"
     SESSION_LOGS = "session_logs"
     OFFLINE_ANALYSIS = "offline_analysis"
+    ANIMAL_REGISTRY = "animal_registry"
+    RFID_READER = "rfid_reader"
 
     @staticmethod
     def camera(camera_name: str) -> str:
