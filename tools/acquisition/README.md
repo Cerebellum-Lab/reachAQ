@@ -73,6 +73,13 @@ The app saves configuration back to the preferences configuration directory. For
 alternate software-only configs, use a separate preferences file and config
 directory so test settings do not overwrite the bench config.
 
+The current production schema is system-configuration version 57. Older and
+newer versions, unknown fields, retired load-cell/tunnel fields, and obsolete
+NI recording controls are rejected instead of being silently migrated. Start
+from the maintained example at
+[`tools/hardware/reachaq_system_configuration.example.yaml`](../hardware/reachaq_system_configuration.example.yaml)
+when converting a rig configuration.
+
 ## Cameras
 
 Reach cameras are configured as `CameraConfiguration` entries. The left and
@@ -89,9 +96,6 @@ Enable `stimCam` by setting its `CameraConfiguration.isEnabled` value to
 `true`. Its source can then be selected from the far-right camera panel. Keep
 it `false` on rigs without the camera; the placeholder random source is never
 opened while the camera is disabled.
-
-reachAQ does not require a webcam. Leave the `web` camera absent or disabled
-unless a rig intentionally configures it.
 
 For Spinnaker cameras, put the camera serial or configured Spinnaker identifier
 in `host`. The Edit Camera Settings selector keeps that configured binding under
@@ -255,8 +259,8 @@ mkdir -p "$HOME/Documents/rawdatalocal"
 * System Mode - select Idle or Running. During transitions it explicitly shows
   Starting or Stopping acquisition.
 * Notes and Subject - set acquisition notes and select the current animal.
-* Training Mode and Protocol - select the active training workflow when the
-  protocol UI is enabled.
+* Protocol - select a protocol, or select **Manual pellet control**. Automatic
+  pellet cycles and automatic protocol advance are independent settings.
 * Preferences - configure live inference and other application preferences.
 
 Hardware Status uses one collapsible subpanel per category. Subpanels start
@@ -311,13 +315,15 @@ Record, remain visible after Stop, and reset to zero after Abort. The old System
 state display, day/total counters, load-cell UI, and load-cell recording triggers
 have been removed.
 
-Session-aligned auxiliary files are stored beneath the matching `trialNNN`
+Session-aligned auxiliary files are stored beneath the matching `sessionNNN`
 directory:
 
 ```text
 streams/nidaq.h5
 streams/device.csv
 streams/laser.csv
+streams/trials.jsonl
+streams/trial_summary.json
 streams/alignment.json
 logs/session.log
 ```
@@ -353,12 +359,11 @@ initialization step that is still waiting.
 
 Hardware Status categories are collapsed by default. Expanded categories use
 independently scrollable, fixed-width tables with aligned columns and a bold,
-underlined header. Camera serials, NI card models
-and named port/stream routes, CAN driver/interface selection, GPU driver/memory,
-and laser channel/timing bindings are shown per device; only actionable scan
-warnings are added below those rows. Camera rows are limited to the configured
-left, right, and optional stimCam roles; webcam and synthetic/random-image
-sources are omitted.
+underlined header. Camera serials, NI card models and named port/stream routes,
+CAN driver/interface selection, GPU driver/memory, and laser channel/timing
+bindings are shown per device; only actionable scan warnings are added below
+those rows. Camera rows are limited to configured reach and optional stimCam
+roles; synthetic and playback test sources are omitted from hardware discovery.
 
 Some NI devices, including M-Series static digital I/O, return DAQmx status
 `-200303` because their digital lines have no internal hardware sample clock.
@@ -371,3 +376,7 @@ recording is required.
 See [../../linux-install-instructions.md](../../linux-install-instructions.md)
 and [../hardware/reachaq_system_configuration.example.yaml](../hardware/reachaq_system_configuration.example.yaml)
 for the current Linux hardware setup and example config.
+
+See [Recording sessions, pellet trials, protocols, and schema migration](../../docs/acquisition/session-trials-protocols.md)
+for trial numbering, retries, automatic stop behavior, protocol progress, and
+animal v4-to-v5 migration.

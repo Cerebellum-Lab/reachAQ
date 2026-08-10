@@ -40,32 +40,35 @@ NI-DAQ synchronization, and degraded hardware operation.
 Selecting System Mode **Running** starts enabled camera acquisition and preview,
 the configured live-inference pipeline, CAN/pellet communication, the NI-DAQ
 input stream, laser control, and session-output validation. It does not create a
-trial or write session video frames.
+session directory or write session video frames.
 
 The Behavior panel owns the session controls:
 
 | Control | Available state | Result |
 |---|---|---|
-| **Record** | System Mode is Running, recording state is Ready, and every required source is Ready | Creates the trial and begins the existing camera/video-writing path |
-| **Stop** | Recording | Selects the final synchronized camera boundary, closes all writers, retains the trial, and runs offline analysis |
-| **Abort** | Arming or Recording | Closes writers, cancels analysis for that trial, deletes the entire trial directory, and resets session counts |
+| **Record** | System Mode is Running, recording state is Ready, and every required source is Ready | Creates a session and begins the existing camera/video-writing path |
+| **Stop** | Recording | Selects the final synchronized camera boundary, closes all writers, retains the session, and runs offline analysis |
+| **Abort** | Arming or Recording | Closes writers, cancels session analysis, deletes the entire session directory, and resets session counts |
 
 The recording state progresses through `Ready`, `Arming`, `Recording`,
 `Stopping`, and `Analyzing`. Record stays disabled until analysis for a stopped
-trial finishes. Analysis is never started for an aborted trial.
+session finishes. Analysis is never started for an aborted session.
 
 The four Behavior counters are session-scoped: Presented, Reaches, Success, and
 Consumed. They reset when Record is pressed, remain visible after Stop and
 analysis, and return to zero after Abort. The previous System state controls and
 day/total pellet counters are not part of the UI or current persistence model.
-Legacy animal JSON remains loadable, but new recording behavior does not update
-day or lifetime count fields.
+Animal v4 JSON is accepted only for a one-way migration to v5. The migration
+preserves identity, pellet coordinates, limits, and selected protocol, archives
+the original file, resets non-convertible recording-based protocol progress,
+and removes day/lifetime count fields.
 
 The load-cell acquisition, tare, configuration, UI, and automatic recording
-triggers have been removed. Older YAML tags and fields are accepted only as
-load-and-drop compatibility data. They do not create a load-cell runtime.
-reachAQ emergency stop/resume and alarm-driven LED overrides are disabled; the
-remaining non-alarm analysis detectors continue to run where configured.
+triggers have been removed. System configuration v57 rejects obsolete schemas
+and fields rather than creating a compatibility runtime. Alarm, emergency,
+tunnel, head-fix, magnet, and webcam/top-camera behavior is removed. Pellet
+presence, pellet misplacement, watchdog liveness, structured errors, and safe
+hardware shutdown remain.
 
 ## Required sources and failure domains
 
@@ -98,7 +101,7 @@ state of a newer retry.
 
 If a required source is unavailable, Record is disabled and its tooltip lists
 the exact blockers. If a required source is lost during Recording, only the
-active trial is aborted; unrelated acquisition domains remain running. Explicit
+active session is aborted; unrelated acquisition domains remain running. Explicit
 System Mode stop still attempts to stop every domain even when one cleanup
 operation fails.
 
@@ -141,25 +144,27 @@ The same finite boundary is required in:
 Final metadata is serialized to temporary JSON and YAML files before either
 destination is replaced. A missing alignment file, non-finite boundary,
 boundary mismatch, primary timing mismatch, missing enabled source, writer
-failure, acquisition gap, or buffer overrun prevents the trial from being
+failure, acquisition gap, or buffer overrun prevents the session from being
 reported as fully saved.
 
 ## Persisted session files
 
-Every session-owned file is below the existing `trialNNN` directory. Exact
+Every session-owned file is below the `sessionNNN` directory. Exact
 camera, pose, and metadata names continue to follow the existing project naming
 conventions.
 
 ```text
-trialNNN/
+sessionNNN/
 ├── <camera videos and camera timing files>
 ├── <live/offline pose and analysis files>
-├── <trial metadata>.json
-├── <trial metadata>.yaml
+├── <session metadata>.json
+├── <session metadata>.yaml
 ├── streams/
 │   ├── nidaq.h5
 │   ├── device.csv
 │   ├── laser.csv
+│   ├── trials.jsonl
+│   ├── trial_summary.json
 │   └── alignment.json
 └── logs/
     └── session.log
@@ -201,6 +206,18 @@ part of this format.
 Pellet-board tone events are stored here. Electrical tone confirmations wired to
 NI-DAQ are separate signals in `nidaq.h5`; `alignment.json` correlates the two.
 
+### `trials.jsonl` and `trial_summary.json`
+
+`trials.jsonl` is the authoritative pellet-delivery attempt ledger for the
+session. It separates logical trial ID, physical attempt ID, operation/context
+ID, send request, successful presentation acknowledgement, terminal outcome,
+retry policy, and explicit hardware errors. Hardware, command, transport, and
+acknowledgement failures remain visible but never count toward trial or protocol
+progress. `trial_summary.json` stores derived counts for the configured trial
+count basis. See
+[Recording sessions, pellet trials, protocols, and schema migration](session-trials-protocols.md)
+for the full accounting contract.
+
 ### `laser.csv`
 
 The laser event ledger records commands, output/state changes, source, channel,
@@ -210,9 +227,9 @@ continuously in `nidaq.h5` when configured.
 
 ### `session.log`
 
-The session log contains only messages within the canonical trial boundary,
+The session log contains only messages within the canonical session boundary,
 with offsets from the start. The acquisition-wide diagnostic log remains
-outside the trial and is retained after Abort so hardware failures can still be
+outside the session and is retained after Abort so hardware failures can still be
 diagnosed.
 
 ### `alignment.json` and final metadata
@@ -231,10 +248,18 @@ diagnosed.
   `persistenceStatus`;
 - `deviceEventOverruns`, `sessionComplete`, and `incompleteReasons`.
 
-Final trial JSON/YAML additionally records `sessionCounts`,
+Final session JSON/YAML additionally records `sessionCounts`,
 `sessionDataComplete`, `sessionDataErrors`, `hardwareConfigured`,
 `hardwareRuntimeAtRecord`, `hardwareRuntime`, recording state, and analysis
-duration.
+duration. Non-finite values are normalized to JSON/YAML null; finalized metadata
+is never written with non-standard `NaN` tokens.
+
+The retained `auto-trainer-api` 0.9.22 status object still requires empty alarm
+and tunnel-shaped fields and a legacy training-mode value. ReachAQ fills those
+fields only as compatibility placeholders; they do not correspond to runtime
+subsystems. Old API recording-boundary `trialStarted`, `trialCaptureEnded`, and
+`trialEnded` events are no longer emitted because a recording is a session, not
+a pellet trial.
 
 Camera/NI matching uses the nearest `cam_frames` transition within half the
 observed frame period and records whether it was rising or falling. The current
@@ -307,7 +332,7 @@ and routes through discovery.
    physical lines are wired.
 6. Confirm JSON, YAML, and `alignment.json` contain the same finite start
    boundary. Repeat three times and compare camera/NI offset stability.
-7. Start a trial and Abort. Confirm the trial directory is removed, counts are
+7. Start a session and Abort. Confirm the session directory is removed, counts are
    zero, analysis does not run, and healthy previews remain active.
 8. Stop System Mode, power off only the PXI chassis, and start again. Cameras
    should report their own results and continue preview if their physical

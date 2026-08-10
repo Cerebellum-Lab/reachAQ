@@ -5,7 +5,7 @@ NI-DAQ persistence, independent hardware failure domains, metadata integrity,
 and operator controls currently on `devel`. Complete it on the actual rig before
 the branch is treated as hardware-accepted.
 
-The short trial002-trial005 audit was useful exploratory coverage, but it was
+The short session002-session005 audit was useful exploratory coverage, but it was
 performed before the final Analysis selector and camera square-wave transition
 fixes. Repeat the applicable tests below against the current commit.
 
@@ -15,8 +15,8 @@ fixes. Repeat the applicable tests below against the current commit.
 - [ ] Record the system configuration path and archive a copy with the results.
 - [ ] Record the rig name, operating system, NI-DAQmx version, camera serials,
       NI model names, device aliases, PXI slots, and relevant wiring routes.
-- [ ] Record the raw-data root and trial identifiers used by this checklist.
-- [ ] Save the application log and a copy of every accepted trial's metadata,
+- [ ] Record the raw-data root and session identifiers used by this checklist.
+- [ ] Save the application log and a copy of every accepted session's metadata,
       source manifest, and `streams/alignment.json`.
 - [ ] Confirm `git status --short` is clean before testing.
 
@@ -67,7 +67,7 @@ fixes. Repeat the applicable tests below against the current commit.
 ## System Mode and operator controls
 
 - [ ] Select System Mode Running without pressing Record. Confirm enabled
-      cameras acquire and preview, but no trial directory or video writer is
+      cameras acquire and preview, but no session directory or video writer is
       created.
 - [ ] Confirm the Hardware Refresh control is at the far right of the Hardware
       Status title bar and is disabled during recording, stopping, abort cleanup,
@@ -88,7 +88,7 @@ fixes. Repeat the applicable tests below against the current commit.
       Ready before Record becomes enabled.
 - [ ] Plot only one NI signal while leaving every configured NI channel enabled.
 - [ ] Record for 30-60 seconds with all enabled cameras.
-- [ ] During the trial, generate multiple barcode transitions, pellet-board CAN
+- [ ] During the session, generate multiple barcode transitions, pellet-board CAN
       messages, and tone events on each available tone channel.
 - [ ] If laser is enabled, generate several commanded laser events and physical
       feedback transitions.
@@ -123,7 +123,7 @@ fixes. Repeat the applicable tests below against the current commit.
       apart; at 10 kHz sampling, expected quantization is 6.6 or 6.7 ms.
 - [ ] Confirm an N-frame sampled interval normally contains N-1 observed
       transitions when acquisition begins within the first plateau.
-- [ ] Start trials on both square-wave polarities. Confirm camera/NI matching can
+- [ ] Start sessions on both square-wave polarities. Confirm camera/NI matching can
       select either a rising or falling transition and records `edgePolarity`.
 - [ ] Confirm the selected camera transition is the nearest valid transition,
       not merely the nearest rising edge.
@@ -135,7 +135,7 @@ fixes. Repeat the applicable tests below against the current commit.
       or boundary mismatches are reported.
 - [ ] Confirm camera/NI and tone-command/NI-feedback correlations are populated
       and unambiguous when the corresponding physical lines are wired.
-- [ ] Repeat the eventful trial at least three times and compare camera/NI and
+- [ ] Repeat the eventful session at least three times and compare camera/NI and
       tone/NI offsets. Document the mean, range, and any outlier.
 
 ## Session boundary and metadata integrity
@@ -165,8 +165,54 @@ fixes. Repeat the applicable tests below against the current commit.
 - [ ] Confirm analysis completes promptly for a short session and does not leave
       Record permanently disabled.
 - [ ] Record at least three consecutive retained sessions without restarting the
-      application. Confirm unique trial directories, isolated stream data, and
+      application. Confirm unique session directories, isolated stream data, and
       no stale callbacks or counters cross session boundaries.
+
+## Pellet trials, protocols, and automatic stops
+
+- [ ] Record one session with zero pellet trials, one with one trial, and one
+      with several automatic pellet cycles. Confirm recording remains continuous
+      across all cycles.
+- [ ] Confirm each send dispatch and successful board acknowledgement appears in
+      both decoded `device.csv` and the appropriate `trials.jsonl` attempt.
+- [ ] Exercise **Retry within the same trial** and confirm labels progress as
+      `1.1`, `1.2`, and so on without double-counting the logical trial.
+- [ ] Exercise **Count every attempt as a new trial** and **Count only successful
+      pellet presentations** and confirm `trial_summary.json` matches the UI
+      choice.
+- [ ] Induce a safe command/acknowledgement failure. Confirm it is an explicit
+      hardware error with an operation ID and never increments any configured
+      trial count or protocol progress.
+- [ ] With a selected protocol, confirm each qualifying pellet trial advances
+      progress once and a recording boundary does not increment progress.
+- [ ] Confirm manual pellet control remains available with no protocol selected,
+      and that automatic protocol advance does not implicitly enable automatic
+      pellet cycles.
+- [ ] Test duration, trial-count, and protocol-completion stop policies
+      separately and with simultaneous thresholds. Confirm the first request
+      wins and the actual/triggered reasons are persisted.
+- [ ] Reach each automatic stop threshold during an active trial. Confirm no new
+      trial starts, the active trial finishes normally, and only then do writers
+      stop.
+- [ ] Safely force a stuck active trial past the 15-second drain timeout. Confirm
+      that this case alone is marked incomplete/error before best-effort recovery
+      and Stop.
+- [ ] Confirm `streams/trials.jsonl`, `streams/trial_summary.json`, final
+      metadata, and `alignment.json` use the same session ID and canonical
+      timestamp boundary.
+
+## Configuration and animal migration
+
+- [ ] Confirm the maintained version-57 system configuration loads and saves.
+- [ ] Confirm an older version, unknown key, retired tunnel/load-cell field,
+      `recordToAcquisition`, and old shift `targetX/Y/Z` fields are rejected with
+      actionable errors.
+- [ ] Load a copy of a current v4 animal and save it. Confirm the original bytes
+      are retained as `.json.v4-backup`, the active file is v5, identity/pellet
+      coordinates/limits/selected protocol are preserved, and protocol progress
+      starts at zero.
+- [ ] Confirm v0-v3, no-ID, and unknown animal versions are rejected and v5
+      round-trips without day/total or auto-clamp fields.
 
 ## Abort behavior
 
@@ -175,18 +221,18 @@ fixes. Repeat the applicable tests below against the current commit.
 - [ ] Confirm all session writers stop and release their files.
 - [ ] Confirm analysis never starts for the aborted session, or is completely
       cancelled if already scheduled.
-- [ ] Confirm the entire aborted trial directory and all session data are
-      removed while application-level diagnostic logs outside the trial remain.
+- [ ] Confirm the entire aborted session directory and all session data are
+      removed while application-level diagnostic logs outside the session remain.
 - [ ] Confirm all four behavior counts become zero after Abort.
 - [ ] Confirm healthy previews and unrelated hardware remain active.
 - [ ] Immediately make a new retained recording after abort cleanup and confirm
-      it contains no buffered events or metadata from the aborted trial.
+      it contains no buffered events or metadata from the aborted session.
 
 ## Camera topology and failure isolation
 
 - [ ] Enable only the primary camera. Confirm it can preview independently in
       the effective standalone/free-run role and can record if configuration
-      permits a single-camera trial.
+      permits a single-camera session.
 - [ ] Enable only each secondary camera in turn. Confirm it can preview
       independently when other reach cameras are disabled.
 - [ ] Enable all synchronized reach cameras. Confirm exactly one effective
@@ -200,7 +246,7 @@ fixes. Repeat the applicable tests below against the current commit.
 - [ ] Restore each failed camera using Hardware Refresh. Confirm only the failed
       or blocked domains retry and healthy cameras are not restarted.
 - [ ] Confirm loss of a required camera during Recording aborts only the active
-      trial and does not initiate a global hardware shutdown.
+      session and does not initiate a global hardware shutdown.
 
 ## PXI, NI-DAQ, CAN, and laser failure isolation
 
@@ -218,7 +264,7 @@ fixes. Repeat the applicable tests below against the current commit.
       required-source readiness is updated, and camera/NI preview is unaffected.
 - [ ] Disable laser while NI input remains enabled and confirm NI acquisition
       remains operational.
-- [ ] Induce a safe writer/source failure during Recording. Confirm the trial is
+- [ ] Induce a safe writer/source failure during Recording. Confirm the session is
       rejected or aborted atomically rather than retained as complete.
 
 ## Camera error diagnostics
@@ -271,7 +317,7 @@ fixes. Repeat the applicable tests below against the current commit.
 
 - [ ] Every enabled source records independently of plot visibility.
 - [ ] All enabled synchronized cameras and the NI timeline meet the alignment
-      requirements above across at least three retained trials.
+      requirements above across at least three retained sessions.
 - [ ] Stop retains complete data; Abort leaves no session data and runs no
       analysis.
 - [ ] Hardware failures remain confined to their owning/dependent domains and

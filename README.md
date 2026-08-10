@@ -47,13 +47,15 @@ from the core logic of the applications for two reasons:
 **Current Applications**
 
 * Acquisition Application
-  * The local user interface for integrated camera, head fix, pellet delivery, and pose inference modules
+  * The local user interface for integrated camera, pellet delivery, NI-DAQ,
+    laser, and pose-inference modules
   * `python -m reachAQ.app -c ~/Autotrainer/system_configuration.yaml`
     * The GUI starts idle by default. Use `--start-mode acquiring` only when immediate startup is intentional.
     * Use `--no-live-inference` or `--live-inference` to override the saved inference setting for one run.
     * Hardware startup progress is written to the log and launching terminal as `HARDWARE INIT` records.
     * [Detailed Instructions](tools/acquisition/README.md)
     * [Session recording, synchronization, persistence, and hardware isolation](docs/acquisition/session-recording-and-synchronization.md)
+    * [Recording sessions, pellet trials, protocols, and schema migration](docs/acquisition/session-trials-protocols.md)
     * Use `--random-cameras` to start with software-generated frames when no physical cameras are configured.
   * Headless implementation for command line only
     * `auto-trainer-headless -c ~/Autotrainer/system_configuration.yaml`
@@ -70,8 +72,8 @@ utilities. Run them from the repository root in the configured environment.
 * `scripts/acquire_image.py` - capture and display one frame from a camera URL.
 * `scripts/capture.py` - preview a camera for a selected frame count and
   optionally record images/video.
-* `scripts/list_cameras.py` - list random, OpenCV/USB, Spinnaker, and playback
-  camera URL forms visible to the video layer.
+* `scripts/list_cameras.py` - list random, Spinnaker, and playback camera URL
+  forms visible to the video layer.
 * `scripts/can_console.py` - interactive command interface for supported CAN
   hardware.
 * `scripts/can_measure_counts.py` - decoded message-rate diagnostic using the
@@ -169,8 +171,9 @@ You can also give many at once.
 
 ### autotrainer.device
 
-[Device](auto-trainer-device/README.md) implements the hardware interfaces for most non-camera hardware for both existing
-and legacy hardware.  The primary purpose is to provide a consistent interface to the hardware for applications.
+[Device](auto-trainer-device/README.md) implements the shared interfaces for
+pellet-board, NI-DAQ, laser, and related non-camera hardware. The primary
+purpose is to provide a consistent interface to applications.
 
 
 **Autotrainer Dependencies**
