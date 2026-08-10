@@ -21,14 +21,12 @@ from autotrainer.core import Offset3DTuple, get_perf_now, Motor
 from autotrainer.core.logging import get_verbose_logger
 from autotrainer.core.message import SystemDataArgsKwargs
 
-from autotrainer.core import (SystemStatusMessageKind, SystemCommandKind,
-                              AudioSpectrumData, Offset3DTuple)
+from autotrainer.core import SystemStatusMessageKind, SystemCommandKind, Offset3DTuple
 
 from .motor_steps import MotorSteps
 from .device import Device
 from .emulation_interface import EmulationInterface
 from .device_api import DeviceApi
-from autotrainer.core.analysis.head_fix_measurement import HeadFixMeasurement
 from .can_interface import CanInterface, Target, target_of_motor
 from .can_transport import CanTransportConfiguration, CanTransportKind
 from .device_interface import (
@@ -215,15 +213,6 @@ class CanDevice(Device):
         self._disconnect_lock = threading.Lock()
         self._command_execution_lock = threading.Lock()
         self._shutdown_callback = shutdown_callback
-
-        self._measurement_buffer_count = buffer_size
-        self._measurements: List[HeadFixMeasurement] = []
-
-        self._current_pressure = 0
-        self._current_digital = False
-        self._current_temperature = 0
-        self._current_humidity = 0
-        self._current_audio = []
 
         self._init_default_move_configs()
         self._compound_movement: Optional[List[Dict[str, Any]]] = None
@@ -499,13 +488,6 @@ class CanDevice(Device):
 
         # Initialize data / response handlers lookup table
 
-        def set_current_temp_humidity(m):
-            self._current_temperature = m.temperature_c
-            self._current_humidity = m.humidity_percent
-
-        def set_current_digital(m: MagnetDigitalInputs):
-            self._current_digital = m.continuity_0
-
         def handle_motor_config(m: Union[StepperConfig, ServoConfig]):
             # do we want to:
             #   self._motor_configs[m.motor] = m
@@ -552,19 +534,13 @@ class CanDevice(Device):
             ColorLed: handle_color_led,
             AnalogOutput: _no_op_handler,
 
-            PressureReading: self._handle_pressure_reading,
-            SensorStatus: set_current_temp_humidity,
-
-            MagnetDigitalInputs: set_current_digital,
+            PressureReading: _no_op_handler,
+            SensorStatus: _no_op_handler,
+            MagnetDigitalInputs: _no_op_handler,
 
             PelletDigitalInputs: handle_stimuli_msg,
 
-            AudioData: lambda message: (
-                self._api.send_message(SystemStatusMessageKind.AUDIO_SPECTRUM,
-                                       AudioSpectrumData(when_val=message.when,
-                                                         index_val=message.index,
-                                                         magnitudes_val=message.magnitudes))
-            ),
+            AudioData: _no_op_handler,
 
             StepperStatus: self._report_stepper_status,
 
@@ -1298,24 +1274,6 @@ class CanDevice(Device):
                 handler(message)
             else:
                 logger.warning("Unhandled data type: %s", type(message))
-
-    def _handle_pressure_reading(self, message: PressureReading):
-        """Build measurement batches from the pressure sample clock."""
-        self._current_pressure = message.pressure
-        measurement = HeadFixMeasurement(
-            when=message.timestamp_ns / 1e9,
-            timestamp=message.index,
-            switch=self._current_digital,
-            pressure=self._current_pressure,
-            temperature=self._current_temperature,
-            humidity=self._current_humidity,
-        )
-
-        measures = self._measurements
-        measures.append(measurement)
-        if len(measures) >= self._measurement_buffer_count:
-            self._api.send_message(SystemStatusMessageKind.MEASUREMENTS, measures)
-            self._measurements = []
 
     def _report_stepper_status(self, message: StepperStatus):
         """
