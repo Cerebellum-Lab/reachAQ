@@ -6,6 +6,7 @@ from PySide6.QtWidgets import (QLabel, QWidget, QVBoxLayout,
                                QHBoxLayout, QStackedLayout, QGridLayout, QPushButton, QSizePolicy)
 
 from autotrainer.inference.analysis import IntersessionResponse
+from autotrainer.inference import InferenceStatus
 from autotrainer.behavior.behavior_algorithm import BehaviorAlgoProps
 from autotrainer.behavior.pellet_shift import ShiftXYZHandler
 from autotrainer.pyside import CardWidget, QSwitch
@@ -17,6 +18,12 @@ from tools.acquisition.model.app_model import AppModel
 from tools.acquisition.model.app_model_status import SessionRecordingStatus
 from tools.acquisition.model.inference_model import InferenceModel
 from tools.acquisition.model.behavior_model import BehaviorModel
+
+
+def inference_status_display(value) -> str:
+    if value == InferenceStatus.intersession:
+        return "Post-session analysis"
+    return str(value)
 
 
 class BehaviorContent(ContentWidget):
@@ -192,7 +199,9 @@ class BehaviorContent(ContentWidget):
 
         self.setLayout(layout)
 
-        self._inference_status.setText(f"Inference: {inference_model.status}")
+        self._inference_status.setText(
+            f"Inference: {inference_status_display(inference_model.status)}"
+        )
         self._intersession_toggle.setChecked(behavior_model.algorithm.intersession_enabled)
 
         self._inference_model_property_changed("model_location", inference_model.model_location, None)
@@ -272,7 +281,9 @@ class BehaviorContent(ContentWidget):
         if name == props.IS_ENABLED:
             self._intersession_toggle.setEnabled(value)
         elif name == props.STATUS:
-            self.status_changed.emit(f"Inference: {value}")
+            self.status_changed.emit(
+                f"Inference: {inference_status_display(value)}"
+            )
         elif name == props.MODEL_LOCATION:
             if value is not None and len(value) > 0:
                 self._model_location_label.setText(value)

@@ -10,6 +10,7 @@ from autotrainer.inference import PoseLocation, PoseResponse
 from autotrainer.pyside import PGWidget
 from autotrainer.pyside.content_widget import ContentWidget
 from tools.acquisition.view import main_content as main_content_module
+from tools.acquisition.view.behavior_content import inference_status_display
 from tools.acquisition.view.main_content import MainContent
 from tools.acquisition.view.main_window import _allow_bidirectional_window_resizing
 from tools.acquisition.view.persistent_splitter import PersistentSplitter
@@ -21,6 +22,14 @@ def qapp():
     if app is None:
         app = QApplication([])
     return app
+
+
+def test_post_session_inference_status_uses_operator_wording():
+    from autotrainer.inference import InferenceStatus
+
+    assert inference_status_display(InferenceStatus.intersession) == (
+        "Post-session analysis"
+    )
 
 
 def test_persistent_splitter_restores_user_sizes(qapp, user_pref):

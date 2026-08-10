@@ -3877,7 +3877,7 @@ class AppModel(ObservableObject):
             parts.append(f"Inference: {cur_inf_status}")
         cur_inter_state = self._behavior.system_machine.intersession.state
         if cur_inter_state != IntersessionState.idle:
-            parts.append(f"Intersession: {cur_inter_state}")
+            parts.append(f"Post-session analysis: {cur_inter_state}")
         text_overlay = None if len(parts) == 0 else "\n".join(parts)
         for camera in self._reach_cameras:
             camera.text_overlay = text_overlay
