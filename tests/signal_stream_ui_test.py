@@ -695,10 +695,7 @@ def test_analysis_uses_active_screen_refresh_rate_for_timer_and_chunk(qapp):
 
 def test_signal_monitor_has_no_analysis_stream_persistence(tmp_path):
     monitor = NidaqSignalMonitorModel()
-    monitor._configuration = dataclasses.replace(
-        _stream_configuration(),
-        record_to_acquisition=True,
-    )
+    monitor._configuration = _stream_configuration()
     monitor.project = SimpleNamespace(
         get_source_path=lambda _name: (_ for _ in ()).throw(
             AssertionError("visualization stream must not request an output path")

@@ -33,11 +33,7 @@ class _ShiftXYZBufferHandlerConfig:
 
 @dataclasses.dataclass
 class ShiftXYZBufferHandlerConfig(_ShiftXYZBufferHandlerConfig):
-
-    def __init__(self, **kwargs):
-        for c in "xyz":
-            kwargs.pop(f"target_{c}", None)  # old config
-        super().__init__(**kwargs)
+    pass
 
 
 @dataclasses.dataclass

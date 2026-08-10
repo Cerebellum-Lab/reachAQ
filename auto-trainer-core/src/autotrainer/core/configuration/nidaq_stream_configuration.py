@@ -47,13 +47,9 @@ class NidaqSignalStreamConfiguration:
     sample_rate_hz: float = 10000.0
     read_chunk_size: int = 500
     rolling_window_seconds: float = 10.0
-    # Both fields are retained only so older YAML configurations continue to
-    # load. Persistence now follows the complete acquisition channel set and
-    # these legacy recording controls are ignored.
-    record_to_acquisition: bool = False
-    output_name: str = "nidaq_signals"
-    # None identifies legacy configuration and adopts all acquisition channels as
-    # the initial display selection. An empty tuple intentionally plots nothing.
+    # Plot selection is independent of acquisition and persistence. ``None``
+    # selects every configured channel by default; an empty tuple intentionally
+    # plots nothing. All configured channels are still read and written.
     display_channels: Optional[Tuple[str, ...]] = None
 
     def __post_init__(self):
@@ -82,8 +78,6 @@ class NidaqSignalStreamConfiguration:
                 "NI-DAQ display channels are not present in the acquisition plan: "
                 + ", ".join(unknown_display_channels)
             )
-        if not self.output_name:
-            raise ValueError("NI-DAQ stream output_name must be provided")
 
     @classmethod
     def from_channels(
@@ -94,8 +88,6 @@ class NidaqSignalStreamConfiguration:
         sample_rate_hz: float = 10000.0,
         read_chunk_size: int = 500,
         rolling_window_seconds: float = 10.0,
-        record_to_acquisition: bool = False,
-        output_name: str = "nidaq_signals",
         display_channels: Optional[Iterable[str]] = None,
     ) -> "NidaqSignalStreamConfiguration":
         return cls(
@@ -104,8 +96,6 @@ class NidaqSignalStreamConfiguration:
             sample_rate_hz=sample_rate_hz,
             read_chunk_size=read_chunk_size,
             rolling_window_seconds=rolling_window_seconds,
-            record_to_acquisition=record_to_acquisition,
-            output_name=output_name,
             display_channels=(
                 None if display_channels is None else tuple(display_channels)
             ),

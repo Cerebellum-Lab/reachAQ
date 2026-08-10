@@ -10,10 +10,38 @@ from autotrainer.core import (
     Offset3DTuple,
 )
 from autotrainer.core.configuration import (
+    NidaqSignalStreamConfiguration,
     SystemConfigurationDumper,
     SystemConfigurationLoader,
 )
-from autotrainer.core.configuration.behavior_configuration import PelletDeliveryConfiguration
+from autotrainer.core.configuration.behavior_configuration import (
+    PelletDeliveryConfiguration,
+    ShiftXYZBufferHandlerConfig,
+)
+
+
+@pytest.mark.parametrize(
+    ("constructor", "kwargs", "retired_name"),
+    (
+        (
+            NidaqSignalStreamConfiguration,
+            {"record_to_acquisition": True},
+            "record_to_acquisition",
+        ),
+        (
+            ShiftXYZBufferHandlerConfig,
+            {"target_x": 1.0},
+            "target_x",
+        ),
+    ),
+)
+def test_current_configuration_rejects_retired_fields(
+    constructor,
+    kwargs,
+    retired_name,
+):
+    with pytest.raises(TypeError, match=retired_name):
+        constructor(**kwargs)
 
 def test_same_version_unknown_attribute_raise():
     config_text = f"""
