@@ -370,7 +370,11 @@ def machine(project_info, pellet_device, inference, sensor_analysis, monkeypatch
     algo.session_minimum_duration = 0  # needed for most current tests
     # might be needed to reset:
     algo.capture_status = CaptureProcessStatus.RUNNING
-    algo.status = BehaviorAlgoStatus.ANIMAL_IN_TRAINING
+    algo.status = BehaviorAlgoStatus.RUNNING
+    # State-machine unit tests exercise individual transitions without building
+    # a complete recording session. Session-bound automation gating is covered
+    # separately by behavior_algo_test.
+    monkeypatch.setattr(algo, "_pellet_automation_enabled_for_session", lambda: True)
     machine.pellet.state = PelletState.monitoring  # force monitoring for current tests
     return machine
 

@@ -52,7 +52,7 @@ class TestStatus:
         else:
             assert isinstance(algo_status, BehaviorAlgoStatus)
             expected = (
-                BehaviorAlgoStatus.ACQUIRING
+                BehaviorAlgoStatus.RUNNING
                 if app_model_status is AppModelStatus.RUNNING
                 else BehaviorAlgoStatus.IDLE
             )

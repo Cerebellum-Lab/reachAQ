@@ -199,7 +199,7 @@ _app_model_status_valid_targets = {
 
 _to_behavior_algo_status = {
     AppModelStatus.IDLE: BehaviorAlgoStatus.IDLE,
-    AppModelStatus.RUNNING: BehaviorAlgoStatus.ACQUIRING,
+    AppModelStatus.RUNNING: BehaviorAlgoStatus.RUNNING,
 }
 
 

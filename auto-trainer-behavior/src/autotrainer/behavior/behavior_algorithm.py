@@ -159,9 +159,7 @@ def _relay_func(func, *, wait: bool=_DEFAULT_ALGO_HANDLER_THREAD_CALL_SYNC_WAIT_
 
 class BehaviorAlgoStatus(str, enum.Enum):
     IDLE = "idle"  # nothing running
-    ACQUIRING = "acquiring"  # camera + system running, but without animal-in-device
-    ANIMAL_IN_DEVICE = "animal_in_device"  # this is ACQUIRING with animal-in-device
-    ANIMAL_IN_TRAINING = "animal_in_training"  # this is ANIMAL_IN_DEVICE with training behavior algo **enabled**
+    RUNNING = "running"
 
 
 class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
@@ -1144,14 +1142,12 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
         self._pellet_automation_stop_requested = bool(value)
 
     def _pellet_automation_enabled_for_session(self) -> bool:
-        configured = (
+        return (
+            not self._pellet_automation_stop_requested
+            and
             self._active_config.session_control.automatic_pellet_cycles_enabled
             and self._is_in_session
             and self._capture_status == CaptureProcessStatus.RECORDING
-        )
-        legacy_training = self._status is BehaviorAlgoStatus.ANIMAL_IN_TRAINING
-        return not self._pellet_automation_stop_requested and (
-            configured or legacy_training
         )
 
     #

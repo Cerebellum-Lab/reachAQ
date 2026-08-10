@@ -1391,7 +1391,7 @@ class MainWindow(QMainWindow):
         def do_sleep():
             time.sleep(random.uniform(step_sleep, 3 * step_sleep))
         for sess_idx in range(n_sessions):
-            if algo.status != BehaviorAlgoStatus.ANIMAL_IN_TRAINING:
+            if algo.status != BehaviorAlgoStatus.RUNNING:
                 return
             print("starting new simulate session")
             app.start_recording()
@@ -1406,7 +1406,7 @@ class MainWindow(QMainWindow):
                 print("wait monitoring")
                 t_end = time.perf_counter() + 15
                 while pellet_m.state != PelletState.monitoring:
-                    if algo.status != BehaviorAlgoStatus.ANIMAL_IN_TRAINING:
+                    if algo.status != BehaviorAlgoStatus.RUNNING:
                         return
                     time.sleep(0.1)
                     if algo.system_state == SystemState.intersession:
@@ -1431,7 +1431,7 @@ class MainWindow(QMainWindow):
                         if pellet_m.covered_state is False:
                             print("is released")
                             break
-                        if algo.status != BehaviorAlgoStatus.ANIMAL_IN_TRAINING:
+                        if algo.status != BehaviorAlgoStatus.RUNNING:
                             return
                         if time.perf_counter() > t_end:
                             break
@@ -1443,7 +1443,7 @@ class MainWindow(QMainWindow):
                 print("waiting pellet monitoring or retract")
                 while pellet_m.state not in {PelletState.monitoring, PelletState.retract}:
                     time.sleep(0.05)
-                    if algo.status != BehaviorAlgoStatus.ANIMAL_IN_TRAINING:
+                    if algo.status != BehaviorAlgoStatus.RUNNING:
                         return
                     if infe.status in {
                         InferenceStatus.stopped,
