@@ -69,6 +69,8 @@ class SessionDataRecorder:
         self._nidaq_thread: Optional[threading.Thread] = None
         self._source_manifest = ()
         self._source_results = {}
+        self._trial_records = ()
+        self._trial_summary = {}
 
         self._system_message_handler = system_message_handler
         self._hardware_model = hardware_model
@@ -97,6 +99,8 @@ class SessionDataRecorder:
             self._nidaq_last_index = None
             self._source_manifest = tuple(source_manifest)
             self._source_results = {}
+            self._trial_records = ()
+            self._trial_summary = {}
             self._start_perf = None
             self._start_wall = None
             self._boundary = None
@@ -152,6 +156,8 @@ class SessionDataRecorder:
             timing_plan = self._nidaq_monitor.timing_plan
             source_manifest = self._source_manifest
             source_results = dict(self._source_results)
+            trial_records = tuple(self._trial_records)
+            trial_summary = dict(self._trial_summary)
             self._clear_locked()
         return self._write_session(
             project,
@@ -167,6 +173,8 @@ class SessionDataRecorder:
             source_manifest=source_manifest,
             source_results=source_results,
             boundary=boundary,
+            trial_records=trial_records,
+            trial_summary=trial_summary,
         )
 
     def abort(self) -> None:
@@ -219,6 +227,14 @@ class SessionDataRecorder:
                 "failure": str(failure or ""),
             }
 
+    def set_trial_ledger(self, records, summary) -> None:
+        """Snapshot the authoritative trial ledger for the current session."""
+        with self._lock:
+            if not self._armed:
+                return
+            self._trial_records = tuple(dict(record) for record in records)
+            self._trial_summary = dict(summary)
+
     def _clear_locked(self) -> None:
         self._armed = False
         self._project = None
@@ -232,6 +248,8 @@ class SessionDataRecorder:
         self._nidaq_last_index = None
         self._source_manifest = ()
         self._source_results = {}
+        self._trial_records = ()
+        self._trial_summary = {}
 
     def _on_device_message(
         self,
@@ -472,6 +490,8 @@ class SessionDataRecorder:
         source_manifest=(),
         source_results=None,
         boundary: Optional[SessionBoundary] = None,
+        trial_records=(),
+        trial_summary=None,
     ):
         session_dir = Path(project.get_session_path().location)
         streams_dir = session_dir / "streams"
@@ -506,6 +526,19 @@ class SessionDataRecorder:
         tone_confirmation = SessionDataRecorder._correlate_tone_confirmations(
             device_rows,
             nidaq_chunks,
+        )
+        trial_records = tuple(
+            dict(record)
+            for record in trial_records
+            if start_perf <= float(record["send_perf_time"]) <= end_perf
+        )
+        for record in trial_records:
+            record["send_offset_seconds"] = (
+                float(record["send_perf_time"]) - start_perf
+            )
+        trial_perf = tuple(
+            float(record["send_perf_time"])
+            for record in trial_records
         )
 
         SessionDataRecorder._write_csv(
@@ -548,6 +581,16 @@ class SessionDataRecorder:
                 ) in device_rows
             ),
         )
+        SessionDataRecorder._write_json_lines(
+            streams_dir / "trials.jsonl",
+            trial_records,
+        )
+        with (streams_dir / "trial_summary.json").open(
+            "w",
+            encoding="utf-8",
+        ) as stream:
+            json.dump({} if trial_summary is None else trial_summary, stream, indent=2)
+            stream.write("\n")
         SessionDataRecorder._write_csv(
             streams_dir / "laser.csv",
             ("perf_time", "offset_seconds", "wall_time", "event", "channel", "source",
@@ -611,6 +654,7 @@ class SessionDataRecorder:
             device_perf=tuple(row[0] for row in device_rows),
             laser_perf=tuple(row[0] for row in laser_rows),
             log_perf=tuple(row[0] for row in log_rows),
+            trial_perf=trial_perf,
             nidaq_perf=nidaq_perf,
             nidaq_chunks=nidaq_chunks,
             device_event_overruns=device_event_overruns,
@@ -684,6 +728,12 @@ class SessionDataRecorder:
                     start_perf,
                     "time.perf_counter",
                 ),
+                "trials": SessionDataRecorder._alignment_entry(
+                    "trials.jsonl",
+                    trial_perf,
+                    start_perf,
+                    "pellet send dispatch on time.perf_counter",
+                ),
             },
             "nidaqTiming": (
                 None if timing_plan is None else dataclasses.asdict(timing_plan)
@@ -718,6 +768,7 @@ class SessionDataRecorder:
         device_perf,
         laser_perf,
         log_perf,
+        trial_perf,
         nidaq_perf,
         nidaq_chunks,
         device_event_overruns,
@@ -737,6 +788,7 @@ class SessionDataRecorder:
             ),
             "laser_outputs": (laser_perf, 0, 0),
             "session_logs": (log_perf, 0, 0),
+            "trials": (trial_perf, 0, 0),
         }
         finalized = []
         for raw_source in source_manifest:
@@ -1160,6 +1212,13 @@ class SessionDataRecorder:
             writer = csv.writer(stream)
             writer.writerow(header)
             writer.writerows(rows)
+
+    @staticmethod
+    def _write_json_lines(path: Path, records) -> None:
+        with path.open("w", encoding="utf-8") as stream:
+            for record in records:
+                json.dump(record, stream, sort_keys=True)
+                stream.write("\n")
 
     @staticmethod
     def _write_nidaq(

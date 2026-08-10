@@ -521,3 +521,76 @@ def test_enabled_source_manifest_contains_final_paths_counts_and_health(
     assert manifest["nidaq.barcode"]["overrunCount"] == 4
     assert manifest["device"]["sampleCount"] == 0
     assert manifest["device"]["persistenceStatus"] == "written"
+
+
+def test_trial_ledger_is_written_on_the_canonical_session_timeline(tmp_path):
+    project = ProjectInfo(
+        root=str(tmp_path),
+        device_id="test",
+        when=datetime(2026, 1, 2, 3, 4, 5),
+        session=6,
+    )
+    records = (
+        {
+            "session_id": project.short_id,
+            "operation_id": "send-1",
+            "trial_id": 10,
+            "attempt_id": 1,
+            "attempt_label": "10.1",
+            "send_perf_time": 10.25,
+            "send_wall_time": 100.25,
+            "send_ack_perf_time": 10.5,
+            "outcome": "success",
+        },
+        {
+            "session_id": project.short_id,
+            "operation_id": "outside",
+            "trial_id": 11,
+            "attempt_id": 1,
+            "attempt_label": "11.1",
+            "send_perf_time": 12.1,
+            "send_wall_time": 102.1,
+            "outcome": "incomplete",
+        },
+    )
+    summary = {
+        "physical_attempts": 1,
+        "trials_completed": 1,
+    }
+
+    result = SessionDataRecorder._write_session(
+        project,
+        10.0,
+        100.0,
+        12.0,
+        (),
+        (),
+        (),
+        (),
+        source_manifest=({
+            "id": "trials",
+            "kind": "pellet_trial_ledger",
+            "path": "streams/trials.jsonl",
+            "runtimeState": "ready",
+        },),
+        trial_records=records,
+        trial_summary=summary,
+    )
+
+    streams = tmp_path / "20260102" / "test" / "trial006" / "streams"
+    written = tuple(
+        json.loads(line)
+        for line in (streams / "trials.jsonl").read_text().splitlines()
+    )
+    assert len(written) == 1
+    assert written[0]["attempt_label"] == "10.1"
+    assert written[0]["send_offset_seconds"] == 0.25
+    assert json.loads((streams / "trial_summary.json").read_text()) == summary
+
+    alignment = json.loads((streams / "alignment.json").read_text())
+    assert alignment["streams"]["trials"]["sampleCount"] == 1
+    assert alignment["streams"]["trials"]["firstOffsetSeconds"] == 0.25
+    trial_source = result["enabledSources"][0]
+    assert trial_source["id"] == "trials"
+    assert trial_source["sampleCount"] == 1
+    assert trial_source["persistenceStatus"] == "written"
