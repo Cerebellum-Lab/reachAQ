@@ -78,7 +78,8 @@ utilities. Run them from the repository root in the configured environment.
   camera URL forms visible to the video layer.
 * `scripts/can_console.py` - interactive command interface for supported CAN
   hardware.
-* `scripts/can_measure_counts.py` - legacy JerryCAN message-rate diagnostic.
+* `scripts/can_measure_counts.py` - decoded message-rate diagnostic using the
+  same environment-selected CAN transport as reachAQ.
 * `scripts/load_dlc_model.py` - load a DeepLabCut model and print its body-part
   metadata.
 * `scripts/run_dlc_model.py` - run a DeepLabCut model against paired recorded

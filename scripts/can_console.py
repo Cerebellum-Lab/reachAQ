@@ -344,7 +344,7 @@ def run_monitor():
     mon_thread = Thread(target=monitor_message_queue, args=(msg_queue,))
     mon_thread.start()
 
-    can_dev = CanDevice()
+    can_dev = CanDevice(required_targets=(Target.PELLET_DEVICE,))
     device_connection = DeviceConnection(can_dev, msg_queue)
 
     device_connection.request_connect()
@@ -758,7 +758,6 @@ def main():
 
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("can", help="the can id", type=int, default=1)
     parser.add_argument("-o", "--output", help="and output file to record measurements")
     parser.add_argument("-p", "--perf",
                         help="performance measurement with specified number of samples",
