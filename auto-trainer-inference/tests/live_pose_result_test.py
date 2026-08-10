@@ -64,7 +64,7 @@ def inference_data_proc(pose_algo, capture_multiprocess_logs, monkeypatch, caplo
     })
 
     proc = InferenceMonitorDataProc(
-        project=ProjectInfo(),
+        project=ProjectInfo(camera_names=("left", "right")),
         pose_data_queue=multiprocessing.Queue(),
         cmd_queue=multiprocessing.Queue(),
         msg_queue=multiprocessing.Queue(),
@@ -77,8 +77,14 @@ def inference_data_proc(pose_algo, capture_multiprocess_logs, monkeypatch, caplo
         (proc.Msg.SET_POSE_ALGO, (pose_algo,), None)
     )
     yield proc  # noqa
-    proc.terminate()
+    # Let the monitor process stop its live workers before falling back to a
+    # hard termination. Terminating the parent first leaves its workers
+    # orphaned and can make subsequent inference tests appear to hang.
+    proc._cmd_queue.put(None)
     proc.join(3)
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(3)
 
 
 def test_live_no_recording(inference_data_proc):
@@ -146,4 +152,3 @@ def test_renew_workers(request, monkeypatch, caplog, capture_multiprocess_logs):
             seq_nr = pose_rsp.sequence
         assert pose_rsp.sequence == seq_nr
         seq_nr += 1
-
