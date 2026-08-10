@@ -1,11 +1,17 @@
 import math
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 
-from autotrainer.core import EventManager, SystemStatusMessageKind
+from autotrainer.core import (
+    EventManager,
+    NidaqSignalChannelConfiguration,
+    NidaqSignalStreamConfiguration,
+    SystemStatusMessageKind,
+)
 from autotrainer.core.capture import CaptureProcessStatus
 from autotrainer.core.configuration.persistence_configuration import PersistenceConfiguration
 from autotrainer.behavior.behavior_algorithm import BehaviorAlgoStatus
@@ -125,6 +131,65 @@ def test_startup_project_exists_before_periodic_status_is_published(app_model):
 
 def test_default_output_path_uses_canonical_lowercase_directory():
     assert PersistenceConfiguration.DEFAULT_OUTPUT_PATH == Path("~/Documents/rawdatalocal")
+
+
+def test_session_manifest_includes_enabled_streams_independent_of_plot_selection(
+    app_model,
+):
+    channels = (
+        NidaqSignalChannelConfiguration(
+            "barcode",
+            "InputCard/port0/line1",
+            kind="digital",
+        ),
+        NidaqSignalChannelConfiguration(
+            "tone1",
+            "InputCard/port0/line2",
+            kind="digital",
+        ),
+        NidaqSignalChannelConfiguration(
+            "laser_feedback",
+            "InputCard/ai0",
+        ),
+    )
+    app_model._nidaq_signal_monitor = SimpleNamespace(
+        hardware_enabled=True,
+        configuration=NidaqSignalStreamConfiguration(
+            channels=channels,
+            is_enabled=True,
+            display_channels=(),
+        ),
+    )
+    app_model._inference = SimpleNamespace(is_enabled=True)
+    app_model._hardware = SimpleNamespace(requires_connection=True)
+    app_model._laser = SimpleNamespace(
+        configuration=SimpleNamespace(backend="nidaq"),
+    )
+    app_model._get_recording_cams = lambda: (
+        SimpleNamespace(
+            name="left",
+            camera_source=SimpleNamespace(url="spinnaker://left"),
+        ),
+    )
+
+    manifest = {
+        source["id"]: source
+        for source in app_model._build_session_source_manifest()
+    }
+
+    assert tuple(manifest) == (
+        "camera.left",
+        "pose",
+        "nidaq.barcode",
+        "nidaq.tone1",
+        "nidaq.laser_feedback",
+        "device",
+        "laser_outputs",
+        "session_logs",
+    )
+    assert manifest["nidaq.barcode"]["binding"] == "InputCard/port0/line1"
+    assert manifest["nidaq.tone1"]["path"] == "streams/nidaq.h5"
+    assert manifest["nidaq.laser_feedback"]["kind"] == "nidaq_analog"
 
 
 def test_abort_removes_whole_session_and_resets_counts(app_model):
