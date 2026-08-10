@@ -28,3 +28,13 @@ from .laser import (LaserCalibrationPoint, LaserCalibrationRamp, LaserChannelCon
                     normalize_laser_channel_id)
 from .nidaq_laser import NidaqLaserController
 from .nidaq_signal_stream import NidaqSignalSampleBlock, NidaqSignalStreamController
+from .rfid_reader import (
+    DEFAULT_RFID_DEVICE,
+    RfidDuplicateSuppressor,
+    RfidFrameParser,
+    RfidReaderService,
+    RfidReaderState,
+    RfidReaderStatus,
+    RfidTagRead,
+    make_rfid_frame,
+)

@@ -19,6 +19,9 @@ dynamic = ["version"]
 dependencies = [
     "auto-trainer-core",
 
+    # FTDI-backed RFID reader transport. Imported lazily by the reader service.
+    'pyserial >= 3.5, < 4',
+
     'pyyaml >= 6.0.2, < 7',
 
     # CAN communication with the pellet board:
