@@ -436,7 +436,6 @@ class SystemMachine(StateMachine):
 
         elif name == props.ALGO_PAUSED:
             algo = self._algorithm
-            self.cancel_timers()
             if new_value:
                 if algo.status != BehaviorAlgoStatus.IDLE:
                     with algo.set_allow_reentrant(True):

@@ -93,7 +93,7 @@ def main():
     # Headless operation still starts acquisition by default; an idle headless
     # process has no UI from which acquisition can subsequently be started.
     from tools.acquisition.model.app_model_status import AppModelStatus
-    parser = make_autotrainer_parser(default_start_mode=AppModelStatus.ACQUIRING)
+    parser = make_autotrainer_parser(default_start_mode=AppModelStatus.RUNNING)
 
     args = parser.parse_args()
 

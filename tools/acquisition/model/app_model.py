@@ -180,45 +180,27 @@ def app_status_to_behavior_algo_status(self: AppModelStatus) -> Optional[Behavio
 
 _app_model_status_2_api_app_mode = {
     AppModelStatus.IDLE: ApiApplicationMode.IDLE,
-    AppModelStatus.ACQUIRING: ApiApplicationMode.RUNNING,
+    AppModelStatus.RUNNING: ApiApplicationMode.RUNNING,
     AppModelStatus.CALIBRATION_3D: ApiApplicationMode.CALIBRATION_3D,
     AppModelStatus.CALIBRATION_DCS: ApiApplicationMode.CALIBRATION_DCS,
-    AppModelStatus.ANIMAL_IN_DEVICE: ApiApplicationMode.IN_DEVICE,
-    AppModelStatus.ANIMAL_IN_TRAINING: ApiApplicationMode.IN_TRAINING,
 }
 
 _app_model_status_valid_targets = {
     AppModelStatus.IDLE: {
-        AppModelStatus.ACQUIRING,
+        AppModelStatus.RUNNING,
         AppModelStatus.CALIBRATION_3D,
-        AppModelStatus.ANIMAL_IN_DEVICE,
-        AppModelStatus.ANIMAL_IN_TRAINING,
     },
-    AppModelStatus.ACQUIRING: {
+    AppModelStatus.RUNNING: {
         AppModelStatus.IDLE,
         AppModelStatus.CALIBRATION_DCS,
-        AppModelStatus.ANIMAL_IN_DEVICE,
-        AppModelStatus.ANIMAL_IN_TRAINING,
-    },
-    AppModelStatus.ANIMAL_IN_DEVICE: {
-        AppModelStatus.IDLE,
-        AppModelStatus.ACQUIRING,
-        AppModelStatus.ANIMAL_IN_TRAINING,
-    },
-    AppModelStatus.ANIMAL_IN_TRAINING: {
-        AppModelStatus.ANIMAL_IN_DEVICE,
-        AppModelStatus.ACQUIRING,
-        AppModelStatus.IDLE,
     },
     AppModelStatus.CALIBRATION_3D: {AppModelStatus.IDLE},
-    AppModelStatus.CALIBRATION_DCS: {AppModelStatus.ACQUIRING, AppModelStatus.IDLE},
+    AppModelStatus.CALIBRATION_DCS: {AppModelStatus.RUNNING, AppModelStatus.IDLE},
 }
 
 _to_behavior_algo_status = {
     AppModelStatus.IDLE: BehaviorAlgoStatus.IDLE,
-    AppModelStatus.ACQUIRING: BehaviorAlgoStatus.ACQUIRING,
-    AppModelStatus.ANIMAL_IN_DEVICE: BehaviorAlgoStatus.ANIMAL_IN_DEVICE,
-    AppModelStatus.ANIMAL_IN_TRAINING: BehaviorAlgoStatus.ANIMAL_IN_TRAINING,
+    AppModelStatus.RUNNING: BehaviorAlgoStatus.ACQUIRING,
 }
 
 
@@ -1078,11 +1060,6 @@ class AppModel(ObservableObject):
             valid = app_status_is_target_status_valid(current_status, target)
             if not valid:
                 raise InvalidTargetAppModelStatus(f"New status {target} not valid for current status {current_status}")
-        if target == AppModelStatus.ANIMAL_IN_TRAINING:
-            dcs_cfg = self._behavior.algorithm.diamond_triangle_config
-            valid_dcs = dcs_cfg is not None and dcs_cfg.fully_valid
-            if not valid_dcs:
-                raise InvalidTargetAppModelStatus("Cannot change to ANIMAL_IN_TRAINING without valid DCS")
 
     def is_target_status_valid(self, target: AppModelStatus) -> bool:
         try:
@@ -1106,7 +1083,7 @@ class AppModel(ObservableObject):
         if algo_status is not None:
             self._behavior.algorithm.status = algo_status
         self.property_changed(self.Props.STATUS, status, prev)
-        is_from_start = status in {AppModelStatus.ACQUIRING, AppModelStatus.IDLE}
+        is_from_start = status in {AppModelStatus.RUNNING, AppModelStatus.IDLE}
         for cam in self._cameras:
             # NB: using is_triggered=None to ensure same state is kept in process side,
             # see: VideoRecord._disable_record()
@@ -3065,7 +3042,7 @@ class AppModel(ObservableObject):
     def capture_start(
         self,
         *,
-        target_status: AppModelStatus = AppModelStatus.ACQUIRING,
+        target_status: AppModelStatus = AppModelStatus.RUNNING,
         wait_connected: bool = True,
     ) -> bool:
         """Request to start the acquisition"""
@@ -3814,8 +3791,6 @@ class AppModel(ObservableObject):
         if self._inference is not None:
             # fully terminate inference, which keeps a background process alive between different stop/start
             self._inference.terminate()
-
-        self._behavior.system_machine.cancel_timers()
 
         # also fully close cameras now:
         for camera in self._cameras:

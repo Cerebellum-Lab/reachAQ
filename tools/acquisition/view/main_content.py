@@ -208,7 +208,6 @@ class MainContent(ContentWidget):
 
         # finally, register handlers to events:
         app_model.property_changed += self._model_property_changed
-        app_model.hardware.property_changed += self._hardware_model_property_changed
         app_model.configuration_loaded_event += self._on_config_loaded
         #
         inference = app_model.inference

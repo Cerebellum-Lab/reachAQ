@@ -47,7 +47,12 @@ class TestStatus:
             assert algo_status is None
         else:
             assert isinstance(algo_status, BehaviorAlgoStatus)
-            assert algo_status.name == app_model_status.name
+            expected = (
+                BehaviorAlgoStatus.ACQUIRING
+                if app_model_status is AppModelStatus.RUNNING
+                else BehaviorAlgoStatus.IDLE
+            )
+            assert algo_status is expected
 
 
 def test_it_drain_record_stop_sema_on_session_recording_start(app_model):

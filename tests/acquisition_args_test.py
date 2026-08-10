@@ -17,6 +17,6 @@ def test_live_inference_cli_overrides():
 
 
 def test_headless_can_keep_acquiring_default():
-    args = make_autotrainer_parser(default_start_mode=AppModelStatus.ACQUIRING).parse_args([])
+    args = make_autotrainer_parser(default_start_mode=AppModelStatus.RUNNING).parse_args([])
 
-    assert args.start_mode is AppModelStatus.ACQUIRING
+    assert args.start_mode is AppModelStatus.RUNNING

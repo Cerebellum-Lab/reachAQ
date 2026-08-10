@@ -15,7 +15,6 @@ from autotrainer.pyside import QCaptureView
 from autotrainer.pyside.content_widget import ContentWidget, invoke_method
 
 from tools.acquisition.model.app_model import AppModel
-from tools.acquisition.model.app_model_status import AppModelStatus
 from tools.acquisition.model.video_capture_model import VideoCaptureModel
 
 logger = get_verbose_logger(__name__)
@@ -91,8 +90,7 @@ class CameraContent(ContentWidget):
 
     @invoke_method
     def set_is_capture_active(self, is_active: bool):
-        self._capture_view.set_is_capture_active(
-            is_active and self._app_model.status == AppModelStatus.ANIMAL_IN_TRAINING)
+        self._capture_view.set_is_capture_active(is_active)
 
     @invoke_method
     def update_image(self):

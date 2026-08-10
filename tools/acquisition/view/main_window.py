@@ -324,8 +324,6 @@ class MainWindow(QMainWindow):
             self._status_label.setStyleSheet("font-weight: 600; color: #b00020;")
             self.running_status_changed.emit(False)
         self.run_action.setEnabled(True)
-        self.animal_in_device_action.setEnabled(True)
-        self.animal_in_training_action.setEnabled(True)
         self._app_model_status_combo.setEnabled(True)
 
     @invoke_method
@@ -334,13 +332,11 @@ class MainWindow(QMainWindow):
         self.running_status_changed.emit(False)
         self._restore_system_mode()
         self.run_action.setEnabled(True)
-        self.animal_in_device_action.setEnabled(True)
-        self.animal_in_training_action.setEnabled(True)
         self._app_model_status_combo.setEnabled(True)
         self._clear_startup_message()
         self._acquisition_started = False
 
-    def _on_capture_start_stop(self, is_toggled, *, target_status: AppModelStatus = AppModelStatus.ACQUIRING):
+    def _on_capture_start_stop(self, is_toggled, *, target_status: AppModelStatus = AppModelStatus.RUNNING):
         app_model = self._app_model
         if is_toggled and self.edit_camera_settings_action.isChecked():
             self.edit_camera_settings_action.blockSignals(True)
@@ -352,8 +348,6 @@ class MainWindow(QMainWindow):
         self.edit_daq_ports_action.setEnabled(False)
         self.make_3d_calib_action.setEnabled(False)
         self.refresh_hardware_action.setEnabled(False)
-        self.animal_in_device_action.setEnabled(False)
-        self.animal_in_training_action.setEnabled(False)
         self._app_model_status_combo.setEnabled(False)
         if is_toggled:
             self.running_status_changed.emit(True)
@@ -416,8 +410,6 @@ class MainWindow(QMainWindow):
         self.refresh_hardware_action.setEnabled(False)
         if not retry_running:
             self.run_action.setEnabled(False)
-            self.animal_in_device_action.setEnabled(False)
-            self.animal_in_training_action.setEnabled(False)
             self._app_model_status_combo.setEnabled(False)
         self._status_label.setText(
             "Retrying failed hardware..." if retry_running else "Refreshing hardware..."
@@ -463,8 +455,6 @@ class MainWindow(QMainWindow):
         )
         can_start = not self._app_model.acquisition_started and self._app_model.status == AppModelStatus.IDLE
         self.run_action.setEnabled(can_start)
-        self.animal_in_device_action.setEnabled(can_start)
-        self.animal_in_training_action.setEnabled(can_start)
         self._app_model_status_combo.setEnabled(can_start)
         self.statusBar().showMessage(message, 12000)
 
@@ -472,37 +462,8 @@ class MainWindow(QMainWindow):
         status = self._app_model_status_combo.itemData(idx)
         if status == AppModelStatus.IDLE:
             self._on_capture_start_stop(False)
-        elif status == AppModelStatus.ACQUIRING:
+        elif status == AppModelStatus.RUNNING:
             self._on_capture_start_stop(True)
-        elif status == AppModelStatus.ANIMAL_IN_DEVICE:
-            self._on_animal_in_device_triggered(True)
-        elif status == AppModelStatus.ANIMAL_IN_TRAINING:
-            self._on_animal_in_training_triggered(True)
-
-    def _on_animal_in_device_triggered(self, is_toggled):
-        logger.verbose("_on_animal_in_device_triggered: %s", is_toggled)
-        if is_toggled:
-            if self._app_model.acquisition_started:
-                self._app_model.status = AppModelStatus.ANIMAL_IN_DEVICE
-            else:
-                self._on_capture_start_stop(True, target_status=AppModelStatus.ANIMAL_IN_DEVICE)
-        else:
-            self._app_model.status = AppModelStatus.ACQUIRING
-
-    def _on_animal_in_training_triggered(self, is_toggled):
-        logger.verbose("_on_animal_in_training_triggered: %s", is_toggled)
-        if is_toggled:
-            for action in (self.animal_in_device_action,):
-                action.blockSignals(True)
-                action.setChecked(True)
-                action.blockSignals(False)
-
-            if self._app_model.acquisition_started:
-                self._app_model.status = AppModelStatus.ANIMAL_IN_TRAINING
-            else:
-                self._on_capture_start_stop(True, target_status=AppModelStatus.ANIMAL_IN_TRAINING)
-        else:
-            self._app_model.status = AppModelStatus.ANIMAL_IN_DEVICE
 
     def on_show_reach_event(self, is_toggled):
         raw = self._previous_intersession_analysis_rsp
@@ -1046,14 +1007,6 @@ class MainWindow(QMainWindow):
         action.setShortcut(QKeyCombination(Qt.Modifier.CTRL, Qt.Key.Key_R))
         action.triggered.connect(self._on_capture_start_stop)
 
-        action = self.animal_in_device_action = QAction(_toolbar_icon("fa5s.vector-square"), "Animal in device", self)
-        action.setCheckable(True)
-        action.triggered.connect(self._on_animal_in_device_triggered)
-
-        action = self.animal_in_training_action = QAction(_toolbar_icon("fa5s.chalkboard-teacher"), "Animal in training", self)
-        action.setCheckable(True)
-        action.triggered.connect(self._on_animal_in_training_triggered)
-
         action = self.show_reach_event_action = QAction(_toolbar_icon("fa5s.bezier-curve"), "Show Previous Reach", self)
         action.setCheckable(True)
         action.setEnabled(False)
@@ -1162,12 +1115,10 @@ class MainWindow(QMainWindow):
         combo.setMinimumWidth(100)
         combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         combo.addItem("Idle", userData=AppModelStatus.IDLE)
-        combo.addItem("Running", userData=AppModelStatus.ACQUIRING)
+        combo.addItem("Running", userData=AppModelStatus.RUNNING)
         combo.currentIndexChanged.connect(self._on_system_mode_combo_changed)
         toolbar.addWidget(combo)
         # toolbar.addAction(self.run_action)
-        # toolbar.addAction(self.animal_in_device_action)
-        # toolbar.addAction(self.animal_in_training_action)
         toolbar.addSeparator()
 
         toolbar.addAction(self.show_reach_event_action)
@@ -1609,74 +1560,28 @@ class MainWindow(QMainWindow):
 
             if value is AppModelStatus.IDLE:
                 self._warned_invalid_dcs_config = False
-                for action in (
-                    self.calib_diamond_triangle_action,
-                    self.animal_in_device_action,
-                    self.animal_in_training_action,
-                ):
-                    action.setEnabled(False)
-                    action.setChecked(False)
+                self.calib_diamond_triangle_action.setEnabled(False)
+                self.calib_diamond_triangle_action.setChecked(False)
                 for item in (
                     self.make_3d_calib_action,
                     self.run_action,
-                    self.animal_in_device_action,
-                    self.animal_in_training_action,
                     self._animal_dropdown_combo,
                     self._training_mode_combo,
                     self._training_plan_combo,
                 ):
                     item.setEnabled(True)
-                self.animal_in_training_action.setEnabled(valid_dcs)
 
-            elif value is AppModelStatus.ACQUIRING:
-                for action in (
-                    self.calib_diamond_triangle_action,
-                    self.animal_in_device_action,
-                    self.animal_in_training_action,
-                ):
-                    action.setEnabled(True)
-                    action.setChecked(False)
+            elif value is AppModelStatus.RUNNING:
+                self.calib_diamond_triangle_action.setEnabled(valid_dcs)
+                self.calib_diamond_triangle_action.setChecked(False)
                 for item in (self._animal_dropdown_combo, self._training_mode_combo, self._training_plan_combo):
                     item.setEnabled(True)
-                self.animal_in_training_action.setEnabled(valid_dcs)
 
             elif value in {AppModelStatus.CALIBRATION_3D, AppModelStatus.CALIBRATION_DCS}:
                 for item in (
                     self._training_mode_combo,
                     self._training_plan_combo,
                     self._animal_dropdown_combo,
-                    self.calib_diamond_triangle_action,
-                    self.animal_in_device_action,
-                    self.animal_in_training_action,
-                ):
-                    item.setEnabled(False)
-
-            elif value is AppModelStatus.ANIMAL_IN_DEVICE:
-                self.animal_in_device_action.setChecked(True)
-                self.animal_in_training_action.setChecked(False)
-                for item in (
-                    self._training_mode_combo,
-                    self._training_plan_combo,
-                ):
-                    item.setEnabled(True)
-                for item in (
-                    self._animal_dropdown_combo,
-                    self.calib_diamond_triangle_action,
-                    self.make_3d_calib_action,
-                    self.calib_diamond_triangle_action,
-                ):
-                    item.setEnabled(False)
-                self.animal_in_training_action.setEnabled(valid_dcs)
-
-            elif value is AppModelStatus.ANIMAL_IN_TRAINING:
-                for action in (self.animal_in_device_action, self.animal_in_training_action):
-                    action.setChecked(True)
-                for item in (
-                    self._training_mode_combo,
-                    self._training_plan_combo,
-                    self._animal_dropdown_combo,
-                    self.calib_diamond_triangle_action,
-                    self.make_3d_calib_action,
                     self.calib_diamond_triangle_action,
                 ):
                     item.setEnabled(False)
@@ -1714,8 +1619,6 @@ class MainWindow(QMainWindow):
                     self._app_model_status_combo,
                     self.run_action,
                     self.refresh_hardware_action,
-                    self.animal_in_device_action,
-                    self.animal_in_training_action,
                     self.calib_diamond_triangle_action,
                     self.make_3d_calib_action,
                 ):
