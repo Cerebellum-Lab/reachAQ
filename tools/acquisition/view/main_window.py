@@ -14,7 +14,7 @@ from itertools import chain
 from pathlib import Path
 from typing import List, Optional, Dict, Tuple, Callable, Union, Literal
 
-from PySide6.QtCore import Qt, QCoreApplication, QTimer, Signal, QSize, QKeyCombination
+from PySide6.QtCore import Qt, QCoreApplication, QRect, QTimer, Signal, QSize, QKeyCombination
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (QMainWindow, QStatusBar, QToolBar, QLabel, QMessageBox, QApplication,
                                QSizePolicy, QWidget, QComboBox, QLineEdit, QFileDialog, QHBoxLayout,
@@ -143,6 +143,7 @@ class MainWindow(QMainWindow):
         self._nidaq_discovery_thread = None
         self._status_log_handler = None
         self._rfid_setup_dialog = None
+        self._normal_geometry_restored = False
 
         self.setWindowTitle(self._title)
 
@@ -212,6 +213,40 @@ class MainWindow(QMainWindow):
         #
         # then after everything:
         QTimer.singleShot(0, self._refresh_hardware_bindings)
+
+    def restore_normal_window_geometry(self) -> None:
+        """Seed Qt's restore geometry before the initial maximized show."""
+        geometry = self._preferences.window_normal_geometry
+        screens = QApplication.screens()
+        if geometry.isValid() and any(
+            geometry.intersects(screen.availableGeometry()) for screen in screens
+        ):
+            self.setGeometry(geometry)
+        else:
+            available = (
+                self.screen().availableGeometry()
+                if self.screen() is not None
+                else QRect(0, 0, 1440, 900)
+            )
+            width = min(max(960, int(available.width() * 0.8)), available.width())
+            height = min(max(640, int(available.height() * 0.8)), available.height())
+            self.setGeometry(
+                available.x() + (available.width() - width) // 2,
+                available.y() + (available.height() - height) // 2,
+                width,
+                height,
+            )
+        self._normal_geometry_restored = True
+
+    def _remember_normal_window_geometry(self) -> None:
+        if (
+            self._normal_geometry_restored
+            and self.isVisible()
+            and not self.isMaximized()
+            and not self.isMinimized()
+            and not self.isFullScreen()
+        ):
+            self._preferences.window_normal_geometry = self.geometry()
 
     @property
     def app_model(self) -> AppModel:
@@ -907,9 +942,12 @@ class MainWindow(QMainWindow):
         self.close()
 
     def moveEvent(self, e):
-        self._preferences.last_window_x = self.pos().x()
-        self._preferences.last_window_y = self.pos().y()
+        self._remember_normal_window_geometry()
         super(MainWindow, self).moveEvent(e)
+
+    def resizeEvent(self, event):
+        self._remember_normal_window_geometry()
+        super().resizeEvent(event)
 
     def _edit_camera_settings(self):
         # isChecked() has already swapped to the new value by the time this is called

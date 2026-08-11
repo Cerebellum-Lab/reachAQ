@@ -30,6 +30,9 @@ def verify_configuration(configuration: Optional[Path]):
 
 def _show_default_window(window) -> None:
     """Open maximized while retaining the normal window frame and restore control."""
+    restore = getattr(window, "restore_normal_window_geometry", None)
+    if restore is not None:
+        restore()
     window.showMaximized()
 
 

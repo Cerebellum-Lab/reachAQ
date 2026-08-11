@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 from typing import Optional, Union
 
-from PySide6.QtCore import QByteArray, QCoreApplication, QSettings
+from PySide6.QtCore import QByteArray, QCoreApplication, QRect, QSettings
 
 from autotrainer.core import ObservableObject
 from autotrainer.core.logging import get_verbose_logger
@@ -39,6 +39,7 @@ class UserPreferences(ObservableObject):
     SOFTMOUSE_MANIFEST_PATH = "softmouse_manifest_path"
     SOFTMOUSE_NAME_COLUMN = "softmouse_name_column"
     SOFTMOUSE_NIGHTLY_REFRESH = "softmouse_nightly_refresh"
+    WINDOW_NORMAL_GEOMETRY = "window_normal_geometry"
 
     def __init__(self, *, settings_file_path: Optional[Path] = None):
         super().__init__()
@@ -101,6 +102,9 @@ class UserPreferences(ObservableObject):
         self._softmouse_nightly_refresh: bool = settings.value(
             "softmouse/nightly_refresh", True, bool
         )
+        self._window_normal_geometry = QRect(
+            settings.value("ui/window_normal_geometry", QRect(), QRect)
+        )
         # Transient values that may come from individual configuration files, but are conveniently accessed from
         # the user preferences.
 
@@ -118,6 +122,20 @@ class UserPreferences(ObservableObject):
 
     def set_splitter_state(self, name: str, state: QByteArray) -> None:
         self._settings.setValue(f"ui/splitters/{name}", state)
+
+    @property
+    def window_normal_geometry(self) -> QRect:
+        return QRect(self._window_normal_geometry)
+
+    @window_normal_geometry.setter
+    def window_normal_geometry(self, value: QRect) -> None:
+        value = QRect(value)
+        if not value.isValid() or value.width() < 1 or value.height() < 1:
+            return
+        previous = self._window_normal_geometry
+        self._window_normal_geometry = value
+        self._settings.setValue("ui/window_normal_geometry", value)
+        self._on_property_changed(self.WINDOW_NORMAL_GEOMETRY, value, previous)
 
     @property
     def last_configuration(self) -> str:
