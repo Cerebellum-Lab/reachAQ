@@ -466,8 +466,10 @@ class MainContent(ContentWidget):
         self.update()
 
     def close(self):
-         self._diagnostics_content.close()  # to ensure the textbox handler is remove from root logger handlers
-         super().close()
+        self._clear_reach_camera_grid()
+        # Ensure the textbox handler is removed from root logger handlers.
+        self._diagnostics_content.close()
+        super().close()
 
     @Slot()
     def update_image(self):

@@ -6,6 +6,7 @@ import pytest
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget
 
+from autotrainer.core import NotificationCenter, TriggerNotification
 from autotrainer.inference import PoseLocation, PoseResponse
 from autotrainer.pyside import PGWidget
 from autotrainer.pyside.content_widget import ContentWidget
@@ -166,7 +167,15 @@ def test_all_visible_main_panel_boundaries_are_splitters(qapp, app_model, monkey
             "right",
         )
     finally:
+        camera_panels = [panel for _camera, panel in content._reach_camera_contents]
         content.close()
+        subscribers = NotificationCenter.default_center()._subscribers.get(
+            TriggerNotification.CAPTURE_ID,
+            (),
+        )
+        assert all(
+            panel._trigger_received not in subscribers for panel in camera_panels
+        )
         content.deleteLater()
 
 
