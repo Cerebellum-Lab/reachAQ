@@ -57,6 +57,7 @@ from tools.acquisition.model.training_plan import get_plan_id
 from tools.acquisition.model.user_preferences import UserPreferences
 from tools.acquisition.view.main_content import MainContent
 from tools.acquisition.view.multi_selection_menu import MultiSelectionMenu
+from tools.acquisition.view.ui_availability import calculate_ui_availability
 from tools.acquisition.view.nidaq_port_configuration_dialog import NidaqPortConfigurationDialog
 from tools.acquisition.view.preferences_dialog import PreferencesDialog
 from tools.acquisition.view.animal_metadata_dialog import AnimalMetadataDialog
@@ -215,6 +216,7 @@ class MainWindow(QMainWindow):
         #
         # then after everything:
         QTimer.singleShot(0, self._refresh_hardware_bindings)
+        QTimer.singleShot(0, self._refresh_ui_availability)
 
     def restore_normal_window_geometry(self) -> None:
         """Seed Qt's restore geometry before the initial maximized show."""
@@ -304,6 +306,34 @@ class MainWindow(QMainWindow):
             icon = _toolbar_icon('ei.play')
             run_action.setText("Start")
             run_action.setIcon(icon)
+        self._refresh_ui_availability()
+
+    def _refresh_ui_availability(self) -> None:
+        capture_transition = (
+            self._start_capture_thread is not None
+            or self._stop_capture_thread is not None
+        )
+        state = calculate_ui_availability(
+            status=self._app_model.status,
+            recording_status=self._app_model.session_recording_status,
+            acquisition_started=self._app_model.acquisition_started,
+            capture_transition=capture_transition,
+            hardware_refreshing=self._hardware_refresh_thread is not None,
+            nidaq_discovering=self._nidaq_discovery_thread is not None,
+            has_valid_dcs=self.has_fully_valid_dcs,
+        )
+        self._app_model_status_combo.setEnabled(state.system_mode)
+        self.run_action.setEnabled(state.system_mode)
+        self.edit_camera_settings_action.setEnabled(state.idle_configuration)
+        self.edit_daq_ports_action.setEnabled(state.idle_configuration)
+        self.make_3d_calib_action.setEnabled(state.idle_configuration)
+        self.refresh_hardware_action.setEnabled(state.hardware_refresh)
+        self._set_hardware_menu_actions_enabled(state.idle_configuration)
+        self._animal_dropdown_combo.setEnabled(state.subject)
+        self.animal_metadata_action.setEnabled(state.subject)
+        self._training_plan_combo.setEnabled(state.protocol_selection)
+        self._notes.setEnabled(state.notes)
+        self.calib_diamond_triangle_action.setEnabled(state.calibration)
 
     def _set_transitional_system_mode(self, text: str) -> None:
         combo = self._app_model_status_combo
@@ -368,18 +398,16 @@ class MainWindow(QMainWindow):
             self._status_label.setText("Startup failed")
             self._status_label.setStyleSheet("font-weight: 600; color: #b00020;")
             self.running_status_changed.emit(False)
-        self.run_action.setEnabled(True)
-        self._app_model_status_combo.setEnabled(True)
+        self._refresh_ui_availability()
 
     @invoke_method
     def _on_capture_stop_finished(self) -> None:
         self._stop_capture_thread = None
         self.running_status_changed.emit(False)
         self._restore_system_mode()
-        self.run_action.setEnabled(True)
-        self._app_model_status_combo.setEnabled(True)
         self._clear_startup_message()
         self._acquisition_started = False
+        self._refresh_ui_availability()
 
     def _on_capture_start_stop(self, is_toggled, *, target_status: AppModelStatus = AppModelStatus.RUNNING):
         app_model = self._app_model
@@ -429,6 +457,7 @@ class MainWindow(QMainWindow):
             thread = threading.Thread(target=exec_stop_capture, daemon=True, name="StopAcquisition")
             self._stop_capture_thread = thread
             thread.start()
+        self._refresh_ui_availability()
 
     def _refresh_hardware_bindings(self):
         if self._hardware_refresh_thread is not None and self._hardware_refresh_thread.is_alive():
@@ -461,6 +490,7 @@ class MainWindow(QMainWindow):
             "Retrying failed hardware..." if retry_running else "Refreshing hardware..."
         )
         self.main_content.set_hardware_refreshing(True)
+        self._refresh_ui_availability()
         QCoreApplication.processEvents()
 
         def refresh_worker():
@@ -486,23 +516,7 @@ class MainWindow(QMainWindow):
         self._hardware_refresh_thread = None
         self._status_label.setText("")
         self.main_content.set_hardware_refreshing(False)
-        self.refresh_hardware_action.setEnabled(
-            (
-                (
-                    not self._app_model.acquisition_started
-                    and self._app_model.status == AppModelStatus.IDLE
-                )
-                or (
-                    self._app_model.acquisition_started
-                    and self._app_model.session_recording_status
-                    is SessionRecordingStatus.READY
-                )
-            )
-        )
-        can_start = not self._app_model.acquisition_started and self._app_model.status == AppModelStatus.IDLE
-        self.run_action.setEnabled(can_start)
-        self._app_model_status_combo.setEnabled(can_start)
-        self._set_hardware_menu_actions_enabled(can_start)
+        self._refresh_ui_availability()
         self.statusBar().showMessage(message, 12000)
 
     def _on_system_mode_combo_changed(self, idx: int):
@@ -988,6 +1002,7 @@ class MainWindow(QMainWindow):
         thread = threading.Thread(target=discover_worker, daemon=True, name="DiscoverNidaq")
         self._nidaq_discovery_thread = thread
         thread.start()
+        self._refresh_ui_availability()
 
     @invoke_method
     def _on_nidaq_discovery_finished(self, devices, discovery_error) -> None:
@@ -1004,6 +1019,7 @@ class MainWindow(QMainWindow):
         self._set_hardware_menu_actions_enabled(
             is_idle and self._hardware_refresh_thread is None
         )
+        self._refresh_ui_availability()
         if not is_idle or self._closing:
             self.statusBar().showMessage("NI-DAQ discovery finished; acquisition is no longer idle", 5000)
             return
@@ -1760,6 +1776,7 @@ class MainWindow(QMainWindow):
             self.blockSignals(False)
 
             self.main_content.set_is_capture_active(value != AppModelStatus.IDLE)
+            self._refresh_ui_availability()
 
         elif name == props.SESSION_RECORDING_STATUS:
             if value == SessionRecordingStatus.READY:
@@ -1984,7 +2001,7 @@ class MainWindow(QMainWindow):
     def _on_inference_property_changed(self, name: str, value, old_value):
         inference = self._app_model.inference
         if name == inference.STATUS:
-            self.calib_diamond_triangle_action.setEnabled(value == InferenceStatus.live)
+            self._refresh_ui_availability()
 
     @invoke_method
     def _on_hardware_property_changed(self, property_name: str, value, _):
@@ -2051,6 +2068,7 @@ class MainWindow(QMainWindow):
             and self._hardware_refresh_thread is None
             and self._nidaq_discovery_thread is None
         )
+        self._refresh_ui_availability()
 
     @invoke_method
     def _on_inference_analysis_result_ready(self, prj: ProjectInfo, rsp: IntersessionResponse):
