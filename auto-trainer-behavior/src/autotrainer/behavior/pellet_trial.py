@@ -200,6 +200,15 @@ class PelletTrialLedger:
     def attempts(self) -> Tuple[PelletTrialAttempt, ...]:
         return tuple(self._attempts)
 
+    @property
+    def planned_trial_id(self) -> int:
+        """Logical row that the next send attempt will use after retries."""
+        return int(
+            self._retry_trial_id
+            if self._retry_trial_id is not None
+            else self._next_trial_id
+        )
+
     def begin_send(
         self,
         perf_time: float,

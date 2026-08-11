@@ -154,6 +154,7 @@ from tools.acquisition.model.softmouse_spreadsheet_source import (
 )
 from tools.acquisition.model.session_data_recorder import SessionDataRecorder
 from tools.acquisition.model.session_boundary import SessionBoundary
+from tools.acquisition.model.trial_protocol_schedule import TrialProtocolSchedule
 from tools.acquisition.model.session_stop_policy import (
     SessionStopConfiguration,
     SessionStopDecision,
@@ -356,6 +357,7 @@ class AppModel(ObservableObject):
         RFID_READER_STATUS = "rfid_reader_status"
         RFID_SCAN_RESULT = "rfid_scan_result"
         ANIMAL_METADATA_PREVIEW = "animal_metadata_preview"
+        TRIAL_PROTOCOL_STATE = "trial_protocol_state"
 
     def __init__(
             self,
@@ -405,6 +407,7 @@ class AppModel(ObservableObject):
         self._animal_name = ""
         self._notes = ""
         self._editable_notes_project: Optional[ProjectInfo] = None
+        self._trial_protocol_schedule = TrialProtocolSchedule.with_placeholder_rows()
         self._left_camera = self._right_camera = self._stim_camera = None
         self._reach_cameras: Tuple[VideoCaptureModel, ...] = ()
 
@@ -3048,6 +3051,46 @@ class AppModel(ObservableObject):
         return True
 
     @property
+    def trial_protocol_rows(self) -> Tuple[dict, ...]:
+        return self._trial_protocol_schedule.to_records()
+
+    @property
+    def trial_protocol_state(self) -> dict:
+        ledger = self._trial_ledger
+        attempts = () if ledger is None else ledger.attempts
+        active = None if ledger is None else ledger.active_attempt
+        active_trial_id = None if active is None else active.trial_id
+        if active is not None and active_trial_id is None and active.protocol_context:
+            active_trial_id = (
+                active.protocol_context.get("trial_row") or {}
+            ).get("trial_id")
+        return {
+            "rows": self.trial_protocol_rows,
+            "active_trial_id": active_trial_id,
+            "completed_trial_ids": tuple(sorted({
+                attempt.trial_id
+                for attempt in attempts
+                if attempt.trial_id is not None and attempt.logical_trial_complete
+            })),
+        }
+
+    def update_trial_protocol_row(self, trial_id: int, field: str, value) -> bool:
+        state = self.trial_protocol_state
+        trial_id = int(trial_id)
+        if trial_id == state["active_trial_id"] or trial_id in state["completed_trial_ids"]:
+            return False
+        self._trial_protocol_schedule.update(trial_id, field, value)
+        self._notify_trial_protocol_state()
+        return True
+
+    def _notify_trial_protocol_state(self) -> None:
+        self.property_changed(
+            self.Props.TRIAL_PROTOCOL_STATE,
+            self.trial_protocol_state,
+            None,
+        )
+
+    @property
     def rpc_service(self) -> Optional[RpcService]:
         return self._rpc_service
 
@@ -5180,6 +5223,7 @@ class AppModel(ObservableObject):
                 ),
             ),
         )
+        self._notify_trial_protocol_state()
         self._cancel_automatic_stop_timers()
         self._session_stop_policy = SessionStopPolicy(
             SessionStopConfiguration(
@@ -5654,6 +5698,7 @@ class AppModel(ObservableObject):
             laser_references=laser_references,
         )
         self._pellet_cycles.sync_behavior_counts(self._behavior.algorithm)
+        self._notify_trial_protocol_state()
 
     @staticmethod
     def _read_trial_stream_references(project):
@@ -5906,6 +5951,7 @@ class AppModel(ObservableObject):
                         self._session_stop_policy.configuration
                     )
                 ),
+                "protocolSchedule": list(self._trial_protocol_schedule.to_records()),
                 "stopResult": (
                     None
                     if self._session_stop_evaluation is None
@@ -6177,6 +6223,7 @@ class AppModel(ObservableObject):
             time.time(),
             retry=retry,
         )
+        self._notify_trial_protocol_state()
         self._evaluate_automatic_stop_policy(
             protocol_complete=self._protocol_runner.protocol_complete,
         )
@@ -6200,8 +6247,11 @@ class AppModel(ObservableObject):
             pellet_position=self._offset_record(self._hardware.last_dcs_set_position),
             planned_shift=self._offset_record(shift.last_shift_xyz),
             applied_shift=self._offset_record(shift.last_processed_shift_xyz),
-            protocol_context=self._current_trial_protocol_context(),
+            protocol_context=self._current_trial_protocol_context(
+                self._pellet_cycles.planned_trial_id
+            ),
         )
+        self._notify_trial_protocol_state()
         logger.info(
             "pellet trial attempt started: session=%s attempt=%s context=%s",
             self._trial_ledger.session_id,
@@ -6217,6 +6267,7 @@ class AppModel(ObservableObject):
         )
         if finalized is None:
             return
+        self._notify_trial_protocol_state()
         self._evaluate_automatic_stop_policy(
             protocol_complete=self._protocol_runner.protocol_complete,
         )
@@ -6240,6 +6291,7 @@ class AppModel(ObservableObject):
                 )
                 if attempt is None:
                     return
+                self._notify_trial_protocol_state()
             if ledger is not None:
                 # Behavioral results are not authoritative until post-session
                 # analysis. Update only the acknowledgement-derived value here;
@@ -6255,11 +6307,14 @@ class AppModel(ObservableObject):
     def _offset_record(value):
         return offset_record(value)
 
-    def _current_trial_protocol_context(self):
+    def _current_trial_protocol_context(self, trial_id: Optional[int] = None):
         plan = self._attached_plan
         phase = None if plan is None else plan.current_phase
+        if trial_id is None:
+            trial_id = self._pellet_cycles.planned_trial_id
         return {
             "protocol_id": None if plan is None else plan.plan_id,
             "phase_id": None if phase is None else phase.phase_id,
             "automatic_advance": self._protocol_runner.automatic_advance,
+            "trial_row": self._trial_protocol_schedule.row(trial_id).to_record(),
         }

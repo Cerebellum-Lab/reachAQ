@@ -46,6 +46,10 @@ class PelletCycleController:
     def active_attempt(self):
         return None if self._ledger is None else self._ledger.active_attempt
 
+    @property
+    def planned_trial_id(self) -> int:
+        return 1 if self._ledger is None else self._ledger.planned_trial_id
+
     def start_session(
         self,
         session_id: str,

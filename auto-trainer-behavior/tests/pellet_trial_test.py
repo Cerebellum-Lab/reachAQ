@@ -43,6 +43,7 @@ def test_hardware_error_retries_same_logical_trial_and_never_counts():
     )
 
     assert failed.outcome is TrialOutcome.HARDWARE_ERROR
+    assert ledger.planned_trial_id == 1
     assert ledger.summary() == {
         "physical_attempts": 1,
         "hardware_errors": 1,
