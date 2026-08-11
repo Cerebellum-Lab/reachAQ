@@ -206,6 +206,9 @@ publication.
 
 ## Troubleshooting
 
+- **`No module named autotrainer.core`:** from the intended repository run
+  `conda run -n reachaq python -m pip install -e '.[test]'`, then rerun the
+  portable installer. Its import check must report the current checkout path.
 - **No usable keyring backend:** rerun the portable installer, log into the
   desktop as the acquisition operator, and run credential setup without
   `sudo`.

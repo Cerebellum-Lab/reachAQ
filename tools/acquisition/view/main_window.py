@@ -196,7 +196,6 @@ class MainWindow(QMainWindow):
         app_model.hardware.property_changed += self._on_hardware_property_changed
         app_model.inference.property_changed += self._on_inference_property_changed
         app_model.inference.detection_result_ready += self._on_inference_analysis_result_ready
-        app_model.behavior.algorithm.property_changed += self._on_behavior_algo_property_changed
 
         user_preferences.property_changed += self._on_preferences_property_changed
 

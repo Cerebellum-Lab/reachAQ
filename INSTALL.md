@@ -30,6 +30,9 @@ OpenPyXL for metadata publication/import, and pyserial plus `dialout` group
 membership for the USB RFID reader. If the installer adds your account to
 `dialout`, log out and back in once, reconnect the reader, and rerun the same
 installer command so its serial-permission check runs in the new login session.
+The installer also confirms that `autotrainer`, `tools`, and `reachAQ` import
+from the checkout being installed, rather than a removed or older editable
+worktree.
 
 Install the NVIDIA kernel driver first so the automatic TensorFlow GPU preflight
 can pass. See the [NVIDIA/TensorFlow guide](docs/linux-install/nvidia-inference.md)

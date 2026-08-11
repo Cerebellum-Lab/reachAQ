@@ -403,8 +403,44 @@ git_lfs_pull() {
 }
 
 verify_imports() {
-    conda_run python -c \
-        'import autotrainer.core, autotrainer.device, autotrainer.video, PySide6, cv2, can, keyring, nidaqmx, openpyxl, requests, serial; print("generic imports ok")'
+    conda_run python - "$INSTALL_REPO" <<'PY'
+import sys
+from pathlib import Path
+
+import PySide6
+import can
+import cv2
+import keyring
+import nidaqmx
+import openpyxl
+import requests
+import serial
+import autotrainer.core
+import autotrainer.device
+import autotrainer.video
+import reachAQ
+import tools
+
+repository = Path(sys.argv[1]).resolve()
+for module in (autotrainer.core, autotrainer.device, autotrainer.video, reachAQ, tools):
+    module_file = getattr(module, "__file__", None)
+    locations = [Path(module_file).resolve()] if module_file else [
+        Path(value).resolve() for value in module.__path__ if Path(value).exists()
+    ]
+    resolves_from_checkout = False
+    for location in locations:
+        try:
+            location.relative_to(repository)
+        except ValueError:
+            continue
+        resolves_from_checkout = True
+        break
+    if not resolves_from_checkout:
+        raise SystemExit(
+            f"{module.__name__} resolves outside the current checkout: {locations}"
+        )
+print(f"generic imports resolve from current checkout: {repository}")
+PY
 }
 
 verify_softmouse_runtime() {

@@ -87,6 +87,9 @@ kernel driver or install a system-wide CUDA toolkit.
   serial permissions.
 - The report separately verifies SoftMouse imports/keyring availability, RFID
   imports/device permissions, and the tracked nightly systemd units.
+- The generic import check verifies module file paths against the current
+  checkout. This catches stale editable installs that still reference a removed
+  worktree.
 
 ## 3. Install only applicable hardware support
 

@@ -68,6 +68,7 @@ def test_portable_installer_covers_softmouse_rfid_requirements():
     assert "tests/softmouse_cli_test.py" in source
     assert "tests/softmouse_https_source_test.py" in source
     assert "auto-trainer-device/tests/rfid_reader_test.py" in source
+    assert "resolves outside the current checkout" in source
 
 
 def test_softmouse_rfid_python_dependencies_are_packaged():
