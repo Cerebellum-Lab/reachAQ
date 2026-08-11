@@ -13,13 +13,15 @@ from autotrainer.device.rfid_reader import (
 )
 
 
-TAG_A = "D4D47231005A30010000000000"
-TAG_B = "B4D47231005A30010000000000"
+PAYLOAD_A = "D4D47231005A30010000000000"
+PAYLOAD_B = "B4D47231005A30010000000000"
+TAG_A = "360002353933099"
+TAG_B = "360002353933101"
 
 
 @pytest.mark.parametrize("split_at", range(31))
 def test_parser_accepts_captured_protocol_at_every_fragment_boundary(split_at):
-    frame = make_rfid_frame(TAG_A)
+    frame = make_rfid_frame(PAYLOAD_A)
     parser = RfidFrameParser()
 
     events = parser.feed(frame[:split_at], monotonic_time=1.0)
@@ -32,18 +34,20 @@ def test_parser_accepts_captured_protocol_at_every_fragment_boundary(split_at):
 
 def test_parser_handles_noise_and_multiple_alternating_tags():
     parser = RfidFrameParser()
-    events = parser.feed(b"noise" + make_rfid_frame(TAG_A) + make_rfid_frame(TAG_B))
+    events = parser.feed(
+        b"noise" + make_rfid_frame(PAYLOAD_A) + make_rfid_frame(PAYLOAD_B)
+    )
 
     assert [event.rfid for event in events] == [TAG_A, TAG_B]
     assert parser.stats.discarded_bytes == 5
 
 
 def test_parser_rejects_checksum_and_resynchronizes():
-    broken = bytearray(make_rfid_frame(TAG_A))
+    broken = bytearray(make_rfid_frame(PAYLOAD_A))
     broken[27] ^= 1
     parser = RfidFrameParser()
 
-    events = parser.feed(bytes(broken) + make_rfid_frame(TAG_B))
+    events = parser.feed(bytes(broken) + make_rfid_frame(PAYLOAD_B))
 
     assert [event.rfid for event in events] == [TAG_B]
     assert parser.stats.invalid_checksum_frames == 1
@@ -53,14 +57,14 @@ def test_parser_recovers_after_bounded_buffer_overflow():
     parser = RfidFrameParser(maximum_buffer_bytes=60)
     parser.feed(b"x" * 100)
 
-    events = parser.feed(make_rfid_frame(TAG_A))
+    events = parser.feed(make_rfid_frame(PAYLOAD_A))
 
     assert [event.rfid for event in events] == [TAG_A]
     assert parser.stats.buffer_overflows == 1
 
 
 def test_parser_normalizes_lowercase_payload_after_checksum_validation():
-    payload = TAG_A.lower().encode("ascii")
+    payload = PAYLOAD_A.lower().encode("ascii")
     checksum = payload_checksum(payload)
     frame = b"\x02" + payload + bytes((checksum, checksum ^ 0xFF, 0x03))
 
@@ -107,7 +111,7 @@ class _FakeSerial:
 
 def test_reader_reconnects_after_disconnect_and_shuts_down_cleanly():
     first = _FakeSerial([OSError("unplugged")])
-    second = _FakeSerial([make_rfid_frame(TAG_A)])
+    second = _FakeSerial([make_rfid_frame(PAYLOAD_A)])
     ports = iter((first, second))
     received = []
     statuses = []

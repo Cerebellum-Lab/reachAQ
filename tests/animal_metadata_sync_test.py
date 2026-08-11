@@ -9,14 +9,14 @@ from tools.acquisition.model.animal_registry import AnimalRegistry
 from tools.acquisition.model.softmouse_spreadsheet_source import SoftMouseSpreadsheetSource
 
 
-TAG = "D4D47231005A30010000000000"
+TAG = "360002353933099"
 
 
 def publish(directory, *, digest_override=None, total_rows=None, tagged_rows=None):
     source = directory / "SoftMouse-AnimalList-current.csv"
     with source.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["Physical Tag", "Alt. ID", "State"])
+        writer.writerow(["Physical Tag", "Plate ID", "State"])
         writer.writerow(["PT-1", TAG, "Stock"])
     digest = hashlib.sha256(source.read_bytes()).hexdigest()
     manifest = directory / "SoftMouse-AnimalList-current.manifest.json"

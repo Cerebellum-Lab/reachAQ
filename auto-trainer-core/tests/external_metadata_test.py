@@ -5,17 +5,29 @@ from autotrainer.core.animal.external_metadata import (
     ExternalIdentity,
     NormalizedAnimalBatch,
     normalize_rfid,
+    reader_payload_to_rfid,
     split_genotype,
 )
 
 
-TAG_A = "D4D47231005A30010000000000"
+TAG_A = "360002353933099"
+READER_PAYLOAD_A = "D4D47231005A30010000000000"
 
 
-def test_rfid_normalization_uses_validated_26_character_payload():
-    assert normalize_rfid(TAG_A.lower()) == TAG_A
+def test_rfid_normalization_uses_iso_11784_decimal_plate_id():
+    assert normalize_rfid(TAG_A) == TAG_A
     with pytest.raises(ValueError):
-        normalize_rfid("D4D47231005A3001")
+        normalize_rfid("D4D47231005A30010000000000")
+
+
+def test_reader_payload_converts_to_iso_11784_decimal_plate_id():
+    assert reader_payload_to_rfid(READER_PAYLOAD_A) == TAG_A
+    assert (
+        reader_payload_to_rfid("AC383BFB439F00010000000000")
+        == "999012345678901"
+    )
+    with pytest.raises(ValueError):
+        reader_payload_to_rfid("AC383BFB439F0001")
 
 
 def test_external_identity_has_stable_normalized_key():

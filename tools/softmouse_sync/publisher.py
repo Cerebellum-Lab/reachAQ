@@ -69,6 +69,11 @@ class SoftMouseExportPublisher:
                     previous_source_row_count=previous_rows,
                 )
                 batch = preview.batch
+                if batch.accepted_rows < 1:
+                    raise ValueError(
+                        "SoftMouse export contains no valid RFID-tagged active animals; "
+                        "refusing to replace the current publication"
+                    )
                 digest = batch.source_file_sha256
                 published_utc = self._utc_now()
                 suffix = downloaded.suffix.casefold()

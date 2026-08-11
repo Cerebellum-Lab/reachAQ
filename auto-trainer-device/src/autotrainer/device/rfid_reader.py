@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Optional
 
-from autotrainer.core.animal.external_metadata import normalize_rfid
+from autotrainer.core.animal.external_metadata import reader_payload_to_rfid
 
 
 STX = 0x02
@@ -62,8 +62,10 @@ def payload_checksum(payload: bytes) -> int:
 
 def make_rfid_frame(payload: str) -> bytes:
     """Build a frame for tests and diagnostic fixtures."""
-    normalized = normalize_rfid(payload)
-    payload_bytes = normalized.encode("ascii")
+    payload_bytes = str(payload).encode("ascii")
+    if _PAYLOAD_RE.fullmatch(payload_bytes) is None:
+        raise ValueError("RFID reader payload must be exactly 26 hexadecimal characters")
+    payload_bytes = payload_bytes.upper()
     checksum = payload_checksum(payload_bytes)
     return bytes((STX,)) + payload_bytes + bytes((checksum, checksum ^ 0xFF, ETX))
 
@@ -144,7 +146,7 @@ class RfidFrameParser:
                 del self._buffer[:FRAME_LENGTH]
                 continue
 
-            normalized = normalize_rfid(payload.decode("ascii"))
+            normalized = reader_payload_to_rfid(payload.decode("ascii"))
             emitted.append(RfidTagRead(normalized, candidate, float(event_time)))
             self.stats.valid_frames += 1
             del self._buffer[:FRAME_LENGTH]

@@ -18,6 +18,15 @@ from .softmouse_spreadsheet_source import (
 )
 
 
+DEFAULT_SOFTMOUSE_PUBLICATION_DIRECTORY = Path(
+    "/mnt/isilon/Data/ReachingData/SoftMouse"
+)
+DEFAULT_SOFTMOUSE_MANIFEST_PATH = (
+    DEFAULT_SOFTMOUSE_PUBLICATION_DIRECTORY
+    / "SoftMouse-AnimalList-current.manifest.json"
+)
+
+
 @dataclass(frozen=True)
 class PublishedExportManifest:
     schema_version: int

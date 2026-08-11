@@ -61,10 +61,10 @@ def _record_hash(payload: Mapping[str, Any]) -> str:
 @dataclass(frozen=True)
 class SoftMouseMappingProfile:
     profile_id: str = "softmouse-default"
-    version: int = 1
+    version: int = 2
     sheet_name: str = "Animal List"
     external_identity_column: str = "Physical Tag"
-    rfid_column: str = "Alt. ID"
+    rfid_column: str = "Plate ID"
     new_animal_name_column: str = "Physical Tag"
     state_column: str = "State"
     sex_column: Optional[str] = "Sex"
@@ -181,8 +181,11 @@ class SoftMouseSpreadsheetSource:
                 )
             try:
                 rfid = normalize_rfid(raw_rfid)
-            except ValueError as exc:
-                raise ValueError(f"Invalid RFID at source row {row_number}: {exc}") from exc
+            except ValueError:
+                # Plate ID may also be used for non-RFID identifiers. Only an
+                # exact ISO 11784 15-digit value participates in the registry.
+                ignored_missing_rfid += 1
+                continue
             external_id = _identifier_value(
                 self._value(values, resolved[self.profile.external_identity_column])
             )

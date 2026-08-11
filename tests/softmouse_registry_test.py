@@ -11,11 +11,11 @@ from tools.acquisition.model.softmouse_spreadsheet_source import (
 )
 
 
-TAG_A = "D4D47231005A30010000000000"
-TAG_B = "B4D47231005A30010000000000"
+TAG_A = "360002353933099"
+TAG_B = "360002353933101"
 HEADERS = [
     "Physical Tag",
-    "Alt. ID",
+    "Plate ID",
     "Sex",
     "Date of Birth",
     "State",
@@ -56,13 +56,18 @@ def test_source_keeps_only_tagged_current_animals(tmp_path):
     assert record.genotype == ("Cre+", "WT")
 
 
-def test_source_rejects_bad_rfid_and_ambiguous_headers(tmp_path):
+def test_source_ignores_non_rfid_plate_ids_and_rejects_ambiguous_headers(tmp_path):
     path = tmp_path / "bad.csv"
     write_export(path, [row("PT-1", "not-a-tag")])
-    with pytest.raises(ValueError, match="source row 2"):
-        SoftMouseSpreadsheetSource().preview(path)
+    preview = SoftMouseSpreadsheetSource().preview(path)
+    assert preview.batch.accepted_rows == 0
+    assert preview.batch.ignored_missing_rfid_rows == 1
 
-    write_export(path, [row("PT-1", TAG_A) + ["duplicate"]], HEADERS + ["Alt ID"])
+    write_export(
+        path,
+        [row("PT-1", TAG_A) + ["duplicate"]],
+        HEADERS + ["PlateID"],
+    )
     with pytest.raises(ValueError, match="Ambiguous"):
         SoftMouseSpreadsheetSource().preview(path)
 

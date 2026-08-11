@@ -127,7 +127,7 @@ def test_external_identity_metadata_and_session_snapshot_round_trip(tmp_path):
         name="stable-local-name",
         external_identity=ExternalIdentity("PT-42"),
         external_metadata=ExternalMetadataSnapshot(
-            rfid="D4D47231005A30010000000000",
+            rfid="360002353933099",
             physical_tag="PT-42",
             sex="F",
             genotype=("Cre+", "WT"),
@@ -147,5 +147,5 @@ def test_external_identity_metadata_and_session_snapshot_round_trip(tmp_path):
     snapshot = loaded.session_snapshot(snapshot_utc="2026-08-10T01:00:00Z")
     assert snapshot["name"] == "stable-local-name"
     assert snapshot["externalIdentity"]["subjectId"] == "PT-42"
-    assert snapshot["externalIdentity"]["rfid"] == "D4D47231005A30010000000000"
+    assert snapshot["externalIdentity"]["rfid"] == "360002353933099"
     assert snapshot["provenance"]["sourceRecordHash"] == "record-hash"

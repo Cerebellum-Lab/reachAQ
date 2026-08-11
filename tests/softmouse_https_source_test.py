@@ -1,4 +1,4 @@
-from pathlib import Path
+import csv
 
 import pytest
 
@@ -34,93 +34,98 @@ class Session:
     def __init__(self):
         self.calls = []
         self.poll_count = 0
-
-    def get(self, url, **kwargs):
-        self.calls.append(("GET", url, kwargs))
-        if url.endswith("login.do"):
-            return Response(
-                url=url,
-                content=(
-                    b'<form action="login.do?reqCode=doLogin" method="post">'
-                    b'<input type="hidden" name="csrf" value="token">'
-                    b"</form>"
-                ),
-            )
-        if url.endswith("animals.do"):
-            return Response(url=url, content=b"Animals")
-        if "downLoadFile" in url:
-            self.poll_count += 1
-            if self.poll_count == 1:
-                return Response(url=url, status=202)
-            return Response(
-                url=url,
-                content=b"Physical Tag,Alt. ID,State\nPT-1,D4D47231005A30010000000000,Stock\n",
-            )
-        raise AssertionError(url)
+        self.animals_content = b'<a id="exportMouseMenuButton">Export</a>'
+        self.home_content = (
+            b'<a href="smdb/mouseline/list.do?reqCode=gotoMouselinelist&amp;ownerCode=34867">'
+            b"Jason Christie</a>"
+        )
+        self.list_rows = [
+            {
+                "id": 1,
+                "ownerId": 34867,
+                "owner": "Jason Christie",
+                "mousestate": "Stock",
+                "physicaltag": "PT-1",
+                "plateIdPattern": "360002353933099",
+            },
+            {
+                "id": 2,
+                "ownerId": 34867,
+                "owner": "Jason Christie",
+                "mousestate": "Mating",
+                "physicaltag": "PT-2",
+                "plateIdPattern": "360002353933101",
+            },
+        ]
 
     def request(self, method, url, **kwargs):
         self.calls.append((method, url, kwargs))
-        if method == "GET":
-            return self.get(url, **kwargs)
-        if "reqCode=doLogin" in url:
+        if method == "GET" and url == "https://www.softmouse.net/":
+            return Response(
+                url=url,
+                content=(
+                    b'<form action="login.do" method="post">'
+                    b'<input type="hidden" name="csrftoken" value="token">'
+                    b"</form>"
+                ),
+            )
+        if method == "POST" and "reqCode=doLogin" in url:
             assert kwargs["data"] == {
-                "csrf": "token",
-                "user": "ben",
+                "csrftoken": "token",
+                "username": "ben",
                 "password": "secret",
             }
-            return Response(url="https://softmouse.example/animals.do", content=b"ok")
-        if url.endswith("start-export"):
-            return Response(url=url, json_value={"result": {"task": "task/1"}})
-        raise AssertionError(url)
+            return Response(url="https://www.softmouse.net/HomePage.do", content=self.home_content)
+        if method == "GET" and "gotoMouselinelist" in url:
+            return Response(url=url, content=b"Selected")
+        if method == "GET" and url.endswith("smdb/mouse/list.do"):
+            return Response(url=url, content=self.animals_content)
+        if method == "POST" and url.endswith("mouse/list.json"):
+            return Response(
+                url=url,
+                json_value={
+                    "records": 2,
+                    "total": 1,
+                    "page": 1,
+                    "list": self.list_rows,
+                },
+            )
+        raise AssertionError((method, url, kwargs))
 
 
-def test_https_source_logs_in_with_csrf_and_polls_encoded_task(tmp_path):
+def test_https_source_selects_christie_active_scope_and_writes_csv(tmp_path):
     session = Session()
-    config = SoftMouseHttpsConfiguration(
-        base_url="https://softmouse.example/",
-        login_path="login.do",
-        export_start_path="start-export",
-        download_path_template="export/downLoadFile?taskid={task_id}",
-        login_username_field="user",
-        csrf_field="csrf",
-        authentication_check_path="animals.do",
-        export_suffix=".csv",
-        task_id_json_path=("result", "task"),
-        poll_interval_seconds=0,
-    )
     source = SoftMouseHttpsSource(
-        config, SoftMouseCredentials("ben", "secret"), session=session
+        SoftMouseHttpsConfiguration(),
+        SoftMouseCredentials("ben", "secret"),
+        session=session,
     )
 
     path = source.download(tmp_path)
 
     assert path.suffix == ".csv"
-    assert b"Physical Tag" in path.read_bytes()
-    poll_urls = [url for method, url, _ in session.calls if "downLoadFile" in url]
-    assert poll_urls[-1].endswith("taskid=task%2F1")
+    with path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows[0]["Physical Tag"] == "PT-1"
+    assert rows[0]["Plate ID"] == "360002353933099"
+    assert rows[0]["State"] == "Stock"
+    list_call = next(call for call in session.calls if call[1].endswith("mouse/list.json"))
+    payload = list_call[2]["data"]
+    assert ("ownerId", "34867") in payload
+    assert [value for name, value in payload if name == "mouseStates"] == [
+        "MATING",
+        "STOCK",
+        "WEANLING",
+        "ORDERED",
+    ]
     assert "secret" not in repr(source.credentials)
 
 
 def test_https_source_rejects_interactive_authentication_challenge(tmp_path):
     session = Session()
-    original_get = session.get
-
-    def challenged_get(url, **kwargs):
-        if url.endswith("animals.do"):
-            return Response(url=url, content=b"Enter verification code for two-factor login")
-        return original_get(url, **kwargs)
-
-    session.get = challenged_get
+    session.animals_content = b"Enter verification code for two-factor login"
     source = SoftMouseHttpsSource(
-        SoftMouseHttpsConfiguration(
-            base_url="https://softmouse.example/",
-            login_path="login.do",
-            export_start_path="start-export",
-            download_path_template="download/{task_id}",
-            authentication_check_path="animals.do",
-            csrf_field="csrf",
-            login_username_field="user",
-        ),
+        SoftMouseHttpsConfiguration(),
         SoftMouseCredentials("ben", "secret"),
         session=session,
         sleep=lambda _seconds: None,
@@ -130,26 +135,65 @@ def test_https_source_rejects_interactive_authentication_challenge(tmp_path):
         source.download(tmp_path)
 
 
-def test_https_source_requires_expected_colony_marker(tmp_path):
+def test_https_source_requires_exact_christie_colony(tmp_path):
     session = Session()
+    session.home_content = b'<a href="other">Another Lab</a>'
     source = SoftMouseHttpsSource(
-        SoftMouseHttpsConfiguration(
-            base_url="https://softmouse.example/",
-            login_path="login.do",
-            export_start_path="start-export",
-            download_path_template="download/{task_id}",
-            authentication_check_path="animals.do",
-            expected_colony_marker="Christie Lab Colony",
-            csrf_field="csrf",
-            login_username_field="user",
-        ),
+        SoftMouseHttpsConfiguration(),
         SoftMouseCredentials("ben", "secret"),
         session=session,
         sleep=lambda _seconds: None,
     )
 
-    with pytest.raises(RuntimeError, match="colony marker"):
+    with pytest.raises(RuntimeError, match="Jason Christie"):
         source.download(tmp_path)
+
+
+def test_https_source_rejects_non_christie_export_scope(tmp_path):
+    session = Session()
+    session.list_rows[0]["ownerId"] = 999
+    source = SoftMouseHttpsSource(
+        SoftMouseHttpsConfiguration(),
+        SoftMouseCredentials("ben", "secret"),
+        session=session,
+        sleep=lambda _seconds: None,
+    )
+
+    with pytest.raises(RuntimeError, match="non-Christie owner"):
+        source.download(tmp_path)
+
+
+def test_https_source_fetches_every_active_page(tmp_path):
+    session = Session()
+    original_request = session.request
+
+    def paged_request(method, url, **kwargs):
+        if method == "POST" and url.endswith("mouse/list.json"):
+            payload = dict(kwargs["data"])
+            page = int(payload["page"])
+            row = dict(session.list_rows[page - 1])
+            return Response(
+                url=url,
+                json_value={
+                    "records": 2,
+                    "total": 2,
+                    "page": page,
+                    "list": [row],
+                },
+            )
+        return original_request(method, url, **kwargs)
+
+    session.request = paged_request
+    source = SoftMouseHttpsSource(
+        SoftMouseHttpsConfiguration(page_size=1),
+        SoftMouseCredentials("ben", "secret"),
+        session=session,
+    )
+
+    path = source.download(tmp_path)
+
+    with path.open(newline="", encoding="utf-8") as handle:
+        assert len(list(csv.DictReader(handle))) == 2
 
 
 def test_https_source_retries_transient_network_failure_on_safe_get(tmp_path):
@@ -159,7 +203,7 @@ def test_https_source_retries_transient_network_failure_on_safe_get(tmp_path):
 
     def transient_request(method, url, **kwargs):
         nonlocal failed_once
-        if method == "GET" and url.endswith("login.do") and not failed_once:
+        if method == "GET" and url == "https://www.softmouse.net/" and not failed_once:
             failed_once = True
             raise OSError("temporary network failure")
         return original_request(method, url, **kwargs)
@@ -167,16 +211,6 @@ def test_https_source_retries_transient_network_failure_on_safe_get(tmp_path):
     session.request = transient_request
     source = SoftMouseHttpsSource(
         SoftMouseHttpsConfiguration(
-            base_url="https://softmouse.example/",
-            login_path="login.do",
-            export_start_path="start-export",
-            download_path_template="export/downLoadFile?taskid={task_id}",
-            authentication_check_path="animals.do",
-            csrf_field="csrf",
-            login_username_field="user",
-            export_suffix=".csv",
-            task_id_json_path=("result", "task"),
-            poll_interval_seconds=0,
             transient_retry_initial_seconds=0,
         ),
         SoftMouseCredentials("ben", "secret"),
@@ -187,4 +221,4 @@ def test_https_source_retries_transient_network_failure_on_safe_get(tmp_path):
     path = source.download(tmp_path)
 
     assert failed_once
-    assert b"Physical Tag" in path.read_bytes()
+    assert path.read_text(encoding="utf-8").startswith("SoftMouse ID,")

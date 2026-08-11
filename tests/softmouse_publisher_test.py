@@ -8,7 +8,7 @@ from tools.acquisition.model.softmouse_spreadsheet_source import SoftMouseSpread
 from tools.softmouse_sync.publisher import SoftMouseExportPublisher
 
 
-TAG = "D4D47231005A30010000000000"
+TAG = "360002353933099"
 
 
 class CsvExportSource:
@@ -19,7 +19,7 @@ class CsvExportSource:
         path = destination_directory / "download.csv"
         with path.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.writer(handle)
-            writer.writerow(["Physical Tag", "Alt. ID", "State"])
+            writer.writerow(["Physical Tag", "Plate ID", "State"])
             writer.writerows(self.rows)
         return path
 
@@ -56,7 +56,7 @@ def test_invalid_download_never_replaces_previous_publication(tmp_path):
         destination_directory=destination,
         spreadsheet_source=SoftMouseSpreadsheetSource(),
     )
-    with pytest.raises(ValueError, match="Invalid RFID"):
+    with pytest.raises(ValueError, match="no valid RFID-tagged"):
         bad.publish()
 
     assert first.export_path.read_bytes() == old_export

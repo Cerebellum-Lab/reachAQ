@@ -5,7 +5,7 @@ from tools.acquisition.model.subsystem_status import SubsystemId, SubsystemState
 from autotrainer.device.rfid_reader import RfidReaderState, RfidReaderStatus
 
 
-TAG = "D4D47231005A30010000000000"
+TAG = "360002353933099"
 
 
 def record(subject="PT-1", name="Mouse A"):
@@ -14,7 +14,7 @@ def record(subject="PT-1", name="Mouse A"):
         physical_rfid=TAG,
         new_animal_name_candidate=name,
         state="Stock",
-        source_payload={"Physical Tag": subject, "Alt. ID": TAG},
+        source_payload={"Physical Tag": subject, "Plate ID": TAG},
         source_hash="record-hash",
     )
 

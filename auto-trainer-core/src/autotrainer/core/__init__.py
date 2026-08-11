@@ -305,6 +305,7 @@ from .animal import (
     ExternalMetadataSnapshot,
     NormalizedAnimalBatch,
     normalize_rfid,
+    reader_payload_to_rfid,
 )
 
 from .perf_monitor import PerfMonitor

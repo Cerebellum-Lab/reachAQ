@@ -2,15 +2,15 @@ from __future__ import annotations
 
 import argparse
 import getpass
-import json
 import os
-import tempfile
+import sys
 from pathlib import Path
 
 from tools.acquisition.model.softmouse_spreadsheet_source import (
-    ImportGuardrails,
-    SoftMouseMappingProfile,
     SoftMouseSpreadsheetSource,
+)
+from tools.acquisition.model.animal_metadata_sync import (
+    DEFAULT_SOFTMOUSE_PUBLICATION_DIRECTORY,
 )
 
 from .https_source import (
@@ -22,84 +22,67 @@ from .publisher import SoftMouseExportPublisher
 
 
 DEFAULT_KEYRING_SERVICE = "reachAQ-softmouse-publisher"
+KEYRING_USERNAME_ACCOUNT = "__username__"
+ISILON_MOUNT_ROOT = Path("/mnt/isilon")
+DEFAULT_PUBLICATION_DIRECTORY = DEFAULT_SOFTMOUSE_PUBLICATION_DIRECTORY
 
 
-def _read_configuration(path: Path):
-    value = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(value, dict):
-        raise ValueError("Publisher configuration must be a JSON object")
-    return value
-
-
-def _configuration(path: Path, *, value=None):
-    value = _read_configuration(path) if value is None else value
-    mapping = SoftMouseMappingProfile(**value.get("mapping", {}))
-    guardrails = ImportGuardrails(**value.get("guardrails", {}))
-    https = SoftMouseHttpsConfiguration(**value["https"])
-    return value, SoftMouseSpreadsheetSource(mapping, guardrails), https
-
-
-def _credential_location(
-    value,
+def _ensure_publication_directory(
+    destination: Path = DEFAULT_PUBLICATION_DIRECTORY,
     *,
-    username_override=None,
-    service_override=None,
-):
-    configured = value.get("credentials", {})
-    if not isinstance(configured, dict):
-        raise ValueError("credentials must be a JSON object")
-    username = (username_override or configured.get("username") or "").strip()
-    service = (
-        service_override
-        or configured.get("keyringService")
-        or DEFAULT_KEYRING_SERVICE
-    ).strip()
-    if not username:
-        raise ValueError(
-            "No SoftMouse username is configured; run with "
-            "--configure-credentials once"
+    mount_root: Path = ISILON_MOUNT_ROOT,
+    is_mount=os.path.ismount,
+) -> Path:
+    destination = Path(destination)
+    mount_root = Path(mount_root)
+    if not is_mount(mount_root):
+        raise RuntimeError(
+            f"Isilon is not mounted at {mount_root}; publication stopped"
         )
-    if not service:
-        raise ValueError("The keyring service name cannot be empty")
-    return service, username
+    if not destination.parent.is_dir():
+        raise RuntimeError(
+            f"Isilon publication parent does not exist: {destination.parent}"
+        )
+    destination.mkdir(exist_ok=True)
+    return destination
 
 
-def _write_private_configuration(path: Path, value) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            delete=False,
-            dir=path.parent,
-        ) as handle:
-            temporary_path = Path(handle.name)
-            json.dump(value, handle, indent=2)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(temporary_path, 0o600)
-        os.replace(temporary_path, path)
-    finally:
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
+def _stored_username(keyring_backend, service: str = DEFAULT_KEYRING_SERVICE):
+    username = keyring_backend.get_password(service, KEYRING_USERNAME_ACCOUNT)
+    if username:
+        return username.strip()
+    # Migrate credentials stored by the earlier config-based setup without
+    # requiring the user to enter them again.
+    get_credential = getattr(keyring_backend, "get_credential", None)
+    if get_credential is not None:
+        credential = get_credential(service, None)
+        if credential is not None and credential.username != KEYRING_USERNAME_ACCOUNT:
+            username = credential.username.strip()
+            if username:
+                keyring_backend.set_password(
+                    service,
+                    KEYRING_USERNAME_ACCOUNT,
+                    username,
+                )
+                return username
+    return None
 
 
 def _configure_credentials(
-    path: Path,
-    value,
     *,
     username=None,
-    keyring_service=None,
     username_prompt=None,
     password_prompt=None,
     keyring_backend=None,
 ):
-    configured = value.get("credentials", {})
-    if not isinstance(configured, dict):
-        raise ValueError("credentials must be a JSON object")
-    existing_username = str(configured.get("username") or "").strip()
+    if keyring_backend is None:
+        try:
+            import keyring as keyring_backend
+        except ImportError as exc:
+            raise RuntimeError(
+                "keyring is required to store SoftMouse credentials"
+            ) from exc
+    existing_username = _stored_username(keyring_backend)
     if username is None:
         username_prompt = username_prompt or input
         prompt = "SoftMouse username"
@@ -111,89 +94,91 @@ def _configure_credentials(
     if not username:
         raise ValueError("SoftMouse username cannot be empty")
 
-    service = str(
-        keyring_service
-        or configured.get("keyringService")
-        or DEFAULT_KEYRING_SERVICE
-    ).strip()
-    if not service:
-        raise ValueError("The keyring service name cannot be empty")
-
     password_prompt = password_prompt or getpass.getpass
     password = password_prompt("SoftMouse password: ")
     if not password:
         raise ValueError("SoftMouse password cannot be empty")
+    keyring_backend.set_password(DEFAULT_KEYRING_SERVICE, username, password)
+    keyring_backend.set_password(
+        DEFAULT_KEYRING_SERVICE,
+        KEYRING_USERNAME_ACCOUNT,
+        username,
+    )
+    if keyring_backend.get_password(DEFAULT_KEYRING_SERVICE, username) != password:
+        raise RuntimeError("The OS keyring did not return the stored password")
+    if (
+        keyring_backend.get_password(
+            DEFAULT_KEYRING_SERVICE, KEYRING_USERNAME_ACCOUNT
+        )
+        != username
+    ):
+        raise RuntimeError("The OS keyring did not return the stored username")
+    return username
+
+
+def _credentials_from_keyring(keyring_backend=None) -> SoftMouseCredentials:
     if keyring_backend is None:
         try:
             import keyring as keyring_backend
         except ImportError as exc:
             raise RuntimeError(
-                "keyring is required to store SoftMouse credentials"
+                "keyring is required to read SoftMouse credentials"
             ) from exc
-    keyring_backend.set_password(service, username, password)
-    if keyring_backend.get_password(service, username) != password:
-        raise RuntimeError("The OS keyring did not return the stored password")
-
-    value["credentials"] = {
-        "username": username,
-        "keyringService": service,
-    }
-    _write_private_configuration(path, value)
-    return service, username
+    username = _stored_username(keyring_backend)
+    if not username:
+        raise RuntimeError(
+            "No SoftMouse credentials are stored; run "
+            "`python -m tools.softmouse_sync.cli --setup` once"
+        )
+    password = keyring_backend.get_password(DEFAULT_KEYRING_SERVICE, username)
+    if not password:
+        raise RuntimeError(
+            "The stored SoftMouse username has no password; run "
+            "`python -m tools.softmouse_sync.cli --setup` again"
+        )
+    return SoftMouseCredentials(username, password)
 
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
-        description="Publish a validated, complete SoftMouse export to shared storage"
+        description="Publish the Christie SoftMouse active-animal export to Isilon"
     )
-    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument(
+        "--setup",
+        action="store_true",
+        help="prompt once for the SoftMouse username and password",
+    )
     parser.add_argument(
         "--configure-credentials",
         action="store_true",
-        help="prompt once for the username/password and store them securely",
-    )
-    parser.add_argument(
-        "--username",
-        help="temporary username override (normally read from the config)",
-    )
-    parser.add_argument(
-        "--keyring-service",
-        help="temporary keyring-service override",
+        help=argparse.SUPPRESS,
     )
     args = parser.parse_args(argv)
 
-    value = _read_configuration(args.config)
-    if args.configure_credentials:
-        service, username = _configure_credentials(
-            args.config,
-            value,
-            username=args.username,
-            keyring_service=args.keyring_service,
-        )
-        print(
-            f"Credentials stored for {username!r} in OS keyring service "
-            f"{service!r}; the password was not written to the config file."
-        )
-        return 0
+    try:
+        if args.setup or args.configure_credentials:
+            username = _configure_credentials()
+            print(
+                f"SoftMouse credentials stored securely for {username!r}. "
+                "No configuration file is needed."
+            )
+            return 0
 
-    service, username = _credential_location(
-        value,
-        username_override=args.username,
-        service_override=args.keyring_service,
-    )
-    value, spreadsheet, https_config = _configuration(args.config, value=value)
-    credentials = SoftMouseCredentials.from_keyring(service, username)
-    publisher = SoftMouseExportPublisher(
-        export_source=SoftMouseHttpsSource(https_config, credentials),
-        destination_directory=Path(value["publicationDirectory"]),
-        spreadsheet_source=spreadsheet,
-        lock_path=(
-            None if value.get("lockPath") is None else Path(value["lockPath"])
-        ),
-    )
-    result = publisher.publish()
+        credentials = _credentials_from_keyring()
+        destination = _ensure_publication_directory()
+        publisher = SoftMouseExportPublisher(
+            export_source=SoftMouseHttpsSource(
+                SoftMouseHttpsConfiguration(), credentials
+            ),
+            destination_directory=destination,
+            spreadsheet_source=SoftMouseSpreadsheetSource(),
+        )
+        result = publisher.publish()
+    except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
+        print(f"SoftMouse publication stopped: {exc}", file=sys.stderr)
+        return 1
     print(
-        f"Published {result.total_source_rows} source rows "
+        f"Published {result.total_source_rows} Christie active-animal rows "
         f"({result.tagged_rows} tagged), SHA-256 {result.sha256}"
     )
     return 0

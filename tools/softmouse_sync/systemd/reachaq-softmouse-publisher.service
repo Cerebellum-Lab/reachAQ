@@ -1,11 +1,14 @@
 [Unit]
 Description=Publish a complete SoftMouse animal export for reachAQ
+# Install this user unit on the single designated publisher computer only.
 After=network-online.target
 Wants=network-online.target
+RequiresMountsFor=/mnt/isilon
 
 [Service]
 Type=oneshot
-ExecStart=/home/christielab10/anaconda3/envs/reachaq/bin/python -m tools.softmouse_sync.cli --config %h/.config/reachaq/softmouse-publisher.json
+# These are the standard reachAQ environment and checkout paths on the publisher.
+ExecStart=/home/christielab10/anaconda3/envs/reachaq/bin/python -m tools.softmouse_sync.cli
 WorkingDirectory=/home/christielab10/Documents/reachAQ
 PrivateTmp=true
 NoNewPrivileges=true

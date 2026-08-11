@@ -8,8 +8,10 @@ from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
 
 SOFTMOUSE_PROVIDER = "softmouse"
 PHYSICAL_TAG_ID_KIND = "physical_tag"
-RFID_HEX_LENGTH = 26
-_RFID_RE = re.compile(r"^[0-9A-F]{26}$")
+RFID_DECIMAL_LENGTH = 15
+RFID_READER_PAYLOAD_LENGTH = 26
+_RFID_RE = re.compile(r"^[0-9]{15}$")
+_RFID_READER_PAYLOAD_RE = re.compile(r"^[0-9A-Fa-f]{26}$")
 
 
 def normalize_optional_text(value: Any) -> Optional[str]:
@@ -32,13 +34,32 @@ def normalize_rfid(value: Any) -> str:
     text = normalize_optional_text(value)
     if text is None:
         raise ValueError("RFID cannot be empty")
-    normalized = text.upper()
-    if _RFID_RE.fullmatch(normalized) is None:
+    if _RFID_RE.fullmatch(text) is None:
         raise ValueError(
-            "RFID must be exactly 26 hexadecimal characters from a validated "
-            "reader payload"
+            "RFID must be the 15-digit ISO 11784 identifier stored in "
+            "SoftMouse Plate ID"
         )
-    return normalized
+    return text
+
+
+def reader_payload_to_rfid(value: Any) -> str:
+    """Convert this reader's 26-hex payload to ISO 11784 decimal form.
+
+    The first 16 hexadecimal characters contain the ISO 11784 64-bit value in
+    the reader's animal-ID-on-the-right ordering. The remaining ten characters
+    are transport payload data and do not participate in the animal identity.
+    """
+    text = normalize_optional_text(value)
+    if text is None or _RFID_READER_PAYLOAD_RE.fullmatch(text) is None:
+        raise ValueError(
+            "RFID reader payload must be exactly 26 hexadecimal characters"
+        )
+    raw = text.upper()[:16]
+    animal_bits = f"{int(raw[:10], 16):040b}"[:38][::-1]
+    country_bits = f"{int(raw[9:12], 16):012b}"[2:12][::-1]
+    country = int(country_bits, 2)
+    animal_id = int(animal_bits, 2)
+    return normalize_rfid(f"{country:03d}{animal_id:012d}")
 
 
 def normalize_state(value: Any) -> str:
