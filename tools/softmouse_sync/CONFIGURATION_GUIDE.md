@@ -3,6 +3,21 @@
 The website paths, colony, export rules, and Isilon destination are built in.
 Only the SoftMouse username and password are entered by the operator.
 
+## Install once on every computer
+
+From the repository, run the normal reachAQ installer:
+
+```bash
+cd /home/christielab10/Documents/reachAQ
+./tools/install/reachaq-linux-install.sh
+```
+
+It installs the SoftMouse HTTPS, spreadsheet, and operating-system keyring
+dependencies plus the RFID serial package and `dialout` permission. If it says
+the account was added to `dialout`, log out and back in, then rerun the same
+command. The final report should show `PASS` for **Verify SoftMouse runtime**,
+**Verify RFID runtime**, and **Verify SoftMouse systemd units**.
+
 ## Every computer allowed to publish
 
 ```bash
@@ -21,6 +36,9 @@ Confirm Isilon is mounted and test publication:
 findmnt /mnt/isilon
 python -m tools.softmouse_sync.cli
 ```
+
+The credential setup requires a logged-in graphical user session so the Linux
+Secret Service can unlock the operator's keyring. Do not run it with `sudo`.
 
 Or open **Preferences → Animal metadata** in reachAQ and click **Sync from
 SoftMouse**. The button is available on every acquisition computer; run the
@@ -56,6 +74,13 @@ Check a run with:
 systemctl --user start reachaq-softmouse-publisher.service
 journalctl --user -u reachaq-softmouse-publisher.service -n 100 --no-pager
 ```
+
+The service runs as the same user who stored the credentials. It automatically
+finds the `reachaq` environment in the standard Anaconda, Miniconda, or
+Mambaforge locations. If the checkout is not at
+`~/Documents/reachAQ`, edit `WorkingDirectory` in the copied file under
+`~/.config/systemd/user/`, run `systemctl --user daemon-reload`, and verify it
+again before enabling the timer.
 
 Do not install or enable that timer on the other computers. Their manual button
 continues to work after local credential setup.

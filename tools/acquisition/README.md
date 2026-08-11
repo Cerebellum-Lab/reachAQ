@@ -286,7 +286,10 @@ to Isilon and refreshes the local cache, from **Refresh local cache**, which
 only consumes the latest completed Isilon publication. Neither action is
 available during recording. See the
 [SoftMouse/RFID guide](../softmouse_sync/README.md) for credentials, reader
-setup, metadata ownership, safety checks, and the single-host nightly timer.
+setup, required packages and serial permissions, metadata ownership, safety
+checks, and the single-host nightly timer. The normal portable installer
+installs and verifies these dependencies; credential entry remains a one-time
+per-publisher action.
 
 The Hardware Refresh icon is at the far right of the Hardware Status title bar.
 While idle it repeats discovery and refreshes bindings. While System Mode is

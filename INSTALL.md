@@ -24,6 +24,13 @@ Python environment, TensorFlow-compatible CUDA libraries, Git LFS, CLI/import
 verification, GPU preflight, and the focused non-hardware suite. Individual
 failures do not stop later categories; a complete report is printed at the end.
 
+The portable dependency set includes the complete Qt runtime used by the GUI,
+the Linux Secret Service/keyring used for SoftMouse credentials, Requests and
+OpenPyXL for metadata publication/import, and pyserial plus `dialout` group
+membership for the USB RFID reader. If the installer adds your account to
+`dialout`, log out and back in once, reconnect the reader, and rerun the same
+installer command so its serial-permission check runs in the new login session.
+
 Install the NVIDIA kernel driver first so the automatic TensorFlow GPU preflight
 can pass. See the [NVIDIA/TensorFlow guide](docs/linux-install/nvidia-inference.md)
 for supported versions and diagnostics.
@@ -31,6 +38,10 @@ for supported versions and diagnostics.
 Vendor drivers and rig configuration are intentionally separate. Use the
 [Linux installation map](linux-install-instructions.md) to select only the
 FLIR, NI/PXI, PEAK CAN, and NVIDIA guides applicable to the target system.
+SoftMouse credentials and the optional single-machine nightly timer are also a
+post-install setup because credentials cannot be entered safely by an
+unattended installer. Follow the
+[SoftMouse/RFID checklist](tools/softmouse_sync/CONFIGURATION_GUIDE.md).
 
 Start the GUI with:
 

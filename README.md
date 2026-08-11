@@ -35,7 +35,12 @@ and local acquisition data should be configured under
 Portable host setup is automated by
 [`tools/install/reachaq-linux-install.sh`](tools/install/reachaq-linux-install.sh).
 Vendor drivers and rig-specific hardware configuration remain in separate
-guides selected from the Linux installation map.
+guides selected from the Linux installation map. The portable installer also
+installs and verifies the SoftMouse HTTPS/spreadsheet/keyring dependencies,
+RFID serial dependency and permissions, and the tracked publisher systemd
+units. Credential entry and enabling the one designated nightly timer remain
+explicit post-install steps in the
+[SoftMouse/RFID checklist](tools/softmouse_sync/CONFIGURATION_GUIDE.md).
 
 ## Applications
 

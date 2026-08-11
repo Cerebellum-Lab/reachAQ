@@ -53,7 +53,10 @@ git status --short --branch
 
 The script installs general Ubuntu/Qt/build packages, creates the conda
 environment, installs Python dependencies and the editable project, initializes
-Git LFS, creates runtime directories, and runs generic verification.
+Git LFS, creates runtime directories, configures the operator's `dialout`
+membership for USB serial access, and runs generic verification. It also
+installs the Linux Secret Service/keyring components needed to store SoftMouse
+credentials securely.
 
 Run the installer:
 
@@ -79,6 +82,11 @@ kernel driver or install a system-wide CUDA toolkit.
   have run.
 - Re-running the same no-argument command is the supported repair and
   verification workflow.
+- If the installer adds the operator to `dialout`, log out and back in before
+  using the RFID reader, then rerun the installer to verify the active login's
+  serial permissions.
+- The report separately verifies SoftMouse imports/keyring availability, RFID
+  imports/device permissions, and the tracked nightly systemd units.
 
 ## 3. Install only applicable hardware support
 
@@ -166,6 +174,11 @@ operator selects Running.
 - [ ] Output directory exists and is writable by the operator.
 - [ ] GUI launches idle and hardware initialization emits `HARDWARE INIT`
   progress records when Running is selected.
+- [ ] SoftMouse runtime and systemd-unit checks pass in the installer report.
+- [ ] The acquisition operator belongs to `dialout`; any attached RFID reader
+  under `/dev/serial/by-id/` is readable and writable after a fresh login.
+- [ ] On each machine allowed to publish, the one-time SoftMouse credential
+  setup and a manual sync pass; the timer is enabled on exactly one machine.
 
 ## Safety boundary
 

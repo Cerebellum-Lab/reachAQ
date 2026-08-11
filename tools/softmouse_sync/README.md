@@ -20,6 +20,28 @@ computer may run the same manual publication because the shared lock allows
 only one writer at a time. Computers that only consume an existing publication
 do not need a SoftMouse login.
 
+## Installation requirements
+
+Run the repository's portable installer on every acquisition computer:
+
+```bash
+cd /home/christielab10/Documents/reachAQ
+./tools/install/reachaq-linux-install.sh
+```
+
+The normal editable package install supplies `requests`, `openpyxl`, `keyring`,
+and `pyserial`. The installer also supplies the Ubuntu Secret Service/D-Bus
+packages required by keyring, the complete portable Qt libraries, and
+`dialout` membership for USB serial access. It verifies the Python imports,
+selects a usable OS keyring backend, checks attached `/dev/serial/by-id/`
+devices for read/write permission, validates the systemd units, and exercises
+the SoftMouse/RFID test suite.
+
+If the installer adds the operator to `dialout`, log out and back in once and
+rerun it. Group changes do not affect applications launched from the old login
+session. Vendor camera, NI-DAQ, CAN, and NVIDIA kernel drivers remain separate
+rig-specific installs described in the main Linux installation guide.
+
 ## Fixed application defaults
 
 These values are built into the application and are not operator configuration:
@@ -54,6 +76,10 @@ does not display characters. Both values are stored by the operating system
 keyring under service `reachAQ-softmouse-publisher`; they are not passed on the
 command line or written to the repository. Repeat `--setup` to replace either
 credential.
+
+Run credential setup as the normal desktop operator, not with `sudo`. The Linux
+Secret Service must be available in that user's logged-in session. The nightly
+user service must also run as this same account so it can read the credential.
 
 No JSON configuration is read. A legacy
 `~/.config/reachaq/softmouse-publisher.json` is ignored and may be deleted after
@@ -101,8 +127,10 @@ systemctl --user list-timers reachaq-softmouse-publisher.timer
 The timer runs at midnight in `America/Denver`, allows up to two minutes of
 randomized delay, and is persistent. If the user timer was unavailable at
 midnight, systemd runs the missed job after it next starts. The tracked service
-uses this machine's standard repository and Conda paths and requires
-`/mnt/isilon` to be mounted.
+uses `~/Documents/reachAQ`, finds the `reachaq` environment in the standard
+Anaconda, Miniconda, or Mambaforge locations, and requires `/mnt/isilon` to be
+mounted. Edit the installed unit's `WorkingDirectory` only when the checkout
+uses a nonstandard path.
 
 Verify or run the installed job with:
 
@@ -178,6 +206,9 @@ publication.
 
 ## Troubleshooting
 
+- **No usable keyring backend:** rerun the portable installer, log into the
+  desktop as the acquisition operator, and run credential setup without
+  `sudo`.
 - **No credentials are stored:** rerun `python -m tools.softmouse_sync.cli
   --setup` on that computer.
 - **Isilon is not mounted:** restore `/mnt/isilon`; the publisher deliberately
@@ -188,7 +219,9 @@ publication.
 - **Another publication is running:** wait for the other computer to finish and
   retry. Do not remove `.publish.lock`.
 - **RFID reader failed:** confirm it is attached at the configured
-  `/dev/serial/by-id/...` path, then apply reader settings or refresh hardware.
+  `/dev/serial/by-id/...` path, confirm `id -nG` includes `dialout`, then apply
+  reader settings or refresh hardware. Log out and back in after any group
+  change.
 - **Shared publication updated but local refresh failed:** use **Refresh local
   cache** after resolving the reported manifest, mount, or recording-state
   error.
