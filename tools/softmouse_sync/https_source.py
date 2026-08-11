@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import csv
+import logging
 import time
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Tuple
 from urllib.parse import parse_qs, urljoin, urlparse
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -160,6 +164,11 @@ class SoftMouseHttpsSource:
         self._sleep = sleep
 
     def download(self, destination_directory: Path) -> Path:
+        logger.info(
+            "SoftMouse HTTPS export started: colony=%s origin=%s",
+            self.configuration.colony_name,
+            self.configuration.base_url,
+        )
         owner_code = self._login_and_select_colony()
         rows = self._download_and_validate_export_scope(owner_code)
         destination = Path(destination_directory) / (
@@ -178,6 +187,12 @@ class SoftMouseHttpsSource:
                         for header, source in self._EXPORT_COLUMNS
                     }
                 )
+        logger.info(
+            "SoftMouse HTTPS export written: colony=%s rows=%d destination=%s",
+            self.configuration.colony_name,
+            len(rows),
+            destination,
+        )
         return destination
 
     def _url(self, path: str) -> str:
@@ -194,6 +209,11 @@ class SoftMouseHttpsSource:
 
     def _login_and_select_colony(self) -> str:
         cfg = self.configuration
+        logger.info(
+            "SoftMouse authentication started: origin=%s colony=%s",
+            cfg.base_url,
+            cfg.colony_name,
+        )
         response = self._transient_request("GET", self._url(cfg.login_path))
         response.raise_for_status()
         parser = self._parse_page(response.text)
@@ -226,6 +246,7 @@ class SoftMouseHttpsSource:
         if any("login" in item["action"].casefold() for item in login_parser.forms):
             raise RuntimeError("SoftMouse rejected the stored username or password")
         self._reject_interactive_challenge(login_response.text)
+        logger.info("SoftMouse authentication accepted")
 
         target_name = cfg.colony_name.casefold()
         matching_links = [
@@ -254,6 +275,10 @@ class SoftMouseHttpsSource:
         self._reject_interactive_challenge(animals.text)
         if cfg.animal_list_marker.casefold() not in animals.text.casefold():
             raise RuntimeError("SoftMouse Animals page marker was not found")
+        logger.info(
+            "SoftMouse colony selected and Animals page validated: colony=%s",
+            cfg.colony_name,
+        )
         return owner_code
 
     def _reject_interactive_challenge(self, text: str) -> None:
@@ -318,6 +343,14 @@ class SoftMouseHttpsSource:
             if not isinstance(page_rows, list):
                 raise RuntimeError("SoftMouse returned invalid Animals rows")
             rows.extend(page_rows)
+            logger.info(
+                "SoftMouse Animals page received: page=%d pages=%d page_rows=%d "
+                "reported_records=%d",
+                page,
+                page_count,
+                len(page_rows),
+                record_count,
+            )
             page += 1
 
         record_count = expected_records or 0
@@ -350,6 +383,12 @@ class SoftMouseHttpsSource:
             if identifier is None or identifier in identifiers:
                 raise RuntimeError("SoftMouse export contains a missing or duplicate animal ID")
             identifiers.add(identifier)
+        logger.info(
+            "SoftMouse export scope validated: colony=%s active_rows=%d states=%s",
+            cfg.colony_name,
+            len(rows),
+            ",".join(cfg.active_states),
+        )
         return rows
 
     def _transient_request(self, method: str, url: str, **kwargs):
@@ -369,6 +408,15 @@ class SoftMouseHttpsSource:
                 last_error = exc
                 if attempt + 1 >= cfg.transient_request_attempts:
                     raise
+                logger.warning(
+                    "SoftMouse request failed; retrying: method=%s path=%s "
+                    "attempt=%d/%d error=%s",
+                    method,
+                    urlparse(url).path,
+                    attempt + 1,
+                    cfg.transient_request_attempts,
+                    exc,
+                )
                 self._sleep(delay)
                 delay = min(
                     cfg.transient_retry_max_seconds,
@@ -379,6 +427,15 @@ class SoftMouseHttpsSource:
             if response.status_code not in {429, 500, 502, 503, 504}:
                 return response
             if attempt + 1 < cfg.transient_request_attempts:
+                logger.warning(
+                    "SoftMouse request returned transient status; retrying: "
+                    "method=%s path=%s status=%d attempt=%d/%d",
+                    method,
+                    urlparse(url).path,
+                    response.status_code,
+                    attempt + 1,
+                    cfg.transient_request_attempts,
+                )
                 self._sleep(delay)
                 delay = min(cfg.transient_retry_max_seconds, max(delay * 2, 0.1))
         if last_response is not None:

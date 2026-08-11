@@ -5,7 +5,11 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, QProcess, Signal
 
+from autotrainer.core.logging import get_verbose_logger
 from tools.acquisition.model.app_model_status import SessionRecordingStatus
+
+
+logger = get_verbose_logger(__name__)
 
 
 class SoftMousePublicationController(QObject):
@@ -57,26 +61,42 @@ class SoftMousePublicationController(QObject):
 
     def start(self) -> bool:
         if self.is_running:
+            logger.warning("SoftMouse manual publication ignored: already running")
             self._set_status("A SoftMouse sync is already running")
             return False
         if (
             self._app_model.session_recording_status
             is not SessionRecordingStatus.READY
         ):
+            logger.warning(
+                "SoftMouse manual publication blocked: recording_status=%s",
+                self._app_model.session_recording_status,
+            )
             self._set_status("SoftMouse sync is unavailable during recording")
             return False
         self._process.setProgram(self._program)
         self._process.setArguments(list(self._arguments))
         self._process.setWorkingDirectory(self._working_directory.as_posix())
         self._set_status("Starting SoftMouse sync…")
+        logger.info(
+            "SoftMouse manual publication requested: program=%s working_directory=%s",
+            self._program,
+            self._working_directory,
+        )
         self._process.start()
         self.running_changed.emit(True)
         return True
 
     def _on_started(self) -> None:
+        logger.info("SoftMouse publisher process started: pid=%s", self._process.processId())
         self._set_status("Downloading current Christie animals from SoftMouse…")
 
     def _on_process_error(self, error) -> None:
+        logger.error(
+            "SoftMouse publisher process error: error=%s detail=%s",
+            error,
+            self._process.errorString(),
+        )
         if error == QProcess.ProcessError.FailedToStart:
             self._set_status(
                 f"SoftMouse sync could not start: {self._process.errorString()}"
@@ -92,24 +112,39 @@ class SoftMousePublicationController(QObject):
         )
         if exit_code != 0:
             detail = self._last_output_line(stderr) or self._last_output_line(stdout)
+            logger.error(
+                "SoftMouse publisher failed: exit_code=%s detail=%s",
+                exit_code,
+                detail or "none",
+            )
             self._set_status(detail or f"SoftMouse sync failed (exit {exit_code})")
             self.running_changed.emit(False)
             return
 
         publication = self._last_output_line(stdout) or "Shared publication updated"
+        logger.info(
+            "SoftMouse publisher completed: exit_code=%s result=%s",
+            exit_code,
+            publication,
+        )
         self._set_status(f"{publication}; refreshing this computer's cache…")
         try:
             self._app_model.refresh_animal_metadata()
         except Exception as exc:
+            logger.exception(
+                "SoftMouse publication succeeded but local cache refresh failed"
+            )
             self._set_status(
                 f"Shared publication updated, but local cache refresh failed: {exc}"
             )
         else:
+            logger.info("SoftMouse manual sync complete: shared and local caches updated")
             self._set_status(f"{publication}; local cache refreshed")
         self.running_changed.emit(False)
 
     def _set_status(self, value: str) -> None:
         self._status = value
+        logger.info("SoftMouse sync status: %s", value)
         self.status_changed.emit(value)
 
     @staticmethod

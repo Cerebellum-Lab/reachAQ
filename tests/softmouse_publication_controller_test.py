@@ -1,4 +1,5 @@
 import os
+import logging
 import sys
 from types import SimpleNamespace
 
@@ -40,7 +41,11 @@ def _wait_for_process(controller, timeout_ms=5000):
     assert not controller.is_running
 
 
-def test_successful_publication_refreshes_local_cache(qapp, tmp_path):
+def test_successful_publication_refreshes_local_cache(qapp, tmp_path, caplog):
+    caplog.set_level(
+        logging.INFO,
+        logger="tools.acquisition.view.softmouse_publication_controller",
+    )
     model = AppModelStub()
     controller = SoftMousePublicationController(
         model,
@@ -54,6 +59,10 @@ def test_successful_publication_refreshes_local_cache(qapp, tmp_path):
 
     assert model.refreshes == 1
     assert controller.status == "Published test snapshot; local cache refreshed"
+    assert any(
+        "SoftMouse manual sync complete" in entry.getMessage()
+        for entry in caplog.records
+    )
 
 
 def test_failed_publication_preserves_error_and_does_not_refresh(qapp, tmp_path):

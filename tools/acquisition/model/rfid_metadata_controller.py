@@ -3,9 +3,16 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
+from autotrainer.core.logging import (
+    ALWAYS_CONSOLE_LOG_ATTRIBUTE,
+    get_verbose_logger,
+)
 from autotrainer.device.rfid_reader import RfidReaderService, RfidTagRead
 
 from .animal_registry import AnimalRegistry
+
+
+logger = get_verbose_logger(__name__)
 
 
 def _qt_dispatcher():
@@ -59,6 +66,20 @@ class RfidMetadataController:
 
     def _on_status(self, status) -> None:
         self.reader_status = status
+        state = getattr(getattr(status, "state", None), "value", "unknown")
+        status_logger = (
+            logger.error
+            if state == "failed"
+            else logger.warning
+            if state == "reconnecting"
+            else logger.info
+        )
+        status_logger(
+            "RFID reader status: state=%s device=%s reason=%s",
+            state,
+            getattr(status, "device", self.reader.device),
+            getattr(status, "reason", "") or "none",
+        )
         callback = getattr(self.app_model, "set_rfid_reader_status", None)
         if callback is not None:
             self.dispatch(lambda: callback(status))
@@ -66,8 +87,18 @@ class RfidMetadataController:
     def _on_tag(self, event: RfidTagRead) -> None:
         # The registry is local SQLite and safe to query on the reader thread;
         # all AppModel mutation is handed to the configured GUI dispatcher.
-        record = self.registry.resolve_rfid(event.rfid)
-        ledger = self.registry.last_complete_import()
+        logger.info(
+            "RFID scan received: rfid=%s device=%s",
+            event.rfid,
+            self.reader.device,
+            extra={ALWAYS_CONSOLE_LOG_ATTRIBUTE: True},
+        )
+        try:
+            record = self.registry.resolve_rfid(event.rfid)
+            ledger = self.registry.last_complete_import()
+        except Exception:
+            logger.exception("RFID registry lookup failed: rfid=%s", event.rfid)
+            raise
         cache_stale = True
         if ledger is not None:
             try:
@@ -80,27 +111,41 @@ class RfidMetadataController:
             except (TypeError, ValueError):
                 cache_stale = True
 
+        logger.info(
+            "RFID registry lookup: rfid=%s matched=%s subject_id=%s "
+            "cache_stale=%s import_id=%s",
+            event.rfid,
+            record is not None,
+            None if record is None else record.identity.subject_id,
+            cache_stale,
+            None if ledger is None else ledger["import_id"],
+        )
+
         def resolve() -> None:
-            handler = getattr(
-                self.app_model,
-                "handle_rfid_scan",
-                self.app_model.resolve_external_record,
-            )
-            self.last_resolution = handler(
-                record,
-                scanned_rfid=event.rfid,
-                registry_import_id=None if ledger is None else ledger["import_id"],
-                source_file_sha256=(
-                    None if ledger is None else ledger["source_file_sha256"]
-                ),
-                imported_utc=None if ledger is None else ledger["imported_utc"],
-                cache_stale=cache_stale,
-            )
+            handler = getattr(self.app_model, "handle_rfid_scan", None)
+            if handler is None:
+                handler = self.app_model.resolve_external_record
+            try:
+                self.last_resolution = handler(
+                    record,
+                    scanned_rfid=event.rfid,
+                    registry_import_id=None if ledger is None else ledger["import_id"],
+                    source_file_sha256=(
+                        None if ledger is None else ledger["source_file_sha256"]
+                    ),
+                    imported_utc=None if ledger is None else ledger["imported_utc"],
+                    cache_stale=cache_stale,
+                )
+            except Exception:
+                logger.exception("RFID scan resolution failed: rfid=%s", event.rfid)
+                raise
 
         self.dispatch(resolve)
 
     def start(self) -> None:
+        logger.info("Starting RFID reader: device=%s", self.reader.device)
         self.reader.start()
 
     def stop(self) -> None:
+        logger.info("Stopping RFID reader: device=%s", self.reader.device)
         self.reader.stop()

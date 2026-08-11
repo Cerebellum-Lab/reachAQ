@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import logging
 import os
 import sys
 from pathlib import Path
@@ -25,6 +26,9 @@ DEFAULT_KEYRING_SERVICE = "reachAQ-softmouse-publisher"
 KEYRING_USERNAME_ACCOUNT = "__username__"
 ISILON_MOUNT_ROOT = Path("/mnt/isilon")
 DEFAULT_PUBLICATION_DIRECTORY = DEFAULT_SOFTMOUSE_PUBLICATION_DIRECTORY
+
+
+logger = logging.getLogger(__name__)
 
 
 def _ensure_publication_directory(
@@ -140,6 +144,11 @@ def _credentials_from_keyring(keyring_backend=None) -> SoftMouseCredentials:
 
 
 def main(argv=None) -> int:
+    if not logging.getLogger().handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        )
     parser = argparse.ArgumentParser(
         description="Publish the Christie SoftMouse active-animal export to Isilon"
     )
@@ -158,6 +167,11 @@ def main(argv=None) -> int:
     try:
         if args.setup or args.configure_credentials:
             username = _configure_credentials()
+            logger.info(
+                "SoftMouse credentials stored in OS keyring: service=%s username=%s",
+                DEFAULT_KEYRING_SERVICE,
+                username,
+            )
             print(
                 f"SoftMouse credentials stored securely for {username!r}. "
                 "No configuration file is needed."
@@ -166,6 +180,11 @@ def main(argv=None) -> int:
 
         credentials = _credentials_from_keyring()
         destination = _ensure_publication_directory()
+        logger.info(
+            "SoftMouse publication requested: colony=%s destination=%s",
+            SoftMouseHttpsConfiguration().colony_name,
+            destination,
+        )
         publisher = SoftMouseExportPublisher(
             export_source=SoftMouseHttpsSource(
                 SoftMouseHttpsConfiguration(), credentials
@@ -175,8 +194,16 @@ def main(argv=None) -> int:
         )
         result = publisher.publish()
     except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
+        logger.exception("SoftMouse publication stopped")
         print(f"SoftMouse publication stopped: {exc}", file=sys.stderr)
         return 1
+    logger.info(
+        "SoftMouse publication complete: rows=%d tagged=%d sha256=%s export=%s",
+        result.total_source_rows,
+        result.tagged_rows,
+        result.sha256,
+        result.export_path,
+    )
     print(
         f"Published {result.total_source_rows} Christie active-animal rows "
         f"({result.tagged_rows} tagged), SHA-256 {result.sha256}"

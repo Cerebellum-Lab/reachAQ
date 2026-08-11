@@ -9,12 +9,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
+from autotrainer.core.logging import get_verbose_logger
 from autotrainer.core.animal.external_metadata import (
     ExternalAnimalRecord,
     ExternalIdentity,
     NormalizedAnimalBatch,
     normalize_rfid,
 )
+
+
+logger = get_verbose_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -56,7 +60,17 @@ class AnimalRegistry:
                 if sidecar.exists():
                     os.replace(sidecar, Path(str(recovery) + suffix))
             self.recovered_corrupt_path = recovery
+            logger.warning(
+                "SoftMouse registry was corrupt and rebuilt: path=%s backup=%s",
+                self.path,
+                recovery,
+            )
             self._initialize()
+        logger.info(
+            "SoftMouse registry ready: path=%s recovered=%s",
+            self.path,
+            self.recovered_corrupt_path is not None,
+        )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(str(self.path), timeout=10)
@@ -134,6 +148,13 @@ class AnimalRegistry:
                 (batch.provider, batch.source_file_sha256),
             ).fetchone()
             if existing is not None:
+                logger.info(
+                    "SoftMouse registry import unchanged: import_id=%s records=%d "
+                    "source_sha256=%s",
+                    existing["import_id"],
+                    len(batch.records),
+                    batch.source_file_sha256,
+                )
                 return RegistryImportResult(
                     existing["import_id"], batch.source_file_sha256, len(batch.records), True
                 )
@@ -218,7 +239,20 @@ class AnimalRegistry:
                 db.commit()
             except Exception:
                 db.rollback()
+                logger.exception(
+                    "SoftMouse registry replacement rolled back: import_id=%s "
+                    "records=%d source_sha256=%s",
+                    batch.import_id,
+                    len(batch.records),
+                    batch.source_file_sha256,
+                )
                 raise
+        logger.info(
+            "SoftMouse registry replaced: import_id=%s records=%d source_sha256=%s",
+            batch.import_id,
+            len(batch.records),
+            batch.source_file_sha256,
+        )
         return RegistryImportResult(
             batch.import_id, batch.source_file_sha256, len(batch.records)
         )
@@ -241,7 +275,14 @@ class AnimalRegistry:
                 """,
                 (normalized,),
             ).fetchone()
-        return None if row is None else self._record_from_dict(json.loads(row[0]))
+        record = None if row is None else self._record_from_dict(json.loads(row[0]))
+        logger.info(
+            "SoftMouse registry RFID lookup: rfid=%s matched=%s subject_id=%s",
+            normalized,
+            record is not None,
+            None if record is None else record.identity.subject_id,
+        )
+        return record
 
     def list_current_records(self) -> List[ExternalAnimalRecord]:
         with self._lock, self._connect() as db:

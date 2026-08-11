@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import logging
 import os
 import shutil
 import tempfile
@@ -10,6 +11,9 @@ from pathlib import Path
 from typing import Optional, Protocol
 
 from tools.acquisition.model.softmouse_spreadsheet_source import SoftMouseSpreadsheetSource
+
+
+logger = logging.getLogger(__name__)
 
 
 class ExportSource(Protocol):
@@ -42,12 +46,19 @@ class SoftMouseExportPublisher:
         self.lock_path = Path(lock_path or (self.destination_directory / ".publish.lock"))
 
     def publish(self) -> PublicationResult:
+        logger.info(
+            "SoftMouse publication transaction started: destination=%s lock=%s",
+            self.destination_directory,
+            self.lock_path,
+        )
         self.destination_directory.mkdir(parents=True, exist_ok=True)
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
         with self.lock_path.open("a+") as lock_file:
             self._lock(lock_file)
+            logger.info("SoftMouse publication lock acquired: lock=%s", self.lock_path)
             with tempfile.TemporaryDirectory(prefix="softmouse-publish-") as temporary:
                 downloaded = self.export_source.download(Path(temporary))
+                logger.info("SoftMouse export downloaded: source=%s", downloaded)
                 previous_rows = None
                 previous_manifest = (
                     self.destination_directory
@@ -69,6 +80,16 @@ class SoftMouseExportPublisher:
                     previous_source_row_count=previous_rows,
                 )
                 batch = preview.batch
+                logger.info(
+                    "SoftMouse export accepted for publication: total_rows=%d "
+                    "tagged_rows=%d ignored_missing_rfid=%d ignored_ended=%d "
+                    "source_sha256=%s",
+                    batch.total_source_rows,
+                    batch.accepted_rows,
+                    batch.ignored_missing_rfid_rows,
+                    batch.ignored_ended_rows,
+                    batch.source_file_sha256,
+                )
                 if batch.accepted_rows < 1:
                     raise ValueError(
                         "SoftMouse export contains no valid RFID-tagged active animals; "
@@ -115,13 +136,16 @@ class SoftMouseExportPublisher:
                         manifest_path,
                     )
                 except Exception:
+                    logger.exception(
+                        "SoftMouse publication commit failed; restoring previous export"
+                    )
                     if stable_replaced:
                         if had_previous_stable:
                             self._atomic_copy(previous_stable, stable_path)
                         else:
                             stable_path.unlink(missing_ok=True)
                     raise
-                return PublicationResult(
+                result = PublicationResult(
                     stable_path,
                     manifest_path,
                     archive_path,
@@ -130,6 +154,15 @@ class SoftMouseExportPublisher:
                     batch.accepted_rows,
                     published_utc,
                 )
+                logger.info(
+                    "SoftMouse publication transaction committed: export=%s "
+                    "manifest=%s archive=%s sha256=%s",
+                    stable_path,
+                    manifest_path,
+                    archive_path,
+                    digest,
+                )
+                return result
 
     @staticmethod
     def _lock(file_object) -> None:

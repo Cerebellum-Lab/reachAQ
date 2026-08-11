@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
+from autotrainer.core.logging import get_verbose_logger
 from autotrainer.core.animal.external_metadata import (
     ExternalAnimalRecord,
     ExternalIdentity,
@@ -20,6 +21,9 @@ from autotrainer.core.animal.external_metadata import (
     normalize_state,
     split_genotype,
 )
+
+
+logger = get_verbose_logger(__name__)
 
 
 def _utc_now() -> str:
@@ -148,6 +152,14 @@ class SoftMouseSpreadsheetSource:
         previous_source_row_count: Optional[int] = None,
     ) -> SpreadsheetImportPreview:
         source_path = Path(path)
+        logger.info(
+            "SoftMouse export validation started: source=%s previous_rows=%s "
+            "rfid_column=%s name_column=%s",
+            source_path,
+            previous_source_row_count,
+            self.profile.rfid_column,
+            self.profile.new_animal_name_column,
+        )
         stat = source_path.stat()
         source_bytes = source_path.read_bytes()
         source_hash = hashlib.sha256(source_bytes).hexdigest()
@@ -238,7 +250,7 @@ class SoftMouseSpreadsheetSource:
             ignored_ended_rows=ignored_ended,
             records=tuple(records),
         )
-        return SpreadsheetImportPreview(
+        preview = SpreadsheetImportPreview(
             batch=batch,
             source_path=source_path,
             source_size=stat.st_size,
@@ -251,6 +263,17 @@ class SoftMouseSpreadsheetSource:
                 header for index, header in enumerate(headers) if header and index not in resolved.values()
             ),
         )
+        logger.info(
+            "SoftMouse export validation complete: source=%s total_rows=%d tagged_rows=%d "
+            "ignored_missing_rfid=%d ignored_ended=%d source_sha256=%s",
+            source_path,
+            batch.total_source_rows,
+            batch.accepted_rows,
+            batch.ignored_missing_rfid_rows,
+            batch.ignored_ended_rows,
+            batch.source_file_sha256,
+        )
+        return preview
 
     def _read_rows(self, path: Path) -> Tuple[List[str], List[Tuple[Any, ...]], str]:
         suffix = path.suffix.casefold()

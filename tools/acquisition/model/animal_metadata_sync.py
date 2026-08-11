@@ -11,11 +11,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
+from autotrainer.core.logging import get_verbose_logger
+
 from .animal_registry import AnimalRegistry, RegistryImportResult
 from .softmouse_spreadsheet_source import (
     SoftMouseSpreadsheetSource,
     SpreadsheetImportPreview,
 )
+
+
+logger = get_verbose_logger(__name__)
 
 
 DEFAULT_SOFTMOUSE_PUBLICATION_DIRECTORY = Path(
@@ -102,10 +107,17 @@ class AnimalMetadataSyncService:
 
     def refresh_now(self) -> MetadataRefreshResult:
         if not self.can_refresh():
+            logger.warning("SoftMouse cache refresh blocked: session is active")
             raise RuntimeError("SoftMouse refresh is disabled while a session is active")
         if not self._lock.acquire(blocking=False):
+            logger.warning("SoftMouse cache refresh blocked: refresh already running")
             raise RuntimeError("A SoftMouse refresh is already running")
         try:
+            logger.info(
+                "SoftMouse cache refresh started: manifest=%s staging_directory=%s",
+                self.manifest_path,
+                self.local_staging_directory,
+            )
             manifest = PublishedExportManifest.from_file(self.manifest_path)
             if Path(manifest.filename).name != manifest.filename:
                 raise ValueError("Publication manifest filename must not contain a path")
@@ -134,7 +146,22 @@ class AnimalMetadataSyncService:
                     "SoftMouse refresh was cancelled because a session became active"
                 )
             registry_result = self.registry.replace(preview.batch)
+            logger.info(
+                "SoftMouse cache refresh validated and committed: import_id=%s "
+                "rows=%d tagged=%d unchanged=%s source_sha256=%s",
+                preview.batch.import_id,
+                preview.batch.total_source_rows,
+                preview.batch.accepted_rows,
+                registry_result.unchanged,
+                preview.batch.source_file_sha256,
+            )
             return MetadataRefreshResult(preview, registry_result)
+        except Exception:
+            logger.exception(
+                "SoftMouse cache refresh transaction failed: manifest=%s",
+                self.manifest_path,
+            )
+            raise
         finally:
             self._lock.release()
 
@@ -165,6 +192,14 @@ class AnimalMetadataSyncService:
             if digest != manifest.sha256:
                 raise ValueError("Published export hash differs from manifest")
             os.replace(temporary_path, destination)
+            logger.info(
+                "SoftMouse publication copied locally: source=%s destination=%s "
+                "bytes=%d sha256=%s",
+                source_path,
+                destination,
+                manifest.size,
+                digest,
+            )
             return destination
         finally:
             temporary_path.unlink(missing_ok=True)
@@ -172,10 +207,18 @@ class AnimalMetadataSyncService:
     def refresh_due(self) -> bool:
         manifest = PublishedExportManifest.from_file(self.manifest_path)
         previous = self.registry.last_complete_import()
-        return (
+        due = (
             previous is None
             or previous["source_file_sha256"].casefold() != manifest.sha256.casefold()
         )
+        logger.info(
+            "SoftMouse cache catch-up check: due=%s manifest_sha256=%s "
+            "local_sha256=%s",
+            due,
+            manifest.sha256,
+            None if previous is None else previous["source_file_sha256"],
+        )
+        return due
 
     def cache_status(
         self, *, now: Optional[datetime] = None
