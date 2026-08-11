@@ -141,6 +141,19 @@ def test_recording_camera_set_includes_all_recordable_reach_cameras(app_model):
     )
 
 
+def test_recording_requires_a_selected_subject(app_model):
+    app_model._acquisition.started = True
+    app_model._status = AppModelStatus.RUNNING
+
+    with mock.patch.object(app_model, "on_error") as on_error:
+        assert app_model.start_recording() is False
+
+    on_error.assert_called_once_with(
+        "Recording unavailable",
+        "Scan an RFID tag or select a subject before recording.",
+    )
+
+
 def test_writer_finalization_waits_for_all_reach_cameras_and_pose(app_model):
     for camera in app_model.reach_cameras:
         camera.is_enabled = True
@@ -789,7 +802,15 @@ def test_final_metadata_uses_canonical_boundary_not_stale_project_timestamp(
         end_wall_time=1_800_000_002.25,
     )
     app_model._on_session_capture_ended(RecordingEndingReason.MANUAL_STOP)
-    output = tmp_path / "metadata"
+    run_metadata = tmp_path / "run_metadata.json"
+    run_metadata.write_text(json.dumps({"configuration": {"version": 1}}))
+    app_model._run_metadata_json_path = run_metadata
+    session_dir = tmp_path / "session003"
+    streams_dir = session_dir / "streams"
+    streams_dir.mkdir(parents=True)
+    (streams_dir / "alignment.json").write_text("{}")
+    (streams_dir / "trial_summary.json").write_text("{}")
+    output = session_dir / "metadata"
 
     app_model._save_metadata(
         project,
@@ -798,17 +819,29 @@ def test_final_metadata_uses_canonical_boundary_not_stale_project_timestamp(
         project.session,
     )
 
-    saved = json.loads(output.with_suffix(".json").read_text())
-    assert saved["start_record_timestamp"] == 1_800_000_000.25
-    assert saved["firstPelletDeliveryOffsetSeconds"] is None
-    assert saved["firstPelletPresentationOffsetSeconds"] is None
+    serialized_json = output.with_suffix(".json").read_text()
+    saved = json.loads(serialized_json)
+    assert saved["metadataSchemaVersion"] == 2
+    assert saved["scope"] == "session"
+    assert saved["recording"]["firstPelletDeliveryOffsetSeconds"] is None
+    assert saved["recording"]["firstPelletPresentationOffsetSeconds"] is None
     assert "NaN" not in output.with_suffix(".json").read_text()
     assert ".nan" not in output.with_suffix(".yaml").read_text().lower()
-    assert saved["sessionBoundary"]["startWallTime"] == 1_800_000_000.25
-    assert saved["sessionBoundary"]["endPerfTime"] == 12.0
-    assert saved["sessionBoundary"]["durationSeconds"] == 2.0
-    assert saved["recordingDurationSeconds"] == 2.0
-    assert saved["recordingStopReason"] == "ManualStop"
+    assert saved["boundary"]["startWallTime"] == 1_800_000_000.25
+    assert saved["boundary"]["endPerfTime"] == 12.0
+    assert saved["boundary"]["durationSeconds"] == 2.0
+    assert saved["recording"]["stopReason"] == "ManualStop"
+    assert "enabledSources" not in saved
+    assert "trialSummary" not in saved
+    assert "hardwareRuntimeAtRecord" not in saved
+    assert "configuration" not in saved
+    assert len(serialized_json) < 8_000
+    assert saved["artifacts"]["alignment"]["$ref"] == "streams/alignment.json"
+    assert saved["artifacts"]["trialSummary"]["$ref"] == "streams/trial_summary.json"
+    assert (
+        saved["artifacts"]["configuration"]["$ref"]
+        == "../run_metadata.json#/configuration"
+    )
 
 
 def test_metadata_pair_is_not_replaced_when_yaml_serialization_fails(

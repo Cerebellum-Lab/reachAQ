@@ -270,6 +270,8 @@ mkdir -p "$HOME/Documents/rawdatalocal"
   the most recently scanned raw 15-digit RFID.
   Subject and RFID are session-only: every application launch starts with both
   empty, and creating or linking an animal selects it for the current session.
+  Recording is blocked until a subject is scanned or selected so every session
+  receives an immutable animal metadata snapshot.
 * Protocol - select a protocol, or select **Manual pellet control**. Automatic
   pellet cycles and automatic protocol advance are independent settings.
 * Preferences - configure live inference and other application preferences.

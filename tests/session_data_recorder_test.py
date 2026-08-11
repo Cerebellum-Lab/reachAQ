@@ -1,5 +1,6 @@
 import csv
 import json
+import logging
 import time as stdlib_time
 from datetime import datetime
 from pathlib import Path
@@ -44,6 +45,54 @@ def test_inactive_session_log_handler_does_not_consume_the_runtime_clock(
     )
     try:
         recorder.add_current_log(100.0, "outside a recording")
+    finally:
+        recorder.close()
+
+
+def test_session_log_handler_filters_raw_can_frames_but_keeps_can_warnings():
+    laser = _EventSource("trace_received")
+    recorder = SessionDataRecorder(object(), laser)
+    recorder._armed = True
+    try:
+        for level, message in (
+            (9, "raw frame"),
+            (logging.WARNING, "CAN warning"),
+        ):
+            recorder._log_handler.emit(
+                logging.LogRecord(
+                    "can.bus",
+                    level,
+                    __file__,
+                    1,
+                    message,
+                    (),
+                    None,
+                )
+            )
+
+        messages = [row[2] for row in recorder._log_rows]
+
+        assert all("raw frame" not in message for message in messages)
+        assert any("CAN warning" in message for message in messages)
+    finally:
+        recorder.close()
+
+
+def test_device_event_does_not_serialize_container_index_method():
+    laser = _EventSource("trace_received")
+    recorder = SessionDataRecorder(object(), laser)
+    try:
+        recorder._append_device_event(
+            10.0,
+            100.0,
+            "inbound",
+            SystemStatusMessageKind.STIMULUS_INPUTS,
+            [False, False, False, False],
+            None,
+            None,
+        )
+
+        assert recorder._device_rows[0][7] is None
     finally:
         recorder.close()
 

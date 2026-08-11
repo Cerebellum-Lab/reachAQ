@@ -29,6 +29,11 @@ class _SessionLogHandler(logging.Handler):
         ))
 
     def emit(self, record: logging.LogRecord) -> None:
+        # Raw python-can frame dumps can arrive hundreds of times per second.
+        # They remain available in the acquisition-wide diagnostic log, while
+        # the session log keeps warnings/errors and higher-level decoded events.
+        if record.name.startswith("can.bus") and record.levelno < logging.WARNING:
+            return
         try:
             self._recorder.add_current_log(record.created, self.format(record))
         except Exception:
@@ -339,6 +344,10 @@ class SessionDataRecorder:
         target_name = target.name if isinstance(target, Enum) else target
         device_timestamp = getattr(data, "timestamp", None)
         device_index = getattr(data, "index", None)
+        # Containers such as list expose ``index`` as a method. Only a concrete
+        # device-provided value belongs in the CSV column.
+        if callable(device_index):
+            device_index = None
         payload_json = self._payload_json(data)
         with self._lock:
             if len(self._device_rows) == self._device_rows.maxlen:

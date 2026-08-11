@@ -2,6 +2,7 @@ import csv
 import ctypes
 import dataclasses
 import enum
+import hashlib
 import json
 import logging
 import math
@@ -193,6 +194,42 @@ def _metadata_without_nonfinite_numbers(value):
         ]
     return value
 
+
+def _compact_subsystem_snapshot(snapshot):
+    """Remove fields repeated by the subsystem key and empty defaults."""
+    compact = {}
+    for subsystem_id, status in (snapshot or {}).items():
+        values = {}
+        for key, value in status.items():
+            if key == "subsystem_id":
+                continue
+            if key != "state" and value in (None, "", False, 0):
+                continue
+            values[key] = value
+        compact[subsystem_id] = values
+    return compact
+
+
+def _subsystem_snapshot_changes(at_record, at_finalize):
+    baseline = _compact_subsystem_snapshot(at_record)
+    final = _compact_subsystem_snapshot(at_finalize)
+    return {
+        subsystem_id: status
+        for subsystem_id, status in final.items()
+        if baseline.get(subsystem_id) != status
+    }
+
+
+def _metadata_reference(path: Path, *, relative_to: Path, pointer: str = ""):
+    if not path.is_file():
+        return None
+    relative_path = Path(os.path.relpath(path, start=relative_to)).as_posix()
+    fragment = f"#{pointer}" if pointer else ""
+    return {
+        "$ref": f"{relative_path}{fragment}",
+        "targetSha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    }
+
 # allow be patched from tests
 _daily_timer = make_daemon_timer
 
@@ -381,6 +418,7 @@ class AppModel(ObservableObject):
         self._training_plan: Optional[TrainingPlan] = None
         self._training_plan_animal: Optional[AnimalSubject] = None
         self._recording_session = RecordingSessionController()
+        self._run_metadata_json_path: Optional[Path] = None
         self._session_stop_policy: Optional[SessionStopPolicy] = None
         self._session_stop_evaluation: Optional[SessionStopEvaluation] = None
         self._recording_ending_reason = RecordingEndingReason.NA
@@ -800,6 +838,13 @@ class AppModel(ObservableObject):
     def start_recording(self) -> bool:
         if not self._acquisition.started or self._status == AppModelStatus.IDLE:
             self.on_error("Recording unavailable", "Set System Mode to Running before recording.")
+            return False
+        if self._selected_animal is None:
+            logger.warning("start_recording refused because no subject is selected")
+            self.on_error(
+                "Recording unavailable",
+                "Scan an RFID tag or select a subject before recording.",
+            )
             return False
         recording_reach_cams = tuple(
             camera
@@ -5742,112 +5787,151 @@ class AppModel(ObservableObject):
                     "boundary differs from streams/alignment.json"
                 )
         self._save_metadata(project_info, when, file_name, session)
+        if session is None:
+            self._run_metadata_json_path = Path(file_name + ".json")
 
     def _save_metadata(self, project: ProjectInfo, when: datetime, file_name: str, session: Optional[int] = -1):
         when_as_utc = when.astimezone(timezone.utc)
         boundary = self._recording_session.boundary
         if boundary is not None and boundary.session_id == project.short_id:
-            start_record_timestamp = boundary.start_wall_time
             session_boundary = boundary.to_metadata()
         else:
-            start_record_timestamp = project.start_record_timestamp
             session_boundary = None
-        recording_duration = (
-            None
-            if boundary is None or boundary.end_perf_time is None
-            else max(0.0, boundary.end_perf_time - boundary.start_perf_time)
-        )
-        info: Dict[str, Any] = {
-            "date": when.strftime("%Y%m%d_%H%M%S"),
-            "created": when.timestamp(),
-            "createdUtc": when_as_utc.timestamp(),  # same than created
-            "start_record_timestamp": start_record_timestamp,
-            "sessionBoundary": session_boundary,
-            "serialNumber": self._preferences.serial_number or "",
-            "appVersion": self._app_version,
-            "animalName": self.animal_name,
-            "animal": self._recording_session.animal_snapshot,
-            "notes": self.notes or "",
-            "cameraNames": list(project.camera_names),
-            "session": session,
-            "firstPelletDeliveryOffsetSeconds": project.first_pellet_delivery_offset,
-            "firstPelletPresentationOffsetSeconds": project.first_pellet_presentation_offset,
-            "sessionCounts": {
-                "presented": self._behavior.algorithm.pellets_presented,
-                "reaches": self._behavior.algorithm.pellet_reaches,
-                "successfulReaches": self._behavior.algorithm.successful_reaches,
-                "consumed": self._behavior.algorithm.pellets_consumed,
-            },
-            "recordingStatus": self._recording_session.status.value,
-            "recordingStopReason": (
-                None
-                if self._recording_ending_reason is RecordingEndingReason.NA
-                else self._recording_ending_reason.value
-            ),
-            "recordingDurationSeconds": recording_duration,
-            "sessionDataComplete": self._recording_session.data_complete,
-            "sessionDataErrors": list(self._recording_session.data_errors),
-            "enabledSources": list(self._recording_session.enabled_sources),
-            "analysisDurationSeconds": self._recording_session.analysis_duration_seconds,
-            "trialSummary": (
-                None
-                if self._trial_ledger is None
-                else self._trial_ledger.summary()
-            ),
-            "sessionStopPolicy": (
-                None
-                if self._session_stop_policy is None
-                else dataclasses.asdict(
-                    self._session_stop_policy.configuration
-                )
-            ),
-            "sessionStopResult": (
-                None
-                if self._session_stop_evaluation is None
-                else {
-                    "decision": self._session_stop_evaluation.decision.value,
-                    "reason": (
-                        None
-                        if self._session_stop_evaluation.reason is None
-                        else self._session_stop_evaluation.reason.value
-                    ),
-                    "triggeredReasons": [
-                        reason.value
-                        for reason in (
-                            self._session_stop_evaluation.triggered_reasons
-                        )
-                    ],
-                    "requestedPerfTime": (
-                        self._session_stop_evaluation.requested_perf_time
-                    ),
-                    "timeoutSeconds": (
-                        self._session_stop_evaluation.timeout_seconds
-                    ),
+        configuration = asdict(self._create_configuration())
+        hardware_configured = {
+            "canEnabled": self._hardware.can_enabled,
+            "pelletControllerEnabled": self._hardware.pellet_controller_enabled,
+            "nidaqEnabled": self._hardware.nidaq_enabled,
+            "laserBackend": self._laser.configuration.backend,
+            "liveInferenceEnabled": self._inference.is_enabled,
+            "cameras": {
+                camera.name: {
+                    "previewEnabled": camera.is_enabled,
+                    "recordEnabled": camera.is_recording_enabled,
                 }
-            ),
-            "hardwareConfigured": {
-                "canEnabled": self._hardware.can_enabled,
-                "pelletControllerEnabled": self._hardware.pellet_controller_enabled,
-                "nidaqEnabled": self._hardware.nidaq_enabled,
-                "laserBackend": self._laser.configuration.backend,
-                "liveInferenceEnabled": self._inference.is_enabled,
-                "cameras": {
-                    camera.name: {
-                        "previewEnabled": camera.is_enabled,
-                        "recordEnabled": camera.is_recording_enabled,
-                    }
-                    for camera in self._cameras
-                },
+                for camera in self._cameras
             },
-            "hardwareRuntime": self._acquisition.subsystems.snapshot(),
-            "hardwareRuntimeAtRecord": self._recording_session.hardware_status_at_record,
-            "configuration": None,
         }
+        runtime_final = self._acquisition.subsystems.snapshot()
 
-        configuration = self._create_configuration()
-
-        out = info.copy()
-        out["configuration"] = asdict(configuration)
+        if session is None:
+            out = {
+                "metadataSchemaVersion": 2,
+                "scope": "acquisition",
+                "createdUtc": when_as_utc.timestamp(),
+                "serialNumber": self._preferences.serial_number or "",
+                "appVersion": self._app_version,
+                "hardware": {
+                    "configured": hardware_configured,
+                    "runtime": _compact_subsystem_snapshot(runtime_final),
+                },
+                "configuration": configuration,
+            }
+        else:
+            session_dir = Path(file_name).parent
+            configuration_reference = (
+                None
+                if self._run_metadata_json_path is None
+                else _metadata_reference(
+                    self._run_metadata_json_path,
+                    relative_to=session_dir,
+                    pointer="/configuration",
+                )
+            )
+            artifacts = {
+                "alignment": _metadata_reference(
+                    session_dir / "streams" / "alignment.json",
+                    relative_to=session_dir,
+                ),
+                "trialSummary": _metadata_reference(
+                    session_dir / "streams" / "trial_summary.json",
+                    relative_to=session_dir,
+                ),
+                "configuration": (
+                    configuration_reference
+                    if configuration_reference is not None
+                    else {"inline": configuration}
+                ),
+            }
+            out = {
+                "metadataSchemaVersion": 2,
+                "scope": "session",
+                "sessionId": project.short_id,
+                "sessionIndex": session,
+                "createdUtc": when_as_utc.timestamp(),
+                "serialNumber": self._preferences.serial_number or "",
+                "appVersion": self._app_version,
+                "boundary": session_boundary,
+                "animal": self._recording_session.animal_snapshot,
+                "notes": self.notes or "",
+                "counts": {
+                    "presented": self._behavior.algorithm.pellets_presented,
+                    "reaches": self._behavior.algorithm.pellet_reaches,
+                    "successfulReaches": self._behavior.algorithm.successful_reaches,
+                    "consumed": self._behavior.algorithm.pellets_consumed,
+                },
+                "recording": {
+                    "status": self._recording_session.status.value,
+                    "stopReason": (
+                        None
+                        if self._recording_ending_reason is RecordingEndingReason.NA
+                        else self._recording_ending_reason.value
+                    ),
+                    "dataComplete": self._recording_session.data_complete,
+                    "dataErrors": list(self._recording_session.data_errors),
+                    "analysisDurationSeconds": (
+                        self._recording_session.analysis_duration_seconds
+                    ),
+                    "firstPelletDeliveryOffsetSeconds": (
+                        project.first_pellet_delivery_offset
+                    ),
+                    "firstPelletPresentationOffsetSeconds": (
+                        project.first_pellet_presentation_offset
+                    ),
+                },
+                "stopPolicy": (
+                    None
+                    if self._session_stop_policy is None
+                    else dataclasses.asdict(
+                        self._session_stop_policy.configuration
+                    )
+                ),
+                "stopResult": (
+                    None
+                    if self._session_stop_evaluation is None
+                    else {
+                        "decision": self._session_stop_evaluation.decision.value,
+                        "reason": (
+                            None
+                            if self._session_stop_evaluation.reason is None
+                            else self._session_stop_evaluation.reason.value
+                        ),
+                        "triggeredReasons": [
+                            reason.value
+                            for reason in (
+                                self._session_stop_evaluation.triggered_reasons
+                            )
+                        ],
+                        "requestedPerfTime": (
+                            self._session_stop_evaluation.requested_perf_time
+                        ),
+                        "timeoutSeconds": (
+                            self._session_stop_evaluation.timeout_seconds
+                        ),
+                    }
+                ),
+                "hardware": {
+                    "configured": hardware_configured,
+                    "atRecord": _compact_subsystem_snapshot(
+                        self._recording_session.hardware_status_at_record
+                    ),
+                    "changesAtFinalize": _subsystem_snapshot_changes(
+                        self._recording_session.hardware_status_at_record,
+                        runtime_final,
+                    ),
+                },
+                "artifacts": artifacts,
+            }
         out = _metadata_without_nonfinite_numbers(out)
         json_path = Path(file_name + ".json")
         yaml_path = Path(file_name + ".yaml")

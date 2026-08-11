@@ -156,7 +156,7 @@ first recorded-frame notification.
 The same finite boundary is required in:
 
 - `streams/alignment.json`;
-- final JSON and YAML `start_record_timestamp` and `sessionBoundary`;
+- final JSON and YAML `boundary`;
 - stream slicing and camera-timing merge;
 - the API/session metadata path.
 
@@ -249,7 +249,9 @@ continuously in `nidaq.h5` when configured.
 The session log contains only messages within the canonical session boundary,
 with offsets from the start. The acquisition-wide diagnostic log remains
 outside the session and is retained after Abort so hardware failures can still be
-diagnosed.
+diagnosed. Low-level `can.bus` frame dumps below Warning are excluded from the
+session log because the decoded events are already persisted in `device.csv`;
+CAN warnings and errors remain in both logs.
 
 ### `alignment.json` and final metadata
 
@@ -267,14 +269,15 @@ diagnosed.
   `persistenceStatus`;
 - `deviceEventOverruns`, `sessionComplete`, and `incompleteReasons`.
 
-Final session JSON/YAML additionally records `sessionCounts`,
-`sessionDataComplete`, `sessionDataErrors`, `hardwareConfigured`,
-`hardwareRuntimeAtRecord`, `hardwareRuntime`, recording state, and analysis
-duration. `recordingStopReason` records the actual manual or automatic terminal
-reason, while `recordingDurationSeconds` and
-`sessionBoundary.durationSeconds` record the final camera-bounded duration.
-Non-finite values are normalized to JSON/YAML null; finalized metadata is never
-written with non-standard `NaN` tokens.
+Final session JSON/YAML uses `metadataSchemaVersion: 2`. It records the animal
+snapshot, `counts`, recording completion, stop policy/result, compact hardware
+state at Record, and only hardware entries that changed by finalization. The
+`artifacts` section references the authoritative `alignment.json`,
+`trial_summary.json`, and the acquisition-level configuration snapshot by path
+and SHA-256 instead of embedding those records again. `boundary.durationSeconds`
+is the final camera-bounded duration. Non-finite values are normalized to
+JSON/YAML null; finalized metadata is never written with non-standard `NaN`
+tokens.
 
 The pinned `auto-trainer-api` 0.11.0 lifecycle supports explicit session and
 pellet-attempt events. ReachAQ's status schema contains no alarm, emergency,

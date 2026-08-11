@@ -234,7 +234,7 @@ software implementation gaps.
 
 - [ ] Confirm JSON, YAML, source manifest, `streams/alignment.json`, and session
       log contain the same finite recording-start wall timestamp.
-- [ ] Confirm `start_record_timestamp` is never `NaN` for a retained session.
+- [ ] Confirm metadata `boundary.startWallTime` is never `NaN` for a retained session.
 - [ ] Confirm source offsets are expressed relative to the same canonical
       recording boundary.
 - [ ] Confirm final duration, camera counts, NI sample counts, and device/laser
