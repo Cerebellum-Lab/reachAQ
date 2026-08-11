@@ -87,7 +87,6 @@ from autotrainer.behavior import (
     InferenceProtocol,
     IntersessionMachine,
     IntersessionState,
-    HardwareErrorKind,
     PelletTrialLedger,
     RetrySettingsPolicy,
     SystemMachine,
@@ -109,12 +108,16 @@ from autotrainer.api import (
 from tools.acquisition.model.app_model_status import AppModelStatus, SessionRecordingStatus
 from tools.acquisition.model.api_status import ReachAQSystemStatus
 from tools.acquisition.model.session_api_publisher import SessionApiPublisher
+from tools.acquisition.model.pellet_cycle_controller import (
+    PelletCycleController,
+    offset_record,
+)
 from tools.autotrainer_version import __version__ as app_version
 from tools.acquisition.model.helpers import get_config_location
 from tools.acquisition.model.hardware_model import HardwareModel
 from tools.acquisition.model.inference_model import InferenceModel
 from tools.acquisition.model.laser_model import LaserModel
-from autotrainer.device import CanFailure, CanFailureKind, CanTransportConfiguration
+from autotrainer.device import CanFailure, CanTransportConfiguration
 from tools.acquisition.model.hardware_scan import HardwareScanEntry, scan_can_adapters, scan_gpus
 from tools.acquisition.model.nidaq_discovery import device_name_from_channel, discover_nidaq_devices
 from tools.acquisition.model.nidaq_channel_plan import build_nidaq_acquisition_configuration
@@ -363,7 +366,6 @@ class AppModel(ObservableObject):
         self._session_data_complete = True
         self._session_data_errors: Tuple[str, ...] = ()
         self._session_enabled_sources: Tuple[dict, ...] = ()
-        self._trial_ledger: Optional[PelletTrialLedger] = None
         self._session_stop_policy: Optional[SessionStopPolicy] = None
         self._session_stop_evaluation: Optional[SessionStopEvaluation] = None
         self._recording_ending_reason = RecordingEndingReason.NA
@@ -494,6 +496,11 @@ class AppModel(ObservableObject):
         self._attached_animal: Optional[AnimalSubject] = None
         self._protocol_runner = TrialProtocolRunner(
             on_protocol_complete=self._on_trial_protocol_complete,
+        )
+        self._pellet_cycles = PelletCycleController(
+            self._session_api,
+            self._protocol_runner,
+            self._session_data_recorder,
         )
 
         self._rpc_service: Optional[RpcService] = None
@@ -737,6 +744,15 @@ class AppModel(ObservableObject):
         return self._behavior.algorithm.thread_lock
 
     @property
+    def _trial_ledger(self) -> Optional[PelletTrialLedger]:
+        """Compatibility view; PelletCycleController owns the ledger."""
+        return self._pellet_cycles.ledger
+
+    @_trial_ledger.setter
+    def _trial_ledger(self, value: Optional[PelletTrialLedger]) -> None:
+        self._pellet_cycles.ledger = value
+
+    @property
     def acquisition_started(self):
         return self._acquisition_started
 
@@ -947,12 +963,11 @@ class AppModel(ObservableObject):
             or self._session_recording_status is not SessionRecordingStatus.RECORDING
         ):
             return None
-        ledger = self._trial_ledger
         evaluation = policy.evaluate(
             get_perf_now(),
-            trial_count=0 if ledger is None else ledger.count(),
+            trial_count=self._pellet_cycles.count(),
             protocol_complete=protocol_complete,
-            trial_active=(ledger is not None and ledger.active_attempt is not None),
+            trial_active=self._pellet_cycles.active_attempt is not None,
         )
         self._session_stop_evaluation = evaluation
         if evaluation.decision is SessionStopDecision.NONE:
@@ -972,9 +987,8 @@ class AppModel(ObservableObject):
             return evaluation
         if evaluation.decision is SessionStopDecision.TIMEOUT_ERROR:
             now_perf = get_perf_now()
-            if ledger is not None and ledger.active_attempt is not None:
-                ledger.finalize(
-                    TrialOutcome.INCOMPLETE,
+            if self._pellet_cycles.active_attempt is not None:
+                self._pellet_cycles.finalize_active_incomplete(
                     now_perf,
                     time.time(),
                     error=(
@@ -4196,7 +4210,7 @@ class AppModel(ObservableObject):
 
     def _on_session_starting_before_record_start(self):
         session_config = self._behavior.algorithm.active_config.session_control
-        self._trial_ledger = PelletTrialLedger(
+        self._pellet_cycles.start_session(
             self._project_info.short_id,
             TrialAccountingConfiguration(
                 assignment_policy=AttemptAssignmentPolicy(
@@ -4253,23 +4267,16 @@ class AppModel(ObservableObject):
             return
         ledger = self._trial_ledger
         if ledger is not None:
-            finalized = ledger.finalize_pending_without_analysis(
-                get_perf_now(),
-                time.time(),
+            self._pellet_cycles.finalize_pending_without_analysis(
+                project,
+                perf_time=get_perf_now(),
+                wall_time=time.time(),
                 reason=(
                     "post-session analysis did not produce a per-attempt result "
                     f"({result.value})"
                 ),
             )
-            for attempt in finalized:
-                self._session_api.trial_ended(attempt)
-            if finalized:
-                self._session_data_recorder.update_persisted_trial_ledger(
-                    project,
-                    ledger.to_records(),
-                    ledger.summary(),
-                )
-            self._session_api.session_ended(ledger.summary())
+            self._pellet_cycles.end_session()
         self._session_analysis_finished = True
         if self._session_recording_status == SessionRecordingStatus.ANALYZING:
             if self._session_analysis_started_perf is not None:
@@ -4331,17 +4338,10 @@ class AppModel(ObservableObject):
         self._session_boundary = boundary.with_end(end_perf)
         project.start_record_timestamp = self._session_boundary.start_wall_time
         try:
-            trial_ledger = self._trial_ledger
-            if trial_ledger is not None:
-                if trial_ledger.active_attempt is not None:
-                    trial_ledger.close_active_for_analysis(
-                        end_perf,
-                        self._session_boundary.end_wall_time,
-                    )
-                self._session_data_recorder.set_trial_ledger(
-                    trial_ledger.to_records(),
-                    trial_ledger.summary(),
-                )
+            self._pellet_cycles.snapshot_for_stop(
+                end_perf,
+                self._session_boundary.end_wall_time,
+            )
             stream_result = self._session_data_recorder.stop(end_perf)
             camera_alignment = (
                 None
@@ -4471,21 +4471,10 @@ class AppModel(ObservableObject):
             logger.exception("Unable to delete aborted session data: %s", err)
             self.on_error("Abort cleanup failed", str(err))
         finally:
-            ledger = self._trial_ledger
-            if ledger is not None:
-                active = ledger.active_attempt
-                if active is not None:
-                    finalized = ledger.finalize(
-                        TrialOutcome.ABORTED,
-                        get_perf_now(),
-                        time.time(),
-                        error="recording aborted by operator",
-                    )
-                    self._session_api.trial_ended(finalized)
-                self._session_api.session_ended(
-                    ledger.summary(),
-                    aborted=True,
-                )
+            self._pellet_cycles.abort(
+                perf_time=get_perf_now(),
+                wall_time=time.time(),
+            )
             self._behavior.algorithm.reset_session_counts()
             self._session_data_recorder.abort()
             self._pending_session_end_perf = None
@@ -4493,7 +4482,6 @@ class AppModel(ObservableObject):
             self._session_data_complete = True
             self._session_data_errors = ()
             self._session_enabled_sources = ()
-            self._trial_ledger = None
             self._session_analysis_finished = True
             self._session_analysis_started_perf = None
             self._session_analysis_duration_seconds = None
@@ -4694,7 +4682,8 @@ class AppModel(ObservableObject):
         tone_references, laser_references = self._read_trial_stream_references(
             project
         )
-        finalized = ledger.reconcile_analysis(
+        self._pellet_cycles.reconcile_analysis(
+            project,
             result,
             recording_start_perf_time=boundary.start_perf_time,
             frame_rate=frame_rate,
@@ -4711,19 +4700,7 @@ class AppModel(ObservableObject):
             tone_references=tone_references,
             laser_references=laser_references,
         )
-        for attempt in finalized:
-            self._session_api.trial_ended(attempt)
-            if attempt.logical_trial_complete:
-                self._protocol_runner.record_trial_outcome(
-                    attempt.attempt_label,
-                    attempt.outcome,
-                )
-        self._sync_session_counts_from_results(ledger)
-        self._session_data_recorder.update_persisted_trial_ledger(
-            project,
-            ledger.to_records(),
-            ledger.summary(),
-        )
+        self._pellet_cycles.sync_behavior_counts(self._behavior.algorithm)
 
     @staticmethod
     def _read_trial_stream_references(project):
@@ -4750,13 +4727,10 @@ class AppModel(ObservableObject):
         self,
         ledger: PelletTrialLedger,
     ) -> None:
-        """Project the four UI values from one reconciled session result."""
-        algo = self._behavior.algorithm
-        summary = ledger.summary()
-        algo.pellet_reaches = summary["reaches"]
-        algo.pellets_presented = summary["pellets_presented"]
-        algo.successful_reaches = summary["successful_reaches"]
-        algo.pellets_consumed = summary["pellets_consumed"]
+        """Compatibility wrapper around the authoritative controller summary."""
+        if ledger is not self._pellet_cycles.ledger:
+            self._pellet_cycles.ledger = ledger
+        self._pellet_cycles.sync_behavior_counts(self._behavior.algorithm)
 
     def _on_training_plan_property_changed(self, name, value, _):
         logger.debug("plan prop: %s -> %s", name, value)
@@ -5212,16 +5186,13 @@ class AppModel(ObservableObject):
         *,
         retry: bool = False,
     ) -> None:
-        ledger = self._trial_ledger
-        if ledger is None or ledger.active_attempt is None:
+        if self._pellet_cycles.active_attempt is None:
             return
-        attempt = ledger.close_active_for_analysis(
+        self._pellet_cycles.finish_active(
             perf_c,
             time.time(),
             retry=retry,
         )
-        self._session_api.trial_capture_ended(attempt)
-        self._protocol_runner.cancel_active_trial()
         self._evaluate_automatic_stop_policy(
             protocol_complete=self._protocol_runner.protocol_complete,
         )
@@ -5233,16 +5204,12 @@ class AppModel(ObservableObject):
         self._finish_active_pellet_trial(perf_c)
 
     def _on_pellet_sending(self, *, perf_c: float, context: str):
-        ledger = self._trial_ledger
         algo = self._behavior.algorithm
-        if ledger is None or not algo.is_in_session:
+        if self._trial_ledger is None or not algo.is_in_session:
             return
         wall_time = time.time()
-        active = ledger.active_attempt
-        if active is not None:
-            ledger.close_active_for_analysis(perf_c, wall_time)
         shift = self._behavior.system_machine.shift_xyz_handler
-        attempt = ledger.begin_send(
+        attempt = self._pellet_cycles.begin_send(
             perf_c,
             wall_time,
             operation_id=context,
@@ -5253,71 +5220,19 @@ class AppModel(ObservableObject):
         )
         logger.info(
             "pellet trial attempt started: session=%s attempt=%s context=%s",
-            ledger.session_id,
+            self._trial_ledger.session_id,
             attempt.attempt_label,
             context,
         )
-        self._session_api.trial_started(attempt)
 
     def _on_hardware_command_failed(self, failure: CanFailure) -> None:
         """Finalize the matching physical pellet attempt as a hardware error."""
-        ledger = self._trial_ledger
-        attempt = None if ledger is None else ledger.active_attempt
-        if (
-            attempt is None
-            and ledger is not None
-            and self._behavior.algorithm.is_in_session
-            and failure.command is SystemCommandKind.SEND_PELLET
-        ):
-            attempt = ledger.begin_send(
-                failure.perf_time,
-                failure.wall_time,
-                operation_id=failure.context,
-            )
-        if attempt is None:
-            return
-        if (
-            failure.context is not None
-            and failure.context != attempt.operation_id
-        ):
-            logger.info(
-                "CAN failure does not match active pellet attempt: "
-                "active=%s failure_context=%s",
-                attempt.operation_id,
-                failure.context,
-            )
-            return
-
-        if failure.kind is CanFailureKind.ACKNOWLEDGEMENT_TIMEOUT:
-            kind = HardwareErrorKind.ACKNOWLEDGEMENT_TIMEOUT
-        elif failure.kind is CanFailureKind.TRANSPORT:
-            kind = HardwareErrorKind.TRANSPORT_FAILURE
-        else:
-            command = failure.command
-            is_motor_command = (
-                isinstance(command, SystemCommandKind)
-                and 200 <= int(command) < 300
-            )
-            kind = (
-                HardwareErrorKind.MOTOR_FAILURE
-                if is_motor_command
-                else HardwareErrorKind.COMMAND_FAILURE
-            )
-
-        finalized = ledger.finalize_hardware_error(
-            kind,
-            failure.perf_time,
-            failure.wall_time,
-            error=failure.error,
+        finalized = self._pellet_cycles.finalize_hardware_failure(
+            failure,
+            in_session=self._behavior.algorithm.is_in_session,
         )
-        self._session_api.trial_ended(finalized)
-        self._protocol_runner.cancel_active_trial()
-        logger.error(
-            "pellet attempt %s finalized as %s: %s",
-            finalized.attempt_label,
-            kind.value,
-            failure.error,
-        )
+        if finalized is None:
+            return
         self._evaluate_automatic_stop_policy(
             protocol_complete=self._protocol_runner.protocol_complete,
         )
@@ -5333,38 +5248,23 @@ class AppModel(ObservableObject):
                      self._session_recording_status, algo.is_in_session)
         if algo.is_in_session:
             ledger = self._trial_ledger
-            if ledger is not None and ledger.active_attempt is not None:
-                if (
-                    context is not None
-                    and ledger.active_attempt.operation_id != context
-                ):
-                    logger.error(
-                        "Ignoring pellet presentation acknowledgement with mismatched "
-                        "context: active=%s received=%s",
-                        ledger.active_attempt.operation_id,
-                        context,
-                    )
-                    return
-                attempt = ledger.acknowledge_presentation(
+            if ledger is not None and self._pellet_cycles.active_attempt is not None:
+                attempt = self._pellet_cycles.acknowledge_presentation(
                     get_perf_now() if perf_c is None else perf_c,
                     time.time(),
+                    operation_id=context,
                 )
-                self._protocol_runner.begin_trial(attempt.attempt_label)
+                if attempt is None:
+                    return
             if ledger is not None:
-                algo.pellets_presented = ledger.count(TrialCountBasis.PRESENTED)
+                self._pellet_cycles.sync_behavior_counts(algo)
             self._evaluate_automatic_stop_policy(
                 protocol_complete=self._protocol_runner.protocol_complete,
             )
 
     @staticmethod
     def _offset_record(value):
-        if value is None:
-            return None
-        result = {}
-        for name in ("x", "y", "z"):
-            item = float(getattr(value, name))
-            result[name] = item if math.isfinite(item) else None
-        return result
+        return offset_record(value)
 
     def _current_trial_protocol_context(self):
         plan = self._attached_plan
