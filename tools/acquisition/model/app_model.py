@@ -4481,7 +4481,9 @@ class AppModel(ObservableObject):
     def _on_hardware_property_changed(self, name: str, value, _):
         animal = self._selected_animal
         hard = self._hardware
-        if animal is not None and name in {hard.SET_X, hard.SET_Y, hard.SET_Z}:
+        if name == hard.CAN_CONNECTION_STATE_PROPERTY:
+            self._on_can_connection_state_changed(value)
+        elif animal is not None and name in {hard.SET_X, hard.SET_Y, hard.SET_Z}:
             # Protocol actions temporarily move the motors without redefining
             # the animal's manually configured base position.
             if self._attached_plan is not None:
@@ -4521,6 +4523,53 @@ class AppModel(ObservableObject):
             changed |= new != prev
             if changed:
                 self._save_animal_metadata(animal, sender=f"hardware_{name}", backup_previous=pellet_dcs_changed)
+
+    def _on_can_connection_state_changed(self, value) -> None:
+        if not self._acquisition.started:
+            return
+        state = str((value or {}).get("state", "failed"))
+        error = str((value or {}).get("error", ""))
+        watchdog = self._analysis.watchdog_monitor
+        if state in {"failed", "recovering", "connecting"}:
+            watchdog.unregister_watchdog(WatchdogItems.DEVICE_READER)
+            watchdog.unregister_watchdog(WatchdogItems.DEVICE_WRITER)
+        if state == "ready":
+            self._set_subsystem_status(
+                SubsystemId.CAN_PELLET,
+                SubsystemState.READY,
+                reason="CAN/pellet controller ready",
+            )
+            watchdog.register_watchdog(
+                WatchdogItems.DEVICE_READER,
+                lambda: self._hardware.watchdog_reader_perf_c,
+            )
+            watchdog.register_watchdog(
+                WatchdogItems.DEVICE_WRITER,
+                lambda: self._hardware.watchdog_writer_perf_c,
+            )
+        elif state in {"recovering", "connecting"}:
+            self._set_subsystem_status(
+                SubsystemId.CAN_PELLET,
+                SubsystemState.STARTING,
+                reason=(
+                    "recovering CAN/pellet controller"
+                    if state == "recovering"
+                    else "connecting CAN/pellet controller"
+                ),
+                error=error,
+            )
+        elif state == "failed":
+            self._set_subsystem_status(
+                SubsystemId.CAN_PELLET,
+                SubsystemState.FAILED,
+                error=error or "CAN/pellet controller failed",
+            )
+        elif state == "stopped" and not self._acquisition.stopping:
+            self._set_subsystem_status(
+                SubsystemId.CAN_PELLET,
+                SubsystemState.STOPPED,
+                reason="CAN/pellet controller stopped",
+            )
 
     def _on_inference_property_changed(self, name: str, value, _):
         if name == InferenceModel.STATUS:

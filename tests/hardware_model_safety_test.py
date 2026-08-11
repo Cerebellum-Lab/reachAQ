@@ -1,11 +1,18 @@
 import threading
 import os
+from queue import Queue
 from unittest import mock
+from uuid import uuid4
 
 import pytest
 
 from autotrainer.core import SystemCommandKind
-from autotrainer.device import CanTransportConfiguration, CanTransportKind
+from autotrainer.device import (
+    CanFailure,
+    CanFailureKind,
+    CanTransportConfiguration,
+    CanTransportKind,
+)
 from tools.acquisition.model.hardware_model import HardwareModel
 
 
@@ -23,6 +30,7 @@ def test_safety_shutdown_is_idempotent_and_disconnects_before_reset():
     hardware._safety_shutdown_lock = threading.Lock()
     hardware._safety_shutdown_started = False
     hardware._safety_shutdown_thread = None
+    hardware._can_recovery_cancel = threading.Event()
     hardware._can_device = mock.Mock()
     hardware._can_device.can_transport_configuration = mock.sentinel.transport
     hardware._disconnect_transport = mock.Mock(side_effect=lambda: events.append("disconnect"))
@@ -42,6 +50,7 @@ def test_confirmed_can_safety_shutdown_resets_configured_transport_without_activ
     hardware._safety_shutdown_lock = threading.Lock()
     hardware._safety_shutdown_started = False
     hardware._safety_shutdown_thread = None
+    hardware._can_recovery_cancel = threading.Event()
     hardware._can_device = None
     hardware._disconnect_transport = mock.Mock()
     hardware._reset_socketcan = mock.Mock()
@@ -58,8 +67,11 @@ def test_confirmed_can_safety_shutdown_resets_configured_transport_without_activ
 
 def test_ordinary_disconnect_closes_only_owned_transport():
     hardware = object.__new__(HardwareModel)
+    hardware._can_recovery_cancel = threading.Event()
     hardware._disconnect_transport = mock.Mock()
     hardware._reset_socketcan = mock.Mock()
+    hardware._can_connection_state = {"state": "ready", "error": ""}
+    hardware._on_property_changed = mock.Mock()
 
     hardware.disconnect()
 
@@ -94,3 +106,49 @@ def test_safety_shutdown_latch_rejects_new_commands():
 
     assert sent is False
     device.send_message.assert_not_called()
+
+
+def test_transport_loss_marks_inflight_command_unknown_without_replay(hardware_model):
+    token = uuid4()
+    hardware_model._pending_tokens[token] = (SystemCommandKind.SEND_PELLET, 1.0)
+    hardware_model._run_can_recovery = mock.Mock()
+    reported = []
+    hardware_model.command_failed += reported.append
+
+    hardware_model._on_can_failure(CanFailure(
+        CanFailureKind.TRANSPORT,
+        "adapter removed",
+        category="device_removed",
+    ))
+    hardware_model._can_recovery_thread.join(1)
+
+    assert len(reported) == 1
+    assert reported[0].kind is CanFailureKind.OPERATION_UNKNOWN
+    assert reported[0].command is SystemCommandKind.SEND_PELLET
+    assert reported[0].context == str(token)
+    assert "not replayed" in reported[0].error
+    hardware_model._run_can_recovery.assert_called_once()
+
+
+def test_bounded_recovery_reuses_full_connection_initialization(hardware_model):
+    command_queue = Queue()
+    hardware_model._command_queue = command_queue
+    hardware_model._can_device = mock.Mock()
+    hardware_model._can_device.can_transport_configuration = CanTransportConfiguration(
+        kind=CanTransportKind.EMULATION,
+    )
+    hardware_model._disconnect_transport = mock.Mock()
+    hardware_model.connect = mock.Mock(
+        side_effect=(RuntimeError("first reopen failed"), None),
+    )
+    hardware_model._first_can_failure = CanFailure(
+        CanFailureKind.TRANSPORT,
+        "reader failed",
+    )
+
+    hardware_model._run_can_recovery(hardware_model._first_can_failure)
+
+    assert hardware_model.connect.call_count == 2
+    hardware_model.connect.assert_called_with(command_queue, _recovery=True)
+    assert hardware_model._can_connection_state == {"state": "ready", "error": ""}
+    assert hardware_model._first_can_failure is None

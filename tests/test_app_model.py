@@ -1027,3 +1027,31 @@ def test_can_start_failure_is_scoped_to_can_domain(app_model):
     assert "PXI/CAN interface unavailable" in status.error
     safety_shutdown.assert_called_once()
     capture_stop.assert_not_called()
+
+
+def test_runtime_can_failure_and_recovery_update_only_can_status(app_model):
+    app_model._acquisition.started = True
+    app_model._set_subsystem_status(
+        SubsystemId.CAN_PELLET,
+        SubsystemState.READY,
+        required_for_recording=True,
+    )
+    monitor = app_model.analysis.watchdog_monitor
+
+    with mock.patch.object(monitor, "unregister_watchdog") as unregister, \
+            mock.patch.object(monitor, "register_watchdog") as register, \
+            mock.patch.object(app_model, "_abort_recording_for_required_subsystem") as abort:
+        app_model._on_can_connection_state_changed({
+            "state": "failed",
+            "error": "CAN adapter removed",
+        })
+        failed = app_model.subsystem_statuses[SubsystemId.CAN_PELLET.value]
+        assert failed.state is SubsystemState.FAILED
+        assert failed.error == "CAN adapter removed"
+        abort.assert_not_called()
+        assert unregister.call_count == 2
+
+        app_model._on_can_connection_state_changed({"state": "ready", "error": ""})
+        ready = app_model.subsystem_statuses[SubsystemId.CAN_PELLET.value]
+        assert ready.state is SubsystemState.READY
+        assert register.call_count == 2

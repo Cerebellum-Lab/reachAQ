@@ -40,6 +40,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
     NIDAQ_ENABLED = "nidaq_enabled"
 
     PENDING_COMMAND_PROPERTY = "pending_command"
+    CAN_CONNECTION_STATE_PROPERTY = "can_connection_state"
 
     DEVICE_ACK_TIMEOUT_ENGAGED = "device_ack_timeout_engaged"
     DEVICE_PELLET_STATUS_TIMEOUT_ENGAGED = "device_pellet_status_timeout_engaged"
@@ -69,6 +70,12 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         self._safety_shutdown_started = False
         self._safety_shutdown_thread: Optional[threading.Thread] = None
         self._connect_count = 0
+        self._command_queue: Optional[Queue] = None
+        self._can_recovery_lock = threading.Lock()
+        self._can_recovery_thread: Optional[threading.Thread] = None
+        self._can_recovery_cancel = threading.Event()
+        self._first_can_failure: Optional[CanFailure] = None
+        self._can_connection_state = {"state": "stopped", "error": ""}
 
         self._event_manager = EventManager.default()
         self._board_status_timeout: Optional[float] = None
@@ -440,7 +447,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         dev_dev = None if dev is None else dev.device
         return dev_dev is not None and dev_dev.connected
 
-    def connect(self, cmd_queue: Queue):
+    def connect(self, cmd_queue: Queue, *, _recovery: bool = False):
         if not self._can_enabled:
             logger.notice("Skipping hardware connection because CAN bus is disabled in configuration")
             log_hardware_initialization(logger, "SKIP | CAN/pellet controller | CAN disabled")
@@ -449,6 +456,12 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             logger.notice("Skipping hardware connection because pellet controller is disabled in configuration")
             log_hardware_initialization(logger, "SKIP | CAN/pellet controller | pellet controller disabled")
             return
+        if not _recovery:
+            self._can_recovery_cancel.clear()
+            with self._can_recovery_lock:
+                self._first_can_failure = None
+        self._command_queue = cmd_queue
+        self._set_can_connection_state("connecting")
         connect_started = time.perf_counter()
         self._emit_device_event("state", "connect_start")
         transport = CanTransportConfiguration.from_environment()
@@ -484,7 +497,6 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             buffer_size=buffer_size,
             required_targets=(Target.PELLET_DEVICE,),
             can_transport=transport,
-            shutdown_callback=lambda reason: self.safety_shutdown(reason, wait=False),
             failure_callback=self._on_can_failure,
         )
         log_hardware_initialization(
@@ -494,7 +506,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             transport.channel,
             time.perf_counter() - connect_started,
         )
-        self._emit_device_event("state", "connected")
+        self._emit_device_event("state", "transport_created")
         self.set_device_ack_timeout(self._device_ack_timeout_delay)  # ensure it's used
         self.set_board_status_timeout(self._board_status_timeout)
 
@@ -605,6 +617,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             "READY | CAN/pellet controller | elapsed=%.3fs",
             time.perf_counter() - connect_started,
         )
+        self._set_can_connection_state("ready")
 
     def _disconnect_transport(self):
         logger.verbose("disconnecting ..")
@@ -698,6 +711,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         This is intentionally not the generic application shutdown path: it
         may restart the shared SocketCAN network interface.
         """
+        self._can_recovery_cancel.set()
         with self._safety_shutdown_lock:
             thread = self._safety_shutdown_thread
             if not self._safety_shutdown_started:
@@ -718,7 +732,9 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
 
     def disconnect(self):
         """Close only this application's device worker and CAN socket."""
+        self._can_recovery_cancel.set()
         self._disconnect_transport()
+        self._set_can_connection_state("stopped")
 
     def _can_device_property_changed(self, name: str, value, prev_value):
         logger.debug("_device_property_changed: %s : %s -> %s", name, prev_value, value)
@@ -805,11 +821,128 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             failure.context,
             failure.error,
         )
-        self.command_failed(failure)
-        self.safety_shutdown(
-            f"CAN {failure.kind.value}: {failure.error}",
-            wait=False,
+        with self._can_recovery_lock:
+            if self._first_can_failure is not None:
+                logger.error(
+                    "Preserving first CAN failure (%s); suppressed later failure: %s",
+                    self._first_can_failure.error,
+                    failure.error,
+                )
+                return
+            self._first_can_failure = failure
+
+        with self._lock:
+            pending = tuple(self._pending_tokens.items())
+        if pending and failure.kind is CanFailureKind.TRANSPORT:
+            for token, (command, _started) in pending:
+                self.command_failed(CanFailure(
+                    CanFailureKind.OPERATION_UNKNOWN,
+                    f"CAN connection was lost while {command.name} was in flight; "
+                    "the operation was not replayed and its physical outcome is unknown",
+                    command=command,
+                    context=str(token),
+                    category=failure.category,
+                    error_code=failure.error_code,
+                    exception_type=failure.exception_type,
+                    diagnostics=failure.diagnostics,
+                ))
+        else:
+            self.command_failed(failure)
+
+        self._emit_device_event(
+            "state",
+            "can_failure",
+            data={
+                "kind": failure.kind.value,
+                "error": failure.error,
+                "category": failure.category,
+                "error_code": failure.error_code,
+                "exception_type": failure.exception_type,
+                "diagnostics": failure.diagnostics,
+            },
+            context=failure.context,
         )
+        self._set_can_connection_state("failed", error=failure.error)
+
+        if failure.kind not in {
+            CanFailureKind.TRANSPORT,
+            CanFailureKind.ACKNOWLEDGEMENT_TIMEOUT,
+        }:
+            return
+        thread = threading.Thread(
+            target=self._run_can_recovery,
+            args=(failure,),
+            name="CanRecovery",
+            daemon=True,
+        )
+        with self._can_recovery_lock:
+            self._can_recovery_thread = thread
+        thread.start()
+
+    def _run_can_recovery(self, failure: CanFailure) -> None:
+        command_queue = self._command_queue
+        if command_queue is None:
+            logger.error("CAN recovery cannot start without the original command queue")
+            return
+        self._set_can_connection_state("recovering", error=failure.error)
+        self._emit_device_event("state", "recovery_start", data={"error": failure.error})
+        transport = (
+            self._can_device.can_transport_configuration
+            if self._can_device is not None
+            else CanTransportConfiguration.from_environment()
+        )
+        delays = (0.0, 0.5, 1.5)
+        last_error = failure.error
+        for attempt, delay in enumerate(delays, start=1):
+            if self._can_recovery_cancel.wait(delay):
+                logger.info("CAN recovery cancelled during application shutdown")
+                return
+            try:
+                self._disconnect_transport()
+            except Exception:
+                logger.exception("Failed to close failed CAN socket before recovery attempt %s", attempt)
+            if attempt == 2 and transport.kind is CanTransportKind.SOCKETCAN:
+                try:
+                    self._reset_socketcan(transport)
+                except Exception as exc:
+                    last_error = str(exc) or exc.__class__.__name__
+                    logger.exception("SocketCAN reset before recovery attempt failed")
+            try:
+                self.connect(command_queue, _recovery=True)
+            except Exception as exc:
+                last_error = str(exc) or exc.__class__.__name__
+                logger.exception("CAN recovery attempt %s/%s failed", attempt, len(delays))
+                self._emit_device_event(
+                    "state",
+                    "recovery_attempt_failed",
+                    data={"attempt": attempt, "error": last_error},
+                )
+                continue
+
+            logger.notice("CAN recovery completed on attempt %s", attempt)
+            self._emit_device_event(
+                "state",
+                "recovery_ready",
+                data={"attempt": attempt},
+            )
+            self._set_can_connection_state("ready")
+            with self._can_recovery_lock:
+                self._first_can_failure = None
+                self._can_recovery_thread = None
+            return
+
+        error = f"CAN recovery exhausted after {len(delays)} attempts: {last_error}"
+        logger.error("%s", error)
+        self._emit_device_event("state", "recovery_exhausted", data={"error": error})
+        self._set_can_connection_state("failed", error=error)
+        with self._can_recovery_lock:
+            self._can_recovery_thread = None
+
+    def _set_can_connection_state(self, state: str, *, error: str = "") -> None:
+        previous = self._can_connection_state
+        value = {"state": str(state), "error": str(error or "")}
+        self._can_connection_state = value
+        self._on_property_changed(self.CAN_CONNECTION_STATE_PROPERTY, value, previous)
 
     def __send_with_token(self, device: DeviceConnectionProtocol, cmd: SystemCommandKind, data=None) -> Optional[UUID]:
         token = uuid4()
@@ -875,28 +1008,30 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
 
     def set_motors_drift(self, drift: Offset3DTuple):
         """Apply the pellet motor drift"""
-        dev = self._device_conn
-        if dev is None:
+        if self._device_conn is None:
             return
-        self._send_command(dev, SystemCommandKind.SET_MOTOR_DRIFT, drift)
+        self._send_with_token(self._device_conn, SystemCommandKind.SET_MOTOR_DRIFT, drift)
         # this ensure the next send_to_fixed_pos command will get the corrected position:
         for cmd_kind in (SystemCommandKind.SET_X, SystemCommandKind.SET_Y, SystemCommandKind.SET_Z):
-            self._send_command(
-                dev,
+            self._send_with_token(
+                self._device_conn,
                 cmd_kind,
                 SystemDataArgsKwargs(0, relative=True),
             )
 
     def set_auto_correct_motor_drift(self, enabled: bool):
-        dev = self._device_conn
-        if dev is None:
+        if self._device_conn is None:
             return
-        self._send_command(dev, SystemCommandKind.SET_AUTO_CORRECT_DRIFT, enabled)
+        self._send_with_token(
+            self._device_conn,
+            SystemCommandKind.SET_AUTO_CORRECT_DRIFT,
+            enabled,
+        )
         if not enabled:
             logger.verbose("Doing SET_X/Y/Z relative=0 to clear possible motors drift")
             for cmd_kind in (SystemCommandKind.SET_X, SystemCommandKind.SET_Y, SystemCommandKind.SET_Z):
-                self._send_command(
-                    dev,
+                self._send_with_token(
+                    self._device_conn,
                     cmd_kind,
                     SystemDataArgsKwargs(0, relative=True),
                 )

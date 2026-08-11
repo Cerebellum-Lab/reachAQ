@@ -186,6 +186,8 @@ class PelletCycleController:
 
         if failure.kind is CanFailureKind.ACKNOWLEDGEMENT_TIMEOUT:
             kind = HardwareErrorKind.ACKNOWLEDGEMENT_TIMEOUT
+        elif failure.kind is CanFailureKind.OPERATION_UNKNOWN:
+            kind = HardwareErrorKind.OPERATION_UNKNOWN
         elif failure.kind is CanFailureKind.TRANSPORT:
             kind = HardwareErrorKind.TRANSPORT_FAILURE
         else:

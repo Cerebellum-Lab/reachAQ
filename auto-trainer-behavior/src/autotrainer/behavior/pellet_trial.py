@@ -81,6 +81,7 @@ class HardwareErrorKind(str, enum.Enum):
     COMMAND_FAILURE = "command_failure"
     TRANSPORT_FAILURE = "transport_failure"
     ACKNOWLEDGEMENT_TIMEOUT = "acknowledgement_timeout"
+    OPERATION_UNKNOWN = "operation_unknown"
 
 
 @dataclass(frozen=True)
