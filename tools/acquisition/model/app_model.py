@@ -115,6 +115,7 @@ from tools.acquisition.model.pellet_cycle_controller import (
 from tools.acquisition.model.recording_session_controller import (
     RecordingSessionController,
 )
+from tools.acquisition.model.acquisition_controller import AcquisitionController
 from tools.autotrainer_version import __version__ as app_version
 from tools.acquisition.model.helpers import get_config_location
 from tools.acquisition.model.hardware_model import HardwareModel
@@ -142,7 +143,6 @@ from tools.acquisition.model.subsystem_status import (
     SubsystemId,
     SubsystemState,
     SubsystemStatus,
-    SubsystemStatusRegistry,
 )
 from tools.acquisition.model.trial_protocol_runner import TrialProtocolRunner
 from tools.acquisition.model.behavior_model import BehaviorModel
@@ -337,8 +337,7 @@ class AppModel(ObservableObject):
         self._runtime_live_inference_override: Optional[bool] = None
         self._nidaq_ports = NidaqPortConfiguration()
         self._hardware_scan_results: Dict[str, HardwareScanEntry] = {}
-        self._subsystem_status_registry = SubsystemStatusRegistry()
-        self._subsystem_status_lock = threading.RLock()
+        self._acquisition = AcquisitionController()
 
         self._output_location = PersistenceConfiguration.get_default_output_path().as_posix()
         self._project_info: Optional[ProjectInfo] = None
@@ -356,9 +355,6 @@ class AppModel(ObservableObject):
         self._plan_repo = PlanRepository()
         self._training_plan: Optional[TrainingPlan] = None
         self._training_plan_animal: Optional[AnimalSubject] = None
-        self._acquisition_starting = False
-        self._acquisition_started = False
-        self._acquisition_stopping = False
         self._recording_session = RecordingSessionController()
         self._session_stop_policy: Optional[SessionStopPolicy] = None
         self._session_stop_evaluation: Optional[SessionStopEvaluation] = None
@@ -415,13 +411,13 @@ class AppModel(ObservableObject):
             for camera in self._cameras
         }
         for camera in self._cameras:
-            self._subsystem_status_registry.ensure(
+            self._acquisition.subsystems.ensure(
                 SubsystemId.camera(camera.name),
                 state=SubsystemState.DISABLED,
                 reason="camera disabled",
             )
         for subsystem_id in SubsystemId:
-            self._subsystem_status_registry.ensure(
+            self._acquisition.subsystems.ensure(
                 subsystem_id,
                 state=SubsystemState.DISABLED,
             )
@@ -748,7 +744,7 @@ class AppModel(ObservableObject):
 
     @property
     def acquisition_started(self):
-        return self._acquisition_started
+        return self._acquisition.started
 
     @property
     def session_recording_status(self) -> SessionRecordingStatus:
@@ -768,7 +764,7 @@ class AppModel(ObservableObject):
         )
 
     def start_recording(self) -> bool:
-        if not self._acquisition_started or self._status == AppModelStatus.IDLE:
+        if not self._acquisition.started or self._status == AppModelStatus.IDLE:
             self.on_error("Recording unavailable", "Set System Mode to Running before recording.")
             return False
         recording_reach_cams = tuple(
@@ -798,7 +794,7 @@ class AppModel(ObservableObject):
             )
             return False
         self._recording_session.prepare_record(
-            self._subsystem_status_registry.snapshot()
+            self._acquisition.subsystems.snapshot()
         )
         self._set_subsystem_status(
             SubsystemId.OFFLINE_ANALYSIS,
@@ -839,7 +835,7 @@ class AppModel(ObservableObject):
 
     def _build_session_source_manifest(self) -> Tuple[dict, ...]:
         def runtime_state(subsystem_id) -> str:
-            status = self._subsystem_status_registry.get(subsystem_id)
+            status = self._acquisition.subsystems.get(subsystem_id)
             return "unknown" if status is None else status.state.value
 
         sources = [
@@ -1061,11 +1057,11 @@ class AppModel(ObservableObject):
                 return False
             self._behavior.on_prepare_capture()
             self._finish_abort_recording()
-            synchronization = self._subsystem_status_registry.get(
+            synchronization = self._acquisition.subsystems.get(
                 SubsystemId.REACH_SYNCHRONIZATION
             )
             if (
-                self._acquisition_started
+                self._acquisition.started
                 and self._inference.is_enabled
                 and synchronization is not None
                 and synchronization.is_ready
@@ -1622,11 +1618,11 @@ class AppModel(ObservableObject):
 
     @property
     def subsystem_statuses(self) -> Dict[str, SubsystemStatus]:
-        return dict(self._subsystem_status_registry.statuses)
+        return dict(self._acquisition.subsystems.statuses)
 
     @property
     def recording_blockers(self) -> Tuple[str, ...]:
-        blockers = list(self._subsystem_status_registry.recording_blockers())
+        blockers = list(self._acquisition.subsystems.recording_blockers())
         session_control = self._behavior.algorithm.active_config.session_control
         if (
             session_control.trial_limit is not None
@@ -1642,7 +1638,7 @@ class AppModel(ObservableObject):
             blockers.append(
                 f"recording state: {self._recording_session.status.value}"
             )
-        if not self._acquisition_started:
+        if not self._acquisition.started:
             blockers.append("System Mode is not running")
         return tuple(blockers)
 
@@ -1656,9 +1652,9 @@ class AppModel(ObservableObject):
         required_for_recording: Optional[bool] = None,
         generation: Optional[int] = None,
     ) -> SubsystemStatus:
-        with self._subsystem_status_lock:
-            previous_statuses = self._subsystem_status_registry.statuses
-            status, _ = self._subsystem_status_registry.transition(
+        with self._acquisition.lock:
+            previous_statuses = self._acquisition.subsystems.statuses
+            status, _ = self._acquisition.subsystems.transition(
                 subsystem_id,
                 state,
                 reason=reason,
@@ -1666,7 +1662,7 @@ class AppModel(ObservableObject):
                 required_for_recording=required_for_recording,
                 generation=generation,
             )
-            current_statuses = self._subsystem_status_registry.statuses
+            current_statuses = self._acquisition.subsystems.statuses
         self.property_changed(
             self.Props.SUBSYSTEM_STATUSES,
             current_statuses,
@@ -1686,14 +1682,14 @@ class AppModel(ObservableObject):
         required_for_recording: Optional[bool] = None,
         reason: str = "",
     ) -> int:
-        with self._subsystem_status_lock:
-            previous_statuses = self._subsystem_status_registry.statuses
-            status, _ = self._subsystem_status_registry.begin_retry(
+        with self._acquisition.lock:
+            previous_statuses = self._acquisition.subsystems.statuses
+            status, _ = self._acquisition.subsystems.begin_retry(
                 subsystem_id,
                 required_for_recording=required_for_recording,
                 reason=reason,
             )
-            current_statuses = self._subsystem_status_registry.statuses
+            current_statuses = self._acquisition.subsystems.statuses
         self.property_changed(
             self.Props.SUBSYSTEM_STATUSES,
             current_statuses,
@@ -1817,7 +1813,7 @@ class AppModel(ObservableObject):
         return tuple(names)
 
     def refresh_hardware_bindings(self) -> str:
-        if self._acquisition_started or self._status != AppModelStatus.IDLE:
+        if self._acquisition.started or self._status != AppModelStatus.IDLE:
             raise RuntimeError("Hardware refresh is only available while acquisition is idle")
 
         scan_started = time.perf_counter()
@@ -2531,7 +2527,7 @@ class AppModel(ObservableObject):
                 generation=generation,
             )
             return False
-        prepared[primary] = self._subsystem_status_registry.get(
+        prepared[primary] = self._acquisition.subsystems.get(
             SubsystemId.camera(primary.name)
         ).generation
 
@@ -2543,7 +2539,7 @@ class AppModel(ObservableObject):
                 self._inference_queue if inference_index is not None else None,
                 inference_index,
             ):
-                prepared[secondary] = self._subsystem_status_registry.get(
+                prepared[secondary] = self._acquisition.subsystems.get(
                     SubsystemId.camera(secondary.name)
                 ).generation
 
@@ -2572,7 +2568,7 @@ class AppModel(ObservableObject):
                 )
         all_ready = topology_error is None and primary_capture_ready and all(
             (
-                status := self._subsystem_status_registry.get(
+                status := self._acquisition.subsystems.get(
                     SubsystemId.camera(camera.name)
                 )
             ) is not None
@@ -2930,7 +2926,7 @@ class AppModel(ObservableObject):
         return True
 
     def _log_acquisition_startup_summary(self) -> None:
-        statuses = self._subsystem_status_registry.statuses
+        statuses = self._acquisition.subsystems.statuses
         for subsystem_id, status in statuses.items():
             detail = status.error or status.reason or "no detail"
             log_hardware_initialization(
@@ -2966,14 +2962,14 @@ class AppModel(ObservableObject):
 
     def retry_failed_subsystems(self) -> str:
         """Retry failed acquisition domains without disturbing healthy domains."""
-        if not self._acquisition_started:
+        if not self._acquisition.started:
             raise RuntimeError("Subsystem retry requires System Mode to be running")
         if self._recording_session.status is not SessionRecordingStatus.READY:
             raise RuntimeError("Subsystem retry is unavailable during recording or analysis")
 
         failed = {
             subsystem_id
-            for subsystem_id, status in self._subsystem_status_registry.statuses.items()
+            for subsystem_id, status in self._acquisition.subsystems.statuses.items()
             if status.state in {SubsystemState.FAILED, SubsystemState.BLOCKED}
         }
         retried = []
@@ -3002,10 +2998,10 @@ class AppModel(ObservableObject):
             if self._validate_session_logs_domain():
                 retried.append("session output")
 
-        synchronization = self._subsystem_status_registry.get(
+        synchronization = self._acquisition.subsystems.get(
             SubsystemId.REACH_SYNCHRONIZATION
         )
-        inference = self._subsystem_status_registry.get(SubsystemId.LIVE_INFERENCE)
+        inference = self._acquisition.subsystems.get(SubsystemId.LIVE_INFERENCE)
         if (
             self._inference.is_enabled
             and synchronization is not None
@@ -3017,7 +3013,7 @@ class AppModel(ObservableObject):
             )
         ):
             retried.append("live inference")
-        remaining = self._subsystem_status_registry.recording_blockers()
+        remaining = self._acquisition.subsystems.recording_blockers()
         if remaining:
             return (
                 f"Retried {', '.join(retried) if retried else 'failed subsystems'}; "
@@ -3034,7 +3030,7 @@ class AppModel(ObservableObject):
         if not cameras:
             return False
         primary = cameras[0]
-        primary_status = self._subsystem_status_registry.get(
+        primary_status = self._acquisition.subsystems.get(
             SubsystemId.camera(primary.name)
         )
         inference_indices = {
@@ -3056,7 +3052,7 @@ class AppModel(ObservableObject):
             reason="retrying unavailable secondary cameras",
         )
         for secondary in cameras[1:]:
-            status = self._subsystem_status_registry.get(
+            status = self._acquisition.subsystems.get(
                 SubsystemId.camera(secondary.name)
             )
             if status is not None and status.is_ready:
@@ -3068,7 +3064,7 @@ class AppModel(ObservableObject):
                 inference_index,
             ):
                 continue
-            camera_generation = self._subsystem_status_registry.get(
+            camera_generation = self._acquisition.subsystems.get(
                 SubsystemId.camera(secondary.name)
             ).generation
             if self._enable_camera_capture_domain(
@@ -3082,7 +3078,7 @@ class AppModel(ObservableObject):
                 )
         all_ready = all(
             (
-                status := self._subsystem_status_registry.get(
+                status := self._acquisition.subsystems.get(
                     SubsystemId.camera(camera.name)
                 )
             ) is not None
@@ -3123,17 +3119,16 @@ class AppModel(ObservableObject):
             if target_status == before_status:
                 logger.verbose("AppModelStatus already %s", before_status)
                 return True
-            if self._acquisition_started:
+            if self._acquisition.started:
                 if self.is_target_status_valid(target_status):
                     self.status = target_status
                     return True
                 self.on_error("AppModelStatus change error",
                               f"Target status {target_status} not valid for source status {before_status}")
                 return False
-            if self._acquisition_starting:
+            if not self._acquisition.begin_start():
                 logger.warning("Acquisition already starting")
                 return False
-            self._acquisition_starting = True
             self._start_count += 1
             is_first_start = self._start_count == 1
 
@@ -3250,7 +3245,7 @@ class AppModel(ObservableObject):
             )
 
         for cam in self._cameras:
-            status = self._subsystem_status_registry.get(
+            status = self._acquisition.subsystems.get(
                 SubsystemId.camera(cam.name)
             )
             if status is not None and status.is_ready:
@@ -3308,8 +3303,7 @@ class AppModel(ObservableObject):
         if animal is not None:
             self._set_animal_base_positions(animal)
 
-        self._acquisition_started = True
-        self._acquisition_starting = False
+        self._acquisition.mark_started()
         self.status = target_status
         self.property_changed(self.Props.ACQUISITION_RUNNING, True, False)
         self._event_manager.post_event_content(
@@ -3330,13 +3324,9 @@ class AppModel(ObservableObject):
     def capture_stop(self, force: bool = False):
         logger.debug("AppModel.capture_stop")
         with self.app_lock:
-            if not self._acquisition_started and not force:
-                logger.verbose("acquisition not running")
+            if not self._acquisition.begin_stop(force=force):
+                logger.verbose("acquisition not running or already stopping")
                 return
-            if self._acquisition_stopping:
-                logger.verbose("acquisition already stopping")
-                return
-            self._acquisition_stopping = True
             before_status = self._status
             recording_status = self._recording_session.status
         if recording_status in {
@@ -3354,9 +3344,7 @@ class AppModel(ObservableObject):
             # always:
             self._nidaq_signal_monitor.stop()
             # must be set before try reload training plans, given checked in it
-            self._acquisition_started = False
-            self._acquisition_stopping = False
-            self._acquisition_starting = False
+            self._acquisition.mark_stopped()
             if self._recording_session.status == SessionRecordingStatus.ABORTING:
                 self._finish_abort_recording()
             elif self._recording_session.status != SessionRecordingStatus.READY:
@@ -3384,7 +3372,7 @@ class AppModel(ObservableObject):
         for item in WatchdogItems:
             watchdog_mon_unregister(item)
 
-        can_status = self._subsystem_status_registry.get(SubsystemId.CAN_PELLET)
+        can_status = self._acquisition.subsystems.get(SubsystemId.CAN_PELLET)
         if can_status is not None and can_status.state is SubsystemState.READY:
             self._set_subsystem_status(
                 SubsystemId.CAN_PELLET,
@@ -3699,9 +3687,9 @@ class AppModel(ObservableObject):
         return True
 
     def reload_training_plans(self, *, refresh: bool = False, reraise_on_error: bool = False):
-        if self._acquisition_started or self._status != AppModelStatus.IDLE:
+        if self._acquisition.started or self._status != AppModelStatus.IDLE:
             logger.notice("delaying reload training plans given acquisition started(%s) or status not idle: %s",
-                          self._acquisition_started, self._status)
+                          self._acquisition.started, self._status)
             self._reload_plans_needed = True
             return
         try:
@@ -4145,10 +4133,10 @@ class AppModel(ObservableObject):
                 reason="laser controller connected",
             )
         elif self._laser.configuration.backend != "disabled":
-            current = self._subsystem_status_registry.get(SubsystemId.LASER)
+            current = self._acquisition.subsystems.get(SubsystemId.LASER)
             if (
-                self._acquisition_started
-                and not self._acquisition_stopping
+                self._acquisition.started
+                and not self._acquisition.stopping
                 and current is not None
                 and current.state is SubsystemState.READY
             ):
@@ -4174,7 +4162,7 @@ class AppModel(ObservableObject):
         subsystem_id,
         reason: str,
     ) -> None:
-        status = self._subsystem_status_registry.get(subsystem_id)
+        status = self._acquisition.subsystems.get(subsystem_id)
         if (
             status is not None
             and status.required_for_recording
@@ -4542,12 +4530,12 @@ class AppModel(ObservableObject):
             if new_is_live:
                 self._p_inference_live_begin = time.perf_counter()
             elif value == InferenceStatus.stopped:
-                current = self._subsystem_status_registry.get(
+                current = self._acquisition.subsystems.get(
                     SubsystemId.LIVE_INFERENCE
                 )
                 if (
-                    self._acquisition_started
-                    and not self._acquisition_stopping
+                    self._acquisition.started
+                    and not self._acquisition.stopping
                     and current is not None
                     and current.state is SubsystemState.READY
                 ):
@@ -4918,7 +4906,7 @@ class AppModel(ObservableObject):
                     for camera in self._cameras
                 },
             },
-            "hardwareRuntime": self._subsystem_status_registry.snapshot(),
+            "hardwareRuntime": self._acquisition.subsystems.snapshot(),
             "hardwareRuntimeAtRecord": self._recording_session.hardware_status_at_record,
             "configuration": None,
         }
@@ -5105,7 +5093,7 @@ class AppModel(ObservableObject):
             recording_state=self._recording_session.status.value,
             synchronization_ready=not any(
                 "camera" in blocker.lower()
-                for blocker in self._subsystem_status_registry.recording_blockers()
+                for blocker in self._acquisition.subsystems.recording_blockers()
             ),
             animal=None if animal is None else animal.to_api_status(),
             project={
@@ -5113,7 +5101,7 @@ class AppModel(ObservableObject):
                 "sessionIndex": project.session,
                 "sessionId": project.short_id,
             },
-            subsystems=self._subsystem_status_registry.snapshot(),
+            subsystems=self._acquisition.subsystems.snapshot(),
             pellet_device={
                 "connected": hard.connected,
                 "position": self._offset_record(hard.last_dcs_position),

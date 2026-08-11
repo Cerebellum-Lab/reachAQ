@@ -317,7 +317,7 @@ def test_hardware_start_failure_performs_can_safety_shutdown(
     assert can_status.state is SubsystemState.FAILED
     assert can_status.error == "connection timeout"
     assert app_model.acquisition_started is True
-    assert app_model._acquisition_starting is False
+    assert app_model._acquisition.starting is False
 
 
 def test_periodic_command_producers_stop_before_safety_shutdown():

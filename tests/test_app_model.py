@@ -533,7 +533,7 @@ def test_abort_during_analysis_cancels_analysis_and_removes_session(
     analysis_file.write_text("partial analysis")
     app_model.behavior.algorithm.increase_pellets_presented(2)
     app_model._recording_session.analysis_finished = False
-    app_model._acquisition_started = True
+    app_model._acquisition.started = True
     app_model._set_subsystem_status(
         SubsystemId.REACH_SYNCHRONIZATION,
         SubsystemState.READY,
@@ -756,7 +756,7 @@ def test_record_start_timeout_aborts_partial_session(app_model):
 
 
 def test_required_failed_subsystem_is_exposed_as_recording_blocker(app_model):
-    app_model._acquisition_started = True
+    app_model._acquisition.started = True
     app_model._set_subsystem_status(
         SubsystemId.NIDAQ_STREAM,
         SubsystemState.FAILED,
@@ -772,7 +772,7 @@ def test_required_failed_subsystem_is_exposed_as_recording_blocker(app_model):
 def test_required_runtime_loss_aborts_session_without_stopping_acquisition(
     app_model,
 ):
-    app_model._acquisition_started = True
+    app_model._acquisition.started = True
     app_model._set_subsystem_status(
         SubsystemId.NIDAQ_STREAM,
         SubsystemState.READY,
