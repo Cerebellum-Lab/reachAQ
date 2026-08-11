@@ -713,9 +713,11 @@ class CanInterface(DeviceInterface):
             logger.notice("pellet_address=%s ; flushed %s",
                         self.pellet_address, tot_flushed)
             if not self.are_addresses_valid():
-                self._jc.Close()
-                self._is_open = False
-                self._channel_ownership.release()
+                try:
+                    self._jc.Close()
+                finally:
+                    self._is_open = False
+                    self._channel_ownership.release()
                 return False
             try:
                 self._query_configuration()

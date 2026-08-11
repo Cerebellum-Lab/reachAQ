@@ -41,9 +41,10 @@ def _exception_errno(exc: BaseException) -> Optional[int]:
     seen = set()
     while current is not None and id(current) not in seen:
         seen.add(id(current))
-        value = getattr(current, "errno", None)
-        if isinstance(value, int):
-            return value
+        for attribute in ("errno", "error_code"):
+            value = getattr(current, attribute, None)
+            if isinstance(value, int):
+                return value
         current = current.__cause__ or current.__context__
     return None
 

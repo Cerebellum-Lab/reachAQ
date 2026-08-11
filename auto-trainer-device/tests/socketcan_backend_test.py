@@ -214,7 +214,7 @@ def test_receive_preserves_can_operation_error_and_enetdown(monkeypatch):
     class CanOperationError(Exception):
         def __init__(self):
             super().__init__("Network is down")
-            self.errno = errno.ENETDOWN
+            self.error_code = errno.ENETDOWN
 
     monkeypatch.setattr(
         "autotrainer.device.can_diagnostics.capture_can_diagnostics",

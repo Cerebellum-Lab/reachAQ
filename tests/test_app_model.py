@@ -388,6 +388,11 @@ def test_failed_send_dispatch_is_persisted_without_counting_trial(app_model):
             SystemCommandKind.PLAY_TONE,
             HardwareErrorKind.COMMAND_FAILURE,
         ),
+        (
+            CanFailureKind.OPERATION_UNKNOWN,
+            SystemCommandKind.SEND_PELLET,
+            HardwareErrorKind.OPERATION_UNKNOWN,
+        ),
     ),
 )
 def test_production_can_failure_kinds_finalize_the_active_attempt(
