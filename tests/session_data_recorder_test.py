@@ -1,5 +1,6 @@
 import csv
 import json
+import time as stdlib_time
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,9 +33,14 @@ def test_inactive_session_log_handler_does_not_consume_the_runtime_clock(
     laser = _EventSource("trace_received")
     recorder = SessionDataRecorder(object(), laser)
     monkeypatch.setattr(
-        session_data_recorder.time,
-        "perf_counter",
-        lambda: (_ for _ in ()).throw(AssertionError("clock must not be read")),
+        session_data_recorder,
+        "time",
+        SimpleNamespace(
+            perf_counter=lambda: (_ for _ in ()).throw(
+                AssertionError("clock must not be read")
+            ),
+            time=stdlib_time.time,
+        ),
     )
     try:
         recorder.add_current_log(100.0, "outside a recording")
