@@ -327,6 +327,9 @@ def test_can_interface_does_not_query_configuration_without_board_address(monkey
             fd=True,
         ),
     )
+    # This unit test exercises missing-board cleanup, not cross-process channel
+    # ownership. Keep it deterministic when a real reachAQ app owns can0.
+    interface._channel_ownership = mock.Mock()
     interface._jc = MissingBoardBus()
     query_called = []
     monkeypatch.setattr(interface, "_query_configuration", lambda: query_called.append(True))
