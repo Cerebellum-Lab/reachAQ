@@ -349,6 +349,57 @@ def test_failed_send_dispatch_is_persisted_without_counting_trial(app_model):
     assert app_model._trial_ledger.count() == 0
 
 
+@pytest.mark.parametrize(
+    "failure_kind, command, expected_error_kind",
+    (
+        (
+            CanFailureKind.ACKNOWLEDGEMENT_TIMEOUT,
+            SystemCommandKind.SEND_PELLET,
+            HardwareErrorKind.ACKNOWLEDGEMENT_TIMEOUT,
+        ),
+        (
+            CanFailureKind.TRANSPORT,
+            SystemCommandKind.SEND_PELLET,
+            HardwareErrorKind.TRANSPORT_FAILURE,
+        ),
+        (
+            CanFailureKind.COMMAND,
+            SystemCommandKind.SEND_PELLET,
+            HardwareErrorKind.MOTOR_FAILURE,
+        ),
+        (
+            CanFailureKind.COMMAND,
+            SystemCommandKind.PLAY_TONE,
+            HardwareErrorKind.COMMAND_FAILURE,
+        ),
+    ),
+)
+def test_production_can_failure_kinds_finalize_the_active_attempt(
+    app_model,
+    failure_kind,
+    command,
+    expected_error_kind,
+):
+    algorithm = app_model.behavior.algorithm
+    assert algorithm.start_session(reason="typed-hardware-error-test")
+    app_model._on_pellet_sending(perf_c=10.0, context="send-1")
+
+    app_model._on_hardware_command_failed(CanFailure(
+        failure_kind,
+        "typed failure",
+        command=command,
+        context="send-1",
+        perf_time=10.5,
+        wall_time=110.5,
+    ))
+
+    attempt = app_model._trial_ledger.attempts[0]
+    assert attempt.outcome is TrialOutcome.HARDWARE_ERROR
+    assert attempt.hardware_error_kind is expected_error_kind
+    assert app_model._trial_ledger.active_attempt is None
+    assert app_model._trial_ledger.count() == 0
+
+
 def test_automatic_stop_finishes_active_trial_normally_before_stopping(
     app_model,
     monkeypatch,
@@ -493,6 +544,74 @@ def test_post_session_analysis_finalizes_attempts_persists_and_syncs_counts(
         ledger.to_records(),
         ledger.summary(),
     )
+
+
+def test_production_analysis_reindexes_behavioral_retry_attempts(app_model):
+    project = app_model.project
+    ledger = PelletTrialLedger(project.short_id)
+    ledger.begin_send(100.5, 1000.5, operation_id="send-1")
+    ledger.acknowledge_presentation(100.55, 1000.55)
+    ledger.close_active_for_analysis(101.5, 1001.5)
+    ledger.begin_send(101.5, 1001.5, operation_id="send-2")
+    ledger.acknowledge_presentation(101.55, 1001.55)
+    ledger.close_active_for_analysis(102.5, 1002.5)
+    app_model._trial_ledger = ledger
+    app_model._recording_session.boundary = SessionBoundary(
+        session_id=project.short_id,
+        primary_camera="left",
+        primary_frame_id=0,
+        start_perf_time=100.0,
+        start_wall_time=1000.0,
+        camera_when=500.0,
+        end_perf_time=103.0,
+    )
+    primary = app_model._ordered_reach_cameras(enabled_only=True)[0]
+    primary.active_config.params["fps"] = 100
+    result = IntersessionResponse(
+        reach_events=[
+            ReachEvent(
+                init=75,
+                end=85,
+                method=ReachEventMethod.RIGHT_HAND,
+                outcome=ReachEventOutcome.MISSED,
+            ),
+            ReachEvent(
+                init=175,
+                end=185,
+                method=ReachEventMethod.RIGHT_HAND,
+                outcome=ReachEventOutcome.EATEN,
+            ),
+        ],
+        food_consumed=1,
+        successful_reaches=1,
+        total_reaches=2,
+    )
+
+    with mock.patch.object(
+        app_model,
+        "_read_trial_stream_references",
+        return_value=((), ()),
+    ), mock.patch.object(
+        app_model._session_data_recorder,
+        "update_persisted_trial_ledger",
+    ), mock.patch.object(
+        app_model._protocol_runner,
+        "record_trial_outcome",
+    ) as protocol_outcome:
+        app_model._on_detection_result_ready(project, result)
+
+    assert [attempt.attempt_label for attempt in ledger.attempts] == [
+        "1.1",
+        "1.2",
+    ]
+    assert [attempt.outcome for attempt in ledger.attempts] == [
+        TrialOutcome.FAILURE,
+        TrialOutcome.SUCCESS,
+    ]
+    assert ledger.attempts[0].logical_trial_complete is False
+    assert ledger.attempts[1].logical_trial_complete is True
+    assert ledger.summary()["scored_trials"] == 1
+    protocol_outcome.assert_called_once_with("1.2", TrialOutcome.SUCCESS)
 
 
 def test_abort_removes_whole_session_and_resets_counts(app_model):
