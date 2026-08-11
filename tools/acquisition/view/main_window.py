@@ -18,7 +18,7 @@ from PySide6.QtCore import Qt, QCoreApplication, QTimer, Signal, QSize, QKeyComb
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (QMainWindow, QStatusBar, QToolBar, QLabel, QMessageBox, QApplication,
                                QSizePolicy, QWidget, QComboBox, QLineEdit, QFileDialog, QHBoxLayout,
-                               QSpinBox, QDoubleSpinBox, QFrame, QDialog, QLayout)
+                               QSpinBox, QDoubleSpinBox, QFrame, QDialog, QInputDialog, QLayout)
 import qtawesome as qta
 
 from autotrainer.core import EventManager, Offset3DTuple, AnimalSubject, SystemConfiguration, CameraConfiguration, \
@@ -51,6 +51,7 @@ from tools.acquisition.model.app_model import AppModel
 from tools.acquisition.model.app_model_status import AppModelStatus, SessionRecordingStatus
 from tools.acquisition.model.handle_3d_calibration import make_3d_calib
 from tools.acquisition.model.nidaq_discovery import discover_nidaq_devices
+from tools.acquisition.model.rfid_resolution import RfidResolutionKind
 from tools.acquisition.model.subsystem_status import SubsystemState
 from tools.acquisition.model.training_plan import get_plan_id
 from tools.acquisition.model.user_preferences import UserPreferences
@@ -58,6 +59,7 @@ from tools.acquisition.view.main_content import MainContent
 from tools.acquisition.view.nidaq_port_configuration_dialog import NidaqPortConfigurationDialog
 from tools.acquisition.view.preferences_dialog import PreferencesDialog
 from tools.acquisition.view.animal_metadata_dialog import AnimalMetadataDialog
+from tools.acquisition.view.animal_details_dialog import AnimalDetailsDialog
 from tools.acquisition.view.debug_content import DebugView
 from tools.acquisition.view.status_log_handler import StatusLogHandler
 
@@ -140,6 +142,7 @@ class MainWindow(QMainWindow):
         self._hardware_refresh_thread = None
         self._nidaq_discovery_thread = None
         self._status_log_handler = None
+        self._rfid_setup_dialog = None
 
         self.setWindowTitle(self._title)
 
@@ -245,6 +248,12 @@ class MainWindow(QMainWindow):
             and self._nidaq_discovery_thread is None
         )
         self.make_3d_calib_action.setEnabled(stopped)
+        self._set_hardware_menu_actions_enabled(
+            stopped
+            and self._app_model.status == AppModelStatus.IDLE
+            and self._hardware_refresh_thread is None
+            and self._nidaq_discovery_thread is None
+        )
         #
         run_action = self.run_action
         run_action.blockSignals(True)  # block signal to ensure we don't re-start/stop
@@ -407,6 +416,7 @@ class MainWindow(QMainWindow):
             return
 
         self.refresh_hardware_action.setEnabled(False)
+        self._set_hardware_menu_actions_enabled(False)
         if not retry_running:
             self.run_action.setEnabled(False)
             self._app_model_status_combo.setEnabled(False)
@@ -455,6 +465,7 @@ class MainWindow(QMainWindow):
         can_start = not self._app_model.acquisition_started and self._app_model.status == AppModelStatus.IDLE
         self.run_action.setEnabled(can_start)
         self._app_model_status_combo.setEnabled(can_start)
+        self._set_hardware_menu_actions_enabled(can_start)
         self.statusBar().showMessage(message, 12000)
 
     def _on_system_mode_combo_changed(self, idx: int):
@@ -922,6 +933,7 @@ class MainWindow(QMainWindow):
 
         self.edit_daq_ports_action.setEnabled(False)
         self.refresh_hardware_action.setEnabled(False)
+        self._set_hardware_menu_actions_enabled(False)
         self._set_startup_message("Discovering NI-DAQ devices...")
 
         def discover_worker():
@@ -949,6 +961,9 @@ class MainWindow(QMainWindow):
         )
         self.edit_daq_ports_action.setEnabled(is_idle)
         self.refresh_hardware_action.setEnabled(is_idle and self._hardware_refresh_thread is None)
+        self._set_hardware_menu_actions_enabled(
+            is_idle and self._hardware_refresh_thread is None
+        )
         if not is_idle or self._closing:
             self.statusBar().showMessage("NI-DAQ discovery finished; acquisition is no longer idle", 5000)
             return
@@ -1010,6 +1025,25 @@ class MainWindow(QMainWindow):
             "Scan hardware while idle, or retry failed subsystems while System Mode is running"
         )
         action.triggered.connect(self._refresh_hardware_bindings)
+
+        self.hardware_enable_actions = {}
+        for field_name, label in (
+            ("can_enabled", "Enable CAN Adapter"),
+            ("pellet_controller_enabled", "Enable Pellet Controller"),
+            ("nidaq_enabled", "Enable NI-DAQ"),
+            ("rfid_reader_enabled", "Enable USB RFID Reader"),
+        ):
+            action = QAction(label, self)
+            action.setCheckable(True)
+            action.setEnabled(False)
+            action.triggered.connect(
+                partial(self._set_hardware_enabled_from_menu, field_name)
+            )
+            self.hardware_enable_actions[field_name] = action
+
+        self.rfid_device_action = QAction("RFID Serial Device…", self)
+        self.rfid_device_action.setEnabled(False)
+        self.rfid_device_action.triggered.connect(self._edit_rfid_device_from_menu)
 
         action = self.run_action = QAction(_toolbar_icon("ei.play"), "Start", self)
         action.setToolTip("Start or stop acquisition")
@@ -1086,6 +1120,12 @@ class MainWindow(QMainWindow):
         )
 
         file_menu = menu_bar.addMenu("File")
+        hardware_menu = self.hardware_menu = file_menu.addMenu("Hardware")
+        for action in self.hardware_enable_actions.values():
+            hardware_menu.addAction(action)
+        hardware_menu.addSeparator()
+        hardware_menu.addAction(self.rfid_device_action)
+        file_menu.addSeparator()
         file_menu.addAction(self.quit_action)
 
         edit_menu = menu_bar.addMenu("Edit")
@@ -1100,6 +1140,90 @@ class MainWindow(QMainWindow):
         view_menu.addAction(self.view_diagnostics_action)
         if self._is_dev:
             view_menu.addAction(self.debug_action)
+
+    def _sync_hardware_menu_actions(self) -> None:
+        configuration = self._app_model.loaded_configuration
+        if configuration is None:
+            return
+        hardware = configuration.hardware
+        for field_name, action in self.hardware_enable_actions.items():
+            action.blockSignals(True)
+            action.setChecked(bool(getattr(hardware, field_name)))
+            action.blockSignals(False)
+        self.rfid_device_action.setText("RFID Serial Device…")
+        self.rfid_device_action.setToolTip(
+            hardware.rfid_device or "No RFID serial device is configured"
+        )
+
+    def _set_hardware_menu_actions_enabled(self, enabled: bool) -> None:
+        for action in self.hardware_enable_actions.values():
+            action.setEnabled(enabled)
+        self.rfid_device_action.setEnabled(enabled)
+
+    def _hardware_menu_values(self, **overrides):
+        configuration = self._app_model.loaded_configuration
+        if configuration is None:
+            raise RuntimeError("No system configuration is loaded")
+        hardware = configuration.hardware
+        values = {
+            "can_enabled": hardware.can_enabled,
+            "pellet_controller_enabled": hardware.pellet_controller_enabled,
+            "nidaq_enabled": hardware.nidaq_enabled,
+            "rfid_reader_enabled": hardware.rfid_reader_enabled,
+            "rfid_device": hardware.rfid_device,
+        }
+        values.update(overrides)
+        return values
+
+    def _apply_hardware_menu_values(self, values, *, refresh_if_enabled: bool) -> None:
+        try:
+            message = self._app_model.update_hardware_configuration(**values)
+        except Exception as exc:
+            logger.exception("Hardware menu setting was not applied")
+            self._sync_hardware_menu_actions()
+            self.statusBar().showMessage(f"Hardware setting not saved: {exc}", 8000)
+            return
+        self._sync_hardware_menu_actions()
+        self.statusBar().showMessage(message, 8000)
+        if refresh_if_enabled:
+            QTimer.singleShot(0, self._refresh_hardware_bindings)
+
+    def _set_hardware_enabled_from_menu(self, field_name: str, enabled: bool) -> None:
+        logger.info(
+            "Hardware menu selection: %s=%s",
+            field_name,
+            bool(enabled),
+        )
+        try:
+            values = self._hardware_menu_values(**{field_name: bool(enabled)})
+        except Exception as exc:
+            self._sync_hardware_menu_actions()
+            self.statusBar().showMessage(f"Hardware setting unavailable: {exc}", 8000)
+            return
+        self._apply_hardware_menu_values(
+            values,
+            refresh_if_enabled=bool(enabled) and field_name != "rfid_reader_enabled",
+        )
+
+    def _edit_rfid_device_from_menu(self) -> None:
+        try:
+            values = self._hardware_menu_values()
+        except Exception as exc:
+            self.statusBar().showMessage(f"RFID setting unavailable: {exc}", 8000)
+            return
+        device, accepted = QInputDialog.getText(
+            self,
+            "RFID Serial Device",
+            "Stable /dev/serial/by-id path:",
+            QLineEdit.EchoMode.Normal,
+            values["rfid_device"],
+        )
+        if not accepted:
+            return
+        device = device.strip()
+        logger.info("RFID serial-device selection changed: device=%s", device or "<empty>")
+        values["rfid_device"] = device
+        self._apply_hardware_menu_values(values, refresh_if_enabled=False)
 
     def _configure_toolbar(self):
 
@@ -1577,6 +1701,12 @@ class MainWindow(QMainWindow):
                 )
                 and self._hardware_refresh_thread is None
             )
+            self._set_hardware_menu_actions_enabled(
+                value is AppModelStatus.IDLE
+                and not app_model.acquisition_started
+                and self._hardware_refresh_thread is None
+                and self._nidaq_discovery_thread is None
+            )
             self.blockSignals(False)
 
             self.main_content.set_is_capture_active(value != AppModelStatus.IDLE)
@@ -1615,21 +1745,24 @@ class MainWindow(QMainWindow):
             kind = getattr(getattr(value, "kind", None), "value", "unknown")
             animal = getattr(value, "animal", None)
             rfid = getattr(value, "rfid", "")
+            self._rfid_status_label.setText(f"RFID: {rfid or 'unknown'}")
             if animal is not None:
-                self._rfid_status_label.setText(f"RFID: {animal.name}")
                 self._rfid_status_label.setStyleSheet("color: #217a3c;")
                 self._rfid_status_label.setToolTip(
-                    f"{kind.replace('_', ' ')} · {rfid}"
+                    f"Subject: {animal.name}\nResult: {kind.replace('_', ' ')}"
                     + (
                         f"\n{getattr(value, 'message', '')}"
                         if getattr(value, "message", "")
                         else ""
                     )
                 )
-            else:
-                self._rfid_status_label.setText(
-                    f"RFID: {kind.replace('_', ' ')}"
+            elif kind == RfidResolutionKind.SETUP_REQUIRED.value:
+                self._rfid_status_label.setStyleSheet("color: #b36b00;")
+                self._rfid_status_label.setToolTip(
+                    f"First scan: set up or link this animal\nTag: {rfid}"
                 )
+                QTimer.singleShot(0, partial(self._open_rfid_setup_dialog, value))
+            else:
                 self._rfid_status_label.setStyleSheet("color: #a33;")
                 self._rfid_status_label.setToolTip(
                     (getattr(value, "message", "") + "\n" if getattr(value, "message", "") else "")
@@ -1654,6 +1787,7 @@ class MainWindow(QMainWindow):
                     animal_dropdown.addItem(value.name, value.id)
 
             animal_dropdown.blockSignals(False)
+            self._show_selected_animal_identity(value)
             self._refresh_prev_next_phases()
 
         elif name == props.TRAINING_PLAN:
@@ -1676,6 +1810,58 @@ class MainWindow(QMainWindow):
 
         elif name == props.TRAINING_PHASE:
             self._refresh_prev_next_phases()
+
+    def _open_rfid_setup_dialog(self, resolution) -> None:
+        if self._rfid_setup_dialog is not None:
+            logger.warning(
+                "RFID first-scan dialog already open; setup remains pending: rfid=%s",
+                resolution.rfid,
+            )
+            return
+        if (
+            resolution.kind is not RfidResolutionKind.SETUP_REQUIRED
+            or resolution.record is None
+        ):
+            return
+        dialog = AnimalDetailsDialog(
+            self._app_model,
+            self,
+            record=resolution.record,
+            scanned_rfid=resolution.rfid,
+        )
+        self._rfid_setup_dialog = dialog
+        logger.info("Opening RFID first-scan setup dialog: rfid=%s", resolution.rfid)
+        try:
+            accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        finally:
+            self._rfid_setup_dialog = None
+        if accepted:
+            logger.info("RFID first-scan setup accepted: rfid=%s", resolution.rfid)
+        else:
+            logger.info(
+                "RFID first-scan setup canceled; no animal was created: rfid=%s",
+                resolution.rfid,
+            )
+            self.statusBar().showMessage(
+                f"RFID {resolution.rfid} setup canceled; nothing was created",
+                8000,
+            )
+
+    def _show_selected_animal_identity(self, animal: Optional[AnimalSubject]) -> None:
+        if animal is None:
+            return
+        metadata = animal.external_metadata
+        rfid = None if metadata is None else metadata.rfid
+        if rfid:
+            self._rfid_status_label.setText(f"RFID: {rfid}")
+            self._rfid_status_label.setStyleSheet("color: #217a3c;")
+            self._rfid_status_label.setToolTip(f"Subject: {animal.name}\nLinked RFID")
+        else:
+            self._rfid_status_label.setText("RFID: unlinked")
+            self._rfid_status_label.setStyleSheet("color: #b36b00;")
+            self._rfid_status_label.setToolTip(
+                f"Subject: {animal.name}\nNo SoftMouse/RFID link"
+            )
 
     @invoke_method
     def _reload_animals(self, animals: List[AnimalSubject]):
@@ -1706,6 +1892,7 @@ class MainWindow(QMainWindow):
                 combo.setCurrentIndex(index)
         else:
             combo.setCurrentIndex(0)
+        self._show_selected_animal_identity(self._app_model.selected_animal)
 
     @staticmethod
     def _update_log_level(value: int):
@@ -1776,6 +1963,13 @@ class MainWindow(QMainWindow):
     @invoke_method
     def _on_app_model_configuration_loaded(self, config):
         self._set_training_plans(self._app_model.training_plans)
+        self._sync_hardware_menu_actions()
+        self._set_hardware_menu_actions_enabled(
+            not self._app_model.acquisition_started
+            and self._app_model.status == AppModelStatus.IDLE
+            and self._hardware_refresh_thread is None
+            and self._nidaq_discovery_thread is None
+        )
 
     @invoke_method
     def _on_inference_analysis_result_ready(self, prj: ProjectInfo, rsp: IntersessionResponse):

@@ -19,8 +19,9 @@ def test_manual_link_and_reconciliation_workflows_are_visible(qapp, app_model):
     dialog = AnimalMetadataDialog(app_model)
 
     tabs = dialog.findChild(QTabWidget)
-    assert tabs.count() == 2
-    assert tabs.tabText(0) == "Manual link"
-    assert tabs.tabText(1) == "Condense duplicates"
+    assert tabs.count() == 3
+    assert tabs.tabText(0) == "Edit animal"
+    assert tabs.tabText(1) == "Link RFID"
+    assert tabs.tabText(2) == "Condense duplicate"
 
     dialog.close()

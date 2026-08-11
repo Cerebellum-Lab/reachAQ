@@ -106,7 +106,7 @@ def test_user_preferences(settings_ini_path, user_pref, trainer_config_dir):
     assert user_pref.selected_animal == "foobar"
 
 
-def test_hardware_editor_settings_persist_to_system_yaml(
+def test_hardware_menu_settings_persist_to_system_yaml(
     app_model,
     config_file_path,
     system_config,

@@ -75,9 +75,10 @@ directory so test settings do not overwrite the bench config.
 
 Rig-level availability for CAN, the pellet controller, NI-DAQ, and the USB RFID
 reader is grouped in the YAML `hardware:` block. The same switches and the RFID
-serial path are editable under **Hardware Status → Hardware Configuration**
-while acquisition is idle. **Apply and save** persists the selection; refresh
-hardware afterward to connect newly enabled devices.
+serial path are editable under **File → Hardware** while acquisition is idle.
+Each menu selection takes effect immediately and persists to the system YAML.
+The Hardware Status panel remains a compact, read-only view of live subsystem
+health.
 
 The current production schema is system-configuration version 57. Older and
 newer versions, unknown fields, retired load-cell/tunnel fields, and obsolete
@@ -264,7 +265,9 @@ mkdir -p "$HOME/Documents/rawdatalocal"
 
 * System Mode - select Idle or Running. During transitions it explicitly shows
   Starting or Stopping acquisition.
-* Notes and Subject - set acquisition notes and select the current animal.
+* Notes - set notes for the current acquisition session.
+* Subject - select the linked local animal name. The adjacent RFID label shows
+  the most recently scanned raw 15-digit RFID.
 * Protocol - select a protocol, or select **Manual pellet control**. Automatic
   pellet cycles and automatic protocol advance are independent settings.
 * Preferences - configure live inference and other application preferences.

@@ -50,11 +50,21 @@ The metadata actions remain in that panel:
 - **Refresh local cache** only imports the latest existing Isilon publication.
 
 RFID hardware settings are grouped with the other rig-level switches under
-**Hardware Status → Hardware Configuration**. Enable **USB RFID reader**,
-confirm the stable `/dev/serial/by-id/...` path, and click **Apply and save**.
-The selection is written to the `hardware:` block in
-`~/Autotrainer/system_configuration.yaml`. Expand **RFID Reader** in the same
-panel to view connection and last-scan details.
+**File → Hardware**. Enable **USB RFID reader** and use **RFID Serial
+Device…** to confirm the stable `/dev/serial/by-id/...` path. Every selection
+takes effect immediately and is written to the `hardware:` block in
+`~/Autotrainer/system_configuration.yaml`. Expand **RFID Reader** under
+**Hardware Status** to view connection and last-scan details.
+
+For a SoftMouse RFID with no existing JSON link, the first scan opens **Set up
+scanned animal**. Choose **Create new animal JSON** or an existing unlinked
+animal name, edit the local subject name and persistent animal notes, then
+Save. Cancel creates nothing. Later scans select the linked subject without
+opening the dialog. The toolbar shows the raw 15-digit RFID beside the linked
+Subject name. **RFID links…** provides simple edit, manual-link, and duplicate-
+condensation workflows; condensation retains the chosen local JSON values,
+transfers the RFID link, archives the duplicate, and opens the survivor for
+editing.
 
 There is no JSON configuration file to create or edit. An old
 `~/.config/reachaq/softmouse-publisher.json` file is ignored and may be removed.

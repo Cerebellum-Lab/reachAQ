@@ -138,23 +138,6 @@ class _AppModelStub(ObservableObject):
             "laser": HardwareScanEntry("not probed; backend disabled", "disabled"),
         }
 
-    def update_hardware_configuration(self, **values):
-        hardware_configuration = self.loaded_configuration.hardware
-        hardware_configuration.can_enabled = values["can_enabled"]
-        hardware_configuration.pellet_controller_enabled = values[
-            "pellet_controller_enabled"
-        ]
-        hardware_configuration.nidaq_enabled = values["nidaq_enabled"]
-        hardware_configuration.rfid_reader_enabled = values[
-            "rfid_reader_enabled"
-        ]
-        hardware_configuration.rfid_device = values["rfid_device"]
-        self.hardware.can_enabled = values["can_enabled"]
-        self.hardware.pellet_controller_enabled = values["pellet_controller_enabled"]
-        self.hardware.nidaq_enabled = values["nidaq_enabled"]
-        self.configuration_loaded_event(self.loaded_configuration)
-        return "Hardware settings saved"
-
 
 def test_status_panel_columns_and_scan_results(qapp):
     content = HardwareStatusContent(_AppModelStub())
@@ -260,29 +243,6 @@ def test_rfid_runtime_and_last_scan_update_hardware_status(qapp):
         assert "reader connected" in panel.details_text
         assert "Mouse 17" in panel.details_text
         assert "#e8f5ec" in panel.header.styleSheet()
-    finally:
-        content.deleteLater()
-
-
-def test_hardware_configuration_editor_applies_all_rig_switches(qapp):
-    app_model = _AppModelStub()
-    content = HardwareStatusContent(app_model)
-    try:
-        assert content._rfid_device_edit.text() == "/dev/serial/by-id/test-rfid"
-        for checkbox in content._hardware_enabled_controls.values():
-            checkbox.setChecked(True)
-        content._rfid_device_edit.setText("/dev/serial/by-id/new-rfid")
-
-        content._save_hardware_button.click()
-        qapp.processEvents()
-
-        hardware = app_model.loaded_configuration.hardware
-        assert hardware.can_enabled is True
-        assert hardware.pellet_controller_enabled is True
-        assert hardware.nidaq_enabled is True
-        assert hardware.rfid_reader_enabled is True
-        assert hardware.rfid_device == "/dev/serial/by-id/new-rfid"
-        assert content._hardware_save_status.text() == "Hardware settings saved"
     finally:
         content.deleteLater()
 

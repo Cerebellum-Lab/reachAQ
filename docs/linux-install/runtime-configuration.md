@@ -48,9 +48,9 @@ product/serial identities and validates timing-master capability. All mapped and
 custom NI-DAQ inputs are recorded when NI-DAQ is enabled; plotting only the
 subset in `displayChannels` does not change persistence.
 
-The same rig-level switches can be changed while idle under **Hardware Status →
-Hardware Configuration**. **Apply and save** writes them back to the system
-YAML; use the hardware refresh button to connect newly enabled devices.
+The same rig-level switches can be changed while idle under **File → Hardware**.
+Each checkable selection takes effect immediately and is saved to the system
+YAML. **RFID Serial Device…** changes the stable reader path from the same menu.
 
 See [Session recording, synchronization, and hardware isolation](../acquisition/session-recording-and-synchronization.md)
 before commissioning Record/Stop/Abort or a multi-device timing topology.

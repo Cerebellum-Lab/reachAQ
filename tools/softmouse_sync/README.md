@@ -2,8 +2,8 @@
 
 This feature synchronizes current Christie colony metadata from SoftMouse,
 publishes one validated snapshot to Isilon, and builds a rebuildable SQLite
-cache on each reachAQ computer. A USB RFID scan can then select, create, or
-manually link a local reachAQ animal without renaming an existing animal.
+cache on each reachAQ computer. A first USB RFID scan opens a local-animal setup
+dialog; later scans select the linked reachAQ animal immediately.
 
 For a short operator checklist, see
 [CONFIGURATION_GUIDE.md](CONFIGURATION_GUIDE.md).
@@ -57,8 +57,8 @@ These values are built into the application and are not operator configuration:
   `/mnt/isilon/Data/ReachingData/SoftMouse/SoftMouse-AnimalList-current.manifest.json`
 
 The new-animal name field remains selectable in **Preferences → Animal
-metadata**. This affects only newly created animals; synchronization never
-renames an existing local animal.
+metadata**. It supplies the editable default in the first-scan dialog;
+synchronization itself never renames an existing local animal.
 
 ## Credentials
 
@@ -140,6 +140,13 @@ systemctl --user start reachaq-softmouse-publisher.service
 journalctl --user -u reachaq-softmouse-publisher.service -n 100 --no-pager
 ```
 
+The publisher journal records authentication progress, colony selection,
+pagination, validation counts, publication paths/hashes, and failures without
+recording passwords, cookies, CSRF values, or request bodies. The normal
+reachAQ application log records RFID reader state, every normalized scan and
+cache match, scan resolution, animal selection/link/reconciliation, and local
+cache refresh outcomes.
+
 Disable nightly publication without affecting manual synchronization:
 
 ```bash
@@ -148,11 +155,12 @@ systemctl --user disable --now reachaq-softmouse-publisher.timer
 
 ## RFID setup and status
 
-In **Hardware Status → Hardware Configuration**:
+In **File → Hardware**:
 
 1. Enable **USB RFID reader** only on computers with the reader attached.
-2. Keep the stable `/dev/serial/by-id/...` path rather than `/dev/ttyUSB0`.
-3. Click **Apply and save**. The setting is persisted in the system YAML.
+2. Use **RFID Serial Device…** to keep the stable `/dev/serial/by-id/...` path
+   rather than `/dev/ttyUSB0`.
+3. Each selection takes effect immediately and is persisted in the system YAML.
 
 Choose the SoftMouse field used to name a newly created local animal under
 **Preferences → Animal metadata**.
@@ -165,11 +173,20 @@ block manual recording.
 Only an exact 15-digit ISO 11784 `Plate ID` is accepted as an RFID. Empty values
 and other identifiers are treated as missing RFID and ignored. Numeric
 spreadsheet cells are rejected to prevent identifier corruption. The USB reader
-sends a validated 26-hex transport payload; reachAQ converts its first 64 bits
-from the reader's animal-ID-on-the-right ordering to the same 15-digit Plate ID
-before lookup. The transport payload is never used as the database identifier.
+sends a validated 26-hex transport payload; reachAQ reverses the reader's
+least-significant-nibble-first animal and country fields to produce the same
+15-digit Plate ID before lookup. The transport payload is never used as the
+database identifier.
 A repeated read of the same physical tag is suppressed briefly by the reader
 service.
+
+On the first scan of a SoftMouse RFID that has no permanent JSON link, reachAQ
+offers **Create new animal JSON**, every existing unlinked animal JSON, an
+editable subject name, and persistent animal notes. Cancel creates nothing.
+Save writes the UUID-named JSON, stores the RFID/SoftMouse link, and selects the
+subject. Subsequent scans load that JSON link and select the subject without
+showing the dialog. The toolbar's RFID label shows the raw 15-digit RFID while
+the Subject control shows the linked local name.
 
 ## Data ownership and safety
 
@@ -181,8 +198,9 @@ service.
 - The registry does not own training state or permanent local links.
 - Ended animals and rows without valid RFID are excluded from the cache.
 - Unknown RFID scans remain unlinked and can be resolved manually.
-- Conflicting local animals are condensed only through the manual reconciliation
-  workflow with explicit overwrite choices.
+- Duplicate condensation keeps the chosen local JSON's name, notes, training,
+  reach position, and limits; transfers the selected SoftMouse/RFID link;
+  archives the duplicate JSON; and then opens the survivor for editing.
 - Metadata import and reconciliation are unavailable during recording.
 
 Publication validates the colony, active states, pagination consistency, row

@@ -13,22 +13,23 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from tools.acquisition.model.animal_reconciliation import AnimalReconciliationChoices
 from tools.acquisition.model.app_model_status import SessionRecordingStatus
+from tools.acquisition.view.animal_details_dialog import AnimalDetailsDialog
 
 
 class AnimalMetadataDialog(QDialog):
-    """Explicit manual-link and two-record condensation workflow."""
+    """Simple manual-link and duplicate-condensation workflow."""
 
     def __init__(self, app_model, parent=None):
         super().__init__(parent)
         self.app_model = app_model
-        self.setWindowTitle("Animal RFID links and reconciliation")
-        self.resize(650, 420)
+        self.setWindowTitle("Animal RFID links and duplicates")
+        self.resize(610, 330)
         layout = QVBoxLayout(self)
         tabs = QTabWidget()
-        tabs.addTab(self._link_tab(), "Manual link")
-        tabs.addTab(self._reconcile_tab(), "Condense duplicates")
+        tabs.addTab(self._edit_tab(), "Edit animal")
+        tabs.addTab(self._link_tab(), "Link RFID")
+        tabs.addTab(self._reconcile_tab(), "Condense duplicate")
         layout.addWidget(tabs)
         self.status = QLabel("")
         self.status.setWordWrap(True)
@@ -37,77 +38,116 @@ class AnimalMetadataDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-    def _animal_combo(self) -> QComboBox:
+    def _all_animal_combo(self) -> QComboBox:
         combo = QComboBox()
         for animal in self.app_model.animals:
-            link = (
-                "unlinked"
-                if animal.external_identity is None
-                else animal.external_identity.subject_id
-            )
-            combo.addItem(f"{animal.name} · {link} · {animal.id}", animal.id)
+            combo.addItem(animal.name, animal.id)
         selected = self.app_model.selected_animal
         if selected is not None:
             combo.setCurrentIndex(combo.findData(selected.id))
         return combo
 
+    def _unlinked_animal_combo(self) -> QComboBox:
+        combo = QComboBox()
+        for animal in self.app_model.animals:
+            if animal.external_identity is None:
+                combo.addItem(animal.name, animal.id)
+        selected = self.app_model.selected_animal
+        if selected is not None and selected.external_identity is None:
+            combo.setCurrentIndex(combo.findData(selected.id))
+        return combo
+
+    def _linked_animal_combo(self) -> QComboBox:
+        combo = QComboBox()
+        records_by_key = {
+            record.identity.key: record
+            for record in self.app_model.current_external_animal_records()
+        }
+        for animal in self.app_model.animals:
+            if animal.external_identity is None:
+                continue
+            metadata = animal.external_metadata
+            record = records_by_key.get(animal.external_identity.key)
+            linked_name = (
+                record.new_animal_name_candidate
+                if record is not None and record.new_animal_name_candidate
+                else animal.external_identity.subject_id
+            )
+            rfid = "unknown" if metadata is None or not metadata.rfid else metadata.rfid
+            combo.addItem(f"{linked_name} · RFID {rfid}", animal.id)
+        return combo
+
     def _link_tab(self) -> QWidget:
         tab = QWidget()
         form = QFormLayout(tab)
-        self.link_animal = self._animal_combo()
-        form.addRow("Local animal:", self.link_animal)
+        self.link_animal = self._unlinked_animal_combo()
+        form.addRow("Animal JSON name:", self.link_animal)
         self.external_record = QComboBox()
-        self._external_records = self.app_model.current_external_animal_records()
+        self._external_records = tuple(
+            record
+            for record in self.app_model.current_external_animal_records()
+            if record.identity.key not in self.app_model.external_link_conflicts
+            and self.app_model.get_animal_by_external_identity(record.identity) is None
+        )
         for record in self._external_records:
+            linked_name = (
+                record.new_animal_name_candidate or record.identity.subject_id
+            )
             self.external_record.addItem(
-                f"{record.identity.subject_id} · {record.physical_rfid} · "
-                f"{record.new_animal_name_candidate or '(no name)'}",
+                f"{linked_name} · RFID {record.physical_rfid}",
                 record.identity.key,
             )
-        form.addRow("SoftMouse animal:", self.external_record)
+        form.addRow("Scanned RFID name:", self.external_record)
         note = QLabel(
-            "Linking updates only external identity/metadata. The existing local "
-            "animal name, training progress, limits, and reach position are preserved."
+            "This attaches the selected SoftMouse/RFID identity to the existing "
+            "animal JSON, selects it, and then opens its editable details."
         )
         note.setWordWrap(True)
         form.addRow("", note)
-        button = QPushButton("Link selected records")
-        button.setEnabled(bool(self._external_records) and self._ready())
+        button = QPushButton("Link and edit")
+        button.setEnabled(
+            self.link_animal.count() > 0
+            and bool(self._external_records)
+            and self._ready()
+        )
         button.clicked.connect(self._link)
+        form.addRow("", button)
+        return tab
+
+    def _edit_tab(self) -> QWidget:
+        tab = QWidget()
+        form = QFormLayout(tab)
+        self.edit_animal = self._all_animal_combo()
+        form.addRow("Animal JSON name:", self.edit_animal)
+        note = QLabel("Edit the local subject name and persistent animal notes.")
+        note.setWordWrap(True)
+        form.addRow("", note)
+        button = QPushButton("Edit selected animal")
+        button.setEnabled(self.edit_animal.count() > 0 and self._ready())
+        button.clicked.connect(self._edit_selected)
         form.addRow("", button)
         return tab
 
     def _reconcile_tab(self) -> QWidget:
         tab = QWidget()
         form = QFormLayout(tab)
-        self.survivor = self._animal_combo()
-        self.loser = self._animal_combo()
-        if self.loser.count() > 1:
-            survivor_index = self.loser.findData(self.survivor.currentData())
-            self.loser.setCurrentIndex(0 if survivor_index != 0 else 1)
-        form.addRow("Surviving UUID:", self.survivor)
-        form.addRow("Losing UUID:", self.loser)
-        self.choice_combos = {}
-        for key, label in (
-            ("name", "Display name from:"),
-            ("pellet", "Reach/pellet position from:"),
-            ("training", "Training state from:"),
-            ("limit", "Target limit from:"),
-            ("external", "SoftMouse link/metadata from:"),
-        ):
-            combo = self._animal_combo()
-            if key == "external" and self.loser.count() > 1:
-                combo.setCurrentIndex(combo.findData(self.loser.currentData()))
-            self.choice_combos[key] = combo
-            form.addRow(label, combo)
+        self.survivor = self._all_animal_combo()
+        self.linked_duplicate = self._linked_animal_combo()
+        form.addRow("Keep animal JSON:", self.survivor)
+        form.addRow("Merge linked RFID animal:", self.linked_duplicate)
         note = QLabel(
-            "Both original JSON files are backed up. The losing UUID is archived "
-            "with a redirect; historical sessions are not changed."
+            "The kept JSON retains its name, notes, training, reach position, and "
+            "limits. The RFID/SoftMouse link is transferred; the duplicate JSON "
+            "is archived with a redirect. The kept animal opens for editing next."
         )
         note.setWordWrap(True)
         form.addRow("", note)
         button = QPushButton("Review and condense")
-        button.setEnabled(len(self.app_model.animals) >= 2 and self._ready())
+        button.setEnabled(
+            self.survivor.count() > 0
+            and self.linked_duplicate.count() > 0
+            and self._ready()
+        )
         button.clicked.connect(self._condense)
         form.addRow("", button)
         return tab
@@ -115,46 +155,52 @@ class AnimalMetadataDialog(QDialog):
     def _ready(self) -> bool:
         return self.app_model.session_recording_status is SessionRecordingStatus.READY
 
-    def _link(self):
+    def _edit(self, animal) -> None:
+        AnimalDetailsDialog(self.app_model, self, animal=animal).exec()
+
+    def _edit_selected(self) -> None:
+        animal = self.app_model.get_animal_by_id(self.edit_animal.currentData())
+        if animal is not None:
+            self._edit(animal)
+
+    def _link(self) -> None:
         try:
             record = self._external_records[self.external_record.currentIndex()]
-            self.app_model.manually_link_animal(self.link_animal.currentData(), record)
-            self.status.setText("Manual link saved.")
+            animal = self.app_model.manually_link_animal(
+                self.link_animal.currentData(), record
+            )
         except Exception as exc:
             self.status.setText(f"Link failed: {exc}")
-
-    def _condense(self):
-        survivor_id = self.survivor.currentData()
-        loser_id = self.loser.currentData()
-        if survivor_id == loser_id:
-            self.status.setText("Choose two different local animals.")
             return
-        sources = {
-            key: combo.currentData() for key, combo in self.choice_combos.items()
-        }
-        summary = "\n".join(
-            f"{field}: {source_id}" for field, source_id in sources.items()
-        )
+        self.status.setText("RFID link saved.")
+        self._edit(animal)
+
+    def _condense(self) -> None:
+        survivor_id = self.survivor.currentData()
+        duplicate_id = self.linked_duplicate.currentData()
+        if survivor_id == duplicate_id:
+            self.status.setText("Choose two different animal JSON records.")
+            return
+        survivor = self.app_model.get_animal_by_id(survivor_id)
+        if survivor is None or self.app_model.get_animal_by_id(duplicate_id) is None:
+            self.status.setText("One of the selected animal JSON records no longer exists.")
+            return
         answer = QMessageBox.question(
             self,
             "Confirm animal condensation",
-            f"Survivor: {survivor_id}\nLoser: {loser_id}\n\n{summary}\n\n"
-            "Both originals will be backed up. Continue?",
+            f"Keep animal JSON: {survivor.name}\n"
+            f"Merge linked RFID animal: {self.linked_duplicate.currentText()}\n\n"
+            "The duplicate JSON will be archived. Continue?",
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
         try:
-            self.app_model.condense_animals(
+            merged = self.app_model.condense_animal_duplicate(
                 survivor_id,
-                loser_id,
-                AnimalReconciliationChoices(
-                    name_from=sources["name"],
-                    pellet_position_from=sources["pellet"],
-                    training_from=sources["training"],
-                    target_limit_from=sources["limit"],
-                    external_identity_from=sources["external"],
-                ),
+                duplicate_id,
             )
-            self.status.setText("Animals condensed; close and reopen to review lists.")
         except Exception as exc:
             self.status.setText(f"Condensation failed: {exc}")
+            return
+        self.status.setText("Animals condensed and RFID link transferred.")
+        self._edit(merged)
