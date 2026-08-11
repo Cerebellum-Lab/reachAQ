@@ -7,9 +7,11 @@ RequiresMountsFor=/mnt/isilon
 
 [Service]
 Type=oneshot
-# These are the standard reachAQ environment and checkout paths on the publisher.
-ExecStart=/home/christielab10/anaconda3/envs/reachaq/bin/python -m tools.softmouse_sync.cli
-WorkingDirectory=/home/christielab10/Documents/reachAQ
+# Support the Anaconda, Miniconda, and Mambaforge locations recognized by the
+# portable installer. /usr/bin/env resolves conda using this explicit path.
+Environment="PATH=%h/anaconda3/bin:%h/miniconda3/bin:%h/mambaforge/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/usr/bin/env conda run --no-capture-output -n reachaq python -m tools.softmouse_sync.cli
+WorkingDirectory=%h/Documents/reachAQ
 PrivateTmp=true
 NoNewPrivileges=true
 

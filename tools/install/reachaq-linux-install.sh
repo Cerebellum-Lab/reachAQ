@@ -24,6 +24,7 @@ INSTALL_ENV=${REACHAQ_INSTALL_ENV:-reachaq}
 INSTALL_PYTHON=${REACHAQ_INSTALL_PYTHON:-3.8}
 INSTALL_CONFIG_DIR=${REACHAQ_INSTALL_CONFIG_DIR:-$HOME/Autotrainer}
 INSTALL_DATA_DIR=${REACHAQ_INSTALL_DATA_DIR:-$HOME/Documents/rawdatalocal}
+INSTALL_OPERATOR=${SUDO_USER:-${USER:-$(id -un)}}
 
 CURRENT_CATEGORY="General"
 RESULT_NAMES=()
@@ -166,17 +167,30 @@ apt_install_base() {
     run_as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y \
         build-essential \
         can-utils \
+        dbus-user-session \
         dkms \
         expat \
         ffmpeg \
         git \
         git-lfs \
+        gnome-keyring \
         iproute2 \
         libegl1 \
+        libfontconfig1 \
         libgl1 \
         libopenal1 \
         libxcb-cursor0 \
+        libxcb-icccm4 \
+        libxcb-image0 \
+        libxcb-keysyms1 \
+        libxcb-randr0 \
+        libxcb-render-util0 \
+        libxcb-shape0 \
+        libxcb-xfixes0 \
+        libxcb-xinerama0 \
+        libxcb-xkb1 \
         libxkbcommon-x11-0 \
+        libsecret-1-0 \
         pkg-config \
         v4l-utils \
         wget
@@ -190,6 +204,19 @@ check_repo() {
 
 make_runtime_directories() {
     mkdir -p "$INSTALL_CONFIG_DIR" "$INSTALL_DATA_DIR"
+}
+
+ensure_rfid_serial_group() {
+    if ! getent group dialout >/dev/null 2>&1; then
+        run_as_root groupadd --system dialout || return
+    fi
+    if id -nG "$INSTALL_OPERATOR" | tr ' ' '\n' | grep -qx dialout; then
+        printf '%s already belongs to the dialout group.\n' "$INSTALL_OPERATOR"
+        return 0
+    fi
+    run_as_root usermod --append --groups dialout "$INSTALL_OPERATOR" || return
+    printf '%s\n' \
+        "$INSTALL_OPERATOR was added to dialout. Log out and back in before using the RFID reader."
 }
 
 find_conda() {
@@ -377,7 +404,53 @@ git_lfs_pull() {
 
 verify_imports() {
     conda_run python -c \
-        'import autotrainer.core, autotrainer.device, autotrainer.video, PySide6, cv2, can, nidaqmx; print("generic imports ok")'
+        'import autotrainer.core, autotrainer.device, autotrainer.video, PySide6, cv2, can, keyring, nidaqmx, openpyxl, requests, serial; print("generic imports ok")'
+}
+
+verify_softmouse_runtime() {
+    conda_run python - <<'PY'
+import keyring
+import openpyxl
+import requests
+
+from tools.softmouse_sync.https_source import SoftMouseHttpsSource
+from tools.softmouse_sync.publisher import SoftMouseExportPublisher
+
+backend = keyring.get_keyring()
+priority = backend.priority
+if priority <= 0:
+    raise SystemExit(f"No usable OS keyring backend is available: {backend}")
+print(f"SoftMouse HTTPS, spreadsheet, and keyring runtime ok ({backend})")
+PY
+}
+
+verify_rfid_runtime() {
+    conda_run python - <<'PY'
+import os
+from pathlib import Path
+
+import serial
+from autotrainer.device.rfid_reader import RfidReaderService
+
+devices = sorted(Path("/dev/serial/by-id").glob("*"))
+if not devices:
+    print("RFID runtime ok; no /dev/serial/by-id device is currently attached")
+else:
+    inaccessible = [path for path in devices if not os.access(path, os.R_OK | os.W_OK)]
+    if inaccessible:
+        raise SystemExit(
+            "RFID serial device is not readable/writable in this login session: "
+            + ", ".join(map(str, inaccessible))
+            + ". Log out and back in after joining dialout."
+        )
+    print("RFID runtime and serial permissions ok: " + ", ".join(map(str, devices)))
+PY
+}
+
+verify_softmouse_systemd_units() {
+    systemd-analyze --user verify \
+        "$INSTALL_REPO/tools/softmouse_sync/systemd/reachaq-softmouse-publisher.service" \
+        "$INSTALL_REPO/tools/softmouse_sync/systemd/reachaq-softmouse-publisher.timer"
 }
 
 run_focused_tests() {
@@ -385,10 +458,13 @@ run_focused_tests() {
         cd "$INSTALL_REPO" || return
         conda_run python -m pytest \
             auto-trainer-core/tests/logging_test.py \
+            auto-trainer-core/tests/external_metadata_test.py \
             auto-trainer-device/tests/can_transport_test.py \
             auto-trainer-device/tests/laser_test.py \
+            auto-trainer-device/tests/rfid_reader_test.py \
             auto-trainer-inference/tests/gpu_runtime_test.py \
             tests/acquisition_args_test.py \
+            tests/animal_metadata_sync_test.py \
             tests/autotrainer_headless_test.py::test_cli_help \
             tests/autotrainer_headless_test.py::test_load_config \
             tests/autotrainer_headless_test.py::test_gpu_preflight_fails_before_cameras_and_hardware \
@@ -399,7 +475,14 @@ run_focused_tests() {
             tests/hardware_status_content_test.py \
             tests/nidaq_port_configuration_dialog_test.py \
             tests/reachaq_linux_install_test.py \
+            tests/rfid_app_model_test.py \
             tests/signal_stream_ui_test.py \
+            tests/softmouse_cli_test.py \
+            tests/softmouse_https_source_test.py \
+            tests/softmouse_publication_controller_test.py \
+            tests/softmouse_publisher_test.py \
+            tests/softmouse_registry_test.py \
+            tests/user_preferences_softmouse_test.py \
             -q
     )
 }
@@ -416,6 +499,7 @@ else
     run_step "Update apt metadata" apt_update
     run_step "Install base packages" apt_install_base
 fi
+run_step "Configure RFID serial permissions" ensure_rfid_serial_group
 
 begin_category "Conda runtime"
 CONDA_BIN=$(find_conda)
@@ -470,15 +554,20 @@ if [ -z "$CONDA_BIN" ]; then
     skip_step "Verify Python version" "conda unavailable"
     skip_step "Verify Python dependencies" "conda unavailable"
     skip_step "Verify generic imports" "conda unavailable"
+    skip_step "Verify SoftMouse runtime" "conda unavailable"
+    skip_step "Verify RFID runtime" "conda unavailable"
     skip_step "Verify GUI CLI" "conda unavailable"
     skip_step "Verify headless CLI" "conda unavailable"
 else
     run_step "Verify Python version" conda_run python --version
     run_step "Verify Python dependencies" conda_run python -m pip check
     run_step "Verify generic imports" verify_imports
+    run_step "Verify SoftMouse runtime" verify_softmouse_runtime
+    run_step "Verify RFID runtime" verify_rfid_runtime
     run_step "Verify GUI CLI" conda_run python -m reachAQ.app -h
     run_step "Verify headless CLI" conda_run auto-trainer-headless -h
 fi
+run_step "Verify SoftMouse systemd units" verify_softmouse_systemd_units
 
 if [ -z "$CONDA_BIN" ]; then
     skip_step "Run focused non-hardware tests" "conda unavailable"

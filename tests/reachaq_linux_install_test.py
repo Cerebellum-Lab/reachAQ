@@ -5,6 +5,15 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 INSTALL_SCRIPT = REPO_ROOT / "tools" / "install" / "reachaq-linux-install.sh"
+TOOLS_PROJECT = REPO_ROOT / "tools" / "pyproject.toml"
+DEVICE_PROJECT = REPO_ROOT / "auto-trainer-device" / "pyproject.toml"
+SOFTMOUSE_SERVICE = (
+    REPO_ROOT
+    / "tools"
+    / "softmouse_sync"
+    / "systemd"
+    / "reachaq-softmouse-publisher.service"
+)
 
 
 def _run_installer(*args: str) -> subprocess.CompletedProcess:
@@ -38,6 +47,46 @@ def test_portable_installer_always_attempts_complete_workflow():
     assert "--skip-" not in source
     assert "--install-tensorflow-gpu" not in source
     assert "grep -q 'git lfs pre-push'" in source
+
+
+def test_portable_installer_covers_softmouse_rfid_requirements():
+    source = INSTALL_SCRIPT.read_text()
+
+    for package in (
+        "dbus-user-session",
+        "gnome-keyring",
+        "libsecret-1-0",
+        "libxcb-icccm4",
+        "libxcb-xinerama0",
+    ):
+        assert package in source
+
+    assert 'run_step "Configure RFID serial permissions"' in source
+    assert 'run_step "Verify SoftMouse runtime"' in source
+    assert 'run_step "Verify RFID runtime"' in source
+    assert 'run_step "Verify SoftMouse systemd units"' in source
+    assert "tests/softmouse_cli_test.py" in source
+    assert "tests/softmouse_https_source_test.py" in source
+    assert "auto-trainer-device/tests/rfid_reader_test.py" in source
+
+
+def test_softmouse_rfid_python_dependencies_are_packaged():
+    tools_project = TOOLS_PROJECT.read_text()
+    device_project = DEVICE_PROJECT.read_text()
+
+    for dependency in ("openpyxl", "requests", "keyring"):
+        assert dependency in tools_project
+    assert "pyserial" in device_project
+
+
+def test_softmouse_service_supports_installer_conda_locations():
+    service = SOFTMOUSE_SERVICE.read_text()
+
+    assert "%h/anaconda3/bin" in service
+    assert "%h/miniconda3/bin" in service
+    assert "%h/mambaforge/bin" in service
+    assert "conda run --no-capture-output -n reachaq" in service
+    assert "/home/christielab10/anaconda3" not in service
 
 
 def test_documented_conda_application_launches_stream_terminal_output():

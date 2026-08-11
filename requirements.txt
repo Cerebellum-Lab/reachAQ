@@ -2,7 +2,10 @@
 #
 # Runtime dependencies are declared in pyproject.toml and the embedded
 # auto-trainer subproject pyproject files. Installing the local package pulls
-# those dependencies, including the PySide6 6.6.x cap needed for this app.
+# all portable application dependencies, including the PySide6 6.6.x cap,
+# Requests/OpenPyXL/keyring for SoftMouse, and pyserial for the RFID reader.
+# Linux keyring/Qt system libraries and serial permissions are installed by
+# tools/install/reachaq-linux-install.sh; pip requirements cannot provide them.
 -e .
 
 # Build frontend for producing local wheel artifacts:
