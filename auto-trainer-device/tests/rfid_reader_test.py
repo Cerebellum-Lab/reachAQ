@@ -15,8 +15,8 @@ from autotrainer.device.rfid_reader import (
 
 PAYLOAD_A = "D4D47231005A30010000000000"
 PAYLOAD_B = "B4D47231005A30010000000000"
-TAG_A = "360002353933099"
-TAG_B = "360002353933101"
+TAG_A = "933000321342797"
+TAG_B = "933000321342795"
 
 
 @pytest.mark.parametrize("split_at", range(31))

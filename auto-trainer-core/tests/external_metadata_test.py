@@ -10,7 +10,7 @@ from autotrainer.core.animal.external_metadata import (
 )
 
 
-TAG_A = "360002353933099"
+TAG_A = "933000321342797"
 READER_PAYLOAD_A = "D4D47231005A30010000000000"
 
 
@@ -23,7 +23,7 @@ def test_rfid_normalization_uses_iso_11784_decimal_plate_id():
 def test_reader_payload_converts_to_iso_11784_decimal_plate_id():
     assert reader_payload_to_rfid(READER_PAYLOAD_A) == TAG_A
     assert (
-        reader_payload_to_rfid("AC383BFB439F00010000000000")
+        reader_payload_to_rfid("53C1CDFD207E30010000000000")
         == "999012345678901"
     )
     with pytest.raises(ValueError):

@@ -45,20 +45,22 @@ def normalize_rfid(value: Any) -> str:
 def reader_payload_to_rfid(value: Any) -> str:
     """Convert this reader's 26-hex payload to ISO 11784 decimal form.
 
-    The first 16 hexadecimal characters contain the ISO 11784 64-bit value in
-    the reader's animal-ID-on-the-right ordering. The remaining ten characters
-    are transport payload data and do not participate in the animal identity.
+    The reader emits the 10-hex animal number and 3-hex country/manufacturer
+    code least-significant nibble first. The remaining characters are
+    transport data and do not participate in the animal identity.
     """
     text = normalize_optional_text(value)
     if text is None or _RFID_READER_PAYLOAD_RE.fullmatch(text) is None:
         raise ValueError(
             "RFID reader payload must be exactly 26 hexadecimal characters"
         )
-    raw = text.upper()[:16]
-    animal_bits = f"{int(raw[:10], 16):040b}"[:38][::-1]
-    country_bits = f"{int(raw[9:12], 16):012b}"[2:12][::-1]
-    country = int(country_bits, 2)
-    animal_id = int(animal_bits, 2)
+    raw = text.upper()
+    animal_id = int(raw[:10][::-1], 16)
+    country = int(raw[10:13][::-1], 16)
+    if animal_id >= 1 << 38 or country >= 1 << 10:
+        raise ValueError(
+            "RFID reader payload contains an invalid ISO 11784 identifier"
+        )
     return normalize_rfid(f"{country:03d}{animal_id:012d}")
 
 
