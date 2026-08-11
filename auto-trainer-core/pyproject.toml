@@ -19,7 +19,7 @@ dynamic = ["version"]
 
 dependencies = [
 
-    'auto-trainer-api == 0.9.22',
+    'auto-trainer-api == 0.11.0',
 
     "verboselogs >= 1.7, < 2",
     "coloredlogs >= 15, < 16",

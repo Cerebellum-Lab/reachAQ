@@ -545,6 +545,34 @@ class PelletTrialLedger:
             if attempt.operation_id in finalized_operation_ids
         )
 
+    def finalize_pending_without_analysis(
+        self,
+        perf_time: float,
+        wall_time: float,
+        *,
+        reason: str = "post-session analysis was not performed",
+    ) -> Tuple[PelletTrialAttempt, ...]:
+        finalized = []
+        for attempt in tuple(self._attempts):
+            if attempt.outcome is TrialOutcome.PENDING_ANALYSIS:
+                finalized.append(self.finalize_pending(
+                    attempt.trial_id,
+                    attempt.attempt_id,
+                    TrialOutcome.INCOMPLETE,
+                    perf_time,
+                    wall_time,
+                    error=reason,
+                ))
+        self._reindex_analyzed_attempts()
+        return tuple(
+            current
+            for current in self._attempts
+            if any(
+                current.operation_id == previous.operation_id
+                for previous in finalized
+            )
+        )
+
     def count(self, basis: Optional[TrialCountBasis] = None) -> int:
         basis = TrialCountBasis(basis or self.configuration.count_basis)
         grouped = self._grouped_attempts()

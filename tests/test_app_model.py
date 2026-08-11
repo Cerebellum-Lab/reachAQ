@@ -1,3 +1,4 @@
+import dataclasses
 import math
 import json
 from pathlib import Path
@@ -87,6 +88,20 @@ def test_api_training_mode_is_derived_from_protocol_state(
         plan,
         automatic_advance=automatic,
     ) is expected
+
+
+def test_public_status_has_no_retired_alarm_tunnel_or_magnet_fields(app_model):
+    status = app_model._make_api_system_status_payload()
+    payload = dataclasses.asdict(status)
+
+    assert payload["schema_version"] == 1
+    assert "alarms" not in payload
+    assert "tunnel_device" not in payload
+    assert "magnet" not in json.dumps(payload).lower()
+    assert payload["recording_state"] == "ready"
+    assert set(payload["session_counts"]) == {
+        "reaches", "presented", "success", "consumed"
+    }
 
 
 def test_automatic_protocol_advance_updates_live_runner(app_model):

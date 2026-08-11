@@ -903,11 +903,6 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
         self.reset_session_counts()
 
         project.calculate_next_session_index()
-        self._event_manager.post_event_content(
-            ApiEventKind.projectSessionChanged,
-            data=dict(root=project.root, session=project.session),
-        )
-
         # ensure we look at their state on start:
         self._session_mouse_seen = False
         self._uncover_ctx.reset()  # always

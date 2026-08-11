@@ -1,7 +1,7 @@
 
 from typing import Optional, Any
 
-from autotrainer.api.api_event_kind import ApiEventKind
+from autotrainer.api import ApiEventKind
 from autotrainer.api.api_options import create_default_api_options
 
 from autotrainer.core.logging import get_verbose_logger

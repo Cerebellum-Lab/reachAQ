@@ -3,7 +3,7 @@ from typing import Callable, Optional
 
 from transitions import Machine
 
-from autotrainer.api.api_event_kind import ApiEventKind
+from autotrainer.api import ApiEventKind
 
 from autotrainer.core import ProjectInfo, transitions_allow_functions
 from autotrainer.core.logging import get_verbose_logger

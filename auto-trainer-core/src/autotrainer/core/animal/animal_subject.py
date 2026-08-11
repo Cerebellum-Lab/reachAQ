@@ -8,8 +8,6 @@ from tempfile import NamedTemporaryFile
 from typing import Optional, Dict, Any, List, Type
 from typing_extensions import Self
 
-from autotrainer.api.api_system_status import ApiAnimalStatus, ApiReachStatus
-
 from .. import Offset3DTuple, get_verbose_logger
 
 logger = get_verbose_logger(__name__)
@@ -188,20 +186,21 @@ class AnimalSubject(_AnimalSubject):
 
         return animal
 
-    def to_api_status(self) -> ApiAnimalStatus:
-        return ApiAnimalStatus(
-            identifier=self.id,
-            name=self.name,
-            dcs_send_x=self.pellet_x,
-            dcs_send_y=self.pellet_y,
-            dcs_send_z=self.pellet_z,
-            target_y_limit=self.target_y_limit,
-            # Keep the public API schema intact while retiring persisted
-            # day/lifetime counters. Session counts are reported in the
-            # system behavior status instead.
-            reach_status_total=ApiReachStatus(),
-            reach_status_day=ApiReachStatus(),
-        )
+    def to_api_status(self) -> Dict[str, Any]:
+        return {
+            "identifier": self.id,
+            "name": self.name,
+            "pellet": {
+                "coordinateSpace": "dcs" if self.is_pellet_dcs else "device",
+                "position": {
+                    "x": self.pellet_x,
+                    "y": self.pellet_y,
+                    "z": self.pellet_z,
+                },
+            },
+            "targetYLimit": self.target_y_limit,
+            "selectedProtocol": self.training.current_protocol,
+        }
 
     def to_file(self, file_path: Path):
         data = {

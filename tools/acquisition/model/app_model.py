@@ -26,10 +26,8 @@ import pandas
 import numpy as np
 import yaml
 
-from autotrainer.api import ApiSystemStatus, ApiDetectorKind, ApiProjectStatus, \
-    ApiDetectorStatus, ApiTunnelDeviceStatus, ApiPelletDeviceStatus, ApiTrainingMode, \
+from autotrainer.api import ApiDetectorKind, ApiTrainingMode, \
     ApiSystemConfiguration, ApiApplicationMode, ApiCommand, ApiCommandRequestErrorKind
-from autotrainer.api.api_system_status import ApiBehaviorStatus, ApiReachStatus
 
 from autotrainer.core import (
     ObservableObject,
@@ -109,6 +107,8 @@ from autotrainer.api import (
 )
 
 from tools.acquisition.model.app_model_status import AppModelStatus, SessionRecordingStatus
+from tools.acquisition.model.api_status import ReachAQSystemStatus
+from tools.acquisition.model.session_api_publisher import SessionApiPublisher
 from tools.autotrainer_version import __version__ as app_version
 from tools.acquisition.model.helpers import get_config_location
 from tools.acquisition.model.hardware_model import HardwareModel
@@ -387,6 +387,7 @@ class AppModel(ObservableObject):
         self._p_inference_live_begin = -math.inf
 
         self._event_manager = EventManager.default()
+        self._session_api = SessionApiPublisher(self._event_manager)
 
         # not sure this should better be in SystemMachine or BehaviorAlgo or BehaviorModel or eventually HardwareModel ?
         # although here it's also working, so keeping for now.
@@ -1439,6 +1440,8 @@ class AppModel(ObservableObject):
                     self._record_start_timer.cancel()
                     self._record_start_timer = no_op_timer
                     self._abort_had_recording_started = True
+                    if project is not None:
+                        self._session_api.session_started(project.short_id)
                     logger.info(
                         "received RECORDING: frame-0 time=%.3f perf_c=%.3f now=%.3f",
                         first_frame_time,
@@ -4248,6 +4251,25 @@ class AppModel(ObservableObject):
         if project.short_id in self._aborted_session_ids:
             logger.info("ignoring session-ending callback for aborted %s", project.short_id)
             return
+        ledger = self._trial_ledger
+        if ledger is not None:
+            finalized = ledger.finalize_pending_without_analysis(
+                get_perf_now(),
+                time.time(),
+                reason=(
+                    "post-session analysis did not produce a per-attempt result "
+                    f"({result.value})"
+                ),
+            )
+            for attempt in finalized:
+                self._session_api.trial_ended(attempt)
+            if finalized:
+                self._session_data_recorder.update_persisted_trial_ledger(
+                    project,
+                    ledger.to_records(),
+                    ledger.summary(),
+                )
+            self._session_api.session_ended(ledger.summary())
         self._session_analysis_finished = True
         if self._session_recording_status == SessionRecordingStatus.ANALYZING:
             if self._session_analysis_started_perf is not None:
@@ -4449,6 +4471,21 @@ class AppModel(ObservableObject):
             logger.exception("Unable to delete aborted session data: %s", err)
             self.on_error("Abort cleanup failed", str(err))
         finally:
+            ledger = self._trial_ledger
+            if ledger is not None:
+                active = ledger.active_attempt
+                if active is not None:
+                    finalized = ledger.finalize(
+                        TrialOutcome.ABORTED,
+                        get_perf_now(),
+                        time.time(),
+                        error="recording aborted by operator",
+                    )
+                    self._session_api.trial_ended(finalized)
+                self._session_api.session_ended(
+                    ledger.summary(),
+                    aborted=True,
+                )
             self._behavior.algorithm.reset_session_counts()
             self._session_data_recorder.abort()
             self._pending_session_end_perf = None
@@ -4675,6 +4712,7 @@ class AppModel(ObservableObject):
             laser_references=laser_references,
         )
         for attempt in finalized:
+            self._session_api.trial_ended(attempt)
             if attempt.logical_trial_complete:
                 self._protocol_runner.record_trial_outcome(
                     attempt.attempt_label,
@@ -5110,73 +5148,50 @@ class AppModel(ObservableObject):
             data=dataclasses.asdict(system_status),
         )
 
-    def _make_api_system_status_payload(self) -> ApiSystemStatus:
+    def _make_api_system_status_payload(self) -> ReachAQSystemStatus:
         hard = self._hardware
         algo = self._behavior.algorithm
-        analysis = self._behavior.analysis
         project = self._project_info
         if project is None:
             project = self.make_project_info()
-        misplaced_mon = analysis.pellet_misplaced_monitor
         animal = self._selected_animal
-
-        detectors = [
-            ApiDetectorStatus(
-                detector_id=ApiDetectorKind.pelletMisplaced,
-                is_enabled=misplaced_mon.running,
-                is_active=misplaced_mon.is_engaged,
+        plan = self._attached_plan
+        phase = None if plan is None else plan.current_phase
+        return ReachAQSystemStatus(
+            schema_version=1,
+            acquisition_state=self._status.value,
+            recording_state=self._session_recording_status.value,
+            synchronization_ready=not any(
+                "camera" in blocker.lower()
+                for blocker in self._subsystem_status_registry.recording_blockers()
             ),
-        ]
-
-        # auto-trainer-api 0.9.22 requires alarm/tunnel-shaped fields in its
-        # status payload. They are compatibility-only placeholders: ReachAQ
-        # has no corresponding alarm, emergency, tunnel, or magnet runtime.
-        legacy_api_alarms = []
-
-        dcs_pos_xyz = hard.last_dcs_position
-        dcs_send_xyz = hard.last_dcs_set_position
-        if dcs_pos_xyz is None or any(map(math.isnan, dcs_pos_xyz)):
-            dcs_pos_xyz = Offset3DTuple.get_nan()
-        if dcs_send_xyz is None or any(map(math.isnan, dcs_send_xyz)):
-            dcs_send_xyz = Offset3DTuple.get_nan()
-
-        reach_status = ApiReachStatus(
-            pellets_presented=algo.pellets_presented,
-            pellets_consumed=algo.pellets_consumed,
-            reaches=algo.pellet_reaches,
-            successful_reaches=algo.successful_reaches,
-        )
-
-        system_status = ApiSystemStatus(
-            application_mode=app_status_to_api_app_mode(self._status),
-            training_mode=self._derived_api_training_mode(),
             animal=None if animal is None else animal.to_api_status(),
-            project=ApiProjectStatus(
-                day_path=project.get_day_path()[0],
-                session_index=project.session,
-            ),
-            detectors=detectors,
-            alarms=legacy_api_alarms,
-            pellet_device=ApiPelletDeviceStatus(
-                dcs_x=dcs_pos_xyz.x,
-                dcs_y=dcs_pos_xyz.y,
-                dcs_z=dcs_pos_xyz.z,
-                dcs_send_x=dcs_send_xyz.x,
-                dcs_send_y=dcs_send_xyz.y,
-                dcs_send_z=dcs_send_xyz.z,
-                load_arm=hard.load_arm_position,
-                barrier_arm=hard.cover_arm_position,
-            ),
-            tunnel_device=ApiTunnelDeviceStatus(
-                magnet_intensity=math.nan,
-                gate_open=False,
-            ),
-            behavior=ApiBehaviorStatus(
-                baseline_magnet_intensity=math.nan,
-                reaches=reach_status,
-            )
+            project={
+                "dayPath": project.get_day_path()[0],
+                "sessionIndex": project.session,
+                "sessionId": project.short_id,
+            },
+            subsystems=self._subsystem_status_registry.snapshot(),
+            pellet_device={
+                "connected": hard.connected,
+                "position": self._offset_record(hard.last_dcs_position),
+                "sendPosition": self._offset_record(hard.last_dcs_set_position),
+                "loadArm": hard.load_arm_position,
+                "coverArm": hard.cover_arm_position,
+            },
+            session_counts={
+                "reaches": algo.pellet_reaches,
+                "presented": algo.pellets_presented,
+                "success": algo.successful_reaches,
+                "consumed": algo.pellets_consumed,
+            },
+            protocol={
+                "selected": None if plan is None else plan.plan_id,
+                "phase": None if phase is None else phase.phase_id,
+                "complete": self._protocol_runner.protocol_complete,
+                "automaticAdvance": self._protocol_runner.automatic_advance,
+            },
         )
-        return system_status
 
     #
 
@@ -5200,11 +5215,12 @@ class AppModel(ObservableObject):
         ledger = self._trial_ledger
         if ledger is None or ledger.active_attempt is None:
             return
-        ledger.close_active_for_analysis(
+        attempt = ledger.close_active_for_analysis(
             perf_c,
             time.time(),
             retry=retry,
         )
+        self._session_api.trial_capture_ended(attempt)
         self._protocol_runner.cancel_active_trial()
         self._evaluate_automatic_stop_policy(
             protocol_complete=self._protocol_runner.protocol_complete,
@@ -5241,6 +5257,7 @@ class AppModel(ObservableObject):
             attempt.attempt_label,
             context,
         )
+        self._session_api.trial_started(attempt)
 
     def _on_hardware_command_failed(self, failure: CanFailure) -> None:
         """Finalize the matching physical pellet attempt as a hardware error."""
@@ -5293,6 +5310,7 @@ class AppModel(ObservableObject):
             failure.wall_time,
             error=failure.error,
         )
+        self._session_api.trial_ended(finalized)
         self._protocol_runner.cancel_active_trial()
         logger.error(
             "pellet attempt %s finalized as %s: %s",

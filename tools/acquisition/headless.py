@@ -4,7 +4,35 @@ import time
 import sys
 import faulthandler
 from multiprocessing import set_start_method
+from pathlib import Path
 # NB: do not put any imports of autotrainer* or any module not part from standard python lib.
+
+
+def _bootstrap_repo_sources():
+    """Prefer packages beside this launcher over stale editable installs."""
+    repo_root = Path(__file__).resolve().parents[2]
+    source_roots = (
+        repo_root,
+        *(repo_root / package / "src" for package in (
+            "auto-trainer-behavior",
+            "auto-trainer-core",
+            "auto-trainer-device",
+            "auto-trainer-inference",
+            "auto-trainer-model",
+            "auto-trainer-pyside",
+            "auto-trainer-video",
+        )),
+    )
+    for source_root in reversed(source_roots):
+        if not source_root.exists():
+            continue
+        source_text = str(source_root)
+        if source_text in sys.path:
+            sys.path.remove(source_text)
+        sys.path.insert(0, source_text)
+
+
+_bootstrap_repo_sources()
 
 
 def _exec_main(args):
