@@ -116,6 +116,7 @@ from tools.acquisition.model.recording_session_controller import (
     RecordingSessionController,
 )
 from tools.acquisition.model.acquisition_controller import AcquisitionController
+from tools.acquisition.model.coordinate_model import CoordinateModel
 from tools.autotrainer_version import __version__ as app_version
 from tools.acquisition.model.helpers import get_config_location
 from tools.acquisition.model.hardware_model import HardwareModel
@@ -368,13 +369,7 @@ class AppModel(ObservableObject):
         self._record_start_timer = no_op_timer
         self._closing_event = threading.Event()
         self._reload_plans_needed = False
-        self._prev_diamond_coord: Offset3DTuple = Offset3DTuple(math.nan, math.nan, math.nan)
-        self._prev_raw_diamond_coord: Offset3DTuple = Offset3DTuple(math.nan, math.nan, math.nan)
-        self._prev_valid_diamond_perf_c: float = -math.inf
-        self._check_diamond_coord_enabled = True
-        self._report_bad_diamond_coord_error = False
-        self._warned_bad_diamond_coord = False
-        self._triggered_bad_diamond_coord = False
+        self._coordinates = CoordinateModel()
         self._p_start_capture = -math.inf
         self._p_inference_live_begin = -math.inf
 
@@ -2224,11 +2219,11 @@ class AppModel(ObservableObject):
 
     @property
     def check_diamond_coord_enabled(self):
-        return self._check_diamond_coord_enabled
+        return self._coordinates.enabled
 
     @check_diamond_coord_enabled.setter
     def check_diamond_coord_enabled(self, value):
-        self._check_diamond_coord_enabled = value
+        self._coordinates.enabled = bool(value)
 
     def get_training_plan_by_id(self, plan_id: Optional[str]) -> Optional[TrainingPlan]:
         if plan_id is None:
@@ -4568,51 +4563,14 @@ class AppModel(ObservableObject):
                                   f"\nModel at {value} failed pre-validate:\n\n{err}")
 
     def _on_pose_response_ready(self, response: PoseResponse):
-        # TODO: move to behavior algo or analysis (as BaseDetector subclass)
-        if not self._check_diamond_coord_enabled or self._behavior.algorithm.algo_paused:
-            return
-        cfg = self._behavior.algorithm.diamond_triangle_config
-        if cfg is None:
-            # nothing we can do
-            return
-        # maybe todo: make these configurable:
-        min_check_delay = 5  # seconds before reporting an invalid/missing measurement
-        delay_inference_begin = 3  # seconds ; wait inference started for that duration before consider min_check_delay
-        max_dist_diff = 5  # mm ; if distance between obtained & expected above that -> invalid measure
-        #
-        loc3d = response.locations_3d.get(SceneElement.Diamond)
-        raw3d = response.raw_loc_3d.get(SceneElement.Diamond)
-        if loc3d is None or raw3d is None:
-            return
-        self._prev_diamond_coord = loc3d
-        diff = loc3d - cfg.diamond_coord
-        raw_diff = raw3d - cfg.raw_diamond_coord
-        p_now = time.perf_counter()
-        if diff.distance > max_dist_diff or raw_diff.distance > max_dist_diff:
-            if not self._warned_bad_diamond_coord:
-                logger.warning("Diamond coordinate invalid: %s ; dist=%.2f raw=%.2f ; pose=%s",
-                               loc3d.humanize(n_digits=2), diff.distance, raw_diff.distance, response)
-                self._warned_bad_diamond_coord = True
-        else:
-            self._prev_valid_diamond_perf_c = p_now
-            self._warned_bad_diamond_coord = False
-            self._triggered_bad_diamond_coord = False
-        #
-        if (p_now - self._p_inference_live_begin > delay_inference_begin
-                and p_now - self._prev_valid_diamond_perf_c > min_check_delay
-        ):
-            if not self._triggered_bad_diamond_coord:
-                self._triggered_bad_diamond_coord = True
-                if self._report_bad_diamond_coord_error:
-                    self.on_error("Diamond not detected or invalid position",
-                                  "Could not ensure valid diamond position for too long.\n\n"
-                                  "Please re-execute a diamond-triangle calibration via menu Tools -> Calibrate Coordinate System\n\n"
-                                  "Automatic pause is disabled in reachAQ, so acquisition was not paused automatically."
-                                  )
-                else:
-                    logger.error("Bad diamond coord check: distance=%.2f ; %s vs %s",
-                                 diff.distance,
-                                 loc3d.humanize(), cfg.diamond_coord.humanize())
+        message = self._coordinates.validate_pose(
+            response,
+            self._behavior.algorithm.diamond_triangle_config,
+            inference_started_perf=self._p_inference_live_begin,
+            paused=self._behavior.algorithm.algo_paused,
+        )
+        if message is not None:
+            self.on_error("Diamond not detected or invalid position", message)
 
     def _on_detection_result_ready(self, project: ProjectInfo, result: IntersessionResponse):
         if project.short_id in self._aborted_session_ids:

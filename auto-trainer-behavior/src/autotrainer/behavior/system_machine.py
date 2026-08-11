@@ -20,9 +20,9 @@ from .behavior_algorithm import BehaviorAlgorithm, BehaviorAlgoProps, BehaviorAl
 from .inference_protocol import InferenceProtocol
 from .intersession import IntersessionMachine, IntersessionState
 from .pellet import PelletState
-from .pellet.pellet_machine import PelletMachine
+from .pellet.pellet_machine import PelletAutomationController
 from .pellet_device_protocol import PelletDeviceProtocol
-from .pellet_shift import ShiftXYZHandler
+from .pellet_shift import ShiftRecommendationController
 from .state_machine import StateMachine
 from .system_machine_state import SystemState
 
@@ -79,7 +79,7 @@ class SystemMachine(StateMachine):
         algo.property_changed += self._on_algorithm_property_changed
         algo.relay_transitions(self, wait=False)  # NB: must be done AFTER creation of previous `self.machine` instance
 
-        shift_xyz_handler = self._shift_xyz_handler = ShiftXYZHandler(algo=algo)
+        shift_xyz_handler = self._shift_xyz_handler = ShiftRecommendationController(algo=algo)
         # NB: could use the shift_xyz_handler.property_changed callback handler with LAST_PROCESSED_SHIFT_XYZ name too:
         shift_xyz_handler.set_processed_handler(self._handle_processed_shift_xyz)
         #
@@ -98,7 +98,11 @@ class SystemMachine(StateMachine):
         inference.detection_result_ready += self._on_detection_result_ready
         inference.segmentation_finished += self._on_inference_segmentation_finished
 
-        pellet_machine = self._pellet_machine = PelletMachine(algo, msg_handler, pellet_device)
+        pellet_machine = self._pellet_machine = PelletAutomationController(
+            algo,
+            msg_handler,
+            pellet_device,
+        )
         pellet_events = pellet_machine.events
         pellet_events.state_changed += self._on_pellet_state_changed
         pellet_events.pellet_loading += self._on_pellet_loading
@@ -126,7 +130,11 @@ class SystemMachine(StateMachine):
         return self._algorithm
 
     @property
-    def pellet(self) -> PelletMachine:
+    def pellet(self) -> PelletAutomationController:
+        return self._pellet_machine
+
+    @property
+    def pellet_automation(self) -> PelletAutomationController:
         return self._pellet_machine
 
     @property
@@ -146,7 +154,11 @@ class SystemMachine(StateMachine):
         self._inference.project = value
 
     @property
-    def shift_xyz_handler(self) -> ShiftXYZHandler:
+    def shift_xyz_handler(self) -> ShiftRecommendationController:
+        return self._shift_xyz_handler
+
+    @property
+    def shift_recommendations(self) -> ShiftRecommendationController:
         return self._shift_xyz_handler
 
     def after_enter_intersession(self, project_info: ProjectInfo, *, reason="NA"):

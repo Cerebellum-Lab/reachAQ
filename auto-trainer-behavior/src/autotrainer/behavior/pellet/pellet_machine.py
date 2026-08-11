@@ -648,3 +648,11 @@ class PelletMachine(StateMachine):
             ),
         ]
     )
+
+
+class PelletAutomationController(PelletMachine):
+    """ReachAQ pellet-cycle controller built on the proven state machine.
+
+    The subclass gives production code an explicit controller boundary while
+    preserving PelletMachine for lower-level reuse and existing integrations.
+    """

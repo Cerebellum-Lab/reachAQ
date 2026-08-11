@@ -266,3 +266,7 @@ class ShiftXYZHandler(ObservableObject):
             else:
                 func: ProcessedShiftXYZCallbackHandler
                 func(project, processed_shift)
+
+
+class ShiftRecommendationController(ShiftXYZHandler):
+    """Own recommended and automatically applied pellet shifts."""

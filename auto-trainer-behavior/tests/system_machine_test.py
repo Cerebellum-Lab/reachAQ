@@ -22,7 +22,8 @@ from autotrainer.behavior import IntersessionState
 from autotrainer.core.interfaces import CaptureAnalysisResult
 from autotrainer.behavior import SystemState, SystemMachine
 from autotrainer.behavior.pellet import PelletState
-from autotrainer.behavior.pellet.pellet_machine import PelletMachine
+from autotrainer.behavior.pellet.pellet_machine import PelletAutomationController
+from autotrainer.behavior.pellet_shift import ShiftRecommendationController
 
 from autotrainer.inference.analysis import IntersessionResponse
 
@@ -63,6 +64,13 @@ def test_start_stop_recording_session(mock_system, machine):
     assert algo.is_in_session is False
     assert is_capture_triggered is False
     assert mock_system.machine_state_trans == []
+
+
+def test_reachaq_controller_boundaries(machine):
+    assert isinstance(machine.pellet_automation, PelletAutomationController)
+    assert machine.pellet is machine.pellet_automation
+    assert isinstance(machine.shift_recommendations, ShiftRecommendationController)
+    assert machine.shift_xyz_handler is machine.shift_recommendations
 
 
 def test_manual_session_does_not_require_pellet(mock_system, machine: SystemMachine):
