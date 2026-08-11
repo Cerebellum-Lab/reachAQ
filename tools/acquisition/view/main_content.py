@@ -398,7 +398,7 @@ class MainContent(ContentWidget):
         tabs.addTab(laser_control_content, "Laser Control")
         self._content_widgets.append(laser_control_content)
 
-        protocol_content = self._protocol_content = ProtocolContent()
+        protocol_content = self._protocol_content = ProtocolContent(self._app_model)
         tabs.addTab(protocol_content, "Protocol")
         self._content_widgets.append(protocol_content)
 
