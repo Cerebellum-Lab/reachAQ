@@ -402,6 +402,43 @@ software implementation gaps.
       without restarting already healthy domains.
 - [ ] Disconnect or stop CAN safely. Confirm its failure is reported separately,
       required-source readiness is updated, and camera/NI preview is unaffected.
+- [ ] With reachAQ acquiring, start a second reachAQ instance against the same
+      CAN channel. Confirm it reports the channel as already owned and cannot
+      issue pellet/motor commands or reset the interface.
+- [ ] Close acquisition normally. Confirm only the application's CAN socket and
+      device worker close; `reachaq-can.service` is not restarted and the
+      interface packet counters are not reset.
+- [ ] Trigger a non-CAN camera, NI-DAQ, analysis, or UI worker failure. Confirm
+      the CAN socket remains connected and neither the reset helper nor systemd
+      CAN service is invoked.
+- [ ] Safely inject each available CAN reader failure: `CanOperationError`,
+      `ENETDOWN`, bus-off, adapter removal, and a malformed JerryCAN frame.
+      Confirm the first exception type, errno/category, interface state, and
+      pre-recovery counters are retained in the log/device event and the UI
+      marks only CAN failed.
+- [ ] Confirm bounded recovery closes the failed socket, reopens the transport,
+      rediscovers the pellet board, requests firmware, reloads motor and move
+      configuration, restarts reader/status streaming, and returns CAN to Ready.
+      Confirm failure after all three attempts remains explicit and does not
+      disturb cameras, NI-DAQ, laser, or logs.
+- [ ] Interrupt CAN while a pellet/motor command is in flight. Confirm the
+      operation is stored as failed/unknown with its context and is never
+      replayed after reconnect. Confirm a later operator/protocol retry receives
+      a new operation context and the intended trial-attempt index.
+- [ ] Request intentional application shutdown while the reader is closing.
+      Confirm `ENETDOWN` is suppressed only for that same-process shutdown; an
+      externally caused `ENETDOWN` must remain a visible failure.
+- [ ] Invoke the privileged recovery helper twice inside 15 seconds and from two
+      processes. Confirm resets serialize/debounce and systemd cannot enter a
+      restart storm. Confirm a reset is refused while a reachAQ process owns the
+      channel.
+- [ ] Before a multi-hour endurance run, save
+      `ip -details -statistics link show <channel>`, then save it again after the
+      run. Compare RX packets/errors/dropped/overrun and controller state, retain
+      the one-minute `CAN reader throughput` and effective receive-buffer logs,
+      and correlate any increase in drops with CPU and frame rate. The previous
+      observation (14,210 drops / roughly 1.07 million packets, about 1.3%) is a
+      baseline to improve, not an acceptable pass threshold.
 - [ ] Disable laser while NI input remains enabled and confirm NI acquisition
       remains operational.
 - [ ] Induce a safe writer/source failure during Recording. Confirm the session is

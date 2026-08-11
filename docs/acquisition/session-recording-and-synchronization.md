@@ -107,8 +107,21 @@ state of a newer retry.
 
 If a required source is unavailable, Record is disabled and its tooltip lists
 the exact blockers. If a required source is lost during Recording, only the
-active session is aborted; unrelated acquisition domains remain running. Explicit
-System Mode stop still attempts to stop every domain even when one cleanup
+active session is aborted; unrelated acquisition domains remain running.
+
+CAN teardown follows the same isolation rule. Ordinary Stop, Close, or
+application exit closes only the process-owned device worker and socket; a
+generic fatal callback from another domain cannot reset the shared kernel
+interface. A confirmed CAN reader/acknowledgement failure marks CAN Failed,
+aborts an active session whose required CAN stream is now incomplete, and runs
+a bounded recovery sequence without stopping camera, NI-DAQ, laser, or log
+acquisition. Recovery closes the failed socket, reopens the transport,
+rediscovers the pellet board, requests firmware, reloads motor/move
+configuration, and restarts status streaming before publishing Ready. An
+in-flight motor operation is finalized as unknown and is never replayed across
+the reconnect boundary.
+
+Explicit System Mode stop still attempts to stop every domain even when one cleanup
 operation fails.
 
 ## Canonical session boundary

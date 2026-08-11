@@ -1029,7 +1029,7 @@ def test_can_start_failure_is_scoped_to_can_domain(app_model):
     capture_stop.assert_not_called()
 
 
-def test_runtime_can_failure_and_recovery_update_only_can_status(app_model):
+def test_runtime_can_failure_aborts_session_but_only_can_status_recovers(app_model):
     app_model._acquisition.started = True
     app_model._set_subsystem_status(
         SubsystemId.CAN_PELLET,
@@ -1048,7 +1048,10 @@ def test_runtime_can_failure_and_recovery_update_only_can_status(app_model):
         failed = app_model.subsystem_statuses[SubsystemId.CAN_PELLET.value]
         assert failed.state is SubsystemState.FAILED
         assert failed.error == "CAN adapter removed"
-        abort.assert_not_called()
+        abort.assert_called_once_with(
+            SubsystemId.CAN_PELLET,
+            "CAN adapter removed",
+        )
         assert unregister.call_count == 2
 
         app_model._on_can_connection_state_changed({"state": "ready", "error": ""})

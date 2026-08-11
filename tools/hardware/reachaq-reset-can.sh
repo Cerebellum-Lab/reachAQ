@@ -6,9 +6,20 @@ if [[ "$(id -u)" != "0" ]]; then
   exit 1
 fi
 
-channel="${1:-can0}"
+configured_channel="can0"
+if [[ -r /etc/default/reachaq-can ]]; then
+  # This file is installed root-owned with mode 0644 alongside the service.
+  # shellcheck disable=SC1091
+  source /etc/default/reachaq-can
+  configured_channel="${REACHAQ_CAN_INTERFACE:-can0}"
+fi
+channel="${1:-$configured_channel}"
 if [[ ! "$channel" =~ ^[A-Za-z0-9_.-]+$ ]]; then
   echo "Invalid CAN channel: $channel" >&2
+  exit 2
+fi
+if [[ "$channel" != "$configured_channel" ]]; then
+  echo "CAN reset refused: requested $channel but reachaq-can.service owns $configured_channel." >&2
   exit 2
 fi
 

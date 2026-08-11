@@ -14,6 +14,12 @@ consume a full CPU core and starve the Qt event loop. Available frames and CAN
 writes are not delayed by the idle throttle. A frame arriving just after an
 empty poll can wait at most 5 ms before being read.
 
+The application requests a 4 MiB receive buffer by default, drains up to 512
+frames per pass on legacy hardware (and up to 2,000 where pyjerrycan is not in
+use), and logs aggregate receive throughput once per minute. It does not log
+every raw frame. Override the requested buffer with
+`AUTOTRAINER_CAN_RECEIVE_BUFFER_BYTES` only after measuring an endurance run.
+
 ## Configuration ownership
 
 The Linux service and the application have separate responsibilities and
@@ -24,7 +30,7 @@ separate environment files:
 | Kernel/driver | `peak_pciefd` and SocketCAN | Expose PEAK channels as network devices such as `can0` |
 | Boot service | `/etc/default/reachaq-can` | Select one application channel and configure its bitrate, CAN FD mode, queue length, and `UP` state |
 | Application | `AUTOTRAINER_CAN_*` environment variables | Select the already-configured channel and open a SocketCAN socket |
-| Safety reset | `/usr/local/sbin/reachaq-reset-can` | Restart only `reachaq-can.service`, bringing its configured channel down and back up |
+| Confirmed-failure recovery | `/usr/local/sbin/reachaq-reset-can` | Serialized, debounced restart of only `reachaq-can.service` after local reopen fails |
 
 `REACHAQ_CAN_INTERFACE` and `AUTOTRAINER_CAN_CHANNEL` must name the same
 interface. Values in `/etc/default/reachaq-can` are visible to systemd only;
@@ -33,6 +39,11 @@ sourcing `reachaq_hardware.env.example` affects the application shell only.
 For SocketCAN, the application does not program Linux bit timing. The service
 must bring the network device up with the correct arbitration bitrate, data
 bitrate, and FD mode before reachAQ opens it.
+
+Only one reachAQ process may own a physical channel. The application holds an
+advisory lock for the lifetime of the device socket. A second instance reports
+the channel as already owned and cannot send commands. The recovery helper
+uses the same lock and refuses to reset a channel acquired by another process.
 
 ## 1. Verify the kernel driver and adapter
 
@@ -151,8 +162,10 @@ configures the one SocketCAN interface named by `REACHAQ_CAN_INTERFACE`; it
 does not configure `can1` unless `can1` is explicitly selected, and it does not
 send pellet or motor commands.
 
-The application safety shutdown invokes only the root-owned reset helper. Grant
-that exact permission through a dedicated operator group:
+Confirmed CAN recovery may invoke the root-owned reset helper after a local
+socket reopen fails. Ordinary Close, camera/NI-DAQ/analysis failures, and
+generic fatal-thread callbacks never invoke it. Grant that exact permission
+through a dedicated operator group:
 
 ```bash
 sudo groupadd -f reachaq
@@ -175,9 +188,10 @@ sudo -n -l /usr/local/sbin/reachaq-reset-can
 
 If `getent` lists the user but `id -nG` does not, the current login still has
 the old group list. The application uses non-interactive `sudo -n`; it cannot
-display a password prompt and its safety reset will fail until the new group
+display a password prompt and recovery reset will fail until the new group
 membership is active. The sudoers rule does not grant general `systemctl`,
-`ip`, or root-shell access.
+`ip`, or root-shell access. Automated tests force CAN emulation and prohibit
+this helper from being invoked.
 
 Verify that every privileged artifact is root-owned and has the expected mode:
 
@@ -231,12 +245,15 @@ With reachAQ closed and the mechanism in a safe state, commission the same
 non-interactive reset path that the application uses:
 
 ```bash
-sudo -n /usr/local/sbin/reachaq-reset-can
+sudo -n /usr/local/sbin/reachaq-reset-can can0
 systemctl is-active reachaq-can.service
 ip -details link show can0
 ```
 
-The reset helper restarts exactly `reachaq-can.service`. Its `ExecStop` brings
+The reset helper verifies that its channel argument matches the service-owned
+channel, acquires the application ownership lock, serializes resets, and
+suppresses another reset for 15 seconds. The systemd unit also limits starts to
+three per 60 seconds. It then restarts exactly `reachaq-can.service`. Its `ExecStop` brings
 the configured channel down; `ExecStart` reapplies its settings and brings it
 up. This flushes the host SocketCAN interface and kernel transmit queue. It
 does not power-cycle the custom board, cancel motion already accepted by the
@@ -350,6 +367,13 @@ Increasing RX packets with valid JerryCAN IDs confirms physical board traffic.
 An empty `candump` does not by itself prove failure if the connected board is
 silent; use the validator's discovery action for an application-level check.
 
+For an endurance run, save the complete before/after outputs and compare
+`RX packets`, `errors`, `dropped`, `overrun`, and the CAN controller state. The
+application log should contain one-minute `CAN reader throughput` summaries and
+the effective socket receive buffer. A growing `dropped` value requires
+investigation even if acquisition remains connected; correlate its rate with
+CPU load and message rate rather than relying on the cumulative count alone.
+
 ## Service operations
 
 Run these operations only while reachAQ is closed:
@@ -387,7 +411,10 @@ out-of-tree PCAN driver and `/dev/pcan*` exists.
 | Interface `DOWN` | Boot service status or manual `ip link` setup |
 | Interface `STOPPED` | Bitrate, termination, wiring, and bus-off logs |
 | `active (exited)` service | Expected healthy oneshot-service state |
-| Safety reset says `sudo: a password is required` | Log out/in so the `reachaq` group is active; verify `sudo -n -l` |
+| CAN recovery says `sudo: a password is required` | Log out/in so the `reachaq` group is active; verify `sudo -n -l` |
+| Channel already owned | Close the other reachAQ/validator process; do not bypass the ownership lock |
+| Reset suppressed | Expected within the 15-second debounce window or while another process owns the channel |
+| RX `dropped` rises | Save before/after interface statistics, one-minute reader throughput, CPU load, and effective receive-buffer log |
 | Application and service use different channels | Match `AUTOTRAINER_CAN_CHANNEL` to `REACHAQ_CAN_INTERFACE` |
 | `REQUEST_VERSION` times out while RX traffic continues | Host startup/ACK handling issue, not proof of a dead board; retain the complete application log |
 | Validator opens bus but misses board | Correct interface, board power, bitrate, and target firmware |

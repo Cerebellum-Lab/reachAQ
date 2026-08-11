@@ -4564,6 +4564,10 @@ class AppModel(ObservableObject):
                 SubsystemState.FAILED,
                 error=error or "CAN/pellet controller failed",
             )
+            self._abort_recording_for_required_subsystem(
+                SubsystemId.CAN_PELLET,
+                error or "CAN/pellet controller failed",
+            )
         elif state == "stopped" and not self._acquisition.stopping:
             self._set_subsystem_status(
                 SubsystemId.CAN_PELLET,

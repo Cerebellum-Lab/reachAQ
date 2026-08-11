@@ -98,9 +98,10 @@ Current hardware bring-up tools live under `tools/hardware`:
   down only the configured application CAN channel.
 * `tools/hardware/reachaq-reset-can.sh` and
   `tools/hardware/reachaq-can-reset.sudoers` - root-owned, narrowly permitted
-  service restart used by application safety shutdown. This resets the host
-  SocketCAN interface; it is not a physical emergency stop or board power
-  cycle.
+  recovery helper used only after a confirmed CAN-domain failure. Ordinary
+  application close only closes its own socket. The helper serializes and
+  debounces service restart, refuses to reset a channel owned by another
+  reachAQ process, and is not a physical emergency stop or board power cycle.
 
 See [linux-install-instructions.md](linux-install-instructions.md) for the
 installation map and [the PEAK SocketCAN guide](docs/linux-install/peak-socketcan.md)
