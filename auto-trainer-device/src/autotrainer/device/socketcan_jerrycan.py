@@ -18,6 +18,49 @@ CAN_FD_MTU = 72
 logger = logging.getLogger(__name__)
 
 
+class CanTransportReadError(RuntimeError):
+    """A classified failure raised by the physical CAN receive path."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        category: str,
+        error_code: Optional[int] = None,
+        diagnostics=None,
+    ):
+        super().__init__(message)
+        self.category = category
+        self.error_code = error_code
+        self.diagnostics = dict(diagnostics or {})
+
+
+def _exception_errno(exc: BaseException) -> Optional[int]:
+    current: Optional[BaseException] = exc
+    seen = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        value = getattr(current, "errno", None)
+        if isinstance(value, int):
+            return value
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def _classify_receive_error(exc: BaseException) -> Tuple[str, Optional[int]]:
+    error_code = _exception_errno(exc)
+    message = str(exc).lower()
+    if error_code == errno.ENETDOWN:
+        return "network_down", error_code
+    if error_code in {errno.ENODEV, errno.ENXIO, errno.ENOTCONN}:
+        return "device_removed", error_code
+    if "bus-off" in message or "bus off" in message:
+        return "bus_off", error_code
+    if exc.__class__.__name__ == "CanOperationError":
+        return "can_operation_error", error_code
+    return "receive_error", error_code
+
+
 class JerryCANCmdType(enum.IntEnum):
     ESTOP = 0x00
     HEARTBEAT = 0x3F
@@ -586,7 +629,9 @@ class SocketCanJerryCAN:
         if transport_kind == CanTransportKind.SOCKETCAN:
             # SocketCAN bit timing belongs to the network device and must be
             # configured with ip/netlink before the application opens it.
-            kwargs["ignore_rx_error_frames"] = True
+            # Keep error frames visible so bus-off and controller failures can
+            # be classified instead of surfacing later as a generic timeout.
+            kwargs["ignore_rx_error_frames"] = False
             if self.configuration.fd:
                 mtu = _socketcan_mtu(self.configuration.channel)
                 if mtu is not None and mtu < CAN_FD_MTU:
@@ -667,20 +712,38 @@ class SocketCanJerryCAN:
         end = time.perf_counter() + collect_ms / 1000
         timeout = self.configuration.receive_timeout_seconds or 0.001
         while True:
-            raw_message = self._bus.recv(timeout=timeout)
+            try:
+                raw_message = self._bus.recv(timeout=timeout)
+            except BaseException as exc:
+                category, error_code = _classify_receive_error(exc)
+                from .can_diagnostics import capture_can_diagnostics
+                raise CanTransportReadError(
+                    f"CAN receive failed on {self.configuration.channel}: {exc}",
+                    category=category,
+                    error_code=error_code,
+                    diagnostics=capture_can_diagnostics(self.configuration.channel),
+                ) from exc
             if raw_message is not None:
-                if (
-                    raw_message.is_error_frame
-                    or raw_message.is_remote_frame
-                    or raw_message.is_extended_id
-                ):
+                if raw_message.is_error_frame:
+                    category = "bus_off" if raw_message.arbitration_id & 0x40 else "error_frame"
+                    from .can_diagnostics import capture_can_diagnostics
+                    raise CanTransportReadError(
+                        "Unsupported CAN frame "
+                        f"id={raw_message.arbitration_id:#x} error={raw_message.is_error_frame} "
+                        f"remote={raw_message.is_remote_frame} extended={raw_message.is_extended_id}",
+                        category=category,
+                        diagnostics=capture_can_diagnostics(self.configuration.channel),
+                    )
+                if raw_message.is_remote_frame or raw_message.is_extended_id:
                     logger.warning(
-                        "Ignoring unsupported CAN frame id=%#x error=%s remote=%s extended=%s",
+                        "Ignoring unsupported CAN frame id=%#x remote=%s extended=%s",
                         raw_message.arbitration_id,
-                        raw_message.is_error_frame,
                         raw_message.is_remote_frame,
                         raw_message.is_extended_id,
                     )
+                    if collect_ms == 0:
+                        break
+                    continue
                 else:
                     timestamp_ns = (
                         int(raw_message.timestamp * 1e9)
@@ -693,11 +756,13 @@ class SocketCanJerryCAN:
                             bytes(raw_message.data),
                             timestamp_ns=timestamp_ns,
                         )
-                    except (IndexError, struct.error, ValueError):
-                        logger.warning(
-                            "Ignoring malformed or non-JerryCAN frame id=%#x length=%s",
-                            raw_message.arbitration_id,
-                            len(raw_message.data),
+                    except (IndexError, struct.error, ValueError) as exc:
+                        from .can_diagnostics import capture_can_diagnostics
+                        raise CanTransportReadError(
+                            "Malformed JerryCAN frame "
+                            f"id={raw_message.arbitration_id:#x} length={len(raw_message.data)}: {exc}",
+                            category="malformed_frame",
+                            diagnostics=capture_can_diagnostics(self.configuration.channel),
                         )
                     else:
                         messages.append(decoded)

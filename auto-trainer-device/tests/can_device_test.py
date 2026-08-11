@@ -1,6 +1,7 @@
 import contextlib
 import logging
 import math
+import errno
 import queue
 import threading
 import time
@@ -253,8 +254,32 @@ def test_device_connection_reports_reader_transport_failure():
     assert len(reported) == 1
     assert reported[0].kind is CanFailureKind.TRANSPORT
     assert reported[0].error == "CAN adapter lost"
+    assert connection.first_failure is reported[0]
     device.disconnect.assert_called_once_with()
     interface.close.assert_called_once_with()
+
+
+def test_device_connection_suppresses_enetdown_only_for_intentional_shutdown():
+    reported = []
+    interface = mock.Mock()
+    interface.is_open = True
+    device = mock.Mock()
+    device.device_interface = interface
+    connection = DeviceConnection(
+        device,
+        message_queue=queue.Queue(),
+        failure_callback=reported.append,
+    )
+    connection._intentional_shutdown.set()
+    error = RuntimeError("network down")
+    error.error_code = errno.ENETDOWN
+    connection._run_unconnected = mock.Mock(return_value=True)
+    connection._run_connected = mock.Mock(side_effect=error)
+
+    connection._run()
+
+    assert reported == []
+    assert connection.first_failure is None
 
 
 def test_disconnect_waits_for_inflight_send_and_rejects_following_send():

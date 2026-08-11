@@ -18,6 +18,7 @@ from autotrainer.device import can_interface
 from autotrainer.device import socketcan_jerrycan
 from autotrainer.device.can_interface import CanInterface
 from autotrainer.device.socketcan_jerrycan import (
+    CanTransportReadError,
     JerryCANCfgMsg,
     JerryCANCmdType,
     JerryCANMsg,
@@ -111,7 +112,7 @@ def test_socketcan_open_uses_fd_filters_and_netdev_owned_bit_timing(monkeypatch)
     assert captured["interface"] == "socketcan"
     assert captured["channel"] == "can0"
     assert captured["fd"] is True
-    assert captured["ignore_rx_error_frames"] is True
+    assert captured["ignore_rx_error_frames"] is False
     assert captured["can_filters"]
     assert "bitrate" not in captured
     assert "data_bitrate" not in captured
@@ -130,17 +131,15 @@ def test_socketcan_open_rejects_classical_can_mtu(monkeypatch):
     assert backend._bus is None
 
 
-def test_receive_ignores_unsupported_and_malformed_frames():
+def test_receive_ignores_remote_and_extended_frames():
     valid_id = (JerryCANCmdType.HEARTBEAT << 5) | 0x01
     backend = SocketCanJerryCAN(CanTransportConfiguration(
         kind="socketcan",
         fd=True,
     ))
     backend._bus = FakeBus([
-        _raw_message(0, error=True),
         _raw_message(valid_id, remote=True),
         _raw_message(valid_id, extended=True),
-        _raw_message(0x15 << 5, b"\0"),
         _raw_message(valid_id, b"\xff\0"),
     ])
 
@@ -149,6 +148,57 @@ def test_receive_ignores_unsupported_and_malformed_frames():
     assert len(messages) == 1
     assert messages[0].type == JerryCANCmdType.HEARTBEAT
     assert messages[0].dst_id == 0x01
+
+
+def test_receive_classifies_bus_off_error_frame(monkeypatch):
+    monkeypatch.setattr(
+        "autotrainer.device.can_diagnostics.capture_can_diagnostics",
+        lambda channel: {"channel": channel, "interface_state": "DOWN"},
+    )
+    backend = SocketCanJerryCAN(CanTransportConfiguration(kind="socketcan", fd=True))
+    backend._bus = FakeBus([_raw_message(0x40, error=True)])
+
+    with pytest.raises(CanTransportReadError) as raised:
+        backend.ReceiveMessages(max_count=1, collect_ms=5)
+
+    assert raised.value.category == "bus_off"
+    assert raised.value.diagnostics["interface_state"] == "DOWN"
+
+
+def test_receive_classifies_malformed_frame(monkeypatch):
+    monkeypatch.setattr(
+        "autotrainer.device.can_diagnostics.capture_can_diagnostics",
+        lambda channel: {"channel": channel},
+    )
+    backend = SocketCanJerryCAN(CanTransportConfiguration(kind="socketcan", fd=True))
+    backend._bus = FakeBus([_raw_message(0x15 << 5, b"\0")])
+
+    with pytest.raises(CanTransportReadError) as raised:
+        backend.ReceiveMessages(max_count=1, collect_ms=5)
+
+    assert raised.value.category == "malformed_frame"
+
+
+def test_receive_preserves_can_operation_error_and_enetdown(monkeypatch):
+    class CanOperationError(Exception):
+        def __init__(self):
+            super().__init__("Network is down")
+            self.errno = errno.ENETDOWN
+
+    monkeypatch.setattr(
+        "autotrainer.device.can_diagnostics.capture_can_diagnostics",
+        lambda channel: {"channel": channel},
+    )
+    backend = SocketCanJerryCAN(CanTransportConfiguration(kind="socketcan", fd=True))
+    backend._bus = mock.Mock()
+    backend._bus.recv.side_effect = CanOperationError()
+
+    with pytest.raises(CanTransportReadError) as raised:
+        backend.ReceiveMessages()
+
+    assert raised.value.category == "network_down"
+    assert raised.value.error_code == errno.ENETDOWN
+    assert raised.value.__cause__.__class__.__name__ == "CanOperationError"
 
 
 def test_pellet_runtime_retains_pellet_board_status_messages():

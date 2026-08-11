@@ -1,10 +1,11 @@
 import contextlib
+import errno
 import logging
 import math
 import time
 import uuid
 from queue import Queue, Empty
-from threading import Thread
+from threading import Event, Lock, Thread
 from typing import Callable, Union, Optional, Any, Set
 
 
@@ -81,6 +82,13 @@ class DeviceConnection(DeviceConnectionProtocol):
         self._current_thread: Optional[Thread] = None
         self._current_thread_watchdog_perf_c = math.nan
         # NB: this is simply the dedicated CAN bus reader thread
+        self._intentional_shutdown = Event()
+        self._failure_lock = Lock()
+        self._first_failure: Optional[CanFailure] = None
+
+    @property
+    def first_failure(self) -> Optional[CanFailure]:
+        return self._first_failure
 
     @property
     def watchdog_reader_perf_c(self) -> float:
@@ -132,6 +140,9 @@ class DeviceConnection(DeviceConnectionProtocol):
         """
         # TODO provide a mechanism for the caller to be notified when a connection attempt succeeds or fails.  Could be
         #  an optional callback provided in this call, a dedicated callback, an observable property, etc.
+        self._intentional_shutdown.clear()
+        with self._failure_lock:
+            self._first_failure = None
         self._start()
 
         if self._cmd_queue is not None:
@@ -161,6 +172,7 @@ class DeviceConnection(DeviceConnectionProtocol):
         allocated with be terminated and disposed.
         """
         # TODO provide a mechanism for the caller to be notified when disconnection is complete.
+        self._intentional_shutdown.set()
         cmd_queue = self._cmd_queue
         if cmd_queue is not None:
             logger.debug("requesting disconnect")
@@ -281,15 +293,16 @@ class DeviceConnection(DeviceConnectionProtocol):
                     break
         except BaseException as err:
             logger.exception("<%s> CAN transport worker failed: %s", self._name, err)
-            callback = self._failure_callback
-            if callback is not None:
-                try:
-                    callback(CanFailure(
-                        CanFailureKind.TRANSPORT,
-                        str(err) or err.__class__.__name__,
-                    ))
-                except Exception:
-                    logger.exception("Failed to report CAN transport failure")
+            failure = self._failure_from_exception(err)
+            if (
+                failure.error_code == errno.ENETDOWN
+                and self._intentional_shutdown.is_set()
+            ):
+                logger.info(
+                    "Suppressing expected ENETDOWN after this process requested CAN shutdown"
+                )
+            else:
+                self._report_first_failure(failure)
         finally:
             if self._interface.is_open:
                 try:
@@ -298,6 +311,33 @@ class DeviceConnection(DeviceConnectionProtocol):
                     self._interface.close()
 
         logger.debug(f"<{self._name}> thread terminated")
+
+    def _failure_from_exception(self, err: BaseException) -> CanFailure:
+        original = err.__cause__ or err
+        return CanFailure(
+            CanFailureKind.TRANSPORT,
+            str(err) or err.__class__.__name__,
+            category=getattr(err, "category", None),
+            error_code=getattr(err, "error_code", getattr(original, "errno", None)),
+            exception_type=original.__class__.__name__,
+            diagnostics=dict(getattr(err, "diagnostics", {}) or {}),
+        )
+
+    def _report_first_failure(self, failure: CanFailure) -> None:
+        with self._failure_lock:
+            if self._first_failure is not None:
+                logger.error(
+                    "Preserving first CAN reader failure; suppressed later error: %s",
+                    failure.error,
+                )
+                return
+            self._first_failure = failure
+        callback = self._failure_callback
+        if callback is not None:
+            try:
+                callback(failure)
+            except Exception:
+                logger.exception("Failed to report CAN transport failure")
 
     def _run_unconnected(self) -> bool:
         logger.info("running unconnected")
