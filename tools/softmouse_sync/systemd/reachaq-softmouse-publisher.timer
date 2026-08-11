@@ -2,6 +2,7 @@
 Description=Run the reachAQ SoftMouse publisher nightly
 
 [Timer]
+# Midnight Mountain Time; Persistent runs a missed job after the user timer starts.
 OnCalendar=*-*-* 00:00:00 America/Denver
 Persistent=true
 RandomizedDelaySec=120

@@ -279,6 +279,15 @@ detail lines show each PXI slot and card
 model/product number, the configured CAN backend/interface, and the detected
 GPU model, memory, and driver.
 
+The `RFID Reader` category shows its stable serial path, connection state or
+error, and most recent scan result. Configure it under **Preferences → Animal
+metadata**. That panel also separates **Sync from SoftMouse**, which publishes
+to Isilon and refreshes the local cache, from **Refresh local cache**, which
+only consumes the latest completed Isilon publication. Neither action is
+available during recording. See the
+[SoftMouse/RFID guide](../softmouse_sync/README.md) for credentials, reader
+setup, metadata ownership, safety checks, and the single-host nightly timer.
+
 The Hardware Refresh icon is at the far right of the Hardware Status title bar.
 While idle it repeats discovery and refreshes bindings. While System Mode is
 Running and no recording or analysis is active, it retries failed subsystems

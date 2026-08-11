@@ -102,6 +102,9 @@ Current hardware bring-up tools live under `tools/hardware`:
   application close only closes its own socket. The helper serializes and
   debounces service restart, refuses to reset a channel owned by another
   reachAQ process, and is not a physical emergency stop or board power cycle.
+* [`tools/softmouse_sync/README.md`](tools/softmouse_sync/README.md) - configure
+  SoftMouse publication, per-computer metadata caches, USB RFID readers, the
+  manual UI sync, and the single-host midnight timer.
 
 See [linux-install-instructions.md](linux-install-instructions.md) for the
 installation map and [the PEAK SocketCAN guide](docs/linux-install/peak-socketcan.md)

@@ -19,6 +19,7 @@ Complete only the hardware categories present on the target rig.
 | 3b | NI DAQ/PXI | [NI-DAQmx and PXI/MXI guide](docs/linux-install/ni-daq-pxi.md) |
 | 3c | Pellet CAN | [PEAK SocketCAN guide](docs/linux-install/peak-socketcan.md) |
 | 3d | Live inference | [NVIDIA/TensorFlow guide](docs/linux-install/nvidia-inference.md) |
+| 3e | SoftMouse/RFID | [SoftMouse/RFID guide](tools/softmouse_sync/CONFIGURATION_GUIDE.md) |
 | 4 | Rig configuration and launch | [Runtime guide](docs/linux-install/runtime-configuration.md) |
 
 The portable installer does **not** install FLIR, NI, PEAK out-of-tree, or
