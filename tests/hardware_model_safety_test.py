@@ -152,3 +152,35 @@ def test_bounded_recovery_reuses_full_connection_initialization(hardware_model):
     hardware_model.connect.assert_called_with(command_queue, _recovery=True)
     assert hardware_model._can_connection_state == {"state": "ready", "error": ""}
     assert hardware_model._first_can_failure is None
+
+
+def test_ack_failure_captures_interface_counters_before_recovery(
+    hardware_model,
+    monkeypatch,
+):
+    hardware_model._can_device = mock.Mock()
+    hardware_model._can_device.can_transport_configuration = CanTransportConfiguration(
+        kind=CanTransportKind.SOCKETCAN,
+        channel="can7",
+        fd=True,
+    )
+    hardware_model._run_can_recovery = mock.Mock()
+    captured = {"channel": "can7", "interface_state": "ERROR-ACTIVE"}
+    monkeypatch.setattr(
+        "tools.acquisition.model.hardware_model.capture_can_diagnostics",
+        lambda channel: captured,
+    )
+    reported = []
+    hardware_model.command_failed += reported.append
+
+    hardware_model._on_can_failure(CanFailure(
+        CanFailureKind.ACKNOWLEDGEMENT_TIMEOUT,
+        "pellet board acknowledgement timed out",
+        command=SystemCommandKind.SEND_PELLET,
+        context="send-1",
+    ))
+    hardware_model._can_recovery_thread.join(1)
+
+    assert reported[0].diagnostics == captured
+    assert hardware_model._first_can_failure.diagnostics == captured
+    hardware_model._run_can_recovery.assert_called_once()

@@ -1,3 +1,4 @@
+import dataclasses
 import logging
 import math
 import os
@@ -21,7 +22,8 @@ from autotrainer.core.event import post_api_detector_event_content
 from autotrainer.core.message import SystemDataArgsKwargs
 from autotrainer.device import (CanTransportConfiguration, CanTransportKind, DeviceConnectionProtocol, HAVE_CAN_DEVICE,
                                 DeviceConnection, CanDevice, CanFailure, CanFailureKind,
-                                StepperConfig, ServoConfig, Device, ColorLed, Target)
+                                StepperConfig, ServoConfig, Device, ColorLed, Target,
+                                capture_can_diagnostics)
 from autotrainer.behavior import PelletDeviceProtocol
 
 logger = get_verbose_logger(__name__)
@@ -814,6 +816,27 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         return tok
 
     def _on_can_failure(self, failure: CanFailure) -> None:
+        if (
+            failure.kind in {
+                CanFailureKind.TRANSPORT,
+                CanFailureKind.ACKNOWLEDGEMENT_TIMEOUT,
+            }
+            and not failure.diagnostics
+        ):
+            try:
+                can_device = self._can_device
+                transport = (
+                    can_device.can_transport_configuration
+                    if can_device is not None
+                    else CanTransportConfiguration.from_environment()
+                )
+                if transport.kind is CanTransportKind.SOCKETCAN:
+                    failure = dataclasses.replace(
+                        failure,
+                        diagnostics=capture_can_diagnostics(transport.channel),
+                    )
+            except Exception:
+                logger.exception("Could not capture CAN counters before recovery")
         logger.error(
             "Terminal CAN failure: kind=%s command=%s context=%s error=%s",
             failure.kind.value,
