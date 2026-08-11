@@ -90,6 +90,11 @@ def inference_data_proc(pose_algo, capture_multiprocess_logs, monkeypatch, caplo
 def test_live_no_recording(inference_data_proc):
     proc = inference_data_proc
     proc.start()
+    # Do not race pose-data submission against the independent command thread
+    # installing the pose algorithm. Under full-suite process load, early data
+    # can otherwise be correctly ignored before SET_POSE_ALGO is acknowledged.
+    assert proc._cmd_ack_event.wait(3)
+    proc._cmd_ack_event.clear()
     for _ in range(5):
         # NB: the 3 first are discarded by the pose result process
         proc._data_queue.put((
