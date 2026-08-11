@@ -162,6 +162,12 @@ class MainWindow(QMainWindow):
         self._previous_intersession_analysis_rsp: Optional[Tuple[ProjectInfo, IntersessionResponse]] = None
 
         app_model = self._app_model = AppModel(prefs)
+        self._notes_save_timer = QTimer(self)
+        self._notes_save_timer.setSingleShot(True)
+        self._notes_save_timer.setInterval(500)
+        self._notes_save_timer.timeout.connect(
+            app_model.persist_stopped_session_notes
+        )
 
         try:
             self.setContentsMargins(0, 0, 0, 0)
@@ -1673,6 +1679,7 @@ class MainWindow(QMainWindow):
 
     def notes_changed(self, value: str):
         self._app_model.notes = value
+        self._notes_save_timer.start()
 
     def _add_animal(self):
         self._app_model.add_animal(self._animal_dropdown_combo.currentText(), select=True)
@@ -1794,6 +1801,12 @@ class MainWindow(QMainWindow):
                     self.make_3d_calib_action,
                 ):
                     item.setEnabled(False)
+            self._refresh_ui_availability()
+
+        elif name == props.NOTES:
+            signals_were_blocked = self._notes.blockSignals(True)
+            self._notes.setText(value or "")
+            self._notes.blockSignals(signals_were_blocked)
 
         elif name == props.SUBSYSTEM_STATUSES:
             if self._start_capture_thread is None:

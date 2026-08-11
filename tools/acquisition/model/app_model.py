@@ -404,6 +404,7 @@ class AppModel(ObservableObject):
         self._project_info: Optional[ProjectInfo] = None
         self._animal_name = ""
         self._notes = ""
+        self._editable_notes_project: Optional[ProjectInfo] = None
         self._left_camera = self._right_camera = self._stim_camera = None
         self._reach_cameras: Tuple[VideoCaptureModel, ...] = ()
 
@@ -870,6 +871,9 @@ class AppModel(ObservableObject):
                 + "\n".join(f"- {blocker}" for blocker in blockers),
             )
             return False
+        self.persist_stopped_session_notes()
+        self._editable_notes_project = None
+        self.notes = ""
         self._recording_session.prepare_record(
             self._acquisition.subsystems.snapshot(),
             animal_snapshot=(
@@ -3027,6 +3031,22 @@ class AppModel(ObservableObject):
         prev, self._notes = self._notes, value
         self._on_property_changed(self.Props.NOTES, value, prev)
 
+    def persist_stopped_session_notes(self) -> bool:
+        """Atomically update notes for the most recently stopped session."""
+        project = self._editable_notes_project
+        if project is None:
+            return False
+        try:
+            self._save_project_metadata(
+                project,
+                caller="session_notes_updated",
+            )
+        except Exception as exc:
+            logger.exception("Failed to update stopped-session notes")
+            self.on_error("Session notes were not saved", str(exc))
+            return False
+        return True
+
     @property
     def rpc_service(self) -> Optional[RpcService]:
         return self._rpc_service
@@ -4728,6 +4748,7 @@ class AppModel(ObservableObject):
         # Stop command producers first so none can race with CAN teardown or
         # reschedule themselves after their current timer is cancelled.
         self._prepare_application_shutdown()
+        self.persist_stopped_session_notes()
 
         if self._rfid_metadata_controller is not None:
             self._rfid_metadata_controller.stop()
@@ -5334,6 +5355,7 @@ class AppModel(ObservableObject):
             )
             self._set_session_recording_status(SessionRecordingStatus.ANALYZING)
         try:
+            self._editable_notes_project = project.to_local_value()
             self._save_project_metadata(
                 project,
                 caller="raw_writers_closed",
@@ -5405,6 +5427,8 @@ class AppModel(ObservableObject):
             )
             self._abort_had_recording_started = False
             self._aborting_project = None
+            self._editable_notes_project = None
+            self.notes = ""
             self._set_session_recording_status(SessionRecordingStatus.READY)
 
     def _remove_timestamps_txt_files(
@@ -5748,7 +5772,11 @@ class AppModel(ObservableObject):
         )
         if session is not None and session < 0:
             session = project_info.session  # ensure use this one
-        if caller in {"raw_writers_closed", "session_analysis_ended"}:
+        if caller in {
+            "raw_writers_closed",
+            "session_analysis_ended",
+            "session_notes_updated",
+        }:
             boundary = self._recording_session.boundary
             if boundary is None or boundary.session_id != project_info.short_id:
                 raise RuntimeError(
