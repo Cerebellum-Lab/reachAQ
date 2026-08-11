@@ -54,7 +54,7 @@ def test_v5_persists_trial_progress_without_retired_fields(tmp_path):
     animal.to_file(destination)
 
     persisted = json.loads(destination.read_text())
-    assert persisted["version"] == 6
+    assert persisted["version"] == 7
     assert persisted["training"]["selectedProtocol"] == "protocol-1"
     phase = persisted["training"]["protocolProgress"][0]["progress"][0]
     assert phase["trial_count"] == 3
@@ -85,7 +85,7 @@ def test_v4_migration_preserves_backup_and_resets_progress(tmp_path):
     assert animal.training.protocols == []
     animal.to_file(destination)
 
-    assert json.loads(destination.read_text())["version"] == 6
+    assert json.loads(destination.read_text())["version"] == 7
     assert json.loads(
         destination.with_suffix(".json.v4-backup").read_text()
     ) == legacy
@@ -96,7 +96,7 @@ def test_unsupported_animal_versions_fail_clearly(tmp_path, version):
     destination = tmp_path / "animal.json"
     destination.write_text(json.dumps({"version": version, "name": "old"}))
 
-    with pytest.raises(ValueError, match="only v4/v5 migration and v6"):
+    with pytest.raises(ValueError, match="only v4/v5/v6 migration and v7"):
         AnimalSubject.from_file(destination)
 
 
@@ -118,13 +118,14 @@ def test_v5_migrates_with_backup(tmp_path):
     animal = AnimalSubject.from_file(destination)
     animal.to_file(destination)
 
-    assert json.loads(destination.read_text())["version"] == 6
+    assert json.loads(destination.read_text())["version"] == 7
     assert json.loads(destination.with_suffix(".json.v5-backup").read_text()) == legacy
 
 
 def test_external_identity_metadata_and_session_snapshot_round_trip(tmp_path):
     animal = AnimalSubject(
         name="stable-local-name",
+        notes="animal-level note",
         external_identity=ExternalIdentity("PT-42"),
         external_metadata=ExternalMetadataSnapshot(
             rfid="360002353933099",
@@ -146,6 +147,32 @@ def test_external_identity_metadata_and_session_snapshot_round_trip(tmp_path):
     assert loaded == animal
     snapshot = loaded.session_snapshot(snapshot_utc="2026-08-10T01:00:00Z")
     assert snapshot["name"] == "stable-local-name"
+    assert snapshot["notes"] == "animal-level note"
     assert snapshot["externalIdentity"]["subjectId"] == "PT-42"
     assert snapshot["externalIdentity"]["rfid"] == "360002353933099"
     assert snapshot["provenance"]["sourceRecordHash"] == "record-hash"
+
+
+def test_v6_migrates_with_empty_notes_and_backup(tmp_path):
+    destination = tmp_path / "animal.json"
+    legacy = {
+        "version": 6,
+        "id": "animal-id",
+        "name": "animal1",
+        "pellet": {
+            "coordinateSpace": "device",
+            "position": {"x": 1, "y": 2, "z": 3},
+        },
+        "training": {"selectedProtocol": None, "protocolProgress": []},
+        "limits": {"targetY": None},
+        "externalIdentity": None,
+        "externalMetadata": None,
+    }
+    destination.write_text(json.dumps(legacy))
+
+    animal = AnimalSubject.from_file(destination)
+    assert animal.notes == ""
+    animal.to_file(destination)
+
+    assert json.loads(destination.read_text())["version"] == 7
+    assert json.loads(destination.with_suffix(".json.v6-backup").read_text()) == legacy

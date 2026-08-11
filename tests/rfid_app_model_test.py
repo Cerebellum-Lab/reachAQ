@@ -1,3 +1,5 @@
+import logging
+
 from autotrainer.core import AnimalSubject, ExternalAnimalRecord, ExternalIdentity
 from tools.acquisition.model.app_model_status import SessionRecordingStatus
 from tools.acquisition.model.rfid_resolution import RfidResolutionKind
@@ -19,21 +21,66 @@ def record(subject="PT-1", name="Mouse A"):
     )
 
 
-def test_scan_does_not_name_link_or_rename_existing_animal(app_model):
+def test_first_scan_waits_for_setup_then_links_existing_animal(app_model):
     manual = app_model.add_animal("Mouse A")
 
     result = app_model.resolve_external_record(record(), scanned_rfid=TAG)
 
-    assert result.kind is RfidResolutionKind.CREATED_AND_SELECTED
-    assert result.animal.id != manual.id
-    assert result.animal.name == "Mouse A"
+    assert result.kind is RfidResolutionKind.SETUP_REQUIRED
+    assert result.animal is None
     assert manual.external_identity is None
+    assert app_model.selected_animal is None
+
+    completed = app_model.complete_rfid_animal_setup(
+        result.record,
+        scanned_rfid=TAG,
+        name="Mouse A",
+        notes="persistent note",
+        existing_animal_id=manual.id,
+    )
+    assert completed.kind is RfidResolutionKind.LINKED_AND_SELECTED
+    assert completed.animal.id == manual.id
+    assert completed.animal.notes == "persistent note"
+    assert app_model.selected_animal.id == manual.id
 
     updated = record(name="New SoftMouse Display")
     second = app_model.resolve_external_record(updated, scanned_rfid=TAG)
     assert second.kind is RfidResolutionKind.SELECTED
-    assert second.animal.id == result.animal.id
+    assert second.animal.id == manual.id
     assert second.animal.name == "Mouse A"
+
+
+def test_scan_creation_selection_and_link_are_logged(app_model, caplog):
+    caplog.set_level(logging.INFO, logger="tools.acquisition.model.app_model")
+
+    pending = app_model.handle_rfid_scan(record(), scanned_rfid=TAG)
+    result = app_model.complete_rfid_animal_setup(
+        pending.record,
+        scanned_rfid=TAG,
+        name="Mouse A",
+        notes="",
+    )
+
+    assert result.kind is RfidResolutionKind.CREATED_AND_SELECTED
+    messages = [entry.getMessage() for entry in caplog.records]
+    assert any(
+        f"RFID scan resolution started: rfid={TAG}" in message
+        for message in messages
+    )
+    assert any(
+        "SoftMouse link saved:" in message and f"rfid={TAG}" in message
+        for message in messages
+    )
+    assert any(
+        "Animal selection changed:" in message
+        and f"animal_id={result.animal.id}" in message
+        for message in messages
+    )
+    assert any(
+        "RFID scan resolution complete:" in message
+        and "result=created_and_selected" in message
+        for message in messages
+    )
 
 
 def test_scan_never_mutates_or_queues_selection_while_busy(app_model):

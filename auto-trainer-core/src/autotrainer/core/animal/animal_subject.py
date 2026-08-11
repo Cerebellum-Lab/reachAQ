@@ -48,9 +48,10 @@ class AnimalTraining:
 class _AnimalSubject:
     """A subject in an animal experiment."""
 
-    version: int = 6
+    version: int = 7
 
     name: str = ""
+    notes: str = ""
     id: str = None   # handled in post_init
 
     is_pellet_dcs: bool = False
@@ -90,6 +91,7 @@ class _AnimalSubject:
             self.id = str(uuid.uuid4())
         if not self.name:
             self.name = f"Mouse-{self.id}"
+        self.notes = str(self.notes or "")
 
 @dataclass
 class AnimalSubject(_AnimalSubject):
@@ -183,6 +185,12 @@ class AnimalSubject(_AnimalSubject):
         return animal
 
     @classmethod
+    def _from_v7(cls, data: Dict[str, Any]) -> Self:
+        animal = cls._from_v6(data)
+        animal.notes = str(data.get("notes") or "")
+        return animal
+
+    @classmethod
     def from_file(cls: Type[Self], file_path: Path) -> Optional[Self]:
         original = file_path.read_bytes()
         data = json.loads(original)
@@ -195,7 +203,7 @@ class AnimalSubject(_AnimalSubject):
             animal._legacy_v4_content = original
             animal._legacy_version = 4
             logger.notice(
-                "Loaded animal v4 for one-way migration to v6; protocol "
+                "Loaded animal v4 for one-way migration to v7; protocol "
                 "recording-count progress was reset"
             )
         elif file_version == 5:
@@ -203,13 +211,19 @@ class AnimalSubject(_AnimalSubject):
             animal._legacy_v4_path = file_path.resolve()
             animal._legacy_v4_content = original
             animal._legacy_version = 5
-            logger.notice("Loaded animal v5 for one-way migration to v6")
-        elif file_version == cls.version:
+            logger.notice("Loaded animal v5 for one-way migration to v7")
+        elif file_version == 6:
             animal = cls._from_v6(data)
+            animal._legacy_v4_path = file_path.resolve()
+            animal._legacy_v4_content = original
+            animal._legacy_version = 6
+            logger.notice("Loaded animal v6 for one-way migration to v7")
+        elif file_version == cls.version:
+            animal = cls._from_v7(data)
         else:
             raise ValueError(
                 f"Unsupported animal schema version {file_version!r} in "
-                f"{file_path}; only v4/v5 migration and v6 are supported"
+                f"{file_path}; only v4/v5/v6 migration and v7 are supported"
             )
 
         logger.debug("loaded animal id=%r name=%r pellet=%s is_dcs=%s current_protocol=%s",
@@ -248,6 +262,7 @@ class AnimalSubject(_AnimalSubject):
         return {
             "reachaqId": self.id,
             "name": self.name,
+            "notes": self.notes,
             "externalIdentity": (
                 None
                 if identity is None
@@ -288,6 +303,7 @@ class AnimalSubject(_AnimalSubject):
             "version": self.version,
             "id": self.id,
             "name": self.name,
+            "notes": self.notes,
             "pellet": {
                 "coordinateSpace": "dcs" if self.is_pellet_dcs else "device",
                 "position": {

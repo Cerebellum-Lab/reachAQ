@@ -223,23 +223,18 @@ acquired and persisted whenever NI-DAQ is enabled, regardless of plot
 selection. The retired `recordToAcquisition` and stream `outputName` controls
 are rejected.
 
-## Animal JSON v4 to v5
+## Animal JSON schema
 
-Animal v4 is the only accepted legacy animal format. On first successful save:
+Animal JSON v7 uses its immutable reachAQ UUID as the filename and identity. It
+persists the editable local name and animal notes, pellet coordinate space and
+position, target limit, protocol/trial progress, and the permanent
+UUID-to-SoftMouse/RFID link with its metadata snapshot.
 
-1. ReachAQ loads identity, name, pellet/device or DCS coordinates, target-Y
-   limit, and selected protocol.
-2. Recording-count protocol progress is reset because it cannot be converted
-   reliably into pellet-delivery trial progress.
-3. The original bytes are written atomically beside the animal file as
-   `<animal>.json.v4-backup` if that backup does not already exist.
-4. A clean v5 document atomically replaces the active file. Subsequent writes
-   are v5 only.
-
-Animal v0-v3, files without an ID, and unknown versions are rejected with a
-clear version error. V5 persists only identity, pellet coordinate space and
-position, selected protocol and trial-based progress, and retained target
-limits. Day/total counts and auto-clamp/magnet history are absent.
+Animal v4, v5, and v6 files are accepted for one-way migration on their first
+successful save. The original bytes are preserved beside the active file as
+`<animal>.json.vN-backup`; v4 recording-count progress is reset because it
+cannot be converted reliably to pellet-trial progress. V0-v3, files without an
+ID, and unknown future versions are rejected clearly.
 
 ## Public API lifecycle
 
