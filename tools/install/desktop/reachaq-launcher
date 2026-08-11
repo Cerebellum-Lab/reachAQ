@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+
+set -u
+
+launcher_config=${REACHAQ_LAUNCHER_CONFIG:-$HOME/.config/reachaq/launcher.conf}
+if [ ! -r "$launcher_config" ]; then
+    printf 'reachAQ launcher configuration is missing: %s\n' "$launcher_config" >&2
+    read -r -p "Press Enter to close..." _unused
+    exit 2
+fi
+
+conda_bin=
+conda_env=
+repository=
+system_config=
+runtime_env=
+while IFS='=' read -r key value || [ -n "${key:-}" ]; do
+    value=${value%$'\r'}
+    case "$key" in
+        CONDA_BIN) conda_bin=$value ;;
+        CONDA_ENV) conda_env=$value ;;
+        REPOSITORY) repository=$value ;;
+        SYSTEM_CONFIG) system_config=$value ;;
+        RUNTIME_ENV) runtime_env=$value ;;
+    esac
+done < "$launcher_config"
+
+for required_value in conda_bin conda_env repository system_config; do
+    if [ -z "${!required_value}" ]; then
+        printf 'reachAQ launcher setting %s is empty in %s\n' \
+            "$required_value" "$launcher_config" >&2
+        read -r -p "Press Enter to close..." _unused
+        exit 2
+    fi
+done
+if [ ! -x "$conda_bin" ]; then
+    printf 'Configured Conda executable is unavailable: %s\n' "$conda_bin" >&2
+    read -r -p "Press Enter to close..." _unused
+    exit 2
+fi
+if [ ! -f "$system_config" ]; then
+    printf 'Configured reachAQ system configuration is unavailable: %s\n' \
+        "$system_config" >&2
+    read -r -p "Press Enter to close..." _unused
+    exit 2
+fi
+
+# Runtime files are data-only KEY=VALUE files. Do not source executable shell.
+if [ -n "$runtime_env" ] && [ -r "$runtime_env" ]; then
+    while IFS='=' read -r key value || [ -n "${key:-}" ]; do
+        value=${value%$'\r'}
+        case "$key" in
+            AUTOTRAINER_*|REACHAQ_*) export "$key=$value" ;;
+        esac
+    done < "$runtime_env"
+fi
+
+runtime_dir=${XDG_RUNTIME_DIR:-/tmp}
+lock_file="$runtime_dir/reachaq-gui-${UID}.lock"
+exec 9>"$lock_file"
+if ! flock -n 9; then
+    printf 'reachAQ is already running for this desktop user.\n' >&2
+    read -r -p "Press Enter to close..." _unused
+    exit 3
+fi
+
+cd "$repository" || {
+    printf 'Configured reachAQ repository is unavailable: %s\n' "$repository" >&2
+    read -r -p "Press Enter to close..." _unused
+    exit 2
+}
+
+printf 'Starting reachAQ from %s using Conda environment %s\n' \
+    "$repository" "$conda_env"
+"$conda_bin" run --no-capture-output -n "$conda_env" \
+    python -m reachAQ.app -c "$system_config"
+status=$?
+if [ "$status" -ne 0 ]; then
+    printf '\nreachAQ exited with status %d.\n' "$status" >&2
+    read -r -p "Press Enter to close this terminal..." _unused
+fi
+exit "$status"

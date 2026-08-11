@@ -5,6 +5,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 INSTALL_SCRIPT = REPO_ROOT / "tools" / "install" / "reachaq-linux-install.sh"
+DESKTOP_INSTALL_SCRIPT = REPO_ROOT / "tools" / "install" / "install-reachaq-desktop.sh"
 TOOLS_PROJECT = REPO_ROOT / "tools" / "pyproject.toml"
 DEVICE_PROJECT = REPO_ROOT / "auto-trainer-device" / "pyproject.toml"
 SOFTMOUSE_SERVICE = (
@@ -69,6 +70,48 @@ def test_portable_installer_covers_softmouse_rfid_requirements():
     assert "tests/softmouse_https_source_test.py" in source
     assert "auto-trainer-device/tests/rfid_reader_test.py" in source
     assert "resolves outside the current checkout" in source
+
+
+def test_desktop_launcher_installer_creates_terminal_entry(tmp_path):
+    home = tmp_path / "home"
+    desktop = home / "Desktop"
+    config_dir = home / "Autotrainer"
+    fake_conda = tmp_path / "conda"
+    home.mkdir()
+    desktop.mkdir()
+    config_dir.mkdir()
+    fake_conda.write_text("#!/bin/sh\nexit 0\n")
+    fake_conda.chmod(0o755)
+    (config_dir / "system_configuration.yaml").write_text("test: true\n")
+    (desktop / "ReachAQ-startup").write_text("obsolete\n")
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "REACHAQ_CONDA_BIN": str(fake_conda),
+        "REACHAQ_INSTALL_REPO": str(REPO_ROOT),
+        "REACHAQ_INSTALL_CONFIG_DIR": str(config_dir),
+        "REACHAQ_DESKTOP_DIR": str(desktop),
+    }
+
+    completed = subprocess.run(
+        [str(DESKTOP_INSTALL_SCRIPT)],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    entry = (desktop / "reachAQ.desktop").read_text()
+    assert "Terminal=true" in entry
+    assert "Icon=reachaq" in entry
+    assert str(home / ".local/bin/reachaq-launcher") in entry
+    assert not (desktop / "ReachAQ-startup").exists()
+    assert os.access(home / ".local/bin/reachaq-launcher", os.X_OK)
+    launcher_config = (home / ".config/reachaq/launcher.conf").read_text()
+    assert f"CONDA_BIN={fake_conda}" in launcher_config
+    assert f"SYSTEM_CONFIG={config_dir / 'system_configuration.yaml'}" in launcher_config
 
 
 def test_softmouse_rfid_python_dependencies_are_packaged():

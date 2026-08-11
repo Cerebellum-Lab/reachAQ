@@ -145,6 +145,26 @@ For a fully separate software configuration, use
 `tools/hardware/reachaq_random_camera_configuration.example.yaml` with a
 separate Preferences configuration directory.
 
+## Desktop launcher
+
+Install or refresh the GNOME desktop launcher without rerunning the complete
+host installer:
+
+```bash
+tools/install/install-reachaq-desktop.sh
+```
+
+The installer places a trusted mouse-icon `reachAQ.desktop` entry on the
+operator's desktop and in the application menu. It starts in Idle through the
+configured `reachaq` Conda environment and opens a terminal containing live
+logs. A per-user lock rejects accidental duplicate GUI launches. Startup
+failures remain visible until Enter is pressed.
+
+Launcher paths are stored in `~/.config/reachaq/launcher.conf`. Optional
+`AUTOTRAINER_*` and `REACHAQ_*` runtime values can be placed as literal
+`KEY=VALUE` lines in `~/.config/reachaq/runtime.env`; the launcher parses this
+file as data and does not source it as shell code.
+
 ## Verification
 
 Portable CLI/import checks and the focused non-hardware suite are part of the

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=reachAQ
+Comment=Start reachAQ acquisition
+Exec=@EXEC@
+Icon=reachaq
+Terminal=true
+StartupNotify=true
+Categories=Science;
+StartupWMClass=reachAQ

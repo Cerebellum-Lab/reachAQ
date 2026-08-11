@@ -168,6 +168,7 @@ apt_install_base() {
         build-essential \
         can-utils \
         dbus-user-session \
+        desktop-file-utils \
         dkms \
         expat \
         ffmpeg \
@@ -290,6 +291,14 @@ conda_run() {
 
 install_editable_package() {
     conda_run python -m pip install -e "$INSTALL_REPO[test]"
+}
+
+install_desktop_launcher() {
+    REACHAQ_INSTALL_REPO="$INSTALL_REPO" \
+    REACHAQ_INSTALL_ENV="$INSTALL_ENV" \
+    REACHAQ_INSTALL_CONFIG_DIR="$INSTALL_CONFIG_DIR" \
+    REACHAQ_CONDA_BIN="$CONDA_BIN" \
+        "$INSTALL_REPO/tools/install/install-reachaq-desktop.sh"
 }
 
 install_tensorflow_gpu_runtime() {
@@ -557,6 +566,7 @@ else
     run_step "Upgrade Python packaging tools" conda_run python -m pip install --upgrade pip setuptools wheel build
     run_step "Install Python requirements" conda_run python -m pip install -r "$INSTALL_REPO/requirements.txt"
     run_step "Install reachAQ editable package" install_editable_package
+    run_step "Install reachAQ desktop launcher" install_desktop_launcher
 fi
 
 begin_category "TensorFlow GPU runtime"
