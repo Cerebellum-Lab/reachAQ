@@ -273,11 +273,12 @@ Final session JSON/YAML uses `metadataSchemaVersion: 2`. It records the animal
 snapshot, `counts`, recording completion, stop policy/result, compact hardware
 state at Record, and only hardware entries that changed by finalization. The
 `artifacts` section references the authoritative `alignment.json`,
-`trial_summary.json`, and the acquisition-level configuration snapshot by path
-and SHA-256 instead of embedding those records again. `boundary.durationSeconds`
-is the final camera-bounded duration. Non-finite values are normalized to
-JSON/YAML null; finalized metadata is never written with non-standard `NaN`
-tokens.
+and `trial_summary.json` by path and SHA-256 instead of embedding those records
+again. The complete `system_configuration.yaml` key/value snapshot remains
+embedded under `configuration` so each recording is independently reproducible.
+`boundary.durationSeconds` is the final camera-bounded duration. Non-finite
+values are normalized to JSON/YAML null; finalized metadata is never written
+with non-standard `NaN` tokens.
 
 The pinned `auto-trainer-api` 0.11.0 lifecycle supports explicit session and
 pellet-attempt events. ReachAQ's status schema contains no alarm, emergency,

@@ -802,9 +802,6 @@ def test_final_metadata_uses_canonical_boundary_not_stale_project_timestamp(
         end_wall_time=1_800_000_002.25,
     )
     app_model._on_session_capture_ended(RecordingEndingReason.MANUAL_STOP)
-    run_metadata = tmp_path / "run_metadata.json"
-    run_metadata.write_text(json.dumps({"configuration": {"version": 1}}))
-    app_model._run_metadata_json_path = run_metadata
     session_dir = tmp_path / "session003"
     streams_dir = session_dir / "streams"
     streams_dir.mkdir(parents=True)
@@ -834,14 +831,21 @@ def test_final_metadata_uses_canonical_boundary_not_stale_project_timestamp(
     assert "enabledSources" not in saved
     assert "trialSummary" not in saved
     assert "hardwareRuntimeAtRecord" not in saved
-    assert "configuration" not in saved
-    assert len(serialized_json) < 8_000
+    assert set(saved["configuration"]) >= {
+        "version",
+        "cameras",
+        "hardware",
+        "inference",
+        "laser",
+        "nidaq_ports",
+        "nidaq_stream",
+        "behavior",
+        "persistence",
+        "watchdog",
+    }
+    assert len(serialized_json) < 12_000
     assert saved["artifacts"]["alignment"]["$ref"] == "streams/alignment.json"
     assert saved["artifacts"]["trialSummary"]["$ref"] == "streams/trial_summary.json"
-    assert (
-        saved["artifacts"]["configuration"]["$ref"]
-        == "../run_metadata.json#/configuration"
-    )
 
 
 def test_metadata_pair_is_not_replaced_when_yaml_serialization_fails(

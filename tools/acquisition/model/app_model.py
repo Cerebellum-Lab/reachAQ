@@ -220,13 +220,12 @@ def _subsystem_snapshot_changes(at_record, at_finalize):
     }
 
 
-def _metadata_reference(path: Path, *, relative_to: Path, pointer: str = ""):
+def _metadata_reference(path: Path, *, relative_to: Path):
     if not path.is_file():
         return None
     relative_path = Path(os.path.relpath(path, start=relative_to)).as_posix()
-    fragment = f"#{pointer}" if pointer else ""
     return {
-        "$ref": f"{relative_path}{fragment}",
+        "$ref": relative_path,
         "targetSha256": hashlib.sha256(path.read_bytes()).hexdigest(),
     }
 
@@ -418,7 +417,6 @@ class AppModel(ObservableObject):
         self._training_plan: Optional[TrainingPlan] = None
         self._training_plan_animal: Optional[AnimalSubject] = None
         self._recording_session = RecordingSessionController()
-        self._run_metadata_json_path: Optional[Path] = None
         self._session_stop_policy: Optional[SessionStopPolicy] = None
         self._session_stop_evaluation: Optional[SessionStopEvaluation] = None
         self._recording_ending_reason = RecordingEndingReason.NA
@@ -5787,8 +5785,6 @@ class AppModel(ObservableObject):
                     "boundary differs from streams/alignment.json"
                 )
         self._save_metadata(project_info, when, file_name, session)
-        if session is None:
-            self._run_metadata_json_path = Path(file_name + ".json")
 
     def _save_metadata(self, project: ProjectInfo, when: datetime, file_name: str, session: Optional[int] = -1):
         when_as_utc = when.astimezone(timezone.utc)
@@ -5829,15 +5825,6 @@ class AppModel(ObservableObject):
             }
         else:
             session_dir = Path(file_name).parent
-            configuration_reference = (
-                None
-                if self._run_metadata_json_path is None
-                else _metadata_reference(
-                    self._run_metadata_json_path,
-                    relative_to=session_dir,
-                    pointer="/configuration",
-                )
-            )
             artifacts = {
                 "alignment": _metadata_reference(
                     session_dir / "streams" / "alignment.json",
@@ -5846,11 +5833,6 @@ class AppModel(ObservableObject):
                 "trialSummary": _metadata_reference(
                     session_dir / "streams" / "trial_summary.json",
                     relative_to=session_dir,
-                ),
-                "configuration": (
-                    configuration_reference
-                    if configuration_reference is not None
-                    else {"inline": configuration}
                 ),
             }
             out = {
@@ -5930,6 +5912,7 @@ class AppModel(ObservableObject):
                         runtime_final,
                     ),
                 },
+                "configuration": configuration,
                 "artifacts": artifacts,
             }
         out = _metadata_without_nonfinite_numbers(out)
