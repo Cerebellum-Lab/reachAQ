@@ -158,6 +158,50 @@ software implementation gaps.
 
 ## System Mode and operator controls
 
+### 2026-08-11 UI, protocol, and launcher regression
+
+- [ ] Start with a fresh preferences file, maximize the application, and drag
+      the title bar. Confirm the first drag restores a practical normal size
+      instead of `320×240`.
+- [ ] Resize and reposition the normal window, restart reachAQ, and repeat the
+      maximize/drag operation. Confirm the chosen normal geometry is restored.
+- [ ] Open **File → Hardware**, toggle at least three independent selections,
+      and confirm the submenu stays open until clicking outside it. Confirm one
+      hardware refresh begins after the menu closes and no callback exception
+      is logged.
+- [ ] Enter Running and confirm the System Mode selector remains enabled. Return
+      to Idle from the selector and confirm shutdown completes normally.
+- [ ] Exercise Idle, starting, Running/Ready, Recording, Stopping, Analyzing,
+      Abort, hardware refresh, and NI discovery. Confirm every conflicting
+      control is disabled and every currently valid control is enabled.
+- [ ] Confirm Subject is editable before Record, locked from Arming through
+      analysis, and editable again only after the session returns to Ready.
+- [ ] Enter Notes before and during recording, press Stop, then edit Notes while
+      analysis is running and after it completes. Confirm JSON and YAML metadata
+      contain the final text. Start another recording and confirm the Notes field
+      clears without modifying the preceding session.
+- [ ] Confirm the pellet-board X/Y/Z controls and feedback are directly beneath
+      **Pellet Release Location**, with the force-override command column closely
+      adjacent and no large empty spacer columns.
+- [ ] Confirm pellet controls are disabled while disconnected or a command is
+      pending, then re-enabled after acknowledgement. Confirm Home, Load, Send,
+      Retract, Release, and Cover retain force-override behavior when enabled.
+- [ ] In the Trial Protocol tab, edit several future rows and confirm the values
+      remain editable until their logical trial starts. Confirm the active row is
+      highlighted and locked, completed rows remain locked, and a hardware-error
+      retry returns the same logical row to Future rather than consuming the next
+      row.
+- [ ] Stop and inspect `streams/trials.jsonl`. Confirm each attempt contains its
+      immutable `protocol_context.trial_row` snapshot and session metadata
+      contains the ordered `protocolSchedule`.
+- [ ] Double-click the mouse-icon `reachAQ.desktop`. Confirm a terminal opens,
+      live logs appear immediately, the configured Conda environment/config are
+      used, and reachAQ starts in Idle.
+- [ ] Double-click the launcher again while reachAQ is open. Confirm it reports
+      an existing instance and does not start a second GUI. Intentionally supply
+      an invalid configuration once and confirm the failure terminal remains
+      visible until Enter is pressed.
+
 - [ ] Select System Mode Running without pressing Record. Confirm enabled
       cameras acquire and preview, but no session directory or video writer is
       created.
