@@ -180,6 +180,7 @@ class HardwareStatusContent(ContentWidget):
             ("nidaq", "NI-DAQ"),
             ("can", "CAN Adapter"),
             ("pellet", "Pellet Controller"),
+            ("rfid", "RFID Reader"),
             ("gpu", "GPU"),
             ("laser", "Laser"),
         ):
@@ -224,6 +225,7 @@ class HardwareStatusContent(ContentWidget):
         self._refresh_daq_status()
         self._refresh_can_status()
         self._refresh_pellet_status()
+        self._refresh_rfid_status()
         self._refresh_gpu_status()
         self._refresh_laser_status()
 
@@ -352,6 +354,40 @@ class HardwareStatusContent(ContentWidget):
             scan_state,
         )
 
+    def _refresh_rfid_status(self) -> None:
+        reader_status = getattr(self._app_model, "rfid_reader_status", None)
+        subsystem = self._subsystem_status(SubsystemId.RFID_READER)
+        if subsystem is None:
+            enabled = reader_status is not None
+            state = "idle" if enabled else "disabled"
+            runtime = "status unavailable" if enabled else "reader disabled"
+            runtime_state = "idle" if enabled else "disabled"
+        else:
+            enabled = subsystem.state is not SubsystemState.DISABLED
+            state = {
+                SubsystemState.READY: "ok",
+                SubsystemState.STARTING: "warning",
+                SubsystemState.FAILED: "error",
+                SubsystemState.BLOCKED: "error",
+                SubsystemState.DISABLED: "disabled",
+                SubsystemState.STOPPED: "idle",
+                SubsystemState.STOPPING: "warning",
+            }[subsystem.state]
+            runtime = subsystem.error or subsystem.reason or subsystem.state.value
+            runtime_state = subsystem.state.value
+        device = getattr(reader_status, "device", "") or self._configured_rfid_device()
+        rows = [("reader", device or "not configured", runtime_state)]
+        rows.append(("runtime", runtime, runtime_state))
+        scan = getattr(self._app_model, "rfid_scan_result", None)
+        if scan is not None:
+            kind = getattr(getattr(scan, "kind", None), "value", "scan")
+            rfid = getattr(scan, "rfid", "")
+            animal = getattr(scan, "animal", None)
+            identity = getattr(animal, "name", "") or rfid or "unknown tag"
+            rows.append(("last scan", identity, kind.replace("_", " ")))
+        self._set_enabled("rfid", enabled, state)
+        self._set_info("rfid", self._format_device_rows(rows), state)
+
     def _refresh_laser_status(self) -> None:
         laser = self._app_model.laser
         configuration = laser.configuration
@@ -400,11 +436,7 @@ class HardwareStatusContent(ContentWidget):
 
     def _subsystem_status_row(self, subsystem_id, label: str) -> Tuple[str, str, str]:
         key = subsystem_id.value if isinstance(subsystem_id, SubsystemId) else str(subsystem_id)
-        try:
-            statuses = object.__getattribute__(self._app_model, "subsystem_statuses")
-        except (AttributeError, TypeError):
-            statuses = {}
-        status = statuses.get(key)
+        status = self._subsystem_status(key)
         if status is None:
             return label, "status unavailable", "idle"
         detail = status.error or status.reason or status.state.value
@@ -418,6 +450,21 @@ class HardwareStatusContent(ContentWidget):
             SubsystemState.STOPPED: "stopped",
         }[status.state]
         return label, detail, state
+
+    def _subsystem_status(self, subsystem_id):
+        key = subsystem_id.value if isinstance(subsystem_id, SubsystemId) else str(subsystem_id)
+        try:
+            statuses = object.__getattribute__(self._app_model, "subsystem_statuses")
+        except (AttributeError, TypeError):
+            statuses = {}
+        return statuses.get(key)
+
+    def _configured_rfid_device(self) -> str:
+        try:
+            preferences = object.__getattribute__(self._app_model, "_preferences")
+        except (AttributeError, TypeError):
+            preferences = None
+        return getattr(preferences, "rfid_device", "")
 
     @staticmethod
     def _camera_binding(camera) -> str:
@@ -622,6 +669,8 @@ class HardwareStatusContent(ContentWidget):
         if property_name in {
             "hardware_scan_results",
             "subsystem_statuses",
+            "rfid_reader_status",
+            "rfid_scan_result",
         }:
             self._refresh_status()
 

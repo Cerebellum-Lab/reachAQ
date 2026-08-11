@@ -9,6 +9,9 @@ from PySide6.QtCore import QByteArray, QCoreApplication, QSettings
 from autotrainer.core import ObservableObject
 from autotrainer.core.logging import get_verbose_logger
 from autotrainer.core.configuration import SystemConfiguration
+from tools.acquisition.model.animal_metadata_sync import (
+    DEFAULT_SOFTMOUSE_MANIFEST_PATH,
+)
 
 
 logger = get_verbose_logger(__name__)
@@ -82,8 +85,13 @@ class UserPreferences(ObservableObject):
         self._live_feed_refresh_rate: int = settings.value("display/refresh_rate", 15, int)  # noqa
         self._measurement_graph: str = settings.value("ui/measurement_graph", "")  # noqa
 
-        self._softmouse_manifest_path: str = settings.value(
-            "softmouse/manifest_path", "", str
+        self._softmouse_manifest_path: str = (
+            settings.value(
+                "softmouse/manifest_path",
+                DEFAULT_SOFTMOUSE_MANIFEST_PATH.as_posix(),
+                str,
+            ).strip()
+            or DEFAULT_SOFTMOUSE_MANIFEST_PATH.as_posix()
         )
         self._softmouse_name_column: str = settings.value(
             "softmouse/new_animal_name_column", "Physical Tag", str
@@ -224,7 +232,8 @@ class UserPreferences(ObservableObject):
 
     @softmouse_manifest_path.setter
     def softmouse_manifest_path(self, value: str) -> None:
-        prev, self._softmouse_manifest_path = self._softmouse_manifest_path, value.strip()
+        value = value.strip() or DEFAULT_SOFTMOUSE_MANIFEST_PATH.as_posix()
+        prev, self._softmouse_manifest_path = self._softmouse_manifest_path, value
         self._settings.setValue("softmouse/manifest_path", self._softmouse_manifest_path)
         self._on_property_changed(self.SOFTMOUSE_MANIFEST_PATH, self._softmouse_manifest_path, prev)
 

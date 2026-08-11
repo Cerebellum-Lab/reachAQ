@@ -14,6 +14,11 @@ from autotrainer.video import CaptureCameraAttrs  # noqa: E402
 from tools.acquisition.model.hardware_scan import HardwareScanEntry, scan_can_adapters, scan_gpus  # noqa: E402
 from tools.acquisition.model.nidaq_discovery import NidaqDevicePorts  # noqa: E402
 from tools.acquisition.model.app_model import AppModel  # noqa: E402
+from tools.acquisition.model.subsystem_status import (  # noqa: E402
+    SubsystemId,
+    SubsystemState,
+    SubsystemStatus,
+)
 from tools.acquisition.view.hardware_status_content import HardwareStatusContent  # noqa: E402
 
 
@@ -89,6 +94,15 @@ class _AppModelStub(ObservableObject):
             tone1="DevOutputs/port0/line0",
         )
         self.configured_nidaq_device_names = ("DevOutputs", "DevInputs")
+        self.rfid_reader_status = None
+        self.rfid_scan_result = None
+        self.subsystem_statuses = {
+            SubsystemId.RFID_READER.value: SubsystemStatus(
+                SubsystemId.RFID_READER.value,
+                SubsystemState.DISABLED,
+                reason="RFID reader disabled",
+            )
+        }
         self.hardware_scan_results = {
             "cameras": HardwareScanEntry(
                 "✓ 4 camera source(s)\n"
@@ -127,6 +141,7 @@ def test_status_panel_columns_and_scan_results(qapp):
             "nidaq",
             "can",
             "pellet",
+            "rfid",
             "gpu",
             "laser",
         )
@@ -170,6 +185,9 @@ def test_status_panel_columns_and_scan_results(qapp):
         assert "GPU0" in gpu_info and "Test GPU · 4096 MiB · drv 1.0" in gpu_info
         pellet_info = content._category_panels["pellet"].details_text
         assert "firmware" in pellet_info and "unknown" in pellet_info
+        rfid_info = content._category_panels["rfid"].details_text
+        assert "RFID reader disabled" in rfid_info
+        assert content._enabled_labels["rfid"].text() == "Disabled"
 
         content._device_labels["can"].click()
         qapp.processEvents()
@@ -187,6 +205,35 @@ def test_status_panel_columns_and_scan_results(qapp):
         content._device_labels["can"].click()
         assert content._info_labels["can"].isHidden()
         assert content._category_panels["can"].details_scroll.isHidden()
+    finally:
+        content.deleteLater()
+
+
+def test_rfid_runtime_and_last_scan_update_hardware_status(qapp):
+    app_model = _AppModelStub()
+    app_model.rfid_reader_status = SimpleNamespace(
+        device="/dev/serial/by-id/test-rfid",
+        state=SimpleNamespace(value="ready"),
+        reason="reader connected",
+    )
+    app_model.rfid_scan_result = SimpleNamespace(
+        kind=SimpleNamespace(value="selected"),
+        rfid="A" * 26,
+        animal=SimpleNamespace(name="Mouse 17"),
+    )
+    app_model.subsystem_statuses[SubsystemId.RFID_READER.value] = SubsystemStatus(
+        SubsystemId.RFID_READER.value,
+        SubsystemState.READY,
+        reason="reader connected",
+    )
+    content = HardwareStatusContent(app_model)
+    try:
+        panel = content._category_panels["rfid"]
+        assert content._enabled_labels["rfid"].text() == "Enabled"
+        assert "/dev/serial/by-id/test-rfid" in panel.details_text
+        assert "reader connected" in panel.details_text
+        assert "Mouse 17" in panel.details_text
+        assert "#e8f5ec" in panel.header.styleSheet()
     finally:
         content.deleteLater()
 

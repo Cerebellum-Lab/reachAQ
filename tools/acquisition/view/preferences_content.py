@@ -10,7 +10,7 @@ import verboselogs
 from PySide6 import QtCore
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QWidget, QFormLayout, QLineEdit, QComboBox, QLabel, QHBoxLayout, QPushButton,
-                               QFileDialog, QTabWidget, QVBoxLayout, QCheckBox, QDoubleSpinBox, QSpinBox, QGridLayout,
+                               QTabWidget, QVBoxLayout, QCheckBox, QDoubleSpinBox, QSpinBox, QGridLayout,
                                QLayout, QSizePolicy, QGroupBox)
 
 from autotrainer.behavior.pellet_trial import (
@@ -25,6 +25,9 @@ from autotrainer.pyside import QSwitch
 from tools.acquisition.model.app_model import AppModel
 from tools.acquisition.model.app_model_status import SessionRecordingStatus
 from tools.acquisition.model.user_preferences import UserPreferences
+from tools.acquisition.view.softmouse_publication_controller import (
+    SoftMousePublicationController,
+)
 
 logger = get_verbose_logger(__name__)
 
@@ -475,26 +478,17 @@ class PreferencesContent(QWidget):
         form = QFormLayout(None)
         form.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
 
-        manifest_layout = QHBoxLayout()
         self._softmouse_manifest_edit = QLineEdit()
         self._softmouse_manifest_edit.setText(
             self._preferences.softmouse_manifest_path
         )
-        self._softmouse_manifest_edit.textChanged.connect(
-            lambda value: setattr(
-                self._preferences, "softmouse_manifest_path", value
-            )
-        )
-        manifest_layout.addWidget(self._softmouse_manifest_edit)
-        browse = QPushButton("Select…")
-        browse.clicked.connect(self._browse_for_softmouse_manifest)
-        manifest_layout.addWidget(browse)
-        form.addRow("Publication manifest:", manifest_layout)
+        self._softmouse_manifest_edit.setReadOnly(True)
+        form.addRow("Shared publication:", self._softmouse_manifest_edit)
 
         external = QLineEdit("Physical Tag")
         external.setReadOnly(True)
         form.addRow("Permanent external ID:", external)
-        rfid = QLineEdit("Alt. ID")
+        rfid = QLineEdit("Plate ID")
         rfid.setReadOnly(True)
         form.addRow("RFID field:", rfid)
 
@@ -502,7 +496,7 @@ class PreferencesContent(QWidget):
         name_field.setEditable(True)
         for header in (
             "Physical Tag",
-            "Alt. ID",
+            "Plate ID",
             "Cage Tag",
             "Comment",
         ):
@@ -530,7 +524,7 @@ class PreferencesContent(QWidget):
         )
         form.addRow("RFID serial device:", self._rfid_device_edit)
 
-        nightly = QCheckBox("Refresh local cache at midnight")
+        nightly = QCheckBox("Refresh this computer's local cache daily")
         nightly.setChecked(self._preferences.softmouse_nightly_refresh)
         nightly.toggled.connect(
             lambda value: setattr(
@@ -543,10 +537,31 @@ class PreferencesContent(QWidget):
         apply_button = QPushButton("Apply reader settings")
         apply_button.clicked.connect(self._apply_animal_metadata_preferences)
         buttons.addWidget(apply_button)
-        self._softmouse_refresh_button = QPushButton("Refresh now")
+        self._softmouse_refresh_button = QPushButton("Refresh local cache")
         self._softmouse_refresh_button.clicked.connect(self._refresh_animal_metadata)
         buttons.addWidget(self._softmouse_refresh_button)
         form.addRow("", buttons)
+
+        self._softmouse_publication_controller = (
+            SoftMousePublicationController.for_model(
+                self._app_model,
+                QtCore.QCoreApplication.instance(),
+            )
+        )
+        self._softmouse_publish_button = QPushButton("Sync from SoftMouse")
+        self._softmouse_publish_button.setToolTip(
+            "Download the current Christie animal list, safely replace the shared "
+            "Isilon publication, and refresh this computer's local cache."
+        )
+        self._softmouse_publish_button.clicked.connect(
+            self._softmouse_publication_controller.start
+        )
+        form.addRow("SoftMouse:", self._softmouse_publish_button)
+        self._softmouse_publication_status = QLabel(
+            self._softmouse_publication_controller.status
+        )
+        self._softmouse_publication_status.setWordWrap(True)
+        form.addRow("Publication:", self._softmouse_publication_status)
 
         self._softmouse_status = QLabel(self._app_model.animal_metadata_status)
         self._softmouse_status.setWordWrap(True)
@@ -573,14 +588,16 @@ class PreferencesContent(QWidget):
             elif name == self._app_model.Props.ANIMAL_METADATA_PREVIEW:
                 self._show_animal_metadata_preview(value)
             elif name == self._app_model.Props.SESSION_RECORDING_STATUS:
-                self._softmouse_refresh_button.setEnabled(
-                    value is SessionRecordingStatus.READY
-                )
+                self._update_softmouse_button_states()
 
         self._app_model.property_changed += model_changed
-        self._softmouse_refresh_button.setEnabled(
-            self._app_model.session_recording_status is SessionRecordingStatus.READY
+        self._softmouse_publication_controller.status_changed.connect(
+            self._softmouse_publication_status.setText
         )
+        self._softmouse_publication_controller.running_changed.connect(
+            self._update_softmouse_button_states
+        )
+        self._update_softmouse_button_states()
         tab = QWidget(None)
         tab.setLayout(form)
         def unsubscribe(*_args):
@@ -612,16 +629,14 @@ class PreferencesContent(QWidget):
             if header and self._softmouse_name_field.findText(header) < 0:
                 self._softmouse_name_field.addItem(header)
 
-    def _browse_for_softmouse_manifest(self):
-        current = self._softmouse_manifest_edit.text()
-        filename, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select SoftMouse publication manifest",
-            current,
-            "JSON manifests (*.json)",
+    def _update_softmouse_button_states(self, _running=None):
+        ready = (
+            self._app_model.session_recording_status
+            is SessionRecordingStatus.READY
         )
-        if filename:
-            self._softmouse_manifest_edit.setText(filename)
+        publishing = self._softmouse_publication_controller.is_running
+        self._softmouse_refresh_button.setEnabled(ready and not publishing)
+        self._softmouse_publish_button.setEnabled(ready and not publishing)
 
     def _apply_animal_metadata_preferences(self):
         try:

@@ -1634,7 +1634,7 @@ class MainWindow(QMainWindow):
                 self._rfid_status_label.setStyleSheet("color: #a33;")
                 self._rfid_status_label.setToolTip(
                     (getattr(value, "message", "") + "\n" if getattr(value, "message", "") else "")
-                    + f"Tag: {rfid}\nUse Animal metadata > Refresh now or manual linking."
+                    + f"Tag: {rfid}\nUse Animal metadata > Refresh local cache or manual linking."
                 )
 
         elif name == props.ANIMALS:
