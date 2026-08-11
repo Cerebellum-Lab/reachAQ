@@ -56,6 +56,7 @@ from tools.acquisition.model.subsystem_status import SubsystemState
 from tools.acquisition.model.training_plan import get_plan_id
 from tools.acquisition.model.user_preferences import UserPreferences
 from tools.acquisition.view.main_content import MainContent
+from tools.acquisition.view.multi_selection_menu import MultiSelectionMenu
 from tools.acquisition.view.nidaq_port_configuration_dialog import NidaqPortConfigurationDialog
 from tools.acquisition.view.preferences_dialog import PreferencesDialog
 from tools.acquisition.view.animal_metadata_dialog import AnimalMetadataDialog
@@ -144,6 +145,7 @@ class MainWindow(QMainWindow):
         self._status_log_handler = None
         self._rfid_setup_dialog = None
         self._normal_geometry_restored = False
+        self._hardware_refresh_pending = False
 
         self.setWindowTitle(self._title)
 
@@ -1074,7 +1076,7 @@ class MainWindow(QMainWindow):
             action = QAction(label, self)
             action.setCheckable(True)
             action.setEnabled(False)
-            action.triggered.connect(
+            action.toggled.connect(
                 partial(self._set_hardware_enabled_from_menu, field_name)
             )
             self.hardware_enable_actions[field_name] = action
@@ -1158,11 +1160,13 @@ class MainWindow(QMainWindow):
         )
 
         file_menu = menu_bar.addMenu("File")
-        hardware_menu = self.hardware_menu = file_menu.addMenu("Hardware")
+        hardware_menu = self.hardware_menu = MultiSelectionMenu("Hardware", file_menu)
+        file_menu.addMenu(hardware_menu)
         for action in self.hardware_enable_actions.values():
             hardware_menu.addAction(action)
         hardware_menu.addSeparator()
         hardware_menu.addAction(self.rfid_device_action)
+        hardware_menu.aboutToHide.connect(self._flush_pending_hardware_refresh)
         file_menu.addSeparator()
         file_menu.addAction(self.quit_action)
 
@@ -1224,7 +1228,15 @@ class MainWindow(QMainWindow):
         self._sync_hardware_menu_actions()
         self.statusBar().showMessage(message, 8000)
         if refresh_if_enabled:
-            QTimer.singleShot(0, self._refresh_hardware_bindings)
+            self._hardware_refresh_pending = True
+            if not self.hardware_menu.isVisible():
+                self._flush_pending_hardware_refresh()
+
+    def _flush_pending_hardware_refresh(self) -> None:
+        if not self._hardware_refresh_pending:
+            return
+        self._hardware_refresh_pending = False
+        QTimer.singleShot(0, self._refresh_hardware_bindings)
 
     def _set_hardware_enabled_from_menu(self, field_name: str, enabled: bool) -> None:
         logger.info(

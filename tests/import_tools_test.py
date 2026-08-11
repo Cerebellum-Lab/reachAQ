@@ -21,7 +21,7 @@ def test_main_window_subscribes_only_existing_callbacks():
     assert not [name for name in callback_names if not hasattr(MainWindow, name)]
 
 
-def test_hardware_switches_live_in_file_menu_and_apply_immediately():
+def test_hardware_switches_use_persistent_file_submenu_and_deferred_refresh():
     from tools.acquisition.view.hardware_status_content import HardwareStatusContent
     from tools.acquisition.view.main_window import MainWindow
 
@@ -29,9 +29,10 @@ def test_hardware_switches_live_in_file_menu_and_apply_immediately():
     apply_source = inspect.getsource(MainWindow._apply_hardware_menu_values)
     status_source = inspect.getsource(HardwareStatusContent)
 
-    assert 'file_menu.addMenu("Hardware")' in menu_source
+    assert 'MultiSelectionMenu("Hardware", file_menu)' in menu_source
+    assert "aboutToHide.connect(self._flush_pending_hardware_refresh)" in menu_source
     assert "update_hardware_configuration" in apply_source
-    assert "QTimer.singleShot" in apply_source
+    assert "_hardware_refresh_pending" in apply_source
     assert "Hardware Configuration" not in status_source
 
 
