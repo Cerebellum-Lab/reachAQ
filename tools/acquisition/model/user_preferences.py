@@ -75,7 +75,11 @@ class UserPreferences(ObservableObject):
             "system/animal_location",
             get_default_animals_location(Path(self._configuration_location)).as_posix())  # noqa
 
-        self._selected_animal: str = settings.value("system/selected_animal", "")  # noqa
+        # Subject selection is session state. Never restore it when reachAQ starts,
+        # and remove the legacy persisted value so older installations also start
+        # with an empty subject.
+        self._selected_animal: str = ""
+        settings.remove("system/selected_animal")
 
         self._log_location: str = settings.value("system/log_location", "")  # noqa
         self._log_level: int = settings.value("system/log_level", logging.WARNING, int)  # noqa
@@ -169,7 +173,6 @@ class UserPreferences(ObservableObject):
     def selected_animal(self, value: str):
         # set new value first,
         prev, self._selected_animal = self._selected_animal, value
-        self._settings.setValue("system/selected_animal", value)
         # then eventually trigger the on_property_changed event:
         self._on_property_changed(self.SELECTED_ANIMAL, value, prev)
 

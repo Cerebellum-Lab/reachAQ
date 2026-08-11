@@ -268,6 +268,8 @@ mkdir -p "$HOME/Documents/rawdatalocal"
 * Notes - set notes for the current acquisition session.
 * Subject - select the linked local animal name. The adjacent RFID label shows
   the most recently scanned raw 15-digit RFID.
+  Subject and RFID are session-only: every application launch starts with both
+  empty, and creating or linking an animal selects it for the current session.
 * Protocol - select a protocol, or select **Manual pellet control**. Automatic
   pellet cycles and automatic protocol advance are independent settings.
 * Preferences - configure live inference and other application preferences.

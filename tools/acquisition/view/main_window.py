@@ -1279,7 +1279,7 @@ class MainWindow(QMainWindow):
         combo.lineEdit().editingFinished.connect(self._add_animal)
         toolbar.addWidget(combo)
 
-        self._rfid_status_label = QLabel("RFID: disabled")
+        self._rfid_status_label = QLabel("RFID: —")
         self._rfid_status_label.setContentsMargins(8, 0, 8, 0)
         toolbar.addWidget(self._rfid_status_label)
         toolbar.addAction(self.animal_metadata_action)
@@ -1735,11 +1735,19 @@ class MainWindow(QMainWindow):
         elif name == props.RFID_READER_STATUS:
             state = getattr(getattr(value, "state", None), "value", "disabled")
             reason = getattr(value, "reason", "")
-            self._rfid_status_label.setText(f"RFID: {state}")
-            self._rfid_status_label.setToolTip(reason)
-            self._rfid_status_label.setStyleSheet(
-                "" if state in {"ready", "stopped", "disabled"} else "color: #b36b00;"
-            )
+            if (
+                self._app_model.rfid_scan_result is None
+                and self._app_model.selected_animal is None
+            ):
+                # Reader health belongs in Hardware Status. The title-bar value
+                # represents only the current session's tag and begins empty.
+                self._rfid_status_label.setText("RFID: —")
+                self._rfid_status_label.setToolTip(reason or f"RFID reader: {state}")
+                self._rfid_status_label.setStyleSheet(
+                    ""
+                    if state in {"ready", "stopped", "disabled"}
+                    else "color: #b36b00;"
+                )
 
         elif name == props.RFID_SCAN_RESULT:
             kind = getattr(getattr(value, "kind", None), "value", "unknown")
@@ -1773,22 +1781,7 @@ class MainWindow(QMainWindow):
             self._reload_animals(value)
 
         elif name == props.SELECTED_ANIMAL:
-            animal_dropdown = self._animal_dropdown_combo
-            animal_dropdown.blockSignals(True)
-            if value is None:
-                animal_dropdown.setCurrentIndex(0)
-            else:
-                assert isinstance(value, AnimalSubject)
-                index = animal_dropdown.findData(value.id)
-                if index != -1:
-                    animal_dropdown.setCurrentIndex(index)
-                else:
-                    logger.warning("Cannot select animal %s given not in current list")
-                    animal_dropdown.addItem(value.name, value.id)
-
-            animal_dropdown.blockSignals(False)
-            self._show_selected_animal_identity(value)
-            self._refresh_prev_next_phases()
+            self._sync_selected_animal_widget(value)
 
         elif name == props.TRAINING_PLAN:
             if value is not None:
@@ -1836,6 +1829,12 @@ class MainWindow(QMainWindow):
         finally:
             self._rfid_setup_dialog = None
         if accepted:
+            if dialog.saved_animal is not None:
+                # Creation and linking select in the model. Reassert the dialog
+                # result here so a concurrent list refresh cannot leave the UI
+                # displaying a previous subject.
+                self._app_model.selected_animal = dialog.saved_animal
+                self._sync_selected_animal_widget(dialog.saved_animal)
             logger.info("RFID first-scan setup accepted: rfid=%s", resolution.rfid)
         else:
             logger.info(
@@ -1847,8 +1846,40 @@ class MainWindow(QMainWindow):
                 8000,
             )
 
+    def _sync_selected_animal_widget(
+        self, animal: Optional[AnimalSubject]
+    ) -> None:
+        combo = self._animal_dropdown_combo
+        signals_were_blocked = combo.blockSignals(True)
+        try:
+            if animal is None:
+                combo.setCurrentIndex(0)
+                combo.setEditText("")
+            else:
+                index = combo.findData(animal.id)
+                if index == -1:
+                    logger.warning(
+                        "Selected animal was not in the subject widget; adding it: "
+                        "animal_id=%s animal_name=%s",
+                        animal.id,
+                        animal.name,
+                    )
+                    combo.addItem(animal.name, animal.id)
+                    index = combo.count() - 1
+                combo.setCurrentIndex(index)
+                # QComboBox can retain its pre-dialog edit text even after the
+                # model index changes. Set it explicitly for first-time animals.
+                combo.setEditText(animal.name)
+        finally:
+            combo.blockSignals(signals_were_blocked)
+        self._show_selected_animal_identity(animal)
+        self._refresh_prev_next_phases()
+
     def _show_selected_animal_identity(self, animal: Optional[AnimalSubject]) -> None:
         if animal is None:
+            self._rfid_status_label.setText("RFID: —")
+            self._rfid_status_label.setStyleSheet("")
+            self._rfid_status_label.setToolTip("No RFID scanned or selected")
             return
         metadata = animal.external_metadata
         rfid = None if metadata is None else metadata.rfid

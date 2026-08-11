@@ -99,11 +99,23 @@ def test_user_preferences(settings_ini_path, user_pref, trainer_config_dir):
     assert Path(user_pref._settings.fileName()) == settings_ini_path
     assert not settings_ini_path.exists()
     user_pref.selected_animal = "foobar"
+    user_pref.serial_number = "test-rig"
     user_pref.save()
     assert settings_ini_path.exists()
     user_pref = UserPreferences(settings_file_path=settings_ini_path)
     assert Path(user_pref.configuration_location) == trainer_config_dir
-    assert user_pref.selected_animal == "foobar"
+    assert user_pref.selected_animal == ""
+
+
+def test_legacy_selected_animal_preference_is_cleared_between_sessions(
+    settings_ini_path,
+):
+    settings_ini_path.write_text("[system]\nselected_animal=legacy-animal-id\n")
+
+    user_pref = UserPreferences(settings_file_path=settings_ini_path)
+
+    assert user_pref.selected_animal == ""
+    assert not user_pref._settings.contains("system/selected_animal")
 
 
 def test_hardware_menu_settings_persist_to_system_yaml(
