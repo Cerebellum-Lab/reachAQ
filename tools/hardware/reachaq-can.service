@@ -11,6 +11,7 @@ StartLimitBurst=3
 [Service]
 Type=oneshot
 EnvironmentFile=-/etc/default/reachaq-can
+ExecStartPre=/usr/bin/systemd-tmpfiles --create /etc/tmpfiles.d/reachaq-can.conf
 ExecStart=/usr/local/sbin/reachaq-bring-up-can
 ExecStop=/usr/local/sbin/reachaq-bring-down-can
 RemainAfterExit=yes

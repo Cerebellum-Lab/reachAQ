@@ -118,6 +118,7 @@ That guide installs these root-owned system artifacts:
 - `/usr/local/sbin/reachaq-reset-can`
 - `/etc/default/reachaq-can`
 - `/etc/systemd/system/reachaq-can.service`
+- `/etc/tmpfiles.d/reachaq-can.conf`
 - `/etc/sudoers.d/reachaq-can-reset`
 
 Adding the operator to the `reachaq` group requires a full logout/login before

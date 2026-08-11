@@ -1,4 +1,5 @@
 import errno
+import logging
 import socket
 import sys
 import types
@@ -232,7 +233,7 @@ def test_receive_preserves_can_operation_error_and_enetdown(monkeypatch):
     assert raised.value.__cause__.__class__.__name__ == "CanOperationError"
 
 
-def test_pellet_runtime_retains_pellet_board_status_messages():
+def test_pellet_runtime_retains_active_status_and_ignores_retired_servo(caplog):
     interface = CanInterface(
         required_targets=(Target.PELLET_DEVICE,),
         can_transport=CanTransportConfiguration(kind="socketcan", fd=True),
@@ -249,19 +250,25 @@ def test_pellet_runtime_retains_pellet_board_status_messages():
     assert isinstance(interface._translate(rgb), ColorLed)
 
     retained_motors = []
-    for motor_id in range(3):
-        status = JerryCANMsg()
-        status.type = JerryCANCmdType.SERVO_STATUS
-        status.dst_id = 0
-        status.servo_status.motor_id = motor_id
-        translated = interface._translate(status)
-        if translated is not None:
-            retained_motors.append(translated.motor)
+    with caplog.at_level(logging.WARNING):
+        for motor_id in range(3):
+            status = JerryCANMsg()
+            status.type = JerryCANCmdType.SERVO_STATUS
+            status.dst_id = 0
+            status.servo_status.motor_id = motor_id
+            translated = interface._translate(status)
+            if translated is not None:
+                retained_motors.append(translated.motor)
 
     assert retained_motors == [
         Motor.PELLET_COVER_SERVO,
         Motor.PELLET_LOAD_SERVO,
     ]
+    assert "Unknown motor id" not in caplog.text
+
+    status.servo_status.motor_id = 3
+    assert interface._translate(status) is None
+    assert "isa_servo=True motor_id=3" in caplog.text
 
 
 def test_send_refuses_large_jerrycan_payload_without_fd():

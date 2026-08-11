@@ -19,7 +19,9 @@ _SAFE_CHANNEL = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
 def can_lock_path(channel: str) -> Path:
-    lock_root = Path(os.environ.get("REACHAQ_CAN_LOCK_DIRECTORY", "/tmp"))
+    lock_root = Path(
+        os.environ.get("REACHAQ_CAN_LOCK_DIRECTORY", "/run/lock/reachaq")
+    )
     safe_channel = _SAFE_CHANNEL.sub("_", channel).strip("._") or "default"
     return lock_root / f"reachaq-can-{safe_channel}.lock"
 
@@ -55,7 +57,13 @@ class CanChannelOwnership:
             flags |= os.O_CLOEXEC
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
-        fd = os.open(self.path, flags, 0o666)
+        try:
+            fd = os.open(self.path, flags, 0o660)
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"CAN lock directory is missing: {self.path.parent}; reinstall "
+                "the reachaq-can tmpfiles configuration"
+            ) from exc
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
@@ -83,4 +91,3 @@ class CanChannelOwnership:
 
     def __exit__(self, *_exc_info) -> None:
         self.release()
-

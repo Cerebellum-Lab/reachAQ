@@ -44,6 +44,9 @@ Only one reachAQ process may own a physical channel. The application holds an
 advisory lock for the lifetime of the device socket. A second instance reports
 the channel as already owned and cannot send commands. The recovery helper
 uses the same lock and refuses to reset a channel acquired by another process.
+The lock is stored under `/run/lock/reachaq`, not `/tmp`: Ubuntu's
+`fs.protected_regular` policy intentionally prevents a root helper from opening
+a user-owned regular file in sticky `/tmp` for writing.
 
 ## 1. Verify the kernel driver and adapter
 
@@ -152,6 +155,10 @@ sudo install -m 0644 \
 sudo install -m 0644 \
   tools/hardware/reachaq-can.service \
   /etc/systemd/system/reachaq-can.service
+sudo install -m 0644 \
+  tools/hardware/reachaq-can.tmpfiles \
+  /etc/tmpfiles.d/reachaq-can.conf
+sudo systemd-tmpfiles --create /etc/tmpfiles.d/reachaq-can.conf
 sudo systemctl daemon-reload
 sudo systemctl enable --now reachaq-can.service
 ```
@@ -202,11 +209,19 @@ stat -c '%U:%G %a %n' \
   /usr/local/sbin/reachaq-reset-can \
   /etc/default/reachaq-can \
   /etc/systemd/system/reachaq-can.service \
+  /etc/tmpfiles.d/reachaq-can.conf \
   /etc/sudoers.d/reachaq-can-reset
 ```
 
 Expected modes are `755` for the three helpers, `644` for the defaults and
-unit, and `440` for the sudoers rule. All should be owned by `root:root`.
+unit/tmpfiles configuration, and `440` for the sudoers rule. All should be
+owned by `root:root`. Also verify the runtime directory:
+
+```bash
+stat -c '%U:%G %a %n' /run/lock/reachaq
+```
+
+It must report `root:reachaq 2770`.
 
 Edit `/etc/default/reachaq-can` when a rig uses a different interface,
 bitrate, driver, or CAN-FD setting. Do not configure the same interfaces through
@@ -294,9 +309,12 @@ sudo install -m 0755 tools/hardware/reachaq-reset-can.sh \
   /usr/local/sbin/reachaq-reset-can
 sudo install -m 0644 tools/hardware/reachaq-can.service \
   /etc/systemd/system/reachaq-can.service
+sudo install -m 0644 tools/hardware/reachaq-can.tmpfiles \
+  /etc/tmpfiles.d/reachaq-can.conf
 sudo install -m 0440 tools/hardware/reachaq-can-reset.sudoers \
   /etc/sudoers.d/reachaq-can-reset
 sudo visudo -cf /etc/sudoers.d/reachaq-can-reset
+sudo systemd-tmpfiles --create /etc/tmpfiles.d/reachaq-can.conf
 sudo systemctl daemon-reload
 sudo systemctl restart reachaq-can.service
 ```
@@ -412,6 +430,7 @@ out-of-tree PCAN driver and `/dev/pcan*` exists.
 | Interface `STOPPED` | Bitrate, termination, wiring, and bus-off logs |
 | `active (exited)` service | Expected healthy oneshot-service state |
 | CAN recovery says `sudo: a password is required` | Log out/in so the `reachaq` group is active; verify `sudo -n -l` |
+| CAN recovery reports `/tmp/reachaq-can-*.lock: Permission denied` | Reinstall the current helper, service, and tmpfiles configuration; restart reachAQ so both processes use `/run/lock/reachaq` |
 | Channel already owned | Close the other reachAQ/validator process; do not bypass the ownership lock |
 | Reset suppressed | Expected within the 15-second debounce window or while another process owns the channel |
 | RX `dropped` rises | Save before/after interface statistics, one-minute reader throughput, CPU load, and effective receive-buffer log |

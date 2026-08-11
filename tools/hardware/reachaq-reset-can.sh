@@ -26,12 +26,19 @@ fi
 # The ownership lock is also held by reachAQ while its device socket is open.
 # Refuse to reset a channel that another application acquired after the failed
 # owner closed; resetting it would disrupt a healthy process.
-ownership_lock="/tmp/reachaq-can-${channel}.lock"
-reset_lock="/run/lock/reachaq-can-reset-${channel}.lock"
+lock_root="/run/lock/reachaq"
+ownership_lock="${lock_root}/reachaq-can-${channel}.lock"
+reset_lock="${lock_root}/reachaq-can-reset-${channel}.lock"
 reset_stamp="/run/reachaq-can-reset-${channel}.stamp"
 debounce_seconds=15
 
+if [[ ! -d "$lock_root" ]]; then
+  echo "CAN reset refused: lock directory is missing: $lock_root" >&2
+  exit 5
+fi
 touch "$ownership_lock"
+chown root:reachaq "$ownership_lock"
+chmod 0660 "$ownership_lock"
 exec 9<>"$ownership_lock"
 if ! /usr/bin/flock --exclusive --nonblock 9; then
   echo "CAN reset refused: channel $channel is owned by another process." >&2

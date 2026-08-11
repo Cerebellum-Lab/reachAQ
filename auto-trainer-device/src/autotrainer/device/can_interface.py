@@ -233,6 +233,12 @@ _pellet_servo_2_motor = {
     MotorInstance.PELLET_LOAD_SERVO_ID: Motor.PELLET_LOAD_SERVO,
 }
 
+# Current pellet-board firmware still broadcasts status for servo channel 2,
+# which formerly drove the tunnel gate.  The pellet-only runtime deliberately
+# does not expose that retired motor, so discard its status without treating it
+# as an unexpected protocol value.
+_retired_pellet_servo_ids = frozenset({2})
+
 _pellet_stepper_2_motor = {
     MotorInstance.PELLET_X_MOTOR_ID: Motor.PELLET_X_MOTOR,
     MotorInstance.PELLET_Y_MOTOR_ID: Motor.PELLET_Y_MOTOR,
@@ -272,7 +278,12 @@ def _id_to_motor(target: Target, isa_servo: bool, motor_id: int) -> Motor:
     else:
         motor = _pellet_stepper_2_motor.get(motor_id, motor)
 
-    if motor == Motor.NONE:
+    is_retired_pellet_servo = (
+        target == Target.PELLET_DEVICE
+        and isa_servo
+        and motor_id in _retired_pellet_servo_ids
+    )
+    if motor == Motor.NONE and not is_retired_pellet_servo:
         logger.warning("Unknown motor id for target: target=%s isa_servo=%s motor_id=%s",
                        target, isa_servo, motor_id)
     return motor
