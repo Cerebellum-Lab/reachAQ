@@ -325,7 +325,11 @@ def test_can_interface_does_not_query_configuration_without_board_address(monkey
     monkeypatch.setattr(interface, "_query_configuration", lambda: query_called.append(True))
     monkeypatch.setattr(can_interface, "get_perf_now", lambda: 0.0)
     clock = iter((0.0, 2.0))
-    monkeypatch.setattr(can_interface.time, "perf_counter", lambda: next(clock))
+    monkeypatch.setattr(
+        can_interface,
+        "time",
+        types.SimpleNamespace(perf_counter=lambda: next(clock)),
+    )
 
     assert interface.open() is False
     assert interface._jc.close_called is True
