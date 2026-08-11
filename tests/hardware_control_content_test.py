@@ -182,3 +182,33 @@ def test_position_spinboxes_accept_typed_values(
         content.close()
         content.deleteLater()
         qapp.processEvents()
+
+
+def test_pending_command_and_connection_share_one_availability_rule(
+    qapp,
+    app_model,
+):
+    hardware = app_model.hardware
+    content = HardwareControlContent(app_model)
+    try:
+        content._capture_active = True
+        hardware._pellet_version = "test"
+        hardware._pending_tokens.clear()
+
+        content._refresh_enabled_state()
+        assert content.isEnabled()
+        assert content._x_set_button.isEnabled()
+
+        hardware._pending_tokens["operation"] = ("moving", 0.0)
+        content._refresh_enabled_state()
+        assert content.isEnabled()
+        assert not content._x_set_button.isEnabled()
+
+        hardware._pellet_version = ""
+        content._refresh_enabled_state()
+        assert not content.isEnabled()
+    finally:
+        hardware._pending_tokens.clear()
+        hardware._pellet_version = ""
+        content.deleteLater()
+        qapp.processEvents()

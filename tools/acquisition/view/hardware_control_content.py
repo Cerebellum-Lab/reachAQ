@@ -84,6 +84,7 @@ class HardwareControlContent(ContentWidget):
 
         self._app_model = app_model
         self._hardware_model = app_model.hardware
+        self._capture_active = app_model.status != AppModelStatus.IDLE
 
         self._commands_widgets = []
         add_cmd_widget = self._commands_widgets.append
@@ -264,7 +265,8 @@ class HardwareControlContent(ContentWidget):
 
     @invoke_method
     def set_is_capture_active(self, is_active: bool):
-        pass
+        self._capture_active = bool(is_active)
+        self._refresh_enabled_state()
 
     @invoke_method
     def set_selected_animal(self, animal: Optional[AnimalSubject]):
@@ -339,11 +341,19 @@ class HardwareControlContent(ContentWidget):
         for widget in self._commands_widgets:
             widget.setEnabled(enabled)
 
+    def _refresh_enabled_state(self) -> None:
+        panel_enabled = self._capture_active and bool(self._hardware_model.pellet_version)
+        self.setEnabled(panel_enabled)
+        self.set_commands_enabled(
+            panel_enabled and not self._hardware_model.pending_tokens
+        )
+
     @invoke_method
     def _on_app_model_property_changed(self, name, value, _):
         app_model = self._app_model
         if name == app_model.Props.STATUS:
-            self.setEnabled(value != AppModelStatus.IDLE)
+            self._capture_active = value != AppModelStatus.IDLE
+            self._refresh_enabled_state()
 
     @invoke_method
     def _on_hardware_model_property_changed(self, property_name: str, value, _):
@@ -351,11 +361,10 @@ class HardwareControlContent(ContentWidget):
             self._update_title(value)
             if value:
                 self._pellet_version.setText(value.replace("emulator", "").strip())
-                self.setEnabled(True)
             else:
                 self._pellet_version.setText("(unknown version)")
-                self.setEnabled(False)
                 self.command_changed.emit("None")
+            self._refresh_enabled_state()
             self._update_motor_feedback()
 
         elif property_name in {
@@ -370,10 +379,9 @@ class HardwareControlContent(ContentWidget):
         elif property_name == HardwareModel.PENDING_COMMAND_PROPERTY:
             if value is not None:
                 self.command_changed.emit(value)
-                self.set_commands_enabled(False)
             else:
                 self.command_changed.emit("None")
-                self.set_commands_enabled(True)
+            self._refresh_enabled_state()
 
     @invoke_method
     def _on_algo_property_changed(self, name, value, _):

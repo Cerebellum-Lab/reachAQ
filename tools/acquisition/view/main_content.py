@@ -525,7 +525,7 @@ class MainContent(ContentWidget):
         if self._is_camera_settings_editable != is_editable:
             self._is_camera_settings_editable = is_editable
             self._rebuild_reach_camera_grid()
-        for widget in self._content_widgets:
+        for _camera, widget in self._reach_camera_contents:
             widget.set_is_editable(is_editable)
 
     @invoke_method
