@@ -11,20 +11,17 @@ fixes. Repeat the applicable tests below against the current commit.
 
 ## Plan-conformance audit
 
-The implementation was audited requirement-by-requirement at commit
-`1bd0d8efcfc5b3c9db74cd6145ae7e0231927d20`. This separates software that is
-implemented and covered by automated tests from runtime integration that still
-needs implementation and from behavior that can only be accepted on a physical
-rig.
+The implementation was re-audited requirement-by-requirement through commit
+`f8603d76`. This separates software implemented and covered by automated tests
+from behavior that still requires physical-rig acceptance.
 
 Completed automated checks:
 
-- [x] Full repository suite: `600 passed, 35 skipped, 1 xpassed`.
+- [x] Full repository suite after final decomposition: `629 passed, 35 skipped,
+      1 xpassed` (2 expected no-stereo-parameters warnings).
 - [x] No production imports reference the removed load-cell, SensorAnalysis,
       webcam/top-camera, head-fix, tunnel, magnet, alarm, or emergency runtime
-      implementations, and no recording-scoped trial events are emitted. The
-      external API's required empty compatibility fields are called out below
-      as unfinished API migration work.
+      implementations, and no recording-scoped trial events are emitted.
 - [x] Session recording, canonical boundaries, auxiliary stream persistence,
       source manifests, NI sample timelines, camera/NI correlations, decoded CAN
       persistence, subsystem states, stop arbitration, trial-ledger primitives,
@@ -38,53 +35,37 @@ Completed automated checks:
 - [x] `temp/` and every file below it are ignored and untracked. The two planning
       files removed from Git tracking are retained as ignored working copies.
 
-Implementation gaps found by this audit (not hardware-test failures):
+Resolved implementation gaps:
 
-- [ ] Connect runtime motor, command, CAN transport, and acknowledgement failure
-      callbacks to `PelletTrialLedger.finalize_hardware_error`. The ledger model
-      excludes these errors correctly, but current production call sites do not
-      invoke that path.
-- [ ] Connect behavioral retry decisions to `PelletTrialLedger.finalize(...,
-      retry=True)` so `1.1`, `1.2`, and later attempt labels occur in a real
-      session. Retry and assignment policies currently have unit-model coverage
-      but not complete runtime integration.
-- [ ] Associate post-session reach analysis with individual pellet-attempt
-      capture windows and call `finalize_pending` exactly once per attempt.
-      Runtime attempts currently remain `pending_analysis` in the persisted
-      ledger because aggregate session results cannot safely be assigned to a
-      particular attempt without this association.
-- [ ] Resolve **Scored trials** as an automatic-stop basis. A scored count is not
-      available until the preceding per-attempt analysis work exists, so this
-      selection cannot currently stop an active recording as its UI wording
-      implies. Either provide a reliable in-session outcome or reject/disable
-      this basis for automatic stopping.
-- [ ] Extend each persisted trial attempt with the approved pellet position,
-      planned/applied shifts, protocol/phase context, reach/success/consumption
-      outcome, and tone/laser command/feedback references. Current records cover
-      IDs, send/acknowledgement/capture timestamps, retry policy, outcome/error,
-      and finalization state, but not the complete approved schema.
-- [ ] Make the four displayed session counts projections of authoritative
-      recorded reach/trial results, or define and test one reconciliation step.
-      They are session-scoped and reset correctly, but some are still maintained
-      as independent behavior counters and can theoretically diverge from the
-      trial ledger or post-session results.
-- [ ] Complete the public API lifecycle migration: publish explicit session and
-      pellet-trial lifecycle states/events and remove the derived empty
-      alarm/tunnel/magnet compatibility fields after updating the external
-      `auto-trainer-api` dependency. ReachAQ no longer emits the old
-      recording-as-trial events, but the installed API schema does not yet offer
-      their complete replacements.
-- [ ] Finish the proposed controller split. `SessionDataRecorder`,
-      `SessionStopPolicy`, `PelletTrialLedger`, `TrialProtocolRunner`, subsystem
-      status, retained reach analysis, pellet misplacement, and watchdog logic
-      are separated, but `AppModel`/`BehaviorAlgorithm` still own duties intended
-      for dedicated acquisition, recording-session, pellet-cycle, pellet
-      automation, presence, shift, and coordinate controllers.
+- [x] Production motor, command-dispatch, CAN-transport, and acknowledgement
+      failures reach `PelletCycleController.finalize_hardware_failure`, map to
+      the matching typed hardware error, close the public lifecycle, cancel the
+      active protocol trial, and preserve the logical number for retry.
+- [x] Behavioral retry numbering is finalized from the only authoritative
+      behavioral result: per-attempt post-session analysis. Real persisted
+      sessions are deterministically reindexed as `1.1`, `1.2`, and so on under
+      **Retry within the same trial**; retry policy and settings policy are
+      recorded. Hardware retries are indexed immediately.
+- [x] Post-session reach events are mapped by frame rate and canonical recording
+      start into non-overlapping attempt performance-time windows. Every pending
+      attempt is finalized exactly once or explicitly marked incomplete.
+- [x] **Scored trials** is disabled in the Preferences selector and rejected by
+      recording readiness because scores do not exist until after Stop. Saved
+      analysis still reports scored counts.
+- [x] Trial records include pellet position, planned/applied shifts,
+      protocol/phase context, per-trial reaches/success/consumption, event
+      indices, and tone/laser references in addition to lifecycle/error fields.
+- [x] Reaches, Presented, Success, and Consumed are projected together from the
+      reconciled ledger summary. Record/Abort reset behavior is retained.
+- [x] `auto-trainer-api` is pinned to 0.11.0; exact-once session and pellet-trial
+      lifecycle events are published, and the ReachAQ status/animal schemas
+      contain no alarm, emergency, tunnel, head-fix, or magnet placeholders.
+- [x] Acquisition, recording-session, pellet-cycle, pellet automation,
+      protocol, presence, shift recommendation, coordinate validation, pellet
+      misplacement, and watchdog responsibilities now have explicit owners.
 
-The unchecked implementation items above must be completed and covered by
-automated integration tests before the cleanup/session-trial migration plan can
-be called fully implemented. The remaining checklist then provides physical-rig
-acceptance.
+The remaining unchecked items below are physical-rig acceptance, not known
+software implementation gaps.
 
 ## Test record
 
@@ -125,6 +106,10 @@ acceptance.
     tests/session_data_recorder_test.py \
     tests/signal_stream_ui_test.py \
     tests/subsystem_status_test.py \
+    tests/acquisition_controller_test.py \
+    tests/recording_session_controller_test.py \
+    tests/coordinate_model_test.py \
+    tests/session_api_publisher_test.py \
     tests/test_app_model.py
   ```
 
@@ -295,10 +280,9 @@ acceptance.
       active attempt with the matching hardware-error kind, preserves the
       decoded device event, and permits a later successful retry without
       consuming a logical trial number.
-- [ ] Cause a behavioral retry through the normal runtime state machine under
-      each retry-settings policy. Confirm the retry uses the intended logical
-      trial/attempt label and that settings are reused or resampled exactly as
-      configured.
+- [ ] Record multiple attempts including analyzed behavioral failures under each
+      assignment/settings policy. After Stop, confirm the reconciled persisted
+      labels and recorded reuse/resample choice are exactly as configured.
 - [ ] With a selected protocol, confirm each qualifying pellet trial advances
       progress once and a recording boundary does not increment progress.
 - [ ] Confirm manual pellet control remains available with no protocol selected,
@@ -334,9 +318,10 @@ acceptance.
 - [ ] Confirm external clients receive explicit acquisition, recording-session,
       pellet-trial, protocol, calibration, synchronization-readiness, and
       subsystem states without interpreting a recording session as a trial.
-- [ ] Confirm session start/capture-end/end and pellet-trial
-      start/presentation/outcome/end events are each emitted once with stable
-      IDs and canonical timestamps.
+- [ ] Confirm session start/end and pellet-trial start/capture-end/outcome-end
+      events are each emitted once with stable IDs and canonical timestamps;
+      presentation acknowledgement must appear in the trial ledger and decoded
+      device stream.
 - [ ] Confirm the current public status/API schema contains no retired
       alarm/emergency/tunnel/head-fix/magnet fields or placeholder values after
       the API dependency migration.

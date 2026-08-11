@@ -34,6 +34,10 @@ NI-DAQ synchronization, and degraded hardware operation.
   rejection so old callbacks cannot revive failed or aborted state.
 - Preserved live inference computation and frame-queue behavior while making
   its startup and failure state explicit.
+- Added explicit acquisition, recording-session, pellet-cycle, pellet
+  automation, presence, shift-recommendation, and coordinate-validation
+  controllers while retaining the proven camera writer, inference, pellet
+  state-machine, calibration, and transform implementations.
 
 ## Acquisition and recording are separate
 
@@ -259,12 +263,38 @@ reason, while `recordingDurationSeconds` and
 Non-finite values are normalized to JSON/YAML null; finalized metadata is never
 written with non-standard `NaN` tokens.
 
-The retained `auto-trainer-api` 0.9.22 status object still requires empty alarm
-and tunnel-shaped fields and a legacy training-mode value. ReachAQ fills those
-fields only as compatibility placeholders; they do not correspond to runtime
-subsystems. Old recording-scoped API events with `trial...` names are no longer
-emitted because a recording is a session, not a pellet trial. Session metadata,
-analysis outputs, and the pellet-trial ledger are the authoritative replacements.
+The pinned `auto-trainer-api` 0.11.0 lifecycle supports explicit session and
+pellet-attempt events. ReachAQ's status schema contains no alarm, emergency,
+tunnel, head-fix, or magnet placeholders. Session events identify the continuous
+recording boundary; trial events identify pellet attempts, never recordings.
+Session metadata, analysis outputs, and the pellet-trial ledger remain the
+authoritative persisted records.
+
+## Controller ownership
+
+The acquisition application uses explicit responsibility boundaries:
+
+- `AcquisitionController` owns acquisition start/stop flags, independent
+  subsystem states, blockers, retries, and derived reach-synchronization
+  readiness.
+- `RecordingSessionController` owns Ready/Arming/Recording/Stopping/Analyzing/
+  Aborting state, canonical boundary, writer completeness, enabled-source
+  results, and analysis timing.
+- `PelletCycleController` owns the session ledger, send/acknowledgement/error
+  mutation paths, attempt closure, analysis reconciliation, protocol outcomes,
+  lifecycle publication, persistence updates, and the authoritative count
+  projection.
+- `PelletAutomationController` owns the established load/send/retract/cover/
+  release state machine; `TrialProtocolRunner` owns protocol progress.
+- `PelletPresenceTracker`, `ShiftRecommendationController`, and
+  `CoordinateModel` own presence history, shift recommendation/application
+  state, and live diamond-coordinate validation respectively.
+- `PelletMisplacedDetector`, `WatchdogMonitor`, and core diamond/triangle
+  calibration/transform objects retain their existing focused ownership.
+
+`AppModel` routes UI, process, hardware, and analysis events between these
+owners. It does not implement camera acquisition, video encoding, inference
+calculation, or the mutable state owned by those controllers.
 
 Camera/NI matching uses the nearest `cam_frames` transition within half the
 observed frame period and records whether it was rising or falling. The current

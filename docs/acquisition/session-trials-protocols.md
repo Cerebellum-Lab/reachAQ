@@ -75,12 +75,17 @@ The trial-limit count basis is independently configurable:
 | Trials started | `started` |
 | Pellets presented | `presented` |
 | Trials completed | `completed` |
-| Scored trials | `scored` |
+| Scored trials (post-session analysis only) | `scored` |
 
 Configured behavioral outcomes may be included or excluded from completed and
 scored counts through the plain-language **Counted outcomes** checkboxes in
 Preferences. Hardware errors cannot be included. Counts are derived from the
 ledger rather than maintained as a second independent source of truth.
+
+**Scored trials** is disabled as an active-session automatic-stop basis. ReachAQ
+does not claim a scored result until post-session analysis has assigned reach
+events to an attempt window, so using it to stop the recording would be
+misleading. A saved ledger still reports its scored count after analysis.
 
 ## Trial persistence
 
@@ -96,11 +101,22 @@ sessionNNN/
 Each JSON Lines record includes session ID, operation ID, logical trial ID,
 attempt ID and display label, send request timestamps, acknowledgement
 timestamps, capture/finalization timestamps, outcome, hardware-error kind,
-error text, retry settings, and whether the logical trial completed.
+error text, retry settings, whether the logical trial completed, pellet
+position, planned/applied shift, protocol/phase context, per-attempt
+reach/success/consumption counts and reach-event indices, and associated
+tone/laser references.
 `trial_summary.json` contains physical-attempt, hardware-error, incomplete,
 pending-analysis, started, presented, completed, scored, and configured-basis
 counts. Both files use the same canonical performance/wall timebase as the
 other session streams and appear in `alignment.json`'s enabled-source manifest.
+
+During recording, attempts close as `pending_analysis` because a behavioral
+outcome is not yet trustworthy. After Stop, analysis maps frame-indexed events
+to the non-overlapping performance-time window of each attempt, finalizes every
+pending attempt exactly once, deterministically applies the configured retry
+numbering (`1.1`, `1.2`, and so on), and atomically replaces both ledger files.
+An attempt left without an analysis result is finalized as explicit incomplete,
+never silently retained as pending.
 
 The decoded device ledger at `streams/device.csv` remains separate and records
 general inbound/outbound pellet-board traffic. The trial ledger consumes the
@@ -122,9 +138,9 @@ progress. Automatic advance/fallback occurs only when enabled. Reaching the
 terminal phase marks the protocol complete and may request a graceful session
 stop if **Stop when protocol finishes** is enabled.
 
-The external package still imports an empty `TunnelHardwareProtocol` type and
-expects a tunnel argument during attachment. ReachAQ passes `None`; this is an
-isolated dependency-compatibility boundary and no tunnel runtime is created.
+The retained training package still accepts a nullable tunnel collaborator at
+its generic attachment boundary. ReachAQ passes `None`; no tunnel runtime or
+tunnel status is created.
 
 ## Automatic session stop
 
@@ -225,18 +241,22 @@ clear version error. V5 persists only identity, pellet coordinate space and
 position, selected protocol and trial-based progress, and retained target
 limits. Day/total counts and auto-clamp/magnet history are absent.
 
-## Retained API compatibility
+## Public API lifecycle
 
-Animal identity, pellet coordinates, selected protocol, and reach status remain
-available through the existing API concepts. The pinned external
-`auto-trainer-api` 0.9.22 schema still requires legacy `training_mode`, alarm,
-tunnel, and magnet-shaped status fields. ReachAQ reports derived/empty/NaN
-placeholders only to satisfy that constructor; it has no corresponding runtime.
+ReachAQ pins `auto-trainer-api` 0.11.0 and publishes its own status schema with
+acquisition state, recording-session state, reach synchronization readiness,
+independent subsystem states, animal identity/pellet coordinates, protocol
+state, pellet-device state, and the four session counts. Retired alarm,
+emergency, tunnel, head-fix, and magnet-shaped status placeholders are absent.
 
-Emergency commands are unhandled. ReachAQ no longer emits the old
-recording-scoped `trialStarted`, `trialCaptureEnded`, `trialEnded`,
-`trialReachEvents`, `trialPelletPresented`, `trialPelletSeen`,
-`trialRightHandSeen`, or `trialAnimalSeen` events. API clients must use
-recording state/session metadata and analysis outputs for session
-lifecycle/results, and the persisted trial ledger for pellet-trial accounting,
-until a new session-aware API schema replaces 0.9.22.
+`sessionStarted`/`sessionEnded` describe the continuous Record-to-Stop boundary.
+`trialStarted`, `trialCaptureEnded`, and `trialEnded` now describe one pellet
+attempt and carry stable session, trial, attempt, and operation IDs. Publication
+is exactly once per lifecycle edge. Abort balances any opened lifecycle for
+diagnostics, marks the session aborted, cancels analysis, and does not retain
+session data. The former recording-as-trial result/presence events are not
+published.
+
+The retained `trainingModeChanged` event is a protocol-selection projection
+(manual, manual with protocol, or automatic protocol advance), not a global
+hardware mode and not a placeholder for removed trainer hardware.
