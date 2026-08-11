@@ -37,6 +37,7 @@ class CanTransportConfiguration:
     data_bitrate: Optional[int] = None
     fd: bool = False
     receive_timeout_seconds: float = 0.0
+    receive_buffer_bytes: int = 4 * 1024 * 1024
 
     def __post_init__(self):
         object.__setattr__(self, "kind", normalize_can_transport_kind(self.kind))
@@ -48,6 +49,8 @@ class CanTransportConfiguration:
             raise ValueError("data_bitrate requires CAN FD to be enabled")
         if self.receive_timeout_seconds < 0:
             raise ValueError("receive_timeout_seconds must be non-negative")
+        if self.receive_buffer_bytes <= 0:
+            raise ValueError("receive_buffer_bytes must be positive")
 
     @classmethod
     def from_mapping(cls, content: Mapping[str, Any]) -> "CanTransportConfiguration":
@@ -73,6 +76,7 @@ class CanTransportConfiguration:
             ("DATA_BITRATE", "data_bitrate"),
             ("FD", "fd"),
             ("RECEIVE_TIMEOUT_SECONDS", "receive_timeout_seconds"),
+            ("RECEIVE_BUFFER_BYTES", "receive_buffer_bytes"),
         ):
             value = env.get(f"{prefix}{env_name}")
             if value is not None:
@@ -95,7 +99,7 @@ class CanTransportConfiguration:
 
 
 def _parse_environment_value(name: str, value: str) -> Any:
-    if name in {"bitrate", "data_bitrate"}:
+    if name in {"bitrate", "data_bitrate", "receive_buffer_bytes"}:
         return int(value)
     if name == "receive_timeout_seconds":
         return float(value)

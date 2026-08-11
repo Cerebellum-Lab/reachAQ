@@ -4,6 +4,7 @@ import dataclasses
 import enum
 import errno
 import logging
+import socket
 import struct
 import time
 from pathlib import Path
@@ -608,6 +609,39 @@ class SocketCanJerryCAN:
     def __init__(self, configuration: CanTransportConfiguration):
         self.configuration = configuration
         self._bus = None
+        self._receive_buffer_bytes: Optional[int] = None
+        self._received_frames = 0
+        self._received_since_log = 0
+        self._receive_log_started = time.perf_counter()
+        self._next_receive_log = self._receive_log_started + 60
+
+    @property
+    def receive_statistics(self):
+        return {
+            "received_frames": self._received_frames,
+            "receive_buffer_bytes": self._receive_buffer_bytes,
+        }
+
+    def _configure_receive_buffer(self) -> None:
+        raw_socket = getattr(self._bus, "socket", None) or getattr(self._bus, "_socket", None)
+        if raw_socket is None or not hasattr(raw_socket, "setsockopt"):
+            logger.debug("CAN backend does not expose its raw socket; SO_RCVBUF unchanged")
+            return
+        requested = self.configuration.receive_buffer_bytes
+        try:
+            raw_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, requested)
+            self._receive_buffer_bytes = raw_socket.getsockopt(
+                socket.SOL_SOCKET,
+                socket.SO_RCVBUF,
+            )
+        except OSError as exc:
+            logger.warning("Could not set CAN socket receive buffer to %s bytes: %s", requested, exc)
+            return
+        logger.info(
+            "CAN socket receive buffer configured: requested=%s effective=%s",
+            requested,
+            self._receive_buffer_bytes,
+        )
 
     def Open(self) -> int:
         try:
@@ -666,6 +700,7 @@ class SocketCanJerryCAN:
                 self.configuration.channel,
             )
             return -errno.EIO
+        self._configure_receive_buffer()
         return 0
 
     def Close(self) -> int:
@@ -766,10 +801,24 @@ class SocketCanJerryCAN:
                         )
                     else:
                         messages.append(decoded)
+                        self._received_frames += 1
+                        self._received_since_log += 1
                         if 0 < max_count <= len(messages):
                             break
             if collect_ms == 0 or time.perf_counter() > end:
                 break
+        now = time.perf_counter()
+        if now >= self._next_receive_log:
+            elapsed = max(now - self._receive_log_started, 1e-9)
+            logger.info(
+                "CAN reader throughput: frames=%s rate=%.1f frames/s receive_buffer=%s",
+                self._received_since_log,
+                self._received_since_log / elapsed,
+                self._receive_buffer_bytes,
+            )
+            self._received_since_log = 0
+            self._receive_log_started = now
+            self._next_receive_log = now + 60
         return messages
 
     def Heartbeat(self) -> int:

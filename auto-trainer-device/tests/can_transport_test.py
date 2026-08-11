@@ -61,6 +61,7 @@ def test_can_transport_configuration_reads_environment(monkeypatch):
     monkeypatch.setenv("AUTOTRAINER_CAN_BITRATE", "500000")
     monkeypatch.setenv("AUTOTRAINER_CAN_DATA_BITRATE", "2000000")
     monkeypatch.setenv("AUTOTRAINER_CAN_FD", "true")
+    monkeypatch.setenv("AUTOTRAINER_CAN_RECEIVE_BUFFER_BYTES", "8388608")
 
     config = CanTransportConfiguration.from_environment()
 
@@ -69,6 +70,7 @@ def test_can_transport_configuration_reads_environment(monkeypatch):
     assert config.bitrate == 500000
     assert config.data_bitrate == 2000000
     assert config.fd is True
+    assert config.receive_buffer_bytes == 8388608
 
 
 def test_can_transport_configuration_defaults_linux_x86_to_socketcan_fd(monkeypatch):

@@ -1,4 +1,5 @@
 import errno
+import socket
 import sys
 import types
 from unittest import mock
@@ -41,6 +42,18 @@ class FakeBus:
 
     def shutdown(self):
         self.shutdown_called = True
+
+
+class FakeSocket:
+    def __init__(self):
+        self.options = {}
+
+    def setsockopt(self, level, option, value):
+        self.options[(level, option)] = value
+
+    def getsockopt(self, level, option):
+        # Linux normally reports a doubled value for SO_RCVBUF.
+        return self.options[(level, option)] * 2
 
 
 def test_close_marks_interface_closed_even_if_backend_close_fails():
@@ -116,6 +129,24 @@ def test_socketcan_open_uses_fd_filters_and_netdev_owned_bit_timing(monkeypatch)
     assert captured["can_filters"]
     assert "bitrate" not in captured
     assert "data_bitrate" not in captured
+
+
+def test_socketcan_open_increases_exposed_socket_receive_buffer(monkeypatch):
+    raw_socket = FakeSocket()
+    bus = FakeBus()
+    bus._socket = raw_socket
+    fake_can = types.SimpleNamespace(Bus=lambda **kwargs: bus)
+    monkeypatch.setitem(sys.modules, "can", fake_can)
+    monkeypatch.setattr(socketcan_jerrycan, "_socketcan_mtu", lambda channel: 72)
+    backend = SocketCanJerryCAN(CanTransportConfiguration(
+        kind="socketcan",
+        fd=True,
+        receive_buffer_bytes=4 * 1024 * 1024,
+    ))
+
+    assert backend.Open() == 0
+    assert raw_socket.options[(socket.SOL_SOCKET, socket.SO_RCVBUF)] == 4 * 1024 * 1024
+    assert backend.receive_statistics["receive_buffer_bytes"] == 8 * 1024 * 1024
 
 
 def test_socketcan_open_rejects_classical_can_mtu(monkeypatch):

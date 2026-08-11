@@ -75,7 +75,10 @@ class DeviceConnection(DeviceConnectionProtocol):
         self._name = name
         self._failure_callback = failure_callback
 
-        self._read_limit: int = 50 if HAVE_CAN_DEVICE else 2000
+        # Drain sizeable bursts on both legacy JerryCAN and SocketCAN. The old
+        # 50-frame cap could leave a busy adapter's kernel queue perpetually
+        # behind even though the reader itself remained alive.
+        self._read_limit: int = 512 if HAVE_CAN_DEVICE else 2000
         self._collect_ms: int = 5  # so freq == 200 Hz
 
         # The means of providing non-blocking access to the device.
