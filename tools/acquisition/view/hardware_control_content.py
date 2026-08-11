@@ -118,7 +118,7 @@ class HardwareControlContent(ContentWidget):
         label = QLabel("<b>Compound Move</b>")
         label.setAlignment(Qt.AlignCenter)
         label.setContentsMargins(0, 0, 0, 4)  # ensure small margin below
-        layout.addWidget(label, 0, 4)
+        layout.addWidget(label, 0, 1)
 
         def set_xyz(coord: str):
             value = getattr(self, f"_{coord}_pos").value()
@@ -174,7 +174,7 @@ class HardwareControlContent(ContentWidget):
         self._motor_set_feedback_label.setAlignment(Qt.AlignmentFlag.AlignLeft)
         sub_layout.addWidget(self._motor_set_feedback_label, row, col, 1, 4)
 
-        layout.addLayout(sub_layout, 1, 2, alignment=Qt.AlignmentFlag.AlignTop)
+        layout.addLayout(sub_layout, 1, 0, alignment=Qt.AlignmentFlag.AlignTop)
 
         self._update_motor_feedback()
 
@@ -218,7 +218,9 @@ class HardwareControlContent(ContentWidget):
         button.clicked.connect(
             lambda: log_hardware_cmd(partial(pellet_machine.cover_pellet, force=True)))
         button_layout.addWidget(button)
-        layout.addLayout(button_layout, 1, 4)
+        layout.addLayout(button_layout, 1, 1, alignment=Qt.AlignmentFlag.AlignTop)
+        layout.setColumnStretch(0, 0)
+        layout.setColumnStretch(1, 0)
 
         # central layout/widget
         widget = QWidget()
