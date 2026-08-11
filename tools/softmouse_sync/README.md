@@ -11,20 +11,34 @@ locally redacted browser Network capture. Do not save a HAR, cookies, CSRF value
 passwords, or private configuration in this repository. A SoftMouse API adapter
 can later replace `SoftMouseHttpsSource` without changing publication or imports.
 
-Store the password in the publisher account's OS keyring:
+Create a private configuration and fill in the HTTP/export values from the
+authorized redacted Network capture:
 
 ```bash
-python -m keyring set reachAQ-softmouse-publisher YOUR_USERNAME
+mkdir -p ~/.config/reachaq
+cp tools/softmouse_sync/config.example.json \
+  ~/.config/reachaq/softmouse-publisher.json
+chmod 600 ~/.config/reachaq/softmouse-publisher.json
 ```
 
-Then run a manual publication:
+Configure the login once. This prompts once for the username and once for the
+password. The username is saved in the private configuration; the password is
+saved only in the publisher account's OS keyring. The command verifies that the
+keyring can return it without displaying it:
 
 ```bash
 python -m tools.softmouse_sync.cli \
   --config ~/.config/reachaq/softmouse-publisher.json \
-  --username YOUR_USERNAME
+  --configure-credentials
+```
+
+All later manual publications need only the config path:
+
+```bash
+python -m tools.softmouse_sync.cli \
+  --config ~/.config/reachaq/softmouse-publisher.json
 ```
 
 The unit templates in `systemd/` provide the midnight schedule after their paths
-and username are configured. The timer is persistent, so a powered-off publisher
-runs once after it next starts.
+are configured. The timer is persistent, so a powered-off publisher runs once
+after it next starts.

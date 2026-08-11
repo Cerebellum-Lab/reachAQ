@@ -1,5 +1,9 @@
 {
   "publicationDirectory": "/mnt/isilon/Data/BR/SoftMouse",
+  "credentials": {
+    "username": "",
+    "keyringService": "reachAQ-softmouse-publisher"
+  },
   "https": {
     "base_url": "https://YOUR-SOFTMOUSE-HOST/",
     "login_path": "login.do",
