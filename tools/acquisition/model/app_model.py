@@ -5171,7 +5171,12 @@ class AppModel(ObservableObject):
                 if attempt is None:
                     return
             if ledger is not None:
-                self._pellet_cycles.sync_behavior_counts(algo)
+                # Behavioral results are not authoritative until post-session
+                # analysis. Update only the acknowledgement-derived value here;
+                # reconciliation projects all four counts together after Stop.
+                algo.pellets_presented = self._pellet_cycles.count(
+                    TrialCountBasis.PRESENTED
+                )
             self._evaluate_automatic_stop_policy(
                 protocol_complete=self._protocol_runner.protocol_complete,
             )

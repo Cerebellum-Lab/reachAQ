@@ -294,6 +294,22 @@ def test_pellet_send_and_ack_create_session_trial_attempt(app_model):
     begin_trial.assert_called_once_with("1.1")
 
 
+def test_pellet_ack_does_not_erase_live_behavior_counts(app_model):
+    algorithm = app_model.behavior.algorithm
+    assert algorithm.start_session(reason="live-count-test")
+    algorithm.pellet_reaches = 3
+    algorithm.successful_reaches = 2
+    algorithm.pellets_consumed = 1
+    app_model._on_pellet_sending(perf_c=10.0, context="send-context")
+
+    app_model._on_pellet_sent(perf_c=10.25, context="send-context")
+
+    assert algorithm.pellets_presented == 1
+    assert algorithm.pellet_reaches == 3
+    assert algorithm.successful_reaches == 2
+    assert algorithm.pellets_consumed == 1
+
+
 def test_mismatched_pellet_ack_does_not_present_or_count_trial(app_model):
     algorithm = app_model.behavior.algorithm
     assert algorithm.start_session(reason="trial-ledger-test")
