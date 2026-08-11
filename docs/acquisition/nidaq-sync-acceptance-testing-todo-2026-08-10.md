@@ -11,21 +11,22 @@ fixes. Repeat the applicable tests below against the current commit.
 
 ## Plan-conformance audit
 
-The implementation was re-audited requirement-by-requirement through commit
-`f8603d76`. This separates software implemented and covered by automated tests
-from behavior that still requires physical-rig acceptance.
+The implementation was re-audited requirement-by-requirement through the UI,
+protocol, and desktop-launcher implementation series ending at `b4daf863`.
+This separates software implemented and covered by automated tests from
+behavior that still requires physical-rig acceptance.
 
 Completed automated checks:
 
-- [x] Full repository suite after final decomposition: `630 passed, 35 skipped,
-      1 xpassed` (2 expected no-stereo-parameters warnings).
+- [x] Full repository suite after the UI/protocol/launcher series: `782 passed,
+      35 skipped, 1 xpassed` (2 expected no-stereo-parameters warnings).
 - [x] No production imports reference the removed load-cell, SensorAnalysis,
       webcam/top-camera, head-fix, tunnel, magnet, alarm, or emergency runtime
       implementations, and no recording-scoped trial events are emitted.
 - [x] Session recording, canonical boundaries, auxiliary stream persistence,
       source manifests, NI sample timelines, camera/NI correlations, decoded CAN
       persistence, subsystem states, stop arbitration, trial-ledger primitives,
-      animal-v5 migration, platform artifact selection, UI controls, and
+      animal-v7 migration, platform artifact selection, UI controls, and
       post-session-analysis cancellation have automated coverage.
 - [x] Live-inference processing remains on the retained implementation; its
       lifecycle fixture/cleanup was repaired without changing the inference
@@ -392,10 +393,12 @@ software implementation gaps.
       `recordToAcquisition`, and old shift `targetX/Y/Z` fields are rejected with
       actionable errors.
 - [ ] Load a copy of a current v4 animal and save it. Confirm the original bytes
-      are retained as `.json.v4-backup`, the active file is v5, identity/pellet
+      are retained as `.json.v4-backup`, the active file is v7, identity/pellet
       coordinates/limits/selected protocol are preserved, and protocol progress
       starts at zero.
-- [ ] Confirm v0-v3, no-ID, and unknown animal versions are rejected and v5
+- [ ] Confirm v5 and v6 inputs preserve their original bytes as matching backup
+      files and migrate to v7 without resetting valid trial-based progress.
+- [ ] Confirm v0-v3, no-ID, and unknown animal versions are rejected and v7
       round-trips without day/total or auto-clamp fields.
 
 ## Abort behavior

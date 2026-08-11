@@ -49,8 +49,10 @@ cycles or start recording.
 The **Trial Protocol** tab presents one row per planned logical pellet trial.
 The initial 15 rows contain placeholder examples for pellet-delivery behavior,
 XYZ shift, cover, tone, and laser choices. These fields define the extensible
-row schema; delivery execution can consume additional row options as those
-behaviors are implemented.
+row schema. They are currently saved and displayed but are not interpreted as
+new pellet-delivery, tone, or laser actions by the existing cycle executor;
+future execution support can consume the persisted schema without changing
+historical attribution.
 
 Only future rows are editable. A row becomes highlighted and read-only while
 its trial is active, then remains read-only once the logical trial completes.

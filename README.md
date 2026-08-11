@@ -36,10 +36,11 @@ Portable host setup is automated by
 [`tools/install/reachaq-linux-install.sh`](tools/install/reachaq-linux-install.sh).
 Vendor drivers and rig-specific hardware configuration remain in separate
 guides selected from the Linux installation map. The portable installer also
-installs and verifies the SoftMouse HTTPS/spreadsheet/keyring dependencies,
-RFID serial dependency and permissions, and the tracked publisher systemd
-units. Credential entry and enabling the one designated nightly timer remain
-explicit post-install steps in the
+installs the terminal-visible mouse-icon desktop launcher, verifies the
+SoftMouse HTTPS/spreadsheet/keyring dependencies and RFID serial dependency and
+permissions, and installs the tracked publisher systemd units. Credential
+entry and enabling the one designated nightly timer remain explicit
+post-install steps in the
 [SoftMouse/RFID checklist](tools/softmouse_sync/CONFIGURATION_GUIDE.md).
 
 ## Applications
@@ -54,10 +55,11 @@ from the core logic of the applications for two reasons:
 * Acquisition Application
   * The local user interface for integrated camera, pellet delivery, NI-DAQ,
     laser, and pose-inference modules
-  * `python -m reachAQ.app -c ~/Autotrainer/system_configuration.yaml`
+  * `conda run --no-capture-output -n reachaq python -m reachAQ.app -c ~/Autotrainer/system_configuration.yaml`
     * The GUI starts idle by default. Use `--start-mode running` only when immediate startup is intentional.
     * Use `--no-live-inference` or `--live-inference` to override the saved inference setting for one run.
     * Hardware startup progress is written to the log and launching terminal as `HARDWARE INIT` records.
+    * The installed `reachAQ.desktop` mouse icon opens the same application in a terminal and prevents duplicate GUI launches.
     * [Detailed Instructions](tools/acquisition/README.md)
     * [Session recording, synchronization, persistence, and hardware isolation](docs/acquisition/session-recording-and-synchronization.md)
     * [Recording sessions, pellet trials, protocols, and schema migration](docs/acquisition/session-trials-protocols.md)

@@ -49,8 +49,12 @@ custom NI-DAQ inputs are recorded when NI-DAQ is enabled; plotting only the
 subset in `displayChannels` does not change persistence.
 
 The same rig-level switches can be changed while idle under **File → Hardware**.
-Each checkable selection takes effect immediately and is saved to the system
-YAML. **RFID Serial Device…** changes the stable reader path from the same menu.
+The multi-selection submenu stays open while checkable entries are changed and
+closes when the operator clicks outside it. Each choice is saved to the system
+YAML immediately; enabling one or more runtime hardware domains schedules one
+hardware refresh after the submenu closes. **RFID Serial Device…** changes the
+stable reader path from the same menu. These controls are unavailable after
+acquisition leaves Idle.
 
 See [Session recording, synchronization, and hardware isolation](../acquisition/session-recording-and-synchronization.md)
 before commissioning Record/Stop/Abort or a multi-device timing topology.
@@ -147,8 +151,9 @@ separate Preferences configuration directory.
 
 ## Desktop launcher
 
-Install or refresh the GNOME desktop launcher without rerunning the complete
-host installer:
+The complete portable installer installs this launcher automatically. Install
+or refresh only the GNOME desktop launcher without rerunning the complete host
+installer with:
 
 ```bash
 tools/install/install-reachaq-desktop.sh
@@ -160,10 +165,24 @@ configured `reachaq` Conda environment and opens a terminal containing live
 logs. A per-user lock rejects accidental duplicate GUI launches. Startup
 failures remain visible until Enter is pressed.
 
+The default installed files are:
+
+```text
+<XDG desktop directory>/reachAQ.desktop
+~/.local/share/applications/reachaq.desktop
+~/.local/share/icons/hicolor/192x192/apps/reachaq.png
+~/.local/bin/reachaq-launcher
+~/.config/reachaq/launcher.conf
+```
+
+The installer replaces an obsolete `ReachAQ-startup` shell fragment in that
+same desktop directory.
 Launcher paths are stored in `~/.config/reachaq/launcher.conf`. Optional
 `AUTOTRAINER_*` and `REACHAQ_*` runtime values can be placed as literal
 `KEY=VALUE` lines in `~/.config/reachaq/runtime.env`; the launcher parses this
-file as data and does not source it as shell code.
+file as data and does not source it as shell code. Re-run the launcher installer
+after moving the repository, changing the Conda environment, or changing the
+system-configuration path.
 
 ## Verification
 

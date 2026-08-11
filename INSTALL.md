@@ -32,7 +32,9 @@ membership for the USB RFID reader. If the installer adds your account to
 installer command so its serial-permission check runs in the new login session.
 The installer also confirms that `autotrainer`, `tools`, and `reachAQ` import
 from the checkout being installed, rather than a removed or older editable
-worktree.
+worktree. It installs a trusted mouse-icon `reachAQ.desktop` entry on the
+desktop and application menu; that launcher opens a terminal for live logs,
+starts reachAQ in Idle, and rejects duplicate GUI launches.
 
 Install the NVIDIA kernel driver first so the automatic TensorFlow GPU preflight
 can pass. See the [NVIDIA/TensorFlow guide](docs/linux-install/nvidia-inference.md)
@@ -59,6 +61,18 @@ buffers stdout/stderr and terminal logs may not appear until the app exits.
 The GUI starts idle by default. Cameras, NI-DAQ, CAN, and live inference do not
 start until the operator selects Running. Use `--start-mode running` only
 when immediate acquisition startup is intentional.
+
+To reinstall or refresh only the desktop launcher after moving the checkout,
+Conda environment, or system configuration, run:
+
+```bash
+./tools/install/install-reachaq-desktop.sh
+```
+
+The launcher records its resolved paths in
+`~/.config/reachaq/launcher.conf`. See the
+[runtime guide](docs/linux-install/runtime-configuration.md#desktop-launcher)
+for its installed files and optional runtime environment file.
 
 For a software-only camera smoke test:
 

@@ -17,10 +17,13 @@ The `--no-capture-output` option is required for live terminal logging when the
 application is launched through Conda.
 
 The GUI starts idle by default, so camera and DAQ configuration remain editable
-until Start is selected. Use `--start-mode running` only when immediate
+until **System Mode** is changed to **Running**. Use `--start-mode running` only when immediate
 startup is intentional. The application window opens maximized by default while
-retaining its normal title bar and restore control. After restoring, it remains
-freely resizable in both width and height—even below child-panel size hints.
+retaining its normal title bar and restore control. Before that maximized show,
+reachAQ restores the last valid normal geometry or seeds a practical centered
+normal size; the first title-bar drag therefore cannot collapse the window to a
+tiny Qt default. After restoring, it remains freely resizable in both width and
+height—even below child-panel size hints.
 Overflowing toolbar actions remain accessible from the toolbar menu, and the
 status-bar corner has a resize grip. The saved live-inference setting can be
 overridden for one run with `--live-inference` or `--no-live-inference`.
@@ -76,9 +79,11 @@ directory so test settings do not overwrite the bench config.
 Rig-level availability for CAN, the pellet controller, NI-DAQ, and the USB RFID
 reader is grouped in the YAML `hardware:` block. The same switches and the RFID
 serial path are editable under **File → Hardware** while acquisition is idle.
-Each menu selection takes effect immediately and persists to the system YAML.
-The Hardware Status panel remains a compact, read-only view of live subsystem
-health.
+The checkable multi-selection submenu stays open while choices are changed and
+closes when the operator clicks outside it. Each choice persists to the system
+YAML immediately; enabling runtime hardware queues one combined refresh after
+the submenu closes. The Hardware Status panel remains a compact, read-only view
+of live subsystem health.
 
 The current production schema is system-configuration version 57. Older and
 newer versions, unknown fields, retired load-cell/tunnel fields, and obsolete
@@ -264,17 +269,30 @@ mkdir -p "$HOME/Documents/rawdatalocal"
 ### Toolbar
 
 * System Mode - select Idle or Running. During transitions it explicitly shows
-  Starting or Stopping acquisition.
-* Notes - set notes for the current acquisition session.
+  Starting or Stopping acquisition. The selector remains available in stable
+  Running/Ready state so the operator can return to Idle; it is locked during
+  recording lifecycle transitions and background hardware discovery.
+* Notes - set notes for the current acquisition session. Stop saves the current
+  value, and edits made after Stop (including during analysis) atomically update
+  that stopped session's JSON/YAML metadata. Starting the next recording
+  finalizes the preceding text and clears the field.
 * Subject - select the linked local animal name. The adjacent RFID label shows
   the most recently scanned raw 15-digit RFID.
   Subject and RFID are session-only: every application launch starts with both
   empty, and creating or linking an animal selects it for the current session.
   Recording is blocked until a subject is scanned or selected so every session
-  receives an immutable animal metadata snapshot.
+  receives an immutable animal metadata snapshot. Subject selection is locked
+  from session Arming through analysis and becomes editable again in Ready.
 * Protocol - select a protocol, or select **Manual pellet control**. Automatic
-  pellet cycles and automatic protocol advance are independent settings.
+  pellet cycles and automatic protocol advance are independent settings. The
+  selector follows the same session lock as Subject.
 * Preferences - configure live inference and other application preferences.
+
+Top-level controls share one lifecycle availability calculation. Camera/DAQ
+editing and **File → Hardware** are Idle-only; hardware refresh is available
+in stable Idle or Running/Ready; calibration requires its own valid hardware and
+coordinate state; conflicting controls are disabled while acquisition starts or
+stops, a recording is active, analysis runs, or discovery/refresh is in flight.
 
 Hardware Status uses one collapsible subpanel per category. Subpanels start
 collapsed and show only the category plus `Enabled` or `Disabled`; green,
@@ -311,6 +329,10 @@ without restarting healthy domains.
 
 ### Menus
 
+* File -> Hardware - enable or disable the CAN adapter, pellet controller,
+  NI-DAQ, or USB RFID reader and edit the stable RFID serial path while Idle.
+  The submenu supports multiple changes without closing after every checkbox;
+  click outside it to close and start any queued hardware refresh.
 * File -> Quit - close the application through its controlled shutdown path.
 * Edit -> Edit Camera Settings - enable or disable editable camera fields while
   idle.
@@ -323,6 +345,29 @@ without restarting healthy domains.
   being rendered inside individual control panels.
 * View -> Debug - development-mode panel shown only when the application is
   launched with development options.
+
+### Hardware Control
+
+Pellet Release Location contains the X/Y/Z editors, their Set buttons, and motor
+feedback directly below the label. The adjacent Compound Move column contains
+Home, Load, Send, Retract, Release, and Cover without spacer columns. These are
+intentional force-override operator commands, but they are still disabled when
+acquisition is Idle, the pellet controller is disconnected, or a command is
+pending; they re-enable after acknowledgement or failure cleanup once the
+controller is available in Running mode.
+
+### Trial Protocol
+
+The **Trial Protocol** tab initially provides 15 ordered placeholder rows. Each
+row stores pellet-delivery behavior, XYZ shift, cover, tone, and laser fields.
+Future rows are editable, the active row is highlighted and locked, and
+completed rows remain locked. A hardware-error retry returns the same logical
+row to Future rather than consuming the next row.
+
+The row is snapshotted into `protocol_context.trial_row` for every attempt and
+the ordered table is saved as session `protocolSchedule` metadata. The new row
+fields are currently persistence/UI placeholders: existing pellet-cycle logic
+does not yet interpret them as new delivery, tone, or laser actions.
 
 ### Camera Control
 
@@ -405,4 +450,4 @@ for the current Linux hardware setup and example config.
 
 See [Recording sessions, pellet trials, protocols, and schema migration](../../docs/acquisition/session-trials-protocols.md)
 for trial numbering, retries, automatic stop behavior, protocol progress, and
-animal v4-to-v5 migration.
+animal v4/v5/v6-to-v7 migration.

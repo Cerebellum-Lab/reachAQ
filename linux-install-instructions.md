@@ -141,6 +141,7 @@ The [runtime guide](docs/linux-install/runtime-configuration.md) covers:
 - configuration and output paths;
 - camera, DAQ, laser, CAN, and inference settings;
 - safe idle GUI and headless launch commands;
+- the terminal-visible desktop launcher installed by the portable installer;
 - software-only random cameras;
 - startup timing logs and troubleshooting.
 
@@ -178,6 +179,8 @@ operator selects Running.
 - [ ] Output directory exists and is writable by the operator.
 - [ ] GUI launches idle and hardware initialization emits `HARDWARE INIT`
   progress records when Running is selected.
+- [ ] The mouse-icon `reachAQ.desktop` entry opens a terminal with live logs,
+  starts reachAQ in Idle, and refuses a duplicate GUI launch.
 - [ ] SoftMouse runtime and systemd-unit checks pass in the installer report.
 - [ ] The acquisition operator belongs to `dialout`; any attached RFID reader
   under `/dev/serial/by-id/` is readable and writable after a fresh login.

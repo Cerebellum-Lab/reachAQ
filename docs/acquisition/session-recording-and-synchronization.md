@@ -64,10 +64,17 @@ The four Behavior counters are session-scoped: Presented, Reaches, Success, and
 Consumed. They reset when Record is pressed, remain visible after Stop and
 analysis, and return to zero after Abort. The previous System state controls and
 day/total pellet counters are not part of the UI or current persistence model.
-Animal v4 JSON is accepted only for a one-way migration to v5. The migration
-preserves identity, pellet coordinates, limits, and selected protocol, archives
-the original file, resets non-convertible recording-based protocol progress,
-and removes day/lifetime count fields.
+Animal v4, v5, and v6 JSON is accepted only for one-way migration to v7. Each
+migration archives the original bytes. V4 migration preserves identity, pellet
+coordinates, limits, and selected protocol, resets non-convertible
+recording-based protocol progress, and removes day/lifetime count fields.
+
+Subject and protocol selection are locked from Arming through analysis, while
+Notes remains editable. Stop writes the current Notes value; later edits update
+the stopped session's JSON/YAML metadata atomically until the next Record clears
+the field. The ordered Trial Protocol table, row locking, and placeholder-field
+scope are defined in
+[Recording sessions, pellet trials, protocols, and schema migration](session-trials-protocols.md).
 
 The load-cell acquisition, tare, configuration, UI, and automatic recording
 triggers have been removed. System configuration v57 rejects obsolete schemas
