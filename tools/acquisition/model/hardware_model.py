@@ -639,8 +639,13 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         if transport.kind != CanTransportKind.SOCKETCAN:
             return
 
+        if os.environ.get("REACHAQ_PROHIBIT_PRIVILEGED_CAN_RESET") == "1" or \
+                "PYTEST_CURRENT_TEST" in os.environ:
+            raise RuntimeError("privileged CAN reset is prohibited under automated tests")
+
         helper = "/usr/local/sbin/reachaq-reset-can"
-        command = [helper] if os.geteuid() == 0 else ["sudo", "-n", helper]
+        helper_args = [helper, transport.channel]
+        command = helper_args if os.geteuid() == 0 else ["sudo", "-n", *helper_args]
         try:
             completed = subprocess.run(
                 command,
@@ -688,7 +693,11 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         )
 
     def safety_shutdown(self, reason: str, *, wait: bool = True) -> None:
-        """Stop hardware once, discard commands, and flush the SocketCAN link."""
+        """Recover after a confirmed CAN-domain failure.
+
+        This is intentionally not the generic application shutdown path: it
+        may restart the shared SocketCAN network interface.
+        """
         with self._safety_shutdown_lock:
             thread = self._safety_shutdown_thread
             if not self._safety_shutdown_started:
@@ -708,7 +717,8 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
                 logger.error("CAN safety shutdown did not finish within 20 seconds")
 
     def disconnect(self):
-        self.safety_shutdown("hardware disconnect")
+        """Close only this application's device worker and CAN socket."""
+        self._disconnect_transport()
 
     def _can_device_property_changed(self, name: str, value, prev_value):
         logger.debug("_device_property_changed: %s : %s -> %s", name, prev_value, value)

@@ -46,12 +46,27 @@ def test_close_marks_interface_closed_even_if_backend_close_fails():
     interface = object.__new__(CanInterface)
     interface._is_open = True
     interface._jc = mock.Mock()
+    interface._channel_ownership = mock.Mock()
     interface._jc.Close.side_effect = RuntimeError("close failed")
 
     with pytest.raises(RuntimeError, match="close failed"):
         interface.close()
 
     assert interface.is_open is False
+    interface._channel_ownership.release.assert_called_once_with()
+
+
+def test_interface_open_releases_channel_when_backend_open_raises():
+    interface = object.__new__(CanInterface)
+    interface._jc = mock.Mock()
+    interface._jc.Open.side_effect = RuntimeError("open failed")
+    interface._channel_ownership = mock.Mock()
+
+    with pytest.raises(RuntimeError, match="open failed"):
+        interface.open()
+
+    interface._channel_ownership.acquire.assert_called_once_with()
+    interface._channel_ownership.release.assert_called_once_with()
 
 
 def _raw_message(

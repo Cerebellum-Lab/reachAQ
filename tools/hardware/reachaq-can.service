@@ -5,6 +5,8 @@ Wants=network-pre.target
 Wants=systemd-udev-settle.service
 After=systemd-udev-settle.service
 Before=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
 
 [Service]
 Type=oneshot

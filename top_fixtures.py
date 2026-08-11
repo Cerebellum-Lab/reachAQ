@@ -53,11 +53,6 @@ fake_perf_now = 0  # used to control time.perf_counter() in BehaviorAlgo/SystemM
 def isolate_host_can(monkeypatch):
     """Never let an automated test control the workstation's SocketCAN link."""
     monkeypatch.setenv("AUTOTRAINER_CAN_TRANSPORT", "emulation")
-    monkeypatch.setattr(
-        HardwareModel,
-        "_reset_socketcan",
-        lambda self, transport: None,
-    )
 
 
 def simulate_get_perf_now():

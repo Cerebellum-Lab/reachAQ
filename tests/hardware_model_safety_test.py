@@ -2,6 +2,8 @@ import threading
 import os
 from unittest import mock
 
+import pytest
+
 from autotrainer.core import SystemCommandKind
 from autotrainer.device import CanTransportConfiguration, CanTransportKind
 from tools.acquisition.model.hardware_model import HardwareModel
@@ -35,7 +37,7 @@ def test_safety_shutdown_is_idempotent_and_disconnects_before_reset():
     hardware._reset_socketcan.assert_called_once_with(mock.sentinel.transport)
 
 
-def test_safety_shutdown_resets_configured_transport_without_active_device(monkeypatch):
+def test_confirmed_can_safety_shutdown_resets_configured_transport_without_active_device(monkeypatch):
     hardware = object.__new__(HardwareModel)
     hardware._safety_shutdown_lock = threading.Lock()
     hardware._safety_shutdown_started = False
@@ -48,10 +50,33 @@ def test_safety_shutdown_resets_configured_transport_without_active_device(monke
         lambda: mock.sentinel.transport,
     )
 
-    hardware.safety_shutdown("application close")
+    hardware.safety_shutdown("confirmed CAN failure")
 
     hardware._disconnect_transport.assert_called_once_with()
     hardware._reset_socketcan.assert_called_once_with(mock.sentinel.transport)
+
+
+def test_ordinary_disconnect_closes_only_owned_transport():
+    hardware = object.__new__(HardwareModel)
+    hardware._disconnect_transport = mock.Mock()
+    hardware._reset_socketcan = mock.Mock()
+
+    hardware.disconnect()
+
+    hardware._disconnect_transport.assert_called_once_with()
+    hardware._reset_socketcan.assert_not_called()
+
+
+def test_privileged_reset_is_prohibited_under_pytest():
+    hardware = object.__new__(HardwareModel)
+    transport = CanTransportConfiguration(
+        kind=CanTransportKind.SOCKETCAN,
+        channel="can0",
+        fd=True,
+    )
+
+    with pytest.raises(RuntimeError, match="prohibited under automated tests"):
+        hardware._reset_socketcan(transport)
 
 
 def test_safety_shutdown_latch_rejects_new_commands():

@@ -16,6 +16,8 @@ from .device_interface import (DeviceInterface, Target, Motor, ServoConfig, Step
 from .emulation_interface import EmulationInterface
 from .can_device import CanDevice, HAVE_CAN_DEVICE
 from .can_failure import CanFailure, CanFailureKind
+from .can_ownership import (CanChannelInUseError, CanChannelOwnership,
+                            can_lock_path)
 from .can_transport import (CanTransportConfiguration, CanTransportKind, CanTransportProtocol,
                             normalize_can_transport_kind)
 from .laser import (LaserCalibrationPoint, LaserCalibrationRamp, LaserChannelConfiguration, LaserChannelId,

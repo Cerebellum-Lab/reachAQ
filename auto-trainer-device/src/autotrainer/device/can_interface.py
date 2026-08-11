@@ -44,6 +44,7 @@ else:
 from autotrainer.core import get_perf_now, Offset3DTuple
 from autotrainer.core.logging import get_verbose_logger
 from .can_transport import CanTransportConfiguration
+from .can_ownership import CanChannelOwnership, CanChannelInUseError
 from .device_interface import (
     DeviceInterface,
     Acknowledge,
@@ -336,6 +337,7 @@ class CanInterface(DeviceInterface):
         super().__init__()
         self._required_targets = tuple(required_targets or (Target.PELLET_DEVICE,))
         self._can_transport = can_transport or CanTransportConfiguration()
+        self._channel_ownership = CanChannelOwnership(self._can_transport.channel)
         if self._can_transport.uses_linux_can_stack:
             self._jerrycan_msg_cls = socketcan_jerrycan.JerryCANMsg
             self._jerrycan_cmd_type = socketcan_jerrycan.JerryCANCmdType
@@ -665,7 +667,17 @@ class CanInterface(DeviceInterface):
         if self._jc is None:
             return False
 
-        self._is_open = self._jc.Open() == 0
+        try:
+            self._channel_ownership.acquire()
+        except CanChannelInUseError as exc:
+            logger.error("%s", exc)
+            return False
+
+        try:
+            self._is_open = self._jc.Open() == 0
+        except BaseException:
+            self._channel_ownership.release()
+            raise
 
         self._read_msgs = self._jc.ReceiveMessages if hasattr(self._jc, "ReceiveMessages") else self._read_by_one_msg
         msg_cls = self._jerrycan_msg_cls
@@ -703,8 +715,19 @@ class CanInterface(DeviceInterface):
             if not self.are_addresses_valid():
                 self._jc.Close()
                 self._is_open = False
+                self._channel_ownership.release()
                 return False
-            self._query_configuration()
+            try:
+                self._query_configuration()
+            except BaseException:
+                try:
+                    self._jc.Close()
+                finally:
+                    self._is_open = False
+                    self._channel_ownership.release()
+                raise
+        else:
+            self._channel_ownership.release()
         return self._is_open
 
     def close(self):
@@ -716,6 +739,7 @@ class CanInterface(DeviceInterface):
                 self._jc.Close()
         finally:
             self._is_open = False
+            self._channel_ownership.release()
 
     def can_read(self) -> bool:
         """

@@ -320,7 +320,7 @@ def test_hardware_start_failure_performs_can_safety_shutdown(
     assert app_model._acquisition.starting is False
 
 
-def test_periodic_command_producers_stop_before_safety_shutdown():
+def test_periodic_command_producers_stop_without_touching_can():
     events = []
     app_model = object.__new__(AppModel)
     app_model._closing_event = threading.Event()
@@ -331,18 +331,23 @@ def test_periodic_command_producers_stop_before_safety_shutdown():
         cancel=lambda: events.append("cancel-daily"),
     )
     app_model._hardware = mock.Mock()
-    app_model._hardware.safety_shutdown.side_effect = (
-        lambda *_args, **_kwargs: events.append("safety-shutdown")
-    )
 
-    app_model._request_safety_shutdown("application close", wait=True)
+    app_model._prepare_application_shutdown()
 
     assert app_model._closing_event.is_set()
-    assert events == ["cancel-minute", "cancel-daily", "safety-shutdown"]
-    app_model._hardware.safety_shutdown.assert_called_once_with(
-        "application close",
-        wait=True,
-    )
+    assert events == ["cancel-minute", "cancel-daily"]
+    app_model._hardware.safety_shutdown.assert_not_called()
+    app_model._hardware.disconnect.assert_not_called()
+
+
+def test_generic_fatal_callback_does_not_touch_can():
+    app_model = object.__new__(AppModel)
+    app_model._hardware = mock.Mock()
+
+    app_model._on_fatal_exception("camera.left", RuntimeError("capture failed"))
+
+    app_model._hardware.safety_shutdown.assert_not_called()
+    app_model._hardware.disconnect.assert_not_called()
 
 
 def test_live_inference_override_is_not_persisted_with_other_configuration_changes(

@@ -3803,15 +3803,14 @@ class AppModel(ObservableObject):
             logger.debug("stopping timer %s", timer)
             timer.cancel()
 
-    def _request_safety_shutdown(self, reason: str, *, wait: bool) -> None:
+    def _prepare_application_shutdown(self) -> None:
         self._stop_periodic_timers()
-        self._hardware.safety_shutdown(reason, wait=wait)
 
     def on_close(self):
         logger.debug("AppModel.on_close")
         # Stop command producers first so none can race with CAN teardown or
         # reschedule themselves after their current timer is cancelled.
-        self._request_safety_shutdown("application close", wait=True)
+        self._prepare_application_shutdown()
 
         self._session_data_recorder.close()
         self._analysis.stop()
@@ -3869,9 +3868,13 @@ class AppModel(ObservableObject):
         unregister_fatal_exception_callback(self._on_fatal_exception)
 
     def _on_fatal_exception(self, source: str, exception: BaseException) -> None:
-        self._request_safety_shutdown(
-            f"{source}: {exception}",
-            wait=False,
+        # Fatal callbacks are process-wide and may originate from cameras,
+        # analysis, NI-DAQ, or UI code. They must never reset or disconnect an
+        # otherwise healthy shared CAN interface.
+        logger.error(
+            "Fatal callback from %s left CAN ownership unchanged: %s",
+            source,
+            exception,
         )
 
     def _load_animals(self):

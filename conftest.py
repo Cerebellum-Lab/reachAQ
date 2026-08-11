@@ -1,3 +1,4 @@
+import os
 import sys
 from pathlib import Path
 
@@ -5,6 +6,12 @@ import pytest
 
 
 _REPO_ROOT = Path(__file__).resolve().parent
+
+# This is established before importing any application modules. Individual
+# transport codec/backend tests may construct mocked hardware configurations,
+# but no pytest process may select or reset a host CAN interface implicitly.
+os.environ["AUTOTRAINER_CAN_TRANSPORT"] = "emulation"
+os.environ["REACHAQ_PROHIBIT_PRIVILEGED_CAN_RESET"] = "1"
 for _source_dir in reversed((
     _REPO_ROOT,
     _REPO_ROOT / "auto-trainer-behavior" / "src",
