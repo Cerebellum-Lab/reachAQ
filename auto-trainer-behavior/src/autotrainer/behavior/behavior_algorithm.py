@@ -40,8 +40,9 @@ from .system_machine_state import SystemState
 from .intersession import IntersessionState
 
 from autotrainer.inference import PoseResponse
-from autotrainer.inference.pose_algorithm import update_scene_elements_context_from_pose
 from autotrainer.inference.analysis import IntersessionResponse
+
+from .pellet_presence_tracker import PelletPresenceTracker
 
 logger = get_verbose_logger(__name__)
 
@@ -204,8 +205,7 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
         self._active_config = BehaviorConfiguration()
         self._loaded_config: Optional[BehaviorConfiguration] = None
 
-        self._parts_pres_ctx_any_cam = ScenePartsPresenceContext()
-        self._parts_pres_ctx_all_cams = ScenePartsPresenceContext()
+        self._presence_tracker = PelletPresenceTracker()
 
         # NB: not saved in config:
         self._sess_min_duration = 1.5  # could add to config
@@ -223,9 +223,7 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
         self._timer_end_capture_session = no_op_timer
         self._prev_can_load_pellet_log_refuse_perf_c = -math.inf
 
-        self._session_mouse_seen = False
         self._pellet_hands_min_distance: float = math.inf
-        self._mouse_seen_last_perf_c = -math.inf
         self._triangle_pellet_last_offset = Offset3DTuple(math.nan, math.nan, math.nan)
         self._next_diamond_triangle_log_report = -math.inf
 
@@ -659,23 +657,25 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
 
     @property
     def triangle_last_seen(self) -> float:  # only used by test atm
-        return self._parts_pres_ctx_any_cam.present_last_perf_c.get(SceneElement.Triangle, -math.inf)
+        return self._presence_tracker.last_seen(SceneElement.Triangle)
 
     @property
     def triangle_recently_seen(self) -> bool:
         # only used in tests and a log
-        return self._parts_pres_ctx_any_cam.get_recently_seen(
+        return self._presence_tracker.is_recently_seen(
             SceneElement.Triangle,
             self.limits.triangle_missing_time,
+            use_any_camera=True,
             perf_now=get_perf_now(),
         )
 
     @property
     def diamond_recently_seen(self) -> bool:
         # only used in test
-        return self._parts_pres_ctx_any_cam.get_recently_seen(
+        return self._presence_tracker.is_recently_seen(
             SceneElement.Diamond,
             self.limits.triangle_missing_time,
+            use_any_camera=True,
             perf_now=get_perf_now(),
         )
 
@@ -869,11 +869,11 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
 
     @property
     def any_cams_scene_parts_presence_context(self) -> ScenePartsPresenceContext:
-        return self._parts_pres_ctx_any_cam
+        return self._presence_tracker.any_camera
 
     @property
     def all_cams_scene_parts_presence_context(self) -> ScenePartsPresenceContext:
-        return self._parts_pres_ctx_all_cams
+        return self._presence_tracker.all_cameras
 
     #
 
@@ -904,7 +904,7 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
 
         project.calculate_next_session_index()
         # ensure we look at their state on start:
-        self._session_mouse_seen = False
+        self._presence_tracker.reset_session()
         self._uncover_ctx.reset()  # always
 
         self.session_starting_before_record_start()
@@ -973,7 +973,7 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
     @property
     def pellet_presence_age(self) -> float:
         """Return value in seconds unit"""
-        return self._parts_pres_ctx_any_cam.get_presence_age(SceneElement.Pellet)
+        return self._presence_tracker.presence_age(SceneElement.Pellet)
 
     @property
     def pellet_recently_seen(self):
@@ -981,16 +981,20 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
         # which using _any_ cam seen, not _all/both_ cams seen flags,
         # but for better certainty, most-if-not-all of them shall be using the later.
         # there is the algo.is_pellet_recently_seen() method which is doing that.
-        return self._parts_pres_ctx_any_cam.get_recently_seen(
-            SceneElement.Pellet, self.limits.pellet_missing_time,
+        return self._presence_tracker.is_recently_seen(
+            SceneElement.Pellet,
+            self.limits.pellet_missing_time,
+            use_any_camera=True,
             perf_now=get_perf_now(),
         )
 
     def is_part_recently_seen(self, part: str, *, use_any_cam: bool=False, perf_now: Optional[float]=None) -> bool:
-        ctx = self._parts_pres_ctx_any_cam if use_any_cam else self._parts_pres_ctx_all_cams
-        if perf_now is None:
-            perf_now = get_perf_now()
-        return ctx.get_recently_seen(part, self.limits.pellet_missing_time, perf_now=perf_now)
+        return self._presence_tracker.is_recently_seen(
+            part,
+            self.limits.pellet_missing_time,
+            use_any_camera=use_any_cam,
+            perf_now=perf_now,
+        )
 
     def is_pellet_recently_seen(self, *, use_any_cam: bool=False, perf_now: Optional[float]=None) -> bool:
         return self.is_part_recently_seen(SceneElement.Pellet, use_any_cam=use_any_cam, perf_now=perf_now)
@@ -1119,7 +1123,10 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
         return False
 
     def can_perform_intersession_analysis(self):
-        return self._active_config.pellet_delivery.is_intersession_analysis_enabled and self._session_mouse_seen
+        return (
+            self._active_config.pellet_delivery.is_intersession_analysis_enabled
+            and self._presence_tracker.session_mouse_seen
+        )
 
     @property
     def pellet_automation_stop_requested(self) -> bool:
@@ -1141,18 +1148,15 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
     #
 
     def update_parts_seen(self, pose_rsp: PoseResponse):
-        any_ctx = self._parts_pres_ctx_any_cam
-        all_ctx = self._parts_pres_ctx_all_cams
-        update_scene_elements_context_from_pose(any_ctx, all_ctx, pose_rsp)
-        # little special case for mouse:
-        self.update_mouse_seen(pose_rsp.mouse_seen, perf_now=pose_rsp.perf_c)
+        if self._presence_tracker.update_pose(pose_rsp, in_session=self._is_in_session):
+            logger.verbose("Session mouse seen")
+            self._on_property_changed(BehaviorAlgoProps.SESSION_MOUSE_SEEN, True, False)
 
     def update_pellet_seen(self, seen: bool = True):
         self.update_part_seen(SceneElement.Pellet, seen, perf_now=get_perf_now())
 
     def update_part_seen(self, part, seen: bool, *, perf_now: Optional[float] = None):
-        self._parts_pres_ctx_any_cam.update_part_seen(part, seen, perf_now=perf_now)
-        self._parts_pres_ctx_all_cams.update_part_seen(part, seen, perf_now=perf_now)
+        self._presence_tracker.update_part(part, seen, perf_now=perf_now)
 
     def pellet_loaded(self):
         self.session_pellet_loaded_count += 1
@@ -1165,25 +1169,22 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
 
     def update_mouse_seen(self, seen: bool = True, *, perf_now: Optional[float] = None):
         # NB: "mouse" == SceneElement.Nose
-        if perf_now is None:
-            perf_now = get_perf_now()
-        self.update_part_seen(SceneElement.Nose, seen, perf_now=perf_now)  # ensure presence_context gets updated
-        if seen:
-            self._mouse_seen_last_perf_c = perf_now
-        if self._is_in_session and seen:
-            prev_seen, self._session_mouse_seen = self._session_mouse_seen, True
-            if not prev_seen:
-                logger.verbose("Session mouse seen")
-                # property currently unused:
-                self._on_property_changed(BehaviorAlgoProps.SESSION_MOUSE_SEEN, True, False)
+        newly_seen = self._presence_tracker.update_mouse(
+            seen,
+            in_session=self._is_in_session,
+            perf_now=perf_now,
+        )
+        if newly_seen:
+            logger.verbose("Session mouse seen")
+            self._on_property_changed(BehaviorAlgoProps.SESSION_MOUSE_SEEN, True, False)
 
     @property
     def mouse_last_seen_age(self) -> float:
-        return get_perf_now() - self._mouse_seen_last_perf_c
+        return self._presence_tracker.mouse_last_seen_age
 
     @property
     def session_mouse_seen(self):
-        return self._session_mouse_seen
+        return self._presence_tracker.session_mouse_seen
 
     @property
     def active_config(self) -> BehaviorConfiguration:

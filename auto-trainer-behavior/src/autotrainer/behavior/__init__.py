@@ -60,6 +60,7 @@ from .pellet_trial import (
     TrialCountBasis,
     TrialOutcome,
 )
+from .pellet_presence_tracker import PelletPresenceTracker
 
 from .intersession import IntersessionState
 from .intersession.intersession_machine import IntersessionMachine
