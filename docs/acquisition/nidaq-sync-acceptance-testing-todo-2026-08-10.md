@@ -17,7 +17,7 @@ from behavior that still requires physical-rig acceptance.
 
 Completed automated checks:
 
-- [x] Full repository suite after final decomposition: `629 passed, 35 skipped,
+- [x] Full repository suite after final decomposition: `630 passed, 35 skipped,
       1 xpassed` (2 expected no-stereo-parameters warnings).
 - [x] No production imports reference the removed load-cell, SensorAnalysis,
       webcam/top-camera, head-fix, tunnel, magnet, alarm, or emergency runtime
