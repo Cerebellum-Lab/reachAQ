@@ -44,6 +44,30 @@ protocol, pellet operation is manual unless automatic cycles are explicitly
 enabled. Enabling automatic protocol advance does not itself enable pellet
 cycles or start recording.
 
+## Ordered trial protocol editor
+
+The **Trial Protocol** tab presents one row per planned logical pellet trial.
+The initial 15 rows contain placeholder examples for pellet-delivery behavior,
+XYZ shift, cover, tone, and laser choices. These fields define the extensible
+row schema; delivery execution can consume additional row options as those
+behaviors are implemented.
+
+Only future rows are editable. A row becomes highlighted and read-only while
+its trial is active, then remains read-only once the logical trial completes.
+A motor, transport, command, or acknowledgement error does not complete or
+consume that row: under retry-within-trial accounting it returns to Future and
+the next attempt keeps the same logical trial number.
+
+Every send attempt receives an immutable copy of its row under
+`protocol_context.trial_row` in `streams/trials.jsonl`. Session JSON/YAML also
+stores the ordered `protocolSchedule`, so later edits cannot change the settings
+attributed to an already recorded attempt.
+
+Subject selection is locked from session Arming through analysis. Session Notes
+are saved when Stop closes the writers but remain editable afterward; subsequent
+edits atomically replace the stopped session's JSON/YAML metadata. Beginning the
+next recording finalizes the previous notes and clears the Notes field.
+
 ## Trial and attempt accounting
 
 Every pellet send dispatch creates an operation ID and an attempt record. A
