@@ -42,3 +42,6 @@ python -m tools.softmouse_sync.cli \
 The unit templates in `systemd/` provide the midnight schedule after their paths
 are configured. The timer is persistent, so a powered-off publisher runs once
 after it next starts.
+
+See `CONFIGURATION_GUIDE.md` for a brief field-by-field setup guide for the
+publisher, acquisition computers, RFID reader, and timer.
