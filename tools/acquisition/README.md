@@ -73,6 +73,12 @@ The app saves configuration back to the preferences configuration directory. For
 alternate software-only configs, use a separate preferences file and config
 directory so test settings do not overwrite the bench config.
 
+Rig-level availability for CAN, the pellet controller, NI-DAQ, and the USB RFID
+reader is grouped in the YAML `hardware:` block. The same switches and the RFID
+serial path are editable under **Hardware Status → Hardware Configuration**
+while acquisition is idle. **Apply and save** persists the selection; refresh
+hardware afterward to connect newly enabled devices.
+
 The current production schema is system-configuration version 57. Older and
 newer versions, unknown fields, retired load-cell/tunnel fields, and obsolete
 NI recording controls are rejected instead of being silently migrated. Start

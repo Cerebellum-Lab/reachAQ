@@ -35,7 +35,8 @@ fi
 |---|---|
 | `persistence.outputLocation` | Writable local acquisition directory |
 | `cameras` | Only physically present cameras; correct scheme/serial/shape/FPS |
-| `hardware.*Enabled` | Enable only connected, validated subsystems |
+| `hardware.*Enabled` | Rig-level CAN, pellet-controller, NI-DAQ, and RFID switches; enable only connected, validated subsystems |
+| `hardware.rfidDevice` | Stable `/dev/serial/by-id/...` path for the USB RFID reader |
 | `inference.poseModelLocation` | Existing compatible model directory |
 | `laser.backend` | `nidaq` for validated hardware; otherwise `null`/`disabled` |
 | `laser.channels` | Real NI-DAQ aliases and wired channel roles |
@@ -46,6 +47,10 @@ prevent duplicate assignments. Saving from the dialog also records stable
 product/serial identities and validates timing-master capability. All mapped and
 custom NI-DAQ inputs are recorded when NI-DAQ is enabled; plotting only the
 subset in `displayChannels` does not change persistence.
+
+The same rig-level switches can be changed while idle under **Hardware Status →
+Hardware Configuration**. **Apply and save** writes them back to the system
+YAML; use the hardware refresh button to connect newly enabled devices.
 
 See [Session recording, synchronization, and hardware isolation](../acquisition/session-recording-and-synchronization.md)
 before commissioning Record/Stop/Abort or a multi-device timing topology.

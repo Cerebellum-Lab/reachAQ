@@ -5,9 +5,14 @@ from urllib.parse import urlparse
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QAbstractScrollArea,
+    QCheckBox,
+    QFormLayout,
     QFrame,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
+    QPushButton,
     QScrollArea,
     QSizePolicy,
     QToolButton,
@@ -172,6 +177,8 @@ class HardwareStatusContent(ContentWidget):
         layout.setContentsMargins(8, 5, 8, 7)
         layout.setSpacing(4)
 
+        layout.addWidget(self._create_hardware_configuration_editor())
+
         self._refresh_label = QLabel("Scanning hardware and refreshing bindings...")
         self._refresh_label.setStyleSheet("color: #8a5a00; font-weight: 600; padding: 4px;")
         layout.addWidget(self._refresh_label)
@@ -202,7 +209,78 @@ class HardwareStatusContent(ContentWidget):
         app_model.configuration_loaded_event += self._on_configuration_loaded
         app_model.hardware.property_changed += self._on_hardware_model_property_changed
         self._refresh_status()
+        self._sync_hardware_configuration_editor()
         self.set_hardware_refreshing(False)
+
+    def _create_hardware_configuration_editor(self) -> QGroupBox:
+        group = QGroupBox("Hardware Configuration")
+        form = QFormLayout(group)
+        form.setContentsMargins(8, 6, 8, 8)
+        self._hardware_enabled_controls = {}
+        for key, title in (
+            ("can", "CAN adapter"),
+            ("pellet", "Pellet controller"),
+            ("nidaq", "NI-DAQ"),
+            ("rfid", "USB RFID reader"),
+        ):
+            checkbox = QCheckBox(f"Enable {title}")
+            self._hardware_enabled_controls[key] = checkbox
+            form.addRow("", checkbox)
+
+        self._rfid_device_edit = QLineEdit()
+        self._rfid_device_edit.setPlaceholderText("/dev/serial/by-id/...")
+        form.addRow("RFID serial device:", self._rfid_device_edit)
+
+        button_row = QHBoxLayout()
+        self._save_hardware_button = QPushButton("Apply and save")
+        self._save_hardware_button.clicked.connect(
+            self._apply_hardware_configuration_editor
+        )
+        button_row.addWidget(self._save_hardware_button)
+        self._hardware_save_status = QLabel("")
+        self._hardware_save_status.setWordWrap(True)
+        button_row.addWidget(self._hardware_save_status, stretch=1)
+        form.addRow("", button_row)
+        return group
+
+    def _sync_hardware_configuration_editor(self) -> None:
+        hardware = self._app_model.hardware
+        configuration = self._loaded_configuration()
+        hardware_configuration = (
+            None if configuration is None else configuration.hardware
+        )
+        values = {
+            "can": bool(hardware.can_enabled),
+            "pellet": bool(hardware.pellet_controller_enabled),
+            "nidaq": bool(hardware.nidaq_enabled),
+            "rfid": bool(
+                hardware_configuration is not None
+                and hardware_configuration.rfid_reader_enabled
+            ),
+        }
+        for key, value in values.items():
+            self._hardware_enabled_controls[key].setChecked(value)
+        self._rfid_device_edit.setText(
+            "" if hardware_configuration is None
+            else hardware_configuration.rfid_device
+        )
+
+    def _apply_hardware_configuration_editor(self) -> None:
+        try:
+            message = self._app_model.update_hardware_configuration(
+                can_enabled=self._hardware_enabled_controls["can"].isChecked(),
+                pellet_controller_enabled=self._hardware_enabled_controls["pellet"].isChecked(),
+                nidaq_enabled=self._hardware_enabled_controls["nidaq"].isChecked(),
+                rfid_reader_enabled=self._hardware_enabled_controls["rfid"].isChecked(),
+                rfid_device=self._rfid_device_edit.text(),
+            )
+        except Exception as exc:
+            self._hardware_save_status.setText(f"Not saved: {exc}")
+            self._sync_hardware_configuration_editor()
+            return
+        self._hardware_save_status.setText(message or "Hardware settings saved")
+        self._sync_hardware_configuration_editor()
+        self._refresh_status()
 
     def set_refresh_action(self, action) -> None:
         self._refresh_button.setDefaultAction(action)
@@ -460,11 +538,10 @@ class HardwareStatusContent(ContentWidget):
         return statuses.get(key)
 
     def _configured_rfid_device(self) -> str:
-        try:
-            preferences = object.__getattribute__(self._app_model, "_preferences")
-        except (AttributeError, TypeError):
-            preferences = None
-        return getattr(preferences, "rfid_device", "")
+        configuration = self._loaded_configuration()
+        if configuration is None:
+            return ""
+        return configuration.hardware.rfid_device
 
     @staticmethod
     def _camera_binding(camera) -> str:
@@ -681,9 +758,12 @@ class HardwareStatusContent(ContentWidget):
             "device_pellet_status_timeout_engaged",
             "can_enabled",
             "pellet_controller_enabled",
+            "nidaq_enabled",
         }:
-            self._refresh_pellet_status()
+            self._sync_hardware_configuration_editor()
+            self._refresh_status()
 
     @invoke_method
     def _on_configuration_loaded(self, _configuration):
+        self._sync_hardware_configuration_editor()
         self._refresh_status()

@@ -512,18 +512,6 @@ class PreferencesContent(QWidget):
         )
         form.addRow("New-animal name field:", name_field)
 
-        self._rfid_enabled = QCheckBox("Enable USB RFID reader")
-        self._rfid_enabled.setChecked(self._preferences.rfid_reader_enabled)
-        self._rfid_enabled.toggled.connect(
-            lambda value: setattr(self._preferences, "rfid_reader_enabled", value)
-        )
-        form.addRow("", self._rfid_enabled)
-        self._rfid_device_edit = QLineEdit(self._preferences.rfid_device)
-        self._rfid_device_edit.textChanged.connect(
-            lambda value: setattr(self._preferences, "rfid_device", value)
-        )
-        form.addRow("RFID serial device:", self._rfid_device_edit)
-
         nightly = QCheckBox("Refresh this computer's local cache daily")
         nightly.setChecked(self._preferences.softmouse_nightly_refresh)
         nightly.toggled.connect(
@@ -534,9 +522,6 @@ class PreferencesContent(QWidget):
         form.addRow("", nightly)
 
         buttons = QHBoxLayout()
-        apply_button = QPushButton("Apply reader settings")
-        apply_button.clicked.connect(self._apply_animal_metadata_preferences)
-        buttons.addWidget(apply_button)
         self._softmouse_refresh_button = QPushButton("Refresh local cache")
         self._softmouse_refresh_button.clicked.connect(self._refresh_animal_metadata)
         buttons.addWidget(self._softmouse_refresh_button)

@@ -5,6 +5,7 @@ import yaml
 
 from autotrainer.core import (
     SystemConfiguration,
+    HardwareConfiguration,
     CameraId,
     CameraConfiguration,
     Offset3DTuple,
@@ -107,5 +108,25 @@ def test_offset3d_yaml():
     o2 = yaml.load(data, Loader=SystemConfigurationLoader)
     assert isinstance(o2, Offset3DTuple)
     assert o2 == o
+
+
+def test_rfid_hardware_settings_round_trip_in_system_yaml():
+    configuration = SystemConfiguration(
+        hardware=HardwareConfiguration(
+            can_enabled=False,
+            pellet_controller_enabled=False,
+            nidaq_enabled=True,
+            rfid_reader_enabled=True,
+            rfid_device="/dev/serial/by-id/test-rfid",
+        )
+    )
+
+    loaded = SystemConfiguration.load_yaml(io.StringIO(configuration.dump_yaml()))
+
+    assert loaded.hardware.can_enabled is False
+    assert loaded.hardware.pellet_controller_enabled is False
+    assert loaded.hardware.nidaq_enabled is True
+    assert loaded.hardware.rfid_reader_enabled is True
+    assert loaded.hardware.rfid_device == "/dev/serial/by-id/test-rfid"
 
 

@@ -44,13 +44,17 @@ Or open **Preferences → Animal metadata** in reachAQ and click **Sync from
 SoftMouse**. The button is available on every acquisition computer; run the
 one-time login setup on each computer that should use it.
 
-In the same panel:
+The metadata actions remain in that panel:
 
 - **Sync from SoftMouse** updates Isilon and then this computer's cache.
 - **Refresh local cache** only imports the latest existing Isilon publication.
-- Enable **USB RFID reader**, confirm the stable `/dev/serial/by-id/...` path,
-  and click **Apply reader settings** on computers with an attached reader.
-- View connection and last-scan details under **Hardware Status → RFID Reader**.
+
+RFID hardware settings are grouped with the other rig-level switches under
+**Hardware Status → Hardware Configuration**. Enable **USB RFID reader**,
+confirm the stable `/dev/serial/by-id/...` path, and click **Apply and save**.
+The selection is written to the `hardware:` block in
+`~/Autotrainer/system_configuration.yaml`. Expand **RFID Reader** in the same
+panel to view connection and last-scan details.
 
 There is no JSON configuration file to create or edit. An old
 `~/.config/reachaq/softmouse-publisher.json` file is ignored and may be removed.

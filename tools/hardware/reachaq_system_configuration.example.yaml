@@ -80,9 +80,12 @@ cameras:
     primary: 'no'
 hardware: !HardwareConfiguration
   pelletIdentifier: CAN
+  # Rig-level hardware availability switches are intentionally grouped here.
   canEnabled: true
   pelletControllerEnabled: true
   nidaqEnabled: true
+  rfidReaderEnabled: false
+  rfidDevice: /dev/serial/by-id/usb-FTDI_FT232R_USB_UART_BG01OZ68-if00-port0
   minAckTimeout: 3.0
   boardStatusTimeout: 15.0
 inference: !InferenceConfiguration

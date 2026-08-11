@@ -8,7 +8,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from autotrainer.core import CameraId, ObservableObject  # noqa: E402
+from autotrainer.core import CameraId, HardwareConfiguration, ObservableObject  # noqa: E402
 from autotrainer.core.capture import CaptureProcessStatus  # noqa: E402
 from autotrainer.video import CaptureCameraAttrs  # noqa: E402
 from tools.acquisition.model.hardware_scan import HardwareScanEntry, scan_can_adapters, scan_gpus  # noqa: E402
@@ -72,6 +72,15 @@ class _AppModelStub(ObservableObject):
             pellet_version="",
             pellet_status_timeout_engaged=False,
         )
+        self.loaded_configuration = SimpleNamespace(
+            hardware=HardwareConfiguration(
+                can_enabled=False,
+                pellet_controller_enabled=False,
+                nidaq_enabled=False,
+                rfid_reader_enabled=False,
+                rfid_device="/dev/serial/by-id/test-rfid",
+            )
+        )
         self.nidaq_signal_monitor = _ObservableStub(
             configuration=SimpleNamespace(
                 channels=(
@@ -128,6 +137,23 @@ class _AppModelStub(ObservableObject):
             "gpu": HardwareScanEntry("✓ 1 NVIDIA GPU\n→ GPU0 Test GPU · 4096 MiB · drv 1.0", "ok"),
             "laser": HardwareScanEntry("not probed; backend disabled", "disabled"),
         }
+
+    def update_hardware_configuration(self, **values):
+        hardware_configuration = self.loaded_configuration.hardware
+        hardware_configuration.can_enabled = values["can_enabled"]
+        hardware_configuration.pellet_controller_enabled = values[
+            "pellet_controller_enabled"
+        ]
+        hardware_configuration.nidaq_enabled = values["nidaq_enabled"]
+        hardware_configuration.rfid_reader_enabled = values[
+            "rfid_reader_enabled"
+        ]
+        hardware_configuration.rfid_device = values["rfid_device"]
+        self.hardware.can_enabled = values["can_enabled"]
+        self.hardware.pellet_controller_enabled = values["pellet_controller_enabled"]
+        self.hardware.nidaq_enabled = values["nidaq_enabled"]
+        self.configuration_loaded_event(self.loaded_configuration)
+        return "Hardware settings saved"
 
 
 def test_status_panel_columns_and_scan_results(qapp):
@@ -234,6 +260,29 @@ def test_rfid_runtime_and_last_scan_update_hardware_status(qapp):
         assert "reader connected" in panel.details_text
         assert "Mouse 17" in panel.details_text
         assert "#e8f5ec" in panel.header.styleSheet()
+    finally:
+        content.deleteLater()
+
+
+def test_hardware_configuration_editor_applies_all_rig_switches(qapp):
+    app_model = _AppModelStub()
+    content = HardwareStatusContent(app_model)
+    try:
+        assert content._rfid_device_edit.text() == "/dev/serial/by-id/test-rfid"
+        for checkbox in content._hardware_enabled_controls.values():
+            checkbox.setChecked(True)
+        content._rfid_device_edit.setText("/dev/serial/by-id/new-rfid")
+
+        content._save_hardware_button.click()
+        qapp.processEvents()
+
+        hardware = app_model.loaded_configuration.hardware
+        assert hardware.can_enabled is True
+        assert hardware.pellet_controller_enabled is True
+        assert hardware.nidaq_enabled is True
+        assert hardware.rfid_reader_enabled is True
+        assert hardware.rfid_device == "/dev/serial/by-id/new-rfid"
+        assert content._hardware_save_status.text() == "Hardware settings saved"
     finally:
         content.deleteLater()
 

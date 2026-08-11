@@ -106,6 +106,30 @@ def test_user_preferences(settings_ini_path, user_pref, trainer_config_dir):
     assert user_pref.selected_animal == "foobar"
 
 
+def test_hardware_editor_settings_persist_to_system_yaml(
+    app_model,
+    config_file_path,
+    system_config,
+):
+    assert app_model.load_configuration() is True
+
+    message = app_model.update_hardware_configuration(
+        can_enabled=False,
+        pellet_controller_enabled=False,
+        nidaq_enabled=False,
+        rfid_reader_enabled=False,
+        rfid_device="/dev/serial/by-id/persistent-rfid",
+    )
+
+    saved = SystemConfiguration.load_yaml_file(config_file_path)
+    assert saved.hardware.can_enabled is False
+    assert saved.hardware.pellet_controller_enabled is False
+    assert saved.hardware.nidaq_enabled is False
+    assert saved.hardware.rfid_reader_enabled is False
+    assert saved.hardware.rfid_device == "/dev/serial/by-id/persistent-rfid"
+    assert "saved" in message.lower()
+
+
 def test_load_config(
     app_model,
     trainer_config_dir,

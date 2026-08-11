@@ -148,12 +148,14 @@ systemctl --user disable --now reachaq-softmouse-publisher.timer
 
 ## RFID setup and status
 
-In **Preferences → Animal metadata**:
+In **Hardware Status → Hardware Configuration**:
 
 1. Enable **USB RFID reader** only on computers with the reader attached.
 2. Keep the stable `/dev/serial/by-id/...` path rather than `/dev/ttyUSB0`.
-3. Choose the SoftMouse field used to name a newly created local animal.
-4. Click **Apply reader settings**.
+3. Click **Apply and save**. The setting is persisted in the system YAML.
+
+Choose the SoftMouse field used to name a newly created local animal under
+**Preferences → Animal metadata**.
 
 The **Hardware Status → RFID Reader** category reports whether the reader is
 disabled, connecting, ready, stopped, or failed. Expanding it shows the serial

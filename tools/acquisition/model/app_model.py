@@ -2120,7 +2120,14 @@ class AppModel(ObservableObject):
         self._animal_metadata_sync = None
         self._rfid_metadata_controller = None
         manifest_value = getattr(self._preferences, "softmouse_manifest_path", "")
-        reader_enabled = getattr(self._preferences, "rfid_reader_enabled", False)
+        hardware_configuration = (
+            None if self._loaded_configuration is None
+            else self._loaded_configuration.hardware
+        )
+        reader_enabled = bool(
+            hardware_configuration is not None
+            and hardware_configuration.rfid_reader_enabled
+        )
         if not manifest_value and not reader_enabled:
             self._set_animal_metadata_status("Not configured")
             self._set_subsystem_status(
@@ -2187,7 +2194,7 @@ class AppModel(ObservableObject):
             self._rfid_metadata_controller = RfidMetadataController(
                 app_model=self,
                 registry=registry,
-                device=getattr(self._preferences, "rfid_device", ""),
+                device=hardware_configuration.rfid_device,
             )
             self._set_subsystem_status(
                 SubsystemId.RFID_READER,
@@ -4154,10 +4161,11 @@ class AppModel(ObservableObject):
         self._hardware.load_config(configuration.hardware)
         log_hardware_initialization(
             logger,
-            "CONFIGURED | hardware flags | CAN=%s pellet_controller=%s NI-DAQ=%s",
+            "CONFIGURED | hardware flags | CAN=%s pellet_controller=%s NI-DAQ=%s RFID=%s",
             configuration.hardware.can_enabled,
             configuration.hardware.pellet_controller_enabled,
             configuration.hardware.nidaq_enabled,
+            configuration.hardware.rfid_reader_enabled,
         )
         self.inference.load_configuration(configuration.inference)
         log_hardware_initialization(
@@ -4308,6 +4316,52 @@ class AppModel(ObservableObject):
         self._nidaq_signal_monitor.set_display_channels(channel_names)
         self._loaded_configuration.nidaq_stream = self._nidaq_signal_monitor.save_configuration()
         self.save_configuration()
+
+    def update_hardware_configuration(
+        self,
+        *,
+        can_enabled: bool,
+        pellet_controller_enabled: bool,
+        nidaq_enabled: bool,
+        rfid_reader_enabled: bool,
+        rfid_device: str,
+    ) -> str:
+        """Apply and persist rig-level hardware availability settings."""
+        if self._loaded_configuration is None:
+            raise RuntimeError("Cannot update hardware settings before configuration is loaded")
+        if self._acquisition.started or self._status != AppModelStatus.IDLE:
+            raise RuntimeError("Hardware settings can only be changed while acquisition is idle")
+
+        rfid_device = str(rfid_device).strip()
+        if rfid_reader_enabled and not rfid_device:
+            raise ValueError("RFID serial device is required when the reader is enabled")
+
+        hardware_configuration = self._loaded_configuration.hardware
+        was_can_required = self._hardware.requires_connection
+        will_require_can = bool(can_enabled and pellet_controller_enabled)
+        if was_can_required and not will_require_can and self._hardware.connected:
+            self._hardware.disconnect()
+
+        hardware_configuration.can_enabled = bool(can_enabled)
+        hardware_configuration.pellet_controller_enabled = bool(
+            pellet_controller_enabled
+        )
+        hardware_configuration.nidaq_enabled = bool(nidaq_enabled)
+        hardware_configuration.rfid_reader_enabled = bool(rfid_reader_enabled)
+        hardware_configuration.rfid_device = rfid_device
+
+        self._hardware.load_config(hardware_configuration)
+        self._nidaq_signal_monitor.set_hardware_enabled(
+            hardware_configuration.nidaq_enabled,
+            auto_start=False,
+        )
+        self._configure_subsystem_intent(self._loaded_configuration)
+        self._configure_animal_metadata_services()
+        if self._rfid_metadata_controller is not None:
+            self._rfid_metadata_controller.start()
+        self.save_configuration()
+        self.configuration_loaded_event(self._loaded_configuration)
+        return "Hardware settings saved; refresh hardware to connect newly enabled devices"
 
     def on_activated(self):
         """Must be called at start"""
@@ -5340,6 +5394,8 @@ class AppModel(ObservableObject):
             can_enabled=self._hardware.can_enabled,
             pellet_controller_enabled=self._hardware.pellet_controller_enabled,
             nidaq_enabled=self._hardware.nidaq_enabled,
+            rfid_reader_enabled=loaded_hardware.rfid_reader_enabled,
+            rfid_device=loaded_hardware.rfid_device,
             min_ack_timeout=loaded_hardware.min_ack_timeout,
             board_status_timeout=loaded_hardware.board_status_timeout,
         )
