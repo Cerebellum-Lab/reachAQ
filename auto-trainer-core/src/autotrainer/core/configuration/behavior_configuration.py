@@ -1,6 +1,6 @@
 import dataclasses
 from dataclasses import dataclass, field
-from typing import Type, Optional
+from typing import ClassVar, Type, Optional
 
 import yaml
 
@@ -121,6 +121,8 @@ class SessionControlConfiguration:
     stop_on_protocol_complete: bool = False
     stop_drain_timeout_seconds: float = 15.0
 
+    MAX_DURATION_SECONDS: ClassVar[float] = 2 * 60 * 60
+
     ATTEMPT_ASSIGNMENTS = (
         "retry_within_trial",
         "every_attempt_is_trial",
@@ -156,6 +158,11 @@ class SessionControlConfiguration:
             )
         if self.duration_limit_seconds is not None and self.duration_limit_seconds <= 0:
             raise ValueError("Recording duration limit must be positive")
+        if (
+            self.duration_limit_seconds is not None
+            and self.duration_limit_seconds > self.MAX_DURATION_SECONDS
+        ):
+            raise ValueError("Recording duration limit cannot exceed 2 hours")
         if self.trial_limit is not None and self.trial_limit <= 0:
             raise ValueError("Trial target must be positive")
         if self.stop_drain_timeout_seconds <= 0:

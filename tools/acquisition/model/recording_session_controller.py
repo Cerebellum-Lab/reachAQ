@@ -37,6 +37,7 @@ class RecordingSessionController:
     data_errors: Tuple[str, ...] = ()
     enabled_sources: Tuple[dict, ...] = ()
     end_actions: Tuple[dict, ...] = ()
+    storage_telemetry: dict = field(default_factory=dict)
     _generation: int = field(default=0, init=False, repr=False)
     _session_id: Optional[str] = field(default=None, init=False, repr=False)
     _lock: threading.RLock = field(
@@ -149,6 +150,7 @@ class RecordingSessionController:
         self.data_errors = ()
         self.enabled_sources = ()
         self.end_actions = ()
+        self.storage_telemetry = {}
 
     def reserve_end_action(self, name: str, details: dict) -> bool:
         with self._lock:
@@ -178,6 +180,10 @@ class RecordingSessionController:
         with self._lock:
             self.data_complete = False
             self.data_errors = (*self.data_errors, str(error))
+
+    def set_storage_telemetry(self, telemetry: dict) -> None:
+        with self._lock:
+            self.storage_telemetry = dict(telemetry)
 
     def set_boundary(
         self,
@@ -217,6 +223,7 @@ class RecordingSessionController:
             self.data_errors = ()
             self.enabled_sources = ()
             self.end_actions = ()
+            self.storage_telemetry = {}
             self.analysis_finished = True
             self.analysis_started_perf = None
             self.analysis_duration_seconds = None

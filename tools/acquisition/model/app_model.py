@@ -174,6 +174,11 @@ from tools.acquisition.model.session_stop_policy import (
     SessionStopPolicy,
     SessionStopReason,
 )
+from tools.acquisition.model.output_storage_monitor import (
+    RecordingStorageMonitor,
+    StorageSnapshot,
+    preflight_storage,
+)
 from tools.acquisition.model.subsystem_status import (
     SubsystemId,
     SubsystemState,
@@ -444,6 +449,8 @@ class AppModel(ObservableObject):
         self._abort_had_recording_started = False
         self._abort_cleanup_timer = no_op_timer
         self._record_start_timer = no_op_timer
+        self._storage_monitor = RecordingStorageMonitor()
+        self._storage_preflight = None
         self._closing_event = threading.Event()
         self._reload_plans_needed = False
         self._coordinates = CoordinateModel()
@@ -923,12 +930,44 @@ class AppModel(ObservableObject):
                 + "\n".join(f"- {blocker}" for blocker in blockers),
             )
             return False
-        self.persist_stopped_session_notes()
-        self._editable_notes_project = None
-        self.notes = ""
         project = self._project_info
         if project is None:
             return False
+        session_config = self._behavior.algorithm.active_config.session_control
+        estimated_rate = self._estimate_session_bytes_per_second()
+        session_path = Path(
+            project.get_session_path(skip_ensure=True).location
+        )
+        try:
+            storage_preflight = preflight_storage(
+                session_path,
+                estimated_bytes_per_second=estimated_rate,
+                configured_duration_seconds=session_config.duration_limit_seconds,
+            )
+        except Exception as error:
+            logger.exception("Session output write/fsync preflight failed")
+            self.on_error("Recording unavailable", f"Storage preflight failed: {error}")
+            return False
+        self._storage_preflight = storage_preflight
+        logger.info(
+            "Session storage preflight: target=%s free_bytes=%d "
+            "estimated_bytes_per_second=%.1f projected_maximum_minutes=%s",
+            storage_preflight.target_directory,
+            storage_preflight.free_bytes,
+            storage_preflight.estimated_bytes_per_second,
+            storage_preflight.projected_maximum_minutes,
+        )
+        if not storage_preflight.duration_fits_projection:
+            message = (
+                f"Configured duration {storage_preflight.configured_duration_seconds / 60:.1f} "
+                "minutes exceeds the projected storage capacity of "
+                f"{storage_preflight.projected_maximum_minutes:.1f} minutes."
+            )
+            logger.warning(message)
+            self.on_error("Storage capacity warning", message)
+        self.persist_stopped_session_notes()
+        self._editable_notes_project = None
+        self.notes = ""
         reservation = self._recording_session.begin_record(
             project.short_id,
             self._acquisition.subsystems.snapshot(),
@@ -951,6 +990,22 @@ class AppModel(ObservableObject):
         )
         self._record_generation_value.value = session_token.generation
         project.session_generation = session_token.generation
+        self._recording_session.set_storage_telemetry({
+            "preflight": {
+                "targetDirectory": storage_preflight.target_directory,
+                "freeBytes": storage_preflight.free_bytes,
+                "estimatedBytesPerSecond": (
+                    storage_preflight.estimated_bytes_per_second
+                ),
+                "projectedMaximumMinutes": (
+                    storage_preflight.projected_maximum_minutes
+                ),
+                "configuredDurationSeconds": (
+                    storage_preflight.configured_duration_seconds
+                ),
+                "durationFitsProjection": storage_preflight.duration_fits_projection,
+            }
+        })
         self._set_subsystem_status(
             SubsystemId.OFFLINE_ANALYSIS,
             SubsystemState.DISABLED,
@@ -993,6 +1048,70 @@ class AppModel(ObservableObject):
             )
             self._record_start_timer.start()
         return True
+
+    def _estimate_session_bytes_per_second(self) -> float:
+        """Conservative configuration-only estimate used until writes are observed."""
+
+        total = 16 * 1024.0  # decoded events, timestamps, pose, laser, and logs
+        for camera in self._get_recording_cams():
+            params = camera.active_config.params
+            width = float(params.get("width", 2048))
+            height = float(params.get("height", 1536))
+            fps = float(params.get("fps", 150))
+            explicit_mbps = params.get("estimated_recording_mbps")
+            if explicit_mbps is not None:
+                total += max(0.0, float(explicit_mbps)) * 1_000_000 / 8.0
+            else:
+                # MP4V is content dependent. One quarter byte per source pixel is
+                # deliberately conservative and observed throughput supersedes it.
+                total += max(0.0, width * height * fps * 0.25)
+            total += max(0.0, fps * 64.0)  # frame timestamp rows
+        monitor = self._nidaq_signal_monitor
+        if monitor.hardware_enabled and monitor.configuration.is_enabled:
+            configuration = monitor.configuration
+            bytes_per_sample = 24 + 4 * len(configuration.channels)
+            total += configuration.sample_rate_hz * bytes_per_sample
+        return total
+
+    def _start_storage_monitor(self, token: SessionGeneration) -> None:
+        project = self._project_info
+        if project is None or not self._recording_session.is_current(
+            token, statuses=(SessionRecordingStatus.RECORDING,)
+        ):
+            return
+        target = Path(project.get_session_path(skip_ensure=True).location)
+        self._storage_monitor.start(
+            target,
+            estimated_bytes_per_second=self._estimate_session_bytes_per_second(),
+            callback=lambda snapshot, threshold, token=token: (
+                self._on_storage_sample(token, snapshot, threshold)
+            ),
+        )
+
+    def _on_storage_sample(
+        self,
+        token: SessionGeneration,
+        snapshot: StorageSnapshot,
+        threshold: Optional[int],
+    ) -> None:
+        if not self._recording_session.is_current(
+            token, statuses=(SessionRecordingStatus.RECORDING,)
+        ):
+            return
+        if threshold is None:
+            return
+        remaining = snapshot.projected_remaining_minutes
+        message = (
+            f"Projected recording capacity is {remaining:.2f} minutes "
+            f"({snapshot.free_bytes} bytes free)."
+        )
+        if threshold == 1:
+            logger.error("Storage critical; requesting normal Stop: %s", message)
+            self.on_error("Storage critical — recording will stop", message)
+            self._stop_recording(RecordingEndingReason.STORAGE_LIMIT, token=token)
+        else:
+            logger.warning("Storage capacity crossed %d minutes: %s", threshold, message)
+            self.on_error(f"Storage below {threshold} minutes", message)
 
     def _build_session_source_manifest(self) -> Tuple[dict, ...]:
         def runtime_state(subsystem_id) -> str:
@@ -1690,6 +1809,8 @@ class AppModel(ObservableObject):
                             expected=(SessionRecordingStatus.ARMING,),
                             token=session_token,
                         ):
+                            if session_token is not None:
+                                self._start_storage_monitor(session_token)
                             self._start_automatic_stop_policy(
                                 first_frame_perf,
                                 session_token,
@@ -4185,9 +4306,12 @@ class AppModel(ObservableObject):
         )
         try:
             output_location = Path(self._output_location).expanduser()
-            output_location.mkdir(parents=True, exist_ok=True)
-            if not os.access(output_location, os.W_OK):
-                raise PermissionError(f"session output is not writable: {output_location}")
+            session_config = self._behavior.algorithm.active_config.session_control
+            preflight = preflight_storage(
+                output_location,
+                estimated_bytes_per_second=self._estimate_session_bytes_per_second(),
+                configured_duration_seconds=session_config.duration_limit_seconds,
+            )
         except Exception as exc:
             error = str(exc) or exc.__class__.__name__
             logger.exception("Session output validation failed")
@@ -4201,7 +4325,11 @@ class AppModel(ObservableObject):
         self._set_subsystem_status(
             SubsystemId.SESSION_LOGS,
             SubsystemState.READY,
-            reason=f"session output writable: {output_location}",
+            reason=(
+                f"session output durable-write test passed: {output_location}; "
+                f"free={preflight.free_bytes} bytes; projected maximum="
+                f"{preflight.projected_maximum_minutes:.1f} minutes"
+            ),
             generation=generation,
         )
         return True
@@ -5154,6 +5282,7 @@ class AppModel(ObservableObject):
         # Stop command producers first so none can race with CAN teardown or
         # reschedule themselves after their current timer is cancelled.
         self._prepare_application_shutdown()
+        self._storage_monitor.abort()
         self.persist_stopped_session_notes()
 
         if self._rfid_metadata_controller is not None:
@@ -5757,6 +5886,10 @@ class AppModel(ObservableObject):
             logger.warning("stopped-recording boundary became stale: %s", token)
             return
         project.start_record_timestamp = self._recording_session.boundary.start_wall_time
+        storage_telemetry = self._storage_monitor.stop()
+        current_storage = dict(self._recording_session.storage_telemetry)
+        current_storage["recording"] = storage_telemetry
+        self._recording_session.set_storage_telemetry(current_storage)
         try:
             self._pellet_cycles.snapshot_for_stop(
                 end_perf,
@@ -5907,6 +6040,7 @@ class AppModel(ObservableObject):
             logger.warning("ignoring stale abort completion: %s", token)
             return
         self._record_start_timer.cancel()
+        self._storage_monitor.abort()
         self._record_start_timer = no_op_timer
         self._abort_cleanup_timer.cancel()
         self._abort_cleanup_timer = no_op_timer
@@ -6448,6 +6582,9 @@ class AppModel(ObservableObject):
                         dict(action)
                         for action in self._recording_session.end_actions
                     ],
+                    "storage": dict(
+                        self._recording_session.storage_telemetry
+                    ),
                 },
                 "stopPolicy": (
                     None

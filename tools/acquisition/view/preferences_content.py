@@ -20,6 +20,7 @@ from autotrainer.behavior.pellet_trial import (
     TrialOutcome,
 )
 from autotrainer.core.logging import get_verbose_logger
+from autotrainer.core.configuration import SessionControlConfiguration
 from autotrainer.pyside import QSwitch
 from autotrainer.pyside.content_widget import invoke_method
 
@@ -800,7 +801,9 @@ class PreferencesContent(QWidget):
         form.addRow("Counted outcomes:", counted_outcomes)
 
         duration_limit = QDoubleSpinBox()
-        duration_limit.setRange(0, _DELAY_OR_DURATION_MAX_VALUE)
+        duration_limit.setRange(
+            0, SessionControlConfiguration.MAX_DURATION_SECONDS,
+        )
         duration_limit.setDecimals(1)
         duration_limit.setSingleStep(10)
         duration_limit.setSpecialValueText("No limit")

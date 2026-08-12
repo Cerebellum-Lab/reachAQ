@@ -44,6 +44,12 @@ def test_session_control_round_trips_with_system_configuration():
     )
 
 
+def test_session_duration_is_capped_at_two_hours():
+    SessionControlConfiguration(duration_limit_seconds=7200)
+    with pytest.raises(ValueError, match="cannot exceed 2 hours"):
+        SessionControlConfiguration(duration_limit_seconds=7200.1)
+
+
 @pytest.mark.parametrize(
     "kwargs, message",
     (
