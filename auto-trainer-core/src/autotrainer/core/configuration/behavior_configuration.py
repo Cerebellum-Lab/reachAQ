@@ -108,6 +108,9 @@ class SessionControlConfiguration:
 
     automatic_pellet_cycles_enabled: bool = False
     automatic_protocol_advance_enabled: bool = False
+    intertrial_analysis_enabled: bool = False
+    intertrial_progression_mode: str = "continue"
+    behavioral_retry_outcomes: tuple = ()
     attempt_assignment: str = "retry_within_trial"
     retry_settings: str = "reuse"
     trial_count_basis: str = "completed"
@@ -139,9 +142,11 @@ class SessionControlConfiguration:
         "incomplete",
         "aborted",
     )
+    INTERTRIAL_PROGRESSION_MODES = ("continue", "wait")
 
     def __post_init__(self):
         self.counted_trial_outcomes = tuple(self.counted_trial_outcomes)
+        self.behavioral_retry_outcomes = tuple(self.behavioral_retry_outcomes)
         if self.attempt_assignment not in self.ATTEMPT_ASSIGNMENTS:
             raise ValueError(
                 "Unknown attempt assignment policy: "
@@ -151,6 +156,11 @@ class SessionControlConfiguration:
             raise ValueError(f"Unknown retry settings policy: {self.retry_settings}")
         if self.trial_count_basis not in self.TRIAL_COUNT_BASES:
             raise ValueError(f"Unknown trial count basis: {self.trial_count_basis}")
+        if self.intertrial_progression_mode not in self.INTERTRIAL_PROGRESSION_MODES:
+            raise ValueError(
+                "Unknown intertrial progression mode: "
+                f"{self.intertrial_progression_mode}"
+            )
         unknown_outcomes = sorted(
             set(self.counted_trial_outcomes) - set(self.TRIAL_OUTCOMES)
         )
@@ -158,6 +168,23 @@ class SessionControlConfiguration:
             raise ValueError(
                 "Unknown counted trial outcome(s): " + ", ".join(unknown_outcomes)
             )
+        unknown_retry_outcomes = sorted(
+            set(self.behavioral_retry_outcomes) - set(self.TRIAL_OUTCOMES)
+        )
+        if unknown_retry_outcomes:
+            raise ValueError(
+                "Unknown behavioral retry outcome(s): "
+                + ", ".join(unknown_retry_outcomes)
+            )
+        if self.behavioral_retry_outcomes and not self.intertrial_analysis_enabled:
+            raise ValueError(
+                "Behavioral retry outcomes require intertrial analysis"
+            )
+        if (
+            self.trial_count_basis == "scored"
+            and not self.intertrial_analysis_enabled
+        ):
+            raise ValueError("Scored trial counting requires intertrial analysis")
         if self.duration_limit_seconds is not None and self.duration_limit_seconds <= 0:
             raise ValueError("Recording duration limit must be positive")
         if (

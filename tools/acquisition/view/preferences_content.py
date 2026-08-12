@@ -709,6 +709,80 @@ class PreferencesContent(QWidget):
         )
         form.addRow("Automatic protocol advance:", automatic_protocol)
 
+        intertrial_analysis = QSwitch()
+        intertrial_analysis.setChecked(config.intertrial_analysis_enabled)
+        intertrial_analysis.setToolTip(
+            "Analyze each completed pellet trial from buffered live tracking. "
+            "This does not reread camera frames or run the pose model again."
+        )
+        intertrial_analysis.stateChanged.connect(
+            lambda value: setattr(
+                config,
+                "intertrial_analysis_enabled",
+                value != 0,
+            )
+        )
+        form.addRow("Live intertrial analysis:", intertrial_analysis)
+
+        analysis_progression = QComboBox()
+        analysis_progression.addItem("Continue while analyzing", "continue")
+        analysis_progression.addItem("Wait for each analysis", "wait")
+        analysis_progression.setCurrentIndex(
+            analysis_progression.findData(config.intertrial_progression_mode)
+        )
+        analysis_progression.currentIndexChanged.connect(
+            lambda _index: setattr(
+                config,
+                "intertrial_progression_mode",
+                analysis_progression.currentData(),
+            )
+        )
+        intertrial_analysis.toggled.connect(analysis_progression.setEnabled)
+        analysis_progression.setEnabled(intertrial_analysis.isChecked())
+        form.addRow("After each pellet trial:", analysis_progression)
+
+        retry_outcomes = QWidget()
+        retry_outcomes_layout = QHBoxLayout(retry_outcomes)
+        retry_outcomes_layout.setContentsMargins(0, 0, 0, 0)
+        retry_outcomes_layout.setSpacing(8)
+
+        def set_retry_outcome(outcome: TrialOutcome, enabled: bool) -> None:
+            selected = set(config.behavioral_retry_outcomes)
+            if enabled:
+                selected.add(outcome.value)
+            else:
+                selected.discard(outcome.value)
+            config.behavioral_retry_outcomes = tuple(
+                candidate.value
+                for candidate in TrialOutcome
+                if candidate.value in selected
+            )
+
+        retry_checkboxes = []
+        for outcome, display_name in (
+            (TrialOutcome.NO_REACH, "No reach"),
+            (TrialOutcome.FAILURE, "Failed reach"),
+            (TrialOutcome.PELLET_MISSING, "Pellet missing"),
+        ):
+            checkbox = QCheckBox(display_name)
+            checkbox.setChecked(outcome.value in config.behavioral_retry_outcomes)
+            checkbox.toggled.connect(
+                lambda checked, item=outcome: set_retry_outcome(item, checked)
+            )
+            intertrial_analysis.toggled.connect(checkbox.setEnabled)
+            checkbox.setEnabled(intertrial_analysis.isChecked())
+            retry_checkboxes.append(checkbox)
+            retry_outcomes_layout.addWidget(checkbox)
+        retry_outcomes_layout.addStretch(1)
+        form.addRow("Retry after outcome:", retry_outcomes)
+
+        def analysis_enabled_changed(enabled: bool) -> None:
+            if not enabled:
+                for checkbox in retry_checkboxes:
+                    checkbox.setChecked(False)
+
+        intertrial_analysis.toggled.connect(analysis_enabled_changed)
+
         attempt_policy = QComboBox()
         for policy in AttemptAssignmentPolicy:
             attempt_policy.addItem(policy.display_name, policy.value)
@@ -742,16 +816,23 @@ class PreferencesContent(QWidget):
         count_basis = QComboBox()
         for basis in TrialCountBasis:
             count_basis.addItem(basis.display_name, basis.value)
-            if basis is TrialCountBasis.SCORED:
-                index = count_basis.count() - 1
-                item = count_basis.model().item(index)
-                item.setEnabled(False)
-                count_basis.setItemData(
-                    index,
-                    "Scored outcomes are calculated after recording stops, so "
-                    "they cannot be used as an active-session stop threshold.",
-                    Qt.ToolTipRole,
-                )
+        scored_index = count_basis.findData(TrialCountBasis.SCORED.value)
+
+        def set_scored_basis_enabled(enabled: bool) -> None:
+            item = count_basis.model().item(scored_index)
+            item.setEnabled(enabled)
+            count_basis.setItemData(
+                scored_index,
+                (
+                    "Uses finalized live intertrial results."
+                    if enabled
+                    else "Enable live intertrial analysis to stop by scored trials."
+                ),
+                Qt.ToolTipRole,
+            )
+
+        set_scored_basis_enabled(intertrial_analysis.isChecked())
+        intertrial_analysis.toggled.connect(set_scored_basis_enabled)
         count_basis.setCurrentIndex(count_basis.findData(config.trial_count_basis))
         count_basis.currentIndexChanged.connect(
             lambda _index: setattr(
@@ -785,6 +866,7 @@ class PreferencesContent(QWidget):
             (TrialOutcome.SUCCESS, "Success"),
             (TrialOutcome.FAILURE, "Failed reach"),
             (TrialOutcome.PELLET_MISSING, "Pellet missing"),
+            (TrialOutcome.NO_REACH, "No reach"),
             (TrialOutcome.INCOMPLETE, "Incomplete trial"),
             (TrialOutcome.ABORTED, "Aborted trial"),
         ):

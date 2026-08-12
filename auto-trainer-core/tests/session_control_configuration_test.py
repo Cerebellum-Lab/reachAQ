@@ -17,6 +17,9 @@ def test_defaults_use_grouped_attempts_and_fifteen_second_drain():
     assert configuration.attempt_assignment == "retry_within_trial"
     assert configuration.automatic_protocol_advance_enabled is False
     assert configuration.trial_count_basis == "completed"
+    assert configuration.intertrial_analysis_enabled is False
+    assert configuration.intertrial_progression_mode == "continue"
+    assert configuration.behavioral_retry_outcomes == ()
     assert configuration.stop_drain_timeout_seconds == 15.0
     assert configuration.duration_limit_seconds is None
     assert configuration.trial_limit is None
@@ -27,6 +30,9 @@ def test_session_control_round_trips_with_system_configuration():
     configuration.behavior.session_control = SessionControlConfiguration(
         automatic_pellet_cycles_enabled=True,
         automatic_protocol_advance_enabled=True,
+        intertrial_analysis_enabled=True,
+        intertrial_progression_mode="wait",
+        behavioral_retry_outcomes=("no_reach", "pellet_missing"),
         attempt_assignment="successful_presentations_only",
         retry_settings="resample",
         trial_count_basis="presented",
@@ -56,6 +62,10 @@ def test_session_duration_is_capped_at_two_hours():
         ({"attempt_assignment": "opaque"}, "attempt assignment"),
         ({"retry_settings": "opaque"}, "retry settings"),
         ({"trial_count_basis": "opaque"}, "trial count basis"),
+        ({"intertrial_progression_mode": "opaque"}, "progression mode"),
+        ({"behavioral_retry_outcomes": ("opaque",), "intertrial_analysis_enabled": True}, "retry outcome"),
+        ({"behavioral_retry_outcomes": ("no_reach",)}, "require intertrial analysis"),
+        ({"trial_count_basis": "scored"}, "requires intertrial analysis"),
         ({"counted_trial_outcomes": ("hardware_error",)}, "outcome"),
         ({"duration_limit_seconds": 0}, "duration"),
         ({"trial_limit": 0}, "Trial target"),
