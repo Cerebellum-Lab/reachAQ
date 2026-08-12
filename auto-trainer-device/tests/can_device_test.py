@@ -43,6 +43,18 @@ def data_callback(kind: int, response):
     del response  # uncheck atm
 
 
+def test_device_connection_retains_live_reader_after_join_timeout():
+    connection = object.__new__(DeviceConnection)
+    reader = mock.Mock()
+    reader.is_alive.return_value = True
+    connection._current_thread = reader
+
+    assert connection.join() is False
+
+    reader.join.assert_called_once_with(3)
+    assert connection._current_thread is reader
+
+
 def test_device_connection_throttles_empty_reads():
     """An idle CAN backend must not spin and starve the application's GUI thread."""
     interface = mock.Mock()

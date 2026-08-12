@@ -77,6 +77,8 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         self._can_recovery_thread: Optional[threading.Thread] = None
         self._can_recovery_cancel = threading.Event()
         self._first_can_failure: Optional[CanFailure] = None
+        self._can_recovery_failure: Optional[CanFailure] = None
+        self._can_recovery_generation = 0
         self._can_connection_state = {"state": "stopped", "error": ""}
 
         self._event_manager = EventManager.default()
@@ -469,6 +471,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             self._can_recovery_cancel.clear()
             with self._can_recovery_lock:
                 self._first_can_failure = None
+                self._can_recovery_failure = None
         self._command_queue = cmd_queue
         self._set_can_connection_state("connecting")
         connect_started = time.perf_counter()
@@ -655,7 +658,10 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         dev = self._device_conn
         if dev is not None:
             dev.request_disconnect()
-            dev.join()
+            if dev.join() is False:
+                raise RuntimeError(
+                    "failed CAN reader is still alive; refusing replacement transport"
+                )
             self._device_conn = None
         if can_dev is not None:
             can_dev.property_changed -= self._can_device_property_changed
@@ -738,6 +744,8 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         may restart the shared SocketCAN network interface.
         """
         self._can_recovery_cancel.set()
+        with self._can_recovery_lock:
+            self._can_recovery_generation += 1
         with self._safety_shutdown_lock:
             thread = self._safety_shutdown_thread
             if not self._safety_shutdown_started:
@@ -759,6 +767,8 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
     def disconnect(self):
         """Close only this application's device worker and CAN socket."""
         self._can_recovery_cancel.set()
+        with self._can_recovery_lock:
+            self._can_recovery_generation += 1
         self._disconnect_transport()
         self._set_can_connection_state("stopped")
 
@@ -868,15 +878,28 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             failure.context,
             failure.error,
         )
+        recoverable = failure.kind in {
+            CanFailureKind.TRANSPORT,
+            CanFailureKind.ACKNOWLEDGEMENT_TIMEOUT,
+        }
         with self._can_recovery_lock:
-            if self._first_can_failure is not None:
+            if self._first_can_failure is None:
+                self._first_can_failure = failure
+            else:
                 logger.error(
-                    "Preserving first CAN failure (%s); suppressed later failure: %s",
+                    "Preserving first CAN diagnostic failure (%s); later failure: %s",
                     self._first_can_failure.error,
                     failure.error,
                 )
+            if recoverable and self._can_recovery_failure is not None:
+                logger.error(
+                    "CAN recovery already owned by %s; suppressed duplicate recovery: %s",
+                    self._can_recovery_failure.error,
+                    failure.error,
+                )
                 return
-            self._first_can_failure = failure
+            if recoverable:
+                self._can_recovery_failure = failure
 
         with self._lock:
             pending = tuple(self._pending_tokens.items())
@@ -909,16 +932,15 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             },
             context=failure.context,
         )
-        self._set_can_connection_state("failed", error=failure.error)
-
-        if failure.kind not in {
-            CanFailureKind.TRANSPORT,
-            CanFailureKind.ACKNOWLEDGEMENT_TIMEOUT,
-        }:
+        if not recoverable:
             return
+        self._set_can_connection_state("failed", error=failure.error)
+        with self._can_recovery_lock:
+            self._can_recovery_generation += 1
+            generation = self._can_recovery_generation
         thread = threading.Thread(
             target=self._run_can_recovery,
-            args=(failure,),
+            args=(failure, generation),
             name="CanRecovery",
             daemon=True,
         )
@@ -926,70 +948,131 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             self._can_recovery_thread = thread
         thread.start()
 
-    def _run_can_recovery(self, failure: CanFailure) -> None:
-        command_queue = self._command_queue
-        if command_queue is None:
-            logger.error("CAN recovery cannot start without the original command queue")
-            return
-        self._set_can_connection_state("recovering", error=failure.error)
-        self._emit_device_event("state", "recovery_start", data={"error": failure.error})
-        transport = (
-            self._can_device.can_transport_configuration
-            if self._can_device is not None
-            else CanTransportConfiguration.from_environment()
-        )
-        delays = (0.0, 0.5, 1.5)
-        last_error = failure.error
-        for attempt, delay in enumerate(delays, start=1):
-            if self._can_recovery_cancel.wait(delay):
-                logger.info("CAN recovery cancelled during application shutdown")
+    def report_can_watchdog_failure(self, error: str) -> None:
+        self._on_can_failure(CanFailure(
+            CanFailureKind.TRANSPORT,
+            str(error),
+            category="watchdog_timeout",
+            exception_type="WatchdogTimeout",
+        ))
+
+    def _run_can_recovery(
+        self,
+        failure: CanFailure,
+        generation: Optional[int] = None,
+    ) -> None:
+        if generation is None:
+            with self._can_recovery_lock:
+                self._can_recovery_generation += 1
+                generation = self._can_recovery_generation
+                self._can_recovery_failure = failure
+        try:
+            command_queue = self._command_queue
+            if command_queue is None:
+                logger.error("CAN recovery cannot start without the original command queue")
                 return
-            try:
-                self._disconnect_transport()
-            except Exception:
-                logger.exception("Failed to close failed CAN socket before recovery attempt %s", attempt)
-            if attempt == 2 and transport.kind is CanTransportKind.SOCKETCAN:
+            if not self._can_recovery_is_current(generation):
+                return
+            self._set_can_connection_state(
+                "recovering", error=failure.error, generation=generation,
+            )
+            self._emit_device_event(
+                "state", "recovery_start",
+                data={"error": failure.error, "generation": generation},
+            )
+            transport = (
+                self._can_device.can_transport_configuration
+                if self._can_device is not None
+                else CanTransportConfiguration.from_environment()
+            )
+            delays = (0.0, 0.5, 1.5)
+            last_error = failure.error
+            for attempt, delay in enumerate(delays, start=1):
+                if self._can_recovery_cancel.wait(delay):
+                    logger.info("CAN recovery cancelled during application shutdown")
+                    return
+                if not self._can_recovery_is_current(generation):
+                    return
                 try:
-                    self._reset_socketcan(transport)
+                    self._disconnect_transport()
                 except Exception as exc:
                     last_error = str(exc) or exc.__class__.__name__
-                    logger.exception("SocketCAN reset before recovery attempt failed")
-            try:
-                self.connect(command_queue, _recovery=True)
-            except Exception as exc:
-                last_error = str(exc) or exc.__class__.__name__
-                logger.exception("CAN recovery attempt %s/%s failed", attempt, len(delays))
+                    logger.exception(
+                        "Failed to close failed CAN socket before recovery attempt %s; "
+                        "replacement transport will not be opened",
+                        attempt,
+                    )
+                    continue
+                if attempt == 2 and transport.kind is CanTransportKind.SOCKETCAN:
+                    try:
+                        self._reset_socketcan(transport)
+                    except Exception as exc:
+                        last_error = str(exc) or exc.__class__.__name__
+                        logger.exception("SocketCAN reset before recovery attempt failed")
+                try:
+                    self.connect(command_queue, _recovery=True)
+                except Exception as exc:
+                    last_error = str(exc) or exc.__class__.__name__
+                    logger.exception("CAN recovery attempt %s/%s failed", attempt, len(delays))
+                    self._emit_device_event(
+                        "state",
+                        "recovery_attempt_failed",
+                        data={
+                            "attempt": attempt,
+                            "error": last_error,
+                            "generation": generation,
+                        },
+                    )
+                    continue
+                if not self._can_recovery_is_current(generation):
+                    self._disconnect_transport()
+                    return
+
+                logger.notice("CAN recovery completed on attempt %s", attempt)
                 self._emit_device_event(
                     "state",
-                    "recovery_attempt_failed",
-                    data={"attempt": attempt, "error": last_error},
+                    "recovery_ready",
+                    data={"attempt": attempt, "generation": generation},
                 )
-                continue
+                self._set_can_connection_state("ready", generation=generation)
+                with self._can_recovery_lock:
+                    if generation == self._can_recovery_generation:
+                        self._can_recovery_failure = None
+                return
 
-            logger.notice("CAN recovery completed on attempt %s", attempt)
+            error = f"CAN recovery exhausted after {len(delays)} attempts: {last_error}"
+            logger.error("%s", error)
             self._emit_device_event(
-                "state",
-                "recovery_ready",
-                data={"attempt": attempt},
+                "state", "recovery_exhausted",
+                data={"error": error, "generation": generation},
             )
-            self._set_can_connection_state("ready")
+            self._set_can_connection_state(
+                "failed", error=error, generation=generation,
+            )
+        finally:
             with self._can_recovery_lock:
-                self._first_can_failure = None
-                self._can_recovery_thread = None
-            return
+                if generation == self._can_recovery_generation:
+                    self._can_recovery_thread = None
 
-        error = f"CAN recovery exhausted after {len(delays)} attempts: {last_error}"
-        logger.error("%s", error)
-        self._emit_device_event("state", "recovery_exhausted", data={"error": error})
-        self._set_can_connection_state("failed", error=error)
+    def _can_recovery_is_current(self, generation: int) -> bool:
         with self._can_recovery_lock:
-            self._can_recovery_thread = None
+            return generation == self._can_recovery_generation
 
-    def _set_can_connection_state(self, state: str, *, error: str = "") -> None:
+    def _set_can_connection_state(
+        self,
+        state: str,
+        *,
+        error: str = "",
+        generation: Optional[int] = None,
+    ) -> bool:
+        if generation is not None and not self._can_recovery_is_current(generation):
+            logger.warning("Ignoring stale CAN state %s from generation %s", state, generation)
+            return False
         previous = self._can_connection_state
         value = {"state": str(state), "error": str(error or "")}
         self._can_connection_state = value
         self._on_property_changed(self.CAN_CONNECTION_STATE_PROPERTY, value, previous)
+        return True
 
     def __send_with_token(self, device: DeviceConnectionProtocol, cmd: SystemCommandKind, data=None) -> Optional[UUID]:
         token = uuid4()

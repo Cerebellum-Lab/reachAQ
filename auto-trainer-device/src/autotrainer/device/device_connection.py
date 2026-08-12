@@ -123,7 +123,12 @@ class DeviceConnection(DeviceConnectionProtocol):
     def read_limit(self, value: int):
         self._read_limit = value
 
-    def join(self):
+    @property
+    def reader_thread_alive(self) -> bool:
+        thread = self._current_thread
+        return thread is not None and thread.is_alive()
+
+    def join(self) -> bool:
         # TODO this is for legacy compatibility when the connection was exposed directly as a thread for clients that
         #  wanted to know when the connection was guaranteed to be terminated.  This should be accommodated a different
         #  way - see TODOs in request_(dis)connect.
@@ -132,8 +137,10 @@ class DeviceConnection(DeviceConnectionProtocol):
             logger.debug("joining %s", thread)
             thread.join(3)
             if thread.is_alive():
-                logger.warning("thread %s still alive, but continuing", thread)
+                logger.error("thread %s is still alive; ownership is retained", thread)
+                return False
             self._current_thread = None
+        return True
 
     def request_connect(self):
         """

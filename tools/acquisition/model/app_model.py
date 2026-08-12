@@ -5350,18 +5350,14 @@ class AppModel(ObservableObject):
             WatchdogItems.DEVICE_WRITER.value,
         }:
             try:
-                self._hardware.safety_shutdown(error, wait=False)
+                self._hardware.report_can_watchdog_failure(error)
             except Exception:
-                logger.exception("CAN safety shutdown failed after watchdog timeout")
+                logger.exception("Failed to start CAN recovery after watchdog timeout")
             self._analysis.watchdog_monitor.unregister_watchdog(watchdog_id)
             self._set_subsystem_status(
                 SubsystemId.CAN_PELLET,
                 SubsystemState.FAILED,
                 error=error,
-            )
-            self._abort_recording_for_required_subsystem(
-                SubsystemId.CAN_PELLET,
-                error,
             )
         elif watchdog_key in {
             WatchdogItems.POSE_PROCESS.value,
@@ -5994,10 +5990,9 @@ class AppModel(ObservableObject):
                 SubsystemState.FAILED,
                 error=error or "CAN/pellet controller failed",
             )
-            self._abort_recording_for_required_subsystem(
-                SubsystemId.CAN_PELLET,
-                error or "CAN/pellet controller failed",
-            )
+            # Preserve all remaining recording streams. The in-flight command
+            # is explicitly failed/unknown by HardwareModel and no new pellet
+            # cycle is allowed until this subsystem returns to Ready.
         elif state == "stopped" and not self._acquisition.stopping:
             self._set_subsystem_status(
                 SubsystemId.CAN_PELLET,

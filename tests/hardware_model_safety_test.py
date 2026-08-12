@@ -31,6 +31,8 @@ def test_safety_shutdown_is_idempotent_and_disconnects_before_reset():
     hardware._safety_shutdown_started = False
     hardware._safety_shutdown_thread = None
     hardware._can_recovery_cancel = threading.Event()
+    hardware._can_recovery_lock = threading.Lock()
+    hardware._can_recovery_generation = 0
     hardware._can_device = mock.Mock()
     hardware._can_device.can_transport_configuration = mock.sentinel.transport
     hardware._disconnect_transport = mock.Mock(side_effect=lambda: events.append("disconnect"))
@@ -51,6 +53,8 @@ def test_confirmed_can_safety_shutdown_resets_configured_transport_without_activ
     hardware._safety_shutdown_started = False
     hardware._safety_shutdown_thread = None
     hardware._can_recovery_cancel = threading.Event()
+    hardware._can_recovery_lock = threading.Lock()
+    hardware._can_recovery_generation = 0
     hardware._can_device = None
     hardware._disconnect_transport = mock.Mock()
     hardware._reset_socketcan = mock.Mock()
@@ -68,6 +72,8 @@ def test_confirmed_can_safety_shutdown_resets_configured_transport_without_activ
 def test_ordinary_disconnect_closes_only_owned_transport():
     hardware = object.__new__(HardwareModel)
     hardware._can_recovery_cancel = threading.Event()
+    hardware._can_recovery_lock = threading.Lock()
+    hardware._can_recovery_generation = 0
     hardware._disconnect_transport = mock.Mock()
     hardware._reset_socketcan = mock.Mock()
     hardware._can_connection_state = {"state": "ready", "error": ""}
@@ -151,7 +157,8 @@ def test_bounded_recovery_reuses_full_connection_initialization(hardware_model):
     assert hardware_model.connect.call_count == 2
     hardware_model.connect.assert_called_with(command_queue, _recovery=True)
     assert hardware_model._can_connection_state == {"state": "ready", "error": ""}
-    assert hardware_model._first_can_failure is None
+    assert hardware_model._first_can_failure.error == "reader failed"
+    assert hardware_model._can_recovery_failure is None
 
 
 def test_ack_failure_captures_interface_counters_before_recovery(
@@ -184,3 +191,49 @@ def test_ack_failure_captures_interface_counters_before_recovery(
     assert reported[0].diagnostics == captured
     assert hardware_model._first_can_failure.diagnostics == captured
     hardware_model._run_can_recovery.assert_called_once()
+
+
+def test_command_failure_does_not_latch_or_suppress_later_transport_recovery(
+    hardware_model,
+):
+    hardware_model._run_can_recovery = mock.Mock()
+
+    hardware_model._on_can_failure(CanFailure(
+        CanFailureKind.COMMAND,
+        "motor command rejected",
+        command=SystemCommandKind.SEND_PELLET,
+    ))
+
+    assert hardware_model._first_can_failure.error == "motor command rejected"
+    assert hardware_model._can_recovery_failure is None
+    assert hardware_model._can_connection_state["state"] != "failed"
+
+    hardware_model._on_can_failure(CanFailure(
+        CanFailureKind.TRANSPORT,
+        "adapter removed",
+    ))
+    hardware_model._can_recovery_thread.join(1)
+
+    assert hardware_model._can_recovery_failure.error == "adapter removed"
+    hardware_model._run_can_recovery.assert_called_once()
+
+
+def test_stale_recovery_generation_cannot_publish_ready(hardware_model):
+    hardware_model._can_recovery_generation = 4
+    before = dict(hardware_model._can_connection_state)
+
+    assert not hardware_model._set_can_connection_state("ready", generation=3)
+
+    assert hardware_model._can_connection_state == before
+
+
+def test_recovery_handle_is_cleared_when_command_queue_is_missing(hardware_model):
+    failure = CanFailure(CanFailureKind.TRANSPORT, "reader failed")
+    hardware_model._command_queue = None
+    hardware_model._can_recovery_generation = 7
+    hardware_model._can_recovery_failure = failure
+    hardware_model._can_recovery_thread = mock.sentinel.thread
+
+    hardware_model._run_can_recovery(failure, 7)
+
+    assert hardware_model._can_recovery_thread is None
