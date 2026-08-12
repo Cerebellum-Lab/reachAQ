@@ -109,11 +109,31 @@ def test_live_no_recording(inference_data_proc):
     pose_rsp = args[0]
     assert isinstance(pose_rsp, PoseResponse)
     assert pose_rsp.sequence == 0
+    assert pose_rsp.source_frame_ids == ((), ())
     #
     msg, (args, kwargs) = proc._msg_queue.get(timeout=3)
     pose_rsp = args[0]
     # print(msg, args, kwargs)
     assert pose_rsp.sequence == 1
+
+
+def test_live_response_preserves_actual_source_frame_ids(
+    inference_data_proc, monkeypatch, tmp_path
+):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ProjectInfo().get_session_path()[0]).mkdir(parents=True)
+    proc = inference_data_proc
+    proc.start()
+    assert proc._cmd_ack_event.wait(3)
+    proc._cmd_ack_event.clear()
+    frame_ids = np.asarray(((101, 102, 103), (201, 202, 203)))
+    # Initial monitor samples can be discarded while live workers warm up.
+    for _ in range(8):
+        proc._data_queue.put((zero_pose_data, InferenceMode.Live, frame_ids))
+        time.sleep(0.1)
+    _, (args, _) = proc._msg_queue.get(timeout=3)
+    pose_rsp = args[0]
+    assert pose_rsp.source_frame_ids == ((101, 102, 103), (201, 202, 203))
 
 
 def test_renew_workers(request, monkeypatch, caplog, capture_multiprocess_logs):

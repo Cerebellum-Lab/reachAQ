@@ -107,15 +107,29 @@ class LivePoseResultProcessWorker(multiprocessing.Process):
                 count_processed = count_out_full = 0
                 p_next_log_info = p_now + log_every_delay
             try:
-                pose_data, seq_nr = self._input_q.get(timeout=0.1)
+                payload = self._input_q.get(timeout=0.1)
             except queue.Empty:
                 continue
+            if len(payload) == 2:
+                # Compatibility with callers/tests that predate source-frame
+                # propagation. New monitor processes always send three items.
+                pose_data, seq_nr = payload
+                source_frame_ids = ()
+            else:
+                pose_data, seq_nr, source_frame_ids = payload
             count_processed += 1
             rsp = self._pose_algo.process(
                 pose_data,
                 pairs_3d_offsets=self._monitored_parts_offsets,
                 sequence=seq_nr,
                 camera_count=self._camera_count,
+            )
+            rsp = dataclasses.replace(
+                rsp,
+                source_frame_ids=tuple(
+                    tuple(int(frame_id) for frame_id in camera_ids)
+                    for camera_ids in source_frame_ids
+                ),
             )
             data = (
                 InferenceMonitorDataMsg.POSE_RESULT_READY,  # cmd

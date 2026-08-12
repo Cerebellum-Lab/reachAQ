@@ -49,6 +49,14 @@ class PoseResponse:
     perf_c: float = dataclasses.field(default_factory=get_perf_now)
     """Perf counter when this response applies"""
 
+    source_frame_ids: Tuple[Tuple[int, ...], ...] = ()
+    """Actual camera frame IDs used to produce this response, by camera.
+
+    ``perf_c`` is the completion time of live pose processing and may lag the
+    camera timeline.  These IDs preserve the acquisition identity required to
+    associate live tracking with an exact recording/trial window.
+    """
+
     parts_flags: Tuple[Dict[str, bool], ...] = dataclasses.field(default_factory=lambda: ({}, {}, {}))
     """Tuple indicating part seen for each camera, followed by all cameras in the same frame."""
 
@@ -131,6 +139,7 @@ class PoseResponse:
         return self.__class__(
             sequence=self.sequence,
             perf_c=self.perf_c,
+            source_frame_ids=self.source_frame_ids,
             parts_flags=self.parts_flags,
             locations=self.locations,
             locations_3d=dict((n, loc.round(ndigits)) for n, loc in self.locations_3d.items()),

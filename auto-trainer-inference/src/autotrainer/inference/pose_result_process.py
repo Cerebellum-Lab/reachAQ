@@ -695,7 +695,14 @@ class InferenceMonitorDataProc(multiprocessing.Process):
 
                     if len(live_pose_workers) > 0:
                         try:
-                            self._live_input_q.put((pose_data, live_pose_sequence), block=False)
+                            source_frame_ids = tuple(
+                                tuple(int(frame_id) for frame_id in cam_frame_ids if frame_id >= 0)
+                                for cam_frame_ids in frames_indices
+                            )
+                            self._live_input_q.put(
+                                (pose_data, live_pose_sequence, source_frame_ids),
+                                block=False,
+                            )
                         except queue.Full:
                             pass
                         live_pose_sequence += 1
