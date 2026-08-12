@@ -12,14 +12,16 @@ fixes. Repeat the applicable tests below against the current commit.
 ## Plan-conformance audit
 
 The implementation was re-audited requirement-by-requirement through the UI,
-protocol, and desktop-launcher implementation series ending at `b4daf863`.
+protocol, reliability, and live-intertrial-analysis implementation series on
+2026-08-12.
 This separates software implemented and covered by automated tests from
 behavior that still requires physical-rig acceptance.
 
 Completed automated checks:
 
-- [x] Full repository suite after the UI/protocol/launcher series: `782 passed,
-      35 skipped, 1 xpassed` (2 expected no-stereo-parameters warnings).
+- [x] Focused lifecycle, trial, intertrial-analysis, persistence, and UI suites
+      pass after the implementation series. Record the final full-suite result
+      in the Test record below before hardware acceptance.
 - [x] No production imports reference the removed load-cell, SensorAnalysis,
       webcam/top-camera, head-fix, tunnel, magnet, alarm, or emergency runtime
       implementations, and no recording-scoped trial events are emitted.
@@ -27,7 +29,7 @@ Completed automated checks:
       source manifests, NI sample timelines, camera/NI correlations, decoded CAN
       persistence, subsystem states, stop arbitration, trial-ledger primitives,
       animal-v7 migration, platform artifact selection, UI controls, and
-      post-session-analysis cancellation have automated coverage.
+      generation-safe intertrial-analysis cancellation have automated coverage.
 - [x] Live-inference processing remains on the retained implementation; its
       lifecycle fixture/cleanup was repaired without changing the inference
       calculation or frame-queue behavior.
@@ -42,17 +44,16 @@ Resolved implementation gaps:
       failures reach `PelletCycleController.finalize_hardware_failure`, map to
       the matching typed hardware error, close the public lifecycle, cancel the
       active protocol trial, and preserve the logical number for retry.
-- [x] Behavioral retry numbering is finalized from the only authoritative
-      behavioral result: per-attempt post-session analysis. Real persisted
-      sessions are deterministically reindexed as `1.1`, `1.2`, and so on under
-      **Retry within the same trial**; retry policy and settings policy are
-      recorded. Hardware retries are indexed immediately.
-- [x] Post-session reach events are mapped by frame rate and canonical recording
-      start into non-overlapping attempt performance-time windows. Every pending
-      attempt is finalized exactly once or explicitly marked incomplete.
-- [x] **Scored trials** is disabled in the Preferences selector and rejected by
-      recording readiness because scores do not exist until after Stop. Saved
-      analysis still reports scored counts.
+- [x] Behavioral retry numbering is finalized from one authoritative per-trial
+      live-tracking result. Retry-dependent modes wait before another SEND;
+      Continue mode cannot relabel an already-started attempt. Hardware retries
+      are indexed immediately.
+- [x] Decoded tone 2 and exact pellet-cycle completion bound immutable tracking
+      windows. A bounded generation-owned worker analyzes existing tracking
+      without reopening video; every pending attempt is finalized once or
+      explicitly marked incomplete/unavailable.
+- [x] **Scored trials** is available only with live intertrial analysis and can
+      drive automatic Stop from finalized results while recording.
 - [x] Trial records include pellet position, planned/applied shifts,
       protocol/phase context, per-trial reaches/success/consumption, event
       indices, and tone/laser references in addition to lifecycle/error fields.
@@ -64,6 +65,11 @@ Resolved implementation gaps:
 - [x] Acquisition, recording-session, pellet-cycle, pellet automation,
       protocol, presence, shift recommendation, coordinate validation, pellet
       misplacement, and watchdog responsibilities now have explicit owners.
+- [x] Camera discovery/ID merge/video validation, bounded NI persistence and
+      coverage classification, atomic auxiliary generations, output preflight,
+      CAN recovery generations, safe pellet initialization, background
+      SoftMouse refresh, bounded event dispatch, cleanup containment, launcher
+      locking, and owned signal shutdown have focused automated coverage.
 
 The remaining unchecked items below are physical-rig acceptance, not known
 software implementation gaps.
@@ -123,13 +129,14 @@ software implementation gaps.
 - [ ] Investigate every failure. If a timing test is classified as a flake,
       preserve its first output and demonstrate at least three consecutive
       passing reruns of that exact test.
-- [ ] Run the live and post-session inference regression tests and confirm no
-      inference workers remain after pytest exits:
+- [ ] Run live inference and intertrial-tracking regression tests and confirm no
+      workers remain after pytest exits:
 
   ```bash
   conda run -n reachaq python -m pytest -q \
     auto-trainer-inference/tests/live_pose_result_test.py \
-    auto-trainer-inference/tests/real_data_intersession_process_test.py \
+    tools/acquisition/tests/intertrial_analysis_test.py \
+    tools/acquisition/tests/live_tracking_buffer_test.py \
     tests/inference_recording_ack_test.py
   ```
 - [ ] Confirm the Spinnaker resolver selects the bundled Linux x86-64, Linux
@@ -229,7 +236,8 @@ software implementation gaps.
       messages, and tone events on each available tone channel.
 - [ ] If laser is enabled, generate several commanded laser events and physical
       feedback transitions.
-- [ ] Press Stop and wait for offline analysis to finish.
+- [ ] Press Stop and wait for already-closed trial analysis and finalization to
+      drain.
 - [ ] Confirm Record remains disabled throughout stopping and analysis and is
       enabled again only after analysis completes.
 - [ ] Confirm cameras, pose data, NI-DAQ, decoded device/CAN events, laser events,
@@ -297,8 +305,8 @@ software implementation gaps.
       once per corresponding event.
 - [ ] Press Stop and confirm all writers use the final synchronized boundary,
       data is retained, and counts remain visible during and after analysis.
-- [ ] Confirm offline analysis populates its expected results after Stop without
-      changing the recorded raw sources.
+- [ ] Confirm each completed pellet trial populates live tracking-derived results
+      while recording without changing or delaying the recorded raw sources.
 - [ ] Confirm analysis completes promptly for a short session and does not leave
       Record permanently disabled.
 - [ ] Record at least three consecutive retained sessions without restarting the
@@ -326,8 +334,8 @@ software implementation gaps.
       decoded device event, and permits a later successful retry without
       consuming a logical trial number.
 - [ ] Record multiple attempts including analyzed behavioral failures under each
-      assignment/settings policy. After Stop, confirm the reconciled persisted
-      labels and recorded reuse/resample choice are exactly as configured.
+      assignment/settings policy. Confirm live-finalized labels and recorded
+      reuse/resample choices are exactly as configured.
 - [ ] With a selected protocol, confirm each qualifying pellet trial advances
       progress once and a recording boundary does not increment progress.
 - [ ] Confirm manual pellet control remains available with no protocol selected,
@@ -345,18 +353,86 @@ software implementation gaps.
 - [ ] Confirm `streams/trials.jsonl`, `streams/trial_summary.json`, final
       metadata, and `alignment.json` use the same session ID and canonical
       timestamp boundary.
-- [ ] Confirm post-session analysis assigns a terminal outcome to every
-      analyzable attempt exactly once, leaves no unexplained `pending_analysis`
-      attempt, and updates `trials.jsonl`, `trial_summary.json`, protocol
-      progress, and displayed counts consistently.
+- [ ] Confirm live intertrial analysis assigns a terminal outcome to every
+      analyzable completed window exactly once, leaves no unexplained
+      `pending_analysis` attempt after Stop, and updates `trials.jsonl`,
+      `trial_summary.json`, protocol progress, and displayed counts consistently.
 - [ ] Verify every persisted attempt contains the pellet position,
       planned/applied shifts, protocol/phase context, reach/success/consumption
       outcome, and references to associated tone/laser command and NI-feedback
       records.
-- [ ] Select **Scored trials** with a small trial limit. Confirm the application
-      either reaches that limit from reliable outcomes while recording or
-      refuses the unsupported combination before Record; it must never silently
-      record forever.
+- [ ] Select **Scored trials** with live intertrial analysis and a small trial
+      limit. Confirm finalized results reach the limit while recording and Stop
+      completes the current physical trial. Disable analysis and confirm the
+      scored combination is rejected before Record.
+
+## Live intertrial analysis and pellet-state acceptance
+
+- [ ] In **Continue while analyzing**, complete several rapid pellet cycles.
+      Confirm subsequent SEND operations are allowed, late results retain their
+      original operation/trial IDs, and already-active rows never change.
+- [ ] In **Wait for analysis**, confirm only SEND is blocked after cycle
+      completion; camera, pose, NI, device, laser, and log writers continue.
+- [ ] Configure retries for `no_reach`, failure, or consumption-dependent
+      outcomes. Confirm waiting is forced regardless of the base mode and the
+      resulting retry receives `N.2` before any following row can start.
+- [ ] Cause a retry-dependent analysis exception or fill the bounded queue.
+      Confirm **Retry analysis** resubmits the identical stored window and
+      **Continue without result** persists incomplete/unavailable while skipping
+      that retry decision. Confirm Stop and Abort remain enabled.
+- [ ] Confirm the Trial Protocol panel reports pending count, measured analysis
+      seconds per tracking second, and `estimating` until measurements exist.
+- [ ] Verify each tracking window begins at decoded pellet-board tone-2 rising
+      and ends exactly at pellet-cycle completion. Confirm NI tone 2 is retained
+      separately as physical confirmation.
+- [ ] Present a pellet with no reach and confirm `no_reach`, never
+      `pellet_missing`. Verify direct live presence, absence, and misplacement
+      finalize at cycle completion without entering the analysis wait queue.
+- [ ] Disable live inference and then disable intertrial analysis. Confirm manual
+      and protocol pellet cycles still operate, presence/misplacement is
+      `unknown`, completed attempts are unscored, and no fabricated retry occurs.
+- [ ] Press Stop with one active physical trial and other closed windows pending.
+      Confirm the active trial becomes incomplete, closed windows drain, stored
+      tracking repairs a missing result if possible, and Record stays disabled
+      only until finalization finishes.
+- [ ] Press Abort while an analysis job is running. Confirm no stale result is
+      published, the session directory is deleted, live inference remains usable,
+      and the next session starts with a new generation.
+
+## Reliability, storage, and metadata acceptance
+
+- [ ] Record synchronized cameras with deliberately missing, duplicate, and
+      out-of-order synthetic timing IDs. Confirm merge is by actual frame ID,
+      missing rows are explicit, synchronization completeness fails, and the
+      retained session is never deleted.
+- [ ] Validate each stopped MP4 against writer and timestamp counts. Confirm a
+      mismatch stores all three counts plus role/serial and first writer error as
+      a warning; unreadable/zero-frame video marks data incomplete but is kept.
+- [ ] Confirm JSON, YAML, alignment, trials, summary, tracking records, and final
+      manifest share one metadata generation ID. Interrupt an auxiliary publish
+      in a test copy and confirm the previous generation remains detectable and
+      staged data is available for bounded retry.
+- [ ] Run a long enabled NI session with plots hidden. Confirm memory remains
+      bounded, all channels persist, sample indices/times remain monotonic, and
+      first/last exceptions, gaps, overruns, epochs, and coverage are recorded.
+- [ ] Inject a recovered NI copy error and boundary shortfall below five seconds;
+      confirm warnings only. Test zero samples, persistence/worker failure, and
+      boundary loss above five seconds; confirm NI is incomplete while partial
+      camera/device data is preserved.
+- [ ] Before Record, confirm the target filesystem probe writes and `fsync`s,
+      and the report contains free bytes and projected maximum minutes. Exercise
+      the 30- and 10-minute warnings and below-one-minute normal Stop without
+      Abort. Confirm the two-hour configured-duration cap.
+- [ ] Open Preferences, start recording through another path, and confirm all
+      mutable configuration controls disable. Confirm model-level setters reject
+      changes through Recording/Stopping/Analyzing and re-enable at Ready.
+- [ ] Corrupt one animal JSON beside valid animals. Confirm valid subjects load,
+      the corrupt file is unchanged and listed with its reason, and duplicate
+      UUID remains a hard conflict.
+- [ ] Trigger manual, scheduled, and publisher-completion SoftMouse refreshes.
+      Confirm file/hash/SQLite work remains off the Qt thread, duplicate requests
+      debounce, one recording-time request is deferred until Ready, and controls
+      re-enable on both success and error.
 
 ## API and lifecycle contract
 
@@ -380,7 +456,7 @@ software implementation gaps.
       watchdog, and coordinate/calibration responsibilities have explicit
       owners and do not rely on removed global-mode or tunnel state gates.
 - [ ] Trace Reaches, Presented, Success, and Consumed from recorded source event
-      to UI, metadata, trial summary, and post-session result. Confirm each has
+      to UI, metadata, trial summary, and per-trial live result. Confirm each has
       one authoritative value or a tested deterministic reconciliation rule.
 - [ ] Confirm every hardware command used for a pellet attempt or automatic
       shift records dispatch, acknowledgement/failure, operation ID, and the
@@ -432,8 +508,10 @@ software implementation gaps.
       remain operational.
 - [ ] Restore each failed camera using Hardware Refresh. Confirm only the failed
       or blocked domains retry and healthy cameras are not restarted.
-- [ ] Confirm loss of a required camera during Recording aborts only the active
-      session and does not initiate a global hardware shutdown.
+- [ ] Lose a secondary camera during Recording. Confirm the primary and other
+      streams continue and the session is retained as synchronization-incomplete.
+      Lose the primary/writer and confirm normal Stop preserves partial data;
+      neither case invokes Abort or global hardware shutdown.
 
 ## PXI, NI-DAQ, CAN, and laser failure isolation
 
@@ -468,6 +546,14 @@ software implementation gaps.
       configuration, restarts reader/status streaming, and returns CAN to Ready.
       Confirm failure after all three attempts remains explicit and does not
       disturb cameras, NI-DAQ, laser, or logs.
+- [ ] On initial pellet-board connection and successful recovery, observe
+      acknowledged motor configuration, X/Y/Z home, and detachment of both
+      pellet servos. Confirm there is no connection-time attach/release motion;
+      normal Load/Cover/Release still attaches on demand.
+- [ ] End sessions by manual Stop, automatic Stop, and Abort. Confirm each
+      requests home only after the closed stream boundary when the board is
+      Ready, records the end action, and cannot block save/deletion if homing
+      fails.
 - [ ] Interrupt CAN while a pellet/motor command is in flight. Confirm the
       operation is stored as failed/unknown with its context and is never
       replayed after reconnect. Confirm a later operator/protocol retry receives
@@ -488,8 +574,9 @@ software implementation gaps.
       baseline to improve, not an acceptable pass threshold.
 - [ ] Disable laser while NI input remains enabled and confirm NI acquisition
       remains operational.
-- [ ] Induce a safe writer/source failure during Recording. Confirm the session is
-      rejected or aborted atomically rather than retained as complete.
+- [ ] Induce a safe writer/source failure during Recording. Confirm normal Stop
+      preserves every partial file and diagnostics and marks the source/session
+      incomplete; it must not invoke automatic Abort or deletion.
 
 ## Camera error diagnostics
 
@@ -523,6 +610,11 @@ software implementation gaps.
       with different NI model(s), aliases, slots, or capabilities.
 - [ ] Confirm optional hardware-timed laser settings remain disabled and do not
       affect ordinary on-demand laser operation when unsupported or unused.
+- [ ] Test a digital-only master. Confirm a counter produces the sample clock,
+      consumers arm first, and no nonexistent AI start trigger is published.
+- [ ] For finite hardware-timed laser output, confirm the AO task actually
+      applies the resolved reference/start/sample routes before reporting
+      synchronized. Confirm arbitrary on-demand pulses remain independent.
 
 ## Endurance and recovery
 
@@ -530,8 +622,8 @@ software implementation gaps.
       sources and representative event traffic.
 - [ ] Confirm no dropped camera frames, NI gaps, buffer overruns, writer lag,
       timestamp reversals, unbounded memory growth, or watchdog failures.
-- [ ] Stop and complete analysis; confirm the long session finalizes as complete
-      and all counts and metadata agree with the files.
+- [ ] Stop and drain closed-window analysis/finalization; confirm the long session
+      finalizes as complete and all counts and metadata agree with the files.
 - [ ] Return System Mode to stopped, restart acquisition, and make another short
       recording without restarting the application.
 - [ ] Restart the application and open the retained sessions. Confirm Analysis
