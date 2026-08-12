@@ -258,6 +258,75 @@ class PelletCycleController:
         )
         return finalized
 
+    def finalize_intertrial_result(
+        self,
+        project,
+        result,
+        *,
+        retry: bool = False,
+        tone_references=(),
+        laser_references=(),
+    ):
+        """Apply one generation-validated live tracking result."""
+        ledger = self._require_ledger()
+        request = result.request
+        attempt = next(
+            (
+                value
+                for value in ledger.attempts
+                if value.trial_id == request.trial_id
+                and value.attempt_id == request.attempt_id
+                and value.operation_id == request.operation_id
+            ),
+            None,
+        )
+        if attempt is None:
+            raise KeyError(
+                f"Unknown intertrial result identity {request.attempt_label}"
+            )
+        window = request.window
+        shift = result.recommended_shift
+        finalized = ledger.finalize_pending(
+            request.trial_id,
+            request.attempt_id,
+            result.outcome,
+            request.window.end_perf,
+            attempt.capture_end_wall_time or attempt.send_wall_time,
+            error=result.error,
+            reach_count=result.reach_count,
+            success_count=result.success_count,
+            consumption_count=result.consumption_count,
+            tone_references=tuple(tone_references),
+            laser_references=tuple(laser_references),
+            pellet_presence=request.pellet_state.presence.value,
+            pellet_misplacement=request.pellet_state.misplacement.value,
+            analysis_window_start_perf=window.start_perf,
+            analysis_window_end_perf=window.end_perf,
+            tracking_coverage=window.coverage,
+            tracking_missing_frame_ids=window.missing_frame_ids,
+            tracking_interpolated_points=result.interpolated_points,
+            tracking_long_gap_count=result.long_gap_count,
+            analysis_duration_seconds=result.analysis_seconds,
+            recommended_shift=(
+                None
+                if shift is None
+                else {"x": shift[0], "y": shift[1], "z": shift[2]}
+            ),
+            retry=retry,
+        )
+        self._session_api.trial_ended(finalized)
+        if finalized.logical_trial_complete:
+            self._protocol_runner.record_trial_outcome(
+                finalized.attempt_label,
+                finalized.outcome,
+            )
+        self._session_data_recorder.update_persisted_trial_ledger(
+            project,
+            ledger.to_records(),
+            ledger.summary(),
+        )
+        return finalized
+
     def finalize_pending_without_analysis(
         self,
         project,

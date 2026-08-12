@@ -201,6 +201,31 @@ def test_runtime_behavioral_retry_reserves_next_attempt_label_before_analysis():
     assert second.attempt_label == "1.2"
 
 
+def test_analysis_driven_retry_is_reserved_before_the_next_send():
+    ledger = PelletTrialLedger("session001")
+    ledger.begin_send(1.0, 11.0)
+    ledger.acknowledge_presentation(1.1, 11.1)
+    ledger.close_active_for_analysis(2.0, 12.0)
+    finalized = ledger.finalize_pending(
+        1, 1, TrialOutcome.NO_REACH, 2.1, 12.1, retry=True
+    )
+    retry = ledger.begin_send(2.2, 12.2)
+    assert not finalized.logical_trial_complete
+    assert retry.attempt_label == "1.2"
+
+
+def test_late_analysis_cannot_relabel_a_subsequent_attempt_for_retry():
+    ledger = PelletTrialLedger("session001")
+    ledger.begin_send(1.0, 11.0)
+    ledger.acknowledge_presentation(1.1, 11.1)
+    ledger.close_active_for_analysis(2.0, 12.0)
+    ledger.begin_send(2.1, 12.1)
+    with pytest.raises(RuntimeError, match="subsequent attempt"):
+        ledger.finalize_pending(
+            1, 1, TrialOutcome.NO_REACH, 2.2, 12.2, retry=True
+        )
+
+
 def test_analysis_fields_are_persisted_on_pending_attempt():
     ledger = PelletTrialLedger("session001")
     ledger.begin_send(

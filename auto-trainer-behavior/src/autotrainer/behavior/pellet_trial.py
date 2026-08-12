@@ -394,6 +394,7 @@ class PelletTrialLedger:
         tracking_long_gap_count: int = 0,
         analysis_duration_seconds: Optional[float] = None,
         recommended_shift: Optional[Dict[str, float]] = None,
+        retry: bool = False,
     ) -> PelletTrialAttempt:
         """Apply one offline-analysis result to a provisionally closed attempt."""
         outcome = TrialOutcome(outcome)
@@ -411,6 +412,21 @@ class PelletTrialLedger:
                 raise RuntimeError(
                     f"Attempt {attempt.attempt_label} is not pending analysis"
                 )
+            if retry and index != len(self._attempts) - 1:
+                raise RuntimeError(
+                    "Cannot apply a behavioral retry after a subsequent attempt started"
+                )
+            policy = self.configuration.assignment_policy
+            should_retry_same_trial = (
+                retry
+                and policy is AttemptAssignmentPolicy.RETRY_WITHIN_TRIAL
+                and attempt.trial_id is not None
+            )
+            logical_complete = not retry
+            if policy is AttemptAssignmentPolicy.EVERY_ATTEMPT_IS_TRIAL:
+                logical_complete = True
+            elif policy is AttemptAssignmentPolicy.SUCCESSFUL_PRESENTATIONS_ONLY:
+                logical_complete = attempt.is_presented and not retry
             finalized = dataclasses.replace(
                 attempt,
                 finalized_perf_time=float(perf_time),
@@ -451,8 +467,12 @@ class PelletTrialLedger:
                 recommended_shift=(
                     None if recommended_shift is None else dict(recommended_shift)
                 ),
+                logical_trial_complete=logical_complete,
             )
             self._attempts[index] = finalized
+            if should_retry_same_trial:
+                self._retry_trial_id = finalized.trial_id
+                self._retry_attempt_id = finalized.attempt_id
             return finalized
         raise KeyError(f"Unknown trial attempt {trial_id}.{attempt_id}")
 
