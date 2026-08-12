@@ -23,6 +23,7 @@ def test_running_ready_keeps_mode_selector_available():
     state = _state()
 
     assert state.system_mode
+    assert state.preferences
     assert state.hardware_refresh
     assert state.subject
     assert state.protocol_selection
@@ -33,6 +34,7 @@ def test_recording_locks_identity_and_system_controls_but_not_notes():
     state = _state(recording_status=SessionRecordingStatus.RECORDING)
 
     assert not state.system_mode
+    assert not state.preferences
     assert not state.subject
     assert not state.protocol_selection
     assert not state.hardware_refresh
@@ -47,6 +49,7 @@ def test_idle_enables_configuration_and_identity_controls():
     )
 
     assert state.system_mode
+    assert state.preferences
     assert state.idle_configuration
     assert state.hardware_refresh
     assert state.subject
@@ -57,5 +60,6 @@ def test_background_operation_temporarily_disables_conflicting_controls():
     state = _state(hardware_refreshing=True)
 
     assert not state.system_mode
+    assert not state.preferences
     assert not state.subject
     assert state.notes

@@ -3007,8 +3007,16 @@ class AppModel(ObservableObject):
     def output_location(self) -> str:
         return self._output_location
 
+    def _require_session_ready_for_configuration(self, action: str) -> None:
+        status = self._recording_session.status
+        if status is not SessionRecordingStatus.READY:
+            raise RuntimeError(
+                f"{action} is unavailable while session state is {status.value}"
+            )
+
     @output_location.setter
     def output_location(self, value: str):
+        self._require_session_ready_for_configuration("Changing the output location")
         if self._output_location == value and self._project_info is not None:
             return
         old_value = self._output_location
@@ -4451,6 +4459,7 @@ class AppModel(ObservableObject):
         return configuration
 
     def load_configuration(self, location: Optional[Path] = None, *, random_cameras: bool = False):
+        self._require_session_ready_for_configuration("Loading configuration")
         if location is None:
             location = self.get_config_location()
 
@@ -4636,6 +4645,9 @@ class AppModel(ObservableObject):
         nidaq_ports: NidaqPortConfiguration,
         laser_configuration: LaserSystemConfiguration,
     ) -> None:
+        self._require_session_ready_for_configuration(
+            "Changing the DAQ port configuration"
+        )
         if self._loaded_configuration is None:
             raise RuntimeError("Cannot update DAQ port configuration before a system configuration is loaded")
         self._nidaq_ports = nidaq_ports

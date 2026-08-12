@@ -11,7 +11,7 @@ from PySide6 import QtCore
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QWidget, QFormLayout, QLineEdit, QComboBox, QLabel, QHBoxLayout, QPushButton,
                                QTabWidget, QVBoxLayout, QCheckBox, QDoubleSpinBox, QSpinBox, QGridLayout,
-                               QLayout, QSizePolicy, QGroupBox)
+                               QLayout, QSizePolicy, QGroupBox, QFileDialog)
 
 from autotrainer.behavior.pellet_trial import (
     AttemptAssignmentPolicy,
@@ -21,6 +21,7 @@ from autotrainer.behavior.pellet_trial import (
 )
 from autotrainer.core.logging import get_verbose_logger
 from autotrainer.pyside import QSwitch
+from autotrainer.pyside.content_widget import invoke_method
 
 from tools.acquisition.model.app_model import AppModel
 from tools.acquisition.model.app_model_status import SessionRecordingStatus
@@ -79,6 +80,28 @@ class PreferencesContent(QWidget):
 
         self._update_tab_sizes()
         tabs.currentChanged.connect(self._update_tab_sizes)
+
+        self._session_status_callback = self._on_session_status_changed
+        self._app_model.property_changed += self._session_status_callback
+        self.destroyed.connect(self._unsubscribe_session_status)
+        self._set_session_mutable(
+            self._app_model.session_recording_status
+            is SessionRecordingStatus.READY
+        )
+
+    def _unsubscribe_session_status(self, *_args):
+        try:
+            self._app_model.property_changed -= self._session_status_callback
+        except (KeyError, ValueError):
+            pass
+
+    def _on_session_status_changed(self, name, value, _old):
+        if name == self._app_model.Props.SESSION_RECORDING_STATUS:
+            self._set_session_mutable(value is SessionRecordingStatus.READY)
+
+    @invoke_method
+    def _set_session_mutable(self, enabled: bool) -> None:
+        self._tabs.setEnabled(bool(enabled))
 
     def _update_tab_sizes(self):
         tabs = self._tabs
@@ -910,6 +933,10 @@ class PreferencesContent(QWidget):
     def _browse_for_location(self, which: str):
         if which == "animal":
             initial_location = self._preferences.animal_location
+        elif which == "data":
+            initial_location = self._app_model.output_location
+        elif which == "inference_model":
+            initial_location = self._app_model.inference.model_location
         else:
             initial_location = self._preferences.log_location
 

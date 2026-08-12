@@ -45,7 +45,9 @@ class SoftMousePublicationController(QObject):
 
     @classmethod
     def for_model(cls, app_model, parent=None):
-        controller = getattr(app_model, "_softmouse_publication_controller", None)
+        # AppModel inherits Events, whose __getattr__ treats unknown names as
+        # undeclared events instead of honoring getattr(..., default).
+        controller = app_model.__dict__.get("_softmouse_publication_controller")
         if controller is None:
             controller = cls(app_model, parent)
             app_model._softmouse_publication_controller = controller

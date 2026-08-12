@@ -154,6 +154,19 @@ def test_recording_requires_a_selected_subject(app_model):
     )
 
 
+def test_configuration_mutators_reject_active_session(app_model):
+    app_model._set_session_recording_status(SessionRecordingStatus.RECORDING)
+    try:
+        with pytest.raises(RuntimeError, match="output location.*recording"):
+            app_model.output_location = app_model.output_location
+        with pytest.raises(RuntimeError, match="Loading configuration.*recording"):
+            app_model.load_configuration()
+        with pytest.raises(RuntimeError, match="DAQ port configuration.*recording"):
+            app_model.update_daq_port_configuration(None, None)
+    finally:
+        app_model._set_session_recording_status(SessionRecordingStatus.READY)
+
+
 def test_writer_finalization_waits_for_all_reach_cameras_and_pose(app_model):
     for camera in app_model.reach_cameras:
         camera.is_enabled = True

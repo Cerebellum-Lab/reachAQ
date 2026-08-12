@@ -11,6 +11,7 @@ from tools.acquisition.model.app_model_status import (
 @dataclass(frozen=True)
 class UiAvailability:
     system_mode: bool
+    preferences: bool
     idle_configuration: bool
     hardware_refresh: bool
     subject: bool
@@ -50,6 +51,7 @@ def calculate_ui_availability(
     session_identity = session_ready and stable_mode and ordinary_mode
     return UiAvailability(
         system_mode=session_ready and stable_mode and ordinary_mode,
+        preferences=session_ready and stable_mode,
         idle_configuration=idle_configuration,
         hardware_refresh=can_refresh,
         subject=session_identity,

@@ -156,9 +156,6 @@ class PelletControl(QWidget):
         setButton.clicked.connect(self._set_y)
         s_layout.addLayout(p_layout)
 
-        if is_legacy:
-            moveButton.setVisible(False)
-
         s_layout.addStretch(1)
 
         line = QFrame()
@@ -172,9 +169,6 @@ class PelletControl(QWidget):
         moveButton.clicked.connect(self._move_z)
         setButton.clicked.connect(self._set_z)
         s_layout.addLayout(p_layout)
-
-        if is_legacy:
-            moveButton.setVisible(False)
 
         v_layout = QVBoxLayout()
         v_layout.setContentsMargins(0, 5, 0, 0)

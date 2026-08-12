@@ -330,6 +330,7 @@ class MainWindow(QMainWindow):
         )
         self._app_model_status_combo.setEnabled(state.system_mode)
         self.run_action.setEnabled(state.system_mode)
+        self.preferences_action.setEnabled(state.preferences)
         self.edit_camera_settings_action.setEnabled(state.idle_configuration)
         self.edit_daq_ports_action.setEnabled(state.idle_configuration)
         self.make_3d_calib_action.setEnabled(state.idle_configuration)
@@ -1056,6 +1057,15 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("DAQ port configuration saved", 5000)
 
     def _show_preferences(self):
+        if (
+            self._app_model.session_recording_status
+            is not SessionRecordingStatus.READY
+        ):
+            self.statusBar().showMessage(
+                "Preferences are unavailable during recording or finalization",
+                5000,
+            )
+            return
         dialog = PreferencesDialog(self._preferences, self._app_model)
         self._add_box_to_open_dialogs(dialog)
         dialog.exec()
