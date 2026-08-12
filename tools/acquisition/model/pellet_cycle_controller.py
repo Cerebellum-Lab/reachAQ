@@ -327,6 +327,27 @@ class PelletCycleController:
         )
         return finalized
 
+    def annotate_intertrial_capture(self, project, request):
+        ledger = self._require_ledger()
+        window = request.window
+        evidence = request.pellet_state
+        updated = ledger.annotate_pending_tracking(
+            request.trial_id,
+            request.attempt_id,
+            pellet_presence=evidence.presence.value,
+            pellet_misplacement=evidence.misplacement.value,
+            window_start_perf=window.start_perf,
+            window_end_perf=window.end_perf,
+            tracking_coverage=window.coverage,
+            missing_frame_ids=window.missing_frame_ids,
+        )
+        self._session_data_recorder.persist_trial_ledger(
+            project,
+            ledger.to_records(),
+            ledger.summary(),
+        )
+        return updated
+
     def finalize_intertrial_unavailable(
         self,
         project,
@@ -339,6 +360,8 @@ class PelletCycleController:
         pellet_misplacement: str = "unknown",
         window=None,
         outcome: TrialOutcome = TrialOutcome.INCOMPLETE,
+        tone_references=(),
+        laser_references=(),
     ):
         ledger = self._require_ledger()
         outcome = TrialOutcome(outcome)
@@ -363,6 +386,8 @@ class PelletCycleController:
             tracking_missing_frame_ids=(
                 () if window is None else window.missing_frame_ids
             ),
+            tone_references=tuple(tone_references),
+            laser_references=tuple(laser_references),
         )
         self._session_api.trial_ended(finalized)
         if finalized.logical_trial_complete:
@@ -408,7 +433,11 @@ class PelletCycleController:
         if ledger is None:
             return
         if ledger.active_attempt is not None:
-            self.finish_active(perf_time, wall_time)
+            self.finalize_active_incomplete(
+                perf_time,
+                wall_time,
+                error="recording stopped before the pellet cycle completed",
+            )
         self._session_data_recorder.set_trial_ledger(
             ledger.to_records(),
             ledger.summary(),

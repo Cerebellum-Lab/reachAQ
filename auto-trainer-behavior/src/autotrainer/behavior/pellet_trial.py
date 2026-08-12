@@ -471,10 +471,48 @@ class PelletTrialLedger:
                 logical_trial_complete=logical_complete,
             )
             self._attempts[index] = finalized
+            self._analysis_counts["reaches"] += int(reach_count)
+            self._analysis_counts["successful_reaches"] += int(success_count)
+            self._analysis_counts["pellets_consumed"] += int(consumption_count)
             if should_retry_same_trial:
                 self._retry_trial_id = finalized.trial_id
                 self._retry_attempt_id = finalized.attempt_id
             return finalized
+        raise KeyError(f"Unknown trial attempt {trial_id}.{attempt_id}")
+
+    def annotate_pending_tracking(
+        self,
+        trial_id: Optional[int],
+        attempt_id: int,
+        *,
+        pellet_presence: str,
+        pellet_misplacement: str,
+        window_start_perf: float,
+        window_end_perf: float,
+        tracking_coverage: float,
+        missing_frame_ids=(),
+    ) -> PelletTrialAttempt:
+        """Persist synchronous live-state evidence before async analysis."""
+        for index, attempt in enumerate(self._attempts):
+            if attempt.trial_id != trial_id or attempt.attempt_id != attempt_id:
+                continue
+            if attempt.outcome is not TrialOutcome.PENDING_ANALYSIS:
+                raise RuntimeError(
+                    f"Attempt {attempt.attempt_label} is not pending analysis"
+                )
+            updated = dataclasses.replace(
+                attempt,
+                pellet_presence=str(pellet_presence),
+                pellet_misplacement=str(pellet_misplacement),
+                analysis_window_start_perf=float(window_start_perf),
+                analysis_window_end_perf=float(window_end_perf),
+                tracking_coverage=float(tracking_coverage),
+                tracking_missing_frame_ids=tuple(
+                    int(value) for value in missing_frame_ids
+                ),
+            )
+            self._attempts[index] = updated
+            return updated
         raise KeyError(f"Unknown trial attempt {trial_id}.{attempt_id}")
 
     def finalize_hardware_error(

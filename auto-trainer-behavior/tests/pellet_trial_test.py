@@ -239,6 +239,19 @@ def test_analysis_fields_are_persisted_on_pending_attempt():
     ledger.acknowledge_presentation(1.1, 11.1)
     ledger.close_active_for_analysis(2.0, 12.0)
 
+    annotated = ledger.annotate_pending_tracking(
+        1,
+        1,
+        pellet_presence="present",
+        pellet_misplacement="not_misplaced",
+        window_start_perf=1.2,
+        window_end_perf=2.0,
+        tracking_coverage=0.98,
+        missing_frame_ids=(8,),
+    )
+    assert annotated.outcome is TrialOutcome.PENDING_ANALYSIS
+    assert annotated.pellet_presence == "present"
+
     final = ledger.finalize_pending(
         1,
         1,

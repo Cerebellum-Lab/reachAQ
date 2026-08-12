@@ -12,6 +12,8 @@ from tools.acquisition.model.intertrial_analysis import (
     PelletPresence,
     analyze_tracking_window,
     classify_pellet_state,
+    tracking_request_from_record,
+    tracking_request_record,
 )
 from tools.acquisition.model.live_tracking_buffer import (
     LiveTrackingSample,
@@ -169,3 +171,12 @@ def test_coordinator_queue_is_bounded_and_timing_starts_as_estimating():
     assert coordinator.wait_for_idle(2)
     assert coordinator.timing_estimate(2).projected_seconds is not None
     assert coordinator.close()
+
+
+def test_tracking_record_round_trip_retains_generation_and_frame_identity():
+    original = request([sample(index, 30) for index in range(5)])
+    restored = tracking_request_from_record(tracking_request_record(original))
+    assert restored.generation == original.generation
+    assert restored.operation_id == original.operation_id
+    assert restored.window.samples[2].primary_frame_ids == (2,)
+    assert restored.pellet_state.presence is PelletPresence.PRESENT

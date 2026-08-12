@@ -420,6 +420,88 @@ class SessionDataRecorder:
             generation_id=generation_id,
         )
 
+    def trial_stream_references(self, start_perf: float, end_perf: float):
+        """Return decoded tone and laser records inside one pellet window."""
+        with self._lock:
+            tones = tuple(
+                {
+                    "perf_time": row[0],
+                    "wall_time": row[1],
+                    "kind": row[3],
+                    "context": row[5],
+                    "payload_json": row[8],
+                }
+                for row in self._device_rows
+                if start_perf <= row[0] <= end_perf
+                and row[3] == "STIMULUS_INPUTS"
+            )
+            lasers = tuple(
+                {
+                    "perf_time": row[0],
+                    "wall_time": row[1],
+                    "record_type": row[2],
+                    "channel": row[3],
+                    "source": row[4],
+                    "command_volts": row[5],
+                    "diode_volts": row[6],
+                    "command_copy_volts": row[7],
+                    "output_name": row[8],
+                    "output_value": row[9],
+                }
+                for row in self._laser_rows
+                if start_perf <= row[0] <= end_perf
+            )
+        return tones, lasers
+
+    def persist_trial_tracking(self, project, request, result=None) -> Path:
+        """Atomically retain the exact live data used for one trial result."""
+        from tools.acquisition.model.intertrial_analysis import (
+            tracking_request_record,
+        )
+
+        session_dir = Path(project.get_session_path().location)
+        tracking_dir = session_dir / "streams" / "tracking"
+        tracking_dir.mkdir(parents=True, exist_ok=True)
+        trial = "unindexed" if request.trial_id is None else f"{request.trial_id:06d}"
+        path = tracking_dir / f"trial_{trial}_attempt_{request.attempt_id:03d}.json"
+        generation_id = self._metadata_generation_id
+        alignment_path = session_dir / "streams" / "alignment.json"
+        if alignment_path.is_file():
+            try:
+                with alignment_path.open("r", encoding="utf-8") as stream:
+                    generation_id = json.load(stream).get("metadataGenerationId")
+            except (OSError, ValueError, TypeError):
+                pass
+        atomic_write_json(
+            path,
+            tracking_request_record(request, result),
+            session_dir=session_dir,
+            generation_id=(
+                generation_id or f"{project.short_id}-live"
+            ),
+        )
+        return path
+
+    @staticmethod
+    def load_trial_tracking_requests(project):
+        """Read final-validation inputs; isolate one corrupt attempt file."""
+        from tools.acquisition.model.intertrial_analysis import (
+            tracking_request_from_record,
+        )
+
+        tracking_dir = (
+            Path(project.get_session_path().location) / "streams" / "tracking"
+        )
+        requests = []
+        errors = []
+        for path in sorted(tracking_dir.glob("trial_*_attempt_*.json")):
+            try:
+                with path.open("r", encoding="utf-8") as stream:
+                    requests.append(tracking_request_from_record(json.load(stream)))
+            except Exception as error:
+                errors.append(f"{path.name}: {error}")
+        return tuple(requests), tuple(errors)
+
     @staticmethod
     def update_persisted_trial_ledger(project, records, summary) -> None:
         """Atomically replace the post-analysis trial ledger and summary."""
@@ -465,16 +547,18 @@ class SessionDataRecorder:
         if manifest_path.is_file():
             with manifest_path.open("r", encoding="utf-8") as stream:
                 manifest = json.load(stream)
+            manifest_paths = (
+                streams_dir / "device.csv",
+                trial_path,
+                summary_path,
+                streams_dir / "laser.csv",
+                streams_dir.parent / "logs" / "session.log",
+                alignment_path,
+                *sorted((streams_dir / "tracking").glob("*.json")),
+            )
             manifest["files"] = [
                 file_manifest_entry(path, relative_to=streams_dir.parent)
-                for path in (
-                    streams_dir / "device.csv",
-                    trial_path,
-                    summary_path,
-                    streams_dir / "laser.csv",
-                    streams_dir.parent / "logs" / "session.log",
-                    alignment_path,
-                )
+                for path in manifest_paths
                 if path.is_file()
             ]
             atomic_write_json(
@@ -1186,6 +1270,7 @@ class SessionDataRecorder:
             streams_dir / "laser.csv",
             logs_dir / "session.log",
             streams_dir / "alignment.json",
+            *sorted((streams_dir / "tracking").glob("*.json")),
         )
         stream_manifest = {
             "schemaVersion": 1,

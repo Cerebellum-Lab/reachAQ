@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import enum
+import logging
 import math
 import queue
 import threading
@@ -15,8 +16,12 @@ from autotrainer.core.pose_elements import SceneElement
 from tools.acquisition.model.live_tracking_buffer import (
     LiveTrackingSample,
     TrackingLocation,
+    TrackingOffset,
     TrackingWindow,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 class AnalysisProgressionMode(str, enum.Enum):
@@ -444,6 +449,15 @@ class IntertrialAnalysisCoordinator:
                     )
             with self._lock:
                 current_after = self._is_current_unlocked(request)
+            if result is not None and current_after:
+                try:
+                    self._callback(result)
+                except Exception:
+                    logger.exception(
+                        "Intertrial result callback failed for %s",
+                        request.attempt_label,
+                    )
+            with self._lock:
                 self._pending = max(0, self._pending - 1)
                 if result is not None and result.video_seconds > 0:
                     self._ratios.append(
@@ -451,8 +465,6 @@ class IntertrialAnalysisCoordinator:
                     )
                     self._ratios = self._ratios[-20:]
                 self._idle.notify_all()
-            if result is not None and current_after:
-                self._callback(result)
 
     def _is_current_unlocked(self, request):
         return (
@@ -470,3 +482,111 @@ class IntertrialAnalysisCoordinator:
             if item is not None:
                 discarded += 1
         self._pending = max(0, self._pending - discarded)
+
+
+def tracking_request_record(
+    request: IntertrialAnalysisRequest,
+    result: Optional[IntertrialAnalysisResult] = None,
+) -> dict:
+    """Create the non-executable record used for final validation/repair."""
+    record = {
+        "schemaVersion": 1,
+        "identity": {
+            "generation": request.generation,
+            "sessionId": request.session_id,
+            "trialId": request.trial_id,
+            "attemptId": request.attempt_id,
+            "operationId": request.operation_id,
+        },
+        "window": {
+            "startPerf": request.window.start_perf,
+            "endPerf": request.window.end_perf,
+            "expectedFrames": request.window.expected_frames,
+            "observedFrames": request.window.observed_frames,
+            "missingFrameIds": request.window.missing_frame_ids,
+            "duplicateFrameIds": request.window.duplicate_frame_ids,
+            "monotonic": request.window.monotonic,
+            "samples": [sample.to_record() for sample in request.window.samples],
+        },
+        "pelletState": {
+            "presence": request.pellet_state.presence.value,
+            "misplacement": request.pellet_state.misplacement.value,
+            "observedSamples": request.pellet_state.observed_samples,
+            "pelletSeenSamples": request.pellet_state.pellet_seen_samples,
+            "trianglePelletSamples": request.pellet_state.triangle_pellet_samples,
+            "medianTrianglePelletDistance": (
+                request.pellet_state.median_triangle_pellet_distance
+            ),
+        },
+    }
+    if result is not None:
+        record["analysis"] = {
+            "outcome": result.outcome.value,
+            "reachCount": result.reach_count,
+            "successCount": result.success_count,
+            "consumptionCount": result.consumption_count,
+            "recommendedShift": result.recommended_shift,
+            "interpolatedPoints": result.interpolated_points,
+            "longGapCount": result.long_gap_count,
+            "analysisSeconds": result.analysis_seconds,
+            "error": result.error,
+        }
+    return record
+
+
+def tracking_request_from_record(record: dict) -> IntertrialAnalysisRequest:
+    if int(record.get("schemaVersion", 0)) != 1:
+        raise ValueError("Unsupported trial tracking schema")
+    identity = record["identity"]
+    window_record = record["window"]
+    samples = tuple(
+        LiveTrackingSample(
+            sequence=int(item["sequence"]),
+            primary_frame_ids=tuple(item["primary_frame_ids"]),
+            primary_frame_perf_times=tuple(item["primary_frame_perf_times"]),
+            source_start_perf=float(item["source_start_perf"]),
+            source_end_perf=float(item["source_end_perf"]),
+            processing_perf=float(item["processing_perf"]),
+            pellet_seen=bool(item["pellet_seen"]),
+            locations_3d=tuple(
+                TrackingLocation(**location) for location in item["locations_3d"]
+            ),
+            offsets_3d=tuple(
+                TrackingOffset(**offset) for offset in item["offsets_3d"]
+            ),
+        )
+        for item in window_record["samples"]
+    )
+    tracking_window = TrackingWindow(
+        start_perf=float(window_record["startPerf"]),
+        end_perf=float(window_record["endPerf"]),
+        samples=samples,
+        expected_frames=int(window_record["expectedFrames"]),
+        observed_frames=int(window_record["observedFrames"]),
+        missing_frame_ids=tuple(window_record["missingFrameIds"]),
+        duplicate_frame_ids=tuple(window_record["duplicateFrameIds"]),
+        monotonic=bool(window_record["monotonic"]),
+    )
+    pellet = record["pelletState"]
+    return IntertrialAnalysisRequest(
+        generation=int(identity["generation"]),
+        session_id=str(identity["sessionId"]),
+        trial_id=(
+            None if identity["trialId"] is None else int(identity["trialId"])
+        ),
+        attempt_id=int(identity["attemptId"]),
+        operation_id=str(identity["operationId"]),
+        window=tracking_window,
+        pellet_state=PelletStateEvidence(
+            presence=PelletPresence(pellet["presence"]),
+            misplacement=PelletMisplacement(pellet["misplacement"]),
+            observed_samples=int(pellet["observedSamples"]),
+            pellet_seen_samples=int(pellet["pelletSeenSamples"]),
+            triangle_pellet_samples=int(pellet["trianglePelletSamples"]),
+            median_triangle_pellet_distance=(
+                None
+                if pellet["medianTrianglePelletDistance"] is None
+                else float(pellet["medianTrianglePelletDistance"])
+            ),
+        ),
+    )
