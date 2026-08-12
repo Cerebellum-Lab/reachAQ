@@ -495,12 +495,24 @@ class SessionDataRecorder:
         tracking_dir = (
             Path(project.get_session_path().location) / "streams" / "tracking"
         )
+        alignment_path = tracking_dir.parent / "alignment.json"
+        expected_generation_id = None
+        try:
+            with alignment_path.open("r", encoding="utf-8") as stream:
+                expected_generation_id = json.load(stream).get(
+                    "metadataGenerationId"
+                )
+        except (OSError, ValueError, TypeError):
+            pass
         requests = []
         errors = []
         for path in sorted(tracking_dir.glob("trial_*_attempt_*.json")):
             try:
                 with path.open("r", encoding="utf-8") as stream:
-                    requests.append(tracking_request_from_record(json.load(stream)))
+                    requests.append(tracking_request_from_record(
+                        json.load(stream),
+                        expected_metadata_generation_id=expected_generation_id,
+                    ))
             except Exception as error:
                 errors.append(f"{path.name}: {error}")
         return tuple(requests), tuple(errors)

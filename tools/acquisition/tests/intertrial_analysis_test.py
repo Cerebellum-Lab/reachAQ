@@ -196,3 +196,9 @@ def test_tracking_record_round_trip_retains_generation_and_frame_identity():
     assert restored.operation_id == original.operation_id
     assert restored.window.samples[2].primary_frame_ids == (2,)
     assert restored.pellet_state.presence is PelletPresence.PRESENT
+
+    with pytest.raises(ValueError, match="does not match alignment"):
+        tracking_request_from_record(
+            record,
+            expected_metadata_generation_id="session001-g2",
+        )

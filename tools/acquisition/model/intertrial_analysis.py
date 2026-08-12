@@ -537,9 +537,23 @@ def tracking_request_record(
     return record
 
 
-def tracking_request_from_record(record: dict) -> IntertrialAnalysisRequest:
+def tracking_request_from_record(
+    record: dict,
+    *,
+    expected_metadata_generation_id: Optional[str] = None,
+) -> IntertrialAnalysisRequest:
     if int(record.get("schemaVersion", 0)) != 1:
         raise ValueError("Unsupported trial tracking schema")
+    if (
+        expected_metadata_generation_id is not None
+        and record.get("metadataGenerationId")
+        != expected_metadata_generation_id
+    ):
+        raise ValueError(
+            "Trial tracking metadata generation does not match alignment: "
+            f"{record.get('metadataGenerationId')!r} != "
+            f"{expected_metadata_generation_id!r}"
+        )
     identity = record["identity"]
     window_record = record["window"]
     samples = tuple(
