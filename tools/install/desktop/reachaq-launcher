@@ -55,9 +55,46 @@ if [ -n "$runtime_env" ] && [ -r "$runtime_env" ]; then
     done < "$runtime_env"
 fi
 
-runtime_dir=${XDG_RUNTIME_DIR:-/tmp}
-lock_file="$runtime_dir/reachaq-gui-${UID}.lock"
-exec 9>"$lock_file"
+runtime_root=${XDG_RUNTIME_DIR:-}
+if [ -n "$runtime_root" ] && [ -d "$runtime_root" ] && [ ! -L "$runtime_root" ]; then
+    runtime_owner=$(stat -c '%u' -- "$runtime_root" 2>/dev/null || true)
+    runtime_mode=$(stat -c '%a' -- "$runtime_root" 2>/dev/null || true)
+    if [ "$runtime_owner" != "$UID" ] || [ "$runtime_mode" != "700" ]; then
+        runtime_root=
+    fi
+fi
+if [ -z "$runtime_root" ]; then
+    temporary_root=${TMPDIR:-/tmp}
+    runtime_root="$temporary_root/reachaq-runtime-${UID}"
+    if [ -L "$runtime_root" ]; then
+        printf 'Unsafe reachAQ runtime path is a symbolic link: %s\n' "$runtime_root" >&2
+        exit 2
+    fi
+    if ! mkdir -m 700 -- "$runtime_root" 2>/dev/null && [ ! -d "$runtime_root" ]; then
+        printf 'Unable to create secure reachAQ runtime directory: %s\n' "$runtime_root" >&2
+        exit 2
+    fi
+fi
+
+lock_dir="$runtime_root/reachaq"
+if [ -L "$lock_dir" ]; then
+    printf 'Unsafe reachAQ lock path is a symbolic link: %s\n' "$lock_dir" >&2
+    exit 2
+fi
+if ! mkdir -m 700 -- "$lock_dir" 2>/dev/null && [ ! -d "$lock_dir" ]; then
+    printf 'Unable to create reachAQ lock directory: %s\n' "$lock_dir" >&2
+    exit 2
+fi
+lock_owner=$(stat -c '%u' -- "$lock_dir" 2>/dev/null || true)
+lock_mode=$(stat -c '%a' -- "$lock_dir" 2>/dev/null || true)
+if [ "$lock_owner" != "$UID" ] || [ "$lock_mode" != "700" ]; then
+    printf 'Unsafe reachAQ lock directory ownership or mode: %s\n' "$lock_dir" >&2
+    exit 2
+fi
+
+# Lock the owned directory itself. This neither follows a user-controlled lock
+# file nor truncates a predictable file in /tmp.
+exec 9<"$lock_dir"
 if ! flock -n 9; then
     printf 'reachAQ is already running for this desktop user.\n' >&2
     read -r -p "Press Enter to close..." _unused

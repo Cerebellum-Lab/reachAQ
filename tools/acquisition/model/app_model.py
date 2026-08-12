@@ -375,6 +375,7 @@ class AppModel(ObservableObject):
         RFID_SCAN_RESULT = "rfid_scan_result"
         ANIMAL_METADATA_PREVIEW = "animal_metadata_preview"
         ANIMAL_METADATA_REFRESH_BUSY = "animal_metadata_refresh_busy"
+        INTERNAL_ERROR_DIAGNOSTIC = "internal_error_diagnostic"
         TRIAL_PROTOCOL_STATE = "trial_protocol_state"
 
     def __init__(
@@ -451,6 +452,8 @@ class AppModel(ObservableObject):
         self._record_start_timer = no_op_timer
         self._storage_monitor = RecordingStorageMonitor()
         self._storage_preflight = None
+        self._internal_error_diagnostic = None
+        self._session_invariant_unknown = False
         self._closing_event = threading.Event()
         self._reload_plans_needed = False
         self._coordinates = CoordinateModel()
@@ -2127,7 +2130,31 @@ class AppModel(ObservableObject):
             )
         if not self._acquisition.started:
             blockers.append("System Mode is not running")
+        if self._session_invariant_unknown:
+            blockers.append(
+                "An internal error left recording lifecycle ownership uncertain; "
+                "restart acquisition before recording again"
+            )
         return tuple(blockers)
+
+    @property
+    def internal_error_diagnostic(self) -> Optional[dict]:
+        return (
+            None
+            if self._internal_error_diagnostic is None
+            else dict(self._internal_error_diagnostic)
+        )
+
+    def _mark_session_invariant_unknown(self, reason: str) -> None:
+        """Explicit lifecycle-owner hook; generic exception reporting never calls it."""
+
+        self._session_invariant_unknown = True
+        logger.error("Recording lifecycle invariant is unknown: %s", reason)
+        self.property_changed(
+            self.Props.RECORDING_BLOCKERS,
+            self.recording_blockers,
+            None,
+        )
 
     def _set_subsystem_status(
         self,
@@ -4538,8 +4565,23 @@ class AppModel(ObservableObject):
             if not self._acquisition.begin_start():
                 logger.warning("Acquisition already starting")
                 return False
+            previous_internal_error = self._internal_error_diagnostic
+            self._internal_error_diagnostic = None
+            self._session_invariant_unknown = False
             self._start_count += 1
             is_first_start = self._start_count == 1
+        if previous_internal_error is not None:
+            self._on_property_changed(
+                self.Props.INTERNAL_ERROR_DIAGNOSTIC,
+                None,
+                previous_internal_error,
+            )
+            self._set_subsystem_status(
+                SubsystemId.RUNTIME_DIAGNOSTICS,
+                SubsystemState.READY,
+                reason="internal-error diagnostic cleared by acquisition restart",
+                required_for_recording=False,
+            )
 
         inference_preflight_error = None
         if self._inference.is_enabled:
@@ -5350,8 +5392,43 @@ class AppModel(ObservableObject):
         # Fatal callbacks are process-wide and may originate from cameras,
         # analysis, NI-DAQ, or UI code. They must never reset or disconnect an
         # otherwise healthy shared CAN interface.
+        previous = self._internal_error_diagnostic
+        if previous is None:
+            token = self._recording_session.token()
+            diagnostic = {
+                "source": str(source),
+                "exceptionType": exception.__class__.__name__,
+                "message": str(exception) or exception.__class__.__name__,
+                "wallTime": time.time(),
+                "sessionStatus": self._recording_session.status.value,
+                "sessionId": None if token is None else token.session_id,
+                "sessionGeneration": None if token is None else token.generation,
+                "operationChanged": False,
+            }
+            self._internal_error_diagnostic = diagnostic
+            self._on_property_changed(
+                self.Props.INTERNAL_ERROR_DIAGNOSTIC,
+                dict(diagnostic),
+                None,
+            )
+            self._set_subsystem_status(
+                SubsystemId.RUNTIME_DIAGNOSTICS,
+                SubsystemState.FAILED,
+                error=(
+                    f"{diagnostic['exceptionType']}: {diagnostic['message']} "
+                    f"({diagnostic['source']})"
+                ),
+                required_for_recording=False,
+            )
+            self.on_error(
+                "Internal software error",
+                "The error was logged without stopping recording, moving hardware, "
+                "resetting CAN, or disconnecting unrelated systems. Stop and Abort "
+                "remain available.",
+            )
         logger.error(
-            "Fatal callback from %s left CAN ownership unchanged: %s",
+            "Fatal callback from %s left the active operation and CAN ownership "
+            "unchanged: %s",
             source,
             exception,
         )
@@ -5565,7 +5642,7 @@ class AppModel(ObservableObject):
                 )
             else:
                 logger.error("Unknown camera watchdog failed: %s", camera_name)
-            self._abort_recording_for_required_subsystem(
+            self._handle_recording_subsystem_failure(
                 SubsystemId.camera(camera_name),
                 root_error,
             )
@@ -5597,7 +5674,7 @@ class AppModel(ObservableObject):
                 SubsystemState.FAILED,
                 error=error,
             )
-            self._abort_recording_for_required_subsystem(
+            self._handle_recording_subsystem_failure(
                 SubsystemId.LIVE_INFERENCE,
                 error,
             )
@@ -5637,7 +5714,7 @@ class AppModel(ObservableObject):
                 SubsystemState.FAILED,
                 error=str(value),
             )
-            self._abort_recording_for_required_subsystem(
+            self._handle_recording_subsystem_failure(
                 SubsystemId.NIDAQ_STREAM,
                 str(value),
             )
@@ -5665,7 +5742,7 @@ class AppModel(ObservableObject):
                     SubsystemState.FAILED,
                     error=reason,
                 )
-                self._abort_recording_for_required_subsystem(
+                self._handle_recording_subsystem_failure(
                     SubsystemId.LASER,
                     reason,
                 )
@@ -5676,26 +5753,59 @@ class AppModel(ObservableObject):
                     reason="laser controller disconnected",
                 )
 
-    def _abort_recording_for_required_subsystem(
+    def _handle_recording_subsystem_failure(
         self,
         subsystem_id,
         reason: str,
     ) -> None:
         status = self._acquisition.subsystems.get(subsystem_id)
-        if (
-            status is not None
-            and status.required_for_recording
-            and self._recording_session.status in {
-                SessionRecordingStatus.ARMING,
-                SessionRecordingStatus.RECORDING,
-            }
-        ):
-            logger.error(
-                "Required subsystem %s failed during recording: %s; aborting session",
-                status.subsystem_id,
-                reason,
+        recording_status = self._recording_session.status
+        if status is None or recording_status not in {
+            SessionRecordingStatus.ARMING,
+            SessionRecordingStatus.RECORDING,
+        }:
+            return
+        subsystem_key = status.subsystem_id
+        if subsystem_key.startswith("camera."):
+            camera_name = subsystem_key.split(".", 1)[1]
+            camera = next(
+                (item for item in self._reach_cameras if item.name == camera_name),
+                None,
             )
-            self.abort_recording()
+            is_session_reference = (
+                camera is not None
+                and camera.camera_index == self._identify_session_reference_cam_idx()
+            )
+            if is_session_reference:
+                if recording_status is SessionRecordingStatus.RECORDING:
+                    logger.error(
+                        "Primary camera failed during recording: %s; requesting "
+                        "normal Stop and preserving partial data",
+                        reason,
+                    )
+                    self._stop_recording(
+                        RecordingEndingReason.REQUIRED_SOURCE_FAILURE,
+                        token=self._recording_session.token(),
+                    )
+                else:
+                    logger.error(
+                        "Primary camera failed before the recording boundary: %s; "
+                        "cleaning the empty armed session",
+                        reason,
+                    )
+                    self.abort_recording(token=self._recording_session.token())
+            else:
+                logger.error(
+                    "Secondary camera failed; healthy primary recording continues: %s",
+                    reason,
+                )
+            return
+        logger.error(
+            "%s failed during recording; remaining streams and the active "
+            "operation continue: %s",
+            subsystem_key,
+            reason,
+        )
 
     def _on_intersession_property_changed(self, name, value, _):
         if name == IntersessionMachine.Properties.STATE_PROPERTY:
@@ -6250,7 +6360,7 @@ class AppModel(ObservableObject):
                         SubsystemState.FAILED,
                         error=reason,
                     )
-                    self._abort_recording_for_required_subsystem(
+                    self._handle_recording_subsystem_failure(
                         SubsystemId.LIVE_INFERENCE,
                         reason,
                     )
@@ -6585,6 +6695,7 @@ class AppModel(ObservableObject):
                     "storage": dict(
                         self._recording_session.storage_telemetry
                     ),
+                    "internalError": self.internal_error_diagnostic,
                 },
                 "stopPolicy": (
                     None

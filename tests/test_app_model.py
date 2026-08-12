@@ -1019,7 +1019,7 @@ def test_required_failed_subsystem_is_exposed_as_recording_blocker(app_model):
     )
 
 
-def test_required_runtime_loss_aborts_session_without_stopping_acquisition(
+def test_required_nidaq_runtime_loss_preserves_session_and_acquisition(
     app_model,
 ):
     app_model._acquisition.started = True
@@ -1030,19 +1030,72 @@ def test_required_runtime_loss_aborts_session_without_stopping_acquisition(
     )
     app_model._set_session_recording_status(SessionRecordingStatus.RECORDING)
 
-    with mock.patch.object(app_model, "abort_recording") as abort:
+    with mock.patch.object(app_model, "abort_recording") as abort, \
+            mock.patch.object(app_model, "_stop_recording") as stop:
         app_model._set_subsystem_status(
             SubsystemId.NIDAQ_STREAM,
             SubsystemState.FAILED,
             error="worker stopped",
         )
-        app_model._abort_recording_for_required_subsystem(
+        app_model._handle_recording_subsystem_failure(
             SubsystemId.NIDAQ_STREAM,
             "worker stopped",
         )
 
-    abort.assert_called_once_with()
+    abort.assert_not_called()
+    stop.assert_not_called()
+    assert app_model.session_recording_status is SessionRecordingStatus.RECORDING
     assert app_model.acquisition_started
+
+
+def test_primary_camera_runtime_loss_requests_preserving_stop(app_model):
+    primary = app_model.reach_cameras[0]
+    primary.set_runtime_primary(True)
+    primary.is_enabled = True
+    primary.is_recording_enabled = True
+    app_model._set_subsystem_status(
+        SubsystemId.camera(primary.name),
+        SubsystemState.FAILED,
+        required_for_recording=True,
+        error="transport lost",
+    )
+    app_model._set_session_recording_status(SessionRecordingStatus.RECORDING)
+
+    with mock.patch.object(app_model, "_stop_recording") as stop, \
+            mock.patch.object(app_model, "abort_recording") as abort:
+        app_model._handle_recording_subsystem_failure(
+            SubsystemId.camera(primary.name), "transport lost"
+        )
+
+    stop.assert_called_once_with(
+        RecordingEndingReason.REQUIRED_SOURCE_FAILURE,
+        token=None,
+    )
+    abort.assert_not_called()
+
+
+def test_secondary_camera_runtime_loss_does_not_stop_recording(app_model):
+    primary, secondary = app_model.reach_cameras[:2]
+    primary.set_runtime_primary(True)
+    for camera in (primary, secondary):
+        camera.is_enabled = True
+        camera.is_recording_enabled = True
+    app_model._set_subsystem_status(
+        SubsystemId.camera(secondary.name),
+        SubsystemState.FAILED,
+        required_for_recording=True,
+        error="frame timeout",
+    )
+    app_model._set_session_recording_status(SessionRecordingStatus.RECORDING)
+
+    with mock.patch.object(app_model, "_stop_recording") as stop, \
+            mock.patch.object(app_model, "abort_recording") as abort:
+        app_model._handle_recording_subsystem_failure(
+            SubsystemId.camera(secondary.name), "frame timeout"
+        )
+
+    stop.assert_not_called()
+    abort.assert_not_called()
 
 
 def test_startup_summary_correlates_camera_and_nidaq_without_claiming_cause(
@@ -1154,8 +1207,7 @@ def test_runtime_can_failure_preserves_session_and_only_can_status_recovers(app_
     monitor = app_model.analysis.watchdog_monitor
 
     with mock.patch.object(monitor, "unregister_watchdog") as unregister, \
-            mock.patch.object(monitor, "register_watchdog") as register, \
-            mock.patch.object(app_model, "_abort_recording_for_required_subsystem") as abort:
+            mock.patch.object(monitor, "register_watchdog") as register:
         app_model._on_can_connection_state_changed({
             "state": "failed",
             "error": "CAN adapter removed",
@@ -1163,7 +1215,6 @@ def test_runtime_can_failure_preserves_session_and_only_can_status_recovers(app_
         failed = app_model.subsystem_statuses[SubsystemId.CAN_PELLET.value]
         assert failed.state is SubsystemState.FAILED
         assert failed.error == "CAN adapter removed"
-        abort.assert_not_called()
         assert unregister.call_count == 2
 
         app_model._on_can_connection_state_changed({"state": "ready", "error": ""})

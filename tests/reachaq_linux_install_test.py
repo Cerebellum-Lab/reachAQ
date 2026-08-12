@@ -109,6 +109,12 @@ def test_desktop_launcher_installer_creates_terminal_entry(tmp_path):
     assert str(home / ".local/bin/reachaq-launcher") in entry
     assert not (desktop / "ReachAQ-startup").exists()
     assert os.access(home / ".local/bin/reachaq-launcher", os.X_OK)
+    installed_launcher = (home / ".local/bin/reachaq-launcher").read_text()
+    assert 'lock_dir="$runtime_root/reachaq"' in installed_launcher
+    assert 'exec 9<"$lock_dir"' in installed_launcher
+    assert 'exec 9>"$lock_file"' not in installed_launcher
+    assert "stat -c '%u'" in installed_launcher
+    assert "stat -c '%a'" in installed_launcher
     launcher_config = (home / ".config/reachaq/launcher.conf").read_text()
     assert f"CONDA_BIN={fake_conda}" in launcher_config
     assert f"SYSTEM_CONFIG={config_dir / 'system_configuration.yaml'}" in launcher_config

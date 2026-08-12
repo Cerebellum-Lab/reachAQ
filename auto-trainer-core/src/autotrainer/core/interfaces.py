@@ -29,6 +29,7 @@ class RecordingEndingReason(str, enum.Enum):
     PROTOCOL_COMPLETE = "ProtocolComplete"
     STOP_DRAIN_TIMEOUT = "StopDrainTimeout"
     STORAGE_LIMIT = "StorageLimit"
+    REQUIRED_SOURCE_FAILURE = "RequiredSourceFailure"
     ALGO_PAUSED = "AlgoPaused"
 
 

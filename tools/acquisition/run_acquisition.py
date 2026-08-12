@@ -1,8 +1,9 @@
+from __future__ import annotations
+
 import logging
-import os
+import multiprocessing
 import signal
 import sys
-import time
 from pathlib import Path
 from typing import Optional
 
@@ -19,6 +20,23 @@ missing_file = "The configuration file %s does not exist; a default configuratio
 
 CardHeader.DEFAULT_BACKGROUND_COLOR = "#cfb87c"
 CardHeader.DEFAULT_TITLE_COLOR = "black"
+
+
+def _terminate_owned_children(*, force: bool = False) -> tuple[int, ...]:
+    """Signal only direct multiprocessing children created by reachAQ."""
+
+    children = tuple(multiprocessing.active_children())
+    signaled = []
+    for child in children:
+        if child.pid is None or not child.is_alive():
+            continue
+        try:
+            child.kill() if force else child.terminate()
+        except (OSError, ValueError):
+            logger.exception("Failed to signal owned child pid=%s", child.pid)
+        else:
+            signaled.append(child.pid)
+    return tuple(signaled)
 
 
 def verify_configuration(configuration: Optional[Path]):
@@ -88,13 +106,23 @@ def run_acquisition(
     def handle_sigint(signum, frame):
         nonlocal sigint_received
         sigint_received += 1
-        logger.notice("Got signal %s ; closing window..", signum)
-        window.close()
-        if sigint_received > 2:
-            logger.critical("too many sigint, exiting with SIG_TERMINATE ..")
-            time.sleep(0.5)
-            os.kill(-os.getpid(), signal.SIGTERM)
-            # killing negative of pid is killing process group
+        if sigint_received == 1:
+            logger.notice("Got signal %s; requesting orderly window close", signum)
+            window.close()
+        elif sigint_received == 2:
+            pids = _terminate_owned_children(force=False)
+            logger.warning(
+                "Shutdown is still draining; terminated reachAQ-owned children: %s",
+                pids or "none",
+            )
+        else:
+            pids = _terminate_owned_children(force=True)
+            logger.critical(
+                "Third interrupt; forcing reachAQ exit code 130; killed owned "
+                "children: %s",
+                pids or "none",
+            )
+            app.exit(130)
 
     signal.signal(signal.SIGINT, handle_sigint)
 

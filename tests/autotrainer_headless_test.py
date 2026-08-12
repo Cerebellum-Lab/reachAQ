@@ -26,7 +26,7 @@ from autotrainer.core import (
 from autotrainer.video import CaptureCameraAttrs, VideoRecordMode
 from autotrainer.inference import GpuRuntimeStatus
 from tools.acquisition.model.app_model import AppModel
-from tools.acquisition.model.app_model_status import AppModelStatus
+from tools.acquisition.model.app_model_status import AppModelStatus, SessionRecordingStatus
 from tools.acquisition.model.subsystem_status import (
     SubsystemId,
     SubsystemState,
@@ -376,14 +376,25 @@ def test_periodic_command_producers_stop_without_touching_can():
     app_model._hardware.disconnect.assert_not_called()
 
 
-def test_generic_fatal_callback_does_not_touch_can():
-    app_model = object.__new__(AppModel)
+def test_generic_fatal_callback_is_diagnostic_only(app_model):
     app_model._hardware = mock.Mock()
+    app_model.stop_recording = mock.Mock()
+    app_model.abort_recording = mock.Mock()
+    app_model._recording_session.status = SessionRecordingStatus.RECORDING
 
     app_model._on_fatal_exception("camera.left", RuntimeError("capture failed"))
+    first = app_model.internal_error_diagnostic
+    app_model._on_fatal_exception("later", RuntimeError("second failure"))
 
     app_model._hardware.safety_shutdown.assert_not_called()
     app_model._hardware.disconnect.assert_not_called()
+    app_model.stop_recording.assert_not_called()
+    app_model.abort_recording.assert_not_called()
+    assert app_model.internal_error_diagnostic == first
+    assert first["message"] == "capture failed"
+    assert first["operationChanged"] is False
+    assert app_model._recording_session.status is SessionRecordingStatus.RECORDING
+    assert all("internal" not in blocker.lower() for blocker in app_model.recording_blockers)
 
 
 def test_live_inference_override_is_not_persisted_with_other_configuration_changes(
