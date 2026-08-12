@@ -128,6 +128,26 @@ def test_scored_trial_limit_is_available_with_live_intertrial_scoring(app_model)
     assert not any("Scored trials" in blocker for blocker in app_model.recording_blockers)
 
 
+def test_intertrial_analysis_requires_live_inference_before_record(app_model):
+    control = app_model.behavior.algorithm.active_config.session_control
+    control.intertrial_analysis_enabled = True
+    previous_inference = app_model._inference
+    app_model._inference = SimpleNamespace(is_enabled=False)
+    try:
+        assert any(
+            "Live intertrial analysis requires live inference" in blocker
+            for blocker in app_model.recording_blockers
+        )
+
+        control.intertrial_analysis_enabled = False
+        assert not any(
+            "Live intertrial analysis requires live inference" in blocker
+            for blocker in app_model.recording_blockers
+        )
+    finally:
+        app_model._inference = previous_inference
+
+
 def test_it_drain_record_stop_sema_on_session_recording_start(app_model):
     app_model._cams_record_start_perf.value = 123.0
     app_model._record_stop_sema.release()

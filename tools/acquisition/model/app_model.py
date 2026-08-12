@@ -2117,6 +2117,11 @@ class AppModel(ObservableObject):
     def recording_blockers(self) -> Tuple[str, ...]:
         blockers = list(self._acquisition.subsystems.recording_blockers())
         session_control = self._behavior.algorithm.active_config.session_control
+        if session_control.intertrial_analysis_enabled and not self._inference.is_enabled:
+            blockers.append(
+                "Live intertrial analysis requires live inference; enable live "
+                "inference or disable live intertrial analysis"
+            )
         if self._protocol_runner.protocol_complete:
             blockers.append("Selected protocol is complete")
         if self._recording_session.status is not SessionRecordingStatus.READY:
