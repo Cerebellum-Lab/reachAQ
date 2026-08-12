@@ -1,9 +1,11 @@
 import atexit
+import collections
+import dataclasses
 import threading
 import time
 from threading import Thread
 from datetime import datetime
-from queue import Queue, Empty
+from queue import Queue, Empty, Full
 from typing import Optional, List, Any
 
 from autotrainer.core.logging import get_verbose_logger
@@ -15,6 +17,16 @@ from .file_event_plugin import FileEventPlugin
 from .logger_event_plugin import LoggerEventPlugin
 
 logger = get_verbose_logger(__name__)
+
+
+class EventQueueFullError(RuntimeError):
+    """An event could not enter the bounded dispatcher queue in time."""
+
+
+@dataclasses.dataclass(frozen=True)
+class _QueuedEvent:
+    info: EventInfo
+    enqueued_perf_time: float
 
 
 class EventManager:
@@ -69,17 +81,33 @@ class EventManager:
                 cls_inst.close()
                 cls._remove_cls_instance()
 
-    def __init__(self, key=""):
+    def __init__(
+        self,
+        key="",
+        *,
+        queue_capacity: int = 4096,
+        producer_wait_seconds: float = 0.05,
+        shutdown_timeout_seconds: float = 5.0,
+    ):
         if key != "EventManagerInstance":
             raise Exception("Use EventManager.default() to access and instance.")
 
         self._plugins: List[EventManagerPlugin] = []
+        self._lock = threading.RLock()
+        self._closing = False
+        self._producer_wait_seconds = max(0.001, float(producer_wait_seconds))
+        self._shutdown_timeout_seconds = max(0.1, float(shutdown_timeout_seconds))
+        self._enqueue_times = collections.deque()
+        self._accepted_count = 0
+        self._delivered_count = 0
+        self._failed_count = 0
+        self._last_shutdown_report = None
 
         self._project_info = None
 
         # Callers should expect requests to post an event return as quickly as possible.  Events are pushed to a queue
         # so that processing can be done in a separate thread as resources allow.
-        self._write_queue = Queue()
+        self._write_queue = Queue(maxsize=max(1, int(queue_capacity)))
         self._write_thread = Thread(
             target=self._process_queue,
             name=f"{self.__class__.__name__}",
@@ -93,7 +121,8 @@ class EventManager:
 
     @property
     def project(self) -> ProjectInfo:
-        return self._project_info
+        with self._lock:
+            return self._project_info
 
     @project.setter
     def project(self, value: ProjectInfo) -> None:
@@ -104,16 +133,18 @@ class EventManager:
         Args
             value: ProjectInfo object.  This is used to determine the location of the event file.
         """
-        self._project_info = value
-
-        for plugin in self._plugins:
+        with self._lock:
+            self._project_info = value
+            plugins = tuple(self._plugins)
+        for plugin in plugins:
             plugin.set_project(value)
 
     @property
     def plugins(self) -> List[EventManagerPlugin]:
         # Do not let callers modify ths list. register/unregister are available for this.  This is already dangerous
         # enough - giving them access to the plugins themselves.
-        return self._plugins.copy()
+        with self._lock:
+            return self._plugins.copy()
 
     def register_plugin(self, plugin: EventManagerPlugin) -> None:
         """
@@ -122,9 +153,14 @@ class EventManager:
         Args:
             plugin: The plugin to register.
         """
-        if plugin not in self._plugins:
+        with self._lock:
+            if self._closing:
+                raise RuntimeError("Cannot register an event plugin during shutdown")
+            if plugin in self._plugins:
+                return
             self._plugins.append(plugin)
-            plugin.set_project(self.project)
+            project = self._project_info
+        plugin.set_project(project)
 
     def unregister_plugin(self, plugin: EventManagerPlugin) -> None:
         """
@@ -133,47 +169,105 @@ class EventManager:
         Args:
             plugin: The plugin to unregister.
         """
-        if plugin in self._plugins:
-            self._plugins.remove(plugin)
+        with self._lock:
+            present = plugin in self._plugins
+            if present:
+                self._plugins.remove(plugin)
+        if present:
             # Even though the caller must have a reference to the plugin, take responsibility to close, if needed.
             # In the future, there may be a way to unregister by some kind of key/type/identifier that doesn't require
             # explicit access to the plugin instance by the caller.
             plugin.close()
 
     def flush(self):
-        for plugin in self._plugins:
+        with self._lock:
+            plugins = tuple(self._plugins)
+        for plugin in plugins:
             plugin.flush()
 
-    def close(self):
+    @property
+    def diagnostics(self) -> dict:
+        with self._lock:
+            now = time.perf_counter()
+            return {
+                "capacity": (
+                    0 if self._write_queue is None else self._write_queue.maxsize
+                ),
+                "pending": len(self._enqueue_times),
+                "oldestAgeSeconds": (
+                    0.0
+                    if not self._enqueue_times
+                    else max(0.0, now - min(self._enqueue_times))
+                ),
+                "accepted": self._accepted_count,
+                "delivered": self._delivered_count,
+                "failed": self._failed_count,
+                "closing": self._closing,
+                "lastShutdown": self._last_shutdown_report,
+            }
+
+    def close(self, timeout: Optional[float] = None):
         """
         Closes the event manager.  This is required to stop any internal threads and allow a clean exit.  This should
         only be called when the application or script is closing or otherwise finished with the event manager as an
         instance, including the `default` cannot be restarted.
         """
         cls_inst = getattr(EventManager, "_instance", None)
-        wt = self._write_thread
-        wq = self._write_queue
+        with self._lock:
+            if self._closing and self._write_thread is None:
+                return self._last_shutdown_report
+            self._closing = True
+            wt = self._write_thread
+            wq = self._write_queue
+        timeout = self._shutdown_timeout_seconds if timeout is None else max(0.0, float(timeout))
+        deadline = time.perf_counter() + timeout
         if wt is not None:
             if wq is not None:
-                wq.put(None)
-            wt.join()
-            self._write_thread = None
-        # disable plugins
-        for plugin in self._plugins:
-            plugin.set_enable(False)
-        # queue needs be flushed so that we can join it:
-        if wq is not None:
-            self._write_queue = None  # set it directly, so that no other thread can now put through this instance
+                remaining = max(0.0, deadline - time.perf_counter())
+                try:
+                    wq.put(None, timeout=remaining)
+                except Full:
+                    logger.error("Event queue remained full during bounded shutdown")
+            wt.join(max(0.0, deadline - time.perf_counter()))
+            if not wt.is_alive():
+                self._write_thread = None
+        worker_stopped = wt is None or not wt.is_alive()
+        if worker_stopped:
+            with self._lock:
+                plugins = tuple(self._plugins)
+            for plugin in plugins:
+                plugin.set_enable(False)
+        # Once stopped, account for anything unexpectedly left behind. Never
+        # call Queue.join() here: an unresponsive plugin must not make shutdown
+        # unbounded.
+        if wq is not None and worker_stopped:
             while True:
                 try:
                     item = wq.get_nowait()
                     logger.warning("dropped unhandled %s: %s", type(item), item)
+                    with self._lock:
+                        if isinstance(item, _QueuedEvent):
+                            try:
+                                self._enqueue_times.remove(item.enqueued_perf_time)
+                            except ValueError:
+                                pass
+                            self._failed_count += 1
                     wq.task_done()
                 except Empty:
                     break
-            wq.join()
+        with self._lock:
+            self._write_queue = None
+            report = {
+                "delivered": self._delivered_count,
+                "pending": len(self._enqueue_times),
+                "failed": self._failed_count,
+                "workerStopped": worker_stopped,
+            }
+            self._last_shutdown_report = report
+        logger.info("Event manager shutdown report: %s", report)
         if cls_inst is self:
             self._remove_cls_instance()
+        return report
 
     def post_event_content(self, kind: int, data: Optional[Any] = None, when: Optional[datetime] = None,
                            index: int = None):
@@ -210,11 +304,32 @@ class EventManager:
         if info is None:
             # "~paranoid" check but that will prevent the non-desired stop of the work thread.
             raise RuntimeError("post_event(None) refused")
-        wq = self._write_queue
-        if wq is None:
-            logger.debug("post_event(%s) but write queue already removed", info.kind)
-        else:
-            wq.put(info)
+        with self._lock:
+            wq = self._write_queue
+            if wq is None or self._closing:
+                raise RuntimeError("Event manager is closed")
+        queued = _QueuedEvent(info, time.perf_counter())
+        with self._lock:
+            if self._write_queue is not wq or self._closing:
+                raise RuntimeError("Event manager is closed")
+            self._enqueue_times.append(queued.enqueued_perf_time)
+        try:
+            wq.put(queued, timeout=self._producer_wait_seconds)
+        except Full as error:
+            with self._lock:
+                try:
+                    self._enqueue_times.remove(queued.enqueued_perf_time)
+                except ValueError:
+                    pass
+                self._failed_count += 1
+                diagnostics = self.diagnostics
+            raise EventQueueFullError(
+                "Event dispatcher queue is full: "
+                f"capacity={diagnostics['capacity']} pending={diagnostics['pending']} "
+                f"oldest_age={diagnostics['oldestAgeSeconds']:.3f}s kind={info.kind}"
+            ) from error
+        with self._lock:
+            self._accepted_count += 1
 
     def has_pending(self) -> bool:
         """
@@ -255,11 +370,20 @@ class EventManager:
                 last_p_flush = p_now
             try:
                 # Workaround or current Jetson behavior w/ queue.get(timeout=).
-                info = input_q.get(timeout=0.5)
+                queued = input_q.get(timeout=0.5)
                 got_data = True
-                if info is None:
+                if queued is None:
                     logger.verbose("got exit sentinel, exiting main loop")
                     break
+                if isinstance(queued, _QueuedEvent):
+                    info = queued.info
+                    with self._lock:
+                        try:
+                            self._enqueue_times.remove(queued.enqueued_perf_time)
+                        except ValueError:
+                            pass
+                else:
+                    info = queued
             except Empty:
                 got_data = False
                 continue
@@ -299,13 +423,28 @@ class EventManager:
         # if got_data: always True.
         input_q.task_done()
 
-        for plugin in self._plugins:
+        with self._lock:
+            plugins = tuple(self._plugins)
+        for plugin in plugins:
             plugin.close()
 
     def _process_event(self, info: EventInfo, repeat_count: int = 0):
-        for plugin in self._plugins:
+        with self._lock:
+            plugins = tuple(self._plugins)
+        failed = False
+        for plugin in plugins:
             logger.spam("plugin %s: processing event %s", plugin, info)
-            plugin.process_event(info, repeat_count)
+            try:
+                plugin.process_event(info, repeat_count)
+            except Exception:
+                failed = True
+                logger.exception("Event plugin %s failed for %s", plugin, info)
+        with self._lock:
+            event_count = 1 + int(repeat_count)
+            if failed:
+                self._failed_count += event_count
+            else:
+                self._delivered_count += event_count
 
 
 atexit.register(EventManager.try_close_default)
