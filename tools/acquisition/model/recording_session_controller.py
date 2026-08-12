@@ -55,6 +55,13 @@ class RecordingSessionController:
         with self._lock:
             return self._session_id
 
+    @property
+    def metadata_generation_id(self) -> Optional[str]:
+        with self._lock:
+            if self._session_id is None:
+                return None
+            return f"{self._session_id}-g{self._generation}"
+
     def token(self) -> Optional[SessionGeneration]:
         with self._lock:
             if self._session_id is None:

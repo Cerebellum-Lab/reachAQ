@@ -859,6 +859,13 @@ def test_final_metadata_uses_canonical_boundary_not_stale_project_timestamp(
     assert len(serialized_json) < 12_000
     assert saved["artifacts"]["alignment"]["$ref"] == "streams/alignment.json"
     assert saved["artifacts"]["trialSummary"]["$ref"] == "streams/trial_summary.json"
+    manifest = json.loads((session_dir / "manifest.json").read_text())
+    assert saved["metadataGenerationId"] == manifest["metadataGenerationId"]
+    assert manifest["authoritativeMetadata"] == "metadata.json"
+    assert {item["path"] for item in manifest["files"]} == {
+        "metadata.json",
+        "metadata.yaml",
+    }
 
 
 def test_metadata_pair_is_not_replaced_when_yaml_serialization_fails(

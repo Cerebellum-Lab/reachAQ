@@ -120,3 +120,4 @@ def test_begin_record_is_atomic_and_refuses_second_reservation():
     assert second is None
     assert controller.status is SessionRecordingStatus.ARMING
     assert controller.session_id == "session001"
+    assert controller.metadata_generation_id == "session001-g1"

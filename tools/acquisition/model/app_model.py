@@ -160,6 +160,11 @@ from tools.acquisition.model.softmouse_spreadsheet_source import (
     SoftMouseSpreadsheetSource,
 )
 from tools.acquisition.model.session_data_recorder import SessionDataRecorder
+from tools.acquisition.model.atomic_session_io import (
+    atomic_publish_file,
+    atomic_write_json,
+    file_manifest_entry,
+)
 from tools.acquisition.model.session_boundary import SessionBoundary
 from tools.acquisition.model.trial_protocol_schedule import TrialProtocolSchedule
 from tools.acquisition.model.session_stop_policy import (
@@ -945,6 +950,9 @@ class AppModel(ObservableObject):
         self._session_data_recorder.arm(
             project,
             source_manifest=self._build_session_source_manifest(),
+            metadata_generation_id=(
+                self._recording_session.metadata_generation_id
+            ),
         )
         try:
             started = self._behavior.algorithm.start_session(reason="manual_record")
@@ -6229,6 +6237,12 @@ class AppModel(ObservableObject):
 
     def _save_metadata(self, project: ProjectInfo, when: datetime, file_name: str, session: Optional[int] = -1):
         when_as_utc = when.astimezone(timezone.utc)
+        metadata_generation_id = (
+            f"acquisition-{when_as_utc.timestamp()}"
+            if session is None
+            else self._recording_session.metadata_generation_id
+            or f"{project.short_id}-g{getattr(project, 'session_generation', 0)}"
+        )
         boundary = self._recording_session.boundary
         if boundary is not None and boundary.session_id == project.short_id:
             session_boundary = boundary.to_metadata()
@@ -6254,6 +6268,7 @@ class AppModel(ObservableObject):
         if session is None:
             out = {
                 "metadataSchemaVersion": 2,
+                "metadataGenerationId": metadata_generation_id,
                 "scope": "acquisition",
                 "createdUtc": when_as_utc.timestamp(),
                 "serialNumber": self._preferences.serial_number or "",
@@ -6278,6 +6293,7 @@ class AppModel(ObservableObject):
             }
             out = {
                 "metadataSchemaVersion": 2,
+                "metadataGenerationId": metadata_generation_id,
                 "scope": "session",
                 "sessionId": project.short_id,
                 "sessionIndex": session,
@@ -6360,29 +6376,61 @@ class AppModel(ObservableObject):
         out = _metadata_without_nonfinite_numbers(out)
         json_path = Path(file_name + ".json")
         yaml_path = Path(file_name + ".yaml")
-        json_temp = json_path.with_name(json_path.name + ".tmp")
-        yaml_temp = yaml_path.with_name(yaml_path.name + ".tmp")
-        try:
-            with json_temp.open("w", encoding="utf-8") as file:
-                json.dump(
-                    out,
-                    file,
-                    cls=SystemConfigurationJSONEncoder,
-                    allow_nan=False,
-                )
+        session_dir = None if session is None else Path(file_name).parent
+        generation_id = str(
+            out.get("metadataGenerationId") or f"acquisition-{when_as_utc.timestamp()}"
+        )
+        # Serialize both representations before publishing either one. This
+        # preserves the previous pair if either encoder rejects the snapshot;
+        # the generation ID detects the narrower power-loss window between the
+        # two atomic replacements.
+        json_text = json.dumps(
+            out,
+            cls=SystemConfigurationJSONEncoder,
+            allow_nan=False,
+            sort_keys=True,
+        ) + "\n"
+        yaml_text = yaml.dump(
+            out,
+            Dumper=SystemConfigurationDumper,
+            sort_keys=False,
+        )
+        atomic_publish_file(
+            json_path,
+            lambda path: path.write_text(json_text, encoding="utf-8"),
+            session_dir=session_dir,
+            generation_id=generation_id,
+            validate=lambda path: json.loads(path.read_text(encoding="utf-8")),
+        )
 
-            with yaml_temp.open("w", encoding="utf-8") as file:
-                yaml.dump(
-                    out,
-                    file,
-                    Dumper=SystemConfigurationDumper,
-                    sort_keys=False,
-                )
-            os.replace(json_temp, json_path)
-            os.replace(yaml_temp, yaml_path)
-        finally:
-            json_temp.unlink(missing_ok=True)
-            yaml_temp.unlink(missing_ok=True)
+        atomic_publish_file(
+            yaml_path,
+            lambda path: path.write_text(yaml_text, encoding="utf-8"),
+            session_dir=session_dir,
+            generation_id=generation_id,
+            validate=lambda path: yaml.safe_load(path.read_text(encoding="utf-8")),
+        )
+        if session_dir is not None:
+            stream_manifest_path = session_dir / "streams" / "stream_manifest.json"
+            manifest_files = [json_path, yaml_path, stream_manifest_path]
+            manifest = {
+                "schemaVersion": 1,
+                "metadataGenerationId": generation_id,
+                "authoritativeMetadata": json_path.relative_to(session_dir).as_posix(),
+                "files": [
+                    file_manifest_entry(path, relative_to=session_dir)
+                    for path in manifest_files
+                    if path.is_file()
+                ],
+            }
+            # This is deliberately last: its presence declares that the current
+            # auxiliary generation reached its authoritative metadata publish.
+            atomic_write_json(
+                session_dir / "manifest.json",
+                manifest,
+                session_dir=session_dir,
+                generation_id=generation_id,
+            )
 
     #
 

@@ -18,6 +18,14 @@ import numpy as np
 
 from autotrainer.core import ProjectInfo
 from tools.acquisition.model.session_boundary import SessionBoundary
+from tools.acquisition.model.atomic_session_io import (
+    atomic_publish_file,
+    atomic_write_json,
+    file_manifest_entry,
+)
+
+
+_PELLET_STIMULUS_CHANNEL_NAMES = ("tone1", "tone2", "stim2", "stim3")
 
 
 class _SessionLogHandler(logging.Handler):
@@ -74,6 +82,8 @@ class SessionDataRecorder:
         self._source_results = {}
         self._trial_records = ()
         self._trial_summary = {}
+        self._metadata_generation_id: Optional[str] = None
+        self._pending_finalization: Optional[dict] = None
 
         self._system_message_handler = system_message_handler
         self._hardware_model = hardware_model
@@ -86,9 +96,20 @@ class SessionDataRecorder:
         self._log_handler = _SessionLogHandler(self)
         logging.getLogger().addHandler(self._log_handler)
 
-    def arm(self, project: ProjectInfo, *, source_manifest=()) -> None:
-        self.abort()
+    def arm(
+        self,
+        project: ProjectInfo,
+        *,
+        source_manifest=(),
+        metadata_generation_id: Optional[str] = None,
+    ) -> None:
         with self._lock:
+            if self._armed:
+                raise RuntimeError("session recorder is already armed")
+            if self._pending_finalization is not None:
+                raise RuntimeError(
+                    "previous session finalization is still pending; retry or abort it"
+                )
             self._armed = True
             # BehaviorAlgorithm assigns the next session index immediately
             # after arming and before enabling the shared camera trigger.
@@ -107,6 +128,10 @@ class SessionDataRecorder:
             self._start_perf = None
             self._start_wall = None
             self._boundary = None
+            self._metadata_generation_id = str(
+                metadata_generation_id
+                or f"{project.short_id}-g{getattr(project, 'session_generation', 0)}"
+            )
             self._nidaq_stop.clear()
         thread = threading.Thread(
             target=self._poll_nidaq,
@@ -161,28 +186,63 @@ class SessionDataRecorder:
             source_results = dict(self._source_results)
             trial_records = tuple(self._trial_records)
             trial_summary = dict(self._trial_summary)
-            self._clear_locked()
-        return self._write_session(
-            project,
-            start_perf,
-            start_wall,
-            end_perf,
-            device_rows,
-            laser_rows,
-            log_rows,
-            nidaq_chunks,
-            timing_plan,
-            device_event_overruns=device_event_overruns,
-            source_manifest=source_manifest,
-            source_results=source_results,
-            boundary=boundary,
-            trial_records=trial_records,
-            trial_summary=trial_summary,
-        )
+            snapshot = {
+                "project": project,
+                "start_perf": start_perf,
+                "start_wall": start_wall,
+                "end_perf": end_perf,
+                "device_rows": device_rows,
+                "laser_rows": laser_rows,
+                "log_rows": log_rows,
+                "nidaq_chunks": nidaq_chunks,
+                "timing_plan": timing_plan,
+                "device_event_overruns": device_event_overruns,
+                "source_manifest": source_manifest,
+                "source_results": source_results,
+                "boundary": boundary,
+                "trial_records": trial_records,
+                "trial_summary": trial_summary,
+                "metadata_generation_id": self._metadata_generation_id,
+            }
+            self._armed = False
+            self._pending_finalization = snapshot
+        return self._publish_pending_finalization(max_attempts=2)
+
+    def retry_pending_finalization(self):
+        """Retry a retained auxiliary snapshot without reacquiring any data."""
+        return self._publish_pending_finalization(max_attempts=1)
+
+    def _publish_pending_finalization(self, *, max_attempts: int):
+        with self._lock:
+            snapshot = self._pending_finalization
+        if snapshot is None:
+            return None
+        first_error = None
+        for attempt in range(1, max(1, int(max_attempts)) + 1):
+            try:
+                result = self._write_session(**snapshot)
+            except Exception as error:
+                first_error = first_error or error
+                logging.getLogger(__name__).exception(
+                    "Session auxiliary finalization attempt %d/%d failed",
+                    attempt,
+                    max_attempts,
+                )
+                continue
+            with self._lock:
+                if self._pending_finalization is snapshot:
+                    self._pending_finalization = None
+                    self._clear_locked()
+            return result
+        raise RuntimeError(
+            "Session auxiliary finalization failed; staged files and the recorder "
+            "snapshot were retained for retry"
+        ) from first_error
 
     def abort(self) -> None:
         self._stop_nidaq_thread()
         with self._lock:
+            self._pending_finalization = None
             self._clear_locked()
 
     def close(self) -> None:
@@ -260,6 +320,9 @@ class SessionDataRecorder:
         with alignment_path.open("r", encoding="utf-8") as stream:
             alignment = json.load(stream)
         boundary = alignment["canonicalBoundary"]
+        metadata_generation_id = str(
+            alignment.get("metadataGenerationId", f"{project.short_id}-legacy")
+        )
         start_perf = float(boundary["startPerfTime"])
         end_perf = float(boundary["endPerfTime"])
         records = tuple(
@@ -268,21 +331,50 @@ class SessionDataRecorder:
             if start_perf <= float(record["send_perf_time"]) <= end_perf
         )
         for record in records:
+            record["metadata_generation_id"] = metadata_generation_id
             record["send_offset_seconds"] = (
                 float(record["send_perf_time"]) - start_perf
             )
 
         trial_path = streams_dir / "trials.jsonl"
-        trial_tmp = trial_path.with_suffix(".jsonl.tmp")
-        SessionDataRecorder._write_json_lines(trial_tmp, records)
-        trial_tmp.replace(trial_path)
+        SessionDataRecorder._atomic_write_json_lines(
+            trial_path,
+            Path(project.get_session_path().location),
+            metadata_generation_id,
+            records,
+        )
 
         summary_path = streams_dir / "trial_summary.json"
-        summary_tmp = summary_path.with_suffix(".json.tmp")
-        with summary_tmp.open("w", encoding="utf-8") as stream:
-            json.dump(dict(summary), stream, indent=2)
-            stream.write("\n")
-        summary_tmp.replace(summary_path)
+        summary = dict(summary)
+        summary["metadata_generation_id"] = metadata_generation_id
+        atomic_write_json(
+            summary_path,
+            summary,
+            session_dir=Path(project.get_session_path().location),
+            generation_id=metadata_generation_id,
+        )
+        manifest_path = streams_dir / "stream_manifest.json"
+        if manifest_path.is_file():
+            with manifest_path.open("r", encoding="utf-8") as stream:
+                manifest = json.load(stream)
+            manifest["files"] = [
+                file_manifest_entry(path, relative_to=streams_dir.parent)
+                for path in (
+                    streams_dir / "device.csv",
+                    trial_path,
+                    summary_path,
+                    streams_dir / "laser.csv",
+                    streams_dir.parent / "logs" / "session.log",
+                    alignment_path,
+                )
+                if path.is_file()
+            ]
+            atomic_write_json(
+                manifest_path,
+                manifest,
+                session_dir=streams_dir.parent,
+                generation_id=metadata_generation_id,
+            )
 
     def _clear_locked(self) -> None:
         self._armed = False
@@ -299,6 +391,7 @@ class SessionDataRecorder:
         self._source_results = {}
         self._trial_records = ()
         self._trial_summary = {}
+        self._metadata_generation_id = None
 
     def _on_device_message(
         self,
@@ -308,6 +401,14 @@ class SessionDataRecorder:
         wall_time: float,
     ) -> None:
         context = None
+        if (
+            getattr(kind, "name", None) == "STIMULUS_INPUTS"
+            and isinstance(data, (tuple, list))
+        ):
+            data = {
+                name: bool(value)
+                for name, value in zip(_PELLET_STIMULUS_CHANNEL_NAMES, data)
+            }
         if (
             getattr(kind, "name", None) == "ACKNOWLEDGE"
             and isinstance(data, (tuple, list))
@@ -545,12 +646,16 @@ class SessionDataRecorder:
         boundary: Optional[SessionBoundary] = None,
         trial_records=(),
         trial_summary=None,
+        metadata_generation_id=None,
     ):
         session_dir = Path(project.get_session_path().location)
         streams_dir = session_dir / "streams"
         logs_dir = session_dir / "logs"
         streams_dir.mkdir(parents=True, exist_ok=True)
         logs_dir.mkdir(parents=True, exist_ok=True)
+        metadata_generation_id = str(
+            metadata_generation_id or f"{project.short_id}-legacy"
+        )
 
         device_rows = tuple(
             row for row in device_rows if start_perf <= row[0] <= end_perf
@@ -586,6 +691,7 @@ class SessionDataRecorder:
             if start_perf <= float(record["send_perf_time"]) <= end_perf
         )
         for record in trial_records:
+            record["metadata_generation_id"] = metadata_generation_id
             record["send_offset_seconds"] = (
                 float(record["send_perf_time"]) - start_perf
             )
@@ -594,8 +700,8 @@ class SessionDataRecorder:
             for record in trial_records
         )
 
-        SessionDataRecorder._write_csv(
-            streams_dir / "device.csv",
+        SessionDataRecorder._atomic_write_csv(
+            streams_dir / "device.csv", session_dir, metadata_generation_id,
             (
                 "perf_time",
                 "offset_seconds",
@@ -634,18 +740,20 @@ class SessionDataRecorder:
                 ) in device_rows
             ),
         )
-        SessionDataRecorder._write_json_lines(
-            streams_dir / "trials.jsonl",
+        SessionDataRecorder._atomic_write_json_lines(
+            streams_dir / "trials.jsonl", session_dir, metadata_generation_id,
             trial_records,
         )
-        with (streams_dir / "trial_summary.json").open(
-            "w",
-            encoding="utf-8",
-        ) as stream:
-            json.dump({} if trial_summary is None else trial_summary, stream, indent=2)
-            stream.write("\n")
-        SessionDataRecorder._write_csv(
-            streams_dir / "laser.csv",
+        trial_summary = {} if trial_summary is None else dict(trial_summary)
+        trial_summary["metadata_generation_id"] = metadata_generation_id
+        atomic_write_json(
+            streams_dir / "trial_summary.json",
+            trial_summary,
+            session_dir=session_dir,
+            generation_id=metadata_generation_id,
+        )
+        SessionDataRecorder._atomic_write_csv(
+            streams_dir / "laser.csv", session_dir, metadata_generation_id,
             ("perf_time", "offset_seconds", "wall_time", "event", "channel", "source",
              "command_volts", "diode_volts", "command_copy_volts", "output_name",
              "output_value"),
@@ -681,22 +789,32 @@ class SessionDataRecorder:
             ),
         )
 
-        with (logs_dir / "session.log").open("w", encoding="utf-8") as stream:
-            stream.write(
-                f"# recording_start_perf={start_perf:.9f} "
-                f"recording_start_wall={start_wall:.9f} "
-                f"recording_end_perf={end_perf:.9f}\n"
-            )
-            for perf, _, message in log_rows:
-                stream.write(f"[+{perf - start_perf:.6f}s] {message}\n")
+        def write_log(path):
+            with path.open("w", encoding="utf-8") as stream:
+                stream.write(
+                    f"# metadata_generation_id={metadata_generation_id}\n"
+                    f"# recording_start_perf={start_perf:.9f} "
+                    f"recording_start_wall={start_wall:.9f} "
+                    f"recording_end_perf={end_perf:.9f}\n"
+                )
+                for perf, _, message in log_rows:
+                    stream.write(f"[+{perf - start_perf:.6f}s] {message}\n")
 
-        SessionDataRecorder._write_nidaq(
+        atomic_publish_file(
+            logs_dir / "session.log",
+            write_log,
+            session_dir=session_dir,
+            generation_id=metadata_generation_id,
+        )
+
+        atomic_publish_file(
             streams_dir / "nidaq.h5",
-            start_perf,
-            start_wall,
-            end_perf,
-            nidaq_chunks,
-            timing_plan,
+            lambda path: SessionDataRecorder._write_nidaq(
+                path, start_perf, start_wall, end_perf, nidaq_chunks, timing_plan,
+            ),
+            session_dir=session_dir,
+            generation_id=metadata_generation_id,
+            validate=SessionDataRecorder._validate_h5,
         )
         finalized_sources = SessionDataRecorder._finalize_source_manifest(
             session_dir,
@@ -738,6 +856,7 @@ class SessionDataRecorder:
                 )
         alignment = {
             "schemaVersion": 1,
+            "metadataGenerationId": metadata_generation_id,
             "canonicalBoundary": {
                 "source": "primary_camera_recorded_frames",
                 "clock": "time.perf_counter",
@@ -798,10 +917,40 @@ class SessionDataRecorder:
             "cameraNidaqAlignment": camera_nidaq_alignment,
             "toneConfirmation": tone_confirmation,
         }
-        with (streams_dir / "alignment.json").open("w", encoding="utf-8") as stream:
-            json.dump(alignment, stream, indent=2)
-            stream.write("\n")
+        atomic_write_json(
+            streams_dir / "alignment.json",
+            alignment,
+            session_dir=session_dir,
+            generation_id=metadata_generation_id,
+        )
+        critical_paths = (
+            streams_dir / "device.csv",
+            streams_dir / "trials.jsonl",
+            streams_dir / "trial_summary.json",
+            streams_dir / "laser.csv",
+            logs_dir / "session.log",
+            streams_dir / "alignment.json",
+        )
+        stream_manifest = {
+            "schemaVersion": 1,
+            "metadataGenerationId": metadata_generation_id,
+            "sessionId": project.short_id,
+            "sessionComplete": not incomplete_reasons,
+            "enabledSources": finalized_sources,
+            "files": [
+                file_manifest_entry(path, relative_to=session_dir)
+                for path in critical_paths
+                if path.is_file()
+            ],
+        }
+        atomic_write_json(
+            streams_dir / "stream_manifest.json",
+            stream_manifest,
+            session_dir=session_dir,
+            generation_id=metadata_generation_id,
+        )
         return {
+            "metadataGenerationId": metadata_generation_id,
             "cameraNidaqAlignment": camera_nidaq_alignment,
             "toneConfirmation": tone_confirmation,
             "deviceEventOverruns": int(device_event_overruns),
@@ -1274,6 +1423,42 @@ class SessionDataRecorder:
             for record in records:
                 json.dump(record, stream, sort_keys=True)
                 stream.write("\n")
+
+    @staticmethod
+    def _atomic_write_csv(path, session_dir, generation_id, header, rows) -> None:
+        rows = tuple(rows)
+        atomic_publish_file(
+            path,
+            lambda staged: SessionDataRecorder._write_csv(staged, header, rows),
+            session_dir=session_dir,
+            generation_id=generation_id,
+        )
+
+    @staticmethod
+    def _atomic_write_json_lines(
+        path, session_dir, generation_id, records,
+    ) -> None:
+        records = tuple(records)
+
+        def validate(staged):
+            with staged.open("r", encoding="utf-8") as stream:
+                for line in stream:
+                    json.loads(line)
+
+        atomic_publish_file(
+            path,
+            lambda staged: SessionDataRecorder._write_json_lines(staged, records),
+            session_dir=session_dir,
+            generation_id=generation_id,
+            validate=validate,
+        )
+
+    @staticmethod
+    def _validate_h5(path: Path) -> None:
+        with h5py.File(path, "r") as stream:
+            for required in ("sample_index", "perf_time", "values"):
+                if required not in stream:
+                    raise RuntimeError(f"NI-DAQ output lacks required dataset {required}")
 
     @staticmethod
     def _write_nidaq(

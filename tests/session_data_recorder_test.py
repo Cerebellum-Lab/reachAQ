@@ -97,6 +97,28 @@ def test_device_event_does_not_serialize_container_index_method():
         recorder.close()
 
 
+def test_pellet_stimulus_lines_are_labeled_for_tone_confirmation():
+    laser = _EventSource("trace_received")
+    recorder = SessionDataRecorder(object(), laser)
+    try:
+        recorder._on_device_message(
+            SystemStatusMessageKind.STIMULUS_INPUTS,
+            [True, False, True, False],
+            10.0,
+            100.0,
+        )
+
+        payload = json.loads(recorder._device_rows[0][-1])
+        assert payload == {
+            "tone1": True,
+            "tone2": False,
+            "stim2": True,
+            "stim3": False,
+        }
+    finally:
+        recorder.close()
+
+
 def test_structured_device_ledger_captures_decoded_input_and_output():
     handler = _EventSource("decoded_message_received")
     hardware = _EventSource("device_event")
@@ -636,7 +658,11 @@ def test_trial_ledger_is_written_on_the_canonical_session_timeline(tmp_path):
     assert len(written) == 1
     assert written[0]["attempt_label"] == "10.1"
     assert written[0]["send_offset_seconds"] == 0.25
-    assert json.loads((streams / "trial_summary.json").read_text()) == summary
+    written_summary = json.loads((streams / "trial_summary.json").read_text())
+    assert written_summary == {
+        **summary,
+        "metadata_generation_id": f"{project.short_id}-legacy",
+    }
 
     alignment = json.loads((streams / "alignment.json").read_text())
     assert alignment["streams"]["trials"]["sampleCount"] == 1
@@ -693,7 +719,74 @@ def test_post_analysis_trial_ledger_replaces_pending_records_atomically(tmp_path
     assert record["reach_count"] == 1
     assert record["send_offset_seconds"] == 0.25
     assert json.loads((streams / "trial_summary.json").read_text()) == {
+        "metadata_generation_id": f"{project.short_id}-legacy",
         "pending_analysis_attempts": 0,
         "scored_trials": 1,
     }
     assert not tuple(streams.glob("*.tmp"))
+
+
+def test_auxiliary_generation_is_shared_by_alignment_trials_and_manifest(tmp_path):
+    project = ProjectInfo(
+        root=str(tmp_path),
+        device_id="test",
+        when=datetime(2026, 1, 2, 3, 4, 5),
+        session=8,
+    )
+    generation_id = f"{project.short_id}-g4"
+
+    result = SessionDataRecorder._write_session(
+        project,
+        10.0,
+        100.0,
+        11.0,
+        (), (), (), (),
+        trial_records=({
+            "session_id": project.short_id,
+            "operation_id": "send-1",
+            "trial_id": 1,
+            "attempt_id": 1,
+            "attempt_label": "1.1",
+            "send_perf_time": 10.25,
+            "outcome": "success",
+        },),
+        trial_summary={"scored_trials": 1},
+        metadata_generation_id=generation_id,
+    )
+
+    streams = Path(project.get_session_path().location) / "streams"
+    alignment = json.loads((streams / "alignment.json").read_text())
+    trial = json.loads((streams / "trials.jsonl").read_text())
+    summary = json.loads((streams / "trial_summary.json").read_text())
+    manifest = json.loads((streams / "stream_manifest.json").read_text())
+
+    assert result["metadataGenerationId"] == generation_id
+    assert alignment["metadataGenerationId"] == generation_id
+    assert trial["metadata_generation_id"] == generation_id
+    assert summary["metadata_generation_id"] == generation_id
+    assert manifest["metadataGenerationId"] == generation_id
+
+
+def test_failed_auxiliary_finalization_retains_snapshot_for_retry(monkeypatch):
+    laser = _EventSource("trace_received")
+    recorder = SessionDataRecorder(object(), laser)
+    snapshot = {"project": object()}
+    recorder._pending_finalization = snapshot
+    attempts = []
+
+    def fail_then_succeed(**received):
+        attempts.append(received)
+        if len(attempts) == 1:
+            raise OSError("temporary write failure")
+        return {"sessionComplete": True}
+
+    monkeypatch.setattr(recorder, "_write_session", fail_then_succeed)
+    try:
+        with pytest.raises(RuntimeError, match="retained for retry"):
+            recorder._publish_pending_finalization(max_attempts=1)
+        assert recorder._pending_finalization is snapshot
+
+        assert recorder.retry_pending_finalization() == {"sessionComplete": True}
+        assert recorder._pending_finalization is None
+    finally:
+        recorder.close()
