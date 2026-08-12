@@ -217,6 +217,10 @@ class RecordingSessionController:
 
     def reset_after_abort(self) -> None:
         with self._lock:
+            # Invalidate every callback issued for the aborted generation even
+            # while the public state returns to Ready.
+            self._generation += 1
+            self._session_id = None
             self.pending_end_perf = None
             self.boundary = None
             self.data_complete = True
@@ -228,3 +232,33 @@ class RecordingSessionController:
             self.analysis_started_perf = None
             self.analysis_duration_seconds = None
             self.animal_snapshot = None
+
+    def set_analysis_started(self, perf_time: float) -> None:
+        with self._lock:
+            self.analysis_started_perf = float(perf_time)
+            self.analysis_finished = False
+
+    def set_analysis_finished(self, perf_time: float) -> None:
+        with self._lock:
+            self.analysis_finished = True
+            self.analysis_duration_seconds = max(
+                0.0,
+                float(perf_time) - (
+                    self.analysis_started_perf or float(perf_time)
+                ),
+            )
+
+    def mark_analysis_pending(self) -> None:
+        with self._lock:
+            self.analysis_finished = False
+
+    def update_boundary_nidaq_sample_index(
+        self,
+        sample_index: int,
+        token: SessionGeneration,
+    ) -> bool:
+        with self._lock:
+            if not self.is_current(token) or self.boundary is None:
+                return False
+            self.boundary = self.boundary.with_nidaq_sample_index(sample_index)
+            return True

@@ -1403,7 +1403,7 @@ class AppModel(ObservableObject):
             )
             return False
         self._cancel_automatic_stop_timers()
-        self._recording_session.analysis_finished = False
+        self._recording_session.mark_analysis_pending()
         if not self._set_session_recording_status(
             SessionRecordingStatus.STOPPING,
             expected=(SessionRecordingStatus.RECORDING,),
@@ -1467,7 +1467,8 @@ class AppModel(ObservableObject):
         self._behavior.algorithm.pellet_send_block_reason = ""
         self._session_data_recorder.abort()
         self._cancel_automatic_stop_timers()
-        self._recording_session.pending_end_perf = None
+        if token is not None:
+            self._recording_session.take_pending_end(token)
         self._record_start_timer.cancel()
         self._record_start_timer = no_op_timer
         if previous_status is SessionRecordingStatus.ANALYZING:
@@ -1735,6 +1736,11 @@ class AppModel(ObservableObject):
                 self._handle_proc_msg(raw, cams_closed_finished=cams_closed_finished)
             except Exception as err:
                 logger.exception("Error handling message %s: %s ; continuing", raw, err)
+                if self._recording_session.status is not SessionRecordingStatus.READY:
+                    self._mark_session_invariant_unknown(
+                        "process message "
+                        f"{raw[0] if isinstance(raw, tuple) and raw else raw}: {err}"
+                    )
         # end while True
         logger.info("handle_proc_msg_queue exiting")
 
@@ -1822,7 +1828,10 @@ class AppModel(ObservableObject):
                             camera_when=float(first_frame_when),
                         )
                         if session_token is None:
-                            self._recording_session.boundary = boundary
+                            logger.warning(
+                                "camera recording boundary arrived without an active token"
+                            )
+                            return
                         elif not self._recording_session.set_boundary(
                             boundary,
                             session_token,
@@ -1883,7 +1892,9 @@ class AppModel(ObservableObject):
                     if self._recording_session.status == SessionRecordingStatus.STOPPING:
                         end_perf = r_args[0] if r_args else get_perf_now()
                         if session_token is None:
-                            self._recording_session.pending_end_perf = end_perf
+                            logger.warning(
+                                "camera recording end arrived without an active token"
+                            )
                         else:
                             self._recording_session.set_pending_end(
                                 end_perf,
@@ -2183,6 +2194,8 @@ class AppModel(ObservableObject):
             )
         if self._protocol_runner.protocol_complete:
             blockers.append("Selected protocol is complete")
+        if self.animal_metadata_refresh_busy:
+            blockers.append("SoftMouse animal metadata refresh is still running")
         if self._recording_session.status is not SessionRecordingStatus.READY:
             blockers.append(
                 f"recording state: {self._recording_session.status.value}"
@@ -3525,6 +3538,9 @@ class AppModel(ObservableObject):
 
     def set_automatic_protocol_advance_enabled(self, enabled: bool) -> None:
         """Apply protocol advancement consistently to config and live runner."""
+        self._require_session_ready_for_configuration(
+            "Changing automatic protocol advancement"
+        )
         enabled = bool(enabled)
         session_control = self._behavior.algorithm.active_config.session_control
         session_control.automatic_protocol_advance_enabled = enabled
@@ -3677,8 +3693,12 @@ class AppModel(ObservableObject):
             return False
         self._trial_protocol_schedule.update(trial_id, field, value)
         self._notify_trial_protocol_state()
+        return True
 
     def set_intertrial_analysis_enabled(self, enabled: bool) -> None:
+        self._require_session_ready_for_configuration(
+            "Changing intertrial analysis"
+        )
         control = self._behavior.algorithm.active_config.session_control
         control.intertrial_analysis_enabled = bool(enabled)
         if not enabled:
@@ -3687,6 +3707,21 @@ class AppModel(ObservableObject):
                 for outcome in control.behavioral_retry_outcomes
                 if outcome == TrialOutcome.PELLET_MISSING.value
             )
+            if control.trial_count_basis == TrialCountBasis.SCORED.value:
+                control.trial_count_basis = TrialCountBasis.COMPLETED.value
+        self._notify_trial_protocol_state()
+        return True
+
+    def update_session_control_option(self, field: str, value) -> bool:
+        """Validate and apply one operator session-policy option while Ready."""
+        self._require_session_ready_for_configuration(
+            "Changing recording-session configuration"
+        )
+        control = self._behavior.algorithm.active_config.session_control
+        if field not in {item.name for item in dataclasses.fields(control)}:
+            raise ValueError(f"Unknown session-control option: {field}")
+        candidate = dataclasses.replace(control, **{str(field): value})
+        setattr(control, str(field), getattr(candidate, str(field)))
         self._notify_trial_protocol_state()
         return True
 
@@ -6180,7 +6215,7 @@ class AppModel(ObservableObject):
             else self._recording_session.take_pending_end(token)
         )
         if token is None:
-            self._recording_session.pending_end_perf = None
+            logger.warning("stopped recording completion has no active token")
         if end_perf is None:
             end_perf = get_perf_now()
             logger.warning("Primary camera did not report a final recorded-frame timestamp")
@@ -6191,7 +6226,8 @@ class AppModel(ObservableObject):
             )
         completed_boundary = boundary.with_end(end_perf)
         if token is None:
-            self._recording_session.boundary = completed_boundary
+            logger.warning("cannot update stopped boundary without a session token")
+            return
         elif not self._recording_session.set_boundary(completed_boundary, token):
             logger.warning("stopped-recording boundary became stale: %s", token)
             return
@@ -6230,11 +6266,11 @@ class AppModel(ObservableObject):
                 else camera_alignment.get("matchedSampleIndex")
             )
             if matched_sample_index is not None:
-                self._recording_session.boundary = (
-                    self._recording_session.boundary.with_nidaq_sample_index(
-                        matched_sample_index
-                    )
-                )
+                if token is None or not self._recording_session.update_boundary_nidaq_sample_index(
+                    matched_sample_index,
+                    token,
+                ):
+                    logger.warning("NI-DAQ alignment boundary update became stale")
             self._recording_session.set_stream_result(stream_result)
             if not self._recording_session.data_complete:
                 message = (
@@ -6244,7 +6280,7 @@ class AppModel(ObservableObject):
                 logger.error(message)
                 self.on_error("Session data incomplete", message)
         self._request_session_end_home("stop")
-        self._recording_session.analysis_started_perf = time.perf_counter()
+        self._recording_session.set_analysis_started(time.perf_counter())
         self._begin_subsystem_start(
             SubsystemId.INTERTRIAL_ANALYSIS,
             reason="finishing closed pellet-trial analyses",
@@ -6383,11 +6419,7 @@ class AppModel(ObservableObject):
         self._intertrial_resolution_reason = ""
         self._intertrial_waiting_operations.clear()
         self._behavior.algorithm.pellet_send_block_reason = ""
-        self._recording_session.analysis_finished = True
-        self._recording_session.analysis_duration_seconds = (
-            time.perf_counter()
-            - (self._recording_session.analysis_started_perf or time.perf_counter())
-        )
+        self._recording_session.set_analysis_finished(time.perf_counter())
         try:
             self._save_project_metadata(
                 project,
@@ -7007,6 +7039,7 @@ class AppModel(ObservableObject):
         if caller in {
             "raw_writers_closed",
             "session_analysis_ended",
+            "intertrial_analysis_finished",
             "session_notes_updated",
         }:
             boundary = self._recording_session.boundary

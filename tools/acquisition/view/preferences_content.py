@@ -689,8 +689,7 @@ class PreferencesContent(QWidget):
             "Automatically repeat pellet delivery trials while recording."
         )
         automatic_cycles.stateChanged.connect(
-            lambda value: setattr(
-                config,
+            lambda value: self._app_model.update_session_control_option(
                 "automatic_pellet_cycles_enabled",
                 value != 0,
             )
@@ -732,8 +731,7 @@ class PreferencesContent(QWidget):
             analysis_progression.findData(config.intertrial_progression_mode)
         )
         analysis_progression.currentIndexChanged.connect(
-            lambda _index: setattr(
-                config,
+            lambda _index: self._app_model.update_session_control_option(
                 "intertrial_progression_mode",
                 analysis_progression.currentData(),
             )
@@ -753,10 +751,13 @@ class PreferencesContent(QWidget):
                 selected.add(outcome.value)
             else:
                 selected.discard(outcome.value)
-            config.behavioral_retry_outcomes = tuple(
+            self._app_model.update_session_control_option(
+                "behavioral_retry_outcomes",
+                tuple(
                 candidate.value
                 for candidate in TrialOutcome
                 if candidate.value in selected
+                ),
             )
 
         analysis_retry_checkboxes = []
@@ -792,8 +793,7 @@ class PreferencesContent(QWidget):
             attempt_policy.findData(config.attempt_assignment)
         )
         attempt_policy.currentIndexChanged.connect(
-            lambda _index: setattr(
-                config,
+            lambda _index: self._app_model.update_session_control_option(
                 "attempt_assignment",
                 attempt_policy.currentData(),
             )
@@ -807,8 +807,7 @@ class PreferencesContent(QWidget):
             retry_settings.findData(config.retry_settings)
         )
         retry_settings.currentIndexChanged.connect(
-            lambda _index: setattr(
-                config,
+            lambda _index: self._app_model.update_session_control_option(
                 "retry_settings",
                 retry_settings.currentData(),
             )
@@ -837,8 +836,7 @@ class PreferencesContent(QWidget):
         intertrial_analysis.toggled.connect(set_scored_basis_enabled)
         count_basis.setCurrentIndex(count_basis.findData(config.trial_count_basis))
         count_basis.currentIndexChanged.connect(
-            lambda _index: setattr(
-                config,
+            lambda _index: self._app_model.update_session_control_option(
                 "trial_count_basis",
                 count_basis.currentData(),
             )
@@ -856,12 +854,15 @@ class PreferencesContent(QWidget):
                 selected.add(outcome.value)
             else:
                 selected.discard(outcome.value)
-            config.counted_trial_outcomes = tuple(
+            self._app_model.update_session_control_option(
+                "counted_trial_outcomes",
+                tuple(
                 candidate.value
                 for candidate in TrialOutcome
                 if candidate.value in selected
                 and candidate is not TrialOutcome.HARDWARE_ERROR
                 and candidate is not TrialOutcome.PENDING_ANALYSIS
+                ),
             )
 
         for outcome, display_name in (
@@ -894,8 +895,7 @@ class PreferencesContent(QWidget):
         duration_limit.setSuffix(" s")
         duration_limit.setValue(config.duration_limit_seconds or 0)
         duration_limit.valueChanged.connect(
-            lambda value: setattr(
-                config,
+            lambda value: self._app_model.update_session_control_option(
                 "duration_limit_seconds",
                 value if value > 0 else None,
             )
@@ -907,8 +907,7 @@ class PreferencesContent(QWidget):
         trial_limit.setSpecialValueText("No limit")
         trial_limit.setValue(config.trial_limit or 0)
         trial_limit.valueChanged.connect(
-            lambda value: setattr(
-                config,
+            lambda value: self._app_model.update_session_control_option(
                 "trial_limit",
                 value if value > 0 else None,
             )
@@ -918,8 +917,7 @@ class PreferencesContent(QWidget):
         stop_on_protocol = QSwitch()
         stop_on_protocol.setChecked(config.stop_on_protocol_complete)
         stop_on_protocol.stateChanged.connect(
-            lambda value: setattr(
-                config,
+            lambda value: self._app_model.update_session_control_option(
                 "stop_on_protocol_complete",
                 value != 0,
             )
@@ -936,8 +934,7 @@ class PreferencesContent(QWidget):
         )
         drain_timeout.setValue(config.stop_drain_timeout_seconds)
         drain_timeout.valueChanged.connect(
-            lambda value: setattr(
-                config,
+            lambda value: self._app_model.update_session_control_option(
                 "stop_drain_timeout_seconds",
                 value,
             )

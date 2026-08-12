@@ -57,6 +57,21 @@ def test_owns_boundary_stream_completeness_and_abort_reset():
     assert controller.analysis_finished is True
 
 
+def test_abort_reset_invalidates_the_active_generation():
+    controller = RecordingSessionController()
+    _, token = controller.begin_record("session001", {})
+    controller.transition(
+        SessionRecordingStatus.ABORTING,
+        expected=(SessionRecordingStatus.ARMING,),
+        token=token,
+    )
+
+    controller.reset_after_abort()
+
+    assert controller.token() is None
+    assert not controller.is_current(token)
+
+
 def test_generation_rejects_stale_transitions_and_boundaries():
     controller = RecordingSessionController()
     first = controller.begin_record("session001", {})

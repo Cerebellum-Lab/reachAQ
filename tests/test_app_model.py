@@ -205,8 +205,33 @@ def test_configuration_mutators_reject_active_session(app_model):
             app_model.load_configuration()
         with pytest.raises(RuntimeError, match="DAQ port configuration.*recording"):
             app_model.update_daq_port_configuration(None, None)
+        with pytest.raises(RuntimeError, match="intertrial analysis.*recording"):
+            app_model.set_intertrial_analysis_enabled(False)
+        with pytest.raises(RuntimeError, match="protocol advancement.*recording"):
+            app_model.set_automatic_protocol_advance_enabled(False)
+        with pytest.raises(RuntimeError, match="session configuration.*recording"):
+            app_model.update_session_control_option("trial_limit", 5)
     finally:
         app_model._set_session_recording_status(SessionRecordingStatus.READY)
+
+
+def test_disabling_analysis_changes_scored_counting_to_completed(app_model):
+    control = app_model.behavior.algorithm.active_config.session_control
+    control.intertrial_analysis_enabled = True
+    control.trial_count_basis = "scored"
+
+    app_model.set_intertrial_analysis_enabled(False)
+
+    assert control.trial_count_basis == "completed"
+
+
+def test_softmouse_refresh_is_a_temporary_recording_blocker(app_model):
+    with app_model._animal_metadata_refresh_lock:
+        app_model._animal_metadata_refresh_busy = True
+
+    assert "SoftMouse animal metadata refresh is still running" in (
+        app_model.recording_blockers
+    )
 
 
 def test_writer_finalization_waits_for_all_reach_cameras_and_pose(app_model):
@@ -923,17 +948,23 @@ def test_abort_during_analysis_cancels_analysis_and_removes_session(
 
 
 def test_stop_finishes_auxiliary_data_after_raw_writers_close(app_model):
-    app_model._recording_session.pending_end_perf = 12.5
-    app_model._recording_session.boundary = SessionBoundary(
+    _, token = app_model._recording_session.begin_record(
+        app_model.project.short_id, {},
+    )
+    app_model._recording_session.set_pending_end(12.5, token)
+    app_model._recording_session.set_boundary(SessionBoundary(
         session_id=app_model.project.short_id,
         primary_camera="left",
         primary_frame_id=42,
         start_perf_time=10.0,
         start_wall_time=100.0,
         camera_when=1_000_000.0,
+    ), token)
+    app_model._recording_session.transition(
+        SessionRecordingStatus.STOPPING,
+        expected=(SessionRecordingStatus.ARMING,),
+        token=token,
     )
-    app_model._recording_session.analysis_finished = False
-    app_model._set_session_recording_status(SessionRecordingStatus.STOPPING)
 
     with mock.patch.object(
         app_model._session_data_recorder, "stop"
@@ -955,21 +986,27 @@ def test_stop_finishes_auxiliary_data_after_raw_writers_close(app_model):
 
 
 def test_stop_snapshots_trial_ledger_with_pending_analysis_outcome(app_model):
-    app_model._recording_session.pending_end_perf = 12.5
-    app_model._recording_session.boundary = SessionBoundary(
+    _, token = app_model._recording_session.begin_record(
+        app_model.project.short_id, {},
+    )
+    app_model._recording_session.set_pending_end(12.5, token)
+    app_model._recording_session.set_boundary(SessionBoundary(
         session_id=app_model.project.short_id,
         primary_camera="left",
         primary_frame_id=42,
         start_perf_time=10.0,
         start_wall_time=100.0,
         camera_when=1_000_000.0,
-    )
+    ), token)
     ledger = PelletTrialLedger(app_model.project.short_id)
     ledger.begin_send(10.5, 100.5, operation_id="send-1")
     ledger.acknowledge_presentation(10.75, 100.75)
     app_model._trial_ledger = ledger
-    app_model._recording_session.analysis_finished = False
-    app_model._set_session_recording_status(SessionRecordingStatus.STOPPING)
+    app_model._recording_session.transition(
+        SessionRecordingStatus.STOPPING,
+        expected=(SessionRecordingStatus.ARMING,),
+        token=token,
+    )
 
     with mock.patch.object(
         app_model._session_data_recorder,
@@ -1095,17 +1132,23 @@ def test_metadata_pair_is_not_replaced_when_yaml_serialization_fails(
 def test_incomplete_auxiliary_streams_are_not_reported_as_fully_saved(
     app_model,
 ):
-    app_model._recording_session.pending_end_perf = 12.0
-    app_model._recording_session.boundary = SessionBoundary(
+    _, token = app_model._recording_session.begin_record(
+        app_model.project.short_id, {},
+    )
+    app_model._recording_session.set_pending_end(12.0, token)
+    app_model._recording_session.set_boundary(SessionBoundary(
         session_id=app_model.project.short_id,
         primary_camera="left",
         primary_frame_id=42,
         start_perf_time=10.0,
         start_wall_time=100.0,
         camera_when=1_000_000.0,
+    ), token)
+    app_model._recording_session.transition(
+        SessionRecordingStatus.STOPPING,
+        expected=(SessionRecordingStatus.ARMING,),
+        token=token,
     )
-    app_model._recording_session.analysis_finished = True
-    app_model._set_session_recording_status(SessionRecordingStatus.STOPPING)
     result = {
         "sessionComplete": False,
         "incompleteReasons": ("nidaq.barcode reported 1 acquisition gap(s)",),
