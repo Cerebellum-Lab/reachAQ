@@ -24,6 +24,10 @@ from tools.acquisition.model.live_tracking_buffer import (
 logger = logging.getLogger(__name__)
 
 
+class AnalysisCancelled(RuntimeError):
+    pass
+
+
 class AnalysisProgressionMode(str, enum.Enum):
     CONTINUE = "continue"
     WAIT = "wait"
@@ -97,16 +101,24 @@ class IntertrialAnalysisResult:
 @dataclass(frozen=True)
 class AnalysisTimingEstimate:
     completed_windows: int
-    mean_realtime_factor: Optional[float]
+    conservative_realtime_factor: Optional[float]
     projected_seconds: Optional[float]
 
     @property
+    def mean_realtime_factor(self) -> Optional[float]:
+        """Compatibility alias for existing status/UI consumers."""
+        return self.conservative_realtime_factor
+
+    @property
     def display_text(self) -> str:
-        if self.projected_seconds is None or self.mean_realtime_factor is None:
+        if (
+            self.projected_seconds is None
+            or self.conservative_realtime_factor is None
+        ):
             return "estimating"
         return (
             f"{self.projected_seconds:.2f}s projected "
-            f"({self.mean_realtime_factor:.2f}x realtime)"
+            f"({self.conservative_realtime_factor:.2f}x realtime)"
         )
 
 
@@ -175,10 +187,14 @@ def analyze_tracking_window(
     *,
     hand_distance_threshold_mm: float = 15.0,
     max_interpolation_gap_seconds: float = 0.1,
+    minimum_consumption_missing_samples: int = 3,
+    cancellation_event: Optional[threading.Event] = None,
 ) -> IntertrialAnalysisResult:
     """Classify reaches from existing live tracking; no frame inference occurs."""
 
     started = time.perf_counter()
+    if cancellation_event is not None and cancellation_event.is_set():
+        raise AnalysisCancelled("intertrial analysis was cancelled")
     samples, interpolated, long_gaps = _interpolate_short_gaps(
         request.window.samples,
         max_gap_seconds=max_interpolation_gap_seconds,
@@ -190,13 +206,15 @@ def analyze_tracking_window(
     approached = False
     pellet_was_seen = False
     pellet_lost = False
+    pellet_missing_run = 0
 
     def finish_active():
-        nonlocal active, approached, pellet_lost
+        nonlocal active, approached, pellet_lost, pellet_missing_run
         if not active or not approached:
             active = []
             approached = False
             pellet_lost = False
+            pellet_missing_run = 0
             return
         closest = min(active, key=lambda item: item[1])
         trajectories.append(ReachTrajectory(
@@ -209,14 +227,21 @@ def analyze_tracking_window(
         active = []
         approached = False
         pellet_lost = False
+        pellet_missing_run = 0
 
     for sample in samples:
+        if cancellation_event is not None and cancellation_event.is_set():
+            raise AnalysisCancelled("intertrial analysis was cancelled")
         pellet = sample.location(str(SceneElement.Pellet))
         hand = sample.location(str(SceneElement.R_Hand))
         if sample.pellet_seen:
             pellet_was_seen = True
+            pellet_missing_run = 0
         elif pellet_was_seen and active:
-            pellet_lost = True
+            pellet_missing_run += 1
+            pellet_lost = (
+                pellet_missing_run >= minimum_consumption_missing_samples
+            )
         if pellet is None or hand is None:
             continue
         offset = (hand.x - pellet.x, hand.y - pellet.y, hand.z - pellet.z)
@@ -337,12 +362,16 @@ class IntertrialAnalysisCoordinator:
         self,
         result_callback: Callable[[IntertrialAnalysisResult], None],
         *,
+        failure_callback: Optional[
+            Callable[[IntertrialAnalysisRequest, Exception], None]
+        ] = None,
         queue_capacity: int = 8,
         analyzer: Callable[[IntertrialAnalysisRequest], IntertrialAnalysisResult] = analyze_tracking_window,
     ):
         if queue_capacity <= 0:
             raise ValueError("Analysis queue capacity must be positive")
         self._callback = result_callback
+        self._failure_callback = failure_callback
         self._analyzer = analyzer
         self._queue = queue.Queue(maxsize=queue_capacity)
         self._lock = threading.RLock()
@@ -352,6 +381,7 @@ class IntertrialAnalysisCoordinator:
         self._pending = 0
         self._closed = False
         self._ratios = []
+        self._cancel_event = threading.Event()
         self._worker = threading.Thread(
             target=self._run,
             name="IntertrialAnalysis",
@@ -361,6 +391,8 @@ class IntertrialAnalysisCoordinator:
 
     def begin_session(self, generation: int, session_id: str) -> None:
         with self._lock:
+            self._cancel_event.set()
+            self._cancel_event = threading.Event()
             self._generation = int(generation)
             self._session_id = str(session_id)
             self._ratios.clear()
@@ -394,6 +426,7 @@ class IntertrialAnalysisCoordinator:
 
     def cancel_session(self) -> None:
         with self._lock:
+            self._cancel_event.set()
             self._generation += 1
             self._session_id = ""
             self._discard_queued_unlocked()
@@ -405,7 +438,11 @@ class IntertrialAnalysisCoordinator:
                 factor = None
                 projected = None
             else:
-                factor = sum(self._ratios) / len(self._ratios)
+                # Use a nearest-rank p90 estimate so a few unusually fast
+                # windows do not promise an optimistic wait time.
+                ordered = sorted(self._ratios)
+                rank = max(0, math.ceil(0.9 * len(ordered)) - 1)
+                factor = ordered[rank]
                 projected = factor * max(0.0, float(video_seconds))
             return AnalysisTimingEstimate(len(self._ratios), factor, projected)
 
@@ -429,10 +466,22 @@ class IntertrialAnalysisCoordinator:
                 return
             with self._lock:
                 current_before = self._is_current_unlocked(request)
+                cancel_event = self._cancel_event
             result = None
             if current_before:
                 try:
-                    result = self._analyzer(request)
+                    if self._analyzer is analyze_tracking_window:
+                        result = self._analyzer(
+                            request,
+                            cancellation_event=cancel_event,
+                        )
+                    else:
+                        result = self._analyzer(request)
+                except AnalysisCancelled:
+                    logger.info(
+                        "Intertrial analysis cancelled for %s",
+                        request.attempt_label,
+                    )
                 except Exception as error:  # preserve a per-trial failure result
                     result = IntertrialAnalysisResult(
                         request=request,
@@ -449,17 +498,33 @@ class IntertrialAnalysisCoordinator:
                     )
             with self._lock:
                 current_after = self._is_current_unlocked(request)
+            callback_error = None
             if result is not None and current_after:
                 try:
                     self._callback(result)
-                except Exception:
+                except Exception as error:
+                    callback_error = error
                     logger.exception(
                         "Intertrial result callback failed for %s",
                         request.attempt_label,
                     )
+                    failure_callback = self._failure_callback
+                    if failure_callback is not None:
+                        try:
+                            failure_callback(request, error)
+                        except Exception:
+                            logger.exception(
+                                "Intertrial callback-failure handler failed for %s",
+                                request.attempt_label,
+                            )
             with self._lock:
                 self._pending = max(0, self._pending - 1)
-                if result is not None and result.video_seconds > 0:
+                if (
+                    callback_error is None
+                    and result is not None
+                    and result.video_seconds > 0
+                    and self._is_current_unlocked(request)
+                ):
                     self._ratios.append(
                         result.analysis_seconds / result.video_seconds
                     )
@@ -509,6 +574,8 @@ def tracking_request_record(
             "missingFrameIds": request.window.missing_frame_ids,
             "duplicateFrameIds": request.window.duplicate_frame_ids,
             "monotonic": request.window.monotonic,
+            "requestedStartFrameId": request.window.requested_start_frame_id,
+            "requestedEndFrameId": request.window.requested_end_frame_id,
             "samples": [sample.to_record() for sample in request.window.samples],
         },
         "pelletState": {
@@ -583,6 +650,8 @@ def tracking_request_from_record(
         missing_frame_ids=tuple(window_record["missingFrameIds"]),
         duplicate_frame_ids=tuple(window_record["duplicateFrameIds"]),
         monotonic=bool(window_record["monotonic"]),
+        requested_start_frame_id=window_record.get("requestedStartFrameId"),
+        requested_end_frame_id=window_record.get("requestedEndFrameId"),
     )
     pellet = record["pelletState"]
     return IntertrialAnalysisRequest(

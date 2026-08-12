@@ -219,6 +219,35 @@ def test_late_analysis_cannot_relabel_a_subsequent_attempt_for_retry():
         )
 
 
+def test_stop_finalization_never_relabels_existing_attempts():
+    ledger = PelletTrialLedger("session001")
+    ledger.begin_send(1.0, 11.0, operation_id="first")
+    ledger.acknowledge_presentation(1.1, 11.1)
+    first = ledger.close_active_for_analysis(2.0, 12.0)
+    ledger.finalize_pending(
+        first.trial_id,
+        first.attempt_id,
+        TrialOutcome.FAILURE,
+        2.1,
+        12.1,
+    )
+    ledger.begin_send(3.0, 13.0, operation_id="second")
+    ledger.acknowledge_presentation(3.1, 13.1)
+    second = ledger.close_active_for_analysis(4.0, 14.0)
+
+    before = tuple(
+        (attempt.operation_id, attempt.attempt_label)
+        for attempt in ledger.attempts
+    )
+    ledger.finalize_pending_without_analysis(5.0, 15.0)
+
+    assert before == tuple(
+        (attempt.operation_id, attempt.attempt_label)
+        for attempt in ledger.attempts
+    )
+    assert second.attempt_label == "2.1"
+
+
 def test_analysis_fields_are_persisted_on_pending_attempt():
     ledger = PelletTrialLedger("session001")
     ledger.begin_send(

@@ -581,7 +581,6 @@ class PelletTrialLedger:
                     wall_time,
                     error=reason,
                 ))
-        self._reindex_analyzed_attempts()
         return tuple(
             current
             for current in self._attempts
@@ -700,71 +699,3 @@ class PelletTrialLedger:
             if perf_time is not None and start <= float(perf_time) < end:
                 selected.append(dict(reference))
         return tuple(selected)
-
-    def _reindex_analyzed_attempts(self) -> None:
-        """Apply behavioral retry numbering once outcomes are known."""
-        policy = self.configuration.assignment_policy
-        if policy is AttemptAssignmentPolicy.SUCCESSFUL_PRESENTATIONS_ONLY:
-            next_trial = 1
-            unindexed = 0
-            for index, attempt in enumerate(self._attempts):
-                if attempt.is_presented:
-                    replacement = dataclasses.replace(
-                        attempt,
-                        trial_id=next_trial,
-                        attempt_id=1,
-                        logical_trial_complete=attempt.outcome is not TrialOutcome.HARDWARE_ERROR,
-                    )
-                    next_trial += 1
-                else:
-                    unindexed += 1
-                    replacement = dataclasses.replace(
-                        attempt,
-                        trial_id=None,
-                        attempt_id=unindexed,
-                        logical_trial_complete=False,
-                    )
-                self._attempts[index] = replacement
-            self._next_trial_id = next_trial
-            self._unindexed_attempt_id = unindexed
-            return
-
-        trial_id = 1
-        attempt_id = 1
-        non_hardware_indices = [
-            index
-            for index, attempt in enumerate(self._attempts)
-            if attempt.outcome is not TrialOutcome.HARDWARE_ERROR
-        ]
-        last_non_hardware = (
-            non_hardware_indices[-1] if non_hardware_indices else None
-        )
-        for index, attempt in enumerate(self._attempts):
-            is_hardware = attempt.outcome is TrialOutcome.HARDWARE_ERROR
-            if policy is AttemptAssignmentPolicy.EVERY_ATTEMPT_IS_TRIAL:
-                retry = is_hardware
-            else:
-                retry = is_hardware or (
-                    index != last_non_hardware
-                    and attempt.outcome in {
-                        TrialOutcome.FAILURE,
-                        TrialOutcome.PELLET_MISSING,
-                    }
-                )
-            self._attempts[index] = dataclasses.replace(
-                attempt,
-                trial_id=trial_id,
-                attempt_id=attempt_id,
-                logical_trial_complete=not retry,
-                retry_settings_policy=(
-                    self.configuration.retry_settings_policy
-                    if attempt_id > 1
-                    else None
-                ),
-            )
-            if retry:
-                attempt_id += 1
-            else:
-                trial_id += 1
-                attempt_id = 1
-        self._next_trial_id = trial_id

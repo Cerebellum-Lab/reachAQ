@@ -123,6 +123,8 @@ class TrackingWindow:
     missing_frame_ids: Tuple[int, ...]
     duplicate_frame_ids: Tuple[int, ...]
     monotonic: bool
+    requested_start_frame_id: Optional[int] = None
+    requested_end_frame_id: Optional[int] = None
 
     @property
     def coverage(self) -> float:
@@ -175,7 +177,14 @@ class LiveTrackingBuffer:
         with self._lock:
             return tuple(self._samples)
 
-    def window(self, start_perf: float, end_perf: float) -> TrackingWindow:
+    def window(
+        self,
+        start_perf: float,
+        end_perf: float,
+        *,
+        expected_start_frame_id: Optional[int] = None,
+        expected_end_frame_id: Optional[int] = None,
+    ) -> TrackingWindow:
         start_perf = float(start_perf)
         end_perf = float(end_perf)
         if end_perf < start_perf:
@@ -202,8 +211,27 @@ class LiveTrackingBuffer:
         monotonic = all(current > previous for previous, current in zip(unique, unique[1:]))
         missing = ()
         expected = 0
-        if unique:
-            expected_ids = set(range(min(unique), max(unique) + 1))
+        if (
+            expected_start_frame_id is None
+            and expected_end_frame_id is None
+            and unique
+        ):
+            expected_start_frame_id = min(unique)
+            expected_end_frame_id = max(unique)
+        if (
+            expected_start_frame_id is not None
+            or expected_end_frame_id is not None
+        ):
+            if expected_start_frame_id is None or expected_end_frame_id is None:
+                raise ValueError("Both expected tracking-window frame bounds are required")
+            expected_start_frame_id = int(expected_start_frame_id)
+            expected_end_frame_id = int(expected_end_frame_id)
+            if expected_end_frame_id < expected_start_frame_id:
+                raise ValueError("Expected tracking-window frame bounds are reversed")
+            expected_ids = set(range(
+                expected_start_frame_id,
+                expected_end_frame_id + 1,
+            ))
             missing = tuple(sorted(expected_ids - set(unique)))
             expected = len(expected_ids)
         return TrackingWindow(
@@ -215,4 +243,6 @@ class LiveTrackingBuffer:
             missing_frame_ids=missing,
             duplicate_frame_ids=duplicates,
             monotonic=monotonic,
+            requested_start_frame_id=expected_start_frame_id,
+            requested_end_frame_id=expected_end_frame_id,
         )

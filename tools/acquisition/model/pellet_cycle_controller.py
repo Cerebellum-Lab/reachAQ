@@ -228,6 +228,7 @@ class PelletCycleController:
         result,
         *,
         retry: bool = False,
+        apply_protocol_outcome: bool = True,
         tone_references=(),
         laser_references=(),
     ):
@@ -248,6 +249,23 @@ class PelletCycleController:
             raise KeyError(
                 f"Unknown intertrial result identity {request.attempt_label}"
             )
+        attempts = ledger.attempts
+        attempt_index = next(
+            index
+            for index, value in enumerate(attempts)
+            if value.operation_id == request.operation_id
+        )
+        result_can_control_next_trial = (
+            attempt_index == len(attempts) - 1
+            and ledger.active_attempt is None
+        )
+        if retry and not result_can_control_next_trial:
+            logger.warning(
+                "Behavioral retry for %s arrived after a subsequent pellet "
+                "attempt started; preserving identities and not scheduling a retry",
+                request.attempt_label,
+            )
+            retry = False
         window = request.window
         shift = result.recommended_shift
         finalized = ledger.finalize_pending(
@@ -279,7 +297,7 @@ class PelletCycleController:
             retry=retry,
         )
         self._session_api.trial_ended(finalized)
-        if finalized.logical_trial_complete:
+        if finalized.logical_trial_complete and apply_protocol_outcome:
             self._protocol_runner.record_trial_outcome(
                 finalized.attempt_label,
                 finalized.outcome,
@@ -290,6 +308,21 @@ class PelletCycleController:
             ledger.summary(),
         )
         return finalized
+
+    def result_can_control_next_trial(self, request) -> bool:
+        """Whether a result may still affect settings for the next SEND."""
+        ledger = self._ledger
+        if ledger is None or ledger.active_attempt is not None:
+            return False
+        attempts = ledger.attempts
+        for index, attempt in enumerate(attempts):
+            if (
+                attempt.trial_id == request.trial_id
+                and attempt.attempt_id == request.attempt_id
+                and attempt.operation_id == request.operation_id
+            ):
+                return index == len(attempts) - 1
+        return False
 
     def annotate_intertrial_capture(self, project, request):
         ledger = self._require_ledger()

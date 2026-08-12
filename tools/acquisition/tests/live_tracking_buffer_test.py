@@ -50,6 +50,25 @@ def test_window_reports_missing_and_duplicate_frame_ids():
     assert not window.complete
 
 
+def test_window_reports_missing_leading_and_trailing_requested_frames():
+    anchor = FrameTimelineAnchor(100, 10.0, 100.0)
+    buffer = LiveTrackingBuffer(capacity=10)
+    buffer.append(
+        LiveTrackingSample.from_pose_response(response(1, (102, 103)), anchor)
+    )
+
+    window = buffer.window(
+        10.0,
+        10.05,
+        expected_start_frame_id=100,
+        expected_end_frame_id=105,
+    )
+
+    assert window.expected_frames == 6
+    assert window.missing_frame_ids == (100, 101, 104, 105)
+    assert not window.complete
+
+
 def test_ring_is_bounded_and_reports_eviction():
     anchor = FrameTimelineAnchor(0, 0.0, 10.0)
     buffer = LiveTrackingBuffer(capacity=2)

@@ -105,7 +105,7 @@ def test_analysis_classifies_no_reach_without_calling_it_missing():
 
 
 def test_analysis_uses_existing_tracking_for_reach_and_consumption():
-    distances = (30, 24, 18, 12, 5, 9, 18, 25)
+    distances = (30, 24, 18, 12, 5, 9, 13, 18, 25)
     samples = [
         sample(index, distance, pellet_seen=index < 5)
         for index, distance in enumerate(distances)
@@ -115,6 +115,19 @@ def test_analysis_uses_existing_tracking_for_reach_and_consumption():
     assert result.reach_count == 1
     assert result.success_count == 1
     assert result.consumption_count == 1
+
+
+def test_single_missing_pellet_sample_does_not_count_as_consumption():
+    distances = (30, 18, 10, 5, 12, 20)
+    samples = [
+        sample(index, distance, pellet_seen=index != 3)
+        for index, distance in enumerate(distances)
+    ]
+
+    result = analyze_tracking_window(request(samples))
+
+    assert result.outcome is TrialOutcome.FAILURE
+    assert result.consumption_count == 0
 
 
 def test_failed_reach_recommendation_has_one_average_per_axis():
