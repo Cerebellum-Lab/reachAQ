@@ -128,6 +128,7 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
         synced_cam_recording: Optional[Synchronized] = None,
         synced_cam_frame_index: Optional[Synchronized] = None,
         record_start_perf: Optional[Synchronized] = None,
+        record_generation: Optional[Synchronized] = None,
         align_record_start_perf: bool = False,
         record_stop_sema: Optional[SemaphoreType] = None,
     ):
@@ -147,6 +148,7 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
         self._synced_cam_recording = synced_cam_recording
         self._synced_cam_frame_index = synced_cam_frame_index
         self._record_start_perf = record_start_perf
+        self._record_generation = record_generation
         self._align_record_start_perf = align_record_start_perf
         self._record_stop_sema = record_stop_sema
 
@@ -481,15 +483,20 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
                 synced_cam_record_enabled=self._synced_cam_recording,
                 synced_cam_frame_index=self._synced_cam_frame_index,
                 record_start_perf=self._record_start_perf,
+                record_generation=self._record_generation,
                 align_record_start_perf=self._align_record_start_perf,
                 record_stop_sema=self._record_stop_sema,
             )
 
             rotate_interval = self._record_rotate_interval if self._is_recording_enabled else -1
             image_interval = self._still_image_capture_interval if self._is_still_capture_enabled else 0
-            record_properties = VideoRecordProperties(project_info=self._project, record_mode=self.record_mode,
-                                                      video_rotate_interval=rotate_interval,
-                                                      image_interval=image_interval)
+            record_properties = VideoRecordProperties(
+                project_info=self._project,
+                record_mode=self.record_mode,
+                video_rotate_interval=rotate_interval,
+                image_interval=image_interval,
+                record_generation=self._record_generation,
+            )
             # Leave the watchdog counter unset (nan) until the capture child writes its first
             # real timestamp; the monitor ignores nan. Seeding a live perf_counter here makes the
             # counter age in real time while the child is still spawning, which on slow spawn-based

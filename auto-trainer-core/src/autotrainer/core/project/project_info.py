@@ -121,6 +121,7 @@ class _ProjectInfo:
     start_record_timestamp: float = math.nan  # regular unix timestamp, in seconds
     first_pellet_delivery_offset: float = math.nan
     first_pellet_presentation_offset: float = math.nan
+    session_generation: int = 0
 
 
 @dataclass
@@ -141,6 +142,7 @@ class ProjectInfo(_ProjectInfo):
         start_record_timestamp: float = _ProjectInfo.start_record_timestamp,
         first_pellet_delivery_offset: float = _ProjectInfo.first_pellet_delivery_offset,
         first_pellet_presentation_offset: float = _ProjectInfo.first_pellet_presentation_offset,
+        session_generation: int = _ProjectInfo.session_generation,
         #
         mp_manager: Optional[multiprocessing.managers.BaseManager]=None,
     ):
@@ -179,6 +181,7 @@ class ProjectInfo(_ProjectInfo):
         self.start_record_timestamp = start_record_timestamp
         self.first_pellet_delivery_offset = first_pellet_delivery_offset
         self.first_pellet_presentation_offset = first_pellet_presentation_offset
+        self.session_generation = int(session_generation)
 
     @property
     def short_id(self) -> str:

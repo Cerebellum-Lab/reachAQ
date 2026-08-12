@@ -8,6 +8,7 @@ from datetime import datetime
 from enum import IntEnum
 from multiprocessing import synchronize
 from multiprocessing.synchronize import Semaphore as SemaphoreType
+from multiprocessing.sharedctypes import Synchronized
 from pathlib import Path
 from queue import Queue, Empty
 from threading import Thread
@@ -54,6 +55,9 @@ class VideoRecordProperties:
     image_interval: float = 0
     """Interval in seconds to capture images.  Values <= 0 disable image capture."""
 
+    record_generation: Optional[Synchronized[int]] = None
+    """Shared application session generation for stale-callback rejection."""
+
     queue_batch_size = 60
     """Number of frames to batch for passing between capture and record queues."""
 
@@ -88,6 +92,8 @@ class VideoRecord(Thread):
         self._cam_idx = cam_idx
         self._project_info = properties.project_info
         self._prepared_project: Optional[ProjectInfo] = None
+        self._record_generation = properties.record_generation
+        self._prepared_generation = 0
         self._name = properties.name
         self._width = properties.frame_size[0]
         self._height = properties.frame_size[1]
@@ -188,6 +194,7 @@ class VideoRecord(Thread):
                         msg_queue.put((
                             SystemStatusMessageKind.CAMERA_RECORDING_CLOSED_FINISHED, (
                                 self._cam_idx, closed_frames_written, self._prepared_project,
+                                self._prepared_generation,
                         )))
                     tot_written = 0
                     continue
@@ -268,6 +275,11 @@ class VideoRecord(Thread):
             return
         self._interval_reference = project.get_interval(self._interval_mode, when=now)
         project = project.to_local_value()  # ensure it doesn't change for below
+        self._prepared_generation = (
+            0
+            if self._record_generation is None
+            else int(self._record_generation.value)
+        )
         self._prepare_video_writer(project)
         self._prepare_image_capture(project)
         self._prepared_project = project

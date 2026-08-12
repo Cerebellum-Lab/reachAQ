@@ -132,6 +132,9 @@ class CaptureAttrs:
     record_start_perf: Optional[Synchronized[float]] = None
     """Canonical primary-camera recording start on the perf-counter clock."""
 
+    record_generation: Optional[Synchronized[int]] = None
+    """Application session generation copied into recording lifecycle messages."""
+
     align_record_start_perf: bool = False
     """Delay this unsynchronized camera until its first frame at/after record_start_perf."""
 
@@ -389,6 +392,7 @@ class VideoCapture(Process):
         attrs = self._attrs
         is_primary = attrs.is_primary
         record_start_perf = attrs.record_start_perf
+        record_generation = attrs.record_generation
         align_record_start_perf = attrs.align_record_start_perf
         frame_period = 1 / camera.fps
         prim_cam_record_enabled = attrs.synced_cam_record_enabled
@@ -546,7 +550,8 @@ class VideoCapture(Process):
             if msg_q is not None:
                 msg_q.put((SystemStatusMessageKind.CAMERA_STATUS_CHANGE,
                            (self._camera_idx, CaptureProcessStatus.RUNNING,
-                            final_frame_perf, final_frame_id)))
+                            final_frame_perf, final_frame_id,
+                            active_record_generation)))
 
         logger.notice("starting capture loop ..")
         self._set_status(CaptureProcessStatus.RUNNING)
@@ -557,6 +562,7 @@ class VideoCapture(Process):
         frame_perf_c = math.nan
         frame_time = time.time()
         save_err = None
+        active_record_generation = 0
 
         while True:
 
@@ -777,12 +783,18 @@ class VideoCapture(Process):
 
                         #
                         self._set_status(CaptureProcessStatus.RECORDING)
+                        active_record_generation = (
+                            0
+                            if record_generation is None
+                            else int(record_generation.value)
+                        )
                         #
                         if msg_q is not None:
                             msg_q.put((SystemStatusMessageKind.CAMERA_STATUS_CHANGE,
                                        (self._camera_idx, CaptureProcessStatus.RECORDING,
                                         first_frame_p_now, first_frame_when,
-                                        first_frame_time, first_frame_id)))
+                                        first_frame_time, first_frame_id,
+                                        active_record_generation)))
 
                 elif not is_record_active and record_start_stop_frame_idx is not None:
                     secondary_acquire()

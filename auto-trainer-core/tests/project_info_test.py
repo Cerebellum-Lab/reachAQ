@@ -59,10 +59,16 @@ def test_explicit_session(root):
 
 
 def test_camera_names_round_trip_to_local_value(root):
-    info = ProjectInfo(root=root, camera_names=("left", "right", "camera3"))
+    info = ProjectInfo(
+        root=root,
+        camera_names=("left", "right", "camera3"),
+        session_generation=7,
+    )
 
     assert info.camera_names == ("left", "right", "camera3")
-    assert info.to_local_value().camera_names == info.camera_names
+    local = info.to_local_value()
+    assert local.camera_names == info.camera_names
+    assert local.session_generation == 7
 
 
 def test_without_session_and_when_are_shared(root):
