@@ -55,3 +55,68 @@ def test_owns_boundary_stream_completeness_and_abort_reset():
     assert controller.data_complete is True
     assert controller.data_errors == ()
     assert controller.analysis_finished is True
+
+
+def test_generation_rejects_stale_transitions_and_boundaries():
+    controller = RecordingSessionController()
+    first = controller.begin_record("session001", {})
+    assert first is not None
+    _, first_token = first
+    assert controller.transition(
+        SessionRecordingStatus.ABORTING,
+        expected=(SessionRecordingStatus.ARMING,),
+        token=first_token,
+    ) is SessionRecordingStatus.ARMING
+    assert controller.transition(
+        SessionRecordingStatus.READY,
+        expected=(SessionRecordingStatus.ABORTING,),
+        token=first_token,
+    ) is SessionRecordingStatus.ABORTING
+
+    second = controller.begin_record("session001", {})
+    assert second is not None
+    _, second_token = second
+    assert second_token.generation == first_token.generation + 1
+    assert not controller.is_current(first_token)
+    assert controller.transition(
+        SessionRecordingStatus.RECORDING,
+        expected=(SessionRecordingStatus.ARMING,),
+        token=first_token,
+    ) is None
+    assert not controller.set_boundary(
+        SessionBoundary(
+            session_id="session001",
+            primary_camera="left",
+            primary_frame_id=1,
+            start_perf_time=1.0,
+            start_wall_time=2.0,
+            camera_when=3.0,
+        ),
+        first_token,
+    )
+    assert controller.status is SessionRecordingStatus.ARMING
+    assert controller.boundary is None
+
+    assert controller.set_boundary(
+        SessionBoundary(
+            session_id="session001",
+            primary_camera="left",
+            primary_frame_id=2,
+            start_perf_time=4.0,
+            start_wall_time=5.0,
+            camera_when=6.0,
+        ),
+        second_token,
+    )
+    assert controller.boundary.primary_frame_id == 2
+
+
+def test_begin_record_is_atomic_and_refuses_second_reservation():
+    controller = RecordingSessionController()
+    first = controller.begin_record("session001", {"camera.left": {}})
+    second = controller.begin_record("session002", {"camera.left": {}})
+
+    assert first is not None
+    assert second is None
+    assert controller.status is SessionRecordingStatus.ARMING
+    assert controller.session_id == "session001"

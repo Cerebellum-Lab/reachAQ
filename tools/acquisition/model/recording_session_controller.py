@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
 from tools.acquisition.model.app_model_status import SessionRecordingStatus
 from tools.acquisition.model.session_boundary import SessionBoundary
+
+
+@dataclass(frozen=True)
+class SessionGeneration:
+    generation: int
+    session_id: str
 
 
 @dataclass
@@ -29,13 +36,95 @@ class RecordingSessionController:
     data_complete: bool = True
     data_errors: Tuple[str, ...] = ()
     enabled_sources: Tuple[dict, ...] = ()
+    _generation: int = field(default=0, init=False, repr=False)
+    _session_id: Optional[str] = field(default=None, init=False, repr=False)
+    _lock: threading.RLock = field(
+        default_factory=threading.RLock,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
-    def transition(self, status: SessionRecordingStatus) -> SessionRecordingStatus:
-        previous = self.status
-        self.status = SessionRecordingStatus(status)
-        return previous
+    @property
+    def generation(self) -> int:
+        with self._lock:
+            return self._generation
+
+    @property
+    def session_id(self) -> Optional[str]:
+        with self._lock:
+            return self._session_id
+
+    def token(self) -> Optional[SessionGeneration]:
+        with self._lock:
+            if self._session_id is None:
+                return None
+            return SessionGeneration(self._generation, self._session_id)
+
+    def is_current(
+        self,
+        token: Optional[SessionGeneration],
+        *,
+        statuses: Optional[Tuple[SessionRecordingStatus, ...]] = None,
+    ) -> bool:
+        if token is None:
+            return False
+        with self._lock:
+            current = (
+                token.generation == self._generation
+                and token.session_id == self._session_id
+            )
+            return current and (statuses is None or self.status in statuses)
+
+    def begin_record(
+        self,
+        session_id: str,
+        hardware_status: dict,
+        *,
+        animal_snapshot: Optional[dict] = None,
+    ) -> Optional[Tuple[SessionRecordingStatus, SessionGeneration]]:
+        with self._lock:
+            if self.status is not SessionRecordingStatus.READY:
+                return None
+            self._generation += 1
+            self._session_id = str(session_id)
+            self._prepare_record_unlocked(
+                hardware_status,
+                animal_snapshot=animal_snapshot,
+            )
+            previous = self.status
+            self.status = SessionRecordingStatus.ARMING
+            return previous, SessionGeneration(self._generation, self._session_id)
+
+    def transition(
+        self,
+        status: SessionRecordingStatus,
+        *,
+        expected: Optional[Tuple[SessionRecordingStatus, ...]] = None,
+        token: Optional[SessionGeneration] = None,
+    ) -> Optional[SessionRecordingStatus]:
+        with self._lock:
+            if token is not None and not self.is_current(token):
+                return None
+            if expected is not None and self.status not in expected:
+                return None
+            previous = self.status
+            self.status = SessionRecordingStatus(status)
+            return previous
 
     def prepare_record(
+        self,
+        hardware_status: dict,
+        *,
+        animal_snapshot: Optional[dict] = None,
+    ) -> None:
+        with self._lock:
+            self._prepare_record_unlocked(
+                hardware_status,
+                animal_snapshot=animal_snapshot,
+            )
+
+    def _prepare_record_unlocked(
         self,
         hardware_status: dict,
         *,
@@ -53,21 +142,54 @@ class RecordingSessionController:
         self.enabled_sources = ()
 
     def set_stream_result(self, result: dict) -> None:
-        self.data_complete = bool(result.get("sessionComplete", True))
-        self.data_errors = tuple(result.get("incompleteReasons", ()))
-        self.enabled_sources = tuple(result.get("enabledSources", ()))
+        with self._lock:
+            self.data_complete = bool(result.get("sessionComplete", True))
+            self.data_errors = tuple(result.get("incompleteReasons", ()))
+            self.enabled_sources = tuple(result.get("enabledSources", ()))
 
     def add_data_error(self, error: str) -> None:
-        self.data_complete = False
-        self.data_errors = (*self.data_errors, str(error))
+        with self._lock:
+            self.data_complete = False
+            self.data_errors = (*self.data_errors, str(error))
+
+    def set_boundary(
+        self,
+        boundary: SessionBoundary,
+        token: SessionGeneration,
+    ) -> bool:
+        with self._lock:
+            if not self.is_current(token) or boundary.session_id != token.session_id:
+                return False
+            self.boundary = boundary
+            return True
+
+    def set_pending_end(
+        self,
+        end_perf: float,
+        token: SessionGeneration,
+    ) -> bool:
+        with self._lock:
+            if not self.is_current(token):
+                return False
+            self.pending_end_perf = float(end_perf)
+            return True
+
+    def take_pending_end(self, token: SessionGeneration) -> Optional[float]:
+        with self._lock:
+            if not self.is_current(token):
+                return None
+            value = self.pending_end_perf
+            self.pending_end_perf = None
+            return value
 
     def reset_after_abort(self) -> None:
-        self.pending_end_perf = None
-        self.boundary = None
-        self.data_complete = True
-        self.data_errors = ()
-        self.enabled_sources = ()
-        self.analysis_finished = True
-        self.analysis_started_perf = None
-        self.analysis_duration_seconds = None
-        self.animal_snapshot = None
+        with self._lock:
+            self.pending_end_perf = None
+            self.boundary = None
+            self.data_complete = True
+            self.data_errors = ()
+            self.enabled_sources = ()
+            self.analysis_finished = True
+            self.analysis_started_perf = None
+            self.analysis_duration_seconds = None
+            self.animal_snapshot = None
