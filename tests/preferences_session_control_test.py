@@ -55,5 +55,20 @@ def test_counted_trial_outcomes_are_operator_configurable(qapp):
     checkboxes["Incomplete trial"].setChecked(True)
     assert "incomplete" in config.counted_trial_outcomes
 
+    missing_controls = [
+        checkbox
+        for checkbox in group.findChildren(QCheckBox)
+        if checkbox.text() == "Pellet missing"
+    ]
+    no_reach_controls = [
+        checkbox
+        for checkbox in group.findChildren(QCheckBox)
+        if checkbox.text() == "No reach"
+    ]
+    assert len(missing_controls) == 2
+    assert all(checkbox.isEnabled() for checkbox in missing_controls)
+    assert len(no_reach_controls) == 2
+    assert sum(checkbox.isEnabled() for checkbox in no_reach_controls) == 1
+
     group.close()
     harness.close()

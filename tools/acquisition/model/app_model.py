@@ -184,6 +184,7 @@ from tools.acquisition.model.intertrial_analysis import (
     IntertrialAnalysisCoordinator,
     IntertrialAnalysisRequest,
     IntertrialAnalysisResult,
+    PelletPresence,
     analyze_tracking_window,
     classify_pellet_state,
 )
@@ -3623,7 +3624,11 @@ class AppModel(ObservableObject):
         control = self._behavior.algorithm.active_config.session_control
         control.intertrial_analysis_enabled = bool(enabled)
         if not enabled:
-            control.behavioral_retry_outcomes = ()
+            control.behavioral_retry_outcomes = tuple(
+                outcome
+                for outcome in control.behavioral_retry_outcomes
+                if outcome == TrialOutcome.PELLET_MISSING.value
+            )
         self._notify_trial_protocol_state()
         return True
 
@@ -6694,7 +6699,10 @@ class AppModel(ObservableObject):
             request,
             result,
         )
-        if result.error and config.behavioral_retry_outcomes:
+        if result.error and (
+            set(config.behavioral_retry_outcomes)
+            - {TrialOutcome.PELLET_MISSING.value}
+        ):
             self._hold_intertrial_resolution(
                 request,
                 "Trial analysis failed while a behavioral retry rule requires "
@@ -7375,6 +7383,47 @@ class AppModel(ObservableObject):
                 request,
             )
 
+        if (
+            request is not None
+            and evidence.presence is PelletPresence.MISSING
+        ):
+            tone_references, laser_references = (
+                self._session_data_recorder.trial_stream_references(
+                    tracking_window.start_perf,
+                    tracking_window.end_perf,
+                )
+            )
+            retry = (
+                TrialOutcome.PELLET_MISSING.value
+                in config.behavioral_retry_outcomes
+            )
+            finalized = self._pellet_cycles.finalize_intertrial_unavailable(
+                self._project_info,
+                closed,
+                perf_time=perf_c,
+                wall_time=closed.capture_end_wall_time or time.time(),
+                reason="live tracking confirmed pellet absence",
+                pellet_presence=evidence.presence.value,
+                pellet_misplacement=evidence.misplacement.value,
+                window=tracking_window,
+                outcome=TrialOutcome.PELLET_MISSING,
+                retry=retry,
+                tone_references=tone_references,
+                laser_references=laser_references,
+            )
+            self._pellet_cycles.sync_behavior_counts(self._behavior.algorithm)
+            self._behavior.algorithm.pellet_send_block_reason = ""
+            self._notify_trial_protocol_state()
+            self._evaluate_automatic_stop_policy(
+                protocol_complete=self._protocol_runner.protocol_complete,
+            )
+            logger.info(
+                "pellet trial %s finalized synchronously as missing; retry=%s",
+                finalized.attempt_label,
+                retry,
+            )
+            return
+
         if unavailable_reason:
             tone_references, laser_references = (
                 ((), ())
@@ -7422,7 +7471,10 @@ class AppModel(ObservableObject):
         must_wait = (
             config.intertrial_progression_mode
             == AnalysisProgressionMode.WAIT.value
-            or bool(config.behavioral_retry_outcomes)
+            or bool(
+                set(config.behavioral_retry_outcomes)
+                - {TrialOutcome.PELLET_MISSING.value}
+            )
         )
         if must_wait:
             estimate = self._intertrial_analysis.timing_estimate(

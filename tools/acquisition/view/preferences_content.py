@@ -759,7 +759,7 @@ class PreferencesContent(QWidget):
                 if candidate.value in selected
             )
 
-        retry_checkboxes = []
+        analysis_retry_checkboxes = []
         for outcome, display_name in (
             (TrialOutcome.NO_REACH, "No reach"),
             (TrialOutcome.FAILURE, "Failed reach"),
@@ -770,16 +770,17 @@ class PreferencesContent(QWidget):
             checkbox.toggled.connect(
                 lambda checked, item=outcome: set_retry_outcome(item, checked)
             )
-            intertrial_analysis.toggled.connect(checkbox.setEnabled)
-            checkbox.setEnabled(intertrial_analysis.isChecked())
-            retry_checkboxes.append(checkbox)
+            if outcome is not TrialOutcome.PELLET_MISSING:
+                intertrial_analysis.toggled.connect(checkbox.setEnabled)
+                checkbox.setEnabled(intertrial_analysis.isChecked())
+                analysis_retry_checkboxes.append(checkbox)
             retry_outcomes_layout.addWidget(checkbox)
         retry_outcomes_layout.addStretch(1)
         form.addRow("Retry after outcome:", retry_outcomes)
 
         def analysis_enabled_changed(enabled: bool) -> None:
             if not enabled:
-                for checkbox in retry_checkboxes:
+                for checkbox in analysis_retry_checkboxes:
                     checkbox.setChecked(False)
 
         intertrial_analysis.toggled.connect(analysis_enabled_changed)

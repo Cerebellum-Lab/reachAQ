@@ -39,7 +39,10 @@ from tools.acquisition.model.intertrial_analysis import (
     PelletStateEvidence,
     ReachTrajectory,
 )
-from tools.acquisition.model.live_tracking_buffer import TrackingWindow
+from tools.acquisition.model.live_tracking_buffer import (
+    LiveTrackingSample,
+    TrackingWindow,
+)
 from tools.acquisition.model.session_stop_policy import (
     SessionStopConfiguration,
     SessionStopDecision,
@@ -681,6 +684,77 @@ def test_live_analysis_reserves_configured_behavioral_retry(app_model):
     retry = ledger.begin_send(102.0, 1002.0, operation_id="send-2")
     assert ledger.attempts[0].logical_trial_complete is False
     assert retry.attempt_label == "1.2"
+
+
+def test_missing_pellet_retry_finishes_synchronously_without_analysis(app_model):
+    project = app_model.project
+    ledger = PelletTrialLedger(project.short_id)
+    ledger.begin_send(5.0, 105.0, operation_id="send-1")
+    ledger.acknowledge_presentation(5.1, 105.1)
+    app_model._trial_ledger = ledger
+    control = app_model.behavior.algorithm.active_config.session_control
+    control.intertrial_analysis_enabled = False
+    control.behavioral_retry_outcomes = (TrialOutcome.PELLET_MISSING.value,)
+    _, token = app_model._recording_session.begin_record(project.short_id, {})
+    app_model._recording_session.transition(
+        SessionRecordingStatus.RECORDING,
+        expected=(SessionRecordingStatus.ARMING,),
+        token=token,
+    )
+    samples = tuple(
+        LiveTrackingSample(
+            sequence=index,
+            primary_frame_ids=(index,),
+            primary_frame_perf_times=(5.2 + index * 0.01,),
+            source_start_perf=5.2 + index * 0.01,
+            source_end_perf=5.2 + index * 0.01,
+            processing_perf=5.3 + index * 0.01,
+            pellet_seen=False,
+            locations_3d=(),
+            offsets_3d=(),
+        )
+        for index in range(5)
+    )
+    tracking_window = TrackingWindow(
+        5.2,
+        6.0,
+        samples,
+        5,
+        5,
+        (),
+        (),
+        True,
+    )
+    app_model._trial_window_start = ("send-1", 5.2)
+
+    with mock.patch.object(
+        app_model._live_tracking,
+        "window",
+        return_value=tracking_window,
+    ), mock.patch.object(
+        app_model._session_data_recorder,
+        "persist_trial_tracking",
+    ), mock.patch.object(
+        app_model._session_data_recorder,
+        "trial_stream_references",
+        return_value=((), ()),
+    ), mock.patch.object(
+        app_model._session_data_recorder,
+        "persist_trial_ledger",
+    ), mock.patch.object(
+        app_model._intertrial_analysis,
+        "submit",
+    ) as submit:
+        app_model._complete_pellet_trial_window(
+            6.0,
+            close_reason="pellet cycle completed",
+        )
+
+    attempt = ledger.attempts[0]
+    assert attempt.outcome is TrialOutcome.PELLET_MISSING
+    assert attempt.logical_trial_complete is False
+    assert ledger.begin_send(6.1, 106.1).attempt_label == "1.2"
+    submit.assert_not_called()
 
 
 def test_failed_retry_dependent_analysis_requires_explicit_resolution(app_model):

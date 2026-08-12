@@ -177,9 +177,13 @@ class SessionControlConfiguration:
                 "Unknown behavioral retry outcome(s): "
                 + ", ".join(unknown_retry_outcomes)
             )
-        if self.behavioral_retry_outcomes and not self.intertrial_analysis_enabled:
+        analysis_retry_outcomes = set(self.behavioral_retry_outcomes) - {
+            "pellet_missing"
+        }
+        if analysis_retry_outcomes and not self.intertrial_analysis_enabled:
             raise ValueError(
-                "Behavioral retry outcomes require intertrial analysis"
+                "Analysis-derived behavioral retry outcomes require intertrial "
+                "analysis"
             )
         if (
             self.trial_count_basis == "scored"

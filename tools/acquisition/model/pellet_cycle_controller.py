@@ -324,6 +324,7 @@ class PelletCycleController:
         pellet_misplacement: str = "unknown",
         window=None,
         outcome: TrialOutcome = TrialOutcome.INCOMPLETE,
+        retry: bool = False,
         tone_references=(),
         laser_references=(),
     ):
@@ -352,6 +353,7 @@ class PelletCycleController:
             ),
             tone_references=tuple(tone_references),
             laser_references=tuple(laser_references),
+            retry=retry,
         )
         self._session_api.trial_ended(finalized)
         if finalized.logical_trial_complete:

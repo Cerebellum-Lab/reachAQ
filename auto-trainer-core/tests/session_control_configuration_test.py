@@ -56,6 +56,14 @@ def test_session_duration_is_capped_at_two_hours():
         SessionControlConfiguration(duration_limit_seconds=7200.1)
 
 
+def test_missing_pellet_retry_does_not_require_intertrial_analysis():
+    configuration = SessionControlConfiguration(
+        behavioral_retry_outcomes=("pellet_missing",),
+    )
+    assert configuration.intertrial_analysis_enabled is False
+    assert configuration.behavioral_retry_outcomes == ("pellet_missing",)
+
+
 @pytest.mark.parametrize(
     "kwargs, message",
     (
