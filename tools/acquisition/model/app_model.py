@@ -2187,16 +2187,29 @@ class AppModel(ObservableObject):
                 for source in camera_sources
                 if source.name or source.url
             )
-            camera_info = f"✓ {len(camera_sources)} camera source(s)"
+            physical_camera_count = sum(
+                source.url.startswith("spinnaker://")
+                for source in camera_sources
+            )
+            camera_info = (
+                f"✓ {len(camera_sources)} selectable source(s) · "
+                f"{physical_camera_count} Spinnaker camera(s)"
+            )
             if source_names:
                 camera_info += "\n" + "\n".join(f"→ {name}" for name in source_names)
             if missing_enabled_cameras:
                 missing_text = ", ".join(missing_enabled_cameras)
                 warnings_list.append(f"configured camera(s) not currently discovered: {missing_text}")
                 camera_info += f"\n! missing: {missing_text}"
+            elif physical_camera_count == 0:
+                camera_info += "\n! zero Spinnaker cameras found"
             scan_results["cameras"] = HardwareScanEntry(
                 camera_info,
-                "warning" if missing_enabled_cameras or not camera_sources else "ok",
+                (
+                    "warning"
+                    if missing_enabled_cameras or physical_camera_count == 0
+                    else "ok"
+                ),
             )
         except Exception as exc:
             logger.exception("Hardware refresh camera scan failed")

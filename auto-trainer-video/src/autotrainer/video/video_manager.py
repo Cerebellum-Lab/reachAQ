@@ -43,10 +43,7 @@ class VideoManager:
 
     @classmethod
     def list_spin_cameras(cls) -> List[str]:
-        try:
-            spincam_cls = _get_spincam_cls()
-        except Exception:
-            return []
+        spincam_cls = _get_spincam_cls()
         return spincam_cls.list()
 
     @classmethod

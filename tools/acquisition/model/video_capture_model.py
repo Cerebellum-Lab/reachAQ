@@ -27,13 +27,22 @@ from autotrainer.core.project import ProjectInfo, ProjectDependentProtocol
 from autotrainer.video import VideoCapture, VideoRecordProperties, VideoRecordMode, VideoManager, \
     VideoReader, CaptureCommandKind, CaptureCameraAttrs, CaptureInferenceAttrs, CaptureAttrs
 from autotrainer.core.capture import CaptureProcessStatus
+from autotrainer.video.camera_discovery import (
+    DEFAULT_CAMERA_DISCOVERY_TIMEOUT_SECONDS,
+    CameraDiscoveryError,
+    discover_spin_cameras,
+)
 
 from tools.acquisition.model.user_preferences import UserPreferences
 
 logger = get_verbose_logger(__name__)
 
 
-def create_camera_list(*, include_hardware: bool = False):
+def create_camera_list(
+    *,
+    include_hardware: bool = False,
+    discovery_timeout_seconds: float = DEFAULT_CAMERA_DISCOVERY_TIMEOUT_SECONDS,
+):
     cameras = list()
 
     cameras.append(CaptureCameraAttrs(name="Random Image", url="random://0?width=300&height=200"))
@@ -53,15 +62,31 @@ def create_camera_list(*, include_hardware: bool = False):
         started = time.perf_counter()
         log_hardware_initialization(logger, "START | camera discovery | backend=spinnaker")
         try:
-            spin_serials = tuple(VideoManager.list_spin_cameras())
+            spin_serials = discover_spin_cameras(
+                timeout_seconds=discovery_timeout_seconds
+            )
         except Exception as exc:
+            stage = getattr(exc, "stage", "unknown")
+            exception_type = getattr(
+                exc,
+                "exception_type",
+                exc.__class__.__name__,
+            )
             log_hardware_initialization(
                 logger,
-                "FAILED | camera discovery | backend=spinnaker elapsed=%.3fs error=%s",
+                "FAILED | camera discovery | backend=spinnaker stage=%s "
+                "elapsed=%.3fs exception=%s error=%s",
+                stage,
                 time.perf_counter() - started,
+                exception_type,
                 str(exc) or exc.__class__.__name__,
                 level=logging.ERROR,
             )
+            if isinstance(exc, CameraDiscoveryError) and exc.traceback_text:
+                logger.error(
+                    "Spinnaker discovery child traceback:\n%s",
+                    exc.traceback_text,
+                )
             raise
         log_hardware_initialization(
             logger,
