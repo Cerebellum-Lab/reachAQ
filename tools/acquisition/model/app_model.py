@@ -6348,6 +6348,14 @@ class AppModel(ObservableObject):
         )
         self._pellet_cycles.sync_behavior_counts(self._behavior.algorithm)
         self._pellet_cycles.end_session()
+        pending_api_events = self._session_api.flush_pending()
+        if pending_api_events:
+            message = (
+                f"{pending_api_events} public lifecycle event(s) remain in the "
+                "bounded retry outbox"
+            )
+            logger.warning(message)
+            self._recording_session.add_data_error(message)
         self._intertrial_resolution_request = None
         self._intertrial_resolution_reason = ""
         self._intertrial_waiting_operations.clear()
@@ -6499,6 +6507,12 @@ class AppModel(ObservableObject):
                 perf_time=get_perf_now(),
                 wall_time=time.time(),
             )
+            pending_api_events = self._session_api.flush_pending()
+            if pending_api_events:
+                logger.warning(
+                    "%s aborted-session lifecycle event(s) remain queued",
+                    pending_api_events,
+                )
             self._behavior.algorithm.reset_session_counts()
             self._session_data_recorder.abort()
             self._recording_session.reset_after_abort()

@@ -2,6 +2,7 @@ from unittest import mock
 
 from autotrainer.api import ApiEventKind
 from autotrainer.behavior import PelletTrialLedger, TrialOutcome
+from autotrainer.core.event.event_manager import EventQueueFullError
 
 from tools.acquisition.model.session_api_publisher import SessionApiPublisher
 
@@ -50,3 +51,29 @@ def test_trial_event_can_open_session_if_send_wins_camera_status_race():
     kinds = [call.args[0] for call in events.post_event_content.call_args_list]
     assert kinds == [ApiEventKind.sessionStarted, ApiEventKind.trialStarted]
 
+
+def test_queue_saturation_retains_lifecycle_order_without_partial_state():
+    events = mock.Mock()
+    events.post_event_content.side_effect = [
+        EventQueueFullError("full"),
+        None,
+        None,
+    ]
+    publisher = SessionApiPublisher(events)
+    attempt = PelletTrialLedger("session003").begin_send(
+        1.0,
+        11.0,
+        operation_id="send-1",
+    )
+
+    assert publisher.session_started("session003")
+    assert publisher.pending_event_count == 1
+    assert publisher.trial_started(attempt)
+    assert publisher.pending_event_count == 0
+
+    kinds = [call.args[0] for call in events.post_event_content.call_args_list]
+    assert kinds == [
+        ApiEventKind.sessionStarted,
+        ApiEventKind.sessionStarted,
+        ApiEventKind.trialStarted,
+    ]

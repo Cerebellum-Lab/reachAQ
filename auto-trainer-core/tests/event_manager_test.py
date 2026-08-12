@@ -125,7 +125,7 @@ def test_bounded_queue_reports_explicit_saturation():
             manager.post_event(_event(3))
 
         diagnostics = manager.diagnostics
-        assert diagnostics["pending"] == 1
+        assert diagnostics["pending"] == 2
         assert diagnostics["failed"] == 1
         assert diagnostics["oldestAgeSeconds"] >= 0
     finally:
@@ -150,6 +150,8 @@ def test_shutdown_is_bounded_when_plugin_is_unresponsive():
 
     assert elapsed < 0.25
     assert report["workerStopped"] is False
+    assert report["pending"] >= 1
     plugin.release.set()
     manager._write_thread.join(1)
     assert not manager._write_thread.is_alive()
+    manager.close()

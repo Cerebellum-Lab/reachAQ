@@ -98,6 +98,7 @@ class EventManager:
         self._producer_wait_seconds = max(0.001, float(producer_wait_seconds))
         self._shutdown_timeout_seconds = max(0.1, float(shutdown_timeout_seconds))
         self._enqueue_times = collections.deque()
+        self._active_event_enqueued_perf: Optional[float] = None
         self._accepted_count = 0
         self._delivered_count = 0
         self._failed_count = 0
@@ -189,15 +190,18 @@ class EventManager:
     def diagnostics(self) -> dict:
         with self._lock:
             now = time.perf_counter()
+            pending_times = tuple(self._enqueue_times)
+            if self._active_event_enqueued_perf is not None:
+                pending_times = (*pending_times, self._active_event_enqueued_perf)
             return {
                 "capacity": (
                     0 if self._write_queue is None else self._write_queue.maxsize
                 ),
-                "pending": len(self._enqueue_times),
+                "pending": len(pending_times),
                 "oldestAgeSeconds": (
                     0.0
-                    if not self._enqueue_times
-                    else max(0.0, now - min(self._enqueue_times))
+                    if not pending_times
+                    else max(0.0, now - min(pending_times))
                 ),
                 "accepted": self._accepted_count,
                 "delivered": self._delivered_count,
@@ -256,16 +260,17 @@ class EventManager:
                 except Empty:
                     break
         with self._lock:
-            self._write_queue = None
+            if worker_stopped:
+                self._write_queue = None
             report = {
                 "delivered": self._delivered_count,
-                "pending": len(self._enqueue_times),
+                "pending": self.diagnostics["pending"],
                 "failed": self._failed_count,
                 "workerStopped": worker_stopped,
             }
             self._last_shutdown_report = report
         logger.info("Event manager shutdown report: %s", report)
-        if cls_inst is self:
+        if cls_inst is self and worker_stopped:
             self._remove_cls_instance()
         return report
 
@@ -382,6 +387,9 @@ class EventManager:
                             self._enqueue_times.remove(queued.enqueued_perf_time)
                         except ValueError:
                             pass
+                        self._active_event_enqueued_perf = (
+                            queued.enqueued_perf_time
+                        )
                 else:
                     info = queued
             except Empty:
@@ -390,6 +398,8 @@ class EventManager:
 
             if not isinstance(info, EventInfo):
                 logger.warning("unexpected event info: type=%s value=%s", type(info), info)
+                with self._lock:
+                    self._active_event_enqueued_perf = None
                 continue
 
             try:
@@ -402,6 +412,8 @@ class EventManager:
                 if is_same:
                     repeat_event_count += 1
                     last_event_info = info
+                    with self._lock:
+                        self._active_event_enqueued_perf = None
                     continue
             try:
                 if last_event_info is not None and repeat_event_count > 0:
@@ -415,6 +427,9 @@ class EventManager:
                 if not process_event_error_reported:
                     logger.exception("process queue info (%s) failed: %s", info, err)
                     process_event_error_reported = True
+            finally:
+                with self._lock:
+                    self._active_event_enqueued_perf = None
         # end while True
 
         if last_event_info is not None and repeat_event_count > 0:
