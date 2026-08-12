@@ -40,10 +40,17 @@ class _Model:
             ),
             "active_trial_id": 2,
             "completed_trial_ids": (1,),
+            "analysis": {},
         }
 
     def update_trial_protocol_row(self, trial_id, field, value):
         self.updated.append((trial_id, field, value))
+        return True
+
+    def retry_pending_intertrial_analysis(self):
+        return True
+
+    def continue_without_pending_intertrial_result(self):
         return True
 
 
@@ -62,4 +69,25 @@ def test_only_future_protocol_rows_are_editable():
     assert future.flags() & Qt.ItemFlag.ItemIsEditable
     assert content._table.item(1, 8).text() == "Active"
     assert content._table.item(0, 8).text() == "Completed"
+    assert not content._retry_analysis.isVisible()
+    content.close()
+
+
+def test_analysis_resolution_actions_are_shown_only_when_needed():
+    app = QApplication.instance() or QApplication([])
+    model = _Model()
+    model.trial_protocol_state["analysis"] = {
+        "enabled": True,
+        "pending_attempts": 1,
+        "estimate": "estimating",
+        "resolution_required": True,
+        "resolution_reason": "analysis worker failed",
+    }
+    content = ProtocolContent(model)
+    content.show()
+    app.processEvents()
+
+    assert content._retry_analysis.isVisible()
+    assert content._continue_without_analysis.isVisible()
+    assert "analysis worker failed" in content._analysis_status.text()
     content.close()

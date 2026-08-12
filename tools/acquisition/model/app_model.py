@@ -467,6 +467,8 @@ class AppModel(ObservableObject):
         self._storage_preflight = None
         self._internal_error_diagnostic = None
         self._session_invariant_unknown = False
+        self._intertrial_resolution_request = None
+        self._intertrial_resolution_reason = ""
         self._closing_event = threading.Event()
         self._reload_plans_needed = False
         self._coordinates = CoordinateModel()
@@ -1421,6 +1423,8 @@ class AppModel(ObservableObject):
         self._intertrial_analysis.cancel_session()
         self._live_tracking.clear()
         self._trial_window_start = None
+        self._intertrial_resolution_request = None
+        self._intertrial_resolution_reason = ""
         self._behavior.algorithm.pellet_send_block_reason = ""
         self._session_data_recorder.abort()
         self._cancel_automatic_stop_timers()
@@ -3595,6 +3599,8 @@ class AppModel(ObservableObject):
                     else ledger.summary().get("pending_analysis_attempts", 0)
                 ),
                 "send_block_reason": self._behavior.algorithm.pellet_send_block_reason,
+                "resolution_required": self._intertrial_resolution_request is not None,
+                "resolution_reason": self._intertrial_resolution_reason,
                 "seconds_per_tracking_second": estimate.mean_realtime_factor,
                 "estimate": estimate.display_text,
             },
@@ -3615,6 +3621,96 @@ class AppModel(ObservableObject):
             control.behavioral_retry_outcomes = ()
         self._notify_trial_protocol_state()
         return True
+
+    def retry_pending_intertrial_analysis(self) -> bool:
+        request = self._intertrial_resolution_request
+        if (
+            request is None
+            or self._recording_session.status is not SessionRecordingStatus.RECORDING
+        ):
+            return False
+        token = self._recording_session.token()
+        if (
+            token is None
+            or request.generation != token.generation
+            or request.session_id != token.session_id
+            or not self._intertrial_analysis.submit(request)
+        ):
+            return False
+        self._intertrial_resolution_request = None
+        self._intertrial_resolution_reason = ""
+        estimate = self._intertrial_analysis.timing_estimate(
+            request.window.end_perf - request.window.start_perf
+        )
+        self._behavior.algorithm.pellet_send_block_reason = (
+            "waiting for retried pellet trial analysis; " + estimate.display_text
+        )
+        self._notify_trial_protocol_state()
+        return True
+
+    def continue_without_pending_intertrial_result(self) -> bool:
+        request = self._intertrial_resolution_request
+        if (
+            request is None
+            or self._recording_session.status is not SessionRecordingStatus.RECORDING
+        ):
+            return False
+        ledger = self._trial_ledger
+        attempt = next(
+            (
+                item
+                for item in (() if ledger is None else ledger.attempts)
+                if item.trial_id == request.trial_id
+                and item.attempt_id == request.attempt_id
+                and item.operation_id == request.operation_id
+            ),
+            None,
+        )
+        if attempt is None or attempt.outcome is not TrialOutcome.PENDING_ANALYSIS:
+            return False
+        tone_references, laser_references = (
+            self._session_data_recorder.trial_stream_references(
+                request.window.start_perf,
+                request.window.end_perf,
+            )
+        )
+        self._pellet_cycles.finalize_intertrial_unavailable(
+            self._project_info,
+            attempt,
+            perf_time=request.window.end_perf,
+            wall_time=attempt.capture_end_wall_time or time.time(),
+            reason=(
+                "operator continued without an analysis result; behavioral retry "
+                "decision was skipped"
+            ),
+            pellet_presence=request.pellet_state.presence.value,
+            pellet_misplacement=request.pellet_state.misplacement.value,
+            window=request.window,
+            tone_references=tone_references,
+            laser_references=laser_references,
+        )
+        self._intertrial_resolution_request = None
+        self._intertrial_resolution_reason = ""
+        self._behavior.algorithm.pellet_send_block_reason = ""
+        self._pellet_cycles.sync_behavior_counts(self._behavior.algorithm)
+        self._notify_trial_protocol_state()
+        self._evaluate_automatic_stop_policy(
+            protocol_complete=self._protocol_runner.protocol_complete,
+        )
+        return True
+
+    def _hold_intertrial_resolution(
+        self,
+        request: IntertrialAnalysisRequest,
+        reason: str,
+    ) -> None:
+        self._intertrial_resolution_request = request
+        self._intertrial_resolution_reason = str(reason)
+        self._behavior.algorithm.pellet_send_block_reason = (
+            "pellet trial analysis needs operator action"
+        )
+        logger.error("%s", reason)
+        self._notify_trial_protocol_state()
 
     def _notify_trial_protocol_state(self) -> None:
         self.property_changed(
@@ -5847,6 +5943,8 @@ class AppModel(ObservableObject):
         self._live_tracking.clear()
         self._trial_window_start = None
         self._tone2_active = False
+        self._intertrial_resolution_request = None
+        self._intertrial_resolution_reason = ""
         self._behavior.algorithm.pellet_send_block_reason = ""
         self._intertrial_analysis.begin_session(
             analysis_generation,
@@ -6150,6 +6248,8 @@ class AppModel(ObservableObject):
         )
         self._pellet_cycles.sync_behavior_counts(self._behavior.algorithm)
         self._pellet_cycles.end_session()
+        self._intertrial_resolution_request = None
+        self._intertrial_resolution_reason = ""
         self._behavior.algorithm.pellet_send_block_reason = ""
         self._recording_session.analysis_finished = True
         self._recording_session.analysis_duration_seconds = (
@@ -6589,6 +6689,13 @@ class AppModel(ObservableObject):
             request,
             result,
         )
+        if result.error and config.behavioral_retry_outcomes:
+            self._hold_intertrial_resolution(
+                request,
+                "Trial analysis failed while a behavioral retry rule requires "
+                f"the result: {result.error}",
+            )
+            return
         tone_references, laser_references = (
             self._session_data_recorder.trial_stream_references(
                 request.window.start_perf,
@@ -6610,6 +6717,14 @@ class AppModel(ObservableObject):
                 error,
             )
             return
+
+        if (
+            self._intertrial_resolution_request is not None
+            and self._intertrial_resolution_request.operation_id
+            == request.operation_id
+        ):
+            self._intertrial_resolution_request = None
+            self._intertrial_resolution_reason = ""
 
         if result.reaches:
             response = IntersessionResponse(
@@ -7312,11 +7427,14 @@ class AppModel(ObservableObject):
                 "waiting for pellet trial analysis; " + estimate.display_text
             )
         if not self._intertrial_analysis.submit(request):
-            self._behavior.algorithm.pellet_send_block_reason = (
-                "intertrial analysis queue is full; Stop or Abort the session"
-                if must_wait
-                else ""
-            )
+            if must_wait:
+                self._hold_intertrial_resolution(
+                    request,
+                    "Intertrial analysis queue is full. Retry this analysis, "
+                    "continue without its result, Stop, or Abort.",
+                )
+                return
+            self._behavior.algorithm.pellet_send_block_reason = ""
             tone_references, laser_references = (
                 self._session_data_recorder.trial_stream_references(
                     tracking_window.start_perf,

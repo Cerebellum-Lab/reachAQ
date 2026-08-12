@@ -663,6 +663,78 @@ def test_live_analysis_reserves_configured_behavioral_retry(app_model):
     assert retry.attempt_label == "1.2"
 
 
+def test_failed_retry_dependent_analysis_requires_explicit_resolution(app_model):
+    project = app_model.project
+    ledger = PelletTrialLedger(project.short_id)
+    ledger.begin_send(100.5, 1000.5, operation_id="send-1")
+    ledger.acknowledge_presentation(100.55, 1000.55)
+    ledger.close_active_for_analysis(101.5, 1001.5)
+    app_model._trial_ledger = ledger
+    control = app_model.behavior.algorithm.active_config.session_control
+    control.intertrial_analysis_enabled = True
+    control.behavioral_retry_outcomes = (TrialOutcome.NO_REACH.value,)
+    _, token = app_model._recording_session.begin_record(project.short_id, {})
+    app_model._recording_session.transition(
+        SessionRecordingStatus.RECORDING,
+        expected=(SessionRecordingStatus.ARMING,),
+        token=token,
+    )
+    window = TrackingWindow(100.6, 101.5, (), 0, 0, (), (), True)
+    request = IntertrialAnalysisRequest(
+        token.generation,
+        token.session_id,
+        1,
+        1,
+        "send-1",
+        window,
+        PelletStateEvidence(
+            PelletPresence.PRESENT,
+            PelletMisplacement.UNKNOWN,
+            0,
+            0,
+            0,
+            None,
+        ),
+    )
+    result = IntertrialAnalysisResult(
+        request,
+        TrialOutcome.INCOMPLETE,
+        (),
+        0,
+        0,
+        0,
+        None,
+        0,
+        0,
+        0.01,
+        "analysis worker failed",
+    )
+
+    with mock.patch.object(
+        app_model._session_data_recorder,
+        "persist_trial_tracking",
+    ):
+        app_model._on_intertrial_analysis_result(result)
+
+    assert ledger.attempts[0].outcome is TrialOutcome.PENDING_ANALYSIS
+    assert app_model.trial_protocol_state["analysis"]["resolution_required"]
+    assert app_model.behavior.algorithm.pellet_send_block_reason
+
+    with mock.patch.object(
+        app_model._session_data_recorder,
+        "trial_stream_references",
+        return_value=((), ()),
+    ), mock.patch.object(
+        app_model._session_data_recorder,
+        "persist_trial_ledger",
+    ):
+        assert app_model.continue_without_pending_intertrial_result()
+
+    assert ledger.attempts[0].outcome is TrialOutcome.INCOMPLETE
+    assert not app_model.trial_protocol_state["analysis"]["resolution_required"]
+    assert app_model.behavior.algorithm.pellet_send_block_reason == ""
+
+
 def test_abort_removes_whole_session_and_resets_counts(app_model):
     project = app_model.project
     project.session = 1

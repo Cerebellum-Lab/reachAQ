@@ -4,7 +4,9 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QHBoxLayout,
     QLabel,
+    QPushButton,
     QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
@@ -54,6 +56,19 @@ class ProtocolContent(ContentWidget):
         self._analysis_status.setWordWrap(True)
         self._analysis_status.setStyleSheet("color: #5f6772;")
         content_layout.addWidget(self._analysis_status)
+        resolution_layout = QHBoxLayout()
+        self._retry_analysis = QPushButton("Retry analysis")
+        self._continue_without_analysis = QPushButton("Continue without result")
+        self._retry_analysis.clicked.connect(
+            app_model.retry_pending_intertrial_analysis
+        )
+        self._continue_without_analysis.clicked.connect(
+            app_model.continue_without_pending_intertrial_result
+        )
+        resolution_layout.addWidget(self._retry_analysis)
+        resolution_layout.addWidget(self._continue_without_analysis)
+        resolution_layout.addStretch(1)
+        content_layout.addLayout(resolution_layout)
 
         table = self._table = QTableWidget()
         table.setColumnCount(len(self.COLUMNS))
@@ -94,7 +109,15 @@ class ProtocolContent(ContentWidget):
                 )
                 if reason:
                     analysis_text += f" — {reason}"
+                resolution_reason = analysis.get("resolution_reason")
+                if resolution_reason:
+                    analysis_text += f"\n{resolution_reason}"
             self._analysis_status.setText(analysis_text)
+            resolution_required = bool(analysis.get("resolution_required"))
+            self._retry_analysis.setVisible(resolution_required)
+            self._continue_without_analysis.setVisible(resolution_required)
+            self._retry_analysis.setEnabled(resolution_required)
+            self._continue_without_analysis.setEnabled(resolution_required)
             active = state.get("active_trial_id")
             completed = set(state.get("completed_trial_ids", ()))
             self._table.setRowCount(len(rows))
