@@ -18,7 +18,7 @@ class SubsystemId(str, enum.Enum):
     NIDAQ_STREAM = "nidaq_stream"
     LASER = "laser"
     SESSION_LOGS = "session_logs"
-    OFFLINE_ANALYSIS = "offline_analysis"
+    INTERTRIAL_ANALYSIS = "intertrial_analysis"
     ANIMAL_REGISTRY = "animal_registry"
     RFID_READER = "rfid_reader"
     RUNTIME_DIAGNOSTICS = "runtime_diagnostics"

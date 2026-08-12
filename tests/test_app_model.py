@@ -17,8 +17,6 @@ from autotrainer.core import (
 from autotrainer.core.interfaces import RecordingEndingReason
 from autotrainer.core.capture import CaptureProcessStatus
 from autotrainer.core.configuration.persistence_configuration import PersistenceConfiguration
-from autotrainer.core.reach_event import ReachEvent, ReachEventMethod, ReachEventOutcome
-from autotrainer.inference.analysis import IntersessionResponse
 from autotrainer.behavior.behavior_algorithm import BehaviorAlgoStatus
 from autotrainer.behavior.pellet_trial import (
     HardwareErrorKind,
@@ -33,6 +31,15 @@ from tools.acquisition.model.app_model import (
 )
 from tools.acquisition.model.app_model_status import AppModelStatus, SessionRecordingStatus
 from tools.acquisition.model.session_boundary import SessionBoundary
+from tools.acquisition.model.intertrial_analysis import (
+    IntertrialAnalysisRequest,
+    IntertrialAnalysisResult,
+    PelletMisplacement,
+    PelletPresence,
+    PelletStateEvidence,
+    ReachTrajectory,
+)
+from tools.acquisition.model.live_tracking_buffer import TrackingWindow
 from tools.acquisition.model.session_stop_policy import (
     SessionStopConfiguration,
     SessionStopDecision,
@@ -112,15 +119,13 @@ def test_automatic_protocol_advance_updates_live_runner(app_model):
     assert app_model._protocol_runner.automatic_advance is True
 
 
-def test_scored_trial_limit_is_blocked_until_online_scoring_exists(app_model):
+def test_scored_trial_limit_is_available_with_live_intertrial_scoring(app_model):
     control = app_model.behavior.algorithm.active_config.session_control
     control.trial_limit = 5
     control.trial_count_basis = "scored"
+    control.intertrial_analysis_enabled = True
 
-    assert any(
-        "Scored trials are available after analysis" in blocker
-        for blocker in app_model.recording_blockers
-    )
+    assert not any("Scored trials" in blocker for blocker in app_model.recording_blockers)
 
 
 def test_it_drain_record_stop_sema_on_session_recording_start(app_model):
@@ -524,7 +529,7 @@ def test_pellet_cycle_completion_finishes_trial_before_automatic_stop(
     finish_trial.assert_not_called()
 
 
-def test_post_session_analysis_finalizes_attempts_persists_and_syncs_counts(
+def test_live_intertrial_result_finalizes_attempt_persists_and_syncs_counts(
     app_model,
 ):
     project = app_model.project
@@ -533,45 +538,62 @@ def test_post_session_analysis_finalizes_attempts_persists_and_syncs_counts(
     ledger.acknowledge_presentation(100.55, 1000.55)
     ledger.close_active_for_analysis(101.5, 1001.5)
     app_model._trial_ledger = ledger
-    app_model._recording_session.boundary = SessionBoundary(
-        session_id=project.short_id,
-        primary_camera="left",
-        primary_frame_id=0,
-        start_perf_time=100.0,
-        start_wall_time=1000.0,
-        camera_when=500.0,
-        end_perf_time=102.0,
+    _, token = app_model._recording_session.begin_record(project.short_id, {})
+    app_model._recording_session.transition(
+        SessionRecordingStatus.RECORDING,
+        expected=(SessionRecordingStatus.ARMING,),
+        token=token,
     )
-    primary = app_model._ordered_reach_cameras(enabled_only=True)[0]
-    primary.active_config.params["fps"] = 150
-    fps = 150.0
-    result = IntersessionResponse(
-        reach_events=[ReachEvent(
-            init=int(0.75 * fps),
-            end=int(0.9 * fps),
-            method=ReachEventMethod.RIGHT_HAND,
-            outcome=ReachEventOutcome.EATEN,
-        )],
-        food_consumed=1,
-        successful_reaches=1,
-        total_reaches=1,
+    tracking_window = TrackingWindow(
+        100.6, 101.5, (), 0, 0, (), (), True,
+    )
+    request = IntertrialAnalysisRequest(
+        token.generation,
+        token.session_id,
+        1,
+        1,
+        "send-1",
+        tracking_window,
+        PelletStateEvidence(
+            PelletPresence.PRESENT,
+            PelletMisplacement.NOT_MISPLACED,
+            10,
+            10,
+            10,
+            5.0,
+        ),
+    )
+    result = IntertrialAnalysisResult(
+        request=request,
+        outcome=TrialOutcome.SUCCESS,
+        reaches=(ReachTrajectory(100.7, 100.8, 100.9, (1, 2, 3), True),),
+        reach_count=1,
+        success_count=1,
+        consumption_count=1,
+        recommended_shift=None,
+        interpolated_points=0,
+        long_gap_count=0,
+        analysis_seconds=0.02,
     )
 
     with mock.patch.object(
-        app_model,
-        "_read_trial_stream_references",
+        app_model._session_data_recorder,
+        "trial_stream_references",
         return_value=(
-            ({"eventPerfTime": 100.8, "channel": "tone1"},),
+            ({"perf_time": 100.8, "channel": "tone1"},),
             ({"perf_time": 100.9, "channel": "left"},),
         ),
     ), mock.patch.object(
         app_model._session_data_recorder,
-        "update_persisted_trial_ledger",
+        "persist_trial_ledger",
     ) as update, mock.patch.object(
+        app_model._session_data_recorder,
+        "persist_trial_tracking",
+    ), mock.patch.object(
         app_model._protocol_runner,
         "record_trial_outcome",
     ) as protocol_outcome:
-        app_model._on_detection_result_ready(project, result)
+        app_model._on_intertrial_analysis_result(result)
 
     attempt = ledger.attempts[0]
     assert attempt.outcome is TrialOutcome.SUCCESS
@@ -593,72 +615,52 @@ def test_post_session_analysis_finalizes_attempts_persists_and_syncs_counts(
     )
 
 
-def test_production_analysis_reindexes_behavioral_retry_attempts(app_model):
+def test_live_analysis_reserves_configured_behavioral_retry(app_model):
     project = app_model.project
     ledger = PelletTrialLedger(project.short_id)
     ledger.begin_send(100.5, 1000.5, operation_id="send-1")
     ledger.acknowledge_presentation(100.55, 1000.55)
     ledger.close_active_for_analysis(101.5, 1001.5)
-    ledger.begin_send(101.5, 1001.5, operation_id="send-2")
-    ledger.acknowledge_presentation(101.55, 1001.55)
-    ledger.close_active_for_analysis(102.5, 1002.5)
     app_model._trial_ledger = ledger
-    app_model._recording_session.boundary = SessionBoundary(
-        session_id=project.short_id,
-        primary_camera="left",
-        primary_frame_id=0,
-        start_perf_time=100.0,
-        start_wall_time=1000.0,
-        camera_when=500.0,
-        end_perf_time=103.0,
+    control = app_model.behavior.algorithm.active_config.session_control
+    control.intertrial_analysis_enabled = True
+    control.behavioral_retry_outcomes = (TrialOutcome.NO_REACH.value,)
+    _, token = app_model._recording_session.begin_record(project.short_id, {})
+    app_model._recording_session.transition(
+        SessionRecordingStatus.RECORDING,
+        expected=(SessionRecordingStatus.ARMING,),
+        token=token,
     )
-    primary = app_model._ordered_reach_cameras(enabled_only=True)[0]
-    primary.active_config.params["fps"] = 100
-    result = IntersessionResponse(
-        reach_events=[
-            ReachEvent(
-                init=75,
-                end=85,
-                method=ReachEventMethod.RIGHT_HAND,
-                outcome=ReachEventOutcome.MISSED,
-            ),
-            ReachEvent(
-                init=175,
-                end=185,
-                method=ReachEventMethod.RIGHT_HAND,
-                outcome=ReachEventOutcome.EATEN,
-            ),
-        ],
-        food_consumed=1,
-        successful_reaches=1,
-        total_reaches=2,
+    window = TrackingWindow(100.6, 101.5, (), 0, 0, (), (), True)
+    request = IntertrialAnalysisRequest(
+        token.generation, token.session_id, 1, 1, "send-1", window,
+        PelletStateEvidence(
+            PelletPresence.PRESENT, PelletMisplacement.UNKNOWN, 0, 0, 0, None,
+        ),
+    )
+    result = IntertrialAnalysisResult(
+        request, TrialOutcome.NO_REACH, (), 0, 0, 0, None, 0, 0, 0.01,
     )
 
     with mock.patch.object(
-        app_model,
-        "_read_trial_stream_references",
+        app_model._session_data_recorder,
+        "trial_stream_references",
         return_value=((), ()),
     ), mock.patch.object(
         app_model._session_data_recorder,
-        "update_persisted_trial_ledger",
+        "persist_trial_ledger",
+    ), mock.patch.object(
+        app_model._session_data_recorder,
+        "persist_trial_tracking",
     ), mock.patch.object(
         app_model._protocol_runner,
         "record_trial_outcome",
-    ) as protocol_outcome:
-        app_model._on_detection_result_ready(project, result)
+    ):
+        app_model._on_intertrial_analysis_result(result)
 
-    assert [attempt.attempt_label for attempt in ledger.attempts] == [
-        "1.1",
-        "1.2",
-    ]
-    assert [attempt.outcome for attempt in ledger.attempts] == [
-        TrialOutcome.FAILURE,
-        TrialOutcome.SUCCESS,
-    ]
+    retry = ledger.begin_send(102.0, 1002.0, operation_id="send-2")
     assert ledger.attempts[0].logical_trial_complete is False
-    assert ledger.attempts[1].logical_trial_complete is True
-    assert ledger.summary()["scored_trials"] == 1
-    protocol_outcome.assert_called_once_with("1.2", TrialOutcome.SUCCESS)
+    assert retry.attempt_label == "1.2"
 
 
 def test_abort_removes_whole_session_and_resets_counts(app_model):
@@ -707,25 +709,13 @@ def test_abort_during_analysis_cancels_analysis_and_removes_session(
     app_model._set_session_recording_status(SessionRecordingStatus.ANALYZING)
 
     with mock.patch.object(
-        type(app_model._inference),
-        "is_enabled",
-        new_callable=mock.PropertyMock,
-        return_value=True,
-    ), mock.patch.object(app_model._inference, "stop") as stop, mock.patch.object(
-        app_model.behavior,
-        "on_prepare_capture",
-    ) as reset_behavior, mock.patch.object(
-        app_model,
-        "_start_inference_domain",
-    ) as restart_inference:
+        app_model._intertrial_analysis,
+        "cancel_session",
+    ) as cancel, mock.patch.object(app_model._inference, "stop") as stop:
         assert app_model.abort_recording()
 
-    stop.assert_called_once_with()
-    reset_behavior.assert_called_once_with()
-    restart_inference.assert_called_once_with(
-        reach_synchronization_ready=True,
-        preflight_error=None,
-    )
+    cancel.assert_called_once_with()
+    stop.assert_not_called()
     assert not session_path.exists()
     assert project.session == 0
     assert app_model.behavior.algorithm.pellets_presented == 0
@@ -749,7 +739,11 @@ def test_stop_finishes_auxiliary_data_after_raw_writers_close(app_model):
         app_model._session_data_recorder, "stop"
     ) as stop, mock.patch.object(
         app_model, "_save_project_metadata"
-    ) as save_metadata:
+    ) as save_metadata, mock.patch.object(
+        app_model._intertrial_analysis, "is_idle", return_value=False,
+    ), mock.patch.object(
+        app_model, "_wait_and_finish_intertrial_session",
+    ):
         app_model._complete_stopped_recording(app_model.project)
 
     stop.assert_called_once_with(12.5)
@@ -790,8 +784,9 @@ def test_stop_snapshots_trial_ledger_with_pending_analysis_outcome(app_model):
         app_model._complete_stopped_recording(app_model.project)
 
     attempt = ledger.attempts[0]
-    assert attempt.outcome is TrialOutcome.PENDING_ANALYSIS
-    assert attempt.capture_end_perf_time == 12.5
+    assert attempt.outcome is TrialOutcome.INCOMPLETE
+    assert attempt.finalized_perf_time == 12.5
+    assert "stopped before the pellet cycle completed" in attempt.error
     set_trial_ledger.assert_called_once_with(
         ledger.to_records(),
         ledger.summary(),
@@ -910,6 +905,7 @@ def test_incomplete_auxiliary_streams_are_not_reported_as_fully_saved(
         camera_when=1_000_000.0,
     )
     app_model._recording_session.analysis_finished = True
+    app_model._set_session_recording_status(SessionRecordingStatus.STOPPING)
     result = {
         "sessionComplete": False,
         "incompleteReasons": ("nidaq.barcode reported 1 acquisition gap(s)",),
@@ -934,7 +930,7 @@ def test_incomplete_auxiliary_streams_are_not_reported_as_fully_saved(
     assert app_model._recording_session.enabled_sources == result["enabledSources"]
     assert app_model._recording_session.boundary.nidaq_sample_index == 100
     assert (
-        app_model.subsystem_statuses[SubsystemId.OFFLINE_ANALYSIS.value].state
+        app_model.subsystem_statuses[SubsystemId.INTERTRIAL_ANALYSIS.value].state
         is SubsystemState.FAILED
     )
     assert app_model.session_recording_status is SessionRecordingStatus.READY

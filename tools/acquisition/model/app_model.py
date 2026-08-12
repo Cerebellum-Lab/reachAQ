@@ -184,6 +184,7 @@ from tools.acquisition.model.intertrial_analysis import (
     IntertrialAnalysisCoordinator,
     IntertrialAnalysisRequest,
     IntertrialAnalysisResult,
+    analyze_tracking_window,
     classify_pellet_state,
 )
 from tools.acquisition.model.live_tracking_buffer import (
@@ -564,6 +565,7 @@ class AppModel(ObservableObject):
             system_machine=system_machine,
         )
         system_machine = behavior_model.system_machine  # ensure same
+        system_machine.use_live_intertrial_analysis = True
 
         self._models: List[ProjectDependentProtocol] = [
             *self._reach_cameras,
@@ -605,6 +607,7 @@ class AppModel(ObservableObject):
         self._intertrial_analysis = IntertrialAnalysisCoordinator(
             self._on_intertrial_analysis_result,
         )
+        self._intertrial_finalize_thread = None
         self._trial_window_start = None
         self._tone2_active = False
         self._intertrial_lock = threading.RLock()
@@ -622,7 +625,6 @@ class AppModel(ObservableObject):
         )
         inference.property_changed += self._on_inference_property_changed
         inference.pose_response_ready += self._on_pose_response_ready
-        inference.detection_result_ready += self._on_detection_result_ready
 
         preferences.property_changed += self._on_preferences_property_changed
 
@@ -1032,9 +1034,9 @@ class AppModel(ObservableObject):
             }
         })
         self._set_subsystem_status(
-            SubsystemId.OFFLINE_ANALYSIS,
+            SubsystemId.INTERTRIAL_ANALYSIS,
             SubsystemState.DISABLED,
-            reason="recording active; no stopped session pending",
+            reason="no completed pellet trial pending",
         )
         self._abort_had_recording_started = False
         self._session_data_recorder.arm(
@@ -1416,6 +1418,10 @@ class AppModel(ObservableObject):
             self._aborting_project = None
             return False
         self._aborted_session_ids.add(self._aborting_project.short_id)
+        self._intertrial_analysis.cancel_session()
+        self._live_tracking.clear()
+        self._trial_window_start = None
+        self._behavior.algorithm.pellet_send_block_reason = ""
         self._session_data_recorder.abort()
         self._cancel_automatic_stop_timers()
         self._recording_session.pending_end_perf = None
@@ -1423,39 +1429,10 @@ class AppModel(ObservableObject):
         self._record_start_timer = no_op_timer
         if previous_status is SessionRecordingStatus.ANALYZING:
             logger.notice(
-                "Cancelling post-session analysis before deleting %s",
+                "Cancelling pending pellet-trial analysis before deleting %s",
                 self._aborting_project.short_id,
             )
-            try:
-                self._inference.stop()
-            except Exception as err:
-                logger.exception("Failed to stop post-session analysis")
-                self.on_error("Analysis cancellation failed", str(err))
-                self._set_session_recording_status(
-                    previous_status,
-                    expected=(SessionRecordingStatus.ABORTING,),
-                    token=token,
-                )
-                self._aborted_session_ids.discard(
-                    self._aborting_project.short_id
-                )
-                self._aborting_project = None
-                return False
-            self._behavior.on_prepare_capture()
             self._finish_abort_recording(token=token)
-            synchronization = self._acquisition.subsystems.get(
-                SubsystemId.REACH_SYNCHRONIZATION
-            )
-            if (
-                self._acquisition.started
-                and self._inference.is_enabled
-                and synchronization is not None
-                and synchronization.is_ready
-            ):
-                self._start_inference_domain(
-                    reach_synchronization_ready=True,
-                    preflight_error=None,
-                )
             return True
         stopped = self._behavior.algorithm.end_capture_session(
             reason=RecordingEndingReason.MANUAL_ABORT,
@@ -2136,14 +2113,6 @@ class AppModel(ObservableObject):
     def recording_blockers(self) -> Tuple[str, ...]:
         blockers = list(self._acquisition.subsystems.recording_blockers())
         session_control = self._behavior.algorithm.active_config.session_control
-        if (
-            session_control.trial_limit is not None
-            and session_control.trial_count_basis == TrialCountBasis.SCORED.value
-        ):
-            blockers.append(
-                "Scored trials are available after analysis and cannot stop "
-                "the active recording; choose another trial-limit count"
-            )
         if self._protocol_runner.protocol_complete:
             blockers.append("Selected protocol is complete")
         if self._recording_session.status is not SessionRecordingStatus.READY:
@@ -2314,9 +2283,9 @@ class AppModel(ObservableObject):
             required_for_recording=True,
         )
         self._set_subsystem_status(
-            SubsystemId.OFFLINE_ANALYSIS,
+            SubsystemId.INTERTRIAL_ANALYSIS,
             SubsystemState.DISABLED,
-            reason="no stopped session pending",
+            reason="no completed pellet trial pending",
             required_for_recording=False,
         )
 
@@ -3603,6 +3572,8 @@ class AppModel(ObservableObject):
         attempts = () if ledger is None else ledger.attempts
         active = None if ledger is None else ledger.active_attempt
         active_trial_id = None if active is None else active.trial_id
+        session_control = self._behavior.algorithm.active_config.session_control
+        estimate = self._intertrial_analysis.timing_estimate(1.0)
         if active is not None and active_trial_id is None and active.protocol_context:
             active_trial_id = (
                 active.protocol_context.get("trial_row") or {}
@@ -3615,6 +3586,18 @@ class AppModel(ObservableObject):
                 for attempt in attempts
                 if attempt.trial_id is not None and attempt.logical_trial_complete
             })),
+            "analysis": {
+                "enabled": session_control.intertrial_analysis_enabled,
+                "progression_mode": session_control.intertrial_progression_mode,
+                "pending_attempts": (
+                    0
+                    if ledger is None
+                    else ledger.summary().get("pending_analysis_attempts", 0)
+                ),
+                "send_block_reason": self._behavior.algorithm.pellet_send_block_reason,
+                "seconds_per_tracking_second": estimate.mean_realtime_factor,
+                "estimate": estimate.display_text,
+            },
         }
 
     def update_trial_protocol_row(self, trial_id: int, field: str, value) -> bool:
@@ -5942,66 +5925,12 @@ class AppModel(ObservableObject):
                 project.short_id,
             )
             return
-        ledger = self._trial_ledger
-        if ledger is not None:
-            self._pellet_cycles.finalize_pending_without_analysis(
-                project,
-                perf_time=get_perf_now(),
-                wall_time=time.time(),
-                reason=(
-                    "post-session analysis did not produce a per-attempt result "
-                    f"({result.value})"
-                ),
-            )
-            self._pellet_cycles.end_session()
-        self._recording_session.analysis_finished = True
-        if self._recording_session.status == SessionRecordingStatus.ANALYZING:
-            if self._recording_session.analysis_started_perf is not None:
-                self._recording_session.analysis_duration_seconds = (
-                    time.perf_counter() - self._recording_session.analysis_started_perf
-                )
-                logger.info(
-                    "Session analysis finished in %.3f seconds: %s",
-                    self._recording_session.analysis_duration_seconds,
-                    project.short_id,
-                )
-            try:
-                self._save_project_metadata(
-                    project,
-                    caller="session_analysis_ended",
-                )
-            except Exception as exc:
-                self._set_subsystem_status(
-                    SubsystemId.OFFLINE_ANALYSIS,
-                    SubsystemState.FAILED,
-                    error=f"final metadata save failed: {exc}",
-                )
-                raise
-            else:
-                self._set_subsystem_status(
-                    SubsystemId.OFFLINE_ANALYSIS,
-                    (
-                        SubsystemState.READY
-                        if self._recording_session.data_complete
-                        else SubsystemState.FAILED
-                    ),
-                    reason=(
-                        "offline analysis completed"
-                        if self._recording_session.data_complete
-                        else "analysis completed; session data is incomplete"
-                    ),
-                    error=(
-                        ""
-                        if self._recording_session.data_complete
-                        else "; ".join(self._recording_session.data_errors)
-                    ),
-                )
-            finally:
-                self._set_session_recording_status(
-                    SessionRecordingStatus.READY,
-                    expected=(SessionRecordingStatus.ANALYZING,),
-                    token=session_token,
-                )
+        logger.info(
+            "capture lifecycle ended for %s (%s); waiting for closed "
+            "pellet-window analyses after writers close",
+            project.short_id,
+            result.value,
+        )
 
     def _complete_stopped_recording(
         self,
@@ -6087,38 +6016,16 @@ class AppModel(ObservableObject):
                 f"auxiliary stream save failed: {err}"
             )
         self._request_session_end_home("stop")
-        if self._recording_session.analysis_finished:
-            if self._recording_session.analysis_duration_seconds is None:
-                self._recording_session.analysis_duration_seconds = 0.0
-            self._set_subsystem_status(
-                SubsystemId.OFFLINE_ANALYSIS,
-                (
-                    SubsystemState.READY
-                    if self._recording_session.data_complete
-                    else SubsystemState.FAILED
-                ),
-                reason=(
-                    "offline analysis completed"
-                    if self._recording_session.data_complete
-                    else "analysis completed; session data is incomplete"
-                ),
-                error=(
-                    ""
-                    if self._recording_session.data_complete
-                    else "; ".join(self._recording_session.data_errors)
-                ),
-            )
-        else:
-            self._recording_session.analysis_started_perf = time.perf_counter()
-            self._begin_subsystem_start(
-                SubsystemId.OFFLINE_ANALYSIS,
-                reason="analyzing stopped session",
-            )
-            self._set_session_recording_status(
-                SessionRecordingStatus.ANALYZING,
-                expected=(SessionRecordingStatus.STOPPING,),
-                token=token,
-            )
+        self._recording_session.analysis_started_perf = time.perf_counter()
+        self._begin_subsystem_start(
+            SubsystemId.INTERTRIAL_ANALYSIS,
+            reason="finishing closed pellet-trial analyses",
+        )
+        transitioned = self._set_session_recording_status(
+            SessionRecordingStatus.ANALYZING,
+            expected=(SessionRecordingStatus.STOPPING,),
+            token=token,
+        )
         try:
             self._editable_notes_project = project.to_local_value()
             self._save_project_metadata(
@@ -6130,18 +6037,158 @@ class AppModel(ObservableObject):
                 f"metadata save failed: {exc}"
             )
             self._set_subsystem_status(
-                SubsystemId.OFFLINE_ANALYSIS,
+                SubsystemId.INTERTRIAL_ANALYSIS,
                 SubsystemState.FAILED,
                 error=f"metadata save failed: {exc}",
             )
             raise
-        finally:
-            if self._recording_session.analysis_finished:
-                self._set_session_recording_status(
-                    SessionRecordingStatus.READY,
-                    expected=(SessionRecordingStatus.STOPPING,),
-                    token=token,
+        if not transitioned:
+            return
+        if self._intertrial_analysis.is_idle():
+            self._finish_intertrial_session(project, token)
+        else:
+            thread = threading.Thread(
+                target=self._wait_and_finish_intertrial_session,
+                args=(project.to_local_value(), token),
+                name="FinishIntertrialSession",
+                daemon=True,
+            )
+            self._intertrial_finalize_thread = thread
+            thread.start()
+
+    def _wait_and_finish_intertrial_session(
+        self,
+        project: ProjectInfo,
+        token: Optional[SessionGeneration],
+    ) -> None:
+        while (
+            token is None
+            and self._recording_session.status is SessionRecordingStatus.ANALYZING
+        ) or self._recording_session.is_current(
+            token, statuses=(SessionRecordingStatus.ANALYZING,)
+        ):
+            if self._intertrial_analysis.wait_for_idle(0.25):
+                self._finish_intertrial_session(project, token)
+                return
+
+    def _finish_intertrial_session(
+        self,
+        project: ProjectInfo,
+        token: Optional[SessionGeneration],
+    ) -> None:
+        if not (
+            (
+                token is None
+                and self._recording_session.status
+                is SessionRecordingStatus.ANALYZING
+            )
+            or self._recording_session.is_current(
+                token, statuses=(SessionRecordingStatus.ANALYZING,)
+            )
+        ):
+            return
+        requests, tracking_errors = (
+            self._session_data_recorder.load_trial_tracking_requests(project)
+        )
+        for error in tracking_errors:
+            logger.warning("Stored trial tracking could not be validated: %s", error)
+        pending_identities = {
+            (attempt.trial_id, attempt.attempt_id, attempt.operation_id)
+            for attempt in (self._trial_ledger.attempts if self._trial_ledger else ())
+            if attempt.outcome is TrialOutcome.PENDING_ANALYSIS
+        }
+        for request in requests:
+            identity = (
+                request.trial_id,
+                request.attempt_id,
+                request.operation_id,
+            )
+            if identity not in pending_identities:
+                continue
+            try:
+                result = analyze_tracking_window(request)
+                self._session_data_recorder.persist_trial_tracking(
+                    project,
+                    request,
+                    result,
                 )
+                tone_references, laser_references = (
+                    self._session_data_recorder.trial_stream_references(
+                        request.window.start_perf,
+                        request.window.end_perf,
+                    )
+                )
+                self._pellet_cycles.finalize_intertrial_result(
+                    project,
+                    result,
+                    retry=False,
+                    tone_references=tone_references,
+                    laser_references=laser_references,
+                )
+                logger.warning(
+                    "Repaired pending trial %s from stored live tracking",
+                    request.attempt_label,
+                )
+            except Exception as error:
+                logger.exception(
+                    "Stored tracking repair failed for %s: %s",
+                    request.attempt_label,
+                    error,
+                )
+        self._pellet_cycles.finalize_pending_without_analysis(
+            project,
+            perf_time=get_perf_now(),
+            wall_time=time.time(),
+            reason="intertrial analysis ended without a result",
+        )
+        self._pellet_cycles.sync_behavior_counts(self._behavior.algorithm)
+        self._pellet_cycles.end_session()
+        self._behavior.algorithm.pellet_send_block_reason = ""
+        self._recording_session.analysis_finished = True
+        self._recording_session.analysis_duration_seconds = (
+            time.perf_counter()
+            - (self._recording_session.analysis_started_perf or time.perf_counter())
+        )
+        try:
+            self._save_project_metadata(
+                project,
+                caller="intertrial_analysis_finished",
+            )
+        except Exception as error:
+            self._recording_session.add_data_error(
+                f"final metadata save failed: {error}"
+            )
+            self._set_subsystem_status(
+                SubsystemId.INTERTRIAL_ANALYSIS,
+                SubsystemState.FAILED,
+                error=f"final metadata save failed: {error}",
+            )
+            logger.exception("Final intertrial metadata save failed")
+        else:
+            self._set_subsystem_status(
+                SubsystemId.INTERTRIAL_ANALYSIS,
+                (
+                    SubsystemState.READY
+                    if self._recording_session.data_complete
+                    else SubsystemState.FAILED
+                ),
+                reason=(
+                    "all closed pellet-trial analyses completed"
+                    if self._recording_session.data_complete
+                    else "trial analysis completed; session data is incomplete"
+                ),
+                error=(
+                    ""
+                    if self._recording_session.data_complete
+                    else "; ".join(self._recording_session.data_errors)
+                ),
+            )
+        finally:
+            self._set_session_recording_status(
+                SessionRecordingStatus.READY,
+                expected=(SessionRecordingStatus.ANALYZING,),
+                token=token,
+            )
 
     def _request_session_end_home(self, ending: str) -> None:
         requested_perf = get_perf_now()
@@ -6248,9 +6295,9 @@ class AppModel(ObservableObject):
             self._session_data_recorder.abort()
             self._recording_session.reset_after_abort()
             self._set_subsystem_status(
-                SubsystemId.OFFLINE_ANALYSIS,
+                SubsystemId.INTERTRIAL_ANALYSIS,
                 SubsystemState.DISABLED,
-                reason="aborted session has no offline analysis",
+                reason="aborted session analysis was cancelled",
             )
             self._abort_had_recording_started = False
             self._aborting_project = None
@@ -6530,11 +6577,24 @@ class AppModel(ObservableObject):
             return
         config = self._behavior.algorithm.active_config.session_control
         retry = result.outcome.value in config.behavioral_retry_outcomes
+        self._session_data_recorder.persist_trial_tracking(
+            self._project_info,
+            request,
+            result,
+        )
+        tone_references, laser_references = (
+            self._session_data_recorder.trial_stream_references(
+                request.window.start_perf,
+                request.window.end_perf,
+            )
+        )
         try:
             finalized = self._pellet_cycles.finalize_intertrial_result(
                 self._project_info,
                 result,
                 retry=retry,
+                tone_references=tone_references,
+                laser_references=laser_references,
             )
         except (KeyError, RuntimeError) as error:
             logger.error(
@@ -6574,72 +6634,6 @@ class AppModel(ObservableObject):
             finalized.reach_count,
             result.analysis_seconds,
         )
-
-    def _on_detection_result_ready(self, project: ProjectInfo, result: IntersessionResponse):
-        if project.short_id in self._aborted_session_ids:
-            logger.info("ignoring analysis result for aborted session %s", project.short_id)
-            return
-        ledger = self._trial_ledger
-        boundary = self._recording_session.boundary
-        if (
-            ledger is None
-            or boundary is None
-            or boundary.session_id != project.short_id
-        ):
-            return
-        primary = self._ordered_reach_cameras(enabled_only=True)[0]
-        frame_rate = primary.active_config.params.get("fps")
-        if frame_rate is None:
-            frame_rate = self._behavior.system_machine.intersession.frame_rate
-        if frame_rate is None:
-            raise RuntimeError(
-                "Cannot reconcile pellet attempts without the analyzed camera frame rate"
-            )
-        frame_rate = float(frame_rate)
-        tone_references, laser_references = self._read_trial_stream_references(
-            project
-        )
-        self._pellet_cycles.reconcile_analysis(
-            project,
-            result,
-            recording_start_perf_time=boundary.start_perf_time,
-            frame_rate=frame_rate,
-            finalized_perf_time=(
-                boundary.end_perf_time
-                if boundary.end_perf_time is not None
-                else get_perf_now()
-            ),
-            finalized_wall_time=(
-                boundary.end_wall_time
-                if boundary.end_wall_time is not None
-                else time.time()
-            ),
-            tone_references=tone_references,
-            laser_references=laser_references,
-        )
-        self._pellet_cycles.sync_behavior_counts(self._behavior.algorithm)
-        self._notify_trial_protocol_state()
-
-    @staticmethod
-    def _read_trial_stream_references(project):
-        streams = Path(project.get_session_path().location) / "streams"
-        tone_references = []
-        alignment_path = streams / "alignment.json"
-        if alignment_path.exists():
-            with alignment_path.open("r", encoding="utf-8") as stream:
-                tone = json.load(stream).get("toneConfirmation") or {}
-            tone_references.extend(tone.get("matched", ()))
-            tone_references.extend(tone.get("unmatchedEvents", ()))
-
-        laser_references = []
-        laser_path = streams / "laser.csv"
-        if laser_path.exists():
-            with laser_path.open("r", encoding="utf-8", newline="") as stream:
-                for row in csv.DictReader(stream):
-                    if row.get("perf_time"):
-                        row["perf_time"] = float(row["perf_time"])
-                    laser_references.append(row)
-        return tuple(tone_references), tuple(laser_references)
 
     def _sync_session_counts_from_results(
         self,
@@ -7178,24 +7172,6 @@ class AppModel(ObservableObject):
         )
         self._evaluate_automatic_stop_policy(protocol_complete=True)
 
-    def _finish_active_pellet_trial(
-        self,
-        perf_c: float,
-        *,
-        retry: bool = False,
-    ) -> None:
-        if self._pellet_cycles.active_attempt is None:
-            return
-        self._pellet_cycles.finish_active(
-            perf_c,
-            time.time(),
-            retry=retry,
-        )
-        self._notify_trial_protocol_state()
-        self._evaluate_automatic_stop_policy(
-            protocol_complete=self._protocol_runner.protocol_complete,
-        )
-
     def _on_pellet_loading_for_trial(self):
         if self._pellet_cycles.active_attempt is not None:
             logger.warning(
@@ -7251,7 +7227,36 @@ class AppModel(ObservableObject):
         elif tracking_window is not None and not tracking_window.samples:
             unavailable_reason = "no live tracking samples covered the pellet trial"
 
+        token = self._recording_session.token()
+        request = None
+        if token is not None and tracking_window is not None and evidence is not None:
+            request = IntertrialAnalysisRequest(
+                generation=token.generation,
+                session_id=token.session_id,
+                trial_id=closed.trial_id,
+                attempt_id=closed.attempt_id,
+                operation_id=closed.operation_id,
+                window=tracking_window,
+                pellet_state=evidence,
+            )
+            self._session_data_recorder.persist_trial_tracking(
+                self._project_info,
+                request,
+            )
+            self._pellet_cycles.annotate_intertrial_capture(
+                self._project_info,
+                request,
+            )
+
         if unavailable_reason:
+            tone_references, laser_references = (
+                ((), ())
+                if tracking_window is None
+                else self._session_data_recorder.trial_stream_references(
+                    tracking_window.start_perf,
+                    tracking_window.end_perf,
+                )
+            )
             finalized = self._pellet_cycles.finalize_intertrial_unavailable(
                 self._project_info,
                 closed,
@@ -7270,6 +7275,8 @@ class AppModel(ObservableObject):
                     if not config.intertrial_analysis_enabled
                     else TrialOutcome.INCOMPLETE
                 ),
+                tone_references=tone_references,
+                laser_references=laser_references,
             )
             self._pellet_cycles.sync_behavior_counts(self._behavior.algorithm)
             self._notify_trial_protocol_state()
@@ -7283,18 +7290,8 @@ class AppModel(ObservableObject):
             )
             return
 
-        token = self._recording_session.token()
-        if token is None:
+        if request is None:
             return
-        request = IntertrialAnalysisRequest(
-            generation=token.generation,
-            session_id=token.session_id,
-            trial_id=closed.trial_id,
-            attempt_id=closed.attempt_id,
-            operation_id=closed.operation_id,
-            window=tracking_window,
-            pellet_state=evidence,
-        )
         must_wait = (
             config.intertrial_progression_mode
             == AnalysisProgressionMode.WAIT.value
@@ -7313,6 +7310,12 @@ class AppModel(ObservableObject):
                 if must_wait
                 else ""
             )
+            tone_references, laser_references = (
+                self._session_data_recorder.trial_stream_references(
+                    tracking_window.start_perf,
+                    tracking_window.end_perf,
+                )
+            )
             finalized = self._pellet_cycles.finalize_intertrial_unavailable(
                 self._project_info,
                 closed,
@@ -7322,6 +7325,8 @@ class AppModel(ObservableObject):
                 pellet_presence=evidence.presence.value,
                 pellet_misplacement=evidence.misplacement.value,
                 window=tracking_window,
+                tone_references=tone_references,
+                laser_references=laser_references,
             )
             self._pellet_cycles.sync_behavior_counts(self._behavior.algorithm)
             logger.error(
@@ -7391,9 +7396,9 @@ class AppModel(ObservableObject):
                     return
                 self._notify_trial_protocol_state()
             if ledger is not None:
-                # Behavioral results are not authoritative until post-session
-                # analysis. Update only the acknowledgement-derived value here;
-                # reconciliation projects all four counts together after Stop.
+                # Presentation is acknowledgement-derived immediately. The
+                # other three counts update together when this pellet window's
+                # live tracking result is finalized.
                 algo.pellets_presented = self._pellet_cycles.count(
                     TrialCountBasis.PRESENTED
                 )
