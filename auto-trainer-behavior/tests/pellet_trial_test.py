@@ -226,6 +226,15 @@ def test_analysis_fields_are_persisted_on_pending_attempt():
         reach_event_indices=(3, 4),
         tone_references=({"context": "tone-1"},),
         laser_references=({"channel": "left"},),
+        pellet_presence="present",
+        pellet_misplacement="not_misplaced",
+        analysis_window_start_perf=1.2,
+        analysis_window_end_perf=2.0,
+        tracking_coverage=0.98,
+        tracking_missing_frame_ids=(8,),
+        tracking_interpolated_points=1,
+        analysis_duration_seconds=0.03,
+        recommended_shift={"x": 0.1, "y": 0.0, "z": -0.1},
     )
 
     assert final.reach_count == 2
@@ -235,6 +244,32 @@ def test_analysis_fields_are_persisted_on_pending_attempt():
     assert record["pellet_position"] == {"x": 1.0, "y": 2.0, "z": 3.0}
     assert record["protocol_context"]["phase_id"] == "phase-1"
     assert record["reach_event_indices"] == (3, 4)
+    assert record["pellet_presence"] == "present"
+    assert record["tracking_missing_frame_ids"] == (8,)
+    assert record["recommended_shift"]["z"] == -0.1
+
+
+def test_presented_attempt_without_reach_is_not_classified_as_missing_pellet():
+    ledger = PelletTrialLedger("session001")
+    ledger.begin_send(101.0, 1001.0)
+    ledger.acknowledge_presentation(101.1, 1001.1)
+    ledger.close_active_for_analysis(102.0, 1002.0)
+    result = SimpleNamespace(
+        reach_events=(),
+        other_events=(),
+        total_reaches=0,
+        successful_reaches=0,
+        food_consumed=0,
+    )
+    finalized = ledger.reconcile_analysis(
+        result,
+        recording_start_perf_time=100.0,
+        frame_rate=150.0,
+        finalized_perf_time=103.0,
+        finalized_wall_time=1003.0,
+    )
+    assert finalized[0].outcome is TrialOutcome.NO_REACH
+    assert finalized[0].outcome is not TrialOutcome.PELLET_MISSING
 
 
 def test_session_frame_analysis_is_reconciled_to_attempt_windows_once():

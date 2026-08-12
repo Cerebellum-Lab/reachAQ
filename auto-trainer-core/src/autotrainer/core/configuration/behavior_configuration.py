@@ -115,6 +115,7 @@ class SessionControlConfiguration:
         "success",
         "failure",
         "pellet_missing",
+        "no_reach",
     )
     duration_limit_seconds: Optional[float] = None
     trial_limit: Optional[int] = None
@@ -134,6 +135,7 @@ class SessionControlConfiguration:
         "success",
         "failure",
         "pellet_missing",
+        "no_reach",
         "incomplete",
         "aborted",
     )

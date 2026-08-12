@@ -63,6 +63,7 @@ class TrialOutcome(str, enum.Enum):
     SUCCESS = "success"
     FAILURE = "failure"
     PELLET_MISSING = "pellet_missing"
+    NO_REACH = "no_reach"
     INCOMPLETE = "incomplete"
     ABORTED = "aborted"
     HARDWARE_ERROR = "hardware_error"
@@ -73,6 +74,7 @@ class TrialOutcome(str, enum.Enum):
             TrialOutcome.SUCCESS,
             TrialOutcome.FAILURE,
             TrialOutcome.PELLET_MISSING,
+            TrialOutcome.NO_REACH,
         }
 
 
@@ -95,6 +97,7 @@ class TrialAccountingConfiguration:
         TrialOutcome.SUCCESS,
         TrialOutcome.FAILURE,
         TrialOutcome.PELLET_MISSING,
+        TrialOutcome.NO_REACH,
     })
 
     def __post_init__(self):
@@ -131,6 +134,16 @@ class PelletTrialAttempt:
     reach_event_indices: Tuple[int, ...] = ()
     tone_references: Tuple[Dict[str, Any], ...] = ()
     laser_references: Tuple[Dict[str, Any], ...] = ()
+    pellet_presence: str = "unknown"
+    pellet_misplacement: str = "unknown"
+    analysis_window_start_perf: Optional[float] = None
+    analysis_window_end_perf: Optional[float] = None
+    tracking_coverage: Optional[float] = None
+    tracking_missing_frame_ids: Tuple[int, ...] = ()
+    tracking_interpolated_points: int = 0
+    tracking_long_gap_count: int = 0
+    analysis_duration_seconds: Optional[float] = None
+    recommended_shift: Optional[Dict[str, float]] = None
 
     @property
     def is_presented(self) -> bool:
@@ -371,6 +384,16 @@ class PelletTrialLedger:
         reach_event_indices: Tuple[int, ...] = (),
         tone_references: Tuple[Dict[str, Any], ...] = (),
         laser_references: Tuple[Dict[str, Any], ...] = (),
+        pellet_presence: str = "unknown",
+        pellet_misplacement: str = "unknown",
+        analysis_window_start_perf: Optional[float] = None,
+        analysis_window_end_perf: Optional[float] = None,
+        tracking_coverage: Optional[float] = None,
+        tracking_missing_frame_ids: Tuple[int, ...] = (),
+        tracking_interpolated_points: int = 0,
+        tracking_long_gap_count: int = 0,
+        analysis_duration_seconds: Optional[float] = None,
+        recommended_shift: Optional[Dict[str, float]] = None,
     ) -> PelletTrialAttempt:
         """Apply one offline-analysis result to a provisionally closed attempt."""
         outcome = TrialOutcome(outcome)
@@ -400,6 +423,34 @@ class PelletTrialLedger:
                 reach_event_indices=tuple(int(value) for value in reach_event_indices),
                 tone_references=tuple(tone_references),
                 laser_references=tuple(laser_references),
+                pellet_presence=str(pellet_presence),
+                pellet_misplacement=str(pellet_misplacement),
+                analysis_window_start_perf=(
+                    None
+                    if analysis_window_start_perf is None
+                    else float(analysis_window_start_perf)
+                ),
+                analysis_window_end_perf=(
+                    None
+                    if analysis_window_end_perf is None
+                    else float(analysis_window_end_perf)
+                ),
+                tracking_coverage=(
+                    None if tracking_coverage is None else float(tracking_coverage)
+                ),
+                tracking_missing_frame_ids=tuple(
+                    int(value) for value in tracking_missing_frame_ids
+                ),
+                tracking_interpolated_points=int(tracking_interpolated_points),
+                tracking_long_gap_count=int(tracking_long_gap_count),
+                analysis_duration_seconds=(
+                    None
+                    if analysis_duration_seconds is None
+                    else float(analysis_duration_seconds)
+                ),
+                recommended_shift=(
+                    None if recommended_shift is None else dict(recommended_shift)
+                ),
             )
             self._attempts[index] = finalized
             return finalized
@@ -503,7 +554,10 @@ class PelletTrialLedger:
                 outcome = TrialOutcome.FAILURE
                 error = ""
             else:
-                outcome = TrialOutcome.PELLET_MISSING
+                # Absence of a reach is not evidence that the pellet itself was
+                # absent. PELLET_MISSING is reserved for direct live tracking
+                # evidence supplied by the pellet-state tracker.
+                outcome = TrialOutcome.NO_REACH
                 error = ""
 
             finalized.append(self.finalize_pending(
