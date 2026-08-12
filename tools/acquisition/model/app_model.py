@@ -965,12 +965,13 @@ class AppModel(ObservableObject):
             return False
         session_config = self._behavior.algorithm.active_config.session_control
         estimated_rate = self._estimate_session_bytes_per_second()
-        session_path = Path(
-            project.get_session_path(skip_ensure=True).location
-        )
+        # Prove the output filesystem before allocating a session directory.
+        # Using the day directory avoids mutating the previous session while
+        # retaining an equivalent durability and free-space check.
+        preflight_path = Path(project.get_day_path(skip_ensure=True)[0])
         try:
             storage_preflight = preflight_storage(
-                session_path,
+                preflight_path,
                 estimated_bytes_per_second=estimated_rate,
                 configured_duration_seconds=session_config.duration_limit_seconds,
             )
@@ -978,6 +979,20 @@ class AppModel(ObservableObject):
             logger.exception("Session output write/fsync preflight failed")
             self.on_error("Recording unavailable", f"Storage preflight failed: {error}")
             return False
+        try:
+            # Reserve the filesystem session before creating the lifecycle
+            # token. Writers and callbacks must observe this immutable ID for
+            # the entire generation.
+            project.calculate_next_session_index()
+        except Exception as error:
+            logger.exception("Session directory allocation failed")
+            self.on_error("Recording unavailable", f"Session allocation failed: {error}")
+            return False
+        session_path = Path(project.get_session_path(skip_ensure=True).location)
+        storage_preflight = dataclasses.replace(
+            storage_preflight,
+            target_directory=str(session_path.resolve()),
+        )
         self._storage_preflight = storage_preflight
         logger.info(
             "Session storage preflight: target=%s free_bytes=%d "
@@ -1042,15 +1057,18 @@ class AppModel(ObservableObject):
             reason="no completed pellet trial pending",
         )
         self._abort_had_recording_started = False
-        self._session_data_recorder.arm(
-            project,
-            source_manifest=self._build_session_source_manifest(),
-            metadata_generation_id=(
-                self._recording_session.metadata_generation_id
-            ),
-        )
         try:
-            started = self._behavior.algorithm.start_session(reason="manual_record")
+            self._session_data_recorder.arm(
+                project,
+                source_manifest=self._build_session_source_manifest(),
+                metadata_generation_id=(
+                    self._recording_session.metadata_generation_id
+                ),
+            )
+            started = self._behavior.algorithm.start_session(
+                reason="manual_record",
+                allocate_project_session=False,
+            )
         except Exception as err:
             logger.exception("manual recording start failed: %s", err)
             self._session_data_recorder.abort()
@@ -1868,8 +1886,14 @@ class AppModel(ObservableObject):
                 dict(r_args[1]) if len(r_args) > 1 and r_args[1] else {}
             )
             session_token = self._recording_session.token()
-            if session_token is not None and (
-                project.short_id != session_token.session_id
+            closing_statuses = {
+                SessionRecordingStatus.STOPPING,
+                SessionRecordingStatus.ABORTING,
+            }
+            if (
+                session_token is None
+                or self._recording_session.status not in closing_statuses
+                or project.short_id != session_token.session_id
                 or message_generation not in (None, 0, session_token.generation)
             ):
                 logger.warning(
@@ -1884,23 +1908,36 @@ class AppModel(ObservableObject):
             recording_cams = self._get_recording_cams()
             recording_cam_indices = tuple(cam.camera_index for cam in recording_cams)
             if cam_idx in recording_cam_indices:
-                cams_closed_finished[cam_idx] = (
+                callback_key = (
+                    session_token.generation,
+                    session_token.session_id,
+                    cam_idx,
+                )
+                cams_closed_finished[callback_key] = (
                     project,
                     frames_written,
                     message_generation,
                     writer_diagnostics,
                 )
-                if all(cam.camera_index in cams_closed_finished for cam in recording_cams):
-                    project = cams_closed_finished[recording_cams[0].camera_index][0]
+                session_keys = tuple(
+                    (
+                        session_token.generation,
+                        session_token.session_id,
+                        camera.camera_index,
+                    )
+                    for camera in recording_cams
+                )
+                if all(key in cams_closed_finished for key in session_keys):
+                    project = cams_closed_finished[session_keys[0]][0]
                     session_dir = Path(project.get_session_path().location)
-                    for camera in recording_cams:
+                    for camera, camera_key in zip(recording_cams, session_keys):
                         (
                             camera_project,
                             camera_frames,
                             _camera_generation,
                             camera_writer_diagnostics,
                         ) = (
-                            cams_closed_finished[camera.camera_index]
+                            cams_closed_finished[camera_key]
                         )
                         video_path, timestamp_path, _ = camera_project.get_video_path(
                             camera.name,
@@ -1983,7 +2020,8 @@ class AppModel(ObservableObject):
                                         "frameAlignment": camera_diagnostics,
                                     },
                                 )
-                    cams_closed_finished.clear()  # now clear
+                    for camera_key in session_keys:
+                        cams_closed_finished.pop(camera_key, None)
                     wait_pose_closed = getattr(
                         type(self._inference),
                         "wait_session_pose_closed",

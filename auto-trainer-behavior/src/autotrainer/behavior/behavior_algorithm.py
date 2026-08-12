@@ -878,12 +878,25 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
 
     #
 
-    def start_session(self, *, reason: str = "NA"):
+    def start_session(
+        self,
+        *,
+        reason: str = "NA",
+        allocate_project_session: bool = True,
+    ):
         """Start a recording session."""
         with self._thread_lock:
-            return self._start_session(reason=reason)
+            return self._start_session(
+                reason=reason,
+                allocate_project_session=allocate_project_session,
+            )
 
-    def _start_session(self, *, reason: str = "NA"):
+    def _start_session(
+        self,
+        *,
+        reason: str = "NA",
+        allocate_project_session: bool = True,
+    ):
         if self._is_in_session:
             logger.warning("%s: start_session() called but already in session", reason)
             return False
@@ -903,7 +916,8 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
         self.reset_session_pellet_count()
         self.reset_session_counts()
 
-        project.calculate_next_session_index()
+        if allocate_project_session:
+            project.calculate_next_session_index()
         # ensure we look at their state on start:
         self._presence_tracker.reset_session()
         self._uncover_ctx.reset()  # always

@@ -160,6 +160,20 @@ def test_it_drain_record_stop_sema_on_session_recording_start(app_model):
     assert math.isnan(app_model._cams_record_start_perf.value)
 
 
+def test_preallocated_session_id_is_not_changed_by_behavior_start(app_model):
+    algorithm = app_model.behavior.algorithm
+    project = app_model.project
+    project.calculate_next_session_index()
+    reserved_session_id = project.short_id
+
+    assert algorithm.start_session(
+        reason="preallocated-test",
+        allocate_project_session=False,
+    )
+
+    assert project.short_id == reserved_session_id
+
+
 def test_recording_camera_set_includes_all_recordable_reach_cameras(app_model):
     for camera in app_model.reach_cameras:
         camera.is_enabled = True
@@ -213,7 +227,17 @@ def test_writer_finalization_waits_for_all_reach_cameras_and_pose(app_model):
     previous_inference = app_model._inference
     app_model._inference = inference
     app_model._abort_had_recording_started = True
-    app_model._set_session_recording_status(SessionRecordingStatus.STOPPING)
+    reservation = app_model._recording_session.begin_record(
+        app_model.project.short_id,
+        {},
+    )
+    assert reservation is not None
+    _, token = reservation
+    app_model._recording_session.transition(
+        SessionRecordingStatus.STOPPING,
+        expected=(SessionRecordingStatus.ARMING,),
+        token=token,
+    )
     camera_closures = {}
     try:
         with mock.patch.object(
@@ -227,7 +251,12 @@ def test_writer_finalization_waits_for_all_reach_cameras_and_pose(app_model):
                 app_model._handle_proc_msg(
                     (
                         SystemStatusMessageKind.CAMERA_RECORDING_CLOSED_FINISHED,
-                        (camera.camera_index, 10, app_model.project),
+                        (
+                            camera.camera_index,
+                            10,
+                            app_model.project,
+                            token.generation,
+                        ),
                     ),
                     cams_closed_finished=camera_closures,
                 )
@@ -237,7 +266,12 @@ def test_writer_finalization_waits_for_all_reach_cameras_and_pose(app_model):
             app_model._handle_proc_msg(
                 (
                     SystemStatusMessageKind.CAMERA_RECORDING_CLOSED_FINISHED,
-                    (camera.camera_index, 10, app_model.project),
+                    (
+                        camera.camera_index,
+                        10,
+                        app_model.project,
+                        token.generation,
+                    ),
                 ),
                 cams_closed_finished=camera_closures,
             )
@@ -247,7 +281,7 @@ def test_writer_finalization_waits_for_all_reach_cameras_and_pose(app_model):
             tuple(camera for camera in recording_cameras if camera in app_model.reach_cameras),
         )
         assert inference.waited_for == [(app_model.project.short_id, 10.0)]
-        complete.assert_called_once_with(app_model.project)
+        complete.assert_called_once_with(app_model.project, token=token)
     finally:
         app_model._inference = previous_inference
 
