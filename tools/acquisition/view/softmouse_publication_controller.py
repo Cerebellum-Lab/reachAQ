@@ -131,7 +131,9 @@ class SoftMousePublicationController(QObject):
         )
         self._set_status(f"{publication}; refreshing this computer's cache…")
         try:
-            self._app_model.refresh_animal_metadata()
+            self._app_model.request_animal_metadata_refresh(
+                "SoftMouse publication completed"
+            )
         except Exception as exc:
             logger.exception(
                 "SoftMouse publication succeeded but local cache refresh failed"
@@ -140,8 +142,8 @@ class SoftMousePublicationController(QObject):
                 f"Shared publication updated, but local cache refresh failed: {exc}"
             )
         else:
-            logger.info("SoftMouse manual sync complete: shared and local caches updated")
-            self._set_status(f"{publication}; local cache refreshed")
+            logger.info("SoftMouse manual sync complete: local cache refresh requested")
+            self._set_status(f"{publication}; local cache refresh started")
         self.running_changed.emit(False)
 
     def _set_status(self, value: str) -> None:

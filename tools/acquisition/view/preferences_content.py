@@ -543,6 +543,7 @@ class PreferencesContent(QWidget):
             )
         )
         form.addRow("", nightly)
+        self._softmouse_editable_controls = (name_field, nightly)
 
         buttons = QHBoxLayout()
         self._softmouse_refresh_button = QPushButton("Refresh local cache")
@@ -590,15 +591,10 @@ class PreferencesContent(QWidget):
         note.setWordWrap(True)
         form.addRow("", note)
 
-        def model_changed(name, value, _old):
-            if name == self._app_model.Props.ANIMAL_METADATA_STATUS:
-                self._softmouse_status.setText(value)
-            elif name == self._app_model.Props.ANIMAL_METADATA_PREVIEW:
-                self._show_animal_metadata_preview(value)
-            elif name == self._app_model.Props.SESSION_RECORDING_STATUS:
-                self._update_softmouse_button_states()
-
-        self._app_model.property_changed += model_changed
+        self._animal_metadata_model_callback = (
+            self._on_animal_metadata_model_changed
+        )
+        self._app_model.property_changed += self._animal_metadata_model_callback
         self._softmouse_publication_controller.status_changed.connect(
             self._softmouse_publication_status.setText
         )
@@ -610,7 +606,9 @@ class PreferencesContent(QWidget):
         tab.setLayout(form)
         def unsubscribe(*_args):
             try:
-                self._app_model.property_changed -= model_changed
+                self._app_model.property_changed -= (
+                    self._animal_metadata_model_callback
+                )
             except (KeyError, ValueError):
                 pass
         tab.destroyed.connect(unsubscribe)
@@ -619,6 +617,18 @@ class PreferencesContent(QWidget):
                 self._app_model.animal_metadata_preview
             )
         return tab
+
+    @invoke_method
+    def _on_animal_metadata_model_changed(self, name, value, _old):
+        if name == self._app_model.Props.ANIMAL_METADATA_STATUS:
+            self._softmouse_status.setText(value)
+        elif name == self._app_model.Props.ANIMAL_METADATA_PREVIEW:
+            self._show_animal_metadata_preview(value)
+        elif name in {
+            self._app_model.Props.SESSION_RECORDING_STATUS,
+            self._app_model.Props.ANIMAL_METADATA_REFRESH_BUSY,
+        }:
+            self._update_softmouse_button_states()
 
     def _show_animal_metadata_preview(self, preview):
         batch = preview.batch
@@ -643,8 +653,12 @@ class PreferencesContent(QWidget):
             is SessionRecordingStatus.READY
         )
         publishing = self._softmouse_publication_controller.is_running
-        self._softmouse_refresh_button.setEnabled(ready and not publishing)
-        self._softmouse_publish_button.setEnabled(ready and not publishing)
+        refreshing = self._app_model.animal_metadata_refresh_busy
+        enabled = ready and not publishing and not refreshing
+        self._softmouse_refresh_button.setEnabled(enabled)
+        self._softmouse_publish_button.setEnabled(enabled)
+        for control in self._softmouse_editable_controls:
+            control.setEnabled(enabled)
 
     def _apply_animal_metadata_preferences(self):
         try:
@@ -655,7 +669,7 @@ class PreferencesContent(QWidget):
     def _refresh_animal_metadata(self):
         try:
             self._app_model.apply_animal_metadata_preferences()
-            self._app_model.refresh_animal_metadata()
+            self._app_model.request_animal_metadata_refresh("manual button")
         except Exception as exc:
             self._softmouse_status.setText(f"Refresh failed: {exc}")
 

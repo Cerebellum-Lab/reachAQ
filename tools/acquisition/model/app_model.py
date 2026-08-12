@@ -369,6 +369,7 @@ class AppModel(ObservableObject):
         RFID_READER_STATUS = "rfid_reader_status"
         RFID_SCAN_RESULT = "rfid_scan_result"
         ANIMAL_METADATA_PREVIEW = "animal_metadata_preview"
+        ANIMAL_METADATA_REFRESH_BUSY = "animal_metadata_refresh_busy"
         TRIAL_PROTOCOL_STATE = "trial_protocol_state"
 
     def __init__(
@@ -561,6 +562,10 @@ class AppModel(ObservableObject):
         self._rfid_reader_status = None
         self._rfid_scan_result = None
         self._animal_metadata_refresh_thread = None
+        self._animal_metadata_refresh_lock = threading.Lock()
+        self._animal_metadata_refresh_busy = False
+        self._animal_metadata_refresh_deferred = False
+        self._animal_metadata_refresh_reason = ""
 
         self._selected_animal: Optional[AnimalSubject] = None
         self._attached_plan: Optional[TrainingPlan] = None
@@ -852,6 +857,11 @@ class AppModel(ObservableObject):
             self.recording_blockers,
             None,
         )
+        if status is SessionRecordingStatus.READY:
+            with self._animal_metadata_refresh_lock:
+                deferred = self._animal_metadata_refresh_deferred
+            if deferred:
+                self.request_animal_metadata_refresh("deferred after session")
 
     def _set_session_recording_status(
         self,
@@ -2435,6 +2445,11 @@ class AppModel(ObservableObject):
     def animal_metadata_preview(self):
         return self._animal_metadata_preview
 
+    @property
+    def animal_metadata_refresh_busy(self) -> bool:
+        with self._animal_metadata_refresh_lock:
+            return self._animal_metadata_refresh_busy
+
     def _set_animal_metadata_status(self, value: str) -> None:
         previous, self._animal_metadata_status = self._animal_metadata_status, value
         if value != previous:
@@ -2570,12 +2585,40 @@ class AppModel(ObservableObject):
             )
 
     def refresh_animal_metadata(self):
+        """Compatibility entry point; refresh work is always asynchronous."""
+        return self.request_animal_metadata_refresh("manual refresh")
+
+    def request_animal_metadata_refresh(
+        self,
+        reason: str,
+        *,
+        only_if_due: bool = False,
+    ) -> bool:
         service = self._animal_metadata_sync
         if service is None:
             raise RuntimeError("Configure a SoftMouse publication manifest first")
+        if self.session_recording_status is not SessionRecordingStatus.READY:
+            with self._animal_metadata_refresh_lock:
+                self._animal_metadata_refresh_deferred = True
+                self._animal_metadata_refresh_reason = str(reason)
+            self._set_animal_metadata_status("Refresh deferred until the session is Ready")
+            return False
+        with self._animal_metadata_refresh_lock:
+            if self._animal_metadata_refresh_busy:
+                self._animal_metadata_refresh_deferred = True
+                self._animal_metadata_refresh_reason = str(reason)
+                logger.info("SoftMouse refresh coalesced while another refresh is active")
+                return False
+            self._animal_metadata_refresh_busy = True
+            self._animal_metadata_refresh_deferred = False
+            self._animal_metadata_refresh_reason = str(reason)
+        self._on_property_changed(
+            self.Props.ANIMAL_METADATA_REFRESH_BUSY, True, False,
+        )
         logger.info(
-            "SoftMouse local-cache refresh requested: manifest=%s",
+            "SoftMouse local-cache refresh requested: manifest=%s reason=%s",
             service.manifest_path,
+            reason,
         )
         self._set_animal_metadata_status("Refreshing…")
         self._set_subsystem_status(
@@ -2584,18 +2627,69 @@ class AppModel(ObservableObject):
             reason="refreshing SoftMouse cache",
             required_for_recording=False,
         )
+        thread = threading.Thread(
+            target=self._run_animal_metadata_refresh,
+            args=(service, bool(only_if_due)),
+            name="softmouse-cache-refresh",
+            daemon=True,
+        )
+        self._animal_metadata_refresh_thread = thread
+        thread.start()
+        return True
+
+    def _run_animal_metadata_refresh(self, service, only_if_due: bool) -> None:
         try:
+            if only_if_due and not service.refresh_due():
+                self._finish_animal_metadata_refresh(None, None, skipped=True)
+                return
             result = service.refresh_now()
         except Exception as exc:
-            logger.exception("SoftMouse local-cache refresh failed")
-            self._set_animal_metadata_status(f"Refresh failed: {exc}")
+            self._finish_animal_metadata_refresh(None, exc)
+            return
+        self._finish_animal_metadata_refresh(result, None)
+
+    def _finish_animal_metadata_refresh(
+        self, result, error: Optional[BaseException], *, skipped: bool = False,
+    ) -> None:
+        if error is not None:
+            logger.error(
+                "SoftMouse local-cache refresh failed: %s",
+                error,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+            self._set_animal_metadata_status(f"Refresh failed: {error}")
             self._set_subsystem_status(
                 SubsystemId.ANIMAL_REGISTRY,
                 SubsystemState.FAILED,
-                error=str(exc),
+                error=str(error),
                 required_for_recording=False,
             )
-            raise
+        elif skipped:
+            self._set_animal_metadata_status("Already current; refresh not due")
+            self._set_subsystem_status(
+                SubsystemId.ANIMAL_REGISTRY,
+                SubsystemState.READY,
+                reason="local cache refresh not due",
+                required_for_recording=False,
+            )
+        else:
+            self._publish_animal_metadata_refresh_result(result)
+        with self._animal_metadata_refresh_lock:
+            self._animal_metadata_refresh_busy = False
+            rerun = self._animal_metadata_refresh_deferred
+            reason = self._animal_metadata_refresh_reason
+            self._animal_metadata_refresh_deferred = False
+        self._on_property_changed(
+            self.Props.ANIMAL_METADATA_REFRESH_BUSY, False, True,
+        )
+        if (
+            rerun
+            and not self._closing_event.is_set()
+            and self.session_recording_status is SessionRecordingStatus.READY
+        ):
+            self.request_animal_metadata_refresh(reason or "coalesced refresh")
+
+    def _publish_animal_metadata_refresh_result(self, result) -> None:
         batch = result.preview.batch
         status = (
             f"Imported {batch.accepted_rows} tagged animals; "
@@ -2636,30 +2730,21 @@ class AppModel(ObservableObject):
             result.registry_result.unchanged,
             batch.source_file_sha256,
         )
-        return result
 
     def _run_animal_metadata_catchup(self) -> None:
-        service = self._animal_metadata_sync
-        if service is None or self._closing_event.is_set():
-            return
         try:
-            if service.refresh_due():
-                self.refresh_animal_metadata()
+            self.request_animal_metadata_refresh(
+                "scheduled catch-up", only_if_due=True,
+            )
         except Exception as exc:
             logger.warning("Scheduled SoftMouse catch-up refresh failed: %s", exc)
 
     def _request_animal_metadata_catchup(self) -> None:
-        thread = self._animal_metadata_refresh_thread
-        if thread is not None and thread.is_alive():
-            return
-        thread = self._animal_metadata_refresh_thread = threading.Thread(
-            target=self._run_animal_metadata_catchup,
-            name="softmouse-cache-refresh",
-            daemon=True,
-        )
-        thread.start()
+        self._run_animal_metadata_catchup()
 
     def apply_animal_metadata_preferences(self) -> None:
+        if self.animal_metadata_refresh_busy:
+            raise RuntimeError("SoftMouse settings cannot change during a cache refresh")
         self._configure_animal_metadata_services()
         if self._rfid_metadata_controller is not None:
             self._rfid_metadata_controller.start()
@@ -5148,14 +5233,24 @@ class AppModel(ObservableObject):
 
         if animals_dir_path.is_dir():
             files = list(animals_dir_path.glob("*.json"))
-            animals: Dict[Path, AnimalSubject] = {
-                path: animal
-                for path, animal in (
-                    (path, AnimalSubject.from_file(path))
-                    for path in files
+            loaded = {}
+            skipped = []
+            for path in files:
+                try:
+                    animal = AnimalSubject.from_file(path)
+                    if animal is None:
+                        raise ValueError("unsupported or invalid animal schema")
+                except Exception as error:
+                    logger.exception("Skipping invalid animal file %s", path)
+                    skipped.append((path.name, str(error) or error.__class__.__name__))
+                    continue
+                loaded[path] = animal
+            animals: Dict[Path, AnimalSubject] = loaded
+            if skipped:
+                self.on_error(
+                    "Some animal files were skipped",
+                    "\n".join(f"{name}: {reason}" for name, reason in skipped),
                 )
-                if animal is not None
-            }
 
             loaded_by_path = animals
             paths_by_id = {}

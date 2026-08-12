@@ -1,4 +1,5 @@
 import logging
+import threading
 
 from autotrainer.core import AnimalSubject, ExternalAnimalRecord, ExternalIdentity
 from tools.acquisition.model.app_model_status import SessionRecordingStatus
@@ -130,18 +131,88 @@ def test_reader_health_is_visible_but_never_a_recording_blocker(app_model):
 
 def test_launch_catchup_refreshes_only_when_manifest_is_new(app_model):
     class Sync:
+        manifest_path = "manifest.json"
+
         def __init__(self, due):
             self.due = due
+            self.refresh_calls = 0
 
         def refresh_due(self):
             return self.due
 
-    calls = []
-    app_model.refresh_animal_metadata = lambda: calls.append("refresh")
-    app_model._animal_metadata_sync = Sync(False)
-    app_model._run_animal_metadata_catchup()
-    assert calls == []
+        def refresh_now(self):
+            self.refresh_calls += 1
+            raise RuntimeError("stop after proving the refresh was requested")
 
-    app_model._animal_metadata_sync = Sync(True)
+    not_due = Sync(False)
+    app_model._animal_metadata_sync = not_due
     app_model._run_animal_metadata_catchup()
+    app_model._animal_metadata_refresh_thread.join(2)
+    assert not_due.refresh_calls == 0
+    assert not app_model.animal_metadata_refresh_busy
+
+    due = Sync(True)
+    app_model._animal_metadata_sync = due
+    app_model._run_animal_metadata_catchup()
+    app_model._animal_metadata_refresh_thread.join(2)
+    assert due.refresh_calls == 1
+    assert not app_model.animal_metadata_refresh_busy
+
+
+def test_refresh_runs_off_caller_thread_and_coalesces_duplicates(app_model):
+    started = threading.Event()
+    release = threading.Event()
+    caller_thread = threading.get_ident()
+
+    class Sync:
+        manifest_path = "manifest.json"
+
+        def __init__(self):
+            self.thread_ids = []
+
+        def refresh_now(self):
+            self.thread_ids.append(threading.get_ident())
+            started.set()
+            assert release.wait(2)
+            raise RuntimeError("test completion")
+
+    sync = Sync()
+    app_model._animal_metadata_sync = sync
+
+    assert app_model.request_animal_metadata_refresh("first")
+    assert started.wait(2)
+    assert not app_model.request_animal_metadata_refresh("duplicate")
+    assert app_model.animal_metadata_refresh_busy
+    release.set()
+    first_thread = app_model._animal_metadata_refresh_thread
+    first_thread.join(2)
+    # A coalesced request is run exactly once after the first exits.
+    second_thread = app_model._animal_metadata_refresh_thread
+    second_thread.join(2)
+
+    assert len(sync.thread_ids) == 2
+    assert all(thread_id != caller_thread for thread_id in sync.thread_ids)
+    assert not app_model.animal_metadata_refresh_busy
+
+
+def test_refresh_is_deferred_until_session_is_ready(app_model):
+    calls = []
+
+    class Sync:
+        manifest_path = "manifest.json"
+
+        def refresh_now(self):
+            calls.append("refresh")
+            raise RuntimeError("test completion")
+
+    app_model._animal_metadata_sync = Sync()
+    app_model._set_session_recording_status(SessionRecordingStatus.RECORDING)
+
+    assert not app_model.request_animal_metadata_refresh("during session")
+    assert calls == []
+    assert not app_model.animal_metadata_refresh_busy
+
+    app_model._set_session_recording_status(SessionRecordingStatus.READY)
+    app_model._animal_metadata_refresh_thread.join(2)
     assert calls == ["refresh"]
+    assert not app_model.animal_metadata_refresh_busy

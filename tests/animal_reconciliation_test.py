@@ -102,3 +102,24 @@ def test_animal_load_refuses_duplicate_uuid_files(app_model):
 
     with pytest.raises(ValueError, match="Duplicate reachAQ animal UUID"):
         app_model._load_animals()
+
+
+def test_animal_load_skips_corrupt_file_without_modifying_it(app_model):
+    valid = app_model.add_animal("valid")
+    directory = Path(app_model._preferences.animal_location)
+    corrupt_path = directory / "corrupt.json"
+    corrupt_contents = b'{"schemaVersion": 5, "broken":'
+    corrupt_path.write_bytes(corrupt_contents)
+    errors = []
+    app_model.on_error = lambda title, detail: errors.append((title, detail))
+
+    app_model._load_animals()
+
+    assert [animal.id for animal in app_model.animals] == [valid.id]
+    assert corrupt_path.read_bytes() == corrupt_contents
+    assert errors == [
+        (
+            "Some animal files were skipped",
+            "corrupt.json: Expecting value: line 1 column 31 (char 30)",
+        )
+    ]

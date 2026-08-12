@@ -27,7 +27,7 @@ class AppModelStub:
     def __init__(self):
         self.refreshes = 0
 
-    def refresh_animal_metadata(self):
+    def request_animal_metadata_refresh(self, _reason):
         self.refreshes += 1
 
 
@@ -58,7 +58,7 @@ def test_successful_publication_refreshes_local_cache(qapp, tmp_path, caplog):
     _wait_for_process(controller)
 
     assert model.refreshes == 1
-    assert controller.status == "Published test snapshot; local cache refreshed"
+    assert controller.status == "Published test snapshot; local cache refresh started"
     assert any(
         "SoftMouse manual sync complete" in entry.getMessage()
         for entry in caplog.records
