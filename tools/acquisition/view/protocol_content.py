@@ -50,6 +50,10 @@ class ProtocolContent(ContentWidget):
         note.setWordWrap(True)
         note.setStyleSheet("color: #5f6772;")
         content_layout.addWidget(note)
+        self._analysis_status = QLabel()
+        self._analysis_status.setWordWrap(True)
+        self._analysis_status.setStyleSheet("color: #5f6772;")
+        content_layout.addWidget(self._analysis_status)
 
         table = self._table = QTableWidget()
         table.setColumnCount(len(self.COLUMNS))
@@ -79,6 +83,18 @@ class ProtocolContent(ContentWidget):
         self._updating = True
         try:
             rows = tuple(state.get("rows", ()))
+            analysis = state.get("analysis", {})
+            if not analysis.get("enabled"):
+                analysis_text = "Live trial analysis: Disabled"
+            else:
+                reason = analysis.get("send_block_reason")
+                analysis_text = (
+                    f"Live trial analysis: {analysis.get('pending_attempts', 0)} pending; "
+                    f"{analysis.get('estimate', 'estimating')} per 1 s tracking"
+                )
+                if reason:
+                    analysis_text += f" — {reason}"
+            self._analysis_status.setText(analysis_text)
             active = state.get("active_trial_id")
             completed = set(state.get("completed_trial_ids", ()))
             self._table.setRowCount(len(rows))
