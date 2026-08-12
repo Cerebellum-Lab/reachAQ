@@ -267,6 +267,19 @@ class SessionDataRecorder:
         """Retry a retained auxiliary snapshot without reacquiring any data."""
         return self._publish_pending_finalization(max_attempts=1)
 
+    @property
+    def has_pending_finalization(self) -> bool:
+        with self._lock:
+            return self._pending_finalization is not None
+
+    @property
+    def pending_finalization_session_id(self) -> Optional[str]:
+        with self._lock:
+            snapshot = self._pending_finalization
+            if snapshot is None:
+                return None
+            return snapshot["project"].short_id
+
     def _publish_pending_finalization(self, *, max_attempts: int):
         with self._lock:
             snapshot = self._pending_finalization
@@ -836,15 +849,17 @@ class SessionDataRecorder:
             return
         self._nidaq_stop.set()
         if thread is not threading.current_thread():
-            thread.join()
-        with self._lock:
-            if thread.is_alive():
+            thread.join(10.0)
+        if thread.is_alive():
+            with self._lock:
+                message = "NI-DAQ recorder thread did not stop within 10 seconds"
                 self._nidaq_stats["worker_failed"] = True
-                self._nidaq_stats["last_error"] = "NI-DAQ recorder thread did not stop"
+                self._nidaq_stats["last_error"] = message
                 self._nidaq_stats["first_error"] = (
-                    self._nidaq_stats["first_error"]
-                    or self._nidaq_stats["last_error"]
+                    self._nidaq_stats["first_error"] or message
                 )
+            raise RuntimeError(message)
+        with self._lock:
             self._close_nidaq_spool_locked()
         self._nidaq_thread = None
         self._nidaq_stop.clear()
@@ -922,14 +937,25 @@ class SessionDataRecorder:
                 count, read.source_wall_time, dtype=np.float64,
             ),
         }
-        for name, data in observations.items():
-            dataset = output[name]
-            dataset.resize((end,))
-            dataset[start:end] = data
-        dataset = output["values"]
-        dataset.resize((len(channel_names), end))
-        dataset[:, start:end] = values
-        output.flush()
+        dataset_names = (*observations, "values")
+        try:
+            for name, data in observations.items():
+                dataset = output[name]
+                dataset.resize((end,))
+                dataset[start:end] = data
+            dataset = output["values"]
+            dataset.resize((len(channel_names), end))
+            dataset[:, start:end] = values
+            output.flush()
+        except Exception:
+            # All datasets share one committed length. Restore it before the
+            # caller retries the same ring range.
+            for name in dataset_names:
+                dataset = output[name]
+                shape = (len(channel_names), start) if name == "values" else (start,)
+                dataset.resize(shape)
+            output.flush()
+            raise
         stats = self._nidaq_stats
         stats["sample_count"] += count
         stats["first_sample_index"] = (
@@ -1285,6 +1311,9 @@ class SessionDataRecorder:
             streams_dir / "laser.csv",
             logs_dir / "session.log",
             streams_dir / "alignment.json",
+            streams_dir / "camera_alignment.json",
+            Path(project.get_frame_timing_path()),
+            streams_dir / "nidaq.h5",
             *sorted((streams_dir / "tracking").glob("*.json")),
         )
         stream_manifest = {

@@ -113,7 +113,14 @@ def validate_closed_video(
                     f"{fallback_error.__class__.__name__}: {fallback_error}"
                 )
 
-    timestamp_count = _timestamp_row_count(timestamp_path)
+    try:
+        timestamp_count = _timestamp_row_count(timestamp_path)
+    except (OSError, UnicodeError) as error:
+        timestamp_count = 0
+        failure = failure or (
+            "camera timestamp file is unreadable: "
+            f"{error.__class__.__name__}: {error}"
+        )
     writer_count = int(writer_frame_count)
     writer_error_count = int(writer_diagnostics.get("errorCount", 0) or 0)
     writer_first_error = writer_diagnostics.get("firstError") or None

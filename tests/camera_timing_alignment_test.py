@@ -75,3 +75,8 @@ def test_alignment_rejects_unprovable_frame_identity(
             primary_frame_id=1,
             primary_fps=150,
         )
+    diagnostics = json.loads(
+        (tmp_path / "camera_alignment.json").read_text(encoding="utf-8")
+    )
+    assert diagnostics["synchronizationComplete"] is False
+    assert message in diagnostics["cameras"]["left"]["integrityError"]

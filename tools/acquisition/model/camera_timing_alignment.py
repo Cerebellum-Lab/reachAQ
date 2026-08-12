@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import csv
-import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Sequence, Tuple
 
 import pandas
+
+from tools.acquisition.model.atomic_session_io import (
+    atomic_publish_file,
+    atomic_write_json,
+)
 
 
 TIMESTAMP_FIELDS = (
@@ -93,7 +97,33 @@ def align_camera_timestamp_files(
     if not math.isfinite(primary_fps) or primary_fps <= 0:
         raise ValueError(f"primary camera FPS is invalid: {primary_fps}")
 
-    tables = tuple(_load_timestamp_table(source) for source in sources)
+    loaded = []
+    load_errors = {}
+    for source in sources:
+        try:
+            loaded.append(_load_timestamp_table(source))
+        except CameraTimestampIntegrityError as error:
+            load_errors[source.name] = str(error)
+            loaded.append(None)
+    if load_errors:
+        diagnostics = {
+            "primaryCamera": sources[0].name,
+            "primaryFrameCount": 0,
+            "synchronizationComplete": False,
+            "cameras": {
+                source.name: {
+                    "integrityError": load_errors.get(source.name),
+                }
+                for source in sources
+            },
+        }
+        atomic_write_json(diagnostics_path, diagnostics)
+        raise CameraTimestampIntegrityError(
+            "; ".join(
+                f"{name}: {error}" for name, error in load_errors.items()
+            )
+        )
+    tables = tuple(loaded)
     primary = tables[0]
     primary_ids = tuple(int(value) for value in primary["frame_id"])
     if primary_ids[0] != int(primary_frame_id):
@@ -142,42 +172,44 @@ def align_camera_timestamp_files(
         ),
         "utc_when",
     ]
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", newline="", encoding="utf-8") as stream:
-        writer = csv.DictWriter(stream, output_fields)
-        writer.writeheader()
-        for frame_id in primary_ids:
-            primary_row = primary.loc[frame_id]
-            primary_when = primary_row["frame_when"]
-            secondary_when = (
-                math.nan
-                if len(tables) < 2 or frame_id not in tables[1].index
-                else tables[1].loc[frame_id]["frame_when"]
-            )
-            recorded_frame_time = primary_row["frame_time"]
-            utc_when = (
-                float(recorded_frame_time)
-                if _finite(recorded_frame_time)
-                else first_frame_time + (frame_id - primary_first) * frame_duration
-            )
-            row = {
-                "frame_id": frame_id,
-                "frame_when": primary_when if _finite(primary_when) else "",
-                "frame_present_primary": 1,
-                "frame_present_secondary": 1 if _finite(secondary_when) else 0,
-                "utc_when": utc_when,
-            }
-            for table, field_name in zip(tables, camera_fields):
-                frame_when = (
+    def write_timing(path):
+        with path.open("w", newline="", encoding="utf-8") as stream:
+            writer = csv.DictWriter(stream, output_fields)
+            writer.writeheader()
+            for frame_id in primary_ids:
+                primary_row = primary.loc[frame_id]
+                primary_when = primary_row["frame_when"]
+                secondary_when = (
                     math.nan
-                    if frame_id not in table.index
-                    else table.loc[frame_id]["frame_when"]
+                    if len(tables) < 2 or frame_id not in tables[1].index
+                    else tables[1].loc[frame_id]["frame_when"]
                 )
-                row[f"frame_when_{field_name}"] = (
-                    frame_when if _finite(frame_when) else ""
+                recorded_frame_time = primary_row["frame_time"]
+                utc_when = (
+                    float(recorded_frame_time)
+                    if _finite(recorded_frame_time)
+                    else first_frame_time + (frame_id - primary_first) * frame_duration
                 )
-                row[f"frame_present_{field_name}"] = 1 if _finite(frame_when) else 0
-            writer.writerow(row)
+                row = {
+                    "frame_id": frame_id,
+                    "frame_when": primary_when if _finite(primary_when) else "",
+                    "frame_present_primary": 1,
+                    "frame_present_secondary": 1 if _finite(secondary_when) else 0,
+                    "utc_when": utc_when,
+                }
+                for table, field_name in zip(tables, camera_fields):
+                    frame_when = (
+                        math.nan
+                        if frame_id not in table.index
+                        else table.loc[frame_id]["frame_when"]
+                    )
+                    row[f"frame_when_{field_name}"] = (
+                        frame_when if _finite(frame_when) else ""
+                    )
+                    row[f"frame_present_{field_name}"] = 1 if _finite(frame_when) else 0
+                writer.writerow(row)
+
+    atomic_publish_file(output_path, write_timing)
 
     diagnostics = {
         "primaryCamera": sources[0].name,
@@ -185,9 +217,5 @@ def align_camera_timestamp_files(
         "synchronizationComplete": synchronization_complete,
         "cameras": camera_diagnostics,
     }
-    diagnostics_path.parent.mkdir(parents=True, exist_ok=True)
-    diagnostics_path.write_text(
-        json.dumps(diagnostics, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    atomic_write_json(diagnostics_path, diagnostics)
     return diagnostics

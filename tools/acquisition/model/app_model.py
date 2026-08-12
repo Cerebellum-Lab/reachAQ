@@ -950,6 +950,23 @@ class AppModel(ObservableObject):
         if self._recording_session.status != SessionRecordingStatus.READY:
             logger.warning("start_recording refused while %s", self._recording_session.status.value)
             return False
+        if self._session_data_recorder.has_pending_finalization:
+            pending_session = (
+                self._session_data_recorder.pending_finalization_session_id
+                or "previous session"
+            )
+            try:
+                self._session_data_recorder.retry_pending_finalization()
+            except Exception as error:
+                logger.exception(
+                    "Retained finalization retry failed for %s",
+                    pending_session,
+                )
+                self.on_error(
+                    "Recording unavailable",
+                    f"Finish saving {pending_session} before recording: {error}",
+                )
+                return False
         blockers = tuple(
             blocker
             for blocker in self.recording_blockers
@@ -6183,16 +6200,29 @@ class AppModel(ObservableObject):
         current_storage = dict(self._recording_session.storage_telemetry)
         current_storage["recording"] = storage_telemetry
         self._recording_session.set_storage_telemetry(current_storage)
+        stream_result = None
         try:
             self._pellet_cycles.snapshot_for_stop(
                 end_perf,
                 self._recording_session.boundary.end_wall_time,
             )
             stream_result = self._session_data_recorder.stop(end_perf)
+        except Exception as first_error:
+            logger.exception(
+                "Initial session auxiliary finalization failed; retrying retained data"
+            )
+            try:
+                stream_result = self._session_data_recorder.retry_pending_finalization()
+            except Exception as retry_error:
+                logger.exception("Failed to save retained session auxiliary streams")
+                self.on_error("Session stream save failed", str(retry_error))
+                self._recording_session.add_data_error(
+                    "auxiliary stream finalization remains pending: "
+                    f"{first_error}"
+                )
+        if isinstance(stream_result, dict):
             camera_alignment = (
-                None
-                if not isinstance(stream_result, dict)
-                else stream_result.get("cameraNidaqAlignment")
+                stream_result.get("cameraNidaqAlignment")
             )
             matched_sample_index = (
                 None
@@ -6205,21 +6235,14 @@ class AppModel(ObservableObject):
                         matched_sample_index
                     )
                 )
-            if isinstance(stream_result, dict):
-                self._recording_session.set_stream_result(stream_result)
-                if not self._recording_session.data_complete:
-                    message = (
-                        "Session auxiliary data is incomplete: "
-                        + "; ".join(self._recording_session.data_errors)
-                    )
-                    logger.error(message)
-                    self.on_error("Session data incomplete", message)
-        except Exception as err:
-            logger.exception("Failed to save session auxiliary streams: %s", err)
-            self.on_error("Session stream save failed", str(err))
-            self._recording_session.add_data_error(
-                f"auxiliary stream save failed: {err}"
-            )
+            self._recording_session.set_stream_result(stream_result)
+            if not self._recording_session.data_complete:
+                message = (
+                    "Session auxiliary data is incomplete: "
+                    + "; ".join(self._recording_session.data_errors)
+                )
+                logger.error(message)
+                self.on_error("Session data incomplete", message)
         self._request_session_end_home("stop")
         self._recording_session.analysis_started_perf = time.perf_counter()
         self._begin_subsystem_start(
@@ -6246,7 +6269,7 @@ class AppModel(ObservableObject):
                 SubsystemState.FAILED,
                 error=f"metadata save failed: {exc}",
             )
-            raise
+            logger.exception("Initial stopped-session metadata save failed")
         if not transitioned:
             return
         if self._intertrial_analysis.is_idle():

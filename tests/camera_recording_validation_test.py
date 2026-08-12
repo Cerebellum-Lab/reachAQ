@@ -49,3 +49,19 @@ def test_missing_or_zero_frame_video_marks_source_incomplete(tmp_path, monkeypat
         writer_frame_count=0,
     )
     assert zero.failure == "closed video contains zero decodable frames"
+
+
+def test_unreadable_timestamp_file_marks_source_incomplete(tmp_path, monkeypatch):
+    video = tmp_path / "left.mp4"
+    timestamps = tmp_path / "left.txt"
+    video.write_bytes(b"closed-video")
+    timestamps.write_bytes(b"\xff\xfe")
+    monkeypatch.setattr(
+        validation_module,
+        "_ffprobe_frame_count",
+        lambda *_args, **_kwargs: 2,
+    )
+
+    result = validate_closed_video(video, timestamps, writer_frame_count=2)
+
+    assert "timestamp file is unreadable" in result.failure
