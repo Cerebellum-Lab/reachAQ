@@ -1,5 +1,4 @@
 import threading
-import time
 
 import pytest
 
@@ -116,6 +115,18 @@ def test_analysis_uses_existing_tracking_for_reach_and_consumption():
     assert result.reach_count == 1
     assert result.success_count == 1
     assert result.consumption_count == 1
+
+
+def test_failed_reach_recommendation_has_one_average_per_axis():
+    distances = (30, 24, 18, 12, 5, 9, 18, 25)
+    result = analyze_tracking_window(
+        request([sample(index, distance) for index, distance in enumerate(distances)])
+    )
+
+    assert result.outcome is TrialOutcome.FAILURE
+    assert result.recommended_shift is not None
+    assert len(result.recommended_shift) == 3
+    assert result.recommended_shift == pytest.approx((5.0, 0.0, 0.0))
 
 
 def test_short_internal_gaps_are_interpolated_but_long_gaps_are_reported():

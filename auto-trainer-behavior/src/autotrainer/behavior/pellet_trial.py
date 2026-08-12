@@ -4,12 +4,22 @@ from __future__ import annotations
 
 import dataclasses
 import enum
-import math
+import functools
+import threading
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, FrozenSet, Iterable, Optional, Tuple
+from typing import Any, Dict, FrozenSet, Optional, Tuple
 
-from autotrainer.core.reach_event import ReachEventMethod, ReachEventOutcome
+
+def _ledger_locked(method):
+    """Serialize one short, in-memory ledger operation."""
+
+    @functools.wraps(method)
+    def locked(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return locked
 
 
 class AttemptAssignmentPolicy(str, enum.Enum):
@@ -187,6 +197,7 @@ class PelletTrialLedger:
         session_id: str,
         configuration: Optional[TrialAccountingConfiguration] = None,
     ):
+        self._lock = threading.RLock()
         self.session_id = str(session_id)
         self.configuration = configuration or TrialAccountingConfiguration()
         self._attempts = []
@@ -205,16 +216,19 @@ class PelletTrialLedger:
         }
 
     @property
+    @_ledger_locked
     def active_attempt(self) -> Optional[PelletTrialAttempt]:
         if self._active_index is None:
             return None
         return self._attempts[self._active_index]
 
     @property
+    @_ledger_locked
     def attempts(self) -> Tuple[PelletTrialAttempt, ...]:
         return tuple(self._attempts)
 
     @property
+    @_ledger_locked
     def planned_trial_id(self) -> int:
         """Logical row that the next send attempt will use after retries."""
         return int(
@@ -223,6 +237,7 @@ class PelletTrialLedger:
             else self._next_trial_id
         )
 
+    @_ledger_locked
     def begin_send(
         self,
         perf_time: float,
@@ -274,6 +289,7 @@ class PelletTrialLedger:
         self._retry_attempt_id = 0
         return attempt
 
+    @_ledger_locked
     def acknowledge_presentation(
         self,
         perf_time: float,
@@ -295,6 +311,7 @@ class PelletTrialLedger:
             send_ack_wall_time=float(wall_time),
         )
 
+    @_ledger_locked
     def finalize(
         self,
         outcome: TrialOutcome,
@@ -336,6 +353,7 @@ class PelletTrialLedger:
             self._retry_attempt_id = finalized.attempt_id
         return finalized
 
+    @_ledger_locked
     def close_active_for_analysis(
         self,
         perf_time: float,
@@ -370,6 +388,7 @@ class PelletTrialLedger:
             self._retry_attempt_id = closed.attempt_id
         return closed
 
+    @_ledger_locked
     def finalize_pending(
         self,
         trial_id: Optional[int],
@@ -480,6 +499,7 @@ class PelletTrialLedger:
             return finalized
         raise KeyError(f"Unknown trial attempt {trial_id}.{attempt_id}")
 
+    @_ledger_locked
     def annotate_pending_tracking(
         self,
         trial_id: Optional[int],
@@ -515,6 +535,7 @@ class PelletTrialLedger:
             return updated
         raise KeyError(f"Unknown trial attempt {trial_id}.{attempt_id}")
 
+    @_ledger_locked
     def finalize_hardware_error(
         self,
         kind: HardwareErrorKind,
@@ -523,7 +544,7 @@ class PelletTrialLedger:
         *,
         error: str,
     ) -> PelletTrialAttempt:
-        attempt = self._require_active()
+        self._require_active()
         kind = HardwareErrorKind(kind)
         finalized = self._replace_active(
             finalized_perf_time=float(perf_time),
@@ -541,133 +562,7 @@ class PelletTrialLedger:
             self._retry_attempt_id = finalized.attempt_id
         return finalized
 
-    def reconcile_analysis(
-        self,
-        result,
-        *,
-        recording_start_perf_time: float,
-        frame_rate: float,
-        finalized_perf_time: float,
-        finalized_wall_time: float,
-        tone_references: Iterable[Dict[str, Any]] = (),
-        laser_references: Iterable[Dict[str, Any]] = (),
-    ) -> Tuple[PelletTrialAttempt, ...]:
-        """Map session-frame analysis events into physical attempt windows."""
-        if frame_rate <= 0:
-            raise ValueError("Analysis reconciliation requires a positive frame rate")
-        reach_events = tuple(result.reach_events)
-        other_events = tuple(result.other_events)
-        all_events = (*reach_events, *other_events)
-        tones = tuple(tone_references)
-        lasers = tuple(laser_references)
-        pending = tuple(
-            attempt
-            for attempt in self._attempts
-            if attempt.outcome is TrialOutcome.PENDING_ANALYSIS
-        )
-        finalized = []
-        for pending_index, attempt in enumerate(pending):
-            window_start = attempt.send_perf_time
-            next_start = (
-                pending[pending_index + 1].send_perf_time
-                if pending_index + 1 < len(pending)
-                else math.inf
-            )
-            window_end = min(
-                next_start,
-                attempt.capture_end_perf_time
-                if attempt.capture_end_perf_time is not None
-                else math.inf,
-            )
-
-            def event_perf(event) -> float:
-                return recording_start_perf_time + float(event.init) / frame_rate
-
-            indexed_reaches = tuple(
-                (index, event)
-                for index, event in enumerate(reach_events)
-                if window_start <= event_perf(event) < window_end
-            )
-            assigned_events = tuple(
-                event
-                for event in all_events
-                if window_start <= event_perf(event) < window_end
-            )
-            consumed = sum(
-                event.outcome == ReachEventOutcome.EATEN
-                for event in assigned_events
-            )
-            successful = sum(
-                event.outcome == ReachEventOutcome.EATEN
-                and event.method == ReachEventMethod.RIGHT_HAND
-                for event in assigned_events
-            )
-            reach_count = len(indexed_reaches)
-            if not attempt.is_presented:
-                outcome = TrialOutcome.INCOMPLETE
-                error = "pellet send was not acknowledged as presented"
-            elif consumed:
-                outcome = TrialOutcome.SUCCESS
-                error = ""
-            elif reach_count:
-                outcome = TrialOutcome.FAILURE
-                error = ""
-            else:
-                # Absence of a reach is not evidence that the pellet itself was
-                # absent. PELLET_MISSING is reserved for direct live tracking
-                # evidence supplied by the pellet-state tracker.
-                outcome = TrialOutcome.NO_REACH
-                error = ""
-
-            finalized.append(self.finalize_pending(
-                attempt.trial_id,
-                attempt.attempt_id,
-                outcome,
-                finalized_perf_time,
-                finalized_wall_time,
-                error=error,
-                reach_count=reach_count,
-                success_count=successful,
-                consumption_count=consumed,
-                reach_event_indices=tuple(index for index, _ in indexed_reaches),
-                tone_references=self._references_in_window(
-                    tones, window_start, window_end
-                ),
-                laser_references=self._references_in_window(
-                    lasers, window_start, window_end
-                ),
-            ))
-        finalized_operation_ids = {
-            attempt.operation_id for attempt in finalized
-        }
-        self._reindex_analyzed_attempts()
-        assigned_reaches = sum(attempt.reach_count for attempt in self._attempts)
-        assigned_successes = sum(
-            attempt.success_count for attempt in self._attempts
-        )
-        assigned_consumed = sum(
-            attempt.consumption_count for attempt in self._attempts
-        )
-        self._analysis_counts = {
-            "reaches": int(result.total_reaches),
-            "successful_reaches": int(result.successful_reaches),
-            "pellets_consumed": int(result.food_consumed),
-            "unassigned_reaches": max(
-                0, int(result.total_reaches) - assigned_reaches
-            ),
-            "unassigned_successful_reaches": max(
-                0, int(result.successful_reaches) - assigned_successes
-            ),
-            "unassigned_pellets_consumed": max(
-                0, int(result.food_consumed) - assigned_consumed
-            ),
-        }
-        return tuple(
-            attempt
-            for attempt in self._attempts
-            if attempt.operation_id in finalized_operation_ids
-        )
-
+    @_ledger_locked
     def finalize_pending_without_analysis(
         self,
         perf_time: float,
@@ -696,6 +591,7 @@ class PelletTrialLedger:
             )
         )
 
+    @_ledger_locked
     def count(self, basis: Optional[TrialCountBasis] = None) -> int:
         basis = TrialCountBasis(basis or self.configuration.count_basis)
         grouped = self._grouped_attempts()
@@ -736,6 +632,7 @@ class PelletTrialLedger:
             total += int(qualifies)
         return total
 
+    @_ledger_locked
     def summary(self) -> dict:
         return {
             "physical_attempts": len(self._attempts),
@@ -759,6 +656,7 @@ class PelletTrialLedger:
             **self._analysis_counts,
         }
 
+    @_ledger_locked
     def to_records(self) -> Tuple[dict, ...]:
         return tuple(attempt.to_dict() for attempt in self._attempts)
 

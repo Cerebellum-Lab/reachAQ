@@ -1,11 +1,4 @@
 import pytest
-from types import SimpleNamespace
-
-from autotrainer.core.reach_event import (
-    ReachEvent,
-    ReachEventMethod,
-    ReachEventOutcome,
-)
 
 from autotrainer.behavior.pellet_trial import (
     AttemptAssignmentPolicy,
@@ -287,29 +280,6 @@ def test_analysis_fields_are_persisted_on_pending_attempt():
     assert record["recommended_shift"]["z"] == -0.1
 
 
-def test_presented_attempt_without_reach_is_not_classified_as_missing_pellet():
-    ledger = PelletTrialLedger("session001")
-    ledger.begin_send(101.0, 1001.0)
-    ledger.acknowledge_presentation(101.1, 1001.1)
-    ledger.close_active_for_analysis(102.0, 1002.0)
-    result = SimpleNamespace(
-        reach_events=(),
-        other_events=(),
-        total_reaches=0,
-        successful_reaches=0,
-        food_consumed=0,
-    )
-    finalized = ledger.reconcile_analysis(
-        result,
-        recording_start_perf_time=100.0,
-        frame_rate=150.0,
-        finalized_perf_time=103.0,
-        finalized_wall_time=1003.0,
-    )
-    assert finalized[0].outcome is TrialOutcome.NO_REACH
-    assert finalized[0].outcome is not TrialOutcome.PELLET_MISSING
-
-
 def test_unscored_completed_cycle_counts_without_becoming_scored():
     ledger = PelletTrialLedger("session001")
     ledger.begin_send(1.0, 11.0)
@@ -317,56 +287,3 @@ def test_unscored_completed_cycle_counts_without_becoming_scored():
     ledger.finalize(TrialOutcome.UNSCORED, 2.0, 12.0)
     assert ledger.count(TrialCountBasis.COMPLETED) == 1
     assert ledger.count(TrialCountBasis.SCORED) == 0
-
-
-def test_session_frame_analysis_is_reconciled_to_attempt_windows_once():
-    ledger = PelletTrialLedger("session001")
-    ledger.begin_send(101.0, 1001.0, operation_id="send-1")
-    ledger.acknowledge_presentation(101.1, 1001.1)
-    ledger.close_active_for_analysis(103.0, 1003.0, retry=True)
-    ledger.begin_send(103.0, 1003.0, operation_id="send-2")
-    ledger.acknowledge_presentation(103.1, 1003.1)
-    ledger.close_active_for_analysis(105.0, 1005.0)
-    result = SimpleNamespace(
-        reach_events=(
-            ReachEvent(
-                init=150,
-                end=165,
-                method=ReachEventMethod.RIGHT_HAND,
-                outcome=ReachEventOutcome.MISSED,
-            ),
-            ReachEvent(
-                init=600,
-                end=620,
-                method=ReachEventMethod.RIGHT_HAND,
-                outcome=ReachEventOutcome.EATEN,
-            ),
-        ),
-        other_events=(),
-        total_reaches=2,
-        successful_reaches=1,
-        food_consumed=1,
-    )
-
-    finalized = ledger.reconcile_analysis(
-        result,
-        recording_start_perf_time=100.0,
-        frame_rate=150.0,
-        finalized_perf_time=106.0,
-        finalized_wall_time=1006.0,
-        tone_references=({"eventPerfTime": 101.5, "channel": "tone1"},),
-        laser_references=({"perf_time": 103.5, "channel": "left"},),
-    )
-
-    assert [attempt.attempt_label for attempt in finalized] == ["1.1", "1.2"]
-    assert finalized[0].outcome is TrialOutcome.FAILURE
-    assert finalized[0].reach_event_indices == (0,)
-    assert finalized[0].tone_references[0]["channel"] == "tone1"
-    assert finalized[1].outcome is TrialOutcome.SUCCESS
-    assert finalized[1].reach_event_indices == (1,)
-    assert finalized[1].laser_references[0]["channel"] == "left"
-    assert ledger.summary()["scored_trials"] == 1
-    assert ledger.summary()["reaches"] == 2
-    assert ledger.summary()["unassigned_reaches"] == 0
-    with pytest.raises(RuntimeError, match="not pending analysis"):
-        ledger.finalize_pending(1, 1, TrialOutcome.SUCCESS, 107.0, 1007.0)

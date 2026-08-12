@@ -222,42 +222,6 @@ class PelletCycleController:
         )
         return finalized
 
-    def reconcile_analysis(
-        self,
-        project,
-        result,
-        *,
-        recording_start_perf_time: float,
-        frame_rate: float,
-        finalized_perf_time: float,
-        finalized_wall_time: float,
-        tone_references=(),
-        laser_references=(),
-    ):
-        ledger = self._require_ledger()
-        finalized = ledger.reconcile_analysis(
-            result,
-            recording_start_perf_time=recording_start_perf_time,
-            frame_rate=frame_rate,
-            finalized_perf_time=finalized_perf_time,
-            finalized_wall_time=finalized_wall_time,
-            tone_references=tone_references,
-            laser_references=laser_references,
-        )
-        for attempt in finalized:
-            self._session_api.trial_ended(attempt)
-            if attempt.logical_trial_complete:
-                self._protocol_runner.record_trial_outcome(
-                    attempt.attempt_label,
-                    attempt.outcome,
-                )
-        self._session_data_recorder.persist_trial_ledger(
-            project,
-            ledger.to_records(),
-            ledger.summary(),
-        )
-        return finalized
-
     def finalize_intertrial_result(
         self,
         project,
