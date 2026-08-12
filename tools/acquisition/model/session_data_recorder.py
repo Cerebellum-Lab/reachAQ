@@ -8,6 +8,7 @@ import math
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Iterable, Optional, Tuple
@@ -23,6 +24,45 @@ from tools.acquisition.model.atomic_session_io import (
     atomic_write_json,
     file_manifest_entry,
 )
+
+
+@dataclass(frozen=True)
+class _NidaqSpoolSnapshot:
+    path: Path
+    channel_names: Tuple[str, ...]
+    sample_rate_hz: float
+    sample_count: int
+    first_sample_index: Optional[int]
+    last_sample_index: Optional[int]
+    first_perf_time: Optional[float]
+    last_perf_time: Optional[float]
+    gap_count: int
+    overrun_samples: int
+    first_error: Optional[str]
+    last_error: Optional[str]
+    error_count: int
+    worker_failed: bool
+
+
+@dataclass(frozen=True)
+class _NidaqPerfSummary:
+    count: int
+    first: Optional[float]
+    last: Optional[float]
+
+    def __len__(self):
+        return self.count
+
+    def __getitem__(self, index):
+        if not self.count:
+            raise IndexError(index)
+        if index in (0, -self.count):
+            return self.first
+        if index in (-1, self.count - 1):
+            return self.last
+        raise IndexError(
+            "bounded NI-DAQ timeline exposes only its first and last sample"
+        )
 
 
 _PELLET_STIMULUS_CHANNEL_NAMES = ("tone1", "tone2", "stim2", "stim3")
@@ -74,8 +114,12 @@ class SessionDataRecorder:
         self._device_events_since_start = 0
         self._laser_rows = []
         self._log_rows = []
-        self._nidaq_chunks = []
+        self._nidaq_chunks = []  # compatibility-only; production uses a spool
         self._nidaq_last_index = None
+        self._nidaq_scratch = None
+        self._nidaq_spool = None
+        self._nidaq_spool_path: Optional[Path] = None
+        self._nidaq_stats = self._new_nidaq_stats()
         self._nidaq_stop = threading.Event()
         self._nidaq_thread: Optional[threading.Thread] = None
         self._source_manifest = ()
@@ -121,6 +165,8 @@ class SessionDataRecorder:
             self._log_rows = []
             self._nidaq_chunks = []
             self._nidaq_last_index = None
+            self._nidaq_scratch = None
+            self._nidaq_stats = self._new_nidaq_stats()
             self._source_manifest = tuple(source_manifest)
             self._source_results = {}
             self._trial_records = ()
@@ -154,6 +200,8 @@ class SessionDataRecorder:
             self._start_perf = float(perf_time)
             self._start_wall = float(wall_time)
             self._boundary = boundary
+            if self._nidaq_spool is None:
+                self._open_nidaq_spool_locked()
             self._device_events_since_start = sum(
                 1
                 for row in self._device_rows
@@ -180,7 +228,7 @@ class SessionDataRecorder:
             )
             laser_rows = tuple(self._laser_rows)
             log_rows = tuple(self._log_rows)
-            nidaq_chunks = tuple(self._nidaq_chunks)
+            nidaq_chunks = self._snapshot_nidaq_locked()
             timing_plan = self._nidaq_monitor.timing_plan
             source_manifest = self._source_manifest
             source_results = dict(self._source_results)
@@ -231,6 +279,9 @@ class SessionDataRecorder:
                 continue
             with self._lock:
                 if self._pending_finalization is snapshot:
+                    nidaq_source = snapshot.get("nidaq_chunks")
+                    if isinstance(nidaq_source, _NidaqSpoolSnapshot):
+                        nidaq_source.path.unlink(missing_ok=True)
                     self._pending_finalization = None
                     self._clear_locked()
             return result
@@ -242,8 +293,16 @@ class SessionDataRecorder:
     def abort(self) -> None:
         self._stop_nidaq_thread()
         with self._lock:
+            spool_path = self._nidaq_spool_path
+            pending = self._pending_finalization
+            if pending is not None:
+                pending_source = pending.get("nidaq_chunks")
+                if isinstance(pending_source, _NidaqSpoolSnapshot):
+                    spool_path = pending_source.path
             self._pending_finalization = None
             self._clear_locked()
+        if spool_path is not None:
+            spool_path.unlink(missing_ok=True)
 
     def close(self) -> None:
         self.abort()
@@ -387,6 +446,10 @@ class SessionDataRecorder:
         self._log_rows = []
         self._nidaq_chunks = []
         self._nidaq_last_index = None
+        self._nidaq_scratch = None
+        self._nidaq_spool = None
+        self._nidaq_spool_path = None
+        self._nidaq_stats = self._new_nidaq_stats()
         self._source_manifest = ()
         self._source_results = {}
         self._trial_records = ()
@@ -579,17 +642,16 @@ class SessionDataRecorder:
     def _copy_nidaq_once(self) -> None:
         try:
             ring = self._nidaq_monitor.sample_ring
-            destination = np.empty(
-                (max(1, len(ring.channel_names)), ring.capacity),
-                dtype=np.float32,
-            )
+            destination = self._nidaq_scratch
+            expected_shape = (max(1, len(ring.channel_names)), ring.capacity)
+            if destination is None or destination.shape != expected_shape:
+                destination = np.empty(expected_shape, dtype=np.float32)
+                self._nidaq_scratch = destination
             read = ring.copy_since(self._nidaq_last_index, destination)
             if read is None:
                 return
-            self._nidaq_last_index = read.end_sample_index
             if read.sample_count <= 0:
                 return
-            values = destination[:len(ring.channel_names), :read.sample_count].copy()
             indices = np.arange(
                 read.start_sample_index,
                 read.end_sample_index,
@@ -601,21 +663,23 @@ class SessionDataRecorder:
             perf_times = read.perf_times(indices)
             wall_times = read.wall_times(indices)
             with self._lock:
-                if self._armed:
-                    self._nidaq_chunks.append((
+                if self._armed and self._nidaq_spool is not None:
+                    self._append_nidaq_spool_locked(
                         indices,
                         perf_times,
                         wall_times,
-                        values,
+                        destination[:len(ring.channel_names), :read.sample_count],
                         tuple(ring.channel_names),
-                        read.sample_rate_hz,
-                        read.epoch,
-                        read.gap_count,
-                        read.overrun_samples,
-                        read.source_perf_time,
-                        read.source_wall_time,
-                    ))
-        except Exception:
+                        read,
+                    )
+                    self._nidaq_last_index = read.end_sample_index
+        except Exception as error:
+            with self._lock:
+                message = f"{type(error).__name__}: {error}"
+                stats = self._nidaq_stats
+                stats["first_error"] = stats["first_error"] or message
+                stats["last_error"] = message
+                stats["error_count"] += 1
             logging.getLogger(__name__).exception("Unable to collect NI-DAQ session samples")
 
     def _stop_nidaq_thread(self) -> None:
@@ -625,8 +689,131 @@ class SessionDataRecorder:
         self._nidaq_stop.set()
         if thread is not threading.current_thread():
             thread.join()
+        with self._lock:
+            if thread.is_alive():
+                self._nidaq_stats["worker_failed"] = True
+                self._nidaq_stats["last_error"] = "NI-DAQ recorder thread did not stop"
+                self._nidaq_stats["first_error"] = (
+                    self._nidaq_stats["first_error"]
+                    or self._nidaq_stats["last_error"]
+                )
+            self._close_nidaq_spool_locked()
         self._nidaq_thread = None
         self._nidaq_stop.clear()
+
+    @staticmethod
+    def _new_nidaq_stats():
+        return {
+            "sample_count": 0,
+            "first_sample_index": None,
+            "last_sample_index": None,
+            "first_perf_time": None,
+            "last_perf_time": None,
+            "gap_count": 0,
+            "overrun_samples": 0,
+            "first_error": None,
+            "last_error": None,
+            "error_count": 0,
+            "worker_failed": False,
+        }
+
+    def _open_nidaq_spool_locked(self) -> None:
+        ring = self._nidaq_monitor.sample_ring
+        if not tuple(ring.channel_names):
+            return
+        if self._project is None or self._metadata_generation_id is None:
+            return
+        session_dir = Path(self._project.get_session_path().location)
+        path = (
+            session_dir / ".staging" / self._metadata_generation_id
+            / "streams" / "nidaq_capture.h5"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        output = h5py.File(path, "w")
+        channel_count = len(ring.channel_names)
+        for name, dtype in (
+            ("sample_index", np.int64),
+            ("perf_time", np.float64),
+            ("wall_time", np.float64),
+            ("epoch", np.uint64),
+            ("block_observation_perf_time", np.float64),
+            ("block_observation_wall_time", np.float64),
+        ):
+            output.create_dataset(name, shape=(0,), maxshape=(None,), dtype=dtype,
+                                  chunks=True)
+        output.create_dataset(
+            "values",
+            shape=(channel_count, 0),
+            maxshape=(channel_count, None),
+            dtype=np.float32,
+            chunks=(channel_count, max(1, min(ring.capacity, 65536))),
+        )
+        output.attrs["channel_names"] = tuple(ring.channel_names)
+        output.attrs["sample_rate_hz"] = float(ring.sample_rate_hz)
+        self._nidaq_spool = output
+        self._nidaq_spool_path = path
+
+    def _append_nidaq_spool_locked(
+        self, indices, perf_times, wall_times, values, channel_names, read,
+    ) -> None:
+        output = self._nidaq_spool
+        if output is None:
+            return
+        count = len(indices)
+        start = int(output["sample_index"].shape[0])
+        end = start + count
+        observations = {
+            "sample_index": indices,
+            "perf_time": perf_times,
+            "wall_time": wall_times,
+            "epoch": np.full(count, read.epoch, dtype=np.uint64),
+            "block_observation_perf_time": np.full(
+                count, read.source_perf_time, dtype=np.float64,
+            ),
+            "block_observation_wall_time": np.full(
+                count, read.source_wall_time, dtype=np.float64,
+            ),
+        }
+        for name, data in observations.items():
+            dataset = output[name]
+            dataset.resize((end,))
+            dataset[start:end] = data
+        dataset = output["values"]
+        dataset.resize((len(channel_names), end))
+        dataset[:, start:end] = values
+        output.flush()
+        stats = self._nidaq_stats
+        stats["sample_count"] += count
+        stats["first_sample_index"] = (
+            int(indices[0]) if stats["first_sample_index"] is None
+            else stats["first_sample_index"]
+        )
+        stats["last_sample_index"] = int(indices[-1])
+        stats["first_perf_time"] = (
+            float(perf_times[0]) if stats["first_perf_time"] is None
+            else stats["first_perf_time"]
+        )
+        stats["last_perf_time"] = float(perf_times[-1])
+        stats["gap_count"] = max(stats["gap_count"], int(read.gap_count))
+        stats["overrun_samples"] += int(read.overrun_samples)
+
+    def _close_nidaq_spool_locked(self) -> None:
+        output, self._nidaq_spool = self._nidaq_spool, None
+        if output is not None:
+            output.flush()
+            output.close()
+
+    def _snapshot_nidaq_locked(self):
+        if self._nidaq_spool_path is None:
+            return tuple(self._nidaq_chunks)
+        ring = self._nidaq_monitor.sample_ring
+        stats = self._nidaq_stats
+        return _NidaqSpoolSnapshot(
+            path=self._nidaq_spool_path,
+            channel_names=tuple(ring.channel_names),
+            sample_rate_hz=float(ring.sample_rate_hz),
+            **stats,
+        )
 
     @staticmethod
     def _write_session(
@@ -670,11 +857,8 @@ class SessionDataRecorder:
         log_rows = tuple(
             row for row in log_rows if start_perf <= row[0] <= end_perf
         )
-        nidaq_perf = tuple(
-            float(sample_perf)
-            for chunk in nidaq_chunks
-            for sample_perf in chunk[1]
-            if start_perf <= sample_perf <= end_perf
+        nidaq_perf = SessionDataRecorder._nidaq_perf_values(
+            nidaq_chunks, start_perf, end_perf,
         )
         camera_nidaq_alignment = SessionDataRecorder._match_camera_nidaq_edge(
             boundary,
@@ -816,10 +1000,33 @@ class SessionDataRecorder:
             generation_id=metadata_generation_id,
             validate=SessionDataRecorder._validate_h5,
         )
+        source_results = {} if source_results is None else dict(source_results)
+        nidaq_health = SessionDataRecorder._nidaq_stream_health(
+            nidaq_chunks,
+            start_perf=start_perf,
+            end_perf=end_perf,
+            saved_perf=nidaq_perf,
+        )
+        for source in source_manifest:
+            source_id = str(source.get("id", ""))
+            if not source_id.startswith("nidaq."):
+                continue
+            existing = dict(source_results.get(source_id, {}))
+            existing_warnings = tuple(existing.get("warnings", ()))
+            existing["warnings"] = tuple(dict.fromkeys(
+                (*existing_warnings, *nidaq_health["warnings"])
+            ))
+            existing["diagnostics"] = {
+                **nidaq_health["diagnostics"],
+                **dict(existing.get("diagnostics", {})),
+            }
+            if not existing.get("failure"):
+                existing["failure"] = nidaq_health["failure"]
+            source_results[source_id] = existing
         finalized_sources = SessionDataRecorder._finalize_source_manifest(
             session_dir,
             source_manifest,
-            {} if source_results is None else source_results,
+            source_results,
             start_perf=start_perf,
             end_perf=end_perf,
             device_perf=tuple(row[0] for row in device_rows),
@@ -846,11 +1053,11 @@ class SessionDataRecorder:
                         else f": {source['failure']}"
                     )
                 )
-            if source["gapCount"]:
+            if source["gapCount"] and not str(source_id).startswith("nidaq."):
                 incomplete_reasons.append(
                     f"{source_id} reported {source['gapCount']} acquisition gap(s)"
                 )
-            if source["overrunCount"]:
+            if source["overrunCount"] and not str(source_id).startswith("nidaq."):
                 incomplete_reasons.append(
                     f"{source_id} overran by {source['overrunCount']} sample/event(s)"
                 )
@@ -960,6 +1167,68 @@ class SessionDataRecorder:
         }
 
     @staticmethod
+    def _nidaq_stream_health(chunks, *, start_perf, end_perf, saved_perf):
+        diagnostics = {
+            "expectedStartPerfTime": float(start_perf),
+            "expectedEndPerfTime": float(end_perf),
+            "savedSampleCount": int(len(saved_perf)),
+        }
+        warnings = []
+        failure = ""
+        if isinstance(chunks, _NidaqSpoolSnapshot):
+            diagnostics.update({
+                "collectionSampleCount": chunks.sample_count,
+                "firstSampleIndex": chunks.first_sample_index,
+                "lastSampleIndex": chunks.last_sample_index,
+                "firstPerfTime": chunks.first_perf_time,
+                "lastPerfTime": chunks.last_perf_time,
+                "collectionErrorCount": chunks.error_count,
+                "firstCollectionError": chunks.first_error,
+                "lastCollectionError": chunks.last_error,
+                "workerFailed": chunks.worker_failed,
+            })
+            if chunks.error_count:
+                warnings.append(
+                    f"NI-DAQ recovered from {chunks.error_count} collection error(s); "
+                    f"first: {chunks.first_error}"
+                )
+            if chunks.worker_failed:
+                failure = chunks.last_error or "NI-DAQ session recorder failed"
+        if not len(saved_perf):
+            failure = failure or "enabled NI-DAQ stream saved zero samples"
+            return {
+                "failure": failure,
+                "warnings": tuple(warnings),
+                "diagnostics": diagnostics,
+            }
+        first_missing = max(0.0, float(saved_perf[0]) - float(start_perf))
+        last_missing = max(0.0, float(end_perf) - float(saved_perf[-1]))
+        diagnostics["startCoverageMissingSeconds"] = first_missing
+        diagnostics["endCoverageMissingSeconds"] = last_missing
+        for edge, missing in (("start", first_missing), ("end", last_missing)):
+            if missing <= 0:
+                continue
+            message = f"NI-DAQ {edge} boundary coverage missing by {missing:.6f} seconds"
+            if missing > 5.0:
+                failure = failure or message
+            else:
+                warnings.append(message)
+        gap_count, overrun_samples = SessionDataRecorder._nidaq_diagnostics(chunks)
+        diagnostics["gapCount"] = gap_count
+        diagnostics["overrunSamples"] = overrun_samples
+        if gap_count:
+            warnings.append(f"NI-DAQ reported {gap_count} recovered acquisition gap(s)")
+        if overrun_samples:
+            warnings.append(
+                f"NI-DAQ session reader overran by {overrun_samples} sample(s)"
+            )
+        return {
+            "failure": failure,
+            "warnings": tuple(warnings),
+            "diagnostics": diagnostics,
+        }
+
+    @staticmethod
     def _finalize_source_manifest(
         session_dir,
         source_manifest,
@@ -976,12 +1245,10 @@ class SessionDataRecorder:
         device_event_overruns,
     ):
         gap_count = max(
-            (int(chunk[7]) for chunk in nidaq_chunks),
-            default=0,
+            SessionDataRecorder._nidaq_diagnostics(nidaq_chunks)[0],
+            0,
         )
-        nidaq_overruns = sum(
-            int(chunk[8]) for chunk in nidaq_chunks
-        )
+        nidaq_overruns = SessionDataRecorder._nidaq_diagnostics(nidaq_chunks)[1]
         stream_stats = {
             "device": (
                 device_perf,
@@ -1044,18 +1311,18 @@ class SessionDataRecorder:
             if (
                 (source_id.startswith("camera.") or source_id == "pose")
                 and source["sampleCount"] > 0
-                and not perf_times
+                and len(perf_times) == 0
             ):
                 perf_times = (float(start_perf), float(end_perf))
                 source["timingSource"] = "canonical_camera_boundary"
             source["firstOffsetSeconds"] = (
                 None
-                if not perf_times
+                if len(perf_times) == 0
                 else float(perf_times[0] - start_perf)
             )
             source["lastOffsetSeconds"] = (
                 None
-                if not perf_times
+                if len(perf_times) == 0
                 else float(perf_times[-1] - start_perf)
             )
             source["gapCount"] = int(source_gap_count)
@@ -1088,7 +1355,91 @@ class SessionDataRecorder:
             return 0
 
     @staticmethod
-    def _nidaq_arrays(chunks):
+    def _iter_nidaq_chunks(chunks, *, block_size=65536):
+        if not isinstance(chunks, _NidaqSpoolSnapshot):
+            yield from chunks
+            return
+        with h5py.File(chunks.path, "r") as source:
+            count = int(source["sample_index"].shape[0])
+            for start in range(0, count, block_size):
+                end = min(count, start + block_size)
+                yield (
+                    source["sample_index"][start:end],
+                    source["perf_time"][start:end],
+                    source["wall_time"][start:end],
+                    source["values"][:, start:end],
+                    chunks.channel_names,
+                    chunks.sample_rate_hz,
+                    int(source["epoch"][end - 1]) if end > start else 0,
+                    chunks.gap_count,
+                    chunks.overrun_samples,
+                    float(source["block_observation_perf_time"][end - 1]),
+                    float(source["block_observation_wall_time"][end - 1]),
+                )
+
+    @staticmethod
+    def _nidaq_perf_values(chunks, start_perf, end_perf):
+        if isinstance(chunks, _NidaqSpoolSnapshot):
+            with h5py.File(chunks.path, "r") as source:
+                perf = source["perf_time"]
+                first_index = SessionDataRecorder._h5_searchsorted(
+                    perf, start_perf, side="left",
+                )
+                end_index = SessionDataRecorder._h5_searchsorted(
+                    perf, end_perf, side="right",
+                )
+                count = max(0, end_index - first_index)
+                return _NidaqPerfSummary(
+                    count=count,
+                    first=(None if not count else float(perf[first_index])),
+                    last=(None if not count else float(perf[end_index - 1])),
+                )
+        return np.asarray(tuple(
+            float(sample_perf)
+            for chunk in chunks
+            for sample_perf in chunk[1]
+            if start_perf <= sample_perf <= end_perf
+        ), dtype=np.float64)
+
+    @staticmethod
+    def _h5_searchsorted(dataset, value, *, side):
+        low, high = 0, int(dataset.shape[0])
+        while low < high:
+            middle = (low + high) // 2
+            observed = float(dataset[middle])
+            if observed < value or (side == "right" and observed == value):
+                low = middle + 1
+            else:
+                high = middle
+        return low
+
+    @staticmethod
+    def _nidaq_diagnostics(chunks):
+        if isinstance(chunks, _NidaqSpoolSnapshot):
+            return chunks.gap_count, chunks.overrun_samples
+        return (
+            max((int(chunk[7]) for chunk in chunks), default=0),
+            sum(int(chunk[8]) for chunk in chunks),
+        )
+
+    @staticmethod
+    def _nidaq_arrays(chunks, requested_names=None):
+        if isinstance(chunks, _NidaqSpoolSnapshot):
+            names = chunks.channel_names
+            selected_names = (
+                names if requested_names is None
+                else tuple(name for name in requested_names if name in names)
+            )
+            rows = [names.index(name) for name in selected_names]
+            with h5py.File(chunks.path, "r") as source:
+                indices = source["sample_index"][:]
+                perf = source["perf_time"][:]
+                values = (
+                    source["values"][rows, :]
+                    if rows
+                    else np.empty((0, len(indices)), dtype=np.float32)
+                )
+            return selected_names, indices, perf, values, chunks.sample_rate_hz
         names = next((tuple(chunk[4]) for chunk in chunks if chunk[4]), tuple())
         selected = tuple(
             (chunk[0], chunk[1], chunk[3])
@@ -1132,7 +1483,7 @@ class SessionDataRecorder:
     @staticmethod
     def _match_camera_nidaq_edge(boundary, start_perf, chunks) -> dict:
         names, indices, perf, values, rate = SessionDataRecorder._nidaq_arrays(
-            chunks
+            chunks, requested_names=("cam_frames",),
         )
         resolution = None if rate is None else 1.0 / rate
         base = {
@@ -1237,7 +1588,8 @@ class SessionDataRecorder:
     @staticmethod
     def _correlate_tone_confirmations(device_rows, chunks) -> dict:
         names, indices, perf, values, rate = SessionDataRecorder._nidaq_arrays(
-            chunks
+            chunks,
+            requested_names=("tone1", "tone2", "tone3_r", "tone3_l"),
         )
         tone_channels = tuple(
             name
@@ -1361,7 +1713,7 @@ class SessionDataRecorder:
 
     @staticmethod
     def _alignment_entry(path, perf_times, start_perf, clock):
-        if perf_times:
+        if len(perf_times):
             first_perf = float(perf_times[0])
             last_perf = float(perf_times[-1])
             first_offset = first_perf - start_perf
@@ -1469,6 +1821,16 @@ class SessionDataRecorder:
         chunks,
         timing_plan=None,
     ) -> None:
+        if isinstance(chunks, _NidaqSpoolSnapshot):
+            SessionDataRecorder._write_nidaq_spool_selection(
+                path,
+                start_perf,
+                start_wall,
+                end_perf,
+                chunks,
+                timing_plan,
+            )
+            return
         channel_names = next((chunk[4] for chunk in chunks if chunk[4]), tuple())
         selected = []
         for chunk in chunks:
@@ -1584,3 +1946,110 @@ class SessionDataRecorder:
             output.attrs["epoch"] = selected[-1][5]
             output.attrs["gap_count"] = selected[-1][6]
             output.attrs["overrun_samples"] = sum(item[7] for item in selected)
+
+    @staticmethod
+    def _write_nidaq_spool_selection(
+        path,
+        start_perf,
+        start_wall,
+        end_perf,
+        snapshot: _NidaqSpoolSnapshot,
+        timing_plan=None,
+    ) -> None:
+        with h5py.File(snapshot.path, "r") as source, h5py.File(path, "w") as output:
+            perf_source = source["perf_time"]
+            count = int(perf_source.shape[0])
+            if count:
+                # The sample-index reconstruction is strictly monotonic, so
+                # binary search finds the camera-boundary slice without loading
+                # the complete values matrix into Python memory.
+                first = SessionDataRecorder._h5_searchsorted(
+                    perf_source, start_perf, side="left",
+                )
+                last = SessionDataRecorder._h5_searchsorted(
+                    perf_source, end_perf, side="right",
+                )
+            else:
+                first = last = 0
+            selected_count = max(0, last - first)
+            output.attrs["recording_start_perf"] = start_perf
+            output.attrs["recording_start_wall"] = start_wall
+            output.attrs["recording_end_perf"] = end_perf
+            output.attrs["alignment"] = (
+                "first sample at or after primary camera first frame"
+            )
+            output.attrs["source_clock"] = (
+                "NI-DAQ ring reconstructed on time.perf_counter"
+            )
+            output.attrs["channel_names"] = snapshot.channel_names
+            output.attrs["timing_plan_json"] = json.dumps(
+                None if timing_plan is None else dataclasses.asdict(timing_plan),
+                sort_keys=True,
+            )
+            output.attrs["collection_error_count"] = snapshot.error_count
+            output.attrs["collection_first_error"] = snapshot.first_error or ""
+            output.attrs["collection_last_error"] = snapshot.last_error or ""
+            output.attrs["collection_worker_failed"] = snapshot.worker_failed
+            output.attrs["gap_count"] = snapshot.gap_count
+            output.attrs["overrun_samples"] = snapshot.overrun_samples
+
+            one_dimensional = (
+                "sample_index",
+                "perf_time",
+                "epoch",
+                "block_observation_perf_time",
+                "block_observation_wall_time",
+            )
+            for name in one_dimensional:
+                source_dataset = source[name]
+                output_dataset = output.create_dataset(
+                    name,
+                    shape=(selected_count,),
+                    dtype=source_dataset.dtype,
+                    compression="gzip" if selected_count else None,
+                )
+                for relative in range(0, selected_count, 65536):
+                    amount = min(65536, selected_count - relative)
+                    output_dataset[relative:relative + amount] = source_dataset[
+                        first + relative:first + relative + amount
+                    ]
+            values = output.create_dataset(
+                "values",
+                shape=(len(snapshot.channel_names), selected_count),
+                dtype=np.float32,
+                compression="gzip" if selected_count else None,
+            )
+            for relative in range(0, selected_count, 65536):
+                amount = min(65536, selected_count - relative)
+                values[:, relative:relative + amount] = source["values"][
+                    :, first + relative:first + relative + amount
+                ]
+            perf_dataset = output["perf_time"]
+            offsets = output.create_dataset(
+                "offset_seconds",
+                shape=(selected_count,),
+                dtype=np.float64,
+                compression="gzip" if selected_count else None,
+            )
+            wall = output.create_dataset(
+                "wall_time",
+                shape=(selected_count,),
+                dtype=np.float64,
+                compression="gzip" if selected_count else None,
+            )
+            for relative in range(0, selected_count, 65536):
+                amount = min(65536, selected_count - relative)
+                selected_perf = perf_dataset[relative:relative + amount]
+                offsets[relative:relative + amount] = selected_perf - start_perf
+                wall[relative:relative + amount] = (
+                    start_wall + selected_perf - start_perf
+                )
+            if selected_count:
+                first_perf = float(perf_dataset[0])
+                last_perf = float(perf_dataset[-1])
+                output.attrs["first_perf_time"] = first_perf
+                output.attrs["last_perf_time"] = last_perf
+                output.attrs["first_offset_seconds"] = first_perf - start_perf
+                output.attrs["last_offset_seconds"] = last_perf - start_perf
+                output.attrs["sample_rate_hz"] = snapshot.sample_rate_hz
+                output.attrs["epoch"] = int(output["epoch"][-1])

@@ -592,6 +592,8 @@ def test_enabled_source_manifest_contains_final_paths_counts_and_health(
     assert manifest["nidaq.barcode"]["firstOffsetSeconds"] == 0.0
     assert manifest["nidaq.barcode"]["gapCount"] == 2
     assert manifest["nidaq.barcode"]["overrunCount"] == 4
+    assert len(manifest["nidaq.barcode"]["warnings"]) == 2
+    assert result["sessionComplete"] is True
     assert manifest["device"]["sampleCount"] == 0
     assert manifest["device"]["persistenceStatus"] == "written"
 
@@ -790,3 +792,133 @@ def test_failed_auxiliary_finalization_retains_snapshot_for_retry(monkeypatch):
         assert recorder._pending_finalization is None
     finally:
         recorder.close()
+
+
+def test_nidaq_poll_reuses_preallocated_ring_scratch():
+    destinations = []
+
+    class Ring:
+        channel_names = ("barcode",)
+        capacity = 16
+
+        @staticmethod
+        def copy_since(_last, destination):
+            destinations.append(destination)
+            return None
+
+    laser = _EventSource("trace_received")
+    recorder = SessionDataRecorder(SimpleNamespace(sample_ring=Ring()), laser)
+    try:
+        recorder._copy_nidaq_once()
+        recorder._copy_nidaq_once()
+        assert destinations[0] is destinations[1]
+    finally:
+        recorder.close()
+
+
+def test_nidaq_spool_is_incremental_and_final_output_is_boundary_clipped(tmp_path):
+    project = ProjectInfo(
+        root=str(tmp_path),
+        device_id="test",
+        when=datetime(2026, 1, 2, 3, 4, 5),
+        session=9,
+    )
+    ring = SimpleNamespace(
+        channel_names=("barcode",),
+        capacity=16,
+        sample_rate_hz=1000.0,
+    )
+    laser = _EventSource("trace_received")
+    recorder = SessionDataRecorder(SimpleNamespace(sample_ring=ring), laser)
+    try:
+        with recorder._lock:
+            recorder._project = project
+            recorder._metadata_generation_id = f"{project.short_id}-g1"
+            recorder._open_nidaq_spool_locked()
+            recorder._append_nidaq_spool_locked(
+                np.arange(4, dtype=np.int64),
+                np.array((9.999, 10.0, 10.001, 10.002)),
+                np.array((99.999, 100.0, 100.001, 100.002)),
+                np.array(((0.0, 1.0, 0.0, 1.0),), dtype=np.float32),
+                ring.channel_names,
+                SimpleNamespace(
+                    epoch=1,
+                    source_perf_time=10.002,
+                    source_wall_time=100.002,
+                    gap_count=0,
+                    overrun_samples=0,
+                ),
+            )
+            recorder._close_nidaq_spool_locked()
+            snapshot = recorder._snapshot_nidaq_locked()
+
+        result = SessionDataRecorder._write_session(
+            project,
+            10.0,
+            100.0,
+            10.001,
+            (), (), (), snapshot,
+            source_manifest=({
+                "id": "nidaq.barcode",
+                "kind": "nidaq_digital",
+                "path": "streams/nidaq.h5",
+                "runtimeState": "ready",
+            },),
+            metadata_generation_id=f"{project.short_id}-g1",
+        )
+
+        with h5py.File(
+            Path(project.get_session_path().location) / "streams" / "nidaq.h5",
+            "r",
+        ) as output:
+            assert output["sample_index"][:].tolist() == [1, 2]
+            assert output["values"][:].tolist() == [[1.0, 0.0]]
+            assert output.attrs["collection_error_count"] == 0
+        assert result["sessionComplete"] is True
+        assert recorder._nidaq_chunks == []
+    finally:
+        recorder.abort()
+
+
+@pytest.mark.parametrize(
+    ("perf", "end_perf", "expected_complete", "warning_fragment"),
+    (
+        (np.array((10.1, 10.9)), 11.0, True, "coverage missing"),
+        (np.array((16.0, 16.1)), 17.0, False, "start boundary coverage"),
+        (np.empty(0), 11.0, False, "zero samples"),
+    ),
+)
+def test_nidaq_coverage_classifies_warning_and_critical_boundaries(
+    tmp_path, perf, end_perf, expected_complete, warning_fragment,
+):
+    project = ProjectInfo(
+        root=str(tmp_path),
+        device_id="test",
+        when=datetime(2026, 1, 2, 3, 4, 5),
+        session=10,
+    )
+    count = len(perf)
+    chunk = (
+        np.arange(count, dtype=np.int64),
+        perf,
+        100.0 + perf - 10.0,
+        np.zeros((1, count), dtype=np.float32),
+        ("barcode",),
+        1000.0,
+        1,
+        0,
+        0,
+    )
+    result = SessionDataRecorder._write_session(
+        project, 10.0, 100.0, end_perf, (), (), (), (chunk,),
+        source_manifest=({
+            "id": "nidaq.barcode",
+            "kind": "nidaq_digital",
+            "path": "streams/nidaq.h5",
+            "runtimeState": "ready",
+        },),
+    )
+    source = result["enabledSources"][0]
+    messages = " ".join((*source["warnings"], source["failure"] or ""))
+    assert result["sessionComplete"] is expected_complete
+    assert warning_fragment in messages
