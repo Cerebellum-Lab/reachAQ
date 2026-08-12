@@ -61,6 +61,9 @@ class SystemMachine(StateMachine):
         project_info: ProjectInfo
         self._project_info = project_info
         self._aborted_session_ids = set()
+        # reachAQ owns per-pellet live analysis. Other applications using this
+        # reusable behavior machine retain the historical whole-session path.
+        self.use_live_intertrial_analysis = False
         #
         self._is_handling_diamond_triangle = False
 
@@ -222,6 +225,20 @@ class SystemMachine(StateMachine):
             with algo.set_allow_reentrant(True):
                 self._pellet_machine.move_retract()
 
+        if self.use_live_intertrial_analysis:
+            logger.notice(
+                "session ended: prj=%s intersession.state=%s system_machine.state=%s "
+                "algo.system_state=%s pellet_machine.state=%s analysis=live-per-pellet",
+                cur_project.short_id,
+                self._intersession.state,
+                self.state,
+                algo.system_state,
+                self._pellet_machine.state,
+            )
+            self._inference.send_message(InferenceCommandMessageKind.SetOfflineToLive)
+            algo.end_session(cur_project, CaptureAnalysisResult.CAPTURE_ONLY)
+            return
+
         can_perform_analysis = (
             algo.can_perform_intersession_analysis()
             and self._intersession.can_perform_segmentation(cur_project)
@@ -238,10 +255,11 @@ class SystemMachine(StateMachine):
         )
         if can_perform_analysis:
             with algo.set_allow_reentrant(True):
-                self.enter_intersession(cur_project, reason="capture-ended-and-can-perform-analysis")
+                self.enter_intersession(
+                    cur_project,
+                    reason="capture-ended-and-can-perform-analysis",
+                )
         else:
-            # at the end of live recording pose-process automatically goes to offline mode,
-            # so we ask it to switch back to live:
             self._inference.send_message(InferenceCommandMessageKind.SetOfflineToLive)
             algo.end_session(cur_project, CaptureAnalysisResult.CAPTURE_ONLY)
 
