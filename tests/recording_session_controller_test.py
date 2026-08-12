@@ -121,3 +121,20 @@ def test_begin_record_is_atomic_and_refuses_second_reservation():
     assert controller.status is SessionRecordingStatus.ARMING
     assert controller.session_id == "session001"
     assert controller.metadata_generation_id == "session001-g1"
+
+
+def test_end_action_is_reserved_once_and_completed_atomically():
+    controller = RecordingSessionController()
+
+    assert controller.reserve_end_action("pellet_home", {"ending": "stop"})
+    assert not controller.reserve_end_action("pellet_home", {"ending": "abort"})
+    controller.finish_end_action(
+        "pellet_home", status="completed", commandToken="token-1",
+    )
+
+    assert controller.end_actions == ({
+        "name": "pellet_home",
+        "status": "completed",
+        "ending": "stop",
+        "commandToken": "token-1",
+    },)

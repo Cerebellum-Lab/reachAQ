@@ -1173,3 +1173,55 @@ def test_runtime_can_failure_aborts_session_but_only_can_status_recovers(app_mod
         ready = app_model.subsystem_statuses[SubsystemId.CAN_PELLET.value]
         assert ready.state is SubsystemState.READY
         assert register.call_count == 2
+
+
+def test_session_end_home_is_acknowledged_once_and_recorded(app_model):
+    app_model._set_subsystem_status(
+        SubsystemId.CAN_PELLET,
+        SubsystemState.READY,
+    )
+    with mock.patch.object(
+        type(app_model.hardware),
+        "connected",
+        new_callable=mock.PropertyMock,
+        return_value=True,
+    ), mock.patch.object(
+        app_model.hardware,
+        "send_home_and_wait",
+        return_value="home-token",
+    ) as send_home:
+        app_model._request_session_end_home("stop")
+        app_model._request_session_end_home("stop")
+
+    send_home.assert_called_once_with(timeout=15.0)
+    action = app_model._recording_session.end_actions[0]
+    assert action["status"] == "completed"
+    assert action["ending"] == "stop"
+    assert action["insideRecordedBoundary"] is False
+    assert action["commandToken"] == "home-token"
+
+
+def test_session_end_home_failure_does_not_raise_or_change_can_status(app_model):
+    app_model._set_subsystem_status(
+        SubsystemId.CAN_PELLET,
+        SubsystemState.READY,
+    )
+    with mock.patch.object(
+        type(app_model.hardware),
+        "connected",
+        new_callable=mock.PropertyMock,
+        return_value=True,
+    ), mock.patch.object(
+        app_model.hardware,
+        "send_home_and_wait",
+        side_effect=TimeoutError("home timed out"),
+    ), mock.patch.object(app_model, "on_error") as on_error:
+        app_model._request_session_end_home("abort")
+
+    action = app_model._recording_session.end_actions[0]
+    assert action["status"] == "failed"
+    assert action["error"] == "home timed out"
+    assert app_model.subsystem_statuses[
+        SubsystemId.CAN_PELLET.value
+    ].state is SubsystemState.READY
+    on_error.assert_called_once()

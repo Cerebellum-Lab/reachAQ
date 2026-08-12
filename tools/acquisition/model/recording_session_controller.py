@@ -36,6 +36,7 @@ class RecordingSessionController:
     data_complete: bool = True
     data_errors: Tuple[str, ...] = ()
     enabled_sources: Tuple[dict, ...] = ()
+    end_actions: Tuple[dict, ...] = ()
     _generation: int = field(default=0, init=False, repr=False)
     _session_id: Optional[str] = field(default=None, init=False, repr=False)
     _lock: threading.RLock = field(
@@ -147,6 +148,25 @@ class RecordingSessionController:
         self.data_complete = True
         self.data_errors = ()
         self.enabled_sources = ()
+        self.end_actions = ()
+
+    def reserve_end_action(self, name: str, details: dict) -> bool:
+        with self._lock:
+            if any(action.get("name") == name for action in self.end_actions):
+                return False
+            self.end_actions = (*self.end_actions, {
+                "name": str(name),
+                "status": "pending",
+                **dict(details),
+            })
+            return True
+
+    def finish_end_action(self, name: str, **result) -> None:
+        with self._lock:
+            self.end_actions = tuple(
+                ({**action, **result} if action.get("name") == name else action)
+                for action in self.end_actions
+            )
 
     def set_stream_result(self, result: dict) -> None:
         with self._lock:
@@ -196,6 +216,7 @@ class RecordingSessionController:
             self.data_complete = True
             self.data_errors = ()
             self.enabled_sources = ()
+            self.end_actions = ()
             self.analysis_finished = True
             self.analysis_started_perf = None
             self.analysis_duration_seconds = None

@@ -373,6 +373,13 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
     def send_home(self) -> Optional[UUID]:
         return self._send_with_token(self._device_conn, SystemCommandKind.SEND_HOME)
 
+    def send_home_and_wait(self, *, timeout: float = 15.0) -> UUID:
+        token = self.send_home()
+        if token is None:
+            raise RuntimeError("pellet home command was not queued")
+        self.wait_pending_command_acked(token, timeout=timeout)
+        return token
+
     def load_pellet(self) -> Optional[UUID]:
         return self._send_with_token(self._device_conn, SystemCommandKind.LOAD_PELLET)
 
@@ -580,7 +587,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         # 1)
         config_started = time.perf_counter()
         log_hardware_initialization(logger, "START | pellet motor configuration")
-        motors_config = device_conn.load_default_motor_config()
+        device_conn.load_default_motor_config()
         log_hardware_initialization(
             logger,
             "READY | pellet motor configuration | elapsed=%.3fs",
@@ -595,14 +602,10 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             "READY | pellet move configuration | elapsed=%.3fs",
             time.perf_counter() - config_started,
         )
-        # 3)
-        if self._connect_count == 1:
-            logger.notice("Doing cover attach-release-detach on first connect")
-            send_dev_ack_cmd(SystemCommandKind.SERVO_ATTACH, Motor.PELLET_COVER_SERVO)
-            send_dev_ack_cmd(SystemCommandKind.RELEASE_PELLET)
-            send_dev_ack_cmd(SystemCommandKind.SERVO_DETACH, Motor.PELLET_COVER_SERVO)
-            send_dev_ack_cmd(SystemCommandKind.WRITE_MOTOR_CONFIGURATION, motors_config.cover_config)
-            # also need to re-apply the config
+        # Every initial connection and recovery establishes one deterministic,
+        # non-presenting mechanical state. Motor configuration is acknowledged
+        # above before homing because its limits and velocities govern HOME.
+        self._home_and_detach_pellet(send_dev_ack_cmd)
 
         self._device_initialization_complete = True
 
@@ -620,6 +623,27 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             time.perf_counter() - connect_started,
         )
         self._set_can_connection_state("ready")
+
+    @staticmethod
+    def _home_and_detach_pellet(send_acknowledged_command) -> None:
+        log_hardware_initialization(logger, "START | pellet XYZ home")
+        send_acknowledged_command(SystemCommandKind.SEND_HOME)
+        log_hardware_initialization(logger, "READY | pellet XYZ home")
+        for servo in (
+            Motor.PELLET_LOAD_SERVO,
+            Motor.PELLET_COVER_SERVO,
+        ):
+            log_hardware_initialization(
+                logger,
+                "START | pellet servo detach | motor=%s",
+                servo.name,
+            )
+            send_acknowledged_command(SystemCommandKind.SERVO_DETACH, servo)
+            log_hardware_initialization(
+                logger,
+                "READY | pellet servo detach | motor=%s",
+                servo.name,
+            )
 
     def _disconnect_transport(self):
         logger.verbose("disconnecting ..")

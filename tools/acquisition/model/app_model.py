@@ -4452,29 +4452,6 @@ class AppModel(ObservableObject):
                 return t_end
             watchdog_mon_register("test-watchdog", lambda t=time.perf_counter() + 180: fake_watchdog(t))
 
-        if can_ready:
-            # We always begin at home when the pellet controller is available.
-            log_hardware_initialization(logger, "START | pellet home command")
-            try:
-                self._behavior.system_machine.pellet.move_home(force=True)
-            except Exception as exc:
-                error = str(exc) or exc.__class__.__name__
-                logger.exception("Pellet home command failed")
-                self._set_subsystem_status(
-                    SubsystemId.CAN_PELLET,
-                    SubsystemState.FAILED,
-                    error=error,
-                )
-                try:
-                    self._hardware.safety_shutdown(
-                        f"pellet home failure: {error}",
-                        wait=True,
-                    )
-                except Exception:
-                    logger.exception("CAN safety shutdown failed after pellet home error")
-            else:
-                log_hardware_initialization(logger, "QUEUED | pellet home command")
-
         # once cameras successfully started:
         self._save_project_metadata(project_info, when=datetime.now(), session=None, caller="capture_start")
         #
@@ -5726,6 +5703,7 @@ class AppModel(ObservableObject):
             self._recording_session.add_data_error(
                 f"auxiliary stream save failed: {err}"
             )
+        self._request_session_end_home("stop")
         if self._recording_session.analysis_finished:
             if self._recording_session.analysis_duration_seconds is None:
                 self._recording_session.analysis_duration_seconds = 0.0
@@ -5782,6 +5760,49 @@ class AppModel(ObservableObject):
                     token=token,
                 )
 
+    def _request_session_end_home(self, ending: str) -> None:
+        requested_perf = get_perf_now()
+        requested_wall = time.time()
+        if not self._recording_session.reserve_end_action(
+            "pellet_home",
+            {
+                "ending": str(ending),
+                "requestedPerfTime": requested_perf,
+                "requestedWallTime": requested_wall,
+                "insideRecordedBoundary": False,
+            },
+        ):
+            return
+        status = self._acquisition.subsystems.get(SubsystemId.CAN_PELLET)
+        if status is None or not status.is_ready or not self._hardware.connected:
+            self._recording_session.finish_end_action(
+                "pellet_home",
+                status="skipped",
+                error="pellet board was not Ready at session end",
+            )
+            logger.warning("Session-end pellet home skipped: pellet board not Ready")
+            return
+        try:
+            token = self._hardware.send_home_and_wait(timeout=15.0)
+        except Exception as error:
+            message = str(error) or error.__class__.__name__
+            logger.exception("Session-end pellet home failed")
+            self._recording_session.finish_end_action(
+                "pellet_home",
+                status="failed",
+                completedPerfTime=get_perf_now(),
+                error=message,
+            )
+            self.on_error("Pellet home failed", message)
+            return
+        self._recording_session.finish_end_action(
+            "pellet_home",
+            status="completed",
+            completedPerfTime=get_perf_now(),
+            commandToken=str(token),
+            error=None,
+        )
+
     def _finish_abort_recording(
         self,
         *,
@@ -5834,6 +5855,7 @@ class AppModel(ObservableObject):
             logger.exception("Unable to delete aborted session data: %s", err)
             self.on_error("Abort cleanup failed", str(err))
         finally:
+            self._request_session_end_home("abort")
             self._pellet_cycles.abort(
                 perf_time=get_perf_now(),
                 wall_time=time.time(),
@@ -6332,6 +6354,10 @@ class AppModel(ObservableObject):
                     "firstPelletPresentationOffsetSeconds": (
                         project.first_pellet_presentation_offset
                     ),
+                    "endActions": [
+                        dict(action)
+                        for action in self._recording_session.end_actions
+                    ],
                 },
                 "stopPolicy": (
                     None
