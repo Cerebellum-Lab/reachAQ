@@ -123,6 +123,25 @@ class VideoRecord(Thread):
         self._first_frame_when = math.inf
         self._first_frame_time = math.inf
         self._first_frame_perf_c = math.inf
+        self._first_writer_error = ""
+        self._writer_error_count = 0
+
+    def _record_writer_error(self, error: BaseException) -> None:
+        self._writer_error_count += 1
+        if not self._first_writer_error:
+            self._first_writer_error = (
+                f"{error.__class__.__name__}: "
+                f"{str(error) or error.__class__.__name__}"
+            )
+
+    def _take_writer_diagnostics(self) -> dict:
+        diagnostics = {
+            "firstError": self._first_writer_error or None,
+            "errorCount": int(self._writer_error_count),
+        }
+        self._first_writer_error = ""
+        self._writer_error_count = 0
+        return diagnostics
 
     @property
     def first_frame_id(self) -> int:
@@ -145,8 +164,13 @@ class VideoRecord(Thread):
         try:
             self._run()
         except Exception as err:
+            self._record_writer_error(err)
             logger.exception("%s: Error during run: %s", self, err)
-        self._close_writers()
+        try:
+            self._close_writers()
+        except Exception as err:
+            self._record_writer_error(err)
+            logger.exception("%s: Error closing writers: %s", self, err)
 
     def _run(self) -> None:
         input_q = self._input_queue
@@ -182,8 +206,17 @@ class VideoRecord(Thread):
                 # if frame is None or when is None:
                 if len(queue_list) == 0:
                     # Indicator for trigger disabled
-                    self._close_writers()
+                    try:
+                        self._close_writers()
+                    except Exception as err:
+                        self._record_writer_error(err)
+                        logger.exception(
+                            "%s: Error closing session writers: %s",
+                            self,
+                            err,
+                        )
                     closed_frames_written = tot_written
+                    writer_diagnostics = self._take_writer_diagnostics()
                     logger.info("Closed video file: tot frames written: %s ; last_perf_now=%s",
                                 closed_frames_written, prev_perf_now)
                     if record_stop_sema is not None:
@@ -195,6 +228,7 @@ class VideoRecord(Thread):
                             SystemStatusMessageKind.CAMERA_RECORDING_CLOSED_FINISHED, (
                                 self._cam_idx, closed_frames_written, self._prepared_project,
                                 self._prepared_generation,
+                                writer_diagnostics,
                         )))
                     tot_written = 0
                     continue
@@ -238,6 +272,7 @@ class VideoRecord(Thread):
                                         frame)
 
             except Exception as err:
+                self._record_writer_error(err)
                 if consecutive_failures < 5:
                     logger.exception("%s: loop error: %s", self, err)
                 consecutive_failures += 1
@@ -245,6 +280,7 @@ class VideoRecord(Thread):
             try:
                 self._check_writers()
             except Exception as err:
+                self._record_writer_error(err)
                 if consecutive_failures < 5:
                     logger.exception("%s: check writers error: %s", self, err)
                 consecutive_failures += 1

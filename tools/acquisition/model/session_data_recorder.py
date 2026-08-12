@@ -10,7 +10,7 @@ import time
 from collections import deque
 from enum import Enum
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Tuple
 from uuid import UUID
 
 import h5py
@@ -218,16 +218,30 @@ class SessionDataRecorder:
         sample_count: Optional[int] = None,
         path: Optional[str] = None,
         failure: str = "",
+        warnings: Tuple[str, ...] = (),
+        diagnostics: Optional[dict] = None,
     ) -> None:
         with self._lock:
             if not self._armed:
                 return
-            self._source_results[str(source_id)] = {
+            source_id = str(source_id)
+            previous = self._source_results.get(source_id, {})
+            previous_warnings = tuple(previous.get("warnings", ()))
+            combined_warnings = tuple(
+                dict.fromkeys((*previous_warnings, *(str(item) for item in warnings)))
+            )
+            combined_diagnostics = dict(previous.get("diagnostics", {}))
+            combined_diagnostics.update(diagnostics or {})
+            self._source_results[source_id] = {
                 "sampleCount": (
-                    None if sample_count is None else int(sample_count)
+                    previous.get("sampleCount")
+                    if sample_count is None
+                    else int(sample_count)
                 ),
-                "path": path,
-                "failure": str(failure or ""),
+                "path": previous.get("path") if path is None else path,
+                "failure": str(failure or previous.get("failure", "")),
+                "warnings": combined_warnings,
+                "diagnostics": combined_diagnostics,
             }
 
     def set_trial_ledger(self, records, summary) -> None:
@@ -875,6 +889,8 @@ class SessionDataRecorder:
                     sample_count = len(perf_times)
 
             failure = result.get("failure", "")
+            source["warnings"] = list(result.get("warnings", ()))
+            source["diagnostics"] = dict(result.get("diagnostics", {}))
             source["sampleCount"] = int(sample_count or 0)
             if (
                 (source_id.startswith("camera.") or source_id == "pose")
