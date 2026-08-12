@@ -302,6 +302,11 @@ class NidaqSignalStreamController:
             kwargs = {}
             if device_name in self._analog_tasks:
                 kwargs["source"] = f"/{device_name}/ai/SampleClock"
+            elif (
+                self._timing_plan is not None
+                and self._timing_plan.clock_producer == "external"
+            ):
+                kwargs["source"] = self._timing_plan.sample_clock_source
             elif self._is_master_device(device_name):
                 kwargs["source"] = self._create_digital_sample_clock(
                     device_name,
@@ -371,6 +376,7 @@ class NidaqSignalStreamController:
             sample_mode=self._nidaqmx.constants.AcquisitionType.CONTINUOUS,
             samps_per_chan=buffer_size,
         )
+        self._configure_reference_clock(task)
         return f"/{device_name}/Ctr0InternalOutput"
 
     def _task_start_order(self) -> Tuple[str, ...]:
@@ -398,6 +404,13 @@ class NidaqSignalStreamController:
         return device_name == self._timing_plan.master_device
 
     def _sample_clock_kwargs(self, device_name: str) -> Dict[str, str]:
+        if (
+            self._timing_plan is not None
+            and self._timing_plan.clock_producer == "external"
+        ):
+            if not self._timing_plan.sample_clock_source:
+                raise RuntimeError("external NI-DAQ timing has no sample clock")
+            return {"source": self._timing_plan.sample_clock_source}
         if self._is_master_device(device_name):
             return {}
         source = (
@@ -427,7 +440,10 @@ class NidaqSignalStreamController:
         plan = self._timing_plan
         if (
             plan is None
-            or self._is_master_device(device_name)
+            or (
+                self._is_master_device(device_name)
+                and plan.clock_producer != "external"
+            )
             or not plan.start_trigger_source
         ):
             return

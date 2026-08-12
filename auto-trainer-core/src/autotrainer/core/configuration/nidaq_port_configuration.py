@@ -85,12 +85,22 @@ class NidaqTimingPlan:
     task_start_order: Tuple[str, ...] = tuple()
     resolved_devices: Tuple[NidaqDeviceIdentity, ...] = tuple()
     synchronization_quality: str = "unresolved"
+    clock_producer: str = "unresolved"
+    clock_producer_device: Optional[str] = None
+    consumer_devices: Tuple[str, ...] = tuple()
+    hardware_output_devices: Tuple[str, ...] = tuple()
+    hardware_output_timing_status: str = "not_configured"
+    hardware_output_timing_reason: str = ""
     reason: str = ""
 
     def __post_init__(self):
         object.__setattr__(self, "slave_devices", tuple(self.slave_devices))
         object.__setattr__(self, "routes", tuple(self.routes))
         object.__setattr__(self, "task_start_order", tuple(self.task_start_order))
+        object.__setattr__(self, "consumer_devices", tuple(self.consumer_devices))
+        object.__setattr__(
+            self, "hardware_output_devices", tuple(self.hardware_output_devices),
+        )
         object.__setattr__(
             self,
             "resolved_devices",

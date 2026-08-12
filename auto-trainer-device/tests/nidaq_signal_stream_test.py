@@ -214,3 +214,93 @@ def test_multi_device_tasks_arm_slave_before_master(monkeypatch):
         assert block.epoch_wall_time is not None
     finally:
         controller.close()
+
+
+def test_digital_master_arms_all_inputs_before_counter_clock(monkeypatch):
+    fake_nidaqmx = _FakeNidaqmx()
+    monkeypatch.setattr(nidaq_signal_stream, "_load_nidaqmx", lambda: fake_nidaqmx)
+    configuration = NidaqSignalStreamConfiguration(
+        channels=(
+            NidaqSignalChannelConfiguration(
+                "master", "Acquire/port0/line0", "digital",
+            ),
+            NidaqSignalChannelConfiguration(
+                "slave", "Confirm/port0/line0", "digital",
+            ),
+        ),
+        is_enabled=True,
+        sample_rate_hz=1000.0,
+        read_chunk_size=3,
+    )
+    plan = NidaqTimingPlan(
+        requested_mode="auto",
+        resolved_mode="backplane",
+        is_valid=True,
+        master_device="Acquire",
+        slave_devices=("Confirm",),
+        reference_clock_source="PXI_CLK10",
+        reference_clock_rate_hz=10_000_000.0,
+        sample_clock_source="/Acquire/Ctr0InternalOutput",
+        start_trigger_source=None,
+        task_start_order=("Confirm", "Acquire"),
+        synchronization_quality="hardware_backplane",
+        clock_producer="counter",
+        clock_producer_device="Acquire",
+        consumer_devices=("Acquire", "Confirm"),
+    )
+
+    controller = NidaqSignalStreamController(configuration, timing_plan=plan)
+    try:
+        controller.start()
+        tasks = {task.name: task for task in fake_nidaqmx.tasks}
+        assert tasks["reachaq_signal_stream_Confirm_di"].timing_configuration[
+            "source"
+        ] == "/Acquire/Ctr0InternalOutput"
+        assert tasks["reachaq_signal_stream_Acquire_di"].timing_configuration[
+            "source"
+        ] == "/Acquire/Ctr0InternalOutput"
+        assert fake_nidaqmx.start_order[-1] == (
+            "reachaq_signal_stream_Acquire_clock"
+        )
+        assert fake_nidaqmx.start_order.index(
+            "reachaq_signal_stream_Confirm_di"
+        ) < fake_nidaqmx.start_order.index("reachaq_signal_stream_Acquire_clock")
+        assert fake_nidaqmx.start_order.index(
+            "reachaq_signal_stream_Acquire_di"
+        ) < fake_nidaqmx.start_order.index("reachaq_signal_stream_Acquire_clock")
+        assert tasks["reachaq_signal_stream_Acquire_clock"].timing.ref_clk_src == (
+            "PXI_CLK10"
+        )
+    finally:
+        controller.close()
+
+
+def test_external_clock_and_start_trigger_apply_to_selected_master(monkeypatch):
+    fake_nidaqmx = _FakeNidaqmx()
+    monkeypatch.setattr(nidaq_signal_stream, "_load_nidaqmx", lambda: fake_nidaqmx)
+    configuration = NidaqSignalStreamConfiguration(
+        channels=(NidaqSignalChannelConfiguration("input", "DevA/ai0"),),
+        is_enabled=True,
+        sample_rate_hz=1000.0,
+        read_chunk_size=3,
+    )
+    plan = NidaqTimingPlan(
+        requested_mode="external",
+        resolved_mode="external",
+        is_valid=True,
+        master_device="DevA",
+        sample_clock_source="/DevA/PFI1",
+        start_trigger_source="/DevA/PFI2",
+        task_start_order=("DevA",),
+        synchronization_quality="hardware_external",
+        clock_producer="external",
+        consumer_devices=("DevA",),
+    )
+
+    controller = NidaqSignalStreamController(configuration, timing_plan=plan)
+    try:
+        task = fake_nidaqmx.tasks[0]
+        assert task.timing_configuration["source"] == "/DevA/PFI1"
+        assert task.start_trigger_source == "/DevA/PFI2"
+    finally:
+        controller.close()

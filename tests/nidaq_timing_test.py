@@ -76,6 +76,30 @@ def test_pxi_input_master_and_hardware_timed_output_slave_use_backplane():
     assert plan.sample_clock_source == "/Acquire/ai/SampleClock"
     assert plan.start_trigger_source == "/Acquire/ai/StartTrigger"
     assert plan.task_start_order == ("LaserOut", "Acquire")
+    assert plan.clock_producer == "ai"
+    assert plan.consumer_devices == ("Acquire",)
+    assert plan.hardware_output_devices == ("LaserOut",)
+    assert plan.hardware_output_timing_status == "declared_not_armed"
+
+
+def test_digital_only_pxi_master_uses_counter_without_fake_ai_trigger():
+    configuration = _stream(
+        ("cam_frames", "Acquire/port0/line0", "digital"),
+        ("tone1", "Confirm/port0/line0", "digital"),
+    )
+
+    plan = build_nidaq_timing_plan(
+        configuration,
+        NidaqTimingConfiguration(),
+        (_pxi("Acquire", 50), _pxi("Confirm", 51)),
+    )
+
+    assert plan.is_valid
+    assert plan.clock_producer == "counter"
+    assert plan.clock_producer_device == "Acquire"
+    assert plan.sample_clock_source == "/Acquire/Ctr0InternalOutput"
+    assert plan.start_trigger_source is None
+    assert all("ai/StartTrigger" not in route.source for route in plan.routes)
 
 
 def test_manual_master_resolves_by_serial_after_runtime_alias_changes():

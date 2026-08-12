@@ -64,6 +64,19 @@ def build_nidaq_timing_plan(
 
     slaves = tuple(device for device in active_devices if device != master)
     task_start_order = (*slaves, master)
+    master_has_analog_input = any(
+        device_name_from_channel(channel.physical_channel) == master
+        for channel in configuration.analog_channels
+    )
+    clock_producer = "ai" if master_has_analog_input else "counter"
+    output_status = (
+        "declared_not_armed" if output_devices else "not_configured"
+    )
+    output_reason = (
+        "Hardware output devices participate in route validation, but no finite "
+        "output waveform is armed by the input-stream timing plan"
+        if output_devices else ""
+    )
     resolved_devices = _resolved_device_identities(
         active_devices,
         discovered,
@@ -77,6 +90,12 @@ def build_nidaq_timing_plan(
             task_start_order=task_start_order,
             resolved_devices=resolved_devices,
             synchronization_quality="hardware_same_device",
+            clock_producer=clock_producer,
+            clock_producer_device=master,
+            consumer_devices=input_devices,
+            hardware_output_devices=output_devices,
+            hardware_output_timing_status=output_status,
+            hardware_output_timing_reason=output_reason,
             reason="All sampled tasks use one NI-DAQ device",
         )
 
@@ -91,6 +110,12 @@ def build_nidaq_timing_plan(
             task_start_order=task_start_order,
             resolved_devices=resolved_devices,
             synchronization_quality="independent_host_estimated",
+            clock_producer=clock_producer,
+            clock_producer_device=master,
+            consumer_devices=input_devices,
+            hardware_output_devices=output_devices,
+            hardware_output_timing_status=output_status,
+            hardware_output_timing_reason=output_reason,
             reason=(
                 "Independent device clocks are diagnostic-only"
                 if not valid
@@ -141,12 +166,11 @@ def build_nidaq_timing_plan(
         sample_clock = timing.sample_clock_source
         resolved_mode = "external"
         quality = "hardware_external"
+        clock_producer = "external"
     else:
         reference_clock = timing.reference_clock_source or "PXI_CLK10"
-        start_trigger = timing.start_trigger_source or f"/{master}/ai/StartTrigger"
-        master_has_analog_input = any(
-            device_name_from_channel(channel.physical_channel) == master
-            for channel in configuration.analog_channels
+        start_trigger = timing.start_trigger_source or (
+            f"/{master}/ai/StartTrigger" if master_has_analog_input else None
         )
         sample_clock = timing.sample_clock_source or (
             f"/{master}/ai/SampleClock"
@@ -213,6 +237,12 @@ def build_nidaq_timing_plan(
         task_start_order=task_start_order,
         resolved_devices=resolved_devices,
         synchronization_quality=quality,
+        clock_producer=clock_producer,
+        clock_producer_device=(None if clock_producer == "external" else master),
+        consumer_devices=input_devices,
+        hardware_output_devices=output_devices,
+        hardware_output_timing_status=output_status,
+        hardware_output_timing_reason=output_reason,
         reason=(
             "Resolved shared PXI reference/start/sample timing"
             if resolved_mode == "backplane"
