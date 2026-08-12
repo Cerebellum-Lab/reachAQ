@@ -307,24 +307,7 @@ def test_agx001_20260205_11():
 @pytest.mark.parametrize("frames_per_batch_per_cam,select_frames_method", [
     # (1, "last_one"),
     (2, "all_most_likely"),  # using most likely looks better here
-    pytest.param(2, "last_one", marks=pytest.mark.xfail),
-    # so the second pair of frames give missing L_Hand in locations:
-    #
-    #         elif isinstance(obj1, dict) and isinstance(obj2, dict):
-    # >           assert set(obj1) == set(obj2)
-    # E           AssertionError: assert {'Diamond', 'LH_flat', 'Triangle', 'Mouth', 'Pellet', 'Star', 'Nose'} \
-    #               == {'L_Hand', 'Diamond', 'LH_flat', 'Mouth', 'Star', 'Triangle', 'Nose', 'Pellet'}
-    # E             Full diff:
-    # E               {
-    # E                   'Diamond',
-    # E                   'LH_flat',
-    # E             -     'L_Hand',
-    # E                   'Mouth',
-    # E                   'Nose',
-    # E                   'Pellet',
-    # E                   'Star',
-    # E                   'Triangle',
-    # E               }
+    (2, "last_one"),
 
     # (3, "last_one"),
     (3, "all_most_likely"),
