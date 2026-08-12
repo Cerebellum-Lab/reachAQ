@@ -120,6 +120,7 @@ from tools.acquisition.model.pellet_cycle_controller import (
 )
 from tools.acquisition.model.recording_session_controller import (
     RecordingSessionController,
+    SessionGeneration,
 )
 from tools.acquisition.model.acquisition_controller import AcquisitionController
 from tools.acquisition.model.coordinate_model import CoordinateModel
@@ -452,6 +453,7 @@ class AppModel(ObservableObject):
         self._cams_record_enabled = mp_ctx.Value(ctypes.c_bool, False)
         self._cams_synced_frame_index = mp_ctx.Value(ctypes.c_int64, -1)
         self._cams_record_start_perf = mp_ctx.Value(ctypes.c_double, math.nan)
+        self._record_generation_value = mp_ctx.Value(ctypes.c_uint64, 0)
 
         self._record_stop_sema = mp_ctx.Semaphore(0)
         # and this is used to notify the end of recording from the reach-camera video_record threads to the offline one,
@@ -625,6 +627,7 @@ class AppModel(ObservableObject):
             synced_cam_frame_index=self._cams_synced_frame_index,
             synced_cam_recording=self._cams_record_enabled,
             record_start_perf=self._cams_record_start_perf,
+            record_generation=self._record_generation_value,
             record_stop_sema=self._record_stop_sema,
         )
 
@@ -824,11 +827,13 @@ class AppModel(ObservableObject):
     def session_recording_status(self) -> SessionRecordingStatus:
         return self._recording_session.status
 
-    def _set_session_recording_status(self, status: SessionRecordingStatus) -> None:
-        previous = self._recording_session.status
+    def _publish_session_recording_transition(
+        self,
+        previous: SessionRecordingStatus,
+        status: SessionRecordingStatus,
+    ) -> None:
         if status == previous:
             return
-        self._recording_session.transition(status)
         logger.info("session recording status: %s -> %s", previous.value, status.value)
         self.property_changed(self.Props.SESSION_RECORDING_STATUS, status, previous)
         self.property_changed(
@@ -836,6 +841,29 @@ class AppModel(ObservableObject):
             self.recording_blockers,
             None,
         )
+
+    def _set_session_recording_status(
+        self,
+        status: SessionRecordingStatus,
+        *,
+        expected: Optional[Tuple[SessionRecordingStatus, ...]] = None,
+        token: Optional[SessionGeneration] = None,
+    ) -> bool:
+        previous = self._recording_session.transition(
+            status,
+            expected=expected,
+            token=token,
+        )
+        if previous is None:
+            logger.warning(
+                "ignored stale/invalid session transition to %s: expected=%s token=%s",
+                status.value,
+                expected,
+                token,
+            )
+            return False
+        self._publish_session_recording_transition(previous, status)
+        return True
 
     def start_recording(self) -> bool:
         if not self._acquisition.started or self._status == AppModelStatus.IDLE:
@@ -877,7 +905,11 @@ class AppModel(ObservableObject):
         self.persist_stopped_session_notes()
         self._editable_notes_project = None
         self.notes = ""
-        self._recording_session.prepare_record(
+        project = self._project_info
+        if project is None:
+            return False
+        reservation = self._recording_session.begin_record(
+            project.short_id,
             self._acquisition.subsystems.snapshot(),
             animal_snapshot=(
                 None
@@ -885,17 +917,25 @@ class AppModel(ObservableObject):
                 else self._selected_animal.session_snapshot()
             ),
         )
+        if reservation is None:
+            logger.warning(
+                "start_recording lost session reservation while %s",
+                self._recording_session.status.value,
+            )
+            return False
+        previous_status, session_token = reservation
+        self._publish_session_recording_transition(
+            previous_status,
+            SessionRecordingStatus.ARMING,
+        )
+        self._record_generation_value.value = session_token.generation
+        project.session_generation = session_token.generation
         self._set_subsystem_status(
             SubsystemId.OFFLINE_ANALYSIS,
             SubsystemState.DISABLED,
             reason="recording active; no stopped session pending",
         )
         self._abort_had_recording_started = False
-        self._set_session_recording_status(SessionRecordingStatus.ARMING)
-        project = self._project_info
-        if project is None:
-            self._set_session_recording_status(SessionRecordingStatus.READY)
-            return False
         self._session_data_recorder.arm(
             project,
             source_manifest=self._build_session_source_manifest(),
@@ -905,19 +945,27 @@ class AppModel(ObservableObject):
         except Exception as err:
             logger.exception("manual recording start failed: %s", err)
             self._session_data_recorder.abort()
-            self._set_session_recording_status(SessionRecordingStatus.READY)
+            self._set_session_recording_status(
+                SessionRecordingStatus.READY,
+                expected=(SessionRecordingStatus.ARMING,),
+                token=session_token,
+            )
             self.on_error("Recording failed", str(err))
             return False
         if not started:
             self._session_data_recorder.abort()
-            self._set_session_recording_status(SessionRecordingStatus.READY)
+            self._set_session_recording_status(
+                SessionRecordingStatus.READY,
+                expected=(SessionRecordingStatus.ARMING,),
+                token=session_token,
+            )
             return False
         self._aborted_session_ids.discard(project.short_id)
         if self._recording_session.status == SessionRecordingStatus.ARMING:
             self._record_start_timer.cancel()
             self._record_start_timer = make_daemon_timer(
                 10.0,
-                self._record_start_timed_out,
+                lambda token=session_token: self._record_start_timed_out(token),
             )
             self._record_start_timer.start()
         return True
@@ -990,7 +1038,16 @@ class AppModel(ObservableObject):
         })
         return tuple(sources)
 
-    def _record_start_timed_out(self) -> None:
+    def _record_start_timed_out(
+        self,
+        token: Optional[SessionGeneration] = None,
+    ) -> None:
+        if token is not None and not self._recording_session.is_current(
+            token,
+            statuses=(SessionRecordingStatus.ARMING,),
+        ):
+            logger.info("ignoring stale record-start timeout: %s", token)
+            return
         if self._recording_session.status != SessionRecordingStatus.ARMING:
             return
         logger.error("Timed out waiting for the primary camera to begin recording")
@@ -999,9 +1056,16 @@ class AppModel(ObservableObject):
             "The primary camera did not begin recording within 10 seconds. "
             "The partial session will be aborted.",
         )
-        self.abort_recording()
+        if token is None:
+            self.abort_recording()
+        else:
+            self.abort_recording(token=token)
 
-    def _start_automatic_stop_policy(self, start_perf_time: float) -> None:
+    def _start_automatic_stop_policy(
+        self,
+        start_perf_time: float,
+        token: Optional[SessionGeneration] = None,
+    ) -> None:
         policy = self._session_stop_policy
         if policy is None:
             return
@@ -1011,7 +1075,9 @@ class AppModel(ObservableObject):
             self._automatic_stop_timer.cancel()
             self._automatic_stop_timer = make_daemon_timer(
                 duration,
-                self._evaluate_automatic_stop_policy,
+                lambda token=token: self._evaluate_automatic_stop_policy(
+                    token=token
+                ),
             )
             self._automatic_stop_timer.start()
 
@@ -1026,7 +1092,14 @@ class AppModel(ObservableObject):
         self,
         *,
         protocol_complete: bool = False,
+        token: Optional[SessionGeneration] = None,
     ) -> Optional[SessionStopEvaluation]:
+        if token is not None and not self._recording_session.is_current(
+            token,
+            statuses=(SessionRecordingStatus.RECORDING,),
+        ):
+            logger.info("ignoring stale automatic-stop callback: %s", token)
+            return None
         policy = self._session_stop_policy
         if (
             policy is None
@@ -1048,7 +1121,9 @@ class AppModel(ObservableObject):
             if self._stop_drain_timer is no_op_timer:
                 self._stop_drain_timer = make_daemon_timer(
                     policy.configuration.drain_timeout_seconds,
-                    self._evaluate_automatic_stop_policy,
+                    lambda token=token: self._evaluate_automatic_stop_policy(
+                        token=token
+                    ),
                 )
                 self._stop_drain_timer.start()
             logger.info(
@@ -1073,13 +1148,25 @@ class AppModel(ObservableObject):
             )
             logger.error(message)
             self.on_error("Automatic recording stop timeout", message)
-        self._stop_recording_with_reason(evaluation.reason, evaluation.decision)
+        if token is None:
+            self._stop_recording_with_reason(
+                evaluation.reason,
+                evaluation.decision,
+            )
+        else:
+            self._stop_recording_with_reason(
+                evaluation.reason,
+                evaluation.decision,
+                token=token,
+            )
         return evaluation
 
     def _stop_recording_with_reason(
         self,
         reason: Optional[SessionStopReason],
         decision: SessionStopDecision = SessionStopDecision.STOP,
+        *,
+        token: Optional[SessionGeneration] = None,
     ) -> bool:
         ending_reason = {
             SessionStopReason.DURATION_LIMIT: RecordingEndingReason.DURATION_LIMIT,
@@ -1088,10 +1175,18 @@ class AppModel(ObservableObject):
         }.get(reason, RecordingEndingReason.STOP_DRAIN_TIMEOUT)
         if decision is SessionStopDecision.TIMEOUT_ERROR:
             ending_reason = RecordingEndingReason.STOP_DRAIN_TIMEOUT
-        return self._stop_recording(ending_reason)
+        return self._stop_recording(ending_reason, token=token)
 
-    def _stop_recording(self, reason: RecordingEndingReason) -> bool:
-        if self._recording_session.status != SessionRecordingStatus.RECORDING:
+    def _stop_recording(
+        self,
+        reason: RecordingEndingReason,
+        *,
+        token: Optional[SessionGeneration] = None,
+    ) -> bool:
+        token = token or self._recording_session.token()
+        if token is not None and not self._recording_session.is_current(
+            token, statuses=(SessionRecordingStatus.RECORDING,)
+        ):
             logger.warning(
                 "stop_recording refused while %s",
                 self._recording_session.status.value,
@@ -1099,16 +1194,30 @@ class AppModel(ObservableObject):
             return False
         self._cancel_automatic_stop_timers()
         self._recording_session.analysis_finished = False
-        self._set_session_recording_status(SessionRecordingStatus.STOPPING)
+        if not self._set_session_recording_status(
+            SessionRecordingStatus.STOPPING,
+            expected=(SessionRecordingStatus.RECORDING,),
+            token=token,
+        ):
+            return False
         stopped = self._behavior.algorithm.end_capture_session(reason=reason)
         if not stopped:
-            self._set_session_recording_status(SessionRecordingStatus.RECORDING)
+            self._set_session_recording_status(
+                SessionRecordingStatus.RECORDING,
+                expected=(SessionRecordingStatus.STOPPING,),
+                token=token,
+            )
         return bool(stopped)
 
     def stop_recording(self) -> bool:
         return self._stop_recording(RecordingEndingReason.MANUAL_STOP)
 
-    def abort_recording(self) -> bool:
+    def abort_recording(
+        self,
+        *,
+        token: Optional[SessionGeneration] = None,
+    ) -> bool:
+        token = token or self._recording_session.token()
         previous_status = self._recording_session.status
         if previous_status not in {
             SessionRecordingStatus.ARMING,
@@ -1117,17 +1226,33 @@ class AppModel(ObservableObject):
         }:
             logger.warning("abort_recording refused while %s", self._recording_session.status.value)
             return False
+        if token is not None and not self._recording_session.is_current(
+            token,
+            statuses=(
+                SessionRecordingStatus.ARMING,
+                SessionRecordingStatus.RECORDING,
+                SessionRecordingStatus.ANALYZING,
+            ),
+        ):
+            logger.warning("abort_recording refused for stale session: %s", token)
+            return False
         project = self._project_info
         if project is None:
             return False
         self._aborting_project = project.to_local_value()
+        if not self._set_session_recording_status(
+            SessionRecordingStatus.ABORTING,
+            expected=(previous_status,),
+            token=token,
+        ):
+            self._aborting_project = None
+            return False
         self._aborted_session_ids.add(self._aborting_project.short_id)
         self._session_data_recorder.abort()
         self._cancel_automatic_stop_timers()
         self._recording_session.pending_end_perf = None
         self._record_start_timer.cancel()
         self._record_start_timer = no_op_timer
-        self._set_session_recording_status(SessionRecordingStatus.ABORTING)
         if previous_status is SessionRecordingStatus.ANALYZING:
             logger.notice(
                 "Cancelling post-session analysis before deleting %s",
@@ -1138,14 +1263,18 @@ class AppModel(ObservableObject):
             except Exception as err:
                 logger.exception("Failed to stop post-session analysis")
                 self.on_error("Analysis cancellation failed", str(err))
-                self._set_session_recording_status(previous_status)
+                self._set_session_recording_status(
+                    previous_status,
+                    expected=(SessionRecordingStatus.ABORTING,),
+                    token=token,
+                )
                 self._aborted_session_ids.discard(
                     self._aborting_project.short_id
                 )
                 self._aborting_project = None
                 return False
             self._behavior.on_prepare_capture()
-            self._finish_abort_recording()
+            self._finish_abort_recording(token=token)
             synchronization = self._acquisition.subsystems.get(
                 SubsystemId.REACH_SYNCHRONIZATION
             )
@@ -1164,19 +1293,32 @@ class AppModel(ObservableObject):
             reason=RecordingEndingReason.MANUAL_ABORT,
         )
         if not stopped:
-            self._set_session_recording_status(previous_status)
+            self._set_session_recording_status(
+                previous_status,
+                expected=(SessionRecordingStatus.ABORTING,),
+                token=token,
+            )
             self._aborting_project = None
             return False
         if previous_status == SessionRecordingStatus.ARMING:
             self._abort_cleanup_timer.cancel()
             self._abort_cleanup_timer = make_daemon_timer(
                 1.0,
-                self._finish_abort_if_never_started,
+                lambda token=token: self._finish_abort_if_never_started(token),
             )
             self._abort_cleanup_timer.start()
         return True
 
-    def _finish_abort_if_never_started(self) -> None:
+    def _finish_abort_if_never_started(
+        self,
+        token: Optional[SessionGeneration] = None,
+    ) -> None:
+        if token is not None and not self._recording_session.is_current(
+            token,
+            statuses=(SessionRecordingStatus.ABORTING,),
+        ):
+            logger.info("ignoring stale abort-cleanup callback: %s", token)
+            return
         if (
             self._recording_session.status == SessionRecordingStatus.ABORTING
             and not self._abort_had_recording_started
@@ -1185,7 +1327,7 @@ class AppModel(ObservableObject):
                 for camera in self._get_recording_cams()
             )
         ):
-            self._finish_abort_recording()
+            self._finish_abort_recording(token=token)
 
     def check_target_status_valid(self, target: AppModelStatus):
         current_status = self._status
@@ -1495,8 +1637,41 @@ class AppModel(ObservableObject):
             if cam_idx == reference_cam_idx:
                 if new_status == CaptureProcessStatus.RECORDING:
                     first_frame_perf, first_frame_when, first_frame_time, *r_args = r_args
+                    first_frame_id = (
+                        int(r_args[0])
+                        if r_args
+                        else int(self._cams_synced_frame_index.value)
+                    )
+                    message_generation = int(r_args[1]) if len(r_args) > 1 else None
+                    session_token = self._recording_session.token()
+                    if (
+                        session_token is not None
+                        and message_generation not in (None, 0, session_token.generation)
+                    ):
+                        logger.warning(
+                            "ignoring stale camera RECORDING callback: camera=%s "
+                            "message_generation=%s active=%s",
+                            cam_idx,
+                            message_generation,
+                            session_token,
+                        )
+                        return
                     p_now = first_frame_perf
                     project = self._project_info
+                    if (
+                        session_token is not None
+                        and (
+                            project is None
+                            or project.short_id != session_token.session_id
+                        )
+                    ):
+                        logger.warning(
+                            "ignoring camera RECORDING callback for wrong project: "
+                            "project=%s active=%s",
+                            None if project is None else project.short_id,
+                            session_token,
+                        )
+                        return
                     if project is not None:
                         project.start_record_timestamp = first_frame_time
                         primary = next(
@@ -1504,12 +1679,7 @@ class AppModel(ObservableObject):
                             for camera in self._cameras
                             if camera.camera_index == cam_idx
                         )
-                        first_frame_id = (
-                            int(r_args[0])
-                            if r_args
-                            else int(self._cams_synced_frame_index.value)
-                        )
-                        self._recording_session.boundary = SessionBoundary(
+                        boundary = SessionBoundary(
                             session_id=project.short_id,
                             primary_camera=primary.name,
                             primary_frame_id=first_frame_id,
@@ -1517,6 +1687,17 @@ class AppModel(ObservableObject):
                             start_wall_time=float(first_frame_time),
                             camera_when=float(first_frame_when),
                         )
+                        if session_token is None:
+                            self._recording_session.boundary = boundary
+                        elif not self._recording_session.set_boundary(
+                            boundary,
+                            session_token,
+                        ):
+                            logger.warning(
+                                "ignoring stale camera recording boundary: %s",
+                                session_token,
+                            )
+                            return
                     self._session_data_recorder.commit_start(
                         first_frame_perf,
                         first_frame_time,
@@ -1534,21 +1715,49 @@ class AppModel(ObservableObject):
                         get_perf_now(),
                     )
                     if self._recording_session.status == SessionRecordingStatus.ARMING:
-                        self._set_session_recording_status(SessionRecordingStatus.RECORDING)
-                        self._start_automatic_stop_policy(first_frame_perf)
+                        if self._set_session_recording_status(
+                            SessionRecordingStatus.RECORDING,
+                            expected=(SessionRecordingStatus.ARMING,),
+                            token=session_token,
+                        ):
+                            self._start_automatic_stop_policy(
+                                first_frame_perf,
+                                session_token,
+                            )
                 else:
                     p_now = get_perf_now()
                 algo.set_capture_status(new_status, perf_now=p_now)
                 if new_status == CaptureProcessStatus.RUNNING:
-                    if self._recording_session.status == SessionRecordingStatus.STOPPING:
-                        self._recording_session.pending_end_perf = (
-                            r_args[0] if r_args else get_perf_now()
+                    message_generation = (
+                        int(r_args[2]) if len(r_args) > 2 else None
+                    )
+                    session_token = self._recording_session.token()
+                    if (
+                        session_token is not None
+                        and message_generation not in (None, 0, session_token.generation)
+                    ):
+                        logger.warning(
+                            "ignoring stale camera RUNNING callback: camera=%s "
+                            "message_generation=%s active=%s",
+                            cam_idx,
+                            message_generation,
+                            session_token,
                         )
+                        return
+                    if self._recording_session.status == SessionRecordingStatus.STOPPING:
+                        end_perf = r_args[0] if r_args else get_perf_now()
+                        if session_token is None:
+                            self._recording_session.pending_end_perf = end_perf
+                        else:
+                            self._recording_session.set_pending_end(
+                                end_perf,
+                                session_token,
+                            )
                     elif (
                         self._recording_session.status == SessionRecordingStatus.ABORTING
                         and not self._abort_had_recording_started
                     ):
-                        self._finish_abort_recording()
+                        self._finish_abort_recording(token=session_token)
             else:
                 logger.verbose("not handling non-primary camera status, cam_idx=%s status=%s",
                                cam_idx, new_status)
@@ -1556,17 +1765,36 @@ class AppModel(ObservableObject):
             cam_idx, frames_written, project, *r_args = args
             if project is None:
                 return
+            message_generation = int(r_args[0]) if r_args else None
+            session_token = self._recording_session.token()
+            if session_token is not None and (
+                project.short_id != session_token.session_id
+                or message_generation not in (None, 0, session_token.generation)
+            ):
+                logger.warning(
+                    "ignoring stale camera-close callback: camera=%s project=%s "
+                    "message_generation=%s active=%s",
+                    cam_idx,
+                    project.short_id,
+                    message_generation,
+                    session_token,
+                )
+                return
             recording_cams = self._get_recording_cams()
             recording_cam_indices = tuple(cam.camera_index for cam in recording_cams)
             if cam_idx in recording_cam_indices:
-                cams_closed_finished[cam_idx] = (project, frames_written)
+                cams_closed_finished[cam_idx] = (
+                    project,
+                    frames_written,
+                    message_generation,
+                )
                 if all(cam.camera_index in cams_closed_finished for cam in recording_cams):
                     project = cams_closed_finished[recording_cams[0].camera_index][0]
                     session_dir = Path(project.get_session_path().location)
                     for camera in recording_cams:
-                        camera_project, camera_frames = cams_closed_finished[
-                            camera.camera_index
-                        ]
+                        camera_project, camera_frames, _camera_generation = (
+                            cams_closed_finished[camera.camera_index]
+                        )
                         video_path, _, _ = camera_project.get_video_path(
                             camera.name,
                             allow_overwrite=True,
@@ -1613,9 +1841,18 @@ class AppModel(ObservableObject):
                             failure=message,
                         )
                     if self._recording_session.status == SessionRecordingStatus.ABORTING:
-                        self._finish_abort_recording()
+                        if session_token is None:
+                            self._finish_abort_recording()
+                        else:
+                            self._finish_abort_recording(token=session_token)
                     elif self._recording_session.status == SessionRecordingStatus.STOPPING:
-                        self._complete_stopped_recording(project)
+                        if session_token is None:
+                            self._complete_stopped_recording(project)
+                        else:
+                            self._complete_stopped_recording(
+                                project,
+                                token=session_token,
+                            )
         else:
             logger.warning("unhandled command: %s raw=%s", cmd, raw)
 
@@ -4240,12 +4477,13 @@ class AppModel(ObservableObject):
                 return
             before_status = self._status
             recording_status = self._recording_session.status
+            session_token = self._recording_session.token()
         if recording_status in {
             SessionRecordingStatus.ARMING,
             SessionRecordingStatus.RECORDING,
         }:
             logger.warning("Acquisition stop requested during recording; aborting the session")
-            self.abort_recording()
+            self.abort_recording(token=session_token)
         # always remove status-file on stop:
         status_file_path = self.status_file_path.expanduser()
         status_file_path.unlink(missing_ok=True)
@@ -4257,10 +4495,13 @@ class AppModel(ObservableObject):
             # must be set before try reload training plans, given checked in it
             self._acquisition.mark_stopped()
             if self._recording_session.status == SessionRecordingStatus.ABORTING:
-                self._finish_abort_recording()
+                self._finish_abort_recording(token=session_token)
             elif self._recording_session.status != SessionRecordingStatus.READY:
                 self._session_data_recorder.abort()
-                self._set_session_recording_status(SessionRecordingStatus.READY)
+                self._set_session_recording_status(
+                    SessionRecordingStatus.READY,
+                    token=session_token,
+                )
             analysis = self._analysis
             analysis.project_info = None
             self.status = AppModelStatus.IDLE
@@ -5273,6 +5514,30 @@ class AppModel(ObservableObject):
         if project.short_id in self._aborted_session_ids:
             logger.info("ignoring session-ending callback for aborted %s", project.short_id)
             return
+        session_token = self._recording_session.token()
+        project_generation = int(getattr(project, "session_generation", 0))
+        if session_token is not None and (
+            project.short_id != session_token.session_id
+            or project_generation not in (0, session_token.generation)
+        ):
+            logger.warning(
+                "ignoring stale session-ending callback: project=%s "
+                "generation=%s active=%s",
+                project.short_id,
+                project_generation,
+                session_token,
+            )
+            return
+        if self._recording_session.status not in {
+            SessionRecordingStatus.STOPPING,
+            SessionRecordingStatus.ANALYZING,
+        }:
+            logger.warning(
+                "ignoring session-ending callback while state is %s: project=%s",
+                self._recording_session.status.value,
+                project.short_id,
+            )
+            return
         ledger = self._trial_ledger
         if ledger is not None:
             self._pellet_cycles.finalize_pending_without_analysis(
@@ -5329,12 +5594,38 @@ class AppModel(ObservableObject):
                 )
             finally:
                 self._set_session_recording_status(
-                    SessionRecordingStatus.READY
+                    SessionRecordingStatus.READY,
+                    expected=(SessionRecordingStatus.ANALYZING,),
+                    token=session_token,
                 )
 
-    def _complete_stopped_recording(self, project: ProjectInfo) -> None:
-        end_perf = self._recording_session.pending_end_perf
-        self._recording_session.pending_end_perf = None
+    def _complete_stopped_recording(
+        self,
+        project: ProjectInfo,
+        *,
+        token: Optional[SessionGeneration] = None,
+    ) -> None:
+        token = token or self._recording_session.token()
+        if token is not None and (
+            not self._recording_session.is_current(
+                token,
+                statuses=(SessionRecordingStatus.STOPPING,),
+            )
+            or project.short_id != token.session_id
+        ):
+            logger.warning(
+                "ignoring stale stopped-recording completion: project=%s active=%s",
+                project.short_id,
+                token,
+            )
+            return
+        end_perf = (
+            self._recording_session.pending_end_perf
+            if token is None
+            else self._recording_session.take_pending_end(token)
+        )
+        if token is None:
+            self._recording_session.pending_end_perf = None
         if end_perf is None:
             end_perf = get_perf_now()
             logger.warning("Primary camera did not report a final recorded-frame timestamp")
@@ -5343,7 +5634,12 @@ class AppModel(ObservableObject):
             raise RuntimeError(
                 f"Missing canonical recording boundary for {project.short_id}"
             )
-        self._recording_session.boundary = boundary.with_end(end_perf)
+        completed_boundary = boundary.with_end(end_perf)
+        if token is None:
+            self._recording_session.boundary = completed_boundary
+        elif not self._recording_session.set_boundary(completed_boundary, token):
+            logger.warning("stopped-recording boundary became stale: %s", token)
+            return
         project.start_record_timestamp = self._recording_session.boundary.start_wall_time
         try:
             self._pellet_cycles.snapshot_for_stop(
@@ -5409,7 +5705,11 @@ class AppModel(ObservableObject):
                 SubsystemId.OFFLINE_ANALYSIS,
                 reason="analyzing stopped session",
             )
-            self._set_session_recording_status(SessionRecordingStatus.ANALYZING)
+            self._set_session_recording_status(
+                SessionRecordingStatus.ANALYZING,
+                expected=(SessionRecordingStatus.STOPPING,),
+                token=token,
+            )
         try:
             self._editable_notes_project = project.to_local_value()
             self._save_project_metadata(
@@ -5429,10 +5729,23 @@ class AppModel(ObservableObject):
         finally:
             if self._recording_session.analysis_finished:
                 self._set_session_recording_status(
-                    SessionRecordingStatus.READY
+                    SessionRecordingStatus.READY,
+                    expected=(SessionRecordingStatus.STOPPING,),
+                    token=token,
                 )
 
-    def _finish_abort_recording(self) -> None:
+    def _finish_abort_recording(
+        self,
+        *,
+        token: Optional[SessionGeneration] = None,
+    ) -> None:
+        token = token or self._recording_session.token()
+        if token is not None and not self._recording_session.is_current(
+            token,
+            statuses=(SessionRecordingStatus.ABORTING,),
+        ):
+            logger.warning("ignoring stale abort completion: %s", token)
+            return
         self._record_start_timer.cancel()
         self._record_start_timer = no_op_timer
         self._abort_cleanup_timer.cancel()
@@ -5440,7 +5753,11 @@ class AppModel(ObservableObject):
         project = self._aborting_project
         if project is None:
             logger.error("abort completed without an associated project")
-            self._set_session_recording_status(SessionRecordingStatus.READY)
+            self._set_session_recording_status(
+                SessionRecordingStatus.READY,
+                expected=(SessionRecordingStatus.ABORTING,),
+                token=token,
+            )
             return
         try:
             day_path = Path(project.get_day_path(skip_ensure=True)[0]).resolve()
@@ -5485,7 +5802,11 @@ class AppModel(ObservableObject):
             self._aborting_project = None
             self._editable_notes_project = None
             self.notes = ""
-            self._set_session_recording_status(SessionRecordingStatus.READY)
+            self._set_session_recording_status(
+                SessionRecordingStatus.READY,
+                expected=(SessionRecordingStatus.ABORTING,),
+                token=token,
+            )
 
     def _remove_timestamps_txt_files(
         self,

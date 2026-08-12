@@ -945,6 +945,59 @@ def test_record_start_timeout_aborts_partial_session(app_model):
     abort.assert_called_once_with()
 
 
+def test_stale_session_generation_cannot_timeout_or_close_new_session(app_model):
+    first_reservation = app_model._recording_session.begin_record(
+        app_model.project.short_id,
+        {},
+    )
+    assert first_reservation is not None
+    _, first_token = first_reservation
+    app_model._recording_session.transition(
+        SessionRecordingStatus.ABORTING,
+        expected=(SessionRecordingStatus.ARMING,),
+        token=first_token,
+    )
+    app_model._recording_session.transition(
+        SessionRecordingStatus.READY,
+        expected=(SessionRecordingStatus.ABORTING,),
+        token=first_token,
+    )
+    second_reservation = app_model._recording_session.begin_record(
+        app_model.project.short_id,
+        {},
+    )
+    assert second_reservation is not None
+    _, second_token = second_reservation
+
+    with mock.patch.object(app_model, "abort_recording") as abort:
+        app_model._record_start_timed_out(first_token)
+    abort.assert_not_called()
+    assert app_model._recording_session.is_current(
+        second_token,
+        statuses=(SessionRecordingStatus.ARMING,),
+    )
+
+    camera = app_model.reach_cameras[0]
+    camera.is_enabled = True
+    camera.is_recording_enabled = True
+    camera_closures = {}
+    with mock.patch.object(app_model, "_complete_stopped_recording") as complete:
+        app_model._handle_proc_msg(
+            (
+                SystemStatusMessageKind.CAMERA_RECORDING_CLOSED_FINISHED,
+                (
+                    camera.camera_index,
+                    10,
+                    app_model.project.to_local_value(),
+                    first_token.generation,
+                ),
+            ),
+            cams_closed_finished=camera_closures,
+        )
+    assert camera_closures == {}
+    complete.assert_not_called()
+
+
 def test_required_failed_subsystem_is_exposed_as_recording_blocker(app_model):
     app_model._acquisition.started = True
     app_model._set_subsystem_status(
