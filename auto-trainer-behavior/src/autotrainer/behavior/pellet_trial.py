@@ -64,6 +64,7 @@ class TrialOutcome(str, enum.Enum):
     FAILURE = "failure"
     PELLET_MISSING = "pellet_missing"
     NO_REACH = "no_reach"
+    UNSCORED = "unscored"
     INCOMPLETE = "incomplete"
     ABORTED = "aborted"
     HARDWARE_ERROR = "hardware_error"
@@ -681,6 +682,7 @@ class PelletTrialLedger:
                     attempt.logical_trial_complete
                     and (
                         attempt.outcome is TrialOutcome.PENDING_ANALYSIS
+                        or attempt.outcome is TrialOutcome.UNSCORED
                         or attempt.outcome in self.configuration.counted_outcomes
                     )
                     for attempt in non_hardware

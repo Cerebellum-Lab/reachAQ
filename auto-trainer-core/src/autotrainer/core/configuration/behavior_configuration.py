@@ -139,6 +139,7 @@ class SessionControlConfiguration:
         "failure",
         "pellet_missing",
         "no_reach",
+        "unscored",
         "incomplete",
         "aborted",
     )

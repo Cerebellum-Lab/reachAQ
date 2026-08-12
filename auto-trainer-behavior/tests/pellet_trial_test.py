@@ -297,6 +297,15 @@ def test_presented_attempt_without_reach_is_not_classified_as_missing_pellet():
     assert finalized[0].outcome is not TrialOutcome.PELLET_MISSING
 
 
+def test_unscored_completed_cycle_counts_without_becoming_scored():
+    ledger = PelletTrialLedger("session001")
+    ledger.begin_send(1.0, 11.0)
+    ledger.acknowledge_presentation(1.1, 11.1)
+    ledger.finalize(TrialOutcome.UNSCORED, 2.0, 12.0)
+    assert ledger.count(TrialCountBasis.COMPLETED) == 1
+    assert ledger.count(TrialCountBasis.SCORED) == 0
+
+
 def test_session_frame_analysis_is_reconciled_to_attempt_windows_once():
     ledger = PelletTrialLedger("session001")
     ledger.begin_send(101.0, 1001.0, operation_id="send-1")

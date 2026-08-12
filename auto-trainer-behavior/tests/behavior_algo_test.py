@@ -215,6 +215,11 @@ def test_delivery_disabled_defaults(algo):
     increase_simulate_perf_now(algo.active_config.pellet_delivery.pellet_send_wait_delay)
     assert algo.can_send_pellet() is True
 
+    algo.pellet_send_block_reason = "waiting for trial analysis"
+    assert algo.can_send_pellet() is False
+    algo.pellet_send_block_reason = ""
+    assert algo.can_send_pellet() is True
+
 
 def test_recorded_session_can_enable_pellet_cycles_without_training_mode(algo):
     algo.active_config.session_control.automatic_pellet_cycles_enabled = True

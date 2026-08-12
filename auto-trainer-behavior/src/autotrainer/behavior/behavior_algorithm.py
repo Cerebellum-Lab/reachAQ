@@ -220,6 +220,7 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
         self._start_session_reason = "NA"
         self._stop_session_reason = RecordingEndingReason.NA
         self._pellet_automation_stop_requested = False
+        self._pellet_send_block_reason = ""
         self._timer_end_capture_session = no_op_timer
         self._prev_can_load_pellet_log_refuse_perf_c = -math.inf
 
@@ -1002,7 +1003,11 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
     #
 
     def can_send_pellet(self):
-        if self._algo_paused or not self._pellet_automation_enabled_for_session():
+        if (
+            self._algo_paused
+            or self._pellet_send_block_reason
+            or not self._pellet_automation_enabled_for_session()
+        ):
             return False
         cfg = self._active_config
         if not cfg.pellet_delivery.is_enabled:
@@ -1019,6 +1024,14 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
             self._is_in_session
             and t_since_rec_started >= cfg.pellet_delivery.pellet_send_wait_delay
         )
+
+    @property
+    def pellet_send_block_reason(self) -> str:
+        return self._pellet_send_block_reason
+
+    @pellet_send_block_reason.setter
+    def pellet_send_block_reason(self, value: str) -> None:
+        self._pellet_send_block_reason = str(value or "")
 
     def would_load_pellet(
         self,
