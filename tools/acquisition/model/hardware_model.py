@@ -68,6 +68,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         super().__init__(event_names=("device_event", "command_failed"))
 
         self._lock = threading.RLock()  # **required** re-entrant lock !!
+        self._can_lifecycle_lock = threading.RLock()
         self._safety_shutdown_lock = threading.Lock()
         self._safety_shutdown_started = False
         self._safety_shutdown_thread: Optional[threading.Thread] = None
@@ -94,6 +95,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         self._nidaq_enabled = False
 
         self._pending_tokens: Dict[UUID, Tuple[SystemCommandKind, float]] = {}
+        self._command_outcomes: Dict[UUID, Tuple[str, str]] = {}
 
         message_handler.property_changed += self._message_handler_property_changed
         message_handler.ack_received += self._ack_received
@@ -157,6 +159,11 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
                         expired_tokens.add(pending_token)
                 for expired in expired_tokens:
                     self._pending_tokens.pop(expired, None)
+                    self._remember_command_outcome(
+                        expired,
+                        "timed_out",
+                        "command acknowledgement was not received within 30 seconds",
+                    )
                 after_commands = list(self._pending_tokens.values())
             if len(expired_tokens) > 0:
                 self._refresh_cmd_in_progress(after_commands)
@@ -458,7 +465,27 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         dev_dev = None if dev is None else dev.device
         return dev_dev is not None and dev_dev.connected
 
-    def connect(self, cmd_queue: Queue, *, _recovery: bool = False):
+    def connect(
+        self,
+        cmd_queue: Queue,
+        *,
+        _recovery: bool = False,
+        _generation: Optional[int] = None,
+    ):
+        with self._can_lifecycle_lock:
+            return self._connect_locked(
+                cmd_queue,
+                _recovery=_recovery,
+                _generation=_generation,
+            )
+
+    def _connect_locked(
+        self,
+        cmd_queue: Queue,
+        *,
+        _recovery: bool,
+        _generation: Optional[int],
+    ):
         if not self._can_enabled:
             logger.notice("Skipping hardware connection because CAN bus is disabled in configuration")
             log_hardware_initialization(logger, "SKIP | CAN/pellet controller | CAN disabled")
@@ -470,10 +497,16 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         if not _recovery:
             self._can_recovery_cancel.clear()
             with self._can_recovery_lock:
+                self._can_recovery_generation += 1
                 self._first_can_failure = None
                 self._can_recovery_failure = None
         self._command_queue = cmd_queue
-        self._set_can_connection_state("connecting")
+        if (
+            _generation is not None
+            and not self._can_recovery_is_current(_generation)
+        ):
+            return False
+        self._set_can_connection_state("connecting", generation=_generation)
         connect_started = time.perf_counter()
         self._emit_device_event("state", "connect_start")
         transport = CanTransportConfiguration.from_environment()
@@ -550,6 +583,12 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
                 level=logging.ERROR,
             )
             raise
+        if (
+            _generation is not None
+            and not self._can_recovery_is_current(_generation)
+        ):
+            self._disconnect_transport_locked(command_outcome="cancelled")
+            return False
         log_hardware_initialization(
             logger,
             "READY | CAN connection readiness | elapsed=%.3fs",
@@ -625,7 +664,10 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             "READY | CAN/pellet controller | elapsed=%.3fs",
             time.perf_counter() - connect_started,
         )
-        self._set_can_connection_state("ready")
+        if not self._set_can_connection_state("ready", generation=_generation):
+            self._disconnect_transport_locked(command_outcome="cancelled")
+            return False
+        return True
 
     @staticmethod
     def _home_and_detach_pellet(send_acknowledged_command) -> None:
@@ -648,11 +690,23 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
                 servo.name,
             )
 
-    def _disconnect_transport(self):
+    def _disconnect_transport(self, *, command_outcome: str = "cancelled"):
+        with self._can_lifecycle_lock:
+            return self._disconnect_transport_locked(
+                command_outcome=command_outcome,
+            )
+
+    def _disconnect_transport_locked(self, *, command_outcome: str):
         logger.verbose("disconnecting ..")
         self._emit_device_event("state", "disconnect_start")
         self._disconnect_event.set()
         with self._lock:
+            for token in self._pending_tokens:
+                self._remember_command_outcome(
+                    token,
+                    command_outcome,
+                    "CAN transport closed before acknowledgement",
+                )
             self._pending_tokens.clear()
         can_dev = self._can_device
         dev = self._device_conn
@@ -905,6 +959,12 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             pending = tuple(self._pending_tokens.items())
         if pending and failure.kind is CanFailureKind.TRANSPORT:
             for token, (command, _started) in pending:
+                with self._lock:
+                    self._remember_command_outcome(
+                        token,
+                        "unknown",
+                        "CAN connection was lost before acknowledgement",
+                    )
                 self.command_failed(CanFailure(
                     CanFailureKind.OPERATION_UNKNOWN,
                     f"CAN connection was lost while {command.name} was in flight; "
@@ -917,6 +977,19 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
                     diagnostics=failure.diagnostics,
                 ))
         else:
+            if failure.context:
+                try:
+                    failed_token = UUID(str(failure.context))
+                except (TypeError, ValueError):
+                    failed_token = None
+                if failed_token is not None:
+                    with self._lock:
+                        if failed_token in self._pending_tokens:
+                            self._remember_command_outcome(
+                                failed_token,
+                                "failed",
+                                failure.error,
+                            )
             self.command_failed(failure)
 
         self._emit_device_event(
@@ -994,7 +1067,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
                 if not self._can_recovery_is_current(generation):
                     return
                 try:
-                    self._disconnect_transport()
+                    self._disconnect_transport(command_outcome="unknown")
                 except Exception as exc:
                     last_error = str(exc) or exc.__class__.__name__
                     logger.exception(
@@ -1010,7 +1083,11 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
                         last_error = str(exc) or exc.__class__.__name__
                         logger.exception("SocketCAN reset before recovery attempt failed")
                 try:
-                    self.connect(command_queue, _recovery=True)
+                    connected = self.connect(
+                        command_queue,
+                        _recovery=True,
+                        _generation=generation,
+                    )
                 except Exception as exc:
                     last_error = str(exc) or exc.__class__.__name__
                     logger.exception("CAN recovery attempt %s/%s failed", attempt, len(delays))
@@ -1024,6 +1101,8 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
                         },
                     )
                     continue
+                if not connected:
+                    return
                 if not self._can_recovery_is_current(generation):
                     self._disconnect_transport()
                     return
@@ -1065,12 +1144,20 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         error: str = "",
         generation: Optional[int] = None,
     ) -> bool:
-        if generation is not None and not self._can_recovery_is_current(generation):
-            logger.warning("Ignoring stale CAN state %s from generation %s", state, generation)
-            return False
-        previous = self._can_connection_state
-        value = {"state": str(state), "error": str(error or "")}
-        self._can_connection_state = value
+        with self._can_recovery_lock:
+            if (
+                generation is not None
+                and generation != self._can_recovery_generation
+            ):
+                logger.warning(
+                    "Ignoring stale CAN state %s from generation %s",
+                    state,
+                    generation,
+                )
+                return False
+            previous = self._can_connection_state
+            value = {"state": str(state), "error": str(error or "")}
+            self._can_connection_state = value
         self._on_property_changed(self.CAN_CONNECTION_STATE_PROPERTY, value, previous)
         return True
 
@@ -1080,6 +1167,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         logger.debug("send_command cmd=%s token=%s nbr=%s", cmd, token, len(self._pending_tokens))
         if self._send_command(device, cmd, data, token):
             self._pending_tokens[token] = (cmd, perf_now)
+            self._remember_command_outcome(token, "pending", "")
             return token
         else:
             logger.verbose("send_command failed, device not setup yet: cmd=%s token=%s", cmd, token)
@@ -1179,6 +1267,8 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
     def _ack_received(self, token: UUID, *, perf_c: Optional[float]=None):
         with self._lock:
             popped = self._pending_tokens.pop(token, None)
+            if popped is not None:
+                self._remember_command_outcome(token, "acknowledged", "")
             commands_in_prog = list(self._pending_tokens.values())
         if popped is None:
             # this can happen at device connection
@@ -1199,14 +1289,43 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         logger.verbose("Waiting ack pending command %s", token)
         while True:
             with self._lock:
-                if token not in self._pending_tokens:
+                outcome, error = self._command_outcomes.get(
+                    token,
+                    ("unknown_token", "command token is not known"),
+                )
+                if outcome == "acknowledged":
                     logger.debug("Got ack for token=%s ; delay=%.6f",
                                  token, time.perf_counter() - p_start)
                     return
+                if outcome not in {"pending"}:
+                    raise RuntimeError(
+                        f"command token={token} ended as {outcome}: {error}"
+                    )
             p_now = time.perf_counter()
             if p_now > p_timeout:
                 break
             time.sleep(0.0025)  # 2.5 ms
+        with self._lock:
+            pending = self._pending_tokens.pop(token, None)
+            if pending is not None:
+                self._remember_command_outcome(
+                    token,
+                    "timed_out",
+                    f"acknowledgement was not received within {timeout} seconds",
+                )
+            commands_in_progress = list(self._pending_tokens.values())
+        if pending is not None:
+            self._refresh_cmd_in_progress(commands_in_progress)
         if raise_on_timeout:
             raise RuntimeError(f"timeout waiting ack of pending token={token}")
         logger.warning("timeout waiting ack token %s, but continuing", token)
+
+    def _remember_command_outcome(
+        self,
+        token: UUID,
+        outcome: str,
+        error: str,
+    ) -> None:
+        self._command_outcomes[token] = (str(outcome), str(error or ""))
+        while len(self._command_outcomes) > 1024:
+            self._command_outcomes.pop(next(iter(self._command_outcomes)))

@@ -145,7 +145,7 @@ def test_bounded_recovery_reuses_full_connection_initialization(hardware_model):
     )
     hardware_model._disconnect_transport = mock.Mock()
     hardware_model.connect = mock.Mock(
-        side_effect=(RuntimeError("first reopen failed"), None),
+        side_effect=(RuntimeError("first reopen failed"), True),
     )
     hardware_model._first_can_failure = CanFailure(
         CanFailureKind.TRANSPORT,
@@ -155,7 +155,11 @@ def test_bounded_recovery_reuses_full_connection_initialization(hardware_model):
     hardware_model._run_can_recovery(hardware_model._first_can_failure)
 
     assert hardware_model.connect.call_count == 2
-    hardware_model.connect.assert_called_with(command_queue, _recovery=True)
+    hardware_model.connect.assert_called_with(
+        command_queue,
+        _recovery=True,
+        _generation=1,
+    )
     assert hardware_model._can_connection_state == {"state": "ready", "error": ""}
     assert hardware_model._first_can_failure.error == "reader failed"
     assert hardware_model._can_recovery_failure is None
@@ -227,6 +231,20 @@ def test_stale_recovery_generation_cannot_publish_ready(hardware_model):
     assert hardware_model._can_connection_state == before
 
 
+def test_stale_recovery_cannot_enter_connect_lifecycle(hardware_model):
+    hardware_model._can_recovery_generation = 4
+    before = dict(hardware_model._can_connection_state)
+
+    connected = hardware_model.connect(
+        Queue(),
+        _recovery=True,
+        _generation=3,
+    )
+
+    assert connected is False
+    assert hardware_model._can_connection_state == before
+
+
 def test_recovery_handle_is_cleared_when_command_queue_is_missing(hardware_model):
     failure = CanFailure(CanFailureKind.TRANSPORT, "reader failed")
     hardware_model._command_queue = None
@@ -237,3 +255,27 @@ def test_recovery_handle_is_cleared_when_command_queue_is_missing(hardware_model
     hardware_model._run_can_recovery(failure, 7)
 
     assert hardware_model._can_recovery_thread is None
+
+
+def test_transport_close_cannot_be_mistaken_for_command_ack(hardware_model):
+    token = uuid4()
+    hardware_model._pending_tokens[token] = (SystemCommandKind.SEND_HOME, 1.0)
+    hardware_model._command_outcomes[token] = ("pending", "")
+    hardware_model._device_conn = None
+    hardware_model._can_device = None
+
+    hardware_model._disconnect_transport(command_outcome="unknown")
+
+    with pytest.raises(RuntimeError, match="ended as unknown"):
+        hardware_model.wait_pending_command_acked(token, timeout=0.01)
+
+
+def test_acknowledged_command_has_explicit_terminal_outcome(hardware_model):
+    token = uuid4()
+    hardware_model._pending_tokens[token] = (SystemCommandKind.SEND_HOME, 1.0)
+    hardware_model._command_outcomes[token] = ("pending", "")
+
+    hardware_model._ack_received(token)
+
+    hardware_model.wait_pending_command_acked(token, timeout=0.01)
+    assert hardware_model._command_outcomes[token] == ("acknowledged", "")
