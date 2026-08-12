@@ -179,6 +179,18 @@ from tools.acquisition.model.output_storage_monitor import (
     StorageSnapshot,
     preflight_storage,
 )
+from tools.acquisition.model.intertrial_analysis import (
+    AnalysisProgressionMode,
+    IntertrialAnalysisCoordinator,
+    IntertrialAnalysisRequest,
+    IntertrialAnalysisResult,
+    classify_pellet_state,
+)
+from tools.acquisition.model.live_tracking_buffer import (
+    FrameTimelineAnchor,
+    LiveTrackingBuffer,
+    LiveTrackingSample,
+)
 from tools.acquisition.model.subsystem_status import (
     SubsystemId,
     SubsystemState,
@@ -589,6 +601,13 @@ class AppModel(ObservableObject):
             self._protocol_runner,
             self._session_data_recorder,
         )
+        self._live_tracking = LiveTrackingBuffer()
+        self._intertrial_analysis = IntertrialAnalysisCoordinator(
+            self._on_intertrial_analysis_result,
+        )
+        self._trial_window_start = None
+        self._tone2_active = False
+        self._intertrial_lock = threading.RLock()
 
         self._rpc_service: Optional[RpcService] = None
 
@@ -598,6 +617,9 @@ class AppModel(ObservableObject):
             self._on_nidaq_monitor_property_changed
         )
         self._laser.property_changed += self._on_laser_runtime_property_changed
+        self._system_message_handler.decoded_message_received += (
+            self._on_intertrial_device_message
+        )
         inference.property_changed += self._on_inference_property_changed
         inference.pose_response_ready += self._on_pose_response_ready
         inference.detection_result_ready += self._on_detection_result_ready
@@ -5333,6 +5355,14 @@ class AppModel(ObservableObject):
         if metadata_thread is not None and metadata_thread.is_alive():
             metadata_thread.join(5)
 
+        try:
+            self._system_message_handler.decoded_message_received -= (
+                self._on_intertrial_device_message
+            )
+        except (KeyError, ValueError):
+            pass
+        if not self._intertrial_analysis.close():
+            logger.warning("Intertrial analysis worker did not stop cleanly")
         self._session_data_recorder.close()
         self._analysis.stop()
 
@@ -5813,6 +5843,25 @@ class AppModel(ObservableObject):
 
     def _on_session_starting_before_record_start(self):
         session_config = self._behavior.algorithm.active_config.session_control
+        token = self._recording_session.token()
+        if token is None:
+            logger.warning(
+                "Behavior session started outside the recording controller; "
+                "intertrial results will not be applied"
+            )
+            analysis_generation = 0
+            analysis_session_id = self._project_info.short_id
+        else:
+            analysis_generation = token.generation
+            analysis_session_id = token.session_id
+        self._live_tracking.clear()
+        self._trial_window_start = None
+        self._tone2_active = False
+        self._behavior.algorithm.pellet_send_block_reason = ""
+        self._intertrial_analysis.begin_session(
+            analysis_generation,
+            analysis_session_id,
+        )
         self._pellet_cycles.start_session(
             self._project_info.short_id,
             TrialAccountingConfiguration(
@@ -6383,6 +6432,29 @@ class AppModel(ObservableObject):
                                   f"\nModel at {value} failed pre-validate:\n\n{err}")
 
     def _on_pose_response_ready(self, response: PoseResponse):
+        boundary = self._recording_session.boundary
+        if (
+            boundary is not None
+            and self._recording_session.status
+            in {SessionRecordingStatus.RECORDING, SessionRecordingStatus.STOPPING}
+        ):
+            try:
+                primary = self._ordered_reach_cameras(enabled_only=True)[0]
+                frame_rate = primary.active_config.params.get("fps")
+                if frame_rate is None:
+                    frame_rate = self._behavior.system_machine.intersession.frame_rate
+                sample = LiveTrackingSample.from_pose_response(
+                    response,
+                    FrameTimelineAnchor(
+                        boundary.primary_frame_id,
+                        boundary.start_perf_time,
+                        float(frame_rate),
+                    ),
+                )
+                if sample is not None:
+                    self._live_tracking.append(sample)
+            except (IndexError, TypeError, ValueError) as error:
+                logger.warning("Live tracking sample was not buffered: %s", error)
         message = self._coordinates.validate_pose(
             response,
             self._behavior.algorithm.diamond_triangle_config,
@@ -6391,6 +6463,117 @@ class AppModel(ObservableObject):
         )
         if message is not None:
             self.on_error("Diamond not detected or invalid position", message)
+
+    def _on_intertrial_device_message(
+        self,
+        kind,
+        data,
+        perf_time: float,
+        _wall_time: float,
+    ) -> None:
+        """Open the physical attempt window on decoded pellet-board tone 2."""
+        if kind is not SystemStatusMessageKind.STIMULUS_INPUTS:
+            return
+        if isinstance(data, dict):
+            tone2 = bool(data.get("tone2", False))
+        elif isinstance(data, (tuple, list)) and len(data) >= 2:
+            tone2 = bool(data[1])
+        else:
+            logger.warning("Cannot decode tone-2 state from stimulus input: %r", data)
+            return
+        rising = tone2 and not self._tone2_active
+        self._tone2_active = tone2
+        if not rising:
+            return
+        attempt = self._pellet_cycles.active_attempt
+        if (
+            attempt is None
+            or self._recording_session.status is not SessionRecordingStatus.RECORDING
+        ):
+            logger.warning("Tone-2 rising edge received without an active recorded pellet attempt")
+            return
+        with self._intertrial_lock:
+            if self._trial_window_start is None:
+                self._trial_window_start = (
+                    attempt.operation_id,
+                    float(perf_time),
+                )
+                logger.info(
+                    "pellet trial tracking window opened: attempt=%s perf=%.6f",
+                    attempt.attempt_label,
+                    perf_time,
+                )
+
+    def _on_intertrial_analysis_result(
+        self,
+        result: IntertrialAnalysisResult,
+    ) -> None:
+        request = result.request
+        token = self._recording_session.token()
+        if (
+            token is None
+            or token.generation != request.generation
+            or token.session_id != request.session_id
+            or self._recording_session.status
+            not in {
+                SessionRecordingStatus.RECORDING,
+                SessionRecordingStatus.STOPPING,
+                SessionRecordingStatus.ANALYZING,
+            }
+        ):
+            logger.warning(
+                "Ignoring stale intertrial result: %s generation=%s active=%s",
+                request.attempt_label,
+                request.generation,
+                token,
+            )
+            return
+        config = self._behavior.algorithm.active_config.session_control
+        retry = result.outcome.value in config.behavioral_retry_outcomes
+        try:
+            finalized = self._pellet_cycles.finalize_intertrial_result(
+                self._project_info,
+                result,
+                retry=retry,
+            )
+        except (KeyError, RuntimeError) as error:
+            logger.error(
+                "Ignoring unusable intertrial result for %s: %s",
+                request.attempt_label,
+                error,
+            )
+            return
+
+        if result.reaches:
+            response = IntersessionResponse(
+                rh_max_vp_list=[
+                    Offset3DTuple(*trajectory.closest_offset)
+                    for trajectory in result.reaches
+                    if not trajectory.consumed
+                ],
+                food_consumed=result.consumption_count,
+                successful_reaches=result.success_count,
+                pellets_presented=1,
+                total_reaches=result.reach_count,
+            )
+            self._behavior.system_machine.shift_xyz_handler.put_intersession_response(
+                self._project_info,
+                response,
+            )
+        self._pellet_cycles.sync_behavior_counts(self._behavior.algorithm)
+        self._behavior.algorithm.pellet_send_block_reason = ""
+        self._notify_trial_protocol_state()
+        self._evaluate_automatic_stop_policy(
+            protocol_complete=self._protocol_runner.protocol_complete,
+        )
+        logger.success(
+            "pellet trial analysis finalized: attempt=%s outcome=%s "
+            "reaches=%s analysis=%.3fs",
+            finalized.attempt_label,
+            finalized.outcome.value,
+            finalized.reach_count,
+            result.analysis_seconds,
+        )
 
     def _on_detection_result_ready(self, project: ProjectInfo, result: IntersessionResponse):
         if project.short_id in self._aborted_session_ids:
@@ -7014,16 +7197,146 @@ class AppModel(ObservableObject):
         )
 
     def _on_pellet_loading_for_trial(self):
-        self._finish_active_pellet_trial(get_perf_now())
+        if self._pellet_cycles.active_attempt is not None:
+            logger.warning(
+                "Pellet loading closed an attempt without a pellet-cycle event"
+            )
+            self._complete_pellet_trial_window(
+                get_perf_now(),
+                close_reason="next pellet load began",
+            )
 
     def _on_pellet_cycle_completed(self, *, perf_c: float):
-        self._finish_active_pellet_trial(perf_c)
+        self._complete_pellet_trial_window(
+            perf_c,
+            close_reason="pellet cycle completed",
+        )
+
+    def _complete_pellet_trial_window(
+        self,
+        perf_c: float,
+        *,
+        close_reason: str,
+    ) -> None:
+        active = self._pellet_cycles.active_attempt
+        if active is None:
+            return
+        closed = self._pellet_cycles.finish_active(perf_c, time.time())
+        with self._intertrial_lock:
+            window_start = self._trial_window_start
+            self._trial_window_start = None
+        config = self._behavior.algorithm.active_config.session_control
+        tracking_window = None
+        evidence = None
+        unavailable_reason = ""
+        if window_start is None:
+            unavailable_reason = "decoded pellet-board tone-2 rising edge was not observed"
+        elif window_start[0] != closed.operation_id:
+            unavailable_reason = "tone-2 window belonged to a different pellet operation"
+        else:
+            tracking_window = self._live_tracking.window(window_start[1], perf_c)
+            pellet_config = self._behavior.algorithm.active_config.pellet_delivery
+            evidence = classify_pellet_state(
+                tracking_window,
+                expected_triangle_pellet_distance=(
+                    pellet_config.triangle_pellet_expected_distance
+                ),
+                misplacement_threshold=(
+                    pellet_config.triangle_pellet_diff_too_far_threshold
+                ),
+            )
+
+        if not config.intertrial_analysis_enabled:
+            unavailable_reason = "live intertrial analysis is disabled"
+        elif tracking_window is not None and not tracking_window.samples:
+            unavailable_reason = "no live tracking samples covered the pellet trial"
+
+        if unavailable_reason:
+            finalized = self._pellet_cycles.finalize_intertrial_unavailable(
+                self._project_info,
+                closed,
+                perf_time=perf_c,
+                wall_time=closed.capture_end_wall_time or time.time(),
+                reason=f"{close_reason}: {unavailable_reason}",
+                pellet_presence=(
+                    "unknown" if evidence is None else evidence.presence.value
+                ),
+                pellet_misplacement=(
+                    "unknown" if evidence is None else evidence.misplacement.value
+                ),
+                window=tracking_window,
+                outcome=(
+                    TrialOutcome.UNSCORED
+                    if not config.intertrial_analysis_enabled
+                    else TrialOutcome.INCOMPLETE
+                ),
+            )
+            self._pellet_cycles.sync_behavior_counts(self._behavior.algorithm)
+            self._notify_trial_protocol_state()
+            self._evaluate_automatic_stop_policy(
+                protocol_complete=self._protocol_runner.protocol_complete,
+            )
+            logger.warning(
+                "pellet trial %s finalized without trajectory analysis: %s",
+                finalized.attempt_label,
+                unavailable_reason,
+            )
+            return
+
+        token = self._recording_session.token()
+        if token is None:
+            return
+        request = IntertrialAnalysisRequest(
+            generation=token.generation,
+            session_id=token.session_id,
+            trial_id=closed.trial_id,
+            attempt_id=closed.attempt_id,
+            operation_id=closed.operation_id,
+            window=tracking_window,
+            pellet_state=evidence,
+        )
+        must_wait = (
+            config.intertrial_progression_mode
+            == AnalysisProgressionMode.WAIT.value
+            or bool(config.behavioral_retry_outcomes)
+        )
+        if must_wait:
+            estimate = self._intertrial_analysis.timing_estimate(
+                tracking_window.end_perf - tracking_window.start_perf
+            )
+            self._behavior.algorithm.pellet_send_block_reason = (
+                "waiting for pellet trial analysis; " + estimate.display_text
+            )
+        if not self._intertrial_analysis.submit(request):
+            self._behavior.algorithm.pellet_send_block_reason = (
+                "intertrial analysis queue is full; Stop or Abort the session"
+                if must_wait
+                else ""
+            )
+            finalized = self._pellet_cycles.finalize_intertrial_unavailable(
+                self._project_info,
+                closed,
+                perf_time=perf_c,
+                wall_time=closed.capture_end_wall_time or time.time(),
+                reason="intertrial analysis queue was full",
+                pellet_presence=evidence.presence.value,
+                pellet_misplacement=evidence.misplacement.value,
+                window=tracking_window,
+            )
+            self._pellet_cycles.sync_behavior_counts(self._behavior.algorithm)
+            logger.error(
+                "Intertrial analysis queue full; attempt %s was not analyzed",
+                finalized.attempt_label,
+            )
+        self._notify_trial_protocol_state()
 
     def _on_pellet_sending(self, *, perf_c: float, context: str):
         algo = self._behavior.algorithm
         if self._trial_ledger is None or not algo.is_in_session:
             return
         wall_time = time.time()
+        with self._intertrial_lock:
+            self._trial_window_start = None
         shift = self._behavior.system_machine.shift_xyz_handler
         attempt = self._pellet_cycles.begin_send(
             perf_c,
