@@ -23,7 +23,6 @@ from datetime import datetime, timezone, date, timedelta
 from pathlib import Path
 from typing import Optional, List, Dict, Callable, Any, Union, ClassVar, Protocol, Tuple
 
-import pandas
 import numpy as np
 import yaml
 
@@ -121,6 +120,13 @@ from tools.acquisition.model.pellet_cycle_controller import (
 from tools.acquisition.model.recording_session_controller import (
     RecordingSessionController,
     SessionGeneration,
+)
+from tools.acquisition.model.camera_recording_validation import (
+    validate_closed_video,
+)
+from tools.acquisition.model.camera_timing_alignment import (
+    CameraTimestampInput,
+    align_camera_timestamp_files,
 )
 from tools.acquisition.model.acquisition_controller import AcquisitionController
 from tools.acquisition.model.coordinate_model import CoordinateModel
@@ -1472,62 +1478,22 @@ class AppModel(ObservableObject):
     def _merge_camera_timestamp_files(self, project: ProjectInfo, cams: Tuple[VideoCaptureModel]):
         if len(cams) == 0:
             logger.warning("_merge_camera_timestamp_files called without cameras")
-            return
+            return None
         timing_path = project.get_frame_timing_path()
-        data = []
         prim_cam = cams[0]  # primary
         main_fps = prim_cam.active_config.params.get('fps', math.nan)
         logger.info("Merging camera timestamp files for session%03d into %s (fps=%s)",
                     project.session, timing_path, main_fps)
-        txt_files = []
         if not isinstance(main_fps, (int, float)) or main_fps == 0 or not math.isfinite(main_fps):
-            logger.error("skipping invalid camera config fps=%s. cam=%s", main_fps, prim_cam.name)
-            return
-        frame_duration = 1 / main_fps
-        utc_when = None
-        ts_file_fields = ("frame_time", "fps", "frame_when", "frame_perf", "frame_id")
-        for cam in cams:
-            _, ts_filename, *_ = project.get_video_path(cam.name, allow_overwrite=True)
-            ts_filename = Path(ts_filename)
-            df = pandas.read_csv(ts_filename, names=ts_file_fields, sep=",", skipinitialspace=True)
-            data.append(df)
-            txt_files.append(ts_filename)
-            logger.debug("cam%s: df=%s", cam.camera_index, df)
-        #
-        df_main_cam = data[0]
-        if len(df_main_cam) == 0:
-            logger.warning("_merge_camera_timestamp_files: empty df for main cam")
-            return
-        main_cam_first_frame_id = df_main_cam["frame_id"][0]
-        boundary = self._recording_session.boundary
-        if (
-            boundary is not None
-            and boundary.session_id == project.short_id
-            and int(main_cam_first_frame_id) != boundary.primary_frame_id
-        ):
-            raise RuntimeError(
-                "Merged primary camera timing begins at frame "
-                f"{int(main_cam_first_frame_id)}, expected canonical frame "
-                f"{boundary.primary_frame_id}"
+            raise ValueError(
+                f"invalid camera config fps={main_fps}; camera={prim_cam.name}"
             )
-        for idx_df, df in enumerate(data[1:], start=1):
-            df: pandas.DataFrame
-            if len(df) == 0:
-                logger.warning("_merge_camera_timestamp_files: empty df for cam-%s", cams[idx_df].name)
-                df = df_main_cam.copy()
-                df["frame_when"] = df["frame_perf"] = df["frame_time"] = math.nan
-            else:
-                # align on same first frame_id than primary cam:
-                cur_first_frame_id = df["frame_id"][0]
-                if cur_first_frame_id < main_cam_first_frame_id:
-                    df = df.tail(-(main_cam_first_frame_id - cur_first_frame_id)).reset_index(drop=True)
-            data[idx_df] = df
-        #
-        r0 = df_main_cam[:1]
-        start_frame_id = r0['frame_id'][0]
-        first_frame_utc_when = r0['frame_time'][0]
-        logger.debug("start_frame_id=%s (utc_when=%s)", start_frame_id, first_frame_utc_when)
-        camera_field_names = []
+        boundary = self._recording_session.boundary
+        if boundary is None or boundary.session_id != project.short_id:
+            raise RuntimeError(
+                f"Missing canonical recording boundary for {project.short_id}"
+            )
+        sources = []
         used_camera_field_names = set()
         for cam in cams:
             base_name = self._camera_timing_field_name(cam)
@@ -1537,47 +1503,33 @@ class AppModel(ObservableObject):
                 suffix += 1
                 name = f"{base_name}_{suffix}"
             used_camera_field_names.add(name)
-            camera_field_names.append(name)
-        timing_csv_fields = [
-            'frame_id',
-            'frame_when',
-            'frame_present_primary',
-            'frame_present_secondary',
-            *(
-                field
-                for camera_field_name in camera_field_names
-                for field in (f"frame_when_{camera_field_name}", f"frame_present_{camera_field_name}")
-            ),
-            'utc_when',
-        ]
-        with timing_path.open("w") as fh:
-            dw = csv.DictWriter(fh, timing_csv_fields)
-            dw.writeheader()
-            # nb: only using main_cam as reference:
-            for idx, frame_id in enumerate(range(start_frame_id, start_frame_id + len(df_main_cam))):
-                # expected_frame_id = start_frame_id + idx
-                utc_when = first_frame_utc_when + idx * frame_duration
-                frame_when = df_main_cam['frame_when'][idx]
-                second_frame_when = data[1]['frame_when'][idx] if len(data) > 1 and idx < len(data[1]) else math.nan
-                d = dict(
-                    frame_id=frame_id,
-                    frame_when=frame_when if math.isfinite(frame_when) else "",  # could keep the math.nan otherwise
-                    frame_present_primary=1 if math.isfinite(frame_when) else 0,
-                    frame_present_secondary=1 if math.isfinite(second_frame_when) else 0,
-                    utc_when=utc_when,
+            _, timestamp_path, _ = project.get_video_path(
+                cam.name,
+                allow_overwrite=True,
+            )
+            sources.append(
+                CameraTimestampInput(
+                    name=cam.name,
+                    field_name=name,
+                    path=Path(timestamp_path),
                 )
-                for cam, df, camera_field_name in zip(cams, data, camera_field_names):
-                    if idx >= len(df):
-                        camera_frame_when = math.nan
-                    else:
-                        camera_frame_when = df['frame_when'][idx]
-                    d[f"frame_when_{camera_field_name}"] = (
-                        camera_frame_when if math.isfinite(camera_frame_when) else ""
-                    )
-                    d[f"frame_present_{camera_field_name}"] = 1 if math.isfinite(camera_frame_when) else 0
-                dw.writerow(d)
-        logger.info("Written %s entries into %s", len(df_main_cam), timing_path)
+            )
+        session_dir = Path(project.get_session_path().location)
+        diagnostics = align_camera_timestamp_files(
+            tuple(sources),
+            output_path=timing_path,
+            diagnostics_path=session_dir / "streams" / "camera_alignment.json",
+            primary_frame_id=boundary.primary_frame_id,
+            primary_fps=float(main_fps),
+        )
+        logger.info(
+            "Written %s entries into %s; synchronization_complete=%s",
+            diagnostics["primaryFrameCount"],
+            timing_path,
+            diagnostics["synchronizationComplete"],
+        )
         self._remove_timestamps_txt_files(project, cams)
+        return diagnostics
 
     def _get_monitored_cams(self):
         return self._ordered_reach_cameras(enabled_only=True)
@@ -1766,6 +1718,9 @@ class AppModel(ObservableObject):
             if project is None:
                 return
             message_generation = int(r_args[0]) if r_args else None
+            writer_diagnostics = (
+                dict(r_args[1]) if len(r_args) > 1 and r_args[1] else {}
+            )
             session_token = self._recording_session.token()
             if session_token is not None and (
                 project.short_id != session_token.session_id
@@ -1787,34 +1742,101 @@ class AppModel(ObservableObject):
                     project,
                     frames_written,
                     message_generation,
+                    writer_diagnostics,
                 )
                 if all(cam.camera_index in cams_closed_finished for cam in recording_cams):
                     project = cams_closed_finished[recording_cams[0].camera_index][0]
                     session_dir = Path(project.get_session_path().location)
                     for camera in recording_cams:
-                        camera_project, camera_frames, _camera_generation = (
+                        (
+                            camera_project,
+                            camera_frames,
+                            _camera_generation,
+                            camera_writer_diagnostics,
+                        ) = (
                             cams_closed_finished[camera.camera_index]
                         )
-                        video_path, _, _ = camera_project.get_video_path(
+                        video_path, timestamp_path, _ = camera_project.get_video_path(
                             camera.name,
                             allow_overwrite=True,
                         )
+                        validation = validate_closed_video(
+                            Path(video_path),
+                            Path(timestamp_path),
+                            writer_frame_count=camera_frames,
+                            writer_diagnostics=camera_writer_diagnostics,
+                        )
+                        if validation.warnings:
+                            logger.warning(
+                                "Camera recording validation warning: camera=%s %s",
+                                camera.name,
+                                "; ".join(validation.warnings),
+                            )
+                        if validation.failure:
+                            logger.error(
+                                "Camera recording validation failed: camera=%s %s",
+                                camera.name,
+                                validation.failure,
+                            )
+                            self.on_error(
+                                "Camera recording incomplete",
+                                f"{camera.name}: {validation.failure}",
+                            )
                         self._session_data_recorder.set_source_result(
                             f"camera.{camera.name}",
-                            sample_count=camera_frames,
+                            sample_count=validation.decoded_frame_count,
                             path=Path(video_path).relative_to(
                                 session_dir
                             ).as_posix(),
+                            failure=validation.failure,
+                            warnings=validation.warnings,
+                            diagnostics=validation.diagnostics(),
                         )
                     monitored_cams = tuple(
                         camera for camera in recording_cams
                         if camera in self._reach_cameras
                     )
                     try:
-                        self._merge_camera_timestamp_files(project, monitored_cams)
+                        alignment_diagnostics = self._merge_camera_timestamp_files(
+                            project,
+                            monitored_cams,
+                        )
                     except Exception as err:
                         logger.exception("Failed to merge camera timestamps: %s", err)
                         self.on_error("Camera timestamp merge failed", str(err))
+                        for camera in monitored_cams:
+                            self._session_data_recorder.set_source_result(
+                                f"camera.{camera.name}",
+                                failure=f"camera timestamp alignment failed: {err}",
+                            )
+                    else:
+                        if (
+                            alignment_diagnostics is not None
+                            and not alignment_diagnostics["synchronizationComplete"]
+                        ):
+                            message = (
+                                "Camera frame synchronization is incomplete; "
+                                "see streams/camera_alignment.json"
+                            )
+                            logger.warning(message)
+                            self.on_error("Camera synchronization incomplete", message)
+                            for camera in monitored_cams:
+                                camera_diagnostics = alignment_diagnostics[
+                                    "cameras"
+                                ][camera.name]
+                                camera_incomplete = bool(
+                                    camera_diagnostics["frameIdGapCount"]
+                                    or camera_diagnostics["missingPrimaryFrameIds"]
+                                    or camera_diagnostics["extraFrameIds"]
+                                )
+                                self._session_data_recorder.set_source_result(
+                                    f"camera.{camera.name}",
+                                    failure=message if camera_incomplete else "",
+                                    warnings=(message,),
+                                    diagnostics={
+                                        "frameAlignment": camera_diagnostics,
+                                    },
+                                )
                     cams_closed_finished.clear()  # now clear
                     wait_pose_closed = getattr(
                         type(self._inference),
