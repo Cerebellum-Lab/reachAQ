@@ -19,9 +19,10 @@ receives a new number, or remains unnumbered until presentation succeeds.
 Acquisition **Running** initializes enabled hardware, camera preview, and live
 inference without opening session writers. **Record** resets session counts and
 arms all enabled writers. **Stop** closes one synchronized boundary, retains the
-session, and runs post-session analysis. **Abort** cancels pending analysis,
-closes writers, deletes the session directory, and clears the four counts.
-Record remains disabled while post-session analysis is running.
+session, and drains analysis already queued for closed pellet trials. **Abort**
+cancels queued/running trial analysis, closes writers, deletes the session
+directory, and clears the four counts. Record remains disabled while stopped
+session finalization is draining.
 
 Automatic pellet cycles are permitted only while a session is actively
 recording. Manual pellet-board controls remain available under their explicit
@@ -36,7 +37,8 @@ independent:
 - selected protocol, or **Manual pellet control**;
 - **Automatic pellet cycles**;
 - **Automatic protocol advance**;
-- post-session shift recommendation and optional application;
+- live per-trial trajectory feedback, shift recommendation, and optional
+  application;
 - optional automatic session stop conditions.
 
 Selecting a protocol attaches it to the active animal. With no selected
@@ -94,6 +96,11 @@ increment any trial-limit or protocol-progress count. Under the default policy,
 a later successful retry retains the reserved logical trial and advances its
 attempt suffix.
 
+`pellet_missing` requires direct live evidence that the pellet was absent.
+A presented pellet with no detected reach is `no_reach`, not
+`pellet_missing`. If tracking is unavailable, presence/misplacement is
+`unknown`; ReachAQ does not invent an outcome to activate a retry rule.
+
 The trial-limit count basis is independently configurable:
 
 | UI label | Configuration value |
@@ -101,17 +108,18 @@ The trial-limit count basis is independently configurable:
 | Trials started | `started` |
 | Pellets presented | `presented` |
 | Trials completed | `completed` |
-| Scored trials (post-session analysis only) | `scored` |
+| Scored trials | `scored` |
 
 Configured behavioral outcomes may be included or excluded from completed and
 scored counts through the plain-language **Counted outcomes** checkboxes in
 Preferences. Hardware errors cannot be included. Counts are derived from the
 ledger rather than maintained as a second independent source of truth.
 
-**Scored trials** is disabled as an active-session automatic-stop basis. ReachAQ
-does not claim a scored result until post-session analysis has assigned reach
-events to an attempt window, so using it to stop the recording would be
-misleading. A saved ledger still reports its scored count after analysis.
+**Scored trials** is available only when live intertrial analysis is enabled.
+Each score is finalized from the just-completed pellet trial while the recording
+continues. An automatic scored-trial limit therefore reacts only to finalized
+results; pending, skipped, unknown, and unavailable results never fabricate a
+score.
 
 ## Trial persistence
 
@@ -120,6 +128,8 @@ Each retained session contains:
 ```text
 sessionNNN/
 └── streams/
+    ├── tracking/
+    │   └── trial_<id>_attempt_<id>.json
     ├── trials.jsonl
     └── trial_summary.json
 ```
@@ -136,13 +146,19 @@ pending-analysis, started, presented, completed, scored, and configured-basis
 counts. Both files use the same canonical performance/wall timebase as the
 other session streams and appear in `alignment.json`'s enabled-source manifest.
 
-During recording, attempts close as `pending_analysis` because a behavioral
-outcome is not yet trustworthy. After Stop, analysis maps frame-indexed events
-to the non-overlapping performance-time window of each attempt, finalizes every
-pending attempt exactly once, deterministically applies the configured retry
-numbering (`1.1`, `1.2`, and so on), and atomically replaces both ledger files.
-An attempt left without an analysis result is finalized as explicit incomplete,
-never silently retained as pending.
+The decoded pellet-board tone-2 rising edge opens a trial's tracking window and
+pellet-cycle completion closes it with no post-trial margin. The immutable
+tracking slice is persisted below `streams/tracking/` and sent to one bounded
+background worker. The worker consumes existing live pose/tracking data; it
+does not reopen video and does not run a second inference pass. Results update
+the ledger atomically while cameras and every other session stream continue.
+
+Stop marks an active, not-yet-completed physical attempt `incomplete`, drains
+only already-closed windows, and performs a final repair from the stored
+tracking JSON if needed. An attempt left without a usable result is explicitly
+finalized as incomplete, never silently retained as pending. Abort cancels the
+analysis generation and removes the tracking records with the rest of the
+session.
 
 The decoded device ledger at `streams/device.csv` remains separate and records
 general inbound/outbound pellet-board traffic. The trial ledger consumes the
@@ -196,30 +212,43 @@ duration, trial summary, protocol state, and incomplete state.
 
 The Behavior panel displays only **Reaches**, **Presented**, **Success**, and
 **Consumed**. All reset together at Record. They remain visible after Stop and
-post-session analysis, and reset to zero after Abort. Day and lifetime counters
-are not persisted in the active animal schema.
+finalization, and reset to zero after Abort. Day and lifetime counters are not
+persisted in the active animal schema. The ledger summary is the one
+authoritative source for all four values.
 
 Live inference continues during acquisition/recording using the existing
 depth-one frame queue and does not control whether camera or NI data is written.
-Post-session analysis remains enabled where configured and may populate final
-reach results and shift recommendations after Stop. Analysis is cancelled for
-Abort and Record remains blocked until analysis completes.
+When live intertrial analysis is enabled, tone-2-to-cycle-completion slices are
+analyzed on a separate bounded worker during the same recording. Pellet
+presence and misplacement are finalized synchronously from live tracking at
+cycle completion and never wait for that worker. Without healthy live tracking,
+those fields are recorded as `unknown` and operation continues.
 
-The implementation still uses some internal `intersession` class/event names
-from the retained inference library. In ReachAQ lifecycle terms these always
-mean **post-session analysis**, not an interval between pellet trials.
+Intertrial analysis requires live inference. Record readiness rejects the
+contradictory configuration where analysis is enabled but inference is disabled;
+disable both to record and run manual/automatic pellet protocols without
+analysis or scoring.
+
+**Continue while analyzing** permits another SEND while advisory analysis is
+pending. **Wait for analysis** blocks the next SEND while other writers remain
+active. Any configured behavioral retry outcome forces waiting so the next row
+and retry label are selected deterministically, except `pellet_missing`: direct
+missing-pellet evidence selects its retry synchronously and never enters the
+analysis wait queue. The UI reports pending work and a locally measured
+analysis-seconds-per-tracking-second estimate. If required analysis fails, the
+operator can retry the same immutable window or continue with an explicit
+unavailable result and skipped retry decision. Stop and Abort are never blocked
+by analysis failure.
 
 ## Shift and calibration behavior
 
 Diamond/triangle calibration, DCS transforms, motor drift checks, recommended
 XYZ shift calculation, display, and persistence are retained. A recommended
-post-session shift can be applied to the next session when enabled. Protocol
-actions may request predetermined motor shifts between trials after the pellet
-machine reaches a safe state and command acknowledgement is available.
-
-Analysis-derived online per-trial shifts are not implemented: the retained
-analysis runs after recording and cannot affect an earlier trial in that same
-session.
+per-trial shift can be applied only to a future trial when enabled. A late
+advisory result cannot modify an active/completed row or relabel a physical
+attempt. Protocol actions may request predetermined motor shifts between trials
+after the pellet machine reaches a safe state and command acknowledgement is
+available.
 
 ## System configuration policy
 
@@ -234,10 +263,13 @@ The `behavior.sessionControl` fields are:
 sessionControl: !SessionControlConfiguration
   automaticPelletCyclesEnabled: false
   automaticProtocolAdvanceEnabled: false
+  intertrialAnalysisEnabled: false
+  intertrialProgressionMode: continue
+  behavioralRetryOutcomes: []
   attemptAssignment: retry_within_trial
   retrySettings: reuse
   trialCountBasis: completed
-  countedTrialOutcomes: [success, failure, pellet_missing]
+  countedTrialOutcomes: [success, failure, pellet_missing, no_reach]
   durationLimitSeconds: null
   trialLimit: null
   stopOnProtocolComplete: false

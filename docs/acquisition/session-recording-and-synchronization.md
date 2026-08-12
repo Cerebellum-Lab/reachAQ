@@ -14,7 +14,7 @@ NI-DAQ synchronization, and degraded hardware operation.
 - Moved Hardware Refresh to the Hardware Status title bar and made it retry only
   failed domains while acquisition is running.
 - Separated camera, reach synchronization, inference, CAN/pellet, NI-DAQ, laser,
-  session-log, and offline-analysis lifecycle state and failure propagation.
+  session-log, and intertrial-analysis lifecycle state and failure propagation.
 - Preserved independent camera preview while requiring all enabled reach cameras
   to form a valid synchronization topology before Record.
 - Made every enabled persistence source part of the recording-readiness and
@@ -51,14 +51,15 @@ The Behavior panel owns the session controls:
 | Control | Available state | Result |
 |---|---|---|
 | **Record** | System Mode is Running, recording state is Ready, and every required source is Ready | Creates a session and begins the existing camera/video-writing path |
-| **Stop** | Recording | Selects the final synchronized camera boundary, closes all writers, retains the session, and runs offline analysis |
-| **Abort** | Arming, Recording, or Analyzing | Closes writers or terminates active analysis, deletes the entire session directory, resets session counts, and restores live inference when enabled |
+| **Stop** | Recording | Selects the final synchronized camera boundary, closes all writers, retains the session, and drains already-closed pellet-trial analyses |
+| **Abort** | Arming, Recording, or Analyzing | Closes writers, cancels the intertrial-analysis generation, deletes the entire session directory, and resets session counts |
 
 The recording state progresses through `Ready`, `Arming`, `Recording`,
-`Stopping`, and `Analyzing`. Record stays disabled until analysis for a stopped
-session finishes. Analysis is never started for a session aborted during
-capture; if Abort is selected during analysis, the analysis worker pool is
-terminated before the session directory is removed.
+`Stopping`, and `Analyzing`. Record stays disabled until all already-closed
+pellet windows and stopped-session finalization finish. Intertrial analysis uses
+the existing live inference outputs while Recording; it does not switch the
+shared pipeline to offline video inference. Abort invalidates the session
+generation, so queued/running results cannot publish after deletion.
 
 The four Behavior counters are session-scoped: Presented, Reaches, Success, and
 Consumed. They reset when Record is pressed, remain visible after Stop and
@@ -113,16 +114,20 @@ analysis. Stale callbacks from an older worker generation cannot overwrite the
 state of a newer retry.
 
 If a required source is unavailable, Record is disabled and its tooltip lists
-the exact blockers. If a required source is lost during Recording, only the
-active session is aborted; unrelated acquisition domains remain running.
+the exact blockers. Subsystem-specific policy applies if a source is lost
+during Recording. NI or secondary-camera loss preserves the remaining streams
+and marks the session incomplete. Primary-camera/writer loss requests normal
+Stop and preserves partial data. CAN loss fails the in-flight operation, pauses
+new pellet cycles, and attempts bounded recovery while other writers continue.
+No source-loss path automatically deletes a retained session.
 
 CAN teardown follows the same isolation rule. Ordinary Stop, Close, or
 application exit closes only the process-owned device worker and socket; a
 generic fatal callback from another domain cannot reset the shared kernel
 interface. A confirmed CAN reader/acknowledgement failure marks CAN Failed,
-aborts an active session whose required CAN stream is now incomplete, and runs
-a bounded recovery sequence without stopping camera, NI-DAQ, laser, or log
-acquisition. Recovery closes the failed socket, reopens the transport,
+marks an active session's CAN stream incomplete, and runs a bounded recovery
+sequence without stopping camera, NI-DAQ, laser, or log acquisition. Recovery
+closes the failed socket, reopens the transport,
 rediscovers the pellet board, requests firmware, reloads motor/move
 configuration, and restarts status streaming before publishing Ready. An
 in-flight motor operation is finalized as unknown and is never replayed across
@@ -167,11 +172,30 @@ The same finite boundary is required in:
 - stream slicing and camera-timing merge;
 - the API/session metadata path.
 
-Final metadata is serialized to temporary JSON and YAML files before either
-destination is replaced. A missing alignment file, non-finite boundary,
+Small critical outputs use a session-local `.staging/<generation>/` area,
+file/directory `fsync` where supported, and atomic replacement. JSON and YAML
+are serialized from the same in-memory object, and metadata, alignment, trial
+files, and the manifest share one generation ID. The authoritative metadata
+reference is published last. Large video and pose stores are not duplicated in
+staging. A missing alignment file, non-finite boundary,
 boundary mismatch, primary timing mismatch, missing enabled source, writer
 failure, acquisition gap, or buffer overrun prevents the session from being
 reported as fully saved.
+
+### Camera frame and closed-video validation
+
+Camera timing rows are keyed by the vendor's actual integer frame ID, not row
+position. Finalization checks uniqueness and strict monotonicity, merges enabled
+synchronized cameras onto the primary frame-ID timeline, and explicitly records
+missing, duplicate, out-of-order, early, and late IDs. These synchronization
+diagnostics never delete a stopped session.
+
+After each writer closes, ReachAQ opens the video read-only and compares its
+decoded frame count with both the writer-reported count and timestamp rows. A
+count mismatch is a structured warning containing the camera role/serial and
+all three counts. The first writer exception and total writer-error count are
+preserved. An unreadable or zero-frame video marks the source and session
+incomplete, but every file and diagnostic is retained.
 
 ## Persisted session files
 
@@ -189,6 +213,8 @@ sessionNNN/
 │   ├── nidaq.h5
 │   ├── device.csv
 │   ├── laser.csv
+│   ├── tracking/
+│   │   └── trial_<id>_attempt_<id>.json
 │   ├── trials.jsonl
 │   ├── trial_summary.json
 │   └── alignment.json
@@ -220,6 +246,16 @@ each block independently, so host scheduling jitter cannot create backward
 timestamp corrections. Sample indices must be continuous and timestamps must be
 strictly increasing. Gaps and overruns are recorded explicitly.
 
+Session NI data is appended incrementally to HDF5 through a bounded writer; the
+live polling path reuses a preallocated scratch buffer rather than retaining an
+unbounded list of chunks. Diagnostics preserve the first/last collection
+exception, exception count, gaps, overruns, epochs, sample/time range, and
+expected session boundary. Recovered gaps and isolated copy errors are warnings.
+Zero samples, worker/persistence failure, or an effectively absent stream is
+critical when NI is enabled. Start/end coverage shortfall up to five seconds is
+a warning; more than five seconds marks the NI source incomplete while
+preserving partial samples.
+
 ### `device.csv`
 
 This is a general decoded device/CAN ledger, not a pressure-only measurement
@@ -243,6 +279,12 @@ progress. `trial_summary.json` stores derived counts for the configured trial
 count basis. See
 [Recording sessions, pellet trials, protocols, and schema migration](session-trials-protocols.md)
 for the full accounting contract.
+
+Each `streams/tracking/` JSON preserves one immutable tone-2-to-cycle-completion
+live tracking slice, source frame identities, coverage/missing-frame
+diagnostics, synchronous pellet-state evidence, and resulting analysis metrics.
+It supports stopped-session verification/repair without reopening video or
+performing novel inference.
 
 ### `laser.csv`
 
@@ -302,12 +344,15 @@ The acquisition application uses explicit responsibility boundaries:
   subsystem states, blockers, retries, and derived reach-synchronization
   readiness.
 - `RecordingSessionController` owns Ready/Arming/Recording/Stopping/Analyzing/
-  Aborting state, canonical boundary, writer completeness, enabled-source
-  results, and analysis timing.
+  Aborting state, generation/session identity, canonical boundary, writer
+  completeness, enabled-source results, and analysis timing. Delayed callbacks
+  must match both generation and session ID.
 - `PelletCycleController` owns the session ledger, send/acknowledgement/error
-  mutation paths, attempt closure, analysis reconciliation, protocol outcomes,
+  mutation paths, attempt closure, per-trial result application, protocol outcomes,
   lifecycle publication, persistence updates, and the authoritative count
   projection.
+- `IntertrialAnalysisCoordinator` owns the bounded worker queue, cancellation
+  generation, immutable requests/results, and measured throughput estimate.
 - `PelletAutomationController` owns the established load/send/retract/cover/
   release state machine; `TrialProtocolRunner` owns protocol progress.
 - `PelletPresenceTracker`, `ShiftRecommendationController`, and
@@ -328,6 +373,10 @@ and `unmatched` when no plausible transition exists. Tone matching pairs
 decoded per-line stimulus rises with unclaimed NI-DAQ rises within 250 ms.
 Generic `PLAY_TONE` commands remain explicitly unmatched when the decoded
 command does not identify a physical confirmation line.
+
+The pellet board supplies the first two decoded confirmation lines: physical
+`STIM0` is `tone1` and physical `STIM1` is `tone2`. `STIM2` and `STIM3` remain
+unassigned.
 
 ## NI-DAQ acquisition and synchronization
 
@@ -375,6 +424,57 @@ No card model, PXI slot, alias, or route is a universal default. The current rig
 uses a PXI-6221 input device as the natural acquisition master and a PXI-6713
 for laser analog output, but every rig must resolve and validate its own devices
 and routes through discovery.
+
+Digital-only multi-device plans use a routed counter sample clock and never
+claim an AI start trigger when no AI task exists. The resolved descriptor names
+the actual clock producer, consumers, start/reference/sample routes, and output
+tasks. Hardware-timed finite laser output is synchronized only when its task
+applies that descriptor and is armed before the master. On-demand laser pulses
+remain explicitly independent.
+
+## Storage, discovery, and safe hardware boundaries
+
+Record preflight performs a real write, flush, `fsync`, and removal probe on the
+target session filesystem. It reports free bytes and projected maximum recording
+minutes from configured camera/NI demand; configured duration is capped at two
+hours. Recording monitors free space and observed write rate at low cadence,
+warns once below 30 and 10 projected minutes, and requests normal Stop below one
+minute. Low space never invokes Abort.
+
+Camera discovery runs in a disposable process with a deadline. SDK/import/load
+failure is reported separately from a successful discovery that found zero
+cameras and includes the first exception, backend/stage, and elapsed time.
+Discovery failure affects only camera state. Animal JSON loading is likewise
+isolated per file: valid animals remain available, malformed/unsupported files
+are listed as skipped without modification, and duplicate UUIDs remain a hard
+conflict.
+
+Pellet-board connection and CAN recovery apply acknowledged motor configuration,
+home X/Y/Z, then detach both pellet servos. Connection never attaches/releases
+the cover or pellet mechanism. Normal LOAD/COVER/RELEASE operations retain their
+on-demand servo behavior. Stop, automatic Stop, and Abort request home after the
+stream boundary when the board is Ready; failure is logged but cannot prevent
+save/deletion.
+
+CAN recovery retains the first diagnostic failure, but only transport and
+acknowledgement domains own recovery. Every run has a generation; a stale run
+cannot publish Ready or replace a reader still alive. Recovery never replays a
+non-idempotent in-flight motor command. Generic unhandled exceptions do not
+reset CAN, command motion, stop an active recording, or disconnect unrelated
+hardware.
+
+Preferences/configuration is locked outside session `Ready`, including an
+already-open dialog. SoftMouse/RFID cache refreshes share one model-owned,
+debounced background path; refresh requested during a session is deferred once,
+and all widget updates return through the Qt thread. The event manager preserves
+its public plugin/API contract while bounding its queue, producer wait, and
+shutdown, and reports pending/failed delivery instead of hanging indefinitely.
+
+The desktop launcher locks through a user-owned mode-0700 runtime directory and
+does not truncate a predictable file under `/tmp`. Calibration cleanup accepts
+only resolved, non-symlink generated child directories under the selected
+calibration root. Repeated Ctrl-C targets only reachAQ and explicitly registered
+child processes; it never signals a presumed process group.
 
 ## Operator verification
 

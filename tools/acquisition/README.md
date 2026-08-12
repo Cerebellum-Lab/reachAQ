@@ -378,13 +378,23 @@ does not yet interpret them as new delivery, tone, or laser actions.
 Normal acquisition always uses triggered recording. Selecting System Mode
 `Running` starts acquisition and preview without writing session video. Use
 `Record` in the Behavior panel to initialize a session and begin writing,
-`Stop` to retain it and run analysis, or `Abort` to discard the entire session,
-including while post-session analysis is running.
-Record remains unavailable until analysis for the stopped session finishes.
+`Stop` to retain it and drain any already-closed pellet-trial analyses, or
+`Abort` to cancel the analysis generation and discard the entire session.
+Record remains unavailable until stopped-session finalization finishes.
 Presented, Reaches, Success, and Consumed are session-only counts: they reset on
 Record, remain visible after Stop, and reset to zero after Abort. The old System
 state display, day/total counters, load-cell UI, and load-cell recording triggers
 have been removed.
+
+Optional live intertrial analysis uses the existing live tracking stream from
+decoded pellet-board tone 2 through exact pellet-cycle completion. It runs on a
+separate bounded worker while all recording streams continue and never reopens
+video or starts a second inference pass. Continue mode is advisory; Wait mode
+and analysis-dependent retry rules block only the next SEND. Pellet presence,
+missing-pellet retry selection, and misplacement are finalized synchronously and
+do not wait for analysis. If a
+required result fails, the Trial Protocol panel offers **Retry analysis** and
+**Continue without result** while Stop and Abort remain available.
 
 Session-aligned auxiliary files are stored beneath the matching `sessionNNN`
 directory:
@@ -393,6 +403,7 @@ directory:
 streams/nidaq.h5
 streams/device.csv
 streams/laser.csv
+streams/tracking/trial_<id>_attempt_<id>.json
 streams/trials.jsonl
 streams/trial_summary.json
 streams/alignment.json
