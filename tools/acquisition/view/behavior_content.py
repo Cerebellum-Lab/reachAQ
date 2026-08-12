@@ -117,12 +117,12 @@ class BehaviorContent(ContentWidget):
         right_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
 
         left_cur_row = 0
-        left_layout.addWidget(QLabel("Post-session analysis:"), left_cur_row, 0)
+        left_layout.addWidget(QLabel("Live trial analysis:"), left_cur_row, 0)
         toggle = self._intersession_toggle = QSwitch()
         toggle.stateChanged.connect(self._intersession_toggle_state_changed)
         toggle.setToolTip(
-            "Run reach detection and segmentation after each recorded session. "
-            "Analysis may update session counts and recommend the next pellet position.")
+            "Analyze each completed pellet delivery from already-produced live "
+            "tracking. No video replay or second inference pass is performed.")
         left_layout.addWidget(toggle, left_cur_row, 1, alignment=Qt.AlignmentFlag.AlignLeft)
 
         right_cur_row = 0
@@ -134,7 +134,7 @@ class BehaviorContent(ContentWidget):
         right_layout.addWidget(label, right_cur_row, 1)
         right_cur_row += 1
 
-        right_layout.addWidget(QLabel("Previous session:"), right_cur_row, 0)
+        right_layout.addWidget(QLabel("Previous trial:"), right_cur_row, 0)
         label = self._prev_pellet_shift_label = XYZQLabel(n_digits=2)
         right_layout.addWidget(label, right_cur_row, 1)
         right_cur_row += 1
@@ -202,7 +202,9 @@ class BehaviorContent(ContentWidget):
         self._inference_status.setText(
             f"Inference: {inference_status_display(inference_model.status)}"
         )
-        self._intersession_toggle.setChecked(behavior_model.algorithm.intersession_enabled)
+        self._intersession_toggle.setChecked(
+            behavior_model.algorithm.active_config.session_control.intertrial_analysis_enabled
+        )
 
         self._inference_model_property_changed("model_location", inference_model.model_location, None)
         #
@@ -247,6 +249,10 @@ class BehaviorContent(ContentWidget):
     def _app_model_property_changed(self, name, value, _):
         if name == self._app_model.Props.SESSION_RECORDING_STATUS:
             self._update_recording_controls(value)
+        elif name == self._app_model.Props.TRIAL_PROTOCOL_STATE:
+            self._intersession_toggle.setChecked(
+                bool((value.get("analysis") or {}).get("enabled"))
+            )
         elif name in {
             self._app_model.Props.STATUS,
             self._app_model.Props.ACQUISITION_RUNNING,
@@ -256,15 +262,12 @@ class BehaviorContent(ContentWidget):
             self._update_recording_controls(self._app_model.session_recording_status)
 
     def _intersession_toggle_state_changed(self, x: int):
-        self._behavior_model.algorithm.intersession_enabled = x != 0
+        self._app_model.set_intertrial_analysis_enabled(x != 0)
 
     @invoke_method
     def _algorithm_property_changed(self, name, value, _):
         props = BehaviorAlgoProps
-        if name == props.INTERSESSION_ENABLED:
-            self._intersession_toggle.setChecked(value)
-
-        elif name == props.SESSION_PELLETS_CONSUMED:
+        if name == props.SESSION_PELLETS_CONSUMED:
             self._pellets_consumed_label.setText(str(value))
 
         elif name == props.SESSION_PELLETS_PRESENTED:

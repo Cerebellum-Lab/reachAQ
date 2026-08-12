@@ -359,9 +359,12 @@ class PreferencesContent(QWidget):
         cur_row += 1
         #
         shift_xyz_cfg = algo.active_config.shift_xyz_handler
-        left_grid_layout.addWidget(QLabel("<b>Post-session Pellet Shift:</b>"), cur_row, cur_col)
+        left_grid_layout.addWidget(QLabel("<b>Intertrial Pellet Shift:</b>"), cur_row, cur_col)
         toggle = self._intersession_pellet_shift_toggle = QSwitch()
-        toggle.setToolTip("Adjust the next session's pellet delivery position from post-session reach analysis.")
+        toggle.setToolTip(
+            "Allow live trial analysis to recommend or automatically apply "
+            "pellet shifts to future pellet trials."
+        )
         add_enabled_state(lambda t=toggle: t.setEnabled(self._inference_enabled_toggle.isChecked()))
         toggle.setChecked(algo.intersession_pellet_shift_enabled)
         def allow_intersession_shift_toggle_state_changed(x: int):
@@ -716,10 +719,8 @@ class PreferencesContent(QWidget):
             "This does not reread camera frames or run the pose model again."
         )
         intertrial_analysis.stateChanged.connect(
-            lambda value: setattr(
-                config,
-                "intertrial_analysis_enabled",
-                value != 0,
+            lambda value: self._app_model.set_intertrial_analysis_enabled(
+                value != 0
             )
         )
         form.addRow("Live intertrial analysis:", intertrial_analysis)

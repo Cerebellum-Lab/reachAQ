@@ -23,6 +23,9 @@ def test_counted_trial_outcomes_are_operator_configurable(qapp):
     harness = QWidget()
     harness._app_model = SimpleNamespace(
         set_automatic_protocol_advance_enabled=lambda _enabled: None,
+        set_intertrial_analysis_enabled=lambda enabled: setattr(
+            config, "intertrial_analysis_enabled", enabled
+        ),
     )
     algorithm = SimpleNamespace(
         active_config=SimpleNamespace(session_control=config),
@@ -42,6 +45,7 @@ def test_counted_trial_outcomes_are_operator_configurable(qapp):
         "Success",
         "Failed reach",
         "Pellet missing",
+        "No reach",
         "Incomplete trial",
         "Aborted trial",
     }

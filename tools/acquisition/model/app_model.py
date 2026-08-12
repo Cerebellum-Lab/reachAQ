@@ -3607,6 +3607,13 @@ class AppModel(ObservableObject):
             return False
         self._trial_protocol_schedule.update(trial_id, field, value)
         self._notify_trial_protocol_state()
+
+    def set_intertrial_analysis_enabled(self, enabled: bool) -> None:
+        control = self._behavior.algorithm.active_config.session_control
+        control.intertrial_analysis_enabled = bool(enabled)
+        if not enabled:
+            control.behavioral_retry_outcomes = ()
+        self._notify_trial_protocol_state()
         return True
 
     def _notify_trial_protocol_state(self) -> None:
