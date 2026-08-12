@@ -232,6 +232,13 @@ class SessionDataRecorder:
             timing_plan = self._nidaq_monitor.timing_plan
             source_manifest = self._source_manifest
             source_results = dict(self._source_results)
+            if self._laser_model.configuration.backend != "disabled":
+                laser_result = dict(source_results.get("laser_outputs", {}))
+                laser_result["diagnostics"] = {
+                    **dict(laser_result.get("diagnostics", {})),
+                    "timing": self._laser_model.timing_status,
+                }
+                source_results["laser_outputs"] = laser_result
             trial_records = tuple(self._trial_records)
             trial_summary = dict(self._trial_summary)
             snapshot = {

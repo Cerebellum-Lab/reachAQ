@@ -8,7 +8,9 @@ from autotrainer.device import (
     LaserSystemConfiguration,
     NidaqLaserController,
     NullLaserController,
+    LaserSynchronizedPulseTrain,
 )
+from autotrainer.core import NidaqTimingPlan
 
 
 def make_channel(channel_id=LaserChannelId.LASER_1, command_copy_input="Dev1/ai1"):
@@ -150,3 +152,59 @@ def test_nidaq_laser_uses_shared_scaled_feedback_without_reserving_ai_tasks():
     assert sample.command_volts == 0.75
     assert sample.diode_volts == 1.25
     assert sample.command_copy_volts == 2.5
+
+
+def test_nidaq_laser_reports_on_demand_output_as_not_synchronized():
+    channel = make_channel()
+    controller = object.__new__(NidaqLaserController)
+    controller._timing_plan = NidaqTimingPlan(
+        requested_mode="auto",
+        resolved_mode="backplane",
+        is_valid=True,
+        master_device="Input",
+        sample_clock_source="/Input/ai/SampleClock",
+        hardware_output_devices=("Dev1",),
+        hardware_output_timing_status="declared_not_armed",
+    )
+    pulse = LaserSynchronizedPulseTrain(
+        pulse_trains=(LaserPulseTrain(
+            channel_id=LaserChannelId.LASER_1,
+            amplitude_volts=1.0,
+            duration_ms=10.0,
+        ),),
+    )
+
+    kwargs, status = controller._resolve_pulse_timing((channel,), pulse)
+
+    assert kwargs == {}
+    assert status["status"] == "declared_not_armed"
+
+
+def test_nidaq_laser_uses_shared_clock_only_with_future_hardware_trigger():
+    channel = make_channel()
+    controller = object.__new__(NidaqLaserController)
+    controller._timing_plan = NidaqTimingPlan(
+        requested_mode="auto",
+        resolved_mode="backplane",
+        is_valid=True,
+        master_device="Input",
+        reference_clock_source="PXI_CLK10",
+        reference_clock_rate_hz=10_000_000.0,
+        sample_clock_source="/Input/ai/SampleClock",
+        hardware_output_devices=("Dev1",),
+        hardware_output_timing_status="declared_not_armed",
+    )
+    pulse = LaserSynchronizedPulseTrain(
+        pulse_trains=(LaserPulseTrain(
+            channel_id=LaserChannelId.LASER_1,
+            amplitude_volts=1.0,
+            duration_ms=10.0,
+        ),),
+        trigger_source="/Input/PXI_Trig0",
+    )
+
+    kwargs, status = controller._resolve_pulse_timing((channel,), pulse)
+
+    assert kwargs == {"source": "/Input/ai/SampleClock"}
+    assert status["status"] == "hardware_synchronized"
+    assert status["referenceClockSource"] == "PXI_CLK10"

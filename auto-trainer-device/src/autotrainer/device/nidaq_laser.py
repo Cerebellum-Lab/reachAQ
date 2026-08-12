@@ -6,6 +6,7 @@ import numbers
 import time
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
+from autotrainer.core import NidaqTimingPlan
 from autotrainer.core.logging import log_hardware_initialization
 
 from .laser import (
@@ -65,6 +66,7 @@ class NidaqLaserController:
         configuration: LaserSystemConfiguration,
         *,
         feedback_reader: Optional[Callable[[str], float]] = None,
+        timing_plan: Optional[NidaqTimingPlan] = None,
     ):
         if configuration.backend != "nidaq":
             raise ValueError("NidaqLaserController requires laser backend 'nidaq'")
@@ -78,6 +80,11 @@ class NidaqLaserController:
         )
         self._configuration = configuration
         self._feedback_reader = feedback_reader
+        self._timing_plan = timing_plan
+        self._last_timing_status = {
+            "status": "independent",
+            "reason": "No finite laser waveform has been executed",
+        }
         self._tasks: Dict[LaserChannelId, _NidaqLaserTasks] = {}
         self._command_volts: Dict[LaserChannelId, float] = {}
         try:
@@ -114,6 +121,10 @@ class NidaqLaserController:
     @property
     def configuration(self) -> LaserSystemConfiguration:
         return self._configuration
+
+    @property
+    def timing_status(self) -> dict:
+        return dict(self._last_timing_status)
 
     def set_command_voltage(self, channel_id: Union[LaserChannelId, int], volts: float) -> float:
         channel = self._configuration.get_channel(channel_id)
@@ -222,11 +233,16 @@ class NidaqLaserController:
         digital_tasks = []
         run_error = None
         try:
+            timing_kwargs, timing_status = self._resolve_pulse_timing(
+                channels, pulse_train,
+            )
             ao_task.timing.cfg_samp_clk_timing(
                 rate=sample_rate_hz,
                 sample_mode=self._nidaqmx.constants.AcquisitionType.FINITE,
                 samps_per_chan=total_samples,
+                **timing_kwargs,
             )
+            self._configure_timing_reference(ao_task, timing_status)
             if pulse_train.trigger_source:
                 ao_task.triggers.start_trigger.cfg_dig_edge_start_trig(
                     pulse_train.trigger_source,
@@ -299,6 +315,7 @@ class NidaqLaserController:
             for task in digital_tasks:
                 task.start()
             ao_task.start()
+            self._last_timing_status = timing_status
             ao_task.wait_until_done(timeout=timeout_seconds)
             for task in digital_tasks:
                 task.wait_until_done(timeout=timeout_seconds)
@@ -314,6 +331,72 @@ class NidaqLaserController:
                 close_pmt=pmt_enabled,
                 run_error=run_error,
             )
+
+    def _resolve_pulse_timing(self, channels, pulse_train):
+        plan = self._timing_plan
+        output_devices = tuple(dict.fromkeys(
+            channel.analog_output.strip("/").split("/", 1)[0]
+            for channel in channels
+        ))
+        base = {
+            "devices": output_devices,
+            "sampleClockSource": None,
+            "startTriggerSource": pulse_train.trigger_source,
+            "referenceClockSource": None,
+        }
+        if plan is None or not plan.is_valid:
+            return {}, {
+                **base,
+                "status": "independent",
+                "reason": "No valid shared NI timing plan was applied",
+            }
+        undeclared = tuple(
+            device for device in output_devices
+            if device not in plan.hardware_output_devices
+        )
+        if undeclared:
+            return {}, {
+                **base,
+                "status": "unsupported",
+                "reason": "Laser output device was not in the resolved timing topology",
+            }
+        if not pulse_train.trigger_source:
+            return {}, {
+                **base,
+                "status": "declared_not_armed",
+                "reason": (
+                    "The acquisition clock is already running and this on-demand "
+                    "waveform has no future hardware start trigger"
+                ),
+            }
+        if not plan.sample_clock_source:
+            return {}, {
+                **base,
+                "status": "unsupported",
+                "reason": "Resolved timing topology has no shared sample clock",
+            }
+        return {"source": plan.sample_clock_source}, {
+            **base,
+            "status": "hardware_synchronized",
+            "reason": "Finite output armed for a future trigger on the shared sample clock",
+            "sampleClockSource": plan.sample_clock_source,
+            "referenceClockSource": plan.reference_clock_source,
+        }
+
+    def _configure_timing_reference(self, task, timing_status) -> None:
+        if timing_status.get("status") != "hardware_synchronized":
+            return
+        plan = self._timing_plan
+        timing = getattr(task, "timing", None)
+        if plan is None or timing is None or not plan.reference_clock_source:
+            return
+        if hasattr(timing, "ref_clk_src"):
+            timing.ref_clk_src = plan.reference_clock_source
+        if (
+            plan.reference_clock_rate_hz is not None
+            and hasattr(timing, "ref_clk_rate")
+        ):
+            timing.ref_clk_rate = plan.reference_clock_rate_hz
 
     def run_calibration_ramp(self, ramp: LaserCalibrationRamp) -> Tuple[LaserCalibrationPoint, ...]:
         if self._feedback_reader is not None:

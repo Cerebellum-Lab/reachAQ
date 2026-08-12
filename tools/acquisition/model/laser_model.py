@@ -6,7 +6,7 @@ import math
 import time
 from typing import Callable, Optional, Tuple, Union
 
-from autotrainer.core import ObservableObject
+from autotrainer.core import NidaqTimingPlan, ObservableObject
 from autotrainer.core.logging import get_verbose_logger, log_hardware_initialization
 from autotrainer.device import (
     LaserControllerProtocol,
@@ -69,6 +69,15 @@ class LaserModel(ObservableObject):
     def last_feedback_sample(self) -> Optional[LaserFeedbackSample]:
         return self._last_feedback_sample
 
+    @property
+    def timing_status(self) -> dict:
+        status = getattr(self._controller, "timing_status", None)
+        return (
+            {"status": "independent", "reason": "Laser controller is unavailable"}
+            if status is None
+            else dict(status)
+        )
+
     def configure_null(self, configuration: LaserSystemConfiguration) -> None:
         self.set_controller(NullLaserController(configuration))
 
@@ -77,11 +86,13 @@ class LaserModel(ObservableObject):
         configuration: LaserSystemConfiguration,
         *,
         feedback_reader: Optional[Callable[[str], float]] = None,
+        timing_plan: Optional[NidaqTimingPlan] = None,
     ) -> None:
         self.set_controller(
             NidaqLaserController(
                 configuration,
                 feedback_reader=feedback_reader,
+                timing_plan=timing_plan,
             )
         )
 
@@ -91,6 +102,7 @@ class LaserModel(ObservableObject):
         *,
         feedback_reader: Optional[Callable[[str], float]] = None,
         persisted_configuration: Optional[LaserSystemConfiguration] = None,
+        timing_plan: Optional[NidaqTimingPlan] = None,
     ) -> None:
         backend = configuration.backend
         if backend == "disabled":
@@ -124,6 +136,7 @@ class LaserModel(ObservableObject):
                 self.configure_nidaq(
                     configuration,
                     feedback_reader=feedback_reader,
+                    timing_plan=timing_plan,
                 )
             else:
                 raise ValueError(f"Unsupported laser backend: {backend}")

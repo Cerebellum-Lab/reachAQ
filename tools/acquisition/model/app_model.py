@@ -3944,6 +3944,11 @@ class AppModel(ObservableObject):
                 runtime_configuration,
                 feedback_reader=feedback_reader,
                 persisted_configuration=configuration,
+                timing_plan=(
+                    self._nidaq_signal_monitor.timing_plan
+                    if configuration.hardware_timed
+                    else None
+                ),
             )
         except Exception as exc:
             error = str(exc) or exc.__class__.__name__
