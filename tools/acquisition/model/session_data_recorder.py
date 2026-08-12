@@ -472,13 +472,16 @@ class SessionDataRecorder:
                     generation_id = json.load(stream).get("metadataGenerationId")
             except (OSError, ValueError, TypeError):
                 pass
+        generation_id = generation_id or f"{project.short_id}-live"
         atomic_write_json(
             path,
-            tracking_request_record(request, result),
-            session_dir=session_dir,
-            generation_id=(
-                generation_id or f"{project.short_id}-live"
+            tracking_request_record(
+                request,
+                result,
+                metadata_generation_id=generation_id,
             ),
+            session_dir=session_dir,
+            generation_id=generation_id,
         )
         return path
 

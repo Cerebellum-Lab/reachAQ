@@ -186,7 +186,12 @@ def test_coordinator_queue_is_bounded_and_timing_starts_as_estimating():
 
 def test_tracking_record_round_trip_retains_generation_and_frame_identity():
     original = request([sample(index, 30) for index in range(5)])
-    restored = tracking_request_from_record(tracking_request_record(original))
+    record = tracking_request_record(
+        original,
+        metadata_generation_id="session001-g1",
+    )
+    restored = tracking_request_from_record(record)
+    assert record["metadataGenerationId"] == "session001-g1"
     assert restored.generation == original.generation
     assert restored.operation_id == original.operation_id
     assert restored.window.samples[2].primary_frame_ids == (2,)

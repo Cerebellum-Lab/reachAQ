@@ -487,10 +487,13 @@ class IntertrialAnalysisCoordinator:
 def tracking_request_record(
     request: IntertrialAnalysisRequest,
     result: Optional[IntertrialAnalysisResult] = None,
+    *,
+    metadata_generation_id: Optional[str] = None,
 ) -> dict:
     """Create the non-executable record used for final validation/repair."""
     record = {
         "schemaVersion": 1,
+        "metadataGenerationId": metadata_generation_id,
         "identity": {
             "generation": request.generation,
             "sessionId": request.session_id,
