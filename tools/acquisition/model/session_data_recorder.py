@@ -378,6 +378,48 @@ class SessionDataRecorder:
             self._trial_records = tuple(dict(record) for record in records)
             self._trial_summary = dict(summary)
 
+    def persist_trial_ledger(self, project, records, summary) -> None:
+        """Publish live trial progress, or update the closed-session ledger."""
+        self.set_trial_ledger(records, summary)
+        streams_dir = Path(project.get_session_path().location) / "streams"
+        alignment_path = streams_dir / "alignment.json"
+        if alignment_path.is_file():
+            self.update_persisted_trial_ledger(project, records, summary)
+            return
+        with self._lock:
+            if not self._armed or self._start_perf is None:
+                return
+            start_perf = self._start_perf
+            generation_id = (
+                self._metadata_generation_id or f"{project.short_id}-live"
+            )
+        session_dir = Path(project.get_session_path().location)
+        streams_dir.mkdir(parents=True, exist_ok=True)
+        live_records = []
+        for original in records:
+            record = dict(original)
+            if float(record["send_perf_time"]) < start_perf:
+                continue
+            record["metadata_generation_id"] = generation_id
+            record["send_offset_seconds"] = (
+                float(record["send_perf_time"]) - start_perf
+            )
+            live_records.append(record)
+        self._atomic_write_json_lines(
+            streams_dir / "trials.jsonl",
+            session_dir,
+            generation_id,
+            live_records,
+        )
+        live_summary = dict(summary)
+        live_summary["metadata_generation_id"] = generation_id
+        atomic_write_json(
+            streams_dir / "trial_summary.json",
+            live_summary,
+            session_dir=session_dir,
+            generation_id=generation_id,
+        )
+
     @staticmethod
     def update_persisted_trial_ledger(project, records, summary) -> None:
         """Atomically replace the post-analysis trial ledger and summary."""

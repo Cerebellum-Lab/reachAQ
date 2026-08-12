@@ -251,7 +251,7 @@ class PelletCycleController:
                     attempt.attempt_label,
                     attempt.outcome,
                 )
-        self._session_data_recorder.update_persisted_trial_ledger(
+        self._session_data_recorder.persist_trial_ledger(
             project,
             ledger.to_records(),
             ledger.summary(),
@@ -320,7 +320,57 @@ class PelletCycleController:
                 finalized.attempt_label,
                 finalized.outcome,
             )
-        self._session_data_recorder.update_persisted_trial_ledger(
+        self._session_data_recorder.persist_trial_ledger(
+            project,
+            ledger.to_records(),
+            ledger.summary(),
+        )
+        return finalized
+
+    def finalize_intertrial_unavailable(
+        self,
+        project,
+        attempt,
+        *,
+        perf_time: float,
+        wall_time: float,
+        reason: str,
+        pellet_presence: str = "unknown",
+        pellet_misplacement: str = "unknown",
+        window=None,
+        outcome: TrialOutcome = TrialOutcome.INCOMPLETE,
+    ):
+        ledger = self._require_ledger()
+        outcome = TrialOutcome(outcome)
+        if pellet_presence == "missing":
+            outcome = TrialOutcome.PELLET_MISSING
+        finalized = ledger.finalize_pending(
+            attempt.trial_id,
+            attempt.attempt_id,
+            outcome,
+            perf_time,
+            wall_time,
+            error=reason,
+            pellet_presence=pellet_presence,
+            pellet_misplacement=pellet_misplacement,
+            analysis_window_start_perf=(
+                None if window is None else window.start_perf
+            ),
+            analysis_window_end_perf=(
+                None if window is None else window.end_perf
+            ),
+            tracking_coverage=(None if window is None else window.coverage),
+            tracking_missing_frame_ids=(
+                () if window is None else window.missing_frame_ids
+            ),
+        )
+        self._session_api.trial_ended(finalized)
+        if finalized.logical_trial_complete:
+            self._protocol_runner.record_trial_outcome(
+                finalized.attempt_label,
+                finalized.outcome,
+            )
+        self._session_data_recorder.persist_trial_ledger(
             project,
             ledger.to_records(),
             ledger.summary(),
@@ -346,7 +396,7 @@ class PelletCycleController:
         for attempt in finalized:
             self._session_api.trial_ended(attempt)
         if finalized:
-            self._session_data_recorder.update_persisted_trial_ledger(
+            self._session_data_recorder.persist_trial_ledger(
                 project,
                 ledger.to_records(),
                 ledger.summary(),
