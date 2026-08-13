@@ -960,6 +960,34 @@ def test_tokenized_abort_transitions_ready_before_invalidating_generation(
     assert not session_path.exists()
 
 
+def test_failed_arming_uses_abort_cleanup_without_reverting_to_arming(
+    app_model,
+):
+    project = app_model.project
+    project.session = 1
+    reservation = app_model._recording_session.begin_record(
+        project.short_id,
+        {},
+    )
+    assert reservation is not None
+    _, token = reservation
+    timer = mock.Mock()
+
+    with mock.patch.object(
+        app_model.behavior.algorithm,
+        "end_capture_session",
+        return_value=False,
+    ), mock.patch(
+        "tools.acquisition.model.app_model.make_daemon_timer",
+        return_value=timer,
+    ):
+        assert app_model.abort_recording(token=token)
+
+    assert app_model.session_recording_status is SessionRecordingStatus.ABORTING
+    assert app_model._aborting_project.short_id == project.short_id
+    timer.start.assert_called_once_with()
+
+
 def test_abort_during_analysis_cancels_analysis_and_removes_session(
     app_model,
 ):

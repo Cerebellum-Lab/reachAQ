@@ -1118,21 +1118,11 @@ class AppModel(ObservableObject):
             )
         except Exception as err:
             logger.exception("manual recording start failed: %s", err)
-            self._session_data_recorder.abort()
-            self._set_session_recording_status(
-                SessionRecordingStatus.READY,
-                expected=(SessionRecordingStatus.ARMING,),
-                token=session_token,
-            )
+            self.abort_recording(token=session_token)
             self.on_error("Recording failed", str(err))
             return False
         if not started:
-            self._session_data_recorder.abort()
-            self._set_session_recording_status(
-                SessionRecordingStatus.READY,
-                expected=(SessionRecordingStatus.ARMING,),
-                token=session_token,
-            )
+            self.abort_recording(token=session_token)
             return False
         self._aborted_session_ids.discard(project.short_id)
         if self._recording_session.status == SessionRecordingStatus.ARMING:
@@ -1546,6 +1536,17 @@ class AppModel(ObservableObject):
             reason=RecordingEndingReason.MANUAL_ABORT,
         )
         if not stopped:
+            if previous_status is SessionRecordingStatus.ARMING:
+                # A failed/declined start has no active behavior session to
+                # stop. Keep Abort ownership and verify that no camera writer
+                # appeared before deleting the reserved session.
+                self._abort_cleanup_timer.cancel()
+                self._abort_cleanup_timer = make_daemon_timer(
+                    1.0,
+                    lambda token=token: self._finish_abort_if_never_started(token),
+                )
+                self._abort_cleanup_timer.start()
+                return True
             self._set_session_recording_status(
                 previous_status,
                 expected=(SessionRecordingStatus.ABORTING,),
