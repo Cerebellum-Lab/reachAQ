@@ -23,6 +23,7 @@ from tools.acquisition.model.atomic_session_io import (
     atomic_publish_file,
     atomic_write_json,
     file_manifest_entry,
+    remove_empty_staging_generation,
 )
 
 
@@ -280,6 +281,15 @@ class SessionDataRecorder:
                 return None
             return snapshot["project"].short_id
 
+    @property
+    def pending_finalization_project(self) -> Optional[ProjectInfo]:
+        """Return an isolated project snapshot for metadata republication."""
+        with self._lock:
+            snapshot = self._pending_finalization
+            if snapshot is None:
+                return None
+            return snapshot["project"].to_local_value()
+
     def _publish_pending_finalization(self, *, max_attempts: int):
         with self._lock:
             snapshot = self._pending_finalization
@@ -302,6 +312,10 @@ class SessionDataRecorder:
                     nidaq_source = snapshot.get("nidaq_chunks")
                     if isinstance(nidaq_source, _NidaqSpoolSnapshot):
                         nidaq_source.path.unlink(missing_ok=True)
+                    remove_empty_staging_generation(
+                        Path(snapshot["project"].get_session_path().location),
+                        str(snapshot["metadata_generation_id"]),
+                    )
                     self._pending_finalization = None
                     self._clear_locked()
             return result

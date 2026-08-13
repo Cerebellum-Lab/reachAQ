@@ -769,10 +769,30 @@ def test_auxiliary_generation_is_shared_by_alignment_trials_and_manifest(tmp_pat
     assert manifest["metadataGenerationId"] == generation_id
 
 
-def test_failed_auxiliary_finalization_retains_snapshot_for_retry(monkeypatch):
+def test_failed_auxiliary_finalization_retains_snapshot_for_retry(
+    monkeypatch,
+    tmp_path,
+):
     laser = _EventSource("trace_received")
     recorder = SessionDataRecorder(object(), laser)
-    snapshot = {"project": object()}
+    project = ProjectInfo(
+        root=str(tmp_path),
+        device_id="test",
+        when=datetime(2026, 1, 2, 3, 4, 5),
+        session=9,
+    )
+    generation_id = f"{project.short_id}-g1"
+    staging = (
+        Path(project.get_session_path().location)
+        / ".staging"
+        / generation_id
+        / "streams"
+    )
+    staging.mkdir(parents=True)
+    snapshot = {
+        "project": project,
+        "metadata_generation_id": generation_id,
+    }
     recorder._pending_finalization = snapshot
     attempts = []
 
@@ -790,6 +810,7 @@ def test_failed_auxiliary_finalization_retains_snapshot_for_retry(monkeypatch):
 
         assert recorder.retry_pending_finalization() == {"sessionComplete": True}
         assert recorder._pending_finalization is None
+        assert not staging.parent.parent.exists()
     finally:
         recorder.close()
 

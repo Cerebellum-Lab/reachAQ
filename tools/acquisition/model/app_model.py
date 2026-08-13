@@ -440,6 +440,7 @@ class AppModel(ObservableObject):
         self._animal_name = ""
         self._notes = ""
         self._editable_notes_project: Optional[ProjectInfo] = None
+        self._pending_metadata_project: Optional[ProjectInfo] = None
         self._trial_protocol_schedule = TrialProtocolSchedule.with_placeholder_rows()
         self._left_camera = self._right_camera = self._stim_camera = None
         self._reach_cameras: Tuple[VideoCaptureModel, ...] = ()
@@ -950,13 +951,38 @@ class AppModel(ObservableObject):
         if self._recording_session.status != SessionRecordingStatus.READY:
             logger.warning("start_recording refused while %s", self._recording_session.status.value)
             return False
-        if self._session_data_recorder.has_pending_finalization:
+        if (
+            self._session_data_recorder.has_pending_finalization
+            or self._pending_metadata_project is not None
+        ):
             pending_session = (
                 self._session_data_recorder.pending_finalization_session_id
+                or (
+                    None
+                    if self._pending_metadata_project is None
+                    else self._pending_metadata_project.short_id
+                )
                 or "previous session"
             )
+            pending_project = (
+                self._session_data_recorder.pending_finalization_project
+                or self._pending_metadata_project
+            )
             try:
-                self._session_data_recorder.retry_pending_finalization()
+                retained_result = None
+                if self._session_data_recorder.has_pending_finalization:
+                    retained_result = (
+                        self._session_data_recorder.retry_pending_finalization()
+                    )
+                if retained_result is not None:
+                    self._recording_session.set_stream_result(retained_result)
+                if pending_project is not None:
+                    self._pending_metadata_project = pending_project
+                    self._save_project_metadata(
+                        pending_project,
+                        caller="retained_finalization_retry",
+                    )
+                    self._pending_metadata_project = None
             except Exception as error:
                 logger.exception(
                     "Retained finalization retry failed for %s",
@@ -6297,6 +6323,7 @@ class AppModel(ObservableObject):
                 caller="raw_writers_closed",
             )
         except Exception as exc:
+            self._pending_metadata_project = project.to_local_value()
             self._recording_session.add_data_error(
                 f"metadata save failed: {exc}"
             )
@@ -6426,6 +6453,7 @@ class AppModel(ObservableObject):
                 caller="intertrial_analysis_finished",
             )
         except Exception as error:
+            self._pending_metadata_project = project.to_local_value()
             self._recording_session.add_data_error(
                 f"final metadata save failed: {error}"
             )
@@ -6436,6 +6464,7 @@ class AppModel(ObservableObject):
             )
             logger.exception("Final intertrial metadata save failed")
         else:
+            self._pending_metadata_project = None
             self._set_subsystem_status(
                 SubsystemId.INTERTRIAL_ANALYSIS,
                 (
@@ -7041,6 +7070,7 @@ class AppModel(ObservableObject):
             "session_analysis_ended",
             "intertrial_analysis_finished",
             "session_notes_updated",
+            "retained_finalization_retry",
         }:
             boundary = self._recording_session.boundary
             if boundary is None or boundary.session_id != project_info.short_id:

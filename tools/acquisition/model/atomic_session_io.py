@@ -45,6 +45,42 @@ def session_staging_path(
     return session_dir / ".staging" / generation_id / relative
 
 
+def remove_empty_staging_generation(
+    session_dir: Path,
+    generation_id: str,
+) -> None:
+    """Remove only empty directories belonging to a published generation.
+
+    Failed staged files are deliberately retained. Using ``rmdir`` rather
+    than recursive cleanup ensures this helper cannot remove those files.
+    """
+    session_dir = Path(session_dir).resolve()
+    staging_root = session_dir / ".staging"
+    generation_root = staging_root / str(generation_id)
+    try:
+        generation_root.resolve().relative_to(staging_root.resolve())
+    except ValueError as error:
+        raise RuntimeError(
+            f"staging generation is outside the session staging root: {generation_root}"
+        ) from error
+    directories = (
+        sorted(
+            (path for path in generation_root.rglob("*") if path.is_dir()),
+            key=lambda path: len(path.parts),
+            reverse=True,
+        )
+        if generation_root.is_dir()
+        else []
+    )
+    for directory in (*directories, generation_root, staging_root):
+        try:
+            directory.rmdir()
+        except (FileNotFoundError, OSError):
+            # Non-empty directories contain retained diagnostics or another
+            # generation and must remain untouched.
+            pass
+
+
 def atomic_publish_file(
     final_path: Path,
     write: Callable[[Path], None],
