@@ -2,6 +2,7 @@ import csv
 import ctypes
 import dataclasses
 import enum
+import functools
 import hashlib
 import json
 import logging
@@ -209,6 +210,16 @@ from tools.acquisition.model.video_capture_model import (
 )
 
 logger = get_verbose_logger(__name__)
+
+
+def _serialized_session_configuration(method):
+    """Serialize configuration changes against Record/Stop/Abort commands."""
+    @functools.wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._session_lifecycle_command_lock:
+            return method(self, *args, **kwargs)
+
+    return wrapped
 
 
 def _metadata_without_nonfinite_numbers(value):
@@ -3627,6 +3638,7 @@ class AppModel(ObservableObject):
         return self._selected_animal
 
     @selected_animal.setter
+    @_serialized_session_configuration
     def selected_animal(self, animal: Optional[AnimalSubject]):
         if (
             animal != self._selected_animal
@@ -3692,6 +3704,7 @@ class AppModel(ObservableObject):
             ),
         )
 
+    @_serialized_session_configuration
     def set_automatic_protocol_advance_enabled(self, enabled: bool) -> None:
         """Apply protocol advancement consistently to config and live runner."""
         self._require_session_ready_for_configuration(
@@ -3721,6 +3734,7 @@ class AppModel(ObservableObject):
     def training_plan(self, plan: Optional[TrainingPlan]):
         self.set_training_plan(plan)
 
+    @_serialized_session_configuration
     def set_training_plan(self, plan: Optional[TrainingPlan], *, force_update: bool = False):
         if (
             plan != self._training_plan
@@ -3767,6 +3781,7 @@ class AppModel(ObservableObject):
                 f"{action} is unavailable while session state is {status.value}"
             )
 
+    @_serialized_session_configuration
     def update_behavior_configuration(
         self,
         action: str,
@@ -3776,18 +3791,21 @@ class AppModel(ObservableObject):
         self._require_session_ready_for_configuration(action)
         update(self._behavior.algorithm)
 
+    @_serialized_session_configuration
     def set_live_inference_enabled(self, enabled: bool) -> None:
         self._require_session_ready_for_configuration(
             "Changing live inference"
         )
         self._inference.is_enabled = bool(enabled)
 
+    @_serialized_session_configuration
     def set_inference_model_location(self, value: str) -> None:
         self._require_session_ready_for_configuration(
             "Changing the inference model"
         )
         self._inference.model_location = str(value)
 
+    @_serialized_session_configuration
     def update_user_preference(self, name: str, value) -> None:
         self._require_session_ready_for_configuration(
             f"Changing preference {name}"
@@ -3797,6 +3815,7 @@ class AppModel(ObservableObject):
         setattr(self._preferences, name, value)
 
     @output_location.setter
+    @_serialized_session_configuration
     def output_location(self, value: str):
         self._require_session_ready_for_configuration("Changing the output location")
         if self._output_location == value and self._project_info is not None:
@@ -3893,6 +3912,7 @@ class AppModel(ObservableObject):
         self._notify_trial_protocol_state()
         return True
 
+    @_serialized_session_configuration
     def set_intertrial_analysis_enabled(self, enabled: bool) -> None:
         self._require_session_ready_for_configuration(
             "Changing intertrial analysis"
@@ -3910,6 +3930,7 @@ class AppModel(ObservableObject):
         self._notify_trial_protocol_state()
         return True
 
+    @_serialized_session_configuration
     def update_session_control_option(self, field: str, value) -> bool:
         """Validate and apply one operator session-policy option while Ready."""
         self._require_session_ready_for_configuration(
@@ -5436,6 +5457,7 @@ class AppModel(ObservableObject):
             configuration.save_file(location, as_yaml=True)
         return configuration
 
+    @_serialized_session_configuration
     def load_configuration(self, location: Optional[Path] = None, *, random_cameras: bool = False):
         self._require_session_ready_for_configuration("Loading configuration")
         if location is None:
@@ -5609,8 +5631,12 @@ class AppModel(ObservableObject):
         conf = self._create_configuration()
         conf.save_default(loc)
 
+    @_serialized_session_configuration
     def set_runtime_live_inference_override(self, enabled: bool) -> None:
         """Override configured live inference without persisting the CLI choice."""
+        self._require_session_ready_for_configuration(
+            "Changing the runtime inference override"
+        )
         if self._loaded_configuration is None:
             raise RuntimeError("Cannot override live inference before configuration is loaded")
         enabled = bool(enabled)
@@ -5618,6 +5644,7 @@ class AppModel(ObservableObject):
         self._runtime_live_inference_override = enabled
         logger.notice("Runtime live inference override: enabled=%s", enabled)
 
+    @_serialized_session_configuration
     def update_daq_port_configuration(
         self,
         nidaq_ports: NidaqPortConfiguration,
