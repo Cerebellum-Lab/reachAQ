@@ -122,6 +122,7 @@ from tools.acquisition.model.recording_session_controller import (
     SessionGeneration,
 )
 from tools.acquisition.model.camera_recording_validation import (
+    ClosedVideoValidation,
     validate_closed_video,
 )
 from tools.acquisition.model.camera_timing_alignment import (
@@ -465,6 +466,7 @@ class AppModel(ObservableObject):
         self._abort_had_recording_started = False
         self._abort_cleanup_timer = no_op_timer
         self._record_start_timer = no_op_timer
+        self._writer_close_timer = no_op_timer
         self._storage_monitor = RecordingStorageMonitor()
         self._storage_preflight = None
         self._internal_error_diagnostic = None
@@ -1443,7 +1445,33 @@ class AppModel(ObservableObject):
                 expected=(SessionRecordingStatus.STOPPING,),
                 token=token,
             )
+        elif token is not None and self._recording_session.is_current(
+            token,
+            statuses=(SessionRecordingStatus.STOPPING,),
+        ):
+            self._writer_close_timer.cancel()
+            self._writer_close_timer = make_daemon_timer(
+                30.0,
+                lambda token=token: self._writer_close_timed_out(token),
+            )
+            self._writer_close_timer.start()
         return bool(stopped)
+
+    def _writer_close_timed_out(self, token: SessionGeneration) -> None:
+        if not self._recording_session.is_current(
+            token,
+            statuses=(SessionRecordingStatus.STOPPING,),
+        ):
+            return
+        message = (
+            "Camera writers did not all report closure within 30 seconds. "
+            "The session remains preserved and will finish if the late writer "
+            "acknowledgement arrives; Abort remains available."
+        )
+        logger.error(message)
+        self._recording_session.add_data_error(message)
+        self._mark_session_invariant_unknown(message)
+        self.on_error("Camera writer close timeout", message)
 
     def stop_recording(self) -> bool:
         return self._stop_recording(RecordingEndingReason.MANUAL_STOP)
@@ -1458,6 +1486,7 @@ class AppModel(ObservableObject):
         if previous_status not in {
             SessionRecordingStatus.ARMING,
             SessionRecordingStatus.RECORDING,
+            SessionRecordingStatus.STOPPING,
             SessionRecordingStatus.ANALYZING,
         }:
             logger.warning("abort_recording refused while %s", self._recording_session.status.value)
@@ -1467,6 +1496,7 @@ class AppModel(ObservableObject):
             statuses=(
                 SessionRecordingStatus.ARMING,
                 SessionRecordingStatus.RECORDING,
+                SessionRecordingStatus.STOPPING,
                 SessionRecordingStatus.ANALYZING,
             ),
         ):
@@ -1497,12 +1527,20 @@ class AppModel(ObservableObject):
             self._recording_session.take_pending_end(token)
         self._record_start_timer.cancel()
         self._record_start_timer = no_op_timer
+        self._writer_close_timer.cancel()
+        self._writer_close_timer = no_op_timer
         if previous_status is SessionRecordingStatus.ANALYZING:
             logger.notice(
                 "Cancelling pending pellet-trial analysis before deleting %s",
                 self._aborting_project.short_id,
             )
             self._finish_abort_recording(token=token)
+            return True
+        if previous_status is SessionRecordingStatus.STOPPING:
+            logger.notice(
+                "Abort requested while camera writers are closing for %s",
+                self._aborting_project.short_id,
+            )
             return True
         stopped = self._behavior.algorithm.end_capture_session(
             reason=RecordingEndingReason.MANUAL_ABORT,
@@ -1985,8 +2023,11 @@ class AppModel(ObservableObject):
                     for camera in recording_cams
                 )
                 if all(key in cams_closed_finished for key in session_keys):
+                    self._writer_close_timer.cancel()
+                    self._writer_close_timer = no_op_timer
                     project = cams_closed_finished[session_keys[0]][0]
                     session_dir = Path(project.get_session_path().location)
+                    validation_inputs = []
                     for camera, camera_key in zip(recording_cams, session_keys):
                         (
                             camera_project,
@@ -2000,12 +2041,69 @@ class AppModel(ObservableObject):
                             camera.name,
                             allow_overwrite=True,
                         )
-                        validation = validate_closed_video(
+                        validation_inputs.append((
+                            camera,
                             Path(video_path),
                             Path(timestamp_path),
-                            writer_frame_count=camera_frames,
-                            writer_diagnostics=camera_writer_diagnostics,
-                        )
+                            camera_frames,
+                            camera_writer_diagnostics,
+                        ))
+                    with ThreadPoolExecutor(
+                        max_workers=max(1, len(validation_inputs)),
+                        thread_name_prefix="ValidateClosedVideo",
+                    ) as executor:
+                        validations = {
+                            camera.name: executor.submit(
+                                validate_closed_video,
+                                video_path,
+                                timestamp_path,
+                                writer_frame_count=camera_frames,
+                                writer_diagnostics=writer_diagnostics,
+                                ffprobe_timeout_seconds=30.0,
+                            )
+                            for (
+                                camera,
+                                video_path,
+                                timestamp_path,
+                                camera_frames,
+                                writer_diagnostics,
+                            ) in validation_inputs
+                        }
+                    for (
+                        camera,
+                        video_path,
+                        timestamp_path,
+                        camera_frames,
+                        camera_writer_diagnostics,
+                    ) in validation_inputs:
+                        try:
+                            validation = validations[camera.name].result()
+                        except Exception as error:
+                            logger.exception(
+                                "Closed-video validation crashed: camera=%s",
+                                camera.name,
+                            )
+                            validation = ClosedVideoValidation(
+                                video_path=video_path.as_posix(),
+                                timestamp_path=timestamp_path.as_posix(),
+                                decoded_frame_count=0,
+                                writer_frame_count=int(camera_frames),
+                                timestamp_row_count=0,
+                                writer_error_count=int(
+                                    camera_writer_diagnostics.get("errorCount", 0)
+                                    or 0
+                                ),
+                                writer_first_error=(
+                                    camera_writer_diagnostics.get("firstError")
+                                    or None
+                                ),
+                                counter_backend="validation_error",
+                                warnings=(),
+                                failure=(
+                                    "closed-video validation failed: "
+                                    f"{error.__class__.__name__}: {error}"
+                                ),
+                            )
                         if validation.warnings:
                             logger.warning(
                                 "Camera recording validation warning: camera=%s %s",
@@ -5597,6 +5695,7 @@ class AppModel(ObservableObject):
         for timer in (
                 self._timer_one_minute_repeat,
                 self._timer_daily,
+                self._writer_close_timer,
         ):
             logger.debug("stopping timer %s", timer)
             timer.cancel()

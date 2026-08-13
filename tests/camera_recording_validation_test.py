@@ -1,3 +1,5 @@
+import subprocess
+
 from tools.acquisition.model import camera_recording_validation as validation_module
 from tools.acquisition.model.camera_recording_validation import validate_closed_video
 
@@ -65,3 +67,32 @@ def test_unreadable_timestamp_file_marks_source_incomplete(tmp_path, monkeypatch
     result = validate_closed_video(video, timestamps, writer_frame_count=2)
 
     assert "timestamp file is unreadable" in result.failure
+
+
+def test_ffprobe_timeout_is_bounded_failure_without_unbounded_fallback(
+    tmp_path,
+    monkeypatch,
+):
+    video = tmp_path / "left.mp4"
+    timestamps = tmp_path / "left.txt"
+    video.write_bytes(b"closed-video")
+    timestamps.write_text("row\n", encoding="utf-8")
+    monkeypatch.setattr(
+        validation_module,
+        "_ffprobe_frame_count",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired("ffprobe", 3.0)
+        ),
+    )
+    monkeypatch.setattr(
+        validation_module,
+        "_opencv_frame_count",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("timed-out validation must not enter an unbounded fallback")
+        ),
+    )
+
+    result = validate_closed_video(video, timestamps, writer_frame_count=1)
+
+    assert result.counter_backend == "ffprobe_timeout"
+    assert "timed out after 3.0 seconds" in result.failure

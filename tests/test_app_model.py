@@ -1191,6 +1191,28 @@ def test_record_start_timeout_aborts_partial_session(app_model):
     abort.assert_called_once_with()
 
 
+def test_writer_close_timeout_preserves_session_and_marks_invariant(app_model):
+    reservation = app_model._recording_session.begin_record(
+        app_model.project.short_id,
+        {},
+    )
+    assert reservation is not None
+    _, token = reservation
+    app_model._recording_session.transition(
+        SessionRecordingStatus.STOPPING,
+        expected=(SessionRecordingStatus.ARMING,),
+        token=token,
+    )
+
+    with mock.patch.object(app_model, "on_error") as on_error:
+        app_model._writer_close_timed_out(token)
+
+    assert app_model.session_recording_status is SessionRecordingStatus.STOPPING
+    assert app_model._recording_session.data_complete is False
+    assert app_model._session_invariant_unknown is True
+    on_error.assert_called_once()
+
+
 def test_stale_session_generation_cannot_timeout_or_close_new_session(app_model):
     first_reservation = app_model._recording_session.begin_record(
         app_model.project.short_id,

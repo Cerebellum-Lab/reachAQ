@@ -101,7 +101,14 @@ def validate_closed_video(
                 video_path,
                 ffprobe_timeout_seconds,
             )
-        except (FileNotFoundError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        except subprocess.TimeoutExpired as exc:
+            decoded_count = 0
+            counter_backend = "ffprobe_timeout"
+            failure = (
+                "closed video validation timed out after "
+                f"{float(exc.timeout):.1f} seconds"
+            )
+        except (FileNotFoundError, RuntimeError) as exc:
             warnings.append(f"ffprobe count unavailable: {exc}")
             counter_backend = "opencv_grab"
             try:
