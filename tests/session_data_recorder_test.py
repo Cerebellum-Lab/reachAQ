@@ -815,6 +815,51 @@ def test_failed_auxiliary_finalization_retains_snapshot_for_retry(
         recorder.close()
 
 
+def test_nidaq_stop_timeout_remains_retryable(monkeypatch, tmp_path):
+    laser = _EventSource("trace_received")
+    laser.configuration = SimpleNamespace(backend="disabled")
+    recorder = SessionDataRecorder(
+        SimpleNamespace(timing_plan=None),
+        laser,
+    )
+    project = ProjectInfo(
+        root=str(tmp_path),
+        device_id="test",
+        when=datetime(2026, 1, 2, 3, 4, 5),
+        session=10,
+    )
+    recorder._armed = True
+    recorder._project = project
+    recorder._start_perf = 10.0
+    recorder._start_wall = 100.0
+    recorder._metadata_generation_id = f"{project.short_id}-g1"
+    stop_calls = 0
+
+    def stop_nidaq():
+        nonlocal stop_calls
+        stop_calls += 1
+        if stop_calls == 1:
+            raise RuntimeError("NI-DAQ recorder thread did not stop")
+
+    monkeypatch.setattr(recorder, "_stop_nidaq_thread", stop_nidaq)
+    monkeypatch.setattr(
+        recorder,
+        "_write_session",
+        lambda **_snapshot: {"sessionComplete": True},
+    )
+    try:
+        with pytest.raises(RuntimeError, match="did not stop"):
+            recorder.stop(12.0)
+
+        assert recorder.has_pending_finalization
+        assert recorder.pending_finalization_session_id == project.short_id
+        assert recorder.retry_pending_finalization() == {"sessionComplete": True}
+        assert not recorder.has_pending_finalization
+        assert stop_calls == 2
+    finally:
+        recorder.close()
+
+
 def test_nidaq_poll_reuses_preallocated_ring_scratch():
     destinations = []
 

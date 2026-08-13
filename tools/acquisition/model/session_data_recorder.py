@@ -129,6 +129,7 @@ class SessionDataRecorder:
         self._trial_summary = {}
         self._metadata_generation_id: Optional[str] = None
         self._pending_finalization: Optional[dict] = None
+        self._pending_stop_end_perf: Optional[float] = None
 
         self._system_message_handler = system_message_handler
         self._hardware_model = hardware_model
@@ -210,9 +211,12 @@ class SessionDataRecorder:
             )
 
     def stop(self, end_perf: float):
+        with self._lock:
+            self._pending_stop_end_perf = float(end_perf)
         self._stop_nidaq_thread()
         with self._lock:
             if not self._armed or self._project is None or self._start_perf is None:
+                self._pending_stop_end_perf = None
                 self._clear_locked()
                 return None
             project = self._project
@@ -261,34 +265,44 @@ class SessionDataRecorder:
                 "metadata_generation_id": self._metadata_generation_id,
             }
             self._armed = False
+            self._pending_stop_end_perf = None
             self._pending_finalization = snapshot
         return self._publish_pending_finalization(max_attempts=2)
 
     def retry_pending_finalization(self):
         """Retry a retained auxiliary snapshot without reacquiring any data."""
+        with self._lock:
+            pending_stop_end_perf = self._pending_stop_end_perf
+        if pending_stop_end_perf is not None:
+            return self.stop(pending_stop_end_perf)
         return self._publish_pending_finalization(max_attempts=1)
 
     @property
     def has_pending_finalization(self) -> bool:
         with self._lock:
-            return self._pending_finalization is not None
+            return (
+                self._pending_stop_end_perf is not None
+                or self._pending_finalization is not None
+            )
 
     @property
     def pending_finalization_session_id(self) -> Optional[str]:
         with self._lock:
             snapshot = self._pending_finalization
-            if snapshot is None:
-                return None
-            return snapshot["project"].short_id
+            project = (
+                None if snapshot is None else snapshot["project"]
+            ) or self._project
+            return None if project is None else project.short_id
 
     @property
     def pending_finalization_project(self) -> Optional[ProjectInfo]:
         """Return an isolated project snapshot for metadata republication."""
         with self._lock:
             snapshot = self._pending_finalization
-            if snapshot is None:
-                return None
-            return snapshot["project"].to_local_value()
+            project = (
+                None if snapshot is None else snapshot["project"]
+            ) or self._project
+            return None if project is None else project.to_local_value()
 
     def _publish_pending_finalization(self, *, max_attempts: int):
         with self._lock:
@@ -334,9 +348,14 @@ class SessionDataRecorder:
                 if isinstance(pending_source, _NidaqSpoolSnapshot):
                     spool_path = pending_source.path
             self._pending_finalization = None
+            self._pending_stop_end_perf = None
             self._clear_locked()
         if spool_path is not None:
             spool_path.unlink(missing_ok=True)
+
+    def request_abort(self) -> None:
+        """Request recorder shutdown without blocking the operator/UI thread."""
+        self._nidaq_stop.set()
 
     def close(self) -> None:
         self.abort()
@@ -630,6 +649,7 @@ class SessionDataRecorder:
         self._trial_records = ()
         self._trial_summary = {}
         self._metadata_generation_id = None
+        self._pending_stop_end_perf = None
 
     def _on_device_message(
         self,

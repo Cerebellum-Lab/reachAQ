@@ -1521,7 +1521,7 @@ class AppModel(ObservableObject):
         self._intertrial_resolution_reason = ""
         self._intertrial_waiting_operations.clear()
         self._behavior.algorithm.pellet_send_block_reason = ""
-        self._session_data_recorder.abort()
+        self._session_data_recorder.request_abort()
         self._cancel_automatic_stop_timers()
         if token is not None:
             self._recording_session.take_pending_end(token)
@@ -6659,6 +6659,21 @@ class AppModel(ObservableObject):
             )
             return
         try:
+            self._session_data_recorder.abort()
+        except Exception as error:
+            message = (
+                "Session data writer has not stopped yet; abort cleanup will "
+                f"retry without deleting files: {error}"
+            )
+            logger.exception(message)
+            self.on_error("Abort cleanup waiting for writer", message)
+            self._abort_cleanup_timer = make_daemon_timer(
+                1.0,
+                lambda token=token: self._finish_abort_recording(token=token),
+            )
+            self._abort_cleanup_timer.start()
+            return
+        try:
             day_path = Path(project.get_day_path(skip_ensure=True)[0]).resolve()
             session_path = Path(project.get_session_path(skip_ensure=True).location).resolve()
             try:
@@ -6697,7 +6712,6 @@ class AppModel(ObservableObject):
                     pending_api_events,
                 )
             self._behavior.algorithm.reset_session_counts()
-            self._session_data_recorder.abort()
             self._recording_session.reset_after_abort()
             self._set_subsystem_status(
                 SubsystemId.INTERTRIAL_ANALYSIS,
