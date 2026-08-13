@@ -78,8 +78,9 @@ class EventManager:
         with cls._class_lock:
             cls_inst: Optional[EventManager] = getattr(cls, "_instance", None)
             if cls_inst is not None:
-                cls_inst.close()
-                cls._remove_cls_instance()
+                report = cls_inst.close()
+                if report and report.get("workerStopped"):
+                    cls._remove_cls_instance()
 
     def __init__(
         self,

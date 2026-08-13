@@ -155,3 +155,26 @@ def test_shutdown_is_bounded_when_plugin_is_unresponsive():
     manager._write_thread.join(1)
     assert not manager._write_thread.is_alive()
     manager.close()
+
+
+def test_timed_out_default_close_retains_singleton_until_worker_stops():
+    manager = EventManager(
+        "EventManagerInstance",
+        queue_capacity=2,
+        shutdown_timeout_seconds=0.02,
+    )
+    plugin = BlockingPlugin()
+    manager.register_plugin(plugin)
+    with EventManager._class_lock:
+        EventManager._instance = manager
+    try:
+        manager.post_event(_event(1))
+        assert plugin.started.wait(1)
+
+        EventManager.try_close_default()
+
+        assert EventManager.default() is manager
+    finally:
+        plugin.release.set()
+        manager._write_thread.join(1)
+        manager.close()
