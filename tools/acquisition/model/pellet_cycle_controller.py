@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import functools
 import math
+import threading
 from typing import Optional
 
 from autotrainer.behavior import (
@@ -20,6 +22,15 @@ from autotrainer.device import CanFailure, CanFailureKind
 logger = get_verbose_logger(__name__)
 
 
+def _controller_locked(method):
+    @functools.wraps(method)
+    def serialized(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return serialized
+
+
 class PelletCycleController:
     """Coordinate the ledger, public lifecycle, protocol, and persistence.
 
@@ -28,28 +39,34 @@ class PelletCycleController:
     """
 
     def __init__(self, session_api, protocol_runner, session_data_recorder):
+        self._lock = threading.RLock()
         self._session_api = session_api
         self._protocol_runner = protocol_runner
         self._session_data_recorder = session_data_recorder
         self._ledger: Optional[PelletTrialLedger] = None
 
     @property
+    @_controller_locked
     def ledger(self) -> Optional[PelletTrialLedger]:
         return self._ledger
 
     @ledger.setter
+    @_controller_locked
     def ledger(self, value: Optional[PelletTrialLedger]) -> None:
         """Compatibility seam for tests and controlled session restoration."""
         self._ledger = value
 
     @property
+    @_controller_locked
     def active_attempt(self):
         return None if self._ledger is None else self._ledger.active_attempt
 
     @property
+    @_controller_locked
     def planned_trial_id(self) -> int:
         return 1 if self._ledger is None else self._ledger.planned_trial_id
 
+    @_controller_locked
     def start_session(
         self,
         session_id: str,
@@ -58,15 +75,19 @@ class PelletCycleController:
         self._ledger = PelletTrialLedger(session_id, configuration)
         return self._ledger
 
+    @_controller_locked
     def reset(self) -> None:
         self._ledger = None
 
+    @_controller_locked
     def count(self, basis: Optional[TrialCountBasis] = None) -> int:
         return 0 if self._ledger is None else self._ledger.count(basis)
 
+    @_controller_locked
     def summary(self) -> dict:
         return {} if self._ledger is None else self._ledger.summary()
 
+    @_controller_locked
     def begin_send(
         self,
         perf_time: float,
@@ -95,6 +116,7 @@ class PelletCycleController:
         self._session_api.trial_started(attempt)
         return attempt
 
+    @_controller_locked
     def acknowledge_presentation(
         self,
         perf_time: float,
@@ -118,6 +140,7 @@ class PelletCycleController:
         self._protocol_runner.begin_trial(presented.attempt_label)
         return presented
 
+    @_controller_locked
     def finish_active(
         self,
         perf_time: float,
@@ -137,6 +160,7 @@ class PelletCycleController:
         self._protocol_runner.cancel_active_trial()
         return attempt
 
+    @_controller_locked
     def finalize_active_incomplete(
         self,
         perf_time: float,
@@ -157,6 +181,7 @@ class PelletCycleController:
         self._protocol_runner.cancel_active_trial()
         return finalized
 
+    @_controller_locked
     def finalize_hardware_failure(
         self,
         failure: CanFailure,
@@ -222,6 +247,7 @@ class PelletCycleController:
         )
         return finalized
 
+    @_controller_locked
     def finalize_intertrial_result(
         self,
         project,
@@ -309,6 +335,7 @@ class PelletCycleController:
         )
         return finalized
 
+    @_controller_locked
     def result_can_control_next_trial(self, request) -> bool:
         """Whether a result may still affect settings for the next SEND."""
         ledger = self._ledger
@@ -324,6 +351,7 @@ class PelletCycleController:
                 return index == len(attempts) - 1
         return False
 
+    @_controller_locked
     def annotate_intertrial_capture(self, project, request):
         ledger = self._require_ledger()
         window = request.window
@@ -345,6 +373,7 @@ class PelletCycleController:
         )
         return updated
 
+    @_controller_locked
     def finalize_intertrial_unavailable(
         self,
         project,
@@ -401,6 +430,7 @@ class PelletCycleController:
         )
         return finalized
 
+    @_controller_locked
     def finalize_pending_without_analysis(
         self,
         project,
@@ -427,6 +457,7 @@ class PelletCycleController:
             )
         return finalized
 
+    @_controller_locked
     def snapshot_for_stop(self, perf_time: float, wall_time: float) -> None:
         ledger = self._ledger
         if ledger is None:
@@ -442,6 +473,7 @@ class PelletCycleController:
             ledger.summary(),
         )
 
+    @_controller_locked
     def end_session(self, *, aborted: bool = False) -> None:
         if self._ledger is not None:
             self._session_api.session_ended(
@@ -449,6 +481,7 @@ class PelletCycleController:
                 aborted=aborted,
             )
 
+    @_controller_locked
     def abort(self, *, perf_time: float, wall_time: float) -> None:
         ledger = self._ledger
         if ledger is not None and ledger.active_attempt is not None:
@@ -462,6 +495,7 @@ class PelletCycleController:
         self.end_session(aborted=True)
         self.reset()
 
+    @_controller_locked
     def sync_behavior_counts(self, algorithm) -> None:
         """Project all four UI counts from the one authoritative summary."""
         summary = self.summary()
