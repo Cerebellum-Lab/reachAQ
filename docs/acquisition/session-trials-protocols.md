@@ -146,12 +146,16 @@ pending-analysis, started, presented, completed, scored, and configured-basis
 counts. Both files use the same canonical performance/wall timebase as the
 other session streams and appear in `alignment.json`'s enabled-source manifest.
 
-The decoded pellet-board tone-2 rising edge opens a trial's tracking window and
-pellet-cycle completion closes it with no post-trial margin. The immutable
-tracking slice is persisted below `streams/tracking/` and sent to one bounded
-background worker. The worker consumes existing live pose/tracking data; it
-does not reopen video and does not run a second inference pass. Results update
-the ledger atomically while cameras and every other session stream continue.
+A validated physical NI Tone 2 onset opens a trial's tracking window when that
+input is configured and running; pellet-cycle completion closes it with no
+post-trial margin. This makes the boundary share the sampled camera/NI timeline
+instead of the delayed periodic CAN GPIO report. The pellet board's immediate
+tone status is the fallback when NI confirmation is unavailable, with periodic
+GPIO status retained only for legacy firmware. The immutable tracking slice is
+persisted below `streams/tracking/` and sent to one bounded background worker.
+The worker consumes existing live pose/tracking data; it does not reopen video
+and does not run a second inference pass. Results update the ledger atomically
+while cameras and every other session stream continue.
 
 Stop marks an active, not-yet-completed physical attempt `incomplete`, drains
 only already-closed windows, and performs a final repair from the stored

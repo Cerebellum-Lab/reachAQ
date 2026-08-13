@@ -386,11 +386,13 @@ Record, remain visible after Stop, and reset to zero after Abort. The old System
 state display, day/total counters, load-cell UI, and load-cell recording triggers
 have been removed.
 
-Optional live intertrial analysis uses the existing live tracking stream from
-decoded pellet-board tone 2 through exact pellet-cycle completion. It runs on a
-separate bounded worker while all recording streams continue and never reopens
-video or starts a second inference pass. Continue mode is advisory; Wait mode
-and analysis-dependent retry rules block only the next SEND. Pellet presence,
+Optional live intertrial analysis uses the existing live tracking stream from a
+validated physical NI Tone 2 onset through exact pellet-cycle completion. When
+that NI input is unavailable, it falls back first to the pellet board's immediate
+tone status and then to legacy periodic GPIO status. It runs on a separate
+bounded worker while all recording streams continue and never reopens video or
+starts a second inference pass. Continue mode is advisory; Wait mode and
+analysis-dependent retry rules block only the next SEND. Pellet presence,
 missing-pellet retry selection, and misplacement are finalized synchronously and
 do not wait for analysis. If a
 required result fails, the Trial Protocol panel offers **Retry analysis** and
@@ -416,6 +418,12 @@ records NI-DAQ topology, camera/NI edge matching, device-tone/NI confirmation,
 enabled-source paths and counts, gaps, overruns, failures, and session
 completeness. Final JSON/YAML metadata must contain the same finite canonical
 camera boundary before a session is reported as fully saved.
+
+Tone correlation treats the NI onset as the canonical physical event and groups
+the compound `PLAY_TONE` command, immediate `TONE_STATUS`, and periodic GPIO
+observation without changing their raw receipt timestamps. Pulses shorter than
+2 ms are reported as artifacts, not tone events, and all reported pulse onsets
+are restricted to the saved camera boundary.
 
 See [Session recording, synchronization, and hardware isolation](../../docs/acquisition/session-recording-and-synchronization.md)
 for the complete state, persistence, timing, metadata, failure, and verification

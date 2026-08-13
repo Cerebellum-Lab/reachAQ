@@ -268,9 +268,10 @@ software implementation gaps.
 - [ ] Confirm `device.csv` contains decoded general CAN traffic, command context,
       acknowledgements where available, direction, board/device identity, and
       timestamps rather than only its header.
-- [ ] Confirm tone commands reported by the pellet board are present in the
-      decoded device stream and their independently wired NI feedback edges are
-      present in the NI stream.
+- [ ] Confirm standalone and compound-sequence tones create outbound
+      `PLAY_TONE` rows in `device.csv`, immediate inbound `TONE_STATUS` rows are
+      retained, and their independently wired NI feedback pulses are present in
+      the NI stream.
 - [ ] Confirm laser commands and NI digital/analog feedback are represented as
       separate sources when configured.
 - [ ] Confirm every enabled source appears in the source manifest with its actual
@@ -301,6 +302,13 @@ software implementation gaps.
       or boundary mismatches are reported.
 - [ ] Confirm camera/NI and tone-command/NI-feedback correlations are populated
       and unambiguous when the corresponding physical lines are wired.
+- [ ] Confirm every valid Tone 1/Tone 2 pulse groups its outbound `PLAY_TONE`,
+      immediate `TONE_STATUS`, and periodic GPIO observation when present. The
+      raw event timestamps must remain unchanged and `alignedEventPerfTime` must
+      equal the NI pulse onset.
+- [ ] Confirm pulses shorter than 2 ms appear under `artifacts`, never as valid
+      tone matches or `unmatchedEdges`. Confirm pre-Record and post-Stop rolling
+      activity appears in neither session artifacts nor unmatched edges.
 - [ ] Repeat the eventful session at least three times and compare camera/NI and
       tone/NI offsets. Document the mean, range, and any outlier.
 
@@ -403,9 +411,13 @@ software implementation gaps.
       that retry decision. Confirm Stop and Abort remain enabled.
 - [ ] Confirm the Trial Protocol panel reports pending count, measured analysis
       seconds per tracking second, and `estimating` until measurements exist.
-- [ ] Verify each tracking window begins at decoded pellet-board tone-2 rising
-      and ends exactly at pellet-cycle completion. Confirm NI tone 2 is retained
-      separately as physical confirmation.
+- [ ] With NI Tone 2 enabled, verify each tracking window begins at the physical
+      NI pulse onset and ends exactly at pellet-cycle completion. Its first
+      behavioral sample should differ by no more than one frame interval. Confirm
+      delayed periodic GPIO receipt does not move the boundary.
+- [ ] Repeat with NI Tone 2 disabled. Confirm the immediate pellet-board tone
+      status opens the window; use legacy periodic GPIO only when immediate tone
+      status is unavailable.
 - [ ] Present a pellet with no reach and confirm `no_reach`, never
       `pellet_missing`. Verify direct live presence, absence, and misplacement
       finalize at cycle completion without entering the analysis wait queue.

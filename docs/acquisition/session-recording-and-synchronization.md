@@ -282,6 +282,11 @@ part of this format.
 
 Pellet-board tone events are stored here. Electrical tone confirmations wired to
 NI-DAQ are separate signals in `nidaq.h5`; `alignment.json` correlates the two.
+An embedded tone step inside a compound pellet sequence is also written as an
+outbound `PLAY_TONE` row with the parent operation context. The pellet board's
+immediate `TONE_STATUS` report is retained separately from the older, periodic
+`STIMULUS_INPUTS` GPIO report. Their raw receipt times are preserved; post-hoc
+alignment never overwrites transport timing.
 
 ### `trials.jsonl` and `trial_summary.json`
 
@@ -326,8 +331,9 @@ CAN warnings and errors remain in both logs.
 - the requested and resolved `nidaqTiming` topology;
 - `cameraNidaqAlignment`, including matched edge/sample, signed offset,
   resolution, confidence, and ambiguity;
-- `toneConfirmation`, including matched and unmatched device events and NI-DAQ
-  edges;
+- `toneConfirmation`, including canonical NI pulse onsets, grouped outbound
+  command/immediate status/periodic GPIO observations, unmatched valid events
+  and pulses, and separately classified short-pulse artifacts;
 - `enabledSources`, including source role/binding, runtime state, actual paths,
   sample/frame count, first/last offsets, gap and overrun counts, failure, and
   `persistenceStatus`;
@@ -395,10 +401,27 @@ Camera/NI matching uses the nearest `cam_frames` transition within half the
 observed frame period and records whether it was rising or falling. The current
 camera output is a square wave whose alternating peaks and troughs each identify
 one frame. Alignment reports `host_estimated` when the line is not configured,
-and `unmatched` when no plausible transition exists. Tone matching pairs
-decoded per-line stimulus rises with unclaimed NI-DAQ rises within 250 ms.
-Generic `PLAY_TONE` commands remain explicitly unmatched when the decoded
-command does not identify a physical confirmation line.
+and `unmatched` when no plausible transition exists. For configured Tone 1 and
+Tone 2 inputs, the NI pulse onset is the canonical physical time. Pulses shorter
+than 2 ms are classified as electrical artifacts and do not become tone events.
+Both valid pulses and artifacts are clipped to the camera Record/Stop boundary,
+so rolling-buffer activity outside the saved session is not reported as an
+unmatched session edge.
+
+Tone matching groups the embedded outbound `PLAY_TONE`, immediate pellet-board
+`TONE_STATUS`, and legacy periodic `STIMULUS_INPUTS` observation for the same
+valid NI pulse within 250 ms. `eventPerfTime` and per-observation latency retain
+the raw host/CAN timing, while `alignedEventPerfTime` is the physical NI onset
+used to compare the event with camera frames. A command whose frequency does
+not identify Tone 1 or Tone 2 remains explicitly unmatched.
+
+During recording, a validated NI Tone 2 pulse opens the live tracking window at
+that exact sampled onset. This removes CAN polling latency from the behavioral
+boundary. If the configured NI tone stream is unavailable, the immediate CAN
+`TONE_STATUS` is the fallback; the periodic GPIO status is used only for legacy
+firmware that supplies neither source. NI pulse validation and the live callback
+carry state across acquisition blocks so a pulse is emitted once, only after its
+duration is known to be at least 2 ms.
 
 The pellet board supplies the first two decoded confirmation lines: physical
 `STIM0` is `tone1` and physical `STIM1` is `tone2`. `STIM2` and `STIM3` remain
