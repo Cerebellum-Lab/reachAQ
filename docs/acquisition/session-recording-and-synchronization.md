@@ -361,7 +361,10 @@ The acquisition application uses explicit responsibility boundaries:
 - `RecordingSessionController` owns Ready/Arming/Recording/Stopping/Analyzing/
   Aborting state, generation/session identity, canonical boundary, writer
   completeness, enabled-source results, and analysis timing. Delayed callbacks
-  must match both generation and session ID.
+  must match both generation and session ID. Record, Stop, and Abort enter through
+  one re-entrant command boundary, so simultaneous UI/API commands cannot allocate
+  or close the same session twice. Abort atomically invalidates its generation and
+  returns to Ready before observers may start another session.
 - `PelletCycleController` owns the session ledger, send/acknowledgement/error
   mutation paths, attempt closure, per-trial result application, protocol outcomes,
   lifecycle publication, persistence updates, and the authoritative count
@@ -384,6 +387,9 @@ Physical pellet attempt IDs and their protocol settings are immutable after SEND
 Late analysis may attach diagnostics and results, but cannot reorder attempts or
 change a row already used by a subsequent SEND. Analysis-dependent retry/protocol
 effects are applied only when the result can still control the next physical trial.
+The future-row edit check and SEND snapshot share one lock, and composite ledger,
+public-event, protocol, and persistence mutations are serialized by the pellet-cycle
+controller.
 
 Camera/NI matching uses the nearest `cam_frames` transition within half the
 observed frame period and records whether it was rising or falling. The current
@@ -492,6 +498,9 @@ debounced background path; refresh requested during a session is deferred once,
 and all widget updates return through the Qt thread. The event manager preserves
 its public plugin/API contract while bounding its queue, producer wait, and
 shutdown, and reports pending/failed delivery instead of hanging indefinitely.
+Configuration mutations and subject/protocol selection also share the lifecycle
+command boundary, preventing a Record preflight/allocation race while the public
+state is still Ready. Future inactive protocol rows remain independently editable.
 
 The desktop launcher locks through a user-owned mode-0700 runtime directory and
 does not truncate a predictable file under `/tmp`. Calibration cleanup accepts

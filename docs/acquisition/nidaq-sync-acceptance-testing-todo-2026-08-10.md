@@ -73,6 +73,13 @@ Resolved implementation gaps:
 - [x] Session allocation is reserved once before writer arming; camera-close,
       timers, analysis, and abort callbacks require the matching session ID and
       generation, and old callbacks cannot finalize a later session.
+- [x] Record/Stop/Abort commands and Ready-only configuration mutations share one
+      re-entrant command boundary. Tokenized Abort returns to Ready and invalidates
+      its generation atomically; failed Arming reservations use the same verified
+      writer-close/delete path.
+- [x] Future protocol-row editing and SEND snapshotting share one lock, while the
+      pellet-cycle controller serializes ledger, lifecycle-event, protocol, and
+      persistence mutations without allowing a late result to relabel an attempt.
 - [x] Retained auxiliary finalization also retains its project/metadata identity,
       retries before the next Record, republishes authoritative metadata, and
       removes only empty successful staging directories.
