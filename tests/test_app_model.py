@@ -932,6 +932,34 @@ def test_abort_removes_whole_session_and_resets_counts(app_model):
     assert algorithm.successful_reaches == 0
 
 
+def test_tokenized_abort_transitions_ready_before_invalidating_generation(
+    app_model,
+):
+    project = app_model.project
+    project.session = 1
+    session_path = Path(project.get_session_path().location)
+    session_path.mkdir(parents=True, exist_ok=True)
+    reservation = app_model._recording_session.begin_record(
+        project.short_id,
+        {},
+    )
+    assert reservation is not None
+    _, token = reservation
+    assert app_model._recording_session.transition(
+        SessionRecordingStatus.ABORTING,
+        expected=(SessionRecordingStatus.ARMING,),
+        token=token,
+    ) is SessionRecordingStatus.ARMING
+    app_model._aborting_project = project.to_local_value()
+
+    app_model._finish_abort_recording(token=token)
+
+    assert app_model.session_recording_status is SessionRecordingStatus.READY
+    assert app_model._recording_session.token() is None
+    assert app_model._recording_session.generation > token.generation
+    assert not session_path.exists()
+
+
 def test_abort_during_analysis_cancels_analysis_and_removes_session(
     app_model,
 ):

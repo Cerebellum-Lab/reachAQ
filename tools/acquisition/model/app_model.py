@@ -6758,7 +6758,6 @@ class AppModel(ObservableObject):
                     pending_api_events,
                 )
             self._behavior.algorithm.reset_session_counts()
-            self._recording_session.reset_after_abort()
             self._set_subsystem_status(
                 SubsystemId.INTERTRIAL_ANALYSIS,
                 SubsystemState.DISABLED,
@@ -6768,11 +6767,13 @@ class AppModel(ObservableObject):
             self._aborting_project = None
             self._editable_notes_project = None
             self.notes = ""
-            self._set_session_recording_status(
+            transitioned = self._set_session_recording_status(
                 SessionRecordingStatus.READY,
                 expected=(SessionRecordingStatus.ABORTING,),
                 token=token,
             )
+            if transitioned:
+                self._recording_session.reset_after_abort()
 
     def _remove_timestamps_txt_files(
         self,
