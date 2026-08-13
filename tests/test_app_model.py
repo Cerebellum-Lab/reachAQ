@@ -1317,12 +1317,28 @@ def test_stale_session_generation_cannot_timeout_or_close_new_session(app_model)
         second_token,
         statuses=(SessionRecordingStatus.ARMING,),
     )
+    app_model._recording_session.transition(
+        SessionRecordingStatus.STOPPING,
+        expected=(SessionRecordingStatus.ARMING,),
+        token=second_token,
+    )
 
     camera = app_model.reach_cameras[0]
     camera.is_enabled = True
     camera.is_recording_enabled = True
     camera_closures = {}
     with mock.patch.object(app_model, "_complete_stopped_recording") as complete:
+        app_model._handle_proc_msg(
+            (
+                SystemStatusMessageKind.CAMERA_RECORDING_CLOSED_FINISHED,
+                (
+                    camera.camera_index,
+                    10,
+                    app_model.project.to_local_value(),
+                ),
+            ),
+            cams_closed_finished=camera_closures,
+        )
         app_model._handle_proc_msg(
             (
                 SystemStatusMessageKind.CAMERA_RECORDING_CLOSED_FINISHED,

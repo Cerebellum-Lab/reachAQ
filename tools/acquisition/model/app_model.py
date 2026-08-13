@@ -1851,7 +1851,7 @@ class AppModel(ObservableObject):
                     session_token = self._recording_session.token()
                     if (
                         session_token is not None
-                        and message_generation not in (None, 0, session_token.generation)
+                        and message_generation != session_token.generation
                     ):
                         logger.warning(
                             "ignoring stale camera RECORDING callback: camera=%s "
@@ -1944,7 +1944,7 @@ class AppModel(ObservableObject):
                     session_token = self._recording_session.token()
                     if (
                         session_token is not None
-                        and message_generation not in (None, 0, session_token.generation)
+                        and message_generation != session_token.generation
                     ):
                         logger.warning(
                             "ignoring stale camera RUNNING callback: camera=%s "
@@ -1990,7 +1990,7 @@ class AppModel(ObservableObject):
                 session_token is None
                 or self._recording_session.status not in closing_statuses
                 or project.short_id != session_token.session_id
-                or message_generation not in (None, 0, session_token.generation)
+                or message_generation != session_token.generation
             ):
                 logger.warning(
                     "ignoring stale camera-close callback: camera=%s project=%s "
