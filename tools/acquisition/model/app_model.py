@@ -3604,6 +3604,14 @@ class AppModel(ObservableObject):
 
     @selected_animal.setter
     def selected_animal(self, animal: Optional[AnimalSubject]):
+        if (
+            animal != self._selected_animal
+            and self._recording_session.status is not SessionRecordingStatus.READY
+        ):
+            raise RuntimeError(
+                "Changing the subject is unavailable while session state is "
+                f"{self._recording_session.status.value}"
+            )
         prev, self._selected_animal = self._selected_animal, animal
         if animal == prev:
             return
@@ -3725,6 +3733,35 @@ class AppModel(ObservableObject):
             raise RuntimeError(
                 f"{action} is unavailable while session state is {status.value}"
             )
+
+    def update_behavior_configuration(
+        self,
+        action: str,
+        update: Callable[[BehaviorAlgorithm], None],
+    ) -> None:
+        """Apply a Preferences mutation through the session-state boundary."""
+        self._require_session_ready_for_configuration(action)
+        update(self._behavior.algorithm)
+
+    def set_live_inference_enabled(self, enabled: bool) -> None:
+        self._require_session_ready_for_configuration(
+            "Changing live inference"
+        )
+        self._inference.is_enabled = bool(enabled)
+
+    def set_inference_model_location(self, value: str) -> None:
+        self._require_session_ready_for_configuration(
+            "Changing the inference model"
+        )
+        self._inference.model_location = str(value)
+
+    def update_user_preference(self, name: str, value) -> None:
+        self._require_session_ready_for_configuration(
+            f"Changing preference {name}"
+        )
+        if not hasattr(self._preferences, name):
+            raise AttributeError(f"Unknown user preference: {name}")
+        setattr(self._preferences, name, value)
 
     @output_location.setter
     def output_location(self, value: str):

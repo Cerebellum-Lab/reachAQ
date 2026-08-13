@@ -190,6 +190,12 @@ class PreferencesContent(QWidget):
         behavior = app_model.behavior
         algo = behavior.algorithm
 
+        def update_config(action: str, target, attribute: str, value) -> None:
+            app_model.update_behavior_configuration(
+                action,
+                lambda _algorithm: setattr(target, attribute, value),
+            )
+
         states_refresh = []
         add_enabled_state = states_refresh.append
         def refresh_enabled_states():
@@ -213,7 +219,7 @@ class PreferencesContent(QWidget):
         toggle.setChecked(app_model.inference.is_enabled)
         def inference_enabled_state_changed(x: int):
             enabled = x != 0
-            app_model.inference.is_enabled = enabled
+            app_model.set_live_inference_enabled(enabled)
             refresh_enabled_states()
         toggle.stateChanged.connect(inference_enabled_state_changed)  # after setChecked
         analysis_layout.addWidget(toggle)
@@ -257,7 +263,12 @@ class PreferencesContent(QWidget):
         left_grid_layout.addWidget(toggle, cur_row, cur_col + 1)
         def deliver_pellet_state_changed(x: int):
             enabled = x != 0
-            algo.pellet_delivery_enabled = enabled
+            update_config(
+                "Changing automatic pellet delivery",
+                algo,
+                "pellet_delivery_enabled",
+                enabled,
+            )
             refresh_enabled_states()
         toggle.stateChanged.connect(deliver_pellet_state_changed)
         cur_row += 1
@@ -270,7 +281,12 @@ class PreferencesContent(QWidget):
         left_grid_layout.addWidget(toggle, cur_row, cur_col + 1)
         def retract_enabled_changed(x: int):
             enabled = x != 0
-            algo.active_config.pellet_delivery.retract_enabled = enabled
+            update_config(
+                "Changing pellet retraction",
+                algo.active_config.pellet_delivery,
+                "retract_enabled",
+                enabled,
+            )
             refresh_enabled_states()
         toggle.stateChanged.connect(retract_enabled_changed)
         cur_row += 1
@@ -287,7 +303,12 @@ class PreferencesContent(QWidget):
                 and algo.active_config.pellet_delivery.retract_enabled
             ))
         def on_pellet_send_delay_changed(value: float):
-            algo.active_config.pellet_delivery.pellet_send_wait_delay = value
+            update_config(
+                "Changing the pellet send delay",
+                algo.active_config.pellet_delivery,
+                "pellet_send_wait_delay",
+                value,
+            )
         spinbox.valueChanged.connect(on_pellet_send_delay_changed)
         left_grid_layout.addWidget(spinbox, cur_row, cur_col + 1)
         cur_row += 1
@@ -303,7 +324,12 @@ class PreferencesContent(QWidget):
         spinbox.setDecimals(2)
         spinbox.setSingleStep(0.05)
         def max_pellet_missing_seconds_changed(value):
-            algo.pellet_missing_time = value
+            update_config(
+                "Changing the pellet-missing interval",
+                algo,
+                "pellet_missing_time",
+                value,
+            )
         spinbox.valueChanged.connect(max_pellet_missing_seconds_changed)
         left_grid_layout.addWidget(spinbox, cur_row, cur_col + 1)
         cur_row += 1
@@ -318,7 +344,12 @@ class PreferencesContent(QWidget):
         toggle.setChecked(algo.pellet_cover_enabled)
         def pellet_cover_toggle_state_changed(x: int):
             enabled = x != 0
-            algo.pellet_cover_enabled = enabled
+            update_config(
+                "Changing pellet cover behavior",
+                algo,
+                "pellet_cover_enabled",
+                enabled,
+            )
             refresh_enabled_states()
         toggle.stateChanged.connect(pellet_cover_toggle_state_changed)
         left_grid_layout.addWidget(toggle, cur_row, cur_col + 1)
@@ -336,7 +367,12 @@ class PreferencesContent(QWidget):
         spinbox.setDecimals(1)
         spinbox.setSingleStep(0.5)
         def pellet_uncover_y_dcs_changed(value):
-            algo.pellet_uncover_y_dcs = value
+            update_config(
+                "Changing the pellet uncover position",
+                algo,
+                "pellet_uncover_y_dcs",
+                value,
+            )
         spinbox.valueChanged.connect(pellet_uncover_y_dcs_changed)
         left_grid_layout.addWidget(spinbox, cur_row, cur_col + 1)
         cur_row += 1
@@ -353,7 +389,12 @@ class PreferencesContent(QWidget):
         spinbox.setDecimals(2)
         spinbox.setSingleStep(0.1)
         def pellet_uncover_delay_changed(value):
-            algo.pellet_uncover_delay = value
+            update_config(
+                "Changing the pellet uncover delay",
+                algo,
+                "pellet_uncover_delay",
+                value,
+            )
         spinbox.valueChanged.connect(pellet_uncover_delay_changed)
         left_grid_layout.addWidget(spinbox, cur_row, cur_col + 1)
         cur_row += 1
@@ -369,7 +410,12 @@ class PreferencesContent(QWidget):
         toggle.setChecked(algo.intersession_pellet_shift_enabled)
         def allow_intersession_shift_toggle_state_changed(x: int):
             enabled = x != 0
-            algo.intersession_pellet_shift_enabled = enabled
+            update_config(
+                "Changing intertrial pellet shifting",
+                algo,
+                "intersession_pellet_shift_enabled",
+                enabled,
+            )
             refresh_enabled_states()
         toggle.stateChanged.connect(allow_intersession_shift_toggle_state_changed)
         left_grid_layout.addWidget(toggle, cur_row, cur_col + 1)
@@ -382,7 +428,12 @@ class PreferencesContent(QWidget):
             self._intersession_pellet_shift_toggle.isChecked() and self._inference_enabled_toggle.isChecked()))
         def use_minimum_reach_fail_changed(x: int):
             enabled = x != 0
-            algo.active_config.shift_xyz_handler.use_reach_buffer = enabled
+            update_config(
+                "Changing minimum-reach shift behavior",
+                algo.active_config.shift_xyz_handler,
+                "use_reach_buffer",
+                enabled,
+            )
             refresh_enabled_states()
         toggle.stateChanged.connect(use_minimum_reach_fail_changed)
         left_grid_layout.addWidget(toggle, cur_row, cur_col + 1)
@@ -398,7 +449,12 @@ class PreferencesContent(QWidget):
         spinbox.setValue(algo.active_config.shift_xyz_handler.buffer.minimum_reach_fail)
         spinbox.setRange(2, 99)
         def minimum_reach_fail_changed(value: int):
-            algo.active_config.shift_xyz_handler.buffer.minimum_reach_fail = value
+            update_config(
+                "Changing the minimum-reach threshold",
+                algo.active_config.shift_xyz_handler.buffer,
+                "minimum_reach_fail",
+                value,
+            )
         spinbox.valueChanged.connect(minimum_reach_fail_changed)
         left_grid_layout.addWidget(spinbox, cur_row, cur_col + 1)
         cur_row += 1
@@ -413,7 +469,12 @@ class PreferencesContent(QWidget):
             ))
         def use_tongue_eaten_changed(x: int):
             enabled = x != 0
-            algo.active_config.shift_xyz_handler.use_tongue_eaten = enabled
+            update_config(
+                "Changing tongue-consumption shift behavior",
+                algo.active_config.shift_xyz_handler,
+                "use_tongue_eaten",
+                enabled,
+            )
             refresh_enabled_states()
         toggle.stateChanged.connect(use_tongue_eaten_changed)
         left_grid_layout.addWidget(toggle, cur_row, cur_col + 1)
@@ -427,7 +488,12 @@ class PreferencesContent(QWidget):
         toggle.setChecked(algo.home_on_excessive_drift_distance_config.enabled)
         def home_on_excessive_toggle_changed(value: int):
             enabled = value != 0
-            algo.home_on_excessive_drift_distance_config.enabled = enabled
+            update_config(
+                "Changing excessive-drift homing",
+                algo.home_on_excessive_drift_distance_config,
+                "enabled",
+                enabled,
+            )
             refresh_enabled_states()
         toggle.stateChanged.connect(home_on_excessive_toggle_changed)
         left_grid_layout.addWidget(toggle, cur_row, cur_col + 1)
@@ -439,7 +505,12 @@ class PreferencesContent(QWidget):
         spinbox.setRange(0, 99)
         spinbox.setValue(algo.home_on_excessive_drift_distance_config.excessive_distance_threshold)
         def excessive_distance_threshold_changed(value):
-            algo.home_on_excessive_drift_distance_config.excessive_distance_threshold = value
+            update_config(
+                "Changing the excessive-drift threshold",
+                algo.home_on_excessive_drift_distance_config,
+                "excessive_distance_threshold",
+                value,
+            )
         spinbox.valueChanged.connect(excessive_distance_threshold_changed)
         left_grid_layout.addWidget(spinbox, cur_row, cur_col + 1)
         cur_row += 1
@@ -463,7 +534,12 @@ class PreferencesContent(QWidget):
         toggle.setChecked(algo.use_triangle_pellet_distance_too_far)
         def use_triangle_pellet_distance_changed(value):
             enabled = value != 0
-            algo.use_triangle_pellet_distance_too_far = enabled
+            update_config(
+                "Changing triangle pellet-distance checks",
+                algo,
+                "use_triangle_pellet_distance_too_far",
+                enabled,
+            )
             refresh_enabled_states()
         toggle.stateChanged.connect(use_triangle_pellet_distance_changed)
         left_grid_layout.addWidget(toggle, cur_row, cur_col + 1)
@@ -475,7 +551,12 @@ class PreferencesContent(QWidget):
         spinbox.setRange(0, 99)
         spinbox.setValue(algo.triangle_pellet_expected_distance)
         def triangle_pellet_expected_distance_changed(value):
-            algo.triangle_pellet_expected_distance = value
+            update_config(
+                "Changing expected triangle pellet distance",
+                algo,
+                "triangle_pellet_expected_distance",
+                value,
+            )
         spinbox.valueChanged.connect(triangle_pellet_expected_distance_changed)
         left_grid_layout.addWidget(spinbox, cur_row, cur_col + 1)
         cur_row += 1
@@ -486,7 +567,12 @@ class PreferencesContent(QWidget):
         spinbox.setRange(0, 20)
         spinbox.setValue(algo.triangle_pellet_diff_too_far_threshold)
         def triangle_pellet_diff_too_far_threshold_changed(value):
-            algo.triangle_pellet_diff_too_far_threshold = value
+            update_config(
+                "Changing the triangle pellet-distance threshold",
+                algo,
+                "triangle_pellet_diff_too_far_threshold",
+                value,
+            )
         spinbox.valueChanged.connect(triangle_pellet_diff_too_far_threshold_changed)
         left_grid_layout.addWidget(spinbox, cur_row, cur_col + 1)
         cur_row += 1
@@ -535,15 +621,19 @@ class PreferencesContent(QWidget):
             index = name_field.findText(current)
         name_field.setCurrentIndex(index)
         name_field.currentTextChanged.connect(
-            lambda value: setattr(self._preferences, "softmouse_name_column", value)
+            lambda value: self._app_model.update_user_preference(
+                "softmouse_name_column",
+                value,
+            )
         )
         form.addRow("New-animal name field:", name_field)
 
         nightly = QCheckBox("Refresh this computer's local cache daily")
         nightly.setChecked(self._preferences.softmouse_nightly_refresh)
         nightly.toggled.connect(
-            lambda value: setattr(
-                self._preferences, "softmouse_nightly_refresh", value
+            lambda value: self._app_model.update_user_preference(
+                "softmouse_nightly_refresh",
+                value,
             )
         )
         form.addRow("", nightly)
@@ -1013,27 +1103,27 @@ class PreferencesContent(QWidget):
         return tab
 
     def _device_id_changed(self, value: str):
-        self._preferences.serial_number = value
+        self._app_model.update_user_preference("serial_number", value)
 
     def _data_location_changed(self, value: str):
         self._app_model.output_location = value
 
     def _animal_location_changed(self, value: str):
-        self._preferences.animal_location = value
+        self._app_model.update_user_preference("animal_location", value)
 
     def _inference_model_changed(self, value: str):
-        self._app_model.inference.model_location = value
+        self._app_model.set_inference_model_location(value)
 
     def _log_level_changed(self, value):
         # logging.root.debug("_log_level_changed: %s", value)
         # print("%s" % (repr_all_loggers(),))
         if value != -1:
             new_level = self._log_level_combobox.itemData(value)
-            self._preferences.log_level = new_level
+            self._app_model.update_user_preference("log_level", new_level)
             # get_console_handler().setLevel(new_level)
 
     def _log_location_changed(self, value: str):
-        self._preferences.log_location = value
+        self._app_model.update_user_preference("log_location", value)
 
     def _browse_for_location(self, which: str):
         if which == "animal":

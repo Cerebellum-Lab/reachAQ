@@ -211,6 +211,21 @@ def test_configuration_mutators_reject_active_session(app_model):
             app_model.set_automatic_protocol_advance_enabled(False)
         with pytest.raises(RuntimeError, match="session configuration.*recording"):
             app_model.update_session_control_option("trial_limit", 5)
+        changed = []
+        with pytest.raises(RuntimeError, match="pellet behavior.*recording"):
+            app_model.update_behavior_configuration(
+                "Changing pellet behavior",
+                lambda _algorithm: changed.append(True),
+            )
+        assert changed == []
+        with pytest.raises(RuntimeError, match="live inference.*recording"):
+            app_model.set_live_inference_enabled(True)
+        with pytest.raises(RuntimeError, match="inference model.*recording"):
+            app_model.set_inference_model_location("other-model")
+        with pytest.raises(RuntimeError, match="preference serial_number.*recording"):
+            app_model.update_user_preference("serial_number", "other-rig")
+        with pytest.raises(RuntimeError, match="subject.*recording"):
+            app_model.selected_animal = SimpleNamespace(id="other-subject")
     finally:
         app_model._set_session_recording_status(SessionRecordingStatus.READY)
 
