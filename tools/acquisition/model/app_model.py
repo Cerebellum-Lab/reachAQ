@@ -3698,6 +3698,15 @@ class AppModel(ObservableObject):
         self.set_training_plan(plan)
 
     def set_training_plan(self, plan: Optional[TrainingPlan], *, force_update: bool = False):
+        if (
+            plan != self._training_plan
+            and self._recording_session.status is not SessionRecordingStatus.READY
+        ):
+            raise RuntimeError(
+                "Changing the selected protocol is unavailable while session "
+                f"state is {self._recording_session.status.value}; edit only "
+                "future inactive trial rows instead"
+            )
         animal = self._selected_animal
         prev, self._training_plan = self._training_plan, plan
         if prev == plan and self._training_plan_animal == animal:

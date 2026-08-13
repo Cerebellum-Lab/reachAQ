@@ -226,6 +226,8 @@ def test_configuration_mutators_reject_active_session(app_model):
             app_model.update_user_preference("serial_number", "other-rig")
         with pytest.raises(RuntimeError, match="subject.*recording"):
             app_model.selected_animal = SimpleNamespace(id="other-subject")
+        with pytest.raises(RuntimeError, match="selected protocol.*recording"):
+            app_model.set_training_plan(SimpleNamespace(plan_id="other-protocol"))
     finally:
         app_model._set_session_recording_status(SessionRecordingStatus.READY)
 
