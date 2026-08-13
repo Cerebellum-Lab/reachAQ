@@ -1,6 +1,7 @@
 import dataclasses
 import math
 import json
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -172,6 +173,48 @@ def test_preallocated_session_id_is_not_changed_by_behavior_start(app_model):
     )
 
     assert project.short_id == reserved_session_id
+
+
+def test_record_commands_are_serialized_before_session_allocation(app_model):
+    entered_first = threading.Event()
+    release_first = threading.Event()
+    entered_second = threading.Event()
+    state_lock = threading.Lock()
+    active = 0
+    maximum_active = 0
+    calls = 0
+
+    def start_locked():
+        nonlocal active, maximum_active, calls
+        with state_lock:
+            calls += 1
+            call_number = calls
+            active += 1
+            maximum_active = max(maximum_active, active)
+        if call_number == 1:
+            entered_first.set()
+            assert release_first.wait(1)
+        else:
+            entered_second.set()
+        with state_lock:
+            active -= 1
+        return True
+
+    app_model._start_recording_locked = start_locked
+    first = threading.Thread(target=app_model.start_recording)
+    second = threading.Thread(target=app_model.start_recording)
+    first.start()
+    assert entered_first.wait(1)
+    second.start()
+    assert not entered_second.wait(0.05)
+    release_first.set()
+    first.join(1)
+    second.join(1)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert entered_second.is_set()
+    assert maximum_active == 1
 
 
 def test_recording_camera_set_includes_all_recordable_reach_cameras(app_model):

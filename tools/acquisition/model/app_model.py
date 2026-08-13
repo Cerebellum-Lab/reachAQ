@@ -456,6 +456,7 @@ class AppModel(ObservableObject):
         self._training_plan: Optional[TrainingPlan] = None
         self._training_plan_animal: Optional[AnimalSubject] = None
         self._recording_session = RecordingSessionController()
+        self._session_lifecycle_command_lock = threading.RLock()
         self._session_stop_policy: Optional[SessionStopPolicy] = None
         self._session_stop_evaluation: Optional[SessionStopEvaluation] = None
         self._recording_ending_reason = RecordingEndingReason.NA
@@ -929,6 +930,10 @@ class AppModel(ObservableObject):
         return True
 
     def start_recording(self) -> bool:
+        with self._session_lifecycle_command_lock:
+            return self._start_recording_locked()
+
+    def _start_recording_locked(self) -> bool:
         if not self._acquisition.started or self._status == AppModelStatus.IDLE:
             self.on_error("Recording unavailable", "Set System Mode to Running before recording.")
             return False
@@ -1411,6 +1416,15 @@ class AppModel(ObservableObject):
         *,
         token: Optional[SessionGeneration] = None,
     ) -> bool:
+        with self._session_lifecycle_command_lock:
+            return self._stop_recording_locked(reason, token=token)
+
+    def _stop_recording_locked(
+        self,
+        reason: RecordingEndingReason,
+        *,
+        token: Optional[SessionGeneration] = None,
+    ) -> bool:
         token = token or self._recording_session.token()
         if token is not None and not self._recording_session.is_current(
             token, statuses=(SessionRecordingStatus.RECORDING,)
@@ -1467,6 +1481,14 @@ class AppModel(ObservableObject):
         return self._stop_recording(RecordingEndingReason.MANUAL_STOP)
 
     def abort_recording(
+        self,
+        *,
+        token: Optional[SessionGeneration] = None,
+    ) -> bool:
+        with self._session_lifecycle_command_lock:
+            return self._abort_recording_locked(token=token)
+
+    def _abort_recording_locked(
         self,
         *,
         token: Optional[SessionGeneration] = None,
