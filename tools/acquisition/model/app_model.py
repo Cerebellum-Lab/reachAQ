@@ -6767,13 +6767,17 @@ class AppModel(ObservableObject):
             self._aborting_project = None
             self._editable_notes_project = None
             self.notes = ""
-            transitioned = self._set_session_recording_status(
-                SessionRecordingStatus.READY,
-                expected=(SessionRecordingStatus.ABORTING,),
-                token=token,
-            )
-            if transitioned:
-                self._recording_session.reset_after_abort()
+            previous = self._recording_session.complete_abort(token)
+            if previous is None:
+                logger.warning(
+                    "ignored stale/invalid abort completion: token=%s",
+                    token,
+                )
+            else:
+                self._publish_session_recording_transition(
+                    previous,
+                    SessionRecordingStatus.READY,
+                )
 
     def _remove_timestamps_txt_files(
         self,

@@ -217,21 +217,42 @@ class RecordingSessionController:
 
     def reset_after_abort(self) -> None:
         with self._lock:
-            # Invalidate every callback issued for the aborted generation even
-            # while the public state returns to Ready.
-            self._generation += 1
-            self._session_id = None
-            self.pending_end_perf = None
-            self.boundary = None
-            self.data_complete = True
-            self.data_errors = ()
-            self.enabled_sources = ()
-            self.end_actions = ()
-            self.storage_telemetry = {}
-            self.analysis_finished = True
-            self.analysis_started_perf = None
-            self.analysis_duration_seconds = None
-            self.animal_snapshot = None
+            self._reset_after_abort_unlocked()
+
+    def complete_abort(
+        self,
+        token: Optional[SessionGeneration],
+    ) -> Optional[SessionRecordingStatus]:
+        """Atomically return to Ready and invalidate the aborted generation."""
+        with self._lock:
+            if token is not None and (
+                token.generation != self._generation
+                or token.session_id != self._session_id
+            ):
+                return None
+            if self.status is not SessionRecordingStatus.ABORTING:
+                return None
+            previous = self.status
+            self.status = SessionRecordingStatus.READY
+            self._reset_after_abort_unlocked()
+            return previous
+
+    def _reset_after_abort_unlocked(self) -> None:
+        # Invalidate every callback issued for the aborted generation before
+        # publishing Ready to observers.
+        self._generation += 1
+        self._session_id = None
+        self.pending_end_perf = None
+        self.boundary = None
+        self.data_complete = True
+        self.data_errors = ()
+        self.enabled_sources = ()
+        self.end_actions = ()
+        self.storage_telemetry = {}
+        self.analysis_finished = True
+        self.analysis_started_perf = None
+        self.analysis_duration_seconds = None
+        self.animal_snapshot = None
 
     def set_analysis_started(self, perf_time: float) -> None:
         with self._lock:

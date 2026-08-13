@@ -72,6 +72,21 @@ def test_abort_reset_invalidates_the_active_generation():
     assert not controller.is_current(token)
 
 
+def test_complete_abort_is_atomic_and_rejects_stale_token():
+    controller = RecordingSessionController()
+    _, token = controller.begin_record("session001", {})
+    controller.transition(
+        SessionRecordingStatus.ABORTING,
+        expected=(SessionRecordingStatus.ARMING,),
+        token=token,
+    )
+
+    assert controller.complete_abort(token) is SessionRecordingStatus.ABORTING
+    assert controller.status is SessionRecordingStatus.READY
+    assert controller.token() is None
+    assert controller.complete_abort(token) is None
+
+
 def test_generation_rejects_stale_transitions_and_boundaries():
     controller = RecordingSessionController()
     first = controller.begin_record("session001", {})
