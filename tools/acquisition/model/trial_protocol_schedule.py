@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import asdict, dataclass, replace
 from typing import Iterable, Tuple
 
@@ -35,6 +36,7 @@ class TrialProtocolSchedule:
     })
 
     def __init__(self, rows: Iterable[TrialProtocolRow] = ()):
+        self._lock = threading.RLock()
         self._rows = {int(row.trial_id): row for row in rows}
 
     @classmethod
@@ -51,27 +53,30 @@ class TrialProtocolSchedule:
 
     @property
     def rows(self) -> Tuple[TrialProtocolRow, ...]:
-        return tuple(self._rows[key] for key in sorted(self._rows))
+        with self._lock:
+            return tuple(self._rows[key] for key in sorted(self._rows))
 
     def row(self, trial_id: int) -> TrialProtocolRow:
-        trial_id = int(trial_id)
-        if trial_id not in self._rows:
-            self._rows[trial_id] = TrialProtocolRow(trial_id=trial_id)
-        return self._rows[trial_id]
+        with self._lock:
+            trial_id = int(trial_id)
+            if trial_id not in self._rows:
+                self._rows[trial_id] = TrialProtocolRow(trial_id=trial_id)
+            return self._rows[trial_id]
 
     def update(self, trial_id: int, field: str, value) -> TrialProtocolRow:
-        if field not in self.EDITABLE_FIELDS:
-            raise ValueError(f"Unknown trial protocol field: {field}")
-        row = self.row(trial_id)
-        if field in {"shift_x_mm", "shift_y_mm", "shift_z_mm"}:
-            value = float(value)
-        elif field == "cover":
-            value = bool(value)
-        else:
-            value = str(value).strip()
-        row = replace(row, **{field: value})
-        self._rows[row.trial_id] = row
-        return row
+        with self._lock:
+            if field not in self.EDITABLE_FIELDS:
+                raise ValueError(f"Unknown trial protocol field: {field}")
+            row = self.row(trial_id)
+            if field in {"shift_x_mm", "shift_y_mm", "shift_z_mm"}:
+                value = float(value)
+            elif field == "cover":
+                value = bool(value)
+            else:
+                value = str(value).strip()
+            row = replace(row, **{field: value})
+            self._rows[row.trial_id] = row
+            return row
 
     def to_records(self) -> Tuple[dict, ...]:
         return tuple(row.to_record() for row in self.rows)

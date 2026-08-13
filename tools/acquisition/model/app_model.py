@@ -442,6 +442,7 @@ class AppModel(ObservableObject):
         self._notes = ""
         self._editable_notes_project: Optional[ProjectInfo] = None
         self._pending_metadata_project: Optional[ProjectInfo] = None
+        self._trial_protocol_lock = threading.RLock()
         self._trial_protocol_schedule = TrialProtocolSchedule.with_placeholder_rows()
         self._left_camera = self._right_camera = self._stim_camera = None
         self._reach_cameras: Tuple[VideoCaptureModel, ...] = ()
@@ -3880,11 +3881,15 @@ class AppModel(ObservableObject):
         }
 
     def update_trial_protocol_row(self, trial_id: int, field: str, value) -> bool:
-        state = self.trial_protocol_state
-        trial_id = int(trial_id)
-        if trial_id == state["active_trial_id"] or trial_id in state["completed_trial_ids"]:
-            return False
-        self._trial_protocol_schedule.update(trial_id, field, value)
+        with self._trial_protocol_lock:
+            state = self.trial_protocol_state
+            trial_id = int(trial_id)
+            if (
+                trial_id == state["active_trial_id"]
+                or trial_id in state["completed_trial_ids"]
+            ):
+                return False
+            self._trial_protocol_schedule.update(trial_id, field, value)
         self._notify_trial_protocol_state()
         return True
 
@@ -7948,17 +7953,20 @@ class AppModel(ObservableObject):
         with self._intertrial_lock:
             self._trial_window_start = None
         shift = self._behavior.system_machine.shift_xyz_handler
-        attempt = self._pellet_cycles.begin_send(
-            perf_c,
-            wall_time,
-            operation_id=context,
-            pellet_position=self._offset_record(self._hardware.last_dcs_set_position),
-            planned_shift=self._offset_record(shift.last_shift_xyz),
-            applied_shift=self._offset_record(shift.last_processed_shift_xyz),
-            protocol_context=self._current_trial_protocol_context(
-                self._pellet_cycles.planned_trial_id
-            ),
-        )
+        with self._trial_protocol_lock:
+            attempt = self._pellet_cycles.begin_send(
+                perf_c,
+                wall_time,
+                operation_id=context,
+                pellet_position=self._offset_record(
+                    self._hardware.last_dcs_set_position
+                ),
+                planned_shift=self._offset_record(shift.last_shift_xyz),
+                applied_shift=self._offset_record(shift.last_processed_shift_xyz),
+                protocol_context=self._current_trial_protocol_context(
+                    self._pellet_cycles.planned_trial_id
+                ),
+            )
         self._notify_trial_protocol_state()
         logger.info(
             "pellet trial attempt started: session=%s attempt=%s context=%s",
