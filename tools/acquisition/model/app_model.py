@@ -5695,7 +5695,7 @@ class AppModel(ObservableObject):
         for timer in (
                 self._timer_one_minute_repeat,
                 self._timer_daily,
-                self._writer_close_timer,
+                self.__dict__.get("_writer_close_timer", no_op_timer),
         ):
             logger.debug("stopping timer %s", timer)
             timer.cancel()
