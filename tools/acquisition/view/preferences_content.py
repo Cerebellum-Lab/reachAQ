@@ -831,9 +831,14 @@ class PreferencesContent(QWidget):
                 ),
                 Qt.ToolTipRole,
             )
+            if (
+                not enabled
+                and count_basis.currentData() == TrialCountBasis.SCORED.value
+            ):
+                count_basis.setCurrentIndex(
+                    count_basis.findData(TrialCountBasis.COMPLETED.value)
+                )
 
-        set_scored_basis_enabled(intertrial_analysis.isChecked())
-        intertrial_analysis.toggled.connect(set_scored_basis_enabled)
         count_basis.setCurrentIndex(count_basis.findData(config.trial_count_basis))
         count_basis.currentIndexChanged.connect(
             lambda _index: self._app_model.update_session_control_option(
@@ -841,6 +846,8 @@ class PreferencesContent(QWidget):
                 count_basis.currentData(),
             )
         )
+        set_scored_basis_enabled(intertrial_analysis.isChecked())
+        intertrial_analysis.toggled.connect(set_scored_basis_enabled)
         form.addRow("Trial-limit count:", count_basis)
 
         counted_outcomes = QWidget()
