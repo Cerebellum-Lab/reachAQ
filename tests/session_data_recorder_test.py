@@ -882,6 +882,84 @@ def test_nidaq_poll_reuses_preallocated_ring_scratch():
         recorder.close()
 
 
+def test_live_tone_edge_rejects_one_sample_glitch_and_keeps_exact_onset():
+    laser = _EventSource("trace_received")
+    recorder = SessionDataRecorder(object(), laser)
+    recorder._start_perf = 10.0
+    sample_rate = 10_000.0
+    try:
+        glitch = np.zeros((2, 30), dtype=np.float32)
+        glitch[1, 5] = 1.0
+        assert recorder._validated_live_tone_edges(
+            np.arange(30),
+            10.0 + np.arange(30) / sample_rate,
+            100.0 + np.arange(30) / sample_rate,
+            glitch,
+            ("tone1", "tone2"),
+            sample_rate,
+        ) == ()
+
+        pulse = np.zeros((2, 40), dtype=np.float32)
+        pulse[1, 4:30] = 1.0
+        edges = recorder._validated_live_tone_edges(
+            np.arange(30, 70),
+            10.003 + np.arange(40) / sample_rate,
+            100.003 + np.arange(40) / sample_rate,
+            pulse,
+            ("tone1", "tone2"),
+            sample_rate,
+        )
+
+        assert edges == ({
+            "channel": "tone2",
+            "perf_time": pytest.approx(10.0034),
+            "wall_time": pytest.approx(100.0034),
+            "sample_index": 34,
+        },)
+    finally:
+        recorder.close()
+
+
+def test_live_tone_edge_confirmation_can_span_nidaq_chunks():
+    laser = _EventSource("trace_received")
+    recorder = SessionDataRecorder(object(), laser)
+    recorder._start_perf = 10.0
+    sample_rate = 10_000.0
+    try:
+        first = np.ones((1, 12), dtype=np.float32)
+        assert recorder._validated_live_tone_edges(
+            np.arange(100, 112),
+            10.0 + np.arange(12) / sample_rate,
+            100.0 + np.arange(12) / sample_rate,
+            first,
+            ("tone2",),
+            sample_rate,
+        ) == ()
+
+        second = np.ones((1, 12), dtype=np.float32)
+        edges = recorder._validated_live_tone_edges(
+            np.arange(112, 124),
+            10.0012 + np.arange(12) / sample_rate,
+            100.0012 + np.arange(12) / sample_rate,
+            second,
+            ("tone2",),
+            sample_rate,
+        )
+
+        assert edges[0]["sample_index"] == 100
+        assert edges[0]["perf_time"] == pytest.approx(10.0)
+        assert recorder._validated_live_tone_edges(
+            np.arange(124, 130),
+            10.0024 + np.arange(6) / sample_rate,
+            100.0024 + np.arange(6) / sample_rate,
+            np.ones((1, 6), dtype=np.float32),
+            ("tone2",),
+            sample_rate,
+        ) == ()
+    finally:
+        recorder.close()
+
+
 def test_nidaq_spool_is_incremental_and_final_output_is_boundary_clipped(tmp_path):
     project = ProjectInfo(
         root=str(tmp_path),

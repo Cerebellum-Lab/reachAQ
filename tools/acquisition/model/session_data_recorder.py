@@ -67,6 +67,8 @@ class _NidaqPerfSummary:
 
 
 _PELLET_STIMULUS_CHANNEL_NAMES = ("tone1", "tone2", "stim2", "stim3")
+_LIVE_TONE_CHANNEL_NAMES = ("tone1", "tone2")
+_MINIMUM_VALID_TONE_PULSE_SECONDS = 0.002
 
 
 class _SessionLogHandler(logging.Handler):
@@ -99,6 +101,7 @@ class SessionDataRecorder:
         *,
         system_message_handler=None,
         hardware_model=None,
+        nidaq_tone_edge_callback=None,
         device_event_capacity: int = 100_000,
     ):
         self._nidaq_monitor = nidaq_monitor
@@ -130,6 +133,8 @@ class SessionDataRecorder:
         self._metadata_generation_id: Optional[str] = None
         self._pending_finalization: Optional[dict] = None
         self._pending_stop_end_perf: Optional[float] = None
+        self._nidaq_tone_edge_callback = nidaq_tone_edge_callback
+        self._live_tone_states = {}
 
         self._system_message_handler = system_message_handler
         self._hardware_model = hardware_model
@@ -169,6 +174,7 @@ class SessionDataRecorder:
             self._nidaq_last_index = None
             self._nidaq_scratch = None
             self._nidaq_stats = self._new_nidaq_stats()
+            self._live_tone_states = {}
             self._source_manifest = tuple(source_manifest)
             self._source_results = {}
             self._trial_records = ()
@@ -644,6 +650,7 @@ class SessionDataRecorder:
         self._nidaq_spool = None
         self._nidaq_spool_path = None
         self._nidaq_stats = self._new_nidaq_stats()
+        self._live_tone_states = {}
         self._source_manifest = ()
         self._source_results = {}
         self._trial_records = ()
@@ -843,6 +850,7 @@ class SessionDataRecorder:
         self._copy_nidaq_once()
 
     def _copy_nidaq_once(self) -> None:
+        tone_edges = ()
         try:
             ring = self._nidaq_monitor.sample_ring
             destination = self._nidaq_scratch
@@ -867,6 +875,14 @@ class SessionDataRecorder:
             wall_times = read.wall_times(indices)
             with self._lock:
                 if self._armed and self._nidaq_spool is not None:
+                    if (
+                        read.overrun_samples
+                        or (
+                            self._nidaq_last_index is not None
+                            and read.start_sample_index != self._nidaq_last_index
+                        )
+                    ):
+                        self._live_tone_states = {}
                     self._append_nidaq_spool_locked(
                         indices,
                         perf_times,
@@ -875,7 +891,24 @@ class SessionDataRecorder:
                         tuple(ring.channel_names),
                         read,
                     )
+                    tone_edges = self._validated_live_tone_edges(
+                        indices,
+                        perf_times,
+                        wall_times,
+                        destination[:len(ring.channel_names), :read.sample_count],
+                        tuple(ring.channel_names),
+                        float(ring.sample_rate_hz),
+                    )
                     self._nidaq_last_index = read.end_sample_index
+            callback = self._nidaq_tone_edge_callback
+            if callback is not None:
+                for edge in tone_edges:
+                    try:
+                        callback(**edge)
+                    except Exception:
+                        logging.getLogger(__name__).exception(
+                            "Unable to publish validated NI-DAQ tone edge",
+                        )
         except Exception as error:
             with self._lock:
                 message = f"{type(error).__name__}: {error}"
@@ -884,6 +917,61 @@ class SessionDataRecorder:
                 stats["last_error"] = message
                 stats["error_count"] += 1
             logging.getLogger(__name__).exception("Unable to collect NI-DAQ session samples")
+
+    def _validated_live_tone_edges(
+        self, indices, perf_times, wall_times, values, channel_names, sample_rate,
+    ):
+        """Return exact onsets after rejecting sub-2 ms digital glitches."""
+        minimum_samples = max(
+            2,
+            int(math.ceil(sample_rate * _MINIMUM_VALID_TONE_PULSE_SECONDS)),
+        )
+        start_perf = self._start_perf
+        stop_perf = self._pending_stop_end_perf
+        edges = []
+        for channel in _LIVE_TONE_CHANNEL_NAMES:
+            if channel not in channel_names:
+                continue
+            state = self._live_tone_states.setdefault(channel, {
+                "high": False,
+                "count": 0,
+                "emitted": False,
+                "sample_index": None,
+                "perf_time": None,
+                "wall_time": None,
+            })
+            samples = np.asarray(
+                values[channel_names.index(channel)], dtype=np.float32,
+            ) >= 0.5
+            for position, high in enumerate(samples):
+                if not high:
+                    state.update(high=False, count=0, emitted=False)
+                    continue
+                if not state["high"]:
+                    state.update(
+                        high=True,
+                        count=0,
+                        emitted=False,
+                        sample_index=int(indices[position]),
+                        perf_time=float(perf_times[position]),
+                        wall_time=float(wall_times[position]),
+                    )
+                state["count"] += 1
+                if state["emitted"] or state["count"] < minimum_samples:
+                    continue
+                state["emitted"] = True
+                edge_perf = state["perf_time"]
+                if start_perf is not None and edge_perf < start_perf:
+                    continue
+                if stop_perf is not None and edge_perf > stop_perf:
+                    continue
+                edges.append({
+                    "channel": channel,
+                    "perf_time": edge_perf,
+                    "wall_time": state["wall_time"],
+                    "sample_index": state["sample_index"],
+                })
+        return tuple(edges)
 
     def _stop_nidaq_thread(self) -> None:
         thread = self._nidaq_thread

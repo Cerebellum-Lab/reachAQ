@@ -557,6 +557,7 @@ class AppModel(ObservableObject):
             self._laser,
             system_message_handler=self._system_message_handler,
             hardware_model=self._hardware,
+            nidaq_tone_edge_callback=self._on_intertrial_nidaq_tone_edge,
         )
 
         self._inference_queue = None
@@ -631,6 +632,7 @@ class AppModel(ObservableObject):
         self._intertrial_finalize_thread = None
         self._trial_window_start = None
         self._tone2_active = False
+        self._tone2_status_active = False
         self._intertrial_lock = threading.RLock()
 
         self._rpc_service: Optional[RpcService] = None
@@ -1541,6 +1543,8 @@ class AppModel(ObservableObject):
         self._intertrial_analysis.cancel_session()
         self._live_tracking.clear()
         self._trial_window_start = None
+        self._tone2_active = False
+        self._tone2_status_active = False
         self._intertrial_resolution_request = None
         self._intertrial_resolution_reason = ""
         self._intertrial_waiting_operations.clear()
@@ -6320,6 +6324,7 @@ class AppModel(ObservableObject):
         self._live_tracking.clear()
         self._trial_window_start = None
         self._tone2_active = False
+        self._tone2_status_active = False
         self._intertrial_resolution_request = None
         self._intertrial_resolution_reason = ""
         self._intertrial_waiting_operations.clear()
@@ -7043,7 +7048,23 @@ class AppModel(ObservableObject):
         perf_time: float,
         _wall_time: float,
     ) -> None:
-        """Open the physical attempt window on decoded pellet-board tone 2."""
+        """Use immediate CAN tone state only when NI confirmation is unavailable."""
+        if kind is SystemStatusMessageKind.TONE_STATUS:
+            frequency_hz = int(getattr(data, "frequency_hz", 0))
+            active = bool(getattr(data, "time_remaining_ms", 0))
+            tone2 = active and frequency_hz == 6000
+            rising = tone2 and not self._tone2_status_active
+            self._tone2_status_active = tone2
+            if not rising or self._nidaq_tone_is_authoritative("tone2"):
+                return
+            source_index = getattr(data, "index", 0)
+            source_perf = (
+                float(source_index) / 1e9
+                if isinstance(source_index, int) and source_index > 0
+                else float(perf_time)
+            )
+            self._open_pellet_trial_window(source_perf, source="immediate_can_tone")
+            return
         if kind is not SystemStatusMessageKind.STIMULUS_INPUTS:
             return
         if isinstance(data, dict):
@@ -7055,14 +7076,51 @@ class AppModel(ObservableObject):
             return
         rising = tone2 and not self._tone2_active
         self._tone2_active = tone2
-        if not rising:
+        if not rising or self._nidaq_tone_is_authoritative("tone2"):
             return
+        if self._tone2_status_active:
+            return
+        self._open_pellet_trial_window(
+            float(perf_time),
+            source="legacy_can_gpio",
+        )
+
+    def _nidaq_tone_is_authoritative(self, channel: str) -> bool:
+        monitor = self._nidaq_signal_monitor
+        return bool(
+            monitor.is_running
+            and any(
+                configured.name == channel
+                for configured in monitor.configuration.channels
+            )
+        )
+
+    def _on_intertrial_nidaq_tone_edge(
+        self,
+        *,
+        channel: str,
+        perf_time: float,
+        wall_time: float,
+        sample_index: int,
+    ) -> None:
+        del wall_time
+        if channel != "tone2":
+            return
+        self._open_pellet_trial_window(
+            float(perf_time),
+            source=f"nidaq:{channel}:sample={sample_index}",
+        )
+
+    def _open_pellet_trial_window(self, perf_time: float, *, source: str) -> None:
         attempt = self._pellet_cycles.active_attempt
         if (
             attempt is None
             or self._recording_session.status is not SessionRecordingStatus.RECORDING
         ):
-            logger.warning("Tone-2 rising edge received without an active recorded pellet attempt")
+            logger.warning(
+                "Tone-2 edge from %s received without an active recorded pellet attempt",
+                source,
+            )
             return
         with self._intertrial_lock:
             if self._trial_window_start is None:
@@ -7071,9 +7129,10 @@ class AppModel(ObservableObject):
                     float(perf_time),
                 )
                 logger.info(
-                    "pellet trial tracking window opened: attempt=%s perf=%.6f",
+                    "pellet trial tracking window opened: attempt=%s perf=%.6f source=%s",
                     attempt.attempt_label,
                     perf_time,
+                    source,
                 )
 
     def _on_intertrial_analysis_result(

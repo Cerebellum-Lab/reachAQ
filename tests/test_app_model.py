@@ -24,7 +24,7 @@ from autotrainer.behavior.pellet_trial import (
     PelletTrialLedger,
     TrialOutcome,
 )
-from autotrainer.device import CanFailure, CanFailureKind
+from autotrainer.device import CanFailure, CanFailureKind, Tone, Target
 from tools.acquisition.model.app_model import (
     app_status_to_api_app_mode,
     app_status_to_behavior_algo_status,
@@ -874,6 +874,72 @@ def test_missing_pellet_retry_finishes_synchronously_without_analysis(app_model)
     assert attempt.logical_trial_complete is False
     assert ledger.begin_send(6.1, 106.1).attempt_label == "1.2"
     submit.assert_not_called()
+
+
+def test_validated_nidaq_tone2_is_the_authoritative_trial_boundary(app_model):
+    ledger = PelletTrialLedger(app_model.project.short_id)
+    ledger.begin_send(5.0, 105.0, operation_id="send-1")
+    app_model._trial_ledger = ledger
+    _, token = app_model._recording_session.begin_record(
+        app_model.project.short_id, {},
+    )
+    app_model._recording_session.transition(
+        SessionRecordingStatus.RECORDING,
+        expected=(SessionRecordingStatus.ARMING,),
+        token=token,
+    )
+    monitor = app_model._nidaq_signal_monitor
+    monitor._is_running = True
+    monitor._configuration = NidaqSignalStreamConfiguration(
+        is_enabled=True,
+        channels=(NidaqSignalChannelConfiguration(
+            name="tone2",
+            physical_channel="Dev1/port0/line1",
+            kind="digital",
+        ),),
+    )
+
+    app_model._on_intertrial_device_message(
+        SystemStatusMessageKind.STIMULUS_INPUTS,
+        (False, True, False, False),
+        5.110,
+        105.110,
+    )
+    assert app_model._trial_window_start is None
+
+    app_model._on_intertrial_nidaq_tone_edge(
+        channel="tone2",
+        perf_time=5.0023,
+        wall_time=105.0023,
+        sample_index=123,
+    )
+
+    assert app_model._trial_window_start == ("send-1", 5.0023)
+
+
+def test_immediate_can_tone_status_is_fallback_without_nidaq(app_model):
+    ledger = PelletTrialLedger(app_model.project.short_id)
+    ledger.begin_send(5.0, 105.0, operation_id="send-1")
+    app_model._trial_ledger = ledger
+    _, token = app_model._recording_session.begin_record(
+        app_model.project.short_id, {},
+    )
+    app_model._recording_session.transition(
+        SessionRecordingStatus.RECORDING,
+        expected=(SessionRecordingStatus.ARMING,),
+        token=token,
+    )
+    tone = Tone(Target.PELLET_DEVICE, time_remaining_ms=300, frequency_hz=6000)
+    tone.index = 5_004_000_000
+
+    app_model._on_intertrial_device_message(
+        SystemStatusMessageKind.TONE_STATUS,
+        tone,
+        5.010,
+        105.010,
+    )
+
+    assert app_model._trial_window_start == ("send-1", 5.004)
 
 
 def test_failed_retry_dependent_analysis_requires_explicit_resolution(app_model):
