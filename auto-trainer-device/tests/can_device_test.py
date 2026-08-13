@@ -27,6 +27,7 @@ from autotrainer.device import (
     MotorSteps,
     DeviceConnection,
     MotorConfigurationFile,
+    Tone,
 )
 from autotrainer.device.can_device import (
     default_move_retract,
@@ -160,6 +161,52 @@ def test_compound_move_keeps_configured_motor_coordinate_unchanged():
         save_as_fixed=False,
     )
     assert steps == []
+
+
+def test_immediate_tone_status_is_forwarded_with_source_timestamp():
+    received = []
+    device = CanDevice(
+        api=DeviceApi(
+            message_callback=lambda kind, data: received.append((kind, data)),
+        ),
+        force_emulation=True,
+        required_targets=(Target.PELLET_DEVICE,),
+    )
+    tone = Tone(Target.PELLET_DEVICE, time_remaining_ms=300, frequency_hz=6000)
+    tone.index = 123_456_789
+    tone.timestamp_ns = 987_654_321
+
+    device.notify_data([tone])
+
+    assert received == [(SystemStatusMessageKind.TONE_STATUS, tone)]
+    assert received[0][1].index == 123_456_789
+    assert received[0][1].timestamp_ns == 987_654_321
+
+
+def test_compound_tone_reports_the_executed_play_tone_command():
+    operations = []
+    device = CanDevice(
+        api=DeviceApi(message_callback=data_callback),
+        force_emulation=True,
+        required_targets=(Target.PELLET_DEVICE,),
+        operation_callback=lambda *args: operations.append(args),
+    )
+    device.device_interface.emit_tone = mock.Mock(return_value=True)
+    board = device._boards_pending_ctx[Target.PELLET_DEVICE]
+    board.ctx = "pellet-cycle"
+    steps = [{"tone": "5000,0.3"}]
+
+    assert device._perform_next_compound_step(board, steps)
+
+    device.device_interface.emit_tone.assert_called_once_with(5000, 300)
+    assert steps == []
+    kind, data, context, target, perf_time, wall_time = operations[0]
+    assert kind is SystemCommandKind.PLAY_TONE
+    assert data == (5000, 300)
+    assert context == "pellet-cycle"
+    assert target is Target.PELLET_DEVICE
+    assert perf_time > 0
+    assert wall_time > 0
 
 
 def test_command_queued_immediately_before_connect_survives_startup():

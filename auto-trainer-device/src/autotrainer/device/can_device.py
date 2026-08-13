@@ -186,7 +186,8 @@ class CanDevice(Device):
                  *, can_transport: Optional[CanTransportConfiguration] = None,
                  required_targets: Optional[Iterable[Target]] = None,
                  shutdown_callback: Optional[Callable[[str], None]] = None,
-                 failure_callback: Optional[Callable[[CanFailure], None]] = None):
+                 failure_callback: Optional[Callable[[CanFailure], None]] = None,
+                 operation_callback: Optional[Callable[..., None]] = None):
         """
         Initialize the CANbus device interface.
 
@@ -208,6 +209,7 @@ class CanDevice(Device):
         self._command_execution_lock = threading.Lock()
         self._shutdown_callback = shutdown_callback
         self._failure_callback = failure_callback
+        self._operation_callback = operation_callback
 
         self._init_default_move_configs()
         self._compound_movement: Optional[List[Dict[str, Any]]] = None
@@ -454,6 +456,16 @@ class CanDevice(Device):
                 previous_stimuli_data_perf_c = (new_data, p_now)
                 self._api.send_message(SystemStatusMessageKind.STIMULUS_INPUTS, new_data)
 
+        previous_tone_data_perf_c = (None, -math.inf)
+        def handle_tone_msg(m):
+            nonlocal previous_tone_data_perf_c
+            new_data = (int(m.frequency_hz), int(m.time_remaining_ms > 0))
+            prev_data, prev_perf_c = previous_tone_data_perf_c
+            p_now = get_perf_now()
+            if new_data != prev_data or p_now - prev_perf_c > self.same_data_refresh_delay:
+                previous_tone_data_perf_c = (new_data, p_now)
+                self._api.send_message(SystemStatusMessageKind.TONE_STATUS, m)
+
         prev_color_led = (None, -math.inf)
         def handle_color_led(m: ColorLed):
             nonlocal prev_color_led
@@ -466,7 +478,7 @@ class CanDevice(Device):
 
         self._data_handlers = {
             Status: _no_op_handler,  # No-op for Status messages
-            Tone: _no_op_handler,
+            Tone: handle_tone_msg,
             ColorLed: handle_color_led,
             AnalogOutput: _no_op_handler,
 
@@ -1401,7 +1413,18 @@ class CanDevice(Device):
         elif 'tone' in step:
             motor = Motor.TONE
             freq, duration = step['tone'].split(',')  # noqa  # (hz), (sec)
-            success = self._interface.emit_tone(int(freq), int(float(duration) * 1000))
+            frequency_hz = int(freq)
+            duration_ms = int(float(duration) * 1000)
+            if self._operation_callback is not None:
+                self._operation_callback(
+                    SystemCommandKind.PLAY_TONE,
+                    (frequency_hz, duration_ms),
+                    board.ctx,
+                    board.target,
+                    time.perf_counter(),
+                    time.time(),
+                )
+            success = self._interface.emit_tone(frequency_hz, duration_ms)
             if success:
                 board.skip_uuid_ack_perf_c = True
 

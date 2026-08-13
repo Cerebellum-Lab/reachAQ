@@ -658,6 +658,12 @@ class SessionDataRecorder:
         perf_time: float,
         wall_time: float,
     ) -> None:
+        source_index = getattr(data, "index", None)
+        source_timestamp_ns = getattr(data, "timestamp_ns", None)
+        if isinstance(source_index, int) and source_index > 0:
+            perf_time = source_index / 1e9
+        if isinstance(source_timestamp_ns, int) and source_timestamp_ns > 0:
+            wall_time = source_timestamp_ns / 1e9
         context = None
         if (
             getattr(kind, "name", None) == "STIMULUS_INPUTS"
@@ -715,7 +721,9 @@ class SessionDataRecorder:
     ) -> None:
         kind_name = kind.name if isinstance(kind, Enum) else str(kind)
         target_name = target.name if isinstance(target, Enum) else target
-        device_timestamp = getattr(data, "timestamp", None)
+        device_timestamp = getattr(
+            data, "timestamp_ns", getattr(data, "timestamp", None),
+        )
         device_index = getattr(data, "index", None)
         # Containers such as list expose ``index`` as a method. Only a concrete
         # device-provided value belongs in the CSV column.

@@ -52,6 +52,9 @@ class SystemStatusMessageKind(IntEnum):
     STIMULUS_INPUTS = 305
     """Message will contain a list of 4 states as True/False"""
 
+    TONE_STATUS = 306
+    """Immediate pellet-board tone-generator state and requested duration."""
+
     COLOR_LED = 403
     """Message is the original ColorLed message"""
 

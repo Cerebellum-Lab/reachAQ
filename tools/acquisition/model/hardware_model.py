@@ -543,6 +543,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             required_targets=(Target.PELLET_DEVICE,),
             can_transport=transport,
             failure_callback=self._on_can_failure,
+            operation_callback=self._on_internal_device_operation,
         )
         log_hardware_initialization(
             logger,
@@ -1210,6 +1211,8 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         data=None,
         context=None,
         target=None,
+        perf_time=None,
+        wall_time=None,
     ) -> None:
         try:
             self.device_event(
@@ -1218,11 +1221,25 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
                 data,
                 context,
                 target,
-                time.perf_counter(),
-                time.time(),
+                time.perf_counter() if perf_time is None else float(perf_time),
+                time.time() if wall_time is None else float(wall_time),
             )
         except Exception:
             logger.exception("Unable to publish structured device event")
+
+    def _on_internal_device_operation(
+        self, kind, data, context, target, perf_time, wall_time,
+    ) -> None:
+        """Persist commands executed inside a configured compound movement."""
+        self._emit_device_event(
+            "outbound",
+            kind,
+            data=data,
+            context=context,
+            target=target,
+            perf_time=perf_time,
+            wall_time=wall_time,
+        )
 
     def set_motors_drift(self, drift: Offset3DTuple):
         """Apply the pellet motor drift"""

@@ -47,6 +47,11 @@ class SystemMessageHandler(MessageHandler):
         elif msg == SystemStatusMessageKind.STIMULUS_INPUTS:
             self.property_changed(MessageHandler.STIMULI_PROPERTY, data, None)
 
+        elif msg == SystemStatusMessageKind.TONE_STATUS:
+            # The decoded-message event carries this timestamp-sensitive state to
+            # acquisition consumers.  It has no legacy UI property of its own.
+            pass
+
         elif msg == SystemStatusMessageKind.MOTOR_CONFIGURATION:
             self._on_property_changed(MessageHandler.CONFIG_PROPERTY, data, None)
 
