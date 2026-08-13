@@ -52,7 +52,7 @@ The Behavior panel owns the session controls:
 |---|---|---|
 | **Record** | System Mode is Running, recording state is Ready, and every required source is Ready | Creates a session and begins the existing camera/video-writing path |
 | **Stop** | Recording | Selects the final synchronized camera boundary, closes all writers, retains the session, and drains already-closed pellet-trial analyses |
-| **Abort** | Arming, Recording, or Analyzing | Closes writers, cancels the intertrial-analysis generation, deletes the entire session directory, and resets session counts |
+| **Abort** | Arming, Recording, Stopping, or Analyzing | Cancels the intertrial-analysis generation, waits for writers to close, deletes the entire session directory, and resets session counts |
 
 The recording state progresses through `Ready`, `Arming`, `Recording`,
 `Stopping`, and `Analyzing`. Record stays disabled until all already-closed
@@ -182,6 +182,13 @@ boundary mismatch, primary timing mismatch, missing enabled source, writer
 failure, acquisition gap, or buffer overrun prevents the session from being
 reported as fully saved.
 
+The recorder retains both its immutable finalization snapshot and the associated
+project identity until publication succeeds. A later Record attempt first retries
+that exact generation and republishes its authoritative metadata; it cannot start a
+new session while the previous one remains incomplete. Successful generations remove
+only now-empty staging directories. Failed staged files are never recursively cleaned
+and remain available for diagnosis and retry.
+
 ### Camera frame and closed-video validation
 
 Camera timing rows are keyed by the vendor's actual integer frame ID, not row
@@ -190,12 +197,20 @@ synchronized cameras onto the primary frame-ID timeline, and explicitly records
 missing, duplicate, out-of-order, early, and late IDs. These synchronization
 diagnostics never delete a stopped session.
 
-After each writer closes, ReachAQ opens the video read-only and compares its
-decoded frame count with both the writer-reported count and timestamp rows. A
+After all enabled writers acknowledge closure, ReachAQ validates camera videos in
+parallel. Each `ffprobe` count has a 30-second deadline; a timeout becomes a retained
+source failure rather than entering an unbounded decoder fallback. ReachAQ compares
+the decoded frame count with both the writer-reported count and timestamp rows. A
 count mismatch is a structured warning containing the camera role/serial and
 all three counts. The first writer exception and total writer-error count are
 preserved. An unreadable or zero-frame video marks the source and session
 incomplete, but every file and diagnostic is retained.
+
+Stop also starts a 30-second writer-acknowledgement watchdog. Expiry reports a
+persistent lifecycle/data diagnostic but does not delete files, disconnect hardware,
+or issue movement. The session remains in Stopping and can still complete when a late
+acknowledgement arrives. Abort remains available; deletion waits until the recorder
+and camera writers have actually closed.
 
 ## Persisted session files
 
@@ -365,6 +380,11 @@ The acquisition application uses explicit responsibility boundaries:
 owners. It does not implement camera acquisition, video encoding, inference
 calculation, or the mutable state owned by those controllers.
 
+Physical pellet attempt IDs and their protocol settings are immutable after SEND.
+Late analysis may attach diagnostics and results, but cannot reorder attempts or
+change a row already used by a subsequent SEND. Analysis-dependent retry/protocol
+effects are applied only when the result can still control the next physical trial.
+
 Camera/NI matching uses the nearest `cam_frames` transition within half the
 observed frame period and records whether it was rising or falling. The current
 camera output is a square wave whose alternating peaks and troughs each identify
@@ -459,7 +479,10 @@ save/deletion.
 CAN recovery retains the first diagnostic failure, but only transport and
 acknowledgement domains own recovery. Every run has a generation; a stale run
 cannot publish Ready or replace a reader still alive. Recovery never replays a
-non-idempotent in-flight motor command. Generic unhandled exceptions do not
+non-idempotent in-flight motor command. Each command retains an explicit pending,
+acknowledged, failed, unknown, cancelled, or timed-out outcome; transport loss marks
+an in-flight non-idempotent operation unknown rather than treating disappearance from
+the pending map as success. Generic unhandled exceptions do not
 reset CAN, command motion, stop an active recording, or disconnect unrelated
 hardware.
 
@@ -475,6 +498,11 @@ does not truncate a predictable file under `/tmp`. Calibration cleanup accepts
 only resolved, non-symlink generated child directories under the selected
 calibration root. Repeated Ctrl-C targets only reachAQ and explicitly registered
 child processes; it never signals a presumed process group.
+
+Event saturation retains exact-once session/trial lifecycle events in a bounded
+publisher outbox. If shutdown times out inside a plugin, the existing manager remains
+the singleton until its worker actually exits; reachAQ never creates a second manager
+that could reorder delivery against the live worker.
 
 ## Operator verification
 

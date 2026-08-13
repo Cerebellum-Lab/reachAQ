@@ -70,6 +70,20 @@ Resolved implementation gaps:
       CAN recovery generations, safe pellet initialization, background
       SoftMouse refresh, bounded event dispatch, cleanup containment, launcher
       locking, and owned signal shutdown have focused automated coverage.
+- [x] Session allocation is reserved once before writer arming; camera-close,
+      timers, analysis, and abort callbacks require the matching session ID and
+      generation, and old callbacks cannot finalize a later session.
+- [x] Retained auxiliary finalization also retains its project/metadata identity,
+      retries before the next Record, republishes authoritative metadata, and
+      removes only empty successful staging directories.
+- [x] NI thread-stop timeout state remains explicitly retryable. Abort requests NI
+      shutdown without blocking camera closure and never deletes the session until
+      the recorder confirms that its writer is closed.
+- [x] CAN connect/disconnect/recovery is serialized and every command has an
+      explicit terminal/unknown outcome; loss cannot turn a disappeared pending
+      command into an acknowledgement.
+- [x] A timed-out event-plugin shutdown retains singleton ownership, and lifecycle
+      event saturation uses the bounded retry outbox rather than silent loss.
 
 The remaining unchecked items below are physical-rig acceptance, not known
 software implementation gaps.
@@ -408,13 +422,28 @@ software implementation gaps.
 - [ ] Validate each stopped MP4 against writer and timestamp counts. Confirm a
       mismatch stores all three counts plus role/serial and first writer error as
       a warning; unreadable/zero-frame video marks data incomplete but is kept.
+- [ ] Delay one camera writer-close acknowledgement beyond 30 seconds. Confirm the
+      application reports the timeout without deleting data or commanding hardware,
+      remains able to accept Abort, and safely completes if the acknowledgement
+      arrives late.
+- [ ] Delay video validation on both cameras. Confirm validations run concurrently,
+      each external count is bounded to 30 seconds, and a timeout is persisted as a
+      source failure without an unbounded OpenCV fallback.
 - [ ] Confirm JSON, YAML, alignment, trials, summary, tracking records, and final
       manifest share one metadata generation ID. Interrupt an auxiliary publish
       in a test copy and confirm the previous generation remains detectable and
       staged data is available for bounded retry.
+- [ ] Force the first auxiliary publish to fail, then retry Record. Confirm the old
+      generation is finalized and its JSON/YAML metadata is republished before a new
+      session is allocated. Successful empty `.staging` directories should disappear;
+      failed staged diagnostics must remain.
 - [ ] Run a long enabled NI session with plots hidden. Confirm memory remains
       bounded, all channels persist, sample indices/times remain monotonic, and
       first/last exceptions, gaps, overruns, epochs, and coverage are recorded.
+- [ ] Delay NI recorder shutdown beyond its join deadline. Confirm the stopped
+      session remains retryable and a later retry publishes the same captured data.
+      During Abort, confirm the session directory is not removed until the NI writer
+      has actually stopped.
 - [ ] Inject a recovered NI copy error and boundary shortfall below five seconds;
       confirm warnings only. Test zero samples, persistence/worker failure, and
       boundary loss above five seconds; confirm NI is incomplete while partial
