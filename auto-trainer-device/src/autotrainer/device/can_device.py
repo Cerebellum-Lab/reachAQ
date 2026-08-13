@@ -456,15 +456,31 @@ class CanDevice(Device):
                 previous_stimuli_data_perf_c = (new_data, p_now)
                 self._api.send_message(SystemStatusMessageKind.STIMULUS_INPUTS, new_data)
 
-        previous_tone_data_perf_c = (None, -math.inf)
+        previous_tone_state = None
+        previous_tone_remaining_ms = 0
+        previous_tone_report_perf_c = -math.inf
         def handle_tone_msg(m):
-            nonlocal previous_tone_data_perf_c
-            new_data = (int(m.frequency_hz), int(m.time_remaining_ms > 0))
-            prev_data, prev_perf_c = previous_tone_data_perf_c
+            nonlocal previous_tone_state
+            nonlocal previous_tone_remaining_ms
+            nonlocal previous_tone_report_perf_c
+            remaining_ms = int(m.time_remaining_ms)
+            new_state = (int(m.frequency_hz), int(remaining_ms > 0))
             p_now = get_perf_now()
-            if new_data != prev_data or p_now - prev_perf_c > self.same_data_refresh_delay:
-                previous_tone_data_perf_c = (new_data, p_now)
+            restarted = (
+                remaining_ms > 0
+                and previous_tone_remaining_ms > 0
+                and remaining_ms > previous_tone_remaining_ms
+            )
+            if (
+                new_state != previous_tone_state
+                or restarted
+                or p_now - previous_tone_report_perf_c
+                > self.same_data_refresh_delay
+            ):
                 self._api.send_message(SystemStatusMessageKind.TONE_STATUS, m)
+                previous_tone_report_perf_c = p_now
+            previous_tone_state = new_state
+            previous_tone_remaining_ms = remaining_ms
 
         prev_color_led = (None, -math.inf)
         def handle_color_led(m: ColorLed):

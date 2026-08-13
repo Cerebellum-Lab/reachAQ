@@ -183,6 +183,29 @@ def test_immediate_tone_status_is_forwarded_with_source_timestamp():
     assert received[0][1].timestamp_ns == 987_654_321
 
 
+def test_repeated_tone_start_is_forwarded_before_an_off_report():
+    received = []
+    device = CanDevice(
+        api=DeviceApi(
+            message_callback=lambda kind, data: received.append((kind, data)),
+        ),
+        force_emulation=True,
+        required_targets=(Target.PELLET_DEVICE,),
+    )
+
+    device.notify_data([
+        Tone(Target.PELLET_DEVICE, time_remaining_ms=300, frequency_hz=6000),
+    ])
+    device.notify_data([
+        Tone(Target.PELLET_DEVICE, time_remaining_ms=100, frequency_hz=6000),
+    ])
+    device.notify_data([
+        Tone(Target.PELLET_DEVICE, time_remaining_ms=300, frequency_hz=6000),
+    ])
+
+    assert [data.time_remaining_ms for _, data in received] == [300, 300]
+
+
 def test_compound_tone_reports_the_executed_play_tone_command():
     operations = []
     device = CanDevice(
