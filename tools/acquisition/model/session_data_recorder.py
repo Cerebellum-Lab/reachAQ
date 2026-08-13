@@ -1172,6 +1172,8 @@ class SessionDataRecorder:
         tone_confirmation = SessionDataRecorder._correlate_tone_confirmations(
             device_rows,
             nidaq_chunks,
+            start_perf=start_perf,
+            end_perf=end_perf,
         )
         trial_records = tuple(
             dict(record)
@@ -1894,7 +1896,9 @@ class SessionDataRecorder:
         }
 
     @staticmethod
-    def _correlate_tone_confirmations(device_rows, chunks) -> dict:
+    def _correlate_tone_confirmations(
+        device_rows, chunks, *, start_perf=-math.inf, end_perf=math.inf,
+    ) -> dict:
         names, indices, perf, values, rate = SessionDataRecorder._nidaq_arrays(
             chunks,
             requested_names=("tone1", "tone2", "tone3_r", "tone3_l"),
@@ -1904,21 +1908,27 @@ class SessionDataRecorder:
             for name in ("tone1", "tone2", "tone3_r", "tone3_l")
             if name in names
         )
-        edges = {
-            channel: [
-                {
-                    "sampleIndex": int(indices[position]),
-                    "perfTime": float(perf[position]),
-                }
-                for position in SessionDataRecorder._rising_edge_positions(
-                    values[names.index(channel)]
-                )
-            ]
+        minimum_samples = (
+            2
+            if rate is None
+            else max(2, int(math.ceil(
+                rate * _MINIMUM_VALID_TONE_PULSE_SECONDS,
+            )))
+        )
+        pulses = {
+            channel: SessionDataRecorder._digital_pulses(
+                values[names.index(channel)], indices, perf,
+                start_perf=start_perf,
+                end_perf=end_perf,
+                minimum_samples=minimum_samples,
+                sample_rate=rate,
+            )
             for channel in tone_channels
         }
         events = []
         previous_states = {channel: False for channel in tone_channels}
-        for row in sorted(device_rows, key=lambda item: item[0]):
+        tone_status_states = {channel: False for channel in tone_channels}
+        for row_index, row in enumerate(sorted(device_rows, key=lambda item: item[0])):
             perf_time, _, direction, kind, target, context, _, _, payload = row
             try:
                 decoded = json.loads(payload)
@@ -1937,87 +1947,183 @@ class SessionDataRecorder:
                             "kind": kind,
                             "target": target,
                             "context": context,
+                            "rowIndex": row_index,
                         })
                     previous_states[channel] = state
+            elif kind == "TONE_STATUS" and isinstance(decoded, dict):
+                frequency = int(decoded.get("frequency_hz", 0))
+                channel = {5000: "tone1", 6000: "tone2"}.get(frequency)
+                if channel not in tone_channels:
+                    continue
+                state = int(decoded.get("time_remaining_ms", 0)) > 0
+                if state and not tone_status_states[channel]:
+                    events.append({
+                        "channel": channel,
+                        "eventPerfTime": float(perf_time),
+                        "direction": direction,
+                        "kind": kind,
+                        "target": target,
+                        "context": context,
+                        "rowIndex": row_index,
+                    })
+                tone_status_states[channel] = state
             elif kind == "PLAY_TONE":
+                frequency = None
+                if isinstance(decoded, (tuple, list)) and decoded:
+                    frequency = int(decoded[0])
+                elif isinstance(decoded, dict):
+                    frequency = int(decoded.get("frequency_hz", 0))
+                channel = {5000: "tone1", 6000: "tone2"}.get(frequency)
                 events.append({
-                    "channel": None,
+                    "channel": channel,
                     "eventPerfTime": float(perf_time),
                     "direction": direction,
                     "kind": kind,
                     "target": target,
                     "context": context,
                     "payload": decoded,
+                    "rowIndex": row_index,
                 })
 
-        claimed = {channel: set() for channel in tone_channels}
-        matched = []
-        unmatched = []
+        matched_events = {channel: {} for channel in tone_channels}
+        unmatched_events = []
         for event in events:
             channel = event["channel"]
             if channel is None:
-                unmatched.append({
+                unmatched_events.append({
                     **event,
-                    "reason": "PLAY_TONE does not identify a confirmation line",
+                    "reason": "Tone frequency does not identify a confirmation line",
                 })
                 continue
             candidates = [
-                (edge_index, edge)
-                for edge_index, edge in enumerate(edges[channel])
-                if edge_index not in claimed[channel]
+                (pulse_index, pulse)
+                for pulse_index, pulse in enumerate(pulses[channel])
+                if pulse["valid"]
             ]
             if not candidates:
-                unmatched.append({
+                unmatched_events.append({
                     **event,
-                    "reason": f"{channel} contained no unclaimed rising edge",
+                    "reason": f"{channel} contained no valid pulse in the session",
                 })
                 continue
-            edge_index, edge = min(
+            pulse_index, pulse = min(
                 candidates,
                 key=lambda item: abs(
                     item[1]["perfTime"] - event["eventPerfTime"]
                 ),
             )
-            latency = edge["perfTime"] - event["eventPerfTime"]
+            latency = pulse["perfTime"] - event["eventPerfTime"]
             if abs(latency) > 0.25:
-                unmatched.append({
+                unmatched_events.append({
                     **event,
-                    "nearestEdgePerfTime": edge["perfTime"],
+                    "nearestEdgePerfTime": pulse["perfTime"],
                     "reason": "Nearest electrical edge was more than 250 ms away",
                 })
                 continue
-            claimed[channel].add(edge_index)
-            matched.append({
+            matched_events[channel].setdefault(pulse_index, []).append({
                 **event,
-                "sampleIndex": edge["sampleIndex"],
-                "edgePerfTime": edge["perfTime"],
                 "latencySeconds": latency,
-                "resolutionSeconds": None if rate is None else 1.0 / rate,
             })
+
+        preference = {"TONE_STATUS": 0, "PLAY_TONE": 1, "STIMULUS_INPUTS": 2}
+        matched = []
+        for channel in tone_channels:
+            for pulse_index, observations in matched_events[channel].items():
+                pulse = pulses[channel][pulse_index]
+                observations = sorted(
+                    observations,
+                    key=lambda item: (
+                        preference.get(item["kind"], 99),
+                        abs(item["latencySeconds"]),
+                    ),
+                )
+                primary = observations[0]
+                matched.append({
+                    **primary,
+                    "sampleIndex": pulse["sampleIndex"],
+                    "edgePerfTime": pulse["perfTime"],
+                    "alignedEventPerfTime": pulse["perfTime"],
+                    "pulseDurationSeconds": pulse["durationSeconds"],
+                    "resolutionSeconds": None if rate is None else 1.0 / rate,
+                    "observations": observations,
+                })
 
         unmatched_edges = [
             {
                 "channel": channel,
-                **edge,
+                **pulse,
             }
             for channel in tone_channels
-            for edge_index, edge in enumerate(edges[channel])
-            if edge_index not in claimed[channel]
+            for pulse_index, pulse in enumerate(pulses[channel])
+            if pulse["valid"] and pulse_index not in matched_events[channel]
+        ]
+        artifacts = [
+            {"channel": channel, **pulse}
+            for channel in tone_channels
+            for pulse in pulses[channel]
+            if not pulse["valid"]
         ]
         return {
             "status": (
                 "unavailable"
                 if not tone_channels
                 else "complete"
-                if not unmatched and not unmatched_edges
+                if not unmatched_events and not unmatched_edges
                 else "partial"
             ),
+            "signalQuality": "artifacts_detected" if artifacts else "clean",
             "channels": list(tone_channels),
             "matched": matched,
-            "unmatchedEvents": unmatched,
+            "unmatchedEvents": unmatched_events,
             "unmatchedEdges": unmatched_edges,
+            "artifacts": artifacts,
+            "artifactCount": len(artifacts),
             "resolutionSeconds": None if rate is None else 1.0 / rate,
         }
+
+    @staticmethod
+    def _digital_pulses(
+        values,
+        indices,
+        perf,
+        *,
+        start_perf,
+        end_perf,
+        minimum_samples,
+        sample_rate,
+    ):
+        binary = np.asarray(values, dtype=np.float32) >= 0.5
+        if not binary.size:
+            return []
+        starts = list(np.flatnonzero((~binary[:-1]) & binary[1:]) + 1)
+        if binary[0]:
+            starts.insert(0, 0)
+        ends = list(np.flatnonzero(binary[:-1] & (~binary[1:])) + 1)
+        if binary[-1]:
+            ends.append(len(binary))
+        pulses = []
+        for position, end_position in zip(starts, ends):
+            pulse_perf = float(perf[position])
+            if not start_perf <= pulse_perf <= end_perf:
+                continue
+            sample_count = int(end_position - position)
+            pulses.append({
+                "sampleIndex": int(indices[position]),
+                "perfTime": pulse_perf,
+                "sampleCount": sample_count,
+                "durationSeconds": (
+                    None
+                    if sample_rate is None
+                    else sample_count / sample_rate
+                ),
+                "valid": sample_count >= minimum_samples,
+                "classification": (
+                    "valid_pulse"
+                    if sample_count >= minimum_samples
+                    else "short_pulse_artifact"
+                ),
+            })
+        return pulses
 
     @staticmethod
     def _alignment_entry(path, perf_times, start_perf, clock):

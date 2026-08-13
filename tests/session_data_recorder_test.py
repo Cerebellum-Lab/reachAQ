@@ -414,6 +414,70 @@ def test_camera_and_tone_edges_are_correlated_on_nidaq_timeline(tmp_path):
     assert alignment["canonicalBoundary"]["nidaqSampleIndex"] == 101
 
 
+def test_tone_correlation_uses_session_pulses_and_groups_can_observations():
+    sample_rate = 1000.0
+    perf = 9.998 + np.arange(155, dtype=np.float64) / sample_rate
+    indices = np.arange(perf.size, dtype=np.int64)
+    tone1 = np.zeros(perf.size, dtype=np.float32)
+    tone1[1] = 1.0  # Short artifact before Record.
+    tone1[5:8] = 1.0  # Valid 3 ms pulse beginning at 10.003.
+    tone1[10] = 1.0  # Short artifact within the saved session.
+    tone1[153] = 1.0  # Short artifact after Stop.
+    chunks = ((
+        indices,
+        perf,
+        100.0 + (perf - 10.0),
+        tone1[np.newaxis, :],
+        ("tone1",),
+        sample_rate,
+        1,
+        0,
+        0,
+    ),)
+    rows = (
+        (
+            10.0025, 100.0025, "outbound", "PLAY_TONE",
+            "PELLET_DEVICE", "sequence-1", None, None,
+            json.dumps([5000, 300]),
+        ),
+        (
+            10.004, 100.004, "inbound", "TONE_STATUS",
+            "PELLET_DEVICE", "tone-1", None, None,
+            json.dumps({"frequency_hz": 5000, "time_remaining_ms": 300}),
+        ),
+        (
+            10.108, 100.108, "inbound", "STIMULUS_INPUTS",
+            "PELLET_DEVICE", "gpio-1", None, None,
+            json.dumps({"tone1": True}),
+        ),
+    )
+
+    result = SessionDataRecorder._correlate_tone_confirmations(
+        rows,
+        chunks,
+        start_perf=10.0,
+        end_perf=10.15,
+    )
+
+    assert result["status"] == "complete"
+    assert result["signalQuality"] == "artifacts_detected"
+    assert result["artifactCount"] == 1
+    assert result["artifacts"][0]["perfTime"] == pytest.approx(10.008)
+    assert result["unmatchedEdges"] == []
+    assert result["unmatchedEvents"] == []
+    assert len(result["matched"]) == 1
+    match = result["matched"][0]
+    assert match["kind"] == "TONE_STATUS"
+    assert match["edgePerfTime"] == pytest.approx(10.003)
+    assert match["alignedEventPerfTime"] == pytest.approx(10.003)
+    assert match["pulseDurationSeconds"] == pytest.approx(0.003)
+    assert {item["kind"] for item in match["observations"]} == {
+        "PLAY_TONE",
+        "TONE_STATUS",
+        "STIMULUS_INPUTS",
+    }
+
+
 def test_camera_alignment_matches_falling_square_wave_transition():
     sample_rate = 1000.0
     indices = np.arange(200, 207, dtype=np.int64)
