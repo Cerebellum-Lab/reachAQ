@@ -478,6 +478,55 @@ def test_tone_correlation_uses_session_pulses_and_groups_can_observations():
     }
 
 
+def test_idle_tone_status_rearms_same_frequency_correlation():
+    sample_rate = 1000.0
+    perf = 10.0 + np.arange(20, dtype=np.float64) / sample_rate
+    tone2 = np.zeros(perf.size, dtype=np.float32)
+    tone2[2:5] = 1.0
+    tone2[12:15] = 1.0
+    chunks = ((
+        np.arange(perf.size, dtype=np.int64),
+        perf,
+        100.0 + (perf - 10.0),
+        tone2[np.newaxis, :],
+        ("tone2",),
+        sample_rate,
+        1,
+        0,
+        0,
+    ),)
+    tone_status = lambda when, frequency, remaining: (
+        when,
+        100.0 + (when - 10.0),
+        "inbound",
+        "TONE_STATUS",
+        "PELLET_DEVICE",
+        "tone",
+        None,
+        None,
+        json.dumps({
+            "frequency_hz": frequency,
+            "time_remaining_ms": remaining,
+        }),
+    )
+    rows = (
+        tone_status(10.003, 6000, 300),
+        tone_status(10.006, 0, 0),
+        tone_status(10.013, 6000, 300),
+    )
+
+    result = SessionDataRecorder._correlate_tone_confirmations(
+        rows,
+        chunks,
+        start_perf=10.0,
+        end_perf=10.019,
+    )
+
+    assert result["status"] == "complete"
+    assert len(result["matched"]) == 2
+    assert all(match["kind"] == "TONE_STATUS" for match in result["matched"])
+
+
 def test_camera_alignment_matches_falling_square_wave_transition():
     sample_rate = 1000.0
     indices = np.arange(200, 207, dtype=np.int64)

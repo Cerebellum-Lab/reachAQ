@@ -1952,10 +1952,17 @@ class SessionDataRecorder:
                     previous_states[channel] = state
             elif kind == "TONE_STATUS" and isinstance(decoded, dict):
                 frequency = int(decoded.get("frequency_hz", 0))
+                remaining_ms = int(decoded.get("time_remaining_ms", 0))
+                if remaining_ms <= 0:
+                    # The board reports an idle generator as frequency zero, so
+                    # this single status ends whichever named tone was active.
+                    for known_channel in tone_status_states:
+                        tone_status_states[known_channel] = False
+                    continue
                 channel = {5000: "tone1", 6000: "tone2"}.get(frequency)
                 if channel not in tone_channels:
                     continue
-                state = int(decoded.get("time_remaining_ms", 0)) > 0
+                state = True
                 if state and not tone_status_states[channel]:
                     events.append({
                         "channel": channel,
