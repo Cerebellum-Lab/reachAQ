@@ -312,6 +312,18 @@ software implementation gaps.
       includes a zero-based video index and frame-start timestamps, and reports
       the NI exposure-counter method and hardware confidence. Decode those MP4
       indices and verify that each is an actual written frame.
+- [ ] Confirm every `device.csv` and `laser.csv` event row contains its wall and
+      recording-relative timestamp, first written frame ID/video index,
+      frame-start time, event-to-frame delay, method, and confidence. Confirm
+      CAN/host observations say `host_timestamp`, never hardware edge.
+- [ ] Trigger repeated application/API events during Record. Confirm
+      `events.csv` contains every occurrence as a separate row (independent of
+      hourly event-file repeat coalescing), with real/relative timestamps,
+      event context, recorded frame ID/video index, method, and confidence.
+- [ ] Confirm every available trial send/acknowledgement/capture/finalization/
+      analysis boundary appears under `event_alignment`, and every persisted
+      tracking window has aligned start/end events. Re-run post-session analysis
+      and confirm its ledger rewrite regenerates these annotations.
 - [ ] Confirm pulses shorter than 2 ms appear under `artifacts`, never as valid
       tone matches or `unmatchedEdges`. Confirm pre-Record and post-Stop rolling
       activity appears in neither session artifacts nor unmatched edges.

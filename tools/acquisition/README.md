@@ -430,6 +430,15 @@ includes the frame ID, zero-based video index, frame timestamps, delay, method,
 and confidence. It is calculated only during finalization and does not add live
 recording or preview latency.
 
+The same contract applies to every discrete structured session event. All
+application/API events are preserved individually in `events.csv` before
+dispatcher repeat coalescing. Device/CAN and laser CSV rows include
+recorded-frame association columns; trial lifecycle records and tracking-window
+boundaries include nested event alignment.
+Method/confidence separates physical NI alignment from host-timestamp
+association. Continuous NI and pose samples already carry native sample/frame
+identity and are not duplicated into per-sample event records.
+
 See [Session recording, synchronization, and hardware isolation](../../docs/acquisition/session-recording-and-synchronization.md)
 for the complete state, persistence, timing, metadata, failure, and verification
 contract.

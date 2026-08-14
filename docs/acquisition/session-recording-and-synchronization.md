@@ -227,6 +227,7 @@ sessionNNN/
 ├── streams/
 │   ├── nidaq.h5
 │   ├── device.csv
+│   ├── events.csv
 │   ├── laser.csv
 │   ├── tracking/
 │   │   └── trial_<id>_attempt_<id>.json
@@ -280,6 +281,13 @@ timestamps, and device indices. Events buffer continuously before Record and
 are sliced at the canonical boundary. Raw byte-for-byte CAN frame capture is not
 part of this format.
 
+Every row also records the first actual written primary-camera frame beginning
+at or after the event, its zero-based video index, frame-start performance/wall/
+relative times, event-to-frame delay, relation, alignment method, and confidence.
+Device/CAN association uses its preserved source or host performance timestamp
+and is labeled `host_timestamp`; it is not hardware timing unless a separately
+wired NI confirmation exists.
+
 Pellet-board tone events are stored here. Electrical tone confirmations wired to
 NI-DAQ are separate signals in `nidaq.h5`; `alignment.json` correlates the two.
 An embedded tone step inside a compound pellet sequence is also written as an
@@ -287,6 +295,22 @@ outbound `PLAY_TONE` row with the parent operation context. The pellet board's
 immediate `TONE_STATUS` report is retained separately from the older, periodic
 `STIMULUS_INPUTS` GPIO report. Their raw receipt times are preserved; post-hoc
 alignment never overwrites transport timing.
+
+### `events.csv`
+
+Every accepted structured application/API event is copied into the session at
+post time, before the existing dispatcher can delay or coalesce repeats. This
+includes mode, property, detector, pellet lifecycle, protocol, and session
+events. Each occurrence remains a separate row with its event name/ID, original
+performance index, context, real and recording-relative timestamps, timestamp
+method, and the same recorded-frame association columns as `device.csv`.
+
+The capture hook only performs a bounded, nonblocking in-memory queue insertion.
+Conversion, frame association, and file I/O occur during stopped-session
+finalization, so they do not run in camera acquisition, preview, or
+video-writing paths. Queue overruns make the session incomplete rather than
+silently dropping data. The legacy hourly event file and API/plugin delivery
+remain unchanged.
 
 ### `trials.jsonl` and `trial_summary.json`
 
@@ -305,6 +329,9 @@ live tracking slice, source frame identities, coverage/missing-frame
 diagnostics, synchronous pellet-state evidence, and resulting analysis metrics.
 It supports stopped-session verification/repair without reopening video or
 performing novel inference.
+Finalization adds the same wall/relative/frame/method contract to both tracking
+window boundaries. Individual pose samples already contain their source frame
+IDs and frame performance times and are not duplicated as synthetic events.
 
 ### `laser.csv`
 
@@ -312,6 +339,9 @@ The laser event ledger records commands, output/state changes, source, channel,
 command voltage, measured diode/command-copy values when available, and generic
 named output values. Physical diode and command-copy inputs are also persisted
 continuously in `nidaq.h5` when configured.
+Every discrete laser row receives the same recorded-frame association columns as
+`device.csv`. Continuous NI samples retain native sample indices and timestamps
+instead of being expanded into duplicate event rows.
 
 ### `session.log`
 
@@ -425,6 +455,17 @@ delay, nearest frame, confidence, NI resolution, and the explicit method
 Individual CAN observations retain their own raw wall and recording-relative
 timestamps. This annotation is vectorized stopped-session finalization; it does
 not run in the camera capture, preview, video writer, or live-analysis path.
+
+This contract applies to all discrete structured session events, not only
+tones. API/application events are stored in `events.csv`; device/CAN and laser
+CSV rows carry flattened association columns; each
+trial record contains `event_alignment` for send, acknowledgement, capture end,
+finalization, and analysis-window boundaries; and tracking files contain
+`eventAlignment` for window start/end. `eventAlignmentContract` declares this
+scope. Hardware-confirmed NI events and host-timestamped events use different
+method/confidence values so CAN receipt time cannot be mistaken for a physical
+edge. Free-form diagnostic logs remain logs, while continuous NI and pose
+samples keep their native sample/frame timelines.
 
 During recording, a validated NI Tone 2 pulse opens the live tracking window at
 that exact sampled onset. This removes CAN polling latency from the behavioral
