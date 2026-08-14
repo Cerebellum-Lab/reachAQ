@@ -9,6 +9,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Iterable, Optional, Tuple
@@ -1174,6 +1175,9 @@ class SessionDataRecorder:
             nidaq_chunks,
             start_perf=start_perf,
             end_perf=end_perf,
+            start_wall=start_wall,
+            boundary=boundary,
+            camera_alignment=camera_nidaq_alignment,
         )
         trial_records = tuple(
             dict(record)
@@ -1368,7 +1372,7 @@ class SessionDataRecorder:
                     f"{source_id} overran by {source['overrunCount']} sample/event(s)"
                 )
         alignment = {
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "metadataGenerationId": metadata_generation_id,
             "canonicalBoundary": {
                 "source": "primary_camera_recorded_frames",
@@ -1897,11 +1901,20 @@ class SessionDataRecorder:
 
     @staticmethod
     def _correlate_tone_confirmations(
-        device_rows, chunks, *, start_perf=-math.inf, end_perf=math.inf,
+        device_rows,
+        chunks,
+        *,
+        start_perf=-math.inf,
+        end_perf=math.inf,
+        start_wall=None,
+        boundary=None,
+        camera_alignment=None,
     ) -> dict:
         names, indices, perf, values, rate = SessionDataRecorder._nidaq_arrays(
             chunks,
-            requested_names=("tone1", "tone2", "tone3_r", "tone3_l"),
+            requested_names=(
+                "tone1", "tone2", "tone3_r", "tone3_l", "cam_frames",
+            ),
         )
         tone_channels = tuple(
             name
@@ -1929,7 +1942,17 @@ class SessionDataRecorder:
         previous_states = {channel: False for channel in tone_channels}
         tone_status_states = {channel: False for channel in tone_channels}
         for row_index, row in enumerate(sorted(device_rows, key=lambda item: item[0])):
-            perf_time, _, direction, kind, target, context, _, _, payload = row
+            (
+                perf_time,
+                wall_time,
+                direction,
+                kind,
+                target,
+                context,
+                _,
+                _,
+                payload,
+            ) = row
             try:
                 decoded = json.loads(payload)
             except (TypeError, json.JSONDecodeError):
@@ -1948,6 +1971,15 @@ class SessionDataRecorder:
                             "target": target,
                             "context": context,
                             "rowIndex": row_index,
+                            "eventWallTimeUnixSeconds": float(wall_time),
+                            "eventWallTimeUtc": SessionDataRecorder._utc_timestamp(
+                                wall_time,
+                            ),
+                            "eventRecordingOffsetSeconds": (
+                                None
+                                if not math.isfinite(start_perf)
+                                else float(perf_time) - start_perf
+                            ),
                         })
                     previous_states[channel] = state
             elif kind == "TONE_STATUS" and isinstance(decoded, dict):
@@ -1972,6 +2004,15 @@ class SessionDataRecorder:
                         "target": target,
                         "context": context,
                         "rowIndex": row_index,
+                        "eventWallTimeUnixSeconds": float(wall_time),
+                        "eventWallTimeUtc": SessionDataRecorder._utc_timestamp(
+                            wall_time,
+                        ),
+                        "eventRecordingOffsetSeconds": (
+                            None
+                            if not math.isfinite(start_perf)
+                            else float(perf_time) - start_perf
+                        ),
                     })
                 tone_status_states[channel] = state
             elif kind == "PLAY_TONE":
@@ -1990,6 +2031,15 @@ class SessionDataRecorder:
                     "context": context,
                     "payload": decoded,
                     "rowIndex": row_index,
+                    "eventWallTimeUnixSeconds": float(wall_time),
+                    "eventWallTimeUtc": SessionDataRecorder._utc_timestamp(
+                        wall_time,
+                    ),
+                    "eventRecordingOffsetSeconds": (
+                        None
+                        if not math.isfinite(start_perf)
+                        else float(perf_time) - start_perf
+                    ),
                 })
 
         matched_events = {channel: {} for channel in tone_channels}
@@ -2050,10 +2100,24 @@ class SessionDataRecorder:
                     "sampleIndex": pulse["sampleIndex"],
                     "edgePerfTime": pulse["perfTime"],
                     "alignedEventPerfTime": pulse["perfTime"],
+                    "physicalEventPerfTime": pulse["perfTime"],
                     "pulseDurationSeconds": pulse["durationSeconds"],
                     "resolutionSeconds": None if rate is None else 1.0 / rate,
                     "observations": observations,
                 })
+
+        SessionDataRecorder._annotate_tone_timestamps_and_frames(
+            matched,
+            names=names,
+            indices=indices,
+            perf=perf,
+            values=values,
+            rate=rate,
+            start_perf=start_perf,
+            start_wall=start_wall,
+            boundary=boundary,
+            camera_alignment=camera_alignment,
+        )
 
         unmatched_edges = [
             {
@@ -2086,7 +2150,168 @@ class SessionDataRecorder:
             "artifacts": artifacts,
             "artifactCount": len(artifacts),
             "resolutionSeconds": None if rate is None else 1.0 / rate,
+            "canonicalEventSource": "validated_nidaq_tone_pulse_onset",
+            "frameRelation": "first_recorded_frame_at_or_after_event",
         }
+
+    @staticmethod
+    def _utc_timestamp(value):
+        try:
+            value = float(value)
+            if not math.isfinite(value):
+                return None
+            return datetime.fromtimestamp(
+                value,
+                tz=timezone.utc,
+            ).isoformat().replace("+00:00", "Z")
+        except (OSError, OverflowError, TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _annotate_tone_timestamps_and_frames(
+        matched,
+        *,
+        names,
+        indices,
+        perf,
+        values,
+        rate,
+        start_perf,
+        start_wall,
+        boundary,
+        camera_alignment,
+    ) -> None:
+        """Attach final wall-clock and recorded-frame identity to NI tones."""
+        wall_anchor_available = (
+            start_wall is not None
+            and math.isfinite(float(start_wall))
+            and math.isfinite(float(start_perf))
+        )
+        for event in matched:
+            event_perf = float(event["physicalEventPerfTime"])
+            recording_offset = (
+                None
+                if not math.isfinite(float(start_perf))
+                else event_perf - float(start_perf)
+            )
+            event_wall = (
+                None
+                if not wall_anchor_available
+                else float(start_wall) + recording_offset
+            )
+            event["recordingOffsetSeconds"] = recording_offset
+            event["wallTimeUnixSeconds"] = event_wall
+            event["wallTimeUtc"] = SessionDataRecorder._utc_timestamp(event_wall)
+            event["timestampMethod"] = (
+                "recording_wall_anchor_plus_nidaq_sample_offset"
+            )
+
+        method = (
+            "nidaq_same_task_tone_edge_to_primary_camera_"
+            "exposure_counter_transition"
+        )
+        unavailable_reason = None
+        if "cam_frames" not in names:
+            unavailable_reason = "cam_frames is not configured in the NI task"
+        elif boundary is None:
+            unavailable_reason = "primary recorded-camera boundary is unavailable"
+        elif not camera_alignment or camera_alignment.get("status") != "matched":
+            unavailable_reason = "recorded-camera boundary has no matched NI edge"
+
+        transition_positions = np.empty(0, dtype=np.int64)
+        anchor_ordinal = None
+        if unavailable_reason is None:
+            camera_values = values[names.index("cam_frames")]
+            transition_positions = SessionDataRecorder._transition_positions(
+                camera_values,
+            )
+            anchor_sample_index = camera_alignment.get("matchedSampleIndex")
+            anchor_matches = np.flatnonzero(
+                indices[transition_positions] == anchor_sample_index
+            )
+            if anchor_matches.size != 1:
+                unavailable_reason = (
+                    "matched camera boundary is not a unique NI transition"
+                )
+            else:
+                anchor_ordinal = int(anchor_matches[0])
+
+        transition_perf = perf[transition_positions]
+        for event in matched:
+            association = {
+                "status": "unavailable",
+                "method": method,
+                "confidence": (
+                    "none"
+                    if not camera_alignment
+                    else camera_alignment.get("confidence", "none")
+                ),
+                "relation": "first_recorded_frame_at_or_after_event",
+                "primaryCamera": (
+                    None if boundary is None else boundary.primary_camera
+                ),
+                "frameId": None,
+                "recordedFrameIndex": None,
+                "frameStartPerfTime": None,
+                "frameStartRecordingOffsetSeconds": None,
+                "frameStartWallTimeUnixSeconds": None,
+                "frameStartWallTimeUtc": None,
+                "eventToFrameStartSeconds": None,
+                "nearestFrameId": None,
+                "nearestFrameSignedOffsetSeconds": None,
+                "resolutionSeconds": None if rate is None else 1.0 / rate,
+            }
+            if unavailable_reason is not None:
+                association["reason"] = unavailable_reason
+                event["frameAssociation"] = association
+                continue
+
+            event_perf = float(event["physicalEventPerfTime"])
+            following = int(np.searchsorted(
+                transition_perf,
+                event_perf,
+                side="left",
+            ))
+            if following >= transition_perf.size:
+                association["reason"] = (
+                    "no recorded camera exposure begins after this event"
+                )
+                event["frameAssociation"] = association
+                continue
+            frame_id = int(
+                boundary.primary_frame_id + following - anchor_ordinal
+            )
+            frame_perf = float(transition_perf[following])
+            frame_offset = frame_perf - float(start_perf)
+            frame_wall = (
+                None
+                if not wall_anchor_available
+                else float(start_wall) + frame_offset
+            )
+            nearest = int(np.argmin(np.abs(transition_perf - event_perf)))
+            association.update({
+                "status": "matched",
+                "reason": (
+                    "Tone and primary-camera exposure counter were sampled "
+                    "by the same NI task"
+                ),
+                "frameId": frame_id,
+                "recordedFrameIndex": frame_id - boundary.primary_frame_id,
+                "frameStartPerfTime": frame_perf,
+                "frameStartRecordingOffsetSeconds": frame_offset,
+                "frameStartWallTimeUnixSeconds": frame_wall,
+                "frameStartWallTimeUtc": (
+                    SessionDataRecorder._utc_timestamp(frame_wall)
+                ),
+                "eventToFrameStartSeconds": frame_perf - event_perf,
+                "nearestFrameId": int(
+                    boundary.primary_frame_id + nearest - anchor_ordinal
+                ),
+                "nearestFrameSignedOffsetSeconds": (
+                    event_perf - float(transition_perf[nearest])
+                ),
+            })
+            event["frameAssociation"] = association
 
     @staticmethod
     def _digital_pulses(

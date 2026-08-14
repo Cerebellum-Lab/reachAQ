@@ -343,7 +343,7 @@ def test_camera_and_tone_edges_are_correlated_on_nidaq_timeline(tmp_path):
         100.0 + (perf - 10.0),
         np.array(
             (
-                (0, 1, 0, 0, 0, 0, 0, 0),
+                (0, 1, 0, 0, 1, 0, 0, 0),
                 (0, 0, 0, 0, 1, 1, 0, 0),
             ),
             dtype=np.float32,
@@ -399,6 +399,25 @@ def test_camera_and_tone_edges_are_correlated_on_nidaq_timeline(tmp_path):
     assert tone["matched"][0]["channel"] == "tone1"
     assert tone["matched"][0]["sampleIndex"] == 104
     assert tone["matched"][0]["latencySeconds"] == pytest.approx(0.0005)
+    assert tone["matched"][0]["physicalEventPerfTime"] == pytest.approx(10.003)
+    assert tone["matched"][0]["recordingOffsetSeconds"] == pytest.approx(0.003)
+    assert tone["matched"][0]["wallTimeUnixSeconds"] == pytest.approx(100.003)
+    assert tone["matched"][0]["wallTimeUtc"] == "1970-01-01T00:01:40.003000Z"
+    observation = tone["matched"][0]["observations"][0]
+    assert observation["eventRecordingOffsetSeconds"] == pytest.approx(0.0025)
+    assert observation["eventWallTimeUnixSeconds"] == pytest.approx(100.0025)
+    frame = tone["matched"][0]["frameAssociation"]
+    assert frame["status"] == "matched"
+    assert frame["frameId"] == 44
+    assert frame["recordedFrameIndex"] == 2
+    assert frame["relation"] == "first_recorded_frame_at_or_after_event"
+    assert frame["frameStartPerfTime"] == pytest.approx(10.003)
+    assert frame["frameStartRecordingOffsetSeconds"] == pytest.approx(0.003)
+    assert frame["frameStartWallTimeUnixSeconds"] == pytest.approx(100.003)
+    assert frame["eventToFrameStartSeconds"] == pytest.approx(0.0)
+    assert frame["nearestFrameId"] == 44
+    assert frame["nearestFrameSignedOffsetSeconds"] == pytest.approx(0.0)
+    assert frame["method"].startswith("nidaq_same_task_tone_edge")
 
     alignment = json.loads(
         (
@@ -412,6 +431,7 @@ def test_camera_and_tone_edges_are_correlated_on_nidaq_timeline(tmp_path):
     )
     assert alignment["canonicalBoundary"]["primaryFrameId"] == 42
     assert alignment["canonicalBoundary"]["nidaqSampleIndex"] == 101
+    assert alignment["schemaVersion"] == 2
 
 
 def test_tone_correlation_uses_session_pulses_and_groups_can_observations():
