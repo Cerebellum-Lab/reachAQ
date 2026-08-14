@@ -306,6 +306,12 @@ software implementation gaps.
       immediate `TONE_STATUS`, and periodic GPIO observation when present. The
       raw event timestamps must remain unchanged and `alignedEventPerfTime` must
       equal the NI pulse onset.
+- [ ] For every valid matched tone, confirm `wallTimeUnixSeconds`, `wallTimeUtc`,
+      and `recordingOffsetSeconds` describe the physical NI onset. Confirm its
+      `frameAssociation` identifies the first recorded frame at or after onset,
+      includes a zero-based video index and frame-start timestamps, and reports
+      the NI exposure-counter method and hardware confidence. Decode those MP4
+      indices and verify that each is an actual written frame.
 - [ ] Confirm pulses shorter than 2 ms appear under `artifacts`, never as valid
       tone matches or `unmatchedEdges`. Confirm pre-Record and post-Stop rolling
       activity appears in neither session artifacts nor unmatched edges.

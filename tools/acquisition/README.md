@@ -424,6 +424,11 @@ the compound `PLAY_TONE` command, immediate `TONE_STATUS`, and periodic GPIO
 observation without changing their raw receipt timestamps. Pulses shorter than
 2 ms are reported as artifacts, not tone events, and all reported pulse onsets
 are restricted to the saved camera boundary.
+Each valid tone also stores its physical wall/UTC time, offset from Record, and
+the first actual recorded frame beginning at or after the event. The association
+includes the frame ID, zero-based video index, frame timestamps, delay, method,
+and confidence. It is calculated only during finalization and does not add live
+recording or preview latency.
 
 See [Session recording, synchronization, and hardware isolation](../../docs/acquisition/session-recording-and-synchronization.md)
 for the complete state, persistence, timing, metadata, failure, and verification

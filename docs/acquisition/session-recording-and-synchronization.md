@@ -415,6 +415,17 @@ the raw host/CAN timing, while `alignedEventPerfTime` is the physical NI onset
 used to compare the event with camera frames. A command whose frequency does
 not identify Tone 1 or Tone 2 remains explicitly unmatched.
 
+Alignment schema version 2 materializes that comparison for every valid matched
+tone. Each entry records the physical NI performance timestamp, Unix/UTC wall
+timestamp, offset from Record, and the first recorded primary-camera frame whose
+exposure-counter transition occurs at or after the tone onset. The frame record
+also contains its zero-based video index, frame-start timestamps, event-to-frame
+delay, nearest frame, confidence, NI resolution, and the explicit method
+`nidaq_same_task_tone_edge_to_primary_camera_exposure_counter_transition`.
+Individual CAN observations retain their own raw wall and recording-relative
+timestamps. This annotation is vectorized stopped-session finalization; it does
+not run in the camera capture, preview, video writer, or live-analysis path.
+
 During recording, a validated NI Tone 2 pulse opens the live tracking window at
 that exact sampled onset. This removes CAN polling latency from the behavioral
 boundary. If the configured NI tone stream is unavailable, the immediate CAN
