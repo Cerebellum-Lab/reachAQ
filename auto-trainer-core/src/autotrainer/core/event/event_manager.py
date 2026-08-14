@@ -6,7 +6,7 @@ import time
 from threading import Thread
 from datetime import datetime
 from queue import Queue, Empty, Full
-from typing import Optional, List, Any
+from typing import Optional, List, Any, Callable
 
 from autotrainer.core.logging import get_verbose_logger
 from autotrainer.core.project import ProjectInfo
@@ -94,6 +94,7 @@ class EventManager:
             raise Exception("Use EventManager.default() to access and instance.")
 
         self._plugins: List[EventManagerPlugin] = []
+        self._post_observers: List[Callable[[EventInfo, float], None]] = []
         self._lock = threading.RLock()
         self._closing = False
         self._producer_wait_seconds = max(0.001, float(producer_wait_seconds))
@@ -180,6 +181,27 @@ class EventManager:
             # In the future, there may be a way to unregister by some kind of key/type/identifier that doesn't require
             # explicit access to the plugin instance by the caller.
             plugin.close()
+
+    def register_post_observer(
+        self,
+        observer: Callable[[EventInfo, float], None],
+    ) -> None:
+        """Observe accepted events at post time, before repeat coalescing."""
+        with self._lock:
+            if self._closing:
+                raise RuntimeError("Cannot register an event observer during shutdown")
+            if observer not in self._post_observers:
+                self._post_observers.append(observer)
+
+    def unregister_post_observer(
+        self,
+        observer: Callable[[EventInfo, float], None],
+    ) -> None:
+        with self._lock:
+            try:
+                self._post_observers.remove(observer)
+            except ValueError:
+                pass
 
     def flush(self):
         with self._lock:
@@ -336,6 +358,14 @@ class EventManager:
             ) from error
         with self._lock:
             self._accepted_count += 1
+
+            observers = tuple(self._post_observers)
+        for observer in observers:
+            try:
+                observer(info, queued.enqueued_perf_time)
+            except Exception:
+                # Observability must never make event delivery fail.
+                logger.exception("Event post observer failed for %s", info)
 
     def has_pending(self) -> bool:
         """

@@ -92,6 +92,29 @@ def test_post_none_event_refused(event_manager):
         event_manager.post_event(None)  # noqa
 
 
+def test_post_observer_receives_each_accepted_event_before_repeat_coalescing(
+    event_manager,
+):
+    observed = []
+
+    def observer(info, perf_time):
+        observed.append((info, perf_time))
+
+    event_manager.register_post_observer(observer)
+    first = EventInfo(kind=1, when=dt.datetime.now(), index=1)
+    repeated = EventInfo(kind=1, when=dt.datetime.now(), index=2)
+
+    event_manager.post_event(first)
+    event_manager.post_event(repeated)
+
+    assert [item[0] for item in observed] == [first, repeated]
+    assert all(item[1] > 0 for item in observed)
+
+    event_manager.unregister_post_observer(observer)
+    event_manager.post_event(EventInfo(kind=2, when=dt.datetime.now(), index=3))
+    assert len(observed) == 2
+
+
 class BlockingPlugin(MockEventPlugin):
     def __init__(self):
         super().__init__()
