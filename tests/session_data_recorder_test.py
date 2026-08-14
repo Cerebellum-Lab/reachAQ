@@ -434,6 +434,156 @@ def test_camera_and_tone_edges_are_correlated_on_nidaq_timeline(tmp_path):
     assert alignment["schemaVersion"] == 2
 
 
+def test_all_structured_events_receive_recorded_frame_alignment(tmp_path):
+    project = ProjectInfo(
+        root=str(tmp_path),
+        device_id="test",
+        when=datetime(2026, 1, 2, 3, 4, 5),
+        session=8,
+    )
+    session_dir = Path(project.get_session_path().location)
+    session_dir.mkdir(parents=True, exist_ok=True)
+    timing_path = Path(project.get_frame_timing_path())
+    timing_path.write_text(
+        "frame_id,frame_when,frame_present_primary,"
+        "frame_present_secondary,utc_when\n"
+        "100,1,1,1,100.000\n"
+        # The writer timestamp deliberately precedes the hardware exposure.
+        # Generic events must use the NI exposure timeline when it is present.
+        "101,2,1,1,100.004\n"
+        "102,3,1,1,100.020\n",
+        encoding="utf-8",
+    )
+    tracking_dir = session_dir / "streams" / "tracking"
+    tracking_dir.mkdir(parents=True, exist_ok=True)
+    tracking_path = tracking_dir / "trial_000001_attempt_001.json"
+    tracking_path.write_text(
+        json.dumps({
+            "schemaVersion": 1,
+            "metadataGenerationId": project.short_id,
+            "identity": {},
+            "window": {"startPerf": 10.005, "endPerf": 10.015},
+            "pelletState": {},
+        }),
+        encoding="utf-8",
+    )
+    boundary = SessionBoundary(
+        session_id=project.short_id,
+        primary_camera="left",
+        primary_frame_id=100,
+        start_perf_time=10.0,
+        start_wall_time=100.0,
+        camera_when=1.0,
+    )
+    device_rows = ((
+        10.005,
+        100.005,
+        "inbound",
+        "PELLET_LOAD",
+        "PELLET_DEVICE",
+        "device-1",
+        None,
+        None,
+        json.dumps(104.0),
+    ),)
+    laser_rows = ((
+        10.015,
+        100.015,
+        "state",
+        "laser_1",
+        "device",
+        None,
+        None,
+        None,
+        "enabled",
+        1.0,
+    ),)
+    trial_records = ({
+        "send_perf_time": 10.005,
+        "send_wall_time": 100.005,
+        "send_ack_perf_time": 10.015,
+        "send_ack_wall_time": 100.015,
+    },)
+    event_rows = ((
+        10.005,
+        100.005,
+        "pelletSendBegin",
+        1205,
+        10_005_000_000,
+        json.dumps({"trial": 1}),
+        "event_info_perf_counter_ns",
+    ),)
+    sample_rate = 1000.0
+    perf = 9.999 + np.arange(25, dtype=np.float64) / sample_rate
+    indices = np.arange(25, dtype=np.int64)
+    cam_frames = np.zeros(25, dtype=np.float32)
+    cam_frames[1:7] = 1.0
+    cam_frames[14:21] = 1.0
+    nidaq_chunks = ((
+        indices,
+        perf,
+        100.0 + (perf - 10.0),
+        cam_frames[np.newaxis, :],
+        ("cam_frames",),
+        sample_rate,
+        1,
+        0,
+        0,
+    ),)
+
+    SessionDataRecorder._write_session(
+        project,
+        10.0,
+        100.0,
+        10.02,
+        device_rows,
+        laser_rows,
+        (),
+        nidaq_chunks,
+        boundary=boundary,
+        trial_records=trial_records,
+        event_rows=event_rows,
+    )
+
+    with (session_dir / "streams" / "device.csv").open(newline="") as stream:
+        device = next(csv.DictReader(stream))
+    assert device["frame_id"] == "101"
+    assert device["recorded_frame_index"] == "1"
+    assert float(device["event_to_frame_start_seconds"]) == pytest.approx(0.001)
+    assert device["alignment_confidence"] == "host_timestamp"
+    assert "nidaq_camera_exposure_timeline" in device["alignment_method"]
+
+    with (session_dir / "streams" / "events.csv").open(newline="") as stream:
+        event = next(csv.DictReader(stream))
+    assert event["event_name"] == "pelletSendBegin"
+    assert event["frame_id"] == "101"
+    assert event["recorded_frame_index"] == "1"
+    assert event["timestamp_method"] == "event_info_perf_counter_ns"
+
+    with (session_dir / "streams" / "laser.csv").open(newline="") as stream:
+        laser = next(csv.DictReader(stream))
+    assert laser["frame_id"] == "102"
+    assert laser["recorded_frame_index"] == "2"
+
+    trial = json.loads(
+        (session_dir / "streams" / "trials.jsonl").read_text().strip()
+    )
+    assert trial["event_alignment"]["send"]["frameAssociation"]["frameId"] == 101
+    assert (
+        trial["event_alignment"]["sendAcknowledged"]["frameAssociation"]["frameId"]
+        == 102
+    )
+
+    tracking = json.loads(tracking_path.read_text())
+    assert tracking["eventAlignment"]["windowStart"]["frameAssociation"]["frameId"] == 101
+    assert tracking["eventAlignment"]["windowEnd"]["frameAssociation"]["frameId"] == 102
+
+    alignment = json.loads(
+        (session_dir / "streams" / "alignment.json").read_text()
+    )
+    assert "all discrete structured" in alignment["eventAlignmentContract"]["scope"]
+
+
 def test_tone_correlation_uses_session_pulses_and_groups_can_observations():
     sample_rate = 1000.0
     perf = 9.998 + np.arange(155, dtype=np.float64) / sample_rate

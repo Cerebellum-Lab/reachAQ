@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
+from queue import Empty, Full, Queue
 from typing import Iterable, Optional, Tuple
 from uuid import UUID
 
@@ -102,8 +103,10 @@ class SessionDataRecorder:
         *,
         system_message_handler=None,
         hardware_model=None,
+        event_manager=None,
         nidaq_tone_edge_callback=None,
         device_event_capacity: int = 100_000,
+        structured_event_capacity: int = 100_000,
     ):
         self._nidaq_monitor = nidaq_monitor
         self._laser_model = laser_model
@@ -118,6 +121,11 @@ class SessionDataRecorder:
         self._device_event_overruns = 0
         self._device_events_since_start = 0
         self._laser_rows = []
+        self._event_queue = Queue(maxsize=max(1, int(structured_event_capacity)))
+        self._structured_event_overruns = 0
+        self._event_capture_lock = threading.Lock()
+        self._event_capture_enabled = False
+        self._event_manager = event_manager
         self._log_rows = []
         self._nidaq_chunks = []  # compatibility-only; production uses a spool
         self._nidaq_last_index = None
@@ -143,6 +151,8 @@ class SessionDataRecorder:
             system_message_handler.decoded_message_received += self._on_device_message
         if hardware_model is not None:
             hardware_model.device_event += self._on_hardware_device_event
+        if event_manager is not None:
+            event_manager.register_post_observer(self._on_structured_event)
         laser_model.trace_received += self._on_laser_trace
         laser_model.property_changed += self._on_laser_property_changed
         self._log_handler = _SessionLogHandler(self)
@@ -155,6 +165,11 @@ class SessionDataRecorder:
         source_manifest=(),
         metadata_generation_id: Optional[str] = None,
     ) -> None:
+        with self._event_capture_lock:
+            self._event_capture_enabled = False
+            self._drain_event_queue()
+            self._structured_event_overruns = 0
+            self._event_capture_enabled = True
         with self._lock:
             if self._armed:
                 raise RuntimeError("session recorder is already armed")
@@ -218,6 +233,9 @@ class SessionDataRecorder:
             )
 
     def stop(self, end_perf: float):
+        with self._event_capture_lock:
+            self._event_capture_enabled = False
+            event_rows = self._drain_event_queue()
         with self._lock:
             self._pending_stop_end_perf = float(end_perf)
         self._stop_nidaq_thread()
@@ -259,6 +277,8 @@ class SessionDataRecorder:
                 "start_wall": start_wall,
                 "end_perf": end_perf,
                 "device_rows": device_rows,
+                "event_rows": event_rows,
+                "structured_event_overruns": self._structured_event_overruns,
                 "laser_rows": laser_rows,
                 "log_rows": log_rows,
                 "nidaq_chunks": nidaq_chunks,
@@ -346,6 +366,9 @@ class SessionDataRecorder:
         ) from first_error
 
     def abort(self) -> None:
+        with self._event_capture_lock:
+            self._event_capture_enabled = False
+            self._drain_event_queue()
         self._stop_nidaq_thread()
         with self._lock:
             spool_path = self._nidaq_spool_path
@@ -370,6 +393,10 @@ class SessionDataRecorder:
             self._system_message_handler.decoded_message_received -= self._on_device_message
         if self._hardware_model is not None:
             self._hardware_model.device_event -= self._on_hardware_device_event
+        if self._event_manager is not None:
+            self._event_manager.unregister_post_observer(
+                self._on_structured_event,
+            )
         logging.getLogger().removeHandler(self._log_handler)
         with self._lock:
             self._device_rows.clear()
@@ -526,13 +553,22 @@ class SessionDataRecorder:
             except (OSError, ValueError, TypeError):
                 pass
         generation_id = generation_id or f"{project.short_id}-live"
+        record = tracking_request_record(
+            request,
+            result,
+            metadata_generation_id=generation_id,
+        )
+        if path.is_file():
+            try:
+                with path.open("r", encoding="utf-8") as stream:
+                    previous = json.load(stream)
+                if "eventAlignment" in previous:
+                    record["eventAlignment"] = previous["eventAlignment"]
+            except (OSError, TypeError, ValueError):
+                pass
         atomic_write_json(
             path,
-            tracking_request_record(
-                request,
-                result,
-                metadata_generation_id=generation_id,
-            ),
+            record,
             session_dir=session_dir,
             generation_id=generation_id,
         )
@@ -583,6 +619,27 @@ class SessionDataRecorder:
         )
         start_perf = float(boundary["startPerfTime"])
         end_perf = float(boundary["endPerfTime"])
+        start_wall = float(boundary["startWallTime"])
+        recorded_boundary = (
+            None
+            if boundary.get("primaryFrameId") is None
+            else SessionBoundary(
+                session_id=project.short_id,
+                primary_camera=str(boundary.get("primaryCamera") or ""),
+                primary_frame_id=int(boundary["primaryFrameId"]),
+                start_perf_time=start_perf,
+                start_wall_time=start_wall,
+                camera_when=float(boundary.get("cameraWhen") or 0.0),
+            )
+        )
+        frame_timeline = SessionDataRecorder._load_recorded_frame_timeline(
+            project,
+            start_perf=start_perf,
+            start_wall=start_wall,
+            boundary=recorded_boundary,
+            nidaq_source=streams_dir / "nidaq.h5",
+            camera_alignment=alignment.get("cameraNidaqAlignment"),
+        )
         records = tuple(
             dict(record)
             for record in records
@@ -592,6 +649,12 @@ class SessionDataRecorder:
             record["metadata_generation_id"] = metadata_generation_id
             record["send_offset_seconds"] = (
                 float(record["send_perf_time"]) - start_perf
+            )
+            SessionDataRecorder._annotate_trial_record_events(
+                record,
+                start_perf=start_perf,
+                start_wall=start_wall,
+                frame_timeline=frame_timeline,
             )
 
         trial_path = streams_dir / "trials.jsonl"
@@ -617,6 +680,7 @@ class SessionDataRecorder:
                 manifest = json.load(stream)
             manifest_paths = (
                 streams_dir / "device.csv",
+                streams_dir / "events.csv",
                 trial_path,
                 summary_path,
                 streams_dir / "laser.csv",
@@ -658,6 +722,57 @@ class SessionDataRecorder:
         self._trial_summary = {}
         self._metadata_generation_id = None
         self._pending_stop_end_perf = None
+
+    def _drain_event_queue(self) -> tuple:
+        rows = []
+        while True:
+            try:
+                rows.append(self._event_queue.get_nowait())
+            except Empty:
+                return tuple(rows)
+
+    def _on_structured_event(self, info, enqueued_perf_time: float) -> None:
+        """Capture every accepted API event without dispatcher coalescing."""
+        with self._event_capture_lock:
+            if not self._event_capture_enabled:
+                return
+            perf_time = float(enqueued_perf_time)
+            timestamp_method = "event_manager_enqueue_perf_counter"
+            event_index = getattr(info, "index", None)
+            try:
+                indexed_perf = int(event_index) / 1e9
+                if (
+                    math.isfinite(indexed_perf)
+                    and abs(indexed_perf - perf_time) <= 5.0
+                ):
+                    perf_time = indexed_perf
+                    timestamp_method = "event_info_perf_counter_ns"
+            except (TypeError, ValueError, OverflowError):
+                pass
+            event_when = getattr(info, "when", None)
+            try:
+                wall_time = float(event_when.timestamp())
+            except (AttributeError, OSError, OverflowError, TypeError, ValueError):
+                wall_time = time.time()
+                timestamp_method += "_with_capture_wall_time"
+            kind = getattr(info, "kind", "")
+            try:
+                event_id = int(kind)
+            except (TypeError, ValueError):
+                event_id = None
+            kind_name = getattr(kind, "name", str(kind))
+            try:
+                self._event_queue.put_nowait((
+                    perf_time,
+                    wall_time,
+                    str(kind_name),
+                    event_id,
+                    event_index,
+                    self._payload_json(getattr(info, "context", None)),
+                    timestamp_method,
+                ))
+            except Full:
+                self._structured_event_overruns += 1
 
     def _on_device_message(
         self,
@@ -1132,6 +1247,8 @@ class SessionDataRecorder:
         nidaq_chunks,
         timing_plan=None,
         *,
+        event_rows=(),
+        structured_event_overruns=0,
         device_event_overruns=0,
         source_manifest=(),
         source_results=None,
@@ -1152,6 +1269,9 @@ class SessionDataRecorder:
         device_rows = tuple(
             row for row in device_rows if start_perf <= row[0] <= end_perf
         )
+        event_rows = tuple(
+            row for row in event_rows if start_perf <= row[0] <= end_perf
+        )
         device_rows = tuple(
             SessionDataRecorder._normalize_device_row(row)
             for row in device_rows
@@ -1170,6 +1290,16 @@ class SessionDataRecorder:
             start_perf,
             nidaq_chunks,
         )
+        recorded_frame_timeline = (
+            SessionDataRecorder._load_recorded_frame_timeline(
+                project,
+                start_perf=start_perf,
+                start_wall=start_wall,
+                boundary=boundary,
+                nidaq_source=nidaq_chunks,
+                camera_alignment=camera_nidaq_alignment,
+            )
+        )
         tone_confirmation = SessionDataRecorder._correlate_tone_confirmations(
             device_rows,
             nidaq_chunks,
@@ -1178,6 +1308,7 @@ class SessionDataRecorder:
             start_wall=start_wall,
             boundary=boundary,
             camera_alignment=camera_nidaq_alignment,
+            frame_timeline=recorded_frame_timeline,
         )
         trial_records = tuple(
             dict(record)
@@ -1188,6 +1319,12 @@ class SessionDataRecorder:
             record["metadata_generation_id"] = metadata_generation_id
             record["send_offset_seconds"] = (
                 float(record["send_perf_time"]) - start_perf
+            )
+            SessionDataRecorder._annotate_trial_record_events(
+                record,
+                start_perf=start_perf,
+                start_wall=start_wall,
+                frame_timeline=recorded_frame_timeline,
             )
         trial_perf = tuple(
             float(record["send_perf_time"])
@@ -1207,6 +1344,15 @@ class SessionDataRecorder:
                 "device_timestamp",
                 "device_index",
                 "payload_json",
+                "frame_id",
+                "recorded_frame_index",
+                "frame_relation",
+                "frame_start_perf_time",
+                "frame_start_offset_seconds",
+                "frame_start_wall_time",
+                "event_to_frame_start_seconds",
+                "alignment_method",
+                "alignment_confidence",
             ),
             (
                 (
@@ -1220,6 +1366,17 @@ class SessionDataRecorder:
                     device_timestamp,
                     device_index,
                     payload,
+                    *SessionDataRecorder._csv_frame_alignment_fields(
+                        SessionDataRecorder._event_alignment_record(
+                            perf,
+                            wall,
+                            start_perf=start_perf,
+                            start_wall=start_wall,
+                            frame_timeline=recorded_frame_timeline,
+                            method="device_source_or_host_perf_counter",
+                            confidence="host_timestamp",
+                        )
+                    ),
                 )
                 for (
                     perf,
@@ -1232,6 +1389,60 @@ class SessionDataRecorder:
                     device_index,
                     payload,
                 ) in device_rows
+            ),
+        )
+        SessionDataRecorder._atomic_write_csv(
+            streams_dir / "events.csv", session_dir, metadata_generation_id,
+            (
+                "perf_time",
+                "offset_seconds",
+                "wall_time",
+                "event_name",
+                "event_id",
+                "event_index",
+                "context_json",
+                "timestamp_method",
+                "frame_id",
+                "recorded_frame_index",
+                "frame_relation",
+                "frame_start_perf_time",
+                "frame_start_offset_seconds",
+                "frame_start_wall_time",
+                "event_to_frame_start_seconds",
+                "alignment_method",
+                "alignment_confidence",
+            ),
+            (
+                (
+                    perf,
+                    perf - start_perf,
+                    wall,
+                    event_name,
+                    event_id,
+                    event_index,
+                    context,
+                    timestamp_method,
+                    *SessionDataRecorder._csv_frame_alignment_fields(
+                        SessionDataRecorder._event_alignment_record(
+                            perf,
+                            wall,
+                            start_perf=start_perf,
+                            start_wall=start_wall,
+                            frame_timeline=recorded_frame_timeline,
+                            method=timestamp_method,
+                            confidence="host_timestamp",
+                        )
+                    ),
+                )
+                for (
+                    perf,
+                    wall,
+                    event_name,
+                    event_id,
+                    event_index,
+                    context,
+                    timestamp_method,
+                ) in event_rows
             ),
         )
         SessionDataRecorder._atomic_write_json_lines(
@@ -1250,7 +1461,11 @@ class SessionDataRecorder:
             streams_dir / "laser.csv", session_dir, metadata_generation_id,
             ("perf_time", "offset_seconds", "wall_time", "event", "channel", "source",
              "command_volts", "diode_volts", "command_copy_volts", "output_name",
-             "output_value"),
+             "output_value", "frame_id", "recorded_frame_index",
+             "frame_relation", "frame_start_perf_time",
+             "frame_start_offset_seconds", "frame_start_wall_time",
+             "event_to_frame_start_seconds", "alignment_method",
+             "alignment_confidence"),
             (
                 (
                     perf,
@@ -1264,6 +1479,17 @@ class SessionDataRecorder:
                     copy,
                     output_name,
                     output_value,
+                    *SessionDataRecorder._csv_frame_alignment_fields(
+                        SessionDataRecorder._event_alignment_record(
+                            perf,
+                            wall,
+                            start_perf=start_perf,
+                            start_wall=start_wall,
+                            frame_timeline=recorded_frame_timeline,
+                            method="laser_event_perf_counter",
+                            confidence="host_timestamp",
+                        )
+                    ),
                 )
                 for (
                     perf,
@@ -1281,6 +1507,14 @@ class SessionDataRecorder:
                     for row in laser_rows
                 )
             ),
+        )
+        SessionDataRecorder._annotate_tracking_event_files(
+            streams_dir / "tracking",
+            session_dir=session_dir,
+            generation_id=metadata_generation_id,
+            start_perf=start_perf,
+            start_wall=start_wall,
+            frame_timeline=recorded_frame_timeline,
         )
 
         def write_log(path):
@@ -1352,6 +1586,11 @@ class SessionDataRecorder:
             incomplete_reasons.append(
                 f"decoded device event ring overran by {device_event_overruns} event(s)"
             )
+        if structured_event_overruns:
+            incomplete_reasons.append(
+                "structured application event queue overran by "
+                f"{structured_event_overruns} event(s)"
+            )
         for source in finalized_sources:
             source_id = source.get("id", "unknown")
             if source["persistenceStatus"] != "written":
@@ -1405,6 +1644,12 @@ class SessionDataRecorder:
                     start_perf,
                     "device monotonic timestamp",
                 ),
+                "events": SessionDataRecorder._alignment_entry(
+                    "events.csv",
+                    tuple(row[0] for row in event_rows),
+                    start_perf,
+                    "EventInfo performance index or EventManager enqueue time",
+                ),
                 "laser": SessionDataRecorder._alignment_entry(
                     "laser.csv",
                     tuple(row[0] for row in laser_rows),
@@ -1428,11 +1673,36 @@ class SessionDataRecorder:
                 None if timing_plan is None else dataclasses.asdict(timing_plan)
             ),
             "deviceEventOverruns": int(device_event_overruns),
+            "structuredEventOverruns": int(structured_event_overruns),
             "sessionComplete": not incomplete_reasons,
             "incompleteReasons": incomplete_reasons,
             "enabledSources": finalized_sources,
             "cameraNidaqAlignment": camera_nidaq_alignment,
             "toneConfirmation": tone_confirmation,
+            "eventAlignmentContract": {
+                "scope": (
+                    "all discrete structured API/application, device, laser, "
+                    "trial lifecycle, tracking-boundary, and validated tone "
+                    "events"
+                ),
+                "continuousSources": (
+                    "NI samples and pose samples retain their native sample/frame "
+                    "indices and are not expanded into duplicate event rows"
+                ),
+                "frameRelation": "first_recorded_frame_at_or_after_event",
+                "hardwareMethod": (
+                    "nidaq_same_task_tone_edge_to_primary_camera_"
+                    "exposure_counter_transition"
+                ),
+                "genericMethod": (
+                    "event_perf_counter_to_nidaq_camera_exposure_timeline_"
+                    "verified_by_writer"
+                ),
+                "genericFallback": (
+                    "finalized recorded-camera writer timeline when NI camera "
+                    "transitions are unavailable"
+                ),
+            },
         }
         atomic_write_json(
             streams_dir / "alignment.json",
@@ -1442,6 +1712,7 @@ class SessionDataRecorder:
         )
         critical_paths = (
             streams_dir / "device.csv",
+            streams_dir / "events.csv",
             streams_dir / "trials.jsonl",
             streams_dir / "trial_summary.json",
             streams_dir / "laser.csv",
@@ -1475,6 +1746,7 @@ class SessionDataRecorder:
             "cameraNidaqAlignment": camera_nidaq_alignment,
             "toneConfirmation": tone_confirmation,
             "deviceEventOverruns": int(device_event_overruns),
+            "structuredEventOverruns": int(structured_event_overruns),
             "sessionComplete": not incomplete_reasons,
             "incompleteReasons": tuple(incomplete_reasons),
             "enabledSources": finalized_sources,
@@ -1909,6 +2181,7 @@ class SessionDataRecorder:
         start_wall=None,
         boundary=None,
         camera_alignment=None,
+        frame_timeline=None,
     ) -> dict:
         names, indices, perf, values, rate = SessionDataRecorder._nidaq_arrays(
             chunks,
@@ -2117,6 +2390,7 @@ class SessionDataRecorder:
             start_wall=start_wall,
             boundary=boundary,
             camera_alignment=camera_alignment,
+            frame_timeline=frame_timeline,
         )
 
         unmatched_edges = [
@@ -2168,6 +2442,365 @@ class SessionDataRecorder:
             return None
 
     @staticmethod
+    def _load_recorded_frame_timeline(
+        project,
+        *,
+        start_perf,
+        start_wall,
+        boundary,
+        nidaq_source=None,
+        camera_alignment=None,
+    ) -> dict:
+        """Load saved frames, preferring their hardware exposure transitions."""
+        timeline = {
+            "status": "unavailable",
+            "reason": "recorded camera timing ledger is unavailable",
+            "primaryCamera": (
+                None if boundary is None else boundary.primary_camera
+            ),
+            "frameIds": np.empty(0, dtype=np.int64),
+            "perfTimes": np.empty(0, dtype=np.float64),
+            "wallTimes": np.empty(0, dtype=np.float64),
+            "recordedFrameIndices": np.empty(0, dtype=np.int64),
+            "resolutionSeconds": None,
+            "method": "unavailable",
+        }
+        if boundary is None:
+            timeline["reason"] = "primary recorded-camera boundary is unavailable"
+            return timeline
+        path = Path(project.get_frame_timing_path())
+        if not path.is_file():
+            timeline["reason"] = f"recorded camera timing ledger is missing: {path}"
+            return timeline
+        frame_ids = []
+        wall_times = []
+        try:
+            with path.open(newline="", encoding="utf-8") as stream:
+                for row in csv.DictReader(stream):
+                    frame_ids.append(int(row["frame_id"]))
+                    wall_times.append(float(row["utc_when"]))
+        except (KeyError, OSError, TypeError, ValueError) as error:
+            timeline["reason"] = (
+                "recorded camera timing ledger could not be read: "
+                f"{error.__class__.__name__}: {error}"
+            )
+            return timeline
+        if not frame_ids:
+            timeline["reason"] = "recorded camera timing ledger is empty"
+            return timeline
+        frame_ids = np.asarray(frame_ids, dtype=np.int64)
+        wall_times = np.asarray(wall_times, dtype=np.float64)
+        if frame_ids[0] != int(boundary.primary_frame_id):
+            timeline["reason"] = (
+                f"recorded frame ledger begins at {frame_ids[0]}, expected "
+                f"{boundary.primary_frame_id}"
+            )
+            return timeline
+        if (
+            np.any(np.diff(frame_ids) <= 0)
+            or not np.all(np.isfinite(wall_times))
+            or np.any(np.diff(wall_times) <= 0)
+        ):
+            timeline["reason"] = (
+                "recorded frame IDs/timestamps are not finite and strictly increasing"
+            )
+            return timeline
+        perf_times = float(start_perf) + (
+            wall_times - float(start_wall)
+        )
+        resolution = (
+            None
+            if len(perf_times) < 2
+            else float(np.median(np.diff(perf_times)))
+        )
+        timeline.update({
+            "status": "ready",
+            "reason": "finalized primary-camera writer timing ledger",
+            "frameIds": frame_ids,
+            "perfTimes": perf_times,
+            "wallTimes": wall_times,
+            "recordedFrameIndices": np.arange(
+                len(frame_ids), dtype=np.int64,
+            ),
+            "resolutionSeconds": resolution,
+            "method": "finalized_recorded_camera_writer_timeline",
+        })
+
+        if (
+            nidaq_source is None
+            or not isinstance(camera_alignment, dict)
+            or camera_alignment.get("status") != "matched"
+        ):
+            return timeline
+
+        try:
+            if isinstance(nidaq_source, (str, Path)):
+                with h5py.File(nidaq_source, "r") as source:
+                    names = tuple(
+                        name.decode() if isinstance(name, bytes) else str(name)
+                        for name in source.attrs.get("channel_names", ())
+                    )
+                    indices = source["sample_index"][:]
+                    hardware_perf = source["perf_time"][:]
+                    if "cam_frames" not in names:
+                        return timeline
+                    camera_values = source["values"][
+                        names.index("cam_frames"), :
+                    ]
+            else:
+                names, indices, hardware_perf, values, _ = (
+                    SessionDataRecorder._nidaq_arrays(
+                        nidaq_source,
+                        requested_names=("cam_frames",),
+                    )
+                )
+                if "cam_frames" not in names:
+                    return timeline
+                camera_values = values[names.index("cam_frames")]
+
+            transitions = SessionDataRecorder._transition_positions(
+                camera_values,
+            )
+            matched_sample = int(camera_alignment["matchedSampleIndex"])
+            anchor_matches = np.flatnonzero(
+                indices[transitions] == matched_sample,
+            )
+            if anchor_matches.size != 1:
+                return timeline
+            anchor = int(anchor_matches[0])
+            hardware_ids = (
+                int(boundary.primary_frame_id)
+                + np.arange(len(transitions), dtype=np.int64)
+                - anchor
+            )
+            writer_positions = np.searchsorted(frame_ids, hardware_ids)
+            present = writer_positions < len(frame_ids)
+            valid_positions = np.flatnonzero(present)
+            present[valid_positions] &= (
+                frame_ids[writer_positions[valid_positions]]
+                == hardware_ids[valid_positions]
+            )
+            transitions = transitions[present]
+            hardware_ids = hardware_ids[present]
+            writer_positions = writer_positions[present]
+            if len(transitions) < 2:
+                return timeline
+            hardware_perf = np.asarray(
+                hardware_perf[transitions], dtype=np.float64,
+            )
+            if (
+                not np.all(np.isfinite(hardware_perf))
+                or np.any(np.diff(hardware_perf) <= 0)
+                or np.any(np.diff(hardware_ids) <= 0)
+            ):
+                return timeline
+            hardware_wall = float(start_wall) + (
+                hardware_perf - float(start_perf)
+            )
+            timeline.update({
+                "reason": (
+                    "NI camera-exposure transitions verified against the "
+                    "finalized primary-camera writer ledger"
+                ),
+                "frameIds": hardware_ids,
+                "perfTimes": hardware_perf,
+                "wallTimes": hardware_wall,
+                "recordedFrameIndices": writer_positions.astype(np.int64),
+                "resolutionSeconds": float(
+                    np.median(np.diff(hardware_perf)),
+                ),
+                "method": (
+                    "nidaq_camera_exposure_timeline_verified_by_writer"
+                ),
+            })
+        except (KeyError, OSError, TypeError, ValueError) as error:
+            logging.getLogger(__name__).warning(
+                "Unable to use NI camera transitions for event-to-frame "
+                "alignment; retaining writer timeline: %s: %s",
+                error.__class__.__name__,
+                error,
+            )
+        return timeline
+
+    @staticmethod
+    def _event_alignment_record(
+        perf_time,
+        wall_time,
+        *,
+        start_perf,
+        start_wall,
+        frame_timeline,
+        method,
+        confidence,
+    ) -> dict:
+        perf_time = float(perf_time)
+        recording_offset = perf_time - float(start_perf)
+        if wall_time is None:
+            wall_time = float(start_wall) + recording_offset
+            timestamp_method = "recording_wall_anchor_plus_perf_counter_offset"
+        else:
+            wall_time = float(wall_time)
+            timestamp_method = "event_source_wall_and_perf_counter_timestamps"
+        result = {
+            "perfTime": perf_time,
+            "wallTimeUnixSeconds": wall_time,
+            "wallTimeUtc": SessionDataRecorder._utc_timestamp(wall_time),
+            "recordingOffsetSeconds": recording_offset,
+            "timestampMethod": timestamp_method,
+        }
+        association = {
+            "status": "unavailable",
+            "method": (
+                f"{method}_via_{frame_timeline.get('method', 'unavailable')}"
+            ),
+            "confidence": str(confidence),
+            "relation": "first_recorded_frame_at_or_after_event",
+            "primaryCamera": frame_timeline.get("primaryCamera"),
+            "frameId": None,
+            "recordedFrameIndex": None,
+            "frameStartPerfTime": None,
+            "frameStartRecordingOffsetSeconds": None,
+            "frameStartWallTimeUnixSeconds": None,
+            "frameStartWallTimeUtc": None,
+            "eventToFrameStartSeconds": None,
+            "nearestFrameId": None,
+            "nearestFrameSignedOffsetSeconds": None,
+            "resolutionSeconds": frame_timeline.get("resolutionSeconds"),
+        }
+        if frame_timeline.get("status") != "ready":
+            association["reason"] = frame_timeline.get("reason", "unavailable")
+            result["frameAssociation"] = association
+            return result
+        frame_ids = frame_timeline["frameIds"]
+        frame_perf = frame_timeline["perfTimes"]
+        frame_wall = frame_timeline["wallTimes"]
+        recorded_indices = frame_timeline["recordedFrameIndices"]
+        following = int(np.searchsorted(frame_perf, perf_time, side="left"))
+        if following >= len(frame_perf):
+            following = len(frame_perf) - 1
+            association["relation"] = "last_recorded_frame_before_event"
+        nearest = int(np.argmin(np.abs(frame_perf - perf_time)))
+        association.update({
+            "status": "matched",
+            "reason": (
+                "Event timestamp was mapped onto the finalized recorded-frame ledger"
+            ),
+            "frameId": int(frame_ids[following]),
+            "recordedFrameIndex": int(recorded_indices[following]),
+            "frameStartPerfTime": float(frame_perf[following]),
+            "frameStartRecordingOffsetSeconds": (
+                float(frame_perf[following]) - float(start_perf)
+            ),
+            "frameStartWallTimeUnixSeconds": float(frame_wall[following]),
+            "frameStartWallTimeUtc": SessionDataRecorder._utc_timestamp(
+                frame_wall[following],
+            ),
+            "eventToFrameStartSeconds": float(frame_perf[following]) - perf_time,
+            "nearestFrameId": int(frame_ids[nearest]),
+            "nearestFrameSignedOffsetSeconds": (
+                perf_time - float(frame_perf[nearest])
+            ),
+        })
+        result["frameAssociation"] = association
+        return result
+
+    @staticmethod
+    def _csv_frame_alignment_fields(event_alignment):
+        frame = event_alignment["frameAssociation"]
+        return (
+            frame.get("frameId"),
+            frame.get("recordedFrameIndex"),
+            frame.get("relation"),
+            frame.get("frameStartPerfTime"),
+            frame.get("frameStartRecordingOffsetSeconds"),
+            frame.get("frameStartWallTimeUnixSeconds"),
+            frame.get("eventToFrameStartSeconds"),
+            frame.get("method"),
+            frame.get("confidence"),
+        )
+
+    @staticmethod
+    def _annotate_trial_record_events(
+        record,
+        *,
+        start_perf,
+        start_wall,
+        frame_timeline,
+    ) -> None:
+        fields = (
+            ("send", "send_perf_time", "send_wall_time"),
+            ("sendAcknowledged", "send_ack_perf_time", "send_ack_wall_time"),
+            ("captureEnded", "capture_end_perf_time", "capture_end_wall_time"),
+            ("finalized", "finalized_perf_time", "finalized_wall_time"),
+            ("analysisWindowStart", "analysis_window_start_perf", None),
+            ("analysisWindowEnd", "analysis_window_end_perf", None),
+        )
+        events = {}
+        for name, perf_key, wall_key in fields:
+            perf_value = record.get(perf_key)
+            if perf_value is None:
+                continue
+            events[name] = SessionDataRecorder._event_alignment_record(
+                perf_value,
+                None if wall_key is None else record.get(wall_key),
+                start_perf=start_perf,
+                start_wall=start_wall,
+                frame_timeline=frame_timeline,
+                method="trial_lifecycle_perf_counter",
+                confidence="host_timestamp",
+            )
+        record["event_alignment"] = events
+
+    @staticmethod
+    def _annotate_tracking_event_files(
+        tracking_dir,
+        *,
+        session_dir,
+        generation_id,
+        start_perf,
+        start_wall,
+        frame_timeline,
+    ) -> None:
+        if not tracking_dir.is_dir():
+            return
+        for path in sorted(tracking_dir.glob("trial_*_attempt_*.json")):
+            try:
+                with path.open("r", encoding="utf-8") as stream:
+                    record = json.load(stream)
+                window = record["window"]
+                record["eventAlignment"] = {
+                    "windowStart": SessionDataRecorder._event_alignment_record(
+                        window["startPerf"],
+                        None,
+                        start_perf=start_perf,
+                        start_wall=start_wall,
+                        frame_timeline=frame_timeline,
+                        method="tracking_window_perf_counter",
+                        confidence="canonical_timeline",
+                    ),
+                    "windowEnd": SessionDataRecorder._event_alignment_record(
+                        window["endPerf"],
+                        None,
+                        start_perf=start_perf,
+                        start_wall=start_wall,
+                        frame_timeline=frame_timeline,
+                        method="tracking_window_perf_counter",
+                        confidence="canonical_timeline",
+                    ),
+                }
+                atomic_write_json(
+                    path,
+                    record,
+                    session_dir=session_dir,
+                    generation_id=generation_id,
+                )
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "Unable to annotate tracking event timestamps: %s",
+                    path,
+                )
+
+    @staticmethod
     def _annotate_tone_timestamps_and_frames(
         matched,
         *,
@@ -2180,6 +2813,7 @@ class SessionDataRecorder:
         start_wall,
         boundary,
         camera_alignment,
+        frame_timeline=None,
     ) -> None:
         """Attach final wall-clock and recorded-frame identity to NI tones."""
         wall_anchor_available = (
@@ -2210,6 +2844,28 @@ class SessionDataRecorder:
             "nidaq_same_task_tone_edge_to_primary_camera_"
             "exposure_counter_transition"
         )
+        if frame_timeline and frame_timeline.get("status") == "ready":
+            hardware_verified = (
+                frame_timeline.get("method")
+                == "nidaq_camera_exposure_timeline_verified_by_writer"
+            )
+            for event in matched:
+                aligned = SessionDataRecorder._event_alignment_record(
+                    event["physicalEventPerfTime"],
+                    None,
+                    start_perf=start_perf,
+                    start_wall=start_wall,
+                    frame_timeline=frame_timeline,
+                    method="nidaq_same_task_tone_edge",
+                    confidence=(
+                        camera_alignment.get("confidence", "hardware_edge")
+                        if hardware_verified and camera_alignment
+                        else "writer_timestamp"
+                    ),
+                )
+                event["frameAssociation"] = aligned["frameAssociation"]
+            return
+
         unavailable_reason = None
         if "cam_frames" not in names:
             unavailable_reason = "cam_frames is not configured in the NI task"
@@ -2273,11 +2929,8 @@ class SessionDataRecorder:
                 side="left",
             ))
             if following >= transition_perf.size:
-                association["reason"] = (
-                    "no recorded camera exposure begins after this event"
-                )
-                event["frameAssociation"] = association
-                continue
+                following = transition_perf.size - 1
+                association["relation"] = "last_recorded_frame_before_event"
             frame_id = int(
                 boundary.primary_frame_id + following - anchor_ordinal
             )

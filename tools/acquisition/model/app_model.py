@@ -557,6 +557,7 @@ class AppModel(ObservableObject):
             self._laser,
             system_message_handler=self._system_message_handler,
             hardware_model=self._hardware,
+            event_manager=self._event_manager,
             nidaq_tone_edge_callback=self._on_intertrial_nidaq_tone_edge,
         )
 
