@@ -54,6 +54,8 @@ class BehaviorContent(ContentWidget):
         header_right_layout.addWidget(self._recording_status_label)
         self._inference_status = QLabel("")
         header_right_layout.addWidget(self._inference_status)
+        self._validation_status = QLabel("")
+        header_right_layout.addWidget(self._validation_status)
         card = self._card_widget = CardWidget(title="Behavior", header_right_layout=header_right_layout)
 
         controls_layout = QHBoxLayout()
@@ -68,6 +70,21 @@ class BehaviorContent(ContentWidget):
         self._abort_button = QPushButton("Abort")
         self._abort_button.clicked.connect(self._app_model.abort_recording)
         controls_layout.addWidget(self._abort_button)
+        self._validate_fast_button = QPushButton("Validate Fast")
+        self._validate_fast_button.clicked.connect(
+            lambda: self._app_model.validate_last_session("fast")
+        )
+        controls_layout.addWidget(self._validate_fast_button)
+        self._validate_full_button = QPushButton("Validate Full")
+        self._validate_full_button.clicked.connect(
+            lambda: self._app_model.validate_last_session("full")
+        )
+        controls_layout.addWidget(self._validate_full_button)
+        self._cancel_validation_button = QPushButton("Cancel Validation")
+        self._cancel_validation_button.clicked.connect(
+            self._app_model.cancel_session_validation
+        )
+        controls_layout.addWidget(self._cancel_validation_button)
         controls_layout.addStretch(1)
 
         counts_layout = QGridLayout()
@@ -217,6 +234,7 @@ class BehaviorContent(ContentWidget):
         self.status_changed.connect(self._inference_status.setText)
         self.set_is_editable(False)
         self._update_recording_controls(app_model.session_recording_status)
+        self._update_validation_status(app_model.session_validation_state)
 
     def set_is_editable(self, is_editable: bool):
         self._stack_layout.setCurrentIndex(1 if is_editable else 0)
@@ -245,6 +263,20 @@ class BehaviorContent(ContentWidget):
             SessionRecordingStatus.STOPPING,
             SessionRecordingStatus.ANALYZING,
         })
+        validation = self._app_model.session_validation_state
+        validation_active = validation["status"] in {"pending", "running"}
+        can_validate = (
+            status is SessionRecordingStatus.READY
+            and not validation_active
+            and self._app_model.last_stopped_session_path is not None
+        )
+        self._validate_fast_button.setEnabled(can_validate)
+        self._validate_full_button.setEnabled(can_validate)
+        self._cancel_validation_button.setEnabled(validation_active)
+        self._cancel_validation_button.setText(
+            f"Cancel {validation['profile'].capitalize()}"
+            if validation_active else "Cancel Validation"
+        )
 
     @invoke_method
     def _app_model_property_changed(self, name, value, _):
@@ -254,6 +286,11 @@ class BehaviorContent(ContentWidget):
             self._intersession_toggle.setChecked(
                 bool((value.get("analysis") or {}).get("enabled"))
             )
+        elif name == self._app_model.Props.SESSION_VALIDATION_STATE:
+            self._update_validation_status(value)
+            self._update_recording_controls(
+                self._app_model.session_recording_status
+            )
         elif name in {
             self._app_model.Props.STATUS,
             self._app_model.Props.ACQUISITION_RUNNING,
@@ -261,6 +298,22 @@ class BehaviorContent(ContentWidget):
             self._app_model.Props.SUBSYSTEM_STATUSES,
         }:
             self._update_recording_controls(self._app_model.session_recording_status)
+
+    def _update_validation_status(self, state):
+        status = state.get("status", "idle")
+        profile = state.get("profile", "")
+        if status == "idle":
+            text = "Validation: —"
+        else:
+            text = f"Validation {profile or 'session'}: {status}"
+        self._validation_status.setText(text)
+        self._validation_status.setToolTip(
+            "\n".join(filter(None, (
+                state.get("session_path", ""),
+                state.get("report_path", ""),
+                state.get("error", ""),
+            )))
+        )
 
     def _intersession_toggle_state_changed(self, x: int):
         self._app_model.set_intertrial_analysis_enabled(x != 0)

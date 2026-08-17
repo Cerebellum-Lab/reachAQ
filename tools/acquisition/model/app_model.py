@@ -174,6 +174,9 @@ from tools.acquisition.model.trial_protocol_repository import (
 from tools.acquisition.model.stimulus_profile_repository import (
     StimulusProfileRepository,
 )
+from tools.acquisition.model.session_validation_controller import (
+    SessionValidationController,
+)
 from tools.acquisition.model.trial_protocol_schedule import (
     TrialOverride,
     TrialProtocolDocument,
@@ -428,6 +431,7 @@ class AppModel(ObservableObject):
         ANIMAL_METADATA_REFRESH_BUSY = "animal_metadata_refresh_busy"
         INTERNAL_ERROR_DIAGNOSTIC = "internal_error_diagnostic"
         TRIAL_PROTOCOL_STATE = "trial_protocol_state"
+        SESSION_VALIDATION_STATE = "session_validation_state"
 
     def __init__(
             self,
@@ -477,6 +481,10 @@ class AppModel(ObservableObject):
         self._animal_name = ""
         self._notes = ""
         self._editable_notes_project: Optional[ProjectInfo] = None
+        self._last_stopped_session_path: Optional[Path] = None
+        self._session_validation = SessionValidationController(
+            self._on_session_validation_state
+        )
         self._pending_metadata_project: Optional[ProjectInfo] = None
         self._trial_protocol_lock = threading.RLock()
         self._trial_protocol_repository = TrialProtocolRepository(
@@ -3945,6 +3953,33 @@ class AppModel(ObservableObject):
             self.on_error("Session notes were not saved", str(exc))
             return False
         return True
+
+    @property
+    def session_validation_state(self):
+        return dataclasses.asdict(self._session_validation.state)
+
+    @property
+    def last_stopped_session_path(self):
+        return self._last_stopped_session_path
+
+    def validate_last_session(self, profile="fast") -> bool:
+        if self._recording_session.status is not SessionRecordingStatus.READY:
+            raise RuntimeError("Session validation is unavailable during recording/finalization")
+        path = self._last_stopped_session_path
+        if path is None or not path.is_dir():
+            raise RuntimeError("No successfully stopped session is available")
+        self._session_validation.start(path, profile, automatic=False)
+        return True
+
+    def cancel_session_validation(self) -> bool:
+        return self._session_validation.cancel()
+
+    def _on_session_validation_state(self, state) -> None:
+        self.property_changed(
+            self.Props.SESSION_VALIDATION_STATE,
+            dataclasses.asdict(state),
+            None,
+        )
 
     @property
     def trial_protocol_rows(self) -> Tuple[dict, ...]:
@@ -7472,6 +7507,17 @@ class AppModel(ObservableObject):
             logger.exception("Final intertrial metadata save failed")
         else:
             self._pending_metadata_project = None
+            self._last_stopped_session_path = Path(
+                project.get_session_path(skip_ensure=True).location
+            ).resolve()
+            try:
+                self._session_validation.start(
+                    self._last_stopped_session_path,
+                    "quick",
+                    automatic=True,
+                )
+            except Exception:
+                logger.exception("Could not schedule automatic quick session validation")
             self._set_subsystem_status(
                 SubsystemId.INTERTRIAL_ANALYSIS,
                 (
