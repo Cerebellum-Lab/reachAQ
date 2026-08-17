@@ -63,6 +63,8 @@ from the core logic of the applications for two reasons:
     * [Detailed Instructions](tools/acquisition/README.md)
     * [Session recording, synchronization, persistence, and hardware isolation](docs/acquisition/session-recording-and-synchronization.md)
     * [Recording sessions, pellet trials, protocols, and schema migration](docs/acquisition/session-trials-protocols.md)
+    * [Session validation command and rule coverage](docs/acquisition/session-validation.md)
+    * [Pellet firmware compatibility and rollout](docs/acquisition/pellet-firmware-compatibility.md)
     * Use `--random-cameras` to start with software-generated frames when no physical cameras are configured.
   * Headless implementation for command line only
     * `auto-trainer-headless -c ~/Autotrainer/system_configuration.yaml`
