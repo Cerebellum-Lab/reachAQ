@@ -197,6 +197,20 @@ def test_pre_reveal_requires_board_route_and_reveal_policy():
     assert row.pre_reveal_ms == 200
 
 
+def test_direct_ni_route_is_limited_to_first_reach():
+    row = TrialProtocolRow(trial_id=1).with_updates({
+        "enabled": True,
+        "stimulus_assignment": "always",
+        "laser_profile_id": "pulse",
+        "laser_phase": "pellet_presentation",
+        "laser_trigger_route": "direct_ni_software",
+        "stimulus_trigger": "tone_1",
+    }, validate=False)
+
+    with pytest.raises(ValueError, match="requires the First Reach"):
+        row.validate(runnable=True)
+
+
 @pytest.mark.parametrize(
     "values, message",
     [

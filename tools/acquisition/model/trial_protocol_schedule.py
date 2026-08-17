@@ -304,6 +304,23 @@ class TrialProtocolRow:
             raise ValueError("ROI1/ROI2 triggers are reserved for a future release")
         if (
             runnable
+            and self.laser_trigger_route is LaserTriggerRoute.DIRECT_NI_SOFTWARE
+            and self.stimulus_trigger is not StimulusTrigger.FIRST_REACH
+        ):
+            raise ValueError(
+                "Direct NI software start currently requires the First Reach trigger"
+            )
+        if (
+            runnable
+            and self.stimulus_trigger
+            in {StimulusTrigger.TONE_1, StimulusTrigger.TONE_2}
+            and self.laser_trigger_route is not LaserTriggerRoute.HARDWARE_STIM3
+        ):
+            raise ValueError(
+                "Tone-triggered stimulation requires a verified hardware trigger input"
+            )
+        if (
+            runnable
             and
             self.stimulus_assignment is not StimulusAssignment.DISABLED
             and not self.laser_profile_id
