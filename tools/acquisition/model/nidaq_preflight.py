@@ -21,6 +21,8 @@ class NidaqPreflightResult:
     error: str = ""
     daqmx_code: Optional[int] = None
     corrective_action: str = ""
+    multidevice_probe_status: str = "not_requested"
+    multidevice_probe_error: str = ""
 
     @property
     def is_valid(self):
@@ -31,12 +33,73 @@ def _preflight_worker(configuration, timing_plan, result_queue):
     controller = None
     verified = ()
     try:
-        controller = NidaqSignalStreamController(
-            configuration,
-            timing_plan=timing_plan,
+        strategy = getattr(
+            getattr(timing_plan, "task_graph", None),
+            "strategy",
+            "per_device",
         )
-        verified = controller.verify_tasks(commit=True)
-        result = NidaqPreflightResult("verified", verified_tasks=verified)
+        requested = strategy in {"auto_multidevice", "forced_multidevice"}
+        input_devices = {
+            str(channel.physical_channel).strip("/").split("/", 1)[0]
+            for channel in getattr(configuration, "channels", ())
+        }
+        multidevice_status = "not_requested"
+        multidevice_error = ""
+        if requested and len(input_devices) > 1:
+            from tools.acquisition.model.nidaq_timing import (
+                resolve_nidaq_multidevice_probe,
+            )
+            combined_plan = (
+                resolve_nidaq_multidevice_probe(timing_plan, "verified")
+                if isinstance(timing_plan, NidaqTimingPlan)
+                else timing_plan
+            )
+            try:
+                controller = NidaqSignalStreamController(
+                    configuration,
+                    timing_plan=combined_plan,
+                )
+                verified = controller.verify_tasks(commit=True)
+                multidevice_status = "verified"
+            except Exception as error:
+                multidevice_error = str(error) or type(error).__name__
+                if controller is not None:
+                    try:
+                        controller.close()
+                    except Exception:
+                        # Preserve the Verify/Commit error which selected the
+                        # fallback. Cleanup is retried by the outer finalizer.
+                        pass
+                    controller = None
+                if strategy == "forced_multidevice":
+                    raise RuntimeError(
+                        "Forced NI multidevice task verification failed: "
+                        + multidevice_error
+                    ) from error
+                multidevice_status = "fallback_per_device"
+        elif requested:
+            multidevice_status = "not_applicable_single_device"
+
+        if controller is None:
+            from tools.acquisition.model.nidaq_timing import (
+                resolve_nidaq_multidevice_probe,
+            )
+            selected_plan = (
+                resolve_nidaq_multidevice_probe(timing_plan, multidevice_status)
+                if isinstance(timing_plan, NidaqTimingPlan)
+                else timing_plan
+            )
+            controller = NidaqSignalStreamController(
+                configuration,
+                timing_plan=selected_plan,
+            )
+            verified = controller.verify_tasks(commit=True)
+        result = NidaqPreflightResult(
+            "verified",
+            verified_tasks=verified,
+            multidevice_probe_status=multidevice_status,
+            multidevice_probe_error=multidevice_error,
+        )
     except Exception as error:
         result = NidaqPreflightResult(
             "failed",

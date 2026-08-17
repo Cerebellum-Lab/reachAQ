@@ -5,6 +5,8 @@ import numpy
 from autotrainer.core import (
     NidaqSignalChannelConfiguration,
     NidaqSignalStreamConfiguration,
+    NidaqTaskGraph,
+    NidaqTaskSpecification,
     NidaqTimingPlan,
 )
 from autotrainer.device import nidaq_signal_stream
@@ -214,6 +216,49 @@ def test_multi_device_tasks_arm_slave_before_master(monkeypatch):
         assert block.sample_count == 3
         assert block.epoch_perf_time is not None
         assert block.epoch_wall_time is not None
+    finally:
+        controller.close()
+
+
+def test_verified_multidevice_probe_uses_one_expanded_task(monkeypatch):
+    fake_nidaqmx = _FakeNidaqmx()
+    monkeypatch.setattr(nidaq_signal_stream, "_load_nidaqmx", lambda: fake_nidaqmx)
+    configuration = NidaqSignalStreamConfiguration(
+        channels=(
+            NidaqSignalChannelConfiguration("master_ai", "Acquire/ai0"),
+            NidaqSignalChannelConfiguration("slave_ai", "Feedback/ai0"),
+        ),
+        is_enabled=True,
+        sample_rate_hz=1000.0,
+        read_chunk_size=3,
+    )
+    plan = NidaqTimingPlan(
+        requested_mode="auto",
+        resolved_mode="backplane",
+        is_valid=True,
+        master_device="Acquire",
+        slave_devices=("Feedback",),
+        task_start_order=("Feedback", "Acquire"),
+        synchronization_quality="hardware_backplane",
+        task_graph=NidaqTaskGraph(
+            graph_id="g",
+            strategy="auto_multidevice",
+            tasks=(
+                NidaqTaskSpecification(
+                    "Acquire.ai", "Acquire", "ai",
+                    ("Acquire/ai0", "Feedback/ai0"), "continuous_input",
+                ),
+            ),
+        ),
+        multidevice_probe_status="verified",
+    )
+
+    controller = NidaqSignalStreamController(configuration, timing_plan=plan)
+    try:
+        assert len(fake_nidaqmx.tasks) == 1
+        assert [item[0] for item in fake_nidaqmx.tasks[0].channels] == [
+            "Acquire/ai0", "Feedback/ai0",
+        ]
     finally:
         controller.close()
 

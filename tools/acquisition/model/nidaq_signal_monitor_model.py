@@ -32,6 +32,7 @@ from tools.acquisition.model.nidaq_channel_plan import with_display_channels
 from tools.acquisition.model.nidaq_discovery import discover_nidaq_devices
 from tools.acquisition.model.nidaq_timing import build_nidaq_timing_plan
 from tools.acquisition.model.nidaq_timing import (
+    resolve_nidaq_multidevice_probe,
     resolve_nidaq_device_aliases,
     resolve_nidaq_device_names,
     resolve_nidaq_stream_configuration,
@@ -423,6 +424,15 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
                             f"{preflight.stage}: {preflight.error}. "
                             f"{preflight.corrective_action}"
                         )
+                    timing_plan = resolve_nidaq_multidevice_probe(
+                        timing_plan,
+                        getattr(
+                            preflight,
+                            "multidevice_probe_status",
+                            timing_plan.multidevice_probe_status,
+                        ),
+                    )
+                    self._set_timing_plan(timing_plan)
                 self._runtime_device_aliases = dict(aliases)
                 message_queue = self._mp_ctx.Queue(maxsize=16)
                 stop_event = self._mp_ctx.Event()

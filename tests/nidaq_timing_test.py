@@ -8,6 +8,7 @@ from autotrainer.core import (
 from tools.acquisition.model.nidaq_discovery import NidaqDevicePorts
 from tools.acquisition.model.nidaq_timing import build_nidaq_timing_plan
 from tools.acquisition.model.nidaq_timing import (
+    resolve_nidaq_multidevice_probe,
     resolve_nidaq_device_aliases,
     resolve_nidaq_stream_configuration,
 )
@@ -220,6 +221,16 @@ def test_timing_graph_retains_explicit_routes_and_strategy():
     assert plan.task_graph.strategy == "auto_multidevice"
     assert route in plan.task_graph.routes
     assert plan.multidevice_probe_status == "pending_exact_probe"
+
+    selected = resolve_nidaq_multidevice_probe(plan, "verified")
+    analog = [task for task in selected.task_graph.tasks if task.subsystem == "ai"]
+    assert len(analog) == 1
+    assert analog[0].device == "DevA"
+    assert analog[0].channels == ("DevA/ai0", "DevB/ai0")
+    assert selected.multidevice_probe_status == "verified"
+
+    fallback = resolve_nidaq_multidevice_probe(plan, "fallback_per_device")
+    assert len([task for task in fallback.task_graph.tasks if task.subsystem == "ai"]) == 2
 
 
 def test_timing_graph_retains_exact_laser_output_channels():

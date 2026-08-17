@@ -288,6 +288,12 @@ class NidaqSignalStreamController:
 
         analog_by_device = self._channels_by_device(cfg.analog_channels)
         digital_by_device = self._channels_by_device(cfg.digital_channels)
+        if self._uses_multidevice_tasks():
+            master = self._timing_plan.master_device
+            if len(analog_by_device) > 1:
+                analog_by_device = {master: tuple(cfg.analog_channels)}
+            if len(digital_by_device) > 1:
+                digital_by_device = {master: tuple(cfg.digital_channels)}
         self._analog_channels_by_device = analog_by_device
         self._digital_channels_by_device = digital_by_device
 
@@ -411,6 +417,16 @@ class NidaqSignalStreamController:
             self._nidaqmx.constants.DataTransferActiveTransferMode.INTERRUPT
         )
         return task
+
+    def _uses_multidevice_tasks(self) -> bool:
+        plan = self._timing_plan
+        return bool(
+            plan is not None
+            and plan.multidevice_probe_status == "verified"
+            and plan.task_graph is not None
+            and plan.task_graph.strategy
+            in {"auto_multidevice", "forced_multidevice"}
+        )
 
     def _make_stream_reader(self, device_name, task, channels, *, analog):
         in_stream = getattr(task, "in_stream", None)

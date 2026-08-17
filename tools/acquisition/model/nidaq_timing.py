@@ -390,6 +390,57 @@ def _with_task_graph(plan, configuration, timing, output_devices, output_channel
     )
 
 
+def resolve_nidaq_multidevice_probe(
+    plan: NidaqTimingPlan,
+    status: str,
+) -> NidaqTimingPlan:
+    """Freeze the exact task graph selected by the disposable probe."""
+    status = str(status)
+    graph = plan.task_graph
+    if graph is None or status != "verified":
+        return dataclasses.replace(plan, multidevice_probe_status=status)
+    master = plan.master_device
+    combined = []
+    for subsystem in ("ai", "di"):
+        members = tuple(task for task in graph.tasks if task.subsystem == subsystem)
+        if len({task.device for task in members}) <= 1:
+            continue
+        template = members[0]
+        combined.append(dataclasses.replace(
+            template,
+            task_id=f"{master}.{subsystem}",
+            device=master,
+            channels=tuple(
+                channel for task in members for channel in task.channels
+            ),
+            sample_clock_source=None,
+            start_trigger_source=None,
+            resources=tuple(
+                resource for task in members for resource in task.resources
+            ),
+        ))
+    combined_subsystems = {task.subsystem for task in combined}
+    tasks = tuple(
+        task for task in graph.tasks if task.subsystem not in combined_subsystems
+    ) + tuple(combined)
+    task_ids = tuple(task.task_id for task in tasks)
+    selected = dataclasses.replace(
+        graph,
+        tasks=tasks,
+        create_order=task_ids,
+        start_order=tuple(dict.fromkeys((
+            *(task_id for task_id in graph.start_order if task_id in task_ids),
+            *(task.task_id for task in combined),
+        ))),
+        shutdown_order=tuple(reversed(task_ids)),
+    )
+    return dataclasses.replace(
+        plan,
+        task_graph=selected,
+        multidevice_probe_status=status,
+    )
+
+
 def _select_master(
     override: Optional[NidaqDeviceIdentity],
     active_devices: tuple[str, ...],
