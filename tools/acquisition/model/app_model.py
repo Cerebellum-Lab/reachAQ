@@ -687,6 +687,10 @@ class AppModel(ObservableObject):
         self._laser_profiles = {
             profile.profile_id: profile for profile in profile_library.laser_profiles
         }
+        self._automatic_shift_policies = {
+            profile.policy_id: profile
+            for profile in profile_library.automatic_shift_profiles
+        }
         self._trial_action_executor = TrialActionExecutor(
             move_absolute=self._move_protocol_motor_target,
             configure_cover=self._configure_protocol_cover,
@@ -4074,12 +4078,39 @@ class AppModel(ObservableObject):
         self._save_stimulus_profiles(self._tone_profiles, lasers)
         return profile
 
+    def save_automatic_shift_policy(self, **values) -> AutomaticShiftPolicy:
+        self._require_session_ready_for_configuration(
+            "Editing automatic shift policies"
+        )
+        policy_id = str(values.pop("policy_id")).strip()
+        previous = self._automatic_shift_policies.get(policy_id)
+        profile = AutomaticShiftPolicy(
+            policy_id=policy_id,
+            revision=1 if previous is None else previous.revision + 1,
+            **values,
+        )
+        policies = {**self._automatic_shift_policies, policy_id: profile}
+        self._save_stimulus_profiles(
+            self._tone_profiles,
+            self._laser_profiles,
+            policies,
+        )
+        return profile
+
     def delete_stimulus_profile(self, kind: str, profile_id: str) -> None:
         self._require_session_ready_for_configuration("Deleting stimulus profiles")
         kind, profile_id = str(kind), str(profile_id)
-        if kind not in {"tone", "laser"}:
-            raise ValueError("Stimulus profile kind must be tone or laser")
-        field = "tone_profile_id" if kind == "tone" else "laser_profile_id"
+        if kind not in {"tone", "laser", "automatic_shift"}:
+            raise ValueError(
+                "Profile kind must be tone, laser, or automatic_shift"
+            )
+        field = {
+            "tone": "tone_profile_id",
+            "laser": "laser_profile_id",
+            "automatic_shift": "automatic_shift_policy_id",
+        }[kind]
+        if kind == "automatic_shift" and profile_id == "default":
+            raise ValueError("The default automatic shift policy cannot be deleted")
         referenced = []
         for document in self._trial_protocol_repository.documents:
             if any(getattr(item.row, field) == profile_id for item in document.resolve()):
@@ -4089,23 +4120,39 @@ class AppModel(ObservableObject):
                 f"Profile {profile_id!r} is used by: {', '.join(referenced)}"
             )
         tones, lasers = dict(self._tone_profiles), dict(self._laser_profiles)
-        target = tones if kind == "tone" else lasers
+        automatic_shifts = dict(self._automatic_shift_policies)
+        target = {
+            "tone": tones,
+            "laser": lasers,
+            "automatic_shift": automatic_shifts,
+        }[kind]
         if target.pop(profile_id, None) is None:
             raise KeyError(f"Unknown {kind} profile {profile_id!r}")
-        self._save_stimulus_profiles(tones, lasers)
+        self._save_stimulus_profiles(tones, lasers, automatic_shifts)
 
-    def _save_stimulus_profiles(self, tones, lasers) -> None:
+    def _save_stimulus_profiles(self, tones, lasers, automatic_shifts=None) -> None:
         library = self._stimulus_profile_repository.library
+        automatic_shifts = (
+            self._automatic_shift_policies
+            if automatic_shifts is None
+            else automatic_shifts
+        )
         saved = self._stimulus_profile_repository.save(
             StimulusProfileLibrary(
                 revision=library.revision,
                 tone_profiles=tuple(tones[key] for key in sorted(tones)),
                 laser_profiles=tuple(lasers[key] for key in sorted(lasers)),
+                automatic_shift_profiles=tuple(
+                    automatic_shifts[key] for key in sorted(automatic_shifts)
+                ),
             ),
             expected_revision=library.revision,
         )
         self._tone_profiles = {item.profile_id: item for item in saved.tone_profiles}
         self._laser_profiles = {item.profile_id: item for item in saved.laser_profiles}
+        self._automatic_shift_policies = {
+            item.policy_id: item for item in saved.automatic_shift_profiles
+        }
         self._notify_trial_protocol_state()
 
     def _selected_protocol_requires_stim_camera(self) -> bool:
@@ -4188,6 +4235,19 @@ class AppModel(ObservableObject):
                     ),
                 }
                 for profile in self._laser_profiles.values()
+            ),
+            "automatic_shift_profiles": tuple(
+                {
+                    "profile_id": profile.policy_id,
+                    "policy_id": profile.policy_id,
+                    "revision": profile.revision,
+                    "summary": (
+                        f"{profile.reduction_method.value}, "
+                        f"{','.join(sorted(profile.eligible_outcomes))}, "
+                        f"max update {profile.maximum_update_mm} mm"
+                    ),
+                }
+                for profile in self._automatic_shift_policies.values()
             ),
             "active_trial_id": active_trial_id,
             "completed_trial_ids": tuple(sorted({
@@ -4693,13 +4753,23 @@ class AppModel(ObservableObject):
             animal_base_dcs=(animal.pellet_x, animal.pellet_y, animal.pellet_z),
             lane_offsets_dcs=lane_offsets,
             automatic_target_dcs=(
-                None if automatic is None else automatic.resolved_target_dcs
+                None
+                if automatic is None or not automatic.apply_automatically
+                else automatic.resolved_target_dcs
             ),
             automatic_generation=(
                 None if automatic is None else automatic.generation
             ),
             automatic_reach_ids=(
                 () if automatic is None else automatic.reach_ids
+            ),
+            automatic_policy=(
+                None
+                if row.position_mode.value != "reach_derived_automatic"
+                else controller.policy.to_record()
+            ),
+            automatic_recommendation=(
+                None if automatic is None else automatic.to_record()
             ),
         )
         if (
@@ -4717,28 +4787,31 @@ class AppModel(ObservableObject):
         return compiler.compile(row, context)
 
     def _automatic_shift_controller(self, row):
+        base_policy = self._automatic_shift_policies.get(
+            row.automatic_shift_policy_id
+        )
+        if base_policy is None:
+            raise RuntimeError(
+                "Unknown automatic shift policy: "
+                f"{row.automatic_shift_policy_id}"
+            )
         key = (
             row.automatic_shift_policy_id,
+            base_policy.revision,
             row.automatic_window_method.value,
             row.automatic_window_size,
         )
         controller = self._automatic_protocol_shifts.get(key)
         if controller is None:
-            shift_config = (
-                self._behavior.algorithm.active_config.shift_xyz_handler.buffer
-            )
-            target = shift_config.target
-            controller = AutomaticPelletShiftController(AutomaticShiftPolicy(
-                policy_id=row.automatic_shift_policy_id,
+            controller = AutomaticPelletShiftController(dataclasses.replace(
+                base_policy,
                 window_method=row.automatic_window_method.value,
                 window_size=row.automatic_window_size,
-                target_reach_offset_dcs=tuple(target),
                 minimum_y_dcs=(
                     None
                     if self._selected_animal is None
                     else self._selected_animal.target_y_limit
                 ),
-                apply_automatically=True,
             ))
             self._automatic_protocol_shifts[key] = controller
         return controller
@@ -6791,6 +6864,10 @@ class AppModel(ObservableObject):
             self._laser_profiles = {
                 profile.profile_id: profile
                 for profile in profile_library.laser_profiles
+            }
+            self._automatic_shift_policies = {
+                profile.policy_id: profile
+                for profile in profile_library.automatic_shift_profiles
             }
         for path, error in self._trial_protocol_repository.errors.items():
             logger.error("Ordered protocol %s was not loaded: %s", path, error)

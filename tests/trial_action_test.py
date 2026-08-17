@@ -85,6 +85,30 @@ def test_automatic_warmup_uses_lane_baseline_without_manual_offset():
     assert recipe.position_evidence["automatic_status"] == "insufficient_history"
 
 
+def test_recommend_only_automatic_shift_is_retained_but_not_applied():
+    row = TrialProtocolRow(trial_id=1).with_updates({
+        "enabled": True,
+        "position_mode": "reach_derived_automatic",
+        "position_lane": "left",
+    })
+    recommendation = {
+        "generation": 2,
+        "resolved_target_dcs": [14.0, 21.0, 30.0],
+        "apply_automatically": False,
+    }
+
+    recipe = _compiler().compile(row, _context(
+        automatic_target_dcs=None,
+        automatic_generation=2,
+        automatic_policy={"policy_id": "recommend", "revision": 1},
+        automatic_recommendation=recommendation,
+    ))
+
+    assert recipe.resolved_dcs_target == (9.0, 20.0, 30.0)
+    assert recipe.position_evidence["automatic_status"] == "recommendation_only"
+    assert recipe.position_evidence["automatic_recommendation"] == recommendation
+
+
 def test_retry_repeat_keeps_draw_while_resample_changes_it():
     base = TrialProtocolRow(trial_id=1).with_updates({
         "enabled": True,

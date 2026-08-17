@@ -157,6 +157,7 @@ class ProtocolContent(ContentWidget):
         _Column("X (mm)", "shift_x_mm", "shift"),
         _Column("Y (mm)", "shift_y_mm", "shift"),
         _Column("Z (mm)", "shift_z_mm", "shift"),
+        _Column("Auto policy", "automatic_shift_policy_id", "automatic_shift_profile"),
         _Column("Auto window", "automatic_window_method", AutomaticWindowMethod),
         _Column("Window N", "automatic_window_size", "window"),
         _Column("Cover", "cover_policy", CoverPolicy),
@@ -259,6 +260,7 @@ class ProtocolContent(ContentWidget):
             ("Revert", self._reload_protocols),
             ("New tone", self._new_tone_profile),
             ("New laser", self._new_laser_profile),
+            ("New auto shift", self._new_automatic_shift_profile),
             ("Delete profile", self._delete_profile),
         ):
             button = QToolButton()
@@ -318,7 +320,9 @@ class ProtocolContent(ContentWidget):
                 delegate = _IntegerDelegate(1, 10_000, self._table)
             elif kind == "pre_reveal":
                 delegate = _IntegerDelegate(0, 60_000, self._table)
-            elif kind in {"tone_profile", "laser_profile"}:
+            elif kind in {
+                "tone_profile", "laser_profile", "automatic_shift_profile",
+            }:
                 delegate = _ProfileDelegate(self, kind, self._table)
             else:
                 delegate = _EnumDelegate(kind, self._table)
@@ -326,7 +330,11 @@ class ProtocolContent(ContentWidget):
 
     def _profile_options(self, kind):
         state = self._app_model.trial_protocol_state
-        key = "tone_profiles" if kind == "tone_profile" else "laser_profiles"
+        key = {
+            "tone_profile": "tone_profiles",
+            "laser_profile": "laser_profiles",
+            "automatic_shift_profile": "automatic_shift_profiles",
+        }[kind]
         return tuple(
             (item["profile_id"], item.get("summary", ""))
             for item in state.get(key, ())
@@ -358,6 +366,7 @@ class ProtocolContent(ContentWidget):
             "position_lane": "center",
             "automatic_window_method": "legacy_batch",
             "automatic_window_size": 15,
+            "automatic_shift_policy_id": "default",
             "tone_phase": "none",
             "laser_phase": "none",
             "laser_trigger_route": "none",
@@ -872,11 +881,99 @@ class ProtocolContent(ContentWidget):
             trigger_terminal=terminal.strip(),
         )
 
+    def _ask_xyz(self, title, label, defaults, minimum, maximum):
+        values = []
+        for axis, default in zip("XYZ", defaults):
+            value, accepted = QInputDialog.getDouble(
+                self,
+                title,
+                f"{label} {axis} (mm):",
+                float(default),
+                float(minimum),
+                float(maximum),
+                3,
+            )
+            if not accepted:
+                return None
+            values.append(value)
+        return tuple(values)
+
+    def _new_automatic_shift_profile(self):
+        policy_id, accepted = QInputDialog.getText(
+            self, "Automatic shift policy", "Policy ID:"
+        )
+        if not accepted or not policy_id.strip():
+            return
+        reduction, accepted = QInputDialog.getItem(
+            self,
+            "Automatic shift policy",
+            "Reach reduction:",
+            ("Mean", "Median"),
+            0,
+            False,
+        )
+        if not accepted:
+            return
+        eligibility, accepted = QInputDialog.getItem(
+            self,
+            "Automatic shift policy",
+            "Eligible reaches:",
+            ("Failed reaches", "Successful reaches", "Both"),
+            0,
+            False,
+        )
+        if not accepted:
+            return
+        target = self._ask_xyz(
+            "Automatic shift policy", "Desired reach offset", (1.5, -3.0, 1.0),
+            -50.0, 50.0,
+        )
+        deadbands = self._ask_xyz(
+            "Automatic shift policy", "Deadband", (0.5, 1.0, 0.5), 0.0, 50.0,
+        )
+        maximum_update = self._ask_xyz(
+            "Automatic shift policy", "Maximum update", (2.0, 2.0, 2.0),
+            0.0, 50.0,
+        )
+        maximum_absolute = self._ask_xyz(
+            "Automatic shift policy", "Maximum absolute shift", (5.0, 5.0, 5.0),
+            0.0, 50.0,
+        )
+        if None in (target, deadbands, maximum_update, maximum_absolute):
+            return
+        application, accepted = QInputDialog.getItem(
+            self,
+            "Automatic shift policy",
+            "Use recommendation:",
+            ("Apply automatically", "Recommend only"),
+            0,
+            False,
+        )
+        if not accepted:
+            return
+        eligible = {
+            "Failed reaches": frozenset({"failure"}),
+            "Successful reaches": frozenset({"success"}),
+            "Both": frozenset({"success", "failure"}),
+        }[eligibility]
+        self._run_library_action(
+            self._app_model.save_automatic_shift_policy,
+            policy_id=policy_id.strip(),
+            eligible_outcomes=eligible,
+            reduction_method=reduction.lower(),
+            target_reach_offset_dcs=target,
+            deadbands_mm=deadbands,
+            maximum_update_mm=maximum_update,
+            maximum_absolute_mm=maximum_absolute,
+            apply_automatically=application == "Apply automatically",
+        )
+
     def _delete_profile(self):
         state = self._app_model.trial_protocol_state
         choices = [
             *(f"tone: {item['profile_id']}" for item in state.get("tone_profiles", ())),
             *(f"laser: {item['profile_id']}" for item in state.get("laser_profiles", ())),
+            *(f"automatic_shift: {item['policy_id']}" for item in state.get("automatic_shift_profiles", ())),
         ]
         if not choices:
             return

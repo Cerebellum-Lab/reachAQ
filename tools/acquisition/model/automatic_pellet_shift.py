@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import enum
 import math
+import re
 import statistics
 import threading
 from collections import deque
@@ -16,12 +17,19 @@ class ShiftWindowMethod(str, enum.Enum):
     SLIDING_LAST_X = "sliding_last_x"
 
 
+class ShiftReductionMethod(str, enum.Enum):
+    MEAN = "mean"
+    MEDIAN = "median"
+
+
 @dataclasses.dataclass(frozen=True)
 class AutomaticShiftPolicy:
     policy_id: str = "default"
+    revision: int = 1
     window_method: ShiftWindowMethod = ShiftWindowMethod.LEGACY_BATCH
     window_size: int = 15
     eligible_outcomes: FrozenSet[str] = frozenset({"failure"})
+    reduction_method: ShiftReductionMethod = ShiftReductionMethod.MEAN
     target_reach_offset_dcs: Tuple[float, float, float] = (1.5, -3.0, 1.0)
     deadbands_mm: Tuple[float, float, float] = (0.5, 1.0, 0.5)
     maximum_update_mm: Tuple[float, float, float] = (2.0, 2.0, 2.0)
@@ -30,9 +38,33 @@ class AutomaticShiftPolicy:
     apply_automatically: bool = True
 
     def __post_init__(self):
+        policy_id = str(self.policy_id).strip()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", policy_id):
+            raise ValueError(
+                "Automatic shift policy ID must use lowercase letters, numbers, "
+                "underscores, or hyphens"
+            )
+        object.__setattr__(self, "policy_id", policy_id)
         object.__setattr__(self, "window_method", ShiftWindowMethod(self.window_method))
-        if not self.policy_id or not 1 <= int(self.window_size) <= 10_000:
+        object.__setattr__(
+            self, "reduction_method", ShiftReductionMethod(self.reduction_method)
+        )
+        object.__setattr__(
+            self,
+            "eligible_outcomes",
+            frozenset(str(value) for value in self.eligible_outcomes),
+        )
+        if int(self.revision) < 1:
+            raise ValueError("Automatic shift policy requires an ID and revision")
+        if not isinstance(self.apply_automatically, bool):
+            raise ValueError("apply_automatically must be true or false")
+        if not 1 <= int(self.window_size) <= 10_000:
             raise ValueError("Automatic shift policy requires an ID and window size 1..10000")
+        unknown_outcomes = self.eligible_outcomes - {"success", "failure"}
+        if not self.eligible_outcomes or unknown_outcomes:
+            raise ValueError(
+                "Automatic shift eligible outcomes must contain success and/or failure"
+            )
         for name in (
             "target_reach_offset_dcs",
             "deadbands_mm",
@@ -47,6 +79,17 @@ class AutomaticShiftPolicy:
             object.__setattr__(self, name, values)
         if self.minimum_y_dcs is not None and not math.isfinite(self.minimum_y_dcs):
             raise ValueError("minimum_y_dcs must be finite")
+
+    def to_record(self):
+        result = dataclasses.asdict(self)
+        result["window_method"] = self.window_method.value
+        result["reduction_method"] = self.reduction_method.value
+        result["eligible_outcomes"] = sorted(self.eligible_outcomes)
+        return result
+
+    @classmethod
+    def from_record(cls, record):
+        return cls(**dict(record))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -144,8 +187,13 @@ class AutomaticPelletShiftController:
                 self._buffer.clear()
             baseline = _vector(baseline_dcs, "baseline_dcs")
             prior = self._accepted_target or baseline
+            reducer = (
+                statistics.fmean
+                if self._policy.reduction_method is ShiftReductionMethod.MEAN
+                else statistics.median
+            )
             reduced = tuple(
-                statistics.fmean(item.closest_offset_dcs[axis] for item in window)
+                reducer(item.closest_offset_dcs[axis] for item in window)
                 for axis in range(3)
             )
             raw_shift = tuple(

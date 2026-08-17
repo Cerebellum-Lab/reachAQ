@@ -33,6 +33,23 @@ def test_profile_library_round_trip_and_revision(tmp_path):
     assert loaded == saved
     assert loaded.revision == 2
     assert loaded.laser_profiles[0].profile_id == "pulse-a"
+    assert loaded.automatic_shift_profiles[0].policy_id == "default"
+
+
+def test_profile_library_migrates_schema_one_with_safe_shift_policy(tmp_path):
+    path = tmp_path / "stimulus_profiles.json"
+    path.write_text(json.dumps({
+        "schema_version": 1,
+        "revision": 3,
+        "tone_profiles": [],
+        "laser_profiles": [],
+    }), encoding="utf-8")
+
+    loaded = StimulusProfileRepository(path).load()
+
+    assert loaded.schema_version == 2
+    assert loaded.revision == 3
+    assert loaded.automatic_shift_profiles[0].policy_id == "default"
 
 
 def test_profile_library_preserves_last_good_value_on_corruption(tmp_path):

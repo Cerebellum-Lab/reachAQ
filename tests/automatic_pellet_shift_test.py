@@ -67,3 +67,19 @@ def test_recommend_only_policy_does_not_change_accepted_target():
     assert result.recommended_shift_dcs != (0.0, 0.0, 0.0)
     assert controller.accept(result.generation) is None
     assert controller.accepted_target is None
+
+
+def test_median_reduction_ignores_one_extreme_reach():
+    controller = AutomaticPelletShiftController(AutomaticShiftPolicy(
+        window_size=3,
+        reduction_method="median",
+        deadbands_mm=(0.0, 0.0, 0.0),
+        maximum_update_mm=(100.0, 100.0, 100.0),
+        maximum_absolute_mm=(100.0, 100.0, 100.0),
+    ))
+
+    controller.add(_reach(1, 2.0), baseline_dcs=(0, 0, 0))
+    controller.add(_reach(2, 2.0), baseline_dcs=(0, 0, 0))
+    result = controller.add(_reach(3, 100.0), baseline_dcs=(0, 0, 0))
+
+    assert result.reduced_reach_offset_dcs[0] == 2.0

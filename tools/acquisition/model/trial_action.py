@@ -106,6 +106,8 @@ class TrialCompileContext:
     automatic_target_dcs: Optional[Tuple[float, float, float]] = None
     automatic_generation: Optional[int] = None
     automatic_reach_ids: Tuple[str, ...] = ()
+    automatic_policy: Optional[Mapping[str, object]] = None
+    automatic_recommendation: Optional[Mapping[str, object]] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -179,6 +181,16 @@ class TrialActionCompiler:
             "lane_offset_dcs": list(lane),
             "automatic_generation": context.automatic_generation,
             "automatic_reach_ids": list(context.automatic_reach_ids),
+            "automatic_policy": (
+                None
+                if context.automatic_policy is None
+                else dict(context.automatic_policy)
+            ),
+            "automatic_recommendation": (
+                None
+                if context.automatic_recommendation is None
+                else dict(context.automatic_recommendation)
+            ),
         }
         if row.position_mode is PelletPositionMode.FIXED_MANUAL:
             target = _add(baseline, (
@@ -194,8 +206,14 @@ class TrialActionCompiler:
         elif row.position_mode is PelletPositionMode.REACH_DERIVED_AUTOMATIC:
             if context.automatic_target_dcs is None:
                 target = baseline
+                recommendation = context.automatic_recommendation or {}
                 position_evidence.update(
-                    automatic_status="insufficient_history",
+                    automatic_status=(
+                        "recommendation_only"
+                        if recommendation
+                        and not recommendation.get("apply_automatically", True)
+                        else "insufficient_history"
+                    ),
                     fallback="categorical_lane_baseline",
                 )
             else:
