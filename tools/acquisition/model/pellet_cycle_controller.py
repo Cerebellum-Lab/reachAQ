@@ -374,6 +374,17 @@ class PelletCycleController:
         return updated
 
     @_controller_locked
+    def annotate_protocol_operation(self, project, operation_id, operation):
+        ledger = self._require_ledger()
+        updated = ledger.annotate_protocol_operation(operation_id, operation)
+        self._session_data_recorder.persist_trial_ledger(
+            project,
+            ledger.to_records(),
+            ledger.summary(),
+        )
+        return updated
+
+    @_controller_locked
     def finalize_intertrial_unavailable(
         self,
         project,

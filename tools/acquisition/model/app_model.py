@@ -4575,6 +4575,23 @@ class AppModel(ObservableObject):
         except RuntimeError:
             logger.info("Ignored stale protocol-operation cancellation: %s", reason)
         self._behavior.system_machine.pellet.cancel_prepared_cover_policy()
+        self._persist_protocol_operation()
+
+    def _persist_protocol_operation(self) -> None:
+        operation = self._trial_action_executor.operation
+        attempt = self._pellet_cycles.active_attempt
+        if operation is None or attempt is None or self._project_info is None:
+            return
+        if not self._trial_action_executor.matches_send_context(attempt.operation_id):
+            return
+        try:
+            self._pellet_cycles.annotate_protocol_operation(
+                self._project_info,
+                attempt.operation_id,
+                operation.to_record(),
+            )
+        except (KeyError, RuntimeError):
+            logger.exception("Could not persist prepared protocol-operation evidence")
 
     @_serialized_session_configuration
     def set_intertrial_analysis_enabled(self, enabled: bool) -> None:
@@ -8470,6 +8487,7 @@ class AppModel(ObservableObject):
                 try:
                     self._trial_action_executor.execute_phase("retract")
                     self._trial_action_executor.complete("next pellet load began")
+                    self._persist_protocol_operation()
                 except RuntimeError:
                     logger.exception("Could not finalize prepared pellet-trial operation")
             logger.warning(
@@ -8489,6 +8507,7 @@ class AppModel(ObservableObject):
             try:
                 self._trial_action_executor.execute_phase("retract")
                 self._trial_action_executor.complete("pellet cycle completed")
+                self._persist_protocol_operation()
             except RuntimeError:
                 logger.exception("Could not finalize prepared pellet-trial operation")
         self._complete_pellet_trial_window(
@@ -8756,6 +8775,7 @@ class AppModel(ObservableObject):
                     self._pellet_cycles.planned_trial_id
                 ),
             )
+            self._persist_protocol_operation()
         self._notify_trial_protocol_state()
         logger.info(
             "pellet trial attempt started: session=%s attempt=%s context=%s",
@@ -8774,6 +8794,7 @@ class AppModel(ObservableObject):
         ):
             try:
                 self._trial_action_executor.fail(RuntimeError(failure.error))
+                self._persist_protocol_operation()
             except RuntimeError:
                 logger.exception("Could not fail prepared pellet-trial operation")
         finalized = self._pellet_cycles.finalize_hardware_failure(
@@ -8803,6 +8824,7 @@ class AppModel(ObservableObject):
                 if operation is not None and operation.state is PreparedState.SEND_ACCEPTED:
                     try:
                         self._trial_action_executor.acknowledge_presentation(context)
+                        self._persist_protocol_operation()
                     except RuntimeError:
                         logger.exception("Pellet acknowledgement did not bind to prepared trial")
                 attempt = self._pellet_cycles.acknowledge_presentation(

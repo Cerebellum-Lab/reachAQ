@@ -139,6 +139,7 @@ class PelletTrialAttempt:
     planned_shift: Optional[Dict[str, float]] = None
     applied_shift: Optional[Dict[str, float]] = None
     protocol_context: Optional[Dict[str, Any]] = None
+    protocol_operation: Optional[Dict[str, Any]] = None
     reach_count: int = 0
     success_count: int = 0
     consumption_count: int = 0
@@ -534,6 +535,24 @@ class PelletTrialLedger:
             self._attempts[index] = updated
             return updated
         raise KeyError(f"Unknown trial attempt {trial_id}.{attempt_id}")
+
+    @_ledger_locked
+    def annotate_protocol_operation(
+        self,
+        operation_id: str,
+        operation: Dict[str, Any],
+    ) -> PelletTrialAttempt:
+        """Refresh requested/resolved/actual protocol evidence for an attempt."""
+        for index, attempt in enumerate(self._attempts):
+            if attempt.operation_id != str(operation_id):
+                continue
+            updated = dataclasses.replace(
+                attempt,
+                protocol_operation=dict(operation),
+            )
+            self._attempts[index] = updated
+            return updated
+        raise KeyError(f"Unknown pellet operation {operation_id}")
 
     @_ledger_locked
     def finalize_hardware_error(

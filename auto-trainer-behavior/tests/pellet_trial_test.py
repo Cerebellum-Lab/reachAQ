@@ -316,3 +316,23 @@ def test_unscored_completed_cycle_counts_without_becoming_scored():
     ledger.finalize(TrialOutcome.UNSCORED, 2.0, 12.0)
     assert ledger.count(TrialCountBasis.COMPLETED) == 1
     assert ledger.count(TrialCountBasis.SCORED) == 0
+
+
+def test_protocol_operation_evidence_can_be_refreshed_through_terminal_state():
+    ledger = PelletTrialLedger("session001")
+    attempt = ledger.begin_send(1.0, 11.0, operation_id="send-context")
+
+    updated = ledger.annotate_protocol_operation(
+        attempt.operation_id,
+        {"state": "send_accepted", "operation_id": "prepared-id"},
+    )
+    ledger.acknowledge_presentation(1.1, 11.1)
+    ledger.finalize(TrialOutcome.SUCCESS, 2.0, 12.0)
+    terminal = ledger.annotate_protocol_operation(
+        attempt.operation_id,
+        {"state": "completed", "operation_id": "prepared-id"},
+    )
+
+    assert updated.protocol_operation["state"] == "send_accepted"
+    assert terminal.protocol_operation["state"] == "completed"
+    assert ledger.to_records()[0]["protocol_operation"]["operation_id"] == "prepared-id"
