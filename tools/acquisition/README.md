@@ -358,16 +358,34 @@ controller is available in Running mode.
 
 ### Trial Protocol
 
-The **Trial Protocol** tab initially provides 15 ordered placeholder rows. Each
-row stores pellet-delivery behavior, XYZ shift, cover, tone, and laser fields.
-Future rows are editable, the active row is highlighted and locked, and
-completed rows remain locked. A hardware-error retry returns the same logical
-row to Future rather than consuming the next row.
+The **Trial Protocol** tab manages reusable, versioned ordered protocols. A
+session selects one saved revision or **No protocol**. Protocols may be shared
+by animals; an animal stores only its preferred protocol ID. New, Duplicate,
+Rename, Import, Export, and Revert operate only while session configuration is
+unlocked.
 
-The row is snapshotted into `protocol_context.trial_row` for every attempt and
-the ordered table is saved as session `protocolSchedule` metadata. The new row
-fields are currently persistence/UI placeholders: existing pellet-cycle logic
-does not yet interpret them as new delivery, tone, or laser actions.
+Each resolved row controls pellet-cycle behavior, center/left/right placement,
+base/fixed/automatic shift, cover policy, named tone and finite pulse-train
+profiles, assignment probability, trigger, and retry behavior. Values may be
+applied to one trial, arbitrary selections, epochs, blocks, or all future
+trials. Copy/fill/repeat, randomized preview, and Undo/Redo create a new saved
+revision. Future rows remain editable; an active row is highlighted and frozen;
+completed rows stay locked.
+
+Before SEND, reachAQ freezes and validates the row, resolves one absolute DCS
+and motor target, acknowledges positioning/cover actions, and pre-arms any laser
+operation. Only then may the pellet state machine queue SEND. Preparation errors
+do not create a pellet attempt. Every accepted attempt persists the requested
+row, compiled recipe, resolved target, profile revisions, action observations,
+and terminal state. Hardware-error retries reuse the logical row and absolute
+target rather than accumulating relative movement.
+
+`Pre-reveal` is a board-owned compound sequence: finite STIM3 pulse, board
+delay, pellet reveal, then the configured SEND sequence. It requires the
+Hardware STIM3 route and Reveal cover policy. First Reach uses the independently
+managed 900 Hz stim camera and either acknowledged STIM3-to-NI triggering or the
+explicit Direct NI software-start route; it never silently switches routes.
+ROI1/ROI2 remain visible, versioned, and non-runnable future framework.
 
 ### Camera Control
 

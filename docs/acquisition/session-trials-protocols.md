@@ -49,12 +49,11 @@ cycles or start recording.
 ## Ordered trial protocol editor
 
 The **Trial Protocol** tab presents one row per planned logical pellet trial.
-The initial 15 rows contain placeholder examples for pellet-delivery behavior,
-XYZ shift, cover, tone, and laser choices. These fields define the extensible
-row schema. They are currently saved and displayed but are not interpreted as
-new pellet-delivery, tone, or laser actions by the existing cycle executor;
-future execution support can consume the persisted schema without changing
-historical attribution.
+Protocols are reusable, atomically saved resources selected per session; they
+are not owned by an animal. Each row is typed and executable: pellet cycle,
+base/fixed/reach-derived position, center/left/right lane, cover policy, named
+tone, named finite laser pulse train, assignment, trigger, and retry policy.
+Malformed or unresolved rows cannot become active.
 
 Only future rows are editable. A row becomes highlighted and read-only while
 its trial is active, then remains read-only once the logical trial completes.
@@ -62,10 +61,34 @@ A motor, transport, command, or acknowledgement error does not complete or
 consume that row: under retry-within-trial accounting it returns to Future and
 the next attempt keeps the same logical trial number.
 
-Every send attempt receives an immutable copy of its row under
-`protocol_context.trial_row` in `streams/trials.jsonl`. Session JSON/YAML also
-stores the ordered `protocolSchedule`, so later edits cannot change the settings
-attributed to an already recorded attempt.
+Before SEND, the action executor reserves the future row and freezes its protocol
+revision, resolves the animal base/lane/shift to one absolute DCS target and one
+motor target, waits for motor and cover acknowledgements, and arms any laser
+task. A failure here is persisted as a preparation error but creates no pellet
+attempt. SEND acceptance creates the physical attempt and binds its CAN context.
+
+Every send attempt receives the immutable row, compiled recipe, resolved target,
+stimulus draw, profile revisions, and action lifecycle in `streams/trials.jsonl`.
+Session JSON/YAML stores both the compact authoring hierarchy and expanded
+schedule. Later edits cannot change an active/completed attempt.
+
+Authoring precedence is protocol defaults, epoch, block, bulk selection, then
+individual trial. Epochs may be noncontiguous but cannot overlap; blocks are
+ordered, nonoverlapping subsets of one epoch. The editor provides multi-row
+selection, fill/repeat, copy/paste, randomized preview, and revision Undo/Redo.
+
+Automatic positioning is mutually exclusive with fixed XYZ. `Legacy batch`
+matches the retained nonoverlapping autotrainer window; `Sliding last X`
+recomputes after every eligible reach once X results exist. Both use the retained
+diamond/triangle coordinate owner and resolve an absolute target, so retries
+cannot move twice. Before X reaches, the calibrated lane baseline is retained.
+
+Tone phases are Before SEND, Embedded in board sequence, Pellet presentation,
+and Retract. Laser recipes freeze either Hardware STIM3 or Direct NI software
+start. Scheduled pre-reveal stimulation is emitted and delayed by the pellet
+board before cover release; Direct NI is rejected for that phase. First Reach
+uses the 900 Hz stim-camera transition detector, not pose inference. ROI1/ROI2
+remain schema/UI framework only and are rejected as runnable.
 
 Subject selection is locked from session Arming through analysis. Session Notes
 are saved when Stop closes the writers but remain editable afterward; subsequent

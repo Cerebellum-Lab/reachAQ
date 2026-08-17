@@ -73,8 +73,8 @@ recording-based protocol progress, and removes day/lifetime count fields.
 Subject and protocol selection are locked from Arming through analysis, while
 Notes remains editable. Stop writes the current Notes value; later edits update
 the stopped session's JSON/YAML metadata atomically until the next Record clears
-the field. The ordered Trial Protocol table, row locking, and placeholder-field
-scope are defined in
+the field. The ordered Trial Protocol authoring, row locking, execution, and
+evidence contracts are defined in
 [Recording sessions, pellet trials, protocols, and schema migration](session-trials-protocols.md).
 
 The load-cell acquisition, tare, configuration, UI, and automatic recording
@@ -511,15 +511,18 @@ The optional timing master is a device/task role, not a channel flag. Automatic
 selection prefers the device owning the canonical sampled inputs, including
 `cam_frames` and analog inputs. With one sampled device, no slave topology is
 created. With multiple synchronized devices, slave tasks are armed before the
-master and the resolved topology is written to session metadata.
+master and the resolved topology is written to session metadata. One or two
+active NI devices are supported in the first release; an AO laser card counts.
+Three or more fail preflight with an actionable error.
 
 For compatible PXI cards, the plan uses `PXI_CLK10` as the shared reference, a
-shared backplane start trigger, and a routed master sample clock. A future
-hardware-timed laser AO task is supported as a synchronized slave: common
-reference when available, shared start trigger, sample-clock route when
-required, and slave-before-master task ordering. The present laser output mode
-remains on-demand unless `laser.hardwareTimed` is explicitly enabled and the
-discovered hardware supports the requested topology.
+shared backplane start trigger, and a routed master sample clock. A finite
+hardware-timed laser AO task can be prepared as a synchronized slave: common
+reference when available, verified sample/start route, prewritten waveform, and
+future trial-local trigger. Nonblocking handles own Prepared/Armed/Triggered/
+Completed/Failed/Cancelled state, resource exclusion, timeout, safe-voltage
+reset, and PMT pulse-train lead/lag. Calibration ramps still reject nonzero PMT
+delay.
 
 No card model, PXI slot, alias, or route is a universal default. The current rig
 uses a PXI-6221 input device as the natural acquisition master and a PXI-6713
@@ -532,6 +535,23 @@ the actual clock producer, consumers, start/reference/sample routes, and output
 tasks. Hardware-timed finite laser output is synchronized only when its task
 applies that descriptor and is armed before the master. On-demand laser pulses
 remain explicitly independent.
+
+`taskStrategy` defaults to auditable per-device tasks. `auto_multidevice` first
+constructs and Verify/Commits the exact combined disposable task. Success uses
+that expanded task; rejection constructs and Verify/Commits the per-device graph
+and records `fallback_per_device`. `forced_multidevice` fails instead of falling
+back. Long-lived tasks independently recreate the selected verified graph.
+
+Input reads use preallocated NI stream-reader buffers. An all-task availability
+barrier requires the common chunk before copying, then verifies equal counts and
+publishes one shared sample-index block. Wait/read durations, short reads, gaps,
+overruns, and the exact task graph are persisted for diagnosis.
+
+The stim camera has one frozen mode per session. Any selected row requiring
+First Reach uses cropped 900 Hz detection/evidence mode: no continuous stim
+video, batched HDF5 evidence for every acquired frame, decimated bounded preview,
+and 0.5 s pre/post clips around emitted triggers. Otherwise it is a full-frame
+150 Hz synchronized camera recorded continuously with the behavioral group.
 
 ## Storage, discovery, and safe hardware boundaries
 

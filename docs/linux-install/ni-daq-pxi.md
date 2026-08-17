@@ -199,6 +199,7 @@ timing: !NidaqTimingConfiguration
   syncMode: auto
   timingMaster: null
   requireHardwareSynchronization: true
+  taskStrategy: per_device
   referenceClockSource: null
   startTriggerSource: null
   sampleClockSource: null
@@ -213,9 +214,17 @@ is required and blocks aligned recording across multiple devices.
 The optional master is a device/task role, not a port flag. Automatic selection
 prefers the device that owns the canonical sampled inputs. On compatible PXI
 hardware, reachAQ uses `PXI_CLK10`, a shared start trigger, and a routed master
-sample clock; slave tasks arm before the master. The same plan supports a future
-hardware-timed laser AO slave. Do not copy the current rig's slot names or routes
-to another rig without discovery and validation.
+sample clock; slave tasks arm before the master. Finite hardware-timed laser AO
+uses the same verified reference/clock graph plus a trial-local future trigger.
+Do not copy the current rig's slot names or routes to another rig without
+discovery and validation.
+
+First-release graphs contain at most two active devices across PXI, PCIe, or a
+properly wired mixed topology. Use `per_device` normally. `auto_multidevice`
+tries the exact disposable channel-expansion task and uses it only after DAQmx
+Verify/Commit; unsupported expansion falls back to the independently verified
+per-device graph. `forced_multidevice` turns that rejection into a startup
+failure. Three-card configurations are rejected rather than labeled supported.
 
 Requested and resolved timing, device identities, task ordering, routes, and
 synchronization quality are saved in each trial's
