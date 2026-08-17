@@ -314,6 +314,18 @@ class EmulationInterface(DeviceInterface):
             self._messages.append(Acknowledge(uuid=EmulationInterface.next_uuid()))
         return self._is_open
 
+    def pulse_digital_output(self, gpio: DigitalOutputs, duration_us: int) -> bool:
+        """Emulate the firmware-owned finite STIM3 pulse acknowledgement."""
+        if DigitalOutputs(gpio) is not DigitalOutputs.STIMULUS_4:
+            raise ValueError("Finite pulse output currently supports STIM3 only")
+        duration_us = int(duration_us)
+        if not 100 <= duration_us <= 5_000_000:
+            raise ValueError("STIM3 pulse duration must be within 100 us..5 s")
+        if self._is_open:
+            logger.info("Pulse digital output %s for %s us", int(gpio.value), duration_us)
+            self._messages.append(Acknowledge(uuid=EmulationInterface.next_uuid()))
+        return self._is_open
+
     def set_analog_output(self, channel: AnalogOutputs, millivolts: int) -> bool:
         if self._is_open:
             logger.info(f"Set analog output {int(channel.value)} -> {millivolts}")

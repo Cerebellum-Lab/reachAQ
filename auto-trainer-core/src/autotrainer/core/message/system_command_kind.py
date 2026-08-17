@@ -57,3 +57,4 @@ class SystemCommandKind(IntEnum):
     SET_RGB_LED = 302
     SET_DIGITAL_OUTPUT = 303
     SET_ANALOG_OUTPUT = 304
+    PULSE_DIGITAL_OUTPUT = 305

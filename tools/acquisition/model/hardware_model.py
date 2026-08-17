@@ -419,6 +419,14 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         duration_ms = int(duration * 1000)
         return self._send_with_token(self._device_conn, SystemCommandKind.PLAY_TONE, (frequency, duration_ms))
 
+    def pulse_stim3(self, duration_us: int) -> Optional[UUID]:
+        """Pulse physical pellet-board STIM3 (logical stimulus output 4)."""
+        return self._send_with_token(
+            self._device_conn,
+            SystemCommandKind.PULSE_DIGITAL_OUTPUT,
+            (4, int(duration_us)),
+        )
+
     def delay(self, amount: float) -> Optional[UUID]:
         return self._send_with_token(self._device_conn, SystemCommandKind.DELAY, amount)
 

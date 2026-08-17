@@ -54,6 +54,7 @@ class LaserPulseProfile:
     pmt_close_lag_ms: float = 0.0
     trigger_route: LaserTriggerRoute = LaserTriggerRoute.HARDWARE_STIM3
     trigger_terminal: str = ""
+    trigger_pulse_us: int = 1000
 
     def __post_init__(self):
         object.__setattr__(self, "trigger_route", LaserTriggerRoute(self.trigger_route))
@@ -71,6 +72,8 @@ class LaserPulseProfile:
             raise ValueError("Laser profile values must be finite")
         if self.pulse_duration_ms <= 0 or self.pulse_count < 1:
             raise ValueError("Laser pulse duration/count must be positive")
+        if not 100 <= int(self.trigger_pulse_us) <= 5_000_000:
+            raise ValueError("STIM3 trigger pulse must be within 100 us..5 s")
         if any(value < 0 for value in numeric[2:]):
             raise ValueError("Laser timing margins cannot be negative")
         if self.pulse_count > 1 and (self.frequency_hz is None or self.frequency_hz <= 0):
@@ -344,6 +347,9 @@ class TrialActionExecutor:
         cancel_laser: Callable[[object], None],
         prepare_detector: Callable[[CompiledTrialRecipe], object] = lambda _recipe: None,
         cancel_detector: Callable[[object], None] = lambda _handle: None,
+        trigger_hardware_stimulus: Callable[
+            [LaserPulseProfile, CompiledTrialRecipe, str], object
+        ] = lambda _profile, _recipe, _detail: None,
     ):
         self._move_absolute = move_absolute
         self._configure_cover = configure_cover
@@ -352,6 +358,7 @@ class TrialActionExecutor:
         self._cancel_laser = cancel_laser
         self._prepare_detector = prepare_detector
         self._cancel_detector = cancel_detector
+        self._trigger_hardware_stimulus = trigger_hardware_stimulus
         self._lock = threading.RLock()
         self._operation: Optional[PreparedTrialOperation] = None
         self._laser_handle = None
@@ -457,8 +464,17 @@ class TrialActionExecutor:
         with self._lock:
             operation = self._require_operation(operation_id)
             operation.require_generation(generation)
-            self._trigger_laser_if_direct(detail)
-            self._observe(f"{detail} direct NI trigger accepted")
+            profile = operation.recipe.laser_profile
+            if profile is None:
+                raise RuntimeError("Stimulus trigger has no prepared laser profile")
+            if profile.trigger_route is LaserTriggerRoute.DIRECT_NI_SOFTWARE:
+                self._trigger_laser_if_direct(detail)
+                self._observe(f"{detail} direct NI trigger accepted")
+            elif profile.trigger_route is LaserTriggerRoute.HARDWARE_STIM3:
+                self._trigger_hardware_stimulus(profile, operation.recipe, detail)
+                self._observe(f"{detail} firmware STIM3 trigger acknowledged")
+            else:
+                raise RuntimeError(f"Unsupported stimulus route: {profile.trigger_route}")
 
     def _trigger_laser_if_direct(self, detail):
         operation = self._require_current()

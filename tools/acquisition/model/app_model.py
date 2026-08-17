@@ -690,6 +690,7 @@ class AppModel(ObservableObject):
             cancel_laser=self._cancel_protocol_laser,
             prepare_detector=self._prepare_protocol_stim_detector,
             cancel_detector=self._cancel_protocol_stim_detector,
+            trigger_hardware_stimulus=self._trigger_protocol_stim3,
         )
         self._live_tracking = LiveTrackingBuffer()
         self._intertrial_analysis = IntertrialAnalysisCoordinator(
@@ -4682,6 +4683,13 @@ class AppModel(ObservableObject):
     def _cancel_protocol_stim_detector(self, handle) -> None:
         if self._stim_camera is not None:
             self._stim_camera.disarm_stim_detector(handle.get("operation_id"))
+
+    def _trigger_protocol_stim3(self, profile, recipe, detail) -> None:
+        token = self._hardware.pulse_stim3(profile.trigger_pulse_us)
+        if token is None:
+            raise RuntimeError("Firmware STIM3 pulse was not queued")
+        timeout = max(3.0, profile.trigger_pulse_us / 1e6 + 2.0)
+        self._hardware.wait_pending_command_acked(token, timeout=timeout)
 
     def _on_stim_camera_trigger(self, camera_index, decision) -> None:
         """Accept only the detector decision owned by the current attempt."""

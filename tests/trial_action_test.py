@@ -191,6 +191,34 @@ def test_executor_preparation_failure_cancels_laser_and_creates_no_send():
         executor.require_send_permission(recipe.operation_id, 4)
 
 
+def test_executor_routes_hardware_stimulus_through_firmware_callback():
+    calls = []
+    row = TrialProtocolRow(trial_id=1).with_updates({
+        "enabled": True,
+        "laser_profile_id": "pulse",
+        "laser_phase": "first_reach",
+        "laser_trigger_route": "hardware_stim3",
+        "stimulus_assignment": "always",
+        "stimulus_trigger": "first_reach",
+    })
+    recipe = _compiler().compile(row, _context())
+    executor = TrialActionExecutor(
+        move_absolute=lambda target: None,
+        configure_cover=lambda policy: None,
+        play_tone=lambda profile, phase: None,
+        prepare_laser=lambda profile, recipe: object(),
+        cancel_laser=lambda handle: None,
+        trigger_hardware_stimulus=lambda profile, recipe, detail: calls.append(
+            (profile.trigger_pulse_us, recipe.operation_id, detail)
+        ),
+    )
+
+    executor.prepare(recipe)
+    executor.trigger_stimulus(recipe.operation_id, 4, detail="frame 7")
+
+    assert calls == [(1000, recipe.operation_id, "frame 7")]
+
+
 def test_embedded_tone_is_prepared_without_host_playback():
     calls = []
     row = TrialProtocolRow(trial_id=1).with_updates({

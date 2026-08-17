@@ -422,6 +422,11 @@ class CanDevice(Device):
             SystemCommandKind.SET_DIGITAL_OUTPUT:
                 lambda data: self._interface.set_digital_output(DigitalOutputs(data[0]), data[1]),
 
+            SystemCommandKind.PULSE_DIGITAL_OUTPUT:
+                lambda data: self._interface.pulse_digital_output(
+                    DigitalOutputs(data[0]), data[1],
+                ),
+
             SystemCommandKind.SET_ANALOG_OUTPUT:
                 lambda data: self._interface.set_analog_output(AnalogOutputs(data[0]), data[1]),
 
@@ -1156,6 +1161,7 @@ class CanDevice(Device):
             return self._find_command_next_board_target(kind, data)
         elif kind in {
             SystemCommandKind.SET_DIGITAL_OUTPUT,
+            SystemCommandKind.PULSE_DIGITAL_OUTPUT,
             SystemCommandKind.SET_ANALOG_OUTPUT,
             SystemCommandKind.SET_RGB_LED,
             SystemCommandKind.MOVE_X,

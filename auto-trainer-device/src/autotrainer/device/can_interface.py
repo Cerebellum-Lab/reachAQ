@@ -1552,6 +1552,25 @@ class CanInterface(DeviceInterface):
                 break
         return rc == 0
 
+    def pulse_digital_output(
+        self,
+        gpio: DigitalOutputs,
+        duration_us: int,
+    ) -> bool:
+        """Request the firmware-owned, guaranteed-return-low STIM3 pulse."""
+        if DigitalOutputs(gpio) is not DigitalOutputs.STIMULUS_4:
+            raise ValueError("Finite pulse output currently supports STIM3 only")
+        duration_us = int(duration_us)
+        if not 100 <= duration_us <= 5_000_000:
+            raise ValueError("STIM3 pulse duration must be within 100 us..5 s")
+        pulse = getattr(self._jc, "GPIOPulse", None)
+        if pulse is None:
+            raise RuntimeError("Pellet firmware/transport does not support finite GPIO pulse")
+        addr = self._tgt2addr(Target.PELLET_DEVICE)
+        uuid = CanInterface.next_uuid()
+        # Physical STIM3 = the fourth logical stimulus output = GPIO 0:7.
+        return pulse(addr, 0, 7, duration_us, uuid) == 0
+
     def request_capabilities(self) -> bool:
         request = getattr(self._jc, "RequestCapabilities", None)
         if request is None or self.pellet_address is None:
