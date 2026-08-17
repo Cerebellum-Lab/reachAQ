@@ -342,15 +342,20 @@ class TrialActionExecutor:
         play_tone: Callable[[ToneProfile, str], object],
         prepare_laser: Callable[[LaserPulseProfile, CompiledTrialRecipe], object],
         cancel_laser: Callable[[object], None],
+        prepare_detector: Callable[[CompiledTrialRecipe], object] = lambda _recipe: None,
+        cancel_detector: Callable[[object], None] = lambda _handle: None,
     ):
         self._move_absolute = move_absolute
         self._configure_cover = configure_cover
         self._play_tone = play_tone
         self._prepare_laser = prepare_laser
         self._cancel_laser = cancel_laser
+        self._prepare_detector = prepare_detector
+        self._cancel_detector = cancel_detector
         self._lock = threading.RLock()
         self._operation: Optional[PreparedTrialOperation] = None
         self._laser_handle = None
+        self._detector_handle = None
         self._send_context: Optional[str] = None
 
     @property
@@ -371,6 +376,7 @@ class TrialActionExecutor:
                 raise RuntimeError("Another pellet-trial operation is still active")
             operation = self._operation = PreparedTrialOperation(recipe)
             self._laser_handle = None
+            self._detector_handle = None
             self._send_context = None
         try:
             self._move_absolute(recipe.resolved_motor_target)
@@ -393,6 +399,9 @@ class TrialActionExecutor:
                 )
                 if row["laser_phase"] == "before_send":
                     self._trigger_laser_if_direct("before_send")
+            if recipe.stimulus_selected and row["stimulus_trigger"] == "first_reach":
+                self._detector_handle = self._prepare_detector(recipe)
+                self._observe("stim-camera First Reach detector armed")
             operation.transition(PreparedState.PREPARED)
             return operation
         except Exception as error:
@@ -469,12 +478,14 @@ class TrialActionExecutor:
                 operation.transition(PreparedState.ACTIVE, "cycle completion")
             operation.transition(PreparedState.COMPLETED, detail)
             self._laser_handle = None
+            self._cancel_detector_safely()
             return operation
 
     def fail(self, error):
         with self._lock:
             operation = self._require_current()
             self._cancel_laser_safely()
+            self._cancel_detector_safely()
             if operation.state not in PreparedTrialOperation.TERMINAL:
                 operation.transition(
                     PreparedState.FAILED,
@@ -490,6 +501,7 @@ class TrialActionExecutor:
             if generation is not None:
                 operation.require_generation(generation)
             self._cancel_laser_safely()
+            self._cancel_detector_safely()
             if operation.state not in PreparedTrialOperation.TERMINAL:
                 operation.transition(PreparedState.CANCELLED, reason)
             return operation
@@ -505,6 +517,11 @@ class TrialActionExecutor:
         handle, self._laser_handle = self._laser_handle, None
         if handle is not None:
             self._cancel_laser(handle)
+
+    def _cancel_detector_safely(self):
+        handle, self._detector_handle = self._detector_handle, None
+        if handle is not None:
+            self._cancel_detector(handle)
 
     def _require_operation(self, operation_id):
         operation = self._require_current()

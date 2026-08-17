@@ -97,6 +97,29 @@ def test_device_event_does_not_serialize_container_index_method():
         recorder.close()
 
 
+def test_external_process_event_retains_acquisition_timestamp_and_frame_id():
+    laser = _EventSource("trace_received")
+    recorder = SessionDataRecorder(object(), laser)
+    recorder._armed = True
+    recorder._start_perf = 10.0
+    recorder._start_wall = 100.0
+    recorder._event_capture_enabled = True
+    try:
+        assert recorder.capture_external_event(
+            "stimCameraFirstReach",
+            {"stim_frame_id": 42},
+            perf_time=10.25,
+            event_index=42,
+            timestamp_method="stim_camera_acquired_frame_perf_time",
+        )
+        row = recorder._event_queue.get_nowait()
+        assert row[:5] == (10.25, 100.25, "stimCameraFirstReach", None, 42)
+        assert json.loads(row[5]) == {"stim_frame_id": 42}
+        assert row[6] == "stim_camera_acquired_frame_perf_time"
+    finally:
+        recorder.close()
+
+
 def test_pellet_stimulus_lines_are_labeled_for_tone_confirmation():
     laser = _EventSource("trace_received")
     recorder = SessionDataRecorder(object(), laser)

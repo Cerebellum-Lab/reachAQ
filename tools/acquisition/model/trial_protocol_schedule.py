@@ -290,11 +290,22 @@ class TrialProtocolRow:
                 raise ValueError("Disabled stimulus assignment cannot have a trigger")
         elif self.stimulus_trigger is StimulusTrigger.NONE:
             raise ValueError("Enabled stimulus assignment requires a trigger")
+        if (
+            runnable
+            and self.stimulus_trigger
+            in {StimulusTrigger.ROI_1, StimulusTrigger.ROI_2}
+        ):
+            raise ValueError("ROI1/ROI2 triggers are reserved for a future release")
+        if (
+            runnable
+            and
+            self.stimulus_assignment is not StimulusAssignment.DISABLED
+            and not self.laser_profile_id
+        ):
+            raise ValueError("Enabled stimulation requires a laser profile")
         if runnable:
             if not self.enabled:
                 raise ValueError("Protocol row is disabled")
-            if self.stimulus_trigger in {StimulusTrigger.ROI_1, StimulusTrigger.ROI_2}:
-                raise ValueError("ROI1/ROI2 triggers are reserved for a future release")
 
     def to_record(self) -> dict:
         result = {}

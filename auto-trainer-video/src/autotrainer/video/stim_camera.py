@@ -212,6 +212,7 @@ class StimEvidenceWriter:
         self._drops = 0
         self._clip_drops = 0
         self._clips_written = 0
+        self._rows_written = 0
         self._high_water = 0
         self._write_latency_max = 0.0
         self._thread = threading.Thread(target=self._run, name="StimEvidenceWriter", daemon=True)
@@ -223,6 +224,7 @@ class StimEvidenceWriter:
             "dropped_batches": self._drops,
             "dropped_clips": self._clip_drops,
             "clips_written": self._clips_written,
+            "rows_written": self._rows_written,
             "queue_high_water": self._high_water,
             "write_latency_max_seconds": self._write_latency_max,
         }
@@ -263,11 +265,18 @@ class StimEvidenceWriter:
                 f"batches={self._drops} clips={self._clip_drops}"
             )
 
-    def queue_clip(self, decision: StimTriggerDecision, frames) -> bool:
+    def queue_clip(
+        self,
+        decision: StimTriggerDecision,
+        frames,
+        *,
+        complete: bool = True,
+    ) -> bool:
         """Queue one bounded clip without performing file I/O on capture."""
         payload = {
             "decision": decision.to_record(),
             "frames": tuple(frames),
+            "complete": bool(complete),
         }
         try:
             self._queue.put_nowait(("clip", payload))
@@ -313,6 +322,7 @@ class StimEvidenceWriter:
                     dataset.resize((count + len(batch),))
                     dataset[count:count + len(batch)] = batch
                     count += len(batch)
+                    self._rows_written = count
                 elif kind == "clip":
                     self._write_clip(store, payload)
                 else:
@@ -327,6 +337,7 @@ class StimEvidenceWriter:
         decision = payload["decision"]
         group = store.require_group("clips").create_group(decision["operation_id"])
         group.attrs["decision"] = json.dumps(decision, sort_keys=True)
+        group.attrs["complete"] = payload["complete"]
         frames = payload["frames"]
         group.create_dataset(
             "frame_id", data=numpy.asarray([item[0] for item in frames], dtype="<i8"),

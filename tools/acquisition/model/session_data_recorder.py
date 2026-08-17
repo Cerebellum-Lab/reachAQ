@@ -450,6 +450,42 @@ class SessionDataRecorder:
                 "diagnostics": combined_diagnostics,
             }
 
+    def capture_external_event(
+        self,
+        kind: str,
+        payload,
+        *,
+        perf_time: float,
+        timestamp_method: str,
+        event_index: Optional[int] = None,
+    ) -> bool:
+        """Capture a precisely timestamped process event without dispatcher delay."""
+        with self._event_capture_lock:
+            if not self._event_capture_enabled:
+                return False
+            with self._lock:
+                start_perf = self._start_perf
+                start_wall = self._start_wall
+            wall_time = (
+                time.time()
+                if start_perf is None or start_wall is None
+                else float(start_wall) + (float(perf_time) - float(start_perf))
+            )
+            try:
+                self._event_queue.put_nowait((
+                    float(perf_time),
+                    float(wall_time),
+                    str(kind),
+                    None,
+                    event_index,
+                    self._payload_json(payload),
+                    str(timestamp_method),
+                ))
+            except Full:
+                self._structured_event_overruns += 1
+                return False
+            return True
+
     def set_trial_ledger(self, records, summary) -> None:
         """Snapshot the authoritative trial ledger for the current session."""
         with self._lock:

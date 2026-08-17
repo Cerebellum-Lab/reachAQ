@@ -989,6 +989,11 @@ class VideoCapture(Process):
         writer, self._stim_evidence_writer = self._stim_evidence_writer, None
         if writer is None:
             return
+        pending, self._stim_pending_clip = self._stim_pending_clip, None
+        if pending is not None:
+            writer.queue_clip(
+                pending["decision"], pending["frames"], complete=False,
+            )
         error = ""
         try:
             writer.close()
@@ -998,7 +1003,17 @@ class VideoCapture(Process):
         if self._attrs.msg_queue is not None:
             self._attrs.msg_queue.put((
                 SystemStatusMessageKind.STIM_CAMERA_EVIDENCE_STATUS,
-                (self._camera_idx, writer.path.as_posix(), writer.diagnostics, error),
+                (
+                    self._camera_idx,
+                    writer.path.as_posix(),
+                    writer.diagnostics,
+                    error,
+                    (
+                        None
+                        if self._attrs.record_generation is None
+                        else int(self._attrs.record_generation.value)
+                    ),
+                ),
             ))
 
     def _process_stim_frame(

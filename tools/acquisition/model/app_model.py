@@ -17,6 +17,7 @@ import subprocess
 import threading
 import sys
 import time
+import uuid
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
@@ -687,6 +688,8 @@ class AppModel(ObservableObject):
             play_tone=self._play_protocol_tone,
             prepare_laser=self._prepare_protocol_laser,
             cancel_laser=self._cancel_protocol_laser,
+            prepare_detector=self._prepare_protocol_stim_detector,
+            cancel_detector=self._cancel_protocol_stim_detector,
         )
         self._live_tracking = LiveTrackingBuffer()
         self._intertrial_analysis = IntertrialAnalysisCoordinator(
@@ -1338,6 +1341,18 @@ class AppModel(ObservableObject):
                 "kind": "decoded_can_and_device_events",
                 "path": "streams/device.csv",
                 "runtimeState": runtime_state(SubsystemId.CAN_PELLET),
+            })
+        if (
+            self._stim_camera is not None
+            and self._stim_camera._stim_detection_configuration is not None
+        ):
+            sources.append({
+                "id": "stim_camera_evidence",
+                "kind": "stim_camera_detection_evidence",
+                "path": "streams/stim_camera_evidence.h5",
+                "runtimeState": runtime_state(
+                    SubsystemId.camera(self._stim_camera.name)
+                ),
             })
         if self._laser.configuration.backend != "disabled":
             sources.append({
@@ -2330,6 +2345,14 @@ class AppModel(ObservableObject):
                                 project,
                                 token=session_token,
                             )
+        elif cmd == SystemStatusMessageKind.STIM_CAMERA_TRIGGER:
+            cam_idx, decision = args
+            self._on_stim_camera_trigger(cam_idx, decision)
+        elif cmd == SystemStatusMessageKind.STIM_CAMERA_EVIDENCE_STATUS:
+            cam_idx, path, diagnostics, error, message_generation = args
+            self._on_stim_camera_evidence_status(
+                cam_idx, path, diagnostics, error, message_generation,
+            )
         else:
             logger.warning("unhandled command: %s raw=%s", cmd, raw)
 
@@ -4637,6 +4660,114 @@ class AppModel(ObservableObject):
         if prepare is None:
             raise RuntimeError("Asynchronous protocol laser preparation is unavailable")
         return prepare(profile, recipe)
+
+    def _prepare_protocol_stim_detector(self, recipe):
+        camera = self._stim_camera
+        if camera is None or not camera.is_enabled:
+            raise RuntimeError("First Reach requires the enabled stimCam")
+        if camera._stim_detection_configuration is None:
+            raise RuntimeError(
+                "First Reach requires stimCam stimulation mode at 900 Hz"
+            )
+        handle = {
+            "session_generation": recipe.session_generation,
+            "operation_id": recipe.operation_id,
+            "logical_trial_id": recipe.logical_trial_id,
+            "attempt_id": recipe.attempt_id,
+            "nonce": uuid.uuid4().hex,
+        }
+        camera.arm_stim_detector(handle)
+        return handle
+
+    def _cancel_protocol_stim_detector(self, handle) -> None:
+        if self._stim_camera is not None:
+            self._stim_camera.disarm_stim_detector(handle.get("operation_id"))
+
+    def _on_stim_camera_trigger(self, camera_index, decision) -> None:
+        """Accept only the detector decision owned by the current attempt."""
+        camera = self._stim_camera
+        token = self._recording_session.token()
+        operation = self._trial_action_executor.operation
+        if (
+            camera is None
+            or int(camera_index) != camera.camera_index
+            or token is None
+            or self._recording_session.status is not SessionRecordingStatus.RECORDING
+            or operation is None
+        ):
+            logger.warning("Ignoring unowned stim-camera trigger: %s", decision)
+            return
+        try:
+            operation_id = str(decision["operation_id"])
+            generation = int(decision["session_generation"])
+            if generation != token.generation:
+                raise RuntimeError("stim trigger belongs to a stale session generation")
+            if operation.recipe.operation_id != operation_id:
+                raise RuntimeError("stim trigger belongs to a stale trial operation")
+            if operation.state is not PreparedState.ACTIVE:
+                raise RuntimeError(
+                    "stim trigger requires active pellet attempt, found "
+                    f"{operation.state.value}"
+                )
+            payload = dict(decision)
+            captured = self._session_data_recorder.capture_external_event(
+                "stimCameraFirstReach",
+                payload,
+                perf_time=float(payload["frame_perf_time"]),
+                event_index=int(payload["stim_frame_id"]),
+                timestamp_method="stim_camera_acquired_frame_perf_time",
+            )
+            if not captured:
+                raise RuntimeError("stim trigger could not enter the session event ledger")
+            self._trial_action_executor.trigger_stimulus(
+                operation_id,
+                generation,
+                detail=f"stim-camera frame {payload['stim_frame_id']}",
+            )
+            self._persist_protocol_operation()
+        except Exception as error:
+            logger.exception("Stim-camera trigger rejected: %s", error)
+            try:
+                self._trial_action_executor.fail(error)
+                self._persist_protocol_operation()
+            except Exception:
+                logger.exception("Could not fail the rejected stim operation")
+
+    def _on_stim_camera_evidence_status(
+        self,
+        camera_index,
+        path,
+        diagnostics,
+        error,
+        message_generation,
+    ) -> None:
+        camera = self._stim_camera
+        token = self._recording_session.token()
+        if (
+            camera is None
+            or int(camera_index) != camera.camera_index
+            or token is None
+            or message_generation != token.generation
+        ):
+            logger.warning(
+                "Ignoring stale stim evidence status: camera=%s generation=%s active=%s",
+                camera_index, message_generation, token,
+            )
+            return
+        session_dir = Path(self._project_info.get_session_path().location)
+        evidence_path = Path(path)
+        try:
+            relative_path = evidence_path.relative_to(session_dir).as_posix()
+        except ValueError:
+            relative_path = "streams/stim_camera_evidence.h5"
+            error = str(error or f"evidence path escaped session directory: {path}")
+        self._session_data_recorder.set_source_result(
+            "stim_camera_evidence",
+            sample_count=int(diagnostics.get("rows_written", 0)),
+            path=relative_path,
+            failure=str(error or ""),
+            diagnostics=dict(diagnostics),
+        )
 
     @staticmethod
     def _cancel_protocol_laser(handle) -> None:
