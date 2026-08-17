@@ -3,6 +3,7 @@ from autotrainer.core import (
     NidaqSignalChannelConfiguration,
     NidaqSignalStreamConfiguration,
     NidaqTimingConfiguration,
+    NidaqTimingRoute,
 )
 from tools.acquisition.model.nidaq_discovery import NidaqDevicePorts
 from tools.acquisition.model.nidaq_timing import build_nidaq_timing_plan
@@ -178,6 +179,47 @@ def test_non_pxi_multi_device_requires_explicit_external_routes():
     assert not unavailable.is_valid
     assert external.is_valid
     assert external.resolved_mode == "external"
+    assert {task.task_id for task in external.task_graph.tasks} == {
+        "DevA.ai", "DevB.ai",
+    }
+
+
+def test_first_release_rejects_three_active_nidaq_devices():
+    configuration = _stream(
+        ("one", "DevA/ai0", "analog"),
+        ("two", "DevB/ai0", "analog"),
+        ("three", "DevC/ai0", "analog"),
+    )
+    plan = build_nidaq_timing_plan(
+        configuration,
+        NidaqTimingConfiguration(sync_mode="independent", require_hardware_synchronization=False),
+        (NidaqDevicePorts(name="DevA"), NidaqDevicePorts(name="DevB"), NidaqDevicePorts(name="DevC")),
+    )
+    assert not plan.is_valid
+    assert "at most two" in plan.reason
+
+
+def test_timing_graph_retains_explicit_routes_and_strategy():
+    configuration = _stream(
+        ("first", "DevA/ai0", "analog"),
+        ("second", "DevB/ai0", "analog"),
+    )
+    route = NidaqTimingRoute("sample_clock", "/DevA/PFI0", ("/DevB/PFI0",))
+    timing = NidaqTimingConfiguration(
+        sync_mode="external",
+        sample_clock_source="/DevA/PFI0",
+        start_trigger_source="/DevA/PFI1",
+        external_routes=(route,),
+        task_strategy="auto_multidevice",
+    )
+    plan = build_nidaq_timing_plan(
+        configuration,
+        timing,
+        (NidaqDevicePorts(name="DevA"), NidaqDevicePorts(name="DevB")),
+    )
+    assert plan.task_graph.strategy == "auto_multidevice"
+    assert route in plan.task_graph.routes
+    assert plan.multidevice_probe_status == "pending_exact_probe"
 
 
 def test_independent_mode_is_diagnostic_only_when_alignment_is_required():

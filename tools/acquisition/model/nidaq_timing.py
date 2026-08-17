@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import json
 from typing import Iterable, Mapping, Optional, Sequence
 
 from autotrainer.core import (
@@ -9,6 +11,8 @@ from autotrainer.core import (
     NidaqTimingConfiguration,
     NidaqTimingPlan,
     NidaqTimingRoute,
+    NidaqTaskGraph,
+    NidaqTaskSpecification,
 )
 from tools.acquisition.model.nidaq_discovery import (
     NidaqDevicePorts,
@@ -36,6 +40,12 @@ def build_nidaq_timing_plan(
         if device_name
     ))
     active_devices = tuple(dict.fromkeys((*input_devices, *output_devices)))
+    if len(active_devices) > 2:
+        return _invalid_plan(
+            timing,
+            "This release supports at most two active NI-DAQ devices in one "
+            f"timing graph; configured devices: {', '.join(active_devices)}",
+        )
     missing = tuple(name for name in active_devices if name not in discovered)
     if missing:
         return _invalid_plan(
@@ -82,7 +92,7 @@ def build_nidaq_timing_plan(
         discovered,
     )
     if not slaves:
-        return NidaqTimingPlan(
+        plan = NidaqTimingPlan(
             requested_mode=timing.sync_mode,
             resolved_mode="same_device",
             is_valid=True,
@@ -98,10 +108,11 @@ def build_nidaq_timing_plan(
             hardware_output_timing_reason=output_reason,
             reason="All sampled tasks use one NI-DAQ device",
         )
+        return _with_task_graph(plan, configuration, timing, output_devices)
 
     if timing.sync_mode == "independent":
         valid = not timing.require_hardware_synchronization
-        return NidaqTimingPlan(
+        plan = NidaqTimingPlan(
             requested_mode=timing.sync_mode,
             resolved_mode="independent",
             is_valid=valid,
@@ -122,6 +133,7 @@ def build_nidaq_timing_plan(
                 else "Independent device clocks explicitly allowed"
             ),
         )
+        return _with_task_graph(plan, configuration, timing, output_devices)
 
     active_capabilities = tuple(discovered[name] for name in active_devices)
     common_pxi_backplane = _has_common_pxi_backplane(active_capabilities)
@@ -206,24 +218,28 @@ def build_nidaq_timing_plan(
             slaves=slaves,
         )
 
-    routes = (
-        NidaqTimingRoute(
-            "reference_clock",
-            reference_clock or "",
-            tuple(f"/{slave}/ReferenceClock" for slave in slaves),
-        ),
-        NidaqTimingRoute(
-            "start_trigger",
-            start_trigger or "",
-            tuple(f"/{slave}/StartTrigger" for slave in slaves),
-        ),
-        NidaqTimingRoute(
-            "sample_clock",
-            sample_clock or "",
-            tuple(f"/{slave}/SampleClock" for slave in slaves),
-        ),
-    )
-    return NidaqTimingPlan(
+    routes = tuple(
+        NidaqTimingRoute(signal, source, destinations)
+        for signal, source, destinations in (
+            (
+                "reference_clock",
+                reference_clock,
+                tuple(f"/{slave}/ReferenceClock" for slave in slaves),
+            ),
+            (
+                "start_trigger",
+                start_trigger,
+                tuple(f"/{slave}/StartTrigger" for slave in slaves),
+            ),
+            (
+                "sample_clock",
+                sample_clock,
+                tuple(f"/{slave}/SampleClock" for slave in slaves),
+            ),
+        )
+        if source and destinations
+    ) + tuple(timing.external_routes)
+    plan = NidaqTimingPlan(
         requested_mode=requested,
         resolved_mode=resolved_mode,
         is_valid=True,
@@ -248,6 +264,113 @@ def build_nidaq_timing_plan(
             if resolved_mode == "backplane"
             else "Resolved explicitly configured external start/sample timing"
         ),
+    )
+    return _with_task_graph(plan, configuration, timing, output_devices)
+
+
+def _with_task_graph(plan, configuration, timing, output_devices):
+    """Attach a stable, exact input-task graph to an already valid plan."""
+    tasks = []
+    device_order = tuple(plan.task_start_order)
+    transfer = dict(timing.transfer_mechanism_overrides)
+    for device in device_order:
+        analog = tuple(
+            channel.physical_channel
+            for channel in configuration.analog_channels
+            if device_name_from_channel(channel.physical_channel) == device
+        )
+        digital = tuple(
+            channel.physical_channel
+            for channel in configuration.digital_channels
+            if device_name_from_channel(channel.physical_channel) == device
+        )
+        clock_source = (
+            None if device == plan.master_device else plan.sample_clock_source
+        )
+        trigger_source = (
+            None if device == plan.master_device else plan.start_trigger_source
+        )
+        if analog:
+            tasks.append(NidaqTaskSpecification(
+                task_id=f"{device}.ai",
+                device=device,
+                subsystem="ai",
+                channels=analog,
+                mode="continuous_input",
+                sample_clock_source=clock_source,
+                start_trigger_source=trigger_source,
+                reference_clock_source=plan.reference_clock_source,
+                transfer_mechanism=transfer.get(f"{device}.ai"),
+            ))
+        if digital:
+            tasks.append(NidaqTaskSpecification(
+                task_id=f"{device}.di",
+                device=device,
+                subsystem="di",
+                channels=digital,
+                mode="continuous_input",
+                sample_clock_source=(
+                    plan.sample_clock_source if analog or device != plan.master_device
+                    else f"/{device}/Ctr0InternalOutput"
+                ),
+                start_trigger_source=trigger_source,
+                reference_clock_source=plan.reference_clock_source,
+                transfer_mechanism=transfer.get(f"{device}.di"),
+            ))
+        if device == plan.clock_producer_device and plan.clock_producer == "counter":
+            tasks.append(NidaqTaskSpecification(
+                task_id=f"{device}.counter-clock",
+                device=device,
+                subsystem="counter",
+                channels=(f"/{device}/ctr0",),
+                mode="continuous_clock_output",
+                reference_clock_source=plan.reference_clock_source,
+                resources=(f"/{device}/ctr0",),
+            ))
+    for device in output_devices:
+        tasks.append(NidaqTaskSpecification(
+            task_id=f"{device}.ao-reservation",
+            device=device,
+            subsystem="ao",
+            channels=(),
+            mode="finite_output_declared",
+            sample_clock_source=plan.sample_clock_source,
+            start_trigger_source=plan.start_trigger_source,
+            reference_clock_source=plan.reference_clock_source,
+        ))
+    identifiers = tuple(task.task_id for task in tasks)
+    graph_payload = json.dumps(
+        {
+            "strategy": timing.task_strategy,
+            "tasks": [dataclasses.asdict(task) for task in tasks],
+            "routes": [dataclasses.asdict(route) for route in plan.routes],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    graph = NidaqTaskGraph(
+        graph_id=hashlib.sha256(graph_payload).hexdigest()[:16],
+        strategy=timing.task_strategy,
+        tasks=tuple(tasks),
+        routes=plan.routes,
+        create_order=identifiers,
+        start_order=tuple(
+            task.task_id
+            for device in device_order
+            for task in tasks
+            if task.device == device
+        ),
+        shutdown_order=tuple(reversed(identifiers)),
+    )
+    probe_status = (
+        "pending_exact_probe"
+        if timing.task_strategy in {"auto_multidevice", "forced_multidevice"}
+        else "not_requested"
+    )
+    return dataclasses.replace(
+        plan,
+        task_graph=graph,
+        multidevice_probe_status=probe_status,
     )
 
 
