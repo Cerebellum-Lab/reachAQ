@@ -6,6 +6,8 @@ import numbers
 import time
 from typing import Dict, List, Optional, Tuple
 
+import numpy
+
 from autotrainer.core import (
     NidaqSignalChannelConfiguration,
     NidaqSignalStreamConfiguration,
@@ -76,6 +78,17 @@ class NidaqSignalStreamController:
             str, Tuple[NidaqSignalChannelConfiguration, ...]
         ] = {}
         self._sample_index = 0
+        self._analog_readers: Dict[str, object] = {}
+        self._digital_readers: Dict[str, object] = {}
+        self._analog_buffers: Dict[str, numpy.ndarray] = {}
+        self._digital_buffers: Dict[str, numpy.ndarray] = {}
+        self._read_telemetry = {
+            "blocks": 0,
+            "availability_wait_seconds": 0.0,
+            "read_seconds": 0.0,
+            "late_barriers": 0,
+            "short_reads": 0,
+        }
         self._is_started = False
         self._epoch_perf_time: Optional[float] = None
         self._epoch_wall_time: Optional[float] = None
@@ -88,6 +101,10 @@ class NidaqSignalStreamController:
     @property
     def configuration(self) -> NidaqSignalStreamConfiguration:
         return self._configuration
+
+    @property
+    def read_telemetry(self):
+        return dict(self._read_telemetry)
 
     def start(self) -> None:
         if self._is_started:
@@ -139,15 +156,18 @@ class NidaqSignalStreamController:
         values: Dict[str, Tuple[float, ...]] = {}
         wall_time = time.time()
         perf_time = time.perf_counter()
+        wait_started = time.perf_counter()
+        self._wait_all_available(chunk_size, timeout)
+        self._read_telemetry["availability_wait_seconds"] += (
+            time.perf_counter() - wait_started
+        )
+        read_started = time.perf_counter()
 
         for device_name in self._task_start_order():
             analog_task = self._analog_tasks.get(device_name)
             analog_channels = self._analog_channels_by_device.get(device_name, tuple())
             if analog_task is not None:
-                raw = analog_task.read(
-                    number_of_samples_per_channel=chunk_size,
-                    timeout=timeout,
-                )
+                raw = self._read_analog(device_name, analog_task, chunk_size, timeout)
                 for channel, samples in zip(
                     analog_channels,
                     _normalize_samples(raw, len(analog_channels)),
@@ -161,10 +181,7 @@ class NidaqSignalStreamController:
                 device_name, tuple()
             )
             if digital_task is not None:
-                raw = digital_task.read(
-                    number_of_samples_per_channel=chunk_size,
-                    timeout=timeout,
-                )
+                raw = self._read_digital(device_name, digital_task, chunk_size, timeout)
                 for channel, samples in zip(
                     digital_channels,
                     _normalize_samples(raw, len(digital_channels)),
@@ -173,6 +190,9 @@ class NidaqSignalStreamController:
                         _scale_sample(1.0 if bool(sample) else 0.0, channel)
                         for sample in samples
                     )
+
+        self._read_telemetry["blocks"] += 1
+        self._read_telemetry["read_seconds"] += time.perf_counter() - read_started
 
         sample_index = self._sample_index
         if values:
@@ -239,6 +259,10 @@ class NidaqSignalStreamController:
         self._digital_task = None
         self._digital_clock_task = None
         self._analog_task = None
+        self._analog_readers.clear()
+        self._digital_readers.clear()
+        self._analog_buffers.clear()
+        self._digital_buffers.clear()
         self._is_started = False
         self._epoch_perf_time = None
         self._epoch_wall_time = None
@@ -301,6 +325,7 @@ class NidaqSignalStreamController:
             self._configure_reference_clock(analog_task)
             self._configure_start_trigger(analog_task, device_name)
             self._configure_exports(analog_task, device_name, "ai")
+            self._make_stream_reader(device_name, analog_task, analog_channels, analog=True)
             log_hardware_initialization(
                 logger,
                 "READY | NI-DAQ analog input task | elapsed=%.3fs",
@@ -366,6 +391,7 @@ class NidaqSignalStreamController:
             self._configure_reference_clock(digital_task)
             self._configure_start_trigger(digital_task, device_name)
             self._configure_exports(digital_task, device_name, "di")
+            self._make_stream_reader(device_name, digital_task, digital_channels, analog=False)
             log_hardware_initialization(
                 logger,
                 "READY | NI-DAQ digital input task | timing=hardware source=%s elapsed=%.3fs",
@@ -385,6 +411,92 @@ class NidaqSignalStreamController:
             self._nidaqmx.constants.DataTransferActiveTransferMode.INTERRUPT
         )
         return task
+
+    def _make_stream_reader(self, device_name, task, channels, *, analog):
+        in_stream = getattr(task, "in_stream", None)
+        readers = getattr(self._nidaqmx, "stream_readers", None)
+        if in_stream is None or readers is None:
+            return
+        chunk_size = self._configuration.read_chunk_size
+        if analog:
+            self._analog_readers[device_name] = readers.AnalogMultiChannelReader(
+                in_stream
+            )
+            self._analog_buffers[device_name] = numpy.empty(
+                (len(channels), chunk_size), dtype=numpy.float64
+            )
+        else:
+            self._digital_readers[device_name] = readers.DigitalMultiChannelReader(
+                in_stream
+            )
+            self._digital_buffers[device_name] = numpy.empty(
+                (len(channels), chunk_size), dtype=numpy.bool_
+            )
+
+    def _wait_all_available(self, sample_count: int, timeout: float) -> None:
+        streams = tuple(
+            task.in_stream
+            for task_id, task in self._owned_task_records()
+            if not task_id.endswith("counter-clock")
+            and hasattr(task, "in_stream")
+            and hasattr(task.in_stream, "avail_samp_per_chan")
+        )
+        if not streams:
+            return
+        deadline = time.perf_counter() + timeout
+        while True:
+            if all(int(stream.avail_samp_per_chan) >= sample_count for stream in streams):
+                return
+            if time.perf_counter() >= deadline:
+                self._read_telemetry["late_barriers"] += 1
+                availability = tuple(
+                    int(stream.avail_samp_per_chan) for stream in streams
+                )
+                raise TimeoutError(
+                    "NI-DAQ synchronized availability barrier timed out: "
+                    f"required={sample_count} available={availability}"
+                )
+            time.sleep(0.0005)
+
+    def _read_analog(self, device_name, task, sample_count, timeout):
+        reader = self._analog_readers.get(device_name)
+        if reader is None:
+            return task.read(
+                number_of_samples_per_channel=sample_count,
+                timeout=timeout,
+            )
+        buffer = self._analog_buffers[device_name]
+        count = reader.read_many_sample(
+            buffer,
+            number_of_samples_per_channel=sample_count,
+            timeout=timeout,
+        )
+        self._require_exact_reader_count(device_name, count, sample_count)
+        return buffer[:, :sample_count]
+
+    def _read_digital(self, device_name, task, sample_count, timeout):
+        reader = self._digital_readers.get(device_name)
+        if reader is None:
+            return task.read(
+                number_of_samples_per_channel=sample_count,
+                timeout=timeout,
+            )
+        buffer = self._digital_buffers[device_name]
+        count = reader.read_many_sample_multi_line(
+            buffer,
+            number_of_samples_per_channel=sample_count,
+            timeout=timeout,
+        )
+        self._require_exact_reader_count(device_name, count, sample_count)
+        return buffer[:, :sample_count]
+
+    def _require_exact_reader_count(self, device_name, observed, expected):
+        if int(observed) == int(expected):
+            return
+        self._read_telemetry["short_reads"] += 1
+        raise RuntimeError(
+            f"NI-DAQ task {device_name} returned {observed} samples; expected {expected}"
+        )
 
     def _create_digital_sample_clock(
         self,
@@ -536,6 +648,16 @@ class NidaqSignalStreamController:
 def _normalize_samples(raw_samples, channel_count: int) -> List[List[object]]:
     if channel_count <= 0:
         return []
+    if isinstance(raw_samples, numpy.ndarray):
+        array = raw_samples
+        if array.ndim == 1:
+            return [array.tolist()]
+        if array.ndim == 2 and array.shape[0] == channel_count:
+            return [row.tolist() for row in array]
+        raise RuntimeError(
+            f"expected {channel_count} NI-DAQ stream channels, received array "
+            f"shape {array.shape}"
+        )
     if channel_count == 1:
         if isinstance(raw_samples, (list, tuple)) and raw_samples and not isinstance(raw_samples[0], numbers.Number):
             return [list(raw_samples[0])]
@@ -553,9 +675,11 @@ def _scale_sample(sample: float, channel: NidaqSignalChannelConfiguration) -> fl
 def _load_nidaqmx():
     try:
         import nidaqmx
+        from nidaqmx import stream_readers
     except ModuleNotFoundError as exc:
         raise ModuleNotFoundError(
             "nidaqmx is required for NI-DAQ signal streaming. Install NI-DAQmx and the nidaqmx Python package "
             "on the hardware runtime machine."
         ) from exc
+    nidaqmx.stream_readers = stream_readers
     return nidaqmx

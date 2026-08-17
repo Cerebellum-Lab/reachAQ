@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import numpy
+
 from autotrainer.core import (
     NidaqSignalChannelConfiguration,
     NidaqSignalStreamConfiguration,
@@ -304,3 +306,39 @@ def test_external_clock_and_start_trigger_apply_to_selected_master(monkeypatch):
         assert task.start_trigger_source == "/DevA/PFI2"
     finally:
         controller.close()
+
+
+def test_preallocated_stream_reader_returns_exact_common_chunk():
+    class Reader:
+        def read_many_sample(self, buffer, **_kwargs):
+            buffer[:] = ((1.0, 2.0, 3.0),)
+            return 3
+
+    controller = object.__new__(NidaqSignalStreamController)
+    controller._analog_readers = {"Dev1": Reader()}
+    controller._analog_buffers = {"Dev1": numpy.empty((1, 3))}
+    controller._read_telemetry = {"short_reads": 0}
+
+    values = controller._read_analog("Dev1", object(), 3, 1.0)
+
+    assert values.tolist() == [[1.0, 2.0, 3.0]]
+    assert controller._read_telemetry["short_reads"] == 0
+
+
+def test_preallocated_stream_reader_rejects_short_chunk():
+    class Reader:
+        def read_many_sample_multi_line(self, _buffer, **_kwargs):
+            return 2
+
+    controller = object.__new__(NidaqSignalStreamController)
+    controller._digital_readers = {"Dev1": Reader()}
+    controller._digital_buffers = {"Dev1": numpy.empty((1, 3), dtype=numpy.bool_)}
+    controller._read_telemetry = {"short_reads": 0}
+
+    try:
+        controller._read_digital("Dev1", object(), 3, 1.0)
+    except RuntimeError as error:
+        assert "returned 2 samples" in str(error)
+    else:
+        raise AssertionError("short read was accepted")
+    assert controller._read_telemetry["short_reads"] == 1
