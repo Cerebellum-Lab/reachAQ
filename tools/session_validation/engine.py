@@ -76,6 +76,7 @@ def validate_session(
         _stim_evidence_rule,
         _board_time_rule,
         _trial_rule,
+        _protocol_action_rule,
     )
     results = []
     for rule in rules:
@@ -917,6 +918,10 @@ def _trial_rule(context):
         return _result("trials.lifecycle", "not_applicable", "No pellet attempts were recorded")
     errors, identities = [], set()
     records = []
+    terminal_outcomes = {
+        "success", "failure", "pellet_missing", "no_reach", "unscored",
+        "hardware_error", "incomplete", "aborted",
+    }
     with path.open("r", encoding="utf-8") as stream:
         for index, line in enumerate(stream, 1):
             if not line.strip():
@@ -929,6 +934,32 @@ def _trial_rule(context):
             if identity in identities:
                 errors.append(f"row {index}: duplicate attempt identity")
             identities.add(identity)
+            if not record.get("operation_id"):
+                errors.append(f"row {index}: operation identity is empty")
+            expected_label = (
+                f"unindexed.{record.get('attempt_id')}"
+                if record.get("trial_id") is None
+                else f"{record.get('trial_id')}.{record.get('attempt_id')}"
+            )
+            if record.get("attempt_label") != expected_label:
+                errors.append(f"row {index}: attempt label is inconsistent")
+            send = _record_float(record, "send_perf_time", errors, index)
+            ack = _record_float(record, "send_ack_perf_time", errors, index, optional=True)
+            finalized = _record_float(
+                record, "finalized_perf_time", errors, index, optional=True,
+            )
+            if ack is not None and send is not None and ack < send:
+                errors.append(f"row {index}: acknowledgement precedes SEND")
+            if finalized is not None and ack is not None and finalized < ack:
+                errors.append(f"row {index}: finalization precedes acknowledgement")
+            if record.get("outcome") not in terminal_outcomes:
+                errors.append(f"row {index}: nonterminal outcome {record.get('outcome')!r}")
+            if finalized is None:
+                errors.append(f"row {index}: finalized time is missing")
+            if int(record.get("reach_count", 0)) < 0:
+                errors.append(f"row {index}: negative reach count")
+            if int(record.get("success_count", 0)) > int(record.get("reach_count", 0)):
+                errors.append(f"row {index}: successes exceed reaches")
     summary_path = context.path("streams/trial_summary.json")
     if summary_path.is_file():
         summary = context.json("streams/trial_summary.json")
@@ -936,9 +967,107 @@ def _trial_rule(context):
             errors.append("trial summary physical_attempts differs from trials.jsonl")
         if int(summary.get("incomplete_attempts", 0)):
             errors.append("finalized session contains incomplete attempts")
+        recomputed = {
+            "physical_attempts": len(records),
+            "hardware_errors": sum(
+                item.get("outcome") == "hardware_error" for item in records
+            ),
+            "pending_analysis_attempts": sum(
+                item.get("outcome") == "pending_analysis" for item in records
+            ),
+            "pellets_presented": sum(
+                item.get("send_ack_perf_time") is not None for item in records
+            ),
+            "reaches": sum(int(item.get("reach_count", 0)) for item in records),
+            "successful_reaches": sum(
+                int(item.get("success_count", 0)) for item in records
+            ),
+            "pellets_consumed": sum(
+                int(item.get("consumption_count", 0)) for item in records
+            ),
+        }
+        for key, value in recomputed.items():
+            if int(summary.get(key, -1)) != value:
+                errors.append(f"trial summary {key}={summary.get(key)}; recomputed={value}")
     return _result(
         "trials.lifecycle", "fail" if errors else "pass",
         "; ".join(errors) if errors else "Pellet-attempt identities and summary are complete",
     )
 _trial_rule.RULE_ID = "trials.lifecycle"
 _trial_rule.MINIMUM = ValidationProfile.FAST
+
+
+def _record_float(record, field, errors, row_index, *, optional=False):
+    value = record.get(field)
+    if value is None and optional:
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        errors.append(f"row {row_index}: invalid {field}")
+        return None
+    if not math.isfinite(value):
+        errors.append(f"row {row_index}: nonfinite {field}")
+        return None
+    return value
+
+
+def _protocol_action_rule(context):
+    path = context.path("streams/trials.jsonl")
+    if not path.is_file():
+        return _result("trials.protocol", "not_applicable", "No pellet attempts were recorded")
+    errors, checked = [], 0
+    with path.open("r", encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, 1):
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            protocol = record.get("protocol_context") or {}
+            selected_protocol = protocol.get("protocol_id")
+            operation = record.get("protocol_operation")
+            if not selected_protocol:
+                continue
+            checked += 1
+            if not operation:
+                errors.append(f"row {line_number}: selected protocol lacks action evidence")
+                continue
+            recipe = operation.get("recipe") or {}
+            requested = recipe.get("requested_row") or {}
+            if str(recipe.get("protocol_id")) != str(selected_protocol):
+                errors.append(f"row {line_number}: protocol identity differs")
+            if recipe.get("logical_trial_id") != record.get("trial_id"):
+                errors.append(f"row {line_number}: recipe trial identity differs")
+            if recipe.get("attempt_id") != record.get("attempt_id"):
+                errors.append(f"row {line_number}: recipe attempt identity differs")
+            if requested.get("trial_id") != record.get("trial_id"):
+                errors.append(f"row {line_number}: frozen row identity differs")
+            snapshotted = protocol.get("compiled_recipe") or {}
+            if snapshotted and snapshotted != recipe:
+                errors.append(f"row {line_number}: compiled recipe snapshot differs")
+            if operation.get("state") not in {"completed", "failed", "cancelled"}:
+                errors.append(f"row {line_number}: protocol operation is not terminal")
+            observations = operation.get("observations") or ()
+            times = [item.get("perf_time") for item in observations]
+            try:
+                if any(not math.isfinite(float(item)) for item in times):
+                    raise ValueError
+                if any(float(b) < float(a) for a, b in zip(times, times[1:])):
+                    errors.append(f"row {line_number}: action observations moved backward")
+            except (TypeError, ValueError):
+                errors.append(f"row {line_number}: invalid action observation time")
+            for field in (
+                "resolved_dcs_target", "resolved_motor_target", "position_evidence",
+                "stimulus_selected", "stimulus_seed", "stimulus_draw",
+            ):
+                if field not in recipe:
+                    errors.append(f"row {line_number}: recipe lacks {field}")
+    if not checked:
+        return _result("trials.protocol", "not_applicable", "Session used No protocol mode")
+    return _result(
+        "trials.protocol", "fail" if errors else "pass",
+        "; ".join(errors[:20]) if errors
+        else "Frozen protocol recipes and action lifecycles are complete",
+        observed=checked, paths=(path.as_posix(),),
+    )
+_protocol_action_rule.RULE_ID = "trials.protocol"
+_protocol_action_rule.MINIMUM = ValidationProfile.FAST
