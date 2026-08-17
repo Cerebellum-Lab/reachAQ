@@ -70,6 +70,10 @@ def validate_session(
         _nidaq_rule,
         _nidaq_timing_graph_rule,
         _event_rule,
+        _event_frame_rule,
+        _tone_confirmation_rule,
+        _laser_confirmation_rule,
+        _stim_evidence_rule,
         _board_time_rule,
         _trial_rule,
     )
@@ -573,6 +577,218 @@ def _event_rule(context):
     )
 _event_rule.RULE_ID = "events.alignment"
 _event_rule.MINIMUM = ValidationProfile.FAST
+
+
+def _event_frame_rule(context):
+    event_paths = tuple(
+        path for path in (
+            context.path("streams/device.csv"),
+            context.path("streams/events.csv"),
+            context.path("streams/laser.csv"),
+        ) if path.is_file() and path.stat().st_size > 0
+    )
+    if not event_paths:
+        return _result("events.frames", "not_applicable", "No event stream is present")
+    frame_path, _ = _frame_ledger_path(context)
+    if frame_path is None:
+        return _result("events.frames", "fail", "Recorded frame ledger is unavailable")
+    frame_ids = set()
+    with frame_path.open("r", encoding="utf-8", newline="") as stream:
+        for row in csv.DictReader(stream):
+            frame_ids.add(int(row["frame_id"]))
+    paths = event_paths
+    errors, warnings, associated = [], [], 0
+    required = {
+        "perf_time", "offset_seconds", "wall_time", "frame_id",
+        "recorded_frame_index", "frame_relation", "frame_start_perf_time",
+        "event_to_frame_start_seconds", "alignment_method",
+        "alignment_confidence",
+    }
+    for path in paths:
+        with path.open("r", encoding="utf-8", newline="") as stream:
+            reader = csv.DictReader(stream)
+            missing = required - set(reader.fieldnames or ())
+            if missing:
+                errors.append(f"{path.name}: missing {', '.join(sorted(missing))}")
+                continue
+            previous = -math.inf
+            for line_number, row in enumerate(reader, 2):
+                try:
+                    perf = float(row["perf_time"])
+                    if not math.isfinite(perf) or perf < previous:
+                        errors.append(f"{path.name}:{line_number}: nonmonotonic event")
+                    previous = perf
+                    frame_value = row.get("frame_id")
+                    if frame_value in (None, ""):
+                        warnings.append(f"{path.name}:{line_number}: no frame association")
+                        continue
+                    frame_id = int(frame_value)
+                    if frame_id not in frame_ids:
+                        errors.append(f"{path.name}:{line_number}: unknown frame {frame_id}")
+                    delta = float(row["event_to_frame_start_seconds"])
+                    if not math.isfinite(delta):
+                        errors.append(f"{path.name}:{line_number}: nonfinite frame delta")
+                    if not row["alignment_method"] or not row["alignment_confidence"]:
+                        errors.append(f"{path.name}:{line_number}: missing alignment evidence")
+                    associated += 1
+                except (TypeError, ValueError) as error:
+                    errors.append(f"{path.name}:{line_number}: {error}")
+    status = "fail" if errors else ("warning" if warnings else "pass")
+    return _result(
+        "events.frames", status,
+        "; ".join((errors or warnings)[:20])
+        if errors or warnings else "All persisted events map to recorded frames",
+        observed={"associated": associated, "warnings": len(warnings)},
+        paths=tuple(path.as_posix() for path in paths),
+    )
+_event_frame_rule.RULE_ID = "events.frames"
+_event_frame_rule.MINIMUM = ValidationProfile.FAST
+
+
+def _tone_confirmation_rule(context):
+    path = context.path("streams/alignment.json")
+    if not path.is_file():
+        return _result("events.tones", "fail", "Alignment metadata is missing")
+    tone = context.json("streams/alignment.json").get("toneConfirmation")
+    if not tone:
+        return _result("events.tones", "not_applicable", "No tone confirmation data")
+    errors, warnings = [], []
+    confirmations = tone.get("matched", ())
+    for index, item in enumerate(confirmations, 1):
+        if not item.get("valid", True):
+            continue
+        for field in ("physicalEventPerfTime", "recordingOffsetSeconds"):
+            if item.get(field) is None:
+                errors.append(f"confirmation {index}: missing {field}")
+        frame = item.get("frameAssociation") or {}
+        if frame.get("frameId") is None:
+            errors.append(f"confirmation {index}: missing recorded frame ID")
+        if not frame.get("method") or not frame.get("confidence"):
+            errors.append(f"confirmation {index}: missing alignment method/confidence")
+    unmatched = tone.get("unmatchedEdges", ())
+    boundary = context.json("streams/alignment.json").get("canonicalBoundary", {})
+    start = boundary.get("startPerfTime")
+    end = boundary.get("endPerfTime")
+    for index, edge in enumerate(unmatched, 1):
+        perf = edge.get("perfTime")
+        if perf is not None and start is not None and end is not None:
+            if not float(start) <= float(perf) <= float(end):
+                errors.append(f"unmatched edge {index} lies outside saved boundary")
+    artifact_count = int(tone.get("artifactCount", len(tone.get("artifacts", ()))))
+    if artifact_count:
+        warnings.append(f"{artifact_count} short-pulse artifact(s) retained")
+    status = "fail" if errors else ("warning" if warnings else "pass")
+    return _result(
+        "events.tones", status,
+        "; ".join(errors or warnings) if errors or warnings
+        else "Tone commands, NI confirmations, and recorded frames agree",
+        observed={"confirmations": len(confirmations), "artifacts": artifact_count},
+        paths=(path.as_posix(),),
+    )
+_tone_confirmation_rule.RULE_ID = "events.tones"
+_tone_confirmation_rule.MINIMUM = ValidationProfile.FAST
+
+
+def _laser_confirmation_rule(context):
+    path = context.path("streams/laser.csv")
+    if not path.is_file():
+        return _result("events.laser", "not_applicable", "Laser stream is absent")
+    with path.open("r", encoding="utf-8", newline="") as stream:
+        reader = csv.DictReader(stream)
+        rows = list(reader)
+    if not rows:
+        return _result("events.laser", "not_applicable", "No laser events were recorded")
+    errors, warnings = [], []
+    for line_number, row in enumerate(rows, 2):
+        event = row.get("event", "")
+        if not event:
+            errors.append(f"row {line_number}: event is missing")
+        if row.get("frame_id") in (None, ""):
+            warnings.append(f"row {line_number}: no recorded-frame association")
+    return _result(
+        "events.laser", "fail" if errors else ("warning" if warnings else "pass"),
+        "; ".join((errors or warnings)[:20]) if errors or warnings
+        else "Laser events have recorded-frame evidence",
+        observed=len(rows), paths=(path.as_posix(),),
+    )
+_laser_confirmation_rule.RULE_ID = "events.laser"
+_laser_confirmation_rule.MINIMUM = ValidationProfile.FAST
+
+
+def _stim_evidence_rule(context):
+    sources = context.json("streams/stream_manifest.json").get("enabledSources", ())
+    source = next((item for item in sources if item.get("id") == "stim_camera_evidence"), None)
+    if source is None:
+        return _result("stim.evidence", "not_applicable", "Stim-camera evidence mode was not enabled")
+    import h5py
+    path = context.path(source["path"])
+    errors, warnings = [], []
+    with h5py.File(path, "r") as store:
+        if "evidence" not in store:
+            errors.append("evidence dataset is missing")
+            count = 0
+        else:
+            evidence = store["evidence"]
+            count = int(evidence.shape[0])
+            names = set(evidence.dtype.names or ())
+            required = {
+                "frame_id", "camera_timestamp_ns", "frame_perf_time",
+                "decision_perf_time", "session_generation", "logical_trial_id",
+                "attempt_id", "armed", "triggered", "gap",
+            }
+            missing = required - names
+            if missing:
+                errors.append("missing evidence fields: " + ", ".join(sorted(missing)))
+            if context.profile is ValidationProfile.FULL and count and "frame_id" in names:
+                import numpy
+                ids = evidence["frame_id"][:]
+                if not numpy.all(numpy.diff(ids) == 1):
+                    errors.append("stim evidence frame IDs are not contiguous")
+            if count and not missing:
+                import numpy
+                gaps = int(numpy.count_nonzero(evidence["gap"][:]))
+                if gaps:
+                    errors.append(f"stim evidence reports {gaps} acquired-frame gap(s)")
+                triggered = numpy.flatnonzero(evidence["triggered"][:])
+                ownership = set()
+                for position in triggered:
+                    key = (
+                        int(evidence["session_generation"][position]),
+                        int(evidence["logical_trial_id"][position]),
+                        int(evidence["attempt_id"][position]),
+                    )
+                    if key in ownership:
+                        errors.append(f"attempt {key} emitted more than one trigger")
+                    ownership.add(key)
+                    if not bool(evidence["armed"][position]):
+                        errors.append(f"attempt {key} triggered while unarmed")
+                clip_group = store.get("clips")
+                clip_count = 0 if clip_group is None else len(clip_group)
+                if clip_count != len(triggered):
+                    errors.append(
+                        f"triggered rows={len(triggered)}; bounded clips={clip_count}"
+                    )
+                if clip_group is not None:
+                    for clip_id, clip in clip_group.items():
+                        if not bool(clip.attrs.get("complete", False)):
+                            warnings.append(f"clip {clip_id} is truncated")
+        dropped = int(store.attrs.get("dropped_batches", 0))
+        clip_drops = int(store.attrs.get("dropped_clips", 0))
+        if dropped:
+            errors.append(f"dropped evidence batches={dropped}")
+        if clip_drops:
+            warnings.append(f"dropped clips={clip_drops}")
+    if count != int(source.get("sampleCount", count)):
+        errors.append(f"evidence count={count}; manifest={source.get('sampleCount')}")
+    status = "fail" if errors else ("warning" if warnings else "pass")
+    return _result(
+        "stim.evidence", status,
+        "; ".join(errors or warnings) if errors or warnings
+        else "Stim-camera evidence is continuous and complete",
+        observed=count, paths=(path.as_posix(),),
+    )
+_stim_evidence_rule.RULE_ID = "stim.evidence"
+_stim_evidence_rule.MINIMUM = ValidationProfile.FAST
 
 
 def _optional_float(row, name):
