@@ -1061,6 +1061,16 @@ def _protocol_action_rule(context):
     if not path.is_file():
         return _result("trials.protocol", "not_applicable", "No pellet attempts were recorded")
     errors, checked = [], 0
+    laser_events = {}
+    laser_path = context.path("streams/laser.csv")
+    if laser_path.is_file():
+        with laser_path.open("r", encoding="utf-8", newline="") as laser_stream:
+            for laser_row in csv.DictReader(laser_stream):
+                operation_id = laser_row.get("operation_id")
+                if operation_id:
+                    laser_events.setdefault(operation_id, set()).add(
+                        laser_row.get("event")
+                    )
     with path.open("r", encoding="utf-8") as stream:
         for line_number, line in enumerate(stream, 1):
             if not line.strip():
@@ -1105,6 +1115,35 @@ def _protocol_action_rule(context):
             ):
                 if field not in recipe:
                     errors.append(f"row {line_number}: recipe lacks {field}")
+            laser_profile = recipe.get("laser_profile")
+            if laser_profile is not None:
+                laser_action = (operation.get("actions") or {}).get("laser")
+                if not laser_action:
+                    errors.append(
+                        f"row {line_number}: laser recipe lacks operation result"
+                    )
+                    continue
+                laser_state = laser_action.get("state")
+                if (
+                    operation.get("state") == "completed"
+                    and laser_state != "completed"
+                ):
+                    errors.append(
+                        f"row {line_number}: completed trial has laser state "
+                        f"{laser_state!r}"
+                    )
+                laser_operation_id = laser_action.get("operation_id")
+                observed_events = laser_events.get(laser_operation_id, set())
+                if "prepared" not in observed_events:
+                    errors.append(
+                        f"row {line_number}: laser prepared event is absent"
+                    )
+                if not observed_events.intersection(
+                    {"completed", "failed", "cancelled"}
+                ):
+                    errors.append(
+                        f"row {line_number}: laser terminal event is absent"
+                    )
     if not checked:
         return _result("trials.protocol", "not_applicable", "Session used No protocol mode")
     return _result(
