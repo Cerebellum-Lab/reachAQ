@@ -3988,6 +3988,25 @@ class AppModel(ObservableObject):
                 for document in self.ordered_protocols
             ),
             "repository_errors": dict(self._trial_protocol_repository.errors),
+            "tone_profiles": tuple(
+                {
+                    "profile_id": profile.profile_id,
+                    "revision": profile.revision,
+                    "summary": f"{profile.frequency_hz} Hz, {profile.duration_ms} ms",
+                }
+                for profile in self._tone_profiles.values()
+            ),
+            "laser_profiles": tuple(
+                {
+                    "profile_id": profile.profile_id,
+                    "revision": profile.revision,
+                    "summary": (
+                        f"channel {profile.channel_id}, {profile.amplitude_volts:g} V, "
+                        f"{profile.pulse_duration_ms:g} ms"
+                    ),
+                }
+                for profile in self._laser_profiles.values()
+            ),
             "active_trial_id": active_trial_id,
             "completed_trial_ids": tuple(sorted({
                 attempt.trial_id
@@ -4554,6 +4573,12 @@ class AppModel(ObservableObject):
         self._behavior.system_machine.pellet.prepare_cover_policy(policy)
 
     def _play_protocol_tone(self, profile: ToneProfile, phase: str) -> None:
+        if phase == "embedded_in_sequence":
+            self._behavior.system_machine.pellet.prepare_embedded_tone(
+                profile.frequency_hz,
+                profile.duration_ms,
+            )
+            return
         token = self._hardware.play_tone(
             profile.frequency_hz,
             profile.duration_ms / 1000.0,

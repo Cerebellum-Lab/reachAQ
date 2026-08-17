@@ -434,3 +434,15 @@ def test_prepared_keep_current_cover_policy_is_not_overridden(machine, mock_syst
     pellet_m.send_pellet(force=True)
 
     assert mock_system.pellet_state_trans == [PelletState.sending]
+
+
+def test_prepared_embedded_tone_is_bound_to_send_command(machine):
+    pellet_m = machine.pellet
+    pellet_m.prepare_embedded_tone(6000, 125)
+
+    pellet_m.send_pellet(force=True)
+
+    pellet_m._pellet_device.send_pellet.assert_called_with(
+        embedded_tone=(6000, 125)
+    )
+    assert pellet_m._prepared_embedded_tone is None

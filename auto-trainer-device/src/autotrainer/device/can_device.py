@@ -391,7 +391,7 @@ class CanDevice(Device):
             # NB: the following sequences are using "predefined" move,
             # that are below automatically handled for possible servo attach/detach
             SystemCommandKind.LOAD_PELLET: lambda _: self._start_sequence(self._load_pellet),
-            SystemCommandKind.SEND_PELLET: lambda _: self._start_sequence(self._send_pellet),
+            SystemCommandKind.SEND_PELLET: self._start_send_pellet_sequence,
 
             SystemCommandKind.RELEASE_PELLET: lambda _: self._start_sequence(self._release_pellet),
             SystemCommandKind.COVER_PELLET: lambda _: self._start_sequence(self._cover_pellet),
@@ -1057,6 +1057,17 @@ class CanDevice(Device):
         tgt = self._find_steps_next_board_target("sequence", move_steps)
         board = self._boards_pending_ctx[tgt]
         return self._perform_next_compound_step(board, move_steps)
+
+    def _start_send_pellet_sequence(self, data) -> bool:
+        steps = self._send_pellet.steps
+        if isinstance(data, dict) and data.get("embedded_tone") is not None:
+            frequency_hz, duration_ms = data["embedded_tone"]
+            frequency_hz = int(frequency_hz)
+            duration_ms = int(duration_ms)
+            if frequency_hz <= 0 or duration_ms <= 0:
+                raise ValueError("Embedded tone frequency and duration must be positive")
+            steps.append({"tone": f"{frequency_hz},{duration_ms / 1000.0}"})
+        return self._start_sequence(MotorSteps("send_pellet", steps))
 
     def _find_step_board(self, step) -> Optional[Target]:
         if 'x' in step or 'x_rel' in step or 'send_x_rel' in step:

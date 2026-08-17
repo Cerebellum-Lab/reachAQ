@@ -5,8 +5,8 @@ from pathlib import Path
 import hashlib
 import json
 
-from PySide6.QtCore import QRegularExpression, Qt
-from PySide6.QtGui import QColor, QRegularExpressionValidator
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -15,7 +15,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QInputDialog,
     QLabel,
-    QLineEdit,
     QMessageBox,
     QPushButton,
     QSizePolicy,
@@ -118,14 +117,25 @@ class _IntegerDelegate(QStyledItemDelegate):
         model.setData(index, editor.value(), Qt.ItemDataRole.EditRole)
 
 
-class _IdentifierDelegate(QStyledItemDelegate):
+class _ProfileDelegate(QStyledItemDelegate):
+    def __init__(self, content, kind, parent=None):
+        super().__init__(parent)
+        self._content = content
+        self._kind = kind
+
     def createEditor(self, parent, _option, _index):
-        editor = QLineEdit(parent)
-        editor.setValidator(QRegularExpressionValidator(
-            QRegularExpression(r"[a-z0-9][a-z0-9._-]{0,63}|"),
-            editor,
-        ))
+        editor = QComboBox(parent)
+        editor.addItem("None", "")
+        for profile_id, summary in self._content._profile_options(self._kind):
+            editor.addItem(f"{profile_id} — {summary}", profile_id)
         return editor
+
+    def setEditorData(self, editor, index):
+        selected = editor.findData(index.data(Qt.ItemDataRole.EditRole))
+        editor.setCurrentIndex(max(0, selected))
+
+    def setModelData(self, editor, model, index):
+        model.setData(index, editor.currentData(), Qt.ItemDataRole.EditRole)
 
 
 @dataclass(frozen=True)
@@ -150,9 +160,9 @@ class ProtocolContent(ContentWidget):
         _Column("Auto window", "automatic_window_method", AutomaticWindowMethod),
         _Column("Window N", "automatic_window_size", "window"),
         _Column("Cover", "cover_policy", CoverPolicy),
-        _Column("Tone profile", "tone_profile_id", "identifier"),
+        _Column("Tone profile", "tone_profile_id", "tone_profile"),
         _Column("Tone phase", "tone_phase", ActionPhase),
-        _Column("Laser profile", "laser_profile_id", "identifier"),
+        _Column("Laser profile", "laser_profile_id", "laser_profile"),
         _Column("Laser phase", "laser_phase", ActionPhase),
         _Column("Laser route", "laser_trigger_route", LaserTriggerRoute),
         _Column("Assignment", "stimulus_assignment", StimulusAssignment),
@@ -302,11 +312,19 @@ class ProtocolContent(ContentWidget):
                 delegate = _FloatDelegate(0.0, 100.0, 1, " %", self._table)
             elif kind == "window":
                 delegate = _IntegerDelegate(1, 10_000, self._table)
-            elif kind == "identifier":
-                delegate = _IdentifierDelegate(self._table)
+            elif kind in {"tone_profile", "laser_profile"}:
+                delegate = _ProfileDelegate(self, kind, self._table)
             else:
                 delegate = _EnumDelegate(kind, self._table)
             self._table.setItemDelegateForColumn(index, delegate)
+
+    def _profile_options(self, kind):
+        state = self._app_model.trial_protocol_state
+        key = "tone_profiles" if kind == "tone_profile" else "laser_profiles"
+        return tuple(
+            (item["profile_id"], item.get("summary", ""))
+            for item in state.get(key, ())
+        )
 
     @staticmethod
     def _display_value(field, value) -> str:

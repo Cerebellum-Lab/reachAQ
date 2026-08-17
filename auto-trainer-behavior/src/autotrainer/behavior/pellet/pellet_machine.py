@@ -122,6 +122,7 @@ class PelletMachine(StateMachine):
         self._send_readiness_callback = None
         self._send_guard_callback = None
         self._prepared_cover_policy: Optional[str] = None
+        self._prepared_embedded_tone = None
         self._command_ack_condition = threading.Condition(threading.RLock())
 
         self.machine = Machine(
@@ -198,10 +199,13 @@ class PelletMachine(StateMachine):
             logger.debug("doing %s prior to pellet-send", reason)
             with algo.set_allow_reentrant(True):
                 action()
-        token = self._pellet_device.send_pellet()
+        token = self._pellet_device.send_pellet(
+            embedded_tone=self._prepared_embedded_tone,
+        )
         if token is None:
             raise PelletDeviceCommandFailed
         self._prepared_cover_policy = None
+        self._prepared_embedded_tone = None
         self._token_pellet_send = self._api_status_token = token
         self._send_begin_perf_c = get_perf_now()
         self.events.pellet_sending(
@@ -289,6 +293,13 @@ class PelletMachine(StateMachine):
 
     def cancel_prepared_cover_policy(self) -> None:
         self._prepared_cover_policy = None
+        self._prepared_embedded_tone = None
+
+    def prepare_embedded_tone(self, frequency_hz: int, duration_ms: int) -> None:
+        frequency_hz, duration_ms = int(frequency_hz), int(duration_ms)
+        if frequency_hz <= 0 or duration_ms <= 0:
+            raise ValueError("Embedded tone frequency and duration must be positive")
+        self._prepared_embedded_tone = (frequency_hz, duration_ms)
 
     def can_cover_pellet(self, *, force: bool=False):
         can = force or (

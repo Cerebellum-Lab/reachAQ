@@ -379,9 +379,13 @@ class TrialActionExecutor:
             self._configure_cover(str(cover))
             self._observe(f"cover policy prepared: {cover}")
             row = recipe.requested_row
-            if recipe.tone_profile is not None and row["tone_phase"] == "before_send":
-                self._play_tone(recipe.tone_profile, "before_send")
-                self._observe("before-SEND tone acknowledged")
+            if (
+                recipe.tone_profile is not None
+                and row["tone_phase"] in {"before_send", "embedded_in_sequence"}
+            ):
+                phase = row["tone_phase"]
+                self._play_tone(recipe.tone_profile, phase)
+                self._observe(f"{phase} tone prepared/acknowledged")
             if recipe.laser_profile is not None:
                 self._laser_handle = self._prepare_laser(recipe.laser_profile, recipe)
                 self._observe(

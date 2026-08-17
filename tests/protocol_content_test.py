@@ -36,6 +36,12 @@ class _Model:
                 "revision": 1,
                 "trial_count": 3,
             },),
+            "tone_profiles": ({
+                "profile_id": "tone-1",
+                "revision": 1,
+                "summary": "5000 Hz, 100 ms",
+            },),
+            "laser_profiles": (),
             "rows": (
                 {
                     "trial_id": trial_id,
@@ -117,6 +123,9 @@ def test_protocol_table_uses_constrained_editors():
 
     assert isinstance(delivery_editor, QComboBox)
     assert isinstance(shift_editor, QDoubleSpinBox)
+    tone_delegate = content._table.itemDelegateForColumn(11)
+    tone_editor = tone_delegate.createEditor(content, None, None)
+    assert tone_editor.findData("tone-1") >= 0
     content.close()
 
 

@@ -392,8 +392,12 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
     def load_pellet(self) -> Optional[UUID]:
         return self._send_with_token(self._device_conn, SystemCommandKind.LOAD_PELLET)
 
-    def send_pellet(self) -> Optional[UUID]:
-        return self._send_with_token(self._device_conn, SystemCommandKind.SEND_PELLET)
+    def send_pellet(self, *, embedded_tone=None) -> Optional[UUID]:
+        return self._send_with_token(
+            self._device_conn,
+            SystemCommandKind.SEND_PELLET,
+            None if embedded_tone is None else {"embedded_tone": embedded_tone},
+        )
 
     def release_pellet(self) -> Optional[UUID]:
         return self._send_with_token(self._device_conn, SystemCommandKind.RELEASE_PELLET)

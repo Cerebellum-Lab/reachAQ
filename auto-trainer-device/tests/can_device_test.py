@@ -163,6 +163,22 @@ def test_compound_move_keeps_configured_motor_coordinate_unchanged():
     assert steps == []
 
 
+def test_send_sequence_can_append_one_embedded_tone_without_mutating_template():
+    device = CanDevice(
+        api=DeviceApi(message_callback=data_callback),
+        force_emulation=True,
+        required_targets=(Target.PELLET_DEVICE,),
+    )
+    original = device._send_pellet.steps
+    device._start_sequence = mock.Mock(return_value=True)
+
+    assert device._start_send_pellet_sequence({"embedded_tone": (6000, 125)})
+
+    sequence = device._start_sequence.call_args.args[0]
+    assert sequence.steps[-1] == {"tone": "6000,0.125"}
+    assert device._send_pellet.steps == original
+
+
 def test_immediate_tone_status_is_forwarded_with_source_timestamp():
     received = []
     device = CanDevice(
