@@ -4086,6 +4086,61 @@ class AppModel(ObservableObject):
         }
 
     @_serialized_session_configuration
+    def apply_ordered_protocol_row_patches(self, row_patches) -> dict:
+        """Apply differing per-row values in one protocol revision."""
+        with self._trial_protocol_lock:
+            document = self._selected_ordered_protocol
+            if document is None:
+                return {
+                    "changed_trial_ids": (),
+                    "skipped_trial_ids": (),
+                    "reason": "No ordered protocol is selected",
+                }
+            state = self.trial_protocol_state
+            locked = set(state["completed_trial_ids"])
+            if state["active_trial_id"] is not None:
+                locked.add(int(state["active_trial_id"]))
+            patches = {int(key): value for key, value in row_patches.items()}
+            valid = set(range(1, document.trial_count + 1))
+            if not set(patches) <= valid:
+                raise ValueError("Protocol edit contains out-of-range trial IDs")
+            changed = tuple(sorted(set(patches) - locked))
+            skipped = tuple(sorted(set(patches) & locked))
+            if not changed:
+                return {
+                    "changed_trial_ids": (),
+                    "skipped_trial_ids": skipped,
+                    "reason": "Every selected trial is locked",
+                }
+            overrides = {
+                item.trial_id: item.patch.to_mapping()
+                for item in document.trial_overrides
+            }
+            for trial_id in changed:
+                patch = ProtocolPatch.from_mapping(patches[trial_id])
+                overrides.setdefault(trial_id, {}).update(patch.to_mapping())
+            updated = dataclasses.replace(
+                document,
+                trial_overrides=tuple(
+                    TrialOverride.create(key, overrides[key])
+                    for key in sorted(overrides)
+                ),
+            )
+            saved = self._trial_protocol_repository.save(
+                updated,
+                expected_revision=document.revision,
+            )
+            self._selected_ordered_protocol = saved
+            self._trial_protocol_schedule = TrialProtocolSchedule.from_document(saved)
+        self._notify_trial_protocol_state()
+        return {
+            "changed_trial_ids": changed,
+            "skipped_trial_ids": skipped,
+            "reason": "",
+            "revision": saved.revision,
+        }
+
+    @_serialized_session_configuration
     def select_ordered_protocol(self, protocol_id: Optional[str]) -> bool:
         self._require_session_ready_for_configuration(
             "Changing the ordered trial protocol"
@@ -4142,6 +4197,22 @@ class AppModel(ObservableObject):
         else:
             self._notify_trial_protocol_state()
         return saved
+
+    @_serialized_session_configuration
+    def restore_ordered_protocol_document(
+        self,
+        document: TrialProtocolDocument,
+    ) -> TrialProtocolDocument:
+        """Publish a historical editor snapshot as a new auditable revision."""
+        current = self._selected_ordered_protocol
+        if current is None or current.protocol_id != document.protocol_id:
+            raise RuntimeError("Undo/redo snapshot does not match the selected protocol")
+        restored = dataclasses.replace(document, revision=current.revision)
+        return self.save_ordered_protocol(
+            restored,
+            expected_revision=current.revision,
+            select=True,
+        )
 
     @_serialized_session_configuration
     def create_ordered_protocol(

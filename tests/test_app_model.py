@@ -293,6 +293,29 @@ def test_ordered_protocol_library_operations(app_model, tmp_path):
     assert app_model.reload_ordered_protocols()
 
 
+def test_ordered_protocol_row_patterns_publish_one_revision(app_model, tmp_path):
+    app_model._trial_protocol_repository = TrialProtocolRepository(tmp_path)
+    first = app_model.save_ordered_protocol(TrialProtocolDocument(
+        protocol_id="pattern",
+        name="Pattern",
+        trial_count=4,
+        defaults=ProtocolPatch.from_mapping({"enabled": True}),
+    ))
+
+    result = app_model.apply_ordered_protocol_row_patches({
+        1: {"position_lane": "left"},
+        2: {"position_lane": "right"},
+        3: {"position_lane": "left"},
+        4: {"position_lane": "right"},
+    })
+
+    assert result["revision"] == first.revision + 1
+    assert [
+        item.row.position_lane.value
+        for item in app_model.selected_ordered_protocol.resolve()
+    ] == ["left", "right", "left", "right"]
+
+
 def test_scored_trial_limit_is_available_with_live_intertrial_scoring(app_model):
     control = app_model.behavior.algorithm.active_config.session_control
     control.trial_limit = 5

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import hashlib
+import json
 
 from PySide6.QtCore import QRegularExpression, Qt
 from PySide6.QtGui import QColor, QRegularExpressionValidator
@@ -166,6 +168,8 @@ class ProtocolContent(ContentWidget):
         self._app_model = app_model
         self._updating = False
         self._copied_values = None
+        self._undo_history = []
+        self._redo_history = []
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         self._card_widget = CardWidget(title="Pellet-trial protocol")
@@ -255,17 +259,29 @@ class ProtocolContent(ContentWidget):
         self._copy_button = QPushButton("Copy row")
         self._paste_button = QPushButton("Paste to selected")
         self._fill_button = QPushButton("Fill selected field")
+        self._repeat_button = QPushButton("Repeat copied pattern")
+        self._undo_button = QPushButton("Undo")
+        self._redo_button = QPushButton("Redo")
+        self._random_preview_button = QPushButton("Preview random assignment")
         self._epoch_button = QPushButton("Create/update epoch")
         self._block_button = QPushButton("Create/update block")
         self._copy_button.clicked.connect(self._copy_row)
         self._paste_button.clicked.connect(self._paste_rows)
         self._fill_button.clicked.connect(self._fill_selected_field)
+        self._repeat_button.clicked.connect(self._paste_rows)
+        self._undo_button.clicked.connect(self._undo)
+        self._redo_button.clicked.connect(self._redo)
+        self._random_preview_button.clicked.connect(self._preview_random_assignment)
         self._epoch_button.clicked.connect(lambda: self._apply_named_scope("epoch"))
         self._block_button.clicked.connect(lambda: self._apply_named_scope("block"))
         for button in (
             self._copy_button,
             self._paste_button,
             self._fill_button,
+            self._repeat_button,
+            self._undo_button,
+            self._redo_button,
+            self._random_preview_button,
             self._epoch_button,
             self._block_button,
         ):
@@ -404,10 +420,14 @@ class ProtocolContent(ContentWidget):
                 self._copy_button,
                 self._paste_button,
                 self._fill_button,
+                self._repeat_button,
+                self._random_preview_button,
                 self._epoch_button,
                 self._block_button,
             ):
                 button.setEnabled(has_protocol)
+            self._undo_button.setEnabled(has_protocol and bool(self._undo_history))
+            self._redo_button.setEnabled(has_protocol and bool(self._redo_history))
             errors = state.get("repository_errors", {})
             if errors:
                 self._edit_status.setText(
@@ -435,6 +455,7 @@ class ProtocolContent(ContentWidget):
         elif field == "position_mode" and value != "fixed_manual":
             patch.update(shift_x_mm=0.0, shift_y_mm=0.0, shift_z_mm=0.0)
         try:
+            before = self._protocol_snapshot()
             accepted = self._app_model.apply_ordered_protocol_values(
                 (trial_id,), patch, scope_kind="trials"
             ) if hasattr(self._app_model, "apply_ordered_protocol_values") else (
@@ -442,6 +463,8 @@ class ProtocolContent(ContentWidget):
             )
             if isinstance(accepted, dict):
                 accepted = bool(accepted.get("changed_trial_ids"))
+            if accepted:
+                self._remember_edit(before)
         except (KeyError, RuntimeError, TypeError, ValueError) as error:
             accepted = False
             self._edit_status.setText(str(error))
@@ -464,18 +487,36 @@ class ProtocolContent(ContentWidget):
         rows = self._selected_trial_ids()
         if not rows:
             return
-        record = self._row_record(rows[0])
-        self._copied_values = {
-            column.field: self._legacy_value(record, column.field)
+        self._copied_values = tuple({
+            column.field: self._legacy_value(self._row_record(trial_id), column.field)
             for column in self.COLUMNS if column.field is not None
-        }
-        self._edit_status.setText(f"Copied resolved values from trial {rows[0]}.")
+        } for trial_id in rows)
+        self._edit_status.setText(
+            f"Copied {len(rows)} row(s); paste repeats this pattern across the selection."
+        )
 
     def _paste_rows(self):
         rows = self._selected_trial_ids()
-        if not rows or self._copied_values is None:
+        if not rows or not self._copied_values:
             return
-        self._apply_values(rows, self._copied_values, "bulk", "paste")
+        before = self._protocol_snapshot()
+        try:
+            result = self._app_model.apply_ordered_protocol_row_patches({
+                trial_id: self._copied_values[index % len(self._copied_values)]
+                for index, trial_id in enumerate(rows)
+            })
+            changed = result.get("changed_trial_ids", ())
+            skipped = result.get("skipped_trial_ids", ())
+        except (KeyError, RuntimeError, TypeError, ValueError) as error:
+            self._edit_status.setText(str(error))
+            return
+        if changed:
+            self._remember_edit(before)
+        self._edit_status.setText(
+            f"Repeated {len(self._copied_values)}-row pattern across "
+            f"{len(changed)} trial(s)"
+            + (f"; skipped {', '.join(map(str, skipped))}" if skipped else "")
+        )
 
     def _fill_selected_field(self):
         rows = self._selected_trial_ids()
@@ -522,6 +563,7 @@ class ProtocolContent(ContentWidget):
 
     def _apply_values(self, rows, values, kind, name, *, parent_epoch=""):
         try:
+            before = self._protocol_snapshot()
             result = self._app_model.apply_ordered_protocol_values(
                 rows,
                 values,
@@ -535,8 +577,72 @@ class ProtocolContent(ContentWidget):
             if skipped:
                 message += f"; locked/skipped: {', '.join(map(str, skipped))}"
             self._edit_status.setText(message)
+            if changed:
+                self._remember_edit(before)
         except (KeyError, RuntimeError, TypeError, ValueError) as error:
             self._edit_status.setText(str(error))
+
+    def _protocol_snapshot(self):
+        document = getattr(self._app_model, "selected_ordered_protocol", None)
+        return document
+
+    def _remember_edit(self, before):
+        after = self._protocol_snapshot()
+        if before is None or after is None or before == after:
+            return
+        self._undo_history.append((before, after))
+        self._redo_history.clear()
+        self._undo_button.setEnabled(True)
+        self._redo_button.setEnabled(False)
+
+    def _undo(self):
+        if not self._undo_history:
+            return
+        before, after = self._undo_history.pop()
+        try:
+            self._app_model.restore_ordered_protocol_document(before)
+        except (RuntimeError, ValueError) as error:
+            self._undo_history.append((before, after))
+            self._edit_status.setText(str(error))
+            return
+        self._redo_history.append((before, after))
+        self._edit_status.setText("Restored the previous values as a new revision.")
+
+    def _redo(self):
+        if not self._redo_history:
+            return
+        before, after = self._redo_history.pop()
+        try:
+            self._app_model.restore_ordered_protocol_document(after)
+        except (RuntimeError, ValueError) as error:
+            self._redo_history.append((before, after))
+            self._edit_status.setText(str(error))
+            return
+        self._undo_history.append((before, after))
+        self._edit_status.setText("Reapplied the values as a new revision.")
+
+    def _preview_random_assignment(self):
+        rows = self._selected_trial_ids()
+        if not rows:
+            self._edit_status.setText("Select trials to preview first.")
+            return
+        seed, accepted = QInputDialog.getInt(
+            self, "Randomized assignment preview", "Seed:", 1, 0, 2_147_483_647
+        )
+        if not accepted:
+            return
+        selected = []
+        for trial_id in rows:
+            record = self._row_record(trial_id)
+            probability = float(record.get("stimulus_probability_percent", 100.0))
+            payload = json.dumps((seed, trial_id), separators=(",", ":")).encode()
+            draw = int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") / 2**64
+            if draw * 100.0 < probability:
+                selected.append(trial_id)
+        self._edit_status.setText(
+            f"Preview seed {seed}: stimulus on trials "
+            f"{', '.join(map(str, selected)) or 'none'}. The actual draw is frozen at preparation."
+        )
 
     def _protocol_selected(self):
         if self._updating or not hasattr(self._app_model, "select_ordered_protocol"):
