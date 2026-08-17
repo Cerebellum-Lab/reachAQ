@@ -4,7 +4,7 @@ from types import SimpleNamespace
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QComboBox, QDoubleSpinBox
 
 from tools.acquisition.view.protocol_content import ProtocolContent
 
@@ -25,6 +25,17 @@ class _Model:
         self.property_changed = _Event()
         self.updated = []
         self.trial_protocol_state = {
+            "selected_protocol": {
+                "protocol_id": "test",
+                "name": "Test",
+                "revision": 1,
+            },
+            "protocols": ({
+                "protocol_id": "test",
+                "name": "Test",
+                "revision": 1,
+                "trial_count": 3,
+            },),
             "rows": (
                 {
                     "trial_id": trial_id,
@@ -47,6 +58,24 @@ class _Model:
         self.updated.append((trial_id, field, value))
         return True
 
+    def apply_ordered_protocol_values(
+        self,
+        trial_ids,
+        values,
+        *,
+        scope_kind,
+        scope_name="",
+        parent_epoch="",
+    ):
+        self.updated.append((tuple(trial_ids), values, scope_kind, scope_name))
+        return {
+            "changed_trial_ids": tuple(trial_ids),
+            "skipped_trial_ids": (),
+        }
+
+    def select_ordered_protocol(self, protocol_id):
+        return protocol_id
+
     def retry_pending_intertrial_analysis(self):
         return True
 
@@ -67,9 +96,41 @@ def test_only_future_protocol_rows_are_editable():
     assert not completed.flags() & Qt.ItemFlag.ItemIsEditable
     assert not active.flags() & Qt.ItemFlag.ItemIsEditable
     assert future.flags() & Qt.ItemFlag.ItemIsEditable
-    assert content._table.item(1, 8).text() == "Active"
-    assert content._table.item(0, 8).text() == "Completed"
+    state_column = next(
+        index for index, column in enumerate(content.COLUMNS)
+        if column.label == "State"
+    )
+    assert content._table.item(1, state_column).text() == "Active"
+    assert content._table.item(0, state_column).text() == "Completed"
     assert not content._retry_analysis.isVisible()
+    content.close()
+
+
+def test_protocol_table_uses_constrained_editors():
+    app = QApplication.instance() or QApplication([])
+    content = ProtocolContent(_Model())
+
+    delivery_delegate = content._table.itemDelegateForColumn(2)
+    delivery_editor = delivery_delegate.createEditor(content, None, None)
+    shift_delegate = content._table.itemDelegateForColumn(5)
+    shift_editor = shift_delegate.createEditor(content, None, None)
+
+    assert isinstance(delivery_editor, QComboBox)
+    assert isinstance(shift_editor, QDoubleSpinBox)
+    content.close()
+
+
+def test_bulk_fill_reports_selected_trial_ids():
+    app = QApplication.instance() or QApplication([])
+    model = _Model()
+    content = ProtocolContent(model)
+    content._table.selectRow(2)
+    content._table.setCurrentCell(2, 2)
+
+    content._fill_selected_field()
+
+    assert model.updated[-1][0] == (3,)
+    assert model.updated[-1][2] == "bulk"
     content.close()
 
 
