@@ -213,6 +213,7 @@ def test_stim_camera_session_modes_are_mutually_exclusive(app_model):
     assert app_model.load_configuration() is True
     camera = app_model.stim_camera
     camera.is_enabled = True
+    operator_configuration = camera.save_configuration()
 
     camera.configure_stim_session_mode(True)
     assert camera.active_config.params["stim_mode"] == "stimulation"
@@ -220,6 +221,9 @@ def test_stim_camera_session_modes_are_mutually_exclusive(app_model):
     assert camera.is_primary
     assert not camera.is_recording_enabled
     assert camera._stim_detection_configuration is not None
+    assert camera.save_configuration().params == operator_configuration.params
+    assert camera.save_configuration().is_enabled
+    assert camera.save_configuration(runtime_mode=True).params["stim_mode"] == "stimulation"
 
     camera.configure_stim_session_mode(False)
     assert camera.active_config.params["stim_mode"] == "ordinary"
@@ -227,6 +231,8 @@ def test_stim_camera_session_modes_are_mutually_exclusive(app_model):
     assert not camera.is_primary
     assert camera.is_recording_enabled
     assert camera._stim_detection_configuration is None
+    assert camera.save_configuration().params == operator_configuration.params
+    assert camera.save_configuration(runtime_mode=True).params["stim_mode"] == "ordinary"
 
 
 def test_stimulus_profiles_are_saved_and_reloaded(app_model):

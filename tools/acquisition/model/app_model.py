@@ -8583,7 +8583,11 @@ class AppModel(ObservableObject):
             dst.with_suffix(f'.{now.strftime(DATE_TIME_FORMAT)}.json.bak').write_bytes(dst.read_bytes())
         animal.to_file(dst)
 
-    def _create_configuration(self) -> SystemConfiguration:
+    def _create_configuration(
+        self,
+        *,
+        runtime_camera_modes: bool = False,
+    ) -> SystemConfiguration:
         loaded_hardware = (
             self._loaded_configuration.hardware
             if self._loaded_configuration is not None
@@ -8602,7 +8606,9 @@ class AppModel(ObservableObject):
 
         cameras = []
         for camera in self._cameras:
-            cameras.append(camera.save_configuration())
+            cameras.append(camera.save_configuration(
+                runtime_mode=runtime_camera_modes,
+            ))
 
         inference_configuration = self._inference.save_configuration()
         if self._runtime_live_inference_override is not None and self._loaded_configuration is not None:
@@ -8688,7 +8694,9 @@ class AppModel(ObservableObject):
             session_boundary = boundary.to_metadata()
         else:
             session_boundary = None
-        configuration = asdict(self._create_configuration())
+        configuration = asdict(self._create_configuration(
+            runtime_camera_modes=True,
+        ))
         hardware_configured = {
             "canEnabled": self._hardware.can_enabled,
             "pelletControllerEnabled": self._hardware.pellet_controller_enabled,

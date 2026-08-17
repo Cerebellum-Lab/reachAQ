@@ -199,6 +199,8 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
         self._shape = None
 
         self._cur_conf: CameraConfiguration = CameraConfiguration()
+        self._operator_conf: Optional[CameraConfiguration] = None
+        self._runtime_stim_mode_active = False
         self._is_enabled = True
         self._is_primary = False
         self._configured_is_primary = False
@@ -590,9 +592,17 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
     def active_config(self) -> CameraConfiguration:
         return self._cur_conf
 
-    def load_configuration(self, conf: CameraConfiguration):
+    def load_configuration(
+        self,
+        conf: CameraConfiguration,
+        *,
+        runtime_mode: bool = False,
+    ):
         self._id = conf.id
         self._name = conf.name if conf.id == CameraId.Camera3 and conf.name else str(conf.id)
+        if not runtime_mode:
+            self._operator_conf = copy.deepcopy(conf)
+        self._runtime_stim_mode_active = bool(runtime_mode)
         self._cur_conf = conf  # keeping config on self too
         self.is_enabled = conf.is_enabled
         self.is_recording_enabled = conf.is_record_enabled
@@ -662,7 +672,17 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
             raise RuntimeError("Stim session mode applies only to Camera3")
         if self._video_capture is not None:
             raise RuntimeError("Stim camera mode cannot change while capture is active")
-        conf = copy.deepcopy(self._cur_conf)
+        # Always derive the frozen runtime mode from the operator-authored
+        # camera configuration. Otherwise the first session's derived crop,
+        # role, frame rate, and recording flag can become the next session's
+        # base configuration (and can be persisted on shutdown).
+        if not self._runtime_stim_mode_active:
+            self._operator_conf = copy.deepcopy(
+                self.save_configuration(runtime_mode=True)
+            )
+        base = self._operator_conf or self._cur_conf
+        conf = copy.deepcopy(base)
+        conf.is_enabled = self._is_enabled
         params = dict(conf.params)
         mode = "stimulation" if stimulation else "ordinary"
         prefix = "stim_" if stimulation else "ordinary_"
@@ -689,9 +709,20 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
         params["primary"] = "yes" if stimulation else "no"
         conf.params = params
         conf.is_record_enabled = not stimulation
-        self.load_configuration(conf)
+        self.load_configuration(conf, runtime_mode=True)
 
-    def save_configuration(self) -> CameraConfiguration:
+    def save_configuration(self, *, runtime_mode: bool = False) -> CameraConfiguration:
+        if (
+            not runtime_mode
+            and self._id == CameraId.Camera3
+            and self._operator_conf is not None
+            and self._runtime_stim_mode_active
+        ):
+            conf = copy.deepcopy(self._operator_conf)
+            # Enabled is an operator-facing property and is not altered by
+            # session-mode resolution, so retain an explicit UI change.
+            conf.is_enabled = self._is_enabled
+            return conf
         parsed, params = VideoManager.parse_params(self._camera_source.url)
         params: Dict[str, Any]
         for key, value in params.items():
