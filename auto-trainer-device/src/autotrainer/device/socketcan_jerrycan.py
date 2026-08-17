@@ -15,6 +15,9 @@ from .can_transport import CanTransportConfiguration, CanTransportKind
 
 JERRYCAN_ACTUAL_PAYLOAD_SIZE = 64
 CAN_FD_MTU = 72
+JERRYCAN_TIMING_TRAILER_TAG = 0xA7
+JERRYCAN_TIMING_TRAILER_VERSION = 1
+_TIMING_TRAILER = struct.Struct("<BBBBIIQ")
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +98,12 @@ class JerryCANCmdType(enum.IntEnum):
     FIXED_XYZ = 0x1C
     SERVO_ATTACH = 0x1D
     SERVO_DETACH = 0x1E
+    TIME_SYNC_REQUEST = 0x1F
+    TIME_SYNC_RESPONSE = 0x20
+    GPIO_PULSE = 0x21
+    GPIO_PULSE_STATUS = 0x22
+    CAPABILITIES_REQUEST = 0x23
+    CAPABILITIES_RESPONSE = 0x24
     ACKNOWLEDGE = 0x30
 
 
@@ -312,12 +321,67 @@ class Acknowledge:
     error: int = 0
 
 
+class JerryCANTimestampKind(enum.IntEnum):
+    TX_QUEUE = 0
+    OBSERVED = 1
+    COMMAND_RECEIVED = 2
+    PHYSICAL_START = 3
+    COMPLETED = 4
+    SAMPLED = 5
+
+
+@dataclasses.dataclass
+class JerryCANTiming:
+    version: int = 0
+    kind: JerryCANTimestampKind = JerryCANTimestampKind.TX_QUEUE
+    flags: int = 0
+    boot_id: int = 0
+    sequence: int = 0
+    board_time_us: int = 0
+
+
+@dataclasses.dataclass
+class TimeSyncRequest:
+    request_id: int = 0
+    host_send_perf_ns: int = 0
+
+
+@dataclasses.dataclass
+class TimeSyncResponse:
+    request_id: int = 0
+    request_receive_time_us: int = 0
+    response_queue_time_us: int = 0
+
+
+@dataclasses.dataclass
+class CapabilitiesResponse:
+    wire_schema_version: int = 0
+    capabilities: int = 0
+    boot_id: int = 0
+
+
+@dataclasses.dataclass
+class GPIOPulse:
+    instance: int = 0
+    gpio_idx: int = 0
+    duration_us: int = 0
+
+
+@dataclasses.dataclass
+class GPIOPulseStatus(GPIOPulse):
+    phase: int = 0
+    error: int = 0
+
+
 class JerryCANMsg:
     def __init__(self):
         self.type = JerryCANCmdType.HEARTBEAT
         self.dst_id = 0
         self.timestamp_ns = 0
         self.index = 0
+        self.wire_length = 0
+        self.board_timing_valid = False
+        self.timing = JerryCANTiming()
         self.uuid = 0
         self.estop = _EmptyCommand()
         self.status = _EmptyCommand()
@@ -348,6 +412,11 @@ class JerryCANMsg:
         self.delay = DelayCommand()
         self.fixed_xyz = FixedXyzCommand()
         self.ack = Acknowledge()
+        self.time_sync_request = TimeSyncRequest()
+        self.time_sync_response = TimeSyncResponse()
+        self.capabilities_response = CapabilitiesResponse()
+        self.gpio_pulse = GPIOPulse()
+        self.gpio_pulse_status = GPIOPulseStatus()
 
 
 _PAYLOAD_SIZES = {
@@ -382,6 +451,12 @@ _PAYLOAD_SIZES = {
     JerryCANCmdType.BOOTLOADER_DATA: 64,
     JerryCANCmdType.DELAY: 2,
     JerryCANCmdType.FIXED_XYZ: 1,
+    JerryCANCmdType.TIME_SYNC_REQUEST: 12,
+    JerryCANCmdType.TIME_SYNC_RESPONSE: 20,
+    JerryCANCmdType.GPIO_PULSE: 7,
+    JerryCANCmdType.GPIO_PULSE_STATUS: 12,
+    JerryCANCmdType.CAPABILITIES_REQUEST: 1,
+    JerryCANCmdType.CAPABILITIES_RESPONSE: 9,
     JerryCANCmdType.ACKNOWLEDGE: 4,
 }
 
@@ -500,6 +575,18 @@ def _pack_payload(message: JerryCANMsg) -> bytes:
         return struct.pack("<H", int(message.delay.delay))
     if message_type == JerryCANCmdType.FIXED_XYZ:
         return struct.pack("<B", int(message.fixed_xyz.rsvd))
+    if message_type == JerryCANCmdType.TIME_SYNC_REQUEST:
+        return struct.pack(
+            "<IQ", message.time_sync_request.request_id,
+            message.time_sync_request.host_send_perf_ns,
+        )
+    if message_type == JerryCANCmdType.CAPABILITIES_REQUEST:
+        return b"\0"
+    if message_type == JerryCANCmdType.GPIO_PULSE:
+        return struct.pack(
+            "<BHI", message.gpio_pulse.instance, message.gpio_pulse.gpio_idx,
+            message.gpio_pulse.duration_us,
+        )
     raise NotImplementedError(f"packing {message_type.name} is not implemented")
 
 
@@ -546,10 +633,26 @@ def decode_frame(arbitration_id: int, data: bytes, *, timestamp_ns: Optional[int
     message.dst_id = arbitration_id & 0x1F
     message.timestamp_ns = time.time_ns() if timestamp_ns is None else timestamp_ns
     message.index = time.perf_counter_ns() if index is None else index
+    message.wire_length = len(data)
     payload_size = _payload_size(message.type)
     payload = bytes(data[:payload_size])
     if payload_size < JERRYCAN_ACTUAL_PAYLOAD_SIZE and len(data) > payload_size:
         message.uuid = data[payload_size]
+        trailer_offset = payload_size + 1
+        if len(data) >= trailer_offset + _TIMING_TRAILER.size:
+            tag, version, kind, flags, boot_id, sequence, board_time_us = (
+                _TIMING_TRAILER.unpack_from(data, trailer_offset)
+            )
+            if tag == JERRYCAN_TIMING_TRAILER_TAG and version == 1:
+                message.board_timing_valid = True
+                message.timing = JerryCANTiming(
+                    version=version,
+                    kind=JerryCANTimestampKind(kind),
+                    flags=flags,
+                    boot_id=boot_id,
+                    sequence=sequence,
+                    board_time_us=board_time_us,
+                )
     _unpack_payload(message, payload)
     return message
 
@@ -602,6 +705,12 @@ def _unpack_payload(message: JerryCANMsg, payload: bytes) -> None:
         message.temp_hum_read = TempHumRead(*fields)
     elif message_type == JerryCANCmdType.ACKNOWLEDGE:
         message.ack.error = struct.unpack("<i", payload)[0]
+    elif message_type == JerryCANCmdType.TIME_SYNC_RESPONSE:
+        message.time_sync_response = TimeSyncResponse(*struct.unpack("<IQQ", payload))
+    elif message_type == JerryCANCmdType.CAPABILITIES_RESPONSE:
+        message.capabilities_response = CapabilitiesResponse(*struct.unpack("<BII", payload))
+    elif message_type == JerryCANCmdType.GPIO_PULSE_STATUS:
+        message.gpio_pulse_status = GPIOPulseStatus(*struct.unpack("<BHIBi", payload))
 
 
 class SocketCanJerryCAN:
@@ -975,4 +1084,29 @@ class SocketCanJerryCAN:
         msg = JerryCANMsg()
         msg.type = JerryCANCmdType.FIXED_XYZ
         msg.uuid = uuid
+        return self.SendMessage(msg, dst_id)
+
+    def TimeSync(self, dst_id: int, request_id: int, host_send_perf_ns: int) -> int:
+        msg = JerryCANMsg()
+        msg.type = JerryCANCmdType.TIME_SYNC_REQUEST
+        msg.time_sync_request = TimeSyncRequest(request_id, host_send_perf_ns)
+        return self.SendMessage(msg, dst_id)
+
+    def RequestCapabilities(self, dst_id: int) -> int:
+        msg = JerryCANMsg()
+        msg.type = JerryCANCmdType.CAPABILITIES_REQUEST
+        return self.SendMessage(msg, dst_id)
+
+    def GPIOPulse(
+        self,
+        dst_id: int,
+        instance: int,
+        gpio_idx: int,
+        duration_us: int,
+        uuid: int,
+    ) -> int:
+        msg = JerryCANMsg()
+        msg.type = JerryCANCmdType.GPIO_PULSE
+        msg.uuid = uuid
+        msg.gpio_pulse = GPIOPulse(instance, gpio_idx, duration_us)
         return self.SendMessage(msg, dst_id)

@@ -1,6 +1,7 @@
 import errno
 import logging
 import socket
+import struct
 import sys
 import types
 from unittest import mock
@@ -180,6 +181,34 @@ def test_receive_ignores_remote_and_extended_frames():
     assert len(messages) == 1
     assert messages[0].type == JerryCANCmdType.HEARTBEAT
     assert messages[0].dst_id == 0x01
+
+
+def test_timestamped_frame_preserves_legacy_uuid_and_decodes_trailer():
+    can_id = (JerryCANCmdType.TONE << 5) | 0x01
+    legacy = struct.pack("<BHHB", 0, 7000, 100, 23)
+    timing = struct.pack(
+        "<BBBBIIQ", 0xA7, 1, 3, 0, 0x12345678, 99, 7_654_321,
+    )
+
+    message = socketcan_jerrycan.decode_frame(can_id, legacy + timing)
+
+    assert message.uuid == 23
+    assert message.tone.frequency_hz == 7000
+    assert message.board_timing_valid
+    assert message.timing.boot_id == 0x12345678
+    assert message.timing.sequence == 99
+    assert message.timing.board_time_us == 7_654_321
+    assert message.timing.kind.name == "PHYSICAL_START"
+
+
+def test_legacy_frame_has_explicit_host_timing_fallback():
+    can_id = (JerryCANCmdType.TONE << 5) | 0x01
+    message = socketcan_jerrycan.decode_frame(
+        can_id, struct.pack("<BHHB", 0, 7000, 100, 23),
+    )
+
+    assert not message.board_timing_valid
+    assert message.timing.board_time_us == 0
 
 
 def test_receive_classifies_bus_off_error_frame(monkeypatch):
