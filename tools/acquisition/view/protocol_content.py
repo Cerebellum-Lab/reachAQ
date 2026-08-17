@@ -168,6 +168,7 @@ class ProtocolContent(ContentWidget):
         _Column("Assignment", "stimulus_assignment", StimulusAssignment),
         _Column("Stim %", "stimulus_probability_percent", "percent"),
         _Column("Trigger", "stimulus_trigger", StimulusTrigger),
+        _Column("Pre-reveal (ms)", "pre_reveal_ms", "pre_reveal"),
         _Column("Retry", "retry_assignment", RetryAssignment),
         _Column("State", None),
         _Column("Sources", None),
@@ -256,6 +257,9 @@ class ProtocolContent(ContentWidget):
             ("Import", self._import_protocol),
             ("Export", self._export_protocol),
             ("Revert", self._reload_protocols),
+            ("New tone", self._new_tone_profile),
+            ("New laser", self._new_laser_profile),
+            ("Delete profile", self._delete_profile),
         ):
             button = QToolButton()
             button.setText(label)
@@ -312,6 +316,8 @@ class ProtocolContent(ContentWidget):
                 delegate = _FloatDelegate(0.0, 100.0, 1, " %", self._table)
             elif kind == "window":
                 delegate = _IntegerDelegate(1, 10_000, self._table)
+            elif kind == "pre_reveal":
+                delegate = _IntegerDelegate(0, 60_000, self._table)
             elif kind in {"tone_profile", "laser_profile"}:
                 delegate = _ProfileDelegate(self, kind, self._table)
             else:
@@ -359,6 +365,7 @@ class ProtocolContent(ContentWidget):
             "stimulus_probability_percent": 100.0,
             "stimulus_trigger": "none",
             "retry_assignment": "repeat",
+            "pre_reveal_ms": 0,
         }
         return record.get(field, defaults.get(field, ""))
 
@@ -747,6 +754,112 @@ class ProtocolContent(ContentWidget):
     def _reload_protocols(self):
         if hasattr(self._app_model, "reload_ordered_protocols"):
             self._run_library_action(self._app_model.reload_ordered_protocols)
+
+    def _new_tone_profile(self):
+        profile_id, accepted = QInputDialog.getText(
+            self, "Tone profile", "Profile ID:"
+        )
+        if not accepted or not profile_id.strip():
+            return
+        frequency, accepted = QInputDialog.getInt(
+            self, "Tone profile", "Frequency (Hz):", 5000, 1, 100_000
+        )
+        if not accepted:
+            return
+        duration, accepted = QInputDialog.getInt(
+            self, "Tone profile", "Duration (ms):", 100, 1, 60_000
+        )
+        if accepted:
+            self._run_library_action(
+                self._app_model.save_tone_profile,
+                profile_id.strip(), frequency, duration,
+            )
+
+    def _new_laser_profile(self):
+        profile_id, accepted = QInputDialog.getText(
+            self, "Laser pulse profile", "Profile ID:"
+        )
+        if not accepted or not profile_id.strip():
+            return
+        channel, accepted = QInputDialog.getInt(
+            self, "Laser pulse profile", "Configured laser channel:", 1, 1, 64
+        )
+        if not accepted:
+            return
+        amplitude, accepted = QInputDialog.getDouble(
+            self, "Laser pulse profile", "Amplitude (V):", 1.0, -100.0, 100.0, 4
+        )
+        if not accepted:
+            return
+        pulse_ms, accepted = QInputDialog.getDouble(
+            self, "Laser pulse profile", "Pulse duration (ms):", 5.0, 0.001, 60_000.0, 3
+        )
+        if not accepted:
+            return
+        count, accepted = QInputDialog.getInt(
+            self, "Laser pulse profile", "Pulse count:", 1, 1, 100_000
+        )
+        if not accepted:
+            return
+        frequency = None
+        if count > 1:
+            frequency, accepted = QInputDialog.getDouble(
+                self, "Laser pulse profile", "Pulse frequency (Hz):", 20.0, 0.001, 100_000.0, 3
+            )
+            if not accepted:
+                return
+        route_label, accepted = QInputDialog.getItem(
+            self,
+            "Laser pulse profile",
+            "First Reach trigger route:",
+            ("Hardware STIM3", "Direct NI software start"),
+            0,
+            False,
+        )
+        if not accepted:
+            return
+        route = (
+            "hardware_stim3"
+            if route_label == "Hardware STIM3"
+            else "direct_ni_software"
+        )
+        terminal = ""
+        if route == "hardware_stim3":
+            terminal, accepted = QInputDialog.getText(
+                self,
+                "Laser pulse profile",
+                "Verified NI trigger terminal (for example /Dev4/PFI0):",
+            )
+            if not accepted or not terminal.strip():
+                return
+        self._run_library_action(
+            self._app_model.save_laser_profile,
+            profile_id=profile_id.strip(),
+            channel_id=channel,
+            amplitude_volts=amplitude,
+            pulse_duration_ms=pulse_ms,
+            pulse_count=count,
+            frequency_hz=frequency,
+            trigger_route=route,
+            trigger_terminal=terminal.strip(),
+        )
+
+    def _delete_profile(self):
+        state = self._app_model.trial_protocol_state
+        choices = [
+            *(f"tone: {item['profile_id']}" for item in state.get("tone_profiles", ())),
+            *(f"laser: {item['profile_id']}" for item in state.get("laser_profiles", ())),
+        ]
+        if not choices:
+            return
+        selected, accepted = QInputDialog.getItem(
+            self, "Delete stimulus profile", "Unused profile:", choices, 0, False
+        )
+        if accepted:
+            kind, profile_id = selected.split(": ", 1)
+            self._run_library_action(
+                self._app_model.delete_stimulus_profile, kind, profile_id
+            )
 
     def _run_library_action(self, action, *args, **kwargs):
         try:

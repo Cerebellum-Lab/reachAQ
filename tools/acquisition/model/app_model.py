@@ -174,6 +174,7 @@ from tools.acquisition.model.trial_protocol_repository import (
 )
 from tools.acquisition.model.stimulus_profile_repository import (
     StimulusProfileRepository,
+    StimulusProfileLibrary,
 )
 from tools.acquisition.model.session_validation_controller import (
     SessionValidationController,
@@ -4047,6 +4048,69 @@ class AppModel(ObservableObject):
     @property
     def selected_ordered_protocol(self) -> Optional[TrialProtocolDocument]:
         return self._selected_ordered_protocol
+
+    def save_tone_profile(
+        self, profile_id: str, frequency_hz: int, duration_ms: int,
+    ) -> ToneProfile:
+        self._require_session_ready_for_configuration("Editing tone profiles")
+        profile_id = str(profile_id).strip()
+        previous = self._tone_profiles.get(profile_id)
+        profile = ToneProfile(
+            profile_id,
+            1 if previous is None else previous.revision + 1,
+            int(frequency_hz),
+            int(duration_ms),
+        )
+        tones = {**self._tone_profiles, profile_id: profile}
+        self._save_stimulus_profiles(tones, self._laser_profiles)
+        return profile
+
+    def save_laser_profile(self, **values) -> LaserPulseProfile:
+        self._require_session_ready_for_configuration("Editing laser profiles")
+        profile_id = str(values.pop("profile_id")).strip()
+        previous = self._laser_profiles.get(profile_id)
+        profile = LaserPulseProfile(
+            profile_id=profile_id,
+            revision=1 if previous is None else previous.revision + 1,
+            **values,
+        )
+        lasers = {**self._laser_profiles, profile_id: profile}
+        self._save_stimulus_profiles(self._tone_profiles, lasers)
+        return profile
+
+    def delete_stimulus_profile(self, kind: str, profile_id: str) -> None:
+        self._require_session_ready_for_configuration("Deleting stimulus profiles")
+        kind, profile_id = str(kind), str(profile_id)
+        if kind not in {"tone", "laser"}:
+            raise ValueError("Stimulus profile kind must be tone or laser")
+        field = "tone_profile_id" if kind == "tone" else "laser_profile_id"
+        referenced = []
+        for document in self._trial_protocol_repository.documents:
+            if any(getattr(item.row, field) == profile_id for item in document.resolve()):
+                referenced.append(document.name)
+        if referenced:
+            raise RuntimeError(
+                f"Profile {profile_id!r} is used by: {', '.join(referenced)}"
+            )
+        tones, lasers = dict(self._tone_profiles), dict(self._laser_profiles)
+        target = tones if kind == "tone" else lasers
+        if target.pop(profile_id, None) is None:
+            raise KeyError(f"Unknown {kind} profile {profile_id!r}")
+        self._save_stimulus_profiles(tones, lasers)
+
+    def _save_stimulus_profiles(self, tones, lasers) -> None:
+        library = self._stimulus_profile_repository.library
+        saved = self._stimulus_profile_repository.save(
+            StimulusProfileLibrary(
+                revision=library.revision,
+                tone_profiles=tuple(tones[key] for key in sorted(tones)),
+                laser_profiles=tuple(lasers[key] for key in sorted(lasers)),
+            ),
+            expected_revision=library.revision,
+        )
+        self._tone_profiles = {item.profile_id: item for item in saved.tone_profiles}
+        self._laser_profiles = {item.profile_id: item for item in saved.laser_profiles}
+        self._notify_trial_protocol_state()
 
     def _selected_protocol_requires_stim_camera(self) -> bool:
         if self._selected_ordered_protocol is None:

@@ -229,6 +229,26 @@ def test_stim_camera_session_modes_are_mutually_exclusive(app_model):
     assert camera._stim_detection_configuration is None
 
 
+def test_stimulus_profiles_are_saved_and_reloaded(app_model):
+    assert app_model.load_configuration() is True
+
+    tone = app_model.save_tone_profile("trial-cue", 7000, 125)
+    laser = app_model.save_laser_profile(
+        profile_id="first-reach-pulse",
+        channel_id=1,
+        amplitude_volts=2.0,
+        pulse_duration_ms=5.0,
+        trigger_route="direct_ni_software",
+        trigger_terminal="",
+    )
+
+    assert app_model._tone_profiles[tone.profile_id] == tone
+    assert app_model._laser_profiles[laser.profile_id] == laser
+    assert app_model._stimulus_profile_repository.load().laser_profiles[-1] == laser
+    app_model.delete_stimulus_profile("tone", tone.profile_id)
+    assert tone.profile_id not in app_model._tone_profiles
+
+
 def test_spinnaker_camera_selectors_keep_only_their_configured_binding(
     app_model,
     trainer_config_dir,

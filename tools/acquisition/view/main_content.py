@@ -42,7 +42,7 @@ from tools.acquisition.view.training_plan_progress_content import TrainingPlanPr
 
 logger = get_verbose_logger(__name__)
 
-_REACHAQ_PROTOCOL_UI_ENABLED = False
+_REACHAQ_PROTOCOL_UI_ENABLED = True
 
 
 def _camera_panel_title(camera_name: str) -> str:
