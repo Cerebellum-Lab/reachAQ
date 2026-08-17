@@ -179,6 +179,28 @@ def test_send_sequence_can_append_one_embedded_tone_without_mutating_template():
     assert device._send_pellet.steps == original
 
 
+def test_send_sequence_can_prepend_board_timed_pre_reveal_stimulus():
+    device = CanDevice(
+        api=DeviceApi(message_callback=data_callback),
+        force_emulation=True,
+        required_targets=(Target.PELLET_DEVICE,),
+    )
+    original = device._send_pellet.steps
+    device._start_sequence = mock.Mock(return_value=True)
+
+    assert device._start_send_pellet_sequence({
+        "pre_reveal_stimulus": (200, 1000),
+    })
+
+    sequence = device._start_sequence.call_args.args[0]
+    assert sequence.steps[:3] == [
+        {"stim3": 1000},
+        {"delay": 0.2},
+        {"predefined": "release"},
+    ]
+    assert device._send_pellet.steps == original
+
+
 def test_immediate_tone_status_is_forwarded_with_source_timestamp():
     received = []
     device = CanDevice(

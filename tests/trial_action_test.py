@@ -146,7 +146,7 @@ def test_executor_prepares_before_send_and_binds_acknowledgement():
     recipe = compiler.compile(row, _context())
     executor = TrialActionExecutor(
         move_absolute=lambda target: calls.append(("move", target)),
-        configure_cover=lambda policy: calls.append(("cover", policy)),
+        configure_cover=lambda policy, recipe: calls.append(("cover", policy)),
         play_tone=lambda profile, phase: calls.append(("tone", profile.profile_id, phase)),
         prepare_laser=lambda profile, recipe: calls.append(("laser", profile.profile_id)),
         cancel_laser=lambda handle: calls.append(("cancel_laser", handle)),
@@ -180,7 +180,7 @@ def test_executor_preparation_failure_cancels_laser_and_creates_no_send():
     recipe = _compiler().compile(laser_row, _context())
     executor = TrialActionExecutor(
         move_absolute=lambda target: None,
-        configure_cover=lambda policy: None,
+        configure_cover=lambda policy, recipe: None,
         play_tone=lambda profile, phase: None,
         prepare_laser=lambda profile, recipe: (_ for _ in ()).throw(RuntimeError("arm failed")),
         cancel_laser=lambda handle: calls.append(handle),
@@ -207,7 +207,7 @@ def test_executor_routes_hardware_stimulus_through_firmware_callback():
     recipe = _compiler().compile(row, _context())
     executor = TrialActionExecutor(
         move_absolute=lambda target: None,
-        configure_cover=lambda policy: None,
+        configure_cover=lambda policy, recipe: None,
         play_tone=lambda profile, phase: None,
         prepare_laser=lambda profile, recipe: object(),
         cancel_laser=lambda handle: None,
@@ -232,7 +232,7 @@ def test_embedded_tone_is_prepared_without_host_playback():
     recipe = _compiler().compile(row, _context())
     executor = TrialActionExecutor(
         move_absolute=lambda target: None,
-        configure_cover=lambda policy: None,
+        configure_cover=lambda policy, recipe: None,
         play_tone=lambda profile, phase: calls.append((profile.profile_id, phase)),
         prepare_laser=lambda profile, recipe: None,
         cancel_laser=lambda handle: None,

@@ -341,7 +341,7 @@ class TrialActionExecutor:
         self,
         *,
         move_absolute: Callable[[Tuple[float, float, float]], object],
-        configure_cover: Callable[[str], object],
+        configure_cover: Callable[[str, CompiledTrialRecipe], object],
         play_tone: Callable[[ToneProfile, str], object],
         prepare_laser: Callable[[LaserPulseProfile, CompiledTrialRecipe], object],
         cancel_laser: Callable[[object], None],
@@ -393,7 +393,7 @@ class TrialActionExecutor:
             self._move_absolute(recipe.resolved_motor_target)
             self._observe("motor target acknowledged")
             cover = recipe.requested_row["cover_policy"]
-            self._configure_cover(str(cover))
+            self._configure_cover(str(cover), recipe)
             self._observe(f"cover policy prepared: {cover}")
             row = recipe.requested_row
             if (

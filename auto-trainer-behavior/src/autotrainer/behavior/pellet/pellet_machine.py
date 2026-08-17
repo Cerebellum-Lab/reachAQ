@@ -123,6 +123,7 @@ class PelletMachine(StateMachine):
         self._send_guard_callback = None
         self._prepared_cover_policy: Optional[str] = None
         self._prepared_embedded_tone = None
+        self._prepared_pre_reveal_stimulus = None
         self._command_ack_condition = threading.Condition(threading.RLock())
 
         self.machine = Machine(
@@ -201,11 +202,13 @@ class PelletMachine(StateMachine):
                 action()
         token = self._pellet_device.send_pellet(
             embedded_tone=self._prepared_embedded_tone,
+            pre_reveal_stimulus=self._prepared_pre_reveal_stimulus,
         )
         if token is None:
             raise PelletDeviceCommandFailed
         self._prepared_cover_policy = None
         self._prepared_embedded_tone = None
+        self._prepared_pre_reveal_stimulus = None
         self._token_pellet_send = self._api_status_token = token
         self._send_begin_perf_c = get_perf_now()
         self.events.pellet_sending(
@@ -294,12 +297,36 @@ class PelletMachine(StateMachine):
     def cancel_prepared_cover_policy(self) -> None:
         self._prepared_cover_policy = None
         self._prepared_embedded_tone = None
+        self._prepared_pre_reveal_stimulus = None
 
     def prepare_embedded_tone(self, frequency_hz: int, duration_ms: int) -> None:
         frequency_hz, duration_ms = int(frequency_hz), int(duration_ms)
         if frequency_hz <= 0 or duration_ms <= 0:
             raise ValueError("Embedded tone frequency and duration must be positive")
         self._prepared_embedded_tone = (frequency_hz, duration_ms)
+
+    def prepare_pre_reveal_stimulus(
+        self,
+        delay_ms: int,
+        pulse_duration_us: int,
+    ) -> None:
+        """Bind a board-timed STIM3 pulse/reveal action to the next SEND.
+
+        The pellet board emits STIM3, waits the requested interval, reveals the
+        pellet, and only then continues the configured SEND sequence.  Keeping
+        all three actions in the compound board command avoids a host timer.
+        """
+        delay_ms = int(delay_ms)
+        pulse_duration_us = int(pulse_duration_us)
+        if not 1 <= delay_ms <= 60_000:
+            raise ValueError("Pre-reveal delay must be within 1..60000 ms")
+        if not 100 <= pulse_duration_us <= 5_000_000:
+            raise ValueError("STIM3 pulse duration must be within 100 us..5 s")
+        self._prepared_cover_policy = "reveal"
+        self._prepared_pre_reveal_stimulus = (
+            delay_ms,
+            pulse_duration_us,
+        )
 
     def can_cover_pellet(self, *, force: bool=False):
         can = force or (

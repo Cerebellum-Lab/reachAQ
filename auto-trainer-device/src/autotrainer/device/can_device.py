@@ -1088,6 +1088,19 @@ class CanDevice(Device):
 
     def _start_send_pellet_sequence(self, data) -> bool:
         steps = self._send_pellet.steps
+        if isinstance(data, dict) and data.get("pre_reveal_stimulus") is not None:
+            delay_ms, pulse_duration_us = data["pre_reveal_stimulus"]
+            delay_ms = int(delay_ms)
+            pulse_duration_us = int(pulse_duration_us)
+            if not 1 <= delay_ms <= 60_000:
+                raise ValueError("Pre-reveal delay must be within 1..60000 ms")
+            if not 100 <= pulse_duration_us <= 5_000_000:
+                raise ValueError("STIM3 pulse duration must be within 100 us..5 s")
+            steps[0:0] = [
+                {"stim3": pulse_duration_us},
+                {"delay": delay_ms / 1000.0},
+                {"predefined": "release"},
+            ]
         if isinstance(data, dict) and data.get("embedded_tone") is not None:
             frequency_hz, duration_ms = data["embedded_tone"]
             frequency_hz = int(frequency_hz)
@@ -1117,6 +1130,10 @@ class CanDevice(Device):
         elif 'delay' in step:
             motor = Motor.DELAY
         elif 'tone' in step:
+            motor = Motor.TONE
+        elif 'stim3' in step:
+            # STIM3 is physically owned by the pellet board.  Motor.TONE is
+            # used only as the existing compound-step timeout category.
             motor = Motor.TONE
         elif 'servo_attach' in step:
             motor = step['servo_attach']
@@ -1483,6 +1500,23 @@ class CanDevice(Device):
             success = self._interface.emit_tone(frequency_hz, duration_ms)
             if success:
                 board.skip_uuid_ack_perf_c = True
+
+        elif 'stim3' in step:
+            motor = Motor.TONE
+            duration_us = int(step['stim3'])
+            if self._operation_callback is not None:
+                self._operation_callback(
+                    SystemCommandKind.PULSE_DIGITAL_OUTPUT,
+                    (4, duration_us),
+                    board.ctx,
+                    board.target,
+                    time.perf_counter(),
+                    time.time(),
+                )
+            success = self._interface.pulse_digital_output(
+                DigitalOutputs.STIMULUS_4,
+                duration_us,
+            )
 
         elif 'predefined' in step:
 

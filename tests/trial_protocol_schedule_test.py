@@ -168,6 +168,35 @@ def test_roi_triggers_are_serializable_but_not_runnable():
         row.validate(runnable=True)
 
 
+def test_pre_reveal_requires_board_route_and_reveal_policy():
+    base = {
+        "enabled": True,
+        "stimulus_assignment": "always",
+        "stimulus_trigger": "pre_reveal",
+        "pre_reveal_ms": 200,
+        "laser_profile_id": "pulse",
+        "laser_phase": "embedded_in_sequence",
+    }
+    with pytest.raises(ValueError, match="Reveal cover policy"):
+        TrialProtocolRow(trial_id=1).with_updates({
+            **base,
+            "laser_trigger_route": "hardware_stim3",
+        })
+    with pytest.raises(ValueError, match="Hardware STIM3"):
+        TrialProtocolRow(trial_id=1).with_updates({
+            **base,
+            "cover_policy": "reveal",
+            "laser_trigger_route": "direct_ni_software",
+        })
+
+    row = TrialProtocolRow(trial_id=1).with_updates({
+        **base,
+        "cover_policy": "reveal",
+        "laser_trigger_route": "hardware_stim3",
+    })
+    assert row.pre_reveal_ms == 200
+
+
 @pytest.mark.parametrize(
     "values, message",
     [

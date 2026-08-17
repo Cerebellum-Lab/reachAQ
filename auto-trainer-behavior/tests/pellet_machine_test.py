@@ -443,6 +443,20 @@ def test_prepared_embedded_tone_is_bound_to_send_command(machine):
     pellet_m.send_pellet(force=True)
 
     pellet_m._pellet_device.send_pellet.assert_called_with(
-        embedded_tone=(6000, 125)
+        embedded_tone=(6000, 125),
+        pre_reveal_stimulus=None,
     )
     assert pellet_m._prepared_embedded_tone is None
+
+
+def test_prepared_pre_reveal_stimulus_is_bound_once(machine):
+    pellet_m = machine.pellet
+    pellet_m.prepare_pre_reveal_stimulus(200, 1000)
+
+    pellet_m.send_pellet(force=True)
+
+    pellet_m._pellet_device.send_pellet.assert_called_with(
+        embedded_tone=None,
+        pre_reveal_stimulus=(200, 1000),
+    )
+    assert pellet_m._prepared_pre_reveal_stimulus is None

@@ -283,6 +283,12 @@ class TrialProtocolRow:
         if self.stimulus_trigger is StimulusTrigger.PRE_REVEAL:
             if self.pre_reveal_ms <= 0:
                 raise ValueError("Pre-reveal trigger requires a positive delay")
+            if self.cover_policy is not CoverPolicy.REVEAL:
+                raise ValueError("Pre-reveal trigger requires Reveal cover policy")
+            if self.laser_trigger_route is not LaserTriggerRoute.HARDWARE_STIM3:
+                raise ValueError(
+                    "Pre-reveal trigger requires the Hardware STIM3 route"
+                )
         elif self.pre_reveal_ms:
             raise ValueError("pre_reveal_ms applies only to pre_reveal trigger")
         if self.stimulus_assignment is StimulusAssignment.DISABLED:
