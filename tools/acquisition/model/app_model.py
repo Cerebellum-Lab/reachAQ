@@ -186,6 +186,11 @@ from tools.acquisition.model.trial_action import (
     TrialActionExecutor,
     TrialCompileContext,
 )
+from tools.acquisition.model.automatic_pellet_shift import (
+    AutomaticPelletShiftController,
+    AutomaticShiftPolicy,
+    ReachPositionObservation,
+)
 from tools.acquisition.model.session_stop_policy import (
     SessionStopConfiguration,
     SessionStopDecision,
@@ -652,6 +657,7 @@ class AppModel(ObservableObject):
         self._protocol_action_thread = None
         self._protocol_positioning_active = False
         self._protocol_session_seed = 0
+        self._automatic_protocol_shifts = {}
         self._tone_profiles = {
             "tone-1": ToneProfile("tone-1", 1, 5000, 100),
             "tone-2": ToneProfile("tone-2", 1, 6000, 100),
@@ -1145,6 +1151,7 @@ class AppModel(ObservableObject):
             ).digest()[:8],
             "big",
         )
+        self._automatic_protocol_shifts.clear()
         self._publish_session_recording_transition(
             previous_status,
             SessionRecordingStatus.ARMING,
@@ -4458,6 +4465,18 @@ class AppModel(ObservableObject):
             converted = offset if diamond is None else diamond.diamond_to_motor(offset)
             return tuple(converted)
 
+        delivery = self._behavior.algorithm.active_config.pellet_delivery
+        lane_offsets = {
+            "center": (0.0, 0.0, 0.0),
+            "left": tuple(delivery.lane_left_offset_dcs),
+            "right": tuple(delivery.lane_right_offset_dcs),
+        }
+        automatic = None
+        if row.position_mode.value == "reach_derived_automatic":
+            controller = self._automatic_shift_controller(row)
+            automatic = controller.latest
+            if automatic is not None and automatic.apply_automatically:
+                controller.accept(automatic.generation)
         context = TrialCompileContext(
             session_id=token.session_id,
             session_generation=token.generation,
@@ -4467,16 +4486,21 @@ class AppModel(ObservableObject):
             attempt_id=attempt_id,
             session_seed=self._protocol_session_seed,
             animal_base_dcs=(animal.pellet_x, animal.pellet_y, animal.pellet_z),
-            # Calibrated lane offsets are explicit future configuration. Center
-            # is the safe baseline; non-center rows are rejected below until
-            # the operator supplies calibrated offsets.
-            lane_offsets_dcs={
-                "center": (0.0, 0.0, 0.0),
-                "left": (0.0, 0.0, 0.0),
-                "right": (0.0, 0.0, 0.0),
-            },
+            lane_offsets_dcs=lane_offsets,
+            automatic_target_dcs=(
+                None if automatic is None else automatic.resolved_target_dcs
+            ),
+            automatic_generation=(
+                None if automatic is None else automatic.generation
+            ),
+            automatic_reach_ids=(
+                () if automatic is None else automatic.reach_ids
+            ),
         )
-        if row.position_lane.value != "center":
+        if (
+            row.position_lane.value != "center"
+            and lane_offsets[row.position_lane.value] == (0.0, 0.0, 0.0)
+        ):
             raise RuntimeError(
                 f"{row.position_lane.label} pellet lane has no calibrated DCS offset"
             )
@@ -4486,6 +4510,33 @@ class AppModel(ObservableObject):
             dcs_to_motor=dcs_to_motor,
         )
         return compiler.compile(row, context)
+
+    def _automatic_shift_controller(self, row):
+        key = (
+            row.automatic_shift_policy_id,
+            row.automatic_window_method.value,
+            row.automatic_window_size,
+        )
+        controller = self._automatic_protocol_shifts.get(key)
+        if controller is None:
+            shift_config = (
+                self._behavior.algorithm.active_config.shift_xyz_handler.buffer
+            )
+            target = shift_config.target
+            controller = AutomaticPelletShiftController(AutomaticShiftPolicy(
+                policy_id=row.automatic_shift_policy_id,
+                window_method=row.automatic_window_method.value,
+                window_size=row.automatic_window_size,
+                target_reach_offset_dcs=tuple(target),
+                minimum_y_dcs=(
+                    None
+                    if self._selected_animal is None
+                    else self._selected_animal.target_y_limit
+                ),
+                apply_automatically=True,
+            ))
+            self._automatic_protocol_shifts[key] = controller
+        return controller
 
     def _move_protocol_motor_target(self, target) -> None:
         self._protocol_positioning_active = True
@@ -7900,9 +7951,14 @@ class AppModel(ObservableObject):
             self._intertrial_resolution_reason = ""
         self._intertrial_waiting_operations.discard(request.operation_id)
 
+        protocol_shift_handled = self._update_protocol_automatic_shift(
+            result,
+            finalized,
+        )
         if (
             result.reaches
             and can_affect_next_trial
+            and not protocol_shift_handled
             and self._behavior.algorithm.active_config.pellet_delivery
             .is_intersession_pellet_shift_enabled
         ):
@@ -7935,6 +7991,61 @@ class AppModel(ObservableObject):
             finalized.reach_count,
             result.analysis_seconds,
         )
+
+    def _update_protocol_automatic_shift(self, result, finalized) -> bool:
+        context = finalized.protocol_context or {}
+        row_record = context.get("trial_row") or {}
+        if row_record.get("position_mode") != "reach_derived_automatic":
+            return False
+        try:
+            row = self._trial_protocol_schedule.row(finalized.trial_id).from_record(
+                row_record
+            )
+            controller = self._automatic_shift_controller(row)
+            animal = self._selected_animal
+            if animal is None:
+                raise RuntimeError("Automatic shift has no selected subject")
+            delivery = self._behavior.algorithm.active_config.pellet_delivery
+            lane_offset = {
+                "center": (0.0, 0.0, 0.0),
+                "left": tuple(delivery.lane_left_offset_dcs),
+                "right": tuple(delivery.lane_right_offset_dcs),
+            }[row.position_lane.value]
+            baseline = tuple(
+                value + offset
+                for value, offset in zip(
+                    (animal.pellet_x, animal.pellet_y, animal.pellet_z),
+                    lane_offset,
+                )
+            )
+            latest = None
+            for index, trajectory in enumerate(result.reaches, start=1):
+                latest = controller.add(
+                    ReachPositionObservation(
+                        reach_id=f"{finalized.attempt_label}:reach-{index}",
+                        outcome=("success" if trajectory.consumed else "failure"),
+                        closest_offset_dcs=trajectory.closest_offset,
+                    ),
+                    baseline_dcs=baseline,
+                ) or latest
+            if latest is not None:
+                accepted = controller.accept(latest.generation)
+                logger.info(
+                    "Automatic pellet target generation %s from reaches %s: "
+                    "recommended=%s target=%s accepted=%s",
+                    latest.generation,
+                    latest.reach_ids,
+                    latest.recommended_shift_dcs,
+                    latest.resolved_target_dcs,
+                    accepted is not None,
+                )
+            return True
+        except (KeyError, RuntimeError, TypeError, ValueError):
+            logger.exception(
+                "Could not update automatic pellet target for %s",
+                finalized.attempt_label,
+            )
+            return True
 
     def _sync_session_counts_from_results(
         self,

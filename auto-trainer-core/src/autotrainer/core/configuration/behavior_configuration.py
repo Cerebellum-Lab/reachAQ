@@ -78,6 +78,10 @@ class PelletDeliveryConfiguration:
     is_enabled: bool = False
     """When disabled no automatic behavior movement will be peformed, but eventually on application start"""
 
+    lane_left_offset_dcs: Offset3DTuple = field(default_factory=Offset3DTuple.get_zero)
+    lane_right_offset_dcs: Offset3DTuple = field(default_factory=Offset3DTuple.get_zero)
+    """Calibrated categorical offsets from the animal's center pellet position."""
+
     pellet_send_wait_delay: float = 1
     """Seconds after recording starts before an automatic pellet send."""
 

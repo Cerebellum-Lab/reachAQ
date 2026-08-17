@@ -348,6 +348,44 @@ def test_ordered_protocol_trial_compiles_absolute_target(app_model, tmp_path):
     assert recipe.requested_row["enabled"] is True
 
 
+def test_protocol_automatic_shift_updates_future_absolute_target(app_model, tmp_path):
+    app_model._trial_protocol_repository = TrialProtocolRepository(tmp_path)
+    app_model.save_ordered_protocol(TrialProtocolDocument(
+        protocol_id="automatic",
+        name="Automatic",
+        trial_count=2,
+        defaults=ProtocolPatch.from_mapping({
+            "enabled": True,
+            "position_mode": "reach_derived_automatic",
+            "automatic_window_size": 1,
+        }),
+    ))
+    app_model._selected_animal = SimpleNamespace(
+        pellet_x=10.0,
+        pellet_y=20.0,
+        pellet_z=30.0,
+        target_y_limit=None,
+    )
+    row = app_model._trial_protocol_schedule.row(1)
+    finalized = SimpleNamespace(
+        trial_id=1,
+        attempt_label="1.1",
+        protocol_context={"trial_row": row.to_record()},
+    )
+    result = SimpleNamespace(reaches=(ReachTrajectory(
+        start_perf=1.0,
+        closest_perf=1.1,
+        end_perf=1.2,
+        closest_offset=(2.5, -3.0, 1.0),
+        consumed=False,
+    ),))
+
+    assert app_model._update_protocol_automatic_shift(result, finalized)
+    controller = app_model._automatic_shift_controller(row)
+    assert controller.latest.recommended_shift_dcs == (1.0, 0.0, 0.0)
+    assert controller.accepted_target == (11.0, 20.0, 30.0)
+
+
 def test_scored_trial_limit_is_available_with_live_intertrial_scoring(app_model):
     control = app_model.behavior.algorithm.active_config.session_control
     control.trial_limit = 5

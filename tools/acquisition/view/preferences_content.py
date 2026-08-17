@@ -21,6 +21,7 @@ from autotrainer.behavior.pellet_trial import (
 )
 from autotrainer.core.logging import get_verbose_logger
 from autotrainer.core.configuration import SessionControlConfiguration
+from autotrainer.core import Offset3DTuple
 from autotrainer.pyside import QSwitch
 from autotrainer.pyside.content_widget import invoke_method
 
@@ -399,6 +400,44 @@ class PreferencesContent(QWidget):
         left_grid_layout.addWidget(spinbox, cur_row, cur_col + 1)
         cur_row += 1
         #
+        left_grid_layout.addWidget(
+            QLabel("<b>Pellet lane offsets (DCS mm):</b>"), cur_row, cur_col
+        )
+        cur_row += 1
+
+        def add_lane_offset_editor(label, attribute):
+            nonlocal cur_row
+            editor = QWidget()
+            editor_layout = QHBoxLayout(editor)
+            editor_layout.setContentsMargins(0, 0, 0, 0)
+            current = getattr(algo.active_config.pellet_delivery, attribute)
+            boxes = []
+
+            def changed(_value):
+                update_config(
+                    f"Changing {label.lower()} pellet lane offset",
+                    algo.active_config.pellet_delivery,
+                    attribute,
+                    Offset3DTuple(*(box.value() for box in boxes)),
+                )
+
+            for axis, value in zip("XYZ", current):
+                box = QDoubleSpinBox()
+                box.setRange(-30.0, 30.0)
+                box.setDecimals(2)
+                box.setSingleStep(0.1)
+                box.setSuffix(f" {axis}")
+                box.setValue(value)
+                box.valueChanged.connect(changed)
+                boxes.append(box)
+                editor_layout.addWidget(box)
+            left_grid_layout.addWidget(QLabel(f"{label}:"), cur_row, cur_col)
+            left_grid_layout.addWidget(editor, cur_row, cur_col + 1)
+            cur_row += 1
+
+        add_lane_offset_editor("Left", "lane_left_offset_dcs")
+        add_lane_offset_editor("Right", "lane_right_offset_dcs")
+
         shift_xyz_cfg = algo.active_config.shift_xyz_handler
         left_grid_layout.addWidget(QLabel("<b>Intertrial Pellet Shift:</b>"), cur_row, cur_col)
         toggle = self._intersession_pellet_shift_toggle = QSwitch()
