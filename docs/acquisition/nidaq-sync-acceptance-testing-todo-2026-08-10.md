@@ -749,6 +749,17 @@ Implementation inventory (code/document review):
 
 Software/emulation checks:
 
+Automated implementation verification on `devel` (2026-08-17):
+
+- [x] Root repository suite: 1,015 passed, 35 skipped, with two expected
+      missing-stereo-parameter warnings and no failures.
+- [x] Every local reachAQ and coordinated hardware commit passes Git patch/
+      whitespace validation; both worktrees are clean and `temp/` has zero
+      tracked files.
+- [x] The existing pellet-module Zephyr sysbuild and JerryCAN updater builds are
+      current (`ninja: no work to do`). This confirms source/build integration,
+      not firmware flash or physical qualification.
+
 - [ ] Create/save/duplicate/rename/import/export a protocol; restart reachAQ and
       confirm the selected revision and expanded schedule are unchanged.
 - [ ] Exercise each pellet-cycle policy and tone phase. Confirm acknowledgements,
