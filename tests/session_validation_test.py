@@ -85,3 +85,33 @@ def test_cli_writes_only_explicit_output(tmp_path):
     output = tmp_path / "report.json"
     assert main([str(root), "--quick", "--json", "--output", str(output)]) == 0
     assert json.loads(output.read_text(encoding="utf-8"))["profile"] == "quick"
+
+
+def test_fast_validator_checks_board_clock_and_sequence_evidence(tmp_path):
+    root = _session(tmp_path)
+    columns = (
+        "perf_time", "host_receive_perf_time", "board_boot_id",
+        "board_sequence", "board_time_us", "board_timestamp_kind",
+        "board_aligned_perf_time", "board_clock_model_id",
+        "board_clock_uncertainty_seconds", "estimated_transport_delay_seconds",
+        "event_perf_time", "event_timestamp_method", "event_timing_confidence",
+    )
+    rows = (
+        (10.0, 10.01, 7, 1, 1000, "physical_start", 10.0, "m1", 0.001,
+         0.01, 10.0, "board_clock_affine", "board_timestamp"),
+        (10.1, 10.11, 7, 2, 101000, "completed", 10.1, "m1", 0.001,
+         0.01, 10.1, "board_clock_affine", "board_timestamp"),
+    )
+    path = root / "streams/device.csv"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as stream:
+        import csv
+        writer = csv.writer(stream)
+        writer.writerow(columns)
+        writer.writerows(rows)
+
+    report = validate_session(root, profile=ValidationProfile.FAST)
+
+    result = next(item for item in report.results if item.rule_id == "events.board_time")
+    assert result.status.value == "pass"
+    assert result.observed["timestamped_rows"] == 2

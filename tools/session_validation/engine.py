@@ -68,6 +68,7 @@ def validate_session(
         _camera_rule,
         _nidaq_rule,
         _event_rule,
+        _board_time_rule,
         _trial_rule,
     )
     results = []
@@ -356,6 +357,126 @@ def _event_rule(context):
     )
 _event_rule.RULE_ID = "events.alignment"
 _event_rule.MINIMUM = ValidationProfile.FAST
+
+
+def _optional_float(row, name):
+    value = row.get(name)
+    if value in (None, ""):
+        return None
+    value = float(value)
+    if not math.isfinite(value):
+        raise ValueError(f"{name} is not finite")
+    return value
+
+
+def _optional_int(row, name):
+    value = row.get(name)
+    if value in (None, ""):
+        return None
+    return int(value)
+
+
+def _board_time_rule(context):
+    path = context.path("streams/device.csv")
+    if not path.is_file():
+        return _result("events.board_time", "not_applicable", "Device stream is absent")
+    errors, warnings = [], []
+    timestamped = 0
+    previous = {}
+    model_ids = set()
+    with path.open("r", encoding="utf-8", newline="") as stream:
+        reader = csv.DictReader(stream)
+        required = {
+            "host_receive_perf_time", "board_boot_id", "board_sequence",
+            "board_time_us", "board_timestamp_kind", "board_aligned_perf_time",
+            "board_clock_model_id", "board_clock_uncertainty_seconds",
+            "estimated_transport_delay_seconds", "event_perf_time",
+            "event_timestamp_method", "event_timing_confidence",
+        }
+        missing = required - set(reader.fieldnames or ())
+        if missing:
+            return _result(
+                "events.board_time", "fail",
+                "Current device timing schema is incomplete: " + ", ".join(sorted(missing)),
+                paths=(path.as_posix(),),
+            )
+        for line_number, row in enumerate(reader, 2):
+            try:
+                boot = _optional_int(row, "board_boot_id")
+                sequence = _optional_int(row, "board_sequence")
+                board_us = _optional_int(row, "board_time_us")
+                if boot is None and sequence is None and board_us is None:
+                    continue
+                timestamped += 1
+                if None in (boot, sequence, board_us):
+                    errors.append(f"row {line_number}: partial board timing envelope")
+                    continue
+                prior = previous.get(boot)
+                if prior is not None:
+                    prior_sequence, prior_us = prior
+                    delta = (sequence - prior_sequence) & 0xFFFFFFFF
+                    if delta == 0:
+                        errors.append(f"row {line_number}: duplicate board sequence {sequence}")
+                    elif delta >= 0x80000000:
+                        errors.append(f"row {line_number}: board sequence moved backward")
+                    elif delta > 1:
+                        warnings.append(
+                            f"row {line_number}: {delta - 1} board message(s) missing"
+                        )
+                    if board_us < prior_us:
+                        errors.append(f"row {line_number}: board clock moved backward")
+                previous[boot] = (sequence, board_us)
+
+                aligned = _optional_float(row, "board_aligned_perf_time")
+                model_id = row.get("board_clock_model_id") or None
+                uncertainty = _optional_float(row, "board_clock_uncertainty_seconds")
+                transport = _optional_float(row, "estimated_transport_delay_seconds")
+                event_perf = _optional_float(row, "event_perf_time")
+                method = row.get("event_timestamp_method")
+                confidence = row.get("event_timing_confidence")
+                if aligned is None:
+                    if method == "board_clock_affine" or confidence == "board_timestamp":
+                        errors.append(f"row {line_number}: board confidence lacks aligned time")
+                    continue
+                if not model_id or uncertainty is None or uncertainty < 0:
+                    errors.append(f"row {line_number}: aligned board time lacks a valid clock model")
+                else:
+                    model_ids.add(model_id)
+                if method == "board_clock_affine":
+                    if event_perf is None or abs(event_perf - aligned) > 1e-9:
+                        errors.append(f"row {line_number}: selected event time differs from board alignment")
+                    if confidence != "board_timestamp":
+                        errors.append(f"row {line_number}: board event has incorrect confidence")
+                if transport is not None and uncertainty is not None:
+                    if transport < -uncertainty:
+                        errors.append(f"row {line_number}: transport delay precedes uncertainty bound")
+                    elif transport < 0:
+                        warnings.append(f"row {line_number}: transport delay is slightly negative")
+                    elif transport > 1.0:
+                        warnings.append(f"row {line_number}: transport delay exceeds 1 s")
+            except (TypeError, ValueError) as error:
+                errors.append(f"row {line_number}: {error}")
+    if not timestamped:
+        return _result(
+            "events.board_time", "not_applicable",
+            "No board timing envelopes were present; host receive timing remains in use",
+        )
+    status = "fail" if errors else ("warning" if warnings else "pass")
+    details = errors or warnings
+    return _result(
+        "events.board_time", status,
+        "; ".join(details[:20]) if details else "Board clocks, sequences, and aligned events are valid",
+        observed={
+            "timestamped_rows": timestamped,
+            "boot_epochs": len(previous),
+            "clock_models": sorted(model_ids),
+            "warnings": len(warnings),
+            "errors": len(errors),
+        },
+        paths=(path.as_posix(),),
+    )
+_board_time_rule.RULE_ID = "events.board_time"
+_board_time_rule.MINIMUM = ValidationProfile.FAST
 
 
 def _trial_rule(context):
