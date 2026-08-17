@@ -61,6 +61,7 @@ class NidaqLaserOperation:
         self._observations = [(self._state.value, time.perf_counter(), "")]
         self._tasks = ()
         self._error = None
+        self._timing_status = {}
         self._thread = None
 
     @property
@@ -135,6 +136,7 @@ class NidaqLaserOperation:
                     None if self._error is None
                     else f"{type(self._error).__name__}: {self._error}"
                 ),
+                "timing_status": dict(self._timing_status),
             }
 
     def add_terminal_callback(self, callback):
@@ -146,7 +148,14 @@ class NidaqLaserOperation:
             else:
                 self._terminal_callbacks.append(callback)
         if call_now:
-            callback(self)
+            try:
+                callback(self)
+            except Exception:
+                logger.exception("Laser terminal callback failed")
+
+    def _set_timing_status(self, status):
+        with self._lock:
+            self._timing_status = dict(status)
 
     def _bind_tasks(self, tasks):
         with self._lock:
@@ -478,6 +487,8 @@ class NidaqLaserController:
             timing_kwargs, timing_status = self._resolve_pulse_timing(
                 channels, pulse_train,
             )
+            if operation is not None:
+                operation._set_timing_status(timing_status)
             ao_task.timing.cfg_samp_clk_timing(
                 rate=sample_rate_hz,
                 sample_mode=self._nidaqmx.constants.AcquisitionType.FINITE,
@@ -601,6 +612,20 @@ class NidaqLaserController:
             "startTriggerSource": pulse_train.trigger_source,
             "referenceClockSource": None,
         }
+        if pulse_train.defer_start:
+            return {}, {
+                **base,
+                "status": "software_start",
+                "reason": (
+                    "Finite output is committed before a dedicated software "
+                    "start request"
+                ),
+                "referenceClockSource": (
+                    None
+                    if plan is None or not plan.is_valid
+                    else plan.reference_clock_source
+                ),
+            }
         if plan is None or not plan.is_valid:
             return {}, {
                 **base,

@@ -212,6 +212,26 @@ def test_nidaq_laser_uses_shared_clock_only_with_future_hardware_trigger():
     assert status["referenceClockSource"] == "PXI_CLK10"
 
 
+def test_nidaq_laser_labels_deferred_start_as_software_timed_without_plan():
+    channel = make_channel()
+    controller = object.__new__(NidaqLaserController)
+    controller._timing_plan = None
+    pulse = LaserSynchronizedPulseTrain(
+        pulse_trains=(LaserPulseTrain(
+            channel_id=LaserChannelId.LASER_1,
+            amplitude_volts=1.0,
+            duration_ms=10.0,
+        ),),
+        wait=False,
+        defer_start=True,
+    )
+
+    kwargs, status = controller._resolve_pulse_timing((channel,), pulse)
+
+    assert kwargs == {}
+    assert status["status"] == "software_start"
+
+
 def test_nonblocking_laser_operation_is_owned_until_terminal(monkeypatch):
     channel = make_channel()
     controller = object.__new__(NidaqLaserController)

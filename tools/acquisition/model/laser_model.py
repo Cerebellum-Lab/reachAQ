@@ -305,6 +305,22 @@ class LaserModel(ObservableObject):
         )
         if operation is None:
             raise RuntimeError("Protocol laser preparation did not return an operation")
+        operation_record = operation.to_record()
+        timing_status = operation_record.get("timing_status") or {}
+        required_status = (
+            "hardware_synchronized" if hardware_trigger else "software_start"
+        )
+        if timing_status.get("status") != required_status:
+            operation.cancel()
+            raise RuntimeError(
+                "Protocol laser timing is not ready: expected "
+                f"{required_status}, found "
+                f"{timing_status.get('status', 'unknown')}; "
+                + str(
+                    timing_status.get("reason")
+                    or "no timing reason was reported"
+                )
+            )
         self._emit_protocol_operation_event(
             operation,
             "prepared",

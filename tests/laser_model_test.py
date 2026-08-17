@@ -3,6 +3,8 @@ import threading
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from autotrainer.device import LaserChannelConfiguration, LaserSystemConfiguration
 from tools.acquisition.model.laser_model import LaserModel
 from tools.acquisition.model.trial_action import LaserPulseProfile
@@ -24,6 +26,16 @@ class _Controller:
         self.operation.trigger = lambda: setattr(
             self.operation, "trigger_count", self.operation.trigger_count + 1
         )
+        self.operation.cancel = lambda: True
+        self.operation.to_record = lambda: {
+            "timing_status": {
+                "status": (
+                    "software_start"
+                    if self.pulse is not None and self.pulse.defer_start
+                    else "hardware_synchronized"
+                )
+            }
+        }
 
     def run_synchronized_pulse_train(self, pulse):
         self.pulse = pulse
@@ -70,6 +82,25 @@ def test_prepare_direct_laser_profile_defers_start():
     model.prepare_pulse_profile(profile, _recipe())
     assert controller.pulse.trigger_source is None
     assert controller.pulse.defer_start
+
+
+def test_prepare_hardware_laser_rejects_unverified_timing():
+    controller = _Controller()
+    controller.operation.to_record = lambda: {
+        "timing_status": {
+            "status": "unsupported",
+            "reason": "trigger route was not verified",
+        }
+    }
+    model = LaserModel(controller)
+    profile = LaserPulseProfile(
+        "pulse", 1, 1, 2.5, 5,
+        trigger_route=LaserTriggerRoute.HARDWARE_STIM3,
+        trigger_terminal="/Dev1/PFI0",
+    )
+
+    with pytest.raises(RuntimeError, match="trigger route was not verified"):
+        model.prepare_pulse_profile(profile, _recipe())
 
 
 def test_direct_trigger_receiver_validates_nonce_and_starts_prepared_operation():
