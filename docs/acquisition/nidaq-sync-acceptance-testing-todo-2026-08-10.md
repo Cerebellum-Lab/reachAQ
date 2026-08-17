@@ -708,3 +708,81 @@ software implementation gaps.
       the tested hardware configurations.
 - [ ] All unexplained warnings/errors and every failed checklist item have a
       linked issue, captured logs, and an explicit disposition before release.
+
+## 2026-08-17 ordered protocol, validation, board time, stim camera, and laser
+
+Implementation inventory (code/document review):
+
+- [x] Reusable versioned protocols support session selection, atomic persistence,
+      per-file failure isolation, typed profile references, defaults/epoch/block/
+      bulk/trial precedence, locking, copy/fill/repeat, deterministic random
+      preview, revision undo/redo, import, and export.
+- [x] The prepared-operation owner freezes a row before physical action, resolves
+      absolute DCS/motor targets, waits for position/cover readiness, pre-arms
+      laser/detector work, and creates no attempt when preparation fails.
+- [x] Base, fixed XYZ, center/left/right, legacy-batch automatic, and sliding-last-X
+      automatic targets are mutually exclusive, absolute, generation-owned, and
+      noncumulative on retry.
+- [x] Tone phases, pellet-cycle policies, First Reach, direct-NI versus STIM3
+      route freezing, board-timed pre-reveal, and terminal action evidence are
+      connected to the retained owners rather than UI hardware calls.
+- [x] NI exact Verify/Commit, one/two-device graph limit, route/resource records,
+      probe-gated multidevice expansion/fallback, preallocated readers, common
+      availability barrier, count checks, and read telemetry are implemented.
+- [x] Finite laser operations own asynchronous state/resources/cleanup, future
+      hardware triggers or explicit software start, and PMT pulse-train lead/lag;
+      delayed calibration ramps remain intentionally unsupported.
+- [x] Stim-camera session mode freezes to synchronized continuous 150 Hz when
+      stimulation is disabled or cropped 900 Hz batched evidence plus 0.5 s
+      pre/post event clips when enabled. ROI1/ROI2 remain non-runnable framework.
+- [x] `reachaq-validate-session` provides Quick/Fast/Full, JSON/exit contracts,
+      Stop-only automatic Quick, manual last-session Fast/Full, and stable rules
+      for publication, media/frame ledger, NI, events/tones/laser/stim, board
+      clocks, and trial/protocol lifecycles.
+- [x] ReachAQ enforces an exact firmware/capability allowlist and persists raw
+      receive, board, clock-model, aligned-event, and recorded-frame evidence
+      separately. The sibling firmware code supplies timing envelopes, sync,
+      semantic physical timestamps, and bounded finite STIM3.
+
+Software/emulation checks:
+
+- [ ] Create/save/duplicate/rename/import/export a protocol; restart reachAQ and
+      confirm the selected revision and expanded schedule are unchanged.
+- [ ] Exercise each pellet-cycle policy and tone phase. Confirm acknowledgements,
+      actual ordering, retry labels, absolute targets, and terminal operation
+      evidence in `trials.jsonl` and `trial_summary.json`.
+- [ ] Exercise legacy batch and sliding last-X below/exactly/above X eligible
+      reaches, duplicate result generations, analysis Wait/Continue, and hardware
+      retry without a second movement.
+- [ ] Use No protocol mode and confirm global/manual pellet operation remains
+      available without live inference, intertrial analysis, laser, or stimCam.
+- [ ] Run validator Quick/Fast/Full on camera-only, camera+NI, eventful protocol,
+      laser, stim-evidence, and multi-camera sessions. Retain JSON output and
+      confirm each intentional corruption is attributed to the expected rule.
+- [ ] Confirm automatic Quick starts only after successful Stop, never Abort, and
+      that manual validation cancel/priority cannot affect recording or hardware.
+
+Physical qualification (required before release claims):
+
+- [ ] On one-device and two-device rigs, retain exact probe result, selected task
+      graph, task start/stop order, shared-pulse skew, zero sample divergence,
+      and immediate next-session reuse. Test `auto_multidevice` success where
+      supported and explicit fallback where channel expansion is rejected.
+- [ ] Sustain stimCam at configured 900 Hz under full camera/NI/CAN load. Require
+      contiguous evidence, no dropped batches, one trigger per attempt, complete
+      0.5 s pre/post clips, bounded preview, and measured CPU/memory/disk latency.
+- [ ] With stimulation disabled, record stimCam continuously at 150 Hz and prove
+      it shares the enabled behavioral-camera synchronization contract.
+- [ ] Qualify both First Reach routes independently. For STIM3, retain detector,
+      CAN/board start/completion, NI edge, AO, feedback, and behavioral-frame
+      intervals. For Direct NI, retain IPC/dispatch/DAQ start/feedback latency and
+      label it software confidence. Confirm no automatic fallback between routes.
+- [ ] Qualify scheduled pre-reveal timing from board STIM3 onset through board
+      delay, physical cover reveal, NI/AO/feedback, and recorded behavioral frame.
+- [ ] Tag/build/publish/verify/flash pellet firmware v2.1.0 following the sibling
+      repository guide. Confirm exact version plus `timing_trailer`, `time_sync`,
+      and `finite_stim3_pulse`; retain reconnect/reboot, tone, STIM3 return-low,
+      clock uncertainty, CAN load/drop, and rollback evidence.
+- [ ] Test finite laser completion, missing trigger, timeout, DAQ error, Stop,
+      Abort, overlapping resource rejection, PMT lead/lag, and safe AO/DO/shutter
+      cleanup on the configured one/two-card topology.
