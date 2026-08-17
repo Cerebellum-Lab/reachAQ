@@ -119,6 +119,22 @@ def test_compile_rejects_unknown_or_route_mismatched_profile():
         _compiler().compile(row, _context())
 
 
+def test_compile_rejects_pre_reveal_shorter_than_trigger_pulse():
+    row = TrialProtocolRow(trial_id=1).with_updates({
+        "enabled": True,
+        "cover_policy": "reveal",
+        "laser_profile_id": "pulse",
+        "laser_phase": "embedded_in_sequence",
+        "laser_trigger_route": "hardware_stim3",
+        "stimulus_assignment": "always",
+        "stimulus_trigger": "pre_reveal",
+        "pre_reveal_ms": 1,
+    })
+
+    with pytest.raises(ValueError, match="longer than the STIM3"):
+        _compiler().compile(row, _context())
+
+
 def test_prepared_operation_enforces_generation_and_terminal_state():
     row = TrialProtocolRow(trial_id=1).with_updates({"enabled": True})
     operation = PreparedTrialOperation(_compiler().compile(row, _context()))

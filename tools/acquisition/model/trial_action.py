@@ -229,6 +229,13 @@ class TrialActionCompiler:
                 raise ValueError(f"Unknown laser profile {row.laser_profile_id!r}")
             if laser.trigger_route is not row.laser_trigger_route:
                 raise ValueError("Protocol row and laser profile trigger routes differ")
+            if (
+                row.stimulus_trigger.value == "pre_reveal"
+                and int(laser.trigger_pulse_us) >= int(row.pre_reveal_ms) * 1000
+            ):
+                raise ValueError(
+                    "Pre-reveal interval must be longer than the STIM3 trigger pulse"
+                )
         if not selected:
             laser = None
 
