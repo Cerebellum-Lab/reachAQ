@@ -137,6 +137,8 @@ def test_compile_rejects_unknown_or_route_mismatched_profile():
         "laser_profile_id": "pulse",
         "laser_phase": "before_send",
         "laser_trigger_route": "direct_ni_software",
+        "stimulus_assignment": "always",
+        "stimulus_trigger": "first_reach",
     })
 
     with pytest.raises(ValueError, match="routes differ"):
