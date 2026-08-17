@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import dataclasses
+import enum
 import logging
 import numbers
+import threading
 import time
+import uuid
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
 from autotrainer.core import NidaqTimingPlan
@@ -23,6 +26,154 @@ from .laser import (
 
 
 logger = logging.getLogger(__name__)
+
+
+class LaserOperationState(str, enum.Enum):
+    PREPARED = "prepared"
+    ARMED = "armed"
+    TRIGGERED = "triggered"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class NidaqLaserOperation:
+    """Generation-owned lifecycle for one finite NI output operation."""
+
+    TERMINAL = {
+        LaserOperationState.COMPLETED,
+        LaserOperationState.FAILED,
+        LaserOperationState.CANCELLED,
+    }
+
+    def __init__(self, *, resources, context=None, terminal_callback=None):
+        self.operation_id = str(uuid.uuid4())
+        self.resources = tuple(sorted(set(resources)))
+        self.context = dict(context or {})
+        self._terminal_callback = terminal_callback
+        self._lock = threading.RLock()
+        self._done = threading.Event()
+        self._armed = threading.Event()
+        self._state = LaserOperationState.PREPARED
+        self._observations = [(self._state.value, time.perf_counter(), "")]
+        self._tasks = ()
+        self._error = None
+        self._thread = None
+
+    @property
+    def state(self):
+        with self._lock:
+            return self._state
+
+    @property
+    def error(self):
+        with self._lock:
+            return self._error
+
+    @property
+    def observations(self):
+        with self._lock:
+            return tuple(self._observations)
+
+    def wait(self, timeout=None):
+        if not self._done.wait(timeout):
+            raise TimeoutError(f"Laser operation {self.operation_id} did not finish")
+        if self.error is not None:
+            raise self.error
+        return self.state
+
+    def wait_until_armed(self, timeout=None):
+        if not self._armed.wait(timeout):
+            raise TimeoutError(f"Laser operation {self.operation_id} was not armed")
+        if self.error is not None:
+            raise self.error
+        if self.state in {LaserOperationState.CANCELLED, LaserOperationState.FAILED}:
+            raise RuntimeError(
+                f"Laser operation reached {self.state.value} before it was armed"
+            )
+        return self.state
+
+    def cancel(self):
+        tasks = ()
+        with self._lock:
+            if self._state in self.TERMINAL:
+                return False
+            self._transition_locked(LaserOperationState.CANCELLED, "cancel requested")
+            tasks = self._tasks
+        for task in tasks:
+            try:
+                task.stop()
+            except Exception:
+                logger.debug("Laser task stop during cancellation failed", exc_info=True)
+        return True
+
+    def to_record(self):
+        with self._lock:
+            return {
+                "operation_id": self.operation_id,
+                "state": self._state.value,
+                "resources": list(self.resources),
+                "context": dict(self.context),
+                "observations": [
+                    {"state": state, "perf_time": perf, "detail": detail}
+                    for state, perf, detail in self._observations
+                ],
+                "error": (
+                    None if self._error is None
+                    else f"{type(self._error).__name__}: {self._error}"
+                ),
+            }
+
+    def _bind_tasks(self, tasks):
+        with self._lock:
+            self._tasks = tuple(task for task in tasks if task is not None)
+
+    def _mark_armed(self):
+        with self._lock:
+            if self._state is LaserOperationState.PREPARED:
+                self._transition_locked(LaserOperationState.ARMED)
+                self._armed.set()
+
+    def _require_not_cancelled(self):
+        if self.state is LaserOperationState.CANCELLED:
+            raise RuntimeError("Laser operation was cancelled before arming")
+
+    def _mark_triggered(self, detail="waveform completed after trigger"):
+        with self._lock:
+            if self._state is LaserOperationState.ARMED:
+                self._transition_locked(LaserOperationState.TRIGGERED, detail)
+
+    def _complete(self):
+        with self._lock:
+            if self._state is LaserOperationState.ARMED:
+                self._transition_locked(LaserOperationState.TRIGGERED)
+            if self._state is LaserOperationState.TRIGGERED:
+                self._transition_locked(LaserOperationState.COMPLETED)
+        self._finish_terminal()
+
+    def _fail(self, error):
+        with self._lock:
+            if self._state not in self.TERMINAL:
+                self._error = error
+                self._transition_locked(
+                    LaserOperationState.FAILED,
+                    f"{type(error).__name__}: {error}",
+                )
+        self._finish_terminal()
+
+    def _transition_locked(self, state, detail=""):
+        self._state = LaserOperationState(state)
+        self._observations.append((self._state.value, time.perf_counter(), detail))
+
+    def _finish_terminal(self):
+        callback = None
+        with self._lock:
+            if not self._done.is_set():
+                self._done.set()
+                self._armed.set()
+                callback = self._terminal_callback
+        if callback is not None:
+            callback(self)
 
 
 @dataclasses.dataclass
@@ -87,6 +238,8 @@ class NidaqLaserController:
         }
         self._tasks: Dict[LaserChannelId, _NidaqLaserTasks] = {}
         self._command_volts: Dict[LaserChannelId, float] = {}
+        self._operation_lock = threading.RLock()
+        self._live_operations: Dict[str, NidaqLaserOperation] = {}
         try:
             for channel in configuration.channels:
                 channel_started = time.perf_counter()
@@ -187,11 +340,71 @@ class NidaqLaserController:
             )
         )
 
-    def run_synchronized_pulse_train(self, pulse_train: LaserSynchronizedPulseTrain) -> None:
+    def run_synchronized_pulse_train(self, pulse_train: LaserSynchronizedPulseTrain):
         if not self._configuration.hardware_timed:
             raise RuntimeError("Hardware-timed laser pulse trains require laser configuration hardware_timed=True")
         if not pulse_train.wait:
-            raise NotImplementedError("Asynchronous hardware-timed laser output is not implemented yet")
+            resources = tuple(
+                self._configuration.get_channel(item.channel_id).analog_output
+                for item in pulse_train.pulse_trains
+            )
+            with self._operation_lock:
+                conflicts = [
+                    operation.operation_id
+                    for operation in self._live_operations.values()
+                    if set(operation.resources) & set(resources)
+                    and operation.state not in operation.TERMINAL
+                ]
+                if conflicts:
+                    raise RuntimeError(
+                        "Laser output resource is already owned by operation(s): "
+                        + ", ".join(conflicts)
+                    )
+                operation = NidaqLaserOperation(
+                    resources=resources,
+                    terminal_callback=self._release_operation,
+                )
+                self._live_operations[operation.operation_id] = operation
+
+            def execute():
+                try:
+                    self._execute_synchronized_pulse_train(
+                        dataclasses.replace(pulse_train, wait=True),
+                        operation=operation,
+                    )
+                except Exception as error:
+                    if operation.state is LaserOperationState.CANCELLED:
+                        operation._finish_terminal()
+                    else:
+                        operation._fail(error)
+                else:
+                    operation._complete()
+
+            operation._thread = threading.Thread(
+                target=execute,
+                name=f"NidaqLaser-{operation.operation_id[:8]}",
+                daemon=True,
+            )
+            operation._thread.start()
+            try:
+                operation.wait_until_armed(timeout=5.0)
+            except Exception:
+                operation.cancel()
+                raise
+            return operation
+        self._execute_synchronized_pulse_train(pulse_train)
+        return None
+
+    def _release_operation(self, operation):
+        with self._operation_lock:
+            self._live_operations.pop(operation.operation_id, None)
+
+    def _execute_synchronized_pulse_train(
+        self,
+        pulse_train: LaserSynchronizedPulseTrain,
+        *,
+        operation: Optional[NidaqLaserOperation] = None,
+    ) -> None:
         channels = [
             self._configuration.get_channel(channel_pulse.channel_id)
             for channel_pulse in pulse_train.pulse_trains
@@ -312,13 +525,20 @@ class NidaqLaserController:
             for channel, channel_pulse in zip(channels, pulse_train.pulse_trains):
                 if channel_pulse.open_shutter:
                     self.set_shutter_open(channel.channel_id, True)
+            if operation is not None:
+                operation._bind_tasks((ao_task, *digital_tasks))
+                operation._require_not_cancelled()
             for task in digital_tasks:
                 task.start()
             ao_task.start()
+            if operation is not None:
+                operation._mark_armed()
             self._last_timing_status = timing_status
             ao_task.wait_until_done(timeout=timeout_seconds)
             for task in digital_tasks:
                 task.wait_until_done(timeout=timeout_seconds)
+            if operation is not None:
+                operation._mark_triggered()
         except Exception as exc:
             run_error = exc
             raise
@@ -596,6 +816,13 @@ class NidaqLaserController:
 
     def close(self) -> None:
         errors = []
+        for operation in tuple(getattr(self, "_live_operations", {}).values()):
+            try:
+                operation.cancel()
+                operation.wait(timeout=5.0)
+            except Exception as exc:
+                errors.append((f"laser operation {operation.operation_id} cancel", exc))
+                logger.exception("Failed to cancel active NI-DAQ laser operation")
         for channel in self._configuration.channels:
             if channel.channel_id not in self._tasks:
                 continue

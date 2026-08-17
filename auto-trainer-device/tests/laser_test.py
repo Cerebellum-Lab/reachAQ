@@ -1,4 +1,5 @@
 import pytest
+import threading
 from types import SimpleNamespace
 
 from autotrainer.device import (
@@ -7,6 +8,7 @@ from autotrainer.device import (
     LaserPulseTrain,
     LaserSystemConfiguration,
     NidaqLaserController,
+    LaserOperationState,
     NullLaserController,
     LaserSynchronizedPulseTrain,
 )
@@ -208,3 +210,72 @@ def test_nidaq_laser_uses_shared_clock_only_with_future_hardware_trigger():
     assert kwargs == {"source": "/Input/ai/SampleClock"}
     assert status["status"] == "hardware_synchronized"
     assert status["referenceClockSource"] == "PXI_CLK10"
+
+
+def test_nonblocking_laser_operation_is_owned_until_terminal(monkeypatch):
+    channel = make_channel()
+    controller = object.__new__(NidaqLaserController)
+    controller._configuration = LaserSystemConfiguration.from_channels(
+        [channel], backend="nidaq", hardware_timed=True, sample_rate_hz=1000.0,
+    )
+    controller._operation_lock = threading.RLock()
+    controller._live_operations = {}
+    release = threading.Event()
+
+    def execute(_pulse, *, operation):
+        operation._mark_armed()
+        release.wait(2)
+        operation._mark_triggered()
+
+    monkeypatch.setattr(controller, "_execute_synchronized_pulse_train", execute)
+    pulse = LaserSynchronizedPulseTrain(
+        pulse_trains=(LaserPulseTrain(
+            channel_id=LaserChannelId.LASER_1,
+            amplitude_volts=1.0,
+            duration_ms=10.0,
+        ),),
+        wait=False,
+    )
+
+    operation = controller.run_synchronized_pulse_train(pulse)
+    assert operation.state is LaserOperationState.ARMED
+    assert operation.operation_id in controller._live_operations
+    with pytest.raises(RuntimeError, match="already owned"):
+        controller.run_synchronized_pulse_train(pulse)
+
+    release.set()
+    assert operation.wait(2) is LaserOperationState.COMPLETED
+    assert operation.operation_id not in controller._live_operations
+
+
+def test_nonblocking_laser_operation_cancel_is_terminal_after_worker_cleanup(monkeypatch):
+    channel = make_channel()
+    controller = object.__new__(NidaqLaserController)
+    controller._configuration = LaserSystemConfiguration.from_channels(
+        [channel], backend="nidaq", hardware_timed=True, sample_rate_hz=1000.0,
+    )
+    controller._operation_lock = threading.RLock()
+    controller._live_operations = {}
+    release = threading.Event()
+
+    def execute(_pulse, *, operation):
+        operation._mark_armed()
+        release.wait(2)
+        operation._require_not_cancelled()
+
+    monkeypatch.setattr(controller, "_execute_synchronized_pulse_train", execute)
+    operation = controller.run_synchronized_pulse_train(LaserSynchronizedPulseTrain(
+        pulse_trains=(LaserPulseTrain(
+            channel_id=LaserChannelId.LASER_1,
+            amplitude_volts=1.0,
+            duration_ms=10.0,
+        ),),
+        wait=False,
+    ))
+
+    assert operation.cancel()
+    assert operation.state is LaserOperationState.CANCELLED
+    assert operation.operation_id in controller._live_operations
+    release.set()
+    assert operation.wait(2) is LaserOperationState.CANCELLED
+    assert operation.operation_id not in controller._live_operations
