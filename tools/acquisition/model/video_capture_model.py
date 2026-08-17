@@ -1,4 +1,5 @@
 import ctypes
+import copy
 import logging
 import math
 import multiprocessing
@@ -651,6 +652,41 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
             source = existing[0]
 
         self.camera_source = source
+
+    def configure_stim_session_mode(self, stimulation: bool) -> None:
+        """Resolve the third camera's immutable mode before capture starts."""
+        if self.camera_id != CameraId.Camera3:
+            raise RuntimeError("Stim session mode applies only to Camera3")
+        if self._video_capture is not None:
+            raise RuntimeError("Stim camera mode cannot change while capture is active")
+        conf = copy.deepcopy(self._cur_conf)
+        params = dict(conf.params)
+        mode = "stimulation" if stimulation else "ordinary"
+        prefix = "stim_" if stimulation else "ordinary_"
+        aliases = {
+            "fps": "fps",
+            "width": "width",
+            "height": "height",
+            "hbin": "hbin",
+            "vbin": "vbin",
+            "exposure": "exposure",
+            "gain": "gain",
+            "gamma": "gamma",
+            "offset_x": "offset_x",
+            "offset_y": "offset_y",
+        }
+        for destination, suffix in aliases.items():
+            profile_key = prefix + suffix
+            if profile_key in params:
+                params[destination] = params[profile_key]
+        params["fps"] = 900 if stimulation else params.get("ordinary_fps", 150)
+        params["stim_mode"] = mode
+        # Stimulation mode is an independent free-running high-rate domain.
+        # Ordinary mode is a triggered secondary in the behavioral group.
+        params["primary"] = "yes" if stimulation else "no"
+        conf.params = params
+        conf.is_record_enabled = not stimulation
+        self.load_configuration(conf)
 
     def save_configuration(self) -> CameraConfiguration:
         parsed, params = VideoManager.parse_params(self._camera_source.url)

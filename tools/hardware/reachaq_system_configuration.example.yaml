@@ -69,6 +69,9 @@ cameras:
   port: 0
   path: ''
   params:
+    # Ordinary sessions record stimCam continuously as a synchronized 150 Hz
+    # secondary. Protocols containing First Reach automatically select the
+    # independent 900 Hz cropped detector/evidence mode before System start.
     fps: 150
     width: 256
     height: 256
@@ -78,6 +81,27 @@ cameras:
     gain: 1
     gamma: 0.7
     primary: 'no'
+    ordinary_fps: 150
+    ordinary_width: 256
+    ordinary_height: 256
+    ordinary_hbin: 4
+    ordinary_vbin: 4
+    ordinary_exposure: 175
+    stim_fps: 900
+    stim_width: 128
+    stim_height: 128
+    stim_hbin: 1
+    stim_vbin: 1
+    stim_exposure: 800
+    stim_roi_x: 0
+    stim_roi_y: 0
+    stim_roi_width: 128
+    stim_roi_height: 128
+    stim_threshold: 0
+    stim_hysteresis: 0
+    stim_pre_event_frames: 90
+    stim_post_event_frames: 180
+    stim_preview_fps: 15
 hardware: !HardwareConfiguration
   pelletIdentifier: CAN
   # Rig-level hardware availability switches are intentionally grouped here.

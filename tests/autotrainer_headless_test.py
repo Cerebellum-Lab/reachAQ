@@ -209,6 +209,26 @@ def test_load_config_extra_reach_camera_slot(app_model, trainer_config_dir, syst
     assert app_model.make_project_info().camera_names == ("stimCam",)
 
 
+def test_stim_camera_session_modes_are_mutually_exclusive(app_model):
+    assert app_model.load_configuration() is True
+    camera = app_model.stim_camera
+    camera.is_enabled = True
+
+    camera.configure_stim_session_mode(True)
+    assert camera.active_config.params["stim_mode"] == "stimulation"
+    assert camera.active_config.params["fps"] == 900
+    assert camera.is_primary
+    assert not camera.is_recording_enabled
+    assert camera._stim_detection_configuration is not None
+
+    camera.configure_stim_session_mode(False)
+    assert camera.active_config.params["stim_mode"] == "ordinary"
+    assert camera.active_config.params["fps"] == 150
+    assert not camera.is_primary
+    assert camera.is_recording_enabled
+    assert camera._stim_detection_configuration is None
+
+
 def test_spinnaker_camera_selectors_keep_only_their_configured_binding(
     app_model,
     trainer_config_dir,

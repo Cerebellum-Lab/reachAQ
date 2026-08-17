@@ -179,6 +179,8 @@ from tools.acquisition.model.session_validation_controller import (
     SessionValidationController,
 )
 from tools.acquisition.model.trial_protocol_schedule import (
+    StimulusAssignment,
+    StimulusTrigger,
     TrialOverride,
     TrialProtocolDocument,
     ProtocolPatch,
@@ -2458,6 +2460,15 @@ class AppModel(ObservableObject):
             )
         if self._protocol_runner.protocol_complete:
             blockers.append("Selected protocol is complete")
+        if self._selected_protocol_requires_stim_camera():
+            camera = self._stim_camera
+            if camera is None or not camera.is_enabled:
+                blockers.append("Selected protocol requires the enabled stimCam")
+            elif camera._stim_detection_configuration is None:
+                blockers.append(
+                    "Selected protocol requires stimCam stimulation mode; "
+                    "restart System Mode to apply the frozen 900 Hz camera mode"
+                )
         if (
             self._hardware.requires_connection
             and not self._hardware.pellet_commands_allowed
@@ -2560,16 +2571,22 @@ class AppModel(ObservableObject):
         self,
         configuration: SystemConfiguration,
     ) -> None:
-        enabled_reach = tuple(
-            camera for camera in self._reach_cameras if camera.is_enabled
+        stim_required = self._selected_protocol_requires_stim_camera()
+        synchronized_reach = tuple(
+            camera for camera in self._reach_cameras
+            if camera.is_enabled
+            and not (
+                camera.camera_id == CameraId.Camera3
+                and camera._stim_detection_configuration is not None
+            )
         )
-        multi_reach = len(enabled_reach) > 1
+        multi_reach = len(synchronized_reach) > 1
         for camera in self._cameras:
             required = bool(
-                camera.is_enabled
-                and (
+                (
                     camera.is_recording_enabled
-                    or (camera in self._reach_cameras and multi_reach)
+                    or (camera in synchronized_reach and multi_reach)
+                    or (camera.camera_id == CameraId.Camera3 and stim_required)
                 )
             )
             self._set_subsystem_status(
@@ -2590,13 +2607,13 @@ class AppModel(ObservableObject):
             SubsystemId.REACH_SYNCHRONIZATION,
             (
                 SubsystemState.STOPPED
-                if enabled_reach
+                if synchronized_reach
                 else SubsystemState.DISABLED
             ),
-            reason="configured; not validated" if enabled_reach else "no reach cameras",
+            reason="configured; not validated" if synchronized_reach else "no synchronized cameras",
             required_for_recording=bool(
                 multi_reach
-                or any(camera.is_recording_enabled for camera in enabled_reach)
+                or any(camera.is_recording_enabled for camera in synchronized_reach)
             ),
         )
         intent = (
@@ -4022,6 +4039,24 @@ class AppModel(ObservableObject):
     def selected_ordered_protocol(self) -> Optional[TrialProtocolDocument]:
         return self._selected_ordered_protocol
 
+    def _selected_protocol_requires_stim_camera(self) -> bool:
+        if self._selected_ordered_protocol is None:
+            return False
+        return any(
+            row.enabled
+            and row.stimulus_assignment is not StimulusAssignment.DISABLED
+            and row.stimulus_trigger is StimulusTrigger.FIRST_REACH
+            for row in self._trial_protocol_schedule.rows
+        )
+
+    def _configure_stim_camera_for_selected_protocol(self) -> None:
+        camera = self._stim_camera
+        if camera is None or not camera.is_enabled:
+            return
+        camera.configure_stim_session_mode(
+            self._selected_protocol_requires_stim_camera()
+        )
+
     @property
     def ordered_protocols(self) -> Tuple[TrialProtocolDocument, ...]:
         return self._trial_protocol_repository.documents
@@ -5334,12 +5369,39 @@ class AppModel(ObservableObject):
         self,
         inference_camera_indices,
     ) -> bool:
-        cameras = self._ordered_reach_cameras(enabled_only=True)
+        all_cameras = self._ordered_reach_cameras(enabled_only=True)
+        independent_stim = next((
+            camera for camera in all_cameras
+            if camera.camera_id == CameraId.Camera3
+            and camera._stim_detection_configuration is not None
+        ), None)
+        cameras = tuple(
+            camera for camera in all_cameras if camera is not independent_stim
+        )
+        if independent_stim is not None:
+            stim_status = self._acquisition.subsystems.get(
+                SubsystemId.camera(independent_stim.name)
+            )
+            if stim_status is None or not stim_status.is_ready:
+                stim_index = inference_camera_indices.get(independent_stim)
+                if self._prepare_camera_domain(
+                    independent_stim,
+                    self._inference_queue if stim_index is not None else None,
+                    stim_index,
+                ):
+                    stim_generation = self._acquisition.subsystems.get(
+                        SubsystemId.camera(independent_stim.name)
+                    ).generation
+                    self._enable_camera_capture_domain(
+                        independent_stim,
+                        stim_generation,
+                        wait_for_first_frame=True,
+                    )
         if not cameras:
             self._set_subsystem_status(
                 SubsystemId.REACH_SYNCHRONIZATION,
                 SubsystemState.DISABLED,
-                reason="no enabled reach cameras",
+                reason="no enabled synchronized behavioral cameras",
             )
             return False
         configured_primaries = tuple(
@@ -5890,9 +5952,43 @@ class AppModel(ObservableObject):
         )
 
     def _retry_reach_camera_domains(self) -> bool:
-        cameras = self._ordered_reach_cameras(enabled_only=True)
+        all_cameras = self._ordered_reach_cameras(enabled_only=True)
+        independent_stim = next((
+            camera for camera in all_cameras
+            if camera.camera_id == CameraId.Camera3
+            and camera._stim_detection_configuration is not None
+        ), None)
+        cameras = tuple(
+            camera for camera in all_cameras if camera is not independent_stim
+        )
+        stim_ready = independent_stim is None
+        if independent_stim is not None:
+            status = self._acquisition.subsystems.get(
+                SubsystemId.camera(independent_stim.name)
+            )
+            if status is not None and status.is_ready:
+                stim_ready = True
+            else:
+                independent_stim.on_capture_stop()
+                inference_indices = {
+                    camera: index
+                    for index, camera in enumerate(self._inference_cameras)
+                }
+                inference_index = inference_indices.get(independent_stim)
+                if self._prepare_camera_domain(
+                    independent_stim,
+                    self._inference_queue if inference_index is not None else None,
+                    inference_index,
+                ):
+                    camera_generation = self._acquisition.subsystems.get(
+                        SubsystemId.camera(independent_stim.name)
+                    ).generation
+                    stim_ready = self._enable_camera_capture_domain(
+                        independent_stim,
+                        camera_generation,
+                    )
         if not cameras:
-            return False
+            return stim_ready
         primary = cameras[0]
         primary_status = self._acquisition.subsystems.get(
             SubsystemId.camera(primary.name)
@@ -5909,7 +6005,8 @@ class AppModel(ObservableObject):
                     camera.on_capture_stop()
                 except Exception:
                     logger.exception("Failed to reset reach camera %s", camera.name)
-            return self._start_reach_camera_domains(inference_indices)
+            sync_ready = self._start_reach_camera_domains(inference_indices)
+            return sync_ready and stim_ready
 
         generation = self._begin_subsystem_start(
             SubsystemId.REACH_SYNCHRONIZATION,
@@ -5960,7 +6057,7 @@ class AppModel(ObservableObject):
             error="" if all_ready else "reach synchronization incomplete",
             generation=generation,
         )
-        return all_ready
+        return all_ready and stim_ready
 
     def capture_start(
         self,
@@ -6033,6 +6130,12 @@ class AppModel(ObservableObject):
 
         algo = self._behavior.algorithm
         analysis = self._analysis
+
+        # Freeze the third camera's mutually exclusive session contract before
+        # any capture process is created. A protocol change while Running is
+        # reported as a blocker and takes effect on the next System restart.
+        self._configure_stim_camera_for_selected_protocol()
+        self._configure_subsystem_intent(self._loaded_configuration)
 
         # first:
         self._behavior.system_machine.intersession.reset_to_idle()
