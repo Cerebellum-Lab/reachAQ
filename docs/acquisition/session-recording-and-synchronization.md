@@ -552,6 +552,10 @@ First Reach uses cropped 900 Hz detection/evidence mode: no continuous stim
 video, batched HDF5 evidence for every acquired frame, decimated bounded preview,
 and 0.5 s pre/post clips around emitted triggers. Otherwise it is a full-frame
 150 Hz synchronized camera recorded continuously with the behavioral group.
+The frozen runtime mode is derived from, but never written back over, the
+operator's saved camera configuration. Interrupted arming/session boundaries
+retain a truncated clip with an explicit completeness warning instead of
+silently discarding its pre-trigger evidence.
 
 ## Storage, discovery, and safe hardware boundaries
 

@@ -41,6 +41,11 @@ Current stable rule IDs:
 | Events | `events.alignment`, `events.frames`, `events.tones`, `events.laser`, `events.board_time`, `stim.evidence` |
 | Trials | `trials.lifecycle`, `trials.protocol` |
 
+The rule-to-checklist proof boundary is maintained in
+[session-validation-coverage.md](session-validation-coverage.md). In particular,
+a validator Pass does not promote a physical wiring, stimulus, UI, recovery, or
+endurance checklist item to complete.
+
 Automated validation cannot prove cable polarity/voltage, physical laser onset,
 motor/cover behavior, UI usability, sustained 900 Hz throughput, or topology
 qualification. Those remain explicit items in the tracked acceptance TODO.

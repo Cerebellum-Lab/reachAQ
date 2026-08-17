@@ -82,6 +82,15 @@ matches the retained nonoverlapping autotrainer window; `Sliding last X`
 recomputes after every eligible reach once X results exist. Both use the retained
 diamond/triangle coordinate owner and resolve an absolute target, so retries
 cannot move twice. Before X reaches, the calibrated lane baseline is retained.
+Automatic-shift policies are named, versioned reusable profiles. Each profile
+freezes its eligible success/failure outcomes, mean or median reduction, desired
+reach offset, per-axis deadbands, maximum update, maximum absolute displacement,
+and either **Apply automatically** or **Recommend only**. A protocol row selects
+the profile and its legacy/sliding window length. Recommend-only results remain
+visible and persisted but never move the pellet. Every compiled attempt stores
+the exact policy revision, source reach IDs, recommendation, accepted generation,
+and absolute target. Final metadata also snapshots the complete stimulus-profile
+library used by the session.
 
 Tone phases are Before SEND, Embedded in board sequence, Pellet presentation,
 and Retract. Laser recipes freeze either Hardware STIM3 or Direct NI software
@@ -89,6 +98,20 @@ start. Scheduled pre-reveal stimulation is emitted and delayed by the pellet
 board before cover release; Direct NI is rejected for that phase. First Reach
 uses the 900 Hz stim-camera transition detector, not pose inference. ROI1/ROI2
 remain schema/UI framework only and are rejected as runnable.
+
+The operator selects hardware trigger terminals from NI discovery/configuration;
+normal protocol editing does not accept an arbitrary raw DAQmx terminal. Advanced
+NI timing declarations remain preserved when the port dialog saves ordinary
+channel changes. A hardware recipe must report verified
+`hardware_synchronized` timing before SEND. Direct NI is valid only for First
+Reach and must report `software_start`; Tone 1, Tone 2, and pre-reveal recipes
+require the configured physical hardware route and never fall back to Direct NI.
+
+For pre-reveal stimulation, firmware reports STIM3 completion after it returns
+the output low. ReachAQ therefore schedules the remaining board delay as the
+requested pre-reveal interval minus the finite STIM3 pulse width. A pulse as long
+as or longer than that interval is rejected before SEND, preserving the requested
+STIM3-onset-to-cover-reveal interval.
 
 Subject selection is locked from session Arming through analysis. Session Notes
 are saved when Stop closes the writers but remain editable afterward; subsequent

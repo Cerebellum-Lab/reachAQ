@@ -372,6 +372,11 @@ trials. Copy/fill/repeat, randomized preview, and Undo/Redo create a new saved
 revision. Future rows remain editable; an active row is highlighted and frozen;
 completed rows stay locked.
 
+The **New auto shift** profile editor defines reusable versioned automatic
+policies: eligible reach outcomes, mean/median reduction, desired reach offset,
+deadbands, per-update/absolute limits, and apply-versus-recommend-only behavior.
+Rows select one policy plus legacy-batch or sliding-last-X window semantics.
+
 Before SEND, reachAQ freezes and validates the row, resolves one absolute DCS
 and motor target, acknowledges positioning/cover actions, and pre-arms any laser
 operation. Only then may the pellet state machine queue SEND. Preparation errors

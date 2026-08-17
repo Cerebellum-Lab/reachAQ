@@ -739,6 +739,9 @@ Implementation inventory (code/document review):
       Stop-only automatic Quick, manual last-session Fast/Full, and stable rules
       for publication, media/frame ledger, NI, events/tones/laser/stim, board
       clocks, and trial/protocol lifecycles.
+- [x] Stable validator rule IDs are mapped to the tracked persisted-data,
+      partial, UI/manual, and physical/hardware proof boundaries in
+      `docs/acquisition/session-validation-coverage.md`.
 - [x] ReachAQ enforces an exact firmware/capability allowlist and persists raw
       receive, board, clock-model, aligned-event, and recorded-frame evidence
       separately. The sibling firmware code supplies timing envelopes, sync,
