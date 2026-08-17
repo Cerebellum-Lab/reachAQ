@@ -23,6 +23,7 @@ class AnimalTraining:
     # NB: protocol == plan ; todo: could/should better be moved to auto-trainer-training repo
 
     current_protocol: Optional[str] = None
+    ordered_protocol_id: Optional[str] = None
     protocols: List[Dict[str, Any]] = dataclasses.field(default_factory=list)
 
     def get_plan_progress(self, plan_id: str) -> Optional[Dict[str, Any]]:
@@ -48,7 +49,7 @@ class AnimalTraining:
 class _AnimalSubject:
     """A subject in an animal experiment."""
 
-    version: int = 7
+    version: int = 8
 
     name: str = ""
     notes: str = ""
@@ -143,6 +144,7 @@ class AnimalSubject(_AnimalSubject):
             pellet_z=position["z"],
             training=AnimalTraining(
                 current_protocol=training.get("currentProtocol"),
+                ordered_protocol_id=training.get("selectedOrderedProtocol"),
                 protocols=[],
             ),
         )
@@ -167,6 +169,7 @@ class AnimalSubject(_AnimalSubject):
             pellet_z=position["z"],
             training=AnimalTraining(
                 current_protocol=training.get("selectedProtocol"),
+                ordered_protocol_id=training.get("selectedOrderedProtocol"),
                 protocols=protocol_progress,
             ),
         )
@@ -189,6 +192,10 @@ class AnimalSubject(_AnimalSubject):
         animal = cls._from_v6(data)
         animal.notes = str(data.get("notes") or "")
         return animal
+
+    @classmethod
+    def _from_v8(cls, data: Dict[str, Any]) -> Self:
+        return cls._from_v7(data)
 
     @classmethod
     def from_file(cls: Type[Self], file_path: Path) -> Optional[Self]:
@@ -218,12 +225,18 @@ class AnimalSubject(_AnimalSubject):
             animal._legacy_v4_content = original
             animal._legacy_version = 6
             logger.notice("Loaded animal v6 for one-way migration to v7")
-        elif file_version == cls.version:
+        elif file_version == 7:
             animal = cls._from_v7(data)
+            animal._legacy_v4_path = file_path.resolve()
+            animal._legacy_v4_content = original
+            animal._legacy_version = 7
+            logger.notice("Loaded animal v7 for one-way migration to v8")
+        elif file_version == cls.version:
+            animal = cls._from_v8(data)
         else:
             raise ValueError(
                 f"Unsupported animal schema version {file_version!r} in "
-                f"{file_path}; only v4/v5/v6 migration and v7 are supported"
+                f"{file_path}; only v4/v5/v6/v7 migration and v8 are supported"
             )
 
         logger.debug("loaded animal id=%r name=%r pellet=%s is_dcs=%s current_protocol=%s",
@@ -247,6 +260,7 @@ class AnimalSubject(_AnimalSubject):
             },
             "targetYLimit": self.target_y_limit,
             "selectedProtocol": self.training.current_protocol,
+            "selectedOrderedProtocol": self.training.ordered_protocol_id,
         }
 
     def session_snapshot(self, *, snapshot_utc: Optional[str] = None) -> Dict[str, Any]:
@@ -314,6 +328,7 @@ class AnimalSubject(_AnimalSubject):
             },
             "training": {
                 "selectedProtocol": self.training.current_protocol,
+                "selectedOrderedProtocol": self.training.ordered_protocol_id,
                 "protocolProgress": self._rename_progress_count(
                     self.training.protocols,
                     to_persisted=True,

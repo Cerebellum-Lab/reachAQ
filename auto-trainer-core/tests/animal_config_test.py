@@ -45,6 +45,7 @@ def test_save_load(tmp_path):
 def test_v5_persists_trial_progress_without_retired_fields(tmp_path):
     animal = AnimalSubject(name="animal1")
     animal.training.current_protocol = "protocol-1"
+    animal.training.ordered_protocol_id = "ordered-a"
     animal.training.protocols = [{
         "plan_id": "protocol-1",
         "progress": [{"session_count": 3}],
@@ -54,8 +55,9 @@ def test_v5_persists_trial_progress_without_retired_fields(tmp_path):
     animal.to_file(destination)
 
     persisted = json.loads(destination.read_text())
-    assert persisted["version"] == 7
+    assert persisted["version"] == 8
     assert persisted["training"]["selectedProtocol"] == "protocol-1"
+    assert persisted["training"]["selectedOrderedProtocol"] == "ordered-a"
     phase = persisted["training"]["protocolProgress"][0]["progress"][0]
     assert phase["trial_count"] == 3
     assert "session_count" not in phase
@@ -85,7 +87,7 @@ def test_v4_migration_preserves_backup_and_resets_progress(tmp_path):
     assert animal.training.protocols == []
     animal.to_file(destination)
 
-    assert json.loads(destination.read_text())["version"] == 7
+    assert json.loads(destination.read_text())["version"] == 8
     assert json.loads(
         destination.with_suffix(".json.v4-backup").read_text()
     ) == legacy
@@ -96,7 +98,7 @@ def test_unsupported_animal_versions_fail_clearly(tmp_path, version):
     destination = tmp_path / "animal.json"
     destination.write_text(json.dumps({"version": version, "name": "old"}))
 
-    with pytest.raises(ValueError, match="only v4/v5/v6 migration and v7"):
+    with pytest.raises(ValueError, match="only v4/v5/v6/v7 migration and v8"):
         AnimalSubject.from_file(destination)
 
 
@@ -118,7 +120,7 @@ def test_v5_migrates_with_backup(tmp_path):
     animal = AnimalSubject.from_file(destination)
     animal.to_file(destination)
 
-    assert json.loads(destination.read_text())["version"] == 7
+    assert json.loads(destination.read_text())["version"] == 8
     assert json.loads(destination.with_suffix(".json.v5-backup").read_text()) == legacy
 
 
@@ -174,5 +176,37 @@ def test_v6_migrates_with_empty_notes_and_backup(tmp_path):
     assert animal.notes == ""
     animal.to_file(destination)
 
-    assert json.loads(destination.read_text())["version"] == 7
+    assert json.loads(destination.read_text())["version"] == 8
     assert json.loads(destination.with_suffix(".json.v6-backup").read_text()) == legacy
+
+
+def test_v7_migrates_ordered_protocol_preference(tmp_path):
+    destination = tmp_path / "animal.json"
+    legacy = {
+        "version": 7,
+        "id": "animal-id",
+        "name": "animal1",
+        "notes": "keep",
+        "pellet": {
+            "coordinateSpace": "dcs",
+            "position": {"x": 1, "y": 2, "z": 3},
+        },
+        "training": {
+            "selectedProtocol": "training-plan",
+            "selectedOrderedProtocol": "ordered-a",
+            "protocolProgress": [],
+        },
+        "limits": {"targetY": None},
+        "externalIdentity": None,
+        "externalMetadata": None,
+    }
+    destination.write_text(json.dumps(legacy))
+
+    animal = AnimalSubject.from_file(destination)
+    animal.to_file(destination)
+
+    persisted = json.loads(destination.read_text())
+    assert persisted["version"] == 8
+    assert persisted["training"]["selectedProtocol"] == "training-plan"
+    assert persisted["training"]["selectedOrderedProtocol"] == "ordered-a"
+    assert json.loads(destination.with_suffix(".json.v7-backup").read_text()) == legacy
