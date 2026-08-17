@@ -152,6 +152,8 @@ class NidaqTimingPlan:
     reference_clock_rate_hz: Optional[float] = None
     sample_clock_source: Optional[str] = None
     start_trigger_source: Optional[str] = None
+    sample_clock_export_terminal: Optional[str] = None
+    start_trigger_export_terminal: Optional[str] = None
     routes: Tuple[NidaqTimingRoute, ...] = tuple()
     task_start_order: Tuple[str, ...] = tuple()
     resolved_devices: Tuple[NidaqDeviceIdentity, ...] = tuple()

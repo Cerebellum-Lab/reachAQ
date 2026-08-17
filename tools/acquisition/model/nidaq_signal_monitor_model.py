@@ -36,9 +36,17 @@ from tools.acquisition.model.nidaq_timing import (
     resolve_nidaq_device_names,
     resolve_nidaq_stream_configuration,
 )
+from tools.acquisition.model.nidaq_preflight import run_isolated_nidaq_preflight
 
 
 logger = get_verbose_logger(__name__)
+
+
+def _resolve_physical_channel_device(channel: str, aliases) -> str:
+    parts = str(channel).strip("/").split("/", 1)
+    if len(parts) != 2:
+        return str(channel)
+    return f"{aliases.get(parts[0], parts[0])}/{parts[1]}"
 
 
 _WORKER_READY = "ready"
@@ -140,6 +148,7 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
         worker_target=_nidaq_signal_stream_worker,
         device_discovery=discover_nidaq_devices,
         startup_timeout_seconds: float = _DEFAULT_STARTUP_TIMEOUT_SECONDS,
+        exact_preflight=None,
     ):
         super().__init__()
         self._configuration = NidaqSignalStreamConfiguration()
@@ -149,6 +158,11 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
         self._worker_target = worker_target
         self._device_discovery = device_discovery
         self._startup_timeout_seconds = startup_timeout_seconds
+        self._exact_preflight = (
+            run_isolated_nidaq_preflight
+            if exact_preflight is None and worker_target is _nidaq_signal_stream_worker
+            else exact_preflight
+        )
         self._display_refresh_rate_hz = 60.0
         self._process = None
         self._message_queue = None
@@ -161,6 +175,7 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
         self._error_message = ""
         self._timing_configuration = NidaqTimingConfiguration()
         self._hardware_timed_output_devices = tuple()
+        self._hardware_timed_output_channels = tuple()
         self._device_identities: tuple[NidaqDeviceIdentity, ...] = tuple()
         self._runtime_device_aliases = {}
         self._timing_plan: Optional[NidaqTimingPlan] = None
@@ -297,6 +312,7 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
         configuration: NidaqTimingConfiguration,
         *,
         hardware_timed_output_devices: Iterable[str] = tuple(),
+        hardware_timed_output_channels: Iterable[str] = tuple(),
         device_identities: Iterable[NidaqDeviceIdentity] = tuple(),
     ) -> None:
         if self._is_running or self._is_starting:
@@ -304,6 +320,9 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
         self._timing_configuration = configuration
         self._hardware_timed_output_devices = tuple(dict.fromkeys(
             str(device) for device in hardware_timed_output_devices if device
+        ))
+        self._hardware_timed_output_channels = tuple(dict.fromkeys(
+            str(channel) for channel in hardware_timed_output_channels if channel
         ))
         self._device_identities = tuple(device_identities)
         self._runtime_device_aliases = {}
@@ -382,15 +401,28 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
                     self._hardware_timed_output_devices,
                     aliases,
                 )
+                hardware_timed_output_channels = tuple(
+                    _resolve_physical_channel_device(channel, aliases)
+                    for channel in self._hardware_timed_output_channels
+                )
                 timing_plan = build_nidaq_timing_plan(
                     configuration,
                     self._timing_configuration,
                     devices,
                     hardware_timed_output_devices=hardware_timed_output_devices,
+                    hardware_timed_output_channels=hardware_timed_output_channels,
                 )
                 self._set_timing_plan(timing_plan)
                 if not timing_plan.is_valid:
                     raise RuntimeError(timing_plan.reason)
+                if self._exact_preflight is not None:
+                    preflight = self._exact_preflight(configuration, timing_plan)
+                    if not preflight.is_valid:
+                        raise RuntimeError(
+                            "NI-DAQ exact task preflight failed at "
+                            f"{preflight.stage}: {preflight.error}. "
+                            f"{preflight.corrective_action}"
+                        )
                 self._runtime_device_aliases = dict(aliases)
                 message_queue = self._mp_ctx.Queue(maxsize=16)
                 stop_event = self._mp_ctx.Event()

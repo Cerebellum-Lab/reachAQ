@@ -222,6 +222,17 @@ def test_timing_graph_retains_explicit_routes_and_strategy():
     assert plan.multidevice_probe_status == "pending_exact_probe"
 
 
+def test_timing_graph_retains_exact_laser_output_channels():
+    plan = build_nidaq_timing_plan(
+        _stream(("cam", "Dev1/ai0", "analog")),
+        NidaqTimingConfiguration(),
+        (NidaqDevicePorts(name="Dev1"),),
+        hardware_timed_output_channels=("Dev1/ao0",),
+    )
+    output = next(task for task in plan.task_graph.tasks if task.subsystem == "ao")
+    assert output.channels == ("Dev1/ao0",)
+
+
 def test_independent_mode_is_diagnostic_only_when_alignment_is_required():
     configuration = _stream(
         ("first", "DevA/ai0", "analog"),

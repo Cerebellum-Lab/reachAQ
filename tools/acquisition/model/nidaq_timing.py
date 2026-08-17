@@ -26,6 +26,7 @@ def build_nidaq_timing_plan(
     devices: Sequence[NidaqDevicePorts],
     *,
     hardware_timed_output_devices: Iterable[str] = tuple(),
+    hardware_timed_output_channels: Iterable[str] = tuple(),
 ) -> NidaqTimingPlan:
     discovered = {device.name: device for device in devices}
     input_devices = tuple(dict.fromkeys(
@@ -34,9 +35,15 @@ def build_nidaq_timing_plan(
         for device_name in (device_name_from_channel(channel.physical_channel),)
         if device_name is not None
     ))
+    output_channels = tuple(dict.fromkeys(
+        str(channel) for channel in hardware_timed_output_channels if channel
+    ))
     output_devices = tuple(dict.fromkeys(
         device_name
-        for device_name in hardware_timed_output_devices
+        for device_name in (
+            *hardware_timed_output_devices,
+            *(device_name_from_channel(channel) for channel in output_channels),
+        )
         if device_name
     ))
     active_devices = tuple(dict.fromkeys((*input_devices, *output_devices)))
@@ -108,7 +115,7 @@ def build_nidaq_timing_plan(
             hardware_output_timing_reason=output_reason,
             reason="All sampled tasks use one NI-DAQ device",
         )
-        return _with_task_graph(plan, configuration, timing, output_devices)
+        return _with_task_graph(plan, configuration, timing, output_devices, output_channels)
 
     if timing.sync_mode == "independent":
         valid = not timing.require_hardware_synchronization
@@ -133,7 +140,7 @@ def build_nidaq_timing_plan(
                 else "Independent device clocks explicitly allowed"
             ),
         )
-        return _with_task_graph(plan, configuration, timing, output_devices)
+        return _with_task_graph(plan, configuration, timing, output_devices, output_channels)
 
     active_capabilities = tuple(discovered[name] for name in active_devices)
     common_pxi_backplane = _has_common_pxi_backplane(active_capabilities)
@@ -249,6 +256,8 @@ def build_nidaq_timing_plan(
         reference_clock_rate_hz=10_000_000.0 if reference_clock == "PXI_CLK10" else None,
         sample_clock_source=sample_clock,
         start_trigger_source=start_trigger,
+        sample_clock_export_terminal=timing.sample_clock_export_terminal,
+        start_trigger_export_terminal=timing.start_trigger_export_terminal,
         routes=routes,
         task_start_order=task_start_order,
         resolved_devices=resolved_devices,
@@ -265,10 +274,10 @@ def build_nidaq_timing_plan(
             else "Resolved explicitly configured external start/sample timing"
         ),
     )
-    return _with_task_graph(plan, configuration, timing, output_devices)
+    return _with_task_graph(plan, configuration, timing, output_devices, output_channels)
 
 
-def _with_task_graph(plan, configuration, timing, output_devices):
+def _with_task_graph(plan, configuration, timing, output_devices, output_channels):
     """Attach a stable, exact input-task graph to an already valid plan."""
     tasks = []
     device_order = tuple(plan.task_start_order)
@@ -332,18 +341,22 @@ def _with_task_graph(plan, configuration, timing, output_devices):
             task_id=f"{device}.ao-reservation",
             device=device,
             subsystem="ao",
-            channels=(),
+            channels=tuple(
+                channel for channel in output_channels
+                if device_name_from_channel(channel) == device
+            ),
             mode="finite_output_declared",
             sample_clock_source=plan.sample_clock_source,
             start_trigger_source=plan.start_trigger_source,
             reference_clock_source=plan.reference_clock_source,
         ))
     identifiers = tuple(task.task_id for task in tasks)
+    effective_routes = tuple(dict.fromkeys((*plan.routes, *timing.external_routes)))
     graph_payload = json.dumps(
         {
             "strategy": timing.task_strategy,
             "tasks": [dataclasses.asdict(task) for task in tasks],
-            "routes": [dataclasses.asdict(route) for route in plan.routes],
+            "routes": [dataclasses.asdict(route) for route in effective_routes],
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -352,7 +365,7 @@ def _with_task_graph(plan, configuration, timing, output_devices):
         graph_id=hashlib.sha256(graph_payload).hexdigest()[:16],
         strategy=timing.task_strategy,
         tasks=tuple(tasks),
-        routes=plan.routes,
+        routes=effective_routes,
         create_order=identifiers,
         start_order=tuple(
             task.task_id
@@ -369,6 +382,9 @@ def _with_task_graph(plan, configuration, timing, output_devices):
     )
     return dataclasses.replace(
         plan,
+        routes=effective_routes,
+        sample_clock_export_terminal=timing.sample_clock_export_terminal,
+        start_trigger_export_terminal=timing.start_trigger_export_terminal,
         task_graph=graph,
         multidevice_probe_status=probe_status,
     )

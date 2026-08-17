@@ -195,6 +195,17 @@ class NidaqSignalStreamController:
             epoch_wall_time=self._epoch_wall_time,
         )
 
+    def verify_tasks(self, *, commit: bool = True) -> Tuple[str, ...]:
+        """Verify the exact disposable graph without starting any task."""
+        verified = []
+        modes = self._nidaqmx.constants.TaskMode
+        for task_id, task in self._owned_task_records():
+            task.control(modes.TASK_VERIFY)
+            if commit:
+                task.control(modes.TASK_COMMIT)
+            verified.append(task_id)
+        return tuple(verified)
+
     def close(self) -> None:
         errors = []
         tasks = tuple(
@@ -234,6 +245,18 @@ class NidaqSignalStreamController:
         if errors:
             locations = ", ".join(location for location, _ in errors)
             raise RuntimeError(f"Failed to close NI-DAQ signal stream task(s): {locations}") from errors[0][1]
+
+    def _owned_task_records(self):
+        return tuple(
+            (f"{device}.counter-clock", task)
+            for device, task in self._digital_clock_tasks.items()
+        ) + tuple(
+            (f"{device}.di", task)
+            for device, task in self._digital_tasks.items()
+        ) + tuple(
+            (f"{device}.ai", task)
+            for device, task in self._analog_tasks.items()
+        )
 
     def _create_tasks(self) -> None:
         cfg = self._configuration
@@ -277,6 +300,7 @@ class NidaqSignalStreamController:
             )
             self._configure_reference_clock(analog_task)
             self._configure_start_trigger(analog_task, device_name)
+            self._configure_exports(analog_task, device_name, "ai")
             log_hardware_initialization(
                 logger,
                 "READY | NI-DAQ analog input task | elapsed=%.3fs",
@@ -341,6 +365,7 @@ class NidaqSignalStreamController:
             )
             self._configure_reference_clock(digital_task)
             self._configure_start_trigger(digital_task, device_name)
+            self._configure_exports(digital_task, device_name, "di")
             log_hardware_initialization(
                 logger,
                 "READY | NI-DAQ digital input task | timing=hardware source=%s elapsed=%.3fs",
@@ -377,7 +402,29 @@ class NidaqSignalStreamController:
             samps_per_chan=buffer_size,
         )
         self._configure_reference_clock(task)
+        self._configure_exports(task, device_name, "counter")
         return f"/{device_name}/Ctr0InternalOutput"
+
+    def _configure_exports(self, task, device_name: str, subsystem: str) -> None:
+        plan = self._timing_plan
+        if plan is None or device_name != plan.master_device:
+            return
+        exporter = getattr(task, "export_signals", None)
+        export = None if exporter is None else getattr(exporter, "export_signal", None)
+        signals = getattr(self._nidaqmx.constants, "Signal", None)
+        if not callable(export) or signals is None:
+            if plan.sample_clock_export_terminal or plan.start_trigger_export_terminal:
+                raise RuntimeError("NI-DAQ task does not expose signal routing APIs")
+            return
+        if plan.sample_clock_export_terminal and subsystem in {"ai", "counter"}:
+            signal = (
+                signals.SAMPLE_CLOCK
+                if subsystem == "ai"
+                else signals.COUNTER_OUTPUT_EVENT
+            )
+            export(signal, plan.sample_clock_export_terminal)
+        if plan.start_trigger_export_terminal and subsystem == "ai":
+            export(signals.START_TRIGGER, plan.start_trigger_export_terminal)
 
     def _task_start_order(self) -> Tuple[str, ...]:
         available = tuple(dict.fromkeys((

@@ -6329,6 +6329,11 @@ class AppModel(ObservableObject):
         self.nidaq_signal_monitor.configure_timing(
             configuration.nidaq_ports.timing,
             hardware_timed_output_devices=hardware_timed_output_devices,
+            hardware_timed_output_channels=tuple(
+                channel.analog_output
+                for channel in configuration.laser.channels
+                if configuration.laser.hardware_timed
+            ),
             device_identities=configuration.nidaq_ports.device_identities,
         )
         nidaq_acquisition = build_nidaq_acquisition_configuration(
@@ -6472,6 +6477,11 @@ class AppModel(ObservableObject):
         self._nidaq_signal_monitor.configure_timing(
             nidaq_ports.timing,
             hardware_timed_output_devices=hardware_timed_output_devices,
+            hardware_timed_output_channels=tuple(
+                channel.analog_output
+                for channel in laser_configuration.channels
+                if laser_configuration.hardware_timed
+            ),
             device_identities=nidaq_ports.device_identities,
         )
         self._loaded_configuration.nidaq_stream = acquisition
