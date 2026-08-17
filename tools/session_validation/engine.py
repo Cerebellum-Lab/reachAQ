@@ -66,7 +66,9 @@ def validate_session(
         _metadata_mirror_rule,
         _source_contract_rule,
         _camera_rule,
+        _camera_ledger_rule,
         _nidaq_rule,
+        _nidaq_timing_graph_rule,
         _event_rule,
         _board_time_rule,
         _trial_rule,
@@ -186,26 +188,38 @@ def _sha256(path):
 
 
 def _manifest_rule(context):
-    manifest = context.json("manifest.json")
+    manifests = (
+        ("manifest.json", context.json("manifest.json")),
+        (
+            "streams/stream_manifest.json",
+            context.json("streams/stream_manifest.json"),
+        ),
+    )
     seen = set()
     errors = []
-    for item in manifest.get("files", ()):
-        relative = item.get("path", "")
-        try:
-            path = context.path(relative)
-        except ValueError as error:
-            errors.append(str(error))
-            continue
-        if relative in seen:
-            errors.append(f"duplicate path {relative}")
-        seen.add(relative)
-        if not path.is_file():
-            errors.append(f"missing {relative}")
-            continue
-        if path.stat().st_size != item.get("sizeBytes"):
-            errors.append(f"size mismatch {relative}")
-        if context.profile is ValidationProfile.FULL and _sha256(path) != item.get("sha256"):
-            errors.append(f"hash mismatch {relative}")
+    for manifest_name, manifest in manifests:
+        local_seen = set()
+        for item in manifest.get("files", ()):
+            relative = item.get("path", "")
+            try:
+                path = context.path(relative)
+            except ValueError as error:
+                errors.append(str(error))
+                continue
+            if relative in local_seen:
+                errors.append(f"{manifest_name}: duplicate path {relative}")
+            local_seen.add(relative)
+            seen.add(relative)
+            if not path.is_file():
+                errors.append(f"missing {relative}")
+                continue
+            if path.stat().st_size != item.get("sizeBytes"):
+                errors.append(f"size mismatch {relative}")
+            if (
+                context.profile is ValidationProfile.FULL
+                and _sha256(path) != item.get("sha256")
+            ):
+                errors.append(f"hash mismatch {relative}")
     return _result(
         "session.manifest",
         "fail" if errors else "pass",
@@ -291,6 +305,86 @@ _camera_rule.RULE_ID = "camera.frames"
 _camera_rule.MINIMUM = ValidationProfile.FAST
 
 
+def _frame_ledger_path(context):
+    candidates = sorted(context.root.glob("*_frame_timing.csv"))
+    if len(candidates) != 1:
+        return None, candidates
+    return candidates[0], candidates
+
+
+def _camera_ledger_rule(context):
+    stream_manifest = context.json("streams/stream_manifest.json")
+    cameras = {
+        item["id"].split(".", 1)[-1]: item
+        for item in stream_manifest.get("enabledSources", ())
+        if item.get("kind") == "camera"
+    }
+    if not cameras:
+        return _result("camera.ledger", "not_applicable", "No camera source was enabled")
+    path, candidates = _frame_ledger_path(context)
+    if path is None:
+        return _result(
+            "camera.ledger", "fail",
+            f"Expected one merged frame ledger, found {len(candidates)}",
+            paths=tuple(item.as_posix() for item in candidates),
+        )
+    errors, warnings = [], []
+    row_count = 0
+    previous_id = None
+    previous_wall = -math.inf
+    present_counts = {name: 0 for name in cameras}
+    with path.open("r", encoding="utf-8", newline="") as stream:
+        reader = csv.DictReader(stream)
+        required = {"frame_id", "utc_when"}
+        missing = required - set(reader.fieldnames or ())
+        if missing:
+            errors.append("missing columns: " + ", ".join(sorted(missing)))
+        for line_number, row in enumerate(reader, 2):
+            row_count += 1
+            try:
+                frame_id = int(row["frame_id"])
+                wall = float(row["utc_when"])
+                if previous_id is not None:
+                    if frame_id <= previous_id:
+                        errors.append(f"row {line_number}: non-increasing frame ID")
+                    elif frame_id != previous_id + 1:
+                        warnings.append(
+                            f"row {line_number}: {frame_id - previous_id - 1} "
+                            "frame ID(s) explicitly missing"
+                        )
+                if not math.isfinite(wall) or wall <= previous_wall:
+                    errors.append(f"row {line_number}: non-increasing wall time")
+                previous_id, previous_wall = frame_id, wall
+                for name in cameras:
+                    value = row.get(f"frame_present_{name}")
+                    if value is None:
+                        errors.append(f"row {line_number}: camera {name} has no presence column")
+                    elif int(value):
+                        present_counts[name] += 1
+            except (KeyError, TypeError, ValueError) as error:
+                errors.append(f"row {line_number}: {error}")
+    for name, source in cameras.items():
+        expected = int(source.get("sampleCount", -1))
+        if present_counts[name] != expected:
+            errors.append(
+                f"camera {name}: ledger={present_counts[name]} expected={expected}"
+            )
+    if cameras and row_count != max(present_counts.values(), default=0):
+        warnings.append(
+            f"merged rows={row_count}; largest camera coverage={max(present_counts.values(), default=0)}"
+        )
+    status = "fail" if errors else ("warning" if warnings else "pass")
+    return _result(
+        "camera.ledger", status,
+        "; ".join((errors or warnings)[:20])
+        if errors or warnings else "Merged frame IDs and camera coverage are consistent",
+        observed={"rows": row_count, "camera_counts": present_counts},
+        paths=(path.as_posix(),),
+    )
+_camera_ledger_rule.RULE_ID = "camera.ledger"
+_camera_ledger_rule.MINIMUM = ValidationProfile.FAST
+
+
 def _nidaq_rule(context):
     stream = context.json("streams/stream_manifest.json")
     sources = [item for item in stream.get("enabledSources", ()) if str(item.get("kind", "")).startswith("nidaq")]
@@ -301,14 +395,70 @@ def _nidaq_rule(context):
     path = context.path(sources[0]["path"])
     errors, warnings = [], []
     with h5py.File(path, "r") as store:
-        required = {"sample_index", "perf_time", "offset_seconds", "values"}
+        required = {
+            "sample_index", "perf_time", "offset_seconds", "wall_time",
+            "values", "epoch",
+        }
         missing = required - set(store)
         if missing:
             errors.append("missing datasets: " + ", ".join(sorted(missing)))
         else:
             count = int(store["sample_index"].shape[0])
-            if store["values"].shape[1] != count:
+            timelines = ("perf_time", "offset_seconds", "wall_time", "epoch")
+            for name in timelines:
+                if store[name].shape != (count,):
+                    errors.append(f"{name} length differs from sample_index")
+            if len(store["values"].shape) != 2 or store["values"].shape[1] != count:
                 errors.append("values/sample timeline lengths differ")
+            channel_names = tuple(
+                item.decode() if isinstance(item, bytes) else str(item)
+                for item in store.attrs.get("channel_names", ())
+            )
+            if store["values"].shape[0] != len(channel_names):
+                errors.append("values channel axis differs from channel_names")
+            if len(channel_names) != len(set(channel_names)):
+                errors.append("channel_names contains duplicates")
+            expected_channels = {
+                item["id"].split(".", 1)[-1]
+                for item in sources
+            }
+            if set(channel_names) != expected_channels:
+                errors.append(
+                    f"HDF5 channels={sorted(channel_names)}; manifest={sorted(expected_channels)}"
+                )
+            if count <= 0:
+                errors.append("NI stream contains no samples")
+            sample_rate = float(store.attrs.get("sample_rate_hz", 0))
+            if not math.isfinite(sample_rate) or sample_rate <= 0:
+                errors.append("sample_rate_hz is invalid")
+            if count and sample_rate > 0:
+                first_index = int(store["sample_index"][0])
+                last_index = int(store["sample_index"][-1])
+                if last_index - first_index != count - 1:
+                    errors.append("sample-index endpoints do not match sample count")
+                first_offset = float(store["offset_seconds"][0])
+                last_offset = float(store["offset_seconds"][-1])
+                expected_duration = (count - 1) / sample_rate
+                observed_duration = last_offset - first_offset
+                if abs(observed_duration - expected_duration) > 1.5 / sample_rate:
+                    errors.append(
+                        "NI timeline duration differs from sample-index duration"
+                    )
+                start = float(store.attrs.get("recording_start_perf", math.nan))
+                end = float(store.attrs.get("recording_end_perf", math.nan))
+                first_perf = float(store["perf_time"][0])
+                last_perf = float(store["perf_time"][-1])
+                if not all(map(math.isfinite, (start, end, first_perf, last_perf))):
+                    errors.append("canonical NI boundary attributes are not finite")
+                elif first_perf < start - 1.5 / sample_rate or last_perf > end + 1.5 / sample_rate:
+                    errors.append("NI samples extend outside the saved boundary")
+                else:
+                    missing_start = max(0.0, first_perf - start)
+                    missing_end = max(0.0, end - last_perf)
+                    if max(missing_start, missing_end) > 2.0 / sample_rate:
+                        warnings.append(
+                            f"boundary coverage start={missing_start:.6g}s end={missing_end:.6g}s"
+                        )
             if context.profile is ValidationProfile.FULL and count:
                 indices = store["sample_index"][:]
                 perf = store["perf_time"][:]
@@ -319,6 +469,11 @@ def _nidaq_rule(context):
                     errors.append("perf_time is not strictly increasing")
                 if not numpy.all(numpy.diff(offsets) > 0):
                     errors.append("offset_seconds is not strictly increasing")
+            if bool(store.attrs.get("collection_worker_failed", False)):
+                errors.append(
+                    "NI collection worker failed: "
+                    + str(store.attrs.get("collection_first_error", "unknown error"))
+                )
             for key in ("collection_error_count", "gap_count", "overrun_samples"):
                 if int(store.attrs.get(key, 0)):
                     warnings.append(f"{key}={int(store.attrs[key])}")
@@ -329,6 +484,67 @@ def _nidaq_rule(context):
     )
 _nidaq_rule.RULE_ID = "nidaq.continuity"
 _nidaq_rule.MINIMUM = ValidationProfile.FAST
+
+
+def _nidaq_timing_graph_rule(context):
+    sources = [
+        item for item in context.json("streams/stream_manifest.json").get("enabledSources", ())
+        if str(item.get("kind", "")).startswith("nidaq")
+    ]
+    if not sources:
+        return _result("nidaq.timing_graph", "not_applicable", "NI-DAQ was not enabled")
+    import h5py
+    path = context.path(sources[0]["path"])
+    errors, warnings = [], []
+    with h5py.File(path, "r") as store:
+        raw = store.attrs.get("timing_plan_json", "")
+        if isinstance(raw, bytes):
+            raw = raw.decode()
+        if not raw:
+            errors.append("timing_plan_json is missing")
+            plan = {}
+        else:
+            plan = json.loads(raw)
+        if plan and not plan.get("is_valid", False):
+            errors.append("persisted NI timing plan is invalid")
+        devices = plan.get("resolved_devices", ())
+        if len(devices) > 2:
+            errors.append("first-release timing graph contains more than two devices")
+        if len(devices) > 1 and plan.get("synchronization_quality") in {
+            "independent", "software_only", "unresolved", None,
+        }:
+            errors.append("multiple NI devices lack a deterministic synchronization claim")
+        graph = plan.get("task_graph")
+        if not graph:
+            errors.append("exact NI task graph is missing")
+        else:
+            task_ids = [item.get("task_id") for item in graph.get("tasks", ())]
+            if not task_ids or len(task_ids) != len(set(task_ids)):
+                errors.append("NI task graph identifiers are missing or duplicated")
+            if set(graph.get("create_order", ())) != set(task_ids):
+                errors.append("NI task graph create order does not cover every task")
+        status = plan.get("multidevice_probe_status", "not_requested")
+        strategy = (graph or {}).get("strategy", "per_device")
+        if strategy == "forced_multidevice" and status != "verified":
+            errors.append("forced multidevice strategy was not verified")
+        elif strategy == "auto_multidevice" and status not in {
+            "verified", "fallback_per_device", "not_applicable_single_device",
+        }:
+            warnings.append(f"multidevice probe status is {status}")
+    outcome = "fail" if errors else ("warning" if warnings else "pass")
+    return _result(
+        "nidaq.timing_graph", outcome,
+        "; ".join(errors or warnings) if errors or warnings
+        else "Persisted NI task graph and synchronization claim are valid",
+        observed={
+            "devices": len(plan.get("resolved_devices", ())),
+            "quality": plan.get("synchronization_quality"),
+            "multidevice_probe_status": plan.get("multidevice_probe_status"),
+        },
+        paths=(path.as_posix(),),
+    )
+_nidaq_timing_graph_rule.RULE_ID = "nidaq.timing_graph"
+_nidaq_timing_graph_rule.MINIMUM = ValidationProfile.FAST
 
 
 def _event_rule(context):
