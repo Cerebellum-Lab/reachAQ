@@ -358,6 +358,10 @@ class TrialActionExecutor:
         with self._lock:
             return self._operation
 
+    def matches_send_context(self, context) -> bool:
+        with self._lock:
+            return self._send_context is not None and self._send_context == str(context)
+
     def prepare(self, recipe: CompiledTrialRecipe) -> PreparedTrialOperation:
         with self._lock:
             if (

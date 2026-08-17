@@ -316,6 +316,38 @@ def test_ordered_protocol_row_patterns_publish_one_revision(app_model, tmp_path)
     ] == ["left", "right", "left", "right"]
 
 
+def test_ordered_protocol_trial_compiles_absolute_target(app_model, tmp_path):
+    app_model._trial_protocol_repository = TrialProtocolRepository(tmp_path)
+    app_model.save_ordered_protocol(TrialProtocolDocument(
+        protocol_id="runtime",
+        name="Runtime",
+        trial_count=1,
+        defaults=ProtocolPatch.from_mapping({
+            "enabled": True,
+            "position_mode": "fixed_manual",
+            "shift_x_mm": 0.5,
+        }),
+    ))
+    app_model._selected_animal = SimpleNamespace(
+        pellet_x=1.0,
+        pellet_y=2.0,
+        pellet_z=3.0,
+    )
+    _previous, token = app_model._recording_session.begin_record("session001", {})
+    app_model._recording_session.transition(
+        SessionRecordingStatus.RECORDING,
+        expected=(SessionRecordingStatus.ARMING,),
+        token=token,
+    )
+    app_model._protocol_session_seed = 7
+
+    recipe = app_model._compile_protocol_trial(token, 1)
+
+    assert recipe.logical_trial_id == 1
+    assert recipe.resolved_dcs_target == (1.5, 2.0, 3.0)
+    assert recipe.requested_row["enabled"] is True
+
+
 def test_scored_trial_limit_is_available_with_live_intertrial_scoring(app_model):
     control = app_model.behavior.algorithm.active_config.session_control
     control.trial_limit = 5

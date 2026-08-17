@@ -151,6 +151,8 @@ def test_executor_prepares_before_send_and_binds_acknowledgement():
 
     operation = executor.prepare(recipe)
     executor.bind_send(recipe.operation_id, 4, "can-context")
+    assert executor.matches_send_context("can-context")
+    assert not executor.matches_send_context("unrelated")
     executor.acknowledge_presentation("can-context")
     executor.complete("cycle ended")
 

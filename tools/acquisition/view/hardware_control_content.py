@@ -200,7 +200,9 @@ class HardwareControlContent(ContentWidget):
         #
         button = QPushButton("Send")
         add_cmd_widget(button)
-        button.clicked.connect(lambda: log_hardware_cmd(partial(pellet_machine.send_pellet, force=True)))
+        button.clicked.connect(
+            lambda: log_hardware_cmd(partial(app_model.request_pellet_send, force=True))
+        )
         button_layout.addWidget(button)
         #
         button = QPushButton("Retract")

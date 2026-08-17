@@ -178,6 +178,14 @@ from tools.acquisition.model.trial_protocol_schedule import (
     ProtocolScope,
     TrialProtocolSchedule,
 )
+from tools.acquisition.model.trial_action import (
+    LaserPulseProfile,
+    PreparedState,
+    ToneProfile,
+    TrialActionCompiler,
+    TrialActionExecutor,
+    TrialCompileContext,
+)
 from tools.acquisition.model.session_stop_policy import (
     SessionStopConfiguration,
     SessionStopDecision,
@@ -640,6 +648,22 @@ class AppModel(ObservableObject):
             self._protocol_runner,
             self._session_data_recorder,
         )
+        self._protocol_action_lock = threading.RLock()
+        self._protocol_action_thread = None
+        self._protocol_positioning_active = False
+        self._protocol_session_seed = 0
+        self._tone_profiles = {
+            "tone-1": ToneProfile("tone-1", 1, 5000, 100),
+            "tone-2": ToneProfile("tone-2", 1, 6000, 100),
+        }
+        self._laser_profiles: Dict[str, LaserPulseProfile] = {}
+        self._trial_action_executor = TrialActionExecutor(
+            move_absolute=self._move_protocol_motor_target,
+            configure_cover=self._configure_protocol_cover,
+            play_tone=self._play_protocol_tone,
+            prepare_laser=self._prepare_protocol_laser,
+            cancel_laser=self._cancel_protocol_laser,
+        )
         self._live_tracking = LiveTrackingBuffer()
         self._intertrial_analysis = IntertrialAnalysisCoordinator(
             self._on_intertrial_analysis_result,
@@ -681,6 +705,10 @@ class AppModel(ObservableObject):
         pellet_m.events.pellet_cycle_completed += self._on_pellet_cycle_completed
         pellet_m.events.pellet_sending += self._on_pellet_sending
         pellet_m.events.pellet_sent += self._on_pellet_sent
+        pellet_m.set_send_preparation_callbacks(
+            readiness=self._protocol_send_readiness,
+            guard=self._guard_protocol_send,
+        )
 
         analysis.watchdog_monitor.property_changed += self._on_watchdog_property_changed
 
@@ -1111,6 +1139,12 @@ class AppModel(ObservableObject):
             )
             return False
         previous_status, session_token = reservation
+        self._protocol_session_seed = int.from_bytes(
+            hashlib.sha256(
+                f"{session_token.session_id}:{session_token.generation}".encode("utf-8")
+            ).digest()[:8],
+            "big",
+        )
         self._publish_session_recording_transition(
             previous_status,
             SessionRecordingStatus.ARMING,
@@ -1472,6 +1506,7 @@ class AppModel(ObservableObject):
             token=token,
         ):
             return False
+        self._cancel_protocol_operation(token, "recording stopped")
         stopped = self._behavior.algorithm.end_capture_session(reason=reason)
         if not stopped:
             self._set_session_recording_status(
@@ -1556,6 +1591,7 @@ class AppModel(ObservableObject):
             self._aborting_project = None
             return False
         self._aborted_session_ids.add(self._aborting_project.short_id)
+        self._cancel_protocol_operation(token, "recording aborted")
         self._intertrial_analysis.cancel_session()
         self._live_tracking.clear()
         self._trial_window_start = None
@@ -3911,6 +3947,13 @@ class AppModel(ObservableObject):
         attempts = () if ledger is None else ledger.attempts
         active = None if ledger is None else ledger.active_attempt
         active_trial_id = None if active is None else active.trial_id
+        prepared_operation = self._trial_action_executor.operation
+        if (
+            active_trial_id is None
+            and prepared_operation is not None
+            and prepared_operation.state not in prepared_operation.TERMINAL
+        ):
+            active_trial_id = prepared_operation.recipe.logical_trial_id
         session_control = self._behavior.algorithm.active_config.session_control
         estimate = self._intertrial_analysis.timing_estimate(1.0)
         if active is not None and active_trial_id is None and active.protocol_context:
@@ -4306,6 +4349,232 @@ class AppModel(ObservableObject):
         else:
             self._select_ordered_protocol_internal(None, persist_animal=False)
         return True
+
+    def request_pellet_send(
+        self,
+        *,
+        force: bool = True,
+        automatic: bool = False,
+    ) -> bool:
+        """Prepare a selected row off the Qt thread, then dispatch SEND."""
+        pellet = self._behavior.system_machine.pellet
+        if (
+            self._selected_ordered_protocol is None
+            or not self._behavior.algorithm.is_in_session
+        ):
+            return bool(pellet.send_pellet(force=force))
+        token = self._recording_session.token()
+        if token is None or self._recording_session.status is not SessionRecordingStatus.RECORDING:
+            self.on_error(
+                "Pellet trial unavailable",
+                "A selected ordered protocol can send pellets only while recording.",
+            )
+            return False
+        trial_id = self._pellet_cycles.planned_trial_id
+        try:
+            row = self._trial_protocol_schedule.row(trial_id)
+        except KeyError:
+            self.on_error("Protocol complete", "No future pellet-trial row is available.")
+            return False
+        if automatic and row.pellet_behavior.value == "manual_trial":
+            return False
+        with self._protocol_action_lock:
+            operation = self._trial_action_executor.operation
+            if (
+                operation is not None
+                and operation.state is PreparedState.PREPARED
+                and operation.recipe.session_generation == token.generation
+                and operation.recipe.logical_trial_id == trial_id
+            ):
+                return bool(pellet.send_pellet(force=force))
+            if self._protocol_action_thread is not None and self._protocol_action_thread.is_alive():
+                return False
+            thread = threading.Thread(
+                target=self._prepare_and_dispatch_protocol_send,
+                args=(token, trial_id, force),
+                name=f"PreparePelletTrial-{trial_id}",
+                daemon=True,
+            )
+            self._protocol_action_thread = thread
+            thread.start()
+        self._notify_trial_protocol_state()
+        return True
+
+    def _prepare_and_dispatch_protocol_send(
+        self,
+        token: SessionGeneration,
+        trial_id: int,
+        force: bool,
+    ) -> None:
+        try:
+            recipe = self._compile_protocol_trial(token, trial_id)
+            operation = self._trial_action_executor.prepare(recipe)
+            if not self._recording_session.is_current(
+                token,
+                statuses=(SessionRecordingStatus.RECORDING,),
+            ):
+                self._trial_action_executor.cancel(
+                    generation=token.generation,
+                    reason="session generation ended during preparation",
+                )
+                return
+            sent = self._behavior.system_machine.pellet.send_pellet(force=force)
+            if not sent and operation.state is PreparedState.PREPARED:
+                self._trial_action_executor.fail(
+                    RuntimeError("pellet state machine did not accept SEND")
+                )
+                raise RuntimeError("Pellet SEND was not accepted after preparation")
+        except Exception as error:
+            logger.exception("Pellet-trial preparation failed")
+            self.on_error(
+                "Pellet trial was not sent",
+                f"Preparation failed without consuming a trial: {error}",
+            )
+        finally:
+            with self._protocol_action_lock:
+                if self._protocol_action_thread is threading.current_thread():
+                    self._protocol_action_thread = None
+            self._notify_trial_protocol_state()
+
+    def _compile_protocol_trial(
+        self,
+        token: SessionGeneration,
+        trial_id: int,
+    ):
+        document = self._selected_ordered_protocol
+        animal = self._selected_animal
+        if document is None or animal is None:
+            raise RuntimeError("A selected protocol and subject are required")
+        row = self._trial_protocol_schedule.row(trial_id)
+        attempts = () if self._trial_ledger is None else self._trial_ledger.attempts
+        attempt_id = 1 + max(
+            (item.attempt_id for item in attempts if item.trial_id == trial_id),
+            default=0,
+        )
+        diamond = self._behavior.algorithm.diamond_triangle_config
+
+        def dcs_to_motor(values):
+            offset = Offset3DTuple(*values)
+            converted = offset if diamond is None else diamond.diamond_to_motor(offset)
+            return tuple(converted)
+
+        context = TrialCompileContext(
+            session_id=token.session_id,
+            session_generation=token.generation,
+            protocol_id=document.protocol_id,
+            protocol_revision=document.revision,
+            logical_trial_id=trial_id,
+            attempt_id=attempt_id,
+            session_seed=self._protocol_session_seed,
+            animal_base_dcs=(animal.pellet_x, animal.pellet_y, animal.pellet_z),
+            # Calibrated lane offsets are explicit future configuration. Center
+            # is the safe baseline; non-center rows are rejected below until
+            # the operator supplies calibrated offsets.
+            lane_offsets_dcs={
+                "center": (0.0, 0.0, 0.0),
+                "left": (0.0, 0.0, 0.0),
+                "right": (0.0, 0.0, 0.0),
+            },
+        )
+        if row.position_lane.value != "center":
+            raise RuntimeError(
+                f"{row.position_lane.label} pellet lane has no calibrated DCS offset"
+            )
+        compiler = TrialActionCompiler(
+            tone_profiles=self._tone_profiles,
+            laser_profiles=self._laser_profiles,
+            dcs_to_motor=dcs_to_motor,
+        )
+        return compiler.compile(row, context)
+
+    def _move_protocol_motor_target(self, target) -> None:
+        self._protocol_positioning_active = True
+        try:
+            for axis, value in zip("xyz", target):
+                command = getattr(self._hardware, f"set_{axis}")
+                token = command(value, absolute=True, sender="ordered_protocol")
+                if token is None:
+                    raise RuntimeError(f"Pellet {axis.upper()} target was not queued")
+                self._hardware.wait_pending_command_acked(token, timeout=15.0)
+        finally:
+            self._protocol_positioning_active = False
+
+    def _configure_protocol_cover(self, policy: str) -> None:
+        self._behavior.system_machine.pellet.prepare_cover_policy(policy)
+
+    def _play_protocol_tone(self, profile: ToneProfile, phase: str) -> None:
+        token = self._hardware.play_tone(
+            profile.frequency_hz,
+            profile.duration_ms / 1000.0,
+        )
+        if token is None:
+            raise RuntimeError(f"Tone {profile.profile_id} was not queued at {phase}")
+        self._hardware.wait_pending_command_acked(token, timeout=5.0)
+
+    def _prepare_protocol_laser(self, profile, recipe):
+        prepare = getattr(self._laser, "prepare_pulse_profile", None)
+        if prepare is None:
+            raise RuntimeError("Asynchronous protocol laser preparation is unavailable")
+        return prepare(profile, recipe)
+
+    @staticmethod
+    def _cancel_protocol_laser(handle) -> None:
+        cancel = getattr(handle, "cancel", None)
+        if cancel is not None:
+            cancel()
+
+    def _protocol_send_readiness(self) -> bool:
+        if (
+            self._selected_ordered_protocol is None
+            or not self._behavior.algorithm.is_in_session
+        ):
+            return True
+        token = self._recording_session.token()
+        operation = self._trial_action_executor.operation
+        if token is not None and operation is not None:
+            try:
+                operation.require_generation(token.generation)
+            except RuntimeError:
+                return False
+            if (
+                operation.state is PreparedState.PREPARED
+                and operation.recipe.logical_trial_id == self._pellet_cycles.planned_trial_id
+            ):
+                return True
+        self.request_pellet_send(force=False, automatic=True)
+        return False
+
+    def _guard_protocol_send(self) -> None:
+        if (
+            self._selected_ordered_protocol is None
+            or not self._behavior.algorithm.is_in_session
+        ):
+            return
+        token = self._recording_session.token()
+        operation = self._trial_action_executor.operation
+        if token is None or operation is None:
+            raise RuntimeError("Ordered protocol SEND has not been prepared")
+        self._trial_action_executor.require_send_permission(
+            operation.recipe.operation_id,
+            token.generation,
+        )
+
+    def _cancel_protocol_operation(
+        self,
+        token: Optional[SessionGeneration],
+        reason: str,
+    ) -> None:
+        operation = self._trial_action_executor.operation
+        if operation is None:
+            return
+        try:
+            self._trial_action_executor.cancel(
+                generation=(None if token is None else token.generation),
+                reason=reason,
+            )
+        except RuntimeError:
+            logger.info("Ignored stale protocol-operation cancellation: %s", reason)
+        self._behavior.system_machine.pellet.cancel_prepared_cover_policy()
 
     @_serialized_session_configuration
     def set_intertrial_analysis_enabled(self, enabled: bool) -> None:
@@ -7280,7 +7549,7 @@ class AppModel(ObservableObject):
         elif animal is not None and name in {hard.SET_X, hard.SET_Y, hard.SET_Z}:
             # Protocol actions temporarily move the motors without redefining
             # the animal's manually configured base position.
-            if self._attached_plan is not None:
+            if self._attached_plan is not None or self._protocol_positioning_active:
                 return
             coord = name[-1]
             coord_idx = "xyz".index(coord)
@@ -8196,6 +8465,13 @@ class AppModel(ObservableObject):
 
     def _on_pellet_loading_for_trial(self):
         if self._pellet_cycles.active_attempt is not None:
+            operation = self._trial_action_executor.operation
+            if operation is not None and operation.state not in operation.TERMINAL:
+                try:
+                    self._trial_action_executor.execute_phase("retract")
+                    self._trial_action_executor.complete("next pellet load began")
+                except RuntimeError:
+                    logger.exception("Could not finalize prepared pellet-trial operation")
             logger.warning(
                 "Pellet loading closed an attempt without a pellet-cycle event"
             )
@@ -8205,6 +8481,16 @@ class AppModel(ObservableObject):
             )
 
     def _on_pellet_cycle_completed(self, *, perf_c: float):
+        operation = self._trial_action_executor.operation
+        if (
+            operation is not None
+            and operation.state not in operation.TERMINAL
+        ):
+            try:
+                self._trial_action_executor.execute_phase("retract")
+                self._trial_action_executor.complete("pellet cycle completed")
+            except RuntimeError:
+                logger.exception("Could not finalize prepared pellet-trial operation")
         self._complete_pellet_trial_window(
             perf_c,
             close_reason="pellet cycle completed",
@@ -8448,6 +8734,15 @@ class AppModel(ObservableObject):
             self._trial_window_start = None
         shift = self._behavior.system_machine.shift_xyz_handler
         with self._trial_protocol_lock:
+            operation = self._trial_action_executor.operation
+            if self._selected_ordered_protocol is not None:
+                if operation is None:
+                    raise RuntimeError("Ordered protocol SEND has no prepared operation")
+                self._trial_action_executor.bind_send(
+                    operation.recipe.operation_id,
+                    operation.recipe.session_generation,
+                    context,
+                )
             attempt = self._pellet_cycles.begin_send(
                 perf_c,
                 wall_time,
@@ -8471,6 +8766,16 @@ class AppModel(ObservableObject):
 
     def _on_hardware_command_failed(self, failure: CanFailure) -> None:
         """Finalize the matching physical pellet attempt as a hardware error."""
+        operation = self._trial_action_executor.operation
+        if (
+            operation is not None
+            and operation.state not in operation.TERMINAL
+            and self._trial_action_executor.matches_send_context(failure.context)
+        ):
+            try:
+                self._trial_action_executor.fail(RuntimeError(failure.error))
+            except RuntimeError:
+                logger.exception("Could not fail prepared pellet-trial operation")
         finalized = self._pellet_cycles.finalize_hardware_failure(
             failure,
             in_session=self._behavior.algorithm.is_in_session,
@@ -8494,6 +8799,12 @@ class AppModel(ObservableObject):
         if algo.is_in_session:
             ledger = self._trial_ledger
             if ledger is not None and self._pellet_cycles.active_attempt is not None:
+                operation = self._trial_action_executor.operation
+                if operation is not None and operation.state is PreparedState.SEND_ACCEPTED:
+                    try:
+                        self._trial_action_executor.acknowledge_presentation(context)
+                    except RuntimeError:
+                        logger.exception("Pellet acknowledgement did not bind to prepared trial")
                 attempt = self._pellet_cycles.acknowledge_presentation(
                     get_perf_now() if perf_c is None else perf_c,
                     time.time(),
@@ -8501,6 +8812,12 @@ class AppModel(ObservableObject):
                 )
                 if attempt is None:
                     return
+                if operation is not None:
+                    behavior = operation.recipe.requested_row["pellet_behavior"]
+                    if behavior in {"send_and_hold", "manual_trial"}:
+                        algo.pellet_automation_stop_requested = True
+                    elif behavior == "send_then_retract":
+                        self._behavior.system_machine.pellet.move_retract(force=True)
                 self._notify_trial_protocol_state()
             if ledger is not None:
                 # Presentation is acknowledgement-derived immediately. The
@@ -8523,11 +8840,27 @@ class AppModel(ObservableObject):
         ordered = self._selected_ordered_protocol
         if trial_id is None:
             trial_id = self._pellet_cycles.planned_trial_id
+        operation = self._trial_action_executor.operation
+        prepared = (
+            operation is not None
+            and operation.recipe.logical_trial_id == trial_id
+            and operation.state not in operation.TERMINAL
+        )
         return {
             "protocol_id": None if ordered is None else ordered.protocol_id,
             "protocol_revision": None if ordered is None else ordered.revision,
             "training_plan_id": None if plan is None else plan.plan_id,
             "phase_id": None if phase is None else phase.phase_id,
             "automatic_advance": self._protocol_runner.automatic_advance,
-            "trial_row": self._trial_protocol_schedule.row(trial_id).to_record(),
+            "trial_row": (
+                dict(operation.recipe.requested_row)
+                if prepared
+                else self._trial_protocol_schedule.row(trial_id).to_record()
+            ),
+            "compiled_recipe": (
+                operation.recipe.to_record() if prepared else None
+            ),
+            "prepared_operation": (
+                operation.to_record() if prepared else None
+            ),
         }
