@@ -189,6 +189,110 @@ def test_no_protocol_mode_has_safe_disabled_rows(app_model):
     assert not app_model.update_trial_protocol_row(1, "enabled", True)
 
 
+def test_ordered_protocol_authoring_scopes_resolve_and_persist(app_model, tmp_path):
+    app_model._trial_protocol_repository = TrialProtocolRepository(tmp_path)
+    app_model.save_ordered_protocol(TrialProtocolDocument(
+        protocol_id="scoped",
+        name="Scoped",
+        trial_count=5,
+        defaults=ProtocolPatch.from_mapping({"enabled": True}),
+    ))
+
+    app_model.apply_ordered_protocol_values(
+        range(1, 6),
+        {"position_lane": "left"},
+        scope_kind="protocol",
+    )
+    app_model.apply_ordered_protocol_values(
+        (2, 3, 4),
+        {"cover_policy": "reveal"},
+        scope_kind="epoch",
+        scope_name="training",
+    )
+    app_model.apply_ordered_protocol_values(
+        (3, 4),
+        {"tone_profile_id": "cue", "tone_phase": "before_send"},
+        scope_kind="block",
+        scope_name="cued",
+        parent_epoch="training",
+    )
+    result = app_model.apply_ordered_protocol_values(
+        (1, 4),
+        {"position_lane": "right"},
+        scope_kind="bulk",
+        scope_name="selected-right",
+    )
+    app_model.apply_ordered_protocol_values(
+        (4,),
+        {"position_lane": "center"},
+    )
+
+    assert result["changed_trial_ids"] == (1, 4)
+    rows = app_model.selected_ordered_protocol.resolve()
+    assert rows[0].row.position_lane.value == "right"
+    assert rows[1].row.cover_policy.value == "reveal"
+    assert rows[2].row.tone_profile_id == "cue"
+    assert rows[3].row.position_lane.value == "center"
+    assert dict(rows[3].sources)["position_lane"] == "trial:4"
+    reloaded = TrialProtocolRepository(tmp_path)
+    reloaded.reload()
+    assert reloaded.get("scoped").to_record() == (
+        app_model.selected_ordered_protocol.to_record()
+    )
+
+
+def test_ordered_protocol_bulk_edit_skips_active_trial(app_model, tmp_path):
+    app_model._trial_protocol_repository = TrialProtocolRepository(tmp_path)
+    app_model.save_ordered_protocol(TrialProtocolDocument(
+        protocol_id="locking",
+        name="Locking",
+        trial_count=3,
+        defaults=ProtocolPatch.from_mapping({"enabled": True}),
+    ))
+    ledger = PelletTrialLedger("session-lock")
+    ledger.begin_send(1.0, 2.0, operation_id="active")
+    app_model._trial_ledger = ledger
+
+    result = app_model.apply_ordered_protocol_values(
+        (1, 2, 3),
+        {"position_lane": "right"},
+        scope_kind="bulk",
+        scope_name="future-right",
+    )
+
+    assert result["changed_trial_ids"] == (2, 3)
+    assert result["skipped_trial_ids"] == (1,)
+    rows = app_model.selected_ordered_protocol.resolve()
+    assert rows[0].row.position_lane.value == "center"
+    assert rows[1].row.position_lane.value == "right"
+
+
+def test_ordered_protocol_library_operations(app_model, tmp_path):
+    app_model._trial_protocol_repository = TrialProtocolRepository(tmp_path / "lib")
+    created = app_model.create_ordered_protocol("source", "Source", trial_count=2)
+    copied = app_model.duplicate_ordered_protocol(
+        created.protocol_id,
+        protocol_id="copy",
+        name="Copy",
+    )
+    renamed = app_model.rename_ordered_protocol(
+        copied.protocol_id,
+        protocol_id="renamed",
+        name="Renamed",
+    )
+    exported = app_model.export_ordered_protocol(
+        renamed.protocol_id,
+        tmp_path / "renamed-export.json",
+    )
+
+    app_model._trial_protocol_repository = TrialProtocolRepository(tmp_path / "other")
+    imported = app_model.import_ordered_protocol(exported)
+
+    assert imported.protocol_id == "renamed"
+    assert app_model.selected_ordered_protocol.protocol_id == "renamed"
+    assert app_model.reload_ordered_protocols()
+
+
 def test_scored_trial_limit_is_available_with_live_intertrial_scoring(app_model):
     control = app_model.behavior.algorithm.active_config.session_control
     control.trial_limit = 5

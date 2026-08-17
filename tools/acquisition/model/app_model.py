@@ -174,6 +174,8 @@ from tools.acquisition.model.trial_protocol_repository import (
 from tools.acquisition.model.trial_protocol_schedule import (
     TrialOverride,
     TrialProtocolDocument,
+    ProtocolPatch,
+    ProtocolScope,
     TrialProtocolSchedule,
 )
 from tools.acquisition.model.session_stop_policy import (
@@ -3958,29 +3960,112 @@ class AppModel(ObservableObject):
             },
         }
 
+    @_serialized_session_configuration
     def update_trial_protocol_row(self, trial_id: int, field: str, value) -> bool:
+        result = self.apply_ordered_protocol_values(
+            (trial_id,),
+            {field: value},
+            scope_kind="trials",
+        )
+        return bool(result["changed_trial_ids"])
+
+    @_serialized_session_configuration
+    def apply_ordered_protocol_values(
+        self,
+        trial_ids,
+        values,
+        *,
+        scope_kind: str = "trials",
+        scope_name: str = "",
+        parent_epoch: str = "",
+    ) -> dict:
+        """Atomically apply a typed patch at one authoring hierarchy level."""
         with self._trial_protocol_lock:
             state = self.trial_protocol_state
-            trial_id = int(trial_id)
-            if (
-                trial_id == state["active_trial_id"]
-                or trial_id in state["completed_trial_ids"]
-            ):
-                return False
             document = self._selected_ordered_protocol
             if document is None:
-                return False
+                return {
+                    "changed_trial_ids": (),
+                    "skipped_trial_ids": (),
+                    "reason": "No ordered protocol is selected",
+                }
+            requested = tuple(sorted({int(value) for value in trial_ids}))
+            valid_range = set(range(1, document.trial_count + 1))
+            if not set(requested) <= valid_range:
+                raise ValueError("Protocol edit contains out-of-range trial IDs")
+            locked = set(state["completed_trial_ids"])
+            if state["active_trial_id"] is not None:
+                locked.add(int(state["active_trial_id"]))
+            changed = tuple(value for value in requested if value not in locked)
+            skipped = tuple(value for value in requested if value in locked)
+            if scope_kind == "protocol":
+                if locked:
+                    return {
+                        "changed_trial_ids": (),
+                        "skipped_trial_ids": tuple(sorted(locked)),
+                        "reason": (
+                            "Protocol defaults cannot change after a trial is "
+                            "active or completed; edit future trials instead"
+                        ),
+                    }
+                changed = tuple(range(1, document.trial_count + 1))
+            if not changed:
+                return {
+                    "changed_trial_ids": (),
+                    "skipped_trial_ids": skipped,
+                    "reason": "Every selected trial is locked",
+                }
+
+            patch = ProtocolPatch.from_mapping(values)
             overrides = {
                 item.trial_id: item.patch.to_mapping()
                 for item in document.trial_overrides
             }
-            values = overrides.setdefault(trial_id, {})
-            # The schedule performs field normalization and validates the
-            # currently resolved row before the atomic document save.
-            self._trial_protocol_schedule.row(trial_id).with_updates({field: value})
-            values[field] = value
-            updated = dataclasses.replace(
-                document,
+            epochs = document.epochs
+            blocks = document.blocks
+            bulk = document.bulk_overrides
+            defaults = document.defaults
+            if scope_kind == "trials":
+                for trial_id in changed:
+                    merged = overrides.setdefault(trial_id, {})
+                    merged.update(patch.to_mapping())
+            elif scope_kind == "bulk":
+                bulk = (*bulk, ProtocolScope.create(
+                    scope_name or f"bulk-{document.revision + 1}",
+                    changed,
+                    patch.to_mapping(),
+                ))
+            elif scope_kind == "epoch":
+                if skipped:
+                    raise ValueError("An epoch cannot include locked trials")
+                epochs = tuple(item for item in epochs if item.name != scope_name)
+                epochs = (*epochs, ProtocolScope.create(
+                    scope_name,
+                    changed,
+                    patch.to_mapping(),
+                ))
+            elif scope_kind == "block":
+                if skipped:
+                    raise ValueError("A block cannot include locked trials")
+                blocks = tuple(item for item in blocks if item.name != scope_name)
+                blocks = (*blocks, ProtocolScope.create(
+                    scope_name,
+                    changed,
+                    patch.to_mapping(),
+                    parent_epoch=parent_epoch,
+                ))
+            elif scope_kind == "protocol":
+                merged = defaults.to_mapping()
+                merged.update(patch.to_mapping())
+                defaults = ProtocolPatch.from_mapping(merged)
+            else:
+                raise ValueError(f"Unknown protocol edit scope: {scope_kind}")
+
+            updated = dataclasses.replace(document,
+                defaults=defaults,
+                epochs=epochs,
+                blocks=blocks,
+                bulk_overrides=bulk,
                 trial_overrides=tuple(
                     TrialOverride.create(key, overrides[key])
                     for key in sorted(overrides)
@@ -3993,7 +4078,12 @@ class AppModel(ObservableObject):
             self._selected_ordered_protocol = saved
             self._trial_protocol_schedule = TrialProtocolSchedule.from_document(saved)
         self._notify_trial_protocol_state()
-        return True
+        return {
+            "changed_trial_ids": changed,
+            "skipped_trial_ids": skipped,
+            "reason": "",
+            "revision": saved.revision,
+        }
 
     @_serialized_session_configuration
     def select_ordered_protocol(self, protocol_id: Optional[str]) -> bool:
@@ -4031,6 +4121,7 @@ class AppModel(ObservableObject):
                 )
         self._notify_trial_protocol_state()
 
+    @_serialized_session_configuration
     def save_ordered_protocol(
         self,
         document: TrialProtocolDocument,
@@ -4051,6 +4142,99 @@ class AppModel(ObservableObject):
         else:
             self._notify_trial_protocol_state()
         return saved
+
+    @_serialized_session_configuration
+    def create_ordered_protocol(
+        self,
+        protocol_id: str,
+        name: str,
+        *,
+        trial_count: int = 15,
+    ) -> TrialProtocolDocument:
+        document = TrialProtocolDocument(
+            protocol_id=protocol_id,
+            name=name,
+            trial_count=int(trial_count),
+            description="New disabled protocol; validate rows before use.",
+        )
+        return self.save_ordered_protocol(document, select=True)
+
+    @_serialized_session_configuration
+    def duplicate_ordered_protocol(
+        self,
+        source_id: str,
+        *,
+        protocol_id: str,
+        name: str,
+    ) -> TrialProtocolDocument:
+        self._require_session_ready_for_configuration(
+            "Duplicating an ordered protocol"
+        )
+        saved = self._trial_protocol_repository.duplicate(
+            source_id,
+            protocol_id=protocol_id,
+            name=name,
+        )
+        self._select_ordered_protocol_internal(
+            saved.protocol_id,
+            persist_animal=True,
+        )
+        return saved
+
+    @_serialized_session_configuration
+    def rename_ordered_protocol(
+        self,
+        source_id: str,
+        *,
+        protocol_id: str,
+        name: str,
+    ) -> TrialProtocolDocument:
+        self._require_session_ready_for_configuration("Renaming an ordered protocol")
+        source = self._trial_protocol_repository.get(source_id)
+        if source is None:
+            raise KeyError(source_id)
+        saved = self._trial_protocol_repository.rename(
+            source_id,
+            protocol_id=protocol_id,
+            name=name,
+            expected_revision=source.revision,
+        )
+        self._select_ordered_protocol_internal(
+            saved.protocol_id,
+            persist_animal=True,
+        )
+        return saved
+
+    @_serialized_session_configuration
+    def import_ordered_protocol(self, path: Path) -> TrialProtocolDocument:
+        self._require_session_ready_for_configuration("Importing an ordered protocol")
+        saved = self._trial_protocol_repository.import_file(path)
+        self._select_ordered_protocol_internal(
+            saved.protocol_id,
+            persist_animal=True,
+        )
+        return saved
+
+    def export_ordered_protocol(self, protocol_id: str, path: Path) -> Path:
+        return self._trial_protocol_repository.export_file(protocol_id, path)
+
+    @_serialized_session_configuration
+    def reload_ordered_protocols(self) -> bool:
+        self._require_session_ready_for_configuration("Reloading ordered protocols")
+        selected_id = (
+            None
+            if self._selected_ordered_protocol is None
+            else self._selected_ordered_protocol.protocol_id
+        )
+        self._trial_protocol_repository.reload()
+        if selected_id is not None and self._trial_protocol_repository.get(selected_id):
+            self._select_ordered_protocol_internal(
+                selected_id,
+                persist_animal=False,
+            )
+        else:
+            self._select_ordered_protocol_internal(None, persist_animal=False)
+        return True
 
     @_serialized_session_configuration
     def set_intertrial_analysis_enabled(self, enabled: bool) -> None:
