@@ -54,6 +54,7 @@ class NidaqLaserOperation:
         self._lock = threading.RLock()
         self._done = threading.Event()
         self._armed = threading.Event()
+        self._start_requested = threading.Event()
         self._state = LaserOperationState.PREPARED
         self._observations = [(self._state.value, time.perf_counter(), "")]
         self._tasks = ()
@@ -100,12 +101,22 @@ class NidaqLaserOperation:
                 return False
             self._transition_locked(LaserOperationState.CANCELLED, "cancel requested")
             tasks = self._tasks
+            self._start_requested.set()
         for task in tasks:
             try:
                 task.stop()
             except Exception:
                 logger.debug("Laser task stop during cancellation failed", exc_info=True)
         return True
+
+    def trigger(self):
+        with self._lock:
+            if self._state is not LaserOperationState.ARMED:
+                raise RuntimeError(
+                    f"Laser operation must be armed, found {self._state.value}"
+                )
+            self._start_requested.set()
+            return time.perf_counter()
 
     def to_record(self):
         with self._lock:
@@ -362,6 +373,7 @@ class NidaqLaserController:
                     )
                 operation = NidaqLaserOperation(
                     resources=resources,
+                    context=pulse_train.operation_context,
                     terminal_callback=self._release_operation,
                 )
                 self._live_operations[operation.operation_id] = operation
@@ -369,7 +381,7 @@ class NidaqLaserController:
             def execute():
                 try:
                     self._execute_synchronized_pulse_train(
-                        dataclasses.replace(pulse_train, wait=True),
+                        pulse_train,
                         operation=operation,
                     )
                 except Exception as error:
@@ -528,11 +540,19 @@ class NidaqLaserController:
             if operation is not None:
                 operation._bind_tasks((ao_task, *digital_tasks))
                 operation._require_not_cancelled()
+            if operation is not None and pulse_train.defer_start:
+                operation._mark_armed()
+                if not operation._start_requested.wait(timeout_seconds):
+                    raise TimeoutError("Deferred laser operation did not receive a start request")
+                operation._require_not_cancelled()
             for task in digital_tasks:
                 task.start()
             ao_task.start()
             if operation is not None:
-                operation._mark_armed()
+                if pulse_train.defer_start:
+                    operation._mark_triggered("NI software start accepted")
+                else:
+                    operation._mark_armed()
             self._last_timing_status = timing_status
             ao_task.wait_until_done(timeout=timeout_seconds)
             for task in digital_tasks:

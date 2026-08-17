@@ -233,10 +233,55 @@ class LaserModel(ObservableObject):
         self._require_controller().run_pulse_train(pulse_train)
         self.trace_received(self._make_pulse_trace(pulse_train))
 
-    def run_synchronized_pulse_train(self, pulse_train: LaserSynchronizedPulseTrain) -> None:
-        self._require_controller().run_synchronized_pulse_train(pulse_train)
+    def run_synchronized_pulse_train(self, pulse_train: LaserSynchronizedPulseTrain):
+        operation = self._require_controller().run_synchronized_pulse_train(pulse_train)
         for channel_pulse in pulse_train.pulse_trains:
             self.trace_received(self._make_pulse_trace(channel_pulse))
+        return operation
+
+    def prepare_pulse_profile(self, profile, recipe):
+        """Resolve a frozen protocol profile into one pre-armed finite output."""
+        route = getattr(profile.trigger_route, "value", profile.trigger_route)
+        hardware_trigger = route == "hardware_stim3"
+        direct_start = route == "direct_ni_software"
+        if not hardware_trigger and not direct_start:
+            raise ValueError(f"Unsupported protocol laser trigger route: {route}")
+        pulse = LaserPulseTrain(
+            channel_id=LaserChannelId(int(profile.channel_id)),
+            amplitude_volts=float(profile.amplitude_volts),
+            duration_ms=float(profile.pulse_duration_ms),
+            pulse_count=int(profile.pulse_count),
+            frequency_hz=profile.frequency_hz,
+            baseline_ms=float(profile.baseline_ms),
+            post_stim_ms=float(profile.post_stim_ms),
+            pmt_shutter_open_delay_ms=float(profile.pmt_open_lead_ms),
+            pmt_shutter_close_delay_ms=float(profile.pmt_close_lag_ms),
+            enable_pmt_shutter=(
+                profile.pmt_open_lead_ms > 0 or profile.pmt_close_lag_ms > 0
+            ),
+        )
+        operation_context = {
+            "session_id": recipe.session_id,
+            "session_generation": recipe.session_generation,
+            "protocol_id": recipe.protocol_id,
+            "protocol_revision": recipe.protocol_revision,
+            "logical_trial_id": recipe.logical_trial_id,
+            "attempt_id": recipe.attempt_id,
+            "trial_operation_id": recipe.operation_id,
+            "profile_id": profile.profile_id,
+            "profile_revision": profile.revision,
+            "trigger_route": route,
+        }
+        operation = self.run_synchronized_pulse_train(LaserSynchronizedPulseTrain(
+            pulse_trains=(pulse,),
+            trigger_source=(profile.trigger_terminal if hardware_trigger else None),
+            wait=False,
+            defer_start=direct_start,
+            operation_context=operation_context,
+        ))
+        if operation is None:
+            raise RuntimeError("Protocol laser preparation did not return an operation")
+        return operation
 
     def run_calibration_ramp(self, ramp: LaserCalibrationRamp) -> Tuple[LaserCalibrationPoint, ...]:
         self.trace_received(

@@ -391,6 +391,8 @@ class TrialActionExecutor:
                 self._observe(
                     "laser prepared: " + recipe.laser_profile.trigger_route.value
                 )
+                if row["laser_phase"] == "before_send":
+                    self._trigger_laser_if_direct("before_send")
             operation.transition(PreparedState.PREPARED)
             return operation
         except Exception as error:
@@ -438,7 +440,27 @@ class TrialActionExecutor:
             # A laser is already armed. Phase execution records the semantic
             # trigger point; the configured STIM3/NI route owns physical start.
             if recipe.laser_profile is not None and row["laser_phase"] == phase:
+                self._trigger_laser_if_direct(phase)
                 self._observe(f"{phase} laser trigger enabled")
+
+    def trigger_stimulus(self, operation_id: str, generation: int, *, detail="stimulus"):
+        """Accept one generation-tagged detector trigger for the prepared laser."""
+        with self._lock:
+            operation = self._require_operation(operation_id)
+            operation.require_generation(generation)
+            self._trigger_laser_if_direct(detail)
+            self._observe(f"{detail} direct NI trigger accepted")
+
+    def _trigger_laser_if_direct(self, detail):
+        operation = self._require_current()
+        profile = operation.recipe.laser_profile
+        if profile is None or profile.trigger_route is not LaserTriggerRoute.DIRECT_NI_SOFTWARE:
+            return False
+        trigger = getattr(self._laser_handle, "trigger", None)
+        if trigger is None:
+            raise RuntimeError("Prepared direct NI laser operation cannot be triggered")
+        trigger()
+        return True
 
     def complete(self, detail=""):
         with self._lock:

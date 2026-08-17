@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import Dict, Optional, Protocol, Tuple, Union
+from typing import Dict, Mapping, Optional, Protocol, Tuple, Union
 
 from autotrainer.core import (
     LaserChannelConfiguration,
@@ -82,18 +82,25 @@ class LaserSynchronizedPulseTrain:
     trigger_edge: str = "rising"
     enable_pmt_shutter: bool = False
     wait: bool = True
+    defer_start: bool = False
     timeout_seconds: Optional[float] = None
+    operation_context: Mapping[str, object] = dataclasses.field(default_factory=dict)
 
     def __post_init__(self):
         pulse_trains = tuple(self.pulse_trains)
         if not pulse_trains:
             raise ValueError("pulse_trains cannot be empty")
         object.__setattr__(self, "pulse_trains", pulse_trains)
+        object.__setattr__(self, "operation_context", dict(self.operation_context))
         object.__setattr__(self, "trigger_edge", self.trigger_edge.lower())
         if self.trigger_edge not in ("rising", "falling"):
             raise ValueError("trigger_edge must be 'rising' or 'falling'")
         if self.timeout_seconds is not None and self.timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive when provided")
+        if self.defer_start and self.trigger_source is not None:
+            raise ValueError("defer_start cannot be combined with a hardware trigger")
+        if self.defer_start and self.wait:
+            raise ValueError("deferred start requires nonblocking operation ownership")
         channel_ids = [pulse_train.channel_id for pulse_train in pulse_trains]
         if len(set(channel_ids)) != len(channel_ids):
             raise ValueError("synchronized laser pulse trains cannot repeat a channel_id")

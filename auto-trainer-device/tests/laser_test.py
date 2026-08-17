@@ -279,3 +279,17 @@ def test_nonblocking_laser_operation_cancel_is_terminal_after_worker_cleanup(mon
     release.set()
     assert operation.wait(2) is LaserOperationState.CANCELLED
     assert operation.operation_id not in controller._live_operations
+
+
+def test_synchronized_pulse_train_rejects_deferred_hardware_trigger():
+    with pytest.raises(ValueError, match="hardware trigger"):
+        LaserSynchronizedPulseTrain(
+            pulse_trains=(LaserPulseTrain(
+                channel_id=LaserChannelId.LASER_1,
+                amplitude_volts=1.0,
+                duration_ms=10.0,
+            ),),
+            trigger_source="/Dev1/PFI0",
+            wait=False,
+            defer_start=True,
+        )
