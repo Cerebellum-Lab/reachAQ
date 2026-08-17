@@ -1,4 +1,5 @@
 import dataclasses
+from types import SimpleNamespace
 
 import pytest
 
@@ -241,3 +242,43 @@ def test_embedded_tone_is_prepared_without_host_playback():
     executor.prepare(recipe)
 
     assert calls == [("cue", "embedded_in_sequence")]
+
+
+def test_executor_persists_laser_result_and_rejects_failed_cycle():
+    class FailedLaser:
+        state = SimpleNamespace(value="failed")
+        error = RuntimeError("AO task failed")
+
+        def to_record(self):
+            return {"state": self.state.value, "error": str(self.error)}
+
+        def cancel(self):
+            return False
+
+    row = TrialProtocolRow(trial_id=1).with_updates({
+        "enabled": True,
+        "laser_profile_id": "pulse",
+        "laser_phase": "pellet_presentation",
+        "laser_trigger_route": "hardware_stim3",
+        "stimulus_assignment": "always",
+        "stimulus_trigger": "tone_1",
+    })
+    recipe = _compiler().compile(row, _context())
+    executor = TrialActionExecutor(
+        move_absolute=lambda target: None,
+        configure_cover=lambda policy, recipe: None,
+        play_tone=lambda profile, phase: None,
+        prepare_laser=lambda profile, recipe: FailedLaser(),
+        cancel_laser=lambda handle: handle.cancel(),
+    )
+
+    executor.prepare(recipe)
+    executor.bind_send(recipe.operation_id, 4, "can-context")
+    executor.acknowledge_presentation("can-context")
+
+    with pytest.raises(RuntimeError, match="AO task failed"):
+        executor.complete("cycle ended")
+
+    record = executor.operation_record()
+    assert record["state"] == "failed"
+    assert record["actions"]["laser"]["state"] == "failed"

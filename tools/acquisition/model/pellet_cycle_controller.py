@@ -182,6 +182,36 @@ class PelletCycleController:
         return finalized
 
     @_controller_locked
+    def finalize_active_hardware_error(
+        self,
+        perf_time: float,
+        wall_time: float,
+        *,
+        error: str,
+        kind: HardwareErrorKind = HardwareErrorKind.COMMAND_FAILURE,
+    ):
+        """Finalize a non-CAN hardware action owned by the active attempt."""
+        ledger = self._ledger
+        if ledger is None or ledger.active_attempt is None:
+            return None
+        kind = HardwareErrorKind(kind)
+        finalized = ledger.finalize_hardware_error(
+            kind,
+            perf_time,
+            wall_time,
+            error=str(error),
+        )
+        self._session_api.trial_ended(finalized)
+        self._protocol_runner.cancel_active_trial()
+        logger.error(
+            "pellet attempt %s finalized as %s: %s",
+            finalized.attempt_label,
+            kind.value,
+            error,
+        )
+        return finalized
+
+    @_controller_locked
     def finalize_hardware_failure(
         self,
         failure: CanFailure,

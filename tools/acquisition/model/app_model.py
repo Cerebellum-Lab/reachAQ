@@ -5010,7 +5010,7 @@ class AppModel(ObservableObject):
             self._pellet_cycles.annotate_protocol_operation(
                 self._project_info,
                 attempt.operation_id,
-                operation.to_record(),
+                self._trial_action_executor.operation_record(),
             )
         except (KeyError, RuntimeError):
             logger.exception("Could not persist prepared protocol-operation evidence")
@@ -9088,8 +9088,12 @@ class AppModel(ObservableObject):
                     self._trial_action_executor.execute_phase("retract")
                     self._trial_action_executor.complete("next pellet load began")
                     self._persist_protocol_operation()
-                except RuntimeError:
+                except RuntimeError as error:
                     logger.exception("Could not finalize prepared pellet-trial operation")
+                    self._persist_protocol_operation()
+                    self._pellet_cycles.finalize_active_hardware_error(
+                        get_perf_now(), time.time(), error=str(error),
+                    )
             logger.warning(
                 "Pellet loading closed an attempt without a pellet-cycle event"
             )
@@ -9108,8 +9112,12 @@ class AppModel(ObservableObject):
                 self._trial_action_executor.execute_phase("retract")
                 self._trial_action_executor.complete("pellet cycle completed")
                 self._persist_protocol_operation()
-            except RuntimeError:
+            except RuntimeError as error:
                 logger.exception("Could not finalize prepared pellet-trial operation")
+                self._persist_protocol_operation()
+                self._pellet_cycles.finalize_active_hardware_error(
+                    perf_c, time.time(), error=str(error),
+                )
         self._complete_pellet_trial_window(
             perf_c,
             close_reason="pellet cycle completed",

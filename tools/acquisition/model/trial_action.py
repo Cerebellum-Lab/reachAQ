@@ -285,6 +285,7 @@ class PreparedTrialOperation:
         self._lock = threading.RLock()
         self._state = PreparedState.PREPARING
         self._observations = [TrialActionObservation(self._state, time.perf_counter())]
+        self._action_records = {}
 
     @property
     def state(self):
@@ -313,6 +314,10 @@ class PreparedTrialOperation:
         if int(generation) != self.recipe.session_generation:
             raise RuntimeError("Prepared operation belongs to a stale session generation")
 
+    def set_action_record(self, name: str, record) -> None:
+        with self._lock:
+            self._action_records[str(name)] = record
+
     def to_record(self):
         with self._lock:
             return {
@@ -326,6 +331,7 @@ class PreparedTrialOperation:
                     }
                     for item in self._observations
                 ],
+                "actions": dict(self._action_records),
             }
 
 
@@ -405,6 +411,7 @@ class TrialActionExecutor:
                 self._observe(f"{phase} tone prepared/acknowledged")
             if recipe.laser_profile is not None:
                 self._laser_handle = self._prepare_laser(recipe.laser_profile, recipe)
+                self._snapshot_laser_action()
                 self._observe(
                     "laser prepared: " + recipe.laser_profile.trigger_route.value
                 )
@@ -492,15 +499,18 @@ class TrialActionExecutor:
         if trigger is None:
             raise RuntimeError("Prepared direct NI laser operation cannot be triggered")
         trigger()
+        self._snapshot_laser_action()
         return True
 
     def complete(self, detail=""):
         with self._lock:
             operation = self._require_current()
+            self._await_laser_terminal_for_cycle()
             if operation.state is PreparedState.SEND_ACCEPTED:
                 operation.transition(PreparedState.ACTIVE, "cycle completion")
             operation.transition(PreparedState.COMPLETED, detail)
             if self._laser_handle is not None:
+                self._snapshot_laser_action()
                 self._release_laser(self._laser_handle)
             self._laser_handle = None
             self._cancel_detector_safely()
@@ -542,6 +552,67 @@ class TrialActionExecutor:
         handle, self._laser_handle = self._laser_handle, None
         if handle is not None:
             self._cancel_laser(handle)
+            self._snapshot_laser_action(handle)
+
+    def operation_record(self):
+        with self._lock:
+            self._snapshot_laser_action()
+            operation = self._require_current()
+            if self._detector_handle is not None:
+                operation.set_action_record(
+                    "stim_detector", dict(self._detector_handle),
+                )
+            return operation.to_record()
+
+    def _snapshot_laser_action(self, handle=None):
+        operation = self._operation
+        handle = self._laser_handle if handle is None else handle
+        if operation is None or handle is None:
+            return
+        to_record = getattr(handle, "to_record", None)
+        if to_record is not None:
+            operation.set_action_record("laser", to_record())
+
+    def _await_laser_terminal_for_cycle(self):
+        handle = self._laser_handle
+        if handle is None:
+            return
+        state = getattr(getattr(handle, "state", None), "value", None)
+        if state in {"armed", "triggered"}:
+            profile = self._require_current().recipe.laser_profile
+            duration = 0.0
+            if profile is not None:
+                duration = profile.pulse_duration_ms / 1000.0
+                if profile.pulse_count > 1 and profile.frequency_hz:
+                    duration += (profile.pulse_count - 1) / profile.frequency_hz
+                duration += (
+                    profile.baseline_ms
+                    + profile.post_stim_ms
+                    + profile.pmt_open_lead_ms
+                    + profile.pmt_close_lag_ms
+                ) / 1000.0
+            wait = getattr(handle, "wait", None)
+            if wait is not None:
+                try:
+                    wait(timeout=max(1.0, duration + 1.0))
+                except Exception:
+                    self._snapshot_laser_action()
+        self._snapshot_laser_action()
+        state = getattr(getattr(handle, "state", None), "value", None)
+        if state not in {None, "completed"}:
+            error = getattr(handle, "error", None)
+            self._cancel_laser_safely()
+            operation = self._require_current()
+            if operation.state not in operation.TERMINAL:
+                operation.transition(
+                    PreparedState.FAILED,
+                    "laser operation did not complete: "
+                    + (str(error) if error is not None else str(state)),
+                )
+            raise RuntimeError(
+                "Prepared laser operation did not complete successfully: "
+                + (str(error) if error is not None else str(state))
+            )
 
     def _cancel_detector_safely(self):
         handle, self._detector_handle = self._detector_handle, None
