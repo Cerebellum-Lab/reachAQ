@@ -3,7 +3,9 @@ from __future__ import annotations
 import logging.config
 import multiprocessing
 import math
+import pathlib
 import queue
+from collections import deque
 import signal
 import threading
 import time
@@ -33,6 +35,7 @@ from .camera.camera_base import CameraBase
 
 from .video_manager import VideoManager
 from .video_record import VideoRecord, VideoRecordProperties, VideoRecordMode
+from .stim_camera import StimCameraDetectionConfiguration, StimCameraDetector, StimEvidenceWriter
 
 logger = get_verbose_logger(__name__)
 
@@ -62,6 +65,9 @@ class CaptureCommandKind(IntEnum):
 
     SET_LOGGER_LEVEL = 6
     """Set a logger log level"""
+
+    ARM_STIM_DETECTOR = 7
+    DISARM_STIM_DETECTOR = 8
 
 
 @dataclass
@@ -157,6 +163,8 @@ class CaptureAttrs:
     """Use by record thread to signal when it has closed its video file,
     so that offline reader thread can know when it can open the files for offline processing"""
 
+    stim_detection: Optional[StimCameraDetectionConfiguration] = None
+
 
 class VideoCapture(Process):
     """
@@ -212,6 +220,21 @@ class VideoCapture(Process):
         self._record_queue_list: List[
                   # frame_id , frame, frame_when, frame_perf
             Tuple[int, numpy.ndarray, float, float]] = []
+        self._stim_detector = (
+            None
+            if attrs.stim_detection is None or not attrs.stim_detection.enabled
+            else StimCameraDetector(attrs.stim_detection)
+        )
+        self._stim_evidence_writer = None
+        self._stim_session_active = False
+        self._stim_clip_prebuffer = deque(
+            maxlen=(
+                0
+                if attrs.stim_detection is None
+                else attrs.stim_detection.pre_event_frames + 1
+            )
+        )
+        self._stim_pending_clip = None
 
         self._command_handlers: Dict[CaptureCommandKind, Callable] = {
             CaptureCommandKind.TERMINATE: self._user_terminate,
@@ -220,6 +243,8 @@ class VideoCapture(Process):
             CaptureCommandKind.ENABLE_RECORDING: self._enable_record,
             CaptureCommandKind.DISABLE_RECORDING: self._disable_record,
             CaptureCommandKind.SET_LOGGER_LEVEL: set_logger_level,
+            CaptureCommandKind.ARM_STIM_DETECTOR: self._arm_stim_detector,
+            CaptureCommandKind.DISARM_STIM_DETECTOR: self._disarm_stim_detector,
         }
 
         self._set_status(CaptureProcessStatus.INITIALIZED)
@@ -660,6 +685,13 @@ class VideoCapture(Process):
                             start=1,
                         )
                     )
+                self._process_stim_frame(
+                    frame,
+                    cam_frame_id,
+                    int(when),
+                    frame_perf_c,
+                    count_missed_frames=count_missed_frames,
+                )
                 # perf_frame_dropped = (
                 #     0
                 #     if not math.isfinite(prev_frame_perf_now)
@@ -854,6 +886,8 @@ class VideoCapture(Process):
         camera = self._camera
         try:
             logger.info(f"<{self._name}> capture loop ended")
+            self._stim_session_active = False
+            self._stop_stim_evidence()
 
             if camera is not None:
                 camera.end_capture()
@@ -904,6 +938,7 @@ class VideoCapture(Process):
 
     def _user_terminate(self):
         self._is_running = False
+        self._stop_stim_evidence()
 
     def _begin_capture(self):
         self._is_capturing = True
@@ -913,6 +948,9 @@ class VideoCapture(Process):
 
     def _enable_record(self, *, is_from_start: bool=False):
         self._is_record_active = self._record_properties.should_record(True, is_from_start=is_from_start)
+        if self._stim_detector is not None and not is_from_start:
+            self._stim_session_active = True
+            self._start_stim_evidence()
         logger.verbose("_enable_record: is_record_active=%s", self._is_record_active)
 
     def _disable_record(self, *, is_triggered: Optional[bool]=False, is_from_start: bool=False):
@@ -920,5 +958,127 @@ class VideoCapture(Process):
         if is_triggered is None:
             is_triggered = self._is_record_active
         self._is_record_active = self._record_properties.should_record(is_triggered, is_from_start=is_from_start)
+        if self._stim_detector is not None and not is_from_start:
+            self._stim_session_active = False
+            self._stim_detector.disarm()
+            self._stop_stim_evidence()
         logger.verbose("_disable_record(is_triggered=%s, is_from_start=%s): is_record_active=%s",
                        entry_is_triggered, is_from_start, self._is_record_active)
+
+    def _arm_stim_detector(self, context):
+        if self._stim_detector is None:
+            raise RuntimeError("Stim-camera detector is not configured")
+        self._stim_detector.arm(context)
+        self._stim_pending_clip = None
+
+    def _disarm_stim_detector(self, operation_id=None):
+        if self._stim_detector is not None:
+            self._stim_detector.disarm(operation_id)
+        self._stim_pending_clip = None
+
+    def _start_stim_evidence(self):
+        if self._stim_evidence_writer is not None:
+            return
+        project = self._project_info
+        if project is None:
+            raise RuntimeError("Stim evidence requires an active project")
+        path = pathlib.Path(project.get_session_path().location) / "streams" / "stim_camera_evidence.h5"
+        self._stim_evidence_writer = StimEvidenceWriter(path, self._attrs.stim_detection)
+
+    def _stop_stim_evidence(self):
+        writer, self._stim_evidence_writer = self._stim_evidence_writer, None
+        if writer is None:
+            return
+        error = ""
+        try:
+            writer.close()
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            logger.exception("Stim-camera evidence writer failed during close")
+        if self._attrs.msg_queue is not None:
+            self._attrs.msg_queue.put((
+                SystemStatusMessageKind.STIM_CAMERA_EVIDENCE_STATUS,
+                (self._camera_idx, writer.path.as_posix(), writer.diagnostics, error),
+            ))
+
+    def _process_stim_frame(
+        self,
+        frame,
+        frame_id,
+        camera_timestamp_ns,
+        frame_perf_time,
+        *,
+        count_missed_frames=0,
+    ):
+        detector = self._stim_detector
+        writer = self._stim_evidence_writer
+        if detector is None or writer is None or not self._stim_session_active:
+            return
+        arm = detector.arm_context
+        for missing_index in range(int(count_missed_frames)):
+            writer.append(
+                frame_id=int(frame_id) - int(count_missed_frames) + missing_index,
+                camera_timestamp_ns=0,
+                frame_perf_time=float("nan"),
+                value=float("nan"),
+                threshold=detector.configuration.roi.threshold,
+                arm=arm,
+                decision=None,
+                gap=True,
+            )
+        value, decision = detector.process(
+            frame, frame_id, camera_timestamp_ns, frame_perf_time,
+        )
+        clip_frame = self._stim_clip_frame(frame)
+        clip_item = (
+            int(frame_id), int(camera_timestamp_ns), float(frame_perf_time), clip_frame,
+        )
+        self._stim_clip_prebuffer.append(clip_item)
+        writer.append(
+            frame_id=frame_id,
+            camera_timestamp_ns=camera_timestamp_ns,
+            frame_perf_time=frame_perf_time,
+            value=value,
+            threshold=detector.configuration.roi.threshold,
+            arm=arm,
+            decision=decision,
+        )
+        if decision is not None:
+            self._begin_stim_clip(decision)
+        if decision is not None and self._attrs.msg_queue is not None:
+            try:
+                self._attrs.msg_queue.put_nowait((
+                    SystemStatusMessageKind.STIM_CAMERA_TRIGGER,
+                    (self._camera_idx, decision.to_record()),
+                ))
+            except queue.Full:
+                logger.critical("Stim-camera trigger message queue is full")
+        elif self._stim_pending_clip is not None:
+            pending = self._stim_pending_clip
+            pending["frames"].append(clip_item)
+            pending["remaining"] -= 1
+            if pending["remaining"] <= 0:
+                writer.queue_clip(pending["decision"], pending["frames"])
+                self._stim_pending_clip = None
+
+    def _stim_clip_frame(self, frame):
+        roi = self._stim_detector.configuration.roi
+        array = numpy.asarray(frame)
+        if array.ndim == 3:
+            array = array[:, :, 0]
+        if roi.width and roi.height:
+            array = array[roi.y:roi.y + roi.height, roi.x:roi.x + roi.width]
+        return numpy.ascontiguousarray(array)
+
+    def _begin_stim_clip(self, decision):
+        configuration = self._stim_detector.configuration
+        frames = list(self._stim_clip_prebuffer)
+        remaining = configuration.post_event_frames
+        if remaining <= 0:
+            self._stim_evidence_writer.queue_clip(decision, frames)
+            return
+        self._stim_pending_clip = {
+            "decision": decision,
+            "frames": frames,
+            "remaining": remaining,
+        }

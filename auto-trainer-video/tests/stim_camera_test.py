@@ -8,6 +8,7 @@ from autotrainer.video import (
     StimEvidenceWriter,
     StimRoiDefinition,
 )
+from autotrainer.video.video_capture import VideoCapture
 
 
 def _configuration(**kwargs):
@@ -73,9 +74,60 @@ def test_evidence_writer_batches_hdf5_rows(tmp_path):
         frame_id=2, camera_timestamp_ns=20, frame_perf_time=1.1,
         value=60, threshold=50, arm=arm, decision=None,
     )
+    detector.process(
+        numpy.ones((10, 10), dtype=numpy.uint8) * 4, 1, 10, 1.0,
+    )
+    _, decision = detector.process(
+        numpy.ones((10, 10), dtype=numpy.uint8) * 6, 2, 20, 1.1,
+    )
+    writer.queue_clip(decision, [
+        (1, 10, 1.0, numpy.zeros((2, 3), dtype=numpy.uint8)),
+        (2, 20, 1.1, numpy.ones((2, 3), dtype=numpy.uint8)),
+    ])
     writer.close()
 
     with h5py.File(path, "r") as store:
         assert store["evidence"].shape == (2,)
         assert store["evidence"]["frame_id"].tolist() == [1, 2]
         assert store.attrs["dropped_batches"] == 0
+        assert store["clips/op-1/frames"].shape == (2, 2, 3)
+        assert store.attrs["clips_written"] == 1
+
+
+def test_capture_hot_path_emits_one_nonblocking_trigger():
+    configuration = _configuration()
+    detector = StimCameraDetector(configuration)
+    detector.arm(_arm())
+
+    class Writer:
+        def __init__(self):
+            self.rows = []
+        def append(self, **row):
+            self.rows.append(row)
+        def queue_clip(self, decision, frames):
+            self.clip = (decision, tuple(frames))
+            return True
+
+    class Messages:
+        def __init__(self):
+            self.items = []
+        def put_nowait(self, item):
+            self.items.append(item)
+
+    capture = object.__new__(VideoCapture)
+    capture._stim_detector = detector
+    capture._stim_evidence_writer = Writer()
+    capture._stim_session_active = True
+    capture._camera_idx = 2
+    capture._stim_clip_prebuffer = __import__("collections").deque(maxlen=2)
+    capture._stim_pending_clip = None
+    capture._attrs = type("Attrs", (), {"msg_queue": Messages()})()
+
+    capture._process_stim_frame(numpy.ones((10, 10)) * 4, 1, 10, 1.0)
+    capture._process_stim_frame(numpy.ones((10, 10)) * 6, 2, 20, 1.1)
+    capture._process_stim_frame(numpy.ones((10, 10)) * 6, 3, 30, 1.2)
+
+    assert len(capture._stim_evidence_writer.rows) == 3
+    assert len(capture._attrs.msg_queue.items) == 1
+    assert capture._attrs.msg_queue.items[0][1][1]["operation_id"] == "op-1"
+    assert capture._stim_pending_clip is not None

@@ -25,7 +25,8 @@ from autotrainer.core.multiproc import get_mp_ctx
 from autotrainer.core.logging import log_hardware_initialization
 from autotrainer.core.project import ProjectInfo, ProjectDependentProtocol
 from autotrainer.video import VideoCapture, VideoRecordProperties, VideoRecordMode, VideoManager, \
-    VideoReader, CaptureCommandKind, CaptureCameraAttrs, CaptureInferenceAttrs, CaptureAttrs
+    VideoReader, CaptureCommandKind, CaptureCameraAttrs, CaptureInferenceAttrs, CaptureAttrs, \
+    StimCameraDetectionConfiguration, StimRoiDefinition
 from autotrainer.core.capture import CaptureProcessStatus
 from autotrainer.video.camera_discovery import (
     DEFAULT_CAMERA_DISCOVERY_TIMEOUT_SECONDS,
@@ -207,6 +208,7 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
         self._display_dots_detection = True
 
         self._display_update_fcn = None
+        self._stim_detection_configuration = None
 
         self._frame_count = 0
         self._start = 0
@@ -511,6 +513,7 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
                 record_generation=self._record_generation,
                 align_record_start_perf=self._align_record_start_perf,
                 record_stop_sema=self._record_stop_sema,
+                stim_detection=self._stim_detection_configuration,
             )
 
             rotate_interval = self._record_rotate_interval if self._is_recording_enabled else -1
@@ -599,6 +602,7 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
             else raw_primary is True
         )
         self._is_primary = self._configured_is_primary
+        self._stim_detection_configuration = self._stim_configuration_from_camera(conf)
 
         url = f"{conf.scheme}://{conf.host}"
 
@@ -725,6 +729,33 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
             self._send_command(CaptureCommandKind.ENABLE_RECORDING, is_from_start=is_from_start)
         else:
             self._send_command(CaptureCommandKind.DISABLE_RECORDING, is_triggered=is_triggered, is_from_start=is_from_start)
+
+    def arm_stim_detector(self, context) -> None:
+        self._send_command(CaptureCommandKind.ARM_STIM_DETECTOR, dict(context))
+
+    def disarm_stim_detector(self, operation_id=None) -> None:
+        self._send_command(CaptureCommandKind.DISARM_STIM_DETECTOR, operation_id)
+
+    @staticmethod
+    def _stim_configuration_from_camera(conf):
+        if conf.id != CameraId.Camera3 or conf.params.get("stim_mode") != "stimulation":
+            return None
+        params = conf.params
+        return StimCameraDetectionConfiguration(
+            enabled=True,
+            target_fps=float(params.get("fps", 900)),
+            roi=StimRoiDefinition(
+                x=int(params.get("stim_roi_x", 0)),
+                y=int(params.get("stim_roi_y", 0)),
+                width=int(params.get("stim_roi_width", 0)),
+                height=int(params.get("stim_roi_height", 0)),
+                threshold=float(params.get("stim_threshold", 0)),
+                hysteresis=float(params.get("stim_hysteresis", 0)),
+            ),
+            pre_event_frames=int(params.get("stim_pre_event_frames", 90)),
+            post_event_frames=int(params.get("stim_post_event_frames", 180)),
+            preview_fps=float(params.get("stim_preview_fps", 15)),
+        )
 
     def _on_trigger(self, notification: Notification):
         if self._video_capture is not None:

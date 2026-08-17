@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import queue
 import threading
 import time
@@ -206,7 +207,11 @@ class StimEvidenceWriter:
         self._buffer = numpy.empty(configuration.evidence_batch_size, dtype=_EVIDENCE_DTYPE)
         self._buffer_count = 0
         self._queue = queue.Queue(maxsize=configuration.evidence_queue_batches)
+        self._lock = threading.RLock()
+        self._closed = False
         self._drops = 0
+        self._clip_drops = 0
+        self._clips_written = 0
         self._high_water = 0
         self._write_latency_max = 0.0
         self._thread = threading.Thread(target=self._run, name="StimEvidenceWriter", daemon=True)
@@ -216,35 +221,61 @@ class StimEvidenceWriter:
     def diagnostics(self):
         return {
             "dropped_batches": self._drops,
+            "dropped_clips": self._clip_drops,
+            "clips_written": self._clips_written,
             "queue_high_water": self._high_water,
             "write_latency_max_seconds": self._write_latency_max,
         }
 
     def append(self, *, frame_id, camera_timestamp_ns, frame_perf_time, value, threshold, arm, decision, gap=False):
-        index = self._buffer_count
-        self._buffer[index] = (
-            int(frame_id), int(camera_timestamp_ns), float(frame_perf_time),
-            float("nan") if decision is None else decision.decision_perf_time,
-            float(value), float(threshold),
-            0 if arm is None else arm.session_generation,
-            0 if arm is None else arm.logical_trial_id,
-            0 if arm is None else arm.attempt_id,
-            arm is not None,
-            decision is not None,
-            bool(gap),
-        )
-        self._buffer_count += 1
-        if self._buffer_count == len(self._buffer):
-            self._flush_buffer()
+        with self._lock:
+            if self._closed:
+                return
+            index = self._buffer_count
+            self._buffer[index] = (
+                int(frame_id), int(camera_timestamp_ns), float(frame_perf_time),
+                float("nan") if decision is None else decision.decision_perf_time,
+                float(value), float(threshold),
+                0 if arm is None else arm.session_generation,
+                0 if arm is None else arm.logical_trial_id,
+                0 if arm is None else arm.attempt_id,
+                arm is not None,
+                decision is not None,
+                bool(gap),
+            )
+            self._buffer_count += 1
+            if self._buffer_count == len(self._buffer):
+                self._flush_buffer()
 
     def close(self):
-        self._flush_buffer()
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._flush_buffer()
         self._queue.put(None)
         self._thread.join(10)
         if self._thread.is_alive():
             raise TimeoutError("Stim evidence writer did not stop")
-        if self._drops:
-            raise RuntimeError(f"Stim evidence lost {self._drops} full batch(es)")
+        if self._drops or self._clip_drops:
+            raise RuntimeError(
+                "Stim evidence queue overflow: "
+                f"batches={self._drops} clips={self._clip_drops}"
+            )
+
+    def queue_clip(self, decision: StimTriggerDecision, frames) -> bool:
+        """Queue one bounded clip without performing file I/O on capture."""
+        payload = {
+            "decision": decision.to_record(),
+            "frames": tuple(frames),
+        }
+        try:
+            self._queue.put_nowait(("clip", payload))
+            self._high_water = max(self._high_water, self._queue.qsize())
+            return True
+        except queue.Full:
+            self._clip_drops += 1
+            return False
 
     def _flush_buffer(self):
         if not self._buffer_count:
@@ -252,7 +283,7 @@ class StimEvidenceWriter:
         batch = self._buffer[:self._buffer_count].copy()
         self._buffer_count = 0
         try:
-            self._queue.put_nowait(batch)
+            self._queue.put_nowait(("evidence", batch))
             self._high_water = max(self._high_water, self._queue.qsize())
         except queue.Full:
             self._drops += 1
@@ -263,22 +294,56 @@ class StimEvidenceWriter:
         with h5py.File(self.path, "w") as store:
             store.attrs["schema_version"] = STIM_EVIDENCE_SCHEMA_VERSION
             store.attrs["target_fps"] = self.configuration.target_fps
-            store.attrs["roi"] = str(dataclasses.asdict(self.configuration.roi))
+            store.attrs["roi"] = json.dumps(
+                dataclasses.asdict(self.configuration.roi), sort_keys=True,
+            )
             dataset = store.create_dataset(
                 "evidence", shape=(0,), maxshape=(None,), dtype=_EVIDENCE_DTYPE,
                 chunks=(self.configuration.evidence_batch_size,),
             )
             count = 0
             while True:
-                batch = self._queue.get()
-                if batch is None:
+                item = self._queue.get()
+                if item is None:
                     break
                 started = time.perf_counter()
-                dataset.resize((count + len(batch),))
-                dataset[count:count + len(batch)] = batch
-                count += len(batch)
+                kind, payload = item
+                if kind == "evidence":
+                    batch = payload
+                    dataset.resize((count + len(batch),))
+                    dataset[count:count + len(batch)] = batch
+                    count += len(batch)
+                elif kind == "clip":
+                    self._write_clip(store, payload)
+                else:
+                    raise RuntimeError(f"Unknown stim evidence item: {kind}")
                 self._write_latency_max = max(
                     self._write_latency_max, time.perf_counter() - started
                 )
             store.attrs.update(self.diagnostics)
             store.flush()
+
+    def _write_clip(self, store, payload):
+        decision = payload["decision"]
+        group = store.require_group("clips").create_group(decision["operation_id"])
+        group.attrs["decision"] = json.dumps(decision, sort_keys=True)
+        frames = payload["frames"]
+        group.create_dataset(
+            "frame_id", data=numpy.asarray([item[0] for item in frames], dtype="<i8"),
+        )
+        group.create_dataset(
+            "camera_timestamp_ns",
+            data=numpy.asarray([item[1] for item in frames], dtype="<i8"),
+        )
+        group.create_dataset(
+            "frame_perf_time",
+            data=numpy.asarray([item[2] for item in frames], dtype="<f8"),
+        )
+        if frames:
+            group.create_dataset(
+                "frames",
+                data=numpy.stack([item[3] for item in frames]),
+                chunks=True,
+                compression="lzf",
+            )
+        self._clips_written += 1

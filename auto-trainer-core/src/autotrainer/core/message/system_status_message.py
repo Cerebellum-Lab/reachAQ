@@ -65,6 +65,12 @@ class SystemStatusMessageKind(IntEnum):
     CAMERA_RECORDING_CLOSED_FINISHED = 1002  # current associated args is (cam_idx, tot_frames_written, project_info)
     """Sent when camera recording files are closed by record thread"""
 
+    STIM_CAMERA_TRIGGER = 1003
+    """One-shot high-rate stim-camera threshold decision."""
+
+    STIM_CAMERA_EVIDENCE_STATUS = 1004
+    """Stim-camera evidence writer terminal status and diagnostics."""
+
 
 
 class StepperStatusMessage(Protocol):
