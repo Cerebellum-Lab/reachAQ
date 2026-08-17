@@ -8,6 +8,7 @@ from tools.acquisition.model.trial_action import (
     PreparedTrialOperation,
     ToneProfile,
     TrialActionCompiler,
+    TrialActionExecutor,
     TrialCompileContext,
 )
 from tools.acquisition.model.trial_protocol_schedule import TrialProtocolRow
@@ -129,3 +130,60 @@ def test_prepared_operation_enforces_generation_and_terminal_state():
         operation.require_generation(5)
     with pytest.raises(RuntimeError, match="Invalid"):
         operation.transition(PreparedState.FAILED)
+
+
+def test_executor_prepares_before_send_and_binds_acknowledgement():
+    calls = []
+    compiler = _compiler()
+    row = TrialProtocolRow(trial_id=1).with_updates({
+        "enabled": True,
+        "tone_profile_id": "cue",
+        "tone_phase": "before_send",
+    })
+    recipe = compiler.compile(row, _context())
+    executor = TrialActionExecutor(
+        move_absolute=lambda target: calls.append(("move", target)),
+        configure_cover=lambda policy: calls.append(("cover", policy)),
+        play_tone=lambda profile, phase: calls.append(("tone", profile.profile_id, phase)),
+        prepare_laser=lambda profile, recipe: calls.append(("laser", profile.profile_id)),
+        cancel_laser=lambda handle: calls.append(("cancel_laser", handle)),
+    )
+
+    operation = executor.prepare(recipe)
+    executor.bind_send(recipe.operation_id, 4, "can-context")
+    executor.acknowledge_presentation("can-context")
+    executor.complete("cycle ended")
+
+    assert calls == [
+        ("move", (20.0, 40.0, 60.0)),
+        ("cover", "keep_current"),
+        ("tone", "cue", "before_send"),
+    ]
+    assert operation.state is PreparedState.COMPLETED
+
+
+def test_executor_preparation_failure_cancels_laser_and_creates_no_send():
+    calls = []
+    laser_row = TrialProtocolRow(trial_id=1).with_updates({
+        "enabled": True,
+        "laser_profile_id": "pulse",
+        "laser_phase": "pellet_presentation",
+        "laser_trigger_route": "hardware_stim3",
+        "stimulus_assignment": "always",
+        "stimulus_trigger": "tone_1",
+    })
+    recipe = _compiler().compile(laser_row, _context())
+    executor = TrialActionExecutor(
+        move_absolute=lambda target: None,
+        configure_cover=lambda policy: None,
+        play_tone=lambda profile, phase: None,
+        prepare_laser=lambda profile, recipe: (_ for _ in ()).throw(RuntimeError("arm failed")),
+        cancel_laser=lambda handle: calls.append(handle),
+    )
+
+    with pytest.raises(RuntimeError, match="arm failed"):
+        executor.prepare(recipe)
+
+    assert executor.operation.state is PreparedState.FAILED
+    with pytest.raises(RuntimeError, match="Prepared state"):
+        executor.require_send_permission(recipe.operation_id, 4)

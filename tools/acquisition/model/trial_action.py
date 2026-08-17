@@ -326,6 +326,168 @@ class PreparedTrialOperation:
             }
 
 
+class TrialActionExecutor:
+    """Own preparation, SEND permission, and cleanup for frozen recipes.
+
+    Hardware behavior is injected through narrow callbacks so this owner never
+    reaches into Qt, CAN transports, or DAQmx directly. The application invokes
+    ``prepare`` on its command worker, not the UI thread.
+    """
+
+    def __init__(
+        self,
+        *,
+        move_absolute: Callable[[Tuple[float, float, float]], object],
+        configure_cover: Callable[[str], object],
+        play_tone: Callable[[ToneProfile, str], object],
+        prepare_laser: Callable[[LaserPulseProfile, CompiledTrialRecipe], object],
+        cancel_laser: Callable[[object], None],
+    ):
+        self._move_absolute = move_absolute
+        self._configure_cover = configure_cover
+        self._play_tone = play_tone
+        self._prepare_laser = prepare_laser
+        self._cancel_laser = cancel_laser
+        self._lock = threading.RLock()
+        self._operation: Optional[PreparedTrialOperation] = None
+        self._laser_handle = None
+        self._send_context: Optional[str] = None
+
+    @property
+    def operation(self):
+        with self._lock:
+            return self._operation
+
+    def prepare(self, recipe: CompiledTrialRecipe) -> PreparedTrialOperation:
+        with self._lock:
+            if (
+                self._operation is not None
+                and self._operation.state not in PreparedTrialOperation.TERMINAL
+            ):
+                raise RuntimeError("Another pellet-trial operation is still active")
+            operation = self._operation = PreparedTrialOperation(recipe)
+            self._laser_handle = None
+            self._send_context = None
+        try:
+            self._move_absolute(recipe.resolved_motor_target)
+            self._observe("motor target acknowledged")
+            cover = recipe.requested_row["cover_policy"]
+            self._configure_cover(str(cover))
+            self._observe(f"cover policy prepared: {cover}")
+            row = recipe.requested_row
+            if recipe.tone_profile is not None and row["tone_phase"] == "before_send":
+                self._play_tone(recipe.tone_profile, "before_send")
+                self._observe("before-SEND tone acknowledged")
+            if recipe.laser_profile is not None:
+                self._laser_handle = self._prepare_laser(recipe.laser_profile, recipe)
+                self._observe(
+                    "laser prepared: " + recipe.laser_profile.trigger_route.value
+                )
+            operation.transition(PreparedState.PREPARED)
+            return operation
+        except Exception as error:
+            self._cancel_laser_safely()
+            operation.transition(PreparedState.FAILED, f"{type(error).__name__}: {error}")
+            raise
+
+    def require_send_permission(self, operation_id: str, generation: int):
+        with self._lock:
+            operation = self._require_operation(operation_id)
+            operation.require_generation(generation)
+            if operation.state is not PreparedState.PREPARED:
+                raise RuntimeError(
+                    f"Pellet SEND requires Prepared state, found {operation.state.value}"
+                )
+            return operation
+
+    def bind_send(self, operation_id: str, generation: int, send_context: str):
+        with self._lock:
+            operation = self.require_send_permission(operation_id, generation)
+            self._send_context = str(send_context)
+            operation.transition(
+                PreparedState.SEND_ACCEPTED,
+                f"pellet SEND queued: {self._send_context}",
+            )
+            return operation
+
+    def acknowledge_presentation(self, send_context: str):
+        with self._lock:
+            operation = self._require_current()
+            if self._send_context != str(send_context):
+                raise RuntimeError("Pellet acknowledgement does not match prepared SEND")
+            operation.transition(PreparedState.ACTIVE, "pellet presentation acknowledged")
+            self.execute_phase("pellet_presentation")
+            return operation
+
+    def execute_phase(self, phase: str):
+        with self._lock:
+            operation = self._require_current()
+            recipe = operation.recipe
+            row = recipe.requested_row
+            if recipe.tone_profile is not None and row["tone_phase"] == phase:
+                self._play_tone(recipe.tone_profile, phase)
+                self._observe(f"{phase} tone acknowledged")
+            # A laser is already armed. Phase execution records the semantic
+            # trigger point; the configured STIM3/NI route owns physical start.
+            if recipe.laser_profile is not None and row["laser_phase"] == phase:
+                self._observe(f"{phase} laser trigger enabled")
+
+    def complete(self, detail=""):
+        with self._lock:
+            operation = self._require_current()
+            if operation.state is PreparedState.SEND_ACCEPTED:
+                operation.transition(PreparedState.ACTIVE, "cycle completion")
+            operation.transition(PreparedState.COMPLETED, detail)
+            self._laser_handle = None
+            return operation
+
+    def fail(self, error):
+        with self._lock:
+            operation = self._require_current()
+            self._cancel_laser_safely()
+            if operation.state not in PreparedTrialOperation.TERMINAL:
+                operation.transition(
+                    PreparedState.FAILED,
+                    f"{type(error).__name__}: {error}",
+                )
+            return operation
+
+    def cancel(self, *, generation: Optional[int] = None, reason="cancelled"):
+        with self._lock:
+            operation = self._operation
+            if operation is None:
+                return None
+            if generation is not None:
+                operation.require_generation(generation)
+            self._cancel_laser_safely()
+            if operation.state not in PreparedTrialOperation.TERMINAL:
+                operation.transition(PreparedState.CANCELLED, reason)
+            return operation
+
+    def _observe(self, detail):
+        operation = self._require_current()
+        with operation._lock:
+            operation._observations.append(
+                TrialActionObservation(operation.state, time.perf_counter(), detail)
+            )
+
+    def _cancel_laser_safely(self):
+        handle, self._laser_handle = self._laser_handle, None
+        if handle is not None:
+            self._cancel_laser(handle)
+
+    def _require_operation(self, operation_id):
+        operation = self._require_current()
+        if operation.recipe.operation_id != str(operation_id):
+            raise RuntimeError("Prepared operation ID does not match")
+        return operation
+
+    def _require_current(self):
+        if self._operation is None:
+            raise RuntimeError("No prepared pellet-trial operation exists")
+        return self._operation
+
+
 def _finite_vector(values, name):
     result = tuple(float(value) for value in values)
     if len(result) != 3 or not all(math.isfinite(value) for value in result):
