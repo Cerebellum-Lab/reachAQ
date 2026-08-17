@@ -131,3 +131,31 @@ def test_capture_hot_path_emits_one_nonblocking_trigger():
     assert len(capture._attrs.msg_queue.items) == 1
     assert capture._attrs.msg_queue.items[0][1][1]["operation_id"] == "op-1"
     assert capture._stim_pending_clip is not None
+
+
+def test_rearming_persists_pending_clip_as_incomplete():
+    configuration = _configuration()
+    detector = StimCameraDetector(configuration)
+
+    class Writer:
+        def __init__(self):
+            self.clips = []
+
+        def queue_clip(self, decision, frames, *, complete=True):
+            self.clips.append((decision, tuple(frames), complete))
+            return True
+
+    capture = object.__new__(VideoCapture)
+    capture._stim_detector = detector
+    capture._stim_evidence_writer = Writer()
+    capture._stim_pending_clip = {
+        "decision": object(),
+        "frames": [(1, 10, 1.0, numpy.ones((2, 2)))],
+        "remaining": 1,
+    }
+
+    capture._arm_stim_detector(_arm())
+
+    assert capture._stim_pending_clip is None
+    assert len(capture._stim_evidence_writer.clips) == 1
+    assert capture._stim_evidence_writer.clips[0][2] is False

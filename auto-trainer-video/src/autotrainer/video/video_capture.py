@@ -970,13 +970,22 @@ class VideoCapture(Process):
     def _arm_stim_detector(self, context):
         if self._stim_detector is None:
             raise RuntimeError("Stim-camera detector is not configured")
+        self._flush_pending_stim_clip(complete=False)
         self._stim_detector.arm(context)
-        self._stim_pending_clip = None
 
     def _disarm_stim_detector(self, operation_id=None):
         if self._stim_detector is not None:
             self._stim_detector.disarm(operation_id)
-        self._stim_pending_clip = None
+        self._flush_pending_stim_clip(complete=False)
+
+    def _flush_pending_stim_clip(self, *, complete: bool) -> bool:
+        pending, self._stim_pending_clip = self._stim_pending_clip, None
+        writer = self._stim_evidence_writer
+        if pending is None or writer is None:
+            return False
+        return writer.queue_clip(
+            pending["decision"], pending["frames"], complete=complete,
+        )
 
     def _start_stim_evidence(self):
         if self._stim_evidence_writer is not None:
@@ -988,14 +997,11 @@ class VideoCapture(Process):
         self._stim_evidence_writer = StimEvidenceWriter(path, self._attrs.stim_detection)
 
     def _stop_stim_evidence(self):
-        writer, self._stim_evidence_writer = self._stim_evidence_writer, None
+        writer = self._stim_evidence_writer
         if writer is None:
             return
-        pending, self._stim_pending_clip = self._stim_pending_clip, None
-        if pending is not None:
-            writer.queue_clip(
-                pending["decision"], pending["frames"], complete=False,
-            )
+        self._flush_pending_stim_clip(complete=False)
+        self._stim_evidence_writer = None
         error = ""
         try:
             writer.close()
