@@ -54,6 +54,13 @@ from tools.acquisition.model.subsystem_status import (
     SubsystemId,
     SubsystemState,
 )
+from tools.acquisition.model.trial_protocol_repository import (
+    TrialProtocolRepository,
+)
+from tools.acquisition.model.trial_protocol_schedule import (
+    ProtocolPatch,
+    TrialProtocolDocument,
+)
 
 from autotrainer.api import ApiApplicationMode, ApiTrainingMode
 
@@ -121,6 +128,65 @@ def test_automatic_protocol_advance_updates_live_runner(app_model):
     session_control = app_model.behavior.algorithm.active_config.session_control
     assert session_control.automatic_protocol_advance_enabled is True
     assert app_model._protocol_runner.automatic_advance is True
+
+
+def test_ordered_protocol_selection_is_separate_from_training_plan(
+    app_model,
+    tmp_path,
+):
+    app_model._trial_protocol_repository = TrialProtocolRepository(
+        tmp_path / "trial_protocols"
+    )
+    document = TrialProtocolDocument(
+        protocol_id="ordered-a",
+        name="Ordered A",
+        trial_count=3,
+        defaults=ProtocolPatch.from_mapping({"enabled": True}),
+    )
+
+    saved = app_model.save_ordered_protocol(document)
+
+    assert app_model.selected_ordered_protocol == saved
+    assert app_model.trial_protocol_state["selected_protocol"] == {
+        "protocol_id": "ordered-a",
+        "name": "Ordered A",
+        "revision": 1,
+    }
+    assert len(app_model.trial_protocol_rows) == 3
+    context = app_model._current_trial_protocol_context(1)
+    assert context["protocol_id"] == "ordered-a"
+    assert context["protocol_revision"] == 1
+    assert "training_plan_id" in context
+
+
+def test_future_ordered_row_edit_persists_new_revision(app_model, tmp_path):
+    app_model._trial_protocol_repository = TrialProtocolRepository(tmp_path)
+    saved = app_model.save_ordered_protocol(TrialProtocolDocument(
+        protocol_id="ordered-edit",
+        name="Ordered Edit",
+        trial_count=2,
+        defaults=ProtocolPatch.from_mapping({
+            "enabled": True,
+            "position_mode": "fixed_manual",
+        }),
+    ))
+
+    assert app_model.update_trial_protocol_row(2, "shift_y_mm", "1.5")
+
+    updated = app_model.selected_ordered_protocol
+    assert updated.revision == saved.revision + 1
+    assert updated.resolve()[1].row.shift_y_mm == 1.5
+    reloaded = TrialProtocolRepository(tmp_path)
+    reloaded.reload()
+    assert reloaded.get("ordered-edit").revision == updated.revision
+
+
+def test_no_protocol_mode_has_safe_disabled_rows(app_model):
+    app_model._select_ordered_protocol_internal(None, persist_animal=False)
+
+    assert app_model.selected_ordered_protocol is None
+    assert all(not row["enabled"] for row in app_model.trial_protocol_rows)
+    assert not app_model.update_trial_protocol_row(1, "enabled", True)
 
 
 def test_scored_trial_limit_is_available_with_live_intertrial_scoring(app_model):

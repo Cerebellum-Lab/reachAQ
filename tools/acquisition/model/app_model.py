@@ -168,7 +168,14 @@ from tools.acquisition.model.atomic_session_io import (
     file_manifest_entry,
 )
 from tools.acquisition.model.session_boundary import SessionBoundary
-from tools.acquisition.model.trial_protocol_schedule import TrialProtocolSchedule
+from tools.acquisition.model.trial_protocol_repository import (
+    TrialProtocolRepository,
+)
+from tools.acquisition.model.trial_protocol_schedule import (
+    TrialOverride,
+    TrialProtocolDocument,
+    TrialProtocolSchedule,
+)
 from tools.acquisition.model.session_stop_policy import (
     SessionStopConfiguration,
     SessionStopDecision,
@@ -454,6 +461,12 @@ class AppModel(ObservableObject):
         self._editable_notes_project: Optional[ProjectInfo] = None
         self._pending_metadata_project: Optional[ProjectInfo] = None
         self._trial_protocol_lock = threading.RLock()
+        self._trial_protocol_repository = TrialProtocolRepository(
+            Path(preferences.configuration_location).expanduser()
+            / "trial_protocols"
+        )
+        self._trial_protocol_repository.reload()
+        self._selected_ordered_protocol: Optional[TrialProtocolDocument] = None
         self._trial_protocol_schedule = TrialProtocolSchedule.with_placeholder_rows()
         self._left_camera = self._right_camera = self._stim_camera = None
         self._reach_cameras: Tuple[VideoCaptureModel, ...] = ()
@@ -3676,6 +3689,7 @@ class AppModel(ObservableObject):
 
         if animal is None:
             self.training_plan = None
+            self._select_ordered_protocol_internal(None, persist_animal=False)
             algo.reset_selected_animal_counts(None)
         else:
             logger.debug("animal pellet=%s is_dcs=%s",
@@ -3690,6 +3704,19 @@ class AppModel(ObservableObject):
             self.training_plan = self.get_training_plan_by_id(
                 animal.training.current_protocol
             )
+            try:
+                self._select_ordered_protocol_internal(
+                    animal.training.ordered_protocol_id,
+                    persist_animal=False,
+                )
+            except KeyError:
+                logger.warning(
+                    "Animal %s preferred ordered protocol %r is unavailable; "
+                    "using No protocol",
+                    animal.id,
+                    animal.training.ordered_protocol_id,
+                )
+                self._select_ordered_protocol_internal(None, persist_animal=False)
         self._preferences.selected_animal = "" if animal is None else animal.id
         self._on_property_changed(self.Props.SELECTED_ANIMAL, animal, prev)
         self._event_manager.post_event_content(
@@ -3869,6 +3896,14 @@ class AppModel(ObservableObject):
         return self._trial_protocol_schedule.to_records()
 
     @property
+    def selected_ordered_protocol(self) -> Optional[TrialProtocolDocument]:
+        return self._selected_ordered_protocol
+
+    @property
+    def ordered_protocols(self) -> Tuple[TrialProtocolDocument, ...]:
+        return self._trial_protocol_repository.documents
+
+    @property
     def trial_protocol_state(self) -> dict:
         ledger = self._trial_ledger
         attempts = () if ledger is None else ledger.attempts
@@ -3882,6 +3917,25 @@ class AppModel(ObservableObject):
             ).get("trial_id")
         return {
             "rows": self.trial_protocol_rows,
+            "selected_protocol": (
+                None
+                if self._selected_ordered_protocol is None
+                else {
+                    "protocol_id": self._selected_ordered_protocol.protocol_id,
+                    "name": self._selected_ordered_protocol.name,
+                    "revision": self._selected_ordered_protocol.revision,
+                }
+            ),
+            "protocols": tuple(
+                {
+                    "protocol_id": document.protocol_id,
+                    "name": document.name,
+                    "revision": document.revision,
+                    "trial_count": document.trial_count,
+                }
+                for document in self.ordered_protocols
+            ),
+            "repository_errors": dict(self._trial_protocol_repository.errors),
             "active_trial_id": active_trial_id,
             "completed_trial_ids": tuple(sorted({
                 attempt.trial_id
@@ -3913,9 +3967,90 @@ class AppModel(ObservableObject):
                 or trial_id in state["completed_trial_ids"]
             ):
                 return False
-            self._trial_protocol_schedule.update(trial_id, field, value)
+            document = self._selected_ordered_protocol
+            if document is None:
+                return False
+            overrides = {
+                item.trial_id: item.patch.to_mapping()
+                for item in document.trial_overrides
+            }
+            values = overrides.setdefault(trial_id, {})
+            # The schedule performs field normalization and validates the
+            # currently resolved row before the atomic document save.
+            self._trial_protocol_schedule.row(trial_id).with_updates({field: value})
+            values[field] = value
+            updated = dataclasses.replace(
+                document,
+                trial_overrides=tuple(
+                    TrialOverride.create(key, overrides[key])
+                    for key in sorted(overrides)
+                ),
+            )
+            saved = self._trial_protocol_repository.save(
+                updated,
+                expected_revision=document.revision,
+            )
+            self._selected_ordered_protocol = saved
+            self._trial_protocol_schedule = TrialProtocolSchedule.from_document(saved)
         self._notify_trial_protocol_state()
         return True
+
+    @_serialized_session_configuration
+    def select_ordered_protocol(self, protocol_id: Optional[str]) -> bool:
+        self._require_session_ready_for_configuration(
+            "Changing the ordered trial protocol"
+        )
+        self._select_ordered_protocol_internal(protocol_id, persist_animal=True)
+        return True
+
+    def _select_ordered_protocol_internal(
+        self,
+        protocol_id: Optional[str],
+        *,
+        persist_animal: bool,
+    ) -> None:
+        with self._trial_protocol_lock:
+            if protocol_id in {None, "", "none"}:
+                document = None
+                schedule = TrialProtocolSchedule.with_placeholder_rows()
+            else:
+                document = self._trial_protocol_repository.get(str(protocol_id))
+                if document is None:
+                    raise KeyError(f"Unknown ordered protocol {protocol_id!r}")
+                schedule = TrialProtocolSchedule.from_document(document)
+            self._selected_ordered_protocol = document
+            self._trial_protocol_schedule = schedule
+            animal = self._selected_animal
+            if persist_animal and animal is not None:
+                animal.training.ordered_protocol_id = (
+                    None if document is None else document.protocol_id
+                )
+                self._save_animal_metadata(
+                    animal,
+                    sender="ordered_protocol_selection",
+                )
+        self._notify_trial_protocol_state()
+
+    def save_ordered_protocol(
+        self,
+        document: TrialProtocolDocument,
+        *,
+        expected_revision: Optional[int] = None,
+        select: bool = True,
+    ) -> TrialProtocolDocument:
+        self._require_session_ready_for_configuration("Saving an ordered protocol")
+        saved = self._trial_protocol_repository.save(
+            document,
+            expected_revision=expected_revision,
+        )
+        if select:
+            self._select_ordered_protocol_internal(
+                saved.protocol_id,
+                persist_animal=True,
+            )
+        else:
+            self._notify_trial_protocol_state()
+        return saved
 
     @_serialized_session_configuration
     def set_intertrial_analysis_enabled(self, enabled: bool) -> None:
@@ -5584,6 +5719,18 @@ class AppModel(ObservableObject):
         self._loaded_config_dir_path = location.parent.resolve()
         self._loaded_configuration_has_runtime_override = random_cameras
         self._runtime_live_inference_override = None
+
+        with self._trial_protocol_lock:
+            self._trial_protocol_repository = TrialProtocolRepository(
+                self._loaded_config_dir_path / "trial_protocols"
+            )
+            self._trial_protocol_repository.reload()
+            self._selected_ordered_protocol = None
+            self._trial_protocol_schedule = (
+                TrialProtocolSchedule.with_placeholder_rows()
+            )
+        for path, error in self._trial_protocol_repository.errors.items():
+            logger.error("Ordered protocol %s was not loaded: %s", path, error)
 
         # only at the end:
         self.output_location = configuration.persistence.output_location
@@ -7497,6 +7644,11 @@ class AppModel(ObservableObject):
                     )
                 ),
                 "protocolSchedule": list(self._trial_protocol_schedule.to_records()),
+                "orderedProtocol": (
+                    None
+                    if self._selected_ordered_protocol is None
+                    else self._selected_ordered_protocol.to_record()
+                ),
                 "stopResult": (
                     None
                     if self._session_stop_evaluation is None
@@ -8113,10 +8265,13 @@ class AppModel(ObservableObject):
     def _current_trial_protocol_context(self, trial_id: Optional[int] = None):
         plan = self._attached_plan
         phase = None if plan is None else plan.current_phase
+        ordered = self._selected_ordered_protocol
         if trial_id is None:
             trial_id = self._pellet_cycles.planned_trial_id
         return {
-            "protocol_id": None if plan is None else plan.plan_id,
+            "protocol_id": None if ordered is None else ordered.protocol_id,
+            "protocol_revision": None if ordered is None else ordered.revision,
+            "training_plan_id": None if plan is None else plan.plan_id,
             "phase_id": None if phase is None else phase.phase_id,
             "automatic_advance": self._protocol_runner.automatic_advance,
             "trial_row": self._trial_protocol_schedule.row(trial_id).to_record(),
