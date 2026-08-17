@@ -1096,9 +1096,18 @@ class CanDevice(Device):
                 raise ValueError("Pre-reveal delay must be within 1..60000 ms")
             if not 100 <= pulse_duration_us <= 5_000_000:
                 raise ValueError("STIM3 pulse duration must be within 100 us..5 s")
+            delay_us = delay_ms * 1000
+            if pulse_duration_us >= delay_us:
+                raise ValueError(
+                    "STIM3 pulse duration must be shorter than the pre-reveal delay"
+                )
+            # GPIO_PULSE is acknowledged after the firmware has returned the
+            # output low. Wait only for the remainder so pre_reveal_ms means
+            # physical rising edge -> pellet reveal.
+            remaining_delay_s = (delay_us - pulse_duration_us) / 1_000_000.0
             steps[0:0] = [
                 {"stim3": pulse_duration_us},
-                {"delay": delay_ms / 1000.0},
+                {"delay": remaining_delay_s},
                 {"predefined": "release"},
             ]
         if isinstance(data, dict) and data.get("embedded_tone") is not None:

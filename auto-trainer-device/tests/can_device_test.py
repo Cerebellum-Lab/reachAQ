@@ -195,10 +195,23 @@ def test_send_sequence_can_prepend_board_timed_pre_reveal_stimulus():
     sequence = device._start_sequence.call_args.args[0]
     assert sequence.steps[:3] == [
         {"stim3": 1000},
-        {"delay": 0.2},
+        {"delay": 0.199},
         {"predefined": "release"},
     ]
     assert device._send_pellet.steps == original
+
+
+def test_send_sequence_rejects_pulse_longer_than_pre_reveal_interval():
+    device = CanDevice(
+        api=DeviceApi(message_callback=data_callback),
+        force_emulation=True,
+        required_targets=(Target.PELLET_DEVICE,),
+    )
+
+    with pytest.raises(ValueError, match="shorter than the pre-reveal delay"):
+        device._start_send_pellet_sequence({
+            "pre_reveal_stimulus": (1, 1000),
+        })
 
 
 def test_immediate_tone_status_is_forwarded_with_source_timestamp():
