@@ -232,3 +232,58 @@ def test_validator_reconciles_trial_and_protocol_operation(tmp_path):
     assert next(
         item for item in report.results if item.rule_id == "trials.protocol"
     ).status.value == "pass"
+
+
+def test_event_sources_may_be_empty_without_failing_continuous_coverage(tmp_path):
+    root = _session(tmp_path)
+    stream_path = root / "streams/stream_manifest.json"
+    stream = json.loads(stream_path.read_text(encoding="utf-8"))
+    stream["enabledSources"] = [{
+        "id": "laser_outputs",
+        "kind": "laser_commands_and_states",
+        "path": "streams/laser.csv",
+        "sampleCount": 0,
+        "persistenceStatus": "written",
+    }]
+    _write(stream_path, json.dumps(stream))
+    _write(root / "streams/laser.csv", "perf_time,event\n")
+
+    report = validate_session(
+        root,
+        profile=ValidationProfile.FAST,
+        selected_rules=("sources.contract", "events.frames"),
+    )
+
+    assert next(
+        item for item in report.results if item.rule_id == "sources.contract"
+    ).status.value == "pass"
+    assert next(
+        item for item in report.results if item.rule_id == "events.frames"
+    ).status.value == "not_applicable"
+
+
+def test_tone_confirmation_rejects_unmatched_in_session_evidence(tmp_path):
+    root = _session(tmp_path)
+    alignment_path = root / "streams/alignment.json"
+    alignment = json.loads(alignment_path.read_text(encoding="utf-8"))
+    alignment.update({
+        "canonicalBoundary": {"startPerfTime": 10.0, "endPerfTime": 20.0},
+        "toneConfirmation": {
+            "matched": [],
+            "unmatchedEvents": [{"eventPerfTime": 12.0}],
+            "unmatchedEdges": [{"perfTime": 13.0}],
+            "artifacts": [],
+        },
+    })
+    _write(alignment_path, json.dumps(alignment))
+
+    report = validate_session(
+        root,
+        profile=ValidationProfile.FAST,
+        selected_rules=("events.tones",),
+    )
+
+    result = next(item for item in report.results if item.rule_id == "events.tones")
+    assert result.status.value == "fail"
+    assert result.observed["unmatched_events"] == 1
+    assert result.observed["unmatched_edges"] == 1

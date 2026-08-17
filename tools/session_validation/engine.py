@@ -258,6 +258,7 @@ def _source_contract_rule(context):
     errors, warnings = [], []
     for source in stream.get("enabledSources", ()):
         source_id = source.get("id", "unknown")
+        source_kind = str(source.get("kind", ""))
         relative = source.get("path")
         if relative and not context.path(relative).is_file():
             errors.append(f"{source_id}: artifact missing")
@@ -265,7 +266,11 @@ def _source_contract_rule(context):
             errors.append(f"{source_id}: not written")
         if source.get("failure"):
             errors.append(f"{source_id}: {source['failure']}")
-        if source.get("sampleCount", 0) <= 0:
+        requires_continuous_coverage = (
+            source_kind in {"camera", "pose", "logs", "stim_camera_detection_evidence"}
+            or source_kind.startswith("nidaq")
+        )
+        if requires_continuous_coverage and source.get("sampleCount", 0) <= 0:
             errors.append(f"{source_id}: empty")
         warnings.extend(f"{source_id}: {item}" for item in source.get("warnings", ()))
     if not stream.get("sessionComplete", False):
@@ -581,13 +586,28 @@ _event_rule.MINIMUM = ValidationProfile.FAST
 
 
 def _event_frame_rule(context):
-    event_paths = tuple(
-        path for path in (
+    cameras = tuple(
+        source for source in context.json("streams/stream_manifest.json").get(
+            "enabledSources", ()
+        ) if source.get("kind") == "camera"
+    )
+    if not cameras:
+        return _result(
+            "events.frames", "not_applicable",
+            "No recorded camera source exists for frame association",
+        )
+    event_paths = []
+    for path in (
             context.path("streams/device.csv"),
             context.path("streams/events.csv"),
             context.path("streams/laser.csv"),
-        ) if path.is_file() and path.stat().st_size > 0
-    )
+    ):
+        if not path.is_file():
+            continue
+        with path.open("r", encoding="utf-8", newline="") as stream:
+            if next(csv.DictReader(stream), None) is not None:
+                event_paths.append(path)
+    event_paths = tuple(event_paths)
     if not event_paths:
         return _result("events.frames", "not_applicable", "No event stream is present")
     frame_path, _ = _frame_ledger_path(context)
@@ -666,6 +686,11 @@ def _tone_confirmation_rule(context):
             errors.append(f"confirmation {index}: missing recorded frame ID")
         if not frame.get("method") or not frame.get("confidence"):
             errors.append(f"confirmation {index}: missing alignment method/confidence")
+    unmatched_events = tone.get("unmatchedEvents", ())
+    if unmatched_events:
+        errors.append(
+            f"{len(unmatched_events)} decoded tone event(s) lack NI confirmation"
+        )
     unmatched = tone.get("unmatchedEdges", ())
     boundary = context.json("streams/alignment.json").get("canonicalBoundary", {})
     start = boundary.get("startPerfTime")
@@ -675,6 +700,20 @@ def _tone_confirmation_rule(context):
         if perf is not None and start is not None and end is not None:
             if not float(start) <= float(perf) <= float(end):
                 errors.append(f"unmatched edge {index} lies outside saved boundary")
+    in_boundary_unmatched = sum(
+        1
+        for edge in unmatched
+        if (
+            edge.get("perfTime") is not None
+            and start is not None
+            and end is not None
+            and float(start) <= float(edge["perfTime"]) <= float(end)
+        )
+    )
+    if in_boundary_unmatched:
+        errors.append(
+            f"{in_boundary_unmatched} valid in-session NI tone edge(s) lack a decoded event"
+        )
     artifact_count = int(tone.get("artifactCount", len(tone.get("artifacts", ()))))
     if artifact_count:
         warnings.append(f"{artifact_count} short-pulse artifact(s) retained")
@@ -683,7 +722,12 @@ def _tone_confirmation_rule(context):
         "events.tones", status,
         "; ".join(errors or warnings) if errors or warnings
         else "Tone commands, NI confirmations, and recorded frames agree",
-        observed={"confirmations": len(confirmations), "artifacts": artifact_count},
+        observed={
+            "confirmations": len(confirmations),
+            "unmatched_events": len(unmatched_events),
+            "unmatched_edges": len(unmatched),
+            "artifacts": artifact_count,
+        },
         paths=(path.as_posix(),),
     )
 _tone_confirmation_rule.RULE_ID = "events.tones"
