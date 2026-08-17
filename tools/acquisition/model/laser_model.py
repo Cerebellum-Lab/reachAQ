@@ -58,6 +58,7 @@ class LaserModel(ObservableObject):
         self._last_feedback_sample: Optional[LaserFeedbackSample] = None
         self._prepared_profiles = {}
         self._prepared_profiles_lock = threading.RLock()
+        self._direct_trigger_lock = threading.RLock()
         self._direct_trigger_queue = None
         self._direct_trigger_observer = None
         self._direct_trigger_stop = threading.Event()
@@ -300,18 +301,28 @@ class LaserModel(ObservableObject):
         return operation
 
     def start_direct_trigger_receiver(self, trigger_queue, observer=None) -> None:
-        if self._direct_trigger_thread is not None:
-            raise RuntimeError("Direct laser trigger receiver is already running")
-        self._direct_trigger_queue = trigger_queue
-        self._direct_trigger_observer = observer
-        self._direct_trigger_stop.clear()
-        thread = threading.Thread(
-            target=self._run_direct_trigger_receiver,
-            name="StimToNidaqTrigger",
-            daemon=True,
-        )
-        self._direct_trigger_thread = thread
-        thread.start()
+        with self._direct_trigger_lock:
+            thread = self._direct_trigger_thread
+            if thread is not None and thread.is_alive():
+                if (
+                    trigger_queue is not self._direct_trigger_queue
+                    or observer != self._direct_trigger_observer
+                ):
+                    raise RuntimeError(
+                        "Direct laser trigger receiver is already running with "
+                        "different ownership"
+                    )
+                return
+            self._direct_trigger_queue = trigger_queue
+            self._direct_trigger_observer = observer
+            self._direct_trigger_stop.clear()
+            thread = threading.Thread(
+                target=self._run_direct_trigger_receiver,
+                name="StimToNidaqTrigger",
+                daemon=True,
+            )
+            self._direct_trigger_thread = thread
+            thread.start()
 
     def bind_direct_trigger_nonce(self, operation_id: str, nonce: str) -> None:
         with self._prepared_profiles_lock:
@@ -328,11 +339,14 @@ class LaserModel(ObservableObject):
                     self._prepared_profiles.pop(operation_id, None)
 
     def stop_direct_trigger_receiver(self) -> None:
-        self._direct_trigger_stop.set()
-        thread = self._direct_trigger_thread
+        with self._direct_trigger_lock:
+            self._direct_trigger_stop.set()
+            thread = self._direct_trigger_thread
         if thread is not None and thread is not threading.current_thread():
             thread.join(2.0)
-        self._direct_trigger_thread = None
+        with self._direct_trigger_lock:
+            if self._direct_trigger_thread is thread:
+                self._direct_trigger_thread = None
         with self._prepared_profiles_lock:
             self._prepared_profiles.clear()
 

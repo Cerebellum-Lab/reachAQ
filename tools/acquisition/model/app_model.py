@@ -601,10 +601,6 @@ class AppModel(ObservableObject):
 
         self._hardware = HardwareModel(self._system_message_handler)
         self._laser = LaserModel()
-        self._laser.start_direct_trigger_receiver(
-            self._stim_direct_trigger_queue,
-            self._on_direct_stim_trigger_result,
-        )
         self._nidaq_signal_monitor = NidaqSignalMonitorModel()
         self._session_data_recorder = SessionDataRecorder(
             self._nidaq_signal_monitor,
@@ -5794,6 +5790,10 @@ class AppModel(ObservableObject):
                     if configuration.hardware_timed
                     else None
                 ),
+            )
+            self._laser.start_direct_trigger_receiver(
+                self._stim_direct_trigger_queue,
+                self._on_direct_stim_trigger_result,
             )
         except Exception as exc:
             error = str(exc) or exc.__class__.__name__

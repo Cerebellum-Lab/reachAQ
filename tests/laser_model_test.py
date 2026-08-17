@@ -104,3 +104,22 @@ def test_direct_trigger_receiver_validates_nonce_and_starts_prepared_operation()
         assert controller.operation.trigger_count == 1
     finally:
         model.stop_direct_trigger_receiver()
+
+
+def test_direct_trigger_receiver_restarts_after_acquisition_stop():
+    model = LaserModel(_Controller())
+    trigger_queue = queue.Queue(maxsize=1)
+    observer = lambda _result: None
+
+    model.start_direct_trigger_receiver(trigger_queue, observer)
+    first = model._direct_trigger_thread
+    model.start_direct_trigger_receiver(trigger_queue, observer)
+    assert model._direct_trigger_thread is first
+
+    model.stop_direct_trigger_receiver()
+    model.start_direct_trigger_receiver(trigger_queue, observer)
+    try:
+        assert model._direct_trigger_thread is not first
+        assert model._direct_trigger_thread.is_alive()
+    finally:
+        model.stop_direct_trigger_receiver()
