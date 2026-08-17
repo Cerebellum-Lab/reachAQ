@@ -48,8 +48,8 @@ class StimCameraDetectionConfiguration:
     roi: StimRoiDefinition = dataclasses.field(default_factory=StimRoiDefinition)
     evidence_batch_size: int = 1024
     evidence_queue_batches: int = 32
-    pre_event_frames: int = 90
-    post_event_frames: int = 180
+    pre_event_frames: int = 450
+    post_event_frames: int = 450
     preview_fps: float = 15.0
 
     def __post_init__(self):
