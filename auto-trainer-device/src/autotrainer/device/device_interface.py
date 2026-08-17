@@ -60,6 +60,17 @@ class Source:
     target: Target = None
     timestamp_ns: int = dataclasses.field(init=False, default=0)  # realtime unix timestamp but in integer nanoseconds
     index: int = dataclasses.field(init=False, default=0)  # perf counter in integer nanosecond
+    board_boot_id: Optional[int] = dataclasses.field(init=False, default=None)
+    board_sequence: Optional[int] = dataclasses.field(init=False, default=None)
+    board_time_us: Optional[int] = dataclasses.field(init=False, default=None)
+    board_timestamp_kind: Optional[str] = dataclasses.field(init=False, default=None)
+    board_aligned_perf_time: Optional[float] = dataclasses.field(init=False, default=None)
+    board_clock_model_id: Optional[str] = dataclasses.field(init=False, default=None)
+    board_clock_uncertainty_seconds: Optional[float] = dataclasses.field(init=False, default=None)
+    board_sequence_status: Dict[str, Any] = dataclasses.field(init=False, default_factory=dict)
+    event_perf_time: Optional[float] = dataclasses.field(init=False, default=None)
+    timestamp_method: str = dataclasses.field(init=False, default="host_receive_perf_time")
+    timing_confidence: str = dataclasses.field(init=False, default="host_timestamp")
     # init=False: preserve the original behavior/semantic of constructor with position args
     # for subclasses adding other fields.
 
@@ -84,6 +95,29 @@ class PelletDigitalInputs(Source):
     stimulus_2: bool = False
     stimulus_3: bool = False
     stimulus_4: bool = False
+
+
+@dataclass
+class BoardTimeSync(Source):
+    request_id: int = 0
+    request_receive_time_us: int = 0
+    response_queue_time_us: int = 0
+    clock_model: Dict[str, Any] = dataclasses.field(default_factory=dict)
+
+
+@dataclass
+class BoardCapabilities(Source):
+    wire_schema_version: int = 0
+    capabilities: int = 0
+    boot_id: int = 0
+
+
+@dataclass
+class DigitalPulseStatus(Source):
+    channel: DigitalOutputs = DigitalOutputs.STIMULUS_4
+    duration_us: int = 0
+    phase: str = ""
+    error: int = 0
 
 
 @dataclass

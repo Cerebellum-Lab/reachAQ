@@ -11,6 +11,7 @@ from .device_connection import DeviceConnection
 from .device_connection_protocol import DeviceConnectionProtocol
 from .device_interface import (DeviceInterface, Target, Motor, ServoConfig, StepperConfig,
                                Heartbeat, DigitalOutputs, PelletDigitalInputs,
+                               BoardTimeSync, BoardCapabilities, DigitalPulseStatus,
                                Tone, AnalogOutput, AnalogOutputs,
                                ColorLed, StepperStatus, ServoStatus, Status)
 from .emulation_interface import EmulationInterface

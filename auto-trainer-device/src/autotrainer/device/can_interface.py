@@ -18,6 +18,7 @@ import inspect
 import math
 import time
 import warnings
+import dataclasses
 from enum import Enum, IntEnum
 from operator import attrgetter
 from pathlib import Path
@@ -65,7 +66,11 @@ from .device_interface import (
     ServoStatus,
     StepperStatus,
     Version,
+    BoardTimeSync,
+    BoardCapabilities,
+    DigitalPulseStatus,
 )
+from .board_clock import BoardClockModel, BoardSequenceTracker
 from .stepper_motor import mm_to_turns, turns_to_mm
 from .socketcan_jerrycan import SocketCanJerryCAN
 from . import socketcan_jerrycan
@@ -385,6 +390,10 @@ class CanInterface(DeviceInterface):
         }
 
         self._pellet_addr: Optional[int] = None
+        self._board_clock_model = BoardClockModel()
+        self._board_sequence_tracker = BoardSequenceTracker()
+        self._time_sync_requests = {}
+        self._next_time_sync_request_id = 1
 
         self._servo_configs = {}
         self.load_config = ServoConfig()
@@ -441,6 +450,18 @@ class CanInterface(DeviceInterface):
             cmd_type.DELAY: no_op,
             cmd_type.BOOTLOADER_DATA: no_op,
         }
+        optional_handlers = {
+            "TIME_SYNC_RESPONSE": self._translate_time_sync,
+            "CAPABILITIES_RESPONSE": self._translate_capabilities,
+            "GPIO_PULSE_STATUS": self._translate_gpio_pulse_status,
+            "TIME_SYNC_REQUEST": no_op,
+            "CAPABILITIES_REQUEST": no_op,
+            "GPIO_PULSE": no_op,
+        }
+        for name, handler in optional_handlers.items():
+            kind = getattr(cmd_type, name, None)
+            if kind is not None:
+                self._handlers[kind] = handler
 
     def __allow_fake_status_time(self, motor):
         if _debug_path_fake_status_timeout.exists():
@@ -732,6 +753,20 @@ class CanInterface(DeviceInterface):
                 return False
             try:
                 self._query_configuration()
+                if self.request_capabilities():
+                    capabilities = self.get_response(
+                        BoardCapabilities,
+                        Target.PELLET_DEVICE,
+                        timeout=0.25,
+                    )
+                    if capabilities is not None and capabilities.capabilities & 0x2:
+                        for _ in range(4):
+                            if self.request_clock_sync():
+                                self.get_response(
+                                    BoardTimeSync,
+                                    Target.PELLET_DEVICE,
+                                    timeout=0.25,
+                                )
             except BaseException:
                 try:
                     self._jc.Close()
@@ -1517,6 +1552,27 @@ class CanInterface(DeviceInterface):
                 break
         return rc == 0
 
+    def request_capabilities(self) -> bool:
+        request = getattr(self._jc, "RequestCapabilities", None)
+        if request is None or self.pellet_address is None:
+            return False
+        return request(self.pellet_address) == 0
+
+    def request_clock_sync(self) -> bool:
+        request = getattr(self._jc, "TimeSync", None)
+        if request is None or self.pellet_address is None:
+            return False
+        request_id = self._next_time_sync_request_id
+        self._next_time_sync_request_id = (request_id + 1) & 0xFFFFFFFF
+        host_send_ns = time.perf_counter_ns()
+        self._time_sync_requests[request_id] = host_send_ns
+        if request(self.pellet_address, request_id, host_send_ns) != 0:
+            self._time_sync_requests.pop(request_id, None)
+            return False
+        while len(self._time_sync_requests) > 128:
+            self._time_sync_requests.pop(next(iter(self._time_sync_requests)))
+        return True
+
     @staticmethod
     def _assign_timestamp_ns(message):
         return time.time_ns()
@@ -1537,10 +1593,91 @@ class CanInterface(DeviceInterface):
             return None
         res = handler(message)
         if res is not None:
-            assert isinstance(res, Source)
+            if not isinstance(res, Source):
+                raise TypeError(f"CAN decoder returned unsupported value: {type(res)}")
             res.timestamp_ns = self._get_timestamp_ns(message)
             res.index = self._get_index(message)
+            self._apply_board_timing(res, message)
         return res
+
+    def _apply_board_timing(self, source: Source, message) -> None:
+        source.event_perf_time = source.index / 1e9
+        if not bool(getattr(message, "board_timing_valid", False)):
+            return
+        timing = message.timing
+        source.board_boot_id = int(timing.boot_id)
+        source.board_sequence = int(timing.sequence)
+        source.board_time_us = int(timing.board_time_us)
+        kind = getattr(timing.kind, "name", str(timing.kind))
+        source.board_timestamp_kind = str(kind).lower()
+        source.board_sequence_status = self._board_sequence_tracker.observe(
+            source.board_boot_id, source.board_sequence,
+        )
+        estimate = self._board_clock_model.estimate
+        if (
+            source.board_sequence_status.get("reboot")
+            and (estimate is None or estimate.boot_id != source.board_boot_id)
+        ):
+            self._board_clock_model.reset(source.board_boot_id)
+        aligned = self._board_clock_model.align(source.board_time_us)
+        if aligned is None:
+            return
+        source.board_aligned_perf_time = aligned["perf_time"]
+        source.board_clock_model_id = aligned["model_id"]
+        source.board_clock_uncertainty_seconds = aligned["uncertainty_seconds"]
+        source.event_perf_time = aligned["perf_time"]
+        source.timestamp_method = "board_clock_affine"
+        source.timing_confidence = "board_timestamp"
+
+    def _translate_time_sync(self, message) -> BoardTimeSync:
+        response = message.time_sync_response
+        request_id = int(response.request_id)
+        host_send_ns = self._time_sync_requests.pop(request_id, None)
+        model = {}
+        timing = getattr(message, "timing", None)
+        if (
+            host_send_ns is not None
+            and bool(getattr(message, "board_timing_valid", False))
+            and timing is not None
+        ):
+            estimate = self._board_clock_model.observe(
+                request_id=request_id,
+                host_send_perf_ns=host_send_ns,
+                board_receive_time_us=int(response.request_receive_time_us),
+                board_send_time_us=int(response.response_queue_time_us),
+                host_receive_perf_ns=self._get_index(message),
+                boot_id=int(timing.boot_id),
+            )
+            model = dataclasses.asdict(estimate)
+        return BoardTimeSync(
+            target=_addr2tgt(message.dst_id),
+            request_id=request_id,
+            request_receive_time_us=int(response.request_receive_time_us),
+            response_queue_time_us=int(response.response_queue_time_us),
+            clock_model=model,
+        )
+
+    @staticmethod
+    def _translate_capabilities(message) -> BoardCapabilities:
+        response = message.capabilities_response
+        return BoardCapabilities(
+            target=_addr2tgt(message.dst_id),
+            wire_schema_version=int(response.wire_schema_version),
+            capabilities=int(response.capabilities),
+            boot_id=int(response.boot_id),
+        )
+
+    @staticmethod
+    def _translate_gpio_pulse_status(message) -> DigitalPulseStatus:
+        status = message.gpio_pulse_status
+        phase = getattr(status.phase, "name", str(status.phase)).lower()
+        return DigitalPulseStatus(
+            target=_addr2tgt(message.dst_id),
+            channel=DigitalOutputs.STIMULUS_4,
+            duration_us=int(status.duration_us),
+            phase=phase,
+            error=int(status.error),
+        )
 
     def _translate_bootloader(self, message) -> Optional[Version]:
         """

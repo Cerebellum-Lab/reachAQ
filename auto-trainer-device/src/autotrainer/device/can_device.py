@@ -45,6 +45,9 @@ from .device_interface import (
     ServoStatus,
     StepperStatus,
     Version,
+    BoardTimeSync,
+    BoardCapabilities,
+    DigitalPulseStatus,
 )
 
 
@@ -245,6 +248,7 @@ class CanDevice(Device):
         self._commands_handler_thread: Optional[threading.Thread] = None
         self._commands_handler_watchdog_perf_c = math.nan
         self._pellet_status_check_thread: Optional[threading.Thread] = None
+        self._next_clock_sync_perf = time.perf_counter() + 30.0
         # internal data cache:
         self._previous_stepper_status_pos_perf_c: MotorStatusCacheT = {}  # (None, -math.inf)
         self._previous_servo_status_pos_perf_c: MotorStatusCacheT = {}  # (None, -math.inf)
@@ -510,6 +514,16 @@ class CanDevice(Device):
             Version: lambda message: \
                 self._api.send_message(SystemStatusMessageKind.FIRMWARE_VERSION, message.version),
 
+            BoardTimeSync: lambda message: self._api.send_message(
+                SystemStatusMessageKind.BOARD_TIME_SYNC, message,
+            ),
+            BoardCapabilities: lambda message: self._api.send_message(
+                SystemStatusMessageKind.BOARD_CAPABILITIES, message,
+            ),
+            DigitalPulseStatus: lambda message: self._api.send_message(
+                SystemStatusMessageKind.DIGITAL_PULSE_STATUS, message,
+            ),
+
             Acknowledge: self._handle_ack,
         }
 
@@ -537,6 +551,15 @@ class CanDevice(Device):
         logger.verbose("running")
         while not self._want_exit.wait(1):  # no need check more often
             p_now = get_perf_now()
+            if p_now >= self._next_clock_sync_perf:
+                self._next_clock_sync_perf = p_now + 30.0
+                request_sync = getattr(self._interface, "request_clock_sync", None)
+                if request_sync is not None:
+                    try:
+                        if not request_sync():
+                            logger.debug("Pellet-board clock synchronization unavailable")
+                    except Exception:
+                        logger.exception("Could not request pellet-board clock synchronization")
             boards_timeout = self.default_board_status_timeout_delay  # re-read
             pellet_age = p_now - self._interface.pellet_status_perf_c
             check_pellet = self.is_target_required(Target.PELLET_DEVICE)

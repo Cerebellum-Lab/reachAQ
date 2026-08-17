@@ -55,6 +55,10 @@ class SystemStatusMessageKind(IntEnum):
     TONE_STATUS = 306
     """Immediate pellet-board tone-generator state and requested duration."""
 
+    BOARD_TIME_SYNC = 307
+    BOARD_CAPABILITIES = 308
+    DIGITAL_PULSE_STATUS = 309
+
     COLOR_LED = 403
     """Message is the original ColorLed message"""
 

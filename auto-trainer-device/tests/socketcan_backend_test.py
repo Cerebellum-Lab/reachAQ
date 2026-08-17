@@ -16,6 +16,7 @@ from autotrainer.device import (
     Motor,
     ServoStatus,
     Target,
+    BoardTimeSync,
 )
 from autotrainer.device import can_interface
 from autotrainer.device import socketcan_jerrycan
@@ -209,6 +210,39 @@ def test_legacy_frame_has_explicit_host_timing_fallback():
 
     assert not message.board_timing_valid
     assert message.timing.board_time_us == 0
+
+
+def test_can_interface_fits_and_applies_board_clock_response():
+    interface = CanInterface(
+        required_targets=(Target.PELLET_DEVICE,),
+        can_transport=CanTransportConfiguration(kind="socketcan", fd=True),
+    )
+    interface._get_index = lambda item: item.index
+    interface._get_timestamp_ns = lambda item: item.timestamp_ns
+    message = JerryCANMsg()
+    message.type = JerryCANCmdType.TIME_SYNC_RESPONSE
+    message.dst_id = 0
+    message.index = 101_002_000_000
+    message.timestamp_ns = 1_000_000_000
+    message.board_timing_valid = True
+    message.timing = socketcan_jerrycan.JerryCANTiming(
+        version=1, kind=socketcan_jerrycan.JerryCANTimestampKind.OBSERVED,
+        boot_id=9, sequence=1, board_time_us=1_000_100,
+    )
+    message.time_sync_response = socketcan_jerrycan.TimeSyncResponse(
+        request_id=7,
+        request_receive_time_us=1_000_000,
+        response_queue_time_us=1_000_200,
+    )
+    interface._time_sync_requests[7] = 101_000_000_000
+
+    translated = interface._translate(message)
+
+    assert isinstance(translated, BoardTimeSync)
+    assert translated.clock_model["boot_id"] == 9
+    assert translated.board_boot_id == 9
+    assert translated.board_aligned_perf_time == pytest.approx(101.001)
+    assert translated.timestamp_method == "board_clock_affine"
 
 
 def test_receive_classifies_bus_off_error_frame(monkeypatch):
