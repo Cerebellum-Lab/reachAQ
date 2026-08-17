@@ -8880,6 +8880,9 @@ class AppModel(ObservableObject):
                     )
                 ),
                 "protocolSchedule": list(self._trial_protocol_schedule.to_records()),
+                "stimulusProfileLibrary": (
+                    self._stimulus_profile_repository.library.to_record()
+                ),
                 "orderedProtocol": (
                     None
                     if self._selected_ordered_protocol is None

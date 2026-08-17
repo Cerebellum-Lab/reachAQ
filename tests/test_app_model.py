@@ -1518,6 +1518,10 @@ def test_final_metadata_uses_canonical_boundary_not_stale_project_timestamp(
     assert saved["boundary"]["endPerfTime"] == 12.0
     assert saved["boundary"]["durationSeconds"] == 2.0
     assert saved["recording"]["stopReason"] == "ManualStop"
+    assert saved["stimulusProfileLibrary"]["schema_version"] == 2
+    assert saved["stimulusProfileLibrary"]["automatic_shift_profiles"][0][
+        "policy_id"
+    ] == "default"
     assert "enabledSources" not in saved
     assert "trialSummary" not in saved
     assert "hardwareRuntimeAtRecord" not in saved
