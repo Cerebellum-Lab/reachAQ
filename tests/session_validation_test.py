@@ -234,6 +234,69 @@ def test_validator_reconciles_trial_and_protocol_operation(tmp_path):
     ).status.value == "pass"
 
 
+def test_validator_reconciles_automatic_shift_policy_and_recommendation(tmp_path):
+    root = _session(tmp_path)
+    policy = {
+        "policy_id": "rolling-failures",
+        "revision": 2,
+        "eligible_outcomes": ["failure"],
+        "reduction_method": "median",
+        "target_reach_offset_dcs": [1.5, -3.0, 1.0],
+        "deadbands_mm": [0.5, 1.0, 0.5],
+        "maximum_update_mm": [2.0, 2.0, 2.0],
+        "maximum_absolute_mm": [5.0, 5.0, 5.0],
+        "apply_automatically": False,
+    }
+    recommendation = {
+        "generation": 3,
+        "resolved_target_dcs": [4.0, 5.0, 6.0],
+        "apply_automatically": False,
+    }
+    recipe = {
+        "operation_id": "prepared-op",
+        "protocol_id": "p",
+        "logical_trial_id": 1,
+        "attempt_id": 1,
+        "requested_row": {
+            "trial_id": 1,
+            "position_mode": "reach_derived_automatic",
+            "automatic_shift_policy_id": "rolling-failures",
+        },
+        "resolved_dcs_target": [1.0, 2.0, 3.0],
+        "resolved_motor_target": [1.0, 2.0, 3.0],
+        "position_evidence": {
+            "mode": "reach_derived_automatic",
+            "automatic_status": "recommendation_only",
+            "automatic_policy": policy,
+            "automatic_recommendation": recommendation,
+        },
+        "stimulus_selected": False,
+        "stimulus_seed": 1,
+        "stimulus_draw": 0.5,
+    }
+    record = {
+        "trial_id": 1,
+        "attempt_id": 1,
+        "protocol_context": {"protocol_id": "p", "compiled_recipe": recipe},
+        "protocol_operation": {
+            "recipe": recipe,
+            "state": "completed",
+            "observations": [{"state": "completed", "perf_time": 1.0}],
+        },
+    }
+    _write(root / "streams/trials.jsonl", json.dumps(record) + "\n")
+
+    report = validate_session(
+        root,
+        profile=ValidationProfile.FAST,
+        selected_rules=("trials.protocol",),
+    )
+
+    assert next(
+        item for item in report.results if item.rule_id == "trials.protocol"
+    ).status.value == "pass"
+
+
 def test_event_sources_may_be_empty_without_failing_continuous_coverage(tmp_path):
     root = _session(tmp_path)
     stream_path = root / "streams/stream_manifest.json"

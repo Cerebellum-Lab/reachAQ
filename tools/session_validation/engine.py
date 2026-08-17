@@ -1115,6 +1115,52 @@ def _protocol_action_rule(context):
             ):
                 if field not in recipe:
                     errors.append(f"row {line_number}: recipe lacks {field}")
+            position = recipe.get("position_evidence") or {}
+            if requested.get("position_mode") == "reach_derived_automatic":
+                policy = position.get("automatic_policy") or {}
+                recommendation = position.get("automatic_recommendation")
+                policy_id = requested.get("automatic_shift_policy_id")
+                if policy.get("policy_id") != policy_id:
+                    errors.append(
+                        f"row {line_number}: automatic shift policy snapshot differs"
+                    )
+                for field in (
+                    "revision", "eligible_outcomes", "reduction_method",
+                    "target_reach_offset_dcs", "deadbands_mm",
+                    "maximum_update_mm", "maximum_absolute_mm",
+                    "apply_automatically",
+                ):
+                    if field not in policy:
+                        errors.append(
+                            f"row {line_number}: automatic policy lacks {field}"
+                        )
+                status = position.get("automatic_status")
+                if status == "applied":
+                    if not recommendation or not recommendation.get(
+                        "apply_automatically"
+                    ):
+                        errors.append(
+                            f"row {line_number}: applied automatic target lacks an "
+                            "applicable recommendation"
+                        )
+                    elif list(recipe.get("resolved_dcs_target") or ()) != list(
+                        recommendation.get("resolved_target_dcs") or ()
+                    ):
+                        errors.append(
+                            f"row {line_number}: applied automatic target differs "
+                            "from its recommendation"
+                        )
+                elif status == "recommendation_only":
+                    if not recommendation or recommendation.get(
+                        "apply_automatically", True
+                    ):
+                        errors.append(
+                            f"row {line_number}: recommend-only evidence is inconsistent"
+                        )
+                elif status != "insufficient_history":
+                    errors.append(
+                        f"row {line_number}: unknown automatic status {status!r}"
+                    )
             laser_profile = recipe.get("laser_profile")
             if laser_profile is not None:
                 laser_action = (operation.get("actions") or {}).get("laser")
