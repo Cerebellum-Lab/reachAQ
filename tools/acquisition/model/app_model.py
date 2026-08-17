@@ -171,6 +171,9 @@ from tools.acquisition.model.session_boundary import SessionBoundary
 from tools.acquisition.model.trial_protocol_repository import (
     TrialProtocolRepository,
 )
+from tools.acquisition.model.stimulus_profile_repository import (
+    StimulusProfileRepository,
+)
 from tools.acquisition.model.trial_protocol_schedule import (
     TrialOverride,
     TrialProtocolDocument,
@@ -481,6 +484,11 @@ class AppModel(ObservableObject):
             / "trial_protocols"
         )
         self._trial_protocol_repository.reload()
+        self._stimulus_profile_repository = StimulusProfileRepository(
+            Path(preferences.configuration_location).expanduser()
+            / "stimulus_profiles.json"
+        )
+        self._stimulus_profile_repository.load()
         self._selected_ordered_protocol: Optional[TrialProtocolDocument] = None
         self._trial_protocol_schedule = TrialProtocolSchedule.with_placeholder_rows()
         self._left_camera = self._right_camera = self._stim_camera = None
@@ -658,11 +666,13 @@ class AppModel(ObservableObject):
         self._protocol_positioning_active = False
         self._protocol_session_seed = 0
         self._automatic_protocol_shifts = {}
+        profile_library = self._stimulus_profile_repository.library
         self._tone_profiles = {
-            "tone-1": ToneProfile("tone-1", 1, 5000, 100),
-            "tone-2": ToneProfile("tone-2", 1, 6000, 100),
+            profile.profile_id: profile for profile in profile_library.tone_profiles
         }
-        self._laser_profiles: Dict[str, LaserPulseProfile] = {}
+        self._laser_profiles = {
+            profile.profile_id: profile for profile in profile_library.laser_profiles
+        }
         self._trial_action_executor = TrialActionExecutor(
             move_absolute=self._move_protocol_motor_target,
             configure_cover=self._configure_protocol_cover,
@@ -6346,8 +6356,25 @@ class AppModel(ObservableObject):
             self._trial_protocol_schedule = (
                 TrialProtocolSchedule.with_placeholder_rows()
             )
+            self._stimulus_profile_repository = StimulusProfileRepository(
+                self._loaded_config_dir_path / "stimulus_profiles.json"
+            )
+            profile_library = self._stimulus_profile_repository.load()
+            self._tone_profiles = {
+                profile.profile_id: profile
+                for profile in profile_library.tone_profiles
+            }
+            self._laser_profiles = {
+                profile.profile_id: profile
+                for profile in profile_library.laser_profiles
+            }
         for path, error in self._trial_protocol_repository.errors.items():
             logger.error("Ordered protocol %s was not loaded: %s", path, error)
+        if self._stimulus_profile_repository.error:
+            logger.error(
+                "Stimulus profile library was not loaded: %s",
+                self._stimulus_profile_repository.error,
+            )
 
         # only at the end:
         self.output_location = configuration.persistence.output_location
