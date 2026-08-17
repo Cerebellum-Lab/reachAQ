@@ -6316,6 +6316,13 @@ class AppModel(ObservableObject):
                 required_for_recording=False,
             )
 
+        # Freeze the third camera's mutually exclusive session contract before
+        # declaring subsystem intent. Intent must be established before any
+        # preflight publishes a terminal failure, otherwise the intent reset
+        # would erase that first diagnostic.
+        self._configure_stim_camera_for_selected_protocol()
+        self._configure_subsystem_intent(self._loaded_configuration)
+
         inference_preflight_error = None
         if self._inference.is_enabled:
             runtime_check = getattr(self._inference, "check_live_inference_runtime", None)
@@ -6338,12 +6345,6 @@ class AppModel(ObservableObject):
 
         algo = self._behavior.algorithm
         analysis = self._analysis
-
-        # Freeze the third camera's mutually exclusive session contract before
-        # any capture process is created. A protocol change while Running is
-        # reported as a blocker and takes effect on the next System restart.
-        self._configure_stim_camera_for_selected_protocol()
-        self._configure_subsystem_intent(self._loaded_configuration)
 
         # first:
         self._behavior.system_machine.intersession.reset_to_idle()
