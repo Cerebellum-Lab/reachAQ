@@ -115,3 +115,120 @@ def test_fast_validator_checks_board_clock_and_sequence_evidence(tmp_path):
     result = next(item for item in report.results if item.rule_id == "events.board_time")
     assert result.status.value == "pass"
     assert result.observed["timestamped_rows"] == 2
+
+
+def test_validator_checks_merged_frame_ids_and_event_association(tmp_path):
+    root = _session(tmp_path)
+    stream_path = root / "streams/stream_manifest.json"
+    stream = json.loads(stream_path.read_text(encoding="utf-8"))
+    stream["enabledSources"] = [{
+        "id": "camera.left",
+        "kind": "camera",
+        "path": "left.mp4",
+        "sampleCount": 2,
+        "persistenceStatus": "written",
+        "diagnostics": {
+            "writer_frame_count": 2,
+            "timestamp_row_count": 2,
+            "decoded_frame_count": 2,
+        },
+    }]
+    _write(stream_path, json.dumps(stream))
+    _write(root / "left.mp4", "fixture")
+    _write(
+        root / "session001_frame_timing.csv",
+        "frame_id,utc_when,frame_present_left\n10,1000.0,1\n11,1000.01,1\n",
+    )
+    event_columns = (
+        "perf_time,offset_seconds,wall_time,event_name,event_id,event_index,"
+        "context_json,timestamp_method,frame_id,recorded_frame_index,"
+        "frame_relation,frame_start_perf_time,frame_start_offset_seconds,"
+        "frame_start_wall_time,event_to_frame_start_seconds,alignment_method,"
+        "alignment_confidence\n"
+    )
+    _write(
+        root / "streams/events.csv",
+        event_columns
+        + "20.0,1.0,1000.005,event,id,1,{},host,11,1,following,20.005,"
+        "1.005,1000.01,0.005,writer_timeline,writer_timestamp\n",
+    )
+
+    report = validate_session(
+        root,
+        profile=ValidationProfile.FAST,
+        selected_rules=("camera.ledger", "events.frames"),
+    )
+
+    assert next(
+        item for item in report.results if item.rule_id == "camera.ledger"
+    ).status.value == "pass"
+    assert next(
+        item for item in report.results if item.rule_id == "events.frames"
+    ).status.value == "pass"
+
+
+def test_validator_reconciles_trial_and_protocol_operation(tmp_path):
+    root = _session(tmp_path)
+    recipe = {
+        "operation_id": "prepared-op",
+        "protocol_id": "p",
+        "logical_trial_id": 1,
+        "attempt_id": 1,
+        "requested_row": {"trial_id": 1},
+        "resolved_dcs_target": [1, 2, 3],
+        "resolved_motor_target": [4, 5, 6],
+        "position_evidence": {"mode": "base"},
+        "stimulus_selected": False,
+        "stimulus_seed": 1,
+        "stimulus_draw": 0.5,
+    }
+    record = {
+        "session_id": "session001",
+        "operation_id": "can-send-context",
+        "trial_id": 1,
+        "attempt_id": 1,
+        "attempt_label": "1.1",
+        "send_perf_time": 10.0,
+        "send_ack_perf_time": 10.1,
+        "finalized_perf_time": 11.0,
+        "outcome": "success",
+        "reach_count": 1,
+        "success_count": 1,
+        "consumption_count": 1,
+        "protocol_context": {
+            "protocol_id": "p",
+            "compiled_recipe": recipe,
+        },
+        "protocol_operation": {
+            "recipe": recipe,
+            "state": "completed",
+            "observations": [
+                {"state": "preparing", "perf_time": 9.0},
+                {"state": "completed", "perf_time": 11.0},
+            ],
+        },
+    }
+    _write(root / "streams/trials.jsonl", json.dumps(record) + "\n")
+    _write(root / "streams/trial_summary.json", json.dumps({
+        "physical_attempts": 1,
+        "hardware_errors": 0,
+        "incomplete_attempts": 0,
+        "pending_analysis_attempts": 0,
+        "pellets_presented": 1,
+        "reaches": 1,
+        "successful_reaches": 1,
+        "pellets_consumed": 1,
+    }))
+
+    report = validate_session(
+        root,
+        profile=ValidationProfile.FAST,
+        selected_rules=("trials.lifecycle", "trials.protocol"),
+    )
+
+    assert next(
+        item for item in report.results if item.rule_id == "trials.lifecycle"
+    ).status.value == "pass"
+    assert next(
+        item for item in report.results if item.rule_id == "trials.protocol"
+    ).status.value == "pass"
