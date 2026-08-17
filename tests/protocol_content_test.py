@@ -123,7 +123,11 @@ def test_protocol_table_uses_constrained_editors():
 
     assert isinstance(delivery_editor, QComboBox)
     assert isinstance(shift_editor, QDoubleSpinBox)
-    tone_delegate = content._table.itemDelegateForColumn(11)
+    tone_column = next(
+        index for index, column in enumerate(content.COLUMNS)
+        if column.field == "tone_profile_id"
+    )
+    tone_delegate = content._table.itemDelegateForColumn(tone_column)
     tone_editor = tone_delegate.createEditor(content, None, None)
     assert tone_editor.findData("tone-1") >= 0
     content.close()
