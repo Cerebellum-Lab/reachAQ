@@ -1537,7 +1537,9 @@ def test_final_metadata_uses_canonical_boundary_not_stale_project_timestamp(
         "persistence",
         "watchdog",
     }
-    assert len(serialized_json) < 12_000
+    # Keep the authoritative document bounded while retaining the complete
+    # versioned tone, laser, and automatic-shift policy snapshot.
+    assert len(serialized_json) < 20_000
     assert saved["artifacts"]["alignment"]["$ref"] == "streams/alignment.json"
     assert saved["artifacts"]["trialSummary"]["$ref"] == "streams/trial_summary.json"
     manifest = json.loads((session_dir / "manifest.json").read_text())
