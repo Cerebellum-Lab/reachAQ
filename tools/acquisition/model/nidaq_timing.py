@@ -402,7 +402,10 @@ def resolve_nidaq_multidevice_probe(
     master = plan.master_device
     combined = []
     for subsystem in ("ai", "di"):
-        members = tuple(task for task in graph.tasks if task.subsystem == subsystem)
+        members = tuple(sorted(
+            (task for task in graph.tasks if task.subsystem == subsystem),
+            key=lambda task: task.device != master,
+        ))
         if len({task.device for task in members}) <= 1:
             continue
         template = members[0]
