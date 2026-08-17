@@ -819,10 +819,26 @@ class SessionDataRecorder:
     ) -> None:
         source_index = getattr(data, "index", None)
         source_timestamp_ns = getattr(data, "timestamp_ns", None)
-        if isinstance(source_index, int) and source_index > 0:
-            perf_time = source_index / 1e9
-        if isinstance(source_timestamp_ns, int) and source_timestamp_ns > 0:
-            wall_time = source_timestamp_ns / 1e9
+        host_receive_perf = (
+            source_index / 1e9
+            if isinstance(source_index, int) and source_index > 0
+            else float(perf_time)
+        )
+        host_receive_wall = (
+            source_timestamp_ns / 1e9
+            if isinstance(source_timestamp_ns, int) and source_timestamp_ns > 0
+            else float(wall_time)
+        )
+        event_perf = getattr(data, "event_perf_time", None)
+        try:
+            event_perf = float(event_perf)
+        except (TypeError, ValueError):
+            event_perf = host_receive_perf
+        if not math.isfinite(event_perf):
+            event_perf = host_receive_perf
+        # Preserve a wall-clock value on the same host/performance-clock model
+        # used for the event. Raw receive clocks are stored separately below.
+        event_wall = host_receive_wall + event_perf - host_receive_perf
         context = None
         if (
             getattr(kind, "name", None) == "STIMULUS_INPUTS"
@@ -839,8 +855,8 @@ class SessionDataRecorder:
         ):
             context = data[0]
         self._append_device_event(
-            perf_time,
-            wall_time,
+            event_perf,
+            event_wall,
             "inbound",
             kind,
             data,
@@ -889,6 +905,28 @@ class SessionDataRecorder:
         if callable(device_index):
             device_index = None
         payload_json = self._payload_json(data)
+        host_receive_perf = getattr(data, "index", None)
+        if isinstance(host_receive_perf, int) and host_receive_perf > 0:
+            host_receive_perf = host_receive_perf / 1e9
+        else:
+            host_receive_perf = float(perf_time)
+        kernel_receive_wall_ns = getattr(data, "timestamp_ns", None)
+        if not isinstance(kernel_receive_wall_ns, int) or kernel_receive_wall_ns <= 0:
+            kernel_receive_wall_ns = None
+        host_receive_wall = (
+            kernel_receive_wall_ns / 1e9
+            if kernel_receive_wall_ns is not None
+            else float(wall_time)
+        )
+        board_aligned_perf = getattr(data, "board_aligned_perf_time", None)
+        event_perf = getattr(data, "event_perf_time", perf_time)
+        try:
+            event_perf = float(event_perf)
+        except (TypeError, ValueError):
+            event_perf = float(perf_time)
+        if not math.isfinite(event_perf):
+            event_perf = float(perf_time)
+        sequence_status = getattr(data, "board_sequence_status", None)
         with self._lock:
             if len(self._device_rows) == self._device_rows.maxlen:
                 self._device_event_overruns += 1
@@ -907,6 +945,20 @@ class SessionDataRecorder:
                 device_timestamp,
                 device_index,
                 payload_json,
+                host_receive_perf,
+                host_receive_wall,
+                kernel_receive_wall_ns,
+                getattr(data, "board_boot_id", None),
+                getattr(data, "board_sequence", None),
+                getattr(data, "board_time_us", None),
+                getattr(data, "board_timestamp_kind", None),
+                board_aligned_perf,
+                getattr(data, "board_clock_model_id", None),
+                getattr(data, "board_clock_uncertainty_seconds", None),
+                self._payload_json(sequence_status or {}),
+                event_perf,
+                getattr(data, "timestamp_method", "host_receive_perf_time"),
+                getattr(data, "timing_confidence", "host_timestamp"),
             ))
 
     @classmethod
@@ -1380,6 +1432,23 @@ class SessionDataRecorder:
                 "device_timestamp",
                 "device_index",
                 "payload_json",
+                "host_receive_perf_time",
+                "host_receive_wall_time",
+                "kernel_receive_wall_time_ns",
+                "board_boot_id",
+                "board_sequence",
+                "board_time_us",
+                "board_timestamp_kind",
+                "board_aligned_perf_time",
+                "board_aligned_wall_time",
+                "board_recording_offset_seconds",
+                "board_clock_model_id",
+                "board_clock_uncertainty_seconds",
+                "estimated_transport_delay_seconds",
+                "board_sequence_status_json",
+                "event_perf_time",
+                "event_timestamp_method",
+                "event_timing_confidence",
                 "frame_id",
                 "recorded_frame_index",
                 "frame_relation",
@@ -1402,15 +1471,44 @@ class SessionDataRecorder:
                     device_timestamp,
                     device_index,
                     payload,
+                    host_receive_perf,
+                    host_receive_wall,
+                    kernel_receive_wall_ns,
+                    board_boot_id,
+                    board_sequence,
+                    board_time_us,
+                    board_timestamp_kind,
+                    board_aligned_perf,
+                    (
+                        None
+                        if board_aligned_perf is None
+                        else start_wall + float(board_aligned_perf) - start_perf
+                    ),
+                    (
+                        None
+                        if board_aligned_perf is None
+                        else float(board_aligned_perf) - start_perf
+                    ),
+                    board_clock_model_id,
+                    board_clock_uncertainty,
+                    (
+                        None
+                        if board_aligned_perf is None
+                        else float(host_receive_perf) - float(board_aligned_perf)
+                    ),
+                    board_sequence_status_json,
+                    event_perf,
+                    event_timestamp_method,
+                    event_timing_confidence,
                     *SessionDataRecorder._csv_frame_alignment_fields(
                         SessionDataRecorder._event_alignment_record(
-                            perf,
-                            wall,
+                            event_perf,
+                            start_wall + event_perf - start_perf,
                             start_perf=start_perf,
                             start_wall=start_wall,
                             frame_timeline=recorded_frame_timeline,
-                            method="device_source_or_host_perf_counter",
-                            confidence="host_timestamp",
+                            method=event_timestamp_method,
+                            confidence=event_timing_confidence,
                         )
                     ),
                 )
@@ -1424,6 +1522,20 @@ class SessionDataRecorder:
                     device_timestamp,
                     device_index,
                     payload,
+                    host_receive_perf,
+                    host_receive_wall,
+                    kernel_receive_wall_ns,
+                    board_boot_id,
+                    board_sequence,
+                    board_time_us,
+                    board_timestamp_kind,
+                    board_aligned_perf,
+                    board_clock_model_id,
+                    board_clock_uncertainty,
+                    board_sequence_status_json,
+                    event_perf,
+                    event_timestamp_method,
+                    event_timing_confidence,
                 ) in device_rows
             ),
         )
@@ -2261,7 +2373,7 @@ class SessionDataRecorder:
                 _,
                 _,
                 payload,
-            ) = row
+            ) = row[:9]
             try:
                 decoded = json.loads(payload)
             except (TypeError, json.JSONDecodeError):
@@ -3067,11 +3179,16 @@ class SessionDataRecorder:
 
     @staticmethod
     def _normalize_device_row(row):
-        if len(row) == 9:
+        if len(row) == 23:
             return row
+        if len(row) == 9:
+            perf, wall, *_ = row
+            return (*row, perf, wall, None, None, None, None, None, None,
+                    None, None, "{}", perf, "host_receive_perf_time",
+                    "host_timestamp")
         if len(row) == 6:
             perf, wall, switch, pressure, temperature, humidity = row
-            return (
+            legacy = (
                 perf,
                 wall,
                 "inbound",
@@ -3087,6 +3204,7 @@ class SessionDataRecorder:
                     "humidity": humidity,
                 }),
             )
+            return SessionDataRecorder._normalize_device_row(legacy)
         raise ValueError(f"Unsupported structured device row with {len(row)} fields")
 
     @staticmethod

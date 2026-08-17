@@ -97,6 +97,46 @@ def test_device_event_does_not_serialize_container_index_method():
         recorder.close()
 
 
+def test_board_timed_device_event_preserves_receive_and_event_clocks():
+    laser = _EventSource("trace_received")
+    recorder = SessionDataRecorder(object(), laser)
+    source = SimpleNamespace(
+        index=10_200_000_000,
+        timestamp_ns=100_200_000_000,
+        event_perf_time=10.1,
+        timestamp_method="board_clock_affine",
+        timing_confidence="board_timestamp",
+        board_boot_id=7,
+        board_sequence=12,
+        board_time_us=4_000_000,
+        board_timestamp_kind="physical_start",
+        board_aligned_perf_time=10.1,
+        board_clock_model_id="board-7-g2",
+        board_clock_uncertainty_seconds=0.0002,
+        board_sequence_status={"gap": 0},
+    )
+    try:
+        recorder._on_device_message(
+            SystemStatusMessageKind.TONE_STATUS,
+            source,
+            10.25,
+            100.25,
+        )
+
+        row = recorder._device_rows[0]
+        assert row[0] == pytest.approx(10.1)
+        assert row[9] == pytest.approx(10.2)
+        assert row[10] == pytest.approx(100.2)
+        assert row[12:16] == (7, 12, 4_000_000, "physical_start")
+        assert row[20:] == (
+            pytest.approx(10.1),
+            "board_clock_affine",
+            "board_timestamp",
+        )
+    finally:
+        recorder.close()
+
+
 def test_external_process_event_retains_acquisition_timestamp_and_frame_id():
     laser = _EventSource("trace_received")
     recorder = SessionDataRecorder(object(), laser)
@@ -131,7 +171,7 @@ def test_pellet_stimulus_lines_are_labeled_for_tone_confirmation():
             100.0,
         )
 
-        payload = json.loads(recorder._device_rows[0][-1])
+        payload = json.loads(recorder._device_rows[0][8])
         assert payload == {
             "tone1": True,
             "tone2": False,
@@ -180,14 +220,14 @@ def test_structured_device_ledger_captures_decoded_input_and_output():
 
         assert len(rows) == 3
         assert rows[0][2:5] == ("inbound", "STIMULUS_INPUTS", "")
-        assert json.loads(rows[0][-1]) == {"tone1": True}
+        assert json.loads(rows[0][8]) == {"tone1": True}
         assert rows[1][2:6] == (
             "outbound",
             "PLAY_TONE",
             "PELLET_DEVICE",
             "token-1",
         )
-        assert json.loads(rows[1][-1]) == [7000, 100]
+        assert json.loads(rows[1][8]) == [7000, 100]
         assert rows[2][2:6] == (
             "inbound",
             "ACKNOWLEDGE",
