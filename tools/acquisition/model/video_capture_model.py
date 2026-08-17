@@ -791,8 +791,8 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
                 threshold=float(params.get("stim_threshold", 0)),
                 hysteresis=float(params.get("stim_hysteresis", 0)),
             ),
-            pre_event_frames=int(params.get("stim_pre_event_frames", 90)),
-            post_event_frames=int(params.get("stim_post_event_frames", 180)),
+            pre_event_frames=int(params.get("stim_pre_event_frames", 450)),
+            post_event_frames=int(params.get("stim_post_event_frames", 450)),
             preview_fps=float(params.get("stim_preview_fps", 15)),
         )
 

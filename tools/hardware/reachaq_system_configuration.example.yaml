@@ -99,8 +99,9 @@ cameras:
     stim_roi_height: 128
     stim_threshold: 0
     stim_hysteresis: 0
-    stim_pre_event_frames: 90
-    stim_post_event_frames: 180
+    # Half a second on each side at the stimulation-mode 900 Hz rate.
+    stim_pre_event_frames: 450
+    stim_post_event_frames: 450
     stim_preview_fps: 15
 hardware: !HardwareConfiguration
   pelletIdentifier: CAN
