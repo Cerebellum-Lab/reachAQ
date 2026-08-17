@@ -22,9 +22,10 @@ from autotrainer.core.event import post_api_detector_event_content
 from autotrainer.core.message import SystemDataArgsKwargs
 from autotrainer.device import (CanTransportConfiguration, CanTransportKind, DeviceConnectionProtocol, HAVE_CAN_DEVICE,
                                 DeviceConnection, CanDevice, CanFailure, CanFailureKind,
-                                StepperConfig, ServoConfig, Device, ColorLed, Target,
+                                StepperConfig, ServoConfig, Device, ColorLed, Target, EmulationInterface,
                                 capture_can_diagnostics)
 from autotrainer.behavior import PelletDeviceProtocol
+from tools.acquisition.model.firmware_compatibility import FirmwareCompatibilityPolicy
 
 logger = get_verbose_logger(__name__)
 
@@ -35,6 +36,7 @@ _reg_pellet_version_clean = re.compile("pellet ?:? *")
 class HardwareModel(ObservableObject, PelletDeviceProtocol):
 
     PELLET_VERSION_PROPERTY = "pellet_version"
+    FIRMWARE_COMPATIBILITY_PROPERTY = "firmware_compatibility"
 
     PELLET_IDENTIFIER_PROPERTY = "pellet_identifier"
     CAN_ENABLED = "can_enabled"
@@ -99,6 +101,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
 
         message_handler.property_changed += self._message_handler_property_changed
         message_handler.ack_received += self._ack_received
+        message_handler.decoded_message_received += self._decoded_device_message
 
         self._dcs_config: Optional[DiamondTriangleOffsetConfig] = None
         # Cache physical and requested coordinates separately so relative moves
@@ -113,6 +116,12 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         self._load_arm_position: float = math.nan
 
         self._pellet_version = ""
+        self._board_wire_schema_version = None
+        self._board_capabilities = 0
+        self._firmware_version_received = threading.Event()
+        self._can_is_emulation = False
+        self._firmware_policy = FirmwareCompatibilityPolicy.load()
+        self._firmware_compatibility = self._firmware_policy.evaluate("")
         self._color_led: Optional[ColorLed] = None
 
         self._device_ack_timeout_engaged = False
@@ -281,6 +290,14 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
     @property
     def pellet_version(self) -> str:
         return self._pellet_version
+
+    @property
+    def firmware_compatibility(self) -> dict:
+        return self._firmware_compatibility.to_record()
+
+    @property
+    def pellet_commands_allowed(self) -> bool:
+        return self._firmware_compatibility.commands_allowed
 
     @property
     def can_enabled(self) -> bool:
@@ -522,6 +539,11 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         connect_started = time.perf_counter()
         self._emit_device_event("state", "connect_start")
         transport = CanTransportConfiguration.from_environment()
+        self._firmware_version_received.clear()
+        self._board_wire_schema_version = None
+        self._board_capabilities = 0
+        self._can_is_emulation = transport.kind is CanTransportKind.EMULATION
+        self._update_firmware_compatibility("")
         log_hardware_initialization(
             logger,
             "START | CAN/pellet controller | transport=%s channel=%s required_target=%s",
@@ -575,6 +597,9 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             cmd_queue,
             name="can-device",
             failure_callback=self._on_can_failure,
+        )
+        self._can_is_emulation = isinstance(
+            can_device.device_interface, EmulationInterface,
         )
         log_hardware_initialization(logger, "START | CAN connection worker | name=can-device")
         device_conn.request_connect()
@@ -637,6 +662,16 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             )
 
         send_dev_ack_cmd(SystemCommandKind.REQUEST_VERSION)
+        if not self._firmware_version_received.wait(2.0):
+            raise RuntimeError(
+                "Pellet firmware version was not reported; motor initialization is blocked"
+            )
+        if not self.pellet_commands_allowed:
+            raise RuntimeError(
+                "Pellet firmware compatibility check failed: "
+                f"{self._firmware_compatibility.reason} "
+                f"(detected={self._pellet_version or 'unknown'})"
+            )
 
         # load and set motors and move configs
         # 1)
@@ -735,6 +770,8 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             self._can_device = None
         prev, self._pellet_version = self._pellet_version, ""
         self._on_property_changed(self.PELLET_VERSION_PROPERTY, "", prev)
+        self._firmware_version_received.clear()
+        self._update_firmware_compatibility("")
         prev_thread = self._check_timedout_commands_thread
         if prev_thread is not None:
             logger.debug("joining checktimedout commands thread")
@@ -901,8 +938,32 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
                 clean_v = _reg_pellet_version_clean.sub("", version).strip()
                 prev, self._pellet_version = self._pellet_version, clean_v
                 self._on_property_changed(self.PELLET_VERSION_PROPERTY, clean_v, prev)
+                self._update_firmware_compatibility(clean_v)
+                self._firmware_version_received.set()
         elif name == props.COLOR_LED:
             self._color_led = value
+
+    def _decoded_device_message(self, kind, data, perf_time, wall_time) -> None:
+        if kind != SystemStatusMessageKind.BOARD_CAPABILITIES:
+            return
+        self._board_wire_schema_version = int(data.wire_schema_version)
+        self._board_capabilities = int(data.capabilities)
+        self._update_firmware_compatibility(self._pellet_version)
+
+    def _update_firmware_compatibility(self, version: str) -> None:
+        previous = self._firmware_compatibility
+        current = self._firmware_policy.evaluate(
+            version,
+            wire_schema_version=self._board_wire_schema_version,
+            capabilities=self._board_capabilities,
+            emulation=self.__dict__.get("_can_is_emulation", False),
+        )
+        self._firmware_compatibility = current
+        self._on_property_changed(
+            self.FIRMWARE_COMPATIBILITY_PROPERTY,
+            current.to_record(),
+            previous.to_record(),
+        )
 
     def _send_with_token(self, device: Optional[DeviceConnectionProtocol], cmd: SystemCommandKind, data=None) -> Optional[UUID]:
         with self._lock:

@@ -193,6 +193,7 @@ def test_pending_command_and_connection_share_one_availability_rule(
     try:
         content._capture_active = True
         hardware._pellet_version = "test"
+        hardware._firmware_compatibility = hardware._firmware_policy.evaluate("2.0.0")
         hardware._pending_tokens.clear()
 
         content._refresh_enabled_state()

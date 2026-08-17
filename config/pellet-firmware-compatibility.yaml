@@ -1,0 +1,41 @@
+schema_version: 1
+board_type: pellet_module
+versions:
+  - version: 2.1.0
+    wire_schema_version: 1
+    required_capabilities:
+      - timing_trailer
+      - time_sync
+      - finite_stim3_pulse
+    optional_capabilities: []
+    hardware_release: v2.1.0
+    tested_reachaq_release: pre-release-devel
+    qualification_status: rollout_pending
+    qualification_date: null
+    limitations:
+      - Physical rig qualification and retained acceptance evidence are pending.
+  - version: 2.0.0
+    wire_schema_version: 1
+    required_capabilities: []
+    optional_capabilities:
+      - timing_trailer
+      - time_sync
+      - finite_stim3_pulse
+    hardware_release: v2.0.0
+    tested_reachaq_release: pre-release-devel
+    qualification_status: rollout_pending
+    qualification_date: null
+    limitations:
+      - Board timing and finite STIM3 require the board-time-sync firmware rollout.
+      - Legacy v2.0.0 images remain usable with host-receive timestamp confidence.
+  - version: 0.1.0
+    board_type: pellet_emulator
+    wire_schema_version: 0
+    required_capabilities: []
+    optional_capabilities: []
+    hardware_release: emulator
+    tested_reachaq_release: pre-release-devel
+    qualification_status: automated_tests
+    qualification_date: null
+    limitations:
+      - Emulation only; never accepted as physical hardware.

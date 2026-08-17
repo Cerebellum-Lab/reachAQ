@@ -2458,6 +2458,15 @@ class AppModel(ObservableObject):
             )
         if self._protocol_runner.protocol_complete:
             blockers.append("Selected protocol is complete")
+        if (
+            self._hardware.requires_connection
+            and not self._hardware.pellet_commands_allowed
+        ):
+            compatibility = self._hardware.firmware_compatibility
+            blockers.append(
+                "Pellet firmware is not compatible: "
+                + str(compatibility.get("reason") or "unknown compatibility state")
+            )
         if self.animal_metadata_refresh_busy:
             blockers.append("SoftMouse animal metadata refresh is still running")
         if self._recording_session.status is not SessionRecordingStatus.READY:
@@ -7861,6 +7870,12 @@ class AppModel(ObservableObject):
         hard = self._hardware
         if name == hard.CAN_CONNECTION_STATE_PROPERTY:
             self._on_can_connection_state_changed(value)
+        elif name == hard.FIRMWARE_COMPATIBILITY_PROPERTY:
+            self.property_changed(
+                self.Props.RECORDING_BLOCKERS,
+                self.recording_blockers,
+                None,
+            )
         elif animal is not None and name in {hard.SET_X, hard.SET_Y, hard.SET_Z}:
             # Protocol actions temporarily move the motors without redefining
             # the animal's manually configured base position.
@@ -8454,6 +8469,7 @@ class AppModel(ObservableObject):
             "nidaqEnabled": self._hardware.nidaq_enabled,
             "laserBackend": self._laser.configuration.backend,
             "liveInferenceEnabled": self._inference.is_enabled,
+            "pelletFirmwareCompatibility": self._hardware.firmware_compatibility,
             "cameras": {
                 camera.name: {
                     "previewEnabled": camera.is_enabled,

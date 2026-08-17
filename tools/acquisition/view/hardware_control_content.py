@@ -344,7 +344,11 @@ class HardwareControlContent(ContentWidget):
             widget.setEnabled(enabled)
 
     def _refresh_enabled_state(self) -> None:
-        panel_enabled = self._capture_active and bool(self._hardware_model.pellet_version)
+        panel_enabled = (
+            self._capture_active
+            and bool(self._hardware_model.pellet_version)
+            and self._hardware_model.pellet_commands_allowed
+        )
         self.setEnabled(panel_enabled)
         self.set_commands_enabled(
             panel_enabled and not self._hardware_model.pending_tokens
@@ -368,6 +372,9 @@ class HardwareControlContent(ContentWidget):
                 self.command_changed.emit("None")
             self._refresh_enabled_state()
             self._update_motor_feedback()
+
+        elif property_name == HardwareModel.FIRMWARE_COMPATIBILITY_PROPERTY:
+            self._refresh_enabled_state()
 
         elif property_name in {
             HardwareModel.POS_XYZ,

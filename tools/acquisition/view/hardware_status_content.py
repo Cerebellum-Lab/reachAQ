@@ -337,6 +337,17 @@ class HardwareStatusContent(ContentWidget):
                 "reported" if version else "unknown",
             )
         )
+        try:
+            compatibility = hardware.firmware_compatibility
+            commands_allowed = hardware.pellet_commands_allowed
+        except Exception:
+            compatibility = {}
+            commands_allowed = bool(version)
+        rows.append((
+            "compatibility",
+            "supported" if commands_allowed else "blocked",
+            str(compatibility.get("reason", "not reported")),
+        ))
         self._set_info(
             "pellet",
             self._format_device_rows(rows, self._scan_notes(scan_info)),
