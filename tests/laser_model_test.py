@@ -1,3 +1,6 @@
+import queue
+import threading
+import time
 from types import SimpleNamespace
 
 from autotrainer.device import LaserChannelConfiguration, LaserSystemConfiguration
@@ -17,7 +20,10 @@ class _Controller:
             ),
         ), backend="null", hardware_timed=True, sample_rate_hz=10_000)
         self.pulse = None
-        self.operation = object()
+        self.operation = SimpleNamespace(trigger_count=0)
+        self.operation.trigger = lambda: setattr(
+            self.operation, "trigger_count", self.operation.trigger_count + 1
+        )
 
     def run_synchronized_pulse_train(self, pulse):
         self.pulse = pulse
@@ -64,3 +70,37 @@ def test_prepare_direct_laser_profile_defers_start():
     model.prepare_pulse_profile(profile, _recipe())
     assert controller.pulse.trigger_source is None
     assert controller.pulse.defer_start
+
+
+def test_direct_trigger_receiver_validates_nonce_and_starts_prepared_operation():
+    controller = _Controller()
+    model = LaserModel(controller)
+    profile = LaserPulseProfile(
+        "pulse", 1, 1, 2.5, 5,
+        trigger_route=LaserTriggerRoute.DIRECT_NI_SOFTWARE,
+    )
+    model.prepare_pulse_profile(profile, _recipe())
+    model.bind_direct_trigger_nonce("trial-op", "once")
+    trigger_queue = queue.Queue(maxsize=1)
+    result_ready = threading.Event()
+    results = []
+    model.start_direct_trigger_receiver(
+        trigger_queue,
+        lambda result: (results.append(result), result_ready.set()),
+    )
+    try:
+        trigger_queue.put_nowait({
+            "operation_id": "trial-op",
+            "session_generation": 3,
+            "logical_trial_id": 4,
+            "attempt_id": 1,
+            "nonce": "once",
+            "stim_frame_id": 9,
+            "ipc_send_perf_time": time.perf_counter(),
+        })
+        assert result_ready.wait(1)
+        assert results[0]["accepted"]
+        assert results[0]["timing_confidence"] == "software_start"
+        assert controller.operation.trigger_count == 1
+    finally:
+        model.stop_direct_trigger_receiver()

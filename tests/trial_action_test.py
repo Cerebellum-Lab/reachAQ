@@ -90,6 +90,9 @@ def test_retry_repeat_keeps_draw_while_resample_changes_it():
         "stimulus_assignment": "percentage",
         "stimulus_trigger": "tone_1",
         "stimulus_probability_percent": 50,
+        "laser_profile_id": "pulse",
+        "laser_phase": "pellet_presentation",
+        "laser_trigger_route": "hardware_stim3",
     })
 
     first = _compiler().compile(base, _context(attempt_id=1))
@@ -196,7 +199,7 @@ def test_executor_routes_hardware_stimulus_through_firmware_callback():
     row = TrialProtocolRow(trial_id=1).with_updates({
         "enabled": True,
         "laser_profile_id": "pulse",
-        "laser_phase": "first_reach",
+        "laser_phase": "pellet_presentation",
         "laser_trigger_route": "hardware_stim3",
         "stimulus_assignment": "always",
         "stimulus_trigger": "first_reach",

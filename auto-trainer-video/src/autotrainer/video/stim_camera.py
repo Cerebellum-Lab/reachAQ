@@ -70,6 +70,7 @@ class StimDetectorArm:
     logical_trial_id: int
     attempt_id: int
     nonce: str
+    trigger_route: str = "hardware_stim3"
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, object]):
@@ -79,6 +80,7 @@ class StimDetectorArm:
             logical_trial_id=int(value["logical_trial_id"]),
             attempt_id=int(value["attempt_id"]),
             nonce=str(value["nonce"]),
+            trigger_route=str(value.get("trigger_route", "hardware_stim3")),
         )
 
     def to_record(self):

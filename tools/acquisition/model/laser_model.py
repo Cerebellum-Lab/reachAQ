@@ -3,6 +3,8 @@ from __future__ import annotations
 import dataclasses
 import logging
 import math
+import queue
+import threading
 import time
 from typing import Callable, Optional, Tuple, Union
 
@@ -54,6 +56,12 @@ class LaserModel(ObservableObject):
         self._controller: Optional[LaserControllerProtocol] = None
         self._configuration = LaserSystemConfiguration()
         self._last_feedback_sample: Optional[LaserFeedbackSample] = None
+        self._prepared_profiles = {}
+        self._prepared_profiles_lock = threading.RLock()
+        self._direct_trigger_queue = None
+        self._direct_trigger_observer = None
+        self._direct_trigger_stop = threading.Event()
+        self._direct_trigger_thread = None
         if controller is not None:
             self.set_controller(controller)
 
@@ -281,7 +289,104 @@ class LaserModel(ObservableObject):
         ))
         if operation is None:
             raise RuntimeError("Protocol laser preparation did not return an operation")
+        if direct_start:
+            with self._prepared_profiles_lock:
+                self._prepared_profiles[recipe.operation_id] = {
+                    "operation": operation,
+                    "context": operation_context,
+                    "nonce": None,
+                    "enabled": False,
+                }
         return operation
+
+    def start_direct_trigger_receiver(self, trigger_queue, observer=None) -> None:
+        if self._direct_trigger_thread is not None:
+            raise RuntimeError("Direct laser trigger receiver is already running")
+        self._direct_trigger_queue = trigger_queue
+        self._direct_trigger_observer = observer
+        self._direct_trigger_stop.clear()
+        thread = threading.Thread(
+            target=self._run_direct_trigger_receiver,
+            name="StimToNidaqTrigger",
+            daemon=True,
+        )
+        self._direct_trigger_thread = thread
+        thread.start()
+
+    def bind_direct_trigger_nonce(self, operation_id: str, nonce: str) -> None:
+        with self._prepared_profiles_lock:
+            prepared = self._prepared_profiles.get(str(operation_id))
+            if prepared is None:
+                return
+            prepared["nonce"] = str(nonce)
+            prepared["enabled"] = True
+
+    def release_prepared_profile(self, operation) -> None:
+        with self._prepared_profiles_lock:
+            for operation_id, prepared in tuple(self._prepared_profiles.items()):
+                if prepared["operation"] is operation:
+                    self._prepared_profiles.pop(operation_id, None)
+
+    def stop_direct_trigger_receiver(self) -> None:
+        self._direct_trigger_stop.set()
+        thread = self._direct_trigger_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(2.0)
+        self._direct_trigger_thread = None
+        with self._prepared_profiles_lock:
+            self._prepared_profiles.clear()
+
+    def _run_direct_trigger_receiver(self) -> None:
+        while not self._direct_trigger_stop.is_set():
+            try:
+                message = self._direct_trigger_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            received = time.perf_counter()
+            result = dict(message)
+            result["ipc_receive_perf_time"] = received
+            result["ipc_queue_delay_seconds"] = (
+                received - float(message["ipc_send_perf_time"])
+            )
+            try:
+                operation_id = str(message["operation_id"])
+                with self._prepared_profiles_lock:
+                    prepared = self._prepared_profiles.get(operation_id)
+                    if prepared is None:
+                        raise RuntimeError("direct trigger has no prepared NI operation")
+                    context = prepared["context"]
+                    expected = (
+                        int(context["session_generation"]),
+                        int(context["logical_trial_id"]),
+                        int(context["attempt_id"]),
+                        prepared["nonce"],
+                    )
+                    observed = (
+                        int(message["session_generation"]),
+                        int(message["logical_trial_id"]),
+                        int(message["attempt_id"]),
+                        str(message["nonce"]),
+                    )
+                    if observed != expected:
+                        raise RuntimeError("stale or mismatched direct trigger context")
+                    if not prepared["enabled"]:
+                        raise RuntimeError("direct trigger arrived before pellet presentation")
+                    operation = prepared["operation"]
+                result["daqmx_start_entry_perf_time"] = time.perf_counter()
+                operation.trigger()
+                result["daqmx_start_return_perf_time"] = time.perf_counter()
+                result["accepted"] = True
+                result["timing_confidence"] = "software_start"
+            except Exception as error:
+                result["accepted"] = False
+                result["error"] = f"{type(error).__name__}: {error}"
+                logger.exception("Direct stim-to-NI trigger rejected")
+            observer = self._direct_trigger_observer
+            if observer is not None:
+                try:
+                    observer(result)
+                except Exception:
+                    logger.exception("Direct trigger observer failed")
 
     def run_calibration_ramp(self, ramp: LaserCalibrationRamp) -> Tuple[LaserCalibrationPoint, ...]:
         self.trace_received(

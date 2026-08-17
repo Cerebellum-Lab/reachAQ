@@ -345,7 +345,9 @@ class TrialActionExecutor:
         play_tone: Callable[[ToneProfile, str], object],
         prepare_laser: Callable[[LaserPulseProfile, CompiledTrialRecipe], object],
         cancel_laser: Callable[[object], None],
+        release_laser: Callable[[object], None] = lambda _handle: None,
         prepare_detector: Callable[[CompiledTrialRecipe], object] = lambda _recipe: None,
+        activate_detector: Callable[[object], None] = lambda _handle: None,
         cancel_detector: Callable[[object], None] = lambda _handle: None,
         trigger_hardware_stimulus: Callable[
             [LaserPulseProfile, CompiledTrialRecipe, str], object
@@ -356,7 +358,9 @@ class TrialActionExecutor:
         self._play_tone = play_tone
         self._prepare_laser = prepare_laser
         self._cancel_laser = cancel_laser
+        self._release_laser = release_laser
         self._prepare_detector = prepare_detector
+        self._activate_detector = activate_detector
         self._cancel_detector = cancel_detector
         self._trigger_hardware_stimulus = trigger_hardware_stimulus
         self._lock = threading.RLock()
@@ -408,7 +412,7 @@ class TrialActionExecutor:
                     self._trigger_laser_if_direct("before_send")
             if recipe.stimulus_selected and row["stimulus_trigger"] == "first_reach":
                 self._detector_handle = self._prepare_detector(recipe)
-                self._observe("stim-camera First Reach detector armed")
+                self._observe("stim-camera First Reach detector prepared")
             operation.transition(PreparedState.PREPARED)
             return operation
         except Exception as error:
@@ -442,6 +446,9 @@ class TrialActionExecutor:
             if self._send_context != str(send_context):
                 raise RuntimeError("Pellet acknowledgement does not match prepared SEND")
             operation.transition(PreparedState.ACTIVE, "pellet presentation acknowledged")
+            if self._detector_handle is not None:
+                self._activate_detector(self._detector_handle)
+                self._observe("stim-camera First Reach detector activated")
             self.execute_phase("pellet_presentation")
             return operation
 
@@ -493,6 +500,8 @@ class TrialActionExecutor:
             if operation.state is PreparedState.SEND_ACCEPTED:
                 operation.transition(PreparedState.ACTIVE, "cycle completion")
             operation.transition(PreparedState.COMPLETED, detail)
+            if self._laser_handle is not None:
+                self._release_laser(self._laser_handle)
             self._laser_handle = None
             self._cancel_detector_safely()
             return operation

@@ -164,6 +164,8 @@ class CaptureAttrs:
     so that offline reader thread can know when it can open the files for offline processing"""
 
     stim_detection: Optional[StimCameraDetectionConfiguration] = None
+    stim_trigger_queue: Optional[multiprocessing.Queue] = None
+    """Bounded direct stim-camera-to-laser trigger channel."""
 
 
 class VideoCapture(Process):
@@ -1060,6 +1062,18 @@ class VideoCapture(Process):
         )
         if decision is not None:
             self._begin_stim_clip(decision)
+            if (
+                decision.arm.trigger_route == "direct_ni_software"
+                and self._attrs.stim_trigger_queue is not None
+            ):
+                try:
+                    self._attrs.stim_trigger_queue.put_nowait({
+                        **decision.to_record(),
+                        "camera_index": self._camera_idx,
+                        "ipc_send_perf_time": time.perf_counter(),
+                    })
+                except queue.Full:
+                    logger.critical("Direct stim-to-NI trigger queue is full")
         if decision is not None and self._attrs.msg_queue is not None:
             try:
                 self._attrs.msg_queue.put_nowait((

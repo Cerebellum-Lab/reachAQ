@@ -158,6 +158,7 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
         record_generation: Optional[Synchronized] = None,
         align_record_start_perf: bool = False,
         record_stop_sema: Optional[SemaphoreType] = None,
+        stim_trigger_queue: Optional[multiprocessing.Queue] = None,
     ):
         super().__init__()
 
@@ -178,6 +179,7 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
         self._record_generation = record_generation
         self._align_record_start_perf = align_record_start_perf
         self._record_stop_sema = record_stop_sema
+        self._stim_trigger_queue = stim_trigger_queue
 
         self._camera_source: CaptureCameraAttrs = CaptureCameraAttrs(name="", url="")
         self._camera_properties = {}
@@ -515,6 +517,7 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
                 align_record_start_perf=self._align_record_start_perf,
                 record_stop_sema=self._record_stop_sema,
                 stim_detection=self._stim_detection_configuration,
+                stim_trigger_queue=self._stim_trigger_queue,
             )
 
             rotate_interval = self._record_rotate_interval if self._is_recording_enabled else -1

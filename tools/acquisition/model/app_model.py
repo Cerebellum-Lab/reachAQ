@@ -185,6 +185,7 @@ from tools.acquisition.model.trial_protocol_schedule import (
     TrialProtocolDocument,
     ProtocolPatch,
     ProtocolScope,
+    LaserTriggerRoute,
     TrialProtocolSchedule,
 )
 from tools.acquisition.model.trial_action import (
@@ -546,6 +547,7 @@ class AppModel(ObservableObject):
         # not sure this should better be in SystemMachine or BehaviorAlgo or BehaviorModel or eventually HardwareModel ?
         # although here it's also working, so keeping for now.
         proc_msg_queue = self._multiproc_msg_queue = mp_ctx.Queue()
+        self._stim_direct_trigger_queue = mp_ctx.Queue(maxsize=16)
         self._handle_proc_msg_thread = threading.Thread(
             target=self._handle_proc_msg_queue, name="handle_proc_msg_queue", daemon=True)
         self._handle_proc_msg_thread.start()
@@ -598,6 +600,10 @@ class AppModel(ObservableObject):
 
         self._hardware = HardwareModel(self._system_message_handler)
         self._laser = LaserModel()
+        self._laser.start_direct_trigger_receiver(
+            self._stim_direct_trigger_queue,
+            self._on_direct_stim_trigger_result,
+        )
         self._nidaq_signal_monitor = NidaqSignalMonitorModel()
         self._session_data_recorder = SessionDataRecorder(
             self._nidaq_signal_monitor,
@@ -690,7 +696,9 @@ class AppModel(ObservableObject):
             play_tone=self._play_protocol_tone,
             prepare_laser=self._prepare_protocol_laser,
             cancel_laser=self._cancel_protocol_laser,
+            release_laser=self._laser.release_prepared_profile,
             prepare_detector=self._prepare_protocol_stim_detector,
+            activate_detector=self._arm_protocol_stim_detector,
             cancel_detector=self._cancel_protocol_stim_detector,
             trigger_hardware_stimulus=self._trigger_protocol_stim3,
         )
@@ -776,6 +784,7 @@ class AppModel(ObservableObject):
             record_start_perf=self._cams_record_start_perf,
             record_generation=self._record_generation_value,
             record_stop_sema=self._record_stop_sema,
+            stim_trigger_queue=self._stim_direct_trigger_queue,
         )
 
     @staticmethod
@@ -4720,9 +4729,15 @@ class AppModel(ObservableObject):
             "logical_trial_id": recipe.logical_trial_id,
             "attempt_id": recipe.attempt_id,
             "nonce": uuid.uuid4().hex,
+            "trigger_route": recipe.laser_profile.trigger_route.value,
         }
-        camera.arm_stim_detector(handle)
         return handle
+
+    def _arm_protocol_stim_detector(self, handle) -> None:
+        self._laser.bind_direct_trigger_nonce(
+            handle["operation_id"], handle["nonce"],
+        )
+        self._stim_camera.arm_stim_detector(handle)
 
     def _cancel_protocol_stim_detector(self, handle) -> None:
         if self._stim_camera is not None:
@@ -4771,11 +4786,15 @@ class AppModel(ObservableObject):
             )
             if not captured:
                 raise RuntimeError("stim trigger could not enter the session event ledger")
-            self._trial_action_executor.trigger_stimulus(
-                operation_id,
-                generation,
-                detail=f"stim-camera frame {payload['stim_frame_id']}",
-            )
+            if (
+                operation.recipe.laser_profile.trigger_route
+                is LaserTriggerRoute.HARDWARE_STIM3
+            ):
+                self._trial_action_executor.trigger_stimulus(
+                    operation_id,
+                    generation,
+                    detail=f"stim-camera frame {payload['stim_frame_id']}",
+                )
             self._persist_protocol_operation()
         except Exception as error:
             logger.exception("Stim-camera trigger rejected: %s", error)
@@ -4784,6 +4803,25 @@ class AppModel(ObservableObject):
                 self._persist_protocol_operation()
             except Exception:
                 logger.exception("Could not fail the rejected stim operation")
+
+    def _on_direct_stim_trigger_result(self, result) -> None:
+        payload = dict(result)
+        perf_time = float(
+            payload.get("daqmx_start_entry_perf_time")
+            or payload.get("ipc_receive_perf_time")
+            or time.perf_counter()
+        )
+        captured = self._session_data_recorder.capture_external_event(
+            "stimCameraDirectNiStart",
+            payload,
+            perf_time=perf_time,
+            event_index=int(payload.get("stim_frame_id", -1)),
+            timestamp_method="stim_camera_direct_ni_ipc",
+        )
+        if not payload.get("accepted"):
+            logger.error("Direct stim-to-NI trigger failed: %s", payload.get("error"))
+        elif not captured:
+            logger.warning("Direct stim-to-NI trigger occurred outside event capture")
 
     def _on_stim_camera_evidence_status(
         self,
@@ -6377,6 +6415,7 @@ class AppModel(ObservableObject):
             reason="closing laser controller",
         )
         try:
+            self._laser.stop_direct_trigger_receiver()
             self._laser.close()
         except Exception as err:
             logger.exception("Failed to close laser controller during capture stop: %s", err)
