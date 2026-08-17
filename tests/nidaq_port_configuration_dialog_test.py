@@ -10,6 +10,7 @@ from autotrainer.core import (  # noqa: E402
     NidaqDeviceIdentity,
     NidaqPortConfiguration,
     NidaqTimingConfiguration,
+    NidaqTimingRoute,
     SystemConfiguration,
 )
 from tools.acquisition.model.nidaq_discovery import NidaqDevicePorts  # noqa: E402
@@ -199,3 +200,49 @@ def test_external_timing_mode_exposes_route_overrides(qapp):
     assert dialog._start_trigger_edit.isEnabled()
     assert dialog._sample_clock_edit.isEnabled()
     assert not dialog._timing_master_combo.isEnabled()
+
+
+def test_unedited_advanced_timing_fields_survive_dialog_save(qapp):
+    route = NidaqTimingRoute(
+        "sample_clock", "/Dev1/PFI0", ("/Dev2/PFI0",),
+    )
+    config = SystemConfiguration()
+    config.nidaq_ports = NidaqPortConfiguration(
+        timing=NidaqTimingConfiguration(
+            task_strategy="auto_multidevice",
+            require_distinct_start_trigger=True,
+            sample_clock_export_terminal="/Dev1/PFI1",
+            start_trigger_export_terminal="/Dev1/PFI2",
+            external_routes=(route,),
+            transfer_mechanism_overrides=(("Dev1.di", "interrupt"),),
+        )
+    )
+    device = NidaqDevicePorts(name="Dev1", analog_inputs=("Dev1/ai0",))
+
+    dialog = NidaqPortConfigurationDialog(config, devices=(device,))
+    built = dialog._build_timing_configuration()
+
+    assert built.task_strategy == "auto_multidevice"
+    assert built.require_distinct_start_trigger
+    assert built.sample_clock_export_terminal == "/Dev1/PFI1"
+    assert built.start_trigger_export_terminal == "/Dev1/PFI2"
+    assert built.external_routes == (route,)
+    assert built.transfer_mechanism_overrides == (("Dev1.di", "interrupt"),)
+
+
+def test_laser_trigger_selector_only_offers_external_trigger_terminals(qapp):
+    device = NidaqDevicePorts(
+        name="Dev1",
+        terminals=(
+            "/Dev1/PFI0",
+            "/Dev1/RTSI0",
+            "/Dev1/ai/SampleClock",
+        ),
+    )
+
+    dialog = NidaqPortConfigurationDialog(SystemConfiguration(), devices=(device,))
+    values = _combo_values(dialog._laser_combos[1]["trigger_listener"])
+
+    assert "/Dev1/PFI0" in values
+    assert "/Dev1/RTSI0" in values
+    assert "/Dev1/ai/SampleClock" not in values

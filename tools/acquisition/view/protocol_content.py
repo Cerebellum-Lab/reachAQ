@@ -776,16 +776,32 @@ class ProtocolContent(ContentWidget):
             )
 
     def _new_laser_profile(self):
+        configured_channels = tuple(
+            int(channel.channel_id)
+            for channel in self._app_model.laser.configuration.channels
+        )
+        if not configured_channels:
+            self._app_model.on_error(
+                "Laser profile unavailable",
+                "Configure at least one laser channel in Edit DAQ Ports first.",
+            )
+            return
         profile_id, accepted = QInputDialog.getText(
             self, "Laser pulse profile", "Profile ID:"
         )
         if not accepted or not profile_id.strip():
             return
-        channel, accepted = QInputDialog.getInt(
-            self, "Laser pulse profile", "Configured laser channel:", 1, 1, 64
+        channel_label, accepted = QInputDialog.getItem(
+            self,
+            "Laser pulse profile",
+            "Configured laser channel:",
+            tuple(f"Laser {channel}" for channel in configured_channels),
+            0,
+            False,
         )
         if not accepted:
             return
+        channel = int(channel_label.rsplit(" ", 1)[-1])
         amplitude, accepted = QInputDialog.getDouble(
             self, "Laser pulse profile", "Amplitude (V):", 1.0, -100.0, 100.0, 4
         )
@@ -811,7 +827,7 @@ class ProtocolContent(ContentWidget):
         route_label, accepted = QInputDialog.getItem(
             self,
             "Laser pulse profile",
-            "First Reach trigger route:",
+            "Trigger route:",
             ("Hardware STIM3", "Direct NI software start"),
             0,
             False,
@@ -825,10 +841,22 @@ class ProtocolContent(ContentWidget):
         )
         terminal = ""
         if route == "hardware_stim3":
-            terminal, accepted = QInputDialog.getText(
+            terminals = tuple(
+                self._app_model.laser.configuration.trigger_listener_inputs
+            )
+            if not terminals:
+                self._app_model.on_error(
+                    "Hardware trigger unavailable",
+                    "Select a hardware trigger input in Edit DAQ Ports first.",
+                )
+                return
+            terminal, accepted = QInputDialog.getItem(
                 self,
                 "Laser pulse profile",
-                "Verified NI trigger terminal (for example /Dev4/PFI0):",
+                "Configured NI trigger terminal:",
+                terminals,
+                0,
+                False,
             )
             if not accepted or not terminal.strip():
                 return

@@ -49,6 +49,7 @@ _LASER_ROLES: Tuple[Tuple[str, str, str], ...] = (
     ("diode", "diode", "ai"),
     ("shutter", "shutter", "do"),
     ("laser_copy", "laser_copy", "ai"),
+    ("trigger_listener", "hardware trigger input", "trigger"),
 )
 
 
@@ -403,6 +404,7 @@ class NidaqPortConfigurationDialog(QDialog):
         )
 
     def _build_timing_configuration(self) -> NidaqTimingConfiguration:
+        current = self._timing_configuration
         return NidaqTimingConfiguration(
             sync_mode=self._sync_mode_combo.currentData(),
             timing_master=self._timing_master_combo.currentData(),
@@ -410,6 +412,12 @@ class NidaqPortConfigurationDialog(QDialog):
             reference_clock_source=self._optional_text(self._reference_clock_edit),
             start_trigger_source=self._optional_text(self._start_trigger_edit),
             sample_clock_source=self._optional_text(self._sample_clock_edit),
+            task_strategy=current.task_strategy,
+            require_distinct_start_trigger=current.require_distinct_start_trigger,
+            sample_clock_export_terminal=current.sample_clock_export_terminal,
+            start_trigger_export_terminal=current.start_trigger_export_terminal,
+            external_routes=current.external_routes,
+            transfer_mechanism_overrides=current.transfer_mechanism_overrides,
         )
 
     def _select_configured_timing_master(self) -> None:
@@ -547,7 +555,12 @@ class NidaqPortConfigurationDialog(QDialog):
             sample_rate_hz=current.sample_rate_hz,
             backend=backend,
             pmt_shutter_output=current.pmt_shutter_output,
-            trigger_listener_inputs=current.trigger_listener_inputs,
+            trigger_listener_inputs=tuple(
+                value
+                for combos in self._laser_combos.values()
+                for value in (self._combo_selections[combos["trigger_listener"]],)
+                if value is not None
+            ),
         )
 
     def _set_all_combos_enabled(self, enabled: bool) -> None:
@@ -574,6 +587,15 @@ class NidaqPortConfigurationDialog(QDialog):
             return device.digital_outputs
         if kind == "di":
             return device.digital_inputs
+        if kind == "trigger":
+            return tuple(
+                terminal
+                for terminal in device.terminals
+                if any(
+                    marker in terminal.lower()
+                    for marker in ("pfi", "pxitrig", "rtsi")
+                )
+            )
         raise ValueError(f"Unsupported NI-DAQ channel kind: {kind}")
 
     def _options_with_current(
@@ -690,6 +712,7 @@ class NidaqPortConfigurationDialog(QDialog):
             int(channel.channel_id): channel
             for channel in self._configuration.laser.channels
         }
+        trigger_inputs = iter(self._configuration.laser.trigger_listener_inputs)
         for laser_index, combos in self._laser_combos.items():
             channel = existing_channels.get(laser_index)
             values = {
@@ -697,6 +720,7 @@ class NidaqPortConfigurationDialog(QDialog):
                 "diode": None if channel is None else channel.diode_input,
                 "shutter": None if channel is None else channel.shutter_output,
                 "laser_copy": None if channel is None else channel.command_copy_input,
+                "trigger_listener": next(trigger_inputs, None),
             }
             for attr_name, value in values.items():
                 self._combo_selections[combos[attr_name]] = value

@@ -4793,6 +4793,16 @@ class AppModel(ObservableObject):
         prepare = getattr(self._laser, "prepare_pulse_profile", None)
         if prepare is None:
             raise RuntimeError("Asynchronous protocol laser preparation is unavailable")
+        trigger_terminal = profile.trigger_terminal
+        if trigger_terminal:
+            trigger_terminal = remap_nidaq_physical_channel(
+                trigger_terminal,
+                self._nidaq_signal_monitor.runtime_device_aliases,
+            )
+            profile = dataclasses.replace(
+                profile,
+                trigger_terminal=trigger_terminal,
+            )
         return prepare(profile, recipe)
 
     def _prepare_protocol_stim_detector(self, recipe):
