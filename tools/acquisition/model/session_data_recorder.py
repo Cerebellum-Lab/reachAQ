@@ -998,8 +998,16 @@ class SessionDataRecorder:
         return str(value)
 
     def _on_laser_trace(self, trace) -> None:
-        perf_time = time.perf_counter()
-        wall_time = time.time()
+        perf_time = (
+            time.perf_counter()
+            if getattr(trace, "origin_perf_time", None) is None
+            else float(trace.origin_perf_time)
+        )
+        wall_time = (
+            time.time()
+            if getattr(trace, "origin_wall_time", None) is None
+            else float(trace.origin_wall_time)
+        )
         x_values = trace.x_values or (0.0,)
         count = max(
             len(x_values),
@@ -1016,7 +1024,7 @@ class SessionDataRecorder:
                 self._laser_rows.append((
                     perf_time + offset,
                     wall_time + offset,
-                    "trace",
+                    getattr(trace, "event", "trace"),
                     trace.channel_id.value,
                     trace.source,
                     self._value_at(trace.command_volts, index),
@@ -1024,6 +1032,12 @@ class SessionDataRecorder:
                     self._value_at(trace.command_copy_volts, index),
                     trace.output_name,
                     trace.output_value,
+                    getattr(trace, "operation_id", ""),
+                    getattr(trace, "context_json", "{}"),
+                    getattr(
+                        trace, "timestamp_method", "laser_event_perf_counter"
+                    ),
+                    getattr(trace, "timing_confidence", "host_timestamp"),
                 ))
 
     def _on_laser_property_changed(self, name, value, _) -> None:
@@ -1042,6 +1056,10 @@ class SessionDataRecorder:
                     value.command_copy_volts,
                     "",
                     None,
+                    "",
+                    "{}",
+                    "laser_feedback_perf_counter",
+                    "host_timestamp",
                 ))
 
     @staticmethod
@@ -1609,7 +1627,8 @@ class SessionDataRecorder:
             streams_dir / "laser.csv", session_dir, metadata_generation_id,
             ("perf_time", "offset_seconds", "wall_time", "event", "channel", "source",
              "command_volts", "diode_volts", "command_copy_volts", "output_name",
-             "output_value", "frame_id", "recorded_frame_index",
+             "output_value", "operation_id", "context_json", "timestamp_method",
+             "timing_confidence", "frame_id", "recorded_frame_index",
              "frame_relation", "frame_start_perf_time",
              "frame_start_offset_seconds", "frame_start_wall_time",
              "event_to_frame_start_seconds", "alignment_method",
@@ -1627,6 +1646,10 @@ class SessionDataRecorder:
                     copy,
                     output_name,
                     output_value,
+                    operation_id,
+                    context_json,
+                    timestamp_method,
+                    timing_confidence,
                     *SessionDataRecorder._csv_frame_alignment_fields(
                         SessionDataRecorder._event_alignment_record(
                             perf,
@@ -1634,8 +1657,8 @@ class SessionDataRecorder:
                             start_perf=start_perf,
                             start_wall=start_wall,
                             frame_timeline=recorded_frame_timeline,
-                            method="laser_event_perf_counter",
-                            confidence="host_timestamp",
+                            method=timestamp_method,
+                            confidence=timing_confidence,
                         )
                     ),
                 )
@@ -1650,6 +1673,10 @@ class SessionDataRecorder:
                     copy,
                     output_name,
                     output_value,
+                    operation_id,
+                    context_json,
+                    timestamp_method,
+                    timing_confidence,
                 ) in (
                     SessionDataRecorder._normalize_laser_row(row)
                     for row in laser_rows
@@ -3209,10 +3236,15 @@ class SessionDataRecorder:
 
     @staticmethod
     def _normalize_laser_row(row):
-        if len(row) == 10:
+        if len(row) == 14:
             return row
+        if len(row) == 10:
+            return (*row, "", "{}", "laser_event_perf_counter", "host_timestamp")
         if len(row) == 8:
-            return (*row, "", None)
+            return (
+                *row, "", None, "", "{}", "laser_event_perf_counter",
+                "host_timestamp",
+            )
         raise ValueError(f"Unsupported laser event row with {len(row)} fields")
 
     @staticmethod

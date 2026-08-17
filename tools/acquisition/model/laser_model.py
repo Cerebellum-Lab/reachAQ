@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import math
 import queue
@@ -39,6 +40,13 @@ class LaserTraceBlock:
     output_name: str = ""
     output_value: Optional[float] = None
     replace: bool = False
+    event: str = "trace"
+    operation_id: str = ""
+    context_json: str = "{}"
+    timestamp_method: str = "laser_event_perf_counter"
+    timing_confidence: str = "host_timestamp"
+    origin_perf_time: Optional[float] = None
+    origin_wall_time: Optional[float] = None
 
 
 class LaserModelEvents:
@@ -279,17 +287,32 @@ class LaserModel(ObservableObject):
             "trial_operation_id": recipe.operation_id,
             "profile_id": profile.profile_id,
             "profile_revision": profile.revision,
+            "laser_channel_id": int(profile.channel_id),
             "trigger_route": route,
         }
-        operation = self.run_synchronized_pulse_train(LaserSynchronizedPulseTrain(
+        synchronized = LaserSynchronizedPulseTrain(
             pulse_trains=(pulse,),
             trigger_source=(profile.trigger_terminal if hardware_trigger else None),
             wait=False,
             defer_start=direct_start,
             operation_context=operation_context,
-        ))
+        )
+        # Preparing an asynchronous task is not a physical output. Do not use
+        # run_synchronized_pulse_train(), whose ordinary/manual trace represents
+        # an executed waveform.
+        operation = self._require_controller().run_synchronized_pulse_train(
+            synchronized
+        )
         if operation is None:
             raise RuntimeError("Protocol laser preparation did not return an operation")
+        self._emit_protocol_operation_event(
+            operation,
+            "prepared",
+            timing_confidence="planned_only",
+        )
+        add_terminal_callback = getattr(operation, "add_terminal_callback", None)
+        if add_terminal_callback is not None:
+            add_terminal_callback(self._on_protocol_laser_terminal)
         if direct_start:
             with self._prepared_profiles_lock:
                 self._prepared_profiles[recipe.operation_id] = {
@@ -391,6 +414,12 @@ class LaserModel(ObservableObject):
                 result["daqmx_start_return_perf_time"] = time.perf_counter()
                 result["accepted"] = True
                 result["timing_confidence"] = "software_start"
+                self._emit_protocol_operation_event(
+                    operation,
+                    "triggered",
+                    perf_time=result["daqmx_start_entry_perf_time"],
+                    timing_confidence="software_start",
+                )
             except Exception as error:
                 result["accepted"] = False
                 result["error"] = f"{type(error).__name__}: {error}"
@@ -401,6 +430,52 @@ class LaserModel(ObservableObject):
                     observer(result)
                 except Exception:
                     logger.exception("Direct trigger observer failed")
+
+    def _on_protocol_laser_terminal(self, operation) -> None:
+        state = getattr(operation.state, "value", operation.state)
+        observations = tuple(getattr(operation, "observations", ()))
+        perf_time = observations[-1][1] if observations else time.perf_counter()
+        confidence = (
+            "task_completion"
+            if state == "completed"
+            else "operation_failure"
+            if state == "failed"
+            else "operation_cancelled"
+        )
+        self._emit_protocol_operation_event(
+            operation,
+            str(state),
+            perf_time=perf_time,
+            timing_confidence=confidence,
+        )
+
+    def _emit_protocol_operation_event(
+        self,
+        operation,
+        event,
+        *,
+        perf_time=None,
+        timing_confidence,
+    ) -> None:
+        context = dict(getattr(operation, "context", {}) or {})
+        channel_id = int(context.get("channel_id", 0) or 0)
+        if channel_id <= 0:
+            # The prepared profile currently contains one laser channel. Keep
+            # the channel in the operation context for stable persistence.
+            channel_id = int(context.get("laser_channel_id", 1))
+        perf_time = time.perf_counter() if perf_time is None else float(perf_time)
+        wall_time = time.time() - (time.perf_counter() - perf_time)
+        self.trace_received(LaserTraceBlock(
+            channel_id=LaserChannelId(channel_id),
+            source="protocol operation",
+            event=str(event),
+            operation_id=str(getattr(operation, "operation_id", "")),
+            context_json=json.dumps(context, sort_keys=True),
+            timestamp_method="daqmx_operation_perf_counter",
+            timing_confidence=str(timing_confidence),
+            origin_perf_time=perf_time,
+            origin_wall_time=wall_time,
+        ))
 
     def run_calibration_ramp(self, ramp: LaserCalibrationRamp) -> Tuple[LaserCalibrationPoint, ...]:
         self.trace_received(

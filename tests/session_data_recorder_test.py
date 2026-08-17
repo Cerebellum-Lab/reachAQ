@@ -276,7 +276,10 @@ def test_laser_output_state_is_preserved_as_a_structured_event():
             output_value=1.0,
         ))
 
-        assert recorder._laser_rows[0][-2:] == ("shutter_open", 1.0)
+        assert recorder._laser_rows[0][8:10] == ("shutter_open", 1.0)
+        assert recorder._laser_rows[0][10:] == (
+            "", "{}", "laser_event_perf_counter", "host_timestamp",
+        )
     finally:
         recorder.close()
 

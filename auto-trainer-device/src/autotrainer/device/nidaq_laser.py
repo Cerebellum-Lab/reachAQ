@@ -50,7 +50,9 @@ class NidaqLaserOperation:
         self.operation_id = str(uuid.uuid4())
         self.resources = tuple(sorted(set(resources)))
         self.context = dict(context or {})
-        self._terminal_callback = terminal_callback
+        self._terminal_callbacks = (
+            [] if terminal_callback is None else [terminal_callback]
+        )
         self._lock = threading.RLock()
         self._done = threading.Event()
         self._armed = threading.Event()
@@ -135,6 +137,17 @@ class NidaqLaserOperation:
                 ),
             }
 
+    def add_terminal_callback(self, callback):
+        """Observe terminal cleanup without replacing controller ownership."""
+        call_now = False
+        with self._lock:
+            if self._done.is_set():
+                call_now = True
+            else:
+                self._terminal_callbacks.append(callback)
+        if call_now:
+            callback(self)
+
     def _bind_tasks(self, tasks):
         with self._lock:
             self._tasks = tuple(task for task in tasks if task is not None)
@@ -177,14 +190,18 @@ class NidaqLaserOperation:
         self._observations.append((self._state.value, time.perf_counter(), detail))
 
     def _finish_terminal(self):
-        callback = None
+        callbacks = ()
         with self._lock:
             if not self._done.is_set():
                 self._done.set()
                 self._armed.set()
-                callback = self._terminal_callback
-        if callback is not None:
-            callback(self)
+                callbacks = tuple(self._terminal_callbacks)
+                self._terminal_callbacks.clear()
+        for callback in callbacks:
+            try:
+                callback(self)
+            except Exception:
+                logger.exception("Laser terminal callback failed")
 
 
 @dataclasses.dataclass
