@@ -148,12 +148,20 @@ class PelletHardwareProtocol(Protocol):
         :return: A token to expect from the device message handler when the request is complete.
         """
 
-    def send_pellet(self, *, embedded_tone=None) -> Optional[UUID]:
+    def send_pellet(
+        self,
+        *,
+        embedded_tone=None,
+        pre_reveal_stimulus=None,
+    ) -> Optional[UUID]:
         """
         Request a move from the current position to the "send" location stored in the hardware.
 
         ``embedded_tone`` optionally requests a frequency/duration pair inside
         the same board-owned compound sequence.
+
+        ``pre_reveal_stimulus`` optionally requests a finite STIM3 pulse and
+        board-owned delay before pellet reveal in that sequence.
 
         :return: A token to expect from the device message handler when the request is complete.
         """
