@@ -401,3 +401,36 @@ def test_manual_send_pellet_when_delivery_not_enabled(machine, mock_system, befo
     assert pellet_m._api_status_token is None
     assert pellet_m.state == before_state
     assert mock_system.pellet_state_trans == []
+
+
+def test_protocol_send_guard_blocks_before_hardware_dispatch(machine):
+    pellet_m = machine.pellet
+    pellet_m.set_send_preparation_callbacks(
+        guard=lambda: (_ for _ in ()).throw(RuntimeError("not prepared")),
+    )
+
+    with pytest.raises(RuntimeError, match="not prepared"):
+        pellet_m.send_pellet(force=True)
+
+    assert pellet_m._token_pellet_send is None
+
+
+def test_protocol_readiness_can_defer_automatic_send(machine, monkeypatch):
+    pellet_m = machine.pellet
+    monkeypatch.setattr(machine.algorithm, "can_send_pellet", lambda: True)
+    pellet_m.set_send_preparation_callbacks(readiness=lambda: False)
+
+    assert pellet_m.can_send_pellet() is False
+    assert pellet_m.can_send_pellet(force=True) is True
+
+
+def test_prepared_keep_current_cover_policy_is_not_overridden(machine, mock_system):
+    pellet_m = machine.pellet
+    machine.algorithm.pellet_cover_enabled = True
+    pellet_m._covered_state = False
+    pellet_m.prepare_cover_policy("keep_current")
+    mock_system.pellet_state_trans.clear()
+
+    pellet_m.send_pellet(force=True)
+
+    assert mock_system.pellet_state_trans == [PelletState.sending]

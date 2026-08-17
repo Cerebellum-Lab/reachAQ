@@ -1,5 +1,7 @@
 import math
 import os
+import threading
+import time
 from functools import partial
 from typing import Callable, Optional, get_type_hints, Protocol
 
@@ -117,6 +119,10 @@ class PelletMachine(StateMachine):
         self._prev_pellet_load_perf_c = -math.inf
         self._prev_notify_loaded_perf_c = -math.inf
         self._prev_notify_load_failed_perf_c = -math.inf
+        self._send_readiness_callback = None
+        self._send_guard_callback = None
+        self._prepared_cover_policy: Optional[str] = None
+        self._command_ack_condition = threading.Condition(threading.RLock())
 
         self.machine = Machine(
             model=[self],
@@ -164,6 +170,10 @@ class PelletMachine(StateMachine):
     def _before_send_pellet(self, *, force: bool=False):
         algo = self._algorithm
 
+        guard = self._send_guard_callback
+        if guard is not None:
+            guard()
+
         # check for auto-home when load+retract counts >= threshold:
         tot_count = self._load_retract_current_count
         trigger_count = DEFAULT_LOAD_RETRACT_COUNT_FORCE_HOME
@@ -179,7 +189,11 @@ class PelletMachine(StateMachine):
 
         # apply the pellet cover or release here right before sending
         # use can_cover which checks for both cover_pellet_enabled AND pellet_delivery_enabled:
-        action, reason = self._check_cover_or_release()
+        action, reason = (
+            (None, f"prepared_{self._prepared_cover_policy}")
+            if self._prepared_cover_policy is not None
+            else self._check_cover_or_release()
+        )
         if action is not None:
             logger.debug("doing %s prior to pellet-send", reason)
             with algo.set_allow_reentrant(True):
@@ -187,6 +201,7 @@ class PelletMachine(StateMachine):
         token = self._pellet_device.send_pellet()
         if token is None:
             raise PelletDeviceCommandFailed
+        self._prepared_cover_policy = None
         self._token_pellet_send = self._api_status_token = token
         self._send_begin_perf_c = get_perf_now()
         self.events.pellet_sending(
@@ -232,9 +247,48 @@ class PelletMachine(StateMachine):
         can = force or (
             self.can_use_pellet_command() and self._algorithm.can_send_pellet()
         )
+        if can and not force and self._send_readiness_callback is not None:
+            can = bool(self._send_readiness_callback())
         if can != self._prev_can_send:
             self._prev_can_send = can
         return can
+
+    def set_send_preparation_callbacks(self, *, readiness=None, guard=None):
+        """Install the application-owned protocol preparation boundary."""
+        self._send_readiness_callback = readiness
+        self._send_guard_callback = guard
+
+    def prepare_cover_policy(self, policy: str, *, timeout: float = 15.0) -> None:
+        """Acknowledge an explicit one-shot cover policy before SEND."""
+        policy = str(policy)
+        if policy not in {"keep_current", "cover", "reveal"}:
+            raise ValueError(f"Unknown pellet cover policy: {policy}")
+        if policy == "keep_current":
+            self._prepared_cover_policy = policy
+            return
+        expected = policy == "cover"
+        if self._covered_state is expected:
+            self._prepared_cover_policy = policy
+            return
+        trigger = self.cover_pellet if expected else self.release_pellet
+        if not trigger(force=True):
+            raise PelletDeviceCommandFailed(
+                f"Could not queue protocol cover policy {policy}"
+            )
+        token_attr = "_token_cover_pellet" if expected else "_token_release_pellet"
+        deadline = time.monotonic() + float(timeout)
+        with self._command_ack_condition:
+            while getattr(self, token_attr) is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"Timed out waiting for protocol cover policy {policy}"
+                    )
+                self._command_ack_condition.wait(remaining)
+        self._prepared_cover_policy = policy
+
+    def cancel_prepared_cover_policy(self) -> None:
+        self._prepared_cover_policy = None
 
     def can_cover_pellet(self, *, force: bool=False):
         can = force or (
@@ -326,6 +380,9 @@ class PelletMachine(StateMachine):
 
         if api_evt is not None:
             self.post_event_content(api_evt, data=dict(context=token))
+
+        with self._command_ack_condition:
+            self._command_ack_condition.notify_all()
 
         # nb: in live we could bypass this call : it's anyway called with live-inference pellet-seen callback..
         self.environment_changed(
