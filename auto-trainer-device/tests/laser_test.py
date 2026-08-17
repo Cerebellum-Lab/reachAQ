@@ -119,6 +119,7 @@ def test_null_laser_controller_runs_pulse_train():
 def test_null_laser_controller_emulates_deferred_software_start():
     system = LaserSystemConfiguration.from_channels(
         [make_channel()], backend="null", hardware_timed=True,
+        sample_rate_hz=10_000,
     )
     controller = NullLaserController(system)
     operation = controller.run_synchronized_pulse_train(
@@ -144,6 +145,7 @@ def test_null_laser_controller_emulates_deferred_software_start():
 def test_null_laser_controller_does_not_claim_hardware_synchronization():
     system = LaserSystemConfiguration.from_channels(
         [make_channel()], backend="null", hardware_timed=True,
+        sample_rate_hz=10_000,
     )
     controller = NullLaserController(system)
 
