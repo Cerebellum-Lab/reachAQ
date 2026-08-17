@@ -2479,10 +2479,13 @@ class AppModel(ObservableObject):
                     "Selected protocol requires stimCam stimulation mode; "
                     "restart System Mode to apply the frozen 900 Hz camera mode"
                 )
-        if (
+        can_status = self._acquisition.subsystems.get(SubsystemId.CAN_PELLET)
+        pellet_source_required = bool(
             self._hardware.requires_connection
-            and not self._hardware.pellet_commands_allowed
-        ):
+            and can_status is not None
+            and can_status.required_for_recording
+        )
+        if pellet_source_required and not self._hardware.pellet_commands_allowed:
             compatibility = self._hardware.firmware_compatibility
             blockers.append(
                 "Pellet firmware is not compatible: "
