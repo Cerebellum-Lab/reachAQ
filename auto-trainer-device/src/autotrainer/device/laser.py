@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import dataclasses
+import threading
+import time
 from typing import Dict, Mapping, Optional, Protocol, Tuple, Union
 
 from autotrainer.core import (
@@ -251,6 +253,8 @@ class NullLaserController:
         self._aux_enabled: Dict[LaserChannelId, bool] = {
             channel.channel_id: False for channel in configuration.channels
         }
+        self._operation_lock = threading.RLock()
+        self._live_operations = {}
 
     @property
     def configuration(self) -> LaserSystemConfiguration:
@@ -308,9 +312,9 @@ class NullLaserController:
             )
         )
 
-    def run_synchronized_pulse_train(self, pulse_train: LaserSynchronizedPulseTrain) -> None:
+    def run_synchronized_pulse_train(self, pulse_train: LaserSynchronizedPulseTrain):
         if not pulse_train.wait:
-            raise NotImplementedError("Asynchronous laser output is not implemented for null laser control")
+            return self._run_emulated_async_pulse_train(pulse_train)
         if pulse_train.enable_pmt_shutter or any(train.enable_pmt_shutter for train in pulse_train.pulse_trains):
             raise NotImplementedError("PMT shutter sequencing is not implemented for null laser control")
         if any(train.emit_trigger_output or train.emit_timing_trigger_output for train in pulse_train.pulse_trains):
@@ -329,6 +333,122 @@ class NullLaserController:
             self.set_command_voltage(channel.channel_id, channel.minimum_command_volts)
             if train.close_shutter:
                 self.set_shutter_open(channel.channel_id, False)
+
+    def _run_emulated_async_pulse_train(self, pulse_train):
+        """Exercise software-start ownership without claiming physical timing."""
+        from .nidaq_laser import NidaqLaserOperation
+
+        if pulse_train.trigger_source is not None:
+            raise RuntimeError(
+                "Null laser control cannot emulate a hardware-synchronized trigger"
+            )
+        if not pulse_train.defer_start:
+            raise RuntimeError(
+                "Null asynchronous laser control supports Direct NI software start only"
+            )
+        resources = tuple(
+            self._configuration.get_channel(item.channel_id).analog_output
+            for item in pulse_train.pulse_trains
+        )
+        for train in pulse_train.pulse_trains:
+            self._validate_command_voltage(train.channel_id, train.amplitude_volts)
+        with self._operation_lock:
+            conflicts = [
+                item.operation_id
+                for item in self._live_operations.values()
+                if set(item.resources) & set(resources)
+                and item.state.value not in {"completed", "failed", "cancelled"}
+            ]
+            if conflicts:
+                raise RuntimeError(
+                    "Emulated laser output resource is already owned by operation(s): "
+                    + ", ".join(conflicts)
+                )
+            operation = NidaqLaserOperation(
+                resources=resources,
+                context=pulse_train.operation_context,
+                terminal_callback=self._release_emulated_operation,
+            )
+            operation._set_timing_status({
+                "status": "emulated_software_start",
+                "reason": "Null laser backend; no physical AO timing is claimed",
+                "emulated": True,
+            })
+            self._live_operations[operation.operation_id] = operation
+
+        def execute():
+            terminal_error = None
+            try:
+                operation._mark_armed()
+                timeout = pulse_train.timeout_seconds or 30.0
+                if not operation._start_requested.wait(timeout):
+                    raise TimeoutError(
+                        "Emulated deferred laser operation did not receive a start request"
+                    )
+                operation._require_not_cancelled()
+                operation._mark_triggered("emulated software start accepted")
+                for train in pulse_train.pulse_trains:
+                    channel = self._configuration.get_channel(train.channel_id)
+                    if train.open_shutter:
+                        self.set_shutter_open(channel.channel_id, True)
+                    self.set_command_voltage(channel.channel_id, train.amplitude_volts)
+                deadline = (
+                    time.perf_counter()
+                    + self._emulated_pulse_duration_seconds(pulse_train)
+                )
+                while time.perf_counter() < deadline:
+                    operation._require_not_cancelled()
+                    time.sleep(min(0.01, max(0.0, deadline - time.perf_counter())))
+                operation._require_not_cancelled()
+            except Exception as error:
+                terminal_error = error
+            finally:
+                for train in pulse_train.pulse_trains:
+                    channel = self._configuration.get_channel(train.channel_id)
+                    self.set_command_voltage(
+                        channel.channel_id, channel.minimum_command_volts
+                    )
+                    if train.close_shutter:
+                        self.set_shutter_open(channel.channel_id, False)
+            if terminal_error is None:
+                operation._complete()
+            elif operation.state.value == "cancelled":
+                operation._finish_terminal()
+            else:
+                operation._fail(terminal_error)
+
+        operation._thread = threading.Thread(
+            target=execute,
+            name=f"NullLaser-{operation.operation_id[:8]}",
+            daemon=True,
+        )
+        operation._thread.start()
+        try:
+            operation.wait_until_armed(timeout=1.0)
+        except Exception:
+            operation.cancel()
+            raise
+        return operation
+
+    @staticmethod
+    def _emulated_pulse_duration_seconds(pulse_train):
+        durations = []
+        for train in pulse_train.pulse_trains:
+            duration = (
+                train.baseline_ms
+                + train.duration_ms
+                + train.post_stim_ms
+                + train.pmt_shutter_open_delay_ms
+                + train.pmt_shutter_close_delay_ms
+            ) / 1000.0
+            if train.pulse_count > 1:
+                duration += (train.pulse_count - 1) / train.frequency_hz
+            durations.append(duration)
+        return max(durations, default=0.0)
+
+    def _release_emulated_operation(self, operation):
+        with self._operation_lock:
+            self._live_operations.pop(operation.operation_id, None)
 
     def run_calibration_ramp(self, ramp: LaserCalibrationRamp) -> Tuple[LaserCalibrationPoint, ...]:
         if ramp.enable_pmt_shutter:
@@ -377,6 +497,12 @@ class NullLaserController:
             self._shutter_open[channel_id] = False
 
     def close(self) -> None:
+        for operation in tuple(self._live_operations.values()):
+            operation.cancel()
+            try:
+                operation.wait(timeout=1.0)
+            except Exception:
+                pass
         self.close_all_shutters()
 
     def is_shutter_open(self, channel_id: Union[LaserChannelId, int]) -> bool:

@@ -84,6 +84,29 @@ def test_prepare_direct_laser_profile_defers_start():
     assert controller.pulse.defer_start
 
 
+def test_prepare_direct_profile_accepts_explicit_simulated_timing():
+    configuration = LaserSystemConfiguration.from_channels((
+        LaserChannelConfiguration(
+            channel_id=1,
+            analog_output="Dev1/ao0",
+            diode_input="Dev1/ai0",
+            shutter_output="Dev1/port0/line0",
+        ),
+    ), backend="null", hardware_timed=True, sample_rate_hz=10_000)
+    model = LaserModel()
+    model.configure_null(configuration)
+    profile = LaserPulseProfile(
+        "pulse", 1, 1, 2.5, 1,
+        trigger_route=LaserTriggerRoute.DIRECT_NI_SOFTWARE,
+    )
+
+    operation = model.prepare_pulse_profile(profile, _recipe())
+    operation.trigger()
+
+    assert operation.wait(1).value == "completed"
+    assert operation.to_record()["timing_status"]["emulated"] is True
+
+
 def test_prepare_hardware_laser_rejects_unverified_timing():
     controller = _Controller()
     controller.operation.to_record = lambda: {

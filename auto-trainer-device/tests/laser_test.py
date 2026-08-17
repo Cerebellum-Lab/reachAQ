@@ -116,6 +116,49 @@ def test_null_laser_controller_runs_pulse_train():
     assert not controller.is_shutter_open(LaserChannelId.LASER_1)
 
 
+def test_null_laser_controller_emulates_deferred_software_start():
+    system = LaserSystemConfiguration.from_channels(
+        [make_channel()], backend="null", hardware_timed=True,
+    )
+    controller = NullLaserController(system)
+    operation = controller.run_synchronized_pulse_train(
+        LaserSynchronizedPulseTrain(
+            pulse_trains=(LaserPulseTrain(
+                channel_id=LaserChannelId.LASER_1,
+                amplitude_volts=2.0,
+                duration_ms=1.0,
+            ),),
+            wait=False,
+            defer_start=True,
+        )
+    )
+
+    assert operation.to_record()["timing_status"]["status"] == (
+        "emulated_software_start"
+    )
+    operation.trigger()
+    assert operation.wait(1).value == "completed"
+    assert controller.read_diode_voltage(LaserChannelId.LASER_1) == 0.0
+
+
+def test_null_laser_controller_does_not_claim_hardware_synchronization():
+    system = LaserSystemConfiguration.from_channels(
+        [make_channel()], backend="null", hardware_timed=True,
+    )
+    controller = NullLaserController(system)
+
+    with pytest.raises(RuntimeError, match="cannot emulate a hardware"):
+        controller.run_synchronized_pulse_train(LaserSynchronizedPulseTrain(
+            pulse_trains=(LaserPulseTrain(
+                channel_id=LaserChannelId.LASER_1,
+                amplitude_volts=2.0,
+                duration_ms=1.0,
+            ),),
+            trigger_source="/Dev1/PFI0",
+            wait=False,
+        ))
+
+
 def test_nidaq_laser_uses_shared_scaled_feedback_without_reserving_ai_tasks():
     channel = make_channel()
     configuration = LaserSystemConfiguration.from_channels(

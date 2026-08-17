@@ -310,12 +310,21 @@ class LaserModel(ObservableObject):
         required_status = (
             "hardware_synchronized" if hardware_trigger else "software_start"
         )
-        if timing_status.get("status") != required_status:
+        observed_status = timing_status.get("status")
+        emulated_status = (
+            "emulated_software_start"
+            if direct_start and self._configuration.backend == "null"
+            else None
+        )
+        accepted_statuses = {required_status}
+        if emulated_status is not None:
+            accepted_statuses.add(emulated_status)
+        if observed_status not in accepted_statuses:
             operation.cancel()
             raise RuntimeError(
                 "Protocol laser timing is not ready: expected "
                 f"{required_status}, found "
-                f"{timing_status.get('status', 'unknown')}; "
+                f"{observed_status or 'unknown'}; "
                 + str(
                     timing_status.get("reason")
                     or "no timing reason was reported"
@@ -324,7 +333,9 @@ class LaserModel(ObservableObject):
         self._emit_protocol_operation_event(
             operation,
             "prepared",
-            timing_confidence="planned_only",
+            timing_confidence=(
+                "simulated" if observed_status == emulated_status else "planned_only"
+            ),
         )
         add_terminal_callback = getattr(operation, "add_terminal_callback", None)
         if add_terminal_callback is not None:
@@ -429,12 +440,17 @@ class LaserModel(ObservableObject):
                 operation.trigger()
                 result["daqmx_start_return_perf_time"] = time.perf_counter()
                 result["accepted"] = True
-                result["timing_confidence"] = "software_start"
+                timing_status = operation.to_record().get("timing_status") or {}
+                result["timing_confidence"] = (
+                    "simulated"
+                    if timing_status.get("emulated")
+                    else "software_start"
+                )
                 self._emit_protocol_operation_event(
                     operation,
                     "triggered",
                     perf_time=result["daqmx_start_entry_perf_time"],
-                    timing_confidence="software_start",
+                    timing_confidence=result["timing_confidence"],
                 )
             except Exception as error:
                 result["accepted"] = False
