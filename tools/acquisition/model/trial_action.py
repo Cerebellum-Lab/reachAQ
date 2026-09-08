@@ -12,6 +12,16 @@ import time
 import uuid
 from typing import Callable, Mapping, Optional, Tuple
 
+from autotrainer.core.delay_distribution import (
+    EXPONENTIAL_CDF_TAU_MS,
+    DelayDistributionProfile,
+    DelayPreset,
+    build_delay_distribution_profile,
+    normalize_delay_preset,
+    preset_values,
+    select_delay,
+)
+
 from tools.acquisition.model.trial_protocol_schedule import (
     LaserTriggerRoute,
     PelletLane,
@@ -37,6 +47,55 @@ class ToneProfile:
 
     def to_record(self):
         return dataclasses.asdict(self)
+
+
+@dataclasses.dataclass(frozen=True)
+class CueIntervalProfile:
+    """Reusable Tone 1 to Tone 2 interval distribution.
+
+    The profile owns the configuration; the resolved probability weights are
+    derived by :mod:`autotrainer.core.delay_distribution` so the published
+    supports stay in one place.
+    """
+
+    profile_id: str
+    revision: int
+    preset: str = DelayPreset.PUBLISHED_4S.value
+    values: Tuple[int, ...] = ()
+    tau_ms: int = EXPONENTIAL_CDF_TAU_MS
+    manual_probabilities: Optional[Tuple[float, ...]] = None
+
+    def __post_init__(self):
+        if not self.profile_id:
+            raise ValueError("Cue interval profile ID cannot be empty")
+        if self.revision < 1:
+            raise ValueError("Cue interval profile revision must be positive")
+        # Build once so a malformed profile fails at construction rather than
+        # part-way through compiling a trial.
+        self.distribution()
+
+    def distribution(self) -> DelayDistributionProfile:
+        """Return the resolved distribution for this profile."""
+
+        preset = normalize_delay_preset(self.preset)
+        values = self.values or preset_values(preset)
+        if not values:
+            raise ValueError(
+                f"Cue interval profile {self.profile_id!r} requires cue intervals"
+            )
+        return build_delay_distribution_profile(
+            values,
+            preset,
+            tau_ms=self.tau_ms,
+            manual_probabilities=self.manual_probabilities,
+        )
+
+    def to_record(self):
+        record = dataclasses.asdict(self)
+        record["values"] = list(self.values)
+        if self.manual_probabilities is not None:
+            record["manual_probabilities"] = list(self.manual_probabilities)
+        return record
 
 
 @dataclasses.dataclass(frozen=True)
@@ -128,6 +187,12 @@ class CompiledTrialRecipe:
     stimulus_draw: float
     tone_profile: Optional[ToneProfile]
     laser_profile: Optional[LaserPulseProfile]
+    cue_tone_profile: Optional[ToneProfile] = None
+    cue_interval_ms: Optional[int] = None
+    cue_interval_seed: Optional[int] = None
+    cue_interval_draw: Optional[float] = None
+    cue_interval_selection: Optional[Mapping[str, object]] = None
+    cue_interval_distribution: Optional[Mapping[str, object]] = None
 
     def to_record(self):
         return {
@@ -147,6 +212,24 @@ class CompiledTrialRecipe:
             "stimulus_draw": self.stimulus_draw,
             "tone_profile": None if self.tone_profile is None else self.tone_profile.to_record(),
             "laser_profile": None if self.laser_profile is None else self.laser_profile.to_record(),
+            "cue_tone_profile": (
+                None
+                if self.cue_tone_profile is None
+                else self.cue_tone_profile.to_record()
+            ),
+            "cue_interval_ms": self.cue_interval_ms,
+            "cue_interval_seed": self.cue_interval_seed,
+            "cue_interval_draw": self.cue_interval_draw,
+            "cue_interval_selection": (
+                None
+                if self.cue_interval_selection is None
+                else dict(self.cue_interval_selection)
+            ),
+            "cue_interval_distribution": (
+                None
+                if self.cue_interval_distribution is None
+                else dict(self.cue_interval_distribution)
+            ),
         }
 
 
@@ -158,10 +241,12 @@ class TrialActionCompiler:
         *,
         tone_profiles: Mapping[str, ToneProfile] = None,
         laser_profiles: Mapping[str, LaserPulseProfile] = None,
+        cue_interval_profiles: Mapping[str, CueIntervalProfile] = None,
         dcs_to_motor: Callable[[Tuple[float, float, float]], Tuple[float, float, float]],
     ):
         self._tone_profiles = dict(tone_profiles or {})
         self._laser_profiles = dict(laser_profiles or {})
+        self._cue_interval_profiles = dict(cue_interval_profiles or {})
         self._dcs_to_motor = dcs_to_motor
 
     def compile(self, row: TrialProtocolRow, context: TrialCompileContext):
@@ -240,6 +325,39 @@ class TrialActionCompiler:
             tone = self._tone_profiles.get(row.tone_profile_id)
             if tone is None:
                 raise ValueError(f"Unknown tone profile {row.tone_profile_id!r}")
+        cue_tone = None
+        cue_interval_ms = None
+        cue_interval_seed = None
+        cue_interval_draw = None
+        cue_interval_selection = None
+        cue_interval_distribution = None
+        if row.cue_tone_profile_id:
+            cue_tone = self._tone_profiles.get(row.cue_tone_profile_id)
+            if cue_tone is None:
+                raise ValueError(
+                    f"Unknown cue tone profile {row.cue_tone_profile_id!r}"
+                )
+            if row.cue_interval_profile_id:
+                interval_profile = self._cue_interval_profiles.get(
+                    row.cue_interval_profile_id
+                )
+                if interval_profile is None:
+                    raise ValueError(
+                        "Unknown cue interval profile "
+                        f"{row.cue_interval_profile_id!r}"
+                    )
+                distribution = interval_profile.distribution()
+                # A separate seed domain keeps the cue interval independent of
+                # the stimulus draw for the same trial.
+                cue_interval_seed = _domain_seed(row, context, "cue_interval")
+                cue_interval_draw = _stable_draw(cue_interval_seed)
+                selection = select_delay(distribution, cue_interval_draw)
+                cue_interval_ms = selection.delay_ms
+                cue_interval_selection = selection.to_record()
+                cue_interval_distribution = distribution.to_record()
+            else:
+                cue_interval_ms = int(row.cue_interval_fixed_ms)
+
         laser = None
         if row.laser_profile_id:
             laser = self._laser_profiles.get(row.laser_profile_id)
@@ -274,6 +392,12 @@ class TrialActionCompiler:
             stimulus_draw=stimulus_draw,
             tone_profile=tone,
             laser_profile=laser,
+            cue_tone_profile=cue_tone,
+            cue_interval_ms=cue_interval_ms,
+            cue_interval_seed=cue_interval_seed,
+            cue_interval_draw=cue_interval_draw,
+            cue_interval_selection=cue_interval_selection,
+            cue_interval_distribution=cue_interval_distribution,
         )
 
 
@@ -667,18 +791,37 @@ def _add(left, right):
     return tuple(a + b for a, b in zip(left, right))
 
 
-def _stimulus_seed(row, context):
-    attempt_component = (
+def _attempt_component(row, context):
+    return (
         context.attempt_id
         if row.retry_assignment is RetryAssignment.RESAMPLE
         else 0
     )
+
+
+def _stimulus_seed(row, context):
+    # The payload is deliberately untagged so previously recorded stimulus
+    # seeds and draws remain reproducible.
     payload = json.dumps((
         int(context.session_seed),
         context.protocol_id,
         int(context.protocol_revision),
         int(context.logical_trial_id),
-        int(attempt_component),
+        int(_attempt_component(row, context)),
+    ), separators=(",", ":"), ensure_ascii=True).encode("ascii")
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
+
+
+def _domain_seed(row, context, domain):
+    """Return an independent seed stream for one named draw domain."""
+
+    payload = json.dumps((
+        str(domain),
+        int(context.session_seed),
+        context.protocol_id,
+        int(context.protocol_revision),
+        int(context.logical_trial_id),
+        int(_attempt_component(row, context)),
     ), separators=(",", ":"), ensure_ascii=True).encode("ascii")
     return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
 
