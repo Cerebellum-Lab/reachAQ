@@ -688,6 +688,10 @@ class AppModel(ObservableObject):
             profile.profile_id: profile
             for profile in profile_library.cue_interval_profiles
         }
+        self._stimulus_trigger_profiles = {
+            profile.profile_id: profile
+            for profile in profile_library.stimulus_trigger_profiles
+        }
         self._laser_profiles = {
             profile.profile_id: profile for profile in profile_library.laser_profiles
         }
@@ -4152,6 +4156,10 @@ class AppModel(ObservableObject):
                     self._cue_interval_profiles[key]
                     for key in sorted(self._cue_interval_profiles)
                 ),
+                stimulus_trigger_profiles=tuple(
+                    self._stimulus_trigger_profiles[key]
+                    for key in sorted(self._stimulus_trigger_profiles)
+                ),
                 laser_profiles=tuple(lasers[key] for key in sorted(lasers)),
                 automatic_shift_profiles=tuple(
                     automatic_shifts[key] for key in sorted(automatic_shifts)
@@ -4162,6 +4170,9 @@ class AppModel(ObservableObject):
         self._tone_profiles = {item.profile_id: item for item in saved.tone_profiles}
         self._cue_interval_profiles = {
             item.profile_id: item for item in saved.cue_interval_profiles
+        }
+        self._stimulus_trigger_profiles = {
+            item.profile_id: item for item in saved.stimulus_trigger_profiles
         }
         self._laser_profiles = {item.profile_id: item for item in saved.laser_profiles}
         self._automatic_shift_policies = {
@@ -4797,6 +4808,7 @@ class AppModel(ObservableObject):
             tone_profiles=self._tone_profiles,
             laser_profiles=self._laser_profiles,
             cue_interval_profiles=self._cue_interval_profiles,
+            stimulus_trigger_profiles=self._stimulus_trigger_profiles,
             dcs_to_motor=dcs_to_motor,
         )
         return compiler.compile(row, context)
