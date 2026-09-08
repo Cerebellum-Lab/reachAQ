@@ -3,6 +3,7 @@ import json
 import pytest
 
 from tools.acquisition.model.stimulus_profile_repository import (
+    PROFILE_SCHEMA_VERSION,
     StimulusProfileLibrary,
     StimulusProfileRepository,
 )
@@ -47,7 +48,7 @@ def test_profile_library_migrates_schema_one_with_safe_shift_policy(tmp_path):
 
     loaded = StimulusProfileRepository(path).load()
 
-    assert loaded.schema_version == 2
+    assert loaded.schema_version == PROFILE_SCHEMA_VERSION
     assert loaded.revision == 3
     assert loaded.automatic_shift_profiles[0].policy_id == "default"
 

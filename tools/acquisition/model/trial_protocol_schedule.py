@@ -14,8 +14,10 @@ from dataclasses import dataclass, fields, replace
 from enum import Enum
 from typing import Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
+from autotrainer.core.delay_distribution import MINIMUM_CUE_INTERVAL_MS
 
-PROTOCOL_SCHEMA_VERSION = 1
+
+PROTOCOL_SCHEMA_VERSION = 2
 DEFAULT_TRIAL_COUNT = 15
 MAX_ABS_SHIFT_MM = 50.0
 _IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
@@ -114,13 +116,22 @@ _FLOAT_FIELDS = {
     "shift_z_mm",
     "stimulus_probability_percent",
 }
-_INT_FIELDS = {"pre_reveal_ms", "automatic_window_size"}
+_INT_FIELDS = {"pre_reveal_ms", "automatic_window_size", "cue_interval_fixed_ms"}
 _STRING_FIELDS = {
     "tone_profile_id",
+    "cue_tone_profile_id",
+    "cue_interval_profile_id",
     "laser_profile_id",
     "automatic_shift_policy_id",
     "stimulus_category",
 }
+_OPTIONAL_ID_FIELDS = {
+    "tone_profile_id",
+    "cue_tone_profile_id",
+    "cue_interval_profile_id",
+    "laser_profile_id",
+}
+MAX_CUE_INTERVAL_MS = 60_000
 
 
 def _identifier(value: str, *, field: str, allow_empty: bool = False) -> str:
@@ -164,6 +175,11 @@ class TrialProtocolRow:
     cover_policy: CoverPolicy = CoverPolicy.KEEP_CURRENT
     tone_profile_id: str = ""
     tone_phase: ActionPhase = ActionPhase.NONE
+    # Tone 2, the go cue. It fires once the cue interval elapses from Tone 1,
+    # which is the tone_profile_id action above.
+    cue_tone_profile_id: str = ""
+    cue_interval_profile_id: str = ""
+    cue_interval_fixed_ms: int = 0
     laser_profile_id: str = ""
     laser_phase: ActionPhase = ActionPhase.NONE
     laser_trigger_route: LaserTriggerRoute = LaserTriggerRoute.NONE
@@ -239,6 +255,16 @@ class TrialProtocolRow:
                 if not 0 <= value <= 60_000:
                     raise ValueError("pre_reveal_ms must be between 0 and 60000")
                 normalized[field] = value
+            elif field == "cue_interval_fixed_ms":
+                value = int(value)
+                if value and not (
+                    MINIMUM_CUE_INTERVAL_MS <= value <= MAX_CUE_INTERVAL_MS
+                ):
+                    raise ValueError(
+                        "cue_interval_fixed_ms must be zero or between "
+                        f"{MINIMUM_CUE_INTERVAL_MS} and {MAX_CUE_INTERVAL_MS}"
+                    )
+                normalized[field] = value
             elif field == "automatic_window_size":
                 value = int(value)
                 if not 1 <= value <= 10_000:
@@ -252,7 +278,7 @@ class TrialProtocolRow:
                 normalized[field] = _identifier(
                     value,
                     field=field,
-                    allow_empty=field in {"tone_profile_id", "laser_profile_id"},
+                    allow_empty=field in _OPTIONAL_ID_FIELDS,
                 )
             else:  # Defensive; all current fields are covered above.
                 normalized[field] = value
@@ -275,6 +301,7 @@ class TrialProtocolRow:
             raise ValueError("A tone profile requires a non-none tone phase")
         if self.tone_phase is not ActionPhase.NONE and not self.tone_profile_id:
             raise ValueError("A tone phase requires a tone profile")
+        self._validate_cue_pair()
         if self.laser_trigger_route is LaserTriggerRoute.NONE:
             if self.laser_profile_id or self.laser_phase is not ActionPhase.NONE:
                 raise ValueError("Laser actions require a trigger route")
@@ -329,6 +356,33 @@ class TrialProtocolRow:
         if runnable:
             if not self.enabled:
                 raise ValueError("Protocol row is disabled")
+
+    def _validate_cue_pair(self) -> None:
+        """Tone 2 needs a Tone 1 and exactly one interval source."""
+
+        has_interval = bool(self.cue_interval_profile_id) or bool(
+            self.cue_interval_fixed_ms
+        )
+        if not self.cue_tone_profile_id:
+            if has_interval:
+                raise ValueError(
+                    "A cue interval requires a cue tone profile for Tone 2"
+                )
+            return
+        if not self.tone_profile_id:
+            raise ValueError("A cue tone requires a Tone 1 tone profile")
+        if self.tone_phase is ActionPhase.NONE:
+            raise ValueError("A cue tone requires a non-none Tone 1 phase")
+        if self.cue_tone_profile_id == self.tone_profile_id:
+            raise ValueError("Tone 1 and Tone 2 must use different tone profiles")
+        if not has_interval:
+            raise ValueError(
+                "A cue tone requires a cue interval profile or a fixed interval"
+            )
+        if self.cue_interval_profile_id and self.cue_interval_fixed_ms:
+            raise ValueError(
+                "Use either a cue interval profile or a fixed interval, not both"
+            )
 
     def to_record(self) -> dict:
         result = {}
