@@ -16,6 +16,8 @@ from typing import Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
 from autotrainer.core.delay_distribution import MINIMUM_CUE_INTERVAL_MS
 
+MAX_POST_CLEAR_DELAY_MS = 60_000
+
 
 PROTOCOL_SCHEMA_VERSION = 2
 DEFAULT_TRIAL_COUNT = 15
@@ -122,7 +124,12 @@ _FLOAT_FIELDS = {
     "shift_z_mm",
     "stimulus_probability_percent",
 }
-_INT_FIELDS = {"pre_reveal_ms", "automatic_window_size", "cue_interval_fixed_ms"}
+_INT_FIELDS = {
+    "pre_reveal_ms",
+    "automatic_window_size",
+    "cue_interval_fixed_ms",
+    "cue_post_clear_delay_ms",
+}
 _STRING_FIELDS = {
     "tone_profile_id",
     "cue_tone_profile_id",
@@ -188,6 +195,10 @@ class TrialProtocolRow:
     cue_tone_profile_id: str = ""
     cue_interval_profile_id: str = ""
     cue_interval_fixed_ms: int = 0
+    # With lock timing on, a blocked or stale gate at the Tone 2 deadline skips
+    # the cue and resets instead of firing late.
+    cue_lock_timing: bool = True
+    cue_post_clear_delay_ms: int = 0
     laser_profile_id: str = ""
     laser_phase: ActionPhase = ActionPhase.NONE
     laser_trigger_route: LaserTriggerRoute = LaserTriggerRoute.NONE
@@ -274,6 +285,14 @@ class TrialProtocolRow:
                     raise ValueError(
                         "cue_interval_fixed_ms must be zero or between "
                         f"{MINIMUM_CUE_INTERVAL_MS} and {MAX_CUE_INTERVAL_MS}"
+                    )
+                normalized[field] = value
+            elif field == "cue_post_clear_delay_ms":
+                value = int(value)
+                if not 0 <= value <= MAX_POST_CLEAR_DELAY_MS:
+                    raise ValueError(
+                        "cue_post_clear_delay_ms must be between 0 and "
+                        f"{MAX_POST_CLEAR_DELAY_MS}"
                     )
                 normalized[field] = value
             elif field == "automatic_window_size":
@@ -397,6 +416,10 @@ class TrialProtocolRow:
                 raise ValueError(
                     "A cue interval requires a cue tone profile for Tone 2"
                 )
+            if self.cue_post_clear_delay_ms:
+                raise ValueError(
+                    "A post-clear delay requires a cue tone profile for Tone 2"
+                )
             return
         if not self.tone_profile_id:
             raise ValueError("A cue tone requires a Tone 1 tone profile")
@@ -411,6 +434,10 @@ class TrialProtocolRow:
         if self.cue_interval_profile_id and self.cue_interval_fixed_ms:
             raise ValueError(
                 "Use either a cue interval profile or a fixed interval, not both"
+            )
+        if self.cue_lock_timing and self.cue_post_clear_delay_ms:
+            raise ValueError(
+                "cue_post_clear_delay_ms applies only when lock timing is off"
             )
 
     def to_record(self) -> dict:
