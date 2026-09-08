@@ -81,6 +81,12 @@ class StimulusAssignment(ProtocolValue):
     RANDOMIZED = "randomized"
 
 
+# Triggers that can fire a fixed lead time before their reference event.
+OFFSET_STIMULUS_TRIGGERS = frozenset(
+    {StimulusTrigger.PRE_REVEAL, StimulusTrigger.TONE_2}
+)
+
+
 class RetryAssignment(ProtocolValue):
     REPEAT = "repeat"
     RESAMPLE = "resample"
@@ -124,12 +130,14 @@ _STRING_FIELDS = {
     "laser_profile_id",
     "automatic_shift_policy_id",
     "stimulus_category",
+    "stimulus_trigger_profile_id",
 }
 _OPTIONAL_ID_FIELDS = {
     "tone_profile_id",
     "cue_tone_profile_id",
     "cue_interval_profile_id",
     "laser_profile_id",
+    "stimulus_trigger_profile_id",
 }
 MAX_CUE_INTERVAL_MS = 60_000
 
@@ -187,6 +195,9 @@ class TrialProtocolRow:
     stimulus_assignment: StimulusAssignment = StimulusAssignment.DISABLED
     stimulus_probability_percent: float = 100.0
     stimulus_trigger: StimulusTrigger = StimulusTrigger.NONE
+    # Randomized assignment draws its trigger from this profile instead of
+    # using the single stimulus_trigger above.
+    stimulus_trigger_profile_id: str = ""
     pre_reveal_ms: int = 0
     retry_assignment: RetryAssignment = RetryAssignment.REPEAT
 
@@ -321,8 +332,26 @@ class TrialProtocolRow:
         if self.stimulus_assignment is StimulusAssignment.DISABLED:
             if self.stimulus_trigger is not StimulusTrigger.NONE:
                 raise ValueError("Disabled stimulus assignment cannot have a trigger")
+            if self.stimulus_trigger_profile_id:
+                raise ValueError(
+                    "Disabled stimulus assignment cannot have a trigger profile"
+                )
+        elif self.stimulus_assignment is StimulusAssignment.RANDOMIZED:
+            if not self.stimulus_trigger_profile_id:
+                raise ValueError(
+                    "Randomized stimulus assignment requires a trigger profile"
+                )
+            if self.stimulus_trigger is not StimulusTrigger.NONE:
+                raise ValueError(
+                    "Randomized stimulus assignment draws its trigger from the "
+                    "profile; leave the single trigger unset"
+                )
         elif self.stimulus_trigger is StimulusTrigger.NONE:
             raise ValueError("Enabled stimulus assignment requires a trigger")
+        elif self.stimulus_trigger_profile_id:
+            raise ValueError(
+                "A stimulus trigger profile applies only to randomized assignment"
+            )
         if (
             runnable
             and self.stimulus_trigger

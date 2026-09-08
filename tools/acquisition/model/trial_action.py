@@ -12,6 +12,13 @@ import time
 import uuid
 from typing import Callable, Mapping, Optional, Tuple
 
+from autotrainer.core.stimulus_trigger_profile import (
+    StimulusTriggerCategory,
+    profile_record as stimulus_trigger_profile_record,
+    select_trigger,
+    validate_profile as validate_stimulus_trigger_profile,
+)
+
 from autotrainer.core.delay_distribution import (
     EXPONENTIAL_CDF_TAU_MS,
     DelayDistributionProfile,
@@ -23,11 +30,13 @@ from autotrainer.core.delay_distribution import (
 )
 
 from tools.acquisition.model.trial_protocol_schedule import (
+    OFFSET_STIMULUS_TRIGGERS,
     LaserTriggerRoute,
     PelletLane,
     PelletPositionMode,
     RetryAssignment,
     StimulusAssignment,
+    StimulusTrigger,
     TrialProtocolRow,
 )
 
@@ -96,6 +105,55 @@ class CueIntervalProfile:
         if self.manual_probabilities is not None:
             record["manual_probabilities"] = list(self.manual_probabilities)
         return record
+
+
+@dataclasses.dataclass(frozen=True)
+class StimulusTriggerProfile:
+    """Reusable weighted set of stimulus trigger categories.
+
+    Weights are conditional on stimulation already having been selected for
+    the trial, so they total 100% among enabled categories.
+    """
+
+    profile_id: str
+    revision: int
+    categories: Tuple[StimulusTriggerCategory, ...] = ()
+
+    def __post_init__(self):
+        if not self.profile_id:
+            raise ValueError("Stimulus trigger profile ID cannot be empty")
+        if self.revision < 1:
+            raise ValueError("Stimulus trigger profile revision must be positive")
+        object.__setattr__(
+            self,
+            "categories",
+            tuple(
+                item
+                if isinstance(item, StimulusTriggerCategory)
+                else StimulusTriggerCategory(**dict(item))
+                for item in self.categories
+            ),
+        )
+        for category in self.categories:
+            trigger = StimulusTrigger(category.trigger)
+            if category.is_offset_trigger and trigger not in OFFSET_STIMULUS_TRIGGERS:
+                raise ValueError(
+                    f"{trigger.value} stimulus triggers do not take a lead time"
+                )
+        # Reject an unusable profile at construction rather than mid-trial.
+        validate_stimulus_trigger_profile(self.categories)
+
+    def validated(self, *, offset_upper_bound_ms: Optional[int] = None):
+        return validate_stimulus_trigger_profile(
+            self.categories, offset_upper_bound_ms=offset_upper_bound_ms
+        )
+
+    def to_record(self):
+        return {
+            "profile_id": self.profile_id,
+            "revision": self.revision,
+            **stimulus_trigger_profile_record(self.categories),
+        }
 
 
 @dataclasses.dataclass(frozen=True)
@@ -193,6 +251,11 @@ class CompiledTrialRecipe:
     cue_interval_draw: Optional[float] = None
     cue_interval_selection: Optional[Mapping[str, object]] = None
     cue_interval_distribution: Optional[Mapping[str, object]] = None
+    resolved_stimulus_trigger: str = StimulusTrigger.NONE.value
+    resolved_trigger_offset_ms: int = 0
+    stimulus_trigger_seed: Optional[int] = None
+    stimulus_trigger_draw: Optional[float] = None
+    stimulus_trigger_selection: Optional[Mapping[str, object]] = None
 
     def to_record(self):
         return {
@@ -230,6 +293,15 @@ class CompiledTrialRecipe:
                 if self.cue_interval_distribution is None
                 else dict(self.cue_interval_distribution)
             ),
+            "resolved_stimulus_trigger": self.resolved_stimulus_trigger,
+            "resolved_trigger_offset_ms": self.resolved_trigger_offset_ms,
+            "stimulus_trigger_seed": self.stimulus_trigger_seed,
+            "stimulus_trigger_draw": self.stimulus_trigger_draw,
+            "stimulus_trigger_selection": (
+                None
+                if self.stimulus_trigger_selection is None
+                else dict(self.stimulus_trigger_selection)
+            ),
         }
 
 
@@ -242,11 +314,13 @@ class TrialActionCompiler:
         tone_profiles: Mapping[str, ToneProfile] = None,
         laser_profiles: Mapping[str, LaserPulseProfile] = None,
         cue_interval_profiles: Mapping[str, CueIntervalProfile] = None,
+        stimulus_trigger_profiles: Mapping[str, StimulusTriggerProfile] = None,
         dcs_to_motor: Callable[[Tuple[float, float, float]], Tuple[float, float, float]],
     ):
         self._tone_profiles = dict(tone_profiles or {})
         self._laser_profiles = dict(laser_profiles or {})
         self._cue_interval_profiles = dict(cue_interval_profiles or {})
+        self._stimulus_trigger_profiles = dict(stimulus_trigger_profiles or {})
         self._dcs_to_motor = dcs_to_motor
 
     def compile(self, row: TrialProtocolRow, context: TrialCompileContext):
@@ -358,6 +432,49 @@ class TrialActionCompiler:
             else:
                 cue_interval_ms = int(row.cue_interval_fixed_ms)
 
+        resolved_trigger = row.stimulus_trigger
+        resolved_offset_ms = int(row.pre_reveal_ms)
+        stimulus_trigger_seed = None
+        stimulus_trigger_draw = None
+        stimulus_trigger_selection = None
+        if row.stimulus_assignment is StimulusAssignment.RANDOMIZED:
+            trigger_profile = self._stimulus_trigger_profiles.get(
+                row.stimulus_trigger_profile_id
+            )
+            if trigger_profile is None:
+                raise ValueError(
+                    "Unknown stimulus trigger profile "
+                    f"{row.stimulus_trigger_profile_id!r}"
+                )
+            # A Tone 2 lead time has to fit inside the shortest cue interval
+            # this row can draw, otherwise it could never be delivered.
+            categories = trigger_profile.validated(
+                offset_upper_bound_ms=_shortest_cue_interval(
+                    row, cue_interval_ms, cue_interval_distribution
+                )
+            )
+            for category in categories:
+                if (
+                    category.enabled
+                    and StimulusTrigger(category.trigger) is StimulusTrigger.TONE_2
+                    and not row.cue_tone_profile_id
+                ):
+                    raise ValueError(
+                        "Tone 2 stimulus triggers require a configured cue tone"
+                    )
+            if selected:
+                stimulus_trigger_seed = _domain_seed(
+                    row, context, "stimulus_trigger"
+                )
+                stimulus_trigger_draw = _stable_draw(stimulus_trigger_seed)
+                selection = select_trigger(categories, stimulus_trigger_draw)
+                resolved_trigger = StimulusTrigger(selection.category.trigger)
+                resolved_offset_ms = int(selection.category.offset_ms or 0)
+                stimulus_trigger_selection = selection.to_record()
+            else:
+                resolved_trigger = StimulusTrigger.NONE
+                resolved_offset_ms = 0
+
         laser = None
         if row.laser_profile_id:
             laser = self._laser_profiles.get(row.laser_profile_id)
@@ -366,8 +483,8 @@ class TrialActionCompiler:
             if laser.trigger_route is not row.laser_trigger_route:
                 raise ValueError("Protocol row and laser profile trigger routes differ")
             if (
-                row.stimulus_trigger.value == "pre_reveal"
-                and int(laser.trigger_pulse_us) >= int(row.pre_reveal_ms) * 1000
+                resolved_trigger is StimulusTrigger.PRE_REVEAL
+                and int(laser.trigger_pulse_us) >= resolved_offset_ms * 1000
             ):
                 raise ValueError(
                     "Pre-reveal interval must be longer than the STIM3 trigger pulse"
@@ -398,6 +515,11 @@ class TrialActionCompiler:
             cue_interval_draw=cue_interval_draw,
             cue_interval_selection=cue_interval_selection,
             cue_interval_distribution=cue_interval_distribution,
+            resolved_stimulus_trigger=resolved_trigger.value,
+            resolved_trigger_offset_ms=resolved_offset_ms,
+            stimulus_trigger_seed=stimulus_trigger_seed,
+            stimulus_trigger_draw=stimulus_trigger_draw,
+            stimulus_trigger_selection=stimulus_trigger_selection,
         )
 
 
@@ -789,6 +911,17 @@ def _finite_vector(values, name):
 
 def _add(left, right):
     return tuple(a + b for a, b in zip(left, right))
+
+
+def _shortest_cue_interval(row, cue_interval_ms, distribution_record):
+    """Return the shortest cue interval this row can produce, if it has one."""
+
+    if not row.cue_tone_profile_id:
+        return None
+    if distribution_record:
+        values = distribution_record.get("values") or ()
+        return min(int(value) for value in values) if values else None
+    return None if cue_interval_ms is None else int(cue_interval_ms)
 
 
 def _attempt_component(row, context):
