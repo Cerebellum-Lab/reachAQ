@@ -6415,7 +6415,11 @@ class AppModel(ObservableObject):
                     # this should makes less delay / be more reactive in live inference results,
                     1,
                     len(inference_cameras),
-                    3,
+                    # One frame per camera: the batch is released as soon as a frame
+                    # arrives instead of accumulating three, which removes two frame
+                    # periods of staleness. PoseProcess pads up to the model batch
+                    # size, so the DeepLabCut graph and the offline path are unchanged.
+                    1,
                     shape=shape,
                     primary=0,
                     name="inference_q",
