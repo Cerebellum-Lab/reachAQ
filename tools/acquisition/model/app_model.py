@@ -163,6 +163,7 @@ from tools.acquisition.model.softmouse_spreadsheet_source import (
     SoftMouseSpreadsheetSource,
 )
 from tools.acquisition.model.session_data_recorder import SessionDataRecorder
+from tools.acquisition.model.stim_latency_budget import StimLatencyBudget
 from tools.acquisition.model.atomic_session_io import (
     atomic_publish_file,
     atomic_write_json,
@@ -549,6 +550,7 @@ class AppModel(ObservableObject):
         # although here it's also working, so keeping for now.
         proc_msg_queue = self._multiproc_msg_queue = mp_ctx.Queue()
         self._stim_direct_trigger_queue = mp_ctx.Queue(maxsize=16)
+        self._stim_latency_budget = StimLatencyBudget()
         self._handle_proc_msg_thread = threading.Thread(
             target=self._handle_proc_msg_queue, name="handle_proc_msg_queue", daemon=True)
         self._handle_proc_msg_thread.start()
@@ -4970,8 +4972,30 @@ class AppModel(ObservableObject):
             except Exception:
                 logger.exception("Could not fail the rejected stim operation")
 
+    @property
+    def stim_latency_budget(self) -> StimLatencyBudget:
+        """Rolling Tier 1 stim-loop latency view, aggregated from trigger records."""
+        return self._stim_latency_budget
+
+    def _log_stim_latency_budget(self) -> None:
+        """Emit the Tier 1 breakdown once per capture stop, when triggers occurred."""
+        try:
+            summary = self._stim_latency_budget.summary()
+            if summary.accepted == 0 and summary.rejected == 0:
+                return
+            report = self._stim_latency_budget.format_report()
+            if summary.total is not None and not summary.meets_budget:
+                logger.warning("Stim loop exceeded its p99 budget\n%s", report)
+            else:
+                logger.notice("%s", report)
+        except Exception:
+            logger.exception("Failed to report the stim latency budget")
+
     def _on_direct_stim_trigger_result(self, result) -> None:
         payload = dict(result)
+        # Aggregate before anything that can raise, so a recorder or capture
+        # failure does not also lose the latency sample.
+        self._stim_latency_budget.observe(payload)
         perf_time = float(
             payload.get("daqmx_start_entry_perf_time")
             or payload.get("ipc_receive_perf_time")
@@ -6590,6 +6614,7 @@ class AppModel(ObservableObject):
             self._laser.close()
         except Exception as err:
             logger.exception("Failed to close laser controller during capture stop: %s", err)
+        self._log_stim_latency_budget()
         self._set_subsystem_status(
             SubsystemId.LASER,
             (
