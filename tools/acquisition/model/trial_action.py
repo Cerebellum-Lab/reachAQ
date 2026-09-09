@@ -63,6 +63,10 @@ DEFAULT_CUE_MAX_WAIT_SECONDS = 5.0
 # How often the gate is re-read while an unlocked trial waits out a block.
 DEFAULT_CUE_POLL_SECONDS = 0.010
 
+# A Tone 2 transport slower than this dominates the cue interval error and is
+# worth a log line. The host timer contributes microseconds by comparison.
+DEFAULT_CUE_TRANSPORT_WARN_SECONDS = 0.002
+
 
 @dataclasses.dataclass(frozen=True)
 class ToneProfile:
@@ -658,6 +662,7 @@ class TrialActionExecutor:
         cue_timer_factory: Optional[Callable[[], CueTimer]] = None,
         cue_max_wait_seconds: float = DEFAULT_CUE_MAX_WAIT_SECONDS,
         cue_poll_seconds: float = DEFAULT_CUE_POLL_SECONDS,
+        cue_transport_warn_seconds: float = DEFAULT_CUE_TRANSPORT_WARN_SECONDS,
         clock: Callable[[], float] = time.perf_counter,
     ):
         self._move_absolute = move_absolute
@@ -685,6 +690,7 @@ class TrialActionExecutor:
         self._cue_timer_factory = cue_timer_factory or CueTimer
         self._cue_max_wait_seconds = max(0.0, float(cue_max_wait_seconds))
         self._cue_poll_seconds = max(0.001, float(cue_poll_seconds))
+        self._cue_transport_warn_seconds = max(0.0, float(cue_transport_warn_seconds))
         self._clock = clock
         self._cue_timer: Optional[CueTimer] = None
         self._cue_recipe: Optional[CompiledTrialRecipe] = None
@@ -992,20 +998,55 @@ class TrialActionExecutor:
             self._schedule_cue(fired_at + max(delay, 0.0))
 
     def _fire_cue_tone(self, recipe, lateness_seconds, evaluation) -> None:
+        """
+        Send Tone 2 and record what the delivery actually cost.
+
+        Both halves of the delay are measured, because only their sum is the
+        error in the cue interval:
+
+          scheduling   how late this ran against the deadline, sub-microsecond
+                       on a host timer that spins out the last 2 ms
+          transport    how long ``play_tone`` took, which for a CAN-routed tone
+                       is a command queue plus a firmware acknowledgement
+
+        The transport half is not compensated for by firing early. That would
+        mean committing to the cue before the gate is read at the deadline,
+        which is precisely what Lock Timing exists to prevent. Compensation is
+        only sound where the cue is not gated, or where the firmware can accept
+        a scheduled tone that is still cancellable.
+
+        The acknowledgement is not the tone. This measures when the board
+        confirmed the command, not when sound was produced, so it bounds the
+        host-side contribution and no more. Delivery itself still has to be
+        validated against recorded NI-DAQ edges.
+        """
+        send_started = self._clock()
         try:
             self._play_tone(recipe.cue_tone_profile, "tone_2")
         except Exception as err:
-            logger.exception("Tone 2 send failed: %s", err)
-            self._observe_safely(f"Tone 2 send failed: {type(err).__name__}: {err}")
+            transport_ms = (self._clock() - send_started) * 1000.0
+            logger.exception("Tone 2 send failed after %.3f ms: %s", transport_ms, err)
+            self._observe_safely(
+                f"Tone 2 send failed after {transport_ms:.3f} ms: "
+                f"{type(err).__name__}: {err}"
+            )
             return
-        # The achieved lateness is recorded rather than assumed. It covers the
-        # host timer only; the tone transport's own latency is not measured
-        # here and has to be checked against recorded NI-DAQ edges.
-        self._observe_safely(
-            f"Tone 2 fired {lateness_seconds * 1000.0:.3f} ms after its deadline"
-            + (f", extended {evaluation.extension_seconds * 1000.0:.3f} ms"
-               if evaluation.extension_seconds else "")
+
+        transport_seconds = self._clock() - send_started
+        total_ms = (lateness_seconds + transport_seconds) * 1000.0
+        detail = (
+            f"Tone 2 acknowledged {total_ms:.3f} ms after its deadline "
+            f"(scheduling {lateness_seconds * 1000.0:.3f} ms, "
+            f"transport {transport_seconds * 1000.0:.3f} ms)"
         )
+        if evaluation.extension_seconds:
+            detail += f", extended {evaluation.extension_seconds * 1000.0:.3f} ms"
+        self._observe_safely(detail)
+        if transport_seconds > self._cue_transport_warn_seconds:
+            logger.warning(
+                "Tone 2 transport took %.3f ms, which is the dominant term in the "
+                "cue interval error", transport_seconds * 1000.0,
+            )
 
     def _observe_safely(self, detail):
         """Record an observation from the timer thread, tolerating a finished trial."""
