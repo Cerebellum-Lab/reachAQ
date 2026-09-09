@@ -25,6 +25,8 @@ INSTALL_PYTHON=${REACHAQ_INSTALL_PYTHON:-3.8}
 INSTALL_CONFIG_DIR=${REACHAQ_INSTALL_CONFIG_DIR:-$HOME/Autotrainer}
 INSTALL_DATA_DIR=${REACHAQ_INSTALL_DATA_DIR:-$HOME/Documents/rawdatalocal}
 INSTALL_OPERATOR=${SUDO_USER:-${USER:-$(id -un)}}
+REALTIME_GROUP=${REACHAQ_INSTALL_REALTIME_GROUP:-reachaq-rt}
+REALTIME_LIMITS_FILE=/etc/security/limits.d/90-reachaq-rtprio.conf
 
 CURRENT_CATEGORY="General"
 RESULT_NAMES=()
@@ -205,6 +207,50 @@ check_repo() {
 
 make_runtime_directories() {
     mkdir -p "$INSTALL_CONFIG_DIR" "$INSTALL_DATA_DIR"
+}
+
+ensure_realtime_priority_limits() {
+    # The 900 Hz stim loop asks for SCHED_FIFO so its wake-up latency is
+    # bounded. Measured on a rig under CPU load, 60 s at 900 Hz: without this
+    # the worst case is 6.05 ms with 0.026% of cycles past the 5 ms budget;
+    # with it, 0.155 ms and no misses. A stock install grants no rtprio at all,
+    # so without this file the loop silently runs at normal priority.
+    if ! getent group "$REALTIME_GROUP" >/dev/null 2>&1; then
+        run_as_root groupadd --system "$REALTIME_GROUP" || return
+    fi
+    if ! id -nG "$INSTALL_OPERATOR" | tr ' ' '\n' | grep -qx "$REALTIME_GROUP"; then
+        run_as_root usermod --append --groups "$REALTIME_GROUP" "$INSTALL_OPERATOR" || return
+        printf '%s\n' \
+            "$INSTALL_OPERATOR was added to $REALTIME_GROUP. Log out and back in before the stim loop can use it."
+    fi
+    # Priority 80 stays below the kernel's own real-time threads, which run at
+    # 99, so a runaway loop cannot lock the machine out.
+    printf '%s\n' \
+        "# reachAQ: allow the stim-camera capture thread to run SCHED_FIFO." \
+        "# Installed by tools/install/reachaq-linux-install.sh." \
+        "@${REALTIME_GROUP}   -   rtprio   80" \
+        "@${REALTIME_GROUP}   -   memlock  524288" \
+        | run_as_root tee "$REALTIME_LIMITS_FILE" >/dev/null || return
+    printf 'Wrote %s\n' "$REALTIME_LIMITS_FILE"
+}
+
+install_cpu_governor_unit() {
+    # intel_pstate defaults to powersave, which on the reference workstation
+    # holds the P-cores near 2700 MHz under sustained load against a 5000 MHz
+    # ceiling. Measured effect on live pose inference: p50 12.55 -> 10.79 ms,
+    # p99 17.58 -> 11.53 ms. Runtime changes do not survive a reboot, hence a
+    # unit rather than a one-off command.
+    if ! have_command systemctl; then
+        printf 'systemd is unavailable; set the governor manually.\n' >&2
+        return 1
+    fi
+    run_as_root install -m 0644 \
+        "$INSTALL_REPO/tools/hardware/reachaq-cpu-governor.service" \
+        /etc/systemd/system/reachaq-cpu-governor.service || return
+    run_as_root systemctl daemon-reload || return
+    run_as_root systemctl enable --now reachaq-cpu-governor.service || return
+    printf 'Governor is now %s\n' \
+        "$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo unknown)"
 }
 
 ensure_rfid_serial_group() {
@@ -545,6 +591,10 @@ else
     run_step "Install base packages" apt_install_base
 fi
 run_step "Configure RFID serial permissions" ensure_rfid_serial_group
+
+begin_category "Closed-loop latency tuning"
+run_step "Grant real-time priority to the stim loop" ensure_realtime_priority_limits
+run_step "Install CPU governor unit" install_cpu_governor_unit
 
 begin_category "Conda runtime"
 CONDA_BIN=$(find_conda)
