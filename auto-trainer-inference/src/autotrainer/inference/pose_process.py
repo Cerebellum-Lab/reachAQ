@@ -24,6 +24,7 @@ from autotrainer.core.logging import (
 )
 from autotrainer.core.frame_index import FrameIndexCategory
 from . import DlcPoseModel, MemoryPoseModel
+from .cropped_pose_model import maybe_crop
 from .pose_model import PoseModel
 from .pose_offline_input import OfflineInputProcess
 
@@ -310,7 +311,18 @@ class PoseProcess(Process):
         prev_mode = None
         logger.info("%s: starting processing ..", self)
         d_q_put = self._data_queue.put
-        predict = self._pose_model.predict
+        # Live predictions may run on a crop of the frame; offline keeps the full
+        # frame. The DeepLabCut placeholder fixes only the batch dimension, so one
+        # loaded model serves both spatial sizes. Coordinates come back in
+        # full-frame space either way, which is what calibration expects.
+        live_model = maybe_crop(self._pose_model, input_q.shape)
+        live_predict = live_model.predict
+        offline_predict = self._pose_model.predict
+        if live_model is not self._pose_model:
+            logger.notice(
+                "live inference cropping enabled: %s (offline stays full-frame)",
+                live_model.roi,
+            )
         perf_add_c = self._perf_monitor.add_cycle
 
         live_input = self._live_input_queue
@@ -417,9 +429,9 @@ class PoseProcess(Process):
             if (frames_indices >= FrameIndexCategory.ONLINE_NO_RECORDING).any():
                 if i_q is live_input:
                     # Only the leading rows hold real frames; the rest is padding.
-                    pose = predict(predict_buffer)[:live_batch_size]
+                    pose = live_predict(predict_buffer)[:live_batch_size]
                 else:
-                    pose = predict(frame_buffer)
+                    pose = offline_predict(frame_buffer)
             else:
                 logger.debug("indices=%s skipped inference", frames_indices.tolist())
                 # otherwise gives a full "0" result:
