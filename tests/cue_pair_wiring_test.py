@@ -147,7 +147,7 @@ def test_tone_2_fires_at_the_deadline_when_the_gate_is_clear():
     harness.timer.fire(at=100.4, lateness=0.0004)
 
     assert ("tone2", "tone_2") in harness.tones
-    assert any("Tone 2 fired" in detail for detail in _details(operation))
+    assert any("Tone 2 acknowledged" in detail for detail in _details(operation))
 
 
 def test_the_deadline_is_tone_1_plus_the_drawn_interval():
@@ -162,8 +162,33 @@ def test_the_achieved_lateness_is_recorded_not_assumed():
     harness.now = 100.4
     harness.timer.fire(at=100.4, lateness=0.0123)
 
-    recorded = [d for d in _details(operation) if "Tone 2 fired" in d]
+    recorded = [d for d in _details(operation) if "Tone 2 acknowledged" in d]
     assert recorded and "12.300 ms" in recorded[0]
+
+
+def test_the_transport_cost_is_measured_separately_from_scheduling():
+    """The CAN round trip lands after the timer and can dominate the error.
+
+    Reporting only the scheduling lateness would make a 40 ms transport look
+    like a sub-microsecond cue.
+    """
+    harness = _Harness(pellet_presence_provider=lambda: (True, 100.0))
+
+    def slow_send(profile, phase):
+        if phase == "tone_2":
+            harness.now += 0.040  # the board acknowledged 40 ms later
+        harness.tones.append((profile.profile_id, phase))
+
+    harness.executor._play_tone = slow_send
+    operation = _prepare(harness, _recipe())
+    harness.now = 100.4
+    harness.timer.fire(at=100.4, lateness=0.0005)
+
+    recorded = [d for d in _details(operation) if "Tone 2 acknowledged" in d]
+    assert recorded, "the delivery must be recorded"
+    assert "transport 40.000 ms" in recorded[0]
+    assert "scheduling 0.500 ms" in recorded[0]
+    assert "40.500 ms after its deadline" in recorded[0], "the total is what matters"
 
 
 def test_a_missing_pellet_at_the_deadline_skips_and_resets():
@@ -329,4 +354,4 @@ def test_a_failing_tone_send_is_recorded_and_does_not_raise():
     harness.now = 100.4
     harness.timer.fire(at=100.4)
 
-    assert any("Tone 2 send failed" in detail for detail in _details(operation))
+    assert any("Tone 2 send failed after" in detail for detail in _details(operation))
