@@ -11,16 +11,11 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parents[1]
-PYPROJECTS = [
-    REPO / "pyproject.toml",
-    REPO / "auto-trainer-behavior" / "pyproject.toml",
-    REPO / "auto-trainer-core" / "pyproject.toml",
-    REPO / "auto-trainer-device" / "pyproject.toml",
-    REPO / "auto-trainer-inference" / "pyproject.toml",
-    REPO / "auto-trainer-model" / "pyproject.toml",
-    REPO / "auto-trainer-pyside" / "pyproject.toml",
-    REPO / "auto-trainer-video" / "pyproject.toml",
-]
+# Discovered rather than listed. A hand-maintained list already missed
+# tools/pyproject.toml, which stayed at ">= 3.8" while every other package moved
+# to 3.10; the omission was invisible because the test only checked what it was
+# told about. One level deep, so vendored trees are not swept in.
+PYPROJECTS = sorted(REPO.glob("*/pyproject.toml")) + [REPO / "pyproject.toml"]
 
 
 @pytest.mark.parametrize("path", PYPROJECTS, ids=lambda p: p.parent.name)
@@ -36,10 +31,18 @@ def test_requires_python_floor_is_3_10(path):
 
 
 def test_every_package_is_covered():
-    """A new package must not silently escape the floor check."""
-    found = {REPO / "pyproject.toml"}
-    found.update(REPO.glob("auto-trainer-*/pyproject.toml"))
-    assert found == set(PYPROJECTS), (
-        "pyproject files on disk differ from the checked list: "
-        f"{sorted(str(p.relative_to(REPO)) for p in found ^ set(PYPROJECTS))}"
+    """A package must not silently escape the floor check.
+
+    Naming the packages that must be present, rather than re-deriving them with
+    the same glob the list uses, which would assert nothing. The previous
+    version globbed only "auto-trainer-*" and so was blind to tools/ in exactly
+    the same way the hand-maintained list was.
+    """
+    covered = set(PYPROJECTS)
+    required = {REPO / "pyproject.toml", REPO / "tools" / "pyproject.toml"}
+    required.update(REPO.glob("auto-trainer-*/pyproject.toml"))
+    missing = required - covered
+    assert not missing, (
+        "these declare a Python floor but are not checked: "
+        f"{sorted(str(path.relative_to(REPO)) for path in missing)}"
     )
