@@ -132,6 +132,13 @@ from tools.acquisition.model.camera_timing_alignment import (
     align_camera_timestamp_files,
 )
 from tools.acquisition.model.acquisition_controller import AcquisitionController
+from tools.acquisition.model.intertrial_send_gate import InterTrialSendGate
+from tools.acquisition.model.send_block_reasons import SendBlockReasons
+
+
+# The name intertrial analysis holds the pellet send under. Inter-trial timing
+# holds under its own name, so neither releases the other.
+INTERTRIAL_ANALYSIS_BLOCK_NAME = "intertrial_analysis"
 from tools.acquisition.model.coordinate_model import CoordinateModel
 from tools.autotrainer_version import __version__ as app_version
 from tools.acquisition.model.helpers import get_config_location
@@ -712,6 +719,16 @@ class AppModel(ObservableObject):
             trigger_hardware_stimulus=self._trigger_protocol_stim3,
         )
         self._live_tracking = LiveTrackingBuffer()
+        # One holder, several holders-of-holds. intertrial analysis and
+        # inter-trial timing both block the send, and BehaviorAlgorithm reads
+        # a single string, so releasing one must not release the other.
+        self._send_block_reasons = SendBlockReasons(
+            publish=self._publish_pellet_send_block_reason,
+        )
+        self._intertrial_send_gate = InterTrialSendGate(
+            block_reasons=self._send_block_reasons,
+            observe=self._on_intertrial_timing_evaluated,
+        )
         self._intertrial_analysis = IntertrialAnalysisCoordinator(
             self._on_intertrial_analysis_result,
             failure_callback=self._on_intertrial_callback_failed,
@@ -1661,7 +1678,7 @@ class AppModel(ObservableObject):
         self._intertrial_resolution_request = None
         self._intertrial_resolution_reason = ""
         self._intertrial_waiting_operations.clear()
-        self._behavior.algorithm.pellet_send_block_reason = ""
+        self._send_block_reasons.clear_all()
         self._session_data_recorder.request_abort()
         self._cancel_automatic_stop_timers()
         if token is not None:
@@ -5178,8 +5195,9 @@ class AppModel(ObservableObject):
         estimate = self._intertrial_analysis.timing_estimate(
             request.window.end_perf - request.window.start_perf
         )
-        self._behavior.algorithm.pellet_send_block_reason = (
-            "waiting for retried pellet trial analysis; " + estimate.display_text
+        self._send_block_reasons.set(
+            INTERTRIAL_ANALYSIS_BLOCK_NAME,
+            "waiting for retried pellet trial analysis; " + estimate.display_text,
         )
         self._notify_trial_protocol_state()
         return True
@@ -5243,23 +5261,42 @@ class AppModel(ObservableObject):
     ) -> None:
         self._intertrial_resolution_request = request
         self._intertrial_resolution_reason = str(reason)
-        self._behavior.algorithm.pellet_send_block_reason = (
-            "pellet trial analysis needs operator action"
+        self._send_block_reasons.set(
+            INTERTRIAL_ANALYSIS_BLOCK_NAME,
+            "pellet trial analysis needs operator action",
         )
         logger.error("%s", reason)
         self._notify_trial_protocol_state()
 
+    def _publish_pellet_send_block_reason(self, rendered: str) -> None:
+        """Publish the combined holds to the single string BehaviorAlgorithm reads."""
+        self._behavior.algorithm.pellet_send_block_reason = rendered
+
+    def _on_intertrial_timing_evaluated(self, evaluation) -> None:
+        """Record how the inter-trial interval actually came out.
+
+        Lateness is evidence, not a correction: the policy releases a late
+        trial immediately rather than padding it further.
+        """
+        if evaluation.lateness_seconds:
+            logger.notice(
+                "inter-trial target missed by %.3f s", evaluation.lateness_seconds,
+            )
+        self._notify_trial_protocol_state()
+
     def _refresh_intertrial_send_block(self) -> None:
         if self._intertrial_resolution_request is not None:
-            self._behavior.algorithm.pellet_send_block_reason = (
-                "pellet trial analysis needs operator action"
+            self._send_block_reasons.set(
+                INTERTRIAL_ANALYSIS_BLOCK_NAME,
+                "pellet trial analysis needs operator action",
             )
         elif self._intertrial_waiting_operations:
-            self._behavior.algorithm.pellet_send_block_reason = (
-                "waiting for pellet trial analysis"
+            self._send_block_reasons.set(
+                INTERTRIAL_ANALYSIS_BLOCK_NAME,
+                "waiting for pellet trial analysis",
             )
         else:
-            self._behavior.algorithm.pellet_send_block_reason = ""
+            self._send_block_reasons.clear(INTERTRIAL_ANALYSIS_BLOCK_NAME)
 
     def _on_intertrial_callback_failed(
         self,
@@ -7654,7 +7691,7 @@ class AppModel(ObservableObject):
         self._intertrial_resolution_request = None
         self._intertrial_resolution_reason = ""
         self._intertrial_waiting_operations.clear()
-        self._behavior.algorithm.pellet_send_block_reason = ""
+        self._send_block_reasons.clear_all()
         self._intertrial_analysis.begin_session(
             analysis_generation,
             analysis_session_id,
@@ -7976,7 +8013,7 @@ class AppModel(ObservableObject):
         self._intertrial_resolution_request = None
         self._intertrial_resolution_reason = ""
         self._intertrial_waiting_operations.clear()
-        self._behavior.algorithm.pellet_send_block_reason = ""
+        self._send_block_reasons.clear_all()
         self._recording_session.set_analysis_finished(time.perf_counter())
         try:
             self._save_project_metadata(
@@ -9229,6 +9266,9 @@ class AppModel(ObservableObject):
             )
 
     def _on_pellet_cycle_completed(self, *, perf_c: float):
+        # The retrieval has been dispatched, so the inter-trial interval
+        # starts here rather than when the next trial is prepared.
+        self._intertrial_send_gate.arm(perf_c)
         operation = self._trial_action_executor.operation
         if (
             operation is not None
@@ -9440,8 +9480,9 @@ class AppModel(ObservableObject):
             estimate = self._intertrial_analysis.timing_estimate(
                 tracking_window.end_perf - tracking_window.start_perf
             )
-            self._behavior.algorithm.pellet_send_block_reason = (
-                "waiting for pellet trial analysis; " + estimate.display_text
+            self._send_block_reasons.set(
+                INTERTRIAL_ANALYSIS_BLOCK_NAME,
+                "waiting for pellet trial analysis; " + estimate.display_text,
             )
         if not self._intertrial_analysis.submit(request):
             self._intertrial_waiting_operations.discard(request.operation_id)
