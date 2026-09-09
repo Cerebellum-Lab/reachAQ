@@ -73,6 +73,10 @@ class TrialOutcome(str, enum.Enum):
     SUCCESS = "success"
     FAILURE = "failure"
     PELLET_MISSING = "pellet_missing"
+    PELLET_PRECHECK_FAILED = "pellet_precheck_failed"
+    PELLET_PRECHECK_AUTHORIZATION_TIMEOUT = (
+        "pellet_precheck_authorization_timeout"
+    )
     NO_REACH = "no_reach"
     UNSCORED = "unscored"
     INCOMPLETE = "incomplete"
@@ -85,6 +89,8 @@ class TrialOutcome(str, enum.Enum):
             TrialOutcome.SUCCESS,
             TrialOutcome.FAILURE,
             TrialOutcome.PELLET_MISSING,
+            TrialOutcome.PELLET_PRECHECK_FAILED,
+            TrialOutcome.PELLET_PRECHECK_AUTHORIZATION_TIMEOUT,
             TrialOutcome.NO_REACH,
         }
 

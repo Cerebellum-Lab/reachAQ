@@ -12,12 +12,31 @@ import time
 import uuid
 from typing import Callable, Mapping, Optional, Tuple
 
+from autotrainer.core.stimulus_trigger_profile import (
+    StimulusTriggerCategory,
+    profile_record as stimulus_trigger_profile_record,
+    select_trigger,
+    validate_profile as validate_stimulus_trigger_profile,
+)
+
+from autotrainer.core.delay_distribution import (
+    EXPONENTIAL_CDF_TAU_MS,
+    DelayDistributionProfile,
+    DelayPreset,
+    build_delay_distribution_profile,
+    normalize_delay_preset,
+    preset_values,
+    select_delay,
+)
+
 from tools.acquisition.model.trial_protocol_schedule import (
+    OFFSET_STIMULUS_TRIGGERS,
     LaserTriggerRoute,
     PelletLane,
     PelletPositionMode,
     RetryAssignment,
     StimulusAssignment,
+    StimulusTrigger,
     TrialProtocolRow,
 )
 
@@ -37,6 +56,104 @@ class ToneProfile:
 
     def to_record(self):
         return dataclasses.asdict(self)
+
+
+@dataclasses.dataclass(frozen=True)
+class CueIntervalProfile:
+    """Reusable Tone 1 to Tone 2 interval distribution.
+
+    The profile owns the configuration; the resolved probability weights are
+    derived by :mod:`autotrainer.core.delay_distribution` so the published
+    supports stay in one place.
+    """
+
+    profile_id: str
+    revision: int
+    preset: str = DelayPreset.PUBLISHED_4S.value
+    values: Tuple[int, ...] = ()
+    tau_ms: int = EXPONENTIAL_CDF_TAU_MS
+    manual_probabilities: Optional[Tuple[float, ...]] = None
+
+    def __post_init__(self):
+        if not self.profile_id:
+            raise ValueError("Cue interval profile ID cannot be empty")
+        if self.revision < 1:
+            raise ValueError("Cue interval profile revision must be positive")
+        # Build once so a malformed profile fails at construction rather than
+        # part-way through compiling a trial.
+        self.distribution()
+
+    def distribution(self) -> DelayDistributionProfile:
+        """Return the resolved distribution for this profile."""
+
+        preset = normalize_delay_preset(self.preset)
+        values = self.values or preset_values(preset)
+        if not values:
+            raise ValueError(
+                f"Cue interval profile {self.profile_id!r} requires cue intervals"
+            )
+        return build_delay_distribution_profile(
+            values,
+            preset,
+            tau_ms=self.tau_ms,
+            manual_probabilities=self.manual_probabilities,
+        )
+
+    def to_record(self):
+        record = dataclasses.asdict(self)
+        record["values"] = list(self.values)
+        if self.manual_probabilities is not None:
+            record["manual_probabilities"] = list(self.manual_probabilities)
+        return record
+
+
+@dataclasses.dataclass(frozen=True)
+class StimulusTriggerProfile:
+    """Reusable weighted set of stimulus trigger categories.
+
+    Weights are conditional on stimulation already having been selected for
+    the trial, so they total 100% among enabled categories.
+    """
+
+    profile_id: str
+    revision: int
+    categories: Tuple[StimulusTriggerCategory, ...] = ()
+
+    def __post_init__(self):
+        if not self.profile_id:
+            raise ValueError("Stimulus trigger profile ID cannot be empty")
+        if self.revision < 1:
+            raise ValueError("Stimulus trigger profile revision must be positive")
+        object.__setattr__(
+            self,
+            "categories",
+            tuple(
+                item
+                if isinstance(item, StimulusTriggerCategory)
+                else StimulusTriggerCategory(**dict(item))
+                for item in self.categories
+            ),
+        )
+        for category in self.categories:
+            trigger = StimulusTrigger(category.trigger)
+            if category.is_offset_trigger and trigger not in OFFSET_STIMULUS_TRIGGERS:
+                raise ValueError(
+                    f"{trigger.value} stimulus triggers do not take a lead time"
+                )
+        # Reject an unusable profile at construction rather than mid-trial.
+        validate_stimulus_trigger_profile(self.categories)
+
+    def validated(self, *, offset_upper_bound_ms: Optional[int] = None):
+        return validate_stimulus_trigger_profile(
+            self.categories, offset_upper_bound_ms=offset_upper_bound_ms
+        )
+
+    def to_record(self):
+        return {
+            "profile_id": self.profile_id,
+            "revision": self.revision,
+            **stimulus_trigger_profile_record(self.categories),
+        }
 
 
 @dataclasses.dataclass(frozen=True)
@@ -128,6 +245,17 @@ class CompiledTrialRecipe:
     stimulus_draw: float
     tone_profile: Optional[ToneProfile]
     laser_profile: Optional[LaserPulseProfile]
+    cue_tone_profile: Optional[ToneProfile] = None
+    cue_interval_ms: Optional[int] = None
+    cue_interval_seed: Optional[int] = None
+    cue_interval_draw: Optional[float] = None
+    cue_interval_selection: Optional[Mapping[str, object]] = None
+    cue_interval_distribution: Optional[Mapping[str, object]] = None
+    resolved_stimulus_trigger: str = StimulusTrigger.NONE.value
+    resolved_trigger_offset_ms: int = 0
+    stimulus_trigger_seed: Optional[int] = None
+    stimulus_trigger_draw: Optional[float] = None
+    stimulus_trigger_selection: Optional[Mapping[str, object]] = None
 
     def to_record(self):
         return {
@@ -147,6 +275,33 @@ class CompiledTrialRecipe:
             "stimulus_draw": self.stimulus_draw,
             "tone_profile": None if self.tone_profile is None else self.tone_profile.to_record(),
             "laser_profile": None if self.laser_profile is None else self.laser_profile.to_record(),
+            "cue_tone_profile": (
+                None
+                if self.cue_tone_profile is None
+                else self.cue_tone_profile.to_record()
+            ),
+            "cue_interval_ms": self.cue_interval_ms,
+            "cue_interval_seed": self.cue_interval_seed,
+            "cue_interval_draw": self.cue_interval_draw,
+            "cue_interval_selection": (
+                None
+                if self.cue_interval_selection is None
+                else dict(self.cue_interval_selection)
+            ),
+            "cue_interval_distribution": (
+                None
+                if self.cue_interval_distribution is None
+                else dict(self.cue_interval_distribution)
+            ),
+            "resolved_stimulus_trigger": self.resolved_stimulus_trigger,
+            "resolved_trigger_offset_ms": self.resolved_trigger_offset_ms,
+            "stimulus_trigger_seed": self.stimulus_trigger_seed,
+            "stimulus_trigger_draw": self.stimulus_trigger_draw,
+            "stimulus_trigger_selection": (
+                None
+                if self.stimulus_trigger_selection is None
+                else dict(self.stimulus_trigger_selection)
+            ),
         }
 
 
@@ -158,10 +313,14 @@ class TrialActionCompiler:
         *,
         tone_profiles: Mapping[str, ToneProfile] = None,
         laser_profiles: Mapping[str, LaserPulseProfile] = None,
+        cue_interval_profiles: Mapping[str, CueIntervalProfile] = None,
+        stimulus_trigger_profiles: Mapping[str, StimulusTriggerProfile] = None,
         dcs_to_motor: Callable[[Tuple[float, float, float]], Tuple[float, float, float]],
     ):
         self._tone_profiles = dict(tone_profiles or {})
         self._laser_profiles = dict(laser_profiles or {})
+        self._cue_interval_profiles = dict(cue_interval_profiles or {})
+        self._stimulus_trigger_profiles = dict(stimulus_trigger_profiles or {})
         self._dcs_to_motor = dcs_to_motor
 
     def compile(self, row: TrialProtocolRow, context: TrialCompileContext):
@@ -240,6 +399,82 @@ class TrialActionCompiler:
             tone = self._tone_profiles.get(row.tone_profile_id)
             if tone is None:
                 raise ValueError(f"Unknown tone profile {row.tone_profile_id!r}")
+        cue_tone = None
+        cue_interval_ms = None
+        cue_interval_seed = None
+        cue_interval_draw = None
+        cue_interval_selection = None
+        cue_interval_distribution = None
+        if row.cue_tone_profile_id:
+            cue_tone = self._tone_profiles.get(row.cue_tone_profile_id)
+            if cue_tone is None:
+                raise ValueError(
+                    f"Unknown cue tone profile {row.cue_tone_profile_id!r}"
+                )
+            if row.cue_interval_profile_id:
+                interval_profile = self._cue_interval_profiles.get(
+                    row.cue_interval_profile_id
+                )
+                if interval_profile is None:
+                    raise ValueError(
+                        "Unknown cue interval profile "
+                        f"{row.cue_interval_profile_id!r}"
+                    )
+                distribution = interval_profile.distribution()
+                # A separate seed domain keeps the cue interval independent of
+                # the stimulus draw for the same trial.
+                cue_interval_seed = _domain_seed(row, context, "cue_interval")
+                cue_interval_draw = _stable_draw(cue_interval_seed)
+                selection = select_delay(distribution, cue_interval_draw)
+                cue_interval_ms = selection.delay_ms
+                cue_interval_selection = selection.to_record()
+                cue_interval_distribution = distribution.to_record()
+            else:
+                cue_interval_ms = int(row.cue_interval_fixed_ms)
+
+        resolved_trigger = row.stimulus_trigger
+        resolved_offset_ms = int(row.pre_reveal_ms)
+        stimulus_trigger_seed = None
+        stimulus_trigger_draw = None
+        stimulus_trigger_selection = None
+        if row.stimulus_assignment is StimulusAssignment.RANDOMIZED:
+            trigger_profile = self._stimulus_trigger_profiles.get(
+                row.stimulus_trigger_profile_id
+            )
+            if trigger_profile is None:
+                raise ValueError(
+                    "Unknown stimulus trigger profile "
+                    f"{row.stimulus_trigger_profile_id!r}"
+                )
+            # A Tone 2 lead time has to fit inside the shortest cue interval
+            # this row can draw, otherwise it could never be delivered.
+            categories = trigger_profile.validated(
+                offset_upper_bound_ms=_shortest_cue_interval(
+                    row, cue_interval_ms, cue_interval_distribution
+                )
+            )
+            for category in categories:
+                if (
+                    category.enabled
+                    and StimulusTrigger(category.trigger) is StimulusTrigger.TONE_2
+                    and not row.cue_tone_profile_id
+                ):
+                    raise ValueError(
+                        "Tone 2 stimulus triggers require a configured cue tone"
+                    )
+            if selected:
+                stimulus_trigger_seed = _domain_seed(
+                    row, context, "stimulus_trigger"
+                )
+                stimulus_trigger_draw = _stable_draw(stimulus_trigger_seed)
+                selection = select_trigger(categories, stimulus_trigger_draw)
+                resolved_trigger = StimulusTrigger(selection.category.trigger)
+                resolved_offset_ms = int(selection.category.offset_ms or 0)
+                stimulus_trigger_selection = selection.to_record()
+            else:
+                resolved_trigger = StimulusTrigger.NONE
+                resolved_offset_ms = 0
+
         laser = None
         if row.laser_profile_id:
             laser = self._laser_profiles.get(row.laser_profile_id)
@@ -248,8 +483,8 @@ class TrialActionCompiler:
             if laser.trigger_route is not row.laser_trigger_route:
                 raise ValueError("Protocol row and laser profile trigger routes differ")
             if (
-                row.stimulus_trigger.value == "pre_reveal"
-                and int(laser.trigger_pulse_us) >= int(row.pre_reveal_ms) * 1000
+                resolved_trigger is StimulusTrigger.PRE_REVEAL
+                and int(laser.trigger_pulse_us) >= resolved_offset_ms * 1000
             ):
                 raise ValueError(
                     "Pre-reveal interval must be longer than the STIM3 trigger pulse"
@@ -274,6 +509,17 @@ class TrialActionCompiler:
             stimulus_draw=stimulus_draw,
             tone_profile=tone,
             laser_profile=laser,
+            cue_tone_profile=cue_tone,
+            cue_interval_ms=cue_interval_ms,
+            cue_interval_seed=cue_interval_seed,
+            cue_interval_draw=cue_interval_draw,
+            cue_interval_selection=cue_interval_selection,
+            cue_interval_distribution=cue_interval_distribution,
+            resolved_stimulus_trigger=resolved_trigger.value,
+            resolved_trigger_offset_ms=resolved_offset_ms,
+            stimulus_trigger_seed=stimulus_trigger_seed,
+            stimulus_trigger_draw=stimulus_trigger_draw,
+            stimulus_trigger_selection=stimulus_trigger_selection,
         )
 
 
@@ -667,18 +913,48 @@ def _add(left, right):
     return tuple(a + b for a, b in zip(left, right))
 
 
-def _stimulus_seed(row, context):
-    attempt_component = (
+def _shortest_cue_interval(row, cue_interval_ms, distribution_record):
+    """Return the shortest cue interval this row can produce, if it has one."""
+
+    if not row.cue_tone_profile_id:
+        return None
+    if distribution_record:
+        values = distribution_record.get("values") or ()
+        return min(int(value) for value in values) if values else None
+    return None if cue_interval_ms is None else int(cue_interval_ms)
+
+
+def _attempt_component(row, context):
+    return (
         context.attempt_id
         if row.retry_assignment is RetryAssignment.RESAMPLE
         else 0
     )
+
+
+def _stimulus_seed(row, context):
+    # The payload is deliberately untagged so previously recorded stimulus
+    # seeds and draws remain reproducible.
     payload = json.dumps((
         int(context.session_seed),
         context.protocol_id,
         int(context.protocol_revision),
         int(context.logical_trial_id),
-        int(attempt_component),
+        int(_attempt_component(row, context)),
+    ), separators=(",", ":"), ensure_ascii=True).encode("ascii")
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
+
+
+def _domain_seed(row, context, domain):
+    """Return an independent seed stream for one named draw domain."""
+
+    payload = json.dumps((
+        str(domain),
+        int(context.session_seed),
+        context.protocol_id,
+        int(context.protocol_revision),
+        int(context.logical_trial_id),
+        int(_attempt_component(row, context)),
     ), separators=(",", ":"), ensure_ascii=True).encode("ascii")
     return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
 
