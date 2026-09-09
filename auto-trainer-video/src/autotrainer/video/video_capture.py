@@ -36,6 +36,7 @@ from .camera.camera_base import CameraBase
 from .video_manager import VideoManager
 from .video_record import VideoRecord, VideoRecordProperties, VideoRecordMode
 from .stim_camera import StimCameraDetectionConfiguration, StimCameraDetector, StimEvidenceWriter
+from .realtime_priority import apply_realtime_priority
 
 logger = get_verbose_logger(__name__)
 
@@ -409,6 +410,13 @@ class VideoCapture(Process):
                 logger.exception("Failure executing cmd %s: %s", raw, err)
 
     def _run_capture_loop(self, camera: CameraBase) -> None:
+        if self._stim_detector is not None:
+            # Only the stim camera: this is the 900 Hz closed loop, and it is
+            # the one whose wake-up latency has a 5 ms deadline. Making every
+            # camera process real-time would buy nothing and take CPU from the
+            # ones that only need throughput. Returns False and logs when the
+            # rig has no rtprio allowance, and the loop then runs as before.
+            apply_realtime_priority()
         log_cam_frame_info_delay_frame_count = camera.fps * 5
         fault_count = 0
         cnt_net_q_put = 0
