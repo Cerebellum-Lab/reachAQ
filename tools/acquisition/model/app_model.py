@@ -4291,6 +4291,28 @@ class AppModel(ObservableObject):
                 }
                 for profile in self._automatic_shift_policies.values()
             ),
+            "cue_interval_profiles": tuple(
+                {
+                    "profile_id": profile.profile_id,
+                    "revision": profile.revision,
+                    "summary": (
+                        f"{profile.preset}, "
+                        f"{len(profile.distribution().values)} intervals"
+                    ),
+                }
+                for profile in self._cue_interval_profiles.values()
+            ),
+            "stimulus_trigger_profiles": tuple(
+                {
+                    "profile_id": profile.profile_id,
+                    "revision": profile.revision,
+                    "summary": (
+                        f"{len([c for c in profile.categories if c.enabled])} "
+                        f"of {len(profile.categories)} triggers enabled"
+                    ),
+                }
+                for profile in self._stimulus_trigger_profiles.values()
+            ),
             "active_trial_id": active_trial_id,
             "completed_trial_ids": tuple(sorted({
                 attempt.trial_id
