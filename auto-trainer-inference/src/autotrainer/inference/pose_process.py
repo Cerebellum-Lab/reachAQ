@@ -23,7 +23,8 @@ from autotrainer.core.logging import (
     install_log_exception_hook,
 )
 from autotrainer.core.frame_index import FrameIndexCategory
-from . import DlcPoseModel, MemoryPoseModel
+from . import MemoryPoseModel
+from .backend_selection import build_pose_model, selected_backend
 from .cropped_pose_model import maybe_crop
 from .pose_model import PoseModel
 from .pose_offline_input import OfflineInputProcess
@@ -162,8 +163,9 @@ class PoseProcess(Process):
             logger.warning("pellet model not specified; using in-memory random data")
             model = MemoryPoseModel(model_batch_size)
         else:
-            logger.notice("Loading DLC model %r", model_path)
-            model = DlcPoseModel(model_path, 1, 0, model_batch_size)
+            backend = selected_backend()
+            logger.notice("Loading DLC model %r using the %s backend", model_path, backend)
+            model = build_pose_model(model_path, 1, 0, model_batch_size, backend=backend)
 
         if not model.is_valid():
             self._send_message(InferenceStatusMessageKind.Terminated)
