@@ -12,6 +12,7 @@ import time
 import uuid
 from typing import Callable, Mapping, Optional, Tuple
 
+from autotrainer.core.logging import get_verbose_logger
 from autotrainer.core.stimulus_trigger_profile import (
     StimulusTriggerCategory,
     profile_record as stimulus_trigger_profile_record,
@@ -29,6 +30,16 @@ from autotrainer.core.delay_distribution import (
     select_delay,
 )
 
+from tools.acquisition.model.cue_timer import CueTimer
+from tools.acquisition.model.cue_timing import (
+    CueCancelReason,
+    CueDecision,
+    CueGateState,
+    CueTimingConfiguration,
+    CueTimingPolicy,
+)
+from tools.acquisition.model.reach_state_source import ReachStateResolver
+
 from tools.acquisition.model.trial_protocol_schedule import (
     OFFSET_STIMULUS_TRIGGERS,
     LaserTriggerRoute,
@@ -39,6 +50,18 @@ from tools.acquisition.model.trial_protocol_schedule import (
     StimulusTrigger,
     TrialProtocolRow,
 )
+
+
+logger = get_verbose_logger(__name__)
+
+
+# How long an unlocked trial keeps waiting for a blocked gate before giving up.
+# CueTimingPolicy deliberately waits indefinitely and leaves that decision to
+# its caller, so the bound lives here.
+DEFAULT_CUE_MAX_WAIT_SECONDS = 5.0
+
+# How often the gate is re-read while an unlocked trial waits out a block.
+DEFAULT_CUE_POLL_SECONDS = 0.010
 
 
 @dataclasses.dataclass(frozen=True)
@@ -629,6 +652,13 @@ class TrialActionExecutor:
         trigger_hardware_stimulus: Callable[
             [LaserPulseProfile, CompiledTrialRecipe, str], object
         ] = lambda _profile, _recipe, _detail: None,
+        cue_timing_configuration: Optional[CueTimingConfiguration] = None,
+        reach_state_resolver: Optional[ReachStateResolver] = None,
+        pellet_presence_provider: Optional[Callable[[], object]] = None,
+        cue_timer_factory: Optional[Callable[[], CueTimer]] = None,
+        cue_max_wait_seconds: float = DEFAULT_CUE_MAX_WAIT_SECONDS,
+        cue_poll_seconds: float = DEFAULT_CUE_POLL_SECONDS,
+        clock: Callable[[], float] = time.perf_counter,
     ):
         self._move_absolute = move_absolute
         self._configure_cover = configure_cover
@@ -645,6 +675,20 @@ class TrialActionExecutor:
         self._laser_handle = None
         self._detector_handle = None
         self._send_context: Optional[str] = None
+
+        # Cue pair. The policy owns the decision, the timer owns the deadline,
+        # and this owner only routes between them. All of it is inert unless a
+        # recipe carries both a cue tone and a drawn cue interval.
+        self._cue_policy = CueTimingPolicy(cue_timing_configuration)
+        self._reach_state = reach_state_resolver
+        self._pellet_presence_provider = pellet_presence_provider
+        self._cue_timer_factory = cue_timer_factory or CueTimer
+        self._cue_max_wait_seconds = max(0.0, float(cue_max_wait_seconds))
+        self._cue_poll_seconds = max(0.001, float(cue_poll_seconds))
+        self._clock = clock
+        self._cue_timer: Optional[CueTimer] = None
+        self._cue_recipe: Optional[CompiledTrialRecipe] = None
+        self._cue_expiry: Optional[float] = None
 
     @property
     def operation(self):
@@ -738,6 +782,8 @@ class TrialActionExecutor:
             if recipe.tone_profile is not None and row["tone_phase"] == phase:
                 self._play_tone(recipe.tone_profile, phase)
                 self._observe(f"{phase} tone acknowledged")
+                # Tone 1 has just sounded, so the cue interval starts here.
+                self._arm_cue_pair(recipe, phase)
             # A laser is already armed. Phase execution records the semantic
             # trigger point; the configured STIM3/NI route owns physical start.
             if recipe.laser_profile is not None and row["laser_phase"] == phase:
@@ -776,6 +822,7 @@ class TrialActionExecutor:
     def complete(self, detail=""):
         with self._lock:
             operation = self._require_current()
+            self._cancel_cue_pair()
             self._await_laser_terminal_for_cycle()
             if operation.state is PreparedState.SEND_ACCEPTED:
                 operation.transition(PreparedState.ACTIVE, "cycle completion")
@@ -790,6 +837,7 @@ class TrialActionExecutor:
     def fail(self, error):
         with self._lock:
             operation = self._require_current()
+            self._cancel_cue_pair(CueCancelReason.HOST_REQUEST)
             self._cancel_laser_safely()
             self._cancel_detector_safely()
             if operation.state not in PreparedTrialOperation.TERMINAL:
@@ -806,11 +854,165 @@ class TrialActionExecutor:
                 return None
             if generation is not None:
                 operation.require_generation(generation)
+            self._cancel_cue_pair(CueCancelReason.HOST_REQUEST)
             self._cancel_laser_safely()
             self._cancel_detector_safely()
             if operation.state not in PreparedTrialOperation.TERMINAL:
                 operation.transition(PreparedState.CANCELLED, reason)
             return operation
+
+    # --- cue pair -----------------------------------------------------------
+
+    def _arm_cue_pair(self, recipe: CompiledTrialRecipe, phase: str) -> None:
+        """
+        Start the Tone 1 to Tone 2 interval, if this recipe has one.
+
+        Only for a host-played tone. When the tone phase is
+        ``embedded_in_sequence`` the pellet board owns the sequence timing, and
+        a host timer would be describing a cue it does not deliver.
+        """
+        cue_tone = recipe.cue_tone_profile
+        interval_ms = recipe.cue_interval_ms
+        if cue_tone is None or not interval_ms:
+            return
+        if phase == "embedded_in_sequence":
+            self._observe(
+                "cue pair not host-timed: the board owns the embedded sequence"
+            )
+            return
+
+        self._cancel_cue_pair()
+        tone_1_perf_time = self._clock()
+        deadline = self._cue_policy.start(tone_1_perf_time, interval_ms)
+        self._cue_recipe = recipe
+        self._cue_expiry = deadline + self._cue_max_wait_seconds
+        self._observe(f"cue pair armed: Tone 2 due in {interval_ms} ms")
+        self._schedule_cue(deadline)
+
+    def _schedule_cue(self, deadline_perf_time: float) -> None:
+        # A fresh timer per arm: the previous one's thread is the caller when
+        # this runs from a WAIT re-arm, and a timer refuses to reschedule while
+        # its own thread is still alive.
+        timer = self._cue_timer = self._cue_timer_factory()
+        timer.schedule(deadline_perf_time, self._on_cue_deadline)
+
+    def _cancel_cue_pair(self, reason: Optional[CueCancelReason] = None) -> None:
+        timer, self._cue_timer = self._cue_timer, None
+        if timer is not None:
+            timer.cancel()
+        if reason is not None and self._cue_policy.is_started:
+            evaluation = self._cue_policy.cancel(reason)
+            self._observe_safely(f"Tone 2 cancelled: {evaluation.reason.value}")
+        else:
+            self._cue_policy.reset()
+        self._cue_recipe = None
+        self._cue_expiry = None
+
+    def _cue_gate_state(self, now_perf_time: float) -> CueGateState:
+        """
+        Build one gate observation from whatever evidence is available.
+
+        ``observed_at`` is the *oldest* contributing observation, so staleness
+        is judged by the least fresh evidence rather than the freshest. With no
+        provider at all the observation is "now with nothing known", which the
+        policy treats as unknown presence rather than as a clear gate.
+        """
+        pellet_present = None
+        reach_active = False
+        observed_at = now_perf_time
+
+        provider = self._pellet_presence_provider
+        if provider is not None:
+            try:
+                observation = provider()
+            except Exception as err:
+                logger.warning("pellet presence provider failed: %s", err)
+                observation = None
+            if observation is not None:
+                try:
+                    pellet_present, presence_at = observation
+                    observed_at = min(observed_at, float(presence_at))
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "pellet presence provider returned %r, expected (present, time)",
+                        observation,
+                    )
+                    pellet_present = None
+
+        if self._reach_state is not None:
+            reach = self._reach_state.observe(now_perf_time)
+            if reach is not None:
+                reach_active, reach_at = reach
+                observed_at = min(observed_at, reach_at)
+
+        return CueGateState(
+            observed_at=observed_at,
+            pellet_present=pellet_present,
+            reach_active=reach_active,
+        )
+
+    def _on_cue_deadline(self, fired_at: float, lateness_seconds: float) -> None:
+        with self._lock:
+            recipe = self._cue_recipe
+            if recipe is None or not self._cue_policy.is_started:
+                return  # completed, failed or cancelled while the timer waited
+
+            gate = self._cue_gate_state(fired_at)
+            try:
+                evaluation = self._cue_policy.evaluate(fired_at, gate)
+            except Exception as err:
+                logger.exception("cue evaluation failed: %s", err)
+                self._observe_safely(f"Tone 2 abandoned: {type(err).__name__}")
+                self._cancel_cue_pair()
+                return
+
+            if evaluation.decision is CueDecision.FIRE:
+                self._fire_cue_tone(recipe, lateness_seconds, evaluation)
+                self._cancel_cue_pair()
+                return
+
+            if evaluation.decision is CueDecision.SKIP_AND_RESET:
+                self._observe_safely(
+                    f"Tone 2 skipped and reset: {evaluation.reason.value}"
+                )
+                self._cancel_cue_pair()
+                return
+
+            # WAIT. An unlocked trial may wait out a genuine block, but not
+            # forever, so the caller-owned bound applies here.
+            if self._cue_expiry is not None and fired_at >= self._cue_expiry:
+                self._observe_safely(
+                    "Tone 2 abandoned: the gate never cleared within "
+                    f"{self._cue_max_wait_seconds:g}s"
+                )
+                self._cancel_cue_pair(CueCancelReason.HOST_REQUEST)
+                return
+
+            delay = evaluation.remaining_seconds or self._cue_poll_seconds
+            self._schedule_cue(fired_at + max(delay, 0.0))
+
+    def _fire_cue_tone(self, recipe, lateness_seconds, evaluation) -> None:
+        try:
+            self._play_tone(recipe.cue_tone_profile, "tone_2")
+        except Exception as err:
+            logger.exception("Tone 2 send failed: %s", err)
+            self._observe_safely(f"Tone 2 send failed: {type(err).__name__}: {err}")
+            return
+        # The achieved lateness is recorded rather than assumed. It covers the
+        # host timer only; the tone transport's own latency is not measured
+        # here and has to be checked against recorded NI-DAQ edges.
+        self._observe_safely(
+            f"Tone 2 fired {lateness_seconds * 1000.0:.3f} ms after its deadline"
+            + (f", extended {evaluation.extension_seconds * 1000.0:.3f} ms"
+               if evaluation.extension_seconds else "")
+        )
+
+    def _observe_safely(self, detail):
+        """Record an observation from the timer thread, tolerating a finished trial."""
+        try:
+            self._observe(detail)
+        except Exception:
+            logger.debug("cue observation dropped, no current operation: %s", detail)
 
     def _observe(self, detail):
         operation = self._require_current()
