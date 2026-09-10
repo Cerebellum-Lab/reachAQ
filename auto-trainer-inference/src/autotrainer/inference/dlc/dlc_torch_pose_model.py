@@ -21,6 +21,7 @@ Precision is not assumed: it comes from detect_gpu_capability(), because FP16
 measures 3-4x *slower* than FP32 on some cards in this fleet.
 """
 
+import glob
 import os
 import typing
 
@@ -78,11 +79,46 @@ class DlcTorchPoseModel(PoseModel):
         if not os.path.isfile(configuration_file):
             raise FileNotFoundError(f"{configuration_file!r} does not exist")
 
+    @classmethod
+    def has_trained_snapshot(cls, location: str) -> bool:
+        """
+        Whether the project holds any trained PyTorch snapshot at all.
+
+        Checked on the filesystem rather than through DeepLabCut, so the
+        preflight in the parent process stays cheap and does not import torch
+        or DeepLabCut just to find out that it cannot run.
+
+        Deliberately broad: this answers "is this project trained for the
+        PyTorch engine", not "is the configured shuffle trained". The precise
+        answer needs the project configuration and belongs to load(), which
+        raises with the shuffle and folder named. This exists so that the
+        common case - the backend switched on a project that has only ever been
+        trained under TensorFlow - is refused before a process is spawned,
+        rather than surfacing as a child-process crash after preflight passed.
+        """
+        pattern = os.path.join(
+            location, "dlc-models-pytorch", "*", "*", "train", "snapshot-*.pt"
+        )
+        return bool(glob.glob(pattern))
+
     def is_valid(self) -> bool:
         try:
             self.pre_validate(self._source)
         except Exception as err:
             logger.error("source: %s, validation failed: %s", self._source, err)
+            return False
+        if not self.has_trained_snapshot(self._source):
+            # Imported here rather than at module scope: backend_selection is
+            # this module's caller, and the name is only needed for a message.
+            from ..backend_selection import POSE_BACKEND_ENV_VAR
+
+            logger.error(
+                "source: %s has no trained PyTorch snapshot. %s selects the PyTorch "
+                "engine, but this project has no dlc-models-pytorch/**/train/"
+                "snapshot-*.pt. Train a PyTorch shuffle, or unset the variable to "
+                "use the TensorFlow engine.",
+                self._source, POSE_BACKEND_ENV_VAR,
+            )
             return False
         return True
 
