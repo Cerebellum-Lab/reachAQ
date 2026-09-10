@@ -184,6 +184,24 @@ file as data and does not source it as shell code. Re-run the launcher installer
 after moving the repository, changing the Conda environment, or changing the
 system-configuration path.
 
+## Environment variables
+
+These are read from the process environment rather than
+`system_configuration.yaml`. `SystemConfiguration.version` is pinned at 57 and
+rejects any other value, so adding schema fields would stop deployed rigs
+loading their configuration. They should move into the schema when a version
+bump past 57 is acceptable.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `REACHAQ_STIM_RT_PRIORITY` | `80` | SCHED_FIFO priority for the stim capture loop. `0`, `off` or `false` disables it. See the [latency tuning guide](latency-tuning.md). |
+| `REACHAQ_POSE_BACKEND` | `tensorflow` | Selects the DeepLabCut engine: `tensorflow` or `torch`. Also selects which GPU runtime the live-inference preflight probes, so the two cannot disagree. |
+| `REACHAQ_INFERENCE_ROI` | unset | `x,y,width,height`. Crops live frames to this window before inference and shifts the returned coordinates back into full-frame space. Unset means full frame. |
+
+`REACHAQ_POSE_BACKEND=torch` requires a shuffle trained with the PyTorch
+engine; a project trained under TensorFlow has no `pytorch_config.yaml` and the
+model load fails with a message saying so.
+
 ## Verification
 
 Portable CLI/import checks and the focused non-hardware suite are part of the
@@ -236,17 +254,33 @@ record until reachAQ exits.
 
 ## Current workstation reference
 
-Last documentation update 2026-08-10:
+Last documentation update 2026-09-09. Entries marked (verified) were re-checked
+on the workstation on that date.
 
 - Dell Precision 3660 Tower; Ubuntu 22.04.5 LTS, x86_64; kernel
-  `6.8.0-124-generic`.
-- Conda environment `/home/christielab10/anaconda3/envs/reachaq`, Python 3.8,
-  TensorFlow 2.13.1.
-- Spinnaker system runtime 3.2.0.57; bundled Python wheel 3.2.0.62.
-- NI-DAQmx 26.3.1 and PXI Platform Services 26.3; configured PXI-6713 output
-  alias `PXI1Slot4` and PXI-6221 sampled-input alias `PXI1Slot5`.
+  `6.8.0-136-generic` (verified). 12th Gen Core i9-12900: 8 P-cores on CPU
+  0-15 at 5000-5100 MHz, 8 E-cores on CPU 16-23 at 3800 MHz (verified).
+- Conda environment `/home/christielab10/anaconda3/envs/reachaq`, Python
+  3.8.20, TensorFlow **2.12.1** (verified). Not 2.13: that release pairs with a
+  keras which moved `legacy_tf_layers`, which breaks `tf_slim` batch norm and
+  therefore every DeepLabCut model load.
+- Conda environment `reachaq-test310`, Python 3.10.21, for running the test
+  suite on the version the packages now require. It has torch 2.14.0 and
+  DeepLabCut 3.0.1 and deliberately no TensorFlow. It cannot run the three
+  tests that import `PySpin`, because the vendored Spinnaker wheel is cp38.
+- Spinnaker system runtime 3.2.0.57 (verified); bundled Python wheel 3.2.0.62.
+- NI-DAQmx 26.3.1 (verified) and PXI Platform Services 26.3; configured
+  PXI-6713 output alias `PXI1Slot4` and PXI-6221 sampled-input alias
+  `PXI1Slot5`. Kernel modules `nitiork`, `niwfrk` and `nixsrk` are built
+  through DKMS.
 - PEAK PCIe adapter on `peak_pciefd`, exposing `can0` and `can1`.
-- Quadro T1000 present but using `nouveau`; live inference unavailable.
+- Quadro T1000, driver 595.84, CUDA 13.2 (verified). **Live inference works**;
+  the earlier `nouveau` entry is obsolete. The driver is installed as
+  `linux-modules-nvidia-595-open-<kernel>`, Canonical's prebuilt per-kernel
+  modules rather than DKMS, which constrains any kernel change. The T1000 uses
+  the TU117 die and has no tensor cores despite reporting compute capability
+  7.5, so FP16 measures 3-4x slower than FP32 on it.
 - Local output `/home/christielab10/Documents/rawdatalocal`.
-- `nidaq-sync` default software suite at implementation verification: 606
-  passed, 45 skipped, 1 xpassed.
+- Full software suite on this workstation, Python 3.8: 1164 passed, 35 skipped
+  (verified). Run it with `ulimit -n` at its default 1024; the suite no longer
+  exhausts the descriptor limit.

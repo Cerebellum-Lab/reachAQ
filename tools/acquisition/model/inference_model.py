@@ -22,6 +22,7 @@ from autotrainer.core.pose_elements import SceneElement, AllHandsParts
 from autotrainer.inference import GpuRuntimeStatus, PoseProcess, InferenceCommandMessageKind, \
     InferenceStatusMessageKind, PoseAlgorithm, InferenceMode, InferenceStatus, \
     InferenceMonitorDataMsg, detect_gpu_runtime
+from autotrainer.inference.backend_selection import build_pose_model, selected_backend
 from autotrainer.inference.pose_result_process import InferenceMonitorDataProc
 from autotrainer.inference.analysis import intersession_process, IntersessionResponse
 
@@ -327,20 +328,46 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
 
     def check_live_inference_runtime(self, *, force_refresh: bool = False) -> GpuRuntimeStatus:
         if force_refresh or self._gpu_runtime_status is None:
-            # The configured DeepLabCut model uses the TensorFlow backend. A
-            # working PyTorch CUDA installation alone is not sufficient.
-            self._gpu_runtime_status = detect_gpu_runtime(required_backend="tensorflow")
+            # Probe the backend live inference will actually run on. The two
+            # are not interchangeable: on the reachAQ rig TensorFlow sees the
+            # GPU while every torch convolution aborts in cuDNN, so probing
+            # the wrong one passes the check and then crashes the pose process.
+            self._gpu_runtime_status = detect_gpu_runtime(required_backend=selected_backend())
         return self._gpu_runtime_status
 
     def can_start_live_inference(self) -> bool:
         gpu_status = self.check_live_inference_runtime()
-        if gpu_status.is_available:
-            logger.info("Live inference GPU runtime available via %s: %s",
-                        gpu_status.backend, gpu_status.devices)
+        if not gpu_status.is_available:
+            logger.error("Live inference requires GPU acceleration; refusing to start. backend=%s error=%s",
+                         gpu_status.backend, gpu_status.error)
+            return False
+        logger.info("Live inference GPU runtime available via %s: %s",
+                    gpu_status.backend, gpu_status.devices)
+        return self._can_load_pose_model()
+
+    def _can_load_pose_model(self) -> bool:
+        """
+        Check the configured model before the pose process is spawned.
+
+        Without this, a bad path surfaces from inside the child process as a
+        critical log and a non-zero exit, which reads as a crash rather than
+        as a misconfigured model. An empty location is not a failure: that
+        selects the in-memory model used for rig checkout.
+        """
+        if not self._model_location:
             return True
-        logger.error("Live inference requires GPU acceleration; refusing to start. backend=%s error=%s",
-                     gpu_status.backend, gpu_status.error)
-        return False
+        backend = selected_backend()
+        try:
+            model = build_pose_model(self._model_location, backend=backend)
+            valid = model.is_valid()
+        except Exception as err:
+            logger.error("Live inference model %r is not usable by the %s backend: %s",
+                         self._model_location, backend, err)
+            return False
+        if not valid:
+            logger.error("Live inference model %r did not validate for the %s backend",
+                         self._model_location, backend)
+        return valid
 
     def stop(self):
         if self._status in {InferenceStatus.stopped, InferenceStatus.stopping}:
