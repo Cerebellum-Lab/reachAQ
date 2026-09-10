@@ -20,6 +20,12 @@ MAX_POST_CLEAR_DELAY_MS = 60_000
 
 
 PROTOCOL_SCHEMA_VERSION = 2
+
+# Schema versions a stored document may carry. Anything listed here is loaded
+# and upgraded to PROTOCOL_SCHEMA_VERSION; anything else is refused rather than
+# guessed at. Schema 1 predates the Tone 1 to Tone 2 cue pair and the weighted
+# stimulus trigger profiles, both of which added only optional fields.
+SUPPORTED_PROTOCOL_SCHEMA_VERSIONS = frozenset({1, PROTOCOL_SCHEMA_VERSION})
 DEFAULT_TRIAL_COUNT = 15
 MAX_ABS_SHIFT_MM = 50.0
 _IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
@@ -731,8 +737,21 @@ class TrialProtocolDocument:
 
     @classmethod
     def from_record(cls, record: Mapping[str, object]):
+        stored_schema = int(record.get("schema_version", -1))
+        if stored_schema not in SUPPORTED_PROTOCOL_SCHEMA_VERSIONS:
+            raise ValueError(
+                f"Unsupported protocol schema {stored_schema}; expected one of "
+                f"{sorted(SUPPORTED_PROTOCOL_SCHEMA_VERSIONS)}"
+            )
         return cls(
-            schema_version=int(record.get("schema_version", -1)),
+            # Upgraded on load, the way the stimulus profile library already
+            # does it. Schema 2 only added optional cue-pair and trigger-profile
+            # fields, and every one of them defaults to the behaviour a schema 1
+            # document already had: no cue tone means no cue pair is ever armed,
+            # so cue_lock_timing defaulting to True changes nothing for it.
+            # Without this a saved protocol from before the cue pair simply
+            # fails to load, which is a worse outcome than upgrading it.
+            schema_version=PROTOCOL_SCHEMA_VERSION,
             protocol_id=record["protocol_id"],
             name=record["name"],
             description=record.get("description", ""),
