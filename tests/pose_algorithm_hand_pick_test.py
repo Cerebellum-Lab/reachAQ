@@ -82,7 +82,7 @@ def test_they_agree_on_random_frames(seed):
         assert current(frame)[column] == pytest.approx(previous(frame)[column])
 
 
-def test_the_algorithm_no_longer_sorts_to_pick_a_hand():
+def test_the_algorithm_selects_hands_without_pandas():
     """A revert would be silent: the result is identical, only slower."""
     import inspect
 
@@ -90,4 +90,79 @@ def test_the_algorithm_no_longer_sorts_to_pick_a_hand():
 
     source = inspect.getsource(PoseAlgorithm)
     assert 'sort_values(by="likelihood"' not in source
-    assert 'numpy.argmax(hand["likelihood"].to_numpy())' in source
+    assert "process_hand_data(" not in source, (
+        "the live path builds DataFrames again")
+    assert "numpy.argmax(likelihood)" in source
+
+
+# --- the hand choice itself --------------------------------------------------
+#
+# The live path no longer calls process_hand_data. It takes, per camera, the
+# (frame, sub-part) pair with the highest likelihood, which is the same answer
+# process_hand_data reached in two stages: best sub-part per frame, then best
+# frame. These tests hold the two implementations against each other on random
+# input, because the equivalence is the whole justification for the change.
+
+BASES = ["H_flat", "H_spread", "H_grab"]
+
+
+def _pandas_choice(frames, hand):
+    """What process_hand_data plus the old frame pick produced."""
+    from autotrainer.inference.analysis.prepare_jetson_data import process_hand_data
+
+    parts = [option + base for option in ("R", "L") for base in BASES]
+    columns = pandas.MultiIndex.from_product(
+        [parts, COLUMNS], names=["bodyparts", "coordinates"])
+    rows = numpy.asarray(frames, dtype=float).reshape(len(frames), -1)
+    df = pandas.DataFrame(rows, columns=columns)
+    out_columns = pandas.MultiIndex.from_product(
+        [["R_Hand", "L_Hand"], COLUMNS], names=["bodyparts", "coordinates"])
+    result = process_hand_data(
+        df, hand_base_names=BASES, hand_options=["R", "L"], dlc_seg="_raw2D",
+        newdf=pandas.DataFrame(columns=out_columns, index=range(len(df))),
+        additional_names=[])
+    picked = result[f"{hand}_Hand"]
+    best = picked.iloc[int(numpy.argmax(picked["likelihood"].to_numpy()))]
+    return float(best["x"]), float(best["y"]), float(best["likelihood"])
+
+
+def _numpy_choice(frames, hand):
+    """What the live path does now."""
+    rows = [0, 1, 2] if hand == "R" else [3, 4, 5]
+    poses = numpy.asarray(frames, dtype=float)[:, rows, :]
+    likelihood = poses[:, :, 2]
+    frame_index, sub_index = divmod(
+        int(numpy.argmax(likelihood)), likelihood.shape[1])
+    x, y, score = poses[frame_index, sub_index]
+    return float(x), float(y), float(score)
+
+
+@pytest.mark.parametrize("seed", range(20))
+@pytest.mark.parametrize("hand", ["R", "L"])
+def test_the_numpy_choice_matches_process_hand_data(seed, hand):
+    rng = numpy.random.default_rng(seed)
+    count = int(rng.integers(1, 4))
+    frames = rng.uniform(0, 256, (count, 6, 3))
+    # Quantised likelihoods so ties actually occur.
+    frames[:, :, 2] = rng.integers(0, 4, (count, 6)) / 4.0
+    assert _numpy_choice(frames, hand) == pytest.approx(
+        _pandas_choice(frames, hand))
+
+
+def test_a_tie_across_frames_and_subparts_resolves_the_same_way():
+    """Flat argmax must break ties to the first frame, then the first sub-part."""
+    frames = numpy.zeros((2, 6, 3))
+    frames[:, :, 2] = 0.5           # every candidate equally likely
+    frames[0, 0, 0:2] = (11.0, 12.0)
+    assert _numpy_choice(frames, "R")[:2] == (11.0, 12.0)
+    assert _numpy_choice(frames, "R") == pytest.approx(
+        _pandas_choice(frames, "R"))
+
+
+def test_the_most_likely_subpart_wins_over_frame_order():
+    frames = numpy.zeros((2, 6, 3))
+    frames[0, 0] = (1.0, 1.0, 0.20)
+    frames[1, 2] = (9.0, 9.0, 0.90)     # later frame, third sub-part
+    assert _numpy_choice(frames, "R") == pytest.approx((9.0, 9.0, 0.90))
+    assert _numpy_choice(frames, "R") == pytest.approx(
+        _pandas_choice(frames, "R"))
