@@ -214,3 +214,45 @@ def test_trained_model_name_ignores_an_untrained_shuffle(tmp_path):
     (trained / "snapshot-200.pt").write_bytes(b"")
     _write_backbone(trained, "cspnext_s")
     assert trained_model_name(str(tmp_path)) == "cspnext_s"
+
+
+# --- cspnext_m and rtmpose_s -------------------------------------------------
+#
+# Measured the same way, on the project's held-out frames.
+#
+# cspnext_m's score is discriminative - tightening the gate genuinely improves
+# accuracy - so a threshold is a real control on it:
+#
+#   gate   pass    median      gate   pass    median
+#   0.10  99.3%   1.44 px      0.30  84.2%   1.31 px
+#   0.20  96.8%   1.43 px      0.60  51.6%   1.22 px
+#
+# 0.2 keeps 96.8% of keypoints and detects RH_grab in 95%, LH_grab 95%,
+# Pellet 96% and Nose 99% of the frames where they are labelled.
+#
+# rtmpose_s is the opposite and the reason its entry exists at all. Its SimCC
+# head reports 0.325 at the very lowest, so it detects 100% of every bodypart at
+# any gate up to 0.30 - and its error does not move when the gate is tightened:
+# 2.93 px at 0.05 against 2.87 px at 0.90. Rejecting predictions buys nothing,
+# so the entry keeps coverage rather than discarding it for no gain.
+
+
+def test_cspnext_m_uses_its_measured_threshold():
+    assert confidence_threshold(TORCH_BACKEND, {}, model_name="cspnext_m") == 0.2
+
+
+def test_rtmpose_keeps_coverage_because_its_gate_buys_nothing():
+    """Its error is flat across thresholds, so rejecting only loses keypoints."""
+    assert TORCH_MODEL_CONFIDENCE_THRESHOLDS["rtmpose_s"] <= 0.3
+    assert confidence_threshold(TORCH_BACKEND, {}, model_name="rtmpose_s") == 0.3
+
+
+def test_every_measured_threshold_is_a_usable_probability():
+    for name, value in TORCH_MODEL_CONFIDENCE_THRESHOLDS.items():
+        assert 0.0 < value < 1.0, f"{name} threshold {value} is not usable"
+
+
+def test_the_measured_models_are_the_ones_we_have_trained():
+    """A typo in a key would silently fall back to the backend default."""
+    assert set(TORCH_MODEL_CONFIDENCE_THRESHOLDS) == {
+        "resnet_50", "cspnext_s", "cspnext_m", "rtmpose_s"}

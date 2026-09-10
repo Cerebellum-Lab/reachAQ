@@ -90,9 +90,35 @@ DEFAULT_CONFIDENCE_THRESHOLDS = {
 #
 # Keyed by the backbone name DeepLabCut records in the trained shuffle's
 # pytorch_config.yaml, which is what trained_model_name() reads.
+#
+# cspnext_m, measured the same way, has a score that is genuinely
+# discriminative - tightening the gate improves accuracy, which is what a
+# threshold is for:
+#
+#   gate   pass    median        gate   pass    median
+#   0.10  99.3%   1.44 px        0.30  84.2%   1.31 px
+#   0.20  96.8%   1.43 px        0.60  51.6%   1.22 px
+#
+# 0.2 keeps 96.8% of keypoints and detects RH_grab in 95%, LH_grab 95%,
+# Pellet 96% and Nose 99% of the frames where each is labelled.
+#
+# rtmpose_s is the opposite case, and the reason its entry is here rather than
+# left to fall through. Its SimCC head never scores below 0.325, so it "detects"
+# 100% of every bodypart at any gate up to 0.30, and its error does not move
+# when the gate is tightened: 2.93 px at 0.05 against 2.87 px at 0.90. Rejecting
+# its predictions buys no accuracy, so the entry keeps coverage instead of
+# discarding keypoints for nothing.
+#
+# That flatness is a warning, not a convenience. On a second camera this model
+# reported a mean confidence of 0.847 while sitting about 48 px off the
+# pipeline's own output, so its confidence cannot be used to reject a bad
+# prediction. Do not put rtmpose_s behind a closed-loop gate on the strength of
+# its score alone.
 TORCH_MODEL_CONFIDENCE_THRESHOLDS = {
     "resnet_50": 0.3,
     "cspnext_s": 0.1,
+    "cspnext_m": 0.2,
+    "rtmpose_s": 0.3,
 }
 
 _MIN_CONFIDENCE_THRESHOLD = 0.0
