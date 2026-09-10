@@ -32,6 +32,20 @@ class PoseModel:
     def body_part_categories(self):
         return self._body_part_categories
 
+    @property
+    def supports_partial_batch(self) -> bool:
+        """
+        Whether predict() accepts fewer frames than the model was sized for.
+
+        False by default, which is the safe answer: the DeepLabCut TensorFlow
+        graph fixes its batch dimension at build time, so a caller must pad to
+        the model batch size. A backend that batches internally can say True
+        and let the caller skip the padding, which is not a micro-optimisation:
+        live inference pads two real camera frames up to six and then discards
+        four results, so it pays batch-six compute for batch-two output.
+        """
+        return False
+
     def is_valid(self) -> bool:
         """
         Check if the model is valid.  This is called before loading the model.

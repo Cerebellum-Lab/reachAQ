@@ -134,6 +134,11 @@ class DlcTorchPoseModel(PoseModel):
         return True
 
     @property
+    def supports_partial_batch(self) -> bool:
+        """The runner batches internally, so a short batch costs less."""
+        return True
+
+    @property
     def snapshot_path(self) -> str:
         return self._snapshot_path
 

@@ -118,6 +118,11 @@ class CroppedPoseModel(PoseModel):
     def pre_validate(cls, location: str):
         raise RuntimeError("Validate the wrapped model instead")
 
+    @property
+    def supports_partial_batch(self) -> bool:
+        # A decorator that answered for itself would strand the capability.
+        return self._inner.supports_partial_batch
+
     def is_valid(self) -> bool:
         return self._inner.is_valid()
 
