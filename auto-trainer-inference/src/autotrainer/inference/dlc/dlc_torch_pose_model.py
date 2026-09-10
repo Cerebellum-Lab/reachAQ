@@ -25,6 +25,8 @@ import glob
 import os
 import typing
 
+import yaml
+
 import numpy
 
 from autotrainer.core.logging import get_verbose_logger
@@ -70,8 +72,17 @@ class DlcTorchPoseModel(PoseModel):
         self._precision = ""
 
         self._sys_configuration = None
+        self._model_configuration = None
         self._runner = None
         self._body_parts_count = 1
+
+        self._fast_path_enabled = False
+        self._fast_shape = None
+        self._fast_host = None
+        self._fast_device_u8 = None
+        self._fast_input = None
+        self._fast_mean = None
+        self._fast_std = None
 
     @classmethod
     def pre_validate(cls, location: str):
@@ -256,9 +267,127 @@ class DlcTorchPoseModel(PoseModel):
 
         self._runner = self._build_runner(model_configuration_path, self._snapshot_path)
 
+        with open(model_configuration_path) as handle:
+            self._model_configuration = yaml.safe_load(handle) or {}
+        reason = self._fast_path_reason()
+        self._fast_path_enabled = reason is None
+        if self._fast_path_enabled:
+            logger.notice("live predict uses the lean path")
+        else:
+            logger.notice("live predict uses the DeepLabCut runner: %s", reason)
+
+
+    # --- lean live path ---------------------------------------------------
+    #
+    # DeepLabCut's runner.inference() is built for analysing a video: it
+    # transforms each image separately on the CPU, torch.stack()s them, keeps
+    # parallel lists of contexts and batch sizes and re-slices them per call,
+    # runs a per-image postprocessor and rebuilds a dict of dicts. Measured on
+    # this rig that machinery costs 1.2 ms of a 6.9 ms predict() at batch 1.
+    #
+    # At 6.9 ms that is 16%. With a lighter backbone it is not: if compute
+    # falls to ~1.9 ms the same 1.2 ms becomes 39% of the total, so the
+    # overhead has to go for a fast backbone to be worth having.
+    #
+    # Live inference does not need any of it. The batch is a fixed number of
+    # fixed-size camera frames, there is one head, there is no context and no
+    # dynamic cropper. So this path reuses pinned host and device buffers,
+    # normalises on the GPU, and calls the runner's predict() directly.
+    #
+    # The preprocessing it replaces is exactly one step, read from the trained
+    # config rather than assumed: albumentations Normalize with the ImageNet
+    # mean and standard deviation and max_pixel_value 255. resize,
+    # auto_padding and top_down_crop are all null for this project, so there
+    # is nothing else to reproduce. _fast_path_reason() re-checks that on load
+    # and refuses the fast path if the config ever says otherwise.
+
+    IMAGENET_MEAN = (0.485, 0.456, 0.406)
+    IMAGENET_STD = (0.229, 0.224, 0.225)
+
+    def _fast_path_reason(self) -> typing.Optional[str]:
+        """Return why the lean path cannot be used, or None if it can."""
+        if self._runner is None:
+            return "model is not loaded"
+        if not str(self._device).startswith("cuda"):
+            return f"device is {self._device!r}"
+        if getattr(self._runner, "dynamic", None) is not None:
+            return "a dynamic cropper is configured"
+
+        inference_cfg = (self._model_configuration or {}).get("data", {})
+        inference_cfg = inference_cfg.get("inference", {}) or {}
+        if not inference_cfg.get("normalize_images", False):
+            return "normalize_images is off"
+        # Anything that changes geometry or scaling would have to be
+        # reproduced here, and silently getting it wrong would move every
+        # coordinate. Refuse instead.
+        for key in ("resize", "auto_padding", "top_down_crop", "longest_max_size",
+                    "crop_sampling", "collate"):
+            if inference_cfg.get(key):
+                return f"{key} is configured"
+        if inference_cfg.get("scale_to_unit_range") or inference_cfg.get("grayscale"):
+            return "an unsupported scaling transform is configured"
+        heads = (self._model_configuration or {}).get("model", {}).get("heads", {})
+        if set(heads) - {"bodypart"}:
+            return f"more than the bodypart head is configured: {sorted(heads)}"
+        return None
+
+    def _ensure_fast_buffers(self, frames):
+        """Allocate the reusable host and device buffers once per shape."""
+        import torch
+
+        shape = tuple(frames.shape)
+        if self._fast_shape == shape:
+            return
+        batch, height, width, channels = shape
+        # Pinned so the host to device copy can be asynchronous and does not
+        # pay a staging copy inside the driver on every frame.
+        self._fast_host = torch.empty(
+            shape, dtype=torch.uint8, pin_memory=True,
+        )
+        self._fast_device_u8 = torch.empty(
+            shape, dtype=torch.uint8, device=self._device,
+        )
+        self._fast_input = torch.empty(
+            (batch, channels, height, width),
+            dtype=torch.float32, device=self._device,
+        )
+        self._fast_mean = torch.tensor(
+            self.IMAGENET_MEAN, dtype=torch.float32, device=self._device,
+        ).view(1, channels, 1, 1)
+        self._fast_std = torch.tensor(
+            self.IMAGENET_STD, dtype=torch.float32, device=self._device,
+        ).view(1, channels, 1, 1)
+        self._fast_shape = shape
+
+    def _fast_predict(self, frames) -> typing.List[numpy.ndarray]:
+        import torch
+
+        self._ensure_fast_buffers(frames)
+        self._fast_host.copy_(torch.from_numpy(frames))
+        self._fast_device_u8.copy_(self._fast_host, non_blocking=True)
+
+        # NHWC uint8 to NCHW float, normalised, into the preallocated tensor.
+        # permute is a view, so the only write is the one into _fast_input.
+        staged = self._fast_device_u8.permute(0, 3, 1, 2)
+        torch.div(staged.to(torch.float32), 255.0, out=self._fast_input)
+        self._fast_input.sub_(self._fast_mean).div_(self._fast_std)
+
+        with torch.inference_mode():
+            raw = self._runner.predict(self._fast_input)
+
+        part_count = self._body_parts_count
+        poses = []
+        for item in raw:
+            block = numpy.asarray(item["bodypart"]["poses"], dtype="float")
+            poses.append(block.reshape(-1, part_count, 3)[0])
+        return poses
+
     def predict(self, frames) -> typing.List[numpy.ndarray]:
         if self._runner is None:
             raise RuntimeError("load() must be called before predict()")
+
+        if self._fast_path_enabled:
+            return self._fast_predict(numpy.ascontiguousarray(frames))
 
         # The runner takes a sequence of individual frames rather than a stacked
         # array, and batches them internally up to batch_size.
