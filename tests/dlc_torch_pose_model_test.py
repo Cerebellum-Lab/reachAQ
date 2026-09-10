@@ -131,10 +131,24 @@ def test_pre_validate_requires_a_project_config(tmp_path):
         DlcTorchPoseModel.pre_validate(str(tmp_path))
 
 
-def test_is_valid_matches_the_tensorflow_backend(tmp_path):
+def test_is_valid_requires_more_than_the_tensorflow_backend_does(tmp_path):
+    """A project config alone is not enough for the PyTorch engine.
+
+    DlcPoseModel is satisfied by config.yaml, because a TensorFlow project that
+    reaches this point has a trained shuffle. The PyTorch engine does not:
+    switching the backend on a TensorFlow-only project is the expected
+    mistake, so it is refused in the preflight rather than in the pose process.
+    See tests/torch_backend_snapshot_gate_test.py.
+    """
     (tmp_path / "config.yaml").write_text("bodyparts: []\n")
-    assert DlcTorchPoseModel(str(tmp_path)).is_valid() is True
+    assert DlcTorchPoseModel(str(tmp_path)).is_valid() is False
     assert DlcTorchPoseModel(str(tmp_path / "missing")).is_valid() is False
+
+    train = (tmp_path / "dlc-models-pytorch" / "iteration-0"
+             / "projectSep18-trainset95shuffle2" / "train")
+    train.mkdir(parents=True)
+    (train / "snapshot-200.pt").write_text("weights")
+    assert DlcTorchPoseModel(str(tmp_path)).is_valid() is True
 
 
 def test_body_parts_from_a_flat_list_keep_their_order():
