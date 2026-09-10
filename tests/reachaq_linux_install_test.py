@@ -67,6 +67,25 @@ def test_portable_installer_configures_closed_loop_latency():
     assert "rtprio   80" in source, "priority must stay below the kernel's own RT threads"
 
 
+def test_latency_setup_script_is_tracked_and_reversible():
+    """The two settings must be applicable without re-running the installer.
+
+    A rig that is already installed should not have to run a full install to
+    change a governor, and every action has to have a documented way back.
+    """
+    script = REPO_ROOT / "tools" / "hardware" / "reachaq-latency-setup.sh"
+    assert script.is_file()
+    text = script.read_text()
+
+    for action in ("status", "governor", "rtprio-enable", "rtprio-disable"):
+        assert action in text, action
+    # Both directions, or an operator cannot undo what they applied.
+    assert "powersave" in text and "performance" in text
+    assert "/etc/security/limits.d/90-reachaq-rtprio.conf" in text
+    # status must be readable without root, so it can be inspected first.
+    assert 'action="${1:-status}"' in text
+
+
 def test_cpu_governor_unit_is_tracked_and_installable():
     unit = REPO_ROOT / "tools" / "hardware" / "reachaq-cpu-governor.service"
     assert unit.is_file()
