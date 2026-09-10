@@ -220,6 +220,19 @@ class PoseAlgorithm:
         self._hands_columns = pandas.MultiIndex.from_product([
             [SceneElement.R_Hand, SceneElement.L_Hand], axis_labels],
             names=['bodyparts', 'coordinates'])
+        # Where each hand's x, y and likelihood sit inside _hands_columns.
+        # MultiIndex.from_product sorts its levels, so these are looked up
+        # rather than assumed. They let the live path read the winning row
+        # out of a numpy view instead of indexing pandas per hand per camera.
+        # Cache for the triangulation column index, keyed by the mask of
+        # confident parts; see _handle_3d_triangulate.
+        self._confident_columns_cache = {}
+        self._hand_value_columns = {
+            elem: tuple(
+                self._hands_columns.get_loc((elem, axis)) for axis in axis_labels
+            )
+            for elem in (SceneElement.R_Hand, SceneElement.L_Hand)
+        }
         self._hands_input_parts = list(AllHandsParts)
         self._hands_input_columns = pandas.MultiIndex.from_product(
             [self._hands_input_parts, axis_labels], names=['bodyparts', 'coordinates']
@@ -422,9 +435,20 @@ class PoseAlgorithm:
         ]
         if len(confident_parts) == 0:
             return self._empty_3d, self._empty_3d
-        confident_columns = pandas.MultiIndex.from_product(
-            [confident_parts, self._2d_axis_labels], names=self._3d_names,
-        )
+        # from_product measured 0.38 ms per live batch. Its result depends
+        # only on which parts are confident, and a running session sees the
+        # same handful of masks over and over, so it is cached by the mask
+        # instead of rebuilt. The cache is bounded because a pathological
+        # session could otherwise reach one entry per distinct mask.
+        mask_key = confident_mask.tobytes()
+        confident_columns = self._confident_columns_cache.get(mask_key)
+        if confident_columns is None:
+            if len(self._confident_columns_cache) >= 64:
+                self._confident_columns_cache.clear()
+            confident_columns = pandas.MultiIndex.from_product(
+                [confident_parts, self._2d_axis_labels], names=self._3d_names,
+            )
+            self._confident_columns_cache[mask_key] = confident_columns
         confident_order = [
             column
             for column in self._measure_offset_level_order
@@ -560,31 +584,50 @@ class PoseAlgorithm:
                 additional_names=[],
             )
             assert len(process_hands_results) == len(df)
+            # One numpy view for the whole frame, then integer indexing per
+            # hand per camera. Selecting through pandas here - an iloc slice, an
+            # iloc row read and a label-list read - measured 1.1 ms per live
+            # batch on the rig, against a 10-20 ms budget for the whole pose
+            # path. The selection is unchanged: argmax takes the first row at
+            # the highest likelihood, as sort_values did before it.
+            #
+            # process_hand_data is handed a frame built from _hands_columns and
+            # returns it filled, so the cached positions apply. If it ever
+            # returned different columns those positions would be wrong rather
+            # than merely slow, so that is checked and the pandas path kept.
+            hands_columns = process_hands_results.columns
+            hands_values = (
+                process_hands_results.to_numpy()
+                if hands_columns is self._hands_columns else None
+            )
             start_idx = 0
             for cam_idx, frames in enumerate(selected_cams_frames):
-                raw = process_hands_results.iloc[start_idx:start_idx + len(frames)]
-                start_idx += len(frames)
+                stop_idx = start_idx + len(frames)
+                raw = (process_hands_results.iloc[start_idx:stop_idx]
+                       if hands_values is None else None)
                 for elem in SceneElement.L_Hand, SceneElement.R_Hand:
-                    if __debug__ and elem not in process_hands_results.columns:
+                    if __debug__ and elem not in hands_columns:
                         logger.warning("%s not present in hands results", elem)
+                        continue
+                    if hands_values is not None:
+                        x_col, y_col, p_col = self._hand_value_columns[elem]
+                        block = hands_values[start_idx:stop_idx]
+                        row = int(numpy.argmax(block[:, p_col]))
+                        if block[row, p_col] >= self._present_threshold:
+                            locations_by_cam[cam_idx][elem] = PoseLocation(
+                                -1, block[row, x_col], block[row, y_col])
                         continue
                     # if self.process_frames_select_frames_method == "last_one":
                     #     val = raw[elem].iloc[-1]
                     # else:
                     # but if want uses most likelihood, then:
-                    # argmax rather than sort_values: sorting the whole
-                    # frame to read one row measured 313 us per call on
-                    # the rig, and this runs once per hand per camera on
-                    # every live batch - 1.25 ms of a 6.57 ms
-                    # PoseAlgorithm.process. Both pick the first row at
-                    # the maximum, so the selection is unchanged; only
-                    # the discarded ordering of the other rows differs.
                     hand = raw[elem]
                     val = hand.iloc[
                         int(numpy.argmax(hand["likelihood"].to_numpy()))
                     ]
                     if val['likelihood'] >= self._present_threshold:
                         locations_by_cam[cam_idx][elem] = PoseLocation(-1, *val[_xy_col_names])
+                start_idx = stop_idx
         #
         locations_3d = {}
         raw_3d_loc = {}
