@@ -93,6 +93,7 @@ def app_model(
     finally:
         app.capture_stop(force=True)
         app.on_close()
+        top_fixtures.release_multiprocessing_resources(app)
 
 
 def test_user_preferences(settings_ini_path, user_pref, trainer_config_dir):

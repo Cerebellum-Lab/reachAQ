@@ -83,6 +83,96 @@ class AlmostEqualFloat(float):
         return abs(self - other) < 0.01
 
 
+def release_multiprocessing_resources(app):
+    """Close the multiprocessing resources an AppModel opens in __init__.
+
+    AppModel.__init__ starts a multiprocessing Manager and two mp Queues, and
+    every VideoCaptureModel it builds adds one more. Nothing closes them:
+    on_close() leaves the message queue open on purpose ("do not close to allow
+    multiple on_close() calls") and its manager shutdown is commented out, and
+    the mocked fixture cannot call on_close() at all.
+
+    Each test therefore leaked about 13 descriptors. Measured on the rig, a full
+    run grew from 12 open descriptors to 1106, past the default 1024 soft limit,
+    and about 37 unrelated tests near the end failed with OSError: [Errno 24]
+    Too many open files. Each of them passes on its own, which is what made
+    exhaustion look like flakiness.
+
+    The releases have to be explicit. Measured on this interpreter:
+
+      Queue.close()                      frees 1 of the pipe's 2 descriptors
+      Queue._reader/_writer.close()      frees both
+      Manager.shutdown()                 frees 0
+      Manager.shutdown() + _process.close()  frees both
+
+    The remainder is left to garbage collection, which never runs here because
+    the AppModel graph stays reachable through process-global observers.
+
+    Cleanup failures are swallowed: this runs in fixture teardown, where raising
+    would replace the real test result with a teardown error.
+    """
+    message_queue = getattr(app, "_multiproc_msg_queue", None)
+    thread = getattr(app, "_handle_proc_msg_thread", None)
+    if message_queue is not None and thread is not None and thread.is_alive():
+        # The thread blocks in queue.get(). Closing the read end underneath it
+        # raises EOFError, which pytest reports as an unhandled thread
+        # exception, so send the same sentinel on_close() uses and let it
+        # finish first.
+        try:
+            message_queue.put(None)
+            thread.join(5)
+        except Exception:
+            pass
+        if thread.is_alive():
+            # Still blocked. Leave this one open rather than trade two
+            # descriptors for a spurious warning on every test.
+            message_queue = None
+
+    queues = [
+        message_queue,
+        getattr(app, "_stim_direct_trigger_queue", None),
+    ]
+    for camera in getattr(app, "_cameras", None) or ():
+        queues.append(getattr(camera, "_video_command_queue", None))
+
+    for mp_queue in queues:
+        if mp_queue is None:
+            continue
+        try:
+            # A feeder thread can hold a queue open indefinitely when a test
+            # left an unflushed item in it, so do not wait for it.
+            mp_queue.cancel_join_thread()
+        except Exception:
+            pass
+        for attribute in ("_reader", "_writer"):
+            connection = getattr(mp_queue, attribute, None)
+            if connection is None:
+                continue
+            try:
+                connection.close()
+            except Exception:
+                pass
+        try:
+            mp_queue.close()
+        except Exception:
+            pass
+
+    manager = getattr(app, "_mp_manager", None)
+    if manager is None:
+        return
+    try:
+        manager.shutdown()
+    except Exception:
+        pass
+    process = getattr(manager, "_process", None)
+    if process is not None:
+        try:
+            process.join(5)
+            process.close()
+        except Exception:
+            pass
+
+
 @pytest.fixture
 def mock_get_perf_now(monkeypatch):
     global fake_perf_now

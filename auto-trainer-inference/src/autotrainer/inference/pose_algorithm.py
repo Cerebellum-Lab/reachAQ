@@ -220,6 +220,17 @@ class PoseAlgorithm:
             [self._measure_offset_parts, axis_labels],
             names=self._3d_names,
         )
+        # MultiIndex.from_product sorts its levels, and the original pandas
+        # path iterated `columns.levels[0]`. Triangulation input order depends
+        # on it, so cache that ordering rather than reproducing the sort per
+        # live batch.
+        self._measure_offset_level_parts = list(
+            self._measure_offset_parts_columns.levels[0]
+        )
+        self._measure_offset_level_order = [
+            self._measure_offset_parts.index(part)
+            for part in self._measure_offset_level_parts
+        ]
         self._3d_axis_labels = ("x", "y", "z", "p")
         self._columns_3d = pandas.MultiIndex.from_product(
             [self._measure_offset_parts, self._3d_axis_labels],
@@ -330,6 +341,39 @@ class PoseAlgorithm:
                 df_res.loc[idx, elem] = vals
         return df_res
 
+    def _select_most_likely_2d(self, per_cam_detection):
+        """Pick the most likely frame per part across cameras.
+
+        Args:
+            per_cam_detection: one array per camera, each shaped
+                (frames_per_camera, len(self._measure_offset_parts), 3) with the
+                last axis holding x, y, likelihood.
+
+        Returns:
+            A (camera_count, part_count, 3) float array holding each camera's
+            values at the winning frame for every part, and a (part_count,)
+            boolean mask of parts every camera saw confidently.
+        """
+        cams = numpy.asarray(per_cam_detection, dtype=float)
+        camera_count, frames_per_cam, part_count, _ = cams.shape
+        # Sum likelihood across cameras so a part is judged on joint evidence.
+        combined = cams[:, :, :, 2].sum(axis=0)  # (frames, parts)
+        # argmax returns the first maximum; reverse the frame axis so ties
+        # resolve to the most recent frame, as the pandas version did.
+        best_frame = frames_per_cam - 1 - numpy.argmax(combined[::-1], axis=0)
+        parts = numpy.arange(part_count)
+        selected = cams[:, best_frame, parts, :]  # (cams, parts, 3)
+        best_score = combined[best_frame, parts]
+        min_combined_score = camera_count * self.MIN_CONFIDENCE_PRESENT_THRESHOLD
+        below = best_score < min_combined_score
+        if below.any():
+            selected[:, below, 0:2] = numpy.nan
+            selected[:, below, 2] = 0
+        confident_mask = (
+            selected[:, :, 2] >= self.MIN_CONFIDENCE_PRESENT_THRESHOLD
+        ).all(axis=0)
+        return selected, confident_mask
+
     def _handle_3d_triangulate(
         self,
         *per_cam_detection: numpy.ndarray
@@ -346,22 +390,32 @@ class PoseAlgorithm:
         min_cluster = 10  # maximum allowed interpolation
         # not sure min_cluster change anything for when nbr frames == 1 (per cam)
         #
-        frames_per_cam = len(per_cam_detection[0])
-        #
-        # reshape then sort by confidence/likelihood and takes most likely:
-        columns = self._measure_offset_parts_columns
-        df0_2d = pandas.DataFrame(per_cam_detection[0].reshape(frames_per_cam, -1), columns=columns)
-        df1_2d = pandas.DataFrame(per_cam_detection[1].reshape(frames_per_cam, -1), columns=columns)
-        #
-        df_2d = self._take_cams_most_likely(df0_2d, df1_2d)
+        # Select the most likely frame per part and build only the confident
+        # subset as a DataFrame. The vote itself is numpy: the previous pandas
+        # implementation cost a scalar .loc read and write per part per camera
+        # on every live batch.
+        selected, confident_mask = self._select_most_likely_2d(per_cam_detection[:2])
         confident_parts = [
             part
-            for part in df_2d.columns.levels[0]
-            if all(df_2d[part]["likelihood"] >= self.MIN_CONFIDENCE_PRESENT_THRESHOLD)
+            for part, column in zip(
+                self._measure_offset_level_parts, self._measure_offset_level_order
+            )
+            if confident_mask[column]
         ]
-        confident_df = df_2d[confident_parts]
         if len(confident_parts) == 0:
             return self._empty_3d, self._empty_3d
+        confident_columns = pandas.MultiIndex.from_product(
+            [confident_parts, self._2d_axis_labels], names=self._3d_names,
+        )
+        confident_order = [
+            column
+            for column in self._measure_offset_level_order
+            if confident_mask[column]
+        ]
+        confident_df = pandas.DataFrame(
+            selected[:, confident_order, :].reshape(len(selected), -1),
+            columns=confident_columns,
+        )
         # df_2d = interpolate_coordinates(df_2d, p_thresh)  # not required probably
         raw_df_3d = triangulate_3d_with_params(
             # [df_2d.iloc[0:1][confident_parts], df_2d.iloc[1:2]],

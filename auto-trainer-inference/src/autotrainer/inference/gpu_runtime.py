@@ -190,6 +190,50 @@ def _detect_tensorflow_gpu() -> GpuRuntimeStatus:
     return GpuRuntimeStatus(bool(devices), backend="tensorflow", devices=devices, error=error)
 
 
+_CUDNN_PROBE_SOURCE = (
+    "import torch\n"
+    "import torch.nn as nn\n"
+    "with torch.no_grad():\n"
+    "    probe = torch.randn(1, 8, 16, 16, device='cuda')\n"
+    "    nn.Conv2d(8, 8, 3, padding=1).to('cuda')(probe)\n"
+    "torch.cuda.synchronize()\n"
+)
+
+_CUDNN_PROBE_TIMEOUT_SECONDS = 120
+
+
+def _probe_torch_cudnn() -> Optional[str]:
+    """Run one convolution in a subprocess. Returns an error string, or None.
+
+    This cannot be done in-process. A cuDNN that fails to load does not raise:
+    it prints to stderr and aborts the interpreter, so a try/except around the
+    convolution would take the caller down with it. Running it in a subprocess
+    turns that abort into a non-zero return code we can report.
+
+    The cost is one interpreter start plus a torch import, which is acceptable
+    for a preflight that already pays for a framework import.
+    """
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", _CUDNN_PROBE_SOURCE],
+            capture_output=True,
+            text=True,
+            timeout=_CUDNN_PROBE_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return f"cuDNN probe timed out after {_CUDNN_PROBE_TIMEOUT_SECONDS} seconds"
+    except OSError as exc:
+        return f"cuDNN probe could not start: {exc}"
+    if completed.returncode == 0:
+        return None
+    detail = (completed.stderr or completed.stdout or "").strip()
+    # A signal shows as a negative return code; a core dump from cuDNN's loader
+    # lands here rather than as an exception.
+    first_line = detail.splitlines()[0] if detail else f"exit code {completed.returncode}"
+    return first_line[:400]
+
+
 def _detect_torch_cuda() -> GpuRuntimeStatus:
     try:
         import torch
@@ -201,4 +245,18 @@ def _detect_torch_cuda() -> GpuRuntimeStatus:
         devices = tuple(torch.cuda.get_device_name(idx) for idx in range(torch.cuda.device_count()))
     except Exception as exc:
         return GpuRuntimeStatus(False, backend="torch", error=str(exc))
+
+    # A visible device is not a working one. torch.cuda.is_available() checks the
+    # driver and CUDA runtime only; on this fleet cuDNN can be unloadable while
+    # it still returns True, because nvidia-cudnn-cu11 and nvidia-cudnn-cu12
+    # both install libcudnn.so.8 and whichever lands last wins. Inference needs
+    # convolutions, so verify one actually runs.
+    cudnn_error = _probe_torch_cudnn()
+    if cudnn_error is not None:
+        return GpuRuntimeStatus(
+            False,
+            backend="torch",
+            devices=devices,
+            error=f"CUDA is present but cuDNN cannot run a convolution: {cudnn_error}",
+        )
     return GpuRuntimeStatus(True, backend="torch", devices=devices)

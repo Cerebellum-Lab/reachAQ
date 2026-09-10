@@ -20,6 +20,7 @@ Complete only the hardware categories present on the target rig.
 | 3c | Pellet CAN | [PEAK SocketCAN guide](docs/linux-install/peak-socketcan.md) |
 | 3d | Live inference | [NVIDIA/TensorFlow guide](docs/linux-install/nvidia-inference.md) |
 | 3e | SoftMouse/RFID | [SoftMouse/RFID guide](tools/softmouse_sync/CONFIGURATION_GUIDE.md) |
+| 3f | Closed-loop stim timing | [Latency tuning guide](docs/linux-install/latency-tuning.md) |
 | 4 | Rig configuration and launch | [Runtime guide](docs/linux-install/runtime-configuration.md) |
 
 The portable installer does **not** install FLIR, NI, PEAK out-of-tree, or
@@ -85,6 +86,14 @@ kernel driver or install a system-wide CUDA toolkit.
 - If the installer adds the operator to `dialout`, log out and back in before
   using the RFID reader, then rerun the installer to verify the active login's
   serial permissions.
+- The same applies to the `reachaq-rt` group used for closed-loop stim timing:
+  `rtprio` limits are applied at login, so log out and back in before the stim
+  loop can request real-time priority. Until then it runs at normal priority
+  and logs a warning; acquisition is unaffected. See the
+  [latency tuning guide](docs/linux-install/latency-tuning.md).
+- The installer enables `reachaq-cpu-governor.service`, which sets the
+  `performance` CPU governor at boot. This is the one systemd unit the
+  installer enables; `reachaq-can.service` remains a separate reviewed step.
 - The report separately verifies SoftMouse imports/keyring availability, RFID
   imports/device permissions, and the tracked nightly systemd units.
 - The generic import check verifies module file paths against the current

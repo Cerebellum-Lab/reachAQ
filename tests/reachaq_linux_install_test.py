@@ -50,6 +50,45 @@ def test_portable_installer_always_attempts_complete_workflow():
     assert "grep -q 'git lfs pre-push'" in source
 
 
+def test_portable_installer_configures_closed_loop_latency():
+    """Both settings have to reach every rig, not just the one they were tuned on.
+
+    Measured at 900 Hz under CPU load: without the rtprio allowance the stim
+    loop's worst case is 6.05 ms against a 5 ms budget; with SCHED_FIFO it is
+    0.155 ms. The governor is worth p50 12.55 -> 10.79 ms on live pose
+    inference, and a runtime setting does not survive a reboot.
+    """
+    source = INSTALL_SCRIPT.read_text()
+
+    assert 'begin_category "Closed-loop latency tuning"' in source
+    assert 'run_step "Grant real-time priority to the stim loop"' in source
+    assert 'run_step "Install CPU governor unit"' in source
+    assert "/etc/security/limits.d/90-reachaq-rtprio.conf" in source
+    assert "rtprio   80" in source, "priority must stay below the kernel's own RT threads"
+
+
+def test_cpu_governor_unit_is_tracked_and_installable():
+    unit = REPO_ROOT / "tools" / "hardware" / "reachaq-cpu-governor.service"
+    assert unit.is_file()
+    text = unit.read_text()
+
+    assert "performance" in text
+    assert "WantedBy=multi-user.target" in text
+    # oneshot + RemainAfterExit, or systemd treats the unit as dead immediately
+    # and "systemctl status" reports inactive on a working machine.
+    assert "Type=oneshot" in text
+    assert "RemainAfterExit=yes" in text
+    # Driven through sysfs so it does not depend on the versioned linux-tools
+    # package matching the running kernel. Checked on the command lines rather
+    # than the whole file, which explains that choice in a comment.
+    commands = [line for line in text.splitlines() if line.startswith("Exec")]
+    assert commands, "no Exec lines"
+    assert all("scaling_governor" in line for line in commands)
+    assert not any("cpupower" in line for line in commands)
+    # Stopping the unit has to hand the machine back to the distro default.
+    assert any(line.startswith("ExecStop") and "powersave" in line for line in commands)
+
+
 def test_portable_installer_covers_softmouse_rfid_requirements():
     source = INSTALL_SCRIPT.read_text()
 
