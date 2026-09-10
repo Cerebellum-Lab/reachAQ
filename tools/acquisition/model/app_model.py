@@ -84,6 +84,7 @@ from autotrainer.inference import (
 from autotrainer.inference.backend_selection import (
     confidence_threshold,
     selected_backend,
+    trained_model_name,
 )
 from autotrainer.inference.analysis import IntersessionResponse
 from autotrainer.inference.config import load_calib_stereo_params
@@ -1840,18 +1841,27 @@ class AppModel(ObservableObject):
             cam_offsets = None
             logger.warning("calib_src_dir=%r does not exist", calib_src_dir.as_posix())
 
+        inference = self._inference
         pose_algo = PoseAlgorithm(
             stereo_params=stereo_params,
             calib_metadata=calib_metadata,
             cam_names=cam_names,
             square_size=square_size,
             cam_offsets=cam_offsets,
-            # Per backend: the TensorFlow engine saturates its likelihood at
-            # 1.0 while the PyTorch engine reports a real distribution, so a
-            # single constant cannot gate both.
-            confidence_threshold=confidence_threshold(selected_backend()),
+            # Per backend, then per model. The TensorFlow engine saturates
+            # its likelihood at 1.0 while the PyTorch engine reports a real
+            # distribution, so a single constant cannot gate both - and the
+            # PyTorch scale differs by backbone too: a cspnext_s never
+            # scores above 0.33, so the backend default of 0.6 would hold
+            # rh_grab_seen permanently False. An unmeasured backbone, or a
+            # project this cannot read, falls back to the backend default.
+            confidence_threshold=confidence_threshold(
+                selected_backend(),
+                model_name=trained_model_name(
+                    inference.model_location if inference is not None else None
+                ),
+            ),
         )
-        inference = self._inference
         if inference is not None:
             pose_algo.initialize(inference.pose_parts)
             inference.pose_algorithm = pose_algo

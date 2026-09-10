@@ -15,8 +15,11 @@ passed straight to detect_gpu_runtime(required_backend=...). That coupling is
 what stops a rig from checking TensorFlow's CUDA while running PyTorch.
 """
 
+import glob
 import os
 import typing
+
+import yaml
 
 from autotrainer.core.logging import get_verbose_logger
 
@@ -61,6 +64,37 @@ DEFAULT_CONFIDENCE_THRESHOLDS = {
     TORCH_BACKEND: 0.6,
 }
 
+# Refinements of the per-backend default for the models whose scale has been
+# measured on held-out frames. The per-backend figures above were taken on 24
+# frames that were in the training set of both models: fair for comparing the
+# engines, but not a calibration of either.
+#
+# Re-measured on the 19 held-out frames of the curated project, every labelled
+# keypoint scored against its label:
+#
+#   gate   resnet_50 pass / median   cspnext_s pass / median   cspnext RH_grab
+#   0.10        97.5% / 1.56 px           93.4% / 3.73 px            97%
+#   0.15        96.7% / 1.55 px           78.5% / 3.57 px            83%
+#   0.30        90.1% / 1.46 px           27.3% / 2.99 px            17%
+#   0.60        76.0% / 1.30 px            1.7% / 1.30 px             0%
+#
+# cspnext_s never scores above 0.33, so 0.6 discards 98% of its output and
+# holds rh_grab_seen permanently False - and that flag is what a pose-driven
+# reach gate is built on. 0.1 keeps 93% of keypoints at 3.7 px and detects
+# RH_grab in 97% of the frames where it is labelled.
+#
+# resnet_50 moves to 0.3 for the same reason, less dramatically: 0.6 drops 42%
+# of the RH_grab detections that 0.3 keeps at 1.46 px. This is safe to change
+# because the PyTorch engine has no deployment history - the TensorFlow default
+# is what deployed rigs run, and it is untouched.
+#
+# Keyed by the backbone name DeepLabCut records in the trained shuffle's
+# pytorch_config.yaml, which is what trained_model_name() reads.
+TORCH_MODEL_CONFIDENCE_THRESHOLDS = {
+    "resnet_50": 0.3,
+    "cspnext_s": 0.1,
+}
+
 _MIN_CONFIDENCE_THRESHOLD = 0.0
 _MAX_CONFIDENCE_THRESHOLD = 1.0
 
@@ -101,18 +135,77 @@ def selected_backend(environ: typing.Optional[typing.Mapping[str, str]] = None) 
     return backend
 
 
+def trained_model_name(
+    model_path: typing.Optional[str],
+    shuffle_index: typing.Optional[int] = None,
+) -> typing.Optional[str]:
+    """
+    Return the backbone name of the project's trained PyTorch model, or None.
+
+    Read off the filesystem rather than through DeepLabCut, for the same reason
+    as DlcTorchPoseModel.has_trained_snapshot: this is called while deciding a
+    threshold, and importing torch to answer it would be absurd.
+
+    None whenever the answer is not unambiguous - no project, no trained
+    shuffle, an unreadable config, or several trained shuffles that disagree
+    about the backbone. The caller falls back to the per-backend default, which
+    is the conservative direction: an unmeasured model keeps the threshold it
+    has today rather than silently inheriting another model's calibration.
+    """
+    if not model_path:
+        return None
+
+    wanted = "*" if shuffle_index is None else str(shuffle_index)
+    pattern = os.path.join(
+        model_path, "dlc-models-pytorch", "*", f"*shuffle{wanted}", "train",
+    )
+    found = set()
+    for train_folder in sorted(glob.glob(pattern)):
+        # A config without a snapshot is not a model that could be loaded.
+        if not glob.glob(os.path.join(train_folder, "snapshot-*.pt")):
+            continue
+        configuration_path = os.path.join(train_folder, "pytorch_config.yaml")
+        try:
+            with open(configuration_path) as handle:
+                configuration = yaml.safe_load(handle) or {}
+        except (OSError, yaml.YAMLError) as err:
+            logger.debug("cannot read %r: %s", configuration_path, err)
+            continue
+        name = (configuration.get("model", {})
+                .get("backbone", {})
+                .get("model_name"))
+        if name:
+            found.add(str(name))
+
+    if len(found) == 1:
+        return found.pop()
+    if found:
+        logger.warning(
+            "%r has trained shuffles with differing backbones (%s); using the "
+            "per-backend confidence default",
+            model_path, ", ".join(sorted(found)),
+        )
+    return None
+
+
 def confidence_threshold(
     backend: typing.Optional[str] = None,
     environ: typing.Optional[typing.Mapping[str, str]] = None,
+    *,
+    model_name: typing.Optional[str] = None,
 ) -> float:
     """
     Return the confidence a keypoint needs to count as present.
 
     Defaults per backend, because the two engines report on different scales;
-    see DEFAULT_CONFIDENCE_THRESHOLDS for the measurements. Overridable, because
-    the scale is really a property of the trained model rather than the engine,
-    so a different net_type or a retrain can move it and the default would go
-    quietly stale.
+    see DEFAULT_CONFIDENCE_THRESHOLDS for the measurements. Refined per model
+    when the backbone has been measured, because the scale belongs to the
+    trained model rather than the engine: cspnext_s never scores above 0.33, so
+    the backend default of 0.6 would reject 98% of its keypoints. See
+    TORCH_MODEL_CONFIDENCE_THRESHOLDS.
+
+    model_name is keyword-only because environ is the second positional
+    argument in the existing call sites.
 
     Never raises. An unusable value falls back to the backend default with a
     warning: refusing to start over a malformed number would be worse, and
@@ -122,6 +215,19 @@ def confidence_threshold(
     default = DEFAULT_CONFIDENCE_THRESHOLDS.get(
         backend, DEFAULT_CONFIDENCE_THRESHOLDS[DEFAULT_POSE_BACKEND]
     )
+
+    # Only the PyTorch engine: these were measured under it, and TensorFlow's
+    # likelihood is a saturated constant that no per-model figure describes.
+    if backend == TORCH_BACKEND and model_name:
+        measured = TORCH_MODEL_CONFIDENCE_THRESHOLDS.get(model_name)
+        if measured is None:
+            logger.info("no measured confidence threshold for %r; using the %s "
+                        "default of %.2f", model_name, backend, default)
+        else:
+            logger.info("%r uses its measured confidence threshold of %.2f "
+                        "rather than the %s default of %.2f",
+                        model_name, measured, backend, default)
+            default = measured
 
     source = os.environ if environ is None else environ
     raw = source.get(POSE_CONFIDENCE_THRESHOLD_ENV_VAR)
