@@ -75,6 +75,9 @@ class DlcTorchPoseModel(PoseModel):
         self._model_configuration = None
         self._runner = None
         self._body_parts_count = 1
+        # Top-down nets crop to a detected box before estimating pose,
+        # so predict() has to supply one. Set by load().
+        self._top_down = False
 
         self._fast_path_enabled = False
         self._fast_shape = None
@@ -196,9 +199,14 @@ class DlcTorchPoseModel(PoseModel):
                 f"The dataset for shuffle {self._shuffle_index} has not been trained or does not exist.\n Please "
                 f"train it before using it to analyze videos.")
 
+        # "detector" is excluded as well as "best": a top-down net writes
+        # snapshot-detector-<epoch>.pt beside the pose snapshot, and
+        # epoch_of would read its trailing number, so a detector trained
+        # longer than the pose model would sort above it and be selected.
         snapshots = [
             name for name in entries
-            if name.startswith("snapshot-") and name.endswith(".pt") and "best" not in name
+            if name.startswith("snapshot-") and name.endswith(".pt")
+            and "best" not in name and "detector" not in name
         ]
         if not snapshots:
             raise FileNotFoundError(
@@ -274,6 +282,7 @@ class DlcTorchPoseModel(PoseModel):
 
         with open(model_configuration_path) as handle:
             self._model_configuration = yaml.safe_load(handle) or {}
+        self._top_down = self._model_configuration.get("method") == "td"
         reason = self._fast_path_reason()
         self._fast_path_enabled = reason is None
         if self._fast_path_enabled:
@@ -396,7 +405,18 @@ class DlcTorchPoseModel(PoseModel):
 
         # The runner takes a sequence of individual frames rather than a stacked
         # array, and batches them internally up to batch_size.
-        results = self._runner.inference(images=list(frames))
+        images = list(frames)
+        if self._top_down:
+            # A full-frame box, not the trained detector. These frames are
+            # already the ROI the camera is cropped to and hold one animal,
+            # so the box is the identity crop; running the detector would
+            # add its latency and its failure modes to the closed loop.
+            images = [
+                (frame, {"bboxes": numpy.array(
+                    [[0, 0, frame.shape[1], frame.shape[0]]], dtype=float)})
+                for frame in images
+            ]
+        results = self._runner.inference(images=images)
 
         # reshape rather than squeeze: squeeze would also collapse the body part
         # axis for a single-keypoint project.
