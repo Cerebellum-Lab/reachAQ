@@ -165,7 +165,12 @@ class PoseAlgorithm:
     The PoseResponse returned by the PoseAlgorithm captures the interpreted values (e.g., "mouse seen" which may be
     some function of multiple parts being present and/or at different confidence levels).
     """
-    # TODO Configurable properties
+    # Calibrated for the DeepLabCut TensorFlow engine, whose likelihood is a
+    # saturated 1.0, so these have never rejected anything on that engine. The
+    # PyTorch engine reports a real distribution around 0.77 and would lose
+    # ~92% of keypoints at 0.9, so the effective value is injected per backend
+    # by whoever constructs this. These remain the fallback.
+    # See autotrainer.inference.backend_selection.confidence_threshold.
     MIN_CONFIDENCE_PLOT_THRESHOLD = 0.9
     MIN_CONFIDENCE_PRESENT_THRESHOLD = 0.9
 
@@ -180,8 +185,21 @@ class PoseAlgorithm:
         cam_names: Optional[List[str]] = None,
         square_size: Optional[int] = None,
         cam_offsets: Optional[List[float]] = None,
+        confidence_threshold: Optional[float] = None,
     ):
         super().__init__()
+        # None keeps the class defaults, so every existing caller and test is
+        # unaffected and only a backend-aware caller changes behaviour.
+        self._present_threshold = (
+            self.MIN_CONFIDENCE_PRESENT_THRESHOLD
+            if confidence_threshold is None
+            else float(confidence_threshold)
+        )
+        self._plot_threshold = (
+            self.MIN_CONFIDENCE_PLOT_THRESHOLD
+            if confidence_threshold is None
+            else float(confidence_threshold)
+        )
         self._parts_list: List[str] = []
         self._parts: Dict[str, int] = {}  # key is part name, value is part model index
         self._sequence = 0
@@ -327,7 +345,7 @@ class PoseAlgorithm:
         # create a df_res with len(dfs) entries with all NaNs :
         no_result = (math.nan, math.nan, 0)  # x, y, p
         df_res = pandas.DataFrame(index=list(range(len(dfs))), columns=self._measure_offset_parts_columns)
-        min_combined_score = len(dfs) * self.MIN_CONFIDENCE_PRESENT_THRESHOLD
+        min_combined_score = len(dfs) * self._present_threshold
         for elem in df0.columns.levels[0]:
             combined = [
                 (idx, self._combine_frames_likelihood(frames.loc[idx, elem] for frames in dfs))
@@ -364,13 +382,13 @@ class PoseAlgorithm:
         parts = numpy.arange(part_count)
         selected = cams[:, best_frame, parts, :]  # (cams, parts, 3)
         best_score = combined[best_frame, parts]
-        min_combined_score = camera_count * self.MIN_CONFIDENCE_PRESENT_THRESHOLD
+        min_combined_score = camera_count * self._present_threshold
         below = best_score < min_combined_score
         if below.any():
             selected[:, below, 0:2] = numpy.nan
             selected[:, below, 2] = 0
         confident_mask = (
-            selected[:, :, 2] >= self.MIN_CONFIDENCE_PRESENT_THRESHOLD
+            selected[:, :, 2] >= self._present_threshold
         ).all(axis=0)
         return selected, confident_mask
 
@@ -386,7 +404,7 @@ class PoseAlgorithm:
         if len(per_cam_detection) < 2:
             warnings.warn("at least two cameras are required for 3d-triangulate", UserWarning, stacklevel=3)
             return self._empty_3d, self._empty_3d
-        p_thresh = 0.9  # confidence threshold for DLC raw output
+        p_thresh = self._present_threshold  # per-backend; see backend_selection
         min_cluster = 10  # maximum allowed interpolation
         # not sure min_cluster change anything for when nbr frames == 1 (per cam)
         #
@@ -504,7 +522,7 @@ class PoseAlgorithm:
             for idx, part in enumerate(self._parts_list):
                 seen_by_all = True
                 for cam_idx, pose in enumerate(poses):
-                    if pose[idx, 2] >= PoseAlgorithm.MIN_CONFIDENCE_PRESENT_THRESHOLD:
+                    if pose[idx, 2] >= self._present_threshold:
                         parts_flags_by_cam[cam_idx][part] = True
                     else:
                         seen_by_all = False
@@ -555,7 +573,7 @@ class PoseAlgorithm:
                     # else:
                     # but if want uses most likelihood, then:
                     val = raw[elem].sort_values(by="likelihood", ascending=False).reset_index().iloc[0]
-                    if val['likelihood'] >= self.MIN_CONFIDENCE_PRESENT_THRESHOLD:
+                    if val['likelihood'] >= self._present_threshold:
                         locations_by_cam[cam_idx][elem] = PoseLocation(-1, *val[_xy_col_names])
         #
         locations_3d = {}
@@ -573,7 +591,7 @@ class PoseAlgorithm:
         for part in df_3d.columns.levels[0]:
             p_3d = df_3d_row[part]
             r_p_3d = raw_df_3d_row[part]
-            if r_p_3d["p"] >= self.MIN_CONFIDENCE_PRESENT_THRESHOLD:
+            if r_p_3d["p"] >= self._present_threshold:
                 raw_3d_loc[part] = Offset3DTuple(r_p_3d[0:3])
                 locations_3d[part] = Offset3DTuple(p_3d[0:3])  # 3 first columns (x, y, z)
         #
@@ -603,7 +621,7 @@ class PoseAlgorithm:
         locations: Dict[str, PoseLocation] = {}
         for pose in frames:
             for idx, part in enumerate(self._parts_list):
-                if pose[idx, 2] >= PoseAlgorithm.MIN_CONFIDENCE_PLOT_THRESHOLD:
+                if pose[idx, 2] >= self._plot_threshold:
                     locations[part] = PoseLocation(idx, pose[idx, 0], pose[idx, 1])
         return locations
 

@@ -196,6 +196,7 @@ bump past 57 is acceptable.
 |---|---|---|
 | `REACHAQ_STIM_RT_PRIORITY` | `80` | SCHED_FIFO priority for the stim capture loop. `0`, `off` or `false` disables it. See the [latency tuning guide](latency-tuning.md). |
 | `REACHAQ_POSE_BACKEND` | `tensorflow` | Selects the DeepLabCut engine: `tensorflow` or `torch`. Also selects which GPU runtime the live-inference preflight probes, so the two cannot disagree. |
+| `REACHAQ_POSE_CONFIDENCE_THRESHOLD` | per backend | Confidence a keypoint needs to count as present and to enter 3D triangulation. Defaults to 0.9 for `tensorflow` and 0.6 for `torch`, because the engines report on different scales: TensorFlow saturates its likelihood at 1.0 while PyTorch reports a real distribution around 0.77. The PyTorch default is provisional and should be re-derived on held-out frames. |
 | `REACHAQ_INFERENCE_ROI` | unset | `x,y,width,height`. Crops live frames to this window before inference and shifts the returned coordinates back into full-frame space. Unset means full frame. |
 
 `REACHAQ_POSE_BACKEND=torch` requires a shuffle trained with the PyTorch

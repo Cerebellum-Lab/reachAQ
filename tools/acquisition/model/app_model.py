@@ -81,6 +81,10 @@ from autotrainer.inference import (
     calibration_FLIR,
     DlcPoseModel,
 )
+from autotrainer.inference.backend_selection import (
+    confidence_threshold,
+    selected_backend,
+)
 from autotrainer.inference.analysis import IntersessionResponse
 from autotrainer.inference.config import load_calib_stereo_params
 from autotrainer.inference.analysis.prepare_jetson_data import DEFAULT_CAM_OFFSET_FILE_NAME
@@ -1842,6 +1846,10 @@ class AppModel(ObservableObject):
             cam_names=cam_names,
             square_size=square_size,
             cam_offsets=cam_offsets,
+            # Per backend: the TensorFlow engine saturates its likelihood at
+            # 1.0 while the PyTorch engine reports a real distribution, so a
+            # single constant cannot gate both.
+            confidence_threshold=confidence_threshold(selected_backend()),
         )
         inference = self._inference
         if inference is not None:
