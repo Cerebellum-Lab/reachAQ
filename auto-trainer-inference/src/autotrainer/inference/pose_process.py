@@ -318,6 +318,13 @@ class PoseProcess(Process):
         # loaded model serves both spatial sizes. Coordinates come back in
         # full-frame space either way, which is what calibration expects.
         live_model = maybe_crop(self._pose_model, input_q.shape)
+        # A backend that batches internally is given only the real frames.
+        # The padding exists for the TensorFlow graph's fixed batch dimension;
+        # feeding it to a backend that does not need it costs batch-six
+        # compute to produce batch-two output.
+        live_predict_input = (
+            frame_buffer1 if live_model.supports_partial_batch else predict_buffer
+        )
         live_predict = live_model.predict
         offline_predict = self._pose_model.predict
         if live_model is not self._pose_model:
@@ -430,8 +437,10 @@ class PoseProcess(Process):
             # only predict for not fully incomplete frames buffer:
             if (frames_indices >= FrameIndexCategory.ONLINE_NO_RECORDING).any():
                 if i_q is live_input:
-                    # Only the leading rows hold real frames; the rest is padding.
-                    pose = live_predict(predict_buffer)[:live_batch_size]
+                    # Either the real frames alone, or the padded buffer when the
+                    # backend needs a fixed batch. The slice is a no-op in the
+                    # first case and drops the padding rows in the second.
+                    pose = live_predict(live_predict_input)[:live_batch_size]
                 else:
                     pose = offline_predict(frame_buffer)
             else:
