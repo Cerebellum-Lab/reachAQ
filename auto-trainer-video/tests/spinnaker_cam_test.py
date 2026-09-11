@@ -1,5 +1,7 @@
-import PySpin
 import pytest
+
+# PySpin is the FLIR Spinnaker SDK: a vendor wheel that is not on PyPI and is not installed in every environment this suite runs in. Skipping is honest - the test genuinely cannot run - and matches the importorskip already used for other optional dependencies in this suite. It is not a statement that Spinnaker is optional on a rig, where it is required.
+PySpin = pytest.importorskip("PySpin")
 
 from autotrainer.video.camera import spinnaker_cam
 from autotrainer.video.camera.camera_base import CameraBase

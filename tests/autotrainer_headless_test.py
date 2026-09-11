@@ -261,6 +261,9 @@ def test_spinnaker_camera_selectors_keep_only_their_configured_binding(
     trainer_config_dir,
     system_config,
 ):
+    # Binding a spinnaker:// camera resolves the camera class, which imports
+    # the SDK. See the note in spinnaker_cam_test.py.
+    pytest.importorskip("PySpin")
     serials = {
         CameraId.Left: "24095781",
         CameraId.Right: "24095782",
