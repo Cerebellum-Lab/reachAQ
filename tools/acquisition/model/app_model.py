@@ -6524,11 +6524,30 @@ class AppModel(ObservableObject):
                     )
             if inference_error is None:
                 self._inference_queue = FixedArrayMultiQueue(
-                    # live queue does not need/require a lot of "depth" == total nbr of batches that can sit
-                    # in the ring-buffer-queue at the same time.
-                    # Now only using a "depth" of 1 frame batches,
-                    # this should makes less delay / be more reactive in live inference results,
-                    1,
+                    # Depth 2, with PoseProcess draining to the newest batch.
+                    #
+                    # Depth 1 looked like the low-latency choice and is not.
+                    # get_output frees the slot as soon as it has copied the
+                    # frame out, at the start of predict, so the producer
+                    # refills it immediately and then has nowhere to put
+                    # anything else; the batch waiting at the next call is
+                    # already a predict-period old. Measured on the rig at
+                    # 150 fps, cspnext_m went 17.637 ms p50 / 22.185 p99 at
+                    # depth 1 to 13.854 / 17.611 at depth 2, and the share of
+                    # batches the capture loop could not hand over at all fell
+                    # from 35.2% to 0.7%. cspnext_s, which is faster than the
+                    # frame period and so never backs up, is unchanged:
+                    # 7.000 / 7.486 against 6.981 / 7.521.
+                    #
+                    # Not deeper than 2: at depth 4 the drain pays a full
+                    # frame copy and RGB expansion for each batch it skips,
+                    # and cspnext_s regressed to 10.167 / 13.330.
+                    #
+                    # None of this touches acquisition. The capture loop puts
+                    # with block=False and records on a separate queue, so a
+                    # slow pose process can never stall capture or cost a
+                    # recorded frame; what is skipped here is inference work.
+                    2,
                     len(inference_cameras),
                     # One frame per camera: the batch is released as soon as a frame
                     # arrives instead of accumulating three, which removes two frame
