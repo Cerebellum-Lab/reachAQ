@@ -1,16 +1,31 @@
-"""Precision must be chosen per GPU, never assumed.
+"""Precision must be chosen per GPU from measurement, never assumed.
 
-Measured on the rig's T1000: FP16 is 3-4x SLOWER than FP32, by two independent
-methods (a cuBLAS GEMM and a convolution stack). The T1000 uses the TU117 die,
-which omits tensor cores while still reporting compute capability 7.5 - so
-capability alone does not answer the question and the device name has to be
-consulted.
+Two separate traps, and the second was found by taking the first too far.
+
+The T1000 uses the TU117 die, which omits tensor cores while still reporting
+compute capability 7.5, and FP16 there is 3-4x SLOWER than FP32 - measured
+twice, by a cuBLAS GEMM and by a convolution stack. So capability alone cannot
+answer the question and the device name has to be consulted.
+
+Having tensor cores then looked sufficient, and it is not. On an RTX 5060 Ti,
+which has them, FP16 measured 0.78-0.85x - slower - for cspnext_s and
+rtmpose_s at the live batch. That machine turned out to be launch-bound rather
+than compute-bound (batch 1 and batch 8 cost the same wall clock), so the
+result is really about WDDM launch overhead on Windows and says nothing about
+the same card on a Linux rig. Either way, no fleet card is yet measured faster
+in FP16 at the live workload, so the default is FP32 everywhere and
+MEASURED_FASTER_IN_FP16 is empty until a real measurement fills it.
 """
 
+import pytest
+
+from autotrainer.inference import gpu_capability
 from autotrainer.inference.gpu_capability import (
+    PRECISION_ENVIRONMENT_VARIABLE,
     TENSOR_CORE_EXCLUDED_DEVICES,
     GpuCapability,
     detect_gpu_capability,
+    resolve_precision,
 )
 
 
@@ -46,9 +61,69 @@ def test_precision_is_fp32_without_tensor_cores():
     assert _cap("NVIDIA T1000", 7, 5).preferred_precision == "fp32"
 
 
-def test_precision_is_fp16_with_tensor_cores():
+def test_tensor_cores_alone_do_not_select_fp16():
+    """The regression this guards: selecting FP16 from the architecture would
+    have made the 5060 Ti 15-22% slower at the live batch."""
+    assert _cap("NVIDIA RTX A2000", 8, 6).preferred_precision == "fp32"
+    assert _cap("NVIDIA GeForce RTX 5060 Ti", 12, 0).preferred_precision == "fp32"
+
+
+def test_nothing_is_measured_faster_in_fp16_yet():
+    """An entry here is a claim about a card, and needs a measurement from
+    that card on its production OS at the live batch and input size."""
+    assert gpu_capability.MEASURED_FASTER_IN_FP16 == frozenset()
+
+
+def test_a_measured_card_selects_fp16(monkeypatch):
+    monkeypatch.setattr(gpu_capability, "MEASURED_FASTER_IN_FP16",
+                        frozenset({"rtx a2000"}))
     assert _cap("NVIDIA RTX A2000", 8, 6).preferred_precision == "fp16"
-    assert _cap("NVIDIA GeForce RTX 5060 Ti", 12, 0).preferred_precision == "fp16"
+    assert _cap("NVIDIA GeForce RTX 5060 Ti", 12, 0).preferred_precision == "fp32"
+
+
+def test_a_measured_card_without_tensor_cores_still_gets_fp32():
+    """A mistaken entry must not be able to select FP16 on a card that
+    physically cannot do it quickly."""
+    import unittest.mock as mock
+
+    with mock.patch.object(gpu_capability, "MEASURED_FASTER_IN_FP16",
+                           frozenset({"t1000"})):
+        assert _cap("NVIDIA T1000", 7, 5).preferred_precision == "fp32"
+
+
+# --- the per-rig override ----------------------------------------------------
+
+
+def test_the_environment_overrides_the_card_default():
+    """How a rig gets benchmarked before it earns an entry."""
+    capability = _cap("NVIDIA T1000", 7, 5)
+    assert resolve_precision(
+        capability, {PRECISION_ENVIRONMENT_VARIABLE: "fp16"}) == "fp16"
+
+
+@pytest.mark.parametrize("value", ["FP16", " fp16 "])
+def test_the_override_is_case_and_space_insensitive(value):
+    assert resolve_precision(
+        _cap("NVIDIA T1000", 7, 5),
+        {PRECISION_ENVIRONMENT_VARIABLE: value}) == "fp16"
+
+
+@pytest.mark.parametrize("value", ["fp8", "half", "", "  "])
+def test_an_unusable_override_is_ignored_not_raised(value):
+    """A typo in a rig's environment must not stop inference from starting."""
+    assert resolve_precision(
+        _cap("NVIDIA T1000", 7, 5),
+        {PRECISION_ENVIRONMENT_VARIABLE: value}) == "fp32"
+
+
+def test_without_an_override_the_card_decides():
+    assert resolve_precision(_cap("NVIDIA T1000", 7, 5), {}) == "fp32"
+
+
+def test_without_a_card_at_all_it_is_fp32():
+    """Detection returns None when torch cannot see a GPU, and that must not
+    become an exception on the path that starts inference."""
+    assert resolve_precision(None, {}) == "fp32"
 
 
 def test_any_capability_from_maxwell_up_is_describable():
