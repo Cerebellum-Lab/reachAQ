@@ -143,6 +143,50 @@ class ReachStateConfiguration:
         return cls(source=source, max_age_ms=max_age_ms)
 
 
+class LiveTrackingReachProvider:
+    """Answer the cue gate's reach question from the most recent pose sample.
+
+    The criterion is that a hand has a 3D location in that sample. A hand only
+    gets one when both cameras saw it above the confidence gate and
+    triangulation succeeded, so "located" already carries "seen confidently by
+    the stereo pair" - it is not a bare presence flag.
+
+    A distance-to-pellet threshold would be a stronger criterion and is the
+    obvious next step, but what distance counts as a reach is a scientific
+    decision rather than one to invent here. When that is settled it belongs on
+    this class, where the gate already reads from.
+
+    None means unknown, never "not reaching": an empty buffer, a sample without
+    locations, or a buffer that raises are all absence of evidence, and the
+    resolver's staleness bound then applies to whatever this does return.
+    """
+
+    DEFAULT_HANDS = ("R_Hand", "L_Hand")
+
+    def __init__(self, live_tracking, *, hands=DEFAULT_HANDS):
+        self._live_tracking = live_tracking
+        self._hands = tuple(hands)
+
+    def __call__(self):
+        try:
+            sample = self._live_tracking.latest()
+        except Exception as err:
+            logger.warning("live tracking buffer failed: %s", err)
+            return None
+        if sample is None:
+            return None
+        try:
+            reaching = any(
+                sample.location(name) is not None for name in self._hands)
+            # The capture time, not the time the pose was computed: staleness is
+            # about how old the evidence is, not how long it took to produce.
+            observed_at = float(sample.source_perf)
+        except Exception as err:
+            logger.warning("live tracking sample is unusable: %s", err)
+            return None
+        return reaching, observed_at
+
+
 class ReachStateResolver:
     """
     Read reach state from the configured source, or report that it is unknown.
