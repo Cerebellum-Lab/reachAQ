@@ -31,7 +31,7 @@ import numpy
 
 from autotrainer.core.logging import get_verbose_logger
 
-from ..gpu_capability import detect_gpu_capability
+from ..gpu_capability import detect_gpu_capability, resolve_precision
 from ..pose_model import PoseModel
 
 logger = get_verbose_logger(__name__)
@@ -271,8 +271,7 @@ class DlcTorchPoseModel(PoseModel):
 
         capability = detect_gpu_capability()
         self._device = self._requested_device or ("cuda" if capability is not None else "cpu")
-        self._precision = self._requested_precision or (
-            capability.preferred_precision if capability is not None else "fp32")
+        self._precision = self._requested_precision or resolve_precision(capability)
 
         logger.notice("DeepLabCut PyTorch engine: snapshot=%s device=%s precision=%s batch=%s parts=%s",
                       os.path.basename(self._snapshot_path), self._device, self._precision,
@@ -386,7 +385,7 @@ class DlcTorchPoseModel(PoseModel):
         torch.div(staged.to(torch.float32), 255.0, out=self._fast_input)
         self._fast_input.sub_(self._fast_mean).div_(self._fast_std)
 
-        with torch.inference_mode():
+        with torch.inference_mode(), self._precision_context():
             raw = self._runner.predict(self._fast_input)
 
         part_count = self._body_parts_count
@@ -395,6 +394,23 @@ class DlcTorchPoseModel(PoseModel):
             block = numpy.asarray(item["bodypart"]["poses"], dtype="float")
             poses.append(block.reshape(-1, part_count, 3)[0])
         return poses
+
+    def _precision_context(self):
+        """Run the forward pass at the configured precision.
+
+        autocast rather than a half model: it keeps FP32 master weights and
+        FP32 reductions, and hands the decode back FP32 outputs, so selecting
+        fp16 changes speed without changing what the rest of the path sees.
+        At fp32 this is a null context, so the default path is exactly what it
+        was before precision was wired up.
+        """
+        import contextlib
+
+        import torch
+
+        if self._precision != "fp16" or not str(self._device).startswith("cuda"):
+            return contextlib.nullcontext()
+        return torch.autocast(device_type="cuda", dtype=torch.float16)
 
     def predict(self, frames) -> typing.List[numpy.ndarray]:
         if self._runner is None:
@@ -416,7 +432,8 @@ class DlcTorchPoseModel(PoseModel):
                     [[0, 0, frame.shape[1], frame.shape[0]]], dtype=float)})
                 for frame in images
             ]
-        results = self._runner.inference(images=images)
+        with self._precision_context():
+            results = self._runner.inference(images=images)
 
         # reshape rather than squeeze: squeeze would also collapse the body part
         # axis for a single-keypoint project.
