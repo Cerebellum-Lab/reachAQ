@@ -236,6 +236,11 @@ from tools.acquisition.model.intertrial_analysis import (
     analyze_tracking_window,
     classify_pellet_state,
 )
+from tools.acquisition.model.reach_state_source import (
+    LiveTrackingReachProvider,
+    ReachStateConfiguration,
+    ReachStateResolver,
+)
 from tools.acquisition.model.live_tracking_buffer import (
     FrameTimelineAnchor,
     LiveTrackingBuffer,
@@ -713,6 +718,15 @@ class AppModel(ObservableObject):
             profile.policy_id: profile
             for profile in profile_library.automatic_shift_profiles
         }
+        self._live_tracking = LiveTrackingBuffer()
+        # Tone 2's reach gate, answered from live pose. The resolver has always
+        # taken this provider and nothing supplied one, so selecting
+        # live_tracking as the source reported "unknown" forever. The buffer is
+        # built first because the executor reads reach state through it.
+        self._reach_state_resolver = ReachStateResolver(
+            ReachStateConfiguration.from_environment(),
+            live_tracking_provider=LiveTrackingReachProvider(self._live_tracking),
+        )
         self._trial_action_executor = TrialActionExecutor(
             move_absolute=self._move_protocol_motor_target,
             configure_cover=self._configure_protocol_cover,
@@ -724,8 +738,8 @@ class AppModel(ObservableObject):
             activate_detector=self._arm_protocol_stim_detector,
             cancel_detector=self._cancel_protocol_stim_detector,
             trigger_hardware_stimulus=self._trigger_protocol_stim3,
+            reach_state_resolver=self._reach_state_resolver,
         )
-        self._live_tracking = LiveTrackingBuffer()
         # One holder, several holders-of-holds. intertrial analysis and
         # inter-trial timing both block the send, and BehaviorAlgorithm reads
         # a single string, so releasing one must not release the other.
