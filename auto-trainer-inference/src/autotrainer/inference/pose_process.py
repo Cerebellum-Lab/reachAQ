@@ -335,13 +335,41 @@ class PoseProcess(Process):
         perf_add_c = self._perf_monitor.add_cycle
 
         live_input = self._live_input_queue
+        live_drain = live_input.depth > 1
 
         # always begin with live input:
         i_q: Optional[FixedArrayMultiQueue] = live_input
 
         def get_live_input():
-            res = live_input.get_output(frame_buffer1, frames_indices1, timeout=0.1)
-            return res
+            # Take the freshest frame the queue holds, not the oldest one.
+            #
+            # get_output frees the buffer slot as soon as it has copied the
+            # frame out, which is at the start of predict, so the producer
+            # refills it immediately and everything arriving during predict is
+            # dropped. The frame waiting at the next call is therefore already
+            # up to one predict-period old, and that staleness lands directly
+            # on the closed loop: measured on the rig, cspnext_m spent about
+            # 5.5 ms of its 16.3 ms end-to-end sitting in the buffer rather
+            # than being computed.
+            #
+            # Draining costs one 64 KB copy per skipped frame and removes that
+            # wait. It only does anything when the queue has depth to spare,
+            # which is why the live queue is no longer depth 1.
+            #
+            # Acquisition is unaffected either way. The capture loop puts with
+            # block=False, so a slow pose process can never stall it or cost a
+            # recorded frame; skipping here discards inference work, never
+            # acquisition.
+            if not live_input.get_output(frame_buffer1, frames_indices1,
+                                         timeout=0.1):
+                return False
+            # Nothing can be waiting behind it at depth 1, and the probe is
+            # not free: it copies both frames and expands them to RGB before
+            # the caller can know there was a newer one.
+            while live_drain and live_input.get_output(
+                    frame_buffer1, frames_indices1, timeout=0):
+                pass
+            return True
 
         def get_offline_input():
             nonlocal frame_buffer, frames_indices
