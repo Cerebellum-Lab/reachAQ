@@ -8,6 +8,7 @@ from typing import List, Dict, Optional, Tuple, Literal
 from collections import namedtuple, defaultdict
 from dataclasses import dataclass
 
+import cv2
 import numpy
 import pandas
 
@@ -17,7 +18,10 @@ from autotrainer.core.logging import get_verbose_logger
 from autotrainer.inference.config import StereoParams
 from autotrainer.core.pose_elements import SceneElement, AllHandsParts, ScenePartsPresenceContext, AllSceneParts
 
-from autotrainer.inference.analysis.prepare_jetson_data import process_hand_data, reorient_and_center_step1
+from autotrainer.inference.analysis.prepare_jetson_data import (
+    process_hand_data, reorient_and_center_step1, rotate_3d_points,
+    _undistort_points,
+)
 
 
 logger = get_verbose_logger(__name__)
@@ -227,6 +231,10 @@ class PoseAlgorithm:
         # Cache for the triangulation column index, keyed by the mask of
         # confident parts; see _handle_3d_triangulate.
         self._confident_columns_cache = {}
+        # The live 3D path's constants and its precondition check, both
+        # resolved on first use; see _live_3d_reason.
+        self._live_3d_cache = None
+        self._live_3d_reason_cache = self._UNRESOLVED
         # Which rows of a pose frame hold each hand's sub-parts.
         # Filled by initialize(), once the part order is known.
         self._hand_part_indices = {}
@@ -415,6 +423,169 @@ class PoseAlgorithm:
             selected[:, :, 2] >= self._present_threshold
         ).all(axis=0)
         return selected, confident_mask
+
+    # --- the live 3D path ---------------------------------------------------
+    #
+    # _handle_3d_triangulate below is the reference. It builds DataFrames and
+    # calls the helpers shared with the offline pipeline, and on one frame per
+    # camera it measured 1.529 ms p50 / 2.488 ms p99. 85% of that is pandas
+    # construction and per-part Python loops inside triangulate_3d_step1
+    # (0.555 / 1.101) and reorient_and_center_step1 (0.744 / 1.339), not
+    # arithmetic: the actual maths is a ten-point triangulation.
+    #
+    # At one frame per camera those helpers reduce to far less than they
+    # express, and each reduction is exact rather than an approximation:
+    #
+    #   min_cluster  triangulate_3d_step1 marks a point low-confidence only
+    #                when it is low-confidence for min_cluster consecutive
+    #                frames. Only confident parts are passed in, gated on the
+    #                same p_thresh it is given, so low_conf is all-False
+    #                before the cluster loop runs and every point is p=1.
+    #   center_len   reorient_and_center_step1 needs ten frames to recompute
+    #                the centre and sets center_len = 0 below that, so with
+    #                one frame cam_offsets keeps its loaded values.
+    #   rotate_3d    its reorient loop rebuilds three rotation matrices per
+    #                body part from angles that vary by neither part, frame
+    #                nor session, then applies a fixed axis flip and scale.
+    #                That whole loop is one constant 3x3 matrix.
+    #
+    # So the live path is undistort, triangulate, one affine transform. The
+    # shared helpers are untouched and still serve the offline pipeline, and
+    # the reference runs whenever _live_3d_reason() reports a precondition
+    # that does not hold.
+
+    _UNRESOLVED = object()
+
+    def _live_3d_reason(self) -> Optional[str]:
+        """Why the live 3D path cannot run here, or None if it can."""
+        if self._live_3d_reason_cache is not self._UNRESOLVED:
+            return self._live_3d_reason_cache
+        self._live_3d_reason_cache = self._resolve_live_3d_reason()
+        return self._live_3d_reason_cache
+
+    def _resolve_live_3d_reason(self) -> Optional[str]:
+        if self._stereo_params is None:
+            return "no stereo params"
+        if not self._cam_names or len(self._cam_names) < 2:
+            return "fewer than two camera names"
+        pair = f"{self._cam_names[0]}-{self._cam_names[1]}"
+        if pair not in self._stereo_params.as_pickle_dict():
+            return f"no stereo entry for {pair!r}"
+        if not self._calib_metadata or self._calib_metadata.get("camera_pos") is None:
+            # The reference reads camLele and its siblings unconditionally in
+            # its reorient loop, so without camera_pos it raises rather than
+            # returning something different. Fall back and let it raise.
+            return "no camera_pos in the calibration metadata"
+        if not self._cam_offsets:
+            # The reference synthesises offsets from camera_pos in this case.
+            return "no camera offsets"
+        if self._square_size is None:
+            return "no square size"
+        return None
+
+    def _live_3d_constants(self):
+        """The per-session constants the live 3D path applies to each batch."""
+        if self._live_3d_cache is not None:
+            return self._live_3d_cache
+        params = self._stereo_params.matrix
+        pair = f"{self._cam_names[0]}-{self._cam_names[1]}"
+        rot_cor = self._stereo_params.as_pickle_dict()[pair]["rot_cor"]
+        camera_pos = self._calib_metadata["camera_pos"]
+        # The means reorient_and_center_step1 takes, in its argument order.
+        avg_azi = numpy.mean((camera_pos["camLazi"], camera_pos["camRazi"]))
+        avg_ele = numpy.mean((camera_pos["camLele"], camera_pos["camRele"]))
+        # Derived by running the shared rotation on the identity rather than
+        # transcribing its matrices, so the two cannot drift apart.
+        rotation = rotate_3d_points(
+            numpy.eye(3), x_degrees=avg_azi, y_degrees=avg_ele,
+            z_degrees=-rot_cor,
+        )
+        # The loop then writes (-x, -z, -y), which is itself a linear map.
+        flip = numpy.array([[-1.0, 0.0, 0.0],
+                            [0.0, 0.0, -1.0],
+                            [0.0, -1.0, 0.0]])
+        self._live_3d_cache = {
+            "undistort": tuple(
+                (params[f"cameraMatrix{i}"], params[f"distCoeffs{i}"],
+                 params[f"R{i}"], params[f"P{i}"], rot_cor)
+                for i in (1, 2)
+            ),
+            "projection": (params["P1"][:3], params["P2"][:3]),
+            "offsets": numpy.array(
+                [self._cam_offsets["x_off"], self._cam_offsets["y_off"],
+                 self._cam_offsets["z_off"]], dtype=float),
+            "transform": (rotation @ flip) * float(self._square_size),
+        }
+        return self._live_3d_cache
+
+    def _triangulate_3d_live(self, selected, confident_order):
+        """Raw and reoriented 3D points for the confident parts, in numpy."""
+        constants = self._live_3d_constants()
+        # Fancy indexing copies, so _undistort_points writing back into its
+        # argument cannot reach the caller's array.
+        points = numpy.asarray(selected[:2, confident_order, :], dtype=float)
+        undistorted = [
+            _undistort_points(
+                points[index].reshape(1, -1), *constants["undistort"][index],
+            ).reshape(-1, 3)[:, :2].T.astype(numpy.float64)
+            for index in (0, 1)
+        ]
+        projection1, projection2 = constants["projection"]
+        homogeneous = cv2.triangulatePoints(
+            projection1, projection2, undistorted[0], undistorted[1])
+        raw = (homogeneous / homogeneous[3])[:3].T
+        oriented = (raw - constants["offsets"]) @ constants["transform"]
+        return raw, oriented
+
+    def _compute_3d_locations(self, per_cam_detection):
+        """The confident parts' raw and reoriented 3D locations."""
+        if len(per_cam_detection) < 2 or self._live_3d_reason() is not None:
+            return self._reference_3d_locations(per_cam_detection)
+        selected, confident_mask = self._select_most_likely_2d(
+            per_cam_detection[:2])
+        confident_order = [
+            column
+            for column in self._measure_offset_level_order
+            if confident_mask[column]
+        ]
+        if not confident_order:
+            return {}, {}
+        # Every triangulated point comes out p=1, as explained above, so the
+        # reference's per-part gate is this one comparison.
+        if 1.0 < self._present_threshold:
+            return {}, {}
+        confident_parts = [
+            part
+            for part, column in zip(
+                self._measure_offset_level_parts, self._measure_offset_level_order
+            )
+            if confident_mask[column]
+        ]
+        raw, oriented = self._triangulate_3d_live(selected, confident_order)
+        raw_3d_loc = {
+            part: Offset3DTuple(raw[index])
+            for index, part in enumerate(confident_parts)
+        }
+        locations_3d = {
+            part: Offset3DTuple(oriented[index])
+            for index, part in enumerate(confident_parts)
+        }
+        return raw_3d_loc, locations_3d
+
+    def _reference_3d_locations(self, per_cam_detection):
+        """The DataFrame path, kept as the reference and as the fallback."""
+        raw_df_3d, df_3d = self._handle_3d_triangulate(*per_cam_detection)
+        raw_3d_loc = {}
+        locations_3d = {}
+        df_3d_row = df_3d.iloc[0]  # there is only a single result in the df_3d
+        raw_df_3d_row = raw_df_3d.iloc[0]
+        for part in df_3d.columns.levels[0]:
+            p_3d = df_3d_row[part]
+            r_p_3d = raw_df_3d_row[part]
+            if r_p_3d["p"] >= self._present_threshold:
+                raw_3d_loc[part] = Offset3DTuple(r_p_3d[0:3])
+                locations_3d[part] = Offset3DTuple(p_3d[0:3])
+        return raw_3d_loc, locations_3d
 
     def _handle_3d_triangulate(
         self,
@@ -606,24 +777,13 @@ class PoseAlgorithm:
                     if score >= self._present_threshold:
                         locations_by_cam[cam_idx][elem] = PoseLocation(-1, x, y)
         #
-        locations_3d = {}
-        raw_3d_loc = {}
-        raw_df_3d, df_3d = self._handle_3d_triangulate(*(
+        raw_3d_loc, locations_3d = self._compute_3d_locations([
             numpy.asarray([
                 [frame[gpi(p)] for p in self._measure_offset_parts]
                 for frame in frames
             ])
             for frames in selected_cams_frames
-        ))
-        #
-        df_3d_row = df_3d.iloc[0]  # there is only a single result in the df_3d
-        raw_df_3d_row = raw_df_3d.iloc[0]
-        for part in df_3d.columns.levels[0]:
-            p_3d = df_3d_row[part]
-            r_p_3d = raw_df_3d_row[part]
-            if r_p_3d["p"] >= self._present_threshold:
-                raw_3d_loc[part] = Offset3DTuple(r_p_3d[0:3])
-                locations_3d[part] = Offset3DTuple(p_3d[0:3])  # 3 first columns (x, y, z)
+        ])
         #
         parts_3d_offsets = defaultdict(dict)
         if len(pairs_3d_offsets) > 0:
