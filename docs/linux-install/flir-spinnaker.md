@@ -13,7 +13,14 @@ export REACHAQ_REPO="$HOME/Documents/reachAQ"
 export REACHAQ_ENV="reachaq"
 ```
 
-reachAQ currently includes Spinnaker Python 3.2.0.62 wheels for CPython 3.8:
+reachAQ includes Spinnaker Python 3.2.0.62 wheels for CPython 3.8 and 3.10.
+Pick the one matching the interpreter of the target environment: the wheels
+are ABI-locked, so a cp38 wheel will not import on 3.10 and renaming it does
+not help. `vendor/spinnaker/manifest.json` lists what is bundled.
+
+The DeepLabCut 3.x PyTorch engine requires Python 3.10, so the inference
+environment needs the cp310 wheel; the cp38 wheels remain for the older
+TensorFlow environment and the Jetson image:
 
 ```bash
 find "$REACHAQ_REPO/vendor/spinnaker/linux" -name 'spinnaker_python-*.whl'
@@ -52,19 +59,42 @@ instead of creating an unrelated group manually.
 
 ## 3. Install the matching Python wheel
 
-x86_64 Ubuntu with the bundled CPython 3.8 wheel:
+Let the interpreter choose its own wheel, so a 3.8 and a 3.10 environment can
+be provisioned with the same command:
+
+```bash
+conda run -n "$REACHAQ_ENV" python - <<'PY'
+import json, pathlib, platform, subprocess, sys
+root = pathlib.Path("$REACHAQ_REPO/vendor/spinnaker")
+tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
+manifest = json.loads((root / "manifest.json").read_text())
+match = [a for a in manifest["artifacts"]
+         if a["system"] == "linux"
+         and a["machine"] == platform.machine()
+         and a["python"] == tag]
+if not match:
+    raise SystemExit(f"no bundled Spinnaker wheel for {tag} on {platform.machine()}")
+subprocess.check_call([sys.executable, "-m", "pip", "install",
+                       str(root / match[0]["path"])])
+PY
+```
+
+Or name the wheel directly. x86_64 Ubuntu, CPython 3.10:
 
 ```bash
 conda run -n "$REACHAQ_ENV" python -m pip install \
-  "$REACHAQ_REPO/vendor/spinnaker/linux/x86_64/spinnaker_python-3.2.0.62-cp38-cp38-linux_x86_64.whl"
+  "$REACHAQ_REPO/vendor/spinnaker/linux/x86_64/spinnaker_python-3.2.0.62-cp310-cp310-linux_x86_64.whl"
 ```
 
 Jetson/aarch64 requires the corresponding aarch64 system SDK and wheel:
 
 ```bash
 conda run -n "$REACHAQ_ENV" python -m pip install \
-  "$REACHAQ_REPO/vendor/spinnaker/linux/aarch64/spinnaker_python-3.2.0.62-cp38-cp38-linux_aarch64.whl"
+  "$REACHAQ_REPO/vendor/spinnaker/linux/aarch64/spinnaker_python-3.2.0.62-cp310-cp310-linux_aarch64.whl"
 ```
+
+There is no cp310 wheel for Windows here: the 3.2.0.62 Windows bundle is a
+separate download from the Linux one, and only its cp38 wheel was vendored.
 
 ## 4. Verify the complete camera path
 
