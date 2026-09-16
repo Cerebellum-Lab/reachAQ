@@ -69,6 +69,7 @@ from .device_interface import (
     BoardTimeSync,
     BoardCapabilities,
     DigitalPulseStatus,
+    PressureReading,
 )
 from .board_clock import BoardClockModel, BoardSequenceTracker
 from .stepper_motor import mm_to_turns, turns_to_mm
@@ -426,7 +427,11 @@ class CanInterface(DeviceInterface):
             ),
             cmd_type.ANALOG_OUT: self._translate_analog_out,
             cmd_type.RESERVED_0E: no_op,
-            cmd_type.PRESSURE_READ: no_op,
+            cmd_type.PRESSURE_READ: lambda msg: PressureReading(
+                target=_addr2tgt(msg.dst_id),
+                instance=msg.pressure_read.instance,
+                pressure=msg.pressure_read.pressure
+            ),
             cmd_type.RGB_LED: lambda msg: ColorLed(
                 target=_addr2tgt(msg.dst_id),
                 red=msg.rgb_led.red,

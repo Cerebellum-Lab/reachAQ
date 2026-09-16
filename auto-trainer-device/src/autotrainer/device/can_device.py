@@ -48,6 +48,7 @@ from .device_interface import (
     BoardTimeSync,
     BoardCapabilities,
     DigitalPulseStatus,
+    PressureReading,
 )
 
 
@@ -527,6 +528,9 @@ class CanDevice(Device):
             ),
             DigitalPulseStatus: lambda message: self._api.send_message(
                 SystemStatusMessageKind.DIGITAL_PULSE_STATUS, message,
+            ),
+            PressureReading: lambda message: self._api.send_message(
+                SystemStatusMessageKind.PRESSURE_READING, message,
             ),
 
             Acknowledge: self._handle_ack,
