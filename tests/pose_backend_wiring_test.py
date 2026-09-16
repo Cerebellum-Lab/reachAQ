@@ -15,9 +15,9 @@ The pose process is checked by reading the wiring rather than by starting it: a
 real start needs a GPU, a trained model and a multiprocessing queue.
 """
 
-import inspect
-import pathlib
-import re
+import ast
+
+import source_contract
 
 from autotrainer.inference import pose_process
 from autotrainer.inference.backend_selection import (
@@ -27,20 +27,19 @@ from autotrainer.inference.backend_selection import (
 )
 
 
-def _inference_model_source() -> str:
-    repo_root = pathlib.Path(__file__).resolve().parents[1]
-    path = repo_root / "tools" / "acquisition" / "model" / "inference_model.py"
-    return path.read_text(encoding="utf-8")
+INFERENCE_MODEL = "tools/acquisition/model/inference_model.py"
 
 
 def test_the_runtime_probe_is_no_longer_pinned_to_tensorflow():
-    source = _inference_model_source()
-    assert 'required_backend="tensorflow"' not in source
-    # Matched loosely on purpose: what matters is that the probe asks the
-    # selector rather than naming an engine, not how the call is spelled. The
-    # literal form used to be asserted, and adding the model path to the call
-    # failed the test while strengthening exactly what it guards.
-    assert re.search(r"required_backend=selected_backend\(", source)
+    """The probe must ask the selector, not name an engine."""
+    call = source_contract.one_call(INFERENCE_MODEL, "detect_gpu_runtime")
+    required = source_contract.keyword(call, "required_backend")
+    assert required is not None, "the probe no longer states which backend it wants"
+    assert isinstance(required, ast.Call), (
+        "required_backend is a literal again; on this rig TensorFlow sees the "
+        "GPU while every torch convolution aborts in cuDNN, so naming one "
+        "engine passes the preflight and then crashes the pose process")
+    assert source_contract._called_name(required) == "selected_backend"
 
 
 def test_the_runtime_probe_tells_the_selector_which_model_is_configured():
@@ -50,56 +49,73 @@ def test_the_runtime_probe_tells_the_selector_which_model_is_configured():
     environment, so a probe that does not pass the model can demand a
     TensorFlow runtime for torch weights and refuse to start.
     """
-    source = _inference_model_source()
-    assert re.search(
-        r"selected_backend\(\s*model_path=self\._model_location\s*\)", source)
+    call = source_contract.one_call(INFERENCE_MODEL, "detect_gpu_runtime")
+    selector = source_contract.keyword(call, "required_backend")
+    assert source_contract.keyword_name(selector, "model_path") == (
+        "self._model_location")
+
+
+def test_the_model_check_asks_the_selector_about_the_same_model():
+    """The preflight and the loader must agree on the engine."""
+    checks = source_contract.calls(INFERENCE_MODEL, "selected_backend")
+    assert checks, "the model check no longer consults the selector"
+    assert all(
+        source_contract.keyword_name(call, "model_path") == "self._model_location"
+        for call in checks), (
+        "a selected_backend() call in inference_model is not told the model")
 
 
 def test_the_runtime_probe_imports_the_selector():
-    source = _inference_model_source()
-    assert "from autotrainer.inference.backend_selection import" in source
-    assert "selected_backend" in source
+    assert source_contract.imports(INFERENCE_MODEL, "selected_backend")
 
 
 def test_can_start_live_inference_also_validates_the_model():
     """A bad model path must fail in the parent, not inside the child process."""
-    source = _inference_model_source()
-    assert "_can_load_pose_model" in source
-    assert "def can_start_live_inference" in source
+    tree = source_contract.tree(INFERENCE_MODEL)
+    source_contract.function(tree, "can_start_live_inference")
+    source_contract.function(tree, "_can_load_pose_model")
+    assert source_contract.calls(
+        source_contract.function(tree, "can_start_live_inference"),
+        "_can_load_pose_model"), "the model is no longer validated up front"
 
 
 def test_an_empty_model_location_stays_valid():
     """An empty location selects MemoryPoseModel for rig checkout."""
-    source = _inference_model_source()
-    body = source.split("def _can_load_pose_model")[1]
-    assert "if not self._model_location:" in body
-    assert "return True" in body
+    check = source_contract.function(INFERENCE_MODEL, "_can_load_pose_model")
+    guards = [node for node in ast.walk(check) if isinstance(node, ast.If)]
+    assert any(
+        isinstance(node.test, ast.UnaryOp)
+        and isinstance(node.test.op, ast.Not)
+        and source_contract.dotted_name(node.test.operand) == "self._model_location"
+        and any(isinstance(inner, ast.Return) for inner in node.body)
+        for node in guards), (
+        "an empty model location must return early rather than be validated")
 
 
 def test_the_pose_process_builds_through_the_selector():
-    source = inspect.getsource(pose_process)
-    assert "build_pose_model(" in source
+    assert source_contract.calls(pose_process, "build_pose_model")
     # The direct construction is what the selector replaces.
-    assert "DlcPoseModel(" not in source
+    assert not source_contract.constructs(pose_process, "DlcPoseModel")
 
 
 def test_the_pose_process_no_longer_imports_the_tensorflow_model():
     """A torch-only deployment cannot import DlcPoseModel at all."""
-    source = inspect.getsource(pose_process)
-    assert "import DlcPoseModel" not in source
-    assert "MemoryPoseModel" in source, "the in-memory model is still needed"
-
-
-def test_the_pose_process_logs_which_backend_it_loaded():
-    source = inspect.getsource(pose_process)
-    assert re.search(r"selected_backend\(", source)
-    assert "backend" in source.split("Loading DLC model")[1][:200]
+    assert not source_contract.imports(pose_process, "DlcPoseModel")
+    assert source_contract.calls(pose_process, "MemoryPoseModel"), (
+        "the in-memory model is still needed")
 
 
 def test_the_pose_process_selects_from_the_model_it_was_given():
     """The child has to reach the same answer as the parent's probe."""
-    source = inspect.getsource(pose_process)
-    assert re.search(r"selected_backend\(\s*model_path=model_path\s*\)", source)
+    call = source_contract.one_call(pose_process, "selected_backend")
+    assert source_contract.keyword_name(call, "model_path") == "model_path"
+
+
+def test_the_pose_process_selects_before_it_builds():
+    """Building first would construct the model for the wrong engine."""
+    order = source_contract.call_order(
+        pose_process, ["selected_backend", "build_pose_model"])
+    assert order == ["selected_backend", "build_pose_model"], order
 
 
 def test_the_env_var_name_is_stable():
