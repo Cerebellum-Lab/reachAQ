@@ -57,6 +57,7 @@ from autotrainer.core import (
     FixedArrayMultiQueue,
 )
 from autotrainer.core.configuration.json_compat import SystemConfigurationJSONEncoder
+from autotrainer.core.configuration.demo_sources import DemoSources
 from autotrainer.core.interfaces import RecordingEndingReason, CaptureAnalysisResult
 from autotrainer.core.project import ProjectInfo, ProjectDependentProtocol
 from autotrainer.core.configuration import SystemConfigurationDumper, DEFAULT_3D_CALIB_DIR_NAME
@@ -494,6 +495,7 @@ class AppModel(ObservableObject):
         self._loaded_configuration: Optional[SystemConfiguration] = None
         self._loaded_config_dir_path = Path()
         self._loaded_configuration_has_runtime_override = False
+        self._demo_sources: Optional[DemoSources] = None
         self._runtime_live_inference_override: Optional[bool] = None
         self._nidaq_ports = NidaqPortConfiguration()
         self._hardware_scan_results: Dict[str, HardwareScanEntry] = {}
@@ -971,6 +973,50 @@ class AppModel(ObservableObject):
         for camera_config in configuration.cameras:
             if camera_config.id in reach_ids:
                 cls._configure_camera_as_random(camera_config)
+
+        configuration._camera_map = {}
+
+    @classmethod
+    def _apply_demo_playback_override(
+        cls, configuration: SystemConfiguration, sources: DemoSources
+    ) -> None:
+        """Point the reach cameras at pre-recorded video for a demo run.
+
+        Only the camera sources change. Hardware, inference, laser, NI-DAQ,
+        protocol, and persistence stay exactly as the rig has them configured,
+        because the demo's whole claim is that it is the real pipeline with one
+        substituted input.
+        """
+
+        reach_ids = set(CameraId.reach_camera_ids())
+        for camera_config in configuration.cameras:
+            if camera_config.id not in reach_ids:
+                continue
+
+            video = sources.video_for(str(camera_config.id))
+            if video is None:
+                # An enabled camera with no demo video would point at a physical
+                # handle this run is not driving. Disable it rather than fail late.
+                if camera_config.is_enabled:
+                    logger.notice(
+                        "Demo mode has no video for camera %s; disabling it",
+                        camera_config.name,
+                    )
+                camera_config.is_enabled = False
+                continue
+
+            camera_config.scheme = "playback"
+            camera_config.host = ""
+            camera_config.port = 0
+            camera_config.path = Path(video).as_posix()
+            params = dict(camera_config.params)
+            params["fps"] = sources.fps
+            camera_config.params = params
+            camera_config.is_enabled = True
+            logger.notice(
+                "Demo mode camera %s plays %s at %s fps",
+                camera_config.name, camera_config.path, sources.fps,
+            )
 
         configuration._camera_map = {}
 
@@ -2435,6 +2481,15 @@ class AppModel(ObservableObject):
     @property
     def loaded_configuration(self) -> Optional[SystemConfiguration]:
         return self._loaded_configuration
+
+    @property
+    def demo_sources(self) -> Optional[DemoSources]:
+        """The demo playback spec for this run, or None when not in demo mode."""
+        return self._demo_sources
+
+    @property
+    def is_demo_mode(self) -> bool:
+        return self._demo_sources is not None
 
     @property
     def project(self) -> Optional[ProjectInfo]:
@@ -6884,7 +6939,13 @@ class AppModel(ObservableObject):
         return configuration
 
     @_serialized_session_configuration
-    def load_configuration(self, location: Optional[Path] = None, *, random_cameras: bool = False):
+    def load_configuration(
+        self,
+        location: Optional[Path] = None,
+        *,
+        random_cameras: bool = False,
+        demo_sources: Optional[DemoSources] = None,
+    ):
         self._require_session_ready_for_configuration("Loading configuration")
         if location is None:
             location = self.get_config_location()
@@ -6892,14 +6953,18 @@ class AppModel(ObservableObject):
         config_started = time.perf_counter()
         log_hardware_initialization(
             logger,
-            "START | hardware configuration | path=%s random_cameras=%s",
+            "START | hardware configuration | path=%s random_cameras=%s demo=%s",
             location,
             random_cameras,
+            demo_sources is not None,
         )
         configuration: SystemConfiguration = self.get_config_from_location(location)
         if random_cameras:
             logger.notice("Using random camera override for this run")
             self._apply_random_camera_override(configuration)
+        if demo_sources is not None:
+            logger.notice("Using demo playback camera override for this run")
+            self._apply_demo_playback_override(configuration, demo_sources)
         self._ensure_optional_stim_camera(configuration)
 
         self._sync_reach_cameras_to_configuration(configuration)
@@ -7008,7 +7073,10 @@ class AppModel(ObservableObject):
 
         self._loaded_configuration = configuration
         self._loaded_config_dir_path = location.parent.resolve()
-        self._loaded_configuration_has_runtime_override = random_cameras
+        self._loaded_configuration_has_runtime_override = (
+            random_cameras or demo_sources is not None
+        )
+        self._demo_sources = demo_sources
         self._runtime_live_inference_override = None
 
         with self._trial_protocol_lock:
