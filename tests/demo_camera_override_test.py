@@ -95,3 +95,23 @@ def test_camera_map_is_reset(tmp_path):
     AppModel._apply_demo_playback_override(configuration, _sources(tmp_path, "left"))
 
     assert configuration._camera_map == {}
+
+
+def test_fps_param_is_an_int_the_camera_url_can_parse(tmp_path):
+    """CameraBase.set_property parses fps with int(), and int("150.0") raises.
+
+    A float here reaches the capture process as fps=150.0 in the camera URL and
+    kills camera creation with "invalid literal for int() with base 10".
+    """
+    configuration = _configuration()
+    sources = DemoSources(
+        fps=150.015, loop=True, cameras={"left": tmp_path / "left.mp4"}
+    )
+    (tmp_path / "left.mp4").write_bytes(b"video")
+
+    AppModel._apply_demo_playback_override(configuration, sources)
+
+    left = next(c for c in configuration.cameras if c.id == CameraId.Left)
+    assert isinstance(left.params["fps"], int)
+    assert left.params["fps"] == 150
+    assert int(str(left.params["fps"])) == 150
