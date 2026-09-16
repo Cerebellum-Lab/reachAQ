@@ -13,6 +13,8 @@ that need it.
 """
 
 import numpy
+
+import source_contract
 import pytest
 
 from autotrainer.inference.cropped_pose_model import CroppedPoseModel, InferenceRoi
@@ -104,14 +106,24 @@ def test_the_live_slice_is_a_view_of_the_padded_buffer():
 
 
 def test_pose_process_selects_the_input_once_not_per_frame():
-    """A per-frame branch would put the check in the hot loop."""
-    import inspect
+    """A per-frame branch would put the check in the hot loop.
+
+    Counted as attribute reads in the parse tree rather than as occurrences of
+    a word in the source, so a mention in a comment or docstring no longer
+    counts and a second genuine read still does.
+    """
+    import ast
 
     from autotrainer.inference import pose_process
 
-    source = inspect.getsource(pose_process)
-    assert "live_predict_input = (" in source
-    assert source.count("supports_partial_batch") == 1, (
-        "the capability should be read once, outside the loop"
-    )
-    assert "live_predict(live_predict_input)" in source
+    reads = [node for node in ast.walk(source_contract.tree(pose_process))
+             if isinstance(node, ast.Attribute)
+             and node.attr == "supports_partial_batch"]
+    assert len(reads) == 1, (
+        f"the capability should be read once, outside the loop; found "
+        f"{len(reads)} reads")
+
+    assert source_contract.assigned(pose_process, "live_predict_input") is not None, (
+        "the input is no longer chosen once up front")
+    assert source_contract.calls(pose_process, "live_predict"), (
+        "the live path no longer goes through the chosen input")

@@ -7,8 +7,8 @@ live call, and the fall-back to the ultralytics wrapper is silent: on the rig
 that was 7.4 ms per call instead of 3.6 ms, with nothing in the log to say so.
 """
 
-import re
-from pathlib import Path
+
+import source_contract
 
 from autotrainer.inference import pose_process
 from autotrainer.inference.pose_model import PoseModel
@@ -48,15 +48,17 @@ def test_runtime_detail_names_the_batch_the_graph_is_captured_for():
 def test_pose_process_prepares_the_live_batch_before_loading():
     """Order matters: the graph is captured inside load().
 
-    Asserted against the source because the alternative is standing up a pose
-    process with a live queue and a real model, which is a long way to go to
-    check two adjacent statements.
+    Checked against the parse tree rather than the text, because standing up a
+    pose process with a live queue and a real model is a long way to go to
+    verify two adjacent statements - and because the text form broke on a
+    reformat while missing a genuine reordering.
     """
-    source = Path(pose_process.__file__).read_text(encoding="utf-8")
-    prepare = source.index("prepare_live_batch(")
-    load = source.index("self._pose_model.load()")
-    assert prepare < load, "prepare_live_batch must run before load()"
-    assert re.search(
-        r"prepare_live_batch\(\s*self\._live_input_queue\.batch_size\s*\)",
-        source,
-    ), "the live queue's batch size is what the live path sends"
+    order = source_contract.call_order(
+        pose_process, ["prepare_live_batch", "load"])
+    assert order[:2] == ["prepare_live_batch", "load"], (
+        f"prepare_live_batch must run before load(); found {order}")
+
+    call = source_contract.one_call(pose_process, "prepare_live_batch")
+    assert source_contract.dotted_name(call.args[0]) == (
+        "self._live_input_queue.batch_size"), (
+        "the live queue's batch size is what the live path sends")
