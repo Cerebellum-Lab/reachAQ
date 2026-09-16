@@ -66,6 +66,7 @@ from the core logic of the applications for two reasons:
     * [Session validation command and rule coverage](docs/acquisition/session-validation.md)
     * [Pellet firmware compatibility and rollout](docs/acquisition/pellet-firmware-compatibility.md)
     * Use `--random-cameras` to start with software-generated frames when no physical cameras are configured.
+    * Use `--demo` to play pre-recorded video through the real pipeline when no animal is present; every other subsystem stays live. [Demo mode](docs/acquisition/demo-mode.md)
   * Headless implementation for command line only
     * `auto-trainer-headless -c ~/Autotrainer/system_configuration.yaml`
     * Headless mode continues to start acquisition by default because it has no UI start control.
