@@ -59,6 +59,9 @@ class SystemStatusMessageKind(IntEnum):
     BOARD_CAPABILITIES = 308
     DIGITAL_PULSE_STATUS = 309
 
+    PRESSURE_READING = 310
+    """One pellet-board FSR sample as a PressureReading (raw 12-bit ADC count)."""
+
     COLOR_LED = 403
     """Message is the original ColorLed message"""
 
