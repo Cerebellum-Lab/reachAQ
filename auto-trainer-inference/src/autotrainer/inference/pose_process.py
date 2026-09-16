@@ -299,6 +299,13 @@ class PoseProcess(Process):
         frame_buffer1 = predict_buffer[:live_batch_size]
         frames_indices1 = numpy.ndarray(
             (input_q.camera_count, input_q.frames_per_camera), dtype="int64")
+        # Exposure times for the same frames, so sensor-to-result can be
+        # reported alongside how long the call itself took. The two are
+        # different questions: the call is what the model costs, and
+        # sensor-to-result is what the closed loop actually waits on.
+        frames_perf_c1 = numpy.full(
+            (input_q.camera_count, input_q.frames_per_camera), numpy.nan,
+            dtype="float64")
         #
         frame_buffer = frame_buffer1
         frames_indices = frames_indices1
@@ -333,6 +340,13 @@ class PoseProcess(Process):
                 live_model.roi,
             )
         perf_add_c = self._perf_monitor.add_cycle
+        live_predict_count = 0
+        window_predict_count = 0
+        window_predict_total_ms = 0.0
+        window_predict_max_ms = 0.0
+        window_e2e_count = 0
+        window_e2e_total_ms = 0.0
+        window_e2e_max_ms = 0.0
 
         live_input = self._live_input_queue
         live_drain = live_input.depth > 1
@@ -361,13 +375,15 @@ class PoseProcess(Process):
             # recorded frame; skipping here discards inference work, never
             # acquisition.
             if not live_input.get_output(frame_buffer1, frames_indices1,
-                                         timeout=0.1):
+                                         timeout=0.1,
+                                         frames_perf_c=frames_perf_c1):
                 return False
             # Nothing can be waiting behind it at depth 1, and the probe is
             # not free: it copies both frames and expands them to RGB before
             # the caller can know there was a newer one.
             while live_drain and live_input.get_output(
-                    frame_buffer1, frames_indices1, timeout=0):
+                    frame_buffer1, frames_indices1, timeout=0,
+                    frames_perf_c=frames_perf_c1):
                 pass
             return True
 
@@ -468,7 +484,31 @@ class PoseProcess(Process):
                     # Either the real frames alone, or the padded buffer when the
                     # backend needs a fixed batch. The slice is a no-op in the
                     # first case and drops the padding rows in the second.
+                    #
+                    # Timed only on the live path. The operator panel reports
+                    # what the closed loop waits on, and folding the offline
+                    # batch in would average a throughput-shaped workload into
+                    # a latency figure.
+                    predict_started = time.perf_counter()
                     pose = live_predict(live_predict_input)[:live_batch_size]
+                    predict_done = time.perf_counter()
+                    predict_ms = (predict_done - predict_started) * 1000.0
+                    live_predict_count += 1
+                    window_predict_count += 1
+                    window_predict_total_ms += predict_ms
+                    if predict_ms > window_predict_max_ms:
+                        window_predict_max_ms = predict_ms
+                    # Sensor to result, from the OLDEST exposure in the batch:
+                    # a pose is only as fresh as the stalest camera it used,
+                    # and taking the newest would flatter every stereo figure.
+                    # This includes the queue wait the raw call cannot see.
+                    oldest_exposure = numpy.nanmin(frames_perf_c1)
+                    if oldest_exposure == oldest_exposure:  # not NaN
+                        e2e_ms = (predict_done - oldest_exposure) * 1000.0
+                        window_e2e_count += 1
+                        window_e2e_total_ms += e2e_ms
+                        if e2e_ms > window_e2e_max_ms:
+                            window_e2e_max_ms = e2e_ms
                 else:
                     pose = offline_predict(frame_buffer)
             else:
@@ -505,7 +545,31 @@ class PoseProcess(Process):
                 sent_live = True
 
             if perf_add_c():
-                self._send_message(InferenceStatusMessageKind.Performance, self._perf_monitor.cps)
+                # The session pose total, plus the mean and max of the calls in
+                # this window for BOTH figures. Absolute count so the receiver
+                # cannot drift; windowed mean and max because a session-wide
+                # mean hides a slow patch and the max decides whether a
+                # deadline was missed.
+                self._send_message(
+                    InferenceStatusMessageKind.Performance,
+                    (
+                        self._perf_monitor.cps,
+                        live_predict_count,
+                        (window_predict_total_ms / window_predict_count
+                         if window_predict_count else float("nan")),
+                        window_predict_max_ms if window_predict_count
+                        else float("nan"),
+                        (window_e2e_total_ms / window_e2e_count
+                         if window_e2e_count else float("nan")),
+                        window_e2e_max_ms if window_e2e_count else float("nan"),
+                    ),
+                )
+                window_predict_count = 0
+                window_predict_total_ms = 0.0
+                window_predict_max_ms = 0.0
+                window_e2e_count = 0
+                window_e2e_total_ms = 0.0
+                window_e2e_max_ms = 0.0
 
             # could only check the frame index, given is only emitted from offline mode:
             if mode_used == InferenceMode.Offline and (

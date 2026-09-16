@@ -126,10 +126,21 @@ def test_the_live_queue_is_not_depth_one():
 
 def test_capture_offers_frames_without_blocking():
     """Acquisition must never wait on inference. This is the line that
-    guarantees a slow pose process cannot cost a recorded frame."""
+    guarantees a slow pose process cannot cost a recorded frame.
+
+    Asserted on the call's arguments rather than one formatting of it: the
+    guarantee is that this particular put is non-blocking, and pinning the
+    exact source line made an unrelated reformat look like a regression while
+    a genuine change from block=False to block=True inside a rewritten line
+    would still have slipped through.
+    """
     import pathlib
+    import re
 
     source = pathlib.Path(__file__).resolve().parents[1].joinpath(
         "auto-trainer-video", "src", "autotrainer", "video",
         "video_capture.py").read_text()
-    assert "net_q_put(frame, net_q_idx, frame_idx_cat, block=False)" in source
+    match = re.search(r"net_q_put\((?P<args>[^)]*)\)", source, re.S)
+    assert match is not None, "the inference queue put has been renamed or removed"
+    assert "block=False" in match.group("args"), (
+        "the capture loop must offer frames to inference without blocking")

@@ -1,4 +1,5 @@
 import ctypes
+import math
 import logging
 import multiprocessing
 import time
@@ -98,6 +99,16 @@ class FixedArrayMultiQueue:
 
         # a single shared array for all frames indices of all cameras:
         self._frame_indices = mp_ctx.RawArray(ctypes.c_int64, self._depth * self._frames_per_camera * self._cam_count)
+        # The host clock time each frame was exposed, carried beside its index.
+        #
+        # Without this the consumer knows WHICH frames it has but not WHEN they
+        # were taken, so it can time its own work and nothing else. Sensor to
+        # result - the figure a closed loop actually waits on - needs the
+        # exposure time to travel with the frame. perf_counter is the same
+        # monotonic clock in every process on both platforms, so the two ends
+        # are directly comparable. NaN means the writer supplied nothing.
+        self._frame_perf_c = mp_ctx.RawArray(
+            ctypes.c_double, self._depth * self._frames_per_camera * self._cam_count)
 
         self._frame_indexing: List[int] = list(numpy.repeat(range(self._frames_per_camera), self._cam_count))
         self._camera_indexing: List[int] = list(numpy.tile(range(self._cam_count), self._frames_per_camera))
@@ -180,7 +191,8 @@ class FixedArrayMultiQueue:
             raise RuntimeError(f"Timeout waiting space in queue for cam-{camera}")
 
     def put(self, content: numpy.ndarray, camera: int, frame_idx: Optional[int],
-            *, block=True, timeout=0.01) -> BufferResult:
+            *, block=True, timeout=0.01,
+            frame_perf_c: Optional[float] = None) -> BufferResult:
         batch_index = self._batch_index[camera]  # 0 ... up to frames per camera - 1
         if batch_index == 0:
             if not self._sem_free[camera].acquire(block, timeout):
@@ -194,6 +206,12 @@ class FixedArrayMultiQueue:
                 memoryview(self._frame_indices).cast("B"), "int64", len(self._frame_indices)
             ).reshape((self._cam_count, self._depth, self._frames_per_camera))[camera]
             b[buffer_index][batch_index] = frame_idx
+        stamps = numpy.frombuffer(
+            memoryview(self._frame_perf_c).cast("B"), "float64",
+            len(self._frame_perf_c)
+        ).reshape((self._cam_count, self._depth, self._frames_per_camera))[camera]
+        stamps[buffer_index][batch_index] = (
+            math.nan if frame_perf_c is None else frame_perf_c)
         self._put_count += 1
         #
         batch_index = self._batch_index[camera] = (batch_index + 1) % self._frames_per_camera
@@ -203,7 +221,8 @@ class FixedArrayMultiQueue:
 
         return BufferResult.Ok  # if not is_overflow else BufferResult.Overflow
 
-    def get_output(self, output: numpy.ndarray, frames_indices: Optional[numpy.ndarray] = None, *, timeout: float=0.01) -> bool:
+    def get_output(self, output: numpy.ndarray, frames_indices: Optional[numpy.ndarray] = None, *, timeout: float=0.01,
+                   frames_perf_c: Optional[numpy.ndarray] = None) -> bool:
         """Get the next available "output" : i.e: 1 batch of frames_per_camera * nbr_cameras"""
         for cdx in range(self._cam_count):
             if not self._read_sem_acquired[cdx]:
@@ -230,6 +249,14 @@ class FixedArrayMultiQueue:
             # copy frames indices
             frames_indices[:, :] = numpy.frombuffer(
                 memoryview(self._frame_indices).cast("B"), "int64", len(self._frame_indices)
+            ).reshape(
+                (self._cam_count, self._depth, self._frames_per_camera)
+            )[:, read_idx_value, :]
+
+        if frames_perf_c is not None:
+            frames_perf_c[:, :] = numpy.frombuffer(
+                memoryview(self._frame_perf_c).cast("B"), "float64",
+                len(self._frame_perf_c)
             ).reshape(
                 (self._cam_count, self._depth, self._frames_per_camera)
             )[:, read_idx_value, :]

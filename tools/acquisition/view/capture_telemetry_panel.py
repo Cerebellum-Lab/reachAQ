@@ -1,0 +1,242 @@
+import math
+
+from PySide6.QtCore import Qt, QTimer, Slot
+from PySide6.QtWidgets import (
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QSizePolicy,
+    QToolButton,
+    QVBoxLayout,
+    QWidget,
+)
+
+from autotrainer.core.logging import get_verbose_logger
+
+from tools.acquisition.model.session_telemetry import SessionTelemetry
+
+logger = get_verbose_logger(__name__)
+
+#: How often the readouts refresh. Elapsed has to tick on its own because it is
+#: derived from a clock rather than pushed by a message, and twice a second is
+#: the slowest rate at which a seconds counter still looks live.
+REFRESH_INTERVAL_MS = 500
+
+
+class CaptureTelemetryPanel(QWidget):
+    """A collapsed strip under the video that opens onto the live session counters.
+
+    Starts collapsed and stays out of the way: the video is what an operator
+    watches, and this only earns space when they ask for it. Expanded, it takes
+    a fixed small height rather than a share of the layout, so opening it never
+    resizes the video by an unpredictable amount.
+
+    The warning indicator is the exception to staying out of the way. Dropped
+    frames mean the recording has a hole in it, and that is worth knowing while
+    the animal is still in the box rather than during analysis - so the icon
+    shows on the collapsed strip too, and clears when the session ends.
+    """
+
+    _COLLAPSED_ARROW = "▸"     # right-pointing: opens downward
+    _EXPANDED_ARROW = "▾"      # down-pointing: already open
+    _WARNING = "⚠"
+
+    def __init__(self, telemetry: SessionTelemetry, parent=None):
+        super().__init__(parent)
+        self._telemetry = telemetry
+
+        self.setSizePolicy(QSizePolicy.Policy.Expanding,
+                           QSizePolicy.Policy.Fixed)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # -- the always-visible strip ------------------------------------
+        header = QFrame()
+        header.setObjectName("captureTelemetryHeader")
+        header.setFrameShape(QFrame.Shape.NoFrame)
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(6, 2, 6, 2)
+        header_layout.setSpacing(8)
+
+        toggle = self._toggle = QToolButton()
+        toggle.setText(self._COLLAPSED_ARROW)
+        toggle.setToolTip("Show session counters")
+        toggle.setAutoRaise(True)
+        toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        toggle.clicked.connect(self._toggle_clicked)
+        header_layout.addWidget(toggle)
+
+        title = QLabel("Session")
+        title.setStyleSheet("color: palette(mid);")
+        header_layout.addWidget(title)
+
+        # A summary that stays readable while collapsed, so opening the panel
+        # is a choice rather than the only way to see anything.
+        self._collapsed_summary = QLabel("")
+        self._collapsed_summary.setStyleSheet("color: palette(mid);")
+        header_layout.addWidget(self._collapsed_summary)
+
+        header_layout.addStretch(1)
+
+        warning = self._warning = QLabel(self._WARNING)
+        warning.setStyleSheet("color: #d08a00; font-weight: bold;")
+        warning.setVisible(False)
+        header_layout.addWidget(warning)
+
+        outer.addWidget(header)
+
+        # -- the body, hidden until asked for ----------------------------
+        body = self._body = QFrame()
+        body.setObjectName("captureTelemetryBody")
+        body.setFrameShape(QFrame.Shape.NoFrame)
+        body_layout = QHBoxLayout(body)
+        body_layout.setContentsMargins(10, 4, 10, 6)
+        body_layout.setSpacing(18)
+
+        self._elapsed = self._add_readout(body_layout, "Elapsed")
+        self._dropped = self._add_readout(body_layout, "Dropped frames")
+        self._inferenced = self._add_readout(body_layout, "Inferenced")
+        # Two separate figures. The call is what the model costs; sensor to
+        # result adds the queue wait and is what the sub-5 ms target is about.
+        # Showing only one of them would let a model look fast while missing
+        # the deadline that matters.
+        self._inference_ms = self._add_readout(body_layout, "Inference call")
+        self._e2e_ms = self._add_readout(body_layout, "Sensor → result")
+        body_layout.addStretch(1)
+
+        body.setVisible(False)
+        outer.addWidget(body)
+
+        telemetry.property_changed += self._on_telemetry_changed
+
+        timer = self._timer = QTimer(self)
+        timer.setInterval(REFRESH_INTERVAL_MS)
+        timer.timeout.connect(self._refresh)
+        timer.start()
+
+        self._refresh()
+
+    # -- construction helpers --------------------------------------------
+
+    @staticmethod
+    def _add_readout(layout, caption: str) -> QLabel:
+        """One caption-over-value pair. Returns the value label to update."""
+        holder = QWidget()
+        column = QVBoxLayout(holder)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(0)
+
+        label = QLabel(caption)
+        label.setStyleSheet("color: palette(mid); font-size: 10px;")
+        column.addWidget(label)
+
+        value = QLabel("-")
+        value.setStyleSheet("font-family: monospace;")
+        column.addWidget(value)
+
+        layout.addWidget(holder)
+        return value
+
+    # -- behaviour --------------------------------------------------------
+
+    @property
+    def is_expanded(self) -> bool:
+        return self._body.isVisible()
+
+    def set_expanded(self, expanded: bool) -> None:
+        self._body.setVisible(expanded)
+        self._toggle.setText(self._EXPANDED_ARROW if expanded
+                             else self._COLLAPSED_ARROW)
+        self._toggle.setToolTip("Hide session counters" if expanded
+                                else "Show session counters")
+        if expanded:
+            self._refresh()
+
+    @Slot()
+    def _toggle_clicked(self):
+        self.set_expanded(not self.is_expanded)
+
+    def _on_telemetry_changed(self, name, _new, _old):
+        """Refresh on a counter change.
+
+        The panel is updated rather than the individual label, because the
+        readouts are derived from each other - the percentage needs both the
+        pose count and the frame count - and refreshing one at a time would
+        briefly show a percentage computed from a stale denominator.
+        """
+        if name == SessionTelemetry.ACTIVE_PROP:
+            self._refresh()
+            return
+        self._refresh()
+
+    def _refresh(self):
+        telemetry = self._telemetry
+
+        self._elapsed.setText(self._format_elapsed(telemetry.elapsed_seconds))
+
+        dropped = telemetry.dropped_frames
+        self._dropped.setText(f"{dropped}")
+        self._dropped.setStyleSheet(
+            "font-family: monospace; color: #d08a00; font-weight: bold;"
+            if dropped else "font-family: monospace;")
+
+        acquired = telemetry.frames_acquired
+        posed = telemetry.frames_inferenced
+        self._inferenced.setText(
+            f"{telemetry.inferenced_percent:.0f}%  {posed}/{acquired}"
+            if acquired else "-")
+
+        mean_ms = telemetry.inference_mean_ms
+        max_ms = telemetry.inference_max_ms
+        self._inference_ms.setText(
+            f"{mean_ms:.1f} ms  max {max_ms:.1f}"
+            if math.isfinite(mean_ms) else "-")
+
+        e2e_mean = telemetry.sensor_to_result_mean_ms
+        e2e_max = telemetry.sensor_to_result_max_ms
+        self._e2e_ms.setText(
+            f"{e2e_mean:.1f} ms  max {e2e_max:.1f}"
+            if math.isfinite(e2e_mean) else "-")
+
+        # The warning survives collapsing, and clears when the session ends.
+        self._warning.setVisible(telemetry.has_dropped_frames
+                                 and telemetry.is_active)
+        self._warning.setToolTip(
+            f"{dropped} frame(s) dropped this session" if dropped else "")
+
+        self._collapsed_summary.setText(
+            "" if self.is_expanded or not acquired
+            else self._collapsed_text(telemetry))
+
+    @staticmethod
+    def _collapsed_text(telemetry) -> str:
+        """What the strip says while shut.
+
+        Sensor-to-result rather than the call time: if only one number is
+        visible without opening the panel, it should be the one the deadline
+        is set against.
+        """
+        parts = [CaptureTelemetryPanel._format_elapsed(telemetry.elapsed_seconds),
+                 f"{telemetry.inferenced_percent:.0f}% inferenced"]
+        e2e = telemetry.sensor_to_result_mean_ms
+        if math.isfinite(e2e):
+            parts.append(f"{e2e:.1f} ms sensor→result")
+        return "   ".join(parts)
+
+    @staticmethod
+    def _format_elapsed(seconds: float) -> str:
+        total = int(seconds)
+        hours, remainder = divmod(total, 3600)
+        minutes, secs = divmod(remainder, 60)
+        if hours:
+            return f"{hours}:{minutes:02d}:{secs:02d}"
+        return f"{minutes}:{secs:02d}"
+
+    def close(self):
+        self._timer.stop()
+        try:
+            self._telemetry.property_changed -= self._on_telemetry_changed
+        except Exception:  # pragma: no cover - teardown ordering
+            logger.debug("telemetry observer already detached")
