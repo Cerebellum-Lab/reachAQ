@@ -31,6 +31,16 @@ from .pose_offline_input import OfflineInputProcess
 
 logger = get_verbose_logger(__name__)
 
+#: How often the pose process reports its timings. This drives a live readout
+#: an operator watches during a recording, so it has to be short enough to be
+#: worth watching: the previous 30 s meant the first latency figure appeared
+#: half a minute into a session, and the last one was up to 30 s stale when the
+#: session ended. It also bounds how much of the model's warm-up spike can leak
+#: into the first window of a session. Matched to the capture process's own
+#: 0.5 s frame-stats period so the two halves of the panel move together.
+PERFORMANCE_REPORT_PERIOD = 0.5
+
+
 # Frames per camera the pose model graph is built for. DeepLabCut fixes its
 # batch size at construction (`setup_pose_prediction` builds a placeholder with
 # a literal batch dimension), so this value sizes the model and the offline
@@ -131,7 +141,8 @@ class PoseProcess(Process):
         self._model_frames_per_camera = int(model_frames_per_camera)
         self._process_live_when_ready = False
         self._is_running = True
-        self._perf_monitor = PerfMonitor(name="<pose-predict>", units="predict calls/s", report_window=30,
+        self._perf_monitor = PerfMonitor(name="<pose-predict>", units="predict calls/s",
+                                         report_window=PERFORMANCE_REPORT_PERIOD,
                                          enable_log=False)
         #
 
