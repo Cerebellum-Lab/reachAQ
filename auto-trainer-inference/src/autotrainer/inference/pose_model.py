@@ -46,6 +46,30 @@ class PoseModel:
         """
         return False
 
+    def prepare_live_batch(self, batch_size: int) -> None:
+        """Tell the model how many frames the live path will hand it.
+
+        One loaded model serves two callers with opposite priorities: live
+        inference, which sends one batch per camera tick and is judged on
+        latency, and the offline pass, which sends a padded batch and is judged
+        on throughput. A backend that specialises for a fixed shape has to
+        specialise for the live one, because that is the shape with a deadline.
+
+        Called before load(), and a no-op by default: a backend that does not
+        care about the shape should not have to know this exists.
+        """
+
+    def runtime_detail(self) -> str:
+        """One line saying which execution path load() settled on.
+
+        Asked for after load() rather than logged inside it, because the caller
+        quietens logging while a model loads - DeepLabCut's loader is very
+        chatty - and that silence was also swallowing the one line that decides
+        whether live inference meets its deadline. A backend with nothing to
+        choose between says so and costs nothing.
+        """
+        return "default path"
+
     def is_valid(self) -> bool:
         """
         Check if the model is valid.  This is called before loading the model.
