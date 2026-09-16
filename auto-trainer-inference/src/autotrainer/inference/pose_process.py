@@ -41,6 +41,16 @@ logger = get_verbose_logger(__name__)
 PERFORMANCE_REPORT_PERIOD = 0.5
 
 
+def _is_end_of_recording(frames_indices) -> bool:
+    """Whether this batch is the marker capture sends when recording stops.
+
+    Read as "any camera", matching how the consumers test it: capture sends one
+    per camera and they arrive as one batch, so a partially filled batch still
+    means the recording has ended.
+    """
+    return bool((frames_indices == FrameIndexCategory.EOF_RECORDING).any())
+
+
 # Frames per camera the pose model graph is built for. DeepLabCut fixes its
 # batch size at construction (`setup_pose_prediction` builds a placeholder with
 # a literal batch dimension), so this value sizes the model and the offline
@@ -405,9 +415,25 @@ class PoseProcess(Process):
             # Nothing can be waiting behind it at depth 1, and the probe is
             # not free: it copies both frames and expands them to RGB before
             # the caller can know there was a newer one.
-            while live_drain and live_input.get_output(
-                    frame_buffer1, frames_indices1, timeout=0,
-                    frames_perf_c=frames_perf_c1):
+            #
+            # The drain stops on an end-of-recording batch. Skipping a frame
+            # only costs inference work, which is the whole point, but that
+            # batch is not a frame - it is the marker that closes the live pose
+            # files, and capture goes straight back to streaming after sending
+            # it. Draining past it overwrote it in place, so the pose process
+            # never saw the recording stop, the writers were never told to
+            # close, and every session finalized as incomplete with "Timed out
+            # waiting for live pose files to close". Whether it survived was a
+            # race against the next frame: it survived once in eleven sessions.
+            #
+            # Whatever arrives after it stays queued for the next call, which
+            # costs one iteration of staleness on a path where recording has
+            # already stopped.
+            while (live_drain
+                   and not _is_end_of_recording(frames_indices1)
+                   and live_input.get_output(
+                       frame_buffer1, frames_indices1, timeout=0,
+                       frames_perf_c=frames_perf_c1)):
                 pass
             return True
 
