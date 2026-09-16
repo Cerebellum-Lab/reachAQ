@@ -208,9 +208,12 @@ def check_calibration(
                    "stereo params carry no image_shape; cannot compare against the video")
         return
 
-    # image_shape is [(h, w), (h, w)] for the left and right cameras.
+    # image_shape is [(w, h), (w, h)] for the left and right cameras. Confirmed
+    # against a real calibration: 1440x1080 source video at the 4x oversample in
+    # the directory name stores (360, 270), which is width-first.
     calib_dims = [tuple(int(v) for v in pair) for pair in image_shape]
-    report.add(PASS, "calibration geometry", f"image_shape={calib_dims}")
+    report.add(PASS, "calibration geometry",
+               f"image_shape={calib_dims} (width, height)")
 
     ordered = [geometries.get("left"), geometries.get("right")]
     for index, (label, geometry) in enumerate(zip(("left", "right"), ordered)):
@@ -218,16 +221,17 @@ def check_calibration(
             continue
         if index >= len(calib_dims):
             continue
-        calib_h, calib_w = calib_dims[index]
+        calib_w, calib_h = calib_dims[index]
         video_w, video_h = int(geometry["width"]), int(geometry["height"])
-        if (calib_h, calib_w) == (video_h, video_w):
+        if (calib_w, calib_h) == (video_w, video_h):
             report.add(PASS, f"calibration vs {label}",
                        f"{video_w}x{video_h} matches the calibration")
         else:
             report.add(
                 FAIL, f"calibration vs {label}",
                 f"video is {video_w}x{video_h} but calibration was built at "
-                f"{calib_w}x{calib_h}. 2D will look right and 3D will be wrong.",
+                f"{calib_w}x{calib_h}. The intrinsics are in pixels of a different "
+                "frame, so 2D will look right and 3D will be wrong.",
             )
 
 
@@ -303,53 +307,66 @@ def check_pose(
                    f"from it. Model parts: {parts}")
         return
 
-    primary = sources.video_for("left") or next(iter(sources.cameras.values()))
-    above, total, best = _score_video(model, primary, parts, threshold, frame_limit)
-    if total == 0:
-        report.add(FAIL, "pose detection", f"no frames could be read from {primary}")
+    # Every camera, not just the primary. The live overlay is drawn per view, so a
+    # camera the model cannot read is a dead panel on screen regardless of how well
+    # its partner does - and on a real rig the two views can differ enormously.
+    any_camera_detects = False
+    gate_cameras = []
+    for name, video in sorted(sources.cameras.items()):
+        above, total, best = _score_video(model, video, parts, threshold, frame_limit)
+        if total == 0:
+            report.add(FAIL, f"pose {name}", f"no frames could be read from {video}")
+            continue
+
+        print(f"      {name}:")
+        for part in parts:
+            rate = above.get(part, 0) / total
+            marker = "  <- gate part" if part in GATE_PARTS else ""
+            print(f"        {part:<14} {rate * 100:5.1f}% of {total} frames"
+                  f"   best={best.get(part, 0.0):.3f}{marker}")
+
+        detected = [part for part in parts if above.get(part, 0) > 0]
+        gate_hits = max(above.get(part, 0) for part in GATE_PARTS)
+        if not detected:
+            report.add(
+                FAIL, f"pose {name}",
+                f"no body part cleared {threshold:.2f} in any of {total} sampled "
+                f"frames (best seen {max(best.values(), default=0.0):.3f}). This view "
+                "is not footage the model recognises; its live overlay will be noise.",
+            )
+            continue
+
+        any_camera_detects = True
+        if gate_hits:
+            gate_cameras.append(name)
+        report.add(PASS, f"pose {name}",
+                   f"{len(detected)}/{len(parts)} parts detected, hand gate in "
+                   f"{gate_hits / total * 100:.1f}% of {total} sampled frames")
+
+    if not any_camera_detects:
+        report.add(FAIL, "pose detection",
+                   "no camera view is readable by this model; pick a different session")
         return
 
-    for part in parts:
-        rate = above.get(part, 0) / total
-        marker = "  <- gate part" if part in GATE_PARTS else ""
-        print(f"        {part:<14} {rate * 100:5.1f}% of {total} frames"
-              f"   best={best.get(part, 0.0):.3f}{marker}")
-
-    # Is the model seeing this footage at all? Scene parts sit in frame constantly,
-    # so a model that is in-distribution clears the gate on something. Nothing
-    # anywhere means the video is not footage this model was trained for, and the
-    # overlay will be noise.
-    detected = [part for part in parts if above.get(part, 0) > 0]
-    if not detected:
-        report.add(
-            FAIL, "pose detection",
-            f"no body part cleared {threshold:.2f} in any of {total} sampled frames "
-            f"(best confidence seen: {max(best.values(), default=0.0):.3f}). This video "
-            "is not footage the configured model recognises; the demo would show an "
-            "overlay of noise. Pick a session the model was trained for.",
-        )
-        return
-
-    report.add(PASS, "pose detection",
-               f"{len(detected)}/{len(parts)} body parts detected across {total} "
-               f"sampled frames: {', '.join(detected)}")
-
-    # Gate parts are a hand in a grab posture. They exist only during a reach, so
-    # their absence from a sample is weak evidence, not proof - unlike the
-    # whole-model check above, which is decisive.
-    gate_hits = max(above.get(part, 0) for part in GATE_PARTS)
-    if gate_hits / total >= MIN_GATE_DETECTION_RATE:
+    # Live 2D is drawn per view, so one good camera is a usable demo. Live 3D is
+    # not: triangulation needs confident keypoints on both views of the same frame.
+    if len(gate_cameras) >= 2:
         report.add(PASS, "gate detection",
-                   f"a gate part clears the threshold in {gate_hits / total * 100:.1f}% "
-                   "of sampled frames, so the cue gate can be answered")
+                   f"hand gate detected on {', '.join(gate_cameras)} - 2D overlay and "
+                   "3D triangulation both have what they need")
+    elif gate_cameras:
+        report.add(
+            WARN, "gate detection",
+            f"hand gate detected on {gate_cameras[0]} only. Live 2D on that view is "
+            "fine, which is what a per-view overlay demo needs. Live 3D is not: "
+            "triangulation needs confident keypoints on both views of the same frame.",
+        )
     else:
         report.add(
             WARN, "gate detection",
-            f"no gate part ({', '.join(GATE_PARTS)}) cleared {threshold:.2f} in "
-            f"{total} sampled frames; best seen "
-            f"{max(best.get(part, 0.0) for part in GATE_PARTS):.3f}. Reaches are "
-            "sparse, so this may just be sampling. Confirm the chosen clip contains "
-            "reaches, or the closed-loop part of the demo will stay silent.",
+            f"no view put a gate part ({', '.join(GATE_PARTS)}) above {threshold:.2f}. "
+            "Reaches are sparse, so this may be sampling - but confirm the clip "
+            "contains reaches or the hand overlay will stay empty.",
         )
 
 

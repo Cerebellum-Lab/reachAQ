@@ -133,7 +133,8 @@ def test_calibration_geometry_match_passes(tmp_path):
     calib = tmp_path / "calib"
     (calib / "camera_matrix").mkdir(parents=True)
     with (calib / "camera_matrix" / "stereo_params.pickle").open("wb") as handle:
-        pickle.dump({"sessionA_left-sessionA_right": {"image_shape": [(258, 256), (258, 260)]}},
+        # (width, height) per camera, matching the videos below.
+        pickle.dump({"sessionA_left-sessionA_right": {"image_shape": [(256, 258), (260, 258)]}},
                     handle)
 
     report = verify_demo_readiness.Report()
