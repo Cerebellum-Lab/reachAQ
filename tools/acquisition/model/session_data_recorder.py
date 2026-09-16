@@ -2195,11 +2195,24 @@ class SessionDataRecorder:
             with h5py.File(chunks.path, "r") as source:
                 indices = source["sample_index"][:]
                 perf = source["perf_time"][:]
-                values = (
-                    source["values"][rows, :]
-                    if rows
-                    else np.empty((0, len(indices)), dtype=np.float32)
-                )
+                if rows:
+                    # h5py only accepts a strictly increasing fancy index, and
+                    # these rows are in the order the caller asked for, not the
+                    # order the channels were stored in. Those differ on a real
+                    # rig - tone1 is stored after cam_frames but requested
+                    # before it - so reading them directly raised
+                    # "Indexing elements must be in increasing order" and took
+                    # the whole session finalization down with it, leaving the
+                    # recording without its metadata.
+                    #
+                    # So read ascending, then put the rows back in the
+                    # requested order. np.unique also collapses a repeated
+                    # channel, which the index would reject for the same
+                    # reason, and its inverse restores the repeat.
+                    ascending, restore = np.unique(rows, return_inverse=True)
+                    values = source["values"][ascending.tolist(), :][restore]
+                else:
+                    values = np.empty((0, len(indices)), dtype=np.float32)
             return selected_names, indices, perf, values, chunks.sample_rate_hz
         names = next((tuple(chunk[4]) for chunk in chunks if chunk[4]), tuple())
         selected = tuple(
