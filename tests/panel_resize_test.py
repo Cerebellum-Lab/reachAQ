@@ -212,3 +212,40 @@ def test_main_content_coalesces_pose_bursts_at_display_rate(qapp, app_model, mon
     finally:
         content.close()
         content.deleteLater()
+
+
+def test_selecting_a_subject_does_not_crash_the_training_plan_panel(
+        qapp, app_model, monkeypatch):
+    """The progress widgets must survive construction.
+
+    They are built by _create_protocol_phase_progress_widget and were then
+    overwritten by a block of `= None` defaults that ran afterwards, so with
+    the protocol UI enabled _update_training_plan raised AttributeError on
+    _training_plan_progress_content the moment a subject was selected. The
+    handler caught it as a fatal main-thread exception, marked
+    runtime_diagnostics failed and left an error banner up for the rest of the
+    session, while the selection itself completed.
+    """
+    class _BehaviorPanelStub(ContentWidget):
+        def __init__(self, *_args, **_kwargs):
+            super().__init__()
+
+    monkeypatch.setattr(main_content_module, "BehaviorContent", _BehaviorPanelStub)
+    assert app_model.load_configuration() is True
+    content = MainContent(app_model)
+    try:
+        assert content.protocol_ui_enabled, (
+            "this guards the enabled path; disabled has its own early return")
+        for name in ("_training_plan_content",
+                     "_training_phase_content",
+                     "_training_plan_progress_content",
+                     "_training_phase_progress_content",
+                     "_protocol_phase_end_widget"):
+            assert getattr(content, name) is not None, (
+                f"{name} was reset to None after it was built")
+
+        # The call that used to raise. None is the no-plan case an operator
+        # hits first, and it reaches every one of the widgets above.
+        content._update_training_plan(None)
+    finally:
+        content.close()
