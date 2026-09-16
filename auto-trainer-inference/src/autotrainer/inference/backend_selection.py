@@ -288,6 +288,18 @@ def build_pose_model(model_path: str, shuffle_index=1, training_index=0, batch_s
     TensorFlow model pulls in TensorFlow, and on a torch-only deployment that
     import does not resolve at all.
     """
+    # A YOLO model directory is recognised by its sidecar rather than by a
+    # configuration flag. The sidecar has to exist for the model to load at
+    # all - it carries the keypoint names, which a .pt file does not - so its
+    # presence is an unambiguous signal, and detecting it here means demo
+    # mode and live acquisition can point at a YOLO model with no schema
+    # change and no new setting for an operator to get wrong. DeepLabCut
+    # projects are untouched: they have config.yaml and no sidecar, so they
+    # never reach this branch.
+    if os.path.isfile(os.path.join(model_path, "yolo_pose.yaml")):
+        from .yolo import YoloPoseModel
+        return YoloPoseModel(model_path, batch_size=batch_size)
+
     backend = selected_backend() if backend is None else backend
 
     if backend == TORCH_BACKEND:
