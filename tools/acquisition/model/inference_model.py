@@ -42,6 +42,15 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
     IS_ENABLED = "is_enabled"
     IS_PREDICT_ENABLED = "is_predict_enabled"
     MODEL_LOCATION = "model_location"
+    LIVE_POSE_STATS = "live_pose_stats"
+    """From the pose process, per reporting window:
+
+    (session_pose_count, call_mean_ms, call_max_ms, sensor_to_result_mean_ms,
+     sensor_to_result_max_ms)
+
+    The call figures are what the model costs. Sensor-to-result additionally
+    includes the queue wait, and is the number the sub-5 ms target is about.
+    """
 
     def __init__(self,
         pose_algorithm: PoseAlgorithm,
@@ -626,8 +635,22 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
                 elif msg == InferenceStatusMessageKind.Loading:
                     self._set_status(InferenceStatus.loading)
                 elif msg == InferenceStatusMessageKind.Performance:
-                    logger.info(f"{context :.1f} predict calls/s")
-                    fps = context * self._frames_per_camera
+                    # The pose process sends (calls/s, session count, call
+                    # mean/max ms, sensor-to-result mean/max ms). A bare float
+                    # is still accepted so an older pose process does not break
+                    # the handler; it simply carries no timing.
+                    if isinstance(context, tuple):
+                        cps, pose_count, mean_ms, max_ms = context[:4]
+                        e2e_mean, e2e_max = (context[4:6] if len(context) >= 6
+                                             else (float("nan"), float("nan")))
+                        self._on_property_changed(
+                            self.LIVE_POSE_STATS,
+                            (pose_count, mean_ms, max_ms, e2e_mean, e2e_max),
+                            None)
+                    else:
+                        cps = context
+                    logger.info(f"{cps :.1f} predict calls/s")
+                    fps = cps * self._frames_per_camera
                     logger.info(f"{fps :.1f} frames/camera/s ({(fps * 2):.1f} total frames/s)")
                 elif msg == InferenceStatusMessageKind.Running:
                     mode = InferenceMode(context)
