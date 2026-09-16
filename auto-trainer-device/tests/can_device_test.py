@@ -29,6 +29,8 @@ from autotrainer.device import (
     MotorConfigurationFile,
     Tone,
 )
+from autotrainer.device import CanInterface, CanTransportConfiguration
+from autotrainer.device import can_device
 from autotrainer.device.can_device import (
     default_move_retract,
     default_load_pellet,
@@ -662,3 +664,27 @@ def test_rel_move_succeed_after_uuid_ack_timeout(
     assert not ack_timeout_engaged
     assert ack_timeout_engaged_count == 1
     assert device._commands_handler_thread.is_alive()
+
+
+def test_pyjerrycan_interface_keeps_the_configured_transport():
+    """A non-SocketCAN transport must not be replaced by bare constructor defaults.
+
+    The pyjerrycan branch used to drop the caller's configuration entirely, so a
+    custom channel or receive timeout was silently ignored.
+    """
+    transport = CanTransportConfiguration(
+        kind="pyjerrycan",
+        channel="can7",
+        receive_timeout_seconds=0.25,
+    )
+    device = CanDevice(
+        api=DeviceApi(message_callback=data_callback),
+        force_emulation=True,
+        can_transport=transport,
+    )
+    with mock.patch.object(can_device, "HAVE_CAN_DEVICE", True):
+        interface = device._make_device_interface(force_emulation=False)
+
+    assert isinstance(interface, CanInterface)
+    assert interface._can_transport.channel == "can7"
+    assert interface._can_transport.receive_timeout_seconds == 0.25

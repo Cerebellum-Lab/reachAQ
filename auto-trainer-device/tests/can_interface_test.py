@@ -7,7 +7,8 @@ import pytest
 
 pytestmark = pytest.mark.canbus
 
-from autotrainer.device import (CanInterface, Target, Motor, Heartbeat, ServoConfig, StepperConfig,
+from autotrainer.device import (CanInterface, CanTransportConfiguration,
+                                Target, Motor, Heartbeat, ServoConfig, StepperConfig,
                                 DigitalOutputs, PelletDigitalInputs, Tone,
                                 AnalogOutputs, AnalogOutput,
                                 ColorLed, ServoStatus, StepperStatus,
@@ -17,7 +18,10 @@ from autotrainer.device import (CanInterface, Target, Motor, Heartbeat, ServoCon
 @pytest.fixture(scope="module")
 def interface():
     print(f"DEBUG: Loading Interface")
-    interface = CanInterface()
+    # Build the transport explicitly, the way tools/hardware/validate_can_hardware.py
+    # does. A bare CanInterface() takes the pyjerrycan default and cannot open a
+    # SocketCAN rig, whatever AUTOTRAINER_CAN_* says.
+    interface = CanInterface(can_transport=CanTransportConfiguration.from_environment())
 
     if not interface.open():
         pytest.fail("Failed to open CAN interface")
