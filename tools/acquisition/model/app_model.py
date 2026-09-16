@@ -1010,7 +1010,9 @@ class AppModel(ObservableObject):
             camera_config.port = 0
             camera_config.path = Path(video).as_posix()
             params = dict(camera_config.params)
-            params["fps"] = sources.fps
+            # int, not float: this reaches the camera as a URL parameter and
+            # CameraBase.set_property parses it with int(), which rejects "150.0".
+            params["fps"] = int(round(sources.fps))
             camera_config.params = params
             camera_config.is_enabled = True
             logger.notice(
