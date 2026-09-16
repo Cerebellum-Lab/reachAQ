@@ -215,3 +215,65 @@ def test_summary_separates_the_two_timings(telemetry):
     assert summary["sensorToResultMeanMs"] == pytest.approx(7.5)
     assert summary["sensorToResultMaxMs"] == pytest.approx(12.0)
     json.dumps(summary)
+def test_counts_are_relative_to_the_session_not_the_capture_process():
+    """Capture starts at Running, recording starts later; only the gap counts.
+
+    The processes report totals accumulated since they started, which on a real
+    rig is tens of seconds before Record is pressed. Taking them whole made a
+    45 s session claim 7820 frames from a pair of 150 fps cameras - 174 fps.
+    """
+    item = SessionTelemetry()
+    # Eight seconds of streaming while the operator sets up.
+    item.record_capture(0, acquired=1200, dropped=0)
+    item.record_capture(1, acquired=1200, dropped=0)
+    item.record_inference(count=1100, mean_ms=4.0, max_ms=9.0)
+
+    item.begin(started_perf=100.0)
+    item.record_capture(0, acquired=1200 + 6750, dropped=0)
+    item.record_capture(1, acquired=1200 + 6748, dropped=0)
+    item.record_inference(count=1100 + 6300, mean_ms=4.0, max_ms=9.0)
+
+    assert item.frames_acquired == 6750
+    assert item.frames_inferenced == 6300
+    assert item.inferenced_percent == pytest.approx(93.33, abs=0.01)
+
+
+def test_drops_before_the_session_are_not_blamed_on_it():
+    """A drop while idling in Running is not a hole in this recording."""
+    item = SessionTelemetry()
+    item.record_capture(0, acquired=1000, dropped=4)
+    item.begin(started_perf=100.0)
+    assert item.dropped_frames == 0
+    assert item.has_dropped_frames is False
+
+    item.record_capture(0, acquired=2000, dropped=6)
+    assert item.dropped_frames == 2
+    assert item.dropped_by_camera == {0: 2}
+
+
+def test_counts_freeze_when_the_session_ends(telemetry):
+    """Acquisition continues in Running, so the totals keep climbing.
+
+    Subtracting the baseline live would make a finished session grow after the
+    operator stopped it.
+    """
+    telemetry.record_capture(0, acquired=1000, dropped=2)
+    telemetry.record_inference(count=900, mean_ms=4.0, max_ms=5.0)
+    telemetry.end(ended_perf=110.0)
+
+    telemetry.record_capture(0, acquired=5000, dropped=9)
+    telemetry.record_inference(count=4800, mean_ms=4.0, max_ms=5.0)
+    assert telemetry.frames_acquired == 1000
+    assert telemetry.dropped_frames == 2
+    assert telemetry.frames_inferenced == 900
+    assert telemetry.summary()["framesAcquired"] == 1000
+
+
+def test_a_restarted_source_counts_from_zero_rather_than_going_negative():
+    """A capture process that restarts reports a total below the baseline."""
+    item = SessionTelemetry()
+    item.record_capture(0, acquired=5000, dropped=3)
+    item.begin(started_perf=100.0)
+    item.record_capture(0, acquired=120, dropped=1)
+    assert item.frames_acquired == 120
+    assert item.dropped_frames == 1

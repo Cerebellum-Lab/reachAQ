@@ -1547,6 +1547,21 @@ def test_final_metadata_uses_canonical_boundary_not_stale_project_timestamp(
     assert len(serialized_json) < 20_000
     assert saved["artifacts"]["alignment"]["$ref"] == "streams/alignment.json"
     assert saved["artifacts"]["trialSummary"]["$ref"] == "streams/trial_summary.json"
+    # The live counters the operator watched are kept with the session, so the
+    # same numbers can be read back afterwards rather than only having existed
+    # on screen.
+    assert set(saved["capture"]) >= {
+        "elapsedSeconds",
+        "framesAcquired",
+        "framesDropped",
+        "framesDroppedByCamera",
+        "framesInferenced",
+        "inferencedPercent",
+        "inferenceCallMeanMs",
+        "inferenceCallMaxMs",
+        "sensorToResultMeanMs",
+        "sensorToResultMaxMs",
+    }
     manifest = json.loads((session_dir / "manifest.json").read_text())
     assert saved["metadataGenerationId"] == manifest["metadataGenerationId"]
     assert manifest["authoritativeMetadata"] == "metadata.json"
