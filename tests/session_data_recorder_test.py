@@ -1415,3 +1415,93 @@ def test_nidaq_coverage_classifies_warning_and_critical_boundaries(
     messages = " ".join((*source["warnings"], source["failure"] or ""))
     assert result["sessionComplete"] is expected_complete
     assert warning_fragment in messages
+def _nidaq_spool(tmp_path, channel_names, values):
+    """A spooled NI-DAQ capture, as the stream writer leaves it on disk."""
+    path = tmp_path / "nidaq.h5"
+    samples = len(values[0])
+    with h5py.File(path, "w") as handle:
+        handle.create_dataset("sample_index", data=np.arange(samples, dtype=np.int64))
+        handle.create_dataset("perf_time",
+                              data=np.arange(samples, dtype=np.float64) / 10_000.0)
+        handle.create_dataset("values", data=np.asarray(values, dtype=np.float32))
+    return session_data_recorder._NidaqSpoolSnapshot(
+        path=path,
+        channel_names=tuple(channel_names),
+        sample_rate_hz=10_000.0,
+        sample_count=samples,
+        first_sample_index=0,
+        last_sample_index=samples - 1,
+        first_perf_time=0.0,
+        last_perf_time=(samples - 1) / 10_000.0,
+        gap_count=0,
+        overrun_samples=0,
+        first_error=None,
+        last_error=None,
+        error_count=0,
+        worker_failed=False,
+    )
+
+
+def test_spooled_channels_are_read_when_stored_out_of_requested_order(tmp_path):
+    """The stored order is the rig's, the requested order is the caller's.
+
+    On the bench rig cam_frames is stored first and tone1 third, while the tone
+    correlation asks for the tones first - so the row index came out as
+    [2, 3, 0]. h5py only accepts a strictly increasing fancy index, so this
+    raised "Indexing elements must be in increasing order", failed session
+    finalization, and left every recording without its metadata.
+    """
+    snapshot = _nidaq_spool(
+        tmp_path,
+        ("cam_frames", "barcode", "tone1", "tone2"),
+        [[1, 1, 1], [2, 2, 2], [3, 3, 3], [4, 4, 4]],
+    )
+
+    names, _indices, _perf, values, rate = SessionDataRecorder._nidaq_arrays(
+        snapshot,
+        requested_names=("tone1", "tone2", "tone3_r", "tone3_l", "cam_frames"),
+    )
+
+    # Absent channels are dropped, the rest keep the order that was asked for.
+    assert names == ("tone1", "tone2", "cam_frames")
+    assert values.tolist() == [[3, 3, 3], [4, 4, 4], [1, 1, 1]]
+    assert rate == 10_000.0
+
+
+def test_a_repeated_channel_request_is_served_rather_than_rejected(tmp_path):
+    """np.unique collapses the duplicate; the inverse has to restore it.
+
+    A repeated index is not strictly increasing either, so this would fail the
+    same way rather than simply returning the row twice.
+    """
+    snapshot = _nidaq_spool(tmp_path, ("cam_frames", "tone1"),
+                            [[1, 1], [2, 2]])
+
+    names, _indices, _perf, values, _rate = SessionDataRecorder._nidaq_arrays(
+        snapshot, requested_names=("tone1", "cam_frames", "tone1"),
+    )
+
+    assert names == ("tone1", "cam_frames", "tone1")
+    assert values.tolist() == [[2, 2], [1, 1], [2, 2]]
+
+
+def test_every_channel_in_stored_order_still_reads(tmp_path):
+    """The path that already worked: no requested_names, so nothing reorders."""
+    snapshot = _nidaq_spool(tmp_path, ("cam_frames", "tone1"),
+                            [[1, 1], [2, 2]])
+
+    names, _indices, _perf, values, _rate = SessionDataRecorder._nidaq_arrays(
+        snapshot)
+
+    assert names == ("cam_frames", "tone1")
+    assert values.tolist() == [[1, 1], [2, 2]]
+
+
+def test_no_matching_channel_returns_an_empty_block(tmp_path):
+    snapshot = _nidaq_spool(tmp_path, ("cam_frames",), [[1, 1, 1]])
+
+    names, indices, _perf, values, _rate = SessionDataRecorder._nidaq_arrays(
+        snapshot, requested_names=("tone1",))
+
+    assert names == ()
+    assert values.shape == (0, len(indices))
