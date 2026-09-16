@@ -58,9 +58,15 @@ class SessionTelemetry(ObservableObject):
         self._active = False
         self._started_perf: typing.Optional[float] = None
         self._ended_perf: typing.Optional[float] = None
+        # Latest absolute totals, tracked whether or not a session is running.
+        # They have to be known before begin() so it has something to subtract.
         self._acquired_by_camera: typing.Dict[int, int] = {}
         self._dropped_by_camera: typing.Dict[int, int] = {}
         self._inferenced = 0
+        self._baseline_acquired: typing.Dict[int, int] = {}
+        self._baseline_dropped: typing.Dict[int, int] = {}
+        self._baseline_inferenced = 0
+        self._frozen: typing.Optional[typing.Dict[str, typing.Any]] = None
         self._inference_total_ms = 0.0
         self._inference_count = 0
         self._inference_max_ms = 0.0
@@ -71,13 +77,24 @@ class SessionTelemetry(ObservableObject):
     # -- lifecycle --------------------------------------------------------
 
     def begin(self, started_perf: typing.Optional[float] = None) -> None:
-        """Reset for a new session. Every counter is per session, not lifetime."""
+        """Reset for a new session. Every counter is per session, not lifetime.
+
+        The counts arrive as totals accumulated by the capture and pose
+        processes since they started, which is when the system went to Running
+        - routinely tens of seconds before the operator pressed Record. So the
+        session starts by remembering where those totals stood, and every
+        figure below is reported relative to that mark. Clearing the
+        dictionaries instead would let the next absolute report land whole: a
+        45 s session measured that way claimed 7820 frames and 174 fps from a
+        pair of 150 fps cameras.
+        """
         self._active = True
         self._started_perf = time.perf_counter() if started_perf is None else started_perf
         self._ended_perf = None
-        self._acquired_by_camera = {}
-        self._dropped_by_camera = {}
-        self._inferenced = 0
+        self._frozen = None
+        self._baseline_acquired = dict(self._acquired_by_camera)
+        self._baseline_dropped = dict(self._dropped_by_camera)
+        self._baseline_inferenced = self._inferenced
         self._inference_total_ms = 0.0
         self._inference_count = 0
         self._inference_max_ms = 0.0
@@ -91,6 +108,15 @@ class SessionTelemetry(ObservableObject):
         if not self._active:
             return
         self._ended_perf = time.perf_counter() if ended_perf is None else ended_perf
+        # Snapshot before clearing the flag: acquisition continues while the
+        # system stays in Running, so the underlying totals keep climbing and
+        # a live subtraction would make a finished session grow.
+        self._frozen = {
+            "acquired": self.frames_acquired,
+            "dropped": self.dropped_frames,
+            "dropped_by_camera": self.dropped_by_camera,
+            "inferenced": self.frames_inferenced,
+        }
         self._active = False
         self.property_changed(self.ACTIVE_PROP, False, True)
 
@@ -102,13 +128,16 @@ class SessionTelemetry(ObservableObject):
         Totals rather than deltas on purpose: the capture process emits these
         periodically, and a dropped or reordered message would silently corrupt
         a running sum while an absolute value simply corrects itself.
+
+        Recorded even between sessions, because begin() subtracts whatever the
+        totals had reached by then and it can only do that if it has seen them.
         """
-        if not self._active:
-            return
         previous_acquired = self.frames_acquired
         previous_dropped = self.dropped_frames
         self._acquired_by_camera[camera_index] = int(acquired)
         self._dropped_by_camera[camera_index] = int(dropped)
+        if not self._active:
+            return
         if self.frames_acquired != previous_acquired:
             self.property_changed(self.ACQUIRED_PROP, self.frames_acquired,
                                   previous_acquired)
@@ -126,11 +155,11 @@ class SessionTelemetry(ObservableObject):
         by how many calls it covered, so a slow burst is not averaged away by a
         later quiet one.
         """
-        if not self._active:
-            return
         previous = self._inferenced
         new_calls = max(0, int(count) - previous)
         self._inferenced = int(count)
+        if not self._active:
+            return
         if new_calls and math.isfinite(mean_ms):
             self._inference_total_ms += mean_ms * new_calls
             self._inference_count += new_calls
@@ -143,7 +172,8 @@ class SessionTelemetry(ObservableObject):
             self._e2e_max_ms = max(self._e2e_max_ms,
                                    float(sensor_to_result_max_ms))
         if self._inferenced != previous:
-            self.property_changed(self.INFERENCED_PROP, self._inferenced, previous)
+            self.property_changed(self.INFERENCED_PROP, self.frames_inferenced,
+                                  None)
             self.property_changed(self.INFERENCE_TIME_PROP,
                                   self.inference_mean_ms, None)
 
@@ -160,13 +190,39 @@ class SessionTelemetry(ObservableObject):
         end = self._ended_perf if self._ended_perf is not None else time.perf_counter()
         return max(0.0, end - self._started_perf)
 
+    @staticmethod
+    def _since_baseline(latest: int, baseline: int) -> int:
+        """One camera's contribution to this session.
+
+        A capture process that restarted reports a total below the mark taken
+        at begin(). Counting from zero there rather than returning a negative
+        is the conservative direction: over-reporting a frame that predates the
+        restart is better than hiding one that did not.
+        """
+        return latest if latest < baseline else latest - baseline
+
     @property
     def frames_acquired(self) -> int:
-        return max(self._acquired_by_camera.values(), default=0)
+        if self._frozen is not None:
+            return self._frozen["acquired"]
+        if self._started_perf is None:
+            return 0
+        return max(
+            (self._since_baseline(value, self._baseline_acquired.get(index, 0))
+             for index, value in self._acquired_by_camera.items()),
+            default=0,
+        )
 
     @property
     def dropped_frames(self) -> int:
-        return sum(self._dropped_by_camera.values())
+        if self._frozen is not None:
+            return self._frozen["dropped"]
+        if self._started_perf is None:
+            return 0
+        return sum(
+            self._since_baseline(value, self._baseline_dropped.get(index, 0))
+            for index, value in self._dropped_by_camera.items()
+        )
 
     @property
     def has_dropped_frames(self) -> bool:
@@ -174,14 +230,18 @@ class SessionTelemetry(ObservableObject):
 
     @property
     def frames_inferenced(self) -> int:
-        return self._inferenced
+        if self._frozen is not None:
+            return self._frozen["inferenced"]
+        if self._started_perf is None:
+            return 0
+        return self._since_baseline(self._inferenced, self._baseline_inferenced)
 
     @property
     def inferenced_percent(self) -> float:
         acquired = self.frames_acquired
         if acquired <= 0:
             return 0.0
-        return 100.0 * self._inferenced / acquired
+        return 100.0 * self.frames_inferenced / acquired
 
     @property
     def inference_mean_ms(self) -> float:
@@ -205,7 +265,15 @@ class SessionTelemetry(ObservableObject):
 
     @property
     def dropped_by_camera(self) -> typing.Dict[int, int]:
-        return dict(self._dropped_by_camera)
+        if self._frozen is not None:
+            return dict(self._frozen["dropped_by_camera"])
+        if self._started_perf is None:
+            return {}
+        return {
+            index: self._since_baseline(value,
+                                        self._baseline_dropped.get(index, 0))
+            for index, value in self._dropped_by_camera.items()
+        }
 
     def summary(self) -> typing.Dict[str, typing.Any]:
         """What goes into the session metadata.
