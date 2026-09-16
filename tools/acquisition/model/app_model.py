@@ -7863,6 +7863,15 @@ class AppModel(ObservableObject):
     def _on_session_capture_ended(self, reason: RecordingEndingReason):
         self._recording_ending_reason = RecordingEndingReason(reason)
         logger.debug("session capture trigger ended: %s", reason)
+        # Freeze the counters here rather than waiting for finalization. The
+        # pose process finishes its backlog after capture stops, and those
+        # predicts are not frames of this session getting a live pose - once
+        # the model was fast enough to keep up, letting them in took a session
+        # that ran at 99.8% of frames inferenced and reported 125%.
+        #
+        # end() is idempotent, so the later call in _complete_stopped_recording
+        # still covers any ending path that does not reach here.
+        self._session_telemetry.end()
 
     def _on_session_ending(self, project: ProjectInfo, result: CaptureAnalysisResult):
         if project.short_id in self._aborted_session_ids:

@@ -277,3 +277,19 @@ def test_a_restarted_source_counts_from_zero_rather_than_going_negative():
     item.record_capture(0, acquired=120, dropped=1)
     assert item.frames_acquired == 120
     assert item.dropped_frames == 1
+
+
+def test_work_finished_after_the_session_is_not_counted_against_it(telemetry):
+    """The pose backlog drains after capture stops; it is not session work.
+
+    Once the model was fast enough to keep up, a session that ran at 99.8% of
+    frames inferenced reported 125% because the drain landed before the
+    counters were frozen.
+    """
+    telemetry.record_capture(0, acquired=6764, dropped=0)
+    telemetry.record_inference(count=6749, mean_ms=4.3, max_ms=10.2)
+    telemetry.end(ended_perf=145.0)
+
+    telemetry.record_inference(count=8474, mean_ms=4.3, max_ms=10.2)
+    assert telemetry.frames_inferenced == 6749
+    assert telemetry.inferenced_percent <= 100.0
