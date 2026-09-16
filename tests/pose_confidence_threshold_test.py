@@ -20,6 +20,7 @@ than to the engine.
 
 import pytest
 
+from autotrainer.inference import backend_selection
 from autotrainer.inference.backend_selection import (
     DEFAULT_CONFIDENCE_THRESHOLDS,
     POSE_BACKEND_ENV_VAR,
@@ -50,10 +51,13 @@ def test_the_torch_default_would_not_discard_most_keypoints():
     assert DEFAULT_CONFIDENCE_THRESHOLDS[TORCH_BACKEND] < 0.9
 
 
-def test_the_threshold_follows_the_selected_backend():
+def test_the_threshold_follows_the_selected_backend(monkeypatch):
+    # Unset now resolves from what is installed, so pin it: otherwise this
+    # asserts TensorFlow's scale on a rig that would run torch.
+    monkeypatch.setattr(backend_selection, "_installed", lambda module: True)
     assert confidence_threshold(None, {POSE_BACKEND_ENV_VAR: "torch"}) == 0.6
     assert confidence_threshold(None, {POSE_BACKEND_ENV_VAR: "tensorflow"}) == 0.9
-    assert confidence_threshold(None, {}) == 0.9, "unset means TensorFlow"
+    assert confidence_threshold(None, {}) == 0.9, "unset prefers TensorFlow"
 
 
 def test_an_explicit_override_wins():

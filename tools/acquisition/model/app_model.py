@@ -82,6 +82,7 @@ from autotrainer.inference import (
     DlcPoseModel,
 )
 from autotrainer.inference.backend_selection import (
+    available_backends,
     confidence_threshold,
     selected_backend,
     trained_model_name,
@@ -6482,8 +6483,14 @@ class AppModel(ObservableObject):
             if callable(runtime_check):
                 gpu_status = runtime_check()
                 if not gpu_status.is_available:
+                    # Name the engine that was actually probed. This said
+                    # "TensorFlow" whatever the probe ran, so a torch-only rig
+                    # was told to fix a TensorFlow runtime it never installed.
+                    probed = gpu_status.backend or "configured"
+                    installed = ", ".join(available_backends()) or "none"
                     inference_preflight_error = (
-                        "Live inference cannot start because a compatible TensorFlow GPU runtime was not found. "
+                        f"Live inference cannot start because a compatible {probed} GPU "
+                        f"runtime was not found (engines installed: {installed}). "
                         "Cameras and independent hardware will continue without live inference. "
                         "Disable Live inference in Preferences or launch with --no-live-inference "
                         "to suppress this failure.\n\n"
