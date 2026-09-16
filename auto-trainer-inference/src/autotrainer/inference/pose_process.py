@@ -174,7 +174,7 @@ class PoseProcess(Process):
             logger.warning("pellet model not specified; using in-memory random data")
             model = MemoryPoseModel(model_batch_size)
         else:
-            backend = selected_backend()
+            backend = selected_backend(model_path=model_path)
             logger.notice("Loading DLC model %r using the %s backend", model_path, backend)
             model = build_pose_model(model_path, 1, 0, model_batch_size, backend=backend)
 

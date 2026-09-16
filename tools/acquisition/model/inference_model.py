@@ -341,7 +341,12 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
             # are not interchangeable: on the reachAQ rig TensorFlow sees the
             # GPU while every torch convolution aborts in cuDNN, so probing
             # the wrong one passes the check and then crashes the pose process.
-            self._gpu_runtime_status = detect_gpu_runtime(required_backend=selected_backend())
+            # With the model path, so a YOLO model probes the torch runtime
+            # rather than whatever the environment happens to default to. The
+            # probe deciding one engine while build_pose_model loads another is
+            # how a rig passes the check and then fails to start.
+            self._gpu_runtime_status = detect_gpu_runtime(
+                required_backend=selected_backend(model_path=self._model_location))
         return self._gpu_runtime_status
 
     def can_start_live_inference(self) -> bool:
@@ -365,7 +370,7 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
         """
         if not self._model_location:
             return True
-        backend = selected_backend()
+        backend = selected_backend(model_path=self._model_location)
         try:
             model = build_pose_model(self._model_location, backend=backend)
             valid = model.is_valid()
