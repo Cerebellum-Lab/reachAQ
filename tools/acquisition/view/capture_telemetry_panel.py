@@ -107,6 +107,11 @@ class CaptureTelemetryPanel(QWidget):
         body_layout.addStretch(1)
 
         body.setVisible(False)
+        # Tracked explicitly rather than read back from isVisible(): a widget
+        # reports invisible until every ancestor is shown, so on an inactive
+        # tab - or before the window appears - the panel would think it was
+        # collapsed and draw the summary line on top of the open body.
+        self._expanded = False
         outer.addWidget(body)
 
         telemetry.property_changed += self._on_telemetry_changed
@@ -143,9 +148,10 @@ class CaptureTelemetryPanel(QWidget):
 
     @property
     def is_expanded(self) -> bool:
-        return self._body.isVisible()
+        return self._expanded
 
     def set_expanded(self, expanded: bool) -> None:
+        self._expanded = expanded
         self._body.setVisible(expanded)
         self._toggle.setText(self._EXPANDED_ARROW if expanded
                              else self._COLLAPSED_ARROW)
