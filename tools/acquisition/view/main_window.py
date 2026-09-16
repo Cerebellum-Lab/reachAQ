@@ -25,6 +25,12 @@ from autotrainer.core import EventManager, Offset3DTuple, AnimalSubject, SystemC
     calculate_std_dev_manual, ProjectInfo, get_perf_now
 from autotrainer.core.capture import CaptureProcessStatus
 from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
+from autotrainer.core.configuration.demo_sources import (
+    DEFAULT_DEMO_SOURCES_PATH,
+    DemoSources,
+    DemoSourcesError,
+    load_demo_sources,
+)
 from autotrainer.core.logging import get_console_handler, get_verbose_logger
 from autotrainer.core.multiproc import make_daemon_timer, no_op_timer
 from autotrainer.core.pose_elements import SceneElement
@@ -123,6 +129,7 @@ class MainWindow(QMainWindow):
         is_dev: bool = False,
         random_cameras: bool = False,
         live_inference: Optional[bool] = None,
+        demo_sources: Optional[DemoSources] = None,
     ):
         super().__init__(None)
 
@@ -134,6 +141,8 @@ class MainWindow(QMainWindow):
 
         self._app = app
         self._is_dev = is_dev
+        self._demo_sources = demo_sources
+        self._demo_spec_path = DEFAULT_DEMO_SOURCES_PATH
         prefs = self._preferences = user_preferences
         self._update_log_level(prefs.log_level)
         self._title = _make_window_title(prefs)
@@ -193,7 +202,9 @@ class MainWindow(QMainWindow):
         app_model.training_plan_deserialized += self._on_training_plan_deserialized
 
         try:
-            app_model.load_configuration(config_file, random_cameras=random_cameras)
+            app_model.load_configuration(
+                config_file, random_cameras=random_cameras, demo_sources=demo_sources
+            )
         except Exception as err:
             tb = traceback.format_exc()
             app_model.on_error("Failed load configuration",

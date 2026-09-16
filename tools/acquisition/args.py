@@ -3,6 +3,7 @@ import argparse
 from pathlib import Path
 from typing import Optional
 
+from autotrainer.core.configuration.demo_sources import DEFAULT_DEMO_SOURCES_PATH
 from tools.acquisition.model.app_model_status import AppModelStatus
 
 
@@ -27,6 +28,7 @@ class AutoTrainerParsedArgs:
     start_mode: AppModelStatus = AppModelStatus.IDLE
     live_inference: Optional[bool] = None
     random_cameras: bool = False
+    demo: Optional[Path] = None
     dev: bool = False
     allow_can_emulation: bool = False
 
@@ -59,8 +61,20 @@ def make_autotrainer_parser(
         action="store_false",
         help="disable live inference for this run, overriding the configuration",
     )
-    parser.add_argument("--random-cameras", help="use in-memory random image cameras instead of physical cameras",
-                        action="store_true")
+    camera_group = parser.add_mutually_exclusive_group()
+    camera_group.add_argument("--random-cameras",
+                              help="use in-memory random image cameras instead of physical cameras",
+                              action="store_true")
+    camera_group.add_argument(
+        "--demo",
+        nargs="?",
+        const=DEFAULT_DEMO_SOURCES_PATH,
+        default=None,
+        type=Path,
+        metavar="SPEC",
+        help="play pre-recorded video through the real pipeline instead of physical "
+             "cameras; SPEC defaults to %(const)s",
+    )
     if allow_dev_mode:
         parser.add_argument("-d", "--dev", help="enable development mode and options", action="store_true")
         parser.add_argument("-e", "--allow-can-emulation", help="include CAN emulation as a connection option",

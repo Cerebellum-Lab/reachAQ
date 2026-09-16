@@ -20,3 +20,34 @@ def test_headless_can_keep_acquiring_default():
     args = make_autotrainer_parser(default_start_mode=AppModelStatus.RUNNING).parse_args([])
 
     assert args.start_mode is AppModelStatus.RUNNING
+
+
+def test_demo_flag_defaults_to_none():
+    args = make_autotrainer_parser().parse_args([])
+
+    assert args.demo is None
+
+
+def test_bare_demo_flag_uses_the_default_spec_path():
+    from pathlib import Path
+
+    from autotrainer.core.configuration.demo_sources import DEFAULT_DEMO_SOURCES_PATH
+
+    args = make_autotrainer_parser().parse_args(["--demo"])
+
+    assert Path(args.demo) == DEFAULT_DEMO_SOURCES_PATH
+
+
+def test_demo_flag_accepts_an_explicit_path():
+    from pathlib import Path
+
+    args = make_autotrainer_parser().parse_args(["--demo", "/tmp/custom.yaml"])
+
+    assert Path(args.demo) == Path("/tmp/custom.yaml")
+
+
+def test_demo_and_random_cameras_are_mutually_exclusive():
+    import pytest
+
+    with pytest.raises(SystemExit):
+        make_autotrainer_parser().parse_args(["--demo", "--random-cameras"])
