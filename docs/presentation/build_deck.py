@@ -340,14 +340,18 @@ def slide_data(prs):
 def slide_demo(prs):
     slide = _blank(prs)
     _title(slide, "Demo", "No mouse today — so exactly one stage is substituted")
-    _picture(slide, "demo_substitution.png", Inches(1.6), Inches(1.8), Inches(10.1), Inches(2.0))
-    _picture(slide, "demo_frames.png", Inches(3.85), Inches(3.95), Inches(5.6), Inches(3.3))
+    _picture(slide, "demo_substitution.png", Inches(1.9), Inches(1.78), Inches(9.5), Inches(1.6))
+    _picture(slide, "live_overlay.png", Inches(0.75), Inches(3.45), Inches(11.8), Inches(3.0))
+    _text(slide, Inches(0.75), Inches(6.6), Inches(11.8), Inches(0.4),
+          "Live 2D pose, per view, computed on the GPU from the played frames — "
+          "captured from the running application on the rig.", 12, MUTED, italic=True)
     _notes(slide,
            "Run order:\n"
            "1. Launch with --demo, or toggle Tools > Demo Mode while idle, to show both "
            "routes.\n"
-           "2. Show the live camera panels with the pose overlay. Real inference, on "
-           "played frames.\n"
+           "2. Show the live camera panels. Each view carries its own 2D pose overlay, "
+           "computed on the GPU from the played frames. This is real inference running "
+           "now, not a replayed result.\n"
            "3. Show the NI-DAQ live signal stream. Genuinely live.\n"
            "4. Drive the pellet device manually. Genuinely live.\n"
            "5. Open the protocol table; show cue timing and trigger profiles. Genuinely "

@@ -218,16 +218,21 @@ the rig notes.
 
 ## 12. Demo
 
-Assets: `demo_substitution.png`, `demo_frames.png`
+Assets: `demo_substitution.png`, `live_overlay.png`
 
 - No mouse today, so the camera frames come from a recorded session
 - Exactly one stage is substituted. Everything downstream is the real pipeline.
-- Pose inference, NI-DAQ streaming, pellet control, protocols, and ports are all live
+- Each view carries its own live 2D pose overlay, computed on the GPU from the played
+  frames. Real inference running now, not a replayed result.
+- NI-DAQ streaming, pellet control, protocols, and ports are all live
+
+The slide image is a screenshot of the running application on the rig, not a mock-up.
 
 Notes — run order:
 
 1. Launch with `--demo`, or toggle **Tools → Demo Mode** while idle, to show both routes.
-2. Show the live camera panels with the pose overlay. Real inference, on played frames.
+2. Show the live camera panels. Each view carries its own 2D pose overlay, computed on
+   the GPU from the played frames. Real inference running now, not a replayed result.
 3. Show the NI-DAQ live signal stream. Genuinely live.
 4. Drive the pellet device manually. Genuinely live.
 5. Open the protocol table; show cue timing and trigger profiles. Genuinely live.
