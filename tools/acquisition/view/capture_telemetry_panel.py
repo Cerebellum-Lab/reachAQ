@@ -1,6 +1,6 @@
 import math
 
-from PySide6.QtCore import Qt, QTimer, Slot
+from PySide6.QtCore import Qt, QTimer, Signal, Slot
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -40,6 +40,15 @@ class CaptureTelemetryPanel(QWidget):
     _COLLAPSED_ARROW = "▸"     # right-pointing: opens downward
     _EXPANDED_ARROW = "▾"      # down-pointing: already open
     _WARNING = "⚠"
+
+    #: Carries a counter change onto the GUI thread. The telemetry object is
+    #: plain Python and notifies its observers on whichever thread moved the
+    #: counter - the pose process's message reader, or the capture message
+    #: reader - and touching a widget from there is a segmentation fault, not
+    #: an exception. A signal is the cheapest correct hand-off: emitting across
+    #: threads is safe, and the queued connection below runs the repaint where
+    #: Qt requires it.
+    counters_changed = Signal()
 
     def __init__(self, telemetry: SessionTelemetry, parent=None):
         super().__init__(parent)
@@ -115,6 +124,8 @@ class CaptureTelemetryPanel(QWidget):
         outer.addWidget(body)
 
         telemetry.property_changed += self._on_telemetry_changed
+        self.counters_changed.connect(self._refresh,
+                                      Qt.ConnectionType.QueuedConnection)
 
         timer = self._timer = QTimer(self)
         timer.setInterval(REFRESH_INTERVAL_MS)
@@ -164,19 +175,21 @@ class CaptureTelemetryPanel(QWidget):
     def _toggle_clicked(self):
         self.set_expanded(not self.is_expanded)
 
-    def _on_telemetry_changed(self, name, _new, _old):
-        """Refresh on a counter change.
+    def _on_telemetry_changed(self, _name, _new, _old):
+        """Ask for a repaint on a counter change.
 
-        The panel is updated rather than the individual label, because the
-        readouts are derived from each other - the percentage needs both the
-        pose count and the frame count - and refreshing one at a time would
-        briefly show a percentage computed from a stale denominator.
+        Called from whichever thread moved the counter, so it must not touch a
+        widget itself - it only emits, and the queued connection delivers the
+        repaint on the GUI thread.
+
+        The whole panel is repainted rather than the one label that changed,
+        because the readouts are derived from each other - the percentage needs
+        both the pose count and the frame count - and refreshing one at a time
+        would briefly show a percentage computed from a stale denominator.
         """
-        if name == SessionTelemetry.ACTIVE_PROP:
-            self._refresh()
-            return
-        self._refresh()
+        self.counters_changed.emit()
 
+    @Slot()
     def _refresh(self):
         telemetry = self._telemetry
 
