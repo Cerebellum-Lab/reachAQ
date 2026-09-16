@@ -180,6 +180,8 @@ def check_calibration(
     report: Report,
     calib_dir: Path,
     geometries: Dict[str, Dict[str, float]],
+    *,
+    live_2d_only: bool = False,
 ) -> None:
     calib_dir = calib_dir.expanduser()
     if not calib_dir.is_dir():
@@ -227,11 +229,14 @@ def check_calibration(
             report.add(PASS, f"calibration vs {label}",
                        f"{video_w}x{video_h} matches the calibration")
         else:
+            # Calibration only feeds triangulation. A per-view 2D overlay never
+            # touches it, so a mismatch is fatal to 3D and irrelevant to 2D.
             report.add(
-                FAIL, f"calibration vs {label}",
+                WARN if live_2d_only else FAIL, f"calibration vs {label}",
                 f"video is {video_w}x{video_h} but calibration was built at "
                 f"{calib_w}x{calib_h}. The intrinsics are in pixels of a different "
-                "frame, so 2D will look right and 3D will be wrong.",
+                "frame, so 3D would be wrong. Live 2D per view is unaffected."
+                + (" Ignored: this run is live-2D only." if live_2d_only else ""),
             )
 
 
@@ -438,6 +443,9 @@ def main() -> int:
                         help="frames to score for detection rate (default: %(default)s)")
     parser.add_argument("--skip-pose", action="store_true",
                         help="check videos and calibration only; no GPU needed")
+    parser.add_argument("--live-2d-only", action="store_true",
+                        help="the demo shows a per-view 2D overlay and no 3D, so a "
+                             "calibration geometry mismatch warns instead of failing")
     args = parser.parse_args()
 
     report = Report()
@@ -454,7 +462,8 @@ def main() -> int:
                f"{args.sources} -> {sorted(sources.enabled_camera_names())}")
 
     geometries = check_videos(report, sources)
-    check_calibration(report, args.calibration, geometries)
+    check_calibration(report, args.calibration, geometries,
+                      live_2d_only=args.live_2d_only)
 
     if args.skip_pose:
         report.add(SKIP, "pose model", "--skip-pose was given")
