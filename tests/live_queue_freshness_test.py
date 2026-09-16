@@ -21,6 +21,7 @@ What must not regress:
 """
 
 import inspect
+import re
 
 import numpy
 import pytest
@@ -109,8 +110,26 @@ def test_pose_process_drains_and_only_above_depth_one():
     assert "live_drain = live_input.depth > 1" in source, (
         "the drain must be gated on depth; at depth 1 the probe costs a full "
         "frame copy to discover there is nothing behind the current batch")
-    assert "while live_drain and live_input.get_output(" in source, (
+    # Matched on the pieces rather than one line of source: the loop gained a
+    # guard and this assertion failed while the behaviour it protects was
+    # unchanged. What matters is that a gated drain still calls get_output.
+    assert re.search(r"while \(?live_drain", source), (
         "the live path takes the oldest batch again")
+    assert re.search(r"live_input\.get_output\([^)]*timeout=0[,\s)]", source), (
+        "the drain probe must not wait for a frame that is not there")
+
+
+def test_the_drain_stops_on_the_end_of_recording_marker():
+    """Skipping a frame costs inference work; skipping this costs the session.
+
+    EOF_RECORDING closes the live pose files. Draining past it left them open,
+    the wait for them timed out, and every session finalized incomplete.
+    """
+    from autotrainer.inference import pose_process
+
+    source = inspect.getsource(pose_process.PoseProcess)
+    drain = source.split("while (live_drain")[1][:220]
+    assert "_is_end_of_recording(frames_indices1)" in drain
 
 
 def test_the_live_queue_is_not_depth_one():
