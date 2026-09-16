@@ -14,12 +14,45 @@ to start without one, so a machine with no GPU will show the video but no pose.
 
 ## Setup
 
-Copy `tools/hardware/reachaq_demo_sources.example.yaml` to
-`~/Autotrainer/demo/demo_sources.yaml` and point it at real session video. Media files
-are never committed.
+Stage a recorded session as demo media and write the spec in one step:
 
-Match `fps` to the rate the source session was recorded at. The shipped rig records at
-150 FPS.
+    python scripts/stage_demo_media.py ~/Documents/rawdatalocal/<session-dir>
+
+That copies each camera's first video part to `~/Autotrainer/demo/`, reads the frame
+rate off the source, writes `~/Autotrainer/demo/demo_sources.yaml`, and validates the
+result through the same loader the application uses. Add `--dry-run` to see what it
+would stage, `--cameras left right` to restrict it, and `--force` to replace files that
+already exist.
+
+To do it by hand instead, copy `tools/hardware/reachaq_demo_sources.example.yaml` to
+`~/Autotrainer/demo/demo_sources.yaml` and point it at real session video. Match `fps`
+to the rate the source session was recorded at; the shipped rig records at 150 FPS.
+
+Media files are never committed.
+
+## Checking readiness before a demo
+
+Two things can be wrong without crashing and without announcing themselves: the
+configured pose model may not fire on the chosen video, and the rig calibration may not
+match the geometry that video was recorded under. Either one produces a demo that plays
+video and quietly never closes the loop, or a correct-looking 2D overlay over wrong 3D.
+
+Run the check on the rig, well before the meeting:
+
+    python scripts/verify_demo_readiness.py
+
+It reports video geometry, the calibration's own `image_shape` and which session it was
+built from, the effective confidence threshold for the configured backend and backbone,
+and the per-body-part detection rate over the demo video. It exits non-zero if anything
+fails.
+
+`--skip-pose` runs the video and calibration checks only and needs no GPU. `--frames N`
+sets how many frames to score. `--model` overrides the model named in the system
+configuration.
+
+Note that the reach cameras can have different crops: a `christie2P` session records
+left at 256x258 and right at 260x258. The calibration's per-camera `image_shape` has to
+match each of them, which is exactly what this check compares.
 
 ## Running
 
