@@ -51,6 +51,48 @@ def _is_end_of_recording(frames_indices) -> bool:
     return bool((frames_indices == FrameIndexCategory.EOF_RECORDING).any())
 
 
+def take_newest_live_batch(queue, frame_buffer, frames_indices, frames_perf_c,
+                           *, drain: bool) -> bool:
+    """Fill the buffers from the freshest batch the live queue holds.
+
+    get_output frees the buffer slot as soon as it has copied the frame out,
+    which is at the start of predict rather than the end, so the producer
+    refills it immediately and everything arriving during predict is dropped.
+    The batch waiting at the next call is therefore already up to one
+    predict-period old, and that staleness lands directly on the closed loop:
+    measured on the rig, cspnext_m spent about 5.5 ms of its 16.3 ms
+    end-to-end sitting in the buffer rather than being computed.
+
+    Draining costs one 64 KB copy per skipped frame and removes that wait. It
+    only does anything when the queue has depth to spare, which is why the live
+    queue is no longer depth 1 - at depth 1 nothing can be waiting behind the
+    current batch and the probe would pay a full frame copy to discover it.
+
+    The drain stops on an end-of-recording batch. Skipping a frame only costs
+    inference work, which is the whole point, but that batch is not a frame: it
+    is the marker that closes the live pose files, and capture goes straight
+    back to streaming after sending it. Draining past it overwrote it in place,
+    so the pose process never saw the recording stop, the writers were never
+    told to close, and every session finalized incomplete with "Timed out
+    waiting for live pose files to close". Whether it survived was a race
+    against the next frame: it survived once in eleven sessions on the rig.
+    Whatever arrives behind the marker stays queued for the next call, which
+    costs one iteration of staleness on a path where recording has stopped.
+
+    Returns False when the queue had nothing, leaving the buffers untouched.
+    """
+    if not queue.get_output(frame_buffer, frames_indices, timeout=0.1,
+                            frames_perf_c=frames_perf_c):
+        return False
+    while (drain
+           and not _is_end_of_recording(frames_indices)
+           and queue.get_output(frame_buffer, frames_indices, timeout=0,
+                                frames_perf_c=frames_perf_c)):
+        pass
+    return True
+
+
+
 # Frames per camera the pose model graph is built for. DeepLabCut fixes its
 # batch size at construction (`setup_pose_prediction` builds a placeholder with
 # a literal batch dimension), so this value sizes the model and the offline
@@ -389,53 +431,16 @@ class PoseProcess(Process):
         i_q: Optional[FixedArrayMultiQueue] = live_input
 
         def get_live_input():
-            # Take the freshest frame the queue holds, not the oldest one.
-            #
-            # get_output frees the buffer slot as soon as it has copied the
-            # frame out, which is at the start of predict, so the producer
-            # refills it immediately and everything arriving during predict is
-            # dropped. The frame waiting at the next call is therefore already
-            # up to one predict-period old, and that staleness lands directly
-            # on the closed loop: measured on the rig, cspnext_m spent about
-            # 5.5 ms of its 16.3 ms end-to-end sitting in the buffer rather
-            # than being computed.
-            #
-            # Draining costs one 64 KB copy per skipped frame and removes that
-            # wait. It only does anything when the queue has depth to spare,
-            # which is why the live queue is no longer depth 1.
+            # Freshest batch, not the oldest, and never past the end-of-recording
+            # marker. See take_newest_live_batch for why both matter.
             #
             # Acquisition is unaffected either way. The capture loop puts with
             # block=False, so a slow pose process can never stall it or cost a
             # recorded frame; skipping here discards inference work, never
             # acquisition.
-            if not live_input.get_output(frame_buffer1, frames_indices1,
-                                         timeout=0.1,
-                                         frames_perf_c=frames_perf_c1):
-                return False
-            # Nothing can be waiting behind it at depth 1, and the probe is
-            # not free: it copies both frames and expands them to RGB before
-            # the caller can know there was a newer one.
-            #
-            # The drain stops on an end-of-recording batch. Skipping a frame
-            # only costs inference work, which is the whole point, but that
-            # batch is not a frame - it is the marker that closes the live pose
-            # files, and capture goes straight back to streaming after sending
-            # it. Draining past it overwrote it in place, so the pose process
-            # never saw the recording stop, the writers were never told to
-            # close, and every session finalized as incomplete with "Timed out
-            # waiting for live pose files to close". Whether it survived was a
-            # race against the next frame: it survived once in eleven sessions.
-            #
-            # Whatever arrives after it stays queued for the next call, which
-            # costs one iteration of staleness on a path where recording has
-            # already stopped.
-            while (live_drain
-                   and not _is_end_of_recording(frames_indices1)
-                   and live_input.get_output(
-                       frame_buffer1, frames_indices1, timeout=0,
-                       frames_perf_c=frames_perf_c1)):
-                pass
-            return True
+            return take_newest_live_batch(
+                live_input, frame_buffer1, frames_indices1, frames_perf_c1,
+                drain=live_drain)
 
         def get_offline_input():
             nonlocal frame_buffer, frames_indices
