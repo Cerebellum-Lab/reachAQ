@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 from autotrainer.core import EventManager, ApiEventKind
+from autotrainer.core.configuration.demo_sources import DemoSourcesError, load_demo_sources
 from autotrainer.core.event import try_register_api_event_plugin
 from autotrainer.core.logging import (get_verbose_logger, get_console_handler, set_log_location)
 from autotrainer.pyside import CardHeader
@@ -81,6 +82,14 @@ def run_acquisition(
     logging.info("Set log level to %s", preferences.log_level)
     get_console_handler().setLevel(preferences.log_level)
 
+    demo_sources = None
+    if args.demo is not None:
+        try:
+            demo_sources = load_demo_sources(args.demo)
+        except DemoSourcesError as err:
+            logging.error("Cannot start in demo mode: %s", err)
+            return -1
+
     event_manager = EventManager.default()
     plugin = try_register_api_event_plugin()
 
@@ -92,6 +101,7 @@ def run_acquisition(
             is_dev=args.dev,
             random_cameras=args.random_cameras,
             live_inference=args.live_inference,
+            demo_sources=demo_sources,
         )
     except:
         event_manager.close()
