@@ -9028,6 +9028,51 @@ class AppModel(ObservableObject):
                 )
         self._save_metadata(project_info, when, file_name, session)
 
+    def _demo_metadata_block(self) -> Optional[dict]:
+        """Describe the demo playback sources for session metadata.
+
+        Session metadata already embeds the full configuration, so a playback
+        scheme is technically detectable. That is not enough for data nobody
+        should analyze: record it explicitly.
+        """
+
+        sources = self.demo_sources
+        if sources is None:
+            return None
+        return {
+            "active": True,
+            "fps": sources.fps,
+            "loop": sources.loop,
+            "sources": {
+                name: Path(video).as_posix()
+                for name, video in sorted(sources.cameras.items())
+            },
+        }
+
+    def _write_demo_marker(self, session_dir: Path) -> None:
+        """Drop a DEMO file beside the session so the directory is self-describing."""
+
+        sources = self.demo_sources
+        if sources is None:
+            return
+        lines = [
+            "This session was recorded in demo mode and is not experimental data.",
+            "",
+            "The camera frames were played from pre-recorded video. Every other",
+            "subsystem was live. Do not analyze this session.",
+            "",
+            f"playback fps: {sources.fps}",
+            "sources:",
+        ]
+        lines.extend(
+            f"  {name}: {Path(video).as_posix()}"
+            for name, video in sorted(sources.cameras.items())
+        )
+        try:
+            Path(session_dir).joinpath("DEMO").write_text("\n".join(lines) + "\n")
+        except OSError as err:
+            logger.error("Could not write the demo marker in %s: %s", session_dir, err)
+
     def _save_metadata(self, project: ProjectInfo, when: datetime, file_name: str, session: Optional[int] = -1):
         when_as_utc = when.astimezone(timezone.utc)
         metadata_generation_id = (
@@ -9077,6 +9122,7 @@ class AppModel(ObservableObject):
             }
         else:
             session_dir = Path(file_name).parent
+            self._write_demo_marker(session_dir)
             artifacts = {
                 "alignment": _metadata_reference(
                     session_dir / "streams" / "alignment.json",
@@ -9096,6 +9142,7 @@ class AppModel(ObservableObject):
                 "createdUtc": when_as_utc.timestamp(),
                 "serialNumber": self._preferences.serial_number or "",
                 "appVersion": self._app_version,
+                "demoMode": self._demo_metadata_block(),
                 "boundary": session_boundary,
                 "animal": self._recording_session.animal_snapshot,
                 "notes": self.notes or "",
