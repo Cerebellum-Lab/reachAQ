@@ -176,6 +176,7 @@ from tools.acquisition.model.softmouse_spreadsheet_source import (
     SoftMouseSpreadsheetSource,
 )
 from tools.acquisition.model.session_data_recorder import SessionDataRecorder
+from tools.acquisition.model.session_telemetry import SessionTelemetry
 from tools.acquisition.model.stim_latency_budget import StimLatencyBudget
 from tools.acquisition.model.atomic_session_io import (
     atomic_publish_file,
@@ -647,6 +648,10 @@ class AppModel(ObservableObject):
                 record_stop_sema=self._record_stop_sema,
             )
         inference = self._inference =  inference_model
+        # Live counters for the operator panel and the session metadata. Owned
+        # here because it is the only place that sees both the capture messages
+        # and the inference model.
+        self._session_telemetry = SessionTelemetry()
         #
 
         self._training_plans: List[PlanInfo] = []
@@ -2081,6 +2086,11 @@ class AppModel(ObservableObject):
         extra_info = (args, kwargs) if logger.isEnabledFor(logging.DEBUG) else "NA"
         logger.verbose("Handling %s ; data=%s", cmd, extra_info)
         algo = self._behavior.algorithm
+        if cmd == SystemStatusMessageKind.CAMERA_FRAME_STATS:
+            cam_idx, frames_received, frames_missed = args
+            self._session_telemetry.record_capture(
+                cam_idx, acquired=frames_received, dropped=frames_missed)
+            return
         if cmd == SystemStatusMessageKind.CAMERA_STATUS_CHANGE:
             cam_idx, new_status, *r_args = args
             reference_cam_idx = (
@@ -2161,6 +2171,10 @@ class AppModel(ObservableObject):
                         first_frame_time,
                         boundary=self._recording_session.boundary,
                     )
+                    # Counters are per session, and the session starts at the
+                    # first recorded frame rather than at arm time, so elapsed
+                    # matches the recording rather than the operator's clicking.
+                    self._session_telemetry.begin(first_frame_perf)
                     self._record_start_timer.cancel()
                     self._record_start_timer = no_op_timer
                     self._abort_had_recording_started = True
@@ -8033,6 +8047,7 @@ class AppModel(ObservableObject):
                 end_perf,
                 self._recording_session.boundary.end_wall_time,
             )
+            self._session_telemetry.end(end_perf)
             stream_result = self._session_data_recorder.stop(end_perf)
         except Exception as first_error:
             logger.exception(
@@ -8543,6 +8558,15 @@ class AppModel(ObservableObject):
             )
 
     def _on_inference_property_changed(self, name: str, value, _):
+        if name == InferenceModel.LIVE_POSE_STATS and value is not None:
+            # Windowed timing from the pose process, folded into the session
+            # counters the operator panel and the metadata read.
+            pose_count, mean_ms, max_ms, e2e_mean_ms, e2e_max_ms = value
+            self._session_telemetry.record_inference(
+                pose_count, mean_ms, max_ms,
+                sensor_to_result_mean_ms=e2e_mean_ms,
+                sensor_to_result_max_ms=e2e_max_ms)
+            return
         if name == InferenceModel.STATUS:
             new_is_live = value == InferenceStatus.live
             if new_is_live:
@@ -8671,6 +8695,11 @@ class AppModel(ObservableObject):
                 for configured in monitor.configuration.channels
             )
         )
+
+    @property
+    def session_telemetry(self) -> SessionTelemetry:
+        """Live capture and inference counters for the current session."""
+        return self._session_telemetry
 
     def _on_intertrial_nidaq_tone_edge(
         self,
@@ -9233,6 +9262,10 @@ class AppModel(ObservableObject):
                 },
                 "configuration": configuration,
                 "artifacts": artifacts,
+                # What the operator watched during the recording, kept so the
+                # same numbers can be read back from the session rather than
+                # only having existed on screen.
+                "capture": self._session_telemetry.summary(),
             }
         out = _metadata_without_nonfinite_numbers(out)
         json_path = Path(file_name + ".json")
