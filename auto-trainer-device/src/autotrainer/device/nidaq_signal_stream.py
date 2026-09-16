@@ -442,9 +442,34 @@ class NidaqSignalStreamController:
                 (len(channels), chunk_size), dtype=numpy.float64
             )
         else:
-            self._digital_readers[device_name] = readers.DigitalMultiChannelReader(
-                in_stream
-            )
+            reader = readers.DigitalMultiChannelReader(in_stream)
+            # There is no line-based many-sample digital read to preallocate
+            # for. nidaqmx offers read_many_sample on the analog readers, and
+            # for digital only the per-PORT variants - port_byte, port_uint16,
+            # port_uint32 - never one per line. read_many_sample_multi_line
+            # does not exist on any reader class at 1.6.0 either, so this is
+            # not a version floor to raise: the call has never resolved, and
+            # asking for it raised AttributeError on the first chunk, failed
+            # the stream, and blocked Record outright.
+            #
+            # Kept as a capability check rather than deleting the digital
+            # branch, so a future nidaqmx that does offer a line-based
+            # many-sample read is picked up without another change here.
+            #
+            # Leaving the reader unregistered selects the task.read() path just
+            # below, which is the behaviour this preallocation replaced. It
+            # allocates per chunk, which is the cost this avoided, and that is
+            # strictly better than no acquisition at all.
+            if not hasattr(reader, "read_many_sample_multi_line"):
+                logger.warning(
+                    "nidaqmx %s offers no line-based many-sample digital read "
+                    "(DigitalMultiChannelReader.read_many_sample_multi_line); "
+                    "reading digital channels through task.read() instead, "
+                    "which allocates per chunk.",
+                    getattr(self._nidaqmx, "__version__", "?"),
+                )
+                return
+            self._digital_readers[device_name] = reader
             self._digital_buffers[device_name] = numpy.empty(
                 (len(channels), chunk_size), dtype=numpy.bool_
             )
