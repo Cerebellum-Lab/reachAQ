@@ -136,6 +136,23 @@ def check_videos(report: Report, sources: DemoSources) -> Dict[str, Dict[str, fl
         else:
             report.add(PASS, "spec fps", f"{spec_fps:g} matches the source video")
 
+    # The live inference queue is allocated once, at a single shape taken from the
+    # camera configuration. Media that differs between cameras fails the capture
+    # loop with "memoryview assignment: lvalue and rvalue have different
+    # structures" - which names nothing useful, so catch it here instead.
+    sizes = {name: (int(g["width"]), int(g["height"])) for name, g in geometries.items()}
+    if len(set(sizes.values())) > 1:
+        report.add(
+            FAIL, "frame size",
+            f"cameras disagree on frame size {sizes}. The inference queue is one "
+            "fixed shape, so capture fails on the mismatched camera. Restage with "
+            "--resize WxH to normalise them to the configured camera size.",
+        )
+    elif sizes:
+        report.add(PASS, "frame size",
+                   f"every camera is {next(iter(sizes.values()))}; restage with "
+                   "--resize if that differs from the configured camera size")
+
     _check_lengths(report, geometries)
     return geometries
 
