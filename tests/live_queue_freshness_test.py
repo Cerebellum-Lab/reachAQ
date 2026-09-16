@@ -20,11 +20,12 @@ What must not regress:
     batch and the probe would pay a full frame copy to discover that.
 """
 
-import inspect
-import re
+import ast
 
 import numpy
 import pytest
+
+import source_contract
 
 from autotrainer.core.fixed_array_multiqueue import BufferResult
 from autotrainer.core.fixed_array_multiqueue import FixedArrayMultiQueue
@@ -102,64 +103,56 @@ def test_draining_an_empty_queue_returns_nothing():
 # --- the wiring --------------------------------------------------------------
 
 
-def test_pose_process_drains_and_only_above_depth_one():
-    """A revert would be silent: the result is identical, only staler."""
-    from autotrainer.inference import pose_process
+def test_the_pose_process_uses_the_drain():
+    """A revert would be silent: the result is identical, only staler.
 
-    source = inspect.getsource(pose_process.PoseProcess)
-    assert "live_drain = live_input.depth > 1" in source, (
-        "the drain must be gated on depth; at depth 1 the probe costs a full "
-        "frame copy to discover there is nothing behind the current batch")
-    # Matched on the pieces rather than one line of source: the loop gained a
-    # guard and this assertion failed while the behaviour it protects was
-    # unchanged. What matters is that a gated drain still calls get_output.
-    assert re.search(r"while \(?live_drain", source), (
-        "the live path takes the oldest batch again")
-    assert re.search(r"live_input\.get_output\([^)]*timeout=0[,\s)]", source), (
-        "the drain probe must not wait for a frame that is not there")
-
-
-def test_the_drain_stops_on_the_end_of_recording_marker():
-    """Skipping a frame costs inference work; skipping this costs the session.
-
-    EOF_RECORDING closes the live pose files. Draining past it left them open,
-    the wait for them timed out, and every session finalized incomplete.
+    The drain's behaviour is covered directly in live_drain_eof_test. What is
+    left to check here is that the live path still goes through it, and that
+    queue depth still decides whether it runs.
     """
     from autotrainer.inference import pose_process
 
-    source = inspect.getsource(pose_process.PoseProcess)
-    drain = source.split("while (live_drain")[1][:220]
-    assert "_is_end_of_recording(frames_indices1)" in drain
+    call = source_contract.one_call(pose_process, "take_newest_live_batch")
+    assert source_contract.keyword_name(call, "drain") == "live_drain", (
+        "the live path no longer drains to the newest batch")
+
+    gate = source_contract.assigned(pose_process, "live_drain")
+    assert gate is not None, "live_drain is no longer derived at all"
+    assert "depth" in gate and "Gt" in gate, (
+        "the drain must stay gated on queue depth; at depth 1 the probe costs "
+        "a full frame copy to discover there is nothing behind the batch "
+        f"(found {gate!r})")
 
 
 def test_the_live_queue_is_not_depth_one():
-    """app_model sizes the queue the pose path depends on."""
-    import pathlib
+    """app_model sizes the queue the pose path depends on.
 
-    source = pathlib.Path(__file__).resolve().parents[1].joinpath(
-        "tools", "acquisition", "model", "app_model.py").read_text()
-    start = source.index("self._inference_queue = FixedArrayMultiQueue(")
-    block = source[start:start + 2000]
-    assert "Depth 2, with PoseProcess draining to the newest batch." in block
+    Read as the argument rather than as a comment beside it: the comment was
+    what used to be asserted, which a correct rewording would have broken and
+    a silent change from 2 to 1 would not.
+    """
+    call = source_contract.one_call(
+        "tools/acquisition/model/app_model.py", "FixedArrayMultiQueue")
+    depth = call.args[0] if call.args else source_contract.keyword(call, "depth")
+    assert isinstance(depth, ast.Constant), (
+        "the live queue depth is no longer a literal; check it by hand")
+    assert depth.value > 1, (
+        "depth 1 cannot hold a newer batch, so the pose path is served a stale "
+        "one and the capture loop cannot hand over at all")
 
 
 def test_capture_offers_frames_without_blocking():
-    """Acquisition must never wait on inference. This is the line that
-    guarantees a slow pose process cannot cost a recorded frame.
+    """Acquisition must never wait on inference. This is the guarantee that a
+    slow pose process cannot cost a recorded frame.
 
-    Asserted on the call's arguments rather than one formatting of it: the
+    Asserted on the call's arguments rather than on one formatting of it: the
     guarantee is that this particular put is non-blocking, and pinning the
-    exact source line made an unrelated reformat look like a regression while
-    a genuine change from block=False to block=True inside a rewritten line
+    source line made an unrelated reformat look like a regression while a
+    genuine change from block=False to block=True inside a rewritten line
     would still have slipped through.
     """
-    import pathlib
-    import re
-
-    source = pathlib.Path(__file__).resolve().parents[1].joinpath(
-        "auto-trainer-video", "src", "autotrainer", "video",
-        "video_capture.py").read_text()
-    match = re.search(r"net_q_put\((?P<args>[^)]*)\)", source, re.S)
-    assert match is not None, "the inference queue put has been renamed or removed"
-    assert "block=False" in match.group("args"), (
+    call = source_contract.one_call(
+        "auto-trainer-video/src/autotrainer/video/video_capture.py",
+        "net_q_put")
+    assert source_contract.keyword_equals(call, "block", False), (
         "the capture loop must offer frames to inference without blocking")
