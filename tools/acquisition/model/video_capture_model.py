@@ -11,6 +11,7 @@ from multiprocessing.sharedctypes import (
     SynchronizedString,
     Synchronized,
 )
+from multiprocessing.synchronize import Barrier as BarrierType
 from multiprocessing.synchronize import Semaphore as SemaphoreType
 from typing import Optional, List, Tuple, Dict, Any, Iterable, Union
 from threading import Event
@@ -180,6 +181,7 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
         self._align_record_start_perf = align_record_start_perf
         self._record_stop_sema = record_stop_sema
         self._stim_trigger_queue = stim_trigger_queue
+        self._playback_start_barrier: Optional[BarrierType] = None
 
         self._camera_source: CaptureCameraAttrs = CaptureCameraAttrs(name="", url="")
         self._camera_properties = {}
@@ -373,6 +375,25 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
     def set_runtime_primary(self, is_primary: bool) -> None:
         self._is_primary = is_primary
 
+    @property
+    def is_playback_source(self) -> bool:
+        """True when this camera plays a recorded video rather than driving hardware."""
+        url = self._camera_source.url if self._camera_source is not None else ""
+        return urllib.parse.urlsplit(url).scheme.lower() == "playback"
+
+    @property
+    def playback_start_barrier(self) -> Optional[BarrierType]:
+        return self._playback_start_barrier
+
+    @playback_start_barrier.setter
+    def playback_start_barrier(self, value: Optional[BarrierType]) -> None:
+        """Shared across every playback camera, so their first frames align.
+
+        Set by the owner before preparing capture; a single playback camera needs
+        no barrier and should be left None.
+        """
+        self._playback_start_barrier = value
+
     def _runtime_camera_url(self) -> str:
         """Apply the effective capture role without mutating saved configuration."""
         camera_url = self._camera_source.url
@@ -520,6 +541,7 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
                 record_stop_sema=self._record_stop_sema,
                 stim_detection=self._stim_detection_configuration,
                 stim_trigger_queue=self._stim_trigger_queue,
+                playback_start_barrier=self._playback_start_barrier,
             )
 
             rotate_interval = self._record_rotate_interval if self._is_recording_enabled else -1

@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from enum import IntEnum
 from functools import partial
 from multiprocessing import Process
+from multiprocessing.synchronize import Barrier as BarrierType
 from multiprocessing.synchronize import Semaphore as SemaphoreType
 from multiprocessing.sharedctypes import Synchronized, SynchronizedArray, SynchronizedString
 from typing import Callable, Dict, Union, Optional, List, Tuple
@@ -167,6 +168,22 @@ class CaptureAttrs:
     stim_detection: Optional[StimCameraDetectionConfiguration] = None
     stim_trigger_queue: Optional[multiprocessing.Queue] = None
     """Bounded direct stim-camera-to-laser trigger channel."""
+
+    playback_start_barrier: Optional[BarrierType] = None
+    """Aligns playback camera start times.
+
+    Hardware-synchronized cameras guarantee frame N left matches frame N right.
+    Independently started playback processes do not, and live 3D triangulation
+    pairs by frame id, so an unsynchronized start yields wrong 3D from
+    plausible-looking 2D. Only set for playback sources.
+    """
+
+    playback_start_timeout: float = 30.0
+    """Bounded wait on playback_start_barrier, so a missing camera fails visibly.
+
+    Cameras are prepared sequentially, so this must cover the spawn and open cost
+    of every other playback camera, not just one.
+    """
 
 
 class VideoCapture(Process):
@@ -409,6 +426,27 @@ class VideoCapture(Process):
             except Exception as err:
                 logger.exception("Failure executing cmd %s: %s", raw, err)
 
+    def _await_playback_start(self) -> None:
+        """Block until every playback camera is ready to take its first frame.
+
+        CameraBase.capture sets _capture_start on the first frame, and PlaybackCam
+        paces to an absolute _capture_start + n/fps target rather than to an
+        accumulating delta. So aligning the moment of the first capture call is
+        enough to keep frame indices aligned for the whole run.
+        """
+
+        barrier = self._attrs.playback_start_barrier
+        if barrier is None:
+            return
+        try:
+            barrier.wait(timeout=self._attrs.playback_start_timeout)
+        except Exception as err:
+            raise RuntimeError(
+                f"Playback camera {self._name} timed out waiting for the other demo "
+                f"cameras after {self._attrs.playback_start_timeout:g}s: {err}"
+            ) from err
+        logger.notice("<%s> playback start barrier cleared", self._name)
+
     def _run_capture_loop(self, camera: CameraBase) -> None:
         if self._stim_detector is not None:
             # Only the stim camera: this is the 900 Hz closed loop, and it is
@@ -598,6 +636,11 @@ class VideoCapture(Process):
         frame_time = time.time()
         save_err = None
         active_record_generation = 0
+
+        # After RUNNING is published, never before: camera startup is sequential and
+        # each camera is waited on for RUNNING, so blocking earlier would deadlock
+        # the second camera's own preparation.
+        self._await_playback_start()
 
         while True:
 

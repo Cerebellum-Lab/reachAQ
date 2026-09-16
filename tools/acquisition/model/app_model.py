@@ -5776,6 +5776,31 @@ class AppModel(ObservableObject):
         cameras = tuple(
             camera for camera in all_cameras if camera is not independent_stim
         )
+
+        # Playback cameras start together on a shared barrier. Hardware-synchronized
+        # cameras guarantee frame N on left matches frame N on right; independently
+        # started playback processes do not, and live 3D triangulation pairs by frame
+        # id, so an unsynchronized start yields wrong 3D under a correct-looking 2D
+        # overlay. Scoped to the triangulated reach group: the independent stim camera
+        # is Tier 1, is never triangulated, and is started before this group, so
+        # including it would deadlock its own first-frame wait.
+        playback_cameras = [camera for camera in cameras if camera.is_playback_source]
+        playback_barrier = (
+            get_mp_ctx().Barrier(len(playback_cameras))
+            if len(playback_cameras) > 1
+            else None
+        )
+        if playback_barrier is not None:
+            logger.notice(
+                "Demo playback start barrier armed for %s cameras: %s",
+                len(playback_cameras),
+                ", ".join(camera.name for camera in playback_cameras),
+            )
+        for camera in all_cameras:
+            camera.playback_start_barrier = (
+                playback_barrier if camera in playback_cameras else None
+            )
+
         if independent_stim is not None:
             stim_status = self._acquisition.subsystems.get(
                 SubsystemId.camera(independent_stim.name)
