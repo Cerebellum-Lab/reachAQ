@@ -216,6 +216,8 @@ class MainWindow(QMainWindow):
             if live_inference is not None:
                 app_model.set_runtime_live_inference_override(live_inference)
 
+        self._refresh_demo_banner()
+
         app_model.property_changed += self._on_app_model_property_changed
         app_model.hardware.property_changed += self._on_hardware_property_changed
         app_model.inference.property_changed += self._on_inference_property_changed
@@ -1161,6 +1163,15 @@ class MainWindow(QMainWindow):
         action.setCheckable(True)
         action.triggered.connect(self.on_3d_calibrate)
 
+        action = self.demo_mode_action = QAction("Demo Mode (play recorded video)", self)
+        action.setCheckable(True)
+        action.setChecked(self._demo_sources is not None)
+        action.setToolTip(
+            "Play pre-recorded video through the real pipeline. Every other "
+            "subsystem stays live. Available only while the session is idle."
+        )
+        action.toggled.connect(self._on_demo_mode_toggled)
+
         action = self.view_diagnostics_action = QAction("Logging", self)
         action.setToolTip("Show or hide the application logging panel")
         action.setCheckable(True)
@@ -1220,6 +1231,8 @@ class MainWindow(QMainWindow):
         tools_menu = menu_bar.addMenu("Tools")
         tools_menu.addAction(self.calib_diamond_triangle_action)
         tools_menu.addAction(self.make_3d_calib_action)
+        tools_menu.addSeparator()
+        tools_menu.addAction(self.demo_mode_action)
 
         view_menu = menu_bar.addMenu("View")
         view_menu.addAction(self.view_diagnostics_action)
@@ -1244,6 +1257,53 @@ class MainWindow(QMainWindow):
         for action in self.hardware_enable_actions.values():
             action.setEnabled(enabled)
         self.rfid_device_action.setEnabled(enabled)
+        # Demo mode reloads the configuration, which the model refuses unless the
+        # recording session is READY. Ride the same gate rather than inventing one.
+        self.demo_mode_action.setEnabled(enabled)
+
+    def _on_demo_mode_toggled(self, checked: bool) -> None:
+        """Reload the configuration with or without the demo camera override.
+
+        A spec that cannot be loaded leaves the toggle off and the current
+        configuration untouched. Demo mode never falls back to physical cameras
+        silently, and never starts partially configured.
+        """
+
+        if checked == (self._demo_sources is not None):
+            return
+
+        sources = None
+        if checked:
+            try:
+                sources = load_demo_sources(self._demo_spec_path)
+            except DemoSourcesError as err:
+                self._show_message("Cannot enter demo mode", str(err))
+                self.demo_mode_action.blockSignals(True)
+                self.demo_mode_action.setChecked(False)
+                self.demo_mode_action.blockSignals(False)
+                return
+
+        try:
+            self._app_model.load_configuration(
+                self._app_model.get_config_location(), demo_sources=sources
+            )
+        except Exception as err:
+            self._show_message("Could not change demo mode", str(err))
+            self.demo_mode_action.blockSignals(True)
+            self.demo_mode_action.setChecked(self._demo_sources is not None)
+            self.demo_mode_action.blockSignals(False)
+            return
+
+        self._demo_sources = sources
+        self._refresh_demo_banner()
+
+    def _refresh_demo_banner(self) -> None:
+        active = self._demo_sources is not None
+        self._demo_banner.setVisible(active)
+        if active:
+            names = ", ".join(sorted(self._demo_sources.enabled_camera_names()))
+            self._demo_banner.setText(f"DEMO MODE — recorded video on {names}")
+        self.setWindowTitle(f"{self._title} — DEMO MODE" if active else self._title)
 
     def _hardware_menu_values(self, **overrides):
         configuration = self._app_model.loaded_configuration
@@ -1489,6 +1549,12 @@ class MainWindow(QMainWindow):
         bar = self._status_bar = QStatusBar(self)
         bar.addWidget(self._status_label)
         bar.setSizeGripEnabled(True)
+        self._demo_banner = QLabel("")
+        self._demo_banner.setStyleSheet(
+            "QLabel { background: #b3261e; color: white; padding: 2px 8px; font-weight: bold; }"
+        )
+        self._demo_banner.setVisible(False)
+        bar.addPermanentWidget(self._demo_banner)
         widget = self._status_training_widget = QWidget()
         widget.setVisible(False)
         hbox = QHBoxLayout()
