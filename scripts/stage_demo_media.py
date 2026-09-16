@@ -66,6 +66,35 @@ def video_fps(path: Path) -> Optional[float]:
         capture.release()
 
 
+def parse_size(text: str) -> tuple:
+    try:
+        width, height = (int(v) for v in text.lower().split("x", 1))
+    except Exception as err:
+        raise SystemExit(f"error: --resize wants WxH, e.g. 256x256; got {text!r}") from err
+    if width <= 0 or height <= 0:
+        raise SystemExit(f"error: --resize needs positive dimensions; got {text!r}")
+    return width, height
+
+
+def reencode(source: Path, target: Path, size: tuple) -> None:
+    """Re-encode to an exact frame size with ffmpeg, preserving frame count."""
+    import subprocess
+
+    width, height = size
+    command = [
+        "ffmpeg", "-loglevel", "error", "-y", "-i", str(source),
+        "-vf", f"scale={width}:{height}",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+        "-pix_fmt", "yuv420p", "-an", str(target),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0 or not target.is_file():
+        raise SystemExit(
+            f"error: ffmpeg could not re-encode {source.name}: "
+            f"{(result.stderr or '').strip()[:300]}"
+        )
+
+
 def write_spec(spec_path: Path, fps: float, staged: Dict[str, Path], loop: bool) -> None:
     lines = [
         "# reachAQ demo playback sources.",
@@ -98,6 +127,12 @@ def main() -> int:
                              f"{', '.join(KNOWN_CAMERAS)} the session has)")
     parser.add_argument("--fps", type=float, default=None,
                         help="playback rate (default: read from the source video)")
+    parser.add_argument("--resize", metavar="WxH", default=None,
+                        help="re-encode to exactly this frame size, e.g. 256x256. "
+                             "The live inference queue is allocated at one fixed shape "
+                             "from the camera configuration, so demo media whose size "
+                             "differs from it, or differs between cameras, fails the "
+                             "capture loop. Match the rig's configured camera size.")
     parser.add_argument("--no-loop", action="store_true",
                         help="do not restart at frame 0 on reaching the end")
     parser.add_argument("--force", action="store_true",
@@ -153,12 +188,17 @@ def main() -> int:
         print(f"dry run: would write {spec_path}")
         return 0
 
+    size = parse_size(args.resize) if args.resize else None
+
     dest.mkdir(parents=True, exist_ok=True)
     staged: Dict[str, Path] = {}
     for camera, source in sorted(found.items()):
         target = dest / source.name
         if target.exists() and not args.force:
             print(f"  keeping existing {target.name} (pass --force to replace)")
+        elif size is not None:
+            print(f"  re-encoding {source.name} to {size[0]}x{size[1]} -> {target}")
+            reencode(source, target, size)
         else:
             print(f"  copying {source.name} -> {target}")
             shutil.copy2(source, target)
