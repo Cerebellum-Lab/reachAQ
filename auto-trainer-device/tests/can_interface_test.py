@@ -183,6 +183,10 @@ def test_tone(interface: CanInterface, frequency_hz: int, duration_ms: int):
     assert tone.time_remaining_ms <= duration_ms, f"Tone generation not functional"
 
 
+@pytest.mark.skip(
+    reason="pellet firmware v2.1.0 removed analog_out/dac2; PA6 is now pressure sensor 2, "
+           "so the board neither answers ANALOG_OUT nor publishes analog-out status"
+)
 @pytest.mark.parametrize("value_mv", [
     1000,
     3000,
