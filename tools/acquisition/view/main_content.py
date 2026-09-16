@@ -128,6 +128,19 @@ class MainContent(ContentWidget):
         self._mid_widget_manual = self._create_mid_widget_manual(app_model)
         mid_stacked_layout.addWidget(self._mid_widget_manual)
 
+        # Defaults first. These used to sit below, after
+        # _create_protocol_phase_progress_widget had already assigned the two
+        # progress widgets, so the assignment to None overwrote them: with the
+        # protocol UI enabled, _update_training_plan then raised AttributeError
+        # on _training_plan_progress_content the moment a subject was selected.
+        # The other two are assigned later still, by
+        # _create_protocol_phase_end_widget, which is why only these two broke.
+        self._training_plan_content = None
+        self._training_phase_content = None
+        self._training_plan_progress_content = None
+        self._training_phase_progress_content = None
+        self._protocol_phase_end_widget = None
+
         self._protocol_phase_progress_widget = None
         if self._protocol_ui_enabled:
             self._protocol_phase_progress_widget = self._create_protocol_phase_progress_widget()
@@ -141,12 +154,6 @@ class MainContent(ContentWidget):
 
         end_widget_manual = self._end_widget_manual = self._create_end_widget_manual()
         end_stacked_layout.addWidget(end_widget_manual)
-
-        self._training_plan_content = None
-        self._training_phase_content = None
-        self._training_plan_progress_content = None
-        self._training_phase_progress_content = None
-        self._protocol_phase_end_widget = None
 
         if self._protocol_ui_enabled:
             # Limit end_protocol_phase widget to the phase content size.
