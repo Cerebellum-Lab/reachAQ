@@ -40,6 +40,11 @@ from .realtime_priority import apply_realtime_priority
 
 logger = get_verbose_logger(__name__)
 
+# How often the capture process reports frame accounting to the UI. Twice a
+# second is fast enough that an operator sees a drop while the animal is still
+# in the box, and slow enough to be invisible against a 150 fps capture loop.
+FRAME_STATS_REPORT_PERIOD = 0.5
+
 
 # Always keep that extra more nbr of frames for cameras recording sync purpose:
 _PREBUFFER_SYNC_KEEP = 3
@@ -434,6 +439,12 @@ class VideoCapture(Process):
         prim_cam_synced_frame_idx = attrs.synced_cam_frame_index
         synced_frame_idx: Optional[int] = None
         msg_q = attrs.msg_queue  # message queue to main process
+        # Session totals for the live telemetry panel. Reported as absolutes on
+        # a timer rather than per frame: at 150 fps a message per frame would
+        # cost more than the accounting, and an absolute total corrects itself
+        # if one is dropped where a delta would corrupt the running sum.
+        total_missed_frames = 0
+        next_frame_stats_perf = 0.0
         record_start_stop_frame_idx: Optional[int] = None
         last_recorded_frame_id = -1
         last_recorded_frame_perf = math.nan
@@ -695,6 +706,15 @@ class VideoCapture(Process):
                             start=1,
                         )
                     )
+                if count_missed_frames > 0:
+                    total_missed_frames += count_missed_frames
+                if msg_q is not None and perf_now >= next_frame_stats_perf:
+                    next_frame_stats_perf = perf_now + FRAME_STATS_REPORT_PERIOD
+                    msg_q.put((
+                        SystemStatusMessageKind.CAMERA_FRAME_STATS,
+                        (self._camera_idx, count_frames_received,
+                         total_missed_frames),
+                    ))
                 self._process_stim_frame(
                     frame,
                     cam_frame_id,
@@ -870,7 +890,13 @@ class VideoCapture(Process):
                         FrameIndexCategory.ONLINE_NO_RECORDING if record_start_stop_frame_idx is None
                         else cam_frame_id - record_start_stop_frame_idx
                     )
-                    if net_q_put(frame, net_q_idx, frame_idx_cat, block=False) == BufferResult.Ok:
+                    # frame_perf_c travels with the frame so the pose process
+                    # can report sensor-to-result, not just how long its own
+                    # call took. It is the host time the exposure maps to, from
+                    # the camera's hardware timestamp - not when Python noticed
+                    # the frame.
+                    if net_q_put(frame, net_q_idx, frame_idx_cat, block=False,
+                                 frame_perf_c=frame_perf_c) == BufferResult.Ok:
                         cnt_net_q_put += 1
 
 
