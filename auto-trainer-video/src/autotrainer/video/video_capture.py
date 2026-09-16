@@ -637,10 +637,11 @@ class VideoCapture(Process):
         save_err = None
         active_record_generation = 0
 
-        # After RUNNING is published, never before: camera startup is sequential and
-        # each camera is waited on for RUNNING, so blocking earlier would deadlock
-        # the second camera's own preparation.
-        self._await_playback_start()
+        # Gates the first real capture, below. Not loop entry: the loop spins on
+        # _is_capturing until ENABLE_CAPTURE arrives, and CameraBase.capture sets
+        # _capture_start on its first call, so enable time is the moment that has
+        # to be aligned.
+        awaited_playback_start = False
 
         while True:
 
@@ -677,6 +678,14 @@ class VideoCapture(Process):
                 time.sleep(0.001)
                 frame_time = time.time()
                 continue
+
+            if not awaited_playback_start:
+                # Every playback camera takes its first frame together. Each one
+                # receives its own ENABLE_CAPTURE, and those arrive tens of
+                # milliseconds apart; at 150 FPS that is several frames of skew
+                # baked in for the whole run.
+                self._await_playback_start()
+                awaited_playback_start = True
 
             try:
                 # this eventually set/unset recording enabled on the primary cam, or on non-synced cam(s):

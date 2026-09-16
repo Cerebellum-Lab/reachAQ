@@ -136,13 +136,41 @@ def check_videos(report: Report, sources: DemoSources) -> Dict[str, Dict[str, fl
         else:
             report.add(PASS, "spec fps", f"{spec_fps:g} matches the source video")
 
-    lengths = {geometry["frames"] for geometry in geometries.values()}
-    if len(lengths) > 1:
-        report.add(WARN, "video lengths",
-                   f"sources differ in length {sorted(lengths)}; the shorter one loops "
-                   "first and the views then no longer correspond")
-
+    _check_lengths(report, geometries)
     return geometries
+
+
+def _check_lengths(report: Report, geometries: Dict[str, Dict[str, float]]) -> None:
+    """Length mismatch matters differently for the triangulated pair than elsewhere.
+
+    The start barrier aligns the first frame, but nothing re-aligns a loop. When
+    the reach pair differ in length the shorter one restarts while the other runs
+    on, so triangulation keeps pairing frames that are aligned in time and no
+    longer show the same moment. That is a break, not a nuisance.
+
+    Any other camera looping separately is cosmetic: the stim camera is never
+    triangulated.
+    """
+    pair = {name: geometries[name]["frames"]
+            for name in ("left", "right") if name in geometries}
+    if len(set(pair.values())) > 1:
+        report.add(
+            FAIL, "reach pair length",
+            f"left and right differ in length {pair}. The start barrier aligns the "
+            "first frame but nothing re-aligns a loop, so after the shorter one "
+            "restarts, triangulation pairs frames that no longer show the same moment.",
+        )
+    elif pair:
+        report.add(PASS, "reach pair length",
+                   f"left and right are both {next(iter(pair.values()))} frames, "
+                   "so they loop together")
+
+    others = {name: int(geometry["frames"]) for name, geometry in geometries.items()
+              if name not in ("left", "right")}
+    if others and set(others.values()) - set(pair.values()):
+        report.add(WARN, "other camera length",
+                   f"{others} differs from the reach pair; that camera loops at a "
+                   "different point. Cosmetic: it is not triangulated.")
 
 
 # ----------------------------------------------------------------- calibration
