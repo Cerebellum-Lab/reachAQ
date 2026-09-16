@@ -185,6 +185,12 @@ class PoseProcess(Process):
             raise RuntimeError(f"Model at {model_path} not valid")
 
         self._pose_model = model
+        # Before load(), so a backend that specialises for a fixed input shape
+        # specialises for the live one. The padded size above exists for the
+        # offline pass and for the TensorFlow graph's fixed batch dimension;
+        # sizing a fast path to it optimises the one caller that has no
+        # deadline.
+        model.prepare_live_batch(self._live_input_queue.batch_size)
 
         self._send_message(InferenceStatusMessageKind.Loading)
 
@@ -192,6 +198,13 @@ class PoseProcess(Process):
         logging.root.setLevel(logging.WARN)
         self._pose_model.load()
         logging.root.setLevel(prev_lvl)
+        # Outside the quiet window above, so it actually reaches the log. Which
+        # path a model settled on is the difference between meeting the latency
+        # budget and missing it, and it was previously only knowable by reading
+        # the source and guessing.
+        logger.notice("pose model runtime: %s | live batch %d, offline batch %d",
+                      self._pose_model.runtime_detail(),
+                      self._live_input_queue.batch_size, model_batch_size)
 
         self._send_message(InferenceStatusMessageKind.Initialized, self._pose_model.body_parts)
 
