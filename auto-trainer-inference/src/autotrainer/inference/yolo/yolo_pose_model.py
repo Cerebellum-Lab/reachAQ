@@ -151,6 +151,37 @@ class YoloPoseModel(PoseModel):
                     os.path.basename(self._weights_path),
                     self._body_parts_count, self._imgsz)
 
+    def prepare_live_batch(self, batch_size: int) -> None:
+        """Capture the graph for the batch live inference actually sends.
+
+        A CUDA graph only replays for the exact shape it was captured at. The
+        model is constructed for the padded offline batch - two cameras times
+        three frames - while live inference sends two frames, so the graph was
+        captured at six, never matched, and every live call fell through to the
+        ultralytics wrapper. On the rig that was 7.4 ms instead of 3.6 ms, and
+        nothing said so: the fall-back is silent by design.
+
+        The offline pass keeps working through predict(), which takes any
+        count. It trades its graph for the live path's, which is the right way
+        round - offline has no deadline.
+        """
+        if batch_size > 0:
+            self._batch_size = int(batch_size)
+
+    def runtime_detail(self) -> str:
+        """Whether the graphed path is live, and for what batch.
+
+        The batch matters as much as the graph: a captured graph only replays
+        for exactly the shape it was captured at, so a model that graphed for
+        two frames and is handed one silently falls back to the ultralytics
+        wrapper. Both numbers belong in the same line.
+        """
+        if self._graph is None:
+            return (f"ultralytics predict(), imgsz {self._imgsz} "
+                    f"(no CUDA graph: {self._graph_reason() or 'capture failed'})")
+        return (f"CUDA graph, batch {self._batch_size}, imgsz {self._imgsz} "
+                f"(falls back to predict() for any other batch)")
+
     def predict(self, frames: numpy.ndarray) -> typing.List[numpy.ndarray]:
         """
         Pose for each frame, in input order.
