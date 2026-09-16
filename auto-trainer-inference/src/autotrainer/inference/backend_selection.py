@@ -16,6 +16,7 @@ what stops a rig from checking TensorFlow's CUDA while running PyTorch.
 """
 
 import glob
+import importlib.util
 import os
 import typing
 
@@ -137,27 +138,96 @@ _BACKEND_ALIASES = {
 }
 
 
-def selected_backend(environ: typing.Optional[typing.Mapping[str, str]] = None) -> str:
+def is_yolo_model(model_path: typing.Optional[str]) -> bool:
+    """Whether this location is a YOLO model directory.
+
+    Recognised by the sidecar, which has to exist for the model to load at all -
+    it carries the keypoint names, which a .pt file does not. A DeepLabCut
+    project has config.yaml and no sidecar, so the two never collide.
     """
-    Return the configured pose backend name.
+    if not model_path:
+        return False
+    return os.path.isfile(os.path.join(model_path, "yolo_pose.yaml"))
+
+
+def _installed(module: str) -> bool:
+    """Whether an engine is importable, without paying to import it.
+
+    find_spec only looks the module up; importing TensorFlow to ask whether
+    TensorFlow is present would cost seconds and load CUDA.
+    """
+    try:
+        return importlib.util.find_spec(module) is not None
+    except (ImportError, ValueError):
+        # A partially removed distribution can leave a spec that raises.
+        return False
+
+
+def available_backends() -> typing.Tuple[str, ...]:
+    """The engines this deployment could actually run, in preference order."""
+    return tuple(name for name, module in ((TENSORFLOW_BACKEND, "tensorflow"),
+                                           (TORCH_BACKEND, "torch"))
+                 if _installed(module))
+
+
+def selected_backend(environ: typing.Optional[typing.Mapping[str, str]] = None,
+                     model_path: typing.Optional[str] = None) -> str:
+    """
+    Return the pose backend name live inference should run on.
 
     Never raises and never returns an unknown name: an unusable value falls back
-    to the default with a warning, because refusing to start live inference over
-    a typo in an environment variable is worse than running the engine the rig
-    was already running.
+    with a warning, because refusing to start live inference over a typo in an
+    environment variable is worse than running the engine the rig was already
+    running.
+
+    The environment variable wins when it is set. Unset, this used to answer
+    TensorFlow unconditionally, which is right on a rig that has TensorFlow and
+    a guaranteed failure anywhere else: the GPU probe would ask for a
+    TensorFlow runtime that was never installed, live inference would be
+    refused, and the operator was told a TensorFlow runtime was missing without
+    being told that torch was present and was what the model needed. That is
+    the failure this function exists to avoid, so it now answers from what is
+    installed and what the model is.
+
+    A YOLO model settles it on its own - those weights are torch and cannot be
+    anything else - which matters because the model can be chosen in the
+    configuration while the backend can only be chosen through the environment.
+
+    TensorFlow still wins when both are installed. Deployed rigs run trained
+    TensorFlow snapshots, and an unset variable must not change what they do.
     """
     source = os.environ if environ is None else environ
     raw = source.get(POSE_BACKEND_ENV_VAR)
-    if raw is None or not raw.strip():
-        return DEFAULT_POSE_BACKEND
+    if raw is not None and raw.strip():
+        backend = _BACKEND_ALIASES.get(raw.strip().lower())
+        if backend is None:
+            logger.warning("%s=%r is not one of %s; falling back to detection",
+                           POSE_BACKEND_ENV_VAR, raw, POSE_BACKENDS)
+        else:
+            logger.info("%s=%r selects the %s pose backend",
+                        POSE_BACKEND_ENV_VAR, raw, backend)
+            return backend
 
-    backend = _BACKEND_ALIASES.get(raw.strip().lower())
-    if backend is None:
-        logger.warning("%s=%r is not one of %s; using %s",
-                       POSE_BACKEND_ENV_VAR, raw, POSE_BACKENDS, DEFAULT_POSE_BACKEND)
-        return DEFAULT_POSE_BACKEND
+    if is_yolo_model(model_path):
+        logger.info("%r is a YOLO model; using the %s pose backend",
+                    model_path, TORCH_BACKEND)
+        return TORCH_BACKEND
 
-    logger.info("%s=%r selects the %s pose backend", POSE_BACKEND_ENV_VAR, raw, backend)
+    available = available_backends()
+    if not available:
+        # Neither engine importable. Answering the historical default keeps the
+        # message the operator sees pointing at the engine this rig was set up
+        # for, rather than inventing a preference from nothing.
+        logger.warning("neither TensorFlow nor torch is installed; reporting "
+                       "the %s backend so the failure names it",
+                       DEFAULT_POSE_BACKEND)
+        return DEFAULT_POSE_BACKEND
+    if DEFAULT_POSE_BACKEND in available:
+        return DEFAULT_POSE_BACKEND
+    backend = available[0]
+    logger.notice("%s is not installed; using the %s pose backend. Set %s to "
+                  "choose explicitly.",
+                  DEFAULT_POSE_BACKEND, backend, POSE_BACKEND_ENV_VAR)
     return backend
 
 

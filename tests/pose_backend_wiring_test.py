@@ -17,6 +17,7 @@ real start needs a GPU, a trained model and a multiprocessing queue.
 
 import inspect
 import pathlib
+import re
 
 from autotrainer.inference import pose_process
 from autotrainer.inference.backend_selection import (
@@ -35,7 +36,23 @@ def _inference_model_source() -> str:
 def test_the_runtime_probe_is_no_longer_pinned_to_tensorflow():
     source = _inference_model_source()
     assert 'required_backend="tensorflow"' not in source
-    assert "required_backend=selected_backend()" in source
+    # Matched loosely on purpose: what matters is that the probe asks the
+    # selector rather than naming an engine, not how the call is spelled. The
+    # literal form used to be asserted, and adding the model path to the call
+    # failed the test while strengthening exactly what it guards.
+    assert re.search(r"required_backend=selected_backend\(", source)
+
+
+def test_the_runtime_probe_tells_the_selector_which_model_is_configured():
+    """A YOLO model is torch whatever the environment defaults to.
+
+    The model is chosen in the configuration and the backend only through the
+    environment, so a probe that does not pass the model can demand a
+    TensorFlow runtime for torch weights and refuse to start.
+    """
+    source = _inference_model_source()
+    assert re.search(
+        r"selected_backend\(\s*model_path=self\._model_location\s*\)", source)
 
 
 def test_the_runtime_probe_imports_the_selector():
@@ -75,8 +92,14 @@ def test_the_pose_process_no_longer_imports_the_tensorflow_model():
 
 def test_the_pose_process_logs_which_backend_it_loaded():
     source = inspect.getsource(pose_process)
-    assert "selected_backend()" in source
+    assert re.search(r"selected_backend\(", source)
     assert "backend" in source.split("Loading DLC model")[1][:200]
+
+
+def test_the_pose_process_selects_from_the_model_it_was_given():
+    """The child has to reach the same answer as the parent's probe."""
+    source = inspect.getsource(pose_process)
+    assert re.search(r"selected_backend\(\s*model_path=model_path\s*\)", source)
 
 
 def test_the_env_var_name_is_stable():
