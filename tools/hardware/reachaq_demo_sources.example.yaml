@@ -1,0 +1,22 @@
+# reachAQ demo playback sources.
+#
+# Demo mode plays pre-recorded video through the real acquisition pipeline so the
+# system can be shown without an animal present. Only the camera frames are
+# recorded: pose inference, NI-DAQ streaming, pellet control, laser control, and
+# protocol execution all stay live.
+#
+# Copy to ~/Autotrainer/demo/demo_sources.yaml and point it at real media.
+# Video files are never committed to the repository.
+
+# Playback rate. Match the rate the source session was recorded at, so live
+# inference sees the same load it sees on the rig.
+fps: 150
+
+# Restart at frame 0 on reaching the end, so the demo runs indefinitely.
+loop: true
+
+cameras:
+  left: /home/christie07/Autotrainer/demo/session001_left-0000.mp4
+  right: /home/christie07/Autotrainer/demo/session001_right-0000.mp4
+  # stimCam is an accepted alias for camera3.
+  stimCam: /home/christie07/Autotrainer/demo/session001_stimCam-0000.mp4
