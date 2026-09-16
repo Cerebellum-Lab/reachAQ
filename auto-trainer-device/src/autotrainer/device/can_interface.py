@@ -757,6 +757,7 @@ class CanInterface(DeviceInterface):
                     capabilities = self.get_response(
                         BoardCapabilities,
                         Target.PELLET_DEVICE,
+                        motor=None,
                         timeout=0.25,
                     )
                     if capabilities is not None and capabilities.capabilities & 0x2:
@@ -765,6 +766,7 @@ class CanInterface(DeviceInterface):
                                 self.get_response(
                                     BoardTimeSync,
                                     Target.PELLET_DEVICE,
+                                    motor=None,
                                     timeout=0.25,
                                 )
             except BaseException:
