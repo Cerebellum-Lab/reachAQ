@@ -304,7 +304,7 @@ def check_pose(
         return
 
     primary = sources.video_for("left") or next(iter(sources.cameras.values()))
-    above, total = _score_video(model, primary, parts, threshold, frame_limit)
+    above, total, best = _score_video(model, primary, parts, threshold, frame_limit)
     if total == 0:
         report.add(FAIL, "pose detection", f"no frames could be read from {primary}")
         return
@@ -312,52 +312,93 @@ def check_pose(
     for part in parts:
         rate = above.get(part, 0) / total
         marker = "  <- gate part" if part in GATE_PARTS else ""
-        print(f"        {part:<14} {rate * 100:5.1f}% of {total} frames{marker}")
+        print(f"        {part:<14} {rate * 100:5.1f}% of {total} frames"
+              f"   best={best.get(part, 0.0):.3f}{marker}")
 
-    worst = min(above.get(part, 0) / total for part in GATE_PARTS)
-    if worst >= MIN_GATE_DETECTION_RATE:
+    # Is the model seeing this footage at all? Scene parts sit in frame constantly,
+    # so a model that is in-distribution clears the gate on something. Nothing
+    # anywhere means the video is not footage this model was trained for, and the
+    # overlay will be noise.
+    detected = [part for part in parts if above.get(part, 0) > 0]
+    if not detected:
+        report.add(
+            FAIL, "pose detection",
+            f"no body part cleared {threshold:.2f} in any of {total} sampled frames "
+            f"(best confidence seen: {max(best.values(), default=0.0):.3f}). This video "
+            "is not footage the configured model recognises; the demo would show an "
+            "overlay of noise. Pick a session the model was trained for.",
+        )
+        return
+
+    report.add(PASS, "pose detection",
+               f"{len(detected)}/{len(parts)} body parts detected across {total} "
+               f"sampled frames: {', '.join(detected)}")
+
+    # Gate parts are a hand in a grab posture. They exist only during a reach, so
+    # their absence from a sample is weak evidence, not proof - unlike the
+    # whole-model check above, which is decisive.
+    gate_hits = max(above.get(part, 0) for part in GATE_PARTS)
+    if gate_hits / total >= MIN_GATE_DETECTION_RATE:
         report.add(PASS, "gate detection",
-                   f"weakest gate part clears the threshold in {worst * 100:.1f}% of frames")
+                   f"a gate part clears the threshold in {gate_hits / total * 100:.1f}% "
+                   "of sampled frames, so the cue gate can be answered")
     else:
         report.add(
-            FAIL, "gate detection",
-            f"weakest gate part clears the threshold in only {worst * 100:.1f}% of "
-            f"{total} frames. The demo will play video and never close the loop. "
-            "Either the backbone's threshold is wrong for this model, or this video "
-            "is not one the model was trained for.",
+            WARN, "gate detection",
+            f"no gate part ({', '.join(GATE_PARTS)}) cleared {threshold:.2f} in "
+            f"{total} sampled frames; best seen "
+            f"{max(best.get(part, 0.0) for part in GATE_PARTS):.3f}. Reaches are "
+            "sparse, so this may just be sampling. Confirm the chosen clip contains "
+            "reaches, or the closed-loop part of the demo will stay silent.",
         )
 
 
 def _score_video(model, video: Path, parts: List[str], threshold: float,
-                 frame_limit: int) -> Tuple[Dict[str, int], int]:
-    """Count, per body part, how many frames put it above the confidence gate."""
+                 frame_limit: int) -> Tuple[Dict[str, int], int, Dict[str, float]]:
+    """Per body part: how often it clears the gate, and its best confidence.
+
+    Samples across the whole clip rather than reading consecutively from the
+    start. A run of consecutive frames covers a second or two of a ten-minute
+    recording, and reaches are sparse, so a consecutive sample reports zero for
+    the hand parts almost regardless of the video.
+    """
     above: Dict[str, int] = {part: 0 for part in parts}
+    best: Dict[str, float] = {part: 0.0 for part in parts}
     capture = cv2.VideoCapture(str(video))
     total = 0
     try:
         if not capture.isOpened():
-            return above, 0
-        while total < frame_limit:
+            return above, 0, best
+        frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+        if frame_count <= 0:
+            return above, 0, best
+        wanted = min(frame_limit, frame_count)
+        for index in range(wanted):
+            position = int(frame_count * (index + 0.5) / wanted)
+            capture.set(cv2.CAP_PROP_POS_FRAMES, position)
             ok, frame = capture.read()
             if not ok:
-                break
-            batch = numpy.expand_dims(frame, axis=0)
+                continue
             try:
-                pose = numpy.asarray(model.predict(batch))
+                pose = numpy.asarray(model.predict(numpy.expand_dims(frame, axis=0)))
             except Exception as err:
-                logger.error("predict failed on frame %s: %s", total, err)
+                logger.error("predict failed at frame %s: %s", position, err)
                 break
-            # Flattened (x, y, confidence) per part, in body_parts order.
+            # (x, y, confidence) per part, in body_parts order.
             values = pose.reshape(-1, 3)
-            for index, part in enumerate(parts):
-                if index < len(values) and values[index, 2] >= threshold:
+            for part_index, part in enumerate(parts):
+                if part_index >= len(values):
+                    continue
+                confidence = float(values[part_index, 2])
+                best[part] = max(best[part], confidence)
+                if confidence >= threshold:
                     above[part] += 1
             total += 1
-            if total % 100 == 0:
-                print(f"        ... {total} frames", flush=True)
+            if total % 50 == 0:
+                print(f"        ... {total}/{wanted} sampled", flush=True)
     finally:
         capture.release()
-    return above, total
+    return above, total, best
 
 
 # ----------------------------------------------------------------- main
