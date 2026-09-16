@@ -12,7 +12,7 @@ from .device_connection_protocol import DeviceConnectionProtocol
 from .device_interface import (DeviceInterface, Target, Motor, ServoConfig, StepperConfig,
                                Heartbeat, DigitalOutputs, PelletDigitalInputs,
                                BoardTimeSync, BoardCapabilities, DigitalPulseStatus,
-                               Tone, AnalogOutput, AnalogOutputs,
+                               Tone, AnalogOutput, AnalogOutputs, PressureReading,
                                ColorLed, StepperStatus, ServoStatus, Status)
 from .emulation_interface import EmulationInterface
 from .can_device import CanDevice, HAVE_CAN_DEVICE

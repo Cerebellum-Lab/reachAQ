@@ -53,10 +53,16 @@ def qapp():
     return app
 
 
+class _MessageHandlerStub(ObservableObject):
+    def __init__(self):
+        super().__init__(("decoded_message_received",))
+
+
 class _AnalysisAppStub(ObservableObject):
     def __init__(self, monitor):
         super().__init__(("configuration_loaded_event",))
         self.nidaq_signal_monitor = monitor
+        self.message_handler = _MessageHandlerStub()
         self.nidaq_ports = NidaqPortConfiguration(
             cam_frames="Dev1/port0/line0",
             tone1="Dev1/port0/line3",
