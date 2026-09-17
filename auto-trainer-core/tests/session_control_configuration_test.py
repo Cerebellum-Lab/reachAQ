@@ -50,10 +50,10 @@ def test_session_control_round_trips_with_system_configuration():
     )
 
 
-def test_session_duration_is_capped_at_two_hours():
-    SessionControlConfiguration(duration_limit_seconds=7200)
-    with pytest.raises(ValueError, match="cannot exceed 2 hours"):
-        SessionControlConfiguration(duration_limit_seconds=7200.1)
+def test_session_duration_is_capped_at_five_hours():
+    SessionControlConfiguration(duration_limit_seconds=18000)
+    with pytest.raises(ValueError, match="cannot exceed 5 hours"):
+        SessionControlConfiguration(duration_limit_seconds=18000.1)
 
 
 def test_missing_pellet_retry_does_not_require_intertrial_analysis():
