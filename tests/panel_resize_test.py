@@ -205,10 +205,79 @@ def test_main_content_coalesces_pose_bursts_at_display_rate(qapp, app_model, mon
         content.refresh_pose(first)
         content.refresh_pose(newest)
 
+        # Nothing reaches the panel before the tick. That is the guarantee:
+        # dispatching each result as it arrives floods the UI thread and delays
+        # unrelated timers.
         assert camera_panel.camera_view._next_frame_points == {}
+
         content.update_image()
+
+        # Both are handed over on the tick, newest last, so the panel can pick
+        # the one matching the frame it is showing rather than being left with
+        # only the newest. Painting still happens once per tick.
         assert camera_panel.camera_view._next_frame_points == newest.locations[0]
-        assert content._pending_pose_response is None
+        assert content._pending_pose_responses == [], "the buffer must drain"
+    finally:
+        content.close()
+        content.deleteLater()
+
+
+def test_selecting_a_subject_does_not_crash_the_training_plan_panel(
+        qapp, app_model, monkeypatch):
+    """The progress widgets must survive construction.
+
+    They are built by _create_protocol_phase_progress_widget and were then
+    overwritten by a block of `= None` defaults that ran afterwards, so with
+    the protocol UI enabled _update_training_plan raised AttributeError on
+    _training_plan_progress_content the moment a subject was selected. The
+    handler caught it as a fatal main-thread exception, marked
+    runtime_diagnostics failed and left an error banner up for the rest of the
+    session, while the selection itself completed.
+    """
+    class _BehaviorPanelStub(ContentWidget):
+        def __init__(self, *_args, **_kwargs):
+            super().__init__()
+
+    monkeypatch.setattr(main_content_module, "BehaviorContent", _BehaviorPanelStub)
+    assert app_model.load_configuration() is True
+    content = MainContent(app_model)
+    try:
+        assert content.protocol_ui_enabled, (
+            "this guards the enabled path; disabled has its own early return")
+        for name in ("_training_plan_content",
+                     "_training_phase_content",
+                     "_training_plan_progress_content",
+                     "_training_phase_progress_content",
+                     "_protocol_phase_end_widget"):
+            assert getattr(content, name) is not None, (
+                f"{name} was reset to None after it was built")
+
+        # The call that used to raise. None is the no-plan case an operator
+        # hits first, and it reaches every one of the widgets above.
+        content._update_training_plan(None)
+    finally:
+        content.close()
+
+
+def test_main_content_bounds_the_pose_buffer(qapp, app_model, monkeypatch):
+    """A stall must not grow the pose buffer without limit."""
+    class _BehaviorPanelStub(ContentWidget):
+        def __init__(self, *_args, **_kwargs):
+            super().__init__()
+
+    monkeypatch.setattr(main_content_module, "BehaviorContent", _BehaviorPanelStub)
+    assert app_model.load_configuration() is True
+    content = MainContent(app_model)
+    content._timer.stop()
+    try:
+        limit = main_content_module.PENDING_POSE_LIMIT
+        for sequence in range(limit * 3):
+            content.refresh_pose(PoseResponse(sequence=sequence, locations=[{}]))
+        assert len(content._pending_pose_responses) == limit
+        # The newest survive; the oldest are the ones dropped.
+        kept = [response.sequence for response in content._pending_pose_responses]
+        assert kept[-1] == limit * 3 - 1
+        assert kept[0] == limit * 2
     finally:
         content.close()
         content.deleteLater()

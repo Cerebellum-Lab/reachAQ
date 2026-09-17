@@ -177,6 +177,16 @@ class LiveTrackingBuffer:
         with self._lock:
             return tuple(self._samples)
 
+    def latest(self) -> Optional[LiveTrackingSample]:
+        """The most recent sample, or None before the first one arrives.
+
+        Separate from snapshot() because the cue gate asks for this on every
+        poll and snapshot() copies the whole deque, which holds up to 18000
+        samples.
+        """
+        with self._lock:
+            return self._samples[-1] if self._samples else None
+
     def window(
         self,
         start_perf: float,

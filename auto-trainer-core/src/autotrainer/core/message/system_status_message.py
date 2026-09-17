@@ -59,6 +59,9 @@ class SystemStatusMessageKind(IntEnum):
     BOARD_CAPABILITIES = 308
     DIGITAL_PULSE_STATUS = 309
 
+    PRESSURE_READING = 310
+    """One pellet-board FSR sample as a PressureReading (raw 12-bit ADC count)."""
+
     COLOR_LED = 403
     """Message is the original ColorLed message"""
 
@@ -74,6 +77,18 @@ class SystemStatusMessageKind(IntEnum):
 
     STIM_CAMERA_EVIDENCE_STATUS = 1004
     """Stim-camera evidence writer terminal status and diagnostics."""
+
+    CAMERA_FRAME_STATS = 1005
+    """Periodic per-camera frame accounting: (cam_idx, frames_received, frames_missed).
+
+    Absolute session totals, not deltas. The capture process emits these on a
+    timer, and an absolute value corrects itself if a message is lost or
+    arrives out of order, where a delta would corrupt a running sum silently.
+
+    frames_missed counts gaps in the camera's own frame-ID sequence - frames
+    the sensor produced that never reached the host. It is not the pose path
+    skipping frames, which is by design and is not a fault.
+    """
 
 
 

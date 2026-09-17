@@ -1146,6 +1146,13 @@ class MainWindow(QMainWindow):
         action.triggered.connect(self.on_calibrate_diamond_triangle)
         action.setEnabled(False)
 
+        action = self.overlay_parts_action = QAction("Overlay Parts and Legend…", self)
+        action.setToolTip(
+            "Which colour means which part, and which parts the live "
+            "overlay draws"
+        )
+        action.triggered.connect(self._on_overlay_parts)
+
         action = self.make_3d_calib_action = QAction(_toolbar_icon("fa5s.crosshairs"), "Make 3D calibration", self)
         action.setCheckable(True)
         action.triggered.connect(self.on_3d_calibrate)
@@ -1199,6 +1206,7 @@ class MainWindow(QMainWindow):
         hardware_menu.addSeparator()
         hardware_menu.addAction(self.rfid_device_action)
         hardware_menu.aboutToHide.connect(self._flush_pending_hardware_refresh)
+        file_menu.addAction(self.overlay_parts_action)
         file_menu.addSeparator()
         file_menu.addAction(self.quit_action)
 
@@ -1514,6 +1522,31 @@ class MainWindow(QMainWindow):
             self.debug_action.setChecked(True)
         else:
             v.close()
+
+    def _on_overlay_parts(self) -> None:
+        """Show the overlay legend and let the operator narrow it."""
+        from tools.acquisition.view.overlay_parts_dialog import (
+            OverlayPartsDialog)
+
+        inference = self._app_model.inference
+        parts = list(inference.pose_parts)
+        if not parts:
+            self._show_message(
+                "Overlay parts",
+                "The pose model has not reported its parts yet. Start the "
+                "system and try again once inference is running.")
+            return
+        # The model emits the hand composites in addition to its own
+        # keypoints, so they belong in the list even though the model does
+        # not name them.
+        for composite in (SceneElement.L_Hand, SceneElement.R_Hand):
+            if composite not in parts:
+                parts.append(str(composite))
+
+        dialog = OverlayPartsDialog(parts, inference.overlay_parts, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        inference.overlay_parts = dialog.selected_parts()
 
     def _show_message(self, title: str, message: str):
         @invoke_method

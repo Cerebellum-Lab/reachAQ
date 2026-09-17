@@ -48,10 +48,15 @@ class VideoReader(Thread):
                 self._reset_event.clear()
 
             try:
-                data = q_get(timeout=0.5)
+                data, frame_id = q_get(timeout=0.5, with_frame_id=True)
             except queue.Empty:
                 continue
+            except TypeError:
+                # A plain queue.Queue has no with_frame_id; the display then
+                # has no id to pair against and falls back to showing the
+                # newest pose, which is what it did before any of this.
+                data, frame_id = q_get(timeout=0.5), -1
             # if count % self._decimation == 0:
             # applied on camera capture side
-            self._update_fcn(data)
+            self._update_fcn(data, frame_id)
             count += 1

@@ -3,15 +3,27 @@
   "artifacts": [
     {
       "system": "linux",
-      "machine": "x86_64",
-      "python": "cp38",
-      "path": "linux/x86_64/spinnaker_python-3.2.0.62-cp38-cp38-linux_x86_64.whl"
+      "machine": "aarch64",
+      "python": "cp310",
+      "path": "linux/aarch64/spinnaker_python-3.2.0.62-cp310-cp310-linux_aarch64.whl"
     },
     {
       "system": "linux",
       "machine": "aarch64",
       "python": "cp38",
       "path": "linux/aarch64/spinnaker_python-3.2.0.62-cp38-cp38-linux_aarch64.whl"
+    },
+    {
+      "system": "linux",
+      "machine": "x86_64",
+      "python": "cp310",
+      "path": "linux/x86_64/spinnaker_python-3.2.0.62-cp310-cp310-linux_x86_64.whl"
+    },
+    {
+      "system": "linux",
+      "machine": "x86_64",
+      "python": "cp38",
+      "path": "linux/x86_64/spinnaker_python-3.2.0.62-cp38-cp38-linux_x86_64.whl"
     },
     {
       "system": "windows",

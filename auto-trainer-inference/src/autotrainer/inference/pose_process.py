@@ -23,11 +23,81 @@ from autotrainer.core.logging import (
     install_log_exception_hook,
 )
 from autotrainer.core.frame_index import FrameIndexCategory
-from . import DlcPoseModel, MemoryPoseModel
+from . import MemoryPoseModel
+from .backend_selection import build_pose_model, selected_backend
+from .cropped_pose_model import maybe_crop
 from .pose_model import PoseModel
 from .pose_offline_input import OfflineInputProcess
 
 logger = get_verbose_logger(__name__)
+
+#: How often the pose process reports its timings. This drives a live readout
+#: an operator watches during a recording, so it has to be short enough to be
+#: worth watching: the previous 30 s meant the first latency figure appeared
+#: half a minute into a session, and the last one was up to 30 s stale when the
+#: session ended. It also bounds how much of the model's warm-up spike can leak
+#: into the first window of a session. Matched to the capture process's own
+#: 0.5 s frame-stats period so the two halves of the panel move together.
+PERFORMANCE_REPORT_PERIOD = 0.5
+
+
+def _is_end_of_recording(frames_indices) -> bool:
+    """Whether this batch is the marker capture sends when recording stops.
+
+    Read as "any camera", matching how the consumers test it: capture sends one
+    per camera and they arrive as one batch, so a partially filled batch still
+    means the recording has ended.
+    """
+    return bool((frames_indices == FrameIndexCategory.EOF_RECORDING).any())
+
+
+def take_newest_live_batch(queue, frame_buffer, frames_indices, frames_perf_c,
+                           *, drain: bool) -> bool:
+    """Fill the buffers from the freshest batch the live queue holds.
+
+    get_output frees the buffer slot as soon as it has copied the frame out,
+    which is at the start of predict rather than the end, so the producer
+    refills it immediately and everything arriving during predict is dropped.
+    The batch waiting at the next call is therefore already up to one
+    predict-period old, and that staleness lands directly on the closed loop:
+    measured on the rig, cspnext_m spent about 5.5 ms of its 16.3 ms
+    end-to-end sitting in the buffer rather than being computed.
+
+    Draining costs one 64 KB copy per skipped frame and removes that wait. It
+    only does anything when the queue has depth to spare, which is why the live
+    queue is no longer depth 1 - at depth 1 nothing can be waiting behind the
+    current batch and the probe would pay a full frame copy to discover it.
+
+    The drain stops on an end-of-recording batch. Skipping a frame only costs
+    inference work, which is the whole point, but that batch is not a frame: it
+    is the marker that closes the live pose files, and capture goes straight
+    back to streaming after sending it. Draining past it overwrote it in place,
+    so the pose process never saw the recording stop, the writers were never
+    told to close, and every session finalized incomplete with "Timed out
+    waiting for live pose files to close". Whether it survived was a race
+    against the next frame: it survived once in eleven sessions on the rig.
+    Whatever arrives behind the marker stays queued for the next call, which
+    costs one iteration of staleness on a path where recording has stopped.
+
+    Returns False when the queue had nothing, leaving the buffers untouched.
+    """
+    if not queue.get_output(frame_buffer, frames_indices, timeout=0.1,
+                            frames_perf_c=frames_perf_c):
+        return False
+    while (drain
+           and not _is_end_of_recording(frames_indices)
+           and queue.get_output(frame_buffer, frames_indices, timeout=0,
+                                frames_perf_c=frames_perf_c)):
+        pass
+    return True
+
+
+
+# Frames per camera the pose model graph is built for. DeepLabCut fixes its
+# batch size at construction (`setup_pose_prediction` builds a placeholder with
+# a literal batch dimension), so this value sizes the model and the offline
+# input, while the live queue may deliver fewer real frames and be padded.
+DEFAULT_MODEL_FRAMES_PER_CAMERA = 3
 
 _local_do_debug = True
 
@@ -87,6 +157,7 @@ class PoseProcess(Process):
         offline_input_event_cb_ack: synchronize.Event,
         watchdog_perf_c: Synchronized,
         record_stop_sema: Optional[SemaphoreType] = None,
+        model_frames_per_camera: int = DEFAULT_MODEL_FRAMES_PER_CAMERA,
     ):
         """
         :param live_queue: a FixedArrayMultiQueue as the default source of input frames
@@ -95,6 +166,9 @@ class PoseProcess(Process):
         :param cmd_queue: an input Queue for starting, terminating, and changing queues
         :param msg_queue: an output Queue for status and performance messages
         :param stop_recorded_event: DataMonitorProc stop recorded
+        :param model_frames_per_camera: frames per camera the model graph is built for.
+            The offline input uses the same value. The live queue may provide fewer, in
+            which case the remaining rows of the predict buffer stay zero-padded.
         """
         log_dict_config = make_log_dict_config()
         super().__init__(
@@ -116,9 +190,11 @@ class PoseProcess(Process):
         self._mode = InferenceMode.Live
         self._input_queue = live_queue
         self._record_stop_sema = record_stop_sema
+        self._model_frames_per_camera = int(model_frames_per_camera)
         self._process_live_when_ready = False
         self._is_running = True
-        self._perf_monitor = PerfMonitor(name="<pose-predict>", units="predict calls/s", report_window=30,
+        self._perf_monitor = PerfMonitor(name="<pose-predict>", units="predict calls/s",
+                                         report_window=PERFORMANCE_REPORT_PERIOD,
                                          enable_log=False)
         #
 
@@ -141,12 +217,18 @@ class PoseProcess(Process):
         self._send_message(InferenceStatusMessageKind.Created)
 
         model_path = self._model_location
+        # Sized from the model frame count, not the live queue: the live queue now
+        # delivers a single frame per camera and its batch is padded before predict.
+        model_batch_size = (
+            self._live_input_queue.camera_count * self._model_frames_per_camera
+        )
         if model_path is None or len(model_path) == 0:
             logger.warning("pellet model not specified; using in-memory random data")
-            model = MemoryPoseModel(self._live_input_queue.batch_size)
+            model = MemoryPoseModel(model_batch_size)
         else:
-            logger.notice("Loading DLC model %r", model_path)
-            model = DlcPoseModel(model_path, 1, 0, self._live_input_queue.batch_size)
+            backend = selected_backend(model_path=model_path)
+            logger.notice("Loading DLC model %r using the %s backend", model_path, backend)
+            model = build_pose_model(model_path, 1, 0, model_batch_size, backend=backend)
 
         if not model.is_valid():
             self._send_message(InferenceStatusMessageKind.Terminated)
@@ -155,6 +237,12 @@ class PoseProcess(Process):
             raise RuntimeError(f"Model at {model_path} not valid")
 
         self._pose_model = model
+        # Before load(), so a backend that specialises for a fixed input shape
+        # specialises for the live one. The padded size above exists for the
+        # offline pass and for the TensorFlow graph's fixed batch dimension;
+        # sizing a fast path to it optimises the one caller that has no
+        # deadline.
+        model.prepare_live_batch(self._live_input_queue.batch_size)
 
         self._send_message(InferenceStatusMessageKind.Loading)
 
@@ -162,6 +250,13 @@ class PoseProcess(Process):
         logging.root.setLevel(logging.WARN)
         self._pose_model.load()
         logging.root.setLevel(prev_lvl)
+        # Outside the quiet window above, so it actually reaches the log. Which
+        # path a model settled on is the difference between meeting the latency
+        # budget and missing it, and it was previously only knowable by reading
+        # the source and guessing.
+        logger.notice("pose model runtime: %s | live batch %d, offline batch %d",
+                      self._pose_model.runtime_detail(),
+                      self._live_input_queue.batch_size, model_batch_size)
 
         self._send_message(InferenceStatusMessageKind.Initialized, self._pose_model.body_parts)
 
@@ -170,7 +265,7 @@ class PoseProcess(Process):
         offline_input = OfflineInputProcess(
             stop_recorded=self._stop_recorded_event,
             frame_shape=input_q.shape,
-            frames_per_cam=input_q.frames_per_camera,
+            frames_per_cam=self._model_frames_per_camera,
             nr_cams=input_q.camera_count,
             msg_queue=self._msg_queue,
             event_cb_ack=self._offline_input_event_cb_ack,
@@ -266,35 +361,86 @@ class PoseProcess(Process):
         sent_live = False  # on first processed capture
         #
         input_q = self._live_input_queue
-        # use input_queue to know the "sizes"
-        frame_buffer1 = numpy.ndarray(
-            (input_q.batch_size,  # nbr cams * frames per cam (3 atm)
+        # The predict buffer is sized for the model graph. The live queue fills only
+        # its leading rows; the rest stay zero. CNN inference is per-image, so the
+        # padding rows cannot influence the real ones, they only cost compute.
+        model_batch_size = input_q.camera_count * self._model_frames_per_camera
+        live_batch_size = input_q.batch_size
+        predict_buffer = numpy.zeros(
+            (model_batch_size,  # nbr cams * frames per cam the model expects
              *input_q.shape,  # W, H
              3,  # current model takes RGB
              ))
+        # A view, so the queue writes straight into the padded buffer.
+        frame_buffer1 = predict_buffer[:live_batch_size]
         frames_indices1 = numpy.ndarray(
             (input_q.camera_count, input_q.frames_per_camera), dtype="int64")
+        # Exposure times for the same frames, so sensor-to-result can be
+        # reported alongside how long the call itself took. The two are
+        # different questions: the call is what the model costs, and
+        # sensor-to-result is what the closed loop actually waits on.
+        frames_perf_c1 = numpy.full(
+            (input_q.camera_count, input_q.frames_per_camera), numpy.nan,
+            dtype="float64")
         #
         frame_buffer = frame_buffer1
         frames_indices = frames_indices1
 
-        empty_zero_pose = [np.asarray([0] * 3 * len(self._pose_model.body_parts))] * frames_indices.size
+        # Live and offline no longer share a frame count, so the zero result has to
+        # match whichever mode produced the batch.
+        _zero_pose_row = np.asarray([0] * 3 * len(self._pose_model.body_parts))
+        empty_zero_pose_live = [_zero_pose_row] * frames_indices1.size
+        empty_zero_pose_offline = [_zero_pose_row] * model_batch_size
 
         # use a pre-allocated copy for outputting the frames indices:
         prev_mode = None
         logger.info("%s: starting processing ..", self)
         d_q_put = self._data_queue.put
-        predict = self._pose_model.predict
+        # Live predictions may run on a crop of the frame; offline keeps the full
+        # frame. The DeepLabCut placeholder fixes only the batch dimension, so one
+        # loaded model serves both spatial sizes. Coordinates come back in
+        # full-frame space either way, which is what calibration expects.
+        live_model = maybe_crop(self._pose_model, input_q.shape)
+        # A backend that batches internally is given only the real frames.
+        # The padding exists for the TensorFlow graph's fixed batch dimension;
+        # feeding it to a backend that does not need it costs batch-six
+        # compute to produce batch-two output.
+        live_predict_input = (
+            frame_buffer1 if live_model.supports_partial_batch else predict_buffer
+        )
+        live_predict = live_model.predict
+        offline_predict = self._pose_model.predict
+        if live_model is not self._pose_model:
+            logger.notice(
+                "live inference cropping enabled: %s (offline stays full-frame)",
+                live_model.roi,
+            )
         perf_add_c = self._perf_monitor.add_cycle
+        live_predict_count = 0
+        window_predict_count = 0
+        window_predict_total_ms = 0.0
+        window_predict_max_ms = 0.0
+        window_e2e_count = 0
+        window_e2e_total_ms = 0.0
+        window_e2e_max_ms = 0.0
 
         live_input = self._live_input_queue
+        live_drain = live_input.depth > 1
 
         # always begin with live input:
         i_q: Optional[FixedArrayMultiQueue] = live_input
 
         def get_live_input():
-            res = live_input.get_output(frame_buffer1, frames_indices1, timeout=0.1)
-            return res
+            # Freshest batch, not the oldest, and never past the end-of-recording
+            # marker. See take_newest_live_batch for why both matter.
+            #
+            # Acquisition is unaffected either way. The capture loop puts with
+            # block=False, so a slow pose process can never stall it or cost a
+            # recorded frame; skipping here discards inference work, never
+            # acquisition.
+            return take_newest_live_batch(
+                live_input, frame_buffer1, frames_indices1, frames_perf_c1,
+                drain=live_drain)
 
         def get_offline_input():
             nonlocal frame_buffer, frames_indices
@@ -389,11 +535,44 @@ class PoseProcess(Process):
 
             # only predict for not fully incomplete frames buffer:
             if (frames_indices >= FrameIndexCategory.ONLINE_NO_RECORDING).any():
-                pose = predict(frame_buffer)
+                if i_q is live_input:
+                    # Either the real frames alone, or the padded buffer when the
+                    # backend needs a fixed batch. The slice is a no-op in the
+                    # first case and drops the padding rows in the second.
+                    #
+                    # Timed only on the live path. The operator panel reports
+                    # what the closed loop waits on, and folding the offline
+                    # batch in would average a throughput-shaped workload into
+                    # a latency figure.
+                    predict_started = time.perf_counter()
+                    pose = live_predict(live_predict_input)[:live_batch_size]
+                    predict_done = time.perf_counter()
+                    predict_ms = (predict_done - predict_started) * 1000.0
+                    live_predict_count += 1
+                    window_predict_count += 1
+                    window_predict_total_ms += predict_ms
+                    if predict_ms > window_predict_max_ms:
+                        window_predict_max_ms = predict_ms
+                    # Sensor to result, from the OLDEST exposure in the batch:
+                    # a pose is only as fresh as the stalest camera it used,
+                    # and taking the newest would flatter every stereo figure.
+                    # This includes the queue wait the raw call cannot see.
+                    oldest_exposure = numpy.nanmin(frames_perf_c1)
+                    if oldest_exposure == oldest_exposure:  # not NaN
+                        e2e_ms = (predict_done - oldest_exposure) * 1000.0
+                        window_e2e_count += 1
+                        window_e2e_total_ms += e2e_ms
+                        if e2e_ms > window_e2e_max_ms:
+                            window_e2e_max_ms = e2e_ms
+                else:
+                    pose = offline_predict(frame_buffer)
             else:
                 logger.debug("indices=%s skipped inference", frames_indices.tolist())
                 # otherwise gives a full "0" result:
-                pose = empty_zero_pose
+                pose = (
+                    empty_zero_pose_live if i_q is live_input
+                    else empty_zero_pose_offline
+                )
                 # that will anyway be skipped in the consumer when needed
 
             # ensure we make a copy of the frames_indices:
@@ -421,7 +600,31 @@ class PoseProcess(Process):
                 sent_live = True
 
             if perf_add_c():
-                self._send_message(InferenceStatusMessageKind.Performance, self._perf_monitor.cps)
+                # The session pose total, plus the mean and max of the calls in
+                # this window for BOTH figures. Absolute count so the receiver
+                # cannot drift; windowed mean and max because a session-wide
+                # mean hides a slow patch and the max decides whether a
+                # deadline was missed.
+                self._send_message(
+                    InferenceStatusMessageKind.Performance,
+                    (
+                        self._perf_monitor.cps,
+                        live_predict_count,
+                        (window_predict_total_ms / window_predict_count
+                         if window_predict_count else float("nan")),
+                        window_predict_max_ms if window_predict_count
+                        else float("nan"),
+                        (window_e2e_total_ms / window_e2e_count
+                         if window_e2e_count else float("nan")),
+                        window_e2e_max_ms if window_e2e_count else float("nan"),
+                    ),
+                )
+                window_predict_count = 0
+                window_predict_total_ms = 0.0
+                window_predict_max_ms = 0.0
+                window_e2e_count = 0
+                window_e2e_total_ms = 0.0
+                window_e2e_max_ms = 0.0
 
             # could only check the frame index, given is only emitted from offline mode:
             if mode_used == InferenceMode.Offline and (

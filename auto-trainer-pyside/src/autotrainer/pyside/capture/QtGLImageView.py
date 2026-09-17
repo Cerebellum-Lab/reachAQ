@@ -8,11 +8,70 @@ from PySide6.QtWidgets import QWidget, QGraphicsView, QGraphicsScene, QHBoxLayou
     QGraphicsEllipseItem, QGraphicsItem
 
 from autotrainer.core.logging import get_verbose_logger
-from autotrainer.core.pose_elements import SceneElement
+from autotrainer.core.pose_elements import AllHandsParts, SceneElement
 from autotrainer.inference import PoseLocation
 
 
 logger = get_verbose_logger(__name__)
+
+# Colours for the parts this rig has always drawn, kept so the overlay looks
+# the same as before. Any other part the model emits gets a colour from
+# _FALLBACK_COLOURS, picked by name so it stays the same across restarts.
+_PART_COLOURS = {
+    SceneElement.Pellet: Qt.GlobalColor.red,
+    SceneElement.Star: Qt.GlobalColor.magenta,
+    SceneElement.Diamond: Qt.GlobalColor.blue,
+    SceneElement.Triangle: Qt.GlobalColor.green,
+    SceneElement.Nose: Qt.GlobalColor.cyan,
+    SceneElement.Mouth: Qt.GlobalColor.darkYellow,
+    SceneElement.Tongue_mid: Qt.GlobalColor.darkRed,
+    SceneElement.Tongue_tip: Qt.GlobalColor.darkMagenta,
+    SceneElement.RH_flat: Qt.GlobalColor.yellow,
+    SceneElement.RH_spread: Qt.GlobalColor.darkGreen,
+    SceneElement.RH_grab: Qt.GlobalColor.darkCyan,
+    SceneElement.LH_flat: Qt.GlobalColor.white,
+    SceneElement.LH_spread: Qt.GlobalColor.lightGray,
+    SceneElement.LH_grab: Qt.GlobalColor.gray,
+}
+
+_FALLBACK_COLOURS = (
+    Qt.GlobalColor.red, Qt.GlobalColor.green, Qt.GlobalColor.blue,
+    Qt.GlobalColor.cyan, Qt.GlobalColor.magenta, Qt.GlobalColor.yellow,
+    Qt.GlobalColor.white, Qt.GlobalColor.darkRed, Qt.GlobalColor.darkGreen,
+    Qt.GlobalColor.darkBlue,
+)
+
+# The markers are landmarks rather than anatomy and want to stay legible
+# under a cluster of animal parts, so they keep the original larger dot.
+_MARKER_PARTS = frozenset((
+    SceneElement.Star, SceneElement.Diamond, SceneElement.Triangle,
+    SceneElement.Pellet,
+))
+
+# A hand is one thing whose appearance changes with its orientation, so the
+# model predicts it three ways and the pose algorithm emits whichever of the
+# three it saw most confidently as L_Hand or R_Hand. Drawing the source
+# keypoint as well puts two dots on the same pixel and says nothing extra,
+# so the orientations are left out unless a configuration names them.
+_SUBSUMED_BY_COMPOSITE = frozenset(AllHandsParts)
+
+
+def overlay_colour_for(name: str):
+    """The colour this part is drawn in.
+
+    Shared with the legend, so what the dialog shows and what the overlay
+    paints cannot drift apart - a legend that has to be kept in step by hand
+    is a legend that will eventually lie.
+    """
+    colour = _PART_COLOURS.get(name)
+    if colour is not None:
+        return colour
+    return _FALLBACK_COLOURS[hash(str(name)) % len(_FALLBACK_COLOURS)]
+
+
+def is_subsumed_by_composite(name: str) -> bool:
+    """Whether a composite already stands for this part, so it is off by default."""
+    return name in _SUBSUMED_BY_COMPOSITE
 
 
 class QGLImageView(QWidget):
@@ -51,29 +110,16 @@ class QGLImageView(QWidget):
         view.setFixedSize(width, height)
         view.setContentsMargins(0, 0, 0, 0)
 
-        self._points: Dict[SceneElement, QGraphicsEllipseItem] = {}
-
-        def add_managed_point(color, elem: SceneElement, *, size_w: float=5, size_h: float=5):
-            point = self._points[elem] = QGraphicsEllipseItem(0, 0, size_w, size_h)
-            pen = QPen(color)
-            pen.setWidth(1)
-            point.setPen(pen)
-            point.setBrush(QBrush(color))
-            point.setZValue(100)
-            point.setPos(-10, -10)
-            self._scene.addItem(point)
-
-        add_managed_point(Qt.GlobalColor.red, SceneElement.Pellet)
-        add_managed_point(Qt.GlobalColor.magenta, SceneElement.Star)
-        add_managed_point(Qt.GlobalColor.blue, SceneElement.Diamond)
-        add_managed_point(Qt.GlobalColor.green, SceneElement.Triangle)
-        add_managed_point(Qt.GlobalColor.white, SceneElement.L_Hand)
-        add_managed_point(Qt.GlobalColor.yellow, SceneElement.R_Hand)
-        if os.getenv("AUTOTRAINER_SHOW_NOSE"):
-            add_managed_point(Qt.GlobalColor.cyan, SceneElement.Nose, size_w=1.75, size_h=1.75)
-        # was previously used until we had L/R_Hand :
-        # add_managed_point(Qt.GlobalColor.white, SceneElement.LH_grab)
-        # add_managed_point(Qt.GlobalColor.yellow, SceneElement.RH_grab)
+        # Created on first sight of a part rather than from a fixed list. That
+        # list named six elements, two of which - L_Hand and R_Hand - are
+        # composites the pose algorithm never emits, so those two slots waited
+        # for keys that never arrived while Mouth, both tongue points and all
+        # six real hand parts had no slot at all. Ten of the model's fourteen
+        # keypoints could not be drawn at any confidence and nothing said so.
+        # Driving this from what actually arrives means a retrained model with
+        # new keypoints draws without editing this file.
+        self._points: Dict[str, QGraphicsEllipseItem] = {}
+        self._overlay_parts: Optional[frozenset] = None
 
         self._pixmap = None
         self._cur_image = None  # image must remain active to prevent segfault when pixmap continue use it.
@@ -141,18 +187,62 @@ class QGLImageView(QWidget):
         else:
             self._pixmap.setPixmap(pixmap)
 
+    def set_overlay_parts(self, parts) -> None:
+        """Restrict the overlay to these part names; empty or None means all.
+
+        Configured rather than hard-coded, so narrowing a cluttered view never
+        again means a part becomes undrawable with nothing to say so.
+        """
+        self._overlay_parts = frozenset(parts) if parts else None
+        for name, widget_point in self._points.items():
+            if not self._is_part_shown(name):
+                widget_point.setVisible(False)
+
+    def _is_part_shown(self, name: str) -> bool:
+        if self._overlay_parts is None:
+            # Nothing configured: everything except what a composite
+            # already stands for.
+            return name not in _SUBSUMED_BY_COMPOSITE
+        # Naming a part is an explicit request, so an orientation asked for
+        # by name is drawn even though a composite covers it.
+        return name in self._overlay_parts
+
+    def _point_for(self, name: str) -> QGraphicsEllipseItem:
+        """The dot for one part, created the first time that part is seen."""
+        widget_point = self._points.get(name)
+        if widget_point is not None:
+            return widget_point
+        colour = overlay_colour_for(name)
+        size = 5.0 if name in _MARKER_PARTS else 3.0
+        widget_point = QGraphicsEllipseItem(0, 0, size, size)
+        pen = QPen(colour)
+        pen.setWidth(1)
+        widget_point.setPen(pen)
+        widget_point.setBrush(QBrush(colour))
+        widget_point.setZValue(100)
+        widget_point.setPos(-10, -10)
+        widget_point.setVisible(False)
+        self._scene.addItem(widget_point)
+        self._points[name] = widget_point
+        return widget_point
+
     def set_points(self, points: Dict[str, PoseLocation]):
         width_f, height_f = self.size_factor
-        # values are in coordinates (self._data_width, self._data_height)
-        for elem, widget_point in self._points.items():
-            values = points.get(elem, None)
-            if values is None:
-                widget_point.setVisible(False)
+        # Iterate what arrived, not a fixed registry, so a part is drawn
+        # whenever the model reports it. Parts absent this frame are hidden
+        # below rather than left showing a stale position.
+        for name, values in points.items():
+            if values is None or not self._is_part_shown(name):
                 continue
+            # values are in coordinates (self._data_width, self._data_height)
             x = values.x * width_f
             y = values.y * height_f
+            widget_point = self._point_for(name)
             if x < 0 or y < 0 or x > self._width or y > self._height:
                 widget_point.setVisible(False)
             else:
                 widget_point.setPos(x, y)
                 widget_point.setVisible(True)
+        for name, widget_point in self._points.items():
+            if name not in points:
+                widget_point.setVisible(False)

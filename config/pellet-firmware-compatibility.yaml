@@ -3,17 +3,30 @@ board_type: pellet_module
 versions:
   - version: 2.1.0
     wire_schema_version: 1
-    required_capabilities:
+    required_capabilities: []
+    optional_capabilities:
       - timing_trailer
       - time_sync
       - finite_stim3_pulse
-    optional_capabilities: []
     hardware_release: v2.1.0
     tested_reachaq_release: pre-release-devel
     qualification_status: rollout_pending
     qualification_date: null
     limitations:
       - Physical rig qualification and retained acceptance evidence are pending.
+      - >-
+        Firmware v2.1.0 implements no capability-report or time-sync command.
+        Verified against the release source (commit 161b635): its command set
+        is CFG/GPIO/SERVO/STEPPER/TONE/AUDIO/DOOR_SENSOR/PRESSURE_READ and
+        friends, with no counterpart to the host's CAPABILITIES_REQUEST (0x23)
+        or TIME_SYNC_REQUEST (0x1F), and the board answers neither on the bus.
+        These three were listed as required in anticipation of a firmware that
+        reports them; requiring them rejected every real 2.1.0 board. They are
+        optional here for the same reason they are optional on 2.0.0, and a
+        2.1.0 board therefore runs with host-receive timestamp confidence -
+        the same behaviour 2.0.0 boards already have. Restore them to
+        required_capabilities when a firmware that implements the commands
+        ships, so the policy starts protecting again rather than predicting.
   - version: 2.0.0
     wire_schema_version: 1
     required_capabilities: []

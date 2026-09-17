@@ -16,6 +16,7 @@ from autotrainer.pyside.content_widget import ContentWidget, invoke_method
 
 from tools.acquisition.model.app_model import AppModel
 from tools.acquisition.model.video_capture_model import VideoCaptureModel
+from tools.acquisition.view.capture_telemetry_panel import CaptureTelemetryPanel
 
 logger = get_verbose_logger(__name__)
 
@@ -58,6 +59,13 @@ class CameraContent(ContentWidget):
 
         layout.addWidget(self._capture_view)
 
+        # Below the video, collapsed. It expands into the preview rather than
+        # pushing it, so opening it costs a fixed sliver of video rather than
+        # reflowing the panel.
+        telemetry_panel = self._telemetry_panel = CaptureTelemetryPanel(
+            app_model.session_telemetry)
+        layout.addWidget(telemetry_panel)
+
         self.setLayout(layout)
 
         NotificationCenter.default_center().add_observer(TriggerNotification.CAPTURE_ID, self._trigger_received)
@@ -77,12 +85,17 @@ class CameraContent(ContentWidget):
     def close(self):
         NotificationCenter.default_center().remove_observer(TriggerNotification.CAPTURE_ID, self._trigger_received)
         self._model.property_changed -= self._on_model_property_changed
+        # The panel holds a running timer and an observer on the telemetry
+        # model, which outlives this view; leaving either attached keeps the
+        # widget alive and ticking after it is gone.
+        self._telemetry_panel.close()
         super().close()
 
     @Slot(ndarray, float)
-    def refresh_image(self, data: ndarray, fps: float):
+    def refresh_image(self, data: ndarray, fps: float, frame_id: int = -1):
         row, col = data.shape
-        self._capture_view.refresh_image(ImageData(data, col, row), fps)
+        self._capture_view.refresh_image(
+            ImageData(data, col, row, frame_id), fps)
 
     @invoke_method
     def set_is_editable(self, is_editable: bool):
@@ -98,8 +111,13 @@ class CameraContent(ContentWidget):
         self._capture_view.update_pose()
 
     @invoke_method
-    def refresh_pose(self, points: Dict[str, PoseLocation]):
-        self._capture_view.refresh_pose(points)
+    def set_overlay_parts(self, parts) -> None:
+        self._capture_view.set_overlay_parts(parts)
+
+    @invoke_method
+    def refresh_pose(self, points: Dict[str, PoseLocation],
+                     frame_id: int = -1):
+        self._capture_view.refresh_pose(points, frame_id)
 
     def _camera_source_changed(self, camera):
         self._model.camera_source = camera

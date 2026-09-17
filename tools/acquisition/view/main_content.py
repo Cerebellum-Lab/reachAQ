@@ -25,6 +25,7 @@ from autotrainer.pyside.content_widget import ContentWidget, invoke_method
 
 from autotrainer.training import TrainingPlan, TrainingPhase
 from tools.acquisition.model.app_model import AppModel
+from tools.acquisition.model.inference_model import InferenceModel
 from tools.acquisition.model.hardware_model import HardwareModel
 from tools.acquisition.view.analysis_content import AnalysisContent
 from tools.acquisition.view.behavior_content import BehaviorContent
@@ -41,6 +42,13 @@ from tools.acquisition.view.training_plan_content import TrainingPlanContent
 from tools.acquisition.view.training_plan_progress_content import TrainingPlanProgressContent
 
 logger = get_verbose_logger(__name__)
+
+#: How many inference results to hold between display ticks. The panel picks
+#: the one matching the frame it is showing, and at 150 fps against a 15 Hz
+#: display about ten arrive per tick; a few ticks' worth covers the lag
+#: between the two queues without letting a stall grow this without limit.
+PENDING_POSE_LIMIT = 48
+
 
 _REACHAQ_PROTOCOL_UI_ENABLED = True
 
@@ -128,6 +136,19 @@ class MainContent(ContentWidget):
         self._mid_widget_manual = self._create_mid_widget_manual(app_model)
         mid_stacked_layout.addWidget(self._mid_widget_manual)
 
+        # Defaults first. These used to sit below, after
+        # _create_protocol_phase_progress_widget had already assigned the two
+        # progress widgets, so the assignment to None overwrote them: with the
+        # protocol UI enabled, _update_training_plan then raised AttributeError
+        # on _training_plan_progress_content the moment a subject was selected.
+        # The other two are assigned later still, by
+        # _create_protocol_phase_end_widget, which is why only these two broke.
+        self._training_plan_content = None
+        self._training_phase_content = None
+        self._training_plan_progress_content = None
+        self._training_phase_progress_content = None
+        self._protocol_phase_end_widget = None
+
         self._protocol_phase_progress_widget = None
         if self._protocol_ui_enabled:
             self._protocol_phase_progress_widget = self._create_protocol_phase_progress_widget()
@@ -141,12 +162,6 @@ class MainContent(ContentWidget):
 
         end_widget_manual = self._end_widget_manual = self._create_end_widget_manual()
         end_stacked_layout.addWidget(end_widget_manual)
-
-        self._training_plan_content = None
-        self._training_phase_content = None
-        self._training_plan_progress_content = None
-        self._training_phase_progress_content = None
-        self._protocol_phase_end_widget = None
 
         if self._protocol_ui_enabled:
             # Limit end_protocol_phase widget to the phase content size.
@@ -195,7 +210,9 @@ class MainContent(ContentWidget):
 
         self._prev_parts_3d_loc = {}
         self._next_parts_3d_loc_report = time.perf_counter()
-        self._pending_pose_response = None
+        #: Recent results awaiting the next display tick, oldest first. See
+        #: refresh_pose for why more than one is kept.
+        self._pending_pose_responses = []
         self._pending_pose_lock = threading.Lock()
 
         self._timer = QTimer(self)
@@ -210,9 +227,18 @@ class MainContent(ContentWidget):
         #
         inference = app_model.inference
         inference.pose_response_ready += self.refresh_pose
+        # The overlay dialog writes the choice here; the panels follow it.
+        inference.property_changed += self._inference_property_changed
         #
         # app_model.behavior.algorithm.property_changed += self._behavior_algo_property_changed
         self.training_plan_changed.connect(self._update_training_plan)
+
+    def _inference_property_changed(self, name, value, _previous):
+        """Follow the overlay part choice as the operator changes it."""
+        if name != InferenceModel.OVERLAY_PARTS:
+            return
+        for _camera, camera_content in self._reach_camera_contents:
+            camera_content.set_overlay_parts(value)
 
     @property
     def protocol_ui_enabled(self) -> bool:
@@ -301,6 +327,14 @@ class MainContent(ContentWidget):
             self._content_widgets.append(camera_content)
             self._reach_camera_contents.append((camera, camera_content))
             self._reach_camera_content_by_model[camera] = camera_content
+            # Empty means draw every part the model emits, which is what the
+            # painter now does on its own; a configured list only narrows it.
+            # Asked of the class, not the instance: the inference object is
+            # an Events object whose __getattr__ raises EventsException for
+            # anything undeclared, which getattr's default does not catch.
+            if hasattr(type(app_model.inference), "overlay_parts"):
+                camera_content.set_overlay_parts(
+                    app_model.inference.overlay_parts)
             if camera is app_model.left_camera:
                 self._left_camera_content = camera_content
             elif camera is app_model.right_camera:
@@ -479,28 +513,50 @@ class MainContent(ContentWidget):
                 camera_content.update_image()
 
     def refresh_pose(self, response: PoseResponse):
-        """Cache only the newest inference result until the next display tick.
+        """Buffer recent inference results until the next display tick.
 
-        Live inference can produce pose results much faster than Qt renders the
-        camera panels.  Dispatching every result to every camera creates an
-        unbounded queue of UI-thread calls and delays unrelated timers, including
-        the live analysis plot.  The intermediate poses are never displayed, so
-        retain just the newest result and consume it at the configured live-feed
-        refresh rate.
+        Live inference produces results much faster than Qt renders the camera
+        panels, so these are collected rather than dispatched: dispatching each
+        one as it arrives creates an unbounded queue of UI-thread calls and
+        delays unrelated timers, including the live analysis plot.
+
+        Buffered rather than overwritten, which is what this used to do. The
+        panel draws the pose belonging to the frame it is showing, and the
+        display runs about a tenth of the capture rate - so keeping only the
+        newest threw away the matching one nine times out of ten and left the
+        overlay a median of two frames off with a quarter of them undrawable.
+
+        Bounded, because a stall must not grow this without limit.
         """
         with self._pending_pose_lock:
-            self._pending_pose_response = response
+            self._pending_pose_responses.append(response)
+            while len(self._pending_pose_responses) > PENDING_POSE_LIMIT:
+                self._pending_pose_responses.pop(0)
 
     def _flush_pending_pose(self):
         with self._pending_pose_lock:
-            response = self._pending_pose_response
-            self._pending_pose_response = None
-        if response is None:
+            responses = self._pending_pose_responses
+            self._pending_pose_responses = []
+        if not responses:
             return
+        for response in responses:
+            self._dispatch_pose(response)
+
+    def _dispatch_pose(self, response: PoseResponse):
+        """Hand one result to each camera panel, tagged with its frame."""
+        # source_frame_ids records the camera frames this pose was computed
+        # from, per camera. Passing it through lets the panel draw the dots
+        # over the frame they belong to instead of whatever is on screen.
+        source_ids = getattr(response, "source_frame_ids", ())
         for idx, camera in enumerate(self._app_model.inference_cameras):
             camera_content = self._reach_camera_content_by_model.get(camera)
             if camera_content is not None and camera.is_enabled and idx < len(response.locations):
-                camera_content.refresh_pose(response.locations[idx])
+                frame_id = -1
+                if idx < len(source_ids) and source_ids[idx]:
+                    # Several frames per camera per batch; the last is the
+                    # one the pose describes.
+                    frame_id = source_ids[idx][-1]
+                camera_content.refresh_pose(response.locations[idx], frame_id)
         if __debug__:
             perf_now = time.perf_counter()
             if perf_now >= self._next_parts_3d_loc_report:

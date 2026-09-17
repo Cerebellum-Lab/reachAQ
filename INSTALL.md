@@ -19,10 +19,19 @@ cd "$HOME/Documents/reachAQ"
 ```
 
 The installer accepts no options. It attempts every portable category in one
-run: Ubuntu packages, automatic Miniconda bootstrap when needed, the complete
-Python environment, TensorFlow-compatible CUDA libraries, Git LFS, CLI/import
-verification, GPU preflight, and the focused non-hardware suite. Individual
-failures do not stop later categories; a complete report is printed at the end.
+run: Ubuntu packages, closed-loop latency tuning, automatic Miniconda bootstrap
+when needed, the complete Python environment, TensorFlow-compatible CUDA
+libraries, Git LFS, CLI/import verification, GPU preflight, and the focused
+non-hardware suite. Individual failures do not stop later categories; a complete
+report is printed at the end.
+
+The latency-tuning category grants the operator real-time scheduling priority
+for the 900 Hz stim loop and enables `reachaq-cpu-governor.service` so the
+`performance` CPU governor is set at boot. Both are measured wins for
+closed-loop timing and both are reversible; see the
+[latency tuning guide](docs/linux-install/latency-tuning.md). The `rtprio`
+allowance applies at login, so log out and back in once. A rig without it still
+acquires normally, at normal scheduling priority.
 
 The portable dependency set includes the complete Qt runtime used by the GUI,
 the Linux Secret Service/keyring used for SoftMouse credentials, Requests and

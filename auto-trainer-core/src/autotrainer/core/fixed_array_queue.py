@@ -33,6 +33,11 @@ class FixedArrayQueue:
         # indexing: [buffer]
         self._buffers: List[sharedctypes.SynchronizedArray[ctypes.c_ubyte]] = []
         self._is_dirty: List[sharedctypes.Synchronized[bool]] = []
+        # The camera frame id each buffer holds, so a consumer can say which
+        # frame it is looking at. Parallel array rather than a field on the
+        # payload: the payload is raw shared bytes with no room for one.
+        # -1 means the producer did not say.
+        self._frame_ids: List[sharedctypes.Synchronized] = []
 
         self._depth = depth
         self._shape = shape
@@ -45,6 +50,7 @@ class FixedArrayQueue:
         for idx in range(depth):
             self._buffers.append(mp_ctx.RawArray(ctypes.c_ubyte, self._byte_count))
             self._is_dirty.append(mp_ctx.Value(ctypes.c_bool, False))
+            self._frame_ids.append(mp_ctx.Value(ctypes.c_int64, -1))
 
         self._next_counts_log_time = time.time()
         self._overflow_count = 0
@@ -61,17 +67,18 @@ class FixedArrayQueue:
     def buffer_index(self) -> int:
         return self._buffer_index
 
-    def put(self, content: numpy.ndarray):
-        return self._put(content)
+    def put(self, content: numpy.ndarray, frame_id: int = -1):
+        return self._put(content, frame_id)
 
-    def _put(self, content: numpy.ndarray):
+    def _put(self, content: numpy.ndarray, frame_id: int = -1):
         self._buff_views.clear()
         for idx in range(self._depth):
             self._buff_views.append(memoryview(self._buffers[idx]).cast("B"))
         self.put = self._put = self._put_view
-        return self._put_view(content)
+        return self._put_view(content, frame_id)
 
-    def _put_view(self, content: numpy.ndarray) -> BufferResult:
+    def _put_view(self, content: numpy.ndarray,
+                  frame_id: int = -1) -> BufferResult:
         buffer_index = self._buffer_index
         is_overflow = self._is_dirty[buffer_index].value
         if is_overflow:
@@ -80,6 +87,9 @@ class FixedArrayQueue:
 
         self._put_count += 1
         self._buff_views[buffer_index][:] = content.reshape(-1)
+        self._frame_ids[buffer_index].value = int(frame_id)
+        # Dirty last: it is what publishes the slot, so the id has to be
+        # in place before a consumer can see the frame.
         self._is_dirty[buffer_index].value = True
 
         buffer_index += 1
@@ -88,7 +98,13 @@ class FixedArrayQueue:
 
         return BufferResult.Ok
 
-    def get(self, block: bool = True, timeout: float = 0.01) -> numpy.ndarray:
+    def get(self, block: bool = True, timeout: float = 0.01,
+            *, with_frame_id: bool = False):
+        """The next frame, or (frame, frame_id) when asked for the id.
+
+        The id is opt-in so existing callers are untouched; -1 means the
+        producer did not supply one.
+        """
         perf_timeout = time.perf_counter() + timeout
         read_index = self._read_index
         dirty = self._is_dirty[read_index]
@@ -101,9 +117,10 @@ class FixedArrayQueue:
         buffer = self._buffers[read_index]
         v = numpy.frombuffer(buffer, ctypes.c_uint8, self._byte_count).reshape(self.shape)  # noqa
         output = v.copy()  # numpy.frombuffer() returns a view
+        frame_id = self._frame_ids[read_index].value
         dirty.value = False  # after copy of content
         self._read_index = (read_index + 1) % self._depth
-        return output
+        return (output, frame_id) if with_frame_id else output
 
     def empty(self) -> bool:
         return all(not dirty.value for dirty in self._is_dirty)

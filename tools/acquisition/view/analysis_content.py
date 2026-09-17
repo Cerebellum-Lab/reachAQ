@@ -27,9 +27,16 @@ from autotrainer.pyside import CardWidget, PGWidget
 from autotrainer.pyside.content_widget import ContentWidget, invoke_method
 from tools.acquisition.model.analysis_plot_process import AnalysisPlotProcess
 from tools.acquisition.model.nidaq_signal_monitor_model import NidaqSignalMonitorModel
+from tools.acquisition.model.pressure_stream_model import (
+    ADC_FULL_SCALE,
+    REFERENCE_VOLTS,
+    PressureStreamModel,
+    counts_to_volts,
+)
 from tools.acquisition.view.stream_graph_style import (
     StreamGraphLegend,
     color_code_checkbox,
+    color_hex,
     stream_signal_color,
 )
 
@@ -40,6 +47,13 @@ _GRAY_COLOR_TUPLE = (240, 240, 240)
 _DIGITAL_WINDOW_SECONDS = 10.0
 _DIGITAL_Y_MINIMUM = -0.2
 _DIGITAL_Y_MAXIMUM = 1.2
+
+_PRESSURE_WINDOW_SECONDS = PressureStreamModel.WINDOW_SECONDS
+# Instance to connector/pin, as wired on the pellet board by firmware v2.1.0.
+_PRESSURE_SENSOR_LABELS = {
+    0: "Sensor 1 - J11 (PA0)",
+    1: "Sensor 2 - J21 (PA6)",
+}
 
 
 class _NidaqRollingPlot(QWidget):
@@ -162,6 +176,139 @@ class _NidaqRollingPlot(QWidget):
         view_box.setXRange(-visible_seconds, 0.0, padding=0)
 
 
+class _PressurePlot(QWidget):
+    """One FSR sensor's rolling trace."""
+
+    def __init__(self, title: str, color, show_x_axis: bool, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+
+        heading = QLabel(title, self)
+        heading.setStyleSheet(
+            f"color: {color_hex(color)}; font-size: 10px; font-weight: 600;"
+        )
+        layout.addWidget(heading)
+
+        self._plot = PGWidget(self)
+        self._plot.clear()
+        self._plot.setBackground("w")
+        plot_item = self._plot.getPlotItem()
+        view_box = plot_item.getViewBox()
+        view_box.setBackgroundColor(_GRAY_COLOR_TUPLE)
+        view_box.setMouseEnabled(x=True, y=False)
+        view_box.setMenuEnabled(False)
+        view_box.setLimits(
+            xMin=-_PRESSURE_WINDOW_SECONDS,
+            xMax=0.0,
+            maxXRange=_PRESSURE_WINDOW_SECONDS,
+        )
+        self._plot.setXRange(-_PRESSURE_WINDOW_SECONDS, 0.0, padding=0)
+        bottom_axis = self._plot.getAxis("bottom")
+        if show_x_axis:
+            bottom_axis.setLabel("Time from latest sample (s)")
+        else:
+            # Both graphs share one time origin, so only the lower one is labelled.
+            bottom_axis.setStyle(showValues=False)
+        plot_item.setClipToView(True)
+        layout.addWidget(self._plot, stretch=1)
+
+        self.curve = self._plot.plot(
+            [], [], pen=pg.mkPen(color=color, width=2.2, style=Qt.PenStyle.SolidLine),
+        )
+
+    def set_y_axis(self, label: str, maximum: float) -> None:
+        self._plot.getAxis("left").setLabel(label)
+        # A fixed range keeps a railed or floating channel from being autoscaled
+        # until its own noise fills the graph and reads as signal.
+        padding = maximum * 0.02
+        self._plot.getPlotItem().getViewBox().setLimits(
+            yMin=-padding, yMax=maximum + padding,
+        )
+        self._plot.setYRange(-padding, maximum + padding, padding=0)
+
+    def go_live(self) -> None:
+        view_box = self._plot.getPlotItem().getViewBox()
+        x_minimum, x_maximum = view_box.viewRange()[0]
+        visible_seconds = min(
+            _PRESSURE_WINDOW_SECONDS,
+            max(0.001, float(x_maximum - x_minimum)),
+        )
+        view_box.setXRange(-visible_seconds, 0.0, padding=0)
+
+
+class _PressurePlots(QWidget):
+    """Stacked per-sensor pellet-board FSR graphs, with a raw/volts toggle."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(0, 0)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 0)
+        layout.setSpacing(4)
+
+        self._raw_counts_checkbox = QCheckBox("Raw ADC counts", self)
+        self._raw_counts_checkbox.setToolTip(
+            "Plot the unconverted 12-bit ADC sample instead of volts"
+        )
+        self._raw_counts_checkbox.toggled.connect(self.set_show_raw_counts)
+        layout.addWidget(self._raw_counts_checkbox)
+
+        self._show_raw_counts = False
+        self._plots = {}
+        self.curves = {}
+        instances = tuple(PressureStreamModel.INSTANCES)
+        for index, instance in enumerate(instances):
+            plot = _PressurePlot(
+                _PRESSURE_SENSOR_LABELS.get(instance, f"Sensor {instance}"),
+                stream_signal_color(index),
+                show_x_axis=index == len(instances) - 1,
+                parent=self,
+            )
+            self._plots[instance] = plot
+            self.curves[instance] = plot.curve
+            layout.addWidget(plot, stretch=1)
+        self._apply_y_axis()
+
+    def y_axis_label(self) -> str:
+        return "ADC counts" if self._show_raw_counts else "Volts"
+
+    def set_show_raw_counts(self, show_raw_counts: bool) -> None:
+        show_raw_counts = bool(show_raw_counts)
+        if show_raw_counts == self._show_raw_counts:
+            return
+        self._show_raw_counts = show_raw_counts
+        if self._raw_counts_checkbox.isChecked() != show_raw_counts:
+            self._raw_counts_checkbox.setChecked(show_raw_counts)
+        self._apply_y_axis()
+
+    def _apply_y_axis(self) -> None:
+        maximum = ADC_FULL_SCALE if self._show_raw_counts else REFERENCE_VOLTS
+        for plot in self._plots.values():
+            plot.set_y_axis(self.y_axis_label(), float(maximum))
+
+    def display_latest(self, frame) -> bool:
+        if frame is None:
+            return False
+        for instance, curve in self.curves.items():
+            seconds, counts = frame.series.get(instance, (None, None))
+            if seconds is None:
+                continue
+            values = counts if self._show_raw_counts else counts_to_volts(counts)
+            curve.setData(seconds, values, skipFiniteCheck=True)
+        return True
+
+    def clear(self) -> None:
+        for curve in self.curves.values():
+            curve.setData([], [])
+
+    def go_live(self) -> None:
+        for plot in self._plots.values():
+            plot.go_live()
+
+
 class AnalysisContent(ContentWidget):
     """Rolling NI-DAQ input stream display for acquisition hardware checks."""
 
@@ -176,6 +323,7 @@ class AnalysisContent(ContentWidget):
         self._channel_colors_by_name: Dict[str, Tuple[int, int, int]] = {}
         self._selector_signature = None
         self._plot_process = AnalysisPlotProcess(self._nidaq_signal_monitor.sample_ring)
+        self._pressure_model = PressureStreamModel(app_model.message_handler)
         self._display_refresh_rate_hz = 0.0
         self._next_screen_check = 0.0
         self._window_handle = None
@@ -217,6 +365,9 @@ class AnalysisContent(ContentWidget):
         self._signal_layout.setSpacing(6)
         self._signal_scroll.setWidget(self._signal_widget)
         self._content_tabs.addTab(self._signal_scroll, "Signals")
+
+        self._pressure_plots = _PressurePlots()
+        self._content_tabs.addTab(self._pressure_plots, "Pressure")
         self._content_tabs.currentChanged.connect(self._redraw_visible_stream)
         self._card_widget.setContentWidget(self._content_tabs)
 
@@ -249,7 +400,7 @@ class AnalysisContent(ContentWidget):
         app_model.laser.property_changed += self._laser_property_changed
         self._start_stop_button.clicked.connect(self._toggle_stream)
         self._clear_button.clicked.connect(self._clear_plot)
-        self._live_button.clicked.connect(self._rolling_plot.go_live)
+        self._live_button.clicked.connect(self._go_live)
         self._plot_timer = QTimer(self)
         self._plot_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._plot_timer.timeout.connect(self._flush_pending_blocks)
@@ -263,6 +414,7 @@ class AnalysisContent(ContentWidget):
         self._app_model.configuration_loaded_event -= self._configuration_loaded
         self._app_model.laser.property_changed -= self._laser_property_changed
         self._plot_process.close()
+        self._pressure_model.close()
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -317,6 +469,7 @@ class AnalysisContent(ContentWidget):
         self._refresh_from_model()
 
     def _flush_pending_blocks(self) -> None:
+        self._flush_pressure()
         now = time.monotonic()
         if now >= self._next_screen_check:
             self._next_screen_check = now + 1.0
@@ -330,9 +483,28 @@ class AnalysisContent(ContentWidget):
                 f"Latency: {frame.source_latency_ms:.1f} ms | Gaps: {frame.gap_count}"
             )
 
+    def _go_live(self) -> None:
+        if self._content_tabs.currentWidget() is self._pressure_plots:
+            self._pressure_plots.go_live()
+        else:
+            self._rolling_plot.go_live()
+
+    def _flush_pressure(self) -> None:
+        """Repaint the pressure graphs from CAN telemetry.
+
+        This is independent of the NI-DAQ stream: pressure arrives over CAN, so
+        the graphs stay live whether or not that stream is running.  The model
+        keeps buffering while the tab is hidden; only the repaint is skipped.
+        """
+        if self._content_tabs.currentWidget() is not self._pressure_plots:
+            return
+        self._pressure_plots.display_latest(self._pressure_model.snapshot())
+
     def _clear_plot(self) -> None:
         self._plot_process.clear()
         self._rolling_plot.clear()
+        self._pressure_model.clear()
+        self._pressure_plots.clear()
 
     def _redraw_visible_stream(self, *_args) -> None:
         self._flush_pending_blocks()

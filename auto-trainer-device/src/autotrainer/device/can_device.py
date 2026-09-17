@@ -48,6 +48,7 @@ from .device_interface import (
     BoardTimeSync,
     BoardCapabilities,
     DigitalPulseStatus,
+    PressureReading,
 )
 
 
@@ -281,9 +282,12 @@ class CanDevice(Device):
         transport = self._can_transport_configuration
         if force_emulation or transport.kind == CanTransportKind.EMULATION:
             return EmulationInterface()
-        if transport.uses_linux_can_stack:
-            return CanInterface(required_targets=self._required_targets, can_transport=transport)
-        return CanInterface(required_targets=self._required_targets) if HAVE_CAN_DEVICE else EmulationInterface()
+        if not transport.uses_linux_can_stack and not HAVE_CAN_DEVICE:
+            # The pyjerrycan backend needs its module; emulate when it is absent.
+            return EmulationInterface()
+        # Pass the configuration on every path: dropping it here silently replaced a
+        # caller's channel and timeouts with bare constructor defaults.
+        return CanInterface(required_targets=self._required_targets, can_transport=transport)
 
     def _init_default_move_configs(self):
         self._load_pellet = default_load_pellet()
@@ -527,6 +531,9 @@ class CanDevice(Device):
             ),
             DigitalPulseStatus: lambda message: self._api.send_message(
                 SystemStatusMessageKind.DIGITAL_PULSE_STATUS, message,
+            ),
+            PressureReading: lambda message: self._api.send_message(
+                SystemStatusMessageKind.PRESSURE_READING, message,
             ),
 
             Acknowledge: self._handle_ack,

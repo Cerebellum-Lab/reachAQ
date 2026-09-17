@@ -372,6 +372,23 @@ class AnalogOutput(Source):
 
 
 @dataclass
+class PressureReading(Source):
+    """
+    One FSR pressure sample from a pellet-board analog input.
+
+    ``pressure`` is the raw 12-bit ADC count, in [0, 4095]; it is *not*
+    millivolts, despite the wording in the firmware's pressure.c.  Convert
+    host-side when a voltage is wanted: ``volts = pressure / 4095.0 * 3.3``.
+
+    ``instance`` selects the connector: 0 = J11 (PA0/ADC1_IN1),
+    1 = J21 (PA6/ADC2_IN3).
+    """
+
+    instance: int = 0
+    pressure: int = 0
+
+
+@dataclass
 class ColorLed(Source):
     """As integer % [0, 100] value"""
 
