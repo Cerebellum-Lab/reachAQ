@@ -19,6 +19,7 @@ from pathlib import Path
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy
 from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -241,6 +242,110 @@ def pose_backbones():
     )
 
 
+# ----------------------------------------------------------------- benchmarks
+#
+# Every number below is copied from docs/linux-install/latency-tuning.md, which
+# records what was measured on the reference workstation. Nothing here is
+# illustrative: if the measurements are re-run, edit them there and here together.
+
+#: 60 s at 900 Hz pinned to physical P-cores. Cost = scheduler wake-up lateness
+#: plus decision time, in milliseconds.
+STIM_LOOP_MS = [
+    # label,                       p50,   p99,  p99.9,  max
+    ("idle\nSCHED_OTHER", 0.129, 0.221, 0.262, 0.332),
+    ("idle\nSCHED_FIFO", 0.077, 0.170, 0.183, 0.246),
+    ("16 busy procs\nSCHED_OTHER", 0.099, 3.662, 4.481, 6.050),
+    ("16 busy procs\nSCHED_FIFO", 0.047, 0.059, 0.122, 0.155),
+]
+STIM_BUDGET_MS = 5.0
+
+#: Live pose inference, DeepLabCut TensorFlow, batch 2 at 128x128, on the GPU.
+INFERENCE_MS = [
+    ("powersave governor", 12.55, 17.58, 18.96),
+    ("performance governor", 10.79, 11.53, 11.73),
+]
+
+
+def stim_latency():
+    """Stim-loop cost by condition, against the 5 ms budget."""
+    figure, axes = plt.subplots(figsize=(12, 5), dpi=200)
+    figure.patch.set_facecolor("white")
+    labels = [row[0] for row in STIM_LOOP_MS]
+    series = [("p50", 0), ("p99", 1), ("p99.9", 2), ("max", 3)]
+    colors = ["#9fb3c8", "#6b7f9e", "#c98c6a", NEW]
+    width = 0.2
+    positions = numpy.arange(len(labels))
+    for index, ((name, offset), color) in enumerate(zip(series, colors)):
+        values = [row[offset + 1] for row in STIM_LOOP_MS]
+        bars = axes.bar(positions + (index - 1.5) * width, values, width,
+                        label=name, color=color)
+        for bar, value in zip(bars, values):
+            axes.text(bar.get_x() + bar.get_width() / 2, value + 0.08, f"{value:g}",
+                      ha="center", va="bottom", fontsize=7.5, color=INK)
+
+    axes.axhline(STIM_BUDGET_MS, color=NEW, linestyle="--", linewidth=1.4)
+    axes.text(len(labels) - 0.45, STIM_BUDGET_MS + 0.12, "5 ms budget",
+              ha="right", color=NEW, fontsize=9, weight="bold")
+    axes.set_xticks(positions)
+    axes.set_xticklabels(labels, fontsize=9, color=INK)
+    axes.set_ylabel("milliseconds", fontsize=9, color=INK)
+    axes.set_ylim(0, 6.8)
+    axes.legend(frameon=False, fontsize=9, ncol=4, loc="upper left")
+    axes.spines[["top", "right"]].set_visible(False)
+    axes.tick_params(colors=MUTED, labelsize=8)
+    axes.set_title("Stim loop: 900 Hz, 60 s, wake-up lateness + decision time",
+                   fontsize=11, color=INK, weight="bold", pad=12)
+    _save(figure, "stim_latency.png")
+
+
+def inference_latency():
+    """Live pose inference cost, and what the CPU governor did to it."""
+    figure, axes = plt.subplots(figsize=(11, 4.2), dpi=200)
+    figure.patch.set_facecolor("white")
+    labels = [row[0] for row in INFERENCE_MS]
+    series = [("p50", 1), ("p99", 2), ("max", 3)]
+    colors = ["#9fb3c8", AUTO, NEW]
+    width = 0.24
+    positions = numpy.arange(len(labels))
+    for index, ((name, offset), color) in enumerate(zip(series, colors)):
+        values = [row[offset] for row in INFERENCE_MS]
+        bars = axes.barh(positions + (index - 1) * width, values, width,
+                         label=name, color=color)
+        for bar, value in zip(bars, values):
+            axes.text(value + 0.25, bar.get_y() + bar.get_height() / 2, f"{value:g} ms",
+                      va="center", fontsize=8.5, color=INK)
+    axes.set_yticks(positions)
+    axes.set_yticklabels(labels, fontsize=10, color=INK)
+    axes.set_xlabel("milliseconds per inference", fontsize=9, color=INK)
+    axes.set_xlim(0, 22)
+    axes.invert_yaxis()
+    axes.legend(frameon=False, fontsize=9, ncol=3, loc="lower right")
+    axes.spines[["top", "right"]].set_visible(False)
+    axes.tick_params(colors=MUTED, labelsize=8)
+    axes.set_title("Live pose inference: DeepLabCut TensorFlow, batch 2 at 128x128, GPU",
+                   fontsize=11, color=INK, weight="bold", pad=12)
+    _save(figure, "inference_latency.png")
+
+
+def synchronization():
+    """One clock, and what hangs off it."""
+    # No title or footnote inside the figure: the slide supplies both, and
+    # duplicating them reads as a mistake.
+    figure, axes = _fig(12, 3.9)
+    _box(axes, 36, 20, 28, 7, "NI-DAQ master clock", NEW, size=11)
+    feeds = [
+        (2, "Cameras\n150 FPS", AUTO),
+        (20, "stimCam\n900 Hz", NEW),
+        (38, "Tones\n1 / 2 / 3", AUTO),
+        (56, "Pellet board\nFSR + events", NEW),
+        (74, "Laser\nAO + diode", NEW),
+    ]
+    for x, label, color in feeds:
+        _box(axes, x, 4, 16, 9, label, color, size=8.5)
+        _arrow(axes, (x + 8, 13.5), (48, 19.5))
+    _save(figure, "synchronization.png")
+
+
 def main():
     global MEDIA_ROOT
 
@@ -261,6 +366,9 @@ def main():
 
     lineage()
     pipeline()
+    stim_latency()
+    inference_latency()
+    synchronization()
     two_tier()
     demo_substitution()
     demo_frames()
