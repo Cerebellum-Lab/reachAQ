@@ -52,6 +52,19 @@ _DEFAULT_MAXIMUM_COMMAND_VOLTS = 5.0
 _COMMAND_TRACE_COLOR = stream_signal_color(0)
 _DIODE_TRACE_COLOR = stream_signal_color(1)
 _COMMAND_COPY_TRACE_COLOR = stream_signal_color(2)
+_TRIGGER_TRACE_COLOR = stream_signal_color(3)
+
+
+def _nidaq_channel_kind(physical_channel: str) -> str:
+    """Analog or digital, from the NI channel name.
+
+    NI names a digital line by its port and line, as in Dev1/port0/line3, and
+    an analog input as Dev1/ai3. The stimulus line can be wired back into
+    either, so the kind follows the name rather than another setting to keep
+    in step with it.
+    """
+    lowered = str(physical_channel).lower()
+    return "digital" if "port" in lowered or "line" in lowered else "analog"
 
 
 class _LaserOperationWorker(QObject):
@@ -326,6 +339,21 @@ class _LaserChannelTab(QWidget):
                 [], [], pen=pg.mkPen(color=_COMMAND_COPY_TRACE_COLOR, width=2.0)
             ),
         }
+
+        # The board's stimulus line, read back on its own axis. It is a TTL
+        # edge rather than a command voltage, so sharing the laser plot's Y
+        # range would flatten it against the waveform.
+        self.trigger_plot = PGWidget()
+        self.trigger_plot.setBackground("w")
+        self.trigger_plot.getAxis("bottom").setLabel("Time from latest sample", units="s")
+        self.trigger_plot.getAxis("left").setLabel("Trigger", units="V")
+        self.trigger_plot.getPlotItem().setClipToView(True)
+        self.trigger_plot.setMouseEnabled(x=False, y=False)
+        self.trigger_plot.setMaximumHeight(140)
+        self.trigger_plot.setYRange(-0.5, 5.5, padding=0)
+        self._trace_curves["trigger"] = self.trigger_plot.plot(
+            [], [], pen=pg.mkPen(color=_TRIGGER_TRACE_COLOR, width=2.0)
+        )
         self._trace_data = {
             curve_name: ([], [])
             for curve_name in self._trace_curves
@@ -358,6 +386,7 @@ class _LaserChannelTab(QWidget):
                 ("Command output", _COMMAND_TRACE_COLOR, False),
                 ("Diode feedback", _DIODE_TRACE_COLOR, False),
                 ("Command copy", _COMMAND_COPY_TRACE_COLOR, False),
+                ("Board trigger", _TRIGGER_TRACE_COLOR, False),
             )
         )
         trace_stream_layout.addWidget(self._trace_legend)
@@ -436,11 +465,13 @@ class _LaserChannelTab(QWidget):
         self._trace_signal_candidates = {
             "diode": self._make_trace_signal_candidate("diode"),
             "copy": self._make_trace_signal_candidate("copy"),
+            "trigger": self._make_trace_signal_candidate("trigger"),
         }
         self._trace_signal_checkboxes = {}
         for key, label, color in (
             ("diode", "Diode feedback", _DIODE_TRACE_COLOR),
             ("copy", "Command copy", _COMMAND_COPY_TRACE_COLOR),
+            ("trigger", "Board trigger readback", _TRIGGER_TRACE_COLOR),
         ):
             candidate = self._trace_signal_candidates[key]
             physical_channel = "not configured" if candidate is None else candidate.physical_channel
@@ -456,7 +487,31 @@ class _LaserChannelTab(QWidget):
         self._trace_tabs.addTab(self._trace_stream_page, "Stream")
         self._trace_tabs.addTab(self._trace_signals_page, "Signals")
         trace_layout.addWidget(self._trace_tabs)
-        output_page_layout.addWidget(trace_group, stretch=1)
+
+        # The live output sits under the pulse controls that produce it, and the
+        # board trigger that starts it sits under that, so a press, its waveform
+        # and the edge that launched it are all in one view.
+        pulse_page_layout.addWidget(trace_group, stretch=2)
+
+        trigger_group = QGroupBox("Board Trigger")
+        trigger_layout = QVBoxLayout(trigger_group)
+        trigger_layout.setContentsMargins(8, 4, 8, 6)
+        trigger_layout.setSpacing(2)
+        trigger_layout.addWidget(self.trigger_plot)
+        self.trigger_status = QLabel()
+        self.trigger_status.setObjectName("LaserPreviewStatus")
+        self.trigger_status.setWordWrap(True)
+        trigger_layout.addWidget(self.trigger_status)
+        pulse_page_layout.addWidget(trigger_group)
+        self.refresh_trigger_status()
+
+        output_page_layout.addWidget(
+            QLabel(
+                "The laser output stream and the board trigger readback now sit "
+                "under the pulse controls on the Pulse page."
+            )
+        )
+        output_page_layout.addStretch(1)
 
         self._pulse_controls = (
             self._amplitude,
@@ -527,6 +582,10 @@ class _LaserChannelTab(QWidget):
             physical_channel = self._channel.command_copy_input
             name = f"laser{laser_number}_command_copy"
             scale = self._channel.command_copy_scale
+        elif signal_key == "trigger":
+            physical_channel = self._channel.trigger_monitor_input
+            name = f"laser{laser_number}_trigger"
+            scale = 1.0
         else:
             raise ValueError(f"Unknown laser trace signal: {signal_key}")
         if not physical_channel:
@@ -534,7 +593,7 @@ class _LaserChannelTab(QWidget):
         return NidaqSignalChannelConfiguration(
             name=name,
             physical_channel=physical_channel,
-            kind="analog",
+            kind=_nidaq_channel_kind(physical_channel),
             scale=scale,
         )
 
@@ -740,6 +799,8 @@ class _LaserChannelTab(QWidget):
             maximum = self._trace_max_volts.value()
         self._trace_plot.setYRange(minimum, maximum, padding=0)
         self._trace_plot.setXRange(-self._trace_window_seconds, 0.0, padding=0)
+        # Same time base, so an edge below lines up with the waveform above.
+        self.trigger_plot.setXRange(-self._trace_window_seconds, 0.0, padding=0)
         if self._plot_controller is not None:
             self._plot_controller.configure_laser_plot(self)
         self.redraw_trace()
@@ -785,6 +846,22 @@ class _LaserChannelTab(QWidget):
             return f"Pulse complete: laser {self._channel.channel_id.value}"
 
         self._start_operation(f"Running laser {self._channel.channel_id.value} pulse train", operation)
+
+    def refresh_trigger_status(self) -> None:
+        """Say whether the board trigger can be read back at all."""
+        candidate = self._trace_signal_candidates.get("trigger")
+        if candidate is None:
+            self.trigger_status.setText(
+                "No trigger readback input is configured for this laser. Wire the "
+                "board stimulus line into an NI input and set it in Edit DAQ Ports "
+                "to see the edge that starts the waveform."
+            )
+            return
+        self.trigger_status.setText(
+            "Reading {} as {}. Enable it under Signals.".format(
+                candidate.physical_channel, candidate.kind
+            )
+        )
 
     def refresh_stim_profiles(self) -> None:
         """List saved laser profiles that target this channel."""
@@ -1160,11 +1237,15 @@ class LaserControlContent(ContentWidget):
         }
         diode_name = names_by_physical_channel.get(tab._channel.diode_input)
         copy_name = names_by_physical_channel.get(tab._channel.command_copy_input)
+        trigger_name = names_by_physical_channel.get(
+            tab._channel.trigger_monitor_input
+        )
         signature = (
             tab._trace_window_seconds,
             tab.physical_plot_width(),
             diode_name,
             copy_name,
+            trigger_name,
         )
         if not reset and self._plot_configuration_signatures.get(tab.channel_id_value) == signature:
             return
@@ -1175,6 +1256,7 @@ class LaserControlContent(ContentWidget):
             pixel_width=signature[1],
             diode_name=diode_name,
             copy_name=copy_name,
+            trigger_name=trigger_name,
         )
         if reset:
             self._plot_process.clear(tab.channel_id_value)

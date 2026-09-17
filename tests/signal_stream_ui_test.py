@@ -851,6 +851,9 @@ def test_laser_trace_auto_resumes_and_displays_entire_calibration_ramp(qapp):
             "Command output",
             "Diode feedback",
             "Command copy",
+            # The board stimulus line read back. It is drawn on its own plot
+            # beneath this one, but shares the legend and the time base.
+            "Board trigger",
         )
         assert all(
             curve.opts["pen"].style().name == "SolidLine"
