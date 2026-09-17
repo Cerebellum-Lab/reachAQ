@@ -1,6 +1,7 @@
 import math
 
 from PySide6.QtCore import Qt, QTimer, Signal, Slot
+from PySide6.QtGui import QFontDatabase, QFontMetrics
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -85,6 +86,15 @@ class CaptureTelemetryPanel(QWidget):
         # is a choice rather than the only way to see anything.
         self._collapsed_summary = QLabel("")
         self._collapsed_summary.setStyleSheet("color: palette(mid);")
+        # Same reservation as the readouts: the strip is on the header
+        # row, so its width growing by a digit moved the header too.
+        self._collapsed_summary.setFont(
+            QFontDatabase.systemFont(QFontDatabase.FixedFont))
+        self._collapsed_summary.setMinimumWidth(
+            QFontMetrics(self._collapsed_summary.font()).horizontalAdvance(
+                "0:00:00   000% inferenced   000.0 ms sensor→result"))
+        self._collapsed_summary.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         header_layout.addWidget(self._collapsed_summary)
 
         header_layout.addStretch(1)
@@ -104,15 +114,21 @@ class CaptureTelemetryPanel(QWidget):
         body_layout.setContentsMargins(10, 4, 10, 6)
         body_layout.setSpacing(18)
 
-        self._elapsed = self._add_readout(body_layout, "Elapsed")
-        self._dropped = self._add_readout(body_layout, "Dropped frames")
-        self._inferenced = self._add_readout(body_layout, "Inferenced")
+        # Widest reading each readout can show, so none of them resizes the
+        # panel when a number grows a digit.
+        self._elapsed = self._add_readout(body_layout, "Elapsed", "0:00:00")
+        self._dropped = self._add_readout(body_layout, "Dropped frames",
+                                          "0000000")
+        self._inferenced = self._add_readout(body_layout, "Inferenced",
+                                             "000%  0000000/0000000")
         # Two separate figures. The call is what the model costs; sensor to
         # result adds the queue wait and is what the sub-5 ms target is about.
         # Showing only one of them would let a model look fast while missing
         # the deadline that matters.
-        self._inference_ms = self._add_readout(body_layout, "Inference call")
-        self._e2e_ms = self._add_readout(body_layout, "Sensor → result")
+        self._inference_ms = self._add_readout(body_layout, "Inference call",
+                                               "000.0 ms  max 0000.0")
+        self._e2e_ms = self._add_readout(body_layout, "Sensor → result",
+                                          "000.0 ms  max 0000.0")
         body_layout.addStretch(1)
 
         body.setVisible(False)
@@ -137,8 +153,14 @@ class CaptureTelemetryPanel(QWidget):
     # -- construction helpers --------------------------------------------
 
     @staticmethod
-    def _add_readout(layout, caption: str) -> QLabel:
-        """One caption-over-value pair. Returns the value label to update."""
+    def _add_readout(layout, caption: str, widest: str) -> QLabel:
+        """One caption-over-value pair. Returns the value label to update.
+
+        The value reserves the width of the widest reading it can ever
+        show. Without that the panel resized whenever a number gained a
+        digit - elapsed passing a minute, a percentage reaching three
+        figures - and the whole strip twitched several times a second.
+        """
         holder = QWidget()
         column = QVBoxLayout(holder)
         column.setContentsMargins(0, 0, 0, 0)
@@ -149,7 +171,13 @@ class CaptureTelemetryPanel(QWidget):
         column.addWidget(label)
 
         value = QLabel("-")
-        value.setStyleSheet("font-family: monospace;")
+        # Set as a font rather than only in the stylesheet, so the width
+        # below is measured in the font the label will actually use.
+        value.setFont(QFontDatabase.systemFont(QFontDatabase.FixedFont))
+        value.setMinimumWidth(
+            QFontMetrics(value.font()).horizontalAdvance(widest))
+        value.setAlignment(Qt.AlignmentFlag.AlignLeft
+                           | Qt.AlignmentFlag.AlignVCenter)
         column.addWidget(value)
 
         layout.addWidget(holder)
