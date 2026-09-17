@@ -104,9 +104,18 @@ def refuse_reason(
         return "Laser channel {} has no hardware mapping.".format(
             int(profile.channel_id)
         )
-    if "finite_stim3_pulse" not in set(firmware_capabilities):
+    reported = set(firmware_capabilities)
+    # Only a board that reports *some* capabilities can be said to lack this
+    # one. No released pellet firmware answers the capability request at all
+    # (see config/pellet-firmware-compatibility.yaml on v2.1.0), so an empty
+    # set means "did not say", not "cannot". Refusing on it would block the
+    # very path the trial route already drives successfully through
+    # _trigger_protocol_stim3, which applies no capability gate either. A board
+    # that genuinely cannot pulse fails at the call, where pulse_stim3 returns
+    # no token.
+    if reported and "finite_stim3_pulse" not in reported:
         return (
-            "The pellet firmware does not report finite_stim3_pulse, so it "
-            "cannot emit a timed board trigger."
+            "The pellet firmware reports its capabilities and finite_stim3_pulse "
+            "is not among them, so it cannot emit a timed board trigger."
         )
     return None
