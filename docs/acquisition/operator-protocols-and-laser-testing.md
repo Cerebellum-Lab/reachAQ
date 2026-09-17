@@ -214,24 +214,22 @@ Every refusal names its reason in the status line and fires nothing.
 | *Laser channel N has no hardware mapping* | the channel is not configured in Edit DAQ Ports. |
 | *The pellet firmware reports its capabilities and finite_stim3_pulse is not among them* | the board says it cannot pulse. |
 
-## The failure you will actually see today
+## Firmware requirement
 
-**The pellet firmware does not implement the pulse command.** Until it does, a
-hardware stim test will arm the output, send the request, be acknowledged, and
-then report:
+The hardware stim test needs pellet firmware **v2.2.0 or later**. That is the
+first release to implement the finite pulse command; every release through
+v2.1.0 has no handler for it.
 
-> *Stim test stim-a on laser 1 via STIM3: board acknowledged but the waveform
-> did not report terminal*
+On v2.1.0 or earlier the board does not acknowledge the request, so the test
+fails after about three seconds with a timeout naming the command token rather
+than a laser result. It is not a fault in the laser, the NI card, the wiring or
+the profile: the board has no such command. Check the board version in the
+hardware panel, and use **Run Pulse** meanwhile, which proves everything except
+the board trigger.
 
-with no measured interval. That is not a fault in the laser, the NI card, the
-wiring or the profile. The board accepts the CAN frame, has no handler for it,
-and drops it, so the trigger edge never arrives and the armed output waits until
-it times out.
+## What is still unproven, even on v2.2.0
 
-The same is true of any trial configured with the hardware route: it does not
-trigger the board today, and until recently did so silently. See
-`pellet-firmware-gpio-pulse.md` for the evidence and the implementation
-specification.
-
-Use **Run Pulse** to check the laser and the analog output in the meantime. It
-proves everything except the board trigger.
+Short pulses. The firmware times both edges from a hardware counter and the
+long end measures within 170 us of a 500 ms request, but a 100 us pulse cannot
+be resolved over CAN. Before trusting this path for optogenetics timing, put a
+scope on the BNC and measure a 100 us and a 1 ms pulse.

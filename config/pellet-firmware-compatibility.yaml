@@ -1,6 +1,38 @@
 schema_version: 1
 board_type: pellet_module
 versions:
+  - version: 2.2.0
+    wire_schema_version: 1
+    required_capabilities: []
+    optional_capabilities:
+      - timing_trailer
+      - time_sync
+      - finite_stim3_pulse
+    hardware_release: v2.2.0
+    tested_reachaq_release: pre-release-devel
+    qualification_status: rollout_pending
+    qualification_date: null
+    limitations:
+      - >-
+        First firmware to implement JERRYCAN_CMD_GPIO_PULSE (0x21) and
+        GPIO_PULSE_STATUS (0x22). Every release through 2.1.0 dropped the pulse
+        frame: no handler, and no acknowledgement either, so the hardware_stim3
+        laser route could not fire the board at all. Verified on christielab10
+        on 2026-09-17: board STIM3 and STIM2 each pulsed 500 ms within 170 us of
+        the request, returned low unaided, and a pulse addressed to a tone
+        confirmation line was refused with -EPERM.
+      - >-
+        Capability reporting is still not implemented. This firmware answers no
+        CAPABILITIES_REQUEST (0x23), so it reports no capability bits and
+        finite_stim3_pulse stays optional here rather than required. Requiring
+        it would reject every real 2.2.0 board, which is the same trap the 2.1.0
+        entry below records. Move it to required_capabilities only once a
+        firmware that answers the request ships.
+      - >-
+        Pulse width is verified only at the long end. Two status frames for a
+        100 us pulse arrive about 3 us apart at the host, which only proves both
+        were queued, so the short end of the 100 us..5 s range stays unmeasured
+        until someone puts a scope on the BNC.
   - version: 2.1.0
     wire_schema_version: 1
     required_capabilities: []
