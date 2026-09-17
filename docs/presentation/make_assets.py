@@ -327,72 +327,74 @@ def inference_latency():
     _save(figure, "inference_latency.png")
 
 
-#: Pose predict cost per batch, and the CPU decode block beside it. Author's rig
-#: measurements. Status colours: adopted, gated behind a flag, or measured and
-#: deliberately not adopted.
+#: Author's rig measurements on an NVIDIA T1000. Before/after pairs only, so
+#: every bar in a pair shares one unit and nothing has to be read across axes.
 GATED = "#c98c6a"
 DECLINED = "#a8adb4"
 
-PREDICT_MS = [
-    ("DLC TensorFlow ResNet-50\nbatch 6 at 256 px", 54.8, DECLINED, "starting point"),
-    ("+ partial batch\n2 real frames, no padding", 25.3, GATED, "gated: torch engine"),
-    ("mobile-class backbone\nbatch 6 at 256 px", 3.3, DECLINED, "measured, not adopted"),
+#: label, before, after, unit note, colour of the "after" bar
+WINS = [
+    ("Partial batch\n2 real frames, not a padded 6", 54.8, 25.3, "ms / batch", GATED),
+    ("CPU decode rewrite\nargmax + numpy, not sort + pandas", 6.565, 2.675, "ms / batch", AUTO),
+    ("CUDA-graph capture\nreplay the graph for the live batch", 7.4, 3.6, "ms / call", AUTO),
 ]
 
-DECODE_MS = [("before", 6.565, DECLINED), ("after", 2.675, AUTO)]
 
-
-def inference_ladder():
-    """Where the pose-tier milliseconds went."""
+def measurements():
+    """Tier 1 tail on the left, the Tier 2 wins on the right."""
     figure, (left, right) = plt.subplots(
-        1, 2, figsize=(12.4, 4.4), dpi=200, gridspec_kw={"width_ratios": [2.5, 1]}
+        1, 2, figsize=(13, 4.6), dpi=200, gridspec_kw={"width_ratios": [1.15, 1]}
     )
     figure.patch.set_facecolor("white")
 
-    labels = [row[0] for row in PREDICT_MS]
-    values = [row[1] for row in PREDICT_MS]
-    colors = [row[2] for row in PREDICT_MS]
-    notes = [row[3] for row in PREDICT_MS]
+    # --- Tier 1: worst case under load, against the budget
+    labels = [row[0].replace("\n", " · ") for row in STIM_LOOP_MS]
+    maxima = [row[4] for row in STIM_LOOP_MS]
+    colors = [DECLINED, DECLINED, NEW, AUTO]
     positions = numpy.arange(len(labels))
-    bars = left.barh(positions, values, 0.55, color=colors)
-    for bar, value, note in zip(bars, values, notes):
-        left.text(value + 0.9, bar.get_y() + bar.get_height() / 2,
-                  f"{value:g} ms   ({note})", va="center", fontsize=9, color=INK)
+    bars = left.barh(positions, maxima, 0.55, color=colors)
+    for bar, value in zip(bars, maxima):
+        left.text(value + 0.12, bar.get_y() + bar.get_height() / 2, f"{value:g} ms",
+                  va="center", fontsize=9, color=INK)
+    left.axvline(STIM_BUDGET_MS, color=MUTED, linestyle="--", linewidth=1.2)
+    # Clear space to the right of the line, between the two idle rows.
+    left.text(STIM_BUDGET_MS + 0.14, 1.3, "5 ms budget", ha="left", va="center",
+              fontsize=8.5, color=MUTED, style="italic")
     left.set_yticks(positions)
-    left.set_yticklabels(labels, fontsize=9, color=INK)
+    left.set_yticklabels(labels, fontsize=8.5, color=INK)
     left.invert_yaxis()
-    left.set_xlim(0, 78)
-    left.set_xlabel("milliseconds per batch", fontsize=9, color=INK)
-    left.set_title("Pose predict", fontsize=11, color=INK, weight="bold", pad=10)
+    left.set_xlim(0, 7.4)
+    left.set_xlabel("worst case over 60 s at 900 Hz, ms", fontsize=9, color=INK)
+    left.set_title("Tier 1 — reflex loop", fontsize=11, color=INK, weight="bold", pad=10)
     left.spines[["top", "right"]].set_visible(False)
     left.tick_params(colors=MUTED, labelsize=8)
 
-    dec_pos = numpy.arange(len(DECODE_MS))
-    bars = right.barh(dec_pos, [row[1] for row in DECODE_MS], 0.5,
-                      color=[row[2] for row in DECODE_MS])
-    for bar, row in zip(bars, DECODE_MS):
-        right.text(row[1] + 0.2, bar.get_y() + bar.get_height() / 2, f"{row[1]:g} ms",
-                   va="center", fontsize=9, color=INK)
-    right.set_yticks(dec_pos)
-    right.set_yticklabels([row[0] for row in DECODE_MS], fontsize=9, color=INK)
+    # --- Tier 2: each change as its own before/after pair
+    gap, positions = 0.42, []
+    for index, (label, before, after, unit, color) in enumerate(WINS):
+        base = index * 1.3
+        positions.append(base + gap / 2)
+        for offset, value, bar_color in ((0, before, DECLINED), (gap, after, color)):
+            bar = right.barh(base + offset, value, gap * 0.92, color=bar_color)[0]
+            right.text(value + 0.6, bar.get_y() + bar.get_height() / 2, f"{value:g}",
+                       va="center", fontsize=8.5, color=INK)
+        right.text(58, base + gap / 2, unit, va="center", ha="right",
+                   fontsize=7.5, color=MUTED, style="italic")
+    right.set_yticks(positions)
+    right.set_yticklabels([row[0] for row in WINS], fontsize=8.5, color=INK)
     right.invert_yaxis()
-    right.set_xlim(0, 9.5)
-    right.set_xlabel("milliseconds per batch", fontsize=9, color=INK)
-    right.set_title("CPU decode  (adopted, always on)", fontsize=11, color=INK,
-                    weight="bold", pad=10)
+    right.set_xlim(0, 60)
+    right.set_xlabel("before  →  after", fontsize=9, color=INK)
+    right.set_title("Tier 2 — pose stream", fontsize=11, color=INK, weight="bold", pad=10)
     right.spines[["top", "right"]].set_visible(False)
     right.tick_params(colors=MUTED, labelsize=8)
 
-    handles = [
-        plt.Rectangle((0, 0), 1, 1, color=AUTO),
-        plt.Rectangle((0, 0), 1, 1, color=GATED),
-        plt.Rectangle((0, 0), 1, 1, color=DECLINED),
-    ]
-    figure.legend(handles, ["adopted", "gated behind a flag", "not adopted"],
+    handles = [plt.Rectangle((0, 0), 1, 1, color=c) for c in (AUTO, GATED, DECLINED)]
+    figure.legend(handles, ["adopted, always on", "gated behind a flag", "before / not taken"],
                   frameon=False, fontsize=9, ncol=3, loc="lower center",
-                  bbox_to_anchor=(0.5, -0.04))
+                  bbox_to_anchor=(0.5, -0.05))
     figure.tight_layout()
-    _save(figure, "inference_ladder.png")
+    _save(figure, "measurements.png")
 
 
 def synchronization():
@@ -432,16 +434,10 @@ def main():
     if not MEDIA_ROOT.is_dir():
         print("  (not a directory; stills will render as placeholders)")
 
-    lineage()
-    pipeline()
-    stim_latency()
-    inference_latency()
-    inference_ladder()
+    # Only what the deck references. The other generators above are kept for
+    # slides that may come back; add the call here if one does.
+    measurements()
     synchronization()
-    two_tier()
-    demo_substitution()
-    demo_frames()
-    pose_backbones()
     print(f"\nassets in {ASSETS.relative_to(REPO_ROOT)}")
     return 0
 

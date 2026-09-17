@@ -11,10 +11,11 @@
 #
 # Every slide may carry `notes:` for the presenter view.
 #
-# Timing figures are rig measurements. Two honesty rules worth keeping if this
+# Timing figures are rig measurements on an NVIDIA T1000 (Turing, no tensor
+# cores) and are not claims about other cards. Two rules worth keeping if this
 # copy is edited: the 5 ms stim figure is a budget and a tail figure, never an
-# average; and the mobile-class backbone was measured and deliberately not
-# adopted, so it must never read as shipped.
+# average; and model choice is a menu with a speed/accuracy trade, not a single
+# winner - YOLO is the current default, not the only option.
 
 meta:
   title: reachAQ
@@ -64,111 +65,102 @@ slides:
       stream fast enough to act on. Everything underneath is auto-trainer's
       design.
 
-  - layout: bullets
-    title: The budget
-    lead: Two cameras, two clocks, two very different deadlines.
-    bullets:
-      - "Reach cameras run at 150 fps — a 6.667 ms per-frame budget for the perception stream"
-      - "The stim camera runs at 900 Hz — a 5 ms budget for the reflex loop. That is a design target and a tail figure, not a measured average"
-      - "The starting point: the DeepLabCut TensorFlow ResNet-50 pose path cost 54.8 ms per batch, about 18 Hz"
-      - "That single number was the largest latency term in the system, and far below camera rate — which is what made pose useless for closing a loop"
+  - layout: split
+    title: Why pose could not close a loop before
+    lead: Two cameras, two deadlines. The pose path missed its by a factor of eight.
+    left_heading: What has to be fast
+    left:
+      - "Reach cameras run at 150 fps — a 6.667 ms per-frame budget for the pose stream"
+      - "The stim camera runs at 900 Hz — a 5 ms budget for the reflex that fires the laser. That is a design target and a tail figure, not an average"
+      - "The reflex detector's own compute is under 0.1 ms, so its problem was never arithmetic — it was the OS delivering it on time"
+    right_heading: Where it started
+    right:
+      - "DeepLabCut on TensorFlow with ResNet-50 cost 54.8 ms per batch — about 18 Hz"
+      - "That was the largest single latency term in the system, and roughly eight times over the frame budget"
+      - "Pose could describe behaviour afterwards, but nothing could be decided from it while the reach was happening"
     notes: >
-      This slide exists so the numbers later have something to be measured
-      against. Do not let 5 ms drift into sounding like an average — it is the
-      tail figure the loop is designed to hold.
+      This slide exists so the later numbers have something to be measured
+      against. The user-facing consequence is the line that matters: before,
+      pose was a recording product; now it is a control input. Keep 5 ms
+      described as a budget and a tail figure, never an average.
+
+  - layout: bullets
+    title: What we changed
+    lead: The wins came from removing our own overhead and letting each tier meet its own deadline — not from a faster runtime.
+    bullets:
+      - "Split the work in two. The reflex loop keeps its millisecond deadline; the pose stream is allowed to run slower than the cameras, because it informs behaviour rather than firing hardware"
+      - "Gave the reflex loop real-time scheduling (SCHED_FIFO) and a performance CPU governor, so a busy machine cannot delay it"
+      - "Stopped padding the inference batch — run the 2 real frames instead of a padded 6 — and rewrote the CPU decode to use argmax and numpy instead of a sort and pandas"
+      - "Captured the CUDA graph for the live batch and replayed it, instead of re-submitting the same work every call"
+      - "Made the pose stage unable to hurt acquisition: it takes frames on a separate non-blocking queue, always takes the newest and drops stale ones, so latency never grows into a backlog"
+      - "Tried the usual accelerators and kept none of them — fp16, torch.compile and ONNX Runtime all measured at or below parity on this card, and TensorRT's real 1.3x was not worth a second inference path"
+    notes: >
+      This is the words-before-the-graph slide. Technical detail for the members
+      who want it: partial batch and the lean predict path need the PyTorch
+      engine, because the TensorFlow graph fixes its batch size; the ROI crop
+      from 256 to 128 px is opt-in and worth about 2.6x on the forward pass;
+      the decode rewrite and the freshness drain are always on and
+      model-independent. The freshness drain alone took end-to-end from 17.6 to
+      13.9 ms and cut frames the loop could not hand over from 35.2% to 0.7%.
+
+  - layout: image
+    title: What it measured
+    lead: Same rig, same load, before and after each change.
+    image: measurements.png
+    caption: >
+      Measured on an NVIDIA T1000 — a low-end Turing card with no tensor cores,
+      which is why fp16 lost here and why a tensor-core GPU would shift several
+      of these numbers.
+    notes: >
+      Left: under a 16-process load the reflex loop's worst case went from
+      6.05 ms, which breaks the budget, to 0.155 ms with zero missed deadlines
+      and the full 900 Hz cadence restored. No PREEMPT_RT kernel and no core
+      pinning — both measured, both declined. Right: the three pose-stream
+      changes, each shown against its own before. Units differ between rows,
+      which is why they are labelled per row rather than sharing an axis.
+      All figures are rig measurements on this hardware, not claims about
+      other cards.
 
   - layout: split
-    title: Two tiers, not one fast path
-    lead: We did not make one model fast enough for everything. We separated the millisecond-critical reflex from the perception stream and optimised each to its own budget.
-    left_heading: Tier 1 — reflex
+    title: Pick the model that fits the experiment
+    lead: The backend takes several model families. Speed and accuracy trade against each other, and the choice is yours per use case.
+    left_heading: What you get to choose
     left:
-      - The stim camera's first-reach detector triggers the laser
-      - This is the path that genuinely must be fast
-      - Its own compute is under 0.1 ms, so the work was making the OS deliver it on time, not making it compute less
-    right_heading: Tier 2 — perception
+      - "YOLO — the current default, and the one the CUDA-graph path accelerates"
+      - "cspnext and rtmpose — top-down pose families with measured confidence thresholds per backbone"
+      - "DeepLabCut ResNet-50 — the accuracy reference, and where this started"
+    right_heading: What the choice costs
     right:
-      - The reach-camera pose stream, informing behaviour and gating
-      - It does not have to hit camera rate to be useful
-      - Accepting that is what let an accuracy decision beat a raw-speed one
+      - "Faster backbones hold camera rate: cspnext_s sustains 150 fps at 7.66 ms sensor-to-pose; cspnext_m runs near 103 fps"
+      - "ResNet-50 runs below camera rate on this GPU — fine for a behaviour stream, not for closing a loop"
+      - "Confidence does not mean the same thing across families, so the gate threshold is measured per backbone rather than set globally"
     notes: >
-      This is the organising idea of the whole section. The payoff for a user is
-      that there are now two closed loops available — the fast ROI reflex, and
-      machine vision on the pose stream — rather than one compromise between
-      them.
+      The honest framing is a menu, not a winner. A user optimising for a tight
+      closed loop picks differently from one optimising for keypoint accuracy in
+      later analysis. The per-backbone threshold matters: a cspnext_s never
+      scores above 0.33, so a single global threshold would hold the reach flag
+      permanently false.
 
-  - layout: image
-    title: Tier 1 — making the reflex land on time
-    lead: The detector's own compute never exceeds 0.09 ms. The entire problem was scheduler wake-up latency under load.
-    image: stim_latency.png
-    caption: >
-      Under a 16-process load, real-time scheduling took the worst case from
-      6.05 ms to 0.155 ms, with zero missed deadlines and the full 900 Hz cadence
-      restored.
+  - layout: split
+    title: What this buys, and what it costs
+    lead: The speed work was not the point. This is what it enabled.
+    left_heading: New abilities
+    left:
+      - "A second closed loop driven by machine vision, alongside the fast ROI reflex — decisions can now depend on where the paw actually is"
+      - "A live 2D pose overlay per camera view while the session runs"
+      - "Signals visualised during acquisition instead of plotted afterwards"
+      - "Experiments composed from reusable trial sets, with reproducible draws"
+    right_heading: What it asks of you
+    right:
+      - "A working CUDA GPU. Live inference refuses to start without one, by design, rather than silently running slow"
+      - "Two settings the installer applies: real-time scheduling for the reflex loop and the performance CPU governor"
+      - "Calibration that matches the geometry the cameras actually record, or 3D is wrong beneath a correct-looking 2D overlay"
+      - "Unfiltered signal recording costs disk — the FSR stream alone adds roughly 166 rows a second"
     notes: >
-      Adopted: SCHED_FIFO plus the performance CPU governor. Both a PREEMPT_RT
-      kernel and core pinning were measured and declined — stock Linux already
-      preempts SCHED_OTHER for SCHED_FIFO, and the result leaves roughly 32x
-      headroom under a load harsher than real acquisition.
-
-  - layout: image
-    title: Tier 2 — where the milliseconds went
-    lead: The speed came from removing our own overhead and choosing the right architecture.
-    image: inference_ladder.png
-    caption: >
-      Colour is status, not just result. The mobile-class backbone was measured
-      at about 8x and deliberately not adopted — its confidence does not predict
-      accuracy, which would break the 3D confidence gate.
-    notes: >
-      Partial batch — running the 2 real frames instead of a padded 6 — took
-      54.8 to 25.3 ms, and needs the PyTorch engine because the TensorFlow graph
-      fixes its batch size. The decode rewrite, argmax instead of sort with
-      cached column indices and numpy instead of pandas, is always on and
-      model-independent. Also gated: an ROI crop from 256 to 128 px, worth about
-      2.6x on the forward pass, and a lean predict path worth about 1.2 ms per
-      call. CUDA-graph capture, 7.4 to 3.6 ms, is YOLO-backend only.
-      The engine migration to PyTorch is roughly neutral like-for-like — its
-      value is unlocking newer GPUs, dynamic batching and everything above it.
-
-  - layout: image
-    title: One OS setting was worth six more milliseconds
-    lead: Same hardware, same model, same batch. Only the CPU governor changed.
-    image: inference_latency.png
-    caption: >
-      powersave held the P-cores near 2700 MHz against a 5000 MHz ceiling. The
-      installer now sets performance, because the default cost more than half
-      the win.
-    notes: >
-      Worth pairing with the Tier 1 slide — the governor is one of the two
-      always-on system settings, alongside real-time scheduling.
-
-  - layout: bullets
-    title: Running below camera rate is safe by design
-    lead: The pose tier is allowed to be slower than the cameras, because it cannot hold them up.
-    bullets:
-      - "Non-blocking backpressure — the 150 fps capture loop hands frames to inference on a separate queue from recording, so a slow pose stage can never stall acquisition or cost a recorded frame. Slowness costs inference work only"
-      - "Freshness drain — inference always takes the newest queued frame and drops stale ones, so latency never grows into a backlog"
-      - "That drain removed up to a full predict period of buffer-sitting: end-to-end went from 17.6 to 13.9 ms, and frames the loop could not hand over fell from 35.2% to 0.7%"
-      - "Both are always on, and neither depends on which backend or model is configured"
-    notes: >
-      This is the correctness property, not a speedup, and it is what makes
-      "pose runs below camera rate" an accepted design point rather than a
-      hazard. Worth saying out loud for an audience that will otherwise assume
-      a slow model drops data.
-
-  - layout: bullets
-    title: Benchmarked, and not taken
-    lead: Every acceleration knob was measured on the rig. Several gave nothing here.
-    bullets:
-      - "fp16 / mixed precision — 3 to 4x slower on this card. The T1000 has no tensor cores, so the default stays fp32"
-      - "torch.compile — about 0.99x, and slower on the larger model"
-      - "ONNX Runtime on CUDA — matches PyTorch at 0.99x"
-      - "TensorRT — a real 1.30 to 1.36x, the only external-runtime win, rejected on cost: per-model export, per-card engine builds, 6.4 GB of libraries, a second inference path and a CUDA-version reconciliation"
-      - "The honest summary: the speed came from removing our own overhead and picking the right architecture, not from a magic runtime"
-    notes: >
-      This slide is for the technical audience. If asked about INT8 — it could
-      pay on Turing's DP4A, the route tried produced a broken engine, and the
-      correct route is identified but not done. Figures throughout are rig
-      measurements on this hardware; they are not claims about other cards.
+      If asked about flags: a default rig gets the always-on wins, the decode
+      rewrite and the freshness drain, plus the Tier 1 scheduling. The partial
+      batch and lean predict path need the PyTorch backend selected, and the ROI
+      crop is opt-in.
 
   - layout: image
     title: Everything lands on one timebase
