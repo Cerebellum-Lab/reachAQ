@@ -499,6 +499,8 @@ class AppModel(ObservableObject):
         self._loaded_config_dir_path = Path()
         self._loaded_configuration_has_runtime_override = False
         self._demo_sources: Optional[DemoSources] = None
+        #: Drop the first pose-timing window in demo; see where it is armed.
+        self._demo_skip_first_pose_window = False
         self._runtime_live_inference_override: Optional[bool] = None
         self._nidaq_ports = NidaqPortConfiguration()
         self._hardware_scan_results: Dict[str, HardwareScanEntry] = {}
@@ -8605,6 +8607,17 @@ class AppModel(ObservableObject):
             # Windowed timing from the pose process, folded into the session
             # counters the operator panel and the metadata read.
             pose_count, mean_ms, max_ms, e2e_mean_ms, e2e_max_ms = value
+            if self._demo_skip_first_pose_window:
+                # The first window after inference goes live still holds the
+                # frame that waited for the model to load - 8.5 s of it on
+                # this rig - and rebasing the counters cannot remove it,
+                # because the window arrives after the rebase. In demo that
+                # number is only ever the warm-up, and it is what an
+                # onlooker reads off the panel, so this window's extremes
+                # are dropped. Demo only: in a real session an 8.5 s
+                # sensor-to-result is a finding, not a distraction.
+                self._demo_skip_first_pose_window = False
+                max_ms = e2e_mean_ms = e2e_max_ms = float('nan')
             self._session_telemetry.record_inference(
                 pose_count, mean_ms, max_ms,
                 sensor_to_result_mean_ms=e2e_mean_ms,
@@ -8626,6 +8639,7 @@ class AppModel(ObservableObject):
                 if (self._recording_session.status
                         is not SessionRecordingStatus.RECORDING):
                     self._session_telemetry.begin()
+                    self._demo_skip_first_pose_window = self.is_demo_mode
             elif value == InferenceStatus.stopped:
                 current = self._acquisition.subsystems.get(
                     SubsystemId.LIVE_INFERENCE
