@@ -144,3 +144,33 @@ def test_a_compile_failure_is_reported_rather_than_raised(qapp, stocked_app_mode
     sidebar.compile_selected_experiment()
 
     assert "revision" in sidebar.status_label.text()
+
+
+def test_capturing_with_no_protocol_selected_reports_rather_than_raises(
+    qapp, stocked_app_model
+):
+    sidebar = ProtocolSetSidebar(stocked_app_model)
+
+    sidebar.save_selected_protocol_as_set("captured", "Captured")
+
+    assert "Select a session protocol" in sidebar.status_label.text()
+
+
+def test_opening_a_set_publishes_it_as_an_editable_protocol(qapp, stocked_app_model):
+    sidebar = ProtocolSetSidebar(stocked_app_model)
+    sidebar.set_list.setCurrentRow(0)
+
+    sidebar.open_selected_set_in_editor("baseline-draft", "Baseline draft")
+
+    assert stocked_app_model._trial_protocol_repository.get("baseline-draft")
+
+
+def test_opening_with_no_set_selected_reports_rather_than_raises(
+    qapp, stocked_app_model
+):
+    sidebar = ProtocolSetSidebar(stocked_app_model)
+    sidebar.set_list.setCurrentRow(-1)
+
+    sidebar.open_selected_set_in_editor("baseline-draft", "Baseline draft")
+
+    assert "Select a set to open" in sidebar.status_label.text()
