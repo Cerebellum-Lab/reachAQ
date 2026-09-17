@@ -143,6 +143,8 @@ class MainWindow(QMainWindow):
         self._is_dev = is_dev
         self._demo_sources = demo_sources
         self._demo_spec_path = DEFAULT_DEMO_SOURCES_PATH
+        # Start before the first event, so the first Next lands on it.
+        self._demo_event_index = -1
         prefs = self._preferences = user_preferences
         self._update_log_level(prefs.log_level)
         self._title = _make_window_title(prefs)
@@ -217,6 +219,7 @@ class MainWindow(QMainWindow):
                 app_model.set_runtime_live_inference_override(live_inference)
 
         self._refresh_demo_banner()
+        self._refresh_demo_event_actions()
 
         app_model.property_changed += self._on_app_model_property_changed
         app_model.hardware.property_changed += self._on_hardware_property_changed
@@ -1172,6 +1175,20 @@ class MainWindow(QMainWindow):
         )
         action.toggled.connect(self._on_demo_mode_toggled)
 
+        # Stepping through the clip's events. Both stay disabled unless demo
+        # mode is on AND the spec carries an event index, so a clip staged
+        # without its session's event file shows controls that say why they
+        # cannot work rather than ones that quietly do nothing.
+        action = self.demo_prev_event_action = QAction(
+            _toolbar_icon("fa5s.step-backward"), "Previous pellet delivery", self)
+        action.triggered.connect(self._on_demo_previous_event)
+        action.setEnabled(False)
+
+        action = self.demo_next_event_action = QAction(
+            _toolbar_icon("fa5s.step-forward"), "Next pellet delivery", self)
+        action.triggered.connect(self._on_demo_next_event)
+        action.setEnabled(False)
+
         action = self.view_diagnostics_action = QAction("Logging", self)
         action.setToolTip("Show or hide the application logging panel")
         action.setCheckable(True)
@@ -1233,6 +1250,8 @@ class MainWindow(QMainWindow):
         tools_menu.addAction(self.make_3d_calib_action)
         tools_menu.addSeparator()
         tools_menu.addAction(self.demo_mode_action)
+        tools_menu.addAction(self.demo_prev_event_action)
+        tools_menu.addAction(self.demo_next_event_action)
 
         view_menu = menu_bar.addMenu("View")
         view_menu.addAction(self.view_diagnostics_action)
@@ -1295,7 +1314,73 @@ class MainWindow(QMainWindow):
             return
 
         self._demo_sources = sources
+        self._demo_event_index = -1
         self._refresh_demo_banner()
+        self._refresh_demo_event_actions()
+
+    def _demo_event_frames(self):
+        """The clip's event frames, or empty when there is nothing to step."""
+        sources = self._demo_sources
+        return () if sources is None else sources.event_frames()
+
+    def _refresh_demo_event_actions(self) -> None:
+        """Enable stepping only when there is somewhere to step to."""
+        frames = self._demo_event_frames()
+        enabled = bool(frames)
+        self.demo_prev_event_action.setEnabled(enabled)
+        self.demo_next_event_action.setEnabled(enabled)
+        if not enabled:
+            self._demo_event_index = -1
+            hint = ("Demo mode is playing a clip with no event index"
+                    if self._demo_sources is not None
+                    else "Available in demo mode")
+            self.demo_prev_event_action.setToolTip(hint)
+            self.demo_next_event_action.setToolTip(hint)
+            return
+        total = len(frames)
+        # Worded from the clip's own event kind: a session recording
+        # carries pellet deliveries, a reel of trials carries trial
+        # starts, and the menu should say which it will jump to.
+        label = self._demo_sources.event_label(plural=True)
+        self.demo_prev_event_action.setText(
+            f"Previous {self._demo_sources.event_label()}")
+        self.demo_next_event_action.setText(
+            f"Next {self._demo_sources.event_label()}")
+        self.demo_prev_event_action.setToolTip(
+            f"Jump back one of {total} {label} in the clip")
+        self.demo_next_event_action.setToolTip(
+            f"Jump forward one of {total} {label} in the clip")
+
+    def _step_demo_event(self, delta: int) -> None:
+        """Move the playhead one event, and say where it went.
+
+        Stepped through an index rather than computed from the current
+        playback position: the position lives in two separate capture
+        processes and the clip loops, so an index is both simpler and
+        predictable - pressing next always advances by one event.
+        """
+        frames = self._demo_event_frames()
+        if not frames:
+            return
+        index = self._demo_event_index + delta
+        if index < 0 or index >= len(frames):
+            self.statusBar().showMessage(
+                "Already at the %s %s"
+                % ("first" if delta < 0 else "last",
+                   self._demo_sources.event_label()), 3000)
+            return
+        self._demo_event_index = index
+        frame = frames[index]
+        self._app_model.seek_demo_playback(frame)
+        self.statusBar().showMessage(
+            f"{self._demo_sources.event_label().capitalize()} "
+            f"{index + 1} of {len(frames)} (frame {frame})", 5000)
+
+    def _on_demo_previous_event(self) -> None:
+        self._step_demo_event(-1)
+
+    def _on_demo_next_event(self) -> None:
+        self._step_demo_event(1)
 
     def _refresh_demo_banner(self) -> None:
         active = self._demo_sources is not None

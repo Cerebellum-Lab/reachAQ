@@ -828,6 +828,15 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
     def disarm_stim_detector(self, operation_id=None) -> None:
         self._send_command(CaptureCommandKind.DISARM_STIM_DETECTOR, operation_id)
 
+    def seek(self, frame: int) -> None:
+        """Jump this camera's playback to a frame.
+
+        Demo playback only. A real camera has no past to seek into and
+        ignores it, so the caller can broadcast to every camera without
+        first asking which kind each one is.
+        """
+        self._send_command(CaptureCommandKind.SEEK, int(frame))
+
     @staticmethod
     def _stim_configuration_from_camera(conf):
         if conf.id != CameraId.Camera3 or conf.params.get("stim_mode") != "stimulation":

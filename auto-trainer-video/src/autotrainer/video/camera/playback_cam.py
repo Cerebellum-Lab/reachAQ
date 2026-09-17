@@ -33,6 +33,37 @@ class PlaybackCam(CameraBase):
         self._video_frame_count = int(vc.get(cv2.CAP_PROP_FRAME_COUNT))
         logger.notice("init with fps=%s W=%s H=%s", self.fps, self.width, self.height)
 
+    @property
+    def frame_count(self) -> int:
+        """How many frames the file holds, or -1 before init()."""
+        return self._video_frame_count
+
+    def seek(self, frame: int) -> int:
+        """Jump playback to `frame`, returning where it actually landed.
+
+        Clamped to the file rather than refused: the caller is a navigation
+        control working from an event index, and an index that runs slightly
+        past the end of a re-encoded clip should land on the last frame rather
+        than do nothing.
+
+        The frame counter moves with it and the pacing clock is re-based, so
+        capture() does not then try to catch up on the frames it skipped - it
+        paces against elapsed time since capture started, and seeking forward
+        would otherwise make every subsequent frame look overdue and stream out
+        as fast as the file can be decoded.
+        """
+        if self._video_capture is None:
+            raise RuntimeError("seek before init()")
+        target = max(0, int(frame))
+        if self._video_frame_count > 0:
+            target = min(target, self._video_frame_count - 1)
+        self._video_capture.set(cv2.CAP_PROP_POS_FRAMES, target)
+        self._frame_count = target
+        # Re-base so "now" corresponds to the frame just seeked to.
+        self._capture_start = time.time_ns() - int(target * 1e9 / self._fps)
+        logger.notice("%s: seek to frame %s", self._file_name, target)
+        return target
+
     def capture(self) -> Tuple[numpy.ndarray, int]:
         ret, frame = self._video_capture.read()
         if not ret:
