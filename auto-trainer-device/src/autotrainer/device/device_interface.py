@@ -424,6 +424,23 @@ class Version(Source):
 @dataclass
 class Acknowledge(Source):
     uuid: int = 0
+    #: The board's return code for the command it is acknowledging. Zero means
+    #: it ran. Negative is a system errno, which is how a board reports that it
+    #: refused: -EPERM for a pulse aimed at a tone confirmation line, -EBUSY for
+    #: a second pulse while one is in flight, -EINVAL for a duration out of
+    #: range, -ENOTSUP for a board with no pulse counter. An acknowledgement is
+    #: not by itself a success, so callers that care must read this.
+    error: int = 0
+
+    @property
+    def is_failure(self) -> bool:
+        return int(self.error) != 0
+
+    @property
+    def failure_reason(self) -> str:
+        if not self.is_failure:
+            return ""
+        return f"the board refused the command with error {int(self.error)}"
 
 
 _zero_position = Offset3DTuple(0, 0, 0)

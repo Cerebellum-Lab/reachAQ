@@ -1,12 +1,24 @@
-# Pellet firmware: the GPIO pulse command is missing
+# Pellet firmware: the GPIO pulse command
+
+> **Resolved in pellet firmware v2.2.0** (`reachAQ-hardware` tag `v2.2.0`,
+> commit `01ee28b`), flashed and verified on `christielab10` on 2026-09-17.
+> This document is kept as the specification that release was built against and
+> as the record of what was wrong before it. Everything below describes
+> v2.1.0 and earlier.
 
 The host drives the `hardware_stim3` laser trigger route by asking the pellet
-board for a finite, firmware-timed digital pulse. **No released pellet firmware
-implements that command.** The board silently drops the frame and the host
-reports success, so the route does not trigger anything on real hardware.
+board for a finite, firmware-timed digital pulse. **No pellet firmware through
+v2.1.0 implements that command.** The board drops the frame, so the route does
+not trigger anything on real hardware.
+
+It does not fail silently end to end: the board sends no acknowledgement for a
+command it has no handler for, so the caller's `wait_pending_command_acked`
+raises a timeout roughly three seconds later. `pulse_digital_output` itself
+does return success, because it only reports that the frame was queued locally,
+but the layer above catches the missing acknowledgement.
 
 This document is the implementation specification for adding it, for **STIM2 and
-STIM3**, and the evidence that it is absent today.
+STIM3**, and the evidence that it was absent.
 
 ## Status
 
@@ -15,7 +27,7 @@ STIM3**, and the evidence that it is absent today.
 | Affected firmware | all releases through v2.1.0 |
 | Affected host | `CanInterface.pulse_digital_output`, the `hardware_stim3` laser route |
 | Symptom | a trial or bench test arms the NI analog output and waits for a trigger edge that never arrives |
-| Host-visible | none: `pulse_digital_output` returns success for a frame the board ignores |
+| Host-visible | `pulse_digital_output` returns success for a frame the board ignores, but the board sends no acknowledgement either, so the caller's `wait_pending_command_acked` raises a timeout about three seconds later |
 | Confirmed | 2026-09-17 on `christielab10` against a live board, firmware 2.1.0 |
 
 ## Evidence that it is absent

@@ -453,7 +453,11 @@ class CanInterface(DeviceInterface):
             cmd_type.SERVO_STATUS: self._translate_servo_status,
             cmd_type.STEPPER_STATUS: self._handle_stepper_status,
             cmd_type.TEMP_HUM_READ: no_op,
-            cmd_type.ACKNOWLEDGE: lambda msg: Acknowledge(uuid=msg.uuid),
+            # The board sets ack.error when it refuses a command. Dropping it
+            # here made a refusal indistinguishable from a success.
+            cmd_type.ACKNOWLEDGE: lambda msg: Acknowledge(
+                uuid=msg.uuid, error=int(getattr(msg.ack, "error", 0) or 0)
+            ),
             # no-op handlers, to silence the warning if unknown message type
             cmd_type.STEPPER_HOME: no_op,
             cmd_type.STEPPER_MOVE: no_op,
