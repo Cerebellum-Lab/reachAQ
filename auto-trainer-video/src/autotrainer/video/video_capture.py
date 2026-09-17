@@ -36,8 +36,14 @@ from .camera.camera_base import CameraBase
 from .video_manager import VideoManager
 from .video_record import VideoRecord, VideoRecordProperties, VideoRecordMode
 from .stim_camera import StimCameraDetectionConfiguration, StimCameraDetector, StimEvidenceWriter
+from .realtime_priority import apply_realtime_priority
 
 logger = get_verbose_logger(__name__)
+
+# How often the capture process reports frame accounting to the UI. Twice a
+# second is fast enough that an operator sees a drop while the animal is still
+# in the box, and slow enough to be invisible against a 150 fps capture loop.
+FRAME_STATS_REPORT_PERIOD = 0.5
 
 
 # Always keep that extra more nbr of frames for cameras recording sync purpose:
@@ -409,6 +415,13 @@ class VideoCapture(Process):
                 logger.exception("Failure executing cmd %s: %s", raw, err)
 
     def _run_capture_loop(self, camera: CameraBase) -> None:
+        if self._stim_detector is not None:
+            # Only the stim camera: this is the 900 Hz closed loop, and it is
+            # the one whose wake-up latency has a 5 ms deadline. Making every
+            # camera process real-time would buy nothing and take CPU from the
+            # ones that only need throughput. Returns False and logs when the
+            # rig has no rtprio allowance, and the loop then runs as before.
+            apply_realtime_priority()
         log_cam_frame_info_delay_frame_count = camera.fps * 5
         fault_count = 0
         cnt_net_q_put = 0
@@ -426,6 +439,12 @@ class VideoCapture(Process):
         prim_cam_synced_frame_idx = attrs.synced_cam_frame_index
         synced_frame_idx: Optional[int] = None
         msg_q = attrs.msg_queue  # message queue to main process
+        # Session totals for the live telemetry panel. Reported as absolutes on
+        # a timer rather than per frame: at 150 fps a message per frame would
+        # cost more than the accounting, and an absolute total corrects itself
+        # if one is dropped where a delta would corrupt the running sum.
+        total_missed_frames = 0
+        next_frame_stats_perf = 0.0
         record_start_stop_frame_idx: Optional[int] = None
         last_recorded_frame_id = -1
         last_recorded_frame_perf = math.nan
@@ -687,6 +706,15 @@ class VideoCapture(Process):
                             start=1,
                         )
                     )
+                if count_missed_frames > 0:
+                    total_missed_frames += count_missed_frames
+                if msg_q is not None and perf_now >= next_frame_stats_perf:
+                    next_frame_stats_perf = perf_now + FRAME_STATS_REPORT_PERIOD
+                    msg_q.put((
+                        SystemStatusMessageKind.CAMERA_FRAME_STATS,
+                        (self._camera_idx, count_frames_received,
+                         total_missed_frames),
+                    ))
                 self._process_stim_frame(
                     frame,
                     cam_frame_id,
@@ -729,16 +757,6 @@ class VideoCapture(Process):
                     ):
                         logger.debug("got frame_id=%s frame_when=%.4f frame_perf=%.4f delay=%.4f",
                                      cam_frame_id, when_secs, frame_perf_c, frame_late_delay)
-
-                if img_q is not None:
-                    # image queue goes to GUI video reader frame, currently FixedArrayQueue
-                    if perf_now >= next_t_image_q:
-                        if image_queue_delay is not None:
-                            next_t_image_q = perf_now + image_queue_delay
-                        if len(numpy.shape(frame)) < 3:
-                            img_q.put(frame)
-                        else:
-                            img_q.put(frame[:, :, 0])
 
                 if prim_cam_record_enabled is not None and not is_primary:
                     # for secondary synced cams we don't have other choice than to read
@@ -856,14 +874,49 @@ class VideoCapture(Process):
                         rec_q_put(record_q_list)
                         record_q_list = self._record_queue_list = []
 
+                # This frame's index as every downstream consumer knows it:
+                # relative to the start of the recording, or the category that
+                # says there is no recording. Computed for all of them rather
+                # than inside the inference branch, because the display queue
+                # stamps the same value and must not depend on inference being
+                # enabled to have one.
+                frame_idx_cat = (
+                    FrameIndexCategory.ONLINE_NO_RECORDING if record_start_stop_frame_idx is None
+                    else cam_frame_id - record_start_stop_frame_idx
+                )
+
                 if net_q_put is not None:
                     # network queue goes to processing/inference
-                    frame_idx_cat = (
-                        FrameIndexCategory.ONLINE_NO_RECORDING if record_start_stop_frame_idx is None
-                        else cam_frame_id - record_start_stop_frame_idx
-                    )
-                    if net_q_put(frame, net_q_idx, frame_idx_cat, block=False) == BufferResult.Ok:
+                    # frame_perf_c travels with the frame so the pose process
+                    # can report sensor-to-result, not just how long its own
+                    # call took. It is the host time the exposure maps to, from
+                    # the camera's hardware timestamp - not when Python noticed
+                    # the frame.
+                    if net_q_put(frame, net_q_idx, frame_idx_cat, block=False,
+                                 frame_perf_c=frame_perf_c) == BufferResult.Ok:
                         cnt_net_q_put += 1
+
+                if img_q is not None:
+                    # image queue goes to GUI video reader frame, currently FixedArrayQueue.
+                    #
+                    # Stamped with frame_idx_cat, the SAME index the inference
+                    # queue carries, so the view can pair an overlay with the
+                    # frame it was computed from. It has to be this one and not
+                    # cam_frame_id: the pose path reports frames relative to the
+                    # start of the recording, so stamping the display with the
+                    # camera's own count compared two different numbering
+                    # systems and every overlay was held back.
+                    #
+                    # Which is also why this sits after the block above rather
+                    # than before it: frame_idx_cat is only known once the
+                    # recording origin has been established.
+                    if perf_now >= next_t_image_q:
+                        if image_queue_delay is not None:
+                            next_t_image_q = perf_now + image_queue_delay
+                        if len(numpy.shape(frame)) < 3:
+                            img_q.put(frame, frame_idx_cat)
+                        else:
+                            img_q.put(frame[:, :, 0], frame_idx_cat)
 
 
                 # if not (is_record_active and record_start_stop_frame_idx is not None) and attrs.record_prebuffer_duration > 0:

@@ -4,3 +4,18 @@
 *.pkl filter=lfs diff=lfs merge=lfs -text
 *.whl filter=lfs diff=lfs merge=lfs -text
 *.png filter=lfs diff=lfs merge=lfs -text
+
+# Shell scripts must keep LF endings in every working tree.
+#
+# The blobs are already LF, but core.autocrlf=true rewrites them to CRLF on a
+# Windows checkout, and a CRLF shebang is not executable on Linux: the kernel
+# reads the interpreter as "bash\r" and execve fails with
+#   /usr/bin/env: 'bash\r': No such file or directory
+# which surfaces as exit 127. The target runtime for these installers is
+# Dell/Ubuntu, and they are also run from WSL against the Windows tree, so the
+# ending has to be pinned rather than left to the checkout platform.
+#
+# Deliberately scoped to shell scripts. A repository-wide `* text=auto` would
+# renormalise 127 of the 445 tracked Python files, conflicting with in-flight
+# branches and rewriting blame; that remains a separate decision.
+*.sh text eol=lf

@@ -52,6 +52,7 @@ class SystemMessageHandler(MessageHandler):
             SystemStatusMessageKind.BOARD_TIME_SYNC,
             SystemStatusMessageKind.BOARD_CAPABILITIES,
             SystemStatusMessageKind.DIGITAL_PULSE_STATUS,
+            SystemStatusMessageKind.PRESSURE_READING,
         }:
             # The decoded-message event carries this timestamp-sensitive state to
             # acquisition consumers.  It has no legacy UI property of its own.

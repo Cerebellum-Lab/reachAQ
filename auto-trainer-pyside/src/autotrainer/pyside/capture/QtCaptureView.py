@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import collections
 import dataclasses
 from typing import List, Optional, Dict
 
@@ -21,11 +22,36 @@ from autotrainer.pyside.capture.QtCaptureSettings import QCaptureSettings
 logger = get_verbose_logger(__name__)
 
 
+#: How far a pose overlay may be from the frame it is drawn over, in camera
+#: frames. Three frames is 20 ms at 150 fps, which is below what the eye
+#: resolves as a lag between an image and the dots on it.
+#:
+#: Not zero: acquisition runs ahead of inference by design and the display
+#: receives only about one frame in ten, so an exact match would drop most
+#: overlays rather than align them. This bounds the error instead.
+#:
+#: Display-only. The closed loop consumes pose_response_ready directly and
+#: never passes through this widget, so nothing here delays a reach
+#: decision.
+POSE_FRAME_TOLERANCE = 3
+
+#: How many recent poses to keep so the one matching the displayed frame can
+#: be found. The display lags the camera by up to a queue depth plus a render
+#: tick; 64 frames is under half a second at 150 fps and costs a few hundred
+#: floats.
+POSE_HISTORY = 64
+
+
+
 @dataclasses.dataclass
 class ImageData:
     array: numpy.ndarray
     width: int
     height: int
+    #: Camera frame id this image came from, or -1 when unknown. Carried so
+    #: the overlay can be matched to the frame it was computed from rather
+    #: than drawn over whatever happens to be on screen.
+    frame_id: int = -1
 
 
 class QCaptureView(QWidget):
@@ -43,6 +69,14 @@ class QCaptureView(QWidget):
         self._cameras = list()
 
         self._next_frame_data: Optional[ImageData] = None
+        #: Recent poses by frame id, newest last. Inference produces one per
+        #: frame while the display shows about one in ten, so the pose that
+        #: belongs to the frame on screen is usually already here - keeping
+        #: only the newest threw it away and left half the overlays with no
+        #: match to draw.
+        self._recent_points = collections.OrderedDict()
+        self._next_points_frame_id: int = -1
+        self._pose_frame_tolerance: int = POSE_FRAME_TOLERANCE
         self._is_frame_dirty = False
 
         self._next_frame_points: Dict[str, PoseLocation] = {}
@@ -239,18 +273,83 @@ class QCaptureView(QWidget):
             self._fps = fps
 
     def update_pose(self):
+        """Draw the overlay only over the frame it was computed from.
+
+        The pose and the image reach this widget independently: poses arrive
+        from inference at up to the capture rate, images arrive on a queue
+        rate limited to the display rate. Drawing whichever of each was
+        newest meant the dots could sit on a frame up to a display tick away
+        - 66 ms, ten frames at 150 fps - with nothing correlating them.
+
+        Both now carry a camera frame id, so an overlay is drawn when it
+        belongs to the frame on screen and held back when it does not. A
+        pose for a frame the display never received - the display sees about
+        one frame in ten - is simply never drawn, which is why the tolerance
+        below is not zero: it accepts the nearest frame within half the
+        display spacing, so most poses still land.
+
+        When either side has no id, this falls back to the previous
+        behaviour rather than showing nothing.
+        """
         if not self._display_dots_detection:
             self._image.set_points({})
             return
         if self._next_frame_points is None or not self._are_points_dirty:
             return
-        self._image.set_points(self._next_frame_points)
+        points = self._points_for_displayed_frame()
+        if points is None:
+            return
+        self._image.set_points(points)
         self._are_points_dirty = False
 
+    def _points_for_displayed_frame(self):
+        """The pose belonging to the frame on screen, or None to hold back.
+
+        Chosen from the recent poses rather than taking whichever arrived
+        last. Inference produces a pose per frame and the display shows
+        about one frame in ten, so the matching pose is almost always in
+        hand; using the newest instead left the overlay a median of four
+        frames off and outside tolerance half the time.
+        """
+        frame = self._next_frame_data
+        frame_id = -1 if frame is None else getattr(frame, "frame_id", -1)
+        if frame_id < 0:
+            # The frame carries no id - an older producer, or no recording
+            # in progress. Fall back to the newest pose as before.
+            return self._next_frame_points
+        best_id = None
+        for candidate in self._recent_points:
+            if best_id is None or abs(candidate - frame_id) < abs(best_id - frame_id):
+                best_id = candidate
+        if best_id is None:
+            # No pose carried an id either.
+            return (self._next_frame_points
+                    if self._next_points_frame_id < 0 else None)
+        if abs(best_id - frame_id) > self._pose_frame_tolerance:
+            return None
+        return self._recent_points[best_id]
+
     @Slot(dict)
-    def refresh_pose(self, points: Dict[str, PoseLocation]):
+    def set_overlay_parts(self, parts) -> None:
+        """Restrict which parts the overlay draws; empty means all."""
+        self._image.set_overlay_parts(parts)
+
+    def refresh_pose(self, points: Dict[str, PoseLocation],
+                     frame_id: int = -1):
         self._next_frame_points = points
+        self._next_points_frame_id = int(frame_id)
         self._are_points_dirty = True
+        if frame_id >= 0:
+            self._recent_points[int(frame_id)] = points
+            while len(self._recent_points) > POSE_HISTORY:
+                self._recent_points.popitem(last=False)
+
+    def set_pose_frame_tolerance(self, frames: int) -> None:
+        """How far an overlay may be from the displayed frame and still show.
+
+        See POSE_FRAME_TOLERANCE for why it is not zero.
+        """
+        self._pose_frame_tolerance = max(0, int(frames))
 
     def _source_changed(self, index):
         camera = self._camera.itemData(index)

@@ -14,6 +14,10 @@ CAPABILITY_BITS = {
     "timing_trailer": 1 << 0,
     "time_sync": 1 << 1,
     "finite_stim3_pulse": 1 << 2,
+    # Reserved for the pre-cue pellet authorization path. No released
+    # firmware advertises it yet, so precheck methods stay unavailable
+    # until a board reports this bit.
+    "pellet_precheck": 1 << 3,
 }
 
 

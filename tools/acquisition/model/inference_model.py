@@ -22,6 +22,9 @@ from autotrainer.core.pose_elements import SceneElement, AllHandsParts
 from autotrainer.inference import GpuRuntimeStatus, PoseProcess, InferenceCommandMessageKind, \
     InferenceStatusMessageKind, PoseAlgorithm, InferenceMode, InferenceStatus, \
     InferenceMonitorDataMsg, detect_gpu_runtime
+from autotrainer.inference.backend_selection import (
+    build_pose_model, confidence_threshold, selected_backend, trained_model_name,
+)
 from autotrainer.inference.pose_result_process import InferenceMonitorDataProc
 from autotrainer.inference.analysis import intersession_process, IntersessionResponse
 
@@ -41,6 +44,16 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
     IS_ENABLED = "is_enabled"
     IS_PREDICT_ENABLED = "is_predict_enabled"
     MODEL_LOCATION = "model_location"
+    OVERLAY_PARTS = "overlay_parts"
+    LIVE_POSE_STATS = "live_pose_stats"
+    """From the pose process, per reporting window:
+
+    (session_pose_count, call_mean_ms, call_max_ms, sensor_to_result_mean_ms,
+     sensor_to_result_max_ms)
+
+    The call figures are what the model costs. Sensor-to-result additionally
+    includes the queue wait, and is the number the sub-5 ms target is about.
+    """
 
     def __init__(self,
         pose_algorithm: PoseAlgorithm,
@@ -70,6 +83,7 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
 
         self._is_enabled = False
         self._model_location = ""
+        self._overlay_parts: tuple = ()
         self._pose_algorithm = pose_algorithm
         self._pose_parts: List[str] = []
         self._calib_dir = calib_dir
@@ -164,6 +178,18 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
     def is_predict_enabled(self, value: bool):
         prev, self._is_predict_enabled = self._is_predict_enabled, value
         self._on_property_changed(self.IS_PREDICT_ENABLED, value, prev)
+
+    @property
+    def overlay_parts(self) -> tuple:
+        """Parts the live overlay draws; empty means every part emitted."""
+        return self._overlay_parts
+
+    @overlay_parts.setter
+    def overlay_parts(self, value):
+        value = tuple(value or ())
+        prev, self._overlay_parts = self._overlay_parts, value
+        if value != prev:
+            self._on_property_changed(self.OVERLAY_PARTS, value, prev)
 
     @property
     def model_location(self) -> str:
@@ -327,20 +353,51 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
 
     def check_live_inference_runtime(self, *, force_refresh: bool = False) -> GpuRuntimeStatus:
         if force_refresh or self._gpu_runtime_status is None:
-            # The configured DeepLabCut model uses the TensorFlow backend. A
-            # working PyTorch CUDA installation alone is not sufficient.
-            self._gpu_runtime_status = detect_gpu_runtime(required_backend="tensorflow")
+            # Probe the backend live inference will actually run on. The two
+            # are not interchangeable: on the reachAQ rig TensorFlow sees the
+            # GPU while every torch convolution aborts in cuDNN, so probing
+            # the wrong one passes the check and then crashes the pose process.
+            # With the model path, so a YOLO model probes the torch runtime
+            # rather than whatever the environment happens to default to. The
+            # probe deciding one engine while build_pose_model loads another is
+            # how a rig passes the check and then fails to start.
+            self._gpu_runtime_status = detect_gpu_runtime(
+                required_backend=selected_backend(model_path=self._model_location))
         return self._gpu_runtime_status
 
     def can_start_live_inference(self) -> bool:
         gpu_status = self.check_live_inference_runtime()
-        if gpu_status.is_available:
-            logger.info("Live inference GPU runtime available via %s: %s",
-                        gpu_status.backend, gpu_status.devices)
+        if not gpu_status.is_available:
+            logger.error("Live inference requires GPU acceleration; refusing to start. backend=%s error=%s",
+                         gpu_status.backend, gpu_status.error)
+            return False
+        logger.info("Live inference GPU runtime available via %s: %s",
+                    gpu_status.backend, gpu_status.devices)
+        return self._can_load_pose_model()
+
+    def _can_load_pose_model(self) -> bool:
+        """
+        Check the configured model before the pose process is spawned.
+
+        Without this, a bad path surfaces from inside the child process as a
+        critical log and a non-zero exit, which reads as a crash rather than
+        as a misconfigured model. An empty location is not a failure: that
+        selects the in-memory model used for rig checkout.
+        """
+        if not self._model_location:
             return True
-        logger.error("Live inference requires GPU acceleration; refusing to start. backend=%s error=%s",
-                     gpu_status.backend, gpu_status.error)
-        return False
+        backend = selected_backend(model_path=self._model_location)
+        try:
+            model = build_pose_model(self._model_location, backend=backend)
+            valid = model.is_valid()
+        except Exception as err:
+            logger.error("Live inference model %r is not usable by the %s backend: %s",
+                         self._model_location, backend, err)
+            return False
+        if not valid:
+            logger.error("Live inference model %r did not validate for the %s backend",
+                         self._model_location, backend)
+        return valid
 
     def stop(self):
         if self._status in {InferenceStatus.stopped, InferenceStatus.stopping}:
@@ -459,11 +516,13 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
     def load_configuration(self, configuration: InferenceConfiguration):
         self.model_location = configuration.pose_model_location
         self.is_enabled = configuration.is_enabled
+        self._overlay_parts = tuple(configuration.overlay_parts or ())
 
     def save_configuration(self) -> InferenceConfiguration:
         return InferenceConfiguration(
             pose_model_location=self.model_location,
             is_enabled=self.is_enabled,
+            overlay_parts=tuple(self._overlay_parts),
         )
 
     def send_message(self, kind: InferenceCommandMessageKind, context: Any = None):
@@ -592,6 +651,19 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
                     self._pose_parts = context
                     self._set_status(InferenceStatus.waiting)
                     pose_algo = self._pose_algorithm
+                    # The model is only certainly known here. Gating is
+                    # decided from the loaded model rather than from what
+                    # happens to be installed, which is how a YOLO model
+                    # ended up on TensorFlow's 0.9 and never drew a pellet.
+                    # Named directly rather than through a local, so the
+                    # contract test can see that the selector is told the
+                    # same model the loader will use. An empty location is
+                    # already handled downstream.
+                    pose_algo.set_confidence_threshold(confidence_threshold(
+                        selected_backend(model_path=self._model_location),
+                        model_name=trained_model_name(self._model_location),
+                        model_path=self._model_location,
+                    ))
                     pose_algo.initialize(context)
                     self._data_monitor_cmd_queue.put(
                         (InferenceMonitorDataProc.Msg.SET_POSE_ALGO, (pose_algo,), None))
@@ -599,8 +671,22 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
                 elif msg == InferenceStatusMessageKind.Loading:
                     self._set_status(InferenceStatus.loading)
                 elif msg == InferenceStatusMessageKind.Performance:
-                    logger.info(f"{context :.1f} predict calls/s")
-                    fps = context * self._frames_per_camera
+                    # The pose process sends (calls/s, session count, call
+                    # mean/max ms, sensor-to-result mean/max ms). A bare float
+                    # is still accepted so an older pose process does not break
+                    # the handler; it simply carries no timing.
+                    if isinstance(context, tuple):
+                        cps, pose_count, mean_ms, max_ms = context[:4]
+                        e2e_mean, e2e_max = (context[4:6] if len(context) >= 6
+                                             else (float("nan"), float("nan")))
+                        self._on_property_changed(
+                            self.LIVE_POSE_STATS,
+                            (pose_count, mean_ms, max_ms, e2e_mean, e2e_max),
+                            None)
+                    else:
+                        cps = context
+                    logger.info(f"{cps :.1f} predict calls/s")
+                    fps = cps * self._frames_per_camera
                     logger.info(f"{fps :.1f} frames/camera/s ({(fps * 2):.1f} total frames/s)")
                 elif msg == InferenceStatusMessageKind.Running:
                     mode = InferenceMode(context)

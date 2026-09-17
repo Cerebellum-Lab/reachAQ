@@ -9,7 +9,7 @@ build-backend = "setuptools.build_meta"
 name = "auto-trainer-tools"
 description = "Autotrainer full application and libs"
 license = { text = "MIT" }
-requires-python = ">= 3.8"
+requires-python = ">= 3.10"
 dynamic = ["version"]
 dependencies = [
     # requesting exact version for auto-trainer standalone projects,

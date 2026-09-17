@@ -47,6 +47,115 @@ class _NidaqSpoolSnapshot:
     worker_failed: bool
 
 
+# The pellet board samples the FSRs on a 12-bit ADC referenced to 3V3.
+_PRESSURE_ADC_FULL_SCALE = 4095
+_PRESSURE_REFERENCE_VOLTS = 3.3
+
+# Pressure columns, in the order _PressureRing stores and replays them.
+_PRESSURE_FIELDS = (
+    ("perf_time", np.float64),
+    ("wall_time", np.float64),
+    ("instance", np.int16),
+    ("counts", np.int32),
+    ("event_perf_time", np.float64),
+    ("board_aligned_perf_time", np.float64),
+    ("board_sequence", np.int64),
+    ("board_time_us", np.int64),
+)
+
+
+class _PressureRing:
+    """A bounded, numeric buffer for pellet-board FSR samples.
+
+    The board sends roughly 166 samples a second across its two sensors, two
+    orders of magnitude above every other device message. Held as row tuples
+    like the rest of the device stream that is about 120 MB an hour, so these
+    samples get numeric columns instead: the same hour costs about 32 MB.
+
+    The columns start small and double on demand up to ``capacity``, after
+    which the buffer wraps and keeps the newest samples. Sizing the full cap up
+    front would cost 162 MB at construction whether or not a long session was
+    ever recorded, which is most of a short session's footprint for nothing.
+
+    Every field the board supplies is numeric, so nothing is lost by storing
+    columns rather than tuples.
+    """
+
+    INITIAL_CAPACITY = 8192
+
+    def __init__(self, capacity: int):
+        self._capacity = max(1, int(capacity))
+        self._held = min(self._capacity, self.INITIAL_CAPACITY)
+        self._columns = {
+            name: np.zeros(self._held, dtype=dtype)
+            for name, dtype in _PRESSURE_FIELDS
+        }
+        self._next = 0
+        self._written = 0
+
+    @property
+    def capacity(self) -> int:
+        """The most samples this buffer will ever retain."""
+        return self._capacity
+
+    @property
+    def allocated(self) -> int:
+        """Rows currently reserved, which grows towards ``capacity``."""
+        return self._held
+
+    @property
+    def written(self) -> int:
+        """Samples appended over this buffer's life, including evicted ones."""
+        return self._written
+
+    def clear(self) -> None:
+        self._next = 0
+        self._written = 0
+
+    def _grow(self) -> None:
+        self._held = min(self._capacity, self._held * 2)
+        for (name, dtype) in _PRESSURE_FIELDS:
+            grown = np.zeros(self._held, dtype=dtype)
+            grown[:self._columns[name].size] = self._columns[name]
+            self._columns[name] = grown
+
+    def append(self, values) -> None:
+        # The cursor is allowed to reach _held so that filling the columns is
+        # distinguishable from wrapping them; taking the modulo first hid that
+        # and the buffer never grew.
+        if self._next == self._held:
+            if self._held < self._capacity:
+                self._grow()
+            else:
+                self._next = 0
+        position = self._next
+        for (name, _), value in zip(_PRESSURE_FIELDS, values):
+            self._columns[name][position] = value
+        self._next = position + 1
+        self._written += 1
+
+    def snapshot(self):
+        """Return the retained samples, oldest first, as a column dict."""
+        held = min(self._written, self._held)
+        if held == 0:
+            return {
+                name: np.zeros(0, dtype=dtype)
+                for name, dtype in _PRESSURE_FIELDS
+            }
+        if self._written <= self._held:
+            return {
+                name: column[:held].copy()
+                for name, column in self._columns.items()
+            }
+        # The buffer has wrapped, so the oldest retained sample sits at the
+        # write cursor and the columns have to be rotated back into order.
+        cursor = self._next % self._held
+        return {
+            name: np.concatenate((column[cursor:], column[:cursor]))
+            for name, column in self._columns.items()
+        }
+
+
 @dataclass(frozen=True)
 class _NidaqPerfSummary:
     count: int
@@ -106,6 +215,9 @@ class SessionDataRecorder:
         event_manager=None,
         nidaq_tone_edge_callback=None,
         device_event_capacity: int = 100_000,
+        # Five hours of both FSR sensors at the board's ~83 Hz each, so a
+        # long session keeps every sample it acquired.
+        pressure_sample_capacity: int = 3_000_000,
         structured_event_capacity: int = 100_000,
     ):
         self._nidaq_monitor = nidaq_monitor
@@ -120,6 +232,8 @@ class SessionDataRecorder:
         self._device_event_capacity = int(device_event_capacity)
         self._device_event_overruns = 0
         self._device_events_since_start = 0
+        self._pressure = _PressureRing(pressure_sample_capacity)
+        self._pressure_samples_since_start = 0
         self._laser_rows = []
         self._event_queue = Queue(maxsize=max(1, int(structured_event_capacity)))
         self._structured_event_overruns = 0
@@ -184,6 +298,7 @@ class SessionDataRecorder:
             # session assignment without racing the first camera frame.
             self._project = project
             self._device_events_since_start = 0
+            self._pressure_samples_since_start = 0
             self._laser_rows = []
             self._log_rows = []
             self._nidaq_chunks = []
@@ -231,6 +346,10 @@ class SessionDataRecorder:
                 for row in self._device_rows
                 if row[0] >= self._start_perf
             )
+            # The pressure ring also runs before the session starts, so
+            # count from here rather than from the ring's own total.
+            self._pressure_samples_since_start = 0
+            self._pressure.clear()
 
     def stop(self, end_perf: float):
         with self._event_capture_lock:
@@ -256,6 +375,11 @@ class SessionDataRecorder:
                 0,
                 self._device_events_since_start - self._device_event_capacity,
             )
+            pressure_columns = self._pressure.snapshot()
+            pressure_overruns = max(
+                0,
+                self._pressure_samples_since_start - self._pressure.capacity,
+            )
             laser_rows = tuple(self._laser_rows)
             log_rows = tuple(self._log_rows)
             nidaq_chunks = self._snapshot_nidaq_locked()
@@ -277,6 +401,8 @@ class SessionDataRecorder:
                 "start_wall": start_wall,
                 "end_perf": end_perf,
                 "device_rows": device_rows,
+                "pressure_columns": pressure_columns,
+                "pressure_overruns": pressure_overruns,
                 "event_rows": event_rows,
                 "structured_event_overruns": self._structured_event_overruns,
                 "laser_rows": laser_rows,
@@ -400,6 +526,7 @@ class SessionDataRecorder:
         logging.getLogger().removeHandler(self._log_handler)
         with self._lock:
             self._device_rows.clear()
+            self._pressure.clear()
 
     def add_log(self, perf_time: float, wall_time: float, message: str) -> None:
         with self._lock:
@@ -743,6 +870,7 @@ class SessionDataRecorder:
         self._start_wall = None
         self._boundary = None
         self._device_events_since_start = 0
+        self._pressure_samples_since_start = 0
         self._laser_rows = []
         self._log_rows = []
         self._nidaq_chunks = []
@@ -864,6 +992,39 @@ class SessionDataRecorder:
             None,
         )
 
+    def _record_pressure(
+        self, perf_time, wall_time, data, event_perf, board_aligned_perf,
+    ) -> None:
+        """Append one FSR sample to the pressure ring.
+
+        Called on the CAN decode thread, so it takes the same lock the device
+        ring uses and does no formatting: every value goes in numeric and is
+        rendered once, at finalization.
+        """
+        def numeric(value, fallback=-1):
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                return fallback
+            return value if math.isfinite(value) else fallback
+
+        with self._lock:
+            self._pressure.append((
+                float(perf_time),
+                float(wall_time),
+                int(getattr(data, "instance", 0) or 0),
+                int(getattr(data, "pressure", 0) or 0),
+                numeric(event_perf, float(perf_time)),
+                numeric(board_aligned_perf, numeric(event_perf, float(perf_time))),
+                int(numeric(getattr(data, "board_sequence", None))),
+                int(numeric(getattr(data, "board_time_us", None))),
+            ))
+            if (
+                self._start_perf is not None
+                and float(perf_time) >= self._start_perf
+            ):
+                self._pressure_samples_since_start += 1
+
     def _on_hardware_device_event(
         self,
         direction,
@@ -927,6 +1088,15 @@ class SessionDataRecorder:
         if not math.isfinite(event_perf):
             event_perf = float(perf_time)
         sequence_status = getattr(data, "board_sequence_status", None)
+        if kind_name == "PRESSURE_READING":
+            # Pressure is ~166 Hz across the two sensors and made up 98% of
+            # every device row a session wrote, which overran the shared
+            # ring in about ten minutes and buried the readings in a 93 MB
+            # CSV of mostly-empty columns. It gets its own compact stream.
+            self._record_pressure(
+                perf_time, wall_time, data, event_perf, board_aligned_perf,
+            )
+            return
         with self._lock:
             if len(self._device_rows) == self._device_rows.maxlen:
                 self._device_event_overruns += 1
@@ -1354,6 +1524,8 @@ class SessionDataRecorder:
         timing_plan=None,
         *,
         event_rows=(),
+        pressure_columns=None,
+        pressure_overruns=0,
         structured_event_overruns=0,
         device_event_overruns=0,
         source_manifest=(),
@@ -1387,6 +1559,9 @@ class SessionDataRecorder:
         )
         log_rows = tuple(
             row for row in log_rows if start_perf <= row[0] <= end_perf
+        )
+        pressure_columns = SessionDataRecorder._trim_pressure(
+            pressure_columns, start_perf, end_perf,
         )
         nidaq_perf = SessionDataRecorder._nidaq_perf_values(
             nidaq_chunks, start_perf, end_perf,
@@ -1683,6 +1858,47 @@ class SessionDataRecorder:
                 )
             ),
         )
+        pressure_nidaq_index = SessionDataRecorder._pressure_nidaq_indices(
+            pressure_columns["perf_time"], nidaq_chunks,
+        )
+        SessionDataRecorder._atomic_write_csv(
+            streams_dir / "pressure.csv", session_dir, metadata_generation_id,
+            ("perf_time", "offset_seconds", "wall_time", "instance",
+             "counts", "volts", "event_perf_time",
+             "event_offset_seconds", "board_aligned_perf_time",
+             "board_sequence", "board_time_us", "nidaq_sample_index"),
+            (
+                (
+                    float(perf),
+                    float(perf) - start_perf,
+                    float(wall),
+                    int(instance),
+                    int(counts),
+                    # The board reports raw 12-bit ADC counts; the volts
+                    # column saves every reader repeating the conversion.
+                    int(counts) / _PRESSURE_ADC_FULL_SCALE
+                    * _PRESSURE_REFERENCE_VOLTS,
+                    float(event_perf),
+                    float(event_perf) - start_perf,
+                    None if board_perf < 0 else float(board_perf),
+                    None if sequence < 0 else int(sequence),
+                    None if board_us < 0 else int(board_us),
+                    None if nidaq_index < 0 else int(nidaq_index),
+                )
+                for perf, wall, instance, counts, event_perf, board_perf,
+                    sequence, board_us, nidaq_index in zip(
+                        pressure_columns["perf_time"],
+                        pressure_columns["wall_time"],
+                        pressure_columns["instance"],
+                        pressure_columns["counts"],
+                        pressure_columns["event_perf_time"],
+                        pressure_columns["board_aligned_perf_time"],
+                        pressure_columns["board_sequence"],
+                        pressure_columns["board_time_us"],
+                        pressure_nidaq_index,
+                    )
+            ),
+        )
         SessionDataRecorder._annotate_tracking_event_files(
             streams_dir / "tracking",
             session_dir=session_dir,
@@ -1757,10 +1973,34 @@ class SessionDataRecorder:
             device_event_overruns=device_event_overruns,
         )
         incomplete_reasons = []
+        # The decoded device ring is a retention window, not an acquisition
+        # fault. It rolls once a session outlives the window - about ten
+        # minutes at the 171 events/s this rig produces - and a session was
+        # then marked incomplete purely for having run long, which says
+        # nothing about whether the cameras, the pose path or the writers
+        # did their job. Reported as retention below so the loss stays
+        # visible without being confused for a failure.
+        retention = []
         if device_event_overruns:
-            incomplete_reasons.append(
-                f"decoded device event ring overran by {device_event_overruns} event(s)"
-            )
+            retention.append({
+                "source": "device_events",
+                "stream": "device.csv",
+                "dropped": int(device_event_overruns),
+                "reason": "session outlived the decoded device event ring",
+            })
+            logging.getLogger(__name__).warning(
+                "device event ring rolled; the newest events were kept "
+                "and %s older one(s) were dropped", device_event_overruns)
+        if pressure_overruns:
+            retention.append({
+                "source": "pressure_samples",
+                "stream": "pressure.csv",
+                "dropped": int(pressure_overruns),
+                "reason": "session outlived the pellet-board FSR ring",
+            })
+            logging.getLogger(__name__).warning(
+                "pressure ring rolled; the newest samples were kept "
+                "and %s older one(s) were dropped", pressure_overruns)
         if structured_event_overruns:
             incomplete_reasons.append(
                 "structured application event queue overran by "
@@ -1781,7 +2021,11 @@ class SessionDataRecorder:
                 incomplete_reasons.append(
                     f"{source_id} reported {source['gapCount']} acquisition gap(s)"
                 )
-            if source["overrunCount"] and not str(source_id).startswith("nidaq."):
+            if (source["overrunCount"]
+                    and not str(source_id).startswith("nidaq.")
+                    and source_id != "device"):
+                # Same reasoning as the ring above: the device source's
+                # overrun is that ring rolling, counted a second time.
                 incomplete_reasons.append(
                     f"{source_id} overran by {source['overrunCount']} sample/event(s)"
                 )
@@ -1825,6 +2069,12 @@ class SessionDataRecorder:
                     start_perf,
                     "EventInfo performance index or EventManager enqueue time",
                 ),
+                "pressure": SessionDataRecorder._alignment_entry(
+                    "pressure.csv",
+                    pressure_columns["perf_time"],
+                    start_perf,
+                    "pellet-board FSR sample on time.perf_counter",
+                ),
                 "laser": SessionDataRecorder._alignment_entry(
                     "laser.csv",
                     tuple(row[0] for row in laser_rows),
@@ -1849,6 +2099,7 @@ class SessionDataRecorder:
             ),
             "deviceEventOverruns": int(device_event_overruns),
             "structuredEventOverruns": int(structured_event_overruns),
+            "retentionLimited": retention,
             "sessionComplete": not incomplete_reasons,
             "incompleteReasons": incomplete_reasons,
             "enabledSources": finalized_sources,
@@ -1891,6 +2142,7 @@ class SessionDataRecorder:
             streams_dir / "trials.jsonl",
             streams_dir / "trial_summary.json",
             streams_dir / "laser.csv",
+            streams_dir / "pressure.csv",
             logs_dir / "session.log",
             streams_dir / "alignment.json",
             streams_dir / "camera_alignment.json",
@@ -1922,6 +2174,7 @@ class SessionDataRecorder:
             "toneConfirmation": tone_confirmation,
             "deviceEventOverruns": int(device_event_overruns),
             "structuredEventOverruns": int(structured_event_overruns),
+            "retentionLimited": retention,
             "sessionComplete": not incomplete_reasons,
             "incompleteReasons": tuple(incomplete_reasons),
             "enabledSources": finalized_sources,
@@ -2139,6 +2392,41 @@ class SessionDataRecorder:
                 )
 
     @staticmethod
+    def _trim_pressure(columns, start_perf, end_perf):
+        """Keep only the FSR samples inside the recorded boundary."""
+        empty = {name: np.zeros(0, dtype=dtype) for name, dtype in _PRESSURE_FIELDS}
+        if not columns:
+            return empty
+        perf = columns["perf_time"]
+        if perf.size == 0:
+            return empty
+        # The ring is appended in acquisition order, so the window is a slice.
+        first = int(np.searchsorted(perf, start_perf, side="left"))
+        last = int(np.searchsorted(perf, end_perf, side="right"))
+        return {name: column[first:last] for name, column in columns.items()}
+
+    @staticmethod
+    def _pressure_nidaq_indices(perf, chunks):
+        """Map each pressure sample onto the NI-DAQ sample it landed within.
+
+        Both clocks are time.perf_counter, so this is a lookup in the NI-DAQ
+        timeline rather than a fit. Samples outside the NI-DAQ window get -1,
+        which keeps the column integral and honest about not having a match.
+        """
+        missing = np.full(perf.shape, -1, dtype=np.int64)
+        if perf.size == 0:
+            return missing
+        _, indices, nidaq_perf, _, _ = SessionDataRecorder._nidaq_arrays(
+            chunks, requested_names=(),
+        )
+        if indices.size == 0 or nidaq_perf.size == 0:
+            return missing
+        position = np.searchsorted(nidaq_perf, perf, side="right") - 1
+        inside = (position >= 0) & (position < indices.size)
+        missing[inside] = indices[position[inside]]
+        return missing
+
+    @staticmethod
     def _nidaq_perf_values(chunks, start_perf, end_perf):
         if isinstance(chunks, _NidaqSpoolSnapshot):
             with h5py.File(chunks.path, "r") as source:
@@ -2195,11 +2483,24 @@ class SessionDataRecorder:
             with h5py.File(chunks.path, "r") as source:
                 indices = source["sample_index"][:]
                 perf = source["perf_time"][:]
-                values = (
-                    source["values"][rows, :]
-                    if rows
-                    else np.empty((0, len(indices)), dtype=np.float32)
-                )
+                if rows:
+                    # h5py only accepts a strictly increasing fancy index, and
+                    # these rows are in the order the caller asked for, not the
+                    # order the channels were stored in. Those differ on a real
+                    # rig - tone1 is stored after cam_frames but requested
+                    # before it - so reading them directly raised
+                    # "Indexing elements must be in increasing order" and took
+                    # the whole session finalization down with it, leaving the
+                    # recording without its metadata.
+                    #
+                    # So read ascending, then put the rows back in the
+                    # requested order. np.unique also collapses a repeated
+                    # channel, which the index would reject for the same
+                    # reason, and its inverse restores the repeat.
+                    ascending, restore = np.unique(rows, return_inverse=True)
+                    values = source["values"][ascending.tolist(), :][restore]
+                else:
+                    values = np.empty((0, len(indices)), dtype=np.float32)
             return selected_names, indices, perf, values, chunks.sample_rate_hz
         names = next((tuple(chunk[4]) for chunk in chunks if chunk[4]), tuple())
         selected = tuple(

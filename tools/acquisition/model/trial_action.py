@@ -12,14 +12,60 @@ import time
 import uuid
 from typing import Callable, Mapping, Optional, Tuple
 
+from autotrainer.core.logging import get_verbose_logger
+from autotrainer.core.stimulus_trigger_profile import (
+    StimulusTriggerCategory,
+    profile_record as stimulus_trigger_profile_record,
+    select_trigger,
+    validate_profile as validate_stimulus_trigger_profile,
+)
+
+from autotrainer.core.delay_distribution import (
+    EXPONENTIAL_CDF_TAU_MS,
+    DelayDistributionProfile,
+    DelayPreset,
+    build_delay_distribution_profile,
+    normalize_delay_preset,
+    preset_values,
+    select_delay,
+)
+
+from tools.acquisition.model.cue_timer import CueTimer
+from tools.acquisition.model.cue_timing import (
+    CueCancelReason,
+    CueDecision,
+    CueGateState,
+    CueTimingConfiguration,
+    CueTimingPolicy,
+)
+from tools.acquisition.model.reach_state_source import ReachStateResolver
+
 from tools.acquisition.model.trial_protocol_schedule import (
+    OFFSET_STIMULUS_TRIGGERS,
     LaserTriggerRoute,
     PelletLane,
     PelletPositionMode,
     RetryAssignment,
     StimulusAssignment,
+    StimulusTrigger,
     TrialProtocolRow,
 )
+
+
+logger = get_verbose_logger(__name__)
+
+
+# How long an unlocked trial keeps waiting for a blocked gate before giving up.
+# CueTimingPolicy deliberately waits indefinitely and leaves that decision to
+# its caller, so the bound lives here.
+DEFAULT_CUE_MAX_WAIT_SECONDS = 5.0
+
+# How often the gate is re-read while an unlocked trial waits out a block.
+DEFAULT_CUE_POLL_SECONDS = 0.010
+
+# A Tone 2 transport slower than this dominates the cue interval error and is
+# worth a log line. The host timer contributes microseconds by comparison.
+DEFAULT_CUE_TRANSPORT_WARN_SECONDS = 0.002
 
 
 @dataclasses.dataclass(frozen=True)
@@ -37,6 +83,104 @@ class ToneProfile:
 
     def to_record(self):
         return dataclasses.asdict(self)
+
+
+@dataclasses.dataclass(frozen=True)
+class CueIntervalProfile:
+    """Reusable Tone 1 to Tone 2 interval distribution.
+
+    The profile owns the configuration; the resolved probability weights are
+    derived by :mod:`autotrainer.core.delay_distribution` so the published
+    supports stay in one place.
+    """
+
+    profile_id: str
+    revision: int
+    preset: str = DelayPreset.PUBLISHED_4S.value
+    values: Tuple[int, ...] = ()
+    tau_ms: int = EXPONENTIAL_CDF_TAU_MS
+    manual_probabilities: Optional[Tuple[float, ...]] = None
+
+    def __post_init__(self):
+        if not self.profile_id:
+            raise ValueError("Cue interval profile ID cannot be empty")
+        if self.revision < 1:
+            raise ValueError("Cue interval profile revision must be positive")
+        # Build once so a malformed profile fails at construction rather than
+        # part-way through compiling a trial.
+        self.distribution()
+
+    def distribution(self) -> DelayDistributionProfile:
+        """Return the resolved distribution for this profile."""
+
+        preset = normalize_delay_preset(self.preset)
+        values = self.values or preset_values(preset)
+        if not values:
+            raise ValueError(
+                f"Cue interval profile {self.profile_id!r} requires cue intervals"
+            )
+        return build_delay_distribution_profile(
+            values,
+            preset,
+            tau_ms=self.tau_ms,
+            manual_probabilities=self.manual_probabilities,
+        )
+
+    def to_record(self):
+        record = dataclasses.asdict(self)
+        record["values"] = list(self.values)
+        if self.manual_probabilities is not None:
+            record["manual_probabilities"] = list(self.manual_probabilities)
+        return record
+
+
+@dataclasses.dataclass(frozen=True)
+class StimulusTriggerProfile:
+    """Reusable weighted set of stimulus trigger categories.
+
+    Weights are conditional on stimulation already having been selected for
+    the trial, so they total 100% among enabled categories.
+    """
+
+    profile_id: str
+    revision: int
+    categories: Tuple[StimulusTriggerCategory, ...] = ()
+
+    def __post_init__(self):
+        if not self.profile_id:
+            raise ValueError("Stimulus trigger profile ID cannot be empty")
+        if self.revision < 1:
+            raise ValueError("Stimulus trigger profile revision must be positive")
+        object.__setattr__(
+            self,
+            "categories",
+            tuple(
+                item
+                if isinstance(item, StimulusTriggerCategory)
+                else StimulusTriggerCategory(**dict(item))
+                for item in self.categories
+            ),
+        )
+        for category in self.categories:
+            trigger = StimulusTrigger(category.trigger)
+            if category.is_offset_trigger and trigger not in OFFSET_STIMULUS_TRIGGERS:
+                raise ValueError(
+                    f"{trigger.value} stimulus triggers do not take a lead time"
+                )
+        # Reject an unusable profile at construction rather than mid-trial.
+        validate_stimulus_trigger_profile(self.categories)
+
+    def validated(self, *, offset_upper_bound_ms: Optional[int] = None):
+        return validate_stimulus_trigger_profile(
+            self.categories, offset_upper_bound_ms=offset_upper_bound_ms
+        )
+
+    def to_record(self):
+        return {
+            "profile_id": self.profile_id,
+            "revision": self.revision,
+            **stimulus_trigger_profile_record(self.categories),
+        }
 
 
 @dataclasses.dataclass(frozen=True)
@@ -128,6 +272,17 @@ class CompiledTrialRecipe:
     stimulus_draw: float
     tone_profile: Optional[ToneProfile]
     laser_profile: Optional[LaserPulseProfile]
+    cue_tone_profile: Optional[ToneProfile] = None
+    cue_interval_ms: Optional[int] = None
+    cue_interval_seed: Optional[int] = None
+    cue_interval_draw: Optional[float] = None
+    cue_interval_selection: Optional[Mapping[str, object]] = None
+    cue_interval_distribution: Optional[Mapping[str, object]] = None
+    resolved_stimulus_trigger: str = StimulusTrigger.NONE.value
+    resolved_trigger_offset_ms: int = 0
+    stimulus_trigger_seed: Optional[int] = None
+    stimulus_trigger_draw: Optional[float] = None
+    stimulus_trigger_selection: Optional[Mapping[str, object]] = None
 
     def to_record(self):
         return {
@@ -147,6 +302,33 @@ class CompiledTrialRecipe:
             "stimulus_draw": self.stimulus_draw,
             "tone_profile": None if self.tone_profile is None else self.tone_profile.to_record(),
             "laser_profile": None if self.laser_profile is None else self.laser_profile.to_record(),
+            "cue_tone_profile": (
+                None
+                if self.cue_tone_profile is None
+                else self.cue_tone_profile.to_record()
+            ),
+            "cue_interval_ms": self.cue_interval_ms,
+            "cue_interval_seed": self.cue_interval_seed,
+            "cue_interval_draw": self.cue_interval_draw,
+            "cue_interval_selection": (
+                None
+                if self.cue_interval_selection is None
+                else dict(self.cue_interval_selection)
+            ),
+            "cue_interval_distribution": (
+                None
+                if self.cue_interval_distribution is None
+                else dict(self.cue_interval_distribution)
+            ),
+            "resolved_stimulus_trigger": self.resolved_stimulus_trigger,
+            "resolved_trigger_offset_ms": self.resolved_trigger_offset_ms,
+            "stimulus_trigger_seed": self.stimulus_trigger_seed,
+            "stimulus_trigger_draw": self.stimulus_trigger_draw,
+            "stimulus_trigger_selection": (
+                None
+                if self.stimulus_trigger_selection is None
+                else dict(self.stimulus_trigger_selection)
+            ),
         }
 
 
@@ -158,10 +340,14 @@ class TrialActionCompiler:
         *,
         tone_profiles: Mapping[str, ToneProfile] = None,
         laser_profiles: Mapping[str, LaserPulseProfile] = None,
+        cue_interval_profiles: Mapping[str, CueIntervalProfile] = None,
+        stimulus_trigger_profiles: Mapping[str, StimulusTriggerProfile] = None,
         dcs_to_motor: Callable[[Tuple[float, float, float]], Tuple[float, float, float]],
     ):
         self._tone_profiles = dict(tone_profiles or {})
         self._laser_profiles = dict(laser_profiles or {})
+        self._cue_interval_profiles = dict(cue_interval_profiles or {})
+        self._stimulus_trigger_profiles = dict(stimulus_trigger_profiles or {})
         self._dcs_to_motor = dcs_to_motor
 
     def compile(self, row: TrialProtocolRow, context: TrialCompileContext):
@@ -240,6 +426,82 @@ class TrialActionCompiler:
             tone = self._tone_profiles.get(row.tone_profile_id)
             if tone is None:
                 raise ValueError(f"Unknown tone profile {row.tone_profile_id!r}")
+        cue_tone = None
+        cue_interval_ms = None
+        cue_interval_seed = None
+        cue_interval_draw = None
+        cue_interval_selection = None
+        cue_interval_distribution = None
+        if row.cue_tone_profile_id:
+            cue_tone = self._tone_profiles.get(row.cue_tone_profile_id)
+            if cue_tone is None:
+                raise ValueError(
+                    f"Unknown cue tone profile {row.cue_tone_profile_id!r}"
+                )
+            if row.cue_interval_profile_id:
+                interval_profile = self._cue_interval_profiles.get(
+                    row.cue_interval_profile_id
+                )
+                if interval_profile is None:
+                    raise ValueError(
+                        "Unknown cue interval profile "
+                        f"{row.cue_interval_profile_id!r}"
+                    )
+                distribution = interval_profile.distribution()
+                # A separate seed domain keeps the cue interval independent of
+                # the stimulus draw for the same trial.
+                cue_interval_seed = _domain_seed(row, context, "cue_interval")
+                cue_interval_draw = _stable_draw(cue_interval_seed)
+                selection = select_delay(distribution, cue_interval_draw)
+                cue_interval_ms = selection.delay_ms
+                cue_interval_selection = selection.to_record()
+                cue_interval_distribution = distribution.to_record()
+            else:
+                cue_interval_ms = int(row.cue_interval_fixed_ms)
+
+        resolved_trigger = row.stimulus_trigger
+        resolved_offset_ms = int(row.pre_reveal_ms)
+        stimulus_trigger_seed = None
+        stimulus_trigger_draw = None
+        stimulus_trigger_selection = None
+        if row.stimulus_assignment is StimulusAssignment.RANDOMIZED:
+            trigger_profile = self._stimulus_trigger_profiles.get(
+                row.stimulus_trigger_profile_id
+            )
+            if trigger_profile is None:
+                raise ValueError(
+                    "Unknown stimulus trigger profile "
+                    f"{row.stimulus_trigger_profile_id!r}"
+                )
+            # A Tone 2 lead time has to fit inside the shortest cue interval
+            # this row can draw, otherwise it could never be delivered.
+            categories = trigger_profile.validated(
+                offset_upper_bound_ms=_shortest_cue_interval(
+                    row, cue_interval_ms, cue_interval_distribution
+                )
+            )
+            for category in categories:
+                if (
+                    category.enabled
+                    and StimulusTrigger(category.trigger) is StimulusTrigger.TONE_2
+                    and not row.cue_tone_profile_id
+                ):
+                    raise ValueError(
+                        "Tone 2 stimulus triggers require a configured cue tone"
+                    )
+            if selected:
+                stimulus_trigger_seed = _domain_seed(
+                    row, context, "stimulus_trigger"
+                )
+                stimulus_trigger_draw = _stable_draw(stimulus_trigger_seed)
+                selection = select_trigger(categories, stimulus_trigger_draw)
+                resolved_trigger = StimulusTrigger(selection.category.trigger)
+                resolved_offset_ms = int(selection.category.offset_ms or 0)
+                stimulus_trigger_selection = selection.to_record()
+            else:
+                resolved_trigger = StimulusTrigger.NONE
+                resolved_offset_ms = 0
+
         laser = None
         if row.laser_profile_id:
             laser = self._laser_profiles.get(row.laser_profile_id)
@@ -248,8 +510,8 @@ class TrialActionCompiler:
             if laser.trigger_route is not row.laser_trigger_route:
                 raise ValueError("Protocol row and laser profile trigger routes differ")
             if (
-                row.stimulus_trigger.value == "pre_reveal"
-                and int(laser.trigger_pulse_us) >= int(row.pre_reveal_ms) * 1000
+                resolved_trigger is StimulusTrigger.PRE_REVEAL
+                and int(laser.trigger_pulse_us) >= resolved_offset_ms * 1000
             ):
                 raise ValueError(
                     "Pre-reveal interval must be longer than the STIM3 trigger pulse"
@@ -274,6 +536,17 @@ class TrialActionCompiler:
             stimulus_draw=stimulus_draw,
             tone_profile=tone,
             laser_profile=laser,
+            cue_tone_profile=cue_tone,
+            cue_interval_ms=cue_interval_ms,
+            cue_interval_seed=cue_interval_seed,
+            cue_interval_draw=cue_interval_draw,
+            cue_interval_selection=cue_interval_selection,
+            cue_interval_distribution=cue_interval_distribution,
+            resolved_stimulus_trigger=resolved_trigger.value,
+            resolved_trigger_offset_ms=resolved_offset_ms,
+            stimulus_trigger_seed=stimulus_trigger_seed,
+            stimulus_trigger_draw=stimulus_trigger_draw,
+            stimulus_trigger_selection=stimulus_trigger_selection,
         )
 
 
@@ -383,6 +656,14 @@ class TrialActionExecutor:
         trigger_hardware_stimulus: Callable[
             [LaserPulseProfile, CompiledTrialRecipe, str], object
         ] = lambda _profile, _recipe, _detail: None,
+        cue_timing_configuration: Optional[CueTimingConfiguration] = None,
+        reach_state_resolver: Optional[ReachStateResolver] = None,
+        pellet_presence_provider: Optional[Callable[[], object]] = None,
+        cue_timer_factory: Optional[Callable[[], CueTimer]] = None,
+        cue_max_wait_seconds: float = DEFAULT_CUE_MAX_WAIT_SECONDS,
+        cue_poll_seconds: float = DEFAULT_CUE_POLL_SECONDS,
+        cue_transport_warn_seconds: float = DEFAULT_CUE_TRANSPORT_WARN_SECONDS,
+        clock: Callable[[], float] = time.perf_counter,
     ):
         self._move_absolute = move_absolute
         self._configure_cover = configure_cover
@@ -399,6 +680,21 @@ class TrialActionExecutor:
         self._laser_handle = None
         self._detector_handle = None
         self._send_context: Optional[str] = None
+
+        # Cue pair. The policy owns the decision, the timer owns the deadline,
+        # and this owner only routes between them. All of it is inert unless a
+        # recipe carries both a cue tone and a drawn cue interval.
+        self._cue_policy = CueTimingPolicy(cue_timing_configuration)
+        self._reach_state = reach_state_resolver
+        self._pellet_presence_provider = pellet_presence_provider
+        self._cue_timer_factory = cue_timer_factory or CueTimer
+        self._cue_max_wait_seconds = max(0.0, float(cue_max_wait_seconds))
+        self._cue_poll_seconds = max(0.001, float(cue_poll_seconds))
+        self._cue_transport_warn_seconds = max(0.0, float(cue_transport_warn_seconds))
+        self._clock = clock
+        self._cue_timer: Optional[CueTimer] = None
+        self._cue_recipe: Optional[CompiledTrialRecipe] = None
+        self._cue_expiry: Optional[float] = None
 
     @property
     def operation(self):
@@ -492,6 +788,8 @@ class TrialActionExecutor:
             if recipe.tone_profile is not None and row["tone_phase"] == phase:
                 self._play_tone(recipe.tone_profile, phase)
                 self._observe(f"{phase} tone acknowledged")
+                # Tone 1 has just sounded, so the cue interval starts here.
+                self._arm_cue_pair(recipe, phase)
             # A laser is already armed. Phase execution records the semantic
             # trigger point; the configured STIM3/NI route owns physical start.
             if recipe.laser_profile is not None and row["laser_phase"] == phase:
@@ -530,6 +828,7 @@ class TrialActionExecutor:
     def complete(self, detail=""):
         with self._lock:
             operation = self._require_current()
+            self._cancel_cue_pair()
             self._await_laser_terminal_for_cycle()
             if operation.state is PreparedState.SEND_ACCEPTED:
                 operation.transition(PreparedState.ACTIVE, "cycle completion")
@@ -544,6 +843,7 @@ class TrialActionExecutor:
     def fail(self, error):
         with self._lock:
             operation = self._require_current()
+            self._cancel_cue_pair(CueCancelReason.HOST_REQUEST)
             self._cancel_laser_safely()
             self._cancel_detector_safely()
             if operation.state not in PreparedTrialOperation.TERMINAL:
@@ -560,11 +860,200 @@ class TrialActionExecutor:
                 return None
             if generation is not None:
                 operation.require_generation(generation)
+            self._cancel_cue_pair(CueCancelReason.HOST_REQUEST)
             self._cancel_laser_safely()
             self._cancel_detector_safely()
             if operation.state not in PreparedTrialOperation.TERMINAL:
                 operation.transition(PreparedState.CANCELLED, reason)
             return operation
+
+    # --- cue pair -----------------------------------------------------------
+
+    def _arm_cue_pair(self, recipe: CompiledTrialRecipe, phase: str) -> None:
+        """
+        Start the Tone 1 to Tone 2 interval, if this recipe has one.
+
+        Only for a host-played tone. When the tone phase is
+        ``embedded_in_sequence`` the pellet board owns the sequence timing, and
+        a host timer would be describing a cue it does not deliver.
+        """
+        cue_tone = recipe.cue_tone_profile
+        interval_ms = recipe.cue_interval_ms
+        if cue_tone is None or not interval_ms:
+            return
+        if phase == "embedded_in_sequence":
+            self._observe(
+                "cue pair not host-timed: the board owns the embedded sequence"
+            )
+            return
+
+        self._cancel_cue_pair()
+        tone_1_perf_time = self._clock()
+        deadline = self._cue_policy.start(tone_1_perf_time, interval_ms)
+        self._cue_recipe = recipe
+        self._cue_expiry = deadline + self._cue_max_wait_seconds
+        self._observe(f"cue pair armed: Tone 2 due in {interval_ms} ms")
+        self._schedule_cue(deadline)
+
+    def _schedule_cue(self, deadline_perf_time: float) -> None:
+        # A fresh timer per arm: the previous one's thread is the caller when
+        # this runs from a WAIT re-arm, and a timer refuses to reschedule while
+        # its own thread is still alive.
+        timer = self._cue_timer = self._cue_timer_factory()
+        timer.schedule(deadline_perf_time, self._on_cue_deadline)
+
+    def _cancel_cue_pair(self, reason: Optional[CueCancelReason] = None) -> None:
+        timer, self._cue_timer = self._cue_timer, None
+        if timer is not None:
+            timer.cancel()
+        if reason is not None and self._cue_policy.is_started:
+            evaluation = self._cue_policy.cancel(reason)
+            self._observe_safely(f"Tone 2 cancelled: {evaluation.reason.value}")
+        else:
+            self._cue_policy.reset()
+        self._cue_recipe = None
+        self._cue_expiry = None
+
+    def _cue_gate_state(self, now_perf_time: float) -> CueGateState:
+        """
+        Build one gate observation from whatever evidence is available.
+
+        ``observed_at`` is the *oldest* contributing observation, so staleness
+        is judged by the least fresh evidence rather than the freshest. With no
+        provider at all the observation is "now with nothing known", which the
+        policy treats as unknown presence rather than as a clear gate.
+        """
+        pellet_present = None
+        reach_active = False
+        observed_at = now_perf_time
+
+        provider = self._pellet_presence_provider
+        if provider is not None:
+            try:
+                observation = provider()
+            except Exception as err:
+                logger.warning("pellet presence provider failed: %s", err)
+                observation = None
+            if observation is not None:
+                try:
+                    pellet_present, presence_at = observation
+                    observed_at = min(observed_at, float(presence_at))
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "pellet presence provider returned %r, expected (present, time)",
+                        observation,
+                    )
+                    pellet_present = None
+
+        if self._reach_state is not None:
+            reach = self._reach_state.observe(now_perf_time)
+            if reach is not None:
+                reach_active, reach_at = reach
+                observed_at = min(observed_at, reach_at)
+
+        return CueGateState(
+            observed_at=observed_at,
+            pellet_present=pellet_present,
+            reach_active=reach_active,
+        )
+
+    def _on_cue_deadline(self, fired_at: float, lateness_seconds: float) -> None:
+        with self._lock:
+            recipe = self._cue_recipe
+            if recipe is None or not self._cue_policy.is_started:
+                return  # completed, failed or cancelled while the timer waited
+
+            gate = self._cue_gate_state(fired_at)
+            try:
+                evaluation = self._cue_policy.evaluate(fired_at, gate)
+            except Exception as err:
+                logger.exception("cue evaluation failed: %s", err)
+                self._observe_safely(f"Tone 2 abandoned: {type(err).__name__}")
+                self._cancel_cue_pair()
+                return
+
+            if evaluation.decision is CueDecision.FIRE:
+                self._fire_cue_tone(recipe, lateness_seconds, evaluation)
+                self._cancel_cue_pair()
+                return
+
+            if evaluation.decision is CueDecision.SKIP_AND_RESET:
+                self._observe_safely(
+                    f"Tone 2 skipped and reset: {evaluation.reason.value}"
+                )
+                self._cancel_cue_pair()
+                return
+
+            # WAIT. An unlocked trial may wait out a genuine block, but not
+            # forever, so the caller-owned bound applies here.
+            if self._cue_expiry is not None and fired_at >= self._cue_expiry:
+                self._observe_safely(
+                    "Tone 2 abandoned: the gate never cleared within "
+                    f"{self._cue_max_wait_seconds:g}s"
+                )
+                self._cancel_cue_pair(CueCancelReason.HOST_REQUEST)
+                return
+
+            delay = evaluation.remaining_seconds or self._cue_poll_seconds
+            self._schedule_cue(fired_at + max(delay, 0.0))
+
+    def _fire_cue_tone(self, recipe, lateness_seconds, evaluation) -> None:
+        """
+        Send Tone 2 and record what the delivery actually cost.
+
+        Both halves of the delay are measured, because only their sum is the
+        error in the cue interval:
+
+          scheduling   how late this ran against the deadline, sub-microsecond
+                       on a host timer that spins out the last 2 ms
+          transport    how long ``play_tone`` took, which for a CAN-routed tone
+                       is a command queue plus a firmware acknowledgement
+
+        The transport half is not compensated for by firing early. That would
+        mean committing to the cue before the gate is read at the deadline,
+        which is precisely what Lock Timing exists to prevent. Compensation is
+        only sound where the cue is not gated, or where the firmware can accept
+        a scheduled tone that is still cancellable.
+
+        The acknowledgement is not the tone. This measures when the board
+        confirmed the command, not when sound was produced, so it bounds the
+        host-side contribution and no more. Delivery itself still has to be
+        validated against recorded NI-DAQ edges.
+        """
+        send_started = self._clock()
+        try:
+            self._play_tone(recipe.cue_tone_profile, "tone_2")
+        except Exception as err:
+            transport_ms = (self._clock() - send_started) * 1000.0
+            logger.exception("Tone 2 send failed after %.3f ms: %s", transport_ms, err)
+            self._observe_safely(
+                f"Tone 2 send failed after {transport_ms:.3f} ms: "
+                f"{type(err).__name__}: {err}"
+            )
+            return
+
+        transport_seconds = self._clock() - send_started
+        total_ms = (lateness_seconds + transport_seconds) * 1000.0
+        detail = (
+            f"Tone 2 acknowledged {total_ms:.3f} ms after its deadline "
+            f"(scheduling {lateness_seconds * 1000.0:.3f} ms, "
+            f"transport {transport_seconds * 1000.0:.3f} ms)"
+        )
+        if evaluation.extension_seconds:
+            detail += f", extended {evaluation.extension_seconds * 1000.0:.3f} ms"
+        self._observe_safely(detail)
+        if transport_seconds > self._cue_transport_warn_seconds:
+            logger.warning(
+                "Tone 2 transport took %.3f ms, which is the dominant term in the "
+                "cue interval error", transport_seconds * 1000.0,
+            )
+
+    def _observe_safely(self, detail):
+        """Record an observation from the timer thread, tolerating a finished trial."""
+        try:
+            self._observe(detail)
+        except Exception:
+            logger.debug("cue observation dropped, no current operation: %s", detail)
 
     def _observe(self, detail):
         operation = self._require_current()
@@ -667,18 +1156,48 @@ def _add(left, right):
     return tuple(a + b for a, b in zip(left, right))
 
 
-def _stimulus_seed(row, context):
-    attempt_component = (
+def _shortest_cue_interval(row, cue_interval_ms, distribution_record):
+    """Return the shortest cue interval this row can produce, if it has one."""
+
+    if not row.cue_tone_profile_id:
+        return None
+    if distribution_record:
+        values = distribution_record.get("values") or ()
+        return min(int(value) for value in values) if values else None
+    return None if cue_interval_ms is None else int(cue_interval_ms)
+
+
+def _attempt_component(row, context):
+    return (
         context.attempt_id
         if row.retry_assignment is RetryAssignment.RESAMPLE
         else 0
     )
+
+
+def _stimulus_seed(row, context):
+    # The payload is deliberately untagged so previously recorded stimulus
+    # seeds and draws remain reproducible.
     payload = json.dumps((
         int(context.session_seed),
         context.protocol_id,
         int(context.protocol_revision),
         int(context.logical_trial_id),
-        int(attempt_component),
+        int(_attempt_component(row, context)),
+    ), separators=(",", ":"), ensure_ascii=True).encode("ascii")
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
+
+
+def _domain_seed(row, context, domain):
+    """Return an independent seed stream for one named draw domain."""
+
+    payload = json.dumps((
+        str(domain),
+        int(context.session_seed),
+        context.protocol_id,
+        int(context.protocol_revision),
+        int(context.logical_trial_id),
+        int(_attempt_component(row, context)),
     ), separators=(",", ":"), ensure_ascii=True).encode("ascii")
     return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
 

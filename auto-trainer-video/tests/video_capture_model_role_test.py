@@ -1,9 +1,15 @@
 from urllib.parse import parse_qs, urlsplit
 
+import pytest
+
 
 def test_spinnaker_runtime_role_does_not_mutate_configured_role(
     video_capture_model,
 ):
+    # Parsing a spinnaker:// URL reaches VideoManager.parse_params, which
+    # resolves the camera class to read its default_params and so imports the
+    # SDK. See the note in spinnaker_cam_test.py.
+    pytest.importorskip("PySpin")
     configuration = video_capture_model.save_configuration()
     configuration.scheme = "spinnaker"
     configuration.host = "24095781"

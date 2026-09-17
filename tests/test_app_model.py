@@ -32,6 +32,9 @@ from tools.acquisition.model.app_model import (
 )
 from tools.acquisition.model.app_model_status import AppModelStatus, SessionRecordingStatus
 from tools.acquisition.model.session_boundary import SessionBoundary
+from tools.acquisition.model.stimulus_profile_repository import (
+    PROFILE_SCHEMA_VERSION,
+)
 from tools.acquisition.model.intertrial_analysis import (
     IntertrialAnalysisRequest,
     IntertrialAnalysisResult,
@@ -1518,7 +1521,9 @@ def test_final_metadata_uses_canonical_boundary_not_stale_project_timestamp(
     assert saved["boundary"]["endPerfTime"] == 12.0
     assert saved["boundary"]["durationSeconds"] == 2.0
     assert saved["recording"]["stopReason"] == "ManualStop"
-    assert saved["stimulusProfileLibrary"]["schema_version"] == 2
+    assert saved["stimulusProfileLibrary"]["schema_version"] == (
+        PROFILE_SCHEMA_VERSION
+    )
     assert saved["stimulusProfileLibrary"]["automatic_shift_profiles"][0][
         "policy_id"
     ] == "default"
@@ -1542,6 +1547,21 @@ def test_final_metadata_uses_canonical_boundary_not_stale_project_timestamp(
     assert len(serialized_json) < 20_000
     assert saved["artifacts"]["alignment"]["$ref"] == "streams/alignment.json"
     assert saved["artifacts"]["trialSummary"]["$ref"] == "streams/trial_summary.json"
+    # The live counters the operator watched are kept with the session, so the
+    # same numbers can be read back afterwards rather than only having existed
+    # on screen.
+    assert set(saved["capture"]) >= {
+        "elapsedSeconds",
+        "framesAcquired",
+        "framesDropped",
+        "framesDroppedByCamera",
+        "framesInferenced",
+        "inferencedPercent",
+        "inferenceCallMeanMs",
+        "inferenceCallMaxMs",
+        "sensorToResultMeanMs",
+        "sensorToResultMaxMs",
+    }
     manifest = json.loads((session_dir / "manifest.json").read_text())
     assert saved["metadataGenerationId"] == manifest["metadataGenerationId"]
     assert manifest["authoritativeMetadata"] == "metadata.json"

@@ -8,6 +8,7 @@ from typing import List, Dict, Optional, Tuple, Literal
 from collections import namedtuple, defaultdict
 from dataclasses import dataclass
 
+import cv2
 import numpy
 import pandas
 
@@ -17,7 +18,10 @@ from autotrainer.core.logging import get_verbose_logger
 from autotrainer.inference.config import StereoParams
 from autotrainer.core.pose_elements import SceneElement, AllHandsParts, ScenePartsPresenceContext, AllSceneParts
 
-from autotrainer.inference.analysis.prepare_jetson_data import process_hand_data, reorient_and_center_step1
+from autotrainer.inference.analysis.prepare_jetson_data import (
+    process_hand_data, reorient_and_center_step1, rotate_3d_points,
+    _undistort_points,
+)
 
 
 logger = get_verbose_logger(__name__)
@@ -165,7 +169,12 @@ class PoseAlgorithm:
     The PoseResponse returned by the PoseAlgorithm captures the interpreted values (e.g., "mouse seen" which may be
     some function of multiple parts being present and/or at different confidence levels).
     """
-    # TODO Configurable properties
+    # Calibrated for the DeepLabCut TensorFlow engine, whose likelihood is a
+    # saturated 1.0, so these have never rejected anything on that engine. The
+    # PyTorch engine reports a real distribution around 0.77 and would lose
+    # ~92% of keypoints at 0.9, so the effective value is injected per backend
+    # by whoever constructs this. These remain the fallback.
+    # See autotrainer.inference.backend_selection.confidence_threshold.
     MIN_CONFIDENCE_PLOT_THRESHOLD = 0.9
     MIN_CONFIDENCE_PRESENT_THRESHOLD = 0.9
 
@@ -180,8 +189,21 @@ class PoseAlgorithm:
         cam_names: Optional[List[str]] = None,
         square_size: Optional[int] = None,
         cam_offsets: Optional[List[float]] = None,
+        confidence_threshold: Optional[float] = None,
     ):
         super().__init__()
+        # None keeps the class defaults, so every existing caller and test is
+        # unaffected and only a backend-aware caller changes behaviour.
+        self._present_threshold = (
+            self.MIN_CONFIDENCE_PRESENT_THRESHOLD
+            if confidence_threshold is None
+            else float(confidence_threshold)
+        )
+        self._plot_threshold = (
+            self.MIN_CONFIDENCE_PLOT_THRESHOLD
+            if confidence_threshold is None
+            else float(confidence_threshold)
+        )
         self._parts_list: List[str] = []
         self._parts: Dict[str, int] = {}  # key is part name, value is part model index
         self._sequence = 0
@@ -202,6 +224,26 @@ class PoseAlgorithm:
         self._hands_columns = pandas.MultiIndex.from_product([
             [SceneElement.R_Hand, SceneElement.L_Hand], axis_labels],
             names=['bodyparts', 'coordinates'])
+        # Where each hand's x, y and likelihood sit inside _hands_columns.
+        # MultiIndex.from_product sorts its levels, so these are looked up
+        # rather than assumed. They let the live path read the winning row
+        # out of a numpy view instead of indexing pandas per hand per camera.
+        # Cache for the triangulation column index, keyed by the mask of
+        # confident parts; see _handle_3d_triangulate.
+        self._confident_columns_cache = {}
+        # The live 3D path's constants and its precondition check, both
+        # resolved on first use; see _live_3d_reason.
+        self._live_3d_cache = None
+        self._live_3d_reason_cache = self._UNRESOLVED
+        # Which rows of a pose frame hold each hand's sub-parts.
+        # Filled by initialize(), once the part order is known.
+        self._hand_part_indices = {}
+        self._hand_value_columns = {
+            elem: tuple(
+                self._hands_columns.get_loc((elem, axis)) for axis in axis_labels
+            )
+            for elem in (SceneElement.R_Hand, SceneElement.L_Hand)
+        }
         self._hands_input_parts = list(AllHandsParts)
         self._hands_input_columns = pandas.MultiIndex.from_product(
             [self._hands_input_parts, axis_labels], names=['bodyparts', 'coordinates']
@@ -220,6 +262,17 @@ class PoseAlgorithm:
             [self._measure_offset_parts, axis_labels],
             names=self._3d_names,
         )
+        # MultiIndex.from_product sorts its levels, and the original pandas
+        # path iterated `columns.levels[0]`. Triangulation input order depends
+        # on it, so cache that ordering rather than reproducing the sort per
+        # live batch.
+        self._measure_offset_level_parts = list(
+            self._measure_offset_parts_columns.levels[0]
+        )
+        self._measure_offset_level_order = [
+            self._measure_offset_parts.index(part)
+            for part in self._measure_offset_level_parts
+        ]
         self._3d_axis_labels = ("x", "y", "z", "p")
         self._columns_3d = pandas.MultiIndex.from_product(
             [self._measure_offset_parts, self._3d_axis_labels],
@@ -268,6 +321,24 @@ class PoseAlgorithm:
         """Give the model part index, or -1 if unknown"""
         return self._parts.get(part, -1)
 
+    def set_confidence_threshold(self, threshold: float) -> None:
+        """Re-gate once the loaded model is known.
+
+        The algorithm is constructed during app startup, before any
+        configuration is read - at that point the inference model is still
+        None, so the threshold could only ever be the backend default and
+        a YOLO model was gated on TensorFlow's scale for the whole run.
+        The model's identity is only certain when the pose process reports
+        Initialized, so the gate is applied again there.
+        """
+        threshold = float(threshold)
+        if threshold == self._present_threshold == self._plot_threshold:
+            return
+        logger.info("confidence gate set to %.3f (was present=%.3f plot=%.3f)",
+                    threshold, self._present_threshold, self._plot_threshold)
+        self._present_threshold = threshold
+        self._plot_threshold = threshold
+
     def initialize(
         self,
         parts: List[str],
@@ -301,6 +372,14 @@ class PoseAlgorithm:
             SceneElement.RH_flat, SceneElement.RH_spread, SceneElement.RH_grab,
             SceneElement.LH_flat, SceneElement.LH_spread, SceneElement.LH_grab,
         )))
+        self._hand_part_indices = {}
+        if self._has_hands_part_names:
+            for option, elem in (("R", SceneElement.R_Hand),
+                                 ("L", SceneElement.L_Hand)):
+                self._hand_part_indices[elem] = [
+                    self.get_part_index(f"{option}{base}")
+                    for base in self._hand_base_names
+                ]
 
     @property
     def pose_result_columns(self) -> pandas.MultiIndex:
@@ -316,7 +395,7 @@ class PoseAlgorithm:
         # create a df_res with len(dfs) entries with all NaNs :
         no_result = (math.nan, math.nan, 0)  # x, y, p
         df_res = pandas.DataFrame(index=list(range(len(dfs))), columns=self._measure_offset_parts_columns)
-        min_combined_score = len(dfs) * self.MIN_CONFIDENCE_PRESENT_THRESHOLD
+        min_combined_score = len(dfs) * self._present_threshold
         for elem in df0.columns.levels[0]:
             combined = [
                 (idx, self._combine_frames_likelihood(frames.loc[idx, elem] for frames in dfs))
@@ -330,6 +409,202 @@ class PoseAlgorithm:
                 df_res.loc[idx, elem] = vals
         return df_res
 
+    def _select_most_likely_2d(self, per_cam_detection):
+        """Pick the most likely frame per part across cameras.
+
+        Args:
+            per_cam_detection: one array per camera, each shaped
+                (frames_per_camera, len(self._measure_offset_parts), 3) with the
+                last axis holding x, y, likelihood.
+
+        Returns:
+            A (camera_count, part_count, 3) float array holding each camera's
+            values at the winning frame for every part, and a (part_count,)
+            boolean mask of parts every camera saw confidently.
+        """
+        cams = numpy.asarray(per_cam_detection, dtype=float)
+        camera_count, frames_per_cam, part_count, _ = cams.shape
+        # Sum likelihood across cameras so a part is judged on joint evidence.
+        combined = cams[:, :, :, 2].sum(axis=0)  # (frames, parts)
+        # argmax returns the first maximum; reverse the frame axis so ties
+        # resolve to the most recent frame, as the pandas version did.
+        best_frame = frames_per_cam - 1 - numpy.argmax(combined[::-1], axis=0)
+        parts = numpy.arange(part_count)
+        selected = cams[:, best_frame, parts, :]  # (cams, parts, 3)
+        best_score = combined[best_frame, parts]
+        min_combined_score = camera_count * self._present_threshold
+        below = best_score < min_combined_score
+        if below.any():
+            selected[:, below, 0:2] = numpy.nan
+            selected[:, below, 2] = 0
+        confident_mask = (
+            selected[:, :, 2] >= self._present_threshold
+        ).all(axis=0)
+        return selected, confident_mask
+
+    # --- the live 3D path ---------------------------------------------------
+    #
+    # _handle_3d_triangulate below is the reference. It builds DataFrames and
+    # calls the helpers shared with the offline pipeline, and on one frame per
+    # camera it measured 1.529 ms p50 / 2.488 ms p99. 85% of that is pandas
+    # construction and per-part Python loops inside triangulate_3d_step1
+    # (0.555 / 1.101) and reorient_and_center_step1 (0.744 / 1.339), not
+    # arithmetic: the actual maths is a ten-point triangulation.
+    #
+    # At one frame per camera those helpers reduce to far less than they
+    # express, and each reduction is exact rather than an approximation:
+    #
+    #   min_cluster  triangulate_3d_step1 marks a point low-confidence only
+    #                when it is low-confidence for min_cluster consecutive
+    #                frames. Only confident parts are passed in, gated on the
+    #                same p_thresh it is given, so low_conf is all-False
+    #                before the cluster loop runs and every point is p=1.
+    #   center_len   reorient_and_center_step1 needs ten frames to recompute
+    #                the centre and sets center_len = 0 below that, so with
+    #                one frame cam_offsets keeps its loaded values.
+    #   rotate_3d    its reorient loop rebuilds three rotation matrices per
+    #                body part from angles that vary by neither part, frame
+    #                nor session, then applies a fixed axis flip and scale.
+    #                That whole loop is one constant 3x3 matrix.
+    #
+    # So the live path is undistort, triangulate, one affine transform. The
+    # shared helpers are untouched and still serve the offline pipeline, and
+    # the reference runs whenever _live_3d_reason() reports a precondition
+    # that does not hold.
+
+    _UNRESOLVED = object()
+
+    def _live_3d_reason(self) -> Optional[str]:
+        """Why the live 3D path cannot run here, or None if it can."""
+        if self._live_3d_reason_cache is not self._UNRESOLVED:
+            return self._live_3d_reason_cache
+        self._live_3d_reason_cache = self._resolve_live_3d_reason()
+        return self._live_3d_reason_cache
+
+    def _resolve_live_3d_reason(self) -> Optional[str]:
+        if self._stereo_params is None:
+            return "no stereo params"
+        if not self._cam_names or len(self._cam_names) < 2:
+            return "fewer than two camera names"
+        pair = f"{self._cam_names[0]}-{self._cam_names[1]}"
+        if pair not in self._stereo_params.as_pickle_dict():
+            return f"no stereo entry for {pair!r}"
+        if not self._calib_metadata or self._calib_metadata.get("camera_pos") is None:
+            # The reference reads camLele and its siblings unconditionally in
+            # its reorient loop, so without camera_pos it raises rather than
+            # returning something different. Fall back and let it raise.
+            return "no camera_pos in the calibration metadata"
+        if not self._cam_offsets:
+            # The reference synthesises offsets from camera_pos in this case.
+            return "no camera offsets"
+        if self._square_size is None:
+            return "no square size"
+        return None
+
+    def _live_3d_constants(self):
+        """The per-session constants the live 3D path applies to each batch."""
+        if self._live_3d_cache is not None:
+            return self._live_3d_cache
+        params = self._stereo_params.matrix
+        pair = f"{self._cam_names[0]}-{self._cam_names[1]}"
+        rot_cor = self._stereo_params.as_pickle_dict()[pair]["rot_cor"]
+        camera_pos = self._calib_metadata["camera_pos"]
+        # The means reorient_and_center_step1 takes, in its argument order.
+        avg_azi = numpy.mean((camera_pos["camLazi"], camera_pos["camRazi"]))
+        avg_ele = numpy.mean((camera_pos["camLele"], camera_pos["camRele"]))
+        # Derived by running the shared rotation on the identity rather than
+        # transcribing its matrices, so the two cannot drift apart.
+        rotation = rotate_3d_points(
+            numpy.eye(3), x_degrees=avg_azi, y_degrees=avg_ele,
+            z_degrees=-rot_cor,
+        )
+        # The loop then writes (-x, -z, -y), which is itself a linear map.
+        flip = numpy.array([[-1.0, 0.0, 0.0],
+                            [0.0, 0.0, -1.0],
+                            [0.0, -1.0, 0.0]])
+        self._live_3d_cache = {
+            "undistort": tuple(
+                (params[f"cameraMatrix{i}"], params[f"distCoeffs{i}"],
+                 params[f"R{i}"], params[f"P{i}"], rot_cor)
+                for i in (1, 2)
+            ),
+            "projection": (params["P1"][:3], params["P2"][:3]),
+            "offsets": numpy.array(
+                [self._cam_offsets["x_off"], self._cam_offsets["y_off"],
+                 self._cam_offsets["z_off"]], dtype=float),
+            "transform": (rotation @ flip) * float(self._square_size),
+        }
+        return self._live_3d_cache
+
+    def _triangulate_3d_live(self, selected, confident_order):
+        """Raw and reoriented 3D points for the confident parts, in numpy."""
+        constants = self._live_3d_constants()
+        # Fancy indexing copies, so _undistort_points writing back into its
+        # argument cannot reach the caller's array.
+        points = numpy.asarray(selected[:2, confident_order, :], dtype=float)
+        undistorted = [
+            _undistort_points(
+                points[index].reshape(1, -1), *constants["undistort"][index],
+            ).reshape(-1, 3)[:, :2].T.astype(numpy.float64)
+            for index in (0, 1)
+        ]
+        projection1, projection2 = constants["projection"]
+        homogeneous = cv2.triangulatePoints(
+            projection1, projection2, undistorted[0], undistorted[1])
+        raw = (homogeneous / homogeneous[3])[:3].T
+        oriented = (raw - constants["offsets"]) @ constants["transform"]
+        return raw, oriented
+
+    def _compute_3d_locations(self, per_cam_detection):
+        """The confident parts' raw and reoriented 3D locations."""
+        if len(per_cam_detection) < 2 or self._live_3d_reason() is not None:
+            return self._reference_3d_locations(per_cam_detection)
+        selected, confident_mask = self._select_most_likely_2d(
+            per_cam_detection[:2])
+        confident_order = [
+            column
+            for column in self._measure_offset_level_order
+            if confident_mask[column]
+        ]
+        if not confident_order:
+            return {}, {}
+        # Every triangulated point comes out p=1, as explained above, so the
+        # reference's per-part gate is this one comparison.
+        if 1.0 < self._present_threshold:
+            return {}, {}
+        confident_parts = [
+            part
+            for part, column in zip(
+                self._measure_offset_level_parts, self._measure_offset_level_order
+            )
+            if confident_mask[column]
+        ]
+        raw, oriented = self._triangulate_3d_live(selected, confident_order)
+        raw_3d_loc = {
+            part: Offset3DTuple(raw[index])
+            for index, part in enumerate(confident_parts)
+        }
+        locations_3d = {
+            part: Offset3DTuple(oriented[index])
+            for index, part in enumerate(confident_parts)
+        }
+        return raw_3d_loc, locations_3d
+
+    def _reference_3d_locations(self, per_cam_detection):
+        """The DataFrame path, kept as the reference and as the fallback."""
+        raw_df_3d, df_3d = self._handle_3d_triangulate(*per_cam_detection)
+        raw_3d_loc = {}
+        locations_3d = {}
+        df_3d_row = df_3d.iloc[0]  # there is only a single result in the df_3d
+        raw_df_3d_row = raw_df_3d.iloc[0]
+        for part in df_3d.columns.levels[0]:
+            p_3d = df_3d_row[part]
+            r_p_3d = raw_df_3d_row[part]
+            if r_p_3d["p"] >= self._present_threshold:
+                raw_3d_loc[part] = Offset3DTuple(r_p_3d[0:3])
+                locations_3d[part] = Offset3DTuple(p_3d[0:3])
+        return raw_3d_loc, locations_3d
+
     def _handle_3d_triangulate(
         self,
         *per_cam_detection: numpy.ndarray
@@ -342,26 +617,47 @@ class PoseAlgorithm:
         if len(per_cam_detection) < 2:
             warnings.warn("at least two cameras are required for 3d-triangulate", UserWarning, stacklevel=3)
             return self._empty_3d, self._empty_3d
-        p_thresh = 0.9  # confidence threshold for DLC raw output
+        p_thresh = self._present_threshold  # per-backend; see backend_selection
         min_cluster = 10  # maximum allowed interpolation
         # not sure min_cluster change anything for when nbr frames == 1 (per cam)
         #
-        frames_per_cam = len(per_cam_detection[0])
-        #
-        # reshape then sort by confidence/likelihood and takes most likely:
-        columns = self._measure_offset_parts_columns
-        df0_2d = pandas.DataFrame(per_cam_detection[0].reshape(frames_per_cam, -1), columns=columns)
-        df1_2d = pandas.DataFrame(per_cam_detection[1].reshape(frames_per_cam, -1), columns=columns)
-        #
-        df_2d = self._take_cams_most_likely(df0_2d, df1_2d)
+        # Select the most likely frame per part and build only the confident
+        # subset as a DataFrame. The vote itself is numpy: the previous pandas
+        # implementation cost a scalar .loc read and write per part per camera
+        # on every live batch.
+        selected, confident_mask = self._select_most_likely_2d(per_cam_detection[:2])
         confident_parts = [
             part
-            for part in df_2d.columns.levels[0]
-            if all(df_2d[part]["likelihood"] >= self.MIN_CONFIDENCE_PRESENT_THRESHOLD)
+            for part, column in zip(
+                self._measure_offset_level_parts, self._measure_offset_level_order
+            )
+            if confident_mask[column]
         ]
-        confident_df = df_2d[confident_parts]
         if len(confident_parts) == 0:
             return self._empty_3d, self._empty_3d
+        # from_product measured 0.38 ms per live batch. Its result depends
+        # only on which parts are confident, and a running session sees the
+        # same handful of masks over and over, so it is cached by the mask
+        # instead of rebuilt. The cache is bounded because a pathological
+        # session could otherwise reach one entry per distinct mask.
+        mask_key = confident_mask.tobytes()
+        confident_columns = self._confident_columns_cache.get(mask_key)
+        if confident_columns is None:
+            if len(self._confident_columns_cache) >= 64:
+                self._confident_columns_cache.clear()
+            confident_columns = pandas.MultiIndex.from_product(
+                [confident_parts, self._2d_axis_labels], names=self._3d_names,
+            )
+            self._confident_columns_cache[mask_key] = confident_columns
+        confident_order = [
+            column
+            for column in self._measure_offset_level_order
+            if confident_mask[column]
+        ]
+        confident_df = pandas.DataFrame(
+            selected[:, confident_order, :].reshape(len(selected), -1),
+            columns=confident_columns,
+        )
         # df_2d = interpolate_coordinates(df_2d, p_thresh)  # not required probably
         raw_df_3d = triangulate_3d_with_params(
             # [df_2d.iloc[0:1][confident_parts], df_2d.iloc[1:2]],
@@ -450,7 +746,7 @@ class PoseAlgorithm:
             for idx, part in enumerate(self._parts_list):
                 seen_by_all = True
                 for cam_idx, pose in enumerate(poses):
-                    if pose[idx, 2] >= PoseAlgorithm.MIN_CONFIDENCE_PRESENT_THRESHOLD:
+                    if pose[idx, 2] >= self._present_threshold:
                         parts_flags_by_cam[cam_idx][part] = True
                     else:
                         seen_by_all = False
@@ -469,59 +765,43 @@ class PoseAlgorithm:
         gpi = self.get_part_index
         #
         if self._has_hands_part_names:
-            # compute L_Hand / R_Hand averaged position (based on possibly many sub-hand parts)
-            all_lst = [
-                [f[gpi(p)] for p in self._hands_input_parts]
-                for f in itertools.chain(*selected_cams_frames)
-            ]
-            all_frames = numpy.asarray(all_lst).reshape(len(all_lst), -1)
-            df = pandas.DataFrame(
-                all_frames,
-                columns=self._hands_input_columns)
-            process_hands_results = pandas.DataFrame(columns=self._hands_columns, index=range(len(df)))
-            process_hands_results = process_hand_data(
-                df,
-                hand_base_names=self._hand_base_names,
-                hand_options=self._hand_options,
-                dlc_seg="_raw2D",
-                newdf=process_hands_results,
-                additional_names=[],
-            )
-            assert len(process_hands_results) == len(df)
-            start_idx = 0
+            # Each hand's position is whichever of H_flat, H_spread and
+            # H_grab that camera saw most confidently, in whichever frame.
+            #
+            # This was two DataFrame constructions feeding process_hand_data,
+            # which read 18 columns by label and wrote 6 back, followed by a
+            # per-hand per-camera pandas row selection. Measured on the rig
+            # that route cost about 2.7 ms of a 4.2 ms PoseAlgorithm.process,
+            # to take an argmax over a 3x3 array of numbers the caller
+            # already had. pandas is a session-analysis structure and this is
+            # a 150 fps loop, so the live path selects directly;
+            # prepare_jetson_data.process_hand_data stays for offline use.
+            #
+            # The two stages collapse into one: the best sub-part per frame
+            # and then the best frame is the same as the best (frame,
+            # sub-part) pair, and a flat argmax in C order breaks ties to the
+            # first frame and then the first sub-part, as the staged version
+            # did.
             for cam_idx, frames in enumerate(selected_cams_frames):
-                raw = process_hands_results.iloc[start_idx:start_idx + len(frames)]
-                start_idx += len(frames)
-                for elem in SceneElement.L_Hand, SceneElement.R_Hand:
-                    if __debug__ and elem not in process_hands_results.columns:
-                        logger.warning("%s not present in hands results", elem)
-                        continue
-                    # if self.process_frames_select_frames_method == "last_one":
-                    #     val = raw[elem].iloc[-1]
-                    # else:
-                    # but if want uses most likelihood, then:
-                    val = raw[elem].sort_values(by="likelihood", ascending=False).reset_index().iloc[0]
-                    if val['likelihood'] >= self.MIN_CONFIDENCE_PRESENT_THRESHOLD:
-                        locations_by_cam[cam_idx][elem] = PoseLocation(-1, *val[_xy_col_names])
+                if len(frames) == 0:
+                    continue
+                poses = numpy.asarray(frames, dtype=float)
+                for elem, rows in self._hand_part_indices.items():
+                    hand = poses[:, rows, :]        # (frames, sub-parts, 3)
+                    likelihood = hand[:, :, 2]
+                    frame_index, sub_index = divmod(
+                        int(numpy.argmax(likelihood)), likelihood.shape[1])
+                    x, y, score = hand[frame_index, sub_index]
+                    if score >= self._present_threshold:
+                        locations_by_cam[cam_idx][elem] = PoseLocation(-1, x, y)
         #
-        locations_3d = {}
-        raw_3d_loc = {}
-        raw_df_3d, df_3d = self._handle_3d_triangulate(*(
+        raw_3d_loc, locations_3d = self._compute_3d_locations([
             numpy.asarray([
                 [frame[gpi(p)] for p in self._measure_offset_parts]
                 for frame in frames
             ])
             for frames in selected_cams_frames
-        ))
-        #
-        df_3d_row = df_3d.iloc[0]  # there is only a single result in the df_3d
-        raw_df_3d_row = raw_df_3d.iloc[0]
-        for part in df_3d.columns.levels[0]:
-            p_3d = df_3d_row[part]
-            r_p_3d = raw_df_3d_row[part]
-            if r_p_3d["p"] >= self.MIN_CONFIDENCE_PRESENT_THRESHOLD:
-                raw_3d_loc[part] = Offset3DTuple(r_p_3d[0:3])
-                locations_3d[part] = Offset3DTuple(p_3d[0:3])  # 3 first columns (x, y, z)
+        ])
         #
         parts_3d_offsets = defaultdict(dict)
         if len(pairs_3d_offsets) > 0:
@@ -549,7 +829,7 @@ class PoseAlgorithm:
         locations: Dict[str, PoseLocation] = {}
         for pose in frames:
             for idx, part in enumerate(self._parts_list):
-                if pose[idx, 2] >= PoseAlgorithm.MIN_CONFIDENCE_PLOT_THRESHOLD:
+                if pose[idx, 2] >= self._plot_threshold:
                     locations[part] = PoseLocation(idx, pose[idx, 0], pose[idx, 1])
         return locations
 

@@ -81,6 +81,13 @@ from autotrainer.inference import (
     calibration_FLIR,
     DlcPoseModel,
 )
+from autotrainer.inference.backend_selection import (
+    available_backends,
+    confidence_threshold,
+    pre_validate_model,
+    selected_backend,
+    trained_model_name,
+)
 from autotrainer.inference.analysis import IntersessionResponse
 from autotrainer.inference.config import load_calib_stereo_params
 from autotrainer.inference.analysis.prepare_jetson_data import DEFAULT_CAM_OFFSET_FILE_NAME
@@ -132,6 +139,13 @@ from tools.acquisition.model.camera_timing_alignment import (
     align_camera_timestamp_files,
 )
 from tools.acquisition.model.acquisition_controller import AcquisitionController
+from tools.acquisition.model.intertrial_send_gate import InterTrialSendGate
+from tools.acquisition.model.send_block_reasons import SendBlockReasons
+
+
+# The name intertrial analysis holds the pellet send under. Inter-trial timing
+# holds under its own name, so neither releases the other.
+INTERTRIAL_ANALYSIS_BLOCK_NAME = "intertrial_analysis"
 from tools.acquisition.model.coordinate_model import CoordinateModel
 from tools.autotrainer_version import __version__ as app_version
 from tools.acquisition.model.helpers import get_config_location
@@ -163,6 +177,8 @@ from tools.acquisition.model.softmouse_spreadsheet_source import (
     SoftMouseSpreadsheetSource,
 )
 from tools.acquisition.model.session_data_recorder import SessionDataRecorder
+from tools.acquisition.model.session_telemetry import SessionTelemetry
+from tools.acquisition.model.stim_latency_budget import StimLatencyBudget
 from tools.acquisition.model.atomic_session_io import (
     atomic_publish_file,
     atomic_write_json,
@@ -222,6 +238,11 @@ from tools.acquisition.model.intertrial_analysis import (
     PelletPresence,
     analyze_tracking_window,
     classify_pellet_state,
+)
+from tools.acquisition.model.reach_state_source import (
+    LiveTrackingReachProvider,
+    ReachStateConfiguration,
+    ReachStateResolver,
 )
 from tools.acquisition.model.live_tracking_buffer import (
     FrameTimelineAnchor,
@@ -549,6 +570,7 @@ class AppModel(ObservableObject):
         # although here it's also working, so keeping for now.
         proc_msg_queue = self._multiproc_msg_queue = mp_ctx.Queue()
         self._stim_direct_trigger_queue = mp_ctx.Queue(maxsize=16)
+        self._stim_latency_budget = StimLatencyBudget()
         self._handle_proc_msg_thread = threading.Thread(
             target=self._handle_proc_msg_queue, name="handle_proc_msg_queue", daemon=True)
         self._handle_proc_msg_thread.start()
@@ -626,6 +648,10 @@ class AppModel(ObservableObject):
                 record_stop_sema=self._record_stop_sema,
             )
         inference = self._inference =  inference_model
+        # Live counters for the operator panel and the session metadata. Owned
+        # here because it is the only place that sees both the capture messages
+        # and the inference model.
+        self._session_telemetry = SessionTelemetry()
         #
 
         self._training_plans: List[PlanInfo] = []
@@ -684,6 +710,14 @@ class AppModel(ObservableObject):
         self._tone_profiles = {
             profile.profile_id: profile for profile in profile_library.tone_profiles
         }
+        self._cue_interval_profiles = {
+            profile.profile_id: profile
+            for profile in profile_library.cue_interval_profiles
+        }
+        self._stimulus_trigger_profiles = {
+            profile.profile_id: profile
+            for profile in profile_library.stimulus_trigger_profiles
+        }
         self._laser_profiles = {
             profile.profile_id: profile for profile in profile_library.laser_profiles
         }
@@ -691,6 +725,15 @@ class AppModel(ObservableObject):
             profile.policy_id: profile
             for profile in profile_library.automatic_shift_profiles
         }
+        self._live_tracking = LiveTrackingBuffer()
+        # Tone 2's reach gate, answered from live pose. The resolver has always
+        # taken this provider and nothing supplied one, so selecting
+        # live_tracking as the source reported "unknown" forever. The buffer is
+        # built first because the executor reads reach state through it.
+        self._reach_state_resolver = ReachStateResolver(
+            ReachStateConfiguration.from_environment(),
+            live_tracking_provider=LiveTrackingReachProvider(self._live_tracking),
+        )
         self._trial_action_executor = TrialActionExecutor(
             move_absolute=self._move_protocol_motor_target,
             configure_cover=self._configure_protocol_cover,
@@ -702,8 +745,18 @@ class AppModel(ObservableObject):
             activate_detector=self._arm_protocol_stim_detector,
             cancel_detector=self._cancel_protocol_stim_detector,
             trigger_hardware_stimulus=self._trigger_protocol_stim3,
+            reach_state_resolver=self._reach_state_resolver,
         )
-        self._live_tracking = LiveTrackingBuffer()
+        # One holder, several holders-of-holds. intertrial analysis and
+        # inter-trial timing both block the send, and BehaviorAlgorithm reads
+        # a single string, so releasing one must not release the other.
+        self._send_block_reasons = SendBlockReasons(
+            publish=self._publish_pellet_send_block_reason,
+        )
+        self._intertrial_send_gate = InterTrialSendGate(
+            block_reasons=self._send_block_reasons,
+            observe=self._on_intertrial_timing_evaluated,
+        )
         self._intertrial_analysis = IntertrialAnalysisCoordinator(
             self._on_intertrial_analysis_result,
             failure_callback=self._on_intertrial_callback_failed,
@@ -1653,7 +1706,7 @@ class AppModel(ObservableObject):
         self._intertrial_resolution_request = None
         self._intertrial_resolution_reason = ""
         self._intertrial_waiting_operations.clear()
-        self._behavior.algorithm.pellet_send_block_reason = ""
+        self._send_block_reasons.clear_all()
         self._session_data_recorder.request_abort()
         self._cancel_automatic_stop_timers()
         if token is not None:
@@ -1809,14 +1862,32 @@ class AppModel(ObservableObject):
             cam_offsets = None
             logger.warning("calib_src_dir=%r does not exist", calib_src_dir.as_posix())
 
+        inference = self._inference
+        model_location = inference.model_location if inference is not None else None
         pose_algo = PoseAlgorithm(
             stereo_params=stereo_params,
             calib_metadata=calib_metadata,
             cam_names=cam_names,
             square_size=square_size,
             cam_offsets=cam_offsets,
+            # Per backend, then per model. The TensorFlow engine saturates
+            # its likelihood at 1.0 while the PyTorch engine reports a real
+            # distribution, so a single constant cannot gate both - and the
+            # PyTorch scale differs by backbone too: a cspnext_s never
+            # scores above 0.33, so the backend default of 0.6 would hold
+            # rh_grab_seen permanently False. An unmeasured backbone, or a
+            # project this cannot read, falls back to the backend default.
+            # The model location has to reach both calls. Without it
+            # selected_backend() answers from what is installed, which on a box
+            # with both engines is TensorFlow, and a YOLO model was then gated
+            # at TensorFlow's 0.9 - above the confidence it ever reaches, so
+            # the pellet never once appeared on the overlay.
+            confidence_threshold=confidence_threshold(
+                selected_backend(model_path=model_location),
+                model_name=trained_model_name(model_location),
+                model_path=model_location,
+            ),
         )
-        inference = self._inference
         if inference is not None:
             pose_algo.initialize(inference.pose_parts)
             inference.pose_algorithm = pose_algo
@@ -1974,6 +2045,11 @@ class AppModel(ObservableObject):
         extra_info = (args, kwargs) if logger.isEnabledFor(logging.DEBUG) else "NA"
         logger.verbose("Handling %s ; data=%s", cmd, extra_info)
         algo = self._behavior.algorithm
+        if cmd == SystemStatusMessageKind.CAMERA_FRAME_STATS:
+            cam_idx, frames_received, frames_missed = args
+            self._session_telemetry.record_capture(
+                cam_idx, acquired=frames_received, dropped=frames_missed)
+            return
         if cmd == SystemStatusMessageKind.CAMERA_STATUS_CHANGE:
             cam_idx, new_status, *r_args = args
             reference_cam_idx = (
@@ -2054,6 +2130,10 @@ class AppModel(ObservableObject):
                         first_frame_time,
                         boundary=self._recording_session.boundary,
                     )
+                    # Counters are per session, and the session starts at the
+                    # first recorded frame rather than at arm time, so elapsed
+                    # matches the recording rather than the operator's clicking.
+                    self._session_telemetry.begin(first_frame_perf)
                     self._record_start_timer.cancel()
                     self._record_start_timer = no_op_timer
                     self._abort_had_recording_started = True
@@ -4144,6 +4224,14 @@ class AppModel(ObservableObject):
             StimulusProfileLibrary(
                 revision=library.revision,
                 tone_profiles=tuple(tones[key] for key in sorted(tones)),
+                cue_interval_profiles=tuple(
+                    self._cue_interval_profiles[key]
+                    for key in sorted(self._cue_interval_profiles)
+                ),
+                stimulus_trigger_profiles=tuple(
+                    self._stimulus_trigger_profiles[key]
+                    for key in sorted(self._stimulus_trigger_profiles)
+                ),
                 laser_profiles=tuple(lasers[key] for key in sorted(lasers)),
                 automatic_shift_profiles=tuple(
                     automatic_shifts[key] for key in sorted(automatic_shifts)
@@ -4152,6 +4240,12 @@ class AppModel(ObservableObject):
             expected_revision=library.revision,
         )
         self._tone_profiles = {item.profile_id: item for item in saved.tone_profiles}
+        self._cue_interval_profiles = {
+            item.profile_id: item for item in saved.cue_interval_profiles
+        }
+        self._stimulus_trigger_profiles = {
+            item.profile_id: item for item in saved.stimulus_trigger_profiles
+        }
         self._laser_profiles = {item.profile_id: item for item in saved.laser_profiles}
         self._automatic_shift_policies = {
             item.policy_id: item for item in saved.automatic_shift_profiles
@@ -4251,6 +4345,28 @@ class AppModel(ObservableObject):
                     ),
                 }
                 for profile in self._automatic_shift_policies.values()
+            ),
+            "cue_interval_profiles": tuple(
+                {
+                    "profile_id": profile.profile_id,
+                    "revision": profile.revision,
+                    "summary": (
+                        f"{profile.preset}, "
+                        f"{len(profile.distribution().values)} intervals"
+                    ),
+                }
+                for profile in self._cue_interval_profiles.values()
+            ),
+            "stimulus_trigger_profiles": tuple(
+                {
+                    "profile_id": profile.profile_id,
+                    "revision": profile.revision,
+                    "summary": (
+                        f"{len([c for c in profile.categories if c.enabled])} "
+                        f"of {len(profile.categories)} triggers enabled"
+                    ),
+                }
+                for profile in self._stimulus_trigger_profiles.values()
             ),
             "active_trial_id": active_trial_id,
             "completed_trial_ids": tuple(sorted({
@@ -4785,6 +4901,8 @@ class AppModel(ObservableObject):
         compiler = TrialActionCompiler(
             tone_profiles=self._tone_profiles,
             laser_profiles=self._laser_profiles,
+            cue_interval_profiles=self._cue_interval_profiles,
+            stimulus_trigger_profiles=self._stimulus_trigger_profiles,
             dcs_to_motor=dcs_to_motor,
         )
         return compiler.compile(row, context)
@@ -4970,8 +5088,30 @@ class AppModel(ObservableObject):
             except Exception:
                 logger.exception("Could not fail the rejected stim operation")
 
+    @property
+    def stim_latency_budget(self) -> StimLatencyBudget:
+        """Rolling Tier 1 stim-loop latency view, aggregated from trigger records."""
+        return self._stim_latency_budget
+
+    def _log_stim_latency_budget(self) -> None:
+        """Emit the Tier 1 breakdown once per capture stop, when triggers occurred."""
+        try:
+            summary = self._stim_latency_budget.summary()
+            if summary.accepted == 0 and summary.rejected == 0:
+                return
+            report = self._stim_latency_budget.format_report()
+            if summary.total is not None and not summary.meets_budget:
+                logger.warning("Stim loop exceeded its p99 budget\n%s", report)
+            else:
+                logger.notice("%s", report)
+        except Exception:
+            logger.exception("Failed to report the stim latency budget")
+
     def _on_direct_stim_trigger_result(self, result) -> None:
         payload = dict(result)
+        # Aggregate before anything that can raise, so a recorder or capture
+        # failure does not also lose the latency sample.
+        self._stim_latency_budget.observe(payload)
         perf_time = float(
             payload.get("daqmx_start_entry_perf_time")
             or payload.get("ipc_receive_perf_time")
@@ -5154,8 +5294,9 @@ class AppModel(ObservableObject):
         estimate = self._intertrial_analysis.timing_estimate(
             request.window.end_perf - request.window.start_perf
         )
-        self._behavior.algorithm.pellet_send_block_reason = (
-            "waiting for retried pellet trial analysis; " + estimate.display_text
+        self._send_block_reasons.set(
+            INTERTRIAL_ANALYSIS_BLOCK_NAME,
+            "waiting for retried pellet trial analysis; " + estimate.display_text,
         )
         self._notify_trial_protocol_state()
         return True
@@ -5219,23 +5360,42 @@ class AppModel(ObservableObject):
     ) -> None:
         self._intertrial_resolution_request = request
         self._intertrial_resolution_reason = str(reason)
-        self._behavior.algorithm.pellet_send_block_reason = (
-            "pellet trial analysis needs operator action"
+        self._send_block_reasons.set(
+            INTERTRIAL_ANALYSIS_BLOCK_NAME,
+            "pellet trial analysis needs operator action",
         )
         logger.error("%s", reason)
         self._notify_trial_protocol_state()
 
+    def _publish_pellet_send_block_reason(self, rendered: str) -> None:
+        """Publish the combined holds to the single string BehaviorAlgorithm reads."""
+        self._behavior.algorithm.pellet_send_block_reason = rendered
+
+    def _on_intertrial_timing_evaluated(self, evaluation) -> None:
+        """Record how the inter-trial interval actually came out.
+
+        Lateness is evidence, not a correction: the policy releases a late
+        trial immediately rather than padding it further.
+        """
+        if evaluation.lateness_seconds:
+            logger.notice(
+                "inter-trial target missed by %.3f s", evaluation.lateness_seconds,
+            )
+        self._notify_trial_protocol_state()
+
     def _refresh_intertrial_send_block(self) -> None:
         if self._intertrial_resolution_request is not None:
-            self._behavior.algorithm.pellet_send_block_reason = (
-                "pellet trial analysis needs operator action"
+            self._send_block_reasons.set(
+                INTERTRIAL_ANALYSIS_BLOCK_NAME,
+                "pellet trial analysis needs operator action",
             )
         elif self._intertrial_waiting_operations:
-            self._behavior.algorithm.pellet_send_block_reason = (
-                "waiting for pellet trial analysis"
+            self._send_block_reasons.set(
+                INTERTRIAL_ANALYSIS_BLOCK_NAME,
+                "waiting for pellet trial analysis",
             )
         else:
-            self._behavior.algorithm.pellet_send_block_reason = ""
+            self._send_block_reasons.clear(INTERTRIAL_ANALYSIS_BLOCK_NAME)
 
     def _on_intertrial_callback_failed(
         self,
@@ -6329,8 +6489,14 @@ class AppModel(ObservableObject):
             if callable(runtime_check):
                 gpu_status = runtime_check()
                 if not gpu_status.is_available:
+                    # Name the engine that was actually probed. This said
+                    # "TensorFlow" whatever the probe ran, so a torch-only rig
+                    # was told to fix a TensorFlow runtime it never installed.
+                    probed = gpu_status.backend or "configured"
+                    installed = ", ".join(available_backends()) or "none"
                     inference_preflight_error = (
-                        "Live inference cannot start because a compatible TensorFlow GPU runtime was not found. "
+                        f"Live inference cannot start because a compatible {probed} GPU "
+                        f"runtime was not found (engines installed: {installed}). "
                         "Cameras and independent hardware will continue without live inference. "
                         "Disable Live inference in Preferences or launch with --no-live-inference "
                         "to suppress this failure.\n\n"
@@ -6385,13 +6551,36 @@ class AppModel(ObservableObject):
                     )
             if inference_error is None:
                 self._inference_queue = FixedArrayMultiQueue(
-                    # live queue does not need/require a lot of "depth" == total nbr of batches that can sit
-                    # in the ring-buffer-queue at the same time.
-                    # Now only using a "depth" of 1 frame batches,
-                    # this should makes less delay / be more reactive in live inference results,
-                    1,
+                    # Depth 2, with PoseProcess draining to the newest batch.
+                    #
+                    # Depth 1 looked like the low-latency choice and is not.
+                    # get_output frees the slot as soon as it has copied the
+                    # frame out, at the start of predict, so the producer
+                    # refills it immediately and then has nowhere to put
+                    # anything else; the batch waiting at the next call is
+                    # already a predict-period old. Measured on the rig at
+                    # 150 fps, cspnext_m went 17.637 ms p50 / 22.185 p99 at
+                    # depth 1 to 13.854 / 17.611 at depth 2, and the share of
+                    # batches the capture loop could not hand over at all fell
+                    # from 35.2% to 0.7%. cspnext_s, which is faster than the
+                    # frame period and so never backs up, is unchanged:
+                    # 7.000 / 7.486 against 6.981 / 7.521.
+                    #
+                    # Not deeper than 2: at depth 4 the drain pays a full
+                    # frame copy and RGB expansion for each batch it skips,
+                    # and cspnext_s regressed to 10.167 / 13.330.
+                    #
+                    # None of this touches acquisition. The capture loop puts
+                    # with block=False and records on a separate queue, so a
+                    # slow pose process can never stall capture or cost a
+                    # recorded frame; what is skipped here is inference work.
+                    2,
                     len(inference_cameras),
-                    3,
+                    # One frame per camera: the batch is released as soon as a frame
+                    # arrives instead of accumulating three, which removes two frame
+                    # periods of staleness. PoseProcess pads up to the model batch
+                    # size, so the DeepLabCut graph and the offline path are unchanged.
+                    1,
                     shape=shape,
                     primary=0,
                     name="inference_q",
@@ -6472,6 +6661,13 @@ class AppModel(ObservableObject):
             self._set_animal_base_positions(animal)
 
         self._acquisition.mark_started()
+        # Start counting as soon as the system is acquiring, not only when
+        # a recording starts. Demo playback and plain preview run frames
+        # through the same pipeline, and the operator has no way to see the
+        # inference rate or percentage there - the panel simply showed a
+        # dash. A recording re-baselines this at its first recorded frame,
+        # so session figures stay session-relative.
+        self._session_telemetry.begin()
         self.status = target_status
         self.property_changed(self.Props.ACQUISITION_RUNNING, True, False)
         self._event_manager.post_event_content(
@@ -6590,6 +6786,7 @@ class AppModel(ObservableObject):
             self._laser.close()
         except Exception as err:
             logger.exception("Failed to close laser controller during capture stop: %s", err)
+        self._log_stim_latency_budget()
         self._set_subsystem_status(
             SubsystemId.LASER,
             (
@@ -7630,7 +7827,7 @@ class AppModel(ObservableObject):
         self._intertrial_resolution_request = None
         self._intertrial_resolution_reason = ""
         self._intertrial_waiting_operations.clear()
-        self._behavior.algorithm.pellet_send_block_reason = ""
+        self._send_block_reasons.clear_all()
         self._intertrial_analysis.begin_session(
             analysis_generation,
             analysis_session_id,
@@ -7686,6 +7883,15 @@ class AppModel(ObservableObject):
     def _on_session_capture_ended(self, reason: RecordingEndingReason):
         self._recording_ending_reason = RecordingEndingReason(reason)
         logger.debug("session capture trigger ended: %s", reason)
+        # Freeze the counters here rather than waiting for finalization. The
+        # pose process finishes its backlog after capture stops, and those
+        # predicts are not frames of this session getting a live pose - once
+        # the model was fast enough to keep up, letting them in took a session
+        # that ran at 99.8% of frames inferenced and reported 125%.
+        #
+        # end() is idempotent, so the later call in _complete_stopped_recording
+        # still covers any ending path that does not reach here.
+        self._session_telemetry.end()
 
     def _on_session_ending(self, project: ProjectInfo, result: CaptureAnalysisResult):
         if project.short_id in self._aborted_session_ids:
@@ -7775,6 +7981,7 @@ class AppModel(ObservableObject):
                 end_perf,
                 self._recording_session.boundary.end_wall_time,
             )
+            self._session_telemetry.end(end_perf)
             stream_result = self._session_data_recorder.stop(end_perf)
         except Exception as first_error:
             logger.exception(
@@ -7952,7 +8159,7 @@ class AppModel(ObservableObject):
         self._intertrial_resolution_request = None
         self._intertrial_resolution_reason = ""
         self._intertrial_waiting_operations.clear()
-        self._behavior.algorithm.pellet_send_block_reason = ""
+        self._send_block_reasons.clear_all()
         self._recording_session.set_analysis_finished(time.perf_counter())
         try:
             self._save_project_metadata(
@@ -8285,10 +8492,31 @@ class AppModel(ObservableObject):
             )
 
     def _on_inference_property_changed(self, name: str, value, _):
+        if name == InferenceModel.LIVE_POSE_STATS and value is not None:
+            # Windowed timing from the pose process, folded into the session
+            # counters the operator panel and the metadata read.
+            pose_count, mean_ms, max_ms, e2e_mean_ms, e2e_max_ms = value
+            self._session_telemetry.record_inference(
+                pose_count, mean_ms, max_ms,
+                sensor_to_result_mean_ms=e2e_mean_ms,
+                sensor_to_result_max_ms=e2e_max_ms)
+            return
         if name == InferenceModel.STATUS:
             new_is_live = value == InferenceStatus.live
             if new_is_live:
                 self._p_inference_live_begin = time.perf_counter()
+                # Acquisition starts before inference is ready - the model
+                # still has to load - so counting both from capture start
+                # charged inference for the couple of seconds it did not
+                # exist. The preview panel read 74% rising to 96% on a run
+                # that dropped nothing, and carried an 8.5 s end-to-end max
+                # from the first frame through the warming pipeline. Rebase
+                # here so the percentage measures the two running together.
+                # A recording owns the counters once it starts, so this
+                # never moves a session's baseline.
+                if (self._recording_session.status
+                        is not SessionRecordingStatus.RECORDING):
+                    self._session_telemetry.begin()
             elif value == InferenceStatus.stopped:
                 current = self._acquisition.subsystems.get(
                     SubsystemId.LIVE_INFERENCE
@@ -8322,9 +8550,12 @@ class AppModel(ObservableObject):
         elif name == InferenceModel.MODEL_LOCATION:
             if value:
                 try:
-                    DlcPoseModel.pre_validate(value)
+                    # Routed by backend, not pinned to DeepLabCut: this
+                    # reported every YOLO model as broken, an error dialog
+                    # on every start for a model that then ran correctly.
+                    pre_validate_model(value)
                 except Exception as err:
-                    self.on_error("DlcPoseModel pre_validate failed",
+                    self.on_error("Pose model pre-validate failed",
                                   f"\nModel at {value} failed pre-validate:\n\n{err}")
 
     def _on_pose_response_ready(self, response: PoseResponse):
@@ -8413,6 +8644,11 @@ class AppModel(ObservableObject):
                 for configured in monitor.configuration.channels
             )
         )
+
+    @property
+    def session_telemetry(self) -> SessionTelemetry:
+        """Live capture and inference counters for the current session."""
+        return self._session_telemetry
 
     def _on_intertrial_nidaq_tone_edge(
         self,
@@ -8928,6 +9164,10 @@ class AppModel(ObservableObject):
                 },
                 "configuration": configuration,
                 "artifacts": artifacts,
+                # What the operator watched during the recording, kept so the
+                # same numbers can be read back from the session rather than
+                # only having existed on screen.
+                "capture": self._session_telemetry.summary(),
             }
         out = _metadata_without_nonfinite_numbers(out)
         json_path = Path(file_name + ".json")
@@ -9205,6 +9445,9 @@ class AppModel(ObservableObject):
             )
 
     def _on_pellet_cycle_completed(self, *, perf_c: float):
+        # The retrieval has been dispatched, so the inter-trial interval
+        # starts here rather than when the next trial is prepared.
+        self._intertrial_send_gate.arm(perf_c)
         operation = self._trial_action_executor.operation
         if (
             operation is not None
@@ -9416,8 +9659,9 @@ class AppModel(ObservableObject):
             estimate = self._intertrial_analysis.timing_estimate(
                 tracking_window.end_perf - tracking_window.start_perf
             )
-            self._behavior.algorithm.pellet_send_block_reason = (
-                "waiting for pellet trial analysis; " + estimate.display_text
+            self._send_block_reasons.set(
+                INTERTRIAL_ANALYSIS_BLOCK_NAME,
+                "waiting for pellet trial analysis; " + estimate.display_text,
             )
         if not self._intertrial_analysis.submit(request):
             self._intertrial_waiting_operations.discard(request.operation_id)

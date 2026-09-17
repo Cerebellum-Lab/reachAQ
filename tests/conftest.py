@@ -70,3 +70,4 @@ def app_model(mock_system, user_pref, calib_dir, diamond_config_path, system_con
         # callback so one later test exception cannot fan out across every
         # AppModel created earlier in the pytest process.
         unregister_fatal_exception_callback(app._on_fatal_exception)
+        top_fixtures.release_multiprocessing_resources(app)

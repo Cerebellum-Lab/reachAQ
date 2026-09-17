@@ -308,6 +308,33 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
     def save_configuration(self) -> NidaqSignalStreamConfiguration:
         return self._configuration
 
+    def _timing_matches(
+        self,
+        configuration,
+        hardware_timed_output_devices,
+        hardware_timed_output_channels,
+        device_identities,
+    ) -> bool:
+        """Whether this request is the timing already in force.
+
+        Compared field by field rather than by identity: the caller has
+        usually just rebuilt these objects from the same file, so they are
+        equal without being the same object.
+        """
+        def normalise(devices, channels):
+            return (
+                tuple(dict.fromkeys(str(d) for d in devices if d)),
+                tuple(dict.fromkeys(str(c) for c in channels if c)),
+            )
+
+        wanted = normalise(hardware_timed_output_devices,
+                           hardware_timed_output_channels)
+        current = (self._hardware_timed_output_devices,
+                   self._hardware_timed_output_channels)
+        return (configuration == self._timing_configuration
+                and wanted == current
+                and tuple(device_identities) == self._device_identities)
+
     def configure_timing(
         self,
         configuration: NidaqTimingConfiguration,
@@ -317,6 +344,18 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
         device_identities: Iterable[NidaqDeviceIdentity] = tuple(),
     ) -> None:
         if self._is_running or self._is_starting:
+            # Reloading the configuration re-applies the timing it already
+            # has, and demo mode is toggled by reloading the configuration:
+            # entering demo while acquiring therefore raised here, the toggle
+            # reported "Could not change demo mode", and the clip never
+            # played - so Next/Previous trial stayed dead with nothing on
+            # screen to say why. Re-applying what is already in force is not
+            # a change, so it is allowed; only a real change is refused.
+            if self._timing_matches(configuration,
+                                    hardware_timed_output_devices,
+                                    hardware_timed_output_channels,
+                                    device_identities):
+                return
             raise RuntimeError("cannot change NI-DAQ timing while acquisition is active")
         self._timing_configuration = configuration
         self._hardware_timed_output_devices = tuple(dict.fromkeys(

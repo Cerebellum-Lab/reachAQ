@@ -163,12 +163,24 @@ class ProtocolContent(ContentWidget):
         _Column("Cover", "cover_policy", CoverPolicy),
         _Column("Tone profile", "tone_profile_id", "tone_profile"),
         _Column("Tone phase", "tone_phase", ActionPhase),
+        # Tone 2 and the interval that separates it from Tone 1. A fixed
+        # interval and an interval profile are alternatives; the compiler
+        # rejects a row that sets both.
+        _Column("Cue tone", "cue_tone_profile_id", "tone_profile"),
+        _Column("Cue interval", "cue_interval_profile_id", "cue_interval_profile"),
+        _Column("Cue fixed (ms)", "cue_interval_fixed_ms", "cue_interval"),
+        _Column("Lock timing", "cue_lock_timing", _BooleanDelegate),
+        _Column("Post-clear (ms)", "cue_post_clear_delay_ms", "post_clear"),
         _Column("Laser profile", "laser_profile_id", "laser_profile"),
         _Column("Laser phase", "laser_phase", ActionPhase),
         _Column("Laser route", "laser_trigger_route", LaserTriggerRoute),
         _Column("Assignment", "stimulus_assignment", StimulusAssignment),
         _Column("Stim %", "stimulus_probability_percent", "percent"),
         _Column("Trigger", "stimulus_trigger", StimulusTrigger),
+        # Randomized assignment draws from this profile instead of using the
+        # single trigger above.
+        _Column("Trigger profile", "stimulus_trigger_profile_id",
+                "stimulus_trigger_profile"),
         _Column("Pre-reveal (ms)", "pre_reveal_ms", "pre_reveal"),
         _Column("Retry", "retry_assignment", RetryAssignment),
         _Column("State", None),
@@ -320,8 +332,15 @@ class ProtocolContent(ContentWidget):
                 delegate = _IntegerDelegate(1, 10_000, self._table)
             elif kind == "pre_reveal":
                 delegate = _IntegerDelegate(0, 60_000, self._table)
+            elif kind == "cue_interval":
+                # Zero means "use the interval profile instead"; the schema
+                # rejects anything between 1 and 304 ms.
+                delegate = _IntegerDelegate(0, 60_000, self._table)
+            elif kind == "post_clear":
+                delegate = _IntegerDelegate(0, 60_000, self._table)
             elif kind in {
                 "tone_profile", "laser_profile", "automatic_shift_profile",
+                "cue_interval_profile", "stimulus_trigger_profile",
             }:
                 delegate = _ProfileDelegate(self, kind, self._table)
             else:
@@ -334,6 +353,8 @@ class ProtocolContent(ContentWidget):
             "tone_profile": "tone_profiles",
             "laser_profile": "laser_profiles",
             "automatic_shift_profile": "automatic_shift_profiles",
+            "cue_interval_profile": "cue_interval_profiles",
+            "stimulus_trigger_profile": "stimulus_trigger_profiles",
         }[kind]
         return tuple(
             (item["profile_id"], item.get("summary", ""))
@@ -348,6 +369,14 @@ class ProtocolContent(ContentWidget):
             return f"{float(value):.1f}"
         if field == "enabled":
             return "Enabled" if value else "Disabled"
+        if field == "cue_lock_timing":
+            # Named for what it does at the deadline, not True/False.
+            return "Locked" if value else "Unlocked"
+        if field == "cue_interval_fixed_ms":
+            # Zero is not a zero-length interval; it defers to the profile.
+            return "From profile" if not value else f"{int(value)} ms"
+        if field == "cue_post_clear_delay_ms":
+            return "None" if not value else f"{int(value)} ms"
         return str(value)
 
     @staticmethod
