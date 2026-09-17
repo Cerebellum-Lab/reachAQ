@@ -666,13 +666,26 @@ class NidaqSignalStreamController:
         timing = getattr(task, "timing", None)
         if timing is None:
             return
-        if hasattr(timing, "ref_clk_src"):
-            timing.ref_clk_src = source
-        if (
-            plan.reference_clock_rate_hz is not None
-            and hasattr(timing, "ref_clk_rate")
-        ):
-            timing.ref_clk_rate = plan.reference_clock_rate_hz
+        # Having the terminal is not the same as the task being able to use
+        # it: a PXI-6221 exposes PXI_Clk10, but its digital-input task rejects
+        # DAQmx_RefClk_Src outright (-200452, "not applicable to the task"),
+        # which failed the preflight and took recording with it. NI is the
+        # only authority on applicability, so ask it rather than maintain a
+        # table of which task types accept what. A task that cannot take one
+        # runs on its own timebase, exactly as it did before hardware-timed
+        # output existed.
+        try:
+            if hasattr(timing, "ref_clk_src"):
+                timing.ref_clk_src = source
+            if (
+                plan.reference_clock_rate_hz is not None
+                and hasattr(timing, "ref_clk_rate")
+            ):
+                timing.ref_clk_rate = plan.reference_clock_rate_hz
+        except Exception as error:
+            logger.info("%s does not accept a reference clock on this task "
+                        "(%s); it will run on its own timebase",
+                        device_name, error)
 
     def _configure_start_trigger(self, task, device_name: str) -> None:
         plan = self._timing_plan

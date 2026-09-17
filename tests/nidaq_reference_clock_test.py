@@ -109,3 +109,44 @@ def test_the_rate_is_applied_alongside_a_resolved_clock():
 
     assert timing.ref_clk_src == "/PXI1Slot5/PXI_Clk10"
     assert timing.ref_clk_rate == pytest.approx(10_000_000.0)
+
+
+class _RejectingTiming:
+    """A task whose type does not accept a reference clock.
+
+    A PXI-6221 exposes PXI_Clk10 but its digital-input task rejects
+    DAQmx_RefClk_Src with -200452, "not applicable to the task".
+    """
+
+    def __init__(self):
+        self.ref_clk_rate = None
+
+    @property
+    def ref_clk_src(self):
+        return None
+
+    @ref_clk_src.setter
+    def ref_clk_src(self, _value):
+        raise RuntimeError(
+            "Specified property is not supported by the device or is not "
+            "applicable to the task. Property: DAQmx_RefClk_Src")
+
+
+def test_a_task_that_rejects_the_clock_does_not_fail_the_whole_stream():
+    stream = _stream({"PXI1Slot5": SLOT5})
+    stream._timing_plan = _plan("PXI_CLK10")
+    task = types.SimpleNamespace(timing=_RejectingTiming())
+
+    # Must not raise: the task runs on its own timebase instead.
+    stream._configure_reference_clock(task, "PXI1Slot5")
+
+
+def test_a_rejecting_task_leaves_the_rate_unset():
+    stream = _stream({"PXI1Slot5": SLOT5})
+    stream._timing_plan = _plan("PXI_CLK10")
+    timing = _RejectingTiming()
+    task = types.SimpleNamespace(timing=timing)
+
+    stream._configure_reference_clock(task, "PXI1Slot5")
+
+    assert timing.ref_clk_rate is None
