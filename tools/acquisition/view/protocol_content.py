@@ -41,6 +41,7 @@ from tools.acquisition.model.trial_protocol_schedule import (
     StimulusAssignment,
     StimulusTrigger,
 )
+from tools.acquisition.view.protocol_set_sidebar import ProtocolSetSidebar
 
 
 class _EnumDelegate(QStyledItemDelegate):
@@ -246,7 +247,13 @@ class ProtocolContent(ContentWidget):
         table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         table.itemChanged.connect(self._item_changed)
         self._install_delegates()
-        content_layout.addWidget(table, stretch=1)
+        body = QHBoxLayout()
+        self._set_sidebar = ProtocolSetSidebar(self._app_model)
+        self._set_sidebar.setMaximumWidth(280)
+        self._set_sidebar.selection_changed.connect(self._sidebar_selection_changed)
+        body.addWidget(self._set_sidebar)
+        body.addWidget(table, stretch=1)
+        content_layout.addLayout(body, stretch=1)
         self._card_widget.setContentWidget(content)
 
         layout = QVBoxLayout(self)
@@ -706,6 +713,18 @@ class ProtocolContent(ContentWidget):
             f"Preview seed {seed}: stimulus on trials "
             f"{', '.join(map(str, selected)) or 'none'}. The actual draw is frozen at preparation."
         )
+
+    def _sidebar_selection_changed(self, kind: str, identifier: str) -> None:
+        """Say what the sidebar selection means for the table beside it."""
+        if kind == "experiment":
+            self._edit_status.setText(
+                "Experiment {} selected. Compile it to run or edit its "
+                "trials.".format(identifier)
+            )
+        elif kind == "set":
+            self._edit_status.setText(
+                "Set {} selected. Open it to edit its trials.".format(identifier)
+            )
 
     def _protocol_selected(self):
         if self._updating or not hasattr(self._app_model, "select_ordered_protocol"):
