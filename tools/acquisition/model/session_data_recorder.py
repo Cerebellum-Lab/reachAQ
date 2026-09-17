@@ -120,12 +120,18 @@ class _PressureRing:
             self._columns[name] = grown
 
     def append(self, values) -> None:
-        if self._next == self._held and self._held < self._capacity:
-            self._grow()
+        # The cursor is allowed to reach _held so that filling the columns is
+        # distinguishable from wrapping them; taking the modulo first hid that
+        # and the buffer never grew.
+        if self._next == self._held:
+            if self._held < self._capacity:
+                self._grow()
+            else:
+                self._next = 0
         position = self._next
         for (name, _), value in zip(_PRESSURE_FIELDS, values):
             self._columns[name][position] = value
-        self._next = (position + 1) % self._held
+        self._next = position + 1
         self._written += 1
 
     def snapshot(self):
@@ -143,8 +149,9 @@ class _PressureRing:
             }
         # The buffer has wrapped, so the oldest retained sample sits at the
         # write cursor and the columns have to be rotated back into order.
+        cursor = self._next % self._held
         return {
-            name: np.concatenate((column[self._next:], column[:self._next]))
+            name: np.concatenate((column[cursor:], column[:cursor]))
             for name, column in self._columns.items()
         }
 
