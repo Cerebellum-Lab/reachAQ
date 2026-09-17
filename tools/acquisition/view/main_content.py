@@ -6,10 +6,10 @@ from typing import Tuple, Optional, List
 import pandas
 
 from PySide6 import QtCore
-from PySide6.QtCore import QTimer, Slot, Signal, Qt, QSize, QPoint, QPointF
+from PySide6.QtCore import QTimer, Slot, Signal, Qt, QSize, QPoint, QPointF, QRect
 from PySide6.QtGui import QPixmap, QPainter, QPen, QPolygon, QPolygonF, QImage, QFont
 from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QStackedLayout, QWidget, QSizePolicy, QScrollBar, \
-    QScrollArea, QLayout, QTabWidget
+    QScrollArea, QLayout, QTabWidget, QToolButton
 
 from autotrainer.core import AnimalSubject, CameraId, ProjectInfo
 from autotrainer.core.logging import get_verbose_logger
@@ -30,6 +30,7 @@ from tools.acquisition.model.hardware_model import HardwareModel
 from tools.acquisition.view.analysis_content import AnalysisContent
 from tools.acquisition.view.behavior_content import BehaviorContent
 from tools.acquisition.view.camera_content import CameraContent
+from tools.acquisition.view.detachable_panel import DetachablePanelHost, PanelState
 from tools.acquisition.view.diagnostics_content import DiagnosticsContent
 from tools.acquisition.view.hardware_control_content import HardwareControlContent
 from tools.acquisition.view.hardware_status_content import HardwareStatusContent
@@ -202,6 +203,18 @@ class MainContent(ContentWidget):
         self._main_splitter.apply_saved_or_default_sizes([1180, 430])
         self._section_splitter.apply_saved_or_default_sizes([340, 410, 260, 120])
 
+        # 430 px is not enough for the protocol editor's 29 typed columns, so
+        # the panel can take most of the window or leave it for its own.
+        self._right_panel_host = DetachablePanelHost(
+            self._right_side_tabs,
+            self._main_splitter,
+            1,
+            title="Laser Control and Protocol",
+            parent=self,
+        )
+        self._right_panel_host.state_changed.connect(self._remember_right_panel_state)
+        self._restore_right_panel_placement()
+
         self._frame_count = 0
         self._start = 0
 
@@ -243,6 +256,53 @@ class MainContent(ContentWidget):
     @property
     def protocol_ui_enabled(self) -> bool:
         return self._protocol_ui_enabled
+
+    @property
+    def right_panel_host(self) -> DetachablePanelHost:
+        return self._right_panel_host
+
+    def update_right_panel_tracking(self) -> None:
+        """Keep an expanded panel over this widget as the window moves."""
+        self._right_panel_host.track(
+            QRect(self.mapToGlobal(self.rect().topLeft()), self.rect().size())
+        )
+
+    def _remember_right_panel_state(self, state: str) -> None:
+        self._preferences.right_panel_state = state
+        if state == PanelState.DETACHED.value:
+            window = self._right_panel_host.window
+            if window is not None:
+                self._preferences.right_panel_detached_geometry = window.geometry()
+
+    def _restore_right_panel_placement(self) -> None:
+        """Reopen where the panel was left, falling back to docked."""
+        state = self._preferences.right_panel_state
+        try:
+            if state == PanelState.EXPANDED.value:
+                self.update_right_panel_tracking()
+                self._right_panel_host.expand()
+            elif state == PanelState.DETACHED.value:
+                self._right_panel_host.detach(
+                    self._preferences.right_panel_detached_geometry
+                )
+        except Exception:
+            logger.exception("Could not restore the right panel placement")
+            self._right_panel_host.collapse()
+
+    def _toggle_right_panel_expanded(self) -> None:
+        if self._right_panel_host.state is PanelState.EXPANDED:
+            self._right_panel_host.collapse()
+            return
+        self.update_right_panel_tracking()
+        self._right_panel_host.expand()
+
+    def _toggle_right_panel_detached(self) -> None:
+        if self._right_panel_host.state is PanelState.DETACHED:
+            self._right_panel_host.collapse()
+            return
+        self._right_panel_host.detach(
+            self._preferences.right_panel_detached_geometry
+        )
 
     def _create_top_widget_manual(self):
         widget = QWidget()
@@ -436,6 +496,24 @@ class MainContent(ContentWidget):
         tabs.addTab(protocol_content, "Protocol")
         self._content_widgets.append(protocol_content)
 
+        corner = QWidget()
+        corner_layout = QHBoxLayout(corner)
+        corner_layout.setContentsMargins(0, 0, 4, 0)
+        corner_layout.setSpacing(2)
+        self._expand_panel_button = QToolButton()
+        self._expand_panel_button.setText("Expand")
+        self._expand_panel_button.setToolTip(
+            "Expand this panel leftward over the other panels"
+        )
+        self._expand_panel_button.clicked.connect(self._toggle_right_panel_expanded)
+        self._detach_panel_button = QToolButton()
+        self._detach_panel_button.setText("Detach")
+        self._detach_panel_button.setToolTip("Move this panel into its own window")
+        self._detach_panel_button.clicked.connect(self._toggle_right_panel_detached)
+        corner_layout.addWidget(self._expand_panel_button)
+        corner_layout.addWidget(self._detach_panel_button)
+        tabs.setCornerWidget(corner, Qt.Corner.TopRightCorner)
+
         return tabs
 
     def _create_protocol_phase_end_widget(self):
@@ -500,6 +578,9 @@ class MainContent(ContentWidget):
         self.update()
 
     def close(self):
+        # Bring the panel home first, so it is destroyed with its parent rather
+        # than left behind in a live top-level window.
+        self._right_panel_host.collapse()
         self._clear_reach_camera_grid()
         # Ensure the textbox handler is removed from root logger handlers.
         self._diagnostics_content.close()

@@ -966,10 +966,14 @@ class MainWindow(QMainWindow):
 
     def moveEvent(self, e):
         self._remember_normal_window_geometry()
+        # An expanded panel is its own top-level window, so it has to be told
+        # where the main window went.
+        self.main_content.update_right_panel_tracking()
         super(MainWindow, self).moveEvent(e)
 
     def resizeEvent(self, event):
         self._remember_normal_window_geometry()
+        self.main_content.update_right_panel_tracking()
         super().resizeEvent(event)
 
     def _edit_camera_settings(self):
