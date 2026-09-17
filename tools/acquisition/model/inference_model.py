@@ -44,6 +44,7 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
     IS_ENABLED = "is_enabled"
     IS_PREDICT_ENABLED = "is_predict_enabled"
     MODEL_LOCATION = "model_location"
+    OVERLAY_PARTS = "overlay_parts"
     LIVE_POSE_STATS = "live_pose_stats"
     """From the pose process, per reporting window:
 
@@ -182,6 +183,13 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
     def overlay_parts(self) -> tuple:
         """Parts the live overlay draws; empty means every part emitted."""
         return self._overlay_parts
+
+    @overlay_parts.setter
+    def overlay_parts(self, value):
+        value = tuple(value or ())
+        prev, self._overlay_parts = self._overlay_parts, value
+        if value != prev:
+            self._on_property_changed(self.OVERLAY_PARTS, value, prev)
 
     @property
     def model_location(self) -> str:
