@@ -25,6 +25,7 @@ from autotrainer.pyside.content_widget import ContentWidget, invoke_method
 
 from autotrainer.training import TrainingPlan, TrainingPhase
 from tools.acquisition.model.app_model import AppModel
+from tools.acquisition.model.inference_model import InferenceModel
 from tools.acquisition.model.hardware_model import HardwareModel
 from tools.acquisition.view.analysis_content import AnalysisContent
 from tools.acquisition.view.behavior_content import BehaviorContent
@@ -226,9 +227,18 @@ class MainContent(ContentWidget):
         #
         inference = app_model.inference
         inference.pose_response_ready += self.refresh_pose
+        # The overlay dialog writes the choice here; the panels follow it.
+        inference.property_changed += self._inference_property_changed
         #
         # app_model.behavior.algorithm.property_changed += self._behavior_algo_property_changed
         self.training_plan_changed.connect(self._update_training_plan)
+
+    def _inference_property_changed(self, name, value, _previous):
+        """Follow the overlay part choice as the operator changes it."""
+        if name != InferenceModel.OVERLAY_PARTS:
+            return
+        for _camera, camera_content in self._reach_camera_contents:
+            camera_content.set_overlay_parts(value)
 
     @property
     def protocol_ui_enabled(self) -> bool:
