@@ -327,6 +327,74 @@ def inference_latency():
     _save(figure, "inference_latency.png")
 
 
+#: Pose predict cost per batch, and the CPU decode block beside it. Author's rig
+#: measurements. Status colours: adopted, gated behind a flag, or measured and
+#: deliberately not adopted.
+GATED = "#c98c6a"
+DECLINED = "#a8adb4"
+
+PREDICT_MS = [
+    ("DLC TensorFlow ResNet-50\nbatch 6 at 256 px", 54.8, DECLINED, "starting point"),
+    ("+ partial batch\n2 real frames, no padding", 25.3, GATED, "gated: torch engine"),
+    ("mobile-class backbone\nbatch 6 at 256 px", 3.3, DECLINED, "measured, not adopted"),
+]
+
+DECODE_MS = [("before", 6.565, DECLINED), ("after", 2.675, AUTO)]
+
+
+def inference_ladder():
+    """Where the pose-tier milliseconds went."""
+    figure, (left, right) = plt.subplots(
+        1, 2, figsize=(12.4, 4.4), dpi=200, gridspec_kw={"width_ratios": [2.5, 1]}
+    )
+    figure.patch.set_facecolor("white")
+
+    labels = [row[0] for row in PREDICT_MS]
+    values = [row[1] for row in PREDICT_MS]
+    colors = [row[2] for row in PREDICT_MS]
+    notes = [row[3] for row in PREDICT_MS]
+    positions = numpy.arange(len(labels))
+    bars = left.barh(positions, values, 0.55, color=colors)
+    for bar, value, note in zip(bars, values, notes):
+        left.text(value + 0.9, bar.get_y() + bar.get_height() / 2,
+                  f"{value:g} ms   ({note})", va="center", fontsize=9, color=INK)
+    left.set_yticks(positions)
+    left.set_yticklabels(labels, fontsize=9, color=INK)
+    left.invert_yaxis()
+    left.set_xlim(0, 78)
+    left.set_xlabel("milliseconds per batch", fontsize=9, color=INK)
+    left.set_title("Pose predict", fontsize=11, color=INK, weight="bold", pad=10)
+    left.spines[["top", "right"]].set_visible(False)
+    left.tick_params(colors=MUTED, labelsize=8)
+
+    dec_pos = numpy.arange(len(DECODE_MS))
+    bars = right.barh(dec_pos, [row[1] for row in DECODE_MS], 0.5,
+                      color=[row[2] for row in DECODE_MS])
+    for bar, row in zip(bars, DECODE_MS):
+        right.text(row[1] + 0.2, bar.get_y() + bar.get_height() / 2, f"{row[1]:g} ms",
+                   va="center", fontsize=9, color=INK)
+    right.set_yticks(dec_pos)
+    right.set_yticklabels([row[0] for row in DECODE_MS], fontsize=9, color=INK)
+    right.invert_yaxis()
+    right.set_xlim(0, 9.5)
+    right.set_xlabel("milliseconds per batch", fontsize=9, color=INK)
+    right.set_title("CPU decode  (adopted, always on)", fontsize=11, color=INK,
+                    weight="bold", pad=10)
+    right.spines[["top", "right"]].set_visible(False)
+    right.tick_params(colors=MUTED, labelsize=8)
+
+    handles = [
+        plt.Rectangle((0, 0), 1, 1, color=AUTO),
+        plt.Rectangle((0, 0), 1, 1, color=GATED),
+        plt.Rectangle((0, 0), 1, 1, color=DECLINED),
+    ]
+    figure.legend(handles, ["adopted", "gated behind a flag", "not adopted"],
+                  frameon=False, fontsize=9, ncol=3, loc="lower center",
+                  bbox_to_anchor=(0.5, -0.04))
+    figure.tight_layout()
+    _save(figure, "inference_ladder.png")
+
+
 def synchronization():
     """One clock, and what hangs off it."""
     # No title or footnote inside the figure: the slide supplies both, and
@@ -368,6 +436,7 @@ def main():
     pipeline()
     stim_latency()
     inference_latency()
+    inference_ladder()
     synchronization()
     two_tier()
     demo_substitution()
