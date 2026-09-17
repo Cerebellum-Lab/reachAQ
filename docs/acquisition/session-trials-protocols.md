@@ -155,6 +155,14 @@ revised and captured again. A protocol that uses epochs or blocks is refused
 rather than flattened, since the compiler writes epochs itself and folding an
 epoch into the bulk layer would change its precedence relative to blocks.
 
+Experiments are built in the sidebar beside the trial table. **New experiment**
+starts an empty one; its entry table then takes one row per appearance, with the
+set, a repeat count, and a shuffle toggle, ordered by **Up** and **Down**.
+Adding a row pins the set's current revision. Editing never repins an existing
+row, and a row whose set has moved on shows both revisions, so a stale pin is
+visible before a compile refuses it. **Save experiment** stores the list;
+**Compile and save** turns it into a protocol.
+
 Sets live in `trial_protocol_sets/` and experiments in `trial_experiments/`,
 beside `trial_protocols/`, one file each. A loaded configuration brings its own
 libraries.
