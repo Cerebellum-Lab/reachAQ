@@ -212,6 +212,7 @@ class MainContent(ContentWidget):
             title="Laser Control and Protocol",
             parent=self,
         )
+        self._closing_right_panel = False
         self._right_panel_host.state_changed.connect(self._remember_right_panel_state)
         self._restore_right_panel_placement()
 
@@ -268,6 +269,11 @@ class MainContent(ContentWidget):
         )
 
     def _remember_right_panel_state(self, state: str) -> None:
+        # Teardown brings the panel home, which is not the operator choosing
+        # docked. Recording it would mean an expanded or detached panel never
+        # survived a restart, which is the whole point of remembering it.
+        if self._closing_right_panel:
+            return
         self._preferences.right_panel_state = state
         if state == PanelState.DETACHED.value:
             window = self._right_panel_host.window
@@ -579,7 +585,9 @@ class MainContent(ContentWidget):
 
     def close(self):
         # Bring the panel home first, so it is destroyed with its parent rather
-        # than left behind in a live top-level window.
+        # than left behind in a live top-level window. The flag keeps that from
+        # being recorded as the operator docking it.
+        self._closing_right_panel = True
         self._right_panel_host.collapse()
         self._clear_reach_camera_grid()
         # Ensure the textbox handler is removed from root logger handlers.

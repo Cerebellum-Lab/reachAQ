@@ -103,3 +103,16 @@ def test_the_toggle_buttons_expand_and_restore(main_content):
 
     main_content._expand_panel_button.click()
     assert host.state is PanelState.DOCKED
+
+
+def test_closing_does_not_overwrite_the_remembered_placement(main_content, app_model):
+    # close() brings the panel home so it is destroyed with its parent, but
+    # that must not be recorded as the operator choosing docked: it would mean
+    # an expanded or detached panel never survived a restart.
+    host = main_content.right_panel_host
+    host.expand()
+    assert app_model.preferences.right_panel_state == "expanded"
+
+    main_content.close()
+
+    assert app_model.preferences.right_panel_state == "expanded"
