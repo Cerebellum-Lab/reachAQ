@@ -138,6 +138,31 @@ class UserPreferences(ObservableObject):
         self._on_property_changed(self.WINDOW_NORMAL_GEOMETRY, value, previous)
 
     @property
+    def right_panel_state(self) -> str:
+        """Where the laser and protocol panel was left: docked, expanded or detached."""
+        value = self._settings.value("ui/panels/right_side_state", "docked")
+        return str(value) if value else "docked"
+
+    @right_panel_state.setter
+    def right_panel_state(self, value: str) -> None:
+        self._settings.setValue("ui/panels/right_side_state", str(value))
+
+    @property
+    def right_panel_detached_geometry(self) -> QRect:
+        value = self._settings.value(
+            "ui/panels/right_side_detached_geometry", QRect()
+        )
+        return QRect(value) if isinstance(value, QRect) else QRect()
+
+    @right_panel_detached_geometry.setter
+    def right_panel_detached_geometry(self, value: QRect) -> None:
+        value = QRect(value)
+        # A zero-size or invalid rectangle would restore an unusable window.
+        if not value.isValid() or value.width() < 1 or value.height() < 1:
+            return
+        self._settings.setValue("ui/panels/right_side_detached_geometry", value)
+
+    @property
     def last_configuration(self) -> str:
         return self._last_configuration
 
