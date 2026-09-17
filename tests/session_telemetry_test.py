@@ -293,3 +293,34 @@ def test_work_finished_after_the_session_is_not_counted_against_it(telemetry):
     telemetry.record_inference(count=8474, mean_ms=4.3, max_ms=10.2)
     assert telemetry.frames_inferenced == 6749
     assert telemetry.inferenced_percent <= 100.0
+
+
+def test_poses_never_outnumber_frames(telemetry):
+    """The two counters are sampled independently, half a second apart.
+
+    A pose is computed from an acquired frame, so more poses than frames cannot
+    happen; the excess is the fresher counter running ahead. A real session
+    reported 101.4% this way, from 4575 poses against 4512 frames.
+    """
+    telemetry.record_capture(0, acquired=4512, dropped=0)
+    telemetry.record_inference(count=4575, mean_ms=4.3, max_ms=5.3)
+    assert telemetry.frames_inferenced == 4512
+    assert telemetry.inferenced_percent == pytest.approx(100.0)
+
+
+def test_the_cap_lifts_once_the_frame_count_catches_up(telemetry):
+    """Capping the readout must not lose the poses themselves."""
+    telemetry.record_capture(0, acquired=4512, dropped=0)
+    telemetry.record_inference(count=4575, mean_ms=4.3, max_ms=5.3)
+    assert telemetry.frames_inferenced == 4512
+
+    telemetry.record_capture(0, acquired=4600, dropped=0)
+    assert telemetry.frames_inferenced == 4575
+
+
+def test_a_genuine_shortfall_is_still_reported(telemetry):
+    """The cap is an upper bound only; under-inferencing must stay visible."""
+    telemetry.record_capture(0, acquired=1000, dropped=0)
+    telemetry.record_inference(count=400, mean_ms=4.0, max_ms=5.0)
+    assert telemetry.frames_inferenced == 400
+    assert telemetry.inferenced_percent == pytest.approx(40.0)
