@@ -230,11 +230,28 @@ class SessionTelemetry(ObservableObject):
 
     @property
     def frames_inferenced(self) -> int:
+        """Poses computed this session, never more than frames acquired.
+
+        The two counts come from separate periodic reports - the capture
+        process every 0.5 s, the pose process every 0.5 s - so at any instant
+        one can be up to half a second fresher than the other. At 150 fps that
+        is 75 frames of skew, which showed up as a session reporting 101.4% of
+        frames inferenced.
+
+        A pose is computed from an acquired frame, so more poses than frames is
+        not a thing that can happen; the excess is always the newer counter
+        running ahead of the older one. Capping keeps the count and the
+        percentage consistent with each other rather than leaving an operator
+        to reconcile 4575 of 4512.
+        """
         if self._frozen is not None:
             return self._frozen["inferenced"]
         if self._started_perf is None:
             return 0
-        return self._since_baseline(self._inferenced, self._baseline_inferenced)
+        inferenced = self._since_baseline(self._inferenced,
+                                          self._baseline_inferenced)
+        acquired = self.frames_acquired
+        return min(inferenced, acquired) if acquired > 0 else inferenced
 
     @property
     def inferenced_percent(self) -> float:
