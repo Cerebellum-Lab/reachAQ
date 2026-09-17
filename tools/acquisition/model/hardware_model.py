@@ -24,6 +24,7 @@ from autotrainer.device import (CanTransportConfiguration, CanTransportKind, Dev
                                 DeviceConnection, CanDevice, CanFailure, CanFailureKind,
                                 StepperConfig, ServoConfig, Device, ColorLed, Target, EmulationInterface,
                                 capture_can_diagnostics)
+from autotrainer.device.device_interface import BOARD_STIM_LINE_OUTPUTS
 from autotrainer.behavior import PelletDeviceProtocol
 from tools.acquisition.model.firmware_compatibility import FirmwareCompatibilityPolicy
 
@@ -446,13 +447,28 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         duration_ms = int(duration * 1000)
         return self._send_with_token(self._device_conn, SystemCommandKind.PLAY_TONE, (frequency, duration_ms))
 
-    def pulse_stim3(self, duration_us: int) -> Optional[UUID]:
-        """Pulse physical pellet-board STIM3 (logical stimulus output 4)."""
+    def pulse_stim(self, duration_us: int, stim_line: int = 3) -> Optional[UUID]:
+        """Pulse a pellet-board stimulus line, named as the board names it.
+
+        Board STIM2 and STIM3 only; STIM0 and STIM1 carry the firmware tone
+        confirmations. BOARD_STIM_LINE_OUTPUTS holds the off-by-one between the
+        board's labels and the host's DigitalOutputs.
+        """
+        output = BOARD_STIM_LINE_OUTPUTS.get(int(stim_line))
+        if output is None:
+            raise ValueError(
+                f"Board STIM{stim_line} cannot carry a stimulus pulse; use "
+                "board STIM2 or STIM3"
+            )
         return self._send_with_token(
             self._device_conn,
             SystemCommandKind.PULSE_DIGITAL_OUTPUT,
-            (4, int(duration_us)),
+            (int(output.value), int(duration_us)),
         )
+
+    def pulse_stim3(self, duration_us: int) -> Optional[UUID]:
+        """Pulse physical pellet-board STIM3, the line available before STIM2."""
+        return self.pulse_stim(duration_us, stim_line=3)
 
     def delay(self, amount: float) -> Optional[UUID]:
         return self._send_with_token(self._device_conn, SystemCommandKind.DELAY, amount)

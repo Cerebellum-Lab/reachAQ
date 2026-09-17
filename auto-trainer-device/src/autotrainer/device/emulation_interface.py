@@ -10,7 +10,8 @@ from autotrainer.core.logging import get_verbose_logger
 from .device_interface import (DeviceInterface, ServoConfig, StepperConfig,
                                StepperStatus, ServoStatus, Target, DigitalOutputs,
                                Motor, AnalogOutputs, Version,
-                               PelletDigitalInputs, Acknowledge, ColorLed
+                               PelletDigitalInputs, Acknowledge, ColorLed,
+                               BOARD_STIM_LINE_OUTPUTS
                                )
 from .can_interface import motor_to_str
 
@@ -315,12 +316,20 @@ class EmulationInterface(DeviceInterface):
         return self._is_open
 
     def pulse_digital_output(self, gpio: DigitalOutputs, duration_us: int) -> bool:
-        """Emulate the firmware-owned finite STIM3 pulse acknowledgement."""
-        if DigitalOutputs(gpio) is not DigitalOutputs.STIMULUS_4:
-            raise ValueError("Finite pulse output currently supports STIM3 only")
+        """Emulate the firmware-owned finite pulse acknowledgement.
+
+        Mirrors CanInterface.pulse_digital_output, including refusing the two
+        tone confirmation lines, so the emulator keeps matching the board.
+        """
+        gpio = DigitalOutputs(gpio)
+        if gpio not in BOARD_STIM_LINE_OUTPUTS.values():
+            raise ValueError(
+                f"Finite pulse output supports board STIM2 and STIM3 only; "
+                f"{gpio.name} drives a tone confirmation line"
+            )
         duration_us = int(duration_us)
         if not 100 <= duration_us <= 5_000_000:
-            raise ValueError("STIM3 pulse duration must be within 100 us..5 s")
+            raise ValueError("Stimulus pulse duration must be within 100 us..5 s")
         if self._is_open:
             logger.info("Pulse digital output %s for %s us", int(gpio.value), duration_us)
             self._messages.append(Acknowledge(uuid=EmulationInterface.next_uuid()))

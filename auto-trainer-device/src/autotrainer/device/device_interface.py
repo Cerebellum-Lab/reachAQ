@@ -48,6 +48,20 @@ class DigitalOutputs(IntEnum):
     STIMULUS_4 = 4
 
 
+#: Board stimulus line label to the output that drives it. The pellet board
+#: device tree names its four outputs STIM0..STIM3 while this enum counts from
+#: one, so board STIM2 is STIMULUS_3. This is the only place that off-by-one is
+#: written down; resolve board labels through here rather than restating it.
+#:
+#: STIM0 and STIM1 are deliberately absent. The firmware tone generator drives
+#: those two pins directly as the Tone 1 and Tone 2 TTL confirmations the NI-DAQ
+#: records, so they cannot also carry a stimulus pulse.
+BOARD_STIM_LINE_OUTPUTS = {
+    2: DigitalOutputs.STIMULUS_3,
+    3: DigitalOutputs.STIMULUS_4,
+}
+
+
 class AnalogOutputs(IntEnum):
     STATUS_OUT = 1
 

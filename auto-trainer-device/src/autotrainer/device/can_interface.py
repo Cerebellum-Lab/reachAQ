@@ -81,6 +81,14 @@ logger = get_verbose_logger(__name__)
 
 _debug_path_fake_status_timeout = Path("/tmp/autotrainer_fake_device_timeout")
 
+#: Stimulus outputs that can carry a firmware-timed finite pulse, mapped to the
+#: generic-GPIO index the board expects. The index is offset by the board's
+#: inputs, which is why board STIM2 is 6 and board STIM3 is 7.
+_PULSEABLE_GPIO_INDEX = {
+    DigitalOutputs.STIMULUS_3: 6,  # board STIM2
+    DigitalOutputs.STIMULUS_4: 7,  # board STIM3
+}
+
 
 class MissingDeviceAddressError(RuntimeError):
     """Dedicated for when device address could not be read"""
@@ -1564,19 +1572,29 @@ class CanInterface(DeviceInterface):
         gpio: DigitalOutputs,
         duration_us: int,
     ) -> bool:
-        """Request the firmware-owned, guaranteed-return-low STIM3 pulse."""
-        if DigitalOutputs(gpio) is not DigitalOutputs.STIMULUS_4:
-            raise ValueError("Finite pulse output currently supports STIM3 only")
+        """Request a firmware-owned, guaranteed-return-low pulse on STIM2/STIM3.
+
+        The generic-GPIO index is offset by the board's inputs, so board STIM2
+        is index 6 and board STIM3 is index 7. STIM0 and STIM1 are refused: the
+        firmware tone generator owns those pins as the Tone 1 and Tone 2 TTL
+        confirmations, so pulsing them would contend with tone reporting.
+        """
+        gpio = DigitalOutputs(gpio)
+        gpio_index = _PULSEABLE_GPIO_INDEX.get(gpio)
+        if gpio_index is None:
+            raise ValueError(
+                f"Finite pulse output supports board STIM2 and STIM3 only; "
+                f"{gpio.name} drives a tone confirmation line"
+            )
         duration_us = int(duration_us)
         if not 100 <= duration_us <= 5_000_000:
-            raise ValueError("STIM3 pulse duration must be within 100 us..5 s")
+            raise ValueError("Stimulus pulse duration must be within 100 us..5 s")
         pulse = getattr(self._jc, "GPIOPulse", None)
         if pulse is None:
             raise RuntimeError("Pellet firmware/transport does not support finite GPIO pulse")
         addr = self._tgt2addr(Target.PELLET_DEVICE)
         uuid = CanInterface.next_uuid()
-        # Physical STIM3 = the fourth logical stimulus output = GPIO 0:7.
-        return pulse(addr, 0, 7, duration_us, uuid) == 0
+        return pulse(addr, 0, gpio_index, duration_us, uuid) == 0
 
     def request_capabilities(self) -> bool:
         request = getattr(self._jc, "RequestCapabilities", None)

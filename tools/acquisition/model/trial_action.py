@@ -199,9 +199,20 @@ class LaserPulseProfile:
     trigger_route: LaserTriggerRoute = LaserTriggerRoute.HARDWARE_STIM3
     trigger_terminal: str = ""
     trigger_pulse_us: int = 1000
+    #: Board stimulus line the hardware trigger pulses, named the way the board
+    #: device tree names it. Defaults to 3 so every profile saved before the
+    #: second line existed keeps the line it was built against. STIM0 and STIM1
+    #: are not selectable: the firmware tone generator owns those pins.
+    stim_line: int = 3
 
     def __post_init__(self):
         object.__setattr__(self, "trigger_route", LaserTriggerRoute(self.trigger_route))
+        if int(self.stim_line) not in (2, 3):
+            raise ValueError(
+                "Laser profiles must pulse board STIM2 or STIM3; STIM0 and "
+                "STIM1 carry the tone confirmations"
+            )
+        object.__setattr__(self, "stim_line", int(self.stim_line))
         numeric = (
             self.amplitude_volts,
             self.pulse_duration_ms,

@@ -18,7 +18,7 @@ from tools.acquisition.model.trial_action import (
 )
 
 
-PROFILE_SCHEMA_VERSION = 4
+PROFILE_SCHEMA_VERSION = 5
 
 
 def _cue_interval_profile(record: Mapping[str, object]) -> CueIntervalProfile:
@@ -94,7 +94,7 @@ class StimulusProfileLibrary:
     @classmethod
     def from_record(cls, record: Mapping[str, object]):
         schema_version = int(record.get("schema_version", 0))
-        if schema_version not in {1, 2, 3, PROFILE_SCHEMA_VERSION}:
+        if schema_version not in {1, 2, 3, 4, PROFILE_SCHEMA_VERSION}:
             raise ValueError(
                 f"Unsupported stimulus-profile schema {schema_version}"
             )

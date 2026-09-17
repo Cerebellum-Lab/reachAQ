@@ -44,17 +44,22 @@ class StimTestResult:
     trigger_pulse_us: int
     arm_to_terminal_ms: Optional[float]
     detail: str = ""
+    stim_line: int = 3
 
     def __str__(self) -> str:
         if self.arm_to_terminal_ms is None:
-            return "Stim test {} on laser {}: {}".format(
-                self.profile_id, self.channel_id, self.detail or "completed"
-            )
-        return (
-            "Stim test {} on laser {}: board pulse {} us on {}, "
-            "arm to terminal {:.2f} ms".format(
+            return "Stim test {} on laser {} via STIM{}: {}".format(
                 self.profile_id,
                 self.channel_id,
+                self.stim_line,
+                self.detail or "completed",
+            )
+        return (
+            "Stim test {} on laser {}: STIM{} pulse {} us started the waveform "
+            "on {}, arm to terminal {:.2f} ms".format(
+                self.profile_id,
+                self.channel_id,
+                self.stim_line,
                 self.trigger_pulse_us,
                 self.trigger_terminal,
                 self.arm_to_terminal_ms,

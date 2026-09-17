@@ -4423,7 +4423,7 @@ class AppModel(ObservableObject):
                     "revision": profile.revision,
                     "summary": (
                         f"channel {profile.channel_id}, {profile.amplitude_volts:g} V, "
-                        f"{profile.pulse_duration_ms:g} ms"
+                        f"{profile.pulse_duration_ms:g} ms, STIM{profile.stim_line}"
                     ),
                 }
                 for profile in self._laser_profiles.values()
@@ -5123,7 +5123,9 @@ class AppModel(ObservableObject):
             self._stim_camera.disarm_stim_detector(handle.get("operation_id"))
 
     def _trigger_protocol_stim3(self, profile, recipe, detail) -> None:
-        token = self._hardware.pulse_stim3(profile.trigger_pulse_us)
+        token = self._hardware.pulse_stim(
+            profile.trigger_pulse_us, stim_line=profile.stim_line
+        )
         if token is None:
             raise RuntimeError("Firmware STIM3 pulse was not queued")
         timeout = max(3.0, profile.trigger_pulse_us / 1e6 + 2.0)
@@ -5165,9 +5167,13 @@ class AppModel(ObservableObject):
             add_terminal_callback(lambda _operation: finished.set())
         started = time.perf_counter()
         try:
-            token = self._hardware.pulse_stim3(int(profile.trigger_pulse_us))
+            token = self._hardware.pulse_stim(
+                int(profile.trigger_pulse_us), stim_line=profile.stim_line
+            )
             if token is None:
-                raise RuntimeError("Firmware STIM3 pulse was not queued")
+                raise RuntimeError(
+                    "Firmware STIM{} pulse was not queued".format(profile.stim_line)
+                )
             timeout = max(3.0, profile.trigger_pulse_us / 1e6 + 2.0)
             self._hardware.wait_pending_command_acked(token, timeout=timeout)
             completed = finished.wait(timeout)
@@ -5187,6 +5193,7 @@ class AppModel(ObservableObject):
             trigger_terminal=profile.trigger_terminal,
             trigger_pulse_us=int(profile.trigger_pulse_us),
             arm_to_terminal_ms=elapsed_ms if completed else None,
+            stim_line=int(profile.stim_line),
             detail=(
                 "completed"
                 if completed

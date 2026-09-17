@@ -53,8 +53,8 @@ class FakeHardware:
             "reported_capabilities": ["finite_stim3_pulse"]
         }
 
-    def pulse_stim3(self, duration_us):
-        self.pulses.append(duration_us)
+    def pulse_stim(self, duration_us, stim_line=3):
+        self.pulses.append((duration_us, stim_line))
         # The board acknowledges, and the armed waveform runs to completion.
         threading.Timer(0.0, self.operation.finish).start()
         return "token"
@@ -95,7 +95,7 @@ def test_a_bench_test_arms_the_output_before_pulsing_the_board(bench):
     result = model.run_stim_bench_test("stim-a")
 
     assert laser.prepared, "the analog output must be armed first"
-    assert hardware.pulses == [1000]
+    assert hardware.pulses == [(1000, 3)]
     assert isinstance(result, StimTestResult)
     assert result.arm_to_terminal_ms is not None
 
@@ -130,10 +130,10 @@ def test_an_unknown_profile_is_refused(bench):
 def test_a_board_failure_cancels_the_armed_output(bench):
     model, laser, hardware, operation = bench
 
-    def fail(_duration_us):
+    def fail(_duration_us, stim_line=3):
         raise RuntimeError("bus down")
 
-    hardware.pulse_stim3 = fail
+    hardware.pulse_stim = fail
 
     with pytest.raises(RuntimeError, match="bus down"):
         model.run_stim_bench_test("stim-a")
@@ -144,7 +144,7 @@ def test_a_board_failure_cancels_the_armed_output(bench):
 
 def test_a_board_that_does_not_queue_the_pulse_cancels_the_output(bench):
     model, laser, hardware, operation = bench
-    hardware.pulse_stim3 = lambda _duration_us: None
+    hardware.pulse_stim = lambda _duration_us, stim_line=3: None
 
     with pytest.raises(RuntimeError, match="not queued"):
         model.run_stim_bench_test("stim-a")
@@ -169,7 +169,7 @@ def test_a_board_that_reports_nothing_still_runs(bench):
 
     result = model.run_stim_bench_test("stim-a")
 
-    assert hardware.pulses == [1000]
+    assert hardware.pulses == [(1000, 3)]
     assert result.profile_id == "stim-a"
 
 
@@ -186,3 +186,14 @@ def test_a_software_route_profile_is_refused(bench):
         model.run_stim_bench_test("stim-a")
 
     assert hardware.pulses == []
+
+
+def test_a_stim2_profile_pulses_the_second_line(bench):
+    model, _laser, hardware, _operation = bench
+    model._laser_profiles = {"stim-b": make_profile(profile_id="stim-b", stim_line=2)}
+
+    result = model.run_stim_bench_test("stim-b")
+
+    assert hardware.pulses == [(1000, 2)]
+    assert result.stim_line == 2
+    assert "STIM2" in str(result)
