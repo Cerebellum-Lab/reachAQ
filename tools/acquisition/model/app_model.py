@@ -194,6 +194,7 @@ from tools.acquisition.model.trial_protocol_set_repository import (
 )
 from tools.acquisition.model.experiment_compiler import compile_experiment
 from tools.acquisition.model.trial_protocol_set import (
+    ExperimentComposition,
     document_from_set,
     set_from_document,
 )
@@ -4307,6 +4308,32 @@ class AppModel(ObservableObject):
     def experiment_compositions(self):
         with self._trial_protocol_lock:
             return self._experiment_repository.documents
+
+    def create_experiment(self, experiment_id: str, name: str):
+        """Start an empty experiment for the builder to fill."""
+        with self._trial_protocol_lock:
+            if self._experiment_repository.get(experiment_id) is not None:
+                raise ValueError(
+                    "Experiment {!r} already exists".format(experiment_id)
+                )
+            return self._experiment_repository.save(
+                ExperimentComposition(experiment_id=experiment_id, name=name)
+            )
+
+    def save_experiment_entries(self, experiment_id: str, entries):
+        """Replace an experiment's ordered set list.
+
+        Entries are not checked against the set library here: an experiment is
+        a draft until it is compiled, and compile_experiment is where a missing
+        set or a stale revision pin is reported against the offending entry.
+        """
+        with self._trial_protocol_lock:
+            composition = self._experiment_repository.get(experiment_id)
+            if composition is None:
+                raise ValueError("Unknown experiment {!r}".format(experiment_id))
+            return self._experiment_repository.save(
+                composition.with_entries(tuple(entries))
+            )
 
     def compile_and_save_experiment(self, experiment_id: str):
         """Compile an experiment and publish it as a selectable protocol."""

@@ -7,6 +7,7 @@ appearance to carry provenance through the existing resolution order.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from typing import Mapping, Optional, Tuple
 
@@ -201,6 +202,12 @@ class ExperimentComposition:
         # An empty experiment is allowed so it can be built up in the editor.
         # compile_experiment refuses to compile one.
         object.__setattr__(self, "entries", tuple(self.entries))
+
+    def with_entries(
+        self, entries: Tuple["ExperimentSetEntry", ...]
+    ) -> "ExperimentComposition":
+        """Same experiment, different set list. Used by the builder."""
+        return dataclasses.replace(self, entries=tuple(entries))
 
     def to_record(self) -> dict:
         return {
