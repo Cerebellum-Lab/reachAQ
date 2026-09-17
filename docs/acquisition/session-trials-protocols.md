@@ -118,6 +118,47 @@ are saved when Stop closes the writers but remain editable afterward; subsequent
 edits atomically replace the stopped session's JSON/YAML metadata. Beginning the
 next recording finalizes the previous notes and clears the Notes field.
 
+## Trial sets and experiment composition
+
+A **trial set** is a reusable group of trials saved on its own, so a phase
+shared by several experiments is written once instead of duplicated into each
+protocol. A set holds trial content only: defaults, bulk overrides, and
+individual trial overrides. It has no epochs and no blocks, because those are
+the experiment level.
+
+An **experiment** is an ordered list of set appearances. Each entry names a set,
+**pins the set revision** it was built against, may **repeat** that set several
+times, and may **shuffle the trial order within each appearance**. Pinning means
+editing a set later cannot silently change an experiment that was already
+validated; a compile against a changed set is refused, naming the entry.
+
+**Compiling** an experiment flattens it into an ordinary protocol document,
+saved into the same protocol library and selected for a session in the usual
+way. Nothing about the runtime changes: the runner, the schedule, session
+persistence, and session evidence all see a normal protocol.
+
+Each set appearance becomes one **epoch** in the compiled protocol, named after
+the set. Values resolve in the order protocol defaults, epochs, blocks, bulk
+overrides, individual trial overrides, so a set's own precedence is preserved
+and the `Sources` column names the set each value came from. A set used more
+than once is numbered, counting appearances across the whole experiment.
+
+Shuffling is reproducible. The seed is stored on the entry, and an entry that
+asks to shuffle without one has a seed drawn and written back at the first
+compile, so a compile can always be repeated exactly. Repeats of one entry
+differ from each other while still deriving from that single stored seed.
+
+Sets are authored through the protocol editor rather than a separate one. **Set
+from protocol** captures the protocol currently selected for the session as a
+set; **Open set** publishes a set back as an ordinary protocol so it can be
+revised and captured again. A protocol that uses epochs or blocks is refused
+rather than flattened, since the compiler writes epochs itself and folding an
+epoch into the bulk layer would change its precedence relative to blocks.
+
+Sets live in `trial_protocol_sets/` and experiments in `trial_experiments/`,
+beside `trial_protocols/`, one file each. A loaded configuration brings its own
+libraries.
+
 ## Trial and attempt accounting
 
 Every pellet send dispatch creates an operation ID and an attempt record. A
