@@ -328,7 +328,7 @@ class NidaqSignalStreamController:
                 samps_per_chan=buffer_size,
                 **timing_kwargs,
             )
-            self._configure_reference_clock(analog_task)
+            self._configure_reference_clock(analog_task, device_name)
             self._configure_start_trigger(analog_task, device_name)
             self._configure_exports(analog_task, device_name, "ai")
             self._make_stream_reader(device_name, analog_task, analog_channels, analog=True)
@@ -394,7 +394,7 @@ class NidaqSignalStreamController:
             digital_task.di_channels.all.di_data_xfer_req_cond = (
                 self._nidaqmx.constants.InputDataTransferCondition.ON_BOARD_MEMORY_NOT_EMPTY
             )
-            self._configure_reference_clock(digital_task)
+            self._configure_reference_clock(digital_task, device_name)
             self._configure_start_trigger(digital_task, device_name)
             self._configure_exports(digital_task, device_name, "di")
             self._make_stream_reader(device_name, digital_task, digital_channels, analog=False)
@@ -554,7 +554,7 @@ class NidaqSignalStreamController:
             sample_mode=self._nidaqmx.constants.AcquisitionType.CONTINUOUS,
             samps_per_chan=buffer_size,
         )
-        self._configure_reference_clock(task)
+        self._configure_reference_clock(task, device_name)
         self._configure_exports(task, device_name, "counter")
         return f"/{device_name}/Ctr0InternalOutput"
 
@@ -621,15 +621,53 @@ class NidaqSignalStreamController:
             raise RuntimeError(f"NI-DAQ slave {device_name} has no sample clock")
         return {"source": source}
 
-    def _configure_reference_clock(self, task) -> None:
+    def _reference_clock_for(self, device_name: str):
+        """The device's own reference-clock terminal, or None if it has none.
+
+        The plan carries one terminal name for the whole chassis, and the
+        boards are not alike: a PXI-6221 exposes /PXI1Slot5/PXI_Clk10 while
+        the PXI-6713 beside it exposes no Clk10 at all. Setting a reference
+        clock on the board that has none fails the task with "property is
+        not supported by the device", which took down the whole signal
+        stream the moment hardware-timed output was enabled.
+
+        An explicitly configured terminal is returned untouched - naming one
+        is a deliberate choice and this must not second-guess it. A bare
+        name is matched against what the device actually reports, which also
+        fixes its spelling: the default is written PXI_CLK10 and NI calls
+        the terminal PXI_Clk10.
+        """
         plan = self._timing_plan
-        if plan is None or not plan.reference_clock_source:
+        source = None if plan is None else plan.reference_clock_source
+        if not source:
+            return None
+        if source.startswith("/"):
+            return source
+        try:
+            terminals = self._nidaqmx.system.Device(device_name).terminals
+        except Exception:
+            # Cannot ask, so do not guess on this device's behalf.
+            logger.warning("could not read terminals of %s; leaving its "
+                           "reference clock unset", device_name)
+            return None
+        wanted = source.rsplit("/", 1)[-1].lower()
+        for terminal in terminals:
+            if terminal.rsplit("/", 1)[-1].lower() == wanted:
+                return terminal
+        logger.info("%s exposes no %s terminal; running it without a "
+                    "reference clock", device_name, source)
+        return None
+
+    def _configure_reference_clock(self, task, device_name: str) -> None:
+        plan = self._timing_plan
+        source = self._reference_clock_for(device_name)
+        if source is None:
             return
         timing = getattr(task, "timing", None)
         if timing is None:
             return
         if hasattr(timing, "ref_clk_src"):
-            timing.ref_clk_src = plan.reference_clock_source
+            timing.ref_clk_src = source
         if (
             plan.reference_clock_rate_hz is not None
             and hasattr(timing, "ref_clk_rate")

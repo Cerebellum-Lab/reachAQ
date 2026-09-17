@@ -1,6 +1,27 @@
 schema_version: 1
 board_type: pellet_module
 versions:
+  - version: 2.2.0
+    wire_schema_version: 1
+    required_capabilities: []
+    optional_capabilities:
+      - timing_trailer
+      - time_sync
+      - finite_stim3_pulse
+    hardware_release: v2.2.0
+    tested_reachaq_release: pre-release-devel
+    qualification_status: rollout_pending
+    qualification_date: null
+    limitations:
+      - Physical rig qualification and retained acceptance evidence are pending.
+      - >-
+        Qualified for the stimulus output bound to a BNC connector. The
+        capability set is carried over from 2.1.0 unchanged: this firmware
+        family still implements no capability-report or time-sync command, so
+        those stay optional and a 2.2.0 board runs with host-receive timestamp
+        confidence, exactly as 2.0.0 and 2.1.0 do. Added because an unqualified
+        version refuses to record at all, which stopped a 2.2.0 board arming
+        its session streams.
   - version: 2.1.0
     wire_schema_version: 1
     required_capabilities: []
