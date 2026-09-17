@@ -155,10 +155,22 @@ def test_a_board_that_does_not_queue_the_pulse_cancels_the_output(bench):
 
 def test_the_capability_guard_reads_the_hardware_model_record(bench):
     model, _laser, hardware, _operation = bench
-    hardware.firmware_compatibility = {"reported_capabilities": []}
+    hardware.firmware_compatibility = {"reported_capabilities": ["time_sync"]}
 
     with pytest.raises(RuntimeError, match="finite_stim3_pulse"):
         model.run_stim_bench_test("stim-a")
+
+
+def test_a_board_that_reports_nothing_still_runs(bench):
+    # Shipped firmware does not answer the capability request at all, so an
+    # empty record must not block a path the trial route already drives.
+    model, _laser, hardware, _operation = bench
+    hardware.firmware_compatibility = {}
+
+    result = model.run_stim_bench_test("stim-a")
+
+    assert hardware.pulses == [1000]
+    assert result.profile_id == "stim-a"
 
 
 def test_a_software_route_profile_is_refused(bench):

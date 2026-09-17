@@ -230,6 +230,28 @@ class _LaserChannelTab(QWidget):
         trigger_options_layout.addStretch(1)
         pulse_layout.addWidget(trigger_options, 10, 0, 1, 2)
         pulse_layout.addWidget(self._run_pulse_button, 11, 1)
+
+        # Run Pulse above drives the analog output straight from the host. This
+        # fires a saved profile the way a trial does: arm the output on its
+        # trigger terminal, then let the board's timed STIM3 pulse start it.
+        self.stim_profile_selector = QComboBox()
+        self.stim_profile_selector.setToolTip(
+            "Saved laser profiles that target this channel"
+        )
+        self.stim_test_button = QPushButton("Test stim (hardware trigger)")
+        self.stim_test_button.setToolTip(
+            "Arm this channel's analog output on its trigger terminal, then ask "
+            "the board for its timed STIM3 pulse to start the waveform"
+        )
+        self.stim_test_button.clicked.connect(self._run_stim_test)
+        self.stim_test_result = QLabel()
+        self.stim_test_result.setWordWrap(True)
+        self.stim_test_result.setObjectName("LaserPreviewStatus")
+        pulse_layout.addWidget(self._form_label("Stim profile:"), 12, 0)
+        pulse_layout.addWidget(self.stim_profile_selector, 12, 1)
+        pulse_layout.addWidget(self.stim_test_button, 13, 1)
+        pulse_layout.addWidget(self.stim_test_result, 14, 0, 1, 2)
+
         pulse_page_layout.addWidget(pulse_group)
 
         self._preview_plot = PGWidget()
@@ -477,6 +499,7 @@ class _LaserChannelTab(QWidget):
                 )
             )
         self.refresh_signal_selections()
+        self.refresh_stim_profiles()
         self._connect_preview_signals()
         self._refresh_trigger_mode_enabled()
         self._refresh_preview()
@@ -762,6 +785,49 @@ class _LaserChannelTab(QWidget):
             return f"Pulse complete: laser {self._channel.channel_id.value}"
 
         self._start_operation(f"Running laser {self._channel.channel_id.value} pulse train", operation)
+
+    def refresh_stim_profiles(self) -> None:
+        """List saved laser profiles that target this channel."""
+        previous = self.stim_profile_selector.currentData()
+        self.stim_profile_selector.blockSignals(True)
+        self.stim_profile_selector.clear()
+        state = getattr(self._app_model, "trial_protocol_state", {}) or {}
+        marker = "channel {}".format(self._channel.channel_id.value)
+        for item in state.get("laser_profiles", ()):
+            summary = item.get("summary", "")
+            if marker not in summary:
+                continue
+            self.stim_profile_selector.addItem(
+                "{} ({})".format(item["profile_id"], summary), item["profile_id"]
+            )
+        self.stim_profile_selector.blockSignals(False)
+        if previous is not None:
+            index = self.stim_profile_selector.findData(previous)
+            if index >= 0:
+                self.stim_profile_selector.setCurrentIndex(index)
+
+    def _run_stim_test(self) -> None:
+        profile_id = self.stim_profile_selector.currentData()
+        if not profile_id:
+            self._set_parent_status(
+                "Select a saved laser profile for laser {} first".format(
+                    self._channel.channel_id.value
+                ),
+                True,
+            )
+            return
+
+        def operation():
+            result = self._app_model.run_stim_bench_test(profile_id)
+            invoke_method(lambda: self.stim_test_result.setText(str(result)))()
+            return str(result)
+
+        self._start_operation(
+            "Running stim test {} on laser {}".format(
+                profile_id, self._channel.channel_id.value
+            ),
+            operation,
+        )
 
     def _run_calibration_ramp(self) -> None:
         if not self._is_configured:
