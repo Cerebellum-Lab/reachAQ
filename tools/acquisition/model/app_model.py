@@ -189,6 +189,11 @@ from tools.acquisition.model.session_boundary import SessionBoundary
 from tools.acquisition.model.trial_protocol_repository import (
     TrialProtocolRepository,
 )
+from tools.acquisition.model.trial_protocol_set_repository import (
+    ExperimentCompositionRepository,
+    TrialProtocolSetRepository,
+)
+from tools.acquisition.model.experiment_compiler import compile_experiment
 from tools.acquisition.model.stimulus_profile_repository import (
     StimulusProfileRepository,
     StimulusProfileLibrary,
@@ -522,6 +527,16 @@ class AppModel(ObservableObject):
             / "trial_protocols"
         )
         self._trial_protocol_repository.reload()
+        self._trial_protocol_set_repository = TrialProtocolSetRepository(
+            Path(preferences.configuration_location).expanduser()
+            / "trial_protocol_sets"
+        )
+        self._trial_protocol_set_repository.reload()
+        self._experiment_repository = ExperimentCompositionRepository(
+            Path(preferences.configuration_location).expanduser()
+            / "trial_experiments"
+        )
+        self._experiment_repository.reload()
         self._stimulus_profile_repository = StimulusProfileRepository(
             Path(preferences.configuration_location).expanduser()
             / "stimulus_profiles.json"
@@ -4334,6 +4349,30 @@ class AppModel(ObservableObject):
         return self._trial_protocol_repository.documents
 
     @property
+    def trial_protocol_sets(self):
+        with self._trial_protocol_lock:
+            return self._trial_protocol_set_repository.documents
+
+    @property
+    def experiment_compositions(self):
+        with self._trial_protocol_lock:
+            return self._experiment_repository.documents
+
+    def compile_and_save_experiment(self, experiment_id: str):
+        """Compile an experiment and publish it as a selectable protocol."""
+        with self._trial_protocol_lock:
+            composition = self._experiment_repository.get(experiment_id)
+            if composition is None:
+                raise ValueError("Unknown experiment {!r}".format(experiment_id))
+            compiled = compile_experiment(
+                composition, self._trial_protocol_set_repository.library()
+            )
+            # Persist any seed the compiler drew before publishing the protocol
+            # it produced, so the compile can always be reproduced.
+            self._experiment_repository.save(compiled.composition)
+            return self._trial_protocol_repository.save(compiled.document)
+
+    @property
     def trial_protocol_state(self) -> dict:
         ledger = self._trial_ledger
         attempts = () if ledger is None else ledger.attempts
@@ -7147,6 +7186,16 @@ class AppModel(ObservableObject):
                 self._loaded_config_dir_path / "trial_protocols"
             )
             self._trial_protocol_repository.reload()
+            # A loaded configuration brings its own set and experiment
+            # libraries, the same way it brings its own protocols.
+            self._trial_protocol_set_repository = TrialProtocolSetRepository(
+                self._loaded_config_dir_path / "trial_protocol_sets"
+            )
+            self._trial_protocol_set_repository.reload()
+            self._experiment_repository = ExperimentCompositionRepository(
+                self._loaded_config_dir_path / "trial_experiments"
+            )
+            self._experiment_repository.reload()
             self._selected_ordered_protocol = None
             self._trial_protocol_schedule = (
                 TrialProtocolSchedule.with_placeholder_rows()
