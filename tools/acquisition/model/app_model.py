@@ -198,6 +198,11 @@ from tools.acquisition.model.trial_protocol_set import (
     document_from_set,
     set_from_document,
 )
+from tools.acquisition.model.stim_bench_test import (
+    BenchRecipe,
+    StimTestResult,
+    refuse_reason,
+)
 from tools.acquisition.model.stimulus_profile_repository import (
     StimulusProfileRepository,
     StimulusProfileLibrary,
@@ -5155,6 +5160,71 @@ class AppModel(ObservableObject):
             raise RuntimeError("Firmware STIM3 pulse was not queued")
         timeout = max(3.0, profile.trigger_pulse_us / 1e6 + 2.0)
         self._hardware.wait_pending_command_acked(token, timeout=timeout)
+
+    def run_stim_bench_test(self, profile_id: str) -> StimTestResult:
+        """Fire one saved laser profile through the real hardware trigger.
+
+        Arms the analog output on the profile's trigger terminal, then asks the
+        board for its firmware-timed STIM3 pulse, which is what starts the
+        waveform. This is the route a trial takes, exercised without a session.
+
+        The channel comes from the profile rather than the caller, so a caller
+        cannot fire one profile's waveform at another channel.
+        """
+        profile = self._laser_profiles.get(str(profile_id))
+        refusal = refuse_reason(
+            profile=profile,
+            recording_status_value=self.session_recording_status.value,
+            trial_operation_active=(
+                self._trial_action_executor.operation is not None
+            ),
+            laser_backend=self._laser.configuration.backend,
+            configured_channel_ids=tuple(
+                int(channel.channel_id)
+                for channel in self._laser.configuration.channels
+            ),
+            firmware_capabilities=self._hardware.firmware_compatibility.get(
+                "reported_capabilities", ()
+            ),
+        )
+        if refusal is not None:
+            raise RuntimeError(refusal)
+
+        finished = threading.Event()
+        prepared = self._laser.prepare_pulse_profile(profile, BenchRecipe())
+        add_terminal_callback = getattr(prepared, "add_terminal_callback", None)
+        if add_terminal_callback is not None:
+            add_terminal_callback(lambda _operation: finished.set())
+        started = time.perf_counter()
+        try:
+            token = self._hardware.pulse_stim3(int(profile.trigger_pulse_us))
+            if token is None:
+                raise RuntimeError("Firmware STIM3 pulse was not queued")
+            timeout = max(3.0, profile.trigger_pulse_us / 1e6 + 2.0)
+            self._hardware.wait_pending_command_acked(token, timeout=timeout)
+            completed = finished.wait(timeout)
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+        except Exception:
+            # Never leave an armed analog output behind on a failed test.
+            cancel = getattr(prepared, "cancel", None)
+            if cancel is not None:
+                cancel()
+            raise
+        finally:
+            self._laser.release_prepared_profile(prepared)
+
+        return StimTestResult(
+            profile_id=profile.profile_id,
+            channel_id=int(profile.channel_id),
+            trigger_terminal=profile.trigger_terminal,
+            trigger_pulse_us=int(profile.trigger_pulse_us),
+            arm_to_terminal_ms=elapsed_ms if completed else None,
+            detail=(
+                "completed"
+                if completed
+                else "board acknowledged but the waveform did not report terminal"
+            ),
+        )
 
     def _on_stim_camera_trigger(self, camera_index, decision) -> None:
         """Accept only the detector decision owned by the current attempt."""
