@@ -162,3 +162,33 @@ def test_a_deeplabcut_project_keeps_its_own_threshold(tmp_path):
 
     gate = confidence_threshold(TENSORFLOW_BACKEND, model_path=str(project))
     assert gate == pytest.approx(0.9)
+
+
+def test_the_gate_can_be_reapplied_once_the_model_is_known():
+    """The live failure the unit tests above did not catch.
+
+    PoseAlgorithm is constructed during app startup, before any configuration
+    is read - the inference model is literally None at that point, so the
+    threshold could only ever be the backend default. A demo run confirmed it:
+    the gate was still 0.900 and Pellet appeared on 1.7% of samples. The gate
+    therefore has to be applied again when the pose process reports the model
+    it actually loaded.
+    """
+    from autotrainer.inference.pose_algorithm import PoseAlgorithm
+
+    algorithm = PoseAlgorithm()
+    assert algorithm._plot_threshold == pytest.approx(0.9)
+
+    algorithm.set_confidence_threshold(YOLO_CONFIDENCE_THRESHOLD)
+
+    assert algorithm._plot_threshold == pytest.approx(YOLO_CONFIDENCE_THRESHOLD)
+    assert algorithm._present_threshold == pytest.approx(YOLO_CONFIDENCE_THRESHOLD)
+
+
+def test_regating_is_idempotent():
+    from autotrainer.inference.pose_algorithm import PoseAlgorithm
+
+    algorithm = PoseAlgorithm(confidence_threshold=0.25)
+    algorithm.set_confidence_threshold(0.25)
+
+    assert algorithm._plot_threshold == pytest.approx(0.25)

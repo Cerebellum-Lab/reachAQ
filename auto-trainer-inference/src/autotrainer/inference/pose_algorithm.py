@@ -321,6 +321,24 @@ class PoseAlgorithm:
         """Give the model part index, or -1 if unknown"""
         return self._parts.get(part, -1)
 
+    def set_confidence_threshold(self, threshold: float) -> None:
+        """Re-gate once the loaded model is known.
+
+        The algorithm is constructed during app startup, before any
+        configuration is read - at that point the inference model is still
+        None, so the threshold could only ever be the backend default and
+        a YOLO model was gated on TensorFlow's scale for the whole run.
+        The model's identity is only certain when the pose process reports
+        Initialized, so the gate is applied again there.
+        """
+        threshold = float(threshold)
+        if threshold == self._present_threshold == self._plot_threshold:
+            return
+        logger.info("confidence gate set to %.3f (was present=%.3f plot=%.3f)",
+                    threshold, self._present_threshold, self._plot_threshold)
+        self._present_threshold = threshold
+        self._plot_threshold = threshold
+
     def initialize(
         self,
         parts: List[str],
