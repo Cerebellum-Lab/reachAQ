@@ -76,6 +76,10 @@ class CaptureCommandKind(IntEnum):
     ARM_STIM_DETECTOR = 7
     DISARM_STIM_DETECTOR = 8
 
+    SEEK = 9
+    """Jump playback to a frame. Demo playback only; ignored by a real camera,
+    which has no past to seek into."""
+
 
 @dataclass
 class CaptureCameraAttrs:
@@ -270,6 +274,7 @@ class VideoCapture(Process):
             CaptureCommandKind.SET_LOGGER_LEVEL: set_logger_level,
             CaptureCommandKind.ARM_STIM_DETECTOR: self._arm_stim_detector,
             CaptureCommandKind.DISARM_STIM_DETECTOR: self._disarm_stim_detector,
+            CaptureCommandKind.SEEK: self._seek,
         }
 
         self._set_status(CaptureProcessStatus.INITIALIZED)
@@ -1011,6 +1016,29 @@ class VideoCapture(Process):
             if not is_failed:
                 self._set_status(CaptureProcessStatus.TERMINATED)
         logger.debug("exiting")
+
+    def _seek(self, context: object):
+        """Jump this camera's playback to a frame, if it can.
+
+        A real camera has no past to seek into, so this is a no-op there
+        rather than an error: the command is broadcast to every camera in
+        the session and only the playback ones can act on it. Logged at
+        notice either way, because a seek that silently did nothing on one
+        of two cameras would leave the pair out of step with nothing to
+        show for it.
+        """
+        camera = self._camera
+        seek = getattr(camera, "seek", None)
+        if seek is None:
+            logger.notice("%s: ignoring SEEK, %s cannot seek",
+                          self._name, type(camera).__name__)
+            return
+        try:
+            landed = seek(int(context))
+        except Exception:
+            logger.exception("%s: SEEK to %s failed", self._name, context)
+            return
+        logger.notice("%s: SEEK to %s landed at %s", self._name, context, landed)
 
     def _handle_command(self, cmd: CaptureCommandKind, context: object):
         logger.info("executing %s", cmd)

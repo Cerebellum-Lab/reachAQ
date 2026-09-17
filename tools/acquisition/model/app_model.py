@@ -7962,6 +7962,20 @@ class AppModel(ObservableObject):
         if prepare_pose is not None:
             prepare_pose(self._inference, self._project_info)
 
+    def seek_demo_playback(self, frame: int) -> None:
+        """Jump every camera's playback to the same frame.
+
+        Broadcast rather than addressed, because the cameras are separate
+        processes and a real one simply ignores it. Sending the same target
+        to all of them is what keeps the pair frame-aligned: the videos were
+        recorded synchronously, so the same frame number is the same moment
+        in both.
+        """
+        for camera in self._cameras:
+            seek = getattr(camera, "seek", None)
+            if seek is not None:
+                seek(frame)
+
     def _on_session_capture_ended(self, reason: RecordingEndingReason):
         self._recording_ending_reason = RecordingEndingReason(reason)
         logger.debug("session capture trigger ended: %s", reason)
