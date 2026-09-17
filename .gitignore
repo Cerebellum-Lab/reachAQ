@@ -195,3 +195,6 @@ auto-trainer-inference/tests/**/*_reach_events.h5
 
 # Pyright LSP config (machine-specific conda env path)
 pyrightconfig.json
+
+# Office lock files, created while a doc is open
+~$*
