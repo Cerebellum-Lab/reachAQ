@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import collections
 import dataclasses
 from typing import List, Optional, Dict
 
@@ -34,6 +35,13 @@ logger = get_verbose_logger(__name__)
 #: decision.
 POSE_FRAME_TOLERANCE = 3
 
+#: How many recent poses to keep so the one matching the displayed frame can
+#: be found. The display lags the camera by up to a queue depth plus a render
+#: tick; 64 frames is under half a second at 150 fps and costs a few hundred
+#: floats.
+POSE_HISTORY = 64
+
+
 
 @dataclasses.dataclass
 class ImageData:
@@ -61,8 +69,12 @@ class QCaptureView(QWidget):
         self._cameras = list()
 
         self._next_frame_data: Optional[ImageData] = None
-        #: Frame id of the pending overlay, and how far it may be from the
-        #: displayed frame. See update_pose.
+        #: Recent poses by frame id, newest last. Inference produces one per
+        #: frame while the display shows about one in ten, so the pose that
+        #: belongs to the frame on screen is usually already here - keeping
+        #: only the newest threw it away and left half the overlays with no
+        #: match to draw.
+        self._recent_points = collections.OrderedDict()
         self._next_points_frame_id: int = -1
         self._pose_frame_tolerance: int = POSE_FRAME_TOLERANCE
         self._is_frame_dirty = False
@@ -284,20 +296,38 @@ class QCaptureView(QWidget):
             return
         if self._next_frame_points is None or not self._are_points_dirty:
             return
-        if not self._pose_matches_displayed_frame():
+        points = self._points_for_displayed_frame()
+        if points is None:
             return
-        self._image.set_points(self._next_frame_points)
+        self._image.set_points(points)
         self._are_points_dirty = False
 
-    def _pose_matches_displayed_frame(self) -> bool:
-        """Whether the pending overlay belongs to the frame on screen."""
+    def _points_for_displayed_frame(self):
+        """The pose belonging to the frame on screen, or None to hold back.
+
+        Chosen from the recent poses rather than taking whichever arrived
+        last. Inference produces a pose per frame and the display shows
+        about one frame in ten, so the matching pose is almost always in
+        hand; using the newest instead left the overlay a median of four
+        frames off and outside tolerance half the time.
+        """
         frame = self._next_frame_data
         frame_id = -1 if frame is None else getattr(frame, "frame_id", -1)
-        pose_frame_id = self._next_points_frame_id
-        if frame_id < 0 or pose_frame_id < 0:
-            # No id on one side or the other: nothing to match against.
-            return True
-        return abs(frame_id - pose_frame_id) <= self._pose_frame_tolerance
+        if frame_id < 0:
+            # The frame carries no id - an older producer, or no recording
+            # in progress. Fall back to the newest pose as before.
+            return self._next_frame_points
+        best_id = None
+        for candidate in self._recent_points:
+            if best_id is None or abs(candidate - frame_id) < abs(best_id - frame_id):
+                best_id = candidate
+        if best_id is None:
+            # No pose carried an id either.
+            return (self._next_frame_points
+                    if self._next_points_frame_id < 0 else None)
+        if abs(best_id - frame_id) > self._pose_frame_tolerance:
+            return None
+        return self._recent_points[best_id]
 
     @Slot(dict)
     def refresh_pose(self, points: Dict[str, PoseLocation],
@@ -305,6 +335,10 @@ class QCaptureView(QWidget):
         self._next_frame_points = points
         self._next_points_frame_id = int(frame_id)
         self._are_points_dirty = True
+        if frame_id >= 0:
+            self._recent_points[int(frame_id)] = points
+            while len(self._recent_points) > POSE_HISTORY:
+                self._recent_points.popitem(last=False)
 
     def set_pose_frame_tolerance(self, frames: int) -> None:
         """How far an overlay may be from the displayed frame and still show.

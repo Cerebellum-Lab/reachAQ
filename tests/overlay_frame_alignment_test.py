@@ -23,6 +23,7 @@ from PySide6.QtWidgets import QApplication
 from autotrainer.core.fixed_array_queue import BufferResult, FixedArrayQueue
 from autotrainer.pyside.capture.QtCaptureView import (
     POSE_FRAME_TOLERANCE,
+    POSE_HISTORY,
     ImageData,
     QCaptureView,
 )
@@ -38,16 +39,23 @@ def qapp():
 def view(qapp):
     widget = QCaptureView()
     widget._display_dots_detection = True
-    return widget
+    return _points_recorder(widget)
 
 
 def _image(frame_id):
     return ImageData(numpy.zeros((4, 4), dtype=numpy.uint8), 4, 4, frame_id)
 
 
-def _drawn(view):
-    """The points the widget actually pushed to its image."""
-    return view._image.points if hasattr(view._image, "points") else view._last_set
+def _points_recorder(view):
+    """Capture what the widget pushes to its image."""
+    captured = {}
+
+    def set_points(points):
+        captured["points"] = points
+
+    view._image.set_points = set_points
+    view._image_points = lambda: captured.get("points")
+    return view
 
 
 # --- the matching rule -------------------------------------------------------
@@ -176,3 +184,53 @@ def test_ids_stay_with_their_own_buffer_slot():
     for value, frame_id in ((1, 10), (2, 20), (3, 30)):
         data, got = queue.get(timeout=0.1, with_frame_id=True)
         assert (int(data[0, 0]), got) == (value, frame_id)
+
+
+# --- picking the right pose, not the newest --------------------------------
+
+
+def test_the_pose_matching_the_frame_is_chosen_over_the_newest(view):
+    """Inference produces a pose per frame; the display shows one in ten.
+
+    Taking whichever arrived last left the overlay a median of four frames off
+    and outside tolerance half the time, when the matching pose was already in
+    hand.
+    """
+    match = {"which": "match"}
+    for frame_id, points in ((100, match), (101, {"which": "newer"}),
+                             (102, {"which": "newest"})):
+        view.refresh_pose(points, frame_id)
+    view.refresh_image(_image(100), 15.0)
+    view.update_pose()
+    assert view._image_points() is match
+
+
+def test_the_nearest_pose_is_used_when_the_exact_frame_is_missing(view):
+    """The display sees a subset, so an exact pose is not guaranteed."""
+    near = {"which": "near"}
+    view.refresh_pose({"which": "far"}, 90)
+    view.refresh_pose(near, 101)
+    view.refresh_image(_image(100), 15.0)
+    view.update_pose()
+    assert view._image_points() is near
+
+
+def test_nothing_within_tolerance_holds_the_overlay(view):
+    view.refresh_pose({"which": "stale"}, 50)
+    view.refresh_image(_image(100), 15.0)
+    view.update_pose()
+    assert view._are_points_dirty is True
+
+
+def test_the_history_is_bounded(view):
+    for frame_id in range(POSE_HISTORY * 2):
+        view.refresh_pose({"f": frame_id}, frame_id)
+    assert len(view._recent_points) == POSE_HISTORY
+
+
+def test_the_history_keeps_the_newest(view):
+    for frame_id in range(POSE_HISTORY * 2):
+        view.refresh_pose({"f": frame_id}, frame_id)
+    newest = POSE_HISTORY * 2 - 1
+    assert newest in view._recent_points
+    assert 0 not in view._recent_points
