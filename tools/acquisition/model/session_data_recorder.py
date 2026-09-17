@@ -65,22 +65,29 @@ _PRESSURE_FIELDS = (
 
 
 class _PressureRing:
-    """A fixed-size, numeric ring for pellet-board FSR samples.
+    """A bounded, numeric buffer for pellet-board FSR samples.
 
     The board sends roughly 166 samples a second across its two sensors, two
     orders of magnitude above every other device message. Held as row tuples
     like the rest of the device stream that is about 120 MB an hour, so these
-    samples get a preallocated numeric buffer instead: the same hour costs
-    about 32 MB, and a full five-hour session stays under 170 MB.
+    samples get numeric columns instead: the same hour costs about 32 MB.
+
+    The columns start small and double on demand up to ``capacity``, after
+    which the buffer wraps and keeps the newest samples. Sizing the full cap up
+    front would cost 162 MB at construction whether or not a long session was
+    ever recorded, which is most of a short session's footprint for nothing.
 
     Every field the board supplies is numeric, so nothing is lost by storing
     columns rather than tuples.
     """
 
+    INITIAL_CAPACITY = 8192
+
     def __init__(self, capacity: int):
         self._capacity = max(1, int(capacity))
+        self._held = min(self._capacity, self.INITIAL_CAPACITY)
         self._columns = {
-            name: np.zeros(self._capacity, dtype=dtype)
+            name: np.zeros(self._held, dtype=dtype)
             for name, dtype in _PRESSURE_FIELDS
         }
         self._next = 0
@@ -88,36 +95,54 @@ class _PressureRing:
 
     @property
     def capacity(self) -> int:
+        """The most samples this buffer will ever retain."""
         return self._capacity
 
     @property
+    def allocated(self) -> int:
+        """Rows currently reserved, which grows towards ``capacity``."""
+        return self._held
+
+    @property
     def written(self) -> int:
-        """Samples appended over this ring's life, including evicted ones."""
+        """Samples appended over this buffer's life, including evicted ones."""
         return self._written
 
     def clear(self) -> None:
         self._next = 0
         self._written = 0
 
+    def _grow(self) -> None:
+        self._held = min(self._capacity, self._held * 2)
+        for (name, dtype) in _PRESSURE_FIELDS:
+            grown = np.zeros(self._held, dtype=dtype)
+            grown[:self._columns[name].size] = self._columns[name]
+            self._columns[name] = grown
+
     def append(self, values) -> None:
+        if self._next == self._held and self._held < self._capacity:
+            self._grow()
         position = self._next
         for (name, _), value in zip(_PRESSURE_FIELDS, values):
             self._columns[name][position] = value
-        self._next = (position + 1) % self._capacity
+        self._next = (position + 1) % self._held
         self._written += 1
 
     def snapshot(self):
         """Return the retained samples, oldest first, as a column dict."""
-        held = min(self._written, self._capacity)
+        held = min(self._written, self._held)
         if held == 0:
-            return {name: column[:0].copy() for name, column in self._columns.items()}
-        if self._written <= self._capacity:
+            return {
+                name: np.zeros(0, dtype=dtype)
+                for name, dtype in _PRESSURE_FIELDS
+            }
+        if self._written <= self._held:
             return {
                 name: column[:held].copy()
                 for name, column in self._columns.items()
             }
-        # The ring has wrapped, so the oldest retained sample sits at the write
-        # cursor and the buffer has to be rotated back into acquisition order.
+        # The buffer has wrapped, so the oldest retained sample sits at the
+        # write cursor and the columns have to be rotated back into order.
         return {
             name: np.concatenate((column[self._next:], column[:self._next]))
             for name, column in self._columns.items()

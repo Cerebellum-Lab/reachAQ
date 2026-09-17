@@ -100,6 +100,31 @@ def test_pressure_capture_falls_back_to_host_receipt_without_a_board_clock():
         recorder.close()
 
 
+def test_pressure_buffer_starts_small_and_grows_only_as_needed():
+    """Sizing the five-hour cap up front would cost 162 MB per app start."""
+    ring = _PressureRing(3_000_000)
+    assert ring.allocated == _PressureRing.INITIAL_CAPACITY
+
+    for index in range(_PressureRing.INITIAL_CAPACITY + 1):
+        ring.append((float(index), 0.0, 0, index, float(index), -1.0, -1, -1))
+
+    assert ring.allocated == _PressureRing.INITIAL_CAPACITY * 2
+    assert ring.capacity == 3_000_000
+    # Growing must not disturb what was already held.
+    columns = ring.snapshot()
+    assert columns["counts"].size == _PressureRing.INITIAL_CAPACITY + 1
+    assert list(columns["counts"][:3]) == [0, 1, 2]
+    assert columns["counts"][-1] == _PressureRing.INITIAL_CAPACITY
+
+
+def test_pressure_buffer_never_grows_past_its_cap():
+    ring = _PressureRing(4)
+    for index in range(10):
+        ring.append((float(index), 0.0, 0, index, float(index), -1.0, -1, -1))
+    assert ring.allocated == 4
+    assert list(ring.snapshot()["counts"]) == [6, 7, 8, 9]
+
+
 def test_pressure_ring_keeps_the_newest_samples_when_it_wraps():
     ring = _PressureRing(3)
     for index in range(5):
