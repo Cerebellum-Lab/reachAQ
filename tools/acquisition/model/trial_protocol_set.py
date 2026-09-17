@@ -117,3 +117,117 @@ class TrialProtocolSet:
                 for item in record.get("trial_overrides", ())
             ),
         )
+
+
+EXPERIMENT_SCHEMA_VERSION = 1
+
+#: Upper bound on how many times one set may appear through a single entry.
+#: Large enough for any real session, small enough that a typo cannot compile a
+#: million-trial document.
+MAX_SET_REPEAT = 100
+
+
+@dataclass(frozen=True)
+class ExperimentSetEntry:
+    """One appearance of a set inside an experiment, pinned to a revision."""
+
+    set_id: str
+    set_revision: int
+    repeat: int = 1
+    shuffle_trials: bool = False
+    shuffle_seed: Optional[int] = None
+
+    def __post_init__(self):
+        object.__setattr__(
+            self, "set_id", normalize_identifier(self.set_id, field="set_id")
+        )
+        if int(self.set_revision) < 1:
+            raise ValueError("Set revision must be positive")
+        if not 1 <= int(self.repeat) <= MAX_SET_REPEAT:
+            raise ValueError(
+                "Set repeat must be between 1 and {}".format(MAX_SET_REPEAT)
+            )
+        if self.shuffle_seed is not None:
+            object.__setattr__(self, "shuffle_seed", int(self.shuffle_seed))
+
+    def to_record(self) -> dict:
+        return {
+            "set_id": self.set_id,
+            "set_revision": int(self.set_revision),
+            "repeat": int(self.repeat),
+            "shuffle_trials": bool(self.shuffle_trials),
+            "shuffle_seed": self.shuffle_seed,
+        }
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, object]) -> "ExperimentSetEntry":
+        return cls(
+            set_id=record["set_id"],
+            set_revision=int(record["set_revision"]),
+            repeat=int(record.get("repeat", 1)),
+            shuffle_trials=bool(record.get("shuffle_trials", False)),
+            shuffle_seed=record.get("shuffle_seed"),
+        )
+
+
+@dataclass(frozen=True)
+class ExperimentComposition:
+    """An ordered list of set appearances that compiles to one protocol."""
+
+    experiment_id: str
+    name: str
+    revision: int = 1
+    entries: Tuple[ExperimentSetEntry, ...] = ()
+    description: str = ""
+    schema_version: int = EXPERIMENT_SCHEMA_VERSION
+
+    def __post_init__(self):
+        object.__setattr__(
+            self,
+            "experiment_id",
+            normalize_identifier(self.experiment_id, field="experiment_id"),
+        )
+        if not str(self.name).strip():
+            raise ValueError("Experiment name cannot be empty")
+        if self.schema_version != EXPERIMENT_SCHEMA_VERSION:
+            raise ValueError(
+                "Unsupported experiment schema {}; expected {}".format(
+                    self.schema_version, EXPERIMENT_SCHEMA_VERSION
+                )
+            )
+        if int(self.revision) < 1:
+            raise ValueError("Experiment revision must be positive")
+        # An empty experiment is allowed so it can be built up in the editor.
+        # compile_experiment refuses to compile one.
+        object.__setattr__(self, "entries", tuple(self.entries))
+
+    def to_record(self) -> dict:
+        return {
+            "schema_version": self.schema_version,
+            "experiment_id": self.experiment_id,
+            "name": self.name,
+            "description": self.description,
+            "revision": self.revision,
+            "entries": [item.to_record() for item in self.entries],
+        }
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, object]) -> "ExperimentComposition":
+        stored = int(record.get("schema_version", -1))
+        if stored != EXPERIMENT_SCHEMA_VERSION:
+            raise ValueError(
+                "Unsupported experiment schema {}; expected {}".format(
+                    stored, EXPERIMENT_SCHEMA_VERSION
+                )
+            )
+        return cls(
+            schema_version=EXPERIMENT_SCHEMA_VERSION,
+            experiment_id=record["experiment_id"],
+            name=record["name"],
+            description=record.get("description", ""),
+            revision=int(record.get("revision", 1)),
+            entries=tuple(
+                ExperimentSetEntry.from_record(item)
+                for item in record.get("entries", ())
+            ),
+        )
