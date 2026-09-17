@@ -6661,6 +6661,13 @@ class AppModel(ObservableObject):
             self._set_animal_base_positions(animal)
 
         self._acquisition.mark_started()
+        # Start counting as soon as the system is acquiring, not only when
+        # a recording starts. Demo playback and plain preview run frames
+        # through the same pipeline, and the operator has no way to see the
+        # inference rate or percentage there - the panel simply showed a
+        # dash. A recording re-baselines this at its first recorded frame,
+        # so session figures stay session-relative.
+        self._session_telemetry.begin()
         self.status = target_status
         self.property_changed(self.Props.ACQUISITION_RUNNING, True, False)
         self._event_manager.post_event_content(
