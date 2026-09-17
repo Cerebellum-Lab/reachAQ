@@ -655,11 +655,14 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
                     # decided from the loaded model rather than from what
                     # happens to be installed, which is how a YOLO model
                     # ended up on TensorFlow's 0.9 and never drew a pellet.
-                    location = self._model_location or None
+                    # Named directly rather than through a local, so the
+                    # contract test can see that the selector is told the
+                    # same model the loader will use. An empty location is
+                    # already handled downstream.
                     pose_algo.set_confidence_threshold(confidence_threshold(
-                        selected_backend(model_path=location),
-                        model_name=trained_model_name(location),
-                        model_path=location,
+                        selected_backend(model_path=self._model_location),
+                        model_name=trained_model_name(self._model_location),
+                        model_path=self._model_location,
                     ))
                     pose_algo.initialize(context)
                     self._data_monitor_cmd_queue.put(

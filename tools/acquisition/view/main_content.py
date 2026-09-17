@@ -329,8 +329,12 @@ class MainContent(ContentWidget):
             self._reach_camera_content_by_model[camera] = camera_content
             # Empty means draw every part the model emits, which is what the
             # painter now does on its own; a configured list only narrows it.
-            camera_content.set_overlay_parts(
-                getattr(app_model.inference, "overlay_parts", ()))
+            # Asked of the class, not the instance: the inference object is
+            # an Events object whose __getattr__ raises EventsException for
+            # anything undeclared, which getattr's default does not catch.
+            if hasattr(type(app_model.inference), "overlay_parts"):
+                camera_content.set_overlay_parts(
+                    app_model.inference.overlay_parts)
             if camera is app_model.left_camera:
                 self._left_camera_content = camera_content
             elif camera is app_model.right_camera:
