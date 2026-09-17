@@ -42,6 +42,13 @@ from tools.acquisition.view.training_plan_progress_content import TrainingPlanPr
 
 logger = get_verbose_logger(__name__)
 
+#: How many inference results to hold between display ticks. The panel picks
+#: the one matching the frame it is showing, and at 150 fps against a 15 Hz
+#: display about ten arrive per tick; a few ticks' worth covers the lag
+#: between the two queues without letting a stall grow this without limit.
+PENDING_POSE_LIMIT = 48
+
+
 _REACHAQ_PROTOCOL_UI_ENABLED = True
 
 
@@ -202,7 +209,9 @@ class MainContent(ContentWidget):
 
         self._prev_parts_3d_loc = {}
         self._next_parts_3d_loc_report = time.perf_counter()
-        self._pending_pose_response = None
+        #: Recent results awaiting the next display tick, oldest first. See
+        #: refresh_pose for why more than one is kept.
+        self._pending_pose_responses = []
         self._pending_pose_lock = threading.Lock()
 
         self._timer = QTimer(self)
@@ -486,24 +495,37 @@ class MainContent(ContentWidget):
                 camera_content.update_image()
 
     def refresh_pose(self, response: PoseResponse):
-        """Cache only the newest inference result until the next display tick.
+        """Buffer recent inference results until the next display tick.
 
-        Live inference can produce pose results much faster than Qt renders the
-        camera panels.  Dispatching every result to every camera creates an
-        unbounded queue of UI-thread calls and delays unrelated timers, including
-        the live analysis plot.  The intermediate poses are never displayed, so
-        retain just the newest result and consume it at the configured live-feed
-        refresh rate.
+        Live inference produces results much faster than Qt renders the camera
+        panels, so these are collected rather than dispatched: dispatching each
+        one as it arrives creates an unbounded queue of UI-thread calls and
+        delays unrelated timers, including the live analysis plot.
+
+        Buffered rather than overwritten, which is what this used to do. The
+        panel draws the pose belonging to the frame it is showing, and the
+        display runs about a tenth of the capture rate - so keeping only the
+        newest threw away the matching one nine times out of ten and left the
+        overlay a median of two frames off with a quarter of them undrawable.
+
+        Bounded, because a stall must not grow this without limit.
         """
         with self._pending_pose_lock:
-            self._pending_pose_response = response
+            self._pending_pose_responses.append(response)
+            while len(self._pending_pose_responses) > PENDING_POSE_LIMIT:
+                self._pending_pose_responses.pop(0)
 
     def _flush_pending_pose(self):
         with self._pending_pose_lock:
-            response = self._pending_pose_response
-            self._pending_pose_response = None
-        if response is None:
+            responses = self._pending_pose_responses
+            self._pending_pose_responses = []
+        if not responses:
             return
+        for response in responses:
+            self._dispatch_pose(response)
+
+    def _dispatch_pose(self, response: PoseResponse):
+        """Hand one result to each camera panel, tagged with its frame."""
         # source_frame_ids records the camera frames this pose was computed
         # from, per camera. Passing it through lets the panel draw the dots
         # over the frame they belong to instead of whatever is on screen.
