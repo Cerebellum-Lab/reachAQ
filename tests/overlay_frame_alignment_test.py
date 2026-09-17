@@ -21,7 +21,11 @@ import pytest
 from PySide6.QtWidgets import QApplication
 
 from autotrainer.core.fixed_array_queue import BufferResult, FixedArrayQueue
-from autotrainer.pyside.capture.QtCaptureView import ImageData, QCaptureView
+from autotrainer.pyside.capture.QtCaptureView import (
+    POSE_FRAME_TOLERANCE,
+    ImageData,
+    QCaptureView,
+)
 
 
 @pytest.fixture(scope="module")
@@ -56,19 +60,34 @@ def test_an_overlay_for_the_displayed_frame_is_drawn(view):
     assert view._are_points_dirty is False, "the overlay was not drawn"
 
 
+def test_the_default_tolerance_is_twenty_milliseconds_at_150_fps():
+    """The bound the overlay is held to: below what the eye reads as lag.
+
+    Acquisition runs ahead of inference by design, so the two are rarely on the
+    same frame; what matters is that the gap stays small enough not to show.
+    """
+    assert POSE_FRAME_TOLERANCE / 150.0 <= 0.020 + 1e-9
+    assert POSE_FRAME_TOLERANCE > 0, (
+        "an exact match would drop most overlays; the display sees about one "
+        "frame in ten")
+
+
 def test_an_overlay_within_tolerance_is_drawn(view):
-    """The display sees about one frame in ten, so an exact match would drop
-    almost every pose."""
-    view.set_pose_frame_tolerance(5)
     view.refresh_image(_image(100), 15.0)
-    view.refresh_pose({"a": object()}, 104)
+    view.refresh_pose({"a": object()}, 100 + POSE_FRAME_TOLERANCE)
     view.update_pose()
     assert view._are_points_dirty is False
 
 
+def test_an_overlay_just_past_tolerance_is_held(view):
+    view.refresh_image(_image(100), 15.0)
+    view.refresh_pose({"a": object()}, 100 + POSE_FRAME_TOLERANCE + 1)
+    view.update_pose()
+    assert view._are_points_dirty is True
+
+
 def test_an_overlay_from_a_distant_frame_is_held_back(view):
     """This is the misalignment the change exists to prevent."""
-    view.set_pose_frame_tolerance(5)
     view.refresh_image(_image(100), 15.0)
     view.refresh_pose({"a": object()}, 130)
     view.update_pose()
@@ -78,7 +97,6 @@ def test_an_overlay_from_a_distant_frame_is_held_back(view):
 
 def test_a_held_overlay_is_drawn_once_its_frame_arrives(view):
     """Held back, not discarded: the frame it belongs to may still be coming."""
-    view.set_pose_frame_tolerance(5)
     view.refresh_image(_image(100), 15.0)
     view.refresh_pose({"a": object()}, 130)
     view.update_pose()
