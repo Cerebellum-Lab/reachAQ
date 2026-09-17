@@ -69,11 +69,18 @@ def test_an_unconfigured_channel_refuses_the_test():
     assert "channel 1" in reason.lower()
 
 
-def test_missing_firmware_capability_refuses_the_test():
-    reason = refuse_reason(**allowed(firmware_capabilities=()))
+def test_a_board_that_reports_capabilities_without_this_one_is_refused():
+    reason = refuse_reason(**allowed(firmware_capabilities=("time_sync",)))
 
     assert reason is not None
     assert "finite_stim3_pulse" in reason
+
+
+def test_a_board_that_reports_no_capabilities_at_all_is_allowed():
+    # No released pellet firmware answers the capability request, so an empty
+    # set means "did not say", not "cannot". Refusing here would block the path
+    # the trial route already drives successfully with no capability gate.
+    assert refuse_reason(**allowed(firmware_capabilities=())) is None
 
 
 def test_a_direct_software_profile_refuses_the_test():
