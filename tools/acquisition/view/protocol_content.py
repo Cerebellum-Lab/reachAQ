@@ -919,6 +919,21 @@ class ProtocolContent(ContentWidget):
             )
             if not accepted or not terminal.strip():
                 return
+        stim_line = 3
+        if route == "hardware_stim3":
+            # Board names, not host names. STIM0 and STIM1 are absent because
+            # the firmware tone generator drives them as the tone confirmations.
+            line_label, accepted = QInputDialog.getItem(
+                self,
+                "Laser pulse profile",
+                "Board stimulus line:",
+                ("STIM3", "STIM2"),
+                0,
+                False,
+            )
+            if not accepted:
+                return
+            stim_line = int(line_label[-1])
         self._run_library_action(
             self._app_model.save_laser_profile,
             profile_id=profile_id.strip(),
@@ -929,6 +944,7 @@ class ProtocolContent(ContentWidget):
             frequency_hz=frequency,
             trigger_route=route,
             trigger_terminal=terminal.strip(),
+            stim_line=stim_line,
         )
 
     def _ask_xyz(self, title, label, defaults, minimum, maximum):

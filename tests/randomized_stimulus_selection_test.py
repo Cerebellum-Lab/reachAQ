@@ -311,7 +311,9 @@ def test_non_randomized_rows_keep_their_declared_trigger():
 
 
 def test_library_round_trips_stimulus_trigger_profiles():
-    assert PROFILE_SCHEMA_VERSION == 4
+    # Schema 5 added the laser profile's stim_line. The bump is deliberate: the
+    # version is what lets an older reader refuse a record it cannot parse.
+    assert PROFILE_SCHEMA_VERSION == 5
     library = StimulusProfileLibrary(
         tone_profiles=(TONE_1, TONE_2),
         stimulus_trigger_profiles=(MIXED, FIRST_REACH_ONLY),
