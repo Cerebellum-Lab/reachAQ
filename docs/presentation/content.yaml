@@ -1,0 +1,147 @@
+# reachAQ overview deck — all slide copy.
+#
+# Edit this file and rerun `python docs/presentation/build_deck.py`. Nothing in
+# the builder needs touching to change wording, reorder slides, add or drop one.
+#
+# Layouts:
+#   cover    title + subtitle
+#   bullets  title, optional lead line, bullet list
+#   split    title, optional lead, two headed columns
+#   image    title, optional lead, one asset, optional caption
+#
+# Every slide may carry `notes:` for the presenter view.
+
+meta:
+  title: reachAQ
+  subtitle: Automated mouse reach acquisition
+  footer: reachAQ
+
+slides:
+
+  - layout: cover
+    title: reachAQ
+    subtitle: Automated mouse reach acquisition — what changed, and what it costs in milliseconds
+
+  - layout: split
+    title: What changed from reach-training
+    lead: Same experiment. The difference is what the system can do while the reach is still happening.
+    left_heading: reach-training
+    left:
+      - Reach detected by a brightness threshold inside a drawn ROI
+      - Pellet arm driven by an Arduino over USB serial
+      - Timing owned by a Python loop on the host
+      - Signals inspected afterwards, from files
+      - One flat protocol per experiment, delays drawn live
+    right_heading: reachAQ
+    right:
+      - Reach detected from live pose keypoints, per camera view, on the GPU
+      - Pellet arm on a CAN bus, with firmware capability checks and FSR pressure
+      - Timing owned by hardware-timed NI-DAQ tasks and a SCHED_FIFO stim loop
+      - Signals plotted live during the session, and recorded unfiltered
+      - Experiments composed from reusable trial sets, with reproducible draws
+    notes: >
+      Keep this at the level of what the operator notices. The detail is on the
+      slides that follow. The single sentence worth landing: reach-training
+      watched and recorded, reachAQ decides and acts inside the same reach.
+
+  - layout: bullets
+    title: What came from auto-trainer
+    lead: reachAQ is built on auto-trainer, not beside it. The architecture and most of the runtime are theirs.
+    bullets:
+      - The modular package split — core, video, device, inference, behavior, model, pyside — which is why hardware can be swapped without touching the rest
+      - Per-process video capture with a shared synchronized frame index, so frame N means the same instant on every camera
+      - Pose inference and FLIR stereo calibration, already integrated into the application rather than run afterwards
+      - The CAN device abstraction, and the project, session and metadata structure that makes a recording self-describing
+      - The PySide6 UI layer and its panel patterns
+    notes: >
+      Say plainly that we did not start over. reachAQ changed the hardware
+      target, added stimulation and signal visualisation, and put pose in the
+      control loop. Everything underneath it is auto-trainer's design.
+
+  - layout: image
+    title: The stim loop holds well under its budget
+    lead: 900 Hz stimCam, small ROI, decision made inline in the capture thread. 60 s runs, pinned to physical P-cores.
+    image: stim_latency.png
+    caption: >
+      The detector's own work never exceeds 0.09 ms. The entire tail was scheduler
+      wake-up latency — so it is a scheduling problem, not a compute one.
+    notes: >
+      The numbers that matter: under 16 competing processes, SCHED_OTHER reaches
+      6.05 ms max and misses 13 deadlines; SCHED_FIFO holds p99 at 0.059 ms and
+      max at 0.155 ms with zero misses, and restores the full 900 Hz cadence.
+      That is roughly 32x headroom under a load harsher than real acquisition.
+      Worth stating: a PREEMPT_RT kernel is not required. Stock Linux already
+      preempts SCHED_OTHER for SCHED_FIFO.
+
+  - layout: image
+    title: Live inference is fast enough to sit in the loop
+    lead: DeepLabCut on TensorFlow, batch 2 at 128x128, running on the GPU.
+    image: inference_latency.png
+    caption: >
+      Same hardware, same model. Six milliseconds of p99 came from one CPU
+      governor setting — powersave held the P-cores near 2700 MHz against a
+      5000 MHz ceiling.
+    notes: >
+      This is the measurement that makes pose-driven gating viable at all. At
+      ~11 ms p99 the behaviour loop has room inside a 150 FPS frame budget.
+      It also shows why the install script sets the governor: the default cost
+      more than half the win.
+
+  - layout: image
+    title: Everything lands on one timebase
+    lead: Cameras, tones, pellet events and laser output are not separately timestamped and hoped to agree.
+    image: synchronization.png
+    caption: >
+      Camera frame edges are matched to NI-DAQ samples with a signed offset,
+      a resolution, and a confidence — all written into alignment.json.
+    notes: >
+      Four sync modes: auto, backplane, external, independent. Compatible PXI
+      cards share PXI_CLK10, a backplane start trigger and a routed master
+      sample clock. Devices resolve by product and serial, so a changed NI-DAQmx
+      alias never silently rebinds to the wrong card. Tone confirmation
+      cross-checks commanded tones against the pulses actually observed.
+
+  - layout: bullets
+    title: Signals you can watch while the session runs
+    lead: Everything is acquired continuously at 10 kHz and recorded unfiltered. The plot selection only changes what is drawn.
+    bullets:
+      - "Tones 1, 2 and 3 as logic traces, with the commanded onset checked against the pulse the DAQ actually saw"
+      - "Pellet FSR pressure — two sensors at about 83 Hz each, from firmware 2.1.0, on their own stream rather than mixed into the device log"
+      - "Laser analog command alongside the diode readback, so what was asked for and what came out are on the same axis"
+      - "Camera frame pulses and the barcode line, which are what tie video to samples"
+      - "Closed-loop state: what the pose gate answered, when the cue fired, and whether the trial was cancelled"
+    notes: >
+      The point for a new user is that this replaces post-hoc plotting. A
+      decimated FSR trace is useless for behavioural analysis, so samples are
+      forwarded unthrottled and an armed session gains roughly 166 rows a second.
+      Worth flagging out loud: there is no microphone channel in the system today.
+
+  - layout: bullets
+    title: Experiments are composed, not copied
+    lead: A phase shared by several experiments is written once.
+    bullets:
+      - "A trial set is a reusable group of trials, saved on its own — trial content only, no epochs or blocks"
+      - "An experiment is an ordered list of set appearances; each entry pins the set revision it was built against, can repeat, and can shuffle trial order within an appearance"
+      - "Compiling flattens it into an ordinary protocol document, so the runner, the schedule and session evidence see nothing new"
+      - "Each appearance becomes a named epoch, and the Sources column names the set every value came from"
+      - "Shuffle seeds are stored on the entry, so a compile can always be repeated exactly"
+      - "Editing a set never repins an existing row; a stale pin is visible, and a compile against a changed set is refused rather than silently different"
+    notes: >
+      The pinning behaviour is the part worth dwelling on. It is what stops an
+      edit to a shared phase from quietly changing an experiment that was
+      already validated.
+
+  - layout: image
+    title: Demo — recorded video, everything else live
+    lead: No animal today, so the camera frames are played from a recorded session. Exactly one stage is substituted.
+    image: live_overlay.png
+    caption: >
+      Live 2D pose, per view, computed on the GPU from the played frames.
+      Captured from the running application on the rig.
+    notes: >
+      Run order — launch with --demo or toggle Tools > Demo Mode while idle;
+      show both camera panels carrying their own overlay; show the NI-DAQ signal
+      stream; drive the pellet device by hand; open the protocol editor and the
+      experiment sidebar; start a recording and let trials run; stop and show the
+      session directory with its DEMO marker. Point at the red banner — it is
+      there so nobody mistakes a demo session for data.
