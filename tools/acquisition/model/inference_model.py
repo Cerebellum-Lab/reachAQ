@@ -80,6 +80,7 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
 
         self._is_enabled = False
         self._model_location = ""
+        self._overlay_parts: tuple = ()
         self._pose_algorithm = pose_algorithm
         self._pose_parts: List[str] = []
         self._calib_dir = calib_dir
@@ -174,6 +175,11 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
     def is_predict_enabled(self, value: bool):
         prev, self._is_predict_enabled = self._is_predict_enabled, value
         self._on_property_changed(self.IS_PREDICT_ENABLED, value, prev)
+
+    @property
+    def overlay_parts(self) -> tuple:
+        """Parts the live overlay draws; empty means every part emitted."""
+        return self._overlay_parts
 
     @property
     def model_location(self) -> str:
@@ -500,11 +506,13 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
     def load_configuration(self, configuration: InferenceConfiguration):
         self.model_location = configuration.pose_model_location
         self.is_enabled = configuration.is_enabled
+        self._overlay_parts = tuple(configuration.overlay_parts or ())
 
     def save_configuration(self) -> InferenceConfiguration:
         return InferenceConfiguration(
             pose_model_location=self.model_location,
             is_enabled=self.is_enabled,
+            overlay_parts=tuple(self._overlay_parts),
         )
 
     def send_message(self, kind: InferenceCommandMessageKind, context: Any = None):
