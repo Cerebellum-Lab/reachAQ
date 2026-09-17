@@ -348,6 +348,33 @@ def confidence_threshold(
     return value
 
 
+def pre_validate_model(model_path: str,
+                       backend: typing.Optional[str] = None) -> None:
+    """Cheap filesystem check of a model location, for the selected backend.
+
+    Routed the same way build_pose_model routes, so a YOLO directory is checked
+    against the YOLO layout. app_model used to call DlcPoseModel.pre_validate
+    unconditionally, which looked for a DeepLabCut config.yaml and reported
+    every YOLO model as broken - an error dialog on every start, for a model
+    that then loaded and ran correctly.
+
+    Raises whatever the backend's own pre_validate raises, so the caller still
+    reports one failure rather than guessing.
+    """
+    if is_yolo_model(model_path):
+        from .yolo import YoloPoseModel
+        YoloPoseModel.pre_validate(model_path)
+        return
+
+    backend = selected_backend(model_path=model_path) if backend is None else backend
+    if backend == TORCH_BACKEND:
+        from .dlc import DlcTorchPoseModel
+        DlcTorchPoseModel.pre_validate(model_path)
+        return
+    from .dlc import DlcPoseModel
+    DlcPoseModel.pre_validate(model_path)
+
+
 def build_pose_model(model_path: str, shuffle_index=1, training_index=0, batch_size=1,
                      backend: typing.Optional[str] = None) -> PoseModel:
     """
