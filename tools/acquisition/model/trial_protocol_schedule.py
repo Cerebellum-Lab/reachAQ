@@ -167,6 +167,20 @@ def _identifier(value: str, *, field: str, allow_empty: bool = False) -> str:
     return value
 
 
+def normalize_identifier(
+    value: str,
+    *,
+    field: str,
+    allow_empty: bool = False,
+) -> str:
+    """Public name for the identifier rule protocol documents already use.
+
+    Sibling modules need the same rule; this exists so they do not import a
+    private name. Behaviour is unchanged.
+    """
+    return _identifier(value, field=field, allow_empty=allow_empty)
+
+
 def _finite_shift(value, *, field: str) -> float:
     value = float(value)
     if not math.isfinite(value) or abs(value) > MAX_ABS_SHIFT_MM:
