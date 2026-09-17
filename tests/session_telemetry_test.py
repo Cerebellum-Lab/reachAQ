@@ -338,11 +338,13 @@ def test_counters_run_while_acquiring_without_a_recording():
 
     telemetry.record_capture(0, acquired=150, dropped=0)
     telemetry.record_capture(1, acquired=150, dropped=0)
-    telemetry.record_inference(300, mean_ms=4.5, max_ms=6.0)
+    telemetry.record_inference(150, mean_ms=4.5, max_ms=6.0)
 
     assert telemetry.is_active
-    assert telemetry.frames_acquired == 300
-    assert telemetry.frames_inferenced == 300
+    # Per camera, not summed: both cameras see the same run, so the figure
+    # that means anything is one camera's count.
+    assert telemetry.frames_acquired == 150
+    assert telemetry.frames_inferenced == 150
     assert telemetry.inferenced_percent == pytest.approx(100.0)
 
 
