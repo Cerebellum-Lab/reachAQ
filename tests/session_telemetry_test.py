@@ -323,3 +323,44 @@ def test_a_genuine_shortfall_is_still_reported(telemetry):
     telemetry.record_inference(count=400, mean_ms=4.0, max_ms=5.0)
     assert telemetry.frames_inferenced == 400
     assert telemetry.inferenced_percent == pytest.approx(40.0)
+
+
+def test_counters_run_while_acquiring_without_a_recording():
+    """Demo playback and preview must show a rate, not a dash.
+
+    begin() used to be called only when a recording committed its first frame,
+    so in demo mode the panel had nothing to show however many frames the
+    pipeline had processed.
+    """
+    telemetry = SessionTelemetry()
+    telemetry.begin(100.0)
+
+    telemetry.record_capture(0, acquired=150, dropped=0)
+    telemetry.record_capture(1, acquired=150, dropped=0)
+    telemetry.record_inference(300, mean_ms=4.5, max_ms=6.0)
+
+    assert telemetry.is_active
+    assert telemetry.frames_acquired == 300
+    assert telemetry.frames_inferenced == 300
+    assert telemetry.inferenced_percent == pytest.approx(100.0)
+
+
+def test_a_recording_rebaselines_counters_that_were_already_running():
+    """Preview counters must not leak into the session's figures.
+
+    This is what the session-relative baselines exist for: a 45 s session once
+    claimed 7820 frames and 174 fps from a pair of 150 fps cameras because the
+    totals from before the recording landed whole.
+    """
+    telemetry = SessionTelemetry()
+    telemetry.begin(100.0)
+    telemetry.record_capture(0, acquired=5000, dropped=0)
+    telemetry.record_inference(5000, mean_ms=4.5, max_ms=6.0)
+
+    # Operator presses Record: the session starts here, not at capture start.
+    telemetry.begin(200.0)
+    telemetry.record_capture(0, acquired=5150, dropped=0)
+    telemetry.record_inference(5150, mean_ms=4.5, max_ms=6.0)
+
+    assert telemetry.frames_acquired == 150
+    assert telemetry.frames_inferenced == 150
