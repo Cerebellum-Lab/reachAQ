@@ -21,6 +21,20 @@ from autotrainer.pyside.capture.QtCaptureSettings import QCaptureSettings
 logger = get_verbose_logger(__name__)
 
 
+#: How far a pose overlay may be from the frame it is drawn over, in camera
+#: frames. Three frames is 20 ms at 150 fps, which is below what the eye
+#: resolves as a lag between an image and the dots on it.
+#:
+#: Not zero: acquisition runs ahead of inference by design and the display
+#: receives only about one frame in ten, so an exact match would drop most
+#: overlays rather than align them. This bounds the error instead.
+#:
+#: Display-only. The closed loop consumes pose_response_ready directly and
+#: never passes through this widget, so nothing here delays a reach
+#: decision.
+POSE_FRAME_TOLERANCE = 3
+
+
 @dataclasses.dataclass
 class ImageData:
     array: numpy.ndarray
@@ -50,7 +64,7 @@ class QCaptureView(QWidget):
         #: Frame id of the pending overlay, and how far it may be from the
         #: displayed frame. See update_pose.
         self._next_points_frame_id: int = -1
-        self._pose_frame_tolerance: int = 5
+        self._pose_frame_tolerance: int = POSE_FRAME_TOLERANCE
         self._is_frame_dirty = False
 
         self._next_frame_points: Dict[str, PoseLocation] = {}
@@ -295,8 +309,7 @@ class QCaptureView(QWidget):
     def set_pose_frame_tolerance(self, frames: int) -> None:
         """How far an overlay may be from the displayed frame and still show.
 
-        Half the display spacing by default: the display receives about one
-        frame in ten, so demanding an exact match would drop most overlays.
+        See POSE_FRAME_TOLERANCE for why it is not zero.
         """
         self._pose_frame_tolerance = max(0, int(frames))
 
