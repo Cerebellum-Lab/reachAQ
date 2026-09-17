@@ -59,12 +59,21 @@ def _visible(view):
     return {name for name, item in view._points.items() if item.isVisible()}
 
 
+HAND_ORIENTATIONS = {"RH_flat", "RH_spread", "RH_grab",
+                     "LH_flat", "LH_spread", "LH_grab"}
+
+
 def test_every_part_the_model_emits_is_drawn(qapp):
-    """The registry used to name six; ten parts could not be drawn at all."""
+    """The registry used to name six; ten parts could not be drawn at all.
+
+    The hand orientations are the exception: L_Hand and R_Hand already
+    stand for whichever of the three the algorithm picked, so drawing the
+    source as well puts two dots on one pixel.
+    """
     view = _view(qapp)
     view.set_points(_points(MODEL_PARTS))
 
-    assert _visible(view) == set(MODEL_PARTS)
+    assert _visible(view) == set(MODEL_PARTS) - HAND_ORIENTATIONS
 
 
 def test_the_parts_that_were_silently_undrawable_now_draw(qapp):
@@ -74,10 +83,25 @@ def test_the_parts_that_were_silently_undrawable_now_draw(qapp):
     previously_lost = {
         SceneElement.Mouth, SceneElement.Nose,
         SceneElement.Tongue_mid, SceneElement.Tongue_tip,
-        SceneElement.RH_flat, SceneElement.RH_spread, SceneElement.RH_grab,
-        SceneElement.LH_flat, SceneElement.LH_spread, SceneElement.LH_grab,
     }
     assert previously_lost <= _visible(view)
+
+
+def test_a_hand_is_one_dot_not_two(qapp):
+    """The composite stands for the orientation it was chosen from."""
+    view = _view(qapp)
+    view.set_points(_points(("L_Hand", "LH_flat", "R_Hand", "RH_grab")))
+
+    assert _visible(view) == {"L_Hand", "R_Hand"}
+
+
+def test_an_orientation_named_in_configuration_is_still_drawn(qapp):
+    """Naming a part is explicit, and beats the composite standing for it."""
+    view = _view(qapp)
+    view.set_overlay_parts(("LH_flat", "Pellet"))
+    view.set_points(_points(MODEL_PARTS))
+
+    assert _visible(view) == {"LH_flat", "Pellet"}
 
 
 def test_a_part_absent_this_frame_is_hidden_not_left_stale(qapp):
@@ -102,7 +126,7 @@ def test_empty_configuration_means_every_part(qapp):
     view.set_overlay_parts(())
     view.set_points(_points(MODEL_PARTS))
 
-    assert _visible(view) == set(MODEL_PARTS)
+    assert _visible(view) == set(MODEL_PARTS) - HAND_ORIENTATIONS
 
 
 def test_narrowing_hides_parts_already_on_screen(qapp):

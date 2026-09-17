@@ -8,7 +8,7 @@ from PySide6.QtWidgets import QWidget, QGraphicsView, QGraphicsScene, QHBoxLayou
     QGraphicsEllipseItem, QGraphicsItem
 
 from autotrainer.core.logging import get_verbose_logger
-from autotrainer.core.pose_elements import SceneElement
+from autotrainer.core.pose_elements import AllHandsParts, SceneElement
 from autotrainer.inference import PoseLocation
 
 
@@ -47,6 +47,13 @@ _MARKER_PARTS = frozenset((
     SceneElement.Star, SceneElement.Diamond, SceneElement.Triangle,
     SceneElement.Pellet,
 ))
+
+# A hand is one thing whose appearance changes with its orientation, so the
+# model predicts it three ways and the pose algorithm emits whichever of the
+# three it saw most confidently as L_Hand or R_Hand. Drawing the source
+# keypoint as well puts two dots on the same pixel and says nothing extra,
+# so the orientations are left out unless a configuration names them.
+_SUBSUMED_BY_COMPOSITE = frozenset(AllHandsParts)
 
 
 class QGLImageView(QWidget):
@@ -174,7 +181,13 @@ class QGLImageView(QWidget):
                 widget_point.setVisible(False)
 
     def _is_part_shown(self, name: str) -> bool:
-        return self._overlay_parts is None or name in self._overlay_parts
+        if self._overlay_parts is None:
+            # Nothing configured: everything except what a composite
+            # already stands for.
+            return name not in _SUBSUMED_BY_COMPOSITE
+        # Naming a part is an explicit request, so an orientation asked for
+        # by name is drawn even though a composite covers it.
+        return name in self._overlay_parts
 
     def _point_for(self, name: str) -> QGraphicsEllipseItem:
         """The dot for one part, created the first time that part is seen."""
