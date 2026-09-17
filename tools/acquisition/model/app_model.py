@@ -8505,6 +8505,18 @@ class AppModel(ObservableObject):
             new_is_live = value == InferenceStatus.live
             if new_is_live:
                 self._p_inference_live_begin = time.perf_counter()
+                # Acquisition starts before inference is ready - the model
+                # still has to load - so counting both from capture start
+                # charged inference for the couple of seconds it did not
+                # exist. The preview panel read 74% rising to 96% on a run
+                # that dropped nothing, and carried an 8.5 s end-to-end max
+                # from the first frame through the warming pipeline. Rebase
+                # here so the percentage measures the two running together.
+                # A recording owns the counters once it starts, so this
+                # never moves a session's baseline.
+                if (self._recording_session.status
+                        is not SessionRecordingStatus.RECORDING):
+                    self._session_telemetry.begin()
             elif value == InferenceStatus.stopped:
                 current = self._acquisition.subsystems.get(
                     SubsystemId.LIVE_INFERENCE
