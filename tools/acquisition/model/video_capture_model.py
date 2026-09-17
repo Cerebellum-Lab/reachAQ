@@ -469,7 +469,7 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
     def set_display_fcn(self, display_fcn):
         self._display_update_fcn = display_fcn
 
-    def refresh_image(self, data: ndarray):
+    def refresh_image(self, data: ndarray, frame_id: int = -1):
         if self._frame_count == 0:
             self._start = time.perf_counter_ns()
 
@@ -480,7 +480,7 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
             self._trace(f"display fps: {int(self._fps)}")
 
         if self._display_update_fcn is not None and self._video_capture is not None:
-            self._display_update_fcn(data, self._fps)
+            self._display_update_fcn(data, self._fps, frame_id)
 
     def on_prepare_capture(
         self,
