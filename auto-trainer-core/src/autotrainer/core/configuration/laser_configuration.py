@@ -31,6 +31,11 @@ class LaserChannelConfiguration:
     shutter_output: str
     auxiliary_output: Optional[str] = None
     command_copy_input: Optional[str] = None
+    #: NI input the board's stimulus line is wired back into, so the trigger
+    #: that starts this channel's waveform can be plotted beside the waveform.
+    #: This is a readback and is distinct from trigger_source below, which is
+    #: the terminal the analog output task arms on.
+    trigger_monitor_input: Optional[str] = None
     trigger_source: Optional[str] = None
     trigger_output: Optional[str] = None
     timing_trigger_output: Optional[str] = None

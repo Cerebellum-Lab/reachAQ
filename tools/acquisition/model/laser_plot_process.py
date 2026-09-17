@@ -21,7 +21,10 @@ _CONTROL_TRACE = "trace"
 _CONTROL_CLEAR = "clear"
 _CONTROL_STOP = "stop"
 _CHANNEL_COUNT = 4
-_CURVE_NAMES = ("command", "diode", "copy")
+_CURVE_NAMES = ("command", "diode", "copy", "trigger")
+#: Curves fed from the NI-DAQ ring by channel name. "command" is absent
+#: because it arrives as a pulse trace rather than a streamed input.
+STREAM_CURVE_NAMES = ("diode", "copy", "trigger")
 _CURVES_PER_CHANNEL = len(_CURVE_NAMES)
 _CURVE_COUNT = _CHANNEL_COUNT * _CURVES_PER_CHANNEL
 _MAX_POINTS = 4096
@@ -49,6 +52,7 @@ class _LaserChannelPlotState:
     pixel_width: int
     diode_name: Optional[str]
     copy_name: Optional[str]
+    trigger_name: Optional[str]
     buffers: Dict[str, RollingStreamBuffer]
     scratch: Dict[str, Tuple[np.ndarray, np.ndarray]]
     streaming: bool = False
@@ -227,7 +231,10 @@ def _laser_plot_worker(
                 stopped = True
                 break
             if kind == _CONTROL_CONFIGURE:
-                channel_id, window_seconds, pixel_width, diode_name, copy_name = payload
+                (
+                    channel_id, window_seconds, pixel_width,
+                    diode_name, copy_name, trigger_name,
+                ) = payload
                 channel_id = int(channel_id)
                 window_seconds = max(0.1, min(60.0, float(window_seconds)))
                 existing = states.get(channel_id)
@@ -237,6 +244,7 @@ def _laser_plot_worker(
                         pixel_width=max(1, int(pixel_width)),
                         diode_name=diode_name,
                         copy_name=copy_name,
+                        trigger_name=trigger_name,
                         buffers=_new_buffers(raw_ring.sample_rate_hz, window_seconds),
                         scratch=_new_scratch(raw_ring.sample_rate_hz, window_seconds),
                     )
@@ -245,10 +253,13 @@ def _laser_plot_worker(
                         existing.buffers["diode"].clear()
                     if existing.copy_name != copy_name:
                         existing.buffers["copy"].clear()
+                    if existing.trigger_name != trigger_name:
+                        existing.buffers["trigger"].clear()
                     existing.window_seconds = window_seconds
                     existing.pixel_width = max(1, int(pixel_width))
                     existing.diode_name = diode_name
                     existing.copy_name = copy_name
+                    existing.trigger_name = trigger_name
                     capacity = max(1, int(math.ceil(raw_ring.sample_rate_hz * window_seconds)))
                     if next(iter(existing.buffers.values())).capacity != capacity:
                         for buffer in existing.buffers.values():
@@ -290,8 +301,8 @@ def _laser_plot_worker(
         if sample_read is not None:
             if last_raw_epoch is not None and sample_read.epoch != last_raw_epoch:
                 for state in states.values():
-                    state.buffers["diode"].clear()
-                    state.buffers["copy"].clear()
+                    for stream_curve in STREAM_CURVE_NAMES:
+                        state.buffers[stream_curve].clear()
                 last_raw_sample_index = None
                 last_raw_epoch = sample_read.epoch
                 last_gap_count = sample_read.gap_count
@@ -302,8 +313,8 @@ def _laser_plot_worker(
             gap_count = sample_read.gap_count
             if last_gap_count is not None and gap_count != last_gap_count:
                 for state in states.values():
-                    state.buffers["diode"].clear()
-                    state.buffers["copy"].clear()
+                    for stream_curve in STREAM_CURVE_NAMES:
+                        state.buffers[stream_curve].clear()
                 last_raw_sample_index = None
                 last_gap_count = gap_count
                 dirty = True
@@ -312,8 +323,8 @@ def _laser_plot_worker(
             if sample_read.overrun_samples:
                 overrun_count += 1
                 for state in states.values():
-                    state.buffers["diode"].clear()
-                    state.buffers["copy"].clear()
+                    for stream_curve in STREAM_CURVE_NAMES:
+                        state.buffers[stream_curve].clear()
             if sample_read.source_perf_time > 0:
                 source_perf_time = sample_read.source_perf_time
             if sample_read.sample_count:
@@ -328,6 +339,7 @@ def _laser_plot_worker(
                     for curve_name, stream_name in (
                         ("diode", state.diode_name),
                         ("copy", state.copy_name),
+                        ("trigger", state.trigger_name),
                     ):
                         ring_index = ring_channel_indices.get(stream_name)
                         if ring_index is not None:
@@ -462,10 +474,14 @@ class LaserPlotProcess:
         pixel_width: int,
         diode_name: Optional[str],
         copy_name: Optional[str],
+        trigger_name: Optional[str] = None,
     ) -> None:
         self._control_queue.put((
             _CONTROL_CONFIGURE,
-            (channel_id, window_seconds, pixel_width, diode_name, copy_name),
+            (
+                channel_id, window_seconds, pixel_width,
+                diode_name, copy_name, trigger_name,
+            ),
         ))
 
     def set_streaming(self, channel_id: int, is_streaming: bool) -> None:
