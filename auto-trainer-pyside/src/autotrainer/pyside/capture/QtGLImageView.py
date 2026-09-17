@@ -56,6 +56,24 @@ _MARKER_PARTS = frozenset((
 _SUBSUMED_BY_COMPOSITE = frozenset(AllHandsParts)
 
 
+def overlay_colour_for(name: str):
+    """The colour this part is drawn in.
+
+    Shared with the legend, so what the dialog shows and what the overlay
+    paints cannot drift apart - a legend that has to be kept in step by hand
+    is a legend that will eventually lie.
+    """
+    colour = _PART_COLOURS.get(name)
+    if colour is not None:
+        return colour
+    return _FALLBACK_COLOURS[hash(str(name)) % len(_FALLBACK_COLOURS)]
+
+
+def is_subsumed_by_composite(name: str) -> bool:
+    """Whether a composite already stands for this part, so it is off by default."""
+    return name in _SUBSUMED_BY_COMPOSITE
+
+
 class QGLImageView(QWidget):
     def __init__(self, width: int = 450, height: int = 300):
         """Image view for a camera, (width, height) is the dimension of the output model"""
@@ -194,10 +212,7 @@ class QGLImageView(QWidget):
         widget_point = self._points.get(name)
         if widget_point is not None:
             return widget_point
-        colour = _PART_COLOURS.get(name)
-        if colour is None:
-            # Stable across restarts: the same part keeps the same colour.
-            colour = _FALLBACK_COLOURS[hash(str(name)) % len(_FALLBACK_COLOURS)]
+        colour = overlay_colour_for(name)
         size = 5.0 if name in _MARKER_PARTS else 3.0
         widget_point = QGraphicsEllipseItem(0, 0, size, size)
         pen = QPen(colour)

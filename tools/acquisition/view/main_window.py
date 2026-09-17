@@ -1166,6 +1166,13 @@ class MainWindow(QMainWindow):
         action.setCheckable(True)
         action.triggered.connect(self.on_3d_calibrate)
 
+        action = self.overlay_parts_action = QAction("Overlay Parts and Legend…", self)
+        action.setToolTip(
+            "Which colour means which part, and which parts the live "
+            "overlay draws"
+        )
+        action.triggered.connect(self._on_overlay_parts)
+
         action = self.demo_mode_action = QAction("Demo Mode (play recorded video)", self)
         action.setCheckable(True)
         action.setChecked(self._demo_sources is not None)
@@ -1238,6 +1245,7 @@ class MainWindow(QMainWindow):
         hardware_menu.addSeparator()
         hardware_menu.addAction(self.rfid_device_action)
         hardware_menu.aboutToHide.connect(self._flush_pending_hardware_refresh)
+        file_menu.addAction(self.overlay_parts_action)
         file_menu.addSeparator()
         file_menu.addAction(self.quit_action)
 
@@ -1317,6 +1325,32 @@ class MainWindow(QMainWindow):
         self._demo_event_index = -1
         self._refresh_demo_banner()
         self._refresh_demo_event_actions()
+
+    def _on_overlay_parts(self) -> None:
+        """Show the overlay legend and let the operator narrow it."""
+        from tools.acquisition.view.overlay_parts_dialog import (
+            OverlayPartsDialog)
+
+        inference = self._app_model.inference
+        parts = list(inference.pose_parts)
+        if not parts:
+            self._show_message(
+                "Overlay parts",
+                "The pose model has not reported its parts yet. Start the "
+                "system and try again once inference is running.")
+            return
+        # The model emits the hand composites in addition to its own
+        # keypoints, so they belong in the list even though the model does
+        # not name them.
+        for composite in (SceneElement.L_Hand, SceneElement.R_Hand):
+            if composite not in parts:
+                parts.append(str(composite))
+
+        dialog = OverlayPartsDialog(parts, inference.overlay_parts, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        chosen = dialog.selected_parts()
+        inference.overlay_parts = chosen
 
     def _demo_event_frames(self):
         """The clip's event frames, or empty when there is nothing to step."""
