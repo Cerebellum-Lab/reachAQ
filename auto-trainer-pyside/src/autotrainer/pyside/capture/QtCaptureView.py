@@ -330,6 +330,10 @@ class QCaptureView(QWidget):
         return self._recent_points[best_id]
 
     @Slot(dict)
+    def set_overlay_parts(self, parts) -> None:
+        """Restrict which parts the overlay draws; empty means all."""
+        self._image.set_overlay_parts(parts)
+
     def refresh_pose(self, points: Dict[str, PoseLocation],
                      frame_id: int = -1):
         self._next_frame_points = points

@@ -317,6 +317,10 @@ class MainContent(ContentWidget):
             self._content_widgets.append(camera_content)
             self._reach_camera_contents.append((camera, camera_content))
             self._reach_camera_content_by_model[camera] = camera_content
+            # Empty means draw every part the model emits, which is what the
+            # painter now does on its own; a configured list only narrows it.
+            camera_content.set_overlay_parts(
+                getattr(app_model.inference, "overlay_parts", ()))
             if camera is app_model.left_camera:
                 self._left_camera_content = camera_content
             elif camera is app_model.right_camera:

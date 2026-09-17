@@ -111,6 +111,10 @@ class CameraContent(ContentWidget):
         self._capture_view.update_pose()
 
     @invoke_method
+    def set_overlay_parts(self, parts) -> None:
+        self._capture_view.set_overlay_parts(parts)
+
+    @invoke_method
     def refresh_pose(self, points: Dict[str, PoseLocation],
                      frame_id: int = -1):
         self._capture_view.refresh_pose(points, frame_id)
