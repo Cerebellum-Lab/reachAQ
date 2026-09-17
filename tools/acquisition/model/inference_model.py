@@ -22,7 +22,9 @@ from autotrainer.core.pose_elements import SceneElement, AllHandsParts
 from autotrainer.inference import GpuRuntimeStatus, PoseProcess, InferenceCommandMessageKind, \
     InferenceStatusMessageKind, PoseAlgorithm, InferenceMode, InferenceStatus, \
     InferenceMonitorDataMsg, detect_gpu_runtime
-from autotrainer.inference.backend_selection import build_pose_model, selected_backend
+from autotrainer.inference.backend_selection import (
+    build_pose_model, confidence_threshold, selected_backend, trained_model_name,
+)
 from autotrainer.inference.pose_result_process import InferenceMonitorDataProc
 from autotrainer.inference.analysis import intersession_process, IntersessionResponse
 
@@ -641,6 +643,16 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
                     self._pose_parts = context
                     self._set_status(InferenceStatus.waiting)
                     pose_algo = self._pose_algorithm
+                    # The model is only certainly known here. Gating is
+                    # decided from the loaded model rather than from what
+                    # happens to be installed, which is how a YOLO model
+                    # ended up on TensorFlow's 0.9 and never drew a pellet.
+                    location = self._model_location or None
+                    pose_algo.set_confidence_threshold(confidence_threshold(
+                        selected_backend(model_path=location),
+                        model_name=trained_model_name(location),
+                        model_path=location,
+                    ))
                     pose_algo.initialize(context)
                     self._data_monitor_cmd_queue.put(
                         (InferenceMonitorDataProc.Msg.SET_POSE_ALGO, (pose_algo,), None))
