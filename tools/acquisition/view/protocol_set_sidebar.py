@@ -8,6 +8,7 @@ from typing import Optional, Tuple
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QListWidget,
     QListWidgetItem,
@@ -51,6 +52,25 @@ class ProtocolSetSidebar(QWidget):
         buttons.addWidget(self.compile_button)
         buttons.addStretch(1)
         layout.addLayout(buttons)
+
+        # A set's trials are authored through the protocol editor rather than a
+        # second one: capture the protocol you built, or open a set back up to
+        # revise it and capture it again.
+        authoring = QHBoxLayout()
+        self.capture_button = QPushButton("Set from protocol")
+        self.capture_button.setToolTip(
+            "Save the protocol selected for the session as a reusable set"
+        )
+        self.capture_button.clicked.connect(self._capture_selected_protocol)
+        authoring.addWidget(self.capture_button)
+        self.open_set_button = QPushButton("Open set")
+        self.open_set_button.setToolTip(
+            "Publish the selected set as an editable protocol"
+        )
+        self.open_set_button.clicked.connect(self._open_selected_set)
+        authoring.addWidget(self.open_set_button)
+        authoring.addStretch(1)
+        layout.addLayout(authoring)
 
         self.status_label = QLabel()
         self.status_label.setWordWrap(True)
@@ -112,6 +132,62 @@ class ProtocolSetSidebar(QWidget):
             )
         )
         self.refresh()
+
+    def save_selected_protocol_as_set(self, set_id: str, name: str) -> None:
+        protocol = self._app_model.selected_ordered_protocol
+        if protocol is None:
+            self.status_label.setText("Select a session protocol to capture.")
+            return
+        try:
+            saved = self._app_model.save_protocol_as_set(
+                protocol.protocol_id, set_id, name
+            )
+        except Exception as error:
+            logger.exception("Could not capture protocol as a set")
+            self.status_label.setText("{}: {}".format(type(error).__name__, error))
+            return
+        self.status_label.setText(
+            "Saved set {} revision {}.".format(saved.set_id, saved.revision)
+        )
+        self.refresh()
+
+    def open_selected_set_in_editor(self, protocol_id: str, name: str) -> None:
+        item = self.set_list.currentItem()
+        if item is None:
+            self.status_label.setText("Select a set to open.")
+            return
+        set_id = item.data(Qt.ItemDataRole.UserRole)
+        try:
+            saved = self._app_model.open_set_as_protocol(set_id, protocol_id, name)
+        except Exception as error:
+            logger.exception("Could not open set %s", set_id)
+            self.status_label.setText("{}: {}".format(type(error).__name__, error))
+            return
+        self.status_label.setText(
+            "Opened set {} as protocol {}. Edit it, then capture it again.".format(
+                set_id, saved.protocol_id
+            )
+        )
+        self.refresh()
+
+    def _capture_selected_protocol(self) -> None:
+        identity = self._ask_identity("New set")
+        if identity is not None:
+            self.save_selected_protocol_as_set(*identity)
+
+    def _open_selected_set(self) -> None:
+        identity = self._ask_identity("Open set as protocol")
+        if identity is not None:
+            self.open_selected_set_in_editor(*identity)
+
+    def _ask_identity(self, title: str):
+        identifier, accepted = QInputDialog.getText(self, title, "Identifier:")
+        if not accepted or not identifier.strip():
+            return None
+        name, accepted = QInputDialog.getText(self, title, "Display name:")
+        if not accepted or not name.strip():
+            return None
+        return identifier.strip(), name.strip()
 
     @staticmethod
     def _fill(widget: QListWidget, rows) -> None:

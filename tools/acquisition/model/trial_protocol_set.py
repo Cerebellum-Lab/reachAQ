@@ -15,6 +15,7 @@ from tools.acquisition.model.trial_protocol_schedule import (
     ProtocolPatch,
     ProtocolScope,
     TrialOverride,
+    TrialProtocolDocument,
     normalize_identifier,
 )
 
@@ -231,3 +232,52 @@ class ExperimentComposition:
                 for item in record.get("entries", ())
             ),
         )
+
+
+def set_from_document(
+    document: TrialProtocolDocument,
+    *,
+    set_id: str,
+    name: str,
+) -> TrialProtocolSet:
+    """Snapshot a protocol's trial content as a reusable set.
+
+    Epochs and blocks are refused rather than flattened. Within a protocol they
+    are the older, protocol-local grouping; a set is the cross-protocol one, and
+    the compiler writes epochs itself. Flattening an epoch patch into the bulk
+    layer would also change its precedence relative to blocks, so a silent
+    conversion could alter what the trials actually do.
+    """
+    if document.epochs or document.blocks:
+        raise ValueError(
+            "Protocol {} uses epochs or blocks, which a set cannot hold. Express "
+            "those groups as bulk overrides, or build the experiment from "
+            "several sets instead.".format(document.protocol_id)
+        )
+    return TrialProtocolSet(
+        set_id=set_id,
+        name=name,
+        trial_count=int(document.trial_count),
+        defaults=document.defaults,
+        bulk_overrides=tuple(document.bulk_overrides),
+        trial_overrides=tuple(document.trial_overrides),
+        description=document.description,
+    )
+
+
+def document_from_set(
+    protocol_set: TrialProtocolSet,
+    *,
+    protocol_id: str,
+    name: str,
+) -> TrialProtocolDocument:
+    """Materialise a set as an ordinary protocol so the editor can revise it."""
+    return TrialProtocolDocument(
+        protocol_id=protocol_id,
+        name=name,
+        trial_count=int(protocol_set.trial_count),
+        defaults=protocol_set.defaults,
+        bulk_overrides=tuple(protocol_set.bulk_overrides),
+        trial_overrides=tuple(protocol_set.trial_overrides),
+        description=protocol_set.description,
+    )
