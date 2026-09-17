@@ -11,7 +11,9 @@ import types
 
 import pytest
 
-from autotrainer.device.nidaq_signal_stream import NidaqSignalStream
+from autotrainer.device.nidaq_signal_stream import (
+    NidaqSignalStreamController,
+)
 
 
 class _Device:
@@ -21,7 +23,7 @@ class _Device:
 
 def _stream(devices):
     """A stream stub carrying only what the reference-clock lookup reads."""
-    stream = NidaqSignalStream.__new__(NidaqSignalStream)
+    stream = NidaqSignalStreamController.__new__(NidaqSignalStreamController)
     stream._nidaqmx = types.SimpleNamespace(
         system=types.SimpleNamespace(
             Device=lambda name: _Device(devices[name])))
@@ -78,7 +80,7 @@ def test_an_unreadable_device_is_left_unset_rather_than_guessed():
     def explode(_name):
         raise RuntimeError("device offline")
 
-    stream = NidaqSignalStream.__new__(NidaqSignalStream)
+    stream = NidaqSignalStreamController.__new__(NidaqSignalStreamController)
     stream._nidaqmx = types.SimpleNamespace(
         system=types.SimpleNamespace(Device=explode))
     stream._timing_plan = _plan("PXI_CLK10")
