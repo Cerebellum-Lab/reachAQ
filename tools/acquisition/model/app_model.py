@@ -84,6 +84,7 @@ from autotrainer.inference import (
 from autotrainer.inference.backend_selection import (
     available_backends,
     confidence_threshold,
+    pre_validate_model,
     selected_backend,
     trained_model_name,
 )
@@ -8525,9 +8526,12 @@ class AppModel(ObservableObject):
         elif name == InferenceModel.MODEL_LOCATION:
             if value:
                 try:
-                    DlcPoseModel.pre_validate(value)
+                    # Routed by backend, not pinned to DeepLabCut: this
+                    # reported every YOLO model as broken, an error dialog
+                    # on every start for a model that then ran correctly.
+                    pre_validate_model(value)
                 except Exception as err:
-                    self.on_error("DlcPoseModel pre_validate failed",
+                    self.on_error("Pose model pre-validate failed",
                                   f"\nModel at {value} failed pre-validate:\n\n{err}")
 
     def _on_pose_response_ready(self, response: PoseResponse):
