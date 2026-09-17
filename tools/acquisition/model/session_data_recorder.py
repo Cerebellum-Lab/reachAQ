@@ -47,6 +47,10 @@ class _NidaqSpoolSnapshot:
     worker_failed: bool
 
 
+# The pellet board samples the FSRs on a 12-bit ADC referenced to 3V3.
+_PRESSURE_ADC_FULL_SCALE = 4095
+_PRESSURE_REFERENCE_VOLTS = 3.3
+
 # Pressure columns, in the order _PressureRing stores and replays them.
 _PRESSURE_FIELDS = (
     ("perf_time", np.float64),
