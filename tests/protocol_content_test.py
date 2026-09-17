@@ -24,6 +24,11 @@ class _Model:
     def __init__(self):
         self.property_changed = _Event()
         self.updated = []
+        # The protocol panel now carries the set and experiment sidebar, so any
+        # model it is handed has to answer for those libraries too.
+        self.trial_protocol_sets = ()
+        self.experiment_compositions = ()
+        self.selected_ordered_protocol = None
         self.trial_protocol_state = {
             "selected_protocol": {
                 "protocol_id": "test",

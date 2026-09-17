@@ -194,6 +194,10 @@ from tools.acquisition.model.trial_protocol_set_repository import (
     TrialProtocolSetRepository,
 )
 from tools.acquisition.model.experiment_compiler import compile_experiment
+from tools.acquisition.model.trial_protocol_set import (
+    document_from_set,
+    set_from_document,
+)
 from tools.acquisition.model.stimulus_profile_repository import (
     StimulusProfileRepository,
     StimulusProfileLibrary,
@@ -4371,6 +4375,26 @@ class AppModel(ObservableObject):
             # it produced, so the compile can always be reproduced.
             self._experiment_repository.save(compiled.composition)
             return self._trial_protocol_repository.save(compiled.document)
+
+    def save_protocol_as_set(self, protocol_id: str, set_id: str, name: str):
+        """Capture a protocol you have built in the editor as a reusable set."""
+        with self._trial_protocol_lock:
+            document = self._trial_protocol_repository.get(protocol_id)
+            if document is None:
+                raise ValueError("Unknown protocol {!r}".format(protocol_id))
+            return self._trial_protocol_set_repository.save(
+                set_from_document(document, set_id=set_id, name=name)
+            )
+
+    def open_set_as_protocol(self, set_id: str, protocol_id: str, name: str):
+        """Publish a set as an editable protocol, to revise and capture again."""
+        with self._trial_protocol_lock:
+            protocol_set = self._trial_protocol_set_repository.get(set_id)
+            if protocol_set is None:
+                raise ValueError("Unknown set {!r}".format(set_id))
+            return self._trial_protocol_repository.save(
+                document_from_set(protocol_set, protocol_id=protocol_id, name=name)
+            )
 
     @property
     def trial_protocol_state(self) -> dict:
