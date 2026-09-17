@@ -1911,6 +1911,7 @@ class AppModel(ObservableObject):
             logger.warning("calib_src_dir=%r does not exist", calib_src_dir.as_posix())
 
         inference = self._inference
+        model_location = inference.model_location if inference is not None else None
         pose_algo = PoseAlgorithm(
             stereo_params=stereo_params,
             calib_metadata=calib_metadata,
@@ -1924,11 +1925,15 @@ class AppModel(ObservableObject):
             # scores above 0.33, so the backend default of 0.6 would hold
             # rh_grab_seen permanently False. An unmeasured backbone, or a
             # project this cannot read, falls back to the backend default.
+            # The model location has to reach both calls. Without it
+            # selected_backend() answers from what is installed, which on a box
+            # with both engines is TensorFlow, and a YOLO model was then gated
+            # at TensorFlow's 0.9 - above the confidence it ever reaches, so
+            # the pellet never once appeared on the overlay.
             confidence_threshold=confidence_threshold(
-                selected_backend(),
-                model_name=trained_model_name(
-                    inference.model_location if inference is not None else None
-                ),
+                selected_backend(model_path=model_location),
+                model_name=trained_model_name(model_location),
+                model_path=model_location,
             ),
         )
         if inference is not None:

@@ -122,6 +122,28 @@ TORCH_MODEL_CONFIDENCE_THRESHOLDS = {
     "rtmpose_s": 0.3,
 }
 
+# YOLO-pose reports keypoint confidence on its own scale again, so neither
+# the DeepLabCut backbones above nor the torch backend default describes it.
+# Measured the same way: every labelled keypoint of the 33 held-out frames of
+# the merged project (DeepLabCut shuffle 30), scored against its label.
+#
+#   gate   coverage   median err   Pellet cov   Tongue_tip cov
+#   0.10      99.1%      2.04 px        100%           100%
+#   0.30      92.9%      1.98 px        100%            20%
+#   0.60      84.0%      1.81 px         88%             0%
+#   0.90      55.7%      1.69 px          8%             0%
+#
+# Raising the gate buys 0.35 px and costs 43 points of coverage. At the 0.9
+# this model was gated at in production - the TensorFlow default, reached
+# because the backend was chosen without looking at the model - Pellet fell to
+# 8% and never appeared on the overlay at all. 0.05 measures identically to
+# 0.10, so 0.10 is the same result with more margin.
+#
+# Thinly labelled parts: RH_spread, LH_spread and LH_grab have one labelled
+# frame each and tongue 3-5, so those columns are indicative only. LH_spread
+# and LH_grab score 0% at every gate including 0.05 - not learned, not gated.
+YOLO_CONFIDENCE_THRESHOLD = 0.1
+
 _MIN_CONFIDENCE_THRESHOLD = 0.0
 _MAX_CONFIDENCE_THRESHOLD = 1.0
 
@@ -289,6 +311,7 @@ def confidence_threshold(
     environ: typing.Optional[typing.Mapping[str, str]] = None,
     *,
     model_name: typing.Optional[str] = None,
+    model_path: typing.Optional[str] = None,
 ) -> float:
     """
     Return the confidence a keypoint needs to count as present.
@@ -307,10 +330,19 @@ def confidence_threshold(
     warning: refusing to start over a malformed number would be worse, and
     silently gating on a nonsense threshold would be worse still.
     """
-    backend = selected_backend(environ) if backend is None else backend
+    backend = (selected_backend(environ, model_path=model_path)
+               if backend is None else backend)
     default = DEFAULT_CONFIDENCE_THRESHOLDS.get(
         backend, DEFAULT_CONFIDENCE_THRESHOLDS[DEFAULT_POSE_BACKEND]
     )
+    # A YOLO model runs on the torch engine but not on its scale, and it has no
+    # DeepLabCut backbone name for the table below to match, so it is resolved
+    # from the model itself before anything else looks at the name.
+    if is_yolo_model(model_path):
+        logger.info("YOLO model at %r uses its measured confidence threshold "
+                    "of %.2f rather than the %s default of %.2f",
+                    model_path, YOLO_CONFIDENCE_THRESHOLD, backend, default)
+        default = YOLO_CONFIDENCE_THRESHOLD
 
     # Only the PyTorch engine: these were measured under it, and TensorFlow's
     # likelihood is a saturated constant that no per-model figure describes.
