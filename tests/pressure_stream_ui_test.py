@@ -16,7 +16,14 @@ from tools.acquisition.model.nidaq_signal_monitor_model import (  # noqa: E402
 )
 from tools.acquisition.view.analysis_content import AnalysisContent  # noqa: E402
 
-from tests.signal_stream_ui_test import _AnalysisAppStub, _stream_configuration  # noqa: E402
+# tests/ has no __init__.py, so pytest puts this directory on sys.path
+# rather than the repository root: the sibling is a top-level module here,
+# and spelling it "tests.signal_stream_ui_test" failed to import and took
+# the whole suite's collection down with it.
+from signal_stream_ui_test import (  # noqa: E402
+    _AnalysisAppStub,
+    _stream_configuration,
+)
 
 
 @pytest.fixture(scope="module")
