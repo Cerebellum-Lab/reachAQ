@@ -249,7 +249,9 @@ class ProtocolContent(ContentWidget):
         self._install_delegates()
         body = QHBoxLayout()
         self._set_sidebar = ProtocolSetSidebar(self._app_model)
-        self._set_sidebar.setMaximumWidth(280)
+        # Wide enough for the experiment entry table's three columns. The panel
+        # expands, so this only costs width when it is docked.
+        self._set_sidebar.setMaximumWidth(360)
         self._set_sidebar.selection_changed.connect(self._sidebar_selection_changed)
         body.addWidget(self._set_sidebar)
         body.addWidget(table, stretch=1)
