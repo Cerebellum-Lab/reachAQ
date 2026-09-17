@@ -11,11 +11,13 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QGridLayout,
     QGroupBox,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSpinBox,
     QTabWidget,
@@ -166,7 +168,17 @@ class _LaserChannelTab(QWidget):
         output_page_layout = QVBoxLayout(output_page)
         output_page_layout.setContentsMargins(2, 4, 2, 2)
         output_page_layout.setSpacing(5)
-        self._mode_tabs.addTab(pulse_page, "Pulse")
+        # The pulse page stacks the controls, the preview, the live output and
+        # the board trigger. That is taller than the panel at most sizes, so it
+        # scrolls rather than pushing the lower graphs out of reach.
+        pulse_scroll = QScrollArea(self._mode_tabs)
+        pulse_scroll.setWidgetResizable(True)
+        pulse_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        pulse_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        pulse_scroll.setWidget(pulse_page)
+        self._mode_tabs.addTab(pulse_scroll, "Pulse")
         self._mode_tabs.addTab(calibration_page, "Calibration")
         self._mode_tabs.addTab(output_page, "Output")
 
@@ -349,6 +361,9 @@ class _LaserChannelTab(QWidget):
         self.trigger_plot.getAxis("left").setLabel("Trigger", units="V")
         self.trigger_plot.getPlotItem().setClipToView(True)
         self.trigger_plot.setMouseEnabled(x=False, y=False)
+        # Bounded both ways: small, because it is a single TTL edge beside a
+        # waveform, but never squeezed to nothing when the page is crowded.
+        self.trigger_plot.setMinimumHeight(80)
         self.trigger_plot.setMaximumHeight(140)
         self.trigger_plot.setYRange(-0.5, 5.5, padding=0)
         self._trace_curves["trigger"] = self.trigger_plot.plot(
@@ -379,6 +394,9 @@ class _LaserChannelTab(QWidget):
         trace_stream_layout = QVBoxLayout(self._trace_stream_page)
         trace_stream_layout.setContentsMargins(0, 4, 0, 0)
         trace_stream_layout.setSpacing(4)
+        # The live output is the reason this page is stacked, so it keeps room
+        # even when the pulse controls above it are fully expanded.
+        self._trace_plot.setMinimumHeight(140)
         trace_stream_layout.addWidget(self._trace_plot, stretch=1)
         self._trace_legend = StreamGraphLegend(columns=1, parent=self._trace_stream_page)
         self._trace_legend.set_entries(
