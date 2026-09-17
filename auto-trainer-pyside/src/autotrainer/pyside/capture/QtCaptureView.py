@@ -26,6 +26,10 @@ class ImageData:
     array: numpy.ndarray
     width: int
     height: int
+    #: Camera frame id this image came from, or -1 when unknown. Carried so
+    #: the overlay can be matched to the frame it was computed from rather
+    #: than drawn over whatever happens to be on screen.
+    frame_id: int = -1
 
 
 class QCaptureView(QWidget):
@@ -43,6 +47,10 @@ class QCaptureView(QWidget):
         self._cameras = list()
 
         self._next_frame_data: Optional[ImageData] = None
+        #: Frame id of the pending overlay, and how far it may be from the
+        #: displayed frame. See update_pose.
+        self._next_points_frame_id: int = -1
+        self._pose_frame_tolerance: int = 5
         self._is_frame_dirty = False
 
         self._next_frame_points: Dict[str, PoseLocation] = {}
@@ -239,18 +247,58 @@ class QCaptureView(QWidget):
             self._fps = fps
 
     def update_pose(self):
+        """Draw the overlay only over the frame it was computed from.
+
+        The pose and the image reach this widget independently: poses arrive
+        from inference at up to the capture rate, images arrive on a queue
+        rate limited to the display rate. Drawing whichever of each was
+        newest meant the dots could sit on a frame up to a display tick away
+        - 66 ms, ten frames at 150 fps - with nothing correlating them.
+
+        Both now carry a camera frame id, so an overlay is drawn when it
+        belongs to the frame on screen and held back when it does not. A
+        pose for a frame the display never received - the display sees about
+        one frame in ten - is simply never drawn, which is why the tolerance
+        below is not zero: it accepts the nearest frame within half the
+        display spacing, so most poses still land.
+
+        When either side has no id, this falls back to the previous
+        behaviour rather than showing nothing.
+        """
         if not self._display_dots_detection:
             self._image.set_points({})
             return
         if self._next_frame_points is None or not self._are_points_dirty:
             return
+        if not self._pose_matches_displayed_frame():
+            return
         self._image.set_points(self._next_frame_points)
         self._are_points_dirty = False
 
+    def _pose_matches_displayed_frame(self) -> bool:
+        """Whether the pending overlay belongs to the frame on screen."""
+        frame = self._next_frame_data
+        frame_id = -1 if frame is None else getattr(frame, "frame_id", -1)
+        pose_frame_id = self._next_points_frame_id
+        if frame_id < 0 or pose_frame_id < 0:
+            # No id on one side or the other: nothing to match against.
+            return True
+        return abs(frame_id - pose_frame_id) <= self._pose_frame_tolerance
+
     @Slot(dict)
-    def refresh_pose(self, points: Dict[str, PoseLocation]):
+    def refresh_pose(self, points: Dict[str, PoseLocation],
+                     frame_id: int = -1):
         self._next_frame_points = points
+        self._next_points_frame_id = int(frame_id)
         self._are_points_dirty = True
+
+    def set_pose_frame_tolerance(self, frames: int) -> None:
+        """How far an overlay may be from the displayed frame and still show.
+
+        Half the display spacing by default: the display receives about one
+        frame in ten, so demanding an exact match would drop most overlays.
+        """
+        self._pose_frame_tolerance = max(0, int(frames))
 
     def _source_changed(self, index):
         camera = self._camera.itemData(index)

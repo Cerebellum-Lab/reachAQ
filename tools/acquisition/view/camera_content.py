@@ -92,9 +92,10 @@ class CameraContent(ContentWidget):
         super().close()
 
     @Slot(ndarray, float)
-    def refresh_image(self, data: ndarray, fps: float):
+    def refresh_image(self, data: ndarray, fps: float, frame_id: int = -1):
         row, col = data.shape
-        self._capture_view.refresh_image(ImageData(data, col, row), fps)
+        self._capture_view.refresh_image(
+            ImageData(data, col, row, frame_id), fps)
 
     @invoke_method
     def set_is_editable(self, is_editable: bool):
@@ -110,8 +111,9 @@ class CameraContent(ContentWidget):
         self._capture_view.update_pose()
 
     @invoke_method
-    def refresh_pose(self, points: Dict[str, PoseLocation]):
-        self._capture_view.refresh_pose(points)
+    def refresh_pose(self, points: Dict[str, PoseLocation],
+                     frame_id: int = -1):
+        self._capture_view.refresh_pose(points, frame_id)
 
     def _camera_source_changed(self, camera):
         self._model.camera_source = camera

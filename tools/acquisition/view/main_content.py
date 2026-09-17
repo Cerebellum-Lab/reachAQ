@@ -504,10 +504,19 @@ class MainContent(ContentWidget):
             self._pending_pose_response = None
         if response is None:
             return
+        # source_frame_ids records the camera frames this pose was computed
+        # from, per camera. Passing it through lets the panel draw the dots
+        # over the frame they belong to instead of whatever is on screen.
+        source_ids = getattr(response, "source_frame_ids", ())
         for idx, camera in enumerate(self._app_model.inference_cameras):
             camera_content = self._reach_camera_content_by_model.get(camera)
             if camera_content is not None and camera.is_enabled and idx < len(response.locations):
-                camera_content.refresh_pose(response.locations[idx])
+                frame_id = -1
+                if idx < len(source_ids) and source_ids[idx]:
+                    # Several frames per camera per batch; the last is the
+                    # one the pose describes.
+                    frame_id = source_ids[idx][-1]
+                camera_content.refresh_pose(response.locations[idx], frame_id)
         if __debug__:
             perf_now = time.perf_counter()
             if perf_now >= self._next_parts_3d_loc_report:

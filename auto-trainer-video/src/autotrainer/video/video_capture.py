@@ -763,10 +763,14 @@ class VideoCapture(Process):
                     if perf_now >= next_t_image_q:
                         if image_queue_delay is not None:
                             next_t_image_q = perf_now + image_queue_delay
+                        # Stamped with the camera frame id so the view can say
+                        # which frame it is showing, and pair a pose with it.
+                        # This queue is rate limited to the display rate, so it
+                        # carries roughly one frame in ten at 150 fps.
                         if len(numpy.shape(frame)) < 3:
-                            img_q.put(frame)
+                            img_q.put(frame, cam_frame_id)
                         else:
-                            img_q.put(frame[:, :, 0])
+                            img_q.put(frame[:, :, 0], cam_frame_id)
 
                 if prim_cam_record_enabled is not None and not is_primary:
                     # for secondary synced cams we don't have other choice than to read
