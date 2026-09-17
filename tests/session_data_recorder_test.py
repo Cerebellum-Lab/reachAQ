@@ -824,7 +824,15 @@ def test_missing_cam_frames_is_explicitly_host_estimated():
     assert alignment["matchedSampleIndex"] == 1
 
 
-def test_device_event_overrun_marks_session_incomplete(tmp_path):
+def test_device_event_overrun_is_retention_not_an_incomplete_session(
+    tmp_path,
+):
+    """The ring is a retention window, so rolling it is not a fault.
+
+    It rolls because the session outlived the buffer, which says nothing
+    about whether the cameras, the pose path or the writers did their
+    job. The loss is still reported, under retentionLimited.
+    """
     project = ProjectInfo(
         root=str(tmp_path),
         device_id="test",
@@ -844,8 +852,14 @@ def test_device_event_overrun_marks_session_incomplete(tmp_path):
         device_event_overruns=3,
     )
 
-    assert result["sessionComplete"] is False
-    assert "overran by 3 event(s)" in result["incompleteReasons"][0]
+    assert result["sessionComplete"] is True
+    assert result["incompleteReasons"] == ()
+    assert result["retentionLimited"] == [{
+        "source": "device_events",
+        "stream": "device.csv",
+        "dropped": 3,
+        "reason": "session outlived the decoded device event ring",
+    }]
     alignment = json.loads(
         (
             tmp_path
@@ -856,8 +870,9 @@ def test_device_event_overrun_marks_session_incomplete(tmp_path):
             / "alignment.json"
         ).read_text()
     )
-    assert alignment["sessionComplete"] is False
+    assert alignment["sessionComplete"] is True
     assert alignment["deviceEventOverruns"] == 3
+    assert alignment["retentionLimited"][0]["dropped"] == 3
 
 
 def test_enabled_source_manifest_contains_final_paths_counts_and_health(
