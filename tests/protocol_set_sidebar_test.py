@@ -174,3 +174,84 @@ def test_opening_with_no_set_selected_reports_rather_than_raises(
     sidebar.open_selected_set_in_editor("baseline-draft", "Baseline draft")
 
     assert "Select a set to open" in sidebar.status_label.text()
+
+
+def test_selecting_an_experiment_loads_its_entries_into_the_editor(
+    qapp, stocked_app_model
+):
+    sidebar = ProtocolSetSidebar(stocked_app_model)
+
+    sidebar.experiment_list.setCurrentRow(0)
+
+    assert [e.set_id for e in sidebar.entry_editor.entries()] == ["baseline"]
+
+
+def test_selecting_a_set_clears_the_entry_editor(qapp, stocked_app_model):
+    sidebar = ProtocolSetSidebar(stocked_app_model)
+    sidebar.experiment_list.setCurrentRow(0)
+
+    sidebar.set_list.setCurrentRow(0)
+
+    assert sidebar.entry_editor.entries() == ()
+
+
+def test_a_new_experiment_starts_empty_and_is_selected(qapp, stocked_app_model):
+    sidebar = ProtocolSetSidebar(stocked_app_model)
+
+    sidebar.new_experiment("day4", "Day 4")
+
+    assert stocked_app_model._experiment_repository.get("day4") is not None
+    assert sidebar.current_selection() == ("experiment", "day4")
+    assert sidebar.entry_editor.entries() == ()
+
+
+def test_a_duplicate_new_experiment_reports_rather_than_raises(
+    qapp, stocked_app_model
+):
+    sidebar = ProtocolSetSidebar(stocked_app_model)
+
+    sidebar.new_experiment("day3", "Day 3 again")
+
+    assert "already exists" in sidebar.status_label.text()
+
+
+def test_building_and_saving_an_experiment_round_trips(qapp, stocked_app_model):
+    sidebar = ProtocolSetSidebar(stocked_app_model)
+    sidebar.new_experiment("day4", "Day 4")
+
+    sidebar.entry_editor.add_entry("baseline")
+    sidebar.entry_editor.add_entry("baseline")
+    sidebar.entry_editor.table.cellWidget(1, 1).setValue(3)
+    sidebar.save_selected_experiment()
+
+    stored = stocked_app_model._experiment_repository.get("day4")
+    assert [e.set_id for e in stored.entries] == ["baseline", "baseline"]
+    assert stored.entries[1].repeat == 3
+
+
+def test_a_built_experiment_compiles_to_the_expected_trial_count(
+    qapp, stocked_app_model
+):
+    sidebar = ProtocolSetSidebar(stocked_app_model)
+    sidebar.new_experiment("day4", "Day 4")
+    sidebar.entry_editor.add_entry("baseline")
+    sidebar.entry_editor.table.cellWidget(0, 1).setValue(3)
+    sidebar.save_selected_experiment()
+
+    sidebar.compile_selected_experiment()
+
+    compiled = stocked_app_model._trial_protocol_repository.get("day4")
+    assert compiled is not None
+    # The baseline set holds two trials, repeated three times.
+    assert compiled.trial_count == 6
+
+
+def test_saving_with_no_experiment_selected_reports_rather_than_raises(
+    qapp, stocked_app_model
+):
+    sidebar = ProtocolSetSidebar(stocked_app_model)
+    sidebar.experiment_list.setCurrentRow(-1)
+
+    sidebar.save_selected_experiment()
+
+    assert "Select an experiment to save" in sidebar.status_label.text()
