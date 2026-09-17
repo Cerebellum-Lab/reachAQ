@@ -17,6 +17,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from tools.acquisition.view.experiment_entry_editor import ExperimentEntryEditor
+
 logger = logging.getLogger(__name__)
 
 
@@ -42,6 +44,27 @@ class ProtocolSetSidebar(QWidget):
         self.experiment_list = QListWidget()
         self.experiment_list.currentRowChanged.connect(self._experiment_selected)
         layout.addWidget(self.experiment_list, stretch=1)
+
+        experiment_buttons = QHBoxLayout()
+        self.new_experiment_button = QPushButton("New experiment")
+        self.new_experiment_button.setToolTip(
+            "Start an empty experiment to build from your sets"
+        )
+        self.new_experiment_button.clicked.connect(self._new_experiment)
+        experiment_buttons.addWidget(self.new_experiment_button)
+        experiment_buttons.addStretch(1)
+        layout.addLayout(experiment_buttons)
+
+        self.entry_editor = ExperimentEntryEditor()
+        self.entry_editor.changed.connect(self._entries_changed)
+        layout.addWidget(self.entry_editor, stretch=1)
+
+        self.save_entries_button = QPushButton("Save experiment")
+        self.save_entries_button.setToolTip(
+            "Store this set list against the selected experiment"
+        )
+        self.save_entries_button.clicked.connect(self.save_selected_experiment)
+        layout.addWidget(self.save_entries_button)
 
         buttons = QHBoxLayout()
         self.compile_button = QPushButton("Compile and save")
@@ -89,6 +112,7 @@ class ProtocolSetSidebar(QWidget):
         return "", ""
 
     def refresh(self) -> None:
+        self.entry_editor.set_available_sets(self._app_model.trial_protocol_sets)
         self._fill(
             self.set_list,
             [
@@ -113,6 +137,56 @@ class ProtocolSetSidebar(QWidget):
                 for item in self._app_model.experiment_compositions
             ],
         )
+
+    def new_experiment(self, experiment_id: str, name: str) -> None:
+        try:
+            created = self._app_model.create_experiment(experiment_id, name)
+        except Exception as error:
+            logger.exception("Could not create experiment %s", experiment_id)
+            self.status_label.setText("{}: {}".format(type(error).__name__, error))
+            return
+        self.status_label.setText(
+            "Created experiment {}. Add sets, then save.".format(
+                created.experiment_id
+            )
+        )
+        self.refresh()
+        self._select(self.experiment_list, created.experiment_id)
+
+    def save_selected_experiment(self) -> None:
+        item = self.experiment_list.currentItem()
+        if item is None:
+            self.status_label.setText("Select an experiment to save.")
+            return
+        experiment_id = item.data(Qt.ItemDataRole.UserRole)
+        try:
+            saved = self._app_model.save_experiment_entries(
+                experiment_id, self.entry_editor.entries()
+            )
+        except Exception as error:
+            logger.exception("Could not save experiment %s", experiment_id)
+            self.status_label.setText("{}: {}".format(type(error).__name__, error))
+            return
+        self.status_label.setText(
+            "Saved experiment {} revision {}, {} entries.".format(
+                saved.experiment_id, saved.revision, len(saved.entries)
+            )
+        )
+        self.refresh()
+
+    def _new_experiment(self) -> None:
+        identity = self._ask_identity("New experiment")
+        if identity is not None:
+            self.new_experiment(*identity)
+
+    def _entries_changed(self) -> None:
+        self.status_label.setText("Unsaved changes to this experiment.")
+
+    def _select(self, widget: QListWidget, key: str) -> None:
+        for index in range(widget.count()):
+            if widget.item(index).data(Qt.ItemDataRole.UserRole) == key:
+                widget.setCurrentRow(index)
+                return
 
     def compile_selected_experiment(self) -> None:
         item = self.experiment_list.currentItem()
@@ -214,15 +288,24 @@ class ProtocolSetSidebar(QWidget):
         if row < 0:
             return
         self.experiment_list.setCurrentRow(-1)
+        self.entry_editor.load(None)
         self.selection_changed.emit(
             "set", self.set_list.item(row).data(Qt.ItemDataRole.UserRole)
         )
 
     def _experiment_selected(self, row: int) -> None:
         if row < 0:
+            self.entry_editor.load(None)
             return
         self.set_list.setCurrentRow(-1)
-        self.selection_changed.emit(
-            "experiment",
-            self.experiment_list.item(row).data(Qt.ItemDataRole.UserRole),
+        experiment_id = self.experiment_list.item(row).data(
+            Qt.ItemDataRole.UserRole
         )
+        self.entry_editor.load(self._experiment(experiment_id))
+        self.selection_changed.emit("experiment", experiment_id)
+
+    def _experiment(self, experiment_id: str):
+        for item in self._app_model.experiment_compositions:
+            if item.experiment_id == experiment_id:
+                return item
+        return None
