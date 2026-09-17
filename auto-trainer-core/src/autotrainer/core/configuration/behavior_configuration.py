@@ -129,7 +129,10 @@ class SessionControlConfiguration:
     stop_on_protocol_complete: bool = False
     stop_drain_timeout_seconds: float = 15.0
 
-    MAX_DURATION_SECONDS: ClassVar[float] = 2 * 60 * 60
+    # Five hours, which is what the rig's buffers now hold: pressure has
+    # its own stream, so the decoded device ring spans about that long
+    # too. Raise both together if this grows.
+    MAX_DURATION_SECONDS: ClassVar[float] = 5 * 60 * 60
 
     ATTEMPT_ASSIGNMENTS = (
         "retry_within_trial",
@@ -200,7 +203,7 @@ class SessionControlConfiguration:
             self.duration_limit_seconds is not None
             and self.duration_limit_seconds > self.MAX_DURATION_SECONDS
         ):
-            raise ValueError("Recording duration limit cannot exceed 2 hours")
+            raise ValueError("Recording duration limit cannot exceed 5 hours")
         if self.trial_limit is not None and self.trial_limit <= 0:
             raise ValueError("Trial target must be positive")
         if self.stop_drain_timeout_seconds <= 0:
