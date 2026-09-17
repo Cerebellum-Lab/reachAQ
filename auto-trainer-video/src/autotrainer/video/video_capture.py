@@ -815,20 +815,6 @@ class VideoCapture(Process):
                         logger.debug("got frame_id=%s frame_when=%.4f frame_perf=%.4f delay=%.4f",
                                      cam_frame_id, when_secs, frame_perf_c, frame_late_delay)
 
-                if img_q is not None:
-                    # image queue goes to GUI video reader frame, currently FixedArrayQueue
-                    if perf_now >= next_t_image_q:
-                        if image_queue_delay is not None:
-                            next_t_image_q = perf_now + image_queue_delay
-                        # Stamped with the camera frame id so the view can say
-                        # which frame it is showing, and pair a pose with it.
-                        # This queue is rate limited to the display rate, so it
-                        # carries roughly one frame in ten at 150 fps.
-                        if len(numpy.shape(frame)) < 3:
-                            img_q.put(frame, cam_frame_id)
-                        else:
-                            img_q.put(frame[:, :, 0], cam_frame_id)
-
                 if prim_cam_record_enabled is not None and not is_primary:
                     # for secondary synced cams we don't have other choice than to read
                     # the primary cam recording enabled shared flag on each frame read:
@@ -945,12 +931,19 @@ class VideoCapture(Process):
                         rec_q_put(record_q_list)
                         record_q_list = self._record_queue_list = []
 
+                # This frame's index as every downstream consumer knows it:
+                # relative to the start of the recording, or the category that
+                # says there is no recording. Computed for all of them rather
+                # than inside the inference branch, because the display queue
+                # stamps the same value and must not depend on inference being
+                # enabled to have one.
+                frame_idx_cat = (
+                    FrameIndexCategory.ONLINE_NO_RECORDING if record_start_stop_frame_idx is None
+                    else cam_frame_id - record_start_stop_frame_idx
+                )
+
                 if net_q_put is not None:
                     # network queue goes to processing/inference
-                    frame_idx_cat = (
-                        FrameIndexCategory.ONLINE_NO_RECORDING if record_start_stop_frame_idx is None
-                        else cam_frame_id - record_start_stop_frame_idx
-                    )
                     # frame_perf_c travels with the frame so the pose process
                     # can report sensor-to-result, not just how long its own
                     # call took. It is the host time the exposure maps to, from
@@ -959,6 +952,34 @@ class VideoCapture(Process):
                     if net_q_put(frame, net_q_idx, frame_idx_cat, block=False,
                                  frame_perf_c=frame_perf_c) == BufferResult.Ok:
                         cnt_net_q_put += 1
+
+                if img_q is not None:
+                    # image queue goes to GUI video reader frame, currently FixedArrayQueue.
+                    #
+                    # Stamped with frame_idx_cat, the SAME index the inference
+                    # queue carries, so the view can pair an overlay with the
+                    # frame it was computed from. It has to be this one and not
+                    # cam_frame_id: the pose path reports frames relative to the
+                    # start of the recording, so stamping the display with the
+                    # camera's own count compared two different numbering
+                    # systems and every overlay was held back - measured at a
+                    # constant 2150 frame offset, which is exactly how long the
+                    # cameras had been running before Record.
+                    #
+                    # Which is also why this sits after the block above rather
+                    # than before it: frame_idx_cat is only known once the
+                    # recording origin has been established.
+                    #
+                    # Outside a recording both sides carry the same category
+                    # value instead of an index, and the view falls back to
+                    # drawing the newest pose as it did before.
+                    if perf_now >= next_t_image_q:
+                        if image_queue_delay is not None:
+                            next_t_image_q = perf_now + image_queue_delay
+                        if len(numpy.shape(frame)) < 3:
+                            img_q.put(frame, frame_idx_cat)
+                        else:
+                            img_q.put(frame[:, :, 0], frame_idx_cat)
 
 
                 # if not (is_record_active and record_start_stop_frame_idx is not None) and attrs.record_prebuffer_duration > 0:
