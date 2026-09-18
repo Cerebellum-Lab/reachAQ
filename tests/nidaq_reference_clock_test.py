@@ -161,6 +161,9 @@ def _barrier_stream(records):
     stream = NidaqSignalStreamController.__new__(NidaqSignalStreamController)
     stream._owned_task_records = lambda: records
     stream._read_telemetry = {"late_barriers": 0}
+    # No board here is read straight from its FIFO; those are excluded from
+    # the barrier and are covered in nidaq_polled_analog_test.
+    stream._polled_analog_devices = set()
     return stream
 
 
