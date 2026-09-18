@@ -150,3 +150,54 @@ def test_a_rejecting_task_leaves_the_rate_unset():
     stream._configure_reference_clock(task, "PXI1Slot5")
 
     assert timing.ref_clk_rate is None
+
+
+class _Stream:
+    def __init__(self, available):
+        self.avail_samp_per_chan = available
+
+
+def _barrier_stream(records):
+    stream = NidaqSignalStreamController.__new__(NidaqSignalStreamController)
+    stream._owned_task_records = lambda: records
+    stream._read_telemetry = {"late_barriers": 0}
+    return stream
+
+
+def _task(available, *, acquires=True):
+    channels = [object()] if acquires else []
+    return types.SimpleNamespace(in_stream=_Stream(available),
+                                 ai_channels=channels, di_channels=[])
+
+
+def test_a_starved_barrier_names_the_task_holding_it_up():
+    """"available=(513, 0)" says a task is starved without saying which."""
+    records = [("stream_PXI1Slot5_ai", _task(513)),
+               ("stream_PXI1Slot5_di", _task(0))]
+    stream = _barrier_stream(records)
+
+    with pytest.raises(TimeoutError) as timed_out:
+        stream._wait_all_available(167, timeout=0.01)
+
+    message = str(timed_out.value)
+    assert "stream_PXI1Slot5_di=0" in message
+    assert "stream_PXI1Slot5_ai=513" in message
+
+
+def test_the_barrier_says_which_tasks_it_ignored():
+    """A task missing from the wait is as interesting as a starved one."""
+    records = [("stream_PXI1Slot5_ai", _task(0)),
+               ("stream_PXI1Slot4_ao", _task(0, acquires=False))]
+    stream = _barrier_stream(records)
+
+    with pytest.raises(TimeoutError) as timed_out:
+        stream._wait_all_available(167, timeout=0.01)
+
+    assert "not waited on: stream_PXI1Slot4_ao" in str(timed_out.value)
+
+
+def test_a_satisfied_barrier_returns_without_raising():
+    records = [("stream_PXI1Slot5_ai", _task(200)),
+               ("stream_PXI1Slot5_di", _task(200))]
+
+    _barrier_stream(records)._wait_all_available(167, timeout=0.01)
