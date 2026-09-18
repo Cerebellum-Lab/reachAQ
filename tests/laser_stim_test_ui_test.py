@@ -192,10 +192,11 @@ def test_selecting_a_profile_rebuilds_the_pulse_train_it_describes(
     assert rebuilt.baseline_ms == pytest.approx(15.0)
     assert rebuilt.post_stim_ms == pytest.approx(7.0)
     assert rebuilt.trigger_source == "/Dev1/PFI0"
-    # The preview is drawn from the same train: 100 pulses at 20 Hz run for
-    # five seconds, plus the baseline and post-stim margins.
+    # The preview is drawn from the same train: 15 ms of baseline, then the
+    # last of 100 pulses at 20 Hz starts at 4.95 s and runs 3 ms, then 7 ms
+    # of post-stim.
     x_values, _y_values = tab._build_preview_points(rebuilt)
-    assert x_values[-1] == pytest.approx(5.022, abs=0.01)
+    assert x_values[-1] == pytest.approx(0.015 + 99 * 0.05 + 0.003 + 0.007)
 
 
 def test_choosing_new_profile_leaves_the_built_train_alone(
