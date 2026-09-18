@@ -30,6 +30,54 @@ class CanChannelInUseError(RuntimeError):
     """Raised when another process already owns a CAN channel."""
 
 
+def describe_lock_holders(path: Path):
+    """Which live processes hold this lock, as (pid, command) pairs.
+
+    The lock is advisory and released by the kernel when its owner dies, so
+    a refusal always means something is still running - and saying only
+    "owned by another reachAQ process" leaves the operator to find it by
+    hand. That has cost real time: the holder is usually an orphaned worker
+    of an app that was closed, which looks identical to a rig that is simply
+    broken.
+
+    Best effort by design. Reading /proc can race with processes exiting,
+    and a failure to identify the holder must never replace the original
+    error with a worse one.
+    """
+    holders = []
+    proc = Path("/proc")
+    if os.name != "posix" or not proc.is_dir():
+        return holders
+    try:
+        target = os.path.realpath(path)
+    except OSError:
+        return holders
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            descriptors = (entry / "fd").iterdir()
+        except (PermissionError, FileNotFoundError, NotADirectoryError):
+            continue
+        try:
+            for descriptor in descriptors:
+                try:
+                    if os.path.realpath(descriptor) != target:
+                        continue
+                except OSError:
+                    continue
+                try:
+                    command = (entry / "cmdline").read_bytes().replace(
+                        bytes(1), b" ").decode("utf-8", "replace").strip()
+                except OSError:
+                    command = ""
+                holders.append((int(entry.name), command or "(unknown)"))
+                break
+        except (PermissionError, FileNotFoundError):
+            continue
+    return holders
+
+
 class CanChannelOwnership:
     """Non-blocking advisory lock for one configured CAN channel."""
 
@@ -69,9 +117,15 @@ class CanChannelOwnership:
         except OSError as exc:
             os.close(fd)
             if exc.errno in (errno.EACCES, errno.EAGAIN):
+                holders = describe_lock_holders(self.path)
+                detail = "; ".join(
+                    f"pid {pid}: {command}" for pid, command in holders)
                 raise CanChannelInUseError(
                     f"CAN channel {self.channel!r} is already owned by another "
                     "reachAQ process"
+                    + (f" ({detail})" if detail else
+                       " (holder could not be identified; check for orphaned"
+                       " workers of a closed session)")
                 ) from exc
             raise
         self._fd = fd
