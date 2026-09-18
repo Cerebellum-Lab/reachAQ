@@ -82,6 +82,11 @@ class LaserSystemConfiguration:
     backend: str = "disabled"
     pmt_shutter_output: Optional[str] = None
     trigger_listener_inputs: Tuple[str, ...] = tuple()
+    #: Backplane line the shared sample clock is driven onto when a laser's
+    #: output sits on a different board from the clock producer. Only used in
+    #: that case, and distinct from whatever line the stimulus trigger takes,
+    #: which each channel names through trigger_source.
+    backplane_clock_line: str = "PXI_Trig1"
 
     def __post_init__(self):
         object.__setattr__(self, "channels", tuple(self.channels))
