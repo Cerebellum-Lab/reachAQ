@@ -474,6 +474,26 @@ class NidaqSignalStreamController:
                 (len(channels), chunk_size), dtype=numpy.bool_
             )
 
+    @staticmethod
+    def _acquires_samples(task) -> bool:
+        """Whether this task will ever have input samples to wait for.
+
+        Every nidaqmx task carries an in_stream, including a pure output
+        task, whose avail_samp_per_chan is zero for as long as it exists.
+        Enabling hardware-timed laser output put the PXI-6713 - an analog
+        output board with no input channels - into the same task graph, and
+        the barrier then waited on a number that could never arrive:
+        "required=167 available=(513, 0)", and the stream never started.
+        """
+        for attribute in ("ai_channels", "di_channels"):
+            channels = getattr(task, attribute, None)
+            try:
+                if channels is not None and len(channels):
+                    return True
+            except TypeError:
+                continue
+        return False
+
     def _wait_all_available(self, sample_count: int, timeout: float) -> None:
         streams = tuple(
             task.in_stream
@@ -481,6 +501,7 @@ class NidaqSignalStreamController:
             if not task_id.endswith("counter-clock")
             and hasattr(task, "in_stream")
             and hasattr(task.in_stream, "avail_samp_per_chan")
+            and self._acquires_samples(task)
         )
         if not streams:
             return
