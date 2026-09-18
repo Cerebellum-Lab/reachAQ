@@ -328,7 +328,7 @@ class NidaqSignalStreamController:
                 samps_per_chan=buffer_size,
                 **timing_kwargs,
             )
-            self._configure_reference_clock(analog_task)
+            self._configure_reference_clock(analog_task, device_name)
             self._configure_start_trigger(analog_task, device_name)
             self._configure_exports(analog_task, device_name, "ai")
             self._make_stream_reader(device_name, analog_task, analog_channels, analog=True)
@@ -394,7 +394,7 @@ class NidaqSignalStreamController:
             digital_task.di_channels.all.di_data_xfer_req_cond = (
                 self._nidaqmx.constants.InputDataTransferCondition.ON_BOARD_MEMORY_NOT_EMPTY
             )
-            self._configure_reference_clock(digital_task)
+            self._configure_reference_clock(digital_task, device_name)
             self._configure_start_trigger(digital_task, device_name)
             self._configure_exports(digital_task, device_name, "di")
             self._make_stream_reader(device_name, digital_task, digital_channels, analog=False)
@@ -474,28 +474,77 @@ class NidaqSignalStreamController:
                 (len(channels), chunk_size), dtype=numpy.bool_
             )
 
+    @staticmethod
+    def _acquires_samples(task) -> bool:
+        """Whether this task will ever have input samples to wait for.
+
+        Every nidaqmx task carries an in_stream, including a pure output
+        task, whose avail_samp_per_chan is zero for as long as it exists.
+        Enabling hardware-timed laser output put the PXI-6713 - an analog
+        output board with no input channels - into the same task graph, and
+        the barrier then waited on a number that could never arrive:
+        "required=167 available=(513, 0)", and the stream never started.
+        """
+        for attribute in ("ai_channels", "di_channels"):
+            channels = getattr(task, attribute, None)
+            try:
+                if channels is not None and len(channels):
+                    return True
+            except TypeError:
+                continue
+        return False
+
     def _wait_all_available(self, sample_count: int, timeout: float) -> None:
-        streams = tuple(
-            task.in_stream
+        # Keep the task id beside each stream. A bare tuple of counts -
+        # "available=(513, 0)" - says a task is starved without saying which,
+        # and guessing at the zero from the device list sent one fix at the
+        # wrong task entirely.
+        waiting = tuple(
+            (task_id, task.in_stream)
             for task_id, task in self._owned_task_records()
             if not task_id.endswith("counter-clock")
             and hasattr(task, "in_stream")
             and hasattr(task.in_stream, "avail_samp_per_chan")
+            and self._acquires_samples(task)
         )
-        if not streams:
+        if not waiting:
             return
         deadline = time.perf_counter() + timeout
         while True:
-            if all(int(stream.avail_samp_per_chan) >= sample_count for stream in streams):
+            if all(int(stream.avail_samp_per_chan) >= sample_count
+                   for _task_id, stream in waiting):
                 return
             if time.perf_counter() >= deadline:
                 self._read_telemetry["late_barriers"] += 1
-                availability = tuple(
-                    int(stream.avail_samp_per_chan) for stream in streams
+                # Whether the task is running separates "never started"
+                # from "started but not clocked", which need different
+                # fixes and look identical from the sample count alone.
+                def state(task_id):
+                    task = dict(self._owned_task_records()).get(task_id)
+                    done = getattr(task, "is_task_done", None)
+                    try:
+                        return "done" if done() else "running"
+                    except Exception as err:
+                        # The message matters: DAQmx reports a task that
+                        # started and then faulted through the same query
+                        # as one that never started, and only the text
+                        # tells them apart.
+                        text = str(err).replace(chr(10), " ")[:160]
+                        return f"not-running({type(err).__name__}: {text})"
+
+                availability = ", ".join(
+                    f"{task_id}={int(stream.avail_samp_per_chan)}"
+                    f"[{state(task_id)}]"
+                    for task_id, stream in waiting
                 )
+                skipped = ", ".join(
+                    task_id for task_id, task in self._owned_task_records()
+                    if task_id not in {name for name, _ in waiting}
+                ) or "none"
                 raise TimeoutError(
                     "NI-DAQ synchronized availability barrier timed out: "
-                    f"required={sample_count} available={availability}"
+                    f"required={sample_count} per task: {availability}; "
+                    f"not waited on: {skipped}"
                 )
             time.sleep(0.0005)
 
@@ -554,7 +603,7 @@ class NidaqSignalStreamController:
             sample_mode=self._nidaqmx.constants.AcquisitionType.CONTINUOUS,
             samps_per_chan=buffer_size,
         )
-        self._configure_reference_clock(task)
+        self._configure_reference_clock(task, device_name)
         self._configure_exports(task, device_name, "counter")
         return f"/{device_name}/Ctr0InternalOutput"
 
@@ -621,20 +670,71 @@ class NidaqSignalStreamController:
             raise RuntimeError(f"NI-DAQ slave {device_name} has no sample clock")
         return {"source": source}
 
-    def _configure_reference_clock(self, task) -> None:
+    def _reference_clock_for(self, device_name: str):
+        """The device's own reference-clock terminal, or None if it has none.
+
+        The plan carries one terminal name for the whole chassis, and the
+        boards are not alike: a PXI-6221 exposes /PXI1Slot5/PXI_Clk10 while
+        the PXI-6713 beside it exposes no Clk10 at all. Setting a reference
+        clock on the board that has none fails the task with "property is
+        not supported by the device", which took down the whole signal
+        stream the moment hardware-timed output was enabled.
+
+        An explicitly configured terminal is returned untouched - naming one
+        is a deliberate choice and this must not second-guess it. A bare
+        name is matched against what the device actually reports, which also
+        fixes its spelling: the default is written PXI_CLK10 and NI calls
+        the terminal PXI_Clk10.
+        """
         plan = self._timing_plan
-        if plan is None or not plan.reference_clock_source:
+        source = None if plan is None else plan.reference_clock_source
+        if not source:
+            return None
+        if source.startswith("/"):
+            return source
+        try:
+            terminals = self._nidaqmx.system.Device(device_name).terminals
+        except Exception:
+            # Cannot ask, so do not guess on this device's behalf.
+            logger.warning("could not read terminals of %s; leaving its "
+                           "reference clock unset", device_name)
+            return None
+        wanted = source.rsplit("/", 1)[-1].lower()
+        for terminal in terminals:
+            if terminal.rsplit("/", 1)[-1].lower() == wanted:
+                return terminal
+        logger.info("%s exposes no %s terminal; running it without a "
+                    "reference clock", device_name, source)
+        return None
+
+    def _configure_reference_clock(self, task, device_name: str) -> None:
+        plan = self._timing_plan
+        source = self._reference_clock_for(device_name)
+        if source is None:
             return
         timing = getattr(task, "timing", None)
         if timing is None:
             return
-        if hasattr(timing, "ref_clk_src"):
-            timing.ref_clk_src = plan.reference_clock_source
-        if (
-            plan.reference_clock_rate_hz is not None
-            and hasattr(timing, "ref_clk_rate")
-        ):
-            timing.ref_clk_rate = plan.reference_clock_rate_hz
+        # Having the terminal is not the same as the task being able to use
+        # it: a PXI-6221 exposes PXI_Clk10, but its digital-input task rejects
+        # DAQmx_RefClk_Src outright (-200452, "not applicable to the task"),
+        # which failed the preflight and took recording with it. NI is the
+        # only authority on applicability, so ask it rather than maintain a
+        # table of which task types accept what. A task that cannot take one
+        # runs on its own timebase, exactly as it did before hardware-timed
+        # output existed.
+        try:
+            if hasattr(timing, "ref_clk_src"):
+                timing.ref_clk_src = source
+            if (
+                plan.reference_clock_rate_hz is not None
+                and hasattr(timing, "ref_clk_rate")
+            ):
+                timing.ref_clk_rate = plan.reference_clock_rate_hz
+        except Exception as error:
+            logger.info("%s does not accept a reference clock on this task "
+                        "(%s); it will run on its own timebase",
+                        device_name, error)
 
     def _configure_start_trigger(self, task, device_name: str) -> None:
         plan = self._timing_plan
