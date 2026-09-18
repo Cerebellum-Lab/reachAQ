@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QProgressBar,
+    QInputDialog,
     QPushButton,
     QSizePolicy,
     QSpinBox,
@@ -33,6 +34,9 @@ from autotrainer.device import (
 )
 from autotrainer.pyside import CardWidget, PGWidget
 from autotrainer.pyside.content_widget import ContentWidget, invoke_method
+from tools.acquisition.model.trial_protocol_schedule import (
+    LaserTriggerRoute,
+)
 from tools.acquisition.model.app_model import AppModel
 from tools.acquisition.model.laser_model import LaserModel, LaserTraceBlock
 from tools.acquisition.model.laser_plot_process import LaserPlotFrame, LaserPlotProcess
@@ -193,6 +197,12 @@ class _LaserChannelTab(QWidget):
         self._emit_trigger = self._make_checkbox("Trigger DO")
         self._emit_timing_trigger = self._make_checkbox("Timing DO")
         self._run_pulse_button = QPushButton("Run Pulse")
+        self._save_profile_button = QPushButton("Save as Profile…")
+        self._save_profile_button.setToolTip(
+            "Store these settings in stimulus_profiles.json so the protocol "
+            "can reuse them. Only a name is asked for; every value is taken "
+            "from this tab as it stands."
+        )
 
         pulse_layout.addWidget(self._form_label("Amplitude:"), 0, 0)
         pulse_layout.addWidget(self._amplitude, 0, 1)
@@ -230,6 +240,7 @@ class _LaserChannelTab(QWidget):
         trigger_options_layout.addStretch(1)
         pulse_layout.addWidget(trigger_options, 10, 0, 1, 2)
         pulse_layout.addWidget(self._run_pulse_button, 11, 1)
+        pulse_layout.addWidget(self._save_profile_button, 12, 1)
         pulse_page_layout.addWidget(pulse_group)
 
         self._preview_plot = PGWidget()
@@ -461,6 +472,7 @@ class _LaserChannelTab(QWidget):
         )
 
         self._run_pulse_button.clicked.connect(self._run_pulse)
+        self._save_profile_button.clicked.connect(self._save_as_profile)
         self._run_ramp_button.clicked.connect(self._run_calibration_ramp)
         self._trace_toggle_button.clicked.connect(self._toggle_trace_stream)
         self._trace_clear_button.clicked.connect(self._clear_trace)
@@ -762,6 +774,54 @@ class _LaserChannelTab(QWidget):
             return f"Pulse complete: laser {self._channel.channel_id.value}"
 
         self._start_operation(f"Running laser {self._channel.channel_id.value} pulse train", operation)
+
+    def _save_as_profile(self) -> None:
+        """Store what is on this tab as a reusable laser profile.
+
+        The tab is where a pulse is actually built and tuned against the
+        traces, but it had no way to keep one: the only route to a saved
+        profile was a chain of dialogs in the protocol tab that asked for
+        every value again by hand. This takes the settings as they stand and
+        asks only for a name.
+        """
+        try:
+            pulse_train = self._build_pulse_train()
+            self._validate_pulse_train(pulse_train)
+        except Exception as exc:
+            self._set_parent_status(str(exc) or exc.__class__.__name__, True)
+            return
+
+        suggested = f"laser{self._channel.channel_id.value}"
+        profile_id, accepted = QInputDialog.getText(
+            self, "Save laser profile", "Profile name:", text=suggested)
+        if not accepted or not profile_id.strip():
+            return
+
+        # An external trigger names a terminal, so the profile records the
+        # direct NI route; otherwise it keeps the board-driven default.
+        terminal = pulse_train.trigger_source or ""
+        route = (LaserTriggerRoute.DIRECT_NI_SOFTWARE if terminal
+                 else LaserTriggerRoute.HARDWARE_STIM3)
+        values = dict(
+            profile_id=profile_id.strip(),
+            channel_id=int(self._channel.channel_id.value),
+            amplitude_volts=float(pulse_train.amplitude_volts),
+            pulse_duration_ms=float(pulse_train.duration_ms),
+            pulse_count=int(pulse_train.pulse_count),
+            frequency_hz=pulse_train.frequency_hz,
+            baseline_ms=float(pulse_train.baseline_ms),
+            post_stim_ms=float(pulse_train.post_stim_ms),
+            trigger_route=route,
+            trigger_terminal=terminal,
+        )
+        try:
+            saved = self._app_model.save_laser_profile(**values)
+        except Exception as exc:
+            self._set_parent_status(str(exc) or exc.__class__.__name__, True)
+            return
+        self._set_parent_status(
+            f"Saved laser profile {saved.profile_id!r} (revision "
+            f"{saved.revision})", False)
 
     def _run_calibration_ramp(self) -> None:
         if not self._is_configured:
