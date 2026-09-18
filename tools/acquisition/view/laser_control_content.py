@@ -241,10 +241,11 @@ class _LaserChannelTab(QWidget):
         trigger_options_layout.addStretch(1)
         pulse_layout.addWidget(trigger_options, 10, 0, 1, 2)
         pulse_layout.addWidget(self._run_pulse_button, 11, 1)
-        # Row 12 already holds the stim profile selector and 13 its test
-        # button; placing this there put it underneath them, so it was
-        # created and connected but never visible.
-        pulse_layout.addWidget(self._save_profile_button, 14, 1)
+        # Rows 12-14 already hold the stim profile selector, its test
+        # button and the result label, and the label spans both columns.
+        # Anything placed in those rows sits underneath widgets added after
+        # it, so it is drawn over and its clicks land on the label instead.
+        pulse_layout.addWidget(self._save_profile_button, 15, 1)
 
         # Run Pulse above drives the analog output straight from the host. This
         # fires a saved profile the way a trial does: arm the output on its
@@ -666,6 +667,24 @@ class _LaserChannelTab(QWidget):
         spinbox.setValue(value)
         return spinbox
 
+    def run_pulse_refusal(self) -> str:
+        """Why Run Pulse is unavailable, or an empty string.
+
+        A greyed button with no explanation reads as a fault; both reasons
+        here are ordinary states the operator can act on.
+        """
+        if not self._is_configured:
+            return (
+                f"Laser {self._channel.channel_id.value} has no hardware "
+                "channel in the system configuration"
+            )
+        if not self._app_model.laser.is_connected:
+            return (
+                "The laser controller is not open: it claims its NI-DAQ "
+                "channels when the system starts, so press Run first"
+            )
+        return ""
+
     def _connect_preview_signals(self) -> None:
         for spinbox in (
             self._amplitude,
@@ -679,6 +698,8 @@ class _LaserChannelTab(QWidget):
         self._trigger_source.textChanged.connect(self._refresh_preview)
         self._trigger_mode.currentTextChanged.connect(self._on_trigger_mode_changed)
         self._trigger_edge.currentTextChanged.connect(self._refresh_preview)
+        self.stim_profile_selector.currentIndexChanged.connect(
+            self._on_stim_profile_selected)
         for checkbox in (
             self._open_shutter,
             self._close_shutter,
@@ -694,6 +715,7 @@ class _LaserChannelTab(QWidget):
             control.setEnabled(can_edit)
         self._refresh_trigger_mode_enabled()
         self._run_pulse_button.setEnabled(can_run_pulse)
+        self._run_pulse_button.setToolTip(self.run_pulse_refusal())
         # Saving writes a profile to disk and touches no hardware, so it
         # follows whether the values are editable rather than whether a
         # pulse may be fired. Left out of this method it kept whatever
@@ -812,6 +834,9 @@ class _LaserChannelTab(QWidget):
         previous = self.stim_profile_selector.currentData()
         self.stim_profile_selector.blockSignals(True)
         self.stim_profile_selector.clear()
+        # Selecting a profile overwrites the build controls, so there has to
+        # be a way back to whatever is being built by hand.
+        self.stim_profile_selector.addItem("(new profile)", None)
         state = getattr(self._app_model, "trial_protocol_state", {}) or {}
         marker = "channel {}".format(self._channel.channel_id.value)
         for item in state.get("laser_profiles", ()):
@@ -821,11 +846,68 @@ class _LaserChannelTab(QWidget):
             self.stim_profile_selector.addItem(
                 "{} ({})".format(item["profile_id"], summary), item["profile_id"]
             )
-        self.stim_profile_selector.blockSignals(False)
         if previous is not None:
             index = self.stim_profile_selector.findData(previous)
             if index >= 0:
                 self.stim_profile_selector.setCurrentIndex(index)
+        self.stim_profile_selector.blockSignals(False)
+
+    def _on_stim_profile_selected(self, *_args) -> None:
+        """Draw the selected profile in the build graph.
+
+        The preview is built from the controls, so a profile picked from the
+        list showed nothing of itself: the graph kept displaying whatever had
+        been typed. Loading writes the profile's values back into the same
+        controls, which redraws the preview and makes Run Pulse fire what the
+        list says. "(new profile)" leaves them alone.
+        """
+        profile_id = self.stim_profile_selector.currentData()
+        if not profile_id:
+            self._refresh_preview()
+            return
+        profile = self._app_model.laser_profile(profile_id)
+        if profile is None:
+            self._set_parent_status(
+                f"Laser profile {profile_id!r} is no longer saved", True)
+            return
+        self._apply_profile_to_controls(profile)
+        self._set_parent_status(
+            f"Loaded profile {profile.profile_id!r} into the laser "
+            f"{self._channel.channel_id.value} pulse train", False)
+
+    def _apply_profile_to_controls(self, profile) -> None:
+        controls = (
+            self._amplitude,
+            self._duration_ms,
+            self._baseline_ms,
+            self._post_stim_ms,
+            self._pulse_count,
+            self._frequency_hz,
+            self._trigger_mode,
+            self._trigger_source,
+            self._trigger_edge,
+        )
+        for control in controls:
+            control.blockSignals(True)
+        try:
+            self._amplitude.setValue(float(profile.amplitude_volts))
+            self._duration_ms.setValue(float(profile.pulse_duration_ms))
+            self._baseline_ms.setValue(float(profile.baseline_ms))
+            self._post_stim_ms.setValue(float(profile.post_stim_ms))
+            self._pulse_count.setValue(int(profile.pulse_count))
+            # A single-pulse profile carries no frequency; leaving the control
+            # where it is keeps the value the count would fall back to.
+            if profile.frequency_hz:
+                self._frequency_hz.setValue(float(profile.frequency_hz))
+            terminal = profile.trigger_terminal or ""
+            self._trigger_source.setText(terminal)
+            self._trigger_mode.setCurrentText(
+                "external" if terminal else "internal")
+        finally:
+            for control in controls:
+                control.blockSignals(False)
+        self._refresh_trigger_mode_enabled()
+        self._refresh_preview()
 
     def _run_stim_test(self) -> None:
         profile_id = self.stim_profile_selector.currentData()
@@ -896,6 +978,10 @@ class _LaserChannelTab(QWidget):
             self._set_parent_status(message, True)
             QMessageBox.warning(self, "Could not save laser profile", message)
             return
+        self.refresh_stim_profiles()
+        index = self.stim_profile_selector.findData(saved.profile_id)
+        if index >= 0:
+            self.stim_profile_selector.setCurrentIndex(index)
         self._set_parent_status(
             f"Saved laser profile {saved.profile_id!r} (revision "
             f"{saved.revision})", False)
@@ -1411,10 +1497,20 @@ class LaserControlContent(ContentWidget):
             is_running = self._operation_thread is not None
         can_edit = self._is_editable and not is_running
         can_run = can_edit and self._app_model.laser.is_connected
+        refusals = []
         for tab in self._channel_tabs:
             can_run_pulse = can_run and tab.is_configured
             can_run_ramp = can_run_pulse and not self._is_capture_active
             tab.set_controls_enabled(can_edit, can_run_pulse, can_run_ramp)
+            refusal = tab.run_pulse_refusal()
+            if refusal and refusal not in refusals:
+                refusals.append(refusal)
+        # Nothing can be fired and the buttons alone do not say why, so the
+        # shared status line carries the reason.
+        if refusals and not any(
+            tab.is_configured and can_run for tab in self._channel_tabs
+        ):
+            self._set_status(refusals[0], is_error=False)
 
     @invoke_method
     def set_is_editable(self, is_editable: bool):
