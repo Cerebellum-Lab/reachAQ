@@ -254,6 +254,9 @@ def build_nidaq_timing_plan(
         slave_devices=slaves,
         reference_clock_source=reference_clock,
         reference_clock_rate_hz=10_000_000.0 if reference_clock == "PXI_CLK10" else None,
+        # The clock named above is the stream's own, so its rate is the
+        # stream's too, and anything clocked by it runs at this rate.
+        sample_clock_rate_hz=configuration.sample_rate_hz,
         sample_clock_source=sample_clock,
         start_trigger_source=start_trigger,
         sample_clock_export_terminal=timing.sample_clock_export_terminal,

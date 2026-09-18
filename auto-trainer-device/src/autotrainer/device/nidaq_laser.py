@@ -462,9 +462,15 @@ class NidaqLaserController:
         ]
         for channel, channel_pulse in zip(channels, pulse_train.pulse_trains):
             self._validate_command_voltage(channel, channel_pulse.amplitude_volts)
-        sample_rate_hz = self._require_sample_rate()
+        # Resolved before the waveform is built rather than after, because the
+        # timing decides the rate it will be generated at and every sample
+        # count below is computed from that rate.
+        timing_kwargs, timing_status = self._resolve_pulse_timing(
+            channels, pulse_train,
+        )
+        sample_rate_hz = self._require_sample_rate(timing_kwargs)
         waveforms = [
-            self._build_pulse_train_waveform(channel, channel_pulse)
+            self._build_pulse_train_waveform(channel, channel_pulse, sample_rate_hz)
             for channel, channel_pulse in zip(channels, pulse_train.pulse_trains)
         ]
         pmt_enabled = pulse_train.enable_pmt_shutter or any(
@@ -497,9 +503,6 @@ class NidaqLaserController:
         digital_tasks = []
         run_error = None
         try:
-            timing_kwargs, timing_status = self._resolve_pulse_timing(
-                channels, pulse_train,
-            )
             if operation is not None:
                 operation._set_timing_status(timing_status)
             ao_task.timing.cfg_samp_clk_timing(
@@ -1130,8 +1133,13 @@ class NidaqLaserController:
         self,
         channel: LaserChannelConfiguration,
         pulse_train: LaserPulseTrain,
+        sample_rate_hz: Optional[float] = None,
     ) -> list:
-        sample_rate_hz = self._require_sample_rate()
+        # Taken from the caller when it knows better. Fetching it here made
+        # the caller's choice moot: it resolved the shared clock's rate, and
+        # the waveform was still laid out for the configured one.
+        if sample_rate_hz is None:
+            sample_rate_hz = self._require_sample_rate()
         baseline_samples = _samples_from_ms(pulse_train.baseline_ms, sample_rate_hz)
         high_samples = max(1, _samples_from_ms(pulse_train.duration_ms, sample_rate_hz))
         post_stim_samples = _samples_from_ms(pulse_train.post_stim_ms, sample_rate_hz)
@@ -1226,7 +1234,27 @@ class NidaqLaserController:
             raise RuntimeError(f"cannot infer NI-DAQ AO sample clock source from physical channel {physical_channel}")
         return f"/{parts[0]}/ao/SampleClock"
 
-    def _require_sample_rate(self) -> float:
+    def _require_sample_rate(self, timing_kwargs=None) -> float:
+        """The rate the waveform will actually be generated at.
+
+        A task clocked from a shared terminal ticks at that terminal's rate,
+        not the one the laser was configured with, and nothing objects: the
+        rate passed to cfg_samp_clk_timing beside an external source only
+        sizes the buffer. Building for the wrong one silently stretches every
+        pulse width and interval - built at 100 kHz and clocked at the
+        stream's 10 kHz, a two-second train took twenty seconds and came out
+        at 2 Hz rather than 20.
+        """
+        if timing_kwargs and timing_kwargs.get("source"):
+            plan = self._timing_plan
+            shared = None if plan is None else plan.sample_clock_rate_hz
+            if shared:
+                return shared
+            raise RuntimeError(
+                "hardware-synchronized laser output is clocked by "
+                f"{timing_kwargs['source']} but the timing plan does not say "
+                "at what rate, so the waveform cannot be built for it"
+            )
         sample_rate_hz = self._configuration.sample_rate_hz
         if sample_rate_hz is None:
             raise RuntimeError("hardware-timed laser output requires sample_rate_hz")

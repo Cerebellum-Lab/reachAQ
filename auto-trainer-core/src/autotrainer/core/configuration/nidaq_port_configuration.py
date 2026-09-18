@@ -151,6 +151,11 @@ class NidaqTimingPlan:
     reference_clock_source: Optional[str] = None
     reference_clock_rate_hz: Optional[float] = None
     sample_clock_source: Optional[str] = None
+    #: Rate of sample_clock_source. A consumer clocked by that terminal ticks
+    #: at this rate whatever rate it asked for, so a waveform built for a
+    #: different one comes out stretched: the laser built at 100 kHz and ran
+    #: on the stream's 10 kHz, and a two-second pulse train took twenty.
+    sample_clock_rate_hz: Optional[float] = None
     start_trigger_source: Optional[str] = None
     sample_clock_export_terminal: Optional[str] = None
     start_trigger_export_terminal: Optional[str] = None
