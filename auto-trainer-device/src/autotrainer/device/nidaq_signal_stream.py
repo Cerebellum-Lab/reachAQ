@@ -516,8 +516,20 @@ class NidaqSignalStreamController:
                 return
             if time.perf_counter() >= deadline:
                 self._read_telemetry["late_barriers"] += 1
+                # Whether the task is running separates "never started"
+                # from "started but not clocked", which need different
+                # fixes and look identical from the sample count alone.
+                def state(task_id):
+                    task = dict(self._owned_task_records()).get(task_id)
+                    done = getattr(task, "is_task_done", None)
+                    try:
+                        return "done" if done() else "running"
+                    except Exception as err:
+                        return f"unstarted?({type(err).__name__})"
+
                 availability = ", ".join(
                     f"{task_id}={int(stream.avail_samp_per_chan)}"
+                    f"[{state(task_id)}]"
                     for task_id, stream in waiting
                 )
                 skipped = ", ".join(
