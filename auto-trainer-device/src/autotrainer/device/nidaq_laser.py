@@ -31,6 +31,11 @@ from autotrainer.device.nidaq_reference_clock import (
 
 logger = logging.getLogger(__name__)
 
+#: Backplane line the shared sample clock is driven onto when the laser's
+#: output sits on a different board from the clock producer. PXI_Trig0 is
+#: left for the stimulus trigger, which is configured per channel.
+_BACKPLANE_CLOCK_LINE = "PXI_Trig1"
+
 
 class LaserOperationState(str, enum.Enum):
     PREPARED = "prepared"
@@ -278,6 +283,9 @@ class NidaqLaserController:
             "reason": "No finite laser waveform has been executed",
         }
         self._tasks: Dict[LaserChannelId, _NidaqLaserTasks] = {}
+        #: Backplane routes held open for this controller, source to
+        #: destination, released in close().
+        self._trigger_routes: List[Tuple[str, str]] = []
         self._command_volts: Dict[LaserChannelId, float] = {}
         self._operation_lock = threading.RLock()
         self._live_operations: Dict[str, NidaqLaserOperation] = {}
@@ -299,6 +307,7 @@ class NidaqLaserController:
                 self.set_shutter_open(channel.channel_id, False)
                 if channel.auxiliary_output is not None:
                     self.set_auxiliary_output(channel.channel_id, False)
+                self._connect_trigger_route(channel)
                 log_hardware_initialization(
                     logger,
                     "READY | NI-DAQ laser channel | id=%s elapsed=%.3fs",
@@ -661,7 +670,8 @@ class NidaqLaserController:
                 "status": "unsupported",
                 "reason": "Resolved timing topology has no shared sample clock",
             }
-        return {"source": plan.sample_clock_source}, {
+        return {"source": self._shared_clock_for(
+            output_devices[0], plan.sample_clock_source)}, {
             **base,
             "status": "hardware_synchronized",
             "reason": "Finite output armed for a future trigger on the shared sample clock",
@@ -902,9 +912,101 @@ class NidaqLaserController:
                 errors.append((f"channel {channel_id.value} task close", exc))
                 logger.exception("Failed to close NI-DAQ laser tasks for channel %s", channel_id.value)
         self._tasks.clear()
+        errors.extend(self._disconnect_trigger_routes())
         if errors:
             locations = ", ".join(location for location, _ in errors)
             raise RuntimeError(f"Failed to close NI-DAQ laser controller cleanly: {locations}") from errors[0][1]
+
+    def _connect_trigger_route(self, channel: LaserChannelConfiguration) -> None:
+        """Drive this channel's trigger terminal from where the pulse arrives.
+
+        A trigger that starts on one board and arms an output on another has
+        to cross the PXI backplane. DAQmx will do that itself only by
+        reserving a trigger line, and it refuses to reserve one when the
+        chassis is unidentified: "no registered trigger lines could be found
+        between the devices in the route", -89125, which is where every
+        cross-board arm on this rig stopped. Driving a PXI_Trig line by name
+        asks for no reservation and works - measured carrying the pellet
+        board's STIM3 pulse from the PXI-6221 to the PXI-6713, which then ran
+        its waveform on time.
+
+        The route is a property of the system rather than of a task, so it is
+        held for as long as the controller is open and released in close().
+        """
+        source = channel.trigger_route_source
+        if not source or not channel.trigger_source:
+            return
+        # The route is made on the source board, not across the two: naming
+        # the far board's terminal as the destination is asking DAQmx for the
+        # cross-device route it refuses. Each board addresses the same
+        # backplane line by its own name, so PFI0 is driven onto this board's
+        # PXI_Trig0 and the other board arms on its own PXI_Trig0.
+        line = channel.trigger_source.rsplit("/", 1)[-1]
+        destination = f"{source.rsplit('/', 1)[0]}/{line}"
+        try:
+            self._nidaqmx.system.System.local().connect_terms(
+                source, destination)
+        except Exception as error:
+            raise RuntimeError(
+                f"laser {channel.channel_id.value} could not route "
+                f"{source} to {destination}: {error}"
+            ) from error
+        self._trigger_routes.append((source, destination))
+        log_hardware_initialization(
+            logger,
+            "READY | NI-DAQ laser trigger route | id=%s %s -> %s",
+            channel.channel_id.value,
+            source,
+            destination,
+        )
+
+    def _shared_clock_for(self, output_device: str, source: str) -> str:
+        """The shared sample clock as this output board can see it.
+
+        A clock produced on one board reaches an output on another the same
+        way its trigger does, and runs into the same refusal: DAQmx will not
+        route across an unidentified chassis. Driving it onto a backplane line
+        and naming that line locally needs no reservation. A clock already on
+        the output's own board is returned untouched, so a single-board rig
+        never acquires a route it does not need.
+        """
+        clock_device = source.strip("/").split("/", 1)[0]
+        if not output_device or clock_device == output_device:
+            return source
+        destination = f"/{clock_device}/{_BACKPLANE_CLOCK_LINE}"
+        local = f"/{output_device}/{_BACKPLANE_CLOCK_LINE}"
+        if (source, destination) not in self._trigger_routes:
+            try:
+                self._nidaqmx.system.System.local().connect_terms(
+                    source, destination)
+            except Exception as error:
+                raise RuntimeError(
+                    f"could not put the shared sample clock {source} on "
+                    f"{destination} for {output_device}: {error}"
+                ) from error
+            self._trigger_routes.append((source, destination))
+            log_hardware_initialization(
+                logger,
+                "READY | NI-DAQ laser clock route | %s -> %s, read as %s",
+                source,
+                destination,
+                local,
+            )
+        return local
+
+    def _disconnect_trigger_routes(self) -> List[Tuple[str, Exception]]:
+        errors = []
+        for source, destination in self._trigger_routes:
+            try:
+                self._nidaqmx.system.System.local().disconnect_terms(
+                    source, destination)
+            except Exception as error:
+                errors.append((f"trigger route {source} -> {destination}",
+                               error))
+                logger.exception("Failed to release NI-DAQ laser trigger "
+                                 "route %s -> %s", source, destination)
+        self._trigger_routes.clear()
+        return errors
 
     def _create_channel_tasks(self, channel: LaserChannelConfiguration) -> _NidaqLaserTasks:
         analog_output = None

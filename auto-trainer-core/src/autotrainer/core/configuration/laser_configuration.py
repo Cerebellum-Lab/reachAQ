@@ -37,6 +37,16 @@ class LaserChannelConfiguration:
     #: the terminal the analog output task arms on.
     trigger_monitor_input: Optional[str] = None
     trigger_source: Optional[str] = None
+    #: Terminal to drive trigger_source from, when the two are on different
+    #: boards. DAQmx routes a trigger across a PXI backplane by reserving a
+    #: line, and it will not reserve one without knowing the chassis - which
+    #: this chassis never reports, failing every cross-board arm with -89125.
+    #: Driving a PXI_Trig line explicitly needs no such bookkeeping and was
+    #: measured carrying the board's stimulus pulse from the PXI-6221 to the
+    #: PXI-6713. Set this to the originating terminal, for example
+    #: /PXI1Slot5/PFI0, with trigger_source naming the far board's view of the
+    #: same line, /PXI1Slot4/PXI_Trig0.
+    trigger_route_source: Optional[str] = None
     trigger_output: Optional[str] = None
     timing_trigger_output: Optional[str] = None
     minimum_command_volts: float = 0.0
