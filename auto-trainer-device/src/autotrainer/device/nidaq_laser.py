@@ -31,10 +31,6 @@ from autotrainer.device.nidaq_reference_clock import (
 
 logger = logging.getLogger(__name__)
 
-#: Backplane line the shared sample clock is driven onto when the laser's
-#: output sits on a different board from the clock producer. PXI_Trig0 is
-#: left for the stimulus trigger, which is configured per channel.
-_BACKPLANE_CLOCK_LINE = "PXI_Trig1"
 
 
 class LaserOperationState(str, enum.Enum):
@@ -981,8 +977,9 @@ class NidaqLaserController:
         clock_device = source.strip("/").split("/", 1)[0]
         if not output_device or clock_device == output_device:
             return source
-        destination = f"/{clock_device}/{_BACKPLANE_CLOCK_LINE}"
-        local = f"/{output_device}/{_BACKPLANE_CLOCK_LINE}"
+        line = self._configuration.backplane_clock_line
+        destination = f"/{clock_device}/{line}"
+        local = f"/{output_device}/{line}"
         if (source, destination) not in self._trigger_routes:
             try:
                 self._nidaqmx.system.System.local().connect_terms(
