@@ -525,7 +525,12 @@ class NidaqSignalStreamController:
                     try:
                         return "done" if done() else "running"
                     except Exception as err:
-                        return f"unstarted?({type(err).__name__})"
+                        # The message matters: DAQmx reports a task that
+                        # started and then faulted through the same query
+                        # as one that never started, and only the text
+                        # tells them apart.
+                        text = str(err).replace(chr(10), " ")[:160]
+                        return f"not-running({type(err).__name__}: {text})"
 
                 availability = ", ".join(
                     f"{task_id}={int(stream.avail_samp_per_chan)}"
