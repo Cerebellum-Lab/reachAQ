@@ -946,6 +946,11 @@ class NidaqLaserController:
         # PXI_Trig0 and the other board arms on its own PXI_Trig0.
         line = channel.trigger_source.rsplit("/", 1)[-1]
         destination = f"{source.rsplit('/', 1)[0]}/{line}"
+        # Channels sharing one stimulus line share one route. Connecting it
+        # per channel registered it twice and would have released it twice on
+        # close, the second call against a route that no longer existed.
+        if (source, destination) in self._trigger_routes:
+            return
         try:
             self._nidaqmx.system.System.local().connect_terms(
                 source, destination)
