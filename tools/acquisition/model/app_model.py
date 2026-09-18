@@ -4173,6 +4173,15 @@ class AppModel(ObservableObject):
         self._save_stimulus_profiles(tones, self._laser_profiles)
         return profile
 
+    def laser_profile(self, profile_id: str) -> Optional[LaserPulseProfile]:
+        """The saved laser profile with this identifier, or None.
+
+        The protocol state only carries each profile's name and a summary
+        line, which is enough to list them but not to rebuild the pulse train
+        they describe.
+        """
+        return self._laser_profiles.get(str(profile_id))
+
     def save_laser_profile(self, **values) -> LaserPulseProfile:
         self._require_session_ready_for_configuration("Editing laser profiles")
         profile_id = str(values.pop("profile_id")).strip()

@@ -16,6 +16,8 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QProgressBar,
+    QInputDialog,
+    QMessageBox,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -35,6 +37,9 @@ from autotrainer.device import (
 )
 from autotrainer.pyside import CardWidget, PGWidget
 from autotrainer.pyside.content_widget import ContentWidget, invoke_method
+from tools.acquisition.model.trial_protocol_schedule import (
+    LaserTriggerRoute,
+)
 from tools.acquisition.model.app_model import AppModel
 from tools.acquisition.model.laser_model import LaserModel, LaserTraceBlock
 from tools.acquisition.model.laser_plot_process import LaserPlotFrame, LaserPlotProcess
@@ -218,6 +223,12 @@ class _LaserChannelTab(QWidget):
         self._emit_trigger = self._make_checkbox("Trigger DO")
         self._emit_timing_trigger = self._make_checkbox("Timing DO")
         self._run_pulse_button = QPushButton("Run Pulse")
+        self._save_profile_button = QPushButton("Save as Profile…")
+        self._save_profile_button.setToolTip(
+            "Store these settings in stimulus_profiles.json so the protocol "
+            "can reuse them. Only a name is asked for; every value is taken "
+            "from this tab as it stands."
+        )
 
         pulse_layout.addWidget(self._form_label("Amplitude:"), 0, 0)
         pulse_layout.addWidget(self._amplitude, 0, 1)
@@ -255,6 +266,11 @@ class _LaserChannelTab(QWidget):
         trigger_options_layout.addStretch(1)
         pulse_layout.addWidget(trigger_options, 10, 0, 1, 2)
         pulse_layout.addWidget(self._run_pulse_button, 11, 1)
+        # Rows 12-14 already hold the stim profile selector, its test
+        # button and the result label, and the label spans both columns.
+        # Anything placed in those rows sits underneath widgets added after
+        # it, so it is drawn over and its clicks land on the label instead.
+        pulse_layout.addWidget(self._save_profile_button, 15, 1)
 
         # Run Pulse above drives the analog output straight from the host. This
         # fires a saved profile the way a trial does: arm the output on its
@@ -556,6 +572,7 @@ class _LaserChannelTab(QWidget):
         )
 
         self._run_pulse_button.clicked.connect(self._run_pulse)
+        self._save_profile_button.clicked.connect(self._save_as_profile)
         self._run_ramp_button.clicked.connect(self._run_calibration_ramp)
         self._trace_toggle_button.clicked.connect(self._toggle_trace_stream)
         self._trace_clear_button.clicked.connect(self._clear_trace)
@@ -727,6 +744,24 @@ class _LaserChannelTab(QWidget):
         spinbox.setValue(value)
         return spinbox
 
+    def run_pulse_refusal(self) -> str:
+        """Why Run Pulse is unavailable, or an empty string.
+
+        A greyed button with no explanation reads as a fault; both reasons
+        here are ordinary states the operator can act on.
+        """
+        if not self._is_configured:
+            return (
+                f"Laser {self._channel.channel_id.value} has no hardware "
+                "channel in the system configuration"
+            )
+        if not self._app_model.laser.is_connected:
+            return (
+                "The laser controller is not open: it claims its NI-DAQ "
+                "channels when the system starts, so press Run first"
+            )
+        return ""
+
     def _connect_preview_signals(self) -> None:
         for spinbox in (
             self._amplitude,
@@ -740,6 +775,8 @@ class _LaserChannelTab(QWidget):
         self._trigger_source.textChanged.connect(self._refresh_preview)
         self._trigger_mode.currentTextChanged.connect(self._on_trigger_mode_changed)
         self._trigger_edge.currentTextChanged.connect(self._refresh_preview)
+        self.stim_profile_selector.currentIndexChanged.connect(
+            self._on_stim_profile_selected)
         for checkbox in (
             self._open_shutter,
             self._close_shutter,
@@ -755,6 +792,12 @@ class _LaserChannelTab(QWidget):
             control.setEnabled(can_edit)
         self._refresh_trigger_mode_enabled()
         self._run_pulse_button.setEnabled(can_run_pulse)
+        self._run_pulse_button.setToolTip(self.run_pulse_refusal())
+        # Saving writes a profile to disk and touches no hardware, so it
+        # follows whether the values are editable rather than whether a
+        # pulse may be fired. Left out of this method it kept whatever
+        # state it happened to inherit.
+        self._save_profile_button.setEnabled(can_edit)
         for control in self._ramp_controls:
             control.setEnabled(can_edit)
         self._run_ramp_button.setEnabled(can_run_ramp)
@@ -886,6 +929,9 @@ class _LaserChannelTab(QWidget):
         previous = self.stim_profile_selector.currentData()
         self.stim_profile_selector.blockSignals(True)
         self.stim_profile_selector.clear()
+        # Selecting a profile overwrites the build controls, so there has to
+        # be a way back to whatever is being built by hand.
+        self.stim_profile_selector.addItem("(new profile)", None)
         state = getattr(self._app_model, "trial_protocol_state", {}) or {}
         marker = "channel {}".format(self._channel.channel_id.value)
         for item in state.get("laser_profiles", ()):
@@ -895,11 +941,68 @@ class _LaserChannelTab(QWidget):
             self.stim_profile_selector.addItem(
                 "{} ({})".format(item["profile_id"], summary), item["profile_id"]
             )
-        self.stim_profile_selector.blockSignals(False)
         if previous is not None:
             index = self.stim_profile_selector.findData(previous)
             if index >= 0:
                 self.stim_profile_selector.setCurrentIndex(index)
+        self.stim_profile_selector.blockSignals(False)
+
+    def _on_stim_profile_selected(self, *_args) -> None:
+        """Draw the selected profile in the build graph.
+
+        The preview is built from the controls, so a profile picked from the
+        list showed nothing of itself: the graph kept displaying whatever had
+        been typed. Loading writes the profile's values back into the same
+        controls, which redraws the preview and makes Run Pulse fire what the
+        list says. "(new profile)" leaves them alone.
+        """
+        profile_id = self.stim_profile_selector.currentData()
+        if not profile_id:
+            self._refresh_preview()
+            return
+        profile = self._app_model.laser_profile(profile_id)
+        if profile is None:
+            self._set_parent_status(
+                f"Laser profile {profile_id!r} is no longer saved", True)
+            return
+        self._apply_profile_to_controls(profile)
+        self._set_parent_status(
+            f"Loaded profile {profile.profile_id!r} into the laser "
+            f"{self._channel.channel_id.value} pulse train", False)
+
+    def _apply_profile_to_controls(self, profile) -> None:
+        controls = (
+            self._amplitude,
+            self._duration_ms,
+            self._baseline_ms,
+            self._post_stim_ms,
+            self._pulse_count,
+            self._frequency_hz,
+            self._trigger_mode,
+            self._trigger_source,
+            self._trigger_edge,
+        )
+        for control in controls:
+            control.blockSignals(True)
+        try:
+            self._amplitude.setValue(float(profile.amplitude_volts))
+            self._duration_ms.setValue(float(profile.pulse_duration_ms))
+            self._baseline_ms.setValue(float(profile.baseline_ms))
+            self._post_stim_ms.setValue(float(profile.post_stim_ms))
+            self._pulse_count.setValue(int(profile.pulse_count))
+            # A single-pulse profile carries no frequency; leaving the control
+            # where it is keeps the value the count would fall back to.
+            if profile.frequency_hz:
+                self._frequency_hz.setValue(float(profile.frequency_hz))
+            terminal = profile.trigger_terminal or ""
+            self._trigger_source.setText(terminal)
+            self._trigger_mode.setCurrentText(
+                "external" if terminal else "internal")
+        finally:
+            for control in controls:
+                control.blockSignals(False)
+        self._refresh_trigger_mode_enabled()
+        self._refresh_preview()
 
     def _run_stim_test(self) -> None:
         profile_id = self.stim_profile_selector.currentData()
@@ -923,6 +1026,60 @@ class _LaserChannelTab(QWidget):
             ),
             operation,
         )
+
+    def _save_as_profile(self) -> None:
+        """Store what is on this tab as a reusable laser profile.
+
+        The tab is where a pulse is actually built and tuned against the
+        traces, but it had no way to keep one: the only route to a saved
+        profile was a chain of dialogs in the protocol tab that asked for
+        every value again by hand. This takes the settings as they stand and
+        asks only for a name.
+        """
+        try:
+            pulse_train = self._build_pulse_train()
+            self._validate_pulse_train(pulse_train)
+        except Exception as exc:
+            self._set_parent_status(str(exc) or exc.__class__.__name__, True)
+            return
+
+        suggested = f"laser{self._channel.channel_id.value}"
+        profile_id, accepted = QInputDialog.getText(
+            self, "Save laser profile", "Profile name:", text=suggested)
+        if not accepted or not profile_id.strip():
+            return
+
+        # An external trigger names a terminal, so the profile records the
+        # direct NI route; otherwise it keeps the board-driven default.
+        terminal = pulse_train.trigger_source or ""
+        route = (LaserTriggerRoute.DIRECT_NI_SOFTWARE if terminal
+                 else LaserTriggerRoute.HARDWARE_STIM3)
+        values = dict(
+            profile_id=profile_id.strip(),
+            channel_id=int(self._channel.channel_id.value),
+            amplitude_volts=float(pulse_train.amplitude_volts),
+            pulse_duration_ms=float(pulse_train.duration_ms),
+            pulse_count=int(pulse_train.pulse_count),
+            frequency_hz=pulse_train.frequency_hz,
+            baseline_ms=float(pulse_train.baseline_ms),
+            post_stim_ms=float(pulse_train.post_stim_ms),
+            trigger_route=route,
+            trigger_terminal=terminal,
+        )
+        try:
+            saved = self._app_model.save_laser_profile(**values)
+        except Exception as exc:
+            message = str(exc) or exc.__class__.__name__
+            self._set_parent_status(message, True)
+            QMessageBox.warning(self, "Could not save laser profile", message)
+            return
+        self.refresh_stim_profiles()
+        index = self.stim_profile_selector.findData(saved.profile_id)
+        if index >= 0:
+            self.stim_profile_selector.setCurrentIndex(index)
+        self._set_parent_status(
+            f"Saved laser profile {saved.profile_id!r} (revision "
+            f"{saved.revision})", False)
 
     def _run_calibration_ramp(self) -> None:
         if not self._is_configured:
@@ -1440,10 +1597,20 @@ class LaserControlContent(ContentWidget):
             is_running = self._operation_thread is not None
         can_edit = self._is_editable and not is_running
         can_run = can_edit and self._app_model.laser.is_connected
+        refusals = []
         for tab in self._channel_tabs:
             can_run_pulse = can_run and tab.is_configured
             can_run_ramp = can_run_pulse and not self._is_capture_active
             tab.set_controls_enabled(can_edit, can_run_pulse, can_run_ramp)
+            refusal = tab.run_pulse_refusal()
+            if refusal and refusal not in refusals:
+                refusals.append(refusal)
+        # Nothing can be fired and the buttons alone do not say why, so the
+        # shared status line carries the reason.
+        if refusals and not any(
+            tab.is_configured and can_run for tab in self._channel_tabs
+        ):
+            self._set_status(refusals[0], is_error=False)
 
     @invoke_method
     def set_is_editable(self, is_editable: bool):
