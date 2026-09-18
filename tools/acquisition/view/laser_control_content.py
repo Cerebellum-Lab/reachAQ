@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QProgressBar,
     QInputDialog,
+    QMessageBox,
     QPushButton,
     QSizePolicy,
     QSpinBox,
@@ -693,6 +694,11 @@ class _LaserChannelTab(QWidget):
             control.setEnabled(can_edit)
         self._refresh_trigger_mode_enabled()
         self._run_pulse_button.setEnabled(can_run_pulse)
+        # Saving writes a profile to disk and touches no hardware, so it
+        # follows whether the values are editable rather than whether a
+        # pulse may be fired. Left out of this method it kept whatever
+        # state it happened to inherit.
+        self._save_profile_button.setEnabled(can_edit)
         for control in self._ramp_controls:
             control.setEnabled(can_edit)
         self._run_ramp_button.setEnabled(can_run_ramp)
@@ -886,7 +892,9 @@ class _LaserChannelTab(QWidget):
         try:
             saved = self._app_model.save_laser_profile(**values)
         except Exception as exc:
-            self._set_parent_status(str(exc) or exc.__class__.__name__, True)
+            message = str(exc) or exc.__class__.__name__
+            self._set_parent_status(message, True)
+            QMessageBox.warning(self, "Could not save laser profile", message)
             return
         self._set_parent_status(
             f"Saved laser profile {saved.profile_id!r} (revision "
