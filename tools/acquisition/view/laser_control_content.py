@@ -240,7 +240,10 @@ class _LaserChannelTab(QWidget):
         trigger_options_layout.addStretch(1)
         pulse_layout.addWidget(trigger_options, 10, 0, 1, 2)
         pulse_layout.addWidget(self._run_pulse_button, 11, 1)
-        pulse_layout.addWidget(self._save_profile_button, 12, 1)
+        # Row 12 already holds the stim profile selector and 13 its test
+        # button; placing this there put it underneath them, so it was
+        # created and connected but never visible.
+        pulse_layout.addWidget(self._save_profile_button, 14, 1)
 
         # Run Pulse above drives the analog output straight from the host. This
         # fires a saved profile the way a trial does: arm the output on its
