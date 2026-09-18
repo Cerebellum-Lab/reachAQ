@@ -718,6 +718,7 @@ class NidaqLaserController:
                 sample_mode=self._nidaqmx.constants.AcquisitionType.FINITE,
                 samps_per_chan=len(waveform),
             )
+            self._configure_analog_transfer(ai_task, channel)
             if ramp.enable_pmt_shutter:
                 digital_tasks.append(
                     self._create_finite_digital_output_task(
@@ -962,6 +963,35 @@ class NidaqLaserController:
         if channel.command_copy_input is not None:
             analog_input.ai_channels.add_ai_voltage_chan(channel.command_copy_input)
         return analog_input
+
+    def _configure_analog_transfer(self, task, channel: LaserChannelConfiguration) -> None:
+        """Move this clocked read off DMA, which this chassis does not deliver.
+
+        The calibration ramp is the only clocked analog read the laser
+        performs, so it meets the same blocked transfer path as the signal
+        stream: the ramp runs, the board fills its FIFO and the read returns
+        nothing. NidaqSignalStreamController._configure_analog_transfer
+        carries the measurement and the IOMMU cause behind it.
+
+        The mechanism is a property of a buffered input task, so this is
+        called after the task has its timing, never at creation.
+        """
+        mechanism = getattr(
+            self._nidaqmx.constants.DataTransferActiveTransferMode,
+            "POLLED",
+            None,
+        )
+        if mechanism is None:
+            return
+        try:
+            task.ai_channels.all.ai_data_xfer_mech = mechanism
+        except Exception as error:
+            logger.warning(
+                "laser %s calibration input kept the driver's analog transfer "
+                "mode (%s)",
+                channel.channel_id.value,
+                error,
+            )
 
     def _create_finite_digital_output_task(
         self,

@@ -65,6 +65,9 @@ class NidaqSignalStreamController:
         if timing_plan is not None and not timing_plan.is_valid:
             raise RuntimeError(f"Invalid NI-DAQ timing plan: {timing_plan.reason}")
         self._analog_tasks: Dict[str, object] = {}
+        # Devices whose analog input is read straight from the FIFO. Such
+        # a task has no host buffer, so it cannot be waited on.
+        self._polled_analog_devices: set = set()
         self._digital_tasks: Dict[str, object] = {}
         self._digital_clock_tasks: Dict[str, object] = {}
         # Compatibility aliases for existing diagnostics and focused tests.
@@ -328,6 +331,10 @@ class NidaqSignalStreamController:
                 samps_per_chan=buffer_size,
                 **timing_kwargs,
             )
+            # After the timing, not before: the transfer mechanism is a
+            # property of a buffered input task, and an unbuffered one refuses
+            # it with "the task is not a buffered input task".
+            self._configure_analog_transfer(analog_task, device_name)
             self._configure_reference_clock(analog_task, device_name)
             self._configure_start_trigger(analog_task, device_name)
             self._configure_exports(analog_task, device_name, "ai")
@@ -404,6 +411,54 @@ class NidaqSignalStreamController:
                 kwargs["source"],
                 time.perf_counter() - started,
             )
+
+    def _configure_analog_transfer(self, task, device_name: str) -> None:
+        """Move analog input off DMA, which this chassis does not deliver.
+
+        DAQmx picks DMA and the board never transfers a sample: it converts,
+        fills its 4095-sample FIFO and raises -200361 "onboard device memory
+        overflow" with an empty host buffer, so the availability barrier waits
+        on an analog task that has already faulted. Every clocked analog read
+        failed this way, down to a single channel at 1 kHz, while the digital
+        task clocked off the same board ran - because that one had already
+        been moved off DMA for what was recorded as a runtime quirk.
+
+        The cause is below NI: the kernel IOMMU refuses the PXI bridge's
+        transfers, logging "DMAR: [DMA Read NO_PASID] Request device
+        [0b:00.0] ... PTE Read access is not set" for every attempt. Measured
+        on christielab10 on 2026-09-18: DMA and INTERRUPT both deliver
+        nothing, POLLED sustains all ten analog channels at 10 kHz - 100 kS/s
+        on a board rated for 250 kS/s - for four seconds with no overflow.
+
+        Polling copies each sample with the host CPU, so this is a workaround
+        and not the destination: booting with intel_iommu=off (or iommu=pt)
+        restores DMA, and this should go back to letting DAQmx choose.
+        """
+        mechanism = getattr(
+            self._nidaqmx.constants.DataTransferActiveTransferMode,
+            "POLLED",
+            None,
+        )
+        if mechanism is None:
+            logger.warning(
+                "nidaqmx %s offers no POLLED analog transfer mode; %s will "
+                "use the driver default, which does not deliver samples while "
+                "the IOMMU blocks this chassis",
+                getattr(self._nidaqmx, "__version__", "?"),
+                device_name,
+            )
+            return
+        try:
+            task.ai_channels.all.ai_data_xfer_mech = mechanism
+        except Exception as error:
+            logger.warning(
+                "%s did not accept a polled analog transfer mode (%s); it "
+                "keeps the driver default",
+                device_name,
+                error,
+            )
+            return
+        self._polled_analog_devices.add(device_name)
 
     def _make_digital_task(self, digital_channels, task_name) -> object:
         task = self._nidaqmx.Task(task_name)
@@ -503,6 +558,14 @@ class NidaqSignalStreamController:
             (task_id, task.in_stream)
             for task_id, task in self._owned_task_records()
             if not task_id.endswith("counter-clock")
+            # Before the attribute is touched, not after: a polled task holds
+            # no host buffer, so asking how many samples are available fails
+            # outright with -200455, and hasattr does not catch a DaqError.
+            # Its read blocks until the samples are there, which is the same
+            # wait by another means.
+            and task_id not in {
+                f"{device}.ai" for device in self._polled_analog_devices
+            }
             and hasattr(task, "in_stream")
             and hasattr(task.in_stream, "avail_samp_per_chan")
             and self._acquires_samples(task)
@@ -549,6 +612,12 @@ class NidaqSignalStreamController:
             time.sleep(0.0005)
 
     def _read_analog(self, device_name, task, sample_count, timeout):
+        try:
+            return self._read_analog_samples(device_name, task, sample_count, timeout)
+        except Exception as error:
+            raise self._explain_analog_read_failure(device_name, error) from error
+
+    def _read_analog_samples(self, device_name, task, sample_count, timeout):
         reader = self._analog_readers.get(device_name)
         if reader is None:
             return task.read(
@@ -563,6 +632,35 @@ class NidaqSignalStreamController:
         )
         self._require_exact_reader_count(device_name, count, sample_count)
         return buffer[:, :sample_count]
+
+    def _explain_analog_read_failure(self, device_name, error):
+        """Say what a polled overflow means, because DAQmx cannot know.
+
+        On a polled task the board's FIFO is the only buffer there is, so an
+        overflow is not the usual "the host fell behind its large buffer": it
+        means the reader did not come back within the few tens of milliseconds
+        the FIFO holds. The channel count and rate are what decide that, and
+        neither appears in the DAQmx text.
+        """
+        if device_name not in self._polled_analog_devices:
+            return error
+        if "overflow" not in str(error).lower():
+            return error
+        cfg = self._configuration
+        channels = self._channels_by_device(cfg.analog_channels).get(
+            device_name, tuple()
+        )
+        return RuntimeError(
+            f"{device_name} analog input overran its onboard FIFO: "
+            f"{len(channels)} channels at {cfg.sample_rate_hz:g} Hz leaves "
+            "only a few tens of milliseconds of slack, because the task is "
+            "read straight from that FIFO with no host buffer. It is polled "
+            "because this chassis's IOMMU blocks the board's DMA (see "
+            "_configure_analog_transfer). Measured on christielab10 on "
+            "2026-09-18: eight channels at 10 kHz and ten at 5 kHz both run; "
+            "ten at 10 kHz do not. Restoring DMA - booting with "
+            f"intel_iommu=off - removes the limit. DAQmx said: {error}"
+        )
 
     def _read_digital(self, device_name, task, sample_count, timeout):
         reader = self._digital_readers.get(device_name)
