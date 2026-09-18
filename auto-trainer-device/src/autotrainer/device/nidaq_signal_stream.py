@@ -495,28 +495,39 @@ class NidaqSignalStreamController:
         return False
 
     def _wait_all_available(self, sample_count: int, timeout: float) -> None:
-        streams = tuple(
-            task.in_stream
+        # Keep the task id beside each stream. A bare tuple of counts -
+        # "available=(513, 0)" - says a task is starved without saying which,
+        # and guessing at the zero from the device list sent one fix at the
+        # wrong task entirely.
+        waiting = tuple(
+            (task_id, task.in_stream)
             for task_id, task in self._owned_task_records()
             if not task_id.endswith("counter-clock")
             and hasattr(task, "in_stream")
             and hasattr(task.in_stream, "avail_samp_per_chan")
             and self._acquires_samples(task)
         )
-        if not streams:
+        if not waiting:
             return
         deadline = time.perf_counter() + timeout
         while True:
-            if all(int(stream.avail_samp_per_chan) >= sample_count for stream in streams):
+            if all(int(stream.avail_samp_per_chan) >= sample_count
+                   for _task_id, stream in waiting):
                 return
             if time.perf_counter() >= deadline:
                 self._read_telemetry["late_barriers"] += 1
-                availability = tuple(
-                    int(stream.avail_samp_per_chan) for stream in streams
+                availability = ", ".join(
+                    f"{task_id}={int(stream.avail_samp_per_chan)}"
+                    for task_id, stream in waiting
                 )
+                skipped = ", ".join(
+                    task_id for task_id, task in self._owned_task_records()
+                    if task_id not in {name for name, _ in waiting}
+                ) or "none"
                 raise TimeoutError(
                     "NI-DAQ synchronized availability barrier timed out: "
-                    f"required={sample_count} available={availability}"
+                    f"required={sample_count} per task: {availability}; "
+                    f"not waited on: {skipped}"
                 )
             time.sleep(0.0005)
 
