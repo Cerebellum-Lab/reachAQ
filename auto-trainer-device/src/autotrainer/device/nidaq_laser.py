@@ -25,6 +25,10 @@ from .laser import (
 )
 
 
+from autotrainer.device.nidaq_reference_clock import (
+    apply_reference_clock,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -668,17 +672,12 @@ class NidaqLaserController:
     def _configure_timing_reference(self, task, timing_status) -> None:
         if timing_status.get("status") != "hardware_synchronized":
             return
-        plan = self._timing_plan
-        timing = getattr(task, "timing", None)
-        if plan is None or timing is None or not plan.reference_clock_source:
-            return
-        if hasattr(timing, "ref_clk_src"):
-            timing.ref_clk_src = plan.reference_clock_source
-        if (
-            plan.reference_clock_rate_hz is not None
-            and hasattr(timing, "ref_clk_rate")
-        ):
-            timing.ref_clk_rate = plan.reference_clock_rate_hz
+        # This used to set the terminal straight from the plan. The plan's
+        # default is spelled PXI_CLK10 and the PXI-6713 driving the laser has
+        # no Clk10 terminal at all, so arming a triggered pulse died at
+        # -200452 on laser_sync_pulse_ao - after the wiring was already
+        # right, which made it look like a trigger fault.
+        apply_reference_clock(self._nidaqmx, task, self._timing_plan)
 
     def run_calibration_ramp(self, ramp: LaserCalibrationRamp) -> Tuple[LaserCalibrationPoint, ...]:
         if self._feedback_reader is not None:

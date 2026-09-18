@@ -16,6 +16,11 @@ from autotrainer.core import (
 from autotrainer.core.logging import log_hardware_initialization
 
 
+from autotrainer.device.nidaq_reference_clock import (
+    apply_reference_clock,
+    resolve_reference_clock,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -671,70 +676,17 @@ class NidaqSignalStreamController:
         return {"source": source}
 
     def _reference_clock_for(self, device_name: str):
-        """The device's own reference-clock terminal, or None if it has none.
-
-        The plan carries one terminal name for the whole chassis, and the
-        boards are not alike: a PXI-6221 exposes /PXI1Slot5/PXI_Clk10 while
-        the PXI-6713 beside it exposes no Clk10 at all. Setting a reference
-        clock on the board that has none fails the task with "property is
-        not supported by the device", which took down the whole signal
-        stream the moment hardware-timed output was enabled.
-
-        An explicitly configured terminal is returned untouched - naming one
-        is a deliberate choice and this must not second-guess it. A bare
-        name is matched against what the device actually reports, which also
-        fixes its spelling: the default is written PXI_CLK10 and NI calls
-        the terminal PXI_Clk10.
-        """
+        """The device's own reference-clock terminal, or None if it has none."""
         plan = self._timing_plan
-        source = None if plan is None else plan.reference_clock_source
-        if not source:
-            return None
-        if source.startswith("/"):
-            return source
-        try:
-            terminals = self._nidaqmx.system.Device(device_name).terminals
-        except Exception:
-            # Cannot ask, so do not guess on this device's behalf.
-            logger.warning("could not read terminals of %s; leaving its "
-                           "reference clock unset", device_name)
-            return None
-        wanted = source.rsplit("/", 1)[-1].lower()
-        for terminal in terminals:
-            if terminal.rsplit("/", 1)[-1].lower() == wanted:
-                return terminal
-        logger.info("%s exposes no %s terminal; running it without a "
-                    "reference clock", device_name, source)
-        return None
+        return resolve_reference_clock(
+            self._nidaqmx,
+            device_name,
+            None if plan is None else plan.reference_clock_source,
+        )
 
     def _configure_reference_clock(self, task, device_name: str) -> None:
-        plan = self._timing_plan
-        source = self._reference_clock_for(device_name)
-        if source is None:
-            return
-        timing = getattr(task, "timing", None)
-        if timing is None:
-            return
-        # Having the terminal is not the same as the task being able to use
-        # it: a PXI-6221 exposes PXI_Clk10, but its digital-input task rejects
-        # DAQmx_RefClk_Src outright (-200452, "not applicable to the task"),
-        # which failed the preflight and took recording with it. NI is the
-        # only authority on applicability, so ask it rather than maintain a
-        # table of which task types accept what. A task that cannot take one
-        # runs on its own timebase, exactly as it did before hardware-timed
-        # output existed.
-        try:
-            if hasattr(timing, "ref_clk_src"):
-                timing.ref_clk_src = source
-            if (
-                plan.reference_clock_rate_hz is not None
-                and hasattr(timing, "ref_clk_rate")
-            ):
-                timing.ref_clk_rate = plan.reference_clock_rate_hz
-        except Exception as error:
-            logger.info("%s does not accept a reference clock on this task "
-                        "(%s); it will run on its own timebase",
-                        device_name, error)
+        apply_reference_clock(
+            self._nidaqmx, task, self._timing_plan, device_name=device_name)
 
     def _configure_start_trigger(self, task, device_name: str) -> None:
         plan = self._timing_plan
