@@ -34,6 +34,7 @@ class _FakeDigitalChannels:
         self.di_data_xfer_req_cond = None
 
     def add_di_chan(self, physical_channel, *, line_grouping):
+        self._task.is_digital = True
         self._task.channels.append((physical_channel, line_grouping))
 
 
@@ -74,6 +75,17 @@ class _FakeTask:
         self.started = False
         self.closed = False
         self.read_count = 0
+        self.is_digital = False
+
+    @property
+    def devices(self):
+        """What DAQmx offers a task, and how the board gets asked anything."""
+        names = []
+        for physical_channel, _ in self.channels:
+            name = str(physical_channel).split("/", 1)[0]
+            if name not in names:
+                names.append(name)
+        return [SimpleNamespace(name=name) for name in names]
 
     def start(self):
         self.started = True
@@ -87,13 +99,26 @@ class _FakeTask:
 
     def read(self, *, number_of_samples_per_channel, timeout):
         assert timeout >= 1.0
-        values = tuple(
-            [
-                (index + channel_index) % 2 == 0
-                for index in range(number_of_samples_per_channel)
-            ]
-            for channel_index in range(len(self.channels))
-        )
+        if self.is_digital:
+            # A port-grouped digital task reads whole port words, one row per
+            # port - not one row per line. Alternating which single line is
+            # high is what makes this a test: a reader that took a line's bit
+            # from its position in the channel list instead of from its line
+            # number would see nothing on either of these, and that defect
+            # shipped once.
+            values = tuple(
+                [(1 << 7) if index % 2 == 0 else (1 << 2)
+                 for index in range(number_of_samples_per_channel)]
+                for _ in range(len(self.channels))
+            )
+        else:
+            values = tuple(
+                [
+                    (index + channel_index) % 2 == 0
+                    for index in range(number_of_samples_per_channel)
+                ]
+                for channel_index in range(len(self.channels))
+            )
         self.read_count += number_of_samples_per_channel
         return values[0] if len(values) == 1 else list(values)
 
@@ -108,8 +133,16 @@ class _FakeNidaqmx:
         InputDataTransferCondition=SimpleNamespace(
             ON_BOARD_MEMORY_NOT_EMPTY="not-empty",
         ),
-        LineGrouping=SimpleNamespace(CHAN_PER_LINE="per-line"),
+        LineGrouping=SimpleNamespace(CHAN_PER_LINE="per-line",
+                                     CHAN_FOR_ALL_LINES="all-lines"),
+        TerminalConfiguration=SimpleNamespace(RSE="rse", NRSE="nrse",
+                                              DIFF="diff"),
     )
+
+    system = SimpleNamespace(
+        Device=lambda name: SimpleNamespace(terminals=(
+            f"/{name}/PXI_Clk10", f"/{name}/PFI0",
+            f"/{name}/Ctr0InternalOutput")))
 
     def __init__(self):
         self.tasks = []
@@ -204,7 +237,7 @@ def test_multi_device_tasks_arm_slave_before_master(monkeypatch):
         assert "source" not in master.timing_configuration
         assert slave.start_trigger_source == "/Acquire/ai/StartTrigger"
         assert master.start_trigger_source is None
-        assert slave.timing.ref_clk_src == "PXI_CLK10"
+        assert slave.timing.ref_clk_src == "/Feedback/PXI_Clk10"
         assert slave.timing.ref_clk_rate == 10_000_000.0
         assert fake_nidaqmx.start_order == (
             ["reachaq_signal_stream_Feedback_ai", "reachaq_signal_stream_Acquire_ai"]
@@ -316,7 +349,7 @@ def test_digital_master_arms_all_inputs_before_counter_clock(monkeypatch):
             "reachaq_signal_stream_Acquire_di"
         ) < fake_nidaqmx.start_order.index("reachaq_signal_stream_Acquire_clock")
         assert tasks["reachaq_signal_stream_Acquire_clock"].timing.ref_clk_src == (
-            "PXI_CLK10"
+            "/Acquire/PXI_Clk10"
         )
     finally:
         controller.close()
@@ -372,12 +405,13 @@ def test_preallocated_stream_reader_returns_exact_common_chunk():
 
 def test_preallocated_stream_reader_rejects_short_chunk():
     class Reader:
-        def read_many_sample_multi_line(self, _buffer, **_kwargs):
+        def read_many_sample_port_uint32(self, _buffer, **_kwargs):
             return 2
 
     controller = object.__new__(NidaqSignalStreamController)
     controller._digital_readers = {"Dev1": Reader()}
-    controller._digital_buffers = {"Dev1": numpy.empty((1, 3), dtype=numpy.bool_)}
+    controller._digital_buffers = {
+        "Dev1": numpy.empty((1, 3), dtype=numpy.uint32)}
     controller._read_telemetry = {"short_reads": 0}
 
     try:
