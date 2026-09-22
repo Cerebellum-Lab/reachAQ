@@ -56,6 +56,10 @@ for _path in (
 sys.path.insert(0, str(_REPO_ROOT))
 
 from autotrainer.core.configuration import SystemConfiguration  # noqa: E402
+from tools.acquisition.model.nidaq_wiring_report import (  # noqa: E402
+    build_report,
+    format_report,
+)
 from tools.acquisition.model.nidaq_wiring_verification import (  # noqa: E402
     CONFIRMED,
     DRIVER,
@@ -93,6 +97,8 @@ def parse_args():
                              "light.")
     parser.add_argument("--command-volts", type=float, default=1.0,
                         help="level each laser command is held at (default 1.0)")
+    parser.add_argument("--report", type=Path, default=None,
+                        help="also write the formatted report here")
     parser.add_argument("--dry-run", action="store_true",
                         help="list the points the configuration asserts and "
                              "stop, without touching the hardware")
@@ -214,11 +220,56 @@ def read_analog(nidaqmx, channels, terminal_config):
             pass
 
 
+def inspect_configuration(configuration):
+    """What the boards say about this map, before anything is driven.
+
+    Discovery needs the hardware, and this tool is useful without it, so a
+    failure to discover is reported as a note rather than swallowed: the
+    configuration could not be checked, which is not the same as it passing.
+    """
+    try:
+        from tools.acquisition.model.nidaq_discovery import discover_nidaq_devices
+        from tools.acquisition.model.nidaq_validation import (
+            chassis_identification_note,
+            validate_nidaq_configuration,
+        )
+    except Exception as error:
+        return (), (f"configuration could not be checked: {error}",)
+
+    devices, error = discover_nidaq_devices()
+    if error or not devices:
+        detail = f": {error}" if error else ""
+        return (), (f"no boards to check the configuration against{detail}",)
+
+    issues = validate_nidaq_configuration(
+        devices,
+        stream=configuration.nidaq_stream,
+        ports=configuration.nidaq_ports,
+        laser=configuration.laser,
+    )
+    notes = tuple(n for n in (chassis_identification_note(devices),) if n)
+    return tuple(issue.describe() for issue in issues), notes
+
+
+def emit_report(configuration, verification, issues, notes, path) -> None:
+    report = build_report(configuration, verification, issues=issues,
+                          notes=notes)
+    text = format_report(report)
+    print()
+    print(text)
+    if path is not None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text + chr(10), encoding="utf-8")
+        print()
+        print(f"report written to {path}")
+
+
 def main() -> int:
     args = parse_args()
     configuration = SystemConfiguration.load_yaml_file(args.config,
                                                        save_backup=False)
     points = wiring_points(configuration)
+    issues, notes = inspect_configuration(configuration)
 
     print(f"{len(points)} points asserted by {args.config}")
     for point in points:
@@ -226,6 +277,13 @@ def main() -> int:
         print(f"  {point.name:<26} {point.physical_channel:<26} "
               f"{point.role}{note}")
     if args.dry_run:
+        # Everything that can be said without touching the rig: where
+        # each point is on the block, anything the boards already disagree
+        # with, and what the last run found. Reading the existing record
+        # matters - a dry run that ignored it would report a confirmed rig
+        # as entirely unknown.
+        emit_report(configuration, WiringVerification.load(args.record),
+                    issues, notes, args.report)
         return 0
 
     import nidaqmx
@@ -390,14 +448,9 @@ def main() -> int:
     )
     verification.save(args.record)
 
-    print(f"\n--- result, written to {args.record} ---")
-    width = max(len(check.name) for check in checks)
-    for check in sorted(checks, key=lambda c: (c.status != CONFIRMED, c.name)):
-        print(f"  {check.name:<{width}}  {check.status:<14} {check.detail}")
-    unconfirmed = [c.name for c in checks if c.status != CONFIRMED]
-    print(f"\n{len(checks) - len(unconfirmed)}/{len(checks)} confirmed")
-    if unconfirmed:
-        print("unconfirmed: " + ", ".join(unconfirmed))
+    print()
+    print(f"--- result, written to {args.record} ---")
+    emit_report(configuration, verification, issues, notes, args.report)
     return 0
 
 
