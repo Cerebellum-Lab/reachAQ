@@ -15,11 +15,18 @@ class NidaqDeviceIdentity:
     runtime_name: Optional[str] = None
     product_type: Optional[str] = None
     serial_number: Optional[int] = None
+    #: The breakout block cabled to this device, by name - BNC-2090A,
+    #: BNC-2110. Optional, and a device without one behaves exactly as it did
+    #: before there was a name for this: card terms are canonical either way,
+    #: and this only buys the label printed on the thing being touched and a
+    #: warning when a connector is a dead end on this particular card.
+    breakout: Optional[str] = None
 
     def __post_init__(self):
         if not self.logical_name.strip():
             raise ValueError("NI-DAQ logical device name must be provided")
-        for name in ("logical_name", "runtime_name", "product_type"):
+        for name in ("logical_name", "runtime_name", "product_type",
+                     "breakout"):
             value = getattr(self, name)
             if isinstance(value, str):
                 object.__setattr__(self, name, value.strip() or None)
