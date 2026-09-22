@@ -156,6 +156,10 @@ from autotrainer.device import CanFailure, CanTransportConfiguration
 from tools.acquisition.model.hardware_scan import HardwareScanEntry, scan_can_adapters, scan_gpus
 from tools.acquisition.model.nidaq_discovery import device_name_from_channel, discover_nidaq_devices
 from tools.acquisition.model.nidaq_channel_plan import build_nidaq_acquisition_configuration
+from tools.acquisition.model.nidaq_validation import (
+    chassis_identification_note,
+    require_valid_nidaq_configuration,
+)
 from tools.acquisition.model.nidaq_wiring_verification import (
     WiringVerification,
     summarize as summarize_nidaq_wiring,
@@ -2984,6 +2988,16 @@ class AppModel(ObservableObject):
         # used to test them, so a wrong one recorded plausible data instead of
         # failing. This does not probe hardware - it reports what the last
         # verification run found, and says so when there has not been one.
+        # An unidentified chassis is not an error - explicit routing works
+        # without one - but it removes automatic cross-board routing, and
+        # meeting that as -89125 inside a task is worse than reading it here.
+        try:
+            note = chassis_identification_note(nidaq_devices)
+            if note:
+                warnings_list.append(note)
+        except Exception:
+            logger.exception("NI-DAQ chassis identification could not be read")
+
         try:
             wiring = summarize_nidaq_wiring(
                 configuration, WiringVerification.load(self._wiring_record_path))
@@ -6144,6 +6158,11 @@ class AppModel(ObservableObject):
             reason="starting synchronized NI-DAQ tasks",
         )
         try:
+            # Refuse a channel map the boards cannot honour, before any task
+            # is built from it. The alternative is what this replaces: a
+            # DAQmx status code from inside a running task, naming neither the
+            # configuration line responsible nor the remedy.
+            self._require_valid_nidaq_configuration()
             if not monitor.start():
                 raise RuntimeError(
                     monitor.error_message or "NI-DAQ stream did not start"
@@ -6190,6 +6209,28 @@ class AppModel(ObservableObject):
             generation=generation,
         )
         return True
+
+    def _require_valid_nidaq_configuration(self) -> None:
+        """Check the configuration against the installed boards, or refuse.
+
+        Discovery is reused when the stream has already resolved device
+        aliases, so this costs nothing on the usual path. An empty probe means
+        the hardware could not be asked, which is unknown rather than invalid
+        and is left to the domain start to report.
+        """
+        configuration = self._loaded_configuration
+        if configuration is None:
+            return
+        devices, discovery_error = discover_nidaq_devices()
+        if discovery_error or not devices:
+            return
+        require_valid_nidaq_configuration(
+            devices,
+            stream=configuration.nidaq_stream,
+            ports=configuration.nidaq_ports,
+            laser=configuration.laser,
+            timing_plan=self._nidaq_signal_monitor.timing_plan,
+        )
 
     def _start_laser_domain(self) -> bool:
         configuration = self._laser.configuration
