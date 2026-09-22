@@ -157,47 +157,65 @@ class _Stream:
         self.avail_samp_per_chan = available
 
 
-def _barrier_stream(records):
+class _UnbufferedStream:
+    """A polled task holds no host buffer, so the query itself fails."""
+
+    @property
+    def avail_samp_per_chan(self):
+        raise RuntimeError("not a buffered input task")
+
+
+def _described(records):
     stream = NidaqSignalStreamController.__new__(NidaqSignalStreamController)
     stream._owned_task_records = lambda: records
-    stream._read_telemetry = {"late_barriers": 0}
-    return stream
+    return stream._describe_task_state()
 
 
-def _task(available, *, acquires=True):
+def _task(available, *, acquires=True, done=False, fault=None):
+    def is_task_done():
+        if fault is not None:
+            raise fault
+        return done
+
     channels = [object()] if acquires else []
-    return types.SimpleNamespace(in_stream=_Stream(available),
-                                 ai_channels=channels, di_channels=[])
+    return types.SimpleNamespace(
+        in_stream=_Stream(available) if available is not None
+        else _UnbufferedStream(),
+        ai_channels=channels, di_channels=[], is_task_done=is_task_done)
 
 
-def test_a_starved_barrier_names_the_task_holding_it_up():
-    """"available=(513, 0)" says a task is starved without saying which."""
-    records = [("stream_PXI1Slot5_ai", _task(513)),
-               ("stream_PXI1Slot5_di", _task(0))]
-    stream = _barrier_stream(records)
+def test_each_task_is_named_with_what_it_is_holding():
+    """"available=(513, 0)" said a task was starved without saying which."""
+    described = _described([("stream_PXI1Slot5_ai", _task(513)),
+                            ("stream_PXI1Slot5_di", _task(0))])
 
-    with pytest.raises(TimeoutError) as timed_out:
-        stream._wait_all_available(167, timeout=0.01)
-
-    message = str(timed_out.value)
-    assert "stream_PXI1Slot5_di=0" in message
-    assert "stream_PXI1Slot5_ai=513" in message
+    assert "stream_PXI1Slot5_ai=513[running]" in described
+    assert "stream_PXI1Slot5_di=0[running]" in described
 
 
-def test_the_barrier_says_which_tasks_it_ignored():
-    """A task missing from the wait is as interesting as a starved one."""
-    records = [("stream_PXI1Slot5_ai", _task(0)),
-               ("stream_PXI1Slot4_ao", _task(0, acquires=False))]
-    stream = _barrier_stream(records)
+def test_a_task_with_no_input_channels_is_left_out():
+    """A pure output task's avail_samp_per_chan is zero forever.
 
-    with pytest.raises(TimeoutError) as timed_out:
-        stream._wait_all_available(167, timeout=0.01)
+    Reporting it beside a genuinely starved input would read as two stalled
+    tasks, which is how the PXI-6713 made the barrier wait for a number that
+    could never arrive.
+    """
+    described = _described([("stream_PXI1Slot5_ai", _task(0)),
+                            ("stream_PXI1Slot4_ao", _task(0, acquires=False))])
 
-    assert "not waited on: stream_PXI1Slot4_ao" in str(timed_out.value)
+    assert "stream_PXI1Slot4_ao" not in described
+    assert described == "stream_PXI1Slot5_ai=0[running]"
 
 
-def test_a_satisfied_barrier_returns_without_raising():
-    records = [("stream_PXI1Slot5_ai", _task(200)),
-               ("stream_PXI1Slot5_di", _task(200))]
+def test_a_faulted_task_is_told_apart_from_one_that_never_started():
+    """DAQmx answers both through the same query; only the text separates them."""
+    described = _described([("stream_PXI1Slot5_ai", _task(
+        0, fault=RuntimeError("Onboard device memory overflow")))])
 
-    _barrier_stream(records)._wait_all_available(167, timeout=0.01)
+    assert "not-running(RuntimeError: Onboard device memory overflow)" in described
+
+
+def test_a_task_with_no_host_buffer_says_so_rather_than_zero():
+    described = _described([("stream_PXI1Slot5_ai", _task(None))])
+
+    assert "stream_PXI1Slot5_ai=unbuffered[running]" == described

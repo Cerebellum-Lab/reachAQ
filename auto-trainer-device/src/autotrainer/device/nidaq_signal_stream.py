@@ -94,9 +94,8 @@ class NidaqSignalStreamController:
         self._digital_buffers: Dict[str, numpy.ndarray] = {}
         self._read_telemetry = {
             "blocks": 0,
-            "availability_wait_seconds": 0.0,
             "read_seconds": 0.0,
-            "late_barriers": 0,
+            "read_failures": 0,
             "short_reads": 0,
         }
         self._is_started = False
@@ -166,13 +165,47 @@ class NidaqSignalStreamController:
         values: Dict[str, Tuple[float, ...]] = {}
         wall_time = time.time()
         perf_time = time.perf_counter()
-        wait_started = time.perf_counter()
-        self._wait_all_available(chunk_size, timeout)
-        self._read_telemetry["availability_wait_seconds"] += (
-            time.perf_counter() - wait_started
-        )
         read_started = time.perf_counter()
 
+        try:
+            self._read_all_devices(values, chunk_size, timeout)
+        except Exception as error:
+            # A blocking read that times out says only that it did. Which
+            # task was short, and whether it is running at all, is what
+            # separates "not clocked" from "faulted", and the two need
+            # different fixes.
+            self._read_telemetry["read_failures"] += 1
+            raise RuntimeError(
+                f"NI-DAQ read of {chunk_size} samples failed: {error}; "
+                f"per task: {self._describe_task_state()}"
+            ) from error
+
+        self._read_telemetry["blocks"] += 1
+        self._read_telemetry["read_seconds"] += time.perf_counter() - read_started
+
+        sample_index = self._sample_index
+        if values:
+            sample_counts = {len(channel_values) for channel_values in values.values()}
+            if len(sample_counts) != 1:
+                raise RuntimeError(
+                    "Synchronized NI-DAQ tasks returned different sample counts: "
+                    + ", ".join(map(str, sorted(sample_counts)))
+                )
+            self._sample_index += next(iter(sample_counts))
+
+        return NidaqSignalSampleBlock(
+            wall_time=wall_time,
+            perf_time=perf_time,
+            sample_rate_hz=cfg.sample_rate_hz,
+            sample_index=sample_index,
+            channels=tuple(cfg.channels),
+            values=values,
+            epoch_perf_time=self._epoch_perf_time,
+            epoch_wall_time=self._epoch_wall_time,
+        )
+
+    def _read_all_devices(self, values, chunk_size, timeout) -> None:
+        """Every task's chunk, in start order, into `values`."""
         for device_name in self._task_start_order():
             analog_task = self._analog_tasks.get(device_name)
             analog_channels = self._analog_channels_by_device.get(device_name, tuple())
@@ -201,30 +234,6 @@ class NidaqSignalStreamController:
                         _scale_sample(1.0 if bool(sample) else 0.0, channel)
                         for sample in samples
                     )
-
-        self._read_telemetry["blocks"] += 1
-        self._read_telemetry["read_seconds"] += time.perf_counter() - read_started
-
-        sample_index = self._sample_index
-        if values:
-            sample_counts = {len(channel_values) for channel_values in values.values()}
-            if len(sample_counts) != 1:
-                raise RuntimeError(
-                    "Synchronized NI-DAQ tasks returned different sample counts: "
-                    + ", ".join(map(str, sorted(sample_counts)))
-                )
-            self._sample_index += next(iter(sample_counts))
-
-        return NidaqSignalSampleBlock(
-            wall_time=wall_time,
-            perf_time=perf_time,
-            sample_rate_hz=cfg.sample_rate_hz,
-            sample_index=sample_index,
-            channels=cfg.channels,
-            values=values,
-            epoch_perf_time=self._epoch_perf_time,
-            epoch_wall_time=self._epoch_wall_time,
-        )
 
     def verify_tasks(self, *, commit: bool = True) -> Tuple[str, ...]:
         """Verify the exact disposable graph without starting any task."""
@@ -558,59 +567,56 @@ class NidaqSignalStreamController:
                 continue
         return False
 
-    def _wait_all_available(self, sample_count: int, timeout: float) -> None:
-        # Keep the task id beside each stream. A bare tuple of counts -
-        # "available=(513, 0)" - says a task is starved without saying which,
-        # and guessing at the zero from the device list sent one fix at the
-        # wrong task entirely.
-        waiting = tuple(
-            (task_id, task.in_stream)
+    def _describe_task_state(self) -> str:
+        """Per task, how much is waiting and whether it is running at all.
+
+        This was the body of an availability barrier that ran before every
+        read, polling each task at half a millisecond until all had a
+        chunk. It was removed for being a second wait in front of a
+        blocking read that already waits, and for the failure mode it
+        carried: it once waited on a pure output task whose available
+        count could never rise, and the stream never started.
+
+        It was not removed to save time, and it does not. Measured on
+        christielab10 at 10 kHz, 160 chunks over eight seconds, three
+        runs each alternating: with the barrier 11.2/11.7/12.1% of a
+        core, without it 13.2/13.5/14.0%. The DAQmx blocking read does
+        not sleep through the wait - it costs slightly more than the
+        spin it replaces. Both deliver the same 160 chunks, because a
+        chunk takes its own 50 ms to arrive whatever asks for it.
+
+        What the barrier was genuinely good for was saying which task had
+        stalled. That is kept, and moved to where it is needed: a read that
+        fails is re-raised carrying this, so the diagnosis survives without
+        the spin. It is also what found the analog input fault - "ai=0
+        [not-running(DaqError: Onboard device memory overflow...)]" beside a
+        digital task at 411 - which a bare DAQmx timeout would not have said.
+        """
+        def state(task):
+            done = getattr(task, "is_task_done", None)
+            try:
+                return "done" if done() else "running"
+            except Exception as error:
+                # The message matters: DAQmx reports a task that started and
+                # then faulted through the same query as one that never
+                # started, and only the text tells them apart.
+                text = str(error).replace(chr(10), " ")[:160]
+                return f"not-running({type(error).__name__}: {text})"
+
+        def available(task):
+            try:
+                return str(int(task.in_stream.avail_samp_per_chan))
+            except Exception:
+                # A polled task holds no host buffer, so it has no answer to
+                # give rather than an answer of zero.
+                return "unbuffered"
+
+        return ", ".join(
+            f"{task_id}={available(task)}[{state(task)}]"
             for task_id, task in self._owned_task_records()
             if not task_id.endswith("counter-clock")
-            and hasattr(task, "in_stream")
-            and hasattr(task.in_stream, "avail_samp_per_chan")
             and self._acquires_samples(task)
         )
-        if not waiting:
-            return
-        deadline = time.perf_counter() + timeout
-        while True:
-            if all(int(stream.avail_samp_per_chan) >= sample_count
-                   for _task_id, stream in waiting):
-                return
-            if time.perf_counter() >= deadline:
-                self._read_telemetry["late_barriers"] += 1
-                # Whether the task is running separates "never started"
-                # from "started but not clocked", which need different
-                # fixes and look identical from the sample count alone.
-                def state(task_id):
-                    task = dict(self._owned_task_records()).get(task_id)
-                    done = getattr(task, "is_task_done", None)
-                    try:
-                        return "done" if done() else "running"
-                    except Exception as err:
-                        # The message matters: DAQmx reports a task that
-                        # started and then faulted through the same query
-                        # as one that never started, and only the text
-                        # tells them apart.
-                        text = str(err).replace(chr(10), " ")[:160]
-                        return f"not-running({type(err).__name__}: {text})"
-
-                availability = ", ".join(
-                    f"{task_id}={int(stream.avail_samp_per_chan)}"
-                    f"[{state(task_id)}]"
-                    for task_id, stream in waiting
-                )
-                skipped = ", ".join(
-                    task_id for task_id, task in self._owned_task_records()
-                    if task_id not in {name for name, _ in waiting}
-                ) or "none"
-                raise TimeoutError(
-                    "NI-DAQ synchronized availability barrier timed out: "
-                    f"required={sample_count} per task: {availability}; "
-                    f"not waited on: {skipped}"
-                )
-            time.sleep(0.0005)
 
     def _read_analog(self, device_name, task, sample_count, timeout):
         reader = self._analog_readers.get(device_name)
