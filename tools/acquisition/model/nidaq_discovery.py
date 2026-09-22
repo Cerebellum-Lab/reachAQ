@@ -37,10 +37,12 @@ class NidaqDevicePorts:
     #: answers this outright, and a day was spent tracing a stimulus line to
     #: an APFI connector on a board where it reads False.
     analog_trigger_supported: Optional[bool] = None
-    #: Terminal configurations the analog inputs accept, as reported by a
-    #: physical channel. Left unset, DAQmx picks per channel and the choice is
-    #: not uniform across a board's channel range.
-    analog_input_terminal_configs: Tuple[str, ...] = tuple()
+    #: Terminal configurations each analog input accepts, as (channel, modes)
+    #: pairs. Per channel rather than per board because they differ within
+    #: one: a PXI-6221 offers DIFF on ai0-ai7, which pair with ai8-ai15, and
+    #: only RSE and NRSE above that. A single board-wide answer says DIFF is
+    #: available and is wrong for half the range.
+    analog_input_terminal_configs: Tuple[Tuple[str, Tuple[str, ...]], ...] = tuple()
     #: Trigger roles each subsystem supports, as (subsystem, roles) pairs -
     #: a tuple rather than a mapping so the record survives the JSON round
     #: trip through the isolated discovery process.
@@ -131,7 +133,9 @@ def discover_nidaq_devices() -> Tuple[Tuple[NidaqDevicePorts, ...], Optional[str
                 device.get("analog_trigger_supported")
             ),
             analog_input_terminal_configs=tuple(
-                device.get("analog_input_terminal_configs", tuple())
+                (str(channel), tuple(modes))
+                for channel, modes in device.get(
+                    "analog_input_terminal_configs", tuple())
             ),
             # JSON gives back lists; the record holds tuples of tuples.
             trigger_usages=tuple(
@@ -273,19 +277,24 @@ def _enum_name(value) -> str:
     return str(getattr(value, "name", value))
 
 
-def _terminal_configs(device) -> Tuple[str, ...]:
-    """Terminal configurations the analog inputs accept.
+def _terminal_configs(device) -> Tuple[Tuple[str, Tuple[str, ...]], ...]:
+    """Terminal configurations each analog input accepts, per channel.
 
-    Asked of a physical channel rather than the device, which does not carry
-    the property. One channel is enough: the list describes the board's input
-    stage, not an individual pin.
+    The property lives on the physical channel, and reading one channel and
+    generalising is wrong: on a PXI-6221, ai0-ai7 report DIFF because each
+    pairs with ai8-ai15, and ai8 upwards report only RSE and NRSE. A board
+    that says "DIFF is supported" is telling the truth about half its inputs.
     """
+    configs = []
     for channel in getattr(device, "ai_physical_chans", tuple()) or tuple():
         try:
-            return tuple(_enum_name(item) for item in channel.ai_term_cfgs)
+            configs.append((
+                str(channel.name),
+                tuple(_enum_name(item) for item in channel.ai_term_cfgs),
+            ))
         except Exception:
-            return tuple()
-    return tuple()
+            continue
+    return tuple(configs)
 
 
 def _trigger_usages(device, daq_error_type) -> Tuple[Tuple[str, Tuple[str, ...]], ...]:
