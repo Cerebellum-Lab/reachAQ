@@ -183,6 +183,18 @@ catch a `DaqError`.
 The barrier earned its keep as diagnostic scaffolding while the timing was
 being established. It should not survive as production code.
 
+**Implemented, and the heading above is wrong on the second half.** The
+barrier is redundant, and removing it removed the class of failure the
+output-task patch had treated one instance of. It does not spin at a cost
+worth recovering. Measured on christielab10 at 10 kHz, 160 chunks over eight
+seconds, three runs of each alternating: with the barrier 11.2/11.7/12.1% of
+a core, without it 13.2/13.5/14.0%. The DAQmx blocking read does not sleep
+through the wait, and costs about two points of a core more than the 0.5 ms
+spin it replaced. Both deliver the same 160 chunks, because a chunk takes its
+own 50 ms to arrive whatever asks for it. So D2 is a simplification that is
+slightly more expensive, and should be judged on that. The per-task state the
+barrier could report is kept and moved to the failure path.
+
 ### D3. `cfg_samp_clk_timing(rate=...)` beside an external source is not the rate
 
 Already fixed for the laser, but the same shape exists wherever a slave device
@@ -231,7 +243,9 @@ that figure was the DAQmx polled transfer, not the scaling.
   `read_many_sample_port_byte` into a preallocated buffer; unpack bits with
   numpy. Removes the per-chunk allocation and the dead capability check.
 - **D2.** Delete `_wait_all_available` once D1 and the shared-timing
-  preflight are trusted; rely on each task's blocking read.
+  preflight are trusted; rely on each task's blocking read. *Done. Costs
+  ~2 points of a core rather than saving any; taken for the simplification
+  and the removed failure mode, not for speed.*
 - **D3.** Audit every `cfg_samp_clk_timing` call for a `source=` with a local
   rate, and derive sample counts from the plan's clock rate.
 - **D5.** Retest `di_data_xfer_mech` under DMA now the IOMMU is fixed, and
