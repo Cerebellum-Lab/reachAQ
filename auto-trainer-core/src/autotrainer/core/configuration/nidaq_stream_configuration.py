@@ -51,6 +51,15 @@ class NidaqSignalStreamConfiguration:
     # selects every configured channel by default; an empty tuple intentionally
     # plots nothing. All configured channels are still read and written.
     display_channels: Optional[Tuple[str, ...]] = None
+    #: How analog inputs are referenced. Left unset, DAQmx chooses per channel
+    #: and the choice is not uniform: on a PXI-6221 ai0-ai7 default to
+    #: differential, pairing each with ai8-ai15, while ai8 and above can only
+    #: be single-ended. A configuration naming channels from both halves then
+    #: reads some of them against pins it also names as channels in their own
+    #: right, which was measured coupling one laser's command into three
+    #: unrelated inputs. "rse" matches a BNC breakout's shared ground and is
+    #: the default; "diff" and "nrse" are available for other wiring.
+    analog_terminal_config: str = "rse"
 
     def __post_init__(self):
         channels = tuple(self.channels)

@@ -156,6 +156,10 @@ from autotrainer.device import CanFailure, CanTransportConfiguration
 from tools.acquisition.model.hardware_scan import HardwareScanEntry, scan_can_adapters, scan_gpus
 from tools.acquisition.model.nidaq_discovery import device_name_from_channel, discover_nidaq_devices
 from tools.acquisition.model.nidaq_channel_plan import build_nidaq_acquisition_configuration
+from tools.acquisition.model.nidaq_wiring_verification import (
+    WiringVerification,
+    summarize as summarize_nidaq_wiring,
+)
 from tools.acquisition.model.nidaq_signal_monitor_model import NidaqSignalMonitorModel
 from tools.acquisition.model.nidaq_timing import (
     remap_nidaq_physical_channel,
@@ -649,6 +653,13 @@ class AppModel(ObservableObject):
         self._hardware = HardwareModel(self._system_message_handler)
         self._laser = LaserModel()
         self._nidaq_signal_monitor = NidaqSignalMonitorModel()
+        #: Written by tools/hardware/verify_nidaq_wiring.py, read here.
+        #: It sits beside the configuration it describes rather than in
+        #: it, so it can be regenerated without touching a hand-edited
+        #: file, and so a missing one plainly means "never checked".
+        self._wiring_record_path = (
+            self.get_config_location().parent
+            / "nidaq_wiring_verification.json")
         self._session_data_recorder = SessionDataRecorder(
             self._nidaq_signal_monitor,
             self._laser,
@@ -2967,6 +2978,23 @@ class AppModel(ObservableObject):
                 f"not probed; {laser_configuration.backend} configured but not connected",
                 "warning",
             )
+
+        # What the channel map claims, against what anyone has checked. A
+        # configuration is a set of assertions about cables and nothing here
+        # used to test them, so a wrong one recorded plausible data instead of
+        # failing. This does not probe hardware - it reports what the last
+        # verification run found, and says so when there has not been one.
+        try:
+            wiring = summarize_nidaq_wiring(
+                configuration, WiringVerification.load(self._wiring_record_path))
+            details.append(wiring.detail())
+            warning = wiring.warning()
+            if warning:
+                warnings_list.append(warning)
+            scan_results["nidaq_wiring"] = HardwareScanEntry(
+                wiring.detail(), "ok" if wiring.is_clean else "warning")
+        except Exception:
+            logger.exception("NI-DAQ wiring verification could not be read")
 
         previous_scan_results = self._hardware_scan_results
         self._hardware_scan_results = scan_results
