@@ -323,6 +323,9 @@ class NidaqSignalStreamController:
                     kwargs["min_val"] = channel.minimum
                 if channel.maximum is not None:
                     kwargs["max_val"] = channel.maximum
+                terminal_config = self._analog_terminal_config()
+                if terminal_config is not None:
+                    kwargs["terminal_config"] = terminal_config
                 analog_task.ai_channels.add_ai_voltage_chan(
                     channel.physical_channel, **kwargs
                 )
@@ -409,6 +412,30 @@ class NidaqSignalStreamController:
                 kwargs["source"],
                 time.perf_counter() - started,
             )
+
+    def _analog_terminal_config(self):
+        """How analog inputs should be referenced, or None to let DAQmx pick.
+
+        Letting it pick is not neutral. On a PXI-6221 it gives ai0-ai7
+        differential - pairing each with ai8-ai15 - and ai8 upwards
+        single-ended, so a channel list spanning both halves reads some
+        channels against pins it also reads directly. Measured on
+        christielab10: one laser's command copy appeared on three inputs it is
+        not wired to, and holding the scan rate down to 10 Hz did not shift
+        it, which is how it was told apart from a settling artefact.
+        """
+        name = getattr(self._configuration, "analog_terminal_config", "") or ""
+        if not name:
+            return None
+        configs = self._nidaqmx.constants.TerminalConfiguration
+        resolved = getattr(configs, name.upper(), None)
+        if resolved is None:
+            logger.warning(
+                "unknown analog terminal configuration %r; letting DAQmx "
+                "choose per channel, which is not uniform across a 6221",
+                name,
+            )
+        return resolved
 
     def _make_digital_task(self, digital_channels, task_name) -> object:
         task = self._nidaqmx.Task(task_name)
