@@ -70,6 +70,11 @@ class NidaqSignalStreamController:
         if timing_plan is not None and not timing_plan.is_valid:
             raise RuntimeError(f"Invalid NI-DAQ timing plan: {timing_plan.reason}")
         self._analog_tasks: Dict[str, object] = {}
+        #: Per device, where each configured digital channel lives in the
+        #: port words that come back: (port index, bit within that port's
+        #: channel). Buffered digital is read per port, not per line.
+        self._digital_layouts: Dict[str, Tuple[Tuple[int, int], ...]] = {}
+        self._digital_port_counts: Dict[str, int] = {}
         self._digital_tasks: Dict[str, object] = {}
         self._digital_clock_tasks: Dict[str, object] = {}
         # Compatibility aliases for existing diagnostics and focused tests.
@@ -189,7 +194,8 @@ class NidaqSignalStreamController:
                 raw = self._read_digital(device_name, digital_task, chunk_size, timeout)
                 for channel, samples in zip(
                     digital_channels,
-                    _normalize_samples(raw, len(digital_channels)),
+                    self._unpack_digital(
+                        device_name, raw, len(digital_channels)),
                 ):
                     values[channel.name] = tuple(
                         _scale_sample(1.0 if bool(sample) else 0.0, channel)
@@ -356,6 +362,7 @@ class NidaqSignalStreamController:
                 buffer_size,
             )
             digital_task = self._make_digital_task(
+                device_name,
                 digital_channels,
                 f"reachaq_signal_stream_{device_name}_di",
             )
@@ -437,11 +444,48 @@ class NidaqSignalStreamController:
             )
         return resolved
 
-    def _make_digital_task(self, digital_channels, task_name) -> object:
+    def _make_digital_task(self, device_name, digital_channels, task_name) -> object:
+        """One channel per port, holding only the lines this stream reads.
+
+        Buffered digital input has no line-based many-sample read - nidaqmx
+        offers the port variants and nothing else - so a task built one
+        channel per line can only be read by task.read(), which allocates a
+        fresh list of lists every chunk. A channel spanning several lines is
+        read by read_many_sample_port_uint32 into a preallocated array
+        instead, which is the path NI documents for correlated DIO.
+
+        Only the configured lines go in. Taking the whole port would be
+        simpler and would collide with the laser shutter outputs, which sit
+        on other lines of this same port.
+
+        A line's bit in the returned word is its physical line number, not
+        its position in the channel, and not an offset from the channel's
+        lowest line. Measured, after assuming otherwise and getting it wrong:
+        a channel declared line1:2 puts line1 at 0x02, and a channel declared
+        in the order line2,line3,line0,line1 still puts line0 at 0x01 and
+        line1 at 0x02.
+        """
         task = self._nidaqmx.Task(task_name)
-        line_grouping = self._nidaqmx.constants.LineGrouping.CHAN_PER_LINE
+        line_grouping = self._nidaqmx.constants.LineGrouping.CHAN_FOR_ALL_LINES
+        ports: List[str] = []
+        lines_by_port: Dict[str, List[str]] = {}
         for channel in digital_channels:
-            task.di_channels.add_di_chan(channel.physical_channel, line_grouping=line_grouping)
+            port = channel.physical_channel.rsplit("/", 1)[0]
+            if port not in lines_by_port:
+                lines_by_port[port] = []
+                ports.append(port)
+            lines_by_port[port].append(channel.physical_channel)
+        for port in ports:
+            task.di_channels.add_di_chan(
+                ",".join(lines_by_port[port]), line_grouping=line_grouping)
+        self._digital_layouts[device_name] = tuple(
+            (
+                ports.index(channel.physical_channel.rsplit("/", 1)[0]),
+                _line_number(channel.physical_channel),
+            )
+            for channel in digital_channels
+        )
+        self._digital_port_counts[device_name] = len(ports)
         # NI-DAQmx's default DMA path returns zero-filled buffered DI samples on
         # the Linux PXI-6221 runtime, while interrupt transfer returns the
         # correct correlated digital states.
@@ -475,35 +519,23 @@ class NidaqSignalStreamController:
             )
         else:
             reader = readers.DigitalMultiChannelReader(in_stream)
-            # There is no line-based many-sample digital read to preallocate
-            # for. nidaqmx offers read_many_sample on the analog readers, and
-            # for digital only the per-PORT variants - port_byte, port_uint16,
-            # port_uint32 - never one per line. read_many_sample_multi_line
-            # does not exist on any reader class at 1.6.0 either, so this is
-            # not a version floor to raise: the call has never resolved, and
-            # asking for it raised AttributeError on the first chunk, failed
-            # the stream, and blocked Record outright.
-            #
-            # Kept as a capability check rather than deleting the digital
-            # branch, so a future nidaqmx that does offer a line-based
-            # many-sample read is picked up without another change here.
-            #
-            # Leaving the reader unregistered selects the task.read() path just
-            # below, which is the behaviour this preallocation replaced. It
-            # allocates per chunk, which is the cost this avoided, and that is
-            # strictly better than no acquisition at all.
-            if not hasattr(reader, "read_many_sample_multi_line"):
+            # Port words, not lines: read_many_sample_port_uint32 is the
+            # widest of the three port variants nidaqmx offers and covers a
+            # 32-line port. There is no line-based many-sample read on any
+            # reader class, which is what sent an earlier version of this
+            # down the allocating task.read() path.
+            if not hasattr(reader, "read_many_sample_port_uint32"):
                 logger.warning(
-                    "nidaqmx %s offers no line-based many-sample digital read "
-                    "(DigitalMultiChannelReader.read_many_sample_multi_line); "
-                    "reading digital channels through task.read() instead, "
-                    "which allocates per chunk.",
+                    "nidaqmx %s offers no buffered port read; digital "
+                    "channels fall back to task.read(), which allocates per "
+                    "chunk",
                     getattr(self._nidaqmx, "__version__", "?"),
                 )
                 return
             self._digital_readers[device_name] = reader
-            self._digital_buffers[device_name] = numpy.empty(
-                (len(channels), chunk_size), dtype=numpy.bool_
+            self._digital_buffers[device_name] = numpy.zeros(
+                (self._digital_port_counts.get(device_name, 1), chunk_size),
+                dtype=numpy.uint32,
             )
 
     @staticmethod
@@ -597,20 +629,31 @@ class NidaqSignalStreamController:
         return buffer[:, :sample_count]
 
     def _read_digital(self, device_name, task, sample_count, timeout):
+        """Port words for this device, one row per port."""
         reader = self._digital_readers.get(device_name)
         if reader is None:
-            return task.read(
+            return numpy.atleast_2d(numpy.asarray(task.read(
                 number_of_samples_per_channel=sample_count,
                 timeout=timeout,
-            )
+            ), dtype=numpy.uint32))
         buffer = self._digital_buffers[device_name]
-        count = reader.read_many_sample_multi_line(
+        count = reader.read_many_sample_port_uint32(
             buffer,
             number_of_samples_per_channel=sample_count,
             timeout=timeout,
         )
         self._require_exact_reader_count(device_name, count, sample_count)
         return buffer[:, :sample_count]
+
+    def _unpack_digital(self, device_name, ports, channel_count):
+        """One row of 0/1 per configured line, taken out of the port words."""
+        layout = self._digital_layouts.get(device_name)
+        if not layout:
+            return _normalize_samples(ports, channel_count)
+        return [
+            (ports[port_index] >> bit) & 1
+            for port_index, bit in layout[:channel_count]
+        ]
 
     def _require_exact_reader_count(self, device_name, observed, expected):
         if int(observed) == int(expected):
@@ -763,6 +806,21 @@ class NidaqSignalStreamController:
         if len(parts) < 2 or not parts[0]:
             raise RuntimeError(f"cannot infer NI-DAQ AI sample clock source from {physical_channel!r}")
         return f"/{parts[0]}/ai/SampleClock"
+
+
+def _line_number(physical_channel: str) -> int:
+    """The line's own number, which is its bit in the port word.
+
+    The last segment has to be a line: harvesting digits from whatever is
+    there accepts "port0" and calls it line zero, which is a whole port
+    silently mistaken for one line.
+    """
+    tail = physical_channel.rsplit("/", 1)[-1].strip().lower()
+    if not tail.startswith("line") or not tail[4:].isdigit():
+        raise ValueError(
+            f"NI-DAQ digital channel {physical_channel!r} does not name a line"
+        )
+    return int(tail[4:])
 
 
 def _normalize_samples(raw_samples, channel_count: int) -> List[List[object]]:
