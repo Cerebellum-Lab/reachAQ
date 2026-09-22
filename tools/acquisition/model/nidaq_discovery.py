@@ -28,6 +28,23 @@ class NidaqDevicePorts:
     counter_inputs: Tuple[str, ...] = tuple()
     bus_type: str = ""
     pxi_chassis_number: Optional[int] = None
+    #: Slot within the chassis. Reads 4294967295 alongside the chassis number
+    #: when PXI Platform Services has not identified the chassis, which is
+    #: also when DAQmx refuses to route timing between slots.
+    pxi_slot_number: Optional[int] = None
+    product_category: str = ""
+    #: Whether the board has an analog trigger circuit at all. The driver
+    #: answers this outright, and a day was spent tracing a stimulus line to
+    #: an APFI connector on a board where it reads False.
+    analog_trigger_supported: Optional[bool] = None
+    #: Terminal configurations the analog inputs accept, as reported by a
+    #: physical channel. Left unset, DAQmx picks per channel and the choice is
+    #: not uniform across a board's channel range.
+    analog_input_terminal_configs: Tuple[str, ...] = tuple()
+    #: Trigger roles each subsystem supports, as (subsystem, roles) pairs -
+    #: a tuple rather than a mapping so the record survives the JSON round
+    #: trip through the isolated discovery process.
+    trigger_usages: Tuple[Tuple[str, Tuple[str, ...]], ...] = tuple()
     terminals: Tuple[str, ...] = tuple()
     analog_output_sample_clock_supported: Optional[bool] = None
     digital_trigger_supported: Optional[bool] = None
@@ -108,6 +125,19 @@ def discover_nidaq_devices() -> Tuple[Tuple[NidaqDevicePorts, ...], Optional[str
             counter_inputs=tuple(device.get("counter_inputs", tuple())),
             bus_type=str(device.get("bus_type", "")),
             pxi_chassis_number=device.get("pxi_chassis_number"),
+            pxi_slot_number=device.get("pxi_slot_number"),
+            product_category=str(device.get("product_category", "")),
+            analog_trigger_supported=_optional_bool(
+                device.get("analog_trigger_supported")
+            ),
+            analog_input_terminal_configs=tuple(
+                device.get("analog_input_terminal_configs", tuple())
+            ),
+            # JSON gives back lists; the record holds tuples of tuples.
+            trigger_usages=tuple(
+                (str(subsystem), tuple(roles))
+                for subsystem, roles in device.get("trigger_usages", tuple())
+            ),
             terminals=tuple(device.get("terminals", tuple())),
             analog_output_sample_clock_supported=_optional_bool(
                 device.get("analog_output_sample_clock_supported")
@@ -194,6 +224,17 @@ def _discover_nidaq_devices_direct() -> Tuple[Tuple[NidaqDevicePorts, ...], Opti
                     pxi_chassis_number=_optional_int(
                         getattr(device, "pxi_chassis_num", None)
                     ),
+                    pxi_slot_number=_optional_int(
+                        getattr(device, "pxi_slot_num", None)
+                    ),
+                    product_category=_enum_name(
+                        _optional_device_property(
+                            device, "product_category", DaqError)),
+                    analog_trigger_supported=_optional_bool(
+                        _optional_device_property(
+                            device, "anlg_trig_supported", DaqError)),
+                    analog_input_terminal_configs=_terminal_configs(device),
+                    trigger_usages=_trigger_usages(device, DaqError),
                     terminals=tuple(
                         str(terminal)
                         for terminal in (getattr(device, "terminals", tuple()) or tuple())
@@ -223,6 +264,50 @@ def _discover_nidaq_devices_direct() -> Tuple[Tuple[NidaqDevicePorts, ...], Opti
         )
     except Exception as exc:
         return tuple(), f"NI-DAQmx discovery failed: {exc}"
+
+
+def _enum_name(value) -> str:
+    """An enum's name, or its string form, so it survives JSON."""
+    if value is None:
+        return ""
+    return str(getattr(value, "name", value))
+
+
+def _terminal_configs(device) -> Tuple[str, ...]:
+    """Terminal configurations the analog inputs accept.
+
+    Asked of a physical channel rather than the device, which does not carry
+    the property. One channel is enough: the list describes the board's input
+    stage, not an individual pin.
+    """
+    for channel in getattr(device, "ai_physical_chans", tuple()) or tuple():
+        try:
+            return tuple(_enum_name(item) for item in channel.ai_term_cfgs)
+        except Exception:
+            return tuple()
+    return tuple()
+
+
+def _trigger_usages(device, daq_error_type) -> Tuple[Tuple[str, Tuple[str, ...]], ...]:
+    """Which trigger roles each subsystem supports.
+
+    An empty list is a real answer, not a missing one: this board's digital
+    input reports no trigger usage at all.
+    """
+    usages = []
+    for subsystem, attribute in (
+        ("ai", "ai_trig_usage"),
+        ("ao", "ao_trig_usage"),
+        ("di", "di_trig_usage"),
+        ("do", "do_trig_usage"),
+        ("ci", "ci_trig_usage"),
+        ("co", "co_trig_usage"),
+    ):
+        value = _optional_device_property(device, attribute, daq_error_type)
+        if value is None:
+            continue
+        usages.append((subsystem, tuple(_enum_name(item) for item in value)))
+    return tuple(usages)
 
 
 def device_name_from_channel(channel_name: Optional[str]) -> Optional[str]:
