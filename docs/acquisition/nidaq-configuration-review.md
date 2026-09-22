@@ -261,9 +261,16 @@ that figure was the DAQmx polled transfer, not the scaling.
 
 ### Facts
 
-The BNC-2090A provides two AO BNCs, two user-defined BNCs, **one APFI BNC**,
-**one PFI BNC**, and two 68-pin connectors; digital I/O and the remaining PFI
-lines are on spring terminal blocks, and PFI0 is the only PFI line with a BNC.
+The BNC-2090A provides, per NI 372101A-01, **22 BNC connectors** - sixteen
+analog input (AI 0 to AI 15), two analog output, **one APFI**, **one PFI**,
+and two user-defined - a **29-position spring terminal block**, and two
+68-pin connectors. Digital I/O and PFI 1 to PFI 15 are on the strip, and PFI0
+is the only PFI line with a BNC.
+
+*Corrected while implementing B1: the list above originally omitted the
+sixteen analog input BNCs entirely, which is the majority of the panel. It
+was written from the connectors this rig had been arguing about rather than
+from the manual, which is the same mistake the section goes on to describe.*
 
 Two consequences, both of which cost time on this rig:
 
@@ -298,12 +305,29 @@ three things the card model cannot:
 - **B1.** Add a breakout model: a named accessory with, per connector, its
   label, its connector type (BNC / spring terminal / screw), and the card
   terminal it lands on. Start with BNC-2090A and BNC-2110; the format should
-  be data, not code, so another block is a file.
+  be data, not code, so another block is a file. *Done:
+  `data/breakouts/*.yaml`, transcribed from NI 372101A-01 and 372121F-01,
+  with each file's connector counts checked against the count its own
+  specification declares - 22 BNC and 29 spring positions on the 2090A, 15
+  and 30 on the 2110 - because a dropped row is how transcribing a panel by
+  hand fails. Where a panel prints a group heading above bare numerals, the
+  heading and the numeral are kept as separate fields rather than joined into
+  a string nobody has seen printed.*
 - **B2.** Name the attached breakout per device in `NidaqPortConfiguration`.
-  Optional - a device with no breakout behaves as today.
+  Optional - a device with no breakout behaves as today. *Done, on
+  `NidaqDeviceIdentity`, which is already the per-device record. Verified to
+  survive the YAML round trip and verified that a configuration written
+  before the field existed still loads with it unset, which is what both of
+  this rig's identities currently do.*
 - **B3.** Cross the breakout model with the capability probe from C1 to mark
   each connector reachable, unreachable-on-this-card, or already assigned.
-  This is what catches the APFI case.
+  This is what catches the APFI case. *Done, and it does. Run against this
+  chassis the APFI 0 BNC comes back unreachable on **both** boards - the
+  PXI-6713 reports `anlg_trig_supported` False as well as the PXI-6221 - so
+  that connector is a dead end on this rig whichever card it is patched to.
+  The other question this rig lost time to now has an answer in software:
+  laser 2's trigger route on PFI1 resolves to "PFI 1 (spring terminal,
+  position 13)" rather than to nothing.*
 - **B4.** In the channel picker, show each terminal as
   `PXI1Slot5/ai3 — BNC-2090A "AI 3" (BNC)`, grey out connectors the card
   cannot use with the reason, and warn when a configured terminal is not
