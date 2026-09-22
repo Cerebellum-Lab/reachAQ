@@ -1,0 +1,269 @@
+# NI BNC-2110, as its own documentation describes it.
+#
+# Source: NI 372121F-01, BNC-2110 Installation Guide, whose specification
+# gives 15 BNC connectors, a 30-position spring terminal block in two blocks
+# of 15, and one 68-pin connector. The counts below match.
+#
+# Recorded caveats, so nobody re-derives them:
+#   * The signal assignments here are all from the current NI-hosted
+#     document. The exact strings printed on a current panel are not: NI's
+#     Figure 1 is a photograph with no extractable text, and the silkscreen
+#     was cross-checked against NI 321860E-01, an older edition of the same
+#     guide found only on a third-party host. Older panels carry the legacy
+#     names - PFI 9, F OUT, CTR1OUT, EXTSTRB, AI HOLD - in the same physical
+#     positions as the NI-DAQmx names used here.
+#   * Six BNCs carry two labels and two meanings, and the numbering reverses
+#     between them: AI 2 shares with AO 7 and AI 7 with AO 2. Which one it is
+#     depends on the card behind the block.
+#   * PFI 15 is not brought out on this block at all, on any connector.
+#   * Referencing is set by eight FS/GS switches, one per AI BNC. There is no
+#     SE/DIFF and no RSE/NRSE switch, and NI does not recommend single-ended
+#     use of this block.
+#
+# terminal is the card terminal the connector lands on, with no device
+# prefix, and empty when it lands on nothing. The card decides what any of
+# these labels means, and whether it means anything at all.
+
+name: BNC-2110
+title: NI BNC-2110
+source: NI 372121F-01, BNC-2110 Installation Guide
+bnc_count: 15
+spring_positions: 30
+pin68_connectors: 1
+connectors:
+  - label: "AI 0"
+    connector: bnc
+    terminal: ai0
+    note: "differential only; single-ended is not recommended on this block"
+  - label: "AI 1"
+    connector: bnc
+    terminal: ai1
+    note: "differential only; single-ended is not recommended on this block"
+  - label: "AI 2/AO 7"
+    connector: bnc
+    terminal: ai2
+    note: "one BNC, two meanings: ai2 on an input card and ao7 on an AO Series card, which reverses the numbering"
+  - label: "AI 3/AO 6"
+    connector: bnc
+    terminal: ai3
+    note: "one BNC, two meanings: ai3 on an input card and ao6 on an AO Series card, which reverses the numbering"
+  - label: "AI 4/AO 5"
+    connector: bnc
+    terminal: ai4
+    note: "one BNC, two meanings: ai4 on an input card and ao5 on an AO Series card, which reverses the numbering"
+  - label: "AI 5/AO 4"
+    connector: bnc
+    terminal: ai5
+    note: "one BNC, two meanings: ai5 on an input card and ao4 on an AO Series card, which reverses the numbering"
+  - label: "AI 6/AO 3"
+    connector: bnc
+    terminal: ai6
+    note: "one BNC, two meanings: ai6 on an input card and ao3 on an AO Series card, which reverses the numbering"
+  - label: "AI 7/AO 2"
+    connector: bnc
+    terminal: ai7
+    note: "one BNC, two meanings: ai7 on an input card and ao2 on an AO Series card, which reverses the numbering"
+  - label: "AO 1"
+    connector: bnc
+    terminal: ao1
+  - label: "AO 0"
+    connector: bnc
+    terminal: ao0
+  - label: "AO EXT REF"
+    connector: bnc
+    terminal: APFI0
+    note: "APFI0 on an M Series card; the analog output external reference on AO, E and S Series"
+  - label: "PFI 0/AI START"
+    connector: bnc
+    terminal: PFI0
+  - label: "CTR 0 OUT"
+    connector: bnc
+    terminal: PFI12
+    note: "counter 0 internal output"
+  - label: "USER 1"
+    connector: bnc
+    role: user
+    note: "wired internally to the USER 1 spring terminal and nowhere else"
+  - label: "USER 2"
+    connector: bnc
+    role: user
+    note: "wired internally to the USER 2 spring terminal and nowhere else"
+  - label: "PFI 9/P2.1"
+    block: "left"
+    position: 1
+    connector: spring
+    terminal: PFI9
+    role: signal
+    note: "NI's own Figure 4 prints this position as PFI 9/P2.0, duplicating the one below it; Table 3 of the same document gives PFI <8..9>/P2.<0..1>, so P2.1 is correct"
+  - label: "PFI 8/P2.0"
+    block: "left"
+    position: 2
+    connector: spring
+    terminal: PFI8
+    role: signal
+  - label: "PFI 7/P1.7"
+    block: "left"
+    position: 3
+    connector: spring
+    terminal: PFI7
+    role: signal
+  - label: "PFI 6/P1.6"
+    block: "left"
+    position: 4
+    connector: spring
+    terminal: PFI6
+    role: signal
+  - label: "PFI 5/P1.5"
+    block: "left"
+    position: 5
+    connector: spring
+    terminal: PFI5
+    role: signal
+  - label: "PFI 4/P1.4"
+    block: "left"
+    position: 6
+    connector: spring
+    terminal: PFI4
+    role: signal
+  - label: "PFI 3/P1.3"
+    block: "left"
+    position: 7
+    connector: spring
+    terminal: PFI3
+    role: signal
+  - label: "PFI 2/P1.2"
+    block: "left"
+    position: 8
+    connector: spring
+    terminal: PFI2
+    role: signal
+  - label: "PFI 1/P1.1"
+    block: "left"
+    position: 9
+    connector: spring
+    terminal: PFI1
+    role: signal
+  - label: "D GND"
+    block: "left"
+    position: 10
+    connector: spring
+    role: reference
+  - label: "USER 2"
+    block: "left"
+    position: 11
+    connector: spring
+    role: user
+    note: "internal to the USER 2 BNC"
+  - label: "PFI 14/P2.6"
+    block: "left"
+    position: 12
+    connector: spring
+    terminal: PFI14
+    role: signal
+    note: "frequency output"
+  - label: "+5V"
+    block: "left"
+    position: 13
+    connector: spring
+    role: reference
+  - label: "+5V"
+    block: "left"
+    position: 14
+    connector: spring
+    role: reference
+  - label: "D GND"
+    block: "left"
+    position: 15
+    connector: spring
+    role: reference
+  - label: "P0.7"
+    block: "right"
+    position: 16
+    connector: spring
+    terminal: port0/line7
+    role: signal
+  - label: "P0.6"
+    block: "right"
+    position: 17
+    connector: spring
+    terminal: port0/line6
+    role: signal
+  - label: "P0.5"
+    block: "right"
+    position: 18
+    connector: spring
+    terminal: port0/line5
+    role: signal
+  - label: "P0.4"
+    block: "right"
+    position: 19
+    connector: spring
+    terminal: port0/line4
+    role: signal
+  - label: "P0.3"
+    block: "right"
+    position: 20
+    connector: spring
+    terminal: port0/line3
+    role: signal
+  - label: "P0.2"
+    block: "right"
+    position: 21
+    connector: spring
+    terminal: port0/line2
+    role: signal
+  - label: "P0.1"
+    block: "right"
+    position: 22
+    connector: spring
+    terminal: port0/line1
+    role: signal
+  - label: "P0.0"
+    block: "right"
+    position: 23
+    connector: spring
+    terminal: port0/line0
+    role: signal
+  - label: "PFI 13/P2.5"
+    block: "right"
+    position: 24
+    connector: spring
+    terminal: PFI13
+    role: signal
+    note: "counter 1 output"
+  - label: "D GND"
+    block: "right"
+    position: 25
+    connector: spring
+    role: reference
+  - label: "USER 1"
+    block: "right"
+    position: 26
+    connector: spring
+    role: user
+    note: "internal to the USER 1 BNC"
+  - label: "PFI 11/P2.3"
+    block: "right"
+    position: 27
+    connector: spring
+    terminal: PFI11
+    role: signal
+    note: "analog input hold complete"
+  - label: "PFI 10/P2.2"
+    block: "right"
+    position: 28
+    connector: spring
+    terminal: PFI10
+    role: signal
+    note: "external strobe"
+  - label: "AI SENSE"
+    block: "right"
+    position: 29
+    connector: spring
+    role: reference
+    note: "the NRSE reference for ai0 to ai15"
+  - label: "AI GND"
+    block: "right"
+    position: 30
+    connector: spring
+    role: reference
