@@ -53,20 +53,24 @@ class DigitalOutputs(IntEnum):
 #: one, so board STIM2 is STIMULUS_3. This is the only place that off-by-one is
 #: written down; resolve board labels through here rather than restating it.
 #:
-#: STIM0 and STIM1 are deliberately absent. They are reserved for the firmware
-#: tone generator, which is documented to drive them as the Tone 1 and Tone 2
-#: TTL confirmations the NI-DAQ records, so they cannot also carry a stimulus
-#: pulse.
+#: STIM0 and STIM1 are deliberately absent. The pellet board's devicetree
+#: reserves them - "Only STIM2 and STIM3 may be pulsed. STIM0 and STIM1 are
+#: the tone generator's" - and the firmware refuses a pulse addressed to
+#: either with -EPERM, so they cannot carry a stimulus.
 #:
-#: Measured on christielab10 against pellet firmware 2.2.0, that confirmation
-#: does not appear. PLAY_TONE is accepted and acknowledged, and no line on
-#: PXI1Slot5 port0 or port1 changes during or after it, polled several
-#: thousand times a second across tones of 0.3s and 1.0s. The same pins do
-#: respond to set_digital_output and to pulse_stim, so they are wired and
-#: readable - it is the confirmation that is absent. Whether this firmware
-#: dropped it or the tone is not sounding at all was not established here.
-#: Treat tone1 and tone2 as unverified on this firmware rather than as a
-#: reliable record that a tone played.
+#: They do not carry a tone confirmation either. No released firmware has
+#: ever driven them: tone.c contains no GPIO reference at v1.2.5, v2.0.0,
+#: v2.1.0, v2.2.0 or HEAD, and outside that devicetree comment nothing in
+#: the firmware source mentions STIM0 or STIM1 at all. Confirmed on
+#: christielab10 against firmware 2.2.0, with the operator listening: the
+#: tone sounds, PLAY_TONE is acknowledged, and no line on port0 or port1
+#: moves - while a pulse_stim control in the same run raised PFI 0 as
+#: expected, so the watch was good.
+#:
+#: So tone1 and tone2 record nothing about a tone and never have. Two of the
+#: four stimulus outputs are reserved for a confirmation no firmware emits.
+#: Treat that as a firmware gap to close or a reservation to lift, not as a
+#: signal to read.
 BOARD_STIM_LINE_OUTPUTS = {
     2: DigitalOutputs.STIMULUS_3,
     3: DigitalOutputs.STIMULUS_4,
