@@ -97,6 +97,12 @@ def parse_args():
                              "light.")
     parser.add_argument("--command-volts", type=float, default=1.0,
                         help="level each laser command is held at (default 1.0)")
+    parser.add_argument("--observe", type=float, default=0.0, metavar="SECONDS",
+                        help="after the driven checks, watch the lines "
+                             "nothing here can drive - cam_frames, barcode "
+                             "- for this long, and confirm any that change. "
+                             "Start the camera or trigger a barcode during "
+                             "the window.")
     parser.add_argument("--report", type=Path, default=None,
                         help="also write the formatted report here")
     parser.add_argument("--dry-run", action="store_true",
@@ -124,6 +130,70 @@ def changed_lines(device, before, after):
             else:
                 names.append(f"{device}/port0/line{bit}")
     return names
+
+
+def observe_undriven(nidaqmx, points, seconds, undriven, report):
+    """Watch the lines nothing in this run drives, and see if they move.
+
+    cam_frames and barcode are sourced by a running camera and a session,
+    neither of which exists here, so the driven phase can only ever report
+    them untested. It cannot drive them; it can watch while somebody else
+    does, which turns "nothing is known" into an answer an operator can
+    produce in one action.
+
+    What this confirms is weaker than the driven checks, and is recorded as
+    such: a line that changes while being watched carries something, which is
+    not the same as carrying what the configuration says it does. The
+    operator asserts the cause by choosing when to start the camera.
+    """
+    watched = [point for point in points if point.fingerprint in undriven]
+    if not watched:
+        print("\n" + "nothing to observe: every point had a driver")
+        return
+    devices = sorted({point.physical_channel.strip("/").split("/", 1)[0]
+                      for point in watched})
+    tasks = {}
+    try:
+        for device in devices:
+            for port in DIGITAL_PORTS:
+                try:
+                    task = nidaqmx.Task(f"observe_{device}_{port}")
+                    task.di_channels.add_di_chan(f"{device}/{port}")
+                    task.read()
+                    tasks[(device, port)] = task
+                except Exception:
+                    continue
+        if not tasks:
+            print("\n" + "no digital port could be opened to observe")
+            return
+
+        print("\n" + f"--- watching {len(watched)} undriven line(s) "
+              f"for {seconds:g}s: {', '.join(p.name for p in watched)} ---")
+        print("    start the camera or trigger a barcode now")
+        baseline = {key: int(task.read()) for key, task in tasks.items()}
+        seen = set()
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            for (device, port), task in tasks.items():
+                try:
+                    word = int(task.read())
+                except Exception:
+                    continue
+                for name in changed_lines(
+                        device, {port: baseline[(device, port)]}, {port: word}):
+                    seen.add(name)
+        print(f"    changed: {', '.join(sorted(seen)) if seen else 'nothing'}")
+        for point in watched:
+            if any(matches(point.physical_channel, name) for name in seen):
+                report(point, f"changed while watched for {seconds:g}s; nothing "
+                              "in this run drove it, so what caused it is the "
+                              "operator's assertion")
+    finally:
+        for task in tasks.values():
+            try:
+                task.close()
+            except Exception:
+                pass
 
 
 def matches(point_channel, observed):
@@ -405,6 +475,23 @@ def main() -> int:
         return point.name in {"tone1", "tone2"} or point.name.endswith(
             "_trigger_in")
 
+    if args.observe > 0:
+        undriven = {
+            point.fingerprint for point in points
+            if point.kind != OPAQUE
+            and point.fingerprint not in observed_by_point
+            and not driver_exercised(point)
+        }
+
+        def record_observed(point, detail):
+            observed_by_point[point.fingerprint] = (CONFIRMED, detail)
+
+        try:
+            observe_undriven(nidaqmx, points, args.observe, undriven,
+                             record_observed)
+        except Exception as error:
+            print(f"observation failed: {error}")
+
     checks = []
     # Observable points first: a driver is confirmed by what it moved, so its
     # witnesses have to exist before it is judged.
@@ -416,6 +503,9 @@ def main() -> int:
         method = ("held DC on its laser command"
                   if "/ai" in point.physical_channel
                   else "static level while each board output was held high")
+        if point.fingerprint in observed_by_point and not driver_exercised(point):
+            method = "watched while the operator drove it"
+
         if point.fingerprint in observed_by_point:
             status, detail = observed_by_point[point.fingerprint]
         elif point.kind == DRIVER:
