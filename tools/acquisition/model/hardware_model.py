@@ -119,6 +119,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         self._pellet_version = ""
         self._board_wire_schema_version = None
         self._board_capabilities = 0
+        self._board_capabilities_received = threading.Event()
         self._firmware_version_received = threading.Event()
         self._can_is_emulation = False
         self._firmware_policy = FirmwareCompatibilityPolicy.load()
@@ -692,6 +693,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             raise RuntimeError(
                 "Pellet firmware version was not reported; motor initialization is blocked"
             )
+        self._request_board_capabilities(can_device)
         if not self.pellet_commands_allowed:
             raise RuntimeError(
                 "Pellet firmware compatibility check failed: "
@@ -969,11 +971,41 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         elif name == props.COLOR_LED:
             self._color_led = value
 
+    def _request_board_capabilities(self, can_device) -> None:
+        """Ask the board what it can do, before judging it on the answer.
+
+        The compatibility check runs at connect and reads a bitmask the board
+        has never been asked for, so a required capability could never be
+        satisfied: the mask was still zero when it was evaluated. A firmware
+        that answers (2.3.0 and later) fills it in here; one that does not
+        (2.2.0 and earlier) leaves it zero, which is exactly why those
+        versions list their capabilities as optional.
+
+        Not reaching the board is not fatal. Silence is what older firmware
+        does, and the policy for those versions expects it.
+        """
+        interface = getattr(getattr(can_device, "device_interface", None),
+                            "request_capabilities", None)
+        if interface is None:
+            return
+        self._board_capabilities_received.clear()
+        try:
+            if not interface():
+                return
+        except Exception as error:
+            logger.debug("capabilities request was not sent: %s", error)
+            return
+        if not self._board_capabilities_received.wait(1.0):
+            logger.info(
+                "pellet board did not answer the capabilities request; "
+                "treating it as a firmware that cannot")
+
     def _decoded_device_message(self, kind, data, perf_time, wall_time) -> None:
         if kind != SystemStatusMessageKind.BOARD_CAPABILITIES:
             return
         self._board_wire_schema_version = int(data.wire_schema_version)
         self._board_capabilities = int(data.capabilities)
+        self._board_capabilities_received.set()
         self._update_firmware_compatibility(self._pellet_version)
 
     def _update_firmware_compatibility(self, version: str) -> None:

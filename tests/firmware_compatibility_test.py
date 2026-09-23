@@ -1,3 +1,4 @@
+import threading
 from tools.acquisition.model.firmware_compatibility import FirmwareCompatibilityPolicy
 
 
@@ -81,3 +82,58 @@ def test_shipped_v2_1_0_runs_without_capability_reporting():
     assert result.commands_allowed
     assert result.missing_capabilities == ()
     assert "time_sync" in result.optional_capabilities
+
+
+def test_a_required_capability_is_asked_for_before_it_is_judged():
+    """The connect check read a bitmask the board had never been asked for.
+
+    So a required capability could never be satisfied: the mask was still
+    zero when it was evaluated, and 2.3.0 - the first firmware that can
+    answer - was refused with "Required capability mismatch". Found by
+    flashing it and watching the host refuse to connect.
+    """
+    from types import SimpleNamespace
+    from tools.acquisition.model.hardware_model import HardwareModel
+
+    model = HardwareModel.__new__(HardwareModel)
+    model._board_capabilities = 0
+    model._board_capabilities_received = threading.Event()
+    asked = []
+
+    def request_capabilities():
+        asked.append(True)
+        # What the board does a moment later, on its own thread.
+        model._board_capabilities = 0x4
+        model._board_capabilities_received.set()
+        return True
+
+    device = SimpleNamespace(device_interface=SimpleNamespace(
+        request_capabilities=request_capabilities))
+
+    HardwareModel._request_board_capabilities(model, device)
+
+    assert asked == [True]
+    assert model._board_capabilities == 0x4
+
+
+def test_a_board_that_cannot_answer_is_not_treated_as_a_failure():
+    """Silence is what every firmware through 2.2.0 does.
+
+    Those versions list their capabilities as optional precisely because they
+    report none, so a timeout here has to leave the mask alone and let the
+    policy decide rather than refusing the connection.
+    """
+    from types import SimpleNamespace
+    from tools.acquisition.model.hardware_model import HardwareModel
+
+    model = HardwareModel.__new__(HardwareModel)
+    model._board_capabilities = 0
+    model._board_capabilities_received = threading.Event()
+
+    for interface in (
+        SimpleNamespace(device_interface=None),
+        SimpleNamespace(device_interface=SimpleNamespace(
+            request_capabilities=lambda: False)),
+    ):
+        HardwareModel._request_board_capabilities(model, interface)
+        assert model._board_capabilities == 0
