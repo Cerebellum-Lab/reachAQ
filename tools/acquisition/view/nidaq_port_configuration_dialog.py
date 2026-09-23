@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -28,6 +29,11 @@ from autotrainer.core import (
     SystemConfiguration,
 )
 from autotrainer.core.logging import get_verbose_logger
+from tools.acquisition.model.nidaq_breakout import (
+    breakout_for_device,
+    describe_terminal,
+    is_panel_terminal,
+)
 from tools.acquisition.model.nidaq_discovery import (
     NidaqDevicePorts,
     device_name_from_channel,
@@ -85,6 +91,9 @@ class NidaqPortConfigurationDialog(QDialog):
         self._combo_role_names: Dict[QComboBox, str] = {}
         self._combo_selections: Dict[QComboBox, Optional[str]] = {}
         self._refreshing_channel_options = False
+        # Resolved once per device. A device with no block named gets None,
+        # and every label below quietly becomes the terminal name again.
+        self._breakouts: Dict[str, object] = {}
 
         root_layout = QVBoxLayout(self)
         root_layout.setContentsMargins(10, 10, 10, 10)
@@ -362,6 +371,14 @@ class NidaqPortConfigurationDialog(QDialog):
         duplicates = self._duplicate_selected_channels()
         if duplicates:
             warnings.append("Duplicate channel assignment(s): " + ", ".join(duplicates))
+        # Not an error - the 68-pin connector reaches everything - but worth
+        # one line, because the alternative is hunting the front panel for a
+        # label that was never printed on it.
+        off_block = self._selected_channels_off_the_block()
+        if off_block:
+            warnings.append(
+                "Not brought out on the named breakout: " + ", ".join(off_block)
+                + " (reachable only through the 68-pin connector)")
         unavailable_kinds = [
             kind.upper()
             for kind, options in (
@@ -381,6 +398,19 @@ class NidaqPortConfigurationDialog(QDialog):
             self._status_label.setStyleSheet("")
         self._set_ok_enabled(not unsupported and not duplicates)
         self._status_label.setText(status)
+
+    def _selected_channels_off_the_block(self) -> Tuple[str, ...]:
+        """Configured channels their device's block does not bring out."""
+        found = []
+        for _role_name, _kind, value in self._selected_channel_entries():
+            if not value:
+                continue
+            model = self._breakout_for(device_name_from_channel(value))
+            if model is None or not is_panel_terminal(self._terminal_of(value)):
+                continue
+            if not self._breakout_label(value):
+                found.append(value)
+        return tuple(sorted(set(found)))
 
     def _build_nidaq_port_configuration(self, device_name: str) -> NidaqPortConfiguration:
         values = {
@@ -616,6 +646,51 @@ class NidaqPortConfigurationDialog(QDialog):
             return (current_value,) + options
         return options
 
+    def _breakout_for(self, device_name: Optional[str]):
+        """The block cabled to this device, per the saved configuration."""
+        if not device_name:
+            return None
+        if device_name not in self._breakouts:
+            self._breakouts[device_name] = breakout_for_device(
+                self._configuration.nidaq_ports, device_name)
+        return self._breakouts[device_name]
+
+    @staticmethod
+    def _terminal_of(channel: Optional[str]) -> str:
+        """A channel name with its device prefix removed."""
+        text = str(channel or "").strip("/")
+        return text.split("/", 1)[-1] if "/" in text else text
+
+    def _breakout_label(self, channel: Optional[str]) -> str:
+        """`PXI1Slot5/ai3` as the thing somebody can find on the bench."""
+        if not channel:
+            return ""
+        model = self._breakout_for(device_name_from_channel(channel))
+        if model is None:
+            return ""
+        return describe_terminal(model, self._terminal_of(channel))
+
+    def _option_text(self, channel: str) -> Tuple[str, str]:
+        """How an option reads, and what to say about it on hover.
+
+        A terminal the block does not bring out is still selectable - a 68-pin
+        cable to something else reaches it - but saying nothing would leave
+        somebody looking for a label that is not printed anywhere.
+        """
+        model = self._breakout_for(device_name_from_channel(channel))
+        if model is None:
+            return channel, ""
+        label = self._breakout_label(channel)
+        if label:
+            return f"{channel} — {label}", ""
+        if not is_panel_terminal(self._terminal_of(channel)):
+            # A backplane or internal route. No block brings it out and none
+            # could, so there is nothing to say about connectors.
+            return channel, ""
+        return (f"{channel} — not on the {model.name}",
+                f"{model.name} does not bring {channel} out on any connector. "
+                "It is still reachable through the 68-pin connector.")
+
     def _set_combo_options(
         self,
         combo: QComboBox,
@@ -628,7 +703,11 @@ class NidaqPortConfigurationDialog(QDialog):
             combo.clear()
             combo.addItem("", None)
             for option in options:
-                combo.addItem(option, option)
+                text, hint = self._option_text(option)
+                combo.addItem(text, option)
+                if hint:
+                    combo.setItemData(combo.count() - 1, hint,
+                                      Qt.ItemDataRole.ToolTipRole)
             index = combo.findData(current_value)
             combo.setCurrentIndex(index if index >= 0 else 0)
         finally:

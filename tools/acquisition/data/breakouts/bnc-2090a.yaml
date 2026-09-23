@@ -20,6 +20,15 @@
 #     SE/DIFF switches, one per AI n / AI n+8 pair, and one global RSE/NRSE
 #     switch - which is worth knowing, because the card reports per channel
 #     what the block sets per pair.
+#   * PFI lines carry a second name on an M Series card: PFI 0 to PFI 7 are
+#     also port1/line0 to line7, and PFI 8 to PFI 15 are also port2/line0 to
+#     line7. That is the card's naming, not the block's, and it is recorded
+#     here because otherwise a configuration written as port1/line0 reads as
+#     a pin this block does not bring out when it is the PFI 0 connector.
+#     Source: NI 372121F-01 prints both names on the BNC-2110 panel itself -
+#     "PFI 1/P1.1", "PFI 9/P2.1" - which is NI asserting the equivalence. It
+#     holds for the M Series cards this is used with; an AO Series card
+#     numbers its digital lines differently and has no PFI alias.
 #
 # terminal is the card terminal the connector lands on, with no device
 # prefix, and empty when it lands on nothing. The card decides what any of
@@ -109,6 +118,7 @@ connectors:
   - label: "PFI 0"
     connector: bnc
     terminal: PFI0
+    also: port1/line0
     note: "the only PFI line with a BNC on this block"
   - label: "USER 1"
     connector: bnc
@@ -188,90 +198,105 @@ connectors:
     position: 13
     connector: spring
     terminal: PFI1
+    also: port1/line1
     role: signal
   - label: "2"
     block: "PFI"
     position: 14
     connector: spring
     terminal: PFI2
+    also: port1/line2
     role: signal
   - label: "3"
     block: "PFI"
     position: 15
     connector: spring
     terminal: PFI3
+    also: port1/line3
     role: signal
   - label: "4"
     block: "PFI"
     position: 16
     connector: spring
     terminal: PFI4
+    also: port1/line4
     role: signal
   - label: "5"
     block: "PFI"
     position: 17
     connector: spring
     terminal: PFI5
+    also: port1/line5
     role: signal
   - label: "6"
     block: "PFI"
     position: 18
     connector: spring
     terminal: PFI6
+    also: port1/line6
     role: signal
   - label: "7"
     block: "PFI"
     position: 19
     connector: spring
     terminal: PFI7
+    also: port1/line7
     role: signal
   - label: "8"
     block: "PFI"
     position: 20
     connector: spring
     terminal: PFI8
+    also: port2/line0
     role: signal
   - label: "9"
     block: "PFI"
     position: 21
     connector: spring
     terminal: PFI9
+    also: port2/line1
     role: signal
   - label: "10"
     block: "PFI"
     position: 22
     connector: spring
     terminal: PFI10
+    also: port2/line2
     role: signal
   - label: "11"
     block: "PFI"
     position: 23
     connector: spring
     terminal: PFI11
+    also: port2/line3
     role: signal
   - label: "12"
     block: "PFI"
     position: 24
     connector: spring
     terminal: PFI12
+    also: port2/line4
     role: signal
   - label: "13"
     block: "PFI"
     position: 25
     connector: spring
     terminal: PFI13
+    also: port2/line5
     role: signal
   - label: "14"
     block: "PFI"
     position: 26
     connector: spring
     terminal: PFI14
+    also: port2/line6
     role: signal
   - label: "15"
     block: "PFI"
     position: 27
     connector: spring
     terminal: PFI15
+    also: port2/line7
     role: signal
   - label: "DGND"
     position: 28

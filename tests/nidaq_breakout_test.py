@@ -23,6 +23,7 @@ from tools.acquisition.model.nidaq_breakout import (
     connector_statuses,
     describe_terminal,
     load_breakout,
+    is_panel_terminal,
     unreachable_terminals,
 )
 
@@ -228,3 +229,53 @@ def test_a_configured_terminal_the_block_does_not_reach_is_reported():
 
     assert unreachable_terminals(model, ("PFI0", "PFI15", "ai0")) == ("PFI15",)
     assert unreachable_terminals(None, ("PFI15",)) == tuple()
+
+
+def test_a_pin_is_a_panel_connection_and_a_backplane_line_is_not():
+    """PXI_Trig0 is inside the chassis; no front panel has ever printed it."""
+    assert is_panel_terminal("ai3")
+    assert is_panel_terminal("PFI0")
+    assert is_panel_terminal("port0/line2")
+    assert is_panel_terminal("APFI0")
+
+    assert not is_panel_terminal("PXI_Trig0")
+    assert not is_panel_terminal("/PXI1Slot4/PXI_Trig2")
+    assert not is_panel_terminal("PXI_Clk10")
+    assert not is_panel_terminal("RTSI0")
+    assert not is_panel_terminal("ai/SampleClock")
+    assert not is_panel_terminal("ao/StartTrigger")
+    assert not is_panel_terminal("Ctr0InternalOutput")
+    assert not is_panel_terminal("")
+
+
+def test_a_backplane_line_is_not_reported_as_missing_from_the_block():
+    """Saying no block brings PXI_Trig0 out would send somebody hunting."""
+    model = load_breakout("BNC-2090A")
+
+    assert unreachable_terminals(
+        model, ("PXI_Trig0", "/PXI1Slot4/PXI_Trig2", "ai/SampleClock")) == ()
+    # A real pin the 2090A does not carry is still reported.
+    assert unreachable_terminals(load_breakout("BNC-2110"), ("PFI15",)) == (
+        "PFI15",)
+
+
+def test_a_pfi_line_answers_to_the_cards_other_name_for_the_same_pin():
+    """PFI 0 and port1/line0 are one pin, and NI prints both on the 2110."""
+    model = load_breakout("BNC-2090A")
+
+    by_pfi, = model.connectors_for("PFI0")
+    by_port, = model.connectors_for("port1/line0")
+
+    assert by_pfi is by_port
+    assert by_pfi.printed == "PFI 0" and by_pfi.connector == "bnc"
+    # PFI 8 upwards live on port2, counting from zero again.
+    assert model.connectors_for("port2/line0")[0].printed == "PFI 8"
+
+
+def test_a_line_configured_by_its_port_name_is_not_called_missing():
+    """It is the PFI 0 BNC; saying the block lacks it would be false."""
+    model = load_breakout("BNC-2090A")
+
+    assert unreachable_terminals(model, ("port1/line0", "port2/line7")) == ()
+    assert describe_terminal(model, "port1/line1") == (
+        'BNC-2090A "PFI 1" (spring terminal, position 13)')
