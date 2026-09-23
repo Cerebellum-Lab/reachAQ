@@ -1015,3 +1015,67 @@ def test_laser_tab_owns_and_persists_its_input_stream_options(qapp):
         app_model.nidaq_signal_monitor.close()
         laser.close()
         tab.deleteLater()
+
+
+def test_turning_a_trace_on_shows_samples_the_ring_already_holds(qapp):
+    """A control message and the ring have no ordering between them.
+
+    The plot worker reads two independent channels: a control queue and the
+    shared ring. It could read samples the parent wrote *after* enabling a
+    trace, decide the trace was not streaming yet because the enable had not
+    arrived, discard them, and advance the shared read cursor past them. The
+    cursor is the only record of what has been seen, so those samples were
+    gone for good.
+
+    A running rig hid it: the next chunk arrives a few milliseconds later and
+    the plot fills in. With no further samples it never recovered, which is
+    what made the test above fail about a quarter of the time.
+
+    This forces the losing order rather than waiting for it: the worker is
+    given time to consume the samples while the trace is still off, and only
+    then is the trace turned on.
+    """
+    channel = _laser_channel()
+    configuration = LaserSystemConfiguration.from_channels(
+        (channel,), backend="null", sample_rate_hz=1000.0,
+    )
+    laser = LaserModel(NullLaserController(configuration))
+    app_model = _LaserAppStub(laser)
+    stream_channel = NidaqSignalChannelConfiguration(
+        name="laser1_diode",
+        physical_channel="Dev1/ai0",
+        kind="analog",
+        unit="V",
+    )
+    app_model.nidaq_signal_monitor._configuration = NidaqSignalStreamConfiguration(
+        channels=(stream_channel,),
+        is_enabled=True,
+        sample_rate_hz=1000.0,
+    )
+    content = LaserControlContent(app_model)
+    try:
+        tab = content._channel_tabs[0]
+        content._flush_laser_plots()
+        app_model.nidaq_signal_monitor.sample_ring.write_block(
+            NidaqSignalSampleBlock(
+                wall_time=1.0,
+                perf_time=1.0,
+                sample_rate_hz=1000.0,
+                sample_index=0,
+                channels=(stream_channel,),
+                values={"laser1_diode": (0.25, 0.5, 0.75)},
+            )
+        )
+        # The worker polls the ring every millisecond. This is long enough
+        # that it has certainly read these samples with the trace still off.
+        time.sleep(0.5)
+
+        tab._set_trace_streaming(True)
+
+        _wait_for_laser_plot(content, minimum_points=3)
+        diode_x, diode_y = tab._trace_data["diode"]
+        assert diode_y == pytest.approx([0.25, 0.5, 0.75])
+    finally:
+        content.on_close()
+        app_model.nidaq_signal_monitor.close()
+        laser.close()

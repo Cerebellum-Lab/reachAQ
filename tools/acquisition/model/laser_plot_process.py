@@ -273,7 +273,27 @@ def _laser_plot_worker(
                 channel_id, is_streaming = payload
                 state = states.get(int(channel_id))
                 if state is not None:
+                    was_streaming = state.streaming
                     state.streaming = bool(is_streaming)
+                    if state.streaming and not was_streaming:
+                        # Rewind, because a control message and the ring are
+                        # two channels with no ordering between them. The
+                        # parent enables streaming and then writes samples;
+                        # this worker can read those samples before it reads
+                        # the enable that precedes them, drop them for a
+                        # state that is not streaming yet, and advance the
+                        # shared cursor past them - and they are gone, because
+                        # the cursor is the only record of what has been seen.
+                        # A running rig hides this: another chunk arrives a
+                        # few milliseconds later and the plot fills in. With
+                        # no further samples it never recovers.
+                        #
+                        # Reading from the oldest sample still held is also
+                        # the better behaviour on its own terms: turning a
+                        # trace on shows the window the ring already has
+                        # rather than nothing until the next chunk.
+                        last_raw_sample_index = None
+                        dirty = True
             elif kind == _CONTROL_TRACE:
                 trace = payload
                 state = states.get(int(trace.channel_id))
