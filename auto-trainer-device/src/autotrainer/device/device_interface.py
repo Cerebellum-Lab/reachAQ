@@ -73,6 +73,17 @@ BOARD_STIM_LINE_OUTPUTS = {
     3: DigitalOutputs.STIMULUS_4,
 }
 
+#: Tone frequency to the configuration field naming the line that confirms
+#: it. The board's devicetree carries tone-output-frequencies-hz against
+#: STIM0 and STIM1, and the tone generator driver asserts a pin only where
+#: the requested frequency equals its mapped one - an exact match, so a tone
+#: at any other frequency sounds with nothing to record it.
+#:
+#: Here rather than wherever it is needed, because it is a fact about the
+#: board and two copies of it would drift the moment the devicetree changes.
+#: If that mapping is edited, this is the line to edit with it.
+TONE_CONFIRMATION_FREQUENCIES_HZ = ((5_000, "tone1"), (6_000, "tone2"))
+
 
 class AnalogOutputs(IntEnum):
     STATUS_OUT = 1

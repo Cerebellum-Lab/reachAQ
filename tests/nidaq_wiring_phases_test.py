@@ -1,9 +1,13 @@
-"""Watching the lines the wiring test cannot drive.
+"""The two wiring phases that do not hold a board output high.
 
-cam_frames and barcode are sourced by a running camera and a session, so the
-driven phase can only ever report them untested and the report could never
-read better than 12 of 14. It cannot drive them; it can watch while an
-operator does.
+Observing: cam_frames and barcode are sourced by a running camera and a
+session, so the driven phase can only ever report them untested. It cannot
+drive them; it can watch while an operator does.
+
+Tones: holding STIM0 high with a digital write proves the cable and nothing
+more. Asking the board for a tone and seeing which line follows proves the
+mechanism the rig depends on, and it is gated on the frequency matching the
+one the devicetree assigns to that pin.
 """
 
 import importlib.util
@@ -140,3 +144,87 @@ def test_no_port_at_all_reports_rather_than_raising(capsys):
 
     assert _observe({}, points, {points[0].fingerprint}) == {}
     assert "no digital port" in capsys.readouterr().out
+
+
+# ------------------------------------------------- the tone confirmations
+
+
+class _Interface:
+    """A board that accepts tones and records which were asked for."""
+
+    def __init__(self, accepts=True):
+        self.tones = []
+        self._accepts = accepts
+
+    def emit_tone(self, frequency_hz, duration_ms):
+        self.tones.append((frequency_hz, duration_ms))
+        return self._accepts
+
+
+def _configuration(tone1="PXI1Slot5/port0/line0", tone2="PXI1Slot5/port0/line1"):
+    return SimpleNamespace(nidaq_ports=SimpleNamespace(tone1=tone1, tone2=tone2))
+
+
+def _check_tones(ports, points, configuration=None, accepts=True):
+    nidaqmx = _Nidaqmx(ports)
+    interface = _Interface(accepts=accepts)
+    confirmed = {}
+    verify.check_tones(
+        nidaqmx, interface, configuration or _configuration(), points,
+        lambda point, detail: confirmed.__setitem__(point.name, detail))
+    return confirmed, interface
+
+
+def test_each_mapped_frequency_confirms_its_own_line():
+    """5 kHz raises tone1 and 6 kHz raises tone2; the board decides which."""
+    points = [_point("tone1", "PXI1Slot5/port0/line0"),
+              _point("tone2", "PXI1Slot5/port0/line1")]
+    # Probe, baseline, then line0 for the first tone and line1 for the second.
+    ports = {"PXI1Slot5/port0": [0, 0, 0b0001, 0b0000, 0b0010],
+             "PXI1Slot5/port1": [0], "PXI1Slot5/port2": [0]}
+
+    confirmed, interface = _check_tones(ports, points)
+
+    assert [frequency for frequency, _ms in interface.tones] == [5000, 6000]
+    assert "5000 Hz tone" in confirmed["tone1"]
+
+
+def test_a_tone_the_board_refuses_confirms_nothing():
+    points = [_point("tone1", "PXI1Slot5/port0/line0")]
+    ports = {"PXI1Slot5/port0": [0, 0, 0b0001], "PXI1Slot5/port1": [0],
+             "PXI1Slot5/port2": [0]}
+
+    confirmed, _interface = _check_tones(ports, points, accepts=False)
+
+    assert confirmed == {}
+
+
+def test_a_tone_that_raises_nothing_is_not_confirmed():
+    """Silence here is real evidence: the tone was played and asked for."""
+    points = [_point("tone1", "PXI1Slot5/port0/line0")]
+    ports = {"PXI1Slot5/port0": [0], "PXI1Slot5/port1": [0],
+             "PXI1Slot5/port2": [0]}
+
+    confirmed, interface = _check_tones(ports, points)
+
+    assert confirmed == {} and interface.tones
+
+
+def test_a_line_the_configuration_does_not_name_is_not_played_for():
+    points = [_point("tone1", "PXI1Slot5/port0/line0")]
+    ports = {"PXI1Slot5/port0": [0, 0, 0b0001], "PXI1Slot5/port1": [0],
+             "PXI1Slot5/port2": [0]}
+
+    confirmed, interface = _check_tones(
+        ports, points, configuration=_configuration(tone2=None))
+
+    assert [frequency for frequency, _ms in interface.tones] == [5000]
+    assert set(confirmed) == {"tone1"}
+
+
+def test_no_tone_lines_configured_is_not_an_error(capsys):
+    confirmed, interface = _check_tones(
+        {}, [], configuration=_configuration(tone1=None, tone2=None))
+
+    assert confirmed == {} and interface.tones == []
+    assert "no tone confirmation lines" in capsys.readouterr().out

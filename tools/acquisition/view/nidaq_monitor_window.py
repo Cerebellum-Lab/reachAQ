@@ -48,6 +48,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from autotrainer.device.device_interface import (
+    TONE_CONFIRMATION_FREQUENCIES_HZ,
+)
 from tools.acquisition.model.nidaq_monitor_session import NidaqMonitorSession
 from tools.acquisition.model.nidaq_wiring_report import format_report
 from tools.acquisition.model.nidaq_wiring_verification import (
@@ -68,10 +71,10 @@ PLOT_INTERVAL_MS = 50
 STATIC_INTERVAL_MS = 200
 #: Seconds of history on screen.
 WINDOW_SECONDS = 4.0
-#: The tone frequencies the pellet board confirms on a TTL line, in the
-#: order the devicetree assigns them: the first raises tone1, the second
-#: tone2. Any other frequency sounds without a confirmation.
-TONE_CONFIRMATION_HZ = (5_000, 6_000)
+#: The tone frequencies the board confirms on a TTL line, from the one
+#: place that mapping is written down.
+TONE_CONFIRMATION_HZ = tuple(
+    frequency for frequency, _line in TONE_CONFIRMATION_FREQUENCIES_HZ)
 
 _STATUS_COLORS = {
     CONFIRMED: "#1b7f3b",
