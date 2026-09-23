@@ -1,0 +1,252 @@
+#!/usr/bin/env bash
+
+# Bring the installed reachAQ checkout up to date with its remote.
+#
+# Fast-forward only, always. This updates a rig that runs experiments, so a
+# sync that could rewrite, merge or discard is a sync that could lose a
+# session's worth of work at the worst moment. If a branch cannot move by
+# fast-forward it is reported and left exactly where it is, for a human to
+# resolve with the full history in front of them.
+#
+# Usage:
+#   reachaq-sync              update every local branch that tracks a remote
+#   reachaq-sync devel        update just devel, creating it if it is missing
+#   reachaq-sync --repository PATH ...
+#
+# Named branches are created from the remote when absent, because asking for a
+# branch by name is asking to have it. Unnamed runs never create anything.
+
+set -u
+
+program=${0##*/}
+repository=
+branches=()
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --repository)
+            if [ $# -lt 2 ]; then
+                printf '%s: --repository needs a path\n' "$program" >&2
+                exit 2
+            fi
+            repository=$2
+            shift 2
+            ;;
+        --repository=*)
+            repository=${1#--repository=}
+            shift
+            ;;
+        -h|--help)
+            printf 'Usage: %s [--repository PATH] [branch ...]\n' "$program"
+            printf '\nFast-forwards the installed reachAQ checkout. Never rewrites,\n'
+            printf 'merges or discards; refuses while tracked files are modified.\n'
+            exit 0
+            ;;
+        --)
+            shift
+            while [ $# -gt 0 ]; do branches+=("$1"); shift; done
+            ;;
+        -*)
+            printf '%s: unknown option %s\n' "$program" "$1" >&2
+            exit 2
+            ;;
+        *)
+            branches+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# Fall back to the repository the launcher runs, so `reachaq-sync` updates the
+# same checkout `reachaq` starts and the two cannot drift apart.
+if [ -z "$repository" ]; then
+    launcher_config=${REACHAQ_LAUNCHER_CONFIG:-$HOME/.config/reachaq/launcher.conf}
+    if [ -r "$launcher_config" ]; then
+        while IFS='=' read -r key value || [ -n "${key:-}" ]; do
+            case "$key" in
+                REPOSITORY) repository=${value%$'\r'} ;;
+            esac
+        done < "$launcher_config"
+    fi
+fi
+if [ -z "$repository" ]; then
+    printf '%s: no repository to update.\n' "$program" >&2
+    printf 'Pass --repository PATH, or install the launcher configuration.\n' >&2
+    exit 2
+fi
+if [ ! -d "$repository" ]; then
+    printf '%s: repository is unavailable: %s\n' "$program" "$repository" >&2
+    exit 2
+fi
+
+cd "$repository" || exit 2
+if ! git rev-parse --git-dir >/dev/null 2>&1; then
+    printf '%s: not a Git repository: %s\n' "$program" "$repository" >&2
+    exit 2
+fi
+
+# Untracked files are normal here: planning.md, todo.md and temp/ are
+# deliberately untracked workspace material, so a plain dirty check would
+# refuse every run forever. Only tracked modifications block a sync, and they
+# block it because a fast-forward would carry them onto a different base.
+if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+    printf '%s: tracked files are modified in %s\n' "$program" "$repository" >&2
+    printf 'Commit or stash them first; nothing was fetched.\n' >&2
+    git status --short --untracked-files=no >&2
+    exit 1
+fi
+for state in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD BISECT_LOG rebase-merge rebase-apply; do
+    if [ -e "$(git rev-parse --git-path "$state")" ]; then
+        printf '%s: an operation is already in progress (%s)\n' "$program" "$state" >&2
+        printf 'Finish or abort it first; nothing was fetched.\n' >&2
+        exit 1
+    fi
+done
+
+printf 'Repository: %s\n' "$(git rev-parse --show-toplevel)"
+printf 'Fetching...\n'
+if ! git fetch --all --prune --tags --quiet; then
+    printf '%s: fetch failed; nothing was changed.\n' "$program" >&2
+    exit 1
+fi
+
+current_branch=$(git symbolic-ref --quiet --short HEAD || true)
+head_before=$(git rev-parse HEAD)
+
+# With no branch named, update everything local that has an upstream. Remote
+# branches with no local counterpart are reported rather than created: a sync
+# should not quietly fill the checkout with branches nobody asked for.
+if [ ${#branches[@]} -eq 0 ]; then
+    while IFS=$'\t' read -r name upstream; do
+        [ -n "$upstream" ] && branches+=("$name")
+    done < <(git for-each-ref --format='%(refname:short)%09%(upstream:short)' refs/heads)
+    created_when_missing=0
+else
+    created_when_missing=1
+fi
+
+if [ ${#branches[@]} -eq 0 ]; then
+    printf 'No local branch tracks a remote; nothing to update.\n'
+    exit 0
+fi
+
+printf '\n'
+attention=0
+for branch in "${branches[@]}"; do
+    if ! git show-ref --quiet --verify "refs/heads/$branch"; then
+        if [ "$created_when_missing" -eq 0 ]; then
+            continue
+        fi
+        # Named but absent. Create it from a remote that has it, tracking that
+        # remote, so later runs update it like any other branch.
+        source_ref=
+        for remote in $(git remote); do
+            if git show-ref --quiet --verify "refs/remotes/$remote/$branch"; then
+                source_ref="$remote/$branch"
+                break
+            fi
+        done
+        if [ -z "$source_ref" ]; then
+            printf '  %-32s no remote has this branch\n' "$branch"
+            attention=1
+            continue
+        fi
+        if git branch --quiet --track "$branch" "$source_ref" >/dev/null 2>&1; then
+            printf '  %-32s created from %s at %s\n' "$branch" "$source_ref" \
+                "$(git rev-parse --short=8 "$branch")"
+        else
+            printf '  %-32s could not be created from %s\n' "$branch" "$source_ref"
+            attention=1
+        fi
+        continue
+    fi
+
+    upstream=$(git rev-parse --abbrev-ref --symbolic-full-name "$branch@{upstream}" 2>/dev/null || true)
+    if [ -z "$upstream" ]; then
+        printf '  %-32s no upstream; left alone\n' "$branch"
+        continue
+    fi
+    if ! git rev-parse --quiet --verify "$upstream" >/dev/null; then
+        printf '  %-32s upstream %s is gone; left alone\n' "$branch" "$upstream"
+        attention=1
+        continue
+    fi
+
+    local_commit=$(git rev-parse "$branch")
+    remote_commit=$(git rev-parse "$upstream")
+    if [ "$local_commit" = "$remote_commit" ]; then
+        printf '  %-32s already current at %s\n' "$branch" "${local_commit:0:8}"
+        continue
+    fi
+    # Behind is the only case that can fast-forward. Ahead means unpushed local
+    # commits and diverged means both; neither is ours to resolve.
+    if ! git merge-base --is-ancestor "$local_commit" "$remote_commit"; then
+        if git merge-base --is-ancestor "$remote_commit" "$local_commit"; then
+            printf '  %-32s ahead of %s by %s commit(s); left alone\n' "$branch" "$upstream" \
+                "$(git rev-list --count "$upstream..$branch")"
+        else
+            printf '  %-32s DIVERGED from %s; left alone\n' "$branch" "$upstream"
+            attention=1
+        fi
+        continue
+    fi
+
+    behind=$(git rev-list --count "$branch..$upstream")
+    if [ "$branch" = "$current_branch" ]; then
+        # The checked-out branch has a working tree to move with it, so it goes
+        # through merge --ff-only rather than a ref update.
+        if git merge --ff-only --quiet "$upstream" >/dev/null 2>&1; then
+            printf '  %-32s %s -> %s (%s commit(s))\n' "$branch" "${local_commit:0:8}" \
+                "$(git rev-parse --short=8 HEAD)" "$behind"
+        else
+            printf '  %-32s fast-forward refused; left alone\n' "$branch"
+            attention=1
+        fi
+        continue
+    fi
+
+    # Not checked out here. `git fetch <remote> <src>:<dst>` updates the ref
+    # only when it is a fast-forward and refuses otherwise, which is the
+    # guarantee wanted; without --force it can never rewrite the branch.
+    remote_name=${upstream%%/*}
+    remote_branch=${upstream#*/}
+    if git fetch --quiet "$remote_name" "$remote_branch:$branch" >/dev/null 2>&1; then
+        printf '  %-32s %s -> %s (%s commit(s))\n' "$branch" "${local_commit:0:8}" \
+            "$(git rev-parse --short=8 "$branch")" "$behind"
+    else
+        printf '  %-32s could not be fast-forwarded; left alone\n' "$branch"
+        attention=1
+    fi
+done
+
+# Only the checked-out branch changes what the installed package actually runs.
+head_after=$(git rev-parse HEAD)
+if [ "$head_before" != "$head_after" ]; then
+    metadata=$(git diff --name-only "$head_before" "$head_after" -- \
+        'pyproject.toml' '*/pyproject.toml' 'setup.py' '*/setup.py' \
+        'setup.cfg' '*/setup.cfg' 'requirements.txt' '*/requirements.txt')
+    if [ -n "$metadata" ]; then
+        printf '\nPackaging files changed on the running branch:\n'
+        printf '  %s\n' $metadata
+        printf 'Reinstall so entry points and dependencies match:\n'
+        printf '  conda run -n reachaq python -m pip install -e "%s[test]"\n' \
+            "$(git rev-parse --show-toplevel)"
+    fi
+fi
+
+# Branches that exist only on a remote. Reported, never created, so an
+# operator learns a new branch exists without the checkout collecting them.
+remote_only=$(comm -23 \
+    <(git for-each-ref --format='%(refname:strip=3)' refs/remotes | sort -u | grep -v '^HEAD$') \
+    <(git for-each-ref --format='%(refname:short)' refs/heads | sort -u))
+if [ -n "$remote_only" ]; then
+    printf '\nOn a remote but not checked out here:\n'
+    printf '  %s\n' $remote_only
+    printf 'Add one with: %s <branch>\n' "$program"
+fi
+
+if [ "$attention" -ne 0 ]; then
+    printf '\nSome branches need attention; see above.\n'
+    exit 1
+fi
+printf '\nUp to date.\n'

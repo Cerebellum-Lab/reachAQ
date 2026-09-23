@@ -172,6 +172,8 @@ The default installed files are:
 ~/.local/share/applications/reachaq.desktop
 ~/.local/share/icons/hicolor/192x192/apps/reachaq.png
 ~/.local/bin/reachaq-launcher
+~/.local/bin/reachaq
+~/.local/bin/reachaq-sync
 ~/.config/reachaq/launcher.conf
 ```
 
@@ -183,6 +185,41 @@ Launcher paths are stored in `~/.config/reachaq/launcher.conf`. Optional
 file as data and does not source it as shell code. Re-run the launcher installer
 after moving the repository, changing the Conda environment, or changing the
 system-configuration path.
+
+## Terminal commands
+
+The same installer puts two commands in `~/.local/bin`. Both read
+`launcher.conf`, so they act on the checkout the desktop icon runs.
+
+```bash
+reachaq
+```
+
+Starts reachAQ from any shell without activating Conda first. It takes the
+same per-user lock as the desktop launcher, so the two cannot open the
+hardware at once, but does not pause on exit: in a terminal the error is
+already on screen. Arguments pass through to the application. When the
+`reachaq` Conda environment is active its own `reachaq` console script comes
+first on `PATH` and starts the same checkout without the lock.
+
+```bash
+reachaq-sync
+reachaq-sync devel
+```
+
+Fetches, then fast-forwards every local branch that tracks a remote, or only
+the branches named. A named branch missing locally is created from the
+remote. It never merges, rebases, resets or discards: a branch that is ahead
+or has diverged is reported and left alone, and a checkout with modified
+tracked files is refused before anything is fetched. Untracked files such as
+`planning.md` do not block it. If the running branch's packaging files
+changed, it prints the reinstall command rather than running it.
+
+Run `reachaq-sync` before flashing new pellet firmware: the application only
+accepts firmware its checkout lists. See
+[pellet firmware compatibility](../acquisition/pellet-firmware-compatibility.md).
+
+On a first install `~/.local/bin` joins `PATH` at the next login.
 
 ## Environment variables
 
