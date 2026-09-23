@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import os
 import subprocess
 import sys
 import time
@@ -59,6 +60,13 @@ class NidaqDevicePorts:
     #: I/O: they hold a level and cannot be sampled against a clock, and
     #: putting them in a buffered task fails at -200452 on DI_DataXferMech.
     digital_input_max_rate: Optional[float] = None
+    #: Internal channels that read an analog output back through the board's
+    #: own input multiplexer, as (analog output, internal channel) pairs. An
+    #: analog output cannot be read directly - DAQmx refuses it as the wrong
+    #: I/O type - and these are the only way to see one without a cable back
+    #: into an input. The driver does not enumerate them, so they are probed
+    #: by NI's documented name and kept only where the probe answers.
+    analog_output_readbacks: Tuple[Tuple[str, str], ...] = tuple()
 
 
 def discover_nidaq_devices() -> Tuple[Tuple[NidaqDevicePorts, ...], Optional[str]]:
@@ -84,6 +92,16 @@ def discover_nidaq_devices() -> Tuple[Tuple[NidaqDevicePorts, ...], Optional[str
             text=True,
             timeout=10,
             check=False,
+            # An explicit environment, which looks redundant and is not.
+            # Once the NI-DAQmx runtime is resident in a Qt process - which
+            # it is as soon as the laser loads - starting a child with the
+            # inherited environment fails at exec with "[Errno 14] Bad
+            # address" naming the Python executable. Measured on
+            # christielab10: default run fails, env=os.environ.copy()
+            # succeeds, in the same process moments apart. Passing an
+            # environment makes CPython build a fresh envp rather than hand
+            # the child the one NI has been in.
+            env=os.environ.copy(),
         )
     except subprocess.TimeoutExpired:
         error = "NI-DAQmx discovery timed out while probing devices."
@@ -164,6 +182,11 @@ def discover_nidaq_devices() -> Tuple[Tuple[NidaqDevicePorts, ...], Optional[str
             digital_input_max_rate=_optional_float(
                 device.get("digital_input_max_rate")
             ),
+            analog_output_readbacks=tuple(
+                (str(output), str(internal))
+                for output, internal in (
+                    device.get("analog_output_readbacks") or ())
+            ),
             analog_output_max_rate=_optional_float(
                 device.get("analog_output_max_rate")
             ),
@@ -197,7 +220,7 @@ def _log_discovery_result(
 
 def _discover_nidaq_devices_direct() -> Tuple[Tuple[NidaqDevicePorts, ...], Optional[str]]:
     try:
-        from nidaqmx.system import System
+        from nidaqmx.system import PhysicalChannel, System
         from nidaqmx.errors import DaqError, DaqNotFoundError
     except ModuleNotFoundError:
         return tuple(), (
@@ -267,6 +290,8 @@ def _discover_nidaq_devices_direct() -> Tuple[Tuple[NidaqDevicePorts, ...], Opti
                     digital_input_max_rate=_optional_float(
                         _optional_device_property(device, "di_max_rate", DaqError)
                     ),
+                    analog_output_readbacks=_analog_output_readbacks(
+                        PhysicalChannel, device),
                     analog_output_max_rate=_optional_float(
                         _optional_device_property(device, "ao_max_rate", DaqError)
                     ),
@@ -280,6 +305,32 @@ def _discover_nidaq_devices_direct() -> Tuple[Tuple[NidaqDevicePorts, ...], Opti
         )
     except Exception as exc:
         return tuple(), f"NI-DAQmx discovery failed: {exc}"
+
+
+def _analog_output_readbacks(physical_channel_class, device
+                             ) -> Tuple[Tuple[str, str], ...]:
+    """Which analog outputs this board can read back through its own input.
+
+    NI names the internal channel `<device>/_ao<n>_vs_aognd`, and does not
+    list it among the physical channels, so the only way to know whether one
+    exists is to name it and see. Measured on christielab10: a PXI-6221
+    answers for ao0 and ao1, and a PXI-6713 answers for none of its eight -
+    it has no analog input subsystem to route them through, so its outputs
+    can only be seen by a cable back into another board.
+    """
+    found = []
+    for channel in getattr(device, "ao_physical_chans", ()) or ():
+        name = getattr(channel, "name", "")
+        tail = str(name).rsplit("/", 1)[-1]
+        if not tail.startswith("ao"):
+            continue
+        internal = f"{device.name}/_{tail}_vs_aognd"
+        try:
+            if tuple(physical_channel_class(internal).ai_term_cfgs):
+                found.append((str(name), internal))
+        except Exception:
+            continue
+    return tuple(found)
 
 
 def _enum_name(value) -> str:

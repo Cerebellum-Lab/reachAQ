@@ -8,7 +8,7 @@ from typing import Optional, Tuple
 import numpy as np
 
 from autotrainer.core import NidaqSignalStreamConfiguration
-from autotrainer.core.multiproc import get_mp_ctx
+from autotrainer.core.multiproc import get_nidaq_mp_ctx
 from autotrainer.device import NidaqSignalSampleBlock
 
 
@@ -60,7 +60,7 @@ class SharedNidaqSampleRing:
         mp_ctx=None,
         capacity: Optional[int] = None,
     ):
-        self._mp_ctx = get_mp_ctx() if mp_ctx is None else mp_ctx
+        self._mp_ctx = get_nidaq_mp_ctx() if mp_ctx is None else mp_ctx
         self.channel_names: Tuple[str, ...] = tuple(
             channel.name for channel in configuration.channels
         )

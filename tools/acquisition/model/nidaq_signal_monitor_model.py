@@ -24,7 +24,7 @@ from autotrainer.core.logging import (
     install_log_exception_hook,
     log_hardware_initialization,
 )
-from autotrainer.core.multiproc import get_mp_ctx
+from autotrainer.core.multiproc import get_nidaq_mp_ctx
 from autotrainer.core.project import ProjectDependentProtocol
 from autotrainer.device import NidaqSignalStreamController
 from tools.acquisition.model.nidaq_sample_ring import SharedNidaqSampleRing
@@ -155,7 +155,7 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
         self._configuration = NidaqSignalStreamConfiguration()
         self._hardware_enabled = False
         self._project: Optional[ProjectInfo] = None
-        self._mp_ctx = get_mp_ctx() if mp_ctx is None else mp_ctx
+        self._mp_ctx = get_nidaq_mp_ctx() if mp_ctx is None else mp_ctx
         self._worker_target = worker_target
         self._device_discovery = device_discovery
         self._startup_timeout_seconds = startup_timeout_seconds
