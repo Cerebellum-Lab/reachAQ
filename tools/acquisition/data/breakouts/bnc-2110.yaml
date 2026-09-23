@@ -19,6 +19,15 @@
 #   * Referencing is set by eight FS/GS switches, one per AI BNC. There is no
 #     SE/DIFF and no RSE/NRSE switch, and NI does not recommend single-ended
 #     use of this block.
+#   * PFI lines carry a second name on an M Series card: PFI 0 to PFI 7 are
+#     also port1/line0 to line7, and PFI 8 to PFI 15 are also port2/line0 to
+#     line7. That is the card's naming, not the block's, and it is recorded
+#     here because otherwise a configuration written as port1/line0 reads as
+#     a pin this block does not bring out when it is the PFI 0 connector.
+#     Source: NI 372121F-01 prints both names on the BNC-2110 panel itself -
+#     "PFI 1/P1.1", "PFI 9/P2.1" - which is NI asserting the equivalence. It
+#     holds for the M Series cards this is used with; an AO Series card
+#     numbers its digital lines differently and has no PFI alias.
 #
 # terminal is the card terminal the connector lands on, with no device
 # prefix, and empty when it lands on nothing. The card decides what any of
@@ -76,9 +85,11 @@ connectors:
   - label: "PFI 0/AI START"
     connector: bnc
     terminal: PFI0
+    also: port1/line0
   - label: "CTR 0 OUT"
     connector: bnc
     terminal: PFI12
+    also: port2/line4
     note: "counter 0 internal output"
   - label: "USER 1"
     connector: bnc
@@ -93,6 +104,7 @@ connectors:
     position: 1
     connector: spring
     terminal: PFI9
+    also: port2/line1
     role: signal
     note: "NI's own Figure 4 prints this position as PFI 9/P2.0, duplicating the one below it; Table 3 of the same document gives PFI <8..9>/P2.<0..1>, so P2.1 is correct"
   - label: "PFI 8/P2.0"
@@ -100,48 +112,56 @@ connectors:
     position: 2
     connector: spring
     terminal: PFI8
+    also: port2/line0
     role: signal
   - label: "PFI 7/P1.7"
     block: "left"
     position: 3
     connector: spring
     terminal: PFI7
+    also: port1/line7
     role: signal
   - label: "PFI 6/P1.6"
     block: "left"
     position: 4
     connector: spring
     terminal: PFI6
+    also: port1/line6
     role: signal
   - label: "PFI 5/P1.5"
     block: "left"
     position: 5
     connector: spring
     terminal: PFI5
+    also: port1/line5
     role: signal
   - label: "PFI 4/P1.4"
     block: "left"
     position: 6
     connector: spring
     terminal: PFI4
+    also: port1/line4
     role: signal
   - label: "PFI 3/P1.3"
     block: "left"
     position: 7
     connector: spring
     terminal: PFI3
+    also: port1/line3
     role: signal
   - label: "PFI 2/P1.2"
     block: "left"
     position: 8
     connector: spring
     terminal: PFI2
+    also: port1/line2
     role: signal
   - label: "PFI 1/P1.1"
     block: "left"
     position: 9
     connector: spring
     terminal: PFI1
+    also: port1/line1
     role: signal
   - label: "D GND"
     block: "left"
@@ -159,6 +179,7 @@ connectors:
     position: 12
     connector: spring
     terminal: PFI14
+    also: port2/line6
     role: signal
     note: "frequency output"
   - label: "+5V"
@@ -229,6 +250,7 @@ connectors:
     position: 24
     connector: spring
     terminal: PFI13
+    also: port2/line5
     role: signal
     note: "counter 1 output"
   - label: "D GND"
@@ -247,6 +269,7 @@ connectors:
     position: 27
     connector: spring
     terminal: PFI11
+    also: port2/line3
     role: signal
     note: "analog input hold complete"
   - label: "PFI 10/P2.2"
@@ -254,6 +277,7 @@ connectors:
     position: 28
     connector: spring
     terminal: PFI10
+    also: port2/line2
     role: signal
     note: "external strobe"
   - label: "AI SENSE"

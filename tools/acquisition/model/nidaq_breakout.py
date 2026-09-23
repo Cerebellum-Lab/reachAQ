@@ -62,10 +62,19 @@ class BreakoutConnector:
     #: `port0/line2`. Empty when the connector lands on nothing, which is the
     #: honest answer for a ground or a user-defined BNC.
     terminal: str = ""
+    #: The same pin under the card's other name for it, where the card has
+    #: one. PFI 0 on an M Series board is also port1/line0, and a
+    #: configuration written either way means this connector.
+    also: str = ""
     block: str = ""
     position: Optional[int] = None
     role: str = "signal"
     note: str = ""
+
+    @property
+    def terminals(self) -> Tuple[str, ...]:
+        """Every name this connector answers to."""
+        return tuple(name for name in (self.terminal, self.also) if name)
 
     @property
     def printed(self) -> str:
@@ -101,7 +110,7 @@ class BreakoutModel:
         if not wanted:
             return tuple()
         return tuple(c for c in self.connectors
-                     if c.terminal and _normalize(c.terminal) == wanted)
+                     if any(_normalize(name) == wanted for name in c.terminals))
 
     def offers(self, terminal: str) -> bool:
         return bool(self.connectors_for(terminal))
@@ -132,6 +141,40 @@ class ConnectorStatus:
         if self.status == NOT_A_TERMINAL:
             return f"{text}: {self.reason or 'lands on no card terminal'}"
         return text
+
+
+#: Routes that exist inside the chassis or inside a board. No block brings
+#: these out, no block ever could, and saying one does not is misleading
+#: rather than merely unhelpful - somebody would go looking for a PXI_Trig0
+#: connector that has never been printed on any front panel.
+_ROUTE_PREFIXES = ("pxi_", "rtsi")
+_ROUTE_SUBSYSTEMS = frozenset({"ai", "ao", "di", "do", "ctr"})
+
+
+def is_panel_terminal(terminal: str) -> bool:
+    """Whether a cable could reach this at all.
+
+    True for the things a block can carry - ai3, PFI0, port0/line2 - and
+    false for a backplane trigger line, a star trigger, an RTSI line, or a
+    board's internal signal such as ai/SampleClock or Ctr0InternalOutput.
+    The distinction matters because "not brought out on this block" is useful
+    advice for the first group and a falsehood for the second.
+    """
+    tail = _normalize(terminal)
+    if not tail:
+        return False
+    # Segment by segment, so a name carrying its device reads the same as a
+    # bare one: /PXI1Slot4/PXI_Trig2 and PXI_Trig2 are the same line.
+    for segment in tail.split("/"):
+        if segment.startswith(_ROUTE_PREFIXES):
+            return False
+        if segment.endswith("internaloutput"):
+            return False
+        # A bare subsystem name is a subsystem's own signal, as in
+        # ai/SampleClock. A pin is never bare: ai3 and line2 carry a number.
+        if segment in _ROUTE_SUBSYSTEMS:
+            return False
+    return True
 
 
 def _normalize(name: str) -> str:
@@ -191,6 +234,7 @@ def load_breakout(name: str) -> Optional[BreakoutModel]:
                 label=str(entry.get("label") or ""),
                 connector=str(entry.get("connector") or "bnc"),
                 terminal=str(entry.get("terminal") or ""),
+                also=str(entry.get("also") or ""),
                 block=str(entry.get("block") or ""),
                 position=entry.get("position"),
                 role=str(entry.get("role") or "signal"),
@@ -353,4 +397,5 @@ def unreachable_terminals(model: Optional[BreakoutModel], terminals: Iterable[st
     if model is None:
         return tuple()
     return tuple(terminal for terminal in terminals
-                 if terminal and not model.offers(terminal))
+                 if terminal and is_panel_terminal(terminal)
+                 and not model.offers(terminal))
