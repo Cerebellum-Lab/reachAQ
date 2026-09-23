@@ -219,9 +219,7 @@ class NidaqSignalStreamController:
                     analog_channels,
                     _normalize_samples(raw, len(analog_channels)),
                 ):
-                    values[channel.name] = tuple(
-                        _scale_sample(sample, channel) for sample in samples
-                    )
+                    values[channel.name] = _scale_samples(samples, channel)
 
             digital_task = self._digital_tasks.get(device_name)
             digital_channels = self._digital_channels_by_device.get(
@@ -234,10 +232,7 @@ class NidaqSignalStreamController:
                     self._unpack_digital(
                         device_name, raw, len(digital_channels)),
                 ):
-                    values[channel.name] = tuple(
-                        _scale_sample(1.0 if bool(sample) else 0.0, channel)
-                        for sample in samples
-                    )
+                    values[channel.name] = _scale_samples(samples, channel)
 
     def verify_tasks(self, *, commit: bool = True) -> Tuple[str, ...]:
         """Verify the exact disposable graph without starting any task."""
@@ -964,8 +959,28 @@ def _normalize_samples(raw_samples, channel_count: int) -> List[List[object]]:
     return [list(channel_samples) for channel_samples in raw_samples]
 
 
-def _scale_sample(sample: float, channel: NidaqSignalChannelConfiguration) -> float:
-    return float(sample) * channel.scale + channel.offset
+def _scale_samples(samples, channel: NidaqSignalChannelConfiguration):
+    """One channel's chunk, scaled, as an array.
+
+    D7. This was a Python-level comprehension per channel per chunk, building
+    a tuple of boxed floats that the ring immediately turned back into a
+    numpy array - ten channels times five hundred samples of allocate,
+    multiply, box, tuple, unbox, twenty times a second. The arithmetic is the
+    same; numpy does it on the buffer the reader already filled.
+
+    A digital line arrives as ones and zeros and is scaled by the same rule,
+    because a digital channel may carry a scale and offset too and silently
+    ignoring them here would be a second place that decides what a channel
+    means.
+    """
+    array = numpy.asarray(samples, dtype=numpy.float64)
+    scale = float(channel.scale)
+    offset = float(channel.offset)
+    if scale == 1.0 and offset == 0.0:
+        # The common case. A copy rather than the reader's own buffer, which
+        # is overwritten by the next chunk while this one is still in flight.
+        return array.copy()
+    return array * scale + offset
 
 
 def _load_nidaqmx():

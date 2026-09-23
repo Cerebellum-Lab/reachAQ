@@ -192,8 +192,8 @@ def test_digital_device_uses_hardware_counter_sample_clock(monkeypatch):
         block = controller.read_chunk()
 
         assert block.sample_count == 3
-        assert block.values["barcode"] == (1.0, 0.0, 1.0)
-        assert block.values["cam_frames"] == (0.0, 1.0, 0.0)
+        assert list(block.values["barcode"]) == [1.0, 0.0, 1.0]
+        assert list(block.values["cam_frames"]) == [0.0, 1.0, 0.0]
         assert digital_task.read_count == 3
     finally:
         controller.close()
