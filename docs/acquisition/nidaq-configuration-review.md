@@ -122,11 +122,19 @@ Then validate, and **refuse** - the decision taken was to constrain hard:
 - **C5.** Fold `require_hardware_synchronization`, `require_distinct_start_trigger`
   and `task_strategy` into `sync_mode`. They are three booleans and an enum
   describing one decision, and most of their sixteen combinations are
-  meaningless.
+  meaningless. *Done, by refusal rather than by folding. The fields are
+  written into every configuration on disk and the default loader does not
+  filter unknown keys, so removing one would stop an existing rig loading;
+  what is removed is the ability to set them to a combination that means
+  nothing. requireHardwareSynchronization now derives from syncMode unless
+  set, and requireDistinctStartTrigger - read by nothing, ever - refuses to
+  be set at all.*
 - **C6.** Derive `reference_clock_source`, `start_trigger_source` and
   `sample_clock_source` from the topology by default, and treat an explicit
   value as an override that is validated the same way. Today the default is a
-  string constant that was wrong for one of two boards.
+  string constant that was wrong for one of two boards. *Done. The start
+  trigger and sample clock were already derived; the reference clock now is
+  too, from whether the boards share a PXI backplane at all.*
 - **C7.** Carry `sample_clock_rate_hz` through the plan for every consumer,
   not just the laser, and refuse a configuration whose declared rate differs
   from the clock it will be given. *Done. The stream refuses the mismatch
@@ -263,8 +271,10 @@ that figure was the DAQmx polled transfer, not the scaling.
   without a code change - which is the safer order for it.*
 - **D6.** Move the worker to
   `register_every_n_samples_acquired_into_buffer_event`, after D1 and D2.
+  *Tried, measured, and not kept. See below.*
 - **D7.** Vectorise scaling and keep numpy arrays end to end into the ring.
-  Low priority; it is 1% of a core.
+  Low priority; it is 1% of a core. *Done, and the estimate was right: 11.0%
+  of a core down to 9.8% on average, with one of three pairs overlapping.*
 
 ---
 
@@ -420,3 +430,32 @@ is, because starting it is itself an exec.
 The application has been avoiding this by accident of ordering: it starts the
 stream before it loads the laser. Any restart of the stream afterwards would
 not have worked, and the monitor, opened later, hit it every time.
+
+
+## D6, and why it is not in the code
+
+The callback is real and on an isolated task it is dramatic. Six channels at
+10 kHz in chunks of 500, twice each: **6.4% and 6.5% of a core** for a
+blocking read against **1.6% and 2.0%** for
+`register_every_n_samples_acquired_into_buffer_event`, for the same hundred
+and twenty chunks. On that evidence it looks like the best item in the list.
+
+It was then implemented in the stream - the callback setting an event that
+`read_chunk` waits on, so the task graph and the alignment guarantee stay
+exactly as they are - and measured again on the real ten-channel graph, three
+runs of each alternating:
+
+| | CPU (% of one core) |
+|---|---|
+| blocking read | 9.3 / 9.3 / 9.3 |
+| buffer event | 10.0 / 9.2 / 9.1 |
+
+Nothing. The saving the isolated probe shows does not exist in this stream,
+which says the blocking read here is not burning CPU waiting - after D7 the
+9.3% is the scaling and the ring, not the wait. A fully event-driven worker
+would do the reads inside the callback instead of after it, but the version
+measured here already sleeps through the wait and gains nothing, so there is
+no reason to believe the larger rewrite would either.
+
+So D6 is closed as not worth doing, on measurement rather than on estimate.
+The change is reverted; what survives is the number.
