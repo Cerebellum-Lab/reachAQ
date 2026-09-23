@@ -331,9 +331,12 @@ three things the card model cannot:
 - **B4.** In the channel picker, show each terminal as
   `PXI1Slot5/ai3 — BNC-2090A "AI 3" (BNC)`, grey out connectors the card
   cannot use with the reason, and warn when a configured terminal is not
-  broken out at all.
+  broken out at all. *Done, and the "not broken out" warning needed two
+  corrections the rig supplied: a backplane line is not a connector the block
+  is missing, and port1/line0 is the PFI 0 BNC under the card's other name.*
 - **B5.** In the wiring verification report, print the breakout label beside
-  the terminal, so "check ai4" becomes "check the AI 4 BNC".
+  the terminal, so "check ai4" becomes "check the AI 4 BNC". *Done, in one
+  report shared by the headless run and the window.*
 
 ---
 
@@ -351,8 +354,35 @@ The reviews assume this order, each stage leaving the system working:
    trusted before the tasks start.
 5. **B1-B3** - the breakout model and capability crossing.
 6. **UI** - the DAQ monitor and wiring test as a new top-level option, with
-   B4 and B5 folded in.
+   B4 and B5 folded in. *Done. Tools > DAQ Monitor, idle only. One tab per
+   card: on this rig sixteen analog inputs and eight digital lines streaming
+   at 2 kHz, twenty-four PFI and static lines polled for a level, the
+   stimulus beneath them, and the wiring report as its own tab.*
 7. **C4-C7, D3, D5-D7** - the remaining cleanups, in whatever order suits.
 
 The UI deliberately comes after the breakout model: what it should display is
 decided by B1-B3, and building it first would mean building it twice.
+
+
+## What the monitor cost to get working
+
+Three things it takes hardware to find, recorded because none is guessable
+and each one produced a message pointing somewhere else.
+
+- **DI tasks open in the GUI process break the stream worker's spawn.** It
+  fails at `[Errno 14] Bad address` naming the Python executable. The same
+  call with those tasks closed starts and streams, measured both ways. The
+  static tasks are closed across the call that forks. No account of the
+  NI-DAQmx runtime's part in it is offered here, because none was
+  established - only that closing them is the difference.
+- **The stream reaches running on the model's reader thread**, after
+  `start()` has returned, so session events arrive off the GUI thread. They
+  go through a queued signal now. The visible half of getting this wrong was
+  traces running while the button still said "Start monitoring".
+- **A Qt timer outlives the window it belongs to** unless it is killed in
+  `closeEvent`. One firing after the session closed reopened the tasks
+  `close()` had just released, and the process exited holding them.
+
+Two more were the survey's and are recorded with it: only port0 is clockable
+on an M Series board, and a PXI-6713 cannot clock digital input at all - it
+refuses the DI maximum rate property, which is the driver saying so.
