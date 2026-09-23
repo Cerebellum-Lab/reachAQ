@@ -68,6 +68,10 @@ PLOT_INTERVAL_MS = 50
 STATIC_INTERVAL_MS = 200
 #: Seconds of history on screen.
 WINDOW_SECONDS = 4.0
+#: The tone frequencies the pellet board confirms on a TTL line, in the
+#: order the devicetree assigns them: the first raises tone1, the second
+#: tone2. Any other frequency sounds without a confirmation.
+TONE_CONFIRMATION_HZ = (5_000, 6_000)
 
 _STATUS_COLORS = {
     CONFIRMED: "#1b7f3b",
@@ -394,10 +398,19 @@ class NidaqMonitorWindow(QMainWindow):
         row.addWidget(QLabel("Tone"))
         self._tone_hz = QSpinBox()
         self._tone_hz.setRange(100, 20_000)
-        self._tone_hz.setValue(8_000)
+        # A mapped frequency by default. The board confirms a tone on a TTL
+        # line only where the frequency matches one the devicetree assigns -
+        # 5 kHz raises tone1, 6 kHz raises tone2 - so a default of anything
+        # else would sound a tone, move no line, and look like a fault.
+        self._tone_hz.setValue(TONE_CONFIRMATION_HZ[0])
         self._tone_hz.setSuffix(" Hz")
+        self._tone_hz.setToolTip(
+            "Only "
+            + " and ".join(f"{hz} Hz" for hz in TONE_CONFIRMATION_HZ)
+            + " raise a confirmation line (tone1 and tone2). Any other "
+              "frequency sounds a tone that no line records.")
         row.addWidget(self._tone_hz)
-        tone = QPushButton("Play 0.3 s")
+        tone = QPushButton("Play 0.5 s")
         tone.clicked.connect(self._play_tone)
         row.addWidget(tone)
 
@@ -623,7 +636,7 @@ class NidaqMonitorWindow(QMainWindow):
     def _play_tone(self) -> None:
         frequency = int(self._tone_hz.value())
         self._run_in_background(
-            lambda: self._session.play_tone(frequency, 0.3),
+            lambda: self._session.play_tone(frequency, 0.5),
             lambda ok, message: self._report_action("tone", ok, message))
 
     def _pulse_board(self, stim_line: int) -> None:
