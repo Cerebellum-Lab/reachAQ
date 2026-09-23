@@ -244,7 +244,16 @@ def test_timing_graph_retains_exact_laser_output_channels():
     assert output.channels == ("Dev1/ao0",)
 
 
-def test_independent_mode_is_diagnostic_only_when_alignment_is_required():
+def test_independent_mode_is_valid_and_says_its_alignment_is_estimated():
+    """Asking for independent is accepting host-estimated alignment.
+
+    This asserted an invalid plan, which it got because
+    require_hardware_synchronization defaulted to true and nobody writing
+    "independent" also wrote "and I do not need synchronization". The
+    boolean now derives from the mode, so the plan is valid and says plainly
+    what its alignment is worth; the contradiction is refused where it would
+    be written instead of surfacing as an invalid plan three layers away.
+    """
     configuration = _stream(
         ("first", "DevA/ai0", "analog"),
         ("second", "DevB/ai0", "analog"),
@@ -260,7 +269,7 @@ def test_independent_mode_is_diagnostic_only_when_alignment_is_required():
         devices,
     )
 
-    assert not plan.is_valid
+    assert plan.is_valid
     assert plan.resolved_mode == "independent"
     assert plan.synchronization_quality == "independent_host_estimated"
 

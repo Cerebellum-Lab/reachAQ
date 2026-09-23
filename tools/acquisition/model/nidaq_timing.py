@@ -118,7 +118,11 @@ def build_nidaq_timing_plan(
         return _with_task_graph(plan, configuration, timing, output_devices, output_channels)
 
     if timing.sync_mode == "independent":
-        valid = not timing.require_hardware_synchronization
+        # Always valid now. Asking for independent boards while requiring
+        # hardware synchronization is refused where it is written, so it
+        # cannot arrive here to be turned into an invalid plan with a reason
+        # three layers from its cause.
+        valid = True
         plan = NidaqTimingPlan(
             requested_mode=timing.sync_mode,
             resolved_mode="independent",
@@ -187,7 +191,14 @@ def build_nidaq_timing_plan(
         quality = "hardware_external"
         clock_producer = "external"
     else:
-        reference_clock = timing.reference_clock_source or "PXI_CLK10"
+        # C6. Derived rather than a constant. PXI_CLK10 exists because a
+        # PXI backplane distributes it; on boards that share no backplane
+        # there is no such terminal to name, and naming it anyway was the
+        # defect this started from - a PXI-6713 with no Clk10 at all, failing
+        # at -200452 and taking the signal stream with it. An explicit value
+        # is still honoured and still validated the same way.
+        reference_clock = timing.reference_clock_source or (
+            "PXI_CLK10" if common_pxi_backplane else None)
         start_trigger = timing.start_trigger_source or (
             f"/{master}/ai/StartTrigger" if master_has_analog_input else None
         )
