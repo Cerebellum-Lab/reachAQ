@@ -68,6 +68,10 @@ mkdir -p \
 
 install -m 0755 "$SCRIPT_DIR/desktop/reachaq-launcher" \
     "$USER_BIN_DIR/reachaq-launcher"
+# Terminal commands. Both read the launcher.conf written below, so they start
+# and update the same checkout the desktop icon runs.
+install -m 0755 "$SCRIPT_DIR/bin/reachaq" "$USER_BIN_DIR/reachaq"
+install -m 0755 "$SCRIPT_DIR/bin/reachaq-sync" "$USER_BIN_DIR/reachaq-sync"
 install -m 0644 "$INSTALL_REPO/tools/acquisition/view/autotrainer.png" \
     "$USER_DATA_DIR/icons/hicolor/192x192/apps/reachaq.png"
 
@@ -109,3 +113,15 @@ fi
 
 printf 'Installed terminal-visible reachAQ launcher: %s\n' \
     "$DESKTOP_DIR/reachAQ.desktop"
+printf 'Installed terminal commands: %s, %s\n' \
+    "$USER_BIN_DIR/reachaq" "$USER_BIN_DIR/reachaq-sync"
+case ":$PATH:" in
+    *":$USER_BIN_DIR:"*) ;;
+    *)
+        # Ubuntu's ~/.profile adds ~/.local/bin only when it existed at login,
+        # so a first install needs a new login before the commands resolve.
+        printf 'Note: %s is not on PATH in this shell; log out and back in,\n' \
+            "$USER_BIN_DIR"
+        printf 'or add it to PATH, before running reachaq or reachaq-sync.\n'
+        ;;
+esac

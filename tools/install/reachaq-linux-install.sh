@@ -347,6 +347,20 @@ install_desktop_launcher() {
         "$INSTALL_REPO/tools/install/install-reachaq-desktop.sh"
 }
 
+# install-reachaq-desktop.sh installs `reachaq` and `reachaq-sync` beside the
+# desktop launcher. Check they landed and run, rather than trusting its exit.
+verify_terminal_commands() {
+    local bin_dir=${REACHAQ_USER_BIN_DIR:-$HOME/.local/bin}
+    local command_name
+    for command_name in reachaq reachaq-sync; do
+        if [ ! -x "$bin_dir/$command_name" ]; then
+            printf 'Missing terminal command: %s\n' "$bin_dir/$command_name" >&2
+            return 1
+        fi
+    done
+    "$bin_dir/reachaq-sync" --help >/dev/null
+}
+
 install_tensorflow_gpu_runtime() {
     if [ "$(uname -m)" != "x86_64" ]; then
         printf '%s\n' \
@@ -616,7 +630,8 @@ else
     run_step "Upgrade Python packaging tools" conda_run python -m pip install --upgrade pip setuptools wheel build
     run_step "Install Python requirements" conda_run python -m pip install -r "$INSTALL_REPO/requirements.txt"
     run_step "Install reachAQ editable package" install_editable_package
-    run_step "Install reachAQ desktop launcher" install_desktop_launcher
+    run_step "Install reachAQ desktop launcher and terminal commands" install_desktop_launcher
+    run_step "Verify reachaq and reachaq-sync commands" verify_terminal_commands
 fi
 
 begin_category "TensorFlow GPU runtime"
