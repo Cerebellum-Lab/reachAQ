@@ -130,6 +130,15 @@ if [ ${#branches[@]} -eq 0 ]; then
     exit 0
 fi
 
+# A branch checked out in another worktree has a working tree of its own that
+# only that worktree may move. git would refuse to update it from here anyway;
+# naming where it lives is more use than a bare refusal.
+worktree_of() {
+    git worktree list --porcelain | awk -v ref="refs/heads/$1" '
+        /^worktree / { path = substr($0, 10) }
+        $0 == "branch " ref { print path; exit }'
+}
+
 printf '\n'
 attention=0
 for branch in "${branches[@]}"; do
@@ -205,7 +214,14 @@ for branch in "${branches[@]}"; do
         continue
     fi
 
-    # Not checked out here. `git fetch <remote> <src>:<dst>` updates the ref
+    elsewhere=$(worktree_of "$branch")
+    if [ -n "$elsewhere" ]; then
+        printf '  %-32s behind by %s, checked out in %s; update it there\n' \
+            "$branch" "$behind" "$elsewhere"
+        continue
+    fi
+
+    # Not checked out anywhere. `git fetch <remote> <src>:<dst>` updates the ref
     # only when it is a fast-forward and refuses otherwise, which is the
     # guarantee wanted; without --force it can never rewrite the branch.
     remote_name=${upstream%%/*}
@@ -239,9 +255,11 @@ fi
 remote_only=$(comm -23 \
     <(git for-each-ref --format='%(refname:strip=3)' refs/remotes | sort -u | grep -v '^HEAD$') \
     <(git for-each-ref --format='%(refname:short)' refs/heads | sort -u))
+# Counted rather than listed: on a repository with many contributors' branches
+# the list is dozens of lines nobody on a rig needs on every run.
 if [ -n "$remote_only" ]; then
-    printf '\nOn a remote but not checked out here:\n'
-    printf '  %s\n' $remote_only
+    printf '\n%s remote branch(es) not checked out here; `git branch -r` lists them.\n' \
+        "$(printf '%s\n' "$remote_only" | grep -c .)"
     printf 'Add one with: %s <branch>\n' "$program"
 fi
 
