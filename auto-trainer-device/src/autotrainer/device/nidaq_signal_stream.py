@@ -69,6 +69,7 @@ class NidaqSignalStreamController:
         self._timing_plan = timing_plan
         if timing_plan is not None and not timing_plan.is_valid:
             raise RuntimeError(f"Invalid NI-DAQ timing plan: {timing_plan.reason}")
+        self._require_matching_clock_rate(configuration, timing_plan)
         self._analog_tasks: Dict[str, object] = {}
         #: Per device, where each configured digital channel lives in the
         #: port words that come back: (port index, bit within that port's
@@ -92,6 +93,9 @@ class NidaqSignalStreamController:
         self._digital_readers: Dict[str, object] = {}
         self._analog_buffers: Dict[str, numpy.ndarray] = {}
         self._digital_buffers: Dict[str, numpy.ndarray] = {}
+        #: Per physical channel, the referencing the driver says it takes.
+        #: None means the question could not be asked.
+        self._terminal_config_support = {}
         self._read_telemetry = {
             "blocks": 0,
             "read_seconds": 0.0,
@@ -339,7 +343,15 @@ class NidaqSignalStreamController:
                 if channel.maximum is not None:
                     kwargs["max_val"] = channel.maximum
                 terminal_config = self._analog_terminal_config()
-                if terminal_config is not None:
+                # Per channel, because not every analog channel accepts the
+                # same referencing and forcing one is fatal rather than
+                # approximate. A board's internal AO readback channel
+                # (_ao0_vs_aognd) reports DIFF and only DIFF, so naming RSE
+                # on it fails the whole task with "requested value is not a
+                # supported value" - and takes the sixteen real inputs that
+                # do accept RSE down with it.
+                if terminal_config is not None and self._channel_accepts(
+                        channel.physical_channel, terminal_config):
                     kwargs["terminal_config"] = terminal_config
                 analog_task.ai_channels.add_ai_voltage_chan(
                     channel.physical_channel, **kwargs
@@ -351,6 +363,7 @@ class NidaqSignalStreamController:
                 samps_per_chan=buffer_size,
                 **timing_kwargs,
             )
+            self._apply_analog_transfer(analog_task, device_name)
             self._configure_reference_clock(analog_task, device_name)
             self._configure_start_trigger(analog_task, device_name)
             self._configure_exports(analog_task, device_name, "ai")
@@ -429,6 +442,28 @@ class NidaqSignalStreamController:
                 time.perf_counter() - started,
             )
 
+    def _channel_accepts(self, physical_channel: str, terminal_config) -> bool:
+        """Whether this one channel supports the referencing being asked for.
+
+        The driver is asked per channel and its answer is cached. A channel
+        that cannot be asked - an older nidaqmx, or a name the system does
+        not resolve - is assumed to accept it, so this can only ever remove a
+        setting that would have failed, never add one that was not wanted.
+        """
+        if physical_channel in self._terminal_config_support:
+            supported = self._terminal_config_support[physical_channel]
+            return supported is None or terminal_config in supported
+        try:
+            channel = self._nidaqmx.system.PhysicalChannel(physical_channel)
+            supported = frozenset(channel.ai_term_cfgs)
+        except Exception:
+            supported = None
+        if not supported:
+            self._terminal_config_support[physical_channel] = None
+            return True
+        self._terminal_config_support[physical_channel] = supported
+        return terminal_config in supported
+
     def _analog_terminal_config(self):
         """How analog inputs should be referenced, or None to let DAQmx pick.
 
@@ -495,11 +530,16 @@ class NidaqSignalStreamController:
             for channel in digital_channels
         )
         self._digital_port_counts[device_name] = len(ports)
-        # NI-DAQmx's default DMA path returns zero-filled buffered DI samples on
-        # the Linux PXI-6221 runtime, while interrupt transfer returns the
-        # correct correlated digital states.
+        # NI-DAQmx's default DMA path returns zero-filled buffered DI
+        # samples on the Linux PXI-6221 runtime, while interrupt transfer
+        # returns the correct correlated digital states. This is the default
+        # rather than the only option: transferMechanismOverrides names a
+        # different one per device and subsystem, and until C4 that setting
+        # reached the plan and was then ignored by everything.
+        mechanism = self._transfer_mechanism(device_name, "di")
         task.di_channels.all.di_data_xfer_mech = (
-            self._nidaqmx.constants.DataTransferActiveTransferMode.INTERRUPT
+            mechanism if mechanism is not None
+            else self._nidaqmx.constants.DataTransferActiveTransferMode.INTERRUPT
         )
         return task
 
@@ -732,6 +772,78 @@ class NidaqSignalStreamController:
             devices = self._task_start_order()
             return not devices or device_name == devices[-1]
         return device_name == self._timing_plan.master_device
+
+    def _transfer_mechanism(self, device_name: str, subsystem: str):
+        """The configured transfer mechanism for this task, or None.
+
+        C4. `transferMechanismOverrides` was carried from the configuration
+        into the task graph and read by nothing, while the stream applied a
+        fixed interrupt mode to every digital task - a knob that did nothing
+        beside a decision nobody could change. It is applied here now, and an
+        unrecognised name is refused rather than silently ignored, because
+        the whole point of the setting is the case where the default is
+        wrong and somebody needs to know their override took effect.
+        """
+        plan = self._timing_plan
+        graph = getattr(plan, "task_graph", None) if plan is not None else None
+        for task in (getattr(graph, "tasks", ()) or ()):
+            if task.device != device_name or task.subsystem != subsystem:
+                continue
+            name = (task.transfer_mechanism or "").strip().upper()
+            if not name:
+                return None
+            modes = self._nidaqmx.constants.DataTransferActiveTransferMode
+            resolved = getattr(modes, name, None)
+            if resolved is None:
+                available = ", ".join(
+                    sorted(m for m in dir(modes) if m.isupper()))
+                raise RuntimeError(
+                    f"NI-DAQ transfer mechanism {task.transfer_mechanism!r} "
+                    f"for {device_name}.{subsystem} is not one DAQmx has "
+                    f"(available: {available})"
+                )
+            return resolved
+        return None
+
+    def _apply_analog_transfer(self, task, device_name: str) -> None:
+        """An analog override, when one is configured. There is no default."""
+        mechanism = self._transfer_mechanism(device_name, "ai")
+        if mechanism is None:
+            return
+        task.ai_channels.all.ai_data_xfer_mech = mechanism
+
+    @staticmethod
+    def _require_matching_clock_rate(configuration, plan) -> None:
+        """Refuse a stream whose declared rate is not the clock it will get.
+
+        C7. The rate handed to cfg_samp_clk_timing beside an external source
+        does not set the rate - the clock does - it sizes the buffer and is
+        what every sample count downstream is computed from. When the two
+        disagree, nothing fails: every timestamp is wrong by the ratio, and
+        on this rig that shape of defect once stretched a two-second pulse
+        train to twenty seconds and nobody saw an error.
+
+        Only the laser derived its rate from the plan. The stream took its
+        own configured value and never compared them, which is the same
+        latent bug one layer up.
+        """
+        if plan is None:
+            return
+        planned = getattr(plan, "sample_clock_rate_hz", None)
+        declared = getattr(configuration, "sample_rate_hz", None)
+        if not planned or not declared:
+            return
+        # A ratio rather than equality: these are floats that have been
+        # through YAML and a plan, and a part in a million is not a
+        # disagreement about the clock.
+        if abs(planned - declared) / max(planned, declared) > 1e-6:
+            raise RuntimeError(
+                f"NI-DAQ signal stream is configured for {declared:g} Hz and "
+                f"the timing plan will clock it at {planned:g} Hz; a chunk "
+                f"the stream treats as one second would really take "
+                f"{declared / planned:g} seconds, and every duration derived "
+                "from the configured rate is wrong by that factor"
+            )
 
     def _sample_clock_kwargs(self, device_name: str) -> Dict[str, str]:
         if (
