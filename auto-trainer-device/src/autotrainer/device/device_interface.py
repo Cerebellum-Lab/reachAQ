@@ -53,24 +53,21 @@ class DigitalOutputs(IntEnum):
 #: one, so board STIM2 is STIMULUS_3. This is the only place that off-by-one is
 #: written down; resolve board labels through here rather than restating it.
 #:
-#: STIM0 and STIM1 are deliberately absent. The pellet board's devicetree
-#: reserves them - "Only STIM2 and STIM3 may be pulsed. STIM0 and STIM1 are
-#: the tone generator's" - and the firmware refuses a pulse addressed to
-#: either with -EPERM, so they cannot carry a stimulus.
+#: STIM0 and STIM1 are deliberately absent. They carry the tone generator's
+#: TTL confirmations, which the NI-DAQ records as tone1 and tone2, so they
+#: cannot also carry a stimulus pulse - the firmware refuses a pulse
+#: addressed to either with -EPERM.
 #:
-#: They do not carry a tone confirmation either. No released firmware has
-#: ever driven them: tone.c contains no GPIO reference at v1.2.5, v2.0.0,
-#: v2.1.0, v2.2.0 or HEAD, and outside that devicetree comment nothing in
-#: the firmware source mentions STIM0 or STIM1 at all. Confirmed on
-#: christielab10 against firmware 2.2.0, with the operator listening: the
-#: tone sounds, PLAY_TONE is acknowledged, and no line on port0 or port1
-#: moves - while a pulse_stim control in the same run raised PFI 0 as
-#: expected, so the watch was good.
+#: The confirmation is gated on the exact frequency. The board's devicetree
+#: maps tone-output-frequencies-hz = <5000 6000> onto those two pins, and
+#: the driver asserts a pin only where the requested frequency equals its
+#: mapped one. So 5 kHz raises tone1, 6 kHz raises tone2, and every other
+#: frequency sounds a tone that no line confirms.
 #:
-#: So tone1 and tone2 record nothing about a tone and never have. Two of the
-#: four stimulus outputs are reserved for a confirmation no firmware emits.
-#: Treat that as a firmware gap to close or a reservation to lift, not as a
-#: signal to read.
+#: Verified on christielab10 against firmware 2.2.0: 5000 Hz raised
+#: port0/line0, 6000 Hz raised port0/line1, and 8000 Hz raised nothing.
+#: Play a tone at any other frequency and the absence of a confirmation
+#: means the frequency was unmapped, not that the tone failed.
 BOARD_STIM_LINE_OUTPUTS = {
     2: DigitalOutputs.STIMULUS_3,
     3: DigitalOutputs.STIMULUS_4,
