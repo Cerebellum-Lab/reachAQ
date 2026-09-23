@@ -43,6 +43,12 @@ from tools.acquisition.model.nidaq_breakout import (
     describe_terminal,
 )
 
+#: A line that exists on the card and cannot be watched from it. Listed
+#: rather than omitted: "ao3 is here and cannot be read without a cable back
+#: into an input" is an answer, and a channel silently missing from the
+#: window is not.
+UNREADABLE = "unreadable"
+
 #: The only port an M Series board can clock. The others are static.
 BUFFERED_PORT = "port0"
 #: Polled beside the stream, for level rather than waveform.
@@ -82,16 +88,29 @@ class SurveyLine:
     device: str
     kind: str
     #: "stream" when it is clocked into the shared ring, "static" when it is
-    #: polled for a level.
+    #: polled for a level, "unreadable" when the card cannot watch it at all.
     acquisition: str
     #: The breakout connector, when the device has a block named.
     label: str = ""
     #: What the configuration already calls this line, when anything does.
     assigned_to: str = ""
+    #: Why it cannot be watched, when acquisition is UNREADABLE.
+    reason: str = ""
+    #: The channel a task must open to see this line, when that is not the
+    #: line itself. An analog output is watched through the board's internal
+    #: readback channel; `physical_channel` stays the pin a cable goes to,
+    #: because that is the one printed on the block and named in a
+    #: configuration.
+    watched_through: str = ""
 
     @property
     def terminal(self) -> str:
         return _tail(self.physical_channel)
+
+    @property
+    def acquired_channel(self) -> str:
+        """What a task opens for this line."""
+        return self.watched_through or self.physical_channel
 
     def describe(self) -> str:
         text = self.assigned_to or self.terminal
@@ -112,6 +131,10 @@ class MonitorSurvey:
 
     def streamed(self) -> Tuple[SurveyLine, ...]:
         return tuple(line for line in self.lines if line.acquisition == "stream")
+
+    def unreadable(self) -> Tuple[SurveyLine, ...]:
+        return tuple(line for line in self.lines
+                     if line.acquisition == UNREADABLE)
 
     def static(self) -> Tuple[SurveyLine, ...]:
         return tuple(line for line in self.lines if line.acquisition == "static")
@@ -187,15 +210,19 @@ def build_survey(devices: Sequence, configuration=None) -> MonitorSurvey:
                     return assignments[candidate]
             return ""
 
-        def add(physical_channel, kind, acquisition):
+        def add(physical_channel, kind, acquisition, *, reason="",
+                watched_through="", named_as=None):
+            named_as = named_as or physical_channel
             lines.append(SurveyLine(
-                name=_channel_name(physical_channel),
+                name=_channel_name(named_as),
                 physical_channel=physical_channel,
                 device=device_name,
                 kind=kind,
                 acquisition=acquisition,
-                label=describe_terminal(model, _tail(physical_channel)),
-                assigned_to=claimed_by(physical_channel),
+                label=describe_terminal(model, _tail(named_as)),
+                assigned_to=claimed_by(named_as),
+                reason=reason,
+                watched_through=watched_through,
             ))
 
         analog_inputs = tuple(getattr(device, "analog_inputs", ()) or ())
@@ -218,6 +245,20 @@ def build_survey(devices: Sequence, configuration=None) -> MonitorSurvey:
                 f"{device_name} reports no clocked digital input, so its "
                 "lines are polled for a level rather than streamed"))
 
+        # An analog output cannot be read directly - DAQmx refuses it as
+        # the wrong I/O type - but a board with an input multiplexer can
+        # route its own output back through it. The line is named after the
+        # output somebody wired a cable to, not after the internal channel.
+        readbacks = dict(getattr(device, "analog_output_readbacks", ()) or ())
+        for channel in tuple(getattr(device, "analog_outputs", ()) or ()):
+            internal = readbacks.get(channel)
+            if internal:
+                add(channel, "analog", "stream", watched_through=internal)
+            else:
+                add(channel, "analog", UNREADABLE, named_as=channel,
+                    reason="this card cannot read its own analog output; it "
+                           "can only be seen on an input it is cabled to")
+
         for channel in tuple(getattr(device, "digital_inputs", ()) or ()):
             port = _port_of(channel)
             if port == BUFFERED_PORT and can_clock_digital:
@@ -226,8 +267,36 @@ def build_survey(devices: Sequence, configuration=None) -> MonitorSurvey:
                 # A level, not a waveform. Polled beside the stream.
                 add(channel, "digital", "static")
 
+        # PFI pins that are not port lines. On an M Series board PFI is
+        # port1 and port2 and is already covered; on a board where it is
+        # neither, there is no way to read a level from it.
+        port_terminals = {_tail(c).lower()
+                          for c in (getattr(device, "digital_inputs", ()) or ())}
+        for terminal in _pfi_terminals(device):
+            connectors = (model.connectors_for(terminal)
+                          if model is not None else ())
+            aliases = {name.lower() for c in connectors for name in c.terminals}
+            if terminal.lower() in port_terminals or aliases & port_terminals:
+                continue
+            add(f"{device_name}/{terminal}", "digital", UNREADABLE,
+                reason="this card does not expose this PFI line as a digital "
+                       "input, so it has no level to read")
+
+        for terminal in tuple(getattr(device, "counter_inputs", ()) or ()):
+            add(terminal, "counter", "static")
+
     return MonitorSurvey(lines=tuple(lines), devices=tuple(names),
                          notes=tuple(notes))
+
+
+def _pfi_terminals(device) -> Tuple[str, ...]:
+    """Every PFI terminal the driver reports, without its device prefix."""
+    found = []
+    for terminal in (getattr(device, "terminals", ()) or ()):
+        tail = str(terminal).strip("/").rsplit("/", 1)[-1]
+        if tail.upper().startswith("PFI") and tail not in found:
+            found.append(tail)
+    return tuple(found)
 
 
 def survey_stream_configuration(
@@ -252,7 +321,7 @@ def survey_stream_configuration(
         channels=tuple(
             NidaqSignalChannelConfiguration(
                 name=line.name,
-                physical_channel=line.physical_channel,
+                physical_channel=line.acquired_channel,
                 kind=line.kind,
             )
             for line in streamed
