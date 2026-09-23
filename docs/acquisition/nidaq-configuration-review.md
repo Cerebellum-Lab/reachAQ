@@ -115,7 +115,10 @@ Then validate, and **refuse** - the decision taken was to constrain hard:
   with the specific assertion that failed and the values the driver reports as
   possible. Refuse rather than warn.
 - **C4.** Delete `transfer_mechanism_overrides`, or apply it. It is currently
-  a knob that does nothing, which is worse than either.
+  a knob that does nothing, which is worse than either. *Applied, per
+  device and subsystem. The interrupt default stays for digital - the DMA
+  path still returns zero-filled samples on this runtime - and a mechanism
+  DAQmx does not have is now refused rather than ignored.*
 - **C5.** Fold `require_hardware_synchronization`, `require_distinct_start_trigger`
   and `task_strategy` into `sync_mode`. They are three booleans and an enum
   describing one decision, and most of their sixteen combinations are
@@ -126,7 +129,9 @@ Then validate, and **refuse** - the decision taken was to constrain hard:
   string constant that was wrong for one of two boards.
 - **C7.** Carry `sample_clock_rate_hz` through the plan for every consumer,
   not just the laser, and refuse a configuration whose declared rate differs
-  from the clock it will be given.
+  from the clock it will be given. *Done. The stream refuses the mismatch
+  and says what it would cost: a chunk it treats as one second really taking
+  ten.*
 - **C8.** Record chassis identification state in the capability probe and
   refuse cross-device timing when it is absent, with the remedy in the
   message, rather than failing at -89125 inside a task.
@@ -247,9 +252,15 @@ that figure was the DAQmx polled transfer, not the scaling.
   ~2 points of a core rather than saving any; taken for the simplification
   and the removed failure mode, not for speed.*
 - **D3.** Audit every `cfg_samp_clk_timing` call for a `source=` with a local
-  rate, and derive sample counts from the plan's clock rate.
+  rate, and derive sample counts from the plan's clock rate. *Audited; no
+  further change needed. The laser resolves its rate through
+  `_require_sample_rate` at all three call sites, the wiring tool clocks
+  internally, and the stream's two calls are what C7 now guards.*
 - **D5.** Retest `di_data_xfer_mech` under DMA now the IOMMU is fixed, and
-  remove the override if it is no longer needed.
+  remove the override if it is no longer needed. *Not retested. C4 made the
+  interrupt mode a default that `transferMechanismOverrides` can now
+  actually override, so the experiment can be run from the configuration
+  without a code change - which is the safer order for it.*
 - **D6.** Move the worker to
   `register_every_n_samples_acquired_into_buffer_event`, after D1 and D2.
 - **D7.** Vectorise scaling and keep numpy arrays end to end into the ring.
@@ -386,3 +397,26 @@ and each one produced a message pointing somewhere else.
 Two more were the survey's and are recorded with it: only port0 is clockable
 on an M Series board, and a PXI-6713 cannot clock digital input at all - it
 refuses the DI maximum rate property, which is the driver saying so.
+
+
+## What the monitor cost, part two
+
+One more, and the worst of them, because every message it produced pointed
+somewhere other than the cause.
+
+**Once the NI-DAQmx runtime is resident in a Qt process, starting a child
+fails.** A spawned child's exec dies at `[Errno 14] Bad address` naming the
+Python executable; through multiprocessing that is invisible and surfaces
+only as exit 255 with no result, reported against the exact-task preflight.
+Measured in one process moments apart: a child starts before the laser loads
+and fails after it. Qt alone is fine, the laser alone is fine, an open DAQmx
+task alone is fine.
+
+Two things work. For `subprocess`, passing an explicit environment - it makes
+CPython build a fresh envp rather than hand the child the one NI has been in.
+For `multiprocessing`, a forkserver, which must be started before NI-DAQmx
+is, because starting it is itself an exec.
+
+The application has been avoiding this by accident of ordering: it starts the
+stream before it loads the laser. Any restart of the stream afterwards would
+not have worked, and the monitor, opened later, hit it every time.
