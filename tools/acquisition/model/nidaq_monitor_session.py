@@ -24,6 +24,7 @@ Three deliberate separations:
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 import sys
 import time
@@ -277,10 +278,14 @@ class NidaqMonitorSession(ObservableObject):
         level, and reopening a task to read one is most of the cost.
         """
         wanted = {}
+        counters = []
         for line in self._survey.static():
+            if line.kind == "counter":
+                counters.append(line)
+                continue
             port = line.terminal.split("/", 1)[0]
             wanted.setdefault((line.device, port), []).append(line)
-        if not wanted:
+        if not wanted and not counters:
             return {}
 
         try:
@@ -314,6 +319,33 @@ class NidaqMonitorSession(ObservableObject):
                 bit = _line_number(line.terminal)
                 if bit is not None:
                     levels[line.name] = (word >> bit) & 1
+
+        for line in counters:
+            task = self._static_tasks.get((line.device, line.terminal))
+            if task is None:
+                try:
+                    task = nidaqmx.Task(
+                        f"reachaq_monitor_{line.device}_{line.terminal}")
+                    task.ci_channels.add_ci_count_edges_chan(
+                        line.physical_channel)
+                    task.start()
+                    self._static_tasks[(line.device, line.terminal)] = task
+                except Exception:
+                    # The stream takes a counter for its digital sample
+                    # clock, so one being reserved is ordinary rather than
+                    # broken; it simply has nothing to show while that runs.
+                    try:
+                        task.close()
+                    except Exception:
+                        pass
+                    self._static_tasks.pop((line.device, line.terminal), None)
+                    continue
+            try:
+                levels[line.name] = int(task.read())
+            except Exception as error:
+                logger.debug("counter read of %s failed: %s",
+                             line.physical_channel, error)
+
         previous, self._static_levels = self._static_levels, levels
         if levels != previous:
             self.property_changed(self.STATIC_LEVELS, levels, previous)
@@ -484,7 +516,11 @@ class NidaqMonitorSession(ObservableObject):
         try:
             finished = subprocess.run(
                 command, cwd=str(_REPO_ROOT), capture_output=True, text=True,
-                timeout=timeout)
+                timeout=timeout,
+                # See nidaq_discovery: with NI-DAQmx resident in a Qt
+                # process, a child started with the inherited environment
+                # fails at exec with "Bad address".
+                env=os.environ.copy())
         except subprocess.TimeoutExpired:
             return False, f"the wiring test did not finish within {timeout:g}s"
         except Exception as error:

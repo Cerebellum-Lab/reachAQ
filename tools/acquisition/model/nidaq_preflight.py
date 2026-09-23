@@ -7,7 +7,7 @@ import queue
 from typing import Optional, Tuple
 
 from autotrainer.core import NidaqSignalStreamConfiguration, NidaqTimingPlan
-from autotrainer.core.multiproc import get_mp_ctx
+from autotrainer.core.multiproc import get_nidaq_mp_ctx
 from autotrainer.device import NidaqSignalStreamController
 
 
@@ -137,7 +137,7 @@ def run_isolated_nidaq_preflight(
     timeout_seconds: float = 15.0,
     mp_ctx=None,
 ) -> NidaqPreflightResult:
-    context = get_mp_ctx() if mp_ctx is None else mp_ctx
+    context = get_nidaq_mp_ctx() if mp_ctx is None else mp_ctx
     result_queue = context.Queue(maxsize=1)
     process = context.Process(
         target=_preflight_worker,
