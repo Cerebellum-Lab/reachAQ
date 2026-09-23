@@ -69,7 +69,9 @@ from autotrainer.core.logging import (
     unregister_fatal_exception_callback,
 )
 from autotrainer.core.analysis import ReachAnalysis
-from autotrainer.core.multiproc import get_mp_ctx, make_daemon_timer, DaemonTimer
+from autotrainer.core.multiproc import (
+    get_mp_ctx, get_nidaq_mp_ctx, make_daemon_timer, DaemonTimer,
+)
 from autotrainer.core.pose_elements import SceneElement
 from autotrainer.core.project.project_info import DATE_TIME_FORMAT
 from autotrainer.video import VideoRecordMode
@@ -653,6 +655,20 @@ class AppModel(ObservableObject):
             system_message_handler = SystemMessageHandler(self._system_message_queue)
         self._system_message_handler = system_message_handler
         self._system_message_handler.start()
+
+        # Before anything loads NI-DAQmx. The NI-DAQ worker context is a
+        # forkserver, and bringing that server up is itself an exec - the
+        # operation that fails once the NI-DAQmx runtime is resident in this
+        # process, which it is as soon as the laser loads. Started here it
+        # serves for the life of the process; started later it dies with a
+        # broken pipe and the signal stream never runs.
+        #
+        # Constructing the monitor below already warmed it as a side effect,
+        # so this line changes nothing today. It is here because that was
+        # luck: it held only while the monitor happened to be built before
+        # the laser, and the fault it avoids reports itself three layers
+        # away as "preflight exited with code 255 without a result".
+        get_nidaq_mp_ctx()
 
         self._hardware = HardwareModel(self._system_message_handler)
         self._laser = LaserModel()
