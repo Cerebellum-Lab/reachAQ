@@ -85,6 +85,20 @@ BOARD_STIM_LINE_OUTPUTS = {
 TONE_CONFIRMATION_FREQUENCIES_HZ = ((5_000, "tone1"), (6_000, "tone2"))
 
 
+def tone_confirmation_frequency(field: str):
+    """The frequency whose tone raises this confirmation line, or None.
+
+    For the handful of places that need to recognise a tone by its frequency
+    rather than play one. Asking here keeps them agreeing with the board:
+    the mapping is the devicetree's, and a literal copied into a comparison
+    is a copy that stops being true without anything failing.
+    """
+    for frequency, name in TONE_CONFIRMATION_FREQUENCIES_HZ:
+        if name == field:
+            return frequency
+    return None
+
+
 class AnalogOutputs(IntEnum):
     STATUS_OUT = 1
 

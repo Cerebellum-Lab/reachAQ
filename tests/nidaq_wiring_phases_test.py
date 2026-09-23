@@ -228,3 +228,25 @@ def test_no_tone_lines_configured_is_not_an_error(capsys):
 
     assert confirmed == {} and interface.tones == []
     assert "no tone confirmation lines" in capsys.readouterr().out
+
+
+def test_the_frequency_mapping_answers_by_line_name():
+    """The one place a literal 5000 or 6000 should ever come from.
+
+    It was written down in three: the board devicetree, the monitor's tone
+    default, and a comparison in the intertrial fallback that recognised
+    tone2 by frequency. Copies of a devicetree fact stop being true without
+    anything failing.
+    """
+    from autotrainer.device.device_interface import (
+        TONE_CONFIRMATION_FREQUENCIES_HZ,
+        tone_confirmation_frequency,
+    )
+
+    assert tone_confirmation_frequency("tone1") == 5000
+    assert tone_confirmation_frequency("tone2") == 6000
+    assert tone_confirmation_frequency("tone3_r") is None
+    assert tone_confirmation_frequency("") is None
+    # Every mapped frequency resolves back to the line it raises.
+    for frequency, field in TONE_CONFIRMATION_FREQUENCIES_HZ:
+        assert tone_confirmation_frequency(field) == frequency

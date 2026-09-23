@@ -69,6 +69,7 @@ from autotrainer.core.logging import (
     unregister_fatal_exception_callback,
 )
 from autotrainer.core.analysis import ReachAnalysis
+from autotrainer.device.device_interface import tone_confirmation_frequency
 from autotrainer.core.multiproc import (
     get_mp_ctx, get_nidaq_mp_ctx, make_daemon_timer, DaemonTimer,
 )
@@ -8873,7 +8874,12 @@ class AppModel(ObservableObject):
         if kind is SystemStatusMessageKind.TONE_STATUS:
             frequency_hz = int(getattr(data, "frequency_hz", 0))
             active = bool(getattr(data, "time_remaining_ms", 0))
-            tone2 = active and frequency_hz == 6000
+            # The board's own mapping rather than a literal. A frequency
+            # compared against a copied constant is a comparison that
+            # stops being true the moment the devicetree changes, with
+            # nothing failing to say so.
+            tone2 = active and frequency_hz == tone_confirmation_frequency(
+                "tone2")
             rising = tone2 and not self._tone2_status_active
             self._tone2_status_active = tone2
             if not rising or self._nidaq_tone_is_authoritative("tone2"):
