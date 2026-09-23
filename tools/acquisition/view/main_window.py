@@ -58,6 +58,7 @@ from tools.acquisition.model.user_preferences import UserPreferences
 from tools.acquisition.view.main_content import MainContent
 from tools.acquisition.view.multi_selection_menu import MultiSelectionMenu
 from tools.acquisition.view.ui_availability import calculate_ui_availability
+from tools.acquisition.view.nidaq_monitor_window import NidaqMonitorWindow
 from tools.acquisition.view.nidaq_port_configuration_dialog import NidaqPortConfigurationDialog
 from tools.acquisition.view.preferences_dialog import PreferencesDialog
 from tools.acquisition.view.animal_metadata_dialog import AnimalMetadataDialog
@@ -1026,6 +1027,9 @@ class MainWindow(QMainWindow):
             and self._start_capture_thread is None
         )
         self.edit_daq_ports_action.setEnabled(is_idle)
+        # The monitor streams every line on every card, so it needs the
+        # hardware the acquisition would otherwise hold.
+        self.daq_monitor_action.setEnabled(is_idle)
         self.refresh_hardware_action.setEnabled(is_idle and self._hardware_refresh_thread is None)
         self._set_hardware_menu_actions_enabled(
             is_idle and self._hardware_refresh_thread is None
@@ -1059,6 +1063,29 @@ class MainWindow(QMainWindow):
             logger.exception("Failed to save DAQ port configuration: %s", exc)
             return
         self.statusBar().showMessage("DAQ port configuration saved", 5000)
+
+    def _open_daq_monitor(self):
+        """Open the monitor, or raise the one already open.
+
+        One window: it holds a second stream process and a set of tasks on
+        the same lines, and two of those would fight over the hardware rather
+        than show twice as much.
+        """
+        existing = getattr(self, "_daq_monitor_window", None)
+        if existing is not None and existing.isVisible():
+            existing.raise_()
+            existing.activateWindow()
+            return
+        try:
+            window = NidaqMonitorWindow(self._app_model, self)
+        except Exception as exc:
+            logger.exception("DAQ monitor could not be opened: %s", exc)
+            self.statusBar().showMessage(
+                f"DAQ monitor could not be opened: {exc}", 8000)
+            return
+        self._daq_monitor_window = window
+        window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+        window.show()
 
     def _show_preferences(self):
         if (
@@ -1161,6 +1188,14 @@ class MainWindow(QMainWindow):
         action.setCheckable(True)
         action.triggered.connect(self.on_3d_calibrate)
 
+        action = self.daq_monitor_action = QAction(
+            _toolbar_icon("fa5s.wave-square"), "DAQ Monitor", self)
+        action.setToolTip(
+            "Watch every line on every DAQ card and drive the stimulus, to "
+            "work out which line is which. Available while acquisition is "
+            "idle, because it opens the same hardware.")
+        action.triggered.connect(self._open_daq_monitor)
+
         action = self.view_diagnostics_action = QAction("Logging", self)
         action.setToolTip("Show or hide the application logging panel")
         action.setCheckable(True)
@@ -1219,6 +1254,8 @@ class MainWindow(QMainWindow):
         edit_menu.addAction(self.edit_daq_ports_action)
 
         tools_menu = menu_bar.addMenu("Tools")
+        tools_menu.addAction(self.daq_monitor_action)
+        tools_menu.addSeparator()
         tools_menu.addAction(self.calib_diamond_triangle_action)
         tools_menu.addAction(self.make_3d_calib_action)
 
