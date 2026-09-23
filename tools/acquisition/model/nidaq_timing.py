@@ -618,6 +618,15 @@ def _validate_channels_and_rates(configuration, discovered) -> Optional[str]:
                 name.strip("/")
                 for name in device.analog_inputs
             }
+            # A board's internal channels are real analog inputs and the
+            # driver does not list them among the physical ones, so checking
+            # against that list alone refuses the only way there is to see an
+            # analog output: PXI1Slot5/_ao0_vs_aognd.
+            available |= {
+                internal.strip("/")
+                for _output, internal in (
+                    getattr(device, "analog_output_readbacks", ()) or ())
+            }
             if available and normalized not in available:
                 return (
                     f"Configured analog input {channel.physical_channel} is not "

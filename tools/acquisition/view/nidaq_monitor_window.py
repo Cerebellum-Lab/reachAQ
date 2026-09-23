@@ -125,6 +125,7 @@ class _CardTab(QWidget):
         analog = [l for l in streamed if l.kind == "analog"]
         digital = [l for l in streamed if l.kind == "digital"]
         static = [l for l in lines if l.acquisition == "static"]
+        unreadable = [l for l in lines if l.acquisition == "unreadable"]
 
         for note in session.survey.notes_for(device):
             label = QLabel(note)
@@ -144,6 +145,8 @@ class _CardTab(QWidget):
                 digital=True))
         if static:
             splitter.addWidget(self._level_group(static))
+        if unreadable:
+            splitter.addWidget(self._unreadable_group(unreadable))
         if not lines:
             layout.addWidget(QLabel(f"{device} reports no readable lines."))
 
@@ -196,9 +199,36 @@ class _CardTab(QWidget):
         box.addWidget(scroll)
         return group
 
-    def _level_group(self, lines) -> QWidget:
+    def _unreadable_group(self, lines) -> QWidget:
+        """Lines the card has and cannot watch, with why.
+
+        Listed rather than left out. "ao3 is here, and this card cannot read
+        its own output" is an answer; a channel missing from the window is
+        indistinguishable from one the software forgot about.
+        """
         group = QGroupBox(
-            "PFI and static lines - a level, polled; these have no sample clock")
+            f"On this card and not watchable from it ({len(lines)})")
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(6, 4, 6, 4)
+        layout.setSpacing(1)
+        for line in lines:
+            label = QLabel(f"{self._describe(line)}  —  {line.reason}")
+            label.setWordWrap(True)
+            label.setStyleSheet("color: #5f6368;")
+            layout.addWidget(label)
+        wrapper = QWidget()
+        outer = QVBoxLayout(wrapper)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(group)
+        outer.addStretch(1)
+        return wrapper
+
+    def _level_group(self, lines) -> QWidget:
+        counters = sum(1 for line in lines if line.kind == "counter")
+        title = "PFI and static lines - a level, polled; these have no sample clock"
+        if counters:
+            title += f"; and {counters} counter(s), as an edge count"
+        group = QGroupBox(title)
         grid = QGridLayout(group)
         grid.setContentsMargins(6, 4, 6, 4)
         grid.setHorizontalSpacing(10)
@@ -228,6 +258,10 @@ class _CardTab(QWidget):
     def _describe(line) -> str:
         """The terminal, what claims it, and what it is called on the block."""
         text = line.terminal
+        if getattr(line, "watched_through", ""):
+            # Named after the pin a cable goes to, not after the internal
+            # channel it is actually read through, which is on no panel.
+            text += " (read back)"
         if line.assigned_to:
             text += f"  [{line.assigned_to}]"
         if line.label:
