@@ -227,10 +227,42 @@ def test_nidaq_laser_reports_on_demand_output_as_not_synchronized():
     assert status["status"] == "declared_not_armed"
 
 
-def test_nidaq_laser_uses_shared_clock_only_with_future_hardware_trigger():
-    channel = make_channel()
+class _RecordingSystem:
+    """Enough of nidaqmx.system to see which terminals get connected."""
+
+    def __init__(self):
+        self.connected = []
+
+    def local(self):
+        return self
+
+    def connect_terms(self, source, destination):
+        self.connected.append((source, destination))
+
+
+def _clock_routing_controller(plan, *, backplane_clock_line="PXI_Trig1"):
+    """A controller with just the collaborators the clock path touches."""
     controller = object.__new__(NidaqLaserController)
-    controller._timing_plan = NidaqTimingPlan(
+    controller._timing_plan = plan
+    controller._trigger_routes = []
+    controller._configuration = SimpleNamespace(
+        backplane_clock_line=backplane_clock_line)
+    system = _RecordingSystem()
+    controller._nidaqmx = SimpleNamespace(system=SimpleNamespace(System=system))
+    return controller, system
+
+
+def test_nidaq_laser_uses_shared_clock_only_with_future_hardware_trigger():
+    """The clock crosses to the output board, and is named there.
+
+    This asserted the plan's clock verbatim until cross-board routing was
+    added, and then failed for two years' worth of reasons at once: the
+    controller it builds by hand never grew the collaborators that path
+    needs, and the answer it expected was the one from before there was a
+    route. Both are the test's to fix; the behaviour is deliberate.
+    """
+    channel = make_channel()
+    plan = NidaqTimingPlan(
         requested_mode="auto",
         resolved_mode="backplane",
         is_valid=True,
@@ -241,6 +273,7 @@ def test_nidaq_laser_uses_shared_clock_only_with_future_hardware_trigger():
         hardware_output_devices=("Dev1",),
         hardware_output_timing_status="declared_not_armed",
     )
+    controller, system = _clock_routing_controller(plan)
     pulse = LaserSynchronizedPulseTrain(
         pulse_trains=(LaserPulseTrain(
             channel_id=LaserChannelId.LASER_1,
@@ -252,9 +285,44 @@ def test_nidaq_laser_uses_shared_clock_only_with_future_hardware_trigger():
 
     kwargs, status = controller._resolve_pulse_timing((channel,), pulse)
 
-    assert kwargs == {"source": "/Input/ai/SampleClock"}
+    # The clock is produced on Input and the output is on Dev1, so it is
+    # driven onto a backplane line and read as Dev1's view of that line.
+    # DAQmx will not route it across an unidentified chassis by name.
+    assert system.connected == [("/Input/ai/SampleClock", "/Input/PXI_Trig1")]
+    assert kwargs == {"source": "/Dev1/PXI_Trig1"}
     assert status["status"] == "hardware_synchronized"
     assert status["referenceClockSource"] == "PXI_CLK10"
+    # The plan's own clock is still reported, because that is what it is.
+    assert status["sampleClockSource"] == "/Input/ai/SampleClock"
+
+
+def test_a_clock_already_on_the_output_board_acquires_no_route():
+    """A single-board rig must not reserve a backplane line it cannot use."""
+    plan = NidaqTimingPlan(
+        requested_mode="auto",
+        resolved_mode="backplane",
+        is_valid=True,
+        master_device="Dev1",
+        reference_clock_source="PXI_CLK10",
+        reference_clock_rate_hz=10_000_000.0,
+        sample_clock_source="/Dev1/ai/SampleClock",
+        hardware_output_devices=("Dev1",),
+        hardware_output_timing_status="declared_not_armed",
+    )
+    controller, system = _clock_routing_controller(plan)
+    pulse = LaserSynchronizedPulseTrain(
+        pulse_trains=(LaserPulseTrain(
+            channel_id=LaserChannelId.LASER_1,
+            amplitude_volts=1.0,
+            duration_ms=10.0,
+        ),),
+        trigger_source="/Dev1/PXI_Trig0",
+    )
+
+    kwargs, _status = controller._resolve_pulse_timing((make_channel(),), pulse)
+
+    assert kwargs == {"source": "/Dev1/ai/SampleClock"}
+    assert system.connected == []
 
 
 def test_nidaq_laser_labels_deferred_start_as_software_timed_without_plan():
