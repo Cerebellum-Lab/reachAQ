@@ -53,6 +53,12 @@ class NidaqDevicePorts:
     analog_input_max_single_channel_rate: Optional[float] = None
     analog_input_max_multi_channel_rate: Optional[float] = None
     analog_output_max_rate: Optional[float] = None
+    #: Maximum clocked digital input rate, or None when the board does not
+    #: support the property at all - which is the driver's way of saying it
+    #: has no correlated digital input. A PXI-6713's digital lines are static
+    #: I/O: they hold a level and cannot be sampled against a clock, and
+    #: putting them in a buffered task fails at -200452 on DI_DataXferMech.
+    digital_input_max_rate: Optional[float] = None
 
 
 def discover_nidaq_devices() -> Tuple[Tuple[NidaqDevicePorts, ...], Optional[str]]:
@@ -155,6 +161,9 @@ def discover_nidaq_devices() -> Tuple[Tuple[NidaqDevicePorts, ...], Optional[str
             analog_input_max_multi_channel_rate=_optional_float(
                 device.get("analog_input_max_multi_channel_rate")
             ),
+            digital_input_max_rate=_optional_float(
+                device.get("digital_input_max_rate")
+            ),
             analog_output_max_rate=_optional_float(
                 device.get("analog_output_max_rate")
             ),
@@ -254,6 +263,9 @@ def _discover_nidaq_devices_direct() -> Tuple[Tuple[NidaqDevicePorts, ...], Opti
                     ),
                     analog_input_max_multi_channel_rate=_optional_float(
                         _optional_device_property(device, "ai_max_multi_chan_rate", DaqError)
+                    ),
+                    digital_input_max_rate=_optional_float(
+                        _optional_device_property(device, "di_max_rate", DaqError)
                     ),
                     analog_output_max_rate=_optional_float(
                         _optional_device_property(device, "ao_max_rate", DaqError)
