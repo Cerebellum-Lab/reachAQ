@@ -79,6 +79,9 @@ DEFAULT_RECORD = Path.home() / "Autotrainer" / "nidaq_wiring_verification.json"
 #: PFI pins on an M-series board, which is where a stimulus trigger lands.
 DIGITAL_PORTS = ("port0", "port1", "port2")
 SETTLE_SECONDS = 0.15
+#: How long each confirmation tone sounds. Long enough to be unmissable
+#: in a poll, short enough that nobody minds hearing two of them.
+TONE_MS = 400
 ANALOG_RATE_HZ = 10_000.0
 ANALOG_SAMPLES = 500
 #: A response has to clear this to count, which keeps noise and the tail of a
@@ -130,6 +133,79 @@ def changed_lines(device, before, after):
             else:
                 names.append(f"{device}/port0/line{bit}")
     return names
+
+
+def check_tones(nidaqmx, interface, configuration, points, report):
+    """Confirm the tone lines through the tone, not through a spare output.
+
+    Holding STIM0 high with a digital write proves the cable. It does not
+    prove the thing the rig actually depends on, which is that asking the
+    board for a tone raises the line the configuration reads as tone1 or
+    tone2 - a different mechanism, driven by the tone generator rather than
+    by the host, and gated on the frequency matching the one the devicetree
+    assigns to that pin.
+
+    So each mapped frequency is played and the line that follows is recorded.
+    A tone at an unmapped frequency raises nothing, by design, which is why
+    the frequencies come from the board's mapping rather than from taste.
+    """
+    from autotrainer.device.device_interface import TONE_CONFIRMATION_FREQUENCIES_HZ
+
+    ports = getattr(configuration, "nidaq_ports", None)
+    by_field = {}
+    for frequency, field in TONE_CONFIRMATION_FREQUENCIES_HZ:
+        channel = getattr(ports, field, None)
+        if channel:
+            by_field[frequency] = (field, channel)
+    if not by_field:
+        print("\n" + "no tone confirmation lines are configured")
+        return
+
+    devices = sorted({channel.strip("/").split("/", 1)[0]
+                      for _field, channel in by_field.values()})
+    tasks = {}
+    try:
+        for device in devices:
+            for port in DIGITAL_PORTS:
+                try:
+                    task = nidaqmx.Task(f"tone_{device}_{port}")
+                    task.di_channels.add_di_chan(f"{device}/{port}")
+                    task.read()
+                    tasks[(device, port)] = task
+                except Exception:
+                    continue
+        if not tasks:
+            print("\n" + "no digital port could be opened to watch the tones")
+            return
+
+        print("\n" + "--- tone confirmations, one mapped frequency at a time ---")
+        for frequency, (field, channel) in sorted(by_field.items()):
+            device = channel.strip("/").split("/", 1)[0]
+            before = {port: int(task.read())
+                      for (dev, port), task in tasks.items() if dev == device}
+            if not interface.emit_tone(int(frequency), int(TONE_MS)):
+                print(f"  {frequency} Hz was not accepted by the board")
+                continue
+            seen = set()
+            deadline = time.time() + TONE_MS / 1000.0 + 0.3
+            while time.time() < deadline:
+                after = {port: int(task.read())
+                         for (dev, port), task in tasks.items() if dev == device}
+                seen.update(changed_lines(device, before, after))
+            observed = sorted(seen)
+            print(f"  {frequency} Hz raised: {', '.join(observed) or 'nothing'}")
+            for point in points:
+                if point.name != field:
+                    continue
+                if any(matches(point.physical_channel, name) for name in observed):
+                    report(point, f"raised by a {frequency} Hz tone, which is "
+                                  "the mapping the board assigns to this line")
+    finally:
+        for task in tasks.values():
+            try:
+                task.close()
+            except Exception:
+                pass
 
 
 def observe_undriven(nidaqmx, points, seconds, undriven, report):
@@ -400,6 +476,14 @@ def main() -> int:
             check_digital(nidaqmx, interface, configuration, points,
                           record_digital)
             board_outputs_exercised = True
+            # After the digital sweep, so a tone confirmation replaces the
+            # weaker evidence rather than the other way round.
+            try:
+                check_tones(nidaqmx, interface, configuration, points,
+                            lambda point, detail: observed_by_point.__setitem__(
+                                point.fingerprint, (CONFIRMED, detail)))
+            except Exception as error:
+                print(f"tone confirmation check failed: {error}")
 
         if analog_points and configuration.laser.backend == "nidaq":
             from nidaqmx.constants import TerminalConfiguration
