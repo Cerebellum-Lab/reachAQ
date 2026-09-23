@@ -210,7 +210,6 @@ def test_unedited_advanced_timing_fields_survive_dialog_save(qapp):
     config.nidaq_ports = NidaqPortConfiguration(
         timing=NidaqTimingConfiguration(
             task_strategy="auto_multidevice",
-            require_distinct_start_trigger=True,
             sample_clock_export_terminal="/Dev1/PFI1",
             start_trigger_export_terminal="/Dev1/PFI2",
             external_routes=(route,),
@@ -223,7 +222,6 @@ def test_unedited_advanced_timing_fields_survive_dialog_save(qapp):
     built = dialog._build_timing_configuration()
 
     assert built.task_strategy == "auto_multidevice"
-    assert built.require_distinct_start_trigger
     assert built.sample_clock_export_terminal == "/Dev1/PFI1"
     assert built.start_trigger_export_terminal == "/Dev1/PFI2"
     assert built.external_routes == (route,)
@@ -246,3 +244,35 @@ def test_laser_trigger_selector_only_offers_external_trigger_terminals(qapp):
     assert "/Dev1/PFI0" in values
     assert "/Dev1/RTSI0" in values
     assert "/Dev1/ai/SampleClock" not in values
+
+
+def test_a_contradictory_timing_configuration_cannot_be_built(qapp):
+    """C5. Most combinations of these four settings mean nothing.
+
+    They used to be expressible, and said nothing until a plan came back
+    invalid several layers later for a reason nobody traced back here.
+    """
+    with pytest.raises(ValueError) as refused:
+        NidaqTimingConfiguration(sync_mode="independent",
+                                 require_hardware_synchronization=True)
+    assert "Independent means each board runs" in str(refused.value)
+
+    with pytest.raises(ValueError) as refused:
+        NidaqTimingConfiguration(sync_mode="independent",
+                                 require_hardware_synchronization=False,
+                                 task_strategy="forced_multidevice")
+    assert "opposite of independent" in str(refused.value)
+
+    # The knob nothing ever read now says so instead of accepting silently.
+    with pytest.raises(ValueError) as refused:
+        NidaqTimingConfiguration(require_distinct_start_trigger=True)
+    assert "not implemented" in str(refused.value)
+
+
+def test_independent_boards_without_requiring_synchronization_is_allowed():
+    """The combination that does mean something still does."""
+    timing = NidaqTimingConfiguration(
+        sync_mode="independent", require_hardware_synchronization=False)
+
+    assert timing.sync_mode == "independent"
+    assert timing.task_strategy == "per_device"

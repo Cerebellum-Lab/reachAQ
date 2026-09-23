@@ -45,7 +45,11 @@ class NidaqTimingConfiguration:
 
     sync_mode: str = "auto"
     timing_master: Optional[NidaqDeviceIdentity] = None
-    require_hardware_synchronization: bool = True
+    #: Whether the boards must share a hardware clock. Unset means derive
+    #: it from sync_mode, which is the whole of C5: choosing "independent"
+    #: is already saying they do not, and having to say it twice is how the
+    #: two came to contradict each other.
+    require_hardware_synchronization: Optional[bool] = None
     reference_clock_source: Optional[str] = None
     start_trigger_source: Optional[str] = None
     sample_clock_source: Optional[str] = None
@@ -55,6 +59,47 @@ class NidaqTimingConfiguration:
     start_trigger_export_terminal: Optional[str] = None
     external_routes: Tuple["NidaqTimingRoute", ...] = tuple()
     transfer_mechanism_overrides: Tuple[Tuple[str, str], ...] = tuple()
+
+    def _refuse_meaningless_combinations(self, sync_mode, strategy) -> None:
+        """C5. Stop the configuration expressing decisions that contradict.
+
+        Four settings describe one decision and most of their combinations
+        say nothing: "run the boards independently, and require them to be
+        hardware synchronized" is not a configuration, it is a contradiction
+        that produced an invalid plan several layers later with a reason
+        nobody traced back to here.
+
+        The fields are kept rather than folded away, because they are written
+        into every system configuration on disk and the loader does not
+        filter unknown keys - removing one would stop an existing rig
+        loading. What is removed is the ability to set them to a combination
+        that means nothing.
+        """
+        if sync_mode == "independent" and self.require_hardware_synchronization:
+            raise ValueError(
+                "NI-DAQ timing asks for independent boards and for hardware "
+                "synchronization at the same time. Independent means each "
+                "board runs on its own clock. Leave "
+                "requireHardwareSynchronization unset to accept that, or "
+                "choose syncMode auto, backplane or external to get "
+                "synchronization."
+            )
+        if sync_mode == "independent" and strategy != "per_device":
+            raise ValueError(
+                f"NI-DAQ timing asks for independent boards and for "
+                f"{strategy} tasks. A task spanning devices is one task on "
+                "one clock, which is the opposite of independent; use "
+                "per_device."
+            )
+        if self.require_distinct_start_trigger:
+            # Read by nothing, from the day it was added. A knob that does
+            # nothing is worse than one that refuses, because somebody sets
+            # it and believes they have changed something.
+            raise ValueError(
+                "NI-DAQ requireDistinctStartTrigger is not implemented - "
+                "nothing has ever read it. Leave it false; the start trigger "
+                "each device uses comes from the resolved topology."
+            )
 
     def __post_init__(self):
         sync_mode = self.sync_mode.strip().lower()
@@ -71,6 +116,12 @@ class NidaqTimingConfiguration:
                 "forced_multidevice"
             )
         object.__setattr__(self, "task_strategy", strategy)
+        self._refuse_meaningless_combinations(sync_mode, strategy)
+        # Resolved after the refusal, so the contradiction is reported
+        # against what was written rather than against what was derived.
+        if self.require_hardware_synchronization is None:
+            object.__setattr__(self, "require_hardware_synchronization",
+                               sync_mode != "independent")
         for name in (
             "reference_clock_source",
             "start_trigger_source",
