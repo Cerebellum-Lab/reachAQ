@@ -5,6 +5,8 @@ from autotrainer.core.delay_distribution import (
     PUBLISHED_4S_VALUES,
     DelayPreset,
 )
+from autotrainer.device import LaserChannelConfiguration, LaserSystemConfiguration
+
 from tools.acquisition.model.stimulus_profile_repository import (
     PROFILE_SCHEMA_VERSION,
     StimulusProfileLibrary,
@@ -21,6 +23,17 @@ from tools.acquisition.model.trial_protocol_schedule import (
     TrialProtocolRow,
 )
 
+
+LASERS = LaserSystemConfiguration.from_channels((
+    LaserChannelConfiguration(
+        channel_id=1,
+        analog_output="Dev4/ao0",
+        diode_input="Dev4/ai0",
+        shutter_output="Dev4/port0/line0",
+        trigger_source="/Dev4/PXI_Trig0",
+        board_stim_line=3,
+    ),
+))
 
 TONE_1 = ToneProfile("tone-1", 1, 5_000, 100)
 TONE_2 = ToneProfile("tone-2", 1, 6_000, 100)
@@ -59,6 +72,7 @@ def _compiler():
             )
         },
         cue_interval_profiles={"published": PUBLISHED, "custom": CUSTOM},
+        laser_configuration=LASERS,
         dcs_to_motor=lambda values: tuple(value * 2 for value in values),
     )
 
@@ -178,6 +192,7 @@ def test_compile_rejects_an_unknown_cue_tone_profile():
     compiler = TrialActionCompiler(
         tone_profiles={"tone-1": TONE_1},
         cue_interval_profiles={"published": PUBLISHED},
+        laser_configuration=LASERS,
         dcs_to_motor=lambda values: values,
     )
     with pytest.raises(ValueError, match="Unknown cue tone profile"):

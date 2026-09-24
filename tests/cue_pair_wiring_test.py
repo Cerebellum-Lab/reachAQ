@@ -15,6 +15,8 @@ The timer and clock are injected so these run instantly and deterministically.
 
 import pytest
 
+from autotrainer.device import LaserChannelConfiguration, LaserSystemConfiguration
+
 from tools.acquisition.model.cue_timing import CueTimingConfiguration
 from tools.acquisition.model.reach_state_source import (
     ReachStateConfiguration,
@@ -28,6 +30,18 @@ from tools.acquisition.model.trial_action import (
     TrialCompileContext,
 )
 from tools.acquisition.model.trial_protocol_schedule import TrialProtocolRow
+
+
+LASERS = LaserSystemConfiguration.from_channels((
+    LaserChannelConfiguration(
+        channel_id=1,
+        analog_output="Dev4/ao0",
+        diode_input="Dev4/ai0",
+        shutter_output="Dev4/port0/line0",
+        trigger_source="/Dev4/PXI_Trig0",
+        board_stim_line=3,
+    ),
+))
 
 
 class _ManualTimer:
@@ -94,6 +108,7 @@ def _recipe(cue_interval_ms=400, cue_tone=True, tone_phase="pellet_presentation"
             "tone2": ToneProfile("tone2", 1, 9000, 100),
         },
         laser_profiles={},
+        laser_configuration=LASERS,
         dcs_to_motor=lambda values: tuple(values),
     )
     updates = {

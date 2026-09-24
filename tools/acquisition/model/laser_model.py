@@ -256,15 +256,15 @@ class LaserModel(ObservableObject):
             self.trace_received(self._make_pulse_trace(channel_pulse))
         return operation
 
-    def prepare_pulse_profile(self, profile, recipe):
+    def prepare_pulse_profile(self, profile, firing, recipe):
         """Resolve a frozen protocol profile into one pre-armed finite output."""
-        route = getattr(profile.trigger_route, "value", profile.trigger_route)
+        route = firing.trigger_route.value
         hardware_trigger = route == "hardware_stim3"
         direct_start = route == "direct_ni_software"
         if not hardware_trigger and not direct_start:
             raise ValueError(f"Unsupported protocol laser trigger route: {route}")
         pulse = LaserPulseTrain(
-            channel_id=LaserChannelId(int(profile.channel_id)),
+            channel_id=LaserChannelId(int(firing.channel_id)),
             amplitude_volts=float(profile.amplitude_volts),
             duration_ms=float(profile.pulse_duration_ms),
             pulse_count=int(profile.pulse_count),
@@ -287,12 +287,12 @@ class LaserModel(ObservableObject):
             "trial_operation_id": recipe.operation_id,
             "profile_id": profile.profile_id,
             "profile_revision": profile.revision,
-            "laser_channel_id": int(profile.channel_id),
+            "laser_channel_id": int(firing.channel_id),
             "trigger_route": route,
         }
         synchronized = LaserSynchronizedPulseTrain(
             pulse_trains=(pulse,),
-            trigger_source=(profile.trigger_terminal if hardware_trigger else None),
+            trigger_source=(firing.trigger_terminal if hardware_trigger else None),
             wait=False,
             defer_start=direct_start,
             operation_context=operation_context,

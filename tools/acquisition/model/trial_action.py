@@ -38,6 +38,7 @@ from tools.acquisition.model.cue_timing import (
     CueTimingConfiguration,
     CueTimingPolicy,
 )
+from tools.acquisition.model.laser_firing import LaserFiring, amplitude_refusal, resolve_laser_firing
 from tools.acquisition.model.reach_state_source import ReachStateResolver
 
 from tools.acquisition.model.trial_protocol_schedule import (
@@ -307,6 +308,7 @@ class CompiledTrialRecipe:
     stimulus_trigger_seed: Optional[int] = None
     stimulus_trigger_draw: Optional[float] = None
     stimulus_trigger_selection: Optional[Mapping[str, object]] = None
+    laser_firing: Optional[LaserFiring] = None
 
     def to_record(self):
         return {
@@ -326,6 +328,7 @@ class CompiledTrialRecipe:
             "stimulus_draw": self.stimulus_draw,
             "tone_profile": None if self.tone_profile is None else self.tone_profile.to_record(),
             "laser_profile": None if self.laser_profile is None else self.laser_profile.to_record(),
+            "laser_firing": None if self.laser_firing is None else self.laser_firing.to_record(),
             "cue_tone_profile": (
                 None
                 if self.cue_tone_profile is None
@@ -366,12 +369,14 @@ class TrialActionCompiler:
         laser_profiles: Mapping[str, LaserPulseProfile] = None,
         cue_interval_profiles: Mapping[str, CueIntervalProfile] = None,
         stimulus_trigger_profiles: Mapping[str, StimulusTriggerProfile] = None,
+        laser_configuration=None,
         dcs_to_motor: Callable[[Tuple[float, float, float]], Tuple[float, float, float]],
     ):
         self._tone_profiles = dict(tone_profiles or {})
         self._laser_profiles = dict(laser_profiles or {})
         self._cue_interval_profiles = dict(cue_interval_profiles or {})
         self._stimulus_trigger_profiles = dict(stimulus_trigger_profiles or {})
+        self._laser_configuration = laser_configuration
         self._dcs_to_motor = dcs_to_motor
 
     def compile(self, row: TrialProtocolRow, context: TrialCompileContext):
@@ -527,21 +532,29 @@ class TrialActionCompiler:
                 resolved_offset_ms = 0
 
         laser = None
+        firing = None
         if row.laser_profile_id:
             laser = self._laser_profiles.get(row.laser_profile_id)
             if laser is None:
                 raise ValueError(f"Unknown laser profile {row.laser_profile_id!r}")
-            if laser.trigger_route is not row.laser_trigger_route:
-                raise ValueError("Protocol row and laser profile trigger routes differ")
+            if self._laser_configuration is None:
+                raise ValueError("Laser rows need the laser configuration to compile")
+            firing = resolve_laser_firing(
+                self._laser_configuration, row.laser_channel_id, row.laser_trigger_route)
+            refusal = amplitude_refusal(
+                laser, self._laser_configuration.get_channel(firing.channel_id))
+            if refusal:
+                raise ValueError(refusal)
             if (
                 resolved_trigger is StimulusTrigger.PRE_REVEAL
-                and int(laser.trigger_pulse_us) >= resolved_offset_ms * 1000
+                and firing.trigger_pulse_us >= resolved_offset_ms * 1000
             ):
                 raise ValueError(
                     "Pre-reveal interval must be longer than the STIM3 trigger pulse"
                 )
         if not selected:
             laser = None
+            firing = None
 
         return CompiledTrialRecipe(
             operation_id=str(uuid.uuid4()),
@@ -571,6 +584,7 @@ class TrialActionCompiler:
             stimulus_trigger_seed=stimulus_trigger_seed,
             stimulus_trigger_draw=stimulus_trigger_draw,
             stimulus_trigger_selection=stimulus_trigger_selection,
+            laser_firing=firing,
         )
 
 
@@ -758,7 +772,7 @@ class TrialActionExecutor:
                 self._laser_handle = self._prepare_laser(recipe.laser_profile, recipe)
                 self._snapshot_laser_action()
                 self._observe(
-                    "laser prepared: " + recipe.laser_profile.trigger_route.value
+                    "laser prepared: " + recipe.laser_firing.trigger_route.value
                 )
                 if row["laser_phase"] == "before_send":
                     self._trigger_laser_if_direct("before_send")
@@ -826,21 +840,22 @@ class TrialActionExecutor:
             operation = self._require_operation(operation_id)
             operation.require_generation(generation)
             profile = operation.recipe.laser_profile
-            if profile is None:
+            firing = operation.recipe.laser_firing
+            if profile is None or firing is None:
                 raise RuntimeError("Stimulus trigger has no prepared laser profile")
-            if profile.trigger_route is LaserTriggerRoute.DIRECT_NI_SOFTWARE:
+            if firing.trigger_route is LaserTriggerRoute.DIRECT_NI_SOFTWARE:
                 self._trigger_laser_if_direct(detail)
                 self._observe(f"{detail} direct NI trigger accepted")
-            elif profile.trigger_route is LaserTriggerRoute.HARDWARE_STIM3:
+            elif firing.trigger_route is LaserTriggerRoute.HARDWARE_STIM3:
                 self._trigger_hardware_stimulus(profile, operation.recipe, detail)
                 self._observe(f"{detail} firmware STIM3 trigger acknowledged")
             else:
-                raise RuntimeError(f"Unsupported stimulus route: {profile.trigger_route}")
+                raise RuntimeError(f"Unsupported stimulus route: {firing.trigger_route}")
 
     def _trigger_laser_if_direct(self, detail):
         operation = self._require_current()
-        profile = operation.recipe.laser_profile
-        if profile is None or profile.trigger_route is not LaserTriggerRoute.DIRECT_NI_SOFTWARE:
+        firing = operation.recipe.laser_firing
+        if firing is None or firing.trigger_route is not LaserTriggerRoute.DIRECT_NI_SOFTWARE:
             return False
         trigger = getattr(self._laser_handle, "trigger", None)
         if trigger is None:
