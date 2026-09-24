@@ -212,6 +212,7 @@ from tools.acquisition.model.trial_protocol_set import (
 from tools.acquisition.model.stim_bench_test import (
     BenchRecipe,
     StimTestResult,
+    bench_wait_seconds,
     refuse_reason,
 )
 from tools.acquisition.model.stimulus_profile_repository import (
@@ -5253,7 +5254,7 @@ class AppModel(ObservableObject):
                 )
             timeout = max(3.0, profile.trigger_pulse_us / 1e6 + 2.0)
             self._hardware.wait_pending_command_acked(token, timeout=timeout)
-            completed = finished.wait(timeout)
+            completed = finished.wait(bench_wait_seconds(profile))
             elapsed_ms = (time.perf_counter() - started) * 1000.0
         except Exception:
             # Never leave an armed analog output behind on a failed test.
