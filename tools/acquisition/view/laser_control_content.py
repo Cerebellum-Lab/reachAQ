@@ -212,8 +212,9 @@ class _LaserChannelTab(QWidget):
         # used to switch to external whenever one was configured, so Run pulse
         # armed the output for a board STIM pulse that nothing on this tab
         # sends, and failed with a DAQmx timeout (christielab10, 2026-09-24).
-        # The route stays filled in for choosing external deliberately; Test
-        # stim and saved profiles set their own trigger.
+        # The route stays filled in for choosing external deliberately. Test
+        # stim and protocol trials take the trigger from the profile, and
+        # loading a profile here does not change it.
         self._trigger_source = QLineEdit(channel.trigger_source or "")
         self._trigger_source.setPlaceholderText("NI-DAQ trigger route")
         self._trigger_edge = QComboBox()
@@ -982,9 +983,6 @@ class _LaserChannelTab(QWidget):
             self._post_stim_ms,
             self._pulse_count,
             self._frequency_hz,
-            self._trigger_mode,
-            self._trigger_source,
-            self._trigger_edge,
         )
         for control in controls:
             control.blockSignals(True)
@@ -998,14 +996,15 @@ class _LaserChannelTab(QWidget):
             # where it is keeps the value the count would fall back to.
             if profile.frequency_hz:
                 self._frequency_hz.setValue(float(profile.frequency_hz))
-            terminal = profile.trigger_terminal or ""
-            self._trigger_source.setText(terminal)
-            self._trigger_mode.setCurrentText(
-                "external" if terminal else "internal")
+            # The waveform only. This also set the trigger to the profile's
+            # terminal and switched to external, and every saved profile names
+            # a board STIM terminal - so picking one for Test stim left Run
+            # Pulse waiting for a board pulse it never sends, until DAQmx timed
+            # out (christielab10, 2026-09-24). Test stim reads the profile's
+            # trigger itself.
         finally:
             for control in controls:
                 control.blockSignals(False)
-        self._refresh_trigger_mode_enabled()
         self._refresh_preview()
 
     def _run_stim_test(self) -> None:
