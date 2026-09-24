@@ -28,13 +28,15 @@ def qapp():
     return app
 
 
-def make_tab(app_model, channel_id=LaserChannelId.LASER_1, trigger_source=None):
+def make_tab(app_model, channel_id=LaserChannelId.LASER_1, trigger_source=None,
+             board_stim_line=None):
     channel = LaserChannelConfiguration(
         channel_id=channel_id,
         analog_output="/Dev1/ao0",
         diode_input="/Dev1/ai0",
         shutter_output="/Dev1/port0/line0",
         trigger_source=trigger_source,
+        board_stim_line=board_stim_line,
     )
     started = []
     statuses = []
@@ -74,6 +76,15 @@ def test_run_pulse_is_internal_even_when_the_channel_has_a_trigger_route(qapp, a
     assert tab._build_pulse_train().trigger_source == "/Dev1/PXI_Trig0"
 
 
+def test_the_board_route_is_unavailable_without_the_lasers_board_wiring(qapp, app_model):
+    tab, _started, _statuses = make_tab(app_model, trigger_source=None)
+
+    board = tab._stim_route.findData("hardware_stim3")
+
+    assert not tab._stim_route.model().item(board).isEnabled()
+    assert tab._stim_route.currentData() == "direct_ni_software"
+
+
 def test_running_a_stim_test_with_no_profile_selected_reports_rather_than_fires(
     channel_tab,
 ):
@@ -87,19 +98,25 @@ def test_running_a_stim_test_with_no_profile_selected_reports_rather_than_fires(
     assert statuses[-1][1] is True
 
 
-def test_running_a_stim_test_starts_a_background_operation(channel_tab, app_model):
-    tab, started, _statuses = channel_tab
+def test_running_a_stim_test_starts_a_background_operation(app_model, qapp, monkeypatch):
+    tab, started, _statuses = make_tab(
+        app_model, trigger_source="/Dev1/PXI_Trig0", board_stim_line=3)
     tab.stim_profile_selector.clear()
     tab.stim_profile_selector.addItem("stim-a", "stim-a")
     tab.stim_profile_selector.setCurrentIndex(0)
+    monkeypatch.setattr(
+        type(app_model), "laser_profile",
+        lambda _self, profile_id: a_profile(profile_id="stim-a"))
     calls = []
-    app_model.run_stim_bench_test = lambda profile_id: calls.append(profile_id)
+    app_model.run_stim_bench_test = (
+        lambda profile, channel_id, route: calls.append(
+            (profile.profile_id, channel_id, route)))
 
     tab._run_stim_test()
 
     assert len(started) == 1
     started[0][1]()
-    assert calls == ["stim-a"]
+    assert calls == [("stim-a", 1, "hardware_stim3")]
 
 
 def with_laser_profiles(monkeypatch, app_model, profiles):

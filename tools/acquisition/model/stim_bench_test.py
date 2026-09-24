@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import dataclasses
 import uuid
-from typing import Iterable, Optional, Sequence
+from typing import Iterable, Optional
 
 from tools.acquisition.model.trial_protocol_schedule import LaserTriggerRoute
 
@@ -46,7 +46,7 @@ class StimTestResult:
     trigger_pulse_us: int
     arm_to_terminal_ms: Optional[float]
     detail: str = ""
-    stim_line: int = 3
+    stim_line: Optional[int] = None
     trigger_route: str = LaserTriggerRoute.HARDWARE_STIM3.value
 
     def __str__(self) -> str:
@@ -85,7 +85,7 @@ _WAIT_MARGIN_SECONDS = 2.0
 _MINIMUM_WAIT_SECONDS = 3.0
 
 
-def bench_wait_seconds(profile) -> float:
+def bench_wait_seconds(profile, firing) -> float:
     """How long a bench test waits for the profile's waveform to finish.
 
     This was max(3 s, trigger pulse + 2 s), which ignored the waveform, so a
@@ -94,24 +94,26 @@ def bench_wait_seconds(profile) -> float:
     """
     return max(
         _MINIMUM_WAIT_SECONDS,
-        profile.trigger_pulse_us / 1e6 + profile.waveform_seconds + _WAIT_MARGIN_SECONDS,
+        firing.trigger_pulse_us / 1e6 + profile.waveform_seconds + _WAIT_MARGIN_SECONDS,
     )
 
 
 def refuse_reason(
     *,
     profile,
+    firing,
     recording_status_value: str,
     trial_operation_active: bool,
     laser_backend: str,
-    configured_channel_ids: Sequence[int],
     firmware_capabilities: Iterable[str],
 ) -> Optional[str]:
     """Return why this bench test must not run, or None when it may.
 
     Every branch here is a safety gate. A bench test drives a real laser, so it
     refuses rather than guesses whenever the rig is not in a state where an
-    unexpected pulse is harmless.
+    unexpected pulse is harmless. The route, terminal and channel wiring are
+    resolve_laser_firing's to refuse; this only judges the profile against the
+    firing it resolved to.
     """
     if profile is None:
         return "Select a saved laser profile to test."
@@ -124,22 +126,7 @@ def refuse_reason(
             "Stim test needs the nidaq laser backend; this rig is configured "
             "for {!r}.".format(laser_backend)
         )
-    software_start = profile.trigger_route is LaserTriggerRoute.DIRECT_NI_SOFTWARE
-    if not software_start and profile.trigger_route is not LaserTriggerRoute.HARDWARE_STIM3:
-        return (
-            "Profile {} uses the {} route, which the bench test cannot "
-            "start.".format(profile.profile_id, profile.trigger_route.value)
-        )
-    if not software_start and not profile.trigger_terminal:
-        return (
-            "Profile {} has no NI trigger terminal, so the board pulse has "
-            "nothing to trigger.".format(profile.profile_id)
-        )
-    if int(profile.channel_id) not in {int(item) for item in configured_channel_ids}:
-        return "Laser channel {} has no hardware mapping.".format(
-            int(profile.channel_id)
-        )
-    if software_start:
+    if not firing.is_board_trigger:
         # The board takes no part in a software start.
         return None
     reported = set(firmware_capabilities)
