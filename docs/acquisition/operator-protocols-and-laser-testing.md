@@ -29,23 +29,16 @@ instead of copied into every protocol.
 
 ## Step 1: create the profiles a trial will use
 
-In the **Protocol** tab, the buttons along the top row. Each opens a short chain
-of prompts and saves into the profile library.
+In the **Protocol** tab, the buttons along the top row open a short chain of
+prompts and save into the profile library.
 
 - **New tone** — profile id, frequency, duration.
-- **New laser** — profile id, laser channel, amplitude, pulse duration, pulse
-  count, and if the count is above one, frequency. Then the trigger route:
-  - **Hardware STIM3** — the board emits a timed pulse that starts an NI analog
-    output already armed on a trigger terminal. You then pick the NI trigger
-    terminal and the **board stimulus line**, STIM2 or STIM3.
-  - **Direct NI software start** — the host starts the waveform itself. No board
-    trigger, so no terminal to pick.
 - **New auto shift** — the automatic pellet-shift policy.
 
-A laser channel must exist before you can make a laser profile. If the button
-refuses with *"Configure at least one laser channel in Edit DAQ Ports first"*,
-set the channels up there. Same for the trigger terminal: hardware-route
-profiles need a trigger input configured in Edit DAQ Ports.
+A laser pulse profile is not made here. Build it on the **Pulse Builder** tab
+in **Laser Control** — see Part 2. A profile there is the pulse train and
+nothing else; which laser fires it, and how, is chosen later, wherever the
+profile is used — including in a protocol row, below.
 
 ## Step 2: create a protocol
 
@@ -73,9 +66,17 @@ The columns that matter most:
 | Cover | whether the pellet is covered or revealed |
 | Tone profile / Tone phase | Tone 1, and when in the cycle it fires |
 | Cue tone / Cue interval / Cue fixed | Tone 2 and its delay after Tone 1 |
-| Laser profile / Laser phase / Laser route | which laser pulse, when, and how it is triggered |
+| Laser profile / Laser / Laser phase / Laser route | which laser pulse, which laser fires it, when, and how it is triggered |
 | Assignment / Stim % / Trigger | whether and how often the stimulus fires, and what triggers it |
 | Retry | what happens on a failed attempt |
+
+Picking a profile in **Laser profile** for a row with no laser action yet fills
+in the rest of the action: **Laser phase** `pellet_presentation`, **Laser
+route** `hardware_stim3`, and **Laser** the first configured laser that has
+both a trigger terminal and a board STIM line (or the first laser, if none
+qualifies). Change any of those cells afterward as needed. Clearing **Laser
+profile** clears the whole action. **Laser** itself lists every configured
+channel (`Laser 1`, `Laser 2`, ...) or `None`.
 
 For anything repetitive, use the edit bar rather than typing each cell:
 
@@ -161,10 +162,34 @@ Three things must be true, and each has its own failure message if it is not.
 1. The laser backend is `nidaq` in the system configuration. At startup the log
    line *"laser not in use"* means it is disabled and every test will refuse.
 2. The laser channel is mapped in **Edit DAQ Ports** — analog output, diode
-   input, shutter output at minimum.
-3. For Test stim, a saved laser profile for the channel. A board STIM profile
-   also needs the channel's NI trigger terminal; a software-start profile does
-   not.
+   input, shutter output at minimum. The board STIM route also needs that
+   channel's NI trigger terminal (`triggerSource`) and its `boardStimLine`, set
+   in the system configuration next to the port mapping — not on the profile.
+3. For Test stim, a saved laser profile, or a valid Pulse Builder draft. Any
+   profile fits any laser: nothing about a profile ties it to one channel.
+
+## Building a pulse train: the Pulse Builder tab
+
+Open **Laser Control**. The first tab, before *Laser 1*, *Laser 2* and so on,
+is **Pulse Builder** — every profile is made here, and nowhere else.
+
+- **Profile:** lists *(new profile)* and every saved profile, as
+  `profile_id — summary`. Selecting one loads its controls. **Delete** asks you
+  to confirm, and is refused, naming the protocols, when one still uses the
+  profile: *"Profile 'x' is used by: some-protocol"*.
+- The controls shape the train: **Amplitude**, **Pulse width**, **Baseline**,
+  **Post-stim**, **Count**, **Frequency**, **PMT open lead**, **PMT close
+  lag**. Amplitude here is limited to the widest range any configured laser
+  accepts; the laser that actually fires the profile checks its own range.
+- The preview plot and the status line under it show the waveform when it is
+  valid, or the reason it is not — for example a pulse width that exceeds the
+  period at the chosen frequency.
+- **Save profile…** asks for a name only. Reusing an existing profile's name
+  saves a new revision of it. Nothing about which laser fires it, or how, is
+  asked or stored here.
+- Whatever is on the controls, saved or not, is the **builder draft**. A laser
+  tab can fire the draft directly, so you can shape a train and try it without
+  saving a revision for every change.
 
 ## The two tests, and what each one proves
 
@@ -172,14 +197,19 @@ Open the **Laser Control** tab. There is one sub-tab per configured channel,
 *Laser 1*, *Laser 2* and so on, each with **Pulse**, **Calibration** and
 **Output** pages.
 
+On the **Pulse** page, **Profile:** picks what fires on this laser: *(builder
+draft)* or any saved profile, unfiltered — a profile made with one laser in
+mind fires just as well on another. The summary line under it reads the picked
+train, such as *"1 V · 500 × 1 ms at 100 Hz · 5.00 s"*, or says the draft is
+not a valid pulse train.
+
 ### Run Pulse — proves the analog output works
 
-On the **Pulse** page, set amplitude, duration, count, frequency and the shutter
-options, then press **Run Pulse**. The host writes the waveform to the analog
-output directly.
+Set **Trigger Mode**, the shutter and PMT options, then press **Run Pulse**.
+The host writes the picked profile's waveform to the analog output directly.
 
-- **Success:** the status line reads *"Pulse complete: laser 1"*, the preview
-  plot matches what you asked for, and the trace shows the diode responding.
+- **Success:** the status line reads *"Pulse complete: laser 1"*, and the
+  trace shows the diode responding.
 - **What it does not prove:** anything about the board. This path never touches
   the pellet board, so it cannot tell you whether a trial's trigger would work.
 
@@ -190,52 +220,46 @@ an edge on **Trigger Source**. Nothing on this page sends that edge, so use
 pulse fails after the train length plus five seconds with *Wait Until Done did
 not indicate that the task was done*.
 
-Picking a profile in **Stim profile** loads its waveform (amplitude, duration,
+Picking a profile in **Profile:** loads its waveform (amplitude, duration,
 count, frequency, baseline, post-stim) into this page, so Run Pulse fires that
-waveform. It does not change Trigger Mode or Trigger Source. Test stim takes
-its trigger from the profile and does not use this selector.
-
-**Save profile** stores the waveform on this page as a profile and asks for:
-
-- a **name** (a loaded profile's name saves a new revision of it);
-- the **trigger route**, how a trial and Test stim start it. *Board STIM*
-  arms on this laser's trigger terminal from Edit DAQ Ports (on christielab10,
-  `/PXI1Slot4/PXI_Trig0` for laser 1 and `/PXI1Slot4/PXI_Trig2` for laser 2),
-  and the board's pulse starts it. *Software start* is started by the host;
-  in a trial that is the stim camera's detector. Board STIM is unavailable for
-  a laser with no trigger terminal;
-- for Board STIM, the **board line** wired to this laser's trigger input
-  (STIM3 for laser 1 and STIM2 for laser 2 on christielab10).
-
-The route and line start from the loaded profile, or from this laser's other
-saved profiles. Trigger Mode is not used: it only decides how Run Pulse
-starts.
+waveform. It does not change Trigger Mode or Trigger Source.
 
 ### Test stim — proves the trial path
 
-Below Run Pulse, pick a saved profile in **Stim profile** and press **Test
-stim**. The selector lists only profiles targeting this channel. It is
-available once the system is running, and refused while a session records.
+Below Run Pulse, pick a profile in **Profile:**, pick a route in **Route:**,
+and press **Test stim**. It is available once the system is running, and
+refused while a session records.
 
-This runs the profile the way a trial does, by the profile's trigger route:
+**Route:** offers:
 
-- **Board STIM** (`hardware_stim3`): arms the analog output on the profile's
-  trigger terminal, then asks the board for its timed pulse on the profile's
-  stimulus line, which is what starts the waveform. Success reads *"Stim test
-  stim-a on laser 1: STIM3 pulse 1000 us started the waveform on
+- **Board STIM (STIMn → terminal)** — built from this laser's own
+  configuration: its board line (`boardStimLine`) and its trigger terminal
+  (`triggerSource`; on christielab10, `/PXI1Slot4/PXI_Trig0` for laser 1 and
+  `/PXI1Slot4/PXI_Trig2` for laser 2). Disabled, with the reason in its
+  tooltip — *"This laser has no trigger terminal or board STIM line
+  configured"* — when either is missing, and **Software start** is picked for
+  you instead.
+- **Software start** — the host starts the waveform itself, the same start a
+  trial's stim-camera detector makes. The camera itself is not part of the
+  test.
+
+This runs the picked profile the way a trial does: arms the analog output,
+then starts it by the chosen route.
+
+- **Board STIM:** arms the output on the terminal, then asks the board for its
+  timed pulse on the board line, which starts the waveform. Success reads
+  *"Stim test stim-a on laser 1: STIM3 pulse 1000 us started the waveform on
   /PXI1Slot4/PXI_Trig0, arm to terminal 5003.42 ms"*, the interval running to
   the end of the waveform.
-- **Software start** (`direct_ni_software`): arms the analog output, then
-  starts it from the host, which is the start a trial's stim camera makes when
-  its detector fires. The camera itself is not part of the test. Success reads
-  *"Stim test stim-s on laser 2: software start, waveform finished 5002.10 ms
-  after the start request"*.
+- **Software start:** arms the output, then starts it from the host. Success
+  reads *"Stim test stim-s on laser 2: software start, waveform finished
+  5002.10 ms after the start request"*.
 
 The test waits for the whole waveform, so a 5 s burst takes about 5 s.
 
-The definitive check for a board STIM profile is a scope: trigger on the STIM
-line and confirm the analog output rises on that edge, not when you pressed
-the button. The status line alone cannot distinguish the two.
+The definitive check for the board route is a scope: trigger on the STIM line
+and confirm the analog output rises on that edge, not when you pressed the
+button. The status line alone cannot distinguish the two.
 
 ## What failure looks like
 
@@ -243,20 +267,22 @@ Every refusal names its reason in the status line and fires nothing.
 
 | Message | Meaning |
 | --- | --- |
-| *Select a saved laser profile for laser N first* | the Stim profile selector is empty or unset. No profile targets this channel: make one with **New laser**. |
+| *Select a saved profile for laser N, or build a valid draft in the Pulse Builder* | the Profile picker is on the draft and the draft is not valid, or nothing usable is selected. |
 | *Stim test is refused while a session is recording* | stop the session first. |
 | *Stim test is refused while a trial operation is prepared or active* | a trial is mid-flight. Wait for it. |
 | *Stim test needs the nidaq laser backend; this rig is configured for 'disabled'* | the laser is off in the system configuration. |
-| *Profile X has no NI trigger terminal, so the board pulse has nothing to trigger* | a board STIM profile without a terminal. Set the terminal in Edit DAQ Ports and re-create the profile. |
-| *Laser channel N has no hardware mapping* | the channel is not configured in Edit DAQ Ports. |
+| *Laser N has no trigger terminal; set it in Edit DAQ Ports* | Board STIM chosen, but this laser has no trigger terminal configured. Route already disables Board STIM in this case. |
+| *Laser N has no board STIM line; set boardStimLine for it in the system configuration* | Board STIM chosen, but this laser has no `boardStimLine` set. Route already disables Board STIM in this case. |
+| *Profile X is Y V; laser N accepts low..high V* | the profile's amplitude does not fit this laser's command range. Pick a different laser, or edit the profile in the Pulse Builder. |
+| *Laser N has no hardware channel in the system configuration* | the channel is not configured in Edit DAQ Ports. |
 | *The pellet firmware reports its capabilities and finite_stim3_pulse is not among them* | the board says it cannot pulse. |
 
 ## Firmware requirement
 
-Test stim with a board STIM profile needs pellet firmware **v2.2.0 or later**
-(a software-start profile does not use the board). That is the
-first release to implement the finite pulse command; every release through
-v2.1.0 has no handler for it.
+Test stim on the Board STIM route needs pellet firmware **v2.2.0 or later**
+(Software start does not use the board). That is the first release to
+implement the finite pulse command; every release through v2.1.0 has no
+handler for it.
 
 On v2.1.0 or earlier the board does not acknowledge the request, so the test
 fails after about three seconds with a timeout naming the command token rather

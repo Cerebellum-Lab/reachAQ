@@ -119,6 +119,19 @@ inference: !InferenceConfiguration
 laser: !LaserSystemConfiguration
   # The PXI-6713 has analog outputs but no analog inputs. Keep laser feedback disabled
   # until a supported analog-input device is configured for diode/command-copy inputs.
+  # Each channel also carries its own board wiring, next to triggerSource:
+  # boardStimLine (2 or 3) is the board line wired to that laser's trigger
+  # input, and boardTriggerPulseUs (100..5000000, default 1000) is the width
+  # of the board STIM pulse that starts it. Example channel, for reference:
+  # channels:
+  # - !LaserChannelConfiguration
+  #   channelId: 1
+  #   analogOutput: PXI1Slot4/ao0
+  #   diodeInput: PXI1Slot5/ai0
+  #   shutterOutput: PXI1Slot4/port0/line0
+  #   triggerSource: /PXI1Slot4/PXI_Trig0
+  #   boardStimLine: 3
+  #   boardTriggerPulseUs: 1000
   backend: disabled
   hardwareTimed: false
   sampleRateHz: null
