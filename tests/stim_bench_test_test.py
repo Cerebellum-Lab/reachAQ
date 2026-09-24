@@ -84,18 +84,31 @@ def test_a_board_that_reports_no_capabilities_at_all_is_allowed():
     assert refuse_reason(**allowed(firmware_capabilities=())) is None
 
 
-def test_a_direct_software_profile_refuses_the_test():
+def test_a_software_start_profile_is_allowed_without_a_terminal_or_the_board():
+    # A software start involves neither the trigger terminal nor the board,
+    # so neither may refuse it.
     reason = refuse_reason(
         **allowed(
             profile=make_profile(
                 trigger_route=LaserTriggerRoute.DIRECT_NI_SOFTWARE,
                 trigger_terminal="",
-            )
+            ),
+            firmware_capabilities=("time_sync",),
         )
     )
 
+    assert reason is None
+
+
+def test_a_board_profile_without_a_terminal_is_still_refused():
+    # Built directly, since the profile itself refuses to exist without one.
+    profile = make_profile()
+    object.__setattr__(profile, "trigger_terminal", "")
+
+    reason = refuse_reason(**allowed(profile=profile))
+
     assert reason is not None
-    assert "hardware" in reason.lower()
+    assert "terminal" in reason
 
 
 def test_a_missing_profile_refuses_the_test():
@@ -150,6 +163,23 @@ def test_the_result_says_so_when_no_timing_was_measured():
     )
 
     assert "did not report terminal" in str(result)
+
+
+def test_a_software_start_result_says_it_was_started_from_the_host():
+    result = StimTestResult(
+        profile_id="stim-s",
+        channel_id=2,
+        trigger_terminal="",
+        trigger_pulse_us=1000,
+        arm_to_terminal_ms=5012.0,
+        detail="completed",
+        trigger_route="direct_ni_software",
+    )
+
+    text = str(result)
+    assert "software start" in text
+    assert "STIM" not in text
+    assert "5012.00 ms" in text
 
 
 def test_a_profile_knows_how_long_its_waveform_runs():

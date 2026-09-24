@@ -5210,11 +5210,12 @@ class AppModel(ObservableObject):
         self._hardware.wait_pending_command_acked(token, timeout=timeout)
 
     def run_stim_bench_test(self, profile_id: str) -> StimTestResult:
-        """Fire one saved laser profile through the real hardware trigger.
+        """Fire one saved laser profile the way a trial would, off any session.
 
-        Arms the analog output on the profile's trigger terminal, then asks the
-        board for its firmware-timed STIM3 pulse, which is what starts the
-        waveform. This is the route a trial takes, exercised without a session.
+        Arms the analog output as a trial does, then starts it by the profile's
+        route: on hardware_stim3 the board's firmware-timed STIM pulse into the
+        trigger terminal starts the waveform; on direct_ni_software the host
+        starts it, which is the start a trial's stim-camera trigger makes.
 
         The channel comes from the profile rather than the caller, so a caller
         cannot fire one profile's waveform at another channel.
@@ -5243,17 +5244,23 @@ class AppModel(ObservableObject):
         add_terminal_callback = getattr(prepared, "add_terminal_callback", None)
         if add_terminal_callback is not None:
             add_terminal_callback(lambda _operation: finished.set())
+        software_start = (
+            profile.trigger_route is LaserTriggerRoute.DIRECT_NI_SOFTWARE
+        )
         started = time.perf_counter()
         try:
-            token = self._hardware.pulse_stim(
-                int(profile.trigger_pulse_us), stim_line=profile.stim_line
-            )
-            if token is None:
-                raise RuntimeError(
-                    "Firmware STIM{} pulse was not queued".format(profile.stim_line)
+            if software_start:
+                prepared.trigger()
+            else:
+                token = self._hardware.pulse_stim(
+                    int(profile.trigger_pulse_us), stim_line=profile.stim_line
                 )
-            timeout = max(3.0, profile.trigger_pulse_us / 1e6 + 2.0)
-            self._hardware.wait_pending_command_acked(token, timeout=timeout)
+                if token is None:
+                    raise RuntimeError(
+                        "Firmware STIM{} pulse was not queued".format(profile.stim_line)
+                    )
+                timeout = max(3.0, profile.trigger_pulse_us / 1e6 + 2.0)
+                self._hardware.wait_pending_command_acked(token, timeout=timeout)
             completed = finished.wait(bench_wait_seconds(profile))
             elapsed_ms = (time.perf_counter() - started) * 1000.0
         except Exception:
@@ -5275,8 +5282,11 @@ class AppModel(ObservableObject):
             detail=(
                 "completed"
                 if completed
+                else "started, but the waveform did not report terminal"
+                if software_start
                 else "board acknowledged but the waveform did not report terminal"
             ),
+            trigger_route=profile.trigger_route.value,
         )
 
     def _on_stim_camera_trigger(self, camera_index, decision) -> None:

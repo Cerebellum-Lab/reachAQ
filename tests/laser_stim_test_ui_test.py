@@ -55,7 +55,8 @@ def channel_tab(qapp, app_model):
 def test_the_channel_tab_offers_a_stim_test_control(channel_tab):
     tab, _started, _statuses = channel_tab
 
-    assert tab.stim_test_button.text() == "Test stim (hardware trigger)"
+    # Not "(hardware trigger)": a software-start profile is tested too.
+    assert tab.stim_test_button.text() == "Test stim"
 
 
 def test_run_pulse_is_internal_even_when_the_channel_has_a_trigger_route(qapp, app_model):

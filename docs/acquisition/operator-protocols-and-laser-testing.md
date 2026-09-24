@@ -162,8 +162,9 @@ Three things must be true, and each has its own failure message if it is not.
    line *"laser not in use"* means it is disabled and every test will refuse.
 2. The laser channel is mapped in **Edit DAQ Ports** — analog output, diode
    input, shutter output at minimum.
-3. For a hardware-triggered test, the channel needs an NI trigger terminal and a
-   saved laser profile on the **Hardware STIM3** route.
+3. For Test stim, a saved laser profile for the channel. A board STIM profile
+   also needs the channel's NI trigger terminal; a software-start profile does
+   not.
 
 ## The two tests, and what each one proves
 
@@ -194,22 +195,31 @@ count, frequency, baseline, post-stim) into this page, so Run Pulse fires that
 waveform. It does not change Trigger Mode or Trigger Source. Test stim takes
 its trigger from the profile and does not use this selector.
 
-### Test stim (hardware trigger) — proves the whole trial path
+### Test stim — proves the trial path
 
-Below Run Pulse, pick a saved profile in **Stim profile** and press **Test stim
-(hardware trigger)**. The selector lists only profiles targeting this channel.
+Below Run Pulse, pick a saved profile in **Stim profile** and press **Test
+stim**. The selector lists only profiles targeting this channel. It is
+available once the system is running, and refused while a session records.
 
-This does what a trial does: arms the analog output on the profile's trigger
-terminal, then asks the board for its timed pulse on the profile's stimulus
-line, which is what starts the waveform.
+This runs the profile the way a trial does, by the profile's trigger route:
 
-- **Success:** the status line reads
-  *"Stim test stim-a on laser 1: STIM3 pulse 1000 us started the waveform on
-  /Dev1/PFI0, arm to terminal 3.42 ms"*. The laser fires. The measured interval
-  is stable across repeated presses.
-- **The definitive check** is a scope: trigger on the STIM line and confirm the
-  analog output rises on that edge, not when you pressed the button. The status
-  line alone cannot distinguish the two.
+- **Board STIM** (`hardware_stim3`): arms the analog output on the profile's
+  trigger terminal, then asks the board for its timed pulse on the profile's
+  stimulus line, which is what starts the waveform. Success reads *"Stim test
+  stim-a on laser 1: STIM3 pulse 1000 us started the waveform on
+  /PXI1Slot4/PXI_Trig0, arm to terminal 5003.42 ms"*, the interval running to
+  the end of the waveform.
+- **Software start** (`direct_ni_software`): arms the analog output, then
+  starts it from the host, which is the start a trial's stim camera makes when
+  its detector fires. The camera itself is not part of the test. Success reads
+  *"Stim test stim-s on laser 2: software start, waveform finished 5002.10 ms
+  after the start request"*.
+
+The test waits for the whole waveform, so a 5 s burst takes about 5 s.
+
+The definitive check for a board STIM profile is a scope: trigger on the STIM
+line and confirm the analog output rises on that edge, not when you pressed
+the button. The status line alone cannot distinguish the two.
 
 ## What failure looks like
 
@@ -221,14 +231,14 @@ Every refusal names its reason in the status line and fires nothing.
 | *Stim test is refused while a session is recording* | stop the session first. |
 | *Stim test is refused while a trial operation is prepared or active* | a trial is mid-flight. Wait for it. |
 | *Stim test needs the nidaq laser backend; this rig is configured for 'disabled'* | the laser is off in the system configuration. |
-| *Profile X uses the direct_ni_software route; the bench test drives the hardware STIM3 route only* | that profile starts the waveform from the host. Use **Run Pulse** for it, or make a hardware-route profile. |
-| *Profile X has no NI trigger terminal, so the board pulse has nothing to trigger* | set the terminal in Edit DAQ Ports and re-create the profile. |
+| *Profile X has no NI trigger terminal, so the board pulse has nothing to trigger* | a board STIM profile without a terminal. Set the terminal in Edit DAQ Ports and re-create the profile. |
 | *Laser channel N has no hardware mapping* | the channel is not configured in Edit DAQ Ports. |
 | *The pellet firmware reports its capabilities and finite_stim3_pulse is not among them* | the board says it cannot pulse. |
 
 ## Firmware requirement
 
-The hardware stim test needs pellet firmware **v2.2.0 or later**. That is the
+Test stim with a board STIM profile needs pellet firmware **v2.2.0 or later**
+(a software-start profile does not use the board). That is the
 first release to implement the finite pulse command; every release through
 v2.1.0 has no handler for it.
 

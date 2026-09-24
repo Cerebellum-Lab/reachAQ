@@ -1,8 +1,10 @@
 """Fire one saved laser profile on the bench, off any recording session.
 
-The board emits its firmware-timed STIM3 pulse into an analog output that has
-already been armed on that trigger terminal, which is the same route a trial
-takes. Nothing here starts a session or touches session evidence.
+The output is armed as a trial arms it, then started by the profile's route.
+On the hardware route the board emits its firmware-timed STIM pulse into the
+trigger terminal. On the software route the host starts it, which is the start
+a trial's stim-camera trigger makes; the camera itself is not exercised.
+Nothing here starts a session or touches session evidence.
 """
 
 from __future__ import annotations
@@ -45,8 +47,18 @@ class StimTestResult:
     arm_to_terminal_ms: Optional[float]
     detail: str = ""
     stim_line: int = 3
+    trigger_route: str = LaserTriggerRoute.HARDWARE_STIM3.value
 
     def __str__(self) -> str:
+        if self.trigger_route == LaserTriggerRoute.DIRECT_NI_SOFTWARE.value:
+            if self.arm_to_terminal_ms is None:
+                return "Stim test {} on laser {} via software start: {}".format(
+                    self.profile_id, self.channel_id, self.detail or "completed")
+            return (
+                "Stim test {} on laser {}: software start, waveform finished "
+                "{:.2f} ms after the start request".format(
+                    self.profile_id, self.channel_id, self.arm_to_terminal_ms)
+            )
         if self.arm_to_terminal_ms is None:
             return "Stim test {} on laser {} via STIM{}: {}".format(
                 self.profile_id,
@@ -112,14 +124,13 @@ def refuse_reason(
             "Stim test needs the nidaq laser backend; this rig is configured "
             "for {!r}.".format(laser_backend)
         )
-    if profile.trigger_route is not LaserTriggerRoute.HARDWARE_STIM3:
+    software_start = profile.trigger_route is LaserTriggerRoute.DIRECT_NI_SOFTWARE
+    if not software_start and profile.trigger_route is not LaserTriggerRoute.HARDWARE_STIM3:
         return (
-            "Profile {} uses the {} route; the bench test drives the hardware "
-            "STIM3 route only.".format(
-                profile.profile_id, profile.trigger_route.value
-            )
+            "Profile {} uses the {} route, which the bench test cannot "
+            "start.".format(profile.profile_id, profile.trigger_route.value)
         )
-    if not profile.trigger_terminal:
+    if not software_start and not profile.trigger_terminal:
         return (
             "Profile {} has no NI trigger terminal, so the board pulse has "
             "nothing to trigger.".format(profile.profile_id)
@@ -128,6 +139,9 @@ def refuse_reason(
         return "Laser channel {} has no hardware mapping.".format(
             int(profile.channel_id)
         )
+    if software_start:
+        # The board takes no part in a software start.
+        return None
     reported = set(firmware_capabilities)
     # Only a board that reports *some* capabilities can be said to lack this
     # one. No released pellet firmware answers the capability request at all
