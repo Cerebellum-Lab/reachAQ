@@ -139,6 +139,26 @@ class _ProfileDelegate(QStyledItemDelegate):
         model.setData(index, editor.currentData(), Qt.ItemDataRole.EditRole)
 
 
+class _LaserChannelDelegate(QStyledItemDelegate):
+    def __init__(self, content, parent=None):
+        super().__init__(parent)
+        self._content = content
+
+    def createEditor(self, parent, _option, _index):
+        editor = QComboBox(parent)
+        editor.addItem("None", 0)
+        for channel in self._content._laser_channel_options():
+            editor.addItem(f"Laser {channel}", channel)
+        return editor
+
+    def setEditorData(self, editor, index):
+        selected = editor.findData(int(index.data(Qt.ItemDataRole.EditRole) or 0))
+        editor.setCurrentIndex(max(0, selected))
+
+    def setModelData(self, editor, model, index):
+        model.setData(index, editor.currentData(), Qt.ItemDataRole.EditRole)
+
+
 @dataclass(frozen=True)
 class _Column:
     label: str
@@ -173,6 +193,7 @@ class ProtocolContent(ContentWidget):
         _Column("Lock timing", "cue_lock_timing", _BooleanDelegate),
         _Column("Post-clear (ms)", "cue_post_clear_delay_ms", "post_clear"),
         _Column("Laser profile", "laser_profile_id", "laser_profile"),
+        _Column("Laser", "laser_channel_id", "laser_channel"),
         _Column("Laser phase", "laser_phase", ActionPhase),
         _Column("Laser route", "laser_trigger_route", LaserTriggerRoute),
         _Column("Assignment", "stimulus_assignment", StimulusAssignment),
@@ -280,7 +301,6 @@ class ProtocolContent(ContentWidget):
             ("Export", self._export_protocol),
             ("Revert", self._reload_protocols),
             ("New tone", self._new_tone_profile),
-            ("New laser", self._new_laser_profile),
             ("New auto shift", self._new_automatic_shift_profile),
             ("Delete profile", self._delete_profile),
         ):
@@ -347,6 +367,8 @@ class ProtocolContent(ContentWidget):
                 delegate = _IntegerDelegate(0, 60_000, self._table)
             elif kind == "post_clear":
                 delegate = _IntegerDelegate(0, 60_000, self._table)
+            elif kind == "laser_channel":
+                delegate = _LaserChannelDelegate(self, self._table)
             elif kind in {
                 "tone_profile", "laser_profile", "automatic_shift_profile",
                 "cue_interval_profile", "stimulus_trigger_profile",
@@ -370,6 +392,51 @@ class ProtocolContent(ContentWidget):
             for item in state.get(key, ())
         )
 
+    _LASER_FIELDS = (
+        "laser_profile_id", "laser_phase", "laser_trigger_route", "laser_channel_id",
+    )
+
+    def _laser_channel_options(self):
+        return tuple(
+            int(channel.channel_id)
+            for channel in self._app_model.laser.configuration.channels
+        )
+
+    def _default_laser_channel(self) -> int:
+        """The first laser a board STIM action can fire, else the first laser."""
+        channels = tuple(self._app_model.laser.configuration.channels)
+        for channel in channels:
+            if channel.trigger_source and channel.board_stim_line is not None:
+                return int(channel.channel_id)
+        return int(channels[0].channel_id) if channels else 0
+
+    def _laser_patch(self, field, value, row) -> dict:
+        """One cell edit as a laser action the row will accept.
+
+        A profile needs a route, a phase and a laser, and each alone is
+        refused, so setting any one in a cell could never make a laser row.
+        Picking a profile on a row without one fills in the rest; clearing it
+        clears the rest.
+        """
+        patch = {field: value}
+        if field != "laser_profile_id":
+            return patch
+        if not value:
+            patch.update(laser_phase="none", laser_trigger_route="none", laser_channel_id=0)
+        elif str(row.get("laser_trigger_route", "none")) == "none":
+            patch.update(
+                laser_phase="pellet_presentation",
+                laser_trigger_route="hardware_stim3",
+                laser_channel_id=self._default_laser_channel(),
+            )
+        return patch
+
+    def _laser_values_from(self, row, field):
+        """Filling a laser field copies the source row's whole laser action."""
+        if field not in self._LASER_FIELDS:
+            return None
+        return {name: row.get(name) for name in self._LASER_FIELDS}
+
     @staticmethod
     def _display_value(field, value) -> str:
         if field in {"shift_x_mm", "shift_y_mm", "shift_z_mm"}:
@@ -386,6 +453,8 @@ class ProtocolContent(ContentWidget):
             return "From profile" if not value else f"{int(value)} ms"
         if field == "cue_post_clear_delay_ms":
             return "None" if not value else f"{int(value)} ms"
+        if field == "laser_channel_id":
+            return "None" if not value else f"Laser {int(value)}"
         return str(value)
 
     @staticmethod
@@ -408,6 +477,7 @@ class ProtocolContent(ContentWidget):
             "tone_phase": "none",
             "laser_phase": "none",
             "laser_trigger_route": "none",
+            "laser_channel_id": 0,
             "stimulus_assignment": "disabled",
             "stimulus_probability_percent": 100.0,
             "stimulus_trigger": "none",
@@ -516,12 +586,9 @@ class ProtocolContent(ContentWidget):
         if trial_id is None or field is None:
             return
         value = item.data(Qt.ItemDataRole.EditRole)
-        patch = {field: value}
-        row = self._row_record(int(trial_id))
+        patch = self._laser_patch(field, value, self._row_record(int(trial_id)))
         if field == "tone_profile_id":
             patch["tone_phase"] = "before_send" if value else "none"
-        elif field == "laser_profile_id" and not value:
-            patch.update(laser_phase="none", laser_trigger_route="none")
         elif field == "stimulus_assignment" and value == "disabled":
             patch.update(stimulus_trigger="none", pre_reveal_ms=0)
         elif field == "position_mode" and value != "fixed_manual":
@@ -598,9 +665,12 @@ class ProtocolContent(ContentWidget):
         _trial_id, field = current.data(Qt.ItemDataRole.UserRole) or (None, None)
         if field is None:
             return
+        values = self._laser_values_from(self._row_record(_trial_id), field) or {
+            field: current.data(Qt.ItemDataRole.EditRole)
+        }
         self._apply_values(
             rows,
-            {field: current.data(Qt.ItemDataRole.EditRole)},
+            values,
             "bulk",
             f"fill-{field}",
         )
@@ -625,9 +695,12 @@ class ProtocolContent(ContentWidget):
         if field is None:
             self._edit_status.setText("Select a value cell to apply to the scope.")
             return
+        values = self._laser_values_from(self._row_record(_trial), field) or {
+            field: current.data(Qt.ItemDataRole.EditRole)
+        }
         self._apply_values(
             rows,
-            {field: current.data(Qt.ItemDataRole.EditRole)},
+            values,
             kind,
             name,
             parent_epoch=parent,
@@ -833,119 +906,6 @@ class ProtocolContent(ContentWidget):
                 self._app_model.save_tone_profile,
                 profile_id.strip(), frequency, duration,
             )
-
-    def _new_laser_profile(self):
-        configured_channels = tuple(
-            int(channel.channel_id)
-            for channel in self._app_model.laser.configuration.channels
-        )
-        if not configured_channels:
-            self._app_model.on_error(
-                "Laser profile unavailable",
-                "Configure at least one laser channel in Edit DAQ Ports first.",
-            )
-            return
-        profile_id, accepted = QInputDialog.getText(
-            self, "Laser pulse profile", "Profile ID:"
-        )
-        if not accepted or not profile_id.strip():
-            return
-        channel_label, accepted = QInputDialog.getItem(
-            self,
-            "Laser pulse profile",
-            "Configured laser channel:",
-            tuple(f"Laser {channel}" for channel in configured_channels),
-            0,
-            False,
-        )
-        if not accepted:
-            return
-        channel = int(channel_label.rsplit(" ", 1)[-1])
-        amplitude, accepted = QInputDialog.getDouble(
-            self, "Laser pulse profile", "Amplitude (V):", 1.0, -100.0, 100.0, 4
-        )
-        if not accepted:
-            return
-        pulse_ms, accepted = QInputDialog.getDouble(
-            self, "Laser pulse profile", "Pulse duration (ms):", 5.0, 0.001, 60_000.0, 3
-        )
-        if not accepted:
-            return
-        count, accepted = QInputDialog.getInt(
-            self, "Laser pulse profile", "Pulse count:", 1, 1, 100_000
-        )
-        if not accepted:
-            return
-        frequency = None
-        if count > 1:
-            frequency, accepted = QInputDialog.getDouble(
-                self, "Laser pulse profile", "Pulse frequency (Hz):", 20.0, 0.001, 100_000.0, 3
-            )
-            if not accepted:
-                return
-        route_label, accepted = QInputDialog.getItem(
-            self,
-            "Laser pulse profile",
-            "Trigger route:",
-            ("Hardware STIM3", "Direct NI software start"),
-            0,
-            False,
-        )
-        if not accepted:
-            return
-        route = (
-            "hardware_stim3"
-            if route_label == "Hardware STIM3"
-            else "direct_ni_software"
-        )
-        terminal = ""
-        if route == "hardware_stim3":
-            terminals = tuple(
-                self._app_model.laser.configuration.trigger_listener_inputs
-            )
-            if not terminals:
-                self._app_model.on_error(
-                    "Hardware trigger unavailable",
-                    "Select a hardware trigger input in Edit DAQ Ports first.",
-                )
-                return
-            terminal, accepted = QInputDialog.getItem(
-                self,
-                "Laser pulse profile",
-                "Configured NI trigger terminal:",
-                terminals,
-                0,
-                False,
-            )
-            if not accepted or not terminal.strip():
-                return
-        stim_line = 3
-        if route == "hardware_stim3":
-            # Board names, not host names. STIM0 and STIM1 are absent because
-            # the firmware tone generator drives them as the tone confirmations.
-            line_label, accepted = QInputDialog.getItem(
-                self,
-                "Laser pulse profile",
-                "Board stimulus line:",
-                ("STIM3", "STIM2"),
-                0,
-                False,
-            )
-            if not accepted:
-                return
-            stim_line = int(line_label[-1])
-        self._run_library_action(
-            self._app_model.save_laser_profile,
-            profile_id=profile_id.strip(),
-            channel_id=channel,
-            amplitude_volts=amplitude,
-            pulse_duration_ms=pulse_ms,
-            pulse_count=count,
-            frequency_hz=frequency,
-            trigger_route=route,
-            trigger_terminal=terminal.strip(),
-            stim_line=stim_line,
-        )
 
     def _ask_xyz(self, title, label, defaults, minimum, maximum):
         values = []
