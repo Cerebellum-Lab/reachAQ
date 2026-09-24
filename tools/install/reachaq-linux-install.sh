@@ -414,24 +414,34 @@ PY
 # pyproject.toml; in short: torch from the CUDA 12.8 index, TensorFlow's CUDA
 # runtime kept apart (install_tensorflow_gpu_runtime), and TensorFlow 2.12's
 # stale numpy and typing-extensions caps overridden afterwards.
-install_pose_engines() {
-    local extra requirement packages
-    for extra in torch tensorflow; do
-        packages=()
-        while IFS= read -r requirement; do
-            [ -n "$requirement" ] && packages+=("$requirement")
-        done < <(pose_engine_requirements "$extra")
-        if [ "${#packages[@]}" -eq 0 ]; then
-            printf 'No %s requirements were found in auto-trainer-inference.\n' "$extra" >&2
-            return 1
-        fi
-        if [ "$extra" = torch ] && [ "$(uname -m)" = x86_64 ]; then
-            conda_run python -m pip install "${packages[@]}" \
-                --index-url https://download.pytorch.org/whl/cu128 || return
-        else
-            conda_run python -m pip install "${packages[@]}" || return
-        fi
-    done
+install_extra() {
+    local extra=$1
+    shift
+    local requirement packages=()
+    while IFS= read -r requirement; do
+        [ -n "$requirement" ] && packages+=("$requirement")
+    done < <(pose_engine_requirements "$extra")
+    if [ "${#packages[@]}" -eq 0 ]; then
+        printf 'No %s requirements were found in auto-trainer-inference.\n' "$extra" >&2
+        return 1
+    fi
+    conda_run python -m pip install "${packages[@]}" "$@"
+}
+
+# Before the application's own dependencies: DeepLabCut 3 requires torch, and
+# left to resolve it alone pip takes the newest build - CUDA 13, which
+# TensorFlow cannot share a process with - only for this step to replace it,
+# leaving the CUDA 13 libraries behind.
+install_torch_engine() {
+    if [ "$(uname -m)" = x86_64 ]; then
+        install_extra torch --index-url https://download.pytorch.org/whl/cu128
+    else
+        install_extra torch
+    fi
+}
+
+install_tensorflow_engine() {
+    install_extra tensorflow || return
     # Installing TensorFlow 2.12 pulls numpy down to 1.24.3, typing-extensions
     # to 4.5 and filelock out of DeepLabCut's range. Put all three back.
     conda_run python -m pip install \
@@ -672,7 +682,13 @@ PY
 }
 
 git_lfs_install() {
-    local pre_push_hook="$INSTALL_REPO/.git/hooks/pre-push"
+    # Ask git where the hook lives rather than assuming .git/hooks: in a
+    # worktree .git is a file and the hooks are in the shared git directory, so
+    # the check never matched there and `git lfs install --local` then refused
+    # to overwrite the LFS hook already in place (exit 2).
+    local pre_push_hook
+    pre_push_hook=$(git -C "$INSTALL_REPO" rev-parse --path-format=absolute \
+        --git-path hooks/pre-push) || return
     if [ -f "$pre_push_hook" ] && grep -q 'git lfs pre-push' "$pre_push_hook"; then
         printf 'Compatible Git LFS pre-push hook is already installed.\n'
         return 0
@@ -786,12 +802,14 @@ run_focused_tests() {
             tests/animal_metadata_sync_test.py \
             tests/autotrainer_headless_test.py::test_cli_help \
             tests/autotrainer_headless_test.py::test_load_config \
-            tests/autotrainer_headless_test.py::test_gpu_preflight_fails_before_cameras_and_hardware \
+            tests/autotrainer_headless_test.py::test_gpu_preflight_failure_does_not_block_cameras_and_hardware \
             tests/autotrainer_headless_test.py::test_live_inference_override_is_not_persisted_with_other_configuration_changes \
             tests/autotrainer_headless_test.py::test_load_config_extra_reach_camera_slot \
             tests/autotrainer_headless_test.py::test_load_config_random_camera_override \
             tests/autotrainer_headless_test.py::test_load_config_random_camera_override_adds_default_reach_cameras \
             tests/hardware_status_content_test.py \
+            tests/inference_dependencies_test.py \
+            tests/instance_lock_test.py \
             tests/nidaq_port_configuration_dialog_test.py \
             tests/reachaq_linux_install_test.py \
             tests/rfid_app_model_test.py \
@@ -849,16 +867,21 @@ if [ -z "$CONDA_BIN" ]; then
     skip_step "Create conda environment" "conda unavailable"
     skip_step "Upgrade Python packaging tools" "conda unavailable"
     skip_step "Install Python requirements" "conda unavailable"
+    skip_step "Install PyTorch pose engine" "conda unavailable"
     skip_step "Install reachAQ editable package" "conda unavailable"
-    skip_step "Install pose engines (PyTorch and TensorFlow)" "conda unavailable"
+    skip_step "Install TensorFlow pose engine" "conda unavailable"
 else
     record_result PASS "Locate conda" "$CONDA_BIN"
     printf '\n[PASS] Locate conda: %s\n' "$CONDA_BIN"
     run_step "Create conda environment" ensure_conda_environment
-    run_step "Upgrade Python packaging tools" conda_run python -m pip install --upgrade pip setuptools wheel build
+    # tomli explicitly: pose_engine_requirements reads pyproject.toml with it,
+    # Python 3.10 has no tomllib, and relying on build to pull it in would break
+    # silently the day build stops needing it.
+    run_step "Upgrade Python packaging tools" conda_run python -m pip install --upgrade pip setuptools wheel build tomli
+    run_step "Install PyTorch pose engine" install_torch_engine
     run_step "Install Python requirements" install_python_requirements
     run_step "Install reachAQ editable package" install_editable_package
-    run_step "Install pose engines (PyTorch and TensorFlow)" install_pose_engines
+    run_step "Install TensorFlow pose engine" install_tensorflow_engine
     run_step "Install reachAQ desktop launcher and terminal commands" install_desktop_launcher
     run_step "Verify reachaq and reachaq-sync commands" verify_terminal_commands
 fi
