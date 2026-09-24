@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -56,7 +57,11 @@ def test_portable_installer_builds_python_310_with_both_pose_engines():
     # Every subproject declares requires-python >= 3.10; a 3.8 default made the
     # editable install fail on a fresh host.
     assert "INSTALL_PYTHON=${REACHAQ_INSTALL_PYTHON:-3.10}" in source
-    assert 'run_step "Install pose engines (PyTorch and TensorFlow)" install_pose_engines' in source
+    # torch first, so DeepLabCut's torch requirement is already met by the
+    # CUDA 12.8 build instead of pip fetching the CUDA 13 one.
+    torch_step = source.index('run_step "Install PyTorch pose engine" install_torch_engine')
+    assert torch_step < source.index('run_step "Install Python requirements"')
+    assert source.index('run_step "Install TensorFlow pose engine" install_tensorflow_engine') > torch_step
     assert "download.pytorch.org/whl/cu128" in source
     assert 'run_step "Verify PyTorch GPU preflight" verify_torch_gpu_runtime' in source
     assert 'run_step "Verify both engines in one process" verify_pose_engines_together' in source
@@ -86,6 +91,29 @@ def test_portable_installer_can_skip_root_steps_without_hiding_them():
         "Install CPU governor unit",
     ):
         assert f'skip_step "{step}" "$SYSTEM_SKIPPED"' in source, step
+
+
+def test_every_focused_test_the_installer_runs_exists():
+    """One missing entry makes pytest refuse the whole list (exit 4).
+
+    test_gpu_preflight_fails_before_cameras_and_hardware was renamed on
+    2026-07-29 and the installer kept naming it, so from then on its focused
+    tests did not run at all, on every host, and the report said only FAIL.
+    """
+    source = INSTALL_SCRIPT.read_text()
+    block = source[source.index("run_focused_tests() {"):]
+    block = block[:block.index("\n}\n")]
+    entries = re.findall(r"((?:auto-trainer-[a-z]+/)?tests/[\w/]+\.py(?:::\w+)?)", block)
+    assert entries, "no focused tests found"
+    missing = []
+    for entry in entries:
+        path, _, test = entry.partition("::")
+        file = REPO_ROOT / path
+        if not file.is_file():
+            missing.append(entry)
+        elif test and not re.search(rf"^def {re.escape(test)}\b", file.read_text(), re.M):
+            missing.append(entry)
+    assert not missing, f"focused tests that no longer exist: {missing}"
 
 
 def test_portable_installer_resolves_requirements_from_the_checkout():
@@ -186,8 +214,12 @@ def test_desktop_launcher_installer_creates_terminal_entry(tmp_path):
     fake_conda.chmod(0o755)
     (config_dir / "system_configuration.yaml").write_text("test: true\n")
     (desktop / "ReachAQ-startup").write_text("obsolete\n")
+    # Inherited REACHAQ_* settings redirect where the installer writes, so a
+    # caller's REACHAQ_USER_BIN_DIR sent the launcher outside this test's HOME.
+    inherited = {key: value for key, value in os.environ.items()
+                 if not key.startswith("REACHAQ_")}
     env = {
-        **os.environ,
+        **inherited,
         "HOME": str(home),
         "REACHAQ_CONDA_BIN": str(fake_conda),
         "REACHAQ_INSTALL_REPO": str(REPO_ROOT),
