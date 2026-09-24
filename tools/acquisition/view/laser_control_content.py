@@ -61,8 +61,9 @@ _DIODE_TRACE_COLOR = stream_signal_color(1)
 _COMMAND_COPY_TRACE_COLOR = stream_signal_color(2)
 _TRIGGER_TRACE_COLOR = stream_signal_color(3)
 _STIM_TEST_TOOLTIP = (
-    "Arm this channel's analog output on its trigger terminal, then ask "
-    "the board for its timed STIM3 pulse to start the waveform"
+    "Run the selected profile as a trial would: a board STIM profile arms on "
+    "its trigger terminal and the board's timed pulse starts it; a software "
+    "start profile is started from here"
 )
 
 
@@ -288,7 +289,7 @@ class _LaserChannelTab(QWidget):
         self.stim_profile_selector.setToolTip(
             "Saved laser profiles that target this channel"
         )
-        self.stim_test_button = QPushButton("Test stim (hardware trigger)")
+        self.stim_test_button = QPushButton("Test stim")
         self.stim_test_button.setToolTip(_STIM_TEST_TOOLTIP)
         self.stim_test_button.clicked.connect(self._run_stim_test)
         self.stim_test_result = QLabel()

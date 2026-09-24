@@ -12,9 +12,15 @@ class FakeOperation:
     def __init__(self):
         self._callbacks = []
         self.cancelled = False
+        self.triggered = False
 
     def add_terminal_callback(self, callback):
         self._callbacks.append(callback)
+
+    def trigger(self):
+        # The software start, after which the armed waveform runs to completion.
+        self.triggered = True
+        threading.Timer(0.0, self.finish).start()
 
     def finish(self):
         for callback in tuple(self._callbacks):
@@ -173,8 +179,9 @@ def test_a_board_that_reports_nothing_still_runs(bench):
     assert result.profile_id == "stim-a"
 
 
-def test_a_software_route_profile_is_refused(bench):
-    model, _laser, hardware, _operation = bench
+def test_a_software_route_profile_is_started_from_the_host(bench):
+    # The start a trial's stim-camera trigger makes, with no board involved.
+    model, laser, hardware, operation = bench
     model._laser_profiles = {
         "stim-a": make_profile(
             trigger_route=LaserTriggerRoute.DIRECT_NI_SOFTWARE,
@@ -182,10 +189,35 @@ def test_a_software_route_profile_is_refused(bench):
         )
     }
 
-    with pytest.raises(RuntimeError, match="STIM3"):
+    result = model.run_stim_bench_test("stim-a")
+
+    assert laser.prepared, "the analog output must be armed first"
+    assert operation.triggered
+    assert hardware.pulses == []
+    assert result.arm_to_terminal_ms is not None
+    assert "software start" in str(result)
+    assert laser.released == [operation]
+
+
+def test_a_software_start_that_fails_cancels_the_armed_output(bench):
+    model, laser, _hardware, operation = bench
+    model._laser_profiles = {
+        "stim-a": make_profile(
+            trigger_route=LaserTriggerRoute.DIRECT_NI_SOFTWARE,
+            trigger_terminal="",
+        )
+    }
+
+    def fail():
+        raise RuntimeError("not armed")
+
+    operation.trigger = fail
+
+    with pytest.raises(RuntimeError, match="not armed"):
         model.run_stim_bench_test("stim-a")
 
-    assert hardware.pulses == []
+    assert operation.cancelled
+    assert laser.released == [operation]
 
 
 def test_a_stim2_profile_pulses_the_second_line(bench):
