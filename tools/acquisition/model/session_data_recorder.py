@@ -1554,6 +1554,12 @@ class SessionDataRecorder:
             SessionDataRecorder._normalize_device_row(row)
             for row in device_rows
         )
+        # Rows arrive in the order the decoded-message callback fires, and
+        # message kinds reach it by different paths: a stepper status received
+        # before a servo status can be recorded after it. device.csv is a time
+        # series on perf_time, the host receive time, so write it in that order.
+        # The sort is stable, so rows with equal times keep their arrival order.
+        device_rows = tuple(sorted(device_rows, key=lambda row: row[0]))
         laser_rows = tuple(
             row for row in laser_rows if start_perf <= row[0] <= end_perf
         )
