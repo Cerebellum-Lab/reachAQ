@@ -68,7 +68,7 @@ def test_a_board_firing_without_a_board_line_is_refused():
 
 
 def test_no_route_cannot_fire():
-    with pytest.raises(ValueError, match="cannot fire"):
+    with pytest.raises(ValueError, match="Laser 2 trigger route 'none' cannot fire"):
         resolve_laser_firing(configuration(), 2, "none")
 
 

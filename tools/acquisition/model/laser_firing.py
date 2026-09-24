@@ -50,7 +50,7 @@ def resolve_laser_firing(laser_configuration, channel_id, route) -> LaserFiring:
     if route is LaserTriggerRoute.DIRECT_NI_SOFTWARE:
         return LaserFiring(number, route, trigger_pulse_us=pulse_us)
     if route is not LaserTriggerRoute.HARDWARE_STIM3:
-        raise ValueError(f"Laser trigger route {route.value!r} cannot fire a profile")
+        raise ValueError(f"Laser {number} trigger route {route.value!r} cannot fire a profile")
     terminal = (channel.trigger_source or "").strip()
     if not terminal:
         raise ValueError(
