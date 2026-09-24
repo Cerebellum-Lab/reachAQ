@@ -42,6 +42,8 @@ from tools.acquisition.model.app_model import AppModel
 from tools.acquisition.model.laser_model import LaserModel, LaserTraceBlock
 from tools.acquisition.model.laser_plot_process import LaserPlotFrame, LaserPlotProcess
 from tools.acquisition.model.nidaq_signal_monitor_model import NidaqSignalMonitorModel
+from tools.acquisition.model.trial_action import LaserPulseProfile
+from tools.acquisition.view.pulse_builder_tab import DRAFT_PROFILE_ID, PulseBuilderTab
 from tools.acquisition.view.stream_graph_style import (
     StreamGraphLegend,
     color_code_checkbox,
@@ -95,7 +97,11 @@ class _LaserOperationWorker(QObject):
 
 
 class _LaserChannelTab(QWidget):
-    """Single-laser controls and pulse preview."""
+    """Single-laser controls: fire a profile, calibrate, and watch the output.
+
+    The pulse train itself is shaped in the Pulse Builder; this tab picks a
+    saved profile or the builder draft and fires it on its own laser.
+    """
 
     def __init__(
         self,
@@ -106,6 +112,7 @@ class _LaserChannelTab(QWidget):
         start_operation: Callable[[str, Callable[[], object]], None],
         set_status: Callable[[str, bool], None],
         plot_controller=None,
+        draft_provider: Optional[Callable[[], Optional[LaserPulseProfile]]] = None,
     ):
         super().__init__()
 
@@ -116,6 +123,7 @@ class _LaserChannelTab(QWidget):
         self._start_operation = start_operation
         self._set_parent_status = set_status
         self._plot_controller = plot_controller
+        self._draft_provider = draft_provider
         self._controls_can_edit = True
         self._trace_streaming = False
         self._trace_data = {}
@@ -175,9 +183,9 @@ class _LaserChannelTab(QWidget):
         output_page_layout = QVBoxLayout(output_page)
         output_page_layout.setContentsMargins(2, 4, 2, 2)
         output_page_layout.setSpacing(5)
-        # The pulse page stacks the controls, the preview, the live output and
-        # the board trigger. That is taller than the panel at most sizes, so it
-        # scrolls rather than pushing the lower graphs out of reach.
+        # The pulse page stacks the controls, the live output and the board
+        # trigger. That is taller than the panel at most sizes, so it scrolls
+        # rather than pushing the lower graphs out of reach.
         pulse_scroll = QScrollArea(self._mode_tabs)
         pulse_scroll.setWidgetResizable(True)
         pulse_scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -196,27 +204,25 @@ class _LaserChannelTab(QWidget):
         pulse_layout.setVerticalSpacing(3)
         pulse_layout.setColumnStretch(1, 1)
 
-        self._amplitude = self._make_voltage_spinbox(channel)
-        self._duration_ms = self._make_ms_spinbox(10.0)
-        self._baseline_ms = self._make_ms_spinbox(0.0)
-        self._post_stim_ms = self._make_ms_spinbox(0.0)
-        self._pulse_count = QSpinBox()
-        self._pulse_count.setRange(1, 100000)
-        self._pulse_count.setValue(1)
-        self._frequency_hz = QDoubleSpinBox()
-        self._frequency_hz.setRange(0.1, 100000.0)
-        self._frequency_hz.setDecimals(3)
-        self._frequency_hz.setValue(10.0)
-        self._frequency_hz.setSuffix(" Hz")
+        # Run Pulse and Test stim both fire the profile picked here, on this
+        # laser: the Pulse Builder's unsaved draft or any saved profile. A
+        # profile is the waveform alone; Run Pulse starts it with the trigger
+        # and shutter options below, Test stim by the route chosen beside it.
+        self.stim_profile_selector = QComboBox()
+        self.stim_profile_selector.setToolTip(
+            "The Pulse Builder draft and every saved laser profile; any of "
+            "them can fire on this laser"
+        )
+        self._profile_summary = QLabel("")
+        self._profile_summary.setObjectName("LaserPreviewStatus")
+        self._profile_summary.setWordWrap(True)
         self._trigger_mode = QComboBox()
         self._trigger_mode.addItems(("internal", "external"))
         # Internal by default, even when the channel has a trigger route. This
         # used to switch to external whenever one was configured, so Run pulse
         # armed the output for a board STIM pulse that nothing on this tab
         # sends, and failed with a DAQmx timeout (christielab10, 2026-09-24).
-        # The route stays filled in for choosing external deliberately. Test
-        # stim and protocol trials take the trigger from the profile, and
-        # loading a profile here does not change it.
+        # The route stays filled in for choosing external deliberately.
         self._trigger_source = QLineEdit(channel.trigger_source or "")
         self._trigger_source.setPlaceholderText("NI-DAQ trigger route")
         self._trigger_edge = QComboBox()
@@ -231,24 +237,15 @@ class _LaserChannelTab(QWidget):
         self._emit_timing_trigger = self._make_checkbox("Timing DO")
         self._run_pulse_button = QPushButton("Run Pulse")
 
-        pulse_layout.addWidget(self._form_label("Amplitude:"), 0, 0)
-        pulse_layout.addWidget(self._amplitude, 0, 1)
-        pulse_layout.addWidget(self._form_label("Duration:"), 1, 0)
-        pulse_layout.addWidget(self._duration_ms, 1, 1)
-        pulse_layout.addWidget(self._form_label("Baseline:"), 2, 0)
-        pulse_layout.addWidget(self._baseline_ms, 2, 1)
-        pulse_layout.addWidget(self._form_label("Post-stim:"), 3, 0)
-        pulse_layout.addWidget(self._post_stim_ms, 3, 1)
-        pulse_layout.addWidget(self._form_label("Count:"), 4, 0)
-        pulse_layout.addWidget(self._pulse_count, 4, 1)
-        pulse_layout.addWidget(self._form_label("Frequency:"), 5, 0)
-        pulse_layout.addWidget(self._frequency_hz, 5, 1)
-        pulse_layout.addWidget(self._form_label("Trigger Mode:"), 6, 0)
-        pulse_layout.addWidget(self._trigger_mode, 6, 1)
-        pulse_layout.addWidget(self._form_label("Trigger Type:"), 7, 0)
-        pulse_layout.addWidget(self._trigger_edge, 7, 1)
-        pulse_layout.addWidget(self._form_label("Trigger Source:"), 8, 0)
-        pulse_layout.addWidget(self._trigger_source, 8, 1)
+        pulse_layout.addWidget(self._form_label("Profile:"), 0, 0)
+        pulse_layout.addWidget(self.stim_profile_selector, 0, 1)
+        pulse_layout.addWidget(self._profile_summary, 1, 0, 1, 2)
+        pulse_layout.addWidget(self._form_label("Trigger Mode:"), 2, 0)
+        pulse_layout.addWidget(self._trigger_mode, 2, 1)
+        pulse_layout.addWidget(self._form_label("Trigger Type:"), 3, 0)
+        pulse_layout.addWidget(self._trigger_edge, 3, 1)
+        pulse_layout.addWidget(self._form_label("Trigger Source:"), 4, 0)
+        pulse_layout.addWidget(self._trigger_source, 4, 1)
         shutter_options = QWidget()
         shutter_options_layout = QGridLayout(shutter_options)
         shutter_options_layout.setContentsMargins(0, 0, 0, 0)
@@ -256,7 +253,7 @@ class _LaserChannelTab(QWidget):
         shutter_options_layout.addWidget(self._open_shutter, 0, 0)
         shutter_options_layout.addWidget(self._close_shutter, 0, 1)
         shutter_options_layout.addWidget(self._enable_pmt, 1, 0)
-        pulse_layout.addWidget(shutter_options, 9, 0, 1, 2)
+        pulse_layout.addWidget(shutter_options, 5, 0, 1, 2)
 
         trigger_options = QWidget()
         trigger_options_layout = QHBoxLayout(trigger_options)
@@ -265,16 +262,13 @@ class _LaserChannelTab(QWidget):
         trigger_options_layout.addWidget(self._emit_trigger)
         trigger_options_layout.addWidget(self._emit_timing_trigger)
         trigger_options_layout.addStretch(1)
-        pulse_layout.addWidget(trigger_options, 10, 0, 1, 2)
-        pulse_layout.addWidget(self._run_pulse_button, 11, 1)
+        pulse_layout.addWidget(trigger_options, 6, 0, 1, 2)
+        pulse_layout.addWidget(self._run_pulse_button, 7, 1)
 
-        # Run Pulse above drives the analog output straight from the host. This
-        # fires a saved profile the way a trial does: arm the output on its
-        # trigger terminal, then let the board's timed STIM3 pulse start it.
-        self.stim_profile_selector = QComboBox()
-        self.stim_profile_selector.setToolTip(
-            "Saved laser profiles that target this channel"
-        )
+        # Run Pulse above drives the analog output straight from the host. Test
+        # stim fires the same profile the way a trial does: arm the output,
+        # then start it by the route chosen here - the board's timed STIM
+        # pulse into this laser's trigger terminal, or a software start.
         self._stim_route = QComboBox()
         self._stim_route.setToolTip(
             "How Test stim starts the profile on this laser")
@@ -285,27 +279,12 @@ class _LaserChannelTab(QWidget):
         self.stim_test_result = QLabel()
         self.stim_test_result.setWordWrap(True)
         self.stim_test_result.setObjectName("LaserPreviewStatus")
-        pulse_layout.addWidget(self._form_label("Stim profile:"), 12, 0)
-        pulse_layout.addWidget(self.stim_profile_selector, 12, 1)
-        pulse_layout.addWidget(self._form_label("Route:"), 13, 0)
-        pulse_layout.addWidget(self._stim_route, 13, 1)
-        pulse_layout.addWidget(self.stim_test_button, 14, 1)
-        pulse_layout.addWidget(self.stim_test_result, 15, 0, 1, 2)
+        pulse_layout.addWidget(self._form_label("Route:"), 8, 0)
+        pulse_layout.addWidget(self._stim_route, 8, 1)
+        pulse_layout.addWidget(self.stim_test_button, 9, 1)
+        pulse_layout.addWidget(self.stim_test_result, 10, 0, 1, 2)
 
         pulse_page_layout.addWidget(pulse_group)
-
-        self._preview_plot = PGWidget()
-        self._preview_plot.clear()
-        self._preview_plot.setBackground("w")
-        self._preview_plot.getAxis("bottom").setLabel("Time", units="s")
-        self._preview_plot.getAxis("left").setLabel("Command", units="V")
-        self._preview_plot.setMouseEnabled(x=False, y=False)
-        self._preview_curve = self._preview_plot.plot([], [], pen=pg.mkPen(color=(30, 90, 180), width=2))
-        self._preview_status = QLabel("")
-        self._preview_status.setObjectName("LaserPreviewStatus")
-        self._preview_status.setWordWrap(True)
-        pulse_page_layout.addWidget(self._preview_plot, stretch=1)
-        pulse_page_layout.addWidget(self._preview_status)
 
         ramp_group = QGroupBox("Calibration Ramp")
         ramp_layout = QGridLayout(ramp_group)
@@ -547,12 +526,6 @@ class _LaserChannelTab(QWidget):
         output_page_layout.addStretch(1)
 
         self._pulse_controls = (
-            self._amplitude,
-            self._duration_ms,
-            self._baseline_ms,
-            self._post_stim_ms,
-            self._pulse_count,
-            self._frequency_hz,
             self._trigger_mode,
             self._trigger_source,
             self._trigger_edge,
@@ -589,9 +562,8 @@ class _LaserChannelTab(QWidget):
             )
         self.refresh_signal_selections()
         self.refresh_stim_profiles()
-        self._connect_preview_signals()
+        self._connect_control_signals()
         self._refresh_trigger_mode_enabled()
-        self._refresh_preview()
 
     @property
     def channel_id_value(self) -> int:
@@ -733,16 +705,6 @@ class _LaserChannelTab(QWidget):
         checkbox.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Preferred)
         return checkbox
 
-    @staticmethod
-    def _make_ms_spinbox(value: float) -> QDoubleSpinBox:
-        spinbox = QDoubleSpinBox()
-        spinbox.setDecimals(3)
-        spinbox.setSingleStep(1.0)
-        spinbox.setSuffix(" ms")
-        spinbox.setRange(0.0, 600000.0)
-        spinbox.setValue(value)
-        return spinbox
-
     def run_pulse_refusal(self) -> str:
         """Why Run Pulse is unavailable, or an empty string.
 
@@ -761,29 +723,9 @@ class _LaserChannelTab(QWidget):
             )
         return ""
 
-    def _connect_preview_signals(self) -> None:
-        for spinbox in (
-            self._amplitude,
-            self._duration_ms,
-            self._baseline_ms,
-            self._post_stim_ms,
-            self._pulse_count,
-            self._frequency_hz,
-        ):
-            spinbox.valueChanged.connect(self._refresh_preview)
-        self._trigger_source.textChanged.connect(self._refresh_preview)
+    def _connect_control_signals(self) -> None:
         self._trigger_mode.currentTextChanged.connect(self._on_trigger_mode_changed)
-        self._trigger_edge.currentTextChanged.connect(self._refresh_preview)
-        self.stim_profile_selector.currentIndexChanged.connect(
-            self._on_stim_profile_selected)
-        for checkbox in (
-            self._open_shutter,
-            self._close_shutter,
-            self._enable_pmt,
-            self._emit_trigger,
-            self._emit_timing_trigger,
-        ):
-            checkbox.toggled.connect(self._refresh_preview)
+        self.stim_profile_selector.currentIndexChanged.connect(self.refresh_draft)
 
     def set_controls_enabled(self, can_edit: bool, can_run_pulse: bool, can_run_ramp: bool) -> None:
         self._controls_can_edit = can_edit
@@ -925,79 +867,24 @@ class _LaserChannelTab(QWidget):
         )
 
     def refresh_stim_profiles(self) -> None:
-        """List every saved laser profile: any profile can fire on any laser."""
+        """The builder draft and every saved profile; any profile fits any laser."""
         previous = self.stim_profile_selector.currentData()
         self.stim_profile_selector.blockSignals(True)
         self.stim_profile_selector.clear()
-        # Selecting a profile overwrites the build controls, so there has to
-        # be a way back to whatever is being built by hand.
-        self.stim_profile_selector.addItem("(new profile)", None)
+        self.stim_profile_selector.addItem("(builder draft)", DRAFT_PROFILE_ID)
         state = getattr(self._app_model, "trial_protocol_state", {}) or {}
         for item in state.get("laser_profiles", ()):
-            summary = item.get("summary", "")
-            self.stim_profile_selector.addItem(
-                "{} ({})".format(item["profile_id"], summary), item["profile_id"]
-            )
-        if previous is not None:
-            index = self.stim_profile_selector.findData(previous)
-            if index >= 0:
-                self.stim_profile_selector.setCurrentIndex(index)
+            self.stim_profile_selector.addItem(item["profile_id"], item["profile_id"])
+        index = self.stim_profile_selector.findData(previous)
+        self.stim_profile_selector.setCurrentIndex(max(0, index))
         self.stim_profile_selector.blockSignals(False)
+        self.refresh_draft()
 
-    def _on_stim_profile_selected(self, *_args) -> None:
-        """Draw the selected profile in the build graph.
-
-        The preview is built from the controls, so a profile picked from the
-        list showed nothing of itself: the graph kept displaying whatever had
-        been typed. Loading writes the profile's values back into the same
-        controls, which redraws the preview and makes Run Pulse fire what the
-        list says. "(new profile)" leaves them alone.
-        """
-        profile_id = self.stim_profile_selector.currentData()
-        if not profile_id:
-            self._refresh_preview()
-            return
-        profile = self._app_model.laser_profile(profile_id)
-        if profile is None:
-            self._set_parent_status(
-                f"Laser profile {profile_id!r} is no longer saved", True)
-            return
-        self._apply_profile_to_controls(profile)
-        self._set_parent_status(
-            f"Loaded profile {profile.profile_id!r} into the laser "
-            f"{self._channel.channel_id.value} pulse train", False)
-
-    def _apply_profile_to_controls(self, profile) -> None:
-        controls = (
-            self._amplitude,
-            self._duration_ms,
-            self._baseline_ms,
-            self._post_stim_ms,
-            self._pulse_count,
-            self._frequency_hz,
-        )
-        for control in controls:
-            control.blockSignals(True)
-        try:
-            self._amplitude.setValue(float(profile.amplitude_volts))
-            self._duration_ms.setValue(float(profile.pulse_duration_ms))
-            self._baseline_ms.setValue(float(profile.baseline_ms))
-            self._post_stim_ms.setValue(float(profile.post_stim_ms))
-            self._pulse_count.setValue(int(profile.pulse_count))
-            # A single-pulse profile carries no frequency; leaving the control
-            # where it is keeps the value the count would fall back to.
-            if profile.frequency_hz:
-                self._frequency_hz.setValue(float(profile.frequency_hz))
-            # The waveform only. This also set the trigger to the profile's
-            # terminal and switched to external, and every saved profile names
-            # a board STIM terminal - so picking one for Test stim left Run
-            # Pulse waiting for a board pulse it never sends, until DAQmx timed
-            # out (christielab10, 2026-09-24). Test stim reads the profile's
-            # trigger itself.
-        finally:
-            for control in controls:
-                control.blockSignals(False)
-        self._refresh_preview()
+    def refresh_draft(self) -> None:
+        profile = self._selected_profile()
+        self._profile_summary.setText(
+            profile.summary() if profile is not None
+            else "The builder draft is not a valid pulse train")
 
     def _refresh_stim_route_options(self) -> None:
         self._stim_route.clear()
@@ -1016,14 +903,16 @@ class _LaserChannelTab(QWidget):
 
     def _selected_profile(self):
         profile_id = self.stim_profile_selector.currentData()
+        if profile_id == DRAFT_PROFILE_ID:
+            return None if self._draft_provider is None else self._draft_provider()
         return self._app_model.laser_profile(profile_id) if profile_id else None
 
     def _run_stim_test(self) -> None:
         profile = self._selected_profile()
         if profile is None:
             self._set_parent_status(
-                "Select a saved laser profile for laser {} first".format(
-                    self._channel.channel_id.value),
+                "Select a saved profile for laser {}, or build a valid draft "
+                "in the Pulse Builder".format(self._channel.channel_id.value),
                 True)
             return
         channel_id = int(self._channel.channel_id.value)
@@ -1079,8 +968,9 @@ class _LaserChannelTab(QWidget):
         self._start_operation(f"Running laser {self._channel.channel_id.value} calibration ramp", operation)
 
     def _build_pulse_train(self) -> LaserPulseTrain:
-        pulse_count = self._pulse_count.value()
-        frequency_hz = self._frequency_hz.value() if pulse_count > 1 else None
+        profile = self._selected_profile()
+        if profile is None:
+            raise ValueError("Select a saved profile, or build a valid draft in the Pulse Builder")
         trigger_source = None
         if self._trigger_mode.currentText() == "external":
             trigger_source = self._trigger_source.text().strip()
@@ -1088,24 +978,25 @@ class _LaserChannelTab(QWidget):
                 raise ValueError("External trigger mode requires a trigger source")
         return LaserPulseTrain(
             channel_id=self._channel.channel_id,
-            amplitude_volts=self._amplitude.value(),
-            duration_ms=self._duration_ms.value(),
-            baseline_ms=self._baseline_ms.value(),
-            post_stim_ms=self._post_stim_ms.value(),
-            pulse_count=pulse_count,
-            frequency_hz=frequency_hz,
+            amplitude_volts=profile.amplitude_volts,
+            duration_ms=profile.pulse_duration_ms,
+            baseline_ms=profile.baseline_ms,
+            post_stim_ms=profile.post_stim_ms,
+            pulse_count=profile.pulse_count,
+            frequency_hz=profile.frequency_hz if profile.pulse_count > 1 else None,
             trigger_source=trigger_source,
             trigger_edge=self._trigger_edge.currentText(),
             open_shutter=self._open_shutter.isChecked(),
             close_shutter=self._close_shutter.isChecked(),
             enable_pmt_shutter=self._enable_pmt.isChecked(),
+            pmt_shutter_open_delay_ms=profile.pmt_open_lead_ms,
+            pmt_shutter_close_delay_ms=profile.pmt_close_lag_ms,
             emit_trigger_output=self._emit_trigger.isChecked(),
             emit_timing_trigger_output=self._emit_timing_trigger.isChecked(),
         )
 
     def _on_trigger_mode_changed(self) -> None:
         self._refresh_trigger_mode_enabled()
-        self._refresh_preview()
 
     def _refresh_trigger_mode_enabled(self) -> None:
         is_external = self._trigger_mode.currentText() == "external"
@@ -1127,66 +1018,6 @@ class _LaserChannelTab(QWidget):
                     f"laser pulse duration {pulse_train.duration_ms:g} ms exceeds pulse period "
                     f"{period_ms:g} ms at {pulse_train.frequency_hz:g} Hz"
                 )
-
-    def _refresh_preview(self, *_args) -> None:
-        try:
-            pulse_train = self._build_pulse_train()
-            self._validate_pulse_train(pulse_train)
-            x_values, y_values = self._build_preview_points(pulse_train)
-        except Exception:
-            self._preview_curve.setData([], [])
-            self._preview_plot.setVisible(False)
-            self._preview_status.setText("")
-            self._preview_status.setStyleSheet("")
-            return
-        self._preview_curve.setData(x_values, y_values)
-        self._preview_plot.setVisible(True)
-        self._preview_status.setText("")
-        self._preview_status.setStyleSheet("")
-        max_x = max(x_values[-1], 0.001)
-        span = max(self._channel.maximum_command_volts - self._channel.minimum_command_volts, 1.0)
-        self._preview_plot.setXRange(0.0, max_x, padding=0.02)
-        self._preview_plot.setYRange(
-            self._channel.minimum_command_volts - span * 0.05,
-            self._channel.maximum_command_volts + span * 0.05,
-            padding=0.0,
-        )
-
-    def _build_preview_points(self, pulse_train: LaserPulseTrain) -> Tuple[list, list]:
-        minimum = self._channel.minimum_command_volts
-        amplitude = pulse_train.amplitude_volts
-        duration_s = pulse_train.duration_ms / 1000.0
-        baseline_s = pulse_train.baseline_ms / 1000.0
-        post_stim_s = pulse_train.post_stim_ms / 1000.0
-        period_s = (1.0 / pulse_train.frequency_hz) if pulse_train.frequency_hz is not None else duration_s
-
-        x_values = [0.0]
-        y_values = [minimum]
-        current_t = 0.0
-
-        def horizontal(to_t: float) -> None:
-            nonlocal current_t
-            if to_t <= current_t:
-                return
-            x_values.append(to_t)
-            y_values.append(y_values[-1])
-            current_t = to_t
-
-        def transition(value: float) -> None:
-            x_values.append(current_t)
-            y_values.append(y_values[-1])
-            x_values.append(current_t)
-            y_values.append(value)
-
-        horizontal(baseline_s)
-        for pulse_index in range(pulse_train.pulse_count):
-            pulse_start = baseline_s + pulse_index * period_s
-            horizontal(pulse_start)
-            transition(amplitude)
-            horizontal(pulse_start + duration_s)
-            transition(minimum)
-        horizontal(current_t + post_stim_s)
-        return x_values, y_values
 
 
 class LaserControlContent(ContentWidget):
@@ -1281,6 +1112,9 @@ class LaserControlContent(ContentWidget):
         ))
         self._stream_plot_timer.timeout.connect(self._flush_laser_plots)
         self._stream_plot_timer.start()
+        self._builder = PulseBuilderTab(app_model, self._set_status_from_tab)
+        self._builder.profiles_changed.connect(self._refresh_channel_profiles)
+        self._builder.draft_changed.connect(self._refresh_channel_drafts)
         self._refresh_from_model()
 
     def on_close(self):
@@ -1404,6 +1238,22 @@ class LaserControlContent(ContentWidget):
     def clear_laser_plot(self, channel_id: int) -> None:
         self._plot_process.clear(channel_id)
 
+    def _refresh_channel_profiles(self) -> None:
+        for tab in self._channel_tabs:
+            tab.refresh_stim_profiles()
+
+    def _refresh_channel_drafts(self) -> None:
+        for tab in self._channel_tabs:
+            tab.refresh_draft()
+
+    @staticmethod
+    def _amplitude_range(configuration) -> Tuple[float, float]:
+        channels = tuple(configuration.channels)
+        if not channels:
+            return _DEFAULT_MINIMUM_COMMAND_VOLTS, _DEFAULT_MAXIMUM_COMMAND_VOLTS
+        return (min(c.minimum_command_volts for c in channels),
+                max(c.maximum_command_volts for c in channels))
+
     def _refresh_from_model(self) -> None:
         configuration = self._app_model.laser.configuration
         current = self._current_channel_id()
@@ -1414,6 +1264,9 @@ class LaserControlContent(ContentWidget):
             self._sample_rate_label.setText(f"{configuration.sample_rate_hz:g} Hz")
 
         self._clear_tabs()
+        self._builder.set_amplitude_range(*self._amplitude_range(configuration))
+        if self._tabs.indexOf(self._builder) < 0:
+            self._tabs.insertTab(0, self._builder, "Pulse Builder")
         tabs = []
         configured_channels = {
             int(channel.channel_id): channel
@@ -1432,6 +1285,7 @@ class LaserControlContent(ContentWidget):
                 self._start_operation,
                 self._set_status_from_tab,
                 self,
+                draft_provider=self._builder.draft_profile,
             )
             self._tabs.addTab(tab, f"Laser {channel_index}")
             tabs.append(tab)
@@ -1456,7 +1310,7 @@ class LaserControlContent(ContentWidget):
         if current is not None:
             for index, tab in enumerate(self._channel_tabs):
                 if tab.channel_id_value == current:
-                    self._tabs.setCurrentIndex(index)
+                    self._tabs.setCurrentIndex(index + 1)
                     break
         configured_count = sum(tab.is_configured for tab in self._channel_tabs)
         if configured_count:
@@ -1484,10 +1338,10 @@ class LaserControlContent(ContentWidget):
         )
 
     def _clear_tabs(self) -> None:
-        while self._tabs.count():
-            widget = self._tabs.widget(0)
-            self._tabs.removeTab(0)
-            widget.deleteLater()
+        # The builder stays: its unsaved draft must survive a configuration reload.
+        for tab in self._channel_tabs:
+            self._tabs.removeTab(self._tabs.indexOf(tab))
+            tab.deleteLater()
         self._channel_tabs = tuple()
         self._plot_x_destinations = {}
         self._plot_y_destinations = {}
@@ -1554,6 +1408,7 @@ class LaserControlContent(ContentWidget):
         if is_running is None:
             is_running = self._operation_thread is not None
         can_edit = self._is_editable and not is_running
+        self._builder.set_controls_enabled(can_edit)
         can_run = can_edit and self._app_model.laser.is_connected
         refusals = []
         for tab in self._channel_tabs:

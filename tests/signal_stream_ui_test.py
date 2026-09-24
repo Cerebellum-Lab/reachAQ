@@ -842,9 +842,7 @@ def test_laser_trace_auto_resumes_and_displays_entire_calibration_ramp(qapp):
         assert "Dev1/ai0" not in tab._trace_signal_checkboxes["diode"].text()
         assert tab._trace_signal_checkboxes["diode"].toolTip().startswith("Dev1/ai0\n")
         assert tab._trace_legend._columns == 1
-        assert tab._preview_plot.minimumSize().isEmpty()
         assert tab._trace_plot.minimumSize().isEmpty()
-        assert tab._preview_plot.sizePolicy().verticalPolicy() == QSizePolicy.Policy.Ignored
         assert tab._trace_plot.sizePolicy().verticalPolicy() == QSizePolicy.Policy.Ignored
         assert tab.minimumSizeHint().width() < 430
         assert tuple(entry[0] for entry in tab._trace_legend.entries) == (
