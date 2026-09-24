@@ -880,6 +880,16 @@ class _LaserChannelTab(QWidget):
         self.stim_profile_selector.blockSignals(False)
         self.refresh_draft()
 
+    def select_profile(self, profile_id) -> None:
+        """Pick this profile if it is still listed; otherwise keep the current pick."""
+        index = self.stim_profile_selector.findData(profile_id)
+        if index < 0:
+            return
+        self.stim_profile_selector.blockSignals(True)
+        self.stim_profile_selector.setCurrentIndex(index)
+        self.stim_profile_selector.blockSignals(False)
+        self.refresh_draft()
+
     def refresh_draft(self) -> None:
         profile = self._selected_profile()
         self._profile_summary.setText(
@@ -1263,6 +1273,13 @@ class LaserControlContent(ContentWidget):
         else:
             self._sample_rate_label.setText(f"{configuration.sample_rate_hz:g} Hz")
 
+        # Every system Run/Stop and DAQ Ports save rebuilds the laser tabs. A
+        # new tab starts on the builder draft, so without this a laser set to a
+        # saved profile silently switched to firing whatever was on the builder.
+        picked_profiles = {
+            tab.channel_id_value: tab.stim_profile_selector.currentData()
+            for tab in self._channel_tabs
+        }
         self._clear_tabs()
         self._builder.set_amplitude_range(*self._amplitude_range(configuration))
         if self._tabs.indexOf(self._builder) < 0:
@@ -1287,6 +1304,7 @@ class LaserControlContent(ContentWidget):
                 self,
                 draft_provider=self._builder.draft_profile,
             )
+            tab.select_profile(picked_profiles.get(channel_index))
             self._tabs.addTab(tab, f"Laser {channel_index}")
             tabs.append(tab)
         self._channel_tabs = tuple(tabs)

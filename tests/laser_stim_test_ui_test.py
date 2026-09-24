@@ -232,3 +232,32 @@ def test_the_pulse_builder_is_the_first_laser_control_tab(qapp, app_model):
         content.on_close()
 
 
+def test_a_laser_keeps_its_profile_when_laser_control_rebuilds(qapp, app_model, monkeypatch):
+    # Every system Run/Stop and DAQ Ports save rebuilds the laser tabs. Each
+    # new tab fell back to the builder draft, so a laser set to a saved
+    # profile silently fired whatever was on the builder instead.
+    from tools.acquisition.view.laser_control_content import LaserControlContent
+    profile = a_profile()
+    with_one_listed_profile(monkeypatch, app_model)
+    with_saved_profile(monkeypatch, app_model, profile)
+    content = LaserControlContent(app_model)
+    try:
+        laser_2 = content._channel_tabs[1]
+        laser_2.stim_profile_selector.setCurrentIndex(
+            laser_2.stim_profile_selector.findData("burst"))
+        content._builder._amplitude.setValue(1.5)
+
+        content._refresh_from_model()
+
+        rebuilt = content._channel_tabs[1]
+        assert rebuilt is not laser_2
+        assert rebuilt.stim_profile_selector.currentData() == "burst"
+        assert rebuilt._profile_summary.text() == profile.summary()
+        assert content._channel_tabs[0].stim_profile_selector.currentData() == "builder-draft"
+        assert content._builder._amplitude.value() == pytest.approx(1.5)
+        assert content._tabs.count() == 1 + len(content._channel_tabs)
+        assert content._tabs.tabText(1) == "Laser 1"
+    finally:
+        content.on_close()
+
+
