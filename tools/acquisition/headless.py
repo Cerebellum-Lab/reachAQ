@@ -125,6 +125,16 @@ def main():
 
     args = parser.parse_args()
 
+    # After argument parsing, so -h still answers while an instance runs, and
+    # before logging, so a refused start leaves no log behind.
+    from tools.acquisition.instance_lock import (
+        ALREADY_RUNNING_EXIT, AlreadyRunning, acquire_instance_lock)
+    try:
+        instance_lock = acquire_instance_lock()  # noqa: F841 - held until exit
+    except AlreadyRunning as err:
+        print(err, file=sys.stderr)
+        return ALREADY_RUNNING_EXIT
+
     from autotrainer.core.logging import setup_logging, stop_multiproc_logging
 
     logger = setup_logging(logger_level=logging.DEBUG, time_precision=6, multiprocess_enabled=True)
