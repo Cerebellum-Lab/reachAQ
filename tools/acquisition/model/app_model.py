@@ -3019,15 +3019,20 @@ class AppModel(ObservableObject):
         except Exception:
             logger.exception("NI-DAQ chassis identification could not be read")
 
+        # This named a `configuration` that does not exist in this method, so
+        # from 2026-09-22 every refresh raised here, the except below logged it,
+        # and the wiring summary was never shown.
+        configuration = self._loaded_configuration
         try:
-            wiring = summarize_nidaq_wiring(
-                configuration, WiringVerification.load(self._wiring_record_path))
-            details.append(wiring.detail())
-            warning = wiring.warning()
-            if warning:
-                warnings_list.append(warning)
-            scan_results["nidaq_wiring"] = HardwareScanEntry(
-                wiring.detail(), "ok" if wiring.is_clean else "warning")
+            if configuration is not None:
+                wiring = summarize_nidaq_wiring(
+                    configuration, WiringVerification.load(self._wiring_record_path))
+                details.append(wiring.detail())
+                warning = wiring.warning()
+                if warning:
+                    warnings_list.append(warning)
+                scan_results["nidaq_wiring"] = HardwareScanEntry(
+                    wiring.detail(), "ok" if wiring.is_clean else "warning")
         except Exception:
             logger.exception("NI-DAQ wiring verification could not be read")
 

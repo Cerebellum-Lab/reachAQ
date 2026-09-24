@@ -1,3 +1,4 @@
+import logging
 import os
 from types import SimpleNamespace
 from unittest import mock
@@ -330,7 +331,7 @@ def test_enabled_category_uses_warning_color_from_scan(qapp):
         content.deleteLater()
 
 
-def test_hardware_refresh_publishes_discovered_devices(app_model, monkeypatch):
+def _patch_hardware_scans(app_model, monkeypatch):
     from tools.acquisition.model import app_model as app_model_module
 
     camera_sources = (
@@ -377,6 +378,11 @@ def test_hardware_refresh_publishes_discovered_devices(app_model, monkeypatch):
         "_initialize_pellet_controller_for_refresh",
         initialize_pellet,
     )
+    return initialize_pellet
+
+
+def test_hardware_refresh_publishes_discovered_devices(app_model, monkeypatch):
+    initialize_pellet = _patch_hardware_scans(app_model, monkeypatch)
 
     app_model.refresh_hardware_bindings()
 
@@ -394,6 +400,22 @@ def test_hardware_refresh_publishes_discovered_devices(app_model, monkeypatch):
     assert "controller session connected" in results["pellet"].info
     assert results["pellet"].state == "ok"
     assert results["gpu"].state == "ok"
+
+
+def test_hardware_refresh_reports_wiring_once_configured(app_model, monkeypatch, caplog):
+    # From 2026-09-22 this block named a variable that did not exist, raised
+    # on every refresh, and the wiring summary never appeared. The fixture's
+    # configuration asserts no wiring points, so the summary is 0 of 0.
+    _patch_hardware_scans(app_model, monkeypatch)
+    assert app_model.load_configuration() is True
+
+    with caplog.at_level(logging.ERROR):
+        app_model.refresh_hardware_bindings()
+
+    wiring = app_model.hardware_scan_results["nidaq_wiring"]
+    assert wiring.info == "NI-DAQ wiring 0/0 confirmed"
+    assert wiring.state == "ok"
+    assert not [r for r in caplog.records if "wiring verification could not be read" in r.getMessage()]
 
 
 def test_startup_refresh_initializes_pellet_controller():
