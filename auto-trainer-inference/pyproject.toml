@@ -21,6 +21,10 @@ dependencies = [
     "auto-trainer-core",
 
     'deeplabcut >= 3.0, < 4',  # famous deeplab; 3.x carries both engines
+    # YOLO-pose models, the live model on christielab10. Imported lazily by
+    # yolo_pose_model, so nothing failed at install time without it - live
+    # inference failed at the first frame instead.
+    'ultralytics >= 8.4, < 9',
 
     'pandas >= 2, < 3',
     'numpy >= 1.23.5, < 2',
@@ -28,11 +32,21 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# The two deep-learning frameworks cannot share one environment.
-# nvidia-cudnn-cu11 and nvidia-cudnn-cu12 both install libcudnn.so.8, so
-# whichever is installed last wins and the other framework can no longer run a
-# convolution. Observed on the reachAQ rig: the cu11 build won, TensorFlow works,
-# and every torch convolution aborts the process. Install exactly one extra.
+# Both extras are installed together by tools/install/reachaq-linux-install.sh,
+# which is the supported way to build an environment. Three conditions make
+# that work, each found on christielab10 on 2026-09-24:
+#   - TensorFlow's CUDA 11.8 / cuDNN 8.6 go in a directory of their own, not
+#     site-packages/nvidia. The two frameworks' nvidia-* wheels install into
+#     the same directory and the later one overwrote the earlier: TensorFlow
+#     lost libcudnn.so.8 and fell back to the CPU without a word.
+#   - torch must be a CUDA 12.8 build (the installer takes it from the PyTorch
+#     cu128 index). DeepLabCut 3 imports torch on import, so the TensorFlow
+#     engine always shares a process with it, and the CUDA 13 build aborted
+#     TensorFlow there ("stack smashing detected").
+#   - TensorFlow 2.12's numpy <= 1.24.3 and typing-extensions < 4.6 caps are
+#     overridden: pyqtgraph, PyTables' blosc2 and albumentations need newer,
+#     and TensorFlow 2.12.1 ran GPU convolutions and a DeepLabCut model with
+#     numpy 1.26.4 and typing-extensions 4.16.
 tensorflow = [
     'tensorflow >= 2.12, < 2.13 ; platform_machine != "aarch64"',
     # Capped below 2.13 deliberately: 2.13 pairs with a keras that moved
@@ -47,16 +61,20 @@ tensorflow = [
     'tf-slim >= 1.1, < 2',
     # NB: tensorpack and tf-slim are used/required by deeplabcut, even tough they are not depended on by it,
     # so we explicitly add them here.
+    'imgaug >= 0.4, < 0.5',
+    # DeepLabCut 3's TensorFlow engine imports imgaug and does not declare it.
 ]
 torch = [
-    'torch >= 2.7 ; platform_machine != "aarch64"',
-    # >= 2.7 on a CUDA 12.8+ build covers compute capability 7.5 through 12.0,
+    'torch >= 2.7, < 2.8 ; platform_machine != "aarch64"',
+    # 2.7 on a CUDA 12.8 build covers compute capability 7.5 through 12.0,
     # which is the whole known fleet: T1000 (7.5), RTX A2000 (8.6),
-    # RTX 5060 Ti (12.0). Do not narrow this to one card.
+    # RTX 5060 Ti (12.0). Do not narrow this to one card. Capped below 2.8
+    # because 2.7.1+cu128 is the build shown to share a process with
+    # TensorFlow; a newer one needs that check repeated before the cap moves.
     'torch == 2.1.0a0+41361538.nv23.6 ; platform_machine == "aarch64"',
     # ensure we get/specify the desired version from nvidia for aarch64 ( == Jetson)
 
-    'torchvision ; platform_machine != "aarch64"',
+    'torchvision >= 0.22, < 0.23 ; platform_machine != "aarch64"',
 ]
 
 [tool.setuptools_scm]
