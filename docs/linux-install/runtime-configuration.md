@@ -305,21 +305,26 @@ record until reachAQ exits.
 
 ## Current workstation reference
 
-Last documentation update 2026-09-09. Entries marked (verified) were re-checked
-on the workstation on that date.
+Last documentation update 2026-09-24. Entries marked (verified) were re-checked
+on the workstation on that date; the hardware entries are from 2026-09-09.
 
 - Dell Precision 3660 Tower; Ubuntu 22.04.5 LTS, x86_64; kernel
-  `6.8.0-136-generic` (verified). 12th Gen Core i9-12900: 8 P-cores on CPU
-  0-15 at 5000-5100 MHz, 8 E-cores on CPU 16-23 at 3800 MHz (verified).
-- Conda environment `/home/christielab10/anaconda3/envs/reachaq`, Python
-  3.8.20, TensorFlow **2.12.1** (verified). Not 2.13: that release pairs with a
-  keras which moved `legacy_tf_layers`, which breaks `tf_slim` batch norm and
-  therefore every DeepLabCut model load.
-- Conda environment `reachaq-test310`, Python 3.10.21, for running the test
-  suite on the version the packages now require. It has torch 2.14.0 and
-  DeepLabCut 3.0.1 and deliberately no TensorFlow. It cannot run the three
-  tests that import `PySpin`, because the vendored Spinnaker wheel is cp38.
-- Spinnaker system runtime 3.2.0.57 (verified); bundled Python wheel 3.2.0.62.
+  `6.8.0-136-generic`. 12th Gen Core i9-12900: 8 P-cores on CPU 0-15 at
+  5000-5100 MHz, 8 E-cores on CPU 16-23 at 3800 MHz.
+- Conda environment `reachaq`, built by the portable installer on 2026-09-24
+  (verified): Python 3.10.21; torch 2.7.1+cu128 (CUDA 12.8, cuDNN 9.7);
+  TensorFlow 2.12.1 with its CUDA 11.8 / cuDNN 8.6 in
+  `lib/reachaq-tensorflow-cuda11`; DeepLabCut 3.0.2; ultralytics 8.4; numpy
+  1.26.4; PySide6 6.6.3.1; nidaqmx 1.6.0; spinnaker-python 3.2.0.62. Both
+  engines pass their GPU checks, alone and in one process; the live YOLO model
+  runs at about 4 ms/frame and the DeepLabCut TensorFlow model
+  `mouseGYM-christie-2025-09-18` at about 53 ms/frame.
+- Conda environment `reachaq-py38-20260924`: the previous Python 3.8.20
+  environment, archived by the installer, kept as a fallback. In it TensorFlow
+  2.12.1 had silently lost its GPU - torch's cuDNN 9 had overwritten its cuDNN 8
+  - so DeepLabCut TensorFlow models ran on the CPU there.
+- Spinnaker system runtime 3.2.0.57 (verified); bundled Python wheel 3.2.0.62,
+  which lists both cameras against it (verified).
 - NI-DAQmx 26.3.1 (verified) and PXI Platform Services 26.3; configured
   PXI-6713 output alias `PXI1Slot4` and PXI-6221 sampled-input alias
   `PXI1Slot5`. Kernel modules `nitiork`, `niwfrk` and `nixsrk` are built
@@ -332,6 +337,7 @@ on the workstation on that date.
   the TU117 die and has no tensor cores despite reporting compute capability
   7.5, so FP16 measures 3-4x slower than FP32 on it.
 - Local output `/home/christielab10/Documents/rawdatalocal`.
-- Full software suite on this workstation, Python 3.8: 1164 passed, 35 skipped
-  (verified). Run it with `ulimit -n` at its default 1024; the suite no longer
-  exhausts the descriptor limit.
+- The installer's focused suite in `reachaq`, Python 3.10: 228 passed
+  (verified). The full suite was last run on the Python 3.8 environment
+  (2026-09-09): 1164 passed, 35 skipped. Run it with `ulimit -n` at its default
+  1024; the suite no longer exhausts the descriptor limit.
