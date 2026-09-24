@@ -72,7 +72,7 @@ def test_a_migrated_document_has_no_cue_pair():
     assert row.cue_interval_fixed_ms == 0
 
 
-@pytest.mark.parametrize("schema_version", [0, 3, 99, -1])
+@pytest.mark.parametrize("schema_version", [0, 4, 99, -1])
 def test_an_unknown_schema_is_refused_not_guessed(schema_version):
     with pytest.raises(ValueError, match="Unsupported protocol schema"):
         TrialProtocolDocument.from_record(_record(schema_version))

@@ -100,6 +100,7 @@ def _row(trial_id=1, **changes):
         "laser_profile_id": "pulse",
         "laser_phase": "pellet_presentation",
         "laser_trigger_route": "hardware_stim3",
+        "laser_channel_id": 1,
         "stimulus_assignment": "randomized",
         "stimulus_trigger_profile_id": "mixed",
     }
@@ -293,6 +294,7 @@ def test_non_randomized_rows_keep_their_declared_trigger():
         stimulus_trigger="first_reach",
         stimulus_trigger_profile_id="",
         laser_trigger_route="direct_ni_software",
+        laser_channel_id=1,
         laser_profile_id="direct",
     )
     compiler = TrialActionCompiler(
