@@ -3,6 +3,8 @@ from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import pytest
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QComboBox, QDoubleSpinBox
 
@@ -64,6 +66,10 @@ class _Model:
             "completed_trial_ids": (1,),
             "analysis": {},
         }
+        self.laser = SimpleNamespace(configuration=SimpleNamespace(channels=(
+            SimpleNamespace(channel_id=1, trigger_source="/Dev1/PXI_Trig0", board_stim_line=3),
+            SimpleNamespace(channel_id=2, trigger_source="/Dev1/PXI_Trig2", board_stim_line=2),
+        )))
 
     def update_trial_protocol_row(self, trial_id, field, value):
         self.updated.append((trial_id, field, value))
@@ -170,3 +176,70 @@ def test_analysis_resolution_actions_are_shown_only_when_needed():
     assert content._continue_without_analysis.isVisible()
     assert "analysis worker failed" in content._analysis_status.text()
     content.close()
+
+
+@pytest.fixture
+def content():
+    QApplication.instance() or QApplication([])
+    return ProtocolContent(_Model())
+
+
+def test_the_default_laser_is_the_first_a_board_stim_action_can_fire(content):
+    assert content._laser_channel_options() == (1, 2)
+    assert content._default_laser_channel() == 1
+
+
+def test_the_protocol_table_has_a_laser_column_beside_the_profile(content):
+    labels = [column.label for column in content.COLUMNS]
+
+    assert labels.index("Laser") == labels.index("Laser profile") + 1
+
+
+def test_the_protocol_tab_has_no_new_laser_button(content):
+    from PySide6.QtWidgets import QToolButton
+    texts = {button.text() for button in content.findChildren(QToolButton)}
+
+    assert "New laser" not in texts
+    assert not hasattr(content, "_new_laser_profile")
+
+
+def test_picking_a_profile_on_a_row_without_a_laser_completes_the_action(content, monkeypatch):
+    monkeypatch.setattr(content, "_default_laser_channel", lambda: 2)
+
+    patch = content._laser_patch(
+        "laser_profile_id", "pulse", {"laser_trigger_route": "none"})
+
+    assert patch == {
+        "laser_profile_id": "pulse",
+        "laser_phase": "pellet_presentation",
+        "laser_trigger_route": "hardware_stim3",
+        "laser_channel_id": 2,
+    }
+
+
+def test_clearing_the_profile_clears_the_whole_laser_action(content):
+    patch = content._laser_patch("laser_profile_id", "", {"laser_trigger_route": "hardware_stim3"})
+
+    assert patch == {
+        "laser_profile_id": "",
+        "laser_phase": "none",
+        "laser_trigger_route": "none",
+        "laser_channel_id": 0,
+    }
+
+
+def test_filling_a_laser_field_copies_the_rows_whole_laser_action(content):
+    source = {
+        "laser_profile_id": "pulse",
+        "laser_phase": "pellet_presentation",
+        "laser_trigger_route": "direct_ni_software",
+        "laser_channel_id": 1,
+    }
+
+    assert content._laser_values_from(source, "laser_channel_id") == source
+    assert content._laser_values_from(source, "tone_profile_id") is None
+
+
+def test_the_laser_column_shows_the_laser(content):
+    assert content._display_value("laser_channel_id", 0) == "None"
+    assert content._display_value("laser_channel_id", 2) == "Laser 2"
