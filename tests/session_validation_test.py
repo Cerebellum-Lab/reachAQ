@@ -297,6 +297,45 @@ def test_validator_reconciles_automatic_shift_policy_and_recommendation(tmp_path
     ).status.value == "pass"
 
 
+def _pose_source_contract(tmp_path, listed, present):
+    # As the recorder writes it: "path" names the source, "paths" are its files.
+    root = _session(tmp_path)
+    stream_path = root / "streams/stream_manifest.json"
+    stream = json.loads(stream_path.read_text(encoding="utf-8"))
+    stream["enabledSources"] = [{
+        "id": "pose",
+        "kind": "pose",
+        "path": "pose",
+        "paths": listed,
+        "sampleCount": 10,
+        "persistenceStatus": "written",
+    }]
+    _write(stream_path, json.dumps(stream))
+    for name in present:
+        _write(root / name, "h5")
+    report = validate_session(
+        root, profile=ValidationProfile.QUICK, selected_rules=("sources.contract",))
+    return next(item for item in report.results if item.rule_id == "sources.contract")
+
+
+def test_a_source_written_as_several_files_is_checked_by_its_paths(tmp_path):
+    files = ["s_left_raw2D_live.h5", "s_right_raw2D_live.h5"]
+    assert _pose_source_contract(tmp_path, files, files).status.value == "pass"
+
+
+def test_a_missing_file_among_a_sources_paths_is_named(tmp_path):
+    files = ["s_left_raw2D_live.h5", "s_right_raw2D_live.h5"]
+    result = _pose_source_contract(tmp_path, files, files[:1])
+    assert result.status.value == "fail"
+    assert "pose: artifact missing: s_right_raw2D_live.h5" in result.message
+
+
+def test_a_source_with_an_empty_paths_list_is_missing(tmp_path):
+    result = _pose_source_contract(tmp_path, [], [])
+    assert result.status.value == "fail"
+    assert "pose: artifact missing" in result.message
+
+
 def test_event_sources_may_be_empty_without_failing_continuous_coverage(tmp_path):
     root = _session(tmp_path)
     stream_path = root / "streams/stream_manifest.json"
