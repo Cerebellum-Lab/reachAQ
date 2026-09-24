@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from collections import Counter
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -557,22 +558,20 @@ class NidaqPortConfigurationDialog(QDialog):
                     f"Laser {laser_index} has incomplete DAQ mapping: missing {', '.join(missing)}"
                 )
             previous = existing.get(laser_index)
+            mapped = dict(
+                analog_output=values["laser_out"],
+                diode_input=values["diode"],
+                shutter_output=values["shutter"],
+                command_copy_input=values["laser_copy"],
+            )
+            # Only the roles this dialog edits. Rebuilding the channel field by
+            # field dropped every field it did not list, so each save erased
+            # trigger_route_source, trigger_monitor_input and the board
+            # trigger wiring.
             channels.append(
-                LaserChannelConfiguration(
-                    channel_id=LaserChannelId(laser_index),
-                    analog_output=values["laser_out"],
-                    diode_input=values["diode"],
-                    shutter_output=values["shutter"],
-                    auxiliary_output=None if previous is None else previous.auxiliary_output,
-                    command_copy_input=values["laser_copy"],
-                    trigger_source=None if previous is None else previous.trigger_source,
-                    trigger_output=None if previous is None else previous.trigger_output,
-                    timing_trigger_output=None if previous is None else previous.timing_trigger_output,
-                    minimum_command_volts=0.0 if previous is None else previous.minimum_command_volts,
-                    maximum_command_volts=5.0 if previous is None else previous.maximum_command_volts,
-                    feedback_scale=1.0 if previous is None else previous.feedback_scale,
-                    command_copy_scale=1.0 if previous is None else previous.command_copy_scale,
-                )
+                LaserChannelConfiguration(channel_id=LaserChannelId(laser_index), **mapped)
+                if previous is None
+                else dataclasses.replace(previous, **mapped)
             )
 
         current = self._configuration.laser

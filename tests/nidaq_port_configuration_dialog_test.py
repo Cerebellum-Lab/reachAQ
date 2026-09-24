@@ -7,6 +7,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from autotrainer.core import (  # noqa: E402
+    LaserChannelConfiguration,
+    LaserSystemConfiguration,
     NidaqDeviceIdentity,
     NidaqPortConfiguration,
     NidaqTimingConfiguration,
@@ -276,3 +278,39 @@ def test_independent_boards_without_requiring_synchronization_is_allowed():
 
     assert timing.sync_mode == "independent"
     assert timing.task_strategy == "per_device"
+
+
+def test_saving_laser_ports_keeps_the_fields_the_dialog_does_not_edit(qapp):
+    # The dialog rebuilt each channel field by field and dropped the rest, so
+    # every save erased trigger_route_source - the PXI_Trig route a board STIM
+    # trigger needs on christielab10 - and trigger_monitor_input.
+    device = NidaqDevicePorts(
+        name="Dev1",
+        analog_outputs=("Dev1/ao0",),
+        analog_inputs=("Dev1/ai0", "Dev1/ai1"),
+        digital_outputs=("Dev1/port0/line4",),
+    )
+    config = SystemConfiguration()
+    config.laser = LaserSystemConfiguration.from_channels((
+        LaserChannelConfiguration(
+            channel_id=1,
+            analog_output="Dev1/ao0",
+            diode_input="Dev1/ai0",
+            shutter_output="Dev1/port0/line4",
+            command_copy_input="Dev1/ai1",
+            trigger_source="/Dev1/PXI_Trig0",
+            trigger_route_source="/Dev1/PFI0",
+            trigger_monitor_input="Dev1/ai1",
+            board_stim_line=3,
+            board_trigger_pulse_us=1500,
+        ),
+    ))
+    dialog = NidaqPortConfigurationDialog(config, devices=(device,))
+
+    channel = dialog._build_laser_configuration().get_channel(1)
+
+    assert channel.trigger_source == "/Dev1/PXI_Trig0"
+    assert channel.trigger_route_source == "/Dev1/PFI0"
+    assert channel.trigger_monitor_input == "Dev1/ai1"
+    assert channel.board_stim_line == 3
+    assert channel.board_trigger_pulse_us == 1500
