@@ -3,6 +3,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from autotrainer.device import LaserChannelConfiguration, LaserSystemConfiguration
+
 from tools.acquisition.model.trial_action import (
     LaserPulseProfile,
     PreparedState,
@@ -13,6 +15,18 @@ from tools.acquisition.model.trial_action import (
     TrialCompileContext,
 )
 from tools.acquisition.model.trial_protocol_schedule import TrialProtocolRow
+
+
+LASERS = LaserSystemConfiguration.from_channels((
+    LaserChannelConfiguration(
+        channel_id=1,
+        analog_output="Dev4/ao0",
+        diode_input="Dev4/ai0",
+        shutter_output="Dev4/port0/line0",
+        trigger_source="/Dev4/PXI_Trig0",
+        board_stim_line=3,
+    ),
+))
 
 
 def _context(**changes):
@@ -44,6 +58,7 @@ def _compiler():
                 trigger_terminal="/Dev4/PFI0",
             )
         },
+        laser_configuration=LASERS,
         dcs_to_motor=lambda values: tuple(value * 2 for value in values),
     )
 
@@ -133,10 +148,13 @@ def test_retry_repeat_keeps_draw_while_resample_changes_it():
     assert resampled.stimulus_seed != first.stimulus_seed
 
 
-def test_compile_rejects_unknown_or_route_mismatched_profile():
+def test_compile_rejects_unknown_laser_profile():
+    # The row's own trigger route now resolves the firing (a laser row no
+    # longer has to agree with the profile's own trigger_route field), so the
+    # remaining rejection here is an unknown profile ID.
     row = TrialProtocolRow(trial_id=1).with_updates({
         "enabled": True,
-        "laser_profile_id": "pulse",
+        "laser_profile_id": "missing",
         "laser_phase": "before_send",
         "laser_trigger_route": "direct_ni_software",
         "laser_channel_id": 1,
@@ -144,7 +162,7 @@ def test_compile_rejects_unknown_or_route_mismatched_profile():
         "stimulus_trigger": "first_reach",
     })
 
-    with pytest.raises(ValueError, match="routes differ"):
+    with pytest.raises(ValueError, match="Unknown laser profile"):
         _compiler().compile(row, _context())
 
 
@@ -331,3 +349,41 @@ def test_executor_persists_laser_result_and_rejects_failed_cycle():
     record = executor.operation_record()
     assert record["state"] == "failed"
     assert record["actions"]["laser"]["state"] == "failed"
+
+
+def test_a_laser_row_compiles_to_the_lasers_own_firing():
+    row = TrialProtocolRow(trial_id=1).with_updates({
+        "enabled": True,
+        "laser_profile_id": "pulse",
+        "laser_phase": "pellet_presentation",
+        "laser_trigger_route": "hardware_stim3",
+        "laser_channel_id": 1,
+        "stimulus_assignment": "always",
+        "stimulus_trigger": "tone_1",
+        "tone_profile_id": "cue",
+        "tone_phase": "before_send",
+    })
+
+    recipe = _compiler().compile(row, _context())
+
+    assert recipe.laser_firing.channel_id == 1
+    assert recipe.laser_firing.trigger_terminal == "/Dev4/PXI_Trig0"
+    assert recipe.laser_firing.stim_line == 3
+    assert recipe.to_record()["laser_firing"]["stim_line"] == 3
+
+
+def test_a_laser_row_on_an_unconfigured_laser_does_not_compile():
+    row = TrialProtocolRow(trial_id=1).with_updates({
+        "enabled": True,
+        "laser_profile_id": "pulse",
+        "laser_phase": "pellet_presentation",
+        "laser_trigger_route": "hardware_stim3",
+        "laser_channel_id": 2,
+        "stimulus_assignment": "always",
+        "stimulus_trigger": "tone_1",
+        "tone_profile_id": "cue",
+        "tone_phase": "before_send",
+    })
+
+    with pytest.raises(ValueError, match="Laser 2 is not configured"):
+        _compiler().compile(row, _context())

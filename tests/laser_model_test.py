@@ -6,9 +6,14 @@ from types import SimpleNamespace
 import pytest
 
 from autotrainer.device import LaserChannelConfiguration, LaserSystemConfiguration
+from tools.acquisition.model.laser_firing import LaserFiring
 from tools.acquisition.model.laser_model import LaserModel
 from tools.acquisition.model.trial_action import LaserPulseProfile
 from tools.acquisition.model.trial_protocol_schedule import LaserTriggerRoute
+
+
+BOARD = LaserFiring(1, LaserTriggerRoute.HARDWARE_STIM3, "/Dev1/PFI0", 3, 1000)
+SOFTWARE = LaserFiring(1, LaserTriggerRoute.DIRECT_NI_SOFTWARE)
 
 
 class _Controller:
@@ -65,7 +70,7 @@ def test_prepare_hardware_laser_profile_freezes_context_and_trigger():
         trigger_terminal="/Dev1/PFI0",
     )
 
-    assert model.prepare_pulse_profile(profile, _recipe()) is controller.operation
+    assert model.prepare_pulse_profile(profile, BOARD, _recipe()) is controller.operation
     assert controller.pulse.trigger_source == "/Dev1/PFI0"
     assert not controller.pulse.defer_start
     assert controller.pulse.operation_context["trial_operation_id"] == "trial-op"
@@ -79,7 +84,7 @@ def test_prepare_direct_laser_profile_defers_start():
         trigger_route=LaserTriggerRoute.DIRECT_NI_SOFTWARE,
     )
 
-    model.prepare_pulse_profile(profile, _recipe())
+    model.prepare_pulse_profile(profile, SOFTWARE, _recipe())
     assert controller.pulse.trigger_source is None
     assert controller.pulse.defer_start
 
@@ -100,7 +105,7 @@ def test_prepare_direct_profile_accepts_explicit_simulated_timing():
         trigger_route=LaserTriggerRoute.DIRECT_NI_SOFTWARE,
     )
 
-    operation = model.prepare_pulse_profile(profile, _recipe())
+    operation = model.prepare_pulse_profile(profile, SOFTWARE, _recipe())
     operation.trigger()
 
     assert operation.wait(1).value == "completed"
@@ -123,7 +128,7 @@ def test_prepare_hardware_laser_rejects_unverified_timing():
     )
 
     with pytest.raises(RuntimeError, match="trigger route was not verified"):
-        model.prepare_pulse_profile(profile, _recipe())
+        model.prepare_pulse_profile(profile, BOARD, _recipe())
 
 
 def test_direct_trigger_receiver_validates_nonce_and_starts_prepared_operation():
@@ -133,7 +138,7 @@ def test_direct_trigger_receiver_validates_nonce_and_starts_prepared_operation()
         "pulse", 1, 1, 2.5, 5,
         trigger_route=LaserTriggerRoute.DIRECT_NI_SOFTWARE,
     )
-    model.prepare_pulse_profile(profile, _recipe())
+    model.prepare_pulse_profile(profile, SOFTWARE, _recipe())
     model.bind_direct_trigger_nonce("trial-op", "once")
     trigger_queue = queue.Queue(maxsize=1)
     result_ready = threading.Event()
@@ -177,3 +182,19 @@ def test_direct_trigger_receiver_restarts_after_acquisition_stop():
         assert model._direct_trigger_thread.is_alive()
     finally:
         model.stop_direct_trigger_receiver()
+
+
+def test_prepare_takes_the_laser_and_terminal_from_the_firing_not_the_profile():
+    controller = _Controller()
+    model = LaserModel(controller)
+    profile = LaserPulseProfile(
+        "pulse", 1, 1, 2.5, 5,
+        trigger_route=LaserTriggerRoute.HARDWARE_STIM3,
+        trigger_terminal="/Dev1/ignored",
+    )
+
+    model.prepare_pulse_profile(
+        profile, LaserFiring(1, LaserTriggerRoute.HARDWARE_STIM3, "/Dev1/PXI_Trig0", 3), _recipe())
+
+    assert controller.pulse.trigger_source == "/Dev1/PXI_Trig0"
+    assert controller.pulse.operation_context["laser_channel_id"] == 1

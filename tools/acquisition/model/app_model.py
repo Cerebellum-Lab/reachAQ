@@ -240,6 +240,7 @@ from tools.acquisition.model.trial_action import (
     TrialActionExecutor,
     TrialCompileContext,
 )
+from tools.acquisition.model.laser_firing import resolve_laser_firing
 from tools.acquisition.model.automatic_pellet_shift import (
     AutomaticPelletShiftController,
     AutomaticShiftPolicy,
@@ -5076,6 +5077,7 @@ class AppModel(ObservableObject):
             laser_profiles=self._laser_profiles,
             cue_interval_profiles=self._cue_interval_profiles,
             stimulus_trigger_profiles=self._stimulus_trigger_profiles,
+            laser_configuration=self._laser.configuration,
             dcs_to_motor=dcs_to_motor,
         )
         return compiler.compile(row, context)
@@ -5125,10 +5127,10 @@ class AppModel(ObservableObject):
     def _configure_protocol_cover(self, policy: str, recipe) -> None:
         row = recipe.requested_row
         if recipe.stimulus_selected and row["stimulus_trigger"] == "pre_reveal":
-            profile = recipe.laser_profile
-            if profile is None or profile.trigger_route.value != "hardware_stim3":
+            firing = recipe.laser_firing
+            if firing is None or not firing.is_board_trigger:
                 raise RuntimeError(
-                    "Pre-reveal stimulation requires a Hardware STIM3 laser profile"
+                    "Pre-reveal stimulation requires a board STIM laser row"
                 )
             if policy != "reveal":
                 raise RuntimeError(
@@ -5136,7 +5138,7 @@ class AppModel(ObservableObject):
                 )
             self._behavior.system_machine.pellet.prepare_pre_reveal_stimulus(
                 row["pre_reveal_ms"],
-                profile.trigger_pulse_us,
+                firing.trigger_pulse_us,
             )
             return
         self._behavior.system_machine.pellet.prepare_cover_policy(policy)
@@ -5160,17 +5162,16 @@ class AppModel(ObservableObject):
         prepare = getattr(self._laser, "prepare_pulse_profile", None)
         if prepare is None:
             raise RuntimeError("Asynchronous protocol laser preparation is unavailable")
-        trigger_terminal = profile.trigger_terminal
-        if trigger_terminal:
-            trigger_terminal = remap_nidaq_physical_channel(
-                trigger_terminal,
-                self._nidaq_signal_monitor.runtime_device_aliases,
+        firing = recipe.laser_firing
+        if firing.trigger_terminal:
+            firing = dataclasses.replace(
+                firing,
+                trigger_terminal=remap_nidaq_physical_channel(
+                    firing.trigger_terminal,
+                    self._nidaq_signal_monitor.runtime_device_aliases,
+                ),
             )
-            profile = dataclasses.replace(
-                profile,
-                trigger_terminal=trigger_terminal,
-            )
-        return prepare(profile, recipe)
+        return prepare(profile, firing, recipe)
 
     def _prepare_protocol_stim_detector(self, recipe):
         camera = self._stim_camera
@@ -5186,7 +5187,7 @@ class AppModel(ObservableObject):
             "logical_trial_id": recipe.logical_trial_id,
             "attempt_id": recipe.attempt_id,
             "nonce": uuid.uuid4().hex,
-            "trigger_route": recipe.laser_profile.trigger_route.value,
+            "trigger_route": recipe.laser_firing.trigger_route.value,
         }
         return handle
 
@@ -5201,12 +5202,13 @@ class AppModel(ObservableObject):
             self._stim_camera.disarm_stim_detector(handle.get("operation_id"))
 
     def _trigger_protocol_stim3(self, profile, recipe, detail) -> None:
+        firing = recipe.laser_firing
         token = self._hardware.pulse_stim(
-            profile.trigger_pulse_us, stim_line=profile.stim_line
+            firing.trigger_pulse_us, stim_line=firing.stim_line
         )
         if token is None:
-            raise RuntimeError("Firmware STIM3 pulse was not queued")
-        timeout = max(3.0, profile.trigger_pulse_us / 1e6 + 2.0)
+            raise RuntimeError("Firmware STIM{} pulse was not queued".format(firing.stim_line))
+        timeout = max(3.0, firing.trigger_pulse_us / 1e6 + 2.0)
         self._hardware.wait_pending_command_acked(token, timeout=timeout)
 
     def run_stim_bench_test(self, profile_id: str) -> StimTestResult:
@@ -5240,7 +5242,9 @@ class AppModel(ObservableObject):
             raise RuntimeError(refusal)
 
         finished = threading.Event()
-        prepared = self._laser.prepare_pulse_profile(profile, BenchRecipe())
+        firing = resolve_laser_firing(
+            self._laser.configuration, profile.channel_id, profile.trigger_route)
+        prepared = self._laser.prepare_pulse_profile(profile, firing, BenchRecipe())
         add_terminal_callback = getattr(prepared, "add_terminal_callback", None)
         if add_terminal_callback is not None:
             add_terminal_callback(lambda _operation: finished.set())
@@ -5326,7 +5330,7 @@ class AppModel(ObservableObject):
             if not captured:
                 raise RuntimeError("stim trigger could not enter the session event ledger")
             if (
-                operation.recipe.laser_profile.trigger_route
+                operation.recipe.laser_firing.trigger_route
                 is LaserTriggerRoute.HARDWARE_STIM3
             ):
                 self._trial_action_executor.trigger_stimulus(

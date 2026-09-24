@@ -1,7 +1,8 @@
 import threading
-from types import SimpleNamespace
 
 import pytest
+
+from autotrainer.device import LaserChannelConfiguration, LaserSystemConfiguration
 
 from tools.acquisition.model.stim_bench_test import StimTestResult
 from tools.acquisition.model.trial_action import LaserPulseProfile
@@ -36,14 +37,22 @@ class FakeLaser:
         self.operation = operation
         self.prepared = []
         self.released = []
-        self.configuration = SimpleNamespace(
-            backend=backend,
-            channels=tuple(
-                SimpleNamespace(channel_id=item) for item in channel_ids
+        self.configuration = LaserSystemConfiguration.from_channels(
+            tuple(
+                LaserChannelConfiguration(
+                    channel_id=item,
+                    analog_output=f"Dev1/ao{item - 1}",
+                    diode_input=f"Dev1/ai{item - 1}",
+                    shutter_output=f"Dev1/port0/line{item - 1}",
+                    trigger_source="/Dev1/PFI0",
+                    board_stim_line=3,
+                )
+                for item in channel_ids
             ),
+            backend=backend,
         )
 
-    def prepare_pulse_profile(self, profile, recipe):
+    def prepare_pulse_profile(self, profile, firing, recipe):
         self.prepared.append((profile, recipe))
         return self.operation
 

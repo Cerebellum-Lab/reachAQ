@@ -1,5 +1,7 @@
 import pytest
 
+from autotrainer.device import LaserChannelConfiguration, LaserSystemConfiguration
+
 from tools.acquisition.model.stimulus_profile_repository import (
     PROFILE_SCHEMA_VERSION,
     StimulusProfileLibrary,
@@ -17,6 +19,17 @@ from tools.acquisition.model.trial_protocol_schedule import (
     TrialProtocolRow,
 )
 
+
+LASERS = LaserSystemConfiguration.from_channels((
+    LaserChannelConfiguration(
+        channel_id=1,
+        analog_output="Dev4/ao0",
+        diode_input="Dev4/ai0",
+        shutter_output="Dev4/port0/line0",
+        trigger_source="/Dev4/PXI_Trig0",
+        board_stim_line=3,
+    ),
+))
 
 TONE_1 = ToneProfile("tone-1", 1, 5_000, 100)
 TONE_2 = ToneProfile("tone-2", 1, 6_000, 100)
@@ -86,6 +99,7 @@ def _compiler():
             "mixed": MIXED,
             "first_reach_only": FIRST_REACH_ONLY,
         },
+        laser_configuration=LASERS,
         dcs_to_motor=lambda values: tuple(value * 2 for value in values),
     )
 
@@ -224,6 +238,7 @@ def test_tone_2_offset_must_fit_inside_the_shortest_cue_interval():
         laser_profiles={"pulse": LASER},
         cue_interval_profiles={"published": CUE},
         stimulus_trigger_profiles={"long": long_offset},
+        laser_configuration=LASERS,
         dcs_to_motor=lambda values: values,
     )
     # The published 4 s support starts at 305 ms, so a 400 ms lead cannot fire.
@@ -305,6 +320,7 @@ def test_non_randomized_rows_keep_their_declared_trigger():
             )
         },
         cue_interval_profiles={"published": CUE},
+        laser_configuration=LASERS,
         dcs_to_motor=lambda values: values,
     )
     recipe = compiler.compile(row, _context())
