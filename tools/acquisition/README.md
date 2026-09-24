@@ -51,7 +51,8 @@ configured physical camera serials when the app closes.
 
 Selecting Running first shows `Starting acquisition...` and temporarily
 disables camera and DAQ editing. If live inference is enabled, its NVIDIA driver
-and TensorFlow GPU preflight is reported as the live-inference domain. A failed
+and GPU preflight - for the engine the configured model runs on - is reported
+as the live-inference domain. A failed
 preflight prevents inference from starting but does not prevent independent
 camera, CAN, laser, or NI-DAQ initialization. Each domain reports its own Ready,
 Blocked, Failed, or Disabled state. Record remains unavailable until every

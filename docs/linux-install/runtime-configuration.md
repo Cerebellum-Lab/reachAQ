@@ -238,7 +238,7 @@ bump past 57 is acceptable.
 | Variable | Default | Effect |
 |---|---|---|
 | `REACHAQ_STIM_RT_PRIORITY` | `80` | SCHED_FIFO priority for the stim capture loop. `0`, `off` or `false` disables it. See the [latency tuning guide](latency-tuning.md). |
-| `REACHAQ_POSE_BACKEND` | `tensorflow` | Selects the DeepLabCut engine: `tensorflow` or `torch`. Also selects which GPU runtime the live-inference preflight probes, so the two cannot disagree. |
+| `REACHAQ_POSE_BACKEND` | `tensorflow` | Selects the engine a DeepLabCut model runs on: `tensorflow` or `torch`. Both are installed. A YOLO model ignores it and always runs on `torch`. Also selects which GPU runtime the live-inference preflight probes, so the two cannot disagree. |
 | `REACHAQ_POSE_CONFIDENCE_THRESHOLD` | per backend | Confidence a keypoint needs to count as present and to enter 3D triangulation. Defaults to 0.9 for `tensorflow` and 0.6 for `torch`, because the engines report on different scales: TensorFlow saturates its likelihood at 1.0 while PyTorch reports a real distribution around 0.77. The PyTorch default is provisional and should be re-derived on held-out frames. |
 | `REACHAQ_INFERENCE_ROI` | unset | `x,y,width,height`. Crops live frames to this window before inference and shifts the returned coordinates back into full-frame space. Unset means full frame. |
 
@@ -248,12 +248,19 @@ model load fails with a message saying so.
 
 ## Verification
 
-Portable CLI/import checks and the focused non-hardware suite are part of the
-tracked installer. The supported repair/verification workflow reruns every
-category:
+Portable CLI/import checks, the pose-engine GPU checks and the focused
+non-hardware suite are part of the tracked installer. The supported
+repair/verification workflow reruns every category:
 
 ```bash
 tools/install/reachaq-linux-install.sh
+```
+
+On a rig whose root-owned setup is already in place, skip those steps; they are
+reported as `SKIP`:
+
+```bash
+REACHAQ_INSTALL_SYSTEM=0 tools/install/reachaq-linux-install.sh
 ```
 
 ## Diagnose startup waits
@@ -293,7 +300,7 @@ record until reachAQ exits.
 | CAN interface down | [PEAK/SocketCAN guide](peak-socketcan.md), bitrate and termination |
 | CAN reset asks for a password | Activate the `reachaq` login group by logging out/in, then verify the narrow `sudo -n` permission |
 | CAN RX continues but startup ACK times out | Preserve the application log; this is an application startup/ACK path issue rather than proof of a dead bus |
-| TensorFlow reports no GPU | [NVIDIA guide](nvidia-inference.md) or `--no-live-inference` |
+| TensorFlow or PyTorch reports no GPU | [NVIDIA guide troubleshooting](nvidia-inference.md#troubleshooting) or `--no-live-inference` |
 | Output permission error | Configured data directory ownership and write permission |
 
 ## Current workstation reference
