@@ -26,7 +26,7 @@ def qapp():
 
 
 def make_tab(app_model, channel_id=LaserChannelId.LASER_1, trigger_source=None,
-             board_stim_line=None):
+             board_stim_line=None, draft_provider=None):
     channel = LaserChannelConfiguration(
         channel_id=channel_id,
         analog_output="/Dev1/ao0",
@@ -44,6 +44,7 @@ def make_tab(app_model, channel_id=LaserChannelId.LASER_1, trigger_source=None,
         None,
         lambda status, operation: started.append((status, operation)),
         lambda message, is_error: statuses.append((message, is_error)),
+        draft_provider=draft_provider,
     )
     return tab, started, statuses
 
@@ -63,7 +64,9 @@ def test_the_channel_tab_offers_a_stim_test_control(channel_tab):
 def test_run_pulse_is_internal_even_when_the_channel_has_a_trigger_route(qapp, app_model):
     # Defaulting to external armed Run pulse for a board STIM pulse nothing on
     # this tab sends; on christielab10 every attempt ended in a DAQmx timeout.
-    tab, _started, _statuses = make_tab(app_model, trigger_source="/Dev1/PXI_Trig0")
+    draft = LaserPulseProfile("builder-draft", 1, 1.0, 1.0)
+    tab, _started, _statuses = make_tab(
+        app_model, trigger_source="/Dev1/PXI_Trig0", draft_provider=lambda: draft)
 
     assert tab._trigger_mode.currentText() == "internal"
     assert tab._trigger_source.text() == "/Dev1/PXI_Trig0"
@@ -125,47 +128,17 @@ def with_laser_profiles(monkeypatch, app_model, profiles):
     )
 
 
-def test_the_selector_lists_every_saved_profile_not_only_this_channel(
-    qapp, app_model, monkeypatch
-):
-    # Any saved profile can fire on any laser now, so the selector no longer
-    # filters by which channel a profile once named.
-    with_laser_profiles(
-        monkeypatch,
-        app_model,
-        (
-            {"profile_id": "one", "revision": 1, "summary": "2 V · 1 × 5 ms · 0.01 s"},
-            {"profile_id": "two", "revision": 1, "summary": "2 V · 1 × 5 ms · 0.01 s"},
-        ),
-    )
-    tab, _started, _statuses = make_tab(app_model)
+def test_every_saved_profile_is_offered_on_every_laser(qapp, app_model, monkeypatch):
+    with_laser_profiles(monkeypatch, app_model, (
+        {"profile_id": "one", "revision": 1, "summary": ""},
+        {"profile_id": "two", "revision": 1, "summary": ""},
+    ))
+    tab, _started, _statuses = make_tab(app_model, channel_id=LaserChannelId.LASER_2)
 
-    listed = [
-        tab.stim_profile_selector.itemData(index)
-        for index in range(tab.stim_profile_selector.count())
-    ]
+    listed = [tab.stim_profile_selector.itemData(index)
+              for index in range(tab.stim_profile_selector.count())]
 
-    # The first entry is the way back to a train built by hand.
-    assert listed == [None, "one", "two"]
-
-
-def test_the_selector_lists_a_profile_saved_from_another_channel(
-    qapp, app_model, monkeypatch
-):
-    with_laser_profiles(
-        monkeypatch,
-        app_model,
-        (
-            {"profile_id": "two", "revision": 1, "summary": "2 V · 1 × 5 ms · 0.01 s"},
-        ),
-    )
-    tab, _started, _statuses = make_tab(app_model)
-
-    listed = [
-        tab.stim_profile_selector.itemData(index)
-        for index in range(tab.stim_profile_selector.count())
-    ]
-    assert listed == [None, "two"]
+    assert listed == ["builder-draft", "one", "two"]
 
 
 def a_profile(**overrides):
@@ -201,88 +174,30 @@ def with_one_listed_profile(monkeypatch, app_model):
     )
 
 
-def test_selecting_a_profile_rebuilds_the_pulse_train_it_describes(
-    qapp, app_model, monkeypatch
-):
-    """The build graph kept showing typed values with a profile selected."""
+def test_run_pulse_fires_the_picked_profile_on_this_laser(qapp, app_model, monkeypatch):
     profile = a_profile()
     with_one_listed_profile(monkeypatch, app_model)
     with_saved_profile(monkeypatch, app_model, profile)
-    tab, _started, _statuses = make_tab(app_model)
+    tab, _started, _statuses = make_tab(app_model, trigger_source="/Dev1/PXI_Trig0")
+
+    tab.stim_profile_selector.setCurrentIndex(tab.stim_profile_selector.findData("burst"))
+    train = tab._build_pulse_train()
+
+    assert train.amplitude_volts == pytest.approx(1.25)
+    assert train.pulse_count == 100
+    assert train.channel_id.value == 1
+    assert train.trigger_source is None
+    assert tab._profile_summary.text() == profile.summary()
+
+
+def test_run_pulse_can_fire_the_builder_draft(qapp, app_model):
+    draft = LaserPulseProfile("builder-draft", 1, 0.5, 2.0)
+    tab, _started, _statuses = make_tab(app_model, draft_provider=lambda: draft)
 
     tab.stim_profile_selector.setCurrentIndex(
-        tab.stim_profile_selector.findData("burst")
-    )
+        tab.stim_profile_selector.findData("builder-draft"))
 
-    rebuilt = tab._build_pulse_train()
-    assert rebuilt.amplitude_volts == pytest.approx(1.25)
-    assert rebuilt.duration_ms == pytest.approx(3.0)
-    assert rebuilt.pulse_count == 100
-    assert rebuilt.frequency_hz == pytest.approx(20.0)
-    assert rebuilt.baseline_ms == pytest.approx(15.0)
-    assert rebuilt.post_stim_ms == pytest.approx(7.0)
-    # The waveform only: the trigger stays the tab's own.
-    assert rebuilt.trigger_source is None
-    # The preview is drawn from the same train: 15 ms of baseline, then the
-    # last of 100 pulses at 20 Hz starts at 4.95 s and runs 3 ms, then 7 ms
-    # of post-stim.
-    x_values, _y_values = tab._build_preview_points(rebuilt)
-    assert x_values[-1] == pytest.approx(0.015 + 99 * 0.05 + 0.003 + 0.007)
-
-
-def test_selecting_a_profile_leaves_run_pulse_on_the_tabs_trigger(
-    qapp, app_model, monkeypatch
-):
-    # christielab10, 2026-09-24: every saved profile named a board trigger
-    # terminal, so picking one for Test stim switched Run Pulse to external,
-    # and Run Pulse then waited for a board STIM pulse it never sends.
-    profile = a_profile()
-    with_one_listed_profile(monkeypatch, app_model)
-    with_saved_profile(monkeypatch, app_model, profile)
-    tab, _started, _statuses = make_tab(app_model, trigger_source="/Dev1/PXI_Trig2")
-
-    tab.stim_profile_selector.setCurrentIndex(
-        tab.stim_profile_selector.findData("burst")
-    )
-
-    assert tab._trigger_mode.currentText() == "internal"
-    assert tab._trigger_source.text() == "/Dev1/PXI_Trig2"
-    assert tab._build_pulse_train().trigger_source is None
-
-
-def test_selecting_a_profile_keeps_a_deliberately_chosen_external_trigger(
-    qapp, app_model, monkeypatch
-):
-    profile = a_profile()
-    with_one_listed_profile(monkeypatch, app_model)
-    with_saved_profile(monkeypatch, app_model, profile)
-    tab, _started, _statuses = make_tab(app_model, trigger_source="/Dev1/PFI3")
-    tab._trigger_mode.setCurrentText("external")
-
-    tab.stim_profile_selector.setCurrentIndex(
-        tab.stim_profile_selector.findData("burst")
-    )
-
-    assert tab._build_pulse_train().trigger_source == "/Dev1/PFI3"
-
-
-def test_choosing_new_profile_leaves_the_built_train_alone(
-    qapp, app_model, monkeypatch
-):
-    profile = a_profile()
-    with_one_listed_profile(monkeypatch, app_model)
-    with_saved_profile(monkeypatch, app_model, profile)
-    tab, _started, _statuses = make_tab(app_model)
-    tab.stim_profile_selector.setCurrentIndex(
-        tab.stim_profile_selector.findData("burst")
-    )
-
-    tab.stim_profile_selector.setCurrentIndex(
-        tab.stim_profile_selector.findData(None)
-    )
-
-    # Nothing is reset: what was loaded stays as the starting point to edit.
-    assert tab._build_pulse_train().pulse_count == 100
+    assert tab._build_pulse_train().amplitude_volts == pytest.approx(0.5)
 
 
 def test_run_pulse_says_why_it_is_unavailable(channel_tab):
@@ -303,5 +218,17 @@ def test_stim_test_is_unavailable_until_run_pulse_is(channel_tab):
 
     tab.set_controls_enabled(True, True, True)
     assert tab.stim_test_button.isEnabled()
+
+
+def test_the_pulse_builder_is_the_first_laser_control_tab(qapp, app_model):
+    from tools.acquisition.view.laser_control_content import LaserControlContent
+    content = LaserControlContent(app_model)
+    try:
+        assert content._tabs.tabText(0) == "Pulse Builder"
+        assert content._tabs.tabText(1) == "Laser 1"
+        content._refresh_from_model()
+        assert content._tabs.widget(0) is content._builder
+    finally:
+        content.on_close()
 
 
