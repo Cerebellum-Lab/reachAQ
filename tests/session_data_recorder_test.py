@@ -1473,6 +1473,52 @@ def test_nidaq_coverage_classifies_warning_and_critical_boundaries(
     messages = " ".join((*source["warnings"], source["failure"] or ""))
     assert result["sessionComplete"] is expected_complete
     assert warning_fragment in messages
+
+
+@pytest.mark.parametrize(("first_offset", "warns"), (
+    # christielab10, 2026-09-24: where the sample clock fell, nothing lost.
+    (0.000088, False),
+    # The sample at +50 us is missing.
+    (0.000150, True),
+))
+def test_nidaq_coverage_allows_less_than_one_sample_period_at_a_boundary(
+    tmp_path, first_offset, warns,
+):
+    project = ProjectInfo(
+        root=str(tmp_path),
+        device_id="test",
+        when=datetime(2026, 1, 2, 3, 4, 5),
+        session=10,
+    )
+    rate = 10_000.0
+    count = 1000
+    perf = 10.0 + first_offset + np.arange(count) / rate
+    end_perf = float(perf[-1]) + 0.5 / rate
+    chunk = (
+        np.arange(count, dtype=np.int64),
+        perf,
+        100.0 + perf - 10.0,
+        np.zeros((1, count), dtype=np.float32),
+        ("cam_frames",),
+        rate,
+        1,
+        0,
+        0,
+    )
+    result = SessionDataRecorder._write_session(
+        project, 10.0, 100.0, end_perf, (), (), (), (chunk,),
+        source_manifest=({
+            "id": "nidaq.cam_frames",
+            "kind": "nidaq_digital",
+            "path": "streams/nidaq.h5",
+            "runtimeState": "ready",
+        },),
+    )
+    messages = " ".join(result["enabledSources"][0]["warnings"])
+    assert ("start boundary coverage" in messages) is warns
+    assert "end boundary coverage" not in messages
+
+
 def _nidaq_spool(tmp_path, channel_names, values):
     """A spooled NI-DAQ capture, as the stream writer leaves it on disk."""
     path = tmp_path / "nidaq.h5"

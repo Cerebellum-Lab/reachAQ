@@ -2225,8 +2225,15 @@ class SessionDataRecorder:
         last_missing = max(0.0, float(end_perf) - float(saved_perf[-1]))
         diagnostics["startCoverageMissingSeconds"] = first_missing
         diagnostics["endCoverageMissingSeconds"] = last_missing
+        # The saved samples are the ones inside the boundary, so the first can
+        # fall up to one sample period after it, and the last one period
+        # before, with none lost: 88 us at 10 kHz on christielab10 on
+        # 2026-09-24 was reported as missing coverage. perf_time advances by
+        # exactly one period per sample, so a gap of a period or more is a
+        # sample that is not there.
+        sample_period = SessionDataRecorder._nidaq_sample_period(chunks)
         for edge, missing in (("start", first_missing), ("end", last_missing)):
-            if missing <= 0:
+            if missing <= 0 or missing < sample_period:
                 continue
             message = f"NI-DAQ {edge} boundary coverage missing by {missing:.6f} seconds"
             if missing > 5.0:
@@ -2476,6 +2483,15 @@ class SessionDataRecorder:
             max((int(chunk[7]) for chunk in chunks), default=0),
             sum(int(chunk[8]) for chunk in chunks),
         )
+
+    @staticmethod
+    def _nidaq_sample_period(chunks) -> float:
+        """Seconds between NI samples, or 0.0 when the rate is not known."""
+        if isinstance(chunks, _NidaqSpoolSnapshot):
+            rate = float(chunks.sample_rate_hz)
+        else:
+            rate = next((float(chunk[5]) for chunk in chunks if chunk[5]), 0.0)
+        return 1.0 / rate if math.isfinite(rate) and rate > 0 else 0.0
 
     @staticmethod
     def _nidaq_arrays(chunks, requested_names=None):
