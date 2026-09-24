@@ -11,22 +11,29 @@ The module has three fundamental responsibilities:
 
 ## Live Runtime Requirements
 
-The current reachAQ DeepLabCut live path requires TensorFlow GPU acceleration
-on a CUDA-capable NVIDIA GPU. It intentionally refuses CPU fallback because the
-live acquisition rate cannot be supported reliably by CPU inference.
+Live pose inference requires GPU acceleration on a CUDA-capable NVIDIA GPU. It
+intentionally refuses CPU fallback because the live acquisition rate cannot be
+supported reliably by CPU inference.
+
+The installed environment carries both engines: PyTorch runs YOLO models and
+DeepLabCut PyTorch models, TensorFlow runs DeepLabCut TensorFlow models, and
+`REACHAQ_POSE_BACKEND` picks the engine for a DeepLabCut model
+(`backend_selection.py`). Why the two can share an environment, and what that
+needs, is recorded beside the extras in `pyproject.toml`.
 
 Before acquisition hardware starts, reachAQ checks the active NVIDIA kernel
-driver with `nvidia-smi` and then validates that TensorFlow reports a GPU. A
-Linux system using `nouveau`, a system without `nvidia-smi`, or a TensorFlow
-runtime with no GPU fails the preflight before cameras are opened. The
-application-level `--live-inference` and `--no-live-inference` flags can override
-the saved setting for one run.
+driver with `nvidia-smi` and then validates that the engine the configured model
+runs on reports a GPU. A Linux system using `nouveau`, a system without
+`nvidia-smi`, or an engine with no GPU fails the preflight before cameras are
+opened. The application-level `--live-inference` and `--no-live-inference`
+flags can override the saved setting for one run.
 
 The preflight can be inspected directly from the configured environment:
 
 ```bash
 python - <<'PY'
 from autotrainer.inference import detect_gpu_runtime
+print(detect_gpu_runtime(required_backend="torch"))
 print(detect_gpu_runtime(required_backend="tensorflow"))
 PY
 ```

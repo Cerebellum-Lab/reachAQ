@@ -18,18 +18,19 @@ Complete only the hardware categories present on the target rig.
 | 3a | FLIR cameras | [Spinnaker guide](docs/linux-install/flir-spinnaker.md) |
 | 3b | NI DAQ/PXI | [NI-DAQmx and PXI/MXI guide](docs/linux-install/ni-daq-pxi.md) |
 | 3c | Pellet CAN | [PEAK SocketCAN guide](docs/linux-install/peak-socketcan.md) |
-| 3d | Live inference | [NVIDIA/TensorFlow guide](docs/linux-install/nvidia-inference.md) |
+| 3d | Live inference | [NVIDIA guide](docs/linux-install/nvidia-inference.md) |
 | 3e | SoftMouse/RFID | [SoftMouse/RFID guide](tools/softmouse_sync/CONFIGURATION_GUIDE.md) |
 | 3f | Closed-loop stim timing | [Latency tuning guide](docs/linux-install/latency-tuning.md) |
 | 4 | Rig configuration and launch | [Runtime guide](docs/linux-install/runtime-configuration.md) |
 
 The portable installer does **not** install FLIR, NI, PEAK out-of-tree, or
 NVIDIA kernel drivers and does not select camera serials, DAQ channels, CAN
-bitrate, or an inference model. After a working NVIDIA driver is installed, an
-opt-in installer step can add the supported TensorFlow CUDA user-space runtime.
-It installs the portable `can-utils` and `iproute2` packages, but it does not
-install or enable `reachaq-can.service`; that service is intentionally a
-separate, reviewed hardware step.
+bitrate, or an inference model. It does install everything that lives in the
+Python environment: both pose engines and their CUDA user-space libraries, and
+the Spinnaker Python binding once the Spinnaker SDK is present. It installs the
+portable `can-utils` and `iproute2` packages, but it does not install or enable
+`reachaq-can.service`; that service is intentionally a separate, reviewed
+hardware step.
 
 ## 1. Clone the repository
 
@@ -52,9 +53,11 @@ git status --short --branch
 
 ## 2. Run the portable installer
 
-The script installs general Ubuntu/Qt/build packages, creates the conda
-environment, installs Python dependencies and the editable project, initializes
-Git LFS, creates runtime directories, configures the operator's `dialout`
+The script installs general Ubuntu/Qt/build packages, creates the Python 3.10
+conda environment, installs Python dependencies and the editable project,
+installs both pose engines (PyTorch and TensorFlow) and the YOLO runtime,
+initializes Git LFS, installs the Spinnaker Python binding when the SDK is
+present, creates runtime directories, configures the operator's `dialout`
 membership for USB serial access, and runs generic verification. It also
 installs the Linux Secret Service/keyring components needed to store SoftMouse
 credentials securely.
@@ -68,14 +71,22 @@ cd "$HOME/Documents/reachAQ"
 
 The script accepts no options and attempts every portable category. It
 automatically installs Miniconda when Conda is absent, includes test
-dependencies, runs the focused tests, installs the supported TensorFlow GPU
-user-space runtime, and verifies the GPU. The CUDA libraries require about 1.7
-GB and remain inside the Conda environment; the script does not change the
-kernel driver or install a system-wide CUDA toolkit.
+dependencies, runs the focused tests, installs both engines' CUDA user-space
+libraries, and verifies each engine on the GPU, and both in one process. The
+CUDA libraries remain inside the Conda environment; the script does not change
+the kernel driver or install a system-wide CUDA toolkit.
 
 ### Installer behavior
 
-- It is safe to re-run: existing directories and conda environments are reused.
+- It is safe to re-run: existing directories are reused, and an environment
+  already on Python 3.10 is updated in place.
+- An environment on another Python version cannot be upgraded in place, so it
+  is kept, renamed `reachaq-py<version>-<date>`, and a fresh one is built. Run
+  the archive with
+  `conda run --no-capture-output -n <archive> python -m reachAQ.app`.
+- `REACHAQ_INSTALL_SYSTEM=0` skips the steps that need root (apt packages,
+  groups, limits, systemd) and reports them as `SKIP`. Use it to rerun on a rig
+  that already has them, for example after `reachaq-sync`.
 - It does not use `set -e`; one failed command does not stop later categories.
 - Every step is recorded as `PASS`, `FAIL`, `SKIP`, or `PLAN`.
 - A complete summary is always printed at the end.
@@ -104,8 +115,10 @@ kernel driver or install a system-wide CUDA toolkit.
 
 ### FLIR/Spinnaker cameras
 
-Follow the [FLIR Spinnaker guide](docs/linux-install/flir-spinnaker.md) to match
-the vendor SDK, CPython wheel, architecture, udev rules, and operator groups.
+Follow the [FLIR Spinnaker guide](docs/linux-install/flir-spinnaker.md) to
+install the vendor SDK, udev rules, and operator groups. Then rerun the
+portable installer: it installs the matching bundled Python wheel and lists
+the cameras it can see.
 
 ### NI-DAQmx and PXI/MXI
 
@@ -138,10 +151,9 @@ configuration and application environment are separate; make
 ### NVIDIA live inference
 
 Live inference is optional. Follow the
-[NVIDIA/TensorFlow guide](docs/linux-install/nvidia-inference.md) to replace
-`nouveau`, verify `nvidia-smi`, let the installer add compatible CUDA/cuDNN,
-and run the reachAQ preflight. Otherwise launch with
-`--no-live-inference`.
+[NVIDIA guide](docs/linux-install/nvidia-inference.md) to replace `nouveau`
+and verify `nvidia-smi`; the installer then adds both engines' CUDA libraries
+and runs the GPU checks. Otherwise launch with `--no-live-inference`.
 
 ## 4. Configure and launch
 
@@ -154,7 +166,8 @@ The [runtime guide](docs/linux-install/runtime-configuration.md) covers:
 - software-only random cameras;
 - startup timing logs and troubleshooting.
 
-Safe first GUI launch after configuration:
+Start it with `reachaq`, or the desktop icon. A safe first launch after
+configuration, without live inference:
 
 ```bash
 conda run --no-capture-output -n reachaq python -m reachAQ.app \
@@ -183,7 +196,8 @@ operator selects Running.
   `/etc/default/reachaq-can` retains any intentional rig-specific values.
 - [ ] The application `AUTOTRAINER_CAN_CHANNEL` matches service
   `REACHAQ_CAN_INTERFACE`.
-- [ ] TensorFlow, if inference is enabled, reports a GPU and passes preflight.
+- [ ] If inference is enabled, the report passes the TensorFlow, PyTorch and
+  both-engines GPU checks.
 - [ ] Configuration contains real serials, aliases, channels, paths, and model.
 - [ ] Output directory exists and is writable by the operator.
 - [ ] GUI launches idle and hardware initialization emits `HARDWARE INIT`

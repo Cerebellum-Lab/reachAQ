@@ -1,8 +1,10 @@
 # FLIR Spinnaker camera setup
 
 Use this guide only on a reachAQ host with Teledyne FLIR/Point Grey cameras.
-The portable installer does not install vendor SDKs because the SDK, wheel,
-architecture, and camera firmware must be compatible.
+The portable installer does not install the vendor SDK, because the SDK,
+architecture, and camera firmware must be compatible and the SDK needs root.
+Install the SDK (steps 1-2), then rerun the portable installer: it installs
+the matching bundled Python wheel (step 3) and lists the cameras it can see.
 
 ## Inputs
 
@@ -18,9 +20,10 @@ Pick the one matching the interpreter of the target environment: the wheels
 are ABI-locked, so a cp38 wheel will not import on 3.10 and renaming it does
 not help. `vendor/spinnaker/manifest.json` lists what is bundled.
 
-The DeepLabCut 3.x PyTorch engine requires Python 3.10, so the inference
-environment needs the cp310 wheel; the cp38 wheels remain for the older
-TensorFlow environment and the Jetson image:
+The reachAQ environment is Python 3.10, so it uses the cp310 wheel; the cp38
+wheels remain for archived Python 3.8 environments and the Jetson image. The
+bundled 3.2.0.62 wheel runs against the 3.2.0.57 system runtime on
+christielab10 and lists both of its cameras.
 
 ```bash
 find "$REACHAQ_REPO/vendor/spinnaker/linux" -name 'spinnaker_python-*.whl'
@@ -59,8 +62,10 @@ instead of creating an unrelated group manually.
 
 ## 3. Install the matching Python wheel
 
-Let the interpreter choose its own wheel, so a 3.8 and a 3.10 environment can
-be provisioned with the same command:
+The portable installer does this step whenever the SDK is present, under
+`Spinnaker camera binding` in its report. By hand, let the interpreter choose
+its own wheel, so a 3.8 and a 3.10 environment can be provisioned with the same
+command:
 
 ```bash
 conda run -n "$REACHAQ_ENV" python - <<'PY'

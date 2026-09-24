@@ -32,6 +32,14 @@ environment name is `reachaq`, the GUI entry point is `python -m reachAQ.app`,
 and local acquisition data should be configured under
 `$HOME/Documents/rawdatalocal`.
 
+Install, start and update in three commands - see [INSTALL.md](INSTALL.md):
+
+```bash
+./tools/install/reachaq-linux-install.sh   # install, or repair; Python 3.10, both pose engines
+reachaq                                    # start
+reachaq-sync                               # update the checkout
+```
+
 Portable host setup is automated by
 [`tools/install/reachaq-linux-install.sh`](tools/install/reachaq-linux-install.sh).
 Vendor drivers and rig-specific hardware configuration remain in separate
@@ -133,7 +141,8 @@ by default.
 
 Tests that require the physical pellet board are marked as `@pytest.mark.canbus` and are not run by default.
 
-The test dependencies are optional. Install them from the repository root with:
+The portable installer already includes the test dependencies. To add them to
+another environment, from the repository root:
 
 ```bash
 conda run -n reachaq python -m pip install -e '.[test]'
