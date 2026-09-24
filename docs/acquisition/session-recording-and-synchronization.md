@@ -281,6 +281,11 @@ timestamps, and device indices. Events buffer continuously before Record and
 are sliced at the canonical boundary. Raw byte-for-byte CAN frame capture is not
 part of this format.
 
+Rows are in host receive-time order (`perf_time`); rows received at the same
+time keep their arrival order. Sessions recorded before 2026-09-24 can have
+rows out of order, and fail `events.alignment` and `events.frames` with
+`nonmonotonic performance timestamp`.
+
 Every row also records the first actual written primary-camera frame beginning
 at or after the event, its zero-based video index, frame-start performance/wall/
 relative times, event-to-frame delay, relation, alignment method, and confidence.

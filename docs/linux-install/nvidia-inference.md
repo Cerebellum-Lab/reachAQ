@@ -53,28 +53,29 @@ A YOLO model always runs on PyTorch. A DeepLabCut model runs on the engine
 `REACHAQ_POSE_BACKEND` selects (`tensorflow` by default); see the
 [runtime guide](runtime-configuration.md#environment-variables).
 
-Three things make the two engines safe together. Each was a failure on a real
-rig before it was fixed, and the installer checks each one:
-
-- **Separate CUDA libraries.** Both engines' CUDA libraries arrive as
-  `nvidia-*` Python packages that install into the same `site-packages/nvidia`
-  directory, so the later install overwrote the earlier: TensorFlow lost
-  `libcudnn.so.8` and fell back to the CPU without an error. TensorFlow's CUDA
-  11.8 / cuDNN 8.6 now go in `<env>/lib/reachaq-tensorflow-cuda11`, reached
-  only through the environment's `LD_LIBRARY_PATH`.
-- **A CUDA 12.8 PyTorch.** DeepLabCut 3 imports PyTorch as soon as it is
-  imported, so its TensorFlow engine always shares a process with PyTorch.
-  With PyTorch's CUDA 13 build that aborted TensorFlow ("stack smashing
-  detected"); with the CUDA 12.8 build both run. The installer takes PyTorch
-  from the PyTorch cu128 index for that reason.
-- **Newer numpy than TensorFlow 2.12 asks for.** TensorFlow 2.12 caps numpy at
-  1.24.3 and typing-extensions below 4.6, but the plotting, HDF5 and
-  augmentation libraries need newer. TensorFlow 2.12 runs GPU convolutions and
-  DeepLabCut models with numpy 1.26, so the installer keeps 1.26, and its
-  dependency check allows exactly those two TensorFlow caps.
-
 The PyTorch build covers compute capability 7.5 through 12.0: T1000, RTX A2000
 and RTX 5060 Ti.
+
+### Keep these if you change the environment by hand
+
+The installer sets the environment up so the two engines can share it. Rerun
+the installer rather than upgrading pose packages with `pip`; if you must, keep
+these:
+
+- **TensorFlow's CUDA libraries stay in their own directory,**
+  `<env>/lib/reachaq-tensorflow-cuda11`, reached through the environment's
+  `LD_LIBRARY_PATH`. Do not `pip install` the `nvidia-*-cu11` packages into the
+  environment itself: they share `site-packages/nvidia` with PyTorch's, and one
+  set overwrites the other, leaving TensorFlow on the CPU without an error.
+- **PyTorch stays a CUDA 12.8 build (2.7.x).** DeepLabCut imports PyTorch as
+  soon as it is imported, so DeepLabCut TensorFlow models always run with
+  PyTorch in the same process. The CUDA 13 builds make TensorFlow abort there
+  ("stack smashing detected").
+- **numpy stays at 1.26.** TensorFlow 2.12 declares numpy 1.24.3 or older and
+  typing-extensions below 4.6; reachAQ's plotting, HDF5 and augmentation
+  libraries need newer, and TensorFlow 2.12 works with them. `pip check`
+  therefore reports those two TensorFlow requirements; the installer expects
+  exactly those and nothing else.
 
 ## 4. Verify
 
