@@ -89,6 +89,16 @@ _PULSEABLE_GPIO_INDEX = {
     DigitalOutputs.STIMULUS_4: 7,  # board STIM3
 }
 
+#: The same index read back. The board echoes the command's index on every
+#: pulse status, a refusal included, and a raw request can address the tone
+#: lines the host never pulses - the qualification tool does, to see them
+#: refused - so all four outputs decode.
+_GPIO_INDEX_OUTPUT = {
+    4: DigitalOutputs.STIMULUS_1,  # board STIM0, Tone 1 confirmation
+    5: DigitalOutputs.STIMULUS_2,  # board STIM1, Tone 2 confirmation
+    **{index: output for output, index in _PULSEABLE_GPIO_INDEX.items()},
+}
+
 
 class MissingDeviceAddressError(RuntimeError):
     """Dedicated for when device address could not be read"""
@@ -1719,9 +1729,14 @@ class CanInterface(DeviceInterface):
     def _translate_gpio_pulse_status(message) -> DigitalPulseStatus:
         status = message.gpio_pulse_status
         phase = getattr(status.phase, "name", str(status.phase)).lower()
+        # Every status used to be labelled STIM3, so STIM2 pulses and refused
+        # tone-line pulses were recorded against the wrong line.
+        channel = _GPIO_INDEX_OUTPUT.get(int(status.gpio_idx))
+        if channel is None:
+            logger.warning("GPIO pulse status for unknown gpio_idx %d", status.gpio_idx)
         return DigitalPulseStatus(
             target=_addr2tgt(message.dst_id),
-            channel=DigitalOutputs.STIMULUS_4,
+            channel=channel,
             duration_us=int(status.duration_us),
             phase=phase,
             error=int(status.error),

@@ -165,7 +165,8 @@ class BoardCapabilities(Source):
 
 @dataclass
 class DigitalPulseStatus(Source):
-    channel: DigitalOutputs = DigitalOutputs.STIMULUS_4
+    # None when the board reported a line that is not a stimulus output.
+    channel: Optional[DigitalOutputs] = None
     duration_us: int = 0
     phase: str = ""
     error: int = 0
