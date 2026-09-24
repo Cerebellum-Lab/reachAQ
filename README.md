@@ -5,8 +5,8 @@
 * [Installation instructions](INSTALL.md)
 * [reachAQ Linux install guide](linux-install-instructions.md)
 * [Applications](#applications)
-  * [Acquisition](#acquisition-application)
-  * [Pellet Delivery Test](#pellet-delivery-test-application)
+  * [Acquisition](#applications)
+  * [Pellet Delivery Test](#applications)
 * [Scripts](#scripts)
 * [Additional Tools](#additional-tools)
 * [Testing](#testing)
@@ -67,7 +67,8 @@ from the core logic of the applications for two reasons:
     * The GUI starts idle by default. Use `--start-mode running` only when immediate startup is intentional.
     * Use `--no-live-inference` or `--live-inference` to override the saved inference setting for one run.
     * Hardware startup progress is written to the log and launching terminal as `HARDWARE INIT` records.
-    * The installed `reachAQ.desktop` mouse icon opens the same application in a terminal and prevents duplicate GUI launches.
+    * The installed `reachAQ.desktop` mouse icon opens the same application in a terminal; `reachaq` starts it from any shell.
+    * Only one instance runs per user, however it is started: a second start exits with status 3 and names the running PID.
     * [Detailed Instructions](tools/acquisition/README.md)
     * [Session recording, synchronization, persistence, and hardware isolation](docs/acquisition/session-recording-and-synchronization.md)
     * [Recording sessions, pellet trials, protocols, and schema migration](docs/acquisition/session-trials-protocols.md)
@@ -108,6 +109,13 @@ Current hardware bring-up tools live under `tools/hardware`:
   request status/configuration, or perform explicitly enabled motion tests.
 * `tools/hardware/validate_laser_hardware.py` - validate configured NI-DAQ laser
   channels one controlled operation at a time.
+* `tools/hardware/verify_nidaq_wiring.py` - drive each board output and laser
+  command in turn and record which NI-DAQ line followed; the same test as
+  **Tools → DAQ Monitor → Wiring test**. See
+  [Check the wiring](docs/linux-install/ni-daq-pxi.md#check-the-wiring).
+* `tools/hardware/qualify_pellet_firmware.py` - collect the rig evidence needed
+  to qualify a new pellet firmware version. See
+  [pellet firmware compatibility](docs/acquisition/pellet-firmware-compatibility.md#qualifying-a-new-firmware-version).
 * `tools/hardware/reachaq-bring-up-can.sh` and the accompanying systemd files -
   configure and bring up the selected reachAQ SocketCAN interface (`can0` by
   default) automatically at boot.

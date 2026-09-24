@@ -1,23 +1,23 @@
 # Pellet firmware compatibility and rollout
 
-Every reachAQ release ships
-`config/pellet-firmware-compatibility.yaml`, an exact-version allowlist. Startup
-requests the running board version and capabilities before home/configuration.
-An unknown version or missing required capability blocks pellet movement,
-pellet-dependent protocols, and Record when the pellet board is required;
-camera-only operation remains independent when CAN/pellet is disabled.
+reachAQ accepts only pellet firmware versions listed in
+`config/pellet-firmware-compatibility.yaml`. At startup it asks the board for
+its version and capabilities before homing or configuring it. An unlisted
+version, or a listed one missing a required capability, blocks pellet
+movement, pellet-dependent protocols, and Record when the pellet board is
+required; camera-only operation is unaffected when CAN/pellet is disabled.
 
-Current policy:
+## Accepted versions
 
-- Pellet firmware `2.3.0`: requires `finite_stim3_pulse`, which this release
-  is the first to report, through `CAPABILITIES_REQUEST` (`0x23`).
-- Pellet firmware `2.2.0`: requires nothing; it answers no capability request,
-  so every capability is optional rather than impossible to satisfy.
-- Pellet firmware `2.1.0`: requires `timing_trailer`, `time_sync`, and
-  `finite_stim3_pulse`; rollout/physical qualification is still pending.
-- Pellet firmware `2.0.0`: accepted legacy fallback with host-receive timing;
-  it cannot supply board-time confidence or finite First Reach STIM3.
-- Emulator `0.1.0`: automated testing only, never physical qualification.
+| Firmware | Requires | Status |
+|---|---|---|
+| `2.3.0` | `finite_stim3_pulse` (the first release to report its capabilities) | Rig-verified; recorded-session validation pending |
+| `2.2.0` | nothing (it reports no capabilities) | Rollout pending |
+| `2.1.0` | `timing_trailer`, `time_sync`, `finite_stim3_pulse` | Rollout pending |
+| `2.0.0` | nothing | Legacy fallback: host-receive timing only, no finite STIM3 pulse |
+| Emulator `0.1.0` | nothing | Automated tests only |
+
+Each entry's `limitations` in the YAML file say what that version cannot do.
 
 Raw kernel/host receive time, board time, aligned board time, clock model,
 uncertainty, transport estimate, and selected event time remain distinct in
@@ -25,61 +25,63 @@ uncertainty, transport estimate, and selected event time remain distinct in
 then a valid in-range board clock model, then kernel/host receive time. No
 derived value overwrites raw evidence.
 
-The coordinated firmware work lives in the sibling `reachAQ-hardware` repository
-and is released as `v2.1.0`. Follow its
-`docs/pellet-firmware-operator-quick-start.md` and
-`docs/releases/v2.1.0.md`. The rollout is not complete until the board is flashed
-and retained real-rig version/capability, reconnect, Tone 1/Tone 2, STIM3,
-NI/board alignment, CAN-load, and validator evidence passes. Only then update
-the allowlist qualification status/date in a reviewed reachAQ commit.
+## Updating a rig to new firmware
 
-Collect the rig evidence with the pellet board connected, lasers off or
+Update reachAQ first, then the board. reachAQ reads the list from the checkout
+it runs from, so a board flashed to a version that checkout does not list is
+refused at the next startup.
+
+1. Update reachAQ: `reachaq-sync`.
+2. Flash the board with the release bundle's `reachaq-update`, following the
+   firmware repository's `docs/pellet-firmware-release-and-deployment.md`. It
+   checks that this rig's reachAQ accepts the version before asking for
+   `FLASH`, and refuses otherwise. `--allow-unqualified` overrides that, for
+   bringing up a release that is not yet listed.
+3. Start reachAQ (`reachaq` or the desktop icon) and confirm the pellet
+   controller connects. A version request or the CAN validator is not a
+   substitute: neither applies this list.
+
+Bundles up to and including v2.3.0 do not contain the check. With one of those,
+confirm the version is listed before flashing; the first line printed is the
+checkout that was read, and should be the rig's operator checkout, normally
+`~/Documents/reachAQ`:
+
+```bash
+conda run -n reachaq python -c "import tools.acquisition.model.firmware_compatibility as m; r = m.FirmwareCompatibilityPolicy.load().evaluate('2.3.0'); print(m.__file__); print(r.version, 'listed' if r.supported else 'NOT LISTED', 'requires', list(r.required_capabilities))"
+```
+
+### If startup refuses the board
+
+The hardware refresh reports `controller connection failed`, CAN safety
+shutdown starts, and the log names the reason:
+
+- `Firmware version has not been explicitly qualified (detected=X.Y.Z)`: the
+  checkout reachAQ runs from does not list that version. Run `reachaq-sync`,
+  restart reachAQ, and check again; if the version is still unlisted, reflash a
+  listed one.
+- `Required capability mismatch`: the version is listed but the board did not
+  report a capability the entry requires.
+
+## Qualifying a new firmware version
+
+A version moves to qualified only after rig evidence and a validated recorded
+session. Collect the rig evidence with the pellet board connected, lasers off or
 shutters closed, and reachAQ closed:
 
 ```bash
-conda run -n reachaq python tools/hardware/qualify_pellet_firmware.py --expect-version 2.3.0
+conda run --no-capture-output -n reachaq python tools/hardware/qualify_pellet_firmware.py --expect-version 2.3.0
 ```
 
-It checks version and capabilities against this policy, measures where board
-STIM2 and STIM3 land on the NI, confirms the tone mapping, times finite pulses
-and their return low, confirms the board refuses pulses on tone lines, counts
+It checks version and capabilities against the list, finds where board STIM2
+and STIM3 land on the NI-DAQ, confirms the tone mapping, times finite pulses and
+their return to low, confirms the board refuses pulses on tone lines, counts
 50 short pulses at both ends under normal CAN traffic, checks that no event
 claims board time without the capability for it, and reconnects and reboots
 the board. It writes a JSON record under
-`~/Autotrainer/pellet_firmware_qualification/`. It does not cover the
-recorded-session validator, which still needs a real session.
+`~/Autotrainer/pellet_firmware_qualification/` and exits non-zero if any check
+fails. It drives STIM0-STIM3 and plays tones, but moves no motor and opens no
+shutter.
 
-## Roll out the host before the board
-
-The allowlist is read from whichever checkout the rig's `reachaq` command
-imports, not from the branch the allowlist entry was committed to. A board
-flashed to a version that checkout does not list is refused at the next
-startup, the pellet controller does not connect, and CAN safety shutdown
-starts. That refusal is correct and must stay; the mistake is flashing first.
-
-So on every rig, in this order:
-
-1. Get a reachAQ build that lists the new version onto the rig's installed
-   checkout, normally with `reachaq-sync`.
-2. Confirm that the checkout `reachaq` actually runs lists it. This names the
-   file it read, which is the point: it must be the operator's checkout, not a
-   development copy elsewhere on the machine.
-
-   ```bash
-   conda run -n reachaq python -c "import tools.acquisition.model.firmware_compatibility as m; r = m.FirmwareCompatibilityPolicy.load().evaluate('2.3.0'); print(m.__file__); print(r.version, 'listed' if r.supported else 'NOT LISTED', 'requires', list(r.required_capabilities))"
-   ```
-
-3. Only then flash the board.
-4. Start reachAQ with the operator's own command (`reachaq`, or the desktop
-   icon) and confirm the pellet controller connects. A version request or a
-   validator script is not enough: neither applies this policy, so both pass
-   against a board the application will refuse.
-
-What this prevents: on 2026-09-23 christielab10's board was flashed to 2.3.0
-and the release was qualified on `feature-dev` and `devel`, and connected
-cleanly when tested from a development checkout. The operator's `reachaq`
-imported `~/Documents/reachAQ`, which was still on the closed
-`reach-training-protocol-features` branch with an allowlist ending at 2.1.0,
-and startup failed with `Firmware version has not been explicitly qualified
-(detected=2.3.0)`. That checkout did not list 2.2.0 either, so the gap
-predated the flash; 2.3.0 is what exposed it.
+Then record a short session with a tone and a STIM pulse, check it with
+`reachaq-validate-session --full <session>`, and update the entry's
+`qualification_status` and `qualification_date` in a reviewed commit.

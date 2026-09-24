@@ -179,6 +179,77 @@ final bounded Qt curve draw. The digital graph uses fixed limits of `[-10, 0]`
 seconds and `[-0.2, 1.2]`, supports horizontal-only zoom, and provides **Live**
 to move the right edge to zero while preserving the current zoom width.
 
+## Check the wiring
+
+A channel role in the configuration is a claim about which cable is on which
+pin. reachAQ records whatever arrives on the pin, so a wrong cable produces
+plausible data rather than an error. Check the claims after any rewiring.
+
+### DAQ Monitor
+
+**Tools → DAQ Monitor**, while acquisition is idle, opens a separate window
+over the same hardware. It has one tab per card. Each tab streams every analog
+input and every clockable digital line (at 2 kHz by default; **Rate** changes
+it) and polls the remaining PFI and static lines for their level. Every line
+is labelled with both its terminal name and the connector printed on the
+breakout block. **Start monitoring** starts the stream; **Rescan hardware**
+repeats discovery.
+
+The bar along the bottom drives one thing at a time, so you can see which line
+moves:
+
+- **Tone** / **Play 0.5 s** plays a tone. Only 5 kHz and 6 kHz raise a
+  confirmation line (tone1 and tone2); any other frequency sounds without
+  moving a line.
+- **Pulse board STIM2** and **Pulse board STIM3** pulse the pellet board's
+  stimulus outputs. STIM0 and STIM1 are the tone confirmation lines.
+- **Laser**, a level and **Hold 0.5 s** holds a laser command at that voltage.
+  The shutter stays closed unless **open shutter** is ticked.
+
+### Wiring test
+
+The monitor's **Wiring test** tab runs the check automatically. **Run wiring
+test** stops the monitor stream, then holds each board output high and each
+laser command at a DC level in turn, and records which line followed. The
+shutters stay closed unless **open shutters during the test** is ticked; with
+them closed, the photodiode inputs cannot be confirmed. Each configured channel
+gets one status:
+
+| Status | Meaning |
+|---|---|
+| `CONFIRMED` | Responded to its own driver and nothing else |
+| `SILENT` | Did not respond when driven; check the cable at the named connector |
+| `UNEXPECTED` | Responded to another channel's driver: the cable is on the wrong connector, or two are swapped |
+| `UNTESTED` | Nothing in the run could drive it (camera frames and barcode, for example) |
+| `OPAQUE` | Cannot be checked from the DAQ, such as a shutter output with no readback |
+
+The test reports what it saw, not why. A mislabelled cable, a split, and
+coupling between inputs look the same from the DAQ. **Save report...** writes
+the result as text. The result is kept in
+`~/Autotrainer/nidaq_wiring_verification.json`, and every hardware refresh
+compares the configuration with it. Hardware Status then shows
+`NI-DAQ wiring N/M confirmed`. When any channel is failed or unchecked, a
+warning names each one, for example:
+
+```text
+NI-DAQ wiring is unverified (did not respond when last checked: laser2_diode; never checked: cam_frames, barcode); run tools/hardware/verify_nidaq_wiring.py
+```
+
+The same test runs from a terminal, with reachAQ closed:
+
+```bash
+conda run --no-capture-output -n reachaq python tools/hardware/verify_nidaq_wiring.py
+```
+
+| Option | Effect |
+|---|---|
+| `--dry-run` | List the channels the configuration claims and stop, touching nothing |
+| `--open-shutters` | Open each shutter while its laser is driven, so the photodiodes are checked. This emits light |
+| `--observe SECONDS` | Afterwards, watch the lines nothing here can drive (`cam_frames`, `barcode`) for that long and confirm any that change. Run the cameras or trigger a barcode during the window |
+| `--command-volts V` | Laser command level (default 1.0) |
+| `--report PATH` | Also write the text report to `PATH` |
+| `--config PATH`, `--record PATH` | Configuration read and result file written; default to the files above |
+
 ## Device identity and timing configuration
 
 The DAQ Ports dialog stores the discovered product and serial identity for each

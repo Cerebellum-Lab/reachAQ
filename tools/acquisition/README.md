@@ -73,9 +73,11 @@ default local config is usually:
 ~/Autotrainer/system_configuration.yaml
 ```
 
-The app saves configuration back to the preferences configuration directory. For
-alternate software-only configs, use a separate preferences file and config
-directory so test settings do not overwrite the bench config.
+The app saves configuration back to the file it loaded: the one named with
+`-c`, or the preferences default when none is named. A software-only or test
+run started with `-c` on its own copy therefore never overwrites the bench
+config. Nothing is saved when the last load did not complete, or when the run
+used `--random-cameras`.
 
 Rig-level availability for CAN, the pellet controller, NI-DAQ, and the USB RFID
 reader is grouped in the YAML `hardware:` block. The same switches and the RFID
@@ -341,6 +343,10 @@ without restarting healthy domains.
   roles while idle.
 * Tools -> Calibrate Coordinate System / Make 3D calibration - run the available
   calibration workflows.
+* Tools -> DAQ Monitor - while idle, watch every line on every NI-DAQ card,
+  drive tones, board stimulus lines and laser commands to see which line moves,
+  and run the wiring test. See
+  [Check the wiring](../../docs/linux-install/ni-daq-pxi.md#check-the-wiring).
 * View -> Logging - show or hide the application log. Errors are reported here,
   in the status bar, in the launching terminal, and in the log file instead of
   being rendered inside individual control panels.

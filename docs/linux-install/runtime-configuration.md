@@ -56,6 +56,14 @@ hardware refresh after the submenu closes. **RFID Serial Device…** changes the
 stable reader path from the same menu. These controls are unavailable after
 acquisition leaves Idle.
 
+Settings are saved to the file reachAQ loaded: the one named with `-c`, or the
+Preferences default when none is named. That happens on exit and whenever an
+idle edit is applied (camera settings, DAQ ports, plot selections, **File →
+Hardware**). Nothing is saved when the last load failed or did not complete, so
+a broken file is not overwritten with a half-applied one; the log says
+`Not saving configuration: the last configuration load did not complete`. A run
+started with `--random-cameras` is never saved either.
+
 See [Session recording, synchronization, and hardware isolation](../acquisition/session-recording-and-synchronization.md)
 before commissioning Record/Stop/Abort or a multi-device timing topology.
 
@@ -300,6 +308,10 @@ record until reachAQ exits.
 | CAN interface down | [PEAK/SocketCAN guide](peak-socketcan.md), bitrate and termination |
 | CAN reset asks for a password | Activate the `reachaq` login group by logging out/in, then verify the narrow `sudo -n` permission |
 | CAN RX continues but startup ACK times out | Preserve the application log; this is an application startup/ACK path issue rather than proof of a dead bus |
+| Log warns `CAN error notice on can0 ... controller tx-warning` (or `tx-passive`, `back-to-active`) | Informational. The CAN controller's error counters rose and fell, as they do after any stretch without acknowledgement such as a pellet-board reboot; nothing was lost and the connection stays up. Repeats within a second are counted as `N more suppressed`. Only bus-off or a controller receive overflow stops the connection, reported as `CAN error frame ... on can0` |
+| Pellet controller connection fails after a firmware update | The checkout does not accept that firmware; see [pellet firmware compatibility](../acquisition/pellet-firmware-compatibility.md#if-startup-refuses-the-board) |
+| Start exits at once: `reachAQ is already running for this user (pid N)` | Another instance holds the hardware. Close it, or find it with `ps -p N` |
+| Hardware Status warns `NI-DAQ wiring is unverified` | The named channels have not been confirmed against the cables; run the wiring test from **Tools → DAQ Monitor** ([NI-DAQ guide](ni-daq-pxi.md#check-the-wiring)) |
 | TensorFlow or PyTorch reports no GPU | [NVIDIA guide troubleshooting](nvidia-inference.md#troubleshooting) or `--no-live-inference` |
 | Output permission error | Configured data directory ownership and write permission |
 
@@ -320,9 +332,9 @@ on the workstation on that date; the hardware entries are from 2026-09-09.
   runs at about 4 ms/frame and the DeepLabCut TensorFlow model
   `mouseGYM-christie-2025-09-18` at about 53 ms/frame.
 - Conda environment `reachaq-py38-20260924`: the previous Python 3.8.20
-  environment, archived by the installer, kept as a fallback. In it TensorFlow
-  2.12.1 had silently lost its GPU - torch's cuDNN 9 had overwritten its cuDNN 8
-  - so DeepLabCut TensorFlow models ran on the CPU there.
+  environment, archived by the installer, kept as a fallback. Its TensorFlow
+  has no GPU (its cuDNN 8 was overwritten), so DeepLabCut TensorFlow models run
+  on the CPU there; YOLO models still use the GPU.
 - Spinnaker system runtime 3.2.0.57 (verified); bundled Python wheel 3.2.0.62,
   which lists both cameras against it (verified).
 - NI-DAQmx 26.3.1 (verified) and PXI Platform Services 26.3; configured

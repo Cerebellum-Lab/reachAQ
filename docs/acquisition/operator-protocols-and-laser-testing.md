@@ -182,6 +182,16 @@ output directly.
 - **What it does not prove:** anything about the board. This path never touches
   the pellet board, so it cannot tell you whether a trial's trigger would work.
 
+**Trigger Mode** starts at *internal*, which starts the pulse on the NI clock
+when you press Run Pulse. With *external*, the output is armed and waits for
+an edge on **Trigger Source**. Nothing on this page sends that edge, so use
+*external* only when an outside trigger is wired in. If no edge arrives, the
+pulse fails after the train length plus five seconds with *Wait Until Done did
+not indicate that the task was done*. Loading a saved profile that has a
+trigger terminal switches the selector to *external*; set it back to
+*internal* to run that profile's waveform with Run Pulse. Test stim takes its
+trigger from the profile and does not use this selector.
+
 ### Test stim (hardware trigger) — proves the whole trial path
 
 Below Run Pulse, pick a saved profile in **Stim profile** and press **Test stim

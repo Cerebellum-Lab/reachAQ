@@ -41,6 +41,15 @@ Current stable rule IDs:
 | Events | `events.alignment`, `events.frames`, `events.tones`, `events.laser`, `events.board_time`, `stim.evidence` |
 | Trials | `trials.lifecycle`, `trials.protocol` |
 
+`sources.contract` checks each file a source lists. Pose is recorded as one
+`raw2D_live.h5` per camera, and each missing one is named. Validator versions
+before 2026-09-24 reported `pose: artifact missing` for every session that
+recorded pose, even with the files present; validate such a session again.
+Sessions recorded before 2026-09-24 can also fail `events.alignment` and
+`events.frames` with `nonmonotonic performance timestamp`, because their
+`device.csv` rows were not written in time order. That is a fault in the
+recording, not in the validator.
+
 The rule-to-checklist proof boundary is maintained in
 [session-validation-coverage.md](session-validation-coverage.md). In particular,
 a validator Pass does not promote a physical wiring, stimulus, UI, recovery, or
