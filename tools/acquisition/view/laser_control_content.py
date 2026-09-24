@@ -208,8 +208,12 @@ class _LaserChannelTab(QWidget):
         self._frequency_hz.setSuffix(" Hz")
         self._trigger_mode = QComboBox()
         self._trigger_mode.addItems(("internal", "external"))
-        if channel.trigger_source:
-            self._trigger_mode.setCurrentText("external")
+        # Internal by default, even when the channel has a trigger route. This
+        # used to switch to external whenever one was configured, so Run pulse
+        # armed the output for a board STIM pulse that nothing on this tab
+        # sends, and failed with a DAQmx timeout (christielab10, 2026-09-24).
+        # The route stays filled in for choosing external deliberately; Test
+        # stim and saved profiles set their own trigger.
         self._trigger_source = QLineEdit(channel.trigger_source or "")
         self._trigger_source.setPlaceholderText("NI-DAQ trigger route")
         self._trigger_edge = QComboBox()

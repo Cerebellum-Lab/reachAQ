@@ -26,12 +26,13 @@ def qapp():
     return app
 
 
-def make_tab(app_model, channel_id=LaserChannelId.LASER_1):
+def make_tab(app_model, channel_id=LaserChannelId.LASER_1, trigger_source=None):
     channel = LaserChannelConfiguration(
         channel_id=channel_id,
         analog_output="/Dev1/ao0",
         diode_input="/Dev1/ai0",
         shutter_output="/Dev1/port0/line0",
+        trigger_source=trigger_source,
     )
     started = []
     statuses = []
@@ -55,6 +56,19 @@ def test_the_channel_tab_offers_a_stim_test_control(channel_tab):
     tab, _started, _statuses = channel_tab
 
     assert tab.stim_test_button.text() == "Test stim (hardware trigger)"
+
+
+def test_run_pulse_is_internal_even_when_the_channel_has_a_trigger_route(qapp, app_model):
+    # Defaulting to external armed Run pulse for a board STIM pulse nothing on
+    # this tab sends; on christielab10 every attempt ended in a DAQmx timeout.
+    tab, _started, _statuses = make_tab(app_model, trigger_source="/Dev1/PXI_Trig0")
+
+    assert tab._trigger_mode.currentText() == "internal"
+    assert tab._trigger_source.text() == "/Dev1/PXI_Trig0"
+    assert tab._build_pulse_train().trigger_source is None
+
+    tab._trigger_mode.setCurrentText("external")
+    assert tab._build_pulse_train().trigger_source == "/Dev1/PXI_Trig0"
 
 
 def test_running_a_stim_test_with_no_profile_selected_reports_rather_than_fires(
