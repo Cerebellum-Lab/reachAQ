@@ -1,12 +1,12 @@
-"""TensorFlow must be optional, never a hard requirement.
+"""The pose frameworks are extras, installed together by the portable installer.
 
-The two frameworks cannot share one environment: nvidia-cudnn-cu11 and
-nvidia-cudnn-cu12 both install libcudnn.so.8, so whichever lands last wins and
-the other framework's GPU path breaks. On the reachAQ rig that is exactly what
-happened - the cu11 build won, TensorFlow works, and every torch convolution
-aborts. Extras let a deployment install exactly one.
+They stay extras rather than hard dependencies because installing both naively
+breaks one: their nvidia-* CUDA wheels share site-packages/nvidia, and on
+christielab10 the later install overwrote the earlier. The installer installs
+both deliberately, with TensorFlow's CUDA runtime kept apart; the conditions are
+recorded beside the extras in auto-trainer-inference/pyproject.toml.
 
-DeepLabCut 3.x still ships both engines, verified against the installed 3.0.1,
+DeepLabCut 3.x still ships both engines, verified against the installed 3.0.2,
 so raising the floor does not strand the TensorFlow path.
 """
 
@@ -83,6 +83,26 @@ def test_tensorflow_extra_carries_its_helper_packages():
     extra = _extras_block(_text(), "tensorflow")
     for package in ("tensorpack", "tf-slim"):
         assert package in extra, f"{package} is required by the DeepLabCut TF engine"
+
+
+def test_yolo_runtime_is_a_hard_dependency():
+    """yolo_pose_model imports ultralytics lazily, so a missing one only failed at
+    the first live frame; christielab10's live model is YOLO."""
+    assert "ultralytics" in _dependencies_block(_text())
+
+
+def test_tensorflow_extra_carries_imgaug():
+    """DeepLabCut 3's TensorFlow engine imports imgaug without declaring it."""
+    assert "imgaug" in _extras_block(_text(), "tensorflow")
+
+
+def test_torch_extra_is_capped_at_the_build_shown_to_share_a_process():
+    """2.7.1+cu128 runs beside TensorFlow 2.12; the CUDA 13 build aborted it."""
+    extra = _extras_block(_text(), "torch")
+    assert re.search(r"torch\s*>=\s*2\.7\s*,\s*<\s*2\.8", extra), (
+        "the torch extra must stay below 2.8 until a newer build is checked "
+        "against TensorFlow in one process"
+    )
 
 
 def test_torch_extra_covers_the_whole_gpu_fleet():

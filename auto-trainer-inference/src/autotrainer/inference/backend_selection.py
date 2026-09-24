@@ -1,8 +1,11 @@
 """Which DeepLabCut engine live inference runs on.
 
-The two engines cannot share one environment - nvidia-cudnn-cu11 and
-nvidia-cudnn-cu12 both install libcudnn.so.8 - so a deployment installs exactly
-one of the `tensorflow` or `torch` extras and this selects the matching backend.
+An environment built by tools/install/reachaq-linux-install.sh has both engines,
+and this selects the one a model runs on: a YOLO model always runs on torch, a
+DeepLabCut model on REACHAQ_POSE_BACKEND. The conditions that let the two share
+an environment are recorded beside the extras in auto-trainer-inference's
+pyproject.toml. An environment with only one extra still works; the other
+backend is simply not available.
 
 Selection is an environment variable rather than a SystemConfiguration field on
 purpose. SystemConfiguration.version is pinned at 57 and rejects any other
