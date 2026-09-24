@@ -523,6 +523,9 @@ class AppModel(ObservableObject):
         self._loaded_configuration: Optional[SystemConfiguration] = None
         self._loaded_config_dir_path = Path()
         self._loaded_configuration_has_runtime_override = False
+        # True from the start of load_configuration until it completes. A load
+        # that raises part-way leaves this set, and save_configuration refuses.
+        self._configuration_load_incomplete = False
         self._runtime_live_inference_override: Optional[bool] = None
         self._nidaq_ports = NidaqPortConfiguration()
         self._hardware_scan_results: Dict[str, HardwareScanEntry] = {}
@@ -7182,6 +7185,13 @@ class AppModel(ObservableObject):
     @_serialized_session_configuration
     def load_configuration(self, location: Optional[Path] = None, *, random_cameras: bool = False):
         self._require_session_ready_for_configuration("Loading configuration")
+        # Everything below reconfigures live objects one after another, and
+        # several steps can raise. A load that stops part-way leaves the cameras
+        # on the new configuration and the rest on the old, and save_configuration
+        # builds what it writes from those live objects. On 2026-09-17 exactly
+        # that wrote a demo run's playback cameras over christielab10's real
+        # ones. So nothing may be saved until this load reaches its last line.
+        self._configuration_load_incomplete = True
         if location is None:
             location = self.get_config_location()
 
@@ -7362,6 +7372,7 @@ class AppModel(ObservableObject):
 
         self.configuration_loaded_event(configuration)
 
+        self._configuration_load_incomplete = False
         log_hardware_initialization(
             logger,
             "READY | hardware configuration | elapsed=%.3fs",
@@ -7395,6 +7406,12 @@ class AppModel(ObservableObject):
             return
         if self._loaded_configuration_has_runtime_override:
             logger.info("Skipping configuration save because this run used runtime camera source overrides")
+            return
+        if self._configuration_load_incomplete:
+            logger.warning(
+                "Not saving configuration: the last configuration load did not complete, "
+                "so what is running is part old and part new"
+            )
             return
         loc = self._preferences.configuration_location
         logger.info("Saving configuration to %s", loc)
