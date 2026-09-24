@@ -19,3 +19,8 @@
 # renormalise 127 of the 445 tracked Python files, conflicting with in-flight
 # branches and rewriting blame; that remains a separate decision.
 *.sh text eol=lf
+# Installed commands carry no .sh suffix, so name them. reachaq-launcher was
+# checked out with CRLF on Windows while every *.sh beside it was LF.
+tools/install/bin/* text eol=lf
+tools/install/desktop/reachaq-launcher text eol=lf
+tools/install/desktop/*.desktop.in text eol=lf
