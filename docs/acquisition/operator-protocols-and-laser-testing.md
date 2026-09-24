@@ -195,6 +195,22 @@ count, frequency, baseline, post-stim) into this page, so Run Pulse fires that
 waveform. It does not change Trigger Mode or Trigger Source. Test stim takes
 its trigger from the profile and does not use this selector.
 
+**Save profile** stores the waveform on this page as a profile and asks for:
+
+- a **name** (a loaded profile's name saves a new revision of it);
+- the **trigger route**, how a trial and Test stim start it. *Board STIM*
+  arms on this laser's trigger terminal from Edit DAQ Ports (on christielab10,
+  `/PXI1Slot4/PXI_Trig0` for laser 1 and `/PXI1Slot4/PXI_Trig2` for laser 2),
+  and the board's pulse starts it. *Software start* is started by the host;
+  in a trial that is the stim camera's detector. Board STIM is unavailable for
+  a laser with no trigger terminal;
+- for Board STIM, the **board line** wired to this laser's trigger input
+  (STIM3 for laser 1 and STIM2 for laser 2 on christielab10).
+
+The route and line start from the loaded profile, or from this laser's other
+saved profiles. Trigger Mode is not used: it only decides how Run Pulse
+starts.
+
 ### Test stim — proves the trial path
 
 Below Run Pulse, pick a saved profile in **Stim profile** and press **Test
