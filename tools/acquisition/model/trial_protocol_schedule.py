@@ -19,13 +19,15 @@ from autotrainer.core.delay_distribution import MINIMUM_CUE_INTERVAL_MS
 MAX_POST_CLEAR_DELAY_MS = 60_000
 
 
-PROTOCOL_SCHEMA_VERSION = 2
+PROTOCOL_SCHEMA_VERSION = 3
 
 # Schema versions a stored document may carry. Anything listed here is loaded
 # and upgraded to PROTOCOL_SCHEMA_VERSION; anything else is refused rather than
 # guessed at. Schema 1 predates the Tone 1 to Tone 2 cue pair and the weighted
-# stimulus trigger profiles, both of which added only optional fields.
-SUPPORTED_PROTOCOL_SCHEMA_VERSIONS = frozenset({1, PROTOCOL_SCHEMA_VERSION})
+# stimulus trigger profiles, both of which added only optional fields. Schema 3
+# gave a laser row its laser, which a schema 2 laser row cannot be upgraded to
+# without a guess, so those are refused on load.
+SUPPORTED_PROTOCOL_SCHEMA_VERSIONS = frozenset({1, 2, PROTOCOL_SCHEMA_VERSION})
 DEFAULT_TRIAL_COUNT = 15
 MAX_ABS_SHIFT_MM = 50.0
 _IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
@@ -222,6 +224,9 @@ class TrialProtocolRow:
     laser_profile_id: str = ""
     laser_phase: ActionPhase = ActionPhase.NONE
     laser_trigger_route: LaserTriggerRoute = LaserTriggerRoute.NONE
+    #: Which configured laser fires this row's profile; 0 is none. The
+    #: profile is only the pulse train.
+    laser_channel_id: int = 0
     stimulus_category: str = "none"
     stimulus_assignment: StimulusAssignment = StimulusAssignment.DISABLED
     stimulus_probability_percent: float = 100.0
@@ -315,6 +320,11 @@ class TrialProtocolRow:
                         f"{MAX_POST_CLEAR_DELAY_MS}"
                     )
                 normalized[field] = value
+            elif field == "laser_channel_id":
+                value = int(value)
+                if not 0 <= value <= 4:
+                    raise ValueError("laser_channel_id must be between 0 and 4")
+                normalized[field] = value
             elif field == "automatic_window_size":
                 value = int(value)
                 if not 1 <= value <= 10_000:
@@ -353,10 +363,18 @@ class TrialProtocolRow:
             raise ValueError("A tone phase requires a tone profile")
         self._validate_cue_pair()
         if self.laser_trigger_route is LaserTriggerRoute.NONE:
-            if self.laser_profile_id or self.laser_phase is not ActionPhase.NONE:
+            if (
+                self.laser_profile_id
+                or self.laser_phase is not ActionPhase.NONE
+                or self.laser_channel_id
+            ):
                 raise ValueError("Laser actions require a trigger route")
-        elif not self.laser_profile_id or self.laser_phase is ActionPhase.NONE:
-            raise ValueError("Laser trigger route requires profile and phase")
+        elif (
+            not self.laser_profile_id
+            or self.laser_phase is ActionPhase.NONE
+            or not self.laser_channel_id
+        ):
+            raise ValueError("Laser trigger route requires a laser, profile and phase")
         if self.stimulus_trigger is StimulusTrigger.PRE_REVEAL:
             if self.pre_reveal_ms <= 0:
                 raise ValueError("Pre-reveal trigger requires a positive delay")
@@ -757,6 +775,18 @@ class TrialProtocolDocument:
                 f"Unsupported protocol schema {stored_schema}; expected one of "
                 f"{sorted(SUPPORTED_PROTOCOL_SCHEMA_VERSIONS)}"
             )
+        if stored_schema < 3:
+            laser_trials = sorted(
+                int(item["trial_id"])
+                for item in record.get("resolved_rows", ())
+                if str(item.get("laser_trigger_route", "none")) not in ("", "none")
+            )
+            if laser_trials:
+                raise ValueError(
+                    f"Protocol {record.get('name', record.get('protocol_id'))!r} "
+                    f"was saved before a laser row named its laser; set the laser "
+                    f"on trial {', '.join(map(str, laser_trials))} in a new protocol"
+                )
         return cls(
             # Upgraded on load, the way the stimulus profile library already
             # does it. Schema 2 only added optional cue-pair and trigger-profile

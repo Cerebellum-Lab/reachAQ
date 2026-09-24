@@ -59,6 +59,7 @@ def test_compile_fixed_absolute_target_and_profiles():
         "laser_profile_id": "pulse",
         "laser_phase": "pellet_presentation",
         "laser_trigger_route": "hardware_stim3",
+        "laser_channel_id": 1,
         "stimulus_assignment": "always",
         "stimulus_trigger": "tone_1",
     })
@@ -118,6 +119,7 @@ def test_retry_repeat_keeps_draw_while_resample_changes_it():
         "laser_profile_id": "pulse",
         "laser_phase": "pellet_presentation",
         "laser_trigger_route": "hardware_stim3",
+        "laser_channel_id": 1,
     })
 
     first = _compiler().compile(base, _context(attempt_id=1))
@@ -137,6 +139,7 @@ def test_compile_rejects_unknown_or_route_mismatched_profile():
         "laser_profile_id": "pulse",
         "laser_phase": "before_send",
         "laser_trigger_route": "direct_ni_software",
+        "laser_channel_id": 1,
         "stimulus_assignment": "always",
         "stimulus_trigger": "first_reach",
     })
@@ -152,6 +155,7 @@ def test_compile_rejects_pre_reveal_shorter_than_trigger_pulse():
         "laser_profile_id": "pulse",
         "laser_phase": "embedded_in_sequence",
         "laser_trigger_route": "hardware_stim3",
+        "laser_channel_id": 1,
         "stimulus_assignment": "always",
         "stimulus_trigger": "pre_reveal",
         "pre_reveal_ms": 1,
@@ -217,6 +221,7 @@ def test_executor_preparation_failure_cancels_laser_and_creates_no_send():
         "laser_profile_id": "pulse",
         "laser_phase": "pellet_presentation",
         "laser_trigger_route": "hardware_stim3",
+        "laser_channel_id": 1,
         "stimulus_assignment": "always",
         "stimulus_trigger": "tone_1",
     })
@@ -244,6 +249,7 @@ def test_executor_routes_hardware_stimulus_through_firmware_callback():
         "laser_profile_id": "pulse",
         "laser_phase": "pellet_presentation",
         "laser_trigger_route": "hardware_stim3",
+        "laser_channel_id": 1,
         "stimulus_assignment": "always",
         "stimulus_trigger": "first_reach",
     })
@@ -302,6 +308,7 @@ def test_executor_persists_laser_result_and_rejects_failed_cycle():
         "laser_profile_id": "pulse",
         "laser_phase": "pellet_presentation",
         "laser_trigger_route": "hardware_stim3",
+        "laser_channel_id": 1,
         "stimulus_assignment": "always",
         "stimulus_trigger": "tone_1",
     })

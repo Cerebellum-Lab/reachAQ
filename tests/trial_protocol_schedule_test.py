@@ -6,6 +6,7 @@ from tools.acquisition.model.trial_protocol_schedule import (
     LaserTriggerRoute,
     PelletLane,
     PelletPositionMode,
+    PROTOCOL_SCHEMA_VERSION,
     ProtocolPatch,
     ProtocolScope,
     StimulusAssignment,
@@ -129,6 +130,7 @@ def test_document_round_trip_preserves_resolved_rows():
             "laser_profile_id": "blue-10hz",
             "laser_phase": "pellet_presentation",
             "laser_trigger_route": "direct_ni_software",
+            "laser_channel_id": 1,
         }),
     )
 
@@ -181,18 +183,21 @@ def test_pre_reveal_requires_board_route_and_reveal_policy():
         TrialProtocolRow(trial_id=1).with_updates({
             **base,
             "laser_trigger_route": "hardware_stim3",
+            "laser_channel_id": 1,
         })
     with pytest.raises(ValueError, match="Hardware STIM3"):
         TrialProtocolRow(trial_id=1).with_updates({
             **base,
             "cover_policy": "reveal",
             "laser_trigger_route": "direct_ni_software",
+            "laser_channel_id": 1,
         })
 
     row = TrialProtocolRow(trial_id=1).with_updates({
         **base,
         "cover_policy": "reveal",
         "laser_trigger_route": "hardware_stim3",
+        "laser_channel_id": 1,
     })
     assert row.pre_reveal_ms == 200
 
@@ -204,6 +209,7 @@ def test_direct_ni_route_is_limited_to_first_reach():
         "laser_profile_id": "pulse",
         "laser_phase": "pellet_presentation",
         "laser_trigger_route": "direct_ni_software",
+        "laser_channel_id": 1,
         "stimulus_trigger": "tone_1",
     }, validate=False)
 
@@ -224,3 +230,55 @@ def test_direct_ni_route_is_limited_to_first_reach():
 def test_protocol_values_are_strictly_validated(values, message):
     with pytest.raises(ValueError, match=message):
         TrialProtocolRow(trial_id=1).with_updates(values)
+
+
+def _laser_row(**changes):
+    values = {
+        "laser_profile_id": "pulse",
+        "laser_phase": "pellet_presentation",
+        "laser_trigger_route": "hardware_stim3",
+        "laser_channel_id": 2,
+    }
+    values.update(changes)
+    return TrialProtocolRow(trial_id=1).with_updates(values)
+
+
+def test_a_laser_row_names_its_laser():
+    assert _laser_row().laser_channel_id == 2
+
+
+def test_a_laser_route_without_a_laser_is_refused():
+    with pytest.raises(ValueError, match="requires a laser, profile and phase"):
+        _laser_row(laser_channel_id=0)
+
+
+def test_a_laser_without_a_route_is_refused():
+    with pytest.raises(ValueError, match="require a trigger route"):
+        TrialProtocolRow(trial_id=1).with_updates({"laser_channel_id": 1})
+
+
+def test_a_laser_number_outside_the_four_channels_is_refused():
+    with pytest.raises(ValueError, match="laser_channel_id"):
+        _laser_row(laser_channel_id=5)
+
+
+def test_protocol_schema_is_3():
+    assert PROTOCOL_SCHEMA_VERSION == 3
+
+
+def test_a_schema_2_protocol_without_lasers_loads():
+    record = TrialProtocolDocument(protocol_id="p", name="P").to_record()
+    record["schema_version"] = 2
+
+    assert TrialProtocolDocument.from_record(record).schema_version == 3
+
+
+def test_a_schema_2_protocol_with_a_laser_row_is_refused_by_name():
+    record = TrialProtocolDocument(protocol_id="p", name="Old laser").to_record()
+    record["schema_version"] = 2
+    record["resolved_rows"] = [
+        {"trial_id": 4, "laser_trigger_route": "hardware_stim3"},
+    ]
+
+    with pytest.raises(ValueError, match=r"'Old laser'.*trial 4"):
+        TrialProtocolDocument.from_record(record)

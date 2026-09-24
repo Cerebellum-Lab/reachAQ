@@ -76,7 +76,7 @@ def _cue_row(trial_id=1, **changes):
 
 
 def test_protocol_schema_version_is_bumped_for_the_cue_pair():
-    assert PROTOCOL_SCHEMA_VERSION == 2
+    assert PROTOCOL_SCHEMA_VERSION == 3
     assert PROFILE_SCHEMA_VERSION >= 3
 
 
