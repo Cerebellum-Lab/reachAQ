@@ -5,8 +5,15 @@
 # This script intentionally excludes hardware/model-specific drivers and
 # configuration (FLIR Spinnaker, NI-DAQ/PXI, PEAK CAN, NVIDIA kernel drivers,
 # and channel mappings). The single no-argument workflow installs every
-# portable component, including the TensorFlow-compatible CUDA user-space
-# runtime, and runs all tracked verification.
+# portable component into a Python 3.10 Conda environment: the application,
+# both pose engines DeepLabCut 3 can run (PyTorch and TensorFlow) and the YOLO
+# runtime, TensorFlow's CUDA user-space runtime kept apart from PyTorch's, and
+# all tracked verification.
+#
+# Rerunning it is the update path. An existing environment on another Python
+# version is kept, renamed <env>-py<version>-<date>, and a fresh one is built.
+# REACHAQ_INSTALL_SYSTEM=0 skips the steps that need root (apt packages, groups,
+# limits, systemd), for rerunning on a host that already has them.
 #
 # Do not enable `set -e`: every step must be attempted independently and the
 # complete pass/fail/skip report must be printed at the end.
@@ -21,7 +28,8 @@ fi
 
 INSTALL_REPO=${REACHAQ_INSTALL_REPO:-$DEFAULT_REPO}
 INSTALL_ENV=${REACHAQ_INSTALL_ENV:-reachaq}
-INSTALL_PYTHON=${REACHAQ_INSTALL_PYTHON:-3.8}
+INSTALL_PYTHON=${REACHAQ_INSTALL_PYTHON:-3.10}
+INSTALL_SYSTEM=${REACHAQ_INSTALL_SYSTEM:-1}
 INSTALL_CONFIG_DIR=${REACHAQ_INSTALL_CONFIG_DIR:-$HOME/Autotrainer}
 INSTALL_DATA_DIR=${REACHAQ_INSTALL_DATA_DIR:-$HOME/Documents/rawdatalocal}
 INSTALL_OPERATOR=${SUDO_USER:-${USER:-$(id -un)}}
@@ -324,19 +332,126 @@ install_miniconda() {
 }
 
 ensure_conda_environment() {
-    if "$CONDA_BIN" run -n "$INSTALL_ENV" python --version >/dev/null 2>&1; then
-        printf 'Conda environment %s already exists.\n' "$INSTALL_ENV"
+    local wanted existing
+    wanted=$(printf '%s' "$INSTALL_PYTHON" | cut -d. -f1-2)
+    existing=$("$CONDA_BIN" run -n "$INSTALL_ENV" python -c \
+        'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null)
+    if [ -n "$existing" ] && [ "$existing" = "$wanted" ]; then
+        printf 'Conda environment %s already exists with Python %s.\n' \
+            "$INSTALL_ENV" "$existing"
         return 0
     fi
+    if [ -n "$existing" ]; then
+        archive_conda_environment "$existing" || return
+    fi
     "$CONDA_BIN" create -y -n "$INSTALL_ENV" "python=$INSTALL_PYTHON"
+}
+
+# An environment on another Python cannot be upgraded in place - pip refuses a
+# package whose requires-python it does not meet - so keep it, renamed, and
+# build fresh. The last working environment stays one `conda run -n` away.
+archive_conda_environment() {
+    local old_python=$1
+    local archive_name
+    archive_name="${INSTALL_ENV}-py${old_python//./}-$(date +%Y%m%d)"
+    if "$CONDA_BIN" env list | awk '{print $1}' | grep -qx "$archive_name"; then
+        printf 'Cannot archive %s: %s already exists. Rename or remove it, then rerun.\n' \
+            "$INSTALL_ENV" "$archive_name" >&2
+        return 1
+    fi
+    printf 'Archiving the Python %s environment %s as %s.\n' \
+        "$old_python" "$INSTALL_ENV" "$archive_name"
+    "$CONDA_BIN" rename -n "$INSTALL_ENV" "$archive_name" || return
+    # conda rewrites the paths inside files its own packages installed, but not
+    # the first line of pip's console scripts, which still names the old
+    # location - where the new environment is about to be built.
+    local archive_prefix old_prefix script
+    archive_prefix=$("$CONDA_BIN" run -n "$archive_name" python -c \
+        'import sys; print(sys.prefix)') || return
+    old_prefix="${archive_prefix%/*}/$INSTALL_ENV"
+    for script in "$archive_prefix"/bin/*; do
+        [ -f "$script" ] || continue
+        if head -n 1 "$script" 2>/dev/null | grep -q "^#!$old_prefix/bin/"; then
+            sed -i "1s|^#!$old_prefix/bin/|#!$archive_prefix/bin/|" "$script" || return
+        fi
+    done
+    printf 'Run the archived environment with: conda run --no-capture-output -n %s python -m reachAQ.app\n' \
+        "$archive_name"
 }
 
 conda_run() {
     "$CONDA_BIN" run --no-capture-output -n "$INSTALL_ENV" "$@"
 }
 
+# requirements.txt holds `-e .`, which pip resolves against the working
+# directory rather than the file, so run from the checkout: started from
+# anywhere else, this step failed with "does not appear to be a Python project".
+install_python_requirements() {
+    (cd "$INSTALL_REPO" && conda_run python -m pip install -r requirements.txt)
+}
+
 install_editable_package() {
     conda_run python -m pip install -e "$INSTALL_REPO[test]"
+}
+
+# The pins live in the `torch` and `tensorflow` extras of
+# auto-trainer-inference/pyproject.toml; setup.py merges only base
+# dependencies, so they are read from there rather than copied here.
+pose_engine_requirements() {
+    conda_run python - "$INSTALL_REPO/auto-trainer-inference/pyproject.toml" "$1" <<'PY'
+import sys
+
+import tomli
+
+with open(sys.argv[1], "rb") as stream:
+    extras = tomli.load(stream)["project"]["optional-dependencies"]
+print("\n".join(extras[sys.argv[2]]))
+PY
+}
+
+# Both engines DeepLabCut 3 can run, in one environment. The conditions that
+# makes safe are recorded beside the extras in auto-trainer-inference's
+# pyproject.toml; in short: torch from the CUDA 12.8 index, TensorFlow's CUDA
+# runtime kept apart (install_tensorflow_gpu_runtime), and TensorFlow 2.12's
+# stale numpy and typing-extensions caps overridden afterwards.
+install_pose_engines() {
+    local extra requirement packages
+    for extra in torch tensorflow; do
+        packages=()
+        while IFS= read -r requirement; do
+            [ -n "$requirement" ] && packages+=("$requirement")
+        done < <(pose_engine_requirements "$extra")
+        if [ "${#packages[@]}" -eq 0 ]; then
+            printf 'No %s requirements were found in auto-trainer-inference.\n' "$extra" >&2
+            return 1
+        fi
+        if [ "$extra" = torch ] && [ "$(uname -m)" = x86_64 ]; then
+            conda_run python -m pip install "${packages[@]}" \
+                --index-url https://download.pytorch.org/whl/cu128 || return
+        else
+            conda_run python -m pip install "${packages[@]}" || return
+        fi
+    done
+    # Installing TensorFlow 2.12 pulls numpy down to 1.24.3, typing-extensions
+    # to 4.5 and filelock out of DeepLabCut's range. Put all three back.
+    conda_run python -m pip install \
+        'numpy >= 1.26, < 2' 'typing-extensions >= 4.10' 'filelock >= 3.12, < 3.16'
+}
+
+# pip check, with exactly the two TensorFlow caps the installer overrides on
+# purpose allowed through. Anything else is a real conflict and fails.
+verify_python_dependencies() {
+    local report
+    report=$(conda_run python -m pip check 2>&1)
+    local unexpected
+    unexpected=$(printf '%s\n' "$report" \
+        | grep -v -E '^tensorflow [0-9.]+ has requirement (numpy|typing-extensions)' \
+        | grep -v -E '^No broken requirements found|^ERROR conda|^$')
+    printf '%s\n' "$report"
+    if [ -n "$unexpected" ]; then
+        printf 'Unexpected dependency conflicts:\n%s\n' "$unexpected" >&2
+        return 1
+    fi
 }
 
 install_desktop_launcher() {
@@ -389,9 +504,20 @@ install_tensorflow_gpu_runtime() {
             ;;
     esac
 
-    printf 'Installing CUDA 11.8 and cuDNN 8.6 libraries for TensorFlow %s.\n' \
-        "$tensorflow_version"
-    conda_run python -m pip install \
+    # TensorFlow 2.12 needs CUDA 11.8 and cuDNN 8.6; PyTorch brings CUDA 12 and
+    # cuDNN 9. Both arrive as nvidia-* wheels that install into the same
+    # site-packages/nvidia directory, so the second install overwrote the
+    # first: on christielab10 libcudnn.so.8 was gone and TensorFlow fell back
+    # to the CPU without a word. The libraries themselves differ by soname
+    # (libcudnn.so.8 and .9, libcublas.so.11 and .12), so TensorFlow's set goes
+    # in a directory of its own, reached only through LD_LIBRARY_PATH, and
+    # neither framework can load the other's.
+    local env_prefix runtime_dir
+    env_prefix=$(conda_run python -c 'import sys; print(sys.prefix)') || return
+    runtime_dir="$env_prefix/lib/reachaq-tensorflow-cuda11"
+    printf 'Installing CUDA 11.8 and cuDNN 8.6 libraries for TensorFlow %s into %s.\n' \
+        "$tensorflow_version" "$runtime_dir"
+    conda_run python -m pip install --upgrade --target "$runtime_dir" \
         'nvidia-cuda-runtime-cu11==11.8.89' \
         'nvidia-cuda-cupti-cu11==11.8.87' \
         'nvidia-cuda-nvrtc-cu11==11.8.89' \
@@ -402,8 +528,9 @@ install_tensorflow_gpu_runtime() {
         'nvidia-cusparse-cu11==11.7.5.86' \
         'nvidia-cudnn-cu11==8.6.0.163' || return
 
-    local nvidia_root
-    nvidia_root=$(conda_run python -c \
+    local nvidia_root="$runtime_dir/nvidia"
+    local site_nvidia_root
+    site_nvidia_root=$(conda_run python -c \
         'import sysconfig; print(sysconfig.get_paths()["purelib"] + "/nvidia")') || return
     local tensorflow_library_path
     tensorflow_library_path="$nvidia_root/cublas/lib:$nvidia_root/cuda_cupti/lib"
@@ -420,8 +547,10 @@ install_tensorflow_gpu_runtime() {
         local existing_library_directories=()
         IFS=: read -r -a existing_library_directories <<< "$existing_library_path"
         for library_directory in "${existing_library_directories[@]}"; do
+            # Drop this step's own entries, and the site-packages ones an
+            # earlier version of it set - those now hold PyTorch's CUDA 12.
             case "$library_directory" in
-                "$nvidia_root"/*/lib)
+                "$nvidia_root"/*/lib|"$site_nvidia_root"/*/lib)
                     ;;
                 *)
                     if [ -n "$preserved_library_path" ]; then
@@ -458,6 +587,90 @@ if "GPU:0" not in result.device:
 PY
 }
 
+# A convolution rather than a matmul, because cuDNN is what the two frameworks
+# fought over, and a matmul never touches it.
+verify_torch_gpu_runtime() {
+    conda_run python - <<'PY'
+import torch
+from autotrainer.inference import detect_gpu_runtime
+
+status = detect_gpu_runtime(required_backend="torch")
+print(status)
+if not status.is_available:
+    raise SystemExit(status.error)
+
+image = torch.ones((1, 3, 32, 32), device="cuda")
+result = torch.nn.functional.conv2d(image, torch.ones((4, 3, 3, 3), device="cuda"))
+torch.cuda.synchronize()
+print("PyTorch GPU convolution device:", result.device,
+      "cuDNN", torch.backends.cudnn.version())
+PY
+}
+
+# DeepLabCut 3 imports torch on import, so its TensorFlow engine always runs
+# with both frameworks in one process. That aborted with torch's CUDA 13 build;
+# check it rather than rely on the pins staying right.
+verify_pose_engines_together() {
+    conda_run python - <<'PY'
+import os
+
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+import torch
+import tensorflow as tf
+
+torch_result = torch.nn.functional.conv2d(
+    torch.ones((1, 3, 32, 32), device="cuda"), torch.ones((4, 3, 3, 3), device="cuda"))
+torch.cuda.synchronize()
+with tf.device("/GPU:0"):
+    tf_result = tf.nn.conv2d(tf.ones((1, 32, 32, 3)), tf.ones((3, 3, 3, 4)), 1, "SAME")
+if "GPU:0" not in tf_result.device:
+    raise SystemExit("TensorFlow convolution did not execute on GPU:0")
+print("Both engines in one process: PyTorch on", torch_result.device,
+      "and TensorFlow on", tf_result.device)
+PY
+}
+
+# The Spinnaker SDK itself is a vendor install (docs/linux-install/flir-spinnaker.md);
+# its Python binding is bundled here per interpreter and architecture, so once
+# the SDK is present the matching wheel is installed automatically.
+install_spinnaker_binding() {
+    conda_run python - "$INSTALL_REPO/vendor/spinnaker" <<'PY'
+import json
+import pathlib
+import platform
+import subprocess
+import sys
+
+root = pathlib.Path(sys.argv[1])
+tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
+manifest = json.loads((root / "manifest.json").read_text())
+match = [artifact for artifact in manifest["artifacts"]
+         if artifact["system"] == "linux"
+         and artifact["machine"] == platform.machine()
+         and artifact["python"] == tag]
+if not match:
+    raise SystemExit(f"no bundled Spinnaker wheel for {tag} on {platform.machine()}")
+subprocess.check_call([sys.executable, "-m", "pip", "install", str(root / match[0]["path"])])
+PY
+}
+
+verify_spinnaker_binding() {
+    conda_run python - <<'PY'
+import PySpin
+
+system = PySpin.System.GetInstance()
+try:
+    library = system.GetLibraryVersion()
+    cameras = system.GetCameras()
+    serials = [camera.TLDevice.DeviceSerialNumber.GetValue() for camera in cameras]
+    cameras.Clear()
+finally:
+    system.ReleaseInstance()
+print("PySpin uses Spinnaker %d.%d.%d.%d; cameras: %s" % (
+    library.major, library.minor, library.type, library.build, serials or "none attached"))
+PY
+}
+
 git_lfs_install() {
     local pre_push_hook="$INSTALL_REPO/.git/hooks/pre-push"
     if [ -f "$pre_push_hook" ] && grep -q 'git lfs pre-push' "$pre_push_hook"; then
@@ -484,6 +697,7 @@ import nidaqmx
 import openpyxl
 import requests
 import serial
+import ultralytics
 import autotrainer.core
 import autotrainer.device
 import autotrainer.video
@@ -596,19 +810,32 @@ begin_category "Preflight"
 run_step "Validate repository checkout" check_repo
 run_step "Create runtime directories" make_runtime_directories
 
+SYSTEM_SKIPPED="REACHAQ_INSTALL_SYSTEM=0; needs root, assumed already in place"
+
 begin_category "Portable Ubuntu packages"
-if ! have_command apt-get; then
-    skip_step "Update apt metadata" "apt-get is unavailable; install equivalent packages manually"
-    skip_step "Install base packages" "apt-get is unavailable; install equivalent packages manually"
+if [ "$INSTALL_SYSTEM" = "0" ]; then
+    skip_step "Update apt metadata" "$SYSTEM_SKIPPED"
+    skip_step "Install base packages" "$SYSTEM_SKIPPED"
+    skip_step "Configure RFID serial permissions" "$SYSTEM_SKIPPED"
 else
-    run_step "Update apt metadata" apt_update
-    run_step "Install base packages" apt_install_base
+    if ! have_command apt-get; then
+        skip_step "Update apt metadata" "apt-get is unavailable; install equivalent packages manually"
+        skip_step "Install base packages" "apt-get is unavailable; install equivalent packages manually"
+    else
+        run_step "Update apt metadata" apt_update
+        run_step "Install base packages" apt_install_base
+    fi
+    run_step "Configure RFID serial permissions" ensure_rfid_serial_group
 fi
-run_step "Configure RFID serial permissions" ensure_rfid_serial_group
 
 begin_category "Closed-loop latency tuning"
-run_step "Grant real-time priority to the stim loop" ensure_realtime_priority_limits
-run_step "Install CPU governor unit" install_cpu_governor_unit
+if [ "$INSTALL_SYSTEM" = "0" ]; then
+    skip_step "Grant real-time priority to the stim loop" "$SYSTEM_SKIPPED"
+    skip_step "Install CPU governor unit" "$SYSTEM_SKIPPED"
+else
+    run_step "Grant real-time priority to the stim loop" ensure_realtime_priority_limits
+    run_step "Install CPU governor unit" install_cpu_governor_unit
+fi
 
 begin_category "Conda runtime"
 CONDA_BIN=$(find_conda)
@@ -623,24 +850,30 @@ if [ -z "$CONDA_BIN" ]; then
     skip_step "Upgrade Python packaging tools" "conda unavailable"
     skip_step "Install Python requirements" "conda unavailable"
     skip_step "Install reachAQ editable package" "conda unavailable"
+    skip_step "Install pose engines (PyTorch and TensorFlow)" "conda unavailable"
 else
     record_result PASS "Locate conda" "$CONDA_BIN"
     printf '\n[PASS] Locate conda: %s\n' "$CONDA_BIN"
     run_step "Create conda environment" ensure_conda_environment
     run_step "Upgrade Python packaging tools" conda_run python -m pip install --upgrade pip setuptools wheel build
-    run_step "Install Python requirements" conda_run python -m pip install -r "$INSTALL_REPO/requirements.txt"
+    run_step "Install Python requirements" install_python_requirements
     run_step "Install reachAQ editable package" install_editable_package
+    run_step "Install pose engines (PyTorch and TensorFlow)" install_pose_engines
     run_step "Install reachAQ desktop launcher and terminal commands" install_desktop_launcher
     run_step "Verify reachaq and reachaq-sync commands" verify_terminal_commands
 fi
 
-begin_category "TensorFlow GPU runtime"
+begin_category "Pose engine GPU runtimes"
 if [ -z "$CONDA_BIN" ]; then
     skip_step "Install compatible CUDA user-space runtime" "conda unavailable"
     skip_step "Verify TensorFlow GPU preflight" "conda unavailable"
+    skip_step "Verify PyTorch GPU preflight" "conda unavailable"
+    skip_step "Verify both engines in one process" "conda unavailable"
 else
     run_step "Install compatible CUDA user-space runtime" install_tensorflow_gpu_runtime
     run_step "Verify TensorFlow GPU preflight" verify_tensorflow_gpu_runtime
+    run_step "Verify PyTorch GPU preflight" verify_torch_gpu_runtime
+    run_step "Verify both engines in one process" verify_pose_engines_together
 fi
 
 begin_category "Git LFS"
@@ -660,6 +893,20 @@ else
     run_step "Pull Git LFS assets" git_lfs_pull
 fi
 
+# After Git LFS: the bundled wheels are LFS objects.
+begin_category "Spinnaker camera binding"
+if [ -z "$CONDA_BIN" ]; then
+    skip_step "Install Spinnaker Python binding" "conda unavailable"
+    skip_step "Verify Spinnaker cameras" "conda unavailable"
+elif ! ls /opt/spinnaker/lib/libSpinnaker.so* >/dev/null 2>&1; then
+    skip_step "Install Spinnaker Python binding" \
+        "Spinnaker SDK not installed; see docs/linux-install/flir-spinnaker.md, then rerun"
+    skip_step "Verify Spinnaker cameras" "Spinnaker SDK not installed"
+else
+    run_step "Install Spinnaker Python binding" install_spinnaker_binding
+    run_step "Verify Spinnaker cameras" verify_spinnaker_binding
+fi
+
 begin_category "Portable verification"
 if [ -z "$CONDA_BIN" ]; then
     skip_step "Verify Python version" "conda unavailable"
@@ -671,7 +918,7 @@ if [ -z "$CONDA_BIN" ]; then
     skip_step "Verify headless CLI" "conda unavailable"
 else
     run_step "Verify Python version" conda_run python --version
-    run_step "Verify Python dependencies" conda_run python -m pip check
+    run_step "Verify Python dependencies" verify_python_dependencies
     run_step "Verify generic imports" verify_imports
     run_step "Verify SoftMouse runtime" verify_softmouse_runtime
     run_step "Verify RFID runtime" verify_rfid_runtime

@@ -41,13 +41,57 @@ def test_portable_installer_always_attempts_complete_workflow():
     source = INSTALL_SCRIPT.read_text()
 
     assert 'run_step "Install Miniconda" install_miniconda' in source
-    assert 'begin_category "TensorFlow GPU runtime"' in source
+    assert 'begin_category "Pose engine GPU runtimes"' in source
     assert 'run_step "Verify TensorFlow GPU preflight"' in source
     assert 'run_step "Run focused non-hardware tests"' in source
     assert "[options]" not in source
     assert "--skip-" not in source
     assert "--install-tensorflow-gpu" not in source
     assert "grep -q 'git lfs pre-push'" in source
+
+
+def test_portable_installer_builds_python_310_with_both_pose_engines():
+    source = INSTALL_SCRIPT.read_text()
+
+    # Every subproject declares requires-python >= 3.10; a 3.8 default made the
+    # editable install fail on a fresh host.
+    assert "INSTALL_PYTHON=${REACHAQ_INSTALL_PYTHON:-3.10}" in source
+    assert 'run_step "Install pose engines (PyTorch and TensorFlow)" install_pose_engines' in source
+    assert "download.pytorch.org/whl/cu128" in source
+    assert 'run_step "Verify PyTorch GPU preflight" verify_torch_gpu_runtime' in source
+    assert 'run_step "Verify both engines in one process" verify_pose_engines_together' in source
+    # TensorFlow's CUDA 11 libraries must not share site-packages/nvidia with
+    # torch's, or the second install overwrites the first.
+    assert '--target "$runtime_dir"' in source
+    assert 'run_step "Verify Python dependencies" verify_python_dependencies' in source
+    assert 'run_step "Install Spinnaker Python binding" install_spinnaker_binding' in source
+
+
+def test_portable_installer_archives_an_environment_on_another_python():
+    source = INSTALL_SCRIPT.read_text()
+
+    assert 'archive_conda_environment "$existing"' in source
+    assert '"$CONDA_BIN" rename -n "$INSTALL_ENV" "$archive_name"' in source
+
+
+def test_portable_installer_can_skip_root_steps_without_hiding_them():
+    source = INSTALL_SCRIPT.read_text()
+
+    assert "INSTALL_SYSTEM=${REACHAQ_INSTALL_SYSTEM:-1}" in source
+    for step in (
+        "Update apt metadata",
+        "Install base packages",
+        "Configure RFID serial permissions",
+        "Grant real-time priority to the stim loop",
+        "Install CPU governor unit",
+    ):
+        assert f'skip_step "{step}" "$SYSTEM_SKIPPED"' in source, step
+
+
+def test_portable_installer_resolves_requirements_from_the_checkout():
+    source = INSTALL_SCRIPT.read_text()
+
+    assert '(cd "$INSTALL_REPO" && conda_run python -m pip install -r requirements.txt)' in source
 
 
 def test_portable_installer_configures_closed_loop_latency():
