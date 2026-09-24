@@ -244,8 +244,11 @@ if [ "$head_before" != "$head_after" ]; then
     if [ -n "$metadata" ]; then
         printf '\nPackaging files changed on the running branch:\n'
         printf '  %s\n' $metadata
-        printf 'Reinstall so entry points and dependencies match:\n'
-        printf '  conda run -n reachaq python -m pip install -e "%s[test]"\n' \
+        # The installer, not a bare pip install -e: it also rebuilds the
+        # environment when the required Python changes, installs the pose
+        # engines in the order they need, and checks the result.
+        printf 'Rerun the installer so the environment matches (no root needed):\n'
+        printf '  REACHAQ_INSTALL_SYSTEM=0 %s/tools/install/reachaq-linux-install.sh\n' \
             "$(git rev-parse --show-toplevel)"
     fi
 fi
