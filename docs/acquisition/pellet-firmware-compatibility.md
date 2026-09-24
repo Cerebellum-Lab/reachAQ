@@ -33,6 +33,22 @@ and retained real-rig version/capability, reconnect, Tone 1/Tone 2, STIM3,
 NI/board alignment, CAN-load, and validator evidence passes. Only then update
 the allowlist qualification status/date in a reviewed reachAQ commit.
 
+Collect the rig evidence with the pellet board connected, lasers off or
+shutters closed, and reachAQ closed:
+
+```bash
+conda run -n reachaq python tools/hardware/qualify_pellet_firmware.py --expect-version 2.3.0
+```
+
+It checks version and capabilities against this policy, measures where board
+STIM2 and STIM3 land on the NI, confirms the tone mapping, times finite pulses
+and their return low, confirms the board refuses pulses on tone lines, counts
+50 short pulses at both ends under normal CAN traffic, checks that no event
+claims board time without the capability for it, and reconnects and reboots
+the board. It writes a JSON record under
+`~/Autotrainer/pellet_firmware_qualification/`. It does not cover the
+recorded-session validator, which still needs a real session.
+
 ## Roll out the host before the board
 
 The allowlist is read from whichever checkout the rig's `reachaq` command
