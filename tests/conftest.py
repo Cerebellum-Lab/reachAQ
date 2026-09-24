@@ -16,6 +16,20 @@ from tools.acquisition.model.user_preferences import UserPreferences
 import top_fixtures
 
 
+@pytest.fixture(autouse=True)
+def _isolated_runtime_dir(tmp_path_factory, monkeypatch):
+    """Give each test its own XDG_RUNTIME_DIR, inherited by what it launches.
+
+    The application refuses to start while another instance holds the per-user
+    lock in the runtime directory. Tests that launch the real CLI were refused
+    with exit 3 whenever an operator's reachAQ was running on the same account,
+    as on christielab10 on 2026-09-24.
+    """
+    runtime = tmp_path_factory.mktemp("runtime")
+    runtime.chmod(0o700)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+
+
 @pytest.fixture
 def system_config(trainer_config_dir, tmp_path):
     config = SystemConfiguration()
