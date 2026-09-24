@@ -284,6 +284,49 @@ def test_laser_output_state_is_preserved_as_a_structured_event():
         recorder.close()
 
 
+def test_device_rows_are_written_in_receive_time_order(tmp_path):
+    # Rows reach the recorder in callback order, which is not receive order: on
+    # christielab10 a servo status received after three motor statuses was
+    # recorded before them, and every session failed events.alignment.
+    project = ProjectInfo(
+        root=str(tmp_path),
+        device_id="test",
+        when=datetime(2026, 1, 2, 3, 4, 5),
+        session=1,
+    )
+    nidaq_chunk = (
+        np.arange(4, dtype=np.int64),
+        np.array([9.9, 10.0, 11.0, 12.1]),
+        np.array([99.9, 100.0, 101.0, 102.1]),
+        np.array([[1.0, 2.0, 3.0, 4.0]], dtype=np.float32),
+        ("force",),
+        1000.0,
+        1,
+        0,
+        0,
+    )
+
+    SessionDataRecorder._write_session(
+        project,
+        10.0,
+        100.0,
+        12.0,
+        (
+            (10.3, 100.3, 0, 1, 2, 3),
+            (10.1, 100.1, 1, 4, 5, 6),
+            (10.2, 100.2, 0, 7, 8, 9),
+        ),
+        (),
+        (),
+        (nidaq_chunk,),
+    )
+
+    session_dir = tmp_path / "20260102" / "test" / "session001"
+    with (session_dir / "streams" / "device.csv").open(newline="") as stream:
+        perf = [float(row["perf_time"]) for row in csv.DictReader(stream)]
+    assert perf == [10.1, 10.2, 10.3]
+
+
 def test_session_outputs_are_clipped_to_camera_boundaries(tmp_path):
     project = ProjectInfo(
         root=str(tmp_path),
