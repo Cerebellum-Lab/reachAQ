@@ -3,6 +3,7 @@ import pytest
 from tools.acquisition.model.stim_bench_test import (
     BenchRecipe,
     StimTestResult,
+    bench_wait_seconds,
     refuse_reason,
 )
 from tools.acquisition.model.trial_action import LaserPulseProfile
@@ -149,3 +150,23 @@ def test_the_result_says_so_when_no_timing_was_measured():
     )
 
     assert "did not report terminal" in str(result)
+
+
+def test_a_profile_knows_how_long_its_waveform_runs():
+    # burst_100hz_5s on christielab10: 500 pulses of 1 ms at 100 Hz.
+    profile = make_profile(pulse_duration_ms=1.0, pulse_count=500,
+                           frequency_hz=100.0, baseline_ms=10.0, post_stim_ms=20.0)
+
+    assert profile.waveform_seconds == pytest.approx(0.001 + 4.99 + 0.030)
+
+
+def test_the_bench_test_waits_for_the_whole_waveform():
+    # The wait was max(3 s, trigger pulse + 2 s), so a 5 s burst was reported
+    # as never finishing while it was still running.
+    profile = make_profile(pulse_duration_ms=1.0, pulse_count=500, frequency_hz=100.0)
+
+    assert bench_wait_seconds(profile) > profile.waveform_seconds + 1.0
+
+
+def test_a_short_profile_keeps_the_old_minimum_wait():
+    assert bench_wait_seconds(make_profile()) == pytest.approx(3.0)

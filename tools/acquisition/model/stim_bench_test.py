@@ -67,6 +67,25 @@ class StimTestResult:
         )
 
 
+#: Allowed beyond the trigger pulse and the waveform for the output to report
+#: that it finished. Also the shortest wait, as before.
+_WAIT_MARGIN_SECONDS = 2.0
+_MINIMUM_WAIT_SECONDS = 3.0
+
+
+def bench_wait_seconds(profile) -> float:
+    """How long a bench test waits for the profile's waveform to finish.
+
+    This was max(3 s, trigger pulse + 2 s), which ignored the waveform, so a
+    5 s burst was reported as never finishing while it was still running
+    (christielab10, 2026-09-24).
+    """
+    return max(
+        _MINIMUM_WAIT_SECONDS,
+        profile.trigger_pulse_us / 1e6 + profile.waveform_seconds + _WAIT_MARGIN_SECONDS,
+    )
+
+
 def refuse_reason(
     *,
     profile,

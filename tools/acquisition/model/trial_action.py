@@ -241,6 +241,19 @@ class LaserPulseProfile:
         ):
             raise ValueError("Hardware STIM3 laser profiles require an NI trigger terminal")
 
+    @property
+    def waveform_seconds(self) -> float:
+        """How long the output runs once started, shutter margins included."""
+        seconds = self.pulse_duration_ms / 1000.0
+        if self.pulse_count > 1 and self.frequency_hz:
+            seconds += (self.pulse_count - 1) / self.frequency_hz
+        return seconds + (
+            self.baseline_ms
+            + self.post_stim_ms
+            + self.pmt_open_lead_ms
+            + self.pmt_close_lag_ms
+        ) / 1000.0
+
     def to_record(self):
         result = dataclasses.asdict(self)
         result["trigger_route"] = self.trigger_route.value
