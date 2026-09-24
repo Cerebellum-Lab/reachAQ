@@ -47,6 +47,14 @@ class LaserChannelConfiguration:
     #: /PXI1Slot5/PFI0, with trigger_source naming the far board's view of the
     #: same line, /PXI1Slot4/PXI_Trig0.
     trigger_route_source: Optional[str] = None
+    #: Board line wired to this laser's trigger input, named as the board's
+    #: device tree names it: STIM2 or STIM3. None makes the board STIM route
+    #: unavailable for this laser. It describes the wiring, so it lives here
+    #: and not in a pulse profile, where it once sent laser 2's trigger to
+    #: laser 1's input.
+    board_stim_line: Optional[int] = None
+    #: Width of the board STIM pulse that starts this laser's waveform.
+    board_trigger_pulse_us: int = 1000
     trigger_output: Optional[str] = None
     timing_trigger_output: Optional[str] = None
     minimum_command_volts: float = 0.0
@@ -65,6 +73,16 @@ class LaserChannelConfiguration:
             raise ValueError("feedback_scale must be positive")
         if self.command_copy_scale <= 0:
             raise ValueError("command_copy_scale must be positive")
+        if self.board_stim_line is not None:
+            if int(self.board_stim_line) not in (2, 3):
+                raise ValueError(
+                    "board_stim_line must be 2 or 3; STIM0 and STIM1 carry the "
+                    "tone confirmations"
+                )
+            object.__setattr__(self, "board_stim_line", int(self.board_stim_line))
+        if not 100 <= int(self.board_trigger_pulse_us) <= 5_000_000:
+            raise ValueError("board_trigger_pulse_us must be within 100..5000000")
+        object.__setattr__(self, "board_trigger_pulse_us", int(self.board_trigger_pulse_us))
 
     def clamp_command_voltage(self, volts: float) -> float:
         return min(max(volts, self.minimum_command_volts), self.maximum_command_volts)
