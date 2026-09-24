@@ -187,10 +187,12 @@ when you press Run Pulse. With *external*, the output is armed and waits for
 an edge on **Trigger Source**. Nothing on this page sends that edge, so use
 *external* only when an outside trigger is wired in. If no edge arrives, the
 pulse fails after the train length plus five seconds with *Wait Until Done did
-not indicate that the task was done*. Loading a saved profile that has a
-trigger terminal switches the selector to *external*; set it back to
-*internal* to run that profile's waveform with Run Pulse. Test stim takes its
-trigger from the profile and does not use this selector.
+not indicate that the task was done*.
+
+Picking a profile in **Stim profile** loads its waveform (amplitude, duration,
+count, frequency, baseline, post-stim) into this page, so Run Pulse fires that
+waveform. It does not change Trigger Mode or Trigger Source. Test stim takes
+its trigger from the profile and does not use this selector.
 
 ### Test stim (hardware trigger) — proves the whole trial path
 

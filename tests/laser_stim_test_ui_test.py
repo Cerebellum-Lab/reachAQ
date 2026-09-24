@@ -205,12 +205,55 @@ def test_selecting_a_profile_rebuilds_the_pulse_train_it_describes(
     assert rebuilt.frequency_hz == pytest.approx(20.0)
     assert rebuilt.baseline_ms == pytest.approx(15.0)
     assert rebuilt.post_stim_ms == pytest.approx(7.0)
-    assert rebuilt.trigger_source == "/Dev1/PFI0"
+    # The waveform only: the trigger stays the tab's own.
+    assert rebuilt.trigger_source is None
     # The preview is drawn from the same train: 15 ms of baseline, then the
     # last of 100 pulses at 20 Hz starts at 4.95 s and runs 3 ms, then 7 ms
     # of post-stim.
     x_values, _y_values = tab._build_preview_points(rebuilt)
     assert x_values[-1] == pytest.approx(0.015 + 99 * 0.05 + 0.003 + 0.007)
+
+
+def test_selecting_a_profile_leaves_run_pulse_on_the_tabs_trigger(
+    qapp, app_model, monkeypatch
+):
+    # christielab10, 2026-09-24: every saved profile names a board trigger
+    # terminal, so picking one for Test stim switched Run Pulse to external,
+    # and Run Pulse then waited for a board STIM pulse it never sends.
+    profile = a_profile(
+        trigger_route=LaserTriggerRoute.HARDWARE_STIM3,
+        trigger_terminal="/Dev1/PXI_Trig0",
+    )
+    with_one_listed_profile(monkeypatch, app_model)
+    with_saved_profile(monkeypatch, app_model, profile)
+    tab, _started, _statuses = make_tab(app_model, trigger_source="/Dev1/PXI_Trig2")
+
+    tab.stim_profile_selector.setCurrentIndex(
+        tab.stim_profile_selector.findData("burst")
+    )
+
+    assert tab._trigger_mode.currentText() == "internal"
+    assert tab._trigger_source.text() == "/Dev1/PXI_Trig2"
+    assert tab._build_pulse_train().trigger_source is None
+
+
+def test_selecting_a_profile_keeps_a_deliberately_chosen_external_trigger(
+    qapp, app_model, monkeypatch
+):
+    profile = a_profile(
+        trigger_route=LaserTriggerRoute.HARDWARE_STIM3,
+        trigger_terminal="/Dev1/PXI_Trig0",
+    )
+    with_one_listed_profile(monkeypatch, app_model)
+    with_saved_profile(monkeypatch, app_model, profile)
+    tab, _started, _statuses = make_tab(app_model, trigger_source="/Dev1/PFI3")
+    tab._trigger_mode.setCurrentText("external")
+
+    tab.stim_profile_selector.setCurrentIndex(
+        tab.stim_profile_selector.findData("burst")
+    )
+
+    assert tab._build_pulse_train().trigger_source == "/Dev1/PFI3"
 
 
 def test_choosing_new_profile_leaves_the_built_train_alone(
