@@ -292,11 +292,8 @@ def test_stimulus_profiles_are_saved_and_reloaded(app_model):
     tone = app_model.save_tone_profile("trial-cue", 7000, 125)
     laser = app_model.save_laser_profile(
         profile_id="first-reach-pulse",
-        channel_id=1,
         amplitude_volts=2.0,
         pulse_duration_ms=5.0,
-        trigger_route="direct_ni_software",
-        trigger_terminal="",
     )
 
     assert app_model._tone_profiles[tone.profile_id] == tone

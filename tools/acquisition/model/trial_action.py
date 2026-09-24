@@ -186,9 +186,17 @@ class StimulusTriggerProfile:
 
 @dataclasses.dataclass(frozen=True)
 class LaserPulseProfile:
+    """A pulse train and nothing else.
+
+    Which laser fires it and how it is started are chosen where it is used -
+    a protocol row, Test stim, or Run Pulse - and resolved from that laser's
+    configuration (laser_firing.py). Carrying them here stored the same
+    waveform once per laser and let a profile's board line disagree with the
+    wiring.
+    """
+
     profile_id: str
     revision: int
-    channel_id: int
     amplitude_volts: float
     pulse_duration_ms: float
     pulse_count: int = 1
@@ -197,23 +205,8 @@ class LaserPulseProfile:
     post_stim_ms: float = 0.0
     pmt_open_lead_ms: float = 0.0
     pmt_close_lag_ms: float = 0.0
-    trigger_route: LaserTriggerRoute = LaserTriggerRoute.HARDWARE_STIM3
-    trigger_terminal: str = ""
-    trigger_pulse_us: int = 1000
-    #: Board stimulus line the hardware trigger pulses, named the way the board
-    #: device tree names it. Defaults to 3 so every profile saved before the
-    #: second line existed keeps the line it was built against. STIM0 and STIM1
-    #: are not selectable: the firmware tone generator owns those pins.
-    stim_line: int = 3
 
     def __post_init__(self):
-        object.__setattr__(self, "trigger_route", LaserTriggerRoute(self.trigger_route))
-        if int(self.stim_line) not in (2, 3):
-            raise ValueError(
-                "Laser profiles must pulse board STIM2 or STIM3; STIM0 and "
-                "STIM1 carry the tone confirmations"
-            )
-        object.__setattr__(self, "stim_line", int(self.stim_line))
         numeric = (
             self.amplitude_volts,
             self.pulse_duration_ms,
@@ -222,25 +215,16 @@ class LaserPulseProfile:
             self.pmt_open_lead_ms,
             self.pmt_close_lag_ms,
         )
-        if not self.profile_id or self.revision < 1 or self.channel_id < 1:
-            raise ValueError("Laser profile identity, revision, and channel are required")
+        if not self.profile_id or self.revision < 1:
+            raise ValueError("Laser profile identity and revision are required")
         if not all(math.isfinite(value) for value in numeric):
             raise ValueError("Laser profile values must be finite")
         if self.pulse_duration_ms <= 0 or self.pulse_count < 1:
             raise ValueError("Laser pulse duration/count must be positive")
-        if not 100 <= int(self.trigger_pulse_us) <= 5_000_000:
-            raise ValueError("STIM3 trigger pulse must be within 100 us..5 s")
         if any(value < 0 for value in numeric[2:]):
             raise ValueError("Laser timing margins cannot be negative")
         if self.pulse_count > 1 and (self.frequency_hz is None or self.frequency_hz <= 0):
             raise ValueError("Multi-pulse profiles require a positive frequency")
-        if self.trigger_route is LaserTriggerRoute.NONE:
-            raise ValueError("Laser profiles require an explicit trigger route")
-        if (
-            self.trigger_route is LaserTriggerRoute.HARDWARE_STIM3
-            and not self.trigger_terminal
-        ):
-            raise ValueError("Hardware STIM3 laser profiles require an NI trigger terminal")
 
     @property
     def waveform_seconds(self) -> float:
@@ -255,10 +239,14 @@ class LaserPulseProfile:
             + self.pmt_close_lag_ms
         ) / 1000.0
 
+    def summary(self) -> str:
+        train = f"{self.pulse_count} × {self.pulse_duration_ms:g} ms"
+        if self.pulse_count > 1 and self.frequency_hz:
+            train += f" at {self.frequency_hz:g} Hz"
+        return f"{self.amplitude_volts:g} V · {train} · {self.waveform_seconds:.2f} s"
+
     def to_record(self):
-        result = dataclasses.asdict(self)
-        result["trigger_route"] = self.trigger_route.value
-        return result
+        return dataclasses.asdict(self)
 
 
 @dataclasses.dataclass(frozen=True)

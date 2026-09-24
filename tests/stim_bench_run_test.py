@@ -6,7 +6,6 @@ from autotrainer.device import LaserChannelConfiguration, LaserSystemConfigurati
 
 from tools.acquisition.model.stim_bench_test import StimTestResult
 from tools.acquisition.model.trial_action import LaserPulseProfile
-from tools.acquisition.model.trial_protocol_schedule import LaserTriggerRoute
 
 
 class FakeOperation:
@@ -82,12 +81,8 @@ def make_profile(**overrides):
     values = dict(
         profile_id="stim-a",
         revision=1,
-        channel_id=1,
         amplitude_volts=2.0,
         pulse_duration_ms=5.0,
-        trigger_route=LaserTriggerRoute.HARDWARE_STIM3,
-        trigger_terminal="/Dev1/PFI0",
-        trigger_pulse_us=1000,
     )
     values.update(overrides)
     return LaserPulseProfile(**values)
@@ -191,10 +186,7 @@ def test_a_board_that_reports_nothing_still_runs(bench):
 def test_a_software_route_profile_is_started_from_the_host(bench):
     # The start a trial's stim-camera trigger makes, with no board involved.
     model, laser, hardware, operation = bench
-    profile = make_profile(
-        trigger_route=LaserTriggerRoute.DIRECT_NI_SOFTWARE,
-        trigger_terminal="",
-    )
+    profile = make_profile()
 
     result = model.run_stim_bench_test(profile, 1, "direct_ni_software")
 
@@ -208,10 +200,7 @@ def test_a_software_route_profile_is_started_from_the_host(bench):
 
 def test_a_software_start_that_fails_cancels_the_armed_output(bench):
     model, laser, _hardware, operation = bench
-    profile = make_profile(
-        trigger_route=LaserTriggerRoute.DIRECT_NI_SOFTWARE,
-        trigger_terminal="",
-    )
+    profile = make_profile()
 
     def fail():
         raise RuntimeError("not armed")
@@ -227,7 +216,7 @@ def test_a_software_start_that_fails_cancels_the_armed_output(bench):
 
 def test_a_stim2_profile_pulses_the_second_line(bench):
     model, _laser, hardware, _operation = bench
-    profile = make_profile(profile_id="stim-b", stim_line=2)
+    profile = make_profile(profile_id="stim-b")
     model._laser.configuration = LaserSystemConfiguration.from_channels((
         LaserChannelConfiguration(
             channel_id=1, analog_output="Dev1/ao0", diode_input="Dev1/ai0",
@@ -243,7 +232,7 @@ def test_a_stim2_profile_pulses_the_second_line(bench):
 
 def test_the_board_line_comes_from_the_laser_not_the_profile(bench):
     model, _laser, hardware, _operation = bench
-    profile = make_profile(stim_line=3)
+    profile = make_profile()
     model._laser.configuration = LaserSystemConfiguration.from_channels((
         LaserChannelConfiguration(
             channel_id=2, analog_output="Dev1/ao1", diode_input="Dev1/ai1",

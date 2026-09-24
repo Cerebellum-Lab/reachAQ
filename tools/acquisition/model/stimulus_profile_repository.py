@@ -18,7 +18,23 @@ from tools.acquisition.model.trial_action import (
 )
 
 
-PROFILE_SCHEMA_VERSION = 5
+PROFILE_SCHEMA_VERSION = 6
+
+#: Fields a laser profile carried through schema 5. Schema 6 made the profile
+#: only the pulse train; which laser fires it and how is chosen at use.
+_LEGACY_LASER_ROUTING = frozenset({
+    "channel_id", "trigger_route", "trigger_terminal", "trigger_pulse_us", "stim_line",
+})
+
+
+def _laser_profile(record: Mapping[str, object], schema_version: int) -> LaserPulseProfile:
+    """Rebuild a laser profile, dropping routing fields a schema-5 record carried."""
+
+    values = dict(record)
+    if schema_version < 6:
+        for field in _LEGACY_LASER_ROUTING:
+            values.pop(field, None)
+    return LaserPulseProfile(**values)
 
 
 def _cue_interval_profile(record: Mapping[str, object]) -> CueIntervalProfile:
@@ -94,7 +110,7 @@ class StimulusProfileLibrary:
     @classmethod
     def from_record(cls, record: Mapping[str, object]):
         schema_version = int(record.get("schema_version", 0))
-        if schema_version not in {1, 2, 3, 4, PROFILE_SCHEMA_VERSION}:
+        if schema_version not in {1, 2, 3, 4, 5, PROFILE_SCHEMA_VERSION}:
             raise ValueError(
                 f"Unsupported stimulus-profile schema {schema_version}"
             )
@@ -113,7 +129,7 @@ class StimulusProfileLibrary:
                 for item in record.get("stimulus_trigger_profiles", ())
             ),
             laser_profiles=tuple(
-                LaserPulseProfile(**item)
+                _laser_profile(item, schema_version)
                 for item in record.get("laser_profiles", ())
             ),
             automatic_shift_profiles=tuple(
@@ -188,6 +204,8 @@ class StimulusProfileRepository:
             candidate = StimulusProfileLibrary(
                 revision=self._library.revision + 1,
                 tone_profiles=tuple(library.tone_profiles),
+                cue_interval_profiles=tuple(library.cue_interval_profiles),
+                stimulus_trigger_profiles=tuple(library.stimulus_trigger_profiles),
                 laser_profiles=tuple(library.laser_profiles),
                 automatic_shift_profiles=tuple(library.automatic_shift_profiles),
             )

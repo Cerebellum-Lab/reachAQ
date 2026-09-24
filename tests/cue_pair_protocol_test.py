@@ -67,9 +67,7 @@ def _compiler():
     return TrialActionCompiler(
         tone_profiles={"tone-1": TONE_1, "tone-2": TONE_2},
         laser_profiles={
-            "pulse": LaserPulseProfile(
-                "pulse", 3, 1, 2.5, 5.0, trigger_terminal="/Dev4/PFI0"
-            )
+            "pulse": LaserPulseProfile("pulse", 3, 2.5, 5.0)
         },
         cue_interval_profiles={"published": PUBLISHED, "custom": CUSTOM},
         laser_configuration=LASERS,

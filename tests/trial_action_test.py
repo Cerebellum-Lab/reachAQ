@@ -53,10 +53,7 @@ def _compiler():
     return TrialActionCompiler(
         tone_profiles={"cue": ToneProfile("cue", 1, 6000, 100)},
         laser_profiles={
-            "pulse": LaserPulseProfile(
-                "pulse", 3, 1, 2.5, 5.0,
-                trigger_terminal="/Dev4/PFI0",
-            )
+            "pulse": LaserPulseProfile("pulse", 3, 2.5, 5.0)
         },
         laser_configuration=LASERS,
         dcs_to_motor=lambda values: tuple(value * 2 for value in values),
@@ -279,7 +276,7 @@ def test_executor_routes_hardware_stimulus_through_firmware_callback():
         prepare_laser=lambda profile, recipe: object(),
         cancel_laser=lambda handle: None,
         trigger_hardware_stimulus=lambda profile, recipe, detail: calls.append(
-            (profile.trigger_pulse_us, recipe.operation_id, detail)
+            (recipe.laser_firing.trigger_pulse_us, recipe.operation_id, detail)
         ),
     )
 
