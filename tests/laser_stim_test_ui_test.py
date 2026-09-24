@@ -280,3 +280,16 @@ def test_run_pulse_says_why_it_is_unavailable(channel_tab):
     tab, _started, _statuses = channel_tab
 
     assert "press Run" in tab.run_pulse_refusal()
+
+
+def test_stim_test_is_unavailable_until_run_pulse_is(channel_tab):
+    # christielab10, 2026-09-24: pressed before the system was running, it
+    # failed with "Laser controller is not configured".
+    tab, _started, _statuses = channel_tab
+
+    tab.set_controls_enabled(True, False, False)
+    assert not tab.stim_test_button.isEnabled()
+    assert "press Run" in tab.stim_test_button.toolTip()
+
+    tab.set_controls_enabled(True, True, True)
+    assert tab.stim_test_button.isEnabled()
