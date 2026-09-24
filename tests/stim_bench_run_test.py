@@ -107,7 +107,7 @@ def bench(app_model):
 def test_a_bench_test_arms_the_output_before_pulsing_the_board(bench):
     model, laser, hardware, _operation = bench
 
-    result = model.run_stim_bench_test("stim-a")
+    result = model.run_stim_bench_test(model._laser_profiles["stim-a"], 1, "hardware_stim3")
 
     assert laser.prepared, "the analog output must be armed first"
     assert hardware.pulses == [(1000, 3)]
@@ -118,7 +118,7 @@ def test_a_bench_test_arms_the_output_before_pulsing_the_board(bench):
 def test_the_bench_recipe_claims_no_session(bench):
     model, laser, _hardware, _operation = bench
 
-    model.run_stim_bench_test("stim-a")
+    model.run_stim_bench_test(model._laser_profiles["stim-a"], 1, "hardware_stim3")
 
     _profile, recipe = laser.prepared[0]
     assert recipe.session_generation == 0
@@ -128,16 +128,16 @@ def test_the_bench_recipe_claims_no_session(bench):
 def test_the_prepared_profile_is_always_released(bench):
     model, laser, _hardware, operation = bench
 
-    model.run_stim_bench_test("stim-a")
+    model.run_stim_bench_test(model._laser_profiles["stim-a"], 1, "hardware_stim3")
 
     assert laser.released == [operation]
 
 
-def test_an_unknown_profile_is_refused(bench):
+def test_no_profile_is_refused(bench):
     model, _laser, hardware, _operation = bench
 
     with pytest.raises(RuntimeError, match="profile"):
-        model.run_stim_bench_test("missing")
+        model.run_stim_bench_test(None, 1, "hardware_stim3")
 
     assert hardware.pulses == []
 
@@ -151,7 +151,7 @@ def test_a_board_failure_cancels_the_armed_output(bench):
     hardware.pulse_stim = fail
 
     with pytest.raises(RuntimeError, match="bus down"):
-        model.run_stim_bench_test("stim-a")
+        model.run_stim_bench_test(model._laser_profiles["stim-a"], 1, "hardware_stim3")
 
     assert operation.cancelled, "a failed test must not leave the output armed"
     assert laser.released == [operation]
@@ -162,7 +162,7 @@ def test_a_board_that_does_not_queue_the_pulse_cancels_the_output(bench):
     hardware.pulse_stim = lambda _duration_us, stim_line=3: None
 
     with pytest.raises(RuntimeError, match="not queued"):
-        model.run_stim_bench_test("stim-a")
+        model.run_stim_bench_test(model._laser_profiles["stim-a"], 1, "hardware_stim3")
 
     assert operation.cancelled
     assert laser.released == [operation]
@@ -173,7 +173,7 @@ def test_the_capability_guard_reads_the_hardware_model_record(bench):
     hardware.firmware_compatibility = {"reported_capabilities": ["time_sync"]}
 
     with pytest.raises(RuntimeError, match="finite_stim3_pulse"):
-        model.run_stim_bench_test("stim-a")
+        model.run_stim_bench_test(model._laser_profiles["stim-a"], 1, "hardware_stim3")
 
 
 def test_a_board_that_reports_nothing_still_runs(bench):
@@ -182,7 +182,7 @@ def test_a_board_that_reports_nothing_still_runs(bench):
     model, _laser, hardware, _operation = bench
     hardware.firmware_compatibility = {}
 
-    result = model.run_stim_bench_test("stim-a")
+    result = model.run_stim_bench_test(model._laser_profiles["stim-a"], 1, "hardware_stim3")
 
     assert hardware.pulses == [(1000, 3)]
     assert result.profile_id == "stim-a"
@@ -191,14 +191,12 @@ def test_a_board_that_reports_nothing_still_runs(bench):
 def test_a_software_route_profile_is_started_from_the_host(bench):
     # The start a trial's stim-camera trigger makes, with no board involved.
     model, laser, hardware, operation = bench
-    model._laser_profiles = {
-        "stim-a": make_profile(
-            trigger_route=LaserTriggerRoute.DIRECT_NI_SOFTWARE,
-            trigger_terminal="",
-        )
-    }
+    profile = make_profile(
+        trigger_route=LaserTriggerRoute.DIRECT_NI_SOFTWARE,
+        trigger_terminal="",
+    )
 
-    result = model.run_stim_bench_test("stim-a")
+    result = model.run_stim_bench_test(profile, 1, "direct_ni_software")
 
     assert laser.prepared, "the analog output must be armed first"
     assert operation.triggered
@@ -210,12 +208,10 @@ def test_a_software_route_profile_is_started_from_the_host(bench):
 
 def test_a_software_start_that_fails_cancels_the_armed_output(bench):
     model, laser, _hardware, operation = bench
-    model._laser_profiles = {
-        "stim-a": make_profile(
-            trigger_route=LaserTriggerRoute.DIRECT_NI_SOFTWARE,
-            trigger_terminal="",
-        )
-    }
+    profile = make_profile(
+        trigger_route=LaserTriggerRoute.DIRECT_NI_SOFTWARE,
+        trigger_terminal="",
+    )
 
     def fail():
         raise RuntimeError("not armed")
@@ -223,7 +219,7 @@ def test_a_software_start_that_fails_cancels_the_armed_output(bench):
     operation.trigger = fail
 
     with pytest.raises(RuntimeError, match="not armed"):
-        model.run_stim_bench_test("stim-a")
+        model.run_stim_bench_test(profile, 1, "direct_ni_software")
 
     assert operation.cancelled
     assert laser.released == [operation]
@@ -231,10 +227,46 @@ def test_a_software_start_that_fails_cancels_the_armed_output(bench):
 
 def test_a_stim2_profile_pulses_the_second_line(bench):
     model, _laser, hardware, _operation = bench
-    model._laser_profiles = {"stim-b": make_profile(profile_id="stim-b", stim_line=2)}
+    profile = make_profile(profile_id="stim-b", stim_line=2)
+    model._laser.configuration = LaserSystemConfiguration.from_channels((
+        LaserChannelConfiguration(
+            channel_id=1, analog_output="Dev1/ao0", diode_input="Dev1/ai0",
+            shutter_output="Dev1/port0/line0", trigger_source="/Dev1/PFI0",
+            board_stim_line=2),
+    ), backend="nidaq")
 
-    result = model.run_stim_bench_test("stim-b")
+    result = model.run_stim_bench_test(profile, 1, "hardware_stim3")
 
     assert hardware.pulses == [(1000, 2)]
-    assert result.stim_line == 2
     assert "STIM2" in str(result)
+
+
+def test_the_board_line_comes_from_the_laser_not_the_profile(bench):
+    model, _laser, hardware, _operation = bench
+    profile = make_profile(stim_line=3)
+    model._laser.configuration = LaserSystemConfiguration.from_channels((
+        LaserChannelConfiguration(
+            channel_id=2, analog_output="Dev1/ao1", diode_input="Dev1/ai1",
+            shutter_output="Dev1/port0/line1", trigger_source="/Dev1/PXI_Trig2",
+            board_stim_line=2),
+    ), backend="nidaq")
+
+    result = model.run_stim_bench_test(profile, 2, "hardware_stim3")
+
+    assert hardware.pulses == [(1000, 2)]
+    assert result.channel_id == 2
+    assert result.trigger_terminal == "/Dev1/PXI_Trig2"
+
+
+def test_a_board_test_on_a_laser_without_a_board_line_is_refused(bench):
+    model, _laser, hardware, _operation = bench
+    model._laser.configuration = LaserSystemConfiguration.from_channels((
+        LaserChannelConfiguration(
+            channel_id=1, analog_output="Dev1/ao0", diode_input="Dev1/ai0",
+            shutter_output="Dev1/port0/line0", trigger_source="/Dev1/PFI0"),
+    ), backend="nidaq")
+
+    with pytest.raises(RuntimeError, match="boardStimLine"):
+        model.run_stim_bench_test(make_profile(), 1, "hardware_stim3")
+
+    assert hardware.pulses == []

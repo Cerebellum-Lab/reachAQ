@@ -240,7 +240,7 @@ from tools.acquisition.model.trial_action import (
     TrialActionExecutor,
     TrialCompileContext,
 )
-from tools.acquisition.model.laser_firing import resolve_laser_firing
+from tools.acquisition.model.laser_firing import amplitude_refusal, resolve_laser_firing
 from tools.acquisition.model.automatic_pellet_shift import (
     AutomaticPelletShiftController,
     AutomaticShiftPolicy,
@@ -5211,61 +5211,63 @@ class AppModel(ObservableObject):
         timeout = max(3.0, firing.trigger_pulse_us / 1e6 + 2.0)
         self._hardware.wait_pending_command_acked(token, timeout=timeout)
 
-    def run_stim_bench_test(self, profile_id: str) -> StimTestResult:
-        """Fire one saved laser profile the way a trial would, off any session.
+    def run_stim_bench_test(self, profile, channel_id, route) -> StimTestResult:
+        """Fire one pulse profile on one laser, the way a trial would, off any session.
 
-        Arms the analog output as a trial does, then starts it by the profile's
+        Arms the analog output as a trial does, then starts it by the chosen
         route: on hardware_stim3 the board's firmware-timed STIM pulse into the
         trigger terminal starts the waveform; on direct_ni_software the host
         starts it, which is the start a trial's stim-camera trigger makes.
 
-        The channel comes from the profile rather than the caller, so a caller
-        cannot fire one profile's waveform at another channel.
+        The terminal, board line and trigger pulse come from resolve_laser_firing,
+        which reads them off this laser's own configuration - not from the
+        profile - so the same profile fires correctly on whichever laser and
+        route the caller names.
         """
-        profile = self._laser_profiles.get(str(profile_id))
-        refusal = refuse_reason(
+        if profile is None:
+            raise RuntimeError("Select a saved laser profile, or the builder draft, to test.")
+        try:
+            firing = resolve_laser_firing(self._laser.configuration, channel_id, route)
+            refusal = amplitude_refusal(
+                profile, self._laser.configuration.get_channel(firing.channel_id))
+        except ValueError as error:
+            raise RuntimeError(str(error)) from None
+        refusal = refusal or refuse_reason(
             profile=profile,
+            firing=firing,
             recording_status_value=self.session_recording_status.value,
             trial_operation_active=(
                 self._trial_action_executor.operation is not None
             ),
             laser_backend=self._laser.configuration.backend,
-            configured_channel_ids=tuple(
-                int(channel.channel_id)
-                for channel in self._laser.configuration.channels
-            ),
             firmware_capabilities=self._hardware.firmware_compatibility.get(
                 "reported_capabilities", ()
             ),
         )
-        if refusal is not None:
+        if refusal:
             raise RuntimeError(refusal)
 
         finished = threading.Event()
-        firing = resolve_laser_firing(
-            self._laser.configuration, profile.channel_id, profile.trigger_route)
         prepared = self._laser.prepare_pulse_profile(profile, firing, BenchRecipe())
         add_terminal_callback = getattr(prepared, "add_terminal_callback", None)
         if add_terminal_callback is not None:
             add_terminal_callback(lambda _operation: finished.set())
-        software_start = (
-            profile.trigger_route is LaserTriggerRoute.DIRECT_NI_SOFTWARE
-        )
+        software_start = not firing.is_board_trigger
         started = time.perf_counter()
         try:
             if software_start:
                 prepared.trigger()
             else:
                 token = self._hardware.pulse_stim(
-                    int(profile.trigger_pulse_us), stim_line=profile.stim_line
+                    int(firing.trigger_pulse_us), stim_line=firing.stim_line
                 )
                 if token is None:
                     raise RuntimeError(
-                        "Firmware STIM{} pulse was not queued".format(profile.stim_line)
+                        "Firmware STIM{} pulse was not queued".format(firing.stim_line)
                     )
-                timeout = max(3.0, profile.trigger_pulse_us / 1e6 + 2.0)
+                timeout = max(3.0, firing.trigger_pulse_us / 1e6 + 2.0)
                 self._hardware.wait_pending_command_acked(token, timeout=timeout)
-            completed = finished.wait(bench_wait_seconds(profile))
+            completed = finished.wait(bench_wait_seconds(profile, firing))
             elapsed_ms = (time.perf_counter() - started) * 1000.0
         except Exception:
             # Never leave an armed analog output behind on a failed test.
@@ -5278,11 +5280,11 @@ class AppModel(ObservableObject):
 
         return StimTestResult(
             profile_id=profile.profile_id,
-            channel_id=int(profile.channel_id),
-            trigger_terminal=profile.trigger_terminal,
-            trigger_pulse_us=int(profile.trigger_pulse_us),
+            channel_id=firing.channel_id,
+            trigger_terminal=firing.trigger_terminal,
+            trigger_pulse_us=int(firing.trigger_pulse_us),
             arm_to_terminal_ms=elapsed_ms if completed else None,
-            stim_line=int(profile.stim_line),
+            stim_line=firing.stim_line,
             detail=(
                 "completed"
                 if completed
@@ -5290,7 +5292,7 @@ class AppModel(ObservableObject):
                 if software_start
                 else "board acknowledged but the waveform did not report terminal"
             ),
-            trigger_route=profile.trigger_route.value,
+            trigger_route=firing.trigger_route.value,
         )
 
     def _on_stim_camera_trigger(self, camera_index, decision) -> None:

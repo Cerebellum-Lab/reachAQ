@@ -64,9 +64,8 @@ _DIODE_TRACE_COLOR = stream_signal_color(1)
 _COMMAND_COPY_TRACE_COLOR = stream_signal_color(2)
 _TRIGGER_TRACE_COLOR = stream_signal_color(3)
 _STIM_TEST_TOOLTIP = (
-    "Run the selected profile as a trial would: a board STIM profile arms on "
-    "its trigger terminal and the board's timed pulse starts it; a software "
-    "start profile is started from here"
+    "Run the selected profile on this laser as a trial would, started by the "
+    "route chosen beside it"
 )
 _BOARD_STIM_LINES = (2, 3)
 
@@ -391,11 +390,12 @@ class _LaserChannelTab(QWidget):
         trigger_options_layout.addStretch(1)
         pulse_layout.addWidget(trigger_options, 10, 0, 1, 2)
         pulse_layout.addWidget(self._run_pulse_button, 11, 1)
-        # Rows 12-14 already hold the stim profile selector, its test
-        # button and the result label, and the label spans both columns.
-        # Anything placed in those rows sits underneath widgets added after
-        # it, so it is drawn over and its clicks land on the label instead.
-        pulse_layout.addWidget(self._save_profile_button, 15, 1)
+        # Rows 12-15 already hold the stim profile selector, the route
+        # picker, the test button and the result label, and the label spans
+        # both columns. Anything placed in those rows sits underneath widgets
+        # added after it, so it is drawn over and its clicks land on the
+        # label instead.
+        pulse_layout.addWidget(self._save_profile_button, 16, 1)
 
         # Run Pulse above drives the analog output straight from the host. This
         # fires a saved profile the way a trial does: arm the output on its
@@ -404,6 +404,10 @@ class _LaserChannelTab(QWidget):
         self.stim_profile_selector.setToolTip(
             "Saved laser profiles that target this channel"
         )
+        self._stim_route = QComboBox()
+        self._stim_route.setToolTip(
+            "How Test stim starts the profile on this laser")
+        self._refresh_stim_route_options()
         self.stim_test_button = QPushButton("Test stim")
         self.stim_test_button.setToolTip(_STIM_TEST_TOOLTIP)
         self.stim_test_button.clicked.connect(self._run_stim_test)
@@ -412,8 +416,10 @@ class _LaserChannelTab(QWidget):
         self.stim_test_result.setObjectName("LaserPreviewStatus")
         pulse_layout.addWidget(self._form_label("Stim profile:"), 12, 0)
         pulse_layout.addWidget(self.stim_profile_selector, 12, 1)
-        pulse_layout.addWidget(self.stim_test_button, 13, 1)
-        pulse_layout.addWidget(self.stim_test_result, 14, 0, 1, 2)
+        pulse_layout.addWidget(self._form_label("Route:"), 13, 0)
+        pulse_layout.addWidget(self._stim_route, 13, 1)
+        pulse_layout.addWidget(self.stim_test_button, 14, 1)
+        pulse_layout.addWidget(self.stim_test_result, 15, 0, 1, 2)
 
         pulse_page_layout.addWidget(pulse_group)
 
@@ -684,6 +690,7 @@ class _LaserChannelTab(QWidget):
             self._enable_pmt,
             self._emit_trigger,
             self._emit_timing_trigger,
+            self._stim_route,
         )
         self._ramp_controls = (
             self._ramp_start,
@@ -1130,26 +1137,43 @@ class _LaserChannelTab(QWidget):
                 control.blockSignals(False)
         self._refresh_preview()
 
-    def _run_stim_test(self) -> None:
+    def _refresh_stim_route_options(self) -> None:
+        self._stim_route.clear()
+        line = self._channel.board_stim_line
+        terminal = (self._channel.trigger_source or "").strip()
+        self._stim_route.addItem(
+            f"Board STIM (STIM{line} → {terminal})" if line and terminal
+            else "Board STIM", LaserTriggerRoute.HARDWARE_STIM3.value)
+        self._stim_route.addItem("Software start", LaserTriggerRoute.DIRECT_NI_SOFTWARE.value)
+        if not (line and terminal):
+            self._stim_route.model().item(0).setEnabled(False)
+            self._stim_route.setItemData(
+                0, "This laser has no trigger terminal or board STIM line configured",
+                Qt.ItemDataRole.ToolTipRole)
+            self._stim_route.setCurrentIndex(1)
+
+    def _selected_profile(self):
         profile_id = self.stim_profile_selector.currentData()
-        if not profile_id:
+        return self._app_model.laser_profile(profile_id) if profile_id else None
+
+    def _run_stim_test(self) -> None:
+        profile = self._selected_profile()
+        if profile is None:
             self._set_parent_status(
                 "Select a saved laser profile for laser {} first".format(
-                    self._channel.channel_id.value
-                ),
-                True,
-            )
+                    self._channel.channel_id.value),
+                True)
             return
+        channel_id = int(self._channel.channel_id.value)
+        route = self._stim_route.currentData()
 
         def operation():
-            result = self._app_model.run_stim_bench_test(profile_id)
+            result = self._app_model.run_stim_bench_test(profile, channel_id, route)
             invoke_method(lambda: self.stim_test_result.setText(str(result)))()
             return str(result)
 
         self._start_operation(
-            "Running stim test {} on laser {}".format(
-                profile_id, self._channel.channel_id.value
-            ),
+            "Running stim test {} on laser {}".format(profile.profile_id, channel_id),
             operation,
         )
 

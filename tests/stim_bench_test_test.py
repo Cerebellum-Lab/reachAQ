@@ -1,5 +1,6 @@
 import pytest
 
+from tools.acquisition.model.laser_firing import LaserFiring
 from tools.acquisition.model.stim_bench_test import (
     BenchRecipe,
     StimTestResult,
@@ -31,7 +32,7 @@ def allowed(**overrides):
         recording_status_value="ready",
         trial_operation_active=False,
         laser_backend="nidaq",
-        configured_channel_ids=(1, 2),
+        firing=LaserFiring(1, LaserTriggerRoute.HARDWARE_STIM3, "/Dev1/PFI0", 3),
         firmware_capabilities=("finite_stim3_pulse",),
     )
     values.update(overrides)
@@ -63,13 +64,6 @@ def test_a_non_nidaq_laser_backend_refuses_the_test():
     assert "nidaq" in reason.lower()
 
 
-def test_an_unconfigured_channel_refuses_the_test():
-    reason = refuse_reason(**allowed(configured_channel_ids=(2, 3)))
-
-    assert reason is not None
-    assert "channel 1" in reason.lower()
-
-
 def test_a_board_that_reports_capabilities_without_this_one_is_refused():
     reason = refuse_reason(**allowed(firmware_capabilities=("time_sync",)))
 
@@ -93,22 +87,12 @@ def test_a_software_start_profile_is_allowed_without_a_terminal_or_the_board():
                 trigger_route=LaserTriggerRoute.DIRECT_NI_SOFTWARE,
                 trigger_terminal="",
             ),
+            firing=LaserFiring(1, LaserTriggerRoute.DIRECT_NI_SOFTWARE),
             firmware_capabilities=("time_sync",),
         )
     )
 
     assert reason is None
-
-
-def test_a_board_profile_without_a_terminal_is_still_refused():
-    # Built directly, since the profile itself refuses to exist without one.
-    profile = make_profile()
-    object.__setattr__(profile, "trigger_terminal", "")
-
-    reason = refuse_reason(**allowed(profile=profile))
-
-    assert reason is not None
-    assert "terminal" in reason
 
 
 def test_a_missing_profile_refuses_the_test():
@@ -194,9 +178,12 @@ def test_the_bench_test_waits_for_the_whole_waveform():
     # The wait was max(3 s, trigger pulse + 2 s), so a 5 s burst was reported
     # as never finishing while it was still running.
     profile = make_profile(pulse_duration_ms=1.0, pulse_count=500, frequency_hz=100.0)
+    firing = LaserFiring(1, LaserTriggerRoute.HARDWARE_STIM3, "/t", 3, 1000)
 
-    assert bench_wait_seconds(profile) > profile.waveform_seconds + 1.0
+    assert bench_wait_seconds(profile, firing) > profile.waveform_seconds + 1.0
 
 
 def test_a_short_profile_keeps_the_old_minimum_wait():
-    assert bench_wait_seconds(make_profile()) == pytest.approx(3.0)
+    firing = LaserFiring(1, LaserTriggerRoute.HARDWARE_STIM3, "/t", 3, 1000)
+
+    assert bench_wait_seconds(make_profile(), firing) == pytest.approx(3.0)
