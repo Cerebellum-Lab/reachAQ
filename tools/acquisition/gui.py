@@ -23,6 +23,16 @@ def main():
 
     args = parse_autotrainer_args(allow_dev_mode=True)
 
+    # After argument parsing, so -h still answers while an instance runs, and
+    # before logging, so a refused start leaves no log behind.
+    from tools.acquisition.instance_lock import (
+        ALREADY_RUNNING_EXIT, AlreadyRunning, acquire_instance_lock)
+    try:
+        instance_lock = acquire_instance_lock()  # noqa: F841 - held until exit
+    except AlreadyRunning as err:
+        print(err, file=sys.stderr)
+        return ALREADY_RUNNING_EXIT
+
     # import autotrainer only AFTER having set mp start method,
     # otherwise it can be set by some other 3rd party dependency.
     from autotrainer.core.logging import setup_logging, stop_multiproc_logging, repr_all_loggers

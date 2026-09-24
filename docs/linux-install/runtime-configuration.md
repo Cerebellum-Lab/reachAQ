@@ -200,7 +200,13 @@ same per-user lock as the desktop launcher, so the two cannot open the
 hardware at once, but does not pause on exit: in a terminal the error is
 already on screen. Arguments pass through to the application. When the
 `reachaq` Conda environment is active its own `reachaq` console script comes
-first on `PATH` and starts the same checkout without the lock.
+first on `PATH` instead; it starts the same checkout.
+
+The application also holds a lock of its own,
+`$XDG_RUNTIME_DIR/reachaq/app.lock`, however it is started: through either
+launcher, the environment's console script, `python -m reachAQ.app`, or
+`auto-trainer-headless`. A second start exits with status 3 and names the
+running instance's PID. `-h` still works while one runs.
 
 ```bash
 reachaq-sync
