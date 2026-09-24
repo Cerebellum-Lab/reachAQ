@@ -260,7 +260,20 @@ def _source_contract_rule(context):
         source_id = source.get("id", "unknown")
         source_kind = str(source.get("kind", ""))
         relative = source.get("path")
-        if relative and not context.path(relative).is_file():
+        if "paths" in source:
+            # A source written as several files lists them here, and its
+            # "path" is then a name rather than a file - pose writes one
+            # raw2D_live.h5 per camera. Checking "path" failed every session
+            # that recorded pose, with the data sitting beside it.
+            listed = source.get("paths") or ()
+            if not listed:
+                errors.append(f"{source_id}: artifact missing")
+            errors.extend(
+                f"{source_id}: artifact missing: {item}"
+                for item in listed
+                if not context.path(item).is_file()
+            )
+        elif relative and not context.path(relative).is_file():
             errors.append(f"{source_id}: artifact missing")
         if source.get("persistenceStatus") != "written":
             errors.append(f"{source_id}: not written")
