@@ -66,6 +66,54 @@ def _classify_receive_error(exc: BaseException) -> Tuple[str, Optional[int]]:
     return "receive_error", error_code
 
 
+# SocketCAN error frames, from linux/can/error.h: the error class is in the id
+# and the details are in the payload.
+_CAN_ERR_CRTL = 0x004
+_CAN_ERR_BUSOFF = 0x040
+_CAN_ERR_CNT = 0x200
+_CAN_ERR_CRTL_OVERFLOW = 0x01 | 0x02  # RX and TX buffer overflow
+_CAN_ERROR_CLASSES = (
+    (0x001, "tx-timeout"), (0x002, "lost-arbitration"), (0x004, "controller"),
+    (0x008, "protocol"), (0x010, "transceiver"), (0x020, "no-ack"),
+    (0x040, "bus-off"), (0x080, "bus-error"), (0x100, "restarted"), (0x200, "counters"),
+)
+_CAN_CONTROLLER_STATES = (
+    (0x01, "rx-overflow"), (0x02, "tx-overflow"), (0x04, "rx-warning"),
+    (0x08, "tx-warning"), (0x10, "rx-passive"), (0x20, "tx-passive"),
+    (0x40, "back-to-active"),
+)
+#: How often one kind of error notice may be logged. A controller with bus-error
+#: reporting on can emit thousands a second under an electrical fault.
+_ERROR_NOTICE_LOG_PERIOD_S = 1.0
+
+
+def _classify_error_frame(arbitration_id: int, data: bytes) -> Tuple[Optional[str], str]:
+    """Whether an error frame means frames were lost, and what it says.
+
+    Returns a failure category for bus-off and for controller buffer overflow,
+    the two cases where the host has lost frames or the controller has left the
+    bus. Every other error frame is a notice: the controller moving between
+    error-active, warning and passive as its error counters rise and fall.
+    Those follow any stretch of unacknowledged transmission, such as a board
+    reboot, and do not mean anything was lost - so they return None.
+    """
+    parts = [name for bit, name in _CAN_ERROR_CLASSES if arbitration_id & bit]
+    if not parts:
+        parts = [f"class {arbitration_id:#x}"]
+    controller = data[1] if arbitration_id & _CAN_ERR_CRTL and len(data) > 1 else 0
+    if arbitration_id & _CAN_ERR_CRTL:
+        states = [name for bit, name in _CAN_CONTROLLER_STATES if controller & bit]
+        parts.append("controller " + ("/".join(states) or "unspecified"))
+    if arbitration_id & _CAN_ERR_CNT and len(data) > 7:
+        parts.append(f"tx errors {data[6]}, rx errors {data[7]}")
+    description = ", ".join(parts)
+    if arbitration_id & _CAN_ERR_BUSOFF:
+        return "bus_off", description
+    if controller & _CAN_ERR_CRTL_OVERFLOW:
+        return "overflow", description
+    return None, description
+
+
 class JerryCANCmdType(enum.IntEnum):
     ESTOP = 0x00
     HEARTBEAT = 0x3F
@@ -724,6 +772,9 @@ class SocketCanJerryCAN:
         self._received_since_log = 0
         self._receive_log_started = time.perf_counter()
         self._next_receive_log = self._receive_log_started + 60
+        # Per kind of error notice: when it may next be logged, and how many
+        # were suppressed since it last was.
+        self._error_notice_log: dict = {}
 
     @property
     def receive_statistics(self):
@@ -870,16 +921,20 @@ class SocketCanJerryCAN:
                 ) from exc
             if raw_message is not None:
                 if raw_message.is_error_frame:
-                    category = "bus_off" if raw_message.arbitration_id & 0x40 else "error_frame"
-                    from .can_diagnostics import capture_can_diagnostics
-                    raise CanTransportReadError(
-                        "Unsupported CAN frame "
-                        f"id={raw_message.arbitration_id:#x} error={raw_message.is_error_frame} "
-                        f"remote={raw_message.is_remote_frame} extended={raw_message.is_extended_id}",
-                        category=category,
-                        diagnostics=capture_can_diagnostics(self.configuration.channel),
-                    )
-                if raw_message.is_remote_frame or raw_message.is_extended_id:
+                    category, description = _classify_error_frame(
+                        raw_message.arbitration_id, bytes(raw_message.data))
+                    if category is not None:
+                        from .can_diagnostics import capture_can_diagnostics
+                        raise CanTransportReadError(
+                            f"CAN error frame id={raw_message.arbitration_id:#x} "
+                            f"on {self.configuration.channel}: {description}",
+                            category=category,
+                            diagnostics=capture_can_diagnostics(self.configuration.channel),
+                        )
+                    # A state notice. Raising here ended the reader, and with it
+                    # the pellet connection, every time the board rebooted.
+                    self._log_error_notice(raw_message.arbitration_id, description)
+                elif raw_message.is_remote_frame or raw_message.is_extended_id:
                     logger.warning(
                         "Ignoring unsupported CAN frame id=%#x remote=%s extended=%s",
                         raw_message.arbitration_id,
@@ -930,6 +985,21 @@ class SocketCanJerryCAN:
             self._receive_log_started = now
             self._next_receive_log = now + 60
         return messages
+
+    def _log_error_notice(self, arbitration_id: int, description: str) -> None:
+        now = time.perf_counter()
+        next_allowed, suppressed = self._error_notice_log.get(description, (0.0, 0))
+        if now < next_allowed:
+            self._error_notice_log[description] = (next_allowed, suppressed + 1)
+            return
+        logger.warning(
+            "CAN error notice on %s id=%#x: %s%s",
+            self.configuration.channel,
+            arbitration_id,
+            description,
+            f" ({suppressed} more suppressed)" if suppressed else "",
+        )
+        self._error_notice_log[description] = (now + _ERROR_NOTICE_LOG_PERIOD_S, 0)
 
     def Heartbeat(self) -> int:
         msg = JerryCANMsg()

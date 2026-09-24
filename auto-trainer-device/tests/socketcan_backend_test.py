@@ -260,6 +260,56 @@ def test_receive_classifies_bus_off_error_frame(monkeypatch):
     assert raised.value.diagnostics["interface_state"] == "DOWN"
 
 
+# Controller-problem + error-counter frames exactly as christielab10's PEAK
+# adapter emitted them across a pellet-board reboot on 2026-09-23.
+_TX_WARNING_NOTICE = bytes([0x00, 0x08, 0, 0, 0, 0, 0x67, 0x00])
+_TX_PASSIVE_NOTICE = bytes([0x00, 0x20, 0, 0, 0, 0, 0x87, 0x00])
+
+
+def test_receive_logs_controller_state_notices_and_keeps_reading(caplog):
+    heartbeat = (JerryCANCmdType.HEARTBEAT << 5) | 0x01
+    backend = SocketCanJerryCAN(CanTransportConfiguration(kind="socketcan", fd=True))
+    backend._bus = FakeBus([
+        _raw_message(0x204, _TX_WARNING_NOTICE, error=True),
+        _raw_message(0x204, _TX_PASSIVE_NOTICE, error=True),
+        _raw_message(heartbeat, b"\xff\0"),
+    ])
+
+    with caplog.at_level(logging.WARNING, logger=socketcan_jerrycan.__name__):
+        messages = backend.ReceiveMessages(max_count=1, collect_ms=5)
+
+    assert [m.type for m in messages] == [JerryCANCmdType.HEARTBEAT]
+    notices = [r.getMessage() for r in caplog.records if "CAN error notice" in r.getMessage()]
+    assert any("controller tx-warning" in n and "tx errors 103" in n for n in notices)
+    assert any("controller tx-passive" in n and "tx errors 135" in n for n in notices)
+
+
+def test_receive_throttles_repeated_identical_notices(caplog):
+    backend = SocketCanJerryCAN(CanTransportConfiguration(kind="socketcan", fd=True))
+    backend._bus = FakeBus([_raw_message(0x204, _TX_WARNING_NOTICE, error=True)] * 5)
+
+    with caplog.at_level(logging.WARNING, logger=socketcan_jerrycan.__name__):
+        backend.ReceiveMessages(max_count=10, collect_ms=5)
+
+    assert sum("CAN error notice" in r.getMessage() for r in caplog.records) == 1
+
+
+@pytest.mark.parametrize("controller", [0x01, 0x02])
+def test_receive_fails_on_controller_overflow(monkeypatch, controller):
+    monkeypatch.setattr(
+        "autotrainer.device.can_diagnostics.capture_can_diagnostics",
+        lambda channel: {"channel": channel},
+    )
+    backend = SocketCanJerryCAN(CanTransportConfiguration(kind="socketcan", fd=True))
+    backend._bus = FakeBus([
+        _raw_message(0x004, bytes([0x00, controller, 0, 0, 0, 0, 0, 0]), error=True)])
+
+    with pytest.raises(CanTransportReadError) as raised:
+        backend.ReceiveMessages(max_count=1, collect_ms=5)
+
+    assert raised.value.category == "overflow"
+
+
 def test_receive_classifies_malformed_frame(monkeypatch):
     monkeypatch.setattr(
         "autotrainer.device.can_diagnostics.capture_can_diagnostics",
