@@ -225,6 +225,10 @@ analog inputs, hardware-clocked digital input support, and two counters. Prefer
 the 6221 for buffered input streams and verify that `nidaqPorts` and
 `nidaqStream.channels` identify the same wired terminals.
 
+Laser Control opens on **Pulse Builder**, the first tab, before the per-channel
+tabs. Every laser pulse profile is built and saved there; a laser's own tab
+only picks a saved profile or the builder's unsaved draft and fires it.
+
 Each Laser Control channel uses compact **Pulse**, **Calibration**, and **Output**
 tabs so its controls remain usable when the right-side panel is narrow. The
 Output area has nested **Stream** and **Signals** tabs. Stream contains the graph

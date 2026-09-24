@@ -40,13 +40,20 @@ fi
 | `inference.poseModelLocation` | Existing compatible model directory |
 | `laser.backend` | `nidaq` for validated hardware; otherwise `null`/`disabled` |
 | `laser.channels` | Real NI-DAQ aliases and wired channel roles |
+| `laser.channels[].boardStimLine` | `2` or `3`: the board line wired to that laser's trigger input. Unset makes the board STIM route unavailable for that laser |
+| `laser.channels[].boardTriggerPulseUs` | `100`..`5000000`; default `1000`. Width of the board STIM pulse that starts that laser's waveform |
 | `nidaqPorts`, `nidaqStream` | Real device identity, supported channel types, timing policy, and independent plot selection |
 
 Use **Edit → Edit DAQ Ports** while idle to discover supported channel types and
 prevent duplicate assignments. Saving from the dialog also records stable
 product/serial identities and validates timing-master capability. All mapped and
 custom NI-DAQ inputs are recorded when NI-DAQ is enabled; plotting only the
-subset in `displayChannels` does not change persistence.
+subset in `displayChannels` does not change persistence. The dialog edits only
+the port roles it shows (analog output, diode input, shutter output, command
+copy input); saving it keeps every other laser field as it was, including
+`boardStimLine` and `boardTriggerPulseUs`. On christielab10, laser 1 uses
+`boardStimLine: 3` and laser 2 `boardStimLine: 2`, both with
+`boardTriggerPulseUs: 1000`.
 
 The same rig-level switches can be changed while idle under **File → Hardware**.
 The multi-selection submenu stays open while checkable entries are changed and
@@ -238,10 +245,10 @@ On a first install `~/.local/bin` joins `PATH` at the next login.
 ## Environment variables
 
 These are read from the process environment rather than
-`system_configuration.yaml`. `SystemConfiguration.version` is pinned at 57 and
+`system_configuration.yaml`. `SystemConfiguration.version` is pinned at 58 and
 rejects any other value, so adding schema fields would stop deployed rigs
 loading their configuration. They should move into the schema when a version
-bump past 57 is acceptable.
+bump past 58 is acceptable.
 
 | Variable | Default | Effect |
 |---|---|---|
