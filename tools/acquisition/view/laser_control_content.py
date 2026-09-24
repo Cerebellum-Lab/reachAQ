@@ -60,6 +60,10 @@ _COMMAND_TRACE_COLOR = stream_signal_color(0)
 _DIODE_TRACE_COLOR = stream_signal_color(1)
 _COMMAND_COPY_TRACE_COLOR = stream_signal_color(2)
 _TRIGGER_TRACE_COLOR = stream_signal_color(3)
+_STIM_TEST_TOOLTIP = (
+    "Arm this channel's analog output on its trigger terminal, then ask "
+    "the board for its timed STIM3 pulse to start the waveform"
+)
 
 
 def _nidaq_channel_kind(physical_channel: str) -> str:
@@ -285,10 +289,7 @@ class _LaserChannelTab(QWidget):
             "Saved laser profiles that target this channel"
         )
         self.stim_test_button = QPushButton("Test stim (hardware trigger)")
-        self.stim_test_button.setToolTip(
-            "Arm this channel's analog output on its trigger terminal, then ask "
-            "the board for its timed STIM3 pulse to start the waveform"
-        )
+        self.stim_test_button.setToolTip(_STIM_TEST_TOOLTIP)
         self.stim_test_button.clicked.connect(self._run_stim_test)
         self.stim_test_result = QLabel()
         self.stim_test_result.setWordWrap(True)
@@ -798,6 +799,12 @@ class _LaserChannelTab(QWidget):
         self._refresh_trigger_mode_enabled()
         self._run_pulse_button.setEnabled(can_run_pulse)
         self._run_pulse_button.setToolTip(self.run_pulse_refusal())
+        # A stim test needs the same open controller. Left out of this method
+        # it stayed enabled before the system started, and failed with "Laser
+        # controller is not configured".
+        self.stim_test_button.setEnabled(can_run_pulse)
+        self.stim_test_button.setToolTip(
+            self.run_pulse_refusal() or _STIM_TEST_TOOLTIP)
         # Saving writes a profile to disk and touches no hardware, so it
         # follows whether the values are editable rather than whether a
         # pulse may be fired. Left out of this method it kept whatever
