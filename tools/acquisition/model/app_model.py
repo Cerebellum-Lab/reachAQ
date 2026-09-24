@@ -522,6 +522,7 @@ class AppModel(ObservableObject):
         self._preferences = preferences
         self._loaded_configuration: Optional[SystemConfiguration] = None
         self._loaded_config_dir_path = Path()
+        self._loaded_configuration_path: Optional[Path] = None
         self._loaded_configuration_has_runtime_override = False
         # True from the start of load_configuration until it completes. A load
         # that raises part-way leaves this set, and save_configuration refuses.
@@ -7314,6 +7315,7 @@ class AppModel(ObservableObject):
 
         self._loaded_configuration = configuration
         self._loaded_config_dir_path = location.parent.resolve()
+        self._loaded_configuration_path = Path(location).resolve()
         self._loaded_configuration_has_runtime_override = random_cameras
         self._runtime_live_inference_override = None
 
@@ -7413,10 +7415,15 @@ class AppModel(ObservableObject):
                 "so what is running is part old and part new"
             )
             return
-        loc = self._preferences.configuration_location
+        # Back to the file it was loaded from. The preferences location is only
+        # where the application looks when no file is named; saving there meant
+        # a run started with -c on a copy overwrote the real configuration on
+        # exit, which on christielab10 wrote a test run's settings into
+        # ~/Autotrainer on 2026-09-16.
+        loc = self._loaded_configuration_path
         logger.info("Saving configuration to %s", loc)
         conf = self._create_configuration()
-        conf.save_default(loc)
+        conf.save_file(loc, as_yaml=True)
 
     @_serialized_session_configuration
     def set_runtime_live_inference_override(self, enabled: bool) -> None:

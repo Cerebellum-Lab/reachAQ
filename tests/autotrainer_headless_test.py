@@ -225,6 +225,19 @@ def test_saving_resumes_once_a_load_completes(app_model, config_file_path, monke
     assert SystemConfiguration.load_yaml_file(config_file_path).get_camera(CameraId.Camera3).is_enabled
 
 
+def test_a_run_on_another_file_saves_back_to_that_file(app_model, config_file_path, tmp_path):
+    copy = tmp_path / "copy_configuration.yaml"
+    copy.write_bytes(config_file_path.read_bytes())
+    real = config_file_path.read_bytes()
+
+    assert app_model.load_configuration(copy) is True
+    app_model.stim_camera.is_enabled = True
+    app_model.save_configuration()
+
+    assert config_file_path.read_bytes() == real
+    assert SystemConfiguration.load_yaml_file(copy).get_camera(CameraId.Camera3).is_enabled
+
+
 def test_load_config_extra_reach_camera_slot(app_model, trainer_config_dir, system_config):
     camera3 = CameraConfiguration(
         id=CameraId.Camera3,
