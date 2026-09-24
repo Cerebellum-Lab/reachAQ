@@ -188,6 +188,43 @@ def test_load_config(
     assert Path(pref.configuration_location) == trainer_config_dir
 
 
+def _fail_the_nidaq_step(app_model, monkeypatch):
+    # The step that raised on christielab10 on 2026-09-17: after the cameras
+    # are reconfigured, before the load completes.
+    def refuse(*_args, **_kwargs):
+        raise RuntimeError("NI-DAQ refused to re-apply its timing")
+
+    monkeypatch.setattr(app_model.nidaq_signal_monitor, "load_configuration", refuse)
+
+
+def test_a_load_that_fails_part_way_is_never_saved(app_model, config_file_path, monkeypatch):
+    assert app_model.load_configuration() is True
+    on_disk = config_file_path.read_bytes()
+
+    _fail_the_nidaq_step(app_model, monkeypatch)
+    with pytest.raises(RuntimeError, match="re-apply"):
+        app_model.load_configuration()
+    # A change the save would otherwise write, as a half-applied demo reload did.
+    app_model.stim_camera.is_enabled = True
+    app_model.save_configuration()
+
+    assert config_file_path.read_bytes() == on_disk
+
+
+def test_saving_resumes_once_a_load_completes(app_model, config_file_path, monkeypatch):
+    assert app_model.load_configuration() is True
+    _fail_the_nidaq_step(app_model, monkeypatch)
+    with pytest.raises(RuntimeError):
+        app_model.load_configuration()
+    monkeypatch.undo()
+
+    assert app_model.load_configuration() is True
+    app_model.stim_camera.is_enabled = True
+    app_model.save_configuration()
+
+    assert SystemConfiguration.load_yaml_file(config_file_path).get_camera(CameraId.Camera3).is_enabled
+
+
 def test_load_config_extra_reach_camera_slot(app_model, trainer_config_dir, system_config):
     camera3 = CameraConfiguration(
         id=CameraId.Camera3,
