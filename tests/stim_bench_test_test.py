@@ -15,12 +15,8 @@ def make_profile(**overrides):
     values = dict(
         profile_id="stim-a",
         revision=1,
-        channel_id=1,
         amplitude_volts=2.0,
         pulse_duration_ms=5.0,
-        trigger_route=LaserTriggerRoute.HARDWARE_STIM3,
-        trigger_terminal="/Dev1/PFI0",
-        trigger_pulse_us=1000,
     )
     values.update(overrides)
     return LaserPulseProfile(**values)
@@ -83,10 +79,7 @@ def test_a_software_start_profile_is_allowed_without_a_terminal_or_the_board():
     # so neither may refuse it.
     reason = refuse_reason(
         **allowed(
-            profile=make_profile(
-                trigger_route=LaserTriggerRoute.DIRECT_NI_SOFTWARE,
-                trigger_terminal="",
-            ),
+            profile=make_profile(),
             firing=LaserFiring(1, LaserTriggerRoute.DIRECT_NI_SOFTWARE),
             firmware_capabilities=("time_sync",),
         )

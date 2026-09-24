@@ -4500,10 +4500,7 @@ class AppModel(ObservableObject):
                 {
                     "profile_id": profile.profile_id,
                     "revision": profile.revision,
-                    "summary": (
-                        f"channel {profile.channel_id}, {profile.amplitude_volts:g} V, "
-                        f"{profile.pulse_duration_ms:g} ms, STIM{profile.stim_line}"
-                    ),
+                    "summary": profile.summary(),
                 }
                 for profile in self._laser_profiles.values()
             ),

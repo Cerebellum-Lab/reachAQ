@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import dataclasses
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import numpy as np
 import pyqtgraph as pg
@@ -9,10 +8,7 @@ from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot, Qt
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
-    QDialog,
-    QDialogButtonBox,
     QDoubleSpinBox,
-    QFormLayout,
     QGridLayout,
     QGroupBox,
     QFrame,
@@ -20,7 +16,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QProgressBar,
-    QMessageBox,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -67,118 +62,6 @@ _STIM_TEST_TOOLTIP = (
     "Run the selected profile on this laser as a trial would, started by the "
     "route chosen beside it"
 )
-_BOARD_STIM_LINES = (2, 3)
-
-
-@dataclasses.dataclass(frozen=True)
-class _ProfileSaveChoice:
-    """What the operator chose when saving a profile from the tab."""
-
-    profile_id: str
-    trigger_route: LaserTriggerRoute
-    #: Board line the board pulses; None for a software start.
-    stim_line: Optional[int] = None
-
-
-def _profile_trigger_values(choice: _ProfileSaveChoice, channel) -> Dict[str, object]:
-    """The trigger fields a profile saved from the tab stores.
-
-    Chosen when saving, not taken from Trigger Mode. Trigger Mode is how Run
-    Pulse starts on the bench; the route is how a trial or Test stim starts
-    the profile. Deriving one from the other saved every profile unusable:
-    internal gave hardware_stim3 with no terminal, which the profile refuses,
-    external gave direct_ni_software, and the board line was always STIM3.
-
-    A board STIM profile arms on the channel's own configured terminal, the
-    one the board's pulse reaches, whatever is typed into the tab.
-    """
-    if choice.trigger_route is LaserTriggerRoute.DIRECT_NI_SOFTWARE:
-        return {"trigger_route": choice.trigger_route, "trigger_terminal": ""}
-    if choice.trigger_route is not LaserTriggerRoute.HARDWARE_STIM3:
-        raise ValueError(f"Unsupported laser trigger route: {choice.trigger_route}")
-    terminal = (channel.trigger_source or "").strip()
-    if not terminal:
-        raise ValueError(
-            f"Laser {channel.channel_id.value} has no trigger terminal in Edit "
-            "DAQ Ports, so a board STIM profile has nothing to arm on"
-        )
-    if choice.stim_line not in _BOARD_STIM_LINES:
-        raise ValueError("Choose the board line, STIM2 or STIM3, for a board STIM profile")
-    return {
-        "trigger_route": choice.trigger_route,
-        "trigger_terminal": terminal,
-        "stim_line": int(choice.stim_line),
-    }
-
-
-class _SaveProfileDialog(QDialog):
-    """Name, trigger route and board line for a profile saved from the tab."""
-
-    def __init__(self, defaults: _ProfileSaveChoice, channel, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Save laser profile")
-        layout = QFormLayout(self)
-
-        self._name = QLineEdit(defaults.profile_id)
-        layout.addRow("Profile name:", self._name)
-
-        self._route = QComboBox()
-        # Stored as the value: Qt hands a str enum back as a plain string.
-        self._route.addItem("Board STIM (hardware trigger)",
-                            LaserTriggerRoute.HARDWARE_STIM3.value)
-        self._route.addItem("Software start", LaserTriggerRoute.DIRECT_NI_SOFTWARE.value)
-        self._route.setToolTip(
-            "How a trial and Test stim start this profile. Board STIM arms on "
-            "the channel's trigger terminal and the board's pulse starts it; "
-            "software start is started by the host. Trigger Mode on the Pulse "
-            "page only affects Run Pulse.")
-        if not (channel.trigger_source or "").strip():
-            # Disabled rather than hidden, so the reason can be read.
-            self._route.model().item(0).setEnabled(False)
-            self._route.setItemData(
-                0, "This laser has no trigger terminal in Edit DAQ Ports",
-                Qt.ItemDataRole.ToolTipRole)
-        self._route.setCurrentIndex(
-            max(0, self._route.findData(LaserTriggerRoute(defaults.trigger_route).value)))
-        layout.addRow("Trigger route:", self._route)
-
-        self._line = QComboBox()
-        self._line.addItem("Choose...", None)
-        for line in _BOARD_STIM_LINES:
-            self._line.addItem(f"STIM{line}", line)
-        self._line.setToolTip("The board line wired to this laser's trigger input")
-        self._line.setCurrentIndex(max(0, self._line.findData(defaults.stim_line)))
-        layout.addRow("Board line:", self._line)
-
-        self._buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        self._buttons.accepted.connect(self.accept)
-        self._buttons.rejected.connect(self.reject)
-        layout.addRow(self._buttons)
-
-        self._name.textChanged.connect(self._refresh)
-        self._route.currentIndexChanged.connect(self._refresh)
-        self._line.currentIndexChanged.connect(self._refresh)
-        self._refresh()
-
-    def _selected_route(self) -> LaserTriggerRoute:
-        return LaserTriggerRoute(self._route.currentData())
-
-    def _refresh(self, *_args) -> None:
-        board = self._selected_route() is LaserTriggerRoute.HARDWARE_STIM3
-        self._line.setEnabled(board)
-        ready = bool(self._name.text().strip()) and (
-            not board or self._line.currentData() is not None)
-        self._buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(ready)
-
-    def choice(self) -> _ProfileSaveChoice:
-        route = self._selected_route()
-        return _ProfileSaveChoice(
-            profile_id=self._name.text().strip(),
-            trigger_route=route,
-            stim_line=(self._line.currentData()
-                       if route is LaserTriggerRoute.HARDWARE_STIM3 else None),
-        )
 
 
 def _nidaq_channel_kind(physical_channel: str) -> str:
@@ -347,12 +230,6 @@ class _LaserChannelTab(QWidget):
         self._emit_trigger = self._make_checkbox("Trigger DO")
         self._emit_timing_trigger = self._make_checkbox("Timing DO")
         self._run_pulse_button = QPushButton("Run Pulse")
-        self._save_profile_button = QPushButton("Save as Profile…")
-        self._save_profile_button.setToolTip(
-            "Store these settings in stimulus_profiles.json so the protocol "
-            "can reuse them. Only a name is asked for; every value is taken "
-            "from this tab as it stands."
-        )
 
         pulse_layout.addWidget(self._form_label("Amplitude:"), 0, 0)
         pulse_layout.addWidget(self._amplitude, 0, 1)
@@ -390,12 +267,6 @@ class _LaserChannelTab(QWidget):
         trigger_options_layout.addStretch(1)
         pulse_layout.addWidget(trigger_options, 10, 0, 1, 2)
         pulse_layout.addWidget(self._run_pulse_button, 11, 1)
-        # Rows 12-15 already hold the stim profile selector, the route
-        # picker, the test button and the result label, and the label spans
-        # both columns. Anything placed in those rows sits underneath widgets
-        # added after it, so it is drawn over and its clicks land on the
-        # label instead.
-        pulse_layout.addWidget(self._save_profile_button, 16, 1)
 
         # Run Pulse above drives the analog output straight from the host. This
         # fires a saved profile the way a trial does: arm the output on its
@@ -701,7 +572,6 @@ class _LaserChannelTab(QWidget):
         )
 
         self._run_pulse_button.clicked.connect(self._run_pulse)
-        self._save_profile_button.clicked.connect(self._save_as_profile)
         self._run_ramp_button.clicked.connect(self._run_calibration_ramp)
         self._trace_toggle_button.clicked.connect(self._toggle_trace_stream)
         self._trace_clear_button.clicked.connect(self._clear_trace)
@@ -928,11 +798,6 @@ class _LaserChannelTab(QWidget):
         self.stim_test_button.setEnabled(can_run_pulse)
         self.stim_test_button.setToolTip(
             self.run_pulse_refusal() or _STIM_TEST_TOOLTIP)
-        # Saving writes a profile to disk and touches no hardware, so it
-        # follows whether the values are editable rather than whether a
-        # pulse may be fired. Left out of this method it kept whatever
-        # state it happened to inherit.
-        self._save_profile_button.setEnabled(can_edit)
         for control in self._ramp_controls:
             control.setEnabled(can_edit)
         self._run_ramp_button.setEnabled(can_run_ramp)
@@ -1060,7 +925,7 @@ class _LaserChannelTab(QWidget):
         )
 
     def refresh_stim_profiles(self) -> None:
-        """List saved laser profiles that target this channel."""
+        """List every saved laser profile: any profile can fire on any laser."""
         previous = self.stim_profile_selector.currentData()
         self.stim_profile_selector.blockSignals(True)
         self.stim_profile_selector.clear()
@@ -1068,11 +933,8 @@ class _LaserChannelTab(QWidget):
         # be a way back to whatever is being built by hand.
         self.stim_profile_selector.addItem("(new profile)", None)
         state = getattr(self._app_model, "trial_protocol_state", {}) or {}
-        marker = "channel {}".format(self._channel.channel_id.value)
         for item in state.get("laser_profiles", ()):
             summary = item.get("summary", "")
-            if marker not in summary:
-                continue
             self.stim_profile_selector.addItem(
                 "{} ({})".format(item["profile_id"], summary), item["profile_id"]
             )
@@ -1176,100 +1038,6 @@ class _LaserChannelTab(QWidget):
             "Running stim test {} on laser {}".format(profile.profile_id, channel_id),
             operation,
         )
-
-    def _save_as_profile(self) -> None:
-        """Store what is on this tab as a reusable laser profile.
-
-        The tab is where a pulse is actually built and tuned against the
-        traces, but it had no way to keep one: the only route to a saved
-        profile was a chain of dialogs in the protocol tab that asked for
-        every value again by hand. This takes the waveform as it stands and
-        asks for a name, the trigger route and, for a board STIM profile, the
-        board line.
-        """
-        try:
-            pulse_train = self._build_pulse_train()
-            self._validate_pulse_train(pulse_train)
-        except Exception as exc:
-            self._set_parent_status(str(exc) or exc.__class__.__name__, True)
-            return
-
-        choice = self._ask_profile_to_save(self._profile_save_defaults())
-        if choice is None or not choice.profile_id:
-            return
-        try:
-            trigger = _profile_trigger_values(choice, self._channel)
-        except ValueError as exc:
-            self._set_parent_status(str(exc), True)
-            return
-        values = dict(
-            profile_id=choice.profile_id,
-            channel_id=int(self._channel.channel_id.value),
-            amplitude_volts=float(pulse_train.amplitude_volts),
-            pulse_duration_ms=float(pulse_train.duration_ms),
-            pulse_count=int(pulse_train.pulse_count),
-            frequency_hz=pulse_train.frequency_hz,
-            baseline_ms=float(pulse_train.baseline_ms),
-            post_stim_ms=float(pulse_train.post_stim_ms),
-            **trigger,
-        )
-        try:
-            saved = self._app_model.save_laser_profile(**values)
-        except Exception as exc:
-            message = str(exc) or exc.__class__.__name__
-            self._set_parent_status(message, True)
-            QMessageBox.warning(self, "Could not save laser profile", message)
-            return
-        self.refresh_stim_profiles()
-        index = self.stim_profile_selector.findData(saved.profile_id)
-        if index >= 0:
-            self.stim_profile_selector.setCurrentIndex(index)
-        self._set_parent_status(
-            f"Saved laser profile {saved.profile_id!r} (revision "
-            f"{saved.revision})", False)
-
-    def _ask_profile_to_save(self, defaults: _ProfileSaveChoice) -> Optional[_ProfileSaveChoice]:
-        dialog = _SaveProfileDialog(defaults, self._channel, self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return None
-        return dialog.choice()
-
-    def _profile_save_defaults(self) -> _ProfileSaveChoice:
-        """Start from the loaded profile, so re-saving one keeps its trigger.
-
-        With none loaded, the board line is the one this channel's saved board
-        profiles agree on; the configuration has no field naming it, and
-        guessing STIM3 would send laser 2's trigger to laser 1's input.
-        """
-        loaded = None
-        profile_id = self.stim_profile_selector.currentData()
-        if profile_id:
-            loaded = self._app_model.laser_profile(profile_id)
-        has_terminal = bool((self._channel.trigger_source or "").strip())
-        route = (
-            loaded.trigger_route if loaded is not None
-            else LaserTriggerRoute.HARDWARE_STIM3 if has_terminal
-            else LaserTriggerRoute.DIRECT_NI_SOFTWARE
-        )
-        if loaded is not None and loaded.trigger_route is LaserTriggerRoute.HARDWARE_STIM3:
-            line = loaded.stim_line
-        else:
-            line = self._channel_board_line()
-        return _ProfileSaveChoice(
-            profile_id=(loaded.profile_id if loaded is not None
-                        else f"laser{self._channel.channel_id.value}"),
-            trigger_route=route,
-            stim_line=line,
-        )
-
-    def _channel_board_line(self) -> Optional[int]:
-        lines = set()
-        for index in range(self.stim_profile_selector.count()):
-            profile_id = self.stim_profile_selector.itemData(index)
-            profile = self._app_model.laser_profile(profile_id) if profile_id else None
-            if profile is not None and profile.trigger_route is LaserTriggerRoute.HARDWARE_STIM3:
-                lines.add(int(profile.stim_line))
-        return lines.pop() if len(lines) == 1 else None
 
     def _run_calibration_ramp(self) -> None:
         if not self._is_configured:

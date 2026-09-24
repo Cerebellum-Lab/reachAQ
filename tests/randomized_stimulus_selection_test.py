@@ -34,9 +34,7 @@ LASERS = LaserSystemConfiguration.from_channels((
 TONE_1 = ToneProfile("tone-1", 1, 5_000, 100)
 TONE_2 = ToneProfile("tone-2", 1, 6_000, 100)
 CUE = CueIntervalProfile("published", 1, preset="published_4s")
-LASER = LaserPulseProfile(
-    "pulse", 3, 1, 2.5, 5.0, trigger_terminal="/Dev4/PFI0", trigger_pulse_us=1000
-)
+LASER = LaserPulseProfile("pulse", 3, 2.5, 5.0)
 
 MIXED = StimulusTriggerProfile(
     "mixed",
@@ -315,9 +313,7 @@ def test_non_randomized_rows_keep_their_declared_trigger():
     compiler = TrialActionCompiler(
         tone_profiles={"tone-1": TONE_1, "tone-2": TONE_2},
         laser_profiles={
-            "direct": LaserPulseProfile(
-                "direct", 1, 1, 2.5, 5.0, trigger_route="direct_ni_software"
-            )
+            "direct": LaserPulseProfile("direct", 1, 2.5, 5.0)
         },
         cue_interval_profiles={"published": CUE},
         laser_configuration=LASERS,
@@ -329,9 +325,10 @@ def test_non_randomized_rows_keep_their_declared_trigger():
 
 
 def test_library_round_trips_stimulus_trigger_profiles():
-    # Schema 5 added the laser profile's stim_line. The bump is deliberate: the
-    # version is what lets an older reader refuse a record it cannot parse.
-    assert PROFILE_SCHEMA_VERSION == 5
+    # Schema 6 made the laser profile only the pulse train. The bump is
+    # deliberate: the version is what lets an older reader refuse a record it
+    # cannot parse.
+    assert PROFILE_SCHEMA_VERSION == 6
     library = StimulusProfileLibrary(
         tone_profiles=(TONE_1, TONE_2),
         stimulus_trigger_profiles=(MIXED, FIRST_REACH_ONLY),
