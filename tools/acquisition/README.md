@@ -392,7 +392,9 @@ without restarting healthy domains.
 * Edit -> Edit Camera Settings - enable or disable editable camera fields while
   idle.
 * Edit -> Edit DAQ Ports - discover NI-DAQ devices and configure named channel
-  roles while idle.
+  roles while idle. The digital roles (tones, camera frames, barcode) must be
+  port0 lines on the input card, the only lines the stream can clock; the
+  dialog offers no others, and marks a stored one invalid with the reason.
 * Tools -> Calibrate Coordinate System / Make 3D calibration - run the available
   calibration workflows.
 * Tools -> DAQ Monitor - while idle, watch every line on every NI-DAQ card,
