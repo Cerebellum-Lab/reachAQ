@@ -27,9 +27,17 @@ from autotrainer.video import CaptureCameraAttrs, VideoRecordMode
 from autotrainer.inference import GpuRuntimeStatus
 from tools.acquisition.model.app_model import AppModel
 from tools.acquisition.model.app_model_status import AppModelStatus, SessionRecordingStatus
+from tools.acquisition.model.stimulus_profile_repository import (
+    StimulusProfileLibrary,
+    StimulusProfileRepository,
+)
 from tools.acquisition.model.subsystem_status import (
     SubsystemId,
     SubsystemState,
+)
+from tools.acquisition.model.trial_action import (
+    CueIntervalProfile,
+    StimulusTriggerProfile,
 )
 from tools.acquisition.model.user_preferences import UserPreferences
 
@@ -301,6 +309,71 @@ def test_stimulus_profiles_are_saved_and_reloaded(app_model):
     assert app_model._stimulus_profile_repository.load().laser_profiles[-1] == laser
     app_model.delete_stimulus_profile("tone", tone.profile_id)
     assert tone.profile_id not in app_model._tone_profiles
+
+
+def _save_cue_and_trigger_profiles(config_dir, name):
+    repository = StimulusProfileRepository(config_dir / "stimulus_profiles.json")
+    library = repository.load()
+    repository.save(
+        StimulusProfileLibrary(
+            revision=library.revision,
+            tone_profiles=library.tone_profiles,
+            cue_interval_profiles=(CueIntervalProfile(f"cue-{name}", 1),),
+            stimulus_trigger_profiles=(
+                StimulusTriggerProfile(
+                    f"trigger-{name}",
+                    1,
+                    categories=({
+                        "category_id": "first_reach",
+                        "trigger": "first_reach",
+                        "percentage": 100.0,
+                    },),
+                ),
+            ),
+        ),
+        expected_revision=library.revision,
+    )
+
+
+def _cue_and_trigger_profile_ids(app_model):
+    state = app_model.trial_protocol_state
+    return (
+        tuple(item["profile_id"] for item in state["cue_interval_profiles"]),
+        tuple(item["profile_id"] for item in state["stimulus_trigger_profiles"]),
+    )
+
+
+@pytest.fixture
+def startup_cue_and_trigger_profiles(trainer_config_dir):
+    # On disk before the application model is built, as they are at startup.
+    _save_cue_and_trigger_profiles(trainer_config_dir, "startup")
+
+
+def test_a_configuration_from_another_directory_brings_its_cue_and_trigger_profiles(
+    startup_cue_and_trigger_profiles, app_model, config_file_path, tmp_path,
+):
+    # A load swapped in the loaded directory's tone, laser and shift profiles
+    # but kept the cue-interval and trigger profiles read at startup, and the
+    # next profile save wrote those into the loaded directory's store.
+    assert app_model.load_configuration() is True
+    assert _cue_and_trigger_profile_ids(app_model) == (
+        ("cue-startup",), ("trigger-startup",))
+    other_dir = tmp_path / "other"
+    other_dir.mkdir()
+    other = other_dir / config_file_path.name
+    other.write_bytes(config_file_path.read_bytes())
+    _save_cue_and_trigger_profiles(other_dir, "other")
+
+    assert app_model.load_configuration(other) is True
+
+    assert _cue_and_trigger_profile_ids(app_model) == (
+        ("cue-other",), ("trigger-other",))
+    app_model.save_tone_profile("trial-cue", 7000, 125)
+    saved = StimulusProfileRepository(other_dir / "stimulus_profiles.json").load()
+    assert tuple(item.profile_id for item in saved.cue_interval_profiles) == (
+        "cue-other",)
+    assert tuple(item.profile_id for item in saved.stimulus_trigger_profiles) == (
+        "trigger-other",)
 
 
 def test_spinnaker_camera_selectors_keep_only_their_configured_binding(
