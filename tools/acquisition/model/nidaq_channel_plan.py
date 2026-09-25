@@ -40,6 +40,29 @@ def _is_role_name(name: str) -> bool:
     )
 
 
+def _claimed_role_names(lasers) -> set:
+    """The names roles claim in a plan, whether or not each role is set.
+
+    Only a role ever writes its name, so a stored channel under one is that
+    role's: left on an old input when the role moved, or left behind when it
+    was cleared. Claimed only while set, a cleared role's channel came back
+    as a custom input and was recorded from then on - choosing "(none)" for
+    a trigger readback, or for tone1 or camFrames.
+
+    Every port role claims its name always: the ports are planned whatever
+    else is configured. A laser's names are claimed for each laser the plan
+    acquires, which is only while the laser backend is enabled; disabled, the
+    plan adds no laser role, and a stored laser channel stays a custom input,
+    as it always has.
+    """
+    names = {name for _attribute, name in _PORT_INPUT_ROLES}
+    for channel in lasers:
+        number = int(channel.channel_id)
+        names.update(
+            f"laser{number}_{suffix}" for suffix in ("diode", "command_copy", "trigger"))
+    return names
+
+
 def nidaq_channel_kind(physical_channel: str) -> str:
     """Analog or digital, from the NI channel name.
 
@@ -280,13 +303,7 @@ def build_nidaq_acquisition_configuration(
         )
     role_pins = {channel.name: channel.physical_channel for channel in mapped.values()}
     role_pins.update((trigger.name, trigger.physical_channel) for trigger in triggers)
-    # Every acquired laser claims its trigger name, readback set or not: only
-    # the readback role ever writes it. Claimed only when set, choosing
-    # "(none)" in Edit DAQ Ports left the stored laser1_trigger on its input,
-    # and it came back as a hidden custom input, recorded indefinitely.
-    role_names = set(role_pins) | {
-        f"laser{int(channel.channel_id)}_trigger" for channel in lasers
-    }
+    role_names = set(role_pins) | _claimed_role_names(lasers)
 
     # Existing channels not claimed by a named hardware role are explicit
     # custom acquisition inputs and remain enabled. One stored under a role's

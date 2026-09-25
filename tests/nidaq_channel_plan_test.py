@@ -313,9 +313,13 @@ def test_moving_a_port_role_to_another_line_keeps_one_channel():
     ) == (("tone1", "InputCard/port0/line3"),)
 
 
-def test_a_stored_channel_named_like_an_unconfigured_role_stays_a_custom_input():
+def test_a_stored_laser_channel_stays_a_custom_input_with_the_laser_disabled():
+    # This asserted the same for a stored tone2 with its role unset; that is
+    # a cleared port role now, and dropped (see below). A disabled laser
+    # backend plans no laser role, so its names are not claimed and a stored
+    # laser channel stays as it always has.
     stored = _stream_of(
-        NidaqSignalChannelConfiguration("tone2", "InputCard/port0/line5", kind="digital"),
+        NidaqSignalChannelConfiguration("laser1_diode", "InputCard/ai0"),
     )
 
     result = build_nidaq_acquisition_configuration(
@@ -652,3 +656,47 @@ def test_christielab10s_port_block_loads_unchanged():
     assert result.channels == stored.channels
     assert result.display_channels == stored.display_channels
     assert result == stored
+
+
+# -------------------------------------------------------- cleared port roles
+
+
+def test_a_cleared_port_role_stops_being_acquired(caplog):
+    # Cleared in Edit DAQ Ports, tone1 claimed neither its pin nor its name,
+    # so its stored channel came back as a custom input and was recorded
+    # from then on - the readback's "(none)" problem, for the port roles.
+    stored = NidaqSignalStreamConfiguration(
+        channels=(
+            NidaqSignalChannelConfiguration(
+                "tone1", "InputCard/port0/line0", kind="digital"),
+            NidaqSignalChannelConfiguration("stim_readback", "InputCard/ai6"),
+        ),
+        is_enabled=True,
+        display_channels=("tone1", "stim_readback"),
+    )
+
+    with caplog.at_level("WARNING"):
+        result = build_nidaq_acquisition_configuration(
+            stored, NidaqPortConfiguration(tone1=None), LaserSystemConfiguration())
+
+    assert "tone1" not in {channel.name for channel in result.channels}
+    assert "InputCard/port0/line0" not in {
+        channel.physical_channel for channel in result.channels}
+    # A channel no role owns is left alone, and so is its display selection.
+    assert tuple(channel.name for channel in result.channels) == ("stim_readback",)
+    assert result.display_channels == ("stim_readback",)
+    warning, = [record.getMessage() for record in caplog.records
+                if "drops the stored channel" in record.getMessage()]
+    assert "'tone1'" in warning and "not set" in warning
+
+
+@pytest.mark.parametrize(
+    "role", ["tone1", "tone2", "tone3_r", "tone3_l", "cam_frames", "barcode"])
+def test_every_port_role_claims_its_name_when_cleared(role):
+    stored = _stream_of(
+        NidaqSignalChannelConfiguration(role, "InputCard/port0/line7", kind="digital"))
+
+    result = build_nidaq_acquisition_configuration(
+        stored, NidaqPortConfiguration(), LaserSystemConfiguration())
+
+    assert result.channels == ()

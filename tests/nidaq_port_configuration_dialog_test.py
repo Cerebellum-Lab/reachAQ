@@ -594,3 +594,60 @@ def test_choosing_none_for_the_readback_stops_it_being_acquired_for_good(
         saved.nidaq_stream, saved.nidaq_ports, saved.laser)
     assert "Dev1/ai7" not in _pins(reloaded)
     assert "laser1_trigger" not in {channel.name for channel in reloaded.channels}
+
+
+def test_clearing_a_port_role_stops_it_being_recorded_for_good(
+    qapp, nidaq_app, system_config, trainer_config_dir,
+):
+    # camFrames cleared in the dialog came back as a custom channel from the
+    # live plan: saved, reloaded, recorded, and listed in Analysis as "no
+    # longer mapped".
+    from autotrainer.core import NidaqSignalChannelConfiguration, NidaqSignalStreamConfiguration
+    from tools.acquisition.view.analysis_content import AnalysisContent
+
+    system_config.nidaq_stream = NidaqSignalStreamConfiguration(
+        channels=(NidaqSignalChannelConfiguration("stim_readback", "Dev1/ai5"),),
+        is_enabled=True,
+    )
+    system_config.save_default(trainer_config_dir)
+    assert nidaq_app.load_configuration() is True
+    _settle(nidaq_app)
+    names = {channel.name for channel in nidaq_app.nidaq_signal_monitor.configuration.channels}
+    assert {"cam_frames", "stim_readback"} <= names
+    device = NidaqDevicePorts(
+        name="Dev1",
+        analog_inputs=("Dev1/ai5",),
+        digital_inputs=("Dev1/port0/line0", "Dev1/port0/line1"),
+        digital_input_max_rate=_BUFFERED_DI_RATE,
+    )
+    dialog = NidaqPortConfigurationDialog(nidaq_app.loaded_configuration, devices=(device,))
+    cam_frames = dialog._general_combos["cam_frames"]
+    assert cam_frames.currentData() == "Dev1/port0/line0"
+
+    cam_frames.setCurrentIndex(cam_frames.findData(None))
+    dialog.accept()
+    assert dialog.result() == QDialog.DialogCode.Accepted
+    nidaq_app.update_daq_port_configuration(dialog.nidaq_ports, dialog.laser_configuration)
+    _settle(nidaq_app)
+
+    for plan in (
+        nidaq_app.nidaq_signal_monitor.configuration,
+        nidaq_app.loaded_configuration.nidaq_stream,
+    ):
+        assert "Dev1/port0/line0" not in _pins(plan)
+        assert "stim_readback" in {channel.name for channel in plan.channels}
+    # And from the saved file, through the plan a load builds from it.
+    saved = nidaq_app.get_config_from_location(nidaq_app.get_config_location())
+    assert saved.nidaq_ports.cam_frames is None
+    reloaded = build_nidaq_acquisition_configuration(
+        saved.nidaq_stream, saved.nidaq_ports, saved.laser)
+    assert "Dev1/port0/line0" not in _pins(reloaded)
+    assert "stim_readback" in {channel.name for channel in reloaded.channels}
+
+    content = AnalysisContent(nidaq_app)
+    try:
+        assert "custom:cam_frames" not in content._signal_checkboxes
+        assert "custom:stim_readback" in content._signal_checkboxes
+    finally:
+        content.on_close()
+        content.deleteLater()
