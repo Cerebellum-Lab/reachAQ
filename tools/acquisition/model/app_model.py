@@ -7535,6 +7535,17 @@ class AppModel(ObservableObject):
                 profile.profile_id: profile
                 for profile in profile_library.tone_profiles
             }
+            # Kept from startup before, so a configuration from another
+            # directory showed the startup directory's cue-interval and trigger
+            # profiles, and the next profile save wrote them into this one.
+            self._cue_interval_profiles = {
+                profile.profile_id: profile
+                for profile in profile_library.cue_interval_profiles
+            }
+            self._stimulus_trigger_profiles = {
+                profile.profile_id: profile
+                for profile in profile_library.stimulus_trigger_profiles
+            }
             self._laser_profiles = {
                 profile.profile_id: profile
                 for profile in profile_library.laser_profiles
