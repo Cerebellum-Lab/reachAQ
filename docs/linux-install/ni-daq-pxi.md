@@ -134,10 +134,12 @@ checks names only, since no board is asked then: a digital role that is not
 one port0 line (a port1 or port2 PFI pin, a whole port, an analog input)
 still loads, but its NI-DAQ plan is refused, naming the field; see below. A
 port0 line on a board that cannot clock digital input, such as the 6713,
-passes the load. Edit DAQ Ports marks it, and System Mode refuses it at Run,
-naming the channel and the board; the driver's answer is the test, not the
-board model (the 6713 reports no digital-input rate, the 6221 1 MHz). In Idle
-the stream's own start still reports it only as DAQmx error -200452.
+passes the load. Edit DAQ Ports marks it, and the stream refuses to start on
+it, naming the channel and the board: in Idle, when the stream starts by
+itself or after a Hardware refresh, and at Run. NI-DAQ then reads failed, the
+same in Idle as at Run, and nothing reaches DAQmx, which used to answer only
+with error -200452. The driver's answer is the test, not the board model (the
+6713 reports no digital-input rate, the 6221 1 MHz).
 christielab10 uses `PXI1Slot5/port0/line0`-`line3` for tone1, tone2,
 camFrames and barcode. Clearing a role (choosing the empty entry) stops its
 channel being acquired and recorded from the next save on; the log notes the

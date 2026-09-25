@@ -7,9 +7,11 @@ process id to compare.
 """
 
 import dataclasses
+import logging
 import queue
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -22,6 +24,7 @@ from autotrainer.core import (
 )
 from tools.acquisition.model import nidaq_monitor_session, nidaq_signal_monitor_model
 from tools.acquisition.model.app_model_status import SessionRecordingStatus
+from tools.acquisition.model.nidaq_discovery import NidaqDevicePorts
 from tools.acquisition.model.nidaq_monitor_session import NidaqMonitorSession
 from tools.acquisition.model.subsystem_status import SubsystemId, SubsystemState
 
@@ -418,6 +421,118 @@ def test_a_hardware_refresh_starts_a_stopped_stream(nidaq_app, monkeypatch):
     nidaq_app.refresh_hardware_bindings()
 
     assert _settle(nidaq_app).is_running
+
+
+def _discover_dev1_lines(digital_input_max_rate):
+    """Dev1 listing its port0 lines, with the digital-input rate discovery reads.
+
+    discover_dev1 lists no lines at all, so no rule about lines applies to it.
+    A PXI-6713 lists its port0 lines and reports no digital-input rate; a
+    PXI-6221 reports 1 MHz (christielab10, 2026-09-25).
+    """
+    def discover():
+        return (NidaqDevicePorts(
+            name="Dev1",
+            digital_inputs=tuple(f"Dev1/port0/line{line}" for line in range(8)),
+            counter_outputs=("Dev1/ctr0",),
+            digital_input_max_rate=digital_input_max_rate,
+        ),), None
+    return discover
+
+
+def _counting_preflight(calls, *, valid):
+    """The exact-task preflight; refused as a 6713 port0 line is refused there."""
+    def preflight(_configuration, _timing_plan):
+        calls.append(True)
+        if valid:
+            return SimpleNamespace(is_valid=True)
+        return SimpleNamespace(
+            is_valid=False, stage="DI_DataXferMech",
+            error="DaqError -200452: Specified property is not supported by "
+                  "the device or is not applicable to the task",
+            corrective_action="")
+    return preflight
+
+
+def _status_bar_lines(caplog, text):
+    """ERROR lines the status bar would show, as its handler cuts them."""
+    shown = []
+    for record in caplog.records:
+        if record.levelno < logging.ERROR:
+            continue
+        lines = [line.strip() for line in record.getMessage().splitlines() if line.strip()]
+        if lines and text in lines[0][:320]:
+            shown.append(lines[0])
+    return shown
+
+
+def test_an_idle_start_refuses_a_line_its_board_cannot_clock_as_run_does(
+    nidaq_app, monkeypatch, caplog,
+):
+    # Run and the DAQ Monitor asked whether a digital line's board could
+    # clock it; the stream's own start in Idle asked only whether the line
+    # existed, reached the preflight, and failed there at -200452, naming
+    # neither the line nor the board.
+    from hardware_status_content_test import _patch_hardware_scans
+    from tools.acquisition.model import app_model as app_model_module
+
+    discover = _discover_dev1_lines(None)
+    monitor = nidaq_app.nidaq_signal_monitor
+    monitor._device_discovery = discover
+    preflights = []
+    monitor._exact_preflight = _counting_preflight(preflights, valid=False)
+    starts = _count_starts(monkeypatch, monitor)
+    _patch_hardware_scans(nidaq_app, monkeypatch)
+    monkeypatch.setattr(app_model_module, "discover_nidaq_devices", discover)
+
+    with caplog.at_level("ERROR"):
+        assert nidaq_app.load_configuration() is True
+        _settle(nidaq_app, running=False)
+    idle = _nidaq_state(nidaq_app)
+
+    assert starts == [True]
+    assert preflights == [] and monitor._process is None
+    assert not monitor.is_running
+    assert idle.state is SubsystemState.FAILED
+    assert "'Dev1/port0/line0'" in idle.error
+    assert "Dev1, which cannot clock digital input" in idle.error
+    assert len(_status_bar_lines(caplog, "cannot clock digital input")) == 1
+
+    def refresh_is_refused_again(attempts):
+        # A hardware refresh is how a failed start is retried; it is refused
+        # again, by name, before the preflight, and says so once.
+        caplog.clear()
+        with caplog.at_level("ERROR"):
+            nidaq_app.refresh_hardware_bindings()
+            _settle(nidaq_app, running=False)
+        assert len(starts) == attempts
+        assert preflights == [] and monitor._process is None
+        retried = _nidaq_state(nidaq_app)
+        assert retried.state is SubsystemState.FAILED
+        assert idle.error in retried.error
+        assert len(_status_bar_lines(caplog, "cannot clock digital input")) == 1
+
+    refresh_is_refused_again(2)
+
+    # Run gives the same refusal the same state, from the same check.
+    assert nidaq_app._start_nidaq_domain(restart=True) is False
+    run = _nidaq_state(nidaq_app)
+    assert run.state is idle.state
+    assert idle.error in run.error
+    refresh_is_refused_again(3)
+
+
+def test_an_idle_start_on_a_board_that_clocks_digital_input_is_unchanged(nidaq_app):
+    monitor = nidaq_app.nidaq_signal_monitor
+    monitor._device_discovery = _discover_dev1_lines(1_000_000.0)
+    preflights = []
+    monitor._exact_preflight = _counting_preflight(preflights, valid=True)
+
+    assert nidaq_app.load_configuration() is True
+
+    assert _settle(nidaq_app).is_running
+    assert preflights == [True]
+    assert _nidaq_state(nidaq_app).state is SubsystemState.READY
 
 
 def test_the_daq_monitor_pauses_the_stream_and_resumes_it_when_closed(

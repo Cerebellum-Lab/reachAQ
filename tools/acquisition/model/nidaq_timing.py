@@ -18,6 +18,7 @@ from tools.acquisition.model.nidaq_discovery import (
     NidaqDevicePorts,
     device_name_from_channel,
 )
+from tools.acquisition.model.nidaq_validation import unclockable_digital_input
 
 
 def build_nidaq_timing_plan(
@@ -654,6 +655,13 @@ def _validate_channels_and_rates(configuration, discovered) -> Optional[str]:
                     f"Configured digital input {channel.physical_channel} is not "
                     f"available on {device_name}"
                 )
+            # Every start builds this plan from its own discovery, Idle's
+            # included, so this is where a line the board cannot clock is
+            # refused before the preflight meets it as -200452. Run and the
+            # DAQ Monitor refuse it through the same check.
+            refusal = unclockable_digital_input(device, channel)
+            if refusal is not None:
+                return refusal.describe()
     for device_name, channel_count in analog_counts.items():
         device = discovered[device_name]
         maximum = (

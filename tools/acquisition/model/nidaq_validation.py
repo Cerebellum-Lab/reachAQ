@@ -143,12 +143,33 @@ def _is_digital_input(device, physical_channel: str) -> bool:
                for line in getattr(device, "digital_inputs", ()) or ())
 
 
+def unclockable_digital_input(device, channel, subject_prefix="stream channel"
+                              ) -> Optional[ValidationIssue]:
+    """The refusal for a digital input its board cannot clock, or None.
+
+    The stream samples every digital input in one clocked task. A PXI-6713
+    port0 line passed every check and failed only when the stream started,
+    at -200452, naming neither line nor board. This is the one check for it:
+    Run and the DAQ Monitor reach it through validate_channels, and every
+    stream start, Idle's included, through the timing plan the start builds
+    from its own discovery (nidaq_timing._validate_channels_and_rates).
+    """
+    physical = getattr(channel, "physical_channel", "")
+    if not _is_digital_input(device, physical) or clocks_digital_input(device):
+        return None
+    return ValidationIssue(
+        f"{subject_prefix} {getattr(channel, 'name', physical)!r}", physical,
+        f"names a line on {getattr(device, 'name', '')}, which cannot clock "
+        "digital input: discovery reports no digital-input rate for it",
+        remedy="use a port0 line on a board that clocks digital input",
+    )
+
+
 def validate_channels(devices, channels, subject_prefix="stream channel"):
     """Every configured channel names a device and a channel that exist.
 
-    And a digital input names a board that can clock one: the stream samples
-    its lines in a clocked task. A PXI-6713 port0 line passed here and failed
-    when the stream started, at -200452, naming neither line nor board.
+    And a digital input names a board that can clock one
+    (unclockable_digital_input).
     """
     issues = []
     for channel in channels or ():
@@ -169,13 +190,9 @@ def validate_channels(devices, channels, subject_prefix="stream channel"):
                 f"names a channel {device_name} does not have",
             ))
             continue
-        if _is_digital_input(device, physical) and not clocks_digital_input(device):
-            issues.append(ValidationIssue(
-                f"{subject_prefix} {name!r}", physical,
-                f"names a line on {device_name}, which cannot clock digital "
-                "input: discovery reports no digital-input rate for it",
-                remedy="use a port0 line on a board that clocks digital input",
-            ))
+        issue = unclockable_digital_input(device, channel, subject_prefix)
+        if issue is not None:
+            issues.append(issue)
     return tuple(issues)
 
 
