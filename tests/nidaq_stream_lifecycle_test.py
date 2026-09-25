@@ -125,6 +125,34 @@ def test_acquisition_start_restarts_a_stream_whose_plan_changed(nidaq_app, monke
     assert _worker_pid(monitor) != pid
 
 
+def test_the_daq_monitor_cannot_take_the_stream_from_a_running_acquisition(
+    nidaq_app, monkeypatch,
+):
+    # Pausing for the monitor stopped the acquisition's stream, marked it
+    # STOPPED rather than FAILED, so a recording carried on without its NI
+    # data, and nothing restarted it when the monitor closed.
+    monkeypatch.setattr(nidaq_monitor_session, "NidaqSignalMonitorModel", _Stream)
+    monkeypatch.setattr(nidaq_monitor_session, "discover_nidaq_devices",
+                        lambda: ((), None))
+    monkeypatch.setattr(nidaq_app, "_require_valid_nidaq_configuration", lambda: None)
+    assert nidaq_app.load_configuration() is True
+    monitor = _settle(nidaq_app)
+    try:
+        assert nidaq_app.capture_start() is True
+        assert monitor.is_running
+        pid = _worker_pid(monitor)
+
+        with pytest.raises(RuntimeError, match="System Mode"):
+            NidaqMonitorSession(nidaq_app)
+
+        assert monitor.is_running
+        assert _worker_pid(monitor) == pid
+        assert nidaq_app._nidaq_stream_autostart.pause_reasons == ()
+        assert _nidaq_state(nidaq_app).state is SubsystemState.READY
+    finally:
+        nidaq_app.capture_stop()
+
+
 def test_saving_daq_ports_restarts_the_stream_with_the_new_plan(nidaq_app):
     assert nidaq_app.load_configuration() is True
     monitor = _settle(nidaq_app)

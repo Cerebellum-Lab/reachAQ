@@ -335,6 +335,9 @@ class MainWindow(QMainWindow):
         self.edit_camera_settings_action.setEnabled(state.idle_configuration)
         self.edit_daq_ports_action.setEnabled(state.idle_configuration)
         self.make_3d_calib_action.setEnabled(state.idle_configuration)
+        # It pauses the NI-DAQ input stream, which in System Mode is the
+        # acquisition's; AppModel refuses the pause then as well.
+        self.daq_monitor_action.setEnabled(state.idle_configuration)
         self.refresh_hardware_action.setEnabled(state.hardware_refresh)
         self._set_hardware_menu_actions_enabled(state.idle_configuration)
         self._animal_dropdown_combo.setEnabled(state.subject)
