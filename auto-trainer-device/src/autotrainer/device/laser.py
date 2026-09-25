@@ -121,6 +121,12 @@ class LaserSynchronizedPulseTrain:
             raise NotImplementedError("per-laser asynchronous output is not supported in synchronized pulse trains")
 
 
+#: The part of each calibration step left out of its mean, by default: 20 of
+#: 100 samples, 200 us at christielab10's 100 kHz. To be confirmed from the
+#: measured step response (hardware check H2).
+CALIBRATION_SETTLE_FRACTION = 0.2
+
+
 @dataclasses.dataclass(frozen=True)
 class LaserCalibrationRamp:
     """Sample-clocked command ramp used to acquire diode and command-copy feedback."""
@@ -136,6 +142,12 @@ class LaserCalibrationRamp:
     pmt_shutter_open_delay_ms: float = 0.0
     pmt_shutter_close_delay_ms: float = 0.0
     timeout_seconds: Optional[float] = None
+    #: Samples at the start of each step left out of its point. The input
+    #: converts on the edge the output updates on, and the laser driver and
+    #: the diode take time to follow, so the first samples of a step still
+    #: read the step before: averaged in, they pulled every point of a
+    #: rising ramp low. None takes CALIBRATION_SETTLE_FRACTION of the step.
+    settle_samples: Optional[int] = None
 
     def __post_init__(self):
         object.__setattr__(self, "channel_id", normalize_laser_channel_id(self.channel_id))
@@ -143,6 +155,15 @@ class LaserCalibrationRamp:
             raise ValueError("steps must be at least 2")
         if self.samples_per_step <= 0:
             raise ValueError("samples_per_step must be positive")
+        if self.settle_samples is None:
+            object.__setattr__(self, "settle_samples", int(round(
+                self.samples_per_step * CALIBRATION_SETTLE_FRACTION)))
+        if not 0 <= int(self.settle_samples) < self.samples_per_step:
+            raise ValueError(
+                f"settle_samples must leave at least one of the "
+                f"{self.samples_per_step} samples of each step: 0 to "
+                f"{self.samples_per_step - 1}, not {self.settle_samples}")
+        object.__setattr__(self, "settle_samples", int(self.settle_samples))
         if self.pmt_shutter_open_delay_ms < 0:
             raise ValueError("pmt_shutter_open_delay_ms cannot be negative")
         if self.pmt_shutter_close_delay_ms < 0:

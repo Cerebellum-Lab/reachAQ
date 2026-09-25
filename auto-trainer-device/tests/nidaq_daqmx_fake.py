@@ -113,6 +113,8 @@ class FakeTask:
             or self.stopped_while_waiting.is_set())
 
     def read(self, number_of_samples_per_channel, timeout):
+        if self.daq.read_samples is not None:
+            return self.daq.read_samples(self, number_of_samples_per_channel)
         values = [1.0] * number_of_samples_per_channel
         if len(self.channels) == 1:
             return values
@@ -181,6 +183,9 @@ class FakeDaqmx:
         self.before_control = None
         #: A task, by name suffix, whose abort fails while it is still open.
         self.failing_abort = None
+        #: Called as read_samples(task, count) for what a read returns, in
+        #: place of a constant 1.0, such as a diode's step response.
+        self.read_samples = None
         self.hang_released = threading.Event()
         #: Set as a call starts to hang; hung names each such call, in order.
         self.hanging = threading.Event()

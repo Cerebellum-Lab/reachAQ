@@ -382,6 +382,10 @@ def test_run_ramp_runs_through_the_model_and_never_stops_the_stream_itself(
     tab._ramp_start.setValue(0.5)
     tab._ramp_stop.setValue(2.5)
     tab._ramp_steps.setValue(5)
+    # A fifth of the default 100 samples, until changed.
+    assert tab._ramp_settle.value() == 20
+    assert "settle" in tab._ramp_settle.toolTip().lower()
+    tab._ramp_settle.setValue(7)
 
     tab._run_ramp_button.click()
     deadline = time.monotonic() + 10.0
@@ -393,6 +397,7 @@ def test_run_ramp_runs_through_the_model_and_never_stops_the_stream_itself(
     ramp, = ramps
     assert (ramp.channel_id, ramp.start_volts, ramp.stop_volts, ramp.steps) == (
         LaserChannelId.LASER_1, 0.5, 2.5, 5)
+    assert ramp.settle_samples == 7
     assert monitor_calls == []
     # The outcome stays on the status line; it was replaced at once by the
     # Run Pulse refusal, which is still true in Idle.

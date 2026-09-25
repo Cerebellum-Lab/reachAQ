@@ -404,3 +404,40 @@ def test_an_abort_that_fails_on_a_task_the_ramp_still_holds_is_reported(monkeypa
     finally:
         daq.waits_released.set()
         ramp.join(5.0)
+
+
+
+# ---------------------------------------------------- settling at each step
+
+
+def _lagging_step_response(ramp, lag):
+    """Each step's samples, the first `lag` still at the step before."""
+    def read(task, count):
+        assert count == ramp.steps * ramp.samples_per_step
+        levels = [ramp.start_volts + index * (ramp.stop_volts - ramp.start_volts)
+                  / (ramp.steps - 1) for index in range(ramp.steps)]
+        samples = []
+        for index, level in enumerate(levels):
+            previous = levels[index - 1] if index else level
+            samples.extend([previous] * lag + [level] * (ramp.samples_per_step - lag))
+        return [list(samples) for _ in task.channels]
+    return read
+
+
+def test_each_point_is_the_level_the_step_settled_to(daq):
+    # The input converts on the edge the output updates on, and the laser
+    # and diode take time to follow: the first samples of each step read the
+    # step before. Averaged in, they pulled every point of a rising ramp low
+    # (2.0 V for a 2.5 V step, with 2 of 10 samples lagging).
+    import dataclasses
+
+    ramp = dataclasses.replace(RAMP, samples_per_step=10)
+    daq.read_samples = _lagging_step_response(ramp, lag=2)
+    controller = NidaqLaserController(_rig_lasers())
+
+    points = controller.run_calibration_ramp(ramp)
+
+    assert [point.diode_volts for point in points] == [0.0, 2.5, 5.0]
+    assert [point.command_copy_volts for point in points] == [0.0, 2.5, 5.0]
+    # By default, a fifth of each step: 2 of these 10 samples.
+    assert ramp.settle_samples == 2

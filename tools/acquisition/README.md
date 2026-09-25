@@ -288,7 +288,11 @@ NI-DAQ input stream stopped, through the same hold as the DAQ Monitor, opens a
 laser controller for the ramp alone, and hands both back when the ramp ends,
 however it ends. Run, the DAQ Monitor, configuration loads and DAQ Ports saves
 are refused while it runs, and its tooltip gives the reason whenever it is
-unavailable.
+unavailable. Its **Settle:** field is how many samples at the start of each
+step are left out of that step's point, a fifth of **Samples/step:** by
+default: the input is read on the clock edge the command changes on, and the
+laser and diode take time to follow, so those first samples still read the
+step before.
 Each live stream graph has its own editable time window and voltage limits.
 
 Every stream option and curve uses the same high-contrast color assignment:
