@@ -84,3 +84,44 @@ def test_a_set_refuses_an_unknown_schema():
 
     with pytest.raises(ValueError, match="Unsupported set schema"):
         TrialProtocolSet.from_record(record)
+
+
+LASER_ACTION = {
+    "laser_profile_id": "burst",
+    "laser_phase": "pellet_presentation",
+    "laser_trigger_route": "hardware_stim3",
+}
+
+
+def test_a_set_saved_before_a_laser_row_named_its_laser_is_refused_by_name():
+    # A set keeps set schema 1 across protocol schema 3, and its patches load
+    # unvalidated, so this used to load and fail only at compile time with
+    # "Laser trigger route requires a laser, profile and phase".
+    record = make_set().to_record()
+    record["defaults"] = {"enabled": True, **LASER_ACTION}
+    record["trial_overrides"] = [
+        {"trial_id": 3, "values": {"laser_trigger_route": "none",
+                                   "laser_profile_id": "", "laser_phase": "none"}},
+    ]
+
+    with pytest.raises(ValueError, match=(
+        r"Set 'Baseline' was saved before a laser row named its laser; set the "
+        r"laser on trial 1, 2, 4 in a new set"
+    )):
+        TrialProtocolSet.from_record(record)
+
+
+def test_a_set_whose_override_changes_only_the_route_still_loads():
+    # A bulk edit stores only the fields it changed, so the laser can come
+    # from the defaults while the route comes from the override.
+    record = make_set().to_record()
+    record["defaults"] = {"enabled": True, **LASER_ACTION, "laser_channel_id": 2}
+    record["bulk_overrides"] = [{
+        "name": "software", "trial_ids": [3, 4], "parent_epoch": "",
+        "values": {"laser_trigger_route": "direct_ni_software"},
+    }]
+
+    restored = TrialProtocolSet.from_record(record)
+
+    assert restored.bulk_overrides[0].patch.to_mapping() == {
+        "laser_trigger_route": "direct_ni_software"}
