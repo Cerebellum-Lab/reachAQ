@@ -182,6 +182,9 @@ def test_a_profile_just_saved_is_selected_and_can_be_deleted(qapp, app_model, mo
 
     assert tab._profile_selector.currentData() == "fresh"
     assert tab._delete_button.isEnabled()
+    # Selected with its signals blocked; the hover text follows it anyway.
+    assert tab._profile_selector.toolTip().splitlines()[0] == (
+        tab._profile_selector.currentText())
 
 
 def test_the_preview_draws_every_pulse():

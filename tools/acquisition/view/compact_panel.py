@@ -10,11 +10,12 @@ drawn in the panel's smaller font.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import List, Optional, Tuple
 
 from PySide6.QtCore import QEvent, QSize, Qt, Signal
-from PySide6.QtGui import QFont, QPainter
+from PySide6.QtGui import QFont, QPainter, QTextLayout, QTextOption
 from PySide6.QtWidgets import (
+    QApplication,
     QComboBox,
     QGridLayout,
     QHBoxLayout,
@@ -26,7 +27,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-#: The panel font, about 20% under the rig's 9 pt Qt default.
+#: The panel font. The rest of reachAQ keeps the platform font: Ubuntu 11 pt
+#: on christielab10's desktop (DejaVu Sans 9 pt under offscreen Qt).
 COMPACT_FONT_POINT_SIZE = 7.5
 #: Graph tick and axis-label font; pyqtgraph draws these itself.
 COMPACT_AXIS_POINT_SIZE = 7.0
@@ -38,11 +40,26 @@ WIDE_FIELD_MAXIMUM_WIDTH = 400
 FIELD_COLUMN_STRETCH = 10
 
 
+def _application_font_size() -> str:
+    font = QApplication.font()
+    if font.pointSizeF() > 0:
+        return f"{font.pointSizeF():g}pt"
+    return f"{font.pixelSize()}px"
+
+
 def compact_font_style_sheet(object_name: str) -> str:
-    """The panel font for a widget and everything inside it."""
+    """The panel font for a widget and everything inside it but dialogs.
+
+    A style sheet reaches every widget whose parents include the panel,
+    dialogs too, so the builder's Save profile and Delete dialogs came up at
+    the panel's size. The second rule gives dialogs the application font
+    size, as it is when the style sheet is built.
+    """
     return (
         f"#{object_name}, #{object_name} QWidget "
         f"{{font-size: {COMPACT_FONT_POINT_SIZE:g}pt;}}"
+        f"#{object_name} QDialog, #{object_name} QDialog QWidget "
+        f"{{font-size: {_application_font_size()};}}"
     )
 
 
@@ -114,33 +131,80 @@ def compact_plot_axes(plot_widget, point_size: float = COMPACT_AXIS_POINT_SIZE) 
 
 
 class ElidedLabel(QLabel):
-    """One line of text that ends in an ellipsis when it does not fit.
+    """Text that ends in an ellipsis when it does not fit its lines.
 
     A plain label either wraps, which makes a panel's height depend on its
     text, or sets the panel's minimum width to the whole line. This one keeps
-    one line at any width, and its tooltip shows the whole text whenever any
-    of it is cut, followed by whatever tooltip it was given.
+    the same height at any width: one line, or ``max_lines`` lines wrapped at
+    word boundaries. Its tooltip shows the whole text whenever any of it is
+    cut, followed by whatever tooltip it was given.
     """
 
-    def __init__(self, text: str = "", parent: Optional[QWidget] = None):
+    def __init__(
+        self, text: str = "", parent: Optional[QWidget] = None, *, max_lines: int = 1,
+    ):
         super().__init__(text, parent)
+        self._max_lines = max(1, int(max_lines))
         self.setWordWrap(False)
         self.setTextFormat(Qt.TextFormat.PlainText)
+        if self._max_lines > 1:
+            # A short text sits on the first line rather than between two.
+            self.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+
+    def _extra_lines_height(self) -> int:
+        return (self._max_lines - 1) * self.fontMetrics().lineSpacing()
+
+    def sizeHint(self) -> QSize:
+        hint = super().sizeHint()
+        return QSize(hint.width(), hint.height() + self._extra_lines_height())
 
     def minimumSizeHint(self) -> QSize:
         hint = super().minimumSizeHint()
         ellipsis = self.fontMetrics().horizontalAdvance("…")
         margins = self.contentsMargins()
         width = min(hint.width(), 3 * ellipsis + margins.left() + margins.right())
-        return QSize(width, hint.height())
+        return QSize(width, hint.height() + self._extra_lines_height())
+
+    def _drawn_lines(self) -> Tuple[List[str], bool]:
+        """The lines as drawn, and whether any of the text was cut."""
+        text = self.text()
+        width = self.contentsRect().width()
+        metrics = self.fontMetrics()
+        if self._max_lines == 1:
+            line = metrics.elidedText(text, Qt.TextElideMode.ElideRight, width)
+            return [line], line != text
+        layout = QTextLayout(text, self.font(), self)
+        option = QTextOption()
+        option.setWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+        layout.setTextOption(option)
+        lines: List[str] = []
+        is_cut = False
+        layout.beginLayout()
+        try:
+            while len(lines) < self._max_lines:
+                line = layout.createLine()
+                if not line.isValid():
+                    break
+                line.setLineWidth(width)
+                start = line.textStart()
+                if len(lines) == self._max_lines - 1:
+                    # The last line takes the rest of the text, cut to fit.
+                    rest = text[start:]
+                    last = metrics.elidedText(rest, Qt.TextElideMode.ElideRight, width)
+                    is_cut = last != rest
+                    lines.append(last)
+                else:
+                    lines.append(text[start:start + line.textLength()].rstrip())
+        finally:
+            layout.endLayout()
+        return lines, is_cut
 
     def elided_text(self) -> str:
-        return self.fontMetrics().elidedText(
-            self.text(), Qt.TextElideMode.ElideRight, self.contentsRect().width())
+        return "\n".join(self._drawn_lines()[0])
 
     def is_elided(self) -> bool:
-        return self.elided_text() != self.text()
+        return self._drawn_lines()[1]
 
     def full_tooltip(self) -> str:
         """What hovering shows: the whole text when cut, then the set tooltip."""
@@ -242,8 +306,8 @@ class CollapsibleSection(QWidget):
     def set_expanded(self, expanded: bool) -> None:
         self.toggle_button.setChecked(bool(expanded))
 
-    def setToolTip(self, text: str) -> None:
-        # On the header, where the pointer is when deciding to open it.
+    def set_header_tooltip(self, text: str) -> None:
+        """A tooltip on the header, where the pointer is when deciding to open it."""
         self.toggle_button.setToolTip(text)
 
     def _on_toggled(self, expanded: bool) -> None:

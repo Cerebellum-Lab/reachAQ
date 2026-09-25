@@ -37,6 +37,7 @@ from tools.acquisition.view.compact_panel import (
 
 #: The identifier the builder draft is fired under.
 DRAFT_PROFILE_ID = "builder-draft"
+_PROFILE_SELECTOR_TOOLTIP = "Load a saved profile into the builder"
 
 
 def pulse_shape_refusal(profile: LaserPulseProfile) -> str:
@@ -120,7 +121,6 @@ class PulseBuilderTab(QWidget):
         # Sized to a few characters rather than its longest "name — summary"
         # entry, which made the builder wider than the docked panel.
         self._profile_selector = compact_combo_box()
-        self._profile_selector.setToolTip("Load a saved profile into the builder")
         self._profile_selector.setMaximumWidth(WIDE_FIELD_MAXIMUM_WIDTH)
         self._delete_button = QPushButton("Delete")
         self._save_button = QPushButton("Save profile…")
@@ -232,7 +232,14 @@ class PulseBuilderTab(QWidget):
         index = self._profile_selector.findData(previous)
         self._profile_selector.setCurrentIndex(max(0, index))
         self._profile_selector.blockSignals(False)
+        self._refresh_selector_tooltip()
         self._refresh_delete_enabled()
+
+    def _refresh_selector_tooltip(self) -> None:
+        # The docked panel shows only about 250 px of "name — summary", which
+        # cuts a realistic profile name off; hovering shows the whole entry.
+        self._profile_selector.setToolTip(
+            f"{self._profile_selector.currentText()}\n{_PROFILE_SELECTOR_TOOLTIP}")
 
     def _refresh_delete_enabled(self) -> None:
         # Both conditions, wherever either changes: refreshing the list after
@@ -257,6 +264,7 @@ class PulseBuilderTab(QWidget):
 
     def _on_profile_selected(self, *_args) -> None:
         profile_id = self._profile_selector.currentData()
+        self._refresh_selector_tooltip()
         self._refresh_delete_enabled()
         if not profile_id:
             return
@@ -353,6 +361,7 @@ class PulseBuilderTab(QWidget):
         self._profile_selector.setCurrentIndex(
             max(0, self._profile_selector.findData(saved.profile_id)))
         self._profile_selector.blockSignals(False)
+        self._refresh_selector_tooltip()
         self._refresh_delete_enabled()
         self._set_status(
             f"Saved laser profile {saved.profile_id!r} (revision {saved.revision})", False)
