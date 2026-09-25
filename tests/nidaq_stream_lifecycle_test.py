@@ -525,39 +525,220 @@ def test_a_run_on_independent_boards_is_blocked_from_recording(independent_app):
         independent_app.capture_stop()
 
 
+def _wait_until_running_is_announced(monitor, timeout=10.0):
+    """Wait for the monitor to finish telling everyone its worker is ready."""
+    deadline = time.monotonic() + timeout
+    while (monitor.status_message != "NI-DAQ signal stream running"
+           and time.monotonic() < deadline):
+        time.sleep(0.01)
+    return monitor.status_message == "NI-DAQ signal stream running"
+
+
+def _hold_the_ready_announcement(monitor, until):
+    """Settle "not starting", then wait for `until()` before telling anyone.
+
+    The monitor settles both of its flags under its lock and then notifies,
+    and a Run polls the flags without the lock, so it can act inside that
+    moment. Held here, the moment is long every time.
+    """
+    set_starting = monitor._set_starting
+    ready_pids = []
+
+    def announce_late(value):
+        if value or not monitor._is_starting:
+            return set_starting(value)
+        ready_pids.append(_worker_pid(monitor))
+        monitor._is_starting = False
+        deadline = time.monotonic() + 5.0
+        while not until() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        monitor._on_property_changed(monitor.IS_STARTING, False, True)
+
+    monitor._set_starting = announce_late
+    return ready_pids
+
+
 def test_a_late_ready_from_the_stream_cannot_overwrite_the_runs_verdict(
     independent_app,
 ):
-    # The monitor marks itself running before it tells its listeners, so a
-    # Run can see the stream running and write its verdict first; the READY
-    # published after it then replaced BLOCKED. Held here until the verdict
-    # is written, so the order is the bad one every time.
+    # A Run can see the stream running and write its verdict, and finish,
+    # before the monitor's READY event reaches the application; that READY
+    # replaced BLOCKED.
     assert independent_app.load_configuration() is True
     monitor = _settle(independent_app)
-    set_running = monitor._set_running
-    published = threading.Event()
 
-    def publish_after_the_verdict(value):
-        if not value:
-            return set_running(value)
-        monitor._is_running = True
-        deadline = time.monotonic() + 5.0
-        while (_nidaq_state(independent_app).state is not SubsystemState.BLOCKED
-               and time.monotonic() < deadline):
-            time.sleep(0.01)
-        monitor._on_property_changed(monitor.IS_RUNNING, True, False)
-        published.set()
+    def the_run_has_finished_with_the_stream():
+        return (_nidaq_state(independent_app).state is SubsystemState.BLOCKED
+                and not independent_app._nidaq_domain_start_active)
 
-    monitor._set_running = publish_after_the_verdict
+    _hold_the_ready_announcement(
+        monitor, until=the_run_has_finished_with_the_stream)
     try:
         assert independent_app.capture_start() is True
-        assert published.wait(10.0)
+        assert _wait_until_running_is_announced(monitor)
 
         assert monitor.is_running
         assert _nidaq_state(independent_app).state is SubsystemState.BLOCKED
     finally:
-        del monitor._set_running
+        del monitor._set_starting
         independent_app.capture_stop()
+
+
+def test_a_run_is_not_failed_in_the_moment_its_stream_turns_ready(
+    nidaq_app, monkeypatch,
+):
+    # The monitor cleared "starting", and told its listeners (the views, on
+    # the rig), before it set "running". A Run polling in that moment saw
+    # neither, wrote "not ready within 12 seconds" and stopped a worker that
+    # had just come up.
+    monkeypatch.setattr(nidaq_app, "_require_valid_nidaq_configuration", lambda: None)
+    assert nidaq_app.load_configuration() is True
+    monitor = _settle(nidaq_app)
+    assert monitor.is_running, "the stream did not start by itself"
+    first_asked = []
+
+    def a_moment_later():
+        first_asked.append(time.monotonic())
+        return time.monotonic() - first_asked[0] >= 0.3
+
+    ready_pids = _hold_the_ready_announcement(monitor, until=a_moment_later)
+    try:
+        assert nidaq_app.capture_start() is True
+
+        state = _nidaq_state(nidaq_app)
+        assert state.state is SubsystemState.READY, state
+        assert _wait_until_running_is_announced(monitor)
+        assert _nidaq_state(nidaq_app).state is SubsystemState.READY
+        assert monitor.is_running
+        assert len(ready_pids) == 1
+        assert _worker_pid(monitor) == ready_pids[0]
+    finally:
+        del monitor._set_starting
+        nidaq_app.capture_stop()
+
+
+def test_a_stream_that_dies_as_the_run_decides_reads_failed(nidaq_app, monkeypatch):
+    # The Run saw the stream running, then wrote READY at its generation. A
+    # worker that died between the two had already been written FAILED at
+    # that same generation, and READY replaced it: a required subsystem read
+    # ready on a dead stream.
+    monkeypatch.setattr(nidaq_app, "_require_valid_nidaq_configuration", lambda: None)
+    assert nidaq_app.load_configuration() is True
+    monitor = _settle(nidaq_app)
+    assert monitor.is_running, "the stream did not start by itself"
+    idle_pid = _worker_pid(monitor)
+    timing_plan = nidaq_signal_monitor_model.NidaqSignalMonitorModel.timing_plan
+    killed = []
+
+    def die_as_the_run_decides(self):
+        # The Run reads the plan right after it sees the stream running.
+        if (self is monitor and not killed
+                and threading.current_thread() is threading.main_thread()
+                and self.is_running
+                and _worker_pid(self) not in (None, idle_pid)):
+            killed.append(_worker_pid(self))
+            self._process.terminate()
+            deadline = time.monotonic() + 5.0
+            while (_nidaq_state(nidaq_app).state is not SubsystemState.FAILED
+                   and time.monotonic() < deadline):
+                time.sleep(0.02)
+        return timing_plan.fget(self)
+
+    monkeypatch.setattr(nidaq_signal_monitor_model.NidaqSignalMonitorModel,
+                        "timing_plan", property(die_as_the_run_decides))
+    try:
+        assert nidaq_app.capture_start() is True
+
+        assert killed, "the Run never read the timing plan"
+        failed = _nidaq_state(nidaq_app)
+        assert failed.state is SubsystemState.FAILED, failed
+        assert "crashed" in failed.error
+    finally:
+        nidaq_app.capture_stop()
+
+
+class _ReadyHeldBack:
+    """A worker's message queue that holds back "ready" until released."""
+
+    def __init__(self, message_queue, held, release):
+        self._message_queue = message_queue
+        self._held = held
+        self._release = release
+
+    def get(self, timeout=None):
+        message = self._message_queue.get(timeout=timeout)
+        if message[0] == "ready" and not self._release.is_set():
+            self._held.set()
+            self._release.wait(10.0)
+        return message
+
+
+def _nidaq_statuses_published(app_model, on_status=None):
+    """Each NIDAQ state and reason the application publishes from now on."""
+    seen = []
+
+    def record(name, value, _previous):
+        if name != app_model.Props.SUBSYSTEM_STATUSES:
+            return
+        status = value.get(SubsystemId.NIDAQ_STREAM.value)
+        if status is None:
+            return
+        entry = (status.state, status.reason)
+        if not seen or seen[-1] != entry:
+            seen.append(entry)
+        if on_status is not None:
+            on_status(status)
+
+    app_model.property_changed += record
+    return seen
+
+
+def test_an_idle_ready_inside_a_runs_start_does_not_stand_for_it(
+    nidaq_app, monkeypatch,
+):
+    # An Idle start that began before the Run and turned ready after the
+    # Run's NI-DAQ start had begun wrote READY, and it stood while the Run
+    # stopped that worker and started a fresh one through discovery and
+    # the preflight.
+    monkeypatch.setattr(nidaq_app, "_require_valid_nidaq_configuration", lambda: None)
+    monitor = nidaq_app.nidaq_signal_monitor
+    monitor._startup_timeout_seconds = 30.0
+    held, release = threading.Event(), threading.Event()
+    run = monitor._run
+    gated = []
+
+    def run_with_the_first_ready_held(process, message_queue, stop_event, started):
+        if not gated:
+            gated.append(process)
+            message_queue = _ReadyHeldBack(message_queue, held, release)
+        return run(process, message_queue, stop_event, started)
+
+    def let_the_idle_ready_in(status):
+        # Once the Run's NI-DAQ start has begun, and before it restarts.
+        if (status.reason == "starting synchronized NI-DAQ tasks"
+                and not release.is_set()):
+            release.set()
+            _wait_until_running_is_announced(monitor, timeout=5.0)
+
+    monitor._run = run_with_the_first_ready_held
+    try:
+        assert nidaq_app.load_configuration() is True
+        assert held.wait(10.0), "the stream did not start by itself"
+        seen = _nidaq_statuses_published(nidaq_app, let_the_idle_ready_in)
+
+        assert nidaq_app.capture_start() is True
+
+        begun = seen.index(
+            (SubsystemState.STARTING, "starting synchronized NI-DAQ tasks"))
+        during = seen[begun:]
+        assert during[-1] == (
+            SubsystemState.READY, "synchronized NI-DAQ tasks running"), during
+        assert SubsystemState.READY not in [s for s, _ in during[:-1]], during
+        assert during[-2][0] is SubsystemState.STARTING, during
+    finally:
+        release.set()
+        del monitor._run
+        nidaq_app.capture_stop()
 
 
 def test_a_run_whose_stream_never_becomes_ready_reads_failed(nidaq_app, monkeypatch):

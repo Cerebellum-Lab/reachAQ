@@ -6392,11 +6392,33 @@ class AppModel(ObservableObject):
                 ),
                 generation=generation,
             )
+            self._fail_nidaq_domain_if_stream_lost(generation)
             return False
         self._set_subsystem_status(
             SubsystemId.NIDAQ_STREAM,
             SubsystemState.READY,
             reason="synchronized NI-DAQ tasks running",
+            generation=generation,
+        )
+        return not self._fail_nidaq_domain_if_stream_lost(generation)
+
+    def _fail_nidaq_domain_if_stream_lost(self, generation: int) -> bool:
+        """Write FAILED if the stream failed while its verdict was written.
+
+        The verdict follows a check that the stream runs. A worker that died
+        after that check was written FAILED at the same generation, and the
+        verdict then replaced it: a required subsystem read ready on a dead
+        stream. Checked after the write, a failure either came first and is
+        seen here, or comes later and stands.
+        """
+        monitor = self._nidaq_signal_monitor
+        error = monitor.error_message
+        if not error and monitor.is_running:
+            return False
+        self._set_subsystem_status(
+            SubsystemId.NIDAQ_STREAM,
+            SubsystemState.FAILED,
+            error=error or "NI-DAQ stream stopped as System Mode started it",
             generation=generation,
         )
         return True
@@ -8207,15 +8229,26 @@ class AppModel(ObservableObject):
         if name == monitor.IS_STARTING and value:
             # A start during _start_nidaq_domain is that attempt, not a new
             # one; the domain writes its READY, BLOCKED or FAILED itself.
+            # It says "starting" again, over whatever an Idle stream said
+            # since the domain began.
             self._nidaq_stream_started_by_domain = self._nidaq_domain_start_active
-            if not self._nidaq_stream_started_by_domain:
+            if self._nidaq_stream_started_by_domain:
+                self._set_subsystem_status(
+                    SubsystemId.NIDAQ_STREAM,
+                    SubsystemState.STARTING,
+                    reason="starting synchronized NI-DAQ tasks",
+                )
+            else:
                 self._begin_subsystem_start(SubsystemId.NIDAQ_STREAM)
         elif name == monitor.IS_RUNNING:
             if value:
-                # Decided by the start, not by whether the domain is still
-                # running: the monitor marks itself running before it tells
-                # anyone, so this can arrive after the domain's verdict.
-                if not self._nidaq_stream_started_by_domain:
+                # Not while the domain runs: an Idle start that turns ready
+                # then is about to be replaced, and its READY stood through
+                # the fresh start. Nor for the domain's own start, whose
+                # READY can arrive after the verdict: the monitor settles its
+                # flags before telling anyone, and the domain polls them.
+                if not (self._nidaq_stream_started_by_domain
+                        or self._nidaq_domain_start_active):
                     self._set_subsystem_status(
                         SubsystemId.NIDAQ_STREAM,
                         SubsystemState.READY,

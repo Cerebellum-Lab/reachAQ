@@ -641,8 +641,18 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
                         if process is not self._process:
                             break
                         self._set_error("")
+                        # Both flags settle before anyone is told. Clearing
+                        # and announcing "starting" before setting "running"
+                        # left a moment with neither set, and a Run polling
+                        # them without the lock (AppModel.
+                        # _finish_nidaq_domain_start) failed and stopped a
+                        # worker that had just come up. Announcing "running"
+                        # first instead showed both set to the Hardware
+                        # panel, which reads is_starting when told.
+                        was_running, self._is_running = self._is_running, True
                         self._set_starting(False)
-                        self._set_running(True)
+                        self._on_property_changed(
+                            self.IS_RUNNING, True, was_running)
                         self._set_status("NI-DAQ signal stream running")
                     log_hardware_initialization(
                         logger,
