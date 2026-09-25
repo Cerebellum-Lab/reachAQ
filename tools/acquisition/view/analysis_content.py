@@ -375,7 +375,8 @@ class AnalysisContent(ContentWidget):
         footer_layout = QHBoxLayout(footer)
         footer_layout.setContentsMargins(4, 0, 0, 0)
         footer_layout.setSpacing(8)
-        self._start_stop_button = QPushButton("Start Stream")
+        # No Start/Stop: the stream runs by itself whenever NI-DAQ is enabled
+        # (see AppModel._request_nidaq_stream), and its state is in the header.
         self._clear_button = QPushButton("Clear")
         self._live_button = QPushButton("Live")
         self._live_button.setToolTip(
@@ -383,7 +384,6 @@ class AnalysisContent(ContentWidget):
         )
         self._status_label = QLabel("NI-DAQ signal stream disabled")
         self._status_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        footer_layout.addWidget(self._start_stop_button)
         footer_layout.addWidget(self._clear_button)
         footer_layout.addWidget(self._live_button)
         footer_layout.addWidget(self._status_label)
@@ -398,7 +398,6 @@ class AnalysisContent(ContentWidget):
         self._nidaq_signal_monitor.property_changed += self._model_property_changed
         app_model.configuration_loaded_event += self._configuration_loaded
         app_model.laser.property_changed += self._laser_property_changed
-        self._start_stop_button.clicked.connect(self._toggle_stream)
         self._clear_button.clicked.connect(self._clear_plot)
         self._live_button.clicked.connect(self._go_live)
         self._plot_timer = QTimer(self)
@@ -458,15 +457,6 @@ class AnalysisContent(ContentWidget):
         pixel_width = self._rolling_plot.physical_pixel_width()
         if self._rolling_plot.set_pixel_width(pixel_width):
             self._plot_process.set_pixel_width(pixel_width)
-
-    def _toggle_stream(self) -> None:
-        if not self._nidaq_signal_monitor.hardware_enabled:
-            return
-        if self._nidaq_signal_monitor.is_running:
-            self._nidaq_signal_monitor.stop()
-        else:
-            self._nidaq_signal_monitor.start()
-        self._refresh_from_model()
 
     def _flush_pending_blocks(self) -> None:
         self._flush_pressure()
@@ -553,26 +543,12 @@ class AnalysisContent(ContentWidget):
             pixel_width = self._rolling_plot.physical_pixel_width()
             self._rolling_plot.set_pixel_width(pixel_width)
             self._plot_process.configure(plot_configuration, pixel_width)
-        self._stream_state_label.setText("running" if model.is_running else "stopped")
-        if not model.hardware_enabled:
-            self._stream_state_label.setText("disabled")
-        elif not configuration.is_enabled:
-            self._stream_state_label.setText("disabled")
-        elif model.is_starting:
-            self._stream_state_label.setText("starting")
+        self._stream_state_label.setText(model.stream_state)
+        # The details stay out of the footer, which is one line; they are in
+        # the Hardware panel, the log, and here on hover.
+        self._stream_state_label.setToolTip(model.error_message or model.status_message)
         self._sample_rate_label.setText(f"{configuration.sample_rate_hz:g} Hz")
         self._channel_count_label.setText(str(len(display_configuration.channels)))
-        if model.is_starting:
-            self._start_stop_button.setText("Starting...")
-        else:
-            self._start_stop_button.setText("Stop Stream" if model.is_running else "Start Stream")
-        can_stream = (
-            model.hardware_enabled
-            and configuration.is_enabled
-            and bool(display_configuration.channels)
-            and not model.is_starting
-        )
-        self._start_stop_button.setEnabled(can_stream)
         self._clear_button.setEnabled(model.hardware_enabled and bool(display_configuration.channels))
         self._live_button.setEnabled(bool(display_configuration.channels))
         if not model.hardware_enabled:
