@@ -824,23 +824,27 @@ def test_laser_trace_auto_resumes_and_displays_entire_calibration_ramp(qapp):
         command_x, command_y = tab._trace_data["command"]
         diode_x, diode_y = tab._trace_data["diode"]
         assert tab._trace_streaming
+        # The Output page only said the stream had moved to the Pulse page.
         assert tuple(
             tab._mode_tabs.tabText(index)
             for index in range(tab._mode_tabs.count())
-        ) == ("Pulse", "Calibration", "Output")
+        ) == ("Pulse", "Calibration")
         assert tab._trace_signal_checkboxes["diode"].property("signalColor") == "#128a43"
         assert tab._trace_signal_checkboxes["copy"].property("signalColor") == "#d66b00"
-        assert tuple(
-            tab._trace_tabs.tabText(index)
-            for index in range(tab._trace_tabs.count())
-        ) == ("Stream", "Signals")
-        assert tab._trace_stream_page.isAncestorOf(tab._trace_plot)
-        assert tab._trace_signals_page.isAncestorOf(tab._trace_signal_checkboxes["diode"])
-        assert tab._trace_signals_page.isAncestorOf(tab._trace_signal_checkboxes["copy"])
+        # The signal choices fold away under the graph instead of hiding it
+        # behind a Signals tab.
+        assert not hasattr(tab, "_trace_tabs")
+        output_stream = tab.sections["output_stream"].content
+        signals = tab.sections["signals"].content
+        assert output_stream.isAncestorOf(tab._trace_plot)
+        assert not signals.isAncestorOf(tab._trace_plot)
+        assert signals.isAncestorOf(tab._trace_command_checkbox)
+        assert signals.isAncestorOf(tab._trace_signal_checkboxes["diode"])
+        assert signals.isAncestorOf(tab._trace_signal_checkboxes["copy"])
         assert tab._trace_signal_checkboxes["diode"].text().endswith("Diode feedback")
         assert "Dev1/ai0" not in tab._trace_signal_checkboxes["diode"].text()
         assert tab._trace_signal_checkboxes["diode"].toolTip().startswith("Dev1/ai0\n")
-        assert tab._trace_legend._columns == 1
+        assert tab._trace_legend._columns == 2
         assert tab._trace_plot.minimumSize().isEmpty()
         assert tab._trace_plot.sizePolicy().verticalPolicy() == QSizePolicy.Policy.Ignored
         assert tab.minimumSizeHint().width() < 430
