@@ -234,19 +234,6 @@ def test_a_paused_monitor_says_why_and_forgets_it_on_resume():
     assert monitor.status_message == "NI-DAQ signal stream stopped"
 
 
-def test_a_display_change_is_not_a_change_to_the_running_stream():
-    monitor = NidaqSignalMonitorModel()
-    monitor._configuration = _configuration("cam_frames", "tone1")
-    monitor._started_signature = monitor._acquisition_signature()
-    monitor._is_running = True
-
-    monitor.set_display_channels(("tone1",))
-    assert monitor.running_matches_configuration
-
-    monitor._configuration = _configuration("cam_frames", "tone1", "tone2")
-    assert not monitor.running_matches_configuration
-
-
 def test_the_sample_ring_is_available_while_a_start_holds_the_lock():
     # start() holds the monitor lock through discovery and the preflight.
     # The Qt timers read sample_ring sixty times a second, and waiting on

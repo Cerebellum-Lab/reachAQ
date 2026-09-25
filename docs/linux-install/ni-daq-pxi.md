@@ -163,7 +163,9 @@ included in the recording task and saved to `streams/nidaq.h5`.
 The input stream has no Start button. With NI-DAQ enabled and at least one
 input mapped, reachAQ starts it by itself while idle - when the configuration
 loads, after a hardware refresh, after **Edit DAQ Ports** saves, and when
-acquisition stops - and System Mode uses the stream already running. A start
+acquisition stops. Starting System Mode restarts it, so recorded timing starts
+from a fresh task-start anchor rather than carrying the Idle stream's clock
+drift into a session. A start
 that fails is shown in Hardware Status and the log and is not retried by
 itself; a hardware refresh tries again. Stream task
 creation happens in an isolated child
