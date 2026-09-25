@@ -13,10 +13,12 @@ from typing import Mapping, Optional, Tuple
 
 from tools.acquisition.model.trial_protocol_schedule import (
     DEFAULT_TRIAL_COUNT,
+    LaserTriggerRoute,
     ProtocolPatch,
     ProtocolScope,
     TrialOverride,
     TrialProtocolDocument,
+    TrialProtocolRow,
     normalize_identifier,
 )
 
@@ -102,7 +104,7 @@ class TrialProtocolSet:
                     stored, SET_SCHEMA_VERSION
                 )
             )
-        return cls(
+        protocol_set = cls(
             schema_version=SET_SCHEMA_VERSION,
             set_id=record["set_id"],
             name=record["name"],
@@ -118,6 +120,38 @@ class TrialProtocolSet:
                 TrialOverride.create(item["trial_id"], item.get("values", {}))
                 for item in record.get("trial_overrides", ())
             ),
+        )
+        # The set schema did not change when protocol schema 3 gave a laser
+        # row its laser, and set patches load unvalidated, so a set saved
+        # before then loaded and failed only when compiled, with a message
+        # that named neither the set nor the missing laser. Refused here as
+        # TrialProtocolDocument.from_record refuses such a protocol.
+        laser_trials = protocol_set._trials_with_a_route_and_no_laser()
+        if laser_trials:
+            raise ValueError(
+                f"Set {record.get('name', record.get('set_id'))!r} was saved "
+                f"before a laser row named its laser; set the laser on trial "
+                f"{', '.join(map(str, laser_trials))} in a new set"
+            )
+        return protocol_set
+
+    def _trials_with_a_route_and_no_laser(self) -> Tuple[int, ...]:
+        # Resolved per trial, not per patch: a bulk edit stores only the
+        # fields it changed, so a route can come from an override while the
+        # laser comes from the defaults.
+        rows = {
+            trial_id: self.defaults.apply(TrialProtocolRow(trial_id=trial_id))
+            for trial_id in range(1, int(self.trial_count) + 1)
+        }
+        for scope in self.bulk_overrides:
+            for trial_id in scope.trial_ids:
+                rows[trial_id] = scope.patch.apply(rows[trial_id])
+        for override in self.trial_overrides:
+            rows[override.trial_id] = override.patch.apply(rows[override.trial_id])
+        return tuple(
+            trial_id for trial_id, row in sorted(rows.items())
+            if row.laser_trigger_route is not LaserTriggerRoute.NONE
+            and not row.laser_channel_id
         )
 
 
