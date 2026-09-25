@@ -689,6 +689,10 @@ class AnalysisContent(ContentWidget):
             color = selected_colors.get(physical_channel, stream_signal_color(color_index))
             is_mapped = physical_channel in mapped_channels if physical_channel else False
             is_selected = channel.name in selected_channel_names if channel is not None else False
+            # What the stream acquires, not what nidaqPorts names: with a
+            # refused plan it acquires nothing, and a tick on a pin it does
+            # not acquire is refused.
+            is_acquired = physical_channel in configured_by_physical
             channel_text = physical_channel or "not configured"
             checkbox = QCheckBox(f"{label} — {channel_text}")
             color_code_checkbox(checkbox, color)
@@ -697,7 +701,7 @@ class AnalysisContent(ContentWidget):
             # hides a curve the plot process is already buffering.
             checkbox.setEnabled(
                 self._nidaq_signal_monitor.hardware_enabled
-                and (is_mapped or is_selected)
+                and (is_selected or (is_mapped and is_acquired))
             )
             if not physical_channel:
                 checkbox.setToolTip("Assign this signal in Edit → Edit DAQ Ports first.")
@@ -707,6 +711,8 @@ class AnalysisContent(ContentWidget):
                 )
             elif not self._nidaq_signal_monitor.hardware_enabled:
                 checkbox.setToolTip("NI-DAQ hardware is disabled in the system configuration.")
+            elif not is_acquired:
+                checkbox.setToolTip(self._not_acquired_reason())
             else:
                 checkbox.setToolTip(
                     "Show or hide this signal on the graph. It is recorded either way."
@@ -740,7 +746,37 @@ class AnalysisContent(ContentWidget):
             selected_names = [
                 name for name in selected_names if name != candidate.name
             ]
-        self._app_model.update_nidaq_signal_stream_channels(selected_names)
+        try:
+            self._app_model.update_nidaq_signal_stream_channels(selected_names)
+        except Exception as exc:
+            # Refused, as with a refused NI-DAQ plan: the box goes back to
+            # what is saved rather than claim a change, and says why. Raised
+            # from this slot, it reached sys.excepthook and the "Internal
+            # software error" dialog.
+            message = str(exc) or exc.__class__.__name__
+            logger.warning("NI-DAQ plot selection refused: %s", message)
+            self._status_label.setText(message)
+            checkbox = self._signal_checkboxes.get(candidate_key)
+            if checkbox is not None:
+                checkbox.blockSignals(True)
+                checkbox.setChecked(
+                    candidate.name in self._nidaq_signal_monitor.configuration.display_channels)
+                checkbox.blockSignals(False)
+
+    def _not_acquired_reason(self) -> str:
+        # On the class: a model's missing attribute raises EventsException,
+        # which getattr's default does not catch, and stand-ins lack this one.
+        refusal = (
+            self._app_model.nidaq_plan_error
+            if hasattr(type(self._app_model), "nidaq_plan_error")
+            else ""
+        )
+        if refusal:
+            return (
+                "Not acquired: the NI-DAQ plan is refused. Fix it in Edit → "
+                f"Edit DAQ Ports: {refusal}"
+            )
+        return "Not acquired by the NI-DAQ stream."
 
     def _plot_configuration(self) -> NidaqSignalStreamConfiguration:
         """Every signal this card can plot, whether or not it is ticked.

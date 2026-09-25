@@ -607,6 +607,17 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
             elif self._status_message.startswith(_PAUSED_STATUS):
                 self._set_status("NI-DAQ signal stream stopped")
 
+    def show_blocked(self, reason: str) -> None:
+        """Say why a stream with nothing to acquire is held back.
+
+        The application holds it when its NI-DAQ plan is refused. The stream
+        then has no channels and would say only that it is disabled, as one
+        switched off does. The next load_configuration says otherwise.
+        """
+        with self._lock:
+            if self._process is None and reason:
+                self._set_status(reason)
+
     def _run(self, process, message_queue, stop_event, started: float) -> None:
         worker_error = ""
         ready = False

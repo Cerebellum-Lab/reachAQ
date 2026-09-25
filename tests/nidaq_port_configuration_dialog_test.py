@@ -656,8 +656,6 @@ def test_clearing_a_port_role_stops_it_being_recorded_for_good(
 def test_a_bad_ni_line_is_fixed_in_the_dialog_and_the_stream_starts(
     qapp, nidaq_app, system_config, trainer_config_dir,
 ):
-    import dataclasses
-
     from nidaq_stream_lifecycle_test import _nidaq_state, _with_bad_nidaq_line
     from tools.acquisition.model.subsystem_status import SubsystemState
 
@@ -688,10 +686,8 @@ def test_a_bad_ni_line_is_fixed_in_the_dialog_and_the_stream_starts(
     assert _ok_enabled(dialog)
     dialog.accept()
     assert dialog.result() == QDialog.DialogCode.Accepted
-    nidaq_app.update_daq_port_configuration(
-        dataclasses.replace(nidaq_app.nidaq_ports, tone1=dialog.nidaq_ports.tone1),
-        dialog.laser_configuration,
-    )
+    # Whole, as main_window saves it.
+    nidaq_app.update_daq_port_configuration(dialog.nidaq_ports, dialog.laser_configuration)
     monitor = _settle(nidaq_app)
 
     assert monitor.is_running
@@ -700,3 +696,39 @@ def test_a_bad_ni_line_is_fixed_in_the_dialog_and_the_stream_starts(
     assert {"tone1", "cam_frames", "stim_readback"} <= names
     saved = nidaq_app.get_config_from_location(nidaq_app.get_config_location())
     assert saved.nidaq_ports.tone1 == "Dev1/port0/line3"
+
+
+def test_analysis_offers_no_box_for_an_input_a_bad_ni_line_holds_back(
+    qapp, nidaq_app, system_config, trainer_config_dir, monkeypatch,
+):
+    # Every port-role box was enabled by its pin in nidaqPorts, not by what
+    # the stream acquires, which is nothing while the plan is refused. A tick
+    # raised from update_nidaq_signal_stream_channels, past a slot with no
+    # try, into sys.excepthook: the "Internal software error" dialog.
+    import sys
+
+    from nidaq_stream_lifecycle_test import _with_bad_nidaq_line
+    from tools.acquisition.view.analysis_content import AnalysisContent
+
+    _with_bad_nidaq_line(system_config, trainer_config_dir, tone1="Dev1/port1/line0")
+    assert nidaq_app.load_configuration() is True
+    _settle(nidaq_app, running=False, timeout=2.0)
+    errors = []
+    monkeypatch.setattr(sys, "excepthook", lambda *error: errors.append(error))
+
+    content = AnalysisContent(nidaq_app)
+    try:
+        cam_frames = content._signal_checkboxes["cam_frames"]
+        assert not cam_frames.isEnabled()
+        assert "nidaqPorts.tone1" in cam_frames.toolTip()
+        try:
+            cam_frames.setChecked(True)
+        except Exception as error:  # a slot's error, if it reaches here
+            errors.append(error)
+        qapp.processEvents()
+
+        assert errors == []
+        assert not cam_frames.isChecked()
+    finally:
+        content.on_close()
+        content.deleteLater()
