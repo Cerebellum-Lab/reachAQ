@@ -201,6 +201,13 @@ Open the **Laser Control** tab. There is one sub-tab per configured channel,
 *Laser 1*, *Laser 2* and so on, each with **Pulse**, **Calibration** and
 **Output** pages.
 
+The **Output Stream** graph on the Pulse page needs nothing started: it plots
+whenever the NI-DAQ input stream runs, and that stream starts by itself, in
+Idle as well as in System Mode. Its status line says whether it is running.
+Under its **Signals** tab, **Command output**, **Diode feedback**, **Command
+copy** and **Board trigger readback** each show or hide their trace at once,
+at any time.
+
 On the **Pulse** page, **Profile:** picks what fires on this laser: *(none)*,
 *(builder draft)* or any saved profile, unfiltered — a profile made with one
 laser in mind fires just as well on another. A laser tab starts on *(none)*,

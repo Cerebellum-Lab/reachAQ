@@ -153,9 +153,17 @@ conda run -n reachaq python tools/hardware/validate_laser_hardware.py \
 
 Main Analysis camera/barcode/tone selections and the diode/command-copy
 selections owned by each Laser Control tab are saved immediately under
-`nidaqStream.displayChannels`. Plot visibility does not change acquisition:
+`nidaqStream.displayChannels`, and can be changed while the stream runs. Plot
+visibility does not change acquisition:
 every mapped camera-frame, barcode, tone, laser-feedback, and custom input is
-included in the recording task and saved to `streams/nidaq.h5`. Stream task
+included in the recording task and saved to `streams/nidaq.h5`.
+
+The input stream has no Start button. With NI-DAQ enabled and at least one
+input mapped, reachAQ starts it by itself while idle - when the configuration
+loads, after a hardware refresh, after **Edit DAQ Ports** saves, and when
+acquisition stops - and System Mode uses the stream already running. A start
+that fails is shown in Hardware Status and the log and is not retried by
+itself; a hardware refresh tries again. Stream task
 creation happens in an isolated child
 process because a broken or incompatible NI-DAQmx native runtime can terminate
 the Python interpreter. If the worker exits with `SIGSEGV` or does not become
@@ -193,7 +201,9 @@ input and every clockable digital line (at 2 kHz by default; **Rate** changes
 it) and polls the remaining PFI and static lines for their level. Every line
 is labelled with both its terminal name and the connector printed on the
 breakout block. **Start monitoring** starts the stream; **Rescan hardware**
-repeats discovery.
+repeats discovery. The application's own input stream is paused while this
+window is open, because both would open tasks on the same lines, and starts
+again by itself when the window closes.
 
 The bar along the bottom drives one thing at a time, so you can see which line
 moves:
