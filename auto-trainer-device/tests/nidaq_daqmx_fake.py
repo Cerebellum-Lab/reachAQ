@@ -119,7 +119,14 @@ class FakeTask:
         return [list(values) for _ in self.channels]
 
     def control(self, mode):
+        if self.daq.before_control is not None:
+            self.daq.before_control(self)
         self.daq.controlled.append((self.name, mode))
+        if self.closed:
+            # The fake's model of a call on a task already cleared.
+            raise RuntimeError(f"{self.name} was closed before it was aborted")
+        if self.daq.failing_abort and self.name.endswith(self.daq.failing_abort):
+            raise RuntimeError(f"DAQmx refused to abort {self.name}")
         self.aborted.set()
         if self.daq.abort_releases:
             self.started = False
@@ -169,6 +176,11 @@ class FakeDaqmx:
         #: "connect_terms", "disconnect_terms" or "task_close" - blocks until
         #: hang_released is set, as a call does inside a driver that has hung.
         self.hang = set(hang)
+        #: Called with the task at the start of each control(), before it
+        #: acts: where a test holds an abort to interleave it.
+        self.before_control = None
+        #: A task, by name suffix, whose abort fails while it is still open.
+        self.failing_abort = None
         self.hang_released = threading.Event()
         #: Set as a call starts to hang; hung names each such call, in order.
         self.hanging = threading.Event()
