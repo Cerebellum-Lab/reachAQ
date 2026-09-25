@@ -13,6 +13,7 @@ pixel counts, so a slightly different font on another machine does not fail
 them.
 """
 
+import dataclasses
 import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -34,6 +35,11 @@ from autotrainer.core import (  # noqa: E402
     LaserChannelConfiguration,
     LaserChannelId,
     LaserSystemConfiguration,
+    NidaqPortConfiguration,
+    NidaqSignalStreamConfiguration,
+)
+from tools.acquisition.model.nidaq_channel_plan import (  # noqa: E402
+    build_nidaq_acquisition_configuration,
 )
 from tools.acquisition.model.trial_action import LaserPulseProfile  # noqa: E402
 from tools.acquisition.view.compact_panel import (  # noqa: E402
@@ -196,6 +202,80 @@ def test_the_calibration_page_fits_the_docked_panel(panel, qapp):
     assert page.minimumSizeHint().height() <= page.height()
     assert page.minimumSizeHint().width() <= page.width()
     assert tab._run_ramp_button.isVisible()
+
+
+def _with_readback(lasers, terminal):
+    channels = tuple(
+        dataclasses.replace(channel, trigger_monitor_input=terminal)
+        if channel.channel_id == LaserChannelId.LASER_1 else channel
+        for channel in lasers.channels
+    )
+    return dataclasses.replace(lasers, channels=channels)
+
+
+#: A realistic failure, longer than the line has room for.
+_STREAM_ERROR = (
+    "NI-DAQ worker failed: DAQmx Error -50103: The specified resource is "
+    "reserved. The operation could not be completed as specified."
+)
+
+
+@pytest.mark.parametrize(
+    "state",
+    ["not in the plan", "hardware disabled", "stopped", "failed", "reading", "showing"],
+)
+def test_every_configured_board_trigger_status_fits_the_docked_panel(
+    qapp, app_model, monkeypatch, state,
+):
+    # Only the unconfigured text was measured at the rig font; these run to
+    # about 105-120 characters, and the one after a failure names the error.
+    monkeypatch.setattr(type(app_model), "trial_protocol_state", property(
+        lambda _self: {"laser_profiles": ()}))
+    lasers = _with_readback(_christielab10_lasers(), "PXI1Slot5/ai9")
+    monitor = app_model.nidaq_signal_monitor
+    plan = build_nidaq_acquisition_configuration(
+        NidaqSignalStreamConfiguration(),
+        NidaqPortConfiguration(),
+        _christielab10_lasers() if state == "not in the plan" else lasers,
+    )
+    if state == "showing":
+        plan = dataclasses.replace(plan, display_channels=("laser1_trigger",))
+    monitor._configuration = plan
+    monitor._hardware_enabled = state != "hardware disabled"
+    if state == "failed":
+        monitor._set_error(_STREAM_ERROR)
+    app_model.laser.configure_null(lasers)
+    content = LaserControlContent(app_model)
+    content.resize(PANEL_WIDTH, PANEL_HEIGHT)
+    content.show()
+    try:
+        if state in ("reading", "showing"):
+            monitor._set_running(True)
+        _settle(qapp)
+        _open_every_section(content, qapp)
+        tab = content._channel_tabs[0]
+        scroll = _show_pulse_page(content, tab, qapp)
+
+        text = tab.trigger_status.text()
+        assert "PXI1Slot5/ai9" in text
+        assert {
+            "not in the plan": "acquisition plan",
+            "hardware disabled": "hardware is disabled",
+            "stopped": "it is stopped",
+            "failed": "the stream failed: NI-DAQ worker failed",
+            "reading": "Tick Board trigger readback",
+            "showing": "Showing",
+        }[state] in text
+        assert not tab.trigger_status.is_elided(), text
+        assert scroll.verticalScrollBar().maximum() == 0
+        if state == "failed":
+            assert _STREAM_ERROR in tab.trigger_status.toolTip()
+    finally:
+        monitor._set_running(False)
+        content.on_close()
+        content.close()
+        content.deleteLater()
+        app_model.laser.close()
 
 
 def test_the_pulse_builder_fits_the_docked_panel_with_every_section_open(panel, qapp):

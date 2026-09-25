@@ -139,8 +139,9 @@ analog feedback inputs, hardware-clocked digital inputs, and counters used by
 the acquisition timeline. Laser `diodeInput` and `commandCopyInput` therefore
 belong on the 6221 (or another discovered analog-input device), and so does a
 laser's board-trigger readback, `triggerMonitorInput`: the board STIM line
-wired into an analog input (`aiN`) or a digital input line (`portN/lineN`),
-never a PFI terminal, set as **trigger readback input** on the laser's tab in
+wired into an analog input (`aiN`) or a port0 line (`port0/lineN`) - the 6221
+clocks digital input on port0 only, and port1/port2 are its PFI pins - never
+a PFI terminal, set as **trigger readback input** on the laser's tab in
 **Edit DAQ Ports** and recorded as `laserN_trigger`. Laser analog commands can
 remain on the 6713. Digital and analog inputs may share the 6221 task; a
 future hardware-timed 6713 output task must join the validated multi-device

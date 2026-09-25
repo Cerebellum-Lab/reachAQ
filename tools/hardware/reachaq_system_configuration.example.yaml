@@ -133,7 +133,7 @@ laser: !LaserSystemConfiguration
   #   boardStimLine: 3
   #   boardTriggerPulseUs: 1000
   #   # Optional: the board STIM line wired back into an analog input or a
-  #   # digital input line (not a PFI), acquired and recorded as
+  #   # port0 line (not a PFI, nor port1/port2), acquired and recorded as
   #   # laser1_trigger for the laser tab's Board trigger graph. Edit DAQ
   #   # Ports sets it as "trigger readback input".
   #   triggerMonitorInput: PXI1Slot5/ai9

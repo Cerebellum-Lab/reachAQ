@@ -10,6 +10,12 @@ from autotrainer.core import (
     NidaqSignalChannelConfiguration,
     NidaqSignalStreamConfiguration,
 )
+from autotrainer.core.logging import get_verbose_logger
+
+from tools.acquisition.model.nidaq_monitor_survey import BUFFERED_PORT
+
+
+logger = get_verbose_logger(__name__)
 
 
 _PORT_INPUT_ROLES = (
@@ -20,6 +26,18 @@ _PORT_INPUT_ROLES = (
     ("tone3_r", "tone3_r"),
     ("tone3_l", "tone3_l"),
 )
+
+
+#: The names the plan gives its laser roles.
+_LASER_ROLE_NAME = re.compile(r"^laser\d+_(diode|command_copy|trigger)$")
+
+
+def _is_role_name(name: str) -> bool:
+    """Whether the plan writes this name for a role, rather than an operator."""
+    return (
+        any(name == role for _attribute, role in _PORT_INPUT_ROLES)
+        or bool(_LASER_ROLE_NAME.match(name))
+    )
 
 
 def nidaq_channel_kind(physical_channel: str) -> str:
@@ -34,8 +52,13 @@ def nidaq_channel_kind(physical_channel: str) -> str:
     return "digital" if "port" in lowered or "line" in lowered else "analog"
 
 
-#: One analog input, Dev1/ai3, or one digital line, Dev1/port0/line3.
-_SINGLE_INPUT = re.compile(r"^/?[^/]+/(ai\d+|port\d+/line\d+)$", re.IGNORECASE)
+#: One analog input, Dev1/ai3, or one port0 line, Dev1/port0/line3: what the
+#: stream can sample. It puts every digital input in one clocked task, and an
+#: M Series board clocks port0 only (see nidaq_monitor_survey).
+_STREAMABLE_INPUT = re.compile(
+    rf"^/?[^/]+/(ai\d+|{BUFFERED_PORT}/line\d+)$", re.IGNORECASE)
+#: A digital line on another port: port1 and port2 are the static PFI pins.
+_STATIC_LINE = re.compile(r"^/?[^/]+/port\d+/line\d+$", re.IGNORECASE)
 
 
 def laser_output_lines(
@@ -66,11 +89,18 @@ def trigger_readback_refusal(
 ) -> str:
     """Why this trigger readback input cannot be acquired, or an empty string."""
     subject = f"Laser {int(laser_number)} trigger readback input {terminal!r}"
-    if not _SINGLE_INPUT.match(terminal):
+    if _STATIC_LINE.match(terminal) and not _STREAMABLE_INPUT.match(terminal):
+        # STIM3's /PXI1Slot5/PFI0 is PXI1Slot5/port1/line0 by another name.
         return (
-            f"{subject} must be one analog input (aiN) or one digital input "
-            "line (portN/lineN); a PFI terminal, an output or a counter "
-            "cannot be streamed"
+            f"{subject} is not streamable: port1/port2 lines are PFI pins that "
+            "cannot be sampled with the stream; use an analog input (aiN) or "
+            "a port0 line"
+        )
+    if not _STREAMABLE_INPUT.match(terminal):
+        return (
+            f"{subject} must be one analog input (aiN) or one port0 line "
+            "(port0/lineN); a PFI terminal, an output or a counter cannot be "
+            "streamed"
         )
     if terminal in outputs:
         return f"{subject} is {outputs[terminal]}"
@@ -181,17 +211,23 @@ def build_nidaq_acquisition_configuration(
     # graph. It was never added, so it was neither streamed nor recorded.
     # Claimed here, so a channel already acquired on that input is taken over
     # rather than kept as a custom one; added last, below. It has no scale in
-    # the laser configuration, so a channel it takes over keeps its own.
+    # the laser configuration. It keeps the settings of a custom channel it
+    # takes over, such as christielab10's laser1_trigger_readback, and its
+    # own from an earlier load; another role's entry left on its input, an
+    # old command copy's scale for one, is not its to keep.
     triggers = []
     for channel in lasers:
         physical_channel = channel.trigger_monitor_input
         if not physical_channel:
             continue
+        name = f"laser{int(channel.channel_id)}_trigger"
         role_physical_channels.add(physical_channel)
         previous = configured_by_physical.get(physical_channel)
+        if previous is not None and previous.name != name and _is_role_name(previous.name):
+            previous = None
         triggers.append(
             NidaqSignalChannelConfiguration(
-                name=f"laser{int(channel.channel_id)}_trigger",
+                name=name,
                 physical_channel=physical_channel,
                 kind=nidaq_channel_kind(physical_channel),
                 # Empty picks the kind's default: V, or logic for a line.
@@ -202,7 +238,15 @@ def build_nidaq_acquisition_configuration(
                 maximum=None if previous is None else previous.maximum,
             )
         )
-    role_names = set(mapped) | {trigger.name for trigger in triggers}
+    role_pins = {channel.name: channel.physical_channel for channel in mapped.values()}
+    role_pins.update((trigger.name, trigger.physical_channel) for trigger in triggers)
+    # Every acquired laser claims its trigger name, readback set or not: only
+    # the readback role ever writes it. Claimed only when set, choosing
+    # "(none)" in Edit DAQ Ports left the stored laser1_trigger on its input,
+    # and it came back as a hidden custom input, recorded indefinitely.
+    role_names = set(role_pins) | {
+        f"laser{int(channel.channel_id)}_trigger" for channel in lasers
+    }
 
     # Existing channels not claimed by a named hardware role are explicit
     # custom acquisition inputs and remain enabled. One stored under a role's
@@ -212,15 +256,29 @@ def build_nidaq_acquisition_configuration(
     # the configuration no longer loaded. A role that is not configured
     # claims no name, so such a channel stays a custom input as before.
     for channel in configured_stream.channels:
-        if (
-            channel.physical_channel not in role_physical_channels
-            and channel.name not in role_names
-        ):
-            add(channel)
+        if channel.physical_channel in role_physical_channels:
+            continue
+        if channel.name in role_names:
+            logger.warning(
+                "NI-DAQ plan drops the stored channel %r on %s: the %s role is %s",
+                channel.name,
+                channel.physical_channel,
+                channel.name,
+                (
+                    f"now on {role_pins[channel.name]}"
+                    if channel.name in role_pins
+                    else "not set"
+                ),
+            )
+            continue
+        add(channel)
 
-    # Last, so every channel acquired before keeps its place in the
-    # multiplexed scan, and the fast STIM edge is not converted just before
-    # a diode.
+    # Last, so the readbacks follow every other input in the multiplexed
+    # scan and the fast STIM edge is not converted just before a diode. A
+    # channel already acquired keeps its place when nothing is taken over,
+    # or when what is taken over came last, as christielab10's two
+    # *_trigger_readback channels did; one taken over from the middle moves
+    # the channels after it up by one.
     for trigger in triggers:
         add(trigger)
 

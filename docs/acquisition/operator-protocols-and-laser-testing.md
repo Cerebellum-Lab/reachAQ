@@ -222,20 +222,26 @@ input, on its own axis under the output graph, so the edge that starts a
 waveform lines up with the waveform. To see it:
 
 1. Wire this laser's board STIM line (on christielab10, STIM3 for laser 1 and
-   STIM2 for laser 2) into a spare **analog input** (`aiN`) or **digital input
-   line** (`portN/lineN`) on the input card. Not a PFI terminal: a PFI cannot
-   be streamed, and is refused.
+   STIM2 for laser 2) into a spare **analog input** (`aiN`) or **port0 line**
+   (`port0/lineN`) on the input card. Not a PFI terminal, and not a port1 or
+   port2 line, which are the same PFI pins by another name (STIM3's
+   `/PXI1Slot5/PFI0` is `PXI1Slot5/port1/line0`): the stream samples every
+   digital input in one clocked task, and an M Series board clocks port0 only.
+   Those are refused.
 2. In Idle, open **Edit → Edit DAQ Ports**, pick the laser's tab, and choose
-   that input in **trigger readback input**. It lists the input card's analog
-   inputs and digital input lines that no other role holds; *(none)* turns the
-   readback off. Save.
+   that input in **trigger readback input**. It lists the analog inputs and
+   port0 lines of the device selected as **Channel source** that no other role
+   holds, and no lines at all from a board that cannot clock digital input,
+   such as the PXI-6713. *(none)* turns the readback off: the channel is no
+   longer acquired or recorded. Save.
 3. The input is acquired and recorded as `laserN_trigger`, after every other
-   input, as analog for `aiN` or digital for `portN/lineN`. Tick **Board
+   input, as analog for `aiN` or digital for `port0/lineN`. Tick **Board
    trigger readback** under Signals to plot it.
 
 The status line under the Board trigger graph says what it is doing: that no
-input is set, that it reads the input once the NI-DAQ stream runs, that it is
-reading it and the box is unticked, or that it is showing it. An input that
+input is set, that it reads the input once the NI-DAQ stream runs (or that
+the stream failed, and how), that it is reading it and the box is unticked,
+or that it is showing it. An input that
 another role already uses - this or another laser's diode, command copy or
 shutter, a tone or camera line, or the PMT shutter output - is refused, naming
 both, in the dialog before it closes; the same check refuses such a
