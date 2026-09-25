@@ -337,10 +337,10 @@ def test_saving_daq_ports_restarts_the_stream_with_the_new_plan(nidaq_app):
 
 
 def test_a_daq_ports_save_clashing_with_the_trigger_readback_changes_nothing(nidaq_app):
-    # Edit DAQ Ports has no field for the trigger readback and keeps it as
-    # it was, so it can offer that input to the diode. The plan refuses the
-    # pair; the laser configuration was applied before the plan was built,
-    # so a refused save still changed the lasers.
+    # Edit DAQ Ports refuses the pair itself now, but the application does
+    # not depend on it: the plan refuses it too, and the laser configuration
+    # was applied before the plan was built, so a refused save still changed
+    # the lasers.
     assert nidaq_app.load_configuration() is True
     _settle(nidaq_app)
     laser_before = nidaq_app.laser.configuration

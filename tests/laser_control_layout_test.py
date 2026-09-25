@@ -178,7 +178,8 @@ def test_every_laser_pulse_page_fits_the_docked_panel_with_every_section_open(pa
         assert tab.trigger_plot.height() >= MINIMUM_BOARD_TRIGGER_HEIGHT
         assert tab.trigger_status.isVisible()
         # Its second line holds what to do about it: wire the board line into
-        # an NI input and set it in Edit DAQ Ports. One line cut that off.
+        # an NI input and set it as trigger readback input in Edit DAQ Ports.
+        # One line cut that off.
         assert not tab.trigger_status.is_elided(), tab.trigger_status.text()
         assert all(checkbox.isVisible() for checkbox in tab._trace_signal_checkboxes.values())
         assert tab.stim_test_button.isVisible()

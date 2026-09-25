@@ -84,11 +84,14 @@ _TRACE_SIGNALS_EXPLANATION = (
 # (440 x 860 px on christielab10's 1920x1080 screen) with no scroll bar.
 _TRACE_PLOT_MINIMUM_HEIGHT = 140
 _TRIGGER_PLOT_HEIGHT = 76
-# Edit DAQ Ports has no field for the trigger readback; it is set in the
-# system configuration, and that dialog keeps whatever is there.
+# Short enough for the Board trigger status line's two lines at the docked
+# width; the checkbox tooltip adds which inputs qualify.
 _TRIGGER_INPUT_INSTRUCTION = (
-    "Wire the board STIM line into an NI input and set it as this laser's "
-    "triggerMonitorInput in the system configuration."
+    "Wire the board STIM line into an NI input and set it as trigger readback "
+    "input in Edit DAQ Ports."
+)
+_TRIGGER_INPUT_KINDS = (
+    "Use an analog input or a digital input line, not a PFI terminal."
 )
 
 
@@ -656,7 +659,8 @@ class _LaserChannelTab(QWidget):
             checkbox.setEnabled(acquired is not None and monitor.hardware_enabled)
             channel_tooltip = "" if candidate is None else f"{candidate.physical_channel}\n"
             if candidate is None and key == "trigger":
-                checkbox.setToolTip(_TRIGGER_INPUT_INSTRUCTION)
+                checkbox.setToolTip(
+                    _TRIGGER_INPUT_INSTRUCTION + " " + _TRIGGER_INPUT_KINDS)
             elif candidate is None:
                 checkbox.setToolTip("Assign this input in Edit → Edit DAQ Ports first.")
             elif acquired is None:
@@ -675,6 +679,8 @@ class _LaserChannelTab(QWidget):
                     + "Show or hide this input on this laser's graph. It is recorded either way."
                 )
         self._apply_curve_visibility()
+        # It says whether the readback is shown, so it follows every tick.
+        self.refresh_trigger_status()
 
     @property
     def command_trace_visible(self) -> bool:
@@ -897,25 +903,44 @@ class _LaserChannelTab(QWidget):
         self._start_operation(f"Running laser {self._channel.channel_id.value} pulse train", operation)
 
     def refresh_trigger_status(self) -> None:
-        """Say whether the board trigger can be read back at all."""
+        """What the Board trigger graph reads, and what it takes to see it.
+
+        One text per state. It said "Reading X. Enable it under Signals."
+        with the stream stopped or NI-DAQ disabled, and with the box already
+        ticked, and nothing rewrote it when the stream started or stopped.
+        """
         candidate = self._trace_signal_candidates.get("trigger")
         if candidate is None:
             self.trigger_status.setText(
                 "No trigger readback input is configured. " + _TRIGGER_INPUT_INSTRUCTION
             )
             return
-        if self._acquired_channel("trigger") is None:
+        acquired = self._acquired_channel("trigger")
+        if acquired is None:
             self.trigger_status.setText(
                 "{} is set as this laser's trigger readback but is not in the "
                 "NI-DAQ acquisition plan, so it cannot be shown.".format(
                     candidate.physical_channel)
             )
             return
-        self.trigger_status.setText(
-            "Reading {} as {}. Enable it under Signals.".format(
-                candidate.physical_channel, candidate.kind
+        source = "{} ({}, recorded as {})".format(
+            acquired.physical_channel, acquired.kind, acquired.name)
+        monitor = self._app_model.nidaq_signal_monitor
+        if not monitor.hardware_enabled:
+            text = f"Reads {source}, but NI-DAQ hardware is disabled."
+        elif not monitor.is_running:
+            text = (
+                f"Reads {source} while the NI-DAQ input stream runs; "
+                f"it is {monitor.stream_state}."
             )
-        )
+        elif self._trace_signal_checkboxes["trigger"].isChecked():
+            text = f"Showing {source}."
+        else:
+            text = (
+                f"Reading {source}. Tick Board trigger readback under "
+                "Signals to show it."
+            )
+        self.trigger_status.setText(text)
 
     def refresh_stim_profiles(self) -> None:
         """(none), the builder draft and every saved profile; any fits any laser."""
@@ -1251,10 +1276,6 @@ class LaserControlContent(ContentWidget):
         ):
             for tab in self._channel_tabs:
                 tab.refresh_signal_selections()
-                # A load or a DAQ ports save rebuilds the tabs against the
-                # old plan and loads the new one after; written only at the
-                # rebuild, this said the readback was not acquired.
-                tab.refresh_trigger_status()
         if property_name in (
             NidaqSignalMonitorModel.CONFIGURATION,
             NidaqSignalMonitorModel.HARDWARE_ENABLED,
@@ -1265,6 +1286,12 @@ class LaserControlContent(ContentWidget):
         ):
             for tab in self._channel_tabs:
                 tab.refresh_stream_status()
+                # A load or a DAQ ports save rebuilds the tabs against the
+                # old plan and loads the new one after, and the readback's
+                # state follows the stream's; written only at the rebuild,
+                # this said the readback was not acquired, or was being read
+                # while the stream was stopped.
+                tab.refresh_trigger_status()
 
     def _flush_laser_plots(self) -> None:
         ring = self._app_model.nidaq_signal_monitor.sample_ring
