@@ -31,6 +31,9 @@ class FakeTask:
         self.started = False
         self.closed = False
         self.aborted = threading.Event()
+        #: Set by a stop() from another thread while the task ran, with
+        #: stop_unblocks; its wait then returns with an error.
+        self.stopped_while_waiting = threading.Event()
         self.ao_channels = SimpleNamespace(add_ao_voltage_chan=self._add)
         self.ai_channels = SimpleNamespace(add_ai_voltage_chan=self._add)
         self.do_channels = SimpleNamespace(add_do_chan=self._add)
@@ -100,10 +103,14 @@ class FakeTask:
                 time.sleep(0.005)
         if self.aborted.is_set():
             raise RuntimeError("DAQmx -88709: the task was aborted")
+        if self.stopped_while_waiting.is_set():
+            raise RuntimeError("the task was stopped while Wait Until Done waited on it")
 
     def _unblocked(self):
-        return self.daq.waits_released.is_set() or (
-            self.daq.abort_unblocks and self.aborted.is_set())
+        return (
+            self.daq.waits_released.is_set()
+            or (self.daq.abort_unblocks and self.aborted.is_set())
+            or self.stopped_while_waiting.is_set())
 
     def read(self, number_of_samples_per_channel, timeout):
         values = [1.0] * number_of_samples_per_channel
@@ -119,6 +126,8 @@ class FakeTask:
             self._release()
 
     def stop(self):
+        if self.started and self.daq.stop_unblocks:
+            self.stopped_while_waiting.set()
         self.started = False
         self._release()
 
@@ -139,6 +148,7 @@ class FakeDaqmx:
         abort_releases=True,
         abort_unblocks=True,
         hold_waits=False,
+        stop_unblocks=False,
     ):
         self.block_wait = block_wait
         self.failing_task = failing_task
@@ -148,6 +158,11 @@ class FakeDaqmx:
         self.abort_releases = abort_releases
         self.abort_unblocks = abort_unblocks
         self.hold_waits = hold_waits
+        #: Whether stopping a running task from another thread returns a
+        #: wait blocked on it, with an error. A laser operation's cancel
+        #: stops its tasks and relies on that; like the abort, it is the
+        #: fake's model of DAQmx, not a measurement.
+        self.stop_unblocks = stop_unblocks
         self.held_wait_limit = 20.0
         #: Set to let every blocked wait return.
         self.waits_released = threading.Event()

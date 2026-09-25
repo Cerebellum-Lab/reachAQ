@@ -911,6 +911,67 @@ def test_a_ramp_that_never_wrote_a_command_is_not_blamed_for_the_output(
         ramp_thread.join(10.0)
 
 
+def _system_mode_with_the_fake_laser(app_model, monkeypatch, **fake_modes):
+    """System Mode running with the NI-DAQ laser on the DAQmx stand-in."""
+    from autotrainer.device import nidaq_laser
+
+    fake = _daqmx_fake()
+    daq = fake.FakeDaqmx(**fake_modes)
+    monkeypatch.setattr(nidaq_laser, "_load_nidaqmx", lambda: daq)
+    assert app_model.load_configuration() is True
+    app_model.laser.set_configuration_offline(fake.rig_lasers())
+    assert app_model.capture_start() is True
+    assert app_model.laser.is_connected
+    return daq
+
+
+def _wait_for_the_pulse(daq, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    while not any(task.name == "laser_sync_pulse_ao" and task.started
+                  for task in daq.tasks):
+        assert time.monotonic() < deadline, "the pulse did not start"
+        time.sleep(0.01)
+
+
+def test_stop_mid_pulse_cancels_the_pulse_and_resets_the_laser(
+    app_model, monkeypatch, caplog,
+):
+    # Run Pulse waits for its train, and ran with no operation the laser
+    # controller could cancel. System Mode's Stop closed the controller under
+    # it: the command reset met the train's task at -50103, and the train ran
+    # on to its end with the shutter left to it.
+    from autotrainer.core import LaserChannelId
+    from autotrainer.device import LaserPulseTrain
+
+    daq = _system_mode_with_the_fake_laser(
+        app_model, monkeypatch, block_wait=True, hold_waits=True, stop_unblocks=True)
+    try:
+        pulse_thread, pulse_outcome = _in_thread(
+            app_model.laser.run_pulse_train,
+            LaserPulseTrain(channel_id=LaserChannelId.LASER_1,
+                            amplitude_volts=1.0, duration_ms=1.0))
+        _wait_for_the_pulse(daq)
+
+        with caplog.at_level("ERROR"):
+            stop_thread, stop_outcome = _in_thread(app_model.capture_stop)
+            stop_thread.join(20.0)
+
+        assert not stop_thread.is_alive()
+        assert stop_outcome == [None]
+        pulse_thread.join(5.0)
+        error, = pulse_outcome
+        assert "cancelled" in str(error) and "-50103" not in str(error)
+        assert daq.writes_to("PXI1Slot4/ao0", task_suffix="manual_ao",
+                             thread=stop_thread) == [0.0]
+        assert daq.task("laser_1_shutter").writes[-1] is False
+        assert not any("-50103" in record.getMessage()
+                       or "Failed to close laser controller" in record.getMessage()
+                       for record in caplog.records)
+    finally:
+        daq.waits_released.set()
+        app_model.capture_stop()
+
+
 def test_acquisition_owns_configured_signal_stream_lifecycle(app_model, monkeypatch):
     assert app_model.load_configuration() is True
     monitor = app_model.nidaq_signal_monitor

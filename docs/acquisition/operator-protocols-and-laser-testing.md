@@ -277,6 +277,12 @@ edge, so use *external* only when an outside trigger is wired in. If no edge
 arrives, the pulse fails after the train length plus five seconds with *Wait
 Until Done did not indicate that the task was done*.
 
+Stopping System Mode, or closing reachAQ, while a Run Pulse train is still
+running cancels the train: the controller waits up to five seconds for it to
+stop, then puts the command back to its minimum and closes the shutters. The
+status line then reads *"Laser operation failed: Laser operation ... was
+cancelled: the laser controller was closed while it ran"*.
+
 Picking a profile in **Profile:** chooses what Run Pulse and Test stim fire on
 this laser; this page has no waveform controls, and nothing is copied into it.
 Picking *(builder draft)* fires whatever is on the Pulse Builder at the moment
