@@ -1077,9 +1077,13 @@ class NidaqLaserController:
         if released is None or released.is_set():
             return []
         if not released.wait(_CALIBRATION_RELEASE_TIMEOUT_S):
+            # Not "resetting the laser": if the ramp's output task still holds
+            # ao0, the reset below is refused (-50103) and close() raises.
             logger.error(
-                "A NI-DAQ laser calibration ramp still held its tasks %.1f s "
-                "after close() aborted it; resetting the laser without it",
+                "A NI-DAQ laser calibration ramp had not ended %.1f s after "
+                "close() aborted it; close() goes on without it, and its "
+                "command reset is refused if the ramp's tasks still hold the "
+                "output",
                 _CALIBRATION_RELEASE_TIMEOUT_S,
             )
         # Held high for the whole ramp when it was asked for; nothing else

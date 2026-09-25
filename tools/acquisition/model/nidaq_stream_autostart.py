@@ -45,10 +45,15 @@ class NidaqStreamAutoStart:
         *,
         may_start: Callable[[], bool],
         background: bool = True,
+        on_released: Optional[Callable[[], None]] = None,
     ):
         self._monitor = monitor
         self._may_start = may_start
         self._background = background
+        #: Called once the last holder lets go, before a start is requested:
+        #: releasing a hold says only "stopped", which may not be the whole
+        #: story, such as a stream held back by a refused NI-DAQ plan.
+        self._on_released = on_released
         # Two locks, so a request from the Qt thread never waits on a start
         # in progress. The state lock is only ever held for a few lines.
         self._state_lock = threading.Lock()
@@ -102,6 +107,11 @@ class NidaqStreamAutoStart:
             self._monitor.show_paused(remaining[-1])
             return
         self._monitor.show_paused("")
+        if self._on_released is not None:
+            try:
+                self._on_released()
+            except Exception:
+                logger.exception("NI-DAQ input stream release handler failed")
         self.request()
 
     def wait(self, timeout: Optional[float] = None) -> bool:
