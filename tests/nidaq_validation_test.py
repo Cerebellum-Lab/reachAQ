@@ -243,3 +243,35 @@ def test_an_unidentified_chassis_is_noted_without_being_an_error():
 
     assert "PXI1Slot5" in note and "explicit route" in note
     assert chassis_identification_note([_device("PXI1Slot5", chassis=1)]) == ""
+
+
+def _digital_device(name, *, digital_input_max_rate):
+    device = _device(name, analog_inputs=())
+    device.digital_inputs = (f"{name}/port0/line0", f"{name}/port0/line1")
+    device.digital_input_max_rate = digital_input_max_rate
+    return device
+
+
+def test_a_digital_stream_line_on_a_board_that_cannot_clock_it_is_refused():
+    # A PXI-6713 port0 line passed every check here and was caught only when
+    # the stream started, as -200452, naming neither the line nor the board.
+    # Discovery says it: the 6713 reports no digital-input rate, the 6221
+    # 1 MHz (christielab10, 2026-09-25).
+    devices = [
+        _digital_device("PXI1Slot4", digital_input_max_rate=None),
+        _digital_device("PXI1Slot5", digital_input_max_rate=1_000_000.0),
+    ]
+    stream = _stream([
+        _channel("tone1", "PXI1Slot4/port0/line0", kind="digital"),
+        _channel("tone2", "PXI1Slot5/port0/line1", kind="digital"),
+    ])
+
+    issues = validate_nidaq_configuration(devices, stream=stream)
+
+    issue, = issues
+    assert issue.subject == "stream channel 'tone1'"
+    assert issue.value == "PXI1Slot4/port0/line0"
+    assert "PXI1Slot4, which cannot clock digital input" in issue.problem
+    with pytest.raises(NidaqConfigurationInvalid,
+                       match="PXI1Slot4, which cannot clock digital input"):
+        require_valid_nidaq_configuration(devices, stream=stream)

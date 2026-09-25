@@ -700,3 +700,189 @@ def test_every_port_role_claims_its_name_when_cleared(role):
         stored, NidaqPortConfiguration(), LaserSystemConfiguration())
 
     assert result.channels == ()
+
+
+# ------------------------------------------------------- cleared laser tabs
+
+
+def _christielab10_laser1_only():
+    lasers = _christielab10_lasers()
+    return dataclasses.replace(lasers, channels=(lasers.get_channel(1),))
+
+
+def test_a_laser_cleared_from_its_tab_drops_its_stored_channels(caplog):
+    # Clearing a whole laser tab in Edit DAQ Ports takes that laser out of
+    # laser.channels. Its names were claimed only for the lasers configured,
+    # so christielab10's laser2_diode on ai4 and laser2_command_copy on ai5
+    # stayed in the scan: recorded, hidden, and shown nowhere.
+    stored = _christielab10_stream()
+
+    with caplog.at_level("WARNING"):
+        result = build_nidaq_acquisition_configuration(
+            stored, CHRISTIELAB10_PORTS, _christielab10_laser1_only())
+
+    assert tuple(channel.name for channel in result.channels) == (
+        "cam_frames", "barcode", "tone1", "tone2",
+        "laser1_diode", "laser1_command_copy",
+        "laser1_trigger_readback", "laser2_trigger_readback",
+    )
+    assert {"PXI1Slot5/ai4", "PXI1Slot5/ai5"}.isdisjoint(
+        channel.physical_channel for channel in result.channels)
+    warnings = sorted(record.getMessage() for record in caplog.records
+                      if "drops the stored channel" in record.getMessage())
+    assert len(warnings) == 2
+    assert "'laser2_command_copy' on PXI1Slot5/ai5" in warnings[0]
+    assert "'laser2_diode' on PXI1Slot5/ai4" in warnings[1]
+    assert all("not set" in warning for warning in warnings)
+
+
+@pytest.mark.parametrize(
+    "name", ["laser2_diode", "laser3_command_copy", "laser4_trigger"])
+def test_every_laser_claims_its_names_while_the_backend_is_enabled(name):
+    stored = _stream_of(NidaqSignalChannelConfiguration(name, "InputCard/ai7"))
+
+    result = build_nidaq_acquisition_configuration(
+        stored, NidaqPortConfiguration(), _laser_with())
+
+    assert name not in {channel.name for channel in result.channels}
+    assert "InputCard/ai7" not in {
+        channel.physical_channel for channel in result.channels}
+
+
+# ------------------------------------------------ christielab10, from YAML
+
+
+#: christielab10's nidaqPorts and nidaqStream blocks as the file stores them,
+#: camelCase, transcribed from the fixtures above (as of 2026-09-24).
+_CHRISTIELAB10_YAML = """
+!SystemConfiguration
+version: {version}
+nidaqPorts: !NidaqPortConfiguration
+  deviceName: PXI1Slot5
+  tone1: PXI1Slot5/port0/line0
+  tone2: PXI1Slot5/port0/line1
+  tone3R: null
+  tone3L: null
+  camFrames: PXI1Slot5/port0/line2
+  barcode: PXI1Slot5/port0/line3
+nidaqStream: !NidaqSignalStreamConfiguration
+  isEnabled: true
+  sampleRateHz: 10000.0
+  readChunkSize: 500
+  channels:
+  - !NidaqSignalChannelConfiguration
+    name: cam_frames
+    physicalChannel: PXI1Slot5/port0/line2
+    kind: digital
+    unit: logic
+  - !NidaqSignalChannelConfiguration
+    name: barcode
+    physicalChannel: PXI1Slot5/port0/line3
+    kind: digital
+    unit: logic
+  - !NidaqSignalChannelConfiguration
+    name: tone1
+    physicalChannel: PXI1Slot5/port0/line0
+    kind: digital
+    unit: logic
+  - !NidaqSignalChannelConfiguration
+    name: tone2
+    physicalChannel: PXI1Slot5/port0/line1
+    kind: digital
+    unit: logic
+  - !NidaqSignalChannelConfiguration
+    name: laser1_diode
+    physicalChannel: PXI1Slot5/ai8
+    kind: analog
+    unit: V
+  - !NidaqSignalChannelConfiguration
+    name: laser1_command_copy
+    physicalChannel: PXI1Slot5/ai3
+    kind: analog
+    unit: V
+  - !NidaqSignalChannelConfiguration
+    name: laser2_diode
+    physicalChannel: PXI1Slot5/ai4
+    kind: analog
+    unit: V
+  - !NidaqSignalChannelConfiguration
+    name: laser2_command_copy
+    physicalChannel: PXI1Slot5/ai5
+    kind: analog
+    unit: V
+  - !NidaqSignalChannelConfiguration
+    name: laser1_trigger_readback
+    physicalChannel: PXI1Slot5/ai9
+    kind: analog
+    unit: V
+  - !NidaqSignalChannelConfiguration
+    name: laser2_trigger_readback
+    physicalChannel: PXI1Slot5/ai10
+    kind: analog
+    unit: V
+  displayChannels:
+  - laser1_command_copy
+  - cam_frames
+  - barcode
+  - tone2
+  - tone1
+"""
+
+
+def _christielab10_from_yaml():
+    import io
+
+    from autotrainer.core import SystemConfiguration
+
+    return SystemConfiguration.load_yaml(io.StringIO(
+        _CHRISTIELAB10_YAML.format(version=SystemConfiguration.version)))
+
+
+def test_christielab10s_yaml_blocks_load_unchanged():
+    # The fixtures above are Python objects; this goes through the parser,
+    # camelCase and all, as a load does.
+    loaded = _christielab10_from_yaml()
+
+    assert loaded.nidaq_ports == CHRISTIELAB10_PORTS
+    assert loaded.nidaq_stream == _christielab10_stream()
+    result = build_nidaq_acquisition_configuration(
+        loaded.nidaq_stream, loaded.nidaq_ports, _christielab10_lasers())
+    assert result == loaded.nidaq_stream
+
+
+def _with_readbacks(lasers, **inputs):
+    """christielab10's lasers with trigger readbacks, laser1="PXI1Slot5/ai9"."""
+    return dataclasses.replace(lasers, channels=tuple(
+        dataclasses.replace(
+            channel,
+            trigger_monitor_input=inputs.get(f"laser{int(channel.channel_id)}"),
+        )
+        for channel in lasers.channels
+    ))
+
+
+def test_christielab10s_readbacks_take_over_its_custom_channels_in_place():
+    # With triggerMonitorInput set on ai9 and ai10, the two custom
+    # *_trigger_readback channels become the laser trigger roles where they
+    # stand, last in the scan, with their own V / 1.0 / 0.0.
+    loaded = _christielab10_from_yaml()
+    lasers = _with_readbacks(
+        _christielab10_lasers(), laser1="PXI1Slot5/ai9", laser2="PXI1Slot5/ai10")
+
+    result = build_nidaq_acquisition_configuration(
+        loaded.nidaq_stream, loaded.nidaq_ports, lasers)
+
+    names = tuple(channel.name for channel in result.channels)
+    pins = tuple(channel.physical_channel for channel in result.channels)
+    assert len(names) == len(set(names)) == 10
+    assert len(pins) == len(set(pins)) == 10
+    assert "laser1_trigger_readback" not in names
+    assert "laser2_trigger_readback" not in names
+    # Positions 9 and 10 of the scan, as the custom channels were.
+    ninth, tenth = result.channels[8], result.channels[9]
+    assert (ninth.name, ninth.physical_channel) == ("laser1_trigger", "PXI1Slot5/ai9")
+    assert (tenth.name, tenth.physical_channel) == ("laser2_trigger", "PXI1Slot5/ai10")
+    for trigger in (ninth, tenth):
+        assert (trigger.unit, trigger.scale, trigger.offset) == ("V", 1.0, 0.0)
+    assert result.channels[:8] == loaded.nidaq_stream.channels[:8]
+    assert result.display_channels == loaded.nidaq_stream.display_channels

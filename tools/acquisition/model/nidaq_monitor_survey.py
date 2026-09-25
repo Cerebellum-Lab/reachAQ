@@ -31,6 +31,7 @@ lines in one task":
 from __future__ import annotations
 
 import dataclasses
+import re
 from typing import Dict, Optional, Sequence, Tuple
 
 from autotrainer.core import (
@@ -53,6 +54,29 @@ UNREADABLE = "unreadable"
 BUFFERED_PORT = "port0"
 #: Polled beside the stream, for level rather than waveform.
 STATIC_PORTS = ("port1", "port2")
+
+#: One line of the buffered port, as in Dev1/port0/line3.
+_STREAMABLE_LINE = re.compile(rf"^/?[^/]+/{BUFFERED_PORT}/line\d+$", re.IGNORECASE)
+
+
+def is_streamable_line(terminal) -> bool:
+    """Whether `terminal` is one port0 line: the only digital line streamed.
+
+    The stream puts every digital input in one clocked task, and an M Series
+    board clocks port0 only; port1 and port2 are its static PFI pins. Edit
+    DAQ Ports, the acquisition plan and this survey all use this one rule.
+    """
+    return bool(_STREAMABLE_LINE.match(str(terminal or "")))
+
+
+def clocks_digital_input(device) -> bool:
+    """Whether discovery says `device` can clock digital input at all.
+
+    The driver's own answer, not a board model: a board with no correlated
+    digital input, such as a PXI-6713, reports no maximum DI rate, and a
+    clocked task on any of its lines fails at -200452.
+    """
+    return getattr(device, "digital_input_max_rate", None) is not None
 
 #: Slow enough that sixteen inputs and eight lines cost nothing, fast enough
 #: to see a stimulus pulse a human is triggering by hand.
@@ -237,8 +261,7 @@ def build_survey(devices: Sequence, configuration=None) -> MonitorSurvey:
         # The driver's own answer. A board with no correlated digital input
         # does not report a maximum rate for it, and none of its lines can go
         # in a clocked task however they are named.
-        can_clock_digital = getattr(
-            device, "digital_input_max_rate", None) is not None
+        can_clock_digital = clocks_digital_input(device)
         if not can_clock_digital and getattr(device, "digital_inputs", ()):
             notes.append((
                 device_name,
@@ -261,7 +284,7 @@ def build_survey(devices: Sequence, configuration=None) -> MonitorSurvey:
 
         for channel in tuple(getattr(device, "digital_inputs", ()) or ()):
             port = _port_of(channel)
-            if port == BUFFERED_PORT and can_clock_digital:
+            if can_clock_digital and is_streamable_line(channel):
                 add(channel, "digital", "stream")
             elif port in STATIC_PORTS or not can_clock_digital:
                 # A level, not a waveform. Polled beside the stream.

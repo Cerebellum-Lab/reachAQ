@@ -151,6 +151,25 @@ def test_every_digital_port_role_offers_only_lines_the_stream_can_clock(qapp):
         assert _combo_values(dialog._general_combos[role]) == (None,), role
 
 
+def test_a_board_that_cannot_clock_digital_input_says_so_on_its_di_fields(qapp):
+    # The 6713 has eight DI lines, and its DI fields said it had none.
+    dialog = NidaqPortConfigurationDialog(
+        SystemConfiguration(), devices=(_input_card(), _output_card()))
+
+    _set_device(dialog, "Dev2")
+
+    for role in _DIGITAL_PORT_ROLES:
+        tooltip = dialog._general_combos[role].toolTip()
+        assert "Dev2 cannot clock digital input" in tooltip, role
+        assert "has no DI channels" not in tooltip, role
+    readback = dialog._laser_combos[1]["trigger_readback"].toolTip()
+    assert "Dev2 has no analog input and cannot clock digital input" in readback
+    # A board without the lines still says it has none.
+    _set_device(dialog, "Dev1")
+    assert dialog._laser_combos[1]["laser_out"].toolTip() == (
+        "The selected device has no AO channels.")
+
+
 def test_a_stored_pfi_pin_tone_is_shown_as_invalid_and_blocks_ok(qapp):
     config = SystemConfiguration()
     config.nidaq_ports = NidaqPortConfiguration(
@@ -577,7 +596,8 @@ def test_choosing_none_for_the_readback_stops_it_being_acquired_for_good(
     readback.setCurrentIndex(readback.findData(None))
     dialog.accept()
     assert dialog.result() == QDialog.DialogCode.Accepted
-    nidaq_app.update_daq_port_configuration(nidaq_app.nidaq_ports, dialog.laser_configuration)
+    # Whole, as main_window saves it.
+    nidaq_app.update_daq_port_configuration(dialog.nidaq_ports, dialog.laser_configuration)
     _settle(nidaq_app)
 
     assert nidaq_app.laser.configuration.get_channel(1).trigger_monitor_input is None
