@@ -1193,7 +1193,8 @@ class MainWindow(QMainWindow):
         action.setToolTip(
             "Watch every line on every DAQ card and drive the stimulus, to "
             "work out which line is which. Available while acquisition is "
-            "idle, because it opens the same hardware.")
+            "idle, because it opens the same hardware; the application's "
+            "NI-DAQ input stream pauses while it is open.")
         action.triggered.connect(self._open_daq_monitor)
 
         action = self.view_diagnostics_action = QAction("Logging", self)

@@ -278,3 +278,39 @@ def test_a_wiring_test_that_never_finishes_is_reported(session, monkeypatch):
     ok, message = session.run_wiring_test(timeout=1.0)
 
     assert not ok and "did not finish" in message
+
+
+class _PausingApp(_App):
+    """An application that records being asked to give up its stream."""
+
+    def __init__(self):
+        super().__init__()
+        self.holds = []
+
+    def pause_nidaq_stream(self, holder, reason):
+        self.holds.append(("pause", holder, reason))
+
+    def resume_nidaq_stream(self, holder):
+        self.holds.append(("resume", holder))
+
+
+def test_the_application_stream_is_paused_while_the_monitor_is_open(monkeypatch):
+    # The application's own stream runs by itself now. Left running, it holds
+    # the digital port and counter this monitor opens tasks on, and the two
+    # fail each other at -89137.
+    monkeypatch.setattr(module, "NidaqSignalMonitorModel", _Stream)
+    monkeypatch.setattr(module, "discover_nidaq_devices",
+                        lambda: ((_device(),), None))
+    app = _PausingApp()
+
+    session = NidaqMonitorSession(app)
+
+    assert len(app.holds) == 1
+    kind, holder, reason = app.holds[0]
+    assert (kind, holder) == ("pause", session)
+    assert "DAQ Monitor" in reason
+
+    session.close()
+    session.close()
+
+    assert app.holds[1:] == [("resume", session)]

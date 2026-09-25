@@ -168,6 +168,7 @@ from tools.acquisition.model.nidaq_wiring_verification import (
     summarize as summarize_nidaq_wiring,
 )
 from tools.acquisition.model.nidaq_signal_monitor_model import NidaqSignalMonitorModel
+from tools.acquisition.model.nidaq_stream_autostart import NidaqStreamAutoStart
 from tools.acquisition.model.nidaq_timing import (
     remap_nidaq_physical_channel,
     resolve_nidaq_device_aliases,
@@ -292,6 +293,11 @@ from tools.acquisition.model.video_capture_model import (
 )
 
 logger = get_verbose_logger(__name__)
+
+
+#: Holders of the NI-DAQ input stream while the plan it acquires is replaced.
+_CONFIGURATION_LOAD = "configuration load"
+_DAQ_PORTS_UPDATE = "DAQ ports update"
 
 
 def _serialized_session_configuration(method):
@@ -680,6 +686,11 @@ class AppModel(ObservableObject):
         self._hardware = HardwareModel(self._system_message_handler)
         self._laser = LaserModel()
         self._nidaq_signal_monitor = NidaqSignalMonitorModel()
+        #: Starts the input stream by itself while idle; see _request_nidaq_stream.
+        self._nidaq_stream_autostart = NidaqStreamAutoStart(
+            self._nidaq_signal_monitor,
+            may_start=self._nidaq_stream_may_start,
+        )
         #: Written by tools/hardware/verify_nidaq_wiring.py, read here.
         #: It sits beside the configuration it describes rather than in
         #: it, so it can be regenerated without touching a hand-edited
@@ -3045,6 +3056,10 @@ class AppModel(ObservableObject):
             dict(scan_results),
             previous_scan_results,
         )
+        # A refresh is how the operator retries a stream that failed to
+        # start: nothing retries a failed start by itself. It also runs once
+        # at startup, just after the configuration loads.
+        self._request_nidaq_stream("hardware refresh")
 
         message = (
             f"Hardware refresh completed in {time.perf_counter() - scan_started:.2f}s: "
@@ -6184,6 +6199,55 @@ class AppModel(ObservableObject):
         )
         return True
 
+    def _nidaq_stream_may_start(self) -> bool:
+        """Whether the input stream may start by itself now.
+
+        Only while idle with a whole configuration loaded. While System Mode
+        starts, runs or stops, _start_nidaq_domain owns the stream, and a
+        failure there is retried from the Hardware panel, not from here.
+        """
+        acquisition = self._acquisition
+        return not (
+            self._closing_event.is_set()
+            or self._loaded_configuration is None
+            or self._configuration_load_incomplete
+            or acquisition.started
+            or acquisition.starting
+            or acquisition.stopping
+        )
+
+    def _request_nidaq_stream(self, reason: str) -> None:
+        """Start the shared NI-DAQ input stream if it should be running.
+
+        It runs whenever NI-DAQ is enabled and has something to acquire, in
+        Idle as well as in System Mode, so no view has a Start button for it.
+        Returns at once; the start happens on the rule's own thread.
+        """
+        logger.debug("NI-DAQ input stream requested: %s", reason)
+        monitor = self._nidaq_signal_monitor
+        if monitor.is_running and self._nidaq_stream_may_start():
+            # _configure_subsystem_intent marks the domain "not started"
+            # whatever the stream is doing; a stream that kept running
+            # through a settings change is still ready.
+            self._set_subsystem_status(
+                SubsystemId.NIDAQ_STREAM,
+                SubsystemState.READY,
+                reason="NI-DAQ tasks running",
+            )
+        self._nidaq_stream_autostart.request()
+
+    def pause_nidaq_stream(self, holder, reason: str) -> None:
+        """Stop the input stream until `holder` resumes it.
+
+        For whatever needs the NI-DAQ lines to itself, such as the DAQ
+        Monitor, which opens its own tasks on them. `reason` completes
+        "NI-DAQ signal stream paused: ..." where the stream state is shown.
+        """
+        self._nidaq_stream_autostart.pause(holder, reason)
+
+    def resume_nidaq_stream(self, holder) -> None:
+        self._nidaq_stream_autostart.resume(holder)
+
     def _start_nidaq_domain(self, *, timeout: float = 12.0) -> bool:
         monitor = self._nidaq_signal_monitor
         if not (monitor.hardware_enabled and monitor.configuration.is_enabled):
@@ -6191,6 +6255,16 @@ class AppModel(ObservableObject):
                 SubsystemId.NIDAQ_STREAM,
                 SubsystemState.DISABLED,
                 reason="NI-DAQ stream disabled",
+            )
+            return False
+        pause_reasons = self._nidaq_stream_autostart.pause_reasons
+        if pause_reasons:
+            # The DAQ Monitor holds tasks on the same lines. Starting over it
+            # fails inside DAQmx at a reservation error that names neither.
+            self._set_subsystem_status(
+                SubsystemId.NIDAQ_STREAM,
+                SubsystemState.BLOCKED,
+                reason=f"NI-DAQ stream is paused: {pause_reasons[-1]}",
             )
             return False
         generation = self._begin_subsystem_start(
@@ -6203,6 +6277,18 @@ class AppModel(ObservableObject):
             # DAQmx status code from inside a running task, naming neither the
             # configuration line responsible nor the remedy.
             self._require_valid_nidaq_configuration()
+            if (
+                (monitor.is_running or monitor.is_starting)
+                and not monitor.running_matches_configuration
+            ):
+                # The stream normally arrives here already running, started
+                # while idle, and is used as it is. Only one acquiring
+                # something other than the current plan is restarted.
+                logger.info(
+                    "Restarting the NI-DAQ input stream: its channels or "
+                    "timing changed since it started"
+                )
+                monitor.stop()
             if not monitor.start():
                 raise RuntimeError(
                     monitor.error_message or "NI-DAQ stream did not start"
@@ -7017,6 +7103,10 @@ class AppModel(ObservableObject):
                 dict(mode=app_status_to_api_app_mode(AppModelStatus.IDLE))
             )
             self.property_changed(self.Props.ACQUISITION_RUNNING, False, True)
+            # Stopped above with the rest of acquisition; back in Idle it runs
+            # again by itself. Not while the application closes: the rule
+            # refuses once closing has begun.
+            self._request_nidaq_stream("acquisition stopped")
 
     def _capture_stop(self):
         self._detach_training_plan()  # always
@@ -7204,6 +7294,20 @@ class AppModel(ObservableObject):
 
     @_serialized_session_configuration
     def load_configuration(self, location: Optional[Path] = None, *, random_cameras: bool = False):
+        # The input stream now runs while idle, and the timing below is
+        # refused while it runs, so it is held stopped for the load and starts
+        # again from the new plan afterwards. In System Mode it belongs to the
+        # acquisition and is left as it was.
+        if self._acquisition.started:
+            return self._load_configuration(location, random_cameras=random_cameras)
+        holder = _CONFIGURATION_LOAD
+        self.pause_nidaq_stream(holder, "the configuration is loading")
+        try:
+            return self._load_configuration(location, random_cameras=random_cameras)
+        finally:
+            self.resume_nidaq_stream(holder)
+
+    def _load_configuration(self, location: Optional[Path] = None, *, random_cameras: bool = False):
         self._require_session_ready_for_configuration("Loading configuration")
         # Everything below reconfigures live objects one after another, and
         # several steps can raise. A load that stops part-way leaves the cameras
@@ -7468,6 +7572,18 @@ class AppModel(ObservableObject):
         )
         if self._loaded_configuration is None:
             raise RuntimeError("Cannot update DAQ port configuration before a system configuration is loaded")
+        # Held stopped while the plan changes, then started on the new one.
+        self.pause_nidaq_stream(_DAQ_PORTS_UPDATE, "the DAQ ports are being saved")
+        try:
+            self._apply_daq_port_configuration(nidaq_ports, laser_configuration)
+        finally:
+            self.resume_nidaq_stream(_DAQ_PORTS_UPDATE)
+
+    def _apply_daq_port_configuration(
+        self,
+        nidaq_ports: NidaqPortConfiguration,
+        laser_configuration: LaserSystemConfiguration,
+    ) -> None:
         self._nidaq_ports = nidaq_ports
         self._laser.set_configuration_offline(laser_configuration)
         self._loaded_configuration.nidaq_ports = nidaq_ports
@@ -7570,6 +7686,8 @@ class AppModel(ObservableObject):
             auto_start=False,
         )
         self._configure_subsystem_intent(self._loaded_configuration)
+        # Enabling NI-DAQ starts its stream; disabling it stopped it above.
+        self._request_nidaq_stream("hardware settings changed")
         self._configure_animal_metadata_services()
         if self._rfid_metadata_controller is not None:
             self._rfid_metadata_controller.start()
@@ -7656,6 +7774,9 @@ class AppModel(ObservableObject):
             logger.exception("Failed to close laser controller: %s", err)
 
         try:
+            # Closing has begun, so the rule starts nothing new; this waits
+            # briefly for a start already under way, which close() then stops.
+            self._nidaq_stream_autostart.close()
             self._nidaq_signal_monitor.close()
         except Exception as err:
             logger.exception("Failed to close NI-DAQ signal monitor: %s", err)

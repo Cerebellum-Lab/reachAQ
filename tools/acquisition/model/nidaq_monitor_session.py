@@ -10,8 +10,10 @@ Three deliberate separations:
 
   * the clocked lines go through a NidaqSignalMonitorModel, which runs the
     stream in its own process exactly as the application's does. This is a
-    second instance rather than a borrowed one, so opening the monitor cannot
-    disturb what the laser panel is displaying;
+    second instance rather than a borrowed one, because it streams a
+    different set of lines at its own rate. The application's own stream,
+    which now runs by itself while idle, is paused for as long as the session
+    is open: both would reserve the same port and counter;
   * the static lines - the PFI pins, and every line of a board that cannot
     clock digital input - are read as a level by a short-lived task. They
     have no sample clock, so there is no waveform to stream;
@@ -69,6 +71,13 @@ class NidaqMonitorSession(ObservableObject):
     def __init__(self, app_model):
         super().__init__()
         self._app_model = app_model
+        # Before anything here opens a task. The application's stream would
+        # otherwise still hold the lines this polls and streams, and the two
+        # fail each other at -89137 with nothing saying why.
+        pause = getattr(app_model, "pause_nidaq_stream", None)
+        self._holds_app_stream = callable(pause)
+        if self._holds_app_stream:
+            pause(self, "the DAQ Monitor is open")
         self._survey = MonitorSurvey()
         self._devices: Tuple = tuple()
         self._issues: Tuple[str, ...] = tuple()
@@ -254,6 +263,11 @@ class NidaqMonitorSession(ObservableObject):
             self._stream.close()
         except Exception:
             logger.exception("monitor stream did not close cleanly")
+        # Only once every task here is closed: the application's stream is
+        # started as soon as it is let go.
+        if self._holds_app_stream:
+            self._holds_app_stream = False
+            self._app_model.resume_nidaq_stream(self)
 
     # --------------------------------------------------------- the static lines
 
