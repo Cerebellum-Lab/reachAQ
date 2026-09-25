@@ -6265,7 +6265,16 @@ class AppModel(ObservableObject):
     def resume_nidaq_stream(self, holder) -> None:
         self._nidaq_stream_autostart.resume(holder)
 
-    def _start_nidaq_domain(self, *, timeout: float = 12.0) -> bool:
+    def _start_nidaq_domain(self, *, timeout: float = 12.0, restart: bool = False) -> bool:
+        """Start the NI-DAQ domain; `restart` replaces a stream already running.
+
+        System Mode passes restart=True. NI sample times are the worker's
+        task-start anchor plus sample index over rate, anchored once, and are
+        compared with host perf_counter times (the tone-2 trial window, for
+        one); the two clocks drift apart. A stream started in Idle, carried
+        into System Mode, would bring its whole age of drift into a recording.
+        A retry keeps whatever is running.
+        """
         monitor = self._nidaq_signal_monitor
         if not (monitor.hardware_enabled and monitor.configuration.is_enabled):
             self._set_subsystem_status(
@@ -6294,16 +6303,10 @@ class AppModel(ObservableObject):
             # DAQmx status code from inside a running task, naming neither the
             # configuration line responsible nor the remedy.
             self._require_valid_nidaq_configuration()
-            if (
-                (monitor.is_running or monitor.is_starting)
-                and not monitor.running_matches_configuration
-            ):
-                # The stream normally arrives here already running, started
-                # while idle, and is used as it is. Only one acquiring
-                # something other than the current plan is restarted.
+            if restart and (monitor.is_running or monitor.is_starting):
                 logger.info(
-                    "Restarting the NI-DAQ input stream: its channels or "
-                    "timing changed since it started"
+                    "Restarting the NI-DAQ input stream so System Mode's "
+                    "samples are timed from a fresh task-start anchor"
                 )
                 monitor.stop()
             if not monitor.start():
@@ -6997,7 +7000,8 @@ class AppModel(ObservableObject):
         # Each hardware domain starts and fails independently. Readiness is
         # aggregated only when Record is requested.
         can_ready = self._start_can_domain(wait_connected=wait_connected)
-        self._start_nidaq_domain()
+        # A fresh worker, not the one started in Idle: see _start_nidaq_domain.
+        self._start_nidaq_domain(restart=True)
         self._start_laser_domain()
         self._validate_session_logs_domain()
 

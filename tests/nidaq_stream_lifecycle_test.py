@@ -93,36 +93,25 @@ def test_a_disabled_nidaq_is_never_started(app_model, monkeypatch):
     assert starts == []
 
 
-def test_acquisition_start_keeps_the_running_stream(nidaq_app, monkeypatch):
+def test_every_run_restarts_the_stream_from_a_fresh_timing_anchor(nidaq_app, monkeypatch):
+    # NI sample times are the task-start anchor plus index / rate, anchored
+    # once per worker, and are compared with host perf_counter times; the NI
+    # and host clocks drift apart. A stream started in Idle and carried into
+    # System Mode would bring hours of drift into a recording, so each Run
+    # starts a new worker, as before the stream ran in Idle.
+    monkeypatch.setattr(nidaq_app, "_require_valid_nidaq_configuration", lambda: None)
     assert nidaq_app.load_configuration() is True
     monitor = _settle(nidaq_app)
     assert monitor.is_running, "the stream did not start by itself"
-    pid = _worker_pid(monitor)
-    monkeypatch.setattr(nidaq_app, "_require_valid_nidaq_configuration", lambda: None)
-    # A plot selection is not an acquisition change, and must not restart it.
-    nidaq_app.update_nidaq_signal_stream_channels(())
+    idle_pid = _worker_pid(monitor)
+    try:
+        assert nidaq_app.capture_start() is True
 
-    assert nidaq_app._start_nidaq_domain() is True
-
-    assert _worker_pid(monitor) == pid
-    assert _nidaq_state(nidaq_app).state is SubsystemState.READY
-
-
-def test_acquisition_start_restarts_a_stream_whose_plan_changed(nidaq_app, monkeypatch):
-    assert nidaq_app.load_configuration() is True
-    monitor = _settle(nidaq_app)
-    assert monitor.is_running, "the stream did not start by itself"
-    pid = _worker_pid(monitor)
-    monkeypatch.setattr(nidaq_app, "_require_valid_nidaq_configuration", lambda: None)
-    # Nothing in the application changes the plan under a running stream
-    # today; this stands in for a path that one day might.
-    monitor._configuration = dataclasses.replace(
-        monitor.configuration, sample_rate_hz=monitor.configuration.sample_rate_hz / 2)
-
-    assert nidaq_app._start_nidaq_domain() is True
-
-    assert monitor.is_running
-    assert _worker_pid(monitor) != pid
+        assert monitor.is_running
+        assert _worker_pid(monitor) not in (None, idle_pid)
+        assert _nidaq_state(nidaq_app).state is SubsystemState.READY
+    finally:
+        nidaq_app.capture_stop()
 
 
 def test_the_daq_monitor_cannot_take_the_stream_from_a_running_acquisition(

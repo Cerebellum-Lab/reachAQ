@@ -181,8 +181,6 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
         self._device_identities: tuple[NidaqDeviceIdentity, ...] = tuple()
         self._runtime_device_aliases = {}
         self._timing_plan: Optional[NidaqTimingPlan] = None
-        #: What the running worker was started with; see running_matches_configuration.
-        self._started_signature = None
         self._sample_ring = SharedNidaqSampleRing(self._configuration, mp_ctx=self._mp_ctx)
 
     @property
@@ -230,26 +228,6 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
         if self._error_message:
             return "error"
         return "stopped"
-
-    @property
-    def running_matches_configuration(self) -> bool:
-        """Whether the running worker is acquiring what is configured now.
-
-        The plot selection is left out: it decides what is drawn, never what
-        is acquired, so changing it must not cost a restart.
-        """
-        signature = self._started_signature
-        return signature is not None and signature == self._acquisition_signature()
-
-    def _acquisition_signature(self):
-        return (
-            dataclasses.replace(self._configuration, display_channels=()),
-            self.effective_read_chunk_size,
-            self._timing_configuration,
-            self._hardware_timed_output_devices,
-            self._hardware_timed_output_channels,
-            self._device_identities,
-        )
 
     @property
     def timing_plan(self) -> Optional[NidaqTimingPlan]:
@@ -560,7 +538,6 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
             self._process = process
             self._message_queue = message_queue
             self._process_stop_event = stop_event
-            self._started_signature = self._acquisition_signature()
             self._set_error("")
             self._set_status("Starting NI-DAQ signal stream...")
             self._set_starting(True)
@@ -715,7 +692,6 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
             self._message_queue = None
             self._process_stop_event = None
             self._thread = None
-            self._started_signature = None
             self._set_starting(False)
             self._set_running(False)
             if self._configuration.is_enabled:

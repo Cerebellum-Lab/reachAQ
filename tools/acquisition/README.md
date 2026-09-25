@@ -179,7 +179,10 @@ itself whenever NI-DAQ is enabled and at least one input is mapped, in Idle as
 well as in System Mode: once the configuration loads when reachAQ opens, after
 a Hardware Refresh or enabling NI-DAQ under **File → Hardware**, after **Edit
 DAQ Ports** saves (with the new channel plan), and again when acquisition
-stops. Starting System Mode uses the stream that is already running. The
+stops. Starting System Mode restarts it, so that recorded NI sample times
+count from a fresh task-start anchor rather than from whenever the Idle
+stream began: they are compared with host times, and the two clocks drift
+apart. The NI graphs clear for the few seconds that takes. The
 Analysis header shows `running`, `starting`, `stopped`, `disabled` or `error`;
 hover over it for the detail. A stream that fails to start stays stopped and
 reports the failure in Hardware Status and the log. It is not retried by
