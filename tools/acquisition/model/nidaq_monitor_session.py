@@ -29,6 +29,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Dict, Optional, Sequence, Tuple
@@ -71,13 +72,12 @@ class NidaqMonitorSession(ObservableObject):
     def __init__(self, app_model):
         super().__init__()
         self._app_model = app_model
-        # Before anything here opens a task. The application's stream would
-        # otherwise still hold the lines this polls and streams, and the two
-        # fail each other at -89137 with nothing saying why.
-        pause = getattr(app_model, "pause_nidaq_stream", None)
-        self._holds_app_stream = callable(pause)
-        if self._holds_app_stream:
-            pause(self, "the DAQ Monitor is open")
+        self._holds_app_stream = False
+        # Set while the verify tool runs; the application's stream is not let
+        # go until it finishes, even when the window closes first.
+        self._wiring_lock = threading.Lock()
+        self._wiring_active = False
+        self._release_after_wiring = False
         self._survey = MonitorSurvey()
         self._devices: Tuple = tuple()
         self._issues: Tuple[str, ...] = tuple()
@@ -94,6 +94,20 @@ class NidaqMonitorSession(ObservableObject):
         # difference between a button that is right and one that is right
         # eventually.
         self._stream.property_changed += self._on_stream_changed
+        # Last, so a session that fails to build holds nothing, and before
+        # anything here opens a task: the application's stream would still
+        # hold the lines this polls and streams, and the two fail each other
+        # at -89137 with nothing saying why. The application refuses while
+        # System Mode runs, because then the stream is the acquisition's.
+        pause = getattr(app_model, "pause_nidaq_stream", None)
+        if callable(pause):
+            try:
+                pause(self, "the DAQ Monitor is open")
+            except Exception:
+                self._stream.property_changed -= self._on_stream_changed
+                self._stream.close()
+                raise
+            self._holds_app_stream = True
 
     # ------------------------------------------------------------- what is here
 
@@ -255,16 +269,31 @@ class NidaqMonitorSession(ObservableObject):
 
     def close(self) -> None:
         try:
-            self._stream.property_changed -= self._on_stream_changed
-        except Exception:
-            pass
-        self.stop()
-        try:
-            self._stream.close()
-        except Exception:
-            logger.exception("monitor stream did not close cleanly")
-        # Only once every task here is closed: the application's stream is
-        # started as soon as it is let go.
+            try:
+                self._stream.property_changed -= self._on_stream_changed
+            except Exception:
+                pass
+            self.stop()
+            try:
+                self._stream.close()
+            except Exception:
+                logger.exception("monitor stream did not close cleanly")
+        finally:
+            # Only once every task here is closed: the application's stream
+            # is started as soon as it is let go.
+            self._release_app_stream_unless_wiring()
+
+    def _release_app_stream_unless_wiring(self) -> None:
+        # Not while the verify tool still runs: the window gives it five
+        # seconds at close, the tool can take three minutes, and it drives
+        # the same lines. run_wiring_test lets go when it finishes.
+        with self._wiring_lock:
+            if self._wiring_active:
+                self._release_after_wiring = True
+                return
+        self._release_app_stream()
+
+    def _release_app_stream(self) -> None:
         if self._holds_app_stream:
             self._holds_app_stream = False
             self._app_model.resume_nidaq_stream(self)
@@ -521,7 +550,27 @@ class NidaqMonitorSession(ObservableObject):
         The stream is stopped first. The tool opens its own tasks on the same
         lines, and two clients reserving the same digital port is how this
         fails at -89137 rather than telling anyone why.
+
+        While it runs, closing the session does not hand the lines back to
+        the application; this does, once the tool has exited. subprocess.run
+        kills the tool itself on a timeout, so it has exited either way.
         """
+        with self._wiring_lock:
+            self._wiring_active = True
+        try:
+            return self._run_wiring_test(
+                open_shutters=open_shutters, command_volts=command_volts,
+                dry_run=dry_run, timeout=timeout)
+        finally:
+            with self._wiring_lock:
+                self._wiring_active = False
+                release = self._release_after_wiring
+                self._release_after_wiring = False
+            if release:
+                self._release_app_stream()
+
+    def _run_wiring_test(self, *, open_shutters: bool, command_volts: float,
+                         dry_run: bool, timeout: float) -> Tuple[bool, str]:
         if self.is_running:
             self.stop()
         command = self.wiring_test_command(

@@ -4,6 +4,7 @@ Two of these pin behaviour that was measured on the rig rather than designed,
 and both cost a working monitor until they were found.
 """
 
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -313,4 +314,53 @@ def test_the_application_stream_is_paused_while_the_monitor_is_open(monkeypatch)
     session.close()
     session.close()
 
+    assert app.holds[1:] == [("resume", session)]
+
+
+def test_a_session_that_fails_to_build_leaves_the_application_stream_alone(
+    monkeypatch,
+):
+    # The pause used to come first, so a session that failed after it held
+    # the application's stream stopped with nothing left to resume it.
+    def broken_stream():
+        raise RuntimeError("no shared memory for the survey ring")
+
+    monkeypatch.setattr(module, "NidaqSignalMonitorModel", broken_stream)
+    app = _PausingApp()
+
+    with pytest.raises(RuntimeError, match="shared memory"):
+        NidaqMonitorSession(app)
+
+    assert app.holds == []
+
+
+def test_the_application_stream_waits_for_a_wiring_test_that_outlives_the_window(
+    monkeypatch,
+):
+    # Closing the monitor waits five seconds for the wiring test and then
+    # closes the session. The verify tool can run for three minutes on the
+    # same lines, so resuming the application's stream at close put two
+    # clients on them.
+    monkeypatch.setattr(module, "NidaqSignalMonitorModel", _Stream)
+    monkeypatch.setattr(module, "discover_nidaq_devices",
+                        lambda: ((_device(),), None))
+    app = _PausingApp()
+    session = NidaqMonitorSession(app)
+    running, finish = threading.Event(), threading.Event()
+
+    def slow_verify(*_args, **_kwargs):
+        running.set()
+        finish.wait(5.0)
+        return SimpleNamespace(returncode=0, stdout="done", stderr="")
+
+    monkeypatch.setattr(module.subprocess, "run", slow_verify)
+    wiring = threading.Thread(target=session.run_wiring_test, daemon=True)
+    wiring.start()
+    assert running.wait(5.0)
+
+    session.close()
+    assert [hold[0] for hold in app.holds] == ["pause"]
+
+    finish.set()
+    wiring.join(5.0)
     assert app.holds[1:] == [("resume", session)]
