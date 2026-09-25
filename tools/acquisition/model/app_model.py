@@ -313,8 +313,81 @@ _LASER_CALIBRATION_FORCED_CLOSE_S = 15.0
 #: found the ramp's own thread closing, for the ramp to end: a ramp its
 #: driver lets go tries to write the command back to its minimum itself.
 _LASER_CALIBRATION_RAMP_END_WAIT_S = 2.0
+#: How long Stop, a failed Run start and closing wait for System Mode's laser
+#: controller to close, as the ramp's forced close does.
+_LASER_CONTROLLER_CLOSE_S = 15.0
+#: Why laser work is refused while a controller close given up on is still
+#: inside the driver.
+_LASER_CLOSE_PENDING_REFUSAL = (
+    "the laser controller is still closing after a driver hang; make the "
+    "laser safe by hand, and restart reachAQ if this does not clear"
+)
 #: Where the GUI's operator fixes a refused NI-DAQ plan.
 _GUI_NIDAQ_PLAN_REMEDY = "fix it in Edit → Edit DAQ Ports"
+
+
+class _BoundedClose:
+    """A laser controller close, on a thread of its own, waited for with a bound.
+
+    A close that hangs inside DAQmx does not make the laser safer, since its
+    output stays driven either way, and waited for without a bound it held
+    Stop, or reachAQ's exit, for as long as the driver did (controller ruling,
+    2026-09-25). Daemon, so that a close that never returns does not hold
+    the process open. One given up on keeps running, and says so when it
+    ends (`on_late_finish`).
+    """
+
+    def __init__(self, close: Callable[[], object], name: str, *,
+                 on_late_finish: Optional[Callable[["_BoundedClose"], None]] = None):
+        self.name = name
+        self.result = None
+        self.error: Optional[Exception] = None
+        self.done = threading.Event()
+        self._close = close
+        self._on_late_finish = on_late_finish
+        self._lock = threading.Lock()
+        self._given_up = False
+        self._thread = threading.Thread(target=self._run, name=name, daemon=True)
+
+    @property
+    def given_up(self) -> bool:
+        """Whether run() stopped waiting for it before it ended."""
+        with self._lock:
+            return self._given_up
+
+    def run(self, timeout: float) -> bool:
+        """Start the close and wait up to `timeout`; whether it finished."""
+        self._thread.start()
+        if self.done.wait(timeout):
+            return True
+        with self._lock:
+            if self.done.is_set():
+                return True
+            self._given_up = True
+        return False
+
+    def _run(self) -> None:
+        try:
+            self.result = self._close()
+        except Exception as error:
+            self.error = error
+            logger.exception("Failed to close the %s", self.name)
+        finally:
+            with self._lock:
+                self.done.set()
+                late = self._given_up
+            if late and self._on_late_finish is not None:
+                self._on_late_finish(self)
+
+    def failure(self, timeout: float) -> str:
+        """What went wrong, completing "The <name> ...", or empty if nothing."""
+        if not self.done.is_set():
+            return f"did not close within {timeout:.1f} s"
+        if self.error is not None:
+            return "failed to close ({})".format(
+                next(iter(str(self.error).splitlines()), "")
+                or self.error.__class__.__name__)
+        return ""
 
 
 def _serialized_session_configuration(method):
@@ -746,6 +819,10 @@ class AppModel(ObservableObject):
         #: command. Before either, closing must not say it may.
         self._laser_calibration_opened = False
         self._laser_calibration_commanded = False
+        #: System Mode laser controller closes given up on at their bound and
+        #: still inside the driver; laser work is refused while there is one.
+        self._pending_laser_closes: List[_BoundedClose] = []
+        self._pending_laser_closes_lock = threading.Lock()
         #: Written by tools/hardware/verify_nidaq_wiring.py, read here.
         #: It sits beside the configuration it describes rather than in
         #: it, so it can be regenerated without touching a hand-edited
@@ -2922,6 +2999,9 @@ class AppModel(ObservableObject):
     def refresh_hardware_bindings(self) -> str:
         if self._acquisition.started or self._status != AppModelStatus.IDLE:
             raise RuntimeError("Hardware refresh is only available while acquisition is idle")
+        close_refusal = self.laser_controller_close_refusal()
+        if close_refusal:
+            raise RuntimeError(f"Hardware refresh is unavailable: {close_refusal}")
 
         scan_started = time.perf_counter()
         details: List[str] = []
@@ -5300,6 +5380,9 @@ class AppModel(ObservableObject):
         profile - so the same profile fires correctly on whichever laser and
         route the caller names.
         """
+        close_refusal = self.laser_controller_close_refusal()
+        if close_refusal:
+            raise RuntimeError(f"Test stim is unavailable: {close_refusal}")
         if profile is None:
             raise RuntimeError("Select a saved laser profile, or the builder draft, to test.")
         try:
@@ -6435,6 +6518,9 @@ class AppModel(ObservableObject):
             # Not while closing: nothing would wait for it, and the process
             # could end with the laser driven.
             return "reachAQ is closing"
+        close_refusal = self.laser_controller_close_refusal()
+        if close_refusal:
+            return close_refusal
         recording_status = self._recording_session.status
         if recording_status is not SessionRecordingStatus.READY:
             return (
@@ -6619,42 +6705,25 @@ class AppModel(ObservableObject):
             action,
         )
         ramp = self._laser_calibration_ramp
-        outcome = {}
-
-        def force_close():
-            try:
-                outcome["closed"] = self._close_laser_calibration_controller(
-                    keep_error=False)
-            except Exception as error:
-                outcome["error"] = error
-                logger.exception("Failed to close the laser calibration controller")
-
-        # Bounded (controller ruling, 2026-09-25): a close that hangs inside
-        # DAQmx does not make the laser safer, since its output stays driven
-        # either way, and it would keep reachAQ from exiting. Past the bound
-        # the operator is told what may still be driven, and closing goes on.
-        # Daemon, so that a close that never returns does not hold the
-        # process open.
-        closer = threading.Thread(
-            target=force_close, name="laser_calibration_close", daemon=True)
-        closer.start()
-        closer.join(_LASER_CALIBRATION_FORCED_CLOSE_S)
-        if not closer.is_alive() and outcome.get("closed"):
+        # Bounded, as every laser controller close is (_BoundedClose). Past
+        # the bound the operator is told what may still be driven, and closing
+        # goes on.
+        closing = _BoundedClose(
+            lambda: self._close_laser_calibration_controller(keep_error=False),
+            "laser calibration controller")
+        closing.run(_LASER_CALIBRATION_FORCED_CLOSE_S)
+        failure = closing.failure(_LASER_CALIBRATION_FORCED_CLOSE_S)
+        if not failure and closing.result:
             return  # Closed cleanly: the laser was reset.
         with self._laser_calibration_lock:
             opened = self._laser_calibration_opened
             commanded = self._laser_calibration_commanded
-        if closer.is_alive():
-            failure = f"did not close within {_LASER_CALIBRATION_FORCED_CLOSE_S:.1f} s"
-        elif "error" in outcome:
-            error = outcome["error"]
-            failure = "failed to close ({})".format(
-                next(iter(str(error).splitlines()), "") or error.__class__.__name__)
-        elif opened:
-            # The ramp's own thread took the controller first, and closes it.
-            failure = "is being closed by the ramp's own thread"
-        else:
-            failure = "had not finished opening"
+        if not failure:
+            # Nothing here to close: the ramp's own thread took the controller
+            # first, and closes it, or the ramp had not opened one yet.
+            failure = (
+                "is being closed by the ramp's own thread" if opened
+                else "had not finished opening")
         # What the output may hold, as far as closing knows: a ramp that never
         # opened its controller, or never started on it, wrote no command.
         if commanded:
@@ -6693,6 +6762,89 @@ class AppModel(ObservableObject):
                 "The laser calibration ramp had not ended %.1f s later; "
                 "reachAQ closes with it still running",
                 _LASER_CALIBRATION_RAMP_END_WAIT_S)
+
+    def laser_controller_close_refusal(self) -> str:
+        """Why laser work is refused, or an empty string.
+
+        While a System Mode controller close given up on is still inside the
+        driver. The laser model still holds that controller then, and Run,
+        Run Pulse, Test stim, a ramp or a refresh would call into the driver
+        that hung, or open a second controller over the same lines. Clears
+        by itself when the close ends.
+        """
+        with self._pending_laser_closes_lock:
+            pending = any(closing.given_up and not closing.done.is_set()
+                          for closing in self._pending_laser_closes)
+        return _LASER_CLOSE_PENDING_REFUSAL if pending else ""
+
+    def _close_laser_within_bound(self, going_on: str) -> None:
+        """Close System Mode's laser controller, waiting for it with a bound.
+
+        Every path that closes it comes here: Stop, a Run start that failed,
+        and closing. It waited without a bound, and a driver hung in the close
+        hung Stop, or exit, with nothing said. `going_on` completes the
+        CRITICAL's "... without it", such as "System Mode stops".
+        """
+        if self.laser_controller_close_refusal():
+            # Not started again over the one still in the driver, which would
+            # hang the same way; that one's CRITICAL has been logged.
+            logger.error(
+                "The laser controller is still closing after a driver hang; "
+                "%s without closing it again", going_on)
+            return
+        if not self._laser.is_connected:
+            self._laser.close()
+            return
+        channels = self._laser.configuration.channels
+        commands = self._laser.last_command_volts
+        closing = _BoundedClose(
+            self._laser.close, "laser controller",
+            on_late_finish=self._on_laser_close_finished_late)
+        # Listed before it runs, so that one ending just past its bound is
+        # still found and taken off by _on_laser_close_finished_late.
+        with self._pending_laser_closes_lock:
+            self._pending_laser_closes.append(closing)
+        if closing.run(_LASER_CONTROLLER_CLOSE_S):
+            with self._pending_laser_closes_lock:
+                if closing in self._pending_laser_closes:
+                    self._pending_laser_closes.remove(closing)
+        failure = closing.failure(_LASER_CONTROLLER_CLOSE_S)
+        if not failure:
+            return
+        lasers = ", ".join(
+            "laser {} {:g} V".format(
+                int(channel.channel_id),
+                commands.get(int(channel.channel_id), channel.minimum_command_volts))
+            for channel in channels)
+        # With a raise as with a hang: the close is what resets the laser.
+        logger.critical(
+            "The laser controller %s. Each output may still hold its last "
+            "command (%s), and the shutters may be open: make the laser safe "
+            "by hand. %s without it.",
+            failure,
+            lasers or "no laser configured",
+            going_on,
+        )
+
+    def _on_laser_close_finished_late(self, closing: "_BoundedClose") -> None:
+        """A close given up on has ended: laser work may start again."""
+        with self._pending_laser_closes_lock:
+            if closing in self._pending_laser_closes:
+                self._pending_laser_closes.remove(closing)
+        logger.warning(
+            "The laser controller finished closing after it was given up on%s",
+            "" if closing.error is None
+            else f", with an error ({closing.failure(0.0)}); see above")
+        # Tells the laser panel and the menus, which follow the statuses.
+        self._set_subsystem_status(
+            SubsystemId.LASER,
+            (
+                SubsystemState.DISABLED
+                if self._laser.configuration.backend == "disabled"
+                else SubsystemState.STOPPED
+            ),
+            reason="laser controller closed, late, after a driver hang",
+        )
 
     def _start_nidaq_domain(self, *, timeout: float = 12.0, restart: bool = False) -> bool:
         """Start the NI-DAQ domain; `restart` replaces a stream already running.
@@ -6910,10 +7062,7 @@ class AppModel(ObservableObject):
         except Exception as exc:
             error = str(exc) or exc.__class__.__name__
             logger.exception("Laser initialization failed")
-            try:
-                self._laser.close()
-            except Exception:
-                logger.exception("Laser cleanup failed")
+            self._close_laser_within_bound("System Mode goes on")
             self._set_subsystem_status(
                 SubsystemId.LASER,
                 SubsystemState.FAILED,
@@ -7358,6 +7507,13 @@ class AppModel(ObservableObject):
                     "runs; wait for it to finish",
                 )
                 return False
+            # The laser model still holds a controller whose close hung in the
+            # driver; a Run would call into it, or open a second one over it.
+            close_refusal = self.laser_controller_close_refusal()
+            if close_refusal:
+                self._acquisition.mark_stopped()
+                self.on_error("Run unavailable", f"System Mode cannot start: {close_refusal}")
+                return False
             previous_internal_error = self._internal_error_diagnostic
             self._internal_error_diagnostic = None
             self._session_invariant_unknown = False
@@ -7688,9 +7844,9 @@ class AppModel(ObservableObject):
         )
         try:
             self._laser.stop_direct_trigger_receiver()
-            self._laser.close()
         except Exception as err:
-            logger.exception("Failed to close laser controller during capture stop: %s", err)
+            logger.exception("Failed to stop the direct laser trigger receiver: %s", err)
+        self._close_laser_within_bound("System Mode stops")
         self._log_stim_latency_budget()
         self._set_subsystem_status(
             SubsystemId.LASER,
@@ -8386,10 +8542,7 @@ class AppModel(ObservableObject):
         # ensure go back to IDLE mode + stop cameras & inference & analysis + hardware disconnect :
         self.capture_stop()
 
-        try:
-            self._laser.close()
-        except Exception as err:
-            logger.exception("Failed to close laser controller: %s", err)
+        self._close_laser_within_bound("reachAQ is closing")
 
         try:
             # Closing has begun, so the rule starts nothing new; this waits

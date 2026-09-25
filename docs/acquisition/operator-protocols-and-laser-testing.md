@@ -283,6 +283,18 @@ stop, then puts the command back to its minimum and closes the shutters. The
 status line then reads *"Laser operation failed: Laser operation ... was
 cancelled: the laser controller was closed while it ran"*.
 
+That close is bounded at 15 seconds, at Stop, at a Run start that failed,
+and when reachAQ closes. A driver that hangs in it no longer hangs Stop or
+exit: past the bound, or if the close fails, the log and status bar show a
+CRITICAL, *"The laser controller did not close within 15.0 s. Each output may
+still hold its last command (laser 1 0 V, laser 2 0 V), and the shutters may
+be open: make the laser safe by hand. System Mode stops without it."*, and
+Stop or exit goes on. While a close given up on is still inside the driver,
+Run, Run Pulse, Test stim, the calibration ramp and Hardware refresh are
+refused with *"the laser controller is still closing after a driver hang
+..."*; the refusal clears by itself when the close ends, and the log says
+so.
+
 Picking a profile in **Profile:** chooses what Run Pulse and Test stim fire on
 this laser; this page has no waveform controls, and nothing is copied into it.
 Picking *(builder draft)* fires whatever is on the Pulse Builder at the moment

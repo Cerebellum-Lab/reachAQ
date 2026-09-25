@@ -132,6 +132,7 @@ class FakeTask:
         self._release()
 
     def close(self):
+        self.daq.sick("task_close")
         self.closed = True
         self.started = False
         self._release()
@@ -149,6 +150,7 @@ class FakeDaqmx:
         abort_unblocks=True,
         hold_waits=False,
         stop_unblocks=False,
+        hang=(),
     ):
         self.block_wait = block_wait
         self.failing_task = failing_task
@@ -163,6 +165,14 @@ class FakeDaqmx:
         #: stops its tasks and relies on that; like the abort, it is the
         #: fake's model of DAQmx, not a measurement.
         self.stop_unblocks = stop_unblocks
+        #: Sick-driver behaviour, not DAQmx's: each call named here -
+        #: "connect_terms", "disconnect_terms" or "task_close" - blocks until
+        #: hang_released is set, as a call does inside a driver that has hung.
+        self.hang = set(hang)
+        self.hang_released = threading.Event()
+        #: Set as a call starts to hang; hung names each such call, in order.
+        self.hanging = threading.Event()
+        self.hung = []
         self.held_wait_limit = 20.0
         #: Set to let every blocked wait return.
         self.waits_released = threading.Event()
@@ -197,10 +207,19 @@ class FakeDaqmx:
         if self.failing_task and task.name.endswith(self.failing_task):
             raise RuntimeError(f"DAQmx refused to start {task.name}")
 
+    def sick(self, call):
+        """Block `call` until released, when it is one of the hung calls."""
+        if call in self.hang and not self.hang_released.is_set():
+            self.hung.append(call)
+            self.hanging.set()
+            self.hang_released.wait(self.held_wait_limit)
+
     def connect_terms(self, source, destination):
+        self.sick("connect_terms")
         self.connected.append((source, destination))
 
     def disconnect_terms(self, source, destination):
+        self.sick("disconnect_terms")
         self.disconnected.append((source, destination))
 
     def task(self, suffix):

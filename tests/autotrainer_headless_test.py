@@ -911,7 +911,7 @@ def test_a_ramp_that_never_wrote_a_command_is_not_blamed_for_the_output(
         ramp_thread.join(10.0)
 
 
-def _system_mode_with_the_fake_laser(app_model, monkeypatch, **fake_modes):
+def _system_mode_with_the_fake_laser(app_model, monkeypatch, lasers=None, **fake_modes):
     """System Mode running with the NI-DAQ laser on the DAQmx stand-in."""
     from autotrainer.device import nidaq_laser
 
@@ -919,10 +919,103 @@ def _system_mode_with_the_fake_laser(app_model, monkeypatch, **fake_modes):
     daq = fake.FakeDaqmx(**fake_modes)
     monkeypatch.setattr(nidaq_laser, "_load_nidaqmx", lambda: daq)
     assert app_model.load_configuration() is True
-    app_model.laser.set_configuration_offline(fake.rig_lasers())
+    app_model.laser.set_configuration_offline(fake.rig_lasers(**(lasers or {})))
     assert app_model.capture_start() is True
     assert app_model.laser.is_connected
     return daq
+
+
+#: christielab10's board STIM route for laser 1, whose close releases it.
+_ROUTED_LASER = dict(
+    trigger_source="/PXI1Slot4/PXI_Trig0", trigger_route_source="/PXI1Slot5/PFI0")
+
+
+def _wait_until(condition, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert time.monotonic() < deadline, "condition not met"
+        time.sleep(0.02)
+
+
+def test_stop_with_a_hung_laser_close_is_bounded_and_holds_off_run_until_it_ends(
+    app_model, monkeypatch, caplog,
+):
+    # The System Mode controller's close had no bound: a driver hung in it
+    # hung Stop, and exit, indefinitely, and nothing told the operator.
+    from tools.acquisition.model import app_model as app_model_module
+
+    monkeypatch.setattr(app_model_module, "_LASER_CONTROLLER_CLOSE_S", 0.5)
+    daq = _system_mode_with_the_fake_laser(
+        app_model, monkeypatch, lasers=_ROUTED_LASER, hang={"disconnect_terms"})
+    try:
+        with caplog.at_level("CRITICAL"):
+            stop_thread, stop_outcome = _in_thread(app_model.capture_stop)
+            stop_thread.join(10.0)
+
+        assert not stop_thread.is_alive()
+        assert stop_outcome == [None]
+        assert daq.hung == ["disconnect_terms"]
+        critical, = [record for record in caplog.records
+                     if record.levelname == "CRITICAL"]
+        message = critical.getMessage()
+        assert "did not close within 0.5 s" in message
+        assert "laser 1" in message and "0 V" in message
+        assert "make the laser safe by hand" in message
+
+        # Held off while that close is still inside the driver, by name.
+        refusal = app_model.laser_controller_close_refusal()
+        assert "still closing after a driver hang" in refusal
+        assert app_model.capture_start() is False
+        assert refusal in app_model.laser_calibration_refusal()
+        with pytest.raises(RuntimeError, match="still closing after a driver hang"):
+            app_model.refresh_hardware_bindings()
+        with pytest.raises(RuntimeError, match="still closing after a driver hang"):
+            app_model.run_stim_bench_test(None, 1, "direct_ni_software")
+
+        daq.hang_released.set()
+        _wait_until(lambda: not app_model.laser_controller_close_refusal())
+        assert not app_model.laser.is_connected
+        assert app_model.capture_start() is True
+    finally:
+        daq.hang_released.set()
+        app_model.capture_stop()
+
+
+def test_closing_reachaq_with_a_hung_laser_close_is_bounded(app_model, monkeypatch, caplog):
+    from tools.acquisition.model import app_model as app_model_module
+
+    monkeypatch.setattr(app_model_module, "_LASER_CONTROLLER_CLOSE_S", 0.5)
+    daq = _system_mode_with_the_fake_laser(
+        app_model, monkeypatch, lasers=_ROUTED_LASER, hang={"disconnect_terms"})
+    try:
+        with caplog.at_level("CRITICAL"):
+            close_thread, close_outcome = _in_thread(app_model.on_close)
+            close_thread.join(20.0)
+
+        assert not close_thread.is_alive()
+        assert close_outcome == [None]
+        # Once: the close that on_close makes itself is not started again
+        # over the one still in the driver.
+        assert daq.hung == ["disconnect_terms"]
+        critical, = [record for record in caplog.records
+                     if record.levelname == "CRITICAL"]
+        assert "laser 1" in critical.getMessage()
+    finally:
+        daq.hang_released.set()
+
+
+def test_a_normal_laser_close_is_unchanged(app_model, monkeypatch, caplog):
+    daq = _system_mode_with_the_fake_laser(app_model, monkeypatch, lasers=_ROUTED_LASER)
+
+    with caplog.at_level("ERROR"):
+        app_model.capture_stop()
+
+    assert not app_model.laser.is_connected
+    assert app_model.laser_controller_close_refusal() == ""
+    assert daq.disconnected == [("/PXI1Slot5/PFI0", "/PXI1Slot5/PXI_Trig0")]
+    assert not any(record.levelname == "CRITICAL" for record in caplog.records)
+    assert app_model.capture_start() is True
+    app_model.capture_stop()
 
 
 def _wait_for_the_pulse(daq, timeout=10.0):
@@ -951,6 +1044,7 @@ def test_stop_mid_pulse_cancels_the_pulse_and_resets_the_laser(
             LaserPulseTrain(channel_id=LaserChannelId.LASER_1,
                             amplitude_volts=1.0, duration_ms=1.0))
         _wait_for_the_pulse(daq)
+        started = len(daq.writes)
 
         with caplog.at_level("ERROR"):
             stop_thread, stop_outcome = _in_thread(app_model.capture_stop)
@@ -961,11 +1055,16 @@ def test_stop_mid_pulse_cancels_the_pulse_and_resets_the_laser(
         pulse_thread.join(5.0)
         error, = pulse_outcome
         assert "cancelled" in str(error) and "-50103" not in str(error)
-        assert daq.writes_to("PXI1Slot4/ao0", task_suffix="manual_ao",
-                             thread=stop_thread) == [0.0]
+        # The close's own reset, not the pulse's: made on the thread Stop
+        # closes the controller on.
+        assert [write.data for write in daq.writes[started:]
+                if write.channels == ("PXI1Slot4/ao0",)
+                and write.task.endswith("manual_ao")
+                and write.thread is not pulse_thread] == [0.0]
         assert daq.task("laser_1_shutter").writes[-1] is False
         assert not any("-50103" in record.getMessage()
-                       or "Failed to close laser controller" in record.getMessage()
+                       or "Failed to close" in record.getMessage()
+                       or record.levelname == "CRITICAL"
                        for record in caplog.records)
     finally:
         daq.waits_released.set()
