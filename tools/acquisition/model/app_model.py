@@ -2844,11 +2844,10 @@ class AppModel(ObservableObject):
             if (
                 subsystem_id is SubsystemId.NIDAQ_STREAM
                 and enabled
-                and self._nidaq_plan_error
+                and self._hold_nidaq_plan_blocked(required_for_recording=required)
             ):
                 # Required as configured, and held back with the reason.
-                state = SubsystemState.BLOCKED
-                reason = self._nidaq_plan_blocked_reason()
+                continue
             self._set_subsystem_status(
                 subsystem_id,
                 state,
@@ -6264,10 +6263,42 @@ class AppModel(ObservableObject):
             and not self._nidaq_plan_error
         )
 
+    @property
+    def nidaq_plan_error(self) -> str:
+        """Why the loaded NI-DAQ plan was refused, or an empty string."""
+        return self._nidaq_plan_error
+
     def _nidaq_plan_blocked_reason(self) -> str:
+        # The remedy first: the status bar cuts an error at 320 characters,
+        # which two or three refusals run past.
         return (
-            f"NI-DAQ plan refused: {self._nidaq_plan_error}; fix it in Edit DAQ Ports"
+            "NI-DAQ plan refused; fix it in Edit → Edit DAQ Ports: "
+            f"{self._nidaq_plan_error}"
         )
+
+    def _hold_nidaq_plan_blocked(
+        self, *, required_for_recording: Optional[bool] = None,
+    ) -> bool:
+        """Hold the NI-DAQ stream BLOCKED on a refused plan, and say why.
+
+        The one writer of the stream's state while a plan is refused. The
+        stream then has no channels, which every other writer reads as
+        "disabled", and the reason an operator can act on was lost: after a
+        Run and Stop, and in the monitor's own status message, which the
+        laser tabs and Analysis show. Returns whether a refusal is held.
+        """
+        monitor = self._nidaq_signal_monitor
+        if not (self._nidaq_plan_error and monitor.hardware_enabled):
+            return False
+        reason = self._nidaq_plan_blocked_reason()
+        monitor.show_blocked(reason)
+        self._set_subsystem_status(
+            SubsystemId.NIDAQ_STREAM,
+            SubsystemState.BLOCKED,
+            reason=reason,
+            required_for_recording=required_for_recording,
+        )
+        return True
 
     def _request_nidaq_stream(self, reason: str) -> None:
         """Start the shared NI-DAQ input stream if it should be running.
@@ -6535,14 +6566,9 @@ class AppModel(ObservableObject):
         A retry keeps whatever is running.
         """
         monitor = self._nidaq_signal_monitor
-        if self._nidaq_plan_error and monitor.hardware_enabled:
+        if self._hold_nidaq_plan_blocked():
             # The stream has no channels, which read as "disabled" below; it
             # is held back, with the refusal an operator can fix.
-            self._set_subsystem_status(
-                SubsystemId.NIDAQ_STREAM,
-                SubsystemState.BLOCKED,
-                reason=self._nidaq_plan_blocked_reason(),
-            )
             return False
         if not (monitor.hardware_enabled and monitor.configuration.is_enabled):
             self._set_subsystem_status(
@@ -7546,18 +7572,21 @@ class AppModel(ObservableObject):
             self._nidaq_signal_monitor.stop()
         except Exception:
             logger.exception("Failed to stop NI-DAQ stream")
-        self._set_subsystem_status(
-            SubsystemId.NIDAQ_STREAM,
-            (
-                SubsystemState.DISABLED
-                if not (
-                    self._nidaq_signal_monitor.hardware_enabled
-                    and self._nidaq_signal_monitor.configuration.is_enabled
-                )
-                else SubsystemState.STOPPED
-            ),
-            reason="NI-DAQ stream stopped",
-        )
+        # A refused plan keeps its BLOCKED and reason: its empty stream reads
+        # as disabled below.
+        if not self._hold_nidaq_plan_blocked():
+            self._set_subsystem_status(
+                SubsystemId.NIDAQ_STREAM,
+                (
+                    SubsystemState.DISABLED
+                    if not (
+                        self._nidaq_signal_monitor.hardware_enabled
+                        and self._nidaq_signal_monitor.configuration.is_enabled
+                    )
+                    else SubsystemState.STOPPED
+                ),
+                reason="NI-DAQ stream stopped",
+            )
 
         try:
             self._hardware.disconnect()
@@ -7819,9 +7848,11 @@ class AppModel(ObservableObject):
             # The stream gets no channels, and the configuration keeps the
             # operator's own stream, ports and lasers: what Edit DAQ Ports
             # shows marked invalid, and what a save writes back unchanged.
+            # The remedy first: the status bar shows this line cut at 320
+            # characters, which two or three refusals run past.
             logger.error(
-                "NI-DAQ inputs are not acquired: %s. Fix it in Edit → Edit DAQ "
-                "Ports",
+                "NI-DAQ inputs are not acquired; fix it in Edit → Edit DAQ "
+                "Ports. Refused: %s",
                 nidaq_plan_error,
             )
             self.nidaq_signal_monitor.load_configuration(NidaqSignalStreamConfiguration())
@@ -8020,12 +8051,19 @@ class AppModel(ObservableObject):
         self._loaded_configuration.nidaq_ports = nidaq_ports
         self._loaded_configuration.laser = laser_configuration
         if self._nidaq_plan_error:
-            # Fixed: the stream may start again, once the hold is let go.
+            # Fixed: the stream may start again, once the hold is let go. Its
+            # state and requirement are the fixed plan's, as a load would set
+            # them, not the refused one's: a fix can leave nothing to acquire.
             self._nidaq_plan_error = ""
+            enabled = (
+                self._nidaq_signal_monitor.hardware_enabled
+                and acquisition.is_enabled
+            )
             self._set_subsystem_status(
                 SubsystemId.NIDAQ_STREAM,
-                SubsystemState.STOPPED,
-                reason="configured; not started",
+                SubsystemState.STOPPED if enabled else SubsystemState.DISABLED,
+                reason="configured; not started" if enabled else "disabled",
+                required_for_recording=enabled,
             )
         self._nidaq_signal_monitor.load_configuration(acquisition)
         hardware_timed_output_devices = tuple(

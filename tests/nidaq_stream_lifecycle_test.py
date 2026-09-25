@@ -1076,3 +1076,211 @@ def test_christielab10s_configuration_still_loads_exactly(
     finally:
         vars(app_model)["_nidaq_stream_autostart"].close()
         monitor.close()
+
+
+def _load_with_a_bad_ni_line(app_model, system_config, trainer_config_dir, monkeypatch):
+    """Load a PFI-pin tone1, with a stand-in worker and no board check."""
+    _with_bad_nidaq_line(system_config, trainer_config_dir, tone1="Dev1/port1/line0")
+    monitor = _with_fake_worker(app_model)
+    monkeypatch.setattr(app_model, "_require_valid_nidaq_configuration", lambda: None)
+    assert app_model.load_configuration() is True
+    _settle(app_model, running=False, timeout=2.0)
+    assert _nidaq_state(app_model).state is SubsystemState.BLOCKED
+    return monitor
+
+
+def _close_stream(app_model, monitor):
+    rule = vars(app_model).get("_nidaq_stream_autostart")
+    if rule is not None:
+        rule.close()
+    monitor.close()
+
+
+def test_run_then_stop_keeps_a_bad_ni_line_blocked_with_its_reason(
+    app_model, system_config, trainer_config_dir, monkeypatch,
+):
+    # Stop wrote DISABLED "NI-DAQ stream stopped" whenever the stream had no
+    # channels, which it never has while a plan is refused: after one Run the
+    # Hardware panel said NI-DAQ was disabled, and the reason was gone.
+    monitor = _load_with_a_bad_ni_line(
+        app_model, system_config, trainer_config_dir, monkeypatch)
+    try:
+        assert app_model.capture_start() is True
+        assert _nidaq_state(app_model).state is SubsystemState.BLOCKED
+        app_model.capture_stop()
+
+        status = _nidaq_state(app_model)
+        assert status.state is SubsystemState.BLOCKED
+        assert "nidaqPorts.tone1 'Dev1/port1/line0'" in status.reason
+        assert "Edit DAQ Ports" in status.reason
+        assert status.required_for_recording
+    finally:
+        _close_stream(app_model, monitor)
+
+
+def test_record_is_refused_while_a_bad_ni_line_is_held(
+    app_model, system_config, trainer_config_dir, monkeypatch,
+):
+    from types import SimpleNamespace
+    from unittest import mock
+
+    monitor = _load_with_a_bad_ni_line(
+        app_model, system_config, trainer_config_dir, monkeypatch)
+    try:
+        assert app_model.capture_start() is True
+        assert any("nidaqPorts.tone1" in blocker
+                   for blocker in app_model.recording_blockers)
+        # Past the subject and camera checks, to the streams Record needs.
+        app_model._selected_animal = object()
+        monkeypatch.setattr(
+            app_model, "_get_monitored_cams",
+            lambda: (SimpleNamespace(is_recording_enabled=True),))
+        with mock.patch.object(app_model, "on_error") as on_error:
+            assert app_model.start_recording() is False
+        title, message = on_error.call_args.args
+        assert title == "Recording unavailable"
+        assert "nidaqPorts.tone1 'Dev1/port1/line0'" in message
+    finally:
+        app_model._selected_animal = None
+        app_model.capture_stop()
+        _close_stream(app_model, monitor)
+
+
+def test_a_good_second_load_clears_a_bad_ni_line(
+    app_model, system_config, trainer_config_dir, monkeypatch,
+):
+    monitor = _load_with_a_bad_ni_line(
+        app_model, system_config, trainer_config_dir, monkeypatch)
+    try:
+        system_config.nidaq_ports = NidaqPortConfiguration(
+            cam_frames="Dev1/port0/line0", tone1="Dev1/port0/line3")
+        system_config.save_default(trainer_config_dir)
+        assert app_model.load_configuration() is True
+        monitor = _settle(app_model)
+
+        assert app_model.nidaq_plan_error == ""
+        assert monitor.is_running
+        assert _nidaq_state(app_model).state is SubsystemState.READY
+        names = {channel.name for channel in monitor.configuration.channels}
+        assert {"cam_frames", "tone1", "stim_readback"} <= names
+    finally:
+        _close_stream(app_model, monitor)
+
+
+def test_a_bad_ni_line_is_what_the_stream_status_says(
+    app_model, system_config, trainer_config_dir, monkeypatch,
+):
+    # The laser tabs and Analysis show the monitor's status message, which
+    # said only that the stream was disabled.
+    monitor = _load_with_a_bad_ni_line(
+        app_model, system_config, trainer_config_dir, monkeypatch)
+    try:
+        assert "nidaqPorts.tone1 'Dev1/port1/line0'" in monitor.status_message
+        assert monitor.status_message == _nidaq_state(app_model).reason
+        assert monitor.status_message.startswith("NI-DAQ plan refused")
+    finally:
+        _close_stream(app_model, monitor)
+
+
+def test_the_bad_ni_line_log_says_the_remedy_before_the_refusals(
+    app_model, system_config, trainer_config_dir, caplog,
+):
+    # The status bar shows an error's first 320 characters. Three refusals
+    # ran past that, and the remedy after them was cut off.
+    _with_bad_nidaq_line(
+        system_config, trainer_config_dir,
+        tone1="Dev1/port1/line0", tone2="Dev1/port2/line1",
+        tone3_r="Dev1/port1/line5")
+    monitor = _with_fake_worker(app_model)
+    try:
+        with caplog.at_level("ERROR"):
+            assert app_model.load_configuration() is True
+        refusals = [record.getMessage() for record in caplog.records
+                    if "Edit DAQ Ports" in record.getMessage()]
+        assert len(refusals) == 1
+        assert len(refusals[0]) > 320
+        assert "Edit DAQ Ports" in refusals[0][:320]
+        assert "nidaqPorts.tone1" in refusals[0][:320]
+        reason = _nidaq_state(app_model).reason
+        assert reason.index("Edit DAQ Ports") < reason.index("nidaqPorts.tone1")
+    finally:
+        _close_stream(app_model, monitor)
+
+
+def test_the_fix_derives_the_stream_state_and_requirement_from_the_new_plan(
+    app_model, system_config, trainer_config_dir,
+):
+    # The fix wrote STOPPED "configured; not started" and kept the refused
+    # plan's requirement, whatever the fixed plan held.
+    from autotrainer.core import NidaqSignalStreamConfiguration
+
+    # A bad line, and no laser or input of the operator's own.
+    system_config.hardware.nidaq_enabled = True
+    system_config.laser = LaserSystemConfiguration()
+    system_config.nidaq_ports = NidaqPortConfiguration(tone1="Dev1/port1/line0")
+    system_config.nidaq_stream = NidaqSignalStreamConfiguration()
+    system_config.save_default(trainer_config_dir)
+    monitor = _with_fake_worker(app_model)
+    try:
+        assert app_model.load_configuration() is True
+        status = _nidaq_state(app_model)
+        assert status.state is SubsystemState.BLOCKED and status.required_for_recording
+
+        # Fixed by clearing the line: nothing is left to acquire.
+        app_model.update_daq_port_configuration(
+            NidaqPortConfiguration(), LaserSystemConfiguration())
+        _settle(app_model, running=False, timeout=2.0)
+
+        status = _nidaq_state(app_model)
+        assert app_model.nidaq_plan_error == ""
+        assert not monitor.configuration.is_enabled
+        assert status.state is SubsystemState.DISABLED
+        assert not status.required_for_recording
+    finally:
+        _close_stream(app_model, monitor)
+
+
+def test_headless_exits_1_naming_a_bad_ni_line(
+    app_model, system_config, trainer_config_dir, config_file_path, tmp_path,
+    monkeypatch, caplog,
+):
+    # Headless has no Edit DAQ Ports to fix the line in, so it refuses to run
+    # on it, as every load did before the GUI learned to load and block.
+    from types import SimpleNamespace
+
+    import autotrainer.core.event as core_event
+    import autotrainer.core.logging as core_logging
+    from tools.acquisition import headless
+    from tools.acquisition.model import app_model as app_model_module
+    from tools.acquisition.model.app_model_status import AppModelStatus
+
+    _with_bad_nidaq_line(system_config, trainer_config_dir, tone1="Dev1/port1/line0")
+    monitor = _with_fake_worker(app_model)
+    starts, closes = [], []
+    monkeypatch.setattr(app_model_module, "AppModel", lambda _preferences: app_model)
+    monkeypatch.setattr(core_event, "try_register_api_event_plugin",
+                        lambda: SimpleNamespace(service=None))
+    monkeypatch.setattr(core_logging, "get_console_handler",
+                        lambda: SimpleNamespace(setLevel=lambda _level: None))
+    monkeypatch.setattr(app_model, "capture_start",
+                        lambda **kwargs: starts.append(kwargs) or True)
+    monkeypatch.setattr(app_model, "on_close", lambda: closes.append(True))
+    args = SimpleNamespace(
+        configuration=str(config_file_path),
+        preferences_file=tmp_path / "settings.ini",
+        random_cameras=False,
+        live_inference=None,
+        start_mode=AppModelStatus.RUNNING,
+    )
+    try:
+        with caplog.at_level("ERROR"):
+            assert headless._exec_main(args) == 1
+
+        assert starts == [] and closes == [True]
+        assert any(
+            "nidaqPorts.tone1 'Dev1/port1/line0'" in record.getMessage()
+            and record.name == "autotrainer.headless"
+            for record in caplog.records
+        )
+    finally:
+        _close_stream(app_model, monitor)

@@ -130,19 +130,23 @@ port0 only: port1 and port2 are its PFI pins, and the 6713's lines cannot be
 clocked at all. The dialog offers only port0 lines of a board that clocks
 digital input; a stored value that is not one stays on its field, the status
 line says why, and OK stays disabled until it is changed. A configuration file
-naming such a line is refused when it loads, naming the field. christielab10
+naming a line off port0 still loads, but its NI-DAQ plan is refused, naming the
+field; see below. christielab10
 uses `PXI1Slot5/port0/line0`-`line3` for tone1, tone2, camFrames and barcode.
 Clearing a role (choosing the empty entry) stops its channel being acquired
 and recorded from the next save on; the log notes the dropped channel.
 
 A configuration file with a line the stream cannot acquire - a duplicate pin,
 a PFI pin on a digital role, a PFI trigger readback - still loads. Everything
-else is applied, the NI-DAQ stream is held with no channels, Hardware Status
-shows NI-DAQ blocked with the reason, and the status bar says *NI-DAQ inputs
-are not acquired: ... Fix it in Edit → Edit DAQ Ports*. Open the dialog: the
-bad value stays on its field with the reason, and OK stays disabled until it
-is fixed. Saving a valid assignment starts the stream. Until then the file
-keeps the values it had, including when reachAQ saves on exit.
+else is applied, the NI-DAQ stream is held with no channels, and Hardware
+Status shows NI-DAQ blocked with the reason, through Run and Stop; Record is
+refused on it. The status bar says *NI-DAQ inputs are not acquired; fix it in
+Edit → Edit DAQ Ports. Refused: ...*, the remedy first because the status bar
+cuts a long message. Open the dialog: the bad value stays on its field with
+the reason, and OK stays disabled until it is fixed. Saving a valid assignment
+starts the stream. Until then the file keeps the values it had, including when
+reachAQ saves on exit. Headless reachAQ has no dialog to fix it in, so it exits
+with code 1 instead, naming the line.
 
 The current NI PXI-6713 appears as:
 

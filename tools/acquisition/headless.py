@@ -68,6 +68,14 @@ def _exec_main(args):
         logger.exception("Could not load config: %s", err)
         app_model.on_close()
         return 1
+    # The GUI loads a line the NI-DAQ stream cannot acquire and holds the
+    # stream until Edit DAQ Ports fixes it. There is no dialog here, so this
+    # refuses to run on it, as every load did before.
+    if app_model.nidaq_plan_error:
+        logger.error("Could not load config: NI-DAQ plan refused: %s",
+                     app_model.nidaq_plan_error)
+        app_model.on_close()
+        return 1
 
     if args.live_inference is not None:
         app_model.set_runtime_live_inference_override(args.live_inference)
