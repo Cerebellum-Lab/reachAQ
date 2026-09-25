@@ -124,10 +124,13 @@ def test_the_daq_monitor_is_offered_only_while_idle():
         "daq_monitor_action",
     )
     offered = {}
-    for label, status, recording, started in (
-        ("idle", AppModelStatus.IDLE, SessionRecordingStatus.READY, False),
-        ("running", AppModelStatus.RUNNING, SessionRecordingStatus.READY, True),
-        ("recording", AppModelStatus.RUNNING, SessionRecordingStatus.RECORDING, True),
+    run_offered = {}
+    for label, status, recording, started, calibrating in (
+        ("idle", AppModelStatus.IDLE, SessionRecordingStatus.READY, False, False),
+        ("running", AppModelStatus.RUNNING, SessionRecordingStatus.READY, True, False),
+        ("recording", AppModelStatus.RUNNING, SessionRecordingStatus.RECORDING, True, False),
+        # A laser calibration ramp holds the NI-DAQ lines in Idle.
+        ("calibrating", AppModelStatus.IDLE, SessionRecordingStatus.READY, False, True),
     ):
         window = SimpleNamespace(
             _start_capture_thread=None,
@@ -139,11 +142,15 @@ def test_the_daq_monitor_is_offered_only_while_idle():
                 status=status,
                 session_recording_status=recording,
                 acquisition_started=started,
+                laser_calibration_active=calibrating,
             ),
             _set_hardware_menu_actions_enabled=lambda _enabled: None,
             **{name: _EnableRecorder() for name in controls},
         )
         MainWindow._refresh_ui_availability(window)
         offered[label] = window.daq_monitor_action.enabled
+        run_offered[label] = window.run_action.enabled
 
-    assert offered == {"idle": True, "running": False, "recording": False}
+    assert offered == {
+        "idle": True, "running": False, "recording": False, "calibrating": False}
+    assert run_offered["idle"] and not run_offered["calibrating"]

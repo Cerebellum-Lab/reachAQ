@@ -13,6 +13,7 @@ stream worker, and a null laser controller for the ramp itself.
 
 import dataclasses
 import os
+import threading
 import time
 from types import SimpleNamespace
 
@@ -397,3 +398,164 @@ def test_run_ramp_runs_through_the_model_and_never_stops_the_stream_itself(
     # Run Pulse refusal, which is still true in Idle.
     assert content._status_label.text().startswith("Ramp complete: 5 points")
     assert tab._run_ramp_button.isEnabled()
+
+
+# ------------------------------------------------------- review fix round 1
+
+
+def test_a_ramp_is_refused_once_closing_has_begun(ramp_app):
+    app, spy = ramp_app
+    app._closing_event.set()
+
+    assert "closing" in app.laser_calibration_refusal()
+    with pytest.raises(RuntimeError, match="closing"):
+        app.run_laser_calibration_ramp(RAMP)
+    assert spy.controllers == []
+    assert app._nidaq_stream_autostart.pause_reasons == ()
+
+
+def test_a_pause_that_fails_leaves_no_hold_behind(ramp_app, monkeypatch):
+    # The hold is registered before the stream is stopped, and the pause sat
+    # outside the try that lets go: a stop that raised left the ramp holding
+    # the stream forever, and every later ramp and DAQ Monitor refused.
+    app, spy = ramp_app
+    monitor = app.nidaq_signal_monitor
+    real_stop = monitor.stop
+    calls = []
+
+    def failing_stop(*args, **kwargs):
+        calls.append(True)
+        if len(calls) == 1:
+            raise RuntimeError("the NI-DAQ worker did not stop")
+        return real_stop(*args, **kwargs)
+
+    monkeypatch.setattr(monitor, "stop", failing_stop)
+
+    with pytest.raises(RuntimeError, match="did not stop"):
+        app.run_laser_calibration_ramp(RAMP)
+
+    assert app._nidaq_stream_autostart.pause_reasons == ()
+    assert app.laser_calibration_refusal() == ""
+    assert spy.controllers == []
+    assert len(app.run_laser_calibration_ramp(RAMP)) == 3
+    assert _settle(app).is_running
+
+
+def test_the_application_announces_a_ramp_starting_and_ending(ramp_app):
+    app, _spy = ramp_app
+    seen = []
+    app.property_changed += lambda name, value, _old: (
+        seen.append(value) if name == AppModel.Props.LASER_CALIBRATION_ACTIVE else None)
+
+    app.run_laser_calibration_ramp(RAMP)
+
+    assert seen == [True, False]
+    assert app.laser_calibration_active is False
+
+
+def test_a_nidaq_laser_without_hardware_timing_refuses_the_ramp(idle_panel, qapp):
+    # The controller refuses a ramp without hardwareTimed and a sampleRateHz
+    # (nidaq_laser.py); the button stayed enabled and the press failed.
+    app_model, content, _tab = idle_panel
+    app_model.laser.set_configuration_offline(dataclasses.replace(
+        _null_lasers(), backend="nidaq", hardware_timed=False, sample_rate_hz=None))
+    qapp.processEvents()
+
+    refusal = app_model.laser_calibration_refusal()
+    assert "hardwareTimed" in refusal and "sampleRateHz" in refusal
+    tab = content._channel_tabs[0]
+    assert not tab._run_ramp_button.isEnabled()
+    assert "hardwareTimed" in tab._run_ramp_button.toolTip()
+
+
+def test_the_footer_drops_its_own_refusal_once_a_ramp_can_run(idle_panel, qapp):
+    # A rebuild during a hold, a configuration load's or a DAQ ports save's,
+    # found nothing to fire and said "press Run first"; the refreshes after
+    # it do not announce, so the line kept saying so in Idle, where a ramp
+    # can run.
+    app_model, content, _tab = idle_panel
+    rule = app_model._nidaq_stream_autostart
+    rule.pause("test hold", "the configuration is loading")
+    try:
+        content._refresh_from_model()
+        assert "press Run first" in content._status_label.text()
+    finally:
+        rule.resume("test hold")
+    qapp.processEvents()
+
+    assert "press Run first" not in content._status_label.text()
+    assert content._status_label.text().startswith("Ready: 1/4")
+
+
+def test_a_failed_laser_operation_says_what_failed(idle_panel, qapp, caplog):
+    # It said "Laser operation stopped", and the reason reached only the
+    # log's traceback: a -89125 from the ramp's first press would not have
+    # been seen.
+    _app_model, content, _tab = idle_panel
+
+    def failing():
+        raise RuntimeError(
+            "DAQmx Error -89125: No registered trigger lines could be found\n"
+            "Task Name: laser_1_calibration_ai")
+
+    with caplog.at_level("ERROR"):
+        content._start_operation("Running laser 1 calibration ramp", failing)
+        deadline = time.monotonic() + 10.0
+        while content._operation_thread is not None and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(0.01)
+        qapp.processEvents()
+
+    footer = content._status_label.text()
+    assert "-89125" in footer and "Task Name" not in footer
+    assert any(
+        "Laser operation failed: DAQmx Error -89125" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_run_ramp_runs_on_the_operation_worker_off_the_qt_thread(ramp_app, qapp, monkeypatch):
+    # The real path: the button's operation worker calls the application,
+    # which pauses and stops the stream there, not on the Qt thread.
+    app, spy = ramp_app
+    monitor = app.nidaq_signal_monitor
+    real_stop = monitor.stop
+    stop_threads = []
+
+    def recording_stop(*args, **kwargs):
+        stop_threads.append(threading.current_thread())
+        return real_stop(*args, **kwargs)
+
+    monkeypatch.setattr(monitor, "stop", recording_stop)
+    seen = {}
+
+    def during():
+        seen["thread"] = threading.current_thread()
+        seen["holders"] = app._nidaq_stream_autostart.pause_reasons
+        seen["stream active"] = _stream_active(monitor)
+
+    spy.during = during
+    content = LaserControlContent(app)
+    try:
+        tab = content._channel_tabs[0]
+        assert tab._run_ramp_button.isEnabled(), tab._run_ramp_button.toolTip()
+
+        tab._run_ramp_button.click()
+        deadline = time.monotonic() + 15.0
+        while content._operation_thread is not None and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(0.01)
+        qapp.processEvents()
+
+        assert seen["thread"] is not threading.main_thread()
+        assert seen["holders"] == (RAMP_HOLD_REASON,)
+        assert seen["stream active"] is False
+        assert stop_threads and all(
+            thread is not threading.main_thread() for thread in stop_threads)
+        controller, = spy.controllers
+        assert controller.closed
+        assert content._status_label.text().startswith("Ramp complete: 11 points")
+        assert _settle(app).is_running
+    finally:
+        content.on_close()
+        content.deleteLater()

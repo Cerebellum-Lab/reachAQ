@@ -285,6 +285,12 @@ class NidaqLaserController:
         self._command_volts: Dict[LaserChannelId, float] = {}
         self._operation_lock = threading.RLock()
         self._live_operations: Dict[str, NidaqLaserOperation] = {}
+        #: The tasks of a calibration ramp in progress, for close() to abort
+        #: from another thread; see run_calibration_ramp.
+        self._calibration_tasks: List[object] = []
+        #: Set by close(), under _operation_lock. A ramp starts its tasks only
+        #: while it is clear.
+        self._closed = False
         try:
             for channel in configuration.channels:
                 channel_started = time.perf_counter()
@@ -714,6 +720,10 @@ class NidaqLaserController:
         run_error = None
         points = ()
         try:
+            # Where close() can find them: reachAQ closing mid-ramp closes
+            # this controller from its own thread, and this one may then be
+            # inside DAQmx, waiting on these.
+            self._hold_calibration_tasks(ao_task, ai_task)
             ao_task.timing.cfg_samp_clk_timing(
                 rate=sample_rate_hz,
                 sample_mode=self._nidaqmx.constants.AcquisitionType.FINITE,
@@ -739,13 +749,23 @@ class NidaqLaserController:
                         "rising",
                     )
                 )
+                self._hold_calibration_tasks(digital_tasks[-1])
             ao_task.write(waveform, auto_start=False)
-            if ramp.open_shutter:
-                self.set_shutter_open(channel.channel_id, True)
-            for task in digital_tasks:
-                task.start()
-            ai_task.start()
-            ao_task.start()
+            # Under the lock close() takes, and only while the controller is
+            # open: a close that came first has reset the outputs and must
+            # not find the laser driven after it; one that comes after finds
+            # these started, and aborts them.
+            with self._operation_lock:
+                if self._closed:
+                    raise RuntimeError(
+                        "the laser controller was closed before the calibration "
+                        "ramp started")
+                if ramp.open_shutter:
+                    self.set_shutter_open(channel.channel_id, True)
+                for task in digital_tasks:
+                    task.start()
+                ai_task.start()
+                ao_task.start()
             ao_task.wait_until_done(timeout=timeout_seconds)
             ai_task.wait_until_done(timeout=timeout_seconds)
             raw_samples = ai_task.read(number_of_samples_per_channel=len(waveform), timeout=timeout_seconds)
@@ -754,6 +774,8 @@ class NidaqLaserController:
             run_error = exc
             raise
         finally:
+            with self._operation_lock:
+                self._calibration_tasks.clear()
             self._cleanup_calibration_ramp(
                 ao_task=ao_task,
                 ai_task=ai_task,
@@ -763,6 +785,15 @@ class NidaqLaserController:
                 run_error=run_error,
             )
         return points
+
+    def _hold_calibration_tasks(self, *tasks) -> None:
+        """Keep a ramp's tasks where close() can abort them, unless closed."""
+        with self._operation_lock:
+            if self._closed:
+                raise RuntimeError(
+                    "the laser controller was closed before the calibration "
+                    "ramp started")
+            self._calibration_tasks.extend(tasks)
 
     def _validate_command_voltage(self, channel: LaserChannelConfiguration, volts: float) -> None:
         if not channel.minimum_command_volts <= volts <= channel.maximum_command_volts:
@@ -823,6 +854,11 @@ class NidaqLaserController:
         self._stop_and_close_task("calibration analog input task", ai_task, errors)
         for index, task in enumerate(digital_tasks):
             self._stop_and_close_task(f"calibration digital output task {index}", task, errors)
+        if getattr(self, "_closed", False):
+            # close() has already put the command, the shutters and the PMT
+            # shutter back, and released the tasks this would write them with.
+            self._raise_or_log_cleanup_errors("NI-DAQ laser calibration ramp", errors, run_error)
+            return
         try:
             self.set_command_voltage(channel.channel_id, channel.minimum_command_volts)
         except Exception as exc:
@@ -886,6 +922,7 @@ class NidaqLaserController:
 
     def close(self) -> None:
         errors = []
+        errors.extend(self._abort_calibration_ramp())
         for operation in tuple(getattr(self, "_live_operations", {}).values()):
             try:
                 operation.cancel()
@@ -915,6 +952,47 @@ class NidaqLaserController:
         if errors:
             locations = ", ".join(location for location, _ in errors)
             raise RuntimeError(f"Failed to close NI-DAQ laser controller cleanly: {locations}") from errors[0][1]
+
+    def _abort_calibration_ramp(self) -> List[Tuple[str, Exception]]:
+        """Stop a calibration ramp running on another thread, for close().
+
+        reachAQ closing mid-ramp closes this controller from the close path
+        while the ramp's thread may be blocked inside DAQmx, in Wait Until
+        Done. The ramp's tasks hold the analog output, so close() could not
+        write the command back to its minimum (-50103), and the 6713 kept its
+        last sample. Aborting them is the DAQmx operation meant for another
+        thread: it returns a task to before it started, which releases its
+        lines, and makes a wait blocked on it return with an error. The ramp
+        thread still stops and clears them in its own finally; nothing here
+        clears a task another thread may be using. Marked closed under the
+        same lock the ramp starts its tasks under, so a ramp not yet started
+        never starts.
+        """
+        lock = getattr(self, "_operation_lock", None)
+        if lock is None:
+            return []
+        with lock:
+            self._closed = True
+            tasks = tuple(getattr(self, "_calibration_tasks", ()))
+        if not tasks:
+            return []
+        errors = []
+        for task in tasks:
+            try:
+                task.control(self._nidaqmx.constants.TaskMode.TASK_ABORT)
+            except Exception as exc:
+                errors.append(("calibration task abort", exc))
+                logger.exception("Failed to abort a NI-DAQ laser calibration task")
+        # Held high for the whole ramp when it was asked for; nothing else
+        # in close() knows the line.
+        pmt_line = self._configuration.pmt_shutter_output
+        if pmt_line:
+            try:
+                self._write_transient_digital_line(pmt_line, False, "laser_pmt_shutter_close")
+            except Exception as exc:
+                errors.append(("PMT shutter close", exc))
+                logger.exception("Failed to close the NI-DAQ PMT shutter output during close")
+        return errors
 
     def _connect_trigger_route(self, channel: LaserChannelConfiguration) -> None:
         """Drive this channel's trigger terminal from where the pulse arrives.

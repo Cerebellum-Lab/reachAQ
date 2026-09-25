@@ -440,6 +440,129 @@ def test_start_stop(app_model, settings_ini_path):
     # ...
 
 
+def _null_lasers():
+    from autotrainer.core import (
+        LaserChannelConfiguration,
+        LaserChannelId,
+        LaserSystemConfiguration,
+    )
+    return LaserSystemConfiguration.from_channels(
+        (
+            LaserChannelConfiguration(
+                channel_id=LaserChannelId.LASER_1,
+                analog_output="Dev1/ao0",
+                diode_input="Dev1/ai0",
+                shutter_output="Dev1/port0/line2",
+            ),
+        ),
+        backend="null",
+        sample_rate_hz=1000.0,
+    )
+
+
+def _blocking_ramp(app_model, monkeypatch):
+    """A ramp held inside its controller until released, as one inside DAQmx is."""
+    from autotrainer.device import NullLaserController
+
+    inside = threading.Event()
+    release = threading.Event()
+    controllers = []
+
+    class _Held(NullLaserController):
+        closed = False
+
+        def run_calibration_ramp(self, ramp):
+            inside.set()
+            release.wait(30.0)
+            return super().run_calibration_ramp(ramp)
+
+        def close(self):
+            self.closed = True
+            super().close()
+
+    def open_controller(configuration, **_kwargs):
+        controllers.append(_Held(configuration))
+        return controllers[-1]
+
+    monkeypatch.setattr(app_model.laser, "open_controller", open_controller)
+    return inside, release, controllers
+
+
+def _ramp(timeout_seconds=None):
+    from autotrainer.core import LaserChannelId
+    from autotrainer.device import LaserCalibrationRamp
+    return LaserCalibrationRamp(
+        channel_id=LaserChannelId.LASER_1, start_volts=0.0, stop_volts=5.0,
+        steps=3, samples_per_step=10, timeout_seconds=timeout_seconds)
+
+
+def _in_thread(function, *args):
+    outcome = []
+
+    def run():
+        try:
+            outcome.append(function(*args))
+        except Exception as error:
+            outcome.append(error)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread, outcome
+
+
+def test_closing_mid_ramp_waits_for_the_ramp_to_hand_the_laser_back(app_model, monkeypatch):
+    # The ramp's controller is its own, never the laser model's, so the
+    # laser close in on_close never reached it, and nothing waited for the
+    # ramp: the process could end with the 6713 on its last sample and the
+    # shutter line high.
+    assert app_model.load_configuration() is True
+    app_model.laser.set_configuration_offline(_null_lasers())
+    inside, release, controllers = _blocking_ramp(app_model, monkeypatch)
+    ramp_thread, _ramp_outcome = _in_thread(app_model.run_laser_calibration_ramp, _ramp())
+    assert inside.wait(10.0)
+
+    close_thread, close_outcome = _in_thread(app_model.on_close)
+    time.sleep(0.5)
+    assert close_thread.is_alive(), close_outcome
+    controller, = controllers
+    assert not controller.closed
+
+    release.set()
+    ramp_thread.join(10.0)
+    close_thread.join(60.0)
+
+    assert not close_thread.is_alive()
+    assert controller.closed
+    assert close_outcome == [None]
+
+
+def test_closing_past_the_ramp_timeout_closes_the_ramp_controller(app_model, monkeypatch):
+    from tools.acquisition.model import app_model as app_model_module
+
+    monkeypatch.setattr(app_model_module, "_LASER_CALIBRATION_CLOSE_MARGIN_S", 0.5)
+    assert app_model.load_configuration() is True
+    app_model.laser.set_configuration_offline(_null_lasers())
+    inside, release, controllers = _blocking_ramp(app_model, monkeypatch)
+    ramp_thread, _ramp_outcome = _in_thread(
+        app_model.run_laser_calibration_ramp, _ramp(timeout_seconds=0.5))
+    assert inside.wait(10.0)
+    try:
+        close_thread, close_outcome = _in_thread(app_model.on_close)
+        close_thread.join(60.0)
+
+        # The ramp is still held, and close went on without it once the
+        # ramp's own timeout had passed, closing its controller: that drives
+        # the command to its minimum and closes the shutters.
+        assert not close_thread.is_alive()
+        assert close_outcome == [None]
+        assert ramp_thread.is_alive()
+        controller, = controllers
+        assert controller.closed
+    finally:
+        release.set()
+        ramp_thread.join(10.0)
+
+
 def test_acquisition_owns_configured_signal_stream_lifecycle(app_model, monkeypatch):
     assert app_model.load_configuration() is True
     monitor = app_model.nidaq_signal_monitor

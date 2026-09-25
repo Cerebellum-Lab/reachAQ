@@ -336,13 +336,21 @@ shutter** holds the PMT shutter open for the ramp. Press **Run Ramp**.
 - For the ramp's length reachAQ pauses the NI-DAQ input stream, so every NI
   graph stops, and opens the laser controller for the ramp alone. Both are
   handed back when the ramp ends, including when it fails.
-- While it runs, **Run**, opening the **DAQ Monitor**, loading a configuration
-  and saving **Edit DAQ Ports** are refused, with the reason in the status
-  bar.
+- While it runs, **Run**, **Edit DAQ Ports**, the **DAQ Monitor**, hardware
+  refresh and Preferences are greyed out, and the application refuses them,
+  and a configuration load, with the reason in the status bar.
 - It needs `hardwareTimed: true` and a `sampleRateHz` in the laser
-  configuration; christielab10 has both.
+  configuration; christielab10 has both. Without them the button is greyed
+  out and its tooltip names what is missing.
 - Success reads *"Ramp complete: 11 points, last diode 1.234 V, monotonic
-  curve validated"*, and the Output stream graph shows the whole ramp.
+  curve validated"*, and the Output stream graph shows the whole ramp. A
+  failure reads *"Laser operation failed: ..."* with the first line of the
+  reason, on the panel's status line and in the status bar; the whole error is
+  in the log.
+- Closing reachAQ during a ramp waits for the ramp to end, for as long as the
+  ramp itself may take plus five seconds; past that it closes the ramp's laser
+  controller, which puts the command back to its minimum and closes the
+  shutters, before anything else closes.
 
 ## What failure looks like
 
