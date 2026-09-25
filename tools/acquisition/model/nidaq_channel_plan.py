@@ -57,8 +57,41 @@ def nidaq_channel_kind(physical_channel: str) -> str:
 #: M Series board clocks port0 only (see nidaq_monitor_survey).
 _STREAMABLE_INPUT = re.compile(
     rf"^/?[^/]+/(ai\d+|{BUFFERED_PORT}/line\d+)$", re.IGNORECASE)
+#: One port0 line: the only digital line the stream can sample.
+_STREAMABLE_LINE = re.compile(rf"^/?[^/]+/{BUFFERED_PORT}/line\d+$", re.IGNORECASE)
 #: A digital line on another port: port1 and port2 are the static PFI pins.
 _STATIC_LINE = re.compile(r"^/?[^/]+/port\d+/line\d+$", re.IGNORECASE)
+_PFI_PIN_LINES = (
+    "port1/port2 lines are PFI pins that cannot be sampled with the stream")
+
+#: A port role's field as the configuration file and Edit DAQ Ports name it.
+_PORT_ROLE_FIELDS = {"cam_frames": "camFrames", "tone3_r": "tone3R", "tone3_l": "tone3L"}
+
+
+def port_role_field(attribute: str) -> str:
+    """nidaqPorts' field for a port role: camFrames for cam_frames."""
+    return _PORT_ROLE_FIELDS.get(attribute, attribute)
+
+
+def _is_pfi_pin_line(terminal: str) -> bool:
+    """A digital line off port0: STIM3's /PXI1Slot5/PFI0 is PXI1Slot5/port1/line0."""
+    return bool(_STATIC_LINE.match(terminal)) and not _STREAMABLE_LINE.match(terminal)
+
+
+def port_role_refusal(attribute: str, terminal: str) -> str:
+    """Why the stream cannot sample this port role's line, or an empty string.
+
+    Every port role is a digital input in the stream's one clocked DI task,
+    so it has the trigger readback's rule for lines: port0 only. A port1 or
+    port2 line, or anything that is not a line, took every NI input down
+    (-200452). Edit DAQ Ports refuses the same, from this.
+    """
+    subject = f"nidaqPorts.{port_role_field(attribute)} {terminal!r}"
+    if _is_pfi_pin_line(terminal):
+        return f"{subject} is not streamable: {_PFI_PIN_LINES}; use a port0 line"
+    if not _STREAMABLE_LINE.match(terminal):
+        return f"{subject} must be one port0 line (port0/lineN) on the input card"
+    return ""
 
 
 def laser_output_lines(
@@ -89,12 +122,10 @@ def trigger_readback_refusal(
 ) -> str:
     """Why this trigger readback input cannot be acquired, or an empty string."""
     subject = f"Laser {int(laser_number)} trigger readback input {terminal!r}"
-    if _STATIC_LINE.match(terminal) and not _STREAMABLE_INPUT.match(terminal):
-        # STIM3's /PXI1Slot5/PFI0 is PXI1Slot5/port1/line0 by another name.
+    if _is_pfi_pin_line(terminal):
         return (
-            f"{subject} is not streamable: port1/port2 lines are PFI pins that "
-            "cannot be sampled with the stream; use an analog input (aiN) or "
-            "a port0 line"
+            f"{subject} is not streamable: {_PFI_PIN_LINES}; use an analog "
+            "input (aiN) or a port0 line"
         )
     if not _STREAMABLE_INPUT.match(terminal):
         return (
@@ -162,6 +193,15 @@ def build_nidaq_acquisition_configuration(
         for channel in configured_stream.channels
     }
     role_physical_channels = set()
+    port_refusals = tuple(
+        refusal
+        for attribute, _name in _PORT_INPUT_ROLES
+        if getattr(ports, attribute)
+        for refusal in (port_role_refusal(attribute, getattr(ports, attribute)),)
+        if refusal
+    )
+    if port_refusals:
+        raise ValueError("; ".join(port_refusals))
     for attribute, name in _PORT_INPUT_ROLES:
         physical_channel = getattr(ports, attribute)
         if not physical_channel:

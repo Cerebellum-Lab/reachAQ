@@ -123,6 +123,16 @@ a background worker and the dialog lists channels reported for the selected
 device. It rejects duplicate assignments and disables role types unsupported by
 the device.
 
+The digital roles - tone1, tone2, tone3R, tone3L, camFrames and barcode - must
+be **port0 lines on the input card**. The stream samples them all in one
+clocked digital-input task, and an M Series board such as the 6221 clocks
+port0 only: port1 and port2 are its PFI pins, and the 6713's lines cannot be
+clocked at all. The dialog offers only port0 lines of a board that clocks
+digital input; a stored value that is not one stays on its field, the status
+line says why, and OK stays disabled until it is changed. A configuration file
+naming such a line is refused when it loads, naming the field. christielab10
+uses `PXI1Slot5/port0/line0`-`line3` for tone1, tone2, camFrames and barcode.
+
 The current NI PXI-6713 appears as:
 
 ```text

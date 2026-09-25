@@ -532,3 +532,123 @@ def test_a_trigger_readback_on_a_port_role_line_is_refused():
 
     assert "tone1" in str(refused.value)
     assert "laser1_trigger" in str(refused.value)
+
+
+# ------------------------------------------------------------ port-role lines
+
+
+@pytest.mark.parametrize(
+    ("attribute", "field"),
+    [("tone1", "tone1"), ("tone2", "tone2"), ("tone3_r", "tone3R"),
+     ("tone3_l", "tone3L"), ("cam_frames", "camFrames"), ("barcode", "barcode")],
+)
+def test_a_port_role_on_a_pfi_pin_line_is_refused(attribute, field):
+    # The stream samples every digital role in one clocked task, and an M
+    # Series board clocks port0 only; a port1 or port2 line took every NI
+    # input down (-200452).
+    with pytest.raises(ValueError) as refused:
+        build_nidaq_acquisition_configuration(
+            _empty_stream(),
+            NidaqPortConfiguration(**{attribute: "PXI1Slot5/port1/line0"}),
+            LaserSystemConfiguration(),
+        )
+
+    message = str(refused.value)
+    assert field in message and "PXI1Slot5/port1/line0" in message
+    assert "PFI pins" in message and "port0 line" in message
+
+
+def test_a_port_role_on_an_analog_input_is_refused():
+    with pytest.raises(ValueError) as refused:
+        build_nidaq_acquisition_configuration(
+            _empty_stream(),
+            NidaqPortConfiguration(cam_frames="PXI1Slot5/ai0"),
+            LaserSystemConfiguration(),
+        )
+
+    assert "camFrames" in str(refused.value) and "port0 line" in str(refused.value)
+
+
+def _christielab10_stream():
+    """christielab10's saved nidaqStream channels, as of 2026-09-24."""
+    def digital(name, line):
+        return NidaqSignalChannelConfiguration(
+            name, f"PXI1Slot5/port0/line{line}", kind="digital", unit="logic")
+
+    def analog(name, pin):
+        return NidaqSignalChannelConfiguration(name, f"PXI1Slot5/{pin}", kind="analog", unit="V")
+
+    return NidaqSignalStreamConfiguration(
+        channels=(
+            digital("cam_frames", 2),
+            digital("barcode", 3),
+            digital("tone1", 0),
+            digital("tone2", 1),
+            analog("laser1_diode", "ai8"),
+            analog("laser1_command_copy", "ai3"),
+            analog("laser2_diode", "ai4"),
+            analog("laser2_command_copy", "ai5"),
+            analog("laser1_trigger_readback", "ai9"),
+            analog("laser2_trigger_readback", "ai10"),
+        ),
+        is_enabled=True,
+        sample_rate_hz=10000.0,
+        read_chunk_size=500,
+        display_channels=("laser1_command_copy", "cam_frames", "barcode", "tone2", "tone1"),
+    )
+
+
+def _christielab10_lasers():
+    return LaserSystemConfiguration.from_channels(
+        (
+            LaserChannelConfiguration(
+                channel_id=LaserChannelId.LASER_1,
+                analog_output="PXI1Slot4/ao0",
+                diode_input="PXI1Slot5/ai8",
+                shutter_output="PXI1Slot5/port0/line4",
+                command_copy_input="PXI1Slot5/ai3",
+                trigger_source="/PXI1Slot4/PXI_Trig0",
+                trigger_route_source="/PXI1Slot5/PFI0",
+                board_stim_line=3,
+            ),
+            LaserChannelConfiguration(
+                channel_id=LaserChannelId.LASER_2,
+                analog_output="PXI1Slot4/ao1",
+                diode_input="PXI1Slot5/ai4",
+                shutter_output="PXI1Slot5/port0/line5",
+                command_copy_input="PXI1Slot5/ai5",
+                trigger_source="/PXI1Slot4/PXI_Trig2",
+                trigger_route_source="/PXI1Slot5/PFI1",
+                board_stim_line=2,
+            ),
+        ),
+        backend="nidaq",
+        hardware_timed=True,
+        sample_rate_hz=100000.0,
+        trigger_listener_inputs=("/PXI1Slot4/PXI_Trig0", "/PXI1Slot4/PXI_Trig2"),
+    )
+
+
+CHRISTIELAB10_PORTS = NidaqPortConfiguration(
+    device_name="PXI1Slot5",
+    tone1="PXI1Slot5/port0/line0",
+    tone2="PXI1Slot5/port0/line1",
+    cam_frames="PXI1Slot5/port0/line2",
+    barcode="PXI1Slot5/port0/line3",
+    tone3_r=None,
+    tone3_l=None,
+)
+
+
+def test_christielab10s_port_block_loads_unchanged():
+    # The rules for digital lines and cleared roles must leave the rig's own
+    # configuration exactly as it is: every channel, in order, with its
+    # settings and display selection.
+    stored = _christielab10_stream()
+
+    result = build_nidaq_acquisition_configuration(
+        stored, CHRISTIELAB10_PORTS, _christielab10_lasers())
+
+    assert result.channels == stored.channels
+    assert result.display_channels == stored.display_channels
+    assert result == stored

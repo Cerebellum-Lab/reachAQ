@@ -48,10 +48,15 @@ def _set_device(dialog, device_name):
     dialog._device_combo.setCurrentIndex(index)
 
 
+#: What discovery reports for a board that clocks digital input, a PXI-6221.
+_BUFFERED_DI_RATE = 1_000_000.0
+
+
 def test_selected_daq_channel_is_removed_from_other_roles(qapp):
     device = NidaqDevicePorts(
         name="Dev1",
         digital_inputs=("Dev1/port0/line0", "Dev1/port0/line1"),
+        digital_input_max_rate=_BUFFERED_DI_RATE,
     )
     dialog = NidaqPortConfigurationDialog(SystemConfiguration(), devices=(device,))
 
@@ -95,11 +100,84 @@ def test_duplicate_daq_channel_assignments_are_rejected(qapp):
     device = NidaqDevicePorts(
         name="Dev1",
         digital_inputs=("Dev1/port0/line0", "Dev1/port0/line1"),
+        digital_input_max_rate=_BUFFERED_DI_RATE,
     )
     dialog = NidaqPortConfigurationDialog(config, devices=(device,))
 
     with pytest.raises(ValueError, match="Duplicate channel assignment"):
         dialog._validate_selected_channel_assignments(device)
+
+
+_DIGITAL_PORT_ROLES = ("tone1", "tone2", "tone3_r", "tone3_l", "cam_frames", "barcode")
+
+
+def _input_card(name="Dev1"):
+    # An M Series board: port0 clocks, port1 and port2 are the PFI pins.
+    return NidaqDevicePorts(
+        name=name,
+        analog_inputs=(f"{name}/ai0",),
+        digital_inputs=(
+            f"{name}/port0/line0", f"{name}/port0/line1",
+            f"{name}/port1/line0", f"{name}/port2/line7",
+        ),
+        digital_input_max_rate=_BUFFERED_DI_RATE,
+    )
+
+
+def _output_card(name="Dev2"):
+    # A PXI-6713: lines, but no DI rate, and no clocked digital input.
+    return NidaqDevicePorts(
+        name=name,
+        analog_outputs=(f"{name}/ao0",),
+        digital_outputs=(f"{name}/port0/line0",),
+        digital_inputs=(f"{name}/port0/line0", f"{name}/port0/line1"),
+    )
+
+
+def test_every_digital_port_role_offers_only_lines_the_stream_can_clock(qapp):
+    # It offered every digital input line discovery reported, port1/port2
+    # PFI pins and PXI-6713 lines included, and any of them took every NI
+    # input down (-200452).
+    dialog = NidaqPortConfigurationDialog(
+        SystemConfiguration(), devices=(_input_card(), _output_card()))
+
+    _set_device(dialog, "Dev1")
+    for role in _DIGITAL_PORT_ROLES:
+        assert set(_combo_values(dialog._general_combos[role])) == {
+            None, "Dev1/port0/line0", "Dev1/port0/line1"}, role
+
+    _set_device(dialog, "Dev2")
+    for role in _DIGITAL_PORT_ROLES:
+        assert _combo_values(dialog._general_combos[role]) == (None,), role
+
+
+def test_a_stored_pfi_pin_tone_is_shown_as_invalid_and_blocks_ok(qapp):
+    config = SystemConfiguration()
+    config.nidaq_ports = NidaqPortConfiguration(
+        device_name="Dev1", tone1="Dev1/port1/line0")
+    dialog = NidaqPortConfigurationDialog(config, devices=(_input_card(),))
+
+    # Kept and shown, not dropped, so the operator sees what to change.
+    assert dialog._general_combos["tone1"].currentData() == "Dev1/port1/line0"
+    status = dialog._status_label.text()
+    assert "tone1" in status and "Dev1/port1/line0" in status
+    assert "PFI pins" in status
+    assert not _ok_enabled(dialog)
+    dialog.accept()
+    assert dialog.result() != QDialog.DialogCode.Accepted
+
+
+def test_a_stored_line_on_a_board_that_cannot_clock_it_is_shown_as_invalid(qapp):
+    config = SystemConfiguration()
+    config.nidaq_ports = NidaqPortConfiguration(
+        device_name="Dev1", tone2="Dev2/port0/line0")
+    dialog = NidaqPortConfigurationDialog(
+        config, devices=(_input_card(), _output_card()))
+
+    assert dialog._general_combos["tone2"].currentData() == "Dev2/port0/line0"
+    status = dialog._status_label.text()
+    assert "tone2" in status and "Dev2 cannot clock digital input" in status
+    assert not _ok_enabled(dialog)
 
 
 def test_laser_assignments_remain_visible_when_switching_channel_source(qapp):

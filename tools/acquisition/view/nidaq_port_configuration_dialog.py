@@ -37,6 +37,8 @@ from tools.acquisition.model.nidaq_breakout import (
 )
 from tools.acquisition.model.nidaq_channel_plan import (
     laser_output_lines,
+    port_role_field,
+    port_role_refusal,
     trigger_readback_refusal,
 )
 from tools.acquisition.model.nidaq_monitor_survey import BUFFERED_PORT
@@ -382,7 +384,7 @@ class NidaqPortConfigurationDialog(QDialog):
         duplicates = self._duplicate_selected_channels()
         if duplicates:
             warnings.append("Duplicate channel assignment(s): " + ", ".join(duplicates))
-        readback_refusals = self._trigger_readback_refusals()
+        readback_refusals = self._stream_line_refusals()
         warnings.extend(readback_refusals)
         # Not an error - the 68-pin connector reaches everything - but worth
         # one line, because the alternative is hunting the front panel for a
@@ -627,20 +629,14 @@ class NidaqPortConfigurationDialog(QDialog):
         if kind == "do":
             return device.digital_outputs
         if kind == "di":
-            return device.digital_inputs
+            # The port roles are all sampled in the stream's clocked DI task.
+            # Offered every line, a port1/port2 PFI pin or a PXI-6713 line
+            # took every NI input down (-200452).
+            return self._streamable_lines(device)
         if kind == "readback":
             # What the input stream can sample: every analog input, and the
-            # port0 lines of a board that clocks digital input at all. port1
-            # and port2 are the static PFI pins (STIM3's PFI0 is port1/line0),
-            # and a PXI-6713's lines cannot be clocked: the driver has no DI
-            # rate for it, and a buffered task on them fails at -200452.
-            lines = ()
-            if device.digital_input_max_rate is not None:
-                lines = tuple(
-                    line for line in device.digital_inputs
-                    if self._terminal_of(line).split("/", 1)[0].lower() == BUFFERED_PORT
-                )
-            return tuple(dict.fromkeys(device.analog_inputs + lines))
+            # lines a port role could have.
+            return tuple(dict.fromkeys(device.analog_inputs + self._streamable_lines(device)))
         if kind == "trigger":
             return tuple(
                 terminal
@@ -790,10 +786,66 @@ class NidaqPortConfigurationDialog(QDialog):
             terminal = self._combo_selections[combos["trigger_readback"]]
             if terminal is None:
                 continue
-            refusal = trigger_readback_refusal(laser_index, terminal, outputs)
+            refusal = (
+                trigger_readback_refusal(laser_index, terminal, outputs)
+                or self._unclocked_line_refusal(
+                    f"Laser {laser_index} trigger readback input", terminal)
+            )
             if refusal:
                 refusals.append(refusal)
         return refusals
+
+    def _stream_line_refusals(self) -> List[str]:
+        """Why a line picked here cannot be sampled with the stream.
+
+        The acquisition plan's own rules, which a load would refuse, for the
+        port roles and the trigger readbacks; and, since only this dialog
+        knows the boards, a line on one that cannot clock digital input. A
+        stored value that fails them is kept on its field and named here,
+        with OK disabled, rather than dropped where nobody sees it.
+        """
+        refusals = []
+        for attr_name, _label, _kind in _GENERAL_ROLES:
+            terminal = self._combo_selections[self._general_combos[attr_name]]
+            if terminal is None:
+                continue
+            refusal = (
+                port_role_refusal(attr_name, terminal)
+                or self._unclocked_line_refusal(
+                    f"nidaqPorts.{port_role_field(attr_name)}", terminal)
+            )
+            if refusal:
+                refusals.append(refusal)
+        refusals.extend(self._trigger_readback_refusals())
+        return refusals
+
+    def _streamable_lines(self, device: NidaqDevicePorts) -> Tuple[str, ...]:
+        """The digital input lines of `device` the stream can sample.
+
+        Port0 only, on a board that clocks digital input at all: port1 and
+        port2 are the static PFI pins (STIM3's PFI0 is port1/line0), and a
+        PXI-6713's lines cannot be clocked - the driver has no DI rate for
+        it, and a buffered task on them fails at -200452.
+        """
+        if device.digital_input_max_rate is None:
+            return ()
+        return tuple(
+            line for line in device.digital_inputs
+            if self._terminal_of(line).split("/", 1)[0].lower() == BUFFERED_PORT
+        )
+
+    def _unclocked_line_refusal(self, subject: str, terminal: str) -> str:
+        device = self._devices.get(device_name_from_channel(terminal))
+        if (
+            device is None
+            or device.digital_input_max_rate is not None
+            or terminal not in device.digital_inputs
+        ):
+            return ""
+        return (
+            f"{subject} {terminal!r} is not streamable: {device.name} cannot "
+            "clock digital input, so its lines cannot be sampled with the stream"
+        )
 
     def _validate_selected_channel_assignments(self, device: NidaqDevicePorts) -> None:
         unsupported = self._unsupported_selected_channels(device)
@@ -805,9 +857,9 @@ class NidaqPortConfigurationDialog(QDialog):
         duplicates = self._duplicate_selected_channels()
         if duplicates:
             raise ValueError("Duplicate channel assignment(s) are not allowed: " + ", ".join(duplicates))
-        readback_refusals = self._trigger_readback_refusals()
-        if readback_refusals:
-            raise ValueError("; ".join(readback_refusals))
+        stream_refusals = self._stream_line_refusals()
+        if stream_refusals:
+            raise ValueError("; ".join(stream_refusals))
 
     def _infer_configured_device_name(self) -> Optional[str]:
         channels = []

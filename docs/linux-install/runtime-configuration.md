@@ -46,7 +46,10 @@ fi
 | `nidaqPorts`, `nidaqStream` | Real device identity, supported channel types, timing policy, and independent plot selection |
 
 Use **Edit → Edit DAQ Ports** while idle to discover supported channel types and
-prevent duplicate assignments. Saving from the dialog also records stable
+prevent duplicate assignments. The digital roles (`tone1`, `tone2`, `tone3R`,
+`tone3L`, `camFrames`, `barcode`) must be port0 lines on the input card, the
+only lines the stream's clocked digital-input task can sample; a port1 or port2
+line (a PFI pin) is refused, naming the field. Saving from the dialog also records stable
 product/serial identities and validates timing-master capability. All mapped and
 custom NI-DAQ inputs are recorded when NI-DAQ is enabled; plotting only the
 subset in `displayChannels` does not change persistence. The dialog edits only
