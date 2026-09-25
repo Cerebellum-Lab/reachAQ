@@ -359,19 +359,30 @@ shutter** holds the PMT shutter open for the ramp. Press **Run Ramp**.
   the panel's status line and in the status bar; the whole error is in the
   log.
 - Closing reachAQ during a ramp waits for the ramp to end, for as long as the
-  ramp itself may take plus five seconds; past that it closes the ramp's laser
-  controller, which puts the command back to its minimum and closes the
-  shutters, before anything else closes. That close aborts the ramp's tasks
-  and waits up to five seconds for the ramp to close them before it writes
-  the command back.
-- That close is itself bounded, at 15 seconds. A close that hangs inside the
-  driver would not make the laser any safer, since its output stays driven
-  either way, and it would keep reachAQ from exiting. Past the bound the log
-  and status bar show a CRITICAL naming the laser and the ramp's last command,
-  *"The calibration controller for laser 1 did not close within 15.0 s. Its
-  analog output may still hold the ramp's last command, 5 V ..."*, and reachAQ
-  closes anyway. Make the laser safe by hand: switch off the laser driver or
-  close its shutter at the rig.
+  ramp itself may take (its timeout) plus five seconds. Past that it closes
+  the ramp's laser controller, before anything else closes. That close aborts
+  the ramp's tasks, waits up to five seconds for the ramp to let go of them,
+  and then tries to put the command back to its minimum and close the
+  shutters. The reset is refused, and the close fails, if the ramp still
+  holds the output.
+- That forced close is itself bounded, at 15 seconds. A close that hangs
+  inside the driver would not make the laser any safer, since its output
+  stays driven either way, and it would keep reachAQ from exiting. If the
+  close hangs, raises, or finds the ramp's own thread already closing the
+  controller, the log and status bar show a CRITICAL naming the laser and the
+  ramp's last command, *"The calibration controller for laser 1 did not close
+  within 15.0 s. Its analog output may still hold the ramp's last command,
+  5 V ..."*. When the ramp had not yet opened its controller, or had not
+  started on it, the CRITICAL says so instead, and names no command.
+- After the CRITICAL, closing waits up to two seconds more for the ramp to
+  end, since a ramp its driver lets go tries to write the command back
+  itself. The log then says either *"The laser calibration ramp ended; see
+  above for any error from its own reset"* or that it had not ended, and
+  reachAQ closes. The longest a close can take is the ramp's timeout + 5 s +
+  15 s + 2 s.
+- Make the laser safe by hand - switch off the laser driver or close its
+  shutter at the rig - only when that CRITICAL appears and says the output
+  may still hold the ramp's last command.
 
 ## What failure looks like
 

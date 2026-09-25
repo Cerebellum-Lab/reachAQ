@@ -690,8 +690,13 @@ def test_a_forced_ramp_close_that_raises_is_named_and_the_ramp_still_resets(
         assert ramp_writes == [0.0]
         ramp_thread.join(5.0)
         assert not ramp_thread.is_alive()
-        assert any("ramp then ended" in record.getMessage()
-                   for record in caplog.records)
+        # The CRITICAL comes first, then what the wait for the ramp found; it
+        # does not claim the ramp's reset worked.
+        messages = [record.getMessage() for record in caplog.records]
+        ended = messages.index(
+            "The laser calibration ramp ended; see above for any error from "
+            "its own reset")
+        assert messages.index(message) < ended
         error, = ramp_outcome
         assert "aborted" in str(error)
     finally:
@@ -737,6 +742,170 @@ def test_a_ramp_whose_own_close_hangs_is_named_when_reachaq_closes(
         message = critical.getMessage()
         assert "laser 1 is being closed by the ramp's own thread" in message
         assert "5 V" in message
+    finally:
+        hang.set()
+        ramp_thread.join(10.0)
+
+
+class _ReleaseOnCritical(logging.Handler):
+    """Lets `event` go the moment a CRITICAL is logged."""
+
+    def __init__(self, event):
+        super().__init__(level=logging.CRITICAL)
+        self._event = event
+
+    def emit(self, record):
+        self._event.set()
+
+
+def test_a_ramp_that_ends_after_the_critical_is_reported_as_ended(
+    app_model, monkeypatch, caplog,
+):
+    # The CRITICAL came after the wait for the ramp. When the ramp's own
+    # thread was closing its controller and finished inside that wait,
+    # closing returned in silence, taking the laser as reset; one that
+    # finished only after the CRITICAL was reported as not having ended.
+    from autotrainer.device import NullLaserController
+    from tools.acquisition.model import app_model as app_model_module
+
+    monkeypatch.setattr(app_model_module, "_LASER_CALIBRATION_CLOSE_MARGIN_S", 0.5)
+    monkeypatch.setattr(app_model_module, "_LASER_CALIBRATION_RAMP_END_WAIT_S", 3.0)
+    assert app_model.load_configuration() is True
+    app_model.laser.set_configuration_offline(_null_lasers())
+    closing, hang = threading.Event(), threading.Event()
+
+    class _HangsOnClose(NullLaserController):
+        def close(self):
+            closing.set()
+            hang.wait(30.0)
+            super().close()
+
+    monkeypatch.setattr(app_model.laser, "open_controller",
+                        lambda configuration, **_kwargs: _HangsOnClose(configuration))
+    ramp_thread, _ramp_outcome = _in_thread(
+        app_model.run_laser_calibration_ramp, _ramp(timeout_seconds=0.5))
+    assert closing.wait(10.0), "the ramp did not reach its own close"
+    release = _ReleaseOnCritical(hang)
+    logging.getLogger().addHandler(release)
+    try:
+        with caplog.at_level("WARNING"):
+            close_thread, close_outcome = _in_thread(app_model.on_close)
+            close_thread.join(20.0)
+
+        assert not close_thread.is_alive()
+        assert close_outcome == [None]
+        levels = [(record.levelname, record.getMessage()) for record in caplog.records
+                  if record.levelname == "CRITICAL" or "calibration ramp" in record.getMessage()]
+        critical = next(index for index, (level, _) in enumerate(levels)
+                        if level == "CRITICAL")
+        assert levels[critical + 1] == (
+            "WARNING",
+            "The laser calibration ramp ended; see above for any error from "
+            "its own reset")
+        assert not any("had not ended" in message for _, message in levels)
+    finally:
+        logging.getLogger().removeHandler(release)
+        hang.set()
+        ramp_thread.join(10.0)
+
+
+def test_a_ramp_still_opening_its_controller_is_not_blamed_for_the_output(
+    app_model, monkeypatch, caplog,
+):
+    # Closing while the ramp was still opening its controller: nothing had
+    # been opened to close, and none of the ramp's commands written. The
+    # ERROR said closing was closing its laser controller, and the CRITICAL
+    # that the output may still hold the ramp's last command.
+    from autotrainer.device import NullLaserController
+    from tools.acquisition.model import app_model as app_model_module
+
+    monkeypatch.setattr(app_model_module, "_LASER_CALIBRATION_CLOSE_MARGIN_S", 0.5)
+    monkeypatch.setattr(app_model_module, "_LASER_CALIBRATION_RAMP_END_WAIT_S", 0.2)
+    assert app_model.load_configuration() is True
+    app_model.laser.set_configuration_offline(_null_lasers())
+    opening, release = threading.Event(), threading.Event()
+
+    def open_controller(configuration, **_kwargs):
+        opening.set()
+        release.wait(30.0)
+        return NullLaserController(configuration)
+
+    monkeypatch.setattr(app_model.laser, "open_controller", open_controller)
+    ramp_thread, _ramp_outcome = _in_thread(
+        app_model.run_laser_calibration_ramp, _ramp(timeout_seconds=0.5))
+    assert opening.wait(10.0), "the ramp did not begin opening its controller"
+    try:
+        with caplog.at_level("ERROR"):
+            close_thread, close_outcome = _in_thread(app_model.on_close)
+            close_thread.join(20.0)
+
+        assert not close_thread.is_alive()
+        assert close_outcome == [None]
+        announcement, = [record.getMessage() for record in caplog.records
+                         if "after reachAQ began closing" in record.getMessage()]
+        assert "closing its laser controller" not in announcement
+        assert "had not opened its laser controller" in announcement
+        critical, = [record for record in caplog.records
+                     if record.levelname == "CRITICAL"]
+        message = critical.getMessage()
+        assert "laser 1 had not finished opening" in message
+        assert "never wrote a command" in message
+        assert "may still hold" not in message and "by hand" not in message
+    finally:
+        release.set()
+        ramp_thread.join(10.0)
+
+
+def test_a_ramp_that_never_wrote_a_command_is_not_blamed_for_the_output(
+    app_model, monkeypatch, caplog,
+):
+    # The ramp opened its controller as reachAQ began closing, so it refused
+    # to start and closed the controller itself, and that close hung. It had
+    # written no command, and the CRITICAL said the output may hold its last.
+    from autotrainer.device import NullLaserController
+    from tools.acquisition.model import app_model as app_model_module
+
+    monkeypatch.setattr(app_model_module, "_LASER_CALIBRATION_CLOSE_MARGIN_S", 0.5)
+    monkeypatch.setattr(app_model_module, "_LASER_CALIBRATION_RAMP_END_WAIT_S", 0.2)
+    assert app_model.load_configuration() is True
+    app_model.laser.set_configuration_offline(_null_lasers())
+    opening, closing, hang = threading.Event(), threading.Event(), threading.Event()
+    ramps = []
+
+    class _HangsOnClose(NullLaserController):
+        def run_calibration_ramp(self, ramp):
+            ramps.append(ramp)
+            return super().run_calibration_ramp(ramp)
+
+        def close(self):
+            closing.set()
+            hang.wait(30.0)
+            super().close()
+
+    def open_after_closing_began(configuration, **_kwargs):
+        opening.set()
+        app_model._closing_event.wait(30.0)
+        return _HangsOnClose(configuration)
+
+    monkeypatch.setattr(app_model.laser, "open_controller", open_after_closing_began)
+    ramp_thread, ramp_outcome = _in_thread(
+        app_model.run_laser_calibration_ramp, _ramp(timeout_seconds=0.5))
+    assert opening.wait(10.0), "the ramp did not begin opening its controller"
+    try:
+        with caplog.at_level("ERROR"):
+            close_thread, close_outcome = _in_thread(app_model.on_close)
+            assert closing.wait(10.0), "the ramp did not close its controller"
+            close_thread.join(20.0)
+
+        assert not close_thread.is_alive()
+        assert close_outcome == [None]
+        assert ramps == []
+        critical, = [record for record in caplog.records
+                     if record.levelname == "CRITICAL"]
+        message = critical.getMessage()
+        assert "laser 1 is being closed by the ramp's own thread" in message
+        assert "had not started, so it wrote no command" in message
+        assert "may still hold" not in message and "by hand" not in message
     finally:
         hang.set()
         ramp_thread.join(10.0)
