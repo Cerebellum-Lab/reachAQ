@@ -6,6 +6,7 @@ refuses a channel another started task reserves (as DAQmx does, at -50103),
 and records the terminals routed.
 """
 
+import logging
 import threading
 import time
 
@@ -286,3 +287,120 @@ def test_a_ramp_on_one_board_needs_no_route(daq):
 
     assert daq.connected == []
     assert daq.task("laser_1_calibration_ai").timing_kwargs["source"] == "/PXI1Slot5/ao/SampleClock"
+
+
+
+# ------------------------------------------- close()'s abort and the ramp's own
+
+
+def _ramp_in_thread(controller):
+    outcome = []
+
+    def ramp():
+        try:
+            outcome.append(controller.run_calibration_ramp(RAMP))
+        except Exception as error:
+            outcome.append(error)
+
+    thread = threading.Thread(target=ramp, daemon=True)
+    thread.start()
+    return thread, outcome
+
+
+def _wait_until_ramping(daq):
+    _wait_for(lambda: any(
+        task.name.endswith("calibration_ao") and task.started for task in daq.tasks))
+
+
+def _abort_log(caplog):
+    return [record for record in caplog.records
+            if record.levelno > logging.DEBUG and "abort" in record.getMessage()]
+
+
+def test_an_abort_the_ramps_own_cleanup_overtakes_is_not_a_failure(daq, caplog):
+    # close() aborted the ramp's tasks one by one. The first abort let the
+    # ramp's wait return, and its finally stopped and closed both tasks
+    # while close() was still on its way to the second: that abort met a
+    # closed task, and close() reported a "calibration task abort" failure
+    # on a laser that was reset.
+    daq.block_wait = True
+    daq.hold_waits = True
+    controller = NidaqLaserController(_rig_lasers())
+    ramp, ramp_outcome = _ramp_in_thread(controller)
+    _wait_until_ramping(daq)
+    at_input, go_on = threading.Event(), threading.Event()
+
+    def hold_the_second_abort(task):
+        if task.name.endswith("calibration_ai"):
+            at_input.set()
+            go_on.wait(5.0)
+
+    daq.before_control = hold_the_second_abort
+    with caplog.at_level(logging.DEBUG):
+        closer = threading.Thread(target=controller.close)
+        closer.start()
+        assert at_input.wait(5.0), "close() did not reach the second abort"
+        # The first abort let the ramp go; its own cleanup closes both tasks.
+        ramp.join(5.0)
+        assert not ramp.is_alive()
+        assert daq.task("laser_1_calibration_ai").closed
+        go_on.set()
+        closer.join(5.0)
+
+    assert not closer.is_alive()
+    assert _abort_log(caplog) == []
+    assert "aborted" in str(ramp_outcome[0])
+    # The laser was put back.
+    assert daq.writes_to("PXI1Slot4/ao0", task_suffix="manual_ao")[-1] == 0.0
+
+
+def test_a_task_the_ramp_has_let_go_of_is_not_aborted(daq, caplog):
+    # close() took its snapshot while the ramp held its tasks, then the ramp
+    # ended and let go of them before the aborts were made.
+    daq.block_wait = True
+    daq.hold_waits = True
+    controller = NidaqLaserController(_rig_lasers())
+    ramp, ramp_outcome = _ramp_in_thread(controller)
+    _wait_until_ramping(daq)
+    abort = controller._abort_calibration_ramp
+    snapshot_taken, go_on = threading.Event(), threading.Event()
+
+    def abort_after_the_ramp_ends(tasks):
+        snapshot_taken.set()
+        go_on.wait(5.0)
+        return abort(tasks)
+
+    controller._abort_calibration_ramp = abort_after_the_ramp_ends
+    with caplog.at_level(logging.DEBUG):
+        closer = threading.Thread(target=controller.close)
+        closer.start()
+        assert snapshot_taken.wait(5.0)
+        daq.waits_released.set()
+        ramp.join(5.0)
+        assert not ramp.is_alive()
+        go_on.set()
+        closer.join(5.0)
+
+    assert not closer.is_alive()
+    assert daq.controlled == []
+    assert _abort_log(caplog) == []
+
+
+def test_an_abort_that_fails_on_a_task_the_ramp_still_holds_is_reported(monkeypatch, caplog):
+    # The ramp stays in its wait, holding both tasks, whatever is aborted.
+    daq = _FakeDaqmx(block_wait=True, hold_waits=True, abort_unblocks=False)
+    daq.failing_abort = "calibration_ai"
+    monkeypatch.setattr(nidaq_laser, "_load_nidaqmx", lambda: daq)
+    monkeypatch.setattr(nidaq_laser, "_CALIBRATION_RELEASE_TIMEOUT_S", 0.1)
+    controller = NidaqLaserController(_rig_lasers())
+    ramp, _ramp_outcome = _ramp_in_thread(controller)
+    _wait_until_ramping(daq)
+    try:
+        with pytest.raises(RuntimeError, match="calibration task abort"):
+            controller.close()
+        assert any(record.levelname == "ERROR"
+                   and "Failed to abort a NI-DAQ laser calibration task"
+                   in record.getMessage() for record in caplog.records)
+    finally:
+        daq.waits_released.set()
+        ramp.join(5.0)

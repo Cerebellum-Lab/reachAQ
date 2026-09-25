@@ -304,6 +304,9 @@ class NidaqLaserController:
         #: The tasks of a calibration ramp in progress, for close() to abort
         #: from another thread; see run_calibration_ramp.
         self._calibration_tasks: List[object] = []
+        #: Those the ramp's finally has let go of, by id, under the lock:
+        #: close()'s abort leaves them to its cleanup.
+        self._released_calibration_tasks: set = set()
         #: Set by close(), under _operation_lock, before it calls the driver.
         #: A ramp or pulse train starts, and a route is kept, only while it is
         #: clear.
@@ -842,6 +845,7 @@ class NidaqLaserController:
                     "ramp started")
             # close() waits on this before it resets the laser.
             self._calibration_released.clear()
+            self._released_calibration_tasks.clear()
         try:
             # Both inside the cleanup scope: created before it, an input task
             # that failed to create left the output task open on ao0.
@@ -926,6 +930,11 @@ class NidaqLaserController:
         finally:
             try:
                 with self._operation_lock:
+                    # Let go of, before they are stopped and closed below: an
+                    # abort from close() that meets one of them closing, or
+                    # closed, is this cleanup overtaking it, not a failure.
+                    self._released_calibration_tasks.update(
+                        id(task) for task in self._calibration_tasks)
                     self._calibration_tasks.clear()
                 self._cleanup_calibration_ramp(
                     ao_task=ao_task,
@@ -1183,12 +1192,28 @@ class NidaqLaserController:
             return []
         errors = []
         for task in tasks:
+            # One the ramp's own cleanup has taken is its to stop and close;
+            # the first abort can be what let the ramp go to that cleanup.
+            if self._calibration_task_released(task):
+                continue
             try:
                 task.control(self._nidaqmx.constants.TaskMode.TASK_ABORT)
             except Exception as exc:
+                if self._calibration_task_released(task):
+                    # Taken by that cleanup while this aborted it: the abort
+                    # met a task closing or closed, which is not a failure.
+                    logger.debug(
+                        "A NI-DAQ laser calibration task was let go of by its "
+                        "ramp as close() aborted it: %s", exc)
+                    continue
                 errors.append(("calibration task abort", exc))
                 logger.exception("Failed to abort a NI-DAQ laser calibration task")
         return errors
+
+    def _calibration_task_released(self, task) -> bool:
+        """Whether the ramp's finally has let go of `task`; bookkeeping."""
+        with self._route_lock():
+            return id(task) in getattr(self, "_released_calibration_tasks", ())
 
     def _wait_for_calibration_release(self) -> List[Tuple[str, Exception]]:
         """Wait, bounded, for an aborted ramp to let go of its tasks; for close().
