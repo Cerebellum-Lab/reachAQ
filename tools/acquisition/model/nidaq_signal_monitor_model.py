@@ -7,7 +7,7 @@ import queue
 import signal
 import threading
 import time
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
 
 from autotrainer.core import (
     NidaqSignalChannelConfiguration,
@@ -151,6 +151,7 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
         device_discovery=discover_nidaq_devices,
         startup_timeout_seconds: float = _DEFAULT_STARTUP_TIMEOUT_SECONDS,
         exact_preflight=None,
+        restart_allowed: Optional[Callable[[], bool]] = None,
     ):
         super().__init__()
         self._configuration = NidaqSignalStreamConfiguration()
@@ -166,6 +167,9 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
             else exact_preflight
         )
         self._display_refresh_rate_hz = 60.0
+        #: Asked before a display refresh-rate change restarts a running
+        #: stream; None always allows it. See set_display_refresh_rate.
+        self._restart_allowed = restart_allowed
         self._process = None
         self._message_queue = None
         self._process_stop_event = None
@@ -293,6 +297,19 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
         was_active = self._is_running or self._is_starting
         self._display_refresh_rate_hz = refresh_rate_hz
         if was_active and self.effective_read_chunk_size != previous_chunk_size:
+            if self._restart_allowed is not None and not self._restart_allowed():
+                # The rate follows the window's screen, so moving the window
+                # to another screen while recording restarted the stream: a
+                # silent gap, a reset ring and a new timing anchor mid-session.
+                # start() reads the chunk from this rate, and every Run and
+                # every Stop starts the stream again, so the chunk waits.
+                logger.info(
+                    "Display refresh rate is now %g Hz; the NI-DAQ read chunk "
+                    "becomes %d samples when the stream next starts",
+                    refresh_rate_hz,
+                    self.effective_read_chunk_size,
+                )
+                return
             self.stop()
             self.start()
 
