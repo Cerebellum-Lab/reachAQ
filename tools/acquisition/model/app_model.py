@@ -695,6 +695,10 @@ class AppModel(ObservableObject):
             self._nidaq_signal_monitor,
             may_start=self._nidaq_stream_may_start,
         )
+        #: Whether _start_nidaq_domain is running, and whether the stream's
+        #: latest start came while it was; see _on_nidaq_monitor_property_changed.
+        self._nidaq_domain_start_active = False
+        self._nidaq_stream_started_by_domain = False
         #: Written by tools/hardware/verify_nidaq_wiring.py, read here.
         #: It sits beside the configuration it describes rather than in
         #: it, so it can be regenerated without touching a hand-edited
@@ -6302,10 +6306,29 @@ class AppModel(ObservableObject):
                 reason=f"NI-DAQ stream is paused: {pause_reasons[-1]}",
             )
             return False
-        generation = self._begin_subsystem_start(
-            SubsystemId.NIDAQ_STREAM,
-            reason="starting synchronized NI-DAQ tasks",
-        )
+        # The stream reports its own starts and stops as this status too
+        # (_on_nidaq_monitor_property_changed), and the start made below
+        # used to begin an attempt newer than this one. The registry then
+        # dropped this start's verdict as stale: independent device clocks
+        # read READY, so Record stayed allowed, and a start that timed out
+        # read "starting" after it had been stopped. While this runs, the
+        # verdict is its own.
+        self._nidaq_domain_start_active = True
+        try:
+            generation = self._begin_subsystem_start(
+                SubsystemId.NIDAQ_STREAM,
+                reason="starting synchronized NI-DAQ tasks",
+            )
+            return self._finish_nidaq_domain_start(
+                generation, timeout=timeout, restart=restart)
+        finally:
+            self._nidaq_domain_start_active = False
+
+    def _finish_nidaq_domain_start(
+        self, generation: int, *, timeout: float, restart: bool,
+    ) -> bool:
+        """Start the stream for _start_nidaq_domain and write its verdict."""
+        monitor = self._nidaq_signal_monitor
         try:
             # Refuse a channel map the boards cannot honour, before any task
             # is built from it. The alternative is what this replaces: a
@@ -8171,18 +8194,28 @@ class AppModel(ObservableObject):
     def _on_nidaq_monitor_property_changed(self, name, value, _old_value):
         monitor = self._nidaq_signal_monitor
         if name == monitor.IS_STARTING and value:
-            self._begin_subsystem_start(SubsystemId.NIDAQ_STREAM)
+            # A start during _start_nidaq_domain is that attempt, not a new
+            # one; the domain writes its READY, BLOCKED or FAILED itself.
+            self._nidaq_stream_started_by_domain = self._nidaq_domain_start_active
+            if not self._nidaq_stream_started_by_domain:
+                self._begin_subsystem_start(SubsystemId.NIDAQ_STREAM)
         elif name == monitor.IS_RUNNING:
             if value:
-                self._set_subsystem_status(
-                    SubsystemId.NIDAQ_STREAM,
-                    SubsystemState.READY,
-                    reason="NI-DAQ tasks running",
-                )
+                # Decided by the start, not by whether the domain is still
+                # running: the monitor marks itself running before it tells
+                # anyone, so this can arrive after the domain's verdict.
+                if not self._nidaq_stream_started_by_domain:
+                    self._set_subsystem_status(
+                        SubsystemId.NIDAQ_STREAM,
+                        SubsystemState.READY,
+                        reason="NI-DAQ tasks running",
+                    )
             elif (
                 monitor.configuration.is_enabled
                 and monitor.hardware_enabled
                 and not monitor.error_message
+                # The domain's own restart; it stays "starting" throughout.
+                and not self._nidaq_domain_start_active
             ):
                 self._set_subsystem_status(
                     SubsystemId.NIDAQ_STREAM,

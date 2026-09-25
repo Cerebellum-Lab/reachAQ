@@ -14,12 +14,22 @@ def discover_dev1():
     return (NidaqDevicePorts(name="Dev1"),), None
 
 
+def discover_dev1_and_dev2():
+    return (NidaqDevicePorts(name="Dev1"), NidaqDevicePorts(name="Dev2")), None
+
+
 def idle_worker(_configuration, _timing_plan, message_queue, _sample_ring,
                 stop_event, _log_dict_config):
     """Come up, then hold the stream open until asked to stop."""
     message_queue.put(("ready", None))
     stop_event.wait(60.0)
     message_queue.put(("stopped", None))
+
+
+def silent_worker(_configuration, _timing_plan, _message_queue, _sample_ring,
+                  stop_event, _log_dict_config):
+    """Never become ready, as a worker hung loading the driver does."""
+    stop_event.wait(60.0)
 
 
 def failing_worker(_configuration, _timing_plan, message_queue, _sample_ring,
