@@ -351,7 +351,7 @@ available.
 
 ## System configuration policy
 
-The production system configuration schema is version 57. ReachAQ loads only
+The production system configuration schema is version 58. ReachAQ loads only
 that version and rejects older/newer versions, unknown keys, retired
 load-cell/tunnel/head-fix fields, obsolete NI recording controls, and historic
 pellet-shift coordinate keys. There is no hidden compatibility runtime.

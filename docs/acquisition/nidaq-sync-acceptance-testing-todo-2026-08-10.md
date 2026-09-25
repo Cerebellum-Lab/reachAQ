@@ -530,7 +530,7 @@ software implementation gaps.
 
 ## Configuration and animal migration
 
-- [ ] Confirm the maintained version-57 system configuration loads and saves.
+- [ ] Confirm the maintained version-58 system configuration loads and saves.
 - [ ] Confirm an older version, unknown key, retired tunnel/load-cell field,
       `recordToAcquisition`, and old shift `targetX/Y/Z` fields are rejected with
       actionable errors.

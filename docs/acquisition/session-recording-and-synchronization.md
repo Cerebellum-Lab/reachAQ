@@ -78,7 +78,7 @@ evidence contracts are defined in
 [Recording sessions, pellet trials, protocols, and schema migration](session-trials-protocols.md).
 
 The load-cell acquisition, tare, configuration, UI, and automatic recording
-triggers have been removed. System configuration v57 rejects obsolete schemas
+triggers have been removed. System configuration v58 rejects obsolete schemas
 and fields rather than creating a compatibility runtime. Alarm, emergency,
 tunnel, head-fix, magnet, and webcam/top-camera behavior is removed. Pellet
 presence, pellet misplacement, watchdog liveness, structured errors, and safe

@@ -88,7 +88,7 @@ YAML immediately; enabling runtime hardware queues one combined refresh after
 the submenu closes. The Hardware Status panel remains a compact, read-only view
 of live subsystem health.
 
-The current production schema is system-configuration version 57. Older and
+The current production schema is system-configuration version 58. Older and
 newer versions, unknown fields, retired load-cell/tunnel fields, and obsolete
 NI recording controls are rejected instead of being silently migrated. Start
 from the maintained example at
