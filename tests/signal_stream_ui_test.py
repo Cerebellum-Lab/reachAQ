@@ -95,8 +95,21 @@ class _AnalysisAppStub(ObservableObject):
         self.signal_configuration_save_count += 1
 
 
+class _NoEvents:
+    """An event nothing here raises: Laser Control only subscribes to it."""
+
+    def __iadd__(self, _handler):
+        return self
+
+    def __isub__(self, _handler):
+        return self
+
+
 class _LaserAppStub:
     def __init__(self, laser):
+        # Laser Control follows the application's System Mode and recording
+        # state for Run Ramp; these tests never change either.
+        self.property_changed = _NoEvents()
         self.laser = laser
         self.nidaq_signal_monitor = NidaqSignalMonitorModel()
         self.nidaq_signal_monitor._hardware_enabled = True
@@ -106,6 +119,9 @@ class _LaserAppStub:
             laser.configuration,
         )
         self.signal_configuration_save_count = 0
+
+    def laser_calibration_refusal(self):
+        return ""
 
     def update_nidaq_signal_stream_channels(self, channels):
         self.nidaq_signal_monitor.set_display_channels(

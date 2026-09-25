@@ -281,6 +281,12 @@ refused in the dialog, naming both. Manual/internal and
 externally triggered pulse operations append their command waveform. Selected
 measured inputs from the shared NI-DAQ stream are added to the corresponding
 laser graph. Calibration explicitly starts and clears the associated graph.
+The Calibration tab's **Run Ramp** runs only in Idle: it holds the shared
+NI-DAQ input stream stopped, through the same hold as the DAQ Monitor, opens a
+laser controller for the ramp alone, and hands both back when the ramp ends,
+however it ends. Run, the DAQ Monitor, configuration loads and DAQ Ports saves
+are refused while it runs, and its tooltip gives the reason whenever it is
+unavailable.
 Each live stream graph has its own editable time window and voltage limits.
 
 Every stream option and curve uses the same high-contrast color assignment:

@@ -155,7 +155,7 @@ from tools.acquisition.model.helpers import get_config_location
 from tools.acquisition.model.hardware_model import HardwareModel
 from tools.acquisition.model.inference_model import InferenceModel
 from tools.acquisition.model.laser_model import LaserModel
-from autotrainer.device import CanFailure, CanTransportConfiguration
+from autotrainer.device import CanFailure, CanTransportConfiguration, LaserCalibrationRamp
 from tools.acquisition.model.hardware_scan import HardwareScanEntry, scan_can_adapters, scan_gpus
 from tools.acquisition.model.nidaq_discovery import device_name_from_channel, discover_nidaq_devices
 from tools.acquisition.model.nidaq_channel_plan import build_nidaq_acquisition_configuration
@@ -298,6 +298,9 @@ logger = get_verbose_logger(__name__)
 #: Holders of the NI-DAQ input stream while the plan it acquires is replaced.
 _CONFIGURATION_LOAD = "configuration load"
 _DAQ_PORTS_UPDATE = "DAQ ports update"
+#: Holder of the NI-DAQ input stream while a laser calibration ramp runs.
+_LASER_CALIBRATION = "laser calibration"
+_LASER_CALIBRATION_REASON = "a laser calibration ramp is running"
 
 
 def _serialized_session_configuration(method):
@@ -699,6 +702,11 @@ class AppModel(ObservableObject):
         #: latest start came while it was; see _on_nidaq_monitor_property_changed.
         self._nidaq_domain_start_active = False
         self._nidaq_stream_started_by_domain = False
+        #: Set while run_laser_calibration_ramp holds the NI-DAQ lines and a
+        #: laser controller of its own; Run, the DAQ Monitor, a configuration
+        #: load and a DAQ ports save refuse while it is.
+        self._laser_calibration_active = False
+        self._laser_calibration_lock = threading.Lock()
         #: Written by tools/hardware/verify_nidaq_wiring.py, read here.
         #: It sits beside the configuration it describes rather than in
         #: it, so it can be regenerated without touching a hand-edited
@@ -6273,10 +6281,113 @@ class AppModel(ObservableObject):
                 f"the recording session is still {recording_status.value}; "
                 "try again once it is ready"
             )
-        self._nidaq_stream_autostart.pause(holder, reason)
+        self._hold_nidaq_stream_unless_calibrating(
+            holder,
+            reason,
+            "a laser calibration ramp holds the NI-DAQ lines; wait for it to finish",
+        )
 
     def resume_nidaq_stream(self, holder) -> None:
         self._nidaq_stream_autostart.resume(holder)
+
+    def _hold_nidaq_stream_unless_calibrating(self, holder, reason: str, refusal: str) -> None:
+        """Take the stream for `holder`, or refuse with `refusal` while a ramp holds it.
+
+        The DAQ Monitor, a configuration load and a DAQ ports save all come
+        through here: each opens tasks on the ramp's lines or closes the
+        controller under it. Checked again once the hold is taken, because a
+        ramp sets its flag and then checks for other holders, so of two that
+        start together at least one sees the other and backs out.
+        """
+        if self._laser_calibration_active:
+            raise RuntimeError(refusal)
+        self._nidaq_stream_autostart.pause(holder, reason)
+        if self._laser_calibration_active:
+            self._nidaq_stream_autostart.resume(holder)
+            raise RuntimeError(refusal)
+
+    def laser_calibration_refusal(self) -> str:
+        """Why a laser calibration ramp cannot start now, or an empty string.
+
+        Idle only (Ben, 2026-09-25). In System Mode the stream is the
+        acquisition's, and the laser controller System Mode opens is fed by
+        it, which makes the controller refuse a ramp. In Idle the ramp takes
+        the stream through the same hold as the DAQ Monitor and opens a
+        controller of its own; see run_laser_calibration_ramp.
+        """
+        if self._laser_calibration_active:
+            return "a laser calibration ramp is already running"
+        return self._laser_calibration_conditions_refusal()
+
+    def _laser_calibration_conditions_refusal(self) -> str:
+        recording_status = self._recording_session.status
+        if recording_status is not SessionRecordingStatus.READY:
+            return (
+                f"a session is {recording_status.value}; calibrate in Idle "
+                "once it has finished"
+            )
+        acquisition = self._acquisition
+        if acquisition.starting:
+            return "System Mode is starting; the ramp runs only in Idle"
+        if acquisition.stopping:
+            return "System Mode is stopping; wait for Idle"
+        if acquisition.started or self._status is not AppModelStatus.IDLE:
+            return "System Mode is running; set it to Idle to calibrate"
+        if self._loaded_configuration is None or self._configuration_load_incomplete:
+            return "the system configuration has not finished loading"
+        if self._laser.configuration.backend == "disabled":
+            return "the laser is disabled in the system configuration"
+        holders = self._nidaq_stream_autostart.pause_reasons
+        if holders:
+            return f"the NI-DAQ lines are in use: {holders[-1]}"
+        return ""
+
+    def run_laser_calibration_ramp(self, ramp: LaserCalibrationRamp):
+        """Run one calibration ramp in Idle, on a laser controller of its own.
+
+        The ramp reads the diode on its own finite task, so the shared input
+        stream is held stopped for it, through the same holder mechanism as
+        the DAQ Monitor, and the auto-start cannot restart it mid-ramp. It
+        stopped the stream directly before, which nothing prevented from
+        being started again over its tasks. The controller is opened without
+        the stream feeding it and is never given to the laser model; both
+        are handed back in finally, whatever the ramp does.
+        """
+        with self._laser_calibration_lock:
+            if self._laser_calibration_active:
+                raise RuntimeError(
+                    "Laser calibration is unavailable: a laser calibration ramp "
+                    "is already running")
+            self._laser_calibration_active = True
+        try:
+            # After the flag is set: Run and every other holder set theirs
+            # first and check this one after.
+            refusal = self._laser_calibration_conditions_refusal()
+            if refusal:
+                raise RuntimeError(f"Laser calibration is unavailable: {refusal}")
+            configuration = self._laser.configuration
+            self._nidaq_stream_autostart.pause(
+                _LASER_CALIBRATION, _LASER_CALIBRATION_REASON)
+            try:
+                controller = self._laser.open_controller(
+                    self._runtime_laser_configuration(configuration),
+                    timing_plan=(
+                        self._nidaq_signal_monitor.timing_plan
+                        if configuration.hardware_timed
+                        else None
+                    ),
+                )
+                try:
+                    return self._laser.run_calibration_ramp(ramp, controller=controller)
+                finally:
+                    try:
+                        controller.close_all_shutters()
+                    finally:
+                        controller.close()
+            finally:
+                self._nidaq_stream_autostart.resume(_LASER_CALIBRATION)
+        finally:
+            self._laser_calibration_active = False
 
     def _start_nidaq_domain(self, *, timeout: float = 12.0, restart: bool = False) -> bool:
         """Start the NI-DAQ domain; `restart` replaces a stream already running.
@@ -6464,24 +6575,7 @@ class AppModel(ObservableObject):
             reason="opening laser controller",
         )
         try:
-            runtime_configuration = configuration
-            if (
-                configuration.backend == "nidaq"
-                and self._nidaq_ports.device_identities
-            ):
-                aliases = self._nidaq_signal_monitor.runtime_device_aliases
-                if not aliases:
-                    devices, discovery_error = discover_nidaq_devices()
-                    if discovery_error:
-                        raise RuntimeError(discovery_error)
-                    aliases = resolve_nidaq_device_aliases(
-                        self._nidaq_ports.device_identities,
-                        devices,
-                    )
-                runtime_configuration = self._remap_laser_configuration(
-                    configuration,
-                    aliases,
-                )
+            runtime_configuration = self._runtime_laser_configuration(configuration)
             feedback_reader = (
                 self._read_nidaq_feedback_channel
                 if (
@@ -6525,6 +6619,27 @@ class AppModel(ObservableObject):
             generation=generation,
         )
         return True
+
+    def _runtime_laser_configuration(self, configuration):
+        """The laser configuration under the device names NI-DAQmx uses now.
+
+        Shared by System Mode's laser domain and the Idle calibration ramp.
+        """
+        if not (
+            configuration.backend == "nidaq"
+            and self._nidaq_ports.device_identities
+        ):
+            return configuration
+        aliases = self._nidaq_signal_monitor.runtime_device_aliases
+        if not aliases:
+            devices, discovery_error = discover_nidaq_devices()
+            if discovery_error:
+                raise RuntimeError(discovery_error)
+            aliases = resolve_nidaq_device_aliases(
+                self._nidaq_ports.device_identities,
+                devices,
+            )
+        return self._remap_laser_configuration(configuration, aliases)
 
     @staticmethod
     def _remap_laser_configuration(configuration, aliases):
@@ -6920,6 +7035,19 @@ class AppModel(ObservableObject):
                 return False
             if not self._acquisition.begin_start():
                 logger.warning("Acquisition already starting")
+                return False
+            # After begin_start, which a ramp checks for once its own flag is
+            # set, so of the two only one goes ahead. A ramp holds the NI-DAQ
+            # lines and a laser controller of its own: a Run would restart the
+            # stream over its tasks and open a second controller on the same
+            # lines. Nothing but the start flag has been changed yet.
+            if self._laser_calibration_active:
+                self._acquisition.mark_stopped()
+                self.on_error(
+                    "Run unavailable",
+                    "System Mode cannot start while a laser calibration ramp "
+                    "runs; wait for it to finish",
+                )
                 return False
             previous_internal_error = self._internal_error_diagnostic
             self._internal_error_diagnostic = None
@@ -7394,7 +7522,14 @@ class AppModel(ObservableObject):
         if not self._nidaq_stream_idle():
             return self._load_configuration(location, random_cameras=random_cameras)
         holder = _CONFIGURATION_LOAD
-        self._nidaq_stream_autostart.pause(holder, "the configuration is loading")
+        # Not while a calibration ramp runs: the load replaces the laser
+        # configuration and the NI-DAQ plan the ramp is running on.
+        self._hold_nidaq_stream_unless_calibrating(
+            holder,
+            "the configuration is loading",
+            "Loading a configuration is unavailable while a laser calibration "
+            "ramp runs; wait for it to finish",
+        )
         try:
             return self._load_configuration(location, random_cameras=random_cameras)
         finally:
@@ -7682,8 +7817,12 @@ class AppModel(ObservableObject):
         if not self._nidaq_stream_idle():
             self._apply_daq_port_configuration(nidaq_ports, laser_configuration)
             return
-        self._nidaq_stream_autostart.pause(
-            _DAQ_PORTS_UPDATE, "the DAQ ports are being saved")
+        self._hold_nidaq_stream_unless_calibrating(
+            _DAQ_PORTS_UPDATE,
+            "the DAQ ports are being saved",
+            "Saving DAQ ports is unavailable while a laser calibration ramp "
+            "runs; wait for it to finish",
+        )
         try:
             self._apply_daq_port_configuration(nidaq_ports, laser_configuration)
         finally:
