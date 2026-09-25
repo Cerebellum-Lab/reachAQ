@@ -57,11 +57,12 @@ class _FakeTask:
                 del self.daq.reserved[channel]
 
     def write(self, data, auto_start=False):
-        self.writes.append(data)
         if auto_start:
-            # An on-demand write reserves its lines only for the write.
+            # An on-demand write reserves its lines only for the write, and a
+            # refused one (-50103) writes nothing.
             self._reserve()
             self._release()
+        self.writes.append(data)
 
     def start(self):
         self.daq.fail_start(self)
@@ -84,7 +85,8 @@ class _FakeTask:
         self.daq.controlled.append((self.name, mode))
         self.aborted.set()
         self.started = False
-        self._release()
+        if self.daq.abort_releases:
+            self._release()
 
     def stop(self):
         self.started = False
@@ -99,9 +101,12 @@ class _FakeTask:
 class _FakeDaqmx:
     """The parts of nidaqmx the laser controller uses."""
 
-    def __init__(self, *, block_wait=False, failing_task=None):
+    def __init__(self, *, block_wait=False, failing_task=None, abort_releases=True):
         self.block_wait = block_wait
         self.failing_task = failing_task
+        #: Whether an aborted task gives up its lines. DAQmx says an abort
+        #: returns a task to before it started; this does not rely on it.
+        self.abort_releases = abort_releases
         self.tasks = []
         self.reserved = {}
         self.controlled = []
@@ -216,6 +221,101 @@ def test_closing_the_controller_mid_ramp_stops_the_ramp_and_resets_the_laser(daq
     assert shutter.writes[-1] is False
     error, = outcome
     assert isinstance(error, RuntimeError) and "aborted" in str(error)
+    # The ramp's clock route, released once, by whichever let go of it.
+    route = ("/PXI1Slot4/ao/SampleClock", "/PXI1Slot4/PXI_Trig1")
+    assert daq.disconnected.count(route) == 1
+    assert controller._trigger_routes == []
+
+
+def _ramp_in_thread(controller):
+    outcome = []
+
+    def ramp():
+        try:
+            outcome.append(controller.run_calibration_ramp(RAMP))
+        except Exception as error:
+            outcome.append(error)
+
+    thread = threading.Thread(target=ramp)
+    thread.start()
+    return thread, outcome
+
+
+def test_close_waits_for_the_ramp_to_let_go_of_the_output_before_resetting_it(monkeypatch):
+    # close() aborted the ramp and reset the laser at once, and the ramp's own
+    # cleanup skipped its reset once it found the controller closed. Were the
+    # abort not to release ao0, the reset failed at -50103 and the 6713 held
+    # the last ramp sample. The pulse path waits for its owner first; so now
+    # does the ramp's.
+    daq = _FakeDaqmx(block_wait=True, abort_releases=False)
+    monkeypatch.setattr(nidaq_laser, "_load_nidaqmx", lambda: daq)
+    controller = NidaqLaserController(_rig_lasers())
+    thread, outcome = _ramp_in_thread(controller)
+    _wait_for(lambda: any(
+        task.name.endswith("calibration_ao") and task.started for task in daq.tasks))
+    shutter = daq.task("laser_1_shutter")
+
+    controller.close()
+    thread.join(5.0)
+
+    assert not thread.is_alive()
+    assert daq.task("laser_1_manual_ao").writes == [0.0]
+    assert shutter.writes[-1] is False
+    assert daq.reserved == {}
+    error, = outcome
+    assert "aborted" in str(error)
+
+
+def test_a_close_between_holding_the_tasks_and_routing_the_clock_leaves_no_route(daq):
+    # The ramp counted the routes it found and released those after the
+    # count, from its own thread, while close() released all of them from
+    # another: a close in between emptied the list, the ramp's clock route
+    # was then added at index 0, and "since 1" released nothing. Now the
+    # ramp releases the routes it added, by name, and adds none once closed.
+    trigger_route = ("/PXI1Slot5/PFI0", "/PXI1Slot5/PXI_Trig0")
+    controller = NidaqLaserController(_rig_lasers(
+        trigger_source="/PXI1Slot4/PXI_Trig0", trigger_route_source="/PXI1Slot5/PFI0"))
+    assert daq.connected == [trigger_route]
+    shared_clock_for = controller._shared_clock_for
+    closer = threading.Thread(target=controller.close)
+
+    def close_first(*args, **kwargs):
+        if not closer.is_alive() and not controller._closed:
+            closer.start()
+            _wait_for(lambda: controller._closed)
+            # Done, or waiting for this ramp to let go: either way closed.
+            closer.join(1.0)
+        return shared_clock_for(*args, **kwargs)
+
+    controller._shared_clock_for = close_first
+
+    with pytest.raises(RuntimeError, match="closed"):
+        controller.run_calibration_ramp(RAMP)
+    closer.join(5.0)
+
+    assert not closer.is_alive()
+    assert all(daq.disconnected.count(route) == 1 for route in daq.connected)
+    assert controller._trigger_routes == []
+    assert not any(task.started for task in daq.tasks)
+
+
+def test_a_failed_input_task_leaves_the_ramps_output_task_closed(daq, monkeypatch):
+    # The ramp created its output and input tasks before its cleanup scope:
+    # an input task that failed to create left the output task open.
+    controller = NidaqLaserController(_rig_lasers())
+
+    def refuse(_channel):
+        raise RuntimeError("DAQmx -200170: the physical channel does not exist")
+
+    monkeypatch.setattr(controller, "_create_calibration_input_task", refuse)
+
+    with pytest.raises(RuntimeError, match="-200170"):
+        controller.run_calibration_ramp(RAMP)
+
+    assert daq.task("laser_1_calibration_ao").closed
+    assert daq.reserved == {}
+    # And the laser was put back as after any ramp.
+    assert daq.task("laser_1_manual_ao").writes == [0.0]
 
 
 def test_a_ramp_on_a_closed_controller_starts_nothing(daq):

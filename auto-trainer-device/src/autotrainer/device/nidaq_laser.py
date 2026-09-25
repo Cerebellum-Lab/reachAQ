@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import enum
 import logging
@@ -7,7 +8,7 @@ import numbers
 import threading
 import time
 import uuid
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 from autotrainer.core import NidaqTimingPlan
 from autotrainer.core.logging import log_hardware_initialization
@@ -31,6 +32,10 @@ from autotrainer.device.nidaq_reference_clock import (
 
 logger = logging.getLogger(__name__)
 
+#: How long close() waits for an aborted calibration ramp to close its own
+#: tasks before resetting the laser; the pulse path waits as long for its
+#: operation's owner.
+_CALIBRATION_RELEASE_TIMEOUT_S = 5.0
 
 
 class LaserOperationState(str, enum.Enum):
@@ -291,6 +296,10 @@ class NidaqLaserController:
         #: Set by close(), under _operation_lock. A ramp starts its tasks only
         #: while it is clear.
         self._closed = False
+        #: Clear while a calibration ramp owns tasks; set by its finally once
+        #: it has stopped and closed them. close() waits on it, bounded.
+        self._calibration_released = threading.Event()
+        self._calibration_released.set()
         try:
             for channel in configuration.channels:
                 channel_started = time.perf_counter()
@@ -714,18 +723,34 @@ class NidaqLaserController:
         timeout_seconds = ramp.timeout_seconds
         if timeout_seconds is None:
             timeout_seconds = len(waveform) / sample_rate_hz + 5.0
-        ao_task = self._create_analog_output_task(channel, f"laser_{channel.channel_id.value}_calibration_ao")
-        ai_task = self._create_calibration_input_task(channel)
+        ao_task = None
+        ai_task = None
         digital_tasks = []
         run_error = None
         points = ()
-        # The clock routes this ramp adds, which it releases when it ends.
-        route_count = len(self._trigger_routes)
+        # The clock routes this ramp adds, by name, which it releases when it
+        # ends. Counted, as they were, the list was read and cut from two
+        # threads: a close() in between emptied it, and the ramp's own route,
+        # added after, was never released.
+        added_routes: List[Tuple[str, str]] = []
+        with self._operation_lock:
+            if self._closed:
+                raise RuntimeError(
+                    "the laser controller was closed before the calibration "
+                    "ramp started")
+            # close() waits on this before it resets the laser.
+            self._calibration_released.clear()
         try:
+            # Both inside the cleanup scope: created before it, an input task
+            # that failed to create left the output task open on ao0.
+            ao_task = self._create_analog_output_task(
+                channel, f"laser_{channel.channel_id.value}_calibration_ao")
             # Where close() can find them: reachAQ closing mid-ramp closes
             # this controller from its own thread, and this one may then be
             # inside DAQmx, waiting on these.
-            self._hold_calibration_tasks(ao_task, ai_task)
+            self._hold_calibration_tasks(ao_task)
+            ai_task = self._create_calibration_input_task(channel)
+            self._hold_calibration_tasks(ai_task)
             ao_task.timing.cfg_samp_clk_timing(
                 rate=sample_rate_hz,
                 sample_mode=self._nidaqmx.constants.AcquisitionType.FINITE,
@@ -741,7 +766,9 @@ class NidaqLaserController:
             sample_clock_source = self._analog_output_sample_clock_source(channel.analog_output)
             ai_task.timing.cfg_samp_clk_timing(
                 rate=sample_rate_hz,
-                source=self._shared_clock_for(_device_of(channel.diode_input), sample_clock_source),
+                source=self._shared_clock_for(
+                    _device_of(channel.diode_input), sample_clock_source,
+                    added=added_routes),
                 sample_mode=self._nidaqmx.constants.AcquisitionType.FINITE,
                 samps_per_chan=len(waveform),
             )
@@ -754,7 +781,9 @@ class NidaqLaserController:
                         [True] * len(waveform),
                         sample_rate_hz,
                         len(waveform),
-                        self._shared_clock_for(_device_of(pmt_line), sample_clock_source),
+                        self._shared_clock_for(
+                            _device_of(pmt_line), sample_clock_source,
+                            added=added_routes),
                         None,
                         "rising",
                     )
@@ -784,17 +813,23 @@ class NidaqLaserController:
             run_error = exc
             raise
         finally:
-            with self._operation_lock:
-                self._calibration_tasks.clear()
-            self._cleanup_calibration_ramp(
-                ao_task=ao_task,
-                ai_task=ai_task,
-                digital_tasks=digital_tasks,
-                channel=channel,
-                ramp=ramp,
-                run_error=run_error,
-                route_count=route_count,
-            )
+            try:
+                with self._operation_lock:
+                    self._calibration_tasks.clear()
+                self._cleanup_calibration_ramp(
+                    ao_task=ao_task,
+                    ai_task=ai_task,
+                    digital_tasks=digital_tasks,
+                    channel=channel,
+                    ramp=ramp,
+                    run_error=run_error,
+                    routes=added_routes,
+                )
+            finally:
+                # After the tasks are stopped and closed, and after the
+                # cleanup's own writes: close() resets the laser only then, so
+                # its writes never meet a task of this ramp's on the lines.
+                self._calibration_released.set()
         return points
 
     def _hold_calibration_tasks(self, *tasks) -> None:
@@ -859,20 +894,43 @@ class NidaqLaserController:
         channel: LaserChannelConfiguration,
         ramp: LaserCalibrationRamp,
         run_error: Optional[BaseException],
-        route_count: Optional[int] = None,
+        routes: Sequence[Tuple[str, str]] = (),
     ) -> None:
         errors = []
-        self._stop_and_close_task("calibration analog output task", ao_task, errors)
-        self._stop_and_close_task("calibration analog input task", ai_task, errors)
+        # Either task is None when creating it is what failed.
+        if ao_task is not None:
+            self._stop_and_close_task("calibration analog output task", ao_task, errors)
+        if ai_task is not None:
+            self._stop_and_close_task("calibration analog input task", ai_task, errors)
         for index, task in enumerate(digital_tasks):
             self._stop_and_close_task(f"calibration digital output task {index}", task, errors)
-        if route_count is not None:
-            # After the tasks that use them. The controller's own trigger
-            # routes, connected before the ramp, stay until close().
-            errors.extend(self._release_routes_since(route_count))
+        # After the tasks that use them, and only the ramp's own: the
+        # controller's trigger routes, connected before the ramp, stay until
+        # close().
+        errors.extend(self._release_routes(routes))
         if getattr(self, "_closed", False):
-            # close() has already put the command, the shutters and the PMT
-            # shutter back, and released the tasks this would write them with.
+            # close() is waiting for this, and resets the laser after it with
+            # tasks of its own. The command is also written back here, with
+            # this ramp's output task now closed: were close() to have gone
+            # on without it, past its wait, its reset met that task on ao0
+            # (-50103) and the 6713 held the last ramp sample.
+            try:
+                self._write_transient_analog_sample(channel, channel.minimum_command_volts)
+            except Exception as exc:
+                errors.append((f"channel {channel.channel_id.value} command reset", exc))
+                logger.exception(
+                    "Failed to reset NI-DAQ laser command for channel %s after "
+                    "a closed calibration ramp", channel.channel_id.value)
+            if ramp.enable_pmt_shutter:
+                try:
+                    self._write_transient_digital_line(
+                        self._require_pmt_shutter_output(),
+                        False,
+                        "laser_pmt_shutter_calibration_reset",
+                    )
+                except Exception as exc:
+                    errors.append(("PMT shutter close", exc))
+                    logger.exception("Failed to close NI-DAQ PMT shutter output after calibration")
             self._raise_or_log_cleanup_errors("NI-DAQ laser calibration ramp", errors, run_error)
             return
         try:
@@ -939,6 +997,7 @@ class NidaqLaserController:
     def close(self) -> None:
         errors = []
         errors.extend(self._abort_calibration_ramp())
+        errors.extend(self._wait_for_calibration_release())
         for operation in tuple(getattr(self, "_live_operations", {}).values()):
             try:
                 operation.cancel()
@@ -980,9 +1039,12 @@ class NidaqLaserController:
         thread: it returns a task to before it started, which releases its
         lines, and makes a wait blocked on it return with an error. The ramp
         thread still stops and clears them in its own finally; nothing here
-        clears a task another thread may be using. Marked closed under the
-        same lock the ramp starts its tasks under, so a ramp not yet started
-        never starts.
+        clears a task another thread may be using, and close() waits for it
+        to have done so before resetting the laser, as an abort that does not
+        release them would otherwise leave the reset refused
+        (_wait_for_calibration_release). Marked closed under the same lock
+        the ramp starts its tasks under, so a ramp not yet started never
+        starts.
         """
         lock = getattr(self, "_operation_lock", None)
         if lock is None:
@@ -999,8 +1061,31 @@ class NidaqLaserController:
             except Exception as exc:
                 errors.append(("calibration task abort", exc))
                 logger.exception("Failed to abort a NI-DAQ laser calibration task")
+        return errors
+
+    def _wait_for_calibration_release(self) -> List[Tuple[str, Exception]]:
+        """Wait, bounded, for an aborted ramp to let go of its tasks; for close().
+
+        As the pulse path waits for its operation's owner. close() reset the
+        laser straight after the abort, and the ramp's own cleanup skipped
+        its reset once it found the controller closed: were the abort not to
+        release ao0, the reset failed at -50103 and the 6713 held the last
+        ramp sample. Past the bound close() goes on without the ramp, whose
+        cleanup still writes the command back when it ends.
+        """
+        released = getattr(self, "_calibration_released", None)
+        if released is None or released.is_set():
+            return []
+        if not released.wait(_CALIBRATION_RELEASE_TIMEOUT_S):
+            logger.error(
+                "A NI-DAQ laser calibration ramp still held its tasks %.1f s "
+                "after close() aborted it; resetting the laser without it",
+                _CALIBRATION_RELEASE_TIMEOUT_S,
+            )
         # Held high for the whole ramp when it was asked for; nothing else
-        # in close() knows the line.
+        # in close() knows the line. After the wait, so that the ramp's own
+        # task on it has been closed.
+        errors = []
         pmt_line = self._configuration.pmt_shutter_output
         if pmt_line:
             try:
@@ -1058,7 +1143,13 @@ class NidaqLaserController:
             destination,
         )
 
-    def _shared_clock_for(self, output_device: str, source: str) -> str:
+    def _shared_clock_for(
+        self,
+        output_device: str,
+        source: str,
+        *,
+        added: Optional[List[Tuple[str, str]]] = None,
+    ) -> str:
         """The shared sample clock as this output board can see it.
 
         A clock produced on one board reaches an output on another the same
@@ -1067,6 +1158,11 @@ class NidaqLaserController:
         and naming that line locally needs no reservation. A clock already on
         the output's own board is returned untouched, so a single-board rig
         never acquires a route it does not need.
+
+        A route this call connects is appended to `added`, for a caller that
+        releases its own routes when it ends. Refused once the controller is
+        closed: close() may already have released every route, and one added
+        after it would outlive the controller.
         """
         clock_device = source.strip("/").split("/", 1)[0]
         if not output_device or clock_device == output_device:
@@ -1074,46 +1170,68 @@ class NidaqLaserController:
         line = self._configuration.backplane_clock_line
         destination = f"/{clock_device}/{line}"
         local = f"/{output_device}/{line}"
-        if (source, destination) not in self._trigger_routes:
-            try:
-                self._nidaqmx.system.System.local().connect_terms(
-                    source, destination)
-            except Exception as error:
+        with self._route_lock():
+            if getattr(self, "_closed", False):
                 raise RuntimeError(
-                    f"could not put the shared sample clock {source} on "
-                    f"{destination} for {output_device}: {error}"
-                ) from error
-            self._trigger_routes.append((source, destination))
-            log_hardware_initialization(
-                logger,
-                "READY | NI-DAQ laser clock route | %s -> %s, read as %s",
-                source,
-                destination,
-                local,
-            )
+                    "the laser controller is closed; no clock route is made "
+                    f"for {output_device}")
+            if (source, destination) not in self._trigger_routes:
+                try:
+                    self._nidaqmx.system.System.local().connect_terms(
+                        source, destination)
+                except Exception as error:
+                    raise RuntimeError(
+                        f"could not put the shared sample clock {source} on "
+                        f"{destination} for {output_device}: {error}"
+                    ) from error
+                self._trigger_routes.append((source, destination))
+                if added is not None:
+                    added.append((source, destination))
+                log_hardware_initialization(
+                    logger,
+                    "READY | NI-DAQ laser clock route | %s -> %s, read as %s",
+                    source,
+                    destination,
+                    local,
+                )
         return local
 
-    def _disconnect_trigger_routes(self) -> List[Tuple[str, Exception]]:
-        return self._release_routes_since(0)
+    def _route_lock(self):
+        """_operation_lock, which every change to _trigger_routes is made under.
 
-    def _release_routes_since(self, count: int) -> List[Tuple[str, Exception]]:
-        """Disconnect the routes connected after the first `count`.
+        A ramp releases its own routes from its thread while close() may be
+        releasing all of them from another. A controller built without
+        __init__, as some tests build one, has no lock and one thread.
+        """
+        lock = getattr(self, "_operation_lock", None)
+        return lock if lock is not None else contextlib.nullcontext()
+
+    def _disconnect_trigger_routes(self) -> List[Tuple[str, Exception]]:
+        with self._route_lock():
+            return self._release_routes(tuple(self._trigger_routes))
+
+    def _release_routes(self, routes) -> List[Tuple[str, Exception]]:
+        """Disconnect these routes, those this controller still holds.
 
         close() releases every route; an operation that connected its own,
-        such as a calibration ramp's clock, releases just those when it ends.
+        such as a calibration ramp's clock, releases just those when it ends,
+        by name. A route close() has released already is not released again.
         """
-        routes = self._trigger_routes[count:]
-        del self._trigger_routes[count:]
         errors = []
-        for source, destination in routes:
-            try:
-                self._nidaqmx.system.System.local().disconnect_terms(
-                    source, destination)
-            except Exception as error:
-                errors.append((f"trigger route {source} -> {destination}",
-                               error))
-                logger.exception("Failed to release NI-DAQ laser trigger "
-                                 "route %s -> %s", source, destination)
+        with self._route_lock():
+            for route in routes:
+                if route not in self._trigger_routes:
+                    continue
+                self._trigger_routes.remove(route)
+                source, destination = route
+                try:
+                    self._nidaqmx.system.System.local().disconnect_terms(
+                        source, destination)
+                except Exception as error:
+                    errors.append((f"trigger route {source} -> {destination}",
+                                   error))
+                    logger.exception("Failed to release NI-DAQ laser trigger "
+                                     "route %s -> %s", source, destination)
         return errors
 
     def _create_channel_tasks(self, channel: LaserChannelConfiguration) -> _NidaqLaserTasks:
@@ -1167,9 +1285,14 @@ class NidaqLaserController:
 
     def _create_calibration_input_task(self, channel: LaserChannelConfiguration):
         analog_input = self._nidaqmx.Task(f"laser_{channel.channel_id.value}_calibration_ai")
-        analog_input.ai_channels.add_ai_voltage_chan(channel.diode_input)
-        if channel.command_copy_input is not None:
-            analog_input.ai_channels.add_ai_voltage_chan(channel.command_copy_input)
+        try:
+            analog_input.ai_channels.add_ai_voltage_chan(channel.diode_input)
+            if channel.command_copy_input is not None:
+                analog_input.ai_channels.add_ai_voltage_chan(channel.command_copy_input)
+        except Exception:
+            # Not yet the ramp's to close: it never had it.
+            analog_input.close()
+            raise
         return analog_input
 
     def _create_finite_digital_output_task(

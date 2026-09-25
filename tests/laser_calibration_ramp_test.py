@@ -490,13 +490,24 @@ def test_the_footer_drops_its_own_refusal_once_a_ramp_can_run(idle_panel, qapp):
 def test_a_failed_laser_operation_says_what_failed(idle_panel, qapp, caplog):
     # It said "Laser operation stopped", and the reason reached only the
     # log's traceback: a -89125 from the ramp's first press would not have
-    # been seen.
+    # been seen. And nidaqmx's DaqError puts the status code last, so the
+    # first line alone, which is all the footer and status bar show, lost it.
     _app_model, content, _tab = idle_panel
 
     def failing():
+        # As nidaqmx.errors.DaqError formats itself: the driver's own text,
+        # then the task, then the status code on the last line.
         raise RuntimeError(
-            "DAQmx Error -89125: No registered trigger lines could be found\n"
-            "Task Name: laser_1_calibration_ai")
+            "The specified route cannot be satisfied, because it requires "
+            "connecting the source and destination terminals using a trigger "
+            "line, and no registered trigger lines could be found between the "
+            "devices in the route.\n"
+            "Source Device: PXI1Slot4\n"
+            "Destination Device: PXI1Slot5\n"
+            "\n"
+            "Task Name: laser_1_calibration_ai\n"
+            "\n"
+            "Status Code: -89125")
 
     with caplog.at_level("ERROR"):
         content._start_operation("Running laser 1 calibration ramp", failing)
@@ -508,10 +519,53 @@ def test_a_failed_laser_operation_says_what_failed(idle_panel, qapp, caplog):
 
     footer = content._status_label.text()
     assert "-89125" in footer and "Task Name" not in footer
-    assert any(
-        "Laser operation failed: DAQmx Error -89125" in record.getMessage()
-        for record in caplog.records
-    )
+    assert footer.startswith("Laser operation failed: The specified route")
+    # The status bar shows a record's first line.
+    first_lines = [record.getMessage().splitlines()[0] for record in caplog.records
+                   if record.getMessage().startswith("Laser operation failed")]
+    assert first_lines and all("-89125" in line for line in first_lines)
+    assert all(len(line) <= 320 for line in first_lines)
+
+
+def test_the_panel_can_go_while_a_laser_operation_still_runs(qapp, app_model):
+    # The operation thread was QThread(self). A panel destroyed while a
+    # force-closed ramp still ran destroyed a running QThread with it, and
+    # Qt aborts the process for that ("QThread: Destroyed while thread is
+    # still running"), at the very moment reachAQ was closing.
+    import shiboken6
+
+    assert app_model.load_configuration() is True
+    app_model.laser.set_configuration_offline(_null_lasers())
+    content = LaserControlContent(app_model)
+    inside, release = threading.Event(), threading.Event()
+    finished = []
+
+    def held():
+        inside.set()
+        release.wait(10.0)
+        finished.append(True)
+        return "Ramp complete"
+
+    try:
+        content._start_operation("Running laser 1 calibration ramp", held)
+        assert inside.wait(5.0)
+        operation_thread = content._operation_thread
+        content.on_close()
+        shiboken6.delete(content)
+        qapp.processEvents()
+        release.set()
+        operation_thread.join(5.0)
+        # Its result, queued for a panel that has gone.
+        for _ in range(10):
+            qapp.processEvents()
+            time.sleep(0.01)
+
+        assert not operation_thread.is_alive()
+        assert finished == [True]
+    finally:
+        release.set()
+        app_model.laser.close()
+        app_model._acquisition.mark_stopped()
 
 
 def test_run_ramp_runs_on_the_operation_worker_off_the_qt_thread(ramp_app, qapp, monkeypatch):
