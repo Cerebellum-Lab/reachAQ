@@ -3,6 +3,7 @@ import threading
 from types import SimpleNamespace
 
 from autotrainer.device import (
+    LaserCalibrationRamp,
     LaserChannelConfiguration,
     LaserChannelId,
     LaserPulseTrain,
@@ -429,3 +430,24 @@ def test_synchronized_pulse_train_rejects_deferred_hardware_trigger():
             wait=False,
             defer_start=True,
         )
+
+
+
+def _ramp(**values):
+    fields = dict(channel_id=LaserChannelId.LASER_1, start_volts=0.0,
+                  stop_volts=5.0, steps=3, samples_per_step=100)
+    fields.update(values)
+    return LaserCalibrationRamp(**fields)
+
+
+def test_a_calibration_ramp_settles_a_fifth_of_each_step_by_default():
+    assert _ramp().settle_samples == 20
+    assert _ramp(samples_per_step=10).settle_samples == 2
+    assert _ramp(samples_per_step=1).settle_samples == 0
+    assert _ramp(settle_samples=0).settle_samples == 0
+
+
+@pytest.mark.parametrize("settle", [100, 101, -1])
+def test_a_calibration_ramp_keeps_at_least_one_sample_of_each_step(settle):
+    with pytest.raises(ValueError, match="settle_samples"):
+        _ramp(settle_samples=settle)

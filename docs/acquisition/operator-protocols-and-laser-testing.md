@@ -356,6 +356,17 @@ the command from **Start:** to **Stop:** in **Steps:** steps of
 **Samples/step:** samples each, and reads the diode at every step. **PMT
 shutter** holds the PMT shutter open for the ramp. Press **Run Ramp**.
 
+- **Settle:** is how many samples at the start of each step are left out of
+  that step's point; the rest are averaged, for the diode and the command
+  copy alike. The input is read on the clock edge the command changes on, and
+  the laser driver and the diode take time to follow, so the first samples of
+  a step still read the step before: averaged in, they pulled every point of
+  a rising ramp low. The default is a fifth of **Samples/step:**, 20 of 100
+  samples (200 us at christielab10's 100 kHz), until a measured step response
+  says otherwise; it must leave at least one sample of each step.
+  `tools/hardware/validate_laser_hardware.py --action ramp` takes the same
+  window as `--settle-samples`.
+
 - It runs only in **Idle**, with the laser mapped. Otherwise the button is
   greyed out and its tooltip says why: System Mode is running or starting, a
   session is recording, the DAQ Monitor is open, a configuration is loading,

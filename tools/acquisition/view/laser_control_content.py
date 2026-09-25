@@ -33,6 +33,7 @@ from autotrainer.device import (
     LaserChannelId,
     LaserPulseTrain,
 )
+from autotrainer.device.laser import CALIBRATION_SETTLE_FRACTION
 from autotrainer.pyside import CardWidget, PGWidget
 from autotrainer.pyside.content_widget import ContentWidget, invoke_method
 from tools.acquisition.model.trial_protocol_schedule import (
@@ -390,16 +391,30 @@ class _LaserChannelTab(QWidget):
         self._ramp_samples_per_step = QSpinBox()
         self._ramp_samples_per_step.setRange(1, 1000000)
         self._ramp_samples_per_step.setValue(100)
+        # Left out of each step's point, while the laser and the diode follow
+        # the step; at least one sample of the step stays in it.
+        self._ramp_settle = QSpinBox()
+        self._ramp_settle.setRange(0, self._ramp_samples_per_step.value() - 1)
+        self._ramp_settle.setValue(int(round(
+            self._ramp_samples_per_step.value() * CALIBRATION_SETTLE_FRACTION)))
+        self._ramp_settle.setToolTip(
+            "Samples at the start of each step left out of its point, while "
+            "the laser and the diode settle to the new command: the input is "
+            "read on the same clock edge the command changes on. A fifth of "
+            "Samples/step by default.")
+        self._ramp_samples_per_step.valueChanged.connect(
+            lambda samples: self._ramp_settle.setMaximum(max(0, samples - 1)))
         self._ramp_pmt = self._make_checkbox("PMT shutter")
         self._run_ramp_button = QPushButton("Run Ramp")
 
         ramp_layout = field_grid(ramp_section.content, (
             ("Start:", self._ramp_start), ("Stop:", self._ramp_stop),
             ("Steps:", self._ramp_steps), ("Samples/step:", self._ramp_samples_per_step),
+            ("Settle:", self._ramp_settle),
         ))
-        ramp_layout.addWidget(self._ramp_pmt, 2, 0, 1, 2)
+        ramp_layout.addWidget(self._ramp_pmt, 2, 2, 1, 2)
         ramp_layout.addWidget(
-            self._run_ramp_button, 2, 3, 1, 2, alignment=Qt.AlignmentFlag.AlignRight)
+            self._run_ramp_button, 3, 3, 1, 2, alignment=Qt.AlignmentFlag.AlignRight)
         calibration_page_layout.addWidget(ramp_section)
         calibration_page_layout.addStretch(1)
 
@@ -606,6 +621,7 @@ class _LaserChannelTab(QWidget):
             self._ramp_stop,
             self._ramp_steps,
             self._ramp_samples_per_step,
+            self._ramp_settle,
             self._ramp_pmt,
         )
 
@@ -1140,6 +1156,7 @@ class _LaserChannelTab(QWidget):
                 stop_volts=self._ramp_stop.value(),
                 steps=self._ramp_steps.value(),
                 samples_per_step=self._ramp_samples_per_step.value(),
+                settle_samples=self._ramp_settle.value(),
                 enable_pmt_shutter=self._ramp_pmt.isChecked(),
             )
         except Exception as exc:

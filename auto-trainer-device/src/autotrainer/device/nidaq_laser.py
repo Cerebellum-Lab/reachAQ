@@ -1674,8 +1674,10 @@ class NidaqLaserController:
         samples = self._normalize_ai_samples(raw_samples, channel_count)
         points = []
         for index in range(ramp.steps):
-            start = index * ramp.samples_per_step
-            stop = start + ramp.samples_per_step
+            # After the step has settled: its first samples still read the
+            # step before (LaserCalibrationRamp.settle_samples).
+            start = index * ramp.samples_per_step + ramp.settle_samples
+            stop = (index + 1) * ramp.samples_per_step
             fraction = index / (ramp.steps - 1)
             command_volts = ramp.start_volts + fraction * (ramp.stop_volts - ramp.start_volts)
             diode_volts = _mean(samples[0][start:stop]) * channel.feedback_scale

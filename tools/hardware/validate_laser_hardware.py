@@ -88,14 +88,7 @@ def main() -> int:
             print(f"pulse train completed on laser {channel_id.value}")
             return 0
         if args.action == "ramp":
-            ramp = LaserCalibrationRamp(
-                channel_id=channel_id,
-                start_volts=args.ramp_start,
-                stop_volts=args.ramp_stop,
-                steps=args.ramp_steps,
-                samples_per_step=args.samples_per_step,
-                enable_pmt_shutter=args.pmt,
-            )
+            ramp = _calibration_ramp(args, channel_id)
             points = model.run_calibration_ramp(ramp)
             curve = model.make_diode_power_curve(points)
             print(f"calibration ramp completed on laser {channel_id.value}: {len(points)} points")
@@ -114,7 +107,19 @@ def main() -> int:
         model.close()
 
 
-def _parse_args() -> argparse.Namespace:
+def _calibration_ramp(args: argparse.Namespace, channel_id: LaserChannelId) -> LaserCalibrationRamp:
+    return LaserCalibrationRamp(
+        channel_id=channel_id,
+        start_volts=args.ramp_start,
+        stop_volts=args.ramp_stop,
+        steps=args.ramp_steps,
+        samples_per_step=args.samples_per_step,
+        enable_pmt_shutter=args.pmt,
+        settle_samples=args.settle_samples,
+    )
+
+
+def _parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Validate reachAQ NI-DAQ laser hardware one path at a time.")
     parser.add_argument("--config", type=Path, required=True, help="SystemConfiguration YAML file.")
     parser.add_argument("--channel", type=int, default=1, choices=(1, 2, 3, 4), help="Laser channel to validate.")
@@ -141,7 +146,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--ramp-stop", type=float, default=1.0, help="Calibration ramp stop voltage.")
     parser.add_argument("--ramp-steps", type=int, default=11, help="Calibration ramp point count.")
     parser.add_argument("--samples-per-step", type=int, default=100, help="Samples acquired for each ramp point.")
-    return parser.parse_args()
+    parser.add_argument(
+        "--settle-samples",
+        type=int,
+        default=None,
+        help="Samples at the start of each ramp step left out of its point, while the laser "
+        "and diode follow the step; default a fifth of --samples-per-step.",
+    )
+    return parser.parse_args(argv)
 
 
 def _print_laser_summary(laser_config, channel_id: LaserChannelId) -> None:
