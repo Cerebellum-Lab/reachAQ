@@ -409,6 +409,97 @@ def test_a_failed_start_is_shown_and_not_retried(app_model, system_config,
         monitor.close()
 
 
+class _HeldExitContext:
+    """The monitor's process context, holding its first worker's thread.
+
+    The monitor's thread reads the worker's exit code only in the finally of
+    its _run, after its loop has ended. Holding that read keeps the thread
+    alive past stop()'s two-second join, as a slow driver teardown can.
+    """
+
+    def __init__(self, context):
+        self._context = context
+        self.release = threading.Event()
+        self.held = threading.Event()
+        self._made = 0
+
+    def __getattr__(self, name):
+        return getattr(self._context, name)
+
+    def __reduce_ex__(self, _protocol):
+        # The sample ring keeps the context it was made with and goes to the
+        # worker with it; the worker gets the stream's real one.
+        from autotrainer.core.multiproc import get_nidaq_mp_ctx
+        return get_nidaq_mp_ctx, ()
+
+    def Process(self, *args, **kwargs):  # noqa: N802 - multiprocessing's name
+        process = self._context.Process(*args, **kwargs)
+        self._made += 1
+        return _HeldExitProcess(process, self) if self._made == 1 else process
+
+
+class _HeldExitProcess:
+    def __init__(self, process, context):
+        self._process = process
+        self._context = context
+
+    def __getattr__(self, name):
+        return getattr(self._process, name)
+
+    @property
+    def exitcode(self):
+        self._context.held.set()
+        self._context.release.wait(30.0)
+        return self._process.exitcode
+
+
+def test_an_old_workers_late_error_cannot_fail_the_stream_that_replaced_it(
+    nidaq_app, caplog,
+):
+    # stop() waits two seconds for the monitor's thread, then lets it go. A
+    # thread that outlived that posted its worker's error from its finally
+    # with no check that its process was still the monitor's, over a new and
+    # healthy worker: the monitor showed that error, and NI-DAQ read FAILED.
+    monitor = nidaq_app.nidaq_signal_monitor
+    monitor._worker_target = nidaq_stream_fakes.failing_as_stopped_worker
+    context = monitor._mp_ctx = _HeldExitContext(monitor._mp_ctx)
+    try:
+        assert nidaq_app.load_configuration() is True
+        assert _settle(nidaq_app).is_running, "worker A did not start"
+        old_pid = _worker_pid(monitor)
+        old_thread = monitor._thread
+
+        monitor.stop()
+
+        assert context.held.is_set() and old_thread.is_alive()
+        monitor._worker_target = nidaq_stream_fakes.idle_worker
+        assert monitor.start()
+        assert _settle(nidaq_app).is_running, "worker B did not start"
+        new_pid = _worker_pid(monitor)
+        assert new_pid not in (None, old_pid)
+        assert _nidaq_state(nidaq_app).state is SubsystemState.READY
+
+        # Worker A's error arrived while it was still the monitor's, and was
+        # logged then; what follows is its thread posting it after B began.
+        caplog.clear()
+        with caplog.at_level("WARNING"):
+            context.release.set()
+            old_thread.join(5.0)
+
+        assert not old_thread.is_alive()
+        assert monitor.is_running and _worker_pid(monitor) == new_pid
+        assert monitor.error_message == ""
+        assert monitor.status_message == "NI-DAQ signal stream running"
+        assert _nidaq_state(nidaq_app).state is SubsystemState.READY
+        late = [record for record in caplog.records
+                if "the old task failed as it was stopped" in record.getMessage()]
+        warning, = late
+        assert warning.levelname == "WARNING"
+        assert f"pid={old_pid}" in warning.getMessage()
+    finally:
+        context.release.set()
+
+
 def test_a_hardware_refresh_starts_a_stopped_stream(nidaq_app, monkeypatch):
     from hardware_status_content_test import _patch_hardware_scans
 
