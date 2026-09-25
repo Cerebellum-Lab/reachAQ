@@ -334,7 +334,22 @@ class NidaqMonitorWindow(QMainWindow):
         self.setWindowTitle("DAQ Monitor")
         self.resize(1280, 860)
         self._app_model = app_model
+        # The session pauses the application's input stream until it closes.
+        # A window that failed to build would never reach closeEvent, and
+        # the stream would stay paused, so the session is closed here too.
         self._session = NidaqMonitorSession(app_model)
+        try:
+            self._build()
+        except Exception:
+            # Its timers would otherwise reopen the tasks close() releases.
+            for timer in (getattr(self, "_plot_timer", None),
+                          getattr(self, "_static_timer", None)):
+                if timer is not None:
+                    self.killTimer(timer)
+            self._session.close()
+            raise
+
+    def _build(self) -> None:
         self._tabs_by_device: Dict[str, _CardTab] = {}
         self._report_rows: Optional[QGridLayout] = None
         self._destination: Optional[np.ndarray] = None

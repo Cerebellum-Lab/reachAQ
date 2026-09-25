@@ -55,6 +55,7 @@ _WORKER_ERROR = "error"
 _WORKER_STOPPED = "stopped"
 _WORKER_LOG = "log"
 _DEFAULT_STARTUP_TIMEOUT_SECONDS = 10.0
+_PAUSED_STATUS = "NI-DAQ signal stream paused"
 
 
 def _put_worker_message(message_queue, message) -> None:
@@ -180,6 +181,8 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
         self._device_identities: tuple[NidaqDeviceIdentity, ...] = tuple()
         self._runtime_device_aliases = {}
         self._timing_plan: Optional[NidaqTimingPlan] = None
+        #: What the running worker was started with; see running_matches_configuration.
+        self._started_signature = None
         self._sample_ring = SharedNidaqSampleRing(self._configuration, mp_ctx=self._mp_ctx)
 
     @property
@@ -216,6 +219,39 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
         return self._error_message
 
     @property
+    def stream_state(self) -> str:
+        """One word for the stream, as the Analysis card and laser tabs show it."""
+        if not (self._hardware_enabled and self._configuration.is_enabled):
+            return "disabled"
+        if self._is_starting:
+            return "starting"
+        if self._is_running:
+            return "running"
+        if self._error_message:
+            return "error"
+        return "stopped"
+
+    @property
+    def running_matches_configuration(self) -> bool:
+        """Whether the running worker is acquiring what is configured now.
+
+        The plot selection is left out: it decides what is drawn, never what
+        is acquired, so changing it must not cost a restart.
+        """
+        signature = self._started_signature
+        return signature is not None and signature == self._acquisition_signature()
+
+    def _acquisition_signature(self):
+        return (
+            dataclasses.replace(self._configuration, display_channels=()),
+            self.effective_read_chunk_size,
+            self._timing_configuration,
+            self._hardware_timed_output_devices,
+            self._hardware_timed_output_channels,
+            self._device_identities,
+        )
+
+    @property
     def timing_plan(self) -> Optional[NidaqTimingPlan]:
         return self._timing_plan
 
@@ -227,23 +263,35 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
     def display_refresh_rate_hz(self) -> float:
         return self._display_refresh_rate_hz
 
+    def _ring_fits(self, ring, configuration) -> bool:
+        required_capacity = max(
+            configuration.read_chunk_size * 4,
+            int(math.ceil(
+                configuration.sample_rate_hz
+                * configuration.rolling_window_seconds
+            )),
+        )
+        return (
+            ring.channel_names == tuple(channel.name for channel in configuration.channels)
+            and math.isclose(ring.sample_rate_hz, configuration.sample_rate_hz)
+            and ring.capacity >= required_capacity
+        )
+
     @property
     def sample_ring(self) -> SharedNidaqSampleRing:
+        # Checked without the lock first. start() holds the lock through
+        # device discovery and the exact-task preflight, which take seconds,
+        # and the graphs read this at the display refresh rate on the Qt
+        # thread. Now that the stream starts by itself in the background,
+        # waiting on the lock here would freeze every graph for as long as
+        # each start takes. The ring only needs replacing when the
+        # configuration changed, and that path still takes the lock.
+        ring = self._sample_ring
+        if self._ring_fits(ring, self._configuration):
+            return ring
         with self._lock:
-            expected_names = tuple(channel.name for channel in self._configuration.channels)
-            required_capacity = max(
-                self._configuration.read_chunk_size * 4,
-                int(math.ceil(
-                    self._configuration.sample_rate_hz
-                    * self._configuration.rolling_window_seconds
-                )),
-            )
             ring = self._sample_ring
-            if (
-                ring.channel_names != expected_names
-                or not math.isclose(ring.sample_rate_hz, self._configuration.sample_rate_hz)
-                or ring.capacity < required_capacity
-            ):
+            if not self._ring_fits(ring, self._configuration):
                 if self._process is not None:
                     raise RuntimeError("cannot replace NI-DAQ sample ring while stream is active")
                 ring = SharedNidaqSampleRing(self._configuration, mp_ctx=self._mp_ctx)
@@ -280,7 +328,7 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
             self._set_error("")
             log_hardware_initialization(
                 logger,
-                "SKIP | NI-DAQ signal stream | awaiting manual or acquisition start",
+                "SKIP | NI-DAQ signal stream | configured; loading does not start it",
             )
         elif configuration.is_enabled:
             self._set_status("NI-DAQ hardware disabled; signal stream stopped")
@@ -512,6 +560,7 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
             self._process = process
             self._message_queue = message_queue
             self._process_stop_event = stop_event
+            self._started_signature = self._acquisition_signature()
             self._set_error("")
             self._set_status("Starting NI-DAQ signal stream...")
             self._set_starting(True)
@@ -553,6 +602,16 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
 
     def close(self) -> None:
         self.stop()
+
+    def show_paused(self, reason: str) -> None:
+        """Say why a stopped stream is being kept stopped, or stop saying it."""
+        with self._lock:
+            if self._process is not None:
+                return
+            if reason:
+                self._set_status(f"{_PAUSED_STATUS}: {reason}")
+            elif self._status_message.startswith(_PAUSED_STATUS):
+                self._set_status("NI-DAQ signal stream stopped")
 
     def _run(self, process, message_queue, stop_event, started: float) -> None:
         worker_error = ""
@@ -656,6 +715,7 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
             self._message_queue = None
             self._process_stop_event = None
             self._thread = None
+            self._started_signature = None
             self._set_starting(False)
             self._set_running(False)
             if self._configuration.is_enabled:

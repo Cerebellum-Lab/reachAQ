@@ -387,9 +387,15 @@ def test_acquisition_owns_configured_signal_stream_lifecycle(app_model, monkeypa
 
     assert app_model.capture_start() is True
     app_model.capture_stop()
+    # Back in Idle the stream starts again by itself, in the background.
+    rule = vars(app_model).get("_nidaq_stream_autostart")
+    if rule is not None:
+        assert rule.wait(5.0)
 
     assert calls[0] == "start"
     assert "stop" in calls[1:]
+    assert calls[-1] == "start"
+    assert calls.index("stop") < len(calls) - 1
 
 
 def test_gpu_preflight_failure_does_not_block_cameras_and_hardware(
