@@ -314,17 +314,19 @@ def test_moving_a_port_role_to_another_line_keeps_one_channel():
     ) == (("tone1", "InputCard/port0/line3"),)
 
 
-def test_a_stored_laser_channel_stays_a_custom_input_with_the_laser_disabled():
+def test_a_configured_lasers_stored_channel_stays_a_custom_input_with_the_backend_disabled():
     # This asserted the same for a stored tone2 with its role unset; that is
     # a cleared port role now, and dropped (see below). A disabled laser
-    # backend plans no laser role, so its names are not claimed and a stored
-    # laser channel stays as it always has.
+    # backend plans no laser role, so a configured laser's stored channel
+    # stays a custom input, which its tab still finds by pin. One of a laser
+    # not configured is dropped (below).
     stored = _stream_of(
         NidaqSignalChannelConfiguration("laser1_diode", "InputCard/ai0"),
     )
+    lasers = dataclasses.replace(_laser_with(), backend="disabled")
 
     result = build_nidaq_acquisition_configuration(
-        stored, NidaqPortConfiguration(), LaserSystemConfiguration())
+        stored, NidaqPortConfiguration(), lasers)
 
     assert result.channels == stored.channels
 
@@ -735,6 +737,32 @@ def test_a_laser_cleared_from_its_tab_drops_its_stored_channels(caplog):
     assert "'laser2_command_copy' on PXI1Slot5/ai5" in warnings[0]
     assert "'laser2_diode' on PXI1Slot5/ai4" in warnings[1]
     assert all("not set" in warning for warning in warnings)
+
+
+def test_a_disabled_backend_drops_the_stored_channels_of_a_laser_not_configured(caplog):
+    # With the backend disabled no laser name was claimed, so a laser cleared
+    # in Edit DAQ Ports kept its stored channels as custom inputs: recorded,
+    # hidden from Analysis by name, and shown on no tab.
+    lasers = dataclasses.replace(_christielab10_laser1_only(), backend="disabled")
+    stored = _stream_of(
+        NidaqSignalChannelConfiguration("laser1_diode", "PXI1Slot5/ai8"),
+        NidaqSignalChannelConfiguration("laser2_diode", "PXI1Slot5/ai4"),
+        NidaqSignalChannelConfiguration("stim_readback", "PXI1Slot5/ai6"),
+    )
+
+    with caplog.at_level("WARNING"):
+        result = build_nidaq_acquisition_configuration(
+            stored, NidaqPortConfiguration(), lasers)
+
+    pins = {channel.name: channel.physical_channel for channel in result.channels}
+    # A configured laser's stays a custom input, on the pin its tab finds.
+    assert pins["laser1_diode"] == lasers.get_channel(1).diode_input
+    assert "laser2_diode" not in pins
+    assert "PXI1Slot5/ai4" not in pins.values()
+    assert pins["stim_readback"] == "PXI1Slot5/ai6"
+    warning, = [record.getMessage() for record in caplog.records
+                if "drops the stored channel" in record.getMessage()]
+    assert "'laser2_diode' on PXI1Slot5/ai4" in warning and "not set" in warning
 
 
 @pytest.mark.parametrize(
