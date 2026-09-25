@@ -7,6 +7,7 @@ process id to compare.
 """
 
 import dataclasses
+import threading
 import time
 
 import pytest
@@ -112,6 +113,131 @@ def test_every_run_restarts_the_stream_from_a_fresh_timing_anchor(nidaq_app, mon
         assert _nidaq_state(nidaq_app).state is SubsystemState.READY
     finally:
         nidaq_app.capture_stop()
+
+
+def test_a_run_during_an_automatic_start_still_gets_a_fresh_worker(nidaq_app, monkeypatch):
+    # An automatic start decides to start, then holds the monitor through
+    # discovery and preflight, and says it is starting only once its worker
+    # is launched. Run assigns the session's project to the monitor, under
+    # the same lock, before it reaches the NI-DAQ domain, so a start already
+    # inside the monitor holds Run there until the worker is launched. One
+    # that decided just before Run began and reached the monitor just after
+    # that assignment did not: Run found the stream neither running nor
+    # starting, skipped the stop, and its start() waited on the monitor and
+    # returned True for the worker the automatic start had launched in Idle.
+    monkeypatch.setattr(nidaq_app, "_require_valid_nidaq_configuration", lambda: None)
+    monitor = nidaq_app.nidaq_signal_monitor
+    rule = nidaq_app._nidaq_stream_autostart
+    decided = threading.Event()
+    enter_monitor = threading.Event()
+    in_discovery = threading.Event()
+    release = threading.Event()
+    may_start = rule._may_start
+
+    def decide_then_stall():
+        allowed = may_start()
+        if allowed and not decided.is_set():
+            decided.set()
+            enter_monitor.wait(10.0)
+        return allowed
+
+    def gated_discovery():
+        in_discovery.set()
+        release.wait(10.0)
+        return nidaq_stream_fakes.discover_dev1()
+
+    start_can_domain = nidaq_app._start_can_domain
+
+    def let_the_automatic_start_in(*args, **kwargs):
+        # Past the project assignment, before the NI-DAQ domain.
+        enter_monitor.set()
+        in_discovery.wait(10.0)
+        return start_can_domain(*args, **kwargs)
+
+    rule._may_start = decide_then_stall
+    monitor._device_discovery = gated_discovery
+    monkeypatch.setattr(nidaq_app, "_start_can_domain", let_the_automatic_start_in)
+    automatic_pids = []
+    original_start = monitor.start
+
+    def start():
+        started = original_start()
+        if threading.current_thread().name == "nidaq-stream-autostart":
+            automatic_pids.append(_worker_pid(monitor))
+        return started
+
+    monitor.start = start
+    started = []
+    run = threading.Thread(
+        target=lambda: started.append(nidaq_app.capture_start()),
+        name="StartAcquisition", daemon=True)
+    try:
+        assert nidaq_app.load_configuration() is True
+        assert decided.wait(5.0), "the stream did not start by itself"
+
+        run.start()
+        # Let the automatic start finish only once Run is at the NI-DAQ
+        # domain, past the point where it decides whether to restart.
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            status = nidaq_app.subsystem_statuses.get(SubsystemId.NIDAQ_STREAM.value)
+            if status is not None and status.reason == "starting synchronized NI-DAQ tasks":
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("Run never reached the NI-DAQ domain")
+        assert in_discovery.is_set()
+        assert not (monitor.is_running or monitor.is_starting)
+        time.sleep(0.3)
+        release.set()
+        run.join(30.0)
+
+        assert not run.is_alive()
+        assert started == [True]
+        assert len(automatic_pids) == 1 and automatic_pids[0] is not None
+        assert monitor.is_running
+        assert _worker_pid(monitor) not in (None, automatic_pids[0])
+        assert _nidaq_state(nidaq_app).state is SubsystemState.READY
+    finally:
+        enter_monitor.set()
+        release.set()
+        if run.ident is not None:
+            run.join(30.0)
+            nidaq_app.capture_stop()
+
+
+def test_a_run_waits_for_an_automatic_start_only_within_its_bound(
+    nidaq_app, monkeypatch, caplog,
+):
+    # A start stuck in discovery or the preflight must not hang Run; past the
+    # bound it carries on as before and says so.
+    monkeypatch.setattr(nidaq_app, "_require_valid_nidaq_configuration", lambda: None)
+    monitor = nidaq_app.nidaq_signal_monitor
+    in_discovery = threading.Event()
+    release = threading.Event()
+
+    def gated_discovery():
+        in_discovery.set()
+        release.wait(10.0)
+        return nidaq_stream_fakes.discover_dev1()
+
+    monitor._device_discovery = gated_discovery
+    releaser = threading.Timer(2.0, release.set)
+    try:
+        assert nidaq_app.load_configuration() is True
+        assert in_discovery.wait(5.0), "the stream did not start by itself"
+        releaser.start()
+
+        assert nidaq_app._start_nidaq_domain(restart=True, timeout=1.0) is True
+
+        assert monitor.is_running
+        assert any(
+            "still running after 1 seconds" in record.getMessage()
+            for record in caplog.records
+        )
+    finally:
+        release.set()
+        releaser.cancel()
 
 
 def test_the_daq_monitor_cannot_take_the_stream_from_a_running_acquisition(
