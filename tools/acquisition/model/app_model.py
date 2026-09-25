@@ -6412,8 +6412,13 @@ class AppModel(ObservableObject):
         seen here, or comes later and stands.
         """
         monitor = self._nidaq_signal_monitor
+        # Running first. A dying worker sets its error before it clears
+        # running (NidaqSignalMonitorModel._run, then _finalize_worker), so
+        # read the other way round a crash between the two reads showed a
+        # stopped stream with no error, written as the generic FAILED below.
+        running = monitor.is_running
         error = monitor.error_message
-        if not error and monitor.is_running:
+        if running and not error:
             return False
         self._set_subsystem_status(
             SubsystemId.NIDAQ_STREAM,
