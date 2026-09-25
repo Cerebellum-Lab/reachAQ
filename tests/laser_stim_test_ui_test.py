@@ -67,6 +67,8 @@ def test_run_pulse_is_internal_even_when_the_channel_has_a_trigger_route(qapp, a
     draft = LaserPulseProfile("builder-draft", 1, 1.0, 1.0)
     tab, _started, _statuses = make_tab(
         app_model, trigger_source="/Dev1/PXI_Trig0", draft_provider=lambda: draft)
+    tab.stim_profile_selector.setCurrentIndex(
+        tab.stim_profile_selector.findData("builder-draft"))
 
     assert tab._trigger_mode.currentText() == "internal"
     assert tab._trigger_source.text() == "/Dev1/PXI_Trig0"
@@ -138,7 +140,8 @@ def test_every_saved_profile_is_offered_on_every_laser(qapp, app_model, monkeypa
     listed = [tab.stim_profile_selector.itemData(index)
               for index in range(tab.stim_profile_selector.count())]
 
-    assert listed == ["builder-draft", "one", "two"]
+    assert listed == [None, "builder-draft", "one", "two"]
+    assert tab.stim_profile_selector.itemText(0) == "(none)"
 
 
 def a_profile(**overrides):
@@ -253,10 +256,88 @@ def test_a_laser_keeps_its_profile_when_laser_control_rebuilds(qapp, app_model, 
         assert rebuilt is not laser_2
         assert rebuilt.stim_profile_selector.currentData() == "burst"
         assert rebuilt._profile_summary.text() == profile.summary()
-        assert content._channel_tabs[0].stim_profile_selector.currentData() == "builder-draft"
+        assert content._channel_tabs[0].stim_profile_selector.currentData() is None
         assert content._builder._amplitude.value() == pytest.approx(1.5)
         assert content._tabs.count() == 1 + len(content._channel_tabs)
         assert content._tabs.tabText(1) == "Laser 1"
+    finally:
+        content.on_close()
+
+
+def test_a_new_laser_tab_picks_nothing_and_refuses_to_fire(qapp, app_model):
+    # Starting on the builder draft meant a laser nobody had set up fired
+    # whatever happened to be on the builder.
+    draft = LaserPulseProfile("builder-draft", 1, 0.5, 2.0)
+    tab, started, statuses = make_tab(
+        app_model, trigger_source="/Dev1/PXI_Trig0", board_stim_line=3,
+        draft_provider=lambda: draft)
+
+    assert tab.stim_profile_selector.currentData() is None
+    assert tab.stim_profile_selector.currentText() == "(none)"
+    assert tab._profile_summary.text() == "No profile selected"
+
+    tab._run_pulse()
+    tab._run_stim_test()
+
+    assert started == []
+    assert statuses == [
+        ("Laser 1: pick a saved profile or the builder draft", True),
+        ("Laser 1: pick a saved profile or the builder draft", True),
+    ]
+
+
+def with_listed_profiles(monkeypatch, app_model, listed):
+    """A profile list the test can change, as the Pulse Builder's Delete does."""
+    monkeypatch.setattr(
+        type(app_model),
+        "trial_protocol_state",
+        property(lambda _self: {"laser_profiles": tuple(listed)}),
+    )
+
+
+def test_a_laser_whose_profile_is_deleted_picks_nothing_and_says_so(
+    qapp, app_model, monkeypatch,
+):
+    # It fell back to the builder draft, so after the builder deleted
+    # "burst" the laser silently fired whatever was on the builder.
+    listed = [{"profile_id": "burst", "revision": 1, "summary": ""}]
+    with_listed_profiles(monkeypatch, app_model, listed)
+    with_saved_profile(monkeypatch, app_model, a_profile())
+    tab, _started, statuses = make_tab(
+        app_model, draft_provider=lambda: LaserPulseProfile("builder-draft", 1, 0.5, 2.0))
+    tab.stim_profile_selector.setCurrentIndex(tab.stim_profile_selector.findData("burst"))
+
+    listed.clear()
+    tab.refresh_stim_profiles()
+
+    assert tab.stim_profile_selector.currentData() is None
+    assert tab._profile_summary.text() == "No profile selected"
+    assert statuses == [
+        ("Laser 1: profile 'burst' is no longer saved; pick a profile", True)]
+
+
+def test_a_rebuilt_laser_whose_profile_vanished_picks_nothing_and_says_so(
+    qapp, app_model, monkeypatch,
+):
+    from tools.acquisition.view.laser_control_content import LaserControlContent
+    listed = [{"profile_id": "burst", "revision": 1, "summary": ""}]
+    with_listed_profiles(monkeypatch, app_model, listed)
+    with_saved_profile(monkeypatch, app_model, a_profile())
+    content = LaserControlContent(app_model)
+    statuses = []
+    content._set_status_from_tab = lambda message, is_error: statuses.append(
+        (message, is_error))
+    try:
+        laser_2 = content._channel_tabs[1]
+        laser_2.stim_profile_selector.setCurrentIndex(
+            laser_2.stim_profile_selector.findData("burst"))
+
+        listed.clear()
+        content._refresh_from_model()
+
+        assert content._channel_tabs[1].stim_profile_selector.currentData() is None
+        assert ("Laser 2: profile 'burst' is no longer saved; pick a profile",
+                True) in statuses
     finally:
         content.on_close()
 

@@ -208,6 +208,8 @@ class _LaserChannelTab(QWidget):
         # laser: the Pulse Builder's unsaved draft or any saved profile. A
         # profile is the waveform alone; Run Pulse starts it with the trigger
         # and shutter options below, Test stim by the route chosen beside it.
+        # A new tab picks "(none)", so a laser only fires what someone chose
+        # for it, never whatever happens to be on the builder.
         self.stim_profile_selector = QComboBox()
         self.stim_profile_selector.setToolTip(
             "The Pulse Builder draft and every saved laser profile; any of "
@@ -867,34 +869,68 @@ class _LaserChannelTab(QWidget):
         )
 
     def refresh_stim_profiles(self) -> None:
-        """The builder draft and every saved profile; any profile fits any laser."""
+        """(none), the builder draft and every saved profile; any fits any laser."""
         previous = self.stim_profile_selector.currentData()
         self.stim_profile_selector.blockSignals(True)
         self.stim_profile_selector.clear()
+        self.stim_profile_selector.addItem("(none)", None)
         self.stim_profile_selector.addItem("(builder draft)", DRAFT_PROFILE_ID)
         state = getattr(self._app_model, "trial_protocol_state", {}) or {}
         for item in state.get("laser_profiles", ()):
             self.stim_profile_selector.addItem(item["profile_id"], item["profile_id"])
-        index = self.stim_profile_selector.findData(previous)
+        index = self.stim_profile_selector.findData(previous) if previous else -1
         self.stim_profile_selector.setCurrentIndex(max(0, index))
         self.stim_profile_selector.blockSignals(False)
+        if previous and index < 0:
+            self._report_vanished_profile(previous)
         self.refresh_draft()
 
     def select_profile(self, profile_id) -> None:
-        """Pick this profile if it is still listed; otherwise keep the current pick."""
-        index = self.stim_profile_selector.findData(profile_id)
-        if index < 0:
+        """Pick this profile; one no longer listed leaves "(none)" and says so."""
+        if not profile_id:
             return
+        index = self.stim_profile_selector.findData(profile_id)
         self.stim_profile_selector.blockSignals(True)
-        self.stim_profile_selector.setCurrentIndex(index)
+        self.stim_profile_selector.setCurrentIndex(max(0, index))
         self.stim_profile_selector.blockSignals(False)
+        if index < 0:
+            self._report_vanished_profile(profile_id)
         self.refresh_draft()
 
+    def _report_vanished_profile(self, profile_id) -> None:
+        # Falling back to the builder draft here made a laser whose profile
+        # was deleted fire whatever was on the builder, with no word of it.
+        self._set_parent_status(
+            f"Laser {self._channel.channel_id.value}: profile {profile_id!r} is "
+            "no longer saved; pick a profile",
+            True,
+        )
+
     def refresh_draft(self) -> None:
+        profile_id = self.stim_profile_selector.currentData()
         profile = self._selected_profile()
-        self._profile_summary.setText(
-            profile.summary() if profile is not None
-            else "The builder draft is not a valid pulse train")
+        if profile is not None:
+            text = profile.summary()
+        elif not profile_id:
+            text = "No profile selected"
+        elif profile_id == DRAFT_PROFILE_ID:
+            text = "The builder draft is not a valid pulse train"
+        else:
+            text = f"Profile {profile_id!r} is no longer saved"
+        self._profile_summary.setText(text)
+
+    def _profile_refusal(self) -> str:
+        """Why the current pick cannot fire; call only when it gave no profile."""
+        laser = self._channel.channel_id.value
+        profile_id = self.stim_profile_selector.currentData()
+        if not profile_id:
+            return f"Laser {laser}: pick a saved profile or the builder draft"
+        if profile_id == DRAFT_PROFILE_ID:
+            return (
+                f"Laser {laser}: the builder draft is not a valid pulse train; "
+                "fix it in the Pulse Builder"
+            )
+        return f"Laser {laser}: profile {profile_id!r} is no longer saved; pick a profile"
 
     def _refresh_stim_route_options(self) -> None:
         self._stim_route.clear()
@@ -920,10 +956,7 @@ class _LaserChannelTab(QWidget):
     def _run_stim_test(self) -> None:
         profile = self._selected_profile()
         if profile is None:
-            self._set_parent_status(
-                "Select a saved profile for laser {}, or build a valid draft "
-                "in the Pulse Builder".format(self._channel.channel_id.value),
-                True)
+            self._set_parent_status(self._profile_refusal(), True)
             return
         channel_id = int(self._channel.channel_id.value)
         route = self._stim_route.currentData()
@@ -980,7 +1013,7 @@ class _LaserChannelTab(QWidget):
     def _build_pulse_train(self) -> LaserPulseTrain:
         profile = self._selected_profile()
         if profile is None:
-            raise ValueError("Select a saved profile, or build a valid draft in the Pulse Builder")
+            raise ValueError(self._profile_refusal())
         trigger_source = None
         if self._trigger_mode.currentText() == "external":
             trigger_source = self._trigger_source.text().strip()
@@ -1274,8 +1307,8 @@ class LaserControlContent(ContentWidget):
             self._sample_rate_label.setText(f"{configuration.sample_rate_hz:g} Hz")
 
         # Every system Run/Stop and DAQ Ports save rebuilds the laser tabs. A
-        # new tab starts on the builder draft, so without this a laser set to a
-        # saved profile silently switched to firing whatever was on the builder.
+        # new tab starts on "(none)", so without this every laser lost its
+        # pick; a pick that is no longer saved stays "(none)" and is reported.
         picked_profiles = {
             tab.channel_id_value: tab.stim_profile_selector.currentData()
             for tab in self._channel_tabs
