@@ -126,6 +126,8 @@ class _LaserChannelTab(QWidget):
         self._draft_provider = draft_provider
         self._controls_can_edit = True
         self._trace_streaming = False
+        #: What the latest pulse, ramp or Clear did, shown after the stream state.
+        self._trace_note = ""
         self._trace_data = {}
 
         self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
@@ -408,7 +410,9 @@ class _LaserChannelTab(QWidget):
         trace_actions.setContentsMargins(0, 0, 0, 0)
         trace_actions.setHorizontalSpacing(5)
         trace_actions.setVerticalSpacing(3)
-        self._trace_toggle_button = QPushButton("Start Stream")
+        # No Start Stream or Start DAQ Inputs: the graph follows the shared
+        # NI-DAQ input stream, which runs by itself, and the status beside
+        # Clear says what that stream is doing.
         self._trace_clear_button = QPushButton("Clear")
         self._trace_seconds = QDoubleSpinBox()
         self._trace_seconds.setDecimals(1)
@@ -426,11 +430,8 @@ class _LaserChannelTab(QWidget):
         self._trace_max_volts.setRange(-1000.0, 1000.0)
         self._trace_max_volts.setValue(channel.maximum_command_volts)
         self._trace_max_volts.setSuffix(" V")
-        self._trace_daq_button = QPushButton("Start DAQ Inputs")
-        self._trace_daq_button.setToolTip(
-            "Starts or stops the shared NI-DAQ input worker used by Analysis and all laser graphs."
-        )
-        self._trace_status = QLabel("Stopped")
+        self._trace_status = QLabel("")
+        self._trace_status.setWordWrap(True)
         self._trace_status.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         for spinbox in (
             self._trace_seconds,
@@ -439,19 +440,18 @@ class _LaserChannelTab(QWidget):
         ):
             spinbox.setMinimumWidth(0)
             spinbox.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self._trace_toggle_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self._trace_clear_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self._trace_daq_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        trace_actions.addWidget(self._trace_toggle_button, 0, 0)
-        trace_actions.addWidget(self._trace_clear_button, 0, 1)
-        trace_actions.addWidget(self._trace_daq_button, 1, 0, 1, 2)
-        trace_actions.addWidget(QLabel("Window:"), 2, 0)
-        trace_actions.addWidget(self._trace_seconds, 2, 1)
-        trace_actions.addWidget(QLabel("Y min:"), 3, 0)
-        trace_actions.addWidget(self._trace_min_volts, 3, 1)
-        trace_actions.addWidget(QLabel("Y max:"), 4, 0)
-        trace_actions.addWidget(self._trace_max_volts, 4, 1)
-        trace_actions.addWidget(self._trace_status, 5, 0, 1, 2)
+        trace_status_row = QHBoxLayout()
+        trace_status_row.setContentsMargins(0, 0, 0, 0)
+        trace_status_row.setSpacing(5)
+        trace_status_row.addWidget(self._trace_status, stretch=1)
+        trace_status_row.addWidget(self._trace_clear_button)
+        trace_actions.addLayout(trace_status_row, 0, 0, 1, 2)
+        trace_actions.addWidget(QLabel("Window:"), 1, 0)
+        trace_actions.addWidget(self._trace_seconds, 1, 1)
+        trace_actions.addWidget(QLabel("Y min:"), 2, 0)
+        trace_actions.addWidget(self._trace_min_volts, 2, 1)
+        trace_actions.addWidget(QLabel("Y max:"), 3, 0)
+        trace_actions.addWidget(self._trace_max_volts, 3, 1)
         trace_actions.setColumnStretch(1, 1)
         trace_stream_layout.addLayout(trace_actions)
 
@@ -548,13 +548,11 @@ class _LaserChannelTab(QWidget):
 
         self._run_pulse_button.clicked.connect(self._run_pulse)
         self._run_ramp_button.clicked.connect(self._run_calibration_ramp)
-        self._trace_toggle_button.clicked.connect(self._toggle_trace_stream)
         self._trace_clear_button.clicked.connect(self._clear_trace)
         self._trace_seconds.valueChanged.connect(self._apply_trace_view)
         self._trace_min_volts.valueChanged.connect(self._apply_trace_view)
         self._trace_max_volts.valueChanged.connect(self._apply_trace_view)
         self._apply_trace_view()
-        self._trace_daq_button.clicked.connect(self._toggle_daq_input_stream)
         for key, checkbox in self._trace_signal_checkboxes.items():
             checkbox.toggled.connect(
                 lambda checked, signal_key=key: self._trace_signal_selection_changed(
@@ -563,6 +561,7 @@ class _LaserChannelTab(QWidget):
                 )
             )
         self.refresh_signal_selections()
+        self.refresh_stream_status()
         self.refresh_stim_profiles()
         self._connect_control_signals()
         self._refresh_trigger_mode_enabled()
@@ -647,20 +646,15 @@ class _LaserChannelTab(QWidget):
                 checkbox.setToolTip(
                     channel_tooltip + "Include this input in this laser's streaming graph."
                 )
-        has_selected_input = any(
-            checkbox.isChecked()
-            for checkbox in self._trace_signal_checkboxes.values()
-        )
-        if monitor.is_starting:
-            self._trace_daq_button.setText("Cancel DAQ Start")
-        elif monitor.is_running:
-            self._trace_daq_button.setText("Stop Shared Inputs")
-        else:
-            self._trace_daq_button.setText("Start DAQ Inputs")
-        self._trace_daq_button.setEnabled(
-            monitor.hardware_enabled
-            and (has_selected_input or monitor.is_starting or monitor.is_running)
-        )
+
+    def refresh_stream_status(self) -> None:
+        """The shared stream's state, then what the latest pulse or ramp did."""
+        monitor = self._app_model.nidaq_signal_monitor
+        text = f"NI-DAQ inputs {monitor.stream_state}"
+        if self._trace_note:
+            text += f" — {self._trace_note}"
+        self._trace_status.setText(text)
+        self._trace_status.setToolTip(monitor.error_message or monitor.status_message)
 
     def _trace_signal_selection_changed(self, signal_key: str, checked: bool) -> None:
         candidate = self._trace_signal_candidates.get(signal_key)
@@ -675,14 +669,6 @@ class _LaserChannelTab(QWidget):
         if checked:
             channel_names.append(candidate.name)
         self._app_model.update_nidaq_signal_stream_channels(channel_names)
-        self.refresh_signal_selections()
-
-    def _toggle_daq_input_stream(self) -> None:
-        monitor = self._app_model.nidaq_signal_monitor
-        if monitor.is_running or monitor.is_starting:
-            monitor.stop()
-        else:
-            monitor.start()
         self.refresh_signal_selections()
 
     @staticmethod
@@ -755,14 +741,14 @@ class _LaserChannelTab(QWidget):
         if not self._trace_streaming:
             return
         if not trace.x_values:
-            self._trace_status.setText("Calibration running — collecting diode feedback...")
+            self._trace_note = "calibration running, collecting diode feedback..."
+        elif is_calibration:
+            self._trace_note = (
+                f"calibration complete, {len(trace.x_values)} ramp points displayed"
+            )
         else:
-            if is_calibration:
-                self._trace_status.setText(
-                    f"Calibration complete — {len(trace.x_values)} ramp points displayed"
-                )
-            else:
-                self._trace_status.setText(f"Streaming — latest: {trace.source}")
+            self._trace_note = f"latest: {trace.source}"
+        self.refresh_stream_status()
         if self._plot_controller is not None:
             self._plot_controller.submit_laser_trace(trace)
 
@@ -810,18 +796,14 @@ class _LaserChannelTab(QWidget):
             self._plot_controller.configure_laser_plot(self)
         self.redraw_trace()
 
-    def _toggle_trace_stream(self) -> None:
-        self._set_trace_streaming(not self._trace_streaming)
-
     def _set_trace_streaming(self, is_streaming: bool) -> None:
+        """Whether this graph takes samples and traces; set by LaserControlContent."""
         self._trace_streaming = is_streaming
         if self._plot_controller is not None:
             self._plot_controller.set_laser_plot_streaming(
                 self.channel_id_value,
                 is_streaming,
             )
-        self._trace_toggle_button.setText("Stop Stream" if is_streaming else "Start Stream")
-        self._trace_status.setText("Streaming" if is_streaming else "Stopped")
 
     def _clear_trace(self) -> None:
         if self._plot_controller is not None:
@@ -830,7 +812,8 @@ class _LaserChannelTab(QWidget):
         for curve_name, curve in self._trace_curves.items():
             self._trace_data[curve_name] = ([], [])
             curve.setData([], [])
-        self._trace_status.setText("Streaming — cleared" if self._trace_streaming else "Stopped — cleared")
+        self._trace_note = "cleared"
+        self.refresh_stream_status()
 
     def _run_pulse(self) -> None:
         if not self._is_configured:
@@ -1195,6 +1178,16 @@ class LaserControlContent(ContentWidget):
         ):
             for tab in self._channel_tabs:
                 tab.refresh_signal_selections()
+        if property_name in (
+            NidaqSignalMonitorModel.CONFIGURATION,
+            NidaqSignalMonitorModel.HARDWARE_ENABLED,
+            NidaqSignalMonitorModel.IS_STARTING,
+            NidaqSignalMonitorModel.IS_RUNNING,
+            NidaqSignalMonitorModel.STATUS_MESSAGE,
+            NidaqSignalMonitorModel.ERROR_MESSAGE,
+        ):
+            for tab in self._channel_tabs:
+                tab.refresh_stream_status()
 
     def _flush_laser_plots(self) -> None:
         ring = self._app_model.nidaq_signal_monitor.sample_ring
@@ -1354,10 +1347,12 @@ class LaserControlContent(ContentWidget):
         self._plot_configuration_signatures.clear()
         for tab in self._channel_tabs:
             self.configure_laser_plot(tab, reset=True)
-        if self._is_capture_active:
-            for tab in self._channel_tabs:
-                if tab.is_configured:
-                    tab._set_trace_streaming(True)
+        # Every mapped laser's graph takes the shared stream's samples from
+        # the start, in Idle too; they used to only while System Mode ran,
+        # or after its own Start Stream. The stream itself starts by itself.
+        for tab in self._channel_tabs:
+            if tab.is_configured:
+                tab._set_trace_streaming(True)
         if current is not None:
             for index, tab in enumerate(self._channel_tabs):
                 if tab.channel_id_value == current:
@@ -1483,8 +1478,6 @@ class LaserControlContent(ContentWidget):
 
     @invoke_method
     def set_is_capture_active(self, is_active: bool):
+        # The graphs no longer follow System Mode; they follow the stream.
         self._is_capture_active = is_active
-        for tab in self._channel_tabs:
-            if tab.is_configured:
-                tab._set_trace_streaming(is_active)
         self._update_enabled_state()

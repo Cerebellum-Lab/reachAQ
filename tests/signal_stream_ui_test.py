@@ -442,7 +442,8 @@ def test_analysis_signal_selection_requires_mapped_port_and_nidaq_enable(qapp):
             for curve in content._rolling_plot._curves.values()
         )
         assert content._channel_count_label.text() == "1"
-        assert content._start_stop_button.isEnabled()
+        # The stream starts by itself; there is no button to start it.
+        assert not hasattr(content, "_start_stop_button")
         assert content._clear_button.isEnabled()
         assert content._live_button.isEnabled()
         assert not hasattr(content, "_graph_seconds")
@@ -490,7 +491,6 @@ def test_analysis_signal_selection_requires_mapped_port_and_nidaq_enable(qapp):
             "tone1",
             "tone2",
         )
-        assert not content._start_stop_button.isEnabled()
         assert not content._live_button.isEnabled()
         assert app_model.signal_configuration_save_count == 3
 
@@ -506,13 +506,11 @@ def test_analysis_signal_selection_requires_mapped_port_and_nidaq_enable(qapp):
         content._signal_checkboxes["cam_frames"].setChecked(True)
         qapp.processEvents()
         assert monitor.configuration.display_channels == ("cam_frames",)
-        assert content._start_stop_button.isEnabled()
         assert app_model.signal_configuration_save_count == 6
 
         monitor.set_hardware_enabled(False)
         qapp.processEvents()
 
-        assert not content._start_stop_button.isEnabled()
         assert not content._clear_button.isEnabled()
         assert not content._signal_checkboxes["cam_frames"].isEnabled()
 
@@ -807,8 +805,10 @@ def test_laser_trace_auto_resumes_and_displays_entire_calibration_ramp(qapp):
     content = LaserControlContent(app_model)
     tab = content._channel_tabs[0]
     try:
-        assert not tab._trace_streaming
-        assert tab._trace_toggle_button.text() == "Start Stream"
+        # A mapped laser's graph follows the shared input stream from the
+        # start; there is no per-graph Start Stream any more.
+        assert tab._trace_streaming
+        assert not hasattr(tab, "_trace_toggle_button")
         tab._set_trace_streaming(False)
         points = laser.run_calibration_ramp(
             LaserCalibrationRamp(
@@ -824,7 +824,6 @@ def test_laser_trace_auto_resumes_and_displays_entire_calibration_ramp(qapp):
         command_x, command_y = tab._trace_data["command"]
         diode_x, diode_y = tab._trace_data["diode"]
         assert tab._trace_streaming
-        assert tab._trace_toggle_button.text() == "Stop Stream"
         assert tuple(
             tab._mode_tabs.tabText(index)
             for index in range(tab._mode_tabs.count())
@@ -999,8 +998,7 @@ def test_laser_tab_owns_and_persists_its_input_stream_options(qapp):
         )
         assert monitor_configuration.display_channels == ("laser1_diode",)
         assert app_model.signal_configuration_save_count == 1
-        assert tab._trace_daq_button.isEnabled()
-        assert tab._trace_daq_button.text() == "Start DAQ Inputs"
+        assert not hasattr(tab, "_trace_daq_button")
 
         command_copy.setChecked(True)
         qapp.processEvents()
@@ -1076,4 +1074,99 @@ def test_turning_a_trace_on_shows_samples_the_ring_already_holds(qapp):
     finally:
         content.on_close()
         app_model.nidaq_signal_monitor.close()
+        laser.close()
+
+
+def _running(monitor, *, starting=False):
+    """Mark the stream running (or starting) the way its reader thread does."""
+    if starting:
+        monitor._set_starting(True)
+    else:
+        monitor._set_running(True)
+
+
+def test_the_analysis_card_has_no_stream_button_and_names_the_stream_state(qapp):
+    monitor = NidaqSignalMonitorModel()
+    monitor._configuration = _stream_configuration()
+    app_model = _AnalysisAppStub(monitor)
+    content = AnalysisContent(app_model)
+    try:
+        assert not hasattr(content, "_start_stop_button")
+        assert content._clear_button.text() == "Clear"
+        assert content._live_button.text() == "Live"
+        assert content._stream_state_label.text() == "disabled"
+
+        monitor.set_hardware_enabled(True)
+        qapp.processEvents()
+        assert content._stream_state_label.text() == "stopped"
+
+        _running(monitor, starting=True)
+        qapp.processEvents()
+        assert content._stream_state_label.text() == "starting"
+
+        monitor._set_starting(False)
+        _running(monitor)
+        qapp.processEvents()
+        assert content._stream_state_label.text() == "running"
+
+        monitor._set_running(False)
+        monitor._set_error("the task was refused")
+        qapp.processEvents()
+        assert content._stream_state_label.text() == "error"
+        assert "the task was refused" in content._stream_state_label.toolTip()
+    finally:
+        content.on_close()
+        content.deleteLater()
+
+
+def _laser_content_with_diode_stream():
+    channel = _laser_channel()
+    configuration = LaserSystemConfiguration.from_channels(
+        (channel,), backend="null", sample_rate_hz=1000.0,
+    )
+    laser = LaserModel(NullLaserController(configuration))
+    app_model = _LaserAppStub(laser)
+    app_model.nidaq_signal_monitor._configuration = dataclasses.replace(
+        app_model.nidaq_signal_monitor.configuration, sample_rate_hz=1000.0,
+    )
+    return laser, app_model, LaserControlContent(app_model)
+
+
+def test_laser_graphs_follow_the_shared_stream_without_a_button(qapp):
+    laser, app_model, content = _laser_content_with_diode_stream()
+    monitor = app_model.nidaq_signal_monitor
+    try:
+        tab = content._channel_tabs[0]
+        assert not hasattr(tab, "_trace_toggle_button")
+        assert not hasattr(tab, "_trace_daq_button")
+        assert tab._trace_clear_button.text() == "Clear"
+        assert tab._trace_streaming
+        assert "stopped" in tab._trace_status.text()
+
+        _running(monitor)
+        qapp.processEvents()
+        assert "running" in tab._trace_status.text()
+
+        # System Mode is still Idle: nothing has called set_is_capture_active.
+        monitor.sample_ring.write_block(
+            NidaqSignalSampleBlock(
+                wall_time=1.0,
+                perf_time=1.0,
+                sample_rate_hz=1000.0,
+                sample_index=0,
+                channels=monitor.configuration.channels,
+                values={"laser1_diode": (0.25, 0.5, 0.75)},
+            )
+        )
+        _wait_for_laser_plot(content, minimum_points=3)
+        assert tab._trace_data["diode"][1] == pytest.approx([0.25, 0.5, 0.75])
+
+        # Leaving System Mode no longer stops the laser graphs.
+        content.set_is_capture_active(True)
+        content.set_is_capture_active(False)
+        assert tab._trace_streaming
+    finally:
+        content.on_close()
+        content.deleteLater()
+        monitor.close()
         laser.close()
