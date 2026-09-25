@@ -6199,6 +6199,13 @@ class AppModel(ObservableObject):
         )
         return True
 
+    def _nidaq_stream_idle(self) -> bool:
+        """Whether the stream is the application's rather than System Mode's."""
+        acquisition = self._acquisition
+        return not (
+            acquisition.started or acquisition.starting or acquisition.stopping
+        )
+
     def _nidaq_stream_may_start(self) -> bool:
         """Whether the input stream may start by itself now.
 
@@ -6206,14 +6213,11 @@ class AppModel(ObservableObject):
         starts, runs or stops, _start_nidaq_domain owns the stream, and a
         failure there is retried from the Hardware panel, not from here.
         """
-        acquisition = self._acquisition
-        return not (
-            self._closing_event.is_set()
-            or self._loaded_configuration is None
-            or self._configuration_load_incomplete
-            or acquisition.started
-            or acquisition.starting
-            or acquisition.stopping
+        return (
+            self._nidaq_stream_idle()
+            and not self._closing_event.is_set()
+            and self._loaded_configuration is not None
+            and not self._configuration_load_incomplete
         )
 
     def _request_nidaq_stream(self, reason: str) -> None:
@@ -6242,7 +6246,20 @@ class AppModel(ObservableObject):
         For whatever needs the NI-DAQ lines to itself, such as the DAQ
         Monitor, which opens its own tasks on them. `reason` completes
         "NI-DAQ signal stream paused: ..." where the stream state is shown.
+
+        Refused unless idle. In System Mode the stream is the acquisition's:
+        stopping it for the monitor marked it stopped rather than failed, so
+        a recording carried on without its NI data, and nothing restarted it
+        when the monitor closed.
         """
+        if (
+            not self._nidaq_stream_idle()
+            or self._recording_session.status is not SessionRecordingStatus.READY
+        ):
+            raise RuntimeError(
+                "the NI-DAQ input stream belongs to System Mode while it runs; "
+                "set System Mode to Idle first"
+            )
         self._nidaq_stream_autostart.pause(holder, reason)
 
     def resume_nidaq_stream(self, holder) -> None:
@@ -7298,14 +7315,14 @@ class AppModel(ObservableObject):
         # refused while it runs, so it is held stopped for the load and starts
         # again from the new plan afterwards. In System Mode it belongs to the
         # acquisition and is left as it was.
-        if self._acquisition.started:
+        if not self._nidaq_stream_idle():
             return self._load_configuration(location, random_cameras=random_cameras)
         holder = _CONFIGURATION_LOAD
-        self.pause_nidaq_stream(holder, "the configuration is loading")
+        self._nidaq_stream_autostart.pause(holder, "the configuration is loading")
         try:
             return self._load_configuration(location, random_cameras=random_cameras)
         finally:
-            self.resume_nidaq_stream(holder)
+            self._nidaq_stream_autostart.resume(holder)
 
     def _load_configuration(self, location: Optional[Path] = None, *, random_cameras: bool = False):
         self._require_session_ready_for_configuration("Loading configuration")
@@ -7573,11 +7590,17 @@ class AppModel(ObservableObject):
         if self._loaded_configuration is None:
             raise RuntimeError("Cannot update DAQ port configuration before a system configuration is loaded")
         # Held stopped while the plan changes, then started on the new one.
-        self.pause_nidaq_stream(_DAQ_PORTS_UPDATE, "the DAQ ports are being saved")
+        # Only while idle, as for a configuration load: in System Mode the
+        # stream is the acquisition's and is left to it.
+        if not self._nidaq_stream_idle():
+            self._apply_daq_port_configuration(nidaq_ports, laser_configuration)
+            return
+        self._nidaq_stream_autostart.pause(
+            _DAQ_PORTS_UPDATE, "the DAQ ports are being saved")
         try:
             self._apply_daq_port_configuration(nidaq_ports, laser_configuration)
         finally:
-            self.resume_nidaq_stream(_DAQ_PORTS_UPDATE)
+            self._nidaq_stream_autostart.resume(_DAQ_PORTS_UPDATE)
 
     def _apply_daq_port_configuration(
         self,
