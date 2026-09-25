@@ -29,10 +29,7 @@ from autotrainer.core import (
     NidaqTimingConfiguration,
     SystemConfiguration,
 )
-from autotrainer.core.configuration.laser_configuration import (
-    BACKPLANE_CLOCK_LINE_REMEDY,
-    backplane_clock_line_clashes,
-)
+from autotrainer.core.configuration.laser_configuration import clock_line_clashes
 from autotrainer.core.logging import get_verbose_logger
 from tools.acquisition.model.nidaq_breakout import (
     breakout_for_device,
@@ -621,11 +618,12 @@ class NidaqPortConfigurationDialog(QDialog):
         )
 
     def _backplane_clock_line_refusals(self) -> List[str]:
-        """A trigger picked here on the backplane clock line, as the load says it.
+        """A trigger picked here on a clock line, as the load says it.
 
-        The configuration refuses one when it is built, so without this the
-        dialog could not close, and would not say why. The channels' own
-        trigger sources are not fields here, and are taken as configured.
+        backplaneClockLine or pulseClockLine. The configuration refuses one
+        when it is built, so without this the dialog could not close, and
+        would not say why. The channels' own trigger sources are not fields
+        here, and are taken as configured.
         """
         laser = self._configuration.laser
         mapped = {
@@ -633,14 +631,13 @@ class NidaqPortConfigurationDialog(QDialog):
             for laser_index, combos in self._laser_combos.items()
             if any(self._combo_selections[combo] for combo in combos.values())
         }
-        clashes = backplane_clock_line_clashes(
+        clashes = clock_line_clashes(
             laser.backplane_clock_line,
+            laser.pulse_clock_line,
             (channel for channel in laser.channels if int(channel.channel_id) in mapped),
             self._selected_trigger_listener_inputs(),
         )
-        if not clashes:
-            return []
-        return ["; ".join(clashes) + "; " + BACKPLANE_CLOCK_LINE_REMEDY]
+        return ["; ".join(clashes)] if clashes else []
 
     def _set_all_combos_enabled(self, enabled: bool) -> None:
         for combo in self._general_combos.values():

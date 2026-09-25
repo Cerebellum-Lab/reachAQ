@@ -37,6 +37,8 @@ AO_CLOCK_ROUTE = ("/PXI1Slot4/ao/SampleClock", "/PXI1Slot4/PXI_Trig1")
 #: The input stream's clock, which a synchronized pulse train runs on.
 SHARED_CLOCK = "/PXI1Slot5/ai/SampleClock"
 SHARED_CLOCK_ROUTE = (SHARED_CLOCK, "/PXI1Slot5/PXI_Trig1")
+#: The 6713's own clock on pulseClockLine, for a synchronized pulse's DO.
+PULSE_CLOCK_ROUTE = ("/PXI1Slot4/ao/SampleClock", "/PXI1Slot4/PXI_Trig3")
 
 #: Each output: the laser configuration it needs, the pulse asking for it,
 #: its task's name and its line.
@@ -165,20 +167,20 @@ def test_the_ao_clock_route_is_released_when_the_pulse_is_cancelled(daq):
     assert daq.starts == []
 
 
-# -------------------------------------- synchronized: the shared clock, locally
+# ------------------------------- synchronized: the AO clock on pulseClockLine
 
 
 @pytest.mark.parametrize("output", sorted(OUTPUTS))
-def test_a_synchronized_cross_board_output_takes_the_shared_clock_on_its_own_board(
+def test_a_synchronized_cross_board_output_runs_on_the_ao_clock_over_the_pulse_clock_line(
     daq, output,
 ):
-    # In a synchronized pulse train the 6221's clock already runs to the
-    # 6713 on PXI_Trig1, for as long as the controller is open. Putting the
-    # 6713's AO clock on that line as well would be two drivers on one line,
-    # which DAQmx cannot see across these boards. The digital task takes the
-    # shared clock as its own board sees it. That clock runs whether or not
-    # the AO has triggered, so the task keeps its start trigger, named on
-    # its own board: PXI_Trig lines are bussed, and both boards see PXI_Trig0.
+    # In a synchronized pulse train the AO runs on the input stream's clock,
+    # which PXI_Trig1 already carries from the 6221 to the 6713. That clock
+    # runs whether or not the AO has triggered, and the 6221's clocked DO
+    # takes no start trigger to wait for it: do_trig_usage is empty, and
+    # TASK_VERIFY refuses one with -200452 (christielab10, 2026-09-25). So the
+    # line runs on the AO's own clock, which ticks only once the AO has
+    # triggered, put on a line of its own, pulseClockLine (PXI_Trig3).
     configuration, fields, task_name, line = _output(output)
     controller = _controller(_synchronized_plan(), **configuration)
 
@@ -187,35 +189,93 @@ def test_a_synchronized_cross_board_output_takes_the_shared_clock_on_its_own_boa
     digital = daq.task(task_name)
     analog = daq.task("laser_sync_pulse_ao")
     assert digital.channels == [line]
-    assert digital.timing_kwargs["source"] == SHARED_CLOCK
+    assert digital.timing_kwargs["source"] == "/PXI1Slot5/PXI_Trig3"
     assert digital.timing_kwargs["rate"] == 10_000.0
-    assert digital.start_trigger == ("/PXI1Slot5/PXI_Trig0", "rising")
+    assert digital.start_trigger is None
+    # The AO arms as it always did, on the shared clock.
     assert analog.timing_kwargs["source"] == "/PXI1Slot4/PXI_Trig1"
     assert analog.start_trigger == (BOARD_STIM, "rising")
-    assert daq.starts.index(digital.name) < daq.starts.index(analog.name)
-    # Nothing puts the 6713's clock anywhere; the shared clock's route is the
-    # one the pulse train always made, and stays with the controller.
-    assert daq.connected == [TRIGGER_ROUTE, SHARED_CLOCK_ROUTE]
-    assert daq.disconnected == []
+    # Routed before the line starts, the line before the AO, released after.
+    log = daq.log
+    assert (log.index(("connect", PULSE_CLOCK_ROUTE))
+            < log.index(("start", digital.name))
+            < log.index(("start", analog.name))
+            < log.index(("disconnect", PULSE_CLOCK_ROUTE)))
+    assert daq.connected == [TRIGGER_ROUTE, SHARED_CLOCK_ROUTE, PULSE_CLOCK_ROUTE]
+    assert daq.disconnected == [PULSE_CLOCK_ROUTE]
+    # The shared clock's route stays with the controller, as it always did.
     assert controller._trigger_routes == [TRIGGER_ROUTE, SHARED_CLOCK_ROUTE]
     controller.close()
 
 
-def test_a_synchronized_output_refuses_a_trigger_its_board_cannot_see(daq):
-    # A PFI on the AO board reaches the AO and nothing else: no bussed line
-    # carries it to the 6221.
+def test_the_pulse_clock_route_is_released_when_a_synchronized_pulse_fails(monkeypatch):
+    daq = FakeDaqmx(failing_task="laser_sync_pulse_ao")
+    monkeypatch.setattr(nidaq_laser, "_load_nidaqmx", lambda: daq)
+    controller = _controller(_synchronized_plan())
+
+    with pytest.raises(RuntimeError, match="refused to start"):
+        controller.run_synchronized_pulse_train(_pulse(enable_pmt_shutter=True))
+
+    assert daq.disconnected == [PULSE_CLOCK_ROUTE]
+    assert controller._trigger_routes == [TRIGGER_ROUTE, SHARED_CLOCK_ROUTE]
+    assert daq.reserved == {}
+
+
+def test_the_pulse_clock_route_is_released_when_a_synchronized_pulse_is_cancelled(
+    monkeypatch,
+):
+    # Armed on the board STIM, waiting for it, as a trial's pulse is.
+    daq = FakeDaqmx(block_wait=True, hold_waits=True, stop_unblocks=True)
+    monkeypatch.setattr(nidaq_laser, "_load_nidaqmx", lambda: daq)
+    controller = _controller(_synchronized_plan())
+    try:
+        operation = controller.run_synchronized_pulse_train(
+            _pulse(wait=False, enable_pmt_shutter=True))
+        assert PULSE_CLOCK_ROUTE in daq.connected
+
+        assert operation.cancel()
+        assert operation.wait(5.0) is LaserOperationState.CANCELLED
+
+        assert daq.disconnected == [PULSE_CLOCK_ROUTE]
+        assert controller._trigger_routes == [TRIGGER_ROUTE, SHARED_CLOCK_ROUTE]
+    finally:
+        daq.waits_released.set()
+
+
+def test_a_synchronized_output_needs_no_trigger_its_board_can_see(daq):
+    # Its clock is the AO's own, so an AO armed on a PFI of its own board
+    # starts the line too, although nothing carries that PFI to the 6221.
     controller = NidaqLaserController(rig_lasers(), timing_plan=_synchronized_plan())
 
-    with pytest.raises(RuntimeError) as refused:
-        controller.run_synchronized_pulse_train(_pulse(
-            trigger_source="/PXI1Slot4/PFI0", enable_pmt_shutter=True))
+    controller.run_synchronized_pulse_train(_pulse(
+        trigger_source="/PXI1Slot4/PFI0", enable_pmt_shutter=True))
 
-    message = str(refused.value)
-    assert "PXI1Slot5/port0/line6" in message and "/PXI1Slot4/PFI0" in message
-    assert "PXI_Trig" in message
+    digital = daq.task("laser_pmt_shutter_do")
+    assert digital.timing_kwargs["source"] == "/PXI1Slot5/PXI_Trig3"
+    assert digital.start_trigger is None
+
+
+def test_a_start_trigger_on_the_6221s_clocked_output_is_refused_as_the_board_refuses_it(daq):
+    # What Part 2 first built for a synchronized line: the shared clock and a
+    # start trigger named on the 6221. The board refuses it at -200452.
+    controller = NidaqLaserController(rig_lasers())
+
+    with pytest.raises(RuntimeError, match="-200452"):
+        controller._create_finite_digital_output_task(
+            "PXI1Slot5/port0/line6", "laser_pmt_shutter_do", [True] * 10,
+            10_000.0, 10, SHARED_CLOCK, "/PXI1Slot5/PXI_Trig0", "rising")
+
+
+def test_the_pulse_clock_line_is_not_driven_over_the_streams_own_export(daq):
+    plan = dataclasses.replace(
+        _synchronized_plan(), sample_clock_export_terminal="/PXI1Slot5/PXI_Trig3")
+    controller = _controller(plan)
+
+    with pytest.raises(RuntimeError, match="PXI_Trig3"):
+        controller.run_synchronized_pulse_train(_pulse(enable_pmt_shutter=True))
+
+    assert PULSE_CLOCK_ROUTE not in daq.connected
     assert daq.starts == []
-    assert AO_CLOCK_ROUTE not in daq.connected
-    assert daq.reserved == {}
 
 
 # --------------------------------------------------- the backplane clock line
@@ -282,6 +342,9 @@ def test_the_clock_line_is_not_driven_over_the_streams_own_export(daq):
                          ids=["unsynchronized", "synchronized"])
 @pytest.mark.parametrize("output", sorted(OUTPUTS))
 def test_an_output_on_the_ao_board_keeps_its_clock_and_trigger(daq, output, plan):
+    # A board whose clocked DO takes a start trigger, as an X Series one does;
+    # christielab10's 6221 refuses one (above).
+    daq.do_takes_start_trigger = True
     configuration, fields, task_name, line = _output(output)
     controller = _controller(
         plan, analog_output="PXI1Slot5/ao0", trigger_source="/PXI1Slot5/PFI0",

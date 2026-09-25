@@ -123,3 +123,45 @@ def test_a_file_with_a_clash_is_refused_as_it_loads():
     with pytest.raises(ValueError, match="PXI_Trig0, the backplaneClockLine"):
         SystemConfiguration.load_yaml(io.StringIO(
             text.replace("backplaneClockLine: PXI_Trig1", "backplaneClockLine: PXI_Trig0")))
+
+
+# ------------------------------------------------------------ pulseClockLine
+
+
+def test_the_pulse_clock_line_defaults_to_pxi_trig3_and_christielab10_keeps_it():
+    # christielab10's triggers and trigger inputs are on PXI_Trig0 and
+    # PXI_Trig2, and the shared clock on PXI_Trig1.
+    assert _christielab10_lasers().pulse_clock_line == "PXI_Trig3"
+
+
+def test_a_file_without_a_pulse_clock_line_loads_with_the_default():
+    text = SystemConfiguration(laser=_christielab10_lasers()).dump_yaml()
+    assert "pulseClockLine: PXI_Trig3" in text
+
+    loaded = SystemConfiguration.load_yaml(io.StringIO(
+        text.replace("  pulseClockLine: PXI_Trig3\n", "")))
+
+    assert loaded.laser.pulse_clock_line == "PXI_Trig3"
+    assert loaded.laser == _christielab10_lasers()
+
+
+def test_the_pulse_clock_line_cannot_be_the_backplane_clock_line():
+    with pytest.raises(ValueError) as refused:
+        _lasers(_channel(), backplane_clock_line="PXI_Trig1",
+                pulse_clock_line="/PXI1Slot4/pxi_trig1")
+
+    message = str(refused.value)
+    assert "pulseClockLine /PXI1Slot4/pxi_trig1" in message
+    assert "backplaneClockLine" in message
+
+
+@pytest.mark.parametrize("terminal", ["/PXI1Slot4/PXI_Trig3", "/PXI1Slot5/pxi_trig3"])
+def test_a_trigger_on_the_pulse_clock_line_is_refused_naming_both(terminal):
+    with pytest.raises(ValueError) as refused:
+        _lasers(_channel(trigger_source=terminal))
+    assert str(refused.value) == (
+        f"laser 1 triggerSource {terminal} uses PXI_Trig3, the pulseClockLine; "
+        "choose a different trigger line or pulseClockLine")
+
+    with pytest.raises(ValueError, match="triggerListenerInputs .* the pulseClockLine"):
+        _lasers(_channel(), trigger_listener_inputs=(terminal,))

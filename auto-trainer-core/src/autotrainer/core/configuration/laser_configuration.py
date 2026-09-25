@@ -25,10 +25,6 @@ def normalize_laser_channel_id(value: Union[LaserChannelId, int]) -> LaserChanne
 #: One PXI backplane trigger line, as the last part of a terminal's name.
 _BACKPLANE_LINE = re.compile(r"^pxi_trig\d+$")
 
-#: What to do about a trigger on the backplane clock line.
-BACKPLANE_CLOCK_LINE_REMEDY = "choose a different trigger line or backplaneClockLine"
-
-
 def backplane_line_of(terminal: Optional[str]) -> Optional[str]:
     """The PXI_Trig line `terminal` names, lower-cased, or None for any other.
 
@@ -40,34 +36,51 @@ def backplane_line_of(terminal: Optional[str]) -> Optional[str]:
     return tail if _BACKPLANE_LINE.match(tail) else None
 
 
-def backplane_clock_line_clashes(
+def clock_line_clashes(
     backplane_clock_line: str,
+    pulse_clock_line: str,
     channels: Iterable["LaserChannelConfiguration"],
     trigger_listener_inputs: Iterable[str],
 ) -> Tuple[str, ...]:
-    """Each trigger that takes the backplane clock line, as one refusal each.
+    """Each clash with a clock line, as one refusal each, with its remedy.
 
+    Two clocks ride the backplane: backplaneClockLine, and pulseClockLine,
+    which carries the laser's own sample clock to a clocked digital line on
+    another board. Neither may be a line a trigger takes, nor the other one.
     A channel's trigger_source is the line its trigger rides on, and
     NidaqLaserController._connect_trigger_route drives exactly that line,
-    named on the route source's board; the route source itself is only read,
-    so it is not compared. A trigger listener input is watched on its line.
-    Either on the clock's line puts a second driver there.
+    named on the route source's board, as its route's destination; the route
+    source itself is only read, so it is not compared. A trigger listener
+    input is watched on its line. Either on a clock's line puts a second
+    driver there.
     """
-    clock = backplane_line_of(backplane_clock_line)
-    if clock is None:
-        return tuple()
-    shown = str(backplane_clock_line).strip().strip("/").rsplit("/", 1)[-1]
+    channels = tuple(channels)
+    listeners = tuple(trigger_listener_inputs)
     clashes = []
-    for channel in channels:
-        if backplane_line_of(channel.trigger_source) == clock:
-            clashes.append(
-                f"laser {int(channel.channel_id)} triggerSource "
-                f"{channel.trigger_source} uses {shown}, the backplaneClockLine")
-    for terminal in trigger_listener_inputs:
-        if backplane_line_of(terminal) == clock:
-            clashes.append(
-                f"triggerListenerInputs {terminal} uses {shown}, the "
-                "backplaneClockLine")
+    lines = (("backplaneClockLine", backplane_clock_line),
+             ("pulseClockLine", pulse_clock_line))
+    for field, value in lines:
+        clock = backplane_line_of(value)
+        if clock is None:
+            continue
+        shown = str(value).strip().strip("/").rsplit("/", 1)[-1]
+        remedy = f"choose a different trigger line or {field}"
+        for channel in channels:
+            if backplane_line_of(channel.trigger_source) == clock:
+                clashes.append(
+                    f"laser {int(channel.channel_id)} triggerSource "
+                    f"{channel.trigger_source} uses {shown}, the {field}; {remedy}")
+        for terminal in listeners:
+            if backplane_line_of(terminal) == clock:
+                clashes.append(
+                    f"triggerListenerInputs {terminal} uses {shown}, the "
+                    f"{field}; {remedy}")
+    if (backplane_line_of(pulse_clock_line) is not None
+            and backplane_line_of(pulse_clock_line) == backplane_line_of(backplane_clock_line)):
+        clashes.append(
+            f"pulseClockLine {pulse_clock_line} is the backplaneClockLine, "
+            f"{backplane_clock_line}; the two clocks need a line each: choose "
+            "another pulseClockLine")
     return tuple(clashes)
 
 
@@ -152,10 +165,19 @@ class LaserSystemConfiguration:
     trigger_listener_inputs: Tuple[str, ...] = tuple()
     #: Backplane line the shared sample clock is driven onto when a laser's
     #: output sits on a different board from the clock producer. Only used in
-    #: that case, and never a line a trigger takes (backplane_clock_line_clashes):
-    #: two drivers on one line corrupt both, and DAQmx does not see it across
+    #: that case, and never a line a trigger takes (clock_line_clashes): two
+    #: drivers on one line corrupt both, and DAQmx does not see it across
     #: christielab10's boards.
     backplane_clock_line: str = "PXI_Trig1"
+    #: Backplane line a synchronized pulse train drives its analog output's
+    #: own sample clock onto, for a clocked digital line (PMT shutter, trigger
+    #: or timing trigger output) on another board. That line cannot wait for
+    #: the pulse's start trigger: an M Series board's clocked digital output
+    #: takes none (christielab10: do_trig_usage empty, -200452 at verify), so
+    #: it runs on the clock that ticks only once the output has triggered.
+    #: backplane_clock_line carries the shared clock then, so this is a line
+    #: of its own, and a free one (clock_line_clashes).
+    pulse_clock_line: str = "PXI_Trig3"
 
     def __post_init__(self):
         object.__setattr__(self, "channels", tuple(self.channels))
@@ -175,10 +197,11 @@ class LaserSystemConfiguration:
             raise ValueError("hardware_timed laser output requires sample_rate_hz")
         if any(not value for value in self.trigger_listener_inputs):
             raise ValueError("trigger_listener_inputs cannot contain empty channel names")
-        clashes = backplane_clock_line_clashes(
-            self.backplane_clock_line, self.channels, self.trigger_listener_inputs)
+        clashes = clock_line_clashes(
+            self.backplane_clock_line, self.pulse_clock_line, self.channels,
+            self.trigger_listener_inputs)
         if clashes:
-            raise ValueError("; ".join(clashes) + "; " + BACKPLANE_CLOCK_LINE_REMEDY)
+            raise ValueError("; ".join(clashes))
 
     @classmethod
     def from_channels(

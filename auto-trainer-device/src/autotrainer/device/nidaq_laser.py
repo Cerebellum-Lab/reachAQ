@@ -5,7 +5,6 @@ import dataclasses
 import enum
 import logging
 import numbers
-import re
 import threading
 import time
 import uuid
@@ -37,9 +36,6 @@ logger = logging.getLogger(__name__)
 #: tasks before resetting the laser; the pulse path waits as long for its
 #: operation's owner.
 _CALIBRATION_RELEASE_TIMEOUT_S = 5.0
-
-#: A PXI backplane trigger line, which every board in the chassis sees.
-_BACKPLANE_TRIGGER_LINE = re.compile(r"^PXI_Trig\d+$", re.IGNORECASE)
 
 
 class LaserOperationState(str, enum.Enum):
@@ -749,54 +745,27 @@ class NidaqLaserController:
         another board neither name can be used: each is an implicit cross-board
         route, which DAQmx refuses on christielab10's unidentified chassis
         (-89125), and a clocked digital line has to sit on the 6221 there,
-        away from the 6713's AO. Which clock replaces them depends on the AO's.
+        away from the 6713's AO. It then runs on the AO's own sample clock,
+        driven onto a backplane line and read on its own board, with no start
+        trigger: that clock ticks only once the AO has triggered, and the
+        digital tasks start before the AO, so each samples on the AO's own
+        clock edges, as before. It cannot wait for a start trigger instead:
+        the 6221's clocked digital output takes none (do_trig_usage is empty,
+        and TASK_VERIFY refuses one with -200452; christielab10, 2026-09-25).
 
-        Synchronized, the AO runs on the input stream's clock, and that clock
-        is already on backplane_clock_line, from the 6221 to the 6713, for as
-        long as the controller is open. Putting the 6713's AO clock on the same
-        line would be a second driver, which DAQmx cannot see across these
-        boards; so the line takes the shared clock as its own board sees it.
-        That clock ticks whether or not the AO has triggered, so the task keeps
-        its start trigger, named on its own board (_start_trigger_seen_from).
-
-        Otherwise the AO runs on its own clock, which is driven onto the
-        backplane clock line and read there, as the calibration ramp's is. It
-        ticks only once the AO has triggered, and the digital tasks start
-        before the AO, so, slaved to it, they need no start trigger: each
-        samples on the AO's own clock edges, as before.
+        Which line depends on the AO's clock. Unsynchronized, the AO runs on
+        its own, which goes onto backplane_clock_line, as the calibration
+        ramp's does. Synchronized, the AO runs on the input stream's clock,
+        which backplane_clock_line already carries from the 6221 to the 6713
+        for as long as the controller is open; the AO's own clock then goes
+        onto pulse_clock_line, a line of its own, since a second driver on
+        the first is not something DAQmx can see across these boards.
         """
         output_device = _device_of(physical_line)
         if output_device == _device_of(ao_clock):
             return ao_clock, trigger_source
-        if synchronized:
-            clock = self._shared_clock_for(
-                output_device, self._timing_plan.sample_clock_source, added=added)
-            return clock, self._start_trigger_seen_from(
-                output_device, physical_line, trigger_source)
-        return self._shared_clock_for(output_device, ao_clock, added=added), None
-
-    @staticmethod
-    def _start_trigger_seen_from(
-        output_device: str, physical_line: str, terminal: str,
-    ) -> str:
-        """`terminal` as `output_device` sees it, or a refusal naming why not.
-
-        A PXI_Trig line is bussed: every board in the chassis sees the same
-        line under its own name, which is how the AO board sees the stimulus
-        routed onto it (_connect_trigger_route). Anything else on another
-        board, such as one of its PFI pins, does not reach this one.
-        """
-        parts = terminal.strip("/").split("/")
-        if len(parts) < 2 or parts[0] == output_device:
-            return terminal
-        line = parts[-1]
-        if _BACKPLANE_TRIGGER_LINE.match(line):
-            return f"/{output_device}/{line}"
-        raise RuntimeError(
-            f"{physical_line} cannot start with the laser: its start trigger "
-            f"{terminal} is on {parts[0]}, and only a PXI_Trig line reaches "
-            f"{output_device} from there. Arm the laser on a PXI_Trig line, as "
-            "the board STIM route does")
+        line = self._configuration.pulse_clock_line if synchronized else None
+        return self._shared_clock_for(output_device, ao_clock, added=added, line=line), None
 
     def _configure_timing_reference(self, task, timing_status) -> None:
         if timing_status.get("status") != "hardware_synchronized":
@@ -1305,8 +1274,12 @@ class NidaqLaserController:
         source: str,
         *,
         added: Optional[List[Tuple[str, str]]] = None,
+        line: Optional[str] = None,
     ) -> str:
         """The shared sample clock as this output board can see it.
+
+        On `line`, backplane_clock_line unless given: a synchronized pulse
+        puts its analog output's own clock on pulse_clock_line.
 
         A clock produced on one board reaches an output on another the same
         way its trigger does, and runs into the same refusal: DAQmx will not
@@ -1327,7 +1300,7 @@ class NidaqLaserController:
         clock_device = source.strip("/").split("/", 1)[0]
         if not output_device or clock_device == output_device:
             return source
-        line = self._configuration.backplane_clock_line
+        line = line or self._configuration.backplane_clock_line
         destination = f"/{clock_device}/{line}"
         local = f"/{output_device}/{line}"
         route = (source, destination)
