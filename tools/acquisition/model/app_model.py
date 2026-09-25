@@ -304,6 +304,9 @@ _LASER_CALIBRATION = "laser calibration"
 _LASER_CALIBRATION_REASON = "a laser calibration ramp is running"
 #: How much longer than the ramp's own timeout closing waits for it.
 _LASER_CALIBRATION_CLOSE_MARGIN_S = 5.0
+#: How long closing then gives the ramp controller's own close. It waits up
+#: to 5 s for the ramp to let go of its tasks, and resets the laser after.
+_LASER_CALIBRATION_FORCED_CLOSE_S = 15.0
 
 
 def _serialized_session_configuration(method):
@@ -722,6 +725,8 @@ class AppModel(ObservableObject):
         self._laser_calibration_done.set()
         self._laser_calibration_close_wait_s = 0.0
         self._laser_calibration_controller = None
+        #: The ramp running, for what closing says when it cannot close it.
+        self._laser_calibration_ramp: Optional[LaserCalibrationRamp] = None
         #: Written by tools/hardware/verify_nidaq_wiring.py, read here.
         #: It sits beside the configuration it describes rather than in
         #: it, so it can be regenerated without touching a hand-edited
@@ -6456,6 +6461,7 @@ class AppModel(ObservableObject):
             self._laser_calibration_done.clear()
             self._laser_calibration_close_wait_s = self._laser_calibration_wait_seconds(ramp)
             self._laser_calibration_active = True
+            self._laser_calibration_ramp = ramp
         try:
             self._announce_laser_calibration(True)
             # After the flag is set: Run and every other holder set theirs
@@ -6499,6 +6505,7 @@ class AppModel(ObservableObject):
         finally:
             with self._laser_calibration_lock:
                 self._laser_calibration_active = False
+                self._laser_calibration_ramp = None
                 self._laser_calibration_done.set()
             self._announce_laser_calibration(False)
 
@@ -6550,10 +6557,36 @@ class AppModel(ObservableObject):
             "command to its minimum and closes the shutters",
             wait_seconds,
         )
-        try:
-            self._close_laser_calibration_controller(keep_error=False)
-        except Exception:
-            logger.exception("Failed to close the laser calibration controller")
+        ramp = self._laser_calibration_ramp
+
+        def force_close():
+            try:
+                self._close_laser_calibration_controller(keep_error=False)
+            except Exception:
+                logger.exception("Failed to close the laser calibration controller")
+
+        # Bounded (controller ruling, 2026-09-25): a close that hangs inside
+        # DAQmx does not make the laser safer, since its output stays driven
+        # either way, and it would keep reachAQ from exiting. Past the bound
+        # the operator is told what may still be driven, and closing goes on.
+        # Daemon, so that a close that never returns does not hold the
+        # process open.
+        closer = threading.Thread(
+            target=force_close, name="laser_calibration_close", daemon=True)
+        closer.start()
+        closer.join(_LASER_CALIBRATION_FORCED_CLOSE_S)
+        if closer.is_alive():
+            logger.critical(
+                "The calibration controller for laser %s did not close within "
+                "%.1f s. Its analog output may still hold the ramp's last "
+                "command, %g V (a %g V to %g V ramp), and its shutter may be "
+                "open: make the laser safe by hand. reachAQ is closing without it.",
+                "?" if ramp is None else int(ramp.channel_id),
+                _LASER_CALIBRATION_FORCED_CLOSE_S,
+                float("nan") if ramp is None else ramp.stop_volts,
+                float("nan") if ramp is None else ramp.start_volts,
+                float("nan") if ramp is None else ramp.stop_volts,
+            )
 
     def _start_nidaq_domain(self, *, timeout: float = 12.0, restart: bool = False) -> bool:
         """Start the NI-DAQ domain; `restart` replaces a stream already running.

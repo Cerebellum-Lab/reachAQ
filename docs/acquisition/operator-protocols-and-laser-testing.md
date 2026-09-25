@@ -345,12 +345,23 @@ shutter** holds the PMT shutter open for the ramp. Press **Run Ramp**.
 - Success reads *"Ramp complete: 11 points, last diode 1.234 V, monotonic
   curve validated"*, and the Output stream graph shows the whole ramp. A
   failure reads *"Laser operation failed: ..."* with the first line of the
-  reason, on the panel's status line and in the status bar; the whole error is
-  in the log.
+  reason and, for a DAQmx error, its status code, as in *"(DAQmx -89125)"*, on
+  the panel's status line and in the status bar; the whole error is in the
+  log.
 - Closing reachAQ during a ramp waits for the ramp to end, for as long as the
   ramp itself may take plus five seconds; past that it closes the ramp's laser
   controller, which puts the command back to its minimum and closes the
-  shutters, before anything else closes.
+  shutters, before anything else closes. That close aborts the ramp's tasks
+  and waits up to five seconds for the ramp to close them before it writes
+  the command back.
+- That close is itself bounded, at 15 seconds. A close that hangs inside the
+  driver would not make the laser any safer, since its output stays driven
+  either way, and it would keep reachAQ from exiting. Past the bound the log
+  and status bar show a CRITICAL naming the laser and the ramp's last command,
+  *"The calibration controller for laser 1 did not close within 15.0 s. Its
+  analog output may still hold the ramp's last command, 5 V ..."*, and reachAQ
+  closes anyway. Make the laser safe by hand: switch off the laser driver or
+  close its shutter at the rig.
 
 ## What failure looks like
 

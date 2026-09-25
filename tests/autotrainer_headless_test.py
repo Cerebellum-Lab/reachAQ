@@ -563,6 +563,50 @@ def test_closing_past_the_ramp_timeout_closes_the_ramp_controller(app_model, mon
         ramp_thread.join(10.0)
 
 
+def test_a_forced_ramp_close_that_hangs_is_given_up_on_and_named(
+    app_model, monkeypatch, caplog,
+):
+    # A hang does not make the laser safer: the output stays driven either
+    # way (controller ruling, 2026-09-25). The forced close runs with a bound;
+    # past it a CRITICAL names the laser and the ramp's last command, and
+    # reachAQ goes on closing.
+    from tools.acquisition.model import app_model as app_model_module
+
+    monkeypatch.setattr(app_model_module, "_LASER_CALIBRATION_CLOSE_MARGIN_S", 0.5)
+    monkeypatch.setattr(app_model_module, "_LASER_CALIBRATION_FORCED_CLOSE_S", 0.5)
+    assert app_model.load_configuration() is True
+    app_model.laser.set_configuration_offline(_null_lasers())
+    inside, release, controllers = _blocking_ramp(app_model, monkeypatch)
+    ramp_thread, _ramp_outcome = _in_thread(
+        app_model.run_laser_calibration_ramp, _ramp(timeout_seconds=0.5))
+    assert inside.wait(10.0)
+    controller, = controllers
+    hang = threading.Event()
+    closing = []
+
+    def hung_close():
+        closing.append(True)
+        hang.wait(30.0)
+
+    monkeypatch.setattr(controller, "close", hung_close)
+    try:
+        with caplog.at_level("CRITICAL"):
+            close_thread, close_outcome = _in_thread(app_model.on_close)
+            close_thread.join(20.0)
+
+        assert not close_thread.is_alive()
+        assert close_outcome == [None]
+        assert closing == [True]
+        critical, = [record for record in caplog.records
+                     if record.levelname == "CRITICAL"]
+        message = critical.getMessage()
+        assert "laser 1" in message and "5 V" in message
+    finally:
+        hang.set()
+        release.set()
+        ramp_thread.join(10.0)
+
+
 def test_acquisition_owns_configured_signal_stream_lifecycle(app_model, monkeypatch):
     assert app_model.load_configuration() is True
     monitor = app_model.nidaq_signal_monitor

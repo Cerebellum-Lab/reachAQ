@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import re
+import threading
 from typing import Callable, Dict, Optional, Tuple
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot, Qt
+from PySide6.QtCore import QObject, QTimer, Signal, Slot, Qt
 from PySide6.QtWidgets import (
     QCheckBox,
     QDoubleSpinBox,
@@ -107,15 +109,35 @@ def _first_line(text: str, maximum_length: int) -> str:
     return line
 
 
+#: nidaqmx's DaqError ends its message with the status code on a line of its
+#: own, after the driver's text and the task name.
+_DAQMX_STATUS_CODE = re.compile(r"^\s*Status Code:\s*(-?\d+)\s*$", re.MULTILINE)
+
+
+def _failure_line(text: str, maximum_length: int) -> str:
+    """A failure's first line, cut to fit, with its DAQmx status code.
+
+    The footer and the status bar show one line, and a DaqError's first
+    line is the driver's text alone: the code, -89125 for one, was cut off.
+    """
+    match = _DAQMX_STATUS_CODE.search(str(text))
+    line = _first_line(text, maximum_length)
+    if match is None or match.group(1) in line:
+        return line
+    code = f" (DAQmx {match.group(1)})"
+    return _first_line(text, maximum_length - len(code)) + code
+
+
 class _LaserOperationWorker(QObject):
     finished = Signal(object)
     failed = Signal(str)
+    #: After finished or failed, from the operation's own thread.
+    done = Signal()
 
     def __init__(self, operation: Callable[[], object]):
         super().__init__()
         self._operation = operation
 
-    @Slot()
     def run(self):
         try:
             self.finished.emit(self._operation())
@@ -124,8 +146,18 @@ class _LaserOperationWorker(QObject):
             # With the reason in the message itself: the status bar shows a
             # log record's first line, and "Laser operation failed" alone left
             # a DAQmx error such as -89125 in the log's traceback only.
-            logger.exception("Laser operation failed: %s", _first_line(message, 240))
+            logger.exception("Laser operation failed: %s", _failure_line(message, 240))
             self.failed.emit(message)
+        finally:
+            self.done.emit()
+
+    def detach(self) -> None:
+        """Tell nobody when it ends: the panel it would tell is going."""
+        for signal in (self.finished, self.failed, self.done):
+            try:
+                signal.disconnect()
+            except (RuntimeError, TypeError):
+                pass  # Nothing connected.
 
 
 class _LaserChannelTab(QWidget):
@@ -1189,7 +1221,7 @@ class LaserControlContent(ContentWidget):
         #: The refusal this panel last put on its status line, if any.
         self._announced_refusal: Optional[str] = None
         self._is_capture_active = False
-        self._operation_thread: Optional[QThread] = None
+        self._operation_thread: Optional[threading.Thread] = None
         self._operation_worker: Optional[_LaserOperationWorker] = None
         self._channel_tabs: Tuple[_LaserChannelTab, ...] = tuple()
         self._plot_process = LaserPlotProcess(app_model.nidaq_signal_monitor.sample_ring)
@@ -1289,6 +1321,13 @@ class LaserControlContent(ContentWidget):
         self._refresh_from_model()
 
     def on_close(self):
+        worker = self._operation_worker
+        if worker is not None:
+            # Still running, as a ramp force-closed by AppModel's close path
+            # can be: it ends on its own thread, with nothing left to tell.
+            worker.detach()
+            self._operation_thread = None
+            self._operation_worker = None
         self._stream_plot_timer.stop()
         self._app_model.laser.property_changed -= self._on_laser_property_changed
         self._app_model.laser.trace_received -= self._on_laser_trace_received
@@ -1601,18 +1640,16 @@ class LaserControlContent(ContentWidget):
         self._set_status(status, is_error=False)
         self._progress.setVisible(True)
         self._set_running(True)
-        thread = QThread(self)
+        # The worker stays on this thread; its signals reach the panel queued.
         worker = _LaserOperationWorker(operation)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
         worker.finished.connect(self._operation_finished)
         worker.failed.connect(self._operation_failed)
-        worker.finished.connect(thread.quit)
-        worker.failed.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        worker.failed.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(self._operation_thread_finished)
+        worker.done.connect(self._operation_thread_finished)
+        # A Python thread, not QThread(self): the panel destroyed while a
+        # force-closed ramp still ran destroyed a running QThread with it,
+        # and Qt aborts the process for that. Daemon, so a ramp that never
+        # returns does not hold reachAQ open; AppModel bounds its close.
+        thread = threading.Thread(target=worker.run, name="laser_operation", daemon=True)
         self._operation_thread = thread
         self._operation_worker = worker
         thread.start()
@@ -1625,7 +1662,7 @@ class LaserControlContent(ContentWidget):
     def _operation_failed(self, message: str) -> None:
         # It said "Laser operation stopped", and nothing of why.
         self._set_status(
-            f"Laser operation failed: {_first_line(message, 160)}", is_error=False)
+            f"Laser operation failed: {_failure_line(message, 160)}", is_error=False)
 
     @Slot()
     def _operation_thread_finished(self) -> None:
