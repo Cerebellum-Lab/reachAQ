@@ -42,6 +42,7 @@ fi
 | `laser.channels` | Real NI-DAQ aliases and wired channel roles |
 | `laser.channels[].boardStimLine` | `2` or `3`: the board line wired to that laser's trigger input. Unset makes the board STIM route unavailable for that laser |
 | `laser.channels[].boardTriggerPulseUs` | `100`..`5000000`; default `1000`. Width of the board STIM pulse that starts that laser's waveform |
+| `laser.channels[].triggerMonitorInput` | Optional. The input the board STIM line is wired back into, an analog input (`aiN`) or a digital input line (`portN/lineN`), never a PFI terminal. Recorded as `laserN_trigger` and plotted on the laser tab's Board trigger graph. Set it as **trigger readback input** in Edit DAQ Ports |
 | `nidaqPorts`, `nidaqStream` | Real device identity, supported channel types, timing policy, and independent plot selection |
 
 Use **Edit → Edit DAQ Ports** while idle to discover supported channel types and
@@ -50,8 +51,11 @@ product/serial identities and validates timing-master capability. All mapped and
 custom NI-DAQ inputs are recorded when NI-DAQ is enabled; plotting only the
 subset in `displayChannels` does not change persistence. The dialog edits only
 the port roles it shows (analog output, diode input, shutter output, command
-copy input); saving it keeps every other laser field as it was, including
-`boardStimLine` and `boardTriggerPulseUs`. On christielab10, laser 1 uses
+copy input, trigger readback input); saving it keeps every other laser field as
+it was, including `boardStimLine` and `boardTriggerPulseUs`. It refuses, before
+it closes, a trigger readback input that another role uses, that is a laser
+output line, or that is not an analog input or digital input line. On
+christielab10, laser 1 uses
 `boardStimLine: 3` and laser 2 `boardStimLine: 2`, both with
 `boardTriggerPulseUs: 1000`.
 

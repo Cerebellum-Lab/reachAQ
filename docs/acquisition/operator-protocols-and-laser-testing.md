@@ -222,22 +222,24 @@ input, on its own axis under the output graph, so the edge that starts a
 waveform lines up with the waveform. To see it:
 
 1. Wire this laser's board STIM line (on christielab10, STIM3 for laser 1 and
-   STIM2 for laser 2) into a spare NI input.
-2. With reachAQ closed, set that input as the laser channel's
-   `triggerMonitorInput` under `laser: channels:` in
-   `~/Autotrainer/system_configuration.yaml`, for example
-   `triggerMonitorInput: PXI1Slot5/ai9`. **Edit DAQ Ports** has no field for
-   it, and keeps whatever the file says.
-3. Start reachAQ. The input is acquired and recorded as `laserN_trigger`,
-   beside `laserN_diode` and `laserN_command_copy`, as analog or, for a
-   `portN/lineN` input, digital. Tick **Board trigger readback** under
-   Signals to plot it.
+   STIM2 for laser 2) into a spare **analog input** (`aiN`) or **digital input
+   line** (`portN/lineN`) on the input card. Not a PFI terminal: a PFI cannot
+   be streamed, and is refused.
+2. In Idle, open **Edit → Edit DAQ Ports**, pick the laser's tab, and choose
+   that input in **trigger readback input**. It lists the input card's analog
+   inputs and digital input lines that no other role holds; *(none)* turns the
+   readback off. Save.
+3. The input is acquired and recorded as `laserN_trigger`, after every other
+   input, as analog for `aiN` or digital for `portN/lineN`. Tick **Board
+   trigger readback** under Signals to plot it.
 
-The status line under the Board trigger graph names the input it reads, or
-says what to set. An input that another role already uses - this or another
-laser's diode or command copy, or a tone or camera line - is refused, naming
-both, when the configuration loads or Edit DAQ Ports saves; a refused save
-changes nothing.
+The status line under the Board trigger graph says what it is doing: that no
+input is set, that it reads the input once the NI-DAQ stream runs, that it is
+reading it and the box is unticked, or that it is showing it. An input that
+another role already uses - this or another laser's diode, command copy or
+shutter, a tone or camera line, or the PMT shutter output - is refused, naming
+both, in the dialog before it closes; the same check refuses such a
+configuration when it loads. A refused save changes nothing.
 
 On the **Pulse** page, **Profile:** picks what fires on this laser: *(none)*,
 *(builder draft)* or any saved profile, unfiltered — a profile made with one
