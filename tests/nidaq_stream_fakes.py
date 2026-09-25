@@ -37,3 +37,12 @@ def failing_worker(_configuration, _timing_plan, message_queue, _sample_ring,
     """Fail before becoming ready, as a driver refusing the task does."""
     message_queue.put(("error", "the task was refused"))
     message_queue.put(("stopped", None))
+
+
+def failing_as_stopped_worker(_configuration, _timing_plan, message_queue,
+                              _sample_ring, stop_event, _log_dict_config):
+    """Come up, then report an error as it is stopped, as a driver's teardown can."""
+    message_queue.put(("ready", None))
+    stop_event.wait(60.0)
+    message_queue.put(("error", "the old task failed as it was stopped"))
+    message_queue.put(("stopped", None))

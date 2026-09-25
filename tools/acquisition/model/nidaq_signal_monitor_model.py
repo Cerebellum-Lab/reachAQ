@@ -711,15 +711,30 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
                 else:
                     worker_error = f"NI-DAQ signal stream worker exited unexpectedly (exit code {exitcode})"
             if worker_error:
-                log_hardware_initialization(
-                    logger,
-                    "FAILED | NI-DAQ signal stream | elapsed=%.3fs worker_pid=%s error=%s",
-                    time.perf_counter() - started,
-                    process.pid,
-                    worker_error,
-                    level=logging.ERROR,
-                )
-                self._set_error(worker_error)
+                # Only while this is still the monitor's worker, checked under
+                # the lock as the READY block and _finalize_worker check it.
+                # stop() lets this thread go after two seconds, and a newer
+                # start may be running by the time it gets here: its error was
+                # posted over that healthy stream, which then read FAILED.
+                with self._lock:
+                    if process is self._process:
+                        log_hardware_initialization(
+                            logger,
+                            "FAILED | NI-DAQ signal stream | elapsed=%.3fs worker_pid=%s error=%s",
+                            time.perf_counter() - started,
+                            process.pid,
+                            worker_error,
+                            level=logging.ERROR,
+                        )
+                        self._set_error(worker_error)
+                    else:
+                        logger.warning(
+                            "NI-DAQ signal stream worker pid=%s ended after a "
+                            "newer start replaced it; its error is not the "
+                            "current stream's: %s",
+                            process.pid,
+                            worker_error,
+                        )
             self._finalize_worker(process)
 
     def _finalize_worker(self, process) -> None:
