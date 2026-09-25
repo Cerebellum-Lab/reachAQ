@@ -13,7 +13,7 @@ import time
 import pytest
 
 from autotrainer.core import NidaqPortConfiguration
-from tools.acquisition.model import nidaq_monitor_session
+from tools.acquisition.model import nidaq_monitor_session, nidaq_signal_monitor_model
 from tools.acquisition.model.app_model_status import SessionRecordingStatus
 from tools.acquisition.model.nidaq_monitor_session import NidaqMonitorSession
 from tools.acquisition.model.subsystem_status import SubsystemId, SubsystemState
@@ -403,3 +403,79 @@ def test_the_stream_is_not_restarted_while_the_application_closes(nidaq_app):
     nidaq_app._request_nidaq_stream("acquisition stopped")
 
     assert not _settle(nidaq_app, running=True, timeout=1.0).is_running
+
+
+def _launched_chunks(monkeypatch):
+    """Record the read chunk each start hands its worker."""
+    chunks = []
+    resolve = nidaq_signal_monitor_model.resolve_nidaq_stream_configuration
+
+    def recording(*args, **kwargs):
+        configuration = resolve(*args, **kwargs)
+        chunks.append(configuration.read_chunk_size)
+        return configuration
+
+    monkeypatch.setattr(nidaq_signal_monitor_model,
+                        "resolve_nidaq_stream_configuration", recording)
+    return chunks
+
+
+def test_a_refresh_rate_change_leaves_a_running_session_stream_alone(
+    nidaq_app, monkeypatch,
+):
+    # The Analysis view forwards the window's screen refresh rate, polled
+    # once a second, and the read chunk follows it. Moving the window to a
+    # screen with another rate while recording stopped the stream and started
+    # a new one: the subsystem read STOPPED, the shared ring was reset and
+    # the samples took a new timing anchor, so the recording carried on with
+    # a silent gap. The new chunk now waits for the stream's next start.
+    monkeypatch.setattr(nidaq_app, "_require_valid_nidaq_configuration", lambda: None)
+    chunks = _launched_chunks(monkeypatch)
+    assert nidaq_app.load_configuration() is True
+    monitor = _settle(nidaq_app)
+    assert monitor.is_running, "the stream did not start by itself"
+    try:
+        assert nidaq_app.capture_start() is True
+        assert monitor.is_running
+        pid = _worker_pid(monitor)
+        run_chunk = chunks[-1]
+        before = _nidaq_state(nidaq_app)
+        calls = []
+        stop, start = monitor.stop, monitor.start
+        monitor.stop = lambda: calls.append("stop") or stop()
+        monitor.start = lambda: calls.append("start") or start()
+
+        monitor.set_display_refresh_rate(2 * monitor.display_refresh_rate_hz)
+
+        new_chunk = monitor.effective_read_chunk_size
+        assert new_chunk != run_chunk
+        assert calls == []
+        assert monitor.is_running
+        assert _worker_pid(monitor) == pid
+        after = _nidaq_state(nidaq_app)
+        assert (after.state, after.generation) == (before.state, before.generation)
+    finally:
+        nidaq_app.capture_stop()
+
+    # Stop hands the stream back to Idle, and that start takes the new chunk.
+    assert _settle(nidaq_app).is_running
+    assert _worker_pid(monitor) not in (None, pid)
+    assert chunks[-1] == new_chunk
+
+
+def test_a_refresh_rate_change_in_idle_restarts_the_stream_with_its_chunk(
+    nidaq_app, monkeypatch,
+):
+    chunks = _launched_chunks(monkeypatch)
+    assert nidaq_app.load_configuration() is True
+    monitor = _settle(nidaq_app)
+    assert monitor.is_running, "the stream did not start by itself"
+    pid = _worker_pid(monitor)
+    idle_chunk = chunks[-1]
+
+    monitor.set_display_refresh_rate(2 * monitor.display_refresh_rate_hz)
+
+    assert _settle(nidaq_app).is_running
+    assert _worker_pid(monitor) not in (None, pid)
+    assert monitor.effective_read_chunk_size != idle_chunk
+    assert chunks[-1] == monitor.effective_read_chunk_size

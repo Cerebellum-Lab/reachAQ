@@ -685,7 +685,11 @@ class AppModel(ObservableObject):
 
         self._hardware = HardwareModel(self._system_message_handler)
         self._laser = LaserModel()
-        self._nidaq_signal_monitor = NidaqSignalMonitorModel()
+        # A display change restarts the stream only while idle: in System
+        # Mode a restart is a gap and a new timing anchor in the recording.
+        self._nidaq_signal_monitor = NidaqSignalMonitorModel(
+            restart_allowed=self._nidaq_stream_idle,
+        )
         #: Starts the input stream by itself while idle; see _request_nidaq_stream.
         self._nidaq_stream_autostart = NidaqStreamAutoStart(
             self._nidaq_signal_monitor,
