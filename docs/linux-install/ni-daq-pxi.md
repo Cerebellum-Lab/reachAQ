@@ -200,6 +200,16 @@ board, is refused before anything fires, naming the line. christielab10
 configures none of these lines, and this path has not yet been run on its
 hardware.
 
+`backplaneClockLine` (default `PXI_Trig1`) must be a different line from every
+laser's `triggerSource` line and every `triggerListenerInputs` line: a trigger
+on the clock's line is a second driver on it, which DAQmx does not notice
+across these boards, and the clock or the trigger is corrupted. Lines compare
+by name alone, whatever the board and case (`/PXI1Slot4/PXI_Trig1` and
+`pxi_trig1` are one line); a PFI never clashes. Loading a configuration that
+clashes is refused, naming the field and the line, and Edit DAQ Ports refuses
+a trigger input on it before it closes. christielab10 keeps the clock on
+PXI_Trig1 and its triggers and trigger inputs on PXI_Trig0 and PXI_Trig2.
+
 Validate configured laser tasks only after confirming the real wiring, and
 with reachAQ closed: its NI-DAQ input stream runs whenever it is open, and
 holds the input lines this opens tasks on.

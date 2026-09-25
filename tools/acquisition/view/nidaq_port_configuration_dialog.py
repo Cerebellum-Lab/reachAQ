@@ -29,6 +29,10 @@ from autotrainer.core import (
     NidaqTimingConfiguration,
     SystemConfiguration,
 )
+from autotrainer.core.configuration.laser_configuration import (
+    BACKPLANE_CLOCK_LINE_REMEDY,
+    backplane_clock_line_clashes,
+)
 from autotrainer.core.logging import get_verbose_logger
 from tools.acquisition.model.nidaq_breakout import (
     breakout_for_device,
@@ -389,6 +393,8 @@ class NidaqPortConfigurationDialog(QDialog):
             warnings.append("Duplicate channel assignment(s): " + ", ".join(duplicates))
         readback_refusals = self._stream_line_refusals()
         warnings.extend(readback_refusals)
+        clock_line_refusals = self._backplane_clock_line_refusals()
+        warnings.extend(clock_line_refusals)
         # Not an error - the 68-pin connector reaches everything - but worth
         # one line, because the alternative is hunting the front panel for a
         # label that was never printed on it.
@@ -414,7 +420,9 @@ class NidaqPortConfigurationDialog(QDialog):
             self._status_label.setStyleSheet("color: #9a6700;")
         else:
             self._status_label.setStyleSheet("")
-        self._set_ok_enabled(not unsupported and not duplicates and not readback_refusals)
+        self._set_ok_enabled(
+            not unsupported and not duplicates and not readback_refusals
+            and not clock_line_refusals)
         self._status_label.setText(status)
 
     def _selected_channels_off_the_block(self) -> Tuple[str, ...]:
@@ -595,19 +603,44 @@ class NidaqPortConfigurationDialog(QDialog):
         backend = current.backend
         if backend != "disabled" and not channels:
             raise ValueError(f"laser backend '{backend}' requires at least one complete laser mapping")
-        return LaserSystemConfiguration.from_channels(
-            channels,
-            hardware_timed=current.hardware_timed,
-            sample_rate_hz=current.sample_rate_hz,
-            backend=backend,
-            pmt_shutter_output=current.pmt_shutter_output,
-            trigger_listener_inputs=tuple(
-                value
-                for combos in self._laser_combos.values()
-                for value in (self._combo_selections[combos["trigger_listener"]],)
-                if value is not None
-            ),
+        # Every field the dialog does not edit is kept. Rebuilt from its
+        # channels, the configuration lost backplaneClockLine: a save moved
+        # the shared clock back onto PXI_Trig1.
+        return dataclasses.replace(
+            current,
+            channels=tuple(channels),
+            trigger_listener_inputs=self._selected_trigger_listener_inputs(),
         )
+
+    def _selected_trigger_listener_inputs(self) -> Tuple[str, ...]:
+        return tuple(
+            value
+            for combos in self._laser_combos.values()
+            for value in (self._combo_selections[combos["trigger_listener"]],)
+            if value is not None
+        )
+
+    def _backplane_clock_line_refusals(self) -> List[str]:
+        """A trigger picked here on the backplane clock line, as the load says it.
+
+        The configuration refuses one when it is built, so without this the
+        dialog could not close, and would not say why. The channels' own
+        trigger sources are not fields here, and are taken as configured.
+        """
+        laser = self._configuration.laser
+        mapped = {
+            laser_index
+            for laser_index, combos in self._laser_combos.items()
+            if any(self._combo_selections[combo] for combo in combos.values())
+        }
+        clashes = backplane_clock_line_clashes(
+            laser.backplane_clock_line,
+            (channel for channel in laser.channels if int(channel.channel_id) in mapped),
+            self._selected_trigger_listener_inputs(),
+        )
+        if not clashes:
+            return []
+        return ["; ".join(clashes) + "; " + BACKPLANE_CLOCK_LINE_REMEDY]
 
     def _set_all_combos_enabled(self, enabled: bool) -> None:
         for combo in self._general_combos.values():
@@ -665,12 +698,15 @@ class NidaqPortConfigurationDialog(QDialog):
             # lines a port role could have.
             return tuple(dict.fromkeys(device.analog_inputs + self._streamable_lines(device)))
         if kind == "trigger":
+            # DAQmx spells the backplane lines PXI_Trig0-7. Looking for
+            # "pxitrig" alone never matched one, so the lines christielab10's
+            # trigger inputs use were never offered, only kept when stored.
             return tuple(
                 terminal
                 for terminal in device.terminals
                 if any(
                     marker in terminal.lower()
-                    for marker in ("pfi", "pxitrig", "rtsi")
+                    for marker in ("pfi", "pxitrig", "pxi_trig", "rtsi")
                 )
             )
         raise ValueError(f"Unsupported NI-DAQ channel kind: {kind}")
@@ -884,6 +920,10 @@ class NidaqPortConfigurationDialog(QDialog):
         stream_refusals = self._stream_line_refusals()
         if stream_refusals:
             raise ValueError("; ".join(stream_refusals))
+        # Before the configuration is built, which refuses it too, unnamed.
+        clock_line_refusals = self._backplane_clock_line_refusals()
+        if clock_line_refusals:
+            raise ValueError("; ".join(clock_line_refusals))
 
     def _infer_configured_device_name(self) -> Optional[str]:
         channels = []

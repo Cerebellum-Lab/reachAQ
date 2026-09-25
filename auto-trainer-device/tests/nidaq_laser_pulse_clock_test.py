@@ -242,13 +242,14 @@ def test_an_unsynchronized_output_refuses_a_clock_line_the_shared_clock_holds(da
     controller.close()
 
 
-def test_the_clock_line_is_not_driven_over_a_trigger_route(daq, monkeypatch):
-    # A backplane clock line configured as the line the stimulus takes.
-    controller = NidaqLaserController(
-        dataclasses.replace(
-            rig_lasers(trigger_source=BOARD_STIM,
-                       trigger_route_source="/PXI1Slot5/PFI0"),
-            backplane_clock_line="PXI_Trig0"))
+def test_the_clock_line_is_not_driven_over_a_trigger_route(daq):
+    # A backplane clock line on the line the stimulus takes. A configuration
+    # refuses that as it is built (LaserSystemConfiguration); the controller
+    # refuses it too, for one that reaches it another way.
+    configuration = rig_lasers(trigger_source=BOARD_STIM,
+                               trigger_route_source="/PXI1Slot5/PFI0")
+    object.__setattr__(configuration, "backplane_clock_line", "PXI_Trig0")
+    controller = NidaqLaserController(configuration)
 
     with pytest.raises(RuntimeError) as refused:
         controller.run_synchronized_pulse_train(_pulse(enable_pmt_shutter=True))
