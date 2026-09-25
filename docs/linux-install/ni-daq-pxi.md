@@ -129,12 +129,21 @@ clocked digital-input task, and an M Series board such as the 6221 clocks
 port0 only: port1 and port2 are its PFI pins, and the 6713's lines cannot be
 clocked at all. The dialog offers only port0 lines of a board that clocks
 digital input; a stored value that is not one stays on its field, the status
-line says why, and OK stays disabled until it is changed. A configuration file
-naming a line off port0 still loads, but its NI-DAQ plan is refused, naming the
-field; see below. christielab10
-uses `PXI1Slot5/port0/line0`-`line3` for tone1, tone2, camFrames and barcode.
-Clearing a role (choosing the empty entry) stops its channel being acquired
-and recorded from the next save on; the log notes the dropped channel.
+line says why, and OK stays disabled until it is changed. Loading a file
+checks names only, since no board is asked then: a digital role that is not
+one port0 line (a port1 or port2 PFI pin, a whole port, an analog input)
+still loads, but its NI-DAQ plan is refused, naming the field; see below. A
+port0 line on a board that cannot clock digital input, such as the 6713,
+passes the load. Edit DAQ Ports marks it, and System Mode refuses it at Run,
+naming the channel and the board; the driver's answer is the test, not the
+board model (the 6713 reports no digital-input rate, the 6221 1 MHz). In Idle
+the stream's own start still reports it only as DAQmx error -200452.
+christielab10 uses `PXI1Slot5/port0/line0`-`line3` for tone1, tone2,
+camFrames and barcode. Clearing a role (choosing the empty entry) stops its
+channel being acquired and recorded from the next save on; the log notes the
+dropped channel. The same holds for a laser tab cleared whole while the laser
+backend is enabled: its diode, command copy and trigger readback channels
+are dropped from the plan and logged, not kept as hidden custom inputs.
 
 A configuration file with a line the stream cannot acquire - a duplicate pin,
 a PFI pin on a digital role, a PFI trigger readback - still loads. Everything

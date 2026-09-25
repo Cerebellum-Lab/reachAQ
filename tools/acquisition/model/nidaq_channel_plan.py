@@ -5,6 +5,7 @@ import re
 from typing import Dict, Iterable, Tuple
 
 from autotrainer.core import (
+    LaserChannelId,
     LaserSystemConfiguration,
     NidaqPortConfiguration,
     NidaqSignalChannelConfiguration,
@@ -12,7 +13,7 @@ from autotrainer.core import (
 )
 from autotrainer.core.logging import get_verbose_logger
 
-from tools.acquisition.model.nidaq_monitor_survey import BUFFERED_PORT
+from tools.acquisition.model.nidaq_monitor_survey import is_streamable_line
 
 
 logger = get_verbose_logger(__name__)
@@ -40,7 +41,7 @@ def _is_role_name(name: str) -> bool:
     )
 
 
-def _claimed_role_names(lasers) -> set:
+def _claimed_role_names(laser_backend_enabled: bool) -> set:
     """The names roles claim in a plan, whether or not each role is set.
 
     Only a role ever writes its name, so a stored channel under one is that
@@ -50,16 +51,20 @@ def _claimed_role_names(lasers) -> set:
     a trigger readback, or for tone1 or camFrames.
 
     Every port role claims its name always: the ports are planned whatever
-    else is configured. A laser's names are claimed for each laser the plan
-    acquires, which is only while the laser backend is enabled; disabled, the
-    plan adds no laser role, and a stored laser channel stays a custom input,
-    as it always has.
+    else is configured. While the laser backend is enabled, so do the roles
+    of every laser there can be, configured or not. Claimed only for the
+    lasers configured, a laser tab cleared in Edit DAQ Ports took that laser
+    out of the list, and its laser2_diode and laser2_command_copy stayed in
+    the scan: recorded, hidden, and shown nowhere. With the backend disabled
+    the plan adds no laser role, and a stored laser channel stays a custom
+    input, as it always has.
     """
     names = {name for _attribute, name in _PORT_INPUT_ROLES}
-    for channel in lasers:
-        number = int(channel.channel_id)
-        names.update(
-            f"laser{number}_{suffix}" for suffix in ("diode", "command_copy", "trigger"))
+    if laser_backend_enabled:
+        for number in LaserChannelId:
+            names.update(
+                f"laser{int(number)}_{suffix}"
+                for suffix in ("diode", "command_copy", "trigger"))
     return names
 
 
@@ -75,13 +80,20 @@ def nidaq_channel_kind(physical_channel: str) -> str:
     return "digital" if "port" in lowered or "line" in lowered else "analog"
 
 
-#: One analog input, Dev1/ai3, or one port0 line, Dev1/port0/line3: what the
-#: stream can sample. It puts every digital input in one clocked task, and an
-#: M Series board clocks port0 only (see nidaq_monitor_survey).
-_STREAMABLE_INPUT = re.compile(
-    rf"^/?[^/]+/(ai\d+|{BUFFERED_PORT}/line\d+)$", re.IGNORECASE)
-#: One port0 line: the only digital line the stream can sample.
-_STREAMABLE_LINE = re.compile(rf"^/?[^/]+/{BUFFERED_PORT}/line\d+$", re.IGNORECASE)
+#: One analog input, as in Dev1/ai3.
+_ANALOG_INPUT = re.compile(r"^/?[^/]+/ai\d+$", re.IGNORECASE)
+
+
+def _is_streamable_input(terminal: str) -> bool:
+    """One analog input or one port0 line: what the stream can sample.
+
+    It puts every digital input in one clocked task, and an M Series board
+    clocks port0 only; the line rule is nidaq_monitor_survey's, shared with
+    Edit DAQ Ports and the DAQ Monitor.
+    """
+    return bool(_ANALOG_INPUT.match(terminal)) or is_streamable_line(terminal)
+
+
 #: A digital line on another port: port1 and port2 are the static PFI pins.
 _STATIC_LINE = re.compile(r"^/?[^/]+/port\d+/line\d+$", re.IGNORECASE)
 _PFI_PIN_LINES = (
@@ -98,7 +110,7 @@ def port_role_field(attribute: str) -> str:
 
 def _is_pfi_pin_line(terminal: str) -> bool:
     """A digital line off port0: STIM3's /PXI1Slot5/PFI0 is PXI1Slot5/port1/line0."""
-    return bool(_STATIC_LINE.match(terminal)) and not _STREAMABLE_LINE.match(terminal)
+    return bool(_STATIC_LINE.match(terminal)) and not is_streamable_line(terminal)
 
 
 def port_role_refusal(attribute: str, terminal: str) -> str:
@@ -112,7 +124,7 @@ def port_role_refusal(attribute: str, terminal: str) -> str:
     subject = f"nidaqPorts.{port_role_field(attribute)} {terminal!r}"
     if _is_pfi_pin_line(terminal):
         return f"{subject} is not streamable: {_PFI_PIN_LINES}; use a port0 line"
-    if not _STREAMABLE_LINE.match(terminal):
+    if not is_streamable_line(terminal):
         return f"{subject} must be one port0 line (port0/lineN) on the input card"
     return ""
 
@@ -150,7 +162,7 @@ def trigger_readback_refusal(
             f"{subject} is not streamable: {_PFI_PIN_LINES}; use an analog "
             "input (aiN) or a port0 line"
         )
-    if not _STREAMABLE_INPUT.match(terminal):
+    if not _is_streamable_input(terminal):
         return (
             f"{subject} must be one analog input (aiN) or one port0 line "
             "(port0/lineN); a PFI terminal, an output or a counter cannot be "
@@ -303,15 +315,16 @@ def build_nidaq_acquisition_configuration(
         )
     role_pins = {channel.name: channel.physical_channel for channel in mapped.values()}
     role_pins.update((trigger.name, trigger.physical_channel) for trigger in triggers)
-    role_names = set(role_pins) | _claimed_role_names(lasers)
+    role_names = set(role_pins) | _claimed_role_names(laser.backend != "disabled")
 
     # Existing channels not claimed by a named hardware role are explicit
     # custom acquisition inputs and remain enabled. One stored under a role's
     # name is that role's previous input: every load and save stores the
     # plan, so a role moved to a new input left its old one here, and it
     # came back as a custom input under the same name - "maps to both", and
-    # the configuration no longer loaded. A role that is not configured
-    # claims no name, so such a channel stays a custom input as before.
+    # the configuration no longer loaded. Which names a role claims when it
+    # is not set, and so which such channels are dropped rather than kept as
+    # custom inputs, is _claimed_role_names'.
     for channel in configured_stream.channels:
         if channel.physical_channel in role_physical_channels:
             continue

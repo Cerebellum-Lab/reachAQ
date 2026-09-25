@@ -26,6 +26,7 @@ from __future__ import annotations
 import dataclasses
 from typing import Iterable, Optional, Sequence, Tuple
 
+from tools.acquisition.model.nidaq_monitor_survey import clocks_digital_input
 from tools.acquisition.model.nidaq_routing import (
     capability_between,
     chassis_is_identified,
@@ -136,8 +137,19 @@ def _check_named_terminal(devices, subject, terminal) -> Optional[ValidationIssu
     return None
 
 
+def _is_digital_input(device, physical_channel: str) -> bool:
+    wanted = _tail(physical_channel)
+    return any(_tail(str(line)) == wanted
+               for line in getattr(device, "digital_inputs", ()) or ())
+
+
 def validate_channels(devices, channels, subject_prefix="stream channel"):
-    """Every configured channel names a device and a channel that exist."""
+    """Every configured channel names a device and a channel that exist.
+
+    And a digital input names a board that can clock one: the stream samples
+    its lines in a clocked task. A PXI-6713 port0 line passed here and failed
+    when the stream started, at -200452, naming neither line nor board.
+    """
     issues = []
     for channel in channels or ():
         physical = getattr(channel, "physical_channel", "")
@@ -155,6 +167,14 @@ def validate_channels(devices, channels, subject_prefix="stream channel"):
             issues.append(ValidationIssue(
                 f"{subject_prefix} {name!r}", physical,
                 f"names a channel {device_name} does not have",
+            ))
+            continue
+        if _is_digital_input(device, physical) and not clocks_digital_input(device):
+            issues.append(ValidationIssue(
+                f"{subject_prefix} {name!r}", physical,
+                f"names a line on {device_name}, which cannot clock digital "
+                "input: discovery reports no digital-input rate for it",
+                remedy="use a port0 line on a board that clocks digital input",
             ))
     return tuple(issues)
 

@@ -41,7 +41,10 @@ from tools.acquisition.model.nidaq_channel_plan import (
     port_role_refusal,
     trigger_readback_refusal,
 )
-from tools.acquisition.model.nidaq_monitor_survey import BUFFERED_PORT
+from tools.acquisition.model.nidaq_monitor_survey import (
+    clocks_digital_input,
+    is_streamable_line,
+)
 from tools.acquisition.model.nidaq_discovery import (
     NidaqDevicePorts,
     device_name_from_channel,
@@ -347,7 +350,7 @@ class NidaqPortConfigurationDialog(QDialog):
                         f"Assigned to {current_value}. Select a {device.name} channel to replace it."
                     )
                 elif len(all_options) == 0:
-                    combo.setToolTip(f"The selected device has no {kind.upper()} channels.")
+                    combo.setToolTip(self._no_channels_reason(device, kind))
                 elif not has_selectable_channel:
                     combo.setToolTip(f"All {kind.upper()} channels on this device are already assigned.")
                 else:
@@ -621,6 +624,30 @@ class NidaqPortConfigurationDialog(QDialog):
     def _selected_device(self) -> Optional[NidaqDevicePorts]:
         return self._devices.get(self._device_combo.currentData())
 
+    @staticmethod
+    def _no_channels_reason(device: NidaqDevicePorts, kind: str) -> str:
+        """Why `device` offers nothing for a field of `kind`.
+
+        A PXI-6713 has eight DI lines, so "has no DI channels" was wrong: the
+        board cannot clock digital input, which the stream needs.
+        """
+        if (
+            kind in ("di", "readback")
+            and device.digital_inputs
+            and not clocks_digital_input(device)
+        ):
+            if kind == "readback":
+                return (
+                    f"{device.name} has no analog input and cannot clock "
+                    "digital input, so nothing on it can be sampled with the "
+                    "stream."
+                )
+            return (
+                f"{device.name} cannot clock digital input, so none of its "
+                "lines can be sampled with the stream."
+            )
+        return f"The selected device has no {kind.upper()} channels."
+
     def _options_for_kind(self, device: NidaqDevicePorts, kind: str) -> Tuple[str, ...]:
         if kind == "ao":
             return device.analog_outputs
@@ -827,18 +854,15 @@ class NidaqPortConfigurationDialog(QDialog):
         PXI-6713's lines cannot be clocked - the driver has no DI rate for
         it, and a buffered task on them fails at -200452.
         """
-        if device.digital_input_max_rate is None:
+        if not clocks_digital_input(device):
             return ()
-        return tuple(
-            line for line in device.digital_inputs
-            if self._terminal_of(line).split("/", 1)[0].lower() == BUFFERED_PORT
-        )
+        return tuple(line for line in device.digital_inputs if is_streamable_line(line))
 
     def _unclocked_line_refusal(self, subject: str, terminal: str) -> str:
         device = self._devices.get(device_name_from_channel(terminal))
         if (
             device is None
-            or device.digital_input_max_rate is not None
+            or clocks_digital_input(device)
             or terminal not in device.digital_inputs
         ):
             return ""
