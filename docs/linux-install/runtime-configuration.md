@@ -43,6 +43,7 @@ fi
 | `laser.channels[].boardStimLine` | `2` or `3`: the board line wired to that laser's trigger input. Unset makes the board STIM route unavailable for that laser |
 | `laser.channels[].boardTriggerPulseUs` | `100`..`5000000`; default `1000`. Width of the board STIM pulse that starts that laser's waveform |
 | `laser.channels[].triggerMonitorInput` | Optional. The input the board STIM line is wired back into, an analog input (`aiN`) or a port0 line (`port0/lineN`), never a PFI terminal or a port1/port2 line (the PFI pins, which the stream cannot clock). Recorded as `laserN_trigger` and plotted on the laser tab's Board trigger graph. Set it as **trigger readback input** in Edit DAQ Ports |
+| `laser.pmtShutterOutput`, `laser.channels[].triggerOutput`, `laser.channels[].timingTriggerOutput` | Optional. Clocked digital output lines that run with a pulse's waveform: each a line on a board that can run clocked digital output (on christielab10 a port0 line on the 6221, never the 6713). A line on another board than the laser's analog output is clocked over the backplane (`laser.backplaneClockLine`, default `PXI_Trig1`). None is set on christielab10, and this path has not yet been run on its hardware |
 | `nidaqPorts`, `nidaqStream` | Real device identity, supported channel types, timing policy, and independent plot selection |
 
 Use **Edit → Edit DAQ Ports** while idle to discover supported channel types and

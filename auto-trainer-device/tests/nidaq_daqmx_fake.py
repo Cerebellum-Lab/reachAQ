@@ -35,12 +35,19 @@ class FakeTask:
         self.ai_channels = SimpleNamespace(add_ai_voltage_chan=self._add)
         self.do_channels = SimpleNamespace(add_do_chan=self._add)
         self.timing = SimpleNamespace(cfg_samp_clk_timing=self._timing)
+        #: The digital edge start trigger, as (source, edge), or None.
+        self.start_trigger = None
+        self.triggers = SimpleNamespace(start_trigger=SimpleNamespace(
+            cfg_dig_edge_start_trig=self._start_trigger))
 
     def _add(self, channel, **_kwargs):
         self.channels.append(channel)
 
     def _timing(self, **kwargs):
         self.timing_kwargs = kwargs
+
+    def _start_trigger(self, source, trigger_edge=None):
+        self.start_trigger = (source, trigger_edge)
 
     def _reserve(self):
         for channel in self.channels:
@@ -78,6 +85,7 @@ class FakeTask:
         self.daq.fail_start(self)
         self._reserve()
         self.started = True
+        self.daq.starts.append(self.name)
 
     def wait_until_done(self, timeout):
         if self.daq.block_wait:
@@ -149,9 +157,12 @@ class FakeDaqmx:
         self.controlled = []
         self.connected = []
         self.disconnected = []
+        #: Names of the tasks started, in the order they were.
+        self.starts = []
         self.constants = SimpleNamespace(
             AcquisitionType=SimpleNamespace(FINITE="finite"),
             TaskMode=SimpleNamespace(TASK_ABORT="abort"),
+            Edge=SimpleNamespace(RISING="rising", FALLING="falling"),
         )
         daq = self
 
