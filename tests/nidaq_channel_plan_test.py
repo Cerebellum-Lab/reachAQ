@@ -1,3 +1,5 @@
+import dataclasses
+
 import pytest
 
 from autotrainer.core import (
@@ -173,16 +175,214 @@ def test_a_trigger_readback_on_a_digital_line_is_acquired_as_digital():
 
 
 def test_without_a_trigger_readback_the_plan_is_what_it_was():
+    # Whole channels, so a unit, scale or offset that moved would show.
+    stored_tone = NidaqSignalChannelConfiguration(
+        "tone1", "InputCard/port0/line2", kind="digital", scale=3.0, offset=0.25)
+    stored_diode = NidaqSignalChannelConfiguration(
+        "laser1_diode", "InputCard/ai0", unit="mV", offset=0.5,
+        minimum=-1.0, maximum=6.0)
+    custom = NidaqSignalChannelConfiguration("force", "InputCard/ai12", unit="N")
+    configured = NidaqSignalStreamConfiguration(
+        channels=(stored_tone, stored_diode, custom), is_enabled=True)
+
     result = build_nidaq_acquisition_configuration(
-        _empty_stream(), NidaqPortConfiguration(), _laser_with())
+        configured,
+        NidaqPortConfiguration(tone1="InputCard/port0/line2"),
+        _laser_with(feedback_scale=2.0, command_copy_scale=4.0),
+    )
+
+    assert result.channels == (
+        NidaqSignalChannelConfiguration(
+            "tone1", "InputCard/port0/line2", kind="digital", unit="logic",
+            scale=3.0, offset=0.25),
+        NidaqSignalChannelConfiguration(
+            "laser1_diode", "InputCard/ai0", kind="analog", unit="mV",
+            scale=2.0, offset=0.5, minimum=-1.0, maximum=6.0),
+        NidaqSignalChannelConfiguration(
+            "laser1_command_copy", "InputCard/ai1", kind="analog", unit="V",
+            scale=4.0, offset=0.0),
+        custom,
+    )
+
+
+def test_trigger_readbacks_are_scanned_after_every_other_input():
+    # Appended last, so every channel already acquired keeps its place in
+    # the multiplexed scan, and the fast STIM edge is not converted just
+    # before a diode.
+    custom = NidaqSignalChannelConfiguration("force", "InputCard/ai12")
+    laser = LaserSystemConfiguration.from_channels(
+        (
+            LaserChannelConfiguration(
+                channel_id=LaserChannelId.LASER_1,
+                analog_output="OutputCard/ao0",
+                diode_input="InputCard/ai8",
+                shutter_output="InputCard/port0/line4",
+                command_copy_input="InputCard/ai3",
+                trigger_monitor_input="InputCard/ai9",
+            ),
+            LaserChannelConfiguration(
+                channel_id=LaserChannelId.LASER_2,
+                analog_output="OutputCard/ao1",
+                diode_input="InputCard/ai4",
+                shutter_output="InputCard/port0/line5",
+                command_copy_input="InputCard/ai5",
+                trigger_monitor_input="InputCard/ai10",
+            ),
+        ),
+        backend="nidaq",
+    )
+
+    result = build_nidaq_acquisition_configuration(
+        NidaqSignalStreamConfiguration(channels=(custom,), is_enabled=True),
+        NidaqPortConfiguration(tone1="InputCard/port0/line0"),
+        laser,
+    )
+
+    assert tuple(channel.name for channel in result.channels) == (
+        "tone1",
+        "laser1_diode",
+        "laser1_command_copy",
+        "laser2_diode",
+        "laser2_command_copy",
+        "force",
+        "laser1_trigger",
+        "laser2_trigger",
+    )
+
+
+def _stream_of(*channels):
+    return NidaqSignalStreamConfiguration(channels=channels, is_enabled=True)
+
+
+def test_moving_the_trigger_readback_to_another_input_keeps_one_channel():
+    # A load or save stores the plan, laser1_trigger on ai9 included. With
+    # the readback moved to ai11, the stored ai9 entry came back as a custom
+    # input under the role's own name, and the load failed: "maps to both".
+    stored = build_nidaq_acquisition_configuration(
+        _empty_stream(),
+        NidaqPortConfiguration(),
+        _laser_with(trigger_monitor_input="InputCard/ai9"),
+    )
+
+    result = build_nidaq_acquisition_configuration(
+        stored,
+        NidaqPortConfiguration(),
+        _laser_with(trigger_monitor_input="InputCard/ai11"),
+    )
 
     assert tuple(
-        (channel.name, channel.physical_channel, channel.kind)
-        for channel in result.channels
+        (channel.name, channel.physical_channel) for channel in result.channels
     ) == (
-        ("laser1_diode", "InputCard/ai0", "analog"),
-        ("laser1_command_copy", "InputCard/ai1", "analog"),
+        ("laser1_diode", "InputCard/ai0"),
+        ("laser1_command_copy", "InputCard/ai1"),
+        ("laser1_trigger", "InputCard/ai11"),
     )
+
+
+def test_moving_a_laser_input_to_another_input_keeps_one_channel():
+    stored = _stream_of(
+        NidaqSignalChannelConfiguration("laser1_diode", "InputCard/ai0"),
+        NidaqSignalChannelConfiguration("laser1_command_copy", "InputCard/ai1"),
+    )
+
+    result = build_nidaq_acquisition_configuration(
+        stored, NidaqPortConfiguration(), _laser_with(diode_input="InputCard/ai2"))
+
+    assert tuple(
+        (channel.name, channel.physical_channel) for channel in result.channels
+    ) == (
+        ("laser1_diode", "InputCard/ai2"),
+        ("laser1_command_copy", "InputCard/ai1"),
+    )
+
+
+def test_moving_a_port_role_to_another_line_keeps_one_channel():
+    # The same failure for every role: Edit DAQ Ports moving tone1 to a new
+    # line was refused with "maps to both".
+    stored = _stream_of(
+        NidaqSignalChannelConfiguration("tone1", "InputCard/port0/line0", kind="digital"),
+    )
+
+    result = build_nidaq_acquisition_configuration(
+        stored, NidaqPortConfiguration(tone1="InputCard/port0/line3"),
+        LaserSystemConfiguration(),
+    )
+
+    assert tuple(
+        (channel.name, channel.physical_channel) for channel in result.channels
+    ) == (("tone1", "InputCard/port0/line3"),)
+
+
+def test_a_stored_channel_named_like_an_unconfigured_role_stays_a_custom_input():
+    stored = _stream_of(
+        NidaqSignalChannelConfiguration("tone2", "InputCard/port0/line5", kind="digital"),
+    )
+
+    result = build_nidaq_acquisition_configuration(
+        stored, NidaqPortConfiguration(), LaserSystemConfiguration())
+
+    assert result.channels == stored.channels
+
+
+@pytest.mark.parametrize(
+    "terminal",
+    ["/InputCard/PFI0", "InputCard/ao0", "InputCard/ctr0", "InputCard/ai0:3",
+     "InputCard/port0"],
+    ids=["pfi", "analog_output", "counter", "range", "whole_port"],
+)
+def test_a_trigger_readback_that_is_not_one_input_is_refused(terminal):
+    # A PFI terminal read as an analog input: the stream task failed and
+    # took every NI input down with it.
+    with pytest.raises(ValueError) as refused:
+        build_nidaq_acquisition_configuration(
+            _empty_stream(),
+            NidaqPortConfiguration(),
+            _laser_with(trigger_monitor_input=terminal),
+        )
+
+    message = str(refused.value)
+    assert "Laser 1" in message and terminal in message
+    assert "analog input" in message and "digital input line" in message
+
+
+@pytest.mark.parametrize("terminal", ["/Dev1/ai7", "Dev1/ai15", "Dev1/port0/line3"])
+def test_a_trigger_readback_on_one_input_is_accepted(terminal):
+    result = build_nidaq_acquisition_configuration(
+        _empty_stream(),
+        NidaqPortConfiguration(),
+        _laser_with(trigger_monitor_input=terminal),
+    )
+
+    assert result.channels[-1].physical_channel == terminal
+
+
+def test_a_trigger_readback_on_a_shutter_line_is_refused():
+    with pytest.raises(ValueError) as refused:
+        build_nidaq_acquisition_configuration(
+            _empty_stream(),
+            NidaqPortConfiguration(),
+            _laser_with(
+                shutter_output="InputCard/port0/line4",
+                trigger_monitor_input="InputCard/port0/line4",
+            ),
+        )
+
+    message = str(refused.value)
+    assert "InputCard/port0/line4" in message
+    assert "laser 1 shutter output" in message
+
+
+def test_a_trigger_readback_on_the_pmt_shutter_line_is_refused():
+    laser = dataclasses.replace(
+        _laser_with(trigger_monitor_input="InputCard/port0/line7"),
+        pmt_shutter_output="InputCard/port0/line7",
+    )
+
+    with pytest.raises(ValueError) as refused:
+        build_nidaq_acquisition_configuration(
+            _empty_stream(), NidaqPortConfiguration(), laser)
+
+    assert "PMT shutter output" in str(refused.value)
 
 
 def test_a_custom_input_on_the_trigger_terminal_becomes_the_laser_trigger():

@@ -7695,9 +7695,8 @@ class AppModel(ObservableObject):
         laser_configuration: LaserSystemConfiguration,
     ) -> None:
         # Built first, because building is what refuses two roles on one
-        # input. Edit DAQ Ports keeps a laser's trigger readback without
-        # showing it, so it can offer that input to the diode; built after
-        # the lasers were applied, the refused save had already changed them.
+        # input or a trigger readback the stream cannot acquire. Built after
+        # the lasers were applied, a refused save had already changed them.
         acquisition = build_nidaq_acquisition_configuration(
             self._nidaq_signal_monitor.configuration,
             nidaq_ports,

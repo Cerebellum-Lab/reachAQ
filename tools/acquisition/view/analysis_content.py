@@ -806,9 +806,26 @@ class AnalysisContent(ContentWidget):
                     mapped.add(value)
         return mapped
 
-    @staticmethod
-    def _is_laser_stream_channel(channel: NidaqSignalChannelConfiguration) -> bool:
+    def _is_laser_stream_channel(self, channel: NidaqSignalChannelConfiguration) -> bool:
+        """Whether a laser tab shows this input, which then stays out of here.
+
+        By the laser configuration's own input pins, the trigger readback
+        included, and by the role names the plan gives them. Matched by name
+        suffix alone, laser1_trigger showed here as a custom input, and
+        ticking it here or on the laser tab toggled the other's curve.
+        """
         name = channel.name.lower()
-        return name.startswith("laser") and (
-            name.endswith("_diode") or name.endswith("_command_copy")
+        if name.startswith("laser") and name.endswith(
+            ("_diode", "_command_copy", "_trigger")
+        ):
+            return True
+        return any(
+            channel.physical_channel == value
+            for laser_channel in self._app_model.laser.configuration.channels
+            for value in (
+                laser_channel.diode_input,
+                laser_channel.command_copy_input,
+                laser_channel.trigger_monitor_input,
+            )
+            if value
         )

@@ -4,7 +4,7 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox  # noqa: E402
 
 from autotrainer.core import (  # noqa: E402
     LaserChannelConfiguration,
@@ -283,11 +283,12 @@ def test_independent_boards_without_requiring_synchronization_is_allowed():
 def test_saving_laser_ports_keeps_the_fields_the_dialog_does_not_edit(qapp):
     # The dialog rebuilt each channel field by field and dropped the rest, so
     # every save erased trigger_route_source - the PXI_Trig route a board STIM
-    # trigger needs on christielab10 - and trigger_monitor_input.
+    # trigger needs on christielab10 - and trigger_monitor_input, which the
+    # dialog now edits as the trigger readback input.
     device = NidaqDevicePorts(
         name="Dev1",
         analog_outputs=("Dev1/ao0",),
-        analog_inputs=("Dev1/ai0", "Dev1/ai1"),
+        analog_inputs=("Dev1/ai0", "Dev1/ai1", "Dev1/ai2"),
         digital_outputs=("Dev1/port0/line4",),
     )
     config = SystemConfiguration()
@@ -300,7 +301,7 @@ def test_saving_laser_ports_keeps_the_fields_the_dialog_does_not_edit(qapp):
             command_copy_input="Dev1/ai1",
             trigger_source="/Dev1/PXI_Trig0",
             trigger_route_source="/Dev1/PFI0",
-            trigger_monitor_input="Dev1/ai1",
+            trigger_monitor_input="Dev1/ai2",
             board_stim_line=3,
             board_trigger_pulse_us=1500,
         ),
@@ -311,6 +312,123 @@ def test_saving_laser_ports_keeps_the_fields_the_dialog_does_not_edit(qapp):
 
     assert channel.trigger_source == "/Dev1/PXI_Trig0"
     assert channel.trigger_route_source == "/Dev1/PFI0"
-    assert channel.trigger_monitor_input == "Dev1/ai1"
+    assert channel.trigger_monitor_input == "Dev1/ai2"
     assert channel.board_stim_line == 3
     assert channel.board_trigger_pulse_us == 1500
+
+
+def _readback_device():
+    return NidaqDevicePorts(
+        name="Dev1",
+        analog_outputs=("Dev1/ao0", "Dev1/ao1"),
+        analog_inputs=("Dev1/ai0", "Dev1/ai1", "Dev1/ai2", "Dev1/ai3"),
+        digital_outputs=("Dev1/port0/line4", "Dev1/port0/line5"),
+        digital_inputs=(
+            "Dev1/port0/line0", "Dev1/port0/line1",
+            "Dev1/port0/line4", "Dev1/port0/line5",
+        ),
+        terminals=("/Dev1/PFI0", "/Dev1/PXI_Trig0"),
+    )
+
+
+def _readback_config(**overrides):
+    values = dict(
+        channel_id=1,
+        analog_output="Dev1/ao0",
+        diode_input="Dev1/ai0",
+        shutter_output="Dev1/port0/line4",
+        command_copy_input="Dev1/ai1",
+    )
+    pmt_shutter_output = overrides.pop("pmt_shutter_output", None)
+    values.update(overrides)
+    config = SystemConfiguration()
+    config.laser = LaserSystemConfiguration.from_channels(
+        (LaserChannelConfiguration(**values),),
+        pmt_shutter_output=pmt_shutter_output,
+    )
+    return config
+
+
+def _ok_enabled(dialog):
+    return dialog._buttons.button(QDialogButtonBox.StandardButton.Ok).isEnabled()
+
+
+def test_each_laser_has_a_trigger_readback_input_of_inputs_only(qapp):
+    dialog = NidaqPortConfigurationDialog(
+        SystemConfiguration(), devices=(_readback_device(),))
+
+    for laser_index in range(1, 5):
+        combo = dialog._laser_combos[laser_index]["trigger_readback"]
+        values = _combo_values(combo)
+        assert values[0] is None and combo.itemText(0) == "(none)"
+        # Analog inputs and digital input lines; a PFI, an output or a
+        # backplane line cannot be streamed.
+        assert set(values[1:]) == {
+            "Dev1/ai0", "Dev1/ai1", "Dev1/ai2", "Dev1/ai3",
+            "Dev1/port0/line0", "Dev1/port0/line1",
+            "Dev1/port0/line4", "Dev1/port0/line5",
+        }
+
+
+def test_the_trigger_readback_input_is_loaded_and_saved(qapp):
+    config = _readback_config(trigger_monitor_input="Dev1/ai2")
+    dialog = NidaqPortConfigurationDialog(config, devices=(_readback_device(),))
+    combo = dialog._laser_combos[1]["trigger_readback"]
+
+    assert combo.currentData() == "Dev1/ai2"
+
+    _set_combo_value(combo, "Dev1/port0/line1")
+    assert dialog._build_laser_configuration().get_channel(1).trigger_monitor_input == (
+        "Dev1/port0/line1")
+
+    combo.setCurrentIndex(0)
+    assert dialog._build_laser_configuration().get_channel(1).trigger_monitor_input is None
+
+
+def test_a_trigger_readback_input_is_not_offered_to_another_input(qapp):
+    config = _readback_config(trigger_monitor_input="Dev1/ai2")
+    dialog = NidaqPortConfigurationDialog(config, devices=(_readback_device(),))
+
+    assert "Dev1/ai2" not in _combo_values(dialog._laser_combos[1]["diode"])
+    assert "Dev1/ai2" not in _combo_values(dialog._laser_combos[2]["laser_copy"])
+    readback = _combo_values(dialog._laser_combos[1]["trigger_readback"])
+    for taken in ("Dev1/ai0", "Dev1/ai1", "Dev1/port0/line4"):
+        assert taken not in readback
+
+
+def test_a_trigger_readback_on_another_input_is_refused_before_the_dialog_closes(qapp):
+    # Refused only by the application after the dialog had closed, the
+    # refusal reached the log and every edit in the dialog was lost.
+    config = _readback_config(trigger_monitor_input="Dev1/ai1")
+    dialog = NidaqPortConfigurationDialog(config, devices=(_readback_device(),))
+
+    status = dialog._status_label.text()
+    assert "Duplicate channel assignment" in status
+    assert "trigger readback input" in status
+    assert not _ok_enabled(dialog)
+    dialog.accept()
+    assert dialog.result() != QDialog.DialogCode.Accepted
+    assert dialog.laser_configuration == config.laser
+
+
+@pytest.mark.parametrize("terminal", ["/Dev1/PFI0", "Dev1/ao1"], ids=["pfi", "output"])
+def test_a_trigger_readback_that_is_not_one_input_is_refused_in_the_dialog(qapp, terminal):
+    config = _readback_config(trigger_monitor_input=terminal)
+    dialog = NidaqPortConfigurationDialog(config, devices=(_readback_device(),))
+
+    status = dialog._status_label.text()
+    assert terminal in status
+    assert "analog input" in status and "digital input line" in status
+    assert not _ok_enabled(dialog)
+    dialog.accept()
+    assert dialog.result() != QDialog.DialogCode.Accepted
+
+
+def test_a_trigger_readback_on_the_pmt_shutter_line_is_refused_in_the_dialog(qapp):
+    # Not one of the dialog's own fields, so its duplicate check never saw it.
+    config = _readback_config(
+        trigger_monitor_input="Dev1/port0/line5", pmt_shutter_output="Dev1/port0/line5")
+    dialog = NidaqPortConfigurationDialog(config, devices=(_readback_device(),))
+
+    assert "PMT shutter output" in dialog._status_label.text()
+    assert not _ok_enabled(dialog)

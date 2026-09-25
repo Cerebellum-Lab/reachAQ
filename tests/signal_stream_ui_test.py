@@ -529,17 +529,40 @@ def test_analysis_excludes_laser_owned_inputs_from_selector_and_graph(qapp):
         physical_channel="Dev1/ai0",
         kind="analog",
     )
+    # The trigger readback is the laser tab's too. Matched by name suffix,
+    # it showed here as custom:laser1_trigger, with a tooltip about DAQ-port
+    # assignments, and ticking either one toggled the other's curve.
+    trigger_input = NidaqSignalChannelConfiguration(
+        name="laser1_trigger",
+        physical_channel="Dev1/ai7",
+        kind="analog",
+    )
+    # Owned by its pin as well: whatever it is called, a laser's input is
+    # the laser tab's to show.
+    renamed_readback = NidaqSignalChannelConfiguration(
+        name="stim_readback",
+        physical_channel="Dev1/ai6",
+        kind="analog",
+    )
     base = _stream_configuration()
     monitor = NidaqSignalMonitorModel()
     monitor._configuration = NidaqSignalStreamConfiguration(
-        channels=base.channels + (laser_input,),
+        channels=base.channels + (laser_input, trigger_input, renamed_readback),
         is_enabled=True,
     )
     monitor._hardware_enabled = True
     app_model = _AnalysisAppStub(monitor)
+    app_model.laser.set_configuration_offline(LaserSystemConfiguration.from_channels(
+        (dataclasses.replace(_laser_channel(), trigger_monitor_input="Dev1/ai6"),),
+        backend="disabled",
+    ))
     content = AnalysisContent(app_model)
     try:
-        assert not any(key.startswith("laser") for key in content._signal_checkboxes)
+        # By what they name, not how the key starts: a custom input is keyed
+        # custom:<name>, which a startswith("laser") check never saw.
+        assert not any(
+            "laser" in key or "readback" in key for key in content._signal_checkboxes
+        ), tuple(content._signal_checkboxes)
         assert tuple(channel.name for channel in content._display_configuration().channels) == (
             "cam_frames",
         )
@@ -1409,7 +1432,8 @@ def test_a_configured_board_trigger_readback_is_acquired_ticked_and_plotted(qapp
         trigger = tab._trace_signal_checkboxes["trigger"]
         assert trigger.isEnabled()
         assert "recorded either way" in trigger.toolTip()
-        assert "Reading Dev1/ai7" in tab.trigger_status.text()
+        assert "Dev1/ai7" in tab.trigger_status.text()
+        assert "laser1_trigger" in tab.trigger_status.text()
 
         trigger.setChecked(True)
         qapp.processEvents()
@@ -1463,8 +1487,48 @@ def test_the_board_trigger_status_follows_a_newly_loaded_plan(qapp):
         monitor.load_configuration(planned)
         qapp.processEvents()
 
-        assert "Reading Dev1/ai7" in tab.trigger_status.text()
+        assert "not in the NI-DAQ acquisition plan" not in tab.trigger_status.text()
+        assert "Dev1/ai7" in tab.trigger_status.text()
         assert tab._trace_signal_checkboxes["trigger"].isEnabled()
+    finally:
+        content.on_close()
+        content.deleteLater()
+        monitor.close()
+        laser.close()
+
+
+def test_the_board_trigger_status_says_what_the_readback_is_doing(qapp):
+    # It said "Reading X. Enable it under Signals." whatever the stream was
+    # doing and whether or not the box was already ticked, and it was not
+    # rewritten when the stream started or stopped.
+    laser, app_model = _laser_content_with_trigger_readback()
+    monitor = app_model.nidaq_signal_monitor
+    content = LaserControlContent(app_model)
+    try:
+        tab = content._channel_tabs[0]
+        trigger = tab._trace_signal_checkboxes["trigger"]
+        status = tab.trigger_status
+        assert not monitor.is_running
+        assert "Dev1/ai7" in status.text() and "stopped" in status.text()
+        assert "Tick" not in status.text() and "Showing" not in status.text()
+
+        _running(monitor)
+        qapp.processEvents()
+        assert "Reading Dev1/ai7" in status.text()
+        assert "Tick Board trigger readback" in status.text()
+
+        trigger.setChecked(True)
+        qapp.processEvents()
+        assert "Showing Dev1/ai7" in status.text()
+        assert "Tick" not in status.text()
+
+        trigger.setChecked(False)
+        qapp.processEvents()
+        assert "Tick Board trigger readback" in status.text()
+
+        monitor.set_hardware_enabled(False)
+        qapp.processEvents()
+        assert "hardware is disabled" in status.text()
     finally:
         content.on_close()
         content.deleteLater()
@@ -1481,10 +1545,11 @@ def test_without_a_trigger_readback_the_board_trigger_says_what_to_set(qapp):
         assert "laser1_trigger" not in {
             item.name for item in app_model.nidaq_signal_monitor.configuration.channels
         }
-        # Edit DAQ Ports has no field for it; the system configuration does.
+        # Edit DAQ Ports has a field for it now: trigger readback input.
         for text in (tab.trigger_status.text(), trigger.toolTip()):
-            assert "triggerMonitorInput" in text
-            assert "Edit DAQ Ports" not in text
+            assert "Edit DAQ Ports" in text
+            assert "trigger readback input" in text
+            assert "triggerMonitorInput" not in text
     finally:
         content.on_close()
         content.deleteLater()

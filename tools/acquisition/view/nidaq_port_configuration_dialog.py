@@ -35,6 +35,10 @@ from tools.acquisition.model.nidaq_breakout import (
     describe_terminal,
     is_panel_terminal,
 )
+from tools.acquisition.model.nidaq_channel_plan import (
+    laser_output_lines,
+    trigger_readback_refusal,
+)
 from tools.acquisition.model.nidaq_discovery import (
     NidaqDevicePorts,
     device_name_from_channel,
@@ -57,6 +61,11 @@ _LASER_ROLES: Tuple[Tuple[str, str, str], ...] = (
     ("shutter", "shutter", "do"),
     ("laser_copy", "laser_copy", "ai"),
     ("trigger_listener", "hardware trigger input", "trigger"),
+    # The board STIM line wired back into an input, trigger_monitor_input:
+    # acquired as laserN_trigger for the laser tab's Board trigger graph. It
+    # had no field here, so it could only be set in the file, and a pin it
+    # held was still offered to the other inputs.
+    ("trigger_readback", "trigger readback input", "readback"),
 )
 
 
@@ -372,6 +381,8 @@ class NidaqPortConfigurationDialog(QDialog):
         duplicates = self._duplicate_selected_channels()
         if duplicates:
             warnings.append("Duplicate channel assignment(s): " + ", ".join(duplicates))
+        readback_refusals = self._trigger_readback_refusals()
+        warnings.extend(readback_refusals)
         # Not an error - the 68-pin connector reaches everything - but worth
         # one line, because the alternative is hunting the front panel for a
         # label that was never printed on it.
@@ -397,7 +408,7 @@ class NidaqPortConfigurationDialog(QDialog):
             self._status_label.setStyleSheet("color: #9a6700;")
         else:
             self._status_label.setStyleSheet("")
-        self._set_ok_enabled(not unsupported and not duplicates)
+        self._set_ok_enabled(not unsupported and not duplicates and not readback_refusals)
         self._status_label.setText(status)
 
     def _selected_channels_off_the_block(self) -> Tuple[str, ...]:
@@ -563,11 +574,11 @@ class NidaqPortConfigurationDialog(QDialog):
                 diode_input=values["diode"],
                 shutter_output=values["shutter"],
                 command_copy_input=values["laser_copy"],
+                trigger_monitor_input=values["trigger_readback"],
             )
             # Only the roles this dialog edits. Rebuilding the channel field by
             # field dropped every field it did not list, so each save erased
-            # trigger_route_source, trigger_monitor_input and the board
-            # trigger wiring.
+            # trigger_route_source and the board trigger wiring.
             channels.append(
                 LaserChannelConfiguration(channel_id=LaserChannelId(laser_index), **mapped)
                 if previous is None
@@ -616,6 +627,9 @@ class NidaqPortConfigurationDialog(QDialog):
             return device.digital_outputs
         if kind == "di":
             return device.digital_inputs
+        if kind == "readback":
+            # What the input stream can acquire: a PFI terminal cannot be.
+            return tuple(dict.fromkeys(device.analog_inputs + device.digital_inputs))
         if kind == "trigger":
             return tuple(
                 terminal
@@ -700,7 +714,9 @@ class NidaqPortConfigurationDialog(QDialog):
         combo.blockSignals(True)
         try:
             combo.clear()
-            combo.addItem("", None)
+            # Optional, and most rigs leave it unset, so the empty entry says
+            # so rather than looking like a field nobody filled in.
+            combo.addItem("(none)" if self._combo_kinds.get(combo) == "readback" else "", None)
             for option in options:
                 text, hint = self._option_text(option)
                 combo.addItem(text, option)
@@ -750,6 +766,24 @@ class NidaqPortConfigurationDialog(QDialog):
             duplicates.append(f"{value} ({', '.join(roles)})")
         return duplicates
 
+    def _trigger_readback_refusals(self) -> List[str]:
+        """The acquisition plan's own refusals of the readbacks picked here.
+
+        The other laser inputs and the shutters are fields of this dialog, so
+        its duplicate check covers them; the output lines it does not edit
+        are taken from the configuration.
+        """
+        outputs = laser_output_lines(self._configuration.laser, shutters=False)
+        refusals = []
+        for laser_index, combos in self._laser_combos.items():
+            terminal = self._combo_selections[combos["trigger_readback"]]
+            if terminal is None:
+                continue
+            refusal = trigger_readback_refusal(laser_index, terminal, outputs)
+            if refusal:
+                refusals.append(refusal)
+        return refusals
+
     def _validate_selected_channel_assignments(self, device: NidaqDevicePorts) -> None:
         unsupported = self._unsupported_selected_channels(device)
         if unsupported:
@@ -760,6 +794,9 @@ class NidaqPortConfigurationDialog(QDialog):
         duplicates = self._duplicate_selected_channels()
         if duplicates:
             raise ValueError("Duplicate channel assignment(s) are not allowed: " + ", ".join(duplicates))
+        readback_refusals = self._trigger_readback_refusals()
+        if readback_refusals:
+            raise ValueError("; ".join(readback_refusals))
 
     def _infer_configured_device_name(self) -> Optional[str]:
         channels = []
@@ -799,6 +836,7 @@ class NidaqPortConfigurationDialog(QDialog):
                 "shutter": None if channel is None else channel.shutter_output,
                 "laser_copy": None if channel is None else channel.command_copy_input,
                 "trigger_listener": next(trigger_inputs, None),
+                "trigger_readback": None if channel is None else channel.trigger_monitor_input,
             }
             for attr_name, value in values.items():
                 self._combo_selections[combos[attr_name]] = value
