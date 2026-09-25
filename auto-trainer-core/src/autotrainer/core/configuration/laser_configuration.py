@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+import re
 from typing import ClassVar, Iterable, Optional, Tuple, Union
 
 import yaml
@@ -19,6 +20,55 @@ class LaserChannelId(enum.IntEnum):
 
 def normalize_laser_channel_id(value: Union[LaserChannelId, int]) -> LaserChannelId:
     return value if isinstance(value, LaserChannelId) else LaserChannelId(int(value))
+
+
+#: One PXI backplane trigger line, as the last part of a terminal's name.
+_BACKPLANE_LINE = re.compile(r"^pxi_trig\d+$")
+
+#: What to do about a trigger on the backplane clock line.
+BACKPLANE_CLOCK_LINE_REMEDY = "choose a different trigger line or backplaneClockLine"
+
+
+def backplane_line_of(terminal: Optional[str]) -> Optional[str]:
+    """The PXI_Trig line `terminal` names, lower-cased, or None for any other.
+
+    The device is ignored: every board in the chassis names the same bussed
+    line as its own, so /PXI1Slot4/PXI_Trig0 and /PXI1Slot5/pxi_trig0 are one
+    line.
+    """
+    tail = str(terminal or "").strip().strip("/").rsplit("/", 1)[-1].lower()
+    return tail if _BACKPLANE_LINE.match(tail) else None
+
+
+def backplane_clock_line_clashes(
+    backplane_clock_line: str,
+    channels: Iterable["LaserChannelConfiguration"],
+    trigger_listener_inputs: Iterable[str],
+) -> Tuple[str, ...]:
+    """Each trigger that takes the backplane clock line, as one refusal each.
+
+    A channel's trigger_source is the line its trigger rides on, and
+    NidaqLaserController._connect_trigger_route drives exactly that line,
+    named on the route source's board; the route source itself is only read,
+    so it is not compared. A trigger listener input is watched on its line.
+    Either on the clock's line puts a second driver there.
+    """
+    clock = backplane_line_of(backplane_clock_line)
+    if clock is None:
+        return tuple()
+    shown = str(backplane_clock_line).strip().strip("/").rsplit("/", 1)[-1]
+    clashes = []
+    for channel in channels:
+        if backplane_line_of(channel.trigger_source) == clock:
+            clashes.append(
+                f"laser {int(channel.channel_id)} triggerSource "
+                f"{channel.trigger_source} uses {shown}, the backplaneClockLine")
+    for terminal in trigger_listener_inputs:
+        if backplane_line_of(terminal) == clock:
+            clashes.append(
+                f"triggerListenerInputs {terminal} uses {shown}, the "
+                "backplaneClockLine")
+    return tuple(clashes)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -102,8 +152,9 @@ class LaserSystemConfiguration:
     trigger_listener_inputs: Tuple[str, ...] = tuple()
     #: Backplane line the shared sample clock is driven onto when a laser's
     #: output sits on a different board from the clock producer. Only used in
-    #: that case, and distinct from whatever line the stimulus trigger takes,
-    #: which each channel names through trigger_source.
+    #: that case, and never a line a trigger takes (backplane_clock_line_clashes):
+    #: two drivers on one line corrupt both, and DAQmx does not see it across
+    #: christielab10's boards.
     backplane_clock_line: str = "PXI_Trig1"
 
     def __post_init__(self):
@@ -124,6 +175,10 @@ class LaserSystemConfiguration:
             raise ValueError("hardware_timed laser output requires sample_rate_hz")
         if any(not value for value in self.trigger_listener_inputs):
             raise ValueError("trigger_listener_inputs cannot contain empty channel names")
+        clashes = backplane_clock_line_clashes(
+            self.backplane_clock_line, self.channels, self.trigger_listener_inputs)
+        if clashes:
+            raise ValueError("; ".join(clashes) + "; " + BACKPLANE_CLOCK_LINE_REMEDY)
 
     @classmethod
     def from_channels(

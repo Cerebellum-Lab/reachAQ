@@ -350,6 +350,102 @@ def test_laser_trigger_selector_only_offers_external_trigger_terminals(qapp):
     assert "/Dev1/ai/SampleClock" not in values
 
 
+def _backplane_device():
+    # Backplane lines as DAQmx names them: PXI_Trig, with the underscore.
+    return NidaqDevicePorts(
+        name="Dev1",
+        analog_outputs=("Dev1/ao0",),
+        analog_inputs=("Dev1/ai0", "Dev1/ai1"),
+        digital_outputs=("Dev1/port0/line4",),
+        terminals=("/Dev1/PFI0", "/Dev1/PXI_Trig0", "/Dev1/PXI_Trig1",
+                   "/Dev1/PXI_Trig2", "/Dev1/ai/SampleClock"),
+    )
+
+
+def _backplane_config(**laser):
+    config = SystemConfiguration()
+    config.laser = LaserSystemConfiguration(
+        channels=(LaserChannelConfiguration(
+            channel_id=1,
+            analog_output="Dev1/ao0",
+            diode_input="Dev1/ai0",
+            shutter_output="Dev1/port0/line4",
+            command_copy_input="Dev1/ai1",
+            trigger_source="/Dev1/PXI_Trig0",
+        ),),
+        **laser,
+    )
+    return config
+
+
+def test_the_trigger_input_offers_the_boards_pxi_trig_lines(qapp):
+    # The filter looked for "pxitrig", which no DAQmx terminal is called, so
+    # the PXI_Trig lines christielab10's trigger inputs use were never offered.
+    dialog = NidaqPortConfigurationDialog(_backplane_config(), devices=(_backplane_device(),))
+
+    values = _combo_values(dialog._laser_combos[1]["trigger_listener"])
+
+    assert {"/Dev1/PFI0", "/Dev1/PXI_Trig0", "/Dev1/PXI_Trig2"} <= set(values)
+    assert "/Dev1/ai/SampleClock" not in values
+
+
+def test_a_trigger_input_on_the_backplane_clock_line_is_refused_in_the_dialog(qapp):
+    config = _backplane_config(backplane_clock_line="PXI_Trig2")
+    dialog = NidaqPortConfigurationDialog(config, devices=(_backplane_device(),))
+    assert _ok_enabled(dialog)
+
+    _set_combo_value(dialog._laser_combos[1]["trigger_listener"], "/Dev1/PXI_Trig2")
+
+    status = dialog._status_label.text()
+    assert ("triggerListenerInputs /Dev1/PXI_Trig2 uses PXI_Trig2, the "
+            "backplaneClockLine; choose a different trigger line or "
+            "backplaneClockLine") in status
+    assert not _ok_enabled(dialog)
+    dialog.accept()
+    assert dialog.result() != QDialog.DialogCode.Accepted
+    # Refused whole: nothing the dialog would save has changed.
+    assert dialog.laser_configuration == config.laser
+
+    _set_combo_value(dialog._laser_combos[1]["trigger_listener"], "/Dev1/PXI_Trig0")
+    assert _ok_enabled(dialog)
+
+
+def test_a_save_keeps_the_backplane_clock_line(qapp):
+    # The dialog rebuilt the laser configuration from its channels, and
+    # backplaneClockLine went back to PXI_Trig1: a save moved the shared
+    # clock, here onto the line this trigger input takes.
+    config = _backplane_config(backplane_clock_line="PXI_Trig2",
+                               trigger_listener_inputs=("/Dev1/PXI_Trig1",))
+    dialog = NidaqPortConfigurationDialog(config, devices=(_backplane_device(),))
+    assert _ok_enabled(dialog)
+
+    dialog.accept()
+
+    assert dialog.result() == QDialog.DialogCode.Accepted
+    assert dialog.laser_configuration == config.laser
+
+
+def test_a_refused_trigger_input_changes_nothing_in_the_application(
+    qapp, nidaq_app, system_config, trainer_config_dir,
+):
+    system_config.laser = _backplane_config().laser
+    system_config.save_default(trainer_config_dir)
+    assert nidaq_app.load_configuration() is True
+    laser_before = nidaq_app.laser.configuration
+    stored_before = nidaq_app.loaded_configuration.laser
+    dialog = NidaqPortConfigurationDialog(
+        nidaq_app.loaded_configuration, devices=(_backplane_device(),))
+
+    _set_combo_value(dialog._laser_combos[1]["trigger_listener"], "/Dev1/PXI_Trig1")
+    dialog.accept()
+
+    assert dialog.result() != QDialog.DialogCode.Accepted
+    assert nidaq_app.laser.configuration == laser_before
+    assert nidaq_app.loaded_configuration.laser == stored_before
+    saved = nidaq_app.get_config_from_location(nidaq_app.get_config_location())
+    assert saved.laser == stored_before
+
+
 def test_a_contradictory_timing_configuration_cannot_be_built(qapp):
     """C5. Most combinations of these four settings mean nothing.
 
