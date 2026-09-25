@@ -7,7 +7,6 @@ import pyqtgraph as pg
 from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot, Qt
 from PySide6.QtWidgets import (
     QCheckBox,
-    QComboBox,
     QDoubleSpinBox,
     QGridLayout,
     QFrame,
@@ -43,10 +42,16 @@ from tools.acquisition.model.laser_plot_process import LaserPlotFrame, LaserPlot
 from tools.acquisition.model.nidaq_signal_monitor_model import NidaqSignalMonitorModel
 from tools.acquisition.model.trial_action import LaserPulseProfile
 from tools.acquisition.view.compact_panel import (
+    FIELD_MAXIMUM_WIDTH,
+    WIDE_FIELD_MAXIMUM_WIDTH,
     CollapsibleSection,
     ElidedLabel,
+    compact_button_style_sheet,
+    compact_combo_box,
     compact_font_style_sheet,
     compact_plot_axes,
+    field_grid,
+    form_label,
 )
 from tools.acquisition.view.pulse_builder_tab import DRAFT_PROFILE_ID, PulseBuilderTab
 from tools.acquisition.view.stream_graph_style import (
@@ -78,12 +83,6 @@ _TRACE_SIGNALS_EXPLANATION = (
 # (440 x 860 px on christielab10's 1920x1080 screen) with no scroll bar.
 _TRACE_PLOT_MINIMUM_HEIGHT = 140
 _TRIGGER_PLOT_HEIGHT = 76
-#: Past these, a field only gets emptier; the extra width goes to the graphs.
-_FIELD_MAXIMUM_WIDTH = 170
-_WIDE_FIELD_MAXIMUM_WIDTH = 400
-#: Grid field columns grow first; an empty last column takes what is left
-#: once the fields reach their maximum width.
-_FIELD_COLUMN_STRETCH = 10
 
 
 def _nidaq_channel_kind(physical_channel: str) -> str:
@@ -162,7 +161,7 @@ class _LaserChannelTab(QWidget):
             "#LaserChannelTab QSpinBox:disabled,"
             "#LaserChannelTab QDoubleSpinBox:disabled,"
             "#LaserChannelTab QComboBox:disabled {color: #4f5965; background-color: #edf0f3;}"
-            "#LaserChannelTab QPushButton {min-height: 18px; padding: 1px 8px;}"
+            + compact_button_style_sheet("LaserChannelTab")
         )
 
         layout = QVBoxLayout(self)
@@ -228,14 +227,14 @@ class _LaserChannelTab(QWidget):
         # and shutter options below, Test stim by the route chosen beside it.
         # A new tab picks "(none)", so a laser only fires what someone chose
         # for it, never whatever happens to be on the builder.
-        self.stim_profile_selector = self._make_combo_box()
+        self.stim_profile_selector = compact_combo_box()
         self.stim_profile_selector.setToolTip(
             "The Pulse Builder draft and every saved laser profile; any of "
             "them can fire on this laser"
         )
         self._profile_summary = ElidedLabel("")
         self._profile_summary.setObjectName("LaserPreviewStatus")
-        self._trigger_mode = self._make_combo_box()
+        self._trigger_mode = compact_combo_box()
         self._trigger_mode.addItems(("internal", "external"))
         self._trigger_mode.setToolTip(
             "internal: start on the NI clock when Run Pulse is pressed; "
@@ -249,7 +248,7 @@ class _LaserChannelTab(QWidget):
         self._trigger_source = QLineEdit(channel.trigger_source or "")
         self._trigger_source.setPlaceholderText("NI-DAQ trigger route")
         self._trigger_source.setToolTip("The terminal an external trigger edge arrives on")
-        self._trigger_edge = self._make_combo_box()
+        self._trigger_edge = compact_combo_box()
         self._trigger_edge.addItems(("rising", "falling"))
         self._trigger_edge.setToolTip("Which edge of an external trigger starts the pulse")
 
@@ -266,7 +265,7 @@ class _LaserChannelTab(QWidget):
         profile_row.setContentsMargins(0, 0, 0, 0)
         profile_row.setSpacing(4)
         profile_row.addWidget(self._form_label("Profile:"))
-        self.stim_profile_selector.setMaximumWidth(_WIDE_FIELD_MAXIMUM_WIDTH)
+        self.stim_profile_selector.setMaximumWidth(WIDE_FIELD_MAXIMUM_WIDTH)
         profile_row.addWidget(self.stim_profile_selector, stretch=1)
         profile_row.addStretch(0)
         pulse_page_layout.addLayout(profile_row)
@@ -284,7 +283,7 @@ class _LaserChannelTab(QWidget):
         trigger_row.addWidget(self._form_label("Edge:"))
         trigger_row.addWidget(self._trigger_edge)
         trigger_row.addWidget(self._form_label("Source:"))
-        self._trigger_source.setMaximumWidth(_WIDE_FIELD_MAXIMUM_WIDTH)
+        self._trigger_source.setMaximumWidth(WIDE_FIELD_MAXIMUM_WIDTH)
         trigger_row.addWidget(self._trigger_source, stretch=1)
         trigger_row.addStretch(0)
         run_layout.addLayout(trigger_row)
@@ -307,7 +306,7 @@ class _LaserChannelTab(QWidget):
         # stim fires the same profile the way a trial does: arm the output,
         # then start it by the route chosen here - the board's timed STIM
         # pulse into this laser's trigger terminal, or a software start.
-        self._stim_route = self._make_combo_box()
+        self._stim_route = compact_combo_box()
         self._stim_route.setToolTip(
             "How Test stim starts the profile on this laser")
         self._refresh_stim_route_options()
@@ -326,7 +325,7 @@ class _LaserChannelTab(QWidget):
         stim_row.setContentsMargins(0, 0, 0, 0)
         stim_row.setSpacing(4)
         stim_row.addWidget(self._form_label("Route:"))
-        self._stim_route.setMaximumWidth(_WIDE_FIELD_MAXIMUM_WIDTH)
+        self._stim_route.setMaximumWidth(WIDE_FIELD_MAXIMUM_WIDTH)
         stim_row.addWidget(self._stim_route, stretch=1)
         stim_row.addStretch(0)
         stim_row.addWidget(self.stim_test_button)
@@ -335,10 +334,6 @@ class _LaserChannelTab(QWidget):
         pulse_page_layout.addWidget(stim_section)
 
         ramp_section = self._add_section("calibration_ramp", "Calibration ramp")
-        ramp_layout = QGridLayout(ramp_section.content)
-        ramp_layout.setContentsMargins(4, 0, 2, 2)
-        ramp_layout.setHorizontalSpacing(4)
-        ramp_layout.setVerticalSpacing(2)
 
         self._ramp_start = self._make_voltage_spinbox(channel)
         self._ramp_start.setValue(channel.minimum_command_volts)
@@ -353,18 +348,10 @@ class _LaserChannelTab(QWidget):
         self._ramp_pmt = self._make_checkbox("PMT shutter")
         self._run_ramp_button = QPushButton("Run Ramp")
 
-        for row, column, text, field in (
-            (0, 0, "Start:", self._ramp_start),
-            (0, 2, "Stop:", self._ramp_stop),
-            (1, 0, "Steps:", self._ramp_steps),
-            (1, 2, "Samples/step:", self._ramp_samples_per_step),
-        ):
-            field.setMaximumWidth(_FIELD_MAXIMUM_WIDTH)
-            ramp_layout.addWidget(self._form_label(text), row, column)
-            ramp_layout.addWidget(field, row, column + 1)
-        ramp_layout.setColumnStretch(1, _FIELD_COLUMN_STRETCH)
-        ramp_layout.setColumnStretch(3, _FIELD_COLUMN_STRETCH)
-        ramp_layout.setColumnStretch(4, 1)
+        ramp_layout = field_grid(ramp_section.content, (
+            ("Start:", self._ramp_start), ("Stop:", self._ramp_stop),
+            ("Steps:", self._ramp_steps), ("Samples/step:", self._ramp_samples_per_step),
+        ))
         ramp_layout.addWidget(self._ramp_pmt, 2, 0, 1, 2)
         ramp_layout.addWidget(
             self._run_ramp_button, 2, 3, 1, 2, alignment=Qt.AlignmentFlag.AlignRight)
@@ -482,7 +469,7 @@ class _LaserChannelTab(QWidget):
             ("Y min:", self._trace_min_volts),
             ("Y max:", self._trace_max_volts),
         ):
-            spinbox.setMaximumWidth(_FIELD_MAXIMUM_WIDTH)
+            spinbox.setMaximumWidth(FIELD_MAXIMUM_WIDTH)
             spinbox.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             trace_view_row.addWidget(self._form_label(text))
             trace_view_row.addWidget(spinbox, stretch=1)
@@ -740,21 +727,7 @@ class _LaserChannelTab(QWidget):
             self._set_parent_status(str(exc) or exc.__class__.__name__, True)
         self.refresh_signal_selections()
 
-    @staticmethod
-    def _form_label(text: str) -> QLabel:
-        label = QLabel(text)
-        label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        return label
-
-    @staticmethod
-    def _make_combo_box() -> QComboBox:
-        # Sized to a few characters rather than its longest entry, which for
-        # a board route or a long profile name widened the whole panel.
-        combo_box = QComboBox()
-        combo_box.setSizeAdjustPolicy(
-            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-        combo_box.setMinimumContentsLength(6)
-        return combo_box
+    _form_label = staticmethod(form_label)
 
     def _add_section(
         self, name: str, title: str, *, expanded: bool = True, stretch: bool = False,
