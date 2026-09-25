@@ -397,14 +397,13 @@ class _LaserChannelTab(QWidget):
         self._trace_plot.setMinimumHeight(140)
         trace_stream_layout.addWidget(self._trace_plot, stretch=1)
         self._trace_legend = StreamGraphLegend(columns=1, parent=self._trace_stream_page)
-        self._trace_legend.set_entries(
-            (
-                ("Command output", _COMMAND_TRACE_COLOR, False),
-                ("Diode feedback", _DIODE_TRACE_COLOR, False),
-                ("Command copy", _COMMAND_COPY_TRACE_COLOR, False),
-                ("Board trigger", _TRIGGER_TRACE_COLOR, False),
-            )
-        )
+        # Filled by _apply_curve_visibility with the curves that are shown.
+        self._trace_legend_entries = {
+            "command": ("Command output", _COMMAND_TRACE_COLOR, False),
+            "diode": ("Diode feedback", _DIODE_TRACE_COLOR, False),
+            "copy": ("Command copy", _COMMAND_COPY_TRACE_COLOR, False),
+            "trigger": ("Board trigger", _TRIGGER_TRACE_COLOR, False),
+        }
         trace_stream_layout.addWidget(self._trace_legend)
         trace_actions = QGridLayout()
         trace_actions.setContentsMargins(0, 0, 0, 0)
@@ -460,8 +459,9 @@ class _LaserChannelTab(QWidget):
         trace_signals_layout.setContentsMargins(8, 8, 8, 8)
         trace_signals_layout.setSpacing(8)
         trace_signals_explanation = QLabel(
-            "Choose the signals displayed in this laser's output stream. NI-DAQ inputs are "
-            "available only after their ports are assigned in Edit → Edit DAQ Ports."
+            "Choose the signals displayed in this laser's output stream; a change "
+            "shows at once, while the stream runs. NI-DAQ inputs are available only "
+            "after their ports are assigned in Edit → Edit DAQ Ports."
         )
         trace_signals_explanation.setWordWrap(True)
         trace_signals_layout.addWidget(trace_signals_explanation)
@@ -470,10 +470,17 @@ class _LaserChannelTab(QWidget):
         trace_options_layout = QVBoxLayout(trace_options)
         trace_options_layout.setContentsMargins(0, 0, 0, 0)
         trace_options_layout.setSpacing(8)
-        self._trace_command_checkbox = QCheckBox("Command output (always shown)")
+        # Optional like the rest. It was ticked and greyed out, "always
+        # shown", and Ben asked on 2026-09-24 for the laser command traces to
+        # be uncheckable. Not an NI-DAQ input, so its choice is kept by
+        # LaserControlContent across tab rebuilds rather than in
+        # nidaqStream.displayChannels.
+        self._trace_command_checkbox = QCheckBox("Command output")
         color_code_checkbox(self._trace_command_checkbox, _COMMAND_TRACE_COLOR)
         self._trace_command_checkbox.setChecked(True)
-        self._trace_command_checkbox.setEnabled(False)
+        self._trace_command_checkbox.setToolTip(
+            "The command waveform a pulse or ramp sends to this laser"
+        )
         trace_options_layout.addWidget(self._trace_command_checkbox)
 
         self._trace_signal_candidates = {
@@ -553,6 +560,7 @@ class _LaserChannelTab(QWidget):
         self._trace_min_volts.valueChanged.connect(self._apply_trace_view)
         self._trace_max_volts.valueChanged.connect(self._apply_trace_view)
         self._apply_trace_view()
+        self._trace_command_checkbox.toggled.connect(self._apply_curve_visibility)
         for key, checkbox in self._trace_signal_checkboxes.items():
             checkbox.toggled.connect(
                 lambda checked, signal_key=key: self._trace_signal_selection_changed(
@@ -604,48 +612,81 @@ class _LaserChannelTab(QWidget):
             scale=scale,
         )
 
+    def _acquired_channel(self, signal_key: str) -> Optional[NidaqSignalChannelConfiguration]:
+        """The acquired stream channel behind this input, found by its pin.
+
+        By pin rather than by the candidate's name, as configure_laser_plot
+        finds what to plot. The board trigger readback is not in the plan the
+        ports build, and ticking it named a channel the stream did not have,
+        which the selection refused with an exception.
+        """
+        candidate = self._trace_signal_candidates.get(signal_key)
+        if candidate is None:
+            return None
+        return next(
+            (
+                channel
+                for channel in self._app_model.nidaq_signal_monitor.configuration.channels
+                if channel.physical_channel == candidate.physical_channel
+            ),
+            None,
+        )
+
     def refresh_signal_selections(self) -> None:
         monitor = self._app_model.nidaq_signal_monitor
-        configured_by_name = {
-            channel.name: channel
-            for channel in monitor.configuration.channels
-        }
         displayed_names = set(monitor.configuration.display_channels)
         for key, checkbox in self._trace_signal_checkboxes.items():
             candidate = self._trace_signal_candidates[key]
-            selected = candidate is not None and candidate.name in displayed_names
+            acquired = self._acquired_channel(key)
+            selected = acquired is not None and acquired.name in displayed_names
             checkbox.blockSignals(True)
             checkbox.setChecked(selected)
             checkbox.blockSignals(False)
-            checkbox.setEnabled(
-                candidate is not None
-                and monitor.hardware_enabled
-                and not monitor.is_starting
-            )
+            # Editable while the stream runs or starts: the plot process
+            # buffers every acquired input, so a tick only shows or hides it.
+            checkbox.setEnabled(acquired is not None and monitor.hardware_enabled)
             channel_tooltip = "" if candidate is None else f"{candidate.physical_channel}\n"
             if candidate is None:
                 checkbox.setToolTip("Assign this input in Edit → Edit DAQ Ports first.")
+            elif acquired is None:
+                checkbox.setToolTip(
+                    channel_tooltip
+                    + "This input is not in the NI-DAQ acquisition plan, so there is "
+                    "nothing to plot."
+                )
             elif not monitor.hardware_enabled:
                 checkbox.setToolTip(
                     channel_tooltip + "NI-DAQ hardware is disabled in the system configuration."
                 )
-            elif monitor.is_starting:
-                checkbox.setToolTip(
-                    channel_tooltip + "Wait for the shared NI-DAQ stream to finish starting."
-                )
-            elif selected and configured_by_name[candidate.name].physical_channel != candidate.physical_channel:
-                checkbox.setToolTip(
-                    channel_tooltip
-                    + "The saved input uses an older port mapping. Toggle this option to apply the current mapping."
-                )
-            elif monitor.is_running:
-                checkbox.setToolTip(
-                    channel_tooltip + "Changing this option restarts the shared NI-DAQ input worker."
-                )
             else:
                 checkbox.setToolTip(
-                    channel_tooltip + "Include this input in this laser's streaming graph."
+                    channel_tooltip
+                    + "Show or hide this input on this laser's graph. It is recorded either way."
                 )
+        self._apply_curve_visibility()
+
+    @property
+    def command_trace_visible(self) -> bool:
+        return self._trace_command_checkbox.isChecked()
+
+    def set_command_trace_visible(self, visible: bool) -> None:
+        self._trace_command_checkbox.setChecked(bool(visible))
+
+    def _curve_visible(self, curve_name: str) -> bool:
+        if curve_name == "command":
+            return self._trace_command_checkbox.isChecked()
+        return self._trace_signal_checkboxes[curve_name].isChecked()
+
+    def _apply_curve_visibility(self, *_args) -> None:
+        """Show the ticked curves. Their data is kept either way, so one
+        ticked again shows its history at once."""
+        for curve_name, curve in self._trace_curves.items():
+            curve.setVisible(self._curve_visible(curve_name))
+        self._trace_legend.set_entries(
+            entry
+            for curve_name, entry in self._trace_legend_entries.items()
+            if self._curve_visible(curve_name)
+        )
 
     def refresh_stream_status(self) -> None:
         """The shared stream's state, then what the latest pulse or ramp did."""
@@ -657,18 +698,24 @@ class _LaserChannelTab(QWidget):
         self._trace_status.setToolTip(monitor.error_message or monitor.status_message)
 
     def _trace_signal_selection_changed(self, signal_key: str, checked: bool) -> None:
-        candidate = self._trace_signal_candidates.get(signal_key)
-        if candidate is None:
+        acquired = self._acquired_channel(signal_key)
+        if acquired is None:
+            self.refresh_signal_selections()
             return
         configuration = self._app_model.nidaq_signal_monitor.configuration
         channel_names = [
             name
             for name in configuration.display_channels
-            if name != candidate.name
+            if name != acquired.name
         ]
         if checked:
-            channel_names.append(candidate.name)
-        self._app_model.update_nidaq_signal_stream_channels(channel_names)
+            channel_names.append(acquired.name)
+        try:
+            self._app_model.update_nidaq_signal_stream_channels(channel_names)
+        except Exception as exc:
+            # Refused, for one before any configuration is loaded; the box
+            # goes back to what is saved rather than claiming a change.
+            self._set_parent_status(str(exc) or exc.__class__.__name__, True)
         self.refresh_signal_selections()
 
     @staticmethod
@@ -843,6 +890,13 @@ class _LaserChannelTab(QWidget):
                 "No trigger readback input is configured for this laser. Wire the "
                 "board stimulus line into an NI input and set it in Edit DAQ Ports "
                 "to see the edge that starts the waveform."
+            )
+            return
+        if self._acquired_channel("trigger") is None:
+            self.trigger_status.setText(
+                "{} is set as this laser's trigger readback but is not in the "
+                "NI-DAQ acquisition plan, so it cannot be shown.".format(
+                    candidate.physical_channel)
             )
             return
         self.trigger_status.setText(
@@ -1173,8 +1227,6 @@ class LaserControlContent(ContentWidget):
         if property_name in (
             NidaqSignalMonitorModel.CONFIGURATION,
             NidaqSignalMonitorModel.HARDWARE_ENABLED,
-            NidaqSignalMonitorModel.IS_STARTING,
-            NidaqSignalMonitorModel.IS_RUNNING,
         ):
             for tab in self._channel_tabs:
                 tab.refresh_signal_selections()
@@ -1306,6 +1358,12 @@ class LaserControlContent(ContentWidget):
             tab.channel_id_value: tab.stim_profile_selector.currentData()
             for tab in self._channel_tabs
         }
+        # Likewise whether each laser's command trace is shown; the inputs'
+        # choices survive in nidaqStream.displayChannels.
+        command_shown = {
+            tab.channel_id_value: tab.command_trace_visible
+            for tab in self._channel_tabs
+        }
         self._clear_tabs()
         self._builder.set_amplitude_range(*self._amplitude_range(configuration))
         if self._tabs.indexOf(self._builder) < 0:
@@ -1331,6 +1389,7 @@ class LaserControlContent(ContentWidget):
                 draft_provider=self._builder.draft_profile,
             )
             tab.select_profile(picked_profiles.get(channel_index))
+            tab.set_command_trace_visible(command_shown.get(channel_index, True))
             self._tabs.addTab(tab, f"Laser {channel_index}")
             tabs.append(tab)
         self._channel_tabs = tuple(tabs)

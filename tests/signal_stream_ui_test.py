@@ -844,13 +844,18 @@ def test_laser_trace_auto_resumes_and_displays_entire_calibration_ramp(qapp):
         assert tab._trace_plot.minimumSize().isEmpty()
         assert tab._trace_plot.sizePolicy().verticalPolicy() == QSizePolicy.Policy.Ignored
         assert tab.minimumSizeHint().width() < 430
+        # The legend names what is drawn: the command, and whichever inputs
+        # are ticked under Signals, which here is none yet.
+        assert tuple(entry[0] for entry in tab._trace_legend.entries) == (
+            "Command output",
+        )
+        tab._trace_signal_checkboxes["diode"].setChecked(True)
+        tab._trace_signal_checkboxes["copy"].setChecked(True)
+        qapp.processEvents()
         assert tuple(entry[0] for entry in tab._trace_legend.entries) == (
             "Command output",
             "Diode feedback",
             "Command copy",
-            # The board stimulus line read back. It is drawn on its own plot
-            # beneath this one, but shares the legend and the time base.
-            "Board trigger",
         )
         assert all(
             curve.opts["pen"].style().name == "SolidLine"
@@ -1119,6 +1124,93 @@ def test_the_analysis_card_has_no_stream_button_and_names_the_stream_state(qapp)
         content.deleteLater()
 
 
+@pytest.mark.parametrize("starting", [False, True], ids=["running", "starting"])
+def test_analysis_selections_stay_editable_while_the_stream_runs(qapp, starting):
+    monitor = NidaqSignalMonitorModel()
+    monitor._configuration = _stream_configuration()
+    monitor._hardware_enabled = True
+    app_model = _AnalysisAppStub(monitor)
+    content = AnalysisContent(app_model)
+    try:
+        _running(monitor, starting=starting)
+        qapp.processEvents()
+
+        for key in ("cam_frames", "tone1", "tone2"):
+            checkbox = content._signal_checkboxes[key]
+            assert checkbox.isEnabled(), key
+            assert "Stop the NI-DAQ stream" not in checkbox.toolTip()
+        # Unmapped ports still say why they cannot be ticked.
+        barcode = content._signal_checkboxes["barcode"]
+        assert not barcode.isEnabled()
+        assert "Edit DAQ Ports" in barcode.toolTip()
+
+        content._signal_checkboxes["tone1"].setChecked(True)
+        qapp.processEvents()
+        assert monitor.configuration.display_channels == ("cam_frames", "tone1")
+    finally:
+        content.on_close()
+        content.deleteLater()
+
+
+def test_toggling_an_analysis_signal_keeps_every_other_signals_history(qapp):
+    # Showing or hiding one line used to rebuild the plot process with the
+    # new selection, which emptied every graph and needed the stream stopped.
+    monitor = NidaqSignalMonitorModel()
+    monitor._configuration = dataclasses.replace(
+        _stream_configuration(), sample_rate_hz=1000.0,
+    )
+    monitor._hardware_enabled = True
+    content = AnalysisContent(_AnalysisAppStub(monitor))
+    content.show()
+    qapp.processEvents()
+    try:
+        _running(monitor)
+        qapp.processEvents()
+        monitor.sample_ring.write_block(
+            NidaqSignalSampleBlock(
+                wall_time=1.0,
+                perf_time=1.0,
+                sample_rate_hz=1000.0,
+                sample_index=0,
+                channels=monitor.configuration.channels,
+                values={
+                    "cam_frames": tuple(float(index % 2) for index in range(300)),
+                    "tone1": tuple(float((index // 50) % 2) for index in range(300)),
+                },
+            )
+        )
+        _wait_for_plot_snapshot(content)
+        curves = content._rolling_plot._curves
+        camera_x = np.array(curves["cam_frames"].xData)
+        assert camera_x.size
+        reconfigured = []
+        original_configure = content._plot_process.configure
+        content._plot_process.configure = lambda *args, **kwargs: (
+            reconfigured.append(args), original_configure(*args, **kwargs))
+
+        content._signal_checkboxes["tone1"].setChecked(True)
+        qapp.processEvents()
+
+        assert reconfigured == []
+        assert curves["tone1"].isVisible()
+        # Its history is there at once, with no new samples arriving.
+        assert curves["tone1"].yData is not None and len(curves["tone1"].yData)
+        assert np.array_equal(np.array(curves["cam_frames"].xData), camera_x)
+
+        content._signal_checkboxes["cam_frames"].setChecked(False)
+        qapp.processEvents()
+
+        assert reconfigured == []
+        assert not curves["cam_frames"].isVisible()
+        assert len(curves["tone1"].yData)
+        assert tuple(entry[0] for entry in content._rolling_plot._legend.entries) == (
+            "tone1 (logic)",
+        )
+    finally:
+        content.on_close()
+        content.deleteLater()
+
+
 def _laser_content_with_diode_stream():
     channel = _laser_channel()
     configuration = LaserSystemConfiguration.from_channels(
@@ -1170,3 +1262,101 @@ def test_laser_graphs_follow_the_shared_stream_without_a_button(qapp):
         content.deleteLater()
         monitor.close()
         laser.close()
+
+
+@pytest.mark.parametrize("starting", [False, True], ids=["running", "starting"])
+def test_every_laser_trace_can_be_hidden_and_shown_while_streaming(qapp, starting):
+    laser, app_model, content = _laser_content_with_diode_stream()
+    monitor = app_model.nidaq_signal_monitor
+    try:
+        _running(monitor, starting=starting)
+        qapp.processEvents()
+        tab = content._channel_tabs[0]
+        command = tab._trace_command_checkbox
+        assert command.isEnabled()
+        assert command.isChecked()
+        assert "always shown" not in command.text()
+        for key in ("diode", "copy"):
+            assert tab._trace_signal_checkboxes[key].isEnabled(), key
+
+        laser.run_pulse_train(LaserPulseTrain(
+            channel_id=LaserChannelId.LASER_1, amplitude_volts=2.0, duration_ms=10.0))
+        deadline = time.monotonic() + 5.0
+        while not len(tab._trace_data["command"][0]) and time.monotonic() < deadline:
+            content._flush_laser_plots()
+            tab.redraw_trace()
+            time.sleep(0.02)
+        command_points = len(tab._trace_data["command"][0])
+        assert command_points
+        assert tab._trace_curves["command"].isVisible()
+
+        command.setChecked(False)
+        qapp.processEvents()
+        assert not tab._trace_curves["command"].isVisible()
+        assert "Command output" not in tuple(
+            entry[0] for entry in tab._trace_legend.entries)
+
+        command.setChecked(True)
+        qapp.processEvents()
+        assert tab._trace_curves["command"].isVisible()
+        assert len(tab._trace_data["command"][0]) == command_points
+
+        diode = tab._trace_signal_checkboxes["diode"]
+        diode.setChecked(True)
+        qapp.processEvents()
+        assert tab._trace_curves["diode"].isVisible()
+        diode.setChecked(False)
+        qapp.processEvents()
+        assert not tab._trace_curves["diode"].isVisible()
+        assert "laser1_diode" not in monitor.configuration.display_channels
+    finally:
+        content.on_close()
+        content.deleteLater()
+        monitor.close()
+        laser.close()
+
+
+def test_a_hidden_command_trace_stays_hidden_when_laser_control_rebuilds(qapp):
+    laser, app_model, content = _laser_content_with_diode_stream()
+    try:
+        content._channel_tabs[0]._trace_command_checkbox.setChecked(False)
+
+        content._refresh_from_model()
+
+        rebuilt = content._channel_tabs[0]
+        assert not rebuilt._trace_command_checkbox.isChecked()
+        assert not rebuilt._trace_curves["command"].isVisible()
+        assert content._channel_tabs[1]._trace_command_checkbox.isChecked()
+    finally:
+        content.on_close()
+        content.deleteLater()
+        app_model.nidaq_signal_monitor.close()
+        laser.close()
+
+
+def test_a_laser_input_outside_the_acquisition_plan_cannot_be_ticked(qapp):
+    # The board trigger readback is not part of the acquisition plan, so
+    # ticking it named a channel the stream does not have and raised.
+    channel = dataclasses.replace(_laser_channel(), trigger_monitor_input="Dev1/ai7")
+    configuration = LaserSystemConfiguration.from_channels(
+        (channel,), backend="null", sample_rate_hz=1000.0,
+    )
+    laser = LaserModel(NullLaserController(configuration))
+    app_model = _LaserAppStub(laser)
+    tab = _LaserChannelTab(
+        app_model,
+        channel,
+        True,
+        configuration.sample_rate_hz,
+        lambda _status, operation: operation(),
+        lambda _message, _is_error: None,
+    )
+    try:
+        trigger = tab._trace_signal_checkboxes["trigger"]
+        assert not trigger.isEnabled()
+        assert "acquisition plan" in trigger.toolTip()
+        assert tab._trace_signal_checkboxes["diode"].isEnabled()
+    finally:
+        app_model.nidaq_signal_monitor.close()
+        laser.close()
+        tab.deleteLater()
