@@ -142,7 +142,9 @@ analog commands can remain on the 6713. Digital and analog inputs may share the
 6221 task; a future hardware-timed 6713 output task must join the validated
 multi-device timing topology described below.
 
-Validate configured laser tasks only after confirming the real wiring:
+Validate configured laser tasks only after confirming the real wiring, and
+with reachAQ closed: its NI-DAQ input stream runs whenever it is open, and
+holds the input lines this opens tasks on.
 
 ```bash
 cd "$HOME/Documents/reachAQ"
