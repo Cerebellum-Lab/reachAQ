@@ -14,6 +14,7 @@ import pytest
 
 from autotrainer.core import NidaqPortConfiguration
 from tools.acquisition.model import nidaq_monitor_session
+from tools.acquisition.model.app_model_status import SessionRecordingStatus
 from tools.acquisition.model.nidaq_monitor_session import NidaqMonitorSession
 from tools.acquisition.model.subsystem_status import SubsystemId, SubsystemState
 
@@ -257,7 +258,7 @@ def test_the_daq_monitor_cannot_take_the_stream_from_a_running_acquisition(
         assert monitor.is_running
         pid = _worker_pid(monitor)
 
-        with pytest.raises(RuntimeError, match="System Mode"):
+        with pytest.raises(RuntimeError, match="belongs to System Mode while it runs"):
             NidaqMonitorSession(nidaq_app)
 
         assert monitor.is_running
@@ -266,6 +267,33 @@ def test_the_daq_monitor_cannot_take_the_stream_from_a_running_acquisition(
         assert _nidaq_state(nidaq_app).state is SubsystemState.READY
     finally:
         nidaq_app.capture_stop()
+
+
+def test_the_daq_monitor_waits_for_the_last_recording_session_to_finish(
+    nidaq_app, monkeypatch,
+):
+    # In Idle, a recording session still aborting was refused as "belongs to
+    # System Mode while it runs; set System Mode to Idle first", advice an
+    # operator already in Idle cannot follow.
+    monkeypatch.setattr(nidaq_monitor_session, "NidaqSignalMonitorModel", _Stream)
+    monkeypatch.setattr(nidaq_monitor_session, "discover_nidaq_devices",
+                        lambda: ((), None))
+    assert nidaq_app.load_configuration() is True
+    monitor = _settle(nidaq_app)
+    assert monitor.is_running, "the stream did not start by itself"
+    pid = _worker_pid(monitor)
+    monkeypatch.setattr(nidaq_app._recording_session, "status",
+                        SessionRecordingStatus.ABORTING)
+
+    with pytest.raises(RuntimeError) as refused:
+        NidaqMonitorSession(nidaq_app)
+
+    message = str(refused.value)
+    assert "recording session" in message and "aborting" in message
+    assert "System Mode" not in message
+    assert monitor.is_running
+    assert _worker_pid(monitor) == pid
+    assert nidaq_app._nidaq_stream_autostart.pause_reasons == ()
 
 
 def test_saving_daq_ports_restarts_the_stream_with_the_new_plan(nidaq_app):
