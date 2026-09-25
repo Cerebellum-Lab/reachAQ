@@ -88,6 +88,9 @@ class _NidaqRollingPlot(QWidget):
         self._configuration = NidaqSignalStreamConfiguration()
         self._style_signature = tuple()
         self._curves: Dict[str, object] = {}
+        self._legend_entries: Dict[str, Tuple[str, Tuple[int, int, int], bool]] = {}
+        #: Curves shown; the others are still buffered and kept current.
+        self._visible: Set[str] = set()
         self._display_x: Dict[str, np.ndarray] = {}
         self._display_y: Dict[str, np.ndarray] = {}
         self._pixel_width = 1
@@ -111,10 +114,11 @@ class _NidaqRollingPlot(QWidget):
         self._style_signature = style_signature
         self._plot.clear()
         self._curves.clear()
+        self._legend_entries.clear()
         self._display_x.clear()
         self._display_y.clear()
         self._latest_x = 0.0
-        legend_entries = []
+        self._last_frame = None
         for index, channel in enumerate(configuration.channels):
             color = colors_by_name.get(channel.name, stream_signal_color(index))
             pen = pg.mkPen(color=color, width=2.2, style=Qt.PenStyle.SolidLine)
@@ -125,16 +129,59 @@ class _NidaqRollingPlot(QWidget):
             self._display_y[channel.name] = np.full(
                 AnalysisPlotProcess.MAX_POINTS, np.nan, dtype=np.float32,
             )
-            self._curves[channel.name] = self._plot.plot([], [], pen=pen)
-            legend_entries.append((display_name, color, False))
-        self._legend.set_entries(legend_entries)
+            curve = self._plot.plot([], [], pen=pen)
+            curve.setVisible(channel.name in self._visible)
+            self._curves[channel.name] = curve
+            self._legend_entries[channel.name] = (display_name, color, False)
+        self._visible &= set(self._curves)
+        self._show_legend()
         self._plot.getPlotItem().setClipToView(True)
         return True
+
+    def set_visible_channels(self, channel_names) -> None:
+        """Show these curves and hide the rest, keeping every curve's history.
+
+        Every plotted signal is buffered whether or not it is shown, so one
+        shown again draws its history at once, from the last frame, without
+        waiting for new samples or disturbing the others.
+        """
+        visible = {name for name in channel_names if name in self._curves}
+        if visible == self._visible:
+            return
+        shown = visible - self._visible
+        self._visible = visible
+        for channel_name, curve in self._curves.items():
+            curve.setVisible(channel_name in visible)
+        for index, channel_name in enumerate(self._curves):
+            if channel_name in shown:
+                self._draw_curve(index, channel_name)
+        self._show_legend()
+
+    def _show_legend(self) -> None:
+        self._legend.set_entries(
+            entry
+            for channel_name, entry in self._legend_entries.items()
+            if channel_name in self._visible
+        )
+
+    def _draw_curve(self, index: int, channel_name: str) -> None:
+        frame = self._last_frame
+        curve = self._curves[channel_name]
+        if frame is None:
+            curve.setData([], [])
+            return
+        point_count = frame.point_counts[index]
+        curve.setData(
+            self._display_x[channel_name][:point_count],
+            self._display_y[channel_name][:point_count],
+            skipFiniteCheck=True,
+        )
 
     def clear(self) -> None:
         for curve in self._curves.values():
             curve.setData([], [])
         self._latest_x = 0.0
+        self._last_frame = None
 
     def display_latest(self, plot_process: AnalysisPlotProcess) -> bool:
         frame = plot_process.copy_latest_into(self._display_x, self._display_y)
@@ -144,13 +191,11 @@ class _NidaqRollingPlot(QWidget):
         self._window_seconds = frame.window_seconds
         self._latest_x = frame.latest_x
         self._last_frame = frame
-        for channel_index, (channel_name, curve) in enumerate(self._curves.items()):
-            point_count = frame.point_counts[channel_index]
-            curve.setData(
-                self._display_x[channel_name][:point_count],
-                self._display_y[channel_name][:point_count],
-                skipFiniteCheck=True,
-            )
+        # Hidden curves are copied above but not handed to Qt: drawing is the
+        # cost worth saving, and _draw_curve catches one up when it is shown.
+        for index, channel_name in enumerate(self._curves):
+            if channel_name in self._visible:
+                self._draw_curve(index, channel_name)
         return True
 
     def physical_pixel_width(self) -> int:
@@ -521,35 +566,43 @@ class AnalysisContent(ContentWidget):
             self._plot_process.close()
             self._plot_process = AnalysisPlotProcess(sample_ring)
         configuration = model.configuration
+        # Not the stream's state: the checkboxes no longer depend on it.
         selector_signature = (
             configuration.channels,
             tuple(sorted(self._mapped_physical_channels())),
             model.hardware_enabled,
-            model.is_starting,
-            model.is_running,
         )
         if selector_signature != self._selector_signature:
             self._selector_signature = selector_signature
             self._rebuild_signal_selector()
-        display_configuration = self._display_configuration()
+        # The plot process is given every plottable signal, shown or not, so
+        # ticking one changes only what is drawn. Given only the ticked ones,
+        # as it was, each tick rebuilt its buffers and emptied every graph.
+        plot_configuration = self._plot_configuration()
         if (
-            self._rolling_plot.configure(display_configuration, self._channel_colors_by_name)
+            self._rolling_plot.configure(plot_configuration, self._channel_colors_by_name)
             or ring_changed
         ):
-            plot_configuration = dataclasses.replace(
-                display_configuration,
-                rolling_window_seconds=_DIGITAL_WINDOW_SECONDS,
-            )
             pixel_width = self._rolling_plot.physical_pixel_width()
             self._rolling_plot.set_pixel_width(pixel_width)
-            self._plot_process.configure(plot_configuration, pixel_width)
+            self._plot_process.configure(
+                dataclasses.replace(
+                    plot_configuration,
+                    rolling_window_seconds=_DIGITAL_WINDOW_SECONDS,
+                ),
+                pixel_width,
+            )
+        display_configuration = self._display_configuration()
+        self._rolling_plot.set_visible_channels(
+            channel.name for channel in display_configuration.channels
+        )
         self._stream_state_label.setText(model.stream_state)
         # The details stay out of the footer, which is one line; they are in
         # the Hardware panel, the log, and here on hover.
         self._stream_state_label.setToolTip(model.error_message or model.status_message)
         self._sample_rate_label.setText(f"{configuration.sample_rate_hz:g} Hz")
         self._channel_count_label.setText(str(len(display_configuration.channels)))
-        self._clear_button.setEnabled(model.hardware_enabled and bool(display_configuration.channels))
+        self._clear_button.setEnabled(model.hardware_enabled and bool(plot_configuration.channels))
         self._live_button.setEnabled(bool(display_configuration.channels))
         if not model.hardware_enabled:
             self._status_label.setText("NI-DAQ hardware is disabled")
@@ -640,10 +693,10 @@ class AnalysisContent(ContentWidget):
             checkbox = QCheckBox(f"{label} — {channel_text}")
             color_code_checkbox(checkbox, color)
             checkbox.setChecked(is_selected)
+            # Editable while the stream runs or starts: a tick only shows or
+            # hides a curve the plot process is already buffering.
             checkbox.setEnabled(
                 self._nidaq_signal_monitor.hardware_enabled
-                and not self._nidaq_signal_monitor.is_starting
-                and not self._nidaq_signal_monitor.is_running
                 and (is_mapped or is_selected)
             )
             if not physical_channel:
@@ -654,8 +707,10 @@ class AnalysisContent(ContentWidget):
                 )
             elif not self._nidaq_signal_monitor.hardware_enabled:
                 checkbox.setToolTip("NI-DAQ hardware is disabled in the system configuration.")
-            elif self._nidaq_signal_monitor.is_starting or self._nidaq_signal_monitor.is_running:
-                checkbox.setToolTip("Stop the NI-DAQ stream before changing signal selections.")
+            else:
+                checkbox.setToolTip(
+                    "Show or hide this signal on the graph. It is recorded either way."
+                )
             checkbox.toggled.connect(
                 lambda checked, candidate_key=key: self._signal_selection_changed(
                     candidate_key,
@@ -687,7 +742,29 @@ class AnalysisContent(ContentWidget):
             ]
         self._app_model.update_nidaq_signal_stream_channels(selected_names)
 
+    def _plot_configuration(self) -> NidaqSignalStreamConfiguration:
+        """Every signal this card can plot, whether or not it is ticked.
+
+        Independent of the selection on purpose, down to display_channels,
+        so that ticking a box never looks like a new plot configuration.
+        """
+        configuration = self._nidaq_signal_monitor.configuration
+        mapped_channels = self._mapped_physical_channels()
+        channels = tuple(
+            channel
+            for channel in configuration.channels
+            if channel.physical_channel in mapped_channels
+            and not self._is_laser_stream_channel(channel)
+        )
+        return dataclasses.replace(
+            configuration,
+            channels=channels,
+            display_channels=tuple(channel.name for channel in channels),
+            is_enabled=configuration.is_enabled and bool(channels),
+        )
+
     def _display_configuration(self) -> NidaqSignalStreamConfiguration:
+        """The plottable signals that are ticked, which are the ones drawn."""
         configuration = self._nidaq_signal_monitor.configuration
         mapped_channels = self._mapped_physical_channels()
         channels = tuple(
