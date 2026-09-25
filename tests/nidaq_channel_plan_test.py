@@ -342,7 +342,102 @@ def test_a_trigger_readback_that_is_not_one_input_is_refused(terminal):
 
     message = str(refused.value)
     assert "Laser 1" in message and terminal in message
-    assert "analog input" in message and "digital input line" in message
+    assert "analog input" in message and "port0 line" in message
+
+
+@pytest.mark.parametrize(
+    "terminal", ["PXI1Slot5/port1/line0", "/PXI1Slot5/port2/line7"], ids=["port1", "port2"])
+def test_a_trigger_readback_on_a_pfi_pin_line_is_refused(terminal):
+    # The stream clocks every digital input in one task, and an M Series
+    # board clocks port0 only: port1 and port2 are the static PFI pins.
+    # STIM3's /PXI1Slot5/PFI0 is PXI1Slot5/port1/line0 by another name.
+    with pytest.raises(ValueError) as refused:
+        build_nidaq_acquisition_configuration(
+            _empty_stream(),
+            NidaqPortConfiguration(),
+            _laser_with(trigger_monitor_input=terminal),
+        )
+
+    message = str(refused.value)
+    assert terminal in message
+    assert "PFI pins" in message and "port0 line" in message
+
+
+def test_a_laser_without_a_readback_drops_its_stored_trigger_channel(caplog):
+    # Choosing "(none)" in Edit DAQ Ports saved no readback, but the stored
+    # plan still held laser1_trigger on ai9, and a laser with no readback
+    # claimed neither the pin nor the name: it came back as a hidden custom
+    # input, recorded indefinitely.
+    stored = build_nidaq_acquisition_configuration(
+        _empty_stream(),
+        NidaqPortConfiguration(),
+        _laser_with(trigger_monitor_input="InputCard/ai9"),
+    )
+
+    with caplog.at_level("WARNING"):
+        result = build_nidaq_acquisition_configuration(
+            stored, NidaqPortConfiguration(), _laser_with())
+
+    assert "InputCard/ai9" not in {channel.physical_channel for channel in result.channels}
+    assert tuple(channel.name for channel in result.channels) == (
+        "laser1_diode", "laser1_command_copy")
+    warning, = [record.getMessage() for record in caplog.records
+                if "drops the stored channel" in record.getMessage()]
+    assert "laser1_trigger" in warning and "InputCard/ai9" in warning
+    assert "not set" in warning
+
+
+def test_a_dropped_stored_channel_names_where_its_role_went(caplog):
+    stored = build_nidaq_acquisition_configuration(
+        _empty_stream(),
+        NidaqPortConfiguration(),
+        _laser_with(trigger_monitor_input="InputCard/ai9"),
+    )
+
+    with caplog.at_level("WARNING"):
+        build_nidaq_acquisition_configuration(
+            stored,
+            NidaqPortConfiguration(),
+            _laser_with(trigger_monitor_input="InputCard/ai11"),
+        )
+
+    warning, = [record.getMessage() for record in caplog.records
+                if "drops the stored channel" in record.getMessage()]
+    assert "InputCard/ai9" in warning and "now on InputCard/ai11" in warning
+
+
+def test_a_readback_does_not_inherit_another_roles_settings():
+    # The command copy moved off ai9 and the readback moved onto it: the old
+    # command copy's scale and offset are not the readback's.
+    stored = _stream_of(
+        NidaqSignalChannelConfiguration(
+            "laser1_command_copy", "InputCard/ai9", scale=3.0, offset=0.5, unit="mV"),
+    )
+
+    result = build_nidaq_acquisition_configuration(
+        stored,
+        NidaqPortConfiguration(),
+        _laser_with(command_copy_input="InputCard/ai3", trigger_monitor_input="InputCard/ai9"),
+    )
+
+    trigger = next(channel for channel in result.channels if channel.name == "laser1_trigger")
+    assert (trigger.unit, trigger.scale, trigger.offset) == ("V", 1.0, 0.0)
+
+
+def test_a_readback_keeps_its_own_settings_from_one_load_to_the_next():
+    # Taken over from christielab10's custom channel on the first load, and
+    # stored as laser1_trigger: the next load must not reset what it kept.
+    custom = NidaqSignalChannelConfiguration(
+        "laser1_trigger_readback", "InputCard/ai9", scale=2.0, offset=0.5)
+    laser = _laser_with(trigger_monitor_input="InputCard/ai9")
+    first = build_nidaq_acquisition_configuration(
+        _stream_of(custom), NidaqPortConfiguration(), laser)
+
+    second = build_nidaq_acquisition_configuration(first, NidaqPortConfiguration(), laser)
+
+    for plan in (first, second):
+        trigger = plan.channels[-1]
+        assert (trigger.name, trigger.scale, trigger.offset) == ("laser1_trigger", 2.0, 0.5)
 
 
 @pytest.mark.parametrize("terminal", ["/Dev1/ai7", "Dev1/ai15", "Dev1/port0/line3"])

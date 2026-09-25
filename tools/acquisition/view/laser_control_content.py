@@ -95,8 +95,16 @@ _TRIGGER_INPUT_INSTRUCTION = (
     "input in Edit DAQ Ports."
 )
 _TRIGGER_INPUT_KINDS = (
-    "Use an analog input or a digital input line, not a PFI terminal."
+    "Use an analog input or a port0 line, not a PFI terminal."
 )
+
+
+def _first_line(text: str, maximum_length: int) -> str:
+    """The first non-empty line of `text`, cut to `maximum_length` with an ellipsis."""
+    line = next((part.strip() for part in str(text).splitlines() if part.strip()), "")
+    if len(line) > maximum_length:
+        line = line[: maximum_length - 1].rstrip() + "…"
+    return line
 
 
 class _LaserOperationWorker(QObject):
@@ -951,8 +959,17 @@ class _LaserChannelTab(QWidget):
         source = "{} ({}, recorded as {})".format(
             acquired.physical_channel, acquired.kind, acquired.name)
         monitor = self._app_model.nidaq_signal_monitor
+        error = (monitor.error_message or "").strip()
+        # The whole error on hover; the line itself has room for its start.
+        self.trigger_status.setToolTip(error)
         if not monitor.hardware_enabled:
             text = f"Reads {source}, but NI-DAQ hardware is disabled."
+        elif not monitor.is_running and monitor.stream_state == "error":
+            # It read "it is error.", and said nothing of what failed.
+            text = (
+                f"Reads {source} while the NI-DAQ input stream runs; "
+                f"the stream failed: {_first_line(error, 60)}"
+            )
         elif not monitor.is_running:
             text = (
                 f"Reads {source} while the NI-DAQ input stream runs; "

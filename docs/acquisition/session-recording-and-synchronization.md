@@ -490,9 +490,11 @@ unassigned.
 and tone lines. Configured laser diode and command-copy feedback inputs, and a
 laser's board-trigger readback (`triggerMonitorInput`), are added to the same
 acquisition plan as `laserN_diode`, `laserN_command_copy` and `laserN_trigger`.
-The trigger readbacks come last, after every other input, so adding one does
-not move any channel already acquired in the scan. `displayChannels` controls
-only which curves are plotted.
+The trigger readbacks come last, after every other input. Adding one moves no
+channel already acquired in the scan when it takes nothing over, or when what
+it takes over came last, as christielab10's two `*_trigger_readback` custom
+channels did; a channel taken over from the middle moves the ones after it up
+by one. `displayChannels` controls only which curves are plotted.
 
 Existing `nidaqStream.channels` not claimed by a named role remain custom
 acquired inputs. A stored channel on an input that a role now names is taken
@@ -503,13 +505,17 @@ stored one depends on the role:
 |---|---|---|---|---|
 | Camera frames, barcode, tones | digital, `logic` | kept | kept | dropped |
 | `laserN_diode`, `laserN_command_copy` | analog, unit kept | from the laser's `feedbackScale` or `commandCopyScale` | kept | kept |
-| `laserN_trigger` | analog for `aiN`, digital for `portN/lineN`; unit kept | kept | kept | kept |
+| `laserN_trigger` | analog for `aiN`, digital for `port0/lineN`; unit kept | kept | kept | kept |
 
-With nothing stored on the input, the unit is `V` for an analog input and
-`logic` for a digital line, the scale is 1 (or the laser's scale), and the
-offset is 0. A stored channel under a role's name but on another input is that
-role's previous input, left there when the role was moved; it is dropped
-rather than kept as a custom input.
+The readback keeps these only from a custom channel, or from its own
+`laserN_trigger` entry; from another role's entry left on its input, an old
+command copy's for one, it takes the defaults. With nothing it may keep, the
+unit is `V` for an analog input and `logic` for a digital line, the scale is 1
+(or the laser's scale), and the offset is 0. A stored channel under a role's
+name but on another input is that role's previous input, left there when the
+role was moved; it is dropped rather than kept as a custom input, and the log
+says so. Every acquired laser claims its `laserN_trigger` name whether or not a
+readback is set, so choosing *(none)* drops the stored readback too.
 
 The DAQ Ports dialog discovers device identity and capabilities, including
 model, serial, bus/chassis, AI/AO/DI/DO channels, counters, terminals, maximum

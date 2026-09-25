@@ -15,8 +15,13 @@ from autotrainer.core import (  # noqa: E402
     NidaqTimingRoute,
     SystemConfiguration,
 )
+from tools.acquisition.model.nidaq_channel_plan import (  # noqa: E402
+    build_nidaq_acquisition_configuration,
+)
 from tools.acquisition.model.nidaq_discovery import NidaqDevicePorts  # noqa: E402
 from tools.acquisition.view.nidaq_port_configuration_dialog import NidaqPortConfigurationDialog  # noqa: E402
+
+from nidaq_stream_lifecycle_test import _settle, nidaq_app  # noqa: E402,F401
 
 
 @pytest.fixture(scope="module")
@@ -317,7 +322,9 @@ def test_saving_laser_ports_keeps_the_fields_the_dialog_does_not_edit(qapp):
     assert channel.board_trigger_pulse_us == 1500
 
 
-def _readback_device():
+def _readback_device(*, digital_input_max_rate=1_000_000.0):
+    # A PXI-6221: buffered digital input on port0, and port1 and port2 as
+    # the static PFI pins, listed among the digital inputs all the same.
     return NidaqDevicePorts(
         name="Dev1",
         analog_outputs=("Dev1/ao0", "Dev1/ao1"),
@@ -326,7 +333,9 @@ def _readback_device():
         digital_inputs=(
             "Dev1/port0/line0", "Dev1/port0/line1",
             "Dev1/port0/line4", "Dev1/port0/line5",
+            "Dev1/port1/line0", "Dev1/port2/line7",
         ),
+        digital_input_max_rate=digital_input_max_rate,
         terminals=("/Dev1/PFI0", "/Dev1/PXI_Trig0"),
     )
 
@@ -361,13 +370,24 @@ def test_each_laser_has_a_trigger_readback_input_of_inputs_only(qapp):
         combo = dialog._laser_combos[laser_index]["trigger_readback"]
         values = _combo_values(combo)
         assert values[0] is None and combo.itemText(0) == "(none)"
-        # Analog inputs and digital input lines; a PFI, an output or a
-        # backplane line cannot be streamed.
+        # Analog inputs and port0 lines, which the stream can clock; not the
+        # port1/port2 PFI pins, a PFI terminal, an output or a backplane line.
         assert set(values[1:]) == {
             "Dev1/ai0", "Dev1/ai1", "Dev1/ai2", "Dev1/ai3",
             "Dev1/port0/line0", "Dev1/port0/line1",
             "Dev1/port0/line4", "Dev1/port0/line5",
         }
+
+
+def test_a_board_that_cannot_clock_digital_input_offers_no_readback_lines(qapp):
+    # A PXI-6713: the driver gives no DI rate, and a buffered task on its
+    # lines fails at -200452.
+    dialog = NidaqPortConfigurationDialog(
+        SystemConfiguration(), devices=(_readback_device(digital_input_max_rate=None),))
+
+    values = _combo_values(dialog._laser_combos[1]["trigger_readback"])
+
+    assert set(values[1:]) == {"Dev1/ai0", "Dev1/ai1", "Dev1/ai2", "Dev1/ai3"}
 
 
 def test_the_trigger_readback_input_is_loaded_and_saved(qapp):
@@ -411,14 +431,16 @@ def test_a_trigger_readback_on_another_input_is_refused_before_the_dialog_closes
     assert dialog.laser_configuration == config.laser
 
 
-@pytest.mark.parametrize("terminal", ["/Dev1/PFI0", "Dev1/ao1"], ids=["pfi", "output"])
+@pytest.mark.parametrize(
+    "terminal", ["/Dev1/PFI0", "Dev1/ao1", "Dev1/port1/line0"],
+    ids=["pfi", "output", "pfi_pin_line"])
 def test_a_trigger_readback_that_is_not_one_input_is_refused_in_the_dialog(qapp, terminal):
     config = _readback_config(trigger_monitor_input=terminal)
     dialog = NidaqPortConfigurationDialog(config, devices=(_readback_device(),))
 
     status = dialog._status_label.text()
     assert terminal in status
-    assert "analog input" in status and "digital input line" in status
+    assert "analog input" in status and "port0 line" in status
     assert not _ok_enabled(dialog)
     dialog.accept()
     assert dialog.result() != QDialog.DialogCode.Accepted
@@ -432,3 +454,65 @@ def test_a_trigger_readback_on_the_pmt_shutter_line_is_refused_in_the_dialog(qap
 
     assert "PMT shutter output" in dialog._status_label.text()
     assert not _ok_enabled(dialog)
+
+
+def _pins(configuration):
+    return {channel.physical_channel for channel in configuration.channels}
+
+
+def test_choosing_none_for_the_readback_stops_it_being_acquired_for_good(
+    qapp, nidaq_app, system_config, trainer_config_dir,
+):
+    # The dialog saved no readback, and the application rebuilt the plan from
+    # the live one, which still held laser1_trigger on Dev1/ai7; the laser
+    # claimed neither that pin nor the name, so the channel came back as a
+    # hidden custom input, recorded from then on.
+    system_config.laser = LaserSystemConfiguration.from_channels(
+        (
+            LaserChannelConfiguration(
+                channel_id=1,
+                analog_output="Dev1/ao0",
+                diode_input="Dev1/ai0",
+                shutter_output="Dev1/port0/line2",
+                command_copy_input="Dev1/ai1",
+                trigger_monitor_input="Dev1/ai7",
+            ),
+        ),
+        backend="null",
+    )
+    system_config.save_default(trainer_config_dir)
+    assert nidaq_app.load_configuration() is True
+    _settle(nidaq_app)
+    assert "Dev1/ai7" in _pins(nidaq_app.nidaq_signal_monitor.configuration)
+    device = NidaqDevicePorts(
+        name="Dev1",
+        analog_outputs=("Dev1/ao0",),
+        analog_inputs=("Dev1/ai0", "Dev1/ai1", "Dev1/ai7"),
+        digital_outputs=("Dev1/port0/line2",),
+        digital_inputs=("Dev1/port0/line0", "Dev1/port0/line2"),
+        digital_input_max_rate=1_000_000.0,
+    )
+    dialog = NidaqPortConfigurationDialog(nidaq_app.loaded_configuration, devices=(device,))
+    readback = dialog._laser_combos[1]["trigger_readback"]
+    assert readback.currentData() == "Dev1/ai7"
+
+    readback.setCurrentIndex(readback.findData(None))
+    dialog.accept()
+    assert dialog.result() == QDialog.DialogCode.Accepted
+    nidaq_app.update_daq_port_configuration(nidaq_app.nidaq_ports, dialog.laser_configuration)
+    _settle(nidaq_app)
+
+    assert nidaq_app.laser.configuration.get_channel(1).trigger_monitor_input is None
+    assert "Dev1/ai7" not in _pins(nidaq_app.nidaq_signal_monitor.configuration)
+    assert "Dev1/ai7" not in _pins(nidaq_app.loaded_configuration.nidaq_stream)
+
+    # And from the saved file, through the plan a load builds from it. (A
+    # full reload is not possible here: this fixture's inference model is a
+    # stand-in that saves no inference section.)
+    saved = nidaq_app.get_config_from_location(nidaq_app.get_config_location())
+    assert saved.laser.get_channel(1).trigger_monitor_input is None
+    assert "Dev1/ai7" not in _pins(saved.nidaq_stream)
+    reloaded = build_nidaq_acquisition_configuration(
+        saved.nidaq_stream, saved.nidaq_ports, saved.laser)
+    assert "Dev1/ai7" not in _pins(reloaded)
+    assert "laser1_trigger" not in {channel.name for channel in reloaded.channels}

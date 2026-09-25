@@ -39,6 +39,7 @@ from tools.acquisition.model.nidaq_channel_plan import (
     laser_output_lines,
     trigger_readback_refusal,
 )
+from tools.acquisition.model.nidaq_monitor_survey import BUFFERED_PORT
 from tools.acquisition.model.nidaq_discovery import (
     NidaqDevicePorts,
     device_name_from_channel,
@@ -628,8 +629,18 @@ class NidaqPortConfigurationDialog(QDialog):
         if kind == "di":
             return device.digital_inputs
         if kind == "readback":
-            # What the input stream can acquire: a PFI terminal cannot be.
-            return tuple(dict.fromkeys(device.analog_inputs + device.digital_inputs))
+            # What the input stream can sample: every analog input, and the
+            # port0 lines of a board that clocks digital input at all. port1
+            # and port2 are the static PFI pins (STIM3's PFI0 is port1/line0),
+            # and a PXI-6713's lines cannot be clocked: the driver has no DI
+            # rate for it, and a buffered task on them fails at -200452.
+            lines = ()
+            if device.digital_input_max_rate is not None:
+                lines = tuple(
+                    line for line in device.digital_inputs
+                    if self._terminal_of(line).split("/", 1)[0].lower() == BUFFERED_PORT
+                )
+            return tuple(dict.fromkeys(device.analog_inputs + lines))
         if kind == "trigger":
             return tuple(
                 terminal
