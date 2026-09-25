@@ -241,10 +241,9 @@ The host writes the picked profile's waveform to the analog output directly.
 **Trigger:** starts at *internal*, which starts the pulse on the NI clock
 when you press Run Pulse. With *external*, the output is armed and waits for
 an edge, chosen by **Edge:**, on **Source:**. Nothing on this page sends that
-edge, so use
-*external* only when an outside trigger is wired in. If no edge arrives, the
-pulse fails after the train length plus five seconds with *Wait Until Done did
-not indicate that the task was done*.
+edge, so use *external* only when an outside trigger is wired in. If no edge
+arrives, the pulse fails after the train length plus five seconds with *Wait
+Until Done did not indicate that the task was done*.
 
 Picking a profile in **Profile:** chooses what Run Pulse and Test stim fire on
 this laser; this page has no waveform controls, and nothing is copied into it.
@@ -256,8 +255,8 @@ does not change **Trigger:** or **Source:**.
 ### Test stim — proves the trial path
 
 Pick a profile in **Profile:**. Then, in the **Test stim** section below Run
-Pulse, pick a route in **Route:** and press **Test stim**. It is available once the system is running, and
-refused while a session records.
+Pulse, pick a route in **Route:** and press **Test stim**. It is available
+once the system is running, and refused while a session records.
 
 **Route:** offers:
 
