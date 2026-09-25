@@ -408,58 +408,71 @@ class NidaqLaserController:
     def run_synchronized_pulse_train(self, pulse_train: LaserSynchronizedPulseTrain):
         if not self._configuration.hardware_timed:
             raise RuntimeError("Hardware-timed laser pulse trains require laser configuration hardware_timed=True")
-        if not pulse_train.wait:
-            resources = tuple(
-                self._configuration.get_channel(item.channel_id).analog_output
-                for item in pulse_train.pulse_trains
-            )
-            with self._operation_lock:
-                conflicts = [
-                    operation.operation_id
-                    for operation in self._live_operations.values()
-                    if set(operation.resources) & set(resources)
-                    and operation.state not in operation.TERMINAL
-                ]
-                if conflicts:
-                    raise RuntimeError(
-                        "Laser output resource is already owned by operation(s): "
-                        + ", ".join(conflicts)
-                    )
-                operation = NidaqLaserOperation(
-                    resources=resources,
-                    context=pulse_train.operation_context,
-                    terminal_callback=self._release_operation,
+        # Both paths own their output through one operation, so close() can
+        # cancel and wait for either. A waited-for train (Run Pulse) used to
+        # run with none: close() could not stop it, and its command reset met
+        # the train's task on the output at -50103.
+        resources = tuple(
+            self._configuration.get_channel(item.channel_id).analog_output
+            for item in pulse_train.pulse_trains
+        )
+        with self._operation_lock:
+            conflicts = [
+                operation.operation_id
+                for operation in self._live_operations.values()
+                if set(operation.resources) & set(resources)
+                and operation.state not in operation.TERMINAL
+            ]
+            if conflicts:
+                raise RuntimeError(
+                    "Laser output resource is already owned by operation(s): "
+                    + ", ".join(conflicts)
                 )
-                self._live_operations[operation.operation_id] = operation
-
-            def execute():
-                try:
-                    self._execute_synchronized_pulse_train(
-                        pulse_train,
-                        operation=operation,
-                    )
-                except Exception as error:
-                    if operation.state is LaserOperationState.CANCELLED:
-                        operation._finish_terminal()
-                    else:
-                        operation._fail(error)
-                else:
-                    operation._complete()
-
-            operation._thread = threading.Thread(
-                target=execute,
-                name=f"NidaqLaser-{operation.operation_id[:8]}",
-                daemon=True,
+            operation = NidaqLaserOperation(
+                resources=resources,
+                context=pulse_train.operation_context,
+                terminal_callback=self._release_operation,
             )
-            operation._thread.start()
+            self._live_operations[operation.operation_id] = operation
+
+        def execute():
             try:
-                operation.wait_until_armed(timeout=5.0)
-            except Exception:
-                operation.cancel()
-                raise
-            return operation
-        self._execute_synchronized_pulse_train(pulse_train)
-        return None
+                self._execute_synchronized_pulse_train(
+                    pulse_train,
+                    operation=operation,
+                )
+            except Exception as error:
+                if operation.state is LaserOperationState.CANCELLED:
+                    operation._finish_terminal()
+                else:
+                    operation._fail(error)
+            else:
+                operation._complete()
+
+        if pulse_train.wait:
+            # On the caller's thread, which it still blocks.
+            operation._thread = threading.current_thread()
+            execute()
+            if operation.state is LaserOperationState.CANCELLED:
+                # Not the DAQmx error the cancel's stop provoked.
+                raise RuntimeError(
+                    f"Laser operation {operation.operation_id} was cancelled: "
+                    "the laser controller was closed while it ran")
+            if operation.error is not None:
+                raise operation.error
+            return None
+        operation._thread = threading.Thread(
+            target=execute,
+            name=f"NidaqLaser-{operation.operation_id[:8]}",
+            daemon=True,
+        )
+        operation._thread.start()
+        try:
+            operation.wait_until_armed(timeout=5.0)
+        except Exception:
+            operation.cancel()
+            raise
+        return operation
 
     def _release_operation(self, operation):
         with self._operation_lock:
