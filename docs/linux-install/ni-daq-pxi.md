@@ -132,6 +132,8 @@ digital input; a stored value that is not one stays on its field, the status
 line says why, and OK stays disabled until it is changed. A configuration file
 naming such a line is refused when it loads, naming the field. christielab10
 uses `PXI1Slot5/port0/line0`-`line3` for tone1, tone2, camFrames and barcode.
+Clearing a role (choosing the empty entry) stops its channel being acquired
+and recorded from the next save on; the log notes the dropped channel.
 
 The current NI PXI-6713 appears as:
 

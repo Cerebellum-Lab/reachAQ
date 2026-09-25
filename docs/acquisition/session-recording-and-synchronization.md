@@ -514,8 +514,14 @@ unit is `V` for an analog input and `logic` for a digital line, the scale is 1
 (or the laser's scale), and the offset is 0. A stored channel under a role's
 name but on another input is that role's previous input, left there when the
 role was moved; it is dropped rather than kept as a custom input, and the log
-says so. Every acquired laser claims its `laserN_trigger` name whether or not a
-readback is set, so choosing *(none)* drops the stored readback too.
+says so. A role claims its name whether or not it is set, so clearing one -
+a port role such as tone1 or camFrames, or a laser's trigger readback with
+*(none)* - stops its channel being acquired and recorded, and drops it from
+`displayChannels`. Every port role claims its name always; a laser's
+`laserN_diode`, `laserN_command_copy` and `laserN_trigger` are claimed for
+each configured laser while the laser backend is enabled, since with it
+disabled the plan adds no laser role. Channels whose names no role owns are
+never touched.
 
 The DAQ Ports dialog discovers device identity and capabilities, including
 model, serial, bus/chassis, AI/AO/DI/DO channels, counters, terminals, maximum
