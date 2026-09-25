@@ -42,6 +42,7 @@ from autotrainer.core import (
     HardwareConfiguration,
     LaserSystemConfiguration,
     NidaqPortConfiguration,
+    NidaqSignalStreamConfiguration,
     Notification,
     NotificationCenter,
     TriggerNotification,
@@ -705,6 +706,10 @@ class AppModel(ObservableObject):
         #: latest start came while it was; see _on_nidaq_monitor_property_changed.
         self._nidaq_domain_start_active = False
         self._nidaq_stream_started_by_domain = False
+        #: Why the loaded configuration's NI-DAQ plan was refused, or empty.
+        #: While set, the stream has no channels and reads BLOCKED with it,
+        #: until Edit DAQ Ports saves a plan that builds.
+        self._nidaq_plan_error = ""
         #: Set while run_laser_calibration_ramp holds the NI-DAQ lines and a
         #: laser controller of its own; Run, the DAQ Monitor, a configuration
         #: load and a DAQ ports save refuse while it is.
@@ -2823,9 +2828,9 @@ class AppModel(ObservableObject):
             (
                 SubsystemId.NIDAQ_STREAM,
                 configuration.hardware.nidaq_enabled
-                and configuration.nidaq_stream.is_enabled,
+                and (configuration.nidaq_stream.is_enabled or bool(self._nidaq_plan_error)),
                 configuration.hardware.nidaq_enabled
-                and configuration.nidaq_stream.is_enabled,
+                and (configuration.nidaq_stream.is_enabled or bool(self._nidaq_plan_error)),
             ),
             (
                 SubsystemId.LASER,
@@ -2834,10 +2839,20 @@ class AppModel(ObservableObject):
             ),
         )
         for subsystem_id, enabled, required in intent:
+            state = SubsystemState.STOPPED if enabled else SubsystemState.DISABLED
+            reason = "configured; not started" if enabled else "disabled"
+            if (
+                subsystem_id is SubsystemId.NIDAQ_STREAM
+                and enabled
+                and self._nidaq_plan_error
+            ):
+                # Required as configured, and held back with the reason.
+                state = SubsystemState.BLOCKED
+                reason = self._nidaq_plan_blocked_reason()
             self._set_subsystem_status(
                 subsystem_id,
-                SubsystemState.STOPPED if enabled else SubsystemState.DISABLED,
-                reason="configured; not started" if enabled else "disabled",
+                state,
+                reason=reason,
                 required_for_recording=required,
             )
         self._set_subsystem_status(
@@ -6244,6 +6259,14 @@ class AppModel(ObservableObject):
             and not self._closing_event.is_set()
             and self._loaded_configuration is not None
             and not self._configuration_load_incomplete
+            # A refused plan: there is nothing valid to start until Edit DAQ
+            # Ports saves one.
+            and not self._nidaq_plan_error
+        )
+
+    def _nidaq_plan_blocked_reason(self) -> str:
+        return (
+            f"NI-DAQ plan refused: {self._nidaq_plan_error}; fix it in Edit DAQ Ports"
         )
 
     def _request_nidaq_stream(self, reason: str) -> None:
@@ -6512,6 +6535,15 @@ class AppModel(ObservableObject):
         A retry keeps whatever is running.
         """
         monitor = self._nidaq_signal_monitor
+        if self._nidaq_plan_error and monitor.hardware_enabled:
+            # The stream has no channels, which read as "disabled" below; it
+            # is held back, with the refusal an operator can fix.
+            self._set_subsystem_status(
+                SubsystemId.NIDAQ_STREAM,
+                SubsystemState.BLOCKED,
+                reason=self._nidaq_plan_blocked_reason(),
+            )
+            return False
         if not (monitor.hardware_enabled and monitor.configuration.is_enabled):
             self._set_subsystem_status(
                 SubsystemId.NIDAQ_STREAM,
@@ -7672,6 +7704,23 @@ class AppModel(ObservableObject):
             self._apply_random_camera_override(configuration)
         self._ensure_optional_stim_camera(configuration)
 
+        # The NI-DAQ plan first, before anything is applied. Built after the
+        # lasers, as it was, a refused line - a duplicate pin, a PFI pin, a
+        # port1 tone - left the load half done: nothing kept the configuration,
+        # so Edit DAQ Ports would not open, and the file had to be fixed by
+        # hand. A refused plan now loads everything else, and holds the NI-DAQ
+        # stream back with the reason until Edit DAQ Ports saves a valid one.
+        try:
+            nidaq_acquisition = build_nidaq_acquisition_configuration(
+                configuration.nidaq_stream,
+                configuration.nidaq_ports,
+                configuration.laser,
+            )
+            nidaq_plan_error = ""
+        except ValueError as error:
+            nidaq_acquisition = None
+            nidaq_plan_error = str(error) or error.__class__.__name__
+
         self._sync_reach_cameras_to_configuration(configuration)
 
         frame_rate = None
@@ -7765,13 +7814,20 @@ class AppModel(ObservableObject):
             ),
             device_identities=configuration.nidaq_ports.device_identities,
         )
-        nidaq_acquisition = build_nidaq_acquisition_configuration(
-            configuration.nidaq_stream,
-            configuration.nidaq_ports,
-            configuration.laser,
-        )
-        configuration.nidaq_stream = nidaq_acquisition
-        self.nidaq_signal_monitor.load_configuration(nidaq_acquisition)
+        self._nidaq_plan_error = nidaq_plan_error
+        if nidaq_plan_error:
+            # The stream gets no channels, and the configuration keeps the
+            # operator's own stream, ports and lasers: what Edit DAQ Ports
+            # shows marked invalid, and what a save writes back unchanged.
+            logger.error(
+                "NI-DAQ inputs are not acquired: %s. Fix it in Edit → Edit DAQ "
+                "Ports",
+                nidaq_plan_error,
+            )
+            self.nidaq_signal_monitor.load_configuration(NidaqSignalStreamConfiguration())
+        else:
+            configuration.nidaq_stream = nidaq_acquisition
+            self.nidaq_signal_monitor.load_configuration(nidaq_acquisition)
         self.behavior.load_configuration(configuration.behavior)
 
         self._analysis.watchdog_monitor.config = configuration.watchdog
@@ -7948,8 +8004,14 @@ class AppModel(ObservableObject):
         # Built first, because building is what refuses two roles on one
         # input or a trigger readback the stream cannot acquire. Built after
         # the lasers were applied, a refused save had already changed them.
+        # After a refused plan at load the stream has no channels, so the
+        # operator's own stored stream is the one to build on.
         acquisition = build_nidaq_acquisition_configuration(
-            self._nidaq_signal_monitor.configuration,
+            (
+                self._loaded_configuration.nidaq_stream
+                if self._nidaq_plan_error
+                else self._nidaq_signal_monitor.configuration
+            ),
             nidaq_ports,
             laser_configuration,
         )
@@ -7957,6 +8019,14 @@ class AppModel(ObservableObject):
         self._laser.set_configuration_offline(laser_configuration)
         self._loaded_configuration.nidaq_ports = nidaq_ports
         self._loaded_configuration.laser = laser_configuration
+        if self._nidaq_plan_error:
+            # Fixed: the stream may start again, once the hold is let go.
+            self._nidaq_plan_error = ""
+            self._set_subsystem_status(
+                SubsystemId.NIDAQ_STREAM,
+                SubsystemState.STOPPED,
+                reason="configured; not started",
+            )
         self._nidaq_signal_monitor.load_configuration(acquisition)
         hardware_timed_output_devices = tuple(
             dict.fromkeys(
@@ -7984,6 +8054,10 @@ class AppModel(ObservableObject):
         """Apply and persist plot selection without changing DAQ acquisition."""
         if self._loaded_configuration is None:
             raise RuntimeError("Cannot update NI-DAQ stream channels before a system configuration is loaded")
+        if self._nidaq_plan_error:
+            # The stream has no channels to select, and the stored stream is
+            # the operator's, kept for Edit DAQ Ports; neither is replaced.
+            raise RuntimeError(self._nidaq_plan_blocked_reason())
         channel_names = tuple(
             channel.name if hasattr(channel, "name") else str(channel)
             for channel in channels
@@ -9770,12 +9844,19 @@ class AppModel(ObservableObject):
         if self._runtime_live_inference_override is not None and self._loaded_configuration is not None:
             inference_configuration.is_enabled = self._loaded_configuration.inference.is_enabled
 
+        # With a refused NI-DAQ plan the stream runs no channels; the file
+        # keeps the operator's own stream, as loaded, for Edit DAQ Ports to fix.
+        nidaq_stream = (
+            self._loaded_configuration.nidaq_stream
+            if self._nidaq_plan_error and self._loaded_configuration is not None
+            else self._nidaq_signal_monitor.save_configuration()
+        )
         configuration = SystemConfiguration(cameras=cameras,
                                             hardware=hardware_configuration,
                                             inference=inference_configuration,
                                             laser=self._laser.save_configuration(),
                                             nidaq_ports=self._nidaq_ports,
-                                            nidaq_stream=self._nidaq_signal_monitor.save_configuration(),
+                                            nidaq_stream=nidaq_stream,
                                             behavior=self._behavior.save_configuration(),
                                             persistence=PersistenceConfiguration(output_location=self.output_location))
 

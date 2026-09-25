@@ -819,6 +819,8 @@ def test_app_model_persists_analysis_signal_selection_to_loaded_configuration():
     app_model = object.__new__(AppModel)
     app_model._nidaq_signal_monitor = monitor
     app_model._loaded_configuration = SimpleNamespace(nidaq_stream=None)
+    # No refused NI-DAQ plan: selections are refused while one is held.
+    app_model._nidaq_plan_error = ""
     save_calls = []
     app_model.save_configuration = lambda: save_calls.append(True)
 

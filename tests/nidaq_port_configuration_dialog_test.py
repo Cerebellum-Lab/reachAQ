@@ -651,3 +651,52 @@ def test_clearing_a_port_role_stops_it_being_recorded_for_good(
     finally:
         content.on_close()
         content.deleteLater()
+
+
+def test_a_bad_ni_line_is_fixed_in_the_dialog_and_the_stream_starts(
+    qapp, nidaq_app, system_config, trainer_config_dir,
+):
+    import dataclasses
+
+    from nidaq_stream_lifecycle_test import _nidaq_state, _with_bad_nidaq_line
+    from tools.acquisition.model.subsystem_status import SubsystemState
+
+    _with_bad_nidaq_line(system_config, trainer_config_dir, tone1="Dev1/port1/line0")
+    assert nidaq_app.load_configuration() is True
+    _settle(nidaq_app, running=False, timeout=2.0)
+    assert _nidaq_state(nidaq_app).state is SubsystemState.BLOCKED
+    device = NidaqDevicePorts(
+        name="Dev1",
+        analog_outputs=("Dev1/ao0",),
+        analog_inputs=("Dev1/ai0", "Dev1/ai1", "Dev1/ai5"),
+        digital_outputs=("Dev1/port0/line2",),
+        digital_inputs=(
+            "Dev1/port0/line0", "Dev1/port0/line2", "Dev1/port0/line3",
+            "Dev1/port1/line0",
+        ),
+        digital_input_max_rate=_BUFFERED_DI_RATE,
+    )
+
+    # It opens, with the bad value on its field and named.
+    dialog = NidaqPortConfigurationDialog(nidaq_app.loaded_configuration, devices=(device,))
+    tone1 = dialog._general_combos["tone1"]
+    assert tone1.currentData() == "Dev1/port1/line0"
+    assert "PFI pins" in dialog._status_label.text()
+    assert not _ok_enabled(dialog)
+
+    _set_combo_value(tone1, "Dev1/port0/line3")
+    assert _ok_enabled(dialog)
+    dialog.accept()
+    assert dialog.result() == QDialog.DialogCode.Accepted
+    nidaq_app.update_daq_port_configuration(
+        dataclasses.replace(nidaq_app.nidaq_ports, tone1=dialog.nidaq_ports.tone1),
+        dialog.laser_configuration,
+    )
+    monitor = _settle(nidaq_app)
+
+    assert monitor.is_running
+    assert _nidaq_state(nidaq_app).state is SubsystemState.READY
+    names = {channel.name for channel in monitor.configuration.channels}
+    assert {"tone1", "cam_frames", "stim_readback"} <= names
+    saved = nidaq_app.get_config_from_location(nidaq_app.get_config_location())
+    assert saved.nidaq_ports.tone1 == "Dev1/port0/line3"

@@ -936,3 +936,143 @@ def test_a_stream_that_fails_under_a_run_still_reads_failed(nidaq_app, monkeypat
         assert "crashed" in failed.error
     finally:
         nidaq_app.capture_stop()
+
+
+# ------------------------------------------------ a bad NI line in the file
+
+
+def _null_laser_configuration():
+    return LaserSystemConfiguration.from_channels(
+        (
+            LaserChannelConfiguration(
+                channel_id=LaserChannelId.LASER_1,
+                analog_output="Dev1/ao0",
+                diode_input="Dev1/ai0",
+                shutter_output="Dev1/port0/line2",
+                command_copy_input="Dev1/ai1",
+            ),
+        ),
+        backend="null",
+    )
+
+
+def _with_bad_nidaq_line(system_config, trainer_config_dir, **ports):
+    from autotrainer.core import (
+        NidaqSignalChannelConfiguration,
+        NidaqSignalStreamConfiguration,
+    )
+    system_config.hardware.nidaq_enabled = True
+    system_config.laser = _null_laser_configuration()
+    system_config.nidaq_ports = NidaqPortConfiguration(
+        cam_frames="Dev1/port0/line0", **ports)
+    # An operator's own input, which nothing about the bad line should lose.
+    system_config.nidaq_stream = NidaqSignalStreamConfiguration(
+        channels=(NidaqSignalChannelConfiguration("stim_readback", "Dev1/ai5"),),
+        is_enabled=True,
+    )
+    system_config.save_default(trainer_config_dir)
+
+
+def _count_starts(monkeypatch, monitor):
+    starts = []
+    original = monitor.start
+
+    def counting_start():
+        starts.append(True)
+        return original()
+
+    monkeypatch.setattr(monitor, "start", counting_start)
+    return starts
+
+
+@pytest.mark.parametrize(
+    ("ports", "reason"),
+    [
+        (dict(tone1="Dev1/port1/line0"), "tone1"),
+        (dict(tone1="Dev1/port0/line0"), "assigned to both"),
+    ],
+    ids=["pfi_pin_tone", "duplicate_pin"],
+)
+def test_a_bad_ni_line_loads_everything_else_and_blocks_the_stream(
+    app_model, system_config, trainer_config_dir, monkeypatch, caplog, ports, reason,
+):
+    # The plan was built after the lasers were applied and before the
+    # configuration was kept, so a refused line left the load half done:
+    # Edit DAQ Ports would not open, and the file had to be fixed by hand.
+    _with_bad_nidaq_line(system_config, trainer_config_dir, **ports)
+    monitor = _with_fake_worker(app_model)
+    starts = _count_starts(monkeypatch, monitor)
+    try:
+        with caplog.at_level("ERROR"):
+            assert app_model.load_configuration() is True
+        _settle(app_model, running=False, timeout=2.0)
+
+        assert app_model.loaded_configuration is not None
+        assert app_model.laser.configuration == _null_laser_configuration()
+        assert app_model.nidaq_ports.tone1 == ports["tone1"]
+        status = _nidaq_state(app_model)
+        assert status.state is SubsystemState.BLOCKED
+        assert reason in status.reason
+        assert starts == [] and not monitor.is_running
+        refusals = [record.getMessage() for record in caplog.records
+                    if "Edit DAQ Ports" in record.getMessage()]
+        assert len(refusals) == 1 and reason in refusals[0]
+        # A hardware refresh or Run does not start it either.
+        app_model._request_nidaq_stream("test")
+        _settle(app_model, running=False, timeout=2.0)
+        assert starts == []
+        assert app_model._start_nidaq_domain(restart=True) is False
+        assert _nidaq_state(app_model).state is SubsystemState.BLOCKED
+    finally:
+        rule = vars(app_model).get("_nidaq_stream_autostart")
+        if rule is not None:
+            rule.close()
+        monitor.close()
+
+
+def test_an_exit_save_with_a_bad_ni_line_keeps_the_operators_values(
+    app_model, system_config, trainer_config_dir,
+):
+    _with_bad_nidaq_line(system_config, trainer_config_dir, tone1="Dev1/port1/line0")
+    monitor = _with_fake_worker(app_model)
+    try:
+        assert app_model.load_configuration() is True
+
+        app_model.save_configuration()
+
+        saved = app_model.get_config_from_location(app_model.get_config_location())
+        assert saved.nidaq_ports.tone1 == "Dev1/port1/line0"
+        assert saved.nidaq_ports.cam_frames == "Dev1/port0/line0"
+        assert "stim_readback" in {channel.name for channel in saved.nidaq_stream.channels}
+        assert saved.laser == _null_laser_configuration()
+    finally:
+        vars(app_model)["_nidaq_stream_autostart"].close()
+        monitor.close()
+
+
+def test_christielab10s_configuration_still_loads_exactly(
+    app_model, system_config, trainer_config_dir,
+):
+    from nidaq_channel_plan_test import (
+        CHRISTIELAB10_PORTS,
+        _christielab10_lasers,
+        _christielab10_stream,
+    )
+    system_config.hardware.nidaq_enabled = True
+    system_config.nidaq_ports = CHRISTIELAB10_PORTS
+    system_config.nidaq_stream = _christielab10_stream()
+    system_config.laser = _christielab10_lasers()
+    system_config.save_default(trainer_config_dir)
+    monitor = _with_fake_worker(app_model)
+    try:
+        assert app_model.load_configuration() is True
+        rule = vars(app_model)["_nidaq_stream_autostart"]
+        assert rule.wait(10.0)
+
+        assert monitor.configuration.channels == _christielab10_stream().channels
+        assert monitor.configuration.display_channels == (
+            _christielab10_stream().display_channels)
+        assert app_model._nidaq_plan_error == ""
+    finally:
+        vars(app_model)["_nidaq_stream_autostart"].close()
+        monitor.close()

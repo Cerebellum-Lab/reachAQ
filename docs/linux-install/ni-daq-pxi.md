@@ -135,6 +135,15 @@ uses `PXI1Slot5/port0/line0`-`line3` for tone1, tone2, camFrames and barcode.
 Clearing a role (choosing the empty entry) stops its channel being acquired
 and recorded from the next save on; the log notes the dropped channel.
 
+A configuration file with a line the stream cannot acquire - a duplicate pin,
+a PFI pin on a digital role, a PFI trigger readback - still loads. Everything
+else is applied, the NI-DAQ stream is held with no channels, Hardware Status
+shows NI-DAQ blocked with the reason, and the status bar says *NI-DAQ inputs
+are not acquired: ... Fix it in Edit → Edit DAQ Ports*. Open the dialog: the
+bad value stays on its field with the reason, and OK stays disabled until it
+is fixed. Saving a valid assignment starts the stream. Until then the file
+keeps the values it had, including when reachAQ saves on exit.
+
 The current NI PXI-6713 appears as:
 
 ```text

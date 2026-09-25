@@ -318,6 +318,7 @@ record until reachAQ exits.
 | Qt xcb plugin error | `libxcb-cursor0`, `libxkbcommon-x11-0`, and display environment |
 | Cameras absent or no first frame | Applicable [FLIR guide](flir-spinnaker.md), effective trigger-node diagnostics, physical trigger/power/ground path |
 | NI devices absent | [NI-DAQ/PXI guide](ni-daq-pxi.md), starting at PCI/USB enumeration |
+| Status bar: *NI-DAQ inputs are not acquired: ... Fix it in Edit → Edit DAQ Ports*; Hardware Status shows NI-DAQ blocked | A line in `nidaqPorts` or a laser input that the stream cannot acquire - a duplicate pin, a port1/port2 line (a PFI pin) on a digital role, a PFI trigger readback. Everything else loaded; the NI-DAQ stream has no channels until it is fixed. Open **Edit → Edit DAQ Ports**: the bad value is on its field, named in the status line, and OK stays disabled until it is changed. A valid save starts the stream. The file keeps your values meanwhile, even on exit |
 | PXI off and camera timeout occur together | Treat as correlated until wiring is checked; NI-DAQ software initialization does not trigger cameras |
 | CAN interface down | [PEAK/SocketCAN guide](peak-socketcan.md), bitrate and termination |
 | CAN reset asks for a password | Activate the `reachaq` login group by logging out/in, then verify the narrow `sudo -n` permission |
