@@ -188,27 +188,34 @@ and each laser's `triggerOutput` and `timingTriggerOutput` - run as clocked
 digital output tasks beside a pulse's analog waveform. Each must be a line on
 a board that can run clocked digital output: on christielab10 a port0 line on
 the 6221, never one of the 6713's lines. A line on another board than the
-laser's analog output is clocked over the backplane, never by naming the
-analog output board's clock: when the pulse runs on its own clock, that clock
-is driven onto `backplaneClockLine` (PXI_Trig1) and read on the line's board,
-with no start trigger of its own, since that clock only runs once the output
-has triggered; when the pulse is synchronized to the input stream, the line
-takes the stream's clock on its own board and its start trigger as its own
-board's view of the pulse's PXI_Trig line. A pulse that would put a second
-signal on `backplaneClockLine`, or whose trigger cannot reach the line's
-board, is refused before anything fires, naming the line. christielab10
-configures none of these lines, and this path has not yet been run on its
-hardware.
+laser's analog output runs on the analog output's own sample clock, carried
+over the backplane and read on the line's board, never named across the
+boards, and with no start trigger: that clock only runs once the output has
+triggered. It cannot wait for a start trigger instead, because an M Series
+board's clocked digital output takes none: on christielab10 both boards
+report an empty `do_trig_usage`, and a DO task with a start trigger fails
+DAQmx's verify with -200452, while one clocked from a PXI_Trig line with no
+trigger verifies (measured 2026-09-25, verify only). When the pulse runs on
+its own clock, that clock goes onto `backplaneClockLine` (PXI_Trig1). When
+the pulse is synchronized to the input stream, `backplaneClockLine` already
+carries the stream's clock from the 6221 to the 6713, so the output's clock
+goes onto `pulseClockLine` (default `PXI_Trig3`) instead. A pulse that would
+put a second signal on either line is refused before anything fires, naming
+the line. christielab10 configures none of these lines, and this path has
+not yet been run on its hardware.
 
-`backplaneClockLine` (default `PXI_Trig1`) must be a different line from every
-laser's `triggerSource` line and every `triggerListenerInputs` line: a trigger
-on the clock's line is a second driver on it, which DAQmx does not notice
-across these boards, and the clock or the trigger is corrupted. Lines compare
-by name alone, whatever the board and case (`/PXI1Slot4/PXI_Trig1` and
+`backplaneClockLine` (default `PXI_Trig1`) and `pulseClockLine` (default
+`PXI_Trig3`) must be free PXI_Trig lines: different from each other, from
+every laser's `triggerSource` line (which is also its trigger route's
+destination) and from every `triggerListenerInputs` line. A trigger on a
+clock's line is a second driver on it, which DAQmx does not notice across
+these boards, and the clock or the trigger is corrupted. Lines compare by
+name alone, whatever the board and case (`/PXI1Slot4/PXI_Trig1` and
 `pxi_trig1` are one line); a PFI never clashes. Loading a configuration that
 clashes is refused, naming the field and the line, and Edit DAQ Ports refuses
-a trigger input on it before it closes. christielab10 keeps the clock on
-PXI_Trig1 and its triggers and trigger inputs on PXI_Trig0 and PXI_Trig2.
+a trigger input on either before it closes. christielab10 keeps the shared
+clock on PXI_Trig1, its triggers and trigger inputs on PXI_Trig0 and
+PXI_Trig2, and leaves PXI_Trig3 to `pulseClockLine`.
 
 Validate configured laser tasks only after confirming the real wiring, and
 with reachAQ closed: its NI-DAQ input stream runs whenever it is open, and

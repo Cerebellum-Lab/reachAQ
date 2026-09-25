@@ -36,7 +36,8 @@ class FakeTask:
         self.stopped_while_waiting = threading.Event()
         self.ao_channels = SimpleNamespace(add_ao_voltage_chan=self._add)
         self.ai_channels = SimpleNamespace(add_ai_voltage_chan=self._add)
-        self.do_channels = SimpleNamespace(add_do_chan=self._add)
+        self.do_channels = SimpleNamespace(add_do_chan=self._add_do)
+        self.do_channels_added = False
         self.timing = SimpleNamespace(cfg_samp_clk_timing=self._timing)
         #: The digital edge start trigger, as (source, edge), or None.
         self.start_trigger = None
@@ -46,10 +47,20 @@ class FakeTask:
     def _add(self, channel, **_kwargs):
         self.channels.append(channel)
 
+    def _add_do(self, channel, **_kwargs):
+        self.do_channels_added = True
+        self.channels.append(channel)
+
     def _timing(self, **kwargs):
         self.timing_kwargs = kwargs
 
     def _start_trigger(self, source, trigger_edge=None):
+        if self.do_channels_added and not self.daq.do_takes_start_trigger:
+            # As christielab10's PXI-6221 and PXI-6713 answer: do_trig_usage
+            # is empty, and TASK_VERIFY refuses a clocked DO start trigger.
+            raise RuntimeError(
+                "DAQmx -200452: Specified property is not supported by the "
+                f"device or is not applicable to the task ({self.name})")
         self.start_trigger = (source, trigger_edge)
 
     def _reserve(self):
@@ -89,6 +100,7 @@ class FakeTask:
         self._reserve()
         self.started = True
         self.daq.starts.append(self.name)
+        self.daq.log.append(("start", self.name))
 
     def wait_until_done(self, timeout):
         if self.daq.block_wait:
@@ -160,6 +172,7 @@ class FakeDaqmx:
         hold_waits=False,
         stop_unblocks=False,
         hang=(),
+        do_takes_start_trigger=False,
     ):
         self.block_wait = block_wait
         self.failing_task = failing_task
@@ -201,6 +214,12 @@ class FakeDaqmx:
         self.disconnected = []
         #: Names of the tasks started, in the order they were.
         self.starts = []
+        #: Routes connected and released and tasks started, in one order.
+        self.log = []
+        #: Whether a clocked digital output task takes a start trigger. The
+        #: rig's M Series boards say no (do_trig_usage empty, -200452 at
+        #: verify, 2026-09-25); an X Series board would say yes.
+        self.do_takes_start_trigger = do_takes_start_trigger
         self.constants = SimpleNamespace(
             AcquisitionType=SimpleNamespace(FINITE="finite"),
             TaskMode=SimpleNamespace(TASK_ABORT="abort"),
@@ -234,10 +253,12 @@ class FakeDaqmx:
     def connect_terms(self, source, destination):
         self.sick("connect_terms")
         self.connected.append((source, destination))
+        self.log.append(("connect", (source, destination)))
 
     def disconnect_terms(self, source, destination):
         self.sick("disconnect_terms")
         self.disconnected.append((source, destination))
+        self.log.append(("disconnect", (source, destination)))
 
     def task(self, suffix):
         return next(task for task in reversed(self.tasks) if task.name.endswith(suffix))

@@ -307,10 +307,12 @@ shutter (`pmtShutterOutput`) and, per laser, a trigger output and a timing
 trigger output (`triggerOutput`, `timingTriggerOutput`). Run Pulse, Test stim
 and trials all use them. Each must be a line on a board that can run clocked
 digital output - on christielab10 a port0 line on the 6221, never the 6713 -
-and one on another board than the laser's output is clocked over the
-backplane (`backplaneClockLine`, PXI_Trig1). A pulse that cannot clock such a
-line is refused before anything fires, naming the line. christielab10 sets
-none of these lines, and this path has not yet been run on its hardware.
+and one on another board than the laser's output runs on the output's own
+clock, carried over the backplane (`backplaneClockLine`, PXI_Trig1, or, for a
+pulse synchronized to the input stream, `pulseClockLine`, PXI_Trig3). A pulse
+that cannot clock such a line is refused before anything fires, naming the
+line. christielab10 sets none of these lines, and this path has not yet been
+run on its hardware.
 
 ### Test stim — proves the trial path
 

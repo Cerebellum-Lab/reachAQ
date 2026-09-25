@@ -410,11 +410,29 @@ def test_a_trigger_input_on_the_backplane_clock_line_is_refused_in_the_dialog(qa
     assert _ok_enabled(dialog)
 
 
+def test_a_trigger_input_on_the_pulse_clock_line_is_refused_in_the_dialog(qapp):
+    device = _backplane_device()
+    device = NidaqDevicePorts(**{
+        **vars(device), "terminals": device.terminals + ("/Dev1/PXI_Trig3",)})
+    config = _backplane_config()
+    dialog = NidaqPortConfigurationDialog(config, devices=(device,))
+
+    _set_combo_value(dialog._laser_combos[1]["trigger_listener"], "/Dev1/PXI_Trig3")
+
+    assert ("triggerListenerInputs /Dev1/PXI_Trig3 uses PXI_Trig3, the "
+            "pulseClockLine; choose a different trigger line or pulseClockLine"
+            ) in dialog._status_label.text()
+    assert not _ok_enabled(dialog)
+    dialog.accept()
+    assert dialog.result() != QDialog.DialogCode.Accepted
+
+
 def test_a_save_keeps_the_backplane_clock_line(qapp):
     # The dialog rebuilt the laser configuration from its channels, and
     # backplaneClockLine went back to PXI_Trig1: a save moved the shared
     # clock, here onto the line this trigger input takes.
     config = _backplane_config(backplane_clock_line="PXI_Trig2",
+                               pulse_clock_line="PXI_Trig4",
                                trigger_listener_inputs=("/Dev1/PXI_Trig1",))
     dialog = NidaqPortConfigurationDialog(config, devices=(_backplane_device(),))
     assert _ok_enabled(dialog)
