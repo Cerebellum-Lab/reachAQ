@@ -244,7 +244,8 @@ only picks a saved profile or the builder's unsaved draft and fires it.
 
 Laser Control uses a smaller font (7.5 pt, graph axes 7 pt) so that each
 page fits the docked right-side panel without scrolling; the dialogs it opens
-keep the application font. On christielab10 that panel is 440 x 860 px. Each channel has **Pulse** and **Calibration** tabs.
+keep the application font. On christielab10 that panel is 440 x 860 px. Each
+channel has **Pulse** and **Calibration** tabs.
 The Pulse tab has the **Profile:** picker at the top. Below it are the folding
 sections **Run Pulse**, **Test stim**, **Output stream** and **Board
 trigger**; click a section's title to fold or open it. A folded section gives
