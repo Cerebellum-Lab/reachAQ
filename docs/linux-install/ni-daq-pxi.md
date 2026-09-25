@@ -183,6 +183,23 @@ remain on the 6713. Digital and analog inputs may share the 6221 task; a
 future hardware-timed 6713 output task must join the validated multi-device
 timing topology described below.
 
+The laser's clocked digital outputs - the PMT shutter (`pmtShutterOutput`)
+and each laser's `triggerOutput` and `timingTriggerOutput` - run as clocked
+digital output tasks beside a pulse's analog waveform. Each must be a line on
+a board that can run clocked digital output: on christielab10 a port0 line on
+the 6221, never one of the 6713's lines. A line on another board than the
+laser's analog output is clocked over the backplane, never by naming the
+analog output board's clock: when the pulse runs on its own clock, that clock
+is driven onto `backplaneClockLine` (PXI_Trig1) and read on the line's board,
+with no start trigger of its own, since that clock only runs once the output
+has triggered; when the pulse is synchronized to the input stream, the line
+takes the stream's clock on its own board and its start trigger as its own
+board's view of the pulse's PXI_Trig line. A pulse that would put a second
+signal on `backplaneClockLine`, or whose trigger cannot reach the line's
+board, is refused before anything fires, naming the line. christielab10
+configures none of these lines, and this path has not yet been run on its
+hardware.
+
 Validate configured laser tasks only after confirming the real wiring, and
 with reachAQ closed: its NI-DAQ input stream runs whenever it is open, and
 holds the input lines this opens tasks on.

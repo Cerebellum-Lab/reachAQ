@@ -5,6 +5,7 @@ import dataclasses
 import enum
 import logging
 import numbers
+import re
 import threading
 import time
 import uuid
@@ -36,6 +37,9 @@ logger = logging.getLogger(__name__)
 #: tasks before resetting the laser; the pulse path waits as long for its
 #: operation's owner.
 _CALIBRATION_RELEASE_TIMEOUT_S = 5.0
+
+#: A PXI backplane trigger line, which every board in the chassis sees.
+_BACKPLANE_TRIGGER_LINE = re.compile(r"^PXI_Trig\d+$", re.IGNORECASE)
 
 
 class LaserOperationState(str, enum.Enum):
@@ -512,6 +516,9 @@ class NidaqLaserController:
             timeout_seconds = total_samples / sample_rate_hz + 5.0
         ao_task = self._create_synchronized_analog_output_task(channels, "laser_sync_pulse_ao")
         digital_tasks = []
+        # The clock routes this pulse train adds for its digital outputs, by
+        # name, which it releases when it ends, as the calibration ramp does.
+        added_routes: List[Tuple[str, str]] = []
         run_error = None
         try:
             if operation is not None:
@@ -530,6 +537,13 @@ class NidaqLaserController:
                 )
             ao_task.write(timed_waveforms[0] if len(timed_waveforms) == 1 else timed_waveforms, auto_start=False)
             sample_clock_source = self._analog_output_sample_clock_source(channels[0].analog_output)
+            synchronized = bool(timing_kwargs.get("source"))
+
+            def digital_timing(physical_line):
+                return self._pulse_digital_timing(
+                    physical_line, sample_clock_source, synchronized,
+                    pulse_train.trigger_source, added_routes)
+
             if pmt_enabled:
                 pmt_line = self._require_pmt_shutter_output()
                 digital_tasks.append(
@@ -539,8 +553,7 @@ class NidaqLaserController:
                         [True] * total_samples,
                         sample_rate_hz,
                         total_samples,
-                        sample_clock_source,
-                        pulse_train.trigger_source,
+                        *digital_timing(pmt_line),
                         pulse_train.trigger_edge,
                     )
                 )
@@ -562,8 +575,7 @@ class NidaqLaserController:
                             ),
                             sample_rate_hz,
                             total_samples,
-                            sample_clock_source,
-                            pulse_train.trigger_source,
+                            *digital_timing(channel.trigger_output),
                             pulse_train.trigger_edge,
                         )
                     )
@@ -584,8 +596,7 @@ class NidaqLaserController:
                             ),
                             sample_rate_hz,
                             total_samples,
-                            sample_clock_source,
-                            pulse_train.trigger_source,
+                            *digital_timing(channel.timing_trigger_output),
                             pulse_train.trigger_edge,
                         )
                     )
@@ -625,6 +636,7 @@ class NidaqLaserController:
                 channel_pulses=pulse_train.pulse_trains,
                 close_pmt=pmt_enabled,
                 run_error=run_error,
+                routes=added_routes,
             )
 
     def _resolve_pulse_timing(self, channels, pulse_train):
@@ -692,6 +704,69 @@ class NidaqLaserController:
             "sampleClockSource": plan.sample_clock_source,
             "referenceClockSource": plan.reference_clock_source,
         }
+
+    def _pulse_digital_timing(
+        self,
+        physical_line: str,
+        ao_clock: str,
+        synchronized: bool,
+        trigger_source: Optional[str],
+        added: List[Tuple[str, str]],
+    ) -> Tuple[str, Optional[str]]:
+        """The sample clock and start trigger for one of a pulse's digital lines.
+
+        On the AO's board they are the AO's own, named as they always were. On
+        another board neither name can be used: each is an implicit cross-board
+        route, which DAQmx refuses on christielab10's unidentified chassis
+        (-89125), and a clocked digital line has to sit on the 6221 there,
+        away from the 6713's AO. Which clock replaces them depends on the AO's.
+
+        Synchronized, the AO runs on the input stream's clock, and that clock
+        is already on backplane_clock_line, from the 6221 to the 6713, for as
+        long as the controller is open. Putting the 6713's AO clock on the same
+        line would be a second driver, which DAQmx cannot see across these
+        boards; so the line takes the shared clock as its own board sees it.
+        That clock ticks whether or not the AO has triggered, so the task keeps
+        its start trigger, named on its own board (_start_trigger_seen_from).
+
+        Otherwise the AO runs on its own clock, which is driven onto the
+        backplane clock line and read there, as the calibration ramp's is. It
+        ticks only once the AO has triggered, and the digital tasks start
+        before the AO, so, slaved to it, they need no start trigger: each
+        samples on the AO's own clock edges, as before.
+        """
+        output_device = _device_of(physical_line)
+        if output_device == _device_of(ao_clock):
+            return ao_clock, trigger_source
+        if synchronized:
+            clock = self._shared_clock_for(
+                output_device, self._timing_plan.sample_clock_source, added=added)
+            return clock, self._start_trigger_seen_from(
+                output_device, physical_line, trigger_source)
+        return self._shared_clock_for(output_device, ao_clock, added=added), None
+
+    @staticmethod
+    def _start_trigger_seen_from(
+        output_device: str, physical_line: str, terminal: str,
+    ) -> str:
+        """`terminal` as `output_device` sees it, or a refusal naming why not.
+
+        A PXI_Trig line is bussed: every board in the chassis sees the same
+        line under its own name, which is how the AO board sees the stimulus
+        routed onto it (_connect_trigger_route). Anything else on another
+        board, such as one of its PFI pins, does not reach this one.
+        """
+        parts = terminal.strip("/").split("/")
+        if len(parts) < 2 or parts[0] == output_device:
+            return terminal
+        line = parts[-1]
+        if _BACKPLANE_TRIGGER_LINE.match(line):
+            return f"/{output_device}/{line}"
+        raise RuntimeError(
+            f"{physical_line} cannot start with the laser: its start trigger "
+            f"{terminal} is on {parts[0]}, and only a PXI_Trig line reaches "
+            f"{output_device} from there. Arm the laser on a PXI_Trig line, as "
+            "the board STIM route does")
 
     def _configure_timing_reference(self, task, timing_status) -> None:
         if timing_status.get("status") != "hardware_synchronized":
@@ -856,11 +931,15 @@ class NidaqLaserController:
         channel_pulses: Tuple[LaserPulseTrain, ...],
         close_pmt: bool,
         run_error: Optional[BaseException],
+        routes: Sequence[Tuple[str, str]] = (),
     ) -> None:
         errors = []
         self._stop_and_close_task("pulse analog output task", ao_task, errors)
         for index, task in enumerate(digital_tasks):
             self._stop_and_close_task(f"pulse digital output task {index}", task, errors)
+        # After the tasks that use them, and only this pulse train's own: the
+        # trigger routes and the shared clock's route stay until close().
+        errors.extend(self._release_routes(routes))
         for channel in channels:
             try:
                 self.set_command_voltage(channel.channel_id, channel.minimum_command_volts)
@@ -1164,9 +1243,13 @@ class NidaqLaserController:
         never acquires a route it does not need.
 
         A route this call connects is appended to `added`, for a caller that
-        releases its own routes when it ends. Refused once the controller is
-        closed: close() may already have released every route, and one added
-        after it would outlive the controller.
+        releases its own routes when it ends; one already held is reused, not
+        connected twice. Refused once the controller is closed: close() may
+        already have released every route, and one added after it would
+        outlive the controller. Refused too when something else already drives
+        the line (_backplane_line_holder): in a synchronized pulse train it
+        carries the 6221's clock to the 6713 until close(), and a second
+        driver would corrupt both signals without DAQmx seeing it.
         """
         clock_device = source.strip("/").split("/", 1)[0]
         if not output_device or clock_device == output_device:
@@ -1180,6 +1263,14 @@ class NidaqLaserController:
                     "the laser controller is closed; no clock route is made "
                     f"for {output_device}")
             if (source, destination) not in self._trigger_routes:
+                holder = self._backplane_line_holder(line, source)
+                if holder is not None:
+                    raise RuntimeError(
+                        f"could not put {source} on {line} for "
+                        f"{output_device}: {holder[1]} already carries "
+                        f"{holder[0]}. Two signals driven onto one backplane "
+                        "line corrupt each other, and DAQmx does not see it "
+                        "across these boards")
                 try:
                     self._nidaqmx.system.System.local().connect_terms(
                         source, destination)
@@ -1199,6 +1290,27 @@ class NidaqLaserController:
                     local,
                 )
         return local
+
+    def _backplane_line_holder(self, line: str, source: str) -> Optional[Tuple[str, str]]:
+        """What already drives backplane `line` from another source, or None.
+
+        The line is compared, not the terminal: every board names the same
+        bussed line as its own. This controller's routes count, trigger and
+        clock alike, and so do the input stream's exports in the timing plan,
+        which its worker drives from its own process.
+        """
+        wanted = line.lower()
+        plan = getattr(self, "_timing_plan", None)
+        exports = () if plan is None else (
+            (plan.sample_clock_source, plan.sample_clock_export_terminal),
+            (plan.start_trigger_source, plan.start_trigger_export_terminal),
+        )
+        for held_source, held_destination in (*self._trigger_routes, *exports):
+            if not held_destination or held_source == source:
+                continue
+            if held_destination.rsplit("/", 1)[-1].lower() == wanted:
+                return held_source, held_destination
+        return None
 
     def _route_lock(self):
         """_operation_lock, which every change to _trigger_routes is made under.

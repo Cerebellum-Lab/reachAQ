@@ -284,6 +284,16 @@ you press the button. To change a saved profile's waveform, select it in the
 Pulse Builder, which loads it there for editing, and save. Picking a profile
 does not change **Trigger:** or **Source:**.
 
+A pulse can also drive clocked digital lines with its waveform: the PMT
+shutter (`pmtShutterOutput`) and, per laser, a trigger output and a timing
+trigger output (`triggerOutput`, `timingTriggerOutput`). Run Pulse, Test stim
+and trials all use them. Each must be a line on a board that can run clocked
+digital output - on christielab10 a port0 line on the 6221, never the 6713 -
+and one on another board than the laser's output is clocked over the
+backplane (`backplaneClockLine`, PXI_Trig1). A pulse that cannot clock such a
+line is refused before anything fires, naming the line. christielab10 sets
+none of these lines, and this path has not yet been run on its hardware.
+
 ### Test stim — proves the trial path
 
 Pick a profile in **Profile:**. Then, in the **Test stim** section below Run
