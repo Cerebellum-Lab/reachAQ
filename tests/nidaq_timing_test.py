@@ -1,3 +1,5 @@
+import dataclasses
+
 from autotrainer.core import (
     NidaqDeviceIdentity,
     NidaqSignalChannelConfiguration,
@@ -36,6 +38,9 @@ def _pxi(name, serial):
         counter_outputs=(f"{name}/ctr0",),
         analog_output_sample_clock_supported=True,
         digital_trigger_supported=True,
+        # A board that clocks the digital line it lists, as a 6221 does at
+        # 1 MHz. Discovery's None means it cannot, and the plan refuses it.
+        digital_input_max_rate=1_000_000.0,
     )
 
 
@@ -377,3 +382,54 @@ def test_explicit_route_must_be_present_when_terminals_are_discovered():
 
     assert not plan.is_valid
     assert "/DevA/PFI7" in plan.reason
+
+
+def test_a_digital_line_on_a_board_that_cannot_clock_it_is_refused_by_name():
+    # Run and the DAQ Monitor refused it. Every stream start builds this plan
+    # from fresh discovery, Idle's included, and it let the line through to
+    # the preflight, which failed at -200452 naming neither line nor board.
+    # One check for all three, so one wording.
+    output_board = dataclasses.replace(
+        _pxi("Output", 40), digital_input_max_rate=None)
+
+    plan = build_nidaq_timing_plan(
+        _stream(("tone1", "Output/port0/line0", "digital")),
+        NidaqTimingConfiguration(),
+        (output_board,),
+    )
+
+    assert not plan.is_valid
+    assert "stream channel 'tone1' is 'Output/port0/line0'" in plan.reason
+    assert "Output, which cannot clock digital input" in plan.reason
+
+
+def test_christielab10s_plan_is_unchanged_by_the_digital_clock_rule():
+    # Every stream line is on the 6221, which clocks digital input at 1 MHz.
+    # The 6713, which cannot, carries only the lasers' outputs, and is not
+    # asked about digital input at all.
+    from nidaq_channel_plan_test import _christielab10_stream
+
+    inputs = dataclasses.replace(
+        _pxi("PXI1Slot5", 21803707),
+        analog_inputs=tuple(f"PXI1Slot5/ai{pin}" for pin in range(16)),
+        digital_inputs=tuple(f"PXI1Slot5/port0/line{line}" for line in range(8)),
+    )
+    outputs = dataclasses.replace(
+        _pxi("PXI1Slot4", 27056752),
+        analog_inputs=(),
+        digital_inputs=tuple(f"PXI1Slot4/port0/line{line}" for line in range(8)),
+        digital_input_max_rate=None,
+    )
+
+    plan = build_nidaq_timing_plan(
+        _christielab10_stream(),
+        NidaqTimingConfiguration(),
+        (outputs, inputs),
+        hardware_timed_output_devices=("PXI1Slot4",),
+        hardware_timed_output_channels=("PXI1Slot4/ao0", "PXI1Slot4/ao1"),
+    )
+
+    assert plan.is_valid, plan.reason
+    assert plan.resolved_mode == "backplane"
+    assert plan.master_device == "PXI1Slot5"
+    assert plan.sample_clock_source == "/PXI1Slot5/ai/SampleClock"
