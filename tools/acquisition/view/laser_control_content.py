@@ -39,6 +39,7 @@ from tools.acquisition.model.trial_protocol_schedule import (
 from tools.acquisition.model.app_model import AppModel
 from tools.acquisition.model.laser_model import LaserModel, LaserTraceBlock
 from tools.acquisition.model.laser_plot_process import LaserPlotFrame, LaserPlotProcess
+from tools.acquisition.model.nidaq_channel_plan import nidaq_channel_kind
 from tools.acquisition.model.nidaq_signal_monitor_model import NidaqSignalMonitorModel
 from tools.acquisition.model.trial_action import LaserPulseProfile
 from tools.acquisition.view.compact_panel import (
@@ -83,18 +84,12 @@ _TRACE_SIGNALS_EXPLANATION = (
 # (440 x 860 px on christielab10's 1920x1080 screen) with no scroll bar.
 _TRACE_PLOT_MINIMUM_HEIGHT = 140
 _TRIGGER_PLOT_HEIGHT = 76
-
-
-def _nidaq_channel_kind(physical_channel: str) -> str:
-    """Analog or digital, from the NI channel name.
-
-    NI names a digital line by its port and line, as in Dev1/port0/line3, and
-    an analog input as Dev1/ai3. The stimulus line can be wired back into
-    either, so the kind follows the name rather than another setting to keep
-    in step with it.
-    """
-    lowered = str(physical_channel).lower()
-    return "digital" if "port" in lowered or "line" in lowered else "analog"
+# Edit DAQ Ports has no field for the trigger readback; it is set in the
+# system configuration, and that dialog keeps whatever is there.
+_TRIGGER_INPUT_INSTRUCTION = (
+    "Wire the board STIM line into an NI input and set it as this laser's "
+    "triggerMonitorInput in the system configuration."
+)
 
 
 class _LaserOperationWorker(QObject):
@@ -619,7 +614,9 @@ class _LaserChannelTab(QWidget):
         return NidaqSignalChannelConfiguration(
             name=name,
             physical_channel=physical_channel,
-            kind=_nidaq_channel_kind(physical_channel),
+            # The acquisition plan's own rule, so the kind shown here is the
+            # kind that is acquired.
+            kind=nidaq_channel_kind(physical_channel),
             scale=scale,
         )
 
@@ -627,9 +624,10 @@ class _LaserChannelTab(QWidget):
         """The acquired stream channel behind this input, found by its pin.
 
         By pin rather than by the candidate's name, as configure_laser_plot
-        finds what to plot. The board trigger readback is not in the plan the
-        ports build, and ticking it named a channel the stream did not have,
-        which the selection refused with an exception.
+        finds what to plot. An input the stream does not acquire yet - the
+        board trigger readback was never in the plan, and a new plan loads
+        only after the tabs are rebuilt - named a channel the stream did not
+        have when ticked, which the selection refused with an exception.
         """
         candidate = self._trace_signal_candidates.get(signal_key)
         if candidate is None:
@@ -657,7 +655,9 @@ class _LaserChannelTab(QWidget):
             # buffers every acquired input, so a tick only shows or hides it.
             checkbox.setEnabled(acquired is not None and monitor.hardware_enabled)
             channel_tooltip = "" if candidate is None else f"{candidate.physical_channel}\n"
-            if candidate is None:
+            if candidate is None and key == "trigger":
+                checkbox.setToolTip(_TRIGGER_INPUT_INSTRUCTION)
+            elif candidate is None:
                 checkbox.setToolTip("Assign this input in Edit → Edit DAQ Ports first.")
             elif acquired is None:
                 checkbox.setToolTip(
@@ -901,9 +901,7 @@ class _LaserChannelTab(QWidget):
         candidate = self._trace_signal_candidates.get("trigger")
         if candidate is None:
             self.trigger_status.setText(
-                "No trigger readback input is configured. Wire the board stimulus "
-                "line into an NI input and set it in Edit DAQ Ports to see the "
-                "edge that starts the waveform."
+                "No trigger readback input is configured. " + _TRIGGER_INPUT_INSTRUCTION
             )
             return
         if self._acquired_channel("trigger") is None:
@@ -1253,6 +1251,10 @@ class LaserControlContent(ContentWidget):
         ):
             for tab in self._channel_tabs:
                 tab.refresh_signal_selections()
+                # A load or a DAQ ports save rebuilds the tabs against the
+                # old plan and loads the new one after; written only at the
+                # rebuild, this said the readback was not acquired.
+                tab.refresh_trigger_status()
         if property_name in (
             NidaqSignalMonitorModel.CONFIGURATION,
             NidaqSignalMonitorModel.HARDWARE_ENABLED,

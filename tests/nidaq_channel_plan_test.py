@@ -1,3 +1,5 @@
+import pytest
+
 from autotrainer.core import (
     LaserChannelConfiguration,
     LaserChannelId,
@@ -88,3 +90,150 @@ def test_existing_unmapped_channel_is_retained_as_custom_input():
     )
 
     assert result.channels == (custom,)
+
+
+def _laser_with(**overrides):
+    values = dict(
+        channel_id=LaserChannelId.LASER_1,
+        analog_output="OutputCard/ao0",
+        diode_input="InputCard/ai0",
+        shutter_output="OutputCard/port0/line0",
+        command_copy_input="InputCard/ai1",
+    )
+    values.update(overrides)
+    return LaserSystemConfiguration.from_channels(
+        (LaserChannelConfiguration(**values),), backend="nidaq")
+
+
+def _empty_stream():
+    return NidaqSignalStreamConfiguration()
+
+
+def test_a_configured_trigger_readback_is_acquired_beside_the_laser_inputs():
+    # Streamed and recorded like the diode and the command copy: it was
+    # never in the plan, so the Board trigger graph could never show it.
+    result = build_nidaq_acquisition_configuration(
+        _empty_stream(),
+        NidaqPortConfiguration(),
+        _laser_with(trigger_monitor_input="InputCard/ai9"),
+    )
+
+    assert tuple(channel.name for channel in result.channels) == (
+        "laser1_diode",
+        "laser1_command_copy",
+        "laser1_trigger",
+    )
+    trigger = result.channels[-1]
+    assert trigger.physical_channel == "InputCard/ai9"
+    assert trigger.kind == "analog"
+    assert trigger.unit == "V"
+    assert trigger.scale == 1.0
+
+
+def test_each_laser_gets_its_own_trigger_readback():
+    laser = LaserSystemConfiguration.from_channels(
+        (
+            LaserChannelConfiguration(
+                channel_id=LaserChannelId.LASER_1,
+                analog_output="OutputCard/ao0",
+                diode_input="InputCard/ai8",
+                shutter_output="InputCard/port0/line4",
+                trigger_monitor_input="InputCard/ai9",
+            ),
+            LaserChannelConfiguration(
+                channel_id=LaserChannelId.LASER_2,
+                analog_output="OutputCard/ao1",
+                diode_input="InputCard/ai4",
+                shutter_output="InputCard/port0/line5",
+                trigger_monitor_input="InputCard/ai10",
+            ),
+        ),
+        backend="nidaq",
+    )
+
+    result = build_nidaq_acquisition_configuration(
+        _empty_stream(), NidaqPortConfiguration(), laser)
+
+    by_name = {channel.name: channel.physical_channel for channel in result.channels}
+    assert by_name["laser1_trigger"] == "InputCard/ai9"
+    assert by_name["laser2_trigger"] == "InputCard/ai10"
+
+
+def test_a_trigger_readback_on_a_digital_line_is_acquired_as_digital():
+    result = build_nidaq_acquisition_configuration(
+        _empty_stream(),
+        NidaqPortConfiguration(),
+        _laser_with(trigger_monitor_input="InputCard/port0/line6"),
+    )
+
+    trigger = result.channels[-1]
+    assert trigger.name == "laser1_trigger"
+    assert trigger.kind == "digital"
+    assert trigger.unit == "logic"
+
+
+def test_without_a_trigger_readback_the_plan_is_what_it_was():
+    result = build_nidaq_acquisition_configuration(
+        _empty_stream(), NidaqPortConfiguration(), _laser_with())
+
+    assert tuple(
+        (channel.name, channel.physical_channel, channel.kind)
+        for channel in result.channels
+    ) == (
+        ("laser1_diode", "InputCard/ai0", "analog"),
+        ("laser1_command_copy", "InputCard/ai1", "analog"),
+    )
+
+
+def test_a_custom_input_on_the_trigger_terminal_becomes_the_laser_trigger():
+    # christielab10 acquires ai9 as a custom channel, laser1_trigger_readback.
+    # Named as this laser's readback, it is claimed like any laser input: one
+    # channel under the role's name, keeping its unit and scaling.
+    custom = NidaqSignalChannelConfiguration(
+        "laser1_trigger_readback", "InputCard/ai9", unit="V", scale=2.0, offset=0.5)
+    configured = NidaqSignalStreamConfiguration(
+        channels=(custom,),
+        is_enabled=True,
+        display_channels=("laser1_trigger_readback",),
+    )
+
+    result = build_nidaq_acquisition_configuration(
+        configured,
+        NidaqPortConfiguration(),
+        _laser_with(trigger_monitor_input="InputCard/ai9"),
+    )
+
+    names = tuple(channel.name for channel in result.channels)
+    assert names == ("laser1_diode", "laser1_command_copy", "laser1_trigger")
+    trigger = result.channels[-1]
+    assert (trigger.scale, trigger.offset) == (2.0, 0.5)
+
+
+@pytest.mark.parametrize(
+    ("clashing_input", "owner"),
+    [("InputCard/ai0", "laser1_diode"), ("InputCard/ai1", "laser1_command_copy")],
+    ids=["diode", "command_copy"],
+)
+def test_a_trigger_readback_on_another_laser_input_is_refused(clashing_input, owner):
+    with pytest.raises(ValueError) as refused:
+        build_nidaq_acquisition_configuration(
+            _empty_stream(),
+            NidaqPortConfiguration(),
+            _laser_with(trigger_monitor_input=clashing_input),
+        )
+
+    message = str(refused.value)
+    assert clashing_input in message
+    assert owner in message and "laser1_trigger" in message
+
+
+def test_a_trigger_readback_on_a_port_role_line_is_refused():
+    with pytest.raises(ValueError) as refused:
+        build_nidaq_acquisition_configuration(
+            _empty_stream(),
+            NidaqPortConfiguration(tone1="InputCard/port0/line2"),
+            _laser_with(trigger_monitor_input="InputCard/port0/line2"),
+        )
+
+    assert "tone1" in str(refused.value)
+    assert "laser1_trigger" in str(refused.value)

@@ -268,11 +268,17 @@ curve at once. The input selections persist immediately in
 `nidaqStream.displayChannels`, while remaining absent from the main Analysis
 selector and plot; whether the command output is shown is remembered until
 reachAQ closes. An input that is not in the acquisition plan is disabled and
-its tooltip says so. Manual/internal and externally triggered pulse
-operations append their command waveform. Selected measured inputs from the
-shared NI-DAQ stream are added to the corresponding laser graph. Calibration
-explicitly starts and clears the associated graph. Each live stream graph has
-its own editable time window and voltage limits.
+its tooltip says so. The diode and command-copy inputs come from **Edit DAQ
+Ports**; the board-trigger readback comes from the laser channel's
+`triggerMonitorInput` in the system configuration, which Edit DAQ Ports does
+not show and keeps as it is. Each configured input is acquired and recorded as
+`laserN_diode`, `laserN_command_copy` or `laserN_trigger`, and the Board
+trigger status line names the input it reads or says what to set. An input
+already used by another role is refused, naming both. Manual/internal and
+externally triggered pulse operations append their command waveform. Selected
+measured inputs from the shared NI-DAQ stream are added to the corresponding
+laser graph. Calibration explicitly starts and clears the associated graph.
+Each live stream graph has its own editable time window and voltage limits.
 
 Every stream option and curve uses the same high-contrast color assignment:
 the first displayed signal is blue, the second green, followed by orange,

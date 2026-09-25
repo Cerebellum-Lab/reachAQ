@@ -7694,15 +7694,19 @@ class AppModel(ObservableObject):
         nidaq_ports: NidaqPortConfiguration,
         laser_configuration: LaserSystemConfiguration,
     ) -> None:
-        self._nidaq_ports = nidaq_ports
-        self._laser.set_configuration_offline(laser_configuration)
-        self._loaded_configuration.nidaq_ports = nidaq_ports
-        self._loaded_configuration.laser = laser_configuration
+        # Built first, because building is what refuses two roles on one
+        # input. Edit DAQ Ports keeps a laser's trigger readback without
+        # showing it, so it can offer that input to the diode; built after
+        # the lasers were applied, the refused save had already changed them.
         acquisition = build_nidaq_acquisition_configuration(
             self._nidaq_signal_monitor.configuration,
             nidaq_ports,
             laser_configuration,
         )
+        self._nidaq_ports = nidaq_ports
+        self._laser.set_configuration_offline(laser_configuration)
+        self._loaded_configuration.nidaq_ports = nidaq_ports
+        self._loaded_configuration.laser = laser_configuration
         self._nidaq_signal_monitor.load_configuration(acquisition)
         hardware_timed_output_devices = tuple(
             dict.fromkeys(

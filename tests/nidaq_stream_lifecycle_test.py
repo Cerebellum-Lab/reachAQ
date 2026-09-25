@@ -13,7 +13,13 @@ import time
 
 import pytest
 
-from autotrainer.core import NidaqPortConfiguration, NidaqTimingConfiguration
+from autotrainer.core import (
+    LaserChannelConfiguration,
+    LaserChannelId,
+    LaserSystemConfiguration,
+    NidaqPortConfiguration,
+    NidaqTimingConfiguration,
+)
 from tools.acquisition.model import nidaq_monitor_session, nidaq_signal_monitor_model
 from tools.acquisition.model.app_model_status import SessionRecordingStatus
 from tools.acquisition.model.nidaq_monitor_session import NidaqMonitorSession
@@ -328,6 +334,43 @@ def test_saving_daq_ports_restarts_the_stream_with_the_new_plan(nidaq_app):
     assert monitor.is_running
     assert _worker_pid(monitor) != pid
     assert "tone1" in monitor.sample_ring.channel_names
+
+
+def test_a_daq_ports_save_clashing_with_the_trigger_readback_changes_nothing(nidaq_app):
+    # Edit DAQ Ports has no field for the trigger readback and keeps it as
+    # it was, so it can offer that input to the diode. The plan refuses the
+    # pair; the laser configuration was applied before the plan was built,
+    # so a refused save still changed the lasers.
+    assert nidaq_app.load_configuration() is True
+    _settle(nidaq_app)
+    laser_before = nidaq_app.laser.configuration
+    ports_before = nidaq_app.nidaq_ports
+    plan_before = nidaq_app.nidaq_signal_monitor.configuration
+    clashing = LaserSystemConfiguration.from_channels(
+        (
+            LaserChannelConfiguration(
+                channel_id=LaserChannelId.LASER_1,
+                analog_output="Dev1/ao0",
+                diode_input="Dev1/ai0",
+                shutter_output="Dev1/port0/line2",
+                trigger_monitor_input="Dev1/ai0",
+            ),
+        ),
+        backend="null",
+    )
+
+    with pytest.raises(ValueError) as refused:
+        nidaq_app.update_daq_port_configuration(
+            dataclasses.replace(ports_before, tone1="Dev1/port0/line3"), clashing)
+
+    assert "laser1_diode" in str(refused.value)
+    assert "laser1_trigger" in str(refused.value)
+    assert nidaq_app.laser.configuration == laser_before
+    assert nidaq_app.loaded_configuration.laser == laser_before
+    assert nidaq_app.nidaq_ports == ports_before
+    assert nidaq_app.loaded_configuration.nidaq_ports == ports_before
+    assert nidaq_app.nidaq_signal_monitor.configuration == plan_before
+    assert _settle(nidaq_app).is_running
 
 
 def test_a_failed_start_is_shown_and_not_retried(app_model, system_config,

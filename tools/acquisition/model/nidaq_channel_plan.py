@@ -21,6 +21,18 @@ _PORT_INPUT_ROLES = (
 )
 
 
+def nidaq_channel_kind(physical_channel: str) -> str:
+    """Analog or digital, from the NI channel name.
+
+    NI names a digital line by its port and line, as in Dev1/port0/line3, and
+    an analog input as Dev1/ai3. The stimulus line can be wired back into
+    either, so the kind follows the name rather than another setting to keep
+    in step with it.
+    """
+    lowered = str(physical_channel).lower()
+    return "digital" if "port" in lowered or "line" in lowered else "analog"
+
+
 def build_nidaq_acquisition_configuration(
     configured_stream: NidaqSignalStreamConfiguration,
     ports: NidaqPortConfiguration,
@@ -75,20 +87,35 @@ def build_nidaq_acquisition_configuration(
 
     for channel in laser.channels if laser.backend != "disabled" else ():
         laser_index = int(channel.channel_id)
-        for suffix, physical_channel, scale in (
-            ("diode", channel.diode_input, channel.feedback_scale),
-            ("command_copy", channel.command_copy_input, channel.command_copy_scale),
+        trigger_input = channel.trigger_monitor_input
+        for suffix, physical_channel, kind, scale in (
+            ("diode", channel.diode_input, "analog", channel.feedback_scale),
+            ("command_copy", channel.command_copy_input, "analog", channel.command_copy_scale),
+            # The board's stimulus line read back, for the laser tab's Board
+            # trigger graph. It was never added, so it was neither streamed
+            # nor recorded, and the graph could not show anything. It has no
+            # scale in the laser configuration; a channel already acquired on
+            # that input keeps its own, as the port roles do.
+            (
+                "trigger",
+                trigger_input,
+                nidaq_channel_kind(trigger_input) if trigger_input else "analog",
+                None,
+            ),
         ):
             if not physical_channel:
                 continue
             role_physical_channels.add(physical_channel)
             previous = configured_by_physical.get(physical_channel)
+            if scale is None:
+                scale = 1.0 if previous is None else previous.scale
             add(
                 NidaqSignalChannelConfiguration(
                     name=f"laser{laser_index}_{suffix}",
                     physical_channel=physical_channel,
-                    kind="analog",
-                    unit="V" if previous is None else previous.unit,
+                    kind=kind,
+                    # Empty picks the kind's default: V, or logic for a line.
+                    unit="" if previous is None else previous.unit,
                     scale=scale,
                     offset=0.0 if previous is None else previous.offset,
                     minimum=None if previous is None else previous.minimum,

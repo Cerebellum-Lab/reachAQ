@@ -132,6 +132,10 @@ laser: !LaserSystemConfiguration
   #   triggerSource: /PXI1Slot4/PXI_Trig0
   #   boardStimLine: 3
   #   boardTriggerPulseUs: 1000
+  #   # Optional: the board STIM line wired back into an NI input, acquired
+  #   # and recorded as laser1_trigger for the laser tab's Board trigger
+  #   # graph. Set here only; Edit DAQ Ports keeps it but has no field for it.
+  #   triggerMonitorInput: PXI1Slot5/ai9
   backend: disabled
   hardwareTimed: false
   sampleRateHz: null
