@@ -24,6 +24,11 @@ class LaserFiring:
     stim_line: Optional[int] = None
     trigger_pulse_us: int = 1000
 
+    def __post_init__(self):
+        # A route given as its value ("hardware_stim3") read as a software
+        # start in is_board_trigger, which compares by identity.
+        object.__setattr__(self, "trigger_route", LaserTriggerRoute(self.trigger_route))
+
     @property
     def is_board_trigger(self) -> bool:
         return self.trigger_route is LaserTriggerRoute.HARDWARE_STIM3

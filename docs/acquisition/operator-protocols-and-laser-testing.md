@@ -180,13 +180,17 @@ is **Pulse Builder** — every profile is made here, and nowhere else.
 - The controls shape the train: **Amplitude**, **Pulse width**, **Baseline**,
   **Post-stim**, **Count**, **Frequency**, **PMT open lead**, **PMT close
   lag**. Amplitude here is limited to the widest range any configured laser
-  accepts; the laser that actually fires the profile checks its own range.
+  accepts; the laser that actually fires the profile checks its own range. A
+  saved profile outside that range loads clamped to it, and the status line
+  says so: *"Profile 'hot' is 6 V; the builder allows 0..5 V, so it now shows
+  5 V"*.
 - The preview plot and the status line under it show the waveform when it is
   valid, or the reason it is not — for example a pulse width that exceeds the
   period at the chosen frequency.
 - **Save profile…** asks for a name only. Reusing an existing profile's name
   saves a new revision of it. Nothing about which laser fires it, or how, is
-  asked or stored here.
+  asked or stored here. The name `builder-draft` is reserved for the draft and
+  refused.
 - Whatever is on the controls, saved or not, is the **builder draft**. A laser
   tab can fire the draft directly, so you can shape a train and try it without
   saving a revision for every change.
@@ -197,11 +201,17 @@ Open the **Laser Control** tab. There is one sub-tab per configured channel,
 *Laser 1*, *Laser 2* and so on, each with **Pulse**, **Calibration** and
 **Output** pages.
 
-On the **Pulse** page, **Profile:** picks what fires on this laser: *(builder
-draft)* or any saved profile, unfiltered — a profile made with one laser in
-mind fires just as well on another. The summary line under it reads the picked
-train, such as *"1 V · 500 × 1 ms at 100 Hz · 5.00 s"*, or says the draft is
-not a valid pulse train.
+On the **Pulse** page, **Profile:** picks what fires on this laser: *(none)*,
+*(builder draft)* or any saved profile, unfiltered — a profile made with one
+laser in mind fires just as well on another. A laser tab starts on *(none)*,
+and Run Pulse and Test stim refuse until you pick something, so a laser never
+fires whatever happens to be on the builder. The pick survives the tab
+rebuilds that every system Run/Stop and Edit DAQ Ports save cause. If the
+picked profile is deleted, or is otherwise no longer saved, the tab goes back
+to *(none)* and reports *"Laser 2: profile 'burst' is no longer saved; pick a
+profile"*. The summary line under the picker reads the picked
+train, such as *"1 V · 500 × 1 ms at 100 Hz · 5.00 s"*, *"No profile
+selected"*, or that the draft is not a valid pulse train.
 
 ### Run Pulse — proves the analog output works
 
@@ -220,9 +230,12 @@ an edge on **Trigger Source**. Nothing on this page sends that edge, so use
 pulse fails after the train length plus five seconds with *Wait Until Done did
 not indicate that the task was done*.
 
-Picking a profile in **Profile:** loads its waveform (amplitude, duration,
-count, frequency, baseline, post-stim) into this page, so Run Pulse fires that
-waveform. It does not change Trigger Mode or Trigger Source.
+Picking a profile in **Profile:** chooses what Run Pulse and Test stim fire on
+this laser; this page has no waveform controls, and nothing is copied into it.
+Picking *(builder draft)* fires whatever is on the Pulse Builder at the moment
+you press the button. To change a saved profile's waveform, select it in the
+Pulse Builder, which loads it there for editing, and save. Picking a profile
+does not change Trigger Mode or Trigger Source.
 
 ### Test stim — proves the trial path
 
@@ -267,7 +280,9 @@ Every refusal names its reason in the status line and fires nothing.
 
 | Message | Meaning |
 | --- | --- |
-| *Select a saved profile for laser N, or build a valid draft in the Pulse Builder* | the Profile picker is on the draft and the draft is not valid, or nothing usable is selected. |
+| *Laser N: pick a saved profile or the builder draft* | the Profile picker is on *(none)*. |
+| *Laser N: the builder draft is not a valid pulse train; fix it in the Pulse Builder* | the Profile picker is on *(builder draft)* and the draft cannot be generated; the Pulse Builder's status line says why. |
+| *Laser N: profile 'x' is no longer saved; pick a profile* | the picked profile was deleted; the picker has gone back to *(none)*. |
 | *Stim test is refused while a session is recording* | stop the session first. |
 | *Stim test is refused while a trial operation is prepared or active* | a trial is mid-flight. Wait for it. |
 | *Stim test needs the nidaq laser backend; this rig is configured for 'disabled'* | the laser is off in the system configuration. |

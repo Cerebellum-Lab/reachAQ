@@ -37,6 +37,16 @@ def test_a_board_firing_takes_the_lasers_terminal_line_and_pulse():
     assert firing.is_board_trigger
 
 
+def test_a_route_given_as_its_value_becomes_the_route():
+    # is_board_trigger compares by identity, so a string route read it as a
+    # software start and to_record failed on str.value.
+    firing = LaserFiring(2, "hardware_stim3", "/Dev1/PXI_Trig2", 2)
+
+    assert firing.trigger_route is LaserTriggerRoute.HARDWARE_STIM3
+    assert firing.is_board_trigger
+    assert firing.to_record()["trigger_route"] == "hardware_stim3"
+
+
 def test_a_software_firing_needs_no_terminal_or_line():
     firing = resolve_laser_firing(
         configuration(trigger_source=None, board_stim_line=None), 2,

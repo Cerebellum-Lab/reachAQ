@@ -369,6 +369,46 @@ def test_a_laser_row_compiles_to_the_lasers_own_firing():
     assert recipe.to_record()["laser_firing"]["stim_line"] == 3
 
 
+def test_a_laser_2_row_fires_on_laser_2s_own_line_and_terminal():
+    # christielab10's wiring: laser 1 on STIM3 into PXI_Trig0, laser 2 on
+    # STIM2 into PXI_Trig2. The row's route name is hardware_stim3 either way;
+    # the board line comes from the laser, not the route.
+    lasers = LaserSystemConfiguration.from_channels((
+        LASERS.get_channel(1),
+        LaserChannelConfiguration(
+            channel_id=2,
+            analog_output="Dev4/ao1",
+            diode_input="Dev4/ai4",
+            shutter_output="Dev4/port0/line5",
+            trigger_source="/Dev4/PXI_Trig2",
+            board_stim_line=2,
+        ),
+    ))
+    compiler = TrialActionCompiler(
+        tone_profiles={"cue": ToneProfile("cue", 1, 6000, 100)},
+        laser_profiles={"pulse": LaserPulseProfile("pulse", 3, 2.5, 5.0)},
+        laser_configuration=lasers,
+        dcs_to_motor=lambda values: tuple(value * 2 for value in values),
+    )
+    row = TrialProtocolRow(trial_id=1).with_updates({
+        "enabled": True,
+        "laser_profile_id": "pulse",
+        "laser_phase": "pellet_presentation",
+        "laser_trigger_route": "hardware_stim3",
+        "laser_channel_id": 2,
+        "stimulus_assignment": "always",
+        "stimulus_trigger": "tone_1",
+        "tone_profile_id": "cue",
+        "tone_phase": "before_send",
+    })
+
+    firing = compiler.compile(row, _context()).laser_firing
+
+    assert firing.channel_id == 2
+    assert firing.stim_line == 2
+    assert firing.trigger_terminal == "/Dev4/PXI_Trig2"
+
+
 def test_a_laser_row_on_an_unconfigured_laser_does_not_compile():
     row = TrialProtocolRow(trial_id=1).with_updates({
         "enabled": True,

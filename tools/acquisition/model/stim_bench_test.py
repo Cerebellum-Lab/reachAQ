@@ -1,9 +1,11 @@
-"""Fire one saved laser profile on the bench, off any recording session.
+"""Fire one laser profile, saved or the builder draft, on the bench, off any
+recording session.
 
-The output is armed as a trial arms it, then started by the profile's route.
-On the hardware route the board emits its firmware-timed STIM pulse into the
-trigger terminal. On the software route the host starts it, which is the start
-a trial's stim-camera trigger makes; the camera itself is not exercised.
+The output is armed as a trial arms it, then started by the route chosen for
+the test. On the hardware route the board emits its firmware-timed STIM pulse
+into the laser's trigger terminal. On the software route the host starts it,
+which is the start a trial's stim-camera trigger makes; the camera itself is
+not exercised.
 Nothing here starts a session or touches session evidence.
 """
 
