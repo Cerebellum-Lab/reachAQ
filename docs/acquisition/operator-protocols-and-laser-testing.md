@@ -213,7 +213,31 @@ whenever the NI-DAQ input stream runs, and that stream starts by itself, in
 Idle as well as in System Mode. Its status line says whether it is running.
 Under the graph, the **Signals** section starts folded. Open it, and **Command
 output**, **Diode feedback**, **Command copy** and **Board trigger readback**
-each show or hide their trace at once, at any time.
+each show or hide their trace at once, at any time. An input's box is enabled
+once the input is configured; until then it is greyed out and its tooltip says
+what to set. Every configured input is recorded whether or not it is shown.
+
+The **Board trigger** section plots the board's STIM line read back on an NI
+input, on its own axis under the output graph, so the edge that starts a
+waveform lines up with the waveform. To see it:
+
+1. Wire this laser's board STIM line (on christielab10, STIM3 for laser 1 and
+   STIM2 for laser 2) into a spare NI input.
+2. With reachAQ closed, set that input as the laser channel's
+   `triggerMonitorInput` under `laser: channels:` in
+   `~/Autotrainer/system_configuration.yaml`, for example
+   `triggerMonitorInput: PXI1Slot5/ai9`. **Edit DAQ Ports** has no field for
+   it, and keeps whatever the file says.
+3. Start reachAQ. The input is acquired and recorded as `laserN_trigger`,
+   beside `laserN_diode` and `laserN_command_copy`, as analog or, for a
+   `portN/lineN` input, digital. Tick **Board trigger readback** under
+   Signals to plot it.
+
+The status line under the Board trigger graph names the input it reads, or
+says what to set. An input that another role already uses - this or another
+laser's diode or command copy, or a tone or camera line - is refused, naming
+both, when the configuration loads or Edit DAQ Ports saves; a refused save
+changes nothing.
 
 On the **Pulse** page, **Profile:** picks what fires on this laser: *(none)*,
 *(builder draft)* or any saved profile, unfiltered — a profile made with one

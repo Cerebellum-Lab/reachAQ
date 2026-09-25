@@ -1338,15 +1338,30 @@ def test_a_hidden_command_trace_stays_hidden_when_laser_control_rebuilds(qapp):
         laser.close()
 
 
+def _without_stream_channel(monitor, name):
+    """The stream's plan less one channel, as before the plan names it."""
+    planned = monitor.configuration
+    monitor._configuration = dataclasses.replace(
+        planned,
+        channels=tuple(item for item in planned.channels if item.name != name),
+        display_channels=tuple(
+            item for item in planned.display_channels if item != name),
+    )
+    return planned
+
+
 def test_a_laser_input_outside_the_acquisition_plan_cannot_be_ticked(qapp):
-    # The board trigger readback is not part of the acquisition plan, so
-    # ticking it named a channel the stream does not have and raised.
+    # Ticking an input the stream does not acquire named a channel the
+    # stream does not have, and raised. The board trigger readback was the
+    # case: it was never in the plan. It is now, so the stream here is given
+    # a plan without it, as it has until a new plan is loaded.
     channel = dataclasses.replace(_laser_channel(), trigger_monitor_input="Dev1/ai7")
     configuration = LaserSystemConfiguration.from_channels(
         (channel,), backend="null", sample_rate_hz=1000.0,
     )
     laser = LaserModel(NullLaserController(configuration))
     app_model = _LaserAppStub(laser)
+    _without_stream_channel(app_model.nidaq_signal_monitor, "laser1_trigger")
     tab = _LaserChannelTab(
         app_model,
         channel,
@@ -1364,3 +1379,114 @@ def test_a_laser_input_outside_the_acquisition_plan_cannot_be_ticked(qapp):
         app_model.nidaq_signal_monitor.close()
         laser.close()
         tab.deleteLater()
+
+
+def _laser_content_with_trigger_readback(terminal="Dev1/ai7"):
+    channel = dataclasses.replace(_laser_channel(), trigger_monitor_input=terminal)
+    configuration = LaserSystemConfiguration.from_channels(
+        (channel,), backend="null", sample_rate_hz=1000.0,
+    )
+    laser = LaserModel(NullLaserController(configuration))
+    app_model = _LaserAppStub(laser)
+    app_model.nidaq_signal_monitor._configuration = dataclasses.replace(
+        app_model.nidaq_signal_monitor.configuration, sample_rate_hz=1000.0,
+    )
+    return laser, app_model
+
+
+def test_a_configured_board_trigger_readback_is_acquired_ticked_and_plotted(qapp):
+    # It was never in the acquisition plan, so its box stayed disabled and
+    # the Board trigger graph could never show the edge.
+    laser, app_model = _laser_content_with_trigger_readback()
+    monitor = app_model.nidaq_signal_monitor
+    content = LaserControlContent(app_model)
+    try:
+        acquired = {
+            item.name: item.physical_channel for item in monitor.configuration.channels
+        }
+        assert acquired.get("laser1_trigger") == "Dev1/ai7"
+        tab = content._channel_tabs[0]
+        trigger = tab._trace_signal_checkboxes["trigger"]
+        assert trigger.isEnabled()
+        assert "recorded either way" in trigger.toolTip()
+        assert "Reading Dev1/ai7" in tab.trigger_status.text()
+
+        trigger.setChecked(True)
+        qapp.processEvents()
+        assert "laser1_trigger" in monitor.configuration.display_channels
+        assert tab._trace_curves["trigger"].isVisible()
+        assert "Board trigger" in tuple(
+            entry[0] for entry in tab._trace_legend.entries)
+
+        monitor.sample_ring.write_block(
+            NidaqSignalSampleBlock(
+                wall_time=1.0,
+                perf_time=1.0,
+                sample_rate_hz=1000.0,
+                sample_index=0,
+                channels=monitor.configuration.channels,
+                values={"laser1_trigger": (0.0, 5.0, 0.0)},
+            )
+        )
+        deadline = time.monotonic() + 5.0
+        while len(tab._trace_data["trigger"][0]) < 3 and time.monotonic() < deadline:
+            content._flush_laser_plots()
+            tab.redraw_trace()
+            time.sleep(0.02)
+        assert tab._trace_data["trigger"][1] == pytest.approx([0.0, 5.0, 0.0])
+
+        trigger.setChecked(False)
+        qapp.processEvents()
+        assert "laser1_trigger" not in monitor.configuration.display_channels
+        assert not tab._trace_curves["trigger"].isVisible()
+    finally:
+        content.on_close()
+        content.deleteLater()
+        monitor.close()
+        laser.close()
+
+
+def test_the_board_trigger_status_follows_a_newly_loaded_plan(qapp):
+    # A configuration load and an Edit DAQ Ports save set the laser
+    # configuration first, which rebuilds the tabs against the stream's old
+    # plan, and only then load the new plan. The status line was written
+    # once, at the rebuild, and kept saying the input was not acquired.
+    laser, app_model = _laser_content_with_trigger_readback()
+    monitor = app_model.nidaq_signal_monitor
+    planned = _without_stream_channel(monitor, "laser1_trigger")
+    content = LaserControlContent(app_model)
+    try:
+        tab = content._channel_tabs[0]
+        assert "not in the NI-DAQ acquisition plan" in tab.trigger_status.text()
+        assert not tab._trace_signal_checkboxes["trigger"].isEnabled()
+
+        monitor.load_configuration(planned)
+        qapp.processEvents()
+
+        assert "Reading Dev1/ai7" in tab.trigger_status.text()
+        assert tab._trace_signal_checkboxes["trigger"].isEnabled()
+    finally:
+        content.on_close()
+        content.deleteLater()
+        monitor.close()
+        laser.close()
+
+
+def test_without_a_trigger_readback_the_board_trigger_says_what_to_set(qapp):
+    laser, app_model, content = _laser_content_with_diode_stream()
+    try:
+        tab = content._channel_tabs[0]
+        trigger = tab._trace_signal_checkboxes["trigger"]
+        assert not trigger.isEnabled()
+        assert "laser1_trigger" not in {
+            item.name for item in app_model.nidaq_signal_monitor.configuration.channels
+        }
+        # Edit DAQ Ports has no field for it; the system configuration does.
+        for text in (tab.trigger_status.text(), trigger.toolTip()):
+            assert "triggerMonitorInput" in text
+            assert "Edit DAQ Ports" not in text
+    finally:
+        content.on_close()
+        content.deleteLater()
+        app_model.nidaq_signal_monitor.close()
+        laser.close()

@@ -487,10 +487,13 @@ unassigned.
 ## NI-DAQ acquisition and synchronization
 
 `nidaqPorts` assigns physical inputs to semantic roles: camera frames, barcode,
-and tone lines. Configured laser diode and command-copy feedback inputs are added
-to the same acquisition plan. Existing `nidaqStream.channels` not claimed by a
-named role remain custom acquired inputs. `displayChannels` controls only which
-curves are plotted.
+and tone lines. Configured laser diode and command-copy feedback inputs, and a
+laser's board-trigger readback (`triggerMonitorInput`), are added to the same
+acquisition plan as `laserN_diode`, `laserN_command_copy` and `laserN_trigger`.
+Existing `nidaqStream.channels` not claimed by a named role remain custom
+acquired inputs; one on an input that a role now names is taken over by the
+role, under the role's name, keeping its unit and scaling. `displayChannels`
+controls only which curves are plotted.
 
 The DAQ Ports dialog discovers device identity and capabilities, including
 model, serial, bus/chassis, AI/AO/DI/DO channels, counters, terminals, maximum

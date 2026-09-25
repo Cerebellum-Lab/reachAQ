@@ -137,8 +137,10 @@ The 6713 supplies analog output, digital I/O, and counters, but no analog input.
 The documented rig also has a PXI-6221 at `PXI1Slot5`; it supplies the sampled
 analog feedback inputs, hardware-clocked digital inputs, and counters used by
 the acquisition timeline. Laser `diodeInput` and `commandCopyInput` therefore
-belong on the 6221 (or another discovered analog-input device), while laser
-analog commands can remain on the 6713. Digital and analog inputs may share the
+belong on the 6221 (or another discovered analog-input device), and so does a
+laser's board-trigger readback, `triggerMonitorInput` (an analog input or a
+digital line), while laser analog commands can remain on the 6713. Digital and
+analog inputs may share the
 6221 task; a future hardware-timed 6713 output task must join the validated
 multi-device timing topology described below.
 
@@ -153,11 +155,11 @@ conda run -n reachaq python tools/hardware/validate_laser_hardware.py \
   --action connect
 ```
 
-Main Analysis camera/barcode/tone selections and the diode/command-copy
-selections owned by each Laser Control tab are saved immediately under
-`nidaqStream.displayChannels`, and can be changed while the stream runs. Plot
-visibility does not change acquisition:
-every mapped camera-frame, barcode, tone, laser-feedback, and custom input is
+Main Analysis camera/barcode/tone selections and the diode, command-copy and
+board-trigger selections owned by each Laser Control tab are saved immediately
+under `nidaqStream.displayChannels`, and can be changed while the stream runs.
+Plot visibility does not change acquisition: every mapped camera-frame,
+barcode, tone, laser-feedback, laser trigger-readback, and custom input is
 included in the recording task and saved to `streams/nidaq.h5`.
 
 The input stream has no Start button. With NI-DAQ enabled and at least one
