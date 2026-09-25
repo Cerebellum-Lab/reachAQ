@@ -165,15 +165,14 @@ input mapped, reachAQ starts it by itself while idle - when the configuration
 loads, after a hardware refresh, after **Edit DAQ Ports** saves, and when
 acquisition stops. Starting System Mode restarts it, so recorded timing starts
 from a fresh task-start anchor rather than carrying the Idle stream's clock
-drift into a session. A start
-that fails is shown in Hardware Status and the log and is not retried by
-itself; a hardware refresh tries again. Stream task
-creation happens in an isolated child
-process because a broken or incompatible NI-DAQmx native runtime can terminate
-the Python interpreter. If the worker exits with `SIGSEGV` or does not become
-ready within 10 seconds, reachAQ remains open and displays the failure. Treat
-that message as a driver/device problem: re-run the discovery checks above and
-verify that each selected channel supports the requested input task.
+drift into a session. A start that fails is shown in Hardware Status and the
+log and is not retried by itself; a hardware refresh tries again. Stream task
+creation happens in an isolated child process because a broken or incompatible
+NI-DAQmx native runtime can terminate the Python interpreter. If the worker
+exits with `SIGSEGV` or does not become ready within 10 seconds, reachAQ
+remains open and displays the failure. Treat that message as a driver/device
+problem: re-run the discovery checks above and verify that each selected
+channel supports the requested input task.
 
 For camera/barcode TTL streams, use a hardware-clocked input rate of at least
 5 kHz; reachAQ defaults to 10 kHz and derives the runtime read size from the
