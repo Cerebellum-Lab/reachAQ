@@ -168,14 +168,24 @@ The Analysis card contains **Stream** and **Signals** tabs. Signals lists camera
 frame, barcode, Tone 1, Tone 2, Tone 3 right, and Tone 3 left inputs. Laser
 signals are intentionally excluded from this card. A checkbox becomes
 selectable only after that signal has a physical assignment in **Edit → Edit
-DAQ Ports** and NI-DAQ is enabled. Stop the stream before changing main Analysis
-selections; every checkbox change is immediately saved as the
-`nidaqStream.displayChannels` plot selection. It never changes the complete
-acquisition channel plan. Start Stream and Clear are disabled when NI-DAQ is
-disabled, and Start Stream also requires at least one selected Analysis channel.
-Streams remain stopped when reachAQ opens. They can be started manually while
-idle; configured streams start automatically when acquisition becomes active
-and stop again when acquisition stops.
+DAQ Ports** and NI-DAQ is enabled. Checkboxes can be changed at any time,
+including while the stream runs: a change shows or hides that curve at once,
+and the other curves keep their history. Every checkbox change is immediately
+saved as the `nidaqStream.displayChannels` plot selection. It never changes the
+complete acquisition channel plan. Clear is disabled when NI-DAQ is disabled.
+
+There is no Start or Stop button for the NI-DAQ input stream. It starts by
+itself whenever NI-DAQ is enabled and at least one input is mapped, in Idle as
+well as in System Mode: once the configuration loads when reachAQ opens, after
+a Hardware Refresh or enabling NI-DAQ under **File → Hardware**, after **Edit
+DAQ Ports** saves (with the new channel plan), and again when acquisition
+stops. Starting System Mode uses the stream that is already running. The
+Analysis header shows `running`, `starting`, `stopped`, `disabled` or `error`;
+hover over it for the detail. A stream that fails to start stays stopped and
+reports the failure in Hardware Status and the log. It is not retried by
+itself; Hardware Refresh tries again. **Tools → DAQ Monitor** pauses the stream
+while its window is open, because it opens its own tasks on the same lines,
+and the stream starts again when that window closes.
 
 NI-DAQmx task creation and reads run in an isolated worker process. The Analysis
 card stays responsive while the worker starts, and a native driver crash such as
@@ -231,19 +241,25 @@ only picks a saved profile or the builder's unsaved draft and fires it.
 
 Each Laser Control channel uses compact **Pulse**, **Calibration**, and **Output**
 tabs so its controls remain usable when the right-side panel is narrow. The
-Output area has nested **Stream** and **Signals** tabs. Stream contains the graph
-and its independent Start/Stop and Clear controls; Signals contains only that
-laser's diode-feedback and command-copy display options. Physical NI-DAQ paths
-are shown in signal tooltips instead of widening the panel. Plots and controls
-shrink with the panel; use the main splitter to give them more room when desired.
-**Start DAQ Inputs** starts the shared input worker;
-the button clearly labels its shared stop action while it is running. These
-selections also persist immediately in `nidaqStream.displayChannels`, while remaining
-absent from the main Analysis selector and plot. Manual/internal and externally
-triggered pulse operations append their command waveform. Selected measured
-inputs from the shared NI-DAQ stream are added to the corresponding laser
-graph. Calibration explicitly starts and clears the associated graph. Each live
-stream graph has its own editable time window and voltage limits.
+Output area has nested **Stream** and **Signals** tabs. Stream contains the graph,
+its Clear control and a status line naming the shared input stream's state;
+Signals contains that laser's command-output, diode-feedback, command-copy and
+board-trigger-readback display options. Physical NI-DAQ paths are shown in
+signal tooltips instead of widening the panel. Plots and controls shrink with
+the panel; use the main splitter to give them more room when desired. A mapped
+laser's graph follows the shared NI-DAQ input stream, which starts by itself
+(see above), so its inputs plot in Idle as well as in System Mode; there is no
+Start Stream or Start DAQ Inputs button. Every display option can be ticked or
+unticked at any time, including while the stream runs, and shows or hides its
+curve at once. The input selections persist immediately in
+`nidaqStream.displayChannels`, while remaining absent from the main Analysis
+selector and plot; whether the command output is shown is remembered until
+reachAQ closes. An input that is not in the acquisition plan is disabled and
+its tooltip says so. Manual/internal and externally triggered pulse
+operations append their command waveform. Selected measured inputs from the
+shared NI-DAQ stream are added to the corresponding laser graph. Calibration
+explicitly starts and clears the associated graph. Each live stream graph has
+its own editable time window and voltage limits.
 
 Every stream option and curve uses the same high-contrast color assignment:
 the first displayed signal is blue, the second green, followed by orange,
@@ -349,7 +365,8 @@ without restarting healthy domains.
   calibration workflows.
 * Tools -> DAQ Monitor - while idle, watch every line on every NI-DAQ card,
   drive tones, board stimulus lines and laser commands to see which line moves,
-  and run the wiring test. See
+  and run the wiring test. The application's NI-DAQ input stream pauses while
+  the window is open and starts again when it closes. See
   [Check the wiring](../../docs/linux-install/ni-daq-pxi.md#check-the-wiring).
 * View -> Logging - show or hide the application log. Errors are reported here,
   in the status bar, in the launching terminal, and in the log file instead of
