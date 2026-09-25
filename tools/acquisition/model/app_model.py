@@ -6303,6 +6303,19 @@ class AppModel(ObservableObject):
             # DAQmx status code from inside a running task, naming neither the
             # configuration line responsible nor the remedy.
             self._require_valid_nidaq_configuration()
+            # An automatic start that decided to run just before System Mode
+            # began can still be in discovery or the preflight here, holding
+            # the monitor without yet saying it is starting. Decided now, the
+            # stop below was skipped and start() handed System Mode that Idle
+            # worker once it launched. Let it finish first, within the same
+            # bound as the start; past that, carry on rather than hang Run.
+            if restart and not self._nidaq_stream_autostart.wait(timeout):
+                logger.warning(
+                    "An automatic NI-DAQ input stream start was still running "
+                    "after %g seconds; System Mode may keep its worker instead "
+                    "of a fresh one",
+                    timeout,
+                )
             if restart and (monitor.is_running or monitor.is_starting):
                 logger.info(
                     "Restarting the NI-DAQ input stream so System Mode's "
