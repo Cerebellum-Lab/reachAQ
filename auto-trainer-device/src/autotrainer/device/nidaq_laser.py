@@ -719,6 +719,8 @@ class NidaqLaserController:
         digital_tasks = []
         run_error = None
         points = ()
+        # The clock routes this ramp adds, which it releases when it ends.
+        route_count = len(self._trigger_routes)
         try:
             # Where close() can find them: reachAQ closing mid-ramp closes
             # this controller from its own thread, and this one may then be
@@ -729,22 +731,30 @@ class NidaqLaserController:
                 sample_mode=self._nidaqmx.constants.AcquisitionType.FINITE,
                 samps_per_chan=len(waveform),
             )
+            # The command's sample clock, as each input board can see it. On
+            # christielab10 the command is on the 6713 and the diode on the
+            # 6221: named across the boards, the clock needed a route DAQmx
+            # reserves a backplane line for, and it refuses that on this
+            # unidentified chassis (-89125). _shared_clock_for drives it onto
+            # the backplane clock line by name, as a pulse train's shared
+            # clock is, and leaves a single-board rig untouched.
             sample_clock_source = self._analog_output_sample_clock_source(channel.analog_output)
             ai_task.timing.cfg_samp_clk_timing(
                 rate=sample_rate_hz,
-                source=sample_clock_source,
+                source=self._shared_clock_for(_device_of(channel.diode_input), sample_clock_source),
                 sample_mode=self._nidaqmx.constants.AcquisitionType.FINITE,
                 samps_per_chan=len(waveform),
             )
             if ramp.enable_pmt_shutter:
+                pmt_line = self._require_pmt_shutter_output()
                 digital_tasks.append(
                     self._create_finite_digital_output_task(
-                        self._require_pmt_shutter_output(),
+                        pmt_line,
                         "laser_pmt_shutter_calibration_do",
                         [True] * len(waveform),
                         sample_rate_hz,
                         len(waveform),
-                        sample_clock_source,
+                        self._shared_clock_for(_device_of(pmt_line), sample_clock_source),
                         None,
                         "rising",
                     )
@@ -783,6 +793,7 @@ class NidaqLaserController:
                 channel=channel,
                 ramp=ramp,
                 run_error=run_error,
+                route_count=route_count,
             )
         return points
 
@@ -848,12 +859,17 @@ class NidaqLaserController:
         channel: LaserChannelConfiguration,
         ramp: LaserCalibrationRamp,
         run_error: Optional[BaseException],
+        route_count: Optional[int] = None,
     ) -> None:
         errors = []
         self._stop_and_close_task("calibration analog output task", ao_task, errors)
         self._stop_and_close_task("calibration analog input task", ai_task, errors)
         for index, task in enumerate(digital_tasks):
             self._stop_and_close_task(f"calibration digital output task {index}", task, errors)
+        if route_count is not None:
+            # After the tasks that use them. The controller's own trigger
+            # routes, connected before the ramp, stay until close().
+            errors.extend(self._release_routes_since(route_count))
         if getattr(self, "_closed", False):
             # close() has already put the command, the shutters and the PMT
             # shutter back, and released the tasks this would write them with.
@@ -1078,8 +1094,18 @@ class NidaqLaserController:
         return local
 
     def _disconnect_trigger_routes(self) -> List[Tuple[str, Exception]]:
+        return self._release_routes_since(0)
+
+    def _release_routes_since(self, count: int) -> List[Tuple[str, Exception]]:
+        """Disconnect the routes connected after the first `count`.
+
+        close() releases every route; an operation that connected its own,
+        such as a calibration ramp's clock, releases just those when it ends.
+        """
+        routes = self._trigger_routes[count:]
+        del self._trigger_routes[count:]
         errors = []
-        for source, destination in self._trigger_routes:
+        for source, destination in routes:
             try:
                 self._nidaqmx.system.System.local().disconnect_terms(
                     source, destination)
@@ -1088,7 +1114,6 @@ class NidaqLaserController:
                                error))
                 logger.exception("Failed to release NI-DAQ laser trigger "
                                  "route %s -> %s", source, destination)
-        self._trigger_routes.clear()
         return errors
 
     def _create_channel_tasks(self, channel: LaserChannelConfiguration) -> _NidaqLaserTasks:
@@ -1359,6 +1384,11 @@ def _mean(values) -> float:
     if not values:
         raise RuntimeError("cannot average an empty calibration sample segment")
     return float(sum(values)) / len(values)
+
+
+def _device_of(physical_channel: str) -> str:
+    """The device a channel belongs to: PXI1Slot5 for PXI1Slot5/ai8."""
+    return physical_channel.strip("/").split("/", 1)[0]
 
 
 def _load_nidaqmx():
