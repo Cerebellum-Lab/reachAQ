@@ -123,6 +123,9 @@ class _LaserAppStub:
     def laser_calibration_refusal(self):
         return ""
 
+    def laser_controller_close_refusal(self):
+        return ""
+
     def update_nidaq_signal_stream_channels(self, channels):
         self.nidaq_signal_monitor.set_display_channels(
             channel.name if hasattr(channel, "name") else channel

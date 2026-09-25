@@ -71,6 +71,10 @@ class LaserModel(ObservableObject):
         self._direct_trigger_observer = None
         self._direct_trigger_stop = threading.Event()
         self._direct_trigger_thread = None
+        #: The last command asked of each channel, in volts: a set command, or
+        #: a pulse train's amplitude. What closing says an output may still
+        #: hold when the controller cannot be closed.
+        self._last_command_volts = {}
         if controller is not None:
             self.set_controller(controller)
 
@@ -81,6 +85,14 @@ class LaserModel(ObservableObject):
     @property
     def is_connected(self) -> bool:
         return self._controller is not None
+
+    @property
+    def last_command_volts(self) -> dict:
+        """The last command asked of each channel, by channel number, in volts."""
+        return dict(self._last_command_volts)
+
+    def _record_command(self, channel_id, volts: float) -> None:
+        self._last_command_volts[int(channel_id)] = float(volts)
 
     @property
     def last_feedback_sample(self) -> Optional[LaserFeedbackSample]:
@@ -220,11 +232,17 @@ class LaserModel(ObservableObject):
         self.close()
         self._controller = controller
         self._configuration = controller.configuration
+        # A controller opens with every command at its minimum.
+        self._last_command_volts = {
+            int(channel.channel_id): channel.minimum_command_volts
+            for channel in self._configuration.channels
+        }
         self._on_property_changed(self.CONFIGURATION, self._configuration, prev_config)
         self._on_property_changed(self.IS_CONNECTED, True, False)
 
     def set_command_voltage(self, channel_id: Union[LaserChannelId, int], volts: float) -> float:
         applied = self._require_controller().set_command_voltage(channel_id, volts)
+        self._record_command(channel_id, applied)
         self.trace_received(
             LaserTraceBlock(
                 channel_id=LaserChannelId(int(channel_id)),
@@ -268,11 +286,16 @@ class LaserModel(ObservableObject):
         return self._require_controller().read_command_copy_voltage(channel_id)
 
     def run_pulse_train(self, pulse_train: LaserPulseTrain) -> None:
-        self._require_controller().run_pulse_train(pulse_train)
+        controller = self._require_controller()
+        self._record_command(pulse_train.channel_id, pulse_train.amplitude_volts)
+        controller.run_pulse_train(pulse_train)
         self.trace_received(self._make_pulse_trace(pulse_train))
 
     def run_synchronized_pulse_train(self, pulse_train: LaserSynchronizedPulseTrain):
-        operation = self._require_controller().run_synchronized_pulse_train(pulse_train)
+        controller = self._require_controller()
+        for channel_pulse in pulse_train.pulse_trains:
+            self._record_command(channel_pulse.channel_id, channel_pulse.amplitude_volts)
+        operation = controller.run_synchronized_pulse_train(pulse_train)
         for channel_pulse in pulse_train.pulse_trains:
             self.trace_received(self._make_pulse_trace(channel_pulse))
         return operation
@@ -321,9 +344,9 @@ class LaserModel(ObservableObject):
         # Preparing an asynchronous task is not a physical output. Do not use
         # run_synchronized_pulse_train(), whose ordinary/manual trace represents
         # an executed waveform.
-        operation = self._require_controller().run_synchronized_pulse_train(
-            synchronized
-        )
+        controller = self._require_controller()
+        self._record_command(pulse.channel_id, pulse.amplitude_volts)
+        operation = controller.run_synchronized_pulse_train(synchronized)
         if operation is None:
             raise RuntimeError("Protocol laser preparation did not return an operation")
         operation_record = operation.to_record()

@@ -818,6 +818,10 @@ class _LaserChannelTab(QWidget):
                 f"Laser {self._channel.channel_id.value} has no hardware "
                 "channel in the system configuration"
             )
+        # Still connected, to a controller whose close hung in the driver.
+        close_refusal = self._app_model.laser_controller_close_refusal()
+        if close_refusal:
+            return close_refusal[:1].upper() + close_refusal[1:]
         if not self._app_model.laser.is_connected:
             return (
                 "The laser controller is not open: it claims its NI-DAQ "
@@ -1708,7 +1712,9 @@ class LaserControlContent(ContentWidget):
             is_running = self._operation_thread is not None
         can_edit = self._is_editable and not is_running
         self._builder.set_controls_enabled(can_edit)
-        can_run = can_edit and self._app_model.laser.is_connected
+        can_run = (
+            can_edit and self._app_model.laser.is_connected
+            and not self._app_model.laser_controller_close_refusal())
         ramp_refusal = self._ramp_refusal(is_running=is_running)
         refusals = []
         can_do_something = False

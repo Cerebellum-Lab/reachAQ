@@ -292,13 +292,21 @@ class NidaqLaserController:
         #: destination, released in close().
         self._trigger_routes: List[Tuple[str, str]] = []
         self._command_volts: Dict[LaserChannelId, float] = {}
+        #: Bookkeeping only: nothing is called in the driver while it is held
+        #: (a driver that hangs would hold close() at it, before it could mark
+        #: the controller closed, with every cancel and abort behind it).
         self._operation_lock = threading.RLock()
+        #: Routes being connected or released outside the lock, by the call
+        #: doing it; see _shared_clock_for and _release_routes.
+        self._pending_routes: Dict[Tuple[str, str], str] = {}
+        self._routes_settled = threading.Condition(self._operation_lock)
         self._live_operations: Dict[str, NidaqLaserOperation] = {}
         #: The tasks of a calibration ramp in progress, for close() to abort
         #: from another thread; see run_calibration_ramp.
         self._calibration_tasks: List[object] = []
-        #: Set by close(), under _operation_lock. A ramp starts its tasks only
-        #: while it is clear.
+        #: Set by close(), under _operation_lock, before it calls the driver.
+        #: A ramp or pulse train starts, and a route is kept, only while it is
+        #: clear.
         self._closed = False
         #: Clear while a calibration ramp owns tasks; set by its finally once
         #: it has stopped and closed them. close() waits on it, bounded.
@@ -417,6 +425,12 @@ class NidaqLaserController:
             for item in pulse_train.pulse_trains
         )
         with self._operation_lock:
+            # close() cancels the operations it finds when it marks the
+            # controller closed; one registered after that would drive the
+            # laser after close() had reset it.
+            if getattr(self, "_closed", False):
+                raise RuntimeError(
+                    "the laser controller is closed; no pulse train is started")
             conflicts = [
                 operation.operation_id
                 for operation in self._live_operations.values()
@@ -878,21 +892,30 @@ class NidaqLaserController:
                 )
                 self._hold_calibration_tasks(digital_tasks[-1])
             ao_task.write(waveform, auto_start=False)
-            # Under the lock close() takes, and only while the controller is
-            # open: a close that came first has reset the outputs and must
-            # not find the laser driven after it; one that comes after finds
-            # these started, and aborts them.
+            # Only while the controller is open: a close that came first has
+            # reset the outputs, and must not find the laser driven after it.
+            # The starts themselves are made outside the lock, which close()
+            # takes to mark the controller closed; they used to be made under
+            # it, and a driver hung in one held close() there. A close that
+            # comes while they are made aborts the tasks it finds, and waits
+            # for this ramp to let go of them before it resets the laser;
+            # the check after the starts ends the ramp at once.
             with self._operation_lock:
                 if self._closed:
                     raise RuntimeError(
                         "the laser controller was closed before the calibration "
                         "ramp started")
-                if ramp.open_shutter:
-                    self.set_shutter_open(channel.channel_id, True)
-                for task in digital_tasks:
-                    task.start()
-                ai_task.start()
-                ao_task.start()
+            if ramp.open_shutter:
+                self.set_shutter_open(channel.channel_id, True)
+            for task in digital_tasks:
+                task.start()
+            ai_task.start()
+            ao_task.start()
+            with self._operation_lock:
+                if self._closed:
+                    raise RuntimeError(
+                        "the laser controller was closed as the calibration "
+                        "ramp started")
             ao_task.wait_until_done(timeout=timeout_seconds)
             ai_task.wait_until_done(timeout=timeout_seconds)
             raw_samples = ai_task.read(number_of_samples_per_channel=len(waveform), timeout=timeout_seconds)
@@ -1088,9 +1111,13 @@ class NidaqLaserController:
 
     def close(self) -> None:
         errors = []
-        errors.extend(self._abort_calibration_ramp())
+        # Marked closed, and what it must stop taken, before any driver call:
+        # a cancel, an abort, or a ramp, pulse train or route checking for
+        # closed then never waits on DAQmx behind this.
+        calibration_tasks, operations = self._mark_closed()
+        errors.extend(self._abort_calibration_ramp(calibration_tasks))
         errors.extend(self._wait_for_calibration_release())
-        for operation in tuple(getattr(self, "_live_operations", {}).values()):
+        for operation in operations:
             try:
                 operation.cancel()
                 operation.wait(timeout=5.0)
@@ -1120,7 +1147,21 @@ class NidaqLaserController:
             locations = ", ".join(location for location, _ in errors)
             raise RuntimeError(f"Failed to close NI-DAQ laser controller cleanly: {locations}") from errors[0][1]
 
-    def _abort_calibration_ramp(self) -> List[Tuple[str, Exception]]:
+    def _mark_closed(self):
+        """Mark the controller closed; the ramp tasks and operations to stop.
+
+        Bookkeeping under the lock and nothing else. What registers after
+        this is refused: a ramp or pulse train checks for closed under the
+        same lock before it starts.
+        """
+        with self._route_lock():
+            self._closed = True
+            return (
+                tuple(getattr(self, "_calibration_tasks", ())),
+                tuple(getattr(self, "_live_operations", {}).values()),
+            )
+
+    def _abort_calibration_ramp(self, tasks) -> List[Tuple[str, Exception]]:
         """Stop a calibration ramp running on another thread, for close().
 
         reachAQ closing mid-ramp closes this controller from the close path
@@ -1134,16 +1175,10 @@ class NidaqLaserController:
         clears a task another thread may be using, and close() waits for it
         to have done so before resetting the laser, as an abort that does not
         release them would otherwise leave the reset refused
-        (_wait_for_calibration_release). Marked closed under the same lock
-        the ramp starts its tasks under, so a ramp not yet started never
-        starts.
+        (_wait_for_calibration_release). `tasks` are those _mark_closed took,
+        under the lock the ramp checks for closed under, so a ramp not yet
+        started never starts.
         """
-        lock = getattr(self, "_operation_lock", None)
-        if lock is None:
-            return []
-        with lock:
-            self._closed = True
-            tasks = tuple(getattr(self, "_calibration_tasks", ()))
         if not tasks:
             return []
         errors = []
@@ -1270,39 +1305,96 @@ class NidaqLaserController:
         line = self._configuration.backplane_clock_line
         destination = f"/{clock_device}/{line}"
         local = f"/{output_device}/{line}"
+        route = (source, destination)
+        # Chosen and recorded under the lock, connected outside it. Pending
+        # meanwhile, so that nobody else connects or releases it, and close(),
+        # which releases only the routes held, leaves it to this call.
         with self._route_lock():
-            if getattr(self, "_closed", False):
+            while True:
+                if getattr(self, "_closed", False):
+                    raise RuntimeError(
+                        "the laser controller is closed; no clock route is "
+                        f"made for {output_device}")
+                if route in self._trigger_routes:
+                    return local
+                if route not in self._route_pending():
+                    break
+                # Another caller is connecting or releasing this same route.
+                self._wait_for_routes()
+            holder = self._backplane_line_holder(line, source)
+            if holder is not None:
                 raise RuntimeError(
-                    "the laser controller is closed; no clock route is made "
-                    f"for {output_device}")
-            if (source, destination) not in self._trigger_routes:
-                holder = self._backplane_line_holder(line, source)
-                if holder is not None:
-                    raise RuntimeError(
-                        f"could not put {source} on {line} for "
-                        f"{output_device}: {holder[1]} already carries "
-                        f"{holder[0]}. Two signals driven onto one backplane "
-                        "line corrupt each other, and DAQmx does not see it "
-                        "across these boards")
-                try:
-                    self._nidaqmx.system.System.local().connect_terms(
-                        source, destination)
-                except Exception as error:
-                    raise RuntimeError(
-                        f"could not put the shared sample clock {source} on "
-                        f"{destination} for {output_device}: {error}"
-                    ) from error
-                self._trigger_routes.append((source, destination))
+                    f"could not put {source} on {line} for "
+                    f"{output_device}: {holder[1]} already carries "
+                    f"{holder[0]}. Two signals driven onto one backplane "
+                    "line corrupt each other, and DAQmx does not see it "
+                    "across these boards")
+            self._route_pending()[route] = "connect"
+        try:
+            self._nidaqmx.system.System.local().connect_terms(source, destination)
+        except Exception as error:
+            with self._route_lock():
+                self._settle_route(route)
+            raise RuntimeError(
+                f"could not put the shared sample clock {source} on "
+                f"{destination} for {output_device}: {error}"
+            ) from error
+        with self._route_lock():
+            self._settle_route(route)
+            closed = getattr(self, "_closed", False)
+            if not closed:
+                self._trigger_routes.append(route)
                 if added is not None:
-                    added.append((source, destination))
-                log_hardware_initialization(
-                    logger,
-                    "READY | NI-DAQ laser clock route | %s -> %s, read as %s",
-                    source,
-                    destination,
-                    local,
-                )
+                    added.append(route)
+        if closed:
+            # close() came while the driver made it, and released only the
+            # routes it held: this one is this call's to undo.
+            error = self._disconnect_route(route)
+            raise RuntimeError(
+                "the laser controller was closed while a clock route was made "
+                f"for {output_device}; the route was "
+                + ("released" if error is None else f"not released ({error})"))
+        log_hardware_initialization(
+            logger,
+            "READY | NI-DAQ laser clock route | %s -> %s, read as %s",
+            source,
+            destination,
+            local,
+        )
         return local
+
+    def _route_pending(self) -> Dict[Tuple[str, str], str]:
+        """Routes a call is connecting or releasing outside the lock."""
+        pending = getattr(self, "_pending_routes", None)
+        if pending is None:
+            # A controller built without __init__, as some tests build one.
+            pending = self._pending_routes = {}
+        return pending
+
+    def _settle_route(self, route) -> None:
+        """No longer pending; under the lock. Wakes whoever waits on it."""
+        self._route_pending().pop(route, None)
+        settled = getattr(self, "_routes_settled", None)
+        if settled is not None:
+            settled.notify_all()
+
+    def _wait_for_routes(self) -> None:
+        """Wait, under the lock, for a pending route to settle."""
+        settled = getattr(self, "_routes_settled", None)
+        if settled is None:
+            raise RuntimeError("a route is pending on a controller with no lock")
+        settled.wait(1.0)
+
+    def _disconnect_route(self, route) -> Optional[Exception]:
+        """Disconnect one route in the driver, outside the lock; its error, if any."""
+        source, destination = route
+        try:
+            self._nidaqmx.system.System.local().disconnect_terms(source, destination)
+        except Exception as error:
+            logger.exception("Failed to release NI-DAQ laser trigger route %s -> %s",
+                             source, destination)
+            return error
+        return None
 
     def _backplane_line_holder(self, line: str, source: str) -> Optional[Tuple[str, str]]:
         """What already drives backplane `line` from another source, or None.
@@ -1318,7 +1410,9 @@ class NidaqLaserController:
             (plan.sample_clock_source, plan.sample_clock_export_terminal),
             (plan.start_trigger_source, plan.start_trigger_export_terminal),
         )
-        for held_source, held_destination in (*self._trigger_routes, *exports):
+        # Pending ones too: being connected, or still being released.
+        for held_source, held_destination in (
+                *self._trigger_routes, *self._route_pending(), *exports):
             if not held_destination or held_source == source:
                 continue
             if held_destination.rsplit("/", 1)[-1].lower() == wanted:
@@ -1337,30 +1431,34 @@ class NidaqLaserController:
 
     def _disconnect_trigger_routes(self) -> List[Tuple[str, Exception]]:
         with self._route_lock():
-            return self._release_routes(tuple(self._trigger_routes))
+            routes = tuple(self._trigger_routes)
+        return self._release_routes(routes)
 
     def _release_routes(self, routes) -> List[Tuple[str, Exception]]:
         """Disconnect these routes, those this controller still holds.
 
         close() releases every route; an operation that connected its own,
         such as a calibration ramp's clock, releases just those when it ends,
-        by name. A route close() has released already is not released again.
+        by name. A route close() has released already is not released again:
+        each is taken off the held list under the lock by whichever caller
+        gets it first, and disconnected by that caller, outside the lock,
+        pending until it is gone so that nobody connects it meanwhile.
         """
-        errors = []
         with self._route_lock():
+            owned = []
             for route in routes:
-                if route not in self._trigger_routes:
-                    continue
-                self._trigger_routes.remove(route)
+                if route in self._trigger_routes and route not in owned:
+                    self._trigger_routes.remove(route)
+                    self._route_pending()[route] = "release"
+                    owned.append(route)
+        errors = []
+        for route in owned:
+            error = self._disconnect_route(route)
+            with self._route_lock():
+                self._settle_route(route)
+            if error is not None:
                 source, destination = route
-                try:
-                    self._nidaqmx.system.System.local().disconnect_terms(
-                        source, destination)
-                except Exception as error:
-                    errors.append((f"trigger route {source} -> {destination}",
-                                   error))
-                    logger.exception("Failed to release NI-DAQ laser trigger "
-                                     "route %s -> %s", source, destination)
+                errors.append((f"trigger route {source} -> {destination}", error))
         return errors
 
     def _create_channel_tasks(self, channel: LaserChannelConfiguration) -> _NidaqLaserTasks:
