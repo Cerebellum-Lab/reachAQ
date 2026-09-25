@@ -6247,18 +6247,23 @@ class AppModel(ObservableObject):
         Monitor, which opens its own tasks on them. `reason` completes
         "NI-DAQ signal stream paused: ..." where the stream state is shown.
 
-        Refused unless idle. In System Mode the stream is the acquisition's:
-        stopping it for the monitor marked it stopped rather than failed, so
-        a recording carried on without its NI data, and nothing restarted it
-        when the monitor closed.
+        Refused unless idle with the recording session ready. In System Mode
+        the stream is the acquisition's: stopping it for the monitor marked
+        it stopped rather than failed, so a recording carried on without its
+        NI data, and nothing restarted it when the monitor closed. Each
+        refusal names its own reason; an operator already in Idle was told
+        to set System Mode to Idle while a recording session finished.
         """
-        if (
-            not self._nidaq_stream_idle()
-            or self._recording_session.status is not SessionRecordingStatus.READY
-        ):
+        if not self._nidaq_stream_idle():
             raise RuntimeError(
                 "the NI-DAQ input stream belongs to System Mode while it runs; "
                 "set System Mode to Idle first"
+            )
+        recording_status = self._recording_session.status
+        if recording_status is not SessionRecordingStatus.READY:
+            raise RuntimeError(
+                f"the recording session is still {recording_status.value}; "
+                "try again once it is ready"
             )
         self._nidaq_stream_autostart.pause(holder, reason)
 
