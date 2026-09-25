@@ -479,7 +479,7 @@ class _LaserChannelTab(QWidget):
         # Which signals the graph draws. Folded away by default: it is set
         # once per rig, and the graph needs the height more.
         signals_section = self._add_section("signals", "Signals", expanded=False)
-        signals_section.setToolTip(_TRACE_SIGNALS_EXPLANATION)
+        signals_section.set_header_tooltip(_TRACE_SIGNALS_EXPLANATION)
         trace_layout.addWidget(signals_section)
         signals_layout = QVBoxLayout(signals_section.content)
         signals_layout.setContentsMargins(4, 0, 2, 1)
@@ -533,7 +533,9 @@ class _LaserChannelTab(QWidget):
         trigger_layout.setContentsMargins(0, 0, 0, 1)
         trigger_layout.setSpacing(1)
         trigger_layout.addWidget(self.trigger_plot)
-        self.trigger_status = ElidedLabel()
+        # Two lines: on one, the missing-input message lost what to do
+        # about it at the docked width.
+        self.trigger_status = ElidedLabel(max_lines=2)
         self.trigger_status.setObjectName("LaserPreviewStatus")
         trigger_layout.addWidget(self.trigger_status)
         pulse_page_layout.addWidget(trigger_section)
@@ -899,9 +901,9 @@ class _LaserChannelTab(QWidget):
         candidate = self._trace_signal_candidates.get("trigger")
         if candidate is None:
             self.trigger_status.setText(
-                "No trigger readback input is configured for this laser. Wire the "
-                "board stimulus line into an NI input and set it in Edit DAQ Ports "
-                "to see the edge that starts the waveform."
+                "No trigger readback input is configured. Wire the board stimulus "
+                "line into an NI input and set it in Edit DAQ Ports to see the "
+                "edge that starts the waveform."
             )
             return
         if self._acquired_channel("trigger") is None:
@@ -1135,8 +1137,9 @@ class LaserControlContent(ContentWidget):
         self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         self.setObjectName("LaserControlContent")
         # One smaller font for the whole panel, set here rather than per
-        # widget: at the rig's 9 pt default the laser page needed a scroll
-        # bar in the docked panel (christielab10, 2026-09-24).
+        # widget: at the application font the laser page needed a scroll
+        # bar in the docked panel (christielab10, 2026-09-24). Dialogs it
+        # opens keep the application font.
         self.setStyleSheet(
             compact_font_style_sheet("LaserControlContent")
             + "#LaserControlContent QLabel {color: #2f343a;}"
