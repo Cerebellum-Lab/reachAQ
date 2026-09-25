@@ -328,6 +328,7 @@ class MainWindow(QMainWindow):
             hardware_refreshing=self._hardware_refresh_thread is not None,
             nidaq_discovering=self._nidaq_discovery_thread is not None,
             has_valid_dcs=self.has_fully_valid_dcs,
+            laser_calibrating=self._app_model.laser_calibration_active,
         )
         self._app_model_status_combo.setEnabled(state.system_mode)
         self.run_action.setEnabled(state.system_mode)
@@ -1028,6 +1029,8 @@ class MainWindow(QMainWindow):
             not self._app_model.acquisition_started
             and self._app_model.status == AppModelStatus.IDLE
             and self._start_capture_thread is None
+            # A ramp holds the NI-DAQ lines, and its save would be refused.
+            and not self._app_model.laser_calibration_active
         )
         self.edit_daq_ports_action.setEnabled(is_idle)
         # The monitor streams every line on every card, so it needs the
@@ -1899,6 +1902,9 @@ class MainWindow(QMainWindow):
         elif name == props.SUBSYSTEM_STATUSES:
             if self._start_capture_thread is None:
                 self._update_runtime_health_label()
+
+        elif name == props.LASER_CALIBRATION_ACTIVE:
+            self._refresh_ui_availability()
 
         elif name == props.RFID_READER_STATUS:
             state = getattr(getattr(value, "state", None), "value", "disabled")

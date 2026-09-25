@@ -56,6 +56,21 @@ def test_idle_enables_configuration_and_identity_controls():
     assert not state.calibration
 
 
+def test_a_laser_calibration_ramp_disables_what_it_would_refuse():
+    # Run, Edit DAQ Ports, the DAQ Monitor and hardware refresh stayed
+    # enabled during a ramp and were refused only once used.
+    state = _state(
+        status=AppModelStatus.IDLE,
+        acquisition_started=False,
+        laser_calibrating=True,
+    )
+
+    assert not state.system_mode
+    assert not state.idle_configuration
+    assert not state.hardware_refresh
+    assert state.notes
+
+
 def test_background_operation_temporarily_disables_conflicting_controls():
     state = _state(hardware_refreshing=True)
 

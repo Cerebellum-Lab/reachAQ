@@ -29,9 +29,13 @@ def calculate_ui_availability(
     hardware_refreshing: bool,
     nidaq_discovering: bool,
     has_valid_dcs: bool,
+    laser_calibrating: bool = False,
 ) -> UiAvailability:
     session_ready = recording_status is SessionRecordingStatus.READY
-    background_busy = hardware_refreshing or nidaq_discovering
+    # A laser calibration ramp holds the NI-DAQ lines and a laser controller
+    # of its own: Run, Edit DAQ Ports, the DAQ Monitor and a hardware refresh
+    # are refused while it runs, so they are not offered either.
+    background_busy = hardware_refreshing or nidaq_discovering or laser_calibrating
     stable_mode = not capture_transition and not background_busy
     ordinary_mode = status in {AppModelStatus.IDLE, AppModelStatus.RUNNING}
     idle_configuration = (

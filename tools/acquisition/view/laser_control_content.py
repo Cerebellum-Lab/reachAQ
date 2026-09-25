@@ -120,8 +120,11 @@ class _LaserOperationWorker(QObject):
         try:
             self.finished.emit(self._operation())
         except Exception as exc:
-            logger.exception("Laser operation failed")
             message = str(exc) or exc.__class__.__name__
+            # With the reason in the message itself: the status bar shows a
+            # log record's first line, and "Laser operation failed" alone left
+            # a DAQmx error such as -89125 in the log's traceback only.
+            logger.exception("Laser operation failed: %s", _first_line(message, 240))
             self.failed.emit(message)
 
 
@@ -1183,6 +1186,8 @@ class LaserControlContent(ContentWidget):
 
         self._app_model = app_model
         self._is_editable = True
+        #: The refusal this panel last put on its status line, if any.
+        self._announced_refusal: Optional[str] = None
         self._is_capture_active = False
         self._operation_thread: Optional[QThread] = None
         self._operation_worker: Optional[_LaserOperationWorker] = None
@@ -1302,6 +1307,7 @@ class LaserControlContent(ContentWidget):
             AppModel.Props.STATUS,
             AppModel.Props.SESSION_RECORDING_STATUS,
             AppModel.Props.ACQUISITION_RUNNING,
+            AppModel.Props.LASER_CALIBRATION_ACTIVE,
         ):
             self._update_enabled_state(announce=False)
 
@@ -1530,18 +1536,14 @@ class LaserControlContent(ContentWidget):
                 if tab.channel_id_value == current:
                     self._tabs.setCurrentIndex(index + 1)
                     break
+        self._set_status(self._ready_status_text(), is_error=False)
+        self._update_enabled_state()
+
+    def _ready_status_text(self) -> str:
         configured_count = sum(tab.is_configured for tab in self._channel_tabs)
         if configured_count:
-            self._set_status(
-                f"Ready: {configured_count}/{_LASER_PULSE_TRAIN_COUNT} laser channel(s) mapped",
-                is_error=False,
-            )
-        else:
-            self._set_status(
-                f"Pulse train editor ready; 0/{_LASER_PULSE_TRAIN_COUNT} hardware channel(s) mapped",
-                is_error=False,
-            )
-        self._update_enabled_state()
+            return f"Ready: {configured_count}/{_LASER_PULSE_TRAIN_COUNT} laser channel(s) mapped"
+        return f"Pulse train editor ready; 0/{_LASER_PULSE_TRAIN_COUNT} hardware channel(s) mapped"
 
     def _adopt_sections(self, tab: _LaserChannelTab) -> None:
         """Open or close a new tab's sections as the operator left them."""
@@ -1620,8 +1622,10 @@ class LaserControlContent(ContentWidget):
         self._set_status(str(result), is_error=False)
 
     @Slot(str)
-    def _operation_failed(self, _message: str) -> None:
-        self._set_status("Laser operation stopped", is_error=False)
+    def _operation_failed(self, message: str) -> None:
+        # It said "Laser operation stopped", and nothing of why.
+        self._set_status(
+            f"Laser operation failed: {_first_line(message, 160)}", is_error=False)
 
     @Slot()
     def _operation_thread_finished(self) -> None:
@@ -1683,10 +1687,22 @@ class LaserControlContent(ContentWidget):
         # Nothing can be fired and the buttons alone do not say why, so the
         # shared status line carries the reason. Not when a ramp can run, as
         # it can in Idle: after a ramp that replaced its own outcome with
-        # "press Run first". Not for the refreshes that follow the stream and
-        # System Mode either, which would replace whatever the line says.
-        if announce and refusals and not can_do_something:
-            self._set_status(refusals[0], is_error=False)
+        # "press Run first". The refreshes that follow the stream and System
+        # Mode do not announce, which would replace whatever the line says,
+        # but they do update a refusal of this panel's still on the line: a
+        # rebuild during a load's or a DAQ ports save's hold said "press Run
+        # first", and nothing took it back once a ramp could run.
+        own_refusal_shown = (
+            self._announced_refusal is not None
+            and self._status_label.text() == self._announced_refusal
+        )
+        if refusals and not can_do_something:
+            if announce or own_refusal_shown:
+                self._set_status(refusals[0], is_error=False)
+                self._announced_refusal = refusals[0]
+        elif own_refusal_shown:
+            self._set_status(self._ready_status_text(), is_error=False)
+            self._announced_refusal = None
 
     @invoke_method
     def set_is_editable(self, is_editable: bool):
