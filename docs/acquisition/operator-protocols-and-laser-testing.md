@@ -315,6 +315,29 @@ The definitive check for the board route is a scope: trigger on the STIM line
 and confirm the analog output rises on that edge, not when you pressed the
 button. The status line alone cannot distinguish the two.
 
+### Calibration ramp — in Idle
+
+On the laser's **Calibration** page, the **Calibration ramp** section steps
+the command from **Start:** to **Stop:** in **Steps:** steps of
+**Samples/step:** samples each, and reads the diode at every step. **PMT
+shutter** holds the PMT shutter open for the ramp. Press **Run Ramp**.
+
+- It runs only in **Idle**, with the laser mapped. Otherwise the button is
+  greyed out and its tooltip says why: System Mode is running or starting, a
+  session is recording, the DAQ Monitor is open, a configuration is loading,
+  or another laser operation is running. Run Pulse and Test stim, on the
+  other hand, need System Mode running.
+- For the ramp's length reachAQ pauses the NI-DAQ input stream, so every NI
+  graph stops, and opens the laser controller for the ramp alone. Both are
+  handed back when the ramp ends, including when it fails.
+- While it runs, **Run**, opening the **DAQ Monitor**, loading a configuration
+  and saving **Edit DAQ Ports** are refused, with the reason in the status
+  bar.
+- It needs `hardwareTimed: true` and a `sampleRateHz` in the laser
+  configuration; christielab10 has both.
+- Success reads *"Ramp complete: 11 points, last diode 1.234 V, monotonic
+  curve validated"*, and the Output stream graph shows the whole ramp.
+
 ## What failure looks like
 
 Every refusal names its reason in the status line and fires nothing.
@@ -353,3 +376,8 @@ Short pulses. The firmware times both edges from a hardware counter and the
 long end measures within 170 us of a 500 ms request, but a 100 us pulse cannot
 be resolved over CAN. Before trusting this path for optogenetics timing, put a
 scope on the BNC and measure a 100 us and a 1 ms pulse.
+
+The calibration ramp on christielab10. Its button could never be pressed
+before 2026-09-25, so the ramp itself has not run on this rig: the command
+comes from the PXI-6713 and the diode is read on the PXI-6221, clocked from
+the 6713's output across the backplane.

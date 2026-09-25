@@ -113,6 +113,27 @@ class LaserModel(ObservableObject):
             )
         )
 
+    def open_controller(
+        self,
+        configuration: LaserSystemConfiguration,
+        *,
+        timing_plan: Optional[NidaqTimingPlan] = None,
+    ) -> LaserControllerProtocol:
+        """A controller for `configuration` that this model does not hold.
+
+        For the calibration ramp, which runs in Idle. The controller is opened
+        with no feedback reader: fed by the shared input stream, as System Mode
+        opens it, it refuses a ramp. It is not installed here, so the model
+        stays unconnected, and a Run cannot close it under the ramp; the
+        caller closes it.
+        """
+        if configuration.backend == "null":
+            return NullLaserController(configuration)
+        if configuration.backend == "nidaq":
+            return NidaqLaserController(configuration, timing_plan=timing_plan)
+        raise RuntimeError(
+            f"Laser backend {configuration.backend!r} has no controller to open")
+
     def load_configuration(
         self,
         configuration: LaserSystemConfiguration,
@@ -509,7 +530,13 @@ class LaserModel(ObservableObject):
             origin_wall_time=wall_time,
         ))
 
-    def run_calibration_ramp(self, ramp: LaserCalibrationRamp) -> Tuple[LaserCalibrationPoint, ...]:
+    def run_calibration_ramp(
+        self,
+        ramp: LaserCalibrationRamp,
+        *,
+        controller: Optional[LaserControllerProtocol] = None,
+    ) -> Tuple[LaserCalibrationPoint, ...]:
+        """Run the ramp on `controller`, or on this model's own controller."""
         self.trace_received(
             LaserTraceBlock(
                 channel_id=ramp.channel_id,
@@ -517,7 +544,9 @@ class LaserModel(ObservableObject):
                 replace=True,
             )
         )
-        points = self._require_controller().run_calibration_ramp(ramp)
+        if controller is None:
+            controller = self._require_controller()
+        points = controller.run_calibration_ramp(ramp)
         if points:
             prev, self._last_feedback_sample = self._last_feedback_sample, LaserFeedbackSample(
                 channel_id=points[-1].channel_id,

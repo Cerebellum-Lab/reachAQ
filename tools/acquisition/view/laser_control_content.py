@@ -75,6 +75,10 @@ _STIM_TEST_TOOLTIP = (
     "Run the selected profile on this laser as a trial would, started by the "
     "route chosen beside it"
 )
+_RUN_RAMP_TOOLTIP = (
+    "Step this laser's command from Start to Stop and record the diode at "
+    "each step. Runs in Idle; the NI-DAQ input stream pauses meanwhile"
+)
 _TRACE_SIGNALS_EXPLANATION = (
     "Choose the signals displayed in this laser's output stream; a change "
     "shows at once, while the stream runs. NI-DAQ inputs are available only "
@@ -778,11 +782,31 @@ class _LaserChannelTab(QWidget):
             )
         return ""
 
+    def run_ramp_refusal(self, panel_refusal: str) -> str:
+        """Why Run Ramp is unavailable on this laser, or an empty string.
+
+        `panel_refusal` is the reason that applies to every laser, from
+        LaserControlContent: another laser operation, System Mode, or what
+        the application refuses a ramp for.
+        """
+        if not self._is_configured:
+            return (
+                f"Laser {self._channel.channel_id.value} has no hardware "
+                "channel in the system configuration"
+            )
+        return panel_refusal
+
     def _connect_control_signals(self) -> None:
         self._trigger_mode.currentTextChanged.connect(self._on_trigger_mode_changed)
         self.stim_profile_selector.currentIndexChanged.connect(self.refresh_draft)
 
-    def set_controls_enabled(self, can_edit: bool, can_run_pulse: bool, can_run_ramp: bool) -> None:
+    def set_controls_enabled(
+        self,
+        can_edit: bool,
+        can_run_pulse: bool,
+        can_run_ramp: bool,
+        ramp_refusal: str = "",
+    ) -> None:
         self._controls_can_edit = can_edit
         for control in self._pulse_controls:
             control.setEnabled(can_edit)
@@ -798,6 +822,7 @@ class _LaserChannelTab(QWidget):
         for control in self._ramp_controls:
             control.setEnabled(can_edit)
         self._run_ramp_button.setEnabled(can_run_ramp)
+        self._run_ramp_button.setToolTip(ramp_refusal or _RUN_RAMP_TOOLTIP)
 
     def append_trace(self, trace: LaserTraceBlock, *, redraw: bool = True) -> None:
         if int(trace.channel_id) != self.channel_id_value:
@@ -1066,21 +1091,17 @@ class _LaserChannelTab(QWidget):
             return
 
         def operation():
-            signal_monitor = self._app_model.nidaq_signal_monitor
-            restart_signal_stream = signal_monitor.is_running
-            if restart_signal_stream:
-                signal_monitor.stop()
-            try:
-                points = self._app_model.laser.run_calibration_ramp(ramp)
-                self._app_model.laser.make_diode_power_curve(points)
-                last = points[-1]
-                return (
-                    f"Ramp complete: {len(points)} points, last diode {last.diode_volts:.3f} V, "
-                    "monotonic curve validated"
-                )
-            finally:
-                if restart_signal_stream:
-                    signal_monitor.start()
+            # The application holds the NI-DAQ stream for the ramp and opens
+            # a controller for it. This stopped the stream itself and started
+            # it again after, and nothing kept the auto-start from starting it
+            # over the ramp's own tasks in between.
+            points = self._app_model.run_laser_calibration_ramp(ramp)
+            self._app_model.laser.make_diode_power_curve(points)
+            last = points[-1]
+            return (
+                f"Ramp complete: {len(points)} points, last diode {last.diode_volts:.3f} V, "
+                "monotonic curve validated"
+            )
 
         self._start_operation(f"Running laser {self._channel.channel_id.value} calibration ramp", operation)
 
@@ -1241,6 +1262,8 @@ class LaserControlContent(ContentWidget):
         self._builder = PulseBuilderTab(app_model, self._set_status_from_tab)
         self._builder.profiles_changed.connect(self._refresh_channel_profiles)
         self._builder.draft_changed.connect(self._refresh_channel_drafts)
+        # Once the builder exists: the handler updates every control.
+        app_model.property_changed += self._on_app_model_property_changed
         self._refresh_from_model()
 
     def on_close(self):
@@ -1248,7 +1271,22 @@ class LaserControlContent(ContentWidget):
         self._app_model.laser.property_changed -= self._on_laser_property_changed
         self._app_model.laser.trace_received -= self._on_laser_trace_received
         self._app_model.nidaq_signal_monitor.property_changed -= self._on_nidaq_monitor_property_changed
+        self._app_model.property_changed -= self._on_app_model_property_changed
         self._plot_process.close()
+
+    @invoke_method
+    def _on_app_model_property_changed(self, property_name: str, _value, _old_value) -> None:
+        # Run Ramp follows the application's own refusal. A Run start says so
+        # through the subsystem statuses long before System Mode reads
+        # Running, and the laser connects in between: the button was enabled
+        # there, and a ramp pressed then stopped System Mode's stream.
+        if property_name in (
+            AppModel.Props.SUBSYSTEM_STATUSES,
+            AppModel.Props.STATUS,
+            AppModel.Props.SESSION_RECORDING_STATUS,
+            AppModel.Props.ACQUISITION_RUNNING,
+        ):
+            self._update_enabled_state(announce=False)
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -1292,6 +1330,11 @@ class LaserControlContent(ContentWidget):
                 # this said the readback was not acquired, or was being read
                 # while the stream was stopped.
                 tab.refresh_trigger_status()
+            # The DAQ Monitor, a load or a DAQ ports save taking the stream
+            # shows here first, and each makes a ramp wait. No tabs yet
+            # means the panel is still being built.
+            if self._channel_tabs:
+                self._update_enabled_state(announce=False)
 
     def _flush_laser_plots(self) -> None:
         ring = self._app_model.nidaq_signal_monitor.sample_ring
@@ -1580,25 +1623,52 @@ class LaserControlContent(ContentWidget):
     def _set_running(self, is_running: bool) -> None:
         self._update_enabled_state(is_running=is_running)
 
-    def _update_enabled_state(self, *, is_running: Optional[bool] = None) -> None:
+    def _ramp_refusal(self, *, is_running: bool) -> str:
+        """Why no laser can run a calibration ramp now, or an empty string.
+
+        Idle only (Ben, 2026-09-25). This needed the controller System Mode
+        opens and was also disabled whenever System Mode ran, so it was never
+        enabled; and between the laser connecting during a Run start and
+        System Mode reading Running, it was, and a ramp pressed there stopped
+        System Mode's stream.
+        """
+        if is_running:
+            return "Another laser operation is running; wait for it to finish"
+        if not self._is_editable:
+            return "Laser controls are locked"
+        refusal = self._app_model.laser_calibration_refusal()
+        if refusal:
+            return f"Calibration is unavailable: {refusal}"
+        if self._is_capture_active:
+            return "System Mode is running; set it to Idle to calibrate"
+        return ""
+
+    def _update_enabled_state(
+        self, *, is_running: Optional[bool] = None, announce: bool = True,
+    ) -> None:
         if is_running is None:
             is_running = self._operation_thread is not None
         can_edit = self._is_editable and not is_running
         self._builder.set_controls_enabled(can_edit)
         can_run = can_edit and self._app_model.laser.is_connected
+        ramp_refusal = self._ramp_refusal(is_running=is_running)
         refusals = []
+        can_do_something = False
         for tab in self._channel_tabs:
             can_run_pulse = can_run and tab.is_configured
-            can_run_ramp = can_run_pulse and not self._is_capture_active
-            tab.set_controls_enabled(can_edit, can_run_pulse, can_run_ramp)
+            tab_ramp_refusal = tab.run_ramp_refusal(ramp_refusal)
+            tab.set_controls_enabled(
+                can_edit, can_run_pulse, not tab_ramp_refusal, tab_ramp_refusal)
+            can_do_something = can_do_something or can_run_pulse or not tab_ramp_refusal
             refusal = tab.run_pulse_refusal()
             if refusal and refusal not in refusals:
                 refusals.append(refusal)
         # Nothing can be fired and the buttons alone do not say why, so the
-        # shared status line carries the reason.
-        if refusals and not any(
-            tab.is_configured and can_run for tab in self._channel_tabs
-        ):
+        # shared status line carries the reason. Not when a ramp can run, as
+        # it can in Idle: after a ramp that replaced its own outcome with
+        # "press Run first". Not for the refreshes that follow the stream and
+        # System Mode either, which would replace whatever the line says.
+        if announce and refusals and not can_do_something:
             self._set_status(refusals[0], is_error=False)
 
     @invoke_method
