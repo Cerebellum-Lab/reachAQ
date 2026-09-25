@@ -41,7 +41,9 @@ def _is_role_name(name: str) -> bool:
     )
 
 
-def _claimed_role_names(laser_backend_enabled: bool) -> set:
+def _claimed_role_names(
+    laser_backend_enabled: bool, configured_lasers: Iterable[int] = (),
+) -> set:
     """The names roles claim in a plan, whether or not each role is set.
 
     Only a role ever writes its name, so a stored channel under one is that
@@ -56,12 +58,15 @@ def _claimed_role_names(laser_backend_enabled: bool) -> set:
     lasers configured, a laser tab cleared in Edit DAQ Ports took that laser
     out of the list, and its laser2_diode and laser2_command_copy stayed in
     the scan: recorded, hidden, and shown nowhere. With the backend disabled
-    the plan adds no laser role, and a stored laser channel stays a custom
-    input, as it always has.
+    the plan adds no laser role, and the same holds for every laser not in
+    `configured_lasers`: its names are claimed, and its stored channels
+    dropped. A configured laser's stored channels stay custom inputs, as
+    they always have, and its tab still shows them, by pin.
     """
     names = {name for _attribute, name in _PORT_INPUT_ROLES}
-    if laser_backend_enabled:
-        for number in LaserChannelId:
+    configured = {int(number) for number in configured_lasers}
+    for number in LaserChannelId:
+        if laser_backend_enabled or int(number) not in configured:
             names.update(
                 f"laser{int(number)}_{suffix}"
                 for suffix in ("diode", "command_copy", "trigger"))
@@ -315,7 +320,9 @@ def build_nidaq_acquisition_configuration(
         )
     role_pins = {channel.name: channel.physical_channel for channel in mapped.values()}
     role_pins.update((trigger.name, trigger.physical_channel) for trigger in triggers)
-    role_names = set(role_pins) | _claimed_role_names(laser.backend != "disabled")
+    role_names = set(role_pins) | _claimed_role_names(
+        laser.backend != "disabled",
+        (int(channel.channel_id) for channel in laser.channels))
 
     # Existing channels not claimed by a named hardware role are explicit
     # custom acquisition inputs and remain enabled. One stored under a role's
