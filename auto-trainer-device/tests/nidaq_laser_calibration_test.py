@@ -228,3 +228,65 @@ def test_a_ramp_on_a_closed_controller_starts_nothing(daq):
         controller.run_calibration_ramp(RAMP)
 
     assert not any(task.started for task in daq.tasks)
+
+
+# ------------------------------------------------------ the cross-board clock
+
+
+def test_the_ramp_clocks_its_inputs_over_a_backplane_line(daq):
+    # The AI task on the 6221 was clocked from /PXI1Slot4/ao/SampleClock by
+    # name, a route DAQmx makes across the backplane only by reserving a
+    # line - which it refuses on this unidentified chassis, -89125. The clock
+    # is put on PXI_Trig1 on the 6713 and read as the 6221's PXI_Trig1, as
+    # a pulse train's shared clock is.
+    import dataclasses
+
+    controller = NidaqLaserController(_rig_lasers())
+
+    points = controller.run_calibration_ramp(
+        dataclasses.replace(RAMP, enable_pmt_shutter=True))
+
+    assert len(points) == 3
+    route = ("/PXI1Slot4/ao/SampleClock", "/PXI1Slot4/PXI_Trig1")
+    assert daq.connected == [route]
+    assert daq.task("laser_1_calibration_ai").timing_kwargs["source"] == "/PXI1Slot5/PXI_Trig1"
+    assert daq.task("laser_pmt_shutter_calibration_do").timing_kwargs["source"] == (
+        "/PXI1Slot5/PXI_Trig1")
+    # Held for the ramp alone.
+    assert daq.disconnected == [route]
+    assert controller._trigger_routes == []
+
+
+def test_the_ramp_releases_its_clock_route_when_it_fails(monkeypatch):
+    daq = _FakeDaqmx(failing_task="calibration_ai")
+    monkeypatch.setattr(nidaq_laser, "_load_nidaqmx", lambda: daq)
+    controller = NidaqLaserController(_rig_lasers())
+
+    with pytest.raises(RuntimeError, match="refused to start"):
+        controller.run_calibration_ramp(RAMP)
+
+    route = ("/PXI1Slot4/ao/SampleClock", "/PXI1Slot4/PXI_Trig1")
+    assert daq.connected == [route]
+    assert daq.disconnected == [route]
+    assert controller._trigger_routes == []
+
+
+def test_the_ramp_keeps_the_controllers_own_trigger_route(daq):
+    controller = NidaqLaserController(_rig_lasers(
+        trigger_source="/PXI1Slot4/PXI_Trig0", trigger_route_source="/PXI1Slot5/PFI0"))
+    trigger_route = ("/PXI1Slot5/PFI0", "/PXI1Slot5/PXI_Trig0")
+    assert daq.connected == [trigger_route]
+
+    controller.run_calibration_ramp(RAMP)
+
+    assert daq.disconnected == [("/PXI1Slot4/ao/SampleClock", "/PXI1Slot4/PXI_Trig1")]
+    assert controller._trigger_routes == [trigger_route]
+
+
+def test_a_ramp_on_one_board_needs_no_route(daq):
+    controller = NidaqLaserController(_rig_lasers(analog_output="PXI1Slot5/ao0"))
+
+    controller.run_calibration_ramp(RAMP)
+
+    assert daq.connected == []
+    assert daq.task("laser_1_calibration_ai").timing_kwargs["source"] == "/PXI1Slot5/ao/SampleClock"

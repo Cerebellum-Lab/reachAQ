@@ -394,4 +394,8 @@ scope on the BNC and measure a 100 us and a 1 ms pulse.
 The calibration ramp on christielab10. Its button could never be pressed
 before 2026-09-25, so the ramp itself has not run on this rig: the command
 comes from the PXI-6713 and the diode is read on the PXI-6221, clocked from
-the 6713's output across the backplane.
+the 6713's output. That clock is driven onto the backplane line
+`backplaneClockLine` (PXI_Trig1) and read there by the 6221, the way a pulse
+train's shared clock reaches its output board, because DAQmx refuses to route
+it between the boards by name on this chassis (-89125). The first press is the
+check; if DAQmx refuses anything, the reason is in the status bar.
