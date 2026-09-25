@@ -240,7 +240,10 @@ def test_a_dialog_from_the_builder_keeps_the_application_font(panel, qapp):
         message_box.deleteLater()
         name_dialog.deleteLater()
 
-    assert QFontInfo(builder.findChild(QLabel).font()).pointSizeF() == pytest.approx(
+    # The builder's own label, named directly: the dialogs are still its
+    # children until the event loop deletes them, so findChild could return
+    # one of theirs.
+    assert QFontInfo(builder._preview_status.font()).pointSizeF() == pytest.approx(
         COMPACT_FONT_POINT_SIZE, abs=0.3)
 
 
