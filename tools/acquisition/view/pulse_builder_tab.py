@@ -11,12 +11,11 @@ from __future__ import annotations
 from typing import Callable, Optional, Tuple
 
 import pyqtgraph as pg
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
     QGridLayout,
-    QGroupBox,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -29,9 +28,16 @@ from PySide6.QtWidgets import (
 
 from autotrainer.pyside import PGWidget
 from tools.acquisition.model.trial_action import LaserPulseProfile
+from tools.acquisition.view.compact_panel import CollapsibleSection, compact_plot_axes
 
 #: The identifier the builder draft is fired under.
 DRAFT_PROFILE_ID = "builder-draft"
+#: Past these, a field only gets emptier; the extra width goes to the preview.
+_FIELD_MAXIMUM_WIDTH = 170
+_WIDE_FIELD_MAXIMUM_WIDTH = 400
+#: Field columns grow first; an empty last column takes what is left once
+#: the fields reach their maximum width.
+_FIELD_COLUMN_STRETCH = 10
 
 
 def pulse_shape_refusal(profile: LaserPulseProfile) -> str:
@@ -104,24 +110,39 @@ class PulseBuilderTab(QWidget):
         self._rest_volts = 0.0
         self._can_edit = True
 
+        self.setObjectName("PulseBuilderTab")
+        self.setStyleSheet(
+            "#PulseBuilderTab QPushButton {min-height: 18px; padding: 1px 8px;}"
+        )
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(6, 4, 6, 6)
-        layout.setSpacing(6)
+        layout.setContentsMargins(4, 3, 4, 3)
+        layout.setSpacing(3)
 
         library = QHBoxLayout()
+        library.setSpacing(4)
         self._profile_selector = QComboBox()
         self._profile_selector.setToolTip("Load a saved profile into the builder")
+        # Sized to a few characters rather than its longest "name — summary"
+        # entry, which made the builder wider than the docked panel.
+        self._profile_selector.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self._profile_selector.setMinimumContentsLength(6)
+        self._profile_selector.setMaximumWidth(_WIDE_FIELD_MAXIMUM_WIDTH)
         self._delete_button = QPushButton("Delete")
         self._save_button = QPushButton("Save profile…")
         library.addWidget(QLabel("Profile:"))
         library.addWidget(self._profile_selector, stretch=1)
         library.addWidget(self._delete_button)
         library.addWidget(self._save_button)
+        library.addStretch(0)
         layout.addLayout(library)
 
-        group = QGroupBox("Pulse Train")
-        grid = QGridLayout(group)
-        grid.setColumnStretch(1, 1)
+        self.sections = {
+            "pulse_train": CollapsibleSection("Pulse train", "pulse_train"),
+            # Folded away by default: they matter only with the PMT shutter on.
+            "pmt_margins": CollapsibleSection(
+                "PMT shutter margins", "pmt_margins", expanded=False),
+        }
         self._amplitude = QDoubleSpinBox()
         self._amplitude.setDecimals(3)
         self._amplitude.setSingleStep(0.050)
@@ -143,24 +164,41 @@ class PulseBuilderTab(QWidget):
             self._post_stim_ms, self._pulse_count, self._frequency_hz,
             self._pmt_open_lead_ms, self._pmt_close_lag_ms,
         )
-        for row, (label, widget) in enumerate((
-            ("Amplitude:", self._amplitude),
-            ("Pulse width:", self._duration_ms),
-            ("Baseline:", self._baseline_ms),
-            ("Post-stim:", self._post_stim_ms),
-            ("Count:", self._pulse_count),
-            ("Frequency:", self._frequency_hz),
-            ("PMT open lead:", self._pmt_open_lead_ms),
-            ("PMT close lag:", self._pmt_close_lag_ms),
-        )):
-            grid.addWidget(QLabel(label), row, 0)
-            grid.addWidget(widget, row, 1)
-        layout.addWidget(group)
+        # Two fields to a row: in one column the train and the preview did
+        # not both fit the docked panel.
+        for section_name, fields in (
+            ("pulse_train", (
+                ("Amplitude:", self._amplitude), ("Pulse width:", self._duration_ms),
+                ("Baseline:", self._baseline_ms), ("Post-stim:", self._post_stim_ms),
+                ("Count:", self._pulse_count), ("Frequency:", self._frequency_hz),
+            )),
+            ("pmt_margins", (
+                ("PMT open lead:", self._pmt_open_lead_ms),
+                ("PMT close lag:", self._pmt_close_lag_ms),
+            )),
+        ):
+            section = self.sections[section_name]
+            grid = QGridLayout(section.content)
+            grid.setContentsMargins(4, 0, 2, 2)
+            grid.setHorizontalSpacing(4)
+            grid.setVerticalSpacing(2)
+            for index, (text, widget) in enumerate(fields):
+                row, column = divmod(index, 2)
+                label = QLabel(text)
+                label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                widget.setMaximumWidth(_FIELD_MAXIMUM_WIDTH)
+                grid.addWidget(label, row, 2 * column)
+                grid.addWidget(widget, row, 2 * column + 1)
+            grid.setColumnStretch(1, _FIELD_COLUMN_STRETCH)
+            grid.setColumnStretch(3, _FIELD_COLUMN_STRETCH)
+            grid.setColumnStretch(4, 1)
+            layout.addWidget(section)
 
         self._preview_plot = PGWidget()
         self._preview_plot.setBackground("w")
         self._preview_plot.getAxis("bottom").setLabel("Time", units="s")
         self._preview_plot.getAxis("left").setLabel("Command", units="V")
+        compact_plot_axes(self._preview_plot)
         self._preview_plot.setMouseEnabled(x=False, y=False)
         self._preview_curve = self._preview_plot.plot(
             [], [], pen=pg.mkPen(color=(30, 90, 180), width=2))
