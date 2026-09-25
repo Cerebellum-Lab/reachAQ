@@ -61,6 +61,9 @@ def _exec_main(args):
 
     plugin = try_register_api_event_plugin()
     app_model.rpc_service = plugin.service
+    # There is no Edit DAQ Ports here: a refused NI-DAQ plan is fixed in the
+    # file, at the field each refusal names.
+    app_model.nidaq_plan_remedy = f"fix the field it names in {config_file}"
 
     try:
         app_model.load_configuration(config_file, random_cameras=args.random_cameras)

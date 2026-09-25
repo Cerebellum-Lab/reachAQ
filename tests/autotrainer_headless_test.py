@@ -574,6 +574,7 @@ def test_a_forced_ramp_close_that_hangs_is_given_up_on_and_named(
 
     monkeypatch.setattr(app_model_module, "_LASER_CALIBRATION_CLOSE_MARGIN_S", 0.5)
     monkeypatch.setattr(app_model_module, "_LASER_CALIBRATION_FORCED_CLOSE_S", 0.5)
+    monkeypatch.setattr(app_model_module, "_LASER_CALIBRATION_RAMP_END_WAIT_S", 0.2)
     assert app_model.load_configuration() is True
     app_model.laser.set_configuration_offline(_null_lasers())
     inside, release, controllers = _blocking_ramp(app_model, monkeypatch)
@@ -604,6 +605,140 @@ def test_a_forced_ramp_close_that_hangs_is_given_up_on_and_named(
     finally:
         hang.set()
         release.set()
+        ramp_thread.join(10.0)
+
+
+def _daqmx_fake():
+    """The laser device tests' stand-in for NI-DAQmx, loaded from its file.
+
+    auto-trainer-device/tests is a separate import root from this directory.
+    """
+    import importlib.util
+
+    path = top_fixtures.repo_root_dir.joinpath(
+        "auto-trainer-device", "tests", "nidaq_daqmx_fake.py")
+    spec = importlib.util.spec_from_file_location("nidaq_daqmx_fake", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_a_forced_ramp_close_that_raises_is_named_and_the_ramp_still_resets(
+    app_model, monkeypatch, caplog,
+):
+    # The abort neither released ao0 nor let the ramp's wait return. close()
+    # gave up waiting, its reset was refused at -50103, and it raised. The
+    # forced close logged that at ERROR only: no CRITICAL, since it had not
+    # hung. And reachAQ went on to exit before the ramp, let go by its
+    # driver, could put the command back on its own closed branch.
+    from autotrainer.device import NidaqLaserController, nidaq_laser
+    from tools.acquisition.model import app_model as app_model_module
+
+    fake = _daqmx_fake()
+    daq = fake.FakeDaqmx(block_wait=True, abort_releases=False,
+                         abort_unblocks=False, hold_waits=True)
+    monkeypatch.setattr(nidaq_laser, "_load_nidaqmx", lambda: daq)
+    monkeypatch.setattr(nidaq_laser, "_CALIBRATION_RELEASE_TIMEOUT_S", 0.1)
+    monkeypatch.setattr(app_model_module, "_LASER_CALIBRATION_CLOSE_MARGIN_S", 0.5)
+    assert app_model.load_configuration() is True
+    app_model.laser.set_configuration_offline(_null_lasers())
+    controllers = []
+
+    def open_controller(_configuration, **_kwargs):
+        controller = NidaqLaserController(fake.rig_lasers())
+        close = controller.close
+
+        def close_then_the_driver_lets_go():
+            try:
+                close()
+            finally:
+                # After close() returns, as a driver that lets the ramp go late.
+                daq.waits_released.set()
+
+        controller.close = close_then_the_driver_lets_go
+        controllers.append(controller)
+        return controller
+
+    monkeypatch.setattr(app_model.laser, "open_controller", open_controller)
+    ramp_thread, ramp_outcome = _in_thread(
+        app_model.run_laser_calibration_ramp, _ramp(timeout_seconds=0.5))
+    deadline = time.monotonic() + 10.0
+    while not any(task.name.endswith("calibration_ao") and task.started
+                  for task in daq.tasks):
+        assert time.monotonic() < deadline, "the ramp did not start"
+        time.sleep(0.01)
+    # The ramp's thread also opened the controller, whose own first command
+    # write is 0 V: only what it writes from here on is the ramp's cleanup.
+    ramp_started = len(daq.writes)
+    try:
+        with caplog.at_level("WARNING"):
+            close_thread, close_outcome = _in_thread(app_model.on_close)
+            close_thread.join(30.0)
+            # What the ramp had written by the time reachAQ finished closing.
+            ramp_writes = daq.writes_to(
+                "PXI1Slot4/ao0", task_suffix="manual_ao", thread=ramp_thread,
+                since=ramp_started)
+
+        assert not close_thread.is_alive()
+        assert close_outcome == [None]
+        critical, = [record for record in caplog.records
+                     if record.levelname == "CRITICAL"]
+        message = critical.getMessage()
+        assert "laser 1 failed to close" in message and "5 V" in message
+        assert "channel 1 reset" in message
+        # The ramp's own closed-branch write, made before closing went on.
+        assert ramp_writes == [0.0]
+        ramp_thread.join(5.0)
+        assert not ramp_thread.is_alive()
+        assert any("ramp then ended" in record.getMessage()
+                   for record in caplog.records)
+        error, = ramp_outcome
+        assert "aborted" in str(error)
+    finally:
+        daq.waits_released.set()
+        ramp_thread.join(10.0)
+
+
+def test_a_ramp_whose_own_close_hangs_is_named_when_reachaq_closes(
+    app_model, monkeypatch, caplog,
+):
+    # The ramp's own thread had taken its controller to close it, and that
+    # close hung. The forced close found no controller, did nothing, and
+    # logged nothing: reachAQ exited with the laser as the ramp left it.
+    from autotrainer.device import NullLaserController
+    from tools.acquisition.model import app_model as app_model_module
+
+    monkeypatch.setattr(app_model_module, "_LASER_CALIBRATION_CLOSE_MARGIN_S", 0.5)
+    monkeypatch.setattr(app_model_module, "_LASER_CALIBRATION_RAMP_END_WAIT_S", 0.3)
+    assert app_model.load_configuration() is True
+    app_model.laser.set_configuration_offline(_null_lasers())
+    closing, hang = threading.Event(), threading.Event()
+
+    class _HangsOnClose(NullLaserController):
+        def close(self):
+            closing.set()
+            hang.wait(30.0)
+            super().close()
+
+    monkeypatch.setattr(app_model.laser, "open_controller",
+                        lambda configuration, **_kwargs: _HangsOnClose(configuration))
+    ramp_thread, _ramp_outcome = _in_thread(
+        app_model.run_laser_calibration_ramp, _ramp(timeout_seconds=0.5))
+    assert closing.wait(10.0), "the ramp did not reach its own close"
+    try:
+        with caplog.at_level("CRITICAL"):
+            close_thread, close_outcome = _in_thread(app_model.on_close)
+            close_thread.join(20.0)
+
+        assert not close_thread.is_alive()
+        assert close_outcome == [None]
+        critical, = [record for record in caplog.records
+                     if record.levelname == "CRITICAL"]
+        message = critical.getMessage()
+        assert "laser 1 is being closed by the ramp's own thread" in message
+        assert "5 V" in message
+    finally:
+        hang.set()
         ramp_thread.join(10.0)
 
 

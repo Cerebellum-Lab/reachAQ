@@ -307,6 +307,12 @@ _LASER_CALIBRATION_CLOSE_MARGIN_S = 5.0
 #: How long closing then gives the ramp controller's own close. It waits up
 #: to 5 s for the ramp to let go of its tasks, and resets the laser after.
 _LASER_CALIBRATION_FORCED_CLOSE_S = 15.0
+#: How long closing then waits, after a forced close that failed or hung,
+#: for the ramp to end: a ramp its driver lets go writes the command back to
+#: its minimum itself.
+_LASER_CALIBRATION_RAMP_END_WAIT_S = 2.0
+#: Where the GUI's operator fixes a refused NI-DAQ plan.
+_GUI_NIDAQ_PLAN_REMEDY = "fix it in Edit → Edit DAQ Ports"
 
 
 def _serialized_session_configuration(method):
@@ -704,6 +710,9 @@ class AppModel(ObservableObject):
         self._nidaq_stream_autostart = NidaqStreamAutoStart(
             self._nidaq_signal_monitor,
             may_start=self._nidaq_stream_may_start,
+            # A released hold says "stopped"; with a refused plan held, the
+            # laser tabs and Analysis then lost the reason (A8).
+            on_released=self._hold_nidaq_plan_blocked,
         )
         #: Whether _start_nidaq_domain is running, and whether the stream's
         #: latest start came while it was; see _on_nidaq_monitor_property_changed.
@@ -713,6 +722,9 @@ class AppModel(ObservableObject):
         #: While set, the stream has no channels and reads BLOCKED with it,
         #: until Edit DAQ Ports saves a plan that builds.
         self._nidaq_plan_error = ""
+        #: What the operator is told to do about a refused plan; see
+        #: nidaq_plan_remedy.
+        self._nidaq_plan_remedy = _GUI_NIDAQ_PLAN_REMEDY
         #: Set while run_laser_calibration_ramp holds the NI-DAQ lines and a
         #: laser controller of its own; Run, the DAQ Monitor, a configuration
         #: load and a DAQ ports save refuse while it is.
@@ -6273,11 +6285,25 @@ class AppModel(ObservableObject):
         """Why the loaded NI-DAQ plan was refused, or an empty string."""
         return self._nidaq_plan_error
 
+    @property
+    def nidaq_plan_remedy(self) -> str:
+        """What to do about a refused plan, as the refusal's log line says it.
+
+        "fix it in Edit → Edit DAQ Ports" by default. Headless has no such
+        dialog and names the configuration file instead; each refusal names
+        its own field.
+        """
+        return self._nidaq_plan_remedy
+
+    @nidaq_plan_remedy.setter
+    def nidaq_plan_remedy(self, value: str) -> None:
+        self._nidaq_plan_remedy = str(value)
+
     def _nidaq_plan_blocked_reason(self) -> str:
         # The remedy first: the status bar cuts an error at 320 characters,
         # which two or three refusals run past.
         return (
-            "NI-DAQ plan refused; fix it in Edit → Edit DAQ Ports: "
+            f"NI-DAQ plan refused; {self._nidaq_plan_remedy}: "
             f"{self._nidaq_plan_error}"
         )
 
@@ -6523,13 +6549,17 @@ class AppModel(ObservableObject):
             + _LASER_CALIBRATION_CLOSE_MARGIN_S
         )
 
-    def _close_laser_calibration_controller(self, *, keep_error: bool) -> None:
-        """Close the ramp's controller once, whichever thread gets here first."""
+    def _close_laser_calibration_controller(self, *, keep_error: bool) -> bool:
+        """Close the ramp's controller once, whichever thread gets here first.
+
+        Returns whether this call had a controller to close; False when the
+        other thread took it first.
+        """
         with self._laser_calibration_lock:
             controller, self._laser_calibration_controller = (
                 self._laser_calibration_controller, None)
         if controller is None:
-            return
+            return False
         try:
             controller.close()
         except Exception:
@@ -6537,6 +6567,7 @@ class AppModel(ObservableObject):
                 raise
             # The ramp's own error is the one to report.
             logger.exception("Laser calibration controller did not close cleanly")
+        return True
 
     def _finish_laser_calibration_for_close(self) -> None:
         """Wait for a ramp in progress; past its own timeout, close its controller.
@@ -6551,18 +6582,24 @@ class AppModel(ObservableObject):
         wait_seconds = self._laser_calibration_close_wait_s
         if self._laser_calibration_done.wait(wait_seconds):
             return
+        # Not "which puts the command to its minimum": that reset can be
+        # refused, and the forced close can fail or hang.
         logger.error(
             "A laser calibration ramp was still running %.1f s after reachAQ "
-            "began closing; closing its laser controller, which puts the "
-            "command to its minimum and closes the shutters",
+            "began closing; closing its laser controller, which aborts the "
+            "ramp and tries to put the command to its minimum and close the "
+            "shutters",
             wait_seconds,
         )
         ramp = self._laser_calibration_ramp
+        outcome = {}
 
         def force_close():
             try:
-                self._close_laser_calibration_controller(keep_error=False)
-            except Exception:
+                outcome["closed"] = self._close_laser_calibration_controller(
+                    keep_error=False)
+            except Exception as error:
+                outcome["error"] = error
                 logger.exception("Failed to close the laser calibration controller")
 
         # Bounded (controller ruling, 2026-09-25): a close that hangs inside
@@ -6575,18 +6612,48 @@ class AppModel(ObservableObject):
             target=force_close, name="laser_calibration_close", daemon=True)
         closer.start()
         closer.join(_LASER_CALIBRATION_FORCED_CLOSE_S)
+        if not closer.is_alive() and outcome.get("closed"):
+            return  # Closed cleanly: the laser was reset.
         if closer.is_alive():
-            logger.critical(
-                "The calibration controller for laser %s did not close within "
-                "%.1f s. Its analog output may still hold the ramp's last "
-                "command, %g V (a %g V to %g V ramp), and its shutter may be "
-                "open: make the laser safe by hand. reachAQ is closing without it.",
-                "?" if ramp is None else int(ramp.channel_id),
-                _LASER_CALIBRATION_FORCED_CLOSE_S,
-                float("nan") if ramp is None else ramp.stop_volts,
-                float("nan") if ramp is None else ramp.start_volts,
-                float("nan") if ramp is None else ramp.stop_volts,
-            )
+            failure = f"did not close within {_LASER_CALIBRATION_FORCED_CLOSE_S:.1f} s"
+        elif "error" in outcome:
+            error = outcome["error"]
+            failure = "failed to close ({})".format(
+                next(iter(str(error).splitlines()), "") or error.__class__.__name__)
+        else:
+            # The ramp's own thread took the controller first, and closes it.
+            failure = ""
+        # A ramp let go by its driver after the forced close writes the
+        # command back itself, on its closed branch; the process must not end
+        # before it can. Bounded, as everything on this path.
+        ramp_ended = self._laser_calibration_done.wait(_LASER_CALIBRATION_RAMP_END_WAIT_S)
+        if not failure:
+            if ramp_ended:
+                return  # Its own close finished: the laser was reset there.
+            failure = "is being closed by the ramp's own thread, which has not finished"
+        # With a raise as with a hang: reachAQ exits next, and nothing else
+        # will reset the laser.
+        logger.critical(
+            "The calibration controller for laser %s %s. Its analog output may "
+            "still hold the ramp's last command, %g V (a %g V to %g V ramp), "
+            "and its shutter may be open: make the laser safe by hand. reachAQ "
+            "is closing without it.",
+            "?" if ramp is None else int(ramp.channel_id),
+            failure,
+            float("nan") if ramp is None else ramp.stop_volts,
+            float("nan") if ramp is None else ramp.start_volts,
+            float("nan") if ramp is None else ramp.stop_volts,
+        )
+        if ramp_ended:
+            logger.warning(
+                "The laser calibration ramp then ended; its own cleanup puts "
+                "the command back to its minimum if the driver allows it, and "
+                "logs an error if it could not")
+        else:
+            logger.error(
+                "The laser calibration ramp had not ended %.1f s after that "
+                "either; reachAQ closes with it still running",
+                _LASER_CALIBRATION_RAMP_END_WAIT_S)
 
     def _start_nidaq_domain(self, *, timeout: float = 12.0, restart: bool = False) -> bool:
         """Start the NI-DAQ domain; `restart` replaces a stream already running.
@@ -7884,8 +7951,8 @@ class AppModel(ObservableObject):
             # The remedy first: the status bar shows this line cut at 320
             # characters, which two or three refusals run past.
             logger.error(
-                "NI-DAQ inputs are not acquired; fix it in Edit → Edit DAQ "
-                "Ports. Refused: %s",
+                "NI-DAQ inputs are not acquired; %s. Refused: %s",
+                self._nidaq_plan_remedy,
                 nidaq_plan_error,
             )
             self.nidaq_signal_monitor.load_configuration(NidaqSignalStreamConfiguration())

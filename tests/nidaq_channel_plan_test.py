@@ -1,4 +1,5 @@
 import dataclasses
+from pathlib import Path
 
 import pytest
 
@@ -752,81 +753,10 @@ def test_every_laser_claims_its_names_while_the_backend_is_enabled(name):
 # ------------------------------------------------ christielab10, from YAML
 
 
-#: christielab10's nidaqPorts and nidaqStream blocks as the file stores them,
-#: camelCase, transcribed from the fixtures above (as of 2026-09-24).
-_CHRISTIELAB10_YAML = """
-!SystemConfiguration
-version: {version}
-nidaqPorts: !NidaqPortConfiguration
-  deviceName: PXI1Slot5
-  tone1: PXI1Slot5/port0/line0
-  tone2: PXI1Slot5/port0/line1
-  tone3R: null
-  tone3L: null
-  camFrames: PXI1Slot5/port0/line2
-  barcode: PXI1Slot5/port0/line3
-nidaqStream: !NidaqSignalStreamConfiguration
-  isEnabled: true
-  sampleRateHz: 10000.0
-  readChunkSize: 500
-  channels:
-  - !NidaqSignalChannelConfiguration
-    name: cam_frames
-    physicalChannel: PXI1Slot5/port0/line2
-    kind: digital
-    unit: logic
-  - !NidaqSignalChannelConfiguration
-    name: barcode
-    physicalChannel: PXI1Slot5/port0/line3
-    kind: digital
-    unit: logic
-  - !NidaqSignalChannelConfiguration
-    name: tone1
-    physicalChannel: PXI1Slot5/port0/line0
-    kind: digital
-    unit: logic
-  - !NidaqSignalChannelConfiguration
-    name: tone2
-    physicalChannel: PXI1Slot5/port0/line1
-    kind: digital
-    unit: logic
-  - !NidaqSignalChannelConfiguration
-    name: laser1_diode
-    physicalChannel: PXI1Slot5/ai8
-    kind: analog
-    unit: V
-  - !NidaqSignalChannelConfiguration
-    name: laser1_command_copy
-    physicalChannel: PXI1Slot5/ai3
-    kind: analog
-    unit: V
-  - !NidaqSignalChannelConfiguration
-    name: laser2_diode
-    physicalChannel: PXI1Slot5/ai4
-    kind: analog
-    unit: V
-  - !NidaqSignalChannelConfiguration
-    name: laser2_command_copy
-    physicalChannel: PXI1Slot5/ai5
-    kind: analog
-    unit: V
-  - !NidaqSignalChannelConfiguration
-    name: laser1_trigger_readback
-    physicalChannel: PXI1Slot5/ai9
-    kind: analog
-    unit: V
-  - !NidaqSignalChannelConfiguration
-    name: laser2_trigger_readback
-    physicalChannel: PXI1Slot5/ai10
-    kind: analog
-    unit: V
-  displayChannels:
-  - laser1_command_copy
-  - cam_frames
-  - barcode
-  - tone2
-  - tone1
-"""
+#: christielab10's own nidaqPorts and nidaqStream blocks, deviceIdentities
+#: and timing included, copied read-only from the rig's
+#: ~/Autotrainer/system_configuration.yaml on 2026-09-25.
+_CHRISTIELAB10_BLOCKS = Path(__file__).with_name("christielab10_nidaq_blocks.yaml")
 
 
 def _christielab10_from_yaml():
@@ -835,19 +765,40 @@ def _christielab10_from_yaml():
     from autotrainer.core import SystemConfiguration
 
     return SystemConfiguration.load_yaml(io.StringIO(
-        _CHRISTIELAB10_YAML.format(version=SystemConfiguration.version)))
+        f"!SystemConfiguration\nversion: {SystemConfiguration.version}\n"
+        + _CHRISTIELAB10_BLOCKS.read_text(encoding="utf-8")))
 
 
 def test_christielab10s_yaml_blocks_load_unchanged():
     # The fixtures above are Python objects; this goes through the parser,
-    # camelCase and all, as a load does.
+    # camelCase and all, as a load does, on the rig's own blocks. The plan
+    # they build is the one they built at 1b13e15a, which is the stored
+    # stream itself: every channel, in order, with its settings and the
+    # display selection.
     loaded = _christielab10_from_yaml()
+    ports, stored = loaded.nidaq_ports, loaded.nidaq_stream
 
-    assert loaded.nidaq_ports == CHRISTIELAB10_PORTS
-    assert loaded.nidaq_stream == _christielab10_stream()
+    for attribute in ("device_name", "tone1", "tone2", "tone3_r", "tone3_l",
+                      "cam_frames", "barcode"):
+        assert getattr(ports, attribute) == getattr(CHRISTIELAB10_PORTS, attribute)
+    assert [(identity.runtime_name, identity.product_type, identity.serial_number)
+            for identity in ports.device_identities] == [
+        ("PXI1Slot5", "PXI-6221", 21803707), ("PXI1Slot4", "PXI-6713", 27056752)]
+    assert ports.timing.sync_mode == "auto"
+    assert stored.channels == _christielab10_stream().channels
+    assert stored.display_channels == _christielab10_stream().display_channels
+
     result = build_nidaq_acquisition_configuration(
-        loaded.nidaq_stream, loaded.nidaq_ports, _christielab10_lasers())
-    assert result == loaded.nidaq_stream
+        stored, ports, _christielab10_lasers())
+
+    assert result == stored
+    assert tuple(channel.name for channel in result.channels) == (
+        "cam_frames", "barcode", "tone1", "tone2",
+        "laser1_diode", "laser1_command_copy", "laser2_diode",
+        "laser2_command_copy", "laser1_trigger_readback", "laser2_trigger_readback",
+    )
+    assert result.display_channels == (
+        "laser1_command_copy", "cam_frames", "barcode", "tone2", "tone1")
 
 
 def _with_readbacks(lasers, **inputs):

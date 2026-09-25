@@ -1282,5 +1282,48 @@ def test_headless_exits_1_naming_a_bad_ni_line(
             and record.name == "autotrainer.headless"
             for record in caplog.records
         )
+        # Headless has no Edit DAQ Ports: its load's own ERROR line said to
+        # fix the line there. It names the file, and the refusal the field.
+        messages = [record.getMessage() for record in caplog.records]
+        assert not any("Edit DAQ Ports" in message for message in messages)
+        load_error, = [message for message in messages
+                       if message.startswith("NI-DAQ inputs are not acquired")]
+        assert str(config_file_path) in load_error
+        assert "nidaqPorts.tone1 'Dev1/port1/line0'" in load_error
+    finally:
+        _close_stream(app_model, monitor)
+
+
+def test_releasing_a_hold_keeps_saying_why_a_bad_ni_line_blocks_the_stream(
+    app_model, system_config, trainer_config_dir, monkeypatch,
+):
+    # Opening and closing the DAQ Monitor, or a refused DAQ ports save, pauses
+    # and resumes the stream. The resume said "NI-DAQ signal stream
+    # stopped", and the laser tabs and Analysis lost the plan's reason.
+    monkeypatch.setattr(nidaq_monitor_session, "NidaqSignalMonitorModel", _Stream)
+    monkeypatch.setattr(nidaq_monitor_session, "discover_nidaq_devices",
+                        lambda: ((), None))
+    monitor = _load_with_a_bad_ni_line(
+        app_model, system_config, trainer_config_dir, monkeypatch)
+    reason = _nidaq_state(app_model).reason
+    try:
+        session = NidaqMonitorSession(app_model)
+        try:
+            assert "DAQ Monitor" in monitor.status_message
+        finally:
+            session.close()
+
+        assert monitor.status_message == reason
+        assert _nidaq_state(app_model).state is SubsystemState.BLOCKED
+        assert _nidaq_state(app_model).reason == reason
+
+        # A DAQ ports save that its own plan refuses holds and releases too.
+        with pytest.raises(ValueError):
+            app_model.update_daq_port_configuration(
+                NidaqPortConfiguration(
+                    cam_frames="Dev1/port0/line0", tone1="Dev1/port2/line3"),
+                _null_laser_configuration())
+        assert monitor.status_message == reason
+        assert _nidaq_state(app_model).state is SubsystemState.BLOCKED
     finally:
         _close_stream(app_model, monitor)
