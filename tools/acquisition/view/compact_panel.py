@@ -15,6 +15,8 @@ from typing import Optional
 from PySide6.QtCore import QEvent, QSize, Qt, Signal
 from PySide6.QtGui import QFont, QPainter
 from PySide6.QtWidgets import (
+    QComboBox,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QSizePolicy,
@@ -28,6 +30,12 @@ from PySide6.QtWidgets import (
 COMPACT_FONT_POINT_SIZE = 7.5
 #: Graph tick and axis-label font; pyqtgraph draws these itself.
 COMPACT_AXIS_POINT_SIZE = 7.0
+#: Past these, a field only gets emptier; the extra width goes to the graphs.
+FIELD_MAXIMUM_WIDTH = 170
+WIDE_FIELD_MAXIMUM_WIDTH = 400
+#: Grid field columns grow first; an empty last column takes what is left
+#: once the fields reach their maximum width.
+FIELD_COLUMN_STRETCH = 10
 
 
 def compact_font_style_sheet(object_name: str) -> str:
@@ -36,6 +44,53 @@ def compact_font_style_sheet(object_name: str) -> str:
         f"#{object_name}, #{object_name} QWidget "
         f"{{font-size: {COMPACT_FONT_POINT_SIZE:g}pt;}}"
     )
+
+
+def compact_button_style_sheet(object_name: str) -> str:
+    """Push buttons a little shorter than the style's, inside one widget."""
+    return f"#{object_name} QPushButton {{min-height: 18px; padding: 1px 8px;}}"
+
+
+def compact_combo_box() -> QComboBox:
+    """A combo box sized to a few characters rather than its longest entry.
+
+    Sized to its longest entry, a board route or a long profile name widened
+    the whole panel.
+    """
+    combo_box = QComboBox()
+    combo_box.setSizeAdjustPolicy(
+        QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+    combo_box.setMinimumContentsLength(6)
+    return combo_box
+
+
+def form_label(text: str) -> QLabel:
+    """A field's label, right-aligned against the field."""
+    label = QLabel(text)
+    label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+    return label
+
+
+def field_grid(parent: QWidget, fields) -> QGridLayout:
+    """Label and field pairs, two to a row, in a grid on ``parent``.
+
+    Each field grows up to FIELD_MAXIMUM_WIDTH, and then an empty fifth
+    column takes the rest, so a wide detached panel does not stretch them.
+    Returns the grid, for any rows under the fields.
+    """
+    grid = QGridLayout(parent)
+    grid.setContentsMargins(4, 0, 2, 2)
+    grid.setHorizontalSpacing(4)
+    grid.setVerticalSpacing(2)
+    for index, (text, field) in enumerate(fields):
+        row, column = divmod(index, 2)
+        field.setMaximumWidth(FIELD_MAXIMUM_WIDTH)
+        grid.addWidget(form_label(text), row, 2 * column)
+        grid.addWidget(field, row, 2 * column + 1)
+    grid.setColumnStretch(1, FIELD_COLUMN_STRETCH)
+    grid.setColumnStretch(3, FIELD_COLUMN_STRETCH)
+    grid.setColumnStretch(4, 1)
+    return grid
 
 
 def compact_plot_axes(plot_widget, point_size: float = COMPACT_AXIS_POINT_SIZE) -> None:
