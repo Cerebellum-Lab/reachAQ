@@ -243,8 +243,8 @@ tabs. Every laser pulse profile is built and saved there; a laser's own tab
 only picks a saved profile or the builder's unsaved draft and fires it.
 
 Laser Control uses a smaller font (7.5 pt, graph axes 7 pt) so that each
-page fits the docked right-side panel without scrolling. On christielab10 that
-panel is 440 x 860 px. Each channel has **Pulse** and **Calibration** tabs.
+page fits the docked right-side panel without scrolling; the dialogs it opens
+keep the application font. On christielab10 that panel is 440 x 860 px. Each channel has **Pulse** and **Calibration** tabs.
 The Pulse tab has the **Profile:** picker at the top. Below it are the folding
 sections **Run Pulse**, **Test stim**, **Output stream** and **Board
 trigger**; click a section's title to fold or open it. A folded section gives
@@ -281,8 +281,10 @@ Every legend swatch and plotted curve is solid.
 
 All Analysis and laser graphs take their physical pixel width and height from
 the containing panel. Dragging a horizontal or vertical splitter therefore
-grows or shrinks the graph itself; no graph keeps a fixed pixel height or forces
-its panel wider. This is independent of the editable seconds and voltage ranges.
+grows or shrinks the graph itself, and no graph forces its panel wider. Only
+the laser tabs' Board trigger graph keeps a fixed height, 76 px, for a single
+TTL edge; every other graph takes the height it is given. This is independent
+of the editable seconds and voltage ranges.
 
 ## Output
 
