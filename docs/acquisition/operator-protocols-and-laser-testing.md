@@ -177,9 +177,11 @@ is **Pulse Builder** — every profile is made here, and nowhere else.
   `profile_id — summary`. Selecting one loads its controls. **Delete** asks you
   to confirm, and is refused, naming the protocols, when one still uses the
   profile: *"Profile 'x' is used by: some-protocol"*.
-- The controls shape the train: **Amplitude**, **Pulse width**, **Baseline**,
-  **Post-stim**, **Count**, **Frequency**, **PMT open lead**, **PMT close
-  lag**. Amplitude here is limited to the widest range any configured laser
+- The controls shape the train. The **Pulse train** section holds
+  **Amplitude**, **Pulse width**, **Baseline**, **Post-stim**, **Count** and
+  **Frequency**, two to a row. The **PMT shutter margins** section holds **PMT
+  open lead** and **PMT close lag**; it starts folded, so click its title to
+  open it. Amplitude here is limited to the widest range any configured laser
   accepts; the laser that actually fires the profile checks its own range. A
   saved profile outside that range loads clamped to it, and the status line
   says so: *"Profile 'hot' is 6 V; the builder allows 0..5 V, so it now shows
@@ -198,15 +200,20 @@ is **Pulse Builder** — every profile is made here, and nowhere else.
 ## The two tests, and what each one proves
 
 Open the **Laser Control** tab. There is one sub-tab per configured channel,
-*Laser 1*, *Laser 2* and so on, each with **Pulse**, **Calibration** and
-**Output** pages.
+*Laser 1*, *Laser 2* and so on, each with **Pulse** and **Calibration** pages.
+The Pulse page has **Profile:** at the top, then the sections **Run Pulse**,
+**Test stim**, **Output stream** and **Board trigger**. Click a section's title
+to fold it away or open it again. With every section open, the page fits the
+docked right-hand panel without scrolling. Folding a section gives its height
+to the output graph. A section folded on one laser is folded on every laser,
+and stays folded when the tabs are rebuilt.
 
-The **Output Stream** graph on the Pulse page needs nothing started: it plots
+The **Output stream** graph on the Pulse page needs nothing started: it plots
 whenever the NI-DAQ input stream runs, and that stream starts by itself, in
 Idle as well as in System Mode. Its status line says whether it is running.
-Under its **Signals** tab, **Command output**, **Diode feedback**, **Command
-copy** and **Board trigger readback** each show or hide their trace at once,
-at any time.
+Under the graph, the **Signals** section starts folded. Open it, and **Command
+output**, **Diode feedback**, **Command copy** and **Board trigger readback**
+each show or hide their trace at once, at any time.
 
 On the **Pulse** page, **Profile:** picks what fires on this laser: *(none)*,
 *(builder draft)* or any saved profile, unfiltered — a profile made with one
@@ -222,7 +229,8 @@ selected"*, or that the draft is not a valid pulse train.
 
 ### Run Pulse — proves the analog output works
 
-Set **Trigger Mode**, the shutter and PMT options, then press **Run Pulse**.
+In the **Run Pulse** section, set **Trigger:**, the shutter and PMT options,
+then press **Run Pulse**.
 The host writes the picked profile's waveform to the analog output directly.
 
 - **Success:** the status line reads *"Pulse complete: laser 1"*, and the
@@ -230,9 +238,10 @@ The host writes the picked profile's waveform to the analog output directly.
 - **What it does not prove:** anything about the board. This path never touches
   the pellet board, so it cannot tell you whether a trial's trigger would work.
 
-**Trigger Mode** starts at *internal*, which starts the pulse on the NI clock
+**Trigger:** starts at *internal*, which starts the pulse on the NI clock
 when you press Run Pulse. With *external*, the output is armed and waits for
-an edge on **Trigger Source**. Nothing on this page sends that edge, so use
+an edge, chosen by **Edge:**, on **Source:**. Nothing on this page sends that
+edge, so use
 *external* only when an outside trigger is wired in. If no edge arrives, the
 pulse fails after the train length plus five seconds with *Wait Until Done did
 not indicate that the task was done*.
@@ -242,12 +251,12 @@ this laser; this page has no waveform controls, and nothing is copied into it.
 Picking *(builder draft)* fires whatever is on the Pulse Builder at the moment
 you press the button. To change a saved profile's waveform, select it in the
 Pulse Builder, which loads it there for editing, and save. Picking a profile
-does not change Trigger Mode or Trigger Source.
+does not change **Trigger:** or **Source:**.
 
 ### Test stim — proves the trial path
 
-Below Run Pulse, pick a profile in **Profile:**, pick a route in **Route:**,
-and press **Test stim**. It is available once the system is running, and
+Pick a profile in **Profile:**. Then, in the **Test stim** section below Run
+Pulse, pick a route in **Route:** and press **Test stim**. It is available once the system is running, and
 refused while a session records.
 
 **Route:** offers:

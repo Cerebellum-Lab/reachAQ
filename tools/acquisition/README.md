@@ -242,14 +242,23 @@ Laser Control opens on **Pulse Builder**, the first tab, before the per-channel
 tabs. Every laser pulse profile is built and saved there; a laser's own tab
 only picks a saved profile or the builder's unsaved draft and fires it.
 
-Each Laser Control channel uses compact **Pulse**, **Calibration**, and **Output**
-tabs so its controls remain usable when the right-side panel is narrow. The
-Output area has nested **Stream** and **Signals** tabs. Stream contains the graph,
-its Clear control and a status line naming the shared input stream's state;
-Signals contains that laser's command-output, diode-feedback, command-copy and
+Laser Control uses a smaller font (7.5 pt, graph axes 7 pt) so that each
+page fits the docked right-side panel without scrolling. On christielab10 that
+panel is 440 x 860 px. Each channel has **Pulse** and **Calibration** tabs.
+The Pulse tab has the **Profile:** picker at the top. Below it are the folding
+sections **Run Pulse**, **Test stim**, **Output stream** and **Board
+trigger**; click a section's title to fold or open it. A folded section gives
+its height to the output graph. The open/closed state is shared by every laser
+tab and survives the tab rebuilds at each Run/Stop; it is not saved when
+reachAQ closes. Output stream contains the graph, its legend, a status line
+naming the shared input stream's state with Clear beside it, the time window
+and voltage limits, and a **Signals** section, folded by default. Signals holds
+that laser's command-output, diode-feedback, command-copy and
 board-trigger-readback display options. Physical NI-DAQ paths are shown in
-signal tooltips instead of widening the panel. Plots and controls shrink with
-the panel; use the main splitter to give them more room when desired. A mapped
+signal tooltips instead of widening the panel. A line too long for the panel
+ends in an ellipsis, and hovering over it shows the whole text. Plots and
+controls shrink with the panel; use the main splitter to give them more room
+when desired. A mapped
 laser's graph follows the shared NI-DAQ input stream, which starts by itself
 (see above), so its inputs plot in Idle as well as in System Mode; there is no
 Start Stream or Start DAQ Inputs button. Every display option can be ticked or
@@ -267,7 +276,7 @@ its own editable time window and voltage limits.
 Every stream option and curve uses the same high-contrast color assignment:
 the first displayed signal is blue, the second green, followed by orange,
 purple, red, teal, magenta, and blue-gray. A compact matching legend appears
-below the main Analysis graph and below every laser Output Stream graph.
+below the main Analysis graph and below every laser Output stream graph.
 Every legend swatch and plotted curve is solid.
 
 All Analysis and laser graphs take their physical pixel width and height from
