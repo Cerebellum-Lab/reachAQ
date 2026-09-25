@@ -266,15 +266,18 @@ Start Stream or Start DAQ Inputs button. Every display option can be ticked or
 unticked at any time, including while the stream runs, and shows or hides its
 curve at once. The input selections persist immediately in
 `nidaqStream.displayChannels`, while remaining absent from the main Analysis
-selector and plot; whether the command output is shown is remembered until
+selector and plot, which leaves out every laser's diode, command-copy and
+trigger-readback input; whether the command output is shown is remembered until
 reachAQ closes. An input that is not in the acquisition plan is disabled and
-its tooltip says so. The diode and command-copy inputs come from **Edit DAQ
-Ports**; the board-trigger readback comes from the laser channel's
-`triggerMonitorInput` in the system configuration, which Edit DAQ Ports does
-not show and keeps as it is. Each configured input is acquired and recorded as
-`laserN_diode`, `laserN_command_copy` or `laserN_trigger`, and the Board
-trigger status line names the input it reads or says what to set. An input
-already used by another role is refused, naming both. Manual/internal and
+its tooltip says so. All three inputs are set per laser in **Edit DAQ Ports**:
+diode, laser_copy, and trigger readback input, the last being the board STIM
+line wired into an analog input (`aiN`) or a digital input line
+(`portN/lineN`), never a PFI terminal. Each configured input is acquired and
+recorded as `laserN_diode`, `laserN_command_copy` or `laserN_trigger`, the
+readbacks last in the scan. The Board trigger status line says whether no
+input is set, the stream is not running, or the readback is being read, shown
+or not. An input already used by another role, or a laser output line, is
+refused in the dialog, naming both. Manual/internal and
 externally triggered pulse operations append their command waveform. Selected
 measured inputs from the shared NI-DAQ stream are added to the corresponding
 laser graph. Calibration explicitly starts and clears the associated graph.

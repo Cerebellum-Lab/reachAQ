@@ -138,11 +138,13 @@ The documented rig also has a PXI-6221 at `PXI1Slot5`; it supplies the sampled
 analog feedback inputs, hardware-clocked digital inputs, and counters used by
 the acquisition timeline. Laser `diodeInput` and `commandCopyInput` therefore
 belong on the 6221 (or another discovered analog-input device), and so does a
-laser's board-trigger readback, `triggerMonitorInput` (an analog input or a
-digital line), while laser analog commands can remain on the 6713. Digital and
-analog inputs may share the
-6221 task; a future hardware-timed 6713 output task must join the validated
-multi-device timing topology described below.
+laser's board-trigger readback, `triggerMonitorInput`: the board STIM line
+wired into an analog input (`aiN`) or a digital input line (`portN/lineN`),
+never a PFI terminal, set as **trigger readback input** on the laser's tab in
+**Edit DAQ Ports** and recorded as `laserN_trigger`. Laser analog commands can
+remain on the 6713. Digital and analog inputs may share the 6221 task; a
+future hardware-timed 6713 output task must join the validated multi-device
+timing topology described below.
 
 Validate configured laser tasks only after confirming the real wiring, and
 with reachAQ closed: its NI-DAQ input stream runs whenever it is open, and
