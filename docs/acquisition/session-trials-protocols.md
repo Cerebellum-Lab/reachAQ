@@ -94,7 +94,15 @@ library used by the session.
 
 Tone phases are Before SEND, Embedded in board sequence, Pellet presentation,
 and Retract. Laser recipes freeze either Hardware STIM3 or Direct NI software
-start. Scheduled pre-reveal stimulation is emitted and delayed by the pellet
+start. A laser row also names the laser that fires it (`laser_channel_id`, added
+in protocol schema 3); the profile is only the pulse train. The compiler takes
+the trigger terminal, board STIM line and board pulse width from that laser's
+channel configuration (`triggerSource`, `boardStimLine`, `boardTriggerPulseUs`),
+so the Hardware STIM3 route pulses STIM3 for one laser and STIM2 for another,
+and the trial record stores that `laser_firing` beside the profile. A schema 2
+protocol with a laser row, or a set with a laser route on a trial that names no
+laser, is refused on load with a message naming it. Scheduled pre-reveal
+stimulation is emitted and delayed by the pellet
 board before cover release; Direct NI is rejected for that phase. First Reach
 uses the 900 Hz stim-camera transition detector, not pose inference. ROI1/ROI2
 remain schema/UI framework only and are rejected as runnable.

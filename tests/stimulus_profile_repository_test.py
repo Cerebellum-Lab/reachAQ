@@ -138,7 +138,9 @@ def test_saving_keeps_every_profile_kind(tmp_path):
 
     assert saved.cue_interval_profiles == (cue,)
     assert saved.stimulus_trigger_profiles == (trigger,)
-    assert StimulusProfileRepository(repository.path).load().cue_interval_profiles == (cue,)
+    reloaded = StimulusProfileRepository(repository.path).load()
+    assert reloaded.cue_interval_profiles == (cue,)
+    assert reloaded.stimulus_trigger_profiles == (trigger,)
 
 
 def test_a_profile_summarises_its_train():

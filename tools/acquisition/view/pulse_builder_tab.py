@@ -260,6 +260,17 @@ class PulseBuilderTab(QWidget):
         finally:
             for control in self._controls:
                 control.blockSignals(False)
+        # The spinbox clamps to the builder's range without a word, and a
+        # save would then store the clamped value under this profile's name.
+        # Rounding to the displayed decimals is not worth reporting.
+        shown = self._amplitude.value()
+        if abs(shown - profile.amplitude_volts) > 10 ** -self._amplitude.decimals():
+            self._set_status(
+                f"Profile {profile_id!r} is {profile.amplitude_volts:g} V; the "
+                f"builder allows {self._amplitude.minimum():g}.."
+                f"{self._amplitude.maximum():g} V, so it now shows {shown:g} V",
+                False,
+            )
         self._on_draft_changed()
 
     def _on_draft_changed(self, *_args) -> None:
@@ -299,6 +310,16 @@ class PulseBuilderTab(QWidget):
             return
         name = self._ask_profile_name(self._profile_selector.currentData() or "pulse")
         if name is None:
+            return
+        # A laser tab's picker fires the draft for this identifier, so picking
+        # a profile saved under it would fire the draft instead. Protocol rows
+        # lowercase profile identifiers, hence the case-insensitive check.
+        if name.lower() == DRAFT_PROFILE_ID:
+            self._set_status(
+                f"{DRAFT_PROFILE_ID!r} is reserved for the unsaved builder draft; "
+                "choose another name",
+                True,
+            )
             return
         values = draft.to_record()
         values.pop("revision")

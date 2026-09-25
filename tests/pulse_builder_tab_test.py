@@ -70,6 +70,47 @@ def test_picking_a_saved_profile_loads_it(qapp, app_model, monkeypatch):
         pmt_open_lead_ms=3.0)
 
 
+def test_loading_a_profile_the_builder_cannot_show_says_what_changed(
+    qapp, app_model, monkeypatch,
+):
+    # The amplitude spinbox clamped it silently, so saving again would have
+    # stored 5 V under the name of a 6 V profile.
+    saved = LaserPulseProfile("hot", 1, 6.0, 1.0)
+    with_one_saved_profile(monkeypatch, app_model, saved)
+    tab, statuses = builder(app_model)
+
+    tab._profile_selector.setCurrentIndex(tab._profile_selector.findData("hot"))
+
+    assert statuses == [(
+        "Profile 'hot' is 6 V; the builder allows 0..5 V, so it now shows 5 V", False)]
+
+
+def test_loading_a_profile_within_range_reports_nothing(qapp, app_model, monkeypatch):
+    with_one_saved_profile(monkeypatch, app_model, LaserPulseProfile("ok", 1, 1.2345, 1.0))
+    tab, statuses = builder(app_model)
+
+    tab._profile_selector.setCurrentIndex(tab._profile_selector.findData("ok"))
+
+    assert statuses == []
+
+
+def test_the_draft_name_cannot_be_saved(qapp, app_model, monkeypatch):
+    # A saved profile named "builder-draft" is indistinguishable from the
+    # draft in a laser tab's picker, which fires the draft for that name.
+    saved = []
+    monkeypatch.setattr(type(app_model), "save_laser_profile",
+                        lambda _self, **values: saved.append(values))
+    tab, statuses = builder(app_model)
+    tab._ask_profile_name = lambda _suggested: DRAFT_PROFILE_ID
+
+    tab._save()
+
+    assert saved == []
+    assert statuses == [(
+        "'builder-draft' is reserved for the unsaved builder draft; "
+        "choose another name", True)]
+
+
 def test_saving_stores_the_train_under_the_given_name(qapp, app_model, monkeypatch):
     saved = []
 
