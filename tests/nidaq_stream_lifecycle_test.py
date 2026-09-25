@@ -12,7 +12,7 @@ import time
 
 import pytest
 
-from autotrainer.core import NidaqPortConfiguration
+from autotrainer.core import NidaqPortConfiguration, NidaqTimingConfiguration
 from tools.acquisition.model import nidaq_monitor_session, nidaq_signal_monitor_model
 from tools.acquisition.model.app_model_status import SessionRecordingStatus
 from tools.acquisition.model.nidaq_monitor_session import NidaqMonitorSession
@@ -479,3 +479,124 @@ def test_a_refresh_rate_change_in_idle_restarts_the_stream_with_its_chunk(
     assert _worker_pid(monitor) not in (None, pid)
     assert monitor.effective_read_chunk_size != idle_chunk
     assert chunks[-1] == monitor.effective_read_chunk_size
+
+
+@pytest.fixture
+def independent_app(app_model, system_config, trainer_config_dir, monkeypatch):
+    """Two boards on their own clocks, so the timing plan is "independent"."""
+    system_config.hardware.nidaq_enabled = True
+    system_config.nidaq_ports = NidaqPortConfiguration(
+        cam_frames="Dev1/port0/line0",
+        tone1="Dev2/port0/line0",
+        timing=NidaqTimingConfiguration(
+            sync_mode="independent", require_hardware_synchronization=False),
+    )
+    system_config.save_default(trainer_config_dir)
+    monitor = _with_fake_worker(app_model)
+    monitor._device_discovery = nidaq_stream_fakes.discover_dev1_and_dev2
+    monkeypatch.setattr(app_model, "_require_valid_nidaq_configuration", lambda: None)
+    try:
+        yield app_model
+    finally:
+        rule = vars(app_model).get("_nidaq_stream_autostart")
+        if rule is not None:
+            rule.close()
+        monitor.close()
+
+
+def test_a_run_on_independent_boards_is_blocked_from_recording(independent_app):
+    # _start_nidaq_domain wrote BLOCKED with the generation it began, but the
+    # stream's own start event had begun a newer one, so the registry dropped
+    # the verdict as stale. The stream read READY and Record was allowed on
+    # boards whose samples cannot be aligned.
+    assert independent_app.load_configuration() is True
+    monitor = _settle(independent_app)
+    assert monitor.timing_plan.resolved_mode == "independent"
+    try:
+        assert independent_app.capture_start() is True
+
+        assert monitor.is_running
+        blocked = _nidaq_state(independent_app)
+        assert blocked.state is SubsystemState.BLOCKED
+        assert "independent device clocks" in blocked.reason
+        assert any("independent device clocks" in blocker
+                   for blocker in independent_app.recording_blockers)
+    finally:
+        independent_app.capture_stop()
+
+
+def test_a_late_ready_from_the_stream_cannot_overwrite_the_runs_verdict(
+    independent_app,
+):
+    # The monitor marks itself running before it tells its listeners, so a
+    # Run can see the stream running and write its verdict first; the READY
+    # published after it then replaced BLOCKED. Held here until the verdict
+    # is written, so the order is the bad one every time.
+    assert independent_app.load_configuration() is True
+    monitor = _settle(independent_app)
+    set_running = monitor._set_running
+    published = threading.Event()
+
+    def publish_after_the_verdict(value):
+        if not value:
+            return set_running(value)
+        monitor._is_running = True
+        deadline = time.monotonic() + 5.0
+        while (_nidaq_state(independent_app).state is not SubsystemState.BLOCKED
+               and time.monotonic() < deadline):
+            time.sleep(0.01)
+        monitor._on_property_changed(monitor.IS_RUNNING, True, False)
+        published.set()
+
+    monitor._set_running = publish_after_the_verdict
+    try:
+        assert independent_app.capture_start() is True
+        assert published.wait(10.0)
+
+        assert monitor.is_running
+        assert _nidaq_state(independent_app).state is SubsystemState.BLOCKED
+    finally:
+        del monitor._set_running
+        independent_app.capture_stop()
+
+
+def test_a_run_whose_stream_never_becomes_ready_reads_failed(nidaq_app, monkeypatch):
+    # The domain gave up and wrote FAILED with the generation it began; the
+    # stream's start event had begun a newer one, so the FAILED was dropped
+    # and the stream read "starting" with no error, after it had been stopped.
+    monkeypatch.setattr(nidaq_app, "_require_valid_nidaq_configuration", lambda: None)
+    assert nidaq_app.load_configuration() is True
+    monitor = _settle(nidaq_app)
+    assert monitor.is_running, "the stream did not start by itself"
+    # The next worker hangs, and the domain's bound is the shorter one.
+    monitor._worker_target = nidaq_stream_fakes.silent_worker
+    monitor._startup_timeout_seconds = 30.0
+
+    assert nidaq_app._start_nidaq_domain(restart=True, timeout=1.0) is False
+
+    assert not (monitor.is_running or monitor.is_starting)
+    failed = _nidaq_state(nidaq_app)
+    assert failed.state is SubsystemState.FAILED
+    assert "not ready within 1 seconds" in failed.error
+
+
+def test_a_stream_that_fails_under_a_run_still_reads_failed(nidaq_app, monkeypatch):
+    # The Run's verdict is its own; a failure after it is the stream's.
+    monkeypatch.setattr(nidaq_app, "_require_valid_nidaq_configuration", lambda: None)
+    assert nidaq_app.load_configuration() is True
+    monitor = _settle(nidaq_app)
+    try:
+        assert nidaq_app.capture_start() is True
+        assert _nidaq_state(nidaq_app).state is SubsystemState.READY
+
+        monitor._process.terminate()
+        deadline = time.monotonic() + 5.0
+        while (_nidaq_state(nidaq_app).state is not SubsystemState.FAILED
+               and time.monotonic() < deadline):
+            time.sleep(0.02)
+
+        failed = _nidaq_state(nidaq_app)
+        assert failed.state is SubsystemState.FAILED
+        assert "crashed" in failed.error
+    finally:
+        nidaq_app.capture_stop()
