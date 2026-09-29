@@ -283,11 +283,14 @@ waits up to five seconds for it to stop, then puts the command back to its
 minimum. The status line then reads *"Laser operation failed: Laser operation
 ... was cancelled: the laser controller was closed while it ran"*.
 
-Run Pulse is refused while another pulse on the same laser's output is armed
-or running, such as a trial's pulse waiting for its trigger, with *"Laser
-output ... is in use by laser operation ..., armed or running; another pulse
-on it is refused until that operation ends or is cancelled"*. DAQmx would
-refuse it too; this names the pulse holding the output.
+Run Pulse is refused while another pulse on the same board's analog output
+is armed or running, such as a trial's pulse waiting for its trigger, on this
+laser or on another laser of the same board: *"The analog output of ... is in
+use by laser operation ... (on ...), armed or running: a board runs one timed
+analog output at a time, so a pulse on ... is refused until that operation
+ends or is cancelled"*. DAQmx would refuse it too, at -50103; this names the
+pulse holding the board. Lasers on one board that should fire together do so
+as one pulse train.
 
 That close is bounded at 15 seconds, at Stop, at a Run start that failed,
 and when reachAQ closes, and so is the close a controller makes of what it
@@ -324,8 +327,8 @@ digital output - on christielab10 a port0 line on the 6221, never the 6713 -
 and every one runs on the output's own clock, with no start trigger; one
 on another board than the laser's output takes that clock over the backplane,
 on `pulseClockLine` (PXI_Trig3). A pulse that cannot clock such a line is
-refused before anything fires, naming the line. christielab10 sets none of these lines, and this path has not yet been
-run on its hardware.
+refused before anything fires, naming the line. christielab10 sets none of
+these lines, and this path has not yet been run on its hardware.
 
 ### Test stim — proves the trial path
 

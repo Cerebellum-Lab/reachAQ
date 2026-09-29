@@ -142,6 +142,8 @@ class FakeTask:
             # The fake's model of a call on a task already cleared.
             raise RuntimeError(f"{self.name} was closed before it was aborted")
         if mode == "commit":
+            if self.daq.failing_commit and self.name.endswith(self.daq.failing_commit):
+                raise RuntimeError(f"DAQmx refused to commit {self.name}")
             # Programmed on the board, and started later; nothing else here.
             self.daq.log.append(("commit", self.name))
             return
@@ -205,6 +207,8 @@ class FakeDaqmx:
         self.before_start = None
         #: A task, by name suffix, whose abort fails while it is still open.
         self.failing_abort = None
+        #: A task, by name suffix, whose commit (TASK_COMMIT) fails.
+        self.failing_commit = None
         #: Routes, as (source, destination), the driver will not disconnect.
         self.failing_disconnects = set()
         #: Called as read_samples(task, count) for what a read returns, in

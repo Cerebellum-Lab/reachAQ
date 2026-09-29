@@ -99,22 +99,35 @@ def _bare_backplane_line(field: str, value) -> str:
 
     Bare, without a board: the controller names the line on whichever board
     drives or reads it, so a board given here was either taken for the line
-    or silently dropped. Empty, or anything but a PXI_Trig line, is refused.
+    or silently dropped. Empty, or anything but a PXI_Trig line, is refused,
+    and so is a number the backplane does not have: PXI has PXI_Trig0 to
+    PXI_Trig7.
     """
     text = "" if value is None else str(value).strip()
     if not text:
         raise ValueError(
             f"{field} is empty: it must be a PXI_Trig line, such as PXI_Trig1")
     if "/" in text:
+        # Not the value's own tail as the example: that may be refused too,
+        # as a PFI is.
         raise ValueError(
-            f"{field} {text!r} names a board: give the bare line, such as "
-            f"{text.strip('/').rsplit('/', 1)[-1]}, which every board in the "
-            "chassis sees as its own")
+            f"{field} {text!r} names a board: give a bare PXI_Trig line, such "
+            f"as {_EXAMPLE_LINE[field]}, which every board in the chassis sees "
+            "as its own")
     line = backplane_line_of(text)
     if line is None:
         raise ValueError(
             f"{field} {text!r} is not a PXI_Trig line, such as PXI_Trig1")
-    return "PXI_Trig" + line[len("pxi_trig"):]
+    number = int(line[len("pxi_trig"):])
+    if number > 7:
+        raise ValueError(
+            f"{field} {text!r} is not a line the backplane has: PXI has "
+            "PXI_Trig0 to PXI_Trig7")
+    return f"PXI_Trig{number}"
+
+
+#: A clock line a refusal can suggest: each field's own default.
+_EXAMPLE_LINE = {"backplaneClockLine": "PXI_Trig1", "pulseClockLine": "PXI_Trig3"}
 
 
 @dataclasses.dataclass(frozen=True)
