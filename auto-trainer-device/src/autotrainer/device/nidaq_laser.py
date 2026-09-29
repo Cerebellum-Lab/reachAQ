@@ -473,25 +473,34 @@ class NidaqLaserController:
             if getattr(self, "_closed", False):
                 raise RuntimeError(
                     "the laser controller is closed; no pulse train is started")
+            # By board, not by channel. A board has one analog output timing
+            # engine, and its ao/SampleClock is that engine's: a train holds
+            # it until it ends, waited for or not, and DAQmx refuses a second
+            # timed task on the board (-50103), after this one had made its
+            # tasks and borrowed the first one's pulseClockLine route, which
+            # the first then released under it. Several lasers on one board
+            # fire together as one train, which is one task. Run Pulse, which
+            # waits, is refused so while a trial's pulse is armed.
+            boards = {_device_of(resource) for resource in resources}
             conflicts = [
                 operation
                 for operation in self._live_operations.values()
-                if set(operation.resources) & set(resources)
+                if boards & {_device_of(resource) for resource in operation.resources}
                 and operation.state not in operation.TERMINAL
             ]
             if conflicts:
-                # Waited for or not, a train holds its output until it ends;
-                # DAQmx would refuse a second task on it (-50103), after this
-                # one had made its own. Run Pulse, which waits, is refused so
-                # while a trial's pulse is armed.
-                shared = sorted({
+                held = sorted({
                     resource for operation in conflicts
-                    for resource in operation.resources if resource in resources})
+                    for resource in operation.resources
+                    if _device_of(resource) in boards})
                 raise RuntimeError(
-                    f"Laser output {', '.join(shared)} is in use by laser "
-                    f"operation {', '.join(op.operation_id for op in conflicts)}, "
-                    "armed or running; another pulse on it is refused until "
-                    "that operation ends or is cancelled"
+                    f"The analog output of {', '.join(sorted(boards))} is in use "
+                    f"by laser operation "
+                    f"{', '.join(op.operation_id for op in conflicts)} (on "
+                    f"{', '.join(held)}), armed or running: a board runs one "
+                    f"timed analog output at a time, so a pulse on "
+                    f"{', '.join(resources)} is refused until that operation "
+                    "ends or is cancelled"
                 )
             operation = NidaqLaserOperation(
                 resources=resources,

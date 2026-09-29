@@ -191,15 +191,16 @@ def test_the_pulse_clock_route_is_released_when_a_software_start_is_cancelled(da
     assert daq.starts == []
 
 
+@pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize("output", sorted(OUTPUTS))
 def test_the_pulse_clock_route_is_released_when_an_armed_pulse_is_cancelled(
-    monkeypatch, output,
+    monkeypatch, output, mode,
 ):
     # Armed on the board STIM, waiting for it, as a trial's pulse is.
     daq = FakeDaqmx(block_wait=True, hold_waits=True, stop_unblocks=True)
     monkeypatch.setattr(nidaq_laser, "_load_nidaqmx", lambda: daq)
     configuration, fields, _task_name, _line = _output(output)
-    controller = _controller(_synchronized_plan(), **configuration)
+    controller = _controller(_plan_for(mode), **configuration)
     try:
         operation = controller.run_synchronized_pulse_train(_pulse(wait=False, **fields))
         assert PULSE_CLOCK_ROUTE in daq.connected
@@ -208,9 +209,128 @@ def test_the_pulse_clock_route_is_released_when_an_armed_pulse_is_cancelled(
         assert operation.wait(5.0) is LaserOperationState.CANCELLED
 
         assert daq.disconnected == [PULSE_CLOCK_ROUTE]
-        assert controller._trigger_routes == [TRIGGER_ROUTE, SHARED_CLOCK_ROUTE]
+        shared = [SHARED_CLOCK_ROUTE] if mode == "synchronized" else []
+        assert controller._trigger_routes == [TRIGGER_ROUTE, *shared]
     finally:
         daq.waits_released.set()
+
+
+@pytest.mark.parametrize("output", sorted(OUTPUTS))
+def test_a_commit_that_fails_leaves_nothing_behind(monkeypatch, output):
+    # The AO is committed before its lines start. A refused commit is the
+    # pulse's failure like any other: its tasks closed, its clock route
+    # released, the command put back, and the operation ended FAILED.
+    daq = FakeDaqmx()
+    daq.failing_commit = "laser_sync_pulse_ao"
+    monkeypatch.setattr(nidaq_laser, "_load_nidaqmx", lambda: daq)
+    configuration, fields, task_name, _line = _output(output)
+    controller = _controller(**configuration)
+    ended = []
+    release = controller._release_operation
+    controller._release_operation = lambda operation: (
+        ended.append(operation.state), release(operation))
+
+    with pytest.raises(RuntimeError, match="refused to commit"):
+        controller.run_synchronized_pulse_train(_pulse(**fields))
+
+    assert ended == [LaserOperationState.FAILED]
+    assert daq.task("laser_sync_pulse_ao").closed
+    assert daq.task(task_name).closed
+    assert daq.disconnected == [PULSE_CLOCK_ROUTE]
+    assert daq.writes_to("PXI1Slot4/ao0", task_suffix="manual_ao")[-1] == 0.0
+    assert daq.starts == []
+    assert daq.reserved == {}
+    assert controller._live_operations == {}
+
+
+def test_a_deferred_pulse_is_committed_before_it_is_armed(daq):
+    # A protocol's direct NI route arms the pulse, then starts it by
+    # software. The AO is committed while the operation is still prepared,
+    # so that nothing is programmed on the board once it reads armed.
+    configuration, fields, task_name, _line = _output("pmt_shutter")
+    controller = _controller(**configuration)
+    states = []
+
+    def at_commit(task):
+        operation, = controller._live_operations.values()
+        states.append((task.name, operation.state))
+
+    daq.before_control = at_commit
+    operation = controller.run_synchronized_pulse_train(_pulse(
+        trigger_source=None, wait=False, defer_start=True, **fields))
+
+    assert operation.state is LaserOperationState.ARMED
+    assert states == [("laser_sync_pulse_ao", LaserOperationState.PREPARED)]
+    assert daq.starts == []
+    operation.trigger()
+    assert operation.wait(5.0) is LaserOperationState.COMPLETED
+    assert daq.log.index(("commit", "laser_sync_pulse_ao")) < daq.log.index(
+        ("start", task_name))
+
+
+def _two_lasers_on_one_board():
+    lasers = rig_lasers(trigger_source=BOARD_STIM, trigger_route_source="/PXI1Slot5/PFI0")
+    laser_2 = dataclasses.replace(
+        lasers.channels[0], channel_id=LaserChannelId.LASER_2,
+        analog_output="PXI1Slot4/ao1", diode_input="PXI1Slot5/ai9",
+        shutter_output="PXI1Slot5/port0/line5", command_copy_input=None,
+        trigger_source="/PXI1Slot4/PXI_Trig2", trigger_route_source="/PXI1Slot5/PFI1")
+    return dataclasses.replace(lasers, channels=(lasers.channels[0], laser_2))
+
+
+def test_a_second_pulse_on_the_same_board_is_refused_while_the_first_holds_it(
+    monkeypatch,
+):
+    # The resource check was per channel, so a pulse on ao1 went ahead
+    # while one on ao0 of the same 6713 was armed. It borrowed the first
+    # pulse's route onto pulseClockLine without owning it, and lost its
+    # lines' clock when the first released it. A board has one timed
+    # analog output: DAQmx would refuse the second task (-50103) after
+    # the route and the tasks were made. Refused first now, by name.
+    daq = FakeDaqmx(block_wait=True, hold_waits=True, stop_unblocks=True)
+    monkeypatch.setattr(nidaq_laser, "_load_nidaqmx", lambda: daq)
+    controller = NidaqLaserController(_two_lasers_on_one_board())
+    try:
+        first = controller.run_synchronized_pulse_train(_pulse(
+            wait=False, enable_pmt_shutter=True))
+        created, connected = len(daq.tasks), list(daq.connected)
+        second = LaserSynchronizedPulseTrain(
+            pulse_trains=(LaserPulseTrain(
+                channel_id=LaserChannelId.LASER_2, amplitude_volts=1.0,
+                duration_ms=1.0, enable_pmt_shutter=True),),
+            timeout_seconds=5.0)
+
+        with pytest.raises(RuntimeError) as refused:
+            controller.run_synchronized_pulse_train(second)
+
+        assert str(refused.value) == (
+            "The analog output of PXI1Slot4 is in use by laser operation "
+            f"{first.operation_id} (on PXI1Slot4/ao0), armed or running: a "
+            "board runs one timed analog output at a time, so a pulse on "
+            "PXI1Slot4/ao1 is refused until that operation ends or is cancelled")
+        assert (len(daq.tasks), daq.connected) == (created, connected)
+        assert PULSE_CLOCK_ROUTE in controller._trigger_routes
+
+        daq.waits_released.set()
+        assert first.wait(5.0) is LaserOperationState.COMPLETED
+        controller.run_synchronized_pulse_train(second)
+        assert daq.disconnected == [PULSE_CLOCK_ROUTE, PULSE_CLOCK_ROUTE]
+    finally:
+        daq.waits_released.set()
+
+
+def test_one_train_on_both_lasers_of_a_board_is_one_task_and_runs(daq):
+    controller = NidaqLaserController(_two_lasers_on_one_board())
+    both = LaserSynchronizedPulseTrain(
+        pulse_trains=tuple(
+            LaserPulseTrain(channel_id=channel_id, amplitude_volts=1.0, duration_ms=1.0)
+            for channel_id in (LaserChannelId.LASER_1, LaserChannelId.LASER_2)),
+        timeout_seconds=5.0)
+
+    controller.run_synchronized_pulse_train(both)
+
+    assert daq.task("laser_sync_pulse_ao").channels == ["PXI1Slot4/ao0", "PXI1Slot4/ao1"]
+    assert daq.starts == ["laser_sync_pulse_ao"]
 
 
 def test_an_unsynchronized_pulse_after_a_synchronized_one_runs(daq):
@@ -225,6 +345,8 @@ def test_an_unsynchronized_pulse_after_a_synchronized_one_runs(daq):
     controller.run_synchronized_pulse_train(_pulse(
         trigger_source=None, enable_pmt_shutter=True))
 
+    # On its own clock: no trigger to arm on, so not on the stream's.
+    assert "source" not in daq.task("laser_sync_pulse_ao").timing_kwargs
     assert daq.task("laser_pmt_shutter_do").timing_kwargs["source"] == "/PXI1Slot5/PXI_Trig3"
     assert daq.disconnected == [PULSE_CLOCK_ROUTE]
     controller.close()

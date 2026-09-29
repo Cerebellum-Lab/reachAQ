@@ -127,9 +127,10 @@ def test_a_waited_for_pulse_is_refused_while_an_armed_one_owns_the_output(held):
 
     message = str(refused.value)
     assert message == (
-        "Laser output PXI1Slot4/ao0 is in use by laser operation "
-        f"{operation.operation_id}, armed or running; another pulse on it is "
-        "refused until that operation ends or is cancelled")
+        "The analog output of PXI1Slot4 is in use by laser operation "
+        f"{operation.operation_id} (on PXI1Slot4/ao0), armed or running: a "
+        "board runs one timed analog output at a time, so a pulse on "
+        "PXI1Slot4/ao0 is refused until that operation ends or is cancelled")
     assert len(daq.tasks) == created
     daq.waits_released.set()
     assert operation.wait(5.0) is LaserOperationState.COMPLETED

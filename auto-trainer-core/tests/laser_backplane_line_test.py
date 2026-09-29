@@ -112,7 +112,9 @@ def test_a_route_source_off_the_clock_lines_is_kept(route_source):
 @pytest.mark.parametrize(
     ("value", "why"),
     [("/PXI1Slot4/PXI_Trig1", "names a board"), ("PXI1Slot4/PXI_Trig5", "names a board"),
+     ("/PXI1Slot4/PFI3", "names a board"),
      ("PFI3", "not a PXI_Trig line"), ("RTSI1", "not a PXI_Trig line"),
+     ("PXI_Trig8", "PXI_Trig0 to PXI_Trig7"), ("PXI_Trig12", "PXI_Trig0 to PXI_Trig7"),
      ("", "empty"), (None, "empty"), ("   ", "empty")],
 )
 def test_a_clock_line_is_a_bare_pxi_trig_line(field, value, why):
@@ -127,6 +129,17 @@ def test_a_clock_line_is_a_bare_pxi_trig_line(field, value, why):
     assert camel in message and why in message
 
 
+def test_a_board_named_on_a_clock_line_is_refused_with_a_line_that_is_allowed():
+    # The suggestion was the value's own tail, so "/PXI1Slot4/PFI3" was
+    # told to give PFI3, which is refused too.
+    with pytest.raises(ValueError) as refused:
+        _lasers(_channel(), pulse_clock_line="/PXI1Slot4/PFI3")
+
+    message = str(refused.value)
+    assert "PFI3," not in message and "such as PFI3" not in message
+    assert "a bare PXI_Trig line, such as PXI_Trig3" in message
+
+
 def test_a_clock_line_is_named_as_the_driver_spells_it():
     lasers = _lasers(_channel(), backplane_clock_line=" pxi_trig1 ",
                      pulse_clock_line="PXI_TRIG4")
@@ -135,12 +148,23 @@ def test_a_clock_line_is_named_as_the_driver_spells_it():
         "PXI_Trig1", "PXI_Trig4")
 
 
-def test_a_file_with_no_clock_line_is_refused():
+def test_a_file_with_a_null_clock_line_is_refused():
     text = SystemConfiguration(laser=_christielab10_lasers()).dump_yaml()
 
     with pytest.raises(ValueError, match="backplaneClockLine"):
         SystemConfiguration.load_yaml(io.StringIO(
             text.replace("backplaneClockLine: PXI_Trig1", "backplaneClockLine: null")))
+
+
+def test_a_file_without_a_backplane_clock_line_loads_with_the_default():
+    text = SystemConfiguration(laser=_christielab10_lasers()).dump_yaml()
+    stripped = text.replace("  backplaneClockLine: PXI_Trig1\n", "")
+    assert "backplaneClockLine" not in stripped
+
+    loaded = SystemConfiguration.load_yaml(io.StringIO(stripped))
+
+    assert loaded.laser.backplane_clock_line == "PXI_Trig1"
+    assert loaded.laser == _christielab10_lasers()
 
 
 def _christielab10_lasers():
