@@ -390,7 +390,7 @@ class NidaqPortConfigurationDialog(QDialog):
             warnings.append("Duplicate channel assignment(s): " + ", ".join(duplicates))
         readback_refusals = self._stream_line_refusals()
         warnings.extend(readback_refusals)
-        clock_line_refusals = self._backplane_clock_line_refusals()
+        clock_line_refusals = self._clock_line_refusals()
         warnings.extend(clock_line_refusals)
         # Not an error - the 68-pin connector reaches everything - but worth
         # one line, because the alternative is hunting the front panel for a
@@ -617,7 +617,7 @@ class NidaqPortConfigurationDialog(QDialog):
             if value is not None
         )
 
-    def _backplane_clock_line_refusals(self) -> List[str]:
+    def _clock_line_refusals(self) -> List[str]:
         """A trigger picked here on a clock line, as the load says it.
 
         backplaneClockLine or pulseClockLine. The configuration refuses one
@@ -918,7 +918,7 @@ class NidaqPortConfigurationDialog(QDialog):
         if stream_refusals:
             raise ValueError("; ".join(stream_refusals))
         # Before the configuration is built, which refuses it too, unnamed.
-        clock_line_refusals = self._backplane_clock_line_refusals()
+        clock_line_refusals = self._clock_line_refusals()
         if clock_line_refusals:
             raise ValueError("; ".join(clock_line_refusals))
 

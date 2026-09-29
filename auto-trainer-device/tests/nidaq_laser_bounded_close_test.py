@@ -124,10 +124,11 @@ def test_two_pulses_needing_one_route_share_it(monkeypatch):
         first = controller._shared_clock_for
         routes = []
         one, one_outcome = _in_thread(
-            lambda: first("PXI1Slot5", "/PXI1Slot4/ao/SampleClock", added=routes))
+            lambda: first("PXI1Slot5", "/PXI1Slot4/ao/SampleClock", line="PXI_Trig1",
+                          added=routes))
         assert daq.hanging.wait(5.0)
         two, two_outcome = _in_thread(
-            lambda: first("PXI1Slot5", "/PXI1Slot4/ao/SampleClock"))
+            lambda: first("PXI1Slot5", "/PXI1Slot4/ao/SampleClock", line="PXI_Trig1"))
         two.join(0.5)
         assert two.is_alive(), "the second caller did not wait for the first"
 
