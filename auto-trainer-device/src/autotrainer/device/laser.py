@@ -256,7 +256,11 @@ class LaserControllerProtocol(Protocol):
         """Force all configured shutters closed."""
 
     def close(self) -> None:
-        """Release controller resources."""
+        """Close the shutters and release controller resources.
+
+        The laser model leaves the shutters to this: it calls nothing else
+        on the controller first (LaserModel.close).
+        """
 
 
 class NullLaserController:

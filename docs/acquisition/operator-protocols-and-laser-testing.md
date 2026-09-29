@@ -278,22 +278,36 @@ arrives, the pulse fails after the train length plus five seconds with *Wait
 Until Done did not indicate that the task was done*.
 
 Stopping System Mode, or closing reachAQ, while a Run Pulse train is still
-running cancels the train: the controller waits up to five seconds for it to
-stop, then puts the command back to its minimum and closes the shutters. The
-status line then reads *"Laser operation failed: Laser operation ... was
-cancelled: the laser controller was closed while it ran"*.
+running closes the shutters first, then cancels the train: the controller
+waits up to five seconds for it to stop, then puts the command back to its
+minimum. The status line then reads *"Laser operation failed: Laser operation
+... was cancelled: the laser controller was closed while it ran"*.
+
+Run Pulse is refused while another pulse on the same laser's output is armed
+or running, such as a trial's pulse waiting for its trigger, with *"Laser
+output ... is in use by laser operation ..., armed or running; another pulse
+on it is refused until that operation ends or is cancelled"*. DAQmx would
+refuse it too; this names the pulse holding the output.
 
 That close is bounded at 15 seconds, at Stop, at a Run start that failed,
-and when reachAQ closes. A driver that hangs in it no longer hangs Stop or
-exit: past the bound, or if the close fails, the log and status bar show a
-CRITICAL, *"The laser controller did not close within 15.0 s. Each output may
-still hold its last command (laser 1 0 V, laser 2 0 V), and the shutters may
-be open: make the laser safe by hand. System Mode stops without it."*, and
-Stop or exit goes on. While a close given up on is still inside the driver,
-Run, Run Pulse, Test stim, the calibration ramp and Hardware refresh are
-refused with *"the laser controller is still closing after a driver hang
-..."*; the refusal clears by itself when the close ends, and the log says
-so.
+and when reachAQ closes, and so is the close a controller makes of what it
+had opened when opening it fails part-way, at a Run start or a ramp. A
+driver that hangs in it no longer hangs Stop, the Run start or exit: past the
+bound, or if the close fails, the log and status bar show a CRITICAL, *"The
+laser controller did not close within 15.0 s. Each output may still hold its
+last command (laser 1 0 V, laser 2 0 V), and the shutters may be open: make
+the laser safe by hand. System Mode stops without it."*, and Stop, the Run
+or exit goes on. While a close given up on is still inside the driver, the
+laser's runtime status reads failed, with the reason, and Run, Run
+Pulse, Test stim, the calibration ramp, Refresh Hardware (in Idle, and its
+retry of a failed laser in System Mode), loading a configuration and saving
+Edit DAQ Ports are refused with *"the laser controller is still closing
+after a driver hang ..."*. So is all of it while a pulse train or ramp that
+the close stopped waiting for is still running, since it can still drive the
+lines. The refusal clears by itself when the close ends, and the log says
+so; in System Mode the laser then stays failed until Refresh Hardware opens
+it again. While a close is still within its bound, the same work is refused
+with *"the laser controller is closing; wait for it to finish"*.
 
 Picking a profile in **Profile:** chooses what Run Pulse and Test stim fire on
 this laser; this page has no waveform controls, and nothing is copied into it.
@@ -390,11 +404,12 @@ shutter** holds the PMT shutter open for the ramp. Press **Run Ramp**.
   log.
 - Closing reachAQ during a ramp waits for the ramp to end, for as long as the
   ramp itself may take (its timeout) plus five seconds. Past that it closes
-  the ramp's laser controller, before anything else closes. That close aborts
-  the ramp's tasks, waits up to five seconds for the ramp to let go of them,
-  and then tries to put the command back to its minimum and close the
-  shutters. The reset is refused, and the close fails, if the ramp still
-  holds the output.
+  the ramp's laser controller, before anything else closes. That close closes
+  the shutters, aborts the ramp's tasks, waits up to five seconds for the
+  ramp to let go of them, and then tries to put the command back to its
+  minimum. The close fails if the ramp has not let go by then, since a start
+  still inside the driver could drive the output after the reset, and the
+  reset itself is refused if the ramp still holds the output.
 - That forced close is itself bounded, at 15 seconds. A close that hangs
   inside the driver would not make the laser any safer, since its output
   stays driven either way, and it would keep reachAQ from exiting. If the

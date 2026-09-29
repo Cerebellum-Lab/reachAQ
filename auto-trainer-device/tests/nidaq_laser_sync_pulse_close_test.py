@@ -15,7 +15,9 @@ import pytest
 
 from autotrainer.device import (
     LaserChannelId,
+    LaserOperationState,
     LaserPulseTrain,
+    LaserSynchronizedPulseTrain,
     NidaqLaserController,
 )
 from autotrainer.device import nidaq_laser
@@ -104,6 +106,110 @@ def test_a_synchronous_run_is_an_operation_while_it_runs(held):
     pulse_thread.join(5.0)
     assert pulse_outcome == [None]
     assert controller._live_operations == {}
+
+
+def _armed_pulse(controller):
+    """A pulse on laser 1 that runs on its own thread, as a trial's does."""
+    return controller.run_synchronized_pulse_train(LaserSynchronizedPulseTrain(
+        pulse_trains=(PULSE,), wait=False))
+
+
+def test_a_waited_for_pulse_is_refused_while_an_armed_one_owns_the_output(held):
+    # DAQmx would refuse the second task on ao0 anyway (-50103); refused
+    # before any task is made, it says which operation holds the output.
+    daq = held
+    controller = NidaqLaserController(rig_lasers())
+    operation = _armed_pulse(controller)
+    created = len(daq.tasks)
+
+    with pytest.raises(RuntimeError) as refused:
+        controller.run_pulse_train(PULSE)
+
+    message = str(refused.value)
+    assert message == (
+        "Laser output PXI1Slot4/ao0 is in use by laser operation "
+        f"{operation.operation_id}, armed or running; another pulse on it is "
+        "refused until that operation ends or is cancelled")
+    assert len(daq.tasks) == created
+    daq.waits_released.set()
+    assert operation.wait(5.0) is LaserOperationState.COMPLETED
+    controller.run_pulse_train(PULSE)
+
+
+def test_a_pulse_ended_by_a_base_exception_still_lets_go_of_its_output(monkeypatch):
+    # Only an Exception brought the operation to an end: a KeyboardInterrupt
+    # left it live, owning ao0, and every later pulse on it was refused.
+    daq = FakeDaqmx()
+    monkeypatch.setattr(nidaq_laser, "_load_nidaqmx", lambda: daq)
+    controller = NidaqLaserController(rig_lasers())
+    execute = controller._execute_synchronized_pulse_train
+    operations = []
+
+    def interrupted(pulse_train, *, operation=None):
+        operations.append(operation)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(controller, "_execute_synchronized_pulse_train", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        controller.run_pulse_train(PULSE)
+
+    operation, = operations
+    assert operation.state is LaserOperationState.FAILED
+    assert operation._done.is_set()
+    assert controller._live_operations == {}
+    monkeypatch.setattr(controller, "_execute_synchronized_pulse_train", execute)
+    controller.run_pulse_train(PULSE)
+
+
+def test_close_closes_the_shutters_before_it_waits_for_a_pulse(monkeypatch):
+    # The laser model closed the shutters with a driver call before the
+    # controller's close could mark it closed; the close then reset them
+    # only after the wait for each pulse it cancels.
+    monkeypatch.setattr(nidaq_laser, "_OPERATION_CANCEL_TIMEOUT_S", 3.0)
+    # A cancel whose stop the driver does not act on: the pulse's wait holds.
+    daq = FakeDaqmx(block_wait=True, hold_waits=True)
+    monkeypatch.setattr(nidaq_laser, "_load_nidaqmx", lambda: daq)
+    controller = NidaqLaserController(rig_lasers())
+    try:
+        _armed_pulse(controller)
+        shutter = daq.task("laser_1_shutter")
+        controller.set_shutter_open(LaserChannelId.LASER_1, True)
+
+        close_thread, _close_outcome = _in_thread(controller.close)
+        _wait_for(lambda: shutter.writes[-1] is False, timeout=1.0)
+
+        assert close_thread.is_alive(), "close() had already stopped waiting"
+        daq.waits_released.set()
+        close_thread.join(5.0)
+        assert not close_thread.is_alive()
+    finally:
+        daq.waits_released.set()
+
+
+def test_close_reports_a_pulse_it_gave_up_on_until_the_pulse_ends(monkeypatch):
+    # close() waits a bounded time for each pulse it cancels, then goes on.
+    # One that has not ended can still act later, releasing its clock route
+    # or writing the PMT line after a new controller has opened on the same
+    # lines: close() says so, and for as long as it lasts.
+    monkeypatch.setattr(nidaq_laser, "_OPERATION_CANCEL_TIMEOUT_S", 0.2)
+    daq = FakeDaqmx(block_wait=True, hold_waits=True)
+    monkeypatch.setattr(nidaq_laser, "_load_nidaqmx", lambda: daq)
+    controller = NidaqLaserController(rig_lasers())
+    try:
+        operation = _armed_pulse(controller)
+        assert controller.work_left_running() == ()
+
+        with pytest.raises(RuntimeError, match=f"laser operation {operation.operation_id} cancel"):
+            controller.close()
+
+        assert controller.work_left_running() == (
+            f"laser operation {operation.operation_id}",)
+        assert controller.wait_for_work_left_running(0.1) is False
+        daq.waits_released.set()
+        assert controller.wait_for_work_left_running(5.0) is True
+        assert controller.work_left_running() == ()
+    finally:
+        daq.waits_released.set()
 
 
 def test_a_synchronous_run_without_a_close_returns_and_fails_as_before(monkeypatch):

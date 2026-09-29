@@ -311,6 +311,32 @@ def test_run_ramp_is_enabled_in_idle(idle_panel):
     assert not tab._run_pulse_button.isEnabled()
 
 
+def test_run_pulse_is_refused_while_a_hung_laser_close_is_in_the_driver(
+    idle_panel, qapp, monkeypatch,
+):
+    # The laser model still holds the controller whose close hung in the
+    # driver; Run Pulse would call into it.
+    from tools.acquisition.model import app_model as app_model_module
+
+    app_model, content, _tab = idle_panel
+    app_model.laser.configure_null(_null_lasers())
+    _refresh(app_model, qapp)
+    # Connecting rebuilt the tabs.
+    tab = content._channel_tabs[0]
+    assert tab._run_pulse_button.isEnabled(), tab._run_pulse_button.toolTip()
+
+    monkeypatch.setattr(app_model, "laser_controller_close_refusal",
+                        lambda: app_model_module._LASER_CLOSE_PENDING_REFUSAL)
+    _refresh(app_model, qapp)
+
+    assert tab is content._channel_tabs[0]
+    assert not tab._run_pulse_button.isEnabled()
+    assert tab._run_pulse_button.toolTip() == (
+        "The laser controller is still closing after a driver hang; make the "
+        "laser safe by hand, and restart reachAQ if this does not clear")
+    assert not tab.stim_test_button.isEnabled()
+
+
 def test_run_ramp_is_disabled_while_system_mode_runs(idle_panel, qapp):
     app_model, content, tab = idle_panel
     app_model._acquisition.started = True

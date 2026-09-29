@@ -179,3 +179,80 @@ def test_prepare_takes_the_laser_and_terminal_from_the_firing_not_the_profile():
 
     assert controller.pulse.trigger_source == "/Dev1/PXI_Trig0"
     assert controller.pulse.operation_context["laser_channel_id"] == 1
+
+
+def _null_hardware_timed_model():
+    model = LaserModel()
+    model.configure_null(_Controller().configuration)
+    return model
+
+
+def test_closing_the_model_leaves_the_shutters_to_the_controllers_close():
+    # The model drove the shutters itself before the controller's close had
+    # marked the controller closed: a driver hung in that write held the
+    # close before anything was marked, with every cancel and abort behind
+    # it. NidaqLaserController.close() closes them once it is marked.
+    controller = _Controller()
+    calls = []
+    controller.close_all_shutters = lambda: calls.append("close_all_shutters")
+    controller.close = lambda: calls.append("close")
+    model = LaserModel(controller)
+
+    model.close()
+
+    assert calls == ["close"]
+    assert not model.is_connected
+
+
+def test_a_waited_for_pulse_leaves_the_command_at_its_minimum():
+    # The last command stayed at the pulse's amplitude after the pulse had
+    # returned to baseline, and a close that hung then named that amplitude
+    # as what the output may hold.
+    from autotrainer.device import LaserChannelId, LaserPulseTrain
+
+    model = _null_hardware_timed_model()
+
+    model.run_pulse_train(LaserPulseTrain(
+        channel_id=LaserChannelId.LASER_1, amplitude_volts=2.5, duration_ms=1.0))
+
+    assert model.last_command_volts == {1: 0.0}
+
+
+def test_a_pulse_that_fails_keeps_its_amplitude_as_the_last_command():
+    # Its cleanup may not have reset the output, so the amplitude is what
+    # the output may hold.
+    from autotrainer.device import LaserChannelId, LaserPulseTrain
+
+    model = _null_hardware_timed_model()
+    controller = model._controller
+
+    def refused(_pulse_train):
+        raise RuntimeError("DAQmx refused to start laser_sync_pulse_ao")
+
+    controller.run_pulse_train = refused
+    with pytest.raises(RuntimeError, match="refused"):
+        model.run_pulse_train(LaserPulseTrain(
+            channel_id=LaserChannelId.LASER_1, amplitude_volts=2.5, duration_ms=1.0))
+
+    assert model.last_command_volts == {1: 2.5}
+
+
+def test_the_model_names_what_a_closed_controller_left_running():
+    # A controller whose close gave up waiting on a pulse or a ramp says so
+    # (NidaqLaserController.work_left_running); the model keeps asking it
+    # after the close, until nothing is left.
+    controller = _Controller()
+    left = ["laser operation 1234"]
+    ended = threading.Event()
+    controller.work_left_running = lambda: tuple(left)
+    controller.wait_for_work_left_running = lambda timeout=None: ended.wait(timeout)
+    model = LaserModel(controller)
+
+    model.close()
+
+    assert model.work_left_running_after_close() == ("laser operation 1234",)
+    assert model.wait_for_work_left_running_after_close(0.05) is False
+    left.clear()
+    ended.set()
+    assert model.wait_for_work_left_running_after_close(1.0) is True
+    assert model.work_left_running_after_close() == ()

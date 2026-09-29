@@ -36,6 +36,15 @@ logger = logging.getLogger(__name__)
 #: tasks before resetting the laser; the pulse path waits as long for its
 #: operation's owner.
 _CALIBRATION_RELEASE_TIMEOUT_S = 5.0
+#: How long close() waits for each pulse train it cancels to end.
+_OPERATION_CANCEL_TIMEOUT_S = 5.0
+#: How long a controller that failed to open waits for its own close, of
+#: what it had opened, before it raises; as long as the application waits
+#: for any laser close.
+_FAILED_OPEN_CLOSE_TIMEOUT_S = 15.0
+#: How long a caller waiting for another's route to settle sleeps between
+#: looks; a settle, or close(), wakes it at once.
+_ROUTE_SETTLE_WAIT_S = 1.0
 
 
 class LaserOperationState(str, enum.Enum):
@@ -311,6 +320,10 @@ class NidaqLaserController:
         #: it has stopped and closed them. close() waits on it, bounded.
         self._calibration_released = threading.Event()
         self._calibration_released.set()
+        #: What close() stopped waiting for: operations it cancelled that had
+        #: not ended, and whether the ramp had not let go (work_left_running).
+        self._given_up_operations: List[NidaqLaserOperation] = []
+        self._given_up_on_ramp = False
         try:
             for channel in configuration.channels:
                 channel_started = time.perf_counter()
@@ -336,12 +349,42 @@ class NidaqLaserController:
                     channel.channel_id.value,
                     time.perf_counter() - channel_started,
                 )
-        except Exception:
+        except Exception as error:
+            still_closing = self._close_after_failed_open()
+            if still_closing is not None:
+                # For the caller, which never holds this controller: set when
+                # that close ends, and laser work waits for it until then.
+                error.still_closing = still_closing
+            raise
+
+    def _close_after_failed_open(self) -> Optional[threading.Event]:
+        """Close what a failed open had opened, bounded; an event if it goes on.
+
+        The close had no bound: a driver hung in it hung the Run start, or
+        the calibration ramp, that was opening the controller. Past the bound
+        it goes on inside the driver on a thread of its own, daemon so that a
+        close that never returns does not hold the process open, and the
+        event it returns is set when it ends. None when it ended in time.
+        """
+        closed = threading.Event()
+
+        def close():
             try:
                 self.close()
             except Exception:
                 logger.exception("Failed to close partially initialized NI-DAQ laser controller")
-            raise
+            finally:
+                closed.set()
+
+        threading.Thread(
+            target=close, name="NidaqLaserFailedOpenClose", daemon=True).start()
+        if closed.wait(_FAILED_OPEN_CLOSE_TIMEOUT_S):
+            return None
+        logger.error(
+            "A NI-DAQ laser controller that failed to open had not closed "
+            "what it had opened %.1f s later; its close goes on inside the "
+            "driver", _FAILED_OPEN_CLOSE_TIMEOUT_S)
+        return closed
 
     @property
     def configuration(self) -> LaserSystemConfiguration:
@@ -431,15 +474,24 @@ class NidaqLaserController:
                 raise RuntimeError(
                     "the laser controller is closed; no pulse train is started")
             conflicts = [
-                operation.operation_id
+                operation
                 for operation in self._live_operations.values()
                 if set(operation.resources) & set(resources)
                 and operation.state not in operation.TERMINAL
             ]
             if conflicts:
+                # Waited for or not, a train holds its output until it ends;
+                # DAQmx would refuse a second task on it (-50103), after this
+                # one had made its own. Run Pulse, which waits, is refused so
+                # while a trial's pulse is armed.
+                shared = sorted({
+                    resource for operation in conflicts
+                    for resource in operation.resources if resource in resources})
                 raise RuntimeError(
-                    "Laser output resource is already owned by operation(s): "
-                    + ", ".join(conflicts)
+                    f"Laser output {', '.join(shared)} is in use by laser "
+                    f"operation {', '.join(op.operation_id for op in conflicts)}, "
+                    "armed or running; another pulse on it is refused until "
+                    "that operation ends or is cancelled"
                 )
             operation = NidaqLaserOperation(
                 resources=resources,
@@ -449,18 +501,27 @@ class NidaqLaserController:
             self._live_operations[operation.operation_id] = operation
 
         def execute():
+            ended_by = None
             try:
                 self._execute_synchronized_pulse_train(
                     pulse_train,
                     operation=operation,
                 )
             except Exception as error:
+                ended_by = error
+            except BaseException as error:
+                ended_by = error
+                raise
+            finally:
+                # Terminal whatever ended it, a BaseException too: an operation
+                # left live owns its output, and every pulse on it after that
+                # is refused.
                 if operation.state is LaserOperationState.CANCELLED:
                     operation._finish_terminal()
+                elif ended_by is None:
+                    operation._complete()
                 else:
-                    operation._fail(error)
-            else:
-                operation._complete()
+                    operation._fail(ended_by)
 
         if pulse_train.wait:
             # On the caller's thread, which it still blocks.
@@ -1089,20 +1150,45 @@ class NidaqLaserController:
             raise RuntimeError(f"Failed to close NI-DAQ laser shutter(s) for channel(s): {channels}") from errors[0][1]
 
     def close(self) -> None:
+        """Close the shutters, stop what runs, reset the laser, let go of it all.
+
+        Raises when any of it failed. What it stopped waiting for, a pulse
+        train or a ramp that had not ended, can still act after this returns:
+        work_left_running() names it until it ends.
+        """
         errors = []
         # Marked closed, and what it must stop taken, before any driver call:
         # a cancel, an abort, or a ramp, pulse train or route checking for
         # closed then never waits on DAQmx behind this.
         calibration_tasks, operations = self._mark_closed()
+        # The shutters first, before anything is waited for: nothing else
+        # stops the light while a pulse or a ramp is being stopped. The
+        # laser model closed them itself before this, before the controller
+        # was marked closed; a driver hung in that write held the close there.
+        # Only the channels opened, as the reset below: a controller that
+        # failed part-way through opening is closed too.
+        for channel in self._configuration.channels:
+            if channel.channel_id not in self._tasks:
+                continue
+            try:
+                self.set_shutter_open(channel.channel_id, False)
+            except Exception as exc:
+                errors.append((f"channel {channel.channel_id.value} shutter close", exc))
+                logger.exception(
+                    "Failed to close NI-DAQ laser shutter for channel %s during close",
+                    channel.channel_id.value)
         errors.extend(self._abort_calibration_ramp(calibration_tasks))
         errors.extend(self._wait_for_calibration_release())
         for operation in operations:
             try:
                 operation.cancel()
-                operation.wait(timeout=5.0)
+                operation.wait(timeout=_OPERATION_CANCEL_TIMEOUT_S)
             except Exception as exc:
                 errors.append((f"laser operation {operation.operation_id} cancel", exc))
                 logger.exception("Failed to cancel active NI-DAQ laser operation")
+            if not operation._done.is_set():
+                with self._route_lock():
+                    self._given_up_operations.append(operation)
         for channel in self._configuration.channels:
             if channel.channel_id not in self._tasks:
                 continue
@@ -1126,15 +1212,51 @@ class NidaqLaserController:
             locations = ", ".join(location for location, _ in errors)
             raise RuntimeError(f"Failed to close NI-DAQ laser controller cleanly: {locations}") from errors[0][1]
 
+    def work_left_running(self) -> Tuple[str, ...]:
+        """What close() stopped waiting for and has not ended yet.
+
+        A pulse train whose cancel the driver had not acted on, or a ramp
+        that had not let go of its tasks, when close() went on without it.
+        Either can still act later: release a clock route, write the PMT or
+        command line, after a new controller has opened on the same lines.
+        """
+        with self._route_lock():
+            operations = tuple(getattr(self, "_given_up_operations", ()))
+            ramp = getattr(self, "_given_up_on_ramp", False)
+        left = [
+            f"laser operation {operation.operation_id}"
+            for operation in operations if not operation._done.is_set()
+        ]
+        if ramp and not self._calibration_released.is_set():
+            left.append("the calibration ramp")
+        return tuple(left)
+
+    def wait_for_work_left_running(self, timeout: Optional[float] = None) -> bool:
+        """Wait for work_left_running() to end, up to `timeout`; whether it has."""
+        with self._route_lock():
+            events = [operation._done for operation in getattr(self, "_given_up_operations", ())]
+            if getattr(self, "_given_up_on_ramp", False):
+                events.append(self._calibration_released)
+        deadline = None if timeout is None else time.monotonic() + timeout
+        for event in events:
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            if not event.wait(remaining):
+                return False
+        return True
+
     def _mark_closed(self):
         """Mark the controller closed; the ramp tasks and operations to stop.
 
         Bookkeeping under the lock and nothing else. What registers after
         this is refused: a ramp or pulse train checks for closed under the
-        same lock before it starts.
+        same lock before it starts. A caller waiting for a route to settle
+        is woken, to find it closed.
         """
         with self._route_lock():
             self._closed = True
+            settled = getattr(self, "_routes_settled", None)
+            if settled is not None:
+                settled.notify_all()
             return (
                 tuple(getattr(self, "_calibration_tasks", ())),
                 tuple(getattr(self, "_live_operations", {}).values()),
@@ -1198,9 +1320,18 @@ class NidaqLaserController:
         released = getattr(self, "_calibration_released", None)
         if released is None or released.is_set():
             return []
+        errors = []
         if not released.wait(_CALIBRATION_RELEASE_TIMEOUT_S):
             # Not "resetting the laser": if the ramp's output task still holds
             # ao0, the reset below is refused (-50103) and close() raises.
+            # An error of close()'s, not a log line alone: a ramp still in
+            # the driver, in a start that stalled, can drive the output after
+            # the reset below (work_left_running).
+            with self._route_lock():
+                self._given_up_on_ramp = True
+            errors.append(("calibration ramp release", TimeoutError(
+                f"the calibration ramp had not let go of its tasks "
+                f"{_CALIBRATION_RELEASE_TIMEOUT_S:.1f} s after close() aborted it")))
             logger.error(
                 "A NI-DAQ laser calibration ramp had not ended %.1f s after "
                 "close() aborted it; close() goes on without it, and its "
@@ -1211,7 +1342,6 @@ class NidaqLaserController:
         # Held high for the whole ramp when it was asked for; nothing else
         # in close() knows the line. After the wait, so that the ramp's own
         # task on it has been closed.
-        errors = []
         pmt_line = self._configuration.pmt_shutter_output
         if pmt_line:
             try:
@@ -1382,7 +1512,7 @@ class NidaqLaserController:
         settled = getattr(self, "_routes_settled", None)
         if settled is None:
             raise RuntimeError("a route is pending on a controller with no lock")
-        settled.wait(1.0)
+        settled.wait(_ROUTE_SETTLE_WAIT_S)
 
     def _disconnect_route(self, route) -> Optional[Exception]:
         """Disconnect one route in the driver, outside the lock; its error, if any."""

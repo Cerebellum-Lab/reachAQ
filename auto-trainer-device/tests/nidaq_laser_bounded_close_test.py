@@ -102,10 +102,15 @@ def test_a_route_connected_as_the_controller_closes_is_undone(monkeypatch):
         close.join(5.0)
 
         assert not close.is_alive()
-        assert close_outcome == [None]
+        # The ramp had not let go when close() stopped waiting: an error,
+        # named for as long as the ramp lasts.
+        error, = close_outcome
+        assert "calibration ramp release" in str(error)
+        assert controller.work_left_running() == ("the calibration ramp",)
         daq.hang_released.set()
         ramp.join(5.0)
         assert not ramp.is_alive()
+        assert controller.work_left_running() == ()
         assert "closed" in str(ramp_outcome[0])
         assert daq.connected == [AO_CLOCK_ROUTE]
         assert daq.disconnected == [AO_CLOCK_ROUTE]
@@ -116,8 +121,9 @@ def test_a_route_connected_as_the_controller_closes_is_undone(monkeypatch):
 
 
 def test_two_pulses_needing_one_route_share_it(monkeypatch):
-    # A route another caller is still connecting is waited for and reused,
-    # not connected a second time.
+    # A guard test, which passed before the change it sits beside: a route
+    # another caller is still connecting is waited for and reused, not
+    # connected a second time.
     daq = _sick(monkeypatch, "connect_terms")
     try:
         controller = NidaqLaserController(rig_lasers())
@@ -142,6 +148,82 @@ def test_two_pulses_needing_one_route_share_it(monkeypatch):
         assert controller._trigger_routes == [AO_CLOCK_ROUTE]
     finally:
         daq.hang_released.set()
+
+
+def test_a_caller_waiting_on_a_route_is_woken_by_the_close(monkeypatch):
+    # A caller waiting for another's route to settle slept out its wait
+    # before it found the controller closed: close() woke nobody.
+    monkeypatch.setattr(nidaq_laser, "_ROUTE_SETTLE_WAIT_S", 30.0)
+    daq = _sick(monkeypatch, "connect_terms")
+    try:
+        controller = NidaqLaserController(rig_lasers())
+        clock_for = controller._shared_clock_for
+        one, _one_outcome = _in_thread(
+            lambda: clock_for("PXI1Slot5", "/PXI1Slot4/ao/SampleClock", line="PXI_Trig1"))
+        assert daq.hanging.wait(5.0)
+        two, two_outcome = _in_thread(
+            lambda: clock_for("PXI1Slot5", "/PXI1Slot4/ao/SampleClock", line="PXI_Trig1"))
+        two.join(0.3)
+        assert two.is_alive(), "the second caller did not wait for the first"
+
+        controller.close()
+        two.join(2.0)
+
+        assert not two.is_alive(), "the close did not wake the waiting caller"
+        assert "closed" in str(two_outcome[0])
+    finally:
+        daq.hang_released.set()
+
+
+def test_a_controller_that_fails_to_open_closes_within_a_bound(monkeypatch):
+    # Opening fails part-way, and the controller closes what it had opened.
+    # That close had no bound: a driver hung in it hung the Run start, or the
+    # ramp, behind it. It gives up past its bound now, and says, on the
+    # error, when it ends.
+    monkeypatch.setattr(nidaq_laser, "_FAILED_OPEN_CLOSE_TIMEOUT_S", 0.3)
+    daq = _sick(monkeypatch, "disconnect_terms")
+    daq.held_wait_limit = 3.0
+    connect = NidaqLaserController._connect_trigger_route
+
+    def connect_then_fail(self, channel):
+        connect(self, channel)
+        raise RuntimeError("DAQmx refused the laser's shutter line")
+
+    monkeypatch.setattr(NidaqLaserController, "_connect_trigger_route", connect_then_fail)
+    try:
+        started = time.monotonic()
+        with pytest.raises(RuntimeError, match="refused the laser's shutter line") as refused:
+            NidaqLaserController(rig_lasers(
+                trigger_source="/PXI1Slot4/PXI_Trig0",
+                trigger_route_source="/PXI1Slot5/PFI0"))
+
+        assert time.monotonic() - started < 2.0
+        assert daq.hung == ["disconnect_terms"]
+        still_closing = refused.value.still_closing
+        assert not still_closing.is_set()
+        daq.hang_released.set()
+        assert still_closing.wait(5.0)
+        assert daq.disconnected == [TRIGGER_ROUTE]
+    finally:
+        daq.hang_released.set()
+
+
+def test_a_controller_that_fails_to_open_and_closes_says_nothing_more(monkeypatch):
+    daq = FakeDaqmx()
+    monkeypatch.setattr(nidaq_laser, "_load_nidaqmx", lambda: daq)
+    connect = NidaqLaserController._connect_trigger_route
+
+    def connect_then_fail(self, channel):
+        connect(self, channel)
+        raise RuntimeError("DAQmx refused the laser's shutter line")
+
+    monkeypatch.setattr(NidaqLaserController, "_connect_trigger_route", connect_then_fail)
+    with pytest.raises(RuntimeError, match="refused the laser's shutter line") as refused:
+        NidaqLaserController(rig_lasers(
+            trigger_source="/PXI1Slot4/PXI_Trig0", trigger_route_source="/PXI1Slot5/PFI0"))
+
+    assert not hasattr(refused.value, "still_closing")
+    assert daq.disconnected == [TRIGGER_ROUTE]
 
 
 def test_a_normal_close_is_unchanged(monkeypatch):

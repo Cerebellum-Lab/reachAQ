@@ -196,6 +196,91 @@ def test_a_close_between_holding_the_tasks_and_routing_the_clock_leaves_no_route
     assert not any(task.started for task in daq.tasks)
 
 
+def _close_as_the_ramp_output_starts(daq, controller, *, stall):
+    """Close the controller between the ramp's two checks for closed.
+
+    As the ramp starts its output, the close runs on its own thread; the
+    start goes on once the controller is marked closed, or, when `stall` is
+    given, once that event is set, as a start slow in the driver would.
+    """
+    closer = {}
+
+    def close_first(task):
+        if not task.name.endswith("calibration_ao") or closer:
+            return
+        outcome = []
+
+        def close():
+            try:
+                outcome.append(controller.close())
+            except Exception as error:
+                outcome.append(error)
+
+        closer["thread"] = threading.Thread(target=close, daemon=True)
+        closer["outcome"] = outcome
+        closer["thread"].start()
+        _wait_for(lambda: controller._closed)
+        if stall is not None:
+            closer["stalled"] = True
+            stall.wait(10.0)
+
+    daq.before_start = close_first
+    return closer
+
+
+def test_a_close_between_the_ramps_checks_resets_the_laser_after_the_ramp(daq):
+    # The starts are made outside the lock, with a check for closed before
+    # and after. A close that lands between them finds the output not yet
+    # started: the check after ends the ramp, and the close resets the laser
+    # once the ramp has let go.
+    controller = NidaqLaserController(_rig_lasers())
+    closer = _close_as_the_ramp_output_starts(daq, controller, stall=None)
+
+    with pytest.raises(RuntimeError, match="closed as the calibration ramp started"):
+        controller.run_calibration_ramp(RAMP)
+    closer["thread"].join(5.0)
+
+    assert closer["outcome"] == [None]
+    assert controller.work_left_running() == ()
+    assert daq.writes_to("PXI1Slot4/ao0", task_suffix="manual_ao")[-1] == 0.0
+    assert daq.reserved == {}
+
+
+def test_a_ramp_start_that_stalls_past_the_close_is_a_close_error(monkeypatch):
+    # The close waited for the ramp to let go, gave up, and reset the laser;
+    # the stalled start then drove the output after that reset, and the
+    # close had logged it as an ERROR only. It is a close error now, and the
+    # ramp is named as still running until it lets go.
+    monkeypatch.setattr(nidaq_laser, "_CALIBRATION_RELEASE_TIMEOUT_S", 0.2)
+    daq = _FakeDaqmx()
+    monkeypatch.setattr(nidaq_laser, "_load_nidaqmx", lambda: daq)
+    controller = NidaqLaserController(_rig_lasers())
+    stall = threading.Event()
+    closer = _close_as_the_ramp_output_starts(daq, controller, stall=stall)
+    ramp, ramp_outcome = _ramp_in_thread(controller)
+    try:
+        _wait_for(lambda: closer.get("stalled"))
+        closer["thread"].join(5.0)
+        assert not closer["thread"].is_alive()
+        error, = closer["outcome"]
+        assert isinstance(error, RuntimeError)
+        assert "calibration ramp release" in str(error)
+        assert controller.work_left_running() == ("the calibration ramp",)
+
+        stall.set()
+        ramp.join(5.0)
+        assert not ramp.is_alive()
+        assert "closed as the calibration ramp started" in str(ramp_outcome[0])
+        assert controller.work_left_running() == ()
+        # The ramp's own reset, after the output it started late.
+        assert daq.writes_to("PXI1Slot4/ao0", task_suffix="manual_ao",
+                             thread=ramp)[-1] == 0.0
+        assert daq.reserved == {}
+    finally:
+        stall.set()
+        ramp.join(5.0)
+
+
 def test_a_failed_input_task_leaves_the_ramps_output_task_closed(daq, monkeypatch):
     # The ramp created its output and input tasks before its cleanup scope:
     # an input task that failed to create left the output task open.

@@ -72,9 +72,14 @@ class LaserModel(ObservableObject):
         self._direct_trigger_stop = threading.Event()
         self._direct_trigger_thread = None
         #: The last command asked of each channel, in volts: a set command, or
-        #: a pulse train's amplitude. What closing says an output may still
-        #: hold when the controller cannot be closed.
+        #: a pulse train's amplitude until the train returns to its baseline.
+        #: What closing says an output may still hold when the controller
+        #: cannot be closed.
         self._last_command_volts = {}
+        #: Controllers this model closed whose close stopped waiting for a
+        #: pulse train or a ramp that had not ended (work_left_running).
+        self._closed_with_work_left = []
+        self._closed_with_work_left_lock = threading.Lock()
         if controller is not None:
             self.set_controller(controller)
 
@@ -93,6 +98,13 @@ class LaserModel(ObservableObject):
 
     def _record_command(self, channel_id, volts: float) -> None:
         self._last_command_volts[int(channel_id)] = float(volts)
+
+    def _record_baseline(self, channel_ids) -> None:
+        """A waited-for pulse train has returned: its outputs are at their minimum."""
+        for channel_id in channel_ids:
+            self._record_command(
+                channel_id,
+                self._configuration.get_channel(channel_id).minimum_command_volts)
 
     @property
     def last_feedback_sample(self) -> Optional[LaserFeedbackSample]:
@@ -289,6 +301,11 @@ class LaserModel(ObservableObject):
         controller = self._require_controller()
         self._record_command(pulse_train.channel_id, pulse_train.amplitude_volts)
         controller.run_pulse_train(pulse_train)
+        if pulse_train.wait:
+            # Returned: the train ended on its baseline, and its cleanup put
+            # the command back. One that raised keeps its amplitude, which
+            # its output may still hold.
+            self._record_baseline((pulse_train.channel_id,))
         self.trace_received(self._make_pulse_trace(pulse_train))
 
     def run_synchronized_pulse_train(self, pulse_train: LaserSynchronizedPulseTrain):
@@ -296,6 +313,9 @@ class LaserModel(ObservableObject):
         for channel_pulse in pulse_train.pulse_trains:
             self._record_command(channel_pulse.channel_id, channel_pulse.amplitude_volts)
         operation = controller.run_synchronized_pulse_train(pulse_train)
+        if pulse_train.wait:
+            self._record_baseline(
+                channel_pulse.channel_id for channel_pulse in pulse_train.pulse_trains)
         for channel_pulse in pulse_train.pulse_trains:
             self.trace_received(self._make_pulse_trace(channel_pulse))
         return operation
@@ -612,13 +632,47 @@ class LaserModel(ObservableObject):
             return
         was_connected = self.is_connected
         try:
-            controller.close_all_shutters()
+            # The controller closes its shutters itself, once it has marked
+            # itself closed (NidaqLaserController.close). Driven from here
+            # first, a driver hung in that write held the close before
+            # anything was marked closed, with every cancel and abort behind.
+            controller.close()
         finally:
-            try:
-                controller.close()
-            finally:
-                self._controller = None
-                self._on_property_changed(self.IS_CONNECTED, False, was_connected)
+            self._controller = None
+            self._keep_if_work_left_running(controller)
+            self._on_property_changed(self.IS_CONNECTED, False, was_connected)
+
+    def _keep_if_work_left_running(self, controller) -> None:
+        work_left_running = getattr(controller, "work_left_running", None)
+        if work_left_running is not None and work_left_running():
+            with self._closed_with_work_left_lock:
+                self._closed_with_work_left.append(controller)
+
+    def work_left_running_after_close(self) -> tuple:
+        """What controllers this model closed left running, until it ends.
+
+        A pulse train or a ramp their close stopped waiting for, which can
+        still act on the lines a new controller would open on.
+        """
+        with self._closed_with_work_left_lock:
+            controllers = tuple(self._closed_with_work_left)
+        left = {controller: controller.work_left_running() for controller in controllers}
+        with self._closed_with_work_left_lock:
+            self._closed_with_work_left = [
+                controller for controller in self._closed_with_work_left
+                if left.get(controller, True)]
+        return tuple(item for items in left.values() for item in items)
+
+    def wait_for_work_left_running_after_close(self, timeout: Optional[float] = None) -> bool:
+        """Wait for work_left_running_after_close() to end; whether it has."""
+        with self._closed_with_work_left_lock:
+            controllers = tuple(self._closed_with_work_left)
+        deadline = None if timeout is None else time.monotonic() + timeout
+        for controller in controllers:
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            if not controller.wait_for_work_left_running(remaining):
+                return False
+        return not self.work_left_running_after_close()
 
     def _require_controller(self) -> LaserControllerProtocol:
         controller = self._controller
