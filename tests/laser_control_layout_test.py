@@ -202,6 +202,14 @@ def test_the_calibration_page_fits_the_docked_panel(panel, qapp):
     assert page.minimumSizeHint().height() <= page.height()
     assert page.minimumSizeHint().width() <= page.width()
     assert tab._run_ramp_button.isVisible()
+    # Settle, beside the Samples/step it is a part of.
+    assert tab._ramp_settle.isVisible()
+    grid = tab._ramp_settle.parentWidget().layout()
+
+    def row_of(widget):
+        return grid.getItemPosition(grid.indexOf(widget))[0]
+
+    assert row_of(tab._ramp_settle) == row_of(tab._ramp_samples_per_step)
 
 
 def _with_readback(lasers, terminal):

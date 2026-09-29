@@ -215,7 +215,10 @@ trigger route's destination), from every `triggerListenerInputs` line, and
 from a PXI_Trig `triggerRouteSource`, which would carry the clock into the
 trigger so that the laser arms on its first edge. A trigger on a clock's line
 is a second driver on it, which DAQmx does not notice across these boards,
-and the clock or the trigger is corrupted. Lines compare by name alone,
+and the clock or the trigger is corrupted. A trigger input drives nothing,
+so it cannot corrupt a clock; one on a clock's line is refused as a
+defensive check all the same, since it would read the clock rather than a
+trigger. Lines compare by name alone,
 whatever the board and case (`/PXI1Slot4/PXI_Trig1` and `pxi_trig1` are one
 line); a PFI never clashes. Loading a configuration that clashes is refused,
 naming the field and the line, and Edit DAQ Ports refuses a trigger input on

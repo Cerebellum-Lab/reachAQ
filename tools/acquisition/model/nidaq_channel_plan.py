@@ -42,7 +42,7 @@ def _is_role_name(name: str) -> bool:
 
 
 def _claimed_role_names(
-    laser_backend_enabled: bool, configured_lasers: Iterable[int] = (),
+    laser_backend_enabled: bool, configured_lasers: Iterable[int],
 ) -> set:
     """The names roles claim in a plan, whether or not each role is set.
 
@@ -53,15 +53,19 @@ def _claimed_role_names(
     a trigger readback, or for tone1 or camFrames.
 
     Every port role claims its name always: the ports are planned whatever
-    else is configured. While the laser backend is enabled, so do the roles
-    of every laser there can be, configured or not. Claimed only for the
-    lasers configured, a laser tab cleared in Edit DAQ Ports took that laser
-    out of the list, and its laser2_diode and laser2_command_copy stayed in
-    the scan: recorded, hidden, and shown nowhere. With the backend disabled
-    the plan adds no laser role, and the same holds for every laser not in
-    `configured_lasers`: its names are claimed, and its stored channels
-    dropped. A configured laser's stored channels stay custom inputs, as
-    they always have, and its tab still shows them, by pin.
+    else is configured. While the laser backend is enabled, the roles of
+    every laser there can be claim theirs, configured or not. Claimed only
+    for the lasers configured, a laser tab cleared in Edit DAQ Ports took
+    that laser out of the list, and its laser2_diode and laser2_command_copy
+    stayed in the scan: recorded, hidden, and shown nowhere.
+
+    With the backend disabled the plan adds no laser role at all. A laser
+    not in `configured_lasers` still claims its names, so its stored
+    channels are dropped, as above. A configured laser claims none: its
+    stored channels stay custom inputs, as they always have, and its tab
+    still shows them, by pin. So `configured_lasers`, the channel numbers of
+    the lasers configured, is required: a default of none would drop every
+    laser's stored channels, the configured ones too.
     """
     names = {name for _attribute, name in _PORT_INPUT_ROLES}
     configured = {int(number) for number in configured_lasers}

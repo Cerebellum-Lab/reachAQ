@@ -53,8 +53,9 @@ def clock_line_clashes(
     clock's line, a second driver. The route reads its trigger_route_source:
     a clock's line there would carry that clock into the trigger, and the
     laser would arm on the clock's first edge. Nothing drives a trigger
-    listener input; one on a clock's line is refused all the same, since it
-    would watch the clock rather than a trigger.
+    listener input, so it cannot corrupt a clock; one on a clock's line is
+    refused as a defensive check, since it would watch the clock rather
+    than a trigger.
     """
     channels = tuple(channels)
     listeners = tuple(trigger_listener_inputs)
@@ -249,7 +250,16 @@ class LaserSystemConfiguration:
         backend: str = "disabled",
         pmt_shutter_output: Optional[str] = None,
         trigger_listener_inputs: Iterable[str] = tuple(),
+        backplane_clock_line: Optional[str] = None,
+        pulse_clock_line: Optional[str] = None,
     ) -> "LaserSystemConfiguration":
+        # The clock lines only when given: their defaults are the fields'.
+        clock_lines = {
+            name: value
+            for name, value in (("backplane_clock_line", backplane_clock_line),
+                                ("pulse_clock_line", pulse_clock_line))
+            if value is not None
+        }
         return cls(
             tuple(channels),
             hardware_timed=hardware_timed,
@@ -257,6 +267,7 @@ class LaserSystemConfiguration:
             backend=backend,
             pmt_shutter_output=pmt_shutter_output,
             trigger_listener_inputs=tuple(trigger_listener_inputs),
+            **clock_lines,
         )
 
     def get_channel(self, channel_id: Union[LaserChannelId, int]) -> LaserChannelConfiguration:

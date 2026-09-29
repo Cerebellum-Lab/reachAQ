@@ -337,6 +337,41 @@ def test_run_pulse_is_refused_while_a_hung_laser_close_is_in_the_driver(
     assert not tab.stim_test_button.isEnabled()
 
 
+def _type_into(spin_box, text, qapp):
+    """Replace a spin box's text by typing, then press Return, as an operator."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    spin_box.selectAll()
+    QTest.keyClicks(spin_box, text)
+    QTest.keyClick(spin_box, Qt.Key.Key_Return)
+    qapp.processEvents()
+
+
+@pytest.mark.parametrize(("typed", "settle"), [("100", 20), ("50", 10)])
+def test_typing_samples_per_step_leaves_settle_at_its_share(idle_panel, qapp, typed, settle):
+    # Every keystroke was a new Samples/step, and each clamped Settle under
+    # it: typing "100" went through 1, which clamped Settle to 0, and it
+    # stayed there.
+    _app_model, _content, tab = idle_panel
+
+    _type_into(tab._ramp_samples_per_step, typed, qapp)
+
+    assert tab._ramp_samples_per_step.value() == int(typed)
+    assert tab._ramp_settle.value() == settle
+
+
+def test_a_settle_the_operator_set_is_kept_until_it_leaves_no_sample(idle_panel, qapp):
+    _app_model, _content, tab = idle_panel
+
+    _type_into(tab._ramp_settle, "30", qapp)
+    _type_into(tab._ramp_samples_per_step, "50", qapp)
+    assert tab._ramp_settle.value() == 30
+
+    _type_into(tab._ramp_samples_per_step, "20", qapp)
+    assert tab._ramp_settle.value() == 19
+
+
 def test_run_ramp_is_disabled_while_system_mode_runs(idle_panel, qapp):
     app_model, content, tab = idle_panel
     app_model._acquisition.started = True

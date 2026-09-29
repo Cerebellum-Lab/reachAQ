@@ -405,6 +405,8 @@ def test_a_trigger_input_on_the_backplane_clock_line_is_refused_in_the_dialog(qa
     assert dialog.result() != QDialog.DialogCode.Accepted
     # Refused whole: nothing the dialog would save has changed.
     assert dialog.laser_configuration == config.laser
+    assert dialog.nidaq_ports == config.nidaq_ports
+    assert dialog.timing_configuration == config.nidaq_ports.timing
 
     _set_combo_value(dialog._laser_combos[1]["trigger_listener"], "/Dev1/PXI_Trig0")
     assert _ok_enabled(dialog)
@@ -425,6 +427,9 @@ def test_a_trigger_input_on_the_pulse_clock_line_is_refused_in_the_dialog(qapp):
     assert not _ok_enabled(dialog)
     dialog.accept()
     assert dialog.result() != QDialog.DialogCode.Accepted
+    assert dialog.laser_configuration == config.laser
+    assert dialog.nidaq_ports == config.nidaq_ports
+    assert dialog.timing_configuration == config.nidaq_ports.timing
 
 
 def test_a_save_keeps_the_backplane_clock_line(qapp):
@@ -456,12 +461,63 @@ def test_a_refused_trigger_input_changes_nothing_in_the_application(
 
     _set_combo_value(dialog._laser_combos[1]["trigger_listener"], "/Dev1/PXI_Trig1")
     dialog.accept()
-
     assert dialog.result() != QDialog.DialogCode.Accepted
+    # What the dialog hands on is what it was given, and the application,
+    # saving it, changes nothing.
+    nidaq_app.update_daq_port_configuration(dialog.nidaq_ports, dialog.laser_configuration)
+
     assert nidaq_app.laser.configuration == laser_before
     assert nidaq_app.loaded_configuration.laser == stored_before
     saved = nidaq_app.get_config_from_location(nidaq_app.get_config_location())
     assert saved.laser == stored_before
+
+
+def _christielab10_devices():
+    # The 6221, whose ports the dialog edits, and the 6713 the lasers drive
+    # and christielab10 reads its trigger inputs on.
+    return (
+        NidaqDevicePorts(
+            name="PXI1Slot5",
+            analog_outputs=("PXI1Slot5/ao0", "PXI1Slot5/ao1"),
+            analog_inputs=("PXI1Slot5/ai0", "PXI1Slot5/ai1", "PXI1Slot5/ai2"),
+            digital_outputs=("PXI1Slot5/port0/line6",),
+            terminals=("/PXI1Slot5/PFI0", "/PXI1Slot5/PXI_Trig0"),
+        ),
+        NidaqDevicePorts(
+            name="PXI1Slot4",
+            analog_outputs=("PXI1Slot4/ao0", "PXI1Slot4/ao1"),
+            digital_outputs=("PXI1Slot4/port0/line0", "PXI1Slot4/port0/line1"),
+            terminals=("/PXI1Slot4/PFI0", "/PXI1Slot4/PXI_Trig0",
+                       "/PXI1Slot4/PXI_Trig1", "/PXI1Slot4/PXI_Trig2"),
+        ),
+    )
+
+
+def test_a_trigger_input_stored_on_another_board_leaves_ok_enabled(qapp):
+    # christielab10 reads its trigger inputs on the 6713's PXI_Trig lines,
+    # while the dialog edits the 6221's ports. A line compares by its name,
+    # so PXI_Trig0 there is no clock line, and nothing is refused.
+    config = SystemConfiguration()
+    config.nidaq_ports = NidaqPortConfiguration(device_name="PXI1Slot5")
+    config.laser = LaserSystemConfiguration(
+        channels=(LaserChannelConfiguration(
+            channel_id=1,
+            analog_output="PXI1Slot4/ao0",
+            diode_input="PXI1Slot5/ai0",
+            shutter_output="PXI1Slot4/port0/line0",
+            command_copy_input="PXI1Slot5/ai2",
+            trigger_source="/PXI1Slot4/PXI_Trig0",
+        ),),
+        trigger_listener_inputs=("/PXI1Slot4/PXI_Trig0",),
+    )
+    dialog = NidaqPortConfigurationDialog(config, devices=_christielab10_devices())
+    assert dialog._device_combo.currentData() == "PXI1Slot5"
+
+    assert _ok_enabled(dialog), dialog._status_label.text()
+    dialog.accept()
+
+    assert dialog.result() == QDialog.DialogCode.Accepted
+    assert dialog.laser_configuration.trigger_listener_inputs == ("/PXI1Slot4/PXI_Trig0",)
 
 
 def test_a_contradictory_timing_configuration_cannot_be_built(qapp):

@@ -218,3 +218,18 @@ def test_a_trigger_on_the_pulse_clock_line_is_refused_naming_both(terminal):
 
     with pytest.raises(ValueError, match="triggerListenerInputs .* the pulseClockLine"):
         _lasers(_channel(), trigger_listener_inputs=(terminal,))
+
+
+def test_a_configuration_from_channels_keeps_its_clock_lines():
+    # from_channels built the configuration with the default lines whatever
+    # it was given, and had nowhere to take them.
+    lasers = LaserSystemConfiguration.from_channels(
+        (_channel(),), backend="nidaq", hardware_timed=True,
+        sample_rate_hz=100_000.0, backplane_clock_line="PXI_Trig5",
+        pulse_clock_line="PXI_Trig4")
+
+    assert (lasers.backplane_clock_line, lasers.pulse_clock_line) == (
+        "PXI_Trig5", "PXI_Trig4")
+    defaults = LaserSystemConfiguration.from_channels((_channel(),))
+    assert (defaults.backplane_clock_line, defaults.pulse_clock_line) == (
+        "PXI_Trig1", "PXI_Trig3")

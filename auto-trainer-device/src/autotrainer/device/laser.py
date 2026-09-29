@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import numbers
 import threading
 import time
 from typing import Dict, Mapping, Optional, Protocol, Tuple, Union
@@ -127,6 +128,14 @@ class LaserSynchronizedPulseTrain:
 CALIBRATION_SETTLE_FRACTION = 0.2
 
 
+def default_settle_samples(samples_per_step: int) -> int:
+    """The samples of each calibration step left out of its point by default.
+
+    One formula, for the ramp and for the Calibration page's Settle field.
+    """
+    return int(round(samples_per_step * CALIBRATION_SETTLE_FRACTION))
+
+
 @dataclasses.dataclass(frozen=True)
 class LaserCalibrationRamp:
     """Sample-clocked command ramp used to acquire diode and command-copy feedback."""
@@ -156,8 +165,14 @@ class LaserCalibrationRamp:
         if self.samples_per_step <= 0:
             raise ValueError("samples_per_step must be positive")
         if self.settle_samples is None:
-            object.__setattr__(self, "settle_samples", int(round(
-                self.samples_per_step * CALIBRATION_SETTLE_FRACTION)))
+            object.__setattr__(
+                self, "settle_samples", default_settle_samples(self.samples_per_step))
+        if (isinstance(self.settle_samples, bool)
+                or not isinstance(self.settle_samples, numbers.Integral)):
+            # int() took 2.5 as 2, and "20" as 20, silently.
+            raise ValueError(
+                f"settle_samples must be a whole number of samples, not "
+                f"{self.settle_samples!r}")
         if not 0 <= int(self.settle_samples) < self.samples_per_step:
             raise ValueError(
                 f"settle_samples must leave at least one of the "
