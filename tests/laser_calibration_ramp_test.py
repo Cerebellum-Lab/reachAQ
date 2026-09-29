@@ -420,9 +420,13 @@ def test_samples_per_step_typed_and_left_by_focus_is_what_the_ramp_runs(
 
     app_model, content, tab = idle_panel
     _type_into(tab._ramp_samples_per_step, "50", qapp, commit=False)
+    assert tab._ramp_samples_per_step.value() == 100, "typing alone took it"
     QApplication.sendEvent(tab._ramp_samples_per_step, QFocusEvent(
         QEvent.Type.FocusOut, Qt.FocusReason.OtherFocusReason))
 
+    # Taken by the focus-out itself, before Run Ramp could take it.
+    assert tab._ramp_samples_per_step.value() == 50
+    assert tab._ramp_settle.value() == 10
     ramp, = _ramps_run_from(tab, app_model, qapp, monkeypatch, content,
                             tab._run_ramp_button.click)
 

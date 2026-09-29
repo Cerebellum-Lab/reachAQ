@@ -1177,19 +1177,24 @@ def test_a_stop_and_a_close_entering_together_close_the_laser_once(
         return close()
 
     monkeypatch.setattr(app_model.laser, "close", counted_close)
-    # Both past their first look before either goes on.
-    together = threading.Barrier(2, timeout=2.0)
-    generation = app_model._laser_status_generation
+    # Between the look for a close under way and the listing of this one,
+    # which read the last commands: two closes that could both be there at
+    # once had looked and not listed, and each listed its own. Done in one
+    # hold of the lock, the second waits for the lock; the barrier then
+    # times out, and the first goes on alone.
+    together = threading.Barrier(2, timeout=1.0)
+    laser_model_class = type(app_model.laser)
+    last_commands = laser_model_class.last_command_volts
 
-    def meet_then_generation():
+    def meet_then_read(model):
         try:
             together.wait()
         except threading.BrokenBarrierError:
             pass
-        return generation()
+        return last_commands.fget(model)
 
     if order == "together":
-        monkeypatch.setattr(app_model, "_laser_status_generation", meet_then_generation)
+        monkeypatch.setattr(laser_model_class, "last_command_volts", property(meet_then_read))
     monkeypatch.setattr(app_model_module, "_LASER_CONTROLLER_CLOSE_S", 5.0)
     try:
         stop, stop_outcome = _in_thread(
@@ -1207,6 +1212,86 @@ def test_a_stop_and_a_close_entering_together_close_the_laser_once(
         assert not app_model.laser.is_connected
     finally:
         app_model.capture_stop()
+
+
+def test_a_watch_being_listed_is_not_waited_for_as_a_close_under_way(
+    app_model, monkeypatch,
+):
+    # A watch is listed, then given up on at once. A close that looked in
+    # between took it for one under way and waited for it, up to its bound,
+    # and then went on without closing the laser.
+    from tools.acquisition.model import app_model as app_model_module
+
+    monkeypatch.setattr(app_model_module, "_LASER_CONTROLLER_CLOSE_S", 3.0)
+    _system_mode_with_the_fake_laser(app_model, monkeypatch, lasers=_ROUTED_LASER)
+    listed, go_on, ended = threading.Event(), threading.Event(), threading.Event()
+    run = app_model_module._BoundedClose.run
+
+    def run_once_listed(closing, timeout):
+        if closing.name == "test watch":
+            listed.set()
+            go_on.wait(5.0)
+        return run(closing, timeout)
+
+    monkeypatch.setattr(app_model_module._BoundedClose, "run", run_once_listed)
+    watcher, _outcome = _in_thread(lambda: app_model._watch_given_up_laser_close(
+        ended.wait, "test watch", ended="The test watch ended", late="test watch ended"))
+    assert listed.wait(5.0)
+    try:
+        started = time.monotonic()
+        app_model._close_laser_within_bound("System Mode stops")
+
+        assert time.monotonic() - started < 1.0
+        assert not app_model.laser.is_connected
+    finally:
+        go_on.set()
+        ended.set()
+        watcher.join(5.0)
+        app_model.capture_stop()
+
+
+def test_laser_reads_failed_while_a_pulse_the_close_gave_up_on_runs(
+    app_model, monkeypatch,
+):
+    # The hung close ended late and its model's disconnect wrote STOPPED
+    # "laser controller disconnected"; the late finish then listed the pulse
+    # it had given up on as a watch, and, another close being pending, left
+    # the status alone: STOPPED, while every laser action was refused.
+    from autotrainer.core import LaserChannelId
+    from autotrainer.device import LaserPulseTrain, LaserSynchronizedPulseTrain, nidaq_laser
+    from tools.acquisition.model import app_model as app_model_module
+
+    monkeypatch.setattr(nidaq_laser, "_OPERATION_CANCEL_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(app_model_module, "_LASER_CONTROLLER_CLOSE_S", 1.5)
+    # The pulse's cancel is not acted on (hold_waits), and the close hangs
+    # releasing the trigger route.
+    daq = _system_mode_with_the_fake_laser(
+        app_model, monkeypatch, lasers=_ROUTED_LASER, hang={"disconnect_terms"},
+        block_wait=True, hold_waits=True)
+    try:
+        app_model.laser.run_synchronized_pulse_train(LaserSynchronizedPulseTrain(
+            pulse_trains=(LaserPulseTrain(
+                channel_id=LaserChannelId.LASER_1, amplitude_volts=1.0,
+                duration_ms=1.0),),
+            wait=False))
+        _wait_for_the_pulse(daq)
+        app_model.capture_stop()
+        assert "still closing after a driver hang" in _laser_status(app_model).error
+
+        daq.hang_released.set()
+        _wait_until(lambda: not app_model.laser_controller_close_refusal().startswith(
+            "the laser controller is still closing"))
+        time.sleep(0.2)
+
+        status = _laser_status(app_model)
+        assert status.state is SubsystemState.FAILED, status
+        assert status.error.startswith(
+            "a laser operation the close gave up on is still running in the driver")
+        assert status.error == app_model.laser_controller_close_refusal()
+    finally:
+        daq.hang_released.set()
+        daq.waits_released.set()
+        _wait_until(lambda: not app_model.laser_controller_close_refusal())
 
 
 def test_a_close_already_under_way_is_waited_for_not_run_twice(app_model, monkeypatch):
@@ -1334,6 +1419,19 @@ def test_a_run_whose_laser_failed_to_open_waits_for_its_partial_close(
                 raise RuntimeError(f"the laser did not load: {error}") from error
 
         monkeypatch.setattr(app_model.laser, "load_configuration", load_or_wrap)
+    # Every FAILED written for the laser: there were two, the first without
+    # the open's own error.
+    laser_failures = []
+    registry = app_model._acquisition.subsystems
+    transition = registry.transition
+
+    def recorded(subsystem_id, state, **fields):
+        if (getattr(subsystem_id, "value", subsystem_id) == SubsystemId.LASER.value
+                and state is SubsystemState.FAILED):
+            laser_failures.append(fields.get("error", ""))
+        return transition(subsystem_id, state, **fields)
+
+    monkeypatch.setattr(registry, "transition", recorded)
     caplog.set_level("CRITICAL")
     start_thread, start_outcome = _in_thread(app_model.capture_start)
     try:
@@ -1351,6 +1449,8 @@ def test_a_run_whose_laser_failed_to_open_waits_for_its_partial_close(
         assert status.state is SubsystemState.FAILED
         assert "refused the laser's shutter line" in status.error
         assert refusal in status.error
+        failure, = laser_failures
+        assert failure == status.error
 
         daq.hang_released.set()
         _wait_until(lambda: not app_model.laser_controller_close_refusal())

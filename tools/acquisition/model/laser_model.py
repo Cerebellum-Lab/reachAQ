@@ -77,8 +77,11 @@ class LaserModel(ObservableObject):
         #: cannot be closed.
         self._last_command_volts = {}
         #: How many commands have been recorded for each channel: a pulse's
-        #: end resets its command only if nothing newer was recorded.
+        #: end resets its command only if nothing newer was recorded. Both,
+        #: and the look before a reset, under the lock: pulses end on threads
+        #: of their own.
         self._command_records = {}
+        self._command_lock = threading.RLock()
         #: Controllers this model closed whose close stopped waiting for a
         #: pulse train or a ramp that had not ended (work_left_running).
         self._closed_with_work_left = []
@@ -100,9 +103,10 @@ class LaserModel(ObservableObject):
         return dict(self._last_command_volts)
 
     def _record_command(self, channel_id, volts: float) -> None:
-        self._last_command_volts[int(channel_id)] = float(volts)
-        self._command_records[int(channel_id)] = (
-            self._command_records.get(int(channel_id), 0) + 1)
+        with self._command_lock:
+            self._last_command_volts[int(channel_id)] = float(volts)
+            self._command_records[int(channel_id)] = (
+                self._command_records.get(int(channel_id), 0) + 1)
 
     def _record_baseline_when_completed(self, operation, channel_ids) -> None:
         """An armed or trial pulse's outputs are at their minimum once it completes.
@@ -114,17 +118,21 @@ class LaserModel(ObservableObject):
         add_terminal_callback = getattr(operation, "add_terminal_callback", None)
         if add_terminal_callback is None:
             return
-        marks = {
-            int(channel_id): self._command_records.get(int(channel_id), 0)
-            for channel_id in channel_ids
-        }
+        with self._command_lock:
+            marks = {
+                int(channel_id): self._command_records.get(int(channel_id), 0)
+                for channel_id in channel_ids
+            }
 
         def completed(ended):
             if getattr(getattr(ended, "state", None), "value", None) != "completed":
                 return
-            self._record_baseline(
-                channel_id for channel_id, mark in marks.items()
-                if self._command_records.get(channel_id, 0) == mark)
+            # The look and the reset in one hold: a command recorded between
+            # them was overwritten with the minimum.
+            with self._command_lock:
+                self._record_baseline(
+                    channel_id for channel_id, mark in marks.items()
+                    if self._command_records.get(channel_id, 0) == mark)
 
         add_terminal_callback(completed)
 

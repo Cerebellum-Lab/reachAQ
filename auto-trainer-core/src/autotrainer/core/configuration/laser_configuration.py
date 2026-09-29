@@ -108,12 +108,17 @@ def _bare_backplane_line(field: str, value) -> str:
         raise ValueError(
             f"{field} is empty: it must be a PXI_Trig line, such as PXI_Trig1")
     if "/" in text:
-        # Not the value's own tail as the example: that may be refused too,
-        # as a PFI is.
+        # The value's own line when it is one the backplane has; the field's
+        # default could itself be taken. Not a tail that is refused too, as
+        # a PFI is.
+        tail = backplane_line_of(text)
+        example = (
+            f"PXI_Trig{int(tail[len('pxi_trig'):])}"
+            if tail is not None and int(tail[len("pxi_trig"):]) <= 7
+            else _EXAMPLE_LINE[field])
         raise ValueError(
             f"{field} {text!r} names a board: give a bare PXI_Trig line, such "
-            f"as {_EXAMPLE_LINE[field]}, which every board in the chassis sees "
-            "as its own")
+            f"as {example}, which every board in the chassis sees as its own")
     line = backplane_line_of(text)
     if line is None:
         raise ValueError(
@@ -266,8 +271,8 @@ class LaserSystemConfiguration:
         backend: str = "disabled",
         pmt_shutter_output: Optional[str] = None,
         trigger_listener_inputs: Iterable[str] = tuple(),
-        backplane_clock_line=_FIELD_DEFAULT,
-        pulse_clock_line=_FIELD_DEFAULT,
+        backplane_clock_line: Optional[str] = _FIELD_DEFAULT,  # type: ignore[assignment]
+        pulse_clock_line: Optional[str] = _FIELD_DEFAULT,  # type: ignore[assignment]
     ) -> "LaserSystemConfiguration":
         # The clock lines only when given: their defaults are the fields'.
         # None is given, and refused as the constructor refuses it.

@@ -406,7 +406,8 @@ class _LaserChannelTab(QWidget):
             "read on the same clock edge the command changes on. It follows "
             "a fifth of Samples/step until you change it. The ramp's fields "
             "go back to their defaults whenever Laser Control is rebuilt: on "
-            "every Run/Stop and every DAQ Ports save.")
+            "every Run/Stop, on a DAQ Ports save or a configuration load that "
+            "changes the lasers, and when a late close disconnects the laser.")
         #: Whether the operator has set Settle; until then it follows
         #: Samples/step at its default share.
         self._ramp_settle_edited = False
