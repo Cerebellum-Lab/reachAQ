@@ -33,7 +33,7 @@ from autotrainer.device import (
     LaserChannelId,
     LaserPulseTrain,
 )
-from autotrainer.device.laser import CALIBRATION_SETTLE_FRACTION
+from autotrainer.device.laser import default_settle_samples
 from autotrainer.pyside import CardWidget, PGWidget
 from autotrainer.pyside.content_widget import ContentWidget, invoke_method
 from tools.acquisition.model.trial_protocol_schedule import (
@@ -391,26 +391,35 @@ class _LaserChannelTab(QWidget):
         self._ramp_samples_per_step = QSpinBox()
         self._ramp_samples_per_step.setRange(1, 1000000)
         self._ramp_samples_per_step.setValue(100)
+        # Taken when the operator finishes typing, not at each keystroke:
+        # typing "100" went through 1, which clamped Settle to 0.
+        self._ramp_samples_per_step.setKeyboardTracking(False)
         # Left out of each step's point, while the laser and the diode follow
         # the step; at least one sample of the step stays in it.
         self._ramp_settle = QSpinBox()
         self._ramp_settle.setRange(0, self._ramp_samples_per_step.value() - 1)
-        self._ramp_settle.setValue(int(round(
-            self._ramp_samples_per_step.value() * CALIBRATION_SETTLE_FRACTION)))
+        self._ramp_settle.setValue(
+            default_settle_samples(self._ramp_samples_per_step.value()))
         self._ramp_settle.setToolTip(
             "Samples at the start of each step left out of its point, while "
             "the laser and the diode settle to the new command: the input is "
             "read on the same clock edge the command changes on. A fifth of "
             "Samples/step by default.")
+        #: Whether the operator has set Settle; until then it follows
+        #: Samples/step at its default share.
+        self._ramp_settle_edited = False
+        self._ramp_settle_following = False
+        self._ramp_settle.valueChanged.connect(self._on_ramp_settle_changed)
         self._ramp_samples_per_step.valueChanged.connect(
-            lambda samples: self._ramp_settle.setMaximum(max(0, samples - 1)))
+            self._on_ramp_samples_per_step_changed)
         self._ramp_pmt = self._make_checkbox("PMT shutter")
         self._run_ramp_button = QPushButton("Run Ramp")
 
+        # Settle beside the Samples/step it is a part of.
         ramp_layout = field_grid(ramp_section.content, (
             ("Start:", self._ramp_start), ("Stop:", self._ramp_stop),
-            ("Steps:", self._ramp_steps), ("Samples/step:", self._ramp_samples_per_step),
-            ("Settle:", self._ramp_settle),
+            ("Samples/step:", self._ramp_samples_per_step), ("Settle:", self._ramp_settle),
+            ("Steps:", self._ramp_steps),
         ))
         ramp_layout.addWidget(self._ramp_pmt, 2, 2, 1, 2)
         ramp_layout.addWidget(
@@ -844,6 +853,23 @@ class _LaserChannelTab(QWidget):
                 "channels when the system starts, so press Run first"
             )
         return ""
+
+    def _on_ramp_settle_changed(self, _settle: int) -> None:
+        if not self._ramp_settle_following:
+            self._ramp_settle_edited = True
+
+    def _on_ramp_samples_per_step_changed(self, samples: int) -> None:
+        """Settle keeps its default share until the operator sets it.
+
+        Then it is only kept valid, below Samples/step.
+        """
+        self._ramp_settle_following = True
+        try:
+            self._ramp_settle.setMaximum(max(0, samples - 1))
+            if not self._ramp_settle_edited:
+                self._ramp_settle.setValue(default_settle_samples(samples))
+        finally:
+            self._ramp_settle_following = False
 
     def run_ramp_refusal(self, panel_refusal: str) -> str:
         """Why Run Ramp is unavailable on this laser, or an empty string.

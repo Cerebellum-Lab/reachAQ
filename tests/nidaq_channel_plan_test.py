@@ -865,3 +865,14 @@ def test_christielab10s_readbacks_take_over_its_custom_channels_in_place():
         assert (trigger.unit, trigger.scale, trigger.offset) == ("V", 1.0, 0.0)
     assert result.channels[:8] == loaded.nidaq_stream.channels[:8]
     assert result.display_channels == loaded.nidaq_stream.display_channels
+
+
+def test_the_claimed_names_need_the_configured_lasers():
+    # Defaulting to none configured, a caller that left them out had every
+    # disabled laser's stored channels dropped, the configured ones too.
+    from tools.acquisition.model.nidaq_channel_plan import _claimed_role_names
+
+    with pytest.raises(TypeError):
+        _claimed_role_names(False)
+    assert "laser1_diode" not in _claimed_role_names(False, (1,))
+    assert "laser2_diode" in _claimed_role_names(False, (1,))

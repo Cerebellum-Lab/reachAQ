@@ -432,7 +432,6 @@ def test_synchronized_pulse_train_rejects_deferred_hardware_trigger():
         )
 
 
-
 def _ramp(**values):
     fields = dict(channel_id=LaserChannelId.LASER_1, start_volts=0.0,
                   stop_volts=5.0, steps=3, samples_per_step=100)
@@ -451,3 +450,17 @@ def test_a_calibration_ramp_settles_a_fifth_of_each_step_by_default():
 def test_a_calibration_ramp_keeps_at_least_one_sample_of_each_step(settle):
     with pytest.raises(ValueError, match="settle_samples"):
         _ramp(settle_samples=settle)
+
+
+@pytest.mark.parametrize("settle", [2.5, 20.0, True, "20"])
+def test_a_calibration_ramp_takes_a_whole_number_of_settle_samples(settle):
+    # int() took 2.5 as 2, silently.
+    with pytest.raises(ValueError, match="whole number"):
+        _ramp(settle_samples=settle)
+
+
+def test_the_default_settle_is_one_formula_for_the_ramp_and_the_panel():
+    from autotrainer.device.laser import default_settle_samples
+
+    for samples in (1, 7, 10, 37, 100, 1001):
+        assert _ramp(samples_per_step=samples).settle_samples == default_settle_samples(samples)
