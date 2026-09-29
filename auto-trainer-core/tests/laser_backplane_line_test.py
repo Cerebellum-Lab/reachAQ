@@ -257,3 +257,9 @@ def test_a_configuration_from_channels_keeps_its_clock_lines():
     defaults = LaserSystemConfiguration.from_channels((_channel(),))
     assert (defaults.backplane_clock_line, defaults.pulse_clock_line) == (
         "PXI_Trig1", "PXI_Trig3")
+
+
+@pytest.mark.parametrize("field", ["backplane_clock_line", "pulse_clock_line"])
+def test_a_configuration_from_channels_refuses_a_null_clock_line_as_the_constructor_does(field):
+    with pytest.raises(ValueError, match="empty"):
+        LaserSystemConfiguration.from_channels((_channel(),), **{field: None})

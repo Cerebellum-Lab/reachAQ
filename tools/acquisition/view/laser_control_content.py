@@ -403,12 +403,17 @@ class _LaserChannelTab(QWidget):
         self._ramp_settle.setToolTip(
             "Samples at the start of each step left out of its point, while "
             "the laser and the diode settle to the new command: the input is "
-            "read on the same clock edge the command changes on. A fifth of "
-            "Samples/step by default.")
+            "read on the same clock edge the command changes on. It follows "
+            "a fifth of Samples/step until you change it. The ramp's fields "
+            "go back to their defaults whenever Laser Control is rebuilt: on "
+            "every Run/Stop and every DAQ Ports save.")
         #: Whether the operator has set Settle; until then it follows
         #: Samples/step at its default share.
         self._ramp_settle_edited = False
         self._ramp_settle_following = False
+        #: The value the follow last gave Settle. Qt reports a value on
+        #: Return even when it has not changed, and that is no edit.
+        self._ramp_settle_followed = self._ramp_settle.value()
         self._ramp_settle.valueChanged.connect(self._on_ramp_settle_changed)
         self._ramp_samples_per_step.valueChanged.connect(
             self._on_ramp_samples_per_step_changed)
@@ -854,8 +859,8 @@ class _LaserChannelTab(QWidget):
             )
         return ""
 
-    def _on_ramp_settle_changed(self, _settle: int) -> None:
-        if not self._ramp_settle_following:
+    def _on_ramp_settle_changed(self, settle: int) -> None:
+        if not self._ramp_settle_following and settle != self._ramp_settle_followed:
             self._ramp_settle_edited = True
 
     def _on_ramp_samples_per_step_changed(self, samples: int) -> None:
@@ -868,6 +873,7 @@ class _LaserChannelTab(QWidget):
             self._ramp_settle.setMaximum(max(0, samples - 1))
             if not self._ramp_settle_edited:
                 self._ramp_settle.setValue(default_settle_samples(samples))
+                self._ramp_settle_followed = self._ramp_settle.value()
         finally:
             self._ramp_settle_following = False
 
@@ -1175,6 +1181,11 @@ class _LaserChannelTab(QWidget):
                 True,
             )
             return
+        # What is typed and not yet taken, as when Run Ramp is pressed with
+        # Samples/step still focused, is taken now, and Settle follows it:
+        # Samples/step takes a value only as typing ends.
+        self._ramp_samples_per_step.interpretText()
+        self._ramp_settle.interpretText()
         try:
             ramp = LaserCalibrationRamp(
                 channel_id=self._channel.channel_id,

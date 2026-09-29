@@ -459,7 +459,9 @@ def test_a_calibration_ramp_takes_a_whole_number_of_settle_samples(settle):
         _ramp(settle_samples=settle)
 
 
-def test_the_default_settle_is_one_formula_for_the_ramp_and_the_panel():
+def test_the_ramps_default_settle_is_default_settle_samples():
+    # The panel's Settle takes the same function
+    # (laser_calibration_ramp_test, test_typing_samples_per_step_*).
     from autotrainer.device.laser import default_settle_samples
 
     for samples in (1, 7, 10, 37, 100, 1001):

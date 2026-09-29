@@ -337,14 +337,15 @@ def test_run_pulse_is_refused_while_a_hung_laser_close_is_in_the_driver(
     assert not tab.stim_test_button.isEnabled()
 
 
-def _type_into(spin_box, text, qapp):
+def _type_into(spin_box, text, qapp, *, commit=True):
     """Replace a spin box's text by typing, then press Return, as an operator."""
     from PySide6.QtCore import Qt
     from PySide6.QtTest import QTest
 
     spin_box.selectAll()
     QTest.keyClicks(spin_box, text)
-    QTest.keyClick(spin_box, Qt.Key.Key_Return)
+    if commit:
+        QTest.keyClick(spin_box, Qt.Key.Key_Return)
     qapp.processEvents()
 
 
@@ -359,6 +360,96 @@ def test_typing_samples_per_step_leaves_settle_at_its_share(idle_panel, qapp, ty
 
     assert tab._ramp_samples_per_step.value() == int(typed)
     assert tab._ramp_settle.value() == settle
+
+
+@pytest.mark.parametrize(("typed", "settles"), [
+    (("50", "200"), (10, 40)),
+    (("100", "5", "100"), (20, 1, 20)),
+])
+def test_settle_keeps_following_samples_per_step_through_every_change(
+    idle_panel, qapp, typed, settles,
+):
+    # The follow's own writes are not the operator's: were they taken as an
+    # edit, Settle would stop following after the first change, or keep the
+    # 1 that "5" gave it once Samples/step went back to 100.
+    _app_model, _content, tab = idle_panel
+
+    for samples, settle in zip(typed, settles):
+        _type_into(tab._ramp_samples_per_step, samples, qapp)
+        assert tab._ramp_settle.value() == settle, samples
+
+
+def test_return_in_an_untouched_settle_is_not_an_edit(idle_panel, qapp):
+    # Qt reports a value on Return even when it has not changed; that is
+    # not the operator setting Settle, and Settle still follows.
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    _app_model, _content, tab = idle_panel
+    QTest.keyClick(tab._ramp_settle, Qt.Key.Key_Return)
+    qapp.processEvents()
+
+    _type_into(tab._ramp_samples_per_step, "50", qapp)
+
+    assert tab._ramp_settle.value() == 10
+
+
+def _ramps_run_from(tab, app_model, qapp, monkeypatch, content, run):
+    ramps = []
+
+    def run_ramp(ramp):
+        ramps.append(ramp)
+        return NullLaserController(_null_lasers()).run_calibration_ramp(ramp)
+
+    monkeypatch.setattr(app_model, "run_laser_calibration_ramp", run_ramp)
+    run()
+    deadline = time.monotonic() + 10.0
+    while content._operation_thread is not None and time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(0.01)
+    qapp.processEvents()
+    return ramps
+
+
+def test_samples_per_step_typed_and_left_by_focus_is_what_the_ramp_runs(
+    idle_panel, qapp, monkeypatch,
+):
+    from PySide6.QtCore import QEvent, Qt
+    from PySide6.QtGui import QFocusEvent
+    from PySide6.QtWidgets import QApplication
+
+    app_model, content, tab = idle_panel
+    _type_into(tab._ramp_samples_per_step, "50", qapp, commit=False)
+    QApplication.sendEvent(tab._ramp_samples_per_step, QFocusEvent(
+        QEvent.Type.FocusOut, Qt.FocusReason.OtherFocusReason))
+
+    ramp, = _ramps_run_from(tab, app_model, qapp, monkeypatch, content,
+                            tab._run_ramp_button.click)
+
+    assert (ramp.samples_per_step, ramp.settle_samples) == (50, 10)
+
+
+def test_samples_per_step_typed_then_run_ramp_is_what_the_ramp_runs(
+    idle_panel, qapp, monkeypatch,
+):
+    # Taken only when typing finishes, "50" was still unread when Run Ramp
+    # was pressed without the field losing focus, as by its shortcut: the
+    # ramp ran on the 100 before it.
+    app_model, content, tab = idle_panel
+    _type_into(tab._ramp_samples_per_step, "50", qapp, commit=False)
+
+    ramp, = _ramps_run_from(tab, app_model, qapp, monkeypatch, content,
+                            tab._run_ramp_button.click)
+
+    assert (ramp.samples_per_step, ramp.settle_samples) == (50, 10)
+
+
+def test_the_settle_tooltip_states_when_it_follows_and_when_it_resets(idle_panel):
+    _app_model, _content, tab = idle_panel
+    tooltip = tab._ramp_settle.toolTip()
+
+    assert "a fifth of Samples/step until you change it" in tooltip
+    assert "Run/Stop" in tooltip and "DAQ Ports save" in tooltip
 
 
 def test_a_settle_the_operator_set_is_kept_until_it_leaves_no_sample(idle_panel, qapp):

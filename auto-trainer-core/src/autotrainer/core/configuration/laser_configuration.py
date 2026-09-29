@@ -129,6 +129,9 @@ def _bare_backplane_line(field: str, value) -> str:
 #: A clock line a refusal can suggest: each field's own default.
 _EXAMPLE_LINE = {"backplaneClockLine": "PXI_Trig1", "pulseClockLine": "PXI_Trig3"}
 
+#: An argument left out, as distinct from one given as None.
+_FIELD_DEFAULT = object()
+
 
 @dataclasses.dataclass(frozen=True)
 class LaserChannelConfiguration:
@@ -263,15 +266,16 @@ class LaserSystemConfiguration:
         backend: str = "disabled",
         pmt_shutter_output: Optional[str] = None,
         trigger_listener_inputs: Iterable[str] = tuple(),
-        backplane_clock_line: Optional[str] = None,
-        pulse_clock_line: Optional[str] = None,
+        backplane_clock_line=_FIELD_DEFAULT,
+        pulse_clock_line=_FIELD_DEFAULT,
     ) -> "LaserSystemConfiguration":
         # The clock lines only when given: their defaults are the fields'.
+        # None is given, and refused as the constructor refuses it.
         clock_lines = {
             name: value
             for name, value in (("backplane_clock_line", backplane_clock_line),
                                 ("pulse_clock_line", pulse_clock_line))
-            if value is not None
+            if value is not _FIELD_DEFAULT
         }
         return cls(
             tuple(channels),
