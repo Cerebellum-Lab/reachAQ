@@ -6931,7 +6931,6 @@ class AppModel(ObservableObject):
         generation = self._laser_status_generation()
         deadline = time.monotonic() + _LASER_CONTROLLER_CLOSE_S
         closing = None
-        waited = False
         while True:
             # Looked for and listed in one hold of the lock: a Stop and closing
             # that both looked before either listed its close ran two on one
@@ -6961,7 +6960,6 @@ class AppModel(ObservableObject):
             if remaining <= 0:
                 break
             unfinished[0].done.wait(remaining)
-            waited = True
         if unfinished:
             # Not started again over one still in the driver, which would
             # hang the same way; that one's CRITICAL has been logged.
@@ -6970,9 +6968,8 @@ class AppModel(ObservableObject):
                 "%s without closing it again", going_on)
             return
         if closing is None:
-            if not waited:
-                # Nothing connected: as it always was.
-                self._laser.close()
+            # Nothing connected, or a close that came first has just closed
+            # it: nothing to close. The model's close would be a no-op.
             return
         finished = closing.run(_LASER_CONTROLLER_CLOSE_S)
         if finished:
