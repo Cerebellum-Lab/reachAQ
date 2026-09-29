@@ -256,3 +256,50 @@ def test_the_model_names_what_a_closed_controller_left_running():
     ended.set()
     assert model.wait_for_work_left_running_after_close(1.0) is True
     assert model.work_left_running_after_close() == ()
+
+
+def test_a_trial_pulse_leaves_the_command_at_its_minimum_once_it_completes():
+    # Only a waited-for pulse recorded its end: a trial's, armed and run on
+    # its own thread, left its amplitude as the last command, and a close
+    # that hung after the trial named it as what the output may hold.
+    model = _null_hardware_timed_model()
+    profile = LaserPulseProfile("pulse", 1, 2.5, 1)
+
+    operation = model.prepare_pulse_profile(profile, SOFTWARE, _recipe())
+    assert model.last_command_volts == {1: 2.5}
+    operation.trigger()
+    assert operation.wait(1).value == "completed"
+
+    deadline = time.monotonic() + 2.0
+    while model.last_command_volts != {1: 0.0} and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert model.last_command_volts == {1: 0.0}
+
+
+def test_a_trial_pulse_that_is_cancelled_keeps_its_amplitude():
+    model = _null_hardware_timed_model()
+    profile = LaserPulseProfile("pulse", 1, 2.5, 1)
+
+    operation = model.prepare_pulse_profile(profile, SOFTWARE, _recipe())
+    operation.cancel()
+    operation.wait(1)
+    time.sleep(0.05)
+
+    assert model.last_command_volts == {1: 2.5}
+
+
+def test_a_pulse_that_ends_after_a_newer_command_leaves_that_command():
+    # The end of a pulse is its own: once a newer command has been recorded,
+    # the pulse's completion does not overwrite it with the minimum.
+    from autotrainer.device import LaserChannelId
+
+    model = _null_hardware_timed_model()
+    profile = LaserPulseProfile("pulse", 1, 2.5, 1)
+    operation = model.prepare_pulse_profile(profile, SOFTWARE, _recipe())
+    model._record_command(LaserChannelId.LASER_1, 1.5)
+
+    operation.trigger()
+    operation.wait(1)
+    time.sleep(0.05)
+
+    assert model.last_command_volts == {1: 1.5}

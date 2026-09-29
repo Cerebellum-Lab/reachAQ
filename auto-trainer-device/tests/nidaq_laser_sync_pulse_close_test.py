@@ -162,6 +162,74 @@ def test_a_pulse_ended_by_a_base_exception_still_lets_go_of_its_output(monkeypat
     controller.run_pulse_train(PULSE)
 
 
+def test_a_close_beside_a_pulse_a_base_exception_ends_still_resets(monkeypatch):
+    # The pulse's KeyboardInterrupt was stored as its operation's error, and
+    # close(), waiting for the operation, had it raised at it: close() catches
+    # Exception only, so the reset, the task close and the route release were
+    # skipped. It is stored as a RuntimeError now; the pulse's own thread
+    # still raises the KeyboardInterrupt.
+    daq = FakeDaqmx()
+    monkeypatch.setattr(nidaq_laser, "_load_nidaqmx", lambda: daq)
+    controller = NidaqLaserController(rig_lasers(
+        trigger_source="/PXI1Slot4/PXI_Trig0", trigger_route_source="/PXI1Slot5/PFI0"))
+    go, operations = threading.Event(), []
+
+    def interrupted(pulse_train, *, operation=None):
+        operations.append(operation)
+        go.wait(5.0)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(controller, "_execute_synchronized_pulse_train", interrupted)
+    pulse_outcome = []
+
+    def pulse():
+        try:
+            controller.run_pulse_train(PULSE)
+        except BaseException as error:
+            pulse_outcome.append(error)
+
+    pulse_thread = threading.Thread(target=pulse, daemon=True)
+    pulse_thread.start()
+    _wait_for(lambda: operations)
+    operation, = operations
+    close_outcome = []
+
+    def close():
+        try:
+            close_outcome.append(controller.close())
+        except BaseException as error:
+            close_outcome.append(error)
+
+    close_thread = threading.Thread(target=close, daemon=True)
+    set_shutter_open = controller.set_shutter_open
+
+    def shutter_then_interrupt(channel_id, is_open):
+        # After close() has taken the operation to wait for, and before it
+        # waits: the pulse ends by its KeyboardInterrupt in between.
+        if threading.current_thread() is close_thread and not go.is_set():
+            go.set()
+            assert operation._done.wait(5.0)
+        return set_shutter_open(channel_id, is_open)
+
+    monkeypatch.setattr(controller, "set_shutter_open", shutter_then_interrupt)
+    close_thread.start()
+    close_thread.join(10.0)
+    pulse_thread.join(5.0)
+
+    assert not close_thread.is_alive()
+    error, = pulse_outcome
+    assert isinstance(error, KeyboardInterrupt)
+    assert operation.state is LaserOperationState.FAILED
+    assert isinstance(operation.error, RuntimeError)
+    assert "KeyboardInterrupt" in str(operation.error)
+    # Whatever close() reports of the pulse, it reset the laser and let go.
+    assert not any(isinstance(outcome, KeyboardInterrupt) for outcome in close_outcome)
+    assert daq.writes_to("PXI1Slot4/ao0", task_suffix="manual_ao",
+                         thread=close_thread) == [0.0]
+    assert daq.disconnected == [("/PXI1Slot5/PFI0", "/PXI1Slot5/PXI_Trig0")]
+    assert controller._live_operations == {}
+
+
 def test_close_closes_the_shutters_before_it_waits_for_a_pulse(monkeypatch):
     # The laser model closed the shutters with a driver call before the
     # controller's close could mark it closed; the close then reset them

@@ -1010,6 +1010,20 @@ def test_stop_with_a_hung_laser_close_is_bounded_and_holds_off_run_until_it_ends
             app_model.refresh_hardware_bindings()
         with pytest.raises(RuntimeError, match="still closing after a driver hang"):
             app_model.run_stim_bench_test(None, 1, "direct_ni_software")
+        assert daq.hung == [hang]
+        # A hardware settings save rewrites every subsystem's intent; the
+        # laser's stays the pending close.
+        hardware = app_model.loaded_configuration.hardware
+        app_model.update_hardware_configuration(
+            can_enabled=hardware.can_enabled,
+            pellet_controller_enabled=hardware.pellet_controller_enabled,
+            nidaq_enabled=hardware.nidaq_enabled,
+            rfid_reader_enabled=hardware.rfid_reader_enabled,
+            rfid_device=hardware.rfid_device,
+        )
+        status = _laser_status(app_model)
+        assert status.state is SubsystemState.FAILED
+        assert status.error == refusal
 
         daq.hang_released.set()
         _wait_until(lambda: not app_model.laser_controller_close_refusal())
@@ -1117,6 +1131,77 @@ def test_a_retry_over_a_hung_laser_close_is_refused_until_the_close_ends(
         app_model.capture_stop()
 
 
+def test_a_ramp_whose_controller_failed_to_open_shows_the_pending_close_in_idle(
+    app_model, monkeypatch,
+):
+    # The ramp's open fails part-way in Idle, and its close hangs. The watch
+    # held laser work off, but LASER never said so, and the late finish then
+    # wrote "closed, late, after a driver hang" over a status that had never
+    # said the close was pending.
+    daq = _failing_open(monkeypatch, app_model)
+    try:
+        with pytest.raises(RuntimeError, match="refused the laser's shutter line"):
+            app_model.run_laser_calibration_ramp(_ramp(timeout_seconds=0.5))
+
+        assert daq.hung == ["disconnect_terms"]
+        refusal = app_model.laser_controller_close_refusal()
+        assert "still closing after a driver hang" in refusal
+        status = _laser_status(app_model)
+        assert status.state is SubsystemState.FAILED
+        assert status.error == refusal
+
+        daq.hang_released.set()
+        _wait_until(lambda: _laser_status(app_model).state is SubsystemState.STOPPED)
+        assert "failed to open" in _laser_status(app_model).reason
+        assert app_model.laser_controller_close_refusal() == ""
+    finally:
+        daq.hang_released.set()
+
+
+def test_a_stop_and_a_close_entering_together_close_the_laser_once(app_model, monkeypatch):
+    # The check for a close under way and the listing of this one were two
+    # holds of the lock: a Stop and closing that both checked before either
+    # listed its close ran two on one controller.
+    from tools.acquisition.model import app_model as app_model_module
+
+    _system_mode_with_the_fake_laser(app_model, monkeypatch, lasers=_ROUTED_LASER)
+    closes = []
+    close = app_model.laser.close
+
+    def counted_close():
+        closes.append(threading.current_thread().name)
+        return close()
+
+    monkeypatch.setattr(app_model.laser, "close", counted_close)
+    # Both past their first look before either goes on.
+    together = threading.Barrier(2, timeout=2.0)
+    generation = app_model._laser_status_generation
+
+    def meet_then_generation():
+        try:
+            together.wait()
+        except threading.BrokenBarrierError:
+            pass
+        return generation()
+
+    monkeypatch.setattr(app_model, "_laser_status_generation", meet_then_generation)
+    monkeypatch.setattr(app_model_module, "_LASER_CONTROLLER_CLOSE_S", 5.0)
+    try:
+        stop, stop_outcome = _in_thread(
+            app_model._close_laser_within_bound, "System Mode stops")
+        exit_, exit_outcome = _in_thread(
+            app_model._close_laser_within_bound, "reachAQ is closing")
+        for thread in (stop, exit_):
+            thread.join(10.0)
+            assert not thread.is_alive()
+
+        assert (stop_outcome, exit_outcome) == ([None], [None])
+        assert len(closes) == 1
+        assert not app_model.laser.is_connected
+    finally:
+        app_model.capture_stop()
+
+
 def test_a_close_already_under_way_is_waited_for_not_run_twice(app_model, monkeypatch):
     # Stop and closing can each close the laser: one that came while the
     # other's close was still inside its bound ran a second close on the
@@ -1184,7 +1269,9 @@ def test_a_pulse_the_close_gave_up_on_holds_laser_work_off_until_it_ends(
 
         assert not app_model.laser.is_connected
         refusal = app_model.laser_controller_close_refusal()
-        assert "still closing after a driver hang" in refusal
+        # Not "still closing": the close itself has finished.
+        assert refusal.startswith(
+            "a laser operation the close gave up on is still running in the driver")
         assert _laser_status(app_model).error == refusal
         assert app_model.capture_start() is False
         assert _refused_without_the_driver(app_model.load_configuration) == (
@@ -1199,12 +1286,8 @@ def test_a_pulse_the_close_gave_up_on_holds_laser_work_off_until_it_ends(
         app_model.capture_stop()
 
 
-def test_a_run_whose_laser_failed_to_open_waits_for_its_partial_close(
-    app_model, monkeypatch, caplog,
-):
-    # The controller closes what it had opened when opening fails, and that
-    # close had no bound: a driver hung in it hung the Run start. Bounded
-    # now, the laser work behind it is held off until it ends.
+def _failing_open(monkeypatch, app_model):
+    """A laser controller whose open fails part-way, and whose close then hangs."""
     from autotrainer.device import NidaqLaserController, nidaq_laser
 
     monkeypatch.setattr(nidaq_laser, "_FAILED_OPEN_CLOSE_TIMEOUT_S", 0.5)
@@ -1220,6 +1303,30 @@ def test_a_run_whose_laser_failed_to_open_waits_for_its_partial_close(
         raise RuntimeError("DAQmx refused the laser's shutter line")
 
     monkeypatch.setattr(NidaqLaserController, "_connect_trigger_route", connect_then_fail)
+    return daq
+
+
+@pytest.mark.parametrize("wrapped", [False, True], ids=["raised", "wrapped_once"])
+def test_a_run_whose_laser_failed_to_open_waits_for_its_partial_close(
+    app_model, monkeypatch, caplog, wrapped,
+):
+    # The controller closes what it had opened when opening fails, and that
+    # close had no bound: a driver hung in it hung the Run start. Bounded
+    # now, the laser work behind it is held off until it ends, however the
+    # error that says so is wrapped on its way up: read off the top error
+    # alone, one "raise ... from" lost it, and the next Run opened a second
+    # controller over the close still in the driver.
+    daq = _failing_open(monkeypatch, app_model)
+    if wrapped:
+        load = app_model.laser.load_configuration
+
+        def load_or_wrap(*args, **kwargs):
+            try:
+                return load(*args, **kwargs)
+            except Exception as error:
+                raise RuntimeError(f"the laser did not load: {error}") from error
+
+        monkeypatch.setattr(app_model.laser, "load_configuration", load_or_wrap)
     caplog.set_level("CRITICAL")
     start_thread, start_outcome = _in_thread(app_model.capture_start)
     try:
