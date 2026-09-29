@@ -403,6 +403,27 @@ def test_a_digital_line_on_a_board_that_cannot_clock_it_is_refused_by_name():
     assert "Output, which cannot clock digital input" in plan.reason
 
 
+def test_a_plan_refused_for_a_line_keeps_the_master_it_would_have_had():
+    # What reads the clock's board off a refused plan, Run's laser route
+    # check, gets the plan's own choice: cam_frames' board over the first
+    # analog input's, as a valid plan would have it.
+    clocks = _pxi("Clocks", 41)
+    lines = dataclasses.replace(_pxi("Lines", 42), digital_input_max_rate=None)
+
+    plan = build_nidaq_timing_plan(
+        _stream(("laser_feedback", "Clocks/ai0", "analog"),
+                ("cam_frames", "Lines/port0/line0", "digital")),
+        NidaqTimingConfiguration(),
+        (clocks, lines),
+    )
+
+    assert not plan.is_valid
+    assert "Lines, which cannot clock digital input" in plan.reason
+    assert plan.master_device == "Lines"
+    # Nothing starts on it: a refused plan runs no task.
+    assert plan.sample_clock_source is None
+
+
 def test_christielab10s_plan_is_unchanged_by_the_digital_clock_rule():
     # Every stream line is on the 6221, which clocks digital input at 1 MHz.
     # The 6713, which cannot, carries only the lasers' outputs, and is not

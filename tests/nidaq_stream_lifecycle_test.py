@@ -560,6 +560,27 @@ def test_a_replaced_workers_startup_timeout_is_a_warning_naming_it(caplog):
     assert monitor.error_message == ""
 
 
+@pytest.mark.parametrize(("current", "level"), [(False, "WARNING"), (True, "ERROR")])
+def test_a_relayed_worker_log_is_capped_at_warning_once_the_worker_is_replaced(
+    caplog, current, level,
+):
+    # The worker's own logger.exception, as when it fails or fails to close
+    # its tasks, was relayed at ERROR whichever worker it came from: on the
+    # status bar over a healthy newer one.
+    messages = queue.Queue()
+    messages.put(("log", (
+        logging.ERROR, "tools.acquisition.model.nidaq_signal_monitor_model",
+        "Failed to close the NI-DAQ signal stream", False)))
+    messages.put(("stopped", None))
+
+    _monitor_thread_log(caplog, _EndedProcess(4545), messages, current=current)
+
+    relayed, = [record for record in caplog.records
+                if "Failed to close the NI-DAQ signal stream" in record.getMessage()]
+    assert relayed.levelname == level
+    assert "pid=4545" in relayed.getMessage()
+
+
 def test_the_current_workers_error_is_an_error_naming_it(caplog):
     messages = queue.Queue()
     messages.put(("error", "the task failed"))
@@ -719,7 +740,7 @@ def test_a_repeated_idle_refusal_is_said_each_time(nidaq_app, monkeypatch):
     # "configured; not started" while every start was refused.
     reason = _refused_idle_start(nidaq_app, monkeypatch)
 
-    nidaq_app.capture_start()
+    assert nidaq_app.capture_start() is True
     nidaq_app.capture_stop()
     _settle(nidaq_app, running=False)
     _refused_again(nidaq_app, reason)
@@ -750,7 +771,10 @@ def test_run_still_lists_a_laser_route_problem_after_an_idle_refusal(
 ):
     # The Idle refusal left an invalid plan with no clock on the monitor, and
     # Run's check read the clock's board off it: the laser's missing route
-    # went unlisted beside the refused line.
+    # went unlisted beside the refused line. The board that clock is on is
+    # the plan's own master: here cam_frames' board, Dev2, which the plan
+    # prefers to Dev1, the first analog input's. Guessed "first analog", the
+    # laser on Dev1 looked clocked from its own board, and went unlisted.
     from autotrainer.core import NidaqSignalChannelConfiguration, NidaqSignalStreamConfiguration
     from tools.acquisition.model import app_model as app_model_module
     from tools.acquisition.model.nidaq_routing import UNIDENTIFIED
@@ -762,7 +786,8 @@ def test_run_still_lists_a_laser_route_problem_after_an_idle_refusal(
             digital_inputs=(f"{name}/port0/line0",), **values)
 
     devices = (
-        board("Dev1", analog_inputs=("Dev1/ai0",), digital_input_max_rate=1_000_000.0),
+        board("Dev1", analog_inputs=("Dev1/ai0",), analog_outputs=("Dev1/ao0",),
+              digital_input_max_rate=1_000_000.0),
         board("Dev2", analog_outputs=("Dev2/ao0",)),
     )
     discover = lambda: (devices, None)  # noqa: E731
@@ -773,7 +798,7 @@ def test_run_still_lists_a_laser_route_problem_after_an_idle_refusal(
         is_enabled=True)
     system_config.laser = LaserSystemConfiguration.from_channels(
         (LaserChannelConfiguration(
-            channel_id=LaserChannelId.LASER_1, analog_output="Dev2/ao0",
+            channel_id=LaserChannelId.LASER_1, analog_output="Dev1/ao0",
             diode_input="Dev1/ai0", shutter_output="Dev1/port0/line0"),),
         hardware_timed=True, sample_rate_hz=10_000.0)
     system_config.save_default(trainer_config_dir)
@@ -783,13 +808,16 @@ def test_run_still_lists_a_laser_route_problem_after_an_idle_refusal(
     try:
         assert app_model.load_configuration() is True
         _settle(app_model, running=False)
-        assert monitor.timing_plan is not None and not monitor.timing_plan.is_valid
+        plan = monitor.timing_plan
+        assert plan is not None and not plan.is_valid
+        assert plan.master_device == "Dev2"
 
         assert app_model._start_nidaq_domain(restart=True) is False
 
         error = _nidaq_state(app_model).error
         assert "Dev2, which cannot clock digital input" in error
-        assert "laser channel 1 output" in error and "no explicit route" in error
+        assert "laser channel 1 output" in error and "is clocked from Dev2" in error
+        assert "no explicit route" in error
     finally:
         _close_stream(app_model, monitor)
 
@@ -945,6 +973,60 @@ def independent_app(app_model, system_config, trainer_config_dir, monkeypatch):
     try:
         yield app_model
     finally:
+        rule = vars(app_model).get("_nidaq_stream_autostart")
+        if rule is not None:
+            rule.close()
+        monitor.close()
+
+
+def test_a_laser_on_independent_boards_does_not_fail_run_over_a_route_it_never_uses(
+    app_model, system_config, trainer_config_dir, monkeypatch,
+):
+    # Independent boards share no clock, and the laser's output runs on its
+    # own (NidaqLaserController gives it no shared clock). Fix round 1 gave a
+    # valid plan with no shared clock a guessed one, and Run then failed
+    # NI-DAQ over a route this mode never uses; it read "blocked", as a
+    # diagnostic preview, before that, and does again. Here the validation
+    # is the real one: the fixture above stubs it out.
+    from tools.acquisition.model import app_model as app_model_module
+
+    system_config.hardware.nidaq_enabled = True
+    system_config.nidaq_ports = NidaqPortConfiguration(
+        cam_frames="Dev1/port0/line0",
+        tone1="Dev2/port0/line0",
+        timing=NidaqTimingConfiguration(
+            sync_mode="independent", require_hardware_synchronization=False),
+    )
+    system_config.laser = LaserSystemConfiguration.from_channels(
+        (LaserChannelConfiguration(
+            channel_id=LaserChannelId.LASER_1, analog_output="Dev2/ao0",
+            diode_input="Dev2/ai0", shutter_output="Dev2/port0/line1"),),
+        hardware_timed=True, sample_rate_hz=10_000.0)
+    system_config.save_default(trainer_config_dir)
+
+    def board(name, **values):
+        # On no shared bus: the boards can share no clock.
+        return NidaqDevicePorts(
+            name=name, counter_outputs=(f"{name}/ctr0",),
+            digital_inputs=(f"{name}/port0/line0",),
+            digital_input_max_rate=1_000_000.0, **values)
+
+    devices = (board("Dev1"), board("Dev2", analog_outputs=("Dev2/ao0",)))
+    discover = lambda: (devices, None)  # noqa: E731
+    monitor = _with_fake_worker(app_model)
+    monitor._device_discovery = discover
+    monkeypatch.setattr(app_model_module, "discover_nidaq_devices", discover)
+    try:
+        assert app_model.load_configuration() is True
+        assert _settle(app_model).timing_plan.resolved_mode == "independent"
+
+        assert app_model.capture_start() is True
+
+        status = _nidaq_state(app_model)
+        assert status.state is SubsystemState.BLOCKED, status
+        assert "independent device clocks" in status.reason
+    finally:
+        app_model.capture_stop()
         rule = vars(app_model).get("_nidaq_stream_autostart")
         if rule is not None:
             rule.close()

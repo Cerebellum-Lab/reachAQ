@@ -364,20 +364,25 @@ def validate_nidaq_configuration(
     return tuple(issues)
 
 
-def stream_clock_source(stream) -> Optional[str]:
-    """The sample clock a plan would give `stream` by default, for want of a plan.
+def refused_plan_clock_source(plan, timing) -> Optional[str]:
+    """A terminal on the board a refused plan's shared clock would come from.
 
-    Its first analog input's board, or its first line's: the board the plan
-    makes master when nothing else is asked for. A start the plan refused
+    Only its board is read (validate_output_timing). A start the plan refused
     leaves no clock on it, and the laser's route check, which reads the
-    clock's board off the plan, went unasked beside the refusal.
+    clock's board off the plan, went unasked beside the refusal. The plan
+    keeps the master it would have had (build_nidaq_timing_plan), and a mode
+    that shares a clock puts it there, unless `timing` names the clock
+    itself. None otherwise, as for a valid plan with no shared clock: no
+    plan, a valid one (its own clock is the one to read), a refused plan with
+    no master, or independent boards, which share no clock at all.
     """
-    channels = tuple(getattr(stream, "channels", ()) or ())
-    for channel in sorted(channels, key=lambda item: getattr(item, "kind", "") != "analog"):
-        device = _device_of(getattr(channel, "physical_channel", ""))
-        if device:
-            return f"/{device}/ai/SampleClock"
-    return None
+    if plan is None or plan.is_valid or plan.requested_mode == "independent":
+        return None
+    explicit = getattr(timing, "sample_clock_source", None)
+    if explicit:
+        return explicit
+    master = getattr(plan, "master_device", None)
+    return f"/{master}/ai/SampleClock" if master else None
 
 
 def require_valid_nidaq_configuration(devices, **kwargs) -> None:
