@@ -76,6 +76,9 @@ class LaserModel(ObservableObject):
         #: What closing says an output may still hold when the controller
         #: cannot be closed.
         self._last_command_volts = {}
+        #: How many commands have been recorded for each channel: a pulse's
+        #: end resets its command only if nothing newer was recorded.
+        self._command_records = {}
         #: Controllers this model closed whose close stopped waiting for a
         #: pulse train or a ramp that had not ended (work_left_running).
         self._closed_with_work_left = []
@@ -98,6 +101,32 @@ class LaserModel(ObservableObject):
 
     def _record_command(self, channel_id, volts: float) -> None:
         self._last_command_volts[int(channel_id)] = float(volts)
+        self._command_records[int(channel_id)] = (
+            self._command_records.get(int(channel_id), 0) + 1)
+
+    def _record_baseline_when_completed(self, operation, channel_ids) -> None:
+        """An armed or trial pulse's outputs are at their minimum once it completes.
+
+        As a waited-for pulse's are when it returns. Only for a channel with
+        no newer command recorded since, and only on completion: a pulse
+        cancelled or failed may have left its amplitude on the output.
+        """
+        add_terminal_callback = getattr(operation, "add_terminal_callback", None)
+        if add_terminal_callback is None:
+            return
+        marks = {
+            int(channel_id): self._command_records.get(int(channel_id), 0)
+            for channel_id in channel_ids
+        }
+
+        def completed(ended):
+            if getattr(getattr(ended, "state", None), "value", None) != "completed":
+                return
+            self._record_baseline(
+                channel_id for channel_id, mark in marks.items()
+                if self._command_records.get(channel_id, 0) == mark)
+
+        add_terminal_callback(completed)
 
     def _record_baseline(self, channel_ids) -> None:
         """A waited-for pulse train has returned: its outputs are at their minimum."""
@@ -313,9 +342,12 @@ class LaserModel(ObservableObject):
         for channel_pulse in pulse_train.pulse_trains:
             self._record_command(channel_pulse.channel_id, channel_pulse.amplitude_volts)
         operation = controller.run_synchronized_pulse_train(pulse_train)
+        channel_ids = tuple(
+            channel_pulse.channel_id for channel_pulse in pulse_train.pulse_trains)
         if pulse_train.wait:
-            self._record_baseline(
-                channel_pulse.channel_id for channel_pulse in pulse_train.pulse_trains)
+            self._record_baseline(channel_ids)
+        elif operation is not None:
+            self._record_baseline_when_completed(operation, channel_ids)
         for channel_pulse in pulse_train.pulse_trains:
             self.trace_received(self._make_pulse_trace(channel_pulse))
         return operation
@@ -369,6 +401,7 @@ class LaserModel(ObservableObject):
         operation = controller.run_synchronized_pulse_train(synchronized)
         if operation is None:
             raise RuntimeError("Protocol laser preparation did not return an operation")
+        self._record_baseline_when_completed(operation, (pulse.channel_id,))
         operation_record = operation.to_record()
         timing_status = operation_record.get("timing_status") or {}
         required_status = (

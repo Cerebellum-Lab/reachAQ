@@ -47,6 +47,21 @@ _FAILED_OPEN_CLOSE_TIMEOUT_S = 15.0
 _ROUTE_SETTLE_WAIT_S = 1.0
 
 
+class LaserControllerStillClosing(RuntimeError):
+    """A controller failed to open, and its close of what it had opened goes on.
+
+    Inside the driver, past the constructor's bound. Raised from the open's
+    own error, whose text it keeps, as its cause. `still_closing` is set when
+    that close ends; until then laser work over the same lines must wait. A
+    caller that wraps this keeps it on the error's chain, where it is found
+    whatever the wrapping (the application walks __cause__ and __context__).
+    """
+
+    def __init__(self, error: BaseException, still_closing: threading.Event):
+        super().__init__(str(error) or error.__class__.__name__)
+        self.still_closing = still_closing
+
+
 class LaserOperationState(str, enum.Enum):
     PREPARED = "prepared"
     ARMED = "armed"
@@ -354,7 +369,7 @@ class NidaqLaserController:
             if still_closing is not None:
                 # For the caller, which never holds this controller: set when
                 # that close ends, and laser work waits for it until then.
-                error.still_closing = still_closing
+                raise LaserControllerStillClosing(error, still_closing) from error
             raise
 
     def _close_after_failed_open(self) -> Optional[threading.Event]:
@@ -524,13 +539,19 @@ class NidaqLaserController:
             finally:
                 # Terminal whatever ended it, a BaseException too: an operation
                 # left live owns its output, and every pulse on it after that
-                # is refused.
+                # is refused. Stored as an Exception: wait() raises the stored
+                # error, and close(), waiting on the operation, catches only
+                # Exception; given a KeyboardInterrupt it skipped the reset.
+                # This thread still raises the original, above.
                 if operation.state is LaserOperationState.CANCELLED:
                     operation._finish_terminal()
                 elif ended_by is None:
                     operation._complete()
-                else:
+                elif isinstance(ended_by, Exception):
                     operation._fail(ended_by)
+                else:
+                    operation._fail(RuntimeError(
+                        f"the pulse train was interrupted ({type(ended_by).__name__})"))
 
         if pulse_train.wait:
             # On the caller's thread, which it still blocks.

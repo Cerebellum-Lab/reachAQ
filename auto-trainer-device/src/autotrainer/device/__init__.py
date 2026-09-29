@@ -27,7 +27,8 @@ from .laser import (LaserCalibrationPoint, LaserCalibrationRamp, LaserChannelCon
                     LaserControllerProtocol, LaserDiodePowerCurve, LaserFeedbackSample, LaserPulseTrain,
                     LaserSynchronizedPulseTrain, LaserSystemConfiguration, NullLaserController,
                     normalize_laser_channel_id)
-from .nidaq_laser import LaserOperationState, NidaqLaserController, NidaqLaserOperation
+from .nidaq_laser import (LaserControllerStillClosing, LaserOperationState, NidaqLaserController,
+                          NidaqLaserOperation)
 from .nidaq_signal_stream import NidaqSignalSampleBlock, NidaqSignalStreamController
 from .rfid_reader import (
     DEFAULT_RFID_DEVICE,

@@ -17,6 +17,7 @@ import pytest
 from autotrainer.device import (
     LaserCalibrationRamp,
     LaserChannelId,
+    LaserControllerStillClosing,
     LaserPulseTrain,
     NidaqLaserController,
 )
@@ -195,13 +196,17 @@ def test_a_controller_that_fails_to_open_closes_within_a_bound(monkeypatch):
     monkeypatch.setattr(NidaqLaserController, "_connect_trigger_route", connect_then_fail)
     try:
         started = time.monotonic()
-        with pytest.raises(RuntimeError, match="refused the laser's shutter line") as refused:
+        with pytest.raises(LaserControllerStillClosing,
+                           match="refused the laser's shutter line") as refused:
             NidaqLaserController(rig_lasers(
                 trigger_source="/PXI1Slot4/PXI_Trig0",
                 trigger_route_source="/PXI1Slot5/PFI0"))
 
         assert time.monotonic() - started < 2.0
         assert daq.hung == ["disconnect_terms"]
+        # A type of its own, which a caller finds however the error is
+        # wrapped; the open's own error is its cause.
+        assert "refused the laser's shutter line" in str(refused.value.__cause__)
         still_closing = refused.value.still_closing
         assert not still_closing.is_set()
         daq.hang_released.set()
@@ -225,7 +230,7 @@ def test_a_controller_that_fails_to_open_and_closes_says_nothing_more(monkeypatc
         NidaqLaserController(rig_lasers(
             trigger_source="/PXI1Slot4/PXI_Trig0", trigger_route_source="/PXI1Slot5/PFI0"))
 
-    assert not hasattr(refused.value, "still_closing")
+    assert not isinstance(refused.value, LaserControllerStillClosing)
     assert daq.disconnected == [TRIGGER_ROUTE]
 
 
