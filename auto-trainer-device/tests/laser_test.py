@@ -376,7 +376,7 @@ def test_nonblocking_laser_operation_is_owned_until_terminal(monkeypatch):
     operation.add_terminal_callback(lambda value: terminal.append(value.state))
     assert operation.state is LaserOperationState.ARMED
     assert operation.operation_id in controller._live_operations
-    with pytest.raises(RuntimeError, match="already owned"):
+    with pytest.raises(RuntimeError, match="is in use by laser operation"):
         controller.run_synchronized_pulse_train(pulse)
 
     release.set()

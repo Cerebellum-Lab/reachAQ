@@ -323,6 +323,9 @@ _LASER_CLOSE_PENDING_REFUSAL = (
     "the laser controller is still closing after a driver hang; make the "
     "laser safe by hand, and restart reachAQ if this does not clear"
 )
+#: Why laser work is refused while a controller close is still within its
+#: bound.
+_LASER_CLOSING_REFUSAL = "the laser controller is closing; wait for it to finish"
 #: Where the GUI's operator fixes a refused NI-DAQ plan.
 _GUI_NIDAQ_PLAN_REMEDY = "fix it in Edit → Edit DAQ Ports"
 
@@ -380,9 +383,14 @@ class _BoundedClose:
             if late and self._on_late_finish is not None:
                 self._on_late_finish(self)
 
-    def failure(self, timeout: float) -> str:
-        """What went wrong, completing "The <name> ...", or empty if nothing."""
-        if not self.done.is_set():
+    def failure(self, timeout: float, finished: bool) -> str:
+        """What went wrong, completing "The <name> ...", or empty if nothing.
+
+        `finished` is what run() returned. Read from `done` afterwards, a
+        close that ended just past the bound read as a clean one: nothing was
+        reported, while its late finish said it had been given up on.
+        """
+        if not finished:
             return f"did not close within {timeout:.1f} s"
         if self.error is not None:
             return "failed to close ({})".format(
@@ -824,6 +832,10 @@ class AppModel(ObservableObject):
         #: still inside the driver; laser work is refused while there is one.
         self._pending_laser_closes: List[_BoundedClose] = []
         self._pending_laser_closes_lock = threading.Lock()
+        #: Held while LASER's status is set from whether a close is pending,
+        #: by Stop and by a close's late finish, so neither lands over the
+        #: other out of order. Reentrant: the write announces the statuses.
+        self._laser_close_status_lock = threading.RLock()
         #: Written by tools/hardware/verify_nidaq_wiring.py, read here.
         #: It sits beside the configuration it describes rather than in
         #: it, so it can be regenerated without touching a hand-edited
@@ -6597,14 +6609,20 @@ class AppModel(ObservableObject):
                 # the stream is stopped, and a stop that raised left it held.
                 self._nidaq_stream_autostart.pause(
                     _LASER_CALIBRATION, _LASER_CALIBRATION_REASON)
-                controller = self._laser.open_controller(
-                    self._runtime_laser_configuration(configuration),
-                    timing_plan=(
-                        self._nidaq_signal_monitor.timing_plan
-                        if configuration.hardware_timed
-                        else None
-                    ),
-                )
+                try:
+                    controller = self._laser.open_controller(
+                        self._runtime_laser_configuration(configuration),
+                        timing_plan=(
+                            self._nidaq_signal_monitor.timing_plan
+                            if configuration.hardware_timed
+                            else None
+                        ),
+                    )
+                except Exception as error:
+                    # Its partial close may go on past the ramp's end, which
+                    # clears the ramp's own refusal.
+                    self._watch_failed_open_close(error, "The ramp stops")
+                    raise
                 with self._laser_calibration_lock:
                     self._laser_calibration_controller = controller
                     self._laser_calibration_opened = True
@@ -6712,8 +6730,8 @@ class AppModel(ObservableObject):
         closing = _BoundedClose(
             lambda: self._close_laser_calibration_controller(keep_error=False),
             "laser calibration controller")
-        closing.run(_LASER_CALIBRATION_FORCED_CLOSE_S)
-        failure = closing.failure(_LASER_CALIBRATION_FORCED_CLOSE_S)
+        finished = closing.run(_LASER_CALIBRATION_FORCED_CLOSE_S)
+        failure = closing.failure(_LASER_CALIBRATION_FORCED_CLOSE_S, finished)
         if not failure and closing.result:
             return  # Closed cleanly: the laser was reset.
         with self._laser_calibration_lock:
@@ -6767,16 +6785,72 @@ class AppModel(ObservableObject):
     def laser_controller_close_refusal(self) -> str:
         """Why laser work is refused, or an empty string.
 
-        While a System Mode controller close given up on is still inside the
-        driver. The laser model still holds that controller then, and Run,
-        Run Pulse, Test stim, a ramp or a refresh would call into the driver
-        that hung, or open a second controller over the same lines. Clears
-        by itself when the close ends.
+        While a System Mode controller close is still running: the laser
+        model still holds that controller, and Run, Run Pulse, Test stim, a
+        ramp, a refresh, a configuration load or a DAQ ports save would call
+        into its driver, or open a second controller over the same lines.
+        Past its bound, in a driver that hung, that close stays pending until
+        it ends, and so do a partial close of a controller that failed to
+        open and a pulse train or ramp a close stopped waiting for (each
+        watched as a close given up on). Clears by itself when they end.
         """
         with self._pending_laser_closes_lock:
-            pending = any(closing.given_up and not closing.done.is_set()
-                          for closing in self._pending_laser_closes)
-        return _LASER_CLOSE_PENDING_REFUSAL if pending else ""
+            unfinished = [closing for closing in self._pending_laser_closes
+                          if not closing.done.is_set()]
+        if any(closing.given_up for closing in unfinished):
+            return _LASER_CLOSE_PENDING_REFUSAL
+        return _LASER_CLOSING_REFUSAL if unfinished else ""
+
+    def _laser_close_given_up_pending(self) -> bool:
+        with self._pending_laser_closes_lock:
+            return any(closing.given_up and not closing.done.is_set()
+                       for closing in self._pending_laser_closes)
+
+    def _laser_status_generation(self) -> int:
+        with self._acquisition.lock:
+            status = self._acquisition.subsystems.get(SubsystemId.LASER)
+        return 0 if status is None else status.generation
+
+    def _watch_given_up_laser_close(self, wait: Callable[[], object], name: str,
+                                    ended: str) -> bool:
+        """Hold laser work off until `wait` returns; whether it had not yet.
+
+        For what goes on inside the driver after the close that started it
+        has returned: listed as a close given up on, so every refusal and the
+        LASER status follow it, and taken off, and said, when it ends.
+        """
+        generation = self._laser_status_generation()
+        watch = _BoundedClose(
+            wait, name,
+            on_late_finish=lambda closing: self._on_laser_close_finished_late(
+                closing, generation, ended))
+        with self._pending_laser_closes_lock:
+            self._pending_laser_closes.append(watch)
+        if watch.run(0.0):
+            with self._pending_laser_closes_lock:
+                if watch in self._pending_laser_closes:
+                    self._pending_laser_closes.remove(watch)
+            return False
+        return True
+
+    def _watch_failed_open_close(self, error: BaseException, going_on: str) -> None:
+        """Hold laser work off while a controller that failed to open closes.
+
+        NidaqLaserController closes what it had opened when opening fails,
+        bounded; past the bound that close goes on inside the driver, and
+        the error it raises carries an event set when it ends.
+        """
+        still_closing = getattr(error, "still_closing", None)
+        if still_closing is None:
+            return
+        if self._watch_given_up_laser_close(
+                still_closing.wait, "laser controller that failed to open",
+                "The laser controller that failed to open finished closing"):
+            logger.critical(
+                "The laser controller that failed to open is still closing what "
+                "it had opened, inside the driver. Its outputs may still hold a "
+                "command, and its shutters may be open: make the laser safe by "
+                "hand. %s without it.", going_on)
 
     def _close_laser_within_bound(self, going_on: str) -> None:
         """Close System Mode's laser controller, waiting for it with a bound.
@@ -6786,7 +6860,15 @@ class AppModel(ObservableObject):
         hung Stop, or exit, with nothing said. `going_on` completes the
         CRITICAL's "... without it", such as "System Mode stops".
         """
-        if self.laser_controller_close_refusal():
+        with self._pending_laser_closes_lock:
+            under_way = [closing for closing in self._pending_laser_closes
+                         if not closing.done.is_set() and not closing.given_up]
+        for closing in under_way:
+            # Stop and closing can overlap: a close already running is this
+            # one, waited for as long as it is bounded, not run a second time
+            # on the same controller at once.
+            closing.done.wait(_LASER_CONTROLLER_CLOSE_S)
+        if self._laser_close_given_up_pending():
             # Not started again over the one still in the driver, which would
             # hang the same way; that one's CRITICAL has been logged.
             logger.error(
@@ -6798,18 +6880,22 @@ class AppModel(ObservableObject):
             return
         channels = self._laser.configuration.channels
         commands = self._laser.last_command_volts
+        generation = self._laser_status_generation()
         closing = _BoundedClose(
             self._laser.close, "laser controller",
-            on_late_finish=self._on_laser_close_finished_late)
+            on_late_finish=lambda closing: self._on_laser_close_finished_late(
+                closing, generation, "The laser controller finished closing"))
         # Listed before it runs, so that one ending just past its bound is
         # still found and taken off by _on_laser_close_finished_late.
         with self._pending_laser_closes_lock:
             self._pending_laser_closes.append(closing)
-        if closing.run(_LASER_CONTROLLER_CLOSE_S):
+        finished = closing.run(_LASER_CONTROLLER_CLOSE_S)
+        if finished:
             with self._pending_laser_closes_lock:
                 if closing in self._pending_laser_closes:
                     self._pending_laser_closes.remove(closing)
-        failure = closing.failure(_LASER_CONTROLLER_CLOSE_S)
+            self._watch_laser_work_left_running()
+        failure = closing.failure(_LASER_CONTROLLER_CLOSE_S, finished)
         if not failure:
             return
         lasers = ", ".join(
@@ -6827,25 +6913,73 @@ class AppModel(ObservableObject):
             going_on,
         )
 
-    def _on_laser_close_finished_late(self, closing: "_BoundedClose") -> None:
-        """A close given up on has ended: laser work may start again."""
+    def _watch_laser_work_left_running(self) -> None:
+        """Hold laser work off until what a close stopped waiting for ends.
+
+        The controller's close waits a bounded time for each pulse train it
+        cancels, and for a ramp to let go; past that it goes on, and that
+        work can still act on the lines, releasing a route or writing a line,
+        after a new controller has opened on them.
+        """
+        left = self._laser.work_left_running_after_close()
+        if left and self._watch_given_up_laser_close(
+                self._laser.wait_for_work_left_running_after_close,
+                "laser work its close left running",
+                "What the laser controller's close left running ended"):
+            logger.error(
+                "The laser controller closed without %s, which had not ended; "
+                "laser work is refused until it does", ", ".join(left))
+
+    def _on_laser_close_finished_late(
+        self, closing: "_BoundedClose", generation: int, ended: str,
+    ) -> None:
+        """A close given up on has ended: laser work may start again.
+
+        LASER's status is set with the generation the close began in, so that
+        a start made since keeps its own. Not "stopped" while System Mode is
+        on: that close was a failed start's, and the laser stays failed until
+        Refresh Hardware opens it again.
+        """
         with self._pending_laser_closes_lock:
             if closing in self._pending_laser_closes:
                 self._pending_laser_closes.remove(closing)
         logger.warning(
-            "The laser controller finished closing after it was given up on%s",
+            "%s after it was given up on%s", ended,
             "" if closing.error is None
-            else f", with an error ({closing.failure(0.0)}); see above")
-        # Tells the laser panel and the menus, which follow the statuses.
-        self._set_subsystem_status(
-            SubsystemId.LASER,
-            (
-                SubsystemState.DISABLED
-                if self._laser.configuration.backend == "disabled"
-                else SubsystemState.STOPPED
-            ),
-            reason="laser controller closed, late, after a driver hang",
-        )
+            else f", with an error ({closing.failure(0.0, True)}); see above")
+        if self._laser.work_left_running_after_close():
+            # A late close that left a pulse or a ramp still running.
+            self._watch_laser_work_left_running()
+        acquisition = self._acquisition
+        with self._laser_close_status_lock:
+            if self.laser_controller_close_refusal():
+                # Another is still pending; its own end sets the status.
+                return
+            with acquisition.lock:
+                system_mode_on = (
+                    (acquisition.starting or acquisition.started)
+                    and not acquisition.stopping)
+            if system_mode_on:
+                self._set_subsystem_status(
+                    SubsystemId.LASER,
+                    SubsystemState.FAILED,
+                    error=(
+                        "the laser controller finished closing late, after a "
+                        "driver hang; Refresh Hardware can open it again"),
+                    generation=generation,
+                )
+                return
+            # Tells the laser panel and the menus, which follow the statuses.
+            self._set_subsystem_status(
+                SubsystemId.LASER,
+                (
+                    SubsystemState.DISABLED
+                    if self._laser.configuration.backend == "disabled"
+                    else SubsystemState.STOPPED
+                ),
+                reason="laser controller closed, late, after a driver hang",
+                generation=generation,
+            )
 
     def _start_nidaq_domain(self, *, timeout: float = 12.0, restart: bool = False) -> bool:
         """Start the NI-DAQ domain; `restart` replaces a stream already running.
@@ -7041,6 +7175,19 @@ class AppModel(ObservableObject):
                 reason="laser disabled",
             )
             return False
+        # Not over a close still running, for a Run as for a retry: opening
+        # closes the laser model's controller first, calling into the driver
+        # that hung, and a second controller would go over the same lines.
+        # Before the generation moves on, so that the close's late finish
+        # still sets the status (_on_laser_close_finished_late).
+        close_refusal = self.laser_controller_close_refusal()
+        if close_refusal:
+            self._set_subsystem_status(
+                SubsystemId.LASER,
+                SubsystemState.FAILED,
+                error=f"laser controller not opened: {close_refusal}",
+            )
+            return False
         generation = self._begin_subsystem_start(
             SubsystemId.LASER,
             reason="opening laser controller",
@@ -7073,12 +7220,15 @@ class AppModel(ObservableObject):
             error = str(exc) or exc.__class__.__name__
             logger.exception("Laser initialization failed")
             self._close_laser_within_bound("System Mode goes on")
-            self._set_subsystem_status(
-                SubsystemId.LASER,
-                SubsystemState.FAILED,
-                error=error,
-                generation=generation,
-            )
+            self._watch_failed_open_close(exc, "System Mode goes on")
+            with self._laser_close_status_lock:
+                close_refusal = self.laser_controller_close_refusal()
+                self._set_subsystem_status(
+                    SubsystemId.LASER,
+                    SubsystemState.FAILED,
+                    error=f"{error}; {close_refusal}" if close_refusal else error,
+                    generation=generation,
+                )
             return False
         self._set_subsystem_status(
             SubsystemId.LASER,
@@ -7858,15 +8008,23 @@ class AppModel(ObservableObject):
             logger.exception("Failed to stop the direct laser trigger receiver: %s", err)
         self._close_laser_within_bound("System Mode stops")
         self._log_stim_latency_budget()
-        self._set_subsystem_status(
-            SubsystemId.LASER,
-            (
-                SubsystemState.DISABLED
-                if self._laser.configuration.backend == "disabled"
-                else SubsystemState.STOPPED
-            ),
-            reason="laser controller stopped",
-        )
+        with self._laser_close_status_lock:
+            # Not "stopped" while its close is still inside the driver; the
+            # close's late finish says when it ends.
+            close_refusal = self.laser_controller_close_refusal()
+            if close_refusal:
+                self._set_subsystem_status(
+                    SubsystemId.LASER, SubsystemState.FAILED, error=close_refusal)
+            else:
+                self._set_subsystem_status(
+                    SubsystemId.LASER,
+                    (
+                        SubsystemState.DISABLED
+                        if self._laser.configuration.backend == "disabled"
+                        else SubsystemState.STOPPED
+                    ),
+                    reason="laser controller stopped",
+                )
 
         self._set_subsystem_status(
             SubsystemId.NIDAQ_STREAM,
@@ -7993,6 +8151,12 @@ class AppModel(ObservableObject):
 
     @_serialized_session_configuration
     def load_configuration(self, location: Optional[Path] = None, *, random_cameras: bool = False):
+        # A load closes the laser model's controller: over a close still
+        # inside the driver it would call into the driver that hung, part-way
+        # through the load. Refused before anything is held or applied.
+        close_refusal = self.laser_controller_close_refusal()
+        if close_refusal:
+            raise RuntimeError(f"Loading a configuration is unavailable: {close_refusal}")
         # The input stream now runs while idle, and the timing below is
         # refused while it runs, so it is held stopped for the load and starts
         # again from the new plan afterwards. In System Mode it belongs to the
@@ -8313,6 +8477,11 @@ class AppModel(ObservableObject):
         self._require_session_ready_for_configuration(
             "Changing the DAQ port configuration"
         )
+        # As for a load: saving the ports closes the laser model's controller.
+        close_refusal = self.laser_controller_close_refusal()
+        if close_refusal:
+            raise RuntimeError(
+                f"Changing the DAQ port configuration is unavailable: {close_refusal}")
         if self._loaded_configuration is None:
             raise RuntimeError("Cannot update DAQ port configuration before a system configuration is loaded")
         # Held stopped while the plan changes, then started on the new one.

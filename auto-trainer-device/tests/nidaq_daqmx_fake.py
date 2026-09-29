@@ -96,6 +96,8 @@ class FakeTask:
         ))
 
     def start(self):
+        if self.daq.before_start is not None:
+            self.daq.before_start(self)
         self.daq.fail_start(self)
         self._reserve()
         self.started = True
@@ -198,6 +200,9 @@ class FakeDaqmx:
         #: Called with the task at the start of each control(), before it
         #: acts: where a test holds an abort to interleave it.
         self.before_control = None
+        #: Called with the task at the start of each start(), before it
+        #: acts: where a test holds a start, as a driver slow to start one.
+        self.before_start = None
         #: A task, by name suffix, whose abort fails while it is still open.
         self.failing_abort = None
         #: Routes, as (source, destination), the driver will not disconnect.
