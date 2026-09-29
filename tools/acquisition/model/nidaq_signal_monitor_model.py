@@ -680,9 +680,19 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
                 elif kind == _WORKER_LOG:
                     level, logger_name, message, always_console = payload
                     extra = {ALWAYS_CONSOLE_LOG_ATTRIBUTE: True} if always_console else None
+                    label = "NI-DAQ worker pid=%s | %s"
+                    with self._lock:
+                        current = process is self._process
+                    if not current and level > logging.WARNING:
+                        # A replaced worker's failure, as when it fails to
+                        # close its tasks, is not the running stream's: at
+                        # most a warning, as its other messages are
+                        # (_log_worker_message).
+                        level = logging.WARNING
+                        label = "NI-DAQ worker pid=%s, stopped or replaced | %s"
                     logging.getLogger(logger_name).log(
                         level,
-                        "NI-DAQ worker pid=%s | %s",
+                        label,
                         process.pid,
                         message,
                         extra=extra,

@@ -163,7 +163,7 @@ from tools.acquisition.model.nidaq_channel_plan import build_nidaq_acquisition_c
 from tools.acquisition.model.nidaq_validation import (
     chassis_identification_note,
     require_valid_nidaq_configuration,
-    stream_clock_source,
+    refused_plan_clock_source,
 )
 from tools.acquisition.model.nidaq_wiring_verification import (
     WiringVerification,
@@ -7151,19 +7151,20 @@ class AppModel(ObservableObject):
             return
         # A plan a refused start left has no clock, and the laser's route
         # check reads the clock's board off the plan: it went unasked beside
-        # the refusal. Such a plan is not taken as the timing plan.
+        # the refusal. Only then is a clock put in: the one the refused plan's
+        # own master would have given. With no plan yet, and with a valid one
+        # that shares no clock (one board, or independent boards), the check
+        # is skipped, as it always was; independent boards run the laser on
+        # its own clock, and failed Run over a route that mode never uses.
         plan = self._nidaq_signal_monitor.timing_plan
-        clock_source = (
-            plan.sample_clock_source
-            if plan is not None and plan.is_valid and plan.sample_clock_source
-            else stream_clock_source(configuration.nidaq_stream)
-        )
         require_valid_nidaq_configuration(
             devices,
             stream=configuration.nidaq_stream,
             ports=configuration.nidaq_ports,
             laser=configuration.laser,
-            clock_source=clock_source,
+            timing_plan=plan,
+            clock_source=refused_plan_clock_source(
+                plan, configuration.nidaq_ports.timing),
         )
 
     def _start_laser_domain(self) -> bool:

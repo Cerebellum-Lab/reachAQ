@@ -66,8 +66,6 @@ def build_nidaq_timing_plan(
         configuration,
         discovered,
     )
-    if channel_error:
-        return _invalid_plan(timing, channel_error)
 
     try:
         master = _select_master(
@@ -78,7 +76,12 @@ def build_nidaq_timing_plan(
             discovered,
         )
     except ValueError as exc:
-        return _invalid_plan(timing, str(exc))
+        return _invalid_plan(timing, channel_error or str(exc))
+    if channel_error:
+        # With the master a valid plan would have had, so that what reads the
+        # clock's board off a refused plan, Run's laser route check, gets this
+        # choice rather than a guess (nidaq_validation.refused_plan_clock_source).
+        return _invalid_plan(timing, channel_error, master=master)
 
     slaves = tuple(device for device in active_devices if device != master)
     task_start_order = (*slaves, master)
