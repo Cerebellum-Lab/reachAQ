@@ -12,6 +12,7 @@ Nothing here touches a driver or a board (nidaq_daqmx_fake).
 """
 
 import dataclasses
+import threading
 
 import pytest
 
@@ -105,6 +106,20 @@ def _pulse(*, trigger_source=BOARD_STIM, wait=True, defer_start=False, **fields)
 def _output(name):
     configuration, fields, task, line = OUTPUTS[name]
     return configuration, fields, task, line
+
+
+def _in_thread(function, *args):
+    outcome = []
+
+    def run():
+        try:
+            outcome.append(function(*args))
+        except Exception as error:
+            outcome.append(error)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread, outcome
 
 
 # ------------------------------- a DO line on another board: pulseClockLine
@@ -229,6 +244,8 @@ def test_a_commit_that_fails_leaves_nothing_behind(monkeypatch, output):
     release = controller._release_operation
     controller._release_operation = lambda operation: (
         ended.append(operation.state), release(operation))
+    # The controller's own writes at open are not the cleanup's.
+    before = len(daq.writes)
 
     with pytest.raises(RuntimeError, match="refused to commit"):
         controller.run_synchronized_pulse_train(_pulse(**fields))
@@ -237,7 +254,7 @@ def test_a_commit_that_fails_leaves_nothing_behind(monkeypatch, output):
     assert daq.task("laser_sync_pulse_ao").closed
     assert daq.task(task_name).closed
     assert daq.disconnected == [PULSE_CLOCK_ROUTE]
-    assert daq.writes_to("PXI1Slot4/ao0", task_suffix="manual_ao")[-1] == 0.0
+    assert daq.writes_to("PXI1Slot4/ao0", task_suffix="manual_ao", since=before) == [0.0]
     assert daq.starts == []
     assert daq.reserved == {}
     assert controller._live_operations == {}
@@ -284,9 +301,9 @@ def test_a_second_pulse_on_the_same_board_is_refused_while_the_first_holds_it(
     # The resource check was per channel, so a pulse on ao1 went ahead
     # while one on ao0 of the same 6713 was armed. It borrowed the first
     # pulse's route onto pulseClockLine without owning it, and lost its
-    # lines' clock when the first released it. A board has one timed
-    # analog output: DAQmx would refuse the second task (-50103) after
-    # the route and the tasks were made. Refused first now, by name.
+    # lines' clock when the first released it. NI documents one timed
+    # analog output task per board at a time (not measured here; the fake's
+    # -50103 was the PMT line the two shared). Refused first now, by name.
     daq = FakeDaqmx(block_wait=True, hold_waits=True, stop_unblocks=True)
     monkeypatch.setattr(nidaq_laser, "_load_nidaqmx", lambda: daq)
     controller = NidaqLaserController(_two_lasers_on_one_board())
@@ -303,11 +320,15 @@ def test_a_second_pulse_on_the_same_board_is_refused_while_the_first_holds_it(
         with pytest.raises(RuntimeError) as refused:
             controller.run_synchronized_pulse_train(second)
 
-        assert str(refused.value) == (
-            "The analog output of PXI1Slot4 is in use by laser operation "
-            f"{first.operation_id} (on PXI1Slot4/ao0), armed or running: a "
-            "board runs one timed analog output at a time, so a pulse on "
-            "PXI1Slot4/ao1 is refused until that operation ends or is cancelled")
+        message = str(refused.value)
+        # What Run Pulse's status line shows: the laser, what holds the
+        # board, and what to do; the ids after.
+        shown = message[:160]
+        assert shown.startswith("Laser 2: refused while the pulse on laser 1 holds")
+        assert "wait for it to end, or cancel it" in shown
+        assert first.operation_id not in shown
+        assert message.endswith(
+            f"(laser operation {first.operation_id} on PXI1Slot4/ao0)")
         assert (len(daq.tasks), daq.connected) == (created, connected)
         assert PULSE_CLOCK_ROUTE in controller._trigger_routes
 
@@ -317,6 +338,104 @@ def test_a_second_pulse_on_the_same_board_is_refused_while_the_first_holds_it(
         assert daq.disconnected == [PULSE_CLOCK_ROUTE, PULSE_CLOCK_ROUTE]
     finally:
         daq.waits_released.set()
+
+
+def test_a_trial_holding_the_board_is_named_as_the_trial(monkeypatch):
+    daq = FakeDaqmx(block_wait=True, hold_waits=True, stop_unblocks=True)
+    monkeypatch.setattr(nidaq_laser, "_load_nidaqmx", lambda: daq)
+    controller = NidaqLaserController(_two_lasers_on_one_board())
+    try:
+        trial = dataclasses.replace(
+            _pulse(wait=False), operation_context={"logical_trial_id": 7})
+        controller.run_synchronized_pulse_train(trial)
+
+        with pytest.raises(RuntimeError) as refused:
+            controller.run_synchronized_pulse_train(_second_laser_pulse())
+
+        assert str(refused.value)[:160].startswith(
+            "Laser 2: refused while trial 7's pulse on laser 1 holds")
+    finally:
+        daq.waits_released.set()
+
+
+def _second_laser_pulse(**fields):
+    return LaserSynchronizedPulseTrain(
+        pulse_trains=(LaserPulseTrain(
+            channel_id=LaserChannelId.LASER_2, amplitude_volts=1.0,
+            duration_ms=1.0, **fields),),
+        timeout_seconds=5.0)
+
+
+def test_a_cancelled_pulse_holds_its_board_until_its_cleanup_ends(monkeypatch):
+    # Counted until it was marked cancelled; its cleanup still held the AO
+    # task and the pulseClockLine route after that.
+    daq = FakeDaqmx(block_wait=True, hold_waits=True, stop_unblocks=True)
+    monkeypatch.setattr(nidaq_laser, "_load_nidaqmx", lambda: daq)
+    controller = NidaqLaserController(_two_lasers_on_one_board())
+    try:
+        first = controller.run_synchronized_pulse_train(_pulse(
+            wait=False, enable_pmt_shutter=True))
+        # Its cleanup waits in the driver, closing its tasks.
+        daq.hang = {"task_close"}
+        daq.held_wait_limit = 3.0
+        assert first.cancel()
+        assert daq.hanging.wait(5.0)
+        assert first.state is LaserOperationState.CANCELLED
+        assert not first._done.is_set()
+
+        second, outcome = _in_thread(
+            controller.run_synchronized_pulse_train, _second_laser_pulse())
+        second.join(2.0)
+
+        assert not second.is_alive(), "the second pulse went ahead into the driver"
+        error, = outcome
+        assert isinstance(error, RuntimeError)
+        assert str(error).startswith("Laser 2: refused while the pulse on laser 1 holds")
+    finally:
+        daq.hang_released.set()
+        daq.waits_released.set()
+
+
+def test_board_names_compare_as_daqmx_compares_them(monkeypatch):
+    # DAQmx names devices without regard to case; so does the board rule.
+    daq = FakeDaqmx(block_wait=True, hold_waits=True, stop_unblocks=True)
+    monkeypatch.setattr(nidaq_laser, "_load_nidaqmx", lambda: daq)
+    lasers = _two_lasers_on_one_board()
+    laser_2 = dataclasses.replace(lasers.channels[1], analog_output="pxi1slot4/ao1")
+    controller = NidaqLaserController(
+        dataclasses.replace(lasers, channels=(lasers.channels[0], laser_2)))
+    try:
+        controller.run_synchronized_pulse_train(_pulse(wait=False))
+
+        with pytest.raises(RuntimeError, match="^Laser 2: refused while"):
+            controller.run_synchronized_pulse_train(_second_laser_pulse())
+    finally:
+        daq.waits_released.set()
+
+
+def test_a_pulse_whose_thread_does_not_start_lets_go_of_the_board(monkeypatch):
+    # Left PREPARED among the live operations, it held the whole board: no
+    # pulse on either laser could start again.
+    import threading
+
+    daq = FakeDaqmx()
+    monkeypatch.setattr(nidaq_laser, "_load_nidaqmx", lambda: daq)
+    controller = NidaqLaserController(_two_lasers_on_one_board())
+    start = threading.Thread.start
+
+    def refused_start(thread):
+        if thread.name.startswith("NidaqLaser-"):
+            raise RuntimeError("can't start new thread")
+        return start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", refused_start)
+    with pytest.raises(RuntimeError, match="can't start new thread"):
+        controller.run_synchronized_pulse_train(_pulse(wait=False, trigger_source=None))
+    monkeypatch.setattr(threading.Thread, "start", start)
+
+    assert controller._live_operations == {}
+    controller.run_synchronized_pulse_train(_second_laser_pulse())
+    assert daq.starts == ["laser_sync_pulse_ao"]
 
 
 def test_one_train_on_both_lasers_of_a_board_is_one_task_and_runs(daq):

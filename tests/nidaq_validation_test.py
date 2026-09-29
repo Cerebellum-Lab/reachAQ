@@ -275,3 +275,86 @@ def test_a_digital_stream_line_on_a_board_that_cannot_clock_it_is_refused():
     with pytest.raises(NidaqConfigurationInvalid,
                        match="PXI1Slot4, which cannot clock digital input"):
         require_valid_nidaq_configuration(devices, stream=stream)
+
+
+# ------------------------------------------- the clock a refused plan gives Run
+
+
+def _refused_plan(**values):
+    from autotrainer.core import NidaqTimingPlan
+
+    fields = dict(requested_mode="auto", resolved_mode="unavailable",
+                  is_valid=False, master_device="Clocks", reason="refused")
+    fields.update(values)
+    return NidaqTimingPlan(**fields)
+
+
+def test_a_refused_plan_gives_its_masters_board():
+    from autotrainer.core import NidaqTimingConfiguration
+    from tools.acquisition.model.nidaq_validation import refused_plan_clock_source
+
+    assert refused_plan_clock_source(
+        _refused_plan(), NidaqTimingConfiguration()) == "/Clocks/ai/SampleClock"
+
+
+def test_an_explicit_sample_clock_source_is_the_clock():
+    from autotrainer.core import NidaqTimingConfiguration
+    from tools.acquisition.model.nidaq_validation import refused_plan_clock_source
+
+    timing = NidaqTimingConfiguration(sync_mode="external",
+                                      sample_clock_source="/Other/PFI3",
+                                      start_trigger_source="/Other/PFI4")
+
+    assert refused_plan_clock_source(_refused_plan(), timing) == "/Other/PFI3"
+
+
+def test_a_timing_master_override_is_the_refused_plans_master():
+    # The plan's own choice, overridden by timingMaster, as a valid plan's.
+    import dataclasses
+
+    from autotrainer.core import (
+        NidaqDeviceIdentity,
+        NidaqSignalChannelConfiguration,
+        NidaqSignalStreamConfiguration,
+        NidaqTimingConfiguration,
+    )
+    from tools.acquisition.model.nidaq_discovery import NidaqDevicePorts
+    from tools.acquisition.model.nidaq_timing import build_nidaq_timing_plan
+    from tools.acquisition.model.nidaq_validation import refused_plan_clock_source
+
+    def board(name, serial, **values):
+        return NidaqDevicePorts(
+            name=name, product_type=f"Model-{serial}", serial_number=serial,
+            bus_type="PXI", pxi_chassis_number=1, analog_inputs=(f"{name}/ai0",),
+            digital_inputs=(f"{name}/port0/line0",), counter_outputs=(f"{name}/ctr0",),
+            analog_output_sample_clock_supported=True, digital_trigger_supported=True,
+            digital_input_max_rate=1_000_000.0, **values)
+
+    stream = NidaqSignalStreamConfiguration(
+        channels=(
+            NidaqSignalChannelConfiguration("cam_frames", "Lines/port0/line0", "digital"),
+            NidaqSignalChannelConfiguration("tone1", "Lines/port0/line1", "digital"),
+            NidaqSignalChannelConfiguration("laser_feedback", "Clocks/ai0", "analog"),
+        ),
+        is_enabled=True)
+    timing = NidaqTimingConfiguration(timing_master=NidaqDeviceIdentity(
+        logical_name="Clocks", runtime_name="Clocks", serial_number=41))
+    lines = dataclasses.replace(board("Lines", 42), digital_input_max_rate=None)
+
+    plan = build_nidaq_timing_plan(stream, timing, (board("Clocks", 41), lines))
+
+    assert not plan.is_valid and plan.master_device == "Clocks"
+    assert refused_plan_clock_source(plan, timing) == "/Clocks/ai/SampleClock"
+
+
+def test_independent_boards_a_masterless_plan_a_valid_one_and_none_give_no_clock():
+    from autotrainer.core import NidaqTimingConfiguration
+    from tools.acquisition.model.nidaq_validation import refused_plan_clock_source
+
+    timing = NidaqTimingConfiguration()
+    assert refused_plan_clock_source(
+        _refused_plan(requested_mode="independent"), timing) is None
+    assert refused_plan_clock_source(_refused_plan(master_device=None), timing) is None
+    assert refused_plan_clock_source(
+        _refused_plan(is_valid=True, resolved_mode="same_device"), timing) is None
+    assert refused_plan_clock_source(None, timing) is None

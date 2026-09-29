@@ -489,34 +489,24 @@ class NidaqLaserController:
                 raise RuntimeError(
                     "the laser controller is closed; no pulse train is started")
             # By board, not by channel. A board has one analog output timing
-            # engine, and its ao/SampleClock is that engine's: a train holds
-            # it until it ends, waited for or not, and DAQmx refuses a second
-            # timed task on the board (-50103), after this one had made its
-            # tasks and borrowed the first one's pulseClockLine route, which
-            # the first then released under it. Several lasers on one board
-            # fire together as one train, which is one task. Run Pulse, which
-            # waits, is refused so while a trial's pulse is armed.
-            boards = {_device_of(resource) for resource in resources}
+            # engine, and its ao/SampleClock is that engine's; NI documents
+            # one timed analog output task per board at a time. A second
+            # pulse on another channel of the board went ahead, and borrowed
+            # the first one's pulseClockLine route, which the first then
+            # released under it. Run Pulse, which waits, is refused so while
+            # a trial's pulse is armed. Counted until the operation is done,
+            # not only until it is marked cancelled: its cleanup still holds
+            # its tasks and routes then. Board names compare as DAQmx
+            # compares them, without regard to case.
+            boards = {_device_of(resource).lower() for resource in resources}
             conflicts = [
                 operation
                 for operation in self._live_operations.values()
-                if boards & {_device_of(resource) for resource in operation.resources}
-                and operation.state not in operation.TERMINAL
+                if boards & {_device_of(resource).lower() for resource in operation.resources}
+                and not operation._done.is_set()
             ]
             if conflicts:
-                held = sorted({
-                    resource for operation in conflicts
-                    for resource in operation.resources
-                    if _device_of(resource) in boards})
-                raise RuntimeError(
-                    f"The analog output of {', '.join(sorted(boards))} is in use "
-                    f"by laser operation "
-                    f"{', '.join(op.operation_id for op in conflicts)} (on "
-                    f"{', '.join(held)}), armed or running: a board runs one "
-                    f"timed analog output at a time, so a pulse on "
-                    f"{', '.join(resources)} is refused until that operation "
-                    "ends or is cancelled"
-                )
+                raise RuntimeError(self._board_refusal(pulse_train, conflicts, boards))
             operation = NidaqLaserOperation(
                 resources=resources,
                 context=pulse_train.operation_context,
@@ -570,13 +560,52 @@ class NidaqLaserController:
             name=f"NidaqLaser-{operation.operation_id[:8]}",
             daemon=True,
         )
-        operation._thread.start()
+        try:
+            operation._thread.start()
+        except BaseException as error:
+            # Nothing of it ran, so nothing to clean up; left PREPARED among
+            # the live operations it held the whole board.
+            operation._fail(RuntimeError(
+                f"the pulse train's thread did not start ({error})"))
+            raise
         try:
             operation.wait_until_armed(timeout=5.0)
         except Exception:
             operation.cancel()
             raise
         return operation
+
+    def _board_refusal(self, pulse_train, conflicts, boards) -> str:
+        """Why a pulse is refused while another holds its board, briefly first.
+
+        Run Pulse's status line shows about 160 characters: the laser, what
+        holds the board and what to do come first, the ids after.
+        """
+        requested = [int(item.channel_id) for item in pulse_train.pulse_trains]
+        lasers = "Laser" if len(requested) == 1 else "Lasers"
+        holders = " and ".join(
+            self._describe_operation(operation) for operation in conflicts)
+        held = sorted({
+            resource for operation in conflicts for resource in operation.resources
+            if _device_of(resource).lower() in boards})
+        held_boards = sorted({_device_of(resource) for resource in held})
+        return (
+            f"{lasers} {', '.join(map(str, requested))}: refused while {holders} "
+            f"{'hold' if len(conflicts) > 1 else 'holds'} the analog output of "
+            f"{', '.join(held_boards)}; wait for it to end, or cancel it. A board "
+            "runs one timed analog output at a time (laser operation "
+            f"{', '.join(operation.operation_id for operation in conflicts)} on "
+            f"{', '.join(held)})")
+
+    def _describe_operation(self, operation) -> str:
+        """An operation as an operator knows it: a trial's pulse, or a laser's."""
+        lasers = sorted(
+            int(channel.channel_id) for channel in self._configuration.channels
+            if channel.analog_output in operation.resources)
+        on = (f"laser {', '.join(map(str, lasers))}" if lasers
+              else ", ".join(operation.resources))
+        trial = operation.context.get("logical_trial_id")
+        return f"trial {trial}'s pulse on {on}" if trial is not None else f"the pulse on {on}"
 
     def _release_operation(self, operation):
         with self._operation_lock:

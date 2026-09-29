@@ -208,7 +208,8 @@ lines, and this path has not yet been run on its hardware.
 `backplaneClockLine` (default `PXI_Trig1`) and `pulseClockLine` (default
 `PXI_Trig3`) are each a bare PXI_Trig line, such as `PXI_Trig3`, with no
 board: the controller names it on whichever board drives or reads it. A
-board name, an empty value or anything but a PXI_Trig line is refused, and
+board name, an empty value, anything but a PXI_Trig line, and a line the
+backplane does not have (PXI has `PXI_Trig0` to `PXI_Trig7`) are refused, and
 the case is taken as DAQmx spells it. The two must be free lines: different
 from each other, from every laser's `triggerSource` line (which is also its
 trigger route's destination), from every `triggerListenerInputs` line, and

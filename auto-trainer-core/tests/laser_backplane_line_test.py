@@ -140,6 +140,15 @@ def test_a_board_named_on_a_clock_line_is_refused_with_a_line_that_is_allowed():
     assert "a bare PXI_Trig line, such as PXI_Trig3" in message
 
 
+def test_a_board_named_on_a_pxi_trig_line_suggests_that_line():
+    # The field's default was the example, and it can itself be taken:
+    # here backplaneClockLine is PXI_Trig1 already.
+    with pytest.raises(ValueError) as refused:
+        _lasers(_channel(), pulse_clock_line="/PXI1Slot4/PXI_Trig5")
+
+    assert "a bare PXI_Trig line, such as PXI_Trig5" in str(refused.value)
+
+
 def test_a_clock_line_is_named_as_the_driver_spells_it():
     lasers = _lasers(_channel(), backplane_clock_line=" pxi_trig1 ",
                      pulse_clock_line="PXI_TRIG4")

@@ -124,10 +124,9 @@ def test_a_route_connected_as_the_controller_closes_is_undone(monkeypatch):
 def test_two_callers_needing_one_backplane_clock_route_share_it(monkeypatch):
     # A guard test, which passed before the change it sits beside: a route
     # another caller is still connecting is waited for and reused, not
-    # connected a second time. On backplaneClockLine, which a synchronized
-    # pulse's AO and the calibration ramp's inputs both take the shared clock
-    # from; two pulses never share a pulseClockLine route, as a board runs
-    # one pulse at a time.
+    # connected a second time. The route is the calibration ramp's: the
+    # 6713's ao/SampleClock on backplaneClockLine, which both the ramp's
+    # diode input and its PMT line take from the 6221 side.
     daq = _sick(monkeypatch, "connect_terms")
     try:
         controller = NidaqLaserController(rig_lasers())

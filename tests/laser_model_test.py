@@ -303,3 +303,35 @@ def test_a_pulse_that_ends_after_a_newer_command_leaves_that_command():
     time.sleep(0.05)
 
     assert model.last_command_volts == {1: 1.5}
+
+
+def test_a_command_recorded_as_a_pulse_ends_is_not_overwritten():
+    # The completion looked for a newer command, then recorded the minimum,
+    # as two steps: a command recorded between them was overwritten.
+    from autotrainer.device import LaserChannelId
+
+    model = _null_hardware_timed_model()
+    profile = LaserPulseProfile("pulse", 1, 2.5, 1)
+    operation = model.prepare_pulse_profile(profile, SOFTWARE, _recipe())
+    in_reset, go_on = threading.Event(), threading.Event()
+    record_baseline = model._record_baseline
+
+    def held(channel_ids):
+        channel_ids = tuple(channel_ids)  # the look, before the record
+        in_reset.set()
+        go_on.wait(5.0)
+        record_baseline(channel_ids)
+
+    model._record_baseline = held
+    operation.trigger()
+    assert in_reset.wait(5.0)
+    newer = threading.Thread(
+        target=model._record_command, args=(LaserChannelId.LASER_1, 1.5), daemon=True)
+    newer.start()
+    newer.join(0.2)
+    go_on.set()
+    newer.join(5.0)
+    operation.wait(1)
+    time.sleep(0.05)
+
+    assert model.last_command_volts == {1: 1.5}

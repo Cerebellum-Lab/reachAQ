@@ -284,13 +284,13 @@ minimum. The status line then reads *"Laser operation failed: Laser operation
 ... was cancelled: the laser controller was closed while it ran"*.
 
 Run Pulse is refused while another pulse on the same board's analog output
-is armed or running, such as a trial's pulse waiting for its trigger, on this
-laser or on another laser of the same board: *"The analog output of ... is in
-use by laser operation ... (on ...), armed or running: a board runs one timed
-analog output at a time, so a pulse on ... is refused until that operation
-ends or is cancelled"*. DAQmx would refuse it too, at -50103; this names the
-pulse holding the board. Lasers on one board that should fire together do so
-as one pulse train.
+is armed or running, or still ending after a cancel, such as a trial's pulse
+waiting for its trigger, on this laser or on another laser of the same board:
+*"Laser 2: refused while trial 7's pulse on laser 1 holds the analog output
+of PXI1Slot4; wait for it to end, or cancel it. ..."*, with the operation's
+id and output after. NI documents one timed analog output task per board at
+a time. On christielab10 both lasers are on the 6713, so the two cannot run
+overlapping pulses: the second is refused, naming what holds the board.
 
 That close is bounded at 15 seconds, at Stop, at a Run start that failed,
 and when reachAQ closes, and so is the close a controller makes of what it
@@ -389,7 +389,9 @@ shutter** holds the PMT shutter open for the ramp. Press **Run Ramp**.
   only drops when **Samples/step:** would leave it no sample. **Samples/step:**
   is taken when you finish typing (Return, leaving the field, or **Run
   Ramp**). All of the ramp's fields go back to their defaults whenever Laser
-  Control is rebuilt: on every Run/Stop and every DAQ Ports save.
+  Control is rebuilt: on every Run and Stop, on a DAQ Ports save or a
+  configuration load that changes the lasers, and when a laser close that
+  ended late disconnects the laser.
   `tools/hardware/validate_laser_hardware.py --action ramp` takes the same
   window as `--settle-samples`.
 
