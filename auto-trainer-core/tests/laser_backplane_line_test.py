@@ -60,9 +60,9 @@ def test_a_trigger_listener_on_the_backplane_clock_line_is_refused():
     [
         ("/PXI1Slot5/pxi_trig1", "PXI_Trig1"),
         ("PXI_TRIG1", "PXI_Trig1"),
-        ("/PXI1Slot4/PXI_Trig1", "/PXI1Slot5/pxi_trig1"),
+        ("/PXI1Slot4/PXI_Trig1", "pxi_trig1"),
     ],
-    ids=["lower_case_other_board", "bare_upper_case", "clock_named_on_a_board"],
+    ids=["lower_case_other_board", "bare_upper_case", "clock_in_lower_case"],
 )
 def test_a_clash_ignores_case_and_the_device(terminal, clock_line):
     with pytest.raises(ValueError, match="backplaneClockLine"):
@@ -82,13 +82,65 @@ def test_a_trigger_on_another_kind_of_terminal_never_clashes(terminal):
     assert lasers.backplane_clock_line == "PXI_Trig1"
 
 
-def test_the_route_source_is_not_compared_because_nothing_drives_it():
-    # _connect_trigger_route drives the trigger's own line on the route
-    # source's board, and only reads the route source.
-    lasers = _lasers(_channel(trigger_source="/PXI1Slot4/PXI_Trig0",
-                              trigger_route_source="/PXI1Slot5/PXI_Trig1"))
+@pytest.mark.parametrize(
+    ("route_source", "field", "line"),
+    [("/PXI1Slot5/PXI_Trig1", "backplaneClockLine", "PXI_Trig1"),
+     ("/PXI1Slot5/pxi_trig3", "pulseClockLine", "PXI_Trig3")],
+)
+def test_a_route_source_on_a_clock_line_is_refused(route_source, field, line):
+    # _connect_trigger_route reads the route source and drives the trigger's
+    # own line from it: from a clock's line it would carry that clock into
+    # the trigger, and the laser would arm on the clock's first edge.
+    with pytest.raises(ValueError) as refused:
+        _lasers(_channel(trigger_source="/PXI1Slot4/PXI_Trig0",
+                         trigger_route_source=route_source))
 
-    assert lasers.channels[0].trigger_route_source == "/PXI1Slot5/PXI_Trig1"
+    message = str(refused.value)
+    assert f"laser 1 triggerRouteSource {route_source} uses {line}, the {field}" in message
+    assert "arm on" in message
+
+
+@pytest.mark.parametrize("route_source", ["/PXI1Slot5/PFI0", "/PXI1Slot5/PXI_Trig5"])
+def test_a_route_source_off_the_clock_lines_is_kept(route_source):
+    lasers = _lasers(_channel(trigger_source="/PXI1Slot4/PXI_Trig0",
+                              trigger_route_source=route_source))
+
+    assert lasers.channels[0].trigger_route_source == route_source
+
+
+@pytest.mark.parametrize("field", ["backplane_clock_line", "pulse_clock_line"])
+@pytest.mark.parametrize(
+    ("value", "why"),
+    [("/PXI1Slot4/PXI_Trig1", "names a board"), ("PXI1Slot4/PXI_Trig5", "names a board"),
+     ("PFI3", "not a PXI_Trig line"), ("RTSI1", "not a PXI_Trig line"),
+     ("", "empty"), (None, "empty"), ("   ", "empty")],
+)
+def test_a_clock_line_is_a_bare_pxi_trig_line(field, value, why):
+    # The driver names the line on a board of its choosing; a board's name
+    # given here was taken as the line's, or ignored.
+    with pytest.raises(ValueError) as refused:
+        _lasers(_channel(), **{field: value})
+
+    message = str(refused.value)
+    camel = {"backplane_clock_line": "backplaneClockLine",
+             "pulse_clock_line": "pulseClockLine"}[field]
+    assert camel in message and why in message
+
+
+def test_a_clock_line_is_named_as_the_driver_spells_it():
+    lasers = _lasers(_channel(), backplane_clock_line=" pxi_trig1 ",
+                     pulse_clock_line="PXI_TRIG4")
+
+    assert (lasers.backplane_clock_line, lasers.pulse_clock_line) == (
+        "PXI_Trig1", "PXI_Trig4")
+
+
+def test_a_file_with_no_clock_line_is_refused():
+    text = SystemConfiguration(laser=_christielab10_lasers()).dump_yaml()
+
+    with pytest.raises(ValueError, match="backplaneClockLine"):
+        SystemConfiguration.load_yaml(io.StringIO(
+            text.replace("backplaneClockLine: PXI_Trig1", "backplaneClockLine: null")))
 
 
 def _christielab10_lasers():
@@ -138,8 +190,10 @@ def test_a_file_without_a_pulse_clock_line_loads_with_the_default():
     text = SystemConfiguration(laser=_christielab10_lasers()).dump_yaml()
     assert "pulseClockLine: PXI_Trig3" in text
 
-    loaded = SystemConfiguration.load_yaml(io.StringIO(
-        text.replace("  pulseClockLine: PXI_Trig3\n", "")))
+    stripped = text.replace("  pulseClockLine: PXI_Trig3\n", "")
+    assert "pulseClockLine" not in stripped
+
+    loaded = SystemConfiguration.load_yaml(io.StringIO(stripped))
 
     assert loaded.laser.pulse_clock_line == "PXI_Trig3"
     assert loaded.laser == _christielab10_lasers()
@@ -148,11 +202,10 @@ def test_a_file_without_a_pulse_clock_line_loads_with_the_default():
 def test_the_pulse_clock_line_cannot_be_the_backplane_clock_line():
     with pytest.raises(ValueError) as refused:
         _lasers(_channel(), backplane_clock_line="PXI_Trig1",
-                pulse_clock_line="/PXI1Slot4/pxi_trig1")
+                pulse_clock_line="pxi_trig1")
 
     message = str(refused.value)
-    assert "pulseClockLine /PXI1Slot4/pxi_trig1" in message
-    assert "backplaneClockLine" in message
+    assert "pulseClockLine PXI_Trig1 is the backplaneClockLine" in message
 
 
 @pytest.mark.parametrize("terminal", ["/PXI1Slot4/PXI_Trig3", "/PXI1Slot5/pxi_trig3"])

@@ -563,12 +563,11 @@ class NidaqLaserController:
                 )
             ao_task.write(timed_waveforms[0] if len(timed_waveforms) == 1 else timed_waveforms, auto_start=False)
             sample_clock_source = self._analog_output_sample_clock_source(channels[0].analog_output)
-            synchronized = bool(timing_kwargs.get("source"))
 
             def digital_timing(physical_line):
-                return self._pulse_digital_timing(
-                    physical_line, sample_clock_source, synchronized,
-                    pulse_train.trigger_source, added_routes)
+                # The line's clock, and no start trigger (_pulse_digital_clock).
+                return self._pulse_digital_clock(
+                    physical_line, sample_clock_source, added_routes), None
 
             if pmt_enabled:
                 pmt_line = self._require_pmt_shutter_output()
@@ -626,6 +625,11 @@ class NidaqLaserController:
                             pulse_train.trigger_edge,
                         )
                     )
+            if digital_tasks:
+                # Programmed before the lines start, so that whatever the AO
+                # clock does while the board is programmed happens before a
+                # line takes it: then the lines, then the AO.
+                ao_task.control(self._nidaqmx.constants.TaskMode.TASK_COMMIT)
             for channel, channel_pulse in zip(channels, pulse_train.pulse_trains):
                 if channel_pulse.open_shutter:
                     self.set_shutter_open(channel.channel_id, True)
@@ -723,7 +727,8 @@ class NidaqLaserController:
                 "reason": "Resolved timing topology has no shared sample clock",
             }
         return {"source": self._shared_clock_for(
-            output_devices[0], plan.sample_clock_source)}, {
+            output_devices[0], plan.sample_clock_source,
+            line=self._configuration.backplane_clock_line)}, {
             **base,
             "status": "hardware_synchronized",
             "reason": "Finite output armed for a future trigger on the shared sample clock",
@@ -731,41 +736,36 @@ class NidaqLaserController:
             "referenceClockSource": plan.reference_clock_source,
         }
 
-    def _pulse_digital_timing(
+    def _pulse_digital_clock(
         self,
         physical_line: str,
         ao_clock: str,
-        synchronized: bool,
-        trigger_source: Optional[str],
         added: List[Tuple[str, str]],
-    ) -> Tuple[str, Optional[str]]:
-        """The sample clock and start trigger for one of a pulse's digital lines.
+    ) -> str:
+        """The sample clock one of a pulse's clocked digital lines runs on.
 
-        On the AO's board they are the AO's own, named as they always were. On
-        another board neither name can be used: each is an implicit cross-board
-        route, which DAQmx refuses on christielab10's unidentified chassis
-        (-89125), and a clocked digital line has to sit on the 6221 there,
-        away from the 6713's AO. It then runs on the AO's own sample clock,
-        driven onto a backplane line and read on its own board, with no start
-        trigger: that clock ticks only once the AO has triggered, and the
-        digital tasks start before the AO, so each samples on the AO's own
-        clock edges, as before. It cannot wait for a start trigger instead:
-        the 6221's clocked digital output takes none (do_trig_usage is empty,
-        and TASK_VERIFY refuses one with -200452; christielab10, 2026-09-25).
+        Always the pulse's own analog output clock, and never with a start
+        trigger: that clock ticks only once the output has triggered, and the
+        lines start before the output, so each samples on its edges. A line
+        cannot wait for a trigger instead: an M Series board's clocked
+        digital output takes none (christielab10's 6221 and 6713 report an
+        empty do_trig_usage, and TASK_VERIFY refuses one with -200452,
+        2026-09-25).
 
-        Which line depends on the AO's clock. Unsynchronized, the AO runs on
-        its own, which goes onto backplane_clock_line, as the calibration
-        ramp's does. Synchronized, the AO runs on the input stream's clock,
-        which backplane_clock_line already carries from the 6221 to the 6713
-        for as long as the controller is open; the AO's own clock then goes
-        onto pulse_clock_line, a line of its own, since a second driver on
-        the first is not something DAQmx can see across these boards.
+        On the output's own board the clock is named there, as it always was.
+        On another board naming it is an implicit cross-board route, refused
+        on christielab10's unidentified chassis (-89125), and a clocked line
+        has to sit on the 6221 there: the clock is driven onto
+        pulse_clock_line for the pulse and read on the line's board.
+        backplane_clock_line is not used for it, since in a synchronized
+        pulse it carries the input stream's clock to the output until close().
         """
         output_device = _device_of(physical_line)
         if output_device == _device_of(ao_clock):
-            return ao_clock, trigger_source
-        line = self._configuration.pulse_clock_line if synchronized else None
-        return self._shared_clock_for(output_device, ao_clock, added=added, line=line), None
+            return ao_clock
+        return self._shared_clock_for(
+            output_device, ao_clock, added=added,
+            line=self._configuration.pulse_clock_line)
 
     def _configure_timing_reference(self, task, timing_status) -> None:
         if timing_status.get("status") != "hardware_synchronized":
@@ -843,7 +843,7 @@ class NidaqLaserController:
                 rate=sample_rate_hz,
                 source=self._shared_clock_for(
                     _device_of(channel.diode_input), sample_clock_source,
-                    added=added_routes),
+                    added=added_routes, line=self._configuration.backplane_clock_line),
                 sample_mode=self._nidaqmx.constants.AcquisitionType.FINITE,
                 samps_per_chan=len(waveform),
             )
@@ -858,7 +858,8 @@ class NidaqLaserController:
                         len(waveform),
                         self._shared_clock_for(
                             _device_of(pmt_line), sample_clock_source,
-                            added=added_routes),
+                            added=added_routes,
+                            line=self._configuration.backplane_clock_line),
                         None,
                         "rising",
                     )
@@ -1273,13 +1274,14 @@ class NidaqLaserController:
         output_device: str,
         source: str,
         *,
+        line: str,
         added: Optional[List[Tuple[str, str]]] = None,
-        line: Optional[str] = None,
     ) -> str:
-        """The shared sample clock as this output board can see it.
+        """A sample clock as this output board can see it, over backplane `line`.
 
-        On `line`, backplane_clock_line unless given: a synchronized pulse
-        puts its analog output's own clock on pulse_clock_line.
+        The input stream's clock and the ramp's go on backplane_clock_line, a
+        pulse's own clock for its digital lines on pulse_clock_line; the
+        caller names which, as there is no default to fall back on.
 
         A clock produced on one board reaches an output on another the same
         way its trigger does, and runs into the same refusal: DAQmx will not
@@ -1300,7 +1302,6 @@ class NidaqLaserController:
         clock_device = source.strip("/").split("/", 1)[0]
         if not output_device or clock_device == output_device:
             return source
-        line = line or self._configuration.backplane_clock_line
         destination = f"/{clock_device}/{line}"
         local = f"/{output_device}/{line}"
         route = (source, destination)
@@ -1334,7 +1335,7 @@ class NidaqLaserController:
             with self._route_lock():
                 self._settle_route(route)
             raise RuntimeError(
-                f"could not put the shared sample clock {source} on "
+                f"could not put the sample clock {source} on "
                 f"{destination} for {output_device}: {error}"
             ) from error
         with self._route_lock():
@@ -1440,7 +1441,10 @@ class NidaqLaserController:
         by name. A route close() has released already is not released again:
         each is taken off the held list under the lock by whichever caller
         gets it first, and disconnected by that caller, outside the lock,
-        pending until it is gone so that nobody connects it meanwhile.
+        pending until it is gone so that nobody connects it meanwhile, and
+        the collision check still counts it. One the driver would not
+        disconnect may still be driven: it goes back on the held list, where
+        the collision check keeps finding it and close() tries it again.
         """
         with self._route_lock():
             owned = []
@@ -1454,6 +1458,8 @@ class NidaqLaserController:
             error = self._disconnect_route(route)
             with self._route_lock():
                 self._settle_route(route)
+                if error is not None and route not in self._trigger_routes:
+                    self._trigger_routes.append(route)
             if error is not None:
                 source, destination = route
                 errors.append((f"trigger route {source} -> {destination}", error))

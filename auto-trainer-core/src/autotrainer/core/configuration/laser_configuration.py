@@ -49,10 +49,12 @@ def clock_line_clashes(
     another board. Neither may be a line a trigger takes, nor the other one.
     A channel's trigger_source is the line its trigger rides on, and
     NidaqLaserController._connect_trigger_route drives exactly that line,
-    named on the route source's board, as its route's destination; the route
-    source itself is only read, so it is not compared. A trigger listener
-    input is watched on its line. Either on a clock's line puts a second
-    driver there.
+    named on the route source's board, as its route's destination: on a
+    clock's line, a second driver. The route reads its trigger_route_source:
+    a clock's line there would carry that clock into the trigger, and the
+    laser would arm on the clock's first edge. Nothing drives a trigger
+    listener input; one on a clock's line is refused all the same, since it
+    would watch the clock rather than a trigger.
     """
     channels = tuple(channels)
     listeners = tuple(trigger_listener_inputs)
@@ -70,6 +72,13 @@ def clock_line_clashes(
                 clashes.append(
                     f"laser {int(channel.channel_id)} triggerSource "
                     f"{channel.trigger_source} uses {shown}, the {field}; {remedy}")
+            if backplane_line_of(channel.trigger_route_source) == clock:
+                clashes.append(
+                    f"laser {int(channel.channel_id)} triggerRouteSource "
+                    f"{channel.trigger_route_source} uses {shown}, the {field}: "
+                    "its route would carry that clock into the trigger, and the "
+                    f"laser would arm on its first edge; choose a different "
+                    f"route source or {field}")
         for terminal in listeners:
             if backplane_line_of(terminal) == clock:
                 clashes.append(
@@ -82,6 +91,29 @@ def clock_line_clashes(
             f"{backplane_clock_line}; the two clocks need a line each: choose "
             "another pulseClockLine")
     return tuple(clashes)
+
+
+def _bare_backplane_line(field: str, value) -> str:
+    """`value` as the one PXI_Trig line it names, spelt as DAQmx spells it.
+
+    Bare, without a board: the controller names the line on whichever board
+    drives or reads it, so a board given here was either taken for the line
+    or silently dropped. Empty, or anything but a PXI_Trig line, is refused.
+    """
+    text = "" if value is None else str(value).strip()
+    if not text:
+        raise ValueError(
+            f"{field} is empty: it must be a PXI_Trig line, such as PXI_Trig1")
+    if "/" in text:
+        raise ValueError(
+            f"{field} {text!r} names a board: give the bare line, such as "
+            f"{text.strip('/').rsplit('/', 1)[-1]}, which every board in the "
+            "chassis sees as its own")
+    line = backplane_line_of(text)
+    if line is None:
+        raise ValueError(
+            f"{field} {text!r} is not a PXI_Trig line, such as PXI_Trig1")
+    return "PXI_Trig" + line[len("pxi_trig"):]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -163,25 +195,29 @@ class LaserSystemConfiguration:
     backend: str = "disabled"
     pmt_shutter_output: Optional[str] = None
     trigger_listener_inputs: Tuple[str, ...] = tuple()
-    #: Backplane line the shared sample clock is driven onto when a laser's
-    #: output sits on a different board from the clock producer. Only used in
-    #: that case, and never a line a trigger takes (clock_line_clashes): two
-    #: drivers on one line corrupt both, and DAQmx does not see it across
-    #: christielab10's boards.
+    #: Bare backplane line (PXI_TrigN, no board) the shared sample clock is
+    #: driven onto when a laser's output sits on a different board from the
+    #: clock producer, and the calibration ramp's clock too. Never a line a
+    #: trigger takes (clock_line_clashes): two drivers on one line corrupt
+    #: both, and DAQmx does not see it across christielab10's boards.
     backplane_clock_line: str = "PXI_Trig1"
-    #: Backplane line a synchronized pulse train drives its analog output's
-    #: own sample clock onto, for a clocked digital line (PMT shutter, trigger
-    #: or timing trigger output) on another board. That line cannot wait for
-    #: the pulse's start trigger: an M Series board's clocked digital output
-    #: takes none (christielab10: do_trig_usage empty, -200452 at verify), so
-    #: it runs on the clock that ticks only once the output has triggered.
-    #: backplane_clock_line carries the shared clock then, so this is a line
-    #: of its own, and a free one (clock_line_clashes).
+    #: Bare backplane line every pulse train drives its analog output's own
+    #: sample clock onto, for a clocked digital line (PMT shutter, trigger or
+    #: timing trigger output) on another board. That line cannot wait for the
+    #: pulse's start trigger: an M Series board's clocked digital output takes
+    #: none (christielab10: do_trig_usage empty, -200452 at verify), so it runs
+    #: on the clock that ticks only once the output has triggered.
+    #: backplane_clock_line carries the shared clock in a synchronized pulse,
+    #: so this is a line of its own, and a free one (clock_line_clashes).
     pulse_clock_line: str = "PXI_Trig3"
 
     def __post_init__(self):
         object.__setattr__(self, "channels", tuple(self.channels))
         object.__setattr__(self, "trigger_listener_inputs", tuple(self.trigger_listener_inputs))
+        for attribute, field in (("backplane_clock_line", "backplaneClockLine"),
+                                 ("pulse_clock_line", "pulseClockLine")):
+            object.__setattr__(self, attribute, _bare_backplane_line(
+                field, getattr(self, attribute)))
         channel_ids = tuple(channel.channel_id for channel in self.channels)
         if len(channel_ids) > 4:
             raise ValueError("at most four laser channels are supported")

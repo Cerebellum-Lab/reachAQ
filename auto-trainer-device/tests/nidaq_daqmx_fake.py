@@ -139,6 +139,10 @@ class FakeTask:
         if self.closed:
             # The fake's model of a call on a task already cleared.
             raise RuntimeError(f"{self.name} was closed before it was aborted")
+        if mode == "commit":
+            # Programmed on the board, and started later; nothing else here.
+            self.daq.log.append(("commit", self.name))
+            return
         if self.daq.failing_abort and self.name.endswith(self.daq.failing_abort):
             raise RuntimeError(f"DAQmx refused to abort {self.name}")
         self.aborted.set()
@@ -196,6 +200,8 @@ class FakeDaqmx:
         self.before_control = None
         #: A task, by name suffix, whose abort fails while it is still open.
         self.failing_abort = None
+        #: Routes, as (source, destination), the driver will not disconnect.
+        self.failing_disconnects = set()
         #: Called as read_samples(task, count) for what a read returns, in
         #: place of a constant 1.0, such as a diode's step response.
         self.read_samples = None
@@ -222,7 +228,7 @@ class FakeDaqmx:
         self.do_takes_start_trigger = do_takes_start_trigger
         self.constants = SimpleNamespace(
             AcquisitionType=SimpleNamespace(FINITE="finite"),
-            TaskMode=SimpleNamespace(TASK_ABORT="abort"),
+            TaskMode=SimpleNamespace(TASK_ABORT="abort", TASK_COMMIT="commit"),
             Edge=SimpleNamespace(RISING="rising", FALLING="falling"),
         )
         daq = self
@@ -257,6 +263,8 @@ class FakeDaqmx:
 
     def disconnect_terms(self, source, destination):
         self.sick("disconnect_terms")
+        if (source, destination) in self.failing_disconnects:
+            raise RuntimeError(f"DAQmx refused to disconnect {source} -> {destination}")
         self.disconnected.append((source, destination))
         self.log.append(("disconnect", (source, destination)))
 
