@@ -1158,10 +1158,14 @@ def test_a_ramp_whose_controller_failed_to_open_shows_the_pending_close_in_idle(
         daq.hang_released.set()
 
 
-def test_a_stop_and_a_close_entering_together_close_the_laser_once(app_model, monkeypatch):
+@pytest.mark.parametrize("order", ["together", "one_after_the_other"])
+def test_a_stop_and_a_close_entering_together_close_the_laser_once(
+    app_model, monkeypatch, order,
+):
     # The check for a close under way and the listing of this one were two
     # holds of the lock: a Stop and closing that both checked before either
-    # listed its close ran two on one controller.
+    # listed its close ran two on one controller. One that comes after the
+    # other has finished finds nothing to close, and calls nothing either.
     from tools.acquisition.model import app_model as app_model_module
 
     _system_mode_with_the_fake_laser(app_model, monkeypatch, lasers=_ROUTED_LASER)
@@ -1184,11 +1188,14 @@ def test_a_stop_and_a_close_entering_together_close_the_laser_once(app_model, mo
             pass
         return generation()
 
-    monkeypatch.setattr(app_model, "_laser_status_generation", meet_then_generation)
+    if order == "together":
+        monkeypatch.setattr(app_model, "_laser_status_generation", meet_then_generation)
     monkeypatch.setattr(app_model_module, "_LASER_CONTROLLER_CLOSE_S", 5.0)
     try:
         stop, stop_outcome = _in_thread(
             app_model._close_laser_within_bound, "System Mode stops")
+        if order == "one_after_the_other":
+            stop.join(10.0)
         exit_, exit_outcome = _in_thread(
             app_model._close_laser_within_bound, "reachAQ is closing")
         for thread in (stop, exit_):
