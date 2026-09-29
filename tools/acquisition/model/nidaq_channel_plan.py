@@ -53,11 +53,12 @@ def _claimed_role_names(
     a trigger readback, or for tone1 or camFrames.
 
     Every port role claims its name always: the ports are planned whatever
-    else is configured. While the laser backend is enabled, the roles of
-    every laser there can be claim theirs, configured or not. Claimed only
-    for the lasers configured, a laser tab cleared in Edit DAQ Ports took
-    that laser out of the list, and its laser2_diode and laser2_command_copy
-    stayed in the scan: recorded, hidden, and shown nowhere.
+    else is configured. While the laser backend is enabled, the roles of all
+    four lasers claim their names, whether each laser is configured or not.
+    When only the configured lasers' roles claimed theirs, a laser tab
+    cleared in Edit DAQ Ports took that laser out of the list, and its
+    laser2_diode and laser2_command_copy stayed in the scan: recorded,
+    hidden, and shown nowhere.
 
     With the backend disabled the plan adds no laser role at all. A laser
     not in `configured_lasers` still claims its names, so its stored

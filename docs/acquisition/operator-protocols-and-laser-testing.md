@@ -381,7 +381,12 @@ shutter** holds the PMT shutter open for the ramp. Press **Run Ramp**.
   a step still read the step before: averaged in, they pulled every point of
   a rising ramp low. The default is a fifth of **Samples/step:**, 20 of 100
   samples (200 us at christielab10's 100 kHz), until a measured step response
-  says otherwise; it must leave at least one sample of each step.
+  says otherwise; it must leave at least one sample of each step. **Settle:**
+  follows a fifth of **Samples/step:** until you change it, and after that
+  only drops when **Samples/step:** would leave it no sample. **Samples/step:**
+  is taken when you finish typing (Return, leaving the field, or **Run
+  Ramp**). All of the ramp's fields go back to their defaults whenever Laser
+  Control is rebuilt: on every Run/Stop and every DAQ Ports save.
   `tools/hardware/validate_laser_hardware.py --action ramp` takes the same
   window as `--settle-samples`.
 
