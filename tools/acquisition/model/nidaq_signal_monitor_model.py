@@ -549,7 +549,7 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
                 self._set_starting(False)
                 self._set_running(False)
                 self._set_status("NI-DAQ signal stream stopped")
-                self._set_error(str(exc) or exc.__class__.__name__)
+                self._announce_error(str(exc) or exc.__class__.__name__)
                 return False
 
             self._process = process
@@ -633,7 +633,7 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
                         f"NI-DAQmx runtime did not become ready within "
                         f"{self._startup_timeout_seconds:g} seconds; its isolated worker was stopped"
                     )
-                    logger.error(worker_error)
+                    self._log_worker_message(process, "%s", worker_error)
                     stop_event.set()
                     process.terminate()
                     process.join(timeout=0.5)
@@ -675,7 +675,8 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
                     message = str(payload)
                     if not worker_error:
                         worker_error = message
-                    logger.error("NI-DAQ signal stream worker error: %s", message)
+                    self._log_worker_message(
+                        process, "NI-DAQ signal stream worker error: %s", message)
                 elif kind == _WORKER_LOG:
                     level, logger_name, message, always_console = payload
                     extra = {ALWAYS_CONSOLE_LOG_ATTRIBUTE: True} if always_console else None
@@ -729,9 +730,9 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
                         self._set_error(worker_error)
                     else:
                         logger.warning(
-                            "NI-DAQ signal stream worker pid=%s ended after a "
-                            "newer start replaced it; its error is not the "
-                            "current stream's: %s",
+                            "NI-DAQ signal stream worker pid=%s ended after the "
+                            "monitor stopped or replaced it; its error is not "
+                            "the current stream's: %s",
                             process.pid,
                             worker_error,
                         )
@@ -765,6 +766,34 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
     def _set_error(self, value: str) -> None:
         prev, self._error_message = self._error_message, value
         self._on_property_changed(self.ERROR_MESSAGE, value, prev)
+
+    def _announce_error(self, value: str) -> None:
+        """Set the error and say so even when it is the one already held.
+
+        A refused start is news each time: nothing clears the error between
+        two refusals of the same plan, and announced only on a change, the
+        second went unsaid. Stop wrote "stopped" in between, and so did a
+        refresh or a settings save, and NI-DAQ read so while every start was
+        refused.
+        """
+        prev, self._error_message = self._error_message, value
+        self.property_changed(self.ERROR_MESSAGE, value, prev)
+
+    def _log_worker_message(self, process, message: str, *args) -> None:
+        """A worker's error, at ERROR while it is the monitor's, else WARNING.
+
+        With its pid either way. A thread its stop let go of can still read
+        its worker's messages after a newer worker came up healthy, and put
+        them on the status bar as that stream's.
+        """
+        with self._lock:
+            current = process is self._process
+        if current:
+            logger.error("NI-DAQ worker pid=%s | " + message, process.pid, *args)
+        else:
+            logger.warning(
+                "NI-DAQ worker pid=%s, stopped or replaced | " + message,
+                process.pid, *args)
 
     def _set_timing_plan(self, value: Optional[NidaqTimingPlan]) -> None:
         previous, self._timing_plan = self._timing_plan, value

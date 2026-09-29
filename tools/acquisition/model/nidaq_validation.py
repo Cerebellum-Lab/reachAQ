@@ -314,8 +314,13 @@ def validate_nidaq_configuration(
     ports=None,
     laser=None,
     timing_plan=None,
+    clock_source=None,
 ) -> Tuple[ValidationIssue, ...]:
-    """Every assertion the configuration makes, against the installed boards."""
+    """Every assertion the configuration makes, against the installed boards.
+
+    The laser's route check needs the board the shared clock comes from:
+    `clock_source`, else the timing plan's sample clock.
+    """
     devices = tuple(devices)
     if not devices:
         return tuple()
@@ -354,8 +359,25 @@ def validate_nidaq_configuration(
 
     issues.extend(validate_trigger_capability(devices, laser))
     issues.extend(validate_output_timing(
-        devices, laser, getattr(timing_plan, "sample_clock_source", None)))
+        devices, laser,
+        clock_source or getattr(timing_plan, "sample_clock_source", None)))
     return tuple(issues)
+
+
+def stream_clock_source(stream) -> Optional[str]:
+    """The sample clock a plan would give `stream` by default, for want of a plan.
+
+    Its first analog input's board, or its first line's: the board the plan
+    makes master when nothing else is asked for. A start the plan refused
+    leaves no clock on it, and the laser's route check, which reads the
+    clock's board off the plan, went unasked beside the refusal.
+    """
+    channels = tuple(getattr(stream, "channels", ()) or ())
+    for channel in sorted(channels, key=lambda item: getattr(item, "kind", "") != "analog"):
+        device = _device_of(getattr(channel, "physical_channel", ""))
+        if device:
+            return f"/{device}/ai/SampleClock"
+    return None
 
 
 def require_valid_nidaq_configuration(devices, **kwargs) -> None:

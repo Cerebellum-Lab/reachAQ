@@ -471,7 +471,7 @@ def test_an_old_workers_late_error_cannot_fail_the_stream_that_replaced_it(
 
         monitor.stop()
 
-        assert context.held.is_set() and old_thread.is_alive()
+        assert context.held.wait(5.0) and old_thread.is_alive()
         monitor._worker_target = nidaq_stream_fakes.idle_worker
         assert monitor.start()
         assert _settle(nidaq_app).is_running, "worker B did not start"
@@ -498,6 +498,80 @@ def test_an_old_workers_late_error_cannot_fail_the_stream_that_replaced_it(
         assert f"pid={old_pid}" in warning.getMessage()
     finally:
         context.release.set()
+
+
+class _EndedProcess:
+    """A worker process, for driving the monitor's thread directly."""
+
+    def __init__(self, pid, *, alive=False):
+        self.pid = pid
+        self.exitcode = 0
+        self._alive = alive
+
+    def is_alive(self):
+        return self._alive
+
+    def join(self, timeout=None):
+        pass
+
+    def terminate(self):
+        self._alive = False
+
+
+def _monitor_thread_log(caplog, process, messages, *, current, **settings):
+    monitor = nidaq_signal_monitor_model.NidaqSignalMonitorModel()
+    for name, value in settings.items():
+        setattr(monitor, name, value)
+    # A newer worker, or this one.
+    monitor._process = process if current else object()
+    with caplog.at_level("WARNING"):
+        monitor._run(process, messages, threading.Event(), time.perf_counter())
+    return monitor
+
+
+def test_a_replaced_workers_own_error_is_a_warning_naming_it(caplog):
+    # Its thread logged the error it read at ERROR, with no pid: the status
+    # bar showed "Error: NI-DAQ signal stream worker error" over a healthy
+    # newer worker.
+    messages = queue.Queue()
+    messages.put(("error", "the old task failed"))
+    messages.put(("stopped", None))
+
+    monitor = _monitor_thread_log(caplog, _EndedProcess(4242), messages, current=False)
+
+    said = [record for record in caplog.records
+            if "the old task failed" in record.getMessage()]
+    assert said
+    assert all(record.levelname == "WARNING" and "pid=4242" in record.getMessage()
+               for record in said)
+    assert monitor.error_message == ""
+
+
+def test_a_replaced_workers_startup_timeout_is_a_warning_naming_it(caplog):
+    monitor = _monitor_thread_log(
+        caplog, _EndedProcess(4343, alive=True), queue.Queue(), current=False,
+        _startup_timeout_seconds=0.0)
+
+    said = [record for record in caplog.records
+            if "did not become ready" in record.getMessage()]
+    assert said
+    assert all(record.levelname == "WARNING" and "pid=4343" in record.getMessage()
+               for record in said)
+    assert monitor.error_message == ""
+
+
+def test_the_current_workers_error_is_an_error_naming_it(caplog):
+    messages = queue.Queue()
+    messages.put(("error", "the task failed"))
+    messages.put(("stopped", None))
+
+    monitor = _monitor_thread_log(caplog, _EndedProcess(4444), messages, current=True)
+
+    read = [record for record in caplog.records
+            if "worker error: the task failed" in record.getMessage()]
+    assert [record.levelname for record in read] == ["ERROR"]
+    assert "pid=4444" in read[0].getMessage()
+    assert monitor.error_message == "the task failed"
 
 
 def test_a_hardware_refresh_starts_a_stopped_stream(nidaq_app, monkeypatch):
@@ -611,6 +685,113 @@ def test_an_idle_start_refuses_a_line_its_board_cannot_clock_as_run_does(
     assert run.state is idle.state
     assert idle.error in run.error
     refresh_is_refused_again(3)
+
+
+def _refused_idle_start(nidaq_app, monkeypatch):
+    """Load a plan whose Dev1 line cannot be clocked; the Idle start refuses it."""
+    from hardware_status_content_test import _patch_hardware_scans
+    from tools.acquisition.model import app_model as app_model_module
+
+    discover = _discover_dev1_lines(None)
+    monitor = nidaq_app.nidaq_signal_monitor
+    monitor._device_discovery = discover
+    preflights = []
+    monitor._exact_preflight = _counting_preflight(preflights, valid=False)
+    _patch_hardware_scans(nidaq_app, monkeypatch)
+    monkeypatch.setattr(app_model_module, "discover_nidaq_devices", discover)
+    assert nidaq_app.load_configuration() is True
+    _settle(nidaq_app, running=False)
+    refused = _nidaq_state(nidaq_app)
+    assert refused.state is SubsystemState.FAILED
+    return refused.error
+
+
+def _refused_again(nidaq_app, reason):
+    status = _nidaq_state(nidaq_app)
+    assert status.state is SubsystemState.FAILED, status
+    assert reason in status.error
+
+
+def test_a_repeated_idle_refusal_is_said_each_time(nidaq_app, monkeypatch):
+    # The refusal's text is the same each time, and the monitor announced
+    # its error only when it changed: after a Run and a Stop, a Hardware
+    # refresh, or a hardware settings save, NI-DAQ read "stopped" or
+    # "configured; not started" while every start was refused.
+    reason = _refused_idle_start(nidaq_app, monkeypatch)
+
+    nidaq_app.capture_start()
+    nidaq_app.capture_stop()
+    _settle(nidaq_app, running=False)
+    _refused_again(nidaq_app, reason)
+
+    # Something else first, so what follows is the refresh's own writing.
+    nidaq_app._set_subsystem_status(
+        SubsystemId.NIDAQ_STREAM, SubsystemState.STOPPED, reason="before the refresh")
+    nidaq_app.refresh_hardware_bindings()
+    _settle(nidaq_app, running=False)
+    _refused_again(nidaq_app, reason)
+
+    nidaq_app._set_subsystem_status(
+        SubsystemId.NIDAQ_STREAM, SubsystemState.STOPPED, reason="before the save")
+    hardware = nidaq_app.loaded_configuration.hardware
+    nidaq_app.update_hardware_configuration(
+        can_enabled=hardware.can_enabled,
+        pellet_controller_enabled=hardware.pellet_controller_enabled,
+        nidaq_enabled=hardware.nidaq_enabled,
+        rfid_reader_enabled=hardware.rfid_reader_enabled,
+        rfid_device=hardware.rfid_device,
+    )
+    _settle(nidaq_app, running=False)
+    _refused_again(nidaq_app, reason)
+
+
+def test_run_still_lists_a_laser_route_problem_after_an_idle_refusal(
+    app_model, system_config, trainer_config_dir, monkeypatch,
+):
+    # The Idle refusal left an invalid plan with no clock on the monitor, and
+    # Run's check read the clock's board off it: the laser's missing route
+    # went unlisted beside the refused line.
+    from autotrainer.core import NidaqSignalChannelConfiguration, NidaqSignalStreamConfiguration
+    from tools.acquisition.model import app_model as app_model_module
+    from tools.acquisition.model.nidaq_routing import UNIDENTIFIED
+
+    def board(name, **values):
+        return NidaqDevicePorts(
+            name=name, bus_type="PXI", pxi_chassis_number=UNIDENTIFIED,
+            pxi_slot_number=UNIDENTIFIED, counter_outputs=(f"{name}/ctr0",),
+            digital_inputs=(f"{name}/port0/line0",), **values)
+
+    devices = (
+        board("Dev1", analog_inputs=("Dev1/ai0",), digital_input_max_rate=1_000_000.0),
+        board("Dev2", analog_outputs=("Dev2/ao0",)),
+    )
+    discover = lambda: (devices, None)  # noqa: E731
+    system_config.hardware.nidaq_enabled = True
+    system_config.nidaq_ports = NidaqPortConfiguration(cam_frames="Dev2/port0/line0")
+    system_config.nidaq_stream = NidaqSignalStreamConfiguration(
+        channels=(NidaqSignalChannelConfiguration("stim_readback", "Dev1/ai0"),),
+        is_enabled=True)
+    system_config.laser = LaserSystemConfiguration.from_channels(
+        (LaserChannelConfiguration(
+            channel_id=LaserChannelId.LASER_1, analog_output="Dev2/ao0",
+            diode_input="Dev1/ai0", shutter_output="Dev1/port0/line0"),),
+        hardware_timed=True, sample_rate_hz=10_000.0)
+    system_config.save_default(trainer_config_dir)
+    monitor = _with_fake_worker(app_model)
+    monitor._device_discovery = discover
+    monkeypatch.setattr(app_model_module, "discover_nidaq_devices", discover)
+    try:
+        assert app_model.load_configuration() is True
+        _settle(app_model, running=False)
+        assert monitor.timing_plan is not None and not monitor.timing_plan.is_valid
+
+        assert app_model._start_nidaq_domain(restart=True) is False
+
+        error = _nidaq_state(app_model).error
+        assert "Dev2, which cannot clock digital input" in error
+        assert "laser channel 1 output" in error and "no explicit route" in error
+    finally:
+        _close_stream(app_model, monitor)
 
 
 def test_an_idle_start_on_a_board_that_clocks_digital_input_is_unchanged(nidaq_app):
