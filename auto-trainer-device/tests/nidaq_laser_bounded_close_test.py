@@ -262,8 +262,8 @@ def test_a_route_another_call_leaves_pending_is_given_up_on(monkeypatch):
     daq = FakeDaqmx()
     monkeypatch.setattr(nidaq_laser, "_load_nidaqmx", lambda: daq)
     controller = NidaqLaserController(rig_lasers())
-    with controller._route_lock():
-        controller._route_pending()[AO_CLOCK_ROUTE] = "connect"
+    with controller._operation_lock:
+        controller._pending_routes[AO_CLOCK_ROUTE] = "connect"
     try:
         waiter, outcome = _in_thread(lambda: controller._shared_clock_for(
             "PXI1Slot5", "/PXI1Slot4/ao/SampleClock", line="PXI_Trig1"))
@@ -275,5 +275,5 @@ def test_a_route_another_call_leaves_pending_is_given_up_on(monkeypatch):
         assert "/PXI1Slot4/ao/SampleClock -> /PXI1Slot4/PXI_Trig1" in str(error)
         assert daq.connected == []
     finally:
-        with controller._route_lock():
+        with controller._operation_lock:
             controller._settle_route(AO_CLOCK_ROUTE)
