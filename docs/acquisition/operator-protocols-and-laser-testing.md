@@ -298,8 +298,9 @@ aborted by the cancel, after the output. On christielab10's 6221 an abort ended
 a waiting task in about 40 ms, where a stop from another thread waited for the
 whole task (H5b, H5a). On the 6713 the output was back at 0 V 24-40 ms after a
 cancel; the abort itself takes 12.6-32 ms, and varies from run to run. A pulse
-armed and waiting for its trigger ends the same way. The controller waits up to five seconds for a train that does not
-end, as with a sick driver, before it goes on without it. The status line
+armed and waiting for its trigger ends the same way. The controller waits up
+to five seconds for a train that does not end, as with a sick driver, before
+it goes on without it. The status line
 then reads *"Laser operation failed: Laser operation ... was cancelled: the
 laser controller was closed while it ran"*. A pulse that failed by itself
 just as Stop was pressed, such as one whose trigger never came, keeps its

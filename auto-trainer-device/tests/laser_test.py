@@ -44,22 +44,24 @@ def open_controller(daq):
     These tests built one with object.__new__ and set only the attributes
     the path under test read, and the controller kept a guard for each one
     they left out. Opened whole, it has every attribute __init__ sets. Each
-    is closed after the test.
+    is closed after the test, and no task on the fake is left open.
     """
     opened = []
 
-    def open_one(channel=None, **kwargs):
+    def open_one(channel=None, *, timing_plan=None, feedback_reader=None,
+                 **configuration):
         controller = NidaqLaserController(
             LaserSystemConfiguration.from_channels(
                 [channel or make_channel()], backend="nidaq",
-                hardware_timed=True, sample_rate_hz=1000.0),
-            **kwargs)
+                hardware_timed=True, sample_rate_hz=1000.0, **configuration),
+            timing_plan=timing_plan, feedback_reader=feedback_reader)
         opened.append(controller)
         return controller
 
     yield open_one
     for controller in opened:
         controller.close()
+    assert [task.label for task in daq.tasks if not task.closed] == []
 
 
 def test_laser_channel_configuration_normalizes_channel_id():
@@ -264,7 +266,8 @@ def test_nidaq_laser_uses_shared_clock_only_with_future_hardware_trigger(
         hardware_output_devices=("Dev1",),
         hardware_output_timing_status="declared_not_armed",
     )
-    controller = open_controller(channel, timing_plan=plan)
+    controller = open_controller(
+        channel, timing_plan=plan, backplane_clock_line="PXI_Trig1")
     pulse = LaserSynchronizedPulseTrain(
         pulse_trains=(LaserPulseTrain(
             channel_id=LaserChannelId.LASER_1,
@@ -316,7 +319,9 @@ def test_a_clock_already_on_the_output_board_acquires_no_route(open_controller, 
     assert daq.connected == []
 
 
-def test_nidaq_laser_labels_deferred_start_as_software_timed_without_plan(open_controller):
+def test_nidaq_laser_labels_deferred_start_as_software_timed_without_plan(
+    open_controller,
+):
     channel = make_channel()
     controller = open_controller(channel, timing_plan=None)
     pulse = LaserSynchronizedPulseTrain(
@@ -335,7 +340,9 @@ def test_nidaq_laser_labels_deferred_start_as_software_timed_without_plan(open_c
     assert status["status"] == "software_start"
 
 
-def test_nonblocking_laser_operation_is_owned_until_terminal(open_controller, monkeypatch):
+def test_nonblocking_laser_operation_is_owned_until_terminal(
+    open_controller, monkeypatch,
+):
     controller = open_controller()
     release = threading.Event()
 

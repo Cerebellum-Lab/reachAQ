@@ -464,9 +464,9 @@ class NidaqLaserController:
         }
         self._tasks: Dict[LaserChannelId, _NidaqLaserTasks] = {}
         #: Backplane routes held open for this controller, source to
-        #: destination, released in close(). Changed only under
-        #: _operation_lock: a ramp releases its own routes from its thread
-        #: while close() may be releasing all of them from another.
+        #: destination, released in close(). After __init__, changed only
+        #: under _operation_lock: a ramp releases its own routes from its
+        #: thread while close() may be releasing all of them from another.
         self._trigger_routes: List[Tuple[str, str]] = []
         self._command_volts: Dict[LaserChannelId, float] = {}
         #: Bookkeeping only: nothing is called in the driver while it is held
