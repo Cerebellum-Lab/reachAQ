@@ -15,9 +15,10 @@ Method: drive one thing at a time and watch everything readable.
     on both boards read as a static level. This needs no timing and no edge
     detection, so it names the pin for each output outright;
   * each laser command output is held at a DC level while the configured
-    analog channels are read. A laser's trigger readback, laserN_trigger,
-    follows the board STIM rather than the command, and is not checked
-    against it.
+    analog channels are read. A laser's trigger readback (laserN_trigger,
+    or laserN_trigger_readback) and its trigger input (laserN_trigger_in)
+    follow the board STIM rather than the command, and are not checked
+    against it; the board output sweep checks the digital ones.
 
 It reports what it saw and where that contradicts the configuration. It does
 not diagnose why: a mislabelled cable, a split, and coupling between inputs
@@ -225,7 +226,10 @@ def observe_undriven(nidaqmx, points, seconds, undriven, report):
     not the same as carrying what the configuration says it does. The
     operator asserts the cause by choosing when to start the camera.
     """
-    watched = [point for point in points if point.fingerprint in undriven]
+    # Only the digital ports are read: an analog trigger readback listed here
+    # could never be seen to change.
+    watched = [point for point in points if point.fingerprint in undriven
+               and not (is_trigger_readback(point) and _is_analog(point))]
     if not watched:
         print("\n" + "nothing to observe: every point had a driver")
         return
@@ -400,8 +404,10 @@ def inspect_configuration(configuration):
     return tuple(issue.describe() for issue in issues), notes
 
 
-#: A laser's board-trigger readback, as the channel plan names it.
-_TRIGGER_READBACK = re.compile(r"laser\d+_trigger")
+#: A laser's board-trigger readback: laserN_trigger, as the channel plan
+#: names it, or laserN_trigger_readback, the custom channel christielab10
+#: acquires it as (tests/christielab10_nidaq_blocks.yaml).
+_TRIGGER_READBACK = re.compile(r"laser\d+_trigger(?:_readback)?")
 #: What a trigger readback's check says when nothing here confirmed it.
 TRIGGER_READBACK_NOT_CHECKED = (
     "trigger readback: not checked against the command (it follows the "
@@ -409,8 +415,12 @@ TRIGGER_READBACK_NOT_CHECKED = (
 
 
 def is_trigger_readback(point) -> bool:
-    """Whether `point` is a laser's board-trigger readback, laserN_trigger."""
+    """Whether `point` is a laser's board-trigger readback (_TRIGGER_READBACK)."""
     return bool(_TRIGGER_READBACK.fullmatch(point.name))
+
+
+def _is_analog(point) -> bool:
+    return "/ai" in point.physical_channel
 
 
 def follows_laser_command(point, number) -> bool:
@@ -418,9 +428,13 @@ def follows_laser_command(point, number) -> bool:
 
     Its inputs do, by name. Its trigger readback does not: it carries the
     board's STIM line, and held against the command a correctly wired one
-    read as silent.
+    read as silent. Nor does its trigger input, laserN_trigger_in, the PFI
+    the STIM arrives on: the board output sweep checks it, and with CAN down
+    it read as silent, nothing having driven it.
     """
-    return point.name.startswith(f"laser{number}_") and not is_trigger_readback(point)
+    return (point.name.startswith(f"laser{number}_")
+            and not is_trigger_readback(point)
+            and not point.name.endswith("_trigger_in"))
 
 
 def record_laser_responses(analog_points, number, levels, observed_by_point):
@@ -462,8 +476,12 @@ def driver_exercised(point, lasers_driven, board_outputs_exercised) -> bool:
             return True
     if not board_outputs_exercised:
         return False
-    return point.name in {"tone1", "tone2"} or point.name.endswith(
-        "_trigger_in")
+    # The sweep holds each board STIM high and reads every digital line: a
+    # digital trigger readback is asked there. An analog one is read by
+    # nothing here while a STIM line is held.
+    return (point.name in {"tone1", "tone2"}
+            or point.name.endswith("_trigger_in")
+            or (is_trigger_readback(point) and not _is_analog(point)))
 
 
 def judge_points(points, observed_by_point, lasers_driven,
@@ -504,17 +522,16 @@ def judge_points(points, observed_by_point, lasers_driven,
                 status = SILENT
                 method = "confirmed through what it drove"
                 detail = "driving it moved nothing it is wired to"
-        elif is_trigger_readback(point):
-            # The command says nothing about it. A digital readback the board
-            # output sweep saw go high was confirmed above; one it did not see
-            # is not called silent on that alone, and nothing here reads an
-            # analog one while a STIM line is held.
-            status = UNTESTED
-            method = "not checked against the command"
-            detail = TRIGGER_READBACK_NOT_CHECKED
         elif exercised(point):
             status = SILENT
             detail = "its driver was exercised and it did not respond"
+        elif is_trigger_readback(point):
+            # The command says nothing about it: an analog readback, which
+            # nothing here reads while a STIM line is held, or a digital one
+            # with no board output sweep (CAN down).
+            status = UNTESTED
+            method = "not checked against the command"
+            detail = TRIGGER_READBACK_NOT_CHECKED
         else:
             status = UNTESTED
             method = "no driver available"
