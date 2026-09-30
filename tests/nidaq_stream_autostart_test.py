@@ -284,6 +284,8 @@ def test_nothing_held_back_to_take_back_does_not_wait_for_a_start():
     starter.start()
     try:
         assert discovering.wait(5.0)
+        # The start holds the lock while it discovers.
+        assert not monitor._lock.acquire(blocking=False)
         caller = threading.Thread(
             target=monitor.show_held_back, args=("",), daemon=True)
         caller.start()
