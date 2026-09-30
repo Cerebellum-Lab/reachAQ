@@ -65,14 +65,18 @@ def _pulse_is_running(daq):
 
 
 @pytest.fixture(autouse=True)
-def _every_controller_closed():
+def _every_controller_closed(monkeypatch):
     """Close each controller a test opened, then check no fake task is open.
 
     Most tests here never closed theirs, which kept its channel tasks, and
     any trigger route, open on the fake. This is torn down after the test's
-    own fixtures, so its patches are undone by then. A stand-in the test set
-    on the controller itself is dropped, and any wait or call it left held
-    is let go, so the close meets the fake as a controller's close would.
+    own fixtures, such as held, but before monkeypatch: the root conftest's
+    autouse fixtures ask for monkeypatch first, so it outlives this one.
+    The test's patches (a frozen clock, a shorter cancel bound) are undone
+    here before the close. A stand-in the test assigned on the controller
+    itself, which no undo reaches, is dropped, and any wait or call it left
+    held is let go, so the close meets the fake as a controller's close
+    would.
     """
     opened = []
     init = NidaqLaserController.__init__
@@ -81,11 +85,10 @@ def _every_controller_closed():
         init(self, *args, **kwargs)
         opened.append(self)
 
-    NidaqLaserController.__init__ = opening
-    try:
+    with pytest.MonkeyPatch.context() as tracking:
+        tracking.setattr(NidaqLaserController, "__init__", opening)
         yield
-    finally:
-        NidaqLaserController.__init__ = init
+    monkeypatch.undo()
     fakes = {id(controller._nidaqmx): controller._nidaqmx for controller in opened}
     for daq in fakes.values():
         daq.waits_released.set()
