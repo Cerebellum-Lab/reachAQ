@@ -141,7 +141,9 @@ class UserPreferences(ObservableObject):
     def _saved_flag(self, key: str) -> Optional[bool]:
         """A saved true or false, or None: nothing saved, or anything else.
 
-        Read untyped and judged here: a typed read would turn whatever a
+        Read untyped and judged here. Parsed from the file, true and false
+        come back as the str they are written as; only a value this process
+        set comes back a bool. A typed read would turn whatever else a
         damaged or hand-edited file holds into a bool by rules of its own.
         Never raises, so a bad file cannot stop a panel opening; it opens as
         it would with nothing saved.
