@@ -389,3 +389,104 @@ def test_tone_confirmation_rejects_unmatched_in_session_evidence(tmp_path):
     assert result.status.value == "fail"
     assert result.observed["unmatched_events"] == 1
     assert result.observed["unmatched_edges"] == 1
+
+
+# ------------------------------------- manual Run Pulse events in laser.csv (D-D)
+
+_LASER_HEADER = "perf_time,event,channel,source,operation_id,context_json,frame_id\n"
+
+
+def _laser_row(perf, event, source, operation_id, frame_id=11):
+    context = '"{""manual"": true}"' if operation_id.startswith("manual-") else "{}"
+    return f"{perf},{event},1,{source},{operation_id},{context},{frame_id}\n"
+
+
+def _rule(root, rule_id):
+    report = validate_session(
+        root, profile=ValidationProfile.FAST, selected_rules=(rule_id,))
+    return next(item for item in report.results if item.rule_id == rule_id)
+
+
+def test_events_laser_counts_the_manual_run_pulse_events(tmp_path):
+    # A manual Run Pulse fired while recording is kept as a requested row and
+    # an outcome row sharing its manual- id; the rule says how many it found,
+    # so a reviewer sees them (Ben, 2026-09-30).
+    root = _session(tmp_path)
+    _write(root / "streams/laser.csv", _LASER_HEADER + "".join((
+        _laser_row(10.0, "requested", "manual pulse", "manual-a"),
+        _laser_row(10.0, "trace", "internal pulse", ""),
+        _laser_row(10.2, "completed", "manual pulse", "manual-a"),
+        _laser_row(11.0, "requested", "manual pulse", "manual-b"),
+        _laser_row(11.1, "refused", "manual pulse", "manual-b"),
+    )))
+
+    result = _rule(root, "events.laser")
+
+    assert result.status.value == "pass"
+    assert result.message == (
+        "Laser events have recorded-frame evidence; 2 manual Run Pulse event(s)")
+
+    # With none, the message is what it was.
+    _write(root / "streams/laser.csv", _LASER_HEADER + _laser_row(
+        10.0, "trace", "internal pulse", ""))
+    assert _rule(root, "events.laser").message == (
+        "Laser events have recorded-frame evidence")
+
+
+def _write_protocol_trial_with_a_laser(root, laser_operation_id):
+    recipe = {
+        "operation_id": "prepared-op",
+        "protocol_id": "p",
+        "logical_trial_id": 1,
+        "attempt_id": 1,
+        "requested_row": {"trial_id": 1},
+        "resolved_dcs_target": [1, 2, 3],
+        "resolved_motor_target": [4, 5, 6],
+        "position_evidence": {"mode": "base"},
+        "stimulus_selected": False,
+        "stimulus_seed": 1,
+        "stimulus_draw": 0.5,
+        "laser_profile": {"profile_id": "burst", "revision": 1},
+    }
+    record = {
+        "trial_id": 1,
+        "attempt_id": 1,
+        "protocol_context": {"protocol_id": "p", "compiled_recipe": recipe},
+        "protocol_operation": {
+            "recipe": recipe,
+            "state": "completed",
+            "observations": [{"state": "completed", "perf_time": 11.0}],
+            "actions": {"laser": {
+                "state": "completed", "operation_id": laser_operation_id}},
+        },
+    }
+    _write(root / "streams/trials.jsonl", json.dumps(record) + "\n")
+
+
+def test_manual_run_pulse_events_are_never_a_protocol_lasers_evidence(tmp_path):
+    root = _session(tmp_path)
+    manual = (
+        _laser_row(10.5, "requested", "manual pulse", "manual-a"),
+        _laser_row(10.6, "completed", "manual pulse", "manual-a"),
+    )
+    _write(root / "streams/laser.csv", _LASER_HEADER + "".join((
+        _laser_row(10.0, "prepared", "protocol operation", "protocol-op"),
+        *manual,
+        _laser_row(11.0, "completed", "protocol operation", "protocol-op"),
+    )))
+    _write_protocol_trial_with_a_laser(root, "protocol-op")
+
+    # Manual events beside a trial's own leave it passing.
+    assert _rule(root, "trials.protocol").status.value == "pass"
+
+    # A trial naming a manual- id is not satisfied by rows under it, even
+    # rows that read as a protocol operation's.
+    _write(root / "streams/laser.csv", _LASER_HEADER + "".join((
+        _laser_row(10.0, "prepared", "manual pulse", "manual-a"),
+        *manual,
+    )))
+    _write_protocol_trial_with_a_laser(root, "manual-a")
+
+    result = _rule(root, "trials.protocol")
+    assert result.status.value == "fail"
+    assert "laser prepared event is absent" in result.message

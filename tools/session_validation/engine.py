@@ -747,6 +747,15 @@ _tone_confirmation_rule.RULE_ID = "events.tones"
 _tone_confirmation_rule.MINIMUM = ValidationProfile.FAST
 
 
+#: A manual Run Pulse's event id starts so (the laser model's
+#: MANUAL_PULSE_OPERATION_PREFIX); a protocol operation's never does.
+_MANUAL_PULSE_OPERATION_PREFIX = "manual-"
+
+
+def _is_manual_pulse(operation_id):
+    return str(operation_id or "").startswith(_MANUAL_PULSE_OPERATION_PREFIX)
+
+
 def _laser_confirmation_rule(context):
     path = context.path("streams/laser.csv")
     if not path.is_file():
@@ -763,11 +772,20 @@ def _laser_confirmation_rule(context):
             errors.append(f"row {line_number}: event is missing")
         if row.get("frame_id") in (None, ""):
             warnings.append(f"row {line_number}: no recorded-frame association")
+    message = (
+        "; ".join((errors or warnings)[:20]) if errors or warnings
+        else "Laser events have recorded-frame evidence"
+    )
+    # Each is a request and an outcome under one id. Said, so a reviewer
+    # sees them (Ben, 2026-09-30).
+    manual = {
+        row.get("operation_id") for row in rows if _is_manual_pulse(row.get("operation_id"))
+    }
+    if manual:
+        message += f"; {len(manual)} manual Run Pulse event(s)"
     return _result(
         "events.laser", "fail" if errors else ("warning" if warnings else "pass"),
-        "; ".join((errors or warnings)[:20]) if errors or warnings
-        else "Laser events have recorded-frame evidence",
-        observed=len(rows), paths=(path.as_posix(),),
+        message, observed=len(rows), paths=(path.as_posix(),),
     )
 _laser_confirmation_rule.RULE_ID = "events.laser"
 _laser_confirmation_rule.MINIMUM = ValidationProfile.FAST
@@ -1080,7 +1098,8 @@ def _protocol_action_rule(context):
         with laser_path.open("r", encoding="utf-8", newline="") as laser_stream:
             for laser_row in csv.DictReader(laser_stream):
                 operation_id = laser_row.get("operation_id")
-                if operation_id:
+                # A manual Run Pulse is never a trial's laser evidence.
+                if operation_id and not _is_manual_pulse(operation_id):
                     laser_events.setdefault(operation_id, set()).add(
                         laser_row.get("event")
                     )
