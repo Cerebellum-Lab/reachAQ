@@ -1263,11 +1263,23 @@ def test_laser_reads_failed_while_a_pulse_the_close_gave_up_on_runs(
 
     monkeypatch.setattr(nidaq_laser, "_OPERATION_CANCEL_TIMEOUT_S", 0.3)
     monkeypatch.setattr(app_model_module, "_LASER_CONTROLLER_CLOSE_S", 1.5)
-    # The pulse's cancel is not acted on (hold_waits), and the close hangs
-    # releasing the trigger route.
+    # A sick driver, whose abort does not end the pulse, and a close that
+    # hangs releasing the trigger route.
     daq = _system_mode_with_the_fake_laser(
         app_model, monkeypatch, lasers=_ROUTED_LASER, hang={"disconnect_terms"},
-        block_wait=True, hold_waits=True)
+        block_wait=True, hold_waits=True, abort_unblocks=False)
+    # Whenever it is asked what the close left running, the refusal: the
+    # close was taken off before the watch was listed, and in between laser
+    # work read as free with the pulse still in the driver.
+    seen = []
+    left_running = app_model.laser.work_left_running_after_close
+
+    def asked():
+        left = left_running()
+        seen.append((bool(left), app_model.laser_controller_close_refusal()))
+        return left
+
+    monkeypatch.setattr(app_model.laser, "work_left_running_after_close", asked)
     try:
         app_model.laser.run_synchronized_pulse_train(LaserSynchronizedPulseTrain(
             pulse_trains=(LaserPulseTrain(
@@ -1288,10 +1300,103 @@ def test_laser_reads_failed_while_a_pulse_the_close_gave_up_on_runs(
         assert status.error.startswith(
             "a laser operation the close gave up on is still running in the driver")
         assert status.error == app_model.laser_controller_close_refusal()
+        assert seen and all(refusal for left, refusal in seen if left), seen
     finally:
         daq.hang_released.set()
         daq.waits_released.set()
         _wait_until(lambda: not app_model.laser_controller_close_refusal())
+
+
+def test_a_close_within_its_bound_never_reads_stopped(app_model, monkeypatch):
+    # The model's disconnect, in the middle of a close still within its
+    # bound, wrote STOPPED while laser work was refused as "closing".
+    _system_mode_with_the_fake_laser(app_model, monkeypatch, lasers=_ROUTED_LASER)
+    written = []
+    registry = app_model._acquisition.subsystems
+    transition = registry.transition
+
+    def recorded(subsystem_id, state, **fields):
+        if getattr(subsystem_id, "value", subsystem_id) == SubsystemId.LASER.value:
+            written.append((state, app_model.laser_controller_close_refusal()))
+        return transition(subsystem_id, state, **fields)
+
+    monkeypatch.setattr(registry, "transition", recorded)
+
+    app_model.capture_stop()
+
+    assert (SubsystemState.STOPPED, "") in written
+    assert not [refusal for state, refusal in written
+                if state is SubsystemState.STOPPED and refusal], written
+
+
+def test_a_close_that_raises_keyboard_interrupt_is_reported(app_model):
+    from tools.acquisition.model.app_model import _BoundedClose
+
+    def interrupted():
+        raise KeyboardInterrupt
+
+    closing = _BoundedClose(interrupted, "laser controller")
+
+    assert closing.run(2.0) is True
+    assert isinstance(closing.error, KeyboardInterrupt)
+    assert closing.failure(2.0, True) == "failed to close (KeyboardInterrupt)"
+
+
+def _trial_laser(monkeypatch):
+    """A laser model on the stand-in, synchronized, as a Run gives it."""
+    from autotrainer.core import NidaqTimingPlan
+    from autotrainer.device import NidaqLaserController, nidaq_laser
+    from tools.acquisition.model.laser_model import LaserModel
+
+    fake = _daqmx_fake()
+    daq = fake.FakeDaqmx(block_wait=True, hold_waits=True)
+    monkeypatch.setattr(nidaq_laser, "_load_nidaqmx", lambda: daq)
+    plan = NidaqTimingPlan(
+        requested_mode="auto", resolved_mode="backplane", is_valid=True,
+        master_device="PXI1Slot5", slave_devices=("PXI1Slot4",),
+        sample_clock_source="/PXI1Slot5/ai/SampleClock", sample_clock_rate_hz=10_000.0,
+        start_trigger_source="/PXI1Slot5/ai/StartTrigger",
+        hardware_output_devices=("PXI1Slot4",),
+        hardware_output_timing_status="declared_not_armed")
+    model = LaserModel(NidaqLaserController(
+        fake.rig_lasers(**_ROUTED_LASER), timing_plan=plan))
+    return daq, model
+
+
+def test_a_trial_cancel_ends_the_pulse_at_once_and_it_can_be_armed_again(monkeypatch):
+    # The trial cancel stopped the armed pulse's task; on the hardware that
+    # stop waits behind the pulse's wait for its trigger, the whole timeout
+    # (H5a). And not waiting for the cancelled operation's cleanup, the next
+    # trial's pulse was refused as the board still held.
+    from types import SimpleNamespace
+
+    from tools.acquisition.model.laser_firing import LaserFiring
+    from tools.acquisition.model.trial_action import LaserPulseProfile
+    from tools.acquisition.model.trial_protocol_schedule import LaserTriggerRoute
+
+    daq, model = _trial_laser(monkeypatch)
+    firing = LaserFiring(1, LaserTriggerRoute.HARDWARE_STIM3, "/PXI1Slot4/PXI_Trig0", 3, 1000)
+    profile = LaserPulseProfile("pulse", 1, 2.5, 5)
+
+    def recipe(trial):
+        return SimpleNamespace(
+            session_id="s", session_generation=1, protocol_id="p", protocol_revision=1,
+            logical_trial_id=trial, attempt_id=1, operation_id=f"trial-{trial}")
+
+    try:
+        armed = model.prepare_pulse_profile(profile, firing, recipe(1))
+        started = time.monotonic()
+
+        AppModel._cancel_protocol_laser(armed)
+
+        assert time.monotonic() - started < 1.0
+        assert armed._done.is_set()
+        assert armed.state.value == "cancelled"
+        again = model.prepare_pulse_profile(profile, firing, recipe(2))
+        assert again.state.value == "armed"
+    finally:
+        daq.waits_released.set()
+        model.close()
 
 
 def test_a_close_already_under_way_is_waited_for_not_run_twice(app_model, monkeypatch):
@@ -1344,9 +1449,9 @@ def test_a_pulse_the_close_gave_up_on_holds_laser_work_off_until_it_ends(
     from autotrainer.device import LaserPulseTrain, LaserSynchronizedPulseTrain, nidaq_laser
 
     monkeypatch.setattr(nidaq_laser, "_OPERATION_CANCEL_TIMEOUT_S", 0.3)
-    # A cancel whose stop the driver does not act on: the pulse's wait holds.
+    # A sick driver, whose abort does not wake the wait: the pulse holds.
     daq = _system_mode_with_the_fake_laser(
-        app_model, monkeypatch, block_wait=True, hold_waits=True)
+        app_model, monkeypatch, block_wait=True, hold_waits=True, abort_unblocks=False)
     try:
         operation = app_model.laser.run_synchronized_pulse_train(
             LaserSynchronizedPulseTrain(
@@ -1359,6 +1464,10 @@ def test_a_pulse_the_close_gave_up_on_holds_laser_work_off_until_it_ends(
         with caplog.at_level("CRITICAL"):
             app_model.capture_stop()
 
+        # The bound still holds where the abort does not end the pulse.
+        critical, = [record for record in caplog.records
+                     if record.levelname == "CRITICAL"]
+        assert "failed to close" in critical.getMessage()
         assert not app_model.laser.is_connected
         refusal = app_model.laser_controller_close_refusal()
         # Not "still closing": the close itself has finished.
@@ -1516,7 +1625,7 @@ def test_stop_mid_pulse_cancels_the_pulse_and_resets_the_laser(
     from autotrainer.device import LaserPulseTrain
 
     daq = _system_mode_with_the_fake_laser(
-        app_model, monkeypatch, block_wait=True, hold_waits=True, stop_unblocks=True)
+        app_model, monkeypatch, block_wait=True, hold_waits=True)
     try:
         pulse_thread, pulse_outcome = _in_thread(
             app_model.laser.run_pulse_train,

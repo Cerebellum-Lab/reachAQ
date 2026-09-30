@@ -49,6 +49,28 @@ class LaserTraceBlock:
     origin_wall_time: Optional[float] = None
 
 
+#: How long a path that cancels a laser operation and goes on waits for it
+#: to end. The abort ends it in milliseconds (H5b: about 40 ms); this bounds
+#: a sick driver.
+CANCELLED_OPERATION_WAIT_S = 2.0
+
+
+def wait_until_cancelled_ends(operation, timeout: float = CANCELLED_OPERATION_WAIT_S) -> bool:
+    """Wait, bounded, for a cancelled operation to end; whether it did.
+
+    A pulse armed next on the same board is refused until it has, as the
+    board is still held by the cancelled one's cleanup.
+    """
+    done = getattr(operation, "_done", None)
+    if done is None or done.wait(timeout):
+        return True
+    logger.warning(
+        "The cancelled laser operation %s had not ended %.1f s later; a pulse "
+        "armed next on its board is refused until it does",
+        getattr(operation, "operation_id", "?"), timeout)
+    return False
+
+
 class LaserModelEvents:
     trace_received = Callable[[LaserTraceBlock], None]
 
@@ -394,6 +416,11 @@ class LaserModel(ObservableObject):
             "laser_channel_id": int(firing.channel_id),
             "trigger_route": route,
         }
+        label = getattr(recipe, "operation_label", None)
+        if label:
+            # How the operation is named where it holds the board: Test stim's
+            # recipe numbers its trial 0.
+            operation_context["operation_label"] = label
         synchronized = LaserSynchronizedPulseTrain(
             pulse_trains=(pulse,),
             trigger_source=(firing.trigger_terminal if hardware_trigger else None),
@@ -426,6 +453,8 @@ class LaserModel(ObservableObject):
             accepted_statuses.add(emulated_status)
         if observed_status not in accepted_statuses:
             operation.cancel()
+            # Ended before this raises, so a retry finds the board free.
+            wait_until_cancelled_ends(operation)
             raise RuntimeError(
                 "Protocol laser timing is not ready: expected "
                 f"{required_status}, found "

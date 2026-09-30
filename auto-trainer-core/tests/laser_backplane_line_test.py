@@ -141,8 +141,8 @@ def test_a_board_named_on_a_clock_line_is_refused_with_a_line_that_is_allowed():
 
 
 def test_a_board_named_on_a_pxi_trig_line_suggests_that_line():
-    # The field's default was the example, and it can itself be taken:
-    # here backplaneClockLine is PXI_Trig1 already.
+    # The field's default was the example, and it can itself be taken by
+    # another field or a trigger. The value's own line is the one meant.
     with pytest.raises(ValueError) as refused:
         _lasers(_channel(), pulse_clock_line="/PXI1Slot4/PXI_Trig5")
 

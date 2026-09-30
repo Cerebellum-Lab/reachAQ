@@ -31,9 +31,12 @@ class FakeTask:
         self.started = False
         self.closed = False
         self.aborted = threading.Event()
-        #: Set by a stop() from another thread while the task ran, with
-        #: stop_unblocks; its wait then returns with an error.
-        self.stopped_while_waiting = threading.Event()
+        #: The thread in wait_until_done, and set whenever none is: a stop()
+        #: from another thread waits for it (FakeDaqmx, stop from another
+        #: thread).
+        self._waiter = None
+        self._wait_over = threading.Event()
+        self._wait_over.set()
         self.ao_channels = SimpleNamespace(add_ao_voltage_chan=self._add)
         self.ai_channels = SimpleNamespace(add_ai_voltage_chan=self._add)
         self.do_channels = SimpleNamespace(add_do_chan=self._add_do)
@@ -46,6 +49,12 @@ class FakeTask:
 
     def _add(self, channel, **_kwargs):
         self.channels.append(channel)
+
+    def _note(self, event, data=None):
+        """On the fake's timeline: when, on which thread, what, to which task."""
+        self.daq.timeline.append(SimpleNamespace(
+            time=time.monotonic(), thread=threading.current_thread(),
+            event=event, task=self.name, data=data))
 
     def _add_do(self, channel, **_kwargs):
         self.do_channels_added = True
@@ -84,6 +93,7 @@ class FakeTask:
             self._reserve()
             self._release()
         self.writes.append(data)
+        self._note("write", data)
         # Every write that happened, in order and whoever made it. Asking for
         # a task by name finds only the last one of that name, and each
         # command reset makes a task of the same name, so the last write
@@ -103,28 +113,36 @@ class FakeTask:
         self.started = True
         self.daq.starts.append(self.name)
         self.daq.log.append(("start", self.name))
+        self._note("start")
 
     def wait_until_done(self, timeout):
-        if self.daq.block_wait:
-            # With hold_waits set, the wait models a hung driver: it keeps
-            # waiting past its own timeout, until the test releases it.
-            limit = self.daq.held_wait_limit if self.daq.hold_waits else timeout
-            deadline = time.monotonic() + limit
-            while not self._unblocked():
-                if time.monotonic() > deadline:
-                    raise RuntimeError(
-                        "DAQmx -200560: Wait Until Done did not indicate done")
-                time.sleep(0.005)
-        if self.aborted.is_set():
-            raise RuntimeError("DAQmx -88709: the task was aborted")
-        if self.stopped_while_waiting.is_set():
-            raise RuntimeError("the task was stopped while Wait Until Done waited on it")
+        self._waiter = threading.current_thread()
+        self._wait_over.clear()
+        try:
+            if self.daq.block_wait:
+                # With hold_waits set, the wait models a hung driver, or an
+                # armed task whose trigger never comes: it keeps waiting past
+                # its own timeout, until the test releases it.
+                limit = self.daq.held_wait_limit if self.daq.hold_waits else timeout
+                deadline = time.monotonic() + limit
+                while not self._unblocked():
+                    if time.monotonic() > deadline:
+                        raise RuntimeError(
+                            "DAQmx -200560: Wait Until Done did not indicate done")
+                    time.sleep(0.005)
+            if self.aborted.is_set():
+                raise RuntimeError(
+                    "DAQmx -88709: The specified operation cannot be performed "
+                    "because a task has been aborted")
+        finally:
+            self._note("wait returned")
+            self._waiter = None
+            self._wait_over.set()
 
     def _unblocked(self):
         return (
             self.daq.waits_released.is_set()
-            or (self.daq.abort_unblocks and self.aborted.is_set())
-            or self.stopped_while_waiting.is_set())
+            or (self.daq.abort_unblocks and self.aborted.is_set()))
 
     def read(self, number_of_samples_per_channel, timeout):
         if self.daq.read_samples is not None:
@@ -149,19 +167,27 @@ class FakeTask:
             return
         if self.daq.failing_abort and self.name.endswith(self.daq.failing_abort):
             raise RuntimeError(f"DAQmx refused to abort {self.name}")
+        self._note("abort")
         self.aborted.set()
         if self.daq.abort_releases:
             self.started = False
             self._release()
 
     def stop(self):
-        if self.started and self.daq.stop_unblocks:
-            self.stopped_while_waiting.set()
+        # Measured (christielab10, H5a, 2026-09-29): a stop from another
+        # thread does not wake a wait on the task; it waits behind it, until
+        # the task ends by itself or the wait times out. Stop and clear on a
+        # task that was aborted are clean (H5b, H5c).
+        waiter = self._waiter
+        if waiter is not None and waiter is not threading.current_thread():
+            self._wait_over.wait(self.daq.held_wait_limit)
+        self._note("stop")
         self.started = False
         self._release()
 
     def close(self):
         self.daq.sick("task_close")
+        self._note("close")
         self.closed = True
         self.started = False
         self._release()
@@ -178,23 +204,22 @@ class FakeDaqmx:
         abort_releases=True,
         abort_unblocks=True,
         hold_waits=False,
-        stop_unblocks=False,
         hang=(),
         do_takes_start_trigger=False,
     ):
         self.block_wait = block_wait
         self.failing_task = failing_task
         # Whether an aborted task gives up its lines, and whether the abort
-        # returns a wait blocked on it. DAQmx says an abort does both; the
-        # tests do not rely on it.
+        # returns a wait blocked on it. Measured on christielab10 (H5b,
+        # 2026-09-29, a 6221 AI task): TASK_ABORT from another thread wakes a
+        # blocked wait in about 36 ms with -88709. abort_unblocks=False is a
+        # sick driver's, whose abort does not.
         self.abort_releases = abort_releases
         self.abort_unblocks = abort_unblocks
         self.hold_waits = hold_waits
-        #: Whether stopping a running task from another thread returns a
-        #: wait blocked on it, with an error. A laser operation's cancel
-        #: stops its tasks and relies on that; like the abort, it is the
-        #: fake's model of DAQmx, not a measurement.
-        self.stop_unblocks = stop_unblocks
+        # A stop() from another thread never wakes a wait: it waits behind it
+        # (FakeTask.stop, H5a). There is no option for the opposite, which
+        # the hardware does not do.
         #: Sick-driver behaviour, not DAQmx's: each call named here -
         #: "connect_terms", "disconnect_terms" or "task_close" - blocks until
         #: hang_released is set, as a call does inside a driver that has hung.
@@ -231,6 +256,9 @@ class FakeDaqmx:
         self.starts = []
         #: Routes connected and released and tasks started, in one order.
         self.log = []
+        #: Starts, aborts, stops, closes, returned waits and writes of every
+        #: task, with the time and the thread (FakeTask._note).
+        self.timeline = []
         #: Whether a clocked digital output task takes a start trigger. The
         #: rig's M Series boards say no (do_trig_usage empty, -200452 at
         #: verify, 2026-09-25); an X Series board would say yes.

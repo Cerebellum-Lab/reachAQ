@@ -278,10 +278,16 @@ arrives, the pulse fails after the train length plus five seconds with *Wait
 Until Done did not indicate that the task was done*.
 
 Stopping System Mode, or closing reachAQ, while a Run Pulse train is still
-running closes the shutters first, then cancels the train: the controller
-waits up to five seconds for it to stop, then puts the command back to its
-minimum. The status line then reads *"Laser operation failed: Laser operation
-... was cancelled: the laser controller was closed while it ran"*.
+running closes the shutters first, then cancels the train. A cancel, this
+one or a trial's, aborts the train's tasks, which ends the train at once, and
+puts the command back to its minimum straight after. On christielab10's 6221 an
+abort ended a waiting task in about 40 ms, where a stop from another thread
+waited for the whole task (H5b, H5a); the 6713's output is yet to be
+measured. A pulse armed and waiting for its trigger ends the
+same way. The controller waits up to five seconds for a train that does not
+end, as with a sick driver, before it goes on without it. The status line
+then reads *"Laser operation failed: Laser operation ... was cancelled: the
+laser controller was closed while it ran"*.
 
 Run Pulse is refused while another pulse on the same board's analog output
 is armed or running, or still ending after a cancel, such as a trial's pulse

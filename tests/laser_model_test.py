@@ -335,3 +335,16 @@ def test_a_command_recorded_as_a_pulse_ends_is_not_overwritten():
     time.sleep(0.05)
 
     assert model.last_command_volts == {1: 1.5}
+
+
+def test_test_stims_pulse_says_it_is_test_stim():
+    # Its recipe claims no trial, and trial 0 is what its number reads.
+    from tools.acquisition.model.stim_bench_test import BenchRecipe
+
+    model = _null_hardware_timed_model()
+    profile = LaserPulseProfile("pulse", 1, 2.5, 1)
+
+    operation = model.prepare_pulse_profile(profile, SOFTWARE, BenchRecipe())
+
+    assert operation.context["operation_label"] == "Test stim"
+    operation.cancel()
