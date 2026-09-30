@@ -351,8 +351,9 @@ instead of being expanded into duplicate event rows.
 Rows are in `perf_time` order; rows at the same time keep the order they were
 told. Sessions recorded before 2026-09-30 have them in the order told.
 `nidaq_sample_index` names the NI-DAQ sample each row's `perf_time` landed
-within, looked up in the NI timeline as for `pressure.csv`, and is empty outside
-it. It maps a host time onto the NI clock; it is not an NI-timed event.
+within, looked up in the NI timeline as for `pressure.csv`; it is empty for a
+row before the first NI sample. It maps a host time onto the NI clock; it is
+not an NI-timed event.
 
 A **Run Pulse** fired while a session records is kept as a manual laser event:
 two rows with source `manual pulse` and one `operation_id` starting `manual-`,
