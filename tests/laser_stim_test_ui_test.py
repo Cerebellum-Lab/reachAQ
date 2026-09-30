@@ -342,3 +342,47 @@ def test_a_rebuilt_laser_whose_profile_vanished_picks_nothing_and_says_so(
         content.on_close()
 
 
+
+
+def _set_pmt_line(app_model, line):
+    from autotrainer.core import LaserSystemConfiguration
+
+    app_model.laser.set_configuration_offline(LaserSystemConfiguration.from_channels(
+        (LaserChannelConfiguration(
+            channel_id=LaserChannelId.LASER_1, analog_output="/Dev1/ao0",
+            diode_input="/Dev1/ai0", shutter_output="/Dev1/port0/line0"),),
+        backend="null", pmt_shutter_output=line))
+
+
+def test_run_pulse_has_no_pmt_checkbox(channel_tab):
+    # Run Pulse followed a checkbox of its own, trials the profile's
+    # margins; every path follows the margins now (Ben, 2026-09-30).
+    from PySide6.QtWidgets import QCheckBox
+
+    tab, _started, _statuses = channel_tab
+
+    run_pulse = [box.text() for box in tab.sections["run_pulse"].findChildren(QCheckBox)]
+    assert "PMT shutter" not in run_pulse
+    assert "Open shutter" in run_pulse
+
+
+@pytest.mark.parametrize("line, lead, lag, driven", [
+    ("/Dev1/port0/line6", 5.0, 5.0, True),
+    ("/Dev1/port0/line6", 0.0, 3.0, True),
+    ("/Dev1/port0/line6", 0.0, 0.0, False),
+    (None, 5.0, 5.0, False),
+])
+def test_run_pulse_drives_the_pmt_shutter_by_the_profiles_margins(
+    qapp, app_model, line, lead, lag, driven,
+):
+    _set_pmt_line(app_model, line)
+    draft = LaserPulseProfile(
+        "builder-draft", 1, 1.0, 1.0, pmt_open_lead_ms=lead, pmt_close_lag_ms=lag)
+    tab, _started, _statuses = make_tab(app_model, draft_provider=lambda: draft)
+    tab.stim_profile_selector.setCurrentIndex(
+        tab.stim_profile_selector.findData("builder-draft"))
+
+    train = tab._build_pulse_train()
+
+    assert train.enable_pmt_shutter is driven
+    assert (train.pmt_shutter_open_delay_ms, train.pmt_shutter_close_delay_ms) == (lead, lag)

@@ -104,6 +104,11 @@ class LaserModel(ObservableObject):
         #: pulse train or a ramp that had not ended (work_left_running).
         self._closed_with_work_left = []
         self._closed_with_work_left_lock = threading.Lock()
+        #: Lasers whose PMT margins have been said to be ignored, for want of
+        #: a PMT shutter line, since the controller was set; see
+        #: pmt_shutter_for_profile.
+        self._pmt_margins_ignored = set()
+        self._pmt_margins_lock = threading.Lock()
         if controller is not None:
             self.set_controller(controller)
 
@@ -350,6 +355,8 @@ class LaserModel(ObservableObject):
             int(channel.channel_id): channel.minimum_command_volts
             for channel in self._configuration.channels
         }
+        with self._pmt_margins_lock:
+            self._pmt_margins_ignored.clear()
         self._on_property_changed(self.CONFIGURATION, self._configuration, prev_config)
         self._on_property_changed(self.IS_CONNECTED, True, False)
 
@@ -431,6 +438,36 @@ class LaserModel(ObservableObject):
             self.trace_received(self._make_pulse_trace(channel_pulse))
         return operation
 
+    def pmt_shutter_for_profile(self, profile, channel_id) -> bool:
+        """Whether a pulse of `profile` on `channel_id` drives the PMT shutter.
+
+        The PMT rule, for Run Pulse, Test stim and trials alike (Ben,
+        2026-09-30): only when the profile gives it a margin, its PMT open
+        lead or close lag above zero, and a PMT shutter line is configured.
+        With no line the margins are ignored, so the pulse fires without
+        them, and that is said once for each laser of each controller. Run
+        Pulse followed a checkbox of its own, and a trial with margins failed
+        on christielab10, which has no PMT line ("PMT shutter output
+        requested, but laser pmt_shutter_output is not configured").
+        """
+        lead_ms = float(profile.pmt_open_lead_ms)
+        lag_ms = float(profile.pmt_close_lag_ms)
+        if not (lead_ms > 0 or lag_ms > 0):
+            return False
+        if self._configuration.pmt_shutter_output:
+            return True
+        laser = int(channel_id)
+        with self._pmt_margins_lock:
+            said = laser in self._pmt_margins_ignored
+            self._pmt_margins_ignored.add(laser)
+        if not said:
+            logger.warning(
+                "Laser %s: profile %r's PMT shutter margins (open lead %g ms, "
+                "close lag %g ms) are ignored, since no PMT shutter line "
+                "(pmtShutterOutput) is configured; it fires without them",
+                laser, getattr(profile, "profile_id", "?"), lead_ms, lag_ms)
+        return False
+
     def prepare_pulse_profile(self, profile, firing, recipe):
         """Resolve a frozen protocol profile into one pre-armed finite output."""
         route = firing.trigger_route.value
@@ -448,9 +485,8 @@ class LaserModel(ObservableObject):
             post_stim_ms=float(profile.post_stim_ms),
             pmt_shutter_open_delay_ms=float(profile.pmt_open_lead_ms),
             pmt_shutter_close_delay_ms=float(profile.pmt_close_lag_ms),
-            enable_pmt_shutter=(
-                profile.pmt_open_lead_ms > 0 or profile.pmt_close_lag_ms > 0
-            ),
+            # The margins pad the output only when the shutter is driven.
+            enable_pmt_shutter=self.pmt_shutter_for_profile(profile, firing.channel_id),
         )
         operation_context = {
             "session_id": recipe.session_id,
