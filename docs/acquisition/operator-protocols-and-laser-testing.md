@@ -389,23 +389,39 @@ the command from **Start:** to **Stop:** in **Steps:** steps of
 **Samples/step:** samples each, and reads the diode at every step. **PMT
 shutter** holds the PMT shutter open for the ramp. Press **Run Ramp**.
 
-- **Settle:** is how many samples at the start of each step are left out of
-  that step's point; the rest are averaged, for the diode and the command
-  copy alike. The input is read on the clock edge the command changes on, and
-  the laser driver and the diode take time to follow, so the first samples of
-  a step still read the step before: averaged in, they pulled every point of
-  a rising ramp low. The default is a fifth of **Samples/step:**, 20 of 100
-  samples (200 us at christielab10's 100 kHz), until a measured step response
-  says otherwise; it must leave at least one sample of each step. **Settle:**
-  follows a fifth of **Samples/step:** until you change it, and after that
-  only drops when **Samples/step:** would leave it no sample. **Samples/step:**
-  is taken when you finish typing (Return, leaving the field, or **Run
-  Ramp**). All of the ramp's fields go back to their defaults whenever Laser
-  Control is rebuilt: on every Run and Stop, on a DAQ Ports save or a
-  configuration load that changes the lasers, and when a laser close that
-  ended late disconnects the laser.
+- **Settle:** is how long the start of each step is left out of that step's
+  point, in µs; the rest of the step is averaged, for the diode and the
+  command copy alike. The default is 600 µs, 60 samples at christielab10's
+  100 kHz, whatever **Samples/step:** is. It leaves out two responses. The
+  laser driver and the diode take time to follow a step: christielab10's
+  diodes came within 2% of their level in 420 and 550 µs. And the input path
+  settles on its own: at the ramp's start, with the command steady at 0 V,
+  both diode inputs read about 1 V and decayed with a time constant of about
+  115 µs, which is the acquisition settling, not the laser. The input is read
+  on the clock edge the command changes on, so without a settle the first
+  samples of a step still read the step before, and pulled every point of a
+  rising ramp low. **Settle:** must leave at least one sample of each step;
+  Run Ramp refuses one that does not, naming both values.
+- **Samples/step:** defaults to 500, 5 ms at 100 kHz: christielab10's slower
+  diode was still rising through the second half of a 1 ms step. For a slow
+  diode, use longer steps rather than a longer settle alone, so that each
+  point still averages enough settled samples. **Samples/step:** is taken
+  when you finish typing (Return, leaving the field, or **Run Ramp**).
+- All of the ramp's fields go back to their defaults whenever Laser Control
+  is rebuilt: on every Run and Stop, on a DAQ Ports save or a configuration
+  load that changes the lasers, and when a laser close that ended late
+  disconnects the laser.
   `tools/hardware/validate_laser_hardware.py --action ramp` takes the same
-  window as `--settle-samples`.
+  settle as `--settle-us` (default 600) and the step as `--samples-per-step`
+  (default 500).
+- The laser controller's own inputs, the diode and the command copy for the
+  ramp and for feedback, are referenced as the NI-DAQ stream references its
+  inputs: by the stream's `analogTerminalConfig` (`rse` on christielab10).
+  With none configured, DAQmx picks per channel, and on a PXI-6221 it made
+  ai3, ai4 and ai5 differential, paired with ai11-ai13, where the stream
+  reads them single-ended.
+- Closing reachAQ while a ramp runs ends it with *"the laser calibration
+  ramp was stopped: the laser controller was closed while it ran"*.
 
 - It runs only in **Idle**, with the laser mapped. Otherwise the button is
   greyed out and its tooltip says why: System Mode is running or starting, a

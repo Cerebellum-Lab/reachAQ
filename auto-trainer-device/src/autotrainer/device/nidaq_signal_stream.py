@@ -24,6 +24,35 @@ from autotrainer.device.nidaq_reference_clock import (
 logger = logging.getLogger(__name__)
 
 
+def resolve_analog_terminal_config(nidaqmx, name):
+    """How analog inputs should be referenced, or None to let DAQmx pick.
+
+    `name` is a stream's analogTerminalConfig: rse, nrse, diff or pseudo_diff,
+    as nidaqmx's TerminalConfiguration names them. The laser controller's own
+    inputs take the stream's, by this.
+
+    Letting it pick is not neutral. On a PXI-6221 it gives ai0-ai7
+    differential - pairing each with ai8-ai15 - and ai8 upwards
+    single-ended, so a channel list spanning both halves reads some
+    channels against pins it also reads directly. Measured on
+    christielab10: one laser's command copy appeared on three inputs it is
+    not wired to, and holding the scan rate down to 10 Hz did not shift
+    it, which is how it was told apart from a settling artefact.
+    """
+    name = name or ""
+    if not name:
+        return None
+    configs = nidaqmx.constants.TerminalConfiguration
+    resolved = getattr(configs, name.upper(), None)
+    if resolved is None:
+        logger.warning(
+            "unknown analog terminal configuration %r; letting DAQmx "
+            "choose per channel, which is not uniform across a 6221",
+            name,
+        )
+    return resolved
+
+
 @dataclasses.dataclass(frozen=True)
 class NidaqSignalSampleBlock:
     """A chunk of scaled NI-DAQ input samples from one shared stream read."""
@@ -460,28 +489,10 @@ class NidaqSignalStreamController:
         return terminal_config in supported
 
     def _analog_terminal_config(self):
-        """How analog inputs should be referenced, or None to let DAQmx pick.
-
-        Letting it pick is not neutral. On a PXI-6221 it gives ai0-ai7
-        differential - pairing each with ai8-ai15 - and ai8 upwards
-        single-ended, so a channel list spanning both halves reads some
-        channels against pins it also reads directly. Measured on
-        christielab10: one laser's command copy appeared on three inputs it is
-        not wired to, and holding the scan rate down to 10 Hz did not shift
-        it, which is how it was told apart from a settling artefact.
-        """
-        name = getattr(self._configuration, "analog_terminal_config", "") or ""
-        if not name:
-            return None
-        configs = self._nidaqmx.constants.TerminalConfiguration
-        resolved = getattr(configs, name.upper(), None)
-        if resolved is None:
-            logger.warning(
-                "unknown analog terminal configuration %r; letting DAQmx "
-                "choose per channel, which is not uniform across a 6221",
-                name,
-            )
-        return resolved
+        """How analog inputs should be referenced, or None to let DAQmx pick
+        (resolve_analog_terminal_config)."""
+        return resolve_analog_terminal_config(
+            self._nidaqmx, getattr(self._configuration, "analog_terminal_config", ""))
 
     def _make_digital_task(self, device_name, digital_channels, task_name) -> object:
         """One channel per port, holding only the lines this stream reads.

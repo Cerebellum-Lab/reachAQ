@@ -30,6 +30,7 @@ from .laser import (
 from autotrainer.device.nidaq_reference_clock import (
     apply_reference_clock,
 )
+from autotrainer.device.nidaq_signal_stream import resolve_analog_terminal_config
 
 logger = logging.getLogger(__name__)
 
@@ -420,6 +421,7 @@ class NidaqLaserController:
         *,
         feedback_reader: Optional[Callable[[str], float]] = None,
         timing_plan: Optional[NidaqTimingPlan] = None,
+        analog_terminal_config: Optional[str] = None,
     ):
         if configuration.backend != "nidaq":
             raise ValueError("NidaqLaserController requires laser backend 'nidaq'")
@@ -427,6 +429,11 @@ class NidaqLaserController:
         log_hardware_initialization(logger, "START | NI-DAQmx runtime | consumer=laser")
         self._nidaqmx = _load_nidaqmx()
         _ignore_the_aborts_warning(self._nidaqmx)
+        #: How every input this controller adds is referenced: the stream's
+        #: analogTerminalConfig, given by its caller, as the stream maps it.
+        #: None leaves each to DAQmx's default (_add_voltage_input).
+        self._analog_terminal_config = resolve_analog_terminal_config(
+            self._nidaqmx, analog_terminal_config)
         log_hardware_initialization(
             logger,
             "READY | NI-DAQmx runtime | consumer=laser elapsed=%.3fs",
@@ -1167,6 +1174,7 @@ class NidaqLaserController:
         ):
             raise NotImplementedError("PMT shutter delays for calibration ramps are not implemented yet")
         sample_rate_hz = self._require_sample_rate()
+        settle_samples = ramp.settle_sample_count(sample_rate_hz)
         waveform = self._build_calibration_ramp_waveform(ramp)
         timeout_seconds = ramp.timeout_seconds
         if timeout_seconds is None:
@@ -1176,6 +1184,11 @@ class NidaqLaserController:
         digital_tasks = []
         run_error = None
         points = ()
+        owner = f"laser {channel.channel_id.value}'s calibration ramp"
+        # The ramp's tasks known to have finished, by id: one stopped before
+        # it finished can warn (200010), which the filter hides, so the stop
+        # says so (_cleanup_calibration_ramp).
+        finished = set()
         # The clock routes this ramp adds, by name, which it releases when it
         # ends. Counted, as they were, the list was read and cut from two
         # threads: a close() in between emptied it, and the ramp's own route,
@@ -1199,7 +1212,6 @@ class NidaqLaserController:
             # Where close() can find them: reachAQ closing mid-ramp closes
             # this controller from its own thread, and this one may then be
             # inside DAQmx, waiting on these.
-            owner = f"laser {channel.channel_id.value}'s calibration ramp"
             self._hold_calibration_tasks(owner, ao_name, ao_task)
             ai_task = self._create_calibration_input_task(channel, ai_name)
             self._hold_calibration_tasks(owner, ai_name, ai_task)
@@ -1267,10 +1279,27 @@ class NidaqLaserController:
                     raise RuntimeError(
                         "the laser controller was closed as the calibration "
                         "ramp started")
-            ao_task.wait_until_done(timeout=timeout_seconds)
-            ai_task.wait_until_done(timeout=timeout_seconds)
-            raw_samples = ai_task.read(number_of_samples_per_channel=len(waveform), timeout=timeout_seconds)
-            points = self._build_calibration_points(channel, ramp, raw_samples)
+            try:
+                ao_task.wait_until_done(timeout=timeout_seconds)
+                # The lines run on the output's clock, for as many samples.
+                finished.update(id(task) for task in (ao_task, *digital_tasks))
+                ai_task.wait_until_done(timeout=timeout_seconds)
+                finished.add(id(ai_task))
+                raw_samples = ai_task.read(
+                    number_of_samples_per_channel=len(waveform), timeout=timeout_seconds)
+            except Exception as error:
+                with self._operation_lock:
+                    closed = self._closed
+                if closed:
+                    # close() aborted the ramp's tasks, and the wait or read
+                    # raised the abort's own error (-88709), which says
+                    # nothing of the close. Told as a closed pulse is told;
+                    # the driver's error is kept as the cause.
+                    raise RuntimeError(
+                        "the laser calibration ramp was stopped: the laser "
+                        "controller was closed while it ran") from error
+                raise
+            points = self._build_calibration_points(channel, ramp, raw_samples, settle_samples)
         except Exception as exc:
             run_error = exc
             raise
@@ -1282,6 +1311,11 @@ class NidaqLaserController:
                     # closed, is this cleanup overtaking it, not a failure.
                     self._released_calibration_tasks.update(
                         id(task) for _owner, _name, task in self._calibration_tasks)
+                    unfinished = {
+                        id(task): name
+                        for _owner, name, task in self._calibration_tasks
+                        if id(task) in self._started_calibration_tasks
+                        and id(task) not in finished}
                     self._calibration_tasks.clear()
                     self._started_calibration_tasks.clear()
                 self._cleanup_calibration_ramp(
@@ -1292,6 +1326,8 @@ class NidaqLaserController:
                     ramp=ramp,
                     run_error=run_error,
                     routes=added_routes,
+                    owner=owner,
+                    unfinished=unfinished,
                 )
             finally:
                 # After the tasks are stopped and closed, and after the
@@ -1384,15 +1420,28 @@ class NidaqLaserController:
         ramp: LaserCalibrationRamp,
         run_error: Optional[BaseException],
         routes: Sequence[Tuple[str, str]] = (),
+        owner: str = "",
+        unfinished: Optional[Dict[int, str]] = None,
     ) -> None:
         errors = []
+
+        def stop_and_close(label, task):
+            # A finite task stopped before it finished warns (200010); the
+            # filter keeps that off stderr, so this is its record.
+            name = (unfinished or {}).get(id(task))
+            if name is not None:
+                logger.debug(
+                    "%s: stopping its task %s before it finished (DAQmx may warn 200010)",
+                    owner, name)
+            self._stop_and_close_task(label, task, errors)
+
         # Either task is None when creating it is what failed.
         if ao_task is not None:
-            self._stop_and_close_task("calibration analog output task", ao_task, errors)
+            stop_and_close("calibration analog output task", ao_task)
         if ai_task is not None:
-            self._stop_and_close_task("calibration analog input task", ai_task, errors)
+            stop_and_close("calibration analog input task", ai_task)
         for index, task in enumerate(digital_tasks):
-            self._stop_and_close_task(f"calibration digital output task {index}", task, errors)
+            stop_and_close(f"calibration digital output task {index}", task)
         # After the tasks that use them, and only the ramp's own: the
         # controller's trigger routes, connected before the ramp, stay until
         # close().
@@ -1962,12 +2011,12 @@ class NidaqLaserController:
         diode_input = None
         if self._feedback_reader is None:
             diode_input = self._nidaqmx.Task(f"laser_{channel.channel_id.value}_ai")
-            diode_input.ai_channels.add_ai_voltage_chan(channel.diode_input)
+            self._add_voltage_input(diode_input, channel.diode_input)
 
         command_copy_input = None
         if channel.command_copy_input and self._feedback_reader is None:
             command_copy_input = self._nidaqmx.Task(f"laser_{channel.channel_id.value}_command_copy_ai")
-            command_copy_input.ai_channels.add_ai_voltage_chan(channel.command_copy_input)
+            self._add_voltage_input(command_copy_input, channel.command_copy_input)
 
         shutter_output = self._nidaqmx.Task(f"laser_{channel.channel_id.value}_shutter")
         shutter_output.do_channels.add_do_chan(channel.shutter_output)
@@ -1984,6 +2033,21 @@ class NidaqLaserController:
             shutter_output=shutter_output,
             auxiliary_output=auxiliary_output,
         )
+
+    def _add_voltage_input(self, task, physical_channel: str) -> None:
+        """An input of this controller's, referenced as the stream's are.
+
+        With no terminal configuration given, DAQmx picks per channel, which
+        on christielab10's 6221 made ai3, ai4 and ai5 differential, paired
+        with ai11-ai13, where the stream reads them single-ended (hardware
+        check, phase 2 final).
+        """
+        terminal_config = getattr(self, "_analog_terminal_config", None)
+        if terminal_config is None:
+            task.ai_channels.add_ai_voltage_chan(physical_channel)
+        else:
+            task.ai_channels.add_ai_voltage_chan(
+                physical_channel, terminal_config=terminal_config)
 
     def _create_analog_output_task(self, channel: LaserChannelConfiguration, name: str):
         analog_output = self._nidaqmx.Task(name)
@@ -2007,9 +2071,9 @@ class NidaqLaserController:
     def _create_calibration_input_task(self, channel: LaserChannelConfiguration, name: str):
         analog_input = self._nidaqmx.Task(name)
         try:
-            analog_input.ai_channels.add_ai_voltage_chan(channel.diode_input)
+            self._add_voltage_input(analog_input, channel.diode_input)
             if channel.command_copy_input is not None:
-                analog_input.ai_channels.add_ai_voltage_chan(channel.command_copy_input)
+                self._add_voltage_input(analog_input, channel.command_copy_input)
         except Exception:
             # Not yet the ramp's to close: it never had it.
             analog_input.close()
@@ -2138,14 +2202,15 @@ class NidaqLaserController:
         channel: LaserChannelConfiguration,
         ramp: LaserCalibrationRamp,
         raw_samples,
+        settle_samples: int,
     ) -> Tuple[LaserCalibrationPoint, ...]:
         channel_count = 2 if channel.command_copy_input is not None else 1
         samples = self._normalize_ai_samples(raw_samples, channel_count)
         points = []
         for index in range(ramp.steps):
             # After the step has settled: its first samples still read the
-            # step before (LaserCalibrationRamp.settle_samples).
-            start = index * ramp.samples_per_step + ramp.settle_samples
+            # step before (LaserCalibrationRamp.settle_seconds).
+            start = index * ramp.samples_per_step + settle_samples
             stop = (index + 1) * ramp.samples_per_step
             fraction = index / (ramp.steps - 1)
             command_volts = ramp.start_volts + fraction * (ramp.stop_volts - ramp.start_volts)

@@ -6,6 +6,7 @@ refuses a channel another started task reserves (as DAQmx does, at -50103),
 and records the terminals routed.
 """
 
+import dataclasses
 import logging
 import threading
 import time
@@ -32,6 +33,8 @@ RAMP = LaserCalibrationRamp(
     steps=3,
     samples_per_step=10,
     timeout_seconds=5.0,
+    # 2 samples at 100 kHz: these short steps would keep none of 600 us.
+    settle_seconds=20e-6,
 )
 
 
@@ -85,7 +88,7 @@ def test_closing_the_controller_mid_ramp_stops_the_ramp_and_resets_the_laser(daq
     assert daq.task("laser_1_manual_ao").writes == [0.0]
     assert shutter.writes[-1] is False
     error, = outcome
-    assert isinstance(error, RuntimeError) and "aborted" in str(error)
+    assert isinstance(error, RuntimeError) and "was closed while it ran" in str(error)
     # The ramp's clock route, released once, by whichever let go of it.
     route = ("/PXI1Slot4/ao/SampleClock", "/PXI1Slot4/PXI_Trig1")
     assert daq.disconnected.count(route) == 1
@@ -133,7 +136,7 @@ def test_close_waits_for_the_ramp_to_let_go_of_the_output_before_resetting_it(mo
     assert shutter.writes[-1] is False
     assert daq.reserved == {}
     error, = outcome
-    assert "aborted" in str(error)
+    assert "was closed while it ran" in str(error)
 
 
 def test_a_ramp_that_outlives_the_wait_still_puts_the_command_back(monkeypatch):
@@ -163,7 +166,7 @@ def test_a_ramp_that_outlives_the_wait_still_puts_the_command_back(monkeypatch):
     assert daq.writes_to("PXI1Slot4/ao0", task_suffix="manual_ao")[-1] == 0.0
     assert daq.reserved == {}
     error, = outcome
-    assert "aborted" in str(error)
+    assert "was closed while it ran" in str(error)
 
 
 def test_a_close_between_holding_the_tasks_and_routing_the_clock_leaves_no_route(daq):
@@ -440,7 +443,7 @@ def test_an_abort_the_ramps_own_cleanup_overtakes_is_not_a_failure(daq, caplog):
 
     assert not closer.is_alive()
     assert _abort_log(caplog) == []
-    assert "aborted" in str(ramp_outcome[0])
+    assert "was closed while it ran" in str(ramp_outcome[0])
     # The laser was put back.
     assert daq.writes_to("PXI1Slot4/ao0", task_suffix="manual_ao")[-1] == 0.0
 
@@ -556,5 +559,137 @@ def test_each_point_is_the_level_the_step_settled_to(daq):
 
     assert [point.diode_volts for point in points] == [0.0, 2.5, 5.0]
     assert [point.command_copy_volts for point in points] == [0.0, 2.5, 5.0]
-    # By default, a fifth of each step: 2 of these 10 samples.
-    assert ramp.settle_samples == 2
+    # 20 us at 100 kHz: 2 of these 10 samples.
+    assert ramp.settle_sample_count(100_000.0) == 2
+
+
+
+# ---------------------------------------------- round 8: the inputs' referencing
+
+
+def _ai_channels(daq):
+    """Every analog input channel added: (task, physical channel, kwargs)."""
+    return [(task.label, channel, kwargs)
+            for task in daq.tasks for channel, kwargs in task.ai_added]
+
+
+def test_every_input_the_controller_adds_is_referenced_as_the_stream_says(daq):
+    # They took DAQmx's default: on christielab10's 6221, ai3, ai4 and ai5
+    # differential, paired with ai11-ai13, where the stream reads all of them
+    # as RSE (hardware check, phase 2 final).
+    controller = NidaqLaserController(_rig_lasers(), analog_terminal_config="rse")
+    controller.run_calibration_ramp(RAMP)
+
+    added = _ai_channels(daq)
+    assert {(task, channel) for task, channel, _kwargs in added} == {
+        ("laser_1_ai", "PXI1Slot5/ai8"),
+        ("laser_1_command_copy_ai", "PXI1Slot5/ai3"),
+        ("laser_1_calibration_ai", "PXI1Slot5/ai8"),
+        ("laser_1_calibration_ai", "PXI1Slot5/ai3"),
+    }
+    assert [kwargs for _task, _channel, kwargs in added] == [
+        {"terminal_config": daq.constants.TerminalConfiguration.RSE}] * 4
+
+
+def test_with_no_terminal_config_the_inputs_are_left_to_daqmx(daq):
+    controller = NidaqLaserController(_rig_lasers())
+    controller.run_calibration_ramp(RAMP)
+
+    added = _ai_channels(daq)
+    assert len(added) == 4
+    assert [kwargs for _task, _channel, kwargs in added] == [{}] * 4
+
+
+# ---------------------------------------------- round 8: a close mid-ramp
+
+
+def test_a_close_mid_ramp_says_so_not_what_the_abort_raised(daq):
+    # The ramp's caller got the abort's own DaqError, -88709, which says
+    # nothing of the close that caused it. It is told the ramp was stopped by
+    # the close, as a pulse is, with the driver's error kept as the cause.
+    daq.block_wait = True
+    controller = NidaqLaserController(_rig_lasers())
+    thread, outcome = _ramp_in_thread(controller)
+    _wait_until_ramping(daq)
+
+    controller.close()
+    thread.join(5.0)
+
+    error, = outcome
+    assert type(error) is RuntimeError
+    assert str(error) == (
+        "the laser calibration ramp was stopped: the laser controller was "
+        "closed while it ran")
+    assert getattr(error.__cause__, "error_code", None) == -88709
+
+
+def test_a_ramp_that_fails_by_itself_keeps_the_drivers_error(daq):
+    # Not closed: the driver's own error, and its code, reach the caller.
+    daq.block_wait = True
+    controller = NidaqLaserController(_rig_lasers())
+
+    with pytest.raises(RuntimeError, match="-200560"):
+        controller.run_calibration_ramp(dataclasses.replace(RAMP, timeout_seconds=0.05))
+
+
+# ---------------------------------------------- round 8: the ramp's own stop
+
+
+def test_the_ramp_notes_a_task_it_stops_before_it_finished(daq, caplog):
+    # close() aborts the output; the ramp, woken, stops its input, which is
+    # still running, itself. DAQmx warns 200010 for that stop, the filter
+    # hides it, and nothing recorded that it had happened.
+    daq.block_wait = True
+    controller = NidaqLaserController(_rig_lasers())
+    thread, _outcome = _ramp_in_thread(controller)
+    _wait_until_ramping(daq)
+
+    with caplog.at_level(logging.DEBUG):
+        controller.close()
+        thread.join(5.0)
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert ("laser 1's calibration ramp: stopping its task laser_1_calibration_ai "
+            "before it finished (DAQmx may warn 200010)") in messages
+
+
+def test_a_ramp_that_ends_by_itself_notes_no_early_stop(daq, caplog):
+    controller = NidaqLaserController(_rig_lasers())
+
+    with caplog.at_level(logging.DEBUG):
+        controller.run_calibration_ramp(RAMP)
+
+    assert not [record for record in caplog.records
+                if "before it finished" in record.getMessage()]
+
+
+# ---------------------------------------------- round 8: the settle as a time
+
+
+def test_the_default_settle_leaves_out_600_us_of_each_step(daq):
+    # 60 samples at christielab10's 100 kHz, whatever the step's length: with
+    # 61 lagging, the 61st is the first sample averaged into the point.
+    ramp = LaserCalibrationRamp(
+        channel_id=LaserChannelId.LASER_1, start_volts=0.0, stop_volts=5.0,
+        steps=3, samples_per_step=500, timeout_seconds=5.0)
+    daq.read_samples = _lagging_step_response(ramp, lag=61)
+    controller = NidaqLaserController(_rig_lasers())
+
+    points = controller.run_calibration_ramp(ramp)
+
+    kept = 500 - 60
+    assert [point.diode_volts for point in points] == pytest.approx(
+        [0.0, 2.5 * (kept - 1) / kept, 2.5 + 2.5 * (kept - 1) / kept])
+
+
+def test_a_settle_that_leaves_no_sample_is_refused_before_any_task(daq):
+    ramp = LaserCalibrationRamp(
+        channel_id=LaserChannelId.LASER_1, start_volts=0.0, stop_volts=5.0,
+        steps=3, samples_per_step=60)
+    controller = NidaqLaserController(_rig_lasers())
+    made = len(daq.tasks)
+
+    with pytest.raises(ValueError, match="60 samples of each step"):
+        controller.run_calibration_ramp(ramp)
+
+    assert daq.tasks[made:] == []

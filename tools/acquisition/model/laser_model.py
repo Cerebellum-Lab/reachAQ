@@ -182,12 +182,14 @@ class LaserModel(ObservableObject):
         *,
         feedback_reader: Optional[Callable[[str], float]] = None,
         timing_plan: Optional[NidaqTimingPlan] = None,
+        analog_terminal_config: Optional[str] = None,
     ) -> None:
         self.set_controller(
             NidaqLaserController(
                 configuration,
                 feedback_reader=feedback_reader,
                 timing_plan=timing_plan,
+                analog_terminal_config=analog_terminal_config,
             )
         )
 
@@ -196,6 +198,7 @@ class LaserModel(ObservableObject):
         configuration: LaserSystemConfiguration,
         *,
         timing_plan: Optional[NidaqTimingPlan] = None,
+        analog_terminal_config: Optional[str] = None,
     ) -> LaserControllerProtocol:
         """A controller for `configuration` that this model does not hold.
 
@@ -208,7 +211,9 @@ class LaserModel(ObservableObject):
         if configuration.backend == "null":
             return NullLaserController(configuration)
         if configuration.backend == "nidaq":
-            return NidaqLaserController(configuration, timing_plan=timing_plan)
+            return NidaqLaserController(
+                configuration, timing_plan=timing_plan,
+                analog_terminal_config=analog_terminal_config)
         raise RuntimeError(
             f"Laser backend {configuration.backend!r} has no controller to open")
 
@@ -219,7 +224,13 @@ class LaserModel(ObservableObject):
         feedback_reader: Optional[Callable[[str], float]] = None,
         persisted_configuration: Optional[LaserSystemConfiguration] = None,
         timing_plan: Optional[NidaqTimingPlan] = None,
+        analog_terminal_config: Optional[str] = None,
     ) -> None:
+        """Open the controller `configuration` names.
+
+        `analog_terminal_config` is the NI-DAQ stream's analogTerminalConfig:
+        a NI-DAQ controller references its own inputs as the stream does.
+        """
         backend = configuration.backend
         if backend == "disabled":
             prev_config = self._configuration
@@ -253,6 +264,7 @@ class LaserModel(ObservableObject):
                     configuration,
                     feedback_reader=feedback_reader,
                     timing_plan=timing_plan,
+                    analog_terminal_config=analog_terminal_config,
                 )
             else:
                 raise ValueError(f"Unsupported laser backend: {backend}")

@@ -258,7 +258,8 @@ def test_the_ramp_controller_is_opened_without_the_stream_feeding_it(monkeypatch
     built = []
 
     class _Nidaq:
-        def __init__(self, configuration, *, feedback_reader=None, timing_plan=None):
+        def __init__(self, configuration, *, feedback_reader=None, timing_plan=None,
+                     analog_terminal_config=None):
             built.append((feedback_reader, timing_plan))
             self.configuration = configuration
 
@@ -349,49 +350,24 @@ def _type_into(spin_box, text, qapp, *, commit=True):
     qapp.processEvents()
 
 
-@pytest.mark.parametrize(("typed", "settle"), [("100", 20), ("50", 10)])
-def test_typing_samples_per_step_leaves_settle_at_its_share(idle_panel, qapp, typed, settle):
-    # Every keystroke was a new Samples/step, and each clamped Settle under
-    # it: typing "100" went through 1, which clamped Settle to 0, and it
-    # stayed there.
+def test_settle_is_a_time_with_a_fixed_default(idle_panel, qapp):
+    # Settle followed a fifth of Samples/step until it was edited. It is a
+    # time now, 600 µs, whatever Samples/step is: the laser, the diode and
+    # the input take as long to settle however long the step is.
     _app_model, _content, tab = idle_panel
 
-    _type_into(tab._ramp_samples_per_step, typed, qapp)
-
-    assert tab._ramp_samples_per_step.value() == int(typed)
-    assert tab._ramp_settle.value() == settle
-
-
-@pytest.mark.parametrize(("typed", "settles"), [
-    (("50", "200"), (10, 40)),
-    (("100", "5", "100"), (20, 1, 20)),
-])
-def test_settle_keeps_following_samples_per_step_through_every_change(
-    idle_panel, qapp, typed, settles,
-):
-    # The follow's own writes are not the operator's: were they taken as an
-    # edit, Settle would stop following after the first change, or keep the
-    # 1 that "5" gave it once Samples/step went back to 100.
-    _app_model, _content, tab = idle_panel
-
-    for samples, settle in zip(typed, settles):
-        _type_into(tab._ramp_samples_per_step, samples, qapp)
-        assert tab._ramp_settle.value() == settle, samples
-
-
-def test_return_in_an_untouched_settle_is_not_an_edit(idle_panel, qapp):
-    # Qt reports a value on Return even when it has not changed; that is
-    # not the operator setting Settle, and Settle still follows.
-    from PySide6.QtCore import Qt
-    from PySide6.QtTest import QTest
-
-    _app_model, _content, tab = idle_panel
-    QTest.keyClick(tab._ramp_settle, Qt.Key.Key_Return)
-    qapp.processEvents()
-
+    assert tab._ramp_settle.value() == 600
+    assert tab._ramp_settle.suffix() == " µs"
     _type_into(tab._ramp_samples_per_step, "50", qapp)
+    assert tab._ramp_settle.value() == 600
 
-    assert tab._ramp_settle.value() == 10
+
+def test_the_default_step_is_500_samples(idle_panel):
+    # 5 ms at christielab10's 100 kHz: its slower diode was still rising
+    # through the second half of a 1 ms step (H2b).
+    _app_model, _content, tab = idle_panel
+
+    assert tab._ramp_samples_per_step.value() == 500
 
 
 def _ramps_run_from(tab, app_model, qapp, monkeypatch, content, run):
@@ -420,17 +396,16 @@ def test_samples_per_step_typed_and_left_by_focus_is_what_the_ramp_runs(
 
     app_model, content, tab = idle_panel
     _type_into(tab._ramp_samples_per_step, "50", qapp, commit=False)
-    assert tab._ramp_samples_per_step.value() == 100, "typing alone took it"
+    assert tab._ramp_samples_per_step.value() == 500, "typing alone took it"
     QApplication.sendEvent(tab._ramp_samples_per_step, QFocusEvent(
         QEvent.Type.FocusOut, Qt.FocusReason.OtherFocusReason))
 
     # Taken by the focus-out itself, before Run Ramp could take it.
     assert tab._ramp_samples_per_step.value() == 50
-    assert tab._ramp_settle.value() == 10
     ramp, = _ramps_run_from(tab, app_model, qapp, monkeypatch, content,
                             tab._run_ramp_button.click)
 
-    assert (ramp.samples_per_step, ramp.settle_samples) == (50, 10)
+    assert (ramp.samples_per_step, ramp.settle_seconds) == (50, pytest.approx(600e-6))
 
 
 def test_samples_per_step_typed_then_run_ramp_is_what_the_ramp_runs(
@@ -438,33 +413,49 @@ def test_samples_per_step_typed_then_run_ramp_is_what_the_ramp_runs(
 ):
     # Taken only when typing finishes, "50" was still unread when Run Ramp
     # was pressed without the field losing focus, as by its shortcut: the
-    # ramp ran on the 100 before it.
+    # ramp ran on the 500 before it.
     app_model, content, tab = idle_panel
     _type_into(tab._ramp_samples_per_step, "50", qapp, commit=False)
 
     ramp, = _ramps_run_from(tab, app_model, qapp, monkeypatch, content,
                             tab._run_ramp_button.click)
 
-    assert (ramp.samples_per_step, ramp.settle_samples) == (50, 10)
+    assert ramp.samples_per_step == 50
 
 
-def test_the_settle_tooltip_states_when_it_follows_and_when_it_resets(idle_panel):
+def test_the_settle_tooltip_says_what_it_is_and_when_it_resets(idle_panel):
     _app_model, _content, tab = idle_panel
     tooltip = tab._ramp_settle.toolTip()
 
-    assert "a fifth of Samples/step until you change it" in tooltip
+    assert "600 µs" in tooltip and "60 samples at 100 kHz" in tooltip
     assert "Run/Stop" in tooltip and "DAQ Ports save" in tooltip
 
 
-def test_a_settle_the_operator_set_is_kept_until_it_leaves_no_sample(idle_panel, qapp):
-    _app_model, _content, tab = idle_panel
+def test_the_ramp_runs_with_the_settle_typed_in_microseconds(idle_panel, qapp, monkeypatch):
+    app_model, content, tab = idle_panel
+    _type_into(tab._ramp_settle, "250", qapp)
 
-    _type_into(tab._ramp_settle, "30", qapp)
-    _type_into(tab._ramp_samples_per_step, "50", qapp)
-    assert tab._ramp_settle.value() == 30
+    ramp, = _ramps_run_from(tab, app_model, qapp, monkeypatch, content,
+                            tab._run_ramp_button.click)
 
-    _type_into(tab._ramp_samples_per_step, "20", qapp)
-    assert tab._ramp_settle.value() == 19
+    assert ramp.settle_seconds == pytest.approx(250e-6)
+
+
+def test_a_settle_that_leaves_no_sample_is_refused_before_the_ramp(
+    idle_panel, qapp, monkeypatch, caplog,
+):
+    # At the null laser's 1 kHz, 5 ms is 5 samples: none of a 5-sample step.
+    app_model, content, tab = idle_panel
+    _type_into(tab._ramp_samples_per_step, "5", qapp)
+    _type_into(tab._ramp_settle, "5000", qapp)
+
+    ramps = _ramps_run_from(tab, app_model, qapp, monkeypatch, content,
+                            tab._run_ramp_button.click)
+
+    assert ramps == []
+    # A refusal is logged as the panel's other refusals are.
+    assert any("5 samples of each step" in record.getMessage()
+               for record in caplog.records)
 
 
 def test_run_ramp_is_disabled_while_system_mode_runs(idle_panel, qapp):
@@ -538,10 +529,10 @@ def test_run_ramp_runs_through_the_model_and_never_stops_the_stream_itself(
     tab._ramp_start.setValue(0.5)
     tab._ramp_stop.setValue(2.5)
     tab._ramp_steps.setValue(5)
-    # A fifth of the default 100 samples, until changed.
-    assert tab._ramp_settle.value() == 20
+    # 600 us by default, whatever Samples/step is.
+    assert tab._ramp_settle.value() == 600
     assert "settle" in tab._ramp_settle.toolTip().lower()
-    tab._ramp_settle.setValue(7)
+    tab._ramp_settle.setValue(70)
 
     tab._run_ramp_button.click()
     deadline = time.monotonic() + 10.0
@@ -553,7 +544,7 @@ def test_run_ramp_runs_through_the_model_and_never_stops_the_stream_itself(
     ramp, = ramps
     assert (ramp.channel_id, ramp.start_volts, ramp.stop_volts, ramp.steps) == (
         LaserChannelId.LASER_1, 0.5, 2.5, 5)
-    assert ramp.settle_samples == 7
+    assert ramp.settle_seconds == pytest.approx(70e-6)
     assert monitor_calls == []
     # The outcome stays on the status line; it was replaced at once by the
     # Run Pulse refusal, which is still true in Idle.
@@ -774,3 +765,16 @@ def test_run_ramp_runs_on_the_operation_worker_off_the_qt_thread(ramp_app, qapp,
     finally:
         content.on_close()
         content.deleteLater()
+
+
+
+def test_the_ramps_controller_references_its_inputs_as_the_stream_does(ramp_app):
+    # The controller's own inputs took DAQmx's default: on christielab10's
+    # 6221, ai3, ai4 and ai5 differential, where the stream reads them as RSE.
+    app, spy = ramp_app
+
+    app.run_laser_calibration_ramp(RAMP)
+
+    stream = app.nidaq_signal_monitor.configuration.analog_terminal_config
+    assert stream
+    assert [kwargs.get("analog_terminal_config") for kwargs in spy.opened_with] == [stream]

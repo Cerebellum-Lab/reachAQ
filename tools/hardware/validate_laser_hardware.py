@@ -20,6 +20,7 @@ for _path in (
 
 from autotrainer.core.configuration import SystemConfiguration
 from autotrainer.device import LaserCalibrationRamp, LaserChannelId, LaserPulseTrain
+from autotrainer.device.laser import CALIBRATION_SETTLE_SECONDS
 from tools.acquisition.model.laser_model import LaserModel
 
 
@@ -32,7 +33,10 @@ def main() -> int:
 
     model = LaserModel()
     try:
-        model.load_configuration(laser_config)
+        # Its inputs referenced as the stream references its own.
+        model.load_configuration(
+            laser_config,
+            analog_terminal_config=configuration.nidaq_stream.analog_terminal_config or None)
         channel_id = LaserChannelId(args.channel)
         channel = laser_config.get_channel(channel_id)
         _print_laser_summary(laser_config, channel_id)
@@ -115,7 +119,7 @@ def _calibration_ramp(args: argparse.Namespace, channel_id: LaserChannelId) -> L
         steps=args.ramp_steps,
         samples_per_step=args.samples_per_step,
         enable_pmt_shutter=args.pmt,
-        settle_samples=args.settle_samples,
+        settle_seconds=args.settle_us * 1e-6,
     )
 
 
@@ -145,13 +149,15 @@ def _parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--ramp-start", type=float, default=0.0, help="Calibration ramp start voltage.")
     parser.add_argument("--ramp-stop", type=float, default=1.0, help="Calibration ramp stop voltage.")
     parser.add_argument("--ramp-steps", type=int, default=11, help="Calibration ramp point count.")
-    parser.add_argument("--samples-per-step", type=int, default=100, help="Samples acquired for each ramp point.")
     parser.add_argument(
-        "--settle-samples",
-        type=int,
-        default=None,
-        help="Samples at the start of each ramp step left out of its point, while the laser "
-        "and diode follow the step; default a fifth of --samples-per-step.",
+        "--samples-per-step", type=int, default=500,
+        help="Samples acquired for each ramp point; 500 is 5 ms at 100 kHz.")
+    parser.add_argument(
+        "--settle-us",
+        type=float,
+        default=CALIBRATION_SETTLE_SECONDS * 1e6,
+        help="Microseconds at the start of each ramp step left out of its point, while the "
+        "laser, the diode and the input follow the step; default %(default)g.",
     )
     return parser.parse_args(argv)
 
