@@ -342,8 +342,6 @@ def test_a_rebuilt_laser_whose_profile_vanished_picks_nothing_and_says_so(
         content.on_close()
 
 
-
-
 def _set_pmt_line(app_model, line):
     from autotrainer.core import LaserSystemConfiguration
 
