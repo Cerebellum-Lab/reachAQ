@@ -276,9 +276,15 @@ def test_receive_logs_controller_state_notices_and_keeps_reading(caplog):
     ])
 
     with caplog.at_level(logging.WARNING, logger=socketcan_jerrycan.__name__):
-        messages = backend.ReceiveMessages(max_count=1, collect_ms=5)
+        # Ended by the heartbeat, not by a window: the read returns once
+        # max_count messages are in, and the window only bounds a read that
+        # never gets one. A 5 ms window closed before the heartbeat once in a
+        # full rig run (2026-09-29), the two notices' logging taking longer.
+        messages = backend.ReceiveMessages(max_count=1, collect_ms=5000)
 
     assert [m.type for m in messages] == [JerryCANCmdType.HEARTBEAT]
+    # In the one read: the notices did not end it.
+    assert backend._bus.messages == []
     notices = [r.getMessage() for r in caplog.records if "CAN error notice" in r.getMessage()]
     assert any("controller tx-warning" in n and "tx errors 103" in n for n in notices)
     assert any("controller tx-passive" in n and "tx errors 135" in n for n in notices)
