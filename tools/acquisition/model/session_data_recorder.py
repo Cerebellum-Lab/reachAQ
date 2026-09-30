@@ -1560,9 +1560,16 @@ class SessionDataRecorder:
         # series on perf_time, the host receive time, so write it in that order.
         # The sort is stable, so rows with equal times keep their arrival order.
         device_rows = tuple(sorted(device_rows, key=lambda row: row[0]))
-        laser_rows = tuple(
-            row for row in laser_rows if start_perf <= row[0] <= end_perf
-        )
+        # Rows arrive in the order the laser model tells them, and a manual
+        # Run Pulse's waveform is told once the train has ended, stamped with
+        # the time the pulse was asked for (LaserModel.run_pulse_train):
+        # after any row told while it ran. laser.csv is a time series on
+        # perf_time too; the sort is stable, so rows at the same time keep
+        # the order they were told.
+        laser_rows = tuple(sorted(
+            (row for row in laser_rows if start_perf <= row[0] <= end_perf),
+            key=lambda row: row[0],
+        ))
         log_rows = tuple(
             row for row in log_rows if start_perf <= row[0] <= end_perf
         )
@@ -1804,6 +1811,21 @@ class SessionDataRecorder:
             session_dir=session_dir,
             generation_id=metadata_generation_id,
         )
+        # The NI-DAQ timeline is read once for both streams that name their
+        # NI sample: on a spooled session that is the whole spool's sample
+        # index and time.
+        pressure_perf = pressure_columns["perf_time"]
+        nidaq_index = SessionDataRecorder._pressure_nidaq_indices(
+            np.concatenate((
+                pressure_perf,
+                np.fromiter(
+                    (row[0] for row in laser_rows), dtype=np.float64,
+                    count=len(laser_rows)),
+            )),
+            nidaq_chunks,
+        )
+        pressure_nidaq_index = nidaq_index[:pressure_perf.size]
+        laser_nidaq_index = nidaq_index[pressure_perf.size:]
         SessionDataRecorder._atomic_write_csv(
             streams_dir / "laser.csv", session_dir, metadata_generation_id,
             ("perf_time", "offset_seconds", "wall_time", "event", "channel", "source",
@@ -1813,7 +1835,7 @@ class SessionDataRecorder:
              "frame_relation", "frame_start_perf_time",
              "frame_start_offset_seconds", "frame_start_wall_time",
              "event_to_frame_start_seconds", "alignment_method",
-             "alignment_confidence"),
+             "alignment_confidence", "nidaq_sample_index"),
             (
                 (
                     perf,
@@ -1842,6 +1864,7 @@ class SessionDataRecorder:
                             confidence=timing_confidence,
                         )
                     ),
+                    None if nidaq_sample < 0 else int(nidaq_sample),
                 )
                 for (
                     perf,
@@ -1858,14 +1881,14 @@ class SessionDataRecorder:
                     context_json,
                     timestamp_method,
                     timing_confidence,
-                ) in (
-                    SessionDataRecorder._normalize_laser_row(row)
-                    for row in laser_rows
+                ), nidaq_sample in zip(
+                    (
+                        SessionDataRecorder._normalize_laser_row(row)
+                        for row in laser_rows
+                    ),
+                    laser_nidaq_index,
                 )
             ),
-        )
-        pressure_nidaq_index = SessionDataRecorder._pressure_nidaq_indices(
-            pressure_columns["perf_time"], nidaq_chunks,
         )
         SessionDataRecorder._atomic_write_csv(
             streams_dir / "pressure.csv", session_dir, metadata_generation_id,
@@ -2422,9 +2445,10 @@ class SessionDataRecorder:
     def _pressure_nidaq_indices(perf, chunks):
         """Map each pressure sample onto the NI-DAQ sample it landed within.
 
-        Both clocks are time.perf_counter, so this is a lookup in the NI-DAQ
-        timeline rather than a fit. Samples outside the NI-DAQ window get -1,
-        which keeps the column integral and honest about not having a match.
+        And each laser row: any perf times map the same way. Both clocks are
+        time.perf_counter, so this is a lookup in the NI-DAQ timeline rather
+        than a fit. Samples outside the NI-DAQ window get -1, which keeps the
+        column integral and honest about not having a match.
         """
         missing = np.full(perf.shape, -1, dtype=np.int64)
         if perf.size == 0:
