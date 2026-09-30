@@ -64,6 +64,43 @@ def _pulse_is_running(daq):
     return any(task.label == "laser_sync_pulse_ao" and task.started for task in daq.tasks)
 
 
+@pytest.fixture(autouse=True)
+def _every_controller_closed():
+    """Close each controller a test opened, then check no fake task is open.
+
+    Most tests here never closed theirs, which kept its channel tasks, and
+    any trigger route, open on the fake. This is torn down after the test's
+    own fixtures, so its patches are undone by then. A stand-in the test set
+    on the controller itself is dropped, and any wait or call it left held
+    is let go, so the close meets the fake as a controller's close would.
+    """
+    opened = []
+    init = NidaqLaserController.__init__
+
+    def opening(self, *args, **kwargs):
+        init(self, *args, **kwargs)
+        opened.append(self)
+
+    NidaqLaserController.__init__ = opening
+    try:
+        yield
+    finally:
+        NidaqLaserController.__init__ = init
+    fakes = {id(controller._nidaqmx): controller._nidaqmx for controller in opened}
+    for daq in fakes.values():
+        daq.waits_released.set()
+        daq.hang_released.set()
+    for controller in opened:
+        for name in [name for name in vars(controller)
+                     if callable(getattr(NidaqLaserController, name, None))]:
+            delattr(controller, name)
+        if not controller._closed:
+            controller.close()
+        assert controller.wait_for_work_left_running(5.0)
+    for daq in fakes.values():
+        assert [task.label for task in daq.tasks if not task.closed] == []
+
+
 @pytest.fixture
 def held(monkeypatch):
     """A fake whose waits hold until released, as a train still running does.
@@ -793,6 +830,13 @@ def test_only_the_abort_in_progress_code_is_tried_again(held, monkeypatch, error
 # ------------------------------------------------ round 6: the channel tasks going
 
 
+def _let_go_of_the_channel_tasks(controller):
+    """As close() lets go of the channel tasks: each closed, then all cleared."""
+    for tasks in controller._tasks.values():
+        tasks.close()
+    controller._tasks.clear()
+
+
 def test_a_pulse_cleanup_whose_channel_tasks_go_meanwhile_still_resets(monkeypatch):
     # The cleanup looked for the channel's tasks, then used them: close()
     # clearing them in between raised KeyError, and nothing was reset.
@@ -802,7 +846,7 @@ def test_a_pulse_cleanup_whose_channel_tasks_go_meanwhile_still_resets(monkeypat
     set_command_voltage = controller.set_command_voltage
 
     def tasks_go_first(channel_id, volts):
-        controller._tasks.clear()
+        _let_go_of_the_channel_tasks(controller)
         return set_command_voltage(channel_id, volts)
 
     monkeypatch.setattr(controller, "set_command_voltage", tasks_go_first)
@@ -822,7 +866,7 @@ def test_a_cancels_shutter_close_whose_channel_tasks_go_meanwhile_still_closes(h
 
     def tasks_go_first(channel_id, is_open):
         if threading.current_thread() is canceller:
-            controller._tasks.clear()
+            _let_go_of_the_channel_tasks(controller)
         return set_shutter_open(channel_id, is_open)
 
     monkeypatch.setattr(controller, "set_shutter_open", tasks_go_first)
