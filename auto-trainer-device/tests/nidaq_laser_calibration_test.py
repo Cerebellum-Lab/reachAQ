@@ -42,7 +42,11 @@ RAMP = LaserCalibrationRamp(
 def daq(monkeypatch):
     fake = _FakeDaqmx()
     monkeypatch.setattr(nidaq_laser, "_load_nidaqmx", lambda: fake)
-    return fake
+    yield fake
+    # A running task's abort returned only once its woken owner had closed
+    # it: the fake never had to give up on one.
+    assert not [entry.task for entry in fake.timeline
+                if entry.event == "abort gave up on owner"]
 
 
 def _wait_for(condition, timeout=5.0):
@@ -480,7 +484,6 @@ def test_a_task_the_ramp_has_let_go_of_is_not_aborted(daq, caplog):
     assert _abort_log(caplog) == []
 
 
-
 def test_a_ramp_task_started_before_a_close_is_logged_as_running(daq, caplog):
     # The ramp starts its input, then its output. A close landing between
     # the starts found the ramp not yet marked started, and logged the
@@ -508,6 +511,7 @@ def test_a_ramp_task_started_before_a_close_is_logged_as_running(daq, caplog):
             "laser_1_calibration_ai (DAQmx may warn 200010)") in messages
     assert ("laser 1's calibration ramp: aborting its task "
             "laser_1_calibration_ao, not started") in messages
+
 
 def test_an_abort_that_fails_on_a_task_the_ramp_still_holds_is_reported(monkeypatch, caplog):
     # The ramp stays in its wait, holding both tasks, whatever is aborted.
@@ -561,7 +565,6 @@ def test_each_point_is_the_level_the_step_settled_to(daq):
     assert [point.command_copy_volts for point in points] == [0.0, 2.5, 5.0]
     # 20 us at 100 kHz: 2 of these 10 samples.
     assert ramp.settle_sample_count(100_000.0) == 2
-
 
 
 # ---------------------------------------------- round 8: the inputs' referencing
@@ -693,3 +696,22 @@ def test_a_settle_that_leaves_no_sample_is_refused_before_any_task(daq):
         controller.run_calibration_ramp(ramp)
 
     assert daq.tasks[made:] == []
+
+
+def test_the_ramp_does_not_note_the_stop_of_a_task_close_aborted(daq, caplog):
+    # close() aborted the output, and the ramp's own stop of it after that
+    # is no early stop of a running task: only the input, still running
+    # when the ramp stopped it, is noted.
+    daq.block_wait = True
+    controller = NidaqLaserController(_rig_lasers())
+    thread, _outcome = _ramp_in_thread(controller)
+    _wait_until_ramping(daq)
+
+    with caplog.at_level(logging.DEBUG):
+        controller.close()
+        thread.join(5.0)
+
+    assert [record.getMessage() for record in caplog.records
+            if "before it finished" in record.getMessage()] == [
+        "laser 1's calibration ramp: stopping its task laser_1_calibration_ai "
+        "before it finished (DAQmx may warn 200010)"]
