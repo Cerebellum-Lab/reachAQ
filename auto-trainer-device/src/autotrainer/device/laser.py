@@ -289,9 +289,10 @@ class LaserControllerProtocol(Protocol):
 class LaserPulseRefused(RuntimeError):
     """A pulse train refused before anything was driven: its outputs untouched.
 
-    The board rule, a closed controller, or a configuration that cannot run
-    it. A caller that recorded the pulse's amplitude as what its output may
-    hold takes that back (LaserModel).
+    The board rule, a closed controller, a configuration that cannot run
+    it, or an amplitude outside its laser's range (NidaqLaserController). A
+    caller that recorded the pulse's amplitude as what its output may hold
+    takes that back (LaserModel).
     """
 
 

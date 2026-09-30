@@ -635,6 +635,16 @@ class NidaqLaserController:
     def run_synchronized_pulse_train(self, pulse_train: LaserSynchronizedPulseTrain):
         if not self._configuration.hardware_timed:
             raise LaserPulseRefused("Hardware-timed laser pulse trains require laser configuration hardware_timed=True")
+        # Before the operation exists, as every refusal of a pulse that drives
+        # nothing is. Made in the pulse's own thread, it came back as that
+        # operation's failure, and the laser model kept the amplitude as what
+        # the output may still hold (final re-review, affb7491).
+        for item in pulse_train.pulse_trains:
+            try:
+                self._validate_command_voltage(
+                    self._configuration.get_channel(item.channel_id), item.amplitude_volts)
+            except ValueError as error:
+                raise LaserPulseRefused(str(error)) from error
         # Both paths own their output through one operation, so close() can
         # cancel and wait for either. A waited-for train (Run Pulse) used to
         # run with none: close() could not stop it, and its command reset met
@@ -872,8 +882,8 @@ class NidaqLaserController:
             self._configuration.get_channel(channel_pulse.channel_id)
             for channel_pulse in pulse_train.pulse_trains
         ]
-        for channel, channel_pulse in zip(channels, pulse_train.pulse_trains):
-            self._validate_command_voltage(channel, channel_pulse.amplitude_volts)
+        # Each amplitude is in its laser's range: run_synchronized_pulse_train
+        # refused it before the operation was made otherwise.
         # Resolved before the waveform is built rather than after, because the
         # timing decides the rate it will be generated at and every sample
         # count below is computed from that rate.
