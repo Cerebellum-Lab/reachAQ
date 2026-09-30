@@ -737,3 +737,44 @@ def test_a_ramps_refused_command_reset_is_critical(daq, caplog):
                 if record.levelno == logging.CRITICAL]
     assert len(critical) == 1
     assert "Laser 1" in critical[0] and "PXI1Slot4/ao0" in critical[0]
+
+
+# ---------------------------------------------- workstream D: the follow-ups
+
+
+def _ramp_with_its_reset_refused(controller, daq):
+    daq.failing_write = "laser_1_manual_ao"
+    try:
+        with pytest.raises(RuntimeError, match="channel 1 command reset"):
+            controller.run_calibration_ramp(RAMP)
+    finally:
+        daq.failing_write = None
+
+
+def test_a_ramps_refused_reset_names_the_ramps_last_command(daq, caplog):
+    # It named the level it could not reach, the minimum, and not the one
+    # the output may still hold.
+    controller = NidaqLaserController(_rig_lasers())
+    try:
+        with caplog.at_level(logging.ERROR):
+            _ramp_with_its_reset_refused(controller, daq)
+
+        critical = [record.getMessage() for record in caplog.records
+                    if record.levelno == logging.CRITICAL]
+        assert len(critical) == 1
+        assert ("The output may still hold the ramp's last command, 5 V "
+                "(a 0 V to 5 V ramp)") in critical[0]
+    finally:
+        controller.close()
+
+
+def test_a_close_that_resets_a_laser_a_ramp_left_driven_says_so(daq, caplog):
+    controller = NidaqLaserController(_rig_lasers())
+    with caplog.at_level(logging.WARNING):
+        _ramp_with_its_reset_refused(controller, daq)
+        controller.close()
+
+    warnings_ = [record.getMessage() for record in caplog.records
+                 if record.levelno == logging.WARNING and "after all" in record.getMessage()]
+    assert len(warnings_) == 1
+    assert "Laser 1" in warnings_[0] and "PXI1Slot4/ao0" in warnings_[0]
