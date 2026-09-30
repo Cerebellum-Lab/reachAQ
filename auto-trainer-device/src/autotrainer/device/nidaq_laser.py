@@ -129,15 +129,14 @@ class NidaqLaserOperation:
         self._start_requested = threading.Event()
         self._state = LaserOperationState.PREPARED
         self._observations = [(self._state.value, time.perf_counter(), "")]
-        #: (name, task) pairs, in the order they start (_bind_tasks).
+        #: (name, task) pairs: the output, then its lines (_bind_tasks).
         self._tasks = ()
-        #: Set once the bound tasks have been started: an abort of them then
-        #: warns (200010), and says so (_mark_started).
-        self._started = False
-        #: Held by the pulse while it looks whether it is cancelled and opens
-        #: its shutter, and by cancel() to mark it cancelled: a cancel comes
-        #: before the look, or after the opening (_open_shutters_unless_cancelled).
-        self._opening = threading.Lock()
+        #: The bound tasks started so far, by id: an abort of one of them can
+        #: warn (200010), and says so (_mark_started).
+        self._started = set()
+        #: Set once the pulse's cleanup has taken its tasks, before it stops
+        #: and closes them: a cancel's abort leaves them to it (_let_go_of_tasks).
+        self._let_go = False
         self._error = None
         self._timing_status = {}
         self._thread = None
@@ -181,16 +180,13 @@ class NidaqLaserOperation:
 
     def cancel(self):
         tasks = ()
-        running = False
-        # Behind a pulse opening its shutter: that opening ends first, and
-        # the close below comes after it.
-        with self._opening:
-            with self._lock:
-                if self._state in self.TERMINAL or self._finishing:
-                    return False
-                self._transition_locked(LaserOperationState.CANCELLED, "cancel requested")
-                tasks = self._tasks
-                running = self._started
+        # Marked at once, and never behind a driver call: a pulse opening its
+        # shutter looks again after it opens (_open_shutters_unless_cancelled).
+        with self._lock:
+            if self._state in self.TERMINAL or self._finishing:
+                return False
+            self._transition_locked(LaserOperationState.CANCELLED, "cancel requested")
+            tasks = self._tasks
         # The pulse's shutters first, as close() closes the shutters first:
         # the light is off from then on, whatever the output holds until the
         # cleanup's reset. The trade: this digital write comes before the
@@ -205,16 +201,26 @@ class NidaqLaserOperation:
         # Aborted, not stopped: the operation's own thread is in the task's
         # wait, which the abort ends at once. That thread, finding the
         # operation cancelled, ends it CANCELLED, not FAILED, and cleans up.
-        # The digital lines first and the output last: the output's abort
-        # wakes that thread, whose cleanup stops and closes every task, and
-        # only the one abort measured with it is then still under way (H8a,
-        # H8c).
-        for name, task in reversed(tasks):
+        # The output first: it is what holds the laser on, DAQmx keeping its
+        # last sample until the cleanup's reset, and the lines run on its
+        # clock. Its abort wakes that thread, whose cleanup takes every task
+        # before it stops and closes them (H8a, H8c): a line it has taken is
+        # its to stop, and is not aborted; one it takes during the abort is
+        # not a failure.
+        for name, task in tasks:
+            if self._abort_task is None:
+                break
+            if self._tasks_let_go():
+                logger.debug("A cancel left %s to its pulse's own cleanup", name)
+                continue
             try:
-                if self._abort_task is not None:
-                    self._abort_task(task, name, running)
-            except Exception:
-                logger.debug("Laser task abort during cancellation failed", exc_info=True)
+                self._abort_task(task, name, self._is_started(task))
+            except Exception as error:
+                if self._tasks_let_go():
+                    logger.debug("A cancel's abort of %s met its pulse's own "
+                                 "cleanup: %s", name, error)
+                else:
+                    logger.debug("Laser task abort during cancellation failed", exc_info=True)
         # A deferred pulse is woken only now: woken before the aborts had
         # returned, its cleanup stopped a task still being aborted, -88710
         # (christielab10, H8b).
@@ -267,36 +273,50 @@ class NidaqLaserOperation:
             self._timing_status = dict(status)
 
     def _bind_tasks(self, tasks):
-        """The tasks a cancel aborts: (name, task) pairs, as they start.
+        """The tasks a cancel aborts, in the order it aborts them: (name, task).
 
-        Named by the pulse's own thread, which made them: a task's name is a
-        driver query, which a cancel's abort must not make (_abort_task).
+        Named with the names the controller made them with: a task's own
+        name is a driver query, which a cancel's abort must not make.
         """
-        bound = tuple((name, task) for name, task in tasks if task is not None)
+        bound = tuple(tasks)
         with self._lock:
             self._tasks = bound
 
-    def _mark_started(self):
-        """The bound tasks have been started: an abort of them now warns."""
+    def _mark_started(self, task):
+        """`task` has been started: an abort of it from now on can warn."""
         with self._lock:
-            self._started = True
+            self._started.add(id(task))
 
-    def _open_shutters_unless_cancelled(self, open_shutters):
+    def _is_started(self, task) -> bool:
+        with self._lock:
+            return id(task) in self._started
+
+    def _let_go_of_tasks(self):
+        """The pulse's cleanup has taken its tasks: a cancel leaves them to it."""
+        with self._lock:
+            self._let_go = True
+
+    def _tasks_let_go(self) -> bool:
+        with self._lock:
+            return self._let_go
+
+    def _open_shutters_unless_cancelled(self, open_shutters, close_shutters):
         """Open the pulse's shutters, by `open_shutters`, unless cancelled.
 
         A cancel closes them before its abort. Made just before the pulse
         opened them, it found them closed, and the pulse then opened them: a
-        pulse that leaves its shutter open left it so. The look and the
-        opening are made together, behind the lock a cancel takes to mark the
-        operation cancelled: a cancel comes before the look, and nothing is
-        opened, or it waits for the opening and closes them after. Not under
-        _lock, which every look at the state takes: a driver hung in the
-        write would have held all of those too.
+        pulse that leaves its shutter open left it so. The pulse looks before
+        it opens them and again after. Cancelled by the second look, it
+        closes them itself, by `close_shutters`, and ends as the cancel; a
+        cancel marked after it closes them after the opening. Nothing makes a
+        cancel wait here: a driver hung in the opening holds this thread only.
         """
-        with self._opening:
-            if self.state is LaserOperationState.CANCELLED:
-                raise RuntimeError("Laser operation was cancelled before its shutter opened")
-            open_shutters()
+        if self.state is LaserOperationState.CANCELLED:
+            raise RuntimeError("Laser operation was cancelled before its shutter opened")
+        open_shutters()
+        if self.state is LaserOperationState.CANCELLED:
+            close_shutters()
+            raise RuntimeError("Laser operation was cancelled as its shutter opened")
 
     def _mark_armed(self):
         with self._lock:
@@ -434,14 +454,14 @@ class NidaqLaserController:
         self._routes_settled = threading.Condition(self._operation_lock)
         self._live_operations: Dict[str, NidaqLaserOperation] = {}
         #: The tasks of a calibration ramp in progress, for close() to abort
-        #: from another thread; see run_calibration_ramp.
-        self._calibration_tasks: List[object] = []
+        #: from another thread, as (owner, name, task); see run_calibration_ramp.
+        self._calibration_tasks: List[Tuple[str, str, object]] = []
         #: Those the ramp's finally has let go of, by id, under the lock:
         #: close()'s abort leaves them to its cleanup.
         self._released_calibration_tasks: set = set()
-        #: Set, under the lock, once the ramp's tasks have been started: an
-        #: abort of them then warns (200010), and says so.
-        self._calibration_started = False
+        #: The ramp's tasks started so far, by id, under the lock: close()'s
+        #: abort of one of them can warn (200010), and says so.
+        self._started_calibration_tasks: set = set()
         #: Set by close(), under _operation_lock, before it calls the driver.
         #: A ramp or pulse train starts, and a route is kept, only while it is
         #: clear.
@@ -757,10 +777,10 @@ class NidaqLaserController:
         returns (-200088, christielab10, H8c). Aborting a running task warns,
         DaqWarning 200010 (H5b, H8a), the abort doing what was asked: one
         filter, set as the driver loads, keeps that warning, by its text, off
-        stderr (_ignore_the_aborts_warning), and this line says it came.
+        stderr (_ignore_the_aborts_warning), and this line says it can come.
         """
         if running:
-            logger.debug("%s: aborting its running task %s (DAQmx warns 200010)",
+            logger.debug("%s: aborting its running task %s (DAQmx may warn 200010)",
                          owner, name)
         else:
             logger.debug("%s: aborting its task %s, not started", owner, name)
@@ -864,8 +884,11 @@ class NidaqLaserController:
         timeout_seconds = pulse_train.timeout_seconds
         if timeout_seconds is None:
             timeout_seconds = total_samples / sample_rate_hz + 5.0
-        ao_task = self._create_synchronized_analog_output_task(channels, "laser_sync_pulse_ao")
+        ao_name = "laser_sync_pulse_ao"
+        ao_task = self._create_synchronized_analog_output_task(channels, ao_name)
         digital_tasks = []
+        # The name each digital task is made with, in the same order.
+        digital_names = []
         # The clock routes this pulse train adds for its digital outputs, by
         # name, which it releases when it ends, as the calibration ramp does.
         added_routes: List[Tuple[str, str]] = []
@@ -895,10 +918,11 @@ class NidaqLaserController:
 
             if pmt_enabled:
                 pmt_line = self._require_pmt_shutter_output()
+                digital_names.append("laser_pmt_shutter_do")
                 digital_tasks.append(
                     self._create_finite_digital_output_task(
                         pmt_line,
-                        "laser_pmt_shutter_do",
+                        digital_names[-1],
                         [True] * total_samples,
                         sample_rate_hz,
                         total_samples,
@@ -913,10 +937,11 @@ class NidaqLaserController:
                             f"laser channel {channel.channel_id.value} requested trigger output, "
                             "but trigger_output is not configured"
                         )
+                    digital_names.append(f"laser_{channel.channel_id.value}_trigger_do")
                     digital_tasks.append(
                         self._create_finite_digital_output_task(
                             channel.trigger_output,
-                            f"laser_{channel.channel_id.value}_trigger_do",
+                            digital_names[-1],
                             self._build_digital_pulse_waveform(
                                 total_samples,
                                 channel_pulse.trigger_output_pulse_ms,
@@ -934,10 +959,12 @@ class NidaqLaserController:
                             f"laser channel {channel.channel_id.value} requested timing trigger output, "
                             "but timing_trigger_output is not configured"
                         )
+                    digital_names.append(
+                        f"laser_{channel.channel_id.value}_timing_trigger_do")
                     digital_tasks.append(
                         self._create_finite_digital_output_task(
                             channel.timing_trigger_output,
-                            f"laser_{channel.channel_id.value}_timing_trigger_do",
+                            digital_names[-1],
                             self._build_digital_pulse_waveform(
                                 total_samples,
                                 channel_pulse.timing_trigger_output_pulse_ms,
@@ -960,23 +987,27 @@ class NidaqLaserController:
                     if channel_pulse.open_shutter:
                         self.set_shutter_open(channel.channel_id, True)
 
+            def close_shutters():
+                for channel, channel_pulse in zip(channels, pulse_train.pulse_trains):
+                    if channel_pulse.open_shutter:
+                        self._close_shutter(channel)
+
             if operation is None:
                 open_shutters()
             else:
-                operation._open_shutters_unless_cancelled(open_shutters)
-                operation._bind_tasks(
-                    (task.name, task) for task in (ao_task, *digital_tasks))
+                operation._open_shutters_unless_cancelled(open_shutters, close_shutters)
+                operation._bind_tasks(zip(
+                    (ao_name, *digital_names), (ao_task, *digital_tasks)))
                 operation._require_not_cancelled()
             if operation is not None and pulse_train.defer_start:
                 operation._mark_armed()
                 if not operation._start_requested.wait(timeout_seconds):
                     raise TimeoutError("Deferred laser operation did not receive a start request")
                 operation._require_not_cancelled()
-            for task in digital_tasks:
+            for task in (*digital_tasks, ao_task):
                 task.start()
-            ao_task.start()
-            if operation is not None:
-                operation._mark_started()
+                if operation is not None:
+                    operation._mark_started(task)
             if operation is not None and operation.state is LaserOperationState.CANCELLED:
                 # A cancel between the look above and the starts aborted
                 # tasks not yet started, which does nothing (H5c): the train
@@ -999,6 +1030,9 @@ class NidaqLaserController:
             run_error = exc
             raise
         finally:
+            if operation is not None:
+                # Before the first stop: a cancel from now on leaves them here.
+                operation._let_go_of_tasks()
             self._cleanup_pulse_train(
                 ao_task=ao_task,
                 digital_tasks=digital_tasks,
@@ -1155,18 +1189,20 @@ class NidaqLaserController:
             # close() waits on this before it resets the laser.
             self._calibration_released.clear()
             self._released_calibration_tasks.clear()
+            self._started_calibration_tasks.clear()
         try:
             # Both inside the cleanup scope: created before it, an input task
             # that failed to create left the output task open on ao0.
-            ao_task = self._create_analog_output_task(
-                channel, f"laser_{channel.channel_id.value}_calibration_ao")
+            ao_name = f"laser_{channel.channel_id.value}_calibration_ao"
+            ai_name = f"laser_{channel.channel_id.value}_calibration_ai"
+            ao_task = self._create_analog_output_task(channel, ao_name)
             # Where close() can find them: reachAQ closing mid-ramp closes
             # this controller from its own thread, and this one may then be
             # inside DAQmx, waiting on these.
             owner = f"laser {channel.channel_id.value}'s calibration ramp"
-            self._hold_calibration_tasks(owner, ao_task)
-            ai_task = self._create_calibration_input_task(channel)
-            self._hold_calibration_tasks(owner, ai_task)
+            self._hold_calibration_tasks(owner, ao_name, ao_task)
+            ai_task = self._create_calibration_input_task(channel, ai_name)
+            self._hold_calibration_tasks(owner, ai_name, ai_task)
             ao_task.timing.cfg_samp_clk_timing(
                 rate=sample_rate_hz,
                 sample_mode=self._nidaqmx.constants.AcquisitionType.FINITE,
@@ -1190,10 +1226,11 @@ class NidaqLaserController:
             )
             if ramp.enable_pmt_shutter:
                 pmt_line = self._require_pmt_shutter_output()
+                pmt_name = "laser_pmt_shutter_calibration_do"
                 digital_tasks.append(
                     self._create_finite_digital_output_task(
                         pmt_line,
-                        "laser_pmt_shutter_calibration_do",
+                        pmt_name,
                         [True] * len(waveform),
                         sample_rate_hz,
                         len(waveform),
@@ -1205,7 +1242,7 @@ class NidaqLaserController:
                         "rising",
                     )
                 )
-                self._hold_calibration_tasks(owner, digital_tasks[-1])
+                self._hold_calibration_tasks(owner, pmt_name, digital_tasks[-1])
             ao_task.write(waveform, auto_start=False)
             # Only while the controller is open: a close that came first has
             # reset the outputs, and must not find the laser driven after it.
@@ -1222,12 +1259,10 @@ class NidaqLaserController:
                         "ramp started")
             if ramp.open_shutter:
                 self.set_shutter_open(channel.channel_id, True)
-            for task in digital_tasks:
+            for task in (*digital_tasks, ai_task, ao_task):
                 task.start()
-            ai_task.start()
-            ao_task.start()
+                self._mark_calibration_task_started(task)
             with self._operation_lock:
-                self._calibration_started = True
                 if self._closed:
                     raise RuntimeError(
                         "the laser controller was closed as the calibration "
@@ -1248,7 +1283,7 @@ class NidaqLaserController:
                     self._released_calibration_tasks.update(
                         id(task) for _owner, _name, task in self._calibration_tasks)
                     self._calibration_tasks.clear()
-                    self._calibration_started = False
+                    self._started_calibration_tasks.clear()
                 self._cleanup_calibration_ramp(
                     ao_task=ao_task,
                     ai_task=ai_task,
@@ -1265,19 +1300,23 @@ class NidaqLaserController:
                 self._calibration_released.set()
         return points
 
-    def _hold_calibration_tasks(self, owner: str, task) -> None:
+    def _hold_calibration_tasks(self, owner: str, name: str, task) -> None:
         """Keep a ramp's task where close() can abort it, unless closed.
 
-        Named here, by the ramp's thread, which made it: a task's name is a
-        driver query, which close()'s abort must not make (_abort_task).
+        With the name the ramp made it with: a task's own name is a driver
+        query, which close()'s abort must not make (_abort_task).
         """
-        held = (owner, task.name, task)
         with self._operation_lock:
             if self._closed:
                 raise RuntimeError(
                     "the laser controller was closed before the calibration "
                     "ramp started")
-            self._calibration_tasks.append(held)
+            self._calibration_tasks.append((owner, name, task))
+
+    def _mark_calibration_task_started(self, task) -> None:
+        """A ramp's task has been started: close()'s abort of it can warn."""
+        with self._operation_lock:
+            self._started_calibration_tasks.add(id(task))
 
     def _validate_command_voltage(self, channel: LaserChannelConfiguration, volts: float) -> None:
         if not channel.minimum_command_volts <= volts <= channel.maximum_command_volts:
@@ -1598,15 +1637,14 @@ class NidaqLaserController:
         if not tasks:
             return []
         errors = []
-        with self._route_lock():
-            running = getattr(self, "_calibration_started", False)
         for owner, name, task in tasks:
             # One the ramp's own cleanup has taken is its to stop and close;
             # the first abort can be what let the ramp go to that cleanup.
             if self._calibration_task_released(task):
                 continue
             try:
-                self._abort_task(task, owner, name, running=running)
+                self._abort_task(
+                    task, owner, name, running=self._calibration_task_started(task))
             except Exception as exc:
                 if self._calibration_task_released(task):
                     # Taken by that cleanup while this aborted it: the abort
@@ -1623,6 +1661,11 @@ class NidaqLaserController:
         """Whether the ramp's finally has let go of `task`; bookkeeping."""
         with self._route_lock():
             return id(task) in getattr(self, "_released_calibration_tasks", ())
+
+    def _calibration_task_started(self, task) -> bool:
+        """Whether the ramp has started `task`; bookkeeping."""
+        with self._route_lock():
+            return id(task) in getattr(self, "_started_calibration_tasks", ())
 
     def _wait_for_calibration_release(self) -> List[Tuple[str, Exception]]:
         """Wait, bounded, for an aborted ramp to let go of its tasks; for close().
@@ -1961,8 +2004,8 @@ class NidaqLaserController:
             )
         return analog_output
 
-    def _create_calibration_input_task(self, channel: LaserChannelConfiguration):
-        analog_input = self._nidaqmx.Task(f"laser_{channel.channel_id.value}_calibration_ai")
+    def _create_calibration_input_task(self, channel: LaserChannelConfiguration, name: str):
+        analog_input = self._nidaqmx.Task(name)
         try:
             analog_input.ai_channels.add_ai_voltage_chan(channel.diode_input)
             if channel.command_copy_input is not None:
@@ -2199,18 +2242,15 @@ def _ignore_the_aborts_warning(nidaqmx) -> None:
 
     One filter, by DaqWarning and its text, 200010 alone: every other DAQmx
     warning is still shown. Set each time the driver is loaded for a
-    controller, unless it is already there: a warnings.catch_warnings that
-    ends puts back the filters it found, which pytest does after each test.
-    Filtering by recording them, around each abort, swapped the process's
-    warnings state from the aborting thread for its duration.
+    controller: a warnings.catch_warnings that ends puts back the filters it
+    found, which pytest does after each test, and filterwarnings takes out
+    the one already there and puts it first again, ahead of any catch-all
+    set since. Filtering by recording them, around each abort, swapped the
+    process's warnings state from the aborting thread for its duration.
     """
     category = getattr(getattr(nidaqmx, "errors", None), "DaqWarning", None)
     if not (isinstance(category, type) and issubclass(category, Warning)):
         return
-    for action, message, filtered, _module, _lineno in tuple(warnings.filters):
-        if (action == "ignore" and filtered is category
-                and getattr(message, "pattern", None) == _ABORT_WARNING_PATTERN):
-            return
     warnings.filterwarnings(
         "ignore", message=_ABORT_WARNING_PATTERN, category=category)
 

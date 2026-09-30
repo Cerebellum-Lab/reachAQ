@@ -207,10 +207,13 @@ class FakeTask:
             raise RuntimeError(f"DAQmx refused to abort {self.label}")
         # As measured on christielab10:
         # - running (H8a, H8c on the 6713's AO): the abort takes about 13 ms;
-        #   the owner's wait is woken near its end (11.9 and 15.0 ms), and the
-        #   owner stops and clears the task before the abort returns, cleanly.
-        #   The fake returns once the owner has closed the task, bounded;
-        #   with abort_seconds 0, at once, the rest ordered by the test;
+        #   the owner's wait is woken near its end, 11.8 ms (H8a) and 12.1 ms
+        #   (H8c) from the abort's entry, and the owner stops and clears the
+        #   task before the abort returns, cleanly. The fake returns once the
+        #   owner has closed the task, bounded, and notes "abort gave up on
+        #   owner" on the timeline when the bound runs out, which the cancel
+        #   tests assert never happens; with abort_seconds 0, at once, the
+        #   rest ordered by the test;
         # - never started, its buffer written (H8b): the abort takes about
         #   1 ms, and a stop made meanwhile raised -88710.
         was_started = self.started
@@ -224,7 +227,8 @@ class FakeTask:
                 self._release()
             if (was_started and waited_on and self.daq.abort_unblocks
                     and self.daq.abort_seconds):
-                self._closed_event.wait(self.daq.abort_seconds + 0.5)
+                if not self._closed_event.wait(self.daq.abort_seconds + 0.5):
+                    self._note("abort gave up on owner")
             elif self.daq.abort_seconds:
                 time.sleep(self.daq.abort_seconds)
         finally:
