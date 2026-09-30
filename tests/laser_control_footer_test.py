@@ -226,8 +226,16 @@ def test_a_failed_operation_is_shown_in_red_and_logged_once(panel, qapp, caplog)
 
     refusal = "Stim test needs the nidaq laser backend; this rig is configured for 'null'."
     assert _shows_error(panel, f"Laser operation failed: {refusal}"), _footer(panel).text()
+    # The whole error on hover; the footer's line is its first line, cut.
+    assert _footer(panel).toolTip() == refusal
     # The operation's own record; showing it on the footer adds none.
     assert len(_logged(caplog, refusal)) == 1
+
+    # The next status takes the error's tooltip away with it.
+    tab._run_pulse_button.click()
+    _wait_for_operation(panel, qapp)
+    assert _footer(panel).text() == "Pulse complete: laser 1"
+    assert _footer(panel).toolTip() == ""
 
 
 def test_a_profile_gone_across_a_rebuild_is_left_on_the_footer(panel, listed, caplog):
