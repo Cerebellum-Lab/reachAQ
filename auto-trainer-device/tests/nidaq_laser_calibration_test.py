@@ -742,28 +742,32 @@ def test_a_ramps_refused_command_reset_is_critical(daq, caplog):
 # ---------------------------------------------- workstream D: the follow-ups
 
 
-def _ramp_with_its_reset_refused(controller, daq):
+def _ramp_with_its_reset_refused(controller, daq, ramp=RAMP):
     daq.failing_write = "laser_1_manual_ao"
     try:
         with pytest.raises(RuntimeError, match="channel 1 command reset"):
-            controller.run_calibration_ramp(RAMP)
+            controller.run_calibration_ramp(ramp)
     finally:
         daq.failing_write = None
 
 
-def test_a_ramps_refused_reset_names_the_ramps_last_command(daq, caplog):
+@pytest.mark.parametrize("start, stop", [(0.0, 5.0), (5.0, 0.0)])
+def test_a_ramps_refused_reset_names_the_highest_level_it_commanded(daq, caplog, start, stop):
     # It named the level it could not reach, the minimum, and not the one
-    # the output may still hold.
+    # the output may still hold. Stopped part-way, a ramp's output holds a
+    # level between its ends: its stop, named alone, said 0 V for a falling
+    # ramp that may have left 5 V.
     controller = NidaqLaserController(_rig_lasers())
     try:
         with caplog.at_level(logging.ERROR):
-            _ramp_with_its_reset_refused(controller, daq)
+            _ramp_with_its_reset_refused(
+                controller, daq, dataclasses.replace(RAMP, start_volts=start, stop_volts=stop))
 
         critical = [record.getMessage() for record in caplog.records
                     if record.levelno == logging.CRITICAL]
         assert len(critical) == 1
-        assert ("The output may still hold the ramp's last command, 5 V "
-                "(a 0 V to 5 V ramp)") in critical[0]
+        assert ("The output may still hold up to 5 V, the ramp's highest "
+                f"command (a {start:g} V to {stop:g} V ramp)") in critical[0]
     finally:
         controller.close()
 
@@ -806,5 +810,5 @@ def test_a_closed_ramps_refused_reset_is_critical(daq, caplog):
     assert len(critical) == 1
     assert "after a closed calibration ramp" in critical[0]
     assert "Laser 1" in critical[0] and "PXI1Slot4/ao0" in critical[0]
-    assert "the ramp's last command, 5 V (a 0 V to 5 V ramp)" in critical[0]
+    assert "up to 5 V, the ramp's highest command (a 0 V to 5 V ramp)" in critical[0]
     assert "make the laser safe by hand" in critical[0]

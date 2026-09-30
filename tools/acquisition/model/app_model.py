@@ -6787,17 +6787,19 @@ class AppModel(ObservableObject):
         """What a ramp's output may hold, as far as the application knows.
 
         A ramp that never opened its controller, or never started on it,
-        wrote no command.
+        wrote no command. One that did may hold up to its highest command,
+        whichever end that is: stopped part-way, its output holds a level
+        between the two, and a falling ramp's stop, named alone, said 0 V.
         """
         with self._laser_calibration_lock:
             opened = self._laser_calibration_opened
             commanded = self._laser_calibration_commanded
         if commanded:
             return (
-                "Its analog output may still hold the ramp's last command, %g V "
-                "(a %g V to %g V ramp), and its shutter may be open: make the "
-                "laser safe by hand." % (
-                    float("nan") if ramp is None else ramp.stop_volts,
+                "Its analog output may still hold up to %g V, the ramp's highest "
+                "command (a %g V to %g V ramp), and its shutter may be open: "
+                "make the laser safe by hand." % (
+                    float("nan") if ramp is None else max(ramp.start_volts, ramp.stop_volts),
                     float("nan") if ramp is None else ramp.start_volts,
                     float("nan") if ramp is None else ramp.stop_volts,
                 ))

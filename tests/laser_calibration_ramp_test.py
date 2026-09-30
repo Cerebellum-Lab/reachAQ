@@ -936,14 +936,14 @@ def _laser_status(app):
     return app.subsystem_statuses.get(SubsystemId.LASER.value)
 
 
-def _ramp_whose_close_hangs(app, spy, monkeypatch):
-    """Run the ramp, its close hung; the release that lets that close end."""
+def _ramp_whose_close_hangs(app, spy, monkeypatch, ramp=RAMP):
+    """Run `ramp`, its close hung; the release that lets that close end."""
     from tools.acquisition.model import app_model as app_model_module
 
     monkeypatch.setattr(app_model_module, "_LASER_CONTROLLER_CLOSE_S", 0.3)
     release = threading.Event()
     _hang_the_ramps_close(spy, release)
-    ramp = threading.Thread(target=app.run_laser_calibration_ramp, args=(RAMP,), daemon=True)
+    ramp = threading.Thread(target=app.run_laser_calibration_ramp, args=(ramp,), daemon=True)
     ramp.start()
     ramp.join(5.0)
     assert not ramp.is_alive(), "the ramp waited for its hung close"
@@ -1047,3 +1047,22 @@ def test_the_held_back_text_goes_once_the_close_has_ended(ramp_app, monkeypatch)
         time.sleep(0.02)
     assert monitor.status_message == "NI-DAQ signal stream stopped"
     assert not _stream_active(monitor)
+
+
+def test_a_hung_ramp_close_names_the_highest_level_the_ramp_commanded(
+    ramp_app, monkeypatch, caplog,
+):
+    # It named the ramp's stop as its last command: 0 V for a falling ramp,
+    # whose output, stopped part-way, may hold up to its start.
+    app, spy = ramp_app
+    falling = dataclasses.replace(RAMP, start_volts=2.0, stop_volts=0.0)
+    with caplog.at_level("CRITICAL"):
+        release = _ramp_whose_close_hangs(app, spy, monkeypatch, falling)
+    try:
+        critical, = [record.getMessage() for record in caplog.records
+                     if record.levelname == "CRITICAL"]
+        assert ("Its analog output may still hold up to 2 V, the ramp's highest "
+                "command (a 2 V to 0 V ramp)") in critical
+    finally:
+        release.set()
+    _until_the_close_ends(app)

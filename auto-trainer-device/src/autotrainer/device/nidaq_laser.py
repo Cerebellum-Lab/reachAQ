@@ -1540,8 +1540,8 @@ class NidaqLaserController:
         one), leaves the output on its last level: after a cancel or a failure
         that is the pulse's high level. Whatever else ended the run, as every
         output left driven is (controller ruling, final review). `holding`
-        names that level: the pulse's amplitude, or the ramp's last command,
-        as the application names it for a ramp whose close hung. The laser
+        names that level: the pulse's amplitude, or up to the ramp's highest
+        command, as the application names it for a ramp whose close hung. The laser
         is noted for close(), which says so if it resets it after all.
         """
         with self._operation_lock:
@@ -2397,9 +2397,14 @@ def _mean(values) -> float:
 
 
 def _ramp_holding(ramp: LaserCalibrationRamp) -> str:
-    """What a ramp's output may hold when its reset is refused: its last command."""
-    return (f"the ramp's last command, {ramp.stop_volts:g} V "
-            f"(a {ramp.start_volts:g} V to {ramp.stop_volts:g} V ramp)")
+    """What a ramp's output may hold when its reset is refused.
+
+    Up to its highest command, whichever end that is: stopped part-way, the
+    output holds a level between the two, and a falling ramp's stop, named
+    alone, said 0 V where 5 V may be left.
+    """
+    return (f"up to {max(ramp.start_volts, ramp.stop_volts):g} V, the ramp's "
+            f"highest command (a {ramp.start_volts:g} V to {ramp.stop_volts:g} V ramp)")
 
 
 def _device_of(physical_channel: str) -> str:
