@@ -15,7 +15,9 @@ Method: drive one thing at a time and watch everything readable.
     on both boards read as a static level. This needs no timing and no edge
     detection, so it names the pin for each output outright;
   * each laser command output is held at a DC level while the configured
-    analog channels are read.
+    analog channels are read. A laser's trigger readback, laserN_trigger,
+    follows the board STIM rather than the command, and is not checked
+    against it.
 
 It reports what it saw and where that contradicts the configuration. It does
 not diagnose why: a mislabelled cable, a split, and coupling between inputs
@@ -37,6 +39,7 @@ why that is opt-in.
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -397,6 +400,29 @@ def inspect_configuration(configuration):
     return tuple(issue.describe() for issue in issues), notes
 
 
+#: A laser's board-trigger readback, as the channel plan names it.
+_TRIGGER_READBACK = re.compile(r"laser\d+_trigger")
+#: What a trigger readback's check says when nothing here confirmed it.
+TRIGGER_READBACK_NOT_CHECKED = (
+    "trigger readback: not checked against the command (it follows the "
+    "board STIM)")
+
+
+def is_trigger_readback(point) -> bool:
+    """Whether `point` is a laser's board-trigger readback, laserN_trigger."""
+    return bool(_TRIGGER_READBACK.fullmatch(point.name))
+
+
+def follows_laser_command(point, number) -> bool:
+    """Whether `point` should follow laser `number`'s command.
+
+    Its inputs do, by name. Its trigger readback does not: it carries the
+    board's STIM line, and held against the command a correctly wired one
+    read as silent.
+    """
+    return point.name.startswith(f"laser{number}_") and not is_trigger_readback(point)
+
+
 def record_laser_responses(analog_points, number, levels, observed_by_point):
     """Note what moved while laser `number`'s command was held; the channels.
 
@@ -406,11 +432,10 @@ def record_laser_responses(analog_points, number, levels, observed_by_point):
     """
     responded = sorted(c for c, v in levels.items()
                        if abs(v) >= ANALOG_THRESHOLD_V)
-    prefix = f"laser{number}_"
     for point in analog_points:
         if point.physical_channel not in responded:
             continue
-        if point.name.startswith(prefix):
+        if follows_laser_command(point, number):
             observed_by_point[point.fingerprint] = (
                 CONFIRMED,
                 f"responded to laser {number} at "
@@ -433,7 +458,7 @@ def driver_exercised(point, lasers_driven, board_outputs_exercised) -> bool:
     are a running camera and a session, neither of which exists here.
     """
     for number in lasers_driven:
-        if point.name.startswith(f"laser{number}_"):
+        if follows_laser_command(point, number):
             return True
     if not board_outputs_exercised:
         return False
@@ -479,6 +504,14 @@ def judge_points(points, observed_by_point, lasers_driven,
                 status = SILENT
                 method = "confirmed through what it drove"
                 detail = "driving it moved nothing it is wired to"
+        elif is_trigger_readback(point):
+            # The command says nothing about it. A digital readback the board
+            # output sweep saw go high was confirmed above; one it did not see
+            # is not called silent on that alone, and nothing here reads an
+            # analog one while a STIM line is held.
+            status = UNTESTED
+            method = "not checked against the command"
+            detail = TRIGGER_READBACK_NOT_CHECKED
         elif exercised(point):
             status = SILENT
             detail = "its driver was exercised and it did not respond"
