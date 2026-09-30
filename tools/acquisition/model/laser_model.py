@@ -7,6 +7,7 @@ import math
 import queue
 import threading
 import time
+import uuid
 from typing import Callable, Optional, Tuple, Union
 
 from autotrainer.core import NidaqTimingPlan, ObservableObject
@@ -49,6 +50,22 @@ class LaserTraceBlock:
     timing_confidence: str = "host_timestamp"
     origin_perf_time: Optional[float] = None
     origin_wall_time: Optional[float] = None
+
+
+#: A manual Run Pulse's event id starts so; a protocol operation's is a bare
+#: UUID (NidaqLaserOperation), so the one is never taken for the other.
+MANUAL_PULSE_OPERATION_PREFIX = "manual-"
+
+
+@dataclasses.dataclass(frozen=True)
+class _ManualPulse:
+    """A manual Run Pulse as told so far (LaserModel.run_pulse_train)."""
+
+    channel_id: LaserChannelId
+    operation_id: str
+    context: dict
+    perf_time: float
+    wall_time: float
 
 
 def wait_until_cancelled_ends(operation, timeout: float = CANCELLED_OPERATION_WAIT_S) -> bool:
@@ -405,20 +422,58 @@ class LaserModel(ObservableObject):
     def read_command_copy_voltage(self, channel_id: Union[LaserChannelId, int]) -> float:
         return self._require_controller().read_command_copy_voltage(channel_id)
 
-    def run_pulse_train(self, pulse_train: LaserPulseTrain) -> None:
+    def run_pulse_train(
+        self,
+        pulse_train: LaserPulseTrain,
+        *,
+        manual_context: Optional[dict] = None,
+    ) -> None:
+        """Run a pulse train; one that waits returns once it has ended.
+
+        `manual_context` is Run Pulse's (LaserChannelTab), with what only the
+        tab knows: the profile and the trigger mode. The pulse is then told as
+        a manual laser event, which a recording session keeps
+        (SessionDataRecorder._on_laser_trace) as any laser trace: a
+        "requested" row as the controller is called, and one for how it
+        ended, "completed", "failed" or "refused", under one manual- id.
+        Every other caller passes none, and is told only the train, as before.
+        """
         controller = self._require_controller()
+        if manual_context is not None and not pulse_train.wait:
+            # It returns before it ends, so "completed" would be a guess.
+            raise ValueError("A manual pulse event needs a train that is waited for")
+        # Told before its command is recorded, so that nothing is recorded
+        # of a pulse whose telling failed.
+        manual = (
+            None if manual_context is None
+            else self._manual_pulse_requested(pulse_train, manual_context)
+        )
         before = self._record_pulse_commands((pulse_train,))
         try:
             controller.run_pulse_train(pulse_train)
-        except LaserPulseRefused:
+        except LaserPulseRefused as error:
             self._undo_refused_pulse(before)
+            if manual is not None:
+                self._manual_pulse_ended(manual, "refused", "operation_refused", error)
+            raise
+        except Exception as error:
+            if manual is not None:
+                self._manual_pulse_ended(manual, "failed", "operation_failure", error)
             raise
         if pulse_train.wait:
             # Returned: the train ended on its baseline, and its cleanup put
             # the command back. One that raised keeps its amplitude, which
             # its output may still hold.
             self._record_baseline((pulse_train.channel_id,))
-        self.trace_received(self._make_pulse_trace(pulse_train))
+        trace = self._make_pulse_trace(pulse_train)
+        if manual is not None:
+            # Stamped as it is told, its rows fell after the train had ended.
+            # The live graph places a trace by its own x values, not by these.
+            trace = dataclasses.replace(
+                trace, origin_perf_time=manual.perf_time, origin_wall_time=manual.wall_time)
+        self.trace_received(trace)
+        if manual is not None:
+            self._manual_pulse_ended(manual, "completed", "after_output_end")
 
     def run_synchronized_pulse_train(self, pulse_train: LaserSynchronizedPulseTrain):
         controller = self._require_controller()
@@ -728,6 +783,71 @@ class LaserModel(ObservableObject):
             context_json=json.dumps(context, sort_keys=True),
             timestamp_method="daqmx_operation_perf_counter",
             timing_confidence=str(timing_confidence),
+            origin_perf_time=perf_time,
+            origin_wall_time=wall_time,
+        ))
+
+    def _manual_pulse_requested(self, pulse_train, manual_context) -> _ManualPulse:
+        """Tell a manual Run Pulse as asked for, as the controller is called.
+
+        Its time is taken before the call, so the output starts at or after
+        it: the controller has still to write and start the train, and an
+        external trigger's edge starts it later still.
+        """
+        external = bool(pulse_train.trigger_source)
+        manual = _ManualPulse(
+            channel_id=pulse_train.channel_id,
+            operation_id=MANUAL_PULSE_OPERATION_PREFIX + str(uuid.uuid4()),
+            context={
+                **dict(manual_context),
+                "manual": True,
+                "laser_channel_id": int(pulse_train.channel_id),
+                "amplitude_volts": float(pulse_train.amplitude_volts),
+                # How Run Pulse started it, in LaserFiring's names: an external
+                # trigger's terminal and edge, or none for an internal start.
+                # It never pulses a board STIM line.
+                "route": {
+                    "trigger_terminal": pulse_train.trigger_source or "",
+                    "trigger_edge": pulse_train.trigger_edge if external else None,
+                    "stim_line": None,
+                },
+            },
+            perf_time=time.perf_counter(),
+            wall_time=time.time(),
+        )
+        self._emit_manual_pulse_event(
+            manual, "requested", "before_output_start", manual.context,
+            manual.perf_time, manual.wall_time)
+        return manual
+
+    def _manual_pulse_ended(self, manual, event, timing_confidence, error=None) -> None:
+        """Tell how a manual Run Pulse ended, and what its output may hold.
+
+        That is what the model keeps as the laser's last command: the minimum
+        once it completed, its amplitude once it failed, and the command
+        before it once it was refused, which drove nothing.
+        """
+        context = {
+            **manual.context,
+            "last_command_volts": self.last_command_volts.get(int(manual.channel_id)),
+        }
+        if error is not None:
+            context["error_class"] = type(error).__name__
+            context["error"] = str(error)
+        self._emit_manual_pulse_event(
+            manual, event, timing_confidence, context, time.perf_counter(), time.time())
+
+    def _emit_manual_pulse_event(
+        self, manual, event, timing_confidence, context, perf_time, wall_time,
+    ) -> None:
+        self.trace_received(LaserTraceBlock(
+            channel_id=manual.channel_id,
+            source="manual pulse",
+            event=event,
+            operation_id=manual.operation_id,
+            context_json=json.dumps(context, sort_keys=True),
+            timestamp_method="manual_pulse_call_perf_counter",
+            timing_confidence=timing_confidence,
             origin_perf_time=perf_time,
             origin_wall_time=wall_time,
         ))

@@ -1,3 +1,4 @@
+import json
 import queue
 import threading
 import time
@@ -575,3 +576,196 @@ def test_a_trial_with_pmt_margins_fires_on_a_rig_with_no_pmt_line(monkeypatch):
         assert not [task.label for task in daq.tasks if "pmt" in task.label]
     finally:
         model.close()
+
+
+# ------------------------------- a manual Run Pulse, told as a session event (D-D)
+
+# What Run Pulse's tab hands the model (LaserChannelTab._manual_pulse_context).
+MANUAL = {"profile_id": "burst", "profile_revision": 3, "trigger_mode": "internal"}
+
+
+def _told(model):
+    """Every trace and event the model tells, as a recording would take it."""
+    told = []
+    model.trace_received += told.append
+    return told
+
+
+def _manual_events(told):
+    return [trace for trace in told if trace.source == "manual pulse"]
+
+
+def test_a_manual_run_pulse_is_told_as_requested_then_completed():
+    # Ben, 2026-09-30: Run Pulse stays allowed while a session records, and
+    # is kept in it as a marked manual event. It was kept only as its
+    # waveform, unmarked, and stamped as that was told: after the train.
+    from autotrainer.device import LaserChannelId, LaserPulseTrain
+
+    model = _null_hardware_timed_model()
+    told = _told(model)
+    run_pulse_train = model._controller.run_pulse_train
+    called = []
+
+    def controller_run_pulse_train(pulse_train):
+        called.append(time.perf_counter())
+        run_pulse_train(pulse_train)
+
+    model._controller.run_pulse_train = controller_run_pulse_train
+    before = time.perf_counter()
+    model.run_pulse_train(LaserPulseTrain(
+        channel_id=LaserChannelId.LASER_1, amplitude_volts=2.5, duration_ms=1.0,
+        baseline_ms=2.0), manual_context=MANUAL)
+    returned = time.perf_counter()
+
+    assert [trace.event for trace in told] == ["requested", "trace", "completed"]
+    requested, completed = _manual_events(told)
+    waveform = told[1]
+    assert requested.operation_id.startswith("manual-")
+    assert completed.operation_id == requested.operation_id
+    # Taken as the controller is called: the output starts at or after it.
+    assert before <= requested.origin_perf_time <= called[0]
+    assert called[0] <= completed.origin_perf_time <= returned
+    assert (requested.timestamp_method, requested.timing_confidence) == (
+        "manual_pulse_call_perf_counter", "before_output_start")
+    assert (completed.timestamp_method, completed.timing_confidence) == (
+        "manual_pulse_call_perf_counter", "after_output_end")
+    # The waveform starts where the pulse was asked for, not after it ended.
+    assert waveform.source == "internal pulse"
+    assert (waveform.origin_perf_time, waveform.origin_wall_time) == (
+        requested.origin_perf_time, requested.origin_wall_time)
+    assert waveform.operation_id == ""
+    context = json.loads(requested.context_json)
+    assert context == {
+        "manual": True,
+        "laser_channel_id": 1,
+        "profile_id": "burst",
+        "profile_revision": 3,
+        "amplitude_volts": 2.5,
+        "trigger_mode": "internal",
+        "route": {"trigger_terminal": "", "trigger_edge": None, "stim_line": None},
+    }
+    # Returned: its output is back at the minimum.
+    assert json.loads(completed.context_json) == {**context, "last_command_volts": 0.0}
+
+
+def test_a_manual_pulse_that_fails_is_told_as_failed_with_its_error_class():
+    # It may still hold its amplitude: the failed row says what the model
+    # keeps as what the output may hold.
+    from autotrainer.device import LaserChannelId, LaserPulseTrain
+
+    model = _null_hardware_timed_model()
+    told = _told(model)
+
+    def fails(_pulse_train):
+        raise RuntimeError("DAQmx refused to start laser_sync_pulse_ao")
+
+    model._controller.run_pulse_train = fails
+    with pytest.raises(RuntimeError, match="refused to start"):
+        model.run_pulse_train(LaserPulseTrain(
+            channel_id=LaserChannelId.LASER_1, amplitude_volts=2.5, duration_ms=1.0,
+            trigger_source="/Dev1/PFI0", trigger_edge="falling"),
+            manual_context={**MANUAL, "trigger_mode": "external"})
+
+    # No waveform: it did not run.
+    assert [trace.event for trace in told] == ["requested", "failed"]
+    requested, failed = told
+    assert failed.operation_id == requested.operation_id
+    assert failed.timing_confidence == "operation_failure"
+    context = json.loads(failed.context_json)
+    assert context["route"] == {
+        "trigger_terminal": "/Dev1/PFI0", "trigger_edge": "falling", "stim_line": None}
+    assert context["trigger_mode"] == "external"
+    assert context["error_class"] == "RuntimeError"
+    assert context["error"] == "DAQmx refused to start laser_sync_pulse_ao"
+    assert context["last_command_volts"] == 2.5
+    assert model.last_command_volts == {1: 2.5}
+
+
+def test_a_refused_manual_pulse_is_told_as_refused_and_leaves_the_baseline_logic(
+    monkeypatch,
+):
+    # A refused pulse drove nothing, and must never read as one that fired.
+    # Its refusal still takes back its record and count
+    # (_undo_refused_pulse), so the armed pulse's completion finds its mark.
+    from autotrainer.device import (
+        LaserChannelId, LaserOperationState, LaserPulseTrain, LaserSynchronizedPulseTrain)
+    from autotrainer.device.laser import LaserPulseRefused
+
+    model, _daq = _nidaq_model(monkeypatch)
+    armed = model.run_synchronized_pulse_train(LaserSynchronizedPulseTrain(
+        pulse_trains=(LaserPulseTrain(
+            channel_id=LaserChannelId.LASER_1, amplitude_volts=2.5, duration_ms=1.0),),
+        wait=False, defer_start=True, timeout_seconds=30.0))
+    told = _told(model)
+    try:
+        with pytest.raises(LaserPulseRefused, match="refused while"):
+            model.run_pulse_train(LaserPulseTrain(
+                channel_id=LaserChannelId.LASER_1, amplitude_volts=1.0, duration_ms=1.0),
+                manual_context=MANUAL)
+
+        assert [trace.event for trace in told] == ["requested", "refused"]
+        requested, refused = told
+        assert refused.operation_id == requested.operation_id
+        assert refused.timing_confidence == "operation_refused"
+        context = json.loads(refused.context_json)
+        assert context["error_class"] == "LaserPulseRefused"
+        assert context["amplitude_volts"] == 1.0
+        # The armed pulse's 2.5 V is still what the output may hold.
+        assert context["last_command_volts"] == 2.5
+        assert model.last_command_volts == {1: 2.5}
+
+        armed.trigger()
+        assert armed.wait(5.0) is LaserOperationState.COMPLETED
+        deadline = time.monotonic() + 2.0
+        while model.last_command_volts != {1: 0.0} and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert model.last_command_volts == {1: 0.0}
+    finally:
+        armed.cancel()
+        armed.wait_until_finished(5.0)
+        model.close()
+
+
+def test_every_other_run_pulse_train_caller_is_told_only_the_train():
+    # The protocol path, the hardware tool and the tests pass no manual
+    # context: one unmarked trace, stamped as it is told, as before.
+    from autotrainer.device import LaserChannelId, LaserPulseTrain
+    from autotrainer.device.laser import LaserPulseRefused
+
+    model = _null_hardware_timed_model()
+    told = _told(model)
+    model.run_pulse_train(LaserPulseTrain(
+        channel_id=LaserChannelId.LASER_1, amplitude_volts=2.5, duration_ms=1.0))
+
+    trace, = told
+    assert (trace.event, trace.source, trace.operation_id, trace.context_json) == (
+        "trace", "internal pulse", "", "{}")
+    assert (trace.timestamp_method, trace.timing_confidence) == (
+        "laser_event_perf_counter", "host_timestamp")
+    assert (trace.origin_perf_time, trace.origin_wall_time) == (None, None)
+
+    def refused(_pulse_train):
+        raise LaserPulseRefused("refused while another pulse holds the board")
+
+    model._controller.run_pulse_train = refused
+    with pytest.raises(LaserPulseRefused):
+        model.run_pulse_train(LaserPulseTrain(
+            channel_id=LaserChannelId.LASER_1, amplitude_volts=2.5, duration_ms=1.0))
+    assert len(told) == 1
+
+
+def test_a_manual_pulse_event_needs_a_train_that_is_waited_for():
+    # A train that is not waited for returns before it ends, so "completed"
+    # would be a guess. Refused before anything is recorded or driven.
+    from autotrainer.device import LaserChannelId, LaserPulseTrain
+
+    model = _null_hardware_timed_model()
+    told = _told(model)
+
+    with pytest.raises(ValueError, match="waited for"):
+        model.run_pulse_train(LaserPulseTrain(
+            channel_id=LaserChannelId.LASER_1, amplitude_volts=2.5, duration_ms=1.0,
+            wait=False), manual_context=MANUAL)
+
+    assert told == []
+    assert model.last_command_volts == {1: 0.0}

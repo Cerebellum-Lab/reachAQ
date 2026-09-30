@@ -899,6 +899,12 @@ class _LaserChannelTab(QWidget):
     def append_trace(self, trace: LaserTraceBlock, *, redraw: bool = True) -> None:
         if int(trace.channel_id) != self.channel_id_value:
             return
+        if trace.event != "trace":
+            # An event row, a protocol operation's or a manual Run Pulse's
+            # request and outcome, has nothing to draw. Taken as an empty
+            # trace, it set the note to "calibration running", and every Run
+            # Pulse ended reading so.
+            return
         is_calibration = trace.source == "calibration"
         if is_calibration:
             self._set_trace_streaming(True)
@@ -992,9 +998,11 @@ class _LaserChannelTab(QWidget):
         except Exception as exc:
             self._set_parent_status(str(exc) or exc.__class__.__name__, True)
             return
+        manual_context = self._manual_pulse_context()
 
         def operation():
-            self._app_model.laser.run_pulse_train(pulse_train)
+            self._app_model.laser.run_pulse_train(
+                pulse_train, manual_context=manual_context)
             return f"Pulse complete: laser {self._channel.channel_id.value}"
 
         self._start_operation(f"Running laser {self._channel.channel_id.value} pulse train", operation)
@@ -1226,6 +1234,25 @@ class _LaserChannelTab(QWidget):
             emit_trigger_output=self._emit_trigger.isChecked(),
             emit_timing_trigger_output=self._emit_timing_trigger.isChecked(),
         )
+
+    def _manual_pulse_context(self) -> dict:
+        """What a recording session keeps of this Run Pulse beyond its train.
+
+        The profile, by its saved id and revision or as the builder draft,
+        and the trigger mode; the model takes the laser, the amplitude and
+        the route from the train (LaserModel.run_pulse_train). Called once
+        _build_pulse_train has found the profile.
+        """
+        profile_id = self.stim_profile_selector.currentData()
+        if profile_id == DRAFT_PROFILE_ID:
+            profile_id, revision = "builder draft", None
+        else:
+            revision = self._selected_profile().revision
+        return {
+            "profile_id": profile_id,
+            "profile_revision": revision,
+            "trigger_mode": self._trigger_mode.currentText(),
+        }
 
     def _on_trigger_mode_changed(self) -> None:
         self._refresh_trigger_mode_enabled()
