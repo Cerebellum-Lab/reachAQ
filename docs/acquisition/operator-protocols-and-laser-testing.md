@@ -212,7 +212,8 @@ The Pulse page has **Profile:** at the top, then the sections **Run Pulse**,
 to fold it away or open it again. With every section open, the page fits the
 docked right-hand panel without scrolling. Folding a section gives its height
 to the output graph. A section folded on one laser is folded on every laser,
-and stays folded when the tabs are rebuilt.
+and stays folded when the tabs are rebuilt and the next time reachAQ starts;
+so do the Pulse Builder's sections.
 
 The line at the foot of Laser Control is the panel's own status line. It
 shows, in red, each refusal and failure the panel reports. They go to the
@@ -229,6 +230,7 @@ output**, **Diode feedback**, **Command copy** and **Board trigger readback**
 each show or hide their trace at once, at any time. An input's box is enabled
 once the input is configured; until then it is greyed out and its tooltip says
 what to set. Every configured input is recorded whether or not it is shown.
+Whether each laser's Command output is shown is kept for the next start too.
 
 The **Board trigger** section plots the board's STIM line read back on an NI
 input, on its own axis under the output graph, so the edge that starts a
