@@ -663,7 +663,7 @@ def test_a_forced_ramp_close_that_raises_is_named_and_the_ramp_still_resets(
     ramp_thread, ramp_outcome = _in_thread(
         app_model.run_laser_calibration_ramp, _ramp(timeout_seconds=0.5))
     deadline = time.monotonic() + 10.0
-    while not any(task.name.endswith("calibration_ao") and task.started
+    while not any(task.label.endswith("calibration_ao") and task.started
                   for task in daq.tasks):
         assert time.monotonic() < deadline, "the ramp did not start"
         time.sleep(0.01)
@@ -1630,7 +1630,7 @@ def test_a_normal_laser_close_is_unchanged(app_model, monkeypatch, caplog):
 
 def _wait_for_the_pulse(daq, timeout=10.0):
     deadline = time.monotonic() + timeout
-    while not any(task.name == "laser_sync_pulse_ao" and task.started
+    while not any(task.label == "laser_sync_pulse_ao" and task.started
                   for task in daq.tasks):
         assert time.monotonic() < deadline, "the pulse did not start"
         time.sleep(0.01)

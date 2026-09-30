@@ -161,9 +161,9 @@ def test_a_cross_board_output_runs_on_the_ao_clock_over_the_pulse_clock_line(
     # route released after.
     log = daq.log
     assert (log.index(("connect", PULSE_CLOCK_ROUTE))
-            < log.index(("commit", analog.name))
-            < log.index(("start", digital.name))
-            < log.index(("start", analog.name))
+            < log.index(("commit", analog.label))
+            < log.index(("start", digital.label))
+            < log.index(("start", analog.label))
             < log.index(("disconnect", PULSE_CLOCK_ROUTE)))
     shared = [SHARED_CLOCK_ROUTE] if mode == "synchronized" else []
     assert daq.connected == [TRIGGER_ROUTE, *shared, PULSE_CLOCK_ROUTE]
@@ -270,7 +270,7 @@ def test_a_deferred_pulse_is_committed_before_it_is_armed(daq):
 
     def at_commit(task):
         operation, = controller._live_operations.values()
-        states.append((task.name, operation.state))
+        states.append((task.label, operation.state))
 
     daq.before_control = at_commit
     operation = controller.run_synchronized_pulse_train(_pulse(
@@ -594,7 +594,7 @@ def test_a_pulse_with_no_digital_outputs_makes_the_same_calls(daq, plan):
 
     controller.run_synchronized_pulse_train(_pulse())
 
-    calls = [(task.name, tuple(task.channels), task.timing_kwargs, task.start_trigger)
+    calls = [(task.label, tuple(task.channels), task.timing_kwargs, task.start_trigger)
              for task in daq.tasks[created:]]
     synchronized = plan is not None
     samples = 10 if synchronized else 100
