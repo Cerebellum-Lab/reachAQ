@@ -123,6 +123,43 @@ class UserPreferences(ObservableObject):
     def set_splitter_state(self, name: str, state: QByteArray) -> None:
         self._settings.setValue(f"ui/splitters/{name}", state)
 
+    def laser_section_expanded(self, name: str) -> Optional[bool]:
+        """Whether Laser Control's section `name` was left open; None if not saved."""
+        return self._saved_flag(f"ui/laser_control/sections/{name}")
+
+    def set_laser_section_expanded(self, name: str, expanded: bool) -> None:
+        self._settings.setValue(f"ui/laser_control/sections/{name}", bool(expanded))
+
+    def laser_command_output_shown(self, channel_id: int) -> Optional[bool]:
+        """Whether a laser's Command output trace was left shown; None if not saved."""
+        return self._saved_flag(f"ui/laser_control/command_output/laser{int(channel_id)}")
+
+    def set_laser_command_output_shown(self, channel_id: int, shown: bool) -> None:
+        self._settings.setValue(
+            f"ui/laser_control/command_output/laser{int(channel_id)}", bool(shown))
+
+    def _saved_flag(self, key: str) -> Optional[bool]:
+        """A saved true or false, or None: nothing saved, or anything else.
+
+        Read untyped and judged here: a typed read would turn whatever a
+        damaged or hand-edited file holds into a bool by rules of its own.
+        Never raises, so a bad file cannot stop a panel opening; it opens as
+        it would with nothing saved.
+        """
+        try:
+            value = self._settings.value(key)
+        except Exception as exc:
+            logger.warning("Could not read %s from the preferences: %s", key, exc)
+            return None
+        if isinstance(value, bool):
+            return value
+        text = value.strip().lower() if isinstance(value, str) else None
+        if text in ("true", "false"):
+            return text == "true"
+        if value is not None:
+            logger.warning("Ignoring %s = %r in the preferences: not true or false", key, value)
+        return None
+
     @property
     def window_normal_geometry(self) -> QRect:
         return QRect(self._window_normal_geometry)

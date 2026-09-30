@@ -164,6 +164,9 @@ class _LaserChannelTab(QWidget):
     saved profile or the builder draft and fires it on its own laser.
     """
 
+    #: The operator ticked or unticked Command output.
+    command_trace_visible_changed = Signal(bool)
+
     def __init__(
         self,
         app_model: AppModel,
@@ -223,7 +226,7 @@ class _LaserChannelTab(QWidget):
         layout.addWidget(channel_label)
 
         #: Every folding section on this tab, by name; LaserControlContent
-        #: keeps their open/closed state across the tab rebuilds.
+        #: keeps their open/closed state across the tab rebuilds and restarts.
         self.sections = {}
 
         self._mode_tabs = QTabWidget(self)
@@ -561,8 +564,8 @@ class _LaserChannelTab(QWidget):
         # Optional like the rest. It was ticked and greyed out, "always
         # shown", and Ben asked on 2026-09-24 for the laser command traces to
         # be uncheckable. Not an NI-DAQ input, so its choice is kept by
-        # LaserControlContent across tab rebuilds rather than in
-        # nidaqStream.displayChannels.
+        # LaserControlContent, across tab rebuilds and in the user's
+        # preferences, rather than in nidaqStream.displayChannels.
         self._trace_command_checkbox = QCheckBox("Command output")
         color_code_checkbox(self._trace_command_checkbox, _COMMAND_TRACE_COLOR)
         self._trace_command_checkbox.setChecked(True)
@@ -637,6 +640,7 @@ class _LaserChannelTab(QWidget):
         self._trace_max_volts.valueChanged.connect(self._apply_trace_view)
         self._apply_trace_view()
         self._trace_command_checkbox.toggled.connect(self._apply_curve_visibility)
+        self._trace_command_checkbox.toggled.connect(self.command_trace_visible_changed)
         for key, checkbox in self._trace_signal_checkboxes.items():
             checkbox.toggled.connect(
                 lambda checked, signal_key=key: self._trace_signal_selection_changed(
@@ -1265,9 +1269,16 @@ class LaserControlContent(ContentWidget):
         self._plot_configuration_signatures = {}
         self._plot_x_destinations = {}
         self._plot_y_destinations = {}
-        #: Open or closed, by section name, for every laser tab. The tabs are
-        #: rebuilt on every Run/Stop, and would otherwise open everything again.
+        #: Open or closed, by section name, for every laser tab and the Pulse
+        #: Builder. The tabs are rebuilt on every Run/Stop, and would
+        #: otherwise open everything again.
         self._section_expanded: Dict[str, bool] = {}
+        #: Where the folds and each laser's Command output are saved for the
+        #: next start: the user's preferences, beside the main splitter. With
+        #: none, as in some test stubs, they last until the panel closes; the
+        #: panel never makes a QSettings of its own, which would be the
+        #: user's real file.
+        self._preferences = getattr(app_model, "preferences", None)
 
         self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         self.setObjectName("LaserControlContent")
@@ -1353,6 +1364,7 @@ class LaserControlContent(ContentWidget):
         self._builder = PulseBuilderTab(app_model, self._set_status_from_tab)
         self._builder.profiles_changed.connect(self._refresh_channel_profiles)
         self._builder.draft_changed.connect(self._refresh_channel_drafts)
+        self._adopt_sections(self._builder)
         # Once the builder exists: the handler updates every control.
         app_model.property_changed += self._on_app_model_property_changed
         self._refresh_from_model()
@@ -1552,8 +1564,9 @@ class LaserControlContent(ContentWidget):
             tab.channel_id_value: tab.stim_profile_selector.currentData()
             for tab in self._channel_tabs
         }
-        # Likewise whether each laser's command trace is shown; the inputs'
-        # choices survive in nidaqStream.displayChannels.
+        # Likewise whether each laser's command trace is shown, and at the
+        # first build what the preferences saved; the inputs' choices
+        # survive in nidaqStream.displayChannels.
         command_shown = {
             tab.channel_id_value: tab.command_trace_visible
             for tab in self._channel_tabs
@@ -1582,7 +1595,14 @@ class LaserControlContent(ContentWidget):
                 self,
                 draft_provider=self._builder.draft_profile,
             )
-            tab.set_command_trace_visible(command_shown.get(channel_index, True))
+            shown = command_shown.get(channel_index)
+            if shown is None:
+                shown = self._saved_command_output_shown(channel_index)
+            tab.set_command_trace_visible(shown)
+            # Connected once it is set, so the loading saves nothing.
+            tab.command_trace_visible_changed.connect(
+                lambda visible, laser=channel_index: self._save_command_output_shown(
+                    laser, visible))
             self._adopt_sections(tab)
             self._tabs.addTab(tab, f"Laser {channel_index}")
             tabs.append(tab)
@@ -1625,16 +1645,32 @@ class LaserControlContent(ContentWidget):
             return f"Ready: {configured_count}/{_LASER_PULSE_TRAIN_COUNT} laser channel(s) mapped"
         return f"Pulse train editor ready; 0/{_LASER_PULSE_TRAIN_COUNT} hardware channel(s) mapped"
 
-    def _adopt_sections(self, tab: _LaserChannelTab) -> None:
-        """Open or close a new tab's sections as the operator left them."""
+    def _adopt_sections(self, tab) -> None:
+        """Open or close a new tab's sections as the operator left them.
+
+        A laser tab's or the Pulse Builder's. The first time a section is
+        seen its saved state is read, so a start opens the panel as the last
+        one was left; with nothing saved, or anything but true or false, it
+        keeps its own default.
+        """
         for name, section in tab.sections.items():
-            if name in self._section_expanded:
-                section.set_expanded(self._section_expanded[name])
+            if name not in self._section_expanded:
+                saved = (
+                    None if self._preferences is None
+                    else self._preferences.laser_section_expanded(name))
+                self._section_expanded[name] = (
+                    section.is_expanded if saved is None else saved)
+            section.set_expanded(self._section_expanded[name])
+            # Connected once it is set, so the loading saves nothing.
             section.expanded_changed.connect(
                 lambda expanded, section_name=name: self._on_section_expanded(
                     section_name, expanded))
 
     def _on_section_expanded(self, name: str, expanded: bool) -> None:
+        # Saved once, by the section the operator clicked; the others follow
+        # it below and find it already recorded.
+        if self._section_expanded.get(name) != expanded and self._preferences is not None:
+            self._preferences.set_laser_section_expanded(name, expanded)
         # One layout for every laser, so switching lasers does not move the
         # graphs: opening a section on one tab opens it on all of them.
         self._section_expanded[name] = expanded
@@ -1642,6 +1678,17 @@ class LaserControlContent(ContentWidget):
             section = tab.sections.get(name)
             if section is not None and section.is_expanded != expanded:
                 section.set_expanded(expanded)
+
+    def _saved_command_output_shown(self, channel_id: int) -> bool:
+        """A laser's saved Command output choice; shown when none is saved."""
+        saved = (
+            None if self._preferences is None
+            else self._preferences.laser_command_output_shown(channel_id))
+        return True if saved is None else saved
+
+    def _save_command_output_shown(self, channel_id: int, shown: bool) -> None:
+        if self._preferences is not None:
+            self._preferences.set_laser_command_output_shown(channel_id, shown)
 
     @staticmethod
     def _make_placeholder_channel(channel_index: int) -> LaserChannelConfiguration:

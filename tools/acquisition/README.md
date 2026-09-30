@@ -258,8 +258,12 @@ The Pulse tab has the **Profile:** picker at the top. Below it are the folding
 sections **Run Pulse**, **Test stim**, **Output stream** and **Board
 trigger**; click a section's title to fold or open it. A folded section gives
 its height to the output graph. The open/closed state is shared by every laser
-tab and survives the tab rebuilds at each Run/Stop; it is not saved when
-reachAQ closes. Output stream contains the graph, its legend, a status line
+tab and survives the tab rebuilds at each Run/Stop. It is saved in the user
+preferences file as it changes, as the split positions are, under `[ui]` as
+`laser_control\sections\<section>`, so the next launch opens every section,
+the Pulse Builder's two included, as it was left. A missing or damaged value
+(anything but `true` or `false`) leaves that section as it starts by default.
+Output stream contains the graph, its legend, a status line
 naming the shared input stream's state with Clear beside it, the time window
 and voltage limits, and a **Signals** section, folded by default. Signals holds
 that laser's command-output, diode-feedback, command-copy and
@@ -275,8 +279,10 @@ unticked at any time, including while the stream runs, and shows or hides its
 curve at once. The input selections persist immediately in
 `nidaqStream.displayChannels`, while remaining absent from the main Analysis
 selector and plot, which leaves out every laser's diode, command-copy and
-trigger-readback input; whether the command output is shown is remembered until
-reachAQ closes. An input that is not in the acquisition plan is disabled and
+trigger-readback input; whether each laser's command output is shown is saved
+in the user preferences file, as `laser_control\command_output\laserN` under
+`[ui]`, and a missing or damaged value shows it. An input that is not in the
+acquisition plan is disabled and
 its tooltip says so. All three inputs are set per laser in **Edit DAQ Ports**:
 diode, laser_copy, and trigger readback input, the last being the board STIM
 line wired into an analog input (`aiN`) or a port0 line (`port0/lineN`) of
