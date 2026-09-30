@@ -396,7 +396,8 @@ def test_an_error_on_the_footer_is_cut_to_its_line_and_moves_nothing(panel, qapp
     assert footer.text().startswith("Laser operation failed: The specified route")
     assert "#b00020" in footer.styleSheet()
     assert footer.is_elided()
-    assert footer.full_tooltip() == footer.text()
+    # Hovering shows the line, then the whole error with its task and code.
+    assert footer.full_tooltip() == f"{footer.text()}\n{_DAQMX_FAILURE}"
     assert footer.height() == footer_height
     assert tab._trace_plot.height() == trace_height
     assert scroll.verticalScrollBar().maximum() == 0

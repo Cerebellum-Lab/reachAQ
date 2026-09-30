@@ -1749,9 +1749,12 @@ class LaserControlContent(ContentWidget):
     @Slot(str)
     def _operation_failed(self, message: str) -> None:
         # It said "Laser operation stopped", and nothing of why. Shown, not
-        # logged: the worker logged it, with its traceback.
+        # logged: the worker logged it, with its traceback. The line is the
+        # error's first line; a DAQmx error's task and status code follow it,
+        # so the whole error is on hover.
         self._show_status(
-            f"Laser operation failed: {_failure_line(message, 160)}", is_error=True)
+            f"Laser operation failed: {_failure_line(message, 160)}", is_error=True,
+            detail=message.strip())
 
     @Slot()
     def _operation_thread_finished(self) -> None:
@@ -1766,16 +1769,18 @@ class LaserControlContent(ContentWidget):
             logger.error("Laser control operation rejected: %s", message)
         self._show_status(message, is_error=is_error)
 
-    def _show_status(self, message: str, *, is_error: bool) -> None:
+    def _show_status(self, message: str, *, is_error: bool, detail: str = "") -> None:
         """Put a status or an error on the footer, in place of what it said.
 
         Errors went to the log and the main window's status bar only, which
         is in the other window when this panel is detached (Ben,
         2026-09-30). An error stays until the panel's next status or error
         replaces it, as every status here does: no timeout, so one seen late
-        in a detached panel is still there. Elided to its line, whole on hover.
+        in a detached panel is still there. Elided to its line, whole on
+        hover, followed there by `detail`, which the next status clears.
         """
         self._status_label.setText(message)
+        self._status_label.setToolTip(detail)
         self._status_label.setStyleSheet(_ERROR_STATUS_STYLE if is_error else "")
 
     def _set_running(self, is_running: bool) -> None:
