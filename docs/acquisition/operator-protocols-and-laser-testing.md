@@ -282,12 +282,14 @@ running closes the shutters first, then cancels the train. A cancel, this
 one or a trial's, first closes the shutter of each of the pulse's lasers,
 even for a pulse set to leave its shutter open, and whoever opened it: a
 cancelled pulse leaves the laser safe, and a shutter open before it is closed
-too. A pulse cancelled before it has opened its shutter does not open it. The
-cancel then aborts the train's tasks, which ends the train at once, and puts
+too. A pulse cancelled before it opens its shutter does not open it, and one
+cancelled as it opens it closes it again at once. The cancel then aborts the
+train's output, then its digital lines, which ends the train at once, and puts
 the command back to its minimum straight after. On christielab10's 6221 an
 abort ended a waiting task in about 40 ms, where a stop from another thread
 waited for the whole task (H5b, H5a); on the 6713 the output was back at 0 V
-14.3 ms after the cancel (H8a). A pulse armed and waiting for its trigger ends the
+about 15 ms after the cancel (H8a, measured before the shutter-first order). A
+pulse armed and waiting for its trigger ends the
 same way. The controller waits up to five seconds for a train that does not
 end, as with a sick driver, before it goes on without it. The status line
 then reads *"Laser operation failed: Laser operation ... was cancelled: the

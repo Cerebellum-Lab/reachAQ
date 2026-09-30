@@ -289,7 +289,7 @@ def test_a_failed_input_task_leaves_the_ramps_output_task_closed(daq, monkeypatc
     # an input task that failed to create left the output task open.
     controller = NidaqLaserController(_rig_lasers())
 
-    def refuse(_channel):
+    def refuse(_channel, _name):
         raise RuntimeError("DAQmx -200170: the physical channel does not exist")
 
     monkeypatch.setattr(controller, "_create_calibration_input_task", refuse)
@@ -476,6 +476,35 @@ def test_a_task_the_ramp_has_let_go_of_is_not_aborted(daq, caplog):
     assert daq.controlled == []
     assert _abort_log(caplog) == []
 
+
+
+def test_a_ramp_task_started_before_a_close_is_logged_as_running(daq, caplog):
+    # The ramp starts its input, then its output. A close landing between
+    # the starts found the ramp not yet marked started, and logged the
+    # running input's abort as "not started". Each task is marked as it
+    # starts now. The output's start waits here until the input is aborted.
+    controller = NidaqLaserController(_rig_lasers())
+    closer = []
+
+    def close_as_the_output_starts(task):
+        if not task.label.endswith("calibration_ao") or closer:
+            return
+        closer.append(threading.Thread(target=controller.close, daemon=True))
+        closer[0].start()
+        _wait_for(lambda: ("laser_1_calibration_ai", "abort") in daq.controlled)
+
+    daq.before_start = close_as_the_output_starts
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(RuntimeError, match="closed"):
+            controller.run_calibration_ramp(RAMP)
+        closer[0].join(5.0)
+
+    assert not closer[0].is_alive()
+    messages = [record.getMessage() for record in caplog.records]
+    assert ("laser 1's calibration ramp: aborting its running task "
+            "laser_1_calibration_ai (DAQmx may warn 200010)") in messages
+    assert ("laser 1's calibration ramp: aborting its task "
+            "laser_1_calibration_ao, not started") in messages
 
 def test_an_abort_that_fails_on_a_task_the_ramp_still_holds_is_reported(monkeypatch, caplog):
     # The ramp stays in its wait, holding both tasks, whatever is aborted.
