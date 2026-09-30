@@ -137,6 +137,23 @@ def test_no_profile_is_refused(bench):
     assert hardware.pulses == []
 
 
+def test_a_recording_session_refuses_the_test_before_anything_is_armed(bench):
+    # Run Pulse is allowed while a session records, and kept in it as a
+    # manual event; Test stim stays refused (Ben, 2026-09-30).
+    from tools.acquisition.model.app_model_status import SessionRecordingStatus
+
+    model, laser, hardware, _operation = bench
+    # Set directly: publishing the change reads recording blockers off
+    # hardware this fixture replaces with fakes.
+    model._recording_session.status = SessionRecordingStatus.RECORDING
+
+    with pytest.raises(RuntimeError, match="refused while a session is recording"):
+        model.run_stim_bench_test(model._laser_profiles["stim-a"], 1, "hardware_stim3")
+
+    assert laser.prepared == []
+    assert hardware.pulses == []
+
+
 def test_a_board_failure_cancels_the_armed_output(bench):
     model, laser, hardware, operation = bench
 
