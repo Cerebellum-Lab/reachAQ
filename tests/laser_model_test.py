@@ -464,3 +464,34 @@ def test_a_pulse_outside_the_lasers_range_leaves_the_last_command(monkeypatch, p
         assert model.last_command_volts == {1: 0.0}
     finally:
         model.close()
+
+
+def test_an_armed_pulse_records_its_baseline_after_a_refused_pulse_on_its_laser(monkeypatch):
+    # The refusal takes back its record and its count. Taken back without
+    # the count, the armed pulse's completion found a newer command than its
+    # own, and left its 2.5 V as what the output may hold.
+    from autotrainer.device import (
+        LaserChannelId, LaserOperationState, LaserPulseTrain, LaserSynchronizedPulseTrain)
+    from autotrainer.device.laser import LaserPulseRefused
+
+    model, _daq = _nidaq_model(monkeypatch)
+    armed = model.run_synchronized_pulse_train(LaserSynchronizedPulseTrain(
+        pulse_trains=(LaserPulseTrain(
+            channel_id=LaserChannelId.LASER_1, amplitude_volts=2.5, duration_ms=1.0),),
+        wait=False, defer_start=True, timeout_seconds=30.0))
+    try:
+        with pytest.raises(LaserPulseRefused, match="refused while"):
+            model.run_pulse_train(LaserPulseTrain(
+                channel_id=LaserChannelId.LASER_1, amplitude_volts=1.0, duration_ms=1.0))
+        assert model.last_command_volts == {1: 2.5}
+
+        armed.trigger()
+        assert armed.wait(5.0) is LaserOperationState.COMPLETED
+        deadline = time.monotonic() + 2.0
+        while model.last_command_volts != {1: 0.0} and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert model.last_command_volts == {1: 0.0}
+    finally:
+        armed.cancel()
+        armed.wait_until_finished(5.0)
+        model.close()

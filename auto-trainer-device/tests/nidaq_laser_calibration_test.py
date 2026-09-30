@@ -778,3 +778,33 @@ def test_a_close_that_resets_a_laser_a_ramp_left_driven_says_so(daq, caplog):
                  if record.levelno == logging.WARNING and "after all" in record.getMessage()]
     assert len(warnings_) == 1
     assert "Laser 1" in warnings_[0] and "PXI1Slot4/ao0" in warnings_[0]
+
+
+def test_a_closed_ramps_refused_reset_is_critical(daq, caplog):
+    # close() mid-ramp: the ramp's closed branch writes the command back
+    # itself, as close() waits for it. That write refused was covered by no
+    # test, where the normal branch's was.
+    daq.block_wait = True
+    controller = NidaqLaserController(_rig_lasers())
+    thread, outcome = _ramp_in_thread(controller)
+    _wait_until_ramping(daq)
+    daq.failing_write = "laser_1_manual_ao"
+    try:
+        with caplog.at_level(logging.ERROR):
+            # close()'s own reset is refused as well.
+            with pytest.raises(RuntimeError, match="channel 1 reset"):
+                controller.close()
+            thread.join(5.0)
+    finally:
+        daq.failing_write = None
+
+    assert not thread.is_alive()
+    error, = outcome
+    assert "was closed while it ran" in str(error)
+    critical = [record.getMessage() for record in caplog.records
+                if record.levelno == logging.CRITICAL]
+    assert len(critical) == 1
+    assert "after a closed calibration ramp" in critical[0]
+    assert "Laser 1" in critical[0] and "PXI1Slot4/ao0" in critical[0]
+    assert "the ramp's last command, 5 V (a 0 V to 5 V ramp)" in critical[0]
+    assert "make the laser safe by hand" in critical[0]
