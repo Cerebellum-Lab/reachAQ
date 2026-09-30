@@ -38,6 +38,10 @@ logger = logging.getLogger(__name__)
 _CALIBRATION_RELEASE_TIMEOUT_S = 5.0
 #: How long close() waits for each pulse train it cancels to end.
 _OPERATION_CANCEL_TIMEOUT_S = 5.0
+#: How long a path that cancels a pulse and goes on waits for it to end,
+#: so that what it does next finds the board free. The abort ends it in
+#: milliseconds (H5b: about 40 ms); this bounds a sick driver.
+_CANCEL_SETTLE_S = 2.0
 #: How long a controller that failed to open waits for its own close, of
 #: what it had opened, before it raises; as long as the application waits
 #: for any laser close.
@@ -80,8 +84,16 @@ class NidaqLaserOperation:
         LaserOperationState.CANCELLED,
     }
 
-    def __init__(self, *, resources, context=None, terminal_callback=None):
+    def __init__(self, *, resources, context=None, terminal_callback=None,
+                 abort_task=None):
         self.operation_id = str(uuid.uuid4())
+        #: How cancel() ends a bound task that is running or armed: TASK_ABORT,
+        #: given by the controller. A stop() from another thread waits behind
+        #: the operation's own wait on the task, until the task ends or the
+        #: wait times out (christielab10, H5a, 2026-09-29); an abort wakes the
+        #: wait with -88709 in about 36 ms (H5b), and before a start it is
+        #: harmless (H5c).
+        self._abort_task = abort_task
         self.resources = tuple(sorted(set(resources)))
         self.context = dict(context or {})
         self._terminal_callbacks = (
@@ -139,11 +151,15 @@ class NidaqLaserOperation:
             self._transition_locked(LaserOperationState.CANCELLED, "cancel requested")
             tasks = self._tasks
             self._start_requested.set()
+        # Aborted, not stopped: the operation's own thread is in the task's
+        # wait, which the abort ends at once. That thread, finding the
+        # operation cancelled, ends it CANCELLED, not FAILED, and cleans up.
         for task in tasks:
             try:
-                task.stop()
+                if self._abort_task is not None:
+                    self._abort_task(task)
             except Exception:
-                logger.debug("Laser task stop during cancellation failed", exc_info=True)
+                logger.debug("Laser task abort during cancellation failed", exc_info=True)
         return True
 
     def trigger(self):
@@ -511,6 +527,7 @@ class NidaqLaserController:
                 resources=resources,
                 context=pulse_train.operation_context,
                 terminal_callback=self._release_operation,
+                abort_task=self._abort_task,
             )
             self._live_operations[operation.operation_id] = operation
 
@@ -562,18 +579,29 @@ class NidaqLaserController:
         )
         try:
             operation._thread.start()
-        except BaseException as error:
-            # Nothing of it ran, so nothing to clean up; left PREPARED among
-            # the live operations it held the whole board.
-            operation._fail(RuntimeError(
-                f"the pulse train's thread did not start ({error})"))
+        except Exception as error:
+            # A thread that never started ran nothing, so there is nothing to
+            # clean up; left PREPARED among the live operations it held the
+            # whole board. One that did start (an error once it runs) is its
+            # own thread's to end. A KeyboardInterrupt is not caught: it can
+            # land while start() waits for a thread already running, whose
+            # pulse is then still tracked, and ends by itself.
+            if operation._thread.ident is None:
+                operation._fail(RuntimeError(
+                    f"the pulse train's thread did not start ({error})"))
             raise
         try:
             operation.wait_until_armed(timeout=5.0)
         except Exception:
             operation.cancel()
+            # Ended before this returns, so a retry finds the board free.
+            operation._done.wait(_CANCEL_SETTLE_S)
             raise
         return operation
+
+    def _abort_task(self, task) -> None:
+        """TASK_ABORT on one of an operation's tasks, from any thread."""
+        task.control(self._nidaqmx.constants.TaskMode.TASK_ABORT)
 
     def _board_refusal(self, pulse_train, conflicts, boards) -> str:
         """Why a pulse is refused while another holds its board, briefly first.
@@ -585,6 +613,12 @@ class NidaqLaserController:
         lasers = "Laser" if len(requested) == 1 else "Lasers"
         holders = " and ".join(
             self._describe_operation(operation) for operation in conflicts)
+        # One already cancelled is only ending: nothing is left to cancel.
+        remedy = (
+            "it is finishing its cleanup; try again in a moment"
+            if all(operation.state is LaserOperationState.CANCELLED
+                   for operation in conflicts)
+            else "wait for it to end, or cancel it")
         held = sorted({
             resource for operation in conflicts for resource in operation.resources
             if _device_of(resource).lower() in boards})
@@ -592,18 +626,25 @@ class NidaqLaserController:
         return (
             f"{lasers} {', '.join(map(str, requested))}: refused while {holders} "
             f"{'hold' if len(conflicts) > 1 else 'holds'} the analog output of "
-            f"{', '.join(held_boards)}; wait for it to end, or cancel it. A board "
+            f"{', '.join(held_boards)}; {remedy}. A board "
             "runs one timed analog output at a time (laser operation "
             f"{', '.join(operation.operation_id for operation in conflicts)} on "
             f"{', '.join(held)})")
 
     def _describe_operation(self, operation) -> str:
-        """An operation as an operator knows it: a trial's pulse, or a laser's."""
+        """An operation as an operator knows it: Test stim's, a trial's, a laser's.
+
+        By its context: an `operation_label` its caller gave it (Test stim
+        arms with a recipe whose trial number is 0), else its trial.
+        """
         lasers = sorted(
             int(channel.channel_id) for channel in self._configuration.channels
             if channel.analog_output in operation.resources)
         on = (f"laser {', '.join(map(str, lasers))}" if lasers
               else ", ".join(operation.resources))
+        label = operation.context.get("operation_label")
+        if label:
+            return f"{label}'s pulse on {on}"
         trial = operation.context.get("logical_trial_id")
         return f"trial {trial}'s pulse on {on}" if trial is not None else f"the pulse on {on}"
 
@@ -1070,11 +1111,10 @@ class NidaqLaserController:
     ) -> None:
         errors = []
         self._stop_and_close_task("pulse analog output task", ao_task, errors)
-        for index, task in enumerate(digital_tasks):
-            self._stop_and_close_task(f"pulse digital output task {index}", task, errors)
-        # After the tasks that use them, and only this pulse train's own: the
-        # trigger routes and the shared clock's route stay until close().
-        errors.extend(self._release_routes(routes))
+        # The command straight after the output's own task lets go of it:
+        # aborted mid-pulse, DAQmx leaves the output on the last sample it
+        # wrote, which can be the pulse's high level, until this. Then the
+        # shutters. The digital lines and routes come after.
         for channel in channels:
             try:
                 self.set_command_voltage(channel.channel_id, channel.minimum_command_volts)
@@ -1088,6 +1128,11 @@ class NidaqLaserController:
                 except Exception as exc:
                     errors.append((f"channel {channel.channel_id.value} shutter close", exc))
                     logger.exception("Failed to close NI-DAQ laser shutter for channel %s", channel.channel_id.value)
+        for index, task in enumerate(digital_tasks):
+            self._stop_and_close_task(f"pulse digital output task {index}", task, errors)
+        # After the tasks that use them, and only this pulse train's own: the
+        # trigger routes and the shared clock's route stay until close().
+        errors.extend(self._release_routes(routes))
         if close_pmt:
             try:
                 self._write_transient_digital_line(

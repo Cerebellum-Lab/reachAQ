@@ -38,6 +38,8 @@ class BenchRecipe:
     protocol_revision: int = 1
     logical_trial_id: int = 0
     attempt_id: int = 0
+    #: How its pulse is named where it holds the board, not as "trial 0".
+    operation_label: str = "Test stim"
 
 
 @dataclasses.dataclass(frozen=True)
