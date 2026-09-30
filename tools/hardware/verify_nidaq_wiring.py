@@ -397,6 +397,99 @@ def inspect_configuration(configuration):
     return tuple(issue.describe() for issue in issues), notes
 
 
+def record_laser_responses(analog_points, number, levels, observed_by_point):
+    """Note what moved while laser `number`'s command was held; the channels.
+
+    A point belongs to this laser when the configuration says so by name.
+    Anything else that moved is a contradiction, and the run reports it
+    without deciding what causes it.
+    """
+    responded = sorted(c for c, v in levels.items()
+                       if abs(v) >= ANALOG_THRESHOLD_V)
+    prefix = f"laser{number}_"
+    for point in analog_points:
+        if point.physical_channel not in responded:
+            continue
+        if point.name.startswith(prefix):
+            observed_by_point[point.fingerprint] = (
+                CONFIRMED,
+                f"responded to laser {number} at "
+                f"{levels[point.physical_channel]:.3f} V")
+        else:
+            observed_by_point.setdefault(point.fingerprint, (
+                UNEXPECTED,
+                f"responded to laser {number}, which it is not "
+                f"assigned to, at "
+                f"{levels[point.physical_channel]:.3f} V"))
+    return responded
+
+
+def driver_exercised(point, lasers_driven, board_outputs_exercised) -> bool:
+    """Whether this run drove anything that should have moved this point.
+
+    The distinction decides between "did not respond", which is evidence
+    of a missing cable, and "nothing asked it to", which is no evidence at
+    all. cam_frames and barcode fall in the second group: their sources
+    are a running camera and a session, neither of which exists here.
+    """
+    for number in lasers_driven:
+        if point.name.startswith(f"laser{number}_"):
+            return True
+    if not board_outputs_exercised:
+        return False
+    return point.name in {"tone1", "tone2"} or point.name.endswith(
+        "_trigger_in")
+
+
+def judge_points(points, observed_by_point, lasers_driven,
+                 board_outputs_exercised):
+    """A check for every point, from what moved and what was driven."""
+
+    def exercised(point):
+        return driver_exercised(point, lasers_driven, board_outputs_exercised)
+
+    checks = []
+    # Observable points first: a driver is confirmed by what it moved, so its
+    # witnesses have to exist before it is judged.
+    for point in sorted(points, key=lambda p: p.kind == DRIVER):
+        if point.kind == OPAQUE:
+            checks.append(WiringCheck.for_point(
+                point, UNTESTED, "not observable", point.opaque_reason))
+            continue
+        method = ("held DC on its laser command"
+                  if "/ai" in point.physical_channel
+                  else "static level while each board output was held high")
+        if point.fingerprint in observed_by_point and not exercised(point):
+            method = "watched while the operator drove it"
+
+        if point.fingerprint in observed_by_point:
+            status, detail = observed_by_point[point.fingerprint]
+        elif point.kind == DRIVER:
+            # An output cannot answer to itself. It is confirmed by what it
+            # made move: if this laser's command copy responded, the command
+            # output reached it.
+            witnesses = [c for c in checks
+                         if c.status == CONFIRMED
+                         and c.name.startswith(point.name + "_")]
+            if witnesses:
+                status = CONFIRMED
+                method = "confirmed through what it drove"
+                detail = "drove " + ", ".join(c.name for c in witnesses)
+            else:
+                status = SILENT
+                method = "confirmed through what it drove"
+                detail = "driving it moved nothing it is wired to"
+        elif exercised(point):
+            status = SILENT
+            detail = "its driver was exercised and it did not respond"
+        else:
+            status = UNTESTED
+            method = "no driver available"
+            detail = "nothing in this run drives it"
+        checks.append(WiringCheck.for_point(point, status, method, detail))
+    return checks
+
+
 def emit_report(configuration, verification, issues, notes, path) -> None:
     report = build_report(configuration, verification, issues=issues,
                           notes=notes)
@@ -509,29 +602,11 @@ def main() -> int:
                 if args.open_shutters:
                     laser.set_shutter_open(LaserChannelId(number), False)
 
-                responded = sorted(c for c, v in levels.items()
-                                   if abs(v) >= ANALOG_THRESHOLD_V)
+                responded = record_laser_responses(
+                    analog_points, number, levels, observed_by_point)
                 print(f"\nlaser {number} at {args.command_volts:g} V moved: "
                       + (", ".join(f"{c.split('/')[-1]}={levels[c]:.3f}V"
                                    for c in responded) or "nothing"))
-                # A point belongs to this laser when the configuration says so
-                # by name. Anything else that moved is a contradiction, and
-                # the run reports it without deciding what causes it.
-                prefix = f"laser{number}_"
-                for point in analog_points:
-                    if point.physical_channel not in responded:
-                        continue
-                    if point.name.startswith(prefix):
-                        observed_by_point[point.fingerprint] = (
-                            CONFIRMED,
-                            f"responded to laser {number} at "
-                            f"{levels[point.physical_channel]:.3f} V")
-                    else:
-                        observed_by_point.setdefault(point.fingerprint, (
-                            UNEXPECTED,
-                            f"responded to laser {number}, which it is not "
-                            f"assigned to, at "
-                            f"{levels[point.physical_channel]:.3f} V"))
                 lasers_driven.add(number)
     finally:
         try:
@@ -543,28 +618,13 @@ def main() -> int:
         except Exception:
             pass
 
-    def driver_exercised(point) -> bool:
-        """Whether this run drove anything that should have moved this point.
-
-        The distinction decides between "did not respond", which is evidence
-        of a missing cable, and "nothing asked it to", which is no evidence at
-        all. cam_frames and barcode fall in the second group: their sources
-        are a running camera and a session, neither of which exists here.
-        """
-        for number in lasers_driven:
-            if point.name.startswith(f"laser{number}_"):
-                return True
-        if not board_outputs_exercised:
-            return False
-        return point.name in {"tone1", "tone2"} or point.name.endswith(
-            "_trigger_in")
-
     if args.observe > 0:
         undriven = {
             point.fingerprint for point in points
             if point.kind != OPAQUE
             and point.fingerprint not in observed_by_point
-            and not driver_exercised(point)
+            and not driver_exercised(point, lasers_driven,
+                                     board_outputs_exercised)
         }
 
         def record_observed(point, detail):
@@ -576,45 +636,8 @@ def main() -> int:
         except Exception as error:
             print(f"observation failed: {error}")
 
-    checks = []
-    # Observable points first: a driver is confirmed by what it moved, so its
-    # witnesses have to exist before it is judged.
-    for point in sorted(points, key=lambda p: p.kind == DRIVER):
-        if point.kind == OPAQUE:
-            checks.append(WiringCheck.for_point(
-                point, UNTESTED, "not observable", point.opaque_reason))
-            continue
-        method = ("held DC on its laser command"
-                  if "/ai" in point.physical_channel
-                  else "static level while each board output was held high")
-        if point.fingerprint in observed_by_point and not driver_exercised(point):
-            method = "watched while the operator drove it"
-
-        if point.fingerprint in observed_by_point:
-            status, detail = observed_by_point[point.fingerprint]
-        elif point.kind == DRIVER:
-            # An output cannot answer to itself. It is confirmed by what it
-            # made move: if this laser's command copy responded, the command
-            # output reached it.
-            witnesses = [c for c in checks
-                         if c.status == CONFIRMED
-                         and c.name.startswith(point.name + "_")]
-            if witnesses:
-                status = CONFIRMED
-                method = "confirmed through what it drove"
-                detail = "drove " + ", ".join(c.name for c in witnesses)
-            else:
-                status = SILENT
-                method = "confirmed through what it drove"
-                detail = "driving it moved nothing it is wired to"
-        elif driver_exercised(point):
-            status = SILENT
-            detail = "its driver was exercised and it did not respond"
-        else:
-            status = UNTESTED
-            method = "no driver available"
-            detail = "nothing in this run drives it"
-        checks.append(WiringCheck.for_point(point, status, method, detail))
+    checks = judge_points(points, observed_by_point, lasers_driven,
+                          board_outputs_exercised)
 
     verification = WiringVerification(
         checks=tuple(checks),
