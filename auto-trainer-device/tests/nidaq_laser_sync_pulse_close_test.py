@@ -1183,20 +1183,25 @@ def test_a_command_reset_refused_after_a_cancel_is_critical(held, caplog):
     # ERROR said so, the cancel's own error being the run's.
     daq = held
     controller = NidaqLaserController(_routed())
-    operation = _armed(controller, trigger_source="/PXI1Slot4/PXI_Trig0")
-    daq.failing_write = "laser_1_manual_ao"
     try:
-        with caplog.at_level(logging.DEBUG):
-            assert operation.cancel()
-            assert operation.wait(1.0) is LaserOperationState.CANCELLED
-    finally:
-        daq.failing_write = None
+        operation = _armed(controller, trigger_source="/PXI1Slot4/PXI_Trig0")
+        daq.failing_write = "laser_1_manual_ao"
+        try:
+            with caplog.at_level(logging.DEBUG):
+                assert operation.cancel()
+                assert operation.wait(1.0) is LaserOperationState.CANCELLED
+        finally:
+            daq.failing_write = None
 
-    critical = [record.getMessage() for record in caplog.records
-                if record.levelno == logging.CRITICAL]
-    assert len(critical) == 1
-    assert "Laser 1" in critical[0] and "PXI1Slot4/ao0" in critical[0]
-    assert "make the laser safe by hand" in critical[0]
+        critical = [record.getMessage() for record in caplog.records
+                    if record.levelno == logging.CRITICAL]
+        assert len(critical) == 1
+        assert "Laser 1" in critical[0] and "PXI1Slot4/ao0" in critical[0]
+        assert "make the laser safe by hand" in critical[0]
+    finally:
+        # Left open, the controller kept its tasks and its trigger route.
+        controller.close()
+    assert controller._trigger_routes == []
 
 
 # ------------------------------------------------ workstream D: the follow-ups
