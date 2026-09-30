@@ -253,7 +253,10 @@ window's status bar and the log, as before, so a detached panel shows its
 errors in its own window. An error stays until the panel's next status or
 error replaces it, the next operation's lines or the Ready line of a Run/Stop
 rebuild included; it has no timeout. A long one ends in an ellipsis, and
-hovering over it shows the whole line.
+hovering over it shows the whole line; for a failed operation, hovering also
+shows the whole error, a DAQmx error's task and status code included. While an
+operation runs the footer says so ("Running ..."), not why nothing else can
+be fired meanwhile.
 The Pulse tab has the **Profile:** picker at the top. Below it are the folding
 sections **Run Pulse**, **Test stim**, **Output stream** and **Board
 trigger**; click a section's title to fold or open it. A folded section gives
