@@ -181,7 +181,13 @@ is **Pulse Builder** — every profile is made here, and nowhere else.
   **Amplitude**, **Pulse width**, **Baseline**, **Post-stim**, **Count** and
   **Frequency**, two to a row. The **PMT shutter margins** section holds **PMT
   open lead** and **PMT close lag**; it starts folded, so click its title to
-  open it. Amplitude here is limited to the widest range any configured laser
+  open it. The margins decide the PMT shutter wherever the profile fires, Run
+  Pulse, Test stim and trials alike: with either above zero and a PMT shutter
+  line (`pmtShutterOutput`) configured, the shutter opens that long before the
+  train and closes that long after it. With no PMT line configured, as on
+  christielab10, the margins are ignored and the train fires without them;
+  the log says so once for each laser each time the laser controller opens.
+  Amplitude here is limited to the widest range any configured laser
   accepts; the laser that actually fires the profile checks its own range. A
   saved profile outside that range loads clamped to it, and the status line
   says so: *"Profile 'hot' is 6 V; the builder allows 0..5 V, so it now shows
@@ -261,8 +267,9 @@ selected"*, or that the draft is not a valid pulse train.
 
 ### Run Pulse — proves the analog output works
 
-In the **Run Pulse** section, set **Trigger:**, the shutter and PMT options,
-then press **Run Pulse**.
+In the **Run Pulse** section, set **Trigger:** and the shutter options, then
+press **Run Pulse**. It has no PMT option of its own: the PMT shutter follows
+the profile's PMT margins, as for a trial.
 The host writes the picked profile's waveform to the analog output directly.
 
 - **Success:** the status line reads *"Pulse complete: laser 1"*, and the
@@ -348,10 +355,11 @@ Pulse Builder, which loads it there for editing, and save. Picking a profile
 does not change **Trigger:** or **Source:**.
 
 A pulse can also drive clocked digital lines with its waveform: the PMT
-shutter (`pmtShutterOutput`) and, per laser, a trigger output and a timing
-trigger output (`triggerOutput`, `timingTriggerOutput`). Run Pulse, Test stim
-and trials all use them. Each must be a line on a board that can run clocked
-digital output - on christielab10 a port0 line on the 6221, never the 6713 -
+shutter (`pmtShutterOutput`), when its profile has PMT margins, and, per
+laser, a trigger output and a timing trigger output (`triggerOutput`,
+`timingTriggerOutput`). Run Pulse, Test stim and trials all use them. Each
+must be a line on a board that can run clocked digital output - on
+christielab10 a port0 line on the 6221, never the 6713 -
 and every one runs on the output's own clock, with no start trigger; one
 on another board than the laser's output takes that clock over the backplane,
 on `pulseClockLine` (PXI_Trig3). A pulse that cannot clock such a line is

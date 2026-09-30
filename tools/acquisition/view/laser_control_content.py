@@ -295,7 +295,8 @@ class _LaserChannelTab(QWidget):
         self._open_shutter.setChecked(True)
         self._close_shutter = self._make_checkbox("Close shutter")
         self._close_shutter.setChecked(True)
-        self._enable_pmt = self._make_checkbox("PMT shutter")
+        # No PMT shutter box: the profile's margins decide, as for trials
+        # (LaserModel.pmt_shutter_for_profile).
         self._emit_trigger = self._make_checkbox("Trigger DO")
         self._emit_timing_trigger = self._make_checkbox("Timing DO")
         self._run_pulse_button = QPushButton("Run Pulse")
@@ -332,7 +333,6 @@ class _LaserChannelTab(QWidget):
         run_options.setVerticalSpacing(1)
         run_options.addWidget(self._open_shutter, 0, 0)
         run_options.addWidget(self._close_shutter, 0, 1)
-        run_options.addWidget(self._enable_pmt, 0, 2)
         run_options.addWidget(self._emit_trigger, 1, 0)
         run_options.addWidget(self._emit_timing_trigger, 1, 1)
         run_options.setColumnStretch(3, 1)
@@ -613,7 +613,6 @@ class _LaserChannelTab(QWidget):
             self._trigger_edge,
             self._open_shutter,
             self._close_shutter,
-            self._enable_pmt,
             self._emit_trigger,
             self._emit_timing_trigger,
             self._stim_route,
@@ -1212,7 +1211,8 @@ class _LaserChannelTab(QWidget):
             trigger_edge=self._trigger_edge.currentText(),
             open_shutter=self._open_shutter.isChecked(),
             close_shutter=self._close_shutter.isChecked(),
-            enable_pmt_shutter=self._enable_pmt.isChecked(),
+            enable_pmt_shutter=self._app_model.laser.pmt_shutter_for_profile(
+                profile, self._channel.channel_id),
             pmt_shutter_open_delay_ms=profile.pmt_open_lead_ms,
             pmt_shutter_close_delay_ms=profile.pmt_close_lag_ms,
             emit_trigger_output=self._emit_trigger.isChecked(),

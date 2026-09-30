@@ -495,3 +495,83 @@ def test_an_armed_pulse_records_its_baseline_after_a_refused_pulse_on_its_laser(
         armed.cancel()
         armed.wait_until_finished(5.0)
         model.close()
+
+
+# ------------------------------------------------ the PMT rule (Ben, 2026-09-30)
+
+
+def _with_margins(lead=5.0, lag=5.0):
+    return LaserPulseProfile(
+        "pmt", 1, 2.5, 1.0, pmt_open_lead_ms=lead, pmt_close_lag_ms=lag)
+
+
+def _pmt_line(controller):
+    import dataclasses
+
+    controller.configuration = dataclasses.replace(
+        controller.configuration, pmt_shutter_output="Dev1/port0/line6")
+    return controller
+
+
+def _pmt_warnings(caplog):
+    return [record.getMessage() for record in caplog.records
+            if record.levelname == "WARNING" and "PMT" in record.getMessage()]
+
+
+def test_a_trial_drives_the_pmt_shutter_by_its_margins_with_a_pmt_line():
+    controller = _pmt_line(_Controller())
+    model = LaserModel(controller)
+
+    model.prepare_pulse_profile(_with_margins(), BOARD, _recipe())
+    pulse, = controller.pulse.pulse_trains
+    assert pulse.enable_pmt_shutter
+    assert (pulse.pmt_shutter_open_delay_ms, pulse.pmt_shutter_close_delay_ms) == (5.0, 5.0)
+
+    for lead, lag in ((5.0, 0.0), (0.0, 5.0)):
+        model.prepare_pulse_profile(_with_margins(lead, lag), BOARD, _recipe())
+        assert controller.pulse.pulse_trains[0].enable_pmt_shutter
+    model.prepare_pulse_profile(_with_margins(0.0, 0.0), BOARD, _recipe())
+    assert not controller.pulse.pulse_trains[0].enable_pmt_shutter
+
+
+def test_without_a_pmt_line_a_trials_margins_are_ignored_and_said_once(caplog):
+    # christielab10 configures no PMT shutter line, and a trial with margins
+    # failed there: "PMT shutter output requested, but laser
+    # pmt_shutter_output is not configured". It fires without them.
+    controller = _Controller()
+    model = LaserModel(controller)
+
+    with caplog.at_level("WARNING"):
+        for _ in range(2):
+            model.prepare_pulse_profile(_with_margins(), BOARD, _recipe())
+            assert not controller.pulse.pulse_trains[0].enable_pmt_shutter
+        warning, = _pmt_warnings(caplog)
+        assert "Laser 1" in warning and "pmtShutterOutput" in warning
+
+        # Once per controller: the next one says it again.
+        controller = _Controller()
+        model.set_controller(controller)
+        model.prepare_pulse_profile(_with_margins(), BOARD, _recipe())
+        assert not controller.pulse.pulse_trains[0].enable_pmt_shutter
+        assert len(_pmt_warnings(caplog)) == 2
+
+
+def test_a_trial_with_pmt_margins_fires_on_a_rig_with_no_pmt_line(monkeypatch):
+    # christielab10's own case, through the NI-DAQ controller on the fake:
+    # the margins are ignored, so the output is the train alone, and no PMT
+    # line is driven.
+    import dataclasses
+
+    fake = _daqmx_fake()
+    model, daq = _nidaq_model(
+        monkeypatch, dataclasses.replace(fake.rig_lasers(), pmt_shutter_output=None))
+    try:
+        operation = model.prepare_pulse_profile(_with_margins(), SOFTWARE, _recipe())
+        operation.trigger()
+        assert operation.wait(5.0).value == "completed"
+
+        # 1 ms at 100 kHz, with no 5 ms margin before or after it.
+        assert daq.task("laser_sync_pulse_ao").timing_kwargs["samps_per_chan"] == 100
+        assert not [task.label for task in daq.tasks if "pmt" in task.label]
+    finally:
+        model.close()
