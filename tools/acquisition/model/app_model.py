@@ -6430,10 +6430,11 @@ class AppModel(ObservableObject):
             # Ports saves one.
             and not self._nidaq_plan_error
             # Nor while a laser close given up on is still inside the driver:
-            # a ramp's controller still holds its inputs on the stream's
-            # lines. Its hold on the stream was let go when the ramp ended,
-            # and the stream restarted over that close (final re-review,
-            # affb7491). The close's late finish asks for it again.
+            # a controller still closing can hold inputs on the stream's
+            # lines, as a ramp's does. The ramp let go of its hold on the
+            # stream as it ended, and the stream restarted over that close
+            # (final re-review, affb7491). The close's late finish asks for
+            # the stream again.
             and not self._given_up_close_refusal()
         )
 

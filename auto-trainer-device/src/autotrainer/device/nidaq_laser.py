@@ -886,8 +886,9 @@ class NidaqLaserController:
             self._configuration.get_channel(channel_pulse.channel_id)
             for channel_pulse in pulse_train.pulse_trains
         ]
-        # Each amplitude is in its laser's range: run_synchronized_pulse_train
-        # refused it before the operation was made otherwise.
+        # Every amplitude is in its laser's range: run_synchronized_pulse_train
+        # refuses one that is not, before the operation is made.
+
         # Resolved before the waveform is built rather than after, because the
         # timing decides the rate it will be generated at and every sample
         # count below is computed from that rate.
