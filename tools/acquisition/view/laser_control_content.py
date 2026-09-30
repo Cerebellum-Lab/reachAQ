@@ -1823,6 +1823,13 @@ class LaserControlContent(ContentWidget):
             refusal = tab.run_pulse_refusal()
             if refusal and refusal not in refusals:
                 refusals.append(refusal)
+        if is_running:
+            # The operation is why nothing can be fired, and the footer says
+            # "Running ..." until its outcome. The first refusal found here
+            # was an unmapped laser's, "Laser 3 has no hardware channel ..."
+            # on christielab10, and it replaced "Running ..." for the whole
+            # operation.
+            return
         # Nothing can be fired and the buttons alone do not say why, so the
         # shared status line carries the reason. Not when a ramp can run, as
         # it can in Idle: after a ramp that replaced its own outcome with

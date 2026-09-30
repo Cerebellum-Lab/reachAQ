@@ -10,6 +10,7 @@ once, and that record is what puts it on the status bar.
 """
 
 import os
+import threading
 import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -32,6 +33,7 @@ from tools.acquisition.view.laser_control_content import (  # noqa: E402
 ERROR_RED = "#b00020"
 PROFILE = LaserPulseProfile("short", 1, 1.0, 2.0)
 NO_PROFILE = "Laser 1: pick a saved profile or the builder draft"
+RUNNING = "Running laser 1 pulse train"
 
 
 @pytest.fixture
@@ -132,12 +134,41 @@ def test_a_refused_run_pulse_stays_on_the_footer_until_the_next_status(
     # The next operation's own lines replace it, in the ordinary colour.
     _pick(tab, "short")
     tab._run_pulse_button.click()
-    assert _footer(panel).text() != NO_PROFILE
+    assert _footer(panel).text() == RUNNING
     assert ERROR_RED not in _footer(panel).styleSheet()
     _wait_for_operation(panel, qapp)
     assert _footer(panel).text() == "Pulse complete: laser 1"
     assert _footer(panel).styleSheet() == ""
     assert len(_logged(caplog, NO_PROFILE)) == 1
+
+
+def test_the_running_line_stays_until_the_operation_ends(panel, app_model, qapp, monkeypatch):
+    # Nothing can be fired while an operation runs, and the panel said why in
+    # place of "Running ...": the first refusal it found, an unmapped
+    # laser's ("Laser 3 has no hardware channel ..." on christielab10), for
+    # the whole operation.
+    release = threading.Event()
+    run_pulse_train = app_model.laser.run_pulse_train
+    monkeypatch.setattr(
+        app_model.laser, "run_pulse_train",
+        lambda pulse_train: release.wait(10.0) and run_pulse_train(pulse_train))
+    tab = panel._channel_tabs[0]
+    _pick(tab, "short")
+    try:
+        tab._run_pulse_button.click()
+        assert _footer(panel).text() == RUNNING
+        # What the model announces as System Mode or the subsystems change
+        # meanwhile; the first of these announces refusals, the second not.
+        panel.set_is_capture_active(False)
+        app_model.property_changed(AppModel.Props.SUBSYSTEM_STATUSES, None, None)
+        qapp.processEvents()
+        assert panel._operation_thread is not None
+        assert _footer(panel).text() == RUNNING
+    finally:
+        release.set()
+    _wait_for_operation(panel, qapp)
+
+    assert _footer(panel).text() == "Pulse complete: laser 1"
 
 
 def _test_stim_with_no_profile(panel, _listed):
