@@ -337,7 +337,7 @@ gets one status:
 | `CONFIRMED` | Responded to its own driver and nothing else |
 | `SILENT` | Did not respond when driven; check the cable at the named connector |
 | `UNEXPECTED` | Responded to another channel's driver: the cable is on the wrong connector, or two are swapped |
-| `UNTESTED` | Nothing in the run could drive it (camera frames and barcode, for example). A laser's trigger readback (`laserN_trigger`) follows the board STIM, not the laser command, so the laser drive does not check it: it reads *trigger readback: not checked against the command (it follows the board STIM)* unless the board output sweep saw it go high |
+| `UNTESTED` | Nothing in the run could drive it (camera frames and barcode, for example). A laser's trigger readback (`laserN_trigger`, or `laserN_trigger_readback` as christielab10 acquires it) follows the board STIM, not the laser command, so the laser drive does not check it. An analog one reads *trigger readback: not checked against the command (it follows the board STIM)*. A digital one is checked by the board output sweep, confirmed if it went high and silent if not; it reads *not checked* only when CAN was down |
 | `OPAQUE` | Cannot be checked from the DAQ, such as a shutter output with no readback |
 
 The test reports what it saw, not why. A mislabelled cable, a split, and
