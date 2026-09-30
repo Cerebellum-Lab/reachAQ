@@ -327,6 +327,81 @@ def test_device_rows_are_written_in_receive_time_order(tmp_path):
     assert perf == [10.1, 10.2, 10.3]
 
 
+def _manual_laser_row(perf, event, source, operation_id="manual-a"):
+    method, confidence = (
+        ("manual_pulse_call_perf_counter", "before_output_start")
+        if source == "manual pulse"
+        else ("laser_event_perf_counter", "host_timestamp")
+    )
+    return (
+        perf, 90.0 + perf, event, 1, source, 1.0, float("nan"), float("nan"),
+        "", None, operation_id if source == "manual pulse" else "", "{}",
+        method, confidence,
+    )
+
+
+def _write_laser_rows(tmp_path, laser_rows, nidaq_chunk):
+    project = ProjectInfo(
+        root=str(tmp_path),
+        device_id="test",
+        when=datetime(2026, 9, 30, 12, 0, 0),
+        session=1,
+    )
+    SessionDataRecorder._write_session(
+        project, 10.0, 100.0, 12.0, (), laser_rows, (), (nidaq_chunk,),
+    )
+    session_dir = tmp_path / "20260930" / "test" / "session001"
+    with (session_dir / "streams" / "laser.csv").open(newline="") as stream:
+        return list(csv.DictReader(stream))
+
+
+def _nidaq_chunk(indices, perf):
+    return (
+        np.array(indices, dtype=np.int64),
+        np.array(perf),
+        np.array(perf) + 90.0,
+        np.zeros((1, len(perf)), dtype=np.float32),
+        ("force",),
+        1000.0,
+        1,
+        0,
+        0,
+    )
+
+
+def test_laser_rows_are_written_in_time_order(tmp_path):
+    # A manual Run Pulse's waveform is told once the train has ended, stamped
+    # with the time the pulse was asked for (LaserModel.run_pulse_train):
+    # after any laser row told while it ran. laser.csv is a time series on
+    # perf_time, as device.csv is, and rows at the same time keep the order
+    # they were told.
+    rows = _write_laser_rows(tmp_path, (
+        (10.5, 100.5, "feedback", 1, "", 1.0, 2.0, 3.0),
+        _manual_laser_row(10.2, "requested", "manual pulse"),
+        _manual_laser_row(10.2, "trace", "internal pulse"),
+        _manual_laser_row(10.3, "trace", "internal pulse"),
+        _manual_laser_row(10.25, "completed", "manual pulse"),
+    ), _nidaq_chunk([0, 1, 2, 3], [9.9, 10.0, 11.0, 12.1]))
+
+    assert [(float(row["perf_time"]), row["event"]) for row in rows] == [
+        (10.2, "requested"), (10.2, "trace"), (10.25, "completed"),
+        (10.3, "trace"), (10.5, "feedback"),
+    ]
+
+
+def test_laser_csv_names_the_nidaq_sample_each_row_landed_within(tmp_path):
+    # As pressure.csv does: both clocks are time.perf_counter, so this is a
+    # lookup in the NI-DAQ timeline. A row before the first NI sample has
+    # none, and says so with an empty cell.
+    rows = _write_laser_rows(tmp_path, (
+        _manual_laser_row(10.05, "requested", "manual pulse"),
+        _manual_laser_row(10.5, "completed", "manual pulse"),
+        _manual_laser_row(11.2, "trace", "internal pulse"),
+    ), _nidaq_chunk([5, 6, 7], [10.1, 11.0, 12.1]))
+
+    assert [row["nidaq_sample_index"] for row in rows] == ["", "5", "6"]
+
+
 def test_session_outputs_are_clipped_to_camera_boundaries(tmp_path):
     project = ProjectInfo(
         root=str(tmp_path),
