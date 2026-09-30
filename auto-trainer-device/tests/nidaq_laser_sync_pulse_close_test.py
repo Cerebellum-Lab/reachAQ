@@ -442,6 +442,7 @@ def test_a_cancel_just_before_the_start_is_not_lost(held, armed):
     daq = held
     controller = NidaqLaserController(_routed())
     cancelled = []
+    after_the_cancel = []
 
     def cancel_as_it_starts(task):
         if task.label == "laser_sync_pulse_ao":
@@ -449,6 +450,8 @@ def test_a_cancel_just_before_the_start_is_not_lost(held, armed):
             operation, = controller._live_operations.values()
             cancelled.append(operation)
             operation.cancel()
+            # The cancel's own shutter close is on this thread too.
+            after_the_cancel.append(len(daq.writes))
 
     if armed == "board_stim":
         # Cancelled as it arms: the arming itself reports it.
@@ -466,7 +469,8 @@ def test_a_cancel_just_before_the_start_is_not_lost(held, armed):
     # The pulse's own cleanup: its thread's reset and shutter close.
     assert daq.writes_to("PXI1Slot4/ao0", task_suffix="manual_ao",
                          thread=operation._thread) == [0.0]
-    assert daq.writes_to("PXI1Slot5/port0/line4", thread=operation._thread)[-1] is False
+    assert daq.writes_to("PXI1Slot5/port0/line4", thread=operation._thread,
+                         since=after_the_cancel[0]) == [False]
 
 
 def test_cancelling_an_armed_deferred_pulse_logs_no_error(held, caplog):
