@@ -7049,7 +7049,15 @@ class AppModel(ObservableObject):
         `replacing`, the close that has just ended, is taken off here: in the
         hold that lists the watch, or at once when nothing is left running.
         """
-        left = self._laser.work_left_running_after_close()
+        try:
+            left = self._laser.work_left_running_after_close()
+        except Exception:
+            # The finished close is taken off all the same: left listed, it
+            # refused laser work until reachAQ restarted.
+            logger.exception(
+                "Could not tell what the laser controller's close left "
+                "running; laser work is not held off for it")
+            left = ()
         if not left:
             if replacing is not None:
                 with self._pending_laser_closes_lock:

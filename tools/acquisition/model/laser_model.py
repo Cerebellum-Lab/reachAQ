@@ -11,6 +11,7 @@ from typing import Callable, Optional, Tuple, Union
 
 from autotrainer.core import NidaqTimingPlan, ObservableObject
 from autotrainer.core.logging import get_verbose_logger, log_hardware_initialization
+from autotrainer.device.nidaq_laser import CANCELLED_OPERATION_WAIT_S
 from autotrainer.device import (
     LaserControllerProtocol,
     LaserCalibrationPoint,
@@ -49,10 +50,6 @@ class LaserTraceBlock:
     origin_wall_time: Optional[float] = None
 
 
-#: How long a path that cancels a laser operation and goes on waits for it
-#: to end. The abort ends it in milliseconds (H5b: about 40 ms); this bounds
-#: a sick driver.
-CANCELLED_OPERATION_WAIT_S = 2.0
 
 
 def wait_until_cancelled_ends(operation, timeout: float = CANCELLED_OPERATION_WAIT_S) -> bool:
@@ -61,8 +58,8 @@ def wait_until_cancelled_ends(operation, timeout: float = CANCELLED_OPERATION_WA
     A pulse armed next on the same board is refused until it has, as the
     board is still held by the cancelled one's cleanup.
     """
-    done = getattr(operation, "_done", None)
-    if done is None or done.wait(timeout):
+    wait_until_finished = getattr(operation, "wait_until_finished", None)
+    if wait_until_finished is None or wait_until_finished(timeout):
         return True
     logger.warning(
         "The cancelled laser operation %s had not ended %.1f s later; a pulse "
