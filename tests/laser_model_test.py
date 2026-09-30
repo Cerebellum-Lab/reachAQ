@@ -380,3 +380,48 @@ def test_the_models_nidaq_controllers_take_the_streams_terminal_config(monkeypat
     model.load_configuration(configuration, analog_terminal_config="nrse")
 
     assert made == ["rse", "nrse"]
+
+
+
+def _daqmx_fake():
+    """The laser device tests' stand-in for NI-DAQmx, loaded from its file."""
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1].joinpath(
+        "auto-trainer-device", "tests", "nidaq_daqmx_fake.py")
+    spec = importlib.util.spec_from_file_location("nidaq_daqmx_fake", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_a_pulse_the_board_rule_refuses_leaves_the_last_command(monkeypatch):
+    # The amplitude was recorded before the controller was asked: a pulse
+    # refused, which drove nothing, left it as what the output "may still
+    # hold", and a close that failed named it.
+    from autotrainer.device import (
+        LaserChannelId, LaserPulseTrain, LaserSynchronizedPulseTrain, NidaqLaserController)
+    from autotrainer.device import nidaq_laser
+
+    fake = _daqmx_fake()
+    daq = fake.FakeDaqmx()
+    monkeypatch.setattr(nidaq_laser, "_load_nidaqmx", lambda: daq)
+    model = LaserModel()
+    model.set_controller(NidaqLaserController(fake.rig_lasers()))
+    armed = model.run_synchronized_pulse_train(LaserSynchronizedPulseTrain(
+        pulse_trains=(LaserPulseTrain(
+            channel_id=LaserChannelId.LASER_1, amplitude_volts=2.5, duration_ms=1.0),),
+        wait=False, defer_start=True, timeout_seconds=30.0))
+    try:
+        assert model.last_command_volts == {1: 2.5}
+
+        with pytest.raises(RuntimeError, match="refused while"):
+            model.run_pulse_train(LaserPulseTrain(
+                channel_id=LaserChannelId.LASER_1, amplitude_volts=1.0, duration_ms=1.0))
+
+        assert model.last_command_volts == {1: 2.5}
+    finally:
+        armed.cancel()
+        armed.wait_until_finished(5.0)
+        model.close()

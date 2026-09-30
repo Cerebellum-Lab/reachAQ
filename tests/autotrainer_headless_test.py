@@ -576,7 +576,7 @@ def test_a_forced_ramp_close_that_hangs_is_given_up_on_and_named(
     from tools.acquisition.model import app_model as app_model_module
 
     monkeypatch.setattr(app_model_module, "_LASER_CALIBRATION_CLOSE_MARGIN_S", 0.5)
-    monkeypatch.setattr(app_model_module, "_LASER_CALIBRATION_FORCED_CLOSE_S", 0.5)
+    monkeypatch.setattr(app_model_module, "_LASER_CONTROLLER_CLOSE_S", 0.5)
     monkeypatch.setattr(app_model_module, "_LASER_CALIBRATION_RAMP_END_WAIT_S", 0.2)
     assert app_model.load_configuration() is True
     app_model.laser.set_configuration_offline(_null_lasers())
@@ -1964,3 +1964,52 @@ def test_launch_cli(system_config, config_file_path, user_pref, calib_dir, diamo
     assert_is_present(f"Writing to {config_file_path.as_posix()!r}")
     #
     # etc...
+
+
+
+# ------------------------------------------------ the final fix round
+
+
+def test_stop_as_a_pulse_fails_by_itself_logs_no_critical(app_model, monkeypatch, caplog):
+    # The pulse's own failure, reached between close() taking the live
+    # pulses and cancelling them, was reported as the close's: Stop logged
+    # "make the laser safe by hand" for a laser its cleanup had reset.
+    from autotrainer.device import (
+        LaserChannelId, LaserPulseTrain, LaserSynchronizedPulseTrain)
+
+    _system_mode_with_the_fake_laser(
+        app_model, monkeypatch, lasers=_ROUTED_LASER, block_wait=True)
+    controller = app_model.laser._controller
+    operation = controller.run_synchronized_pulse_train(LaserSynchronizedPulseTrain(
+        pulse_trains=(LaserPulseTrain(
+            channel_id=LaserChannelId.LASER_1, amplitude_volts=1.0, duration_ms=1.0),),
+        trigger_source="/PXI1Slot4/PXI_Trig0", wait=False, timeout_seconds=0.2))
+    mark_closed = controller._mark_closed
+
+    def the_pulse_fails_meanwhile():
+        taken = mark_closed()
+        assert operation.wait_until_finished(5.0)
+        return taken
+
+    monkeypatch.setattr(controller, "_mark_closed", the_pulse_fails_meanwhile)
+    try:
+        with caplog.at_level("ERROR"):
+            app_model._close_laser_within_bound("System Mode stops")
+
+        assert operation.state.value == "failed"
+        assert [record.getMessage() for record in caplog.records
+                if record.levelname == "CRITICAL"] == []
+        assert not app_model.laser.is_connected
+    finally:
+        app_model.capture_stop()
+
+
+def test_a_bounded_close_names_the_first_line_of_text_of_its_error():
+    # The first line as split: a message that starts on a new line, as a
+    # DAQmx one can, gave an empty line and then only the error's class.
+    from tools.acquisition.model import app_model as app_model_module
+
+    closing = app_model_module._BoundedClose(lambda: None, "test close")
+    closing.error = RuntimeError("\nDAQmx refused the reset.\n\nStatus Code: -50103")
+
+    assert closing.failure(1.0, True) == "failed to close (DAQmx refused the reset.)"

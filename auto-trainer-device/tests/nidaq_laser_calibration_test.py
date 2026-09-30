@@ -715,3 +715,25 @@ def test_the_ramp_does_not_note_the_stop_of_a_task_close_aborted(daq, caplog):
             if "before it finished" in record.getMessage()] == [
         "laser 1's calibration ramp: stopping its task laser_1_calibration_ai "
         "before it finished (DAQmx may warn 200010)"]
+
+
+
+# ---------------------------------------------- the final fix round
+
+
+def test_a_ramps_refused_command_reset_is_critical(daq, caplog):
+    # The ramp's own reset of the command, refused, left the output on the
+    # ramp's last level: that is CRITICAL, whatever else ended the ramp.
+    controller = NidaqLaserController(_rig_lasers())
+    daq.failing_write = "laser_1_manual_ao"
+    try:
+        with caplog.at_level(logging.ERROR):
+            with pytest.raises(RuntimeError, match="channel 1 command reset"):
+                controller.run_calibration_ramp(RAMP)
+    finally:
+        daq.failing_write = None
+
+    critical = [record.getMessage() for record in caplog.records
+                if record.levelno == logging.CRITICAL]
+    assert len(critical) == 1
+    assert "Laser 1" in critical[0] and "PXI1Slot4/ao0" in critical[0]

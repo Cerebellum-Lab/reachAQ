@@ -42,6 +42,7 @@ from tools.acquisition.model.trial_protocol_schedule import (
 from tools.acquisition.model.app_model import AppModel
 from tools.acquisition.model.laser_model import LaserModel, LaserTraceBlock
 from tools.acquisition.model.laser_plot_process import LaserPlotFrame, LaserPlotProcess
+from tools.acquisition.model.helpers import first_line
 from tools.acquisition.model.nidaq_channel_plan import nidaq_channel_kind
 from tools.acquisition.model.nidaq_signal_monitor_model import NidaqSignalMonitorModel
 from tools.acquisition.model.trial_action import LaserPulseProfile
@@ -102,14 +103,6 @@ _TRIGGER_INPUT_KINDS = (
 )
 
 
-def _first_line(text: str, maximum_length: int) -> str:
-    """The first non-empty line of `text`, cut to `maximum_length` with an ellipsis."""
-    line = next((part.strip() for part in str(text).splitlines() if part.strip()), "")
-    if len(line) > maximum_length:
-        line = line[: maximum_length - 1].rstrip() + "…"
-    return line
-
-
 #: nidaqmx's DaqError ends its message with the status code on a line of its
 #: own, after the driver's text and the task name.
 _DAQMX_STATUS_CODE = re.compile(r"^\s*Status Code:\s*(-?\d+)\s*$", re.MULTILINE)
@@ -122,11 +115,11 @@ def _failure_line(text: str, maximum_length: int) -> str:
     line is the driver's text alone: the code, -89125 for one, was cut off.
     """
     match = _DAQMX_STATUS_CODE.search(str(text))
-    line = _first_line(text, maximum_length)
+    line = first_line(text, maximum_length)
     if match is None or match.group(1) in line:
         return line
     code = f" (DAQmx {match.group(1)})"
-    return _first_line(text, maximum_length - len(code)) + code
+    return first_line(text, maximum_length - len(code)) + code
 
 
 class _LaserOperationWorker(QObject):
@@ -1032,7 +1025,7 @@ class _LaserChannelTab(QWidget):
             # It read "it is error.", and said nothing of what failed.
             text = (
                 f"Reads {source} while the NI-DAQ input stream runs; "
-                f"the stream failed: {_first_line(error, 60)}"
+                f"the stream failed: {first_line(error, 60)}"
             )
         elif not monitor.is_running:
             text = (

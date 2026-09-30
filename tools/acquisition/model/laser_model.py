@@ -11,6 +11,7 @@ from typing import Callable, Optional, Tuple, Union
 
 from autotrainer.core import NidaqTimingPlan, ObservableObject
 from autotrainer.core.logging import get_verbose_logger, log_hardware_initialization
+from autotrainer.device.laser import LaserPulseRefused
 from autotrainer.device.nidaq_laser import CANCELLED_OPERATION_WAIT_S
 from autotrainer.device import (
     LaserControllerProtocol,
@@ -124,6 +125,40 @@ class LaserModel(ObservableObject):
             self._last_command_volts[int(channel_id)] = float(volts)
             self._command_records[int(channel_id)] = (
                 self._command_records.get(int(channel_id), 0) + 1)
+
+    def _record_pulse_commands(self, pulse_trains) -> dict:
+        """Record each train's amplitude as its channel's last command.
+
+        Before the controller is asked: a train that fails once it runs may
+        leave its amplitude on the output. Returns the records as they were,
+        for _undo_refused_pulse.
+        """
+        with self._command_lock:
+            before = {}
+            for train in pulse_trains:
+                key = int(train.channel_id)
+                before[key] = (
+                    self._last_command_volts.get(key), self._command_records.get(key, 0))
+                self._record_command(train.channel_id, train.amplitude_volts)
+            return before
+
+    def _undo_refused_pulse(self, before: dict) -> None:
+        """A pulse the controller refused drove nothing: its records go back.
+
+        It left its amplitude as what the output "may still hold", and a close
+        that failed named it. Only on a channel nothing has recorded a
+        command on since, and with its count, so that an armed pulse's own
+        completion still finds its mark (_record_baseline_when_completed).
+        """
+        with self._command_lock:
+            for key, (volts, records) in before.items():
+                if self._command_records.get(key, 0) != records + 1:
+                    continue
+                if volts is None:
+                    self._last_command_volts.pop(key, None)
+                else:
+                    self._last_command_volts[key] = volts
+                self._command_records[key] = records
 
     def _record_baseline_when_completed(self, operation, channel_ids) -> None:
         """An armed or trial pulse's outputs are at their minimum once it completes.
@@ -365,8 +400,12 @@ class LaserModel(ObservableObject):
 
     def run_pulse_train(self, pulse_train: LaserPulseTrain) -> None:
         controller = self._require_controller()
-        self._record_command(pulse_train.channel_id, pulse_train.amplitude_volts)
-        controller.run_pulse_train(pulse_train)
+        before = self._record_pulse_commands((pulse_train,))
+        try:
+            controller.run_pulse_train(pulse_train)
+        except LaserPulseRefused:
+            self._undo_refused_pulse(before)
+            raise
         if pulse_train.wait:
             # Returned: the train ended on its baseline, and its cleanup put
             # the command back. One that raised keeps its amplitude, which
@@ -376,9 +415,12 @@ class LaserModel(ObservableObject):
 
     def run_synchronized_pulse_train(self, pulse_train: LaserSynchronizedPulseTrain):
         controller = self._require_controller()
-        for channel_pulse in pulse_train.pulse_trains:
-            self._record_command(channel_pulse.channel_id, channel_pulse.amplitude_volts)
-        operation = controller.run_synchronized_pulse_train(pulse_train)
+        before = self._record_pulse_commands(pulse_train.pulse_trains)
+        try:
+            operation = controller.run_synchronized_pulse_train(pulse_train)
+        except LaserPulseRefused:
+            self._undo_refused_pulse(before)
+            raise
         channel_ids = tuple(
             channel_pulse.channel_id for channel_pulse in pulse_train.pulse_trains)
         if pulse_train.wait:
@@ -439,8 +481,12 @@ class LaserModel(ObservableObject):
         # run_synchronized_pulse_train(), whose ordinary/manual trace represents
         # an executed waveform.
         controller = self._require_controller()
-        self._record_command(pulse.channel_id, pulse.amplitude_volts)
-        operation = controller.run_synchronized_pulse_train(synchronized)
+        before = self._record_pulse_commands((pulse,))
+        try:
+            operation = controller.run_synchronized_pulse_train(synchronized)
+        except LaserPulseRefused:
+            self._undo_refused_pulse(before)
+            raise
         if operation is None:
             raise RuntimeError("Protocol laser preparation did not return an operation")
         self._record_baseline_when_completed(operation, (pulse.channel_id,))

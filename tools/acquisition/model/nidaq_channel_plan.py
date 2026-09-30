@@ -84,10 +84,14 @@ def nidaq_channel_kind(physical_channel: str) -> str:
     NI names a digital line by its port and line, as in Dev1/port0/line3, and
     an analog input as Dev1/ai3. The stimulus line can be wired back into
     either, so the kind follows the name rather than another setting to keep
-    in step with it.
+    in step with it. By the channel's own part of the name, as the stream
+    reads it (_is_streamable_input): by substring, a device whose name held
+    "port" or "line" made its analog inputs digital.
     """
-    lowered = str(physical_channel).lower()
-    return "digital" if "port" in lowered or "line" in lowered else "analog"
+    name = str(physical_channel)
+    if _ANALOG_INPUT.match(name):
+        return "analog"
+    return "digital" if _STATIC_LINE.match(name) else "analog"
 
 
 #: One analog input, as in Dev1/ai3.

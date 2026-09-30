@@ -330,6 +330,34 @@ def test_a_pulse_that_fails_by_itself_still_ends_failed(monkeypatch):
     assert controller._live_operations == {}
 
 
+def test_a_pulse_that_fails_by_itself_as_close_begins_is_no_close_failure(monkeypatch, caplog):
+    # close() takes the live pulses, then cancels each. One that failed by
+    # itself in between, its wait timing out as Stop was pressed, was not
+    # cancelled, and close() raised its own error as a failure to close:
+    # Stop then logged "make the laser safe by hand" for a laser the pulse's
+    # own cleanup had reset.
+    daq = FakeDaqmx(block_wait=True)
+    monkeypatch.setattr(nidaq_laser, "_load_nidaqmx", lambda: daq)
+    controller = NidaqLaserController(rig_lasers())
+    operation = controller.run_synchronized_pulse_train(LaserSynchronizedPulseTrain(
+        pulse_trains=(PULSE,), wait=False, timeout_seconds=0.2))
+    mark_closed = controller._mark_closed
+
+    def the_pulse_fails_meanwhile():
+        taken = mark_closed()
+        assert operation.wait_until_finished(5.0)
+        return taken
+
+    monkeypatch.setattr(controller, "_mark_closed", the_pulse_fails_meanwhile)
+    with caplog.at_level(logging.ERROR):
+        assert controller.close() is None
+
+    assert operation.state is LaserOperationState.FAILED
+    assert [record.getMessage() for record in caplog.records
+            if record.levelno >= logging.ERROR] == []
+    assert controller.work_left_running() == ()
+
+
 def test_an_interrupt_as_a_pulse_thread_starts_leaves_it_tracked(monkeypatch):
     # A KeyboardInterrupt can land in Thread.start() after the thread has
     # started, while start() waits for it: the pulse runs, and was marked
@@ -1143,3 +1171,29 @@ def test_a_never_woken_pulses_cancel_aborts_the_output_then_its_line(monkeypatch
     finally:
         daq.waits_released.set()
     assert operation.wait(5.0) is LaserOperationState.CANCELLED
+
+
+
+# ------------------------------------------------ the final fix round
+
+
+def test_a_command_reset_refused_after_a_cancel_is_critical(held, caplog):
+    # After a cancel the output holds the pulse's level until the cleanup
+    # puts the command back. That reset refused left it driven, and only an
+    # ERROR said so, the cancel's own error being the run's.
+    daq = held
+    controller = NidaqLaserController(_routed())
+    operation = _armed(controller, trigger_source="/PXI1Slot4/PXI_Trig0")
+    daq.failing_write = "laser_1_manual_ao"
+    try:
+        with caplog.at_level(logging.DEBUG):
+            assert operation.cancel()
+            assert operation.wait(1.0) is LaserOperationState.CANCELLED
+    finally:
+        daq.failing_write = None
+
+    critical = [record.getMessage() for record in caplog.records
+                if record.levelno == logging.CRITICAL]
+    assert len(critical) == 1
+    assert "Laser 1" in critical[0] and "PXI1Slot4/ao0" in critical[0]
+    assert "make the laser safe by hand" in critical[0]
