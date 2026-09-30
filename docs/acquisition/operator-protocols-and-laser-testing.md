@@ -294,6 +294,16 @@ edge, so use *external* only when an outside trigger is wired in. If no edge
 arrives, the pulse fails after the train length plus five seconds with *Wait
 Until Done did not indicate that the task was done*.
 
+Run Pulse stays available while a session is recording, and a pulse fired then
+is recorded in the session, in `streams/laser.csv`, as a manual laser event:
+when it was asked for, the laser, the profile (its saved name, or *builder
+draft*), the amplitude, the trigger mode and the route, then whether it
+completed, failed or was refused. A refused pulse drove nothing and is recorded
+as refused, never as fired. Its time is the host's, taken as Run Pulse calls
+the laser controller, so the output starts at or after it. A pulse fired while
+no session records is not recorded. Test stim stays refused while a session is
+recording.
+
 Stopping System Mode, or closing reachAQ, while a Run Pulse train is still
 running closes the shutters first, then cancels the train. A cancel, this
 one or a trial's, first closes the shutter of each of the pulse's lasers,
