@@ -942,6 +942,35 @@ def test_laser_trace_auto_resumes_and_displays_entire_calibration_ramp(qapp):
         laser.close()
 
 
+def test_a_manual_run_pulse_draws_its_train_as_any_pulse_does(qapp):
+    # Its waveform is stamped with the time it was asked for, for the
+    # session (LaserModel.run_pulse_train); the graph places a trace by its
+    # own x values, so it draws the same train. Its request and outcome have
+    # nothing to draw, and leave the status on the pulse.
+    laser, app_model, content = _laser_content_with_diode_stream()
+    try:
+        train = LaserPulseTrain(
+            channel_id=LaserChannelId.LASER_1, amplitude_volts=2.0, duration_ms=10.0,
+            baseline_ms=5.0)
+        expected = laser._make_pulse_trace(train)
+
+        laser.run_pulse_train(train, manual_context={
+            "profile_id": "burst", "profile_revision": 1, "trigger_mode": "internal"})
+
+        tab = _wait_for_laser_plot(content, minimum_points=len(expected.x_values))
+        command_x, command_y = tab._trace_data["command"]
+        # Drawn as seconds before the newest point, which is at 0.
+        assert list(command_x) == pytest.approx(
+            [x - expected.x_values[-1] for x in expected.x_values])
+        assert list(command_y) == pytest.approx(expected.command_volts)
+        assert tab._trace_status.text().endswith("latest: internal pulse")
+    finally:
+        content.on_close()
+        content.deleteLater()
+        app_model.nidaq_signal_monitor.close()
+        laser.close()
+
+
 def test_laser_control_reads_nidaq_samples_directly_from_shared_ring(qapp):
     channel = _laser_channel()
     configuration = LaserSystemConfiguration.from_channels(

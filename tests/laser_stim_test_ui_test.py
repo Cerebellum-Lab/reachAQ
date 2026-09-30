@@ -384,3 +384,67 @@ def test_run_pulse_drives_the_pmt_shutter_by_the_profiles_margins(
 
     assert train.enable_pmt_shutter is driven
     assert (train.pmt_shutter_open_delay_ms, train.pmt_shutter_close_delay_ms) == (lead, lag)
+
+
+def _fired(tab, started, app_model, monkeypatch):
+    """Press Run Pulse and run its operation; what the model was handed."""
+    calls = []
+    monkeypatch.setattr(
+        app_model.laser, "run_pulse_train",
+        lambda pulse_train, **options: calls.append((pulse_train, options)))
+    tab._run_pulse()
+    status, operation = started[-1]
+    assert status == "Running laser 1 pulse train"
+    operation()
+    return calls[-1]
+
+
+def test_run_pulse_hands_the_model_what_a_recording_keeps_of_it(
+    qapp, app_model, monkeypatch,
+):
+    # A Run Pulse fired while a session records is kept as a manual event
+    # naming its profile and trigger mode (Ben, 2026-09-30); only the tab
+    # knows those. The laser, amplitude and route come from the train.
+    with_one_listed_profile(monkeypatch, app_model)
+    with_saved_profile(monkeypatch, app_model, a_profile(revision=4))
+    tab, started, _statuses = make_tab(app_model, trigger_source="/Dev1/PXI_Trig0")
+    tab.stim_profile_selector.setCurrentIndex(tab.stim_profile_selector.findData("burst"))
+    tab._trigger_mode.setCurrentText("external")
+
+    train, options = _fired(tab, started, app_model, monkeypatch)
+
+    assert train.trigger_source == "/Dev1/PXI_Trig0"
+    assert options == {"manual_context": {
+        "profile_id": "burst", "profile_revision": 4, "trigger_mode": "external"}}
+
+
+def test_run_pulse_names_the_builder_draft_as_such(qapp, app_model, monkeypatch):
+    draft = LaserPulseProfile("builder-draft", 1, 0.5, 2.0)
+    tab, started, _statuses = make_tab(app_model, draft_provider=lambda: draft)
+    tab.stim_profile_selector.setCurrentIndex(
+        tab.stim_profile_selector.findData("builder-draft"))
+
+    _train, options = _fired(tab, started, app_model, monkeypatch)
+
+    assert options == {"manual_context": {
+        "profile_id": "builder draft", "profile_revision": None,
+        "trigger_mode": "internal"}}
+
+
+def test_a_laser_event_leaves_the_trace_note_on_what_was_drawn(channel_tab):
+    # A manual Run Pulse's request and outcome, like a protocol operation's
+    # events, have nothing to draw. Taken as an empty trace, each set the
+    # note to "calibration running", so every Run Pulse ended reading so.
+    from tools.acquisition.model.laser_model import LaserTraceBlock
+
+    tab, _started, _statuses = channel_tab
+    tab._set_trace_streaming(True)
+    tab.append_trace(LaserTraceBlock(
+        channel_id=LaserChannelId.LASER_1, source="internal pulse",
+        x_values=(0.0, 0.001), command_volts=(0.0, 1.0)))
+
+    for event in ("requested", "completed"):
+        tab.append_trace(LaserTraceBlock(
+            channel_id=LaserChannelId.LASER_1, source="manual pulse", event=event,
+            operation_id="manual-a"))
+        assert tab._trace_note == "latest: internal pulse"

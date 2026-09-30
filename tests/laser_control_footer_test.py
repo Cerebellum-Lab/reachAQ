@@ -150,7 +150,8 @@ def test_the_running_line_stays_until_the_operation_ends(panel, app_model, qapp,
     run_pulse_train = app_model.laser.run_pulse_train
     monkeypatch.setattr(
         app_model.laser, "run_pulse_train",
-        lambda pulse_train: release.wait(10.0) and run_pulse_train(pulse_train))
+        lambda pulse_train, **options: (
+            release.wait(10.0) and run_pulse_train(pulse_train, **options)))
     tab = panel._channel_tabs[0]
     _pick(tab, "short")
     try:
