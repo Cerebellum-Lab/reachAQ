@@ -12,6 +12,7 @@ separate import roots.
 
 import threading
 import time
+import warnings
 from types import SimpleNamespace
 
 from autotrainer.device import (
@@ -19,6 +20,18 @@ from autotrainer.device import (
     LaserChannelId,
     LaserSystemConfiguration,
 )
+
+
+class FakeDaqError(RuntimeError):
+    """A DAQmx error as nidaqmx raises one: its status code on error_code."""
+
+    def __init__(self, error_code, message):
+        super().__init__(f"DAQmx {error_code}: {message}")
+        self.error_code = error_code
+
+
+class FakeDaqWarning(UserWarning):
+    """A DAQmx warning, which nidaqmx issues through warnings.warn."""
 
 
 class FakeTask:
@@ -37,6 +50,8 @@ class FakeTask:
         self._waiter = None
         self._wait_over = threading.Event()
         self._wait_over.set()
+        #: Set while an abort is under way (FakeTask.control).
+        self._aborting = False
         self.ao_channels = SimpleNamespace(add_ao_voltage_chan=self._add)
         self.ai_channels = SimpleNamespace(add_ai_voltage_chan=self._add)
         self.do_channels = SimpleNamespace(add_do_chan=self._add_do)
@@ -109,6 +124,9 @@ class FakeTask:
         if self.daq.before_start is not None:
             self.daq.before_start(self)
         self.daq.fail_start(self)
+        # An abort before a start is a no-op: the task starts and runs as if
+        # none had been made (christielab10, H5c).
+        self.aborted.clear()
         self._reserve()
         self.started = True
         self.daq.starts.append(self.name)
@@ -120,9 +138,10 @@ class FakeTask:
         self._wait_over.clear()
         try:
             if self.daq.block_wait:
-                # With hold_waits set, the wait models a hung driver, or an
-                # armed task whose trigger never comes: it keeps waiting past
-                # its own timeout, until the test releases it.
+                # Without hold_waits, the wait times out at `timeout`, as the
+                # hardware's does. With it, the wait holds past its timeout,
+                # until the test releases it: a hung driver's, or a stand-in
+                # for a train long enough to outlast the test.
                 limit = self.daq.held_wait_limit if self.daq.hold_waits else timeout
                 deadline = time.monotonic() + limit
                 while not self._unblocked():
@@ -131,8 +150,8 @@ class FakeTask:
                             "DAQmx -200560: Wait Until Done did not indicate done")
                     time.sleep(0.005)
             if self.aborted.is_set():
-                raise RuntimeError(
-                    "DAQmx -88709: The specified operation cannot be performed "
+                raise FakeDaqError(
+                    -88709, "The specified operation cannot be performed "
                     "because a task has been aborted")
         finally:
             self._note("wait returned")
@@ -167,26 +186,57 @@ class FakeTask:
             return
         if self.daq.failing_abort and self.name.endswith(self.daq.failing_abort):
             raise RuntimeError(f"DAQmx refused to abort {self.name}")
+        # An abort takes a few ms (christielab10: 0.8 ms on an armed task,
+        # H8b; 12.6 ms on a running one, H8a). A wait on the task wakes as it
+        # begins (H8a: before the abort returned); a stop or a close made
+        # while it is under way raises -88710 (H8b, for the stop).
+        was_started = self.started
         self._note("abort")
-        self.aborted.set()
-        if self.daq.abort_releases:
-            self.started = False
-            self._release()
+        self._aborting = True
+        try:
+            self.aborted.set()
+            if self.daq.abort_releases:
+                self.started = False
+                self._release()
+            if self.daq.abort_seconds:
+                time.sleep(self.daq.abort_seconds)
+        finally:
+            self._aborting = False
+        self._note("abort returned")
+        if was_started:
+            # Aborting a running task warns, through warnings (H5b, H8a).
+            warnings.warn(FakeDaqWarning(
+                "200010: Finite acquisition or generation has been stopped "
+                "before the requested number of samples were acquired or "
+                "generated"))
+
+    def _refuse_while_aborting(self):
+        if self._aborting:
+            raise FakeDaqError(
+                -88710, "The specified operation cannot be performed because a "
+                "task is in the process of being aborted. Wait until the abort "
+                "operation is complete and attempt to perform the operation again")
 
     def stop(self):
-        # Measured (christielab10, H5a, 2026-09-29): a stop from another
-        # thread does not wake a wait on the task; it waits behind it, until
-        # the task ends by itself or the wait times out. Stop and clear on a
-        # task that was aborted are clean (H5b, H5c).
+        # A stop from another thread does not wake a wait on the task; it
+        # waits behind it, until the task ends by itself or the wait times
+        # out (christielab10, H5a). Made while an abort is under way, it
+        # raises -88710 (H8b). A stop after the abort has returned was not
+        # measured on its own; the fake takes it as clean.
         waiter = self._waiter
         if waiter is not None and waiter is not threading.current_thread():
             self._wait_over.wait(self.daq.held_wait_limit)
+        self._refuse_while_aborting()
         self._note("stop")
         self.started = False
         self._release()
 
     def close(self):
         self.daq.sick("task_close")
+        # A close made while an abort is under way is not measured; the fake
+        # takes it to fail as a stop does. After the abort, close is clean
+        # (H5b, H8a).
+        self._refuse_while_aborting()
         self._note("close")
         self.closed = True
         self.started = False
@@ -220,6 +270,8 @@ class FakeDaqmx:
         # A stop() from another thread never wakes a wait: it waits behind it
         # (FakeTask.stop, H5a). There is no option for the opposite, which
         # the hardware does not do.
+        #: How long an abort takes; a stop or close meanwhile raises -88710.
+        self.abort_seconds = 0.01
         #: Sick-driver behaviour, not DAQmx's: each call named here -
         #: "connect_terms", "disconnect_terms" or "task_close" - blocks until
         #: hang_released is set, as a call does inside a driver that has hung.

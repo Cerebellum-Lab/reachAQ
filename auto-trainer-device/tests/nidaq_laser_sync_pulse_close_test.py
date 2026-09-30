@@ -8,8 +8,10 @@ train to run out with the shutter state unmanaged.
 Nothing here touches a driver or a board (nidaq_daqmx_fake).
 """
 
+import logging
 import threading
 import time
+import warnings
 
 import pytest
 
@@ -410,3 +412,210 @@ def test_a_synchronous_run_without_a_close_returns_and_fails_as_before(monkeypat
     assert str(refused.value) == "DAQmx refused to start laser_sync_pulse_ao"
     assert controller._live_operations == {}
     assert daq.reserved == {}
+
+
+# ------------------------------------------------ round 5: the cancel's edges
+
+
+def _routed():
+    return rig_lasers(
+        trigger_source="/PXI1Slot4/PXI_Trig0", trigger_route_source="/PXI1Slot5/PFI0")
+
+
+def _events(daq, *wanted):
+    """The timeline's (event, task) pairs of these kinds, in order."""
+    return [(entry.event, entry.task, entry.data) for entry in daq.timeline
+            if (entry.event, entry.task) in wanted]
+
+
+@pytest.mark.parametrize("armed", ["board_stim", "deferred_then_triggered"])
+def test_a_cancel_just_before_the_start_is_not_lost(held, armed):
+    # The pulse looked for a cancel, then started its tasks with no look
+    # after: a cancel landing between them aborted tasks not yet started,
+    # which does nothing (H5c), and the train ran.
+    daq = held
+    controller = NidaqLaserController(_routed())
+    cancelled = []
+
+    def cancel_as_it_starts(task):
+        if task.name == "laser_sync_pulse_ao":
+            daq.before_start = None
+            operation, = controller._live_operations.values()
+            cancelled.append(operation)
+            operation.cancel()
+
+    if armed == "board_stim":
+        # Cancelled as it arms: the arming itself reports it.
+        daq.before_start = cancel_as_it_starts
+        with pytest.raises(RuntimeError, match="cancelled"):
+            _armed(controller, trigger_source="/PXI1Slot4/PXI_Trig0")
+        operation, = cancelled
+    else:
+        operation = _armed(controller, defer_start=True)
+        daq.before_start = cancel_as_it_starts
+        operation.trigger()
+
+    assert operation.wait_until_finished(1.0) is True
+    assert operation.state is LaserOperationState.CANCELLED
+    assert daq.writes_to("PXI1Slot4/ao0", task_suffix="manual_ao")[-1] == 0.0
+    assert daq.task("laser_1_shutter").writes[-1] is False
+
+
+def test_cancelling_an_armed_deferred_pulse_logs_no_error(held, caplog):
+    # H8b: the cancel woke the deferred wait before it aborted, and the
+    # pulse's cleanup stopped the task while the abort was under way:
+    # -88710, and two ERROR lines, on a cancel that went as it should.
+    daq = held
+    controller = NidaqLaserController(_routed())
+    operation = _armed(controller, defer_start=True)
+
+    with caplog.at_level("DEBUG"):
+        assert operation.cancel()
+        assert operation.wait(1.0) is LaserOperationState.CANCELLED
+
+    assert not [record.getMessage() for record in caplog.records
+                if record.levelno >= logging.ERROR]
+    assert daq.writes_to("PXI1Slot4/ao0", task_suffix="manual_ao")[-1] == 0.0
+
+
+def test_cancelling_a_running_pulse_logs_no_error(held, caplog):
+    # Its wait wakes as the abort begins, and its cleanup's stop can meet the
+    # abort still under way (-88710): that is the abort finishing, retried.
+    daq = held
+    controller = NidaqLaserController(_routed())
+    operation = _armed(controller, trigger_source="/PXI1Slot4/PXI_Trig0")
+
+    with caplog.at_level("DEBUG"):
+        assert operation.cancel()
+        assert operation.wait(1.0) is LaserOperationState.CANCELLED
+
+    assert not [record.getMessage() for record in caplog.records
+                if record.levelno >= logging.ERROR]
+    assert ("stop", "laser_sync_pulse_ao", None) in _events(
+        daq, ("stop", "laser_sync_pulse_ao"))
+
+
+def test_a_stop_that_fails_otherwise_is_still_an_error(monkeypatch, caplog):
+    daq = FakeDaqmx()
+    monkeypatch.setattr(nidaq_laser, "_load_nidaqmx", lambda: daq)
+    controller = NidaqLaserController(rig_lasers())
+    task = daq.Task("some_task")
+
+    def refused():
+        raise RuntimeError("DAQmx -50103: the resource is reserved")
+
+    task.stop = refused
+    errors = []
+    with caplog.at_level("DEBUG"):
+        controller._stop_and_close_task("some task", task, errors)
+
+    assert [location for location, _error in errors] == ["some task stop"]
+    assert any(record.levelno == logging.ERROR for record in caplog.records)
+
+
+def test_a_cancel_closes_the_pulses_shutter_before_it_aborts(held):
+    # close() closes the shutters first; a trial's cancel went straight to
+    # the abort, and the light stayed on for the abort and the reset, about
+    # 14 ms on the 6713 (H8a).
+    daq = held
+    controller = NidaqLaserController(_routed())
+    operation = _armed(controller, trigger_source="/PXI1Slot4/PXI_Trig0")
+    assert daq.task("laser_1_shutter").writes[-1] is True
+    marked = len(daq.timeline)
+
+    assert operation.cancel()
+    assert operation.wait(1.0) is LaserOperationState.CANCELLED
+
+    after = [(entry.event, entry.task, entry.data) for entry in daq.timeline[marked:]]
+    shut = after.index(("write", "laser_1_shutter", False))
+    abort = after.index(("abort", "laser_sync_pulse_ao", None))
+    reset = after.index(("write", "laser_1_manual_ao", 0.0))
+    assert shut < abort < reset
+
+
+def test_a_cancel_after_the_pulse_has_finished_changes_nothing(monkeypatch):
+    # A cancel between the waits returning and the end marked the delivered
+    # pulse CANCELLED, skipped its baseline, and aborted tasks its own thread
+    # was closing.
+    daq = FakeDaqmx()
+    monkeypatch.setattr(nidaq_laser, "_load_nidaqmx", lambda: daq)
+    controller = NidaqLaserController(rig_lasers())
+    stop_and_close = controller._stop_and_close_task
+    results, operations = [], []
+
+    def cancel_then_close(name, task, errors):
+        if not results:
+            operation, = controller._live_operations.values()
+            operations.append(operation)
+            canceller = threading.Thread(target=lambda: results.append(operation.cancel()))
+            canceller.start()
+            canceller.join(5.0)
+        return stop_and_close(name, task, errors)
+
+    monkeypatch.setattr(controller, "_stop_and_close_task", cancel_then_close)
+
+    controller.run_pulse_train(PULSE)
+
+    assert results == [False]
+    operation, = operations
+    assert operation.state is LaserOperationState.COMPLETED
+    assert not [entry for entry in daq.timeline if entry.event == "abort"]
+
+
+def test_a_pulse_close_gave_up_on_puts_the_command_back_when_it_ends(monkeypatch):
+    # Past its wait, close() reset the output against the pulse's still-open
+    # task (-50103) and let go of the channel tasks; the pulse's own late
+    # reset then went through those tasks, and failed too (KeyError): the
+    # output held its last sample until reachAQ restarted.
+    monkeypatch.setattr(nidaq_laser, "_OPERATION_CANCEL_TIMEOUT_S", 0.2)
+    # A sick driver: its abort neither wakes the wait nor lets go of ao0.
+    daq = FakeDaqmx(block_wait=True, hold_waits=True, abort_unblocks=False,
+                    abort_releases=False)
+    monkeypatch.setattr(nidaq_laser, "_load_nidaqmx", lambda: daq)
+    controller = NidaqLaserController(rig_lasers())
+    try:
+        operation = _armed(controller)
+        with pytest.raises(RuntimeError, match="channel 1 reset"):
+            controller.close()
+        assert operation._thread.is_alive()
+
+        daq.waits_released.set()
+        operation._thread.join(5.0)
+
+        assert not operation._thread.is_alive()
+        assert daq.writes_to("PXI1Slot4/ao0", task_suffix="manual_ao",
+                             thread=operation._thread)[-1] == 0.0
+    finally:
+        daq.waits_released.set()
+
+
+def test_the_aborts_warning_is_kept_to_the_log(held, caplog):
+    # Aborting a running task warns (DaqWarning 200010, H5b, H8a), through
+    # Python's warnings, onto stderr. It is the abort doing what was asked.
+    controller = NidaqLaserController(_routed())
+    operation = _armed(controller, trigger_source="/PXI1Slot4/PXI_Trig0")
+
+    with warnings.catch_warnings(record=True) as escaped:
+        warnings.simplefilter("always")
+        with caplog.at_level("DEBUG"):
+            assert operation.cancel()
+            assert operation.wait(1.0) is LaserOperationState.CANCELLED
+
+    assert [str(warning.message) for warning in escaped] == []
+    assert any("200010" in record.getMessage() and record.levelno == logging.DEBUG
+               for record in caplog.records)
+
+
+def test_a_waited_for_pulse_cancelled_by_itself_says_cancelled_not_closed(held):
+    daq = held
+    controller = NidaqLaserController(rig_lasers())
+    pulse_thread, pulse_outcome = _in_thread(controller.run_pulse_train, PULSE)
+    _wait_for(lambda: _pulse_is_running(daq))
+    operation, = controller._live_operations.values()
+
+    assert operation.cancel()
+    pulse_thread.join(5.0)
+
+    error, = pulse_outcome
+    assert str(error) == f"Laser operation {operation.operation_id} was cancelled"
+    assert operation.wait_until_finished(1.0) is True

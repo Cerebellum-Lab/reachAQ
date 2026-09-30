@@ -55,6 +55,9 @@ def test_closing_the_controller_mid_ramp_stops_the_ramp_and_resets_the_laser(daq
     # thread while the ramp thread waits inside DAQmx. The ramp's tasks hold
     # the analog output, so the command reset in close() failed at -50103,
     # and the 6713 kept its last sample with the shutter open.
+    # The interleaving is the test's own: an abort that takes no time,
+    # so the ramp lets go only when the test says.
+    daq.abort_seconds = 0.0
     daq.block_wait = True
     controller = NidaqLaserController(_rig_lasers())
     outcome = []
@@ -408,6 +411,9 @@ def test_an_abort_the_ramps_own_cleanup_overtakes_is_not_a_failure(daq, caplog):
     # while close() was still on its way to the second: that abort met a
     # closed task, and close() reported a "calibration task abort" failure
     # on a laser that was reset.
+    # The interleaving is the test's own: an abort that takes no time,
+    # so the ramp lets go only when the test says.
+    daq.abort_seconds = 0.0
     daq.block_wait = True
     daq.hold_waits = True
     controller = NidaqLaserController(_rig_lasers())

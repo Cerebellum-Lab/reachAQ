@@ -8,6 +8,7 @@ import numbers
 import threading
 import time
 import uuid
+import warnings
 from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 from autotrainer.core import NidaqTimingPlan
@@ -39,9 +40,16 @@ _CALIBRATION_RELEASE_TIMEOUT_S = 5.0
 #: How long close() waits for each pulse train it cancels to end.
 _OPERATION_CANCEL_TIMEOUT_S = 5.0
 #: How long a path that cancels a pulse and goes on waits for it to end,
-#: so that what it does next finds the board free. The abort ends it in
-#: milliseconds (H5b: about 40 ms); this bounds a sick driver.
-_CANCEL_SETTLE_S = 2.0
+#: so that what it does next finds the board free; the one bound for every
+#: such path, the application's too. The abort ends it in milliseconds
+#: (christielab10, H8a: the wait woke 11.9 ms after the cancel); this bounds
+#: a sick driver.
+CANCELLED_OPERATION_WAIT_S = 2.0
+#: How long a stop or close keeps trying while an abort is still finishing:
+#: DAQmx refuses either then with -88710 (H8b).
+_ABORT_FINISHING_S = 0.2
+#: DAQmx's status for "a task is in the process of being aborted".
+_ABORT_IN_PROGRESS = -88710
 #: How long a controller that failed to open waits for its own close, of
 #: what it had opened, before it raises; as long as the application waits
 #: for any laser close.
@@ -85,8 +93,16 @@ class NidaqLaserOperation:
     }
 
     def __init__(self, *, resources, context=None, terminal_callback=None,
-                 abort_task=None):
+                 abort_task=None, before_abort=None):
         self.operation_id = str(uuid.uuid4())
+        #: Called by cancel() before any abort: closes the pulse's shutter,
+        #: as close() closes the shutters first. After an abort the output
+        #: holds its amplitude until the cleanup's reset, about 14 ms on the
+        #: 6713 (H8a); with the shutter closed the light is off for it.
+        self._before_abort = before_abort
+        #: Set once the pulse's waits have returned: it was delivered, and a
+        #: cancel from then on changes nothing (_mark_finishing).
+        self._finishing = False
         #: How cancel() ends a bound task that is running or armed: TASK_ABORT,
         #: given by the controller. A stop() from another thread waits behind
         #: the operation's own wait on the task, until the task ends or the
@@ -125,6 +141,10 @@ class NidaqLaserOperation:
         with self._lock:
             return tuple(self._observations)
 
+    def wait_until_finished(self, timeout=None) -> bool:
+        """Wait for the operation to end, cleanup included; whether it has."""
+        return self._done.wait(timeout)
+
     def wait(self, timeout=None):
         if not self._done.wait(timeout):
             raise TimeoutError(f"Laser operation {self.operation_id} did not finish")
@@ -146,11 +166,16 @@ class NidaqLaserOperation:
     def cancel(self):
         tasks = ()
         with self._lock:
-            if self._state in self.TERMINAL:
+            if self._state in self.TERMINAL or self._finishing:
                 return False
             self._transition_locked(LaserOperationState.CANCELLED, "cancel requested")
             tasks = self._tasks
-            self._start_requested.set()
+        # The pulse's shutter first, as close() closes the shutters first.
+        if self._before_abort is not None:
+            try:
+                self._before_abort()
+            except Exception:
+                logger.exception("Failed to close the laser shutter before a cancel's abort")
         # Aborted, not stopped: the operation's own thread is in the task's
         # wait, which the abort ends at once. That thread, finding the
         # operation cancelled, ends it CANCELLED, not FAILED, and cleans up.
@@ -160,6 +185,10 @@ class NidaqLaserOperation:
                     self._abort_task(task)
             except Exception:
                 logger.debug("Laser task abort during cancellation failed", exc_info=True)
+        # A deferred pulse is woken only now: woken before the aborts had
+        # returned, its cleanup stopped a task still being aborted, -88710
+        # (christielab10, H8b).
+        self._start_requested.set()
         return True
 
     def trigger(self):
@@ -220,6 +249,14 @@ class NidaqLaserOperation:
     def _require_not_cancelled(self):
         if self.state is LaserOperationState.CANCELLED:
             raise RuntimeError("Laser operation was cancelled before arming")
+
+    def _mark_finishing(self) -> bool:
+        """The pulse's waits have returned; False when a cancel came first."""
+        with self._lock:
+            if self._state is LaserOperationState.CANCELLED:
+                return False
+            self._finishing = True
+            return True
 
     def _mark_triggered(self, detail="waveform completed after trigger"):
         with self._lock:
@@ -528,6 +565,7 @@ class NidaqLaserController:
                 context=pulse_train.operation_context,
                 terminal_callback=self._release_operation,
                 abort_task=self._abort_task,
+                before_abort=lambda: self._close_pulse_shutters(pulse_train),
             )
             self._live_operations[operation.operation_id] = operation
 
@@ -565,10 +603,12 @@ class NidaqLaserController:
             operation._thread = threading.current_thread()
             execute()
             if operation.state is LaserOperationState.CANCELLED:
-                # Not the DAQmx error the cancel's stop provoked.
+                # Not the DAQmx error the cancel's abort provoked (-88709).
+                # A close says so; a cancel alone is only a cancel.
                 raise RuntimeError(
-                    f"Laser operation {operation.operation_id} was cancelled: "
-                    "the laser controller was closed while it ran")
+                    f"Laser operation {operation.operation_id} was cancelled"
+                    + (": the laser controller was closed while it ran"
+                       if getattr(self, "_closed", False) else ""))
             if operation.error is not None:
                 raise operation.error
             return None
@@ -595,13 +635,37 @@ class NidaqLaserController:
         except Exception:
             operation.cancel()
             # Ended before this returns, so a retry finds the board free.
-            operation._done.wait(_CANCEL_SETTLE_S)
+            if not operation.wait_until_finished(CANCELLED_OPERATION_WAIT_S):
+                logger.warning(
+                    "The cancelled laser operation %s had not ended %.1f s later; "
+                    "a pulse armed next on its board is refused until it does",
+                    operation.operation_id, CANCELLED_OPERATION_WAIT_S)
             raise
         return operation
 
+    def _close_pulse_shutters(self, pulse_train) -> None:
+        """Close the shutters this pulse opens, for a cancel, before its abort."""
+        for channel_pulse in pulse_train.pulse_trains:
+            if not channel_pulse.open_shutter:
+                continue
+            channel = self._configuration.get_channel(channel_pulse.channel_id)
+            if channel.channel_id in getattr(self, "_tasks", {}):
+                self.set_shutter_open(channel.channel_id, False)
+
     def _abort_task(self, task) -> None:
-        """TASK_ABORT on one of an operation's tasks, from any thread."""
-        task.control(self._nidaqmx.constants.TaskMode.TASK_ABORT)
+        """TASK_ABORT on one of an operation's tasks, from any thread.
+
+        Aborting a running task warns, DaqWarning 200010 (H5b, H8a): it is
+        the abort doing what was asked, kept to the log at DEBUG rather than
+        stderr. Recording warnings is process-wide for the abort's few ms, so
+        one another thread warns meanwhile is logged here too.
+        """
+        with warnings.catch_warnings(record=True) as warned:
+            warnings.simplefilter("always")
+            task.control(self._nidaqmx.constants.TaskMode.TASK_ABORT)
+        for warning in warned:
+            logger.debug("Aborting %s warned, as an abort does: %s",
+                         getattr(task, "name", task), warning.message)
 
     def _board_refusal(self, pulse_train, conflicts, boards) -> str:
         """Why a pulse is refused while another holds its board, briefly first.
@@ -805,6 +869,11 @@ class NidaqLaserController:
             for task in digital_tasks:
                 task.start()
             ao_task.start()
+            if operation is not None and operation.state is LaserOperationState.CANCELLED:
+                # A cancel between the look above and the starts aborted
+                # tasks not yet started, which does nothing (H5c): the train
+                # would run. Ended here instead, as a cancel.
+                raise RuntimeError("Laser operation was cancelled as it started")
             if operation is not None:
                 if pulse_train.defer_start:
                     operation._mark_triggered("NI software start accepted")
@@ -816,6 +885,8 @@ class NidaqLaserController:
                 task.wait_until_done(timeout=timeout_seconds)
             if operation is not None:
                 operation._mark_triggered()
+                if not operation._mark_finishing():
+                    raise RuntimeError("Laser operation was cancelled as it ended")
         except Exception as exc:
             run_error = exc
             raise
@@ -1117,14 +1188,27 @@ class NidaqLaserController:
         # shutters. The digital lines and routes come after.
         for channel in channels:
             try:
-                self.set_command_voltage(channel.channel_id, channel.minimum_command_volts)
+                if channel.channel_id in self._tasks:
+                    self.set_command_voltage(channel.channel_id, channel.minimum_command_volts)
+                else:
+                    # close() has let go of the channel's tasks: past its wait
+                    # for this pulse, its own reset met this pulse's open task
+                    # (-50103). Written here, the task now closed, as the
+                    # ramp's closed branch does.
+                    self._write_transient_analog_sample(
+                        channel, channel.minimum_command_volts)
             except Exception as exc:
                 errors.append((f"channel {channel.channel_id.value} command reset", exc))
                 logger.exception("Failed to reset NI-DAQ laser command for channel %s", channel.channel_id.value)
         for channel, channel_pulse in zip(channels, channel_pulses):
             if channel_pulse.close_shutter:
                 try:
-                    self.set_shutter_open(channel.channel_id, False)
+                    if channel.channel_id in self._tasks:
+                        self.set_shutter_open(channel.channel_id, False)
+                    else:
+                        self._write_transient_digital_line(
+                            channel.shutter_output, False,
+                            f"laser_{channel.channel_id.value}_shutter_reset")
                 except Exception as exc:
                     errors.append((f"channel {channel.channel_id.value} shutter close", exc))
                     logger.exception("Failed to close NI-DAQ laser shutter for channel %s", channel.channel_id.value)
@@ -1217,15 +1301,34 @@ class NidaqLaserController:
 
     def _stop_and_close_task(self, name: str, task: object, errors: list) -> None:
         try:
-            task.stop()
+            self._retry_while_aborting(task.stop, name)
         except Exception as exc:
             errors.append((f"{name} stop", exc))
             logger.exception("Failed to stop %s", name)
         try:
-            task.close()
+            self._retry_while_aborting(task.close, name)
         except Exception as exc:
             errors.append((f"{name} close", exc))
             logger.exception("Failed to close %s", name)
+
+    @staticmethod
+    def _retry_while_aborting(call, name: str):
+        """`call`, tried again while DAQmx says an abort is still finishing.
+
+        A stop made while the task is being aborted raises -88710 (H8b), by
+        its status code, not its text; for a close the same is assumed, not
+        measured. Anything else, or past the bound, is raised as it was.
+        """
+        deadline = time.monotonic() + _ABORT_FINISHING_S
+        while True:
+            try:
+                return call()
+            except Exception as error:
+                if (getattr(error, "error_code", None) != _ABORT_IN_PROGRESS
+                        or time.monotonic() >= deadline):
+                    raise
+                logger.debug("%s: an abort is still finishing (-88710); again", name)
+                time.sleep(0.005)
 
     def _raise_or_log_cleanup_errors(
         self,
@@ -1393,7 +1496,7 @@ class NidaqLaserController:
             if self._calibration_task_released(task):
                 continue
             try:
-                task.control(self._nidaqmx.constants.TaskMode.TASK_ABORT)
+                self._abort_task(task)
             except Exception as exc:
                 if self._calibration_task_released(task):
                     # Taken by that cleanup while this aborted it: the abort

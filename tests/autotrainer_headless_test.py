@@ -1399,6 +1399,28 @@ def test_a_trial_cancel_ends_the_pulse_at_once_and_it_can_be_armed_again(monkeyp
         model.close()
 
 
+def test_a_close_whose_look_at_what_it_left_raises_still_lets_laser_work_go(
+    app_model, monkeypatch, caplog,
+):
+    # The finished close was taken off only by the hand-off, and the look
+    # at what it left running raising lost the hand-off: listed, it refused
+    # laser work until reachAQ restarted.
+    _system_mode_with_the_fake_laser(app_model, monkeypatch, lasers=_ROUTED_LASER)
+
+    def broken():
+        raise RuntimeError("the controller could not say")
+
+    monkeypatch.setattr(app_model.laser, "work_left_running_after_close", broken)
+    with caplog.at_level("ERROR"):
+        app_model.capture_stop()
+
+    assert app_model.laser_controller_close_refusal() == ""
+    assert any("could not say" in (record.getMessage() + str(record.exc_info))
+               for record in caplog.records if record.levelname == "ERROR")
+    assert app_model.capture_start() is True
+    app_model.capture_stop()
+
+
 def test_a_close_already_under_way_is_waited_for_not_run_twice(app_model, monkeypatch):
     # Stop and closing can each close the laser: one that came while the
     # other's close was still inside its bound ran a second close on the
