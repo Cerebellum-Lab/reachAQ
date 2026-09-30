@@ -496,3 +496,54 @@ def test_the_cycle_takes_the_waveforms_length_from_the_profile(monkeypatch):
     monkeypatch.setattr(LaserPulseProfile, "waveform_seconds", property(lambda _self: 42.0))
 
     assert _cycle_end_wait() == [43.0]
+
+
+# ------------------------------------------------ a refused laser, as recorded
+
+
+def test_a_laser_the_controller_refuses_is_recorded_as_a_refusal(monkeypatch):
+    # The preparation error is "<type>: <message>". A pulse refused before it
+    # drove anything reads LaserPulseRefused, which says more than the
+    # RuntimeError it read before affb7491; kept, and documented (controller
+    # ruling, workstream D).
+    from autotrainer.device import (
+        LaserChannelId, LaserPulseTrain, LaserSynchronizedPulseTrain)
+    from autotrainer.device.laser import LaserPulseRefused
+    from laser_model_test import _nidaq_model
+
+    model, _daq = _nidaq_model(monkeypatch)
+    # A pulse of Test stim's, say, holds laser 1's board.
+    holder = model.run_synchronized_pulse_train(LaserSynchronizedPulseTrain(
+        pulse_trains=(LaserPulseTrain(
+            channel_id=LaserChannelId.LASER_1, amplitude_volts=1.0, duration_ms=1.0),),
+        wait=False, defer_start=True, timeout_seconds=30.0))
+    row = TrialProtocolRow(trial_id=1).with_updates({
+        "enabled": True,
+        "laser_profile_id": "pulse",
+        "laser_phase": "pellet_presentation",
+        "laser_trigger_route": "hardware_stim3",
+        "laser_channel_id": 1,
+        "stimulus_assignment": "always",
+        "stimulus_trigger": "tone_1",
+    })
+    recipe = _compiler().compile(row, _context())
+    executor = TrialActionExecutor(
+        move_absolute=lambda target: None,
+        configure_cover=lambda policy, recipe: None,
+        play_tone=lambda profile, phase: None,
+        prepare_laser=lambda profile, recipe: model.prepare_pulse_profile(
+            profile, recipe.laser_firing, recipe),
+        cancel_laser=lambda handle: handle.cancel(),
+    )
+    try:
+        with pytest.raises(LaserPulseRefused):
+            executor.prepare(recipe)
+
+        failed = executor.operation.to_record()["observations"][-1]
+        assert failed["state"] == PreparedState.FAILED.value
+        assert failed["detail"].startswith(
+            "LaserPulseRefused: Laser 1: refused while the pulse on laser 1 holds")
+    finally:
+        holder.cancel()
+        holder.wait_until_finished(5.0)
+        model.close()

@@ -65,7 +65,13 @@ Before SEND, the action executor reserves the future row and freezes its protoco
 revision, resolves the animal base/lane/shift to one absolute DCS target and one
 motor target, waits for motor and cover acknowledgements, and arms any laser
 task. A failure here is persisted as a preparation error but creates no pellet
-attempt. SEND acceptance creates the physical attempt and binds its CAN context.
+attempt. Its text, the failed step's detail in the action lifecycle, is the
+error's type and message, *"<type>: <message>"*. A laser pulse the controller
+refuses before it drives anything - another pulse holds the laser's board, the
+controller is closed, or the laser configuration cannot run it - reads
+*"LaserPulseRefused: Laser 1: refused while ..."*. Sessions recorded before
+2026-09-30 read *"RuntimeError: ..."* for the same refusals. SEND acceptance
+creates the physical attempt and binds its CAN context.
 
 Every send attempt receives the immutable row, compiled recipe, resolved target,
 stimulus draw, profile revisions, and action lifecycle in `streams/trials.jsonl`.
