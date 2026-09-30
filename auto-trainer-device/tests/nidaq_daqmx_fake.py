@@ -34,10 +34,18 @@ class FakeDaqWarning(UserWarning):
     """A DAQmx warning, which nidaqmx issues through warnings.warn."""
 
 
+#: nidaqmx's text for the warning an abort of a running task gives (H8a).
+ABORT_WARNING_TEXT = (
+    "\nWarning 200010 occurred.\n\nFinite acquisition or generation has been "
+    "stopped before the requested number of samples were acquired or generated.")
+
+
 class FakeTask:
     def __init__(self, daq, name):
         self.daq = daq
-        self.name = name
+        #: The name the task was made with, as the fake and the tests read
+        #: it; `name` is nidaqmx's, a driver query.
+        self.label = name
         self.channels = []
         self.timing_kwargs = None
         self.writes = []
@@ -50,8 +58,10 @@ class FakeTask:
         self._waiter = None
         self._wait_over = threading.Event()
         self._wait_over.set()
-        #: Set while an abort is under way (FakeTask.control).
-        self._aborting = False
+        #: Set while an abort of a task never started is under way.
+        self._aborting_unstarted = False
+        #: Set once the task is closed, for an abort to wait on.
+        self._closed_event = threading.Event()
         self.ao_channels = SimpleNamespace(add_ao_voltage_chan=self._add)
         self.ai_channels = SimpleNamespace(add_ai_voltage_chan=self._add)
         self.do_channels = SimpleNamespace(add_do_chan=self._add_do)
@@ -62,6 +72,15 @@ class FakeTask:
         self.triggers = SimpleNamespace(start_trigger=SimpleNamespace(
             cfg_dig_edge_start_trig=self._start_trigger))
 
+    @property
+    def name(self):
+        # nidaqmx's Task.name asks the driver, and a task already cleared
+        # answers -200088 (christielab10, H8c: read after an abort the
+        # pulse's own thread had closed the task within).
+        if self.closed:
+            raise FakeDaqError(-200088, "Task specified is invalid or does not exist")
+        return self.label
+
     def _add(self, channel, **_kwargs):
         self.channels.append(channel)
 
@@ -69,7 +88,7 @@ class FakeTask:
         """On the fake's timeline: when, on which thread, what, to which task."""
         self.daq.timeline.append(SimpleNamespace(
             time=time.monotonic(), thread=threading.current_thread(),
-            event=event, task=self.name, data=data))
+            event=event, task=self.label, data=data))
 
     def _add_do(self, channel, **_kwargs):
         self.do_channels_added = True
@@ -84,7 +103,7 @@ class FakeTask:
             # is empty, and TASK_VERIFY refuses a clocked DO start trigger.
             raise RuntimeError(
                 "DAQmx -200452: Specified property is not supported by the "
-                f"device or is not applicable to the task ({self.name})")
+                f"device or is not applicable to the task ({self.label})")
         self.start_trigger = (source, trigger_edge)
 
     def _reserve(self):
@@ -92,7 +111,7 @@ class FakeTask:
             holder = self.daq.reserved.get(channel)
             if holder is not None and holder is not self:
                 raise RuntimeError(
-                    f"DAQmx -50103: {channel} is reserved by {holder.name}")
+                    f"DAQmx -50103: {channel} is reserved by {holder.label}")
         for channel in self.channels:
             self.daq.reserved[channel] = self
 
@@ -114,7 +133,7 @@ class FakeTask:
         # command reset makes a task of the same name, so the last write
         # alone cannot tell whose it was.
         self.daq.writes.append(SimpleNamespace(
-            task=self.name,
+            task=self.label,
             channels=tuple(self.channels),
             data=data,
             thread=threading.current_thread(),
@@ -129,8 +148,8 @@ class FakeTask:
         self.aborted.clear()
         self._reserve()
         self.started = True
-        self.daq.starts.append(self.name)
-        self.daq.log.append(("start", self.name))
+        self.daq.starts.append(self.label)
+        self.daq.log.append(("start", self.label))
         self._note("start")
 
     def wait_until_done(self, timeout):
@@ -174,44 +193,55 @@ class FakeTask:
     def control(self, mode):
         if self.daq.before_control is not None:
             self.daq.before_control(self)
-        self.daq.controlled.append((self.name, mode))
+        self.daq.controlled.append((self.label, mode))
         if self.closed:
             # The fake's model of a call on a task already cleared.
-            raise RuntimeError(f"{self.name} was closed before it was aborted")
+            raise RuntimeError(f"{self.label} was closed before it was aborted")
         if mode == "commit":
-            if self.daq.failing_commit and self.name.endswith(self.daq.failing_commit):
-                raise RuntimeError(f"DAQmx refused to commit {self.name}")
+            if self.daq.failing_commit and self.label.endswith(self.daq.failing_commit):
+                raise RuntimeError(f"DAQmx refused to commit {self.label}")
             # Programmed on the board, and started later; nothing else here.
-            self.daq.log.append(("commit", self.name))
+            self.daq.log.append(("commit", self.label))
             return
-        if self.daq.failing_abort and self.name.endswith(self.daq.failing_abort):
-            raise RuntimeError(f"DAQmx refused to abort {self.name}")
-        # An abort takes a few ms (christielab10: 0.8 ms on an armed task,
-        # H8b; 12.6 ms on a running one, H8a). A wait on the task wakes as it
-        # begins (H8a: before the abort returned); a stop or a close made
-        # while it is under way raises -88710 (H8b, for the stop).
+        if self.daq.failing_abort and self.label.endswith(self.daq.failing_abort):
+            raise RuntimeError(f"DAQmx refused to abort {self.label}")
+        # As measured on christielab10:
+        # - running (H8a, H8c on the 6713's AO): the abort takes about 13 ms;
+        #   the owner's wait is woken near its end (11.9 and 15.0 ms), and the
+        #   owner stops and clears the task before the abort returns, cleanly.
+        #   The fake returns once the owner has closed the task, bounded;
+        #   with abort_seconds 0, at once, the rest ordered by the test;
+        # - never started, its buffer written (H8b): the abort takes about
+        #   1 ms, and a stop made meanwhile raised -88710.
         was_started = self.started
+        waited_on = self._waiter is not None
         self._note("abort")
-        self._aborting = True
+        self._aborting_unstarted = not was_started
         try:
             self.aborted.set()
             if self.daq.abort_releases:
                 self.started = False
                 self._release()
-            if self.daq.abort_seconds:
+            if (was_started and waited_on and self.daq.abort_unblocks
+                    and self.daq.abort_seconds):
+                self._closed_event.wait(self.daq.abort_seconds + 0.5)
+            elif self.daq.abort_seconds:
                 time.sleep(self.daq.abort_seconds)
         finally:
-            self._aborting = False
+            self._aborting_unstarted = False
         self._note("abort returned")
         if was_started:
-            # Aborting a running task warns, through warnings (H5b, H8a).
-            warnings.warn(FakeDaqWarning(
-                "200010: Finite acquisition or generation has been stopped "
-                "before the requested number of samples were acquired or "
-                "generated"))
+            # Aborting a running task warns, through warnings.warn, with
+            # nidaqmx's own text (H5b, H8a).
+            warnings.warn(FakeDaqWarning(ABORT_WARNING_TEXT))
 
-    def _refuse_while_aborting(self):
-        if self._aborting:
+    def _refuse_while_aborting(self, what):
+        # Only while a never-started task is being aborted (H8b). A stop or
+        # close of a running task's owner, woken by its abort, is clean even
+        # before the abort returns (H8a, H8c). A refusal is on the timeline,
+        # as "stop refused" or "close refused".
+        if self._aborting_unstarted:
+            self._note(f"{what} refused")
             raise FakeDaqError(
                 -88710, "The specified operation cannot be performed because a "
                 "task is in the process of being aborted. Wait until the abort "
@@ -220,25 +250,27 @@ class FakeTask:
     def stop(self):
         # A stop from another thread does not wake a wait on the task; it
         # waits behind it, until the task ends by itself or the wait times
-        # out (christielab10, H5a). Made while an abort is under way, it
-        # raises -88710 (H8b). A stop after the abort has returned was not
-        # measured on its own; the fake takes it as clean.
+        # out (christielab10, H5a). Made while a never-started task is being
+        # aborted, it raises -88710 (H8b); after an abort, and by a woken
+        # owner during one, it is clean (H8a, H8b again, H8c).
         waiter = self._waiter
         if waiter is not None and waiter is not threading.current_thread():
             self._wait_over.wait(self.daq.held_wait_limit)
-        self._refuse_while_aborting()
+        self._refuse_while_aborting("stop")
         self._note("stop")
         self.started = False
         self._release()
 
     def close(self):
         self.daq.sick("task_close")
-        # A close made while an abort is under way is not measured; the fake
-        # takes it to fail as a stop does. After the abort, close is clean
-        # (H5b, H8a).
-        self._refuse_while_aborting()
+        # By a woken owner during a running task's abort, clean (H8a, H8c);
+        # after an abort, clean (H5b, H8b again). During a never-started
+        # task's abort it is not measured: the fake takes it to fail as the
+        # stop does.
+        self._refuse_while_aborting("close")
         self._note("close")
         self.closed = True
+        self._closed_event.set()
         self.started = False
         self._release()
 
@@ -270,7 +302,10 @@ class FakeDaqmx:
         # A stop() from another thread never wakes a wait: it waits behind it
         # (FakeTask.stop, H5a). There is no option for the opposite, which
         # the hardware does not do.
-        #: How long an abort takes; a stop or close meanwhile raises -88710.
+        #: How long an abort of a task no one waits on takes; a running
+        #: task's returns once its woken owner has closed it (FakeTask.control).
+        #: 0 makes every abort return at once, whatever the owner does: a
+        #: test that sets it orders what follows itself.
         self.abort_seconds = 0.01
         #: Sick-driver behaviour, not DAQmx's: each call named here -
         #: "connect_terms", "disconnect_terms" or "task_close" - blocks until
@@ -315,6 +350,8 @@ class FakeDaqmx:
         #: rig's M Series boards say no (do_trig_usage empty, -200452 at
         #: verify, 2026-09-25); an X Series board would say yes.
         self.do_takes_start_trigger = do_takes_start_trigger
+        #: As nidaqmx.errors: the category DAQmx warnings are issued with.
+        self.errors = SimpleNamespace(DaqWarning=FakeDaqWarning)
         self.constants = SimpleNamespace(
             AcquisitionType=SimpleNamespace(FINITE="finite"),
             TaskMode=SimpleNamespace(TASK_ABORT="abort", TASK_COMMIT="commit"),
@@ -335,8 +372,8 @@ class FakeDaqmx:
         return task
 
     def fail_start(self, task):
-        if self.failing_task and task.name.endswith(self.failing_task):
-            raise RuntimeError(f"DAQmx refused to start {task.name}")
+        if self.failing_task and task.label.endswith(self.failing_task):
+            raise RuntimeError(f"DAQmx refused to start {task.label}")
 
     def sick(self, call):
         """Block `call` until released, when it is one of the hung calls."""
@@ -358,7 +395,7 @@ class FakeDaqmx:
         self.log.append(("disconnect", (source, destination)))
 
     def task(self, suffix):
-        return next(task for task in reversed(self.tasks) if task.name.endswith(suffix))
+        return next(task for task in reversed(self.tasks) if task.label.endswith(suffix))
 
     def writes_to(self, channel, *, task_suffix=None, thread=None, since=0):
         """What was written to `channel`, in order.

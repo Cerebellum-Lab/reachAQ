@@ -50,8 +50,6 @@ class LaserTraceBlock:
     origin_wall_time: Optional[float] = None
 
 
-
-
 def wait_until_cancelled_ends(operation, timeout: float = CANCELLED_OPERATION_WAIT_S) -> bool:
     """Wait, bounded, for a cancelled operation to end; whether it did.
 

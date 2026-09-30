@@ -71,7 +71,7 @@ def test_closing_the_controller_mid_ramp_stops_the_ramp_and_resets_the_laser(daq
     thread = threading.Thread(target=ramp)
     thread.start()
     _wait_for(lambda: any(
-        task.name.endswith("calibration_ao") and task.started for task in daq.tasks))
+        task.label.endswith("calibration_ao") and task.started for task in daq.tasks))
     shutter = daq.task("laser_1_shutter")
     assert shutter.writes[-1] is True
 
@@ -117,7 +117,7 @@ def test_close_waits_for_the_ramp_to_let_go_of_the_output_before_resetting_it(mo
     controller = NidaqLaserController(_rig_lasers())
     thread, outcome = _ramp_in_thread(controller)
     _wait_for(lambda: any(
-        task.name.endswith("calibration_ao") and task.started for task in daq.tasks))
+        task.label.endswith("calibration_ao") and task.started for task in daq.tasks))
     shutter = daq.task("laser_1_shutter")
 
     controller.close()
@@ -148,7 +148,7 @@ def test_a_ramp_that_outlives_the_wait_still_puts_the_command_back(monkeypatch):
     controller = NidaqLaserController(_rig_lasers())
     thread, outcome = _ramp_in_thread(controller)
     _wait_for(lambda: any(
-        task.name.endswith("calibration_ao") and task.started for task in daq.tasks))
+        task.label.endswith("calibration_ao") and task.started for task in daq.tasks))
     shutter = daq.task("laser_1_shutter")
 
     with pytest.raises(RuntimeError, match="channel 1 reset"):
@@ -209,7 +209,7 @@ def _close_as_the_ramp_output_starts(daq, controller, *, stall):
     closer = {}
 
     def close_first(task):
-        if not task.name.endswith("calibration_ao") or closer:
+        if not task.label.endswith("calibration_ao") or closer:
             return
         outcome = []
 
@@ -397,7 +397,7 @@ def _ramp_in_thread(controller):
 
 def _wait_until_ramping(daq):
     _wait_for(lambda: any(
-        task.name.endswith("calibration_ao") and task.started for task in daq.tasks))
+        task.label.endswith("calibration_ao") and task.started for task in daq.tasks))
 
 
 def _abort_log(caplog):
@@ -422,7 +422,7 @@ def test_an_abort_the_ramps_own_cleanup_overtakes_is_not_a_failure(daq, caplog):
     at_input, go_on = threading.Event(), threading.Event()
 
     def hold_the_second_abort(task):
-        if task.name.endswith("calibration_ai"):
+        if task.label.endswith("calibration_ai"):
             at_input.set()
             go_on.wait(5.0)
 
