@@ -501,6 +501,10 @@ class NidaqLaserController:
         #: not ended, and whether the ramp had not let go (work_left_running).
         self._given_up_operations: List[NidaqLaserOperation] = []
         self._given_up_on_ramp = False
+        #: Lasers a CRITICAL said may be left driven, a pulse's or a ramp's
+        #: own reset of the command refused, by id, under the lock; close()
+        #: says so when its own reset of one succeeds (_note_reset_after_all).
+        self._left_driven: set = set()
         try:
             for channel in configuration.channels:
                 channel_started = time.perf_counter()
@@ -1407,7 +1411,7 @@ class NidaqLaserController:
         # aborted mid-pulse, DAQmx leaves the output on the last sample it
         # wrote, which can be the pulse's high level, until this. Then the
         # shutters. The digital lines and routes come after.
-        for channel in channels:
+        for channel, channel_pulse in zip(channels, channel_pulses):
             try:
                 # Through a transient task once close() has let go of the
                 # channel's tasks: past its wait for this pulse, its own reset
@@ -1416,7 +1420,9 @@ class NidaqLaserController:
                 self._reset_command(channel)
             except Exception as exc:
                 errors.append((f"channel {channel.channel_id.value} command reset", exc))
-                self._log_command_left_driven(channel, "its pulse train")
+                self._log_command_left_driven(
+                    channel, "its pulse train",
+                    f"the pulse's amplitude, {channel_pulse.amplitude_volts:g} V")
         for channel, channel_pulse in zip(channels, channel_pulses):
             if channel_pulse.close_shutter:
                 try:
@@ -1486,7 +1492,8 @@ class NidaqLaserController:
                 self._write_transient_analog_sample(channel, channel.minimum_command_volts)
             except Exception as exc:
                 errors.append((f"channel {channel.channel_id.value} command reset", exc))
-                self._log_command_left_driven(channel, "a closed calibration ramp")
+                self._log_command_left_driven(
+                    channel, "a closed calibration ramp", _ramp_holding(ramp))
             if ramp.enable_pmt_shutter:
                 try:
                     self._write_transient_digital_line(
@@ -1503,7 +1510,8 @@ class NidaqLaserController:
             self.set_command_voltage(channel.channel_id, channel.minimum_command_volts)
         except Exception as exc:
             errors.append((f"channel {channel.channel_id.value} command reset", exc))
-            self._log_command_left_driven(channel, "its calibration ramp")
+            self._log_command_left_driven(
+                channel, "its calibration ramp", _ramp_holding(ramp))
         if ramp.close_shutter:
             try:
                 self.set_shutter_open(channel.channel_id, False)
@@ -1522,21 +1530,42 @@ class NidaqLaserController:
                 logger.exception("Failed to close NI-DAQ PMT shutter output after calibration")
         self._raise_or_log_cleanup_errors("NI-DAQ laser calibration ramp", errors, run_error)
 
-    @staticmethod
-    def _log_command_left_driven(channel: LaserChannelConfiguration, after: str) -> None:
+    def _log_command_left_driven(
+        self, channel: LaserChannelConfiguration, after: str, holding: str,
+    ) -> None:
         """CRITICAL, within the except: `channel`'s output may stay driven.
 
         A pulse's or a ramp's own reset of the command, refused (-50103, for
         one), leaves the output on its last level: after a cancel or a failure
         that is the pulse's high level. Whatever else ended the run, as every
-        output left driven is (controller ruling, final review).
+        output left driven is (controller ruling, final review). `holding`
+        names that level: the pulse's amplitude, or the ramp's last command,
+        as the application names it for a ramp whose close hung. The laser
+        is noted for close(), which says so if it resets it after all.
         """
+        with self._operation_lock:
+            self._left_driven.add(channel.channel_id)
         logger.critical(
             "Laser %s: its command on %s could not be put back to %g V after "
-            "%s. The output may still hold its last level: make the laser "
-            "safe by hand.",
+            "%s. The output may still hold %s: make the laser safe by hand.",
             channel.channel_id.value, channel.analog_output,
-            channel.minimum_command_volts, after, exc_info=True)
+            channel.minimum_command_volts, after, holding, exc_info=True)
+
+    def _note_reset_after_all(self, channel: LaserChannelConfiguration) -> None:
+        """WARNING: close() has reset a laser a CRITICAL said may be driven.
+
+        The CRITICAL told the operator to make the laser safe by hand;
+        nothing said that close()'s own reset of it then succeeded.
+        """
+        with self._operation_lock:
+            if channel.channel_id not in self._left_driven:
+                return
+            self._left_driven.discard(channel.channel_id)
+        logger.warning(
+            "Laser %s: close() put its command on %s back to %g V after all; "
+            "the output an earlier CRITICAL said may still be driven was reset.",
+            channel.channel_id.value, channel.analog_output,
+            channel.minimum_command_volts)
 
     def _stop_and_close_task(self, name: str, task: object, errors: list) -> None:
         try:
@@ -1654,6 +1683,7 @@ class NidaqLaserController:
                 if channel.auxiliary_output is not None:
                     self.set_auxiliary_output(channel.channel_id, False)
                 self.set_command_voltage(channel.channel_id, channel.minimum_command_volts)
+                self._note_reset_after_all(channel)
             except Exception as exc:
                 errors.append((f"channel {channel.channel_id.value} reset", exc))
                 logger.exception("Failed to reset NI-DAQ laser channel %s during close", channel.channel_id.value)
@@ -2363,6 +2393,12 @@ def _mean(values) -> float:
     if not values:
         raise RuntimeError("cannot average an empty calibration sample segment")
     return float(sum(values)) / len(values)
+
+
+def _ramp_holding(ramp: LaserCalibrationRamp) -> str:
+    """What a ramp's output may hold when its reset is refused: its last command."""
+    return (f"the ramp's last command, {ramp.stop_volts:g} V "
+            f"(a {ramp.start_volts:g} V to {ramp.stop_volts:g} V ramp)")
 
 
 def _device_of(physical_channel: str) -> str:

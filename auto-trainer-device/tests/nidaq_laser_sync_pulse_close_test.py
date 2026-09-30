@@ -1233,3 +1233,69 @@ def test_a_pulse_outside_its_lasers_range_is_refused_before_its_operation(monkey
         assert controller._live_operations == {}
     finally:
         controller.close()
+
+
+def _critical(caplog):
+    return [record.getMessage() for record in caplog.records
+            if record.levelno == logging.CRITICAL]
+
+
+def _reset_after_all(caplog):
+    return [record.getMessage() for record in caplog.records
+            if record.levelno == logging.WARNING and "after all" in record.getMessage()]
+
+
+def _cancelled_with_its_reset_refused(controller, daq, amplitude_volts):
+    """A board STIM pulse at `amplitude_volts`, cancelled; its reset refused."""
+    operation = controller.run_synchronized_pulse_train(LaserSynchronizedPulseTrain(
+        pulse_trains=(dataclasses.replace(PULSE, amplitude_volts=amplitude_volts),),
+        wait=False, timeout_seconds=30.0, trigger_source="/PXI1Slot4/PXI_Trig0"))
+    daq.failing_write = "laser_1_manual_ao"
+    try:
+        assert operation.cancel()
+        assert operation.wait(1.0) is LaserOperationState.CANCELLED
+    finally:
+        daq.failing_write = None
+
+
+def test_a_refused_reset_after_a_cancel_names_the_pulses_amplitude(held, caplog):
+    # It named the level it could not reach, the minimum, and not the one
+    # the output may still hold.
+    daq = held
+    controller = NidaqLaserController(_routed())
+    try:
+        with caplog.at_level(logging.WARNING):
+            _cancelled_with_its_reset_refused(controller, daq, 2.5)
+
+        critical, = _critical(caplog)
+        assert "The output may still hold the pulse's amplitude, 2.5 V" in critical
+    finally:
+        controller.close()
+
+
+def test_a_close_that_resets_a_laser_a_critical_left_driven_says_so(held, caplog):
+    # The CRITICAL said to make the laser safe by hand; close()'s own reset
+    # of it then succeeded, and nothing said the laser was reset after all.
+    daq = held
+    controller = NidaqLaserController(_routed())
+    with caplog.at_level(logging.WARNING):
+        _cancelled_with_its_reset_refused(controller, daq, 2.5)
+        assert _reset_after_all(caplog) == []
+
+        controller.close()
+
+    warning, = _reset_after_all(caplog)
+    assert "Laser 1" in warning and "PXI1Slot4/ao0" in warning and "0 V" in warning
+    assert daq.writes_to("PXI1Slot4/ao0", task_suffix="manual_ao")[-1] == 0.0
+
+
+def test_a_close_after_no_critical_says_nothing_of_a_reset(held, caplog):
+    daq = held
+    controller = NidaqLaserController(_routed())
+    operation = _armed(controller, trigger_source="/PXI1Slot4/PXI_Trig0")
+    with caplog.at_level(logging.WARNING):
+        assert operation.cancel()
+        assert operation.wait(1.0) is LaserOperationState.CANCELLED
+        controller.close()
+
+    assert _critical(caplog) == [] and _reset_after_all(caplog) == []
