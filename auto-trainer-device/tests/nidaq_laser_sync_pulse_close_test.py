@@ -1197,3 +1197,39 @@ def test_a_command_reset_refused_after_a_cancel_is_critical(held, caplog):
     assert len(critical) == 1
     assert "Laser 1" in critical[0] and "PXI1Slot4/ao0" in critical[0]
     assert "make the laser safe by hand" in critical[0]
+
+
+# ------------------------------------------------ workstream D: the follow-ups
+
+
+@pytest.mark.parametrize("wait", [True, False])
+def test_a_pulse_outside_its_lasers_range_is_refused_before_its_operation(monkeypatch, wait):
+    # The range check ran in the pulse's own thread, once its operation had
+    # been made: the refusal came back as that operation's failure, a
+    # ValueError, and the laser model kept the amplitude as what the output
+    # may hold. Refused first, it drives nothing and makes nothing.
+    from autotrainer.device.laser import LaserPulseRefused
+
+    daq = FakeDaqmx()
+    monkeypatch.setattr(nidaq_laser, "_load_nidaqmx", lambda: daq)
+    controller = NidaqLaserController(rig_lasers())
+    made = []
+
+    class Counted(nidaq_laser.NidaqLaserOperation):
+        def __init__(self, **kwargs):
+            made.append(self)
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr(nidaq_laser, "NidaqLaserOperation", Counted)
+    tasks_before = len(daq.tasks)
+    try:
+        with pytest.raises(LaserPulseRefused, match="6.0 V is outside the configured range 0.0..5.0 V"):
+            controller.run_synchronized_pulse_train(LaserSynchronizedPulseTrain(
+                pulse_trains=(dataclasses.replace(PULSE, amplitude_volts=6.0),),
+                wait=wait, timeout_seconds=5.0))
+
+        assert made == []
+        assert daq.tasks[tasks_before:] == []
+        assert controller._live_operations == {}
+    finally:
+        controller.close()

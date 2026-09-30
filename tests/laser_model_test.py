@@ -425,3 +425,42 @@ def test_a_pulse_the_board_rule_refuses_leaves_the_last_command(monkeypatch):
         armed.cancel()
         armed.wait_until_finished(5.0)
         model.close()
+
+
+# ------------------------------------------------ workstream D: the follow-ups
+
+
+def _nidaq_model(monkeypatch, configuration=None):
+    """A model on a NI-DAQ controller over the device tests' DAQmx fake."""
+    from autotrainer.device import NidaqLaserController
+    from autotrainer.device import nidaq_laser
+
+    fake = _daqmx_fake()
+    daq = fake.FakeDaqmx()
+    monkeypatch.setattr(nidaq_laser, "_load_nidaqmx", lambda: daq)
+    model = LaserModel()
+    model.set_controller(NidaqLaserController(configuration or fake.rig_lasers()))
+    return model, daq
+
+
+@pytest.mark.parametrize("path", ["run_pulse", "trial"])
+def test_a_pulse_outside_the_lasers_range_leaves_the_last_command(monkeypatch, path):
+    # Refused in the pulse's own thread, as its operation's ValueError, it
+    # left its amplitude as what the output "may still hold", and a close
+    # that failed named it. It is refused before anything exists now.
+    from autotrainer.device import LaserChannelId, LaserPulseTrain
+    from autotrainer.device.laser import LaserPulseRefused
+
+    model, _daq = _nidaq_model(monkeypatch)
+    try:
+        with pytest.raises(LaserPulseRefused, match="outside the configured range"):
+            if path == "run_pulse":
+                model.run_pulse_train(LaserPulseTrain(
+                    channel_id=LaserChannelId.LASER_1, amplitude_volts=6.0, duration_ms=1.0))
+            else:
+                model.prepare_pulse_profile(
+                    LaserPulseProfile("hot", 1, 6.0, 1.0), SOFTWARE, _recipe())
+
+        assert model.last_command_volts == {1: 0.0}
+    finally:
+        model.close()
