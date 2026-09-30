@@ -424,3 +424,75 @@ def test_a_laser_row_on_an_unconfigured_laser_does_not_compile():
 
     with pytest.raises(ValueError, match="Laser 2 is not configured"):
         _compiler().compile(row, _context())
+
+
+# ------------------------------------------------ the waveform's length
+
+
+class _ArmedLaser:
+    """A prepared laser that completes when the cycle's end waits for it."""
+
+    def __init__(self):
+        self.state = SimpleNamespace(value="armed")
+        self.timeouts = []
+
+    def wait(self, timeout):
+        self.timeouts.append(timeout)
+        self.state = SimpleNamespace(value="completed")
+
+    def to_record(self):
+        return {"state": self.state.value}
+
+
+_TRAIN = LaserPulseProfile(
+    "train", 1, 2.5, 5.0, pulse_count=10, frequency_hz=20.0, baseline_ms=100.0,
+    post_stim_ms=50.0, pmt_open_lead_ms=5.0, pmt_close_lag_ms=5.0)
+
+
+def _cycle_end_wait():
+    """How long the cycle's end waits for the train's prepared laser."""
+    compiler = TrialActionCompiler(
+        tone_profiles={},
+        laser_profiles={"train": _TRAIN},
+        laser_configuration=LASERS,
+        dcs_to_motor=lambda values: values,
+    )
+    row = TrialProtocolRow(trial_id=1).with_updates({
+        "enabled": True,
+        "laser_profile_id": "train",
+        "laser_phase": "pellet_presentation",
+        "laser_trigger_route": "hardware_stim3",
+        "laser_channel_id": 1,
+        "stimulus_assignment": "always",
+        "stimulus_trigger": "tone_1",
+    })
+    recipe = compiler.compile(row, _context())
+    laser = _ArmedLaser()
+    executor = TrialActionExecutor(
+        move_absolute=lambda target: None,
+        configure_cover=lambda policy, recipe: None,
+        play_tone=lambda profile, phase: None,
+        prepare_laser=lambda profile, recipe: laser,
+        cancel_laser=lambda handle: None,
+    )
+    executor.prepare(recipe)
+    executor.bind_send(recipe.operation_id, 4, "can-context")
+    executor.acknowledge_presentation("can-context")
+    executor.complete("cycle ended")
+    return laser.timeouts
+
+
+def test_the_cycle_waits_for_the_trains_whole_waveform_and_a_second():
+    # 5 ms + 9 periods of 50 ms, with 100 ms of baseline, 50 ms of post-stim
+    # and 5 ms of PMT margin at each end: 0.615 s.
+    assert _TRAIN.waveform_seconds == pytest.approx(0.615)
+
+    assert _cycle_end_wait() == [max(1.0, _TRAIN.waveform_seconds + 1.0)]
+
+
+def test_the_cycle_takes_the_waveforms_length_from_the_profile(monkeypatch):
+    # One definition of how long a train runs: the executor worked it out
+    # again inline, and the two could drift apart.
+    monkeypatch.setattr(LaserPulseProfile, "waveform_seconds", property(lambda _self: 42.0))
+
+    assert _cycle_end_wait() == [43.0]

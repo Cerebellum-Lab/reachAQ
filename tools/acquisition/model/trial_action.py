@@ -1121,17 +1121,7 @@ class TrialActionExecutor:
         state = getattr(getattr(handle, "state", None), "value", None)
         if state in {"armed", "triggered"}:
             profile = self._require_current().recipe.laser_profile
-            duration = 0.0
-            if profile is not None:
-                duration = profile.pulse_duration_ms / 1000.0
-                if profile.pulse_count > 1 and profile.frequency_hz:
-                    duration += (profile.pulse_count - 1) / profile.frequency_hz
-                duration += (
-                    profile.baseline_ms
-                    + profile.post_stim_ms
-                    + profile.pmt_open_lead_ms
-                    + profile.pmt_close_lag_ms
-                ) / 1000.0
+            duration = 0.0 if profile is None else profile.waveform_seconds
             wait = getattr(handle, "wait", None)
             if wait is not None:
                 try:
