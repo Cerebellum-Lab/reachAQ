@@ -348,6 +348,46 @@ Every discrete laser row receives the same recorded-frame association columns as
 `device.csv`. Continuous NI samples retain native sample indices and timestamps
 instead of being expanded into duplicate event rows.
 
+Rows are in `perf_time` order; rows at the same time keep the order they were
+told. Sessions recorded before 2026-09-30 have them in the order told.
+`nidaq_sample_index` names the NI-DAQ sample each row's `perf_time` landed
+within, looked up in the NI timeline as for `pressure.csv`, and is empty outside
+it. It maps a host time onto the NI clock; it is not an NI-timed event.
+
+A **Run Pulse** fired while a session records is kept as a manual laser event:
+two rows with source `manual pulse` and one `operation_id` starting `manual-`,
+which no protocol operation's does. Nothing is kept of one fired while no
+session records, and a pulse that spans Record or Stop can keep only one row.
+
+- `requested`, timed just before the laser controller is called. The output
+  starts at or after it: the controller has still to write and start the
+  train, and an external trigger starts it later still (`timing_confidence`
+  `before_output_start`).
+- How it ended: `completed` once the waited-for train has returned
+  (`after_output_end`); `failed` (`operation_failure`); or `refused`
+  (`operation_refused`), which drove nothing and has no waveform rows.
+
+Both have `timestamp_method` `manual_pulse_call_perf_counter`, and a
+`context_json` holding `manual: true`, `laser_channel_id`, `profile_id` (the
+saved id, or `builder draft`), `profile_revision` (null for the draft),
+`amplitude_volts`, `trigger_mode` (`internal` or `external`) and `route`:
+`trigger_terminal` and `trigger_edge` for an external trigger, empty and null
+for an internal one, and `stim_line` null, since Run Pulse never pulses a board
+STIM line. The outcome row adds `last_command_volts`, what the laser model
+keeps as the laser's last command: its minimum once completed, the amplitude
+its output may still hold once failed, the command before once refused. A
+failed or refused row also has `error_class` and `error`.
+
+A completed pulse's waveform rows (`internal pulse` or `external pulse`, with
+no operation id) start at its `requested` row's `perf_time`, so the two join on
+it. Before 2026-09-30 a Run Pulse was kept only as those rows, unmarked, and
+timed from after the train had ended. The event's time is host time only: the
+`requested` row's `nidaq_sample_index` is the NI sample during which the host
+called the controller, not the one the output started on; that onset is in
+`nidaq.h5` where the command-copy or diode input is recorded. `events.laser`
+reports how many manual Run Pulse events it found, and `trials.protocol` never
+takes one as a trial's laser evidence.
+
 ### `session.log`
 
 The session log contains only messages within the canonical session boundary,
