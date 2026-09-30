@@ -1,6 +1,5 @@
 import pytest
 import threading
-from types import SimpleNamespace
 
 from autotrainer.device import (
     LaserCalibrationRamp,
@@ -13,7 +12,10 @@ from autotrainer.device import (
     NullLaserController,
     LaserSynchronizedPulseTrain,
 )
+from autotrainer.device import nidaq_laser
 from autotrainer.core import NidaqTimingPlan
+
+from nidaq_daqmx_fake import FakeDaqmx
 
 
 def make_channel(channel_id=LaserChannelId.LASER_1, command_copy_input="Dev1/ai1"):
@@ -25,6 +27,39 @@ def make_channel(channel_id=LaserChannelId.LASER_1, command_copy_input="Dev1/ai1
         auxiliary_output="Dev1/port0/line1",
         command_copy_input=command_copy_input,
     )
+
+
+@pytest.fixture
+def daq(monkeypatch):
+    """The DAQmx fake the controllers here open on; nothing touches a board."""
+    fake = FakeDaqmx()
+    monkeypatch.setattr(nidaq_laser, "_load_nidaqmx", lambda: fake)
+    return fake
+
+
+@pytest.fixture
+def open_controller(daq):
+    """Open a NidaqLaserController by its own __init__, on the fake.
+
+    These tests built one with object.__new__ and set only the attributes
+    the path under test read, and the controller kept a guard for each one
+    they left out. Opened whole, it has every attribute __init__ sets. Each
+    is closed after the test.
+    """
+    opened = []
+
+    def open_one(channel=None, **kwargs):
+        controller = NidaqLaserController(
+            LaserSystemConfiguration.from_channels(
+                [channel or make_channel()], backend="nidaq",
+                hardware_timed=True, sample_rate_hz=1000.0),
+            **kwargs)
+        opened.append(controller)
+        return controller
+
+    yield open_one
+    for controller in opened:
+        controller.close()
 
 
 def test_laser_channel_configuration_normalizes_channel_id():
@@ -162,50 +197,27 @@ def test_null_laser_controller_does_not_claim_hardware_synchronization():
         ))
 
 
-def test_nidaq_laser_uses_shared_scaled_feedback_without_reserving_ai_tasks():
-    channel = make_channel()
-    configuration = LaserSystemConfiguration.from_channels(
-        [channel],
-        backend="nidaq",
-        hardware_timed=True,
-        sample_rate_hz=1000.0,
-    )
-    created_tasks = []
-
-    class FakeTask:
-        def __init__(self, name):
-            self.name = name
-            self.ai_channels = SimpleNamespace(
-                add_ai_voltage_chan=lambda *_args, **_kwargs: None,
-            )
-            self.do_channels = SimpleNamespace(
-                add_do_chan=lambda *_args, **_kwargs: None,
-            )
-            created_tasks.append(name)
-
+def test_nidaq_laser_uses_shared_scaled_feedback_without_reserving_ai_tasks(
+    open_controller, daq,
+):
     values = {"Dev1/ai0": 1.25, "Dev1/ai1": 2.5}
-    controller = object.__new__(NidaqLaserController)
-    controller._configuration = configuration
-    controller._feedback_reader = values.__getitem__
-    controller._nidaqmx = SimpleNamespace(Task=FakeTask)
-    controller._command_volts = {LaserChannelId.LASER_1: 0.75}
-    tasks = controller._create_channel_tasks(channel)
-    controller._tasks = {LaserChannelId.LASER_1: tasks}
+    controller = open_controller(feedback_reader=values.__getitem__)
+    controller.set_command_voltage(LaserChannelId.LASER_1, 0.75)
+    tasks = controller._tasks[LaserChannelId.LASER_1]
 
     sample = controller.read_feedback_sample(LaserChannelId.LASER_1)
 
     assert tasks.diode_input is None
     assert tasks.command_copy_input is None
-    assert not any(name.endswith("_ai") for name in created_tasks)
+    assert not any(task.label.endswith("_ai") for task in daq.tasks)
     assert sample.command_volts == 0.75
     assert sample.diode_volts == 1.25
     assert sample.command_copy_volts == 2.5
 
 
-def test_nidaq_laser_reports_on_demand_output_as_not_synchronized():
+def test_nidaq_laser_reports_on_demand_output_as_not_synchronized(open_controller):
     channel = make_channel()
-    controller = object.__new__(NidaqLaserController)
-    controller._timing_plan = NidaqTimingPlan(
+    controller = open_controller(channel, timing_plan=NidaqTimingPlan(
         requested_mode="auto",
         resolved_mode="backplane",
         is_valid=True,
@@ -213,7 +225,7 @@ def test_nidaq_laser_reports_on_demand_output_as_not_synchronized():
         sample_clock_source="/Input/ai/SampleClock",
         hardware_output_devices=("Dev1",),
         hardware_output_timing_status="declared_not_armed",
-    )
+    ))
     pulse = LaserSynchronizedPulseTrain(
         pulse_trains=(LaserPulseTrain(
             channel_id=LaserChannelId.LASER_1,
@@ -228,39 +240,17 @@ def test_nidaq_laser_reports_on_demand_output_as_not_synchronized():
     assert status["status"] == "declared_not_armed"
 
 
-class _RecordingSystem:
-    """Enough of nidaqmx.system to see which terminals get connected."""
-
-    def __init__(self):
-        self.connected = []
-
-    def local(self):
-        return self
-
-    def connect_terms(self, source, destination):
-        self.connected.append((source, destination))
-
-
-def _clock_routing_controller(plan, *, backplane_clock_line="PXI_Trig1"):
-    """A controller with just the collaborators the clock path touches."""
-    controller = object.__new__(NidaqLaserController)
-    controller._timing_plan = plan
-    controller._trigger_routes = []
-    controller._configuration = SimpleNamespace(
-        backplane_clock_line=backplane_clock_line)
-    system = _RecordingSystem()
-    controller._nidaqmx = SimpleNamespace(system=SimpleNamespace(System=system))
-    return controller, system
-
-
-def test_nidaq_laser_uses_shared_clock_only_with_future_hardware_trigger():
+def test_nidaq_laser_uses_shared_clock_only_with_future_hardware_trigger(
+    open_controller, daq,
+):
     """The clock crosses to the output board, and is named there.
 
     This asserted the plan's clock verbatim until cross-board routing was
     added, and then failed for two years' worth of reasons at once: the
-    controller it builds by hand never grew the collaborators that path
+    controller it built by hand never grew the collaborators that path
     needs, and the answer it expected was the one from before there was a
-    route. Both are the test's to fix; the behaviour is deliberate.
+    route. Both are the test's to fix; the behaviour is deliberate. It
+    opens a whole controller on the DAQmx fake now.
     """
     channel = make_channel()
     plan = NidaqTimingPlan(
@@ -274,7 +264,7 @@ def test_nidaq_laser_uses_shared_clock_only_with_future_hardware_trigger():
         hardware_output_devices=("Dev1",),
         hardware_output_timing_status="declared_not_armed",
     )
-    controller, system = _clock_routing_controller(plan)
+    controller = open_controller(channel, timing_plan=plan)
     pulse = LaserSynchronizedPulseTrain(
         pulse_trains=(LaserPulseTrain(
             channel_id=LaserChannelId.LASER_1,
@@ -289,7 +279,7 @@ def test_nidaq_laser_uses_shared_clock_only_with_future_hardware_trigger():
     # The clock is produced on Input and the output is on Dev1, so it is
     # driven onto a backplane line and read as Dev1's view of that line.
     # DAQmx will not route it across an unidentified chassis by name.
-    assert system.connected == [("/Input/ai/SampleClock", "/Input/PXI_Trig1")]
+    assert daq.connected == [("/Input/ai/SampleClock", "/Input/PXI_Trig1")]
     assert kwargs == {"source": "/Dev1/PXI_Trig1"}
     assert status["status"] == "hardware_synchronized"
     assert status["referenceClockSource"] == "PXI_CLK10"
@@ -297,7 +287,7 @@ def test_nidaq_laser_uses_shared_clock_only_with_future_hardware_trigger():
     assert status["sampleClockSource"] == "/Input/ai/SampleClock"
 
 
-def test_a_clock_already_on_the_output_board_acquires_no_route():
+def test_a_clock_already_on_the_output_board_acquires_no_route(open_controller, daq):
     """A single-board rig must not reserve a backplane line it cannot use."""
     plan = NidaqTimingPlan(
         requested_mode="auto",
@@ -310,7 +300,7 @@ def test_a_clock_already_on_the_output_board_acquires_no_route():
         hardware_output_devices=("Dev1",),
         hardware_output_timing_status="declared_not_armed",
     )
-    controller, system = _clock_routing_controller(plan)
+    controller = open_controller(timing_plan=plan)
     pulse = LaserSynchronizedPulseTrain(
         pulse_trains=(LaserPulseTrain(
             channel_id=LaserChannelId.LASER_1,
@@ -323,13 +313,12 @@ def test_a_clock_already_on_the_output_board_acquires_no_route():
     kwargs, _status = controller._resolve_pulse_timing((make_channel(),), pulse)
 
     assert kwargs == {"source": "/Dev1/ai/SampleClock"}
-    assert system.connected == []
+    assert daq.connected == []
 
 
-def test_nidaq_laser_labels_deferred_start_as_software_timed_without_plan():
+def test_nidaq_laser_labels_deferred_start_as_software_timed_without_plan(open_controller):
     channel = make_channel()
-    controller = object.__new__(NidaqLaserController)
-    controller._timing_plan = None
+    controller = open_controller(channel, timing_plan=None)
     pulse = LaserSynchronizedPulseTrain(
         pulse_trains=(LaserPulseTrain(
             channel_id=LaserChannelId.LASER_1,
@@ -346,14 +335,8 @@ def test_nidaq_laser_labels_deferred_start_as_software_timed_without_plan():
     assert status["status"] == "software_start"
 
 
-def test_nonblocking_laser_operation_is_owned_until_terminal(monkeypatch):
-    channel = make_channel()
-    controller = object.__new__(NidaqLaserController)
-    controller._configuration = LaserSystemConfiguration.from_channels(
-        [channel], backend="nidaq", hardware_timed=True, sample_rate_hz=1000.0,
-    )
-    controller._operation_lock = threading.RLock()
-    controller._live_operations = {}
+def test_nonblocking_laser_operation_is_owned_until_terminal(open_controller, monkeypatch):
+    controller = open_controller()
     release = threading.Event()
 
     def execute(_pulse, *, operation):
@@ -385,14 +368,10 @@ def test_nonblocking_laser_operation_is_owned_until_terminal(monkeypatch):
     assert operation.operation_id not in controller._live_operations
 
 
-def test_nonblocking_laser_operation_cancel_is_terminal_after_worker_cleanup(monkeypatch):
-    channel = make_channel()
-    controller = object.__new__(NidaqLaserController)
-    controller._configuration = LaserSystemConfiguration.from_channels(
-        [channel], backend="nidaq", hardware_timed=True, sample_rate_hz=1000.0,
-    )
-    controller._operation_lock = threading.RLock()
-    controller._live_operations = {}
+def test_nonblocking_laser_operation_cancel_is_terminal_after_worker_cleanup(
+    open_controller, monkeypatch,
+):
+    controller = open_controller()
     release = threading.Event()
 
     def execute(_pulse, *, operation):
