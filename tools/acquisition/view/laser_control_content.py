@@ -101,9 +101,10 @@ _TRIGGER_INPUT_INSTRUCTION = (
 _TRIGGER_INPUT_KINDS = (
     "Use an analog input or a port0 line, not a PFI terminal."
 )
-#: An error on the footer, in reachAQ's error red (the main window's
-#: "Startup failed").
-_ERROR_STATUS_STYLE = "color: #b00020;"
+#: reachAQ's error red, as on the main window's "Startup failed"; an error
+#: on the footer is drawn in it.
+_ERROR_STATUS_COLOR = "#b00020"
+_ERROR_STATUS_STYLE = f"color: {_ERROR_STATUS_COLOR};"
 
 
 #: nidaqmx's DaqError ends its message with the status code on a line of its

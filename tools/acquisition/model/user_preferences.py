@@ -17,6 +17,16 @@ from tools.acquisition.model.animal_metadata_sync import (
 logger = get_verbose_logger(__name__)
 
 
+def _laser_section_key(name: str) -> str:
+    """Where a Laser Control section's fold is saved, beside ui/splitters/."""
+    return f"ui/laser_control/sections/{name}"
+
+
+def _laser_command_output_key(channel_id: int) -> str:
+    """Where a laser's Command output choice is saved."""
+    return f"ui/laser_control/command_output/laser{int(channel_id)}"
+
+
 def get_default_configuration_location() -> Path:
     return SystemConfiguration.DEFAULT_CONFIG_DIR.expanduser()
 
@@ -125,18 +135,17 @@ class UserPreferences(ObservableObject):
 
     def laser_section_expanded(self, name: str) -> Optional[bool]:
         """Whether Laser Control's section `name` was left open; None if not saved."""
-        return self._saved_flag(f"ui/laser_control/sections/{name}")
+        return self._saved_flag(_laser_section_key(name))
 
     def set_laser_section_expanded(self, name: str, expanded: bool) -> None:
-        self._settings.setValue(f"ui/laser_control/sections/{name}", bool(expanded))
+        self._settings.setValue(_laser_section_key(name), bool(expanded))
 
     def laser_command_output_shown(self, channel_id: int) -> Optional[bool]:
         """Whether a laser's Command output trace was left shown; None if not saved."""
-        return self._saved_flag(f"ui/laser_control/command_output/laser{int(channel_id)}")
+        return self._saved_flag(_laser_command_output_key(channel_id))
 
     def set_laser_command_output_shown(self, channel_id: int, shown: bool) -> None:
-        self._settings.setValue(
-            f"ui/laser_control/command_output/laser{int(channel_id)}", bool(shown))
+        self._settings.setValue(_laser_command_output_key(channel_id), bool(shown))
 
     def _saved_flag(self, key: str) -> Optional[bool]:
         """A saved true or false, or None: nothing saved, or anything else.

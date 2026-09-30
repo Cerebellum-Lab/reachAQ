@@ -48,6 +48,7 @@ from tools.acquisition.view.compact_panel import (  # noqa: E402
     ElidedLabel,
 )
 from tools.acquisition.view.laser_control_content import (  # noqa: E402
+    _ERROR_STATUS_COLOR,
     LaserControlContent,
 )
 
@@ -394,7 +395,7 @@ def test_an_error_on_the_footer_is_cut_to_its_line_and_moves_nothing(panel, qapp
     _settle(qapp)
 
     assert footer.text().startswith("Laser operation failed: The specified route")
-    assert "#b00020" in footer.styleSheet()
+    assert _ERROR_STATUS_COLOR in footer.styleSheet()
     assert footer.is_elided()
     # Hovering shows the line, then the whole error with its task and code.
     assert footer.full_tooltip() == f"{footer.text()}\n{_DAQMX_FAILURE}"
