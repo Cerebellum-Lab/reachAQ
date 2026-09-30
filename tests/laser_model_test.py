@@ -348,3 +348,36 @@ def test_test_stims_pulse_says_it_is_test_stim():
 
     assert operation.context["operation_label"] == "Test stim"
     operation.cancel()
+
+
+
+def test_the_models_nidaq_controllers_take_the_streams_terminal_config(monkeypatch):
+    # The laser's own inputs are referenced as the stream references its
+    # inputs: the value is passed to each NI-DAQ controller the model opens.
+    from tools.acquisition.model import laser_model as laser_model_module
+
+    made = []
+
+    class _Controller:
+        def __init__(self, configuration, **kwargs):
+            made.append(kwargs.get("analog_terminal_config"))
+            self.configuration = configuration
+
+        def close(self):
+            pass
+
+        def work_left_running(self):
+            return ()
+
+    monkeypatch.setattr(laser_model_module, "NidaqLaserController", _Controller)
+    configuration = LaserSystemConfiguration.from_channels(
+        (LaserChannelConfiguration(
+            channel_id=1, analog_output="Dev1/ao0", diode_input="Dev1/ai0",
+            shutter_output="Dev1/port0/line2"),),
+        backend="nidaq")
+    model = LaserModel()
+
+    model.open_controller(configuration, analog_terminal_config="rse")
+    model.load_configuration(configuration, analog_terminal_config="nrse")
+
+    assert made == ["rse", "nrse"]

@@ -33,7 +33,7 @@ from autotrainer.device import (
     LaserChannelId,
     LaserPulseTrain,
 )
-from autotrainer.device.laser import default_settle_samples
+from autotrainer.device.laser import CALIBRATION_SETTLE_SECONDS
 from autotrainer.pyside import CardWidget, PGWidget
 from autotrainer.pyside.content_widget import ContentWidget, invoke_method
 from tools.acquisition.model.trial_protocol_schedule import (
@@ -390,34 +390,28 @@ class _LaserChannelTab(QWidget):
         self._ramp_steps.setValue(11)
         self._ramp_samples_per_step = QSpinBox()
         self._ramp_samples_per_step.setRange(1, 1000000)
-        self._ramp_samples_per_step.setValue(100)
-        # Taken when the operator finishes typing, not at each keystroke:
-        # typing "100" went through 1, which clamped Settle to 0.
+        # 5 ms at christielab10's 100 kHz: its slower diode was still rising
+        # through the second half of a 1 ms step (H2b).
+        self._ramp_samples_per_step.setValue(500)
+        # Taken when the operator finishes typing, or leaves the field, not at
+        # each keystroke.
         self._ramp_samples_per_step.setKeyboardTracking(False)
-        # Left out of each step's point, while the laser and the diode follow
-        # the step; at least one sample of the step stays in it.
+        # Left out of each step's point, while the laser, the diode and the
+        # input follow the step: a time, whatever the step's length. The
+        # ramp refuses one that leaves no sample of a step (settle_sample_count).
         self._ramp_settle = QSpinBox()
-        self._ramp_settle.setRange(0, self._ramp_samples_per_step.value() - 1)
-        self._ramp_settle.setValue(
-            default_settle_samples(self._ramp_samples_per_step.value()))
+        self._ramp_settle.setRange(0, 100000)
+        self._ramp_settle.setSuffix(" µs")
+        self._ramp_settle.setValue(int(round(CALIBRATION_SETTLE_SECONDS * 1e6)))
         self._ramp_settle.setToolTip(
-            "Samples at the start of each step left out of its point, while "
-            "the laser and the diode settle to the new command: the input is "
-            "read on the same clock edge the command changes on. It follows "
-            "a fifth of Samples/step until you change it. The ramp's fields "
-            "go back to their defaults whenever Laser Control is rebuilt: on "
-            "every Run/Stop, on a DAQ Ports save or a configuration load that "
-            "changes the lasers, and when a late close disconnects the laser.")
-        #: Whether the operator has set Settle; until then it follows
-        #: Samples/step at its default share.
-        self._ramp_settle_edited = False
-        self._ramp_settle_following = False
-        #: The value the follow last gave Settle. Qt reports a value on
-        #: Return even when it has not changed, and that is no edit.
-        self._ramp_settle_followed = self._ramp_settle.value()
-        self._ramp_settle.valueChanged.connect(self._on_ramp_settle_changed)
-        self._ramp_samples_per_step.valueChanged.connect(
-            self._on_ramp_samples_per_step_changed)
+            "How long the start of each step is left out of its point, while "
+            "the laser, the diode and the input settle to the new command: "
+            "600 µs by default, 60 samples at 100 kHz, whatever Samples/step "
+            "is. It must leave at least one sample of each step. The ramp's "
+            "fields go back to their defaults whenever Laser Control is "
+            "rebuilt: on every Run/Stop, on a DAQ Ports save or a "
+            "configuration load that changes the lasers, and when a late "
+            "close disconnects the laser.")
         self._ramp_pmt = self._make_checkbox("PMT shutter")
         self._run_ramp_button = QPushButton("Run Ramp")
 
@@ -860,24 +854,6 @@ class _LaserChannelTab(QWidget):
             )
         return ""
 
-    def _on_ramp_settle_changed(self, settle: int) -> None:
-        if not self._ramp_settle_following and settle != self._ramp_settle_followed:
-            self._ramp_settle_edited = True
-
-    def _on_ramp_samples_per_step_changed(self, samples: int) -> None:
-        """Settle keeps its default share until the operator sets it.
-
-        Then it is only kept valid, below Samples/step.
-        """
-        self._ramp_settle_following = True
-        try:
-            self._ramp_settle.setMaximum(max(0, samples - 1))
-            if not self._ramp_settle_edited:
-                self._ramp_settle.setValue(default_settle_samples(samples))
-                self._ramp_settle_followed = self._ramp_settle.value()
-        finally:
-            self._ramp_settle_following = False
-
     def run_ramp_refusal(self, panel_refusal: str) -> str:
         """Why Run Ramp is unavailable on this laser, or an empty string.
 
@@ -1183,8 +1159,8 @@ class _LaserChannelTab(QWidget):
             )
             return
         # What is typed and not yet taken, as when Run Ramp is pressed with
-        # Samples/step still focused, is taken now, and Settle follows it:
-        # Samples/step takes a value only as typing ends.
+        # Samples/step still focused, is taken now: Samples/step takes a
+        # value only as typing ends.
         self._ramp_samples_per_step.interpretText()
         self._ramp_settle.interpretText()
         try:
@@ -1194,9 +1170,15 @@ class _LaserChannelTab(QWidget):
                 stop_volts=self._ramp_stop.value(),
                 steps=self._ramp_steps.value(),
                 samples_per_step=self._ramp_samples_per_step.value(),
-                settle_samples=self._ramp_settle.value(),
+                settle_seconds=self._ramp_settle.value() * 1e-6,
                 enable_pmt_shutter=self._ramp_pmt.isChecked(),
             )
+            # Refused here, as the controller refuses it, before the stream
+            # is held: a settle that leaves no sample of a step at the
+            # laser's rate.
+            sample_rate_hz = self._app_model.laser.configuration.sample_rate_hz
+            if sample_rate_hz:
+                ramp.settle_sample_count(sample_rate_hz)
         except Exception as exc:
             self._set_parent_status(str(exc) or exc.__class__.__name__, True)
             return

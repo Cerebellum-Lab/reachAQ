@@ -30,7 +30,9 @@ TRIGGER_ROUTE = ("/PXI1Slot5/PFI0", "/PXI1Slot5/PXI_Trig0")
 AO_CLOCK_ROUTE = ("/PXI1Slot4/ao/SampleClock", "/PXI1Slot4/PXI_Trig1")
 RAMP = LaserCalibrationRamp(
     channel_id=LaserChannelId.LASER_1, start_volts=0.0, stop_volts=5.0,
-    steps=3, samples_per_step=10, timeout_seconds=5.0)
+    steps=3, samples_per_step=10, timeout_seconds=5.0,
+    # 2 samples at 100 kHz: these short steps would keep none of 600 us.
+    settle_seconds=20e-6)
 PULSE = LaserPulseTrain(
     channel_id=LaserChannelId.LASER_1, amplitude_volts=1.0, duration_ms=1.0)
 

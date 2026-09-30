@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import math
 import numbers
 import threading
 import time
@@ -122,18 +123,14 @@ class LaserSynchronizedPulseTrain:
             raise NotImplementedError("per-laser asynchronous output is not supported in synchronized pulse trains")
 
 
-#: The part of each calibration step left out of its mean, by default: 20 of
-#: 100 samples, 200 us at christielab10's 100 kHz. To be confirmed from the
-#: measured step response (hardware check H2).
-CALIBRATION_SETTLE_FRACTION = 0.2
-
-
-def default_settle_samples(samples_per_step: int) -> int:
-    """The samples of each calibration step left out of its point by default.
-
-    One formula, for the ramp and for the Calibration page's Settle field.
-    """
-    return int(round(samples_per_step * CALIBRATION_SETTLE_FRACTION))
+#: How long the start of each calibration step is left out of its point, by
+#: default: a time, whatever the step's length. Measured on christielab10
+#: (H2b, 2026-09-29, 1 ms steps at 100 kHz): the diodes came within 2% of
+#: their level by 42 and 55 samples, 420 and 550 us, and the command copies at
+#: once. With the command steady at 0 V, both inputs also decayed from about
+#: 1 V with a time constant of 110-120 us at the ramp's start: the input path
+#: settling, not the laser. 600 us leaves both out.
+CALIBRATION_SETTLE_SECONDS = 600e-6
 
 
 @dataclasses.dataclass(frozen=True)
@@ -151,12 +148,13 @@ class LaserCalibrationRamp:
     pmt_shutter_open_delay_ms: float = 0.0
     pmt_shutter_close_delay_ms: float = 0.0
     timeout_seconds: Optional[float] = None
-    #: Samples at the start of each step left out of its point. The input
-    #: converts on the edge the output updates on, and the laser driver and
-    #: the diode take time to follow, so the first samples of a step still
-    #: read the step before: averaged in, they pulled every point of a
-    #: rising ramp low. None takes CALIBRATION_SETTLE_FRACTION of the step.
-    settle_samples: Optional[int] = None
+    #: How long the start of each step is left out of its point. The input
+    #: converts on the edge the output updates on, and the laser driver, the
+    #: diode and the input path take time to follow, so the first samples of
+    #: a step still read the step before: averaged in, they pulled every point
+    #: of a rising ramp low. Taken as round(settle_seconds x rate) samples at
+    #: the ramp's rate (settle_sample_count).
+    settle_seconds: float = CALIBRATION_SETTLE_SECONDS
 
     def __post_init__(self):
         object.__setattr__(self, "channel_id", normalize_laser_channel_id(self.channel_id))
@@ -164,27 +162,35 @@ class LaserCalibrationRamp:
             raise ValueError("steps must be at least 2")
         if self.samples_per_step <= 0:
             raise ValueError("samples_per_step must be positive")
-        if self.settle_samples is None:
-            object.__setattr__(
-                self, "settle_samples", default_settle_samples(self.samples_per_step))
-        if (isinstance(self.settle_samples, bool)
-                or not isinstance(self.settle_samples, numbers.Integral)):
-            # int() took 2.5 as 2, and "20" as 20, silently.
+        if (isinstance(self.settle_seconds, bool)
+                or not isinstance(self.settle_seconds, numbers.Real)
+                or not math.isfinite(self.settle_seconds)
+                or self.settle_seconds < 0):
+            # float() took "600e-6" silently; a bool is a number to Python.
             raise ValueError(
-                f"settle_samples must be a whole number of samples, not "
-                f"{self.settle_samples!r}")
-        if not 0 <= int(self.settle_samples) < self.samples_per_step:
-            raise ValueError(
-                f"settle_samples must leave at least one of the "
-                f"{self.samples_per_step} samples of each step: 0 to "
-                f"{self.samples_per_step - 1}, not {self.settle_samples}")
-        object.__setattr__(self, "settle_samples", int(self.settle_samples))
+                f"settle_seconds must be a time of 0 s or more, not "
+                f"{self.settle_seconds!r}")
+        object.__setattr__(self, "settle_seconds", float(self.settle_seconds))
         if self.pmt_shutter_open_delay_ms < 0:
             raise ValueError("pmt_shutter_open_delay_ms cannot be negative")
         if self.pmt_shutter_close_delay_ms < 0:
             raise ValueError("pmt_shutter_close_delay_ms cannot be negative")
         if self.timeout_seconds is not None and self.timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive when provided")
+
+    def settle_sample_count(self, sample_rate_hz: float) -> int:
+        """The samples at the start of each step left out of its point.
+
+        At least one sample of each step must be left for the point.
+        """
+        samples = int(round(self.settle_seconds * sample_rate_hz))
+        if samples >= self.samples_per_step:
+            raise ValueError(
+                f"a settle of {self.settle_seconds * 1e6:g} µs is {samples} samples "
+                f"at {sample_rate_hz:g} Hz, which leaves none of the "
+                f"{self.samples_per_step} samples of each step: shorten Settle or "
+                "lengthen Samples/step")
+        return samples
 
 
 @dataclasses.dataclass(frozen=True)

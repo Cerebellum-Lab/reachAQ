@@ -63,7 +63,9 @@ class FakeTask:
         #: Set once the task is closed, for an abort to wait on.
         self._closed_event = threading.Event()
         self.ao_channels = SimpleNamespace(add_ao_voltage_chan=self._add)
-        self.ai_channels = SimpleNamespace(add_ai_voltage_chan=self._add)
+        self.ai_channels = SimpleNamespace(add_ai_voltage_chan=self._add_ai)
+        #: Each analog input channel added, as (physical channel, kwargs).
+        self.ai_added = []
         self.do_channels = SimpleNamespace(add_do_chan=self._add_do)
         self.do_channels_added = False
         self.timing = SimpleNamespace(cfg_samp_clk_timing=self._timing)
@@ -82,6 +84,10 @@ class FakeTask:
         return self.label
 
     def _add(self, channel, **_kwargs):
+        self.channels.append(channel)
+
+    def _add_ai(self, channel, **kwargs):
+        self.ai_added.append((channel, kwargs))
         self.channels.append(channel)
 
     def _note(self, event, data=None):
@@ -359,6 +365,9 @@ class FakeDaqmx:
         self.constants = SimpleNamespace(
             AcquisitionType=SimpleNamespace(FINITE="finite"),
             TaskMode=SimpleNamespace(TASK_ABORT="abort", TASK_COMMIT="commit"),
+            TerminalConfiguration=SimpleNamespace(
+                DEFAULT="default", RSE="rse", NRSE="nrse", DIFF="diff",
+                PSEUDO_DIFF="pseudo_diff"),
             Edge=SimpleNamespace(RISING="rising", FALLING="falling"),
         )
         daq = self

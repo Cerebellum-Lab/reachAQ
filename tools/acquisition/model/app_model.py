@@ -6653,6 +6653,7 @@ class AppModel(ObservableObject):
                             if configuration.hardware_timed
                             else None
                         ),
+                        analog_terminal_config=self._laser_analog_terminal_config(),
                     )
                 except Exception as error:
                     # Its partial close may go on past the ramp's end, which
@@ -7355,6 +7356,7 @@ class AppModel(ObservableObject):
                     if configuration.hardware_timed
                     else None
                 ),
+                analog_terminal_config=self._laser_analog_terminal_config(),
             )
             self._laser.start_direct_trigger_receiver(
                 self._stim_direct_trigger_queue,
@@ -7377,6 +7379,20 @@ class AppModel(ObservableObject):
             generation=generation,
         )
         return True
+
+    def _laser_analog_terminal_config(self):
+        """The stream's analogTerminalConfig, which the laser's own inputs use.
+
+        One source: the stream's configuration, as the stream reads it, or,
+        with a refused plan, as the operator stored it. None leaves the
+        laser's inputs to DAQmx's default.
+        """
+        stream = (
+            self._loaded_configuration.nidaq_stream
+            if self._nidaq_plan_error and self._loaded_configuration is not None
+            else self._nidaq_signal_monitor.configuration
+        )
+        return getattr(stream, "analog_terminal_config", "") or None
 
     def _runtime_laser_configuration(self, configuration):
         """The laser configuration under the device names NI-DAQmx uses now.

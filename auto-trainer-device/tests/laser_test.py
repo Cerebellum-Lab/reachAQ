@@ -439,30 +439,26 @@ def _ramp(**values):
     return LaserCalibrationRamp(**fields)
 
 
-def test_a_calibration_ramp_settles_a_fifth_of_each_step_by_default():
-    assert _ramp().settle_samples == 20
-    assert _ramp(samples_per_step=10).settle_samples == 2
-    assert _ramp(samples_per_step=1).settle_samples == 0
-    assert _ramp(settle_samples=0).settle_samples == 0
+def test_a_calibration_ramp_settles_600_us_by_default():
+    # A time, not a share of the step: the laser, the diode and the input
+    # take as long to settle however long the step is.
+    from autotrainer.device.laser import CALIBRATION_SETTLE_SECONDS
+
+    assert _ramp().settle_seconds == CALIBRATION_SETTLE_SECONDS == 600e-6
+    # round(settle x rate) samples of each step.
+    assert _ramp().settle_sample_count(100_000.0) == 60
+    assert _ramp().settle_sample_count(1_000.0) == 1
+    assert _ramp(settle_seconds=26e-6).settle_sample_count(100_000.0) == 3
+    assert _ramp(settle_seconds=0).settle_sample_count(100_000.0) == 0
 
 
-@pytest.mark.parametrize("settle", [100, 101, -1])
-def test_a_calibration_ramp_keeps_at_least_one_sample_of_each_step(settle):
-    with pytest.raises(ValueError, match="settle_samples"):
-        _ramp(settle_samples=settle)
+def test_a_settle_that_leaves_no_sample_of_a_step_names_both():
+    with pytest.raises(ValueError, match="600 µs is 60 samples at 100000 Hz.*60 samples of each step"):
+        _ramp(samples_per_step=60).settle_sample_count(100_000.0)
+    assert _ramp(samples_per_step=61).settle_sample_count(100_000.0) == 60
 
 
-@pytest.mark.parametrize("settle", [2.5, 20.0, True, "20"])
-def test_a_calibration_ramp_takes_a_whole_number_of_settle_samples(settle):
-    # int() took 2.5 as 2, silently.
-    with pytest.raises(ValueError, match="whole number"):
-        _ramp(settle_samples=settle)
-
-
-def test_the_ramps_default_settle_is_default_settle_samples():
-    # The panel's Settle takes the same function
-    # (laser_calibration_ramp_test, test_typing_samples_per_step_*).
-    from autotrainer.device.laser import default_settle_samples
-
-    for samples in (1, 7, 10, 37, 100, 1001):
-        assert _ramp(samples_per_step=samples).settle_samples == default_settle_samples(samples)
+@pytest.mark.parametrize("settle", [-1e-6, True, "600e-6", float("nan"), float("inf")])
+def test_a_calibration_ramp_takes_a_settle_of_zero_seconds_or_more(settle):
+    with pytest.raises(ValueError, match="settle_seconds"):
+        _ramp(settle_seconds=settle)

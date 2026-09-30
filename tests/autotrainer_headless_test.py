@@ -493,7 +493,10 @@ def _ramp(timeout_seconds=None):
     from autotrainer.device import LaserCalibrationRamp
     return LaserCalibrationRamp(
         channel_id=LaserChannelId.LASER_1, start_volts=0.0, stop_volts=5.0,
-        steps=3, samples_per_step=10, timeout_seconds=timeout_seconds)
+        steps=3, samples_per_step=10, timeout_seconds=timeout_seconds,
+        # 2 samples at the fake rig's 100 kHz: these short steps would keep
+        # none of 600 us.
+        settle_seconds=20e-6)
 
 
 def _in_thread(function, *args):
@@ -698,7 +701,7 @@ def test_a_forced_ramp_close_that_raises_is_named_and_the_ramp_still_resets(
             "its own reset")
         assert messages.index(message) < ended
         error, = ramp_outcome
-        assert "aborted" in str(error)
+        assert "was closed while it ran" in str(error)
     finally:
         daq.waits_released.set()
         ramp_thread.join(10.0)
