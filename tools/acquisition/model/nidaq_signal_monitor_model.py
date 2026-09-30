@@ -615,7 +615,13 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
         As show_paused does for a holder. The application holds the idle
         stream back while a laser close given up on is still inside the
         driver (AppModel._nidaq_stream_may_start), and says so here.
+
+        Asked with no reason on every stream request, on the Qt thread: with
+        no such text shown it returns without the lock, which start() holds
+        through discovery and the preflight, for seconds.
         """
+        if not reason and not self._status_message.startswith(_HELD_BACK_STATUS):
+            return
         with self._lock:
             if self._process is not None:
                 return

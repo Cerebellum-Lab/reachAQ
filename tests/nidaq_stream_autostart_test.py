@@ -263,3 +263,33 @@ def test_the_sample_ring_is_available_while_a_start_holds_the_lock():
     finally:
         release.set()
         holder.join(5.0)
+
+
+def test_nothing_held_back_to_take_back_does_not_wait_for_a_start():
+    # The application asks show_held_back("") on every stream request, on
+    # the Qt thread, and it took the monitor lock each time. start() holds
+    # that lock through discovery and the preflight, which take seconds, so
+    # a request made during a start waited for all of it.
+    discovering, release = threading.Event(), threading.Event()
+
+    def slow_discovery():
+        discovering.set()
+        release.wait(5.0)
+        return (), "no NI-DAQ device (test)"
+
+    monitor = NidaqSignalMonitorModel(device_discovery=slow_discovery)
+    monitor._configuration = _configuration("cam_frames")
+    monitor._hardware_enabled = True
+    starter = threading.Thread(target=monitor.start, daemon=True)
+    starter.start()
+    try:
+        assert discovering.wait(5.0)
+        caller = threading.Thread(
+            target=monitor.show_held_back, args=("",), daemon=True)
+        caller.start()
+        caller.join(0.5)
+
+        assert not caller.is_alive(), "show_held_back('') waited for the start"
+    finally:
+        release.set()
+        starter.join(5.0)
