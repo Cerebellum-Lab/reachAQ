@@ -15,7 +15,6 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest  # noqa: E402
-from PySide6.QtCore import QByteArray  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from autotrainer.core import (  # noqa: E402
@@ -81,12 +80,33 @@ def make_panel(qapp, app_model):
             content.deleteLater()
 
 
-def _restart(app_model, monkeypatch, settings_ini_path):
-    """The preferences reachAQ's next start reads: the settings file, loaded again."""
+def _start_with_file(app_model, monkeypatch, path, text=None):
+    """The preferences a new start reads from `path`, written first if given.
+
+    Qt keeps one parsed copy of each settings file per process, shared by
+    every QSettings on it, so a second UserPreferences on a path already
+    open reads the first one's values and never the file's text. Every
+    path here is one no QSettings has opened, so it is parsed from its
+    text, as a new process parses it.
+    """
+    if text is not None:
+        path.write_text(text)
+    preferences = UserPreferences(settings_file_path=path)
+    monkeypatch.setattr(app_model, "_preferences", preferences)
+    return preferences
+
+
+def _restart(app_model, monkeypatch, settings_ini_path, tmp_path):
+    """The preferences reachAQ's next start reads: the settings file as saved."""
     app_model.preferences.save()
-    reloaded = UserPreferences(settings_file_path=settings_ini_path)
-    monkeypatch.setattr(app_model, "_preferences", reloaded)
-    return reloaded
+    restarted = tmp_path / "restarted.ini"
+    restarted.write_bytes(settings_ini_path.read_bytes())
+    return _start_with_file(app_model, monkeypatch, restarted)
+
+
+def _laser_control_file(values):
+    """A settings file's text, with these Laser Control values under [ui]."""
+    return "[ui]\n" + "".join(f"laser_control\\{key}={value}\n" for key, value in values)
 
 
 def _sections(owner):
@@ -109,18 +129,20 @@ def _ui_lines(settings_ini_path):
 
 
 def test_a_folded_section_stays_folded_after_a_restart(
-    make_panel, app_model, monkeypatch, settings_ini_path,
+    make_panel, app_model, monkeypatch, settings_ini_path, tmp_path,
 ):
     first = make_panel()
     # Read when the panel is made, written only when something changes.
     assert _laser_control_keys(app_model.preferences) == []
+    # The fixture's own file under tmp_path, never the user's.
+    assert app_model.preferences._settings.fileName() == settings_ini_path.as_posix()
     tab = first._channel_tabs[0]
     tab.sections["board_trigger"].set_expanded(False)
     tab.sections["signals"].set_expanded(True)
     first._builder.sections["pulse_train"].set_expanded(False)
     first._builder.sections["pmt_margins"].set_expanded(True)
 
-    reloaded = _restart(app_model, monkeypatch, settings_ini_path)
+    _restart(app_model, monkeypatch, settings_ini_path, tmp_path)
     second = make_panel()
 
     expected = dict(LASER_SECTIONS, board_trigger=False, signals=True)
@@ -129,7 +151,6 @@ def test_a_folded_section_stays_folded_after_a_restart(
     assert _sections(second._builder) == {"pulse_train": False, "pmt_margins": True}
     # Saved as the main splitter is, under [ui] in the same file, as
     # splitters\main_horizontal is; only what was changed.
-    assert reloaded._settings.fileName() == settings_ini_path.as_posix()
     lines = _ui_lines(settings_ini_path)
     for line in (
         r"laser_control\sections\board_trigger=false",
@@ -142,12 +163,12 @@ def test_a_folded_section_stays_folded_after_a_restart(
 
 
 def test_a_laser_s_command_output_stays_off_after_a_restart(
-    make_panel, app_model, monkeypatch, settings_ini_path,
+    make_panel, app_model, monkeypatch, settings_ini_path, tmp_path,
 ):
     first = make_panel()
     first._channel_tabs[1]._trace_command_checkbox.setChecked(False)
 
-    reloaded = _restart(app_model, monkeypatch, settings_ini_path)
+    reloaded = _restart(app_model, monkeypatch, settings_ini_path, tmp_path)
     second = make_panel()
 
     assert [tab.command_trace_visible for tab in second._channel_tabs] == [
@@ -157,19 +178,47 @@ def test_a_laser_s_command_output_stays_off_after_a_restart(
     assert reloaded.laser_command_output_shown(2) is False
 
 
-@pytest.mark.parametrize("damaged", (
-    "banana", "", "1", 7, ["true", "false"], QByteArray(b"\x00\xff"),
-), ids=("word", "empty", "digit", "number", "list", "bytes"))
-def test_a_damaged_saved_value_falls_back_to_the_default(
-    make_panel, app_model, monkeypatch, settings_ini_path, damaged,
+@pytest.mark.parametrize("written, expected", (
+    ("true", True), ("false", False), ("TRUE", True), ("False", False), ('" TRUE "', True),
+), ids=("true", "false", "upper", "capitalised", "quoted-spaces"))
+def test_a_saved_true_or_false_is_read_from_the_file(
+    make_panel, app_model, monkeypatch, tmp_path, written, expected,
 ):
-    settings = app_model.preferences._settings
-    # One good value, so the panel is shown to read the file at all.
-    settings.setValue("ui/laser_control/sections/signals", True)
-    settings.setValue("ui/laser_control/sections/board_trigger", damaged)
-    settings.setValue("ui/laser_control/sections/pmt_margins", damaged)
-    settings.setValue("ui/laser_control/command_output/laser1", damaged)
-    _restart(app_model, monkeypatch, settings_ini_path)
+    preferences = _start_with_file(app_model, monkeypatch, tmp_path / "written.ini", (
+        _laser_control_file((
+            (r"sections\signals", written),
+            (r"sections\board_trigger", written),
+            (r"sections\pmt_margins", written),
+            (r"command_output\laser1", written),
+        ))))
+    # Parsed from its text, the value comes back a str: what the reads
+    # below go through.
+    assert isinstance(preferences._settings.value("ui/laser_control/sections/signals"), str)
+
+    panel = make_panel()
+
+    for tab in panel._channel_tabs:
+        assert _sections(tab) == dict(
+            LASER_SECTIONS, signals=expected, board_trigger=expected), tab.channel_id_value
+    assert _sections(panel._builder) == dict(BUILDER_SECTIONS, pmt_margins=expected)
+    assert [tab.command_trace_visible for tab in panel._channel_tabs] == [
+        expected, True, True, True]
+
+
+@pytest.mark.parametrize("damaged", (
+    "banana", "", "1", "yes", "true, false", "@ByteArray(true)",
+), ids=("word", "empty", "digit", "yes", "list", "bytes"))
+def test_a_damaged_saved_value_falls_back_to_the_default(
+    make_panel, app_model, monkeypatch, tmp_path, caplog, damaged,
+):
+    caplog.set_level("WARNING", logger="tools.acquisition.model.user_preferences")
+    _start_with_file(app_model, monkeypatch, tmp_path / "written.ini", _laser_control_file((
+        # One good value, so the panel is shown to read the file at all.
+        (r"sections\signals", "true"),
+        (r"sections\board_trigger", damaged),
+        (r"sections\pmt_margins", damaged),
+        (r"command_output\laser1", damaged),
+    )))
 
     panel = make_panel()
 
@@ -177,6 +226,15 @@ def test_a_damaged_saved_value_falls_back_to_the_default(
         assert _sections(tab) == dict(LASER_SECTIONS, signals=True), tab.channel_id_value
     assert _sections(panel._builder) == BUILDER_SECTIONS
     assert all(tab.command_trace_visible for tab in panel._channel_tabs)
+    # Each bad value is named once, when the panel reads it.
+    warnings = [record.getMessage() for record in caplog.records
+                if record.levelname == "WARNING" and "Ignoring" in record.getMessage()]
+    for key in ("sections/board_trigger", "sections/pmt_margins", "command_output/laser1"):
+        named = [message for message in warnings
+                 if message.startswith(f"Ignoring ui/laser_control/{key} = ")]
+        assert len(named) == 1, warnings
+        assert named[0].endswith("in the preferences: not true or false")
+    assert not [message for message in warnings if "signals" in message]
 
 
 class _UnreadableSettings:
