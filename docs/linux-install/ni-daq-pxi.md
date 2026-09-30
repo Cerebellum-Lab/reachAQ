@@ -184,6 +184,18 @@ remain on the 6713. Digital and analog inputs may share the 6221 task; a
 future hardware-timed 6713 output task must join the validated multi-device
 timing topology described below.
 
+The stream and the laser controller read every analog input with the
+stream's `analogTerminalConfig` (`rse` by default). Each input also needs a DC
+reference to AI GND, which the terminal setting cannot give it. On a
+BNC-2090A that means the channel's AI x / AI x+8 switch on SE, with the
+RSE/NRSE switch on RSE, or a differential input with a bias resistor from AI-
+to AI GND. An input left floating reads a level that depends on the channels
+scanned around it: its offset, and a laser calibration's intercept, cannot be
+trusted, though a laser calibration's gain still can. christielab10's laser 1
+diode input, `PXI1Slot5/ai8`, is a known case: it floats, and at idle reads
+-0.16 to -0.2 V, depending on the channels scanned with it, in the
+calibration ramp and in recordings alike.
+
 The laser's clocked digital outputs - the PMT shutter (`pmtShutterOutput`)
 and each laser's `triggerOutput` and `timingTriggerOutput` - run as clocked
 digital output tasks beside a pulse's analog waveform. Each must be a line on

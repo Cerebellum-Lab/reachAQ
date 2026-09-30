@@ -284,13 +284,14 @@ even for a pulse set to leave its shutter open, and whoever opened it: a
 cancelled pulse leaves the laser safe, and a shutter open before it is closed
 too. A pulse cancelled before it opens its shutter does not open it, and one
 cancelled as it opens it closes it again at once. The cancel then aborts the
-train's output, then its digital lines, which ends the train at once, and puts
-the command back to its minimum straight after. On christielab10's 6221 an
-abort ended a waiting task in about 40 ms, where a stop from another thread
-waited for the whole task (H5b, H5a); on the 6713 the output was back at 0 V
-about 15 ms after the cancel (H8a, measured before the shutter-first order). A
-pulse armed and waiting for its trigger ends the
-same way. The controller waits up to five seconds for a train that does not
+train's output, which ends the train at once: the train's own cleanup then
+stops its digital lines and puts the command back to its minimum. Only a train
+the abort does not wake, one waiting for its software start, has its lines
+aborted by the cancel, after the output. On christielab10's 6221 an abort ended
+a waiting task in about 40 ms, where a stop from another thread waited for the
+whole task (H5b, H5a). On the 6713 the output was back at 0 V 24-40 ms after a
+cancel; the abort itself takes 12.6-32 ms, and varies from run to run. A pulse
+armed and waiting for its trigger ends the same way. The controller waits up to five seconds for a train that does not
 end, as with a sick driver, before it goes on without it. The status line
 then reads *"Laser operation failed: Laser operation ... was cancelled: the
 laser controller was closed while it ran"*.
@@ -392,21 +393,34 @@ shutter** holds the PMT shutter open for the ramp. Press **Run Ramp**.
 - **Settle:** is how long the start of each step is left out of that step's
   point, in µs; the rest of the step is averaged, for the diode and the
   command copy alike. The default is 600 µs, 60 samples at christielab10's
-  100 kHz, whatever **Samples/step:** is. It leaves out two responses. The
-  laser driver and the diode take time to follow a step: christielab10's
-  diodes came within 2% of their level in 420 and 550 µs. And the input path
-  settles on its own: at the ramp's start, with the command steady at 0 V,
-  both diode inputs read about 1 V and decayed with a time constant of about
-  115 µs, which is the acquisition settling, not the laser. The input is read
-  on the clock edge the command changes on, so without a settle the first
-  samples of a step still read the step before, and pulled every point of a
-  rising ramp low. **Settle:** must leave at least one sample of each step;
-  Run Ramp refuses one that does not, naming both values.
+  100 kHz, whatever **Samples/step:** is. What settles at each step is the
+  laser and the input path together; the measurements cannot tell them
+  apart. The input is read on the clock edge the command changes on, so
+  without a settle the first samples of a step still read the step before,
+  and pulled every point of a rising ramp low. At the ramp's start, with the
+  command steady at 0 V, both diode inputs also read a false level of
+  0.7-1.6 V that decays with a time constant of 93-120 µs: that is the input
+  path settling, not the laser. **Settle:** must leave at least one sample of
+  each step; Run Ramp refuses one that does not, naming both values.
+- 600 µs and 5 ms steps are confirmed on christielab10: laser 2's diode
+  settles within 270-610 µs of each step, and every point lands within 0.5%
+  of its step. 600 µs has little margin, though: laser 2 needs 55-61 samples
+  to come within 2%, against the 60 left out. At 5 ms steps a longer settle
+  costs little, 440 samples still being averaged at 600 µs.
 - **Samples/step:** defaults to 500, 5 ms at 100 kHz: christielab10's slower
   diode was still rising through the second half of a 1 ms step. For a slow
   diode, use longer steps rather than a longer settle alone, so that each
   point still averages enough settled samples. **Samples/step:** is taken
   when you finish typing (Return, leaving the field, or **Run Ramp**).
+- A laser diode's monitor input needs a DC reference to AI GND. On a
+  BNC-2090A that is the channel's AI x / AI x+8 switch on SE, with the
+  RSE/NRSE switch on RSE, or a differential input with a bias resistor to AI
+  GND. A floating input reads a level that depends on the other channels
+  scanned around it: its offset, and the calibration's intercept, cannot be
+  trusted, though its gain still can. christielab10's laser 1 diode input,
+  ai8, is a known case: it floats, and at idle reads -0.16 to -0.2 V,
+  depending on the channels scanned with it, in the ramp and in recordings
+  alike.
 - All of the ramp's fields go back to their defaults whenever Laser Control
   is rebuilt: on every Run and Stop, on a DAQ Ports save or a configuration
   load that changes the lasers, and when a laser close that ended late

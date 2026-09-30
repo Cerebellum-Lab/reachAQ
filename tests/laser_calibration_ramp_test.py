@@ -767,7 +767,6 @@ def test_run_ramp_runs_on_the_operation_worker_off_the_qt_thread(ramp_app, qapp,
         content.deleteLater()
 
 
-
 def test_the_ramps_controller_references_its_inputs_as_the_stream_does(ramp_app):
     # The controller's own inputs took DAQmx's default: on christielab10's
     # 6221, ai3, ai4 and ai5 differential, where the stream reads them as RSE.
@@ -778,3 +777,51 @@ def test_the_ramps_controller_references_its_inputs_as_the_stream_does(ramp_app)
     stream = app.nidaq_signal_monitor.configuration.analog_terminal_config
     assert stream
     assert [kwargs.get("analog_terminal_config") for kwargs in spy.opened_with] == [stream]
+
+
+def _laser_opened_as_a_run_opens_it(app):
+    """The analogTerminalConfig System Mode gave the laser model as it opened it."""
+    given = []
+    load = app.laser.load_configuration
+
+    def recorded(configuration, **kwargs):
+        given.append(kwargs.get("analog_terminal_config"))
+        return load(configuration, **kwargs)
+
+    app.laser.load_configuration = recorded
+    try:
+        assert app._start_laser_domain()
+    finally:
+        del app.laser.load_configuration
+        app.laser.stop_direct_trigger_receiver()
+        app.laser.close()
+    return given
+
+
+def test_system_mode_opens_the_laser_with_the_streams_terminal_config(nidaq_app):
+    assert nidaq_app.load_configuration() is True
+    nidaq_app.laser.set_configuration_offline(_null_lasers())
+
+    given = _laser_opened_as_a_run_opens_it(nidaq_app)
+
+    stream = nidaq_app.nidaq_signal_monitor.configuration.analog_terminal_config
+    assert stream
+    assert given == [stream]
+
+
+def test_with_a_refused_plan_the_laser_takes_the_stored_streams_terminal_config(
+    nidaq_app, monkeypatch,
+):
+    # With a refused plan the stream runs no channels, on a default
+    # configuration: the operator's own stream, as stored, is the source.
+    assert nidaq_app.load_configuration() is True
+    nidaq_app.laser.set_configuration_offline(_null_lasers())
+    stored = nidaq_app._loaded_configuration
+    monkeypatch.setattr(stored, "nidaq_stream", dataclasses.replace(
+        stored.nidaq_stream, analog_terminal_config="nrse"))
+    monkeypatch.setattr(nidaq_app, "_nidaq_plan_error", "test: a refused plan")
+
+    given = _laser_opened_as_a_run_opens_it(nidaq_app)
+
+    assert nidaq_app.nidaq_signal_monitor.configuration.analog_terminal_config != "nrse"
+    assert given == ["nrse"]

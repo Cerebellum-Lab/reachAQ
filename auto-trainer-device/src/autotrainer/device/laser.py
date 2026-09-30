@@ -124,12 +124,14 @@ class LaserSynchronizedPulseTrain:
 
 
 #: How long the start of each calibration step is left out of its point, by
-#: default: a time, whatever the step's length. Measured on christielab10
-#: (H2b, 2026-09-29, 1 ms steps at 100 kHz): the diodes came within 2% of
-#: their level by 42 and 55 samples, 420 and 550 us, and the command copies at
-#: once. With the command steady at 0 V, both inputs also decayed from about
-#: 1 V with a time constant of 110-120 us at the ramp's start: the input path
-#: settling, not the laser. 600 us leaves both out.
+#: default: a time, whatever the step's length. Confirmed on christielab10
+#: with 5 ms steps at 100 kHz (H2b, c12189cd): laser 2's diode came within 2%
+#: in 270-610 us, laser 1's in 420-430 us, the command copies at once, and
+#: every point lands within 0.5% of its step. Laser 2 needs 55-61 samples
+#: against the 60 dropped, so there is little margin. What settles is the
+#: laser and the input path together, which H2b cannot separate; at the
+#: ramp's start, with the command steady at 0 V, both inputs also decay from
+#: a false level with a time constant of 93-120 us, which is the input path.
 CALIBRATION_SETTLE_SECONDS = 600e-6
 
 

@@ -350,7 +350,6 @@ def test_test_stims_pulse_says_it_is_test_stim():
     operation.cancel()
 
 
-
 def test_the_models_nidaq_controllers_take_the_streams_terminal_config(monkeypatch):
     # The laser's own inputs are referenced as the stream references its
     # inputs: the value is passed to each NI-DAQ controller the model opens.

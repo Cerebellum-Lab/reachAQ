@@ -8,6 +8,7 @@ train to run out with the shutter state unmanaged.
 Nothing here touches a driver or a board (nidaq_daqmx_fake).
 """
 
+import dataclasses
 import logging
 import threading
 import time
@@ -543,8 +544,8 @@ def test_a_stop_that_fails_otherwise_is_still_an_error(monkeypatch, caplog):
 
 def test_a_cancel_closes_the_pulses_shutter_before_it_aborts(held):
     # close() closes the shutters first; a trial's cancel went straight to
-    # the abort, and the light stayed on for the abort and the reset, about
-    # 14 ms on the 6713 (H8a).
+    # the abort, and the light stayed on for the abort and the reset, 24-40
+    # ms after the cancel on the 6713 (H8a, H8c on c12189cd).
     daq = held
     controller = NidaqLaserController(_routed())
     operation = _armed(controller, trigger_source="/PXI1Slot4/PXI_Trig0")
@@ -831,13 +832,16 @@ def test_a_cancel_closes_the_shutter_of_a_pulse_meant_to_leave_it_open(held):
 def test_a_cancel_just_before_the_shutter_opens_leaves_it_closed(held):
     # The cancel closed the shutter, and the pulse then opened it: with a
     # pulse that leaves its shutter open, it stayed open. The pulse now
-    # looks whether it is cancelled as it opens it, behind the lock a
-    # cancel takes to mark it so. The cancel here ends as the pulse writes
-    # its output's buffer, its last driver call before the shutter.
+    # looks whether it is cancelled before it opens it, and again after. The
+    # cancel here ends as the pulse writes its output's buffer, its last
+    # driver call before the shutter: the first look finds it, and the
+    # shutter is never opened after it.
     daq = held
     controller = NidaqLaserController(_routed())
     create = controller._create_synchronized_analog_output_task
+    shutter = daq.task("laser_1_shutter")
     cancelled = []
+    after_the_cancel = []
 
     def cancel_as_the_buffer_is_written(channels, name):
         task = create(channels, name)
@@ -849,6 +853,7 @@ def test_a_cancel_just_before_the_shutter_opens_leaves_it_closed(held):
             canceller = threading.Thread(target=lambda: cancelled.append(operation.cancel()))
             canceller.start()
             canceller.join(5.0)
+            after_the_cancel.append(len(shutter.writes))
             return result
 
         task.write = written
@@ -866,7 +871,9 @@ def test_a_cancel_just_before_the_shutter_opens_leaves_it_closed(held):
     _wait_for(lambda: cancelled == [True])
     _wait_for(lambda: controller._live_operations == {})
 
-    assert daq.task("laser_1_shutter").writes[-1] is False
+    assert shutter.writes[-1] is False
+    # Not opened and closed again: the second look would leave it closed too.
+    assert True not in shutter.writes[after_the_cancel[0]:]
 
 
 def test_a_cancel_as_the_shutter_opens_has_the_pulse_close_it_again(held):
@@ -905,9 +912,13 @@ def test_a_cancel_as_the_shutter_opens_has_the_pulse_close_it_again(held):
 
 
 def test_a_cancel_during_a_hung_shutter_open_marks_cancelled_at_once(held):
-    # A cancel waited for a shutter opening in progress: a driver hung in
-    # that write held the cancel, and close() behind it. It is marked at
-    # once now, and the pulse, once its write returns, closes the shutter.
+    # A cancel waited, on a lock, for a shutter opening in progress: a
+    # driver hung in that write held the cancel's mark, and close() behind
+    # it. The mark is made at once now, and the pulse, once its write
+    # returns, closes the shutter. The cancel's own shutter close, and
+    # close()'s first loop, still write that shutter's task: where DAQmx
+    # makes calls on one task wait for each other, those wait behind a hung
+    # opening. The fake does not, so this pins the mark alone.
     daq = held
     controller = NidaqLaserController(_routed())
     shutter = daq.task("laser_1_shutter")
@@ -1025,3 +1036,110 @@ def test_the_aborts_filter_is_not_shadowed_by_a_later_catch_all(held):
         warnings.warn(FakeDaqWarning(ABORT_WARNING_TEXT))
 
     assert [str(warning.message) for warning in seen if "200010" in str(warning.message)] == []
+
+
+# ------------------------------------------------ round 9: several shutters
+
+
+def _two_lasers():
+    """christielab10's two lasers: both outputs on the 6713, both shutters on the 6221."""
+    lasers = rig_lasers()
+    one, = lasers.channels
+    two = dataclasses.replace(
+        one, channel_id=LaserChannelId.LASER_2, analog_output="PXI1Slot4/ao1",
+        diode_input="PXI1Slot5/ai4", command_copy_input="PXI1Slot5/ai5",
+        shutter_output="PXI1Slot5/port0/line5")
+    return dataclasses.replace(lasers, channels=(one, two))
+
+
+def _both_left_open():
+    """Both lasers, each pulse leaving its shutter open."""
+    return LaserSynchronizedPulseTrain(
+        pulse_trains=tuple(
+            LaserPulseTrain(channel_id=channel_id, amplitude_volts=1.0,
+                            duration_ms=1.0, close_shutter=False)
+            for channel_id in (LaserChannelId.LASER_1, LaserChannelId.LASER_2)),
+        wait=False, timeout_seconds=30.0)
+
+
+def test_a_cancel_as_the_second_shutter_fails_to_open_still_closes_the_first(held):
+    # The cancel lands after the pulse's first look, and closes both
+    # shutters; the pulse then opens laser 1's, and laser 2's opening
+    # raises. With no second look after a raise, laser 1's stayed open under
+    # a cancel, the pulse leaving it so.
+    daq = held
+    controller = NidaqLaserController(_two_lasers())
+    set_shutter_open = controller.set_shutter_open
+
+    def cancelled_as_they_open(channel_id, is_open):
+        if is_open and int(channel_id) == 1:
+            operation, = controller._live_operations.values()
+            operation.cancel()
+        if is_open and int(channel_id) == 2:
+            raise RuntimeError("DAQmx refused laser 2's shutter")
+        return set_shutter_open(channel_id, is_open)
+
+    controller.set_shutter_open = cancelled_as_they_open
+
+    with pytest.raises(RuntimeError, match="cancelled"):
+        controller.run_synchronized_pulse_train(_both_left_open())
+    _wait_for(lambda: controller._live_operations == {})
+
+    assert daq.task("laser_1_shutter").writes[-2:] == [True, False]
+
+
+def test_a_shutter_that_fails_to_close_under_a_cancel_leaves_the_others_closed(held, caplog):
+    # The cancel lands as laser 2's shutter opens, after laser 1's. The
+    # second look closes both; laser 1's close raising skipped laser 2's,
+    # which stayed open.
+    daq = held
+    controller = NidaqLaserController(_two_lasers())
+    set_shutter_open = controller.set_shutter_open
+    opened = []
+
+    def cancelled_as_the_second_opens(channel_id, is_open):
+        if is_open and int(channel_id) == 2:
+            operation, = controller._live_operations.values()
+            operation.cancel()
+            opened.append(2)
+        elif not is_open and int(channel_id) == 1 and opened:
+            raise RuntimeError("DAQmx refused to close laser 1's shutter")
+        return set_shutter_open(channel_id, is_open)
+
+    controller.set_shutter_open = cancelled_as_the_second_opens
+
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(RuntimeError, match="cancelled"):
+            controller.run_synchronized_pulse_train(_both_left_open())
+        _wait_for(lambda: controller._live_operations == {})
+
+    assert daq.task("laser_2_shutter").writes[-2:] == [True, False]
+    assert any("laser 1 shutter" in record.getMessage() for record in caplog.records)
+
+
+# ------------------------------------------------ round 9: a pulse never woken
+
+
+def test_a_never_woken_pulses_cancel_aborts_the_output_then_its_line(monkeypatch):
+    # Where the abort does not wake the pulse's wait, its own cleanup never
+    # takes its tasks, and the cancel aborts them all: the output first,
+    # then its line.
+    daq = FakeDaqmx(block_wait=True, hold_waits=True, abort_unblocks=False)
+    monkeypatch.setattr(nidaq_laser, "_load_nidaqmx", lambda: daq)
+    controller = NidaqLaserController(_routed())
+    operation = _armed(controller, trigger_source="/PXI1Slot4/PXI_Trig0",
+                       enable_pmt_shutter=True)
+    before = len(daq.timeline)
+    try:
+        assert operation.cancel()
+
+        wanted = {("write", "laser_1_shutter"), ("abort", "laser_sync_pulse_ao"),
+                  ("abort", "laser_pmt_shutter_do")}
+        order = [(entry.event, entry.task, entry.data) for entry in daq.timeline[before:]
+                 if (entry.event, entry.task) in wanted]
+        assert order == [("write", "laser_1_shutter", False),
+                         ("abort", "laser_sync_pulse_ao", None),
+                         ("abort", "laser_pmt_shutter_do", None)]
+    finally:
+        daq.waits_released.set()
+    assert operation.wait(5.0) is LaserOperationState.CANCELLED

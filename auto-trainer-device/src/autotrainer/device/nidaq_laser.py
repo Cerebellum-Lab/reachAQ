@@ -43,8 +43,8 @@ _OPERATION_CANCEL_TIMEOUT_S = 5.0
 #: How long a path that cancels a pulse and goes on waits for it to end,
 #: so that what it does next finds the board free; the one bound for every
 #: such path, the application's too. The abort ends it in milliseconds
-#: (christielab10, H8a: the wait woke 11.9 ms after the cancel); this bounds
-#: a sick driver.
+#: (christielab10: the wait woke 21-35 ms after the cancel, H8a and H8c on
+#: c12189cd); this bounds a sick driver.
 CANCELLED_OPERATION_WAIT_S = 2.0
 #: How long a stop or close keeps trying while an abort is still finishing.
 #: DAQmx refused a stop so, -88710, made while a task never started, its
@@ -105,8 +105,10 @@ class NidaqLaserOperation:
         self.operation_id = str(uuid.uuid4())
         #: Called by cancel() before any abort: closes the pulse's shutter,
         #: as close() closes the shutters first. After an abort the output
-        #: holds its amplitude until the cleanup's reset, about 14 ms on the
-        #: 6713 (H8a); with the shutter closed the light is off for it.
+        #: holds its amplitude until the cleanup's reset: 0 V came 24-40 ms
+        #: after the cancel on the 6713 (H8a, H8c on c12189cd), the abort
+        #: itself taking 12.6-32 ms. With the shutter closed the light is off
+        #: for it.
         self._before_abort = before_abort
         #: Set once the pulse's waits have returned: it was delivered, and a
         #: cancel from then on changes nothing (_mark_finishing).
@@ -181,8 +183,9 @@ class NidaqLaserOperation:
 
     def cancel(self):
         tasks = ()
-        # Marked at once, and never behind a driver call: a pulse opening its
-        # shutter looks again after it opens (_open_shutters_unless_cancelled).
+        # The mark is made at once, under the lock and before any driver
+        # call: a pulse opening its shutter looks again after it opens
+        # (_open_shutters_unless_cancelled).
         with self._lock:
             if self._state in self.TERMINAL or self._finishing:
                 return False
@@ -194,6 +197,9 @@ class NidaqLaserOperation:
         # abort, which waits for it; about a millisecond through the
         # channel's own task, a transient task's making once close() has let
         # go of that one, and a driver hung in it holds the abort back too.
+        # It writes the task the pulse opens its shutter through: where
+        # DAQmx makes calls on one task wait for each other, it waits behind
+        # a hung opening as well.
         if self._before_abort is not None:
             try:
                 self._before_abort()
@@ -307,17 +313,24 @@ class NidaqLaserOperation:
         A cancel closes them before its abort. Made just before the pulse
         opened them, it found them closed, and the pulse then opened them: a
         pulse that leaves its shutter open left it so. The pulse looks before
-        it opens them and again after. Cancelled by the second look, it
-        closes them itself, by `close_shutters`, and ends as the cancel; a
-        cancel marked after it closes them after the opening. Nothing makes a
-        cancel wait here: a driver hung in the opening holds this thread only.
+        it opens them and again after, however the opening ended: one that
+        raised part-way can have opened some of them. Cancelled by the second
+        look, it closes them itself, by `close_shutters`, and ends as the
+        cancel; a cancel marked after it closes them after the opening.
+
+        The cancel's mark does not wait on the opening. Its own shutter close
+        does write the same tasks, and so does close()'s first loop: where
+        DAQmx makes calls on one task wait for each other, those still wait
+        behind a hung opening.
         """
         if self.state is LaserOperationState.CANCELLED:
             raise RuntimeError("Laser operation was cancelled before its shutter opened")
-        open_shutters()
-        if self.state is LaserOperationState.CANCELLED:
-            close_shutters()
-            raise RuntimeError("Laser operation was cancelled as its shutter opened")
+        try:
+            open_shutters()
+        finally:
+            if self.state is LaserOperationState.CANCELLED:
+                close_shutters()
+                raise RuntimeError("Laser operation was cancelled as its shutter opened")
 
     def _mark_armed(self):
         with self._lock:
@@ -469,6 +482,9 @@ class NidaqLaserController:
         #: The ramp's tasks started so far, by id, under the lock: close()'s
         #: abort of one of them can warn (200010), and says so.
         self._started_calibration_tasks: set = set()
+        #: Those close() has aborted, by id, under the lock: the ramp's own
+        #: stop of one after that is not noted as an early stop.
+        self._aborted_calibration_tasks: set = set()
         #: Set by close(), under _operation_lock, before it calls the driver.
         #: A ramp or pulse train starts, and a route is kept, only while it is
         #: clear.
@@ -778,8 +794,8 @@ class NidaqLaserController:
     def _abort_task(self, task, owner: str, name: str, *, running: bool) -> None:
         """TASK_ABORT on a pulse's or a ramp's task, from any thread.
 
-        Nothing else is asked of the driver: `name` is the one its owner read
-        as it bound the task. Task.name is a driver query, and the owner,
+        Nothing else is asked of the driver: `name` is the one its owner made
+        the task with. Task.name is a driver query, and the owner,
         woken by this abort, can have cleared the task before the abort
         returns (-200088, christielab10, H8c). Aborting a running task warns,
         DaqWarning 200010 (H5b, H8a), the abort doing what was asked: one
@@ -995,9 +1011,15 @@ class NidaqLaserController:
                         self.set_shutter_open(channel.channel_id, True)
 
             def close_shutters():
+                # Each on its own: one that fails leaves the others to close.
                 for channel, channel_pulse in zip(channels, pulse_train.pulse_trains):
                     if channel_pulse.open_shutter:
-                        self._close_shutter(channel)
+                        try:
+                            self._close_shutter(channel)
+                        except Exception:
+                            logger.exception(
+                                "Failed to close the laser %s shutter a cancel "
+                                "found opening", channel.channel_id.value)
 
             if operation is None:
                 open_shutters()
@@ -1203,6 +1225,7 @@ class NidaqLaserController:
             self._calibration_released.clear()
             self._released_calibration_tasks.clear()
             self._started_calibration_tasks.clear()
+            self._aborted_calibration_tasks.clear()
         try:
             # Both inside the cleanup scope: created before it, an input task
             # that failed to create left the output task open on ao0.
@@ -1315,7 +1338,8 @@ class NidaqLaserController:
                         id(task): name
                         for _owner, name, task in self._calibration_tasks
                         if id(task) in self._started_calibration_tasks
-                        and id(task) not in finished}
+                        and id(task) not in finished
+                        and id(task) not in self._aborted_calibration_tasks}
                     self._calibration_tasks.clear()
                     self._started_calibration_tasks.clear()
                 self._cleanup_calibration_ramp(
@@ -1691,6 +1715,12 @@ class NidaqLaserController:
             # the first abort can be what let the ramp go to that cleanup.
             if self._calibration_task_released(task):
                 continue
+            # Before the abort: the ramp, woken by it, can reach its cleanup
+            # before the abort returns (H8c), and must find it aborted then.
+            with self._route_lock():
+                aborted = getattr(self, "_aborted_calibration_tasks", None)
+                if aborted is not None:
+                    aborted.add(id(task))
             try:
                 self._abort_task(
                     task, owner, name, running=self._calibration_task_started(task))
