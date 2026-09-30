@@ -327,13 +327,17 @@ and its retry of a failed laser in System Mode), loading a configuration and
 saving Edit DAQ Ports are refused with *"the laser controller is still
 closing after a driver hang ..."*, and the laser's runtime status reads
 failed with that reason: after Stop, after a Run start or a ramp whose
-controller failed to open, and through a hardware settings save. So is all
+controller failed to open, after a ramp whose own close of its controller
+hung, and through a hardware settings save. So is all
 of it while a pulse train or ramp that the close stopped waiting for is
 still running, since it can still drive the lines; that refusal reads *"a
 laser operation the close gave up on is still running in the driver ..."*.
-The refusal clears by itself when the close ends, and the log says so; in
-System Mode the laser then stays failed until Refresh Hardware opens it
-again. While a close is still within its bound, the same work is refused with
+In Idle the NI-DAQ input stream stays stopped meanwhile, since a controller
+still closing can hold inputs on the stream's lines, and its status reads
+*"NI-DAQ input stream held back: ..."* with the same reason.
+The refusal clears by itself when the close ends, and the log says so, and
+in Idle the stream starts again by itself; in System Mode the laser then
+stays failed until Refresh Hardware opens it again. While a close is still within its bound, the same work is refused with
 *"the laser controller is closing; wait for it to finish"*.
 
 Picking a profile in **Profile:** chooses what Run Pulse and Test stim fire on

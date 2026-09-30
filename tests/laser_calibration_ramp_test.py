@@ -905,3 +905,95 @@ def test_a_hardware_refresh_is_refused_mid_ramp_by_name(ramp_app, monkeypatch):
     assert seen == [
         "Hardware refresh is unavailable while a laser calibration ramp runs; "
         "wait for it to finish"]
+
+
+# ---------------------------------------------- workstream D: the follow-ups
+
+
+def _hang_the_ramps_close(spy, release):
+    """During the ramp: its controller's close will hang until `release`."""
+    def the_close_hangs():
+        controller = spy.controllers[-1]
+        close = controller.close
+
+        def hung():
+            release.wait(10.0)
+            close()
+
+        controller.close = hung
+
+    spy.during = the_close_hangs
+
+
+def _laser_status(app):
+    from tools.acquisition.model.subsystem_status import SubsystemId
+
+    return app.subsystem_statuses.get(SubsystemId.LASER.value)
+
+
+def _ramp_whose_close_hangs(app, spy, monkeypatch):
+    """Run the ramp, its close hung; the release that lets that close end."""
+    from tools.acquisition.model import app_model as app_model_module
+
+    monkeypatch.setattr(app_model_module, "_LASER_CONTROLLER_CLOSE_S", 0.3)
+    release = threading.Event()
+    _hang_the_ramps_close(spy, release)
+    ramp = threading.Thread(target=app.run_laser_calibration_ramp, args=(RAMP,), daemon=True)
+    ramp.start()
+    ramp.join(5.0)
+    assert not ramp.is_alive(), "the ramp waited for its hung close"
+    assert "laser calibration controller is still closing" in (
+        app.laser_controller_close_refusal())
+    return release
+
+
+def _until_the_close_ends(app):
+    deadline = time.monotonic() + 5.0
+    while app.laser_controller_close_refusal() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert app.laser_controller_close_refusal() == ""
+
+
+def test_a_ramps_hung_close_keeps_the_stream_stopped_until_it_ends(ramp_app, monkeypatch):
+    # A close given up on let go of the ramp's hold on the stream, which
+    # restarted while that close was still inside the driver, with the
+    # ramp's inputs open on the same lines.
+    app, spy = ramp_app
+    monitor = app.nidaq_signal_monitor
+    release = _ramp_whose_close_hangs(app, spy, monkeypatch)
+    try:
+        refusal = app.laser_controller_close_refusal()
+        assert app._nidaq_stream_autostart.pause_reasons == ()
+        assert app._nidaq_stream_autostart.wait(10.0)
+        app._request_nidaq_stream("test: while the ramp's close hangs")
+        assert app._nidaq_stream_autostart.wait(10.0)
+        assert not _stream_active(monitor), "the stream restarted over a hung close"
+        # And it says why.
+        assert refusal in monitor.status_message
+    finally:
+        release.set()
+
+    _until_the_close_ends(app)
+    # It starts again by itself once the close has ended.
+    assert _settle(app).is_running
+
+
+def test_a_ramps_hung_close_fails_the_laser_until_it_ends(ramp_app, monkeypatch):
+    # LASER said nothing of it, unlike a failed open's close still in the
+    # driver: the refusal showed only once laser work was tried.
+    from tools.acquisition.model.subsystem_status import SubsystemState
+
+    app, spy = ramp_app
+    release = _ramp_whose_close_hangs(app, spy, monkeypatch)
+    try:
+        laser = _laser_status(app)
+        assert laser.state is SubsystemState.FAILED
+        assert laser.error == app.laser_controller_close_refusal()
+    finally:
+        release.set()
+
+    _until_the_close_ends(app)
+    deadline = time.monotonic() + 5.0
+    while _laser_status(app).state is SubsystemState.FAILED and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert _laser_status(app).state is not SubsystemState.FAILED

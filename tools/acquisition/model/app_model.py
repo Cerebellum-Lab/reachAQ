@@ -820,8 +820,9 @@ class AppModel(ObservableObject):
             self._nidaq_signal_monitor,
             may_start=self._nidaq_stream_may_start,
             # A released hold says "stopped"; with a refused plan held, the
-            # laser tabs and Analysis then lost the reason (A8).
-            on_released=self._hold_nidaq_plan_blocked,
+            # laser tabs and Analysis then lost the reason (A8), and so with
+            # a laser close given up on.
+            on_released=self._on_nidaq_stream_released,
         )
         #: Whether _start_nidaq_domain is running, and whether the stream's
         #: latest start came while it was; see _on_nidaq_monitor_property_changed.
@@ -6428,7 +6429,30 @@ class AppModel(ObservableObject):
             # A refused plan: there is nothing valid to start until Edit DAQ
             # Ports saves one.
             and not self._nidaq_plan_error
+            # Nor while a laser close given up on is still inside the driver:
+            # a ramp's controller still holds its inputs on the stream's
+            # lines. Its hold on the stream was let go when the ramp ended,
+            # and the stream restarted over that close (final re-review,
+            # affb7491). The close's late finish asks for it again.
+            and not self._given_up_close_refusal()
         )
+
+    def _show_nidaq_stream_held_for_laser_close(self) -> None:
+        """Say why the idle input stream stays stopped: a close given up on.
+
+        _nidaq_stream_may_start refuses while one is listed, and the stream
+        read only "stopped". Not in System Mode, whose stream state is the
+        acquisition's to tell, nor over a refused plan's, which is held.
+        """
+        refusal = self._given_up_close_refusal()
+        if refusal and self._nidaq_stream_idle() and not self._nidaq_plan_error:
+            self._nidaq_signal_monitor.show_blocked(
+                f"NI-DAQ input stream held back: {refusal}")
+
+    def _on_nidaq_stream_released(self) -> None:
+        """The last hold on the stream is let go: say what still holds it back."""
+        if not self._hold_nidaq_plan_blocked():
+            self._show_nidaq_stream_held_for_laser_close()
 
     @property
     def nidaq_plan_error(self) -> str:
@@ -6499,6 +6523,7 @@ class AppModel(ObservableObject):
                 SubsystemState.READY,
                 reason="NI-DAQ tasks running",
             )
+        self._show_nidaq_stream_held_for_laser_close()
         self._nidaq_stream_autostart.request()
 
     def pause_nidaq_stream(self, holder, reason: str) -> None:
@@ -6725,8 +6750,10 @@ class AppModel(ObservableObject):
         Unbounded, a driver hung in it held the ramp's thread in its finally:
         the calibration stayed active, the panel stuck, and nothing was said
         until reachAQ closed. Past the bound it is watched as a close given
-        up on, so laser work is refused by name until it ends, and the ramp
-        ends without it. A close that raised is raised here, as before.
+        up on, so laser work is refused by name until it ends, LASER says so
+        meanwhile, and the ramp ends without it. The input stream stays
+        stopped meanwhile too (_nidaq_stream_may_start). A close that raised
+        is raised here, as before.
         """
         closing = _BoundedClose(
             lambda: self._close_laser_calibration_controller(keep_error=keep_error),
@@ -6743,6 +6770,11 @@ class AppModel(ObservableObject):
                 "%.1f s. %s The ramp ends without it.",
                 int(ramp.channel_id), _LASER_CONTROLLER_CLOSE_S,
                 self._laser_calibration_output_note(ramp))
+            # As a failed open's close still in the driver writes it
+            # (_watch_failed_open_close): the refusal showed only once laser
+            # work was tried. The close's late finish sets it back.
+            self._set_laser_status_after_close(
+                lambda refusal: (SubsystemState.FAILED, dict(error=refusal)) if refusal else None)
             return
         if closing.error is not None:
             raise closing.error
@@ -7173,6 +7205,9 @@ class AppModel(ObservableObject):
                 dict(reason=late, generation=generation))
 
         self._set_laser_status_after_close(decide)
+        # The idle stream was held back while it lasted (_nidaq_stream_may_start),
+        # and nothing else asks for it: it starts, or says what still holds it.
+        self._request_nidaq_stream("a laser close given up on has ended")
 
     def _start_nidaq_domain(self, *, timeout: float = 12.0, restart: bool = False) -> bool:
         """Start the NI-DAQ domain; `restart` replaces a stream already running.
