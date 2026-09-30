@@ -246,6 +246,14 @@ Laser Control uses a smaller font (7.5 pt, graph axes 7 pt) so that each
 page fits the docked right-side panel without scrolling; the dialogs it opens
 keep the application font. On christielab10 that panel is 440 x 860 px. Each
 channel has **Pulse** and **Calibration** tabs.
+The panel's footer shows its status and, in red, every error or refusal it
+reports: Run Pulse, Test stim, Run Ramp, a profile no longer saved, a Pulse
+Builder save or delete, and a failed operation. Each also goes to the main
+window's status bar and the log, as before, so a detached panel shows its
+errors in its own window. An error stays until the panel's next status or
+error replaces it, the next operation's lines or the Ready line of a Run/Stop
+rebuild included; it has no timeout. A long one ends in an ellipsis, and
+hovering over it shows the whole line.
 The Pulse tab has the **Profile:** picker at the top. Below it are the folding
 sections **Run Pulse**, **Test stim**, **Output stream** and **Board
 trigger**; click a section's title to fold or open it. A folded section gives

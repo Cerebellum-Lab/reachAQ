@@ -101,6 +101,9 @@ _TRIGGER_INPUT_INSTRUCTION = (
 _TRIGGER_INPUT_KINDS = (
     "Use an analog input or a port0 line, not a PFI terminal."
 )
+#: An error on the footer, in reachAQ's error red (the main window's
+#: "Startup failed").
+_ERROR_STATUS_STYLE = "color: #b00020;"
 
 
 #: nidaqmx's DaqError ends its message with the status code on a line of its
@@ -1579,7 +1582,6 @@ class LaserControlContent(ContentWidget):
                 self,
                 draft_provider=self._builder.draft_profile,
             )
-            tab.select_profile(picked_profiles.get(channel_index))
             tab.set_command_trace_visible(command_shown.get(channel_index, True))
             self._adopt_sections(tab)
             self._tabs.addTab(tab, f"Laser {channel_index}")
@@ -1611,6 +1613,11 @@ class LaserControlContent(ContentWidget):
                     break
         self._set_status(self._ready_status_text(), is_error=False)
         self._update_enabled_state()
+        # Picked after the Ready line, so a profile no longer saved leaves
+        # its refusal on the footer; picked as each tab was made, the Ready
+        # line replaced it at once.
+        for tab in self._channel_tabs:
+            tab.select_profile(picked_profiles.get(tab.channel_id_value))
 
     def _ready_status_text(self) -> str:
         configured_count = sum(tab.is_configured for tab in self._channel_tabs)
@@ -1694,9 +1701,10 @@ class LaserControlContent(ContentWidget):
 
     @Slot(str)
     def _operation_failed(self, message: str) -> None:
-        # It said "Laser operation stopped", and nothing of why.
-        self._set_status(
-            f"Laser operation failed: {_failure_line(message, 160)}", is_error=False)
+        # It said "Laser operation stopped", and nothing of why. Shown, not
+        # logged: the worker logged it, with its traceback.
+        self._show_status(
+            f"Laser operation failed: {_failure_line(message, 160)}", is_error=True)
 
     @Slot()
     def _operation_thread_finished(self) -> None:
@@ -1707,10 +1715,21 @@ class LaserControlContent(ContentWidget):
 
     def _set_status(self, message: str, *, is_error: bool) -> None:
         if is_error:
+            # The record StatusLogHandler puts on the main window's status bar.
             logger.error("Laser control operation rejected: %s", message)
-            return
+        self._show_status(message, is_error=is_error)
+
+    def _show_status(self, message: str, *, is_error: bool) -> None:
+        """Put a status or an error on the footer, in place of what it said.
+
+        Errors went to the log and the main window's status bar only, which
+        is in the other window when this panel is detached (Ben,
+        2026-09-30). An error stays until the panel's next status or error
+        replaces it, as every status here does: no timeout, so one seen late
+        in a detached panel is still there. Elided to its line, whole on hover.
+        """
         self._status_label.setText(message)
-        self._status_label.setStyleSheet("")
+        self._status_label.setStyleSheet(_ERROR_STATUS_STYLE if is_error else "")
 
     def _set_running(self, is_running: bool) -> None:
         self._update_enabled_state(is_running=is_running)

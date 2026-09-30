@@ -214,6 +214,13 @@ docked right-hand panel without scrolling. Folding a section gives its height
 to the output graph. A section folded on one laser is folded on every laser,
 and stays folded when the tabs are rebuilt.
 
+The line at the foot of Laser Control is the panel's own status line. It
+shows, in red, each refusal and failure the panel reports. They go to the
+main window's status bar too, so a detached panel shows them in its own
+window as well. A red line stays until the panel reports something else,
+such as the next press's outcome or the *Ready* line after a Run or Stop; it
+does not time out. A long one ends in "…"; hover over it for the whole line.
+
 The **Output stream** graph on the Pulse page needs nothing started: it plots
 whenever the NI-DAQ input stream runs, and that stream starts by itself, in
 Idle as well as in System Mode. Its status line says whether it is running.
@@ -476,9 +483,9 @@ shutter** holds the PMT shutter open for the ramp. Press **Run Ramp**.
 - Success reads *"Ramp complete: 11 points, last diode 1.234 V, monotonic
   curve validated"*, and the Output stream graph shows the whole ramp. A
   failure reads *"Laser operation failed: ..."* with the first line of the
-  reason and, for a DAQmx error, its status code, as in *"(DAQmx -89125)"*, on
-  the panel's status line and in the status bar; the whole error is in the
-  log.
+  reason and, for a DAQmx error, its status code, as in *"(DAQmx -89125)"*, in
+  red on the panel's status line and in the status bar; the whole error is in
+  the log.
 - Closing reachAQ during a ramp waits for the ramp to end, for as long as the
   ramp itself may take (its timeout) plus five seconds. Past that it closes
   the ramp's laser controller, before anything else closes. That close closes
@@ -510,7 +517,10 @@ shutter** holds the PMT shutter open for the ramp. Press **Run Ramp**.
 
 ## What failure looks like
 
-Every refusal names its reason in the status line and fires nothing.
+Every refusal names its reason, in red on the Laser Control status line and in
+the main window's status bar, and fires nothing. A refusal inside a Test stim
+or other operation reads *"Laser operation failed: ..."* followed by the
+message.
 
 | Message | Meaning |
 | --- | --- |
