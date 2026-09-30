@@ -368,6 +368,41 @@ def test_a_folded_section_gives_its_height_to_the_output_stream(panel, qapp):
     assert tab._trace_plot.height() > before
 
 
+#: A DAQmx failure as nidaqmx formats it: far longer than the footer's line.
+_DAQMX_FAILURE = (
+    "The specified route cannot be satisfied, because it requires connecting "
+    "the source and destination terminals using a trigger line, and no "
+    "registered trigger lines could be found between the devices in the "
+    "route.\n"
+    "Task Name: laser_1_calibration_ai\n"
+    "\n"
+    "Status Code: -89125"
+)
+
+
+def test_an_error_on_the_footer_is_cut_to_its_line_and_moves_nothing(panel, qapp):
+    # Errors show on the footer too (Ben, 2026-09-30), and a DAQmx one is
+    # about 180 characters on its one line.
+    _open_every_section(panel, qapp)
+    tab = panel._channel_tabs[0]
+    scroll = _show_pulse_page(panel, tab, qapp)
+    footer = panel._status_label
+    footer_height = footer.height()
+    trace_height = tab._trace_plot.height()
+
+    panel._operation_failed(_DAQMX_FAILURE)
+    _settle(qapp)
+
+    assert footer.text().startswith("Laser operation failed: The specified route")
+    assert "#b00020" in footer.styleSheet()
+    assert footer.is_elided()
+    assert footer.full_tooltip() == footer.text()
+    assert footer.height() == footer_height
+    assert tab._trace_plot.height() == trace_height
+    assert scroll.verticalScrollBar().maximum() == 0
+    assert (panel.width(), panel.height()) == (PANEL_WIDTH, PANEL_HEIGHT)
+
+
 def test_a_cut_line_keeps_its_whole_text_in_the_tooltip(qapp):
     text ="No trigger readback input is configured for this laser"
     label = ElidedLabel(text)
