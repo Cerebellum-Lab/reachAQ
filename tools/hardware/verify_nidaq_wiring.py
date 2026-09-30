@@ -231,7 +231,15 @@ def observe_undriven(nidaqmx, points, seconds, undriven, report):
     watched = [point for point in points if point.fingerprint in undriven
                and not (is_trigger_readback(point) and _is_analog(point))]
     if not watched:
-        print("\n" + "nothing to observe: every point had a driver")
+        # Any undriven point left out is an analog readback: it had no
+        # driver either, and saying every point had one was wrong.
+        analog = [point.name for point in points if point.fingerprint in undriven]
+        if analog:
+            print("\n" + "nothing to observe: the undriven points left are "
+                  "analog, and only digital lines can be watched: "
+                  + ", ".join(analog))
+        else:
+            print("\n" + "nothing to observe: every point had a driver")
         return
     devices = sorted({point.physical_channel.strip("/").split("/", 1)[0]
                       for point in watched})

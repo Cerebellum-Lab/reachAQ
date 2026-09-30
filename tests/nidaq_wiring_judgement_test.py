@@ -187,3 +187,18 @@ def test_the_observe_window_watches_only_what_it_can_read(capsys):
     assert watching == [
         "--- watching 1 undriven line(s) for 0.05s: laser1_trigger ---"]
     assert list(confirmed) == ["laser1_trigger"]
+
+
+def test_the_observe_window_says_why_it_has_nothing_to_watch(capsys):
+    # With only analog readbacks left undriven it said every point had a
+    # driver: they had none, and they cannot be watched.
+    def observe(undriven):
+        verify.observe_undriven(
+            _Nidaqmx({}), (RIG_READBACK, ANALOG_READBACK, DIODE), 0.01,
+            undriven, lambda point, detail: None)
+        return capsys.readouterr().out.strip()
+
+    assert observe({RIG_READBACK.fingerprint, ANALOG_READBACK.fingerprint}) == (
+        "nothing to observe: the undriven points left are analog, and only "
+        "digital lines can be watched: laser1_trigger_readback, laser1_trigger")
+    assert observe(set()) == "nothing to observe: every point had a driver"

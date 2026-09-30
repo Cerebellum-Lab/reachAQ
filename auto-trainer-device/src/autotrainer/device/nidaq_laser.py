@@ -1540,8 +1540,9 @@ class NidaqLaserController:
         that is the pulse's high level. Whatever else ended the run, as every
         output left driven is (controller ruling, final review). `holding`
         names that level: the pulse's amplitude, or up to the ramp's highest
-        command, as the application names it for a ramp whose close hung. The laser
-        is noted for close(), which says so if it resets it after all.
+        command, as the application names it for a ramp whose close hung.
+        The laser is noted for close(), which says so if it resets it after
+        all.
         """
         with self._operation_lock:
             self._left_driven.add(channel.channel_id)

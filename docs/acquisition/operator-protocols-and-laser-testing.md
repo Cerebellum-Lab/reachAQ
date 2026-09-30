@@ -307,9 +307,10 @@ own error; it is not reported as a failed close. If a pulse's, or a ramp's,
 own reset of the command is refused, the output may still hold its last
 level, and reachAQ logs a CRITICAL naming the laser, its analog output and
 that level - the pulse's amplitude, or up to the ramp's highest command,
-whichever end of the ramp that is: make the laser safe by hand. If the controller's close then puts that laser's command
-back to its minimum after all, a WARNING says so: *"Laser 1: close() put its
-command on PXI1Slot4/ao0 back to 0 V after all ..."*.
+whichever end of the ramp that is: make the laser safe by hand. If the
+controller's close then puts that laser's command back to its minimum after
+all, a WARNING says so: *"Laser 1: close() put its command on PXI1Slot4/ao0
+back to 0 V after all ..."*.
 
 Run Pulse is refused while another pulse on the same board's analog output
 is armed or running, or still ending after a cancel, such as a trial's pulse
