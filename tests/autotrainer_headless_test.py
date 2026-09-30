@@ -571,7 +571,7 @@ def test_a_forced_ramp_close_that_hangs_is_given_up_on_and_named(
 ):
     # A hang does not make the laser safer: the output stays driven either
     # way (controller ruling, 2026-09-25). The forced close runs with a bound;
-    # past it a CRITICAL names the laser and the ramp's last command, and
+    # past it a CRITICAL names the laser and the ramp's highest command, and
     # reachAQ goes on closing.
     from tools.acquisition.model import app_model as app_model_module
 

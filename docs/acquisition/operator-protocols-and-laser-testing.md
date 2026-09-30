@@ -306,8 +306,8 @@ just as Stop was pressed, such as one whose trigger never came, keeps its
 own error; it is not reported as a failed close. If a pulse's, or a ramp's,
 own reset of the command is refused, the output may still hold its last
 level, and reachAQ logs a CRITICAL naming the laser, its analog output and
-that level - the pulse's amplitude, or the ramp's last command: make the
-laser safe by hand. If the controller's close then puts that laser's command
+that level - the pulse's amplitude, or up to the ramp's highest command,
+whichever end of the ramp that is: make the laser safe by hand. If the controller's close then puts that laser's command
 back to its minimum after all, a WARNING says so: *"Laser 1: close() put its
 command on PXI1Slot4/ao0 back to 0 V after all ..."*.
 
@@ -490,9 +490,11 @@ shutter** holds the PMT shutter open for the ramp. Press **Run Ramp**.
   stays driven either way, and it would keep reachAQ from exiting. If the
   close hangs, raises, or finds the ramp's own thread already closing the
   controller, the log and status bar show a CRITICAL naming the laser and the
-  ramp's last command, *"The calibration controller for laser 1 did not close
-  within 15.0 s. Its analog output may still hold the ramp's last command,
-  5 V ..."*. When the ramp had not yet opened its controller, or had not
+  highest level the ramp commanded, *"The calibration controller for laser 1
+  did not close within 15.0 s. Its analog output may still hold up to 5 V,
+  the ramp's highest command (a 0 V to 5 V ramp) ..."*. Stopped part-way,
+  the output holds a level between the ramp's ends, so a falling ramp names
+  its start. When the ramp had not yet opened its controller, or had not
   started on it, the CRITICAL says so instead, and names no command.
 - After the CRITICAL, closing waits up to two seconds more for the ramp to
   end, since a ramp its driver lets go tries to write the command back
@@ -502,7 +504,7 @@ shutter** holds the PMT shutter open for the ramp. Press **Run Ramp**.
   15 s + 2 s.
 - Make the laser safe by hand - switch off the laser driver or close its
   shutter at the rig - only when that CRITICAL appears and says the output
-  may still hold the ramp's last command.
+  may still hold up to the ramp's highest command.
 
 ## What failure looks like
 
