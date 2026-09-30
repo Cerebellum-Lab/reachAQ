@@ -294,7 +294,12 @@ cancel; the abort itself takes 12.6-32 ms, and varies from run to run. A pulse
 armed and waiting for its trigger ends the same way. The controller waits up to five seconds for a train that does not
 end, as with a sick driver, before it goes on without it. The status line
 then reads *"Laser operation failed: Laser operation ... was cancelled: the
-laser controller was closed while it ran"*.
+laser controller was closed while it ran"*. A pulse that failed by itself
+just as Stop was pressed, such as one whose trigger never came, keeps its
+own error; it is not reported as a failed close. If a pulse's, or a ramp's,
+own reset of the command is refused, the output may still hold its last
+level, and reachAQ logs a CRITICAL naming the laser and its analog output:
+make the laser safe by hand.
 
 Run Pulse is refused while another pulse on the same board's analog output
 is armed or running, or still ending after a cancel, such as a trial's pulse

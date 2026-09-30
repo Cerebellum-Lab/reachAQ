@@ -127,6 +127,9 @@ class FakeTask:
                 del self.daq.reserved[channel]
 
     def write(self, data, auto_start=False):
+        if self.daq.failing_write and self.label.endswith(self.daq.failing_write):
+            # As DAQmx refuses an on-demand write to a line another task holds.
+            raise FakeDaqError(-50103, f"The specified resource is reserved ({self.label})")
         if auto_start:
             # An on-demand write reserves its lines only for the write, and a
             # refused one (-50103) writes nothing.
@@ -329,6 +332,8 @@ class FakeDaqmx:
         self.before_start = None
         #: A task, by name suffix, whose abort fails while it is still open.
         self.failing_abort = None
+        #: Refuse every write of a task whose name ends so (-50103).
+        self.failing_write = None
         #: A task, by name suffix, whose commit (TASK_COMMIT) fails.
         self.failing_commit = None
         #: Routes, as (source, destination), the driver will not disconnect.

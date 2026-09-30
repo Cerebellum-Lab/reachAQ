@@ -20,6 +20,7 @@ from .laser import (
     LaserChannelConfiguration,
     LaserChannelId,
     LaserFeedbackSample,
+    LaserPulseRefused,
     LaserPulseTrain,
     LaserSynchronizedPulseTrain,
     LaserSystemConfiguration,
@@ -65,6 +66,9 @@ _FAILED_OPEN_CLOSE_TIMEOUT_S = 15.0
 #: How long a caller waiting for another's route to settle sleeps between
 #: looks; a settle, or close(), wakes it at once.
 _ROUTE_SETTLE_WAIT_S = 1.0
+#: How long it waits in all before it gives up: a driver hung in the other
+#: caller's connect or release held this one with it, without end.
+_ROUTE_PENDING_GIVE_UP_S = 5.0
 
 
 class LaserControllerStillClosing(RuntimeError):
@@ -630,7 +634,7 @@ class NidaqLaserController:
 
     def run_synchronized_pulse_train(self, pulse_train: LaserSynchronizedPulseTrain):
         if not self._configuration.hardware_timed:
-            raise RuntimeError("Hardware-timed laser pulse trains require laser configuration hardware_timed=True")
+            raise LaserPulseRefused("Hardware-timed laser pulse trains require laser configuration hardware_timed=True")
         # Both paths own their output through one operation, so close() can
         # cancel and wait for either. A waited-for train (Run Pulse) used to
         # run with none: close() could not stop it, and its command reset met
@@ -644,7 +648,7 @@ class NidaqLaserController:
             # controller closed; one registered after that would drive the
             # laser after close() had reset it.
             if getattr(self, "_closed", False):
-                raise RuntimeError(
+                raise LaserPulseRefused(
                     "the laser controller is closed; no pulse train is started")
             # By board, not by channel. A board has one analog output timing
             # engine, and its ao/SampleClock is that engine's; NI documents
@@ -664,7 +668,7 @@ class NidaqLaserController:
                 and not operation._done.is_set()
             ]
             if conflicts:
-                raise RuntimeError(self._board_refusal(pulse_train, conflicts, boards))
+                raise LaserPulseRefused(self._board_refusal(pulse_train, conflicts, boards))
             lasers = [int(item.channel_id) for item in pulse_train.pulse_trains]
             owner = (f"laser{'s' if len(lasers) > 1 else ''} "
                      f"{', '.join(map(str, lasers))}")
@@ -862,7 +866,7 @@ class NidaqLaserController:
         self,
         pulse_train: LaserSynchronizedPulseTrain,
         *,
-        operation: Optional[NidaqLaserOperation] = None,
+        operation: NidaqLaserOperation,
     ) -> None:
         channels = [
             self._configuration.get_channel(channel_pulse.channel_id)
@@ -917,8 +921,7 @@ class NidaqLaserController:
         added_routes: List[Tuple[str, str]] = []
         run_error = None
         try:
-            if operation is not None:
-                operation._set_timing_status(timing_status)
+            operation._set_timing_status(timing_status)
             ao_task.timing.cfg_samp_clk_timing(
                 rate=sample_rate_hz,
                 sample_mode=self._nidaqmx.constants.AcquisitionType.FINITE,
@@ -1021,47 +1024,40 @@ class NidaqLaserController:
                                 "Failed to close the laser %s shutter a cancel "
                                 "found opening", channel.channel_id.value)
 
-            if operation is None:
-                open_shutters()
-            else:
-                operation._open_shutters_unless_cancelled(open_shutters, close_shutters)
-                operation._bind_tasks(zip(
-                    (ao_name, *digital_names), (ao_task, *digital_tasks)))
-                operation._require_not_cancelled()
-            if operation is not None and pulse_train.defer_start:
+            operation._open_shutters_unless_cancelled(open_shutters, close_shutters)
+            operation._bind_tasks(zip(
+                (ao_name, *digital_names), (ao_task, *digital_tasks)))
+            operation._require_not_cancelled()
+            if pulse_train.defer_start:
                 operation._mark_armed()
                 if not operation._start_requested.wait(timeout_seconds):
                     raise TimeoutError("Deferred laser operation did not receive a start request")
                 operation._require_not_cancelled()
             for task in (*digital_tasks, ao_task):
                 task.start()
-                if operation is not None:
-                    operation._mark_started(task)
-            if operation is not None and operation.state is LaserOperationState.CANCELLED:
+                operation._mark_started(task)
+            if operation.state is LaserOperationState.CANCELLED:
                 # A cancel between the look above and the starts aborted
                 # tasks not yet started, which does nothing (H5c): the train
                 # would run. Ended here instead, as a cancel.
                 raise RuntimeError("Laser operation was cancelled as it started")
-            if operation is not None:
-                if pulse_train.defer_start:
-                    operation._mark_triggered("NI software start accepted")
-                else:
-                    operation._mark_armed()
+            if pulse_train.defer_start:
+                operation._mark_triggered("NI software start accepted")
+            else:
+                operation._mark_armed()
             self._last_timing_status = timing_status
             ao_task.wait_until_done(timeout=timeout_seconds)
             for task in digital_tasks:
                 task.wait_until_done(timeout=timeout_seconds)
-            if operation is not None:
-                operation._mark_triggered()
-                if not operation._mark_finishing():
-                    raise RuntimeError("Laser operation was cancelled as it ended")
+            operation._mark_triggered()
+            if not operation._mark_finishing():
+                raise RuntimeError("Laser operation was cancelled as it ended")
         except Exception as exc:
             run_error = exc
             raise
         finally:
-            if operation is not None:
-                # Before the first stop: a cancel from now on leaves them here.
-                operation._let_go_of_tasks()
+            # Before the first stop: a cancel from now on leaves them here.
+            operation._let_go_of_tasks()
             self._cleanup_pulse_train(
                 ao_task=ao_task,
                 digital_tasks=digital_tasks,
@@ -1410,7 +1406,7 @@ class NidaqLaserController:
                 self._reset_command(channel)
             except Exception as exc:
                 errors.append((f"channel {channel.channel_id.value} command reset", exc))
-                logger.exception("Failed to reset NI-DAQ laser command for channel %s", channel.channel_id.value)
+                self._log_command_left_driven(channel, "its pulse train")
         for channel, channel_pulse in zip(channels, channel_pulses):
             if channel_pulse.close_shutter:
                 try:
@@ -1480,9 +1476,7 @@ class NidaqLaserController:
                 self._write_transient_analog_sample(channel, channel.minimum_command_volts)
             except Exception as exc:
                 errors.append((f"channel {channel.channel_id.value} command reset", exc))
-                logger.exception(
-                    "Failed to reset NI-DAQ laser command for channel %s after "
-                    "a closed calibration ramp", channel.channel_id.value)
+                self._log_command_left_driven(channel, "a closed calibration ramp")
             if ramp.enable_pmt_shutter:
                 try:
                     self._write_transient_digital_line(
@@ -1499,7 +1493,7 @@ class NidaqLaserController:
             self.set_command_voltage(channel.channel_id, channel.minimum_command_volts)
         except Exception as exc:
             errors.append((f"channel {channel.channel_id.value} command reset", exc))
-            logger.exception("Failed to reset NI-DAQ laser command for channel %s", channel.channel_id.value)
+            self._log_command_left_driven(channel, "its calibration ramp")
         if ramp.close_shutter:
             try:
                 self.set_shutter_open(channel.channel_id, False)
@@ -1517,6 +1511,22 @@ class NidaqLaserController:
                 errors.append(("PMT shutter close", exc))
                 logger.exception("Failed to close NI-DAQ PMT shutter output after calibration")
         self._raise_or_log_cleanup_errors("NI-DAQ laser calibration ramp", errors, run_error)
+
+    @staticmethod
+    def _log_command_left_driven(channel: LaserChannelConfiguration, after: str) -> None:
+        """CRITICAL, within the except: `channel`'s output may stay driven.
+
+        A pulse's or a ramp's own reset of the command, refused (-50103, for
+        one), leaves the output on its last level: after a cancel or a failure
+        that is the pulse's high level. Whatever else ended the run, as every
+        output left driven is (controller ruling, final review).
+        """
+        logger.critical(
+            "Laser %s: its command on %s could not be put back to %g V after "
+            "%s. The output may still hold its last level: make the laser "
+            "safe by hand.",
+            channel.channel_id.value, channel.analog_output,
+            channel.minimum_command_volts, after, exc_info=True)
 
     def _stop_and_close_task(self, name: str, task: object, errors: list) -> None:
         try:
@@ -1609,11 +1619,21 @@ class NidaqLaserController:
         for operation in operations:
             try:
                 operation.cancel()
-                operation.wait(timeout=_OPERATION_CANCEL_TIMEOUT_S)
             except Exception as exc:
                 errors.append((f"laser operation {operation.operation_id} cancel", exc))
                 logger.exception("Failed to cancel active NI-DAQ laser operation")
-            if not operation._done.is_set():
+            # Only one that has not ended is the close's failure. One that
+            # failed by itself, before or during this close, keeps its own
+            # error, where its caller reads it, and its cleanup reset its
+            # laser: raised here as the close's, it made Stop say "make the
+            # laser safe by hand".
+            if not operation.wait_until_finished(_OPERATION_CANCEL_TIMEOUT_S):
+                errors.append((
+                    f"laser operation {operation.operation_id} cancel",
+                    TimeoutError(f"Laser operation {operation.operation_id} did not finish")))
+                logger.error(
+                    "Failed to cancel active NI-DAQ laser operation %s: it had not "
+                    "ended %.1f s later", operation.operation_id, _OPERATION_CANCEL_TIMEOUT_S)
                 with self._route_lock():
                     self._given_up_operations.append(operation)
         for channel in self._configuration.channels:
@@ -1878,6 +1898,7 @@ class NidaqLaserController:
         # meanwhile, so that nobody else connects or releases it, and close(),
         # which releases only the routes held, leaves it to this call.
         with self._route_lock():
+            give_up_at = time.monotonic() + _ROUTE_PENDING_GIVE_UP_S
             while True:
                 if getattr(self, "_closed", False):
                     raise RuntimeError(
@@ -1885,8 +1906,15 @@ class NidaqLaserController:
                         f"made for {output_device}")
                 if route in self._trigger_routes:
                     return local
-                if route not in self._route_pending():
+                pending = self._route_pending().get(route)
+                if pending is None:
                     break
+                if time.monotonic() >= give_up_at:
+                    raise RuntimeError(
+                        f"could not put {source} on {line} for {output_device}: "
+                        f"the route {source} -> {destination} was still being "
+                        f"{'connected' if pending == 'connect' else 'released'} by "
+                        f"another call {_ROUTE_PENDING_GIVE_UP_S:.1f} s later")
                 # Another caller is connecting or releasing this same route.
                 self._wait_for_routes()
             holder = self._backplane_line_holder(line, source)

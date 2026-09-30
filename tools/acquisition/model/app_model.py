@@ -152,7 +152,7 @@ from tools.acquisition.model.send_block_reasons import SendBlockReasons
 INTERTRIAL_ANALYSIS_BLOCK_NAME = "intertrial_analysis"
 from tools.acquisition.model.coordinate_model import CoordinateModel
 from tools.autotrainer_version import __version__ as app_version
-from tools.acquisition.model.helpers import get_config_location
+from tools.acquisition.model.helpers import first_line, get_config_location
 from tools.acquisition.model.hardware_model import HardwareModel
 from tools.acquisition.model.inference_model import InferenceModel
 from tools.acquisition.model.laser_model import LaserModel, wait_until_cancelled_ends
@@ -310,23 +310,27 @@ _LASER_CALIBRATION = "laser calibration"
 _LASER_CALIBRATION_REASON = "a laser calibration ramp is running"
 #: How much longer than the ramp's own timeout closing waits for it.
 _LASER_CALIBRATION_CLOSE_MARGIN_S = 5.0
-#: How long closing then gives the ramp controller's own close. That close
-#: aborts the ramp's tasks, waits up to 5 s for the ramp to let go of them,
-#: then tries to reset the laser; the reset is refused, and the close raises,
-#: while the ramp still holds the output.
-_LASER_CALIBRATION_FORCED_CLOSE_S = 15.0
 #: How long closing then waits, after a forced close that failed, hung or
 #: found the ramp's own thread closing, for the ramp to end: a ramp its
 #: driver lets go tries to write the command back to its minimum itself.
 _LASER_CALIBRATION_RAMP_END_WAIT_S = 2.0
-#: How long Stop, a failed Run start and closing wait for System Mode's laser
-#: controller to close, as the ramp's forced close does.
+#: How long any laser controller close is waited for: Stop's, a failed Run
+#: start's and closing's of System Mode's controller, and the ramp's own and
+#: closing's forced close of the ramp's. The ramp's close aborts its tasks,
+#: waits up to 5 s for the ramp to let go of them, then tries to reset the
+#: laser; the reset is refused, and the close raises, while the ramp still
+#: holds the output.
 _LASER_CONTROLLER_CLOSE_S = 15.0
 #: Why laser work is refused while a controller close given up on is still
 #: inside the driver.
 _LASER_CLOSE_PENDING_REFUSAL = (
     "the laser controller is still closing after a driver hang; make the "
     "laser safe by hand, and restart reachAQ if this does not clear"
+)
+#: The same, for the calibration ramp's own controller.
+_LASER_CALIBRATION_CLOSE_PENDING_REFUSAL = (
+    "the laser calibration controller is still closing after a driver hang; "
+    "make the laser safe by hand, and restart reachAQ if this does not clear"
 )
 #: Why laser work is refused while a controller close is still within its
 #: bound.
@@ -416,8 +420,7 @@ class _BoundedClose:
             return f"did not close within {timeout:.1f} s"
         if self.error is not None:
             return "failed to close ({})".format(
-                next(iter(str(self.error).splitlines()), "")
-                or self.error.__class__.__name__)
+                first_line(self.error) or self.error.__class__.__name__)
         return ""
 
 
@@ -3047,6 +3050,14 @@ class AppModel(ObservableObject):
         close_refusal = self.laser_controller_close_refusal()
         if close_refusal:
             raise RuntimeError(f"Hardware refresh is unavailable: {close_refusal}")
+        # A ramp holds the NI-DAQ lines and a laser controller of its own: a
+        # refresh's request for the stream was declined by the ramp's hold,
+        # which made it harmless, but it is refused by name, as Run, a load, a
+        # DAQ ports save and the DAQ Monitor are.
+        if self._laser_calibration_active:
+            raise RuntimeError(
+                "Hardware refresh is unavailable while a laser calibration ramp "
+                "runs; wait for it to finish")
 
         scan_started = time.perf_counter()
         details: List[str] = []
@@ -6681,8 +6692,8 @@ class AppModel(ObservableObject):
                 finally:
                     # close() drives the command to its minimum and closes the
                     # shutters. Unless the close path already closed it.
-                    self._close_laser_calibration_controller(
-                        keep_error=ramp_error is not None)
+                    self._close_laser_calibration_controller_within_bound(
+                        ramp, keep_error=ramp_error is not None)
             finally:
                 self._nidaq_stream_autostart.resume(_LASER_CALIBRATION)
         finally:
@@ -6705,6 +6716,59 @@ class AppModel(ObservableObject):
             self._laser_calibration_timeout_seconds(ramp, self._laser.configuration)
             + _LASER_CALIBRATION_CLOSE_MARGIN_S
         )
+
+    def _close_laser_calibration_controller_within_bound(
+        self, ramp: LaserCalibrationRamp, *, keep_error: bool,
+    ) -> None:
+        """The ramp's own close of its controller, bounded as every laser close is.
+
+        Unbounded, a driver hung in it held the ramp's thread in its finally:
+        the calibration stayed active, the panel stuck, and nothing was said
+        until reachAQ closed. Past the bound it is watched as a close given
+        up on, so laser work is refused by name until it ends, and the ramp
+        ends without it. A close that raised is raised here, as before.
+        """
+        closing = _BoundedClose(
+            lambda: self._close_laser_calibration_controller(keep_error=keep_error),
+            "laser calibration controller")
+        finished = closing.run(_LASER_CONTROLLER_CLOSE_S)
+        if not finished and self._watch_given_up_laser_close(
+                closing.done.wait, "laser calibration controller",
+                ended="The laser calibration controller finished closing",
+                late=("the laser calibration controller finished closing, late, "
+                      "after a driver hang"),
+                refusal=_LASER_CALIBRATION_CLOSE_PENDING_REFUSAL):
+            logger.critical(
+                "The calibration controller for laser %s did not close within "
+                "%.1f s. %s The ramp ends without it.",
+                int(ramp.channel_id), _LASER_CONTROLLER_CLOSE_S,
+                self._laser_calibration_output_note(ramp))
+            return
+        if closing.error is not None:
+            raise closing.error
+
+    def _laser_calibration_output_note(self, ramp: Optional[LaserCalibrationRamp]) -> str:
+        """What a ramp's output may hold, as far as the application knows.
+
+        A ramp that never opened its controller, or never started on it,
+        wrote no command.
+        """
+        with self._laser_calibration_lock:
+            opened = self._laser_calibration_opened
+            commanded = self._laser_calibration_commanded
+        if commanded:
+            return (
+                "Its analog output may still hold the ramp's last command, %g V "
+                "(a %g V to %g V ramp), and its shutter may be open: make the "
+                "laser safe by hand." % (
+                    float("nan") if ramp is None else ramp.stop_volts,
+                    float("nan") if ramp is None else ramp.start_volts,
+                    float("nan") if ramp is None else ramp.stop_volts,
+                ))
+        if opened:
+            return "The ramp had not started, so it wrote no command."
+        return ("The ramp never wrote a command, so it has not driven the "
+                "laser's output.")
 
     def _close_laser_calibration_controller(self, *, keep_error: bool) -> bool:
         """Close the ramp's controller once, whichever thread gets here first.
@@ -6767,35 +6831,19 @@ class AppModel(ObservableObject):
         closing = _BoundedClose(
             lambda: self._close_laser_calibration_controller(keep_error=False),
             "laser calibration controller")
-        finished = closing.run(_LASER_CALIBRATION_FORCED_CLOSE_S)
-        failure = closing.failure(_LASER_CALIBRATION_FORCED_CLOSE_S, finished)
+        finished = closing.run(_LASER_CONTROLLER_CLOSE_S)
+        failure = closing.failure(_LASER_CONTROLLER_CLOSE_S, finished)
         if not failure and closing.result:
             return  # Closed cleanly: the laser was reset.
         with self._laser_calibration_lock:
             opened = self._laser_calibration_opened
-            commanded = self._laser_calibration_commanded
         if not failure:
             # Nothing here to close: the ramp's own thread took the controller
             # first, and closes it, or the ramp had not opened one yet.
             failure = (
                 "is being closed by the ramp's own thread" if opened
                 else "had not finished opening")
-        # What the output may hold, as far as closing knows: a ramp that never
-        # opened its controller, or never started on it, wrote no command.
-        if commanded:
-            output = (
-                "Its analog output may still hold the ramp's last command, %g V "
-                "(a %g V to %g V ramp), and its shutter may be open: make the "
-                "laser safe by hand." % (
-                    float("nan") if ramp is None else ramp.stop_volts,
-                    float("nan") if ramp is None else ramp.start_volts,
-                    float("nan") if ramp is None else ramp.stop_volts,
-                ))
-        elif opened:
-            output = "The ramp had not started, so it wrote no command."
-        else:
-            output = ("The ramp never wrote a command, so it has not driven the "
-                      "laser's output.")
+        output = self._laser_calibration_output_note(ramp)
         # Before the wait below, whatever it finds: with a raise as with a
         # hang reachAQ exits next, and nothing else will reset the laser.
         logger.critical(

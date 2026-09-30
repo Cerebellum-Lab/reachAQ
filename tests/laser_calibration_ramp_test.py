@@ -825,3 +825,83 @@ def test_with_a_refused_plan_the_laser_takes_the_stored_streams_terminal_config(
 
     assert nidaq_app.nidaq_signal_monitor.configuration.analog_terminal_config != "nrse"
     assert given == ["nrse"]
+
+
+
+# ---------------------------------------------------------------- the final fix round
+
+
+def test_a_ramp_whose_controller_close_hangs_is_let_go_within_the_bound(
+    ramp_app, monkeypatch, caplog,
+):
+    # The ramp closed its own controller in its finally with no bound: a
+    # driver hung in that close kept the calibration active, the panel
+    # stuck, and nothing was said until reachAQ closed.
+    from tools.acquisition.model import app_model as app_model_module
+
+    monkeypatch.setattr(app_model_module, "_LASER_CONTROLLER_CLOSE_S", 0.3)
+    app, spy = ramp_app
+    release = threading.Event()
+
+    def the_close_hangs():
+        controller = spy.controllers[-1]
+        close = controller.close
+
+        def hung():
+            release.wait(10.0)
+            close()
+
+        controller.close = hung
+
+    spy.during = the_close_hangs
+    outcome = []
+    ramp = threading.Thread(
+        target=lambda: outcome.append(app.run_laser_calibration_ramp(RAMP)), daemon=True)
+    try:
+        with caplog.at_level("CRITICAL"):
+            ramp.start()
+            ramp.join(5.0)
+            assert not ramp.is_alive(), "the ramp waited for its hung close"
+
+        points, = outcome
+        assert len(points) == 3
+        assert not app.laser_calibration_active
+        critical, = [record.getMessage() for record in caplog.records
+                     if record.levelname == "CRITICAL"]
+        assert "laser 1" in critical and "did not close within 0.3 s" in critical
+        assert "make the laser safe by hand" in critical
+        refusal = app.laser_controller_close_refusal()
+        assert "laser calibration controller is still closing" in refusal
+        assert app.laser_calibration_refusal() == refusal
+    finally:
+        release.set()
+    deadline = time.monotonic() + 5.0
+    while app.laser_controller_close_refusal() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert app.laser_controller_close_refusal() == ""
+
+
+def test_a_hardware_refresh_is_refused_mid_ramp_by_name(ramp_app, monkeypatch):
+    # The docs said a refresh is refused while a ramp runs, and it was not:
+    # only its request for the stream was declined by the ramp's hold.
+    from hardware_status_content_test import _patch_hardware_scans
+
+    app, spy = ramp_app
+    _patch_hardware_scans(app, monkeypatch)
+    seen = []
+
+    def refresh():
+        try:
+            app.refresh_hardware_bindings()
+        except RuntimeError as error:
+            seen.append(str(error))
+        else:
+            seen.append("refreshed")
+
+    spy.during = refresh
+
+    app.run_laser_calibration_ramp(RAMP)
+
+    assert seen == [
+        "Hardware refresh is unavailable while a laser calibration ramp runs; "
+        "wait for it to finish"]

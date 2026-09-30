@@ -13,6 +13,7 @@ from autotrainer.core import (
 )
 from tools.acquisition.model.nidaq_channel_plan import (
     build_nidaq_acquisition_configuration,
+    nidaq_channel_kind,
     with_display_channels,
 )
 
@@ -876,3 +877,45 @@ def test_the_claimed_names_need_the_configured_lasers():
         _claimed_role_names(False)
     assert "laser1_diode" not in _claimed_role_names(False, (1,))
     assert "laser2_diode" in _claimed_role_names(False, (1,))
+
+
+
+# ------------------------------------------------ the final fix round
+
+
+@pytest.mark.parametrize(("channel", "kind"), [
+    ("PXI1Slot5/ai8", "analog"),
+    ("Portable1/ai3", "analog"),
+    ("Linear2/ai0", "analog"),
+    ("PXI1Slot5/port0/line2", "digital"),
+    ("Portable1/port0/line1", "digital"),
+])
+def test_a_channels_kind_follows_its_own_name_not_its_devices(channel, kind):
+    # By substring, a device whose name holds "port" or "line" made every
+    # analog input on it digital.
+    assert nidaq_channel_kind(channel) == kind
+
+
+#: christielab10's laser block, from the rig's configuration as the hardware
+#: checks read it (hardware-check-report, phase 2) and the plan's ledger.
+_CHRISTIELAB10_LASER_BLOCK = Path(__file__).with_name("christielab10_laser_block.yaml")
+
+
+def test_christielab10s_laser_block_loads_and_keeps_its_lines_apart():
+    import io
+
+    from autotrainer.core import SystemConfiguration
+    from autotrainer.core.configuration.laser_configuration import clock_line_clashes
+
+    loaded = SystemConfiguration.load_yaml(io.StringIO(
+        f"!SystemConfiguration\nversion: {SystemConfiguration.version}\n"
+        + _CHRISTIELAB10_LASER_BLOCK.read_text(encoding="utf-8")))
+    laser = loaded.laser
+
+    assert laser == _christielab10_lasers()
+    assert (laser.backplane_clock_line, laser.pulse_clock_line) == ("PXI_Trig1", "PXI_Trig3")
+    assert [(channel.board_stim_line, channel.board_trigger_pulse_us)
+            for channel in laser.channels] == [(3, 1000), (2, 1000)]
+    assert not clock_line_clashes(
+        laser.backplane_clock_line, laser.pulse_clock_line, laser.channels,
+        laser.trigger_listener_inputs)

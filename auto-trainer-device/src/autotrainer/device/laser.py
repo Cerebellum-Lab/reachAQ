@@ -286,6 +286,15 @@ class LaserControllerProtocol(Protocol):
         """
 
 
+class LaserPulseRefused(RuntimeError):
+    """A pulse train refused before anything was driven: its outputs untouched.
+
+    The board rule, a closed controller, or a configuration that cannot run
+    it. A caller that recorded the pulse's amplitude as what its output may
+    hold takes that back (LaserModel).
+    """
+
+
 class NullLaserController:
     """In-memory laser controller for UI development and tests."""
 
@@ -408,7 +417,7 @@ class NullLaserController:
                 and item.state.value not in {"completed", "failed", "cancelled"}
             ]
             if conflicts:
-                raise RuntimeError(
+                raise LaserPulseRefused(
                     "Emulated laser output resource is already owned by operation(s): "
                     + ", ".join(conflicts)
                 )

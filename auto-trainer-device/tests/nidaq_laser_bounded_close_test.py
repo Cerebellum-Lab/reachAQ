@@ -251,3 +251,29 @@ def test_a_normal_close_is_unchanged(monkeypatch):
     assert daq.writes_to("PXI1Slot4/ao0", task_suffix="manual_ao")[-1] == 0.0
     with pytest.raises(RuntimeError, match="closed"):
         controller.run_pulse_train(PULSE)
+
+
+
+def test_a_route_another_call_leaves_pending_is_given_up_on(monkeypatch):
+    # A caller waiting for another's route to settle waited as long as that
+    # one's driver call took: without end, if it hung.
+    monkeypatch.setattr(nidaq_laser, "_ROUTE_PENDING_GIVE_UP_S", 0.3, raising=False)
+    monkeypatch.setattr(nidaq_laser, "_ROUTE_SETTLE_WAIT_S", 0.05)
+    daq = FakeDaqmx()
+    monkeypatch.setattr(nidaq_laser, "_load_nidaqmx", lambda: daq)
+    controller = NidaqLaserController(rig_lasers())
+    with controller._route_lock():
+        controller._route_pending()[AO_CLOCK_ROUTE] = "connect"
+    try:
+        waiter, outcome = _in_thread(lambda: controller._shared_clock_for(
+            "PXI1Slot5", "/PXI1Slot4/ao/SampleClock", line="PXI_Trig1"))
+        waiter.join(3.0)
+
+        assert not waiter.is_alive(), "it waited on the pending route without end"
+        error, = outcome
+        assert isinstance(error, RuntimeError)
+        assert "/PXI1Slot4/ao/SampleClock -> /PXI1Slot4/PXI_Trig1" in str(error)
+        assert daq.connected == []
+    finally:
+        with controller._route_lock():
+            controller._settle_route(AO_CLOCK_ROUTE)
