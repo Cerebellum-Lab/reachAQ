@@ -56,6 +56,8 @@ _WORKER_STOPPED = "stopped"
 _WORKER_LOG = "log"
 _DEFAULT_STARTUP_TIMEOUT_SECONDS = 10.0
 _PAUSED_STATUS = "NI-DAQ signal stream paused"
+#: How a stopped stream the application holds back says so (show_held_back).
+_HELD_BACK_STATUS = "NI-DAQ input stream held back"
 
 
 def _put_worker_message(message_queue, message) -> None:
@@ -605,6 +607,21 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
             if reason:
                 self._set_status(f"{_PAUSED_STATUS}: {reason}")
             elif self._status_message.startswith(_PAUSED_STATUS):
+                self._set_status("NI-DAQ signal stream stopped")
+
+    def show_held_back(self, reason: str) -> None:
+        """Say why the application holds a stopped stream back, or stop saying it.
+
+        As show_paused does for a holder. The application holds the idle
+        stream back while a laser close given up on is still inside the
+        driver (AppModel._nidaq_stream_may_start), and says so here.
+        """
+        with self._lock:
+            if self._process is not None:
+                return
+            if reason:
+                self._set_status(f"{_HELD_BACK_STATUS}: {reason}")
+            elif self._status_message.startswith(_HELD_BACK_STATUS):
                 self._set_status("NI-DAQ signal stream stopped")
 
     def show_blocked(self, reason: str) -> None:

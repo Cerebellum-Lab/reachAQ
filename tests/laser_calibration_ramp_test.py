@@ -92,12 +92,9 @@ class _RampController(NullLaserController):
         super().close()
 
 
-@pytest.fixture
-def ramp_app(nidaq_app, monkeypatch):
-    """Idle, the stream running by itself, and a null laser to calibrate."""
-    assert nidaq_app.load_configuration() is True
-    assert _settle(nidaq_app).is_running, "the stream did not start by itself"
-    nidaq_app.laser.set_configuration_offline(_null_lasers())
+def _a_null_laser_to_calibrate(app, monkeypatch):
+    """A null laser the ramp opens a _RampController for; the spy on it."""
+    app.laser.set_configuration_offline(_null_lasers())
     spy = SimpleNamespace(during=None, error=None, controllers=[], opened_with=[])
 
     def open_controller(configuration, **kwargs):
@@ -106,8 +103,16 @@ def ramp_app(nidaq_app, monkeypatch):
         spy.controllers.append(controller)
         return controller
 
-    monkeypatch.setattr(nidaq_app.laser, "open_controller", open_controller)
-    return nidaq_app, spy
+    monkeypatch.setattr(app.laser, "open_controller", open_controller)
+    return spy
+
+
+@pytest.fixture
+def ramp_app(nidaq_app, monkeypatch):
+    """Idle, the stream running by itself, and a null laser to calibrate."""
+    assert nidaq_app.load_configuration() is True
+    assert _settle(nidaq_app).is_running, "the stream did not start by itself"
+    return nidaq_app, _a_null_laser_to_calibrate(nidaq_app, monkeypatch)
 
 
 def _stream_active(monitor):
@@ -997,3 +1002,48 @@ def test_a_ramps_hung_close_fails_the_laser_until_it_ends(ramp_app, monkeypatch)
     while _laser_status(app).state is SubsystemState.FAILED and time.monotonic() < deadline:
         time.sleep(0.02)
     assert _laser_status(app).state is not SubsystemState.FAILED
+
+
+def test_a_hung_close_says_nothing_of_holding_back_a_disabled_stream(
+    nidaq_app, system_config, trainer_config_dir, monkeypatch,
+):
+    # With the stream disabled there is nothing to hold back. It said "held
+    # back" all the same, and still said it once the close had ended.
+    from autotrainer.core import NidaqPortConfiguration
+
+    system_config.nidaq_ports = NidaqPortConfiguration()
+    system_config.save_default(trainer_config_dir)
+    assert nidaq_app.load_configuration() is True
+    monitor = nidaq_app.nidaq_signal_monitor
+    assert not monitor.configuration.is_enabled
+    spy = _a_null_laser_to_calibrate(nidaq_app, monkeypatch)
+    release = _ramp_whose_close_hangs(nidaq_app, spy, monkeypatch)
+    try:
+        assert "held back" not in monitor.status_message
+    finally:
+        release.set()
+
+    _until_the_close_ends(nidaq_app)
+    assert "held back" not in monitor.status_message
+
+
+def test_the_held_back_text_goes_once_the_close_has_ended(ramp_app, monkeypatch):
+    # The late finish asks for the stream; one that does not start then,
+    # for whatever reason, still said it was held back by a close that had
+    # ended.
+    app, spy = ramp_app
+    monitor = app.nidaq_signal_monitor
+    release = _ramp_whose_close_hangs(app, spy, monkeypatch)
+    try:
+        assert app._nidaq_stream_autostart.wait(10.0)
+        assert "held back" in monitor.status_message
+        monkeypatch.setattr(app._nidaq_stream_autostart, "request", lambda: None)
+    finally:
+        release.set()
+
+    _until_the_close_ends(app)
+    deadline = time.monotonic() + 5.0
+    while "held back" in monitor.status_message and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert monitor.status_message == "NI-DAQ signal stream stopped"
+    assert not _stream_active(monitor)

@@ -6442,13 +6442,16 @@ class AppModel(ObservableObject):
         """Say why the idle input stream stays stopped: a close given up on.
 
         _nidaq_stream_may_start refuses while one is listed, and the stream
-        read only "stopped". Not in System Mode, whose stream state is the
-        acquisition's to tell, nor over a refused plan's, which is held.
+        read only "stopped". Taken back once none is, for a stream that has
+        not started since. Not for a stream disabled, which is never held
+        back; not in System Mode, whose stream state is the acquisition's to
+        tell; nor over a refused plan's, which is held.
         """
-        refusal = self._given_up_close_refusal()
-        if refusal and self._nidaq_stream_idle() and not self._nidaq_plan_error:
-            self._nidaq_signal_monitor.show_blocked(
-                f"NI-DAQ input stream held back: {refusal}")
+        monitor = self._nidaq_signal_monitor
+        if not (monitor.hardware_enabled and monitor.configuration.is_enabled
+                and self._nidaq_stream_idle() and not self._nidaq_plan_error):
+            return
+        monitor.show_held_back(self._given_up_close_refusal())
 
     def _on_nidaq_stream_released(self) -> None:
         """The last hold on the stream is let go: say what still holds it back."""
