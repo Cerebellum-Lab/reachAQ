@@ -26,11 +26,10 @@ from autotrainer.core import (  # noqa: E402
 from tools.acquisition.model.app_model import AppModel  # noqa: E402
 from tools.acquisition.model.trial_action import LaserPulseProfile  # noqa: E402
 from tools.acquisition.view.laser_control_content import (  # noqa: E402
+    _ERROR_STATUS_COLOR,
     LaserControlContent,
 )
 
-#: The application's error red, as on the main window's "Startup failed".
-ERROR_RED = "#b00020"
 PROFILE = LaserPulseProfile("short", 1, 1.0, 2.0)
 NO_PROFILE = "Laser 1: pick a saved profile or the builder draft"
 RUNNING = "Running laser 1 pulse train"
@@ -93,7 +92,7 @@ def _footer(panel):
 
 def _shows_error(panel, text) -> bool:
     footer = _footer(panel)
-    return footer.text() == text and ERROR_RED in footer.styleSheet()
+    return footer.text() == text and _ERROR_STATUS_COLOR in footer.styleSheet()
 
 
 def _logged(caplog, text):
@@ -135,7 +134,7 @@ def test_a_refused_run_pulse_stays_on_the_footer_until_the_next_status(
     _pick(tab, "short")
     tab._run_pulse_button.click()
     assert _footer(panel).text() == RUNNING
-    assert ERROR_RED not in _footer(panel).styleSheet()
+    assert _ERROR_STATUS_COLOR not in _footer(panel).styleSheet()
     _wait_for_operation(panel, qapp)
     assert _footer(panel).text() == "Pulse complete: laser 1"
     assert _footer(panel).styleSheet() == ""
