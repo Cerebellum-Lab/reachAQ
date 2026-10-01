@@ -675,6 +675,10 @@ def test_a_bare_export_line_is_named_on_the_master(monkeypatch):
             ("sample_clock", "/Acquire/PXI_Trig4"),
             ("start_trigger", "/Acquire/PXI_Trig5"),
         ]
+        # Only the master drives a backplane line: a slave task that exported
+        # onto one would be a second driver on it, beside the master's.
+        assert tasks["reachaq_signal_stream_Feedback_ai"].exports == []
+        assert tasks["reachaq_signal_stream_Feedback_di"].exports == []
         assert controller.read_chunk().sample_count == 3
     finally:
         controller.close()
