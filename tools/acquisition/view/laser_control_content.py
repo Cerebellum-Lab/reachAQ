@@ -993,12 +993,17 @@ class _LaserChannelTab(QWidget):
             )
             return
         try:
-            pulse_train = self._build_pulse_train()
+            # Looked up once: the train and what a recording keeps of it
+            # name the same profile, at the same revision.
+            profile = self._selected_profile()
+            if profile is None:
+                raise ValueError(self._profile_refusal())
+            pulse_train = self._build_pulse_train(profile)
             self._validate_pulse_train(pulse_train)
+            manual_context = self._manual_pulse_context(profile)
         except Exception as exc:
             self._set_parent_status(str(exc) or exc.__class__.__name__, True)
             return
-        manual_context = self._manual_pulse_context()
 
         def operation():
             self._app_model.laser.run_pulse_train(
@@ -1206,8 +1211,10 @@ class _LaserChannelTab(QWidget):
 
         self._start_operation(f"Running laser {self._channel.channel_id.value} calibration ramp", operation)
 
-    def _build_pulse_train(self) -> LaserPulseTrain:
-        profile = self._selected_profile()
+    def _build_pulse_train(self, profile=None) -> LaserPulseTrain:
+        """The train of `profile`, or of the picked profile when none is given."""
+        if profile is None:
+            profile = self._selected_profile()
         if profile is None:
             raise ValueError(self._profile_refusal())
         trigger_source = None
@@ -1235,19 +1242,18 @@ class _LaserChannelTab(QWidget):
             emit_timing_trigger_output=self._emit_timing_trigger.isChecked(),
         )
 
-    def _manual_pulse_context(self) -> dict:
+    def _manual_pulse_context(self, profile) -> dict:
         """What a recording session keeps of this Run Pulse beyond its train.
 
-        The profile, by its saved id and revision or as the builder draft,
-        and the trigger mode; the model takes the laser, the amplitude and
-        the route from the train (LaserModel.run_pulse_train). Called once
-        _build_pulse_train has found the profile.
+        `profile` is the one the train was built from, by its saved id and
+        revision or as the builder draft, and then the trigger mode; the
+        model takes the laser, the amplitude and the route from the train
+        (LaserModel.run_pulse_train).
         """
-        profile_id = self.stim_profile_selector.currentData()
-        if profile_id == DRAFT_PROFILE_ID:
+        if profile.profile_id == DRAFT_PROFILE_ID:
             profile_id, revision = "builder draft", None
         else:
-            revision = self._selected_profile().revision
+            profile_id, revision = profile.profile_id, profile.revision
         return {
             "profile_id": profile_id,
             "profile_revision": revision,
