@@ -446,7 +446,10 @@ class LaserModel(ObservableObject):
             # It returns before it ends, so "completed" would be a guess.
             raise ValueError("A manual pulse event needs a train that is waited for")
         # Told before its command is recorded, so that nothing is recorded
-        # of a pulse whose telling failed.
+        # of a pulse whose telling failed. Told before the controller is
+        # called too, so a trace_received subscriber that raises here stops
+        # the pulse from firing (fail closed); the unmarked path is told only
+        # after the train has run, so a raising subscriber cannot stop it.
         manual = (
             None if manual_context is None
             else self._manual_pulse_requested(pulse_train, manual_context)
