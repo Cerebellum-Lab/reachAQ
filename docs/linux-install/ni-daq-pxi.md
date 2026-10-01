@@ -414,6 +414,44 @@ Verify/Commit; unsupported expansion falls back to the independently verified
 per-device graph. `forced_multidevice` turns that rejection into a startup
 failure. Three-card configurations are rejected rather than labeled supported.
 
+Inputs on two boards in backplane mode reach their timing over two PXI_Trig
+lines, set in `sampleClockExportTerminal` and `startTriggerExportTerminal`
+under `nidaqPorts.timing`:
+
+```yaml
+  sampleClockExportTerminal: /PXI1Slot5/PXI_Trig4
+  startTriggerExportTerminal: /PXI1Slot5/PXI_Trig5
+```
+
+The master exports its sample clock (its analog input's, or its counter's
+when it has none) onto the first and, when it has an analog input, its start
+trigger onto the second. The other board's analog and digital input tasks
+name each as their own line, `/PXI1Slot4/PXI_Trig4`, as the laser names its
+shared clock: the master's own terminals, named across the boards, are a
+route DAQmx makes only by reserving a backplane line, and it reserves none on
+an unidentified chassis such as christielab10's (-89125). A digital task
+beside an analog one on that board still takes that task's clock. Each field
+is a PXI_Trig line on the master, or a bare one such as `PXI_Trig4`. When such
+a slave task exists, both are required, with no default: one could collide
+with backplane wiring reachAQ cannot see. Unset, not a PXI_Trig line
+(`PXI_Trig0` to `PXI_Trig7`), or on another board than the master, the plan is
+refused, naming the field and suggesting a line from `PXI_Trig4` up. A
+`forced_multidevice` task that takes a subsystem's inputs on both boards
+leaves no slave task for it, and needs no line for it. The plan's
+`sampleClockSource` and `startTriggerSource` still name the master's
+terminals, which the laser reads and routes itself; the task graph records
+the slave's own names, so its `graph_id` differs from an earlier build's for
+such a configuration, and only for one.
+
+The two lines must be free: different from each other, from the laser's
+`backplaneClockLine` and `pulseClockLine`, from every laser `triggerSource`
+line and PXI_Trig `triggerRouteSource`, and from every `triggerListenerInputs`
+line, compared by line name whatever the board. Run refuses a clash before
+any task, once for each, naming both and a free line; the DAQ Monitor and
+the wiring check list it. christielab10 keeps every stream input on the
+PXI-6221 and sets neither field. This path is tested against a DAQmx
+stand-in only and is not yet verified on hardware.
+
 Requested and resolved timing, device identities, task ordering, routes, and
 synchronization quality are saved in each trial's
 `streams/alignment.json`. See
