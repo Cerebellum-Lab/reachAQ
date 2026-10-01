@@ -28,6 +28,18 @@ LASERS = LaserSystemConfiguration.from_channels((
     ),
 ))
 
+# christielab10 laser 2: board STIM2 into PFI1, routed to PXI_Trig2.
+LASER_2_ON_STIM2 = LaserSystemConfiguration.from_channels((
+    LaserChannelConfiguration(
+        channel_id=2,
+        analog_output="Dev4/ao1",
+        diode_input="Dev4/ai1",
+        shutter_output="Dev4/port0/line1",
+        trigger_source="/Dev4/PXI_Trig2",
+        board_stim_line=2,
+    ),
+))
+
 
 def _context(**changes):
     values = dict(
@@ -49,13 +61,13 @@ def _context(**changes):
     return TrialCompileContext(**values)
 
 
-def _compiler():
+def _compiler(laser_configuration=LASERS):
     return TrialActionCompiler(
         tone_profiles={"cue": ToneProfile("cue", 1, 6000, 100)},
         laser_profiles={
             "pulse": LaserPulseProfile("pulse", 3, 2.5, 5.0)
         },
-        laser_configuration=LASERS,
+        laser_configuration=laser_configuration,
         dcs_to_motor=lambda values: tuple(value * 2 for value in values),
     )
 
@@ -180,6 +192,23 @@ def test_compile_rejects_pre_reveal_shorter_than_trigger_pulse():
         _compiler().compile(row, _context())
 
 
+def test_pre_reveal_refusal_names_the_lasers_own_board_line():
+    row = TrialProtocolRow(trial_id=1).with_updates({
+        "enabled": True,
+        "cover_policy": "reveal",
+        "laser_profile_id": "pulse",
+        "laser_phase": "embedded_in_sequence",
+        "laser_trigger_route": "hardware_stim3",
+        "laser_channel_id": 2,
+        "stimulus_assignment": "always",
+        "stimulus_trigger": "pre_reveal",
+        "pre_reveal_ms": 1,
+    })
+
+    with pytest.raises(ValueError, match="longer than the STIM2 trigger pulse"):
+        _compiler(LASER_2_ON_STIM2).compile(row, _context())
+
+
 def test_prepared_operation_enforces_generation_and_terminal_state():
     row = TrialProtocolRow(trial_id=1).with_updates({"enabled": True})
     operation = PreparedTrialOperation(_compiler().compile(row, _context()))
@@ -284,6 +313,36 @@ def test_executor_routes_hardware_stimulus_through_firmware_callback():
     executor.trigger_stimulus(recipe.operation_id, 4, detail="frame 7")
 
     assert calls == [(1000, recipe.operation_id, "frame 7")]
+
+
+def test_hardware_stimulus_observation_names_the_line_it_pulsed():
+    # The stim-camera path already pulses laser 2's own STIM2; the trial
+    # record has to say so rather than claim STIM3.
+    row = TrialProtocolRow(trial_id=1).with_updates({
+        "enabled": True,
+        "laser_profile_id": "pulse",
+        "laser_phase": "pellet_presentation",
+        "laser_trigger_route": "hardware_stim3",
+        "laser_channel_id": 2,
+        "stimulus_assignment": "always",
+        "stimulus_trigger": "first_reach",
+    })
+    recipe = _compiler(LASER_2_ON_STIM2).compile(row, _context())
+    executor = TrialActionExecutor(
+        move_absolute=lambda target: None,
+        configure_cover=lambda policy, recipe: None,
+        play_tone=lambda profile, phase: None,
+        prepare_laser=lambda profile, recipe: object(),
+        cancel_laser=lambda handle: None,
+        trigger_hardware_stimulus=lambda profile, recipe, detail: None,
+    )
+
+    operation = executor.prepare(recipe)
+    executor.trigger_stimulus(recipe.operation_id, 4, detail="frame 7")
+
+    details = [item["detail"] for item in operation.to_record()["observations"]]
+    assert "frame 7 firmware STIM2 trigger acknowledged" in details
+    assert not any("STIM3" in detail for detail in details)
 
 
 def test_embedded_tone_is_prepared_without_host_playback():

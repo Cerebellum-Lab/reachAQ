@@ -538,7 +538,8 @@ class TrialActionCompiler:
                 and firing.trigger_pulse_us >= resolved_offset_ms * 1000
             ):
                 raise ValueError(
-                    "Pre-reveal interval must be longer than the STIM3 trigger pulse"
+                    "Pre-reveal interval must be longer than the "
+                    f"STIM{firing.stim_line} trigger pulse"
                 )
         if not selected:
             laser = None
@@ -817,7 +818,8 @@ class TrialActionExecutor:
                 # Tone 1 has just sounded, so the cue interval starts here.
                 self._arm_cue_pair(recipe, phase)
             # A laser is already armed. Phase execution records the semantic
-            # trigger point; the configured STIM3/NI route owns physical start.
+            # trigger point; the configured board STIM/NI route owns physical
+            # start.
             if recipe.laser_profile is not None and row["laser_phase"] == phase:
                 self._trigger_laser_if_direct(phase)
                 self._observe(f"{phase} laser trigger enabled")
@@ -836,7 +838,9 @@ class TrialActionExecutor:
                 self._observe(f"{detail} direct NI trigger accepted")
             elif firing.trigger_route is LaserTriggerRoute.HARDWARE_STIM3:
                 self._trigger_hardware_stimulus(profile, operation.recipe, detail)
-                self._observe(f"{detail} firmware STIM3 trigger acknowledged")
+                self._observe(
+                    f"{detail} firmware STIM{firing.stim_line} trigger acknowledged"
+                )
             else:
                 raise RuntimeError(f"Unsupported stimulus route: {firing.trigger_route}")
 
