@@ -358,3 +358,97 @@ def test_independent_boards_a_masterless_plan_a_valid_one_and_none_give_no_clock
     assert refused_plan_clock_source(
         _refused_plan(is_valid=True, resolved_mode="same_device"), timing) is None
     assert refused_plan_clock_source(None, timing) is None
+
+
+# ------------------------------------------- the stream's two export lines
+
+
+def _christielab10_boards():
+    lines = tuple(f"PXI_Trig{number}" for number in range(8))
+    return [
+        _device("PXI1Slot5", terminals=("PFI0", "PFI1", "PFI3", *lines),
+                analog_inputs=tuple(f"PXI1Slot5/ai{pin}" for pin in range(16)),
+                chassis=UNIDENTIFIED),
+        _device("PXI1Slot4", terminals=("PFI0", *lines), analog_inputs=(),
+                analog_outputs=("PXI1Slot4/ao0", "PXI1Slot4/ao1"),
+                chassis=UNIDENTIFIED),
+    ]
+
+
+def _christielab10_lasers(**changes):
+    """christielab10's lasers: clock lines PXI_Trig1 and PXI_Trig3, triggers
+    and trigger inputs on PXI_Trig0 and PXI_Trig2, routed from PFI0/PFI1."""
+    import dataclasses
+
+    from nidaq_channel_plan_test import _christielab10_lasers as lasers
+
+    return dataclasses.replace(lasers(), **changes)
+
+
+def _export_issues(sample=None, start=None, laser=None):
+    return validate_nidaq_configuration(
+        _christielab10_boards(),
+        ports=_ports(sample_clock_export_terminal=sample,
+                     start_trigger_export_terminal=start),
+        laser=_christielab10_lasers() if laser is None else laser)
+
+
+def test_christielab10_with_no_export_lines_or_two_free_ones_is_accepted():
+    assert _export_issues() == ()
+    assert _export_issues("/PXI1Slot5/PXI_Trig4", "/PXI1Slot5/PXI_Trig5") == ()
+    # A PFI is not a backplane line, and never clashes with one.
+    assert _export_issues("/PXI1Slot5/PFI3") == ()
+
+
+def _route_on_trig7():
+    import dataclasses
+
+    lasers = _christielab10_lasers()
+    first, second = lasers.channels
+    return dataclasses.replace(lasers, channels=(
+        dataclasses.replace(first, trigger_route_source="/PXI1Slot5/PXI_Trig7"),
+        second))
+
+
+@pytest.mark.parametrize(("sample", "start", "laser", "clashes"), [
+    ("/PXI1Slot5/PXI_Trig4", "PXI_Trig4", None, [
+        ("timing startTriggerExportTerminal", "timing sampleClockExportTerminal")]),
+    ("/PXI1Slot5/PXI_Trig1", None, None, [
+        ("timing sampleClockExportTerminal", "the laser backplaneClockLine")]),
+    ("pxi_trig3", None, None, [
+        ("timing sampleClockExportTerminal", "the laser pulseClockLine")]),
+    (None, "/PXI1Slot5/PXI_Trig0", _christielab10_lasers(trigger_listener_inputs=()), [
+        ("timing startTriggerExportTerminal",
+         "laser 1 triggerSource /PXI1Slot4/PXI_Trig0")]),
+    # One refusal each: laser 2's trigger and the trigger input on its line.
+    (None, "/PXI1Slot5/PXI_Trig2", None, [
+        ("timing startTriggerExportTerminal",
+         "laser 2 triggerSource /PXI1Slot4/PXI_Trig2"),
+        ("timing startTriggerExportTerminal",
+         "triggerListenerInputs /PXI1Slot4/PXI_Trig2")]),
+    ("/PXI1Slot5/PXI_Trig7", None, _route_on_trig7(), [
+        ("timing sampleClockExportTerminal",
+         "laser 1 triggerRouteSource /PXI1Slot5/PXI_Trig7")]),
+    (None, "/PXI1Slot5/PXI_Trig6",
+     _christielab10_lasers(trigger_listener_inputs=("/PXI1Slot4/PXI_Trig6",)), [
+        ("timing startTriggerExportTerminal",
+         "triggerListenerInputs /PXI1Slot4/PXI_Trig6")]),
+])
+def test_an_export_line_another_signal_takes_is_refused_once_per_clash(
+        sample, start, laser, clashes):
+    # The stream's master drives both lines for as long as it runs. A second
+    # driver on one corrupts both signals, and DAQmx does not see it across
+    # these boards; a trigger input on one reads the stream's signal instead
+    # of a trigger. Refused before any task, as clock_line_clashes refuses
+    # the laser's own lines.
+    issues = _export_issues(sample, start, laser)
+
+    assert [(issue.subject, other) for issue in issues
+            for _subject, other in clashes if other in issue.problem] == clashes
+    assert len(issues) == len(clashes)
+    for issue in issues:
+        assert issue.value in (sample, start)
+        # A line no other field takes here, as the remedy's example.
+        assert "such as PXI_Trig" in issue.remedy
+        for taken in ("PXI_Trig0", "PXI_Trig1", "PXI_Trig2", "PXI_Trig3"):
+            assert f"such as {taken}" not in issue.remedy
