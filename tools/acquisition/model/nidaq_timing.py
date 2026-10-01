@@ -14,6 +14,10 @@ from autotrainer.core import (
     NidaqTaskGraph,
     NidaqTaskSpecification,
 )
+from autotrainer.core.configuration.nidaq_port_configuration import (
+    pxi_trig_line,
+    slave_input_timing,
+)
 from tools.acquisition.model.nidaq_discovery import (
     NidaqDevicePorts,
     device_name_from_channel,
@@ -239,6 +243,13 @@ def build_nidaq_timing_plan(
             master=master,
             slaves=slaves,
         )
+    line_refusal = (
+        _backplane_line_refusal(
+            configuration, timing, master, slaves, master_has_analog_input)
+        if resolved_mode == "backplane" else None
+    )
+    if line_refusal is not None:
+        return _invalid_plan(timing, line_refusal, master=master, slaves=slaves)
 
     routes = tuple(
         NidaqTimingRoute(signal, source, destinations)
@@ -311,12 +322,16 @@ def _with_task_graph(plan, configuration, timing, output_devices, output_channel
             for channel in configuration.digital_channels
             if device_name_from_channel(channel.physical_channel) == device
         )
-        clock_source = (
-            None if device == plan.master_device else plan.sample_clock_source
-        )
-        trigger_source = (
-            None if device == plan.master_device else plan.start_trigger_source
-        )
+        # A slave's own names for the master's clock and trigger: the
+        # backplane lines in backplane mode (slave_input_timing). A slave
+        # whose tasks a forced multidevice task takes over may have none, and
+        # records the master's, as before.
+        if device == plan.master_device:
+            clock_source = trigger_source = None
+        else:
+            clock_source, trigger_source = slave_input_timing(plan, device)
+            clock_source = clock_source or plan.sample_clock_source
+            trigger_source = trigger_source or plan.start_trigger_source
         if analog:
             tasks.append(NidaqTaskSpecification(
                 task_id=f"{device}.ai",
@@ -337,7 +352,8 @@ def _with_task_graph(plan, configuration, timing, output_devices, output_channel
                 channels=digital,
                 mode="continuous_input",
                 sample_clock_source=(
-                    plan.sample_clock_source if analog or device != plan.master_device
+                    clock_source if device != plan.master_device
+                    else plan.sample_clock_source if analog
                     else f"/{device}/Ctr0InternalOutput"
                 ),
                 start_trigger_source=trigger_source,
@@ -618,6 +634,96 @@ def _has_common_pxi_backplane(
         return False
     chassis = {device.pxi_chassis_number for device in devices}
     return len(chassis) == 1 and None not in chassis
+
+
+def _slaves_keeping_input_tasks(configuration, slaves, strategy) -> tuple[str, ...]:
+    """The slaves with an input task of their own, in plan order.
+
+    Forced multidevice puts each subsystem that is on both boards into one
+    task on the master, or the start fails (resolve_nidaq_multidevice_probe,
+    nidaq_preflight), so only a subsystem on a slave alone stays a slave
+    task. auto_multidevice can fall back to per-device tasks, so every slave
+    input counts there, as it does per device.
+    """
+    subsystems = {}
+    for subsystem, channels in (("ai", configuration.analog_channels),
+                                ("di", configuration.digital_channels)):
+        for channel in channels:
+            device = device_name_from_channel(channel.physical_channel)
+            subsystems.setdefault(device, set()).add(subsystem)
+
+    def merged(device, subsystem):
+        return strategy == "forced_multidevice" and any(
+            other != device and subsystem in theirs
+            for other, theirs in subsystems.items())
+
+    return tuple(
+        device for device in slaves
+        if any(not merged(device, subsystem)
+               for subsystem in subsystems.get(device, ()))
+    )
+
+
+def _backplane_line_refusal(
+    configuration, timing, master, slaves, master_has_analog_input,
+) -> Optional[str]:
+    """Why a slave input task has no backplane line for its timing, or None.
+
+    A slave names the master's sample clock and start trigger as its own view
+    of the lines the master exports them onto (slave_input_timing), so those
+    lines have to be configured: the start trigger's only when the master has
+    an analog input, the only task that exports one. None is chosen by
+    default, since a default could collide with backplane wiring nothing
+    here can see (Ben, 2026-09-30); the reason names the field and suggests
+    a line. PXI_Trig4 upwards are suggested: christielab10's triggers take
+    PXI_Trig0 and PXI_Trig2, and the laser's clock lines default to
+    PXI_Trig1 and PXI_Trig3. Whether a line is free of the laser's is checked
+    where both configurations are seen (nidaq_validation).
+    """
+    devices = _slaves_keeping_input_tasks(configuration, slaves, timing.task_strategy)
+    if not devices:
+        return None
+    fields = [("timing sampleClockExportTerminal", "sample clock",
+               timing.sample_clock_export_terminal)]
+    if master_has_analog_input:
+        fields.append(("timing startTriggerExportTerminal", "start trigger",
+                       timing.start_trigger_export_terminal))
+    named = tuple(
+        terminal
+        for terminal in (
+            timing.sample_clock_export_terminal,
+            timing.start_trigger_export_terminal,
+            timing.reference_clock_source,
+            timing.start_trigger_source,
+            timing.sample_clock_source,
+            *(route.source for route in timing.external_routes),
+            *(destination for route in timing.external_routes
+              for destination in route.destinations),
+        )
+        if terminal
+    )
+    for field, signal, value in fields:
+        board = device_name_from_channel(value)
+        if not value:
+            problem = "is unset"
+        elif pxi_trig_line(value) is None:
+            problem = f"{value!r} is not a PXI_Trig line"
+        elif board is not None and board != master:
+            problem = f"{value!r} names {board}, and {master} drives the line"
+        else:
+            continue
+        taken = {pxi_trig_line(terminal) for terminal in named if terminal != value}
+        example = next(
+            (f"PXI_Trig{number}" for number in range(4, 8)
+             if f"PXI_Trig{number}" not in taken),
+            "PXI_Trig4")
+        return (
+            f"NI-DAQ inputs on {', '.join(devices)} take {master}'s {signal} "
+            f"over a PXI backplane line, and {field} {problem}: set it to a "
+            f"PXI_Trig line on {master} that nothing else drives, such as "
+            f"/{master}/{example}"
+        )
+    return None
 
 
 def _validate_channels_and_rates(configuration, discovered) -> Optional[str]:
