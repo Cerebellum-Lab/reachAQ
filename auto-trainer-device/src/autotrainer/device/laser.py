@@ -296,6 +296,16 @@ class LaserPulseRefused(RuntimeError):
     """
 
 
+class LaserPulseCancelled(RuntimeError):
+    """A waited-for pulse train cancelled while it ran, by a cancel or a close.
+
+    Not a failure of the train (NidaqLaserController.run_synchronized_pulse_train),
+    and told apart from one by its class: the laser model records a manual
+    Run Pulse stopped by System Mode's Stop as cancelled. A RuntimeError, as
+    the error a cancel raised before it had a class of its own.
+    """
+
+
 class NullLaserController:
     """In-memory laser controller for UI development and tests."""
 

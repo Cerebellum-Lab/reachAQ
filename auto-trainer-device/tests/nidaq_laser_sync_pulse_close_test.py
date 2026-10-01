@@ -715,6 +715,12 @@ def test_a_waited_for_pulse_cancelled_by_itself_says_cancelled_not_closed(held):
     error, = pulse_outcome
     assert str(error) == f"Laser operation {operation.operation_id} was cancelled"
     assert operation.wait_until_finished(1.0) is True
+    # Its own class, so that a caller tells a cancel from a failure (the laser
+    # model records a manual Run Pulse as "cancelled"); a RuntimeError still.
+    from autotrainer.device.laser import LaserPulseCancelled
+
+    assert isinstance(error, LaserPulseCancelled)
+    assert isinstance(error, RuntimeError)
 
 
 # ------------------------------------------------ round 6: the abort's logging
