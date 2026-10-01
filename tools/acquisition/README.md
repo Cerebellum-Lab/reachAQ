@@ -247,14 +247,18 @@ slot, say `PXI1Slot6`, names each line as its own (`/PXI1Slot6/PXI_Trig4`):
 named across the boards, the master's own terminals are a route DAQmx refuses
 on an unidentified chassis (-89125). `sampleClockExportTerminal` is then
 required, and `startTriggerExportTerminal` too when the master has an analog
-input; neither has a default. A stream start with a required one unset, or
-not a PXI_Trig line, is refused, naming the field. The two lines must differ
-from each other, from the laser's `backplaneClockLine` and `pulseClockLine`,
-from every laser `triggerSource` line and PXI_Trig `triggerRouteSource`, and
-from every `triggerListenerInputs` line; Run and the stream's own start, Idle's
-included, refuse a clash, once for each, and the DAQ Monitor lists it.
-christielab10 keeps every input on the 6221 and sets neither field. This path
-is tested against a DAQmx stand-in only and is not yet verified on hardware.
+input; neither has a default. They are required on an identified chassis too,
+where DAQmx could route the master's terminals itself and the earlier direct
+naming worked: the code makes no exception for one. A stream start with a
+required one unset, or not a PXI_Trig line, is refused, naming the field. The
+two lines must differ from each other, from the laser's `backplaneClockLine`
+and `pulseClockLine`, from every laser `triggerSource` line and PXI_Trig
+`triggerRouteSource`, and from every `triggerListenerInputs` line; Run and the
+stream's own start, Idle's included, refuse a clash, once for each, and the DAQ
+Monitor lists it. The DAQ Monitor window's own stream is configured without the
+laser, so it refuses only one export line against the other. christielab10
+keeps every input on the 6221 and sets neither field. This path is tested
+against a DAQmx stand-in only and is not yet verified on hardware.
 
 Laser Control opens on **Pulse Builder**, the first tab, before the per-channel
 tabs. Every laser pulse profile is built and saved there; a laser's own tab

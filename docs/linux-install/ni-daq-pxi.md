@@ -437,10 +437,13 @@ exporting onto it. When such a slave task exists, `sampleClockExportTerminal`
 is required, and `startTriggerExportTerminal` too when the master has an
 analog input (a counter-clocked master has no start trigger to export);
 neither has a default, since one could collide with backplane wiring reachAQ
-cannot see. A required one unset, not a PXI_Trig line (`PXI_Trig0` to
-`PXI_Trig7`), or on another board than the master, and the plan is refused,
-naming the field and suggesting a line that nothing in the timing or the
-laser configuration takes, from `PXI_Trig4` up.
+cannot see. The fields are required on an identified chassis too, where DAQmx
+could route the master's terminals across the boards itself and the earlier
+direct naming worked: the code makes no exception for one. A required one
+unset, not a PXI_Trig line (`PXI_Trig0` to `PXI_Trig7`), or on another board
+than the master, and the plan is refused, naming the field and suggesting a
+line that nothing in the timing or the laser configuration takes, from
+`PXI_Trig4` up.
 
 `auto_multidevice` and `forced_multidevice` put each subsystem on both boards
 into one task on the master, which needs no line: only a subsystem on the
@@ -466,8 +469,10 @@ line and PXI_Trig `triggerRouteSource`, and from every `triggerListenerInputs`
 line, compared by line name whatever the board. Run and the stream's own
 start, Idle's included, refuse a clash before any task, once for each, naming
 both and a free line, whether or not any board is found; the DAQ Monitor and
-the wiring check list it. christielab10 keeps every stream input on the
-PXI-6221 and sets neither field. This path is tested against a DAQmx
+the wiring check list it. The DAQ Monitor window's own stream is configured
+without the laser, so its start refuses only one export line against the
+other, and the window lists the rest. christielab10 keeps every stream input
+on the PXI-6221 and sets neither field. This path is tested against a DAQmx
 stand-in only and is not yet verified on hardware.
 
 Requested and resolved timing, device identities, task ordering, routes, and
