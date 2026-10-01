@@ -30,7 +30,7 @@ from autotrainer.device import (
 )
 from autotrainer.device import nidaq_laser
 
-from nidaq_daqmx_fake import FakeDaqmx, rig_lasers
+from nidaq_daqmx_fake import FakeDaqError, FakeDaqmx, rig_lasers
 
 
 #: The pellet board's STIM line, as the 6713 sees it (PXI_Trig0).
@@ -316,3 +316,43 @@ def test_a_trigger_line_the_output_outlasts_keeps_its_width(daq, output, duratio
     pulse_samples = int(duration_ms * 100)
     assert _trigger_line_written(daq, output, duration_ms=duration_ms) == (
         [True] * 100 + [False] * (pulse_samples + 2 - 100))
+
+
+# ------------------------------------------------------ the fake's own rule
+
+
+def _timed_output(daq, channels):
+    task = daq.Task("probe_ao")
+    for channel in channels:
+        task.ao_channels.add_ao_voltage_chan(channel)
+    task.timing.cfg_samp_clk_timing(rate=RATE, sample_mode="finite", samps_per_chan=3)
+    return task
+
+
+def test_the_fake_refuses_an_odd_ao_buffer_as_the_6713_does(daq):
+    # A guard on the stand-in, not on the controller: christielab10's
+    # PXI-6713 refused a 105,741-sample buffer with -200692 (2026-10-01), so
+    # an odd one fails here as it does there, and writes nothing.
+    task = _timed_output(daq, ["PXI1Slot4/ao0"])
+
+    with pytest.raises(FakeDaqError) as refused:
+        task.write([0.0] * 3)
+
+    assert refused.value.error_code == -200692
+    assert str(refused.value) == (
+        "DAQmx -200692: Number of samples per channel to write multiplied by "
+        "the number of channels in the task cannot be an odd number for this device.")
+    assert task.writes == []
+    # Samples per channel times channels: two channels of three are six.
+    _timed_output(daq, ["PXI1Slot4/ao0", "PXI1Slot4/ao1"]).write([[0.0] * 3] * 2)
+    task.write([0.0] * 4)
+
+
+def test_the_fake_takes_an_on_demand_ao_sample(daq):
+    # Not timed: the command reset's one sample, which the 6713 takes.
+    task = daq.Task("laser_1_manual_ao")
+    task.ao_channels.add_ao_voltage_chan("PXI1Slot4/ao0")
+
+    task.write(0.0, auto_start=True)
+
+    assert task.writes == [0.0]
