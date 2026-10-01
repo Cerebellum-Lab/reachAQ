@@ -38,6 +38,7 @@ from autotrainer.behavior import SystemMachine, PelletDeviceProtocol, BehaviorAl
     InferenceProtocol, SystemState
 from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
 from autotrainer.behavior.pellet import PelletState
+from tools.acquisition.model.app_model import AppModel
 from tools.acquisition.model.behavior_model import BehaviorModel
 from tools.acquisition.model.hardware_model import HardwareModel
 from tools.acquisition.model.user_preferences import UserPreferences
@@ -63,8 +64,17 @@ def isolate_host_can(monkeypatch):
 PRODUCTION_DEFAULT_OUTPUT_PATH = PersistenceConfiguration.DEFAULT_OUTPUT_PATH
 
 
+def _own_monkeypatch():
+    # Not the test's monkeypatch: test_saving_resumes_once_a_load_completes
+    # calls monkeypatch.undo(), which lifted the isolation below with its own
+    # patches, and its app's teardown then tried to unlink the operator's real
+    # ~/.config/Colorado/autotrainer_running_status.env (refused by the guard
+    # on christielab10 on 2026-10-01).
+    return pytest.MonkeyPatch.context()
+
+
 @pytest.fixture(autouse=True)
-def isolated_default_data_root(tmp_path_factory, monkeypatch) -> Path:
+def isolated_default_data_root(tmp_path_factory) -> Generator[Path, None, None]:
     """Give each test a default data folder of its own, under pytest's tmp.
 
     AppModel opens its log, its hourly event file and its first project under
@@ -76,8 +86,31 @@ def isolated_default_data_root(tmp_path_factory, monkeypatch) -> Path:
     in the operator's ~/Documents/rawdatalocal/20261001/christielab10.
     """
     root = tmp_path_factory.mktemp("default-data")
-    monkeypatch.setattr(PersistenceConfiguration, "DEFAULT_OUTPUT_PATH", root)
-    return root
+    with _own_monkeypatch() as patch:
+        patch.setattr(PersistenceConfiguration, "DEFAULT_OUTPUT_PATH", root)
+        yield root
+
+
+# ~/.config/Colorado/autotrainer_running_status.env, beside the operator's
+# preferences file. Read at import, before any fixture replaces it.
+PRODUCTION_STATUS_FILE_PATH = AppModel.status_file_path
+
+
+@pytest.fixture(autouse=True)
+def isolated_running_status_file(tmp_path_factory) -> Generator[Path, None, None]:
+    """Give each test a running-status file of its own, under pytest's tmp.
+
+    AppModel writes this file when acquisition leaves IDLE and removes it when
+    acquisition returns, and nothing patched it, so every test that started
+    and stopped acquisition created and deleted the operator's real one: the
+    folder's mtime moved during each full run on christielab10 on 2026-10-01.
+    During a real session that would overwrite, then delete, the running
+    app's file.
+    """
+    path = tmp_path_factory.mktemp("running-status").joinpath(AppModel.status_file_path.name)
+    with _own_monkeypatch() as patch:
+        patch.setattr(AppModel, "status_file_path", path)
+        yield path
 
 
 @pytest.fixture
@@ -96,7 +129,7 @@ def app_launch_env(tmp_path) -> dict:
 
 
 class DataRootWriteRefused(RuntimeError):
-    """A test tried to write under the operator's data folder.
+    """A test tried to write under the operator's data or preferences folder.
 
     Not an OSError, so Path.mkdir(exist_ok=True) cannot mistake it for an
     existing folder and carry on.
@@ -104,7 +137,10 @@ class DataRootWriteRefused(RuntimeError):
 
 
 class DataRootGuard:
-    """Refuse, and record, every write a test makes under the operator's data folder.
+    """Refuse, and record, every write a test makes under the operator's folders.
+
+    They are the data folder and ~/.config/Colorado, which holds the
+    preferences file and the running-status file.
 
     It is an audit hook (PEP 578), so it sees each file and folder this process
     creates, changes or removes through Python, whatever route reached the
@@ -121,7 +157,11 @@ class DataRootGuard:
     puts its default data folder here is refused too.
 
     Writes made in C (cv2, HDF5) are not audited; the application reaches
-    them through folders it first ensures with Path.mkdir, which is.
+    them through folders it first ensures with Path.mkdir, which is. Qt's
+    QSettings writes the preferences file in C++ with no such step, so the
+    watched folders (~/.config/Colorado) are also compared, entry by entry,
+    before and after each test: that catches the write afterwards, though it
+    cannot stop it.
     """
 
     # Audit events that create, change or remove what a path names, with the
@@ -151,11 +191,13 @@ class DataRootGuard:
     )
     _APP_SCRIPTS = ("reachaq", "auto-trainer-local", "auto-trainer-headless")
 
-    def __init__(self, default_output_path: Path):
+    def __init__(self, default_output_path: Path, preferences_folder: Path):
         # The default is under HOME, which each process resolves for itself.
         self._under_home = default_output_path.relative_to("~")
         self.home = Path("~").expanduser()
-        self.roots = (self.home.joinpath(self._under_home),)
+        preferences_folder = preferences_folder.expanduser()
+        self.roots = (self.home.joinpath(self._under_home), preferences_folder)
+        self.watched = (preferences_folder,)
         self._refused: List[str] = []
 
     @property
@@ -184,15 +226,52 @@ class DataRootGuard:
         refused, self._refused = self._refused, []
         return refused
 
-    def fail_on_refusals(self) -> None:
+    def snapshot(self) -> dict:
+        """Each watched folder's own stat and its entries', for changes_since()."""
+        return {folder: self._stat_folder(folder) for folder in self.watched}
+
+    def changes_since(self, snapshot: dict) -> List[str]:
+        changes = []
+        for folder, before in snapshot.items():
+            after = self._stat_folder(folder)
+            if after == before:
+                continue
+            if before is None or after is None:
+                changes.append(f"{folder} {'created' if before is None else 'removed'}")
+                continue
+            (_, entries_before), (_, entries_after) = before, after
+            entry_changes = [
+                f"{folder / name} " + ("created" if name not in entries_before
+                                       else "removed" if name not in entries_after else "changed")
+                for name in sorted(entries_before.keys() | entries_after.keys())
+                if entries_before.get(name) != entries_after.get(name)
+            ]
+            # Otherwise only the folder's own stat moved: an entry came and went.
+            changes.extend(entry_changes or [f"{folder} modified (an entry was created and removed)"])
+        return changes
+
+    def fail_on_refusals(self, snapshot: Optional[dict] = None) -> None:
         refused = self.take_refused()
-        if refused:
+        changed = [] if snapshot is None else self.changes_since(snapshot)
+        if refused or changed:
             pytest.fail(
-                "tried to write under the operator's data folder, and was refused"
-                " (a background thread's attempt may belong to an earlier test):\n  "
-                + "\n  ".join(refused),
+                "tried to write under the operator's folders (a background thread's"
+                " attempt may belong to an earlier test):\n  "
+                + "\n  ".join([*(f"refused: {what}" for what in refused),
+                               *(f"changed: {what}" for what in changed)]),
                 pytrace=False,
             )
+
+    @staticmethod
+    def _stat_folder(folder: Path):
+        def key(stat):
+            return stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, stat.st_ino
+        try:
+            with os.scandir(folder) as entries:
+                listing = {entry.name: key(entry.stat(follow_symlinks=False)) for entry in entries}
+            return key(os.stat(folder)), listing
+        except FileNotFoundError:
+            return None
 
     def _refusal(self, event: str, args: tuple) -> Optional[str]:
         if event == "subprocess.Popen":
@@ -235,15 +314,16 @@ class DataRootGuard:
 
 
 # Installed at import, so collection is covered too; an audit hook cannot be removed.
-data_root_guard = DataRootGuard(PRODUCTION_DEFAULT_OUTPUT_PATH)
+data_root_guard = DataRootGuard(PRODUCTION_DEFAULT_OUTPUT_PATH, PRODUCTION_STATUS_FILE_PATH.parent)
 sys.addaudithook(data_root_guard)
 
 
 @pytest.fixture(autouse=True)
 def guard_the_operator_data_root():
-    """Fail any test that tried to write under the operator's data folder."""
+    """Fail any test that tried to write under the operator's folders."""
+    before = data_root_guard.snapshot()
     yield
-    data_root_guard.fail_on_refusals()
+    data_root_guard.fail_on_refusals(before)
 
 
 def simulate_get_perf_now():

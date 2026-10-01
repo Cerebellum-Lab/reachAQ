@@ -439,6 +439,24 @@ def test_start_stop(app_model, settings_ini_path):
     # ...
 
 
+def test_start_stop_keeps_the_running_status_file_out_of_home(app_model, tmp_path, tmp_path_factory, monkeypatch):
+    # HOME stands in for the operator's: the status file's path is expanded at
+    # each write, and was ~/.config/Colorado/autotrainer_running_status.env.
+    home = tmp_path.joinpath("operator-home")
+    home.mkdir()
+    monkeypatch.setenv("HOME", home.as_posix())
+    assert app_model.load_configuration() is True
+    assert app_model.capture_start() is True
+    status_file = AppModel.status_file_path.expanduser()
+    try:
+        assert status_file.read_text() == "status='running'\n"
+    finally:
+        app_model.capture_stop()
+    assert not status_file.exists()
+    assert not home.joinpath(".config").exists(), sorted(home.rglob("*"))
+    assert status_file.resolve().is_relative_to(tmp_path_factory.getbasetemp().resolve())
+
+
 def _null_lasers():
     from autotrainer.core import (
         LaserChannelConfiguration,
