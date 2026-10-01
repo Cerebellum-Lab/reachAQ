@@ -964,11 +964,13 @@ class NidaqLaserController:
                     self._create_finite_digital_output_task(
                         pmt_line,
                         digital_names[-1],
-                        # Low on the output's last sample, its close lag
-                        # after the train. High on it, the line stayed high
-                        # until the cleanup's reset, which comes last of
-                        # all, as the analog output held its last pulse
-                        # (christielab10, 2026-10-01).
+                        # Low on the output's last sample: the close lag
+                        # after the train with no post-stim, else (lag - 1)
+                        # samples after the post-stim ends, which is still
+                        # at least the lag after the light ends. High on it,
+                        # the line stayed high until the cleanup's reset,
+                        # which comes last of all, as the analog output
+                        # held its last pulse (christielab10, 2026-10-01).
                         [True] * (total_samples - 1) + [False],
                         sample_rate_hz,
                         total_samples,
