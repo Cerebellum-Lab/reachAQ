@@ -388,14 +388,14 @@ no operation id) start at its `requested` row's `perf_time`, so the two join on
 it. They are drawn from that time, so each point was output at or after its
 row's time: `timestamp_method` `manual_pulse_call_perf_counter`,
 `timing_confidence` `before_output`. Before 2026-09-30 a Run Pulse was kept only
-as those rows, unmarked, and timed from after the train had ended. The event's time is host time only: the
-`requested` row's `nidaq_sample_index` is the NI sample during which the host
-called the controller, not the one the output started on; that onset is in
-`nidaq.h5` where the command-copy or diode input is recorded. `events.laser`
-reports how many manual Run Pulse events it found and how each ended, such as
-*2 manual Run Pulse event(s) (1 completed, 1 refused)*; one with no outcome row
-is counted *with no outcome*, and not warned of. `trials.protocol` never takes
-one as a trial's laser evidence.
+as those rows, unmarked, and timed from after the train had ended. The event's
+time is host time only: the `requested` row's `nidaq_sample_index` is the NI
+sample during which the host called the controller, not the one the output
+started on; that onset is in `nidaq.h5` where the command-copy or diode input is
+recorded. `events.laser` reports how many manual Run Pulse events it found and
+how each ended, such as *2 manual Run Pulse event(s) (1 completed, 1 refused)*;
+one with no outcome row is counted *with no outcome*, and not warned of.
+`trials.protocol` never takes one as a trial's laser evidence.
 
 ### `session.log`
 
