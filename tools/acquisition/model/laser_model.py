@@ -12,7 +12,7 @@ from typing import Callable, Optional, Tuple, Union
 
 from autotrainer.core import NidaqTimingPlan, ObservableObject
 from autotrainer.core.logging import get_verbose_logger, log_hardware_initialization
-from autotrainer.device.laser import LaserPulseRefused
+from autotrainer.device.laser import LaserPulseCancelled, LaserPulseRefused
 from autotrainer.device.nidaq_laser import CANCELLED_OPERATION_WAIT_S
 from autotrainer.device import (
     LaserControllerProtocol,
@@ -435,8 +435,9 @@ class LaserModel(ObservableObject):
         a manual laser event, which a recording session keeps
         (SessionDataRecorder._on_laser_trace) as any laser trace: a
         "requested" row as the controller is called, and one for how it
-        ended, "completed", "failed" or "refused", under one manual- id.
-        Every other caller passes none, and is told only the train, as before.
+        ended, "completed", "failed", "cancelled" or "refused", under one
+        manual- id. Every other caller passes none, and is told only the
+        train, as before.
         """
         controller = self._require_controller()
         if manual_context is not None and not pulse_train.wait:
@@ -455,6 +456,12 @@ class LaserModel(ObservableObject):
             self._undo_refused_pulse(before)
             if manual is not None:
                 self._manual_pulse_ended(manual, "refused", "operation_refused", error)
+            raise
+        except LaserPulseCancelled as error:
+            # System Mode's Stop, or another close, cancelled it as it ran.
+            if manual is not None:
+                self._manual_pulse_ended(
+                    manual, "cancelled", "operation_cancelled", error)
             raise
         except Exception as error:
             if manual is not None:
@@ -824,8 +831,8 @@ class LaserModel(ObservableObject):
         """Tell how a manual Run Pulse ended, and what its output may hold.
 
         That is what the model keeps as the laser's last command: the minimum
-        once it completed, its amplitude once it failed, and the command
-        before it once it was refused, which drove nothing.
+        once it completed, its amplitude once it failed or was cancelled, and
+        the command before it once it was refused, which drove nothing.
         """
         context = {
             **manual.context,

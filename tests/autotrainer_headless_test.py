@@ -1684,6 +1684,51 @@ def test_stop_mid_pulse_cancels_the_pulse_and_resets_the_laser(
         app_model.capture_stop()
 
 
+def test_a_manual_run_pulse_stopped_by_system_mode_is_recorded_as_cancelled(
+    app_model, monkeypatch,
+):
+    # Recorded as "failed", operation_failure: the Stop's cancel came back as
+    # a plain RuntimeError, like any failure of the train.
+    import json
+
+    from autotrainer.core import LaserChannelId
+    from autotrainer.device import LaserPulseTrain
+
+    daq = _system_mode_with_the_fake_laser(
+        app_model, monkeypatch, block_wait=True, hold_waits=True)
+    told = []
+    app_model.laser.trace_received += told.append
+    try:
+        pulse_thread, pulse_outcome = _in_thread(
+            lambda: app_model.laser.run_pulse_train(
+                LaserPulseTrain(channel_id=LaserChannelId.LASER_1,
+                                amplitude_volts=1.0, duration_ms=1.0),
+                manual_context={"profile_id": "burst", "profile_revision": 1,
+                                "trigger_mode": "internal"}))
+        _wait_for_the_pulse(daq)
+
+        stop_thread, stop_outcome = _in_thread(app_model.capture_stop)
+        stop_thread.join(20.0)
+        assert not stop_thread.is_alive()
+        pulse_thread.join(5.0)
+
+        events = [trace for trace in told if trace.source == "manual pulse"]
+        assert [trace.event for trace in events] == ["requested", "cancelled"]
+        cancelled = events[-1]
+        assert cancelled.timing_confidence == "operation_cancelled"
+        assert json.loads(cancelled.context_json)["error_class"] == "LaserPulseCancelled"
+        # No waveform: a cancelled train is not one that ran.
+        assert not [trace for trace in told if trace.source == "internal pulse"]
+        from autotrainer.device.laser import LaserPulseCancelled
+
+        error, = pulse_outcome
+        assert isinstance(error, LaserPulseCancelled)
+        assert "the laser controller was closed while it ran" in str(error)
+    finally:
+        daq.waits_released.set()
+        app_model.capture_stop()
+
+
 def test_acquisition_owns_configured_signal_stream_lifecycle(app_model, monkeypatch):
     assert app_model.load_configuration() is True
     monitor = app_model.nidaq_signal_monitor

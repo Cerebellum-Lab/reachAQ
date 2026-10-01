@@ -19,6 +19,7 @@ from .laser import (
     LaserChannelConfiguration,
     LaserChannelId,
     LaserFeedbackSample,
+    LaserPulseCancelled,
     LaserPulseRefused,
     LaserPulseTrain,
     LaserSynchronizedPulseTrain,
@@ -733,7 +734,7 @@ class NidaqLaserController:
             if operation.state is LaserOperationState.CANCELLED:
                 # Not the DAQmx error the cancel's abort provoked (-88709).
                 # A close says so; a cancel alone is only a cancel.
-                raise RuntimeError(
+                raise LaserPulseCancelled(
                     f"Laser operation {operation.operation_id} was cancelled"
                     + (": the laser controller was closed while it ran"
                        if self._closed else ""))
