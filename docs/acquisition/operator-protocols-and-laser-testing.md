@@ -298,8 +298,9 @@ Run Pulse stays available while a session is recording, and a pulse fired then
 is recorded in the session, in `streams/laser.csv`, as a manual laser event:
 when it was asked for, the laser, the profile (its saved name, or *builder
 draft*), the amplitude, the trigger mode and the route, then whether it
-completed, failed or was refused. A refused pulse drove nothing and is recorded
-as refused, never as fired. Its time is the host's, taken as Run Pulse calls
+completed, failed, was cancelled (by stopping System Mode while it ran, as
+below) or was refused. A refused pulse drove nothing and is recorded as
+refused, never as fired. Its time is the host's, taken as Run Pulse calls
 the laser controller, so the output starts at or after it. A pulse fired while
 no session records is not recorded. Test stim stays refused while a session is
 recording.
