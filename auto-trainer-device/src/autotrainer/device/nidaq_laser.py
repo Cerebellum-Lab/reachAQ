@@ -2275,8 +2275,9 @@ class NidaqLaserController:
             waveform.append(minimum)
         if len(waveform) % 2:
             # The 6713 refuses a buffer whose samples per channel times
-            # channels is odd: B2's 105,740 samples and the one above were
-            # refused with -200692 (christielab10, 2026-10-01). Even per
+            # channels is odd: B2's 105,740 samples plus the one above,
+            # 105,741, were refused with -200692 (christielab10,
+            # 2026-10-01). Even per
             # channel, it is even for any number of channels.
             waveform.append(minimum)
         return waveform

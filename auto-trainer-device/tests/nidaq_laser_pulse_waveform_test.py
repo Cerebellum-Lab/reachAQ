@@ -152,8 +152,8 @@ def test_a_train_ends_on_a_minimum_that_is_not_zero(daq):
 def test_run_pulse_leaves_the_output_on_the_minimum(daq):
     # Bench check B2's saved profile, 31 x 23 ms at 29 Hz and 2.0 V, run as
     # Run Pulse runs it: waited for, on the output's own 100 kHz clock. Its
-    # 105,740 samples and the one that ends it on 0 V were refused by the
-    # 6713 (-200692); a second makes them even.
+    # 105,740 samples plus the one that ends it on 0 V, 105,741 in all, were
+    # refused by the 6713 (-200692); a second makes them even.
     controller = NidaqLaserController(rig_lasers())
 
     controller.run_pulse_train(_train(
