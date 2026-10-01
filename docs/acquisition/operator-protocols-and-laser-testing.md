@@ -191,9 +191,13 @@ is **Pulse Builder** — every profile is made here, and nowhere else.
   open it. The margins decide the PMT shutter wherever the profile fires, Run
   Pulse, Test stim and trials alike: with either above zero and a PMT shutter
   line (`pmtShutterOutput`) configured, the shutter opens that long before the
-  train and closes that long after it. With no PMT line configured, as on
-  christielab10, the margins are ignored and the train fires without them;
-  the log says so once for each laser each time the laser controller opens.
+  train and closes that long after it. Since the last-pulse fix, the line
+  closes the close lag after the pulse generation ends, to within one sample,
+  where before it closed after the host's cleanup, about 5-12 ms later; the
+  close lag must therefore cover the shutter's own mechanical close time.
+  With no PMT line configured, as on christielab10, the margins are
+  ignored and the train fires without them; the log says so once for each
+  laser each time the laser controller opens.
   Amplitude here is limited to the widest range any configured laser
   accepts; the laser that actually fires the profile checks its own range. A
   saved profile outside that range loads clamped to it, and the status line

@@ -496,9 +496,9 @@ target rather than accumulating relative movement.
 
 `Pre-reveal` is a board-owned compound sequence: a finite pulse on the laser's
 board STIM line (STIM2 or STIM3), board delay, pellet reveal, then the
-configured SEND sequence. It requires the Hardware STIM3 route and Reveal cover
-policy. First Reach uses the independently managed 900 Hz stim camera and
-either acknowledged board-STIM-to-NI triggering or the
+configured SEND sequence. It requires the `hardware_stim3` (Board STIM) route
+and Reveal cover policy. First Reach uses the independently managed 900 Hz
+stim camera and either acknowledged board-STIM-to-NI triggering or the
 explicit Direct NI software-start route; it never silently switches routes.
 ROI1/ROI2 remain visible, versioned, and non-runnable future framework.
 
