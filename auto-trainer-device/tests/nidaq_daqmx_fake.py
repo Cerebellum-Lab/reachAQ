@@ -3,7 +3,8 @@
 Nothing here touches a driver or a board. The fake records what is done to
 each task and every write that happens, with the thread that made it. It
 refuses a channel another started task reserves, as DAQmx does at -50103, and
-it records the terminals routed.
+a timed analog output buffer of an odd number of samples, as the PXI-6713
+does at -200692. It records the terminals routed.
 
 It is shared by the controller's own tests and by the application's close-path
 tests. Those load it by path, because tests/ and auto-trainer-device/tests are
@@ -39,6 +40,20 @@ ABORT_WARNING_TEXT = (
     "\nWarning 200010 occurred.\n\nFinite acquisition or generation has been "
     "stopped before the requested number of samples were acquired or generated.")
 
+#: DAQmx's text for -200692, as christielab10's PXI-6713 gave it (2026-10-01).
+ODD_AO_WRITE_TEXT = (
+    "Number of samples per channel to write multiplied by the number of "
+    "channels in the task cannot be an odd number for this device.")
+
+
+def _sample_count(data):
+    """Samples in a write: per channel times channels, or 1 for a scalar."""
+    if not isinstance(data, (list, tuple)):
+        return 1
+    if data and isinstance(data[0], (list, tuple)):
+        return sum(len(samples) for samples in data)
+    return len(data)
+
 
 class FakeTask:
     def __init__(self, daq, name):
@@ -62,7 +77,8 @@ class FakeTask:
         self._aborting_unstarted = False
         #: Set once the task is closed, for an abort to wait on.
         self._closed_event = threading.Event()
-        self.ao_channels = SimpleNamespace(add_ao_voltage_chan=self._add)
+        self.ao_channels = SimpleNamespace(add_ao_voltage_chan=self._add_ao)
+        self.ao_channels_added = False
         self.ai_channels = SimpleNamespace(add_ai_voltage_chan=self._add_ai)
         #: Each analog input channel added, as (physical channel, kwargs).
         self.ai_added = []
@@ -83,7 +99,8 @@ class FakeTask:
             raise FakeDaqError(-200088, "Task specified is invalid or does not exist")
         return self.label
 
-    def _add(self, channel, **_kwargs):
+    def _add_ao(self, channel, **_kwargs):
+        self.ao_channels_added = True
         self.channels.append(channel)
 
     def _add_ai(self, channel, **kwargs):
@@ -130,6 +147,12 @@ class FakeTask:
         if self.daq.failing_write and self.label.endswith(self.daq.failing_write):
             # As DAQmx refuses an on-demand write to a line another task holds.
             raise FakeDaqError(-50103, f"The specified resource is reserved ({self.label})")
+        if self.ao_channels_added and self.timing_kwargs is not None and _sample_count(data) % 2:
+            # As christielab10's PXI-6713 refused Run Pulse's 105,741-sample
+            # buffer (2026-10-01): a timed analog output write of an odd
+            # number of samples per channel times channels. An on-demand
+            # write is not timed: the command reset's one sample is taken.
+            raise FakeDaqError(-200692, ODD_AO_WRITE_TEXT)
         if auto_start:
             # An on-demand write reserves its lines only for the write, and a
             # refused one (-50103) writes nothing.
