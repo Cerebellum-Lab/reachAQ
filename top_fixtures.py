@@ -6,6 +6,7 @@ import math
 import multiprocessing
 import os
 import queue
+import sys
 import threading
 import time
 from multiprocessing import synchronize
@@ -92,6 +93,157 @@ def app_launch_env(tmp_path) -> dict:
     env = os.environ.copy()
     env["HOME"] = home.as_posix()
     return env
+
+
+class DataRootWriteRefused(RuntimeError):
+    """A test tried to write under the operator's data folder.
+
+    Not an OSError, so Path.mkdir(exist_ok=True) cannot mistake it for an
+    existing folder and carry on.
+    """
+
+
+class DataRootGuard:
+    """Refuse, and record, every write a test makes under the operator's data folder.
+
+    It is an audit hook (PEP 578), so it sees each file and folder this process
+    creates, changes or removes through Python, whatever route reached the
+    folder: a ProjectInfo rooted there, a configuration left at the
+    PersistenceConfiguration default (fixed at import, out of the fixture's
+    reach), a path built from Path.home(), or a test that builds the app
+    without the fixtures. Raising stops the write, including the shutil.rmtree
+    that removes an aborted session, which tests ran on the operator's
+    20261001/christielab10/session001 several times on 2026-10-01. The refusal
+    is recorded as well, because some callers swallow it (the event file
+    plugin logs and carries on), and fail_on_refusals() fails the test.
+
+    A child process is beyond the hook, so starting reachAQ with a HOME that
+    puts its default data folder here is refused too.
+
+    Writes made in C (cv2, HDF5) are not audited; the application reaches
+    them through folders it first ensures with Path.mkdir, which is.
+    """
+
+    # Audit events that create, change or remove what a path names, with the
+    # positions of those paths among the event's arguments.
+    _WRITE_EVENTS = {
+        "os.mkdir": (0,),
+        "os.rename": (0, 1),  # os.replace too
+        "os.remove": (0,),  # os.unlink too
+        "os.rmdir": (0,),
+        "os.link": (1,),
+        "os.symlink": (1,),
+        "os.truncate": (0,),
+        "os.chmod": (0,),
+        "os.chown": (0,),
+        "os.utime": (0,),
+        "shutil.rmtree": (0,),
+    }
+    _EVENTS = frozenset((*_WRITE_EVENTS, "open", "subprocess.Popen"))
+    _OPEN_WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
+    # What starts reachAQ: its entry modules, by -m or by path, and its
+    # console scripts (pyproject.toml).
+    _APP_MODULES = (
+        "tools.acquisition.headless",
+        "tools.acquisition.gui",
+        "tools.acquisition.run_acquisition",
+        "reachAQ.app",
+    )
+    _APP_SCRIPTS = ("reachaq", "auto-trainer-local", "auto-trainer-headless")
+
+    def __init__(self, default_output_path: Path):
+        # The default is under HOME, which each process resolves for itself.
+        self._under_home = default_output_path.relative_to("~")
+        self.home = Path("~").expanduser()
+        self.roots = (self.home.joinpath(self._under_home),)
+        self._refused: List[str] = []
+
+    @property
+    def roots(self) -> tuple:
+        return self._roots
+
+    @roots.setter
+    def roots(self, value) -> None:
+        self._roots = tuple(Path(root) for root in value)
+        self._prefixes = {
+            resolve(root) for root in self._roots for resolve in (os.path.abspath, os.path.realpath)
+        }
+
+    def __call__(self, event: str, args: tuple) -> None:
+        if event not in self._EVENTS:
+            return
+        try:
+            refusal = self._refusal(event, args)
+        except Exception:
+            return  # the guard must never break a call it has no business with
+        if refusal is not None:
+            self._refused.append(refusal)
+            raise DataRootWriteRefused(f"refused by the test suite's data folder guard: {refusal}")
+
+    def take_refused(self) -> List[str]:
+        refused, self._refused = self._refused, []
+        return refused
+
+    def fail_on_refusals(self) -> None:
+        refused = self.take_refused()
+        if refused:
+            pytest.fail(
+                "tried to write under the operator's data folder, and was refused"
+                " (a background thread's attempt may belong to an earlier test):\n  "
+                + "\n  ".join(refused),
+                pytrace=False,
+            )
+
+    def _refusal(self, event: str, args: tuple) -> Optional[str]:
+        if event == "subprocess.Popen":
+            executable, command, _cwd, env = args
+            return self._launch_refusal(executable, command, env)
+        if event == "open":
+            path, mode, flags = args  # mode is None from os.open
+            writes = (isinstance(mode, str) and any(c in mode for c in "wax+")
+                      or isinstance(flags, int) and bool(flags & self._OPEN_WRITE_FLAGS))
+            paths = (path,) if writes else ()
+        else:
+            paths = tuple(args[i] for i in self._WRITE_EVENTS[event])
+        for path in paths:
+            if not isinstance(path, int):  # a descriptor was audited when it was opened
+                path = os.path.abspath(os.fsdecode(path))
+                if self._is_protected(path):
+                    return f"{event} {path}"
+        return None
+
+    def _launch_refusal(self, executable, command, env) -> Optional[str]:
+        if isinstance(command, (str, bytes, os.PathLike)):
+            command = [command]
+        words = [os.fsdecode(word) for word in command]
+
+        def is_app_module(word: str) -> bool:
+            module = word[:-3] if word.endswith(".py") else word
+            return module.replace("\\", "/").replace("/", ".").endswith(self._APP_MODULES)
+
+        programs = {os.path.basename(os.fsdecode(executable or words[0])), os.path.basename(words[0])}
+        if not (programs & set(self._APP_SCRIPTS) or any(is_app_module(word) for word in words)):
+            return None
+        home = (os.environ if env is None else env).get("HOME") or self.home
+        root = os.path.abspath(os.path.join(os.fsdecode(home), self._under_home))
+        if not self._is_protected(root):
+            return None
+        return f"subprocess.Popen {' '.join(words)} (its HOME puts its data folder at {root})"
+
+    def _is_protected(self, path: str) -> bool:
+        return any(path == prefix or path.startswith(prefix + os.sep) for prefix in self._prefixes)
+
+
+# Installed at import, so collection is covered too; an audit hook cannot be removed.
+data_root_guard = DataRootGuard(PRODUCTION_DEFAULT_OUTPUT_PATH)
+sys.addaudithook(data_root_guard)
+
+
+@pytest.fixture(autouse=True)
+def guard_the_operator_data_root():
+    """Fail any test that tried to write under the operator's data folder."""
+    yield
+    data_root_guard.fail_on_refusals()
 
 
 def simulate_get_perf_now():
