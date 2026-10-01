@@ -431,6 +431,29 @@ def test_run_pulse_names_the_builder_draft_as_such(qapp, app_model, monkeypatch)
         "trigger_mode": "internal"}}
 
 
+def test_run_pulse_records_the_profile_that_built_its_train(
+    qapp, app_model, monkeypatch,
+):
+    # The context looked the profile up a second time, after the train was
+    # built, so a profile saved again in between was recorded at a revision
+    # the train was not built from.
+    with_one_listed_profile(monkeypatch, app_model)
+    with_saved_profile(monkeypatch, app_model, a_profile(revision=4))
+    tab, started, _statuses = make_tab(app_model)
+    tab.stim_profile_selector.setCurrentIndex(tab.stim_profile_selector.findData("burst"))
+    saved = iter((
+        a_profile(revision=4, amplitude_volts=1.25),
+        a_profile(revision=5, amplitude_volts=2.0),
+    ))
+    monkeypatch.setattr(
+        type(app_model), "laser_profile", lambda _self, _profile_id: next(saved))
+
+    train, options = _fired(tab, started, app_model, monkeypatch)
+
+    assert train.amplitude_volts == pytest.approx(1.25)
+    assert options["manual_context"]["profile_revision"] == 4
+
+
 def test_a_laser_event_leaves_the_trace_note_on_what_was_drawn(channel_tab):
     # A manual Run Pulse's request and outcome, like a protocol operation's
     # events, have nothing to draw. Taken as an empty trace, each set the
