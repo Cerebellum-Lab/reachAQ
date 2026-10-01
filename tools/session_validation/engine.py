@@ -752,8 +752,36 @@ _tone_confirmation_rule.MINIMUM = ValidationProfile.FAST
 _MANUAL_PULSE_OPERATION_PREFIX = "manual-"
 
 
+#: How a manual Run Pulse can end, in the order its count names them.
+_MANUAL_PULSE_OUTCOMES = ("completed", "failed", "cancelled", "refused")
+
+
 def _is_manual_pulse(operation_id):
     return str(operation_id or "").startswith(_MANUAL_PULSE_OPERATION_PREFIX)
+
+
+def _manual_pulse_summary(rows):
+    """How many manual Run Pulse events, and how each ended; or empty.
+
+    One with only its request has no outcome: its outcome fell after Stop.
+    That is legitimate, as one with only its outcome is, whose request fell
+    before Record, so neither is warned of.
+    """
+    events = {}
+    for row in rows:
+        if _is_manual_pulse(row.get("operation_id")):
+            events.setdefault(row["operation_id"], set()).add(row.get("event"))
+    if not events:
+        return ""
+    counts = {}
+    for seen in events.values():
+        outcome = next(
+            (name for name in _MANUAL_PULSE_OUTCOMES if name in seen), "with no outcome")
+        counts[outcome] = counts.get(outcome, 0) + 1
+    breakdown = ", ".join(
+        f"{counts[name]} {name}"
+        for name in (*_MANUAL_PULSE_OUTCOMES, "with no outcome") if name in counts)
+    return f"{len(events)} manual Run Pulse event(s) ({breakdown})"
 
 
 def _laser_confirmation_rule(context):
@@ -776,13 +804,12 @@ def _laser_confirmation_rule(context):
         "; ".join((errors or warnings)[:20]) if errors or warnings
         else "Laser events have recorded-frame evidence"
     )
-    # Each is a request and an outcome under one id. Said, so a reviewer
-    # sees them (Ben, 2026-09-30).
-    manual = {
-        row.get("operation_id") for row in rows if _is_manual_pulse(row.get("operation_id"))
-    }
+    # Each is a request and an outcome under one id. Said, by outcome, so a
+    # reviewer sees them and never takes a refused one for one that fired
+    # (Ben, 2026-09-30).
+    manual = _manual_pulse_summary(rows)
     if manual:
-        message += f"; {len(manual)} manual Run Pulse event(s)"
+        message += f"; {manual}"
     return _result(
         "events.laser", "fail" if errors else ("warning" if warnings else "pass"),
         message, observed=len(rows), paths=(path.as_posix(),),
