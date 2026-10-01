@@ -791,8 +791,9 @@ Physical qualification (required before release claims):
       CAN/board start/completion, NI edge, AO, feedback, and behavioral-frame
       intervals. For Direct NI, retain IPC/dispatch/DAQ start/feedback latency and
       label it software confidence. Confirm no automatic fallback between routes.
-- [ ] Qualify scheduled pre-reveal timing from board STIM3 onset through board
-      delay, physical cover reveal, NI/AO/feedback, and recorded behavioral frame.
+- [ ] Qualify scheduled pre-reveal timing from the laser's board STIM line
+      (STIM2 or STIM3) onset through board delay, physical cover reveal,
+      NI/AO/feedback, and recorded behavioral frame.
 - [ ] Tag/build/publish/verify/flash pellet firmware v2.1.0 following the sibling
       repository guide. Confirm exact version plus `timing_trailer`, `time_sync`,
       and `finite_stim3_pulse`; retain reconnect/reboot, tone, STIM3 return-low,

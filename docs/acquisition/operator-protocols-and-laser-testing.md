@@ -78,6 +78,13 @@ qualifies). Change any of those cells afterward as needed. Clearing **Laser
 profile** clears the whole action. **Laser** itself lists every configured
 channel (`Laser 1`, `Laser 2`, ...) or `None`.
 
+A **Trigger** of `pre_reveal` is timed by the pellet board. It pulses the
+laser's board STIM line (STIM2 or STIM3; on christielab10, STIM3 for laser 1
+and STIM2 for laser 2), waits **Pre-reveal (ms)** from that pulse's rising
+edge, reveals the pellet, and then sends. It needs **Laser route**
+`hardware_stim3` and **Cover** `reveal`, and the interval must be longer than
+the laser's board trigger pulse (`boardTriggerPulseUs`).
+
 For anything repetitive, use the edit bar rather than typing each cell:
 
 - **Copy row**, then select rows and **Paste to selected**.
