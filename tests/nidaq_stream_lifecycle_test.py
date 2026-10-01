@@ -835,6 +835,42 @@ def test_an_idle_start_on_a_board_that_clocks_digital_input_is_unchanged(nidaq_a
     assert _nidaq_state(nidaq_app).state is SubsystemState.READY
 
 
+@pytest.mark.parametrize("discovery", ["a board", "no board"])
+def test_an_idle_start_refuses_an_export_line_the_laser_takes_as_run_does(
+    nidaq_app, system_config, trainer_config_dir, monkeypatch, discovery,
+):
+    # Run refused an export line on the laser's backplaneClockLine; the
+    # stream's own start in Idle never asked, and drove the line the laser
+    # drives its clock onto. The check needs no board, so a start that finds
+    # none refuses it too, where Run's check of the boards is skipped.
+    from tools.acquisition.model import app_model as app_model_module
+
+    system_config.nidaq_ports = NidaqPortConfiguration(
+        cam_frames="Dev1/port0/line0",
+        timing=NidaqTimingConfiguration(sample_clock_export_terminal="PXI_Trig1"))
+    system_config.save_default(trainer_config_dir)
+    found = (nidaq_stream_fakes.discover_dev1 if discovery == "a board"
+             else (lambda: ((), "NI-DAQmx reports no devices")))
+    monitor = nidaq_app.nidaq_signal_monitor
+    monitor._device_discovery = found
+    monkeypatch.setattr(app_model_module, "discover_nidaq_devices", found)
+
+    assert nidaq_app.load_configuration() is True
+    _settle(nidaq_app, running=False)
+
+    idle = _nidaq_state(nidaq_app)
+    assert not monitor.is_running and monitor._process is None
+    assert idle.state is SubsystemState.FAILED, idle
+    assert "timing sampleClockExportTerminal is 'PXI_Trig1'" in idle.error
+    assert "the laser backplaneClockLine" in idle.error
+
+    assert nidaq_app._start_nidaq_domain(restart=True) is False
+    run = _nidaq_state(nidaq_app)
+    assert run.state is SubsystemState.FAILED
+    assert "the laser backplaneClockLine" in run.error
+    assert monitor._process is None
+
+
 def test_the_daq_monitor_pauses_the_stream_and_resumes_it_when_closed(
     nidaq_app, monkeypatch,
 ):

@@ -38,6 +38,7 @@ from tools.acquisition.model.nidaq_timing import (
     resolve_nidaq_stream_configuration,
 )
 from tools.acquisition.model.nidaq_preflight import run_isolated_nidaq_preflight
+from tools.acquisition.model.nidaq_validation import validate_export_lines
 
 
 logger = get_verbose_logger(__name__)
@@ -185,6 +186,9 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
         self._hardware_timed_output_devices = tuple()
         self._hardware_timed_output_channels = tuple()
         self._device_identities: tuple[NidaqDeviceIdentity, ...] = tuple()
+        #: The laser configuration, read for its backplane lines alone
+        #: (configure_timing).
+        self._laser = None
         self._runtime_device_aliases = {}
         self._timing_plan: Optional[NidaqTimingPlan] = None
         self._sample_ring = SharedNidaqSampleRing(self._configuration, mp_ctx=self._mp_ctx)
@@ -387,7 +391,13 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
         hardware_timed_output_devices: Iterable[str] = tuple(),
         hardware_timed_output_channels: Iterable[str] = tuple(),
         device_identities: Iterable[NidaqDeviceIdentity] = tuple(),
+        laser=None,
     ) -> None:
+        # The laser's backplane lines, which every start checks the export
+        # lines against (validate_export_lines). Not timing: the running
+        # stream is unchanged by them, so they are taken while it runs too,
+        # for the next start, rather than compared.
+        self._laser = laser
         if self._is_running or self._is_starting:
             # Reloading the configuration re-applies the timing it already
             # has, and demo mode is toggled by reloading the configuration:
@@ -471,6 +481,13 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
                 tuple(channel.physical_channel for channel in configuration.channels),
             )
             try:
+                # Every start, Idle's included, refuses an export line another
+                # signal takes, as Run does (validate_export_lines). Before
+                # discovery, since it needs no board: a start that finds none
+                # refuses it too.
+                clashes = validate_export_lines(self._timing_configuration, self._laser)
+                if clashes:
+                    raise RuntimeError("; ".join(issue.describe() for issue in clashes))
                 devices, discovery_error = self._device_discovery()
                 if discovery_error:
                     raise RuntimeError(discovery_error)
@@ -496,6 +513,7 @@ class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
                     devices,
                     hardware_timed_output_devices=hardware_timed_output_devices,
                     hardware_timed_output_channels=hardware_timed_output_channels,
+                    laser=self._laser,
                 )
                 self._set_timing_plan(timing_plan)
                 if not timing_plan.is_valid:

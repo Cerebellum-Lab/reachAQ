@@ -36,6 +36,21 @@ def backplane_line_of(terminal: Optional[str]) -> Optional[str]:
     return tail if _BACKPLANE_LINE.match(tail) else None
 
 
+def pxi_trig_line(terminal: Optional[str]) -> Optional[str]:
+    """The PXI_Trig line `terminal` names, spelt as DAQmx spells it, or None.
+
+    None for anything else, and for a number the backplane does not have:
+    PXI has PXI_Trig0 to PXI_Trig7. The board is ignored, as
+    backplane_line_of ignores it. The one spelling of a line for the clock
+    lines here and the input stream's export lines alike.
+    """
+    line = backplane_line_of(terminal)
+    if line is None:
+        return None
+    number = int(line[len("pxi_trig"):])
+    return f"PXI_Trig{number}" if number <= 7 else None
+
+
 def clock_line_clashes(
     backplane_clock_line: str,
     pulse_clock_line: str,
@@ -111,24 +126,19 @@ def _bare_backplane_line(field: str, value) -> str:
         # The value's own line when it is one the backplane has; the field's
         # default could itself be taken. Not a tail that is refused too, as
         # a PFI is.
-        tail = backplane_line_of(text)
-        example = (
-            f"PXI_Trig{int(tail[len('pxi_trig'):])}"
-            if tail is not None and int(tail[len("pxi_trig"):]) <= 7
-            else _EXAMPLE_LINE[field])
+        example = pxi_trig_line(text) or _EXAMPLE_LINE[field]
         raise ValueError(
             f"{field} {text!r} names a board: give a bare PXI_Trig line, such "
             f"as {example}, which every board in the chassis sees as its own")
-    line = backplane_line_of(text)
-    if line is None:
+    if backplane_line_of(text) is None:
         raise ValueError(
             f"{field} {text!r} is not a PXI_Trig line, such as PXI_Trig1")
-    number = int(line[len("pxi_trig"):])
-    if number > 7:
+    line = pxi_trig_line(text)
+    if line is None:
         raise ValueError(
             f"{field} {text!r} is not a line the backplane has: PXI has "
             "PXI_Trig0 to PXI_Trig7")
-    return f"PXI_Trig{number}"
+    return line
 
 
 #: A clock line a refusal can suggest: each field's own default.

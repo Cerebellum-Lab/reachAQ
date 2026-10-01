@@ -467,7 +467,7 @@ def test_christielab10s_plan_is_unchanged_by_the_digital_clock_rule():
 # ------------------------------------- inputs on two boards, over the backplane
 
 
-def _two_input_boards(**timing):
+def _two_input_boards(laser=None, **timing):
     """Inputs on Acquire, the master (it has cam_frames), and on Feedback."""
     return build_nidaq_timing_plan(
         _stream(
@@ -478,6 +478,7 @@ def _two_input_boards(**timing):
         ),
         NidaqTimingConfiguration(**timing),
         (_pxi("Acquire", 50), _pxi("Feedback", 51)),
+        laser=laser,
     )
 
 
@@ -713,3 +714,18 @@ def test_christielab10s_pinned_plan_is_its_own():
     assert reservation.channels == ("PXI1Slot4/ao0", "PXI1Slot4/ao1")
     assert (reservation.sample_clock_source, reservation.start_trigger_source) == (
         "/PXI1Slot5/ai/SampleClock", "/PXI1Slot5/ai/StartTrigger")
+
+
+def test_the_suggested_line_is_not_one_the_laser_takes():
+    # One suggester for the plan and the validation (free_backplane_line),
+    # and it sees the laser when it is given: here the laser's clock lines
+    # are PXI_Trig4 and PXI_Trig5, which a plan blind to them would suggest.
+    from autotrainer.core import LaserSystemConfiguration
+
+    laser = LaserSystemConfiguration(
+        backplane_clock_line="PXI_Trig4", pulse_clock_line="PXI_Trig5")
+
+    plan = _two_input_boards(laser=laser)
+
+    assert not plan.is_valid
+    assert "such as /Acquire/PXI_Trig6" in plan.reason

@@ -8549,6 +8549,7 @@ class AppModel(ObservableObject):
                 if configuration.laser.hardware_timed
             ),
             device_identities=configuration.nidaq_ports.device_identities,
+            laser=configuration.laser,
         )
         self._nidaq_plan_error = nidaq_plan_error
         if nidaq_plan_error:
@@ -8795,6 +8796,7 @@ class AppModel(ObservableObject):
                 if laser_configuration.hardware_timed
             ),
             device_identities=nidaq_ports.device_identities,
+            laser=laser_configuration,
         )
         self._loaded_configuration.nidaq_stream = acquisition
         self.configuration_loaded_event(self._loaded_configuration)
