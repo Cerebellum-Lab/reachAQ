@@ -242,15 +242,17 @@ When the stream's inputs span two boards in one PXI chassis, the timing
 master exports its sample clock onto the PXI_Trig line in
 `nidaqPorts.timing.sampleClockExportTerminal` and, when it has an analog
 input, its start trigger onto the one in `startTriggerExportTerminal`, such as
-`/PXI1Slot5/PXI_Trig4` and `/PXI1Slot5/PXI_Trig5`. The other board's tasks
-name each line as their own (`/PXI1Slot4/PXI_Trig4`): named across the boards,
-the master's own terminals are a route DAQmx refuses on an unidentified
-chassis (-89125). Both fields are then required and have no default; a
-stream start with either unset, or not a PXI_Trig line, is refused, naming
-the field. The two lines must differ from each other, from the laser's
-`backplaneClockLine` and `pulseClockLine`, from every laser `triggerSource`
-line and PXI_Trig `triggerRouteSource`, and from every `triggerListenerInputs`
-line; Run refuses a clash, once for each, and the DAQ Monitor lists it.
+`/PXI1Slot5/PXI_Trig4` and `/PXI1Slot5/PXI_Trig5`. An input board in another
+slot, say `PXI1Slot6`, names each line as its own (`/PXI1Slot6/PXI_Trig4`):
+named across the boards, the master's own terminals are a route DAQmx refuses
+on an unidentified chassis (-89125). `sampleClockExportTerminal` is then
+required, and `startTriggerExportTerminal` too when the master has an analog
+input; neither has a default. A stream start with a required one unset, or
+not a PXI_Trig line, is refused, naming the field. The two lines must differ
+from each other, from the laser's `backplaneClockLine` and `pulseClockLine`,
+from every laser `triggerSource` line and PXI_Trig `triggerRouteSource`, and
+from every `triggerListenerInputs` line; Run and the stream's own start, Idle's
+included, refuse a clash, once for each, and the DAQ Monitor lists it.
 christielab10 keeps every input on the 6221 and sets neither field. This path
 is tested against a DAQmx stand-in only and is not yet verified on hardware.
 

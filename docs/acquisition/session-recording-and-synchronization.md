@@ -614,13 +614,15 @@ delay.
 When the inputs themselves span two PXI boards, the slave board's tasks do not
 name the master's clock and start trigger terminals, a cross-board route DAQmx
 refuses on an unidentified chassis (-89125). The master exports them onto the
-PXI_Trig lines in `nidaqPorts.timing.sampleClockExportTerminal` and
-`startTriggerExportTerminal`, required then and with no default, and the slave
-names each line on its own board. The persisted task graph records those
-names in the slave's task specifications, so its `graph_id` differs from an
-earlier build's for such a configuration; a plan with no slave input task,
-christielab10's included, is byte-identical. The plan's `sample_clock_source`
-and `start_trigger_source` keep the master's terminals, which the laser reads.
+PXI_Trig lines in `nidaqPorts.timing.sampleClockExportTerminal` and, when it has
+an analog input, `startTriggerExportTerminal`, required then and with no
+default, and the slave names each line on its own board. The persisted task
+graph records those names in the slave's task specifications, so its
+`graph_id` differs from an earlier build's only for a backplane configuration
+with an input task on a slave board and the export fields set; every plan
+without them, christielab10's included, is byte-identical. The plan's
+`sample_clock_source` and `start_trigger_source` keep the master's terminals,
+which the laser reads.
 See [NI-DAQ PXI](../linux-install/ni-daq-pxi.md) for the fields and the lines
 they must not share. This is not yet verified on hardware: christielab10 has
 no stream input on its second board.
