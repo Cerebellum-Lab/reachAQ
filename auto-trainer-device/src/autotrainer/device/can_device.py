@@ -34,6 +34,7 @@ from .device_interface import (
     Acknowledge,
     AnalogOutput,
     AnalogOutputs,
+    BOARD_STIM_LINE_OUTPUTS,
     Motor,
     DigitalOutputs,
     Status,
@@ -1096,24 +1097,41 @@ class CanDevice(Device):
     def _start_send_pellet_sequence(self, data) -> bool:
         steps = self._send_pellet.steps
         if isinstance(data, dict) and data.get("pre_reveal_stimulus") is not None:
-            delay_ms, pulse_duration_us = data["pre_reveal_stimulus"]
+            # (delay_ms, pulse_us, board STIM line). The line is the trial
+            # laser's own: on christielab10 laser 2 is wired to STIM2, and a
+            # pulse fixed on STIM3 never triggered it. Data from before the
+            # line was carried has two elements and meant STIM3, so it still
+            # does.
+            stimulus = tuple(data["pre_reveal_stimulus"])
+            if len(stimulus) == 2:
+                stimulus += (3,)
+            delay_ms, pulse_duration_us, stim_line = stimulus
             delay_ms = int(delay_ms)
             pulse_duration_us = int(pulse_duration_us)
+            stim_line = int(stim_line)
+            if stim_line not in BOARD_STIM_LINE_OUTPUTS:
+                raise ValueError(
+                    f"Board STIM{stim_line} cannot carry a stimulus pulse; use "
+                    "board STIM2 or STIM3"
+                )
             if not 1 <= delay_ms <= 60_000:
                 raise ValueError("Pre-reveal delay must be within 1..60000 ms")
             if not 100 <= pulse_duration_us <= 5_000_000:
-                raise ValueError("STIM3 pulse duration must be within 100 us..5 s")
+                raise ValueError(
+                    f"STIM{stim_line} pulse duration must be within 100 us..5 s"
+                )
             delay_us = delay_ms * 1000
             if pulse_duration_us >= delay_us:
                 raise ValueError(
-                    "STIM3 pulse duration must be shorter than the pre-reveal delay"
+                    f"STIM{stim_line} pulse duration must be shorter than the "
+                    "pre-reveal delay"
                 )
             # GPIO_PULSE is acknowledged after the firmware has returned the
             # output low. Wait only for the remainder so pre_reveal_ms means
             # physical rising edge -> pellet reveal.
             remaining_delay_s = (delay_us - pulse_duration_us) / 1_000_000.0
             steps[0:0] = [
-                {"stim3": pulse_duration_us},
+                {f"stim{stim_line}": pulse_duration_us},
                 {"delay": remaining_delay_s},
                 {"predefined": "release"},
             ]
@@ -1147,9 +1165,10 @@ class CanDevice(Device):
             motor = Motor.DELAY
         elif 'tone' in step:
             motor = Motor.TONE
-        elif 'stim3' in step:
-            # STIM3 is physically owned by the pellet board.  Motor.TONE is
-            # used only as the existing compound-step timeout category.
+        elif 'stim2' in step or 'stim3' in step:
+            # STIM2 and STIM3 are physically owned by the pellet board.
+            # Motor.TONE is used only as the existing compound-step timeout
+            # category.
             motor = Motor.TONE
         elif 'servo_attach' in step:
             motor = step['servo_attach']
@@ -1517,22 +1536,25 @@ class CanDevice(Device):
             if success:
                 board.skip_uuid_ack_perf_c = True
 
-        elif 'stim3' in step:
+        elif 'stim2' in step or 'stim3' in step:
+            # The step names the board line, as the board does; a configured
+            # procedure's 'stim3' step keeps meaning STIM3.
             motor = Motor.TONE
-            duration_us = int(step['stim3'])
+            stim_line = 2 if 'stim2' in step else 3
+            output = BOARD_STIM_LINE_OUTPUTS[stim_line]
+            duration_us = int(step[f'stim{stim_line}'])
             if self._operation_callback is not None:
+                # (output, duration) as HardwareModel.pulse_stim sends it, so
+                # the recorded event names the line actually pulsed.
                 self._operation_callback(
                     SystemCommandKind.PULSE_DIGITAL_OUTPUT,
-                    (4, duration_us),
+                    (int(output.value), duration_us),
                     board.ctx,
                     board.target,
                     time.perf_counter(),
                     time.time(),
                 )
-            success = self._interface.pulse_digital_output(
-                DigitalOutputs.STIMULUS_4,
-                duration_us,
-            )
+            success = self._interface.pulse_digital_output(output, duration_us)
 
         elif 'predefined' in step:
 
