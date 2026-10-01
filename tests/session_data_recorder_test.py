@@ -402,6 +402,19 @@ def test_laser_csv_names_the_nidaq_sample_each_row_landed_within(tmp_path):
     assert [row["nidaq_sample_index"] for row in rows] == ["", "5", "6"]
 
 
+def test_a_laser_row_after_the_last_nidaq_sample_has_no_index(tmp_path):
+    # It named the last NI sample, however long after it: the tail of every
+    # session, and every row after an NI stream that stopped mid-recording.
+    # The last sample covers one sample period, here 1 ms at 1 kHz.
+    rows = _write_laser_rows(tmp_path, (
+        _manual_laser_row(10.5, "requested", "manual pulse"),
+        _manual_laser_row(11.0005, "completed", "manual pulse"),
+        _manual_laser_row(11.5, "trace", "internal pulse"),
+    ), _nidaq_chunk([0, 1, 2], [9.9, 10.0, 11.0]))
+
+    assert [row["nidaq_sample_index"] for row in rows] == ["1", "2", ""]
+
+
 def test_session_outputs_are_clipped_to_camera_boundaries(tmp_path):
     project = ProjectInfo(
         root=str(tmp_path),

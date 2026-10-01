@@ -2448,7 +2448,12 @@ class SessionDataRecorder:
         And each laser row: any perf times map the same way. Both clocks are
         time.perf_counter, so this is a lookup in the NI-DAQ timeline rather
         than a fit. Samples outside the NI-DAQ window get -1, which keeps the
-        column integral and honest about not having a match.
+        column integral and honest about not having a match: before the
+        first NI sample, or more than one sample period after the last. A
+        time after the last took the last however long after, at the tail of
+        every session and through the rest of one whose NI stream stopped
+        early. Inside the window a gap is not looked for: a time in one takes
+        the sample before it.
         """
         missing = np.full(perf.shape, -1, dtype=np.int64)
         if perf.size == 0:
@@ -2459,7 +2464,8 @@ class SessionDataRecorder:
         if indices.size == 0 or nidaq_perf.size == 0:
             return missing
         position = np.searchsorted(nidaq_perf, perf, side="right") - 1
-        inside = (position >= 0) & (position < indices.size)
+        last_covered = nidaq_perf[-1] + SessionDataRecorder._nidaq_sample_period(chunks)
+        inside = (position >= 0) & (perf <= last_covered)
         missing[inside] = indices[position[inside]]
         return missing
 

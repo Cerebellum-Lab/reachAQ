@@ -220,6 +220,42 @@ def test_pressure_csv_carries_the_master_clock_and_the_nidaq_index(tmp_path):
     assert rows[1]["nidaq_sample_index"] == "2"
 
 
+def test_a_pressure_sample_after_the_last_nidaq_sample_has_no_index(tmp_path):
+    # It named the last NI sample, however long after it, though the lookup
+    # said samples outside the NI window get none. The last sample covers
+    # one sample period, here 1 ms at 1 kHz.
+    project = ProjectInfo(
+        root=str(tmp_path),
+        device_id="test",
+        when=datetime(2026, 1, 2, 3, 4, 5),
+        session=1,
+    )
+    nidaq_chunk = (
+        np.arange(3, dtype=np.int64),
+        np.array([9.9, 10.0, 11.0]),
+        np.array([99.9, 100.0, 101.0]),
+        np.zeros((1, 3), dtype=np.float32),
+        ("force",),
+        1000.0,
+        1,
+        0,
+        0,
+    )
+    SessionDataRecorder._write_session(
+        project, 10.0, 100.0, 12.0, (), (), (), (nidaq_chunk,),
+        pressure_columns=_columns([
+            (10.5, 100.5, 0, 2048, 10.5, 10.5, 7, 900),
+            (11.0005, 101.0005, 0, 2048, 11.0005, 11.0005, 8, 901),
+            (11.5, 101.5, 0, 2048, 11.5, 11.5, 9, 902),
+        ]),
+    )
+    session_dir = tmp_path / "20260102" / "test" / "session001"
+    with (session_dir / "streams" / "pressure.csv").open(newline="") as stream:
+        rows = list(csv.DictReader(stream))
+
+    assert [row["nidaq_sample_index"] for row in rows] == ["1", "2", ""]
+
+
 def test_pressure_stream_is_registered_in_the_session_alignment(tmp_path):
     columns = _columns([(10.0, 100.0, 0, 2048, 10.0, 10.0, 7, 900)])
     _, _, session_dir = _write_session_with_pressure(tmp_path, columns)
