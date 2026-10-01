@@ -655,3 +655,26 @@ def test_preallocated_stream_reader_rejects_short_chunk():
     else:
         raise AssertionError("short read was accepted")
     assert controller._read_telemetry["short_reads"] == 1
+
+
+def test_a_bare_export_line_is_named_on_the_master(monkeypatch):
+    # A bare line is named on the board that drives it, as the laser names
+    # its clock lines (NidaqLaserController._shared_clock_for).
+    fake_nidaqmx = _FakeNidaqmx()
+    monkeypatch.setattr(nidaq_signal_stream, "_load_nidaqmx", lambda: fake_nidaqmx)
+
+    controller = NidaqSignalStreamController(
+        _two_board_inputs(), timing_plan=_backplane_plan(
+            sample_clock_export_terminal="PXI_Trig4",
+            start_trigger_export_terminal="pxi_trig5"))
+    try:
+        controller.start()
+        tasks = {task.name: task for task in fake_nidaqmx.tasks}
+
+        assert tasks["reachaq_signal_stream_Acquire_ai"].exports == [
+            ("sample_clock", "/Acquire/PXI_Trig4"),
+            ("start_trigger", "/Acquire/PXI_Trig5"),
+        ]
+        assert controller.read_chunk().sample_count == 3
+    finally:
+        controller.close()

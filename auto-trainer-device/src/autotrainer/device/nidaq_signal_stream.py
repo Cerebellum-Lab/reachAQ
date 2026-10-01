@@ -13,6 +13,7 @@ from autotrainer.core import (
     NidaqSignalStreamConfiguration,
     NidaqTimingPlan,
 )
+from autotrainer.core.configuration.laser_configuration import pxi_trig_line
 from autotrainer.core.configuration.nidaq_port_configuration import slave_input_timing
 from autotrainer.core.logging import log_hardware_initialization
 
@@ -746,9 +747,10 @@ class NidaqSignalStreamController:
                 if subsystem == "ai"
                 else signals.COUNTER_OUTPUT_EVENT
             )
-            export(signal, plan.sample_clock_export_terminal)
+            export(signal, _named_on(device_name, plan.sample_clock_export_terminal))
         if plan.start_trigger_export_terminal and subsystem == "ai":
-            export(signals.START_TRIGGER, plan.start_trigger_export_terminal)
+            export(signals.START_TRIGGER,
+                   _named_on(device_name, plan.start_trigger_export_terminal))
 
     def _task_start_order(self) -> Tuple[str, ...]:
         available = tuple(dict.fromkeys((
@@ -961,6 +963,20 @@ class NidaqSignalStreamController:
         if len(parts) < 2 or not parts[0]:
             raise RuntimeError(f"cannot infer NI-DAQ AI sample clock source from {physical_channel!r}")
         return f"/{parts[0]}/ai/SampleClock"
+
+
+def _named_on(device_name: str, terminal: str) -> str:
+    """An export terminal as the master exports onto it.
+
+    A bare PXI_Trig line is named on the master, the board that drives it,
+    as the laser names the lines it drives (_shared_clock_for); whether
+    DAQmx would place a bare one on the task's board is not known here.
+    Anything else is passed as written.
+    """
+    line = pxi_trig_line(terminal)
+    if line and "/" not in terminal.strip().strip("/"):
+        return f"/{device_name}/{line}"
+    return terminal
 
 
 def _line_number(physical_channel: str) -> int:
