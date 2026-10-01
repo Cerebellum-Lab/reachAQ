@@ -8,6 +8,11 @@ which comes after the task's stop and close. On christielab10 (2026-10-01,
 efe173a2) a 23 ms last pulse measured 28.45-35.0 ms and a 5 ms one
 12.0-12.4 ms: each too long by the trace's gap from done to the reset.
 
+The 6713 also refuses a buffer of an odd number of samples per channel times
+channels: the one sample that ended B2's 105,740-sample train on the minimum
+made it 105,741, and the write failed with -200692 (christielab10,
+2026-10-01). So the buffer ends on the minimum and is even.
+
 Nothing here touches a driver or a board (nidaq_daqmx_fake).
 """
 
@@ -76,18 +81,21 @@ def _last_samples(daq):
     analog = daq.task("laser_sync_pulse_ao")
     buffer, = analog.writes
     per_channel = buffer if len(analog.channels) > 1 else [buffer]
-    # The buffer is the generation: as many samples as the task runs for.
-    assert {len(samples) for samples in per_channel} == {
-        analog.timing_kwargs["samps_per_chan"]}
-    return [samples[-1] for samples in per_channel]
+    # The buffer is the generation: as many samples as the task runs for,
+    # and an even number of them, which the 6713 requires (-200692).
+    samples = analog.timing_kwargs["samps_per_chan"]
+    assert {len(channel) for channel in per_channel} == {samples}
+    assert samples % 2 == 0
+    return [channel[-1] for channel in per_channel]
 
 
 # ------------------------------------------------------- the waveform builder
 
 
-def test_a_train_with_no_post_stim_ends_on_the_minimum(daq):
-    # Three 1 ms pulses at 100 Hz after 0.5 ms of baseline: 10 samples high
-    # and 90 low each period. It ended on the last pulse's tenth high sample.
+def test_an_odd_train_with_no_post_stim_gains_one_sample_at_the_minimum(daq):
+    # Three 1 ms pulses at 100 Hz after 0.5 ms of baseline: 215 samples,
+    # ending on the last pulse's tenth high sample. One at the minimum ends
+    # it there and makes it even.
     waveform = _built(_train(
         amplitude_volts=2.0, duration_ms=1.0, baseline_ms=0.5,
         pulse_count=3, frequency_hz=100.0))
@@ -96,25 +104,37 @@ def test_a_train_with_no_post_stim_ends_on_the_minimum(daq):
     assert waveform == [0.0] * 5 + period * 2 + [2.0] * 10 + [0.0]
 
 
-def test_a_single_pulse_ends_on_the_minimum(daq):
-    # It was high samples alone, so the output held the amplitude from the
-    # generation's first sample until the reset.
-    assert _built(_train(amplitude_volts=2.0, duration_ms=1.0)) == [2.0] * 10 + [0.0]
+def test_an_even_train_with_no_post_stim_gains_two_samples_at_the_minimum(daq):
+    # A single pulse was high samples alone, so the output held the
+    # amplitude from the generation's first sample until the reset. One
+    # sample ends it on the minimum, and a second keeps it even.
+    assert _built(_train(amplitude_volts=2.0, duration_ms=1.0)) == [2.0] * 10 + [0.0] * 2
 
 
-def test_a_train_whose_post_stim_ends_it_on_the_minimum_is_unchanged(daq):
-    # It ends on the minimum already, so no sample is added to it.
+def test_an_odd_train_whose_post_stim_ends_it_on_the_minimum_gains_one(daq):
+    # Two pulses at 500 Hz and 0.3 ms of post-stim: 33 samples, which the
+    # 6713 refuses although they end on the minimum.
     waveform = _built(_train(
         amplitude_volts=2.0, duration_ms=1.0, post_stim_ms=0.3,
         pulse_count=2, frequency_hz=500.0))
 
-    assert waveform == [2.0] * 10 + [0.0] * 10 + [2.0] * 10 + [0.0] * 3
+    assert waveform == [2.0] * 10 + [0.0] * 10 + [2.0] * 10 + [0.0] * 4
 
 
-def test_a_train_at_the_minimum_is_unchanged(daq):
+def test_an_even_train_whose_post_stim_ends_it_on_the_minimum_is_unchanged(daq):
+    # 0.4 ms of post-stim: 34 samples, ending on the minimum already.
+    waveform = _built(_train(
+        amplitude_volts=2.0, duration_ms=1.0, post_stim_ms=0.4,
+        pulse_count=2, frequency_hz=500.0))
+
+    assert waveform == [2.0] * 10 + [0.0] * 10 + [2.0] * 10 + [0.0] * 4
+
+
+@pytest.mark.parametrize("duration_ms, samples", [(1.0, 10), (1.1, 12)])
+def test_a_train_at_the_minimum_is_only_made_even(daq, duration_ms, samples):
     # The Pulse Builder's default draft is 0 V (bench check B1): every
-    # sample is the minimum, so it ends there already.
-    assert _built(_train(amplitude_volts=0.0, duration_ms=1.0)) == [0.0] * 10
+    # sample is the minimum, so it ends there already. 1.1 ms is 11 samples.
+    assert _built(_train(amplitude_volts=0.0, duration_ms=duration_ms)) == [0.0] * samples
 
 
 def test_a_train_ends_on_a_minimum_that_is_not_zero(daq):
@@ -123,7 +143,7 @@ def test_a_train_ends_on_a_minimum_that_is_not_zero(daq):
         _train(amplitude_volts=2.0, duration_ms=1.0, pulse_count=2, frequency_hz=500.0),
         minimum_command_volts=0.25)
 
-    assert waveform == [2.0] * 10 + [0.25] * 10 + [2.0] * 10 + [0.25]
+    assert waveform == [2.0] * 10 + [0.25] * 10 + [2.0] * 10 + [0.25] * 2
 
 
 # ------------------------------------- what each path writes to the AO task
@@ -131,13 +151,16 @@ def test_a_train_ends_on_a_minimum_that_is_not_zero(daq):
 
 def test_run_pulse_leaves_the_output_on_the_minimum(daq):
     # Bench check B2's saved profile, 31 x 23 ms at 29 Hz and 2.0 V, run as
-    # Run Pulse runs it: waited for, on the output's own 100 kHz clock.
+    # Run Pulse runs it: waited for, on the output's own 100 kHz clock. Its
+    # 105,740 samples and the one that ends it on 0 V were refused by the
+    # 6713 (-200692); a second makes them even.
     controller = NidaqLaserController(rig_lasers())
 
     controller.run_pulse_train(_train(
         amplitude_volts=2.0, duration_ms=23.0, pulse_count=31, frequency_hz=29.0))
 
     assert _last_samples(daq) == [0.0]
+    assert daq.task("laser_sync_pulse_ao").timing_kwargs["samps_per_chan"] == 105_742
     controller.close()
 
 
@@ -189,17 +212,21 @@ def _two_lasers():
     return dataclasses.replace(lasers, channels=(lasers.channels[0], laser_2))
 
 
-@pytest.mark.parametrize("margin_ms", [0.0, 0.5], ids=["no PMT margins", "PMT margins"])
+@pytest.mark.parametrize(
+    "lead_ms, lag_ms", [(0.0, 0.0), (0.5, 0.5), (0.5, 0.0)],
+    ids=["no PMT margins", "PMT margins", "an odd PMT lead alone"])
 def test_both_lasers_of_a_synchronized_train_line_up_and_end_on_their_minimum(
-    daq, margin_ms,
+    daq, lead_ms, lag_ms,
 ):
     # The shorter channel is padded with its minimum to the longer one's
     # length, and PMT margins pad both, so only the longer channel, with no
     # margins, ended on its amplitude. Padded, both still start together.
+    # A 5-sample lead alone made the even waveforms odd: one more sample at
+    # each minimum after them. The PMT line runs for as many samples.
     controller = NidaqLaserController(_two_lasers(), timing_plan=_synchronized_plan())
     margins = dict(
-        enable_pmt_shutter=margin_ms > 0,
-        pmt_shutter_open_delay_ms=margin_ms, pmt_shutter_close_delay_ms=margin_ms)
+        enable_pmt_shutter=lead_ms > 0 or lag_ms > 0,
+        pmt_shutter_open_delay_ms=lead_ms, pmt_shutter_close_delay_ms=lag_ms)
 
     controller.run_synchronized_pulse_train(LaserSynchronizedPulseTrain(
         pulse_trains=(
@@ -211,12 +238,17 @@ def test_both_lasers_of_a_synchronized_train_line_up_and_end_on_their_minimum(
         trigger_source=BOARD_STIM, timeout_seconds=5.0))
 
     laser_1, laser_2 = daq.task("laser_sync_pulse_ao").writes[0]
-    margin = int(margin_ms * RATE / 1000.0)
-    train_2 = ([1.0] * 10 + [0.25] * 10) * 2 + [1.0] * 10 + [0.25]
-    assert laser_2 == [0.25] * margin + train_2 + [0.25] * margin
+    lead, lag = (int(ms * RATE / 1000.0) for ms in (lead_ms, lag_ms))
+    even = (lead + lag) % 2
+    train_2 = ([1.0] * 10 + [0.25] * 10) * 2 + [1.0] * 10 + [0.25] * 2
+    assert laser_2 == [0.25] * lead + train_2 + [0.25] * (lag + even)
     assert laser_1 == (
-        [0.0] * margin + [2.0] * 10 + [0.0] * (len(train_2) - 10 + margin))
+        [0.0] * lead + [2.0] * 10 + [0.0] * (len(train_2) - 10 + lag + even))
     assert _last_samples(daq) == [0.0, 0.25]
+    if margins["enable_pmt_shutter"]:
+        pmt = daq.task("laser_pmt_shutter_do")
+        pmt_samples, = pmt.writes
+        assert len(pmt_samples) == pmt.timing_kwargs["samps_per_chan"] == len(laser_1)
     controller.close()
 
 
@@ -227,21 +259,26 @@ def test_both_lasers_of_a_synchronized_train_line_up_and_end_on_their_minimum(
 # none of these lines, so this is not measured there).
 
 
-def test_the_pmt_shutter_line_ends_low_its_close_lag_after_the_train(daq):
+@pytest.mark.parametrize("lag_ms, parity", [(0.03, 0), (0.0, 1)],
+                         ids=["lead and lag", "an odd lead alone"])
+def test_the_pmt_shutter_line_ends_low_after_its_close_lag(daq, lag_ms, parity):
     # It was high for the whole output, so it stayed high after it until the
     # cleanup wrote it low, last of everything, and the close lag was the
-    # host's. 0.05 ms lead, 0.1 ms pulse, 0.03 ms lag at 100 kHz: low on the
-    # output's last sample, 3 samples after the train returns to 0 V.
+    # host's. A 0.05 ms lead and a 0.1 ms pulse at 100 kHz, two samples at
+    # 0 V that end it there and keep it even, then the lag: low on the
+    # output's last sample. The 5-sample lead alone made the output odd,
+    # which the 6713 refuses: one more sample at 0 V.
     controller = NidaqLaserController(rig_lasers())
 
     controller.run_pulse_train(_train(
         amplitude_volts=2.0, duration_ms=0.1, enable_pmt_shutter=True,
-        pmt_shutter_open_delay_ms=0.05, pmt_shutter_close_delay_ms=0.03))
+        pmt_shutter_open_delay_ms=0.05, pmt_shutter_close_delay_ms=lag_ms))
 
     analog, = daq.task("laser_sync_pulse_ao").writes
     pmt, = daq.task("laser_pmt_shutter_do").writes
-    assert analog == [0.0] * 5 + [2.0] * 10 + [0.0] * 4
-    assert pmt == [True] * 18 + [False]
+    after = 2 + int(lag_ms * 100) + parity
+    assert analog == [0.0] * 5 + [2.0] * 10 + [0.0] * after
+    assert pmt == [True] * (5 + 10 + after - 1) + [False]
     controller.close()
 
 
@@ -266,15 +303,16 @@ def test_a_trigger_line_longer_than_the_output_ends_low(daq, output):
     # Its default 1 ms beside a 0.5 ms pulse filled the output and ended
     # high, and nothing writes these lines low: it stayed high after the
     # pulse, and the next pulse's trigger had no rising edge. It is cut to
-    # all but the output's last sample.
-    assert _trigger_line_written(daq, output, duration_ms=0.5) == [True] * 50 + [False]
+    # all but the output's last sample, of 52.
+    assert _trigger_line_written(daq, output, duration_ms=0.5) == [True] * 51 + [False]
 
 
 @pytest.mark.parametrize("output", sorted(TRIGGER_LINES))
 @pytest.mark.parametrize("duration_ms", [1.0, 2.0])
 def test_a_trigger_line_the_output_outlasts_keeps_its_width(daq, output, duration_ms):
-    # 1 ms at 100 kHz, then low to the output's end. Beside a 1 ms pulse it
-    # filled the output until the output gained its last sample at 0 V.
+    # 1 ms at 100 kHz, then low to the output's end: the pulse and its two
+    # samples at 0 V. Beside a 1 ms pulse it filled the output until the
+    # output gained those samples.
     pulse_samples = int(duration_ms * 100)
     assert _trigger_line_written(daq, output, duration_ms=duration_ms) == (
-        [True] * 100 + [False] * (pulse_samples + 1 - 100))
+        [True] * 100 + [False] * (pulse_samples + 2 - 100))

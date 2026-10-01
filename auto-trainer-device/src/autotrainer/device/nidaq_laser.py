@@ -914,13 +914,19 @@ class NidaqLaserController:
         pre_samples = _samples_from_ms(pmt_open_delay_ms, sample_rate_hz)
         post_samples = _samples_from_ms(pmt_close_delay_ms, sample_rate_hz)
         max_waveform_samples = max(len(waveform) for waveform in waveforms)
+        # Each waveform is even (_build_pulse_train_waveform), but the PMT
+        # margins together may be odd, which the 6713 refuses (-200692 at
+        # 105,741 samples, christielab10, 2026-10-01): one more sample at
+        # each channel's minimum after them.
+        parity_samples = (pre_samples + max_waveform_samples + post_samples) % 2
         timed_waveforms = []
         for channel, waveform in zip(channels, waveforms):
             minimum = channel.minimum_command_volts
             timed_waveforms.append(
                 [minimum] * pre_samples
                 + waveform
-                + [minimum] * (max_waveform_samples - len(waveform) + post_samples)
+                + [minimum] * (
+                    max_waveform_samples - len(waveform) + post_samples + parity_samples)
             )
         total_samples = len(timed_waveforms[0])
         timeout_seconds = pulse_train.timeout_seconds
@@ -964,13 +970,17 @@ class NidaqLaserController:
                     self._create_finite_digital_output_task(
                         pmt_line,
                         digital_names[-1],
-                        # Low on the output's last sample: the close lag
-                        # after the train with no post-stim, else (lag - 1)
-                        # samples after the post-stim ends, which is still
-                        # at least the lag after the light ends. High on it,
-                        # the line stayed high until the cleanup's reset,
-                        # which comes last of all, as the analog output
-                        # held its last pulse (christielab10, 2026-10-01).
+                        # Low on the output's last sample. With no
+                        # post-stim that is the close lag after the train,
+                        # or up to two samples more: those that end the
+                        # output on the minimum and keep it even (the 6713
+                        # refused 105,741 samples with -200692). With
+                        # post-stim it is within a sample of the lag after
+                        # the post-stim ends, which is still at least the
+                        # lag after the light ends. High on it, the line
+                        # stayed high until the cleanup's reset, which
+                        # comes last of all, as the analog output held its
+                        # last pulse (christielab10, 2026-10-01).
                         [True] * (total_samples - 1) + [False],
                         sample_rate_hz,
                         total_samples,
@@ -2262,6 +2272,12 @@ class NidaqLaserController:
             # ran on until the cleanup's reset. 23 ms pulses measured
             # 28.45-35.0 ms, 5 ms ones 12.0-12.4 ms (christielab10,
             # 2026-10-01). One sample at the minimum ends it on time.
+            waveform.append(minimum)
+        if len(waveform) % 2:
+            # The 6713 refuses a buffer whose samples per channel times
+            # channels is odd: B2's 105,740 samples and the one above were
+            # refused with -200692 (christielab10, 2026-10-01). Even per
+            # channel, it is even for any number of channels.
             waveform.append(minimum)
         return waveform
 
