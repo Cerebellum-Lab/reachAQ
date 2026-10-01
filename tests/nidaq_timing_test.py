@@ -1,4 +1,8 @@
 import dataclasses
+import hashlib
+import json
+
+import pytest
 
 from autotrainer.core import (
     NidaqDeviceIdentity,
@@ -97,7 +101,8 @@ def test_digital_only_pxi_master_uses_counter_without_fake_ai_trigger():
 
     plan = build_nidaq_timing_plan(
         configuration,
-        NidaqTimingConfiguration(),
+        # Inputs on two boards take the clock over a backplane line.
+        NidaqTimingConfiguration(sample_clock_export_terminal="/Acquire/PXI_Trig4"),
         (_pxi("Acquire", 50), _pxi("Confirm", 51)),
     )
 
@@ -121,6 +126,9 @@ def test_manual_master_resolves_by_serial_after_runtime_alias_changes():
             product_type="Model-22",
             serial_number=22,
         ),
+        # Bare, as the master is not known by name until it resolves.
+        sample_clock_export_terminal="PXI_Trig4",
+        start_trigger_export_terminal="PXI_Trig5",
     )
 
     plan = build_nidaq_timing_plan(
@@ -454,3 +462,254 @@ def test_christielab10s_plan_is_unchanged_by_the_digital_clock_rule():
     assert plan.resolved_mode == "backplane"
     assert plan.master_device == "PXI1Slot5"
     assert plan.sample_clock_source == "/PXI1Slot5/ai/SampleClock"
+
+
+# ------------------------------------- inputs on two boards, over the backplane
+
+
+def _two_input_boards(**timing):
+    """Inputs on Acquire, the master (it has cam_frames), and on Feedback."""
+    return build_nidaq_timing_plan(
+        _stream(
+            ("cam_frames", "Acquire/port0/line0", "digital"),
+            ("laser_feedback", "Acquire/ai0", "analog"),
+            ("slave_feedback", "Feedback/ai0", "analog"),
+            ("slave_tone", "Feedback/port0/line0", "digital"),
+        ),
+        NidaqTimingConfiguration(**timing),
+        (_pxi("Acquire", 50), _pxi("Feedback", 51)),
+    )
+
+
+def _task(plan, task_id):
+    return next(task for task in plan.task_graph.tasks if task.task_id == task_id)
+
+
+@pytest.mark.parametrize(("sample_export", "start_export"), [
+    ("/Acquire/PXI_Trig4", "/Acquire/PXI_Trig5"),
+    # Bare, and spelt otherwise: the line is the same, named as DAQmx does.
+    ("pxi_trig4", "PXI_Trig5"),
+])
+def test_a_slave_input_board_names_the_masters_clock_and_trigger_on_its_own_lines(
+        sample_export, start_export):
+    # Named on the master, they are a cross-board route, which DAQmx refuses
+    # on christielab10's unidentified chassis (-89125), as the laser found.
+    # The master exports them onto the two lines; the slave names each line
+    # as its own.
+    plan = _two_input_boards(
+        sample_clock_export_terminal=sample_export,
+        start_trigger_export_terminal=start_export)
+
+    assert plan.is_valid, plan.reason
+    assert plan.resolved_mode == "backplane"
+    assert (plan.master_device, plan.slave_devices) == ("Acquire", ("Feedback",))
+    for task_id in ("Feedback.ai", "Feedback.di"):
+        task = _task(plan, task_id)
+        assert (task.sample_clock_source, task.start_trigger_source) == (
+            "/Feedback/PXI_Trig4", "/Feedback/PXI_Trig5")
+    # The master is unchanged: its own clock, armed by nothing.
+    master_ai, master_di = _task(plan, "Acquire.ai"), _task(plan, "Acquire.di")
+    assert (master_ai.sample_clock_source, master_ai.start_trigger_source) == (None, None)
+    assert (master_di.sample_clock_source, master_di.start_trigger_source) == (
+        "/Acquire/ai/SampleClock", None)
+    # What the laser reads stays the master's own terminals, which it routes
+    # itself (NidaqLaserController._shared_clock_for).
+    assert plan.sample_clock_source == "/Acquire/ai/SampleClock"
+    assert plan.start_trigger_source == "/Acquire/ai/StartTrigger"
+    assert (plan.sample_clock_export_terminal, plan.start_trigger_export_terminal) == (
+        sample_export, start_export)
+
+
+def test_a_counter_clocked_master_needs_no_start_trigger_line():
+    # A master with no analog input clocks the inputs from its counter and
+    # has no start trigger to export, so only the clock takes a line.
+    plan = build_nidaq_timing_plan(
+        _stream(
+            ("cam_frames", "Acquire/port0/line0", "digital"),
+            ("tone1", "Confirm/port0/line0", "digital"),
+        ),
+        NidaqTimingConfiguration(sample_clock_export_terminal="/Acquire/PXI_Trig4"),
+        (_pxi("Acquire", 50), _pxi("Confirm", 51)),
+    )
+
+    assert plan.is_valid, plan.reason
+    assert plan.clock_producer == "counter"
+    slave = _task(plan, "Confirm.di")
+    assert (slave.sample_clock_source, slave.start_trigger_source) == (
+        "/Confirm/PXI_Trig4", None)
+    assert plan.sample_clock_source == "/Acquire/Ctr0InternalOutput"
+
+
+@pytest.mark.parametrize(("timing", "field", "words"), [
+    (dict(), "timing sampleClockExportTerminal", "is unset"),
+    (dict(sample_clock_export_terminal="/Acquire/PFI3"),
+     "timing sampleClockExportTerminal", "'/Acquire/PFI3' is not a PXI_Trig line"),
+    # PXI has PXI_Trig0 to PXI_Trig7.
+    (dict(sample_clock_export_terminal="/Acquire/PXI_Trig9"),
+     "timing sampleClockExportTerminal", "'/Acquire/PXI_Trig9' is not a PXI_Trig line"),
+    # The master drives the line, so it is named on the master.
+    (dict(sample_clock_export_terminal="/Feedback/PXI_Trig4"),
+     "timing sampleClockExportTerminal", "'/Feedback/PXI_Trig4' names Feedback"),
+    (dict(sample_clock_export_terminal="/Acquire/PXI_Trig4"),
+     "timing startTriggerExportTerminal", "is unset"),
+])
+def test_a_slave_input_board_without_a_line_is_an_invalid_plan_naming_the_field(
+        timing, field, words):
+    # No default line: one could collide with backplane wiring the plan
+    # cannot see (Ben, 2026-09-30).
+    plan = _two_input_boards(**timing)
+
+    assert not plan.is_valid
+    assert field in plan.reason and words in plan.reason
+    # An example of a line on the master, and not the one the other field
+    # already takes.
+    example = "/Acquire/PXI_Trig5" if "startTrigger" in field else "/Acquire/PXI_Trig4"
+    assert f"such as {example}" in plan.reason
+    # A refused plan keeps the master it would have had, for Run's laser
+    # route check (refused_plan_clock_source).
+    assert (plan.master_device, plan.slave_devices) == ("Acquire", ("Feedback",))
+
+
+def test_a_forced_multidevice_slave_needs_a_line_only_for_a_task_it_keeps():
+    # Forced, every subsystem on both boards is merged into one task on the
+    # master, or the start fails: no slave task is left to take a line. A
+    # subsystem on the slave alone stays a slave task.
+    devices = (_pxi("Acquire", 50), _pxi("Feedback", 51))
+    forced = NidaqTimingConfiguration(task_strategy="forced_multidevice")
+    merged = build_nidaq_timing_plan(
+        _stream(("first", "Acquire/ai0", "analog"), ("second", "Feedback/ai0", "analog")),
+        forced, devices)
+    kept = build_nidaq_timing_plan(
+        _stream(("first", "Acquire/ai0", "analog"),
+                ("tone1", "Feedback/port0/line0", "digital")),
+        forced, devices)
+
+    assert merged.is_valid, merged.reason
+    assert not kept.is_valid
+    assert "timing sampleClockExportTerminal" in kept.reason
+
+
+# ------------------------------- every plan without a slave input, as it was
+
+
+def _pinned_christielab10():
+    """christielab10's own blocks, on its own two boards, as a start builds it."""
+    from nidaq_channel_plan_test import _christielab10_from_yaml, _christielab10_lasers
+    from tools.acquisition.model.nidaq_channel_plan import (
+        build_nidaq_acquisition_configuration,
+    )
+    from tools.acquisition.model.nidaq_routing import UNIDENTIFIED
+
+    loaded = _christielab10_from_yaml()
+    lasers = _christielab10_lasers()
+    stream = build_nidaq_acquisition_configuration(
+        loaded.nidaq_stream, loaded.nidaq_ports, lasers)
+
+    def board(name, product, serial, **values):
+        # Its chassis is unidentified, both boards alike.
+        return NidaqDevicePorts(
+            name=name, product_type=product, serial_number=serial,
+            bus_type="PXI", pxi_chassis_number=UNIDENTIFIED,
+            pxi_slot_number=UNIDENTIFIED, digital_trigger_supported=True,
+            digital_inputs=tuple(f"{name}/port0/line{line}" for line in range(8)),
+            **values)
+
+    devices = (
+        board("PXI1Slot4", "PXI-6713", 27056752,
+              analog_outputs=tuple(f"PXI1Slot4/ao{pin}" for pin in range(8)),
+              counter_outputs=("PXI1Slot4/ctr0", "PXI1Slot4/ctr1"),
+              analog_output_sample_clock_supported=True),
+        board("PXI1Slot5", "PXI-6221", 21803707,
+              analog_inputs=tuple(f"PXI1Slot5/ai{pin}" for pin in range(16)),
+              analog_outputs=("PXI1Slot5/ao0", "PXI1Slot5/ao1"),
+              counter_outputs=("PXI1Slot5/ctr0", "PXI1Slot5/ctr1"),
+              analog_output_sample_clock_supported=True,
+              digital_input_max_rate=1_000_000.0),
+    )
+    return build_nidaq_timing_plan(
+        stream, loaded.nidaq_ports.timing, devices,
+        hardware_timed_output_devices=("PXI1Slot4",),
+        hardware_timed_output_channels=tuple(
+            channel.analog_output for channel in lasers.channels),
+    )
+
+
+def _pinned_merged(status):
+    plan = build_nidaq_timing_plan(
+        _stream(("first", "Acquire/ai0", "analog"), ("second", "Feedback/ai0", "analog")),
+        NidaqTimingConfiguration(task_strategy="forced_multidevice"),
+        (_pxi("Acquire", 50), _pxi("Feedback", 51)))
+    return plan if status is None else resolve_nidaq_multidevice_probe(plan, status)
+
+
+_PINNED_PLANS = {
+    "christielab10": _pinned_christielab10,
+    "one board": lambda: build_nidaq_timing_plan(
+        _stream(("cam_frames", "InputCard/port0/line0", "digital"),
+                ("laser_feedback", "InputCard/ai0", "analog")),
+        NidaqTimingConfiguration(),
+        (NidaqDevicePorts(name="InputCard"),)),
+    "inputs on one board, laser output on another": lambda: build_nidaq_timing_plan(
+        _stream(("cam_frames", "Acquire/port0/line0", "digital"),
+                ("laser_feedback", "Acquire/ai0", "analog")),
+        NidaqTimingConfiguration(),
+        (_pxi("LaserOut", 40), _pxi("Acquire", 50)),
+        hardware_timed_output_devices=("LaserOut",),
+        hardware_timed_output_channels=("LaserOut/ao0",)),
+    "external, inputs on two boards": lambda: build_nidaq_timing_plan(
+        _stream(("first", "DevA/ai0", "analog"), ("second", "DevB/ai0", "analog")),
+        NidaqTimingConfiguration(
+            sync_mode="external", reference_clock_source="/DevA/PFI0",
+            start_trigger_source="/DevA/PFI1", sample_clock_source="/DevA/PFI2"),
+        (NidaqDevicePorts(name="DevA", bus_type="USB"),
+         NidaqDevicePorts(name="DevB", bus_type="USB"))),
+    "independent, inputs on two boards": lambda: build_nidaq_timing_plan(
+        _stream(("first", "DevA/ai0", "analog"), ("second", "DevB/ai0", "analog")),
+        NidaqTimingConfiguration(sync_mode="independent"),
+        (NidaqDevicePorts(name="DevA"), NidaqDevicePorts(name="DevB"))),
+    "forced multidevice, before its probe": lambda: _pinned_merged(None),
+    "forced multidevice, merged": lambda: _pinned_merged("verified"),
+}
+
+#: Each plan's graph_id, and the first 16 hex digits of the SHA-256 of the
+#: plan as a session file stores it (session_data_recorder: timing_plan_json),
+#: as the code before inputs on two boards took backplane lines built them.
+_PINS = {
+    "christielab10": ("5a5fd43ee352a4d9", "d40375201d4d7fc7"),
+    "one board": ("1bbb5feb84f951aa", "9f2dcf80a722e3fa"),
+    "inputs on one board, laser output on another": (
+        "c769e0f6d590de48", "1dad49d00685bb3d"),
+    "external, inputs on two boards": ("f0a0e370d4f445a9", "15f79f6f57b17f23"),
+    "independent, inputs on two boards": ("9dc7f79c01451e85", "1174780911cfa6d9"),
+    # The probe's choice keeps the graph_id; the merged task is in the digest.
+    "forced multidevice, before its probe": ("9e071173adfdf1f6", "172ecab7f68fbadd"),
+    "forced multidevice, merged": ("9e071173adfdf1f6", "0e5429d4e9592be6"),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_PINNED_PLANS))
+def test_a_plan_with_no_slave_input_task_is_byte_identical(name):
+    plan = _PINNED_PLANS[name]()
+
+    assert plan.is_valid, plan.reason
+    stored = json.dumps(dataclasses.asdict(plan), sort_keys=True)
+    digest = hashlib.sha256(stored.encode("utf-8")).hexdigest()[:16]
+    built = (plan.task_graph.graph_id, digest)
+    assert built == _PINS[name], f"{name}: {built}"
+
+
+def test_christielab10s_pinned_plan_is_its_own():
+    # What the pin above holds: inputs on the 6221, the 6713 an output-only
+    # slave whose reservation names the 6221's own clock and trigger.
+    plan = _pinned_christielab10()
+
+    assert (plan.master_device, plan.slave_devices) == ("PXI1Slot5", ("PXI1Slot4",))
+    assert plan.resolved_mode == "backplane"
+    assert plan.sample_clock_export_terminal is None
+    assert plan.start_trigger_export_terminal is None
+    assert {task.task_id for task in plan.task_graph.tasks} == {
+        "PXI1Slot5.ai", "PXI1Slot5.di", "PXI1Slot4.ao-reservation"}
+    reservation = _task(plan, "PXI1Slot4.ao-reservation")
+    assert reservation.channels == ("PXI1Slot4/ao0", "PXI1Slot4/ao1")
+    assert (reservation.sample_clock_source, reservation.start_trigger_source) == (
+        "/PXI1Slot5/ai/SampleClock", "/PXI1Slot5/ai/StartTrigger")

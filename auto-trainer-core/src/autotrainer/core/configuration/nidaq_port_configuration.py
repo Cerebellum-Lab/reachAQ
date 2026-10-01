@@ -5,6 +5,7 @@ from typing import ClassVar, Optional, Tuple
 
 from autotrainer.core import make_camelize_representer, make_decamelize_constructor
 from autotrainer.core.configuration import SystemConfigurationDumper, SystemConfigurationLoader
+from autotrainer.core.configuration.laser_configuration import backplane_line_of
 
 
 @dataclasses.dataclass(frozen=True)
@@ -244,6 +245,48 @@ class NidaqTimingPlan:
             "resolved_devices",
             tuple(self.resolved_devices),
         )
+
+
+def pxi_trig_line(terminal: Optional[str]) -> Optional[str]:
+    """The PXI_Trig line `terminal` names, spelt as DAQmx spells it, or None.
+
+    None for anything else, and for a number the backplane does not have:
+    PXI has PXI_Trig0 to PXI_Trig7. The board is ignored (backplane_line_of).
+    """
+    line = backplane_line_of(terminal)
+    if line is None:
+        return None
+    number = int(line[len("pxi_trig"):])
+    return f"PXI_Trig{number}" if number <= 7 else None
+
+
+def slave_input_timing(
+    plan: NidaqTimingPlan, device: str,
+) -> Tuple[Optional[str], Optional[str]]:
+    """The sample clock and start trigger an input task on slave `device` names.
+
+    In backplane mode, the lines the master exports them onto
+    (sampleClockExportTerminal, startTriggerExportTerminal), named on
+    `device`: the master's own terminals, named on another board, are a route
+    DAQmx makes only by reserving a backplane line, and it reserves none on an
+    unidentified chassis such as christielab10's (-89125), as the laser found
+    (NidaqLaserController._shared_clock_for). None for one whose field names
+    no PXI_Trig line. A master with no analog input clocks its slaves from a
+    counter and exports no start trigger, so its slaves keep the plan's.
+
+    In any other mode, the plan's own sample_clock_source and
+    start_trigger_source, as every slave took before. The plan keeps the
+    master's terminals in those whatever the mode: they are what the laser
+    reads and routes itself.
+    """
+    if plan.resolved_mode != "backplane":
+        return plan.sample_clock_source, plan.start_trigger_source
+    clock_line = pxi_trig_line(plan.sample_clock_export_terminal)
+    clock = f"/{device}/{clock_line}" if clock_line else None
+    if plan.clock_producer != "ai":
+        return clock, plan.start_trigger_source
+    trigger_line = pxi_trig_line(plan.start_trigger_export_terminal)
+    return clock, (f"/{device}/{trigger_line}" if trigger_line else None)
 
 
 @dataclasses.dataclass(frozen=True)
