@@ -17,6 +17,7 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from PySide6.QtCore import QFile, QIODevice, QSettings
@@ -89,7 +90,7 @@ def test_each_test_has_a_running_status_file_of_its_own(tmp_path_factory):
 
 
 def test_a_tests_monkeypatch_undo_leaves_both_in_place(monkeypatch, tmp_path_factory):
-    # test_saving_resumes_once_a_load_completes does this mid-test.
+    # As test_saving_resumes_once_a_load_completes once did, mid-test.
     monkeypatch.undo()
     basetemp = tmp_path_factory.getbasetemp()
     for path in (PersistenceConfiguration.get_default_output_path(),
@@ -145,9 +146,10 @@ def test_the_guard_protects_and_watches_the_operators_preferences_folder():
     production = top_fixtures.PRODUCTION_STATUS_FILE_PATH
     assert production == Path("~/.config/Colorado/autotrainer_running_status.env")
     folder = production.parent.expanduser()
-    # The folder, so the preferences file in it too: Auto Trainer.conf.
+    # The folder, so the preferences file in it too; and that file, which Qt
+    # writes from C++, is watched.
     assert folder in top_fixtures.data_root_guard.roots
-    assert folder in top_fixtures.data_root_guard.watched
+    assert top_fixtures.data_root_guard.watched == (folder / "Auto Trainer.conf",)
 
 
 @pytest.fixture
@@ -158,7 +160,7 @@ def preferences_folder(tmp_path, monkeypatch) -> Path:
     folder.joinpath("Auto Trainer.conf").write_text("[system]\nserial_number=christielab10\n")
     guard = top_fixtures.data_root_guard
     monkeypatch.setattr(guard, "roots", (*guard.roots, folder))
-    monkeypatch.setattr(guard, "watched", (*guard.watched, folder))
+    monkeypatch.setattr(guard, "watched", (*guard.watched, folder / "Auto Trainer.conf"))
     return folder
 
 
@@ -183,24 +185,57 @@ def test_the_guard_sees_a_preferences_write_the_hook_cannot(preferences_folder):
     settings.sync()
     assert settings.status() == QSettings.Status.NoError
     assert guard.take_refused() == []
-    assert f"{conf} changed" in guard.changes_since(before)
-    with pytest.raises(pytest.fail.Exception, match="Auto Trainer.conf changed"):
+    assert guard.changes_since(before) == [f"{conf} changed"]
+    with pytest.raises(pytest.fail.Exception,
+                       match=r"(?s)changed during this test \(by this test, or by another"
+                             r" process such as a running reachAQ\):.*Auto Trainer\.conf changed"):
         guard.fail_on_refusals(before)
 
 
-def test_the_guard_sees_a_file_that_came_and_went(preferences_folder):
+def _write_from_another_process(path: Path, content: bytes) -> None:
+    # Written in C++ with QFile, which the hook does not see, as a running
+    # reachAQ's writes are not in this process at all.
+    file = QFile(path.as_posix())
+    assert file.open(QIODevice.OpenModeFlag.WriteOnly)
+    file.write(content)
+    file.close()
+
+
+def test_the_guard_ignores_the_operators_app_writing_its_status_file(preferences_folder):
+    # A running reachAQ rewrites or removes it at every mode change.
     guard = top_fixtures.data_root_guard
     before = guard.snapshot()
-    time.sleep(0.05)  # a folder's mtime moves with the kernel's clock tick
-    status = preferences_folder.joinpath("autotrainer_running_status.env").as_posix()
-    file = QFile(status)  # from C++ again
-    assert file.open(QIODevice.OpenModeFlag.WriteOnly)
-    file.write(b"status='running'\n")
-    file.close()
-    assert QFile.remove(status)
+    time.sleep(0.05)  # past the kernel's clock tick, so the folder's mtime moves
+    status = preferences_folder.joinpath("autotrainer_running_status.env")
+    _write_from_another_process(status, b"status='running'\n")
+    assert QFile.remove(status.as_posix())
+    _write_from_another_process(status, b"status='calibration_3d'\n")
     assert guard.take_refused() == []
-    assert guard.changes_since(before) == [
-        f"{preferences_folder} modified (an entry was created and removed)"]
+    assert guard.changes_since(before) == []
+
+
+def test_the_guard_sees_a_lock_left_beside_the_preferences(preferences_folder):
+    guard = top_fixtures.data_root_guard
+    before = guard.snapshot()
+    lock = preferences_folder.joinpath("Auto Trainer.conf.lock")
+    _write_from_another_process(lock, b"12345\n")
+    assert guard.changes_since(before) == [f"{lock} created"]
+
+
+def test_a_refusal_after_the_last_tests_check_fails_the_run(guarded_folder):
+    # As from a session fixture's teardown: nothing but the session's end sees it.
+    with pytest.raises(top_fixtures.DataRootWriteRefused):
+        guarded_folder.joinpath("20261002").mkdir()
+    lines = []
+    reporter = SimpleNamespace(write_line=lambda line, **_markup: lines.append(line))
+    session = SimpleNamespace(
+        exitstatus=pytest.ExitCode.OK,
+        config=SimpleNamespace(pluginmanager=SimpleNamespace(get_plugin=lambda name: reporter)),
+    )
+    top_fixtures.pytest_sessionfinish(session, pytest.ExitCode.OK)
+    assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
+    assert any("20261002" in line for line in lines), lines
+    assert top_fixtures.data_root_guard.take_refused() == []
 
 
 def test_the_guard_refuses_each_write_under_the_data_folder_and_records_it(
