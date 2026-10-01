@@ -571,8 +571,9 @@ def test_a_trial_with_pmt_margins_fires_on_a_rig_with_no_pmt_line(monkeypatch):
         operation.trigger()
         assert operation.wait(5.0).value == "completed"
 
-        # 1 ms at 100 kHz, with no 5 ms margin before or after it.
-        assert daq.task("laser_sync_pulse_ao").timing_kwargs["samps_per_chan"] == 100
+        # 1 ms at 100 kHz and the sample that returns the output to its
+        # minimum, with no 5 ms margin before or after it.
+        assert daq.task("laser_sync_pulse_ao").timing_kwargs["samps_per_chan"] == 101
         assert not [task.label for task in daq.tasks if "pmt" in task.label]
     finally:
         model.close()

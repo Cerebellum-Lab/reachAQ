@@ -2249,6 +2249,13 @@ class NidaqLaserController:
         waveform.extend([minimum] * post_stim_samples)
         if not waveform:
             raise ValueError("laser pulse train waveform is empty")
+        if waveform[-1] != minimum:
+            # Ended on the amplitude, with no post-stim: after a finite
+            # generation the 6713 holds its last sample, so the last pulse
+            # ran on until the cleanup's reset. 23 ms pulses measured
+            # 28.45-35.0 ms, 5 ms ones 12.0-12.4 ms (christielab10,
+            # 2026-10-01). One sample at the minimum ends it on time.
+            waveform.append(minimum)
         return waveform
 
     def _build_digital_pulse_waveform(
