@@ -4,6 +4,7 @@ import contextlib
 import logging
 import math
 import multiprocessing
+import os
 import queue
 import threading
 import time
@@ -21,7 +22,8 @@ import verboselogs
 import autotrainer.core
 from autotrainer.behavior.behavior_algorithm import BehaviorAlgoStatus
 
-from autotrainer.core import EventManager, MessageHandler, SystemMessageHandler, ProjectInfo
+from autotrainer.core import EventManager, MessageHandler, SystemMessageHandler, ProjectInfo, \
+    PersistenceConfiguration
 from autotrainer.core.analysis import ReachAnalysis
 from autotrainer.core.multiproc import make_daemon_timer, DaemonTimer
 from autotrainer.device import MotorConfigurationFile, CompoundMovements
@@ -53,6 +55,43 @@ fake_perf_now = 0  # used to control time.perf_counter() in BehaviorAlgo/SystemM
 def isolate_host_can(monkeypatch):
     """Never let an automated test control the workstation's SocketCAN link."""
     monkeypatch.setenv("AUTOTRAINER_CAN_TRANSPORT", "emulation")
+
+
+# ~/Documents/rawdatalocal, where christielab10 records its real sessions.
+# Read at import, before any fixture replaces it.
+PRODUCTION_DEFAULT_OUTPUT_PATH = PersistenceConfiguration.DEFAULT_OUTPUT_PATH
+
+
+@pytest.fixture(autouse=True)
+def isolated_default_data_root(tmp_path_factory, monkeypatch) -> Path:
+    """Give each test a default data folder of its own, under pytest's tmp.
+
+    AppModel opens its log, its hourly event file and its first project under
+    the default data folder while it is constructed, before a configuration's
+    outputLocation is loaded, and a test that never loads one records its
+    sessions there too. The fixtures isolated the configuration and the
+    preferences file, but not this: the full runs on christielab10 on
+    2026-10-01 left 1,533 logs, two event files and two empty session folders
+    in the operator's ~/Documents/rawdatalocal/20261001/christielab10.
+    """
+    root = tmp_path_factory.mktemp("default-data")
+    monkeypatch.setattr(PersistenceConfiguration, "DEFAULT_OUTPUT_PATH", root)
+    return root
+
+
+@pytest.fixture
+def app_launch_env(tmp_path) -> dict:
+    """The environment for a test that starts reachAQ in a child process.
+
+    The child resolves its default data folder from its own HOME, out of the
+    fixture above's reach, so it gets a HOME under tmp_path. What else the
+    child finds under HOME (~/Autotrainer, ~/.config) moves with it.
+    """
+    home = tmp_path.joinpath("home")
+    home.mkdir()
+    env = os.environ.copy()
+    env["HOME"] = home.as_posix()
+    return env
 
 
 def simulate_get_perf_now():

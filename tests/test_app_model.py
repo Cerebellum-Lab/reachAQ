@@ -17,7 +17,6 @@ from autotrainer.core import (
 )
 from autotrainer.core.interfaces import RecordingEndingReason
 from autotrainer.core.capture import CaptureProcessStatus
-from autotrainer.core.configuration.persistence_configuration import PersistenceConfiguration
 from autotrainer.behavior.behavior_algorithm import BehaviorAlgoStatus
 from autotrainer.behavior.pellet_trial import (
     HardwareErrorKind,
@@ -66,6 +65,8 @@ from tools.acquisition.model.trial_protocol_schedule import (
 )
 
 from autotrainer.api import ApiApplicationMode, ApiTrainingMode
+
+import top_fixtures
 
 
 class TestStatus:
@@ -643,7 +644,9 @@ def test_startup_project_exists_before_periodic_status_is_published(app_model):
 
 
 def test_default_output_path_uses_canonical_lowercase_directory():
-    assert PersistenceConfiguration.DEFAULT_OUTPUT_PATH == Path("~/Documents/rawdatalocal")
+    # Every test runs with the default moved under tmp; this is the value the
+    # fixture replaced.
+    assert top_fixtures.PRODUCTION_DEFAULT_OUTPUT_PATH == Path("~/Documents/rawdatalocal")
 
 
 def test_session_manifest_includes_enabled_streams_independent_of_plot_selection(

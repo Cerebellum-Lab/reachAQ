@@ -1,5 +1,4 @@
 import logging
-import os
 import re
 import signal
 import subprocess
@@ -1880,8 +1879,9 @@ def test_live_inference_override_is_not_persisted_with_other_configuration_chang
     assert saved.inference.pose_model_location == "updated-model-location"
 
 
-def test_cli_help():
-    output = subprocess.check_output([sys.executable, "-m", "tools.acquisition.headless", "-h"]).decode()
+def test_cli_help(app_launch_env):
+    output = subprocess.check_output(
+        [sys.executable, "-m", "tools.acquisition.headless", "-h"], env=app_launch_env).decode()
     assert "usage: " in output
     assert "--random-cameras" in output
 
@@ -1928,14 +1928,15 @@ def test_load_config_random_camera_override_adds_default_reach_cameras(app_model
 
 @pytest.mark.skipif(sys.platform.startswith("win"), reason="hang atm. mostlikely signal related, different on windows")
 @pytest.mark.parametrize("record_mode", list(VideoRecordMode))
-def test_launch_cli(system_config, config_file_path, user_pref, calib_dir, diamond_config_path, settings_ini_path, record_mode):
+def test_launch_cli(system_config, config_file_path, user_pref, calib_dir, diamond_config_path, settings_ini_path, record_mode,
+                    app_launch_env):
     user_pref.save()  # do not forget ! otherwise default home config dirs/files are used
     for cam in system_config.cameras:
         cam.is_enabled = True
         cam.is_record_enabled = True
         cam.record_mode = record_mode.value
     system_config.save_file(config_file_path, as_yaml=True)
-    env = os.environ.copy()
+    env = app_launch_env  # its own HOME, so its default data folder is under tmp too
     env['AUTOTRAINER_DIAMOND_TRIANGLE_CONFIG'] = diamond_config_path.as_posix()  # same for this !
     env['AUTOTRAINER_FORCE_CAN_EMULATION_IFACE'] = "1"
     env['AUTOTRAINER_CAN_TRANSPORT'] = "emulation"
@@ -2007,6 +2008,8 @@ def test_launch_cli(system_config, config_file_path, user_pref, calib_dir, diamo
     assert_is_present(f"Using setting ini file: {settings_ini_path.as_posix()!r}")
     assert_is_present("Pellet-board hardware or transport support not found. Using emulation interface.")
     assert_is_present(f"Writing to {config_file_path.as_posix()!r}")
+    # It opened its startup log under that HOME, not the operator's.
+    assert Path(env["HOME"]).joinpath("Documents", "rawdatalocal").is_dir()
     #
     # etc...
 
