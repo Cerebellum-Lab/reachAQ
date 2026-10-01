@@ -603,6 +603,20 @@ Completed/Failed/Cancelled state, resource exclusion, timeout, safe-voltage
 reset, and PMT pulse-train lead/lag. Calibration ramps still reject nonzero PMT
 delay.
 
+When the inputs themselves span two PXI boards, the slave board's tasks do not
+name the master's clock and start trigger terminals, a cross-board route DAQmx
+refuses on an unidentified chassis (-89125). The master exports them onto the
+PXI_Trig lines in `nidaqPorts.timing.sampleClockExportTerminal` and
+`startTriggerExportTerminal`, required then and with no default, and the slave
+names each line on its own board. The persisted task graph records those
+names in the slave's task specifications, so its `graph_id` differs from an
+earlier build's for such a configuration; a plan with no slave input task,
+christielab10's included, is byte-identical. The plan's `sample_clock_source`
+and `start_trigger_source` keep the master's terminals, which the laser reads.
+See [NI-DAQ PXI](../linux-install/ni-daq-pxi.md) for the fields and the lines
+they must not share. This is not yet verified on hardware: christielab10 has
+no stream input on its second board.
+
 No card model, PXI slot, alias, or route is a universal default. The current rig
 uses a PXI-6221 input device as the natural acquisition master and a PXI-6713
 for laser analog output, but every rig must resolve and validate its own devices
