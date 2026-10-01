@@ -26,7 +26,7 @@ from __future__ import annotations
 import dataclasses
 from typing import Iterable, Optional, Sequence, Tuple
 
-from autotrainer.core.configuration.laser_configuration import backplane_line_of
+from autotrainer.core.configuration.laser_configuration import pxi_trig_line
 from tools.acquisition.model.nidaq_monitor_survey import clocks_digital_input
 from tools.acquisition.model.nidaq_routing import (
     capability_between,
@@ -320,6 +320,42 @@ _EXPORT_FIELDS = (
 _CORRUPTED = ("two signals driven onto one backplane line corrupt each other, "
               "and DAQmx does not see it across these boards")
 
+#: The order a free line is suggested in. PXI_Trig0 to PXI_Trig3 come last:
+#: christielab10's triggers take PXI_Trig0 and PXI_Trig2, and the laser's
+#: clock lines default to PXI_Trig1 and PXI_Trig3, which a caller given no
+#: laser configuration cannot see.
+_SUGGESTED_LINES = tuple(f"PXI_Trig{number}" for number in (4, 5, 6, 7, 0, 1, 2, 3))
+
+
+def free_backplane_line(timing, laser, *, ignoring=None) -> Optional[str]:
+    """A PXI_Trig line nothing in `timing` or `laser` takes, or None.
+
+    The one suggestion of a free line, for a refused plan's reason
+    (nidaq_timing) and a clash's remedy (validate_export_lines). Taken are
+    the stream's export lines and timing terminals, its external routes, and
+    the laser's clock lines, trigger lines, PXI_Trig route sources and
+    trigger inputs. `ignoring` is a terminal not counted: the value being
+    refused, whose line is not in use for being refused.
+    """
+    routes = tuple(getattr(timing, "external_routes", ()) or ())
+    channels = tuple(getattr(laser, "channels", ()) or ())
+    terminals = (
+        *(getattr(timing, attribute, None) for attribute in (
+            "sample_clock_export_terminal", "start_trigger_export_terminal",
+            "reference_clock_source", "start_trigger_source",
+            "sample_clock_source")),
+        *(route.source for route in routes),
+        *(destination for route in routes for destination in route.destinations),
+        getattr(laser, "backplane_clock_line", None),
+        getattr(laser, "pulse_clock_line", None),
+        *(getattr(laser, "trigger_listener_inputs", ()) or ()),
+        *(getattr(channel, attribute, None) for channel in channels
+          for attribute in ("trigger_source", "trigger_route_source")),
+    )
+    taken = {pxi_trig_line(terminal) for terminal in terminals
+             if terminal and terminal != ignoring}
+    return next((line for line in _SUGGESTED_LINES if line not in taken), None)
+
 
 def validate_export_lines(timing, laser) -> Tuple[ValidationIssue, ...]:
     """Each of the stream's export lines is a backplane line of its own.
@@ -336,66 +372,59 @@ def validate_export_lines(timing, laser) -> Tuple[ValidationIssue, ...]:
     Lines compare by name, whatever the board.
 
     Here because this is where the timing and the laser configuration are
-    both seen, before any task: Run refuses on it, and the DAQ Monitor and
-    the wiring check list it.
+    both seen. It needs no board: Run and the stream's own start, Idle's
+    included (NidaqSignalMonitorModel.start), refuse on it before any task,
+    and the DAQ Monitor and the wiring check list it.
     """
     exports = tuple(
-        (field, signal, value, backplane_line_of(value))
+        (field, signal, value, pxi_trig_line(value))
         for attribute, field, signal in _EXPORT_FIELDS
         for value in (getattr(timing, attribute, None),)
-        if backplane_line_of(value) is not None
+        if pxi_trig_line(value) is not None
     )
     if not exports:
         return tuple()
     channels = tuple(getattr(laser, "channels", ()) or ())
     listeners = tuple(getattr(laser, "trigger_listener_inputs", ()) or ())
     clock_lines = tuple(
-        (name, backplane_line_of(getattr(laser, attribute, None)))
+        (name, pxi_trig_line(getattr(laser, attribute, None)))
         for attribute, name in (("backplane_clock_line", "backplaneClockLine"),
                                 ("pulse_clock_line", "pulseClockLine"))
     )
-    taken = {line for _field, _signal, _value, line in exports}
-    taken |= {line for _name, line in clock_lines}
-    taken |= {backplane_line_of(terminal) for terminal in listeners}
-    taken |= {backplane_line_of(getattr(channel, attribute, None))
-              for channel in channels
-              for attribute in ("trigger_source", "trigger_route_source")}
-    free = next((f"PXI_Trig{number}" for number in range(8)
-                 if f"pxi_trig{number}" not in taken), None)
+    free = free_backplane_line(timing, laser)
     remedy = ("choose another PXI_Trig line for one of them"
               + (f", such as {free}" if free else ""))
 
     issues = []
     for index, (field, signal, value, line) in enumerate(exports):
-        shown = f"PXI_Trig{line[len('pxi_trig'):]}"
         problems = [
-            f"uses {shown}, as {other_field} does: the master would drive its "
+            f"uses {line}, as {other_field} does: the master would drive its "
             "sample clock and its start trigger onto one line"
             for other_field, _signal, _value, other_line in exports[:index]
             if other_line == line
         ]
         problems += [
-            f"uses {shown}, the laser {name}: {_CORRUPTED}"
+            f"uses {line}, the laser {name}: {_CORRUPTED}"
             for name, clock_line in clock_lines if clock_line == line
         ]
         for channel in channels:
             number = getattr(getattr(channel, "channel_id", None), "value", "?")
             trigger = getattr(channel, "trigger_source", None)
             route = getattr(channel, "trigger_route_source", None)
-            if backplane_line_of(trigger) == line:
+            if pxi_trig_line(trigger) == line:
                 problems.append(
-                    f"uses {shown}, which laser {number} triggerSource "
+                    f"uses {line}, which laser {number} triggerSource "
                     f"{trigger} takes: {_CORRUPTED}")
-            if backplane_line_of(route) == line:
+            if pxi_trig_line(route) == line:
                 problems.append(
-                    f"uses {shown}, which laser {number} triggerRouteSource "
+                    f"uses {line}, which laser {number} triggerRouteSource "
                     f"{route} routes from: the route would carry the stream's "
                     f"{signal} into laser {number}'s trigger, and the laser "
                     "would arm on its first edge")
         problems += [
-            f"uses {shown}, which triggerListenerInputs {terminal} reads: it "
+            f"uses {line}, which triggerListenerInputs {terminal} reads: it "
             f"would read the stream's {signal} rather than a trigger"
-            for terminal in listeners if backplane_line_of(terminal) == line
+            for terminal in listeners if pxi_trig_line(terminal) == line
         ]
         issues.extend(
             ValidationIssue(field, value, problem, remedy=remedy)
@@ -415,16 +444,19 @@ def validate_nidaq_configuration(
     """Every assertion the configuration makes, against the installed boards.
 
     The laser's route check needs the board the shared clock comes from:
-    `clock_source`, else the timing plan's sample clock.
+    `clock_source`, else the timing plan's sample clock. With no boards,
+    only the export lines are checked: two fields that clash do so whatever
+    is installed.
     """
     devices = tuple(devices)
+    timing = getattr(ports, "timing", None)
+    export_issues = validate_export_lines(timing, laser)
     if not devices:
-        return tuple()
+        return export_issues
 
     issues = list(validate_channels(devices, getattr(stream, "channels", ())))
     issues.extend(validate_terminal_configuration(devices, stream))
 
-    timing = getattr(ports, "timing", None)
     for attribute, subject in (
         ("reference_clock_source", "timing referenceClockSource"),
         ("start_trigger_source", "timing startTriggerSource"),
@@ -454,7 +486,7 @@ def validate_nidaq_configuration(
                     issues.append(issue)
 
     issues.extend(validate_trigger_capability(devices, laser))
-    issues.extend(validate_export_lines(timing, laser))
+    issues.extend(export_issues)
     issues.extend(validate_output_timing(
         devices, laser,
         clock_source or getattr(timing_plan, "sample_clock_source", None)))

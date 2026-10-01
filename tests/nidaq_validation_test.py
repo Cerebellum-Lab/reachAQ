@@ -452,3 +452,31 @@ def test_an_export_line_another_signal_takes_is_refused_once_per_clash(
         assert "such as PXI_Trig" in issue.remedy
         for taken in ("PXI_Trig0", "PXI_Trig1", "PXI_Trig2", "PXI_Trig3"):
             assert f"such as {taken}" not in issue.remedy
+
+
+def test_an_export_line_clash_needs_no_boards_to_be_refused():
+    # Unknown hardware is not invalid, but a clash between two fields is one
+    # whatever the boards are, and an empty probe skipped it.
+    issues = validate_nidaq_configuration(
+        (), ports=_ports(sample_clock_export_terminal="PXI_Trig4",
+                         start_trigger_export_terminal="PXI_Trig4"))
+
+    assert [issue.subject for issue in issues] == ["timing startTriggerExportTerminal"]
+
+
+def test_the_remedys_line_is_not_one_the_laser_takes():
+    # The laser's clock lines moved to PXI_Trig4 and PXI_Trig5: the free line
+    # suggested skips them, as the plan's suggestion does (one suggester).
+    from tools.acquisition.model.nidaq_validation import free_backplane_line
+
+    laser = _christielab10_lasers(backplane_clock_line="PXI_Trig4",
+                                  pulse_clock_line="PXI_Trig5")
+
+    issue, = _export_issues("/PXI1Slot5/PXI_Trig4", laser=laser)
+
+    assert "the laser backplaneClockLine" in issue.problem
+    assert issue.remedy.endswith("such as PXI_Trig6")
+    assert free_backplane_line(_ports().timing, laser) == "PXI_Trig6"
+    # Without a laser, the lines christielab10's triggers and the laser's
+    # default clock lines take, PXI_Trig0 to PXI_Trig3, come last.
+    assert free_backplane_line(_ports().timing, None) == "PXI_Trig4"

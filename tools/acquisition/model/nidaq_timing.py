@@ -14,15 +14,16 @@ from autotrainer.core import (
     NidaqTaskGraph,
     NidaqTaskSpecification,
 )
-from autotrainer.core.configuration.nidaq_port_configuration import (
-    pxi_trig_line,
-    slave_input_timing,
-)
+from autotrainer.core.configuration.laser_configuration import pxi_trig_line
+from autotrainer.core.configuration.nidaq_port_configuration import slave_input_timing
 from tools.acquisition.model.nidaq_discovery import (
     NidaqDevicePorts,
     device_name_from_channel,
 )
-from tools.acquisition.model.nidaq_validation import unclockable_digital_input
+from tools.acquisition.model.nidaq_validation import (
+    free_backplane_line,
+    unclockable_digital_input,
+)
 
 
 def build_nidaq_timing_plan(
@@ -32,7 +33,13 @@ def build_nidaq_timing_plan(
     *,
     hardware_timed_output_devices: Iterable[str] = tuple(),
     hardware_timed_output_channels: Iterable[str] = tuple(),
+    laser=None,
 ) -> NidaqTimingPlan:
+    """The timing plan for these inputs on these boards.
+
+    `laser`, the laser configuration, is read only for its backplane lines:
+    a refusal for a missing export line suggests one the laser does not take.
+    """
     discovered = {device.name: device for device in devices}
     input_devices = tuple(dict.fromkeys(
         device_name
@@ -245,7 +252,7 @@ def build_nidaq_timing_plan(
         )
     line_refusal = (
         _backplane_line_refusal(
-            configuration, timing, master, slaves, master_has_analog_input)
+            configuration, timing, master, slaves, master_has_analog_input, laser)
         if resolved_mode == "backplane" else None
     )
     if line_refusal is not None:
@@ -665,7 +672,7 @@ def _slaves_keeping_input_tasks(configuration, slaves, strategy) -> tuple[str, .
 
 
 def _backplane_line_refusal(
-    configuration, timing, master, slaves, master_has_analog_input,
+    configuration, timing, master, slaves, master_has_analog_input, laser,
 ) -> Optional[str]:
     """Why a slave input task has no backplane line for its timing, or None.
 
@@ -675,10 +682,9 @@ def _backplane_line_refusal(
     an analog input, the only task that exports one. None is chosen by
     default, since a default could collide with backplane wiring nothing
     here can see (Ben, 2026-09-30); the reason names the field and suggests
-    a line. PXI_Trig4 upwards are suggested: christielab10's triggers take
-    PXI_Trig0 and PXI_Trig2, and the laser's clock lines default to
-    PXI_Trig1 and PXI_Trig3. Whether a line is free of the laser's is checked
-    where both configurations are seen (nidaq_validation).
+    a line nothing in the timing or `laser` takes (free_backplane_line).
+    Whether the configured lines are free of each other and the laser's is
+    checked where both configurations are seen (validate_export_lines).
     """
     devices = _slaves_keeping_input_tasks(configuration, slaves, timing.task_strategy)
     if not devices:
@@ -688,20 +694,6 @@ def _backplane_line_refusal(
     if master_has_analog_input:
         fields.append(("timing startTriggerExportTerminal", "start trigger",
                        timing.start_trigger_export_terminal))
-    named = tuple(
-        terminal
-        for terminal in (
-            timing.sample_clock_export_terminal,
-            timing.start_trigger_export_terminal,
-            timing.reference_clock_source,
-            timing.start_trigger_source,
-            timing.sample_clock_source,
-            *(route.source for route in timing.external_routes),
-            *(destination for route in timing.external_routes
-              for destination in route.destinations),
-        )
-        if terminal
-    )
     for field, signal, value in fields:
         board = device_name_from_channel(value)
         if not value:
@@ -712,11 +704,7 @@ def _backplane_line_refusal(
             problem = f"{value!r} names {board}, and {master} drives the line"
         else:
             continue
-        taken = {pxi_trig_line(terminal) for terminal in named if terminal != value}
-        example = next(
-            (f"PXI_Trig{number}" for number in range(4, 8)
-             if f"PXI_Trig{number}" not in taken),
-            "PXI_Trig4")
+        example = free_backplane_line(timing, laser, ignoring=value) or "PXI_Trig4"
         return (
             f"NI-DAQ inputs on {', '.join(devices)} take {master}'s {signal} "
             f"over a PXI backplane line, and {field} {problem}: set it to a "

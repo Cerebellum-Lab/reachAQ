@@ -5,7 +5,7 @@ from typing import ClassVar, Optional, Tuple
 
 from autotrainer.core import make_camelize_representer, make_decamelize_constructor
 from autotrainer.core.configuration import SystemConfigurationDumper, SystemConfigurationLoader
-from autotrainer.core.configuration.laser_configuration import backplane_line_of
+from autotrainer.core.configuration.laser_configuration import pxi_trig_line
 
 
 @dataclasses.dataclass(frozen=True)
@@ -245,19 +245,6 @@ class NidaqTimingPlan:
             "resolved_devices",
             tuple(self.resolved_devices),
         )
-
-
-def pxi_trig_line(terminal: Optional[str]) -> Optional[str]:
-    """The PXI_Trig line `terminal` names, spelt as DAQmx spells it, or None.
-
-    None for anything else, and for a number the backplane does not have:
-    PXI has PXI_Trig0 to PXI_Trig7. The board is ignored (backplane_line_of).
-    """
-    line = backplane_line_of(terminal)
-    if line is None:
-        return None
-    number = int(line[len("pxi_trig"):])
-    return f"PXI_Trig{number}" if number <= 7 else None
 
 
 def slave_input_timing(
