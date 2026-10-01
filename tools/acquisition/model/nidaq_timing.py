@@ -331,14 +331,25 @@ def _with_task_graph(plan, configuration, timing, output_devices, output_channel
         )
         # A slave's own names for the master's clock and trigger: the
         # backplane lines in backplane mode (slave_input_timing). A slave
-        # whose tasks a forced multidevice task takes over may have none, and
-        # records the master's, as before.
+        # whose tasks a multidevice task takes over may have none, and records
+        # the master's, as before.
         if device == plan.master_device:
             clock_source = trigger_source = None
+            digital_clock = (plan.sample_clock_source if analog
+                             else f"/{device}/Ctr0InternalOutput")
         else:
-            clock_source, trigger_source = slave_input_timing(plan, device)
-            clock_source = clock_source or plan.sample_clock_source
-            trigger_source = trigger_source or plan.start_trigger_source
+            own_clock, own_trigger = slave_input_timing(plan, device)
+            clock_source = own_clock or plan.sample_clock_source
+            trigger_source = own_trigger or plan.start_trigger_source
+            # Beside an analog task on its own board, a slave's digital task
+            # runs on that task's clock, as the stream clocks it. Only for a
+            # slave that takes its timing over a configured backplane line,
+            # where the slave's names are new; any other keeps the shared
+            # clock the graph always recorded (pinned).
+            digital_clock = (
+                f"/{device}/ai/SampleClock"
+                if analog and plan.resolved_mode == "backplane" and own_clock
+                else clock_source)
         if analog:
             tasks.append(NidaqTaskSpecification(
                 task_id=f"{device}.ai",
@@ -358,11 +369,7 @@ def _with_task_graph(plan, configuration, timing, output_devices, output_channel
                 subsystem="di",
                 channels=digital,
                 mode="continuous_input",
-                sample_clock_source=(
-                    clock_source if device != plan.master_device
-                    else plan.sample_clock_source if analog
-                    else f"/{device}/Ctr0InternalOutput"
-                ),
+                sample_clock_source=digital_clock,
                 start_trigger_source=trigger_source,
                 reference_clock_source=plan.reference_clock_source,
                 transfer_mechanism=transfer.get(f"{device}.di"),
@@ -464,8 +471,21 @@ def resolve_nidaq_multidevice_probe(
             ),
         ))
     combined_subsystems = {task.subsystem for task in combined}
+
+    def kept(task):
+        # A slave's digital task whose board's analog task went into the
+        # master's has no analog task beside it any more: the stream clocks
+        # it as any slave's, over the backplane line (slave_input_timing).
+        if (task.subsystem == "di" and task.device != master
+                and "ai" in combined_subsystems):
+            clock = slave_input_timing(plan, task.device)[0]
+            if clock:
+                return dataclasses.replace(task, sample_clock_source=clock)
+        return task
+
     tasks = tuple(
-        task for task in graph.tasks if task.subsystem not in combined_subsystems
+        kept(task) for task in graph.tasks
+        if task.subsystem not in combined_subsystems
     ) + tuple(combined)
     task_ids = tuple(task.task_id for task in tasks)
     selected = dataclasses.replace(
@@ -646,11 +666,14 @@ def _has_common_pxi_backplane(
 def _slaves_keeping_input_tasks(configuration, slaves, strategy) -> tuple[str, ...]:
     """The slaves with an input task of their own, in plan order.
 
-    Forced multidevice puts each subsystem that is on both boards into one
-    task on the master, or the start fails (resolve_nidaq_multidevice_probe,
-    nidaq_preflight), so only a subsystem on a slave alone stays a slave
-    task. auto_multidevice can fall back to per-device tasks, so every slave
-    input counts there, as it does per device.
+    A multidevice strategy puts each subsystem that is on both boards into
+    one task on the master (resolve_nidaq_multidevice_probe), which takes no
+    line, so only a subsystem on a slave alone stays a slave task and needs
+    one; the merged task is left as it was. When auto_multidevice's probe
+    fails, it falls back to per-device tasks, and a slave task with no line
+    is refused there by the stream, naming the field
+    (NidaqSignalStreamController._no_backplane_line); forced_multidevice
+    fails instead. Per device, every slave input counts.
     """
     subsystems = {}
     for subsystem, channels in (("ai", configuration.analog_channels),
@@ -660,7 +683,7 @@ def _slaves_keeping_input_tasks(configuration, slaves, strategy) -> tuple[str, .
             subsystems.setdefault(device, set()).add(subsystem)
 
     def merged(device, subsystem):
-        return strategy == "forced_multidevice" and any(
+        return strategy in {"auto_multidevice", "forced_multidevice"} and any(
             other != device and subsystem in theirs
             for other, theirs in subsystems.items())
 
