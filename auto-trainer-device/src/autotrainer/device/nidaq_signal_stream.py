@@ -13,6 +13,7 @@ from autotrainer.core import (
     NidaqSignalStreamConfiguration,
     NidaqTimingPlan,
 )
+from autotrainer.core.configuration.nidaq_port_configuration import slave_input_timing
 from autotrainer.core.logging import log_hardware_initialization
 
 
@@ -430,16 +431,10 @@ class NidaqSignalStreamController:
                     buffer_size,
                 )
             else:
-                timing_source = (
-                    None
-                    if self._timing_plan is None
-                    else self._timing_plan.sample_clock_source
+                kwargs["source"] = self._slave_sample_clock(
+                    device_name,
+                    f"NI-DAQ slave {device_name} has no routed sample clock",
                 )
-                if not timing_source:
-                    raise RuntimeError(
-                        f"NI-DAQ slave {device_name} has no routed sample clock"
-                    )
-                kwargs["source"] = timing_source
             digital_task.timing.cfg_samp_clk_timing(
                 rate=cfg.sample_rate_hz,
                 sample_mode=self._nidaqmx.constants.AcquisitionType.CONTINUOUS,
@@ -861,13 +856,40 @@ class NidaqSignalStreamController:
             return {"source": self._timing_plan.sample_clock_source}
         if self._is_master_device(device_name):
             return {}
-        source = (
-            None if self._timing_plan is None
-            else self._timing_plan.sample_clock_source
+        return {"source": self._slave_sample_clock(
+            device_name, f"NI-DAQ slave {device_name} has no sample clock")}
+
+    def _slave_sample_clock(self, device_name: str, missing: str) -> str:
+        """The master's sample clock as slave `device_name` names it.
+
+        In backplane mode, the slave's own view of the line the master
+        exports the clock onto (slave_input_timing); otherwise the plan's
+        clock. `missing` is the refusal when the plan has none at all.
+        """
+        plan = self._timing_plan
+        source = None if plan is None else slave_input_timing(plan, device_name)[0]
+        if source:
+            return source
+        if plan is not None and plan.resolved_mode == "backplane":
+            raise RuntimeError(self._no_backplane_line(
+                device_name, "sample clock", "sampleClockExportTerminal"))
+        raise RuntimeError(missing)
+
+    def _no_backplane_line(self, device_name: str, signal: str, field: str) -> str:
+        """The refusal for a slave whose plan gives it no backplane line.
+
+        The plan refuses this before a start (build_nidaq_timing_plan). Named
+        on the master's own terminal instead, the task would fail inside
+        DAQmx at -89125 on an unidentified chassis such as christielab10's,
+        naming neither the slave nor the field.
+        """
+        return (
+            f"NI-DAQ slave {device_name} has no backplane line for "
+            f"{self._timing_plan.master_device}'s {signal}: timing {field} "
+            "names no PXI_Trig line, and the master's own terminal named on "
+            f"{device_name} is a cross-board route DAQmx refuses on an "
+            "unidentified chassis (-89125)"
         )
-        if not source:
-            raise RuntimeError(f"NI-DAQ slave {device_name} has no sample clock")
-        return {"source": source}
 
     def _reference_clock_for(self, device_name: str):
         """The device's own reference-clock terminal, or None if it has none."""
@@ -893,6 +915,15 @@ class NidaqSignalStreamController:
             or not plan.start_trigger_source
         ):
             return
+        # A slave arms on its own view of the backplane line in backplane
+        # mode (slave_input_timing), as its clock is named.
+        source = (
+            plan.start_trigger_source if self._is_master_device(device_name)
+            else slave_input_timing(plan, device_name)[1]
+        )
+        if not source:
+            raise RuntimeError(self._no_backplane_line(
+                device_name, "start trigger", "startTriggerExportTerminal"))
         triggers = getattr(task, "triggers", None)
         start_trigger = None if triggers is None else getattr(
             triggers, "start_trigger", None
@@ -901,7 +932,7 @@ class NidaqSignalStreamController:
             start_trigger, "cfg_dig_edge_start_trig", None
         )
         if callable(configure):
-            configure(plan.start_trigger_source)
+            configure(source)
 
     @staticmethod
     def _channels_by_device(channels) -> Dict[
