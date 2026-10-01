@@ -115,7 +115,7 @@ def test_a_manual_run_pulse_while_recording_is_kept_as_a_marked_event(tmp_path):
     laser = next(item for item in report.results if item.rule_id == "events.laser")
     # A warning only: this session has no camera frames to associate.
     assert laser.status.value == "warning"
-    assert laser.message.endswith("; 1 manual Run Pulse event(s)")
+    assert laser.message.endswith("; 1 manual Run Pulse event(s) (1 completed)")
 
 
 def test_nothing_is_kept_of_a_manual_run_pulse_when_no_session_records():

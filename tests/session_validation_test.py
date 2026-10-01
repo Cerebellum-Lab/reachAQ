@@ -410,7 +410,8 @@ def _rule(root, rule_id):
 def test_events_laser_counts_the_manual_run_pulse_events(tmp_path):
     # A manual Run Pulse fired while recording is kept as a requested row and
     # an outcome row sharing its manual- id; the rule says how many it found,
-    # so a reviewer sees them (Ben, 2026-09-30).
+    # and how each ended, so a reviewer sees them and never takes a refused
+    # one for one that fired (Ben, 2026-09-30).
     root = _session(tmp_path)
     _write(root / "streams/laser.csv", _LASER_HEADER + "".join((
         _laser_row(10.0, "requested", "manual pulse", "manual-a"),
@@ -418,13 +419,20 @@ def test_events_laser_counts_the_manual_run_pulse_events(tmp_path):
         _laser_row(10.2, "completed", "manual pulse", "manual-a"),
         _laser_row(11.0, "requested", "manual pulse", "manual-b"),
         _laser_row(11.1, "refused", "manual pulse", "manual-b"),
+        _laser_row(12.0, "requested", "manual pulse", "manual-c"),
+        _laser_row(12.5, "cancelled", "manual pulse", "manual-c"),
+        # Its request fell before Record: a legitimate single row, no warning.
+        _laser_row(13.0, "failed", "manual pulse", "manual-d"),
+        # Its outcome fell after Stop.
+        _laser_row(14.0, "requested", "manual pulse", "manual-e"),
     )))
 
     result = _rule(root, "events.laser")
 
     assert result.status.value == "pass"
     assert result.message == (
-        "Laser events have recorded-frame evidence; 2 manual Run Pulse event(s)")
+        "Laser events have recorded-frame evidence; 5 manual Run Pulse event(s) "
+        "(1 completed, 1 failed, 1 cancelled, 1 refused, 1 with no outcome)")
 
     # With none, the message is what it was.
     _write(root / "streams/laser.csv", _LASER_HEADER + _laser_row(
