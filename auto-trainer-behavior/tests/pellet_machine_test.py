@@ -455,8 +455,44 @@ def test_prepared_pre_reveal_stimulus_is_bound_once(machine):
 
     pellet_m.send_pellet(force=True)
 
+    # No line given still means board STIM3, and the SEND data now says so.
     pellet_m._pellet_device.send_pellet.assert_called_with(
         embedded_tone=None,
-        pre_reveal_stimulus=(200, 1000),
+        pre_reveal_stimulus=(200, 1000, 3),
     )
     assert pellet_m._prepared_pre_reveal_stimulus is None
+
+
+def test_prepared_pre_reveal_stimulus_carries_the_trial_lasers_board_line(machine):
+    # christielab10 laser 2 is wired to board STIM2.
+    pellet_m = machine.pellet
+    pellet_m.prepare_pre_reveal_stimulus(200, 1000, stim_line=2)
+
+    pellet_m.send_pellet(force=True)
+
+    pellet_m._pellet_device.send_pellet.assert_called_with(
+        embedded_tone=None,
+        pre_reveal_stimulus=(200, 1000, 2),
+    )
+
+
+@pytest.mark.parametrize("stim_line", [0, 1, 4])
+def test_pre_reveal_stimulus_refuses_a_line_that_cannot_carry_a_stimulus(
+    machine, stim_line,
+):
+    pellet_m = machine.pellet
+
+    with pytest.raises(
+        ValueError,
+        match=f"Board STIM{stim_line} cannot carry a stimulus pulse; "
+              "use board STIM2 or STIM3",
+    ):
+        pellet_m.prepare_pre_reveal_stimulus(200, 1000, stim_line=stim_line)
+
+    assert pellet_m._prepared_pre_reveal_stimulus is None
+    assert pellet_m._prepared_cover_policy is None
+
+
+def test_pre_reveal_pulse_refusal_names_the_line(machine):
+    with pytest.raises(ValueError, match="STIM2 pulse duration must be within"):
+        machine.pellet.prepare_pre_reveal_stimulus(200, 99, stim_line=2)

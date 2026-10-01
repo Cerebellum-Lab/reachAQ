@@ -309,23 +309,40 @@ class PelletMachine(StateMachine):
         self,
         delay_ms: int,
         pulse_duration_us: int,
+        stim_line: int = 3,
     ) -> None:
-        """Bind a board-timed STIM3 pulse/reveal action to the next SEND.
+        """Bind a board-timed STIM pulse/reveal action to the next SEND.
 
-        The pellet board emits STIM3, waits the requested interval, reveals the
+        The pellet board pulses ``stim_line`` - the trial laser's own board
+        STIM line, STIM2 or STIM3 - waits the requested interval, reveals the
         pellet, and only then continues the configured SEND sequence.  Keeping
         all three actions in the compound board command avoids a host timer.
+
+        The line defaults to STIM3, the only line this pulsed before it was
+        carried. Refused here as well as on the CAN device, because a refusal
+        there comes after SEND and stops the CAN command handler.
         """
         delay_ms = int(delay_ms)
         pulse_duration_us = int(pulse_duration_us)
+        stim_line = int(stim_line)
+        # STIM0 and STIM1 carry the tone confirmations (the device package's
+        # BOARD_STIM_LINE_OUTPUTS; this package does not depend on it).
+        if stim_line not in (2, 3):
+            raise ValueError(
+                f"Board STIM{stim_line} cannot carry a stimulus pulse; use "
+                "board STIM2 or STIM3"
+            )
         if not 1 <= delay_ms <= 60_000:
             raise ValueError("Pre-reveal delay must be within 1..60000 ms")
         if not 100 <= pulse_duration_us <= 5_000_000:
-            raise ValueError("STIM3 pulse duration must be within 100 us..5 s")
+            raise ValueError(
+                f"STIM{stim_line} pulse duration must be within 100 us..5 s"
+            )
         self._prepared_cover_policy = "reveal"
         self._prepared_pre_reveal_stimulus = (
             delay_ms,
             pulse_duration_us,
+            stim_line,
         )
 
     def can_cover_pellet(self, *, force: bool=False):

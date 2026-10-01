@@ -5199,7 +5199,7 @@ class AppModel(ObservableObject):
                 )
                 raise RuntimeError("Pellet SEND was not accepted after preparation")
         except Exception as error:
-            # Preparation may have reserved one-shot cover/tone/STIM3 actions
+            # Preparation may have reserved one-shot cover/tone/STIM actions
             # before a later motor or laser step failed. Never let those
             # actions leak into the next manual or protocol SEND.
             self._behavior.system_machine.pellet.cancel_prepared_cover_policy()
@@ -5349,9 +5349,12 @@ class AppModel(ObservableObject):
                 raise RuntimeError(
                     "Pre-reveal stimulation requires the pellet cover policy Reveal"
                 )
+            # The laser's own board line: laser 2 on christielab10 is wired
+            # to STIM2, and a board pulse on STIM3 never triggered it.
             self._behavior.system_machine.pellet.prepare_pre_reveal_stimulus(
                 row["pre_reveal_ms"],
                 firing.trigger_pulse_us,
+                stim_line=firing.stim_line,
             )
             return
         self._behavior.system_machine.pellet.prepare_cover_policy(policy)
