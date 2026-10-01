@@ -218,3 +218,63 @@ def test_both_lasers_of_a_synchronized_train_line_up_and_end_on_their_minimum(
         [0.0] * margin + [2.0] * 10 + [0.0] * (len(train_2) - 10 + margin))
     assert _last_samples(daq) == [0.0, 0.25]
     controller.close()
+
+
+# ------------------------------------------- the pulse's clocked digital lines
+#
+# They run on the output's clock for as many samples, and hold their last one
+# after it as the output does (NI's finite generation; christielab10 configures
+# none of these lines, so this is not measured there).
+
+
+def test_the_pmt_shutter_line_ends_low_its_close_lag_after_the_train(daq):
+    # It was high for the whole output, so it stayed high after it until the
+    # cleanup wrote it low, last of everything, and the close lag was the
+    # host's. 0.05 ms lead, 0.1 ms pulse, 0.03 ms lag at 100 kHz: low on the
+    # output's last sample, 3 samples after the train returns to 0 V.
+    controller = NidaqLaserController(rig_lasers())
+
+    controller.run_pulse_train(_train(
+        amplitude_volts=2.0, duration_ms=0.1, enable_pmt_shutter=True,
+        pmt_shutter_open_delay_ms=0.05, pmt_shutter_close_delay_ms=0.03))
+
+    analog, = daq.task("laser_sync_pulse_ao").writes
+    pmt, = daq.task("laser_pmt_shutter_do").writes
+    assert analog == [0.0] * 5 + [2.0] * 10 + [0.0] * 4
+    assert pmt == [True] * 18 + [False]
+    controller.close()
+
+
+#: Each trigger line: its configuration field, the pulse's field, its task.
+TRIGGER_LINES = {
+    "trigger_output": ("emit_trigger_output", "laser_1_trigger_do"),
+    "timing_trigger_output": ("emit_timing_trigger_output", "laser_1_timing_trigger_do"),
+}
+
+
+def _trigger_line_written(daq, output, **pulse):
+    emit, task = TRIGGER_LINES[output]
+    controller = NidaqLaserController(rig_lasers(**{output: "PXI1Slot5/port0/line7"}))
+    controller.run_pulse_train(_train(amplitude_volts=2.0, **pulse, **{emit: True}))
+    controller.close()
+    line, = daq.task(task).writes
+    return line
+
+
+@pytest.mark.parametrize("output", sorted(TRIGGER_LINES))
+def test_a_trigger_line_longer_than_the_output_ends_low(daq, output):
+    # Its default 1 ms beside a 0.5 ms pulse filled the output and ended
+    # high, and nothing writes these lines low: it stayed high after the
+    # pulse, and the next pulse's trigger had no rising edge. It is cut to
+    # all but the output's last sample.
+    assert _trigger_line_written(daq, output, duration_ms=0.5) == [True] * 50 + [False]
+
+
+@pytest.mark.parametrize("output", sorted(TRIGGER_LINES))
+@pytest.mark.parametrize("duration_ms", [1.0, 2.0])
+def test_a_trigger_line_the_output_outlasts_keeps_its_width(daq, output, duration_ms):
+    # 1 ms at 100 kHz, then low to the output's end. Beside a 1 ms pulse it
+    # filled the output until the output gained its last sample at 0 V.
+    pulse_samples = int(duration_ms * 100)
+    assert _trigger_line_written(daq, output, duration_ms=duration_ms) == (
+        [True] * 100 + [False] * (pulse_samples + 1 - 100))
