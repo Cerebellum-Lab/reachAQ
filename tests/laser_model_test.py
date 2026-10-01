@@ -629,10 +629,13 @@ def test_a_manual_run_pulse_is_told_as_requested_then_completed():
         "manual_pulse_call_perf_counter", "before_output_start")
     assert (completed.timestamp_method, completed.timing_confidence) == (
         "manual_pulse_call_perf_counter", "after_output_end")
-    # The waveform starts where the pulse was asked for, not after it ended.
+    # The waveform starts where the pulse was asked for, not after it ended,
+    # and says so: each of its points was output at or after its time.
     assert waveform.source == "internal pulse"
     assert (waveform.origin_perf_time, waveform.origin_wall_time) == (
         requested.origin_perf_time, requested.origin_wall_time)
+    assert (waveform.timestamp_method, waveform.timing_confidence) == (
+        "manual_pulse_call_perf_counter", "before_output")
     assert waveform.operation_id == ""
     context = json.loads(requested.context_json)
     assert context == {

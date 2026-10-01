@@ -104,6 +104,8 @@ def test_a_manual_run_pulse_while_recording_is_kept_as_a_marked_event(tmp_path):
     # The waveform starts at the request's time: they can be joined on it.
     waveform = [row for row in written if row["source"] == "internal pulse"]
     assert waveform and waveform[0]["perf_time"] == requested["perf_time"]
+    assert {(row["timestamp_method"], row["timing_confidence"]) for row in waveform} == {
+        ("manual_pulse_call_perf_counter", "before_output")}
     # The NI sample the request landed within.
     landed = int(np.searchsorted(nidaq_perf, float(requested["perf_time"]), side="right")) - 1
     assert requested["nidaq_sample_index"] == str(1000 + landed)

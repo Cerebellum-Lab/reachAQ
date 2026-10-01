@@ -55,6 +55,8 @@ class LaserTraceBlock:
 #: A manual Run Pulse's event id starts so; a protocol operation's is a bare
 #: UUID (NidaqLaserOperation), so the one is never taken for the other.
 MANUAL_PULSE_OPERATION_PREFIX = "manual-"
+#: How a manual Run Pulse's rows are timed: by perf_counter at its call.
+_MANUAL_PULSE_TIMESTAMP_METHOD = "manual_pulse_call_perf_counter"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -475,9 +477,16 @@ class LaserModel(ObservableObject):
         trace = self._make_pulse_trace(pulse_train)
         if manual is not None:
             # Stamped as it is told, its rows fell after the train had ended.
-            # The live graph places a trace by its own x values, not by these.
+            # Drawn from the request's time, each point was output at or
+            # after its row's time. The live graph places a trace by its own
+            # x values, not by these.
             trace = dataclasses.replace(
-                trace, origin_perf_time=manual.perf_time, origin_wall_time=manual.wall_time)
+                trace,
+                origin_perf_time=manual.perf_time,
+                origin_wall_time=manual.wall_time,
+                timestamp_method=_MANUAL_PULSE_TIMESTAMP_METHOD,
+                timing_confidence="before_output",
+            )
         self.trace_received(trace)
         if manual is not None:
             self._manual_pulse_ended(manual, "completed", "after_output_end")
@@ -853,7 +862,7 @@ class LaserModel(ObservableObject):
             event=event,
             operation_id=manual.operation_id,
             context_json=json.dumps(context, sort_keys=True),
-            timestamp_method="manual_pulse_call_perf_counter",
+            timestamp_method=_MANUAL_PULSE_TIMESTAMP_METHOD,
             timing_confidence=timing_confidence,
             origin_perf_time=perf_time,
             origin_wall_time=wall_time,
