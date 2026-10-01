@@ -122,7 +122,12 @@ class _FakeTask:
         """As christielab10's unidentified chassis answers a terminal named
         on another board: DAQmx would have to reserve a backplane line for
         the route, and without the chassis it reserves none (-89125). A
-        terminal on the task's own board, or a bare one, is taken."""
+        terminal on the task's own board, or a bare one, is taken.
+
+        Raised as the terminal is set, earlier than DAQmx, which takes the
+        name and refuses the route when the task is verified, committed or
+        started. Every one of those follows the setting in the stream, so a
+        test sees the same refusal for the same naming, only sooner."""
         if not terminal:
             return
         board = _board_of(terminal)
@@ -412,6 +417,43 @@ def test_a_slave_with_no_backplane_line_is_refused_by_the_field(
     with pytest.raises(RuntimeError, match=f"NI-DAQ slave Feedback .*timing {field}"):
         NidaqSignalStreamController(
             _two_board_inputs(), timing_plan=_backplane_plan(**values))
+
+    assert all(task.closed for task in fake_nidaqmx.tasks)
+
+
+def test_an_auto_multidevice_fallback_with_no_line_is_refused_by_the_field(monkeypatch):
+    # auto_multidevice merges both boards' analog inputs into one task, which
+    # needs no line, so the plan asks for none. When its probe fails it falls
+    # back to per-device tasks (nidaq_preflight), and the slave's own task has
+    # no line to take: refused by the field, not at -89125.
+    fake_nidaqmx = _FakeNidaqmx()
+    monkeypatch.setattr(nidaq_signal_stream, "_load_nidaqmx", lambda: fake_nidaqmx)
+    configuration = NidaqSignalStreamConfiguration(
+        channels=(
+            NidaqSignalChannelConfiguration("master_ai", "Acquire/ai0"),
+            NidaqSignalChannelConfiguration("slave_ai", "Feedback/ai0"),
+        ),
+        is_enabled=True,
+        sample_rate_hz=1000.0,
+        read_chunk_size=3,
+    )
+    graph = NidaqTaskGraph(
+        graph_id="g",
+        strategy="auto_multidevice",
+        tasks=(
+            NidaqTaskSpecification("Feedback.ai", "Feedback", "ai",
+                                   ("Feedback/ai0",), "continuous_input"),
+            NidaqTaskSpecification("Acquire.ai", "Acquire", "ai",
+                                   ("Acquire/ai0",), "continuous_input"),
+        ),
+    )
+    fallback = _backplane_plan(
+        sample_clock_export_terminal=None, start_trigger_export_terminal=None,
+        task_graph=graph, multidevice_probe_status="fallback_per_device")
+
+    with pytest.raises(RuntimeError,
+                       match="NI-DAQ slave Feedback .*timing sampleClockExportTerminal"):
+        NidaqSignalStreamController(configuration, timing_plan=fallback)
 
     assert all(task.closed for task in fake_nidaqmx.tasks)
 

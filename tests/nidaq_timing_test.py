@@ -504,10 +504,13 @@ def test_a_slave_input_board_names_the_masters_clock_and_trigger_on_its_own_line
     assert plan.is_valid, plan.reason
     assert plan.resolved_mode == "backplane"
     assert (plan.master_device, plan.slave_devices) == ("Acquire", ("Feedback",))
-    for task_id in ("Feedback.ai", "Feedback.di"):
-        task = _task(plan, task_id)
-        assert (task.sample_clock_source, task.start_trigger_source) == (
-            "/Feedback/PXI_Trig4", "/Feedback/PXI_Trig5")
+    slave_ai, slave_di = _task(plan, "Feedback.ai"), _task(plan, "Feedback.di")
+    assert (slave_ai.sample_clock_source, slave_ai.start_trigger_source) == (
+        "/Feedback/PXI_Trig4", "/Feedback/PXI_Trig5")
+    # Beside an analog task on its board, the digital task runs on that
+    # task's clock, as the stream clocks it.
+    assert (slave_di.sample_clock_source, slave_di.start_trigger_source) == (
+        "/Feedback/ai/SampleClock", "/Feedback/PXI_Trig5")
     # The master is unchanged: its own clock, armed by nothing.
     master_ai, master_di = _task(plan, "Acquire.ai"), _task(plan, "Acquire.di")
     assert (master_ai.sample_clock_source, master_ai.start_trigger_source) == (None, None)
@@ -571,26 +574,71 @@ def test_a_slave_input_board_without_a_line_is_an_invalid_plan_naming_the_field(
     assert (plan.master_device, plan.slave_devices) == ("Acquire", ("Feedback",))
 
 
-def test_a_forced_multidevice_slave_needs_a_line_only_for_a_task_it_keeps():
-    # Forced, every subsystem on both boards is merged into one task on the
-    # master, or the start fails: no slave task is left to take a line. A
+@pytest.mark.parametrize("strategy", ["auto_multidevice", "forced_multidevice"])
+def test_a_multidevice_slave_needs_a_line_only_for_a_task_it_keeps(strategy):
+    # Every subsystem on both boards goes into one task on the master: no
+    # slave task is left to take a line, and the merged task is as it was. A
     # subsystem on the slave alone stays a slave task.
     devices = (_pxi("Acquire", 50), _pxi("Feedback", 51))
-    forced = NidaqTimingConfiguration(task_strategy="forced_multidevice")
+    timing = NidaqTimingConfiguration(task_strategy=strategy)
     merged = build_nidaq_timing_plan(
         _stream(("first", "Acquire/ai0", "analog"), ("second", "Feedback/ai0", "analog")),
-        forced, devices)
+        timing, devices)
     kept = build_nidaq_timing_plan(
         _stream(("first", "Acquire/ai0", "analog"),
                 ("tone1", "Feedback/port0/line0", "digital")),
-        forced, devices)
+        timing, devices)
 
     assert merged.is_valid, merged.reason
     assert not kept.is_valid
     assert "timing sampleClockExportTerminal" in kept.reason
 
 
-# ------------------------------- every plan without a slave input, as it was
+def test_an_auto_multidevice_fallback_leaves_its_slave_task_no_line():
+    # auto_multidevice falls back to per-device tasks when its probe fails.
+    # The slave's task is then its own, and it has no line: the stream
+    # refuses it there, naming the field (nidaq_signal_stream_test).
+    from autotrainer.core.configuration.nidaq_port_configuration import (
+        slave_input_timing,
+    )
+
+    plan = build_nidaq_timing_plan(
+        _stream(("first", "Acquire/ai0", "analog"), ("second", "Feedback/ai0", "analog")),
+        NidaqTimingConfiguration(task_strategy="auto_multidevice"),
+        (_pxi("Acquire", 50), _pxi("Feedback", 51)))
+    fallback = resolve_nidaq_multidevice_probe(plan, "fallback_per_device")
+
+    assert plan.is_valid, plan.reason
+    assert {task.task_id for task in fallback.task_graph.tasks} == {
+        "Acquire.ai", "Feedback.ai"}
+    assert slave_input_timing(fallback, "Feedback") == (None, None)
+
+
+def test_a_slave_line_beside_a_merged_analog_task_takes_the_backplane_clock():
+    # Per device, the slave's digital task runs on its own analog task's
+    # clock. Merged, that analog task is the master's, and the stream clocks
+    # the digital task from the backplane line instead; the graph says so.
+    plan = build_nidaq_timing_plan(
+        _stream(("first", "Acquire/ai0", "analog"),
+                ("second", "Feedback/ai0", "analog"),
+                ("tone1", "Feedback/port0/line0", "digital")),
+        NidaqTimingConfiguration(
+            task_strategy="auto_multidevice",
+            sample_clock_export_terminal="/Acquire/PXI_Trig4",
+            start_trigger_export_terminal="/Acquire/PXI_Trig5"),
+        (_pxi("Acquire", 50), _pxi("Feedback", 51)))
+    merged = resolve_nidaq_multidevice_probe(plan, "verified")
+
+    assert plan.is_valid, plan.reason
+    assert _task(plan, "Feedback.di").sample_clock_source == "/Feedback/ai/SampleClock"
+    assert {task.task_id for task in merged.task_graph.tasks} == {
+        "Feedback.di", "Acquire.ai"}
+    line = _task(merged, "Feedback.di")
+    assert (line.sample_clock_source, line.start_trigger_source) == (
+        "/Feedback/PXI_Trig4", "/Feedback/PXI_Trig5")
+
+
+# ------------------- every plan the backplane lines leave alone, as it was
 
 
 def _pinned_christielab10():
@@ -635,12 +683,22 @@ def _pinned_christielab10():
     )
 
 
-def _pinned_merged(status):
+def _pinned_merged(status, strategy="forced_multidevice"):
     plan = build_nidaq_timing_plan(
         _stream(("first", "Acquire/ai0", "analog"), ("second", "Feedback/ai0", "analog")),
-        NidaqTimingConfiguration(task_strategy="forced_multidevice"),
+        NidaqTimingConfiguration(task_strategy=strategy),
         (_pxi("Acquire", 50), _pxi("Feedback", 51)))
     return plan if status is None else resolve_nidaq_multidevice_probe(plan, status)
+
+
+def _pinned_lines_beside_inputs(devices=None, **timing):
+    """Analog inputs on both boards, and a digital line beside each."""
+    return build_nidaq_timing_plan(
+        _stream(("first", "DevA/ai0", "analog"), ("line_a", "DevA/port0/line0", "digital"),
+                ("second", "DevB/ai0", "analog"), ("line_b", "DevB/port0/line0", "digital")),
+        NidaqTimingConfiguration(**timing),
+        devices or (NidaqDevicePorts(name="DevA", bus_type="USB"),
+                    NidaqDevicePorts(name="DevB", bus_type="USB")))
 
 
 _PINNED_PLANS = {
@@ -670,6 +728,20 @@ _PINNED_PLANS = {
         (NidaqDevicePorts(name="DevA"), NidaqDevicePorts(name="DevB"))),
     "forced multidevice, before its probe": lambda: _pinned_merged(None),
     "forced multidevice, merged": lambda: _pinned_merged("verified"),
+    "auto multidevice, before its probe": lambda: _pinned_merged(
+        None, "auto_multidevice"),
+    "auto multidevice, merged": lambda: _pinned_merged("verified", "auto_multidevice"),
+    # A slave's digital line beside its analog input, outside backplane mode.
+    "external, lines beside inputs on two boards": lambda: _pinned_lines_beside_inputs(
+        sync_mode="external", start_trigger_source="/DevA/PFI1",
+        sample_clock_source="/DevA/PFI2"),
+    "independent, lines beside inputs on two boards": lambda: _pinned_lines_beside_inputs(
+        sync_mode="independent"),
+    # Every subsystem on both boards, merged: no slave task, no line.
+    "auto multidevice, lines beside inputs, merged": lambda: resolve_nidaq_multidevice_probe(
+        _pinned_lines_beside_inputs(
+            (_pxi("DevA", 50), _pxi("DevB", 51)), task_strategy="auto_multidevice"),
+        "verified"),
 }
 
 #: Each plan's graph_id, and the first 16 hex digits of the SHA-256 of the
@@ -685,11 +757,19 @@ _PINS = {
     # The probe's choice keeps the graph_id; the merged task is in the digest.
     "forced multidevice, before its probe": ("9e071173adfdf1f6", "172ecab7f68fbadd"),
     "forced multidevice, merged": ("9e071173adfdf1f6", "0e5429d4e9592be6"),
+    "auto multidevice, before its probe": ("a1b57396982b070e", "7bde56d2b3354424"),
+    "auto multidevice, merged": ("a1b57396982b070e", "48facba247a1fab0"),
+    "external, lines beside inputs on two boards": (
+        "92dad9b41f61bb2b", "4ebd7ca89efdb711"),
+    "independent, lines beside inputs on two boards": (
+        "814e2bba146bb7f1", "150f4b0b3367b5f3"),
+    "auto multidevice, lines beside inputs, merged": (
+        "4820e406bf1d68c2", "7c72c467b30837a3"),
 }
 
 
 @pytest.mark.parametrize("name", sorted(_PINNED_PLANS))
-def test_a_plan_with_no_slave_input_task_is_byte_identical(name):
+def test_a_plan_the_backplane_lines_leave_alone_is_byte_identical(name):
     plan = _PINNED_PLANS[name]()
 
     assert plan.is_valid, plan.reason
