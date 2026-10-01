@@ -220,10 +220,11 @@ def test_a_load_that_fails_part_way_is_never_saved(app_model, config_file_path, 
 
 def test_saving_resumes_once_a_load_completes(app_model, config_file_path, monkeypatch):
     assert app_model.load_configuration() is True
-    _fail_the_nidaq_step(app_model, monkeypatch)
-    with pytest.raises(RuntimeError):
-        app_model.load_configuration()
-    monkeypatch.undo()
+    # Scoped, not monkeypatch.undo(), which lifted every fixture's patch too.
+    with monkeypatch.context() as failing:
+        _fail_the_nidaq_step(app_model, failing)
+        with pytest.raises(RuntimeError):
+            app_model.load_configuration()
 
     assert app_model.load_configuration() is True
     app_model.stim_camera.is_enabled = True
@@ -2026,8 +2027,12 @@ def test_launch_cli(system_config, config_file_path, user_pref, calib_dir, diamo
     assert_is_present(f"Using setting ini file: {settings_ini_path.as_posix()!r}")
     assert_is_present("Pellet-board hardware or transport support not found. Using emulation interface.")
     assert_is_present(f"Writing to {config_file_path.as_posix()!r}")
-    # It opened its startup log under that HOME, not the operator's.
-    assert Path(env["HOME"]).joinpath("Documents", "rawdatalocal").is_dir()
+    # It opened its startup log under that HOME, not the operator's, and read
+    # the motor and move files app_launch_env put there.
+    home = Path(env["HOME"])
+    assert home.joinpath("Documents", "rawdatalocal").is_dir()
+    assert_is_present(f"Reading and applying default motors config: {home / 'Autotrainer' / 'motor_config.yaml'}")
+    assert_is_present(f"Reading and applying default move config: {home / 'Autotrainer' / 'move_config.yaml'}")
     #
     # etc...
 

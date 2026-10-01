@@ -6,6 +6,7 @@ import math
 import multiprocessing
 import os
 import queue
+import shutil
 import sys
 import threading
 import time
@@ -65,11 +66,12 @@ PRODUCTION_DEFAULT_OUTPUT_PATH = PersistenceConfiguration.DEFAULT_OUTPUT_PATH
 
 
 def _own_monkeypatch():
-    # Not the test's monkeypatch: test_saving_resumes_once_a_load_completes
-    # calls monkeypatch.undo(), which lifted the isolation below with its own
-    # patches, and its app's teardown then tried to unlink the operator's real
-    # ~/.config/Colorado/autotrainer_running_status.env (refused by the guard
-    # on christielab10 on 2026-10-01).
+    # Not the test's monkeypatch, which a test can undo(): the undo() that
+    # test_saving_resumes_once_a_load_completes used to call lifted the
+    # isolation below with its own patches, and its app's teardown then tried
+    # to unlink the operator's real ~/.config/Colorado/
+    # autotrainer_running_status.env (refused by the guard on christielab10 on
+    # 2026-10-01).
     return pytest.MonkeyPatch.context()
 
 
@@ -86,6 +88,9 @@ def isolated_default_data_root(tmp_path_factory) -> Generator[Path, None, None]:
     in the operator's ~/Documents/rawdatalocal/20261001/christielab10.
     """
     root = tmp_path_factory.mktemp("default-data")
+    # autotrainer.core.logging.get_log_file_location builds this folder from
+    # Path.home() itself, out of this patch's reach; only tools/pellet_delivery
+    # calls it, no test does, and the guard refuses it.
     with _own_monkeypatch() as patch:
         patch.setattr(PersistenceConfiguration, "DEFAULT_OUTPUT_PATH", root)
         yield root
@@ -119,10 +124,15 @@ def app_launch_env(tmp_path) -> dict:
 
     The child resolves its default data folder from its own HOME, out of the
     fixture above's reach, so it gets a HOME under tmp_path. What else the
-    child finds under HOME (~/Autotrainer, ~/.config) moves with it.
+    child finds under HOME (~/Autotrainer, ~/.config) moves with it, so its
+    ~/Autotrainer is given the motor and move files the motor_config fixture
+    gives in-process tests.
     """
     home = tmp_path.joinpath("home")
-    home.mkdir()
+    autotrainer = home.joinpath("Autotrainer")
+    autotrainer.mkdir(parents=True)
+    for default in (MotorConfigurationFile.DEFAULT_LOCATION, CompoundMovements.DEFAULT_LOCATION):
+        shutil.copy(repo_root_tests_subdir.joinpath(default.name), autotrainer)
     env = os.environ.copy()
     env["HOME"] = home.as_posix()
     return env
@@ -149,19 +159,22 @@ class DataRootGuard:
     reach), a path built from Path.home(), or a test that builds the app
     without the fixtures. Raising stops the write, including the shutil.rmtree
     that removes an aborted session, which tests ran on the operator's
-    20261001/christielab10/session001 several times on 2026-10-01. The refusal
-    is recorded as well, because some callers swallow it (the event file
-    plugin logs and carries on), and fail_on_refusals() fails the test.
+    20261001/christielab10/session001 several times on 2026-10-01 (the day's
+    logs there record nine). The refusal is recorded as well, because some
+    callers swallow it (the event file plugin logs and carries on), and
+    fail_on_refusals() fails the test.
 
     A child process is beyond the hook, so starting reachAQ with a HOME that
     puts its default data folder here is refused too.
 
     Writes made in C (cv2, HDF5) are not audited; the application reaches
     them through folders it first ensures with Path.mkdir, which is. Qt's
-    QSettings writes the preferences file in C++ with no such step, so the
-    watched folders (~/.config/Colorado) are also compared, entry by entry,
-    before and after each test: that catches the write afterwards, though it
-    cannot stop it.
+    QSettings writes the preferences file in C++ with no such step, so that
+    file, with its lock and temporary siblings, is also compared before and
+    after each test: that catches the write afterwards, though it cannot stop
+    it, and cannot tell this test from another process. Only that file: the
+    operator's running reachAQ rewrites its status file beside it at every
+    mode change, which in this process the hook already refuses.
     """
 
     # Audit events that create, change or remove what a path names, with the
@@ -190,6 +203,9 @@ class DataRootGuard:
         "reachAQ.app",
     )
     _APP_SCRIPTS = ("reachaq", "auto-trainer-local", "auto-trainer-headless")
+    # QSettings' file for organisation "Colorado", application "Auto Trainer"
+    # (user_preferences.py).
+    PREFERENCES_FILE_NAME = "Auto Trainer.conf"
 
     def __init__(self, default_output_path: Path, preferences_folder: Path):
         # The default is under HOME, which each process resolves for itself.
@@ -197,7 +213,7 @@ class DataRootGuard:
         self.home = Path("~").expanduser()
         preferences_folder = preferences_folder.expanduser()
         self.roots = (self.home.joinpath(self._under_home), preferences_folder)
-        self.watched = (preferences_folder,)
+        self.watched = (preferences_folder.joinpath(self.PREFERENCES_FILE_NAME),)
         self._refused: List[str] = []
 
     @property
@@ -227,51 +243,52 @@ class DataRootGuard:
         return refused
 
     def snapshot(self) -> dict:
-        """Each watched folder's own stat and its entries', for changes_since()."""
-        return {folder: self._stat_folder(folder) for folder in self.watched}
+        """Each watched file's stat, with its siblings', for changes_since()."""
+        return {path: self._stat_with_siblings(path) for path in self.watched}
 
     def changes_since(self, snapshot: dict) -> List[str]:
         changes = []
-        for folder, before in snapshot.items():
-            after = self._stat_folder(folder)
-            if after == before:
-                continue
-            if before is None or after is None:
-                changes.append(f"{folder} {'created' if before is None else 'removed'}")
-                continue
-            (_, entries_before), (_, entries_after) = before, after
-            entry_changes = [
-                f"{folder / name} " + ("created" if name not in entries_before
-                                       else "removed" if name not in entries_after else "changed")
-                for name in sorted(entries_before.keys() | entries_after.keys())
-                if entries_before.get(name) != entries_after.get(name)
-            ]
-            # Otherwise only the folder's own stat moved: an entry came and went.
-            changes.extend(entry_changes or [f"{folder} modified (an entry was created and removed)"])
+        for path, before in snapshot.items():
+            after = self._stat_with_siblings(path)
+            for name in sorted(before.keys() | after.keys()):
+                if before.get(name) != after.get(name):
+                    state = ("created" if name not in before
+                             else "removed" if name not in after else "changed")
+                    changes.append(f"{path.parent / name} {state}")
         return changes
 
     def fail_on_refusals(self, snapshot: Optional[dict] = None) -> None:
         refused = self.take_refused()
         changed = [] if snapshot is None else self.changes_since(snapshot)
-        if refused or changed:
-            pytest.fail(
-                "tried to write under the operator's folders (a background thread's"
-                " attempt may belong to an earlier test):\n  "
-                + "\n  ".join([*(f"refused: {what}" for what in refused),
-                               *(f"changed: {what}" for what in changed)]),
-                pytrace=False,
-            )
+        report = []
+        if refused:
+            report.append("tried to write under the operator's folders, and was refused"
+                          " (a background thread's attempt may belong to an earlier test):")
+            report.extend(f"  {what}" for what in refused)
+        if changed:
+            report.append("changed during this test (by this test, or by another process"
+                          " such as a running reachAQ):")
+            report.extend(f"  {what}" for what in changed)
+        if report:
+            pytest.fail("\n".join(report), pytrace=False)
 
     @staticmethod
-    def _stat_folder(folder: Path):
+    def _stat_with_siblings(path: Path) -> dict:
+        # QSettings saves through QSaveFile, a temporary file renamed over this
+        # one, under a QLockFile "<name>.lock". A save changes the file's inode,
+        # so it shows here without the folder's own stat, which the operator's
+        # status file moves too.
         def key(stat):
             return stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, stat.st_ino
         try:
-            with os.scandir(folder) as entries:
-                listing = {entry.name: key(entry.stat(follow_symlinks=False)) for entry in entries}
-            return key(os.stat(folder)), listing
+            with os.scandir(path.parent) as entries:
+                return {
+                    entry.name: key(entry.stat(follow_symlinks=False))
+                    for entry in entries
+                    if entry.name == path.name or entry.name.startswith(path.name + ".")
+                }
         except FileNotFoundError:
-            return None
+            return {}
 
     def _refusal(self, event: str, args: tuple) -> Optional[str]:
         if event == "subprocess.Popen":
@@ -324,6 +341,27 @@ def guard_the_operator_data_root():
     before = data_root_guard.snapshot()
     yield
     data_root_guard.fail_on_refusals(before)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Fail the run on a refusal that no test's check saw.
+
+    A session fixture's teardown, or a thread still running, can try after the
+    last test's teardown.
+    """
+    refused = data_root_guard.take_refused()
+    if not refused:
+        return
+    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+    if reporter is not None:
+        reporter.write_line("")  # past the progress line
+        reporter.write_line(
+            "tried to write under the operator's folders after the last test's check,"
+            " and was refused:", red=True)
+        for what in refused:
+            reporter.write_line(f"  {what}", red=True)
+    if session.exitstatus == pytest.ExitCode.OK:
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
 
 def simulate_get_perf_now():
