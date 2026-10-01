@@ -1,10 +1,11 @@
-"""No test writes into the operator's data folder.
+"""No test writes into the operator's data folder, or into ~/.config/Colorado.
 
 The full runs on christielab10 on 2026-10-01 left 1,533 logs, two hourly event
 files and two empty session folders in ~/Documents/rawdatalocal/20261001/
 christielab10, the folder its real sessions are recorded into. AppModel opened
 them under its default data folder while it was constructed, before any
-configuration's outputLocation was loaded.
+configuration's outputLocation was loaded. The same runs created and deleted
+the operator's ~/.config/Colorado/autotrainer_running_status.env.
 
 These tests move HOME under tmp_path to stand in for the operator's, and the
 guard's tests give it a folder there to protect, so even against code that
@@ -18,6 +19,7 @@ import time
 from pathlib import Path
 
 import pytest
+from PySide6.QtCore import QFile, QIODevice, QSettings
 
 from autotrainer.behavior import BehaviorAlgorithm
 from autotrainer.core import PersistenceConfiguration
@@ -80,6 +82,21 @@ def test_each_test_has_a_default_data_folder_of_its_own(tmp_path_factory):
     assert default.is_dir() and not any(default.iterdir()), default
 
 
+def test_each_test_has_a_running_status_file_of_its_own(tmp_path_factory):
+    path = AppModel.status_file_path.expanduser()
+    assert _is_under(path, tmp_path_factory.getbasetemp()), path
+    assert path.parent.is_dir() and not path.exists(), path
+
+
+def test_a_tests_monkeypatch_undo_leaves_both_in_place(monkeypatch, tmp_path_factory):
+    # test_saving_resumes_once_a_load_completes does this mid-test.
+    monkeypatch.undo()
+    basetemp = tmp_path_factory.getbasetemp()
+    for path in (PersistenceConfiguration.get_default_output_path(),
+                 AppModel.status_file_path.expanduser()):
+        assert _is_under(path, basetemp), path
+
+
 def test_the_app_fixture_keeps_its_log_events_and_sessions_under_tmp(
     operator_home, app_model, tmp_path_factory,
 ):
@@ -122,6 +139,68 @@ def _listing(folder: Path) -> list:
 def test_the_guard_protects_the_production_default_data_folder():
     assert top_fixtures.data_root_guard.roots[0] == (
         top_fixtures.PRODUCTION_DEFAULT_OUTPUT_PATH.expanduser())
+
+
+def test_the_guard_protects_and_watches_the_operators_preferences_folder():
+    production = top_fixtures.PRODUCTION_STATUS_FILE_PATH
+    assert production == Path("~/.config/Colorado/autotrainer_running_status.env")
+    folder = production.parent.expanduser()
+    # The folder, so the preferences file in it too: Auto Trainer.conf.
+    assert folder in top_fixtures.data_root_guard.roots
+    assert folder in top_fixtures.data_root_guard.watched
+
+
+@pytest.fixture
+def preferences_folder(tmp_path, monkeypatch) -> Path:
+    """A stand-in for ~/.config/Colorado, protected and watched beside the real one."""
+    folder = tmp_path.joinpath("operator-home", ".config", "Colorado")
+    folder.mkdir(parents=True)
+    folder.joinpath("Auto Trainer.conf").write_text("[system]\nserial_number=christielab10\n")
+    guard = top_fixtures.data_root_guard
+    monkeypatch.setattr(guard, "roots", (*guard.roots, folder))
+    monkeypatch.setattr(guard, "watched", (*guard.watched, folder))
+    return folder
+
+
+def test_the_guard_refuses_the_status_file_there(preferences_folder):
+    status = preferences_folder.joinpath("autotrainer_running_status.env")
+    with pytest.raises(top_fixtures.DataRootWriteRefused):
+        status.write_text("status='running'\n")
+    with pytest.raises(top_fixtures.DataRootWriteRefused):
+        preferences_folder.joinpath("Auto Trainer.conf").unlink()
+    assert sorted(path.name for path in preferences_folder.iterdir()) == ["Auto Trainer.conf"]
+    assert len(top_fixtures.data_root_guard.take_refused()) == 2
+
+
+def test_the_guard_sees_a_preferences_write_the_hook_cannot(preferences_folder):
+    guard = top_fixtures.data_root_guard
+    before = guard.snapshot()
+    assert guard.changes_since(before) == []
+    # QSettings writes from C++, out of the audit hook's sight.
+    conf = preferences_folder.joinpath("Auto Trainer.conf")
+    settings = QSettings(conf.as_posix(), QSettings.Format.IniFormat)
+    settings.setValue("system/serial_number", "pytest")
+    settings.sync()
+    assert settings.status() == QSettings.Status.NoError
+    assert guard.take_refused() == []
+    assert f"{conf} changed" in guard.changes_since(before)
+    with pytest.raises(pytest.fail.Exception, match="Auto Trainer.conf changed"):
+        guard.fail_on_refusals(before)
+
+
+def test_the_guard_sees_a_file_that_came_and_went(preferences_folder):
+    guard = top_fixtures.data_root_guard
+    before = guard.snapshot()
+    time.sleep(0.05)  # a folder's mtime moves with the kernel's clock tick
+    status = preferences_folder.joinpath("autotrainer_running_status.env").as_posix()
+    file = QFile(status)  # from C++ again
+    assert file.open(QIODevice.OpenModeFlag.WriteOnly)
+    file.write(b"status='running'\n")
+    file.close()
+    assert QFile.remove(status)
+    assert guard.take_refused() == []
+    assert guard.changes_since(before) == [
+        f"{preferences_folder} modified (an entry was created and removed)"]
 
 
 def test_the_guard_refuses_each_write_under_the_data_folder_and_records_it(
