@@ -597,7 +597,9 @@ def test_a_pulse_with_no_digital_outputs_makes_the_same_calls(daq, plan):
     calls = [(task.label, tuple(task.channels), task.timing_kwargs, task.start_trigger)
              for task in daq.tasks[created:]]
     synchronized = plan is not None
-    samples = 10 if synchronized else 100
+    # The 1 ms pulse, and the sample that returns the output to its minimum
+    # (nidaq_laser_pulse_waveform_test).
+    samples = 11 if synchronized else 101
     analog_timing = dict(rate=10_000.0 if synchronized else 100_000.0,
                          sample_mode="finite", samps_per_chan=samples)
     if synchronized:
