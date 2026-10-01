@@ -964,7 +964,12 @@ class NidaqLaserController:
                     self._create_finite_digital_output_task(
                         pmt_line,
                         digital_names[-1],
-                        [True] * total_samples,
+                        # Low on the output's last sample, its close lag
+                        # after the train. High on it, the line stayed high
+                        # until the cleanup's reset, which comes last of
+                        # all, as the analog output held its last pulse
+                        # (christielab10, 2026-10-01).
+                        [True] * (total_samples - 1) + [False],
                         sample_rate_hz,
                         total_samples,
                         *digital_timing(pmt_line),
@@ -2264,7 +2269,11 @@ class NidaqLaserController:
         pulse_ms: float,
         sample_rate_hz: float,
     ) -> List[bool]:
-        pulse_samples = min(total_samples, max(1, _samples_from_ms(pulse_ms, sample_rate_hz)))
+        # All but the output's last sample at most. A pulse that filled the
+        # output ended high, and the line held that after the generation, as
+        # the analog output held its last pulse (christielab10, 2026-10-01);
+        # nothing writes a trigger line low after it.
+        pulse_samples = min(total_samples - 1, max(1, _samples_from_ms(pulse_ms, sample_rate_hz)))
         return [True] * pulse_samples + [False] * (total_samples - pulse_samples)
 
     def _build_calibration_ramp_waveform(self, ramp: LaserCalibrationRamp) -> List[float]:
