@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import numpy
+import pytest
 
 from autotrainer.core import (
     NidaqSignalChannelConfiguration,
@@ -12,6 +13,27 @@ from autotrainer.core import (
 from autotrainer.device import nidaq_signal_stream
 from autotrainer.device.nidaq_signal_stream import NidaqSignalStreamController
 
+from nidaq_daqmx_fake import FakeDaqError
+
+#: The signals a master exports for its slaves, as nidaqmx.constants.Signal.
+_SIGNALS = SimpleNamespace(
+    SAMPLE_CLOCK="sample_clock",
+    COUNTER_OUTPUT_EVENT="counter_output_event",
+    START_TRIGGER="start_trigger",
+)
+_CLOCK_SIGNALS = {_SIGNALS.SAMPLE_CLOCK, _SIGNALS.COUNTER_OUTPUT_EVENT}
+
+
+def _board_of(terminal):
+    """The board a terminal names, or None for a bare one such as PXI_Trig4."""
+    parts = str(terminal).strip("/").split("/")
+    return parts[0] if len(parts) > 1 else None
+
+
+def _backplane_line(terminal):
+    tail = str(terminal or "").strip("/").rsplit("/", 1)[-1].lower()
+    return tail if tail.startswith("pxi_trig") else None
+
 
 class _FakeTiming:
     def __init__(self, task):
@@ -20,6 +42,7 @@ class _FakeTiming:
         self.ref_clk_rate = None
 
     def cfg_samp_clk_timing(self, **kwargs):
+        self._task.refuse_another_boards_terminal(kwargs.get("source"))
         self._task.timing_configuration = kwargs
 
     def cfg_implicit_timing(self, **kwargs):
@@ -55,9 +78,10 @@ class _FakeCounterChannels:
 
 
 class _FakeTask:
-    def __init__(self, name: str, start_order):
+    def __init__(self, name: str, start_order, daq=None):
         self.name = name
         self._start_order = start_order
+        self._daq = daq
         self.channels = []
         self.timing_configuration = None
         self.implicit_timing_configuration = None
@@ -71,6 +95,9 @@ class _FakeTask:
                 cfg_dig_edge_start_trig=self._set_start_trigger,
             ),
         )
+        #: Each export_signal call, as (signal, output terminal).
+        self.exports = []
+        self.export_signals = SimpleNamespace(export_signal=self._export_signal)
         self.start_trigger_source = None
         self.started = False
         self.closed = False
@@ -85,7 +112,56 @@ class _FakeTask:
             name = str(physical_channel).split("/", 1)[0]
             if name not in names:
                 names.append(name)
+        if self.counter_configuration is not None:
+            name = _board_of(self.counter_configuration[0])
+            if name not in names:
+                names.append(name)
         return [SimpleNamespace(name=name) for name in names]
+
+    def refuse_another_boards_terminal(self, terminal):
+        """As christielab10's unidentified chassis answers a terminal named
+        on another board: DAQmx would have to reserve a backplane line for
+        the route, and without the chassis it reserves none (-89125). A
+        terminal on the task's own board, or a bare one, is taken."""
+        if not terminal:
+            return
+        board = _board_of(terminal)
+        own = [device.name for device in self.devices]
+        if board is not None and board not in own:
+            raise FakeDaqError(
+                -89125,
+                "No registered trigger lines could be found between the "
+                f"devices in the route. Source Device: {board} Destination "
+                f"Device: {', '.join(own)} ({self.name})")
+
+    def _export_signal(self, signal_id, output_terminal):
+        self.refuse_another_boards_terminal(output_terminal)
+        self.exports.append((signal_id, output_terminal))
+        if self._daq is not None:
+            self._daq.exports.append((signal_id, output_terminal))
+
+    def _refuse_undriven_lines(self):
+        """A task that reads a backplane line nothing drives never samples.
+
+        DAQmx takes the local name and waits: the read times out (-200284).
+        A clock line has to carry a clock and a trigger line a start trigger.
+        """
+        if self._daq is None:
+            return
+        driven = {}
+        for signal_id, terminal in self._daq.exports:
+            line = _backplane_line(terminal)
+            if line is not None:
+                driven.setdefault(line, set()).add(signal_id)
+        source = (self.timing_configuration or {}).get("source")
+        for terminal, wanted in ((source, _CLOCK_SIGNALS),
+                                 (self.start_trigger_source, {_SIGNALS.START_TRIGGER})):
+            line = _backplane_line(terminal)
+            if line is not None and not driven.get(line, set()) & wanted:
+                raise FakeDaqError(
+                    -200284, "Some or all of the samples requested have not "
+                    f"yet been acquired: {terminal} carries "
+                    f"{sorted(driven.get(line, ())) or 'nothing'} ({self.name})")
 
     def start(self):
         self.started = True
@@ -99,6 +175,7 @@ class _FakeTask:
 
     def read(self, *, number_of_samples_per_channel, timeout):
         assert timeout >= 1.0
+        self._refuse_undriven_lines()
         if self.is_digital:
             # A port-grouped digital task reads whole port words, one row per
             # port - not one row per line. Alternating which single line is
@@ -123,6 +200,7 @@ class _FakeTask:
         return values[0] if len(values) == 1 else list(values)
 
     def _set_start_trigger(self, source):
+        self.refuse_another_boards_terminal(source)
         self.start_trigger_source = source
 
 
@@ -137,6 +215,7 @@ class _FakeNidaqmx:
                                      CHAN_FOR_ALL_LINES="all-lines"),
         TerminalConfiguration=SimpleNamespace(RSE="rse", NRSE="nrse",
                                               DIFF="diff"),
+        Signal=_SIGNALS,
     )
 
     system = SimpleNamespace(
@@ -147,9 +226,11 @@ class _FakeNidaqmx:
     def __init__(self):
         self.tasks = []
         self.start_order = []
+        #: Every export made, by any task, as (signal, output terminal).
+        self.exports = []
 
     def Task(self, name):
-        task = _FakeTask(name, self.start_order)
+        task = _FakeTask(name, self.start_order, self)
         self.tasks.append(task)
         return task
 
@@ -211,19 +292,7 @@ def test_multi_device_tasks_arm_slave_before_master(monkeypatch):
         sample_rate_hz=1000.0,
         read_chunk_size=3,
     )
-    plan = NidaqTimingPlan(
-        requested_mode="auto",
-        resolved_mode="backplane",
-        is_valid=True,
-        master_device="Acquire",
-        slave_devices=("Feedback",),
-        reference_clock_source="PXI_CLK10",
-        reference_clock_rate_hz=10_000_000.0,
-        sample_clock_source="/Acquire/ai/SampleClock",
-        start_trigger_source="/Acquire/ai/StartTrigger",
-        task_start_order=("Feedback", "Acquire"),
-        synchronization_quality="hardware_backplane",
-    )
+    plan = _backplane_plan()
 
     controller = NidaqSignalStreamController(
         configuration,
@@ -233,10 +302,21 @@ def test_multi_device_tasks_arm_slave_before_master(monkeypatch):
         controller.start()
         master, slave = fake_nidaqmx.tasks
 
-        assert slave.timing_configuration["source"] == "/Acquire/ai/SampleClock"
+        # The master's clock and start trigger, each on the backplane line
+        # the master exports it onto, named on the slave's own board: named
+        # on the master, they are a cross-board route the fake refuses as
+        # christielab10's unidentified chassis does (-89125).
+        assert slave.timing_configuration["source"] == "/Feedback/PXI_Trig4"
         assert "source" not in master.timing_configuration
-        assert slave.start_trigger_source == "/Acquire/ai/StartTrigger"
+        assert slave.start_trigger_source == "/Feedback/PXI_Trig5"
         assert master.start_trigger_source is None
+        assert master.exports == [
+            ("sample_clock", "/Acquire/PXI_Trig4"),
+            ("start_trigger", "/Acquire/PXI_Trig5"),
+        ]
+        assert slave.exports == []
+        # What the laser reads off the plan is the master's own terminal.
+        assert plan.sample_clock_source == "/Acquire/ai/SampleClock"
         assert slave.timing.ref_clk_src == "/Feedback/PXI_Clk10"
         assert slave.timing.ref_clk_rate == 10_000_000.0
         assert fake_nidaqmx.start_order == (
@@ -251,6 +331,111 @@ def test_multi_device_tasks_arm_slave_before_master(monkeypatch):
         assert block.epoch_wall_time is not None
     finally:
         controller.close()
+
+
+def _backplane_plan(**values):
+    """Acquire's inputs master Feedback's, as build_nidaq_timing_plan has it."""
+    fields = dict(
+        requested_mode="auto",
+        resolved_mode="backplane",
+        is_valid=True,
+        master_device="Acquire",
+        slave_devices=("Feedback",),
+        reference_clock_source="PXI_CLK10",
+        reference_clock_rate_hz=10_000_000.0,
+        sample_clock_source="/Acquire/ai/SampleClock",
+        start_trigger_source="/Acquire/ai/StartTrigger",
+        sample_clock_export_terminal="/Acquire/PXI_Trig4",
+        start_trigger_export_terminal="/Acquire/PXI_Trig5",
+        task_start_order=("Feedback", "Acquire"),
+        synchronization_quality="hardware_backplane",
+        clock_producer="ai",
+        clock_producer_device="Acquire",
+        consumer_devices=("Acquire", "Feedback"),
+    )
+    fields.update(values)
+    return NidaqTimingPlan(**fields)
+
+
+def _two_board_inputs():
+    return NidaqSignalStreamConfiguration(
+        channels=(
+            NidaqSignalChannelConfiguration("master_ai", "Acquire/ai0"),
+            NidaqSignalChannelConfiguration("slave_ai", "Feedback/ai0"),
+            NidaqSignalChannelConfiguration(
+                "slave_line", "Feedback/port0/line0", "digital"),
+        ),
+        is_enabled=True,
+        sample_rate_hz=1000.0,
+        read_chunk_size=3,
+    )
+
+
+def test_a_slaves_digital_input_runs_on_its_own_clock_and_the_backplane_trigger(
+        monkeypatch):
+    # Beside an analog task on the same board, the digital task takes that
+    # task's clock, on its own board as before; its start trigger is the
+    # backplane line's.
+    fake_nidaqmx = _FakeNidaqmx()
+    monkeypatch.setattr(nidaq_signal_stream, "_load_nidaqmx", lambda: fake_nidaqmx)
+
+    controller = NidaqSignalStreamController(
+        _two_board_inputs(), timing_plan=_backplane_plan())
+    try:
+        controller.start()
+        tasks = {task.name: task for task in fake_nidaqmx.tasks}
+        slave_ai = tasks["reachaq_signal_stream_Feedback_ai"]
+        slave_di = tasks["reachaq_signal_stream_Feedback_di"]
+
+        assert slave_ai.timing_configuration["source"] == "/Feedback/PXI_Trig4"
+        assert slave_ai.start_trigger_source == "/Feedback/PXI_Trig5"
+        assert slave_di.timing_configuration["source"] == "/Feedback/ai/SampleClock"
+        assert slave_di.start_trigger_source == "/Feedback/PXI_Trig5"
+        assert controller.read_chunk().sample_count == 3
+    finally:
+        controller.close()
+
+
+@pytest.mark.parametrize(("values", "field"), [
+    (dict(sample_clock_export_terminal=None), "sampleClockExportTerminal"),
+    (dict(sample_clock_export_terminal="/Acquire/PFI3"), "sampleClockExportTerminal"),
+    (dict(start_trigger_export_terminal=None), "startTriggerExportTerminal"),
+])
+def test_a_slave_with_no_backplane_line_is_refused_by_the_field(
+        monkeypatch, values, field):
+    # The plan refuses this first (build_nidaq_timing_plan); a plan that got
+    # here anyway names the field rather than the master's terminal, which
+    # DAQmx would refuse inside the task at -89125.
+    fake_nidaqmx = _FakeNidaqmx()
+    monkeypatch.setattr(nidaq_signal_stream, "_load_nidaqmx", lambda: fake_nidaqmx)
+
+    with pytest.raises(RuntimeError, match=f"NI-DAQ slave Feedback .*timing {field}"):
+        NidaqSignalStreamController(
+            _two_board_inputs(), timing_plan=_backplane_plan(**values))
+
+    assert all(task.closed for task in fake_nidaqmx.tasks)
+
+
+def test_a_slave_named_on_the_masters_terminal_is_refused_as_daqmx_does(monkeypatch):
+    # The fake itself: the old naming meets -89125, as it would on the rig.
+    fake_nidaqmx = _FakeNidaqmx()
+    task = fake_nidaqmx.Task("reachaq_signal_stream_Feedback_ai")
+    task.ai_channels.add_ai_voltage_chan("Feedback/ai0")
+
+    with pytest.raises(FakeDaqError) as refused:
+        task.timing.cfg_samp_clk_timing(source="/Acquire/ai/SampleClock")
+    with pytest.raises(FakeDaqError):
+        task.triggers.start_trigger.cfg_dig_edge_start_trig("/Acquire/ai/StartTrigger")
+
+    assert refused.value.error_code == -89125
+    task.timing.cfg_samp_clk_timing(source="/Feedback/PXI_Trig4")
+    task.triggers.start_trigger.cfg_dig_edge_start_trig("/Feedback/PXI_Trig5")
+    # Nothing drives either line yet, so nothing is ever sampled.
+    with pytest.raises(FakeDaqError, match="-200284"):
+        task.read(number_of_samples_per_channel=3, timeout=1.0)
+    fake_nidaqmx.exports += [("sample_clock", "/Acquire/PXI_Trig4"),
+                             ("start_trigger", "/Acquire/PXI_Trig5")]
+    assert len(task.read(number_of_samples_per_channel=3, timeout=1.0)) == 3
 
 
 def test_verified_multidevice_probe_uses_one_expanded_task(monkeypatch):
@@ -322,6 +507,8 @@ def test_digital_master_arms_all_inputs_before_counter_clock(monkeypatch):
         reference_clock_rate_hz=10_000_000.0,
         sample_clock_source="/Acquire/Ctr0InternalOutput",
         start_trigger_source=None,
+        # A counter master has no start trigger to export: one line only.
+        sample_clock_export_terminal="/Acquire/PXI_Trig4",
         task_start_order=("Confirm", "Acquire"),
         synchronization_quality="hardware_backplane",
         clock_producer="counter",
@@ -335,7 +522,10 @@ def test_digital_master_arms_all_inputs_before_counter_clock(monkeypatch):
         tasks = {task.name: task for task in fake_nidaqmx.tasks}
         assert tasks["reachaq_signal_stream_Confirm_di"].timing_configuration[
             "source"
-        ] == "/Acquire/Ctr0InternalOutput"
+        ] == "/Confirm/PXI_Trig4"
+        assert tasks["reachaq_signal_stream_Confirm_di"].start_trigger_source is None
+        assert tasks["reachaq_signal_stream_Acquire_clock"].exports == [
+            ("counter_output_event", "/Acquire/PXI_Trig4")]
         assert tasks["reachaq_signal_stream_Acquire_di"].timing_configuration[
             "source"
         ] == "/Acquire/Ctr0InternalOutput"
@@ -351,6 +541,8 @@ def test_digital_master_arms_all_inputs_before_counter_clock(monkeypatch):
         assert tasks["reachaq_signal_stream_Acquire_clock"].timing.ref_clk_src == (
             "/Acquire/PXI_Clk10"
         )
+        # The slave samples: its line carries the counter's clock.
+        assert controller.read_chunk().sample_count == 3
     finally:
         controller.close()
 
