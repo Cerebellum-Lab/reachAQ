@@ -26,6 +26,7 @@ from autotrainer.device import (
     StepperConfig,
     MotorSteps,
     DeviceConnection,
+    DigitalOutputs,
     MotorConfigurationFile,
     Tone,
 )
@@ -213,6 +214,79 @@ def test_send_sequence_rejects_pulse_longer_than_pre_reveal_interval():
     with pytest.raises(ValueError, match="shorter than the pre-reveal delay"):
         device._start_send_pellet_sequence({
             "pre_reveal_stimulus": (1, 1000),
+        })
+
+
+def _pre_reveal_device(operations):
+    device = CanDevice(
+        api=DeviceApi(message_callback=data_callback),
+        force_emulation=True,
+        required_targets=(Target.PELLET_DEVICE,),
+        operation_callback=lambda *args: operations.append(args),
+    )
+    interface = device.device_interface
+    interface.open()
+    # Wrapped rather than replaced, so the emulator still refuses STIM0 and
+    # STIM1 the way the board does.
+    interface.pulse_digital_output = mock.Mock(wraps=interface.pulse_digital_output)
+    device._boards_pending_ctx[Target.PELLET_DEVICE].ctx = "pellet-cycle"
+    return device
+
+
+@pytest.mark.parametrize("stimulus, output", [
+    # christielab10 laser 2 is boardStimLine 2; board STIM2 is STIMULUS_3.
+    ((200, 1000, 2), DigitalOutputs.STIMULUS_3),
+    # Laser 1 is boardStimLine 3.
+    ((200, 1000, 3), DigitalOutputs.STIMULUS_4),
+    # Data from before the line was carried meant STIM3, and still does.
+    ((200, 1000), DigitalOutputs.STIMULUS_4),
+])
+def test_pre_reveal_pulse_goes_out_on_the_trial_lasers_board_line(stimulus, output):
+    operations = []
+    device = _pre_reveal_device(operations)
+
+    assert device._start_send_pellet_sequence({"pre_reveal_stimulus": stimulus})
+
+    device.device_interface.pulse_digital_output.assert_called_once_with(output, 1000)
+    kind, data, context, target, _perf_time, _wall_time = operations[0]
+    assert kind is SystemCommandKind.PULSE_DIGITAL_OUTPUT
+    # The (output, duration) a direct HardwareModel.pulse_stim records, so
+    # the session's device events name the line that was actually pulsed.
+    assert data == (int(output.value), 1000)
+    assert context == "pellet-cycle"
+    assert target is Target.PELLET_DEVICE
+
+
+@pytest.mark.parametrize("stim_line", [0, 1, 4])
+def test_pre_reveal_refuses_a_line_that_cannot_carry_a_stimulus(stim_line):
+    operations = []
+    device = _pre_reveal_device(operations)
+
+    with pytest.raises(
+        ValueError,
+        match=f"Board STIM{stim_line} cannot carry a stimulus pulse; "
+              "use board STIM2 or STIM3",
+    ):
+        device._start_send_pellet_sequence({
+            "pre_reveal_stimulus": (200, 1000, stim_line),
+        })
+
+    device.device_interface.pulse_digital_output.assert_not_called()
+    assert operations == []
+
+
+def test_pre_reveal_refusals_name_the_line_they_would_pulse():
+    device = _pre_reveal_device([])
+
+    with pytest.raises(ValueError, match="STIM2 pulse duration must be within"):
+        device._start_send_pellet_sequence({
+            "pre_reveal_stimulus": (200, 99, 2),
+        })
+    with pytest.raises(
+        ValueError, match="STIM2 pulse duration must be shorter than the pre-reveal delay",
+    ):
+        device._start_send_pellet_sequence({
+            "pre_reveal_stimulus": (1, 1000, 2),
         })
 
 
@@ -612,6 +686,33 @@ def test_move_relative(
     # tokens_acked.clear()
     assert math.isclose(dev_positions[Motor.PELLET_X_MOTOR], -5, abs_tol=0.1)  # -5
     assert math.isclose(dev_positions[Motor.PELLET_Y_MOTOR], 5, abs_tol=0.1)  # -15 + 20 == 5
+
+
+def test_emulated_laser_2_pre_reveal_send_pulses_board_stim2_and_completes(
+    expected_tok,
+    expected_tok_event,
+    tokens_acked,
+    device,
+    device_conn,
+):
+    # The whole SEND through the command queue: STIM2 pulse, board delay,
+    # reveal, then the configured send, acknowledged as one command.
+    interface = device.device_interface
+    interface.pulse_digital_output = mock.Mock(wraps=interface.pulse_digital_output)
+    ctx = uuid.uuid4()
+    expected_tok.value = ctx
+
+    device.notify_message(
+        SystemCommandKind.SEND_PELLET,
+        {"pre_reveal_stimulus": (200, 1000, 2)},
+        context=ctx,
+    )
+    expected_tok_event.wait(3)
+
+    assert ctx in tokens_acked
+    interface.pulse_digital_output.assert_called_once_with(
+        DigitalOutputs.STIMULUS_3, 1000,
+    )
 
 
 def test_can_connect_twice(device, caplog):

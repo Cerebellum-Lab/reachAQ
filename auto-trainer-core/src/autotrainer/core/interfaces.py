@@ -160,8 +160,10 @@ class PelletHardwareProtocol(Protocol):
         ``embedded_tone`` optionally requests a frequency/duration pair inside
         the same board-owned compound sequence.
 
-        ``pre_reveal_stimulus`` optionally requests a finite STIM3 pulse and
-        board-owned delay before pellet reveal in that sequence.
+        ``pre_reveal_stimulus`` optionally requests a finite pulse and
+        board-owned delay before pellet reveal in that sequence, as
+        ``(delay_ms, pulse_us, board STIM line)``: the trial laser's own line,
+        STIM2 or STIM3. Two elements, without the line, mean STIM3.
 
         :return: A token to expect from the device message handler when the request is complete.
         """
