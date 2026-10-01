@@ -567,8 +567,8 @@ identity and are not duplicated into per-sample event records.
 `laser.csv` is in time order, and each row names the NI-DAQ sample its host
 time landed within (`nidaq_sample_index`). A Run Pulse fired while a session
 records is kept there as a marked manual event: a `requested` row and a
-`completed`, `failed` or `refused` row under one `manual-` operation id, with
-its profile, laser, amplitude, trigger mode and route.
+`completed`, `failed`, `cancelled` or `refused` row under one `manual-`
+operation id, with its profile, laser, amplitude, trigger mode and route.
 
 See [Session recording, synchronization, and hardware isolation](../../docs/acquisition/session-recording-and-synchronization.md)
 for the complete state, persistence, timing, metadata, failure, and verification
