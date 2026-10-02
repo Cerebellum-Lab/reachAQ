@@ -2,7 +2,7 @@
 
 Nothing here touches a driver or a board. The fake records what is done to
 each task and every write that happens, with the thread that made it. It
-refuses a channel another started task reserves, as DAQmx does at -50103, and
+refuses a channel another started or committed task reserves (-50103), and
 a timed analog output buffer of an odd number of samples, as the PXI-6713
 does at -200692, whether it is a list or a numpy array, and an analog output
 write laid out as nidaqmx 1.6.0 refuses one: -200524 for another number of
@@ -291,7 +291,14 @@ class FakeTask:
         if mode == "commit":
             if self.daq.failing_commit and self.label.endswith(self.daq.failing_commit):
                 raise RuntimeError(f"DAQmx refused to commit {self.label}")
-            # Programmed on the board, and started later; nothing else here.
+            # Programmed on the board, and started later. A commit reserves
+            # the task's channels first (NI's task state model: verified,
+            # reserved, committed): another task's write to one is refused
+            # from here on, not only from the start. A stop releases them
+            # here; DAQmx returns a task committed before its start to
+            # committed, still reserved, until it is aborted or cleared. The
+            # pulse's cleanup stops and then closes, so the two end the same.
+            self._reserve()
             self.daq.log.append(("commit", self.label))
             return
         if self.daq.failing_abort and self.label.endswith(self.daq.failing_abort):

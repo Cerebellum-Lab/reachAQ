@@ -1357,3 +1357,164 @@ def test_a_close_after_no_critical_says_nothing_of_a_reset(held, caplog):
         controller.close()
 
     assert _critical(caplog) == [] and _reset_after_all(caplog) == []
+
+
+# ------------------------------------------------ latency D2.2: the deferred arm
+
+
+def test_the_fake_reserves_a_committed_output_as_daqmx_does():
+    # A guard on the stand-in: DAQmx reserves a task's channels as it commits
+    # it (NI's task state model: verified, reserved, committed), so another
+    # task's write to one of them is refused (-50103) from the commit on. The
+    # fake reserved them only at the start, and could not show a deferred
+    # output holding its channel from its arm.
+    daq = FakeDaqmx()
+    task = daq.Task("laser_sync_pulse_ao")
+    task.ao_channels.add_ao_voltage_chan("PXI1Slot4/ao0")
+    manual = daq.Task("laser_1_manual_ao")
+    manual.ao_channels.add_ao_voltage_chan("PXI1Slot4/ao0")
+
+    task.control(daq.constants.TaskMode.TASK_COMMIT)
+
+    with pytest.raises(RuntimeError, match="-50103"):
+        manual.write(0.0, auto_start=True)
+    task.close()
+    manual.write(0.0, auto_start=True)
+    assert daq.reserved == {}
+
+
+def test_a_deferred_output_is_committed_before_it_is_armed(held):
+    # Committed only when it had lines to start first, and christielab10's
+    # deferred pulses have none: their start() committed inside itself, on
+    # the trigger's path. M3's pre-armed start, 0.58 ms p50, was a committed
+    # task's (christielab10, 2026-10-02); an uncommitted one was not measured.
+    daq = held
+    controller = NidaqLaserController(_routed())
+    at_commit = []
+
+    def note_the_state(task):
+        operation, = controller._live_operations.values()
+        at_commit.append((task.label, operation.state))
+
+    daq.before_control = note_the_state
+    operation = _armed(controller, defer_start=True)
+    daq.before_control = None
+
+    assert operation.state is LaserOperationState.ARMED
+    assert at_commit == [("laser_sync_pulse_ao", LaserOperationState.PREPARED)]
+    assert ("commit", "laser_sync_pulse_ao") in daq.log
+    assert not [task.label for task in daq.tasks if task.label.endswith("_do")]
+    # The board's output is held from the arm (the fake reserves at commit).
+    assert daq.reserved["PXI1Slot4/ao0"] is daq.task("laser_sync_pulse_ao")
+    assert daq.starts == []
+
+    operation.trigger()
+    daq.waits_released.set()
+
+    assert operation.wait(5.0) is LaserOperationState.COMPLETED
+    assert daq.log.index(("commit", "laser_sync_pulse_ao")) < daq.log.index(
+        ("start", "laser_sync_pulse_ao"))
+
+
+def test_the_start_wait_is_its_own_bound(held):
+    # The wait for trigger() was bounded by the output's timeout, which also
+    # bounds its wait to end: the waveform's length + 5 s by default. An arm
+    # that must not stay armed long, as Run Pulse's on a press, needs its own.
+    daq = held
+    controller = NidaqLaserController(_routed())
+    started = time.monotonic()
+    operation = _armed(controller, defer_start=True, start_wait_seconds=0.05)
+
+    assert operation.wait_until_finished(1.0)
+    assert time.monotonic() - started < 1.0
+    assert operation.state is LaserOperationState.FAILED
+    assert isinstance(operation.error, TimeoutError)
+    assert daq.starts == []
+
+    # None keeps the timeout's bound, 30 s here.
+    operation = _armed(controller, defer_start=True)
+    assert not operation.wait_until_finished(0.3)
+    assert operation.state is LaserOperationState.ARMED
+    assert operation.cancel()
+    assert operation.wait(1.0) is LaserOperationState.CANCELLED
+
+
+def _left_open(**fields):
+    """Laser 1's pulse, leaving its shutter open, as "Close shutter" unticked."""
+    return LaserSynchronizedPulseTrain(
+        pulse_trains=(dataclasses.replace(PULSE, close_shutter=False),),
+        wait=False, **fields)
+
+
+@pytest.mark.parametrize("ended", ["start_wait_over", "start_refused", "armed_start_refused"])
+def test_an_arm_that_never_started_closes_the_shutter_it_opened(held, ended):
+    # Its cleanup closed the shutter only for a pulse that closes it, as a
+    # delivered pulse does: an arm left unfired, or refused at its start, with
+    # "Close shutter" unticked left the shutter open with nothing delivered.
+    # A cancel already closed it, whatever close_shutter says.
+    daq = held
+    controller = NidaqLaserController(_routed())
+    shutter = daq.task("laser_1_shutter")
+    before = len(daq.writes)
+    if ended == "start_wait_over":
+        operation = controller.run_synchronized_pulse_train(
+            _left_open(defer_start=True, timeout_seconds=0.2))
+        assert operation.wait_until_finished(5.0)
+        assert isinstance(operation.error, TimeoutError)
+    elif ended == "start_refused":
+        daq.failing_task = "laser_sync_pulse_ao"
+        operation = controller.run_synchronized_pulse_train(
+            _left_open(defer_start=True, timeout_seconds=30.0))
+        operation.trigger()
+        assert operation.wait_until_finished(5.0)
+        assert "refused to start" in str(operation.error)
+    else:
+        # Armed on the board STIM, as a trial's pulse is: its start is its arm.
+        daq.failing_task = "laser_sync_pulse_ao"
+        with pytest.raises(RuntimeError, match="refused to start"):
+            controller.run_synchronized_pulse_train(_left_open(
+                trigger_source="/PXI1Slot4/PXI_Trig0", timeout_seconds=30.0))
+        _wait_for(lambda: controller._live_operations == {})
+
+    assert True in shutter.writes
+    assert shutter.writes[-1] is False
+    assert daq.writes_to("PXI1Slot4/ao0", task_suffix="manual_ao", since=before) == [0.0]
+    assert daq.reserved == {}
+    assert controller._live_operations == {}
+    if ended != "armed_start_refused":
+        assert operation.state is LaserOperationState.FAILED
+        assert daq.writes_to("PXI1Slot5/port0/line4", thread=operation._thread,
+                             since=before) == [True, False]
+
+
+def test_a_pulse_refused_before_it_opened_the_shutter_leaves_it_alone(held):
+    # Only the shutters the pulse opened: one an operator opened by hand,
+    # before a pulse refused at its commit, is left as it was, as before.
+    daq = held
+    controller = NidaqLaserController(_routed())
+    controller.set_shutter_open(LaserChannelId.LASER_1, True)
+    shutter = daq.task("laser_1_shutter")
+    opened_by_hand = len(shutter.writes)
+    daq.failing_commit = "laser_sync_pulse_ao"
+
+    with pytest.raises(RuntimeError, match="refused to commit"):
+        controller.run_synchronized_pulse_train(
+            _left_open(defer_start=True, timeout_seconds=30.0))
+    _wait_for(lambda: controller._live_operations == {})
+
+    assert shutter.writes[opened_by_hand:] == []
+    assert daq.writes_to("PXI1Slot4/ao0", task_suffix="manual_ao")[-1] == 0.0
+
+
+def test_a_delivered_pulse_still_leaves_its_shutter_as_it_asked(held):
+    # Unchanged: a pulse that ran, "Close shutter" unticked, leaves it open.
+    daq = held
+    controller = NidaqLaserController(_routed())
+    operation = controller.run_synchronized_pulse_train(
+        _left_open(defer_start=True, timeout_seconds=30.0))
+
+    operation.trigger()
+    daq.waits_released.set()
+
+    assert operation.wait(5.0) is LaserOperationState.COMPLETED
+    assert daq.task("laser_1_shutter").writes[-1] is True

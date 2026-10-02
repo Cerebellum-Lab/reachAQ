@@ -977,6 +977,11 @@ class NidaqLaserController:
         timeout_seconds = pulse_train.timeout_seconds
         if timeout_seconds is None:
             timeout_seconds = total_samples / sample_rate_hz + 5.0
+        # How long an armed output waits for its start: its own bound when it
+        # has one, else the one its wait to end has, as before.
+        start_wait_seconds = (
+            timeout_seconds if pulse_train.start_wait_seconds is None
+            else pulse_train.start_wait_seconds)
         ao_name = "laser_sync_pulse_ao"
         ao_task = self._create_synchronized_analog_output_task(channels, ao_name)
         digital_tasks = []
@@ -986,6 +991,9 @@ class NidaqLaserController:
         # name, which it releases when it ends, as the calibration ramp does.
         added_routes: List[Tuple[str, str]] = []
         run_error = None
+        # Set as the pulse goes to open its shutters: from then on, one whose
+        # output never started closes them in its cleanup.
+        shutters_opened = False
         try:
             operation._set_timing_status(timing_status)
             ao_task.timing.cfg_samp_clk_timing(
@@ -1081,10 +1089,17 @@ class NidaqLaserController:
                             pulse_train.trigger_edge,
                         )
                     )
-            if digital_tasks:
+            if digital_tasks or pulse_train.defer_start:
                 # Programmed before the lines start, so that whatever the AO
                 # clock does while the board is programmed happens before a
-                # line takes it: then the lines, then the AO.
+                # line takes it: then the lines, then the AO. A deferred
+                # output is committed at its arm with or without lines, so
+                # that its start is all the trigger has left to do: with none,
+                # as on christielab10, its start() committed it itself. M3's
+                # pre-armed start, 0.58 ms p50, was a committed task's
+                # (christielab10, 2026-10-02); an uncommitted one was not
+                # measured. The commit reserves the output from the arm: a
+                # command write to it is refused (-50103) while it is armed.
                 ao_task.control(self._nidaqmx.constants.TaskMode.TASK_COMMIT)
 
             def open_shutters():
@@ -1103,13 +1118,14 @@ class NidaqLaserController:
                                 "Failed to close the laser %s shutter a cancel "
                                 "found opening", channel.channel_id.value)
 
+            shutters_opened = True
             operation._open_shutters_unless_cancelled(open_shutters, close_shutters)
             operation._bind_tasks(zip(
                 (ao_name, *digital_names), (ao_task, *digital_tasks)))
             operation._require_not_cancelled()
             if pulse_train.defer_start:
                 operation._mark_armed()
-                if not operation._start_requested.wait(timeout_seconds):
+                if not operation._start_requested.wait(start_wait_seconds):
                     raise TimeoutError("Deferred laser operation did not receive a start request")
                 operation._require_not_cancelled()
             for task in (*digital_tasks, ao_task):
@@ -1145,6 +1161,15 @@ class NidaqLaserController:
                 close_pmt=pmt_enabled,
                 run_error=run_error,
                 routes=added_routes,
+                # An arm left unfired, or refused at its start, delivered
+                # nothing: the shutters it opened are closed, whatever "Close
+                # shutter" says. A cancel closes them itself, before its abort
+                # (_close_pulse_shutters), and again after an opening it met
+                # (_open_shutters_unless_cancelled).
+                close_opened_shutters=(
+                    shutters_opened
+                    and not operation._is_started(ao_task)
+                    and operation.state is not LaserOperationState.CANCELLED),
             )
 
     def _resolve_pulse_timing(self, channels, pulse_train):
@@ -1469,6 +1494,7 @@ class NidaqLaserController:
         close_pmt: bool,
         run_error: Optional[BaseException],
         routes: Sequence[Tuple[str, str]] = (),
+        close_opened_shutters: bool = False,
     ) -> None:
         errors = []
         self._stop_and_close_task("pulse analog output task", ao_task, errors)
@@ -1489,7 +1515,8 @@ class NidaqLaserController:
                     channel, "its pulse train",
                     f"the pulse's amplitude, {channel_pulse.amplitude_volts:g} V")
         for channel, channel_pulse in zip(channels, channel_pulses):
-            if channel_pulse.close_shutter:
+            if channel_pulse.close_shutter or (
+                    close_opened_shutters and channel_pulse.open_shutter):
                 try:
                     self._close_shutter(channel)
                 except Exception as exc:
