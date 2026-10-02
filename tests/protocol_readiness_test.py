@@ -321,6 +321,22 @@ def test_a_laser_opened_on_an_earlier_plan_than_the_streams_is_an_error():
     assert trial is None and "opened on an earlier NI timing plan" in message
 
 
+def test_a_stream_plan_that_differs_only_where_the_laser_does_not_read_is_no_error():
+    # The monitor sets its plan twice in one start, as built and again after
+    # the multidevice probe, and the stream restarts after every recording:
+    # its bookkeeping can differ from what the laser opened with while the
+    # clock and terminals the laser uses do not.
+    again = dataclasses.replace(
+        PLAN, multidevice_probe_status=f"{PLAN.multidevice_probe_status}, again",
+        reason=f"{PLAN.reason} (built again)", task_graph=None)
+    assert again != PLAN
+
+    findings = _check(_laser_row(3), _laser_row(6, channel=2),
+                      live=dataclasses.replace(READY, timing_plan=again))
+
+    assert _errors(findings) == []
+
+
 def test_a_laser_without_hardware_timing_cannot_take_a_board_trigger():
     # With hardwareTimed off the controller is given no timing plan, and a
     # board STIM pulse needs it.
@@ -356,7 +372,7 @@ def test_a_disabled_row_before_enabled_ones_stops_the_session_there():
     assert trial == 4
     assert "disabled" in message
     assert "4 enabled trials after it" in message and "from trial 5" in message
-    assert "enable trial 4, or move or delete it" in message
+    assert "enable trial 4, or disable the trials after it" in message
 
 
 def test_each_disabled_row_with_enabled_rows_after_it_is_named():

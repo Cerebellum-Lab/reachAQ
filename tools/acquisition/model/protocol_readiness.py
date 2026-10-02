@@ -37,6 +37,27 @@ STIM_CAMERA_REQUIRED = "Selected protocol requires the enabled stimCam"
 #: Record's tooltip names this many protocol errors, then how many more.
 MAX_BLOCKER_LINES = 5
 
+#: What a laser controller reads of the timing plan it was opened with:
+#: NidaqLaserController._resolve_pulse_timing (nidaq_laser.py:1125-1167), its
+#: backplane-line check against the stream's exports (2048-2049), the rate its
+#: synchronized pulses are built at (2374), and apply_reference_clock on its
+#: tasks (nidaq_laser.py:1209, nidaq_reference_clock.py:84-91). The rest is the
+#: stream's own bookkeeping, which can differ between two plans built for the
+#: same configuration: the monitor sets its plan once as built and again
+#: after the multidevice probe, and restarts the stream after every
+#: recording. Compared whole, such a plan would hold Record back for nothing.
+LASER_TIMING_PLAN_FIELDS = (
+    "is_valid",
+    "sample_clock_source",
+    "sample_clock_rate_hz",
+    "sample_clock_export_terminal",
+    "start_trigger_source",
+    "start_trigger_export_terminal",
+    "reference_clock_source",
+    "reference_clock_rate_hz",
+    "hardware_output_devices",
+)
+
 
 @dataclasses.dataclass(frozen=True)
 class ReadinessFinding:
@@ -212,10 +233,15 @@ def board_trigger_timing_refusal(
                 "topology")
     if not plan.sample_clock_source:
         return "Resolved timing topology has no shared sample clock"
-    if plan != live.timing_plan:
+    if _as_the_laser_reads_it(plan) != _as_the_laser_reads_it(live.timing_plan):
         return ("the laser was opened on an earlier NI timing plan than the "
                 "stream runs now" + reopen)
     return ""
+
+
+def _as_the_laser_reads_it(plan):
+    return None if plan is None else tuple(
+        getattr(plan, field, None) for field in LASER_TIMING_PLAN_FIELDS)
 
 
 def _rows_of(document):
@@ -267,8 +293,8 @@ def _disabled_row_errors(future) -> List[ReadinessFinding]:
                 "disabled, and a session stops here: trials run in order and a "
                 f"disabled one is refused, so the {enabled_after} enabled "
                 f"trial{'' if enabled_after == 1 else 's'} after it (from trial "
-                f"{first_after}) never run; enable trial {row.trial_id}, or move "
-                "or delete it")))
+                f"{first_after}) never run; enable trial {row.trial_id}, or disable "
+                "the trials after it")))
     return findings[::-1]
 
 
