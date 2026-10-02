@@ -857,7 +857,7 @@ def test_a_release_with_detach_keeps_the_loops_wait_between_attach_and_move():
 
     assert times["attach_sent"] - times["queued"] < 0.03
     # The attach takes no uuid, so the loop's 50 ms stays between it and the
-    # move: no frame-to-frame interval on the bus changes.
+    # move: the attach -> move interval does not change.
     assert times["release_sent"] - times["attach_sent"] >= 0.04
 
 

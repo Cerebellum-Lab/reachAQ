@@ -3,12 +3,15 @@
 python-can logs every frame it receives (level 9 on "can.bus") and every frame
 it sends (the socketcan "tx" logger, at DEBUG). On christielab10 that was about
 270 records a second, each formatted and pickled into the log queue on the CAN
-reader thread. The application's own CAN lines (the autotrainer.* loggers, such
-as "CAN reader throughput") and the kernel receive stamps in device.csv are not
-affected.
+reader thread. Holding the "can" logger at WARNING also quiets python-can's few
+open and close INFO/DEBUG lines; its warnings still pass. The application's own
+CAN lines (the autotrainer.* loggers, such as "CAN reader throughput") and the
+kernel receive stamps in device.csv are not affected.
 
 Set REACHAQ_CAN_FRAME_LOG=1 and restart to get the per-frame lines back for a
-diagnostic run.
+diagnostic run. Only the app entry points (reachaq, auto-trainer-local and
+auto-trainer-headless) call this; can_console.py and the pellet-delivery tool
+still log every frame.
 
 Import-light on purpose: the entry points call this before setup_logging(),
 and it must not pull in autotrainer.
