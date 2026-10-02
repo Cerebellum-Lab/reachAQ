@@ -467,12 +467,14 @@ def _warnings(firing_rows, configuration, laser_profiles, live) -> List[Readines
         readback = channel.trigger_monitor_input
         if not readback:
             # A custom NI-DAQ channel may record the edge all the same, as
-            # christielab10's laser1_trigger_readback on ai9 does; nothing
-            # ties it to the laser.
+            # christielab10's laser1_trigger_readback on port0/line6 does;
+            # nothing ties it to the laser, so the warning must not say the
+            # edge goes unrecorded.
             messages.append(
                 f"laser {number} has no trigger readback input (triggerMonitorInput), "
                 "so the recording does not tie the board trigger that starts it to "
-                "the laser: no Board trigger graph, and no readback named for it")
+                "the laser and the Board trigger graph does not show it; a stream "
+                "channel may still record that line under its own name")
         elif readback not in acquired:
             messages.append(
                 f"laser {number}'s trigger readback {readback} is not in the NI-DAQ "
