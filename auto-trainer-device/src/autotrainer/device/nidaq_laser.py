@@ -10,6 +10,8 @@ import uuid
 import warnings
 from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
+import numpy
+
 from autotrainer.core import NidaqTimingPlan
 from autotrainer.core.logging import log_hardware_initialization
 
@@ -897,7 +899,7 @@ class NidaqLaserController:
         )
         sample_rate_hz = self._require_sample_rate(timing_kwargs)
         waveforms = [
-            self._build_pulse_train_waveform(channel, channel_pulse, sample_rate_hz)
+            _pulse_train_samples(channel, channel_pulse, sample_rate_hz)
             for channel, channel_pulse in zip(channels, pulse_train.pulse_trains)
         ]
         pmt_enabled = pulse_train.enable_pmt_shutter or any(
@@ -914,21 +916,38 @@ class NidaqLaserController:
         pre_samples = _samples_from_ms(pmt_open_delay_ms, sample_rate_hz)
         post_samples = _samples_from_ms(pmt_close_delay_ms, sample_rate_hz)
         max_waveform_samples = max(len(waveform) for waveform in waveforms)
-        # Each waveform is even (_build_pulse_train_waveform), but the PMT
+        # Each waveform is even (_pulse_train_samples), but the PMT
         # margins together may be odd, which the 6713 refuses (-200692 at
         # 105,741 samples, christielab10, 2026-10-01): one more sample at
         # each channel's minimum after them.
         parity_samples = (pre_samples + max_waveform_samples + post_samples) % 2
-        timed_waveforms = []
-        for channel, waveform in zip(channels, waveforms):
-            minimum = channel.minimum_command_volts
-            timed_waveforms.append(
-                [minimum] * pre_samples
-                + waveform
-                + [minimum] * (
-                    max_waveform_samples - len(waveform) + post_samples + parity_samples)
-            )
-        total_samples = len(timed_waveforms[0])
+        total_samples = pre_samples + max_waveform_samples + post_samples + parity_samples
+        # One buffer, (channels, samples) as nidaqmx lays a write out, filled
+        # once: each row is its channel's minimum, with its waveform copied in
+        # after the PMT lead. Built as lists, padded by list concatenation and
+        # converted by nidaqmx's own numpy.asarray, the same samples took 4.1
+        # ms at 105,742 samples and 19.5 ms at 490,502, on the Run Pulse
+        # click's path; the array is built in 0.07 and 0.19 ms (host
+        # benchmark, one core of christielab10).
+        timed_waveforms = numpy.empty((len(channels), total_samples), dtype=numpy.float64)
+        for row, channel, waveform in zip(timed_waveforms, channels, waveforms):
+            row[:] = channel.minimum_command_volts
+            row[pre_samples:pre_samples + len(waveform)] = waveform
+        # Refused before any task exists: a sample outside its own laser's
+        # range is never written, whatever put it there. A NaN fails both
+        # comparisons. The amplitude is refused already, before the operation
+        # is made (run_synchronized_pulse_train), so this guards the layout
+        # itself, the waveforms and the margins around them.
+        for channel, row in zip(channels, timed_waveforms):
+            lowest, highest = float(row.min()), float(row.max())
+            if not (channel.minimum_command_volts <= lowest
+                    and highest <= channel.maximum_command_volts):
+                outside = lowest if lowest < channel.minimum_command_volts else highest
+                raise LaserPulseRefused(
+                    f"laser channel {channel.channel_id.value} pulse buffer sample "
+                    f"{outside} V is outside the configured range "
+                    f"{channel.minimum_command_volts}..{channel.maximum_command_volts} V"
+                )
         timeout_seconds = pulse_train.timeout_seconds
         if timeout_seconds is None:
             timeout_seconds = total_samples / sample_rate_hz + 5.0
@@ -955,6 +974,8 @@ class NidaqLaserController:
                     pulse_train.trigger_source,
                     trigger_edge=self._get_trigger_edge(pulse_train.trigger_edge),
                 )
+            # One laser writes its row, one-dimensional; two write the
+            # (channels, samples) array, which is how nidaqmx reads a write.
             ao_task.write(timed_waveforms[0] if len(timed_waveforms) == 1 else timed_waveforms, auto_start=False)
             sample_clock_source = self._analog_output_sample_clock_source(channels[0].analog_output)
 
@@ -2238,49 +2259,16 @@ class NidaqLaserController:
         pulse_train: LaserPulseTrain,
         sample_rate_hz: Optional[float] = None,
     ) -> list:
+        # The samples as a list. The pulse path builds them with
+        # _pulse_train_samples as an array and does not call this; it stays
+        # for callers that want the list and, with its tests, as the
+        # specification of the rules.
         # Taken from the caller when it knows better. Fetching it here made
         # the caller's choice moot: it resolved the shared clock's rate, and
         # the waveform was still laid out for the configured one.
         if sample_rate_hz is None:
             sample_rate_hz = self._require_sample_rate()
-        baseline_samples = _samples_from_ms(pulse_train.baseline_ms, sample_rate_hz)
-        high_samples = max(1, _samples_from_ms(pulse_train.duration_ms, sample_rate_hz))
-        post_stim_samples = _samples_from_ms(pulse_train.post_stim_ms, sample_rate_hz)
-        minimum = channel.minimum_command_volts
-        amplitude = pulse_train.amplitude_volts
-        waveform = [minimum] * baseline_samples
-        if pulse_train.pulse_count == 1:
-            waveform.extend([amplitude] * high_samples)
-        else:
-            period_samples = max(1, int(round(sample_rate_hz / pulse_train.frequency_hz)))
-            if high_samples > period_samples:
-                raise ValueError(
-                    f"laser pulse duration {pulse_train.duration_ms} ms exceeds pulse period "
-                    f"at {pulse_train.frequency_hz} Hz"
-                )
-            low_samples = period_samples - high_samples
-            for pulse_index in range(pulse_train.pulse_count):
-                waveform.extend([amplitude] * high_samples)
-                if pulse_index < pulse_train.pulse_count - 1:
-                    waveform.extend([minimum] * low_samples)
-        waveform.extend([minimum] * post_stim_samples)
-        if not waveform:
-            raise ValueError("laser pulse train waveform is empty")
-        if waveform[-1] != minimum:
-            # Ended on the amplitude, with no post-stim: after a finite
-            # generation the 6713 holds its last sample, so the last pulse
-            # ran on until the cleanup's reset. 23 ms pulses measured
-            # 28.45-35.0 ms, 5 ms ones 12.0-12.4 ms (christielab10,
-            # 2026-10-01). One sample at the minimum ends it on time.
-            waveform.append(minimum)
-        if len(waveform) % 2:
-            # The 6713 refuses a buffer whose samples per channel times
-            # channels is odd: B2's 105,740 samples plus the one above,
-            # 105,741, were refused with -200692 (christielab10,
-            # 2026-10-01). Even per
-            # channel, it is even for any number of channels.
-            waveform.append(minimum)
-        return waveform
+        return _pulse_train_samples(channel, pulse_train, sample_rate_hz).tolist()
 
     def _build_digital_pulse_waveform(
         self,
@@ -2396,6 +2384,65 @@ def _samples_from_ms(value_ms: float, sample_rate_hz: float) -> int:
     if value_ms <= 0:
         return 0
     return max(1, int(round(value_ms * sample_rate_hz / 1000.0)))
+
+
+def _pulse_train_samples(
+    channel: LaserChannelConfiguration,
+    pulse_train: LaserPulseTrain,
+    sample_rate_hz: float,
+) -> numpy.ndarray:
+    """One channel's pulse train as float64 samples, laid out once.
+
+    The samples the list builder gave, in one array: the baseline, the pulses
+    one period apart, the post-stim, then what the 6713 needs after them. The
+    count is at least one (LaserPulseTrain), and the array is filled with the
+    channel's minimum and the pulses written over it, where a list was
+    extended piece by piece and then converted by nidaqmx.
+    """
+    baseline_samples = _samples_from_ms(pulse_train.baseline_ms, sample_rate_hz)
+    high_samples = max(1, _samples_from_ms(pulse_train.duration_ms, sample_rate_hz))
+    post_stim_samples = _samples_from_ms(pulse_train.post_stim_ms, sample_rate_hz)
+    minimum = channel.minimum_command_volts
+    amplitude = pulse_train.amplitude_volts
+    pulse_count = pulse_train.pulse_count
+    # Pulses start one period apart: the last is followed by no low samples,
+    # and a single pulse has no period.
+    period_samples = high_samples
+    if pulse_count > 1:
+        period_samples = max(1, int(round(sample_rate_hz / pulse_train.frequency_hz)))
+        if high_samples > period_samples:
+            raise ValueError(
+                f"laser pulse duration {pulse_train.duration_ms} ms exceeds pulse period "
+                f"at {pulse_train.frequency_hz} Hz"
+            )
+    train_samples = (pulse_count - 1) * period_samples + high_samples
+    length = baseline_samples + train_samples + post_stim_samples
+    if length < 1:
+        raise ValueError("laser pulse train waveform is empty")
+    if post_stim_samples == 0 and amplitude != minimum:
+        # Ended on the amplitude, with no post-stim: after a finite
+        # generation the 6713 holds its last sample, so the last pulse
+        # ran on until the cleanup's reset. 23 ms pulses measured
+        # 28.45-35.0 ms, 5 ms ones 12.0-12.4 ms (christielab10,
+        # 2026-10-01). One sample at the minimum ends it on time.
+        length += 1
+    if length % 2:
+        # The 6713 refuses a buffer whose samples per channel times
+        # channels is odd: B2's 105,740 samples plus the one above,
+        # 105,741, were refused with -200692 (christielab10,
+        # 2026-10-01). Even per channel, it is even for any number of
+        # channels.
+        length += 1
+    samples = numpy.full(length, minimum, dtype=numpy.float64)
+    start = baseline_samples
+    if pulse_count > 1:
+        # Every pulse but the last at once: the high samples that open each
+        # of the first (count - 1) periods, which lie end to end.
+        periods = samples[start:start + (pulse_count - 1) * period_samples]
+        periods.reshape(pulse_count - 1, period_samples)[:, :high_samples] = amplitude
+        start += (pulse_count - 1) * period_samples
+    samples[start:start + high_samples] = amplitude
+    return samples
 
 
 def _mean(values) -> float:
