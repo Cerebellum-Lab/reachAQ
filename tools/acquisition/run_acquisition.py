@@ -69,7 +69,10 @@ def run_acquisition(
     args: AutoTrainerParsedArgs
 
     app = QApplication(sys.argv)
-    app.setStyle("Fusion")
+    # Fusion, with disabled controls made obvious (dashed outline, muted
+    # fill) and no change to any control's size.
+    from tools.acquisition.view.disabled_style import apply_disabled_style
+    apply_disabled_style(app)
 
     if not verify_configuration(args.configuration):
         return -1
