@@ -991,9 +991,12 @@ class NidaqLaserController:
         # name, which it releases when it ends, as the calibration ramp does.
         added_routes: List[Tuple[str, str]] = []
         run_error = None
-        # Set as the pulse goes to open its shutters: from then on, one whose
-        # output never started closes them in its cleanup.
+        # Set as the pulse goes to open its shutters: from then on, one that
+        # does not run to its end closes them in its cleanup.
         shutters_opened = False
+        # Set once the pulse has run to its end: only then are its shutters
+        # left as close_shutter says.
+        delivered = False
         try:
             operation._set_timing_status(timing_status)
             ao_task.timing.cfg_samp_clk_timing(
@@ -1147,6 +1150,7 @@ class NidaqLaserController:
             operation._mark_triggered()
             if not operation._mark_finishing():
                 raise RuntimeError("Laser operation was cancelled as it ended")
+            delivered = True
         except Exception as exc:
             run_error = exc
             raise
@@ -1161,14 +1165,15 @@ class NidaqLaserController:
                 close_pmt=pmt_enabled,
                 run_error=run_error,
                 routes=added_routes,
-                # An arm left unfired, or refused at its start, delivered
-                # nothing: the shutters it opened are closed, whatever "Close
-                # shutter" says. A cancel closes them itself, before its abort
-                # (_close_pulse_shutters), and again after an opening it met
-                # (_open_shutters_unless_cancelled).
+                # A pulse that did not run to its end closes the shutters it
+                # opened, whatever "Close shutter" says: an arm left unfired,
+                # one refused at its start, and one whose waits failed after it
+                # (Ben, 2026-10-02). A cancel closes them itself, before its
+                # abort (_close_pulse_shutters), and again after an opening it
+                # met (_open_shutters_unless_cancelled).
                 close_opened_shutters=(
                     shutters_opened
-                    and not operation._is_started(ao_task)
+                    and not delivered
                     and operation.state is not LaserOperationState.CANCELLED),
             )
 
