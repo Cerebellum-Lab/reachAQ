@@ -1456,6 +1456,25 @@ class CanDevice(Device):
             return motor, True
         return motor, meth(new_pos)
 
+    def _send_then_record(self, board: _BoardPendingContext, kind, data, send: Callable[[], bool]) -> bool:
+        """
+        Put a frame on the bus, then hand the operation to the recorder callback.
+
+        The callback runs the hardware model and the session recorder (a lock
+        and JSON), which takes milliseconds. Run before the send, it delayed the
+        frame by that much: on christielab10 the SEND stamp to the PULSE row
+        took 8.5-24.2 ms. The stamp the row carries is still taken before the
+        send. A send that is refused or raises is recorded too, once.
+        """
+        callback = self._operation_callback
+        if callback is None:
+            return send()
+        perf_time, wall_time = time.perf_counter(), time.time()
+        try:
+            return send()
+        finally:
+            callback(kind, data, board.ctx, board.target, perf_time, wall_time)
+
     def _perform_next_compound_step(self, board: _BoardPendingContext, compound_movements: List[Dict[str, Any]]) -> bool:
         """
         Issue the next step in a multi-step motor sequence.
@@ -1523,16 +1542,12 @@ class CanDevice(Device):
             freq, duration = step['tone'].split(',')  # noqa  # (hz), (sec)
             frequency_hz = int(freq)
             duration_ms = int(float(duration) * 1000)
-            if self._operation_callback is not None:
-                self._operation_callback(
-                    SystemCommandKind.PLAY_TONE,
-                    (frequency_hz, duration_ms),
-                    board.ctx,
-                    board.target,
-                    time.perf_counter(),
-                    time.time(),
-                )
-            success = self._interface.emit_tone(frequency_hz, duration_ms)
+            success = self._send_then_record(
+                board,
+                SystemCommandKind.PLAY_TONE,
+                (frequency_hz, duration_ms),
+                partial(self._interface.emit_tone, frequency_hz, duration_ms),
+            )
             if success:
                 board.skip_uuid_ack_perf_c = True
 
@@ -1543,18 +1558,14 @@ class CanDevice(Device):
             stim_line = 2 if 'stim2' in step else 3
             output = BOARD_STIM_LINE_OUTPUTS[stim_line]
             duration_us = int(step[f'stim{stim_line}'])
-            if self._operation_callback is not None:
-                # (output, duration) as HardwareModel.pulse_stim sends it, so
-                # the recorded event names the line actually pulsed.
-                self._operation_callback(
-                    SystemCommandKind.PULSE_DIGITAL_OUTPUT,
-                    (int(output.value), duration_us),
-                    board.ctx,
-                    board.target,
-                    time.perf_counter(),
-                    time.time(),
-                )
-            success = self._interface.pulse_digital_output(output, duration_us)
+            # (output, duration) as HardwareModel.pulse_stim sends it, so
+            # the recorded event names the line actually pulsed.
+            success = self._send_then_record(
+                board,
+                SystemCommandKind.PULSE_DIGITAL_OUTPUT,
+                (int(output.value), duration_us),
+                partial(self._interface.pulse_digital_output, output, duration_us),
+            )
 
         elif 'predefined' in step:
 

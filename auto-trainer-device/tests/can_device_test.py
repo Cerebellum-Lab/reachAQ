@@ -359,6 +359,98 @@ def test_compound_tone_reports_the_executed_play_tone_command():
     assert wall_time > 0
 
 
+# The recorder callback costs milliseconds (the hardware model, the session
+# recorder's lock, JSON), and christielab10 measured the board answering a STIM
+# frame in about 0.3 ms. A compound step must put the frame on the bus first
+# and record it after, with the stamp the row carries still taken before the
+# send. Each step is checked on one list shared by the send and the recorder.
+
+_SEND_THEN_RECORD_STEPS = {
+    "stim": ({"stim3": 1000}, "pulse_digital_output"),
+    "tone": ({"tone": "5000,0.3"}, "emit_tone"),
+}
+
+
+def _device_that_logs_sends_and_rows(events, method_name, send_result):
+    """An emulated device whose send and recorder append to ``events``.
+
+    A send is ("send", time.perf_counter() at its entry). A recorded row is
+    ("record", the perf_time stamp it carries). ``send_result`` is the value
+    the send returns, or an exception to raise.
+    """
+    def record(kind, data, context, target, perf_time, wall_time):
+        events.append(("record", perf_time))
+
+    device = CanDevice(
+        api=DeviceApi(message_callback=data_callback),
+        force_emulation=True,
+        required_targets=(Target.PELLET_DEVICE,),
+        operation_callback=record,
+    )
+
+    def send(*args, **kwargs):
+        events.append(("send", time.perf_counter()))
+        if isinstance(send_result, BaseException):
+            raise send_result
+        return send_result
+
+    setattr(device.device_interface, method_name, mock.Mock(side_effect=send))
+    board = device._boards_pending_ctx[Target.PELLET_DEVICE]
+    board.ctx = "pellet-cycle"
+    return device, board
+
+
+@pytest.mark.parametrize("step_name", sorted(_SEND_THEN_RECORD_STEPS))
+def test_a_compound_step_is_sent_before_it_is_recorded(step_name):
+    step, method_name = _SEND_THEN_RECORD_STEPS[step_name]
+    events = []
+    device, board = _device_that_logs_sends_and_rows(events, method_name, True)
+
+    assert device._perform_next_compound_step(board, [dict(step)])
+
+    assert [name for name, _ in events] == ["send", "record"]
+    (_, sent_at), (_, row_stamp) = events
+    # The row still carries the stamp taken before the frame, not one taken
+    # once the recorder ran.
+    assert row_stamp <= sent_at
+
+
+@pytest.mark.parametrize("step_name", sorted(_SEND_THEN_RECORD_STEPS))
+def test_a_refused_compound_send_is_still_recorded_once(step_name):
+    step, method_name = _SEND_THEN_RECORD_STEPS[step_name]
+    events = []
+    device, board = _device_that_logs_sends_and_rows(events, method_name, False)
+    steps = [dict(step)]
+
+    assert not device._perform_next_compound_step(board, steps)
+
+    assert sorted(name for name, _ in events) == ["record", "send"]
+    assert steps == [step]
+    assert board.skip_uuid_ack_perf_c is False
+
+
+@pytest.mark.parametrize("step_name", sorted(_SEND_THEN_RECORD_STEPS))
+def test_a_compound_send_that_raises_is_still_recorded_once(step_name):
+    step, method_name = _SEND_THEN_RECORD_STEPS[step_name]
+    events = []
+    device, board = _device_that_logs_sends_and_rows(
+        events, method_name, OSError("CAN adapter lost"))
+
+    with pytest.raises(OSError, match="CAN adapter lost"):
+        device._perform_next_compound_step(board, [dict(step)])
+
+    assert sorted(name for name, _ in events) == ["record", "send"]
+
+
+def test_a_sent_compound_tone_skips_the_next_ack_stamp():
+    events = []
+    device, board = _device_that_logs_sends_and_rows(events, "emit_tone", True)
+
+    assert device._perform_next_compound_step(board, [{"tone": "5000,0.3"}])
+
+    assert board.skip_uuid_ack_perf_c is True
+
+
 def test_command_queued_immediately_before_connect_survives_startup():
     token = "queued-before-connect"
     acknowledged = threading.Event()
