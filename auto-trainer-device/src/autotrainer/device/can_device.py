@@ -1460,15 +1460,31 @@ class CanDevice(Device):
         frame by that much: on christielab10 the SEND stamp to the PULSE row
         took 8.5-24.2 ms. The stamp the row carries is still taken before the
         send. A send that is refused or raises is recorded too, once.
+
+        If the send raised and the recording fails as well, the recording's
+        failure is logged and the send's exception is the one raised: the
+        caller must see the bus failure, not the recorder's. A recording that
+        fails after a send that returned still raises, as it always did.
         """
         callback = self._operation_callback
         if callback is None:
             return send()
         perf_time, wall_time = time.perf_counter(), time.time()
+        record = partial(callback, kind, data, board.ctx, board.target, perf_time, wall_time)
         try:
-            return send()
-        finally:
-            callback(kind, data, board.ctx, board.target, perf_time, wall_time)
+            result = send()
+        except BaseException as send_error:
+            try:
+                record()
+            except Exception:
+                logger.exception(
+                    "Recording %s failed after its send raised %r; raising the send's error."
+                    " data=%s ctx=%s target=%s",
+                    kind, send_error, data, board.ctx, board.target,
+                )
+            raise
+        record()
+        return result
 
     def _perform_compound_until_sent(self, board: _BoardPendingContext, steps: Optional[List[Dict]]):
         """
