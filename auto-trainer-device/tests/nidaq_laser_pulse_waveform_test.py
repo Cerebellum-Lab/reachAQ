@@ -676,7 +676,7 @@ def test_the_fake_counts_the_samples_of_a_numpy_array(daq):
     task.write(numpy.zeros(4))
     assert len(task.writes) == 1
     # Two channels of three samples are six, which it takes; three channels
-    # of three are nine, which it refuses, as it does the same as lists.
+    # of three are nine, which it refuses, lists and arrays alike.
     _timed_output(daq, ["PXI1Slot4/ao0", "PXI1Slot4/ao1"]).write(numpy.zeros((2, 3)))
     three = _timed_output(daq, ["PXI1Slot4/ao0", "PXI1Slot4/ao1", "PXI1Slot4/ao2"])
     with pytest.raises(FakeDaqError) as refused:
@@ -711,3 +711,57 @@ def test_the_fake_records_an_array_as_lists_and_keeps_what_was_passed(daq):
     one.write(listed)
     assert one.writes[-1] == listed
     assert one.write_types[-1] is listed
+
+
+# nidaqmx 1.6.0's Task.write (read on christielab10, task/_task.py) refuses an
+# analog output write by its layout before the board is reached. The fake
+# mirrors those rules, so that a layout the driver would refuse is not taken.
+
+
+def test_the_fake_refuses_data_of_the_wrong_shape_for_the_tasks_channels(daq):
+    # One channel takes a 1-D array, and several take (channels, samples), with
+    # as many rows as the task has channels: anything else is -200524. A (1, 6)
+    # array on one channel, a transposed (6, 2) one or a (3, 6) one on two
+    # channels, and lists laid out the same wrong ways, each raise it, and
+    # write nothing, before the odd-count rule is reached.
+    one = _timed_output(daq, ["PXI1Slot4/ao0"])
+    two = _timed_output(daq, ["PXI1Slot4/ao1", "PXI1Slot4/ao2"])
+    refused = [
+        (one, numpy.zeros((1, 6))),
+        (one, [[0.0] * 6]),
+        (two, numpy.zeros((6, 2))),
+        (two, numpy.zeros((3, 6))),
+        (two, numpy.zeros(6)),
+        (two, [[0.0] * 4] * 3),
+    ]
+    for task, data in refused:
+        with pytest.raises(FakeDaqError) as error:
+            task.write(data)
+        assert error.value.error_code == -200524, data
+    assert one.writes == two.writes == []
+    # The layouts it takes: a row for one channel, (channels, samples) for two.
+    one.write(numpy.zeros(6))
+    two.write(numpy.zeros((2, 6)))
+    two.write([[0.0] * 4] * 2)
+    assert len(one.writes) == 1 and len(two.writes) == 2
+
+
+def test_the_fake_refuses_an_array_that_is_not_c_contiguous(daq):
+    # The driver's ctypes argument takes a C-contiguous array only: a strided
+    # view or a transposed one raises TypeError. Each of these has an even
+    # number of samples and the right shape, so only the layout is wrong.
+    one = _timed_output(daq, ["PXI1Slot4/ao0"])
+    two = _timed_output(daq, ["PXI1Slot4/ao1", "PXI1Slot4/ao2"])
+    strided = [
+        (one, numpy.zeros(8)[::2]),
+        (two, numpy.zeros((2, 8))[:, ::2]),
+        (two, numpy.zeros((4, 2)).T),
+    ]
+    for task, data in strided:
+        assert data.shape[-1] == 4 and not data.flags["C_CONTIGUOUS"]
+        with pytest.raises(TypeError, match="C_CONTIGUOUS"):
+            task.write(data)
+    assert one.writes == two.writes == []
+    # A slice that is one piece is taken.
+    one.write(numpy.zeros(8)[:4])
+    assert len(one.writes) == 1

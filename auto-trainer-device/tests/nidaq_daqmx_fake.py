@@ -4,7 +4,9 @@ Nothing here touches a driver or a board. The fake records what is done to
 each task and every write that happens, with the thread that made it. It
 refuses a channel another started task reserves, as DAQmx does at -50103, and
 a timed analog output buffer of an odd number of samples, as the PXI-6713
-does at -200692, whether it is a list or a numpy array. It records the
+does at -200692, whether it is a list or a numpy array, and an analog output
+write laid out as nidaqmx 1.6.0 refuses one: -200524 for another number of
+channels, TypeError for an array that is not C-contiguous. It records the
 terminals routed, and each write's data as lists.
 
 It is shared by the controller's own tests and by the application's close-path
@@ -47,6 +49,43 @@ ABORT_WARNING_TEXT = (
 ODD_AO_WRITE_TEXT = (
     "Number of samples per channel to write multiplied by the number of "
     "channels in the task cannot be an odd number for this device.")
+
+#: DAQmx's description of -200524, WRITE_NUM_CHANS_MISMATCH, the code nidaqmx
+#: 1.6.0 raises for a write laid out for another number of channels. No test
+#: compares the text.
+CHANNEL_MISMATCH_TEXT = (
+    "Write cannot be performed, because the number of channels in the data "
+    "written does not match the number of channels in the task. When writing, "
+    "supply data for all channels in the task. Alternatively, modify the task "
+    "to contain only as many channels as are in the data written.")
+
+
+def _refuse_an_analog_write_by_its_layout(task, data):
+    """nidaqmx 1.6.0's refusals of an analog output write before the board's.
+
+    From its Task.write (task/_task.py), as the task 4-5 review read it on
+    christielab10:
+    - one channel takes a 1-D array, or a list of samples; several take
+      (channels, samples), a 2-D array or a list of lists, with as many rows
+      as the task has channels. Another layout is -200524;
+    - the array goes to the driver as a ctypes argument that takes only a
+      C-contiguous one: a strided view or a transposed array raises TypeError.
+    A scalar is not laid out, and is not refused.
+    """
+    channels = len(task.channels)
+    if isinstance(data, numpy.ndarray):
+        if data.ndim == 0:
+            return
+        wrong = data.ndim != 1 if channels == 1 else data.shape[0] != channels
+    elif isinstance(data, (list, tuple)) and data:
+        wrong = (isinstance(data[0], (list, tuple)) if channels == 1
+                 else len(data) != channels)
+    else:
+        return
+    if wrong:
+        raise FakeDaqError(-200524, CHANNEL_MISMATCH_TEXT)
+    if isinstance(data, numpy.ndarray) and not data.flags["C_CONTIGUOUS"]:
+        raise TypeError("array must have flags ['C_CONTIGUOUS']")
 
 
 def _sample_count(data):
@@ -161,6 +200,10 @@ class FakeTask:
         if self.daq.failing_write and self.label.endswith(self.daq.failing_write):
             # As DAQmx refuses an on-demand write to a line another task holds.
             raise FakeDaqError(-50103, f"The specified resource is reserved ({self.label})")
+        if self.ao_channels_added:
+            # Python's, before the board is reached: its layout is checked
+            # before its count.
+            _refuse_an_analog_write_by_its_layout(self, data)
         if self.ao_channels_added and self.timing_kwargs is not None and _sample_count(data) % 2:
             # As christielab10's PXI-6713 refused Run Pulse's 105,741-sample
             # buffer (2026-10-01): a timed analog output write of an odd
