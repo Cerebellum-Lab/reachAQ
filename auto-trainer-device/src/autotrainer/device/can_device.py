@@ -1078,7 +1078,14 @@ class CanDevice(Device):
         self._compound_movement = move_steps
         tgt = self._find_steps_next_board_target("sequence", move_steps)
         board = self._boards_pending_ctx[tgt]
-        return self._perform_next_compound_step(board, move_steps)
+        before_uuid = self._interface.uuid()
+        success = self._perform_next_compound_step(board, move_steps)
+        if success and self._can_carry_on_after_host_only_step(move_steps, before_uuid):
+            # The command loop never sees this first step, so without this it
+            # would wait its 50 ms before the next one, as after any other
+            # host-only step: a standalone COVER or RELEASE opens with one.
+            self._perform_compound_until_sent(board, move_steps)
+        return success
 
     def _start_send_pellet_sequence(self, data) -> bool:
         steps = self._send_pellet.steps
@@ -1501,15 +1508,23 @@ class CanDevice(Device):
                     break
             if not success:
                 raise RuntimeError("too many failure trying _perform_next_compound_step")
-            if (
-                not self._compound_step_host_only
-                or len(steps) == 0
-                or host_only_budget <= 0
-                or self._interface.uuid() != before_uuid
-                or self._want_exit.is_set()
-            ):
+            if host_only_budget <= 0 or not self._can_carry_on_after_host_only_step(steps, before_uuid):
                 return
             host_only_budget -= 1
+
+    def _can_carry_on_after_host_only_step(self, steps: List[Dict], before_uuid: int) -> bool:
+        """
+        Whether the step just run sent nothing, so the next one can follow at once.
+
+        It was host-only (see _perform_compound_until_sent) and took no uuid,
+        steps remain, and no shutdown was requested.
+        """
+        return (
+            self._compound_step_host_only
+            and len(steps) > 0
+            and self._interface.uuid() == before_uuid
+            and not self._want_exit.is_set()
+        )
 
     def _perform_next_compound_step(self, board: _BoardPendingContext, compound_movements: List[Dict[str, Any]]) -> bool:
         """

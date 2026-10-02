@@ -644,14 +644,21 @@ def test_a_shutdown_request_stops_the_pass_after_a_host_only_step():
         getattr(interface, name).assert_not_called()
 
 
-def test_a_pre_reveal_release_goes_out_without_the_loops_idle_wait():
-    """The release follows the board's ack of the delay by milliseconds, not 50 ms."""
-    token = "pre-reveal-send"
+def _times_through_the_handler(kind, data, *, detach=False):
+    """Run one command on a connected emulated device and time what it sends.
+
+    The command handler runs on its own thread, and a pump thread hands the
+    emulator's acks back as DeviceConnection's reader would. Returns the
+    perf_counter at "queued" (just before the command is queued), at each
+    servo command ("release_sent", "cover_sent", "attach_sent") and at
+    "delay_acked" (when the delay returns, which is when its ack is queued).
+    """
+    token = "handler-run"
     finished = threading.Event()
     times = {}
 
-    def callback(kind, data):
-        if kind == SystemStatusMessageKind.ACKNOWLEDGE and data[0] == token:
+    def callback(message_kind, message):
+        if message_kind == SystemStatusMessageKind.ACKNOWLEDGE and message[0] == token:
             finished.set()
 
     device = CanDevice(
@@ -661,23 +668,27 @@ def test_a_pre_reveal_release_goes_out_without_the_loops_idle_wait():
     )
     interface = device.device_interface
     interface.open()
-    real_delay, real_release = interface.delay, interface.release_pellet
+    device._motor_configs[Motor.PELLET_COVER_SERVO].detach = detach
 
-    def delay(duration):
-        result = real_delay(duration)  # waits the delay, then queues the board's ack
-        times["delay_acked"] = time.perf_counter()
-        return result
+    def stamped(name, method, *, after=False):
+        def call(*args):
+            if not after:
+                times[name] = time.perf_counter()
+            result = method(*args)
+            if after:
+                times[name] = time.perf_counter()
+            return result
+        return call
 
-    def release():
-        times["release_sent"] = time.perf_counter()
-        return real_release()
-
-    interface.delay, interface.release_pellet = delay, release
+    # The delay waits its time, then queues the board's ack.
+    interface.delay = stamped("delay_acked", interface.delay, after=True)
+    interface.release_pellet = stamped("release_sent", interface.release_pellet)
+    interface.cover_pellet = stamped("cover_sent", interface.cover_pellet)
+    interface.servo_attach = stamped("attach_sent", interface.servo_attach)
 
     stop = threading.Event()
 
     def deliver_acks():
-        # What DeviceConnection's reader does with the emulator's acks.
         while not stop.is_set():
             for message in interface.read(64):
                 if isinstance(message, Acknowledge):
@@ -688,21 +699,118 @@ def test_a_pre_reveal_release_goes_out_without_the_loops_idle_wait():
     reader.start()
     try:
         device.connect()
-        device.notify_message(
-            SystemCommandKind.SEND_PELLET,
-            {"pre_reveal_stimulus": (200, 1000, 3)},
-            context=token,
-        )
-        assert finished.wait(5), "the pre-reveal SEND never finished"
+        time.sleep(0.05)  # the handler thread is then waiting on its queue
+        times["queued"] = time.perf_counter()
+        device.notify_message(kind, data, context=token)
+        assert finished.wait(5), f"{kind} never finished"
     finally:
         stop.set()
         reader.join(1)
         device.disconnect()
         interface.close()
+    return times
+
+
+def test_a_pre_reveal_release_goes_out_without_the_loops_idle_wait():
+    """The release follows the board's ack of the delay by milliseconds, not 50 ms."""
+    times = _times_through_the_handler(
+        SystemCommandKind.SEND_PELLET, {"pre_reveal_stimulus": (200, 1000, 3)})
 
     # The loop's idle wait is 50 ms, so before this change the gap was at
     # least that. The bound is loose on purpose: it has to hold on a busy rig.
     assert times["release_sent"] - times["delay_acked"] < 0.03
+
+
+# _start_sequence runs a sequence's first step itself, before the command loop
+# sees it, so a sequence that opens with a host-only step (a standalone COVER or
+# RELEASE is one) waited the loop's 50 ms before its servo command. It follows
+# the same rule as _perform_compound_until_sent.
+
+@pytest.mark.parametrize("steps, sender, arguments", [
+    ([{"predefined": "cover"}], "cover_pellet", ()),
+    ([{"predefined": "release"}], "release_pellet", ()),
+    ([{"predefined": "retrieve"}, {"predefined": "send"}], "retrieve_pellet", ()),
+    ([{"predefined": "scoop"}, {"predefined": "send"}], "scoop_pellet", ()),
+    ([{"load_arm": 45.0}, {"predefined": "send"}],
+     "move_servo_motor", (Motor.PELLET_LOAD_SERVO, 45.0)),
+    ([{"barrier_arm": 45.0}, {"predefined": "send"}],
+     "move_servo_motor", (Motor.PELLET_COVER_SERVO, 45.0)),
+], ids=["cover", "release", "retrieve", "scoop", "load_arm", "barrier_arm"])
+def test_a_sequence_that_opens_with_a_host_only_step_sends_the_servo_command_at_once(
+    steps, sender, arguments,
+):
+    device, interface, board = _open_compound_device()
+
+    assert device._start_sequence(MotorSteps("sequence", [dict(step) for step in steps]))
+
+    getattr(interface, sender).assert_called_once_with(*arguments)
+    interface.fixed_position.assert_not_called()
+    # What the loop attaches to the board once the handler returns.
+    assert device._compound_movement == steps[1:]
+    # An ack timeout retries the servo command, not the host-only step.
+    retry_kind, (_kind, retry_step, retry_steps), _ctx, _perf = device._prev_command
+    assert retry_kind is _retry_compound
+    assert "_internal_func" in retry_step or "_servo_move" in retry_step
+    assert "predefined" not in retry_step and "load_arm" not in retry_step
+    assert "barrier_arm" not in retry_step
+    assert retry_steps is device._compound_movement
+
+
+@pytest.mark.parametrize("step, sender", [
+    ({"servo_attach": Motor.PELLET_COVER_SERVO}, "servo_attach"),
+    ({"servo_detach": Motor.PELLET_COVER_SERVO}, "servo_detach"),
+], ids=["attach", "detach"])
+def test_a_sequence_that_opens_with_an_attach_or_detach_still_returns_to_the_loop(step, sender):
+    device, interface, board = _open_compound_device()
+    following = {"_servo_move": (Motor.PELLET_COVER_SERVO, 10.0)}
+
+    assert device._start_sequence(MotorSteps("sequence", [dict(step), dict(following)]))
+
+    getattr(interface, sender).assert_called_once_with(Motor.PELLET_COVER_SERVO)
+    interface.move_servo_motor.assert_not_called()
+    assert device._compound_movement == [following]
+
+
+def test_a_sequence_with_an_injected_attach_still_returns_to_the_loop_before_the_move():
+    device, interface, board = _open_compound_device()
+    device._motor_configs[Motor.PELLET_COVER_SERVO].detach = True
+
+    assert device._start_sequence(device._release_pellet)
+
+    interface.servo_attach.assert_called_once_with(Motor.PELLET_COVER_SERVO)
+    interface.release_pellet.assert_not_called()
+    assert len(device._compound_movement) == 2
+
+
+def test_a_shutdown_request_stops_a_sequence_after_its_host_only_first_step():
+    device, interface, board = _open_compound_device()
+    device._want_exit.set()
+
+    assert device._start_sequence(device._cover_pellet)
+
+    for name in _SENDERS:
+        getattr(interface, name).assert_not_called()
+
+
+@pytest.mark.parametrize("kind, sent", [
+    (SystemCommandKind.COVER_PELLET, "cover_sent"),
+    (SystemCommandKind.RELEASE_PELLET, "release_sent"),
+], ids=["cover", "release"])
+def test_a_standalone_cover_or_release_goes_out_without_the_loops_idle_wait(kind, sent):
+    times = _times_through_the_handler(kind, None)
+
+    # Before this change the command waited the loop's 50 ms. The bound is
+    # loose on purpose: it has to hold on a busy rig.
+    assert times[sent] - times["queued"] < 0.03
+
+
+def test_a_release_with_detach_keeps_the_loops_wait_between_attach_and_move():
+    times = _times_through_the_handler(SystemCommandKind.RELEASE_PELLET, None, detach=True)
+
+    assert times["attach_sent"] - times["queued"] < 0.03
+    # The attach takes no uuid, so the loop's 50 ms stays between it and the
+    # move: no frame-to-frame interval on the bus changes.
+    assert times["release_sent"] - times["attach_sent"] >= 0.04
 
 
 def test_command_queued_immediately_before_connect_survives_startup():
