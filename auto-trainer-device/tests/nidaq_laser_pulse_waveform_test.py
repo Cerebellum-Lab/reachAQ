@@ -464,6 +464,11 @@ _PROFILES = {
     "a 10 kHz stream-clocked train": dict(
         pulses=(dict(amplitude_volts=2.0, duration_ms=23.0, pulse_count=31, frequency_hz=29.0),),
         samples=10_582, rate=10_000.0, stream=True),
+    # Test stim's software route and a protocol's direct NI start: armed, then
+    # started by trigger(). Five of B3's fifty pulses.
+    "a deferred software start, 5 x 5 ms at 10 Hz": dict(
+        pulses=(dict(amplitude_volts=1.0, duration_ms=5.0, pulse_count=5, frequency_hz=10.0),),
+        samples=40_502, rate=100_000.0, defer=True),
     "PMT margins, both even": dict(
         pulses=(dict(amplitude_volts=2.0, duration_ms=1.0, pulse_count=3, frequency_hz=500.0),),
         samples=602, rate=100_000.0, lead_ms=0.5, lag_ms=0.5),
@@ -478,11 +483,12 @@ _PROFILES = {
 }
 
 
-def _fire(daq, pulses, *, lasers=None, stream=False, lead_ms=0.0, lag_ms=0.0):
+def _fire(daq, pulses, *, lasers=None, stream=False, defer=False, lead_ms=0.0, lag_ms=0.0):
     """Run `pulses`, each a dict of LaserPulseTrain fields, as the pulse path does.
 
-    Returns the AO task it made, the pulses and their channels. Laser 1 is the
-    channel a pulse names none for.
+    Waited for, or with `defer` armed and then started by trigger(). Returns
+    the AO task it made, the pulses and their channels. Laser 1 is the channel
+    a pulse names none for.
     """
     margins = dict(
         enable_pmt_shutter=lead_ms > 0 or lag_ms > 0,
@@ -494,9 +500,12 @@ def _fire(daq, pulses, *, lasers=None, stream=False, lead_ms=0.0, lag_ms=0.0):
         lasers or rig_lasers(), timing_plan=_synchronized_plan() if stream else None)
     try:
         channels = [controller.configuration.get_channel(pulse.channel_id) for pulse in pulses]
-        controller.run_synchronized_pulse_train(LaserSynchronizedPulseTrain(
+        operation = controller.run_synchronized_pulse_train(LaserSynchronizedPulseTrain(
             pulse_trains=pulses, trigger_source=BOARD_STIM if stream else None,
-            timeout_seconds=5.0))
+            wait=not defer, defer_start=defer, timeout_seconds=5.0))
+        if defer:
+            operation.trigger()
+            assert operation.wait(5.0) is LaserOperationState.COMPLETED
     finally:
         controller.close()
     return daq.task("laser_sync_pulse_ao"), pulses, channels
@@ -518,9 +527,12 @@ def test_the_buffer_is_the_list_paths_buffer_element_for_element(daq, name):
 
     ao, pulses, channels = _fire(
         daq, profile["pulses"], lasers=lasers, stream=profile.get("stream", False),
-        lead_ms=lead_ms, lag_ms=lag_ms)
+        defer=profile.get("defer", False), lead_ms=lead_ms, lag_ms=lag_ms)
 
     expected = _listed_buffers(channels, pulses, profile["rate"], lead_ms, lag_ms)
+    # The rows are in the order the task's channels were added: the driver
+    # reads a (channels, samples) write by the task's channel order.
+    assert ao.channels == [channel.analog_output for channel in channels]
     assert ao.timing_kwargs["rate"] == profile["rate"]
     assert ao.timing_kwargs["samps_per_chan"] == profile["samples"] == len(expected[0])
     written, = ao.writes
@@ -617,6 +629,60 @@ def test_each_row_of_the_buffer_is_held_to_its_own_lasers_range(daq, monkeypatch
     tasks_before = len(daq.tasks)
     with pytest.raises(LaserPulseRefused, match=r"laser channel 2 .*0.25..1.0 V"):
         _fire(daq, pulses, lasers=_narrow_second_laser(), stream=True)
+    assert [task for task in daq.tasks[tasks_before:]
+            if task.label == "laser_sync_pulse_ao"] == []
+
+
+@pytest.mark.parametrize("wait", [True, False], ids=["waited for", "not waited for"])
+def test_a_buffer_that_ends_on_the_amplitude_is_refused_before_any_task(
+    daq, monkeypatch, wait,
+):
+    # The 6713 holds its last sample after a finite generation, so a buffer
+    # that ends on the amplitude leaves the laser on until the cleanup's reset:
+    # 23 ms pulses ran 28.45-35.0 ms on christielab10 (2026-10-01), and for as
+    # long as the reset took if it hung. The builder ends it on the minimum; one
+    # that did not (here an even buffer, in range, that ends on the 2 V) is
+    # stopped before a task exists, with nothing written.
+    monkeypatch.setattr(
+        nidaq_laser, "_pulse_train_samples",
+        lambda channel, pulse_train, sample_rate_hz: numpy.full(2, pulse_train.amplitude_volts))
+    controller = NidaqLaserController(rig_lasers())
+    tasks_before, writes_before = len(daq.tasks), len(daq.writes)
+    try:
+        with pytest.raises(LaserPulseRefused, match=r"laser channel 1 .*ends on 2.0 V"):
+            controller.run_synchronized_pulse_train(LaserSynchronizedPulseTrain(
+                pulse_trains=(_train(amplitude_volts=2.0, duration_ms=1.0),),
+                wait=wait, timeout_seconds=5.0))
+
+        assert daq.tasks[tasks_before:] == []
+        assert daq.writes[writes_before:] == []
+        assert controller._live_operations == {}
+    finally:
+        controller.close()
+
+
+def test_each_row_must_end_on_its_own_lasers_minimum(daq, monkeypatch):
+    # Laser 1's minimum is 0 V and laser 2's is 0.25 V. A row that ends on
+    # 0.25 V is right for laser 2 and is taken; one that ends on 0.5 V, in
+    # range and not its minimum, is refused, though the other row is fine.
+    pulses = (
+        dict(channel_id=LaserChannelId.LASER_1, amplitude_volts=2.0, duration_ms=1.0),
+        dict(channel_id=LaserChannelId.LASER_2, amplitude_volts=1.0, duration_ms=1.0))
+    last = {"laser 2": 0.25}
+
+    def builder(channel, pulse_train, sample_rate_hz):
+        if channel.channel_id is LaserChannelId.LASER_1:
+            return numpy.array([2.0, 0.0])
+        return numpy.array([1.0, last["laser 2"]])
+
+    monkeypatch.setattr(nidaq_laser, "_pulse_train_samples", builder)
+    ao, _pulses, _channels = _fire(daq, pulses, lasers=_two_lasers(), stream=True)
+    assert ao.writes == [[[2.0, 0.0], [1.0, 0.25]]]
+
+    last["laser 2"] = 0.5
+    tasks_before = len(daq.tasks)
+    with pytest.raises(LaserPulseRefused, match=r"laser channel 2 .*ends on 0.5 V.*0.25 V"):
+        _fire(daq, pulses, lasers=_two_lasers(), stream=True)
     assert [task for task in daq.tasks[tasks_before:]
             if task.label == "laser_sync_pulse_ao"] == []
 

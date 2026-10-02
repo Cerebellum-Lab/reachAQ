@@ -643,10 +643,14 @@ class NidaqLaserController:
     def run_synchronized_pulse_train(self, pulse_train: LaserSynchronizedPulseTrain):
         if not self._configuration.hardware_timed:
             raise LaserPulseRefused("Hardware-timed laser pulse trains require laser configuration hardware_timed=True")
-        # Before the operation exists, as every refusal of a pulse that drives
-        # nothing is. Made in the pulse's own thread, it came back as that
+        # Before the operation exists, as the refusals that need no more than
+        # the request are. Made in the pulse's own thread, it came back as that
         # operation's failure, and the laser model kept the amplitude as what
-        # the output may still hold (final re-review, affb7491).
+        # the output may still hold (final re-review, affb7491). The one
+        # refusal after it is of the buffer (_execute_synchronized_pulse_train):
+        # that needs the rate the timing resolves, so it fails the operation
+        # before any task exists, with nothing driven. It is still raised as a
+        # LaserPulseRefused, and the laser model takes it back the same way.
         for item in pulse_train.pulse_trains:
             try:
                 self._validate_command_voltage(
@@ -925,19 +929,30 @@ class NidaqLaserController:
         # One buffer, (channels, samples) as nidaqmx lays a write out, filled
         # once: each row is its channel's minimum, with its waveform copied in
         # after the PMT lead. Built as lists, padded by list concatenation and
-        # converted by nidaqmx's own numpy.asarray, the same samples took 4.1
-        # ms at 105,742 samples and 19.5 ms at 490,502, on the Run Pulse
-        # click's path; the array is built in 0.07 and 0.19 ms (host
-        # benchmark, one core of christielab10).
+        # converted by nidaqmx's own numpy.asarray, the same samples took 6.2
+        # ms at 105,742 samples and 28.6 ms at 490,502 on the Run Pulse click's
+        # path. The array takes 0.74 and 4.0 ms to build (the builder, the
+        # allocation, the fill and the copy), and the checks below 0.15 and
+        # 0.68 ms more (medians on christielab10's E-cores, from the review of
+        # this change; its host benchmark, which timed the builder alone, gave
+        # 0.07 and 0.19 ms).
         timed_waveforms = numpy.empty((len(channels), total_samples), dtype=numpy.float64)
         for row, channel, waveform in zip(timed_waveforms, channels, waveforms):
             row[:] = channel.minimum_command_volts
             row[pre_samples:pre_samples + len(waveform)] = waveform
-        # Refused before any task exists: a sample outside its own laser's
-        # range is never written, whatever put it there. A NaN fails both
-        # comparisons. The amplitude is refused already, before the operation
-        # is made (run_synchronized_pulse_train), so this guards the layout
-        # itself, the waveforms and the margins around them.
+        # Refused before any task exists, whatever put the fault there. The
+        # amplitude is refused already, before the operation is made
+        # (run_synchronized_pulse_train), so these guard the layout itself, the
+        # waveforms and the margins around them:
+        # - a sample outside its own laser's range is never written (a NaN
+        #   fails both comparisons);
+        # - each row ends on its own laser's minimum. After a finite
+        #   generation the 6713 holds its last sample, so a row that ended on
+        #   the amplitude would leave the laser on until the cleanup's reset
+        #   (23 ms pulses ran 28.45-35.0 ms, christielab10, 2026-10-01);
+        # - samples times channels is even, which the 6713 refuses otherwise
+        #   (-200692). The count above is even by construction, so this is the
+        #   same refusal made earlier, as a LaserPulseRefused.
         for channel, row in zip(channels, timed_waveforms):
             lowest, highest = float(row.min()), float(row.max())
             if not (channel.minimum_command_volts <= lowest
@@ -948,6 +963,17 @@ class NidaqLaserController:
                     f"{outside} V is outside the configured range "
                     f"{channel.minimum_command_volts}..{channel.maximum_command_volts} V"
                 )
+            if row[-1] != channel.minimum_command_volts:
+                raise LaserPulseRefused(
+                    f"laser channel {channel.channel_id.value} pulse buffer ends on "
+                    f"{float(row[-1])} V, not its minimum {channel.minimum_command_volts} V"
+                )
+        if timed_waveforms.size % 2:
+            raise LaserPulseRefused(
+                f"the pulse buffer is {len(channels)} channels x {total_samples} "
+                f"samples = {timed_waveforms.size}, and the 6713 refuses an odd "
+                "number of samples per channel times channels"
+            )
         timeout_seconds = pulse_train.timeout_seconds
         if timeout_seconds is None:
             timeout_seconds = total_samples / sample_rate_hz + 5.0
@@ -2437,9 +2463,15 @@ def _pulse_train_samples(
     start = baseline_samples
     if pulse_count > 1:
         # Every pulse but the last at once: the high samples that open each
-        # of the first (count - 1) periods, which lie end to end.
-        periods = samples[start:start + (pulse_count - 1) * period_samples]
-        periods.reshape(pulse_count - 1, period_samples)[:, :high_samples] = amplitude
+        # of the first (count - 1) periods, which lie end to end. A view of
+        # the samples: where numpy returned a copy instead, the amplitude would
+        # be written to it and lost, and every pulse but the last would be
+        # missing with no error. A copy never overlaps the samples' memory.
+        periods = samples[start:start + (pulse_count - 1) * period_samples].reshape(
+            pulse_count - 1, period_samples)
+        if not numpy.may_share_memory(periods, samples):
+            raise RuntimeError("the pulse train's periods are not a view of its samples")
+        periods[:, :high_samples] = amplitude
         start += (pulse_count - 1) * period_samples
     samples[start:start + high_samples] = amplitude
     return samples
