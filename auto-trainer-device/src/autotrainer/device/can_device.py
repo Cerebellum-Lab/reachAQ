@@ -1457,8 +1457,9 @@ class CanDevice(Device):
 
         The callback runs the hardware model and the session recorder (a lock
         and JSON), which takes milliseconds. Run before the send, it delayed the
-        frame by that much: on christielab10 the SEND stamp to the PULSE row
-        took 8.5-24.2 ms. The stamp the row carries is still taken before the
+        frame by that much: on christielab10 the PULSE row to the NI rise took
+        3.5-15.7 ms, and this callback was part of it (latency-report.md 3.1).
+        The stamp the row carries is still taken before the
         send. A send that is refused or raises is recorded too, once.
 
         If the send raised and the recording fails as well, the recording's
@@ -1500,8 +1501,8 @@ class CanDevice(Device):
         step's uuid and its retry command are then what the loop's bookkeeping
         finds, as they would have been one iteration later. servo_attach and
         servo_detach send a frame without a uuid, so they end the pass and keep
-        the loop's wait after them: no frame-to-frame interval on the bus
-        changes.
+        the loop's wait after them: the attach -> move and detach -> next
+        intervals do not change.
         """
         if steps is None or len(steps) == 0:
             logger.warning("Got empty compound steps. board=%s kind=%s ctx=%s",
