@@ -1,5 +1,6 @@
 import pytest
 import threading
+import time
 
 from autotrainer.device import (
     LaserCalibrationRamp,
@@ -419,8 +420,10 @@ def _deferred_pulse(**fields):
 @pytest.mark.parametrize("fields", [
     dict(defer_start=True, start_wait_seconds=0),
     dict(defer_start=True, start_wait_seconds=-1.0),
+    dict(defer_start=True, start_wait_seconds=float("nan")),
+    dict(defer_start=True, start_wait_seconds=float("inf")),
     dict(start_wait_seconds=1.0),
-], ids=["zero", "negative", "not_deferred"])
+], ids=["zero", "negative", "nan", "inf", "not_deferred"])
 def test_a_start_wait_is_positive_and_only_for_a_deferred_start(fields):
     with pytest.raises(ValueError, match="start_wait_seconds"):
         _deferred_pulse(**fields)
@@ -437,10 +440,14 @@ def test_the_null_controller_waits_for_a_start_no_longer_than_its_start_wait():
         sample_rate_hz=10_000,
     )
     controller = NullLaserController(system)
+    # 0.5 s against a 30 s timeout, looked for over 10 s: the arm's caller has
+    # that long to see it armed.
+    started = time.monotonic()
     operation = controller.run_synchronized_pulse_train(_deferred_pulse(
-        defer_start=True, timeout_seconds=30.0, start_wait_seconds=0.05))
+        defer_start=True, timeout_seconds=30.0, start_wait_seconds=0.5))
 
-    assert operation.wait_until_finished(1.0)
+    assert operation.wait_until_finished(10.0)
+    assert time.monotonic() - started < 10.0
     assert operation.state is LaserOperationState.FAILED
     assert isinstance(operation.error, TimeoutError)
 

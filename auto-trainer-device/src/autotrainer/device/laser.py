@@ -107,8 +107,10 @@ class LaserSynchronizedPulseTrain:
         if self.timeout_seconds is not None and self.timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive when provided")
         if self.start_wait_seconds is not None:
-            if self.start_wait_seconds <= 0:
-                raise ValueError("start_wait_seconds must be positive when provided")
+            # A NaN passed "<= 0", and an infinite wait is no bound at all.
+            if not (math.isfinite(self.start_wait_seconds) and self.start_wait_seconds > 0):
+                raise ValueError(
+                    "start_wait_seconds must be a finite time above 0 s when provided")
             if not self.defer_start:
                 raise ValueError("start_wait_seconds applies only to a deferred start (defer_start)")
         if self.defer_start and self.trigger_source is not None:

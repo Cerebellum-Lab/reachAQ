@@ -1420,20 +1420,22 @@ def test_the_start_wait_is_its_own_bound(held):
     # The wait for trigger() was bounded by the output's timeout, which also
     # bounds its wait to end: the waveform's length + 5 s by default. An arm
     # that must not stay armed long, as Run Pulse's on a press, needs its own.
+    # The bound is 0.5 s, against a 30 s timeout: the arm's caller has that
+    # long to see it armed, and the end is looked for over 10 s, far from both.
     daq = held
     controller = NidaqLaserController(_routed())
     started = time.monotonic()
-    operation = _armed(controller, defer_start=True, start_wait_seconds=0.05)
+    operation = _armed(controller, defer_start=True, start_wait_seconds=0.5)
 
-    assert operation.wait_until_finished(1.0)
-    assert time.monotonic() - started < 1.0
+    assert operation.wait_until_finished(10.0)
+    assert time.monotonic() - started < 10.0
     assert operation.state is LaserOperationState.FAILED
     assert isinstance(operation.error, TimeoutError)
     assert daq.starts == []
 
-    # None keeps the timeout's bound, 30 s here.
+    # None keeps the timeout's bound, 30 s here: still armed well past 0.5 s.
     operation = _armed(controller, defer_start=True)
-    assert not operation.wait_until_finished(0.3)
+    assert not operation.wait_until_finished(1.0)
     assert operation.state is LaserOperationState.ARMED
     assert operation.cancel()
     assert operation.wait(1.0) is LaserOperationState.CANCELLED
@@ -1504,6 +1506,53 @@ def test_a_pulse_refused_before_it_opened_the_shutter_leaves_it_alone(held):
 
     assert shutter.writes[opened_by_hand:] == []
     assert daq.writes_to("PXI1Slot4/ao0", task_suffix="manual_ao")[-1] == 0.0
+
+
+@pytest.mark.parametrize("path", ["deferred", "software_start", "board_stim"])
+def test_a_pulse_that_fails_after_its_start_closes_the_shutter_it_opened(held, path):
+    # Ben, 2026-10-02: a pulse that fails closes every shutter it opened,
+    # whatever "Close shutter" says; only one that completes leaves it open.
+    # Its wait failing after the start (-200560 here) left it open, with
+    # "Close shutter" unticked. The failure comes on cue, once it is armed.
+    daq = held
+    controller = NidaqLaserController(_routed())
+    create = controller._create_synchronized_analog_output_task
+    fail_now = threading.Event()
+
+    def failing_wait(channels, name):
+        task = create(channels, name)
+
+        def wait_until_done(timeout):
+            assert fail_now.wait(5.0)
+            raise FakeDaqError(-200560, "Wait Until Done did not indicate done")
+
+        task.wait_until_done = wait_until_done
+        return task
+
+    controller._create_synchronized_analog_output_task = failing_wait
+    shutter = daq.task("laser_1_shutter")
+    before = len(daq.writes)
+    fields = {
+        "deferred": dict(defer_start=True),
+        "software_start": dict(),
+        "board_stim": dict(trigger_source="/PXI1Slot4/PXI_Trig0"),
+    }[path]
+    operation = controller.run_synchronized_pulse_train(
+        _left_open(timeout_seconds=30.0, **fields))
+    if path == "deferred":
+        operation.trigger()
+    fail_now.set()
+
+    assert operation.wait_until_finished(5.0)
+    assert operation.state is LaserOperationState.FAILED
+    assert "-200560" in str(operation.error)
+    assert daq.starts == ["laser_sync_pulse_ao"]
+    assert shutter.writes[-1] is False
+    assert daq.writes_to("PXI1Slot5/port0/line4", thread=operation._thread,
+                         since=before) == [True, False]
+    assert daq.writes_to("PXI1Slot4/ao0", task_suffix="manual_ao", since=before) == [0.0]
+    assert daq.reserved == {}
+    assert controller._live_operations == {}
 
 
 def test_a_delivered_pulse_still_leaves_its_shutter_as_it_asked(held):
