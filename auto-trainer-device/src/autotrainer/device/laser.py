@@ -89,6 +89,11 @@ class LaserSynchronizedPulseTrain:
     defer_start: bool = False
     timeout_seconds: Optional[float] = None
     operation_context: Mapping[str, object] = dataclasses.field(default_factory=dict)
+    #: How long a deferred start waits for trigger() before the operation
+    #: fails, when given; None leaves it to timeout_seconds, which also bounds
+    #: the wait for the output to end. An arm that must not stay armed for
+    #: long, such as one held for a button press, sets its own.
+    start_wait_seconds: Optional[float] = None
 
     def __post_init__(self):
         pulse_trains = tuple(self.pulse_trains)
@@ -101,6 +106,11 @@ class LaserSynchronizedPulseTrain:
             raise ValueError("trigger_edge must be 'rising' or 'falling'")
         if self.timeout_seconds is not None and self.timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive when provided")
+        if self.start_wait_seconds is not None:
+            if self.start_wait_seconds <= 0:
+                raise ValueError("start_wait_seconds must be positive when provided")
+            if not self.defer_start:
+                raise ValueError("start_wait_seconds applies only to a deferred start (defer_start)")
         if self.defer_start and self.trigger_source is not None:
             raise ValueError("defer_start cannot be combined with a hardware trigger")
         if self.defer_start and self.wait:
@@ -448,7 +458,11 @@ class NullLaserController:
             terminal_error = None
             try:
                 operation._mark_armed()
-                timeout = pulse_train.timeout_seconds or 30.0
+                timeout = (
+                    pulse_train.timeout_seconds or 30.0
+                    if pulse_train.start_wait_seconds is None
+                    else pulse_train.start_wait_seconds
+                )
                 if not operation._start_requested.wait(timeout):
                     raise TimeoutError(
                         "Emulated deferred laser operation did not receive a start request"

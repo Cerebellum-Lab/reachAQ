@@ -404,6 +404,47 @@ def test_nonblocking_laser_operation_cancel_is_terminal_after_worker_cleanup(
     assert operation.operation_id not in controller._live_operations
 
 
+def _deferred_pulse(**fields):
+    return LaserSynchronizedPulseTrain(
+        pulse_trains=(LaserPulseTrain(
+            channel_id=LaserChannelId.LASER_1,
+            amplitude_volts=1.0,
+            duration_ms=10.0,
+        ),),
+        wait=False,
+        **fields,
+    )
+
+
+@pytest.mark.parametrize("fields", [
+    dict(defer_start=True, start_wait_seconds=0),
+    dict(defer_start=True, start_wait_seconds=-1.0),
+    dict(start_wait_seconds=1.0),
+], ids=["zero", "negative", "not_deferred"])
+def test_a_start_wait_is_positive_and_only_for_a_deferred_start(fields):
+    with pytest.raises(ValueError, match="start_wait_seconds"):
+        _deferred_pulse(**fields)
+
+
+def test_a_start_wait_is_none_unless_given():
+    assert _deferred_pulse(defer_start=True).start_wait_seconds is None
+    assert _deferred_pulse(defer_start=True, start_wait_seconds=2.0).start_wait_seconds == 2.0
+
+
+def test_the_null_controller_waits_for_a_start_no_longer_than_its_start_wait():
+    system = LaserSystemConfiguration.from_channels(
+        [make_channel()], backend="null", hardware_timed=True,
+        sample_rate_hz=10_000,
+    )
+    controller = NullLaserController(system)
+    operation = controller.run_synchronized_pulse_train(_deferred_pulse(
+        defer_start=True, timeout_seconds=30.0, start_wait_seconds=0.05))
+
+    assert operation.wait_until_finished(1.0)
+    assert operation.state is LaserOperationState.FAILED
+    assert isinstance(operation.error, TimeoutError)
+
+
 def test_synchronized_pulse_train_rejects_deferred_hardware_trigger():
     with pytest.raises(ValueError, match="hardware trigger"):
         LaserSynchronizedPulseTrain(
