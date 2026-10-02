@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from autotrainer.core import SystemConfiguration
+from autotrainer.core import NidaqTimingRoute, SystemConfiguration
 
 from nidaq_timing_test import _pinned_christielab10
 from tools.acquisition.model.nidaq_channel_plan import (
@@ -68,13 +68,16 @@ RIG = _rig(CHRISTIELAB10.laser)
 #: 2 V, 31 x 23 ms at 29 Hz, no PMT margins.
 LASER1 = LaserPulseProfile("laser1", 1, 2.0, 23.0, pulse_count=31, frequency_hz=29.0)
 LIBRARY = StimulusProfileLibrary(laser_profiles=(LASER1,))
-#: System Mode running on christielab10: the controller open, the stream
-#: running on its shared clock, stimCam disabled, and a profile picked on
-#: both laser tabs.
+#: The timing plan the stream runs on christielab10's two boards.
+PLAN = _pinned_christielab10()
+#: System Mode running on christielab10: the stream running on its shared
+#: clock, the controller opened on that plan, stimCam disabled, and a
+#: profile picked on both laser tabs.
 READY = ReadinessLiveState(
     laser_connected=True,
     nidaq_stream_state="running",
-    timing_plan=_pinned_christielab10(),
+    timing_plan=PLAN,
+    laser_timing_plan=PLAN,
     stim_camera_enabled=False,
     laser_tab_profiles={1: "laser1", 2: "laser1"},
 )
@@ -163,6 +166,43 @@ def test_a_backplane_trigger_with_nothing_routed_onto_it_is_an_error():
     assert "PXI_Trig2" in message and "triggerRouteSource" in message
 
 
+def _route_errors(findings):
+    return [(trial, message) for trial, message in _errors(findings)
+            if "triggerRouteSource" in message]
+
+
+def test_a_laser_row_that_never_fires_needs_no_route():
+    # Assignment disabled: the runtime's compile drops the laser
+    # (stimulus_selected False, no firing), and the trial runs without it.
+    row = _laser_row(6, channel=2, stimulus_assignment="disabled", stimulus_trigger="none",
+                     pre_reveal_ms=0, cover_policy="keep_current")
+
+    findings = _check(row, configuration=_laser(RIG, 2, trigger_route_source=None))
+
+    assert _route_errors(findings) == []
+
+
+def test_a_backplane_line_another_lasers_route_drives_needs_no_route_of_its_own():
+    # Laser 2 armed on PXI_Trig0: the controller routes laser 1's PFI0 onto
+    # that line when it opens, for every channel, and holds it until close.
+    configuration = _laser(RIG, 2, trigger_source="/PXI1Slot4/PXI_Trig0",
+                           trigger_route_source=None, board_stim_line=3)
+
+    assert _route_errors(_check(_laser_row(6, channel=2), configuration=configuration)) == []
+
+
+def test_a_backplane_line_an_external_timing_route_drives_needs_no_route():
+    plan = READY.timing_plan
+    plan = dataclasses.replace(plan, routes=plan.routes + (NidaqTimingRoute(
+        "laser_2_trigger", "/PXI1Slot5/PFI1", ("/PXI1Slot5/PXI_Trig2",)),))
+
+    findings = _check(_laser_row(6, channel=2),
+                      configuration=_laser(RIG, 2, trigger_route_source=None),
+                      live=dataclasses.replace(READY, timing_plan=plan))
+
+    assert _route_errors(findings) == []
+
+
 def test_a_row_on_a_laser_that_is_not_configured_is_an_error():
     findings = _check(_laser_row(3, channel=3))
 
@@ -218,7 +258,9 @@ def test_a_first_reach_row_without_the_stim_camera_reuses_the_existing_blocker()
 
 
 def test_a_closed_laser_controller_is_an_error():
-    findings = _check(_laser_row(3), live=dataclasses.replace(READY, laser_connected=False))
+    # The controller's plan is not judged until it is open; its error says it.
+    findings = _check(_laser_row(3), live=dataclasses.replace(
+        READY, laser_connected=False, laser_timing_plan=None))
 
     (trial, message), = _errors(findings)
     assert trial is None
@@ -249,13 +291,34 @@ def test_a_timing_plan_without_the_lasers_board_is_an_error():
     plan = dataclasses.replace(READY.timing_plan, hardware_output_devices=())
 
     findings = _check(_laser_row(3), _laser_row(6, channel=2),
-                      live=dataclasses.replace(READY, timing_plan=plan))
+                      live=dataclasses.replace(READY, timing_plan=plan, laser_timing_plan=plan))
 
     errors = _errors(findings)
     assert [trial for trial, _message in errors] == [None, None]
     assert all("Protocol laser timing is not ready" in message for _trial, message in errors)
     assert "laser 1" in errors[0][1] and "laser 2" in errors[1][1]
     assert "not in the resolved timing topology" in errors[0][1]
+
+
+def test_a_laser_opened_without_a_plan_cannot_take_a_board_trigger():
+    # The controller keeps the plan it opened with, here none, whatever the
+    # stream runs now.
+    findings = _check(_laser_row(3), live=dataclasses.replace(READY, laser_timing_plan=None))
+
+    (trial, message), = _errors(findings)
+    assert trial is None
+    assert "laser 1 (trial 3)" in message
+    assert "opened without a valid NI timing plan" in message
+    assert "restart System Mode" in message
+
+
+def test_a_laser_opened_on_an_earlier_plan_than_the_streams_is_an_error():
+    earlier = dataclasses.replace(PLAN, sample_clock_source="/PXI1Slot5/te0/SampleClock")
+
+    (trial, message), = _errors(_check(_laser_row(3), live=dataclasses.replace(
+        READY, laser_timing_plan=earlier)))
+
+    assert trial is None and "opened on an earlier NI timing plan" in message
 
 
 def test_a_laser_without_hardware_timing_cannot_take_a_board_trigger():
@@ -270,14 +333,45 @@ def test_a_laser_without_hardware_timing_cannot_take_a_board_trigger():
 
 
 def test_only_future_enabled_rows_are_checked():
-    disabled = dataclasses.replace(_laser_row(1, laser_profile_id="laser9"), enabled=False)
     completed = _laser_row(2, laser_profile_id="laser9")
     future = _laser_row(3, laser_profile_id="laser9")
+    # Last, so it is where the protocol ends rather than where it stops.
+    disabled = dataclasses.replace(_laser_row(4, laser_profile_id="laser9"), enabled=False)
 
-    findings = _check(disabled, completed, future, live=dataclasses.replace(
+    findings = _check(completed, future, disabled, live=dataclasses.replace(
         READY, completed_trial_ids=(2,)))
 
     assert [trial for trial, _message in _errors(findings)] == [3]
+
+
+def test_a_disabled_row_before_enabled_ones_stops_the_session_there():
+    # The ledger takes the next trial in order, never skipping one, and the
+    # compile refuses a disabled row ("Protocol row is disabled"): every SEND
+    # from trial 4 on is refused, and trials 5-8 never run.
+    rows = [_laser_row(trial) for trial in range(1, 9)]
+    rows[3] = dataclasses.replace(rows[3], enabled=False)
+
+    (trial, message), = _errors(_check(*rows))
+
+    assert trial == 4
+    assert "disabled" in message
+    assert "4 enabled trials after it" in message and "from trial 5" in message
+    assert "enable trial 4, or move or delete it" in message
+
+
+def test_each_disabled_row_with_enabled_rows_after_it_is_named():
+    rows = [_laser_row(trial) for trial in range(1, 7)]
+    for index in (1, 3):
+        rows[index] = dataclasses.replace(rows[index], enabled=False)
+
+    assert [trial for trial, _message in _errors(_check(*rows))] == [2, 4]
+
+
+def test_disabled_rows_at_the_end_are_where_the_protocol_ends():
+    rows = [_laser_row(1), _laser_row(2)] + [
+        dataclasses.replace(_laser_row(trial), enabled=False) for trial in (3, 4)]
+
+    assert _errors(_check(*rows)) == []
 
 
 def test_a_row_the_runtime_compile_refuses_is_an_error_in_its_words():
@@ -311,6 +405,11 @@ def test_a_laser_whose_trigger_is_not_read_back_is_a_warning():
 
     readback = [message for _trial, message in _warnings(findings) if "readback" in message]
     assert len(readback) == 1 and readback[0].startswith("laser 1 ")
+    # christielab10 records the edge all the same, as laser1_trigger_readback
+    # on ai9, a custom channel the check cannot tie to the laser: the
+    # warning says what is missing, and not that nothing is recorded.
+    assert "triggerMonitorInput" in readback[0]
+    assert "not recorded" not in readback[0]
 
     # Read back on ai9, which the acquisition plan then acquires: no warning.
     configuration = _rig(_laser(RIG, 1, trigger_monitor_input="PXI1Slot5/ai9").laser)

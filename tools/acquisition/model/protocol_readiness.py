@@ -69,8 +69,12 @@ class ReadinessLiveState:
     laser_close_refusal: str = ""
     #: NidaqSignalMonitorModel.stream_state.
     nidaq_stream_state: str = "disabled"
-    #: The stream's timing plan, which a board STIM pulse runs on.
+    #: The stream's timing plan as it is now.
     timing_plan: object = None
+    #: The plan the laser controller was opened with, which its pulses run on
+    #: until it closes (NidaqLaserController._resolve_pulse_timing). A
+    #: Refresh Hardware that restarts only the stream leaves it as it was.
+    laser_timing_plan: object = None
     #: Configured board names to the names NI-DAQmx uses now.
     device_aliases: Mapping[str, str] = dataclasses.field(default_factory=dict)
     stim_camera_enabled: bool = False
@@ -90,9 +94,10 @@ def check_protocol_readiness(
     """
     live = live or ReadinessLiveState()
     completed = set(live.completed_trial_ids)
-    rows = tuple(row for row in _rows_of(document)
-                 if row.enabled and row.trial_id not in completed)
+    future = tuple(row for row in _rows_of(document) if row.trial_id not in completed)
+    rows = tuple(row for row in future if row.enabled)
     laser = configuration.laser
+    driven = _driven_backplane_lines(laser, live)
     laser_profiles = {item.profile_id: item for item in profile_library.laser_profiles}
     trigger_profiles = {
         item.profile_id: item for item in profile_library.stimulus_trigger_profiles}
@@ -111,13 +116,13 @@ def check_protocol_readiness(
     revision = getattr(document, "revision", None) or getattr(
         getattr(document, "document", None), "revision", 1)
 
-    findings: List[ReadinessFinding] = []
+    findings: List[ReadinessFinding] = list(_disabled_row_errors(future))
     firing_rows = []
     first_reach = False
     for row in rows:
         stimulated = row.stimulus_assignment is not StimulusAssignment.DISABLED
         errors = (
-            _laser_errors(row, laser, laser_profiles)
+            _laser_errors(row, laser, laser_profiles, stimulated, driven)
             + _trigger_errors(row, stimulated)
             + _randomized_errors(row, trigger_profiles)
         )
@@ -175,8 +180,14 @@ def board_trigger_timing_refusal(
     prepare_pulse_profile requires hardware_synchronized for a board STIM
     route and fails the trial otherwise: "Protocol laser timing is not ready"
     (laser_model.py). The reasons are NidaqLaserController._resolve_pulse_timing's,
-    for a pulse with a trigger terminal, in its order; the configuration's
-    first, then the plan's, which only a running stream has.
+    for a pulse with a trigger terminal, in its order, on the plan the
+    controller was opened with; the configuration's first. Then that plan
+    has to be the one the stream runs now.
+
+    The plan's reasons wait for a running stream and an open controller,
+    whose own errors say it otherwise. A controller keeps its plan until it
+    closes: System Mode opens the laser even when the stream's start failed
+    (_start_laser_domain), and Refresh Hardware retries only what failed.
     """
     if laser.backend != "nidaq":
         return (f"the laser backend is {laser.backend!r}, and only the NI-DAQ "
@@ -184,12 +195,16 @@ def board_trigger_timing_refusal(
     if not laser.hardware_timed:
         return ("laser hardwareTimed is off, so the laser is given no timing "
                 "plan and a board STIM pulse is not synchronized")
-    if live.nidaq_stream_state != "running":
+    if live.nidaq_stream_state != "running" or not live.laser_connected:
         return ""
-    plan = live.timing_plan
+    reopen = ("; restart System Mode so that it opens on the stream's plan "
+              "(Refresh Hardware does not reopen a laser that opened)")
+    plan = live.laser_timing_plan
     if plan is None or not plan.is_valid:
-        return "No valid shared NI timing plan was applied" + (
-            f": {plan.reason}" if plan is not None and plan.reason else "")
+        return ("the laser was opened without a valid NI timing plan, and keeps "
+                "it until it closes" + (
+                    f" ({plan.reason})" if plan is not None and plan.reason else "")
+                + reopen)
     device = channel.analog_output.strip("/").split("/", 1)[0]
     if (device not in plan.hardware_output_devices
             and live.device_aliases.get(device, device) not in plan.hardware_output_devices):
@@ -197,6 +212,9 @@ def board_trigger_timing_refusal(
                 "topology")
     if not plan.sample_clock_source:
         return "Resolved timing topology has no shared sample clock"
+    if plan != live.timing_plan:
+        return ("the laser was opened on an earlier NI timing plan than the "
+                "stream runs now" + reopen)
     return ""
 
 
@@ -206,7 +224,55 @@ def _rows_of(document):
     return tuple(item.row for item in document.resolve())
 
 
-def _laser_errors(row, laser, laser_profiles) -> List[str]:
+def _driven_backplane_lines(laser, live) -> set:
+    """Backplane lines something drives: a laser's route, or a timing route.
+
+    The controller connects every channel's route when it opens and holds it
+    until it closes (NidaqLaserController._connect_trigger_route), so a line
+    one laser's route drives triggers any laser that arms on it. A timing
+    plan's routes include the configured externalRoutes. Generous by
+    design: a line counted driven that is not misses an error, and one
+    counted undriven that is driven blocks a protocol that runs.
+    """
+    lines = {
+        backplane_line_of(channel.trigger_source)
+        for channel in laser.channels
+        if (channel.trigger_source or "").strip()
+        and (channel.trigger_route_source or "").strip()
+    }
+    for plan in (live.timing_plan, live.laser_timing_plan):
+        for route in getattr(plan, "routes", None) or ():
+            lines.update(backplane_line_of(terminal) for terminal in route.destinations)
+    lines.discard(None)
+    return lines
+
+
+def _disabled_row_errors(future) -> List[ReadinessFinding]:
+    """A disabled row with an enabled one after it: the session stops there.
+
+    The ledger takes the next trial in order and never skips one
+    (PelletTrialLedger), and the compile refuses a disabled row ("Protocol
+    row is disabled"), so every SEND from that row on is refused. Disabled
+    rows after the last enabled one are where the protocol ends.
+    """
+    findings = []
+    enabled_after = 0
+    first_after = None
+    for row in reversed(future):
+        if row.enabled:
+            enabled_after += 1
+            first_after = row.trial_id
+        elif enabled_after:
+            findings.append(ReadinessFinding("error", row.trial_id, (
+                "disabled, and a session stops here: trials run in order and a "
+                f"disabled one is refused, so the {enabled_after} enabled "
+                f"trial{'' if enabled_after == 1 else 's'} after it (from trial "
+                f"{first_after}) never run; enable trial {row.trial_id}, or move "
+                "or delete it")))
+    return findings[::-1]
+
+
+def _laser_errors(row, laser, laser_profiles, stimulated, driven) -> List[str]:
     if not row.laser_profile_id:
         return []
     errors = []
@@ -231,11 +297,14 @@ def _laser_errors(row, laser, laser_profiles) -> List[str]:
         if refusal:
             errors.append(refusal)
     terminal = (channel.trigger_source or "").strip()
-    if (row.laser_trigger_route is LaserTriggerRoute.HARDWARE_STIM3
+    if (stimulated
+            and row.laser_trigger_route is LaserTriggerRoute.HARDWARE_STIM3
             and backplane_line_of(terminal)
-            and not (channel.trigger_route_source or "").strip()):
-        # Nothing but the route drives a backplane line: without it the
+            and backplane_line_of(terminal) not in driven):
+        # Nothing but a route drives a backplane line: without one the
         # board's pulse never reaches the terminal, and the laser stays armed.
+        # Only for a row that fires: the compile drops the laser of one whose
+        # assignment is disabled, and its trial runs without it.
         errors.append(
             f"laser {number} arms on {terminal}, a backplane line, and no "
             "triggerRouteSource drives it; set triggerRouteSource to the input "
@@ -371,14 +440,17 @@ def _warnings(firing_rows, configuration, laser_profiles, live) -> List[Readines
             continue
         readback = channel.trigger_monitor_input
         if not readback:
+            # A custom NI-DAQ channel may record the edge all the same, as
+            # christielab10's laser1_trigger_readback on ai9 does; nothing
+            # ties it to the laser.
             messages.append(
-                f"laser {number} has no trigger readback input (triggerMonitorInput "
-                "in Edit DAQ Ports), so the board trigger that starts it is not "
-                "recorded beside it")
+                f"laser {number} has no trigger readback input (triggerMonitorInput), "
+                "so the recording does not tie the board trigger that starts it to "
+                "the laser: no Board trigger graph, and no readback named for it")
         elif readback not in acquired:
             messages.append(
                 f"laser {number}'s trigger readback {readback} is not in the NI-DAQ "
-                "acquisition plan, so the board trigger that starts it is not recorded")
+                "acquisition plan, so that input is not recorded")
     used = _by_laser(firing_rows)
     lines = [
         f"laser {number} shutter {channel.shutter_output}, diode {channel.diode_input}"

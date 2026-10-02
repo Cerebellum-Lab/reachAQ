@@ -713,6 +713,11 @@ class AppModel(ObservableObject):
         self._protocol_readiness_lock = threading.Lock()
         self._protocol_readiness_requests = 0
         self._protocol_readiness_busy = False
+        #: The timing plan _start_laser_domain last opened the laser with,
+        #: which its pulses run on until it closes. The check reads it rather
+        #: than the stream's plan: Refresh Hardware can restart the stream
+        #: alone, with a plan the open laser does not have.
+        self._laser_timing_plan = None
         self._protocol_readiness_enabled = False
         self._protocol_readiness_inputs = None
         self._protocol_readiness: Tuple[ReadinessFinding, ...] = ()
@@ -4723,6 +4728,9 @@ class AppModel(ObservableObject):
                 laser_close_refusal=self.laser_controller_close_refusal(),
                 nidaq_stream_state=monitor.stream_state,
                 timing_plan=monitor.timing_plan,
+                laser_timing_plan=(
+                    self._laser_timing_plan if self._laser.is_connected else None
+                ),
                 device_aliases=monitor.runtime_device_aliases,
                 stim_camera_enabled=camera is not None and camera.is_enabled,
                 laser_tab_profiles=dict(self._laser_tab_profiles),
@@ -7654,15 +7662,19 @@ class AppModel(ObservableObject):
                 )
                 else None
             )
+            timing_plan = (
+                self._nidaq_signal_monitor.timing_plan
+                if configuration.hardware_timed
+                else None
+            )
+            # Before the open, which announces the connection the protocol
+            # check then reads this beside.
+            self._laser_timing_plan = timing_plan
             self._laser.load_configuration(
                 runtime_configuration,
                 feedback_reader=feedback_reader,
                 persisted_configuration=configuration,
-                timing_plan=(
-                    self._nidaq_signal_monitor.timing_plan
-                    if configuration.hardware_timed
-                    else None
-                ),
+                timing_plan=timing_plan,
                 analog_terminal_config=self._laser_analog_terminal_config(),
             )
             self._laser.start_direct_trigger_receiver(
