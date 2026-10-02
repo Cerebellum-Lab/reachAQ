@@ -245,6 +245,9 @@ class CanDevice(Device):
         self._prev_command_timeout: float = self.default_command_ack_timeout_duration
         self._prev_command: Optional[Tuple[object, Any, type(None)]] = None
         self._prev_command_is_relative = False
+        # Set by _perform_next_compound_step: the step sent nothing, it only
+        # injected steps (or was _no_op). See _perform_compound_until_sent.
+        self._compound_step_host_only = False
 
         self._commands_queue = queue.Queue()
         self._commands_handler_thread: Optional[threading.Thread] = None
@@ -619,23 +622,6 @@ class CanDevice(Device):
                     return True
             return False
 
-        def perform_next_compound(board: _BoardPendingContext, steps: Optional[List[Dict]]):
-            if steps is None or len(steps) == 0:
-                logger.warning("Got empty compound steps. board=%s kind=%s ctx=%s",
-                               board.target, board.kind, board.ctx)
-                return
-            self._prev_command_timeout = self.default_command_ack_timeout_duration
-            attempt_idx = 0
-            while True:
-                success = self._perform_next_compound_step(board, steps)
-                if success:
-                    break
-                attempt_idx += 1
-                if attempt_idx > self.default_command_write_failed_repeat_count:
-                    break
-            if not success:
-                raise RuntimeError("too many failure trying _perform_next_compound_step")
-
         def sort_available_commands(r):
             k, d, c, perf_c = r  # kind data ctx perf
             t = self._find_command_next_board_target(k, d)
@@ -849,7 +835,7 @@ class CanDevice(Device):
                 kind, steps = data
                 target_board.kind = kind
                 target_board.compound_steps = steps
-                if self._execute_if_active(perform_next_compound, target_board, steps) is _shutdown_requested:
+                if self._execute_if_active(self._perform_compound_until_sent, target_board, steps) is _shutdown_requested:
                     break
 
             elif kind is _uuid_ack:
@@ -870,7 +856,7 @@ class CanDevice(Device):
                     if found_board_with_uuid_ack is not target_board:
                         found_board_with_uuid_ack.ctx = None
                         found_board_with_uuid_ack.kind = None
-                    if self._execute_if_active(perform_next_compound, target_board, steps) is _shutdown_requested:
+                    if self._execute_if_active(self._perform_compound_until_sent, target_board, steps) is _shutdown_requested:
                         break
                 else:
                     assert target_board is found_board_with_uuid_ack
@@ -1414,6 +1400,7 @@ class CanDevice(Device):
         }  # noqa
         compound_movements[1:1] = steps
         logger.verbose("injected steps: new=%s", compound_movements)
+        self._compound_step_host_only = True
         return True
 
     def _handle_servo_iface_cmd_compound(self, compound_movements, motor, iface_func):
@@ -1426,6 +1413,7 @@ class CanDevice(Device):
             '_internal_func_motor': motor,
         }  # noqa
         compound_movements[1:1] = steps
+        self._compound_step_host_only = True
         return True
 
     def _perform_send_rel_move(self, step: Dict[str, Any]):
@@ -1475,6 +1463,54 @@ class CanDevice(Device):
         finally:
             callback(kind, data, board.ctx, board.target, perf_time, wall_time)
 
+    def _perform_compound_until_sent(self, board: _BoardPendingContext, steps: Optional[List[Dict]]):
+        """
+        Run compound steps until one has sent something to the board.
+
+        A host-only step sends nothing: the predefined cover, release, retrieve
+        and scoop, load_arm and barrier_arm only inject the servo steps, and
+        _no_op does nothing. Returning to the command loop after one cost the
+        loop's 50 ms wait before the next step went out (christielab10
+        session004: the pre-reveal release went out 69-111 ms after its
+        1500 ms target, 50 ms of it this wait). So the pass carries on after a
+        host-only step and ends at the first step that sent a frame. That
+        step's uuid and its retry command are then what the loop's bookkeeping
+        finds, as they would have been one iteration later. servo_attach and
+        servo_detach send a frame without a uuid, so they end the pass and keep
+        the loop's wait after them: no frame-to-frame interval on the bus
+        changes.
+        """
+        if steps is None or len(steps) == 0:
+            logger.warning("Got empty compound steps. board=%s kind=%s ctx=%s",
+                           board.target, board.kind, board.ctx)
+            return
+        self._prev_command_timeout = self.default_command_ack_timeout_duration
+        # A host-only step removes itself, and one that injects adds steps that
+        # send, so the pass reaches a sender or runs out of steps. The budget
+        # only guards against a loop.
+        host_only_budget = len(steps)
+        while True:
+            before_uuid = self._interface.uuid()
+            attempt_idx = 0
+            while True:
+                success = self._perform_next_compound_step(board, steps)
+                if success:
+                    break
+                attempt_idx += 1
+                if attempt_idx > self.default_command_write_failed_repeat_count:
+                    break
+            if not success:
+                raise RuntimeError("too many failure trying _perform_next_compound_step")
+            if (
+                not self._compound_step_host_only
+                or len(steps) == 0
+                or host_only_budget <= 0
+                or self._interface.uuid() != before_uuid
+                or self._want_exit.is_set()
+            ):
+                return
+            host_only_budget -= 1
+
     def _perform_next_compound_step(self, board: _BoardPendingContext, compound_movements: List[Dict[str, Any]]) -> bool:
         """
         Issue the next step in a multi-step motor sequence.
@@ -1489,6 +1525,7 @@ class CanDevice(Device):
         assert isinstance(step, dict)
         save_as_fixed = step.get("save_as_fixed", False)
 
+        self._compound_step_host_only = False
         motor = None
         before_uuid = self._interface.uuid()
 
@@ -1624,6 +1661,8 @@ class CanDevice(Device):
             func = step['_internal_func']
             motor: Motor = step['_internal_func_motor']  # noqa
             success = func()  # noqa
+            if func is _no_op:
+                self._compound_step_host_only = True
 
         elif 'send_x_rel' in step or 'send_y_rel' in step or 'send_z_rel' in step:
             motor, success = self._perform_send_rel_move(step)
