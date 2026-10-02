@@ -148,7 +148,12 @@ def main():
 
     from autotrainer.core.logging import setup_logging, stop_multiproc_logging
 
+    # BEFORE setup_logging: after it, a level set in this process no longer takes effect.
+    from tools.acquisition.can_frame_logging import limit_can_frame_logging, log_can_frame_logging
+    can_frame_logging = limit_can_frame_logging()
+
     logger = setup_logging(logger_level=logging.DEBUG, time_precision=6, multiprocess_enabled=True)
+    log_can_frame_logging(logger, can_frame_logging)
 
     try:
         return _exec_main(args)
