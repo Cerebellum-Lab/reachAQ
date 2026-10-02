@@ -4,7 +4,8 @@ Nothing here touches a driver or a board. The fake records what is done to
 each task and every write that happens, with the thread that made it. It
 refuses a channel another started task reserves, as DAQmx does at -50103, and
 a timed analog output buffer of an odd number of samples, as the PXI-6713
-does at -200692. It records the terminals routed.
+does at -200692, whether it is a list or a numpy array. It records the
+terminals routed, and each write's data as lists.
 
 It is shared by the controller's own tests and by the application's close-path
 tests. Those load it by path, because tests/ and auto-trainer-device/tests are
@@ -15,6 +16,8 @@ import threading
 import time
 import warnings
 from types import SimpleNamespace
+
+import numpy
 
 from autotrainer.device import (
     LaserChannelConfiguration,
@@ -48,6 +51,12 @@ ODD_AO_WRITE_TEXT = (
 
 def _sample_count(data):
     """Samples in a write: per channel times channels, or 1 for a scalar."""
+    if isinstance(data, numpy.ndarray):
+        # nidaqmx's layouts: one channel's samples as a 1-D array, or
+        # (channels, samples) as a 2-D one. Either way every sample is counted.
+        # An array is not a list, so it fell through to the scalar's 1 below:
+        # odd, and refused whatever its length.
+        return data.size
     if not isinstance(data, (list, tuple)):
         return 1
     if data and isinstance(data[0], (list, tuple)):
@@ -63,7 +72,12 @@ class FakeTask:
         self.label = name
         self.channels = []
         self.timing_kwargs = None
+        #: Each write's data as a list (a numpy array as its tolist()), which
+        #: is what the tests compare against.
         self.writes = []
+        #: The same writes, as the controller passed them: the array or the
+        #: list itself, for a test of what the driver is given.
+        self.write_types = []
         self.started = False
         self.closed = False
         self.aborted = threading.Event()
@@ -158,8 +172,10 @@ class FakeTask:
             # refused one (-50103) writes nothing.
             self._reserve()
             self._release()
-        self.writes.append(data)
-        self._note("write", data)
+        recorded = data.tolist() if isinstance(data, numpy.ndarray) else data
+        self.writes.append(recorded)
+        self.write_types.append(data)
+        self._note("write", recorded)
         # Every write that happened, in order and whoever made it. Asking for
         # a task by name finds only the last one of that name, and each
         # command reset makes a task of the same name, so the last write
@@ -167,7 +183,7 @@ class FakeTask:
         self.daq.writes.append(SimpleNamespace(
             task=self.label,
             channels=tuple(self.channels),
-            data=data,
+            data=recorded,
             thread=threading.current_thread(),
         ))
 

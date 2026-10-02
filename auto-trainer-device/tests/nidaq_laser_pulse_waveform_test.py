@@ -18,6 +18,7 @@ Nothing here touches a driver or a board (nidaq_daqmx_fake).
 
 import dataclasses
 
+import numpy
 import pytest
 
 from autotrainer.core import NidaqTimingPlan
@@ -356,3 +357,55 @@ def test_the_fake_takes_an_on_demand_ao_sample(daq):
     task.write(0.0, auto_start=True)
 
     assert task.writes == [0.0]
+
+
+def test_the_fake_counts_the_samples_of_a_numpy_array(daq):
+    # The rule is on samples per channel times channels. An array was not a
+    # list, so it counted as the one sample of a scalar: every array was
+    # odd, and a numpy pulse buffer would have been refused whatever its
+    # length.
+    task = _timed_output(daq, ["PXI1Slot4/ao0"])
+
+    with pytest.raises(FakeDaqError) as refused:
+        task.write(numpy.zeros(3))
+
+    assert refused.value.error_code == -200692
+    assert task.writes == []
+    task.write(numpy.zeros(4))
+    assert len(task.writes) == 1
+    # Two channels of three samples are six, which it takes; three channels
+    # of three are nine, which it refuses, as it does the same as lists.
+    _timed_output(daq, ["PXI1Slot4/ao0", "PXI1Slot4/ao1"]).write(numpy.zeros((2, 3)))
+    three = _timed_output(daq, ["PXI1Slot4/ao0", "PXI1Slot4/ao1", "PXI1Slot4/ao2"])
+    with pytest.raises(FakeDaqError) as refused:
+        three.write(numpy.zeros((3, 3)))
+    assert refused.value.error_code == -200692
+    with pytest.raises(FakeDaqError):
+        three.write([[0.0] * 3] * 3)
+    assert three.writes == []
+
+
+def test_the_fake_records_an_array_as_lists_and_keeps_what_was_passed(daq):
+    # What the tests already compare against are lists, so a written array is
+    # recorded as one, wherever the fake keeps writes; the object passed is
+    # kept apart, for a test of what the driver is given.
+    one = _timed_output(daq, ["PXI1Slot4/ao0"])
+    array = numpy.array([0.0, 2.0, 2.0, 0.0])
+    one.write(array)
+    two = _timed_output(daq, ["PXI1Slot4/ao1", "PXI1Slot4/ao2"])
+    block = numpy.array([[0.0, 1.0], [0.25, 0.5]])
+    two.write(block)
+
+    assert one.writes == [[0.0, 2.0, 2.0, 0.0]]
+    assert isinstance(one.writes[0], list)
+    assert two.writes == [[[0.0, 1.0], [0.25, 0.5]]]
+    assert isinstance(two.writes[0][0], list)
+    assert [write.data for write in daq.writes] == one.writes + two.writes
+    assert daq.writes_to("PXI1Slot4/ao0") == one.writes
+    assert one.write_types[-1] is array
+    assert two.write_types[-1] is block
+    # A list is passed on as it is.
+    listed = [0.0, 1.0]
+    one.write(listed)
+    assert one.writes[-1] == listed
+    assert one.write_types[-1] is listed
