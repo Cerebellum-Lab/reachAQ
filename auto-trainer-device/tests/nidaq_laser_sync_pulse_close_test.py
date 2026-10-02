@@ -519,10 +519,12 @@ def test_a_cancel_just_before_the_start_is_not_lost(held, armed):
     controller = NidaqLaserController(_routed())
     cancelled = []
     after_the_cancel = []
+    started_on = []
 
     def cancel_as_it_starts(task):
         if task.label == "laser_sync_pulse_ao":
             daq.before_start = None
+            started_on.append(threading.current_thread())
             operation, = controller._live_operations.values()
             cancelled.append(operation)
             operation.cancel()
@@ -535,10 +537,16 @@ def test_a_cancel_just_before_the_start_is_not_lost(held, armed):
         with pytest.raises(RuntimeError, match="cancelled"):
             _armed(controller, trigger_source="/PXI1Slot4/PXI_Trig0")
         operation, = cancelled
+        # Armed on the board STIM, its start is its own thread's.
+        assert started_on == [operation._thread]
     else:
         operation = _armed(controller, defer_start=True)
         daq.before_start = cancel_as_it_starts
-        operation.trigger()
+        caller, _outcome = _in_thread(operation.trigger)
+        caller.join(5.0)
+        # Deferred, trigger() starts it on its caller's thread (D2.3), and
+        # trigger() itself then finds the cancel and aborts what it started.
+        assert started_on == [caller]
 
     assert operation.wait_until_finished(1.0) is True
     assert operation.state is LaserOperationState.CANCELLED
