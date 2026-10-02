@@ -17,6 +17,7 @@ Nothing here touches a driver or a board (nidaq_daqmx_fake).
 """
 
 import dataclasses
+import itertools
 
 import numpy
 import pytest
@@ -30,6 +31,7 @@ from autotrainer.device import (
     NidaqLaserController,
 )
 from autotrainer.device import nidaq_laser
+from autotrainer.device.laser import LaserPulseRefused
 
 from nidaq_daqmx_fake import FakeDaqError, FakeDaqmx, rig_lasers
 
@@ -317,6 +319,306 @@ def test_a_trigger_line_the_output_outlasts_keeps_its_width(daq, output, duratio
     pulse_samples = int(duration_ms * 100)
     assert _trigger_line_written(daq, output, duration_ms=duration_ms) == (
         [True] * 100 + [False] * (pulse_samples + 2 - 100))
+
+
+# ----------------------------------------- the pulse's buffer, built with numpy
+#
+# One float64 array, filled once, where the pulse path built a list per
+# channel, padded each by list concatenation, and left nidaqmx to run
+# numpy.asarray over it inside the write: 4.1 ms at 105,742 samples and
+# 19.5 ms at 490,502 on a core of christielab10 (latency-report.md 3.3, 7),
+# on the Run Pulse click path. Its values are the list's.
+
+
+def _listed(channel, pulse_train, sample_rate_hz):
+    """The list builder as it stood before the array one, copied verbatim.
+
+    The specification the array builder is held to; the controller's own
+    _build_pulse_train_waveform now returns the array's samples as a list,
+    so it cannot be its own oracle.
+    """
+    baseline_samples = nidaq_laser._samples_from_ms(pulse_train.baseline_ms, sample_rate_hz)
+    high_samples = max(1, nidaq_laser._samples_from_ms(pulse_train.duration_ms, sample_rate_hz))
+    post_stim_samples = nidaq_laser._samples_from_ms(pulse_train.post_stim_ms, sample_rate_hz)
+    minimum = channel.minimum_command_volts
+    amplitude = pulse_train.amplitude_volts
+    waveform = [minimum] * baseline_samples
+    if pulse_train.pulse_count == 1:
+        waveform.extend([amplitude] * high_samples)
+    else:
+        period_samples = max(1, int(round(sample_rate_hz / pulse_train.frequency_hz)))
+        if high_samples > period_samples:
+            raise ValueError(
+                f"laser pulse duration {pulse_train.duration_ms} ms exceeds pulse period "
+                f"at {pulse_train.frequency_hz} Hz"
+            )
+        low_samples = period_samples - high_samples
+        for pulse_index in range(pulse_train.pulse_count):
+            waveform.extend([amplitude] * high_samples)
+            if pulse_index < pulse_train.pulse_count - 1:
+                waveform.extend([minimum] * low_samples)
+    waveform.extend([minimum] * post_stim_samples)
+    if not waveform:
+        raise ValueError("laser pulse train waveform is empty")
+    if waveform[-1] != minimum:
+        waveform.append(minimum)
+    if len(waveform) % 2:
+        waveform.append(minimum)
+    return waveform
+
+
+def _listed_buffers(channels, pulses, sample_rate_hz, lead_ms, lag_ms):
+    """Each channel's whole AO buffer as the list path wrote it: margins, pads."""
+    waveforms = [
+        _listed(channel, pulse, sample_rate_hz) for channel, pulse in zip(channels, pulses)]
+    pre = nidaq_laser._samples_from_ms(lead_ms, sample_rate_hz)
+    post = nidaq_laser._samples_from_ms(lag_ms, sample_rate_hz)
+    longest = max(len(waveform) for waveform in waveforms)
+    parity = (pre + longest + post) % 2
+    return [
+        [channel.minimum_command_volts] * pre
+        + waveform
+        + [channel.minimum_command_volts] * (longest - len(waveform) + post + parity)
+        for channel, waveform in zip(channels, waveforms)
+    ]
+
+
+def _outcome(build):
+    """What a builder gives, or the refusal it raises."""
+    try:
+        return build()
+    except ValueError as error:
+        return ("refused", str(error))
+
+
+def test_the_array_builder_matches_the_list_rules():
+    # Every sample the list builder gave, and its refusals, over a grid that
+    # takes in the pads (odd and even, ending on the amplitude and not), a
+    # post-stim, a baseline, a minimum that is not zero, an amplitude that is
+    # the minimum, a pulse the period cannot hold, and the 10 kHz stream's
+    # rate as well as the output's own. 29 Hz is a period that is not a whole
+    # number of samples (344.8 at 10 kHz), which rounds.
+    channels = {
+        minimum: rig_lasers(minimum_command_volts=minimum).channels[0] for minimum in (0.0, 0.5)}
+    trains = [(1, None)] + [
+        (count, hz) for count in (2, 3, 7) for hz in (10.0, 29.0, 100.0, 500.0)]
+    grid = itertools.product(
+        channels, (False, True), (10_000.0, 100_000.0), trains,
+        (0.01, 1.0, 5.0, 23.0), (0.0, 0.5), (0.0, 0.3, 0.4))
+    ran = refused = 0
+    for minimum, at_minimum, rate, (count, frequency), duration, baseline, post_stim in grid:
+        channel = channels[minimum]
+        pulse = _train(
+            amplitude_volts=minimum if at_minimum else 2.0, duration_ms=duration,
+            baseline_ms=baseline, post_stim_ms=post_stim,
+            pulse_count=count, frequency_hz=frequency)
+        where = (minimum, at_minimum, rate, count, frequency, duration, baseline, post_stim)
+        expected = _outcome(lambda: _listed(channel, pulse, rate))
+        samples = _outcome(lambda: nidaq_laser._pulse_train_samples(channel, pulse, rate))
+        if isinstance(samples, numpy.ndarray):
+            assert samples.dtype == numpy.float64, where
+            assert samples.ndim == 1, where
+            samples = samples.tolist()
+        assert samples == expected, where
+        # The list builder, which the pulse path no longer calls, is still the
+        # list it was, and callable unbound as the bench harness calls it.
+        legacy = _outcome(lambda: NidaqLaserController._build_pulse_train_waveform(
+            None, channel, pulse, rate))
+        assert legacy == expected, where
+        if isinstance(expected, list):
+            assert isinstance(legacy, list), where
+            ran += 1
+        else:
+            refused += 1
+    # Neither side of the grid is empty: 2,064 build and 432 are refused.
+    assert (ran, refused) == (2064, 432)
+
+
+@pytest.mark.parametrize("rate", [10_000.0, 100_000.0])
+@pytest.mark.parametrize("post_stim_ms", [0.0, 0.3])
+@pytest.mark.parametrize("duration_ms", [0.1, 1.0])
+def test_a_long_train_is_laid_out_pulse_for_pulse(rate, post_stim_ms, duration_ms):
+    # A thousand pulses, which the grid above does not reach: the first 999
+    # are written in one assignment, and the last on its own.
+    channel = rig_lasers(minimum_command_volts=0.5).channels[0]
+    pulse = _train(
+        amplitude_volts=2.0, duration_ms=duration_ms, baseline_ms=0.5,
+        post_stim_ms=post_stim_ms, pulse_count=1000, frequency_hz=500.0)
+
+    samples = nidaq_laser._pulse_train_samples(channel, pulse, rate)
+
+    assert samples.tolist() == _listed(channel, pulse, rate)
+
+
+#: Each representative profile: its lasers, the timing plan and trigger it runs
+#: with, its pulses' fields, and its PMT margins in ms. The first three are
+#: christielab10's: Run Pulse's saved profile (bench check B2), B3's burst
+#: and a trial's pulse on the input stream's clock (B4).
+_PROFILES = {
+    "laser1 Run Pulse, 31 x 23 ms at 29 Hz, 100 kHz": dict(
+        pulses=(dict(amplitude_volts=2.0, duration_ms=23.0, pulse_count=31, frequency_hz=29.0),),
+        samples=105_742, rate=100_000.0),
+    "a 100 kHz burst, 50 x 5 ms at 10 Hz": dict(
+        pulses=(dict(amplitude_volts=1.0, duration_ms=5.0, pulse_count=50, frequency_hz=10.0),),
+        samples=490_502, rate=100_000.0),
+    "a 10 kHz stream-clocked train": dict(
+        pulses=(dict(amplitude_volts=2.0, duration_ms=23.0, pulse_count=31, frequency_hz=29.0),),
+        samples=10_582, rate=10_000.0, stream=True),
+    "PMT margins, both even": dict(
+        pulses=(dict(amplitude_volts=2.0, duration_ms=1.0, pulse_count=3, frequency_hz=500.0),),
+        samples=602, rate=100_000.0, lead_ms=0.5, lag_ms=0.5),
+    "an odd PMT lead alone": dict(
+        pulses=(dict(amplitude_volts=2.0, duration_ms=1.0, pulse_count=3, frequency_hz=500.0),),
+        samples=508, rate=100_000.0, lead_ms=0.05),
+    "two lasers with PMT margins, minima 0 and 0.25 V": dict(
+        pulses=(dict(amplitude_volts=2.0, duration_ms=1.0),
+                dict(amplitude_volts=1.0, duration_ms=1.0, pulse_count=3, frequency_hz=500.0,
+                     channel_id=LaserChannelId.LASER_2)),
+        samples=62, rate=10_000.0, lead_ms=0.5, lag_ms=0.5, stream=True, two=True),
+}
+
+
+def _fire(daq, pulses, *, lasers=None, stream=False, lead_ms=0.0, lag_ms=0.0):
+    """Run `pulses`, each a dict of LaserPulseTrain fields, as the pulse path does.
+
+    Returns the AO task it made, the pulses and their channels. Laser 1 is the
+    channel a pulse names none for.
+    """
+    margins = dict(
+        enable_pmt_shutter=lead_ms > 0 or lag_ms > 0,
+        pmt_shutter_open_delay_ms=lead_ms, pmt_shutter_close_delay_ms=lag_ms)
+    pulses = tuple(
+        LaserPulseTrain(**{"channel_id": LaserChannelId.LASER_1, **fields, **margins})
+        for fields in pulses)
+    controller = NidaqLaserController(
+        lasers or rig_lasers(), timing_plan=_synchronized_plan() if stream else None)
+    try:
+        channels = [controller.configuration.get_channel(pulse.channel_id) for pulse in pulses]
+        controller.run_synchronized_pulse_train(LaserSynchronizedPulseTrain(
+            pulse_trains=pulses, trigger_source=BOARD_STIM if stream else None,
+            timeout_seconds=5.0))
+    finally:
+        controller.close()
+    return daq.task("laser_sync_pulse_ao"), pulses, channels
+
+
+@pytest.mark.parametrize("name", sorted(_PROFILES))
+def test_the_buffer_is_the_list_paths_buffer_element_for_element(daq, name):
+    # What the output is given is what the list path gave it, margins, pads
+    # and all: the same samples, in the same order, for the profiles the rig
+    # runs and for the PMT margins that shift them. Compared as the lists
+    # the fake records, so that it held on the list path as well.
+    profile = _PROFILES[name]
+    lead_ms, lag_ms = profile.get("lead_ms", 0.0), profile.get("lag_ms", 0.0)
+    lasers = None
+    if profile.get("two"):
+        lasers = _two_lasers()
+    elif profile.get("stream"):
+        lasers = rig_lasers(trigger_source=BOARD_STIM, trigger_route_source="/PXI1Slot5/PFI0")
+
+    ao, pulses, channels = _fire(
+        daq, profile["pulses"], lasers=lasers, stream=profile.get("stream", False),
+        lead_ms=lead_ms, lag_ms=lag_ms)
+
+    expected = _listed_buffers(channels, pulses, profile["rate"], lead_ms, lag_ms)
+    assert ao.timing_kwargs["rate"] == profile["rate"]
+    assert ao.timing_kwargs["samps_per_chan"] == profile["samples"] == len(expected[0])
+    written, = ao.writes
+    assert written == (expected if len(expected) > 1 else expected[0])
+
+
+@pytest.mark.parametrize("two", [False, True], ids=["one laser", "two lasers"])
+def test_the_ao_write_is_one_float64_array(daq, two):
+    # The array nidaqmx is given as it is: float64, in one piece, one write.
+    # A (channels, samples) array for two lasers; a transposed one would
+    # interleave them. One laser is its row.
+    profile = _PROFILES["two lasers with PMT margins, minima 0 and 0.25 V"]
+    one_laser = _PROFILES["laser1 Run Pulse, 31 x 23 ms at 29 Hz, 100 kHz"]
+    ao, _pulses, _channels = (
+        _fire(daq, profile["pulses"], lasers=_two_lasers(), stream=True,
+              lead_ms=0.5, lag_ms=0.5)
+        if two else _fire(daq, one_laser["pulses"]))
+
+    written, = ao.write_types
+    samples = ao.timing_kwargs["samps_per_chan"]
+    assert isinstance(written, numpy.ndarray)
+    assert written.dtype == numpy.float64
+    assert written.flags["C_CONTIGUOUS"]
+    assert written.shape == ((2, samples) if two else (samples,))
+    assert samples == (62 if two else 105_742)
+
+
+#: A sample outside the range, as a function of the channel: past its maximum,
+#: below its minimum, and not a number, which fails every comparison.
+_OUT_OF_RANGE = {
+    "above the maximum": lambda channel: channel.maximum_command_volts + 0.1,
+    "below the minimum": lambda channel: channel.minimum_command_volts - 0.1,
+    "not a number": lambda channel: float("nan"),
+}
+
+
+@pytest.mark.parametrize("wait", [True, False], ids=["waited for", "not waited for"])
+@pytest.mark.parametrize("sample", sorted(_OUT_OF_RANGE))
+def test_a_buffer_outside_the_lasers_range_is_refused_before_any_task(
+    daq, monkeypatch, wait, sample,
+):
+    # Defence in depth: the amplitude is refused before the operation is made
+    # (run_synchronized_pulse_train), so the buffer never leaves the range by
+    # that. A builder that lets a sample out of it is stopped before a task
+    # exists, so the output keeps the command reset's value, and nothing is
+    # written to the board.
+    monkeypatch.setattr(
+        nidaq_laser, "_pulse_train_samples",
+        lambda channel, pulse_train, sample_rate_hz: numpy.array(
+            [_OUT_OF_RANGE[sample](channel)]))
+    controller = NidaqLaserController(rig_lasers())
+    tasks_before, writes_before = len(daq.tasks), len(daq.writes)
+    try:
+        with pytest.raises(LaserPulseRefused, match=r"outside the configured range 0.0..5.0 V"):
+            controller.run_synchronized_pulse_train(LaserSynchronizedPulseTrain(
+                pulse_trains=(_train(amplitude_volts=2.0, duration_ms=1.0),),
+                wait=wait, timeout_seconds=5.0))
+
+        assert daq.tasks[tasks_before:] == []
+        assert daq.writes[writes_before:] == []
+        assert controller._live_operations == {}
+    finally:
+        controller.close()
+
+
+def _narrow_second_laser():
+    """Both lasers on the 6713, laser 2's range 0.25..1.0 V and laser 1's 0..5 V."""
+    lasers = _two_lasers()
+    laser_2 = dataclasses.replace(lasers.channels[1], maximum_command_volts=1.0)
+    return dataclasses.replace(lasers, channels=(lasers.channels[0], laser_2))
+
+
+def test_each_row_of_the_buffer_is_held_to_its_own_lasers_range(daq, monkeypatch):
+    # Laser 1 at 2 V is outside laser 2's range, and laser 2 at its maximum
+    # is inside its own: the buffer is taken, the second at exactly its
+    # maximum. A sample 0.1 V over laser 2's maximum is refused although it
+    # is well inside laser 1's.
+    pulses = (
+        dict(channel_id=LaserChannelId.LASER_1, amplitude_volts=2.0, duration_ms=1.0),
+        dict(channel_id=LaserChannelId.LASER_2, amplitude_volts=1.0, duration_ms=1.0))
+    ao, _pulses, _channels = _fire(daq, pulses, lasers=_narrow_second_laser(), stream=True)
+    laser_1, laser_2 = ao.write_types[-1]
+    assert laser_1.max() == 2.0 and laser_2.max() == 1.0
+
+    real = nidaq_laser._pulse_train_samples
+
+    def laser_2_over(channel, pulse_train, sample_rate_hz):
+        samples = real(channel, pulse_train, sample_rate_hz)
+        if channel.channel_id is LaserChannelId.LASER_2:
+            samples[0] = channel.maximum_command_volts + 0.1
+        return samples
+
+    monkeypatch.setattr(nidaq_laser, "_pulse_train_samples", laser_2_over)
+    tasks_before = len(daq.tasks)
+    with pytest.raises(LaserPulseRefused, match=r"laser channel 2 .*0.25..1.0 V"):
+        _fire(daq, pulses, lasers=_narrow_second_laser(), stream=True)
+    assert [task for task in daq.tasks[tasks_before:]
+            if task.label == "laser_sync_pulse_ao"] == []
 
 
 # ------------------------------------------------------ the fake's own rule
