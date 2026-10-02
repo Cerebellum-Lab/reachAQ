@@ -375,15 +375,18 @@ _SEND_THEN_RECORD_STEPS = {
 }
 
 
-def _device_that_logs_sends_and_rows(events, method_name, send_result):
+def _device_that_logs_sends_and_rows(events, method_name, send_result, record_error=None):
     """An emulated device whose send and recorder append to ``events``.
 
     A send is ("send", time.perf_counter() at its entry). A recorded row is
     ("record", the perf_time stamp it carries). ``send_result`` is the value
-    the send returns, or an exception to raise.
+    the send returns, or an exception to raise. ``record_error``, if given, is
+    raised by the recorder once it has logged its row.
     """
     def record(kind, data, context, target, perf_time, wall_time):
         events.append(("record", perf_time))
+        if record_error is not None:
+            raise record_error
 
     device = CanDevice(
         api=DeviceApi(message_callback=data_callback),
@@ -444,6 +447,51 @@ def test_a_compound_send_that_raises_is_still_recorded_once(step_name):
         device._perform_next_compound_step(board, [dict(step)])
 
     assert sorted(name for name, _ in events) == ["record", "send"]
+
+
+@pytest.mark.parametrize("step_name", sorted(_SEND_THEN_RECORD_STEPS))
+def test_a_failing_recorder_does_not_mask_the_send_that_raised(step_name, caplog):
+    step, method_name = _SEND_THEN_RECORD_STEPS[step_name]
+    events = []
+    send_error = OSError("CAN adapter lost")
+    recorder_error = RuntimeError("recorder failed")
+    device, board = _device_that_logs_sends_and_rows(
+        events, method_name, send_error, record_error=recorder_error)
+
+    with caplog.at_level(logging.ERROR, logger="autotrainer.device.can_device"):
+        with pytest.raises(OSError, match="CAN adapter lost") as raised:
+            device._perform_next_compound_step(board, [dict(step)])
+
+    # The caller sees the send's own failure, whole.
+    assert raised.value is send_error
+    assert sorted(name for name, _ in events) == ["record", "send"]
+    # The recorder's failure is not lost: one ERROR record with its traceback,
+    # and what is needed to trace it to the command.
+    (logged,) = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert logged.exc_info[1] is recorder_error
+    message = logged.getMessage()
+    assert "CAN adapter lost" in message
+    assert "pellet-cycle" in message
+    assert "PELLET_DEVICE" in message
+    expected_kind = {"stim": "PULSE_DIGITAL_OUTPUT", "tone": "PLAY_TONE"}[step_name]
+    assert expected_kind in message
+
+
+@pytest.mark.parametrize("step_name", sorted(_SEND_THEN_RECORD_STEPS))
+def test_a_failing_recorder_after_a_good_send_still_raises(step_name):
+    # What happened before, and still does: the failure ends the handler
+    # thread. The frame is already out when it does.
+    step, method_name = _SEND_THEN_RECORD_STEPS[step_name]
+    events = []
+    recorder_error = RuntimeError("recorder failed")
+    device, board = _device_that_logs_sends_and_rows(
+        events, method_name, True, record_error=recorder_error)
+
+    with pytest.raises(RuntimeError, match="recorder failed") as raised:
+        device._perform_next_compound_step(board, [dict(step)])
+
+    assert raised.value is recorder_error
+    assert [name for name, _ in events] == ["send", "record"]
 
 
 def test_a_sent_compound_tone_skips_the_next_ack_stamp():
