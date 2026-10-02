@@ -9,13 +9,16 @@ running stream sets them. No hardware is touched.
 
 import dataclasses
 import io
+import logging
 import os
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest  # noqa: E402
+from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from autotrainer.core import SystemConfiguration  # noqa: E402
@@ -186,14 +189,19 @@ def test_check_protocol_lists_every_finding_and_copies_them(rig, qapp, monkeypat
     from tools.acquisition.view.protocol_content import ProtocolContent
 
     app_model = rig(_without_laser_2s_stim_line(CHRISTIELAB10.laser))
-    shown = []
-    monkeypatch.setattr(
-        protocol_check_dialog.ProtocolCheckDialog, "exec", lambda self: shown.append(self))
+    shown, modal = [], []
+    dialog_class = protocol_check_dialog.ProtocolCheckDialog
+    monkeypatch.setattr(dialog_class, "show", lambda self: shown.append(self))
+    # Modal, it held Stop and Abort back for as long as it was open.
+    monkeypatch.setattr(dialog_class, "exec", lambda self: modal.append(self))
     content = ProtocolContent(app_model)
     try:
         content._check_protocol_button.click()
 
+        assert modal == []
         dialog, = shown
+        assert not dialog.isModal()
+        assert dialog.testAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         table = dialog._table
         rows = [tuple(table.item(row, column).text() for column in range(3))
                 for row in range(table.rowCount())]
@@ -239,3 +247,61 @@ def test_a_laser_opened_on_an_earlier_plan_cannot_take_a_board_trigger(rig):
     assert len(lines) == 2
     assert all("opened on an earlier NI timing plan" in line for line in lines)
 
+
+# ------------------------------------------------------- a fault in the check
+
+
+def test_a_fault_in_the_check_is_logged_once_and_still_holds_record_back(
+        rig, monkeypatch, caplog):
+    from tools.acquisition.model import app_model as app_model_module
+
+    app_model = rig()
+
+    def broken(*_inputs):
+        raise ValueError("a configuration the check does not expect")
+
+    monkeypatch.setattr(app_model_module, "check_protocol_readiness", broken)
+    with caplog.at_level(logging.ERROR):
+        # Each pick is a change, and runs the check again.
+        for profile in ("laser1", None, "laser1"):
+            app_model.note_laser_tab_profile(1, profile)
+
+    logged = [record for record in caplog.records
+              if record.getMessage() == "The protocol check could not run"]
+    assert len(logged) == 1
+    assert ("Protocol check: the protocol check could not run: a configuration "
+            "the check does not expect") in app_model.recording_blockers
+
+
+def test_record_waits_for_a_check_another_thread_is_running(rig, monkeypatch):
+    from tools.acquisition.model import app_model as app_model_module
+
+    app_model = rig(_without_laser_2s_stim_line(CHRISTIELAB10.laser))
+    assert _protocol_lines(app_model)
+    check = app_model_module.check_protocol_readiness
+    running, release = threading.Event(), threading.Event()
+
+    def slow(*inputs):
+        running.set()
+        release.wait(5.0)
+        return check(*inputs)
+
+    monkeypatch.setattr(app_model_module, "check_protocol_readiness", slow)
+    # Another thread's check of a change, still running.
+    other = threading.Thread(target=app_model.note_laser_tab_profile, args=(1, "laser1"))
+    other.start()
+    try:
+        assert running.wait(5.0)
+        # No protocol now; this change's own refresh finds the check busy
+        # and leaves it to that thread's loop.
+        app_model.select_ordered_protocol(None)
+        threading.Timer(0.2, release.set).start()
+
+        # Record's refresh, as _start_recording_locked makes it.
+        app_model._refresh_protocol_readiness(
+            wait_s=app_model_module._PROTOCOL_CHECK_RECORD_WAIT_S)
+
+        assert _protocol_lines(app_model) == []
+    finally:
+        release.set()
+        other.join(5.0)
