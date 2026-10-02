@@ -204,6 +204,14 @@ from tools.acquisition.model.atomic_session_io import (
     file_manifest_entry,
 )
 from tools.acquisition.model.session_boundary import SessionBoundary
+from tools.acquisition.model.protocol_readiness import (
+    STIM_CAMERA_REQUIRED,
+    ProtocolRigConfiguration,
+    ReadinessFinding,
+    ReadinessLiveState,
+    check_protocol_readiness,
+    protocol_blocker_lines,
+)
 from tools.acquisition.model.trial_protocol_repository import (
     TrialProtocolRepository,
 )
@@ -698,6 +706,20 @@ class AppModel(ObservableObject):
         self._stimulus_profile_repository.load()
         self._selected_ordered_protocol: Optional[TrialProtocolDocument] = None
         self._trial_protocol_schedule = TrialProtocolSchedule.with_placeholder_rows()
+        # The selected protocol's check for the next recording
+        # (protocol_readiness.py), rerun when what it reads changes, and the
+        # snapshot it was computed from. Off until __init__ has made all that
+        # it reads (_refresh_protocol_readiness).
+        self._protocol_readiness_lock = threading.Lock()
+        self._protocol_readiness_requests = 0
+        self._protocol_readiness_busy = False
+        self._protocol_readiness_enabled = False
+        self._protocol_readiness_inputs = None
+        self._protocol_readiness: Tuple[ReadinessFinding, ...] = ()
+        self._protocol_blocker_lines: Tuple[str, ...] = ()
+        #: The profile picked on each laser's Laser Control tab, which the
+        #: check reads (note_laser_tab_profile).
+        self._laser_tab_profiles: Dict[int, Optional[str]] = {}
         self._left_camera = self._right_camera = self._stim_camera = None
         self._reach_cameras: Tuple[VideoCaptureModel, ...] = ()
 
@@ -1020,6 +1042,11 @@ class AppModel(ObservableObject):
             self._on_nidaq_monitor_property_changed
         )
         self._laser.property_changed += self._on_laser_runtime_property_changed
+        # After the handlers above, which write the subsystems' statuses.
+        self._nidaq_signal_monitor.property_changed += (
+            self._on_protocol_readiness_input_changed
+        )
+        self._laser.property_changed += self._on_protocol_readiness_input_changed
         self._system_message_handler.decoded_message_received += (
             self._on_intertrial_device_message
         )
@@ -1070,6 +1097,8 @@ class AppModel(ObservableObject):
 
         one_minute_timer_handle_and_reschedule()
         register_fatal_exception_callback(self._on_fatal_exception)
+        self._protocol_readiness_enabled = True
+        self._refresh_protocol_readiness()
 
     def _make_reach_camera_model(self, camera_id: CameraId, camera_index: int) -> VideoCaptureModel:
         return VideoCaptureModel(
@@ -1396,6 +1425,9 @@ class AppModel(ObservableObject):
                     f"Finish saving {pending_session} before recording: {error}",
                 )
                 return False
+        # Checked again as Record is taken, against the state as it is now:
+        # the button follows the check as it last ran.
+        self._refresh_protocol_readiness()
         blockers = tuple(
             blocker
             for blocker in self.recording_blockers
@@ -1540,6 +1572,11 @@ class AppModel(ObservableObject):
                 lambda token=session_token: self._record_start_timed_out(token),
             )
             self._record_start_timer.start()
+        notice = self.protocol_check_notice
+        if notice:
+            # Warnings do not hold Record back; this, and Behavior's status
+            # bar line, are where they are said as the session starts.
+            logger.warning(notice)
         return True
 
     def _estimate_session_bytes_per_second(self) -> float:
@@ -2798,12 +2835,16 @@ class AppModel(ObservableObject):
         if self._selected_protocol_requires_stim_camera():
             camera = self._stim_camera
             if camera is None or not camera.is_enabled:
-                blockers.append("Selected protocol requires the enabled stimCam")
+                blockers.append(STIM_CAMERA_REQUIRED)
             elif camera._stim_detection_configuration is None:
                 blockers.append(
                     "Selected protocol requires stimCam stimulation mode; "
                     "restart System Mode to apply the frozen 900 Hz camera mode"
                 )
+        # The protocol check's errors, as it last ran: this property is read
+        # on every Behavior refresh, so the check runs only on a change
+        # (_refresh_protocol_readiness).
+        blockers.extend(self._protocol_blocker_lines)
         can_status = self._acquisition.subsystems.get(SubsystemId.CAN_PELLET)
         pellet_source_required = bool(
             self._hardware.requires_connection
@@ -2876,6 +2917,8 @@ class AppModel(ObservableObject):
             current_statuses,
             previous_statuses,
         )
+        # Published just below, with the check's lines as they are now.
+        self._refresh_protocol_readiness(publish=False)
         self.property_changed(
             self.Props.RECORDING_BLOCKERS,
             self.recording_blockers,
@@ -4591,6 +4634,167 @@ class AppModel(ObservableObject):
         )
 
     @property
+    def protocol_readiness(self) -> Tuple[ReadinessFinding, ...]:
+        """The selected protocol's check, as the next recording runs it.
+
+        A recording starts at trial 1, so every enabled row is still to run:
+        the rows the last session completed are checked too.
+        """
+        return self._protocol_readiness
+
+    @property
+    def protocol_check_notice(self) -> str:
+        """'Protocol check: N warnings (see Check protocol)', or empty."""
+        count = sum(1 for item in self._protocol_readiness if item.severity == "warning")
+        if not count:
+            return ""
+        return "Protocol check: {} warning{} (see Check protocol)".format(
+            count, "" if count == 1 else "s")
+
+    def check_selected_protocol(self) -> Tuple[ReadinessFinding, ...]:
+        """The check as Check protocol shows it: run now, on the rows still to run.
+
+        During a session those are the rows it has not completed; otherwise
+        every row, as protocol_readiness has them.
+        """
+        completed = ()
+        if self._recording_session.status is not SessionRecordingStatus.READY:
+            completed = tuple(self.trial_protocol_state["completed_trial_ids"])
+        try:
+            inputs = self._protocol_readiness_snapshot(completed)
+            return () if inputs is None else check_protocol_readiness(*inputs)
+        except Exception as error:
+            return self._protocol_check_fault(error)[1]
+
+    def note_laser_tab_profile(self, channel_id, profile_id) -> None:
+        """The profile now picked on a laser's Laser Control tab, for the check.
+
+        Run Pulse and Test stim fire it. A protocol row fires its own, and the
+        check says so for a laser the protocol fires with none picked: on
+        2026-10-02 laser 2's empty tab read as the reason it did not fire.
+        """
+        number, profile_id = int(channel_id), profile_id or None
+        if number in self._laser_tab_profiles and self._laser_tab_profiles[number] == profile_id:
+            return
+        self._laser_tab_profiles[number] = profile_id
+        self._refresh_protocol_readiness()
+
+    def _on_protocol_readiness_input_changed(self, name, _value, _old_value) -> None:
+        # Only what the check reads: the laser's feedback samples and the
+        # stream's status text change often and tell it nothing.
+        if name in {
+            LaserModel.CONFIGURATION,
+            LaserModel.IS_CONNECTED,
+            NidaqSignalMonitorModel.CONFIGURATION,
+            NidaqSignalMonitorModel.HARDWARE_ENABLED,
+            NidaqSignalMonitorModel.IS_STARTING,
+            NidaqSignalMonitorModel.IS_RUNNING,
+            NidaqSignalMonitorModel.ERROR_MESSAGE,
+            NidaqSignalMonitorModel.TIMING_PLAN,
+        }:
+            self._refresh_protocol_readiness()
+
+    def _protocol_readiness_snapshot(self, completed_trial_ids=()):
+        """What the check reads, taken at once; None with no protocol selected."""
+        with self._trial_protocol_lock:
+            if self._selected_ordered_protocol is None:
+                return None
+            # The schedule, not the document: its rows are the ones
+            # _compile_protocol_trial compiles.
+            schedule = self._trial_protocol_schedule
+            library = StimulusProfileLibrary(
+                tone_profiles=tuple(self._tone_profiles.values()),
+                cue_interval_profiles=tuple(self._cue_interval_profiles.values()),
+                stimulus_trigger_profiles=tuple(self._stimulus_trigger_profiles.values()),
+                laser_profiles=tuple(self._laser_profiles.values()),
+                automatic_shift_profiles=tuple(self._automatic_shift_policies.values()),
+            )
+        monitor = self._nidaq_signal_monitor
+        camera = self._stim_camera
+        return (
+            schedule,
+            ProtocolRigConfiguration(
+                laser=self._laser.configuration,
+                nidaq_stream=monitor.configuration,
+            ),
+            library,
+            ReadinessLiveState(
+                laser_connected=self._laser.is_connected,
+                laser_close_refusal=self.laser_controller_close_refusal(),
+                nidaq_stream_state=monitor.stream_state,
+                timing_plan=monitor.timing_plan,
+                device_aliases=monitor.runtime_device_aliases,
+                stim_camera_enabled=camera is not None and camera.is_enabled,
+                laser_tab_profiles=dict(self._laser_tab_profiles),
+                completed_trial_ids=tuple(completed_trial_ids),
+            ),
+        )
+
+    @staticmethod
+    def _protocol_check_fault(error):
+        """A fault in the check itself, as a snapshot and its findings.
+
+        An error, which holds Record back rather than letting the protocol run
+        unchecked; the log has the cause. The snapshot equals nothing, so the
+        next refresh runs the check again.
+        """
+        logger.exception("The protocol check could not run")
+        return object(), (ReadinessFinding(
+            "error", None, f"the protocol check could not run: {error}"),)
+
+    def _refresh_protocol_readiness(self, *, publish: bool = True) -> None:
+        """Run the protocol check again if what it reads has changed.
+
+        Called where that changes: the selected protocol, its revision and the
+        profile library (_notify_trial_protocol_state); the laser and the
+        stream (_on_protocol_readiness_input_changed); a subsystem's status; a
+        configuration load; a laser tab's pick; and Record. One caller runs it
+        at a time, holding no other lock, and a change asked about meanwhile
+        is run by that caller's loop: what is kept is never older than the
+        last state asked about. RECORDING_BLOCKERS is published when Record's
+        lines change.
+        """
+        with self._protocol_readiness_lock:
+            if not self._protocol_readiness_enabled:
+                return
+            self._protocol_readiness_requests += 1
+            if self._protocol_readiness_busy:
+                return
+            self._protocol_readiness_busy = True
+        changed = False
+        try:
+            while True:
+                with self._protocol_readiness_lock:
+                    request = self._protocol_readiness_requests
+                findings = None
+                try:
+                    inputs = self._protocol_readiness_snapshot()
+                    if inputs != self._protocol_readiness_inputs:
+                        findings = () if inputs is None else check_protocol_readiness(*inputs)
+                except Exception as error:
+                    inputs, findings = self._protocol_check_fault(error)
+                if findings is not None:
+                    lines = protocol_blocker_lines(findings)
+                    changed = changed or lines != self._protocol_blocker_lines
+                    self._protocol_readiness_inputs = inputs
+                    self._protocol_readiness = findings
+                    self._protocol_blocker_lines = lines
+                with self._protocol_readiness_lock:
+                    if request == self._protocol_readiness_requests:
+                        self._protocol_readiness_busy = False
+                        break
+        except BaseException:
+            with self._protocol_readiness_lock:
+                self._protocol_readiness_busy = False
+            raise
+        if changed and publish:
+            self.property_changed(
+                self.Props.RECORDING_BLOCKERS,
+                self.recording_blockers,
+                None,
+            )
+
+    @property
     def ordered_protocols(self) -> Tuple[TrialProtocolDocument, ...]:
         return self._trial_protocol_repository.documents
 
@@ -5922,6 +6126,9 @@ class AppModel(ObservableObject):
             self._notify_trial_protocol_state()
 
     def _notify_trial_protocol_state(self) -> None:
+        # First, so that what follows the state reads the check of it. A
+        # trial's progress changes nothing the check reads, and reruns nothing.
+        self._refresh_protocol_readiness()
         self.property_changed(
             self.Props.TRIAL_PROTOCOL_STATE,
             self.trial_protocol_state,
@@ -6974,6 +7181,8 @@ class AppModel(ObservableObject):
         with self._acquisition.lock:
             current = self._acquisition.subsystems.statuses
         self.property_changed(self.Props.SUBSYSTEM_STATUSES, current, previous)
+        # A laser close's refusal changes with this status; the check reads it.
+        self._refresh_protocol_readiness(publish=False)
         self.property_changed(self.Props.RECORDING_BLOCKERS, self.recording_blockers, None)
         return refusal
 
@@ -8632,6 +8841,8 @@ class AppModel(ObservableObject):
                 profile.policy_id: profile
                 for profile in profile_library.automatic_shift_profiles
             }
+        # No protocol is selected now, and the check of the last one goes.
+        self._refresh_protocol_readiness()
         for path, error in self._trial_protocol_repository.errors.items():
             logger.error("Ordered protocol %s was not loaded: %s", path, error)
         if self._stimulus_profile_repository.error:
