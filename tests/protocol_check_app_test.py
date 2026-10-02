@@ -2,8 +2,9 @@
 
 Errors are Record blockers, one line each in its tooltip; warnings leave
 Record available. Every test runs on the app fixture: christielab10's laser
-block on a null controller standing in for the NI-DAQ one, and the NI-DAQ
-stream's flags set as a running stream sets them. No hardware is touched.
+block, opened by System Mode's own _start_laser_domain on a null controller
+standing in for the NI-DAQ one, and the NI-DAQ stream's flags set as a
+running stream sets them. No hardware is touched.
 """
 
 import dataclasses
@@ -31,6 +32,8 @@ CHRISTIELAB10 = SystemConfiguration.load_yaml(io.StringIO(
     f"!SystemConfiguration\nversion: {SystemConfiguration.version}\n"
     + (HERE / "christielab10_nidaq_blocks.yaml").read_text(encoding="utf-8")
     + (HERE / "christielab10_laser_block.yaml").read_text(encoding="utf-8")))
+#: The timing plan the stream runs on christielab10's two boards.
+PLAN = _pinned_christielab10()
 
 
 @pytest.fixture
@@ -46,24 +49,39 @@ def _without_laser_2s_stim_line(laser):
 
 
 @pytest.fixture
-def rig(app_model):
+def rig(app_model, monkeypatch):
     """System Mode running on christielab10, as far as the check can see.
 
-    The bench protocol is imported last, so the check that runs on its
-    selection sees everything else already in place.
+    System Mode starts the stream, then opens the laser on the stream's plan
+    as it is then (_start_laser_domain); `stream_at_laser_open` is that plan,
+    None for a stream whose start failed. The stream then runs PLAN, as a
+    Refresh Hardware that retries only the stream leaves it. The bench
+    protocol is imported last, so the check that runs on its selection sees
+    everything else already in place.
     """
     monitor = app_model.nidaq_signal_monitor
+    laser_model = app_model.laser
+    monkeypatch.setattr(
+        laser_model, "load_configuration",
+        lambda configuration, **_options: laser_model.set_controller(
+            NullLaserController(configuration)))
+    monkeypatch.setattr(laser_model, "start_direct_trigger_receiver", lambda *_args: None)
 
-    def make(laser=CHRISTIELAB10.laser):
+    def run_stream(plan):
+        monitor._set_timing_plan(plan)
+        monitor._set_running(plan is not None)
+
+    def make(laser=CHRISTIELAB10.laser, *, stream_at_laser_open=PLAN):
         app_model.save_laser_profile(
             profile_id="laser1", amplitude_volts=2.0, pulse_duration_ms=23.0,
             pulse_count=31, frequency_hz=29.0)
-        app_model.laser.set_controller(NullLaserController(laser))
+        laser_model.set_configuration_offline(laser)
         monitor._configuration = build_nidaq_acquisition_configuration(
             CHRISTIELAB10.nidaq_stream, CHRISTIELAB10.nidaq_ports, laser)
         monitor._hardware_enabled = True
-        monitor._set_timing_plan(_pinned_christielab10())
-        monitor._set_running(True)
+        run_stream(stream_at_laser_open)
+        assert app_model._start_laser_domain()
+        run_stream(PLAN)
         app_model._acquisition.started = True
         app_model.import_ordered_protocol(BENCH_PROTOCOL)
         return app_model
@@ -193,3 +211,31 @@ def test_check_protocol_lists_every_finding_and_copies_them(rig, qapp, monkeypat
         assert copied.count("\n") == len(rows) - 1
     finally:
         content.deleteLater()
+
+
+# ------------------------------------------------------- the laser's own plan
+
+
+def test_a_laser_opened_while_the_stream_had_no_plan_cannot_take_a_board_trigger(rig):
+    # System Mode's NI start failed and the laser opened anyway, with no
+    # plan; Refresh Hardware then restarted the stream alone
+    # (retry_failed_subsystems retries only the failed domains). The laser
+    # keeps what it opened with until it closes, so every board STIM trial
+    # would fail as it is prepared: "Protocol laser timing is not ready".
+    app_model = rig(stream_at_laser_open=None)
+
+    lines = _protocol_lines(app_model)
+    assert len(lines) == 2
+    assert all("Protocol laser timing is not ready" in line
+               and "opened without a valid NI timing plan" in line for line in lines)
+    assert "laser 1 (trials 3-5)" in lines[0] and "laser 2 (trials 6-8)" in lines[1]
+
+
+def test_a_laser_opened_on_an_earlier_plan_cannot_take_a_board_trigger(rig):
+    earlier = dataclasses.replace(PLAN, sample_clock_source="/PXI1Slot5/te0/SampleClock")
+
+    lines = _protocol_lines(rig(stream_at_laser_open=earlier))
+
+    assert len(lines) == 2
+    assert all("opened on an earlier NI timing plan" in line for line in lines)
+
