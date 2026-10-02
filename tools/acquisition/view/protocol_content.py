@@ -41,6 +41,7 @@ from tools.acquisition.model.trial_protocol_schedule import (
     StimulusAssignment,
     StimulusTrigger,
 )
+from tools.acquisition.view.protocol_check_dialog import ProtocolCheckDialog
 from tools.acquisition.view.protocol_set_sidebar import ProtocolSetSidebar
 
 
@@ -293,6 +294,13 @@ class ProtocolContent(ContentWidget):
         self._protocol_selector.setMinimumContentsLength(18)
         self._protocol_selector.currentIndexChanged.connect(self._protocol_selected)
         layout.addWidget(self._protocol_selector)
+        self._check_protocol_button = QToolButton()
+        self._check_protocol_button.setText("Check protocol")
+        self._check_protocol_button.setToolTip(
+            "List what would stop the selected protocol running as it says, "
+            "and what to check by hand")
+        self._check_protocol_button.clicked.connect(self._check_protocol)
+        layout.addWidget(self._check_protocol_button)
         for label, slot in (
             ("New", self._new_protocol),
             ("Duplicate", self._duplicate_protocol),
@@ -559,6 +567,7 @@ class ProtocolContent(ContentWidget):
             self._table.resizeColumnsToContents()
             has_protocol = selected_id is not None
             for button in (
+                self._check_protocol_button,
                 self._copy_button,
                 self._paste_button,
                 self._fill_button,
@@ -809,6 +818,16 @@ class ProtocolContent(ContentWidget):
         except (KeyError, RuntimeError, ValueError) as error:
             self._edit_status.setText(str(error))
             self._refresh(self._app_model.trial_protocol_state)
+
+    def _check_protocol(self):
+        selected = self._app_model.trial_protocol_state.get("selected_protocol")
+        check = getattr(self._app_model, "check_selected_protocol", None)
+        if selected is None or check is None:
+            self._edit_status.setText("Select a protocol to check it.")
+            return
+        ProtocolCheckDialog(
+            f"{selected['name']} (r{selected['revision']})", check(), self,
+        ).exec()
 
     @staticmethod
     def _ask_identity(parent, title, default_id=""):

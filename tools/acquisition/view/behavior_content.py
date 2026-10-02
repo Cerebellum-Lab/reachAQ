@@ -62,7 +62,7 @@ class BehaviorContent(ContentWidget):
         controls_layout.setContentsMargins(4, 4, 4, 0)
         controls_layout.setSpacing(6)
         self._record_button = QPushButton("Record")
-        self._record_button.clicked.connect(self._app_model.start_recording)
+        self._record_button.clicked.connect(self._start_recording)
         controls_layout.addWidget(self._record_button)
         self._stop_button = QPushButton("Stop")
         self._stop_button.clicked.connect(self._app_model.stop_recording)
@@ -241,6 +241,15 @@ class BehaviorContent(ContentWidget):
 
     def set_is_capture_active(self, is_active: bool):
         self._update_recording_controls(self._app_model.session_recording_status)
+
+    def _start_recording(self):
+        if not self._app_model.start_recording():
+            return
+        # Warnings do not hold Record back, so they are said as it starts.
+        notice = self._app_model.protocol_check_notice
+        window = self.window()
+        if notice and hasattr(window, "statusBar"):
+            window.statusBar().showMessage(notice, 15000)
 
     def _update_recording_controls(self, status: SessionRecordingStatus):
         self._recording_status_label.setText(status.value.capitalize())
