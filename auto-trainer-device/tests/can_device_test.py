@@ -36,9 +36,13 @@ from autotrainer.device.can_device import (
     default_move_retract,
     default_load_pellet,
     default_send_pellet,
+    _no_op,
+    _retry_compound,
     _shutdown_requested,
 )
 from autotrainer.device.device_connection import _REQUEST_DISCONNECT
+from autotrainer.device.device_interface import Acknowledge
+from autotrainer.device.emulation_interface import EmulationInterface
 
 _expected = None
 
@@ -449,6 +453,256 @@ def test_a_sent_compound_tone_skips_the_next_ack_stamp():
     assert device._perform_next_compound_step(board, [{"tone": "5000,0.3"}])
 
     assert board.skip_uuid_ack_perf_c is True
+
+
+# A host-only compound step (the predefined cover, release, retrieve and scoop,
+# load_arm and barrier_arm, and _no_op) sends nothing: it only injects the servo
+# steps. The command loop used to go back to its 50 ms idle wait after one, so
+# the frame came out 50 ms late (christielab10 session004: the pre-reveal
+# release, +69..+111 ms against its 1500 ms target). The tests below say which
+# steps may now continue in the same pass and which must not.
+
+_SENDERS = (
+    "release_pellet", "cover_pellet", "retrieve_pellet", "scoop_pellet",
+    "move_servo_motor", "fixed_position", "servo_attach", "servo_detach",
+)
+
+
+def _open_compound_device():
+    device = CanDevice(
+        api=DeviceApi(message_callback=data_callback),
+        force_emulation=True,
+        required_targets=(Target.PELLET_DEVICE,),
+    )
+    interface = device.device_interface
+    interface.open()
+    # Wrapped, so the emulator still answers and a test can count the frames.
+    for name in _SENDERS:
+        setattr(interface, name, mock.Mock(wraps=getattr(interface, name)))
+    board = device._boards_pending_ctx[Target.PELLET_DEVICE]
+    board.ctx = "pellet-cycle"
+    return device, interface, board
+
+
+@pytest.mark.parametrize("step, sender, arguments", [
+    ({"predefined": "release"}, "release_pellet", ()),
+    ({"predefined": "cover"}, "cover_pellet", ()),
+    ({"predefined": "retrieve"}, "retrieve_pellet", ()),
+    ({"predefined": "scoop"}, "scoop_pellet", ()),
+    ({"load_arm": 45.0}, "move_servo_motor", (Motor.PELLET_LOAD_SERVO, 45.0)),
+    ({"barrier_arm": 45.0}, "move_servo_motor", (Motor.PELLET_COVER_SERVO, 45.0)),
+], ids=["release", "cover", "retrieve", "scoop", "load_arm", "barrier_arm"])
+def test_a_host_only_step_sends_the_servo_command_in_the_same_pass(step, sender, arguments):
+    device, interface, board = _open_compound_device()
+    steps = [dict(step), {"predefined": "send"}]
+
+    device._perform_compound_until_sent(board, steps)
+
+    getattr(interface, sender).assert_called_once_with(*arguments)
+    # It stops at the step that sent: the step after it is left for the ack.
+    interface.fixed_position.assert_not_called()
+    assert steps == [{"predefined": "send"}]
+
+
+def test_a_no_op_step_runs_into_the_next_step_in_the_same_pass():
+    device, interface, board = _open_compound_device()
+    no_op = {"_internal_func": _no_op, "_internal_func_motor": Motor.PELLET_COVER_SERVO}
+    steps = [dict(no_op), dict(no_op), dict(no_op), {"predefined": "send"}]
+
+    device._perform_compound_until_sent(board, steps)
+
+    interface.fixed_position.assert_called_once_with()
+    assert steps == []
+
+
+def test_host_only_steps_with_nothing_to_send_run_out_and_return():
+    device, interface, board = _open_compound_device()
+    no_op = {"_internal_func": _no_op, "_internal_func_motor": Motor.PELLET_COVER_SERVO}
+    steps = [dict(no_op), dict(no_op), dict(no_op)]
+
+    device._perform_compound_until_sent(board, steps)
+
+    assert steps == []
+    for name in _SENDERS:
+        getattr(interface, name).assert_not_called()
+
+
+@pytest.mark.parametrize("step, sender", [
+    ({"servo_attach": Motor.PELLET_COVER_SERVO}, "servo_attach"),
+    ({"servo_detach": Motor.PELLET_COVER_SERVO}, "servo_detach"),
+], ids=["attach", "detach"])
+def test_a_step_that_sends_without_a_uuid_still_returns_to_the_loop(step, sender):
+    # Attach and detach send a frame but take no uuid. The loop's wait after
+    # them is kept, so no frame-to-frame interval on the bus changes.
+    device, interface, board = _open_compound_device()
+    following = {"_servo_move": (Motor.PELLET_COVER_SERVO, 10.0)}
+    steps = [dict(step), dict(following)]
+
+    device._perform_compound_until_sent(board, steps)
+
+    getattr(interface, sender).assert_called_once_with(Motor.PELLET_COVER_SERVO)
+    interface.move_servo_motor.assert_not_called()
+    assert steps == [following]
+
+
+def test_an_injected_attach_still_returns_to_the_loop_before_the_move():
+    device, interface, board = _open_compound_device()
+    device._motor_configs[Motor.PELLET_COVER_SERVO].detach = True
+    steps = [{"predefined": "release"}, {"predefined": "send"}]
+
+    device._perform_compound_until_sent(board, steps)
+
+    # The release injected [attach, release, detach]. The attach went out and
+    # the pass ended there, as the loop's idle wait followed it before.
+    interface.servo_attach.assert_called_once_with(Motor.PELLET_COVER_SERVO)
+    interface.release_pellet.assert_not_called()
+    assert len(steps) == 3
+    assert steps[1:] == [
+        {"servo_detach": Motor.PELLET_COVER_SERVO},
+        {"predefined": "send"},
+    ]
+
+
+def test_the_retry_after_an_injection_targets_the_servo_command():
+    device, interface, board = _open_compound_device()
+    steps = [{"predefined": "release"}, {"predefined": "send"}]
+
+    device._perform_compound_until_sent(board, steps)
+
+    # An ack timeout retries _prev_command. It has to be the command that was
+    # sent, not the host-only step that came before it.
+    retry_kind, (_kind, retry_step, retry_steps), _ctx, _perf = device._prev_command
+    assert retry_kind is _retry_compound
+    assert retry_step["_internal_func"] is interface.release_pellet
+    assert retry_step["_internal_func_motor"] is Motor.PELLET_COVER_SERVO
+    assert retry_steps is steps
+
+
+def test_a_step_that_keeps_failing_after_a_host_only_step_still_raises():
+    device, interface, board = _open_compound_device()
+    interface.close()  # the emulated board then refuses every servo command
+    steps = [{"predefined": "release"}]
+
+    with pytest.raises(RuntimeError, match="too many failure"):
+        device._perform_compound_until_sent(board, steps)
+
+    # One try and the configured repeats, as before.
+    assert interface.release_pellet.call_count == (
+        device.default_command_write_failed_repeat_count + 1
+    )
+
+
+def _device_with_a_host_only_step_stand_in(steps, *, takes_uuid, pops):
+    """A device whose every step is reported host-only, to test the pass's guards."""
+    device, interface, board = _open_compound_device()
+    performed = []
+
+    def perform(_board, compound_movements):
+        performed.append(len(compound_movements))
+        if pops:
+            compound_movements.pop(0)
+        if takes_uuid:
+            EmulationInterface.next_uuid()
+        device._compound_step_host_only = True
+        return True
+
+    device._perform_next_compound_step = perform
+    return device, board, performed
+
+
+def test_a_pass_ends_at_a_step_that_took_a_uuid_even_if_it_was_marked_host_only():
+    steps = [{"x": 1}, {"x": 2}, {"x": 3}]
+    device, board, performed = _device_with_a_host_only_step_stand_in(
+        steps, takes_uuid=True, pops=True)
+
+    device._perform_compound_until_sent(board, steps)
+
+    assert performed == [3]
+    assert steps == [{"x": 2}, {"x": 3}]
+
+
+def test_a_chain_of_host_only_steps_cannot_loop_for_ever():
+    # Real host-only steps always pop themselves, so this one cannot happen;
+    # the pass is still bounded by the steps it was given.
+    steps = [{"x": 1}]
+    device, board, performed = _device_with_a_host_only_step_stand_in(
+        steps, takes_uuid=False, pops=False)
+
+    device._perform_compound_until_sent(board, steps)
+
+    assert len(performed) == 1 + len(steps)
+
+
+def test_a_shutdown_request_stops_the_pass_after_a_host_only_step():
+    device, interface, board = _open_compound_device()
+    device._want_exit.set()
+    steps = [{"predefined": "release"}, {"predefined": "send"}]
+
+    device._perform_compound_until_sent(board, steps)
+
+    for name in _SENDERS:
+        getattr(interface, name).assert_not_called()
+
+
+def test_a_pre_reveal_release_goes_out_without_the_loops_idle_wait():
+    """The release follows the board's ack of the delay by milliseconds, not 50 ms."""
+    token = "pre-reveal-send"
+    finished = threading.Event()
+    times = {}
+
+    def callback(kind, data):
+        if kind == SystemStatusMessageKind.ACKNOWLEDGE and data[0] == token:
+            finished.set()
+
+    device = CanDevice(
+        api=DeviceApi(message_callback=callback),
+        force_emulation=True,
+        required_targets=(Target.PELLET_DEVICE,),
+    )
+    interface = device.device_interface
+    interface.open()
+    real_delay, real_release = interface.delay, interface.release_pellet
+
+    def delay(duration):
+        result = real_delay(duration)  # waits the delay, then queues the board's ack
+        times["delay_acked"] = time.perf_counter()
+        return result
+
+    def release():
+        times["release_sent"] = time.perf_counter()
+        return real_release()
+
+    interface.delay, interface.release_pellet = delay, release
+
+    stop = threading.Event()
+
+    def deliver_acks():
+        # What DeviceConnection's reader does with the emulator's acks.
+        while not stop.is_set():
+            for message in interface.read(64):
+                if isinstance(message, Acknowledge):
+                    device._handle_ack(message)
+            time.sleep(0.001)
+
+    reader = threading.Thread(target=deliver_acks, daemon=True)
+    reader.start()
+    try:
+        device.connect()
+        device.notify_message(
+            SystemCommandKind.SEND_PELLET,
+            {"pre_reveal_stimulus": (200, 1000, 3)},
+            context=token,
+        )
+        assert finished.wait(5), "the pre-reveal SEND never finished"
+    finally:
+        stop.set()
+        reader.join(1)
+        device.disconnect()
+        interface.close()
+
+    # The loop's idle wait is 50 ms, so before this change the gap was at
+    # least that. The bound is loose on purpose: it has to hold on a busy rig.
+    assert times["release_sent"] - times["delay_acked"] < 0.03
 
 
 def test_command_queued_immediately_before_connect_survives_startup():
