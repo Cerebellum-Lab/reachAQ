@@ -71,6 +71,10 @@ _ROUTE_SETTLE_WAIT_S = 1.0
 #: How long it waits in all before it gives up: a driver hung in the other
 #: caller's connect or release held this one with it, without end.
 _ROUTE_PENDING_GIVE_UP_S = 5.0
+#: Who has taken an armed operation's start (NidaqLaserOperation._start_claim),
+#: as a refused trigger() names it.
+_CLAIMED_BY_TRIGGER = "already triggered"
+_START_WAIT_OVER = "its start wait over"
 
 
 class LaserControllerStillClosing(RuntimeError):
@@ -149,6 +153,21 @@ class NidaqLaserOperation:
         self._error = None
         self._timing_status = {}
         self._thread = None
+        #: How trigger() starts the pulse's tasks, on its caller's thread:
+        #: bound at arm, before the operation reads ARMED (_bind_starter).
+        #: None for the null controller's emulation, whose thread acts.
+        self._starter = None
+        #: Who may start the tasks, decided once, under _lock: None while the
+        #: start window is open; _CLAIMED_BY_TRIGGER once a trigger() has
+        #: claimed it; _START_WAIT_OVER once the pulse's thread ended its wait
+        #: with no claim (_end_start_wait). At most one party starts them, and
+        #: never while the pulse's thread stops or closes them.
+        self._start_claim = None
+        #: Set once a claimed trigger()'s start has returned or raised, and
+        #: what it had to abort is aborted: the pulse's thread waits for it.
+        self._start_done = threading.Event()
+        #: What that start raised, for the pulse's thread to fail with.
+        self._start_error = None
 
     @property
     def state(self):
@@ -241,13 +260,110 @@ class NidaqLaserOperation:
         return True
 
     def trigger(self):
+        """Start the armed output on this thread; when the start was entered.
+
+        Raises only when the operation is not armed, or its start is already
+        taken: by an earlier trigger(), or by the end of its start wait. A
+        start that the driver refuses is the operation's failure, which the
+        pulse's own thread ends it with, and is not raised here. Through an
+        Event to the pulse's thread the start came 8.2 ms p50 later under a
+        GIL hog, against 0.6 ms on the deciding thread (christielab10, M3 C
+        and D). Nothing is called in the driver under the lock, as in
+        cancel(): a start hung in the driver holds this caller, and not a
+        cancel or close().
+        """
         with self._lock:
-            if self._state is not LaserOperationState.ARMED:
-                raise RuntimeError(
-                    f"Laser operation must be armed, found {self._state.value}"
-                )
+            if (self._state is not LaserOperationState.ARMED
+                    or self._start_claim is not None):
+                found = self._state.value
+                if self._state is LaserOperationState.ARMED:
+                    found = f"{found}, {self._start_claim}"
+                raise RuntimeError(f"Laser operation must be armed, found {found}")
+            self._start_claim = _CLAIMED_BY_TRIGGER
+            starter = self._starter
+        if starter is None:
+            self._start_done.set()
             self._start_requested.set()
             return time.perf_counter()
+        entry = time.perf_counter()
+        try:
+            self._start_and_look(starter)
+        finally:
+            # Whatever came of it: the pulse's thread waits for this, with no
+            # bound, before it touches a task.
+            self._start_done.set()
+            self._start_requested.set()
+        return entry
+
+    def _start_and_look(self, starter):
+        """trigger()'s start, then its look for a cancel that landed during it.
+
+        A cancel marks the operation first, under the lock, and closes the
+        pulse's shutters and aborts its tasks after. Its aborts can meet tasks
+        this start had not reached yet, which does nothing (H5c), so what this
+        start started is aborted here, and the shutters are closed first, as
+        the cancel's own order is: the cancel's close may not have landed
+        yet. A second close after the cancel's own changes nothing.
+        """
+        error = None
+        try:
+            starter()
+        except Exception as start_error:
+            error = start_error
+        except BaseException as interrupted:
+            with self._lock:
+                self._start_error = RuntimeError(
+                    f"the start was interrupted ({type(interrupted).__name__})")
+            raise
+        with self._lock:
+            self._start_error = error
+            cancelled = self._state is LaserOperationState.CANCELLED
+            if error is None and self._state is LaserOperationState.ARMED:
+                self._transition_locked(
+                    LaserOperationState.TRIGGERED, "NI software start accepted")
+        if not cancelled:
+            return
+        if self._before_abort is not None:
+            try:
+                self._before_abort()
+            except Exception:
+                logger.exception(
+                    "Failed to close the laser shutter before a cancelled start's abort")
+        for name, task in self._tasks:
+            if self._abort_task is None:
+                break
+            if not self._is_started(task):
+                continue
+            try:
+                self._abort_task(task, name, True)
+            except Exception:
+                logger.debug("A cancelled start's abort of %s failed", name, exc_info=True)
+
+    def _bind_starter(self, start):
+        """How trigger() starts the pulse's tasks; bound before ARMED."""
+        with self._lock:
+            self._starter = start
+
+    def _end_start_wait(self) -> bool:
+        """The pulse's thread is done waiting for its start: who starts, decided.
+
+        Called once the start wait has returned, woken or run out, under the
+        lock trigger() claims under. With no claim the window closes, and no
+        trigger() can claim after it: False. With one, that trigger's start is
+        the pulse's: this waits for it with no bound, as a start hung in the
+        driver held this thread before, and raises what it raised; True.
+        Either way, no start runs while this thread stops or closes the tasks.
+        """
+        with self._lock:
+            if self._start_claim is None:
+                self._start_claim = _START_WAIT_OVER
+                return False
+        self._start_done.wait()
+        with self._lock:
+            error = self._start_error
+        if error is not None:
+            raise error
+        return True
 
     def to_record(self):
         with self._lock:
@@ -1126,22 +1242,35 @@ class NidaqLaserController:
             operation._bind_tasks(zip(
                 (ao_name, *digital_names), (ao_task, *digital_tasks)))
             operation._require_not_cancelled()
+
+            def start():
+                # The lines, then the output, whose clock they run on: it
+                # ticks only once the output starts. Each is marked as it
+                # starts, so that a cancel's abort of it says it can warn.
+                for task in (*digital_tasks, ao_task):
+                    task.start()
+                    operation._mark_started(task)
+
             if pulse_train.defer_start:
+                # trigger() starts the tasks, on its caller's thread. This
+                # thread waits for it, or for its start wait to run out, and
+                # then for any start a trigger() claimed (_end_start_wait).
+                operation._bind_starter(start)
                 operation._mark_armed()
-                if not operation._start_requested.wait(start_wait_seconds):
+                operation._start_requested.wait(start_wait_seconds)
+                if not operation._end_start_wait():
+                    operation._require_not_cancelled()
                     raise TimeoutError("Deferred laser operation did not receive a start request")
-                operation._require_not_cancelled()
-            for task in (*digital_tasks, ao_task):
-                task.start()
-                operation._mark_started(task)
-            if operation.state is LaserOperationState.CANCELLED:
-                # A cancel between the look above and the starts aborted
-                # tasks not yet started, which does nothing (H5c): the train
-                # would run. Ended here instead, as a cancel.
-                raise RuntimeError("Laser operation was cancelled as it started")
-            if pulse_train.defer_start:
-                operation._mark_triggered("NI software start accepted")
+                if operation.state is LaserOperationState.CANCELLED:
+                    # trigger() found the cancel, and aborted what it started.
+                    raise RuntimeError("Laser operation was cancelled as it started")
             else:
+                start()
+                if operation.state is LaserOperationState.CANCELLED:
+                    # A cancel between the look above and the starts aborted
+                    # tasks not yet started, which does nothing (H5c): the train
+                    # would run. Ended here instead, as a cancel.
+                    raise RuntimeError("Laser operation was cancelled as it started")
                 operation._mark_armed()
             self._last_timing_status = timing_status
             ao_task.wait_until_done(timeout=timeout_seconds)

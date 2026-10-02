@@ -498,6 +498,44 @@ def test_an_armed_pulse_records_its_baseline_after_a_refused_pulse_on_its_laser(
         model.close()
 
 
+def test_the_direct_receiver_brackets_the_daqmx_start(monkeypatch):
+    # The receiver's start stamps bracketed trigger(), which only woke the
+    # pulse's own thread: the StimLatencyBudget's start segment timed an
+    # Event set, and the output started after it. trigger() starts it now,
+    # between the two stamps (D2.3).
+    model, daq = _nidaq_model(monkeypatch)
+    started_at = []
+    daq.before_start = lambda task: started_at.append(time.perf_counter())
+    operation = model.prepare_pulse_profile(
+        LaserPulseProfile("pulse", 1, 2.5, 1.0), SOFTWARE, _recipe())
+    model.bind_direct_trigger_nonce("trial-op", "once")
+    trigger_queue = queue.Queue(maxsize=1)
+    result_ready = threading.Event()
+    results = []
+    model.start_direct_trigger_receiver(
+        trigger_queue, lambda result: (results.append(result), result_ready.set()))
+    try:
+        trigger_queue.put_nowait({
+            "operation_id": "trial-op",
+            "session_generation": 3,
+            "logical_trial_id": 4,
+            "attempt_id": 1,
+            "nonce": "once",
+            "stim_frame_id": 9,
+            "ipc_send_perf_time": time.perf_counter(),
+        })
+        assert result_ready.wait(5.0)
+        result, = results
+        assert result["accepted"]
+        start, = started_at
+        assert (result["daqmx_start_entry_perf_time"] <= start
+                <= result["daqmx_start_return_perf_time"])
+        assert operation.wait(5.0).value == "completed"
+    finally:
+        model.stop_direct_trigger_receiver()
+        model.close()
+
+
 # ------------------------------------------------ the PMT rule (Ben, 2026-09-30)
 
 
