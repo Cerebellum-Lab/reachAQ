@@ -5192,8 +5192,14 @@ class AppModel(ObservableObject):
                     reason="session generation ended during preparation",
                 )
                 return
-            sent = self._behavior.system_machine.pellet.send_pellet(force=force)
-            if not sent and operation.state is PreparedState.PREPARED:
+            # The pellet machine's triggers are relayed to the behaviour
+            # algorithm's thread without waiting, and the relay returns
+            # nothing. Wait for this one, so the state below says whether
+            # the SEND was taken: unwaited, every protocol Send was failed
+            # here before that thread ran it (christielab10, 2026-10-02).
+            with BehaviorAlgorithm.set_put_func_call_mode(True):
+                self._behavior.system_machine.pellet.send_pellet(force=force)
+            if operation.state is PreparedState.PREPARED:
                 self._trial_action_executor.fail(
                     RuntimeError("pellet state machine did not accept SEND")
                 )
