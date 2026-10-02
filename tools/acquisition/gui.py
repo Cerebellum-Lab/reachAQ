@@ -41,6 +41,10 @@ def main():
     if app_start_log_level.isdigit():
         app_start_log_level = int(app_start_log_level)
 
+    # BEFORE setup_logging: after it, a level set in this process no longer takes effect.
+    from tools.acquisition.can_frame_logging import limit_can_frame_logging, log_can_frame_logging
+    can_frame_logging = limit_can_frame_logging()
+
     logger = setup_logging(
         "autotrainer",
         logger_level=app_start_log_level,
@@ -48,6 +52,7 @@ def main():
         multiprocess_enabled=True,
         fork_method=fork_method,
     )
+    log_can_frame_logging(logger, can_frame_logging)
 
     try:
         return _exec_main(args, logger)
