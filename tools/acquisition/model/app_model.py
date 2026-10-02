@@ -316,6 +316,10 @@ _DAQ_PORTS_UPDATE = "DAQ ports update"
 #: Holder of the NI-DAQ input stream while a laser calibration ramp runs.
 _LASER_CALIBRATION = "laser calibration"
 _LASER_CALIBRATION_REASON = "a laser calibration ramp is running"
+#: How long Record waits for a protocol check another thread is running. A
+#: check of 5000 rows took 0.45 s on christielab10's E-cores; the default
+#: protocol has 15.
+_PROTOCOL_CHECK_RECORD_WAIT_S = 2.0
 #: How much longer than the ramp's own timeout closing waits for it.
 _LASER_CALIBRATION_CLOSE_MARGIN_S = 5.0
 #: How long closing then waits, after a forced close that failed, hung or
@@ -711,8 +715,13 @@ class AppModel(ObservableObject):
         # snapshot it was computed from. Off until __init__ has made all that
         # it reads (_refresh_protocol_readiness).
         self._protocol_readiness_lock = threading.Lock()
+        #: Notified as the computing caller finishes; Record waits on it.
+        self._protocol_readiness_idle = threading.Condition(self._protocol_readiness_lock)
         self._protocol_readiness_requests = 0
         self._protocol_readiness_busy = False
+        #: Each fault in the check already logged: logged once, not on every
+        #: refresh that runs into it again.
+        self._protocol_check_faults = set()
         #: The timing plan _start_laser_domain last opened the laser with,
         #: which its pulses run on until it closes. The check reads it rather
         #: than the stream's plan: Refresh Hardware can restart the stream
@@ -1431,8 +1440,9 @@ class AppModel(ObservableObject):
                 )
                 return False
         # Checked again as Record is taken, against the state as it is now:
-        # the button follows the check as it last ran.
-        self._refresh_protocol_readiness()
+        # the button follows the check as it last ran. A check already
+        # running elsewhere is waited for, as it runs this request too.
+        self._refresh_protocol_readiness(wait_s=_PROTOCOL_CHECK_RECORD_WAIT_S)
         blockers = tuple(
             blocker
             for blocker in self.recording_blockers
@@ -4738,19 +4748,25 @@ class AppModel(ObservableObject):
             ),
         )
 
-    @staticmethod
-    def _protocol_check_fault(error):
+    def _protocol_check_fault(self, error):
         """A fault in the check itself, as a snapshot and its findings.
 
         An error, which holds Record back rather than letting the protocol run
-        unchecked; the log has the cause. The snapshot equals nothing, so the
-        next refresh runs the check again.
+        unchecked. Logged, with its traceback, the first time it is met: the
+        snapshot equals nothing, so every refresh runs the check again, and
+        each one logged it and put it on the status bar.
         """
-        logger.exception("The protocol check could not run")
-        return object(), (ReadinessFinding(
-            "error", None, f"the protocol check could not run: {error}"),)
+        message = f"the protocol check could not run: {error}"
+        with self._protocol_readiness_lock:
+            first = message not in self._protocol_check_faults
+            self._protocol_check_faults.add(message)
+        if first:
+            logger.exception("The protocol check could not run")
+        return object(), (ReadinessFinding("error", None, message),)
 
-    def _refresh_protocol_readiness(self, *, publish: bool = True) -> None:
+    def _refresh_protocol_readiness(
+        self, *, publish: bool = True, wait_s: float = 0.0,
+    ) -> None:
         """Run the protocol check again if what it reads has changed.
 
         Called where that changes: the selected protocol, its revision and the
@@ -4761,12 +4777,22 @@ class AppModel(ObservableObject):
         is run by that caller's loop: what is kept is never older than the
         last state asked about. RECORDING_BLOCKERS is published when Record's
         lines change.
+
+        A caller that finds another computing returns at once, unless it gives
+        `wait_s`: then it waits that long for that caller's loop, which runs
+        its request too, to end. Record does, so that it reads the check of
+        the state as it is when it is taken.
         """
         with self._protocol_readiness_lock:
             if not self._protocol_readiness_enabled:
                 return
             self._protocol_readiness_requests += 1
             if self._protocol_readiness_busy:
+                if wait_s > 0 and not self._protocol_readiness_idle.wait_for(
+                        lambda: not self._protocol_readiness_busy, wait_s):
+                    logger.warning(
+                        "The protocol check was still running %.1f s later; "
+                        "Record reads it as it last ran", wait_s)
                 return
             self._protocol_readiness_busy = True
         changed = False
@@ -4790,10 +4816,12 @@ class AppModel(ObservableObject):
                 with self._protocol_readiness_lock:
                     if request == self._protocol_readiness_requests:
                         self._protocol_readiness_busy = False
+                        self._protocol_readiness_idle.notify_all()
                         break
         except BaseException:
             with self._protocol_readiness_lock:
                 self._protocol_readiness_busy = False
+                self._protocol_readiness_idle.notify_all()
             raise
         if changed and publish:
             self.property_changed(

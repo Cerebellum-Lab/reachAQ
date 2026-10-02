@@ -825,9 +825,14 @@ class ProtocolContent(ContentWidget):
         if selected is None or check is None:
             self._edit_status.setText("Select a protocol to check it.")
             return
-        ProtocolCheckDialog(
+        dialog = ProtocolCheckDialog(
             f"{selected['name']} (r{selected['revision']})", check(), self,
-        ).exec()
+        )
+        # Not modal: opened during a session, it held Stop and Abort back for
+        # as long as it stayed open. Each is its own window, gone once closed.
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dialog.setModal(False)
+        dialog.show()
 
     @staticmethod
     def _ask_identity(parent, title, default_id=""):
