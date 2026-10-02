@@ -1111,6 +1111,12 @@ class _LaserChannelTab(QWidget):
         else:
             text = f"Profile {profile_id!r} is no longer saved"
         self._profile_summary.setText(text)
+        # The protocol check reads the pick: a protocol row fires its own
+        # profile, and on 2026-10-02 laser 2's empty pick here was taken for
+        # the reason its trials did not fire.
+        note = getattr(self._app_model, "note_laser_tab_profile", None)
+        if self._is_configured and note is not None:
+            note(self.channel_id_value, profile_id)
 
     def _profile_refusal(self) -> str:
         """Why the current pick cannot fire; call only when it gave no profile."""
