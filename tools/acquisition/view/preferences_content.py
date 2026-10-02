@@ -6,6 +6,7 @@ import math
 import platform
 from datetime import date
 
+import shiboken6
 import verboselogs
 from PySide6 import QtCore
 from PySide6.QtCore import Qt
@@ -85,17 +86,25 @@ class PreferencesContent(QWidget):
 
         self._session_status_callback = self._on_session_status_changed
         self._app_model.property_changed += self._session_status_callback
-        self.destroyed.connect(self._unsubscribe_session_status)
+        # A plain function, not a method of this widget: Qt does not call a
+        # slot of the object being destroyed, so a bound method here never
+        # ran. The closed window then stayed subscribed, and the next
+        # ready -> arming called it on deleted tabs and left Record stuck at
+        # arming (christielab10, 2026-10-02).
+        app_model = self._app_model
+        callback = self._session_status_callback
+
+        def unsubscribe(*_args):
+            try:
+                app_model.property_changed -= callback
+            except (KeyError, ValueError):
+                pass
+
+        self.destroyed.connect(unsubscribe)
         self._set_session_mutable(
             self._app_model.session_recording_status
             is SessionRecordingStatus.READY
         )
-
-    def _unsubscribe_session_status(self, *_args):
-        try:
-            self._app_model.property_changed -= self._session_status_callback
-        except (KeyError, ValueError):
-            pass
 
     def _on_session_status_changed(self, name, value, _old):
         if name == self._app_model.Props.SESSION_RECORDING_STATUS:
@@ -103,6 +112,9 @@ class PreferencesContent(QWidget):
 
     @invoke_method
     def _set_session_mutable(self, enabled: bool) -> None:
+        # Queued to the GUI thread, it can run after the window has gone.
+        if not shiboken6.isValid(self._tabs):
+            return
         self._tabs.setEnabled(bool(enabled))
 
     def _update_tab_sizes(self):
