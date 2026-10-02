@@ -34,6 +34,35 @@ def test_open_preferences_disable_when_session_leaves_ready(app_model):
         app_model._inference = previous_inference
 
 
+def test_a_closed_preferences_window_does_not_stop_a_session_starting(app_model):
+    # christielab10, 2026-10-02: Preferences was opened and closed, then
+    # Record stuck at "arming". The closed window's handler was still
+    # subscribed, so ready -> arming called setEnabled on its deleted tabs
+    # ("Internal C++ object (PySide6.QtWidgets.QTabWidget) already deleted"),
+    # and the error left start_recording after ARMING.
+    import shiboken6
+    from tools.acquisition.view.preferences_dialog import PreferencesDialog
+
+    app = _qapp()
+    previous_inference = app_model._inference
+    app_model._inference = SimpleNamespace(is_enabled=False, model_location="")
+    try:
+        # As MainWindow opens it: a local dialog that is freed after exec().
+        dialog = PreferencesDialog(app_model.preferences, app_model)
+        content = dialog.findChild(PreferencesContent)
+        assert content is not None
+        shiboken6.delete(dialog)
+        app.processEvents()
+        assert not shiboken6.isValid(content)
+
+        app_model._set_session_recording_status(SessionRecordingStatus.ARMING)
+        app.processEvents()
+        app_model._set_session_recording_status(SessionRecordingStatus.READY)
+        app.processEvents()
+    finally:
+        app_model._inference = previous_inference
+
+
 def test_data_browser_starts_from_data_location(app_model, monkeypatch, tmp_path):
     _qapp()
     previous_inference = app_model._inference
