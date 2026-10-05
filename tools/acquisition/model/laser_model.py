@@ -21,6 +21,7 @@ from autotrainer.device import (
     LaserChannelId,
     LaserDiodePowerCurve,
     LaserFeedbackSample,
+    LaserOperationState,
     LaserPulseTrain,
     LaserSynchronizedPulseTrain,
     LaserSystemConfiguration,
@@ -61,7 +62,7 @@ _MANUAL_PULSE_TIMESTAMP_METHOD = "manual_pulse_call_perf_counter"
 
 @dataclasses.dataclass(frozen=True)
 class _ManualPulse:
-    """A manual Run Pulse as told so far (LaserModel.run_pulse_train)."""
+    """A manual Run Pulse as told so far (LaserModel.run_pulse_train, ArmedManualPulse)."""
 
     channel_id: LaserChannelId
     operation_id: str
@@ -84,6 +85,153 @@ def wait_until_cancelled_ends(operation, timeout: float = CANCELLED_OPERATION_WA
         "armed next on its board is refused until it does",
         getattr(operation, "operation_id", "?"), timeout)
     return False
+
+
+def _controller_closed(controller) -> bool:
+    """Whether `controller` has been marked closed.
+
+    NidaqLaserController marks itself so before its close cancels anything
+    (_mark_closed), and words a waited-for train it cancelled by it; a
+    controller with no such mark, the null one, reads open.
+    """
+    return bool(getattr(controller, "_closed", False))
+
+
+class ArmedManualPulse:
+    """A manual Run Pulse armed while its button is pressed (LaserModel.arm_manual_pulse).
+
+    fire() starts it at the click, on the thread that decides, the Qt thread:
+    one DAQmx start, its edge about 0.6 ms later (christielab10, M3 A), where
+    a click that armed, wrote and started the train took 12-18 ms (session004;
+    M3 B). disarm() lets it go unfired. finish(), on the thread that armed it,
+    waits for its end and tells how it ended. One of fire() and disarm()
+    decides, once: a fire after a disarm, or after the pulse ended unfired,
+    starts nothing.
+    """
+
+    def __init__(self, model, controller, operation, pulse_train, manual_context, before):
+        self.operation = operation
+        self._model = model
+        self._controller = controller
+        self._pulse_train = pulse_train
+        self._manual_context = manual_context
+        #: The command records as they were before the arm recorded its
+        #: amplitude (LaserModel._record_pulse_commands).
+        self._before = before
+        self._lock = threading.Lock()
+        #: "fired", "disarmed", or "ended" when finish() found it ended with
+        #: neither; None until one of them.
+        self._decided = None
+        #: The "requested" row's pulse, once its start was accepted.
+        self._manual = None
+        #: Set once fire() is done: its start accepted and told, or refused.
+        self._fire_done = threading.Event()
+
+    def fire(self) -> bool:
+        """Start the armed pulse, then tell it as requested; whether it started.
+
+        The row is stamped before the start and told after it (Ben,
+        2026-10-02, decision 3), so the click's path is the start alone. The
+        trade: a recorder that fails no longer stops the pulse; that failure
+        is logged at ERROR with the pulse's id, and its end is still told.
+        False, with nothing told, once it was decided already, or is no
+        longer armed: let go by a disarm, by its start wait, or by a cancel
+        or a close.
+        """
+        perf_time, wall_time = time.perf_counter(), time.time()
+        with self._lock:
+            if self._decided is not None:
+                return False
+            self._decided = "fired"
+        try:
+            try:
+                self.operation.trigger()
+            except RuntimeError:
+                # Raised only when it is not armed: nothing was started.
+                return False
+            manual = self._model._manual_pulse(
+                self._pulse_train, self._manual_context, perf_time, wall_time)
+            with self._lock:
+                self._manual = manual
+            try:
+                self._model._emit_manual_pulse_event(
+                    manual, "requested", "before_output_start", manual.context,
+                    perf_time, wall_time)
+            except Exception:
+                logger.exception(
+                    "Laser %s's Run Pulse %s started, but its requested row "
+                    "could not be told", int(self._pulse_train.channel_id),
+                    manual.operation_id)
+            return True
+        finally:
+            self._fire_done.set()
+
+    def disarm(self) -> bool:
+        """Let the pulse go unfired, unless fire() decided first; whether it did.
+
+        A cancel: the pulse's shutter is closed, then its output aborted, and
+        the pulse's own thread resets the output and lets go of the board.
+        What is told and recorded of it is finish()'s.
+        """
+        with self._lock:
+            if self._decided is not None:
+                return False
+            self._decided = "disarmed"
+        self.operation.cancel()
+        return True
+
+    def finish(self) -> bool:
+        """Wait for the pulse to end, and tell how; on the thread that armed it.
+
+        True once it fired and completed: told as completed, its waveform
+        from the click's time, and its output at its minimum, as a waited-for
+        Run Pulse's is. False when it never started: let go by disarm(), its
+        start wait, a cancel or a close, or a fire() that found one of those.
+        Nothing was requested then, so nothing is told, and its amplitude's
+        record is taken back, as a refused pulse's is: the output was never
+        driven, and its cleanup reset it. Raises what ended a pulse that
+        started and failed or was cancelled, told as "failed" or "cancelled",
+        keeping its amplitude, which its output may still hold.
+        """
+        # Without a bound, as a waited-for Run Pulse waited for its train:
+        # the operation bounds its start wait and its output itself.
+        self.operation.wait_until_finished()
+        with self._lock:
+            if self._decided is None:
+                # A fire() from now on is too late, and starts nothing.
+                self._decided = "ended"
+            fired = self._decided == "fired"
+        if fired:
+            # Its "requested" row is told on the firing thread, after the
+            # start; the end is told after it.
+            self._fire_done.wait()
+        with self._lock:
+            manual = self._manual
+        if manual is None:
+            self._model._undo_refused_pulse(self._before)
+            return False
+        operation = self.operation
+        state = operation.state
+        if state is LaserOperationState.COMPLETED:
+            self._model._record_baseline((self._pulse_train.channel_id,))
+            self._model.trace_received(
+                self._model._manual_pulse_trace(self._pulse_train, manual))
+            self._model._manual_pulse_ended(manual, "completed", "after_output_end")
+            return True
+        if state is LaserOperationState.CANCELLED:
+            # Worded as NidaqLaserController words a waited-for train's: a
+            # close says so, as System Mode's Stop and closing reachAQ close.
+            error = LaserPulseCancelled(
+                f"Laser operation {operation.operation_id} was cancelled"
+                + (": the laser controller was closed while it ran"
+                   if _controller_closed(self._controller) else ""))
+            self._model._manual_pulse_ended(
+                manual, "cancelled", "operation_cancelled", error)
+            raise error
+        error = operation.error or RuntimeError(
+            f"Laser operation {operation.operation_id} ended {state.value}")
+        self._model._manual_pulse_ended(manual, "failed", "operation_failure", error)
+        raise error
 
 
 class LaserModelEvents:
@@ -477,22 +625,87 @@ class LaserModel(ObservableObject):
             # the command back. One that raised keeps its amplitude, which
             # its output may still hold.
             self._record_baseline((pulse_train.channel_id,))
-        trace = self._make_pulse_trace(pulse_train)
-        if manual is not None:
-            # Stamped as it is told, its rows fell after the train had ended.
-            # Drawn from the request's time, each point was output at or
-            # after its row's time. The live graph places a trace by its own
-            # x values, not by these.
-            trace = dataclasses.replace(
-                trace,
-                origin_perf_time=manual.perf_time,
-                origin_wall_time=manual.wall_time,
-                timestamp_method=_MANUAL_PULSE_TIMESTAMP_METHOD,
-                timing_confidence="before_output",
-            )
-        self.trace_received(trace)
+        self.trace_received(
+            self._make_pulse_trace(pulse_train) if manual is None
+            else self._manual_pulse_trace(pulse_train, manual))
         if manual is not None:
             self._manual_pulse_ended(manual, "completed", "after_output_end")
+
+    def arm_manual_pulse(
+        self,
+        pulse_train: LaserPulseTrain,
+        *,
+        manual_context: dict,
+        start_wait_seconds: float,
+    ) -> ArmedManualPulse:
+        """Arm a manual Run Pulse for its click; ArmedManualPulse.fire() starts it.
+
+        Run Pulse's internal mode, from its press (Ben, 2026-10-02, decision
+        1 = D): the output is built, written and committed, and its shutter
+        opened (decision 2 = (a)), now, so that the click is left the start
+        alone. `start_wait_seconds` bounds how long it stays armed: unfired
+        by then it fails, and closes the shutter it opened. A train with an
+        external trigger is refused: its edge starts it, not the click, and
+        it runs through run_pulse_train as before.
+
+        Its amplitude is recorded as the laser's last command, as any
+        pulse's is before the controller is asked, and taken back if it is
+        not armed. Nothing is told until it fires.
+        """
+        if pulse_train.trigger_source:
+            raise ValueError(
+                "An externally triggered Run Pulse is armed at its click, by run_pulse_train")
+        controller = self._require_controller()
+        laser = int(pulse_train.channel_id)
+        synchronized = LaserSynchronizedPulseTrain(
+            pulse_trains=(pulse_train,),
+            trigger_edge=pulse_train.trigger_edge,
+            enable_pmt_shutter=pulse_train.enable_pmt_shutter,
+            wait=False,
+            defer_start=True,
+            timeout_seconds=pulse_train.timeout_seconds,
+            start_wait_seconds=start_wait_seconds,
+            # The label names it where it holds the board, in another
+            # pulse's refusal.
+            operation_context={
+                "operation_label": f"Laser {laser}'s Run Pulse",
+                "manual": True,
+                "laser_channel_id": laser,
+            },
+        )
+        # Not run_synchronized_pulse_train(), whose trace says a waveform
+        # ran: this one runs only if it is clicked.
+        before = self._record_pulse_commands((pulse_train,))
+        try:
+            operation = controller.run_synchronized_pulse_train(synchronized)
+        except Exception as error:
+            # Refused, or failed or cancelled before it was armed: a deferred
+            # output starts only at its trigger, so it drove nothing.
+            self._undo_refused_pulse(before)
+            if not isinstance(error, LaserPulseRefused) and _controller_closed(controller):
+                # A Stop or a close landed mid-arm: cancelled, not failed.
+                raise LaserPulseCancelled(
+                    f"Laser {laser}'s Run Pulse was cancelled as it armed: the "
+                    "laser controller was closed") from error
+            raise
+        if operation is None:
+            raise RuntimeError("The laser controller did not arm Run Pulse's operation")
+        return ArmedManualPulse(
+            self, controller, operation, pulse_train, dict(manual_context), before)
+
+    def tell_manual_pulse_not_armed(self, pulse_train, *, manual_context, error) -> None:
+        """Tell the click of a Run Pulse whose arm, at its press, raised `error`.
+
+        As run_pulse_train told a pulse that raised: "requested", then
+        "refused" for a LaserPulseRefused, which drove nothing, or "failed".
+        At the click, which is when the operator asked for it; its arm had
+        been tried at the press.
+        """
+        manual = self._manual_pulse_requested(pulse_train, manual_context)
+        if isinstance(error, LaserPulseRefused):
+            self._manual_pulse_ended(manual, "refused", "operation_refused", error)
+        else:
+            self._manual_pulse_ended(manual, "failed", "operation_failure", error)
 
     def run_synchronized_pulse_train(self, pulse_train: LaserSynchronizedPulseTrain):
         controller = self._require_controller()
@@ -813,8 +1026,17 @@ class LaserModel(ObservableObject):
         it: the controller has still to write and start the train, and an
         external trigger's edge starts it later still.
         """
+        manual = self._manual_pulse(
+            pulse_train, manual_context, time.perf_counter(), time.time())
+        self._emit_manual_pulse_event(
+            manual, "requested", "before_output_start", manual.context,
+            manual.perf_time, manual.wall_time)
+        return manual
+
+    def _manual_pulse(self, pulse_train, manual_context, perf_time, wall_time) -> _ManualPulse:
+        """A manual Run Pulse asked for at `perf_time`, under a new manual- id."""
         external = bool(pulse_train.trigger_source)
-        manual = _ManualPulse(
+        return _ManualPulse(
             channel_id=pulse_train.channel_id,
             operation_id=MANUAL_PULSE_OPERATION_PREFIX + str(uuid.uuid4()),
             context={
@@ -831,13 +1053,24 @@ class LaserModel(ObservableObject):
                     "stim_line": None,
                 },
             },
-            perf_time=time.perf_counter(),
-            wall_time=time.time(),
+            perf_time=perf_time,
+            wall_time=wall_time,
         )
-        self._emit_manual_pulse_event(
-            manual, "requested", "before_output_start", manual.context,
-            manual.perf_time, manual.wall_time)
-        return manual
+
+    def _manual_pulse_trace(self, pulse_train, manual) -> LaserTraceBlock:
+        """A manual Run Pulse's waveform, told from the time it was asked for.
+
+        Stamped as it is told, its rows fell after the train had ended. Drawn
+        from the request's time, each point was output at or after its row's
+        time. The live graph places a trace by its own x values, not by these.
+        """
+        return dataclasses.replace(
+            self._make_pulse_trace(pulse_train),
+            origin_perf_time=manual.perf_time,
+            origin_wall_time=manual.wall_time,
+            timestamp_method=_MANUAL_PULSE_TIMESTAMP_METHOD,
+            timing_confidence="before_output",
+        )
 
     def _manual_pulse_ended(self, manual, event, timing_confidence, error=None) -> None:
         """Tell how a manual Run Pulse ended, and what its output may hold.
