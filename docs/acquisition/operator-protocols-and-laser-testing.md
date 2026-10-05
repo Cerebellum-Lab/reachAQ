@@ -306,7 +306,8 @@ Pulse down, and starts it on the NI clock when you release it on the button.
 An armed output started about 0.6 ms after its start was asked for, where
 arming it after the click took 12-18 ms (christielab10; measured outside
 reachAQ, not yet in it). The shutter opens as it arms, if **Open
-shutter** is ticked. Drag off the button before you release it, or hold it
+shutter** is ticked, and the status line reads *"Laser 1 armed: release to
+fire"* until you do. Drag off the button before you release it, or hold it
 down for over 2 s, and the pulse is disarmed: nothing fires, the shutter
 closes, and the status line says so. A click quicker than the arm fires as
 soon as the arm is ready. With *external*, the output is armed and waits for

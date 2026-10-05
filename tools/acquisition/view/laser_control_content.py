@@ -1220,8 +1220,10 @@ class _LaserChannelTab(QWidget):
         laser_number = self._channel.channel_id.value
         # The panel keeps this button enabled while it is down
         # (set_controls_enabled), and disables the rest, as for any operation.
+        # Armed is all it is until the click, which says it runs (the review
+        # of task 9, Minor 4).
         started = self._start_operation(
-            f"Running laser {laser_number} pulse train",
+            f"Laser {laser_number} armed: release to fire",
             lambda: press.run(laser, laser_number))
         if started is False:
             press.not_armed()
@@ -1250,6 +1252,9 @@ class _LaserChannelTab(QWidget):
             # One start, on this thread; a fire refused, its arm having just
             # ended, is said by the arming thread (_RunPulsePress.run).
             value.fire(clicked_at=press.clicked_at)
+        if action in ("fire", "armed later"):
+            # After the start: nothing is put before it on the click's path.
+            self._set_parent_status(f"Running laser {laser_number} pulse train", False)
         elif action == "ended" and value is not None:
             # Its arm was refused or failed during the press, and the status
             # line says why: told at the click, as run_pulse_train told it.
