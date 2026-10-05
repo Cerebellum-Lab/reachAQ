@@ -200,6 +200,19 @@ def _left_safe(rig, before):
     assert rig.laser.last_command_volts == before
 
 
+def _no_driver_call_on_the_qt_thread(rig, since):
+    """Nothing on the fake's timeline from the main thread since `since`.
+
+    A press let go of is disarmed from the Qt thread, and its cancel, the
+    shutter's write and the output's abort, is made on the thread that armed
+    it: Ben accepted only the click's start on the Qt thread (the review of
+    task 9, Important 1).
+    """
+    main = threading.main_thread()
+    assert [(entry.event, entry.task) for entry in rig.daq.timeline[since:]
+            if entry.thread is main] == []
+
+
 # ------------------------------------------------ the plan's D2.4 tests
 
 
@@ -238,6 +251,7 @@ def test_a_press_dragged_off_the_button_is_disarmed(rig, qapp):
     before = rig.laser.last_command_volts
     _press(rig.button)
     operation = _wait_for_the_arm(rig, qapp)
+    armed = len(rig.daq.timeline)
 
     # Qt's released, with no clicked.
     _drag_off(rig.button)
@@ -246,6 +260,8 @@ def test_a_press_dragged_off_the_button_is_disarmed(rig, qapp):
     _wait_for_the_operation(rig, qapp)
 
     assert operation.state is LaserOperationState.CANCELLED
+    # Its cancel, shutter first, was made off the Qt thread.
+    _no_driver_call_on_the_qt_thread(rig, armed)
     # No manual rows, and no waveform: nothing was asked for.
     assert rig.told == []
     _left_safe(rig, before)
@@ -422,6 +438,7 @@ def test_what_else_ends_a_press_fires_nothing_and_leaves_the_laser_safe(
     _press(rig.button)
     operation = _wait_for_the_arm(rig, qapp)
     arming_thread = rig.panel._operation_thread
+    armed = len(rig.daq.timeline)
 
     end_the_press(rig, qapp)
     _wait_until(qapp, lambda: operation.wait_until_finished(0), "the pulse's end")
@@ -432,6 +449,10 @@ def test_what_else_ends_a_press_fires_nothing_and_leaves_the_laser_safe(
     qapp.processEvents()
 
     assert operation.state is LaserOperationState.CANCELLED
+    if end_the_press is not _stop:
+        # The test's Stop closes the controller on this thread itself; the
+        # application's runs on a thread of its own.
+        _no_driver_call_on_the_qt_thread(rig, armed)
     assert rig.told == []
     _left_safe(rig, before)
 

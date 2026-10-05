@@ -103,10 +103,10 @@ class ArmedManualPulse:
     fire() starts it at the click, on the thread that decides, the Qt thread:
     one DAQmx start, its edge about 0.6 ms later (christielab10, M3 A), where
     a click that armed, wrote and started the train took 12-18 ms (session004;
-    M3 B). disarm() lets it go unfired. finish(), on the thread that armed it,
-    waits for its end and tells how it ended. One of fire() and disarm()
-    decides, once: a fire after a disarm, or after the pulse ended unfired,
-    starts nothing.
+    M3 B). disarm() asks for it to be let go unfired. finish(), on the thread
+    that armed it, makes that cancel, waits for its end and tells how it
+    ended. One of fire() and disarm() decides, once: a fire after a disarm,
+    or after the pulse ended unfired, starts nothing.
     """
 
     def __init__(self, model, controller, operation, pulse_train, manual_context, before):
@@ -126,6 +126,13 @@ class ArmedManualPulse:
         self._manual = None
         #: Set once fire() is done: its start accepted and told, or refused.
         self._fire_done = threading.Event()
+        #: Set by disarm(), and as the operation ends: what finish() waits on
+        #: before it makes a disarm's cancel.
+        self._woken = threading.Event()
+        add_terminal_callback = getattr(operation, "add_terminal_callback", None)
+        self._woken_as_it_ends = add_terminal_callback is not None
+        if add_terminal_callback is not None:
+            add_terminal_callback(lambda _ended: self._woken.set())
 
     def fire(self) -> bool:
         """Start the armed pulse, then tell it as requested; whether it started.
@@ -167,17 +174,21 @@ class ArmedManualPulse:
             self._fire_done.set()
 
     def disarm(self) -> bool:
-        """Let the pulse go unfired, unless fire() decided first; whether it did.
+        """Ask for the pulse to be let go unfired, unless fire() decided first.
 
-        A cancel: the pulse's shutter is closed, then its output aborted, and
-        the pulse's own thread resets the output and lets go of the board.
-        What is told and recorded of it is finish()'s.
+        Whether it was. Nothing is asked of the driver here: a disarm comes
+        from the Qt thread, on a release off the button, a tab switch or a
+        close, and Ben accepted only the click's start there (the review of
+        task 9, Important 1). finish(), on the thread that armed the pulse,
+        makes the cancel: the pulse's shutter closed, then its output
+        aborted; the pulse's own thread then resets the output and lets go of
+        the board.
         """
         with self._lock:
             if self._decided is not None:
                 return False
             self._decided = "disarmed"
-        self.operation.cancel()
+        self._woken.set()
         return True
 
     def finish(self) -> bool:
@@ -195,6 +206,17 @@ class ArmedManualPulse:
         """
         # Without a bound, as a waited-for Run Pulse waited for its train:
         # the operation bounds its start wait and its output itself.
+        if self._woken_as_it_ends:
+            self._woken.wait()
+        else:
+            while not (self._woken.is_set() or self.operation.wait_until_finished(0.05)):
+                pass
+        with self._lock:
+            disarmed = self._decided == "disarmed"
+        if disarmed:
+            # The disarm's cancel, made here, off the Qt thread. One already
+            # ended, by its start wait or a close, is left as it is.
+            self.operation.cancel()
         self.operation.wait_until_finished()
         with self._lock:
             if self._decided is None:

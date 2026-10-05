@@ -1249,9 +1249,9 @@ class _LaserChannelTab(QWidget):
 
         Its press ended with no click: dragged off the button, the focus
         gone, its tab switched away from, or the panel closing. Its pulse
-        is disarmed: its shutter closed and its output aborted, on this
-        thread, then reset by the pulse's own. A clicked press is no longer
-        the tab's, and fires.
+        is disarmed: the thread that armed it closes its shutter and aborts
+        its output, and nothing is asked of the driver on this one. A
+        clicked press is no longer the tab's, and fires.
         """
         press, self._press = self._press, None
         if press is None:
