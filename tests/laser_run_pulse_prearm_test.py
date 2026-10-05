@@ -232,9 +232,12 @@ def test_a_press_arms_the_pulse_and_its_click_fires_it_on_the_main_thread(rig, q
     assert rig.daq.writes_to(SHUTTER_LINE)[-1] is True
     assert rig.told == []
     assert rig.button.isDown() and rig.button.isEnabled()
+    # Nothing runs yet, and the footer says so (the review of task 9, Minor 4).
+    assert _footer(rig).text() == "Laser 1 armed: release to fire"
 
     _release(rig.button)
 
+    assert _footer(rig).text() == "Running laser 1 pulse train"
     (label, thread, started_at), = starts
     assert (label, thread) == (AO, threading.main_thread())
     _wait_for_the_operation(rig, qapp)
