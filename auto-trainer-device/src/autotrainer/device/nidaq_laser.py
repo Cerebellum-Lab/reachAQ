@@ -1654,6 +1654,25 @@ class NidaqLaserController:
         close_opened_shutters: bool = False,
     ) -> None:
         errors = []
+        closed_first = set()
+
+        def close_shutter(channel):
+            try:
+                self._close_shutter(channel)
+                closed_first.add(channel.channel_id)
+            except Exception as exc:
+                errors.append((f"channel {channel.channel_id.value} shutter close", exc))
+                logger.exception("Failed to close NI-DAQ laser shutter for channel %s", channel.channel_id.value)
+
+        if close_opened_shutters:
+            # A pulse that did not run to its end closes the shutters it
+            # opened first, before the output's stop, close and reset, as a
+            # cancel closes them before its abort (Ben, 2026-10-05): closed
+            # last, they stayed open for those, with the output possibly
+            # still driven. One that fails to close is tried again below.
+            for channel, channel_pulse in zip(channels, channel_pulses):
+                if channel_pulse.open_shutter:
+                    close_shutter(channel)
         self._stop_and_close_task("pulse analog output task", ao_task, errors)
         # The command straight after the output's own task lets go of it:
         # aborted mid-pulse, DAQmx leaves the output on the last sample it
@@ -1672,13 +1691,11 @@ class NidaqLaserController:
                     channel, "its pulse train",
                     f"the pulse's amplitude, {channel_pulse.amplitude_volts:g} V")
         for channel, channel_pulse in zip(channels, channel_pulses):
+            if channel.channel_id in closed_first:
+                continue
             if channel_pulse.close_shutter or (
                     close_opened_shutters and channel_pulse.open_shutter):
-                try:
-                    self._close_shutter(channel)
-                except Exception as exc:
-                    errors.append((f"channel {channel.channel_id.value} shutter close", exc))
-                    logger.exception("Failed to close NI-DAQ laser shutter for channel %s", channel.channel_id.value)
+                close_shutter(channel)
         for index, task in enumerate(digital_tasks):
             self._stop_and_close_task(f"pulse digital output task {index}", task, errors)
         # After the tasks that use them, and only this pulse train's own: the

@@ -1575,3 +1575,69 @@ def test_a_delivered_pulse_still_leaves_its_shutter_as_it_asked(held):
 
     assert operation.wait(5.0) is LaserOperationState.COMPLETED
     assert daq.task("laser_1_shutter").writes[-1] is True
+
+
+def _cleanup_order(daq, thread, since):
+    """The cleanup's laser shutter writes, output stop and close, and reset, in order."""
+    wanted = {("write", "laser_1_shutter"), ("stop", "laser_sync_pulse_ao"),
+              ("close", "laser_sync_pulse_ao"), ("write", "laser_1_manual_ao")}
+    return [(entry.event, entry.task, entry.data) for entry in daq.timeline[since:]
+            if entry.thread is thread and (entry.event, entry.task) in wanted]
+
+
+@pytest.mark.parametrize("close_shutter", [False, True], ids=["left_open", "closed"])
+def test_a_failed_pulse_closes_its_shutter_before_it_stops_the_output(held, close_shutter):
+    # Ben, 2026-10-05: a failure closes the shutters the pulse opened first,
+    # before the output's stop, close and reset, in a cancel's order. They
+    # closed last, so the shutter stayed open for those, a few ms, with the
+    # output possibly still driven (the review of tasks 7-8, M3).
+    daq = held
+    controller = NidaqLaserController(_routed())
+    create = controller._create_synchronized_analog_output_task
+    fail_now = threading.Event()
+
+    def failing_wait(channels, name):
+        task = create(channels, name)
+
+        def wait_until_done(timeout):
+            assert fail_now.wait(5.0)
+            raise FakeDaqError(-200560, "Wait Until Done did not indicate done")
+
+        task.wait_until_done = wait_until_done
+        return task
+
+    controller._create_synchronized_analog_output_task = failing_wait
+    operation = controller.run_synchronized_pulse_train(LaserSynchronizedPulseTrain(
+        pulse_trains=(dataclasses.replace(PULSE, close_shutter=close_shutter),),
+        wait=False, defer_start=True, timeout_seconds=30.0))
+    operation.trigger()
+    before = len(daq.timeline)
+    fail_now.set()
+
+    assert operation.wait_until_finished(5.0)
+    assert operation.state is LaserOperationState.FAILED
+    assert _cleanup_order(daq, operation._thread, before) == [
+        ("write", "laser_1_shutter", False),
+        ("stop", "laser_sync_pulse_ao", None),
+        ("close", "laser_sync_pulse_ao", None),
+        ("write", "laser_1_manual_ao", 0.0),
+    ]
+
+
+def test_a_delivered_pulse_still_closes_its_shutter_after_the_reset(held):
+    # Unchanged for a pulse that completes: the output's stop, close and
+    # reset, then the shutter, as "Close shutter" asks.
+    daq = held
+    controller = NidaqLaserController(_routed())
+    operation = _armed(controller, defer_start=True)
+    operation.trigger()
+    before = len(daq.timeline)
+    daq.waits_released.set()
+
+    assert operation.wait(5.0) is LaserOperationState.COMPLETED
+    assert _cleanup_order(daq, operation._thread, before) == [
+        ("stop", "laser_sync_pulse_ao", None),
+        ("close", "laser_sync_pulse_ao", None),
+        ("write", "laser_1_manual_ao", 0.0),
+        ("write", "laser_1_shutter", False),
+    ]
