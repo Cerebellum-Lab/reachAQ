@@ -272,27 +272,39 @@ class NidaqLaserOperation:
         cancel(): a start hung in the driver holds this caller, and not a
         cancel or close().
         """
-        with self._lock:
-            if (self._state is not LaserOperationState.ARMED
-                    or self._start_claim is not None):
-                found = self._state.value
-                if self._state is LaserOperationState.ARMED:
-                    found = f"{found}, {self._start_claim}"
-                raise RuntimeError(f"Laser operation must be armed, found {found}")
-            self._start_claim = _CLAIMED_BY_TRIGGER
-            starter = self._starter
-        if starter is None:
-            self._start_done.set()
-            self._start_requested.set()
-            return time.perf_counter()
-        entry = time.perf_counter()
+        # The claim is made inside the try, so that nothing can come between
+        # it and the finally: an exception there, a KeyboardInterrupt on the
+        # main thread say, left _start_done unset, and the pulse's thread
+        # waiting for it without end (the review of tasks 7-8, M1).
+        claimed = looked = False
         try:
-            self._start_and_look(starter)
+            with self._lock:
+                if (self._state is not LaserOperationState.ARMED
+                        or self._start_claim is not None):
+                    found = self._state.value
+                    if self._state is LaserOperationState.ARMED:
+                        found = f"{found}, {self._start_claim}"
+                    raise RuntimeError(f"Laser operation must be armed, found {found}")
+                claimed = True
+                self._start_claim = _CLAIMED_BY_TRIGGER
+                starter = self._starter
+            entry = time.perf_counter()
+            if starter is not None:
+                self._start_and_look(starter)
+            looked = True
         finally:
-            # Whatever came of it: the pulse's thread waits for this, with no
-            # bound, before it touches a task.
-            self._start_done.set()
-            self._start_requested.set()
+            if claimed:
+                if not looked:
+                    # Interrupted before its start was made and looked at:
+                    # the pulse's thread fails, and does not take it as begun.
+                    with self._lock:
+                        if self._start_error is None:
+                            self._start_error = RuntimeError(
+                                "trigger() was interrupted before its start")
+                # Whatever came of it: the pulse's thread waits for this, with
+                # no bound, before it touches a task.
+                self._start_done.set()
+                self._start_requested.set()
         return entry
 
     def _start_and_look(self, starter):
@@ -344,15 +356,17 @@ class NidaqLaserOperation:
         with self._lock:
             self._starter = start
 
-    def _end_start_wait(self) -> bool:
+    def _end_start_wait(self, raise_start_error=True) -> bool:
         """The pulse's thread is done waiting for its start: who starts, decided.
 
-        Called once the start wait has returned, woken or run out, under the
-        lock trigger() claims under. With no claim the window closes, and no
-        trigger() can claim after it: False. With one, that trigger's start is
-        the pulse's: this waits for it with no bound, as a start hung in the
-        driver held this thread before, and raises what it raised; True.
-        Either way, no start runs while this thread stops or closes the tasks.
+        Called once the start wait has returned, woken or run out, or raised,
+        under the lock trigger() claims under. With no claim the window
+        closes, and no trigger() can claim after it: False. With one, that
+        trigger's start is the pulse's: this waits for it with no bound, as a
+        start hung in the driver held this thread before, and raises what it
+        raised unless told not to (the wait's own error goes on instead);
+        True. Either way, no start runs while this thread stops or closes the
+        tasks.
         """
         with self._lock:
             if self._start_claim is None:
@@ -361,7 +375,7 @@ class NidaqLaserOperation:
         self._start_done.wait()
         with self._lock:
             error = self._start_error
-        if error is not None:
+        if error is not None and raise_start_error:
             raise error
         return True
 
@@ -1256,8 +1270,17 @@ class NidaqLaserController:
                 # thread waits for it, or for its start wait to run out, and
                 # then for any start a trigger() claimed (_end_start_wait).
                 operation._bind_starter(start)
-                operation._mark_armed()
-                operation._start_requested.wait(start_wait_seconds)
+                try:
+                    operation._mark_armed()
+                    operation._start_requested.wait(start_wait_seconds)
+                except BaseException:
+                    # Decided before the error goes on to the cleanup, as
+                    # after any wait: left open, a trigger() could claim and
+                    # start the output under the cleanup's stop and close
+                    # (Event.wait(inf) raised OverflowError; the review of
+                    # tasks 7-8, M1).
+                    operation._end_start_wait(raise_start_error=False)
+                    raise
                 if not operation._end_start_wait():
                     operation._require_not_cancelled()
                     raise TimeoutError("Deferred laser operation did not receive a start request")

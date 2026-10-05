@@ -15,6 +15,18 @@ from autotrainer.core import (
 )
 
 
+def _check_timeout_seconds(timeout_seconds: Optional[float]) -> None:
+    """A timeout, when given, is a finite time above 0 s.
+
+    A NaN passed "<= 0", and an infinite one is no bound: Event.wait(inf)
+    raised OverflowError on a deferred pulse's thread, before its start was
+    decided (the review of latency tasks 7-8, M1).
+    """
+    if timeout_seconds is not None and not (
+            math.isfinite(timeout_seconds) and timeout_seconds > 0):
+        raise ValueError("timeout_seconds must be a finite time above 0 s when provided")
+
+
 @dataclasses.dataclass(frozen=True)
 class LaserFeedbackSample:
     channel_id: LaserChannelId
@@ -73,8 +85,7 @@ class LaserPulseTrain:
             raise ValueError("trigger_output_pulse_ms must be positive")
         if self.timing_trigger_output_pulse_ms <= 0:
             raise ValueError("timing_trigger_output_pulse_ms must be positive")
-        if self.timeout_seconds is not None and self.timeout_seconds <= 0:
-            raise ValueError("timeout_seconds must be positive when provided")
+        _check_timeout_seconds(self.timeout_seconds)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -104,8 +115,7 @@ class LaserSynchronizedPulseTrain:
         object.__setattr__(self, "trigger_edge", self.trigger_edge.lower())
         if self.trigger_edge not in ("rising", "falling"):
             raise ValueError("trigger_edge must be 'rising' or 'falling'")
-        if self.timeout_seconds is not None and self.timeout_seconds <= 0:
-            raise ValueError("timeout_seconds must be positive when provided")
+        _check_timeout_seconds(self.timeout_seconds)
         if self.start_wait_seconds is not None:
             # A NaN passed "<= 0", and an infinite wait is no bound at all.
             if not (math.isfinite(self.start_wait_seconds) and self.start_wait_seconds > 0):
@@ -189,8 +199,7 @@ class LaserCalibrationRamp:
             raise ValueError("pmt_shutter_open_delay_ms cannot be negative")
         if self.pmt_shutter_close_delay_ms < 0:
             raise ValueError("pmt_shutter_close_delay_ms cannot be negative")
-        if self.timeout_seconds is not None and self.timeout_seconds <= 0:
-            raise ValueError("timeout_seconds must be positive when provided")
+        _check_timeout_seconds(self.timeout_seconds)
 
     def settle_sample_count(self, sample_rate_hz: float) -> int:
         """The samples at the start of each step left out of its point.

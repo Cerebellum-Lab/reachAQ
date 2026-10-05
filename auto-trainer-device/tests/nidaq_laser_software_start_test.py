@@ -113,6 +113,7 @@ class _StartWaitOnCue:
         self._condition = threading.Condition()
         self._set = False
         self._ran_out = False
+        self._error = None
 
     def set(self):
         with self._condition:
@@ -128,9 +129,18 @@ class _StartWaitOnCue:
             self._ran_out = True
             self._condition.notify_all()
 
+    def raise_in_wait(self, error):
+        """The wait raises `error`, as Event.wait(inf) raised OverflowError."""
+        with self._condition:
+            self._error = error
+            self._condition.notify_all()
+
     def wait(self, timeout=None):
         with self._condition:
-            self._condition.wait_for(lambda: self._set or self._ran_out, 10.0)
+            self._condition.wait_for(
+                lambda: self._set or self._ran_out or self._error is not None, 10.0)
+            if self._error is not None and not self._set:
+                raise self._error
             return self._set
 
 
@@ -431,6 +441,38 @@ def test_a_trigger_after_the_start_wait_ran_out_starts_nothing(held, on_cue):
     assert isinstance(operation.error, TimeoutError)
     with pytest.raises(RuntimeError, match="must be armed"):
         operation.trigger()
+    _left_safe(daq, controller, operation, before)
+
+
+def test_a_start_wait_that_raises_leaves_no_window_to_claim(held, on_cue):
+    # The start wait itself raised: Event.wait(inf) raised OverflowError, an
+    # infinite timeout_seconds passing validation then. The window was never
+    # closed, the operation stayed armed through its cleanup, and a trigger
+    # landing then started the output under the cleanup's stop and close
+    # (the review of tasks 7-8, M1). It is closed before the error goes on.
+    daq = held
+    controller = NidaqLaserController(_routed())
+    operation = _arm(controller)
+    stop_and_close = controller._stop_and_close_task
+    triggered = []
+
+    def a_trigger_lands_as_the_output_stops(name, task, errors):
+        if task.label == AO and not triggered:
+            caller, outcome = _in_thread(operation.trigger)
+            caller.join(5.0)
+            triggered.append(outcome)
+        return stop_and_close(name, task, errors)
+
+    controller._stop_and_close_task = a_trigger_lands_as_the_output_stops
+    before = len(daq.writes)
+    operation._start_requested.raise_in_wait(OverflowError("timeout value is too large"))
+
+    assert operation.wait_until_finished(5.0)
+    (refused,), = triggered
+    assert isinstance(refused, RuntimeError) and "must be armed" in str(refused)
+    assert daq.starts == []
+    assert operation.state is LaserOperationState.FAILED
+    assert isinstance(operation.error, OverflowError)
     _left_safe(daq, controller, operation, before)
 
 
