@@ -804,25 +804,63 @@ class TrialActionExecutor:
             if self._detector_handle is not None:
                 self._activate_detector(self._detector_handle)
                 self._observe("stim-camera First Reach detector activated")
-            self.execute_phase("pellet_presentation")
-            return operation
+            direct_start = self._execute_phase_locked("pellet_presentation")
+        self._start_direct_laser(direct_start)
+        return operation
 
     def execute_phase(self, phase: str):
         with self._lock:
-            operation = self._require_current()
-            recipe = operation.recipe
-            row = recipe.requested_row
-            if recipe.tone_profile is not None and row["tone_phase"] == phase:
-                self._play_tone(recipe.tone_profile, phase)
-                self._observe(f"{phase} tone acknowledged")
-                # Tone 1 has just sounded, so the cue interval starts here.
-                self._arm_cue_pair(recipe, phase)
-            # A laser is already armed. Phase execution records the semantic
-            # trigger point; the configured board STIM/NI route owns physical
-            # start.
-            if recipe.laser_profile is not None and row["laser_phase"] == phase:
-                self._trigger_laser_if_direct(phase)
-                self._observe(f"{phase} laser trigger enabled")
+            direct_start = self._execute_phase_locked(phase)
+        self._start_direct_laser(direct_start)
+
+    def _execute_phase_locked(self, phase: str):
+        """The phase's actions, under the lock; a direct NI start left to the caller.
+
+        Returns the direct NI laser start the phase makes, as (operation,
+        handle, observation), for _start_direct_laser once the lock is let
+        go of; None when it makes none.
+        """
+        operation = self._require_current()
+        recipe = operation.recipe
+        row = recipe.requested_row
+        if recipe.tone_profile is not None and row["tone_phase"] == phase:
+            self._play_tone(recipe.tone_profile, phase)
+            self._observe(f"{phase} tone acknowledged")
+            # Tone 1 has just sounded, so the cue interval starts here.
+            self._arm_cue_pair(recipe, phase)
+        # A laser is already armed. Phase execution records the semantic
+        # trigger point; the configured board STIM/NI route owns physical
+        # start.
+        if recipe.laser_profile is not None and row["laser_phase"] == phase:
+            observation = f"{phase} laser trigger enabled"
+            handle = self._direct_laser_handle()
+            if handle is None:
+                self._observe(observation)
+                return None
+            return operation, handle, observation
+        return None
+
+    def _start_direct_laser(self, direct_start) -> None:
+        """Start a phase's direct NI laser, with the executor's lock let go of.
+
+        trigger() starts the output on its caller's thread (D2.3). Under the
+        lock, a start hung in the driver held Stop's cancel() on the lock,
+        before it reached the laser's cancel and its shutter close (the
+        review of latency tasks 7-8, M2). As prepare's before_send start is,
+        it is made after the lock: the operation's own claim refuses it once
+        a cancel has landed, and a cancel landing during it closes the
+        shutter, then aborts what it started. Its record and observation are
+        taken under the lock again, on the operation that asked for it, if
+        that is still the current one.
+        """
+        if direct_start is None:
+            return
+        operation, handle, observation = direct_start
+        handle.trigger()
+        with self._lock:
+            if self._operation is operation:
+                self._snapshot_laser_action(handle)
+                self._observe(observation)
 
     def trigger_stimulus(self, operation_id: str, generation: int, *, detail="stimulus"):
         """Accept one generation-tagged detector trigger for the prepared laser."""
@@ -845,16 +883,23 @@ class TrialActionExecutor:
                 raise RuntimeError(f"Unsupported stimulus route: {firing.trigger_route}")
 
     def _trigger_laser_if_direct(self, detail):
+        handle = self._direct_laser_handle()
+        if handle is None:
+            return False
+        handle.trigger()
+        self._snapshot_laser_action()
+        return True
+
+    def _direct_laser_handle(self):
+        """The prepared laser to start by software; None for another route."""
         operation = self._require_current()
         firing = operation.recipe.laser_firing
         if firing is None or firing.trigger_route is not LaserTriggerRoute.DIRECT_NI_SOFTWARE:
-            return False
-        trigger = getattr(self._laser_handle, "trigger", None)
-        if trigger is None:
+            return None
+        handle = self._laser_handle
+        if getattr(handle, "trigger", None) is None:
             raise RuntimeError("Prepared direct NI laser operation cannot be triggered")
-        trigger()
-        self._snapshot_laser_action()
-        return True
+        return handle
 
     def complete(self, detail=""):
         with self._lock:
