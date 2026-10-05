@@ -1,4 +1,6 @@
 import dataclasses
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -605,4 +607,104 @@ def test_a_laser_the_controller_refuses_is_recorded_as_a_refusal(monkeypatch):
     finally:
         holder.cancel()
         holder.wait_until_finished(5.0)
+        model.close()
+
+
+# ------------------------------------------------ a phase's start held in the driver
+
+
+def _in_thread(function, *args):
+    outcome = []
+
+    def run():
+        try:
+            outcome.append(function(*args))
+        except Exception as error:
+            outcome.append(error)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread, outcome
+
+
+@pytest.mark.parametrize("phase", ["pellet_presentation", "retract"])
+def test_a_stop_reaches_the_lasers_cancel_while_a_phases_start_is_held(monkeypatch, phase):
+    # trigger() starts a direct NI laser on its caller's thread (D2.3). A
+    # phase called it holding the executor's lock, so a start hung in the
+    # driver held Stop's executor.cancel() on that lock before it reached
+    # the laser's cancel: the shutter, opened at arm, stayed open (the review
+    # of tasks 7-8, M2). The start is now made after the lock is let go, as
+    # prepare's before_send start is, and the operation's own claim and
+    # cancel protect it.
+    from laser_model_test import _nidaq_model
+    from tools.acquisition.model.laser_model import wait_until_cancelled_ends
+
+    model, daq = _nidaq_model(monkeypatch)
+    row = TrialProtocolRow(trial_id=1).with_updates({
+        "enabled": True,
+        "laser_profile_id": "pulse",
+        "laser_phase": phase,
+        "laser_trigger_route": "direct_ni_software",
+        "laser_channel_id": 1,
+        "stimulus_assignment": "always",
+        "stimulus_trigger": "first_reach",
+    })
+    recipe = _compiler().compile(row, _context())
+
+    def cancel_as_the_app_does(handle):
+        # AppModel._cancel_protocol_laser: the cancel, then a bounded wait for
+        # the operation to end.
+        handle.cancel()
+        wait_until_cancelled_ends(handle)
+
+    executor = TrialActionExecutor(
+        move_absolute=lambda target: None,
+        configure_cover=lambda policy, recipe: None,
+        play_tone=lambda profile, phase: None,
+        prepare_laser=lambda profile, recipe: model.prepare_pulse_profile(
+            profile, recipe.laser_firing, recipe),
+        cancel_laser=cancel_as_the_app_does,
+    )
+    starting, release = threading.Event(), threading.Event()
+
+    def held_in_the_driver(task):
+        if task.label == "laser_sync_pulse_ao":
+            starting.set()
+            release.wait(10.0)
+
+    try:
+        executor.prepare(recipe)
+        laser = executor._laser_handle
+        executor.bind_send(recipe.operation_id, 4, "can-context")
+        daq.before_start = held_in_the_driver
+        if phase == "pellet_presentation":
+            phase_thread, _outcome = _in_thread(
+                executor.acknowledge_presentation, "can-context")
+        else:
+            executor.acknowledge_presentation("can-context")
+            phase_thread, _outcome = _in_thread(executor.execute_phase, phase)
+        try:
+            assert starting.wait(5.0)
+            canceller, _cancelled = _in_thread(lambda: executor.cancel(reason="stop"))
+            deadline = time.monotonic() + 3.0
+            while daq.writes_to("PXI1Slot5/port0/line4")[-1] is not False:
+                assert time.monotonic() < deadline, "the cancel never closed the shutter"
+                time.sleep(0.005)
+            canceller.join(5.0)
+
+            assert not canceller.is_alive()
+            assert not release.is_set()
+            assert executor.operation.state is PreparedState.CANCELLED
+        finally:
+            release.set()
+        phase_thread.join(5.0)
+
+        assert not phase_thread.is_alive()
+        assert laser.wait_until_finished(5.0)
+        assert laser.state.value == "cancelled"
+        assert daq.writes_to("PXI1Slot5/port0/line4")[-1] is False
+        assert daq.writes_to("PXI1Slot4/ao0")[-1] == 0.0
+        assert daq.reserved == {}
+    finally:
+        release.set()
         model.close()
