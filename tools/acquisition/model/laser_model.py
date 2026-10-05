@@ -146,18 +146,26 @@ class ArmedManualPulse:
         or a close.
         """
         perf_time, wall_time = time.perf_counter(), time.time()
-        with self._lock:
-            if self._decided is not None:
-                return False
-            self._decided = "fired"
+        # The claim is made inside the try, so that nothing can come between
+        # it and the finally: an exception there, a KeyboardInterrupt on the
+        # Qt thread say, left _fire_done unset and finish() waiting for it
+        # without end (the review of task 9, Minor 1; as trigger() claims).
+        claimed = False
         try:
+            with self._lock:
+                if self._decided is not None:
+                    return False
+                claimed = True
+                self._decided = "fired"
+            # Made before the start: made after it, one that failed left a
+            # pulse that ran with nothing told of it (Minor 6).
+            manual = self._model._manual_pulse(
+                self._pulse_train, self._manual_context, perf_time, wall_time)
             try:
                 self.operation.trigger()
             except RuntimeError:
                 # Raised only when it is not armed: nothing was started.
                 return False
-            manual = self._model._manual_pulse(
-                self._pulse_train, self._manual_context, perf_time, wall_time)
             with self._lock:
                 self._manual = manual
             try:
@@ -171,7 +179,8 @@ class ArmedManualPulse:
                     manual.operation_id)
             return True
         finally:
-            self._fire_done.set()
+            if claimed:
+                self._fire_done.set()
 
     def disarm(self) -> bool:
         """Ask for the pulse to be let go unfired, unless fire() decided first.
@@ -711,6 +720,8 @@ class LaserModel(ObservableObject):
                     "laser controller was closed") from error
             raise
         if operation is None:
+            # Nothing armed, so nothing driven, as for the failures above.
+            self._undo_refused_pulse(before)
             raise RuntimeError("The laser controller did not arm Run Pulse's operation")
         return ArmedManualPulse(
             self, controller, operation, pulse_train, dict(manual_context), before)

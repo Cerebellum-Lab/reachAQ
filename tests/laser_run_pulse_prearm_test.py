@@ -542,3 +542,38 @@ def test_a_recorder_that_fails_at_the_request_no_longer_stops_the_pulse(rig, qap
                if requested.operation_id in record.getMessage()]
     assert logged.levelname == "ERROR"
     assert _footer(rig).text() == "Pulse complete: laser 1"
+
+
+def test_a_pulse_whose_record_cannot_be_made_is_not_started(rig, qapp, monkeypatch):
+    # Made after the start, a record that failed left a pulse that ran with
+    # nothing told of it, and its amplitude's record taken back (the review
+    # of task 9, Minor 6). Made before it, the click starts nothing, and the
+    # arm is let go by its start wait.
+    monkeypatch.setattr(laser_control_content, "_RUN_PULSE_ARM_CAP_S", 0.5)
+
+    def cannot(*_args):
+        raise RuntimeError("the record could not be made")
+
+    monkeypatch.setattr(rig.laser, "_manual_pulse", cannot)
+    before = rig.laser.last_command_volts
+    _press(rig.button)
+    _wait_for_the_arm(rig, qapp)
+    _release(rig.button)
+    _wait_for_the_operation(rig, qapp)
+
+    assert rig.told == []
+    _left_safe(rig, before)
+
+
+def test_an_arm_that_returns_no_operation_takes_its_amplitude_back(rig, monkeypatch):
+    # Every other arm failure took it back; this defensive one raised with
+    # the amplitude still recorded as what the output may hold (Minor 6).
+    before = rig.laser.last_command_volts
+    pulse_train, manual_context = rig.tab._validated_pulse()
+    monkeypatch.setattr(rig.controller, "run_synchronized_pulse_train", lambda _train: None)
+
+    with pytest.raises(RuntimeError, match="did not arm"):
+        rig.laser.arm_manual_pulse(
+            pulse_train, manual_context=manual_context, start_wait_seconds=2.0)
+
+    assert rig.laser.last_command_volts == before
