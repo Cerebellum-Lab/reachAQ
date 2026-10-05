@@ -467,6 +467,11 @@ class NullLaserController:
 
         def execute():
             terminal_error = None
+            # As NidaqLaserController's: a pulse that does not run to its
+            # end, cancelled or failed, closes the shutters it opened,
+            # whatever close_shutter says (Ben, 2026-10-02). There is no
+            # before_abort here, so a cancel does not close them itself.
+            shutters_opened = delivered = False
             try:
                 operation._mark_armed()
                 timeout = (
@@ -480,6 +485,7 @@ class NullLaserController:
                     )
                 operation._require_not_cancelled()
                 operation._mark_triggered("emulated software start accepted")
+                shutters_opened = True
                 for train in pulse_train.pulse_trains:
                     channel = self._configuration.get_channel(train.channel_id)
                     if train.open_shutter:
@@ -493,6 +499,7 @@ class NullLaserController:
                     operation._require_not_cancelled()
                     time.sleep(min(0.01, max(0.0, deadline - time.perf_counter())))
                 operation._require_not_cancelled()
+                delivered = True
             except Exception as error:
                 terminal_error = error
             finally:
@@ -501,7 +508,8 @@ class NullLaserController:
                     self.set_command_voltage(
                         channel.channel_id, channel.minimum_command_volts
                     )
-                    if train.close_shutter:
+                    if train.close_shutter or (
+                            shutters_opened and not delivered and train.open_shutter):
                         self.set_shutter_open(channel.channel_id, False)
             if terminal_error is None:
                 operation._complete()
