@@ -134,7 +134,7 @@ class ArmedManualPulse:
         if add_terminal_callback is not None:
             add_terminal_callback(lambda _ended: self._woken.set())
 
-    def fire(self) -> bool:
+    def fire(self, *, clicked_at: Optional[float] = None, fallback: bool = False) -> bool:
         """Start the armed pulse, then tell it as requested; whether it started.
 
         The row is stamped before the start and told after it (Ben,
@@ -144,6 +144,12 @@ class ArmedManualPulse:
         False, with nothing told, once it was decided already, or is no
         longer armed: let go by a disarm, by its start wait, or by a cancel
         or a close.
+
+        `clicked_at` is the click's perf_counter time, and `fallback` says
+        it came before the arm was ready, so that the arming thread fires it:
+        both go in the row, which a fallback's start, later than its click,
+        would otherwise read as a click's sub-ms one (the review of task 9,
+        Minor 3).
         """
         perf_time, wall_time = time.perf_counter(), time.time()
         # The claim is made inside the try, so that nothing can come between
@@ -170,7 +176,9 @@ class ArmedManualPulse:
                 self._manual = manual
             try:
                 self._model._emit_manual_pulse_event(
-                    manual, "requested", "before_output_start", manual.context,
+                    manual, "requested", "before_output_start",
+                    {**manual.context, "fallback": bool(fallback),
+                     "click_perf_time": clicked_at},
                     perf_time, wall_time)
             except Exception:
                 logger.exception(

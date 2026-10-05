@@ -242,6 +242,10 @@ def test_a_press_arms_the_pulse_and_its_click_fires_it_on_the_main_thread(rig, q
     assert (requested.event, completed.event) == ("requested", "completed")
     # Stamped before the start, told after it (decision 3).
     assert requested.origin_perf_time <= started_at <= told_at["requested"]
+    # Fired by its click, not once armed: a start about 0.6 ms after it.
+    context = json.loads(requested.context_json)
+    assert context["fallback"] is False
+    assert context["click_perf_time"] <= requested.origin_perf_time
     assert rig.daq.starts.count(AO) == 1
     assert rig.laser.last_command_volts == {1: 0.0}
     assert _footer(rig).text() == "Pulse complete: laser 1"
@@ -297,8 +301,8 @@ def test_a_press_held_past_its_cap_is_disarmed(rig, qapp, monkeypatch):
     assert _footer(rig).text() == "Pulse complete: laser 1"
 
 
-def test_a_click_before_its_arm_is_ready_fires_it_once_armed(rig, qapp, fake, monkeypatch, caplog):
-    caplog.set_level("INFO", logger=laser_control_content.__name__)
+def _hold_the_output_write(fake, monkeypatch):
+    """The arm held in its output's buffer write; (writing, release)."""
     writing, release = threading.Event(), threading.Event()
     write = fake.FakeTask.write
 
@@ -309,6 +313,12 @@ def test_a_click_before_its_arm_is_ready_fires_it_once_armed(rig, qapp, fake, mo
         return write(task, data, auto_start)
 
     monkeypatch.setattr(fake.FakeTask, "write", held_write)
+    return writing, release
+
+
+def test_a_click_before_its_arm_is_ready_fires_it_once_armed(rig, qapp, fake, monkeypatch, caplog):
+    caplog.set_level("INFO", logger=laser_control_content.__name__)
+    writing, release = _hold_the_output_write(fake, monkeypatch)
     starts = []
     rig.daq.before_start = lambda task: starts.append((task.label, threading.current_thread()))
 
@@ -325,7 +335,38 @@ def test_a_click_before_its_arm_is_ready_fires_it_once_armed(rig, qapp, fake, mo
     fallback, = [record for record in caplog.records
                  if "fired once armed" in record.getMessage()]
     assert fallback.levelname == "INFO"
-    assert [trace.event for trace in _manual_events(rig.told)] == ["requested", "completed"]
+    requested, completed = _manual_events(rig.told)
+    assert (requested.event, completed.event) == ("requested", "completed")
+    # Marked as fired once armed, with its click's time, which is earlier
+    # than its start: the data tells it from a sub-ms start (Minor 3).
+    context = json.loads(requested.context_json)
+    assert context["fallback"] is True
+    assert context["click_perf_time"] < requested.origin_perf_time
+
+
+def test_a_click_before_its_arm_whose_start_is_refused_says_so(
+    rig, qapp, fake, monkeypatch, caplog,
+):
+    # The log line said "fired once armed" whenever trigger() returned, and a
+    # start the driver refuses returns too, as the operation's failure
+    # (the review of task 9, Minor 8).
+    caplog.set_level("INFO", logger=laser_control_content.__name__)
+    writing, release = _hold_the_output_write(fake, monkeypatch)
+    rig.daq.failing_task = AO
+
+    _press(rig.button)
+    assert writing.wait(5.0)
+    _release(rig.button)
+    release.set()
+    _wait_for_the_operation(rig, qapp)
+
+    messages = [record.getMessage() for record in caplog.records
+                if record.levelname == "INFO" and "Run Pulse was clicked" in record.getMessage()]
+    assert len(messages) == 1
+    assert "fired once armed" not in messages[0]
+    assert "DAQmx refused to start laser_sync_pulse_ao" in messages[0]
+    assert [trace.event for trace in _manual_events(rig.told)] == ["requested", "failed"]
+    assert rig.daq.writes_to(SHUTTER_LINE)[-1] is False
 
 
 def test_a_refused_arm_is_told_as_requested_then_refused_at_its_click(rig, qapp):
@@ -463,16 +504,7 @@ def test_a_stop_while_the_press_arms_fires_nothing_and_leaves_the_laser_safe(
     # The arm is still being made: the cancel fails it before it is armed,
     # and its amplitude's record is taken back all the same.
     before = rig.laser.last_command_volts
-    writing, release = threading.Event(), threading.Event()
-    write = fake.FakeTask.write
-
-    def held_write(task, data, auto_start=False):
-        if task.label == AO:
-            writing.set()
-            assert release.wait(5.0)
-        return write(task, data, auto_start)
-
-    monkeypatch.setattr(fake.FakeTask, "write", held_write)
+    writing, release = _hold_the_output_write(fake, monkeypatch)
     _press(rig.button)
     assert writing.wait(5.0)
     operation, = rig.controller._live_operations.values()

@@ -224,6 +224,12 @@ class _RunPulsePress:
                 return "armed later", None
             return "fire", self._handle
 
+    @property
+    def clicked_at(self) -> Optional[float]:
+        """When its click came, by perf_counter, or None."""
+        with self._lock:
+            return self._clicked_at
+
     def let_go(self):
         """Its press ended with no click; the armed pulse to disarm, if any."""
         with self._lock:
@@ -265,14 +271,20 @@ class _RunPulsePress:
         with self._lock:
             self._handle = handle
             clicked_at, let_go = self._clicked_at, self._let_go
+        # How long after its click a fallback's start was asked for, said
+        # once its outcome is known: "fired once armed" was said whenever
+        # trigger() returned, a start the driver refused included (the review
+        # of task 9, Minor 8).
+        fallback_ms = None
         try:
             if clicked_at is not None:
-                fired = handle.fire()
-                logger.info(
-                    "Laser %s: Run Pulse was clicked before its arm was ready; "
-                    "%s %.1f ms after the click", laser_number,
-                    "fired once armed" if fired else "no longer armed",
-                    (time.perf_counter() - clicked_at) * 1e3)
+                fallback_ms = (time.perf_counter() - clicked_at) * 1e3
+                if not handle.fire(clicked_at=clicked_at, fallback=True):
+                    fallback_ms = None
+                    logger.info(
+                        "Laser %s: Run Pulse was clicked before its arm was ready, "
+                        "and was no longer armed once it was: nothing started",
+                        laser_number)
             elif let_go:
                 handle.disarm()
             completed = handle.finish()
@@ -281,13 +293,23 @@ class _RunPulsePress:
             if not completed and operation.error is not None and not timed_out:
                 # Failed while armed, by something other than its start wait.
                 raise operation.error
-        except BaseException:
+        except BaseException as error:
             with self._lock:
                 self._ended = True
+            if fallback_ms is not None:
+                logger.info(
+                    "Laser %s: Run Pulse was clicked before its arm was ready; its "
+                    "start, asked for %.1f ms after the click, did not deliver the "
+                    "pulse: %s", laser_number, fallback_ms, error)
             raise
         if completed:
             with self._lock:
                 self._ended = True
+            if fallback_ms is not None:
+                logger.info(
+                    "Laser %s: Run Pulse was clicked before its arm was ready; "
+                    "fired once armed, its start asked for %.1f ms after the click",
+                    laser_number, fallback_ms)
             return f"Pulse complete: laser {laser_number}"
         return self._ended_unfired(
             laser_number,
@@ -1227,7 +1249,7 @@ class _LaserChannelTab(QWidget):
         if action == "fire":
             # One start, on this thread; a fire refused, its arm having just
             # ended, is said by the arming thread (_RunPulsePress.run).
-            value.fire()
+            value.fire(clicked_at=press.clicked_at)
         elif action == "ended" and value is not None:
             # Its arm was refused or failed during the press, and the status
             # line says why: told at the click, as run_pulse_train told it.
