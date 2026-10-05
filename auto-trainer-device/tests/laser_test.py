@@ -468,6 +468,50 @@ def test_a_timeout_is_a_finite_time(make, timeout):
         make(timeout)
 
 
+def _null_system():
+    return LaserSystemConfiguration.from_channels(
+        [make_channel()], backend="null", hardware_timed=True,
+        sample_rate_hz=10_000,
+    )
+
+
+def _left_open_on_the_null(controller, duration_ms):
+    """A deferred pulse on the null controller, "Close shutter" unticked."""
+    return controller.run_synchronized_pulse_train(LaserSynchronizedPulseTrain(
+        pulse_trains=(LaserPulseTrain(
+            channel_id=LaserChannelId.LASER_1, amplitude_volts=1.0,
+            duration_ms=duration_ms, close_shutter=False),),
+        wait=False, defer_start=True, timeout_seconds=30.0))
+
+
+def test_the_null_controller_closes_the_shutter_a_cancelled_pulse_opened():
+    # As the NI controller does (Ben, 2026-10-02): a pulse that does not run
+    # to its end closes the shutter it opened, whatever "Close shutter" says.
+    # The emulation left it open after a cancel or a failure.
+    controller = NullLaserController(_null_system())
+    operation = _left_open_on_the_null(controller, duration_ms=5_000.0)
+    operation.trigger()
+    deadline = time.monotonic() + 5.0
+    while not controller.is_shutter_open(LaserChannelId.LASER_1):
+        assert time.monotonic() < deadline, "the emulated pulse never opened its shutter"
+        time.sleep(0.005)
+
+    assert operation.cancel()
+
+    assert operation.wait_until_finished(5.0)
+    assert operation.state is LaserOperationState.CANCELLED
+    assert not controller.is_shutter_open(LaserChannelId.LASER_1)
+
+
+def test_the_null_controller_leaves_a_delivered_pulses_shutter_as_it_asked():
+    controller = NullLaserController(_null_system())
+    operation = _left_open_on_the_null(controller, duration_ms=1.0)
+    operation.trigger()
+
+    assert operation.wait(5.0) is LaserOperationState.COMPLETED
+    assert controller.is_shutter_open(LaserChannelId.LASER_1)
+
+
 def test_synchronized_pulse_train_rejects_deferred_hardware_trigger():
     with pytest.raises(ValueError, match="hardware trigger"):
         LaserSynchronizedPulseTrain(
