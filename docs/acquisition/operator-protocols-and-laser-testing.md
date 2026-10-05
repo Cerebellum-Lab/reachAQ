@@ -291,6 +291,9 @@ selected"*, or that the draft is not a valid pulse train.
 In the **Run Pulse** section, set **Trigger:** and the shutter options, then
 press **Run Pulse**. It has no PMT option of its own: the PMT shutter follows
 the profile's PMT margins, as for a trial.
+A pulse that fails, or is armed and never started, closes the shutter it
+opened even with **Close shutter** unticked; only a pulse that completes
+leaves the shutter as that box says.
 The host writes the picked profile's waveform to the analog output directly.
 
 - **Success:** the status line reads *"Pulse complete: laser 1"*, and the
@@ -421,6 +424,8 @@ once the system is running, and refused while a session records.
 
 This runs the picked profile the way a trial does: arms the analog output,
 then starts it by the chosen route.
+A pulse that fails, or is armed and never started, closes the shutter it
+opened, as Run Pulse's does even with **Close shutter** unticked.
 
 - **Board STIM:** arms the output on the terminal, then asks the board for its
   timed pulse on the board line, which starts the waveform. Success reads
