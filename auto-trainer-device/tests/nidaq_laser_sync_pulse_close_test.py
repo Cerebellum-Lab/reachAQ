@@ -1467,9 +1467,11 @@ def test_an_arm_that_never_started_closes_the_shutter_it_opened(held, ended):
     shutter = daq.task("laser_1_shutter")
     before = len(daq.writes)
     if ended == "start_wait_over":
+        # A 0.5 s start wait, which the arm's caller sees out, observed over
+        # 10 s (as test_the_start_wait_is_its_own_bound).
         operation = controller.run_synchronized_pulse_train(
-            _left_open(defer_start=True, timeout_seconds=0.2))
-        assert operation.wait_until_finished(5.0)
+            _left_open(defer_start=True, start_wait_seconds=0.5, timeout_seconds=30.0))
+        assert operation.wait_until_finished(10.0)
         assert isinstance(operation.error, TimeoutError)
     elif ended == "start_refused":
         daq.failing_task = "laser_sync_pulse_ao"
