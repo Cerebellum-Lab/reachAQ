@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import threading
+import time
 from typing import Callable, Dict, Optional, Tuple
 
 import numpy as np
@@ -33,7 +34,7 @@ from autotrainer.device import (
     LaserChannelId,
     LaserPulseTrain,
 )
-from autotrainer.device.laser import CALIBRATION_SETTLE_SECONDS
+from autotrainer.device.laser import CALIBRATION_SETTLE_SECONDS, LaserPulseCancelled
 from autotrainer.pyside import CardWidget, PGWidget
 from autotrainer.pyside.content_widget import ContentWidget, invoke_method
 from tools.acquisition.model.trial_protocol_schedule import (
@@ -105,6 +106,10 @@ _TRIGGER_INPUT_KINDS = (
 #: on the footer is drawn in it.
 _ERROR_STATUS_COLOR = "#b00020"
 _ERROR_STATUS_STYLE = f"color: {_ERROR_STATUS_COLOR};"
+#: How long a press of Run Pulse keeps its pulse armed, its shutter open,
+#: before it is let go unfired (Ben, 2026-10-02): the arm's own start wait,
+#: so the controller lets it go whatever happens to the window.
+_RUN_PULSE_ARM_CAP_S = 2.0
 
 
 #: nidaqmx's DaqError ends its message with the status code on a line of its
@@ -158,6 +163,161 @@ class _LaserOperationWorker(QObject):
                 pass  # Nothing connected.
 
 
+class _RunPulsePress:
+    """One press of Run Pulse in internal mode, from its arm to its end.
+
+    The press arms the pulse and the click fires it (Ben, 2026-10-02,
+    decision 1 = D): the click is then one start, its edge about 0.6 ms
+    later, where arming, writing and starting it after the click took 12-18
+    ms (session004; christielab10, M3 B). The Qt thread has the press, the
+    click and the release; the laser_operation thread arms the pulse and
+    waits for its end. Under one lock, exactly one of them fires it, and only
+    after its click:
+    - armed before its click, the click fires it, on the Qt thread;
+    - clicked first, as QPushButton.click() and a quick click are, the
+      arming thread fires it once armed, later than a press held through it;
+    - let go of with no click, dragged off the button say, it is disarmed.
+    One neither clicked nor let go of is let go by its arm's start wait,
+    _RUN_PULSE_ARM_CAP_S.
+    """
+
+    def __init__(self, pulse_train=None, manual_context=None, refusal: str = ""):
+        self.pulse_train = pulse_train
+        self.manual_context = manual_context
+        #: Why no pulse could be made of the pick; shown at the click, as
+        #: before Run Pulse armed on its press.
+        self.refusal = refusal
+        self._lock = threading.Lock()
+        #: The ArmedManualPulse, once armed.
+        self._handle = None
+        self._clicked_at: Optional[float] = None
+        self._let_go = False
+        #: Set once the arming thread is done with it, or none was started.
+        self._ended = False
+        #: What its arm raised.
+        self._arm_error: Optional[Exception] = None
+        #: How its pulse ended unfired, for a click that comes after.
+        self.unfired = ""
+
+    def is_live(self) -> bool:
+        """Arming or armed, and neither clicked nor let go of."""
+        with self._lock:
+            return not (self.refusal or self._ended or self._let_go
+                        or self._clicked_at is not None)
+
+    def click(self):
+        """Its click, on the Qt thread: what is to be done, and with what.
+
+        ("fire", handle): armed, so the click fires it. ("armed later",
+        None): the arming thread fires it once armed. ("ended", error): it
+        ended first, by its arm's refusal or failure, `error`, which is told
+        as the click's, or with none, unfired, and `unfired` says how.
+        ("let go", None): its press had ended with no click.
+        """
+        with self._lock:
+            if self._let_go or self._clicked_at is not None:
+                return "let go", None
+            self._clicked_at = time.perf_counter()
+            if self._ended:
+                return "ended", self._arm_error
+            if self._handle is None:
+                return "armed later", None
+            return "fire", self._handle
+
+    def let_go(self):
+        """Its press ended with no click; the armed pulse to disarm, if any."""
+        with self._lock:
+            if self._let_go or self._clicked_at is not None:
+                return None
+            self._let_go = True
+            return None if self._ended else self._handle
+
+    def not_armed(self) -> None:
+        """No arm was started for it: another laser operation was running."""
+        with self._lock:
+            self._ended = True
+
+    def run(self, laser, laser_number: int) -> str:
+        """Arm it, then fire it or let it go, and wait for its end.
+
+        On the laser_operation thread, as Run Pulse's operation. What it
+        returns, or raises, is what the panel's status line shows.
+        """
+        try:
+            handle = laser.arm_manual_pulse(
+                self.pulse_train, manual_context=self.manual_context,
+                start_wait_seconds=_RUN_PULSE_ARM_CAP_S)
+        except LaserPulseCancelled:
+            # A Stop or a close as it armed: unfired, as one cancelled once
+            # armed is, with nothing told.
+            return self._ended_unfired(laser_number, "was cancelled before its click")
+        except Exception as error:
+            with self._lock:
+                self._ended = True
+                self._arm_error = error
+                clicked = self._clicked_at is not None
+            if clicked:
+                # Clicked as it armed: told here, as its click tells one
+                # whose arm was refused before it.
+                laser.tell_manual_pulse_not_armed(
+                    self.pulse_train, manual_context=self.manual_context, error=error)
+            raise
+        with self._lock:
+            self._handle = handle
+            clicked_at, let_go = self._clicked_at, self._let_go
+        try:
+            if clicked_at is not None:
+                fired = handle.fire()
+                logger.info(
+                    "Laser %s: Run Pulse was clicked before its arm was ready; "
+                    "%s %.1f ms after the click", laser_number,
+                    "fired once armed" if fired else "no longer armed",
+                    (time.perf_counter() - clicked_at) * 1e3)
+            elif let_go:
+                handle.disarm()
+            completed = handle.finish()
+            operation = handle.operation
+            timed_out = isinstance(operation.error, TimeoutError)
+            if not completed and operation.error is not None and not timed_out:
+                # Failed while armed, by something other than its start wait.
+                raise operation.error
+        except BaseException:
+            with self._lock:
+                self._ended = True
+            raise
+        if completed:
+            with self._lock:
+                self._ended = True
+            return f"Pulse complete: laser {laser_number}"
+        return self._ended_unfired(
+            laser_number,
+            f"was held over {_RUN_PULSE_ARM_CAP_S:g} s" if timed_out
+            else "was cancelled before its click")
+
+    def _ended_unfired(self, laser_number: int, how: str) -> str:
+        """It ended unfired, `how` unless it was let go of; what to say of it.
+
+        How, and whether a click came, are decided in the one hold that marks
+        it ended: a click either finds it ended, and says so itself
+        (_LaserChannelTab._on_run_pulse_clicked), or is found here.
+        """
+        with self._lock:
+            if self._let_go:
+                how = "ended without a click"
+            self.unfired = how
+            self._ended = True
+            clicked = self._clicked_at is not None
+        if clicked:
+            # Its click found it no longer armed: said as a failure, since
+            # the click asked for a pulse.
+            raise RuntimeError(self.not_fired_text(laser_number))
+        return f"Run Pulse disarmed, nothing fired: laser {laser_number}'s press {how}"
+
+    def not_fired_text(self, laser_number: int) -> str:
+        return (f"Laser {laser_number}: Run Pulse did not fire, its press "
+                f"{self.unfired}; click it again")
+
+
 class _LaserChannelTab(QWidget):
     """Single-laser controls: fire a profile, calibrate, and watch the output.
 
@@ -178,6 +338,7 @@ class _LaserChannelTab(QWidget):
         set_status: Callable[[str, bool], None],
         plot_controller=None,
         draft_provider: Optional[Callable[[], Optional[LaserPulseProfile]]] = None,
+        refresh_controls: Optional[Callable[[], None]] = None,
     ):
         super().__init__()
 
@@ -189,6 +350,11 @@ class _LaserChannelTab(QWidget):
         self._set_parent_status = set_status
         self._plot_controller = plot_controller
         self._draft_provider = draft_provider
+        #: Has the panel set every control's enabled state again: once a
+        #: press of Run Pulse is over, its button follows the operation.
+        self._refresh_controls = refresh_controls
+        #: Run Pulse's press in internal mode, until its click or release.
+        self._press: Optional[_RunPulsePress] = None
         self._controls_can_edit = True
         self._trace_streaming = False
         #: What the latest pulse, ramp or Clear did, shown after the stream state.
@@ -633,7 +799,11 @@ class _LaserChannelTab(QWidget):
             self._ramp_pmt,
         )
 
-        self._run_pulse_button.clicked.connect(self._run_pulse)
+        # Internal: armed on the press, fired by the click (_RunPulsePress).
+        self._run_pulse_button.pressed.connect(self._on_run_pulse_pressed)
+        self._run_pulse_button.released.connect(self._on_run_pulse_released)
+        self._run_pulse_button.clicked.connect(self._on_run_pulse_clicked)
+        self._mode_tabs.currentChanged.connect(self._on_mode_tab_changed)
         self._run_ramp_button.clicked.connect(self._run_calibration_ramp)
         self._trace_clear_button.clicked.connect(self._clear_trace)
         self._trace_seconds.valueChanged.connect(self._apply_trace_view)
@@ -878,12 +1048,20 @@ class _LaserChannelTab(QWidget):
         can_run_pulse: bool,
         can_run_ramp: bool,
         ramp_refusal: str = "",
+        *,
+        can_hold_run_pulse: bool = False,
     ) -> None:
+        """`can_hold_run_pulse`: Run Pulse could fire, but for the operation running."""
         self._controls_can_edit = can_edit
         for control in self._pulse_controls:
             control.setEnabled(can_edit)
         self._refresh_trigger_mode_enabled()
-        self._run_pulse_button.setEnabled(can_run_pulse)
+        # A press arming its pulse is that operation, and keeps its button
+        # enabled until its click or release: a QPushButton disabled while
+        # it is down never emits its click (QAbstractButton::changeEvent).
+        held = (can_hold_run_pulse and self._press is not None
+                and self._run_pulse_button.isDown())
+        self._run_pulse_button.setEnabled(can_run_pulse or held)
         self._run_pulse_button.setToolTip(self.run_pulse_refusal())
         # A stim test needs the same open controller. Left out of this method
         # it stayed enabled before the system started, and failed with "Laser
@@ -985,22 +1163,118 @@ class _LaserChannelTab(QWidget):
         self._trace_note = "cleared"
         self.refresh_stream_status()
 
-    def _run_pulse(self) -> None:
+    def _validated_pulse(self):
+        """The picked profile's train, checked, and what a recording keeps of it."""
         if not self._is_configured:
-            self._set_parent_status(
-                f"Laser {self._channel.channel_id.value} has no hardware channel mapping",
-                True,
-            )
+            raise ValueError(
+                f"Laser {self._channel.channel_id.value} has no hardware channel mapping")
+        # Looked up once: the train and what a recording keeps of it
+        # name the same profile, at the same revision.
+        profile = self._selected_profile()
+        if profile is None:
+            raise ValueError(self._profile_refusal())
+        pulse_train = self._build_pulse_train(profile)
+        self._validate_pulse_train(pulse_train)
+        return pulse_train, self._manual_pulse_context(profile)
+
+    def _on_run_pulse_pressed(self) -> None:
+        if self._press is not None and self._press.is_live():
+            # Pressed again before its release was looked at: dragged off the
+            # button and back on. Still the one press, and the one arm.
+            return
+        self._press = None
+        if self._trigger_mode.currentText() == "external":
+            # Its edge starts it, not the click: armed at the click, as
+            # before (_run_pulse).
             return
         try:
-            # Looked up once: the train and what a recording keeps of it
-            # name the same profile, at the same revision.
-            profile = self._selected_profile()
-            if profile is None:
-                raise ValueError(self._profile_refusal())
-            pulse_train = self._build_pulse_train(profile)
-            self._validate_pulse_train(pulse_train)
-            manual_context = self._manual_pulse_context(profile)
+            pulse_train, manual_context = self._validated_pulse()
+        except Exception as exc:
+            self._press = _RunPulsePress(refusal=str(exc) or exc.__class__.__name__)
+            return
+        press = _RunPulsePress(pulse_train, manual_context)
+        self._press = press
+        laser = self._app_model.laser
+        laser_number = self._channel.channel_id.value
+        # The panel keeps this button enabled while it is down
+        # (set_controls_enabled), and disables the rest, as for any operation.
+        started = self._start_operation(
+            f"Running laser {laser_number} pulse train",
+            lambda: press.run(laser, laser_number))
+        if started is False:
+            press.not_armed()
+
+    def _on_run_pulse_released(self) -> None:
+        # Qt emits released before clicked. A press that ends with no click
+        # emits released alone: dragged off the button, the button disabled,
+        # or its focus lost, a dialog opening mid-press say (Qt 6.6). Looked
+        # at once both could have been.
+        if self._press is not None:
+            QTimer.singleShot(0, self, self._let_go_unless_down)
+
+    def _on_run_pulse_clicked(self) -> None:
+        press, self._press = self._press, None
+        laser_number = self._channel.channel_id.value
+        if press is None:
+            if self._trigger_mode.currentText() == "external":
+                self._run_pulse()
+            # Internal, its press was let go of first: nothing to fire.
+            return
+        if press.refusal:
+            self._set_parent_status(press.refusal, True)
+            return
+        action, value = press.click()
+        if action == "fire":
+            # One start, on this thread; a fire refused, its arm having just
+            # ended, is said by the arming thread (_RunPulsePress.run).
+            value.fire()
+        elif action == "ended" and value is not None:
+            # Its arm was refused or failed during the press, and the status
+            # line says why: told at the click, as run_pulse_train told it.
+            self._app_model.laser.tell_manual_pulse_not_armed(
+                press.pulse_train, manual_context=press.manual_context, error=value)
+        elif action == "ended" and press.unfired:
+            self._set_parent_status(press.not_fired_text(laser_number), True)
+        if self._refresh_controls is not None:
+            # Released: the button follows the running operation from here.
+            self._refresh_controls()
+
+    def _let_go_unless_down(self) -> None:
+        """A press released with no click, and not pressed again, is let go of."""
+        if self._press is not None and not self._run_pulse_button.isDown():
+            self.let_go_of_press()
+
+    def let_go_of_press(self) -> None:
+        """Let Run Pulse's press go unfired, unless it was clicked.
+
+        Its press ended with no click: dragged off the button, the focus
+        gone, its tab switched away from, or the panel closing. Its pulse
+        is disarmed: its shutter closed and its output aborted, on this
+        thread, then reset by the pulse's own. A clicked press is no longer
+        the tab's, and fires.
+        """
+        press, self._press = self._press, None
+        if press is None:
+            return
+        handle = press.let_go()
+        if handle is not None:
+            handle.disarm()
+        if self._refresh_controls is not None:
+            self._refresh_controls()
+
+    def _on_mode_tab_changed(self, _index: int) -> None:
+        # The Pulse page, and Run Pulse with it, hidden mid-press: the
+        # button can stay down, with no release to come.
+        self.let_go_of_press()
+
+    def _run_pulse(self) -> None:
+        """Run the picked profile through run_pulse_train, armed and started at once.
+
+        External mode's, from its click: an edge on its trigger source
+        starts it. Internal mode arms on the press (_on_run_pulse_pressed).
+        """
+        try:
+            pulse_train, manual_context = self._validated_pulse()
         except Exception as exc:
             self._set_parent_status(str(exc) or exc.__class__.__name__, True)
             return
@@ -1369,6 +1643,7 @@ class LaserControlContent(ContentWidget):
         self._tabs.setMinimumWidth(0)
         self._tabs.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         self._tabs.currentChanged.connect(self._redraw_current_trace)
+        self._tabs.currentChanged.connect(self._let_go_of_hidden_presses)
         self._card_widget.setContentWidget(self._tabs)
 
         footer = QWidget()
@@ -1410,6 +1685,10 @@ class LaserControlContent(ContentWidget):
         self._refresh_from_model()
 
     def on_close(self):
+        # A Run Pulse press still arming or armed fires nothing: only a click
+        # fires one.
+        for tab in self._channel_tabs:
+            tab.let_go_of_press()
         worker = self._operation_worker
         if worker is not None:
             # Still running, as a ramp force-closed by AppModel's close path
@@ -1531,6 +1810,14 @@ class LaserControlContent(ContentWidget):
         if isinstance(current_tab, _LaserChannelTab):
             current_tab.redraw_trace()
 
+    def _let_go_of_hidden_presses(self, _index: int) -> None:
+        # A tab switched away from mid-press keeps its button down, with no
+        # release to come.
+        current_tab = self._tabs.currentWidget()
+        for tab in self._channel_tabs:
+            if tab is not current_tab:
+                tab.let_go_of_press()
+
     def configure_laser_plot(self, tab: _LaserChannelTab, *, reset: bool = False) -> None:
         names_by_physical_channel = {
             channel.physical_channel: channel.name
@@ -1634,6 +1921,7 @@ class LaserControlContent(ContentWidget):
                 self._set_status_from_tab,
                 self,
                 draft_provider=self._builder.draft_profile,
+                refresh_controls=lambda: self._update_enabled_state(announce=False),
             )
             shown = command_shown.get(channel_index)
             if shown is None:
@@ -1745,6 +2033,8 @@ class LaserControlContent(ContentWidget):
     def _clear_tabs(self) -> None:
         # The builder stays: its unsaved draft must survive a configuration reload.
         for tab in self._channel_tabs:
+            # A press going with its tab fires nothing.
+            tab.let_go_of_press()
             self._tabs.removeTab(self._tabs.indexOf(tab))
             tab.deleteLater()
         self._channel_tabs = tuple()
@@ -1760,10 +2050,11 @@ class LaserControlContent(ContentWidget):
     def _set_status_from_tab(self, message: str, is_error: bool) -> None:
         self._set_status(message, is_error=is_error)
 
-    def _start_operation(self, status: str, operation: Callable[[], object]) -> None:
+    def _start_operation(self, status: str, operation: Callable[[], object]) -> bool:
+        """Run `operation` on a laser_operation thread; whether it was started."""
         if self._operation_thread is not None:
             self._set_status("Laser operation already in progress", is_error=True)
-            return
+            return False
         logger.verbose(status)
         self._set_status(status, is_error=False)
         self._progress.setVisible(True)
@@ -1781,6 +2072,7 @@ class LaserControlContent(ContentWidget):
         self._operation_thread = thread
         self._operation_worker = worker
         thread.start()
+        return True
 
     @Slot(object)
     def _operation_finished(self, result) -> None:
@@ -1853,9 +2145,13 @@ class LaserControlContent(ContentWidget):
             is_running = self._operation_thread is not None
         can_edit = self._is_editable and not is_running
         self._builder.set_controls_enabled(can_edit)
-        can_run = (
-            can_edit and self._app_model.laser.is_connected
+        # Whether a pulse could fire but for the operation running: a press
+        # of Run Pulse arming its pulse is that operation, and keeps its own
+        # button enabled.
+        can_fire = (
+            self._is_editable and self._app_model.laser.is_connected
             and not self._app_model.laser_controller_close_refusal())
+        can_run = can_fire and not is_running
         ramp_refusal = self._ramp_refusal(is_running=is_running)
         refusals = []
         can_do_something = False
@@ -1863,7 +2159,8 @@ class LaserControlContent(ContentWidget):
             can_run_pulse = can_run and tab.is_configured
             tab_ramp_refusal = tab.run_ramp_refusal(ramp_refusal)
             tab.set_controls_enabled(
-                can_edit, can_run_pulse, not tab_ramp_refusal, tab_ramp_refusal)
+                can_edit, can_run_pulse, not tab_ramp_refusal, tab_ramp_refusal,
+                can_hold_run_pulse=can_fire and tab.is_configured)
             can_do_something = can_do_something or can_run_pulse or not tab_ramp_refusal
             refusal = tab.run_pulse_refusal()
             if refusal and refusal not in refusals:

@@ -147,11 +147,12 @@ def test_the_running_line_stays_until_the_operation_ends(panel, app_model, qapp,
     # laser's ("Laser 3 has no hardware channel ..." on christielab10), for
     # the whole operation.
     release = threading.Event()
-    run_pulse_train = app_model.laser.run_pulse_train
+    # Held in its arm, which Run Pulse makes on its press (D2.4).
+    arm_manual_pulse = app_model.laser.arm_manual_pulse
     monkeypatch.setattr(
-        app_model.laser, "run_pulse_train",
+        app_model.laser, "arm_manual_pulse",
         lambda pulse_train, **options: (
-            release.wait(10.0) and run_pulse_train(pulse_train, **options)))
+            release.wait(10.0) and arm_manual_pulse(pulse_train, **options)))
     tab = panel._channel_tabs[0]
     _pick(tab, "short")
     try:
