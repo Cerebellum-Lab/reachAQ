@@ -298,20 +298,51 @@ def test_a_cancel_during_the_callers_start_aborts_what_it_started(held):
     _left_safe(daq, controller, operation, 0)
 
 
-def test_a_refused_start_fails_the_operation(held):
+PMT_DO = "laser_pmt_shutter_do"
+
+
+@pytest.mark.parametrize("cancelled", [False, True], ids=["refused", "refused_under_a_cancel"])
+@pytest.mark.parametrize("lines", [False, True], ids=["no_lines", "pmt_line"])
+def test_a_refused_start_fails_the_operation(held, lines, cancelled):
+    # With a PMT line, the output's start is refused after the line has
+    # started on the caller's thread: a partial start, which the pulse's own
+    # thread stops and closes. Under a cancel landing as the output starts,
+    # the operation ends cancelled, not failed, and is left as safe.
     daq = held
     controller = NidaqLaserController(_routed())
-    operation = _arm(controller)
+    pulse = (dataclasses.replace(
+        PULSE, enable_pmt_shutter=True,
+        pmt_shutter_open_delay_ms=1.0, pmt_shutter_close_delay_ms=1.0)
+        if lines else PULSE)
+    operation = _arm(controller, pulse)
     daq.failing_task = AO
-    before = len(daq.writes)
+    if cancelled:
+        def cancel_as_the_output_starts(task):
+            if task.label == AO:
+                daq.before_start = None
+                operation.cancel()
+
+        daq.before_start = cancel_as_the_output_starts
+    before_writes, before_events = len(daq.writes), len(daq.timeline)
 
     assert isinstance(operation.trigger(), float)
 
-    with pytest.raises(RuntimeError, match="refused to start"):
-        operation.wait(1.0)
-    assert operation.state is LaserOperationState.FAILED
-    assert daq.starts == []
-    _left_safe(daq, controller, operation, before)
+    if cancelled:
+        assert operation.wait(1.0) is LaserOperationState.CANCELLED
+    else:
+        with pytest.raises(RuntimeError, match="refused to start"):
+            operation.wait(1.0)
+        assert operation.state is LaserOperationState.FAILED
+    assert daq.starts == ([PMT_DO] if lines else [])
+    if lines:
+        line = [(entry.event, entry.thread) for entry in daq.timeline[before_events:]
+                if entry.task == PMT_DO and entry.event in ("start", "stop", "close")]
+        assert [event for event, _thread in line] == ["start", "stop", "close"]
+        assert line[0][1] is threading.current_thread()
+        assert {thread for _event, thread in line[1:]} == {operation._thread}
+        assert daq.writes_to("PXI1Slot5/port0/line6", task_suffix="laser_pmt_shutter_reset",
+                             since=before_writes) == [False]
+    _left_safe(daq, controller, operation, before_writes)
 
 
 def test_the_cleanup_waits_for_a_start_in_flight(held, on_cue):
