@@ -9,6 +9,7 @@ line a Run/Stop rebuild ends on. There is no timeout. It is still logged
 once, and that record is what puts it on the status bar.
 """
 
+import gc
 import os
 import threading
 import time
@@ -16,6 +17,7 @@ import time
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest  # noqa: E402
+from PySide6.QtCore import QEvent  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from autotrainer.core import (  # noqa: E402
@@ -76,6 +78,11 @@ def panel(qapp, app_model, listed, caplog):
     caplog.set_level("ERROR")
     # Connected, on the null backend, so Run Pulse and Test stim are enabled.
     app_model.laser.configure_null(_lasers())
+    # Panels dropped before, freed on the main thread: freed by the cyclic GC
+    # on a worker thread, a Run Pulse's say, PySide split their deletes
+    # across that thread and this one, which could deadlock (the review of
+    # latency task 9).
+    gc.collect()
     content = LaserControlContent(app_model)
     qapp.processEvents()
     try:
@@ -84,6 +91,11 @@ def panel(qapp, app_model, listed, caplog):
         content.on_close()
         content.deleteLater()
         app_model.laser.close()
+        qapp.processEvents()
+        qapp.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        # The panel itself is held until this teardown has ended; the next
+        # test's setup collects it.
+        gc.collect()
 
 
 def _footer(panel):
