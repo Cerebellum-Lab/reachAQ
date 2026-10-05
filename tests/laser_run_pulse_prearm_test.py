@@ -277,17 +277,23 @@ def test_a_press_dragged_off_the_button_is_disarmed(rig, qapp):
 
 
 def test_a_press_held_past_its_cap_is_disarmed(rig, qapp, monkeypatch):
-    monkeypatch.setattr(laser_control_content, "_RUN_PULSE_ARM_CAP_S", 0.1)
+    # 0.5 s, not the 2 s cap, but wide enough that the arming thread is
+    # never scheduled after the cap has run out (the review of task 9, Minor
+    # 2): woken that late, its arm raised the cap's TimeoutError itself.
+    monkeypatch.setattr(laser_control_content, "_RUN_PULSE_ARM_CAP_S", 0.5)
     before = rig.laser.last_command_volts
     _press(rig.button)
+    operation = _wait_for_the_arm(rig, qapp)
     _wait_for_the_operation(rig, qapp)
 
     # Let go by its arm's start wait with the button still down; usable again.
+    assert operation.state is LaserOperationState.FAILED
+    assert isinstance(operation.error, TimeoutError)
     assert rig.button.isDown() and rig.button.isEnabled()
     assert rig.told == []
     _left_safe(rig, before)
     assert _footer(rig).text() == (
-        "Run Pulse disarmed, nothing fired: laser 1's press was held over 0.1 s")
+        "Run Pulse disarmed, nothing fired: laser 1's press was held over 0.5 s")
 
     # Its click, after the cap, fires nothing, and says so.
     _release(rig.button)
@@ -295,7 +301,7 @@ def test_a_press_held_past_its_cap_is_disarmed(rig, qapp, monkeypatch):
     assert AO not in rig.daq.starts
     assert rig.told == []
     assert _shows_error(
-        rig, "Laser 1: Run Pulse did not fire, its press was held over 0.1 s; click it again")
+        rig, "Laser 1: Run Pulse did not fire, its press was held over 0.5 s; click it again")
 
     # The next click fires.
     rig.button.click()
@@ -472,9 +478,21 @@ def _lose_focus(rig, _qapp):
         QEvent.Type.FocusOut, Qt.FocusReason.ActiveWindowFocusReason))
 
 
+def _rebuild(rig, _qapp):
+    # As a DAQ ports save or a configuration load rebuilds the laser tabs.
+    rig.panel._refresh_from_model()
+
+
+def _lock_the_panel(rig, _qapp):
+    # The held button disabled under it: Qt emits released, with no click.
+    rig.panel.set_is_editable(False)
+
+
 @pytest.mark.parametrize("end_the_press", (
     _stop, _switch_laser_tab, _switch_to_calibration, _close_the_panel, _lose_focus,
-), ids=("stop", "laser_tab_switch", "calibration_tab", "panel_closed", "focus_lost"))
+    _rebuild, _lock_the_panel,
+), ids=("stop", "laser_tab_switch", "calibration_tab", "panel_closed", "focus_lost",
+        "rebuild", "button_disabled"))
 def test_what_else_ends_a_press_fires_nothing_and_leaves_the_laser_safe(
     rig, qapp, end_the_press,
 ):
@@ -499,6 +517,34 @@ def test_what_else_ends_a_press_fires_nothing_and_leaves_the_laser_safe(
         _no_driver_call_on_the_qt_thread(rig, armed)
     assert rig.told == []
     _left_safe(rig, before)
+
+
+def test_a_press_whose_operation_is_refused_arms_nothing(rig, qapp, caplog):
+    # Another laser operation still holds the panel, with Run Pulse enabled
+    # meanwhile, as before the panel's refresh has run: the press is refused
+    # as any second operation is, and its click fires and records nothing
+    # (the review of task 9, Minor 9).
+    before = rig.laser.last_command_volts
+    release = threading.Event()
+    rig.panel._start_operation(
+        "Running another laser operation", lambda: release.wait(10.0) and "done")
+    rig.button.setEnabled(True)
+    try:
+        with caplog.at_level("ERROR"):
+            _press(rig.button)
+            _release(rig.button)
+            qapp.processEvents()
+
+        assert _shows_error(rig, "Laser operation already in progress")
+        assert [record.getMessage() for record in caplog.records
+                if "already in progress" in record.getMessage()] == [
+                    "Laser control operation rejected: Laser operation already in progress"]
+        assert not [task for task in rig.daq.tasks if task.label == AO]
+        assert rig.told == []
+        assert rig.laser.last_command_volts == before
+    finally:
+        release.set()
+        _wait_for_the_operation(rig, qapp)
 
 
 def test_a_stop_while_the_press_arms_fires_nothing_and_leaves_the_laser_safe(
