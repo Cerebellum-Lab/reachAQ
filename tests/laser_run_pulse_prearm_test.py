@@ -10,6 +10,7 @@ nothing and leaves the laser safe.
 On the device tests' DAQmx fake: nothing here touches a driver or a board.
 """
 
+import gc
 import json
 import os
 import threading
@@ -81,6 +82,10 @@ def rig(qapp, app_model, fake, monkeypatch):
             "summary": PROFILE.summary()},)}))
     monkeypatch.setattr(type(app_model), "laser_profile", lambda _self, profile_id: (
         PROFILE if profile_id == PROFILE.profile_id else None))
+    # What earlier tests dropped is freed here, on the main thread, not by
+    # the cyclic GC on whichever worker thread next crosses its threshold
+    # (see the teardown).
+    gc.collect()
     controller = NidaqLaserController(fake.rig_lasers())
     app_model.laser.set_controller(controller)
     panel = LaserControlContent(app_model)
@@ -108,6 +113,16 @@ def rig(qapp, app_model, fake, monkeypatch):
         # panel left alive is repolished by every later application font
         # change, which laser_control_layout_test makes around each test.
         qapp.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        # Its Python side, pyqtgraph's parentless menus among it, is held by
+        # reference cycles, and is freed here, on the main thread. Freed by
+        # the cyclic GC on a worker thread, a later test's pulse thread, it
+        # deadlocked the run about once in 17: PySide deleted the widgets on
+        # the main thread and the other QObjects on the worker, and the two
+        # held a Qt mutex and the GIL against each other (the review of task
+        # 9, gdb on christielab10).
+        rig.panel = rig.tab = rig.button = None
+        del panel, tab
+        gc.collect()
         assert controller.wait_for_work_left_running(5.0)
 
 
