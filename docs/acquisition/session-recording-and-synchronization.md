@@ -381,7 +381,12 @@ STIM line. The outcome row adds `last_command_volts`, what the laser model
 keeps as the laser's last command: its minimum once completed, the amplitude
 its output may still hold once failed or cancelled, the command before once
 refused. A failed, cancelled or refused row also has `error_class` and
-`error`.
+`error`. An internal Run Pulse is armed while its button is held and started
+on the click (2026-10-05), so its `requested` row also has `fallback` and
+`click_perf_time`: `fallback` false when the click started an output already
+armed, true when the click came before the arm finished and the arming thread
+started it once armed; `click_perf_time` is the click's own time, which on a
+fallback is earlier than the row's `perf_time`.
 
 A completed pulse's waveform rows (`internal pulse` or `external pulse`, with
 no operation id) start at its `requested` row's `perf_time`, so the two join on
