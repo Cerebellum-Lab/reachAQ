@@ -452,6 +452,22 @@ def test_the_null_controller_waits_for_a_start_no_longer_than_its_start_wait():
     assert isinstance(operation.error, TimeoutError)
 
 
+@pytest.mark.parametrize("timeout", [float("nan"), float("inf")], ids=["nan", "inf"])
+@pytest.mark.parametrize("make", [
+    lambda timeout: LaserPulseTrain(
+        channel_id=LaserChannelId.LASER_1, amplitude_volts=1.0, duration_ms=10.0,
+        timeout_seconds=timeout),
+    lambda timeout: _deferred_pulse(defer_start=True, timeout_seconds=timeout),
+    lambda timeout: _ramp(timeout_seconds=timeout),
+], ids=["pulse_train", "synchronized", "ramp"])
+def test_a_timeout_is_a_finite_time(make, timeout):
+    # A NaN passed "<= 0", and an infinite one is no bound: Event.wait(inf)
+    # raised OverflowError on the pulse's thread, before its start was decided
+    # (the review of tasks 7-8, M1).
+    with pytest.raises(ValueError, match="timeout_seconds"):
+        make(timeout)
+
+
 def test_synchronized_pulse_train_rejects_deferred_hardware_trigger():
     with pytest.raises(ValueError, match="hardware trigger"):
         LaserSynchronizedPulseTrain(
