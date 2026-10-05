@@ -301,8 +301,15 @@ The host writes the picked profile's waveform to the analog output directly.
 - **What it does not prove:** anything about the board. This path never touches
   the pellet board, so it cannot tell you whether a trial's trigger would work.
 
-**Trigger:** starts at *internal*, which starts the pulse on the NI clock
-when you press Run Pulse. With *external*, the output is armed and waits for
+**Trigger:** starts at *internal*, which arms the pulse while you hold Run
+Pulse down, and starts it on the NI clock when you release it on the button.
+An armed output started about 0.6 ms after its start was asked for, where
+arming it after the click took 12-18 ms (christielab10; measured outside
+reachAQ, not yet in it). The shutter opens as it arms, if **Open
+shutter** is ticked. Drag off the button before you release it, or hold it
+down for over 2 s, and the pulse is disarmed: nothing fires, the shutter
+closes, and the status line says so. A click quicker than the arm fires as
+soon as the arm is ready. With *external*, the output is armed and waits for
 an edge, chosen by **Edge:**, on **Source:**. Nothing on this page sends that
 edge, so use *external* only when an outside trigger is wired in. If no edge
 arrives, the pulse fails after the train length plus five seconds with *Wait
@@ -314,8 +321,10 @@ when it was asked for, the laser, the profile (its saved name, or *builder
 draft*), the amplitude, the trigger mode and the route, then whether it
 completed, failed, was cancelled (by stopping System Mode while it ran, as
 below) or was refused. A refused pulse drove nothing and is recorded as
-refused, never as fired. Its time is the host's, taken as Run Pulse calls
-the laser controller, so the output starts at or after it. A pulse fired while
+refused, never as fired. Its time is the host's, taken just before the
+output's start, or as Run Pulse calls the laser controller with *external*,
+so the output starts at or after it. A press that is disarmed fired nothing,
+and is not recorded. A pulse fired while
 no session records is not recorded. Test stim stays refused while a session is
 recording.
 
