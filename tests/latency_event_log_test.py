@@ -1,10 +1,14 @@
+import logging
 import math
 from types import SimpleNamespace
 
 import h5py
+import pytest
 
 from autotrainer.core.latency.schema import EVENT_TABLES
-from tools.acquisition.model.latency_event_log import LatencyEventLog
+from tools.acquisition.model.latency_event_log import LatencyEventLog, _BlockTable
+
+_LOG_NAME = "tools.acquisition.model.latency_event_log"
 
 
 def _response(sequence):
@@ -104,3 +108,148 @@ def test_a_disabled_record_keeps_nothing(monkeypatch):
     log.begin()
     log.record_live_pose(_response(1), 2.2)
     assert len(log.end()["live_poses"]) == 0
+
+
+def test_a_disabled_record_reports_itself_as_not_enabled(monkeypatch):
+    monkeypatch.setenv("REACHAQ_LATENCY_RECORD", "0")
+    log = LatencyEventLog()
+    log.begin()
+    assert not log.enabled
+    assert not log.is_active
+    log.end()
+    assert not log.enabled
+
+
+def test_an_enabled_record_stays_enabled_after_it_ends(monkeypatch):
+    monkeypatch.delenv("REACHAQ_LATENCY_RECORD", raising=False)
+    log = LatencyEventLog()
+    assert not log.enabled  # nothing has begun yet
+    log.begin()
+    assert log.enabled and log.is_active
+    log.end()
+    assert log.enabled and not log.is_active
+
+
+@pytest.mark.parametrize("payload", [
+    {"operation_id": "bad", "stim_frame_id": None},
+    {"operation_id": "bad", "stim_frame_id": float("nan")},
+    {"operation_id": "bad", "stim_frame_id": "frame"},
+    None,
+    "not a mapping",
+    7,
+])
+def test_a_stim_payload_that_cannot_become_a_row_is_counted_not_raised(payload):
+    log = LatencyEventLog()
+    log.begin()
+    log.record_stim_dispatch(payload)
+    log.record_stim_dispatch({"operation_id": "good", "stim_frame_id": 4})
+
+    assert log.rows_rejected == 1
+    assert log.end()["stim_dispatch"]["operation_id"].tolist() == [b"good"]
+
+
+@pytest.mark.parametrize("fields", [
+    None,
+    {"can_uuid": 10**6},
+    {"can_uuid": 40000},  # numpy 1.x would wrap this to a wrong, valid-looking id
+    {"can_uuid": -32769},
+    {"can_uuid": "abc"},
+])
+def test_a_can_row_that_cannot_be_stored_is_counted_not_raised(fields):
+    log = LatencyEventLog()
+    log.begin()
+    log.record_can("send", fields)
+    log.record_can("ack", {"can_uuid": 12, "perf": 1.0})
+
+    assert log.rows_rejected == 1
+    rows = log.end()["can_events"]
+    assert rows["stage"].tolist() == [b"ack"]
+    assert rows["can_uuid"].tolist() == [12]
+
+
+class _Unprintable:
+    def __str__(self):
+        raise RuntimeError("no text form")
+
+
+def test_every_other_row_kind_is_counted_not_raised_too():
+    log = LatencyEventLog()
+    log.begin()
+    log.record_live_pose(SimpleNamespace(sequence=None, perf_c=1.0), 2.0)
+    log.record_live_pose(SimpleNamespace(sequence=1), 2.0)  # no perf_c
+    log.record_gate_observation(1.0, SimpleNamespace(sequence=None, processing_perf=1.0), True)
+    log.record_stim3_pulse(_Unprintable(), "tok", 1.0, 2.0)
+
+    assert log.rows_rejected == 4
+    tables = log.end()
+    assert all(len(rows) == 0 for rows in tables.values())
+
+
+def test_a_row_the_block_refuses_is_counted_and_later_rows_still_land(monkeypatch):
+    original = _BlockTable.append
+
+    def refuse(self, row):
+        if row[0] == 666:
+            raise ValueError("refused")
+        original(self, row)
+
+    monkeypatch.setattr(_BlockTable, "append", refuse)
+    log = LatencyEventLog(block_rows=2)
+    log.begin()
+    for sequence in (1, 666, 2, 3):
+        log.record_live_pose(_response(sequence), 2.2)
+
+    assert log.rows_rejected == 1
+    assert log.end()["live_poses"]["live_sequence"].tolist() == [1, 2, 3]
+
+
+def test_a_row_offered_while_inactive_is_ignored_not_rejected():
+    log = LatencyEventLog()
+    log.record_can("send", None)  # before begin()
+    log.begin()
+    log.end()
+    log.record_stim_dispatch(None)  # after end()
+    assert log.rows_rejected == 0
+
+
+def test_only_the_first_rejected_row_of_a_recording_is_logged(caplog):
+    log = LatencyEventLog()
+    log.begin()
+    with caplog.at_level(logging.ERROR, logger=_LOG_NAME):
+        log.record_can("send", None)
+        log.record_can("send", None)
+    assert log.rows_rejected == 2
+    assert len([r for r in caplog.records if r.name == _LOG_NAME]) == 1
+
+    caplog.clear()
+    log.begin()  # a new recording: the count and the once-only log both reset
+    assert log.rows_rejected == 0
+    with caplog.at_level(logging.ERROR, logger=_LOG_NAME):
+        log.record_can("send", None)
+    assert len([r for r in caplog.records if r.name == _LOG_NAME]) == 1
+
+
+def test_the_reject_is_logged_with_the_log_lock_released():
+    # The session log handler takes the recorder's lock, and the recorder holds
+    # it while it calls begin() and end() here: logging under this lock would
+    # be a lock-order cycle.
+    log = LatencyEventLog()
+    log.begin()
+    lock_free = []
+
+    class Probe(logging.Handler):
+        def emit(self, record):
+            got = log._lock.acquire(blocking=False)
+            if got:
+                log._lock.release()
+            lock_free.append(got)
+
+    target = logging.getLogger(_LOG_NAME)
+    probe = Probe()
+    target.addHandler(probe)
+    try:
+        log.record_can("send", None)
+    finally:
+        target.removeHandler(probe)
+
+    assert lock_free == [True]

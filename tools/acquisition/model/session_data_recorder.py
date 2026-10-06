@@ -405,6 +405,12 @@ class SessionDataRecorder:
                 source_results["laser_outputs"] = laser_result
             trial_records = tuple(self._trial_records)
             trial_summary = dict(self._trial_summary)
+            # end() either way, so the log stops. None when the switch was off
+            # at arm: _write_session then writes no events.h5, and a session
+            # recorded with the record off carries no latency files at all.
+            latency_events = self._latency_events.end()
+            if not self._latency_events.enabled:
+                latency_events = None
             snapshot = {
                 "project": project,
                 "start_perf": start_perf,
@@ -426,7 +432,7 @@ class SessionDataRecorder:
                 "trial_records": trial_records,
                 "trial_summary": trial_summary,
                 "metadata_generation_id": self._metadata_generation_id,
-                "latency_events": self._latency_events.end(),
+                "latency_events": latency_events,
             }
             self._armed = False
             self._pending_stop_end_perf = None
