@@ -239,18 +239,19 @@ class VideoRecord(Thread):
                     frame_time = self._first_frame_time + estimated_frame_rel_t
 
                     if self._is_video_enabled:
-                        vid_writer = self._video_writer
-                        if vid_writer is None:
+                        if self._video_file is None:
                             # If triggered, may not be configured yet for this batch
                             prev_perf_now = prev_frame_when = None
                             self._prepare_writers()
-                            vid_writer = self._video_writer
 
-                        if vid_writer is not None:
-                            if len(numpy.shape(frame)) < 3 or numpy.shape(frame)[2] == 1:
-                                vid_writer.write(numpy.tile(frame[:, :, numpy.newaxis], (1, 1, 3)))
-                            else:
-                                vid_writer.write(frame)
+                        if self._video_file is not None:
+                            video_frame = frame
+                            if len(numpy.shape(video_frame)) == 3 and numpy.shape(video_frame)[2] == 1:
+                                video_frame = video_frame[:, :, 0]
+                            if self._video_writer is None:
+                                # Opened on the first frame, when its channel count is known.
+                                self._open_video_writer(is_color=len(numpy.shape(video_frame)) == 3)
+                            self._video_writer.write(video_frame)
                             tot_written += 1
 
                         vid_ts_file = self._video_timestamp_file
@@ -349,16 +350,25 @@ class VideoRecord(Thread):
         logger.notice("<%s>: video record to %s", self.name, video_file)
 
         Path(video_file).parent.mkdir(parents=True, exist_ok=True)
-        vid_writer = cv2.VideoWriter(
-            video_file, cv2.VideoWriter_fourcc(*'mp4v'), self._fps, (self._width, self._height))  # noqa
-        if not vid_writer.isOpened():
-            raise RuntimeError(f"Failed open {video_file} for writing")
         try:
             self._video_timestamp_file = open(timestamp_file, "w")
         except IOError as err:
-            vid_writer.release()
             raise RuntimeError(f"Failed open {timestamp_file} for writing: {err}")
+        # The video writer itself is opened on the first frame (_open_video_writer),
+        # once the frames' channel count is known.
         self._video_file = video_file
+
+    def _open_video_writer(self, *, is_color: bool):
+        # Grayscale frames, which every reach camera delivers, go to a grayscale
+        # writer. Expanding them to three channels first cost 2.2 ms per
+        # 1024x1024 frame and halved mp4v throughput (157 vs 304 fps per stream,
+        # two streams in parallel, christielab10 2026-10-06), which limited
+        # 1024x1024 recording to about five minutes before the queue filled.
+        vid_writer = cv2.VideoWriter(
+            self._video_file, cv2.VideoWriter_fourcc(*'mp4v'), self._fps, (self._width, self._height),
+            isColor=is_color)  # noqa
+        if not vid_writer.isOpened():
+            raise RuntimeError(f"Failed open {self._video_file} for writing")
         self._video_writer = vid_writer
 
     def _close_video_writer(self):
@@ -367,7 +377,7 @@ class VideoRecord(Thread):
             vid_writer.release()
             logger.debug("Released %s", self._video_file)
             self._video_writer = None
-            self._video_file = None
+        self._video_file = None
 
         vid_ts_file = self._video_timestamp_file
         if vid_ts_file is not None:
