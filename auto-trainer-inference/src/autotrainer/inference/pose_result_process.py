@@ -91,6 +91,56 @@ def split_pose_item(item):
     return pose_data, mode, frames_indices, latency
 
 
+def _finish_latency_writer(writer):
+    """Close a latency writer and say so when it lost rows.
+
+    close() gives up on its own after 10 s and a timeout drops the rows still
+    queued, so its timeout is left alone. Never raises: it also runs on a
+    thread nobody is watching.
+    """
+    try:
+        stats = writer.close()
+        if stats["failed"] or any(stats["rowsDropped"].values()):
+            logger.warning("pose latency stream incomplete: %s", stats)
+        if stats.get("rowsRejected"):
+            # A rejected row here means the row did not fit the schema.
+            logger.error("pose latency stream rejected %d rows: %s",
+                         stats["rowsRejected"], stats)
+    except Exception:
+        logger.exception("pose latency stream could not be closed cleanly")
+
+
+def close_in_background(writer, name):
+    """Close ``writer`` on its own short-lived thread and return that thread.
+
+    The monitor loop calls this where a recording ends: close() joins the
+    writer's thread, which takes as long as the disk takes to flush, and the
+    loop must not stop for that. It still has to say the live pose files are
+    closed, which the feeder waits on for 10 s, and keep draining the data
+    queue. Returns None when no thread could be started; the close has then
+    already happened here, slowly but without losing anything.
+    """
+    try:
+        closer = threading.Thread(
+            target=_finish_latency_writer, args=(writer,), name=name, daemon=True)
+        closer.start()
+    except Exception:
+        logger.exception("pose latency close thread could not start")
+        _finish_latency_writer(writer)
+        return None
+    return closer
+
+
+def wait_for_latency_closers(closers):
+    """Wait for closes still running, so no stream is open past the caller.
+
+    close() gives up on its own after 10 s; this only has to outlast that.
+    """
+    for closer in list(closers):
+        closer.join(15)
+    closers[:] = [closer for closer in closers if closer.is_alive()]
+
+
 class InferenceMonitorDataProc(multiprocessing.Process):
 
     Msg = InferenceMonitorDataMsg
@@ -395,6 +445,24 @@ class InferenceMonitorDataProc(multiprocessing.Process):
         perf_c_log_counters = time.perf_counter()
         t_perf_live_check_data_queue_size = time.perf_counter() + 5
         pose_latency: Optional[LatencyStreamWriter] = None
+        # Writers whose close is still running on a PoseLatencyClose thread.
+        # A new recording and the end of this loop wait on it.
+        pose_latency_closers: List[threading.Thread] = []
+
+        def close_pose_latency_in_background():
+            # The loop never waits on a close: a stalled disk would hold it
+            # for up to 10 s, past the feeder's own 10 s wait for the live
+            # pose files, and stop it draining the data queue meanwhile.
+            nonlocal pose_latency
+            writer, pose_latency = pose_latency, None
+            if writer is None:
+                return
+            closer = close_in_background(writer, "PoseLatencyClose")
+            pose_latency_closers[:] = [
+                thread for thread in pose_latency_closers if thread.is_alive()
+            ]
+            if closer is not None:
+                pose_latency_closers.append(closer)
 
         def get_next_pose_data(timeout: Optional[float] = 0.25):
             nonlocal pose_data
@@ -628,8 +696,11 @@ class InferenceMonitorDataProc(multiprocessing.Process):
                 self._stop_recorded.clear()
                 logger.debug("cleared stop_recorded")
                 if pose_latency is not None:
-                    pose_latency.close()
+                    # A recording that never saw its stop marker.
+                    _finish_latency_writer(pose_latency)
                     pose_latency = None
+                # A new stream must not open on a file the last one is still flushing.
+                wait_for_latency_closers(pose_latency_closers)
                 if latency_recording_enabled():
                     try:
                         pose_latency = LatencyStreamWriter(
@@ -668,9 +739,7 @@ class InferenceMonitorDataProc(multiprocessing.Process):
                                   mode, prev_mode, frames_indices.tolist())
                     _close_fhs(cams_frame_idx_fhs)
                     cams_frame_idx_fhs = None
-                    if pose_latency is not None:
-                        pose_latency.close()
-                        pose_latency = None
+                    close_pose_latency_in_background()
                     for cam_pose_path, cam_indices, cam_h5_live in zip(pose_paths, cur_cams_indices, cur_h5_live_batch):
                         if len(cam_h5_live) == 0:
                             continue
@@ -697,8 +766,7 @@ class InferenceMonitorDataProc(multiprocessing.Process):
                     # A row that does not fit the stream's layout (camera count)
                     # would recur on every batch: stop the stream, keep the loop.
                     logger.exception("pose latency row rejected; the pose stream stops here")
-                    pose_latency.close()
-                    pose_latency = None
+                    close_pose_latency_in_background()
 
             cnt_data_received += 1
 
@@ -893,5 +961,8 @@ class InferenceMonitorDataProc(multiprocessing.Process):
                                  mode, type(pose_data), err)
 
         # end while self._is_running
+        # Here the close is waited on: nothing runs after this, and the file
+        # must be closed before the process ends.
         if pose_latency is not None:
-            pose_latency.close()
+            _finish_latency_writer(pose_latency)
+        wait_for_latency_closers(pose_latency_closers)
