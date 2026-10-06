@@ -9,7 +9,7 @@ import pytest
 from autotrainer.core import SystemStatusMessageKind
 from autotrainer.core.project import ProjectInfo
 from autotrainer.video import VideoRecord, VideoRecordMode, VideoRecordProperties
-from autotrainer.video import video_record
+from autotrainer.video import ffmpeg_writer, video_record
 
 
 @pytest.fixture
@@ -52,12 +52,13 @@ def _gradient_frames(count, rows=64, cols=64, channels=None):
     return frames
 
 
-def _recorder(project_info, name, rows=64, cols=64, msg_queue=None):
+def _recorder(project_info, name, rows=64, cols=64, msg_queue=None, encoder="mp4v"):
     input_queue = queue.Queue()
     stopped = threading.Semaphore(0)
     recorder = VideoRecord(
         VideoRecordProperties(project_info=project_info, name=name, frame_size=(cols, rows), fps=30,
-                              record_mode=VideoRecordMode.TRIGGER, video_rotate_interval=0),
+                              record_mode=VideoRecordMode.TRIGGER, video_rotate_interval=0,
+                              encoder=encoder),
         input_queue,
         record_stop_sema=stopped,
         msg_queue=msg_queue,
@@ -69,9 +70,9 @@ def _videos(project_info, name):
     return sorted(Path(project_info.root).rglob(f"*{name}*.{ProjectInfo.video_write_ext}"))
 
 
-def _record(project_info, frames, name, batches=1):
+def _record(project_info, frames, name, batches=1, encoder="mp4v"):
     rows, cols = frames[0].shape[:2]
-    recorder, input_queue, stopped = _recorder(project_info, name, rows, cols)
+    recorder, input_queue, stopped = _recorder(project_info, name, rows, cols, encoder=encoder)
     recorder.start()
     try:
         size = -(-len(frames) // batches)
@@ -255,3 +256,59 @@ def test_closing_a_recording_that_got_no_frames_leaves_no_stale_file(project_inf
     assert recorder._video_timestamp_file is None
     assert writer_spy == []  # nothing was opened without a frame to write
     assert _videos(project_info, "idle") == []
+
+
+def _fourcc(path):
+    code = int(cv2.VideoCapture(str(path)).get(cv2.CAP_PROP_FOURCC))
+    return "".join(chr((code >> 8 * idx) & 0xFF) for idx in range(4)).lower()
+
+
+def test_the_default_encoder_is_still_mp4v(project_info):
+    video = _record(project_info, _gradient_frames(5), "defaultenc")
+
+    assert _fourcc(video) in {"mp4v", "fmp4"}
+
+
+def test_the_x264_encoder_records_grayscale_frames_as_h264(project_info):
+    frames = _gradient_frames(20)
+
+    video = _record(project_info, frames, "x264gray", encoder="x264")
+
+    assert _fourcc(video) in {"avc1", "h264"}
+    decoded = _decode(video)
+    assert len(decoded) == 20
+    assert numpy.abs(decoded[5][:, :, 0].astype(int) - frames[5].astype(int)).mean() < 2
+
+
+def test_the_x264_encoder_keeps_mono_fillers_in_a_colour_recording(project_info):
+    colour = _gradient_frames(6, channels=3)
+    frames = colour[:3] + [numpy.zeros((64, 64), numpy.uint8)] * 2 + colour[3:]
+
+    video = _record(project_info, frames, "x264mixed", encoder="x264")
+
+    decoded = _decode(video)
+    assert len(decoded) == len(frames)
+    assert numpy.abs(decoded[0][:, :, 0].astype(int) - decoded[0][:, :, 1].astype(int)).mean() > 20
+
+
+def test_x264_without_ffmpeg_is_reported_rather_than_silent(project_info, monkeypatch):
+    monkeypatch.setattr(ffmpeg_writer.shutil, "which", lambda _name: None)
+    msg_queue = queue.Queue()
+    recorder, input_queue, stopped = _recorder(project_info, "noffmpeg", msg_queue=msg_queue, encoder="x264")
+    recorder.start()
+    try:
+        input_queue.put([(idx, frame, 0.0, 0.0) for idx, frame in enumerate(_gradient_frames(5))])
+        input_queue.put([])
+        assert stopped.acquire(timeout=10)
+    finally:
+        recorder.cancel()
+        recorder.join(5)
+
+    _cam_idx, written, _project, _generation, diagnostics = _closed_message(msg_queue)
+    assert written == 0
+    assert "ffmpeg is not installed" in diagnostics["firstError"]
+
+
+def test_an_unknown_encoder_is_refused(project_info):
+    with pytest.raises(ValueError, match="video encoder"):
+        _recorder(project_info, "badenc", encoder="vp9")
