@@ -61,6 +61,12 @@ class PoseResponse:
     associate live tracking with an exact recording/trial window.
     """
 
+    live_recv_perf_c: float = math.nan
+    """perf_counter when a live worker took this pose off its queue; NaN off the live path."""
+
+    live_put_perf_c: float = math.nan
+    """perf_counter just before the live worker queued this response for the GUI."""
+
     parts_flags: Tuple[Dict[str, bool], ...] = dataclasses.field(default_factory=lambda: ({}, {}, {}))
     """Tuple indicating part seen for each camera, followed by all cameras in the same frame."""
 
@@ -144,6 +150,8 @@ class PoseResponse:
             sequence=self.sequence,
             perf_c=self.perf_c,
             source_frame_ids=self.source_frame_ids,
+            live_recv_perf_c=self.live_recv_perf_c,
+            live_put_perf_c=self.live_put_perf_c,
             parts_flags=self.parts_flags,
             locations=self.locations,
             locations_3d=dict((n, loc.round(ndigits)) for n, loc in self.locations_3d.items()),

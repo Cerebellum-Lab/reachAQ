@@ -110,6 +110,7 @@ class LivePoseResultProcessWorker(multiprocessing.Process):
                 payload = self._input_q.get(timeout=0.1)
             except queue.Empty:
                 continue
+            received = time.perf_counter()
             if len(payload) == 2:
                 # Compatibility with callers/tests that predate source-frame
                 # propagation. New monitor processes always send three items.
@@ -130,6 +131,10 @@ class LivePoseResultProcessWorker(multiprocessing.Process):
                     tuple(int(frame_id) for frame_id in camera_ids)
                     for camera_ids in source_frame_ids
                 ),
+                # The latency record: when this worker took the pose, and when
+                # it hands the result on (perf_c already marks triangulation).
+                live_recv_perf_c=received,
+                live_put_perf_c=time.perf_counter(),
             )
             data = (
                 InferenceMonitorDataMsg.POSE_RESULT_READY,  # cmd
