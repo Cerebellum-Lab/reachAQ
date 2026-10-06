@@ -30,6 +30,18 @@ from autotrainer.core.logging import (
 from autotrainer.core.frame_index import FrameIndexCategory
 from autotrainer.core.fixed_array_queue import BufferResult
 from autotrainer.core.capture import CaptureProcessStatus
+from autotrainer.core.latency import (
+    LatencyStreamWriter,
+    latency_recording_enabled,
+    latency_stream_path,
+)
+from autotrainer.core.latency.schema import (
+    CAMERA_FRAME_DTYPE,
+    POSE_PUT_NOT_ATTEMPTED,
+    POSE_PUT_OK,
+    POSE_PUT_OVERFLOW,
+    RECORD_BATCH_DTYPE,
+)
 from .camera.camera_base import CameraBase
 
 from .video_manager import VideoManager
@@ -244,6 +256,11 @@ class VideoCapture(Process):
             )
         )
         self._stim_pending_clip = None
+        # Per-recording latency stream (streams/latency/camera_<name>.h5).
+        # Opened by the command thread on Record; closed by the capture loop
+        # once the recording has really ended, so its last frames are kept.
+        self._latency: Optional[LatencyStreamWriter] = None
+        self._latency_close_requested = False
 
         self._command_handlers: Dict[CaptureCommandKind, Callable] = {
             CaptureCommandKind.TERMINATE: self._user_terminate,
@@ -461,8 +478,27 @@ class VideoCapture(Process):
         record_backlog = RecordBacklog(record_q.maxsize, self._record_batch_size, camera.width * camera.height)
 
         def rec_q_put(batch):
-            record_q.put(batch, timeout=3)
-            warning = record_backlog.observe(record_q.qsize())
+            latency = self._latency
+            entry = time.perf_counter()
+            try:
+                record_q.put(batch, timeout=3)
+            except queue.Full:
+                # Recorded here as well as raised: the loop's fault handler
+                # only counts a generic error, and a lost batch is a fact the
+                # recording should keep.
+                if latency is not None and batch:
+                    latency.append("record_batches", (
+                        batch[0][0], batch[-1][0], len(batch), entry,
+                        time.perf_counter(), record_q.qsize(), True,
+                    ))
+                raise
+            depth = record_q.qsize()
+            if latency is not None and batch:
+                latency.append("record_batches", (
+                    batch[0][0], batch[-1][0], len(batch), entry,
+                    time.perf_counter(), depth, False,
+                ))
+            warning = record_backlog.observe(depth)
             if warning is not None:
                 logger.warning("<%s> %s", self._name, warning)
         # using a ~small timeout on record_q put, to prevent deadlock if queue is full, given it has a maxsize.
@@ -915,17 +951,36 @@ class VideoCapture(Process):
                 )
 
                 net_frame = None
+                pose_put_result = POSE_PUT_NOT_ATTEMPTED
                 if net_q_put is not None:
                     # network queue goes to processing/inference
                     # frame_perf_c travels with the frame so the pose process
-                    # can report sensor-to-result, not just how long its own
-                    # call took. It is the host time the exposure maps to, from
-                    # the camera's hardware timestamp - not when Python noticed
-                    # the frame.
+                    # can report a sensor-to-result figure, not just how long
+                    # its own call took. It is fitted to when the host's poll
+                    # first saw the frame (spinnaker_cam._capture), so it holds
+                    # neither exposure nor readout; the latency record measures
+                    # those against the NI exposure edge instead. The camera's
+                    # own frame id goes too: the recording-relative index is -1
+                    # outside a recording.
                     net_frame = net_fit(frame)
                     if net_q_put(net_frame, net_q_idx, frame_idx_cat, block=False,
-                                 frame_perf_c=frame_perf_c) == BufferResult.Ok:
+                                 frame_perf_c=frame_perf_c,
+                                 cam_frame_id=cam_frame_id) == BufferResult.Ok:
                         cnt_net_q_put += 1
+                        pose_put_result = POSE_PUT_OK
+                    else:
+                        pose_put_result = POSE_PUT_OVERFLOW
+
+                latency = self._latency
+                if latency is not None:
+                    latency.append("frames", (
+                        cam_frame_id, int(when), camera.frame_poll_perf_c,
+                        camera.frame_arrival_perf_c, perf_now, pose_put_result,
+                    ))
+                    if self._latency_close_requested and record_start_stop_frame_idx is None:
+                        # The recording has wound down (or this camera never
+                        # recorded): every frame of it is in the stream now.
+                        self._close_latency()
 
                 if img_q is not None:
                     # image queue goes to GUI video reader frame, currently FixedArrayQueue.
@@ -976,6 +1031,7 @@ class VideoCapture(Process):
             logger.info(f"<{self._name}> capture loop ended")
             self._stim_session_active = False
             self._stop_stim_evidence()
+            self._close_latency()
 
             if camera is not None:
                 camera.end_capture()
@@ -1035,6 +1091,11 @@ class VideoCapture(Process):
         self._is_capturing = False
 
     def _enable_record(self, *, is_from_start: bool=False):
+        if not is_from_start:
+            # Before the flag below: the capture loop polls it between frames
+            # and starts the recording on the next one, and that frame needs
+            # the stream to be there to be recorded in it.
+            self._start_latency()
         self._is_record_active = self._record_properties.should_record(True, is_from_start=is_from_start)
         if self._stim_detector is not None and not is_from_start:
             self._stim_session_active = True
@@ -1050,6 +1111,8 @@ class VideoCapture(Process):
             self._stim_session_active = False
             self._stim_detector.disarm()
             self._stop_stim_evidence()
+        if not is_from_start:
+            self._latency_close_requested = True
         logger.verbose("_disable_record(is_triggered=%s, is_from_start=%s): is_record_active=%s",
                        entry_is_triggered, is_from_start, self._is_record_active)
 
@@ -1109,6 +1172,40 @@ class VideoCapture(Process):
                     ),
                 ),
             ))
+
+    def _start_latency(self):
+        if self._latency is not None:
+            # A previous recording that had not wound down yet.
+            self._close_latency()
+        project = self._project_info
+        if project is None or not latency_recording_enabled():
+            return
+        try:
+            self._latency = LatencyStreamWriter(
+                latency_stream_path(project, f"camera_{self._name}"),
+                {"frames": CAMERA_FRAME_DTYPE, "record_batches": RECORD_BATCH_DTYPE},
+                attrs={
+                    "camera": self._name,
+                    "camera_index": self._camera_idx,
+                    "is_primary": bool(self._attrs.is_primary),
+                },
+            )
+        except Exception:
+            logger.exception("<%s> latency stream could not start; recording continues without it",
+                             self._name)
+
+    def _close_latency(self):
+        writer, self._latency = self._latency, None
+        self._latency_close_requested = False
+        if writer is None:
+            return
+        stats = writer.close()
+        if stats["failed"] or any(stats["rowsDropped"].values()):
+            logger.warning("<%s> latency stream incomplete: %s", self._name, stats)
+        if stats.get("rowsRejected"):
+            # A rejected row here means the row did not fit the schema.
+            logger.error("<%s> latency stream rejected %d rows: %s", self._name,
+                         stats["rowsRejected"], stats)
 
     def _process_stim_frame(
         self,
