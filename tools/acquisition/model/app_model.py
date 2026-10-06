@@ -5751,9 +5751,12 @@ class AppModel(ObservableObject):
 
     def _trigger_protocol_stim3(self, profile, recipe, detail) -> None:
         firing = recipe.laser_firing
+        called = time.perf_counter()
         token = self._hardware.pulse_stim(
             firing.trigger_pulse_us, stim_line=firing.stim_line
         )
+        self._session_data_recorder.latency_events.record_stim3_pulse(
+            getattr(recipe, "operation_id", ""), token, called, time.perf_counter())
         if token is None:
             raise RuntimeError("Firmware STIM{} pulse was not queued".format(firing.stim_line))
         timeout = max(3.0, firing.trigger_pulse_us / 1e6 + 2.0)
@@ -5848,6 +5851,15 @@ class AppModel(ObservableObject):
 
     def _on_stim_camera_trigger(self, camera_index, decision) -> None:
         """Accept only the detector decision owned by the current attempt."""
+        received = time.perf_counter()
+        if decision.get("trigger_route") == "hardware_stim3":
+            # The direct route is recorded where its NI start returns; this
+            # message is the only GUI hop the STIM3 route has.
+            try:
+                self._session_data_recorder.latency_events.record_stim_dispatch(
+                    decision, gui_recv_perf=received)
+            except Exception:
+                logger.exception("STIM3 dispatch latency row was not recorded")
         camera = self._stim_camera
         token = self._recording_session.token()
         operation = self._trial_action_executor.operation
@@ -5924,6 +5936,10 @@ class AppModel(ObservableObject):
         # Aggregate before anything that can raise, so a recorder or capture
         # failure does not also lose the latency sample.
         self._stim_latency_budget.observe(payload)
+        try:
+            self._session_data_recorder.latency_events.record_stim_dispatch(payload)
+        except Exception:
+            logger.exception("Direct stim dispatch latency row was not recorded")
         perf_time = float(
             payload.get("daqmx_start_entry_perf_time")
             or payload.get("ipc_receive_perf_time")
