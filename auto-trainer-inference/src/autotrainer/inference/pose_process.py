@@ -3,6 +3,7 @@ import queue
 import re
 import signal
 import threading
+import math
 import time
 from enum import IntEnum
 from multiprocessing import Process, Queue, synchronize
@@ -52,7 +53,8 @@ def _is_end_of_recording(frames_indices) -> bool:
 
 
 def take_newest_live_batch(queue, frame_buffer, frames_indices, frames_perf_c,
-                           *, drain: bool) -> bool:
+                           *, drain: bool, cam_frame_ids=None, put_perf_c=None,
+                           stats=None) -> bool:
     """Fill the buffers from the freshest batch the live queue holds.
 
     get_output frees the buffer slot as soon as it has copied the frame out,
@@ -80,15 +82,28 @@ def take_newest_live_batch(queue, frame_buffer, frames_indices, frames_perf_c,
     costs one iteration of staleness on a path where recording has stopped.
 
     Returns False when the queue had nothing, leaving the buffers untouched.
+
+    When given, ``cam_frame_ids`` and ``put_perf_c`` receive each camera's own
+    frame id and slot-write time, and ``stats["skipped"]`` how many batches
+    the drain overwrote: the latency record's identity and queue stages.
+    They are only passed on when given, so a queue without them still works.
     """
+    extra = {}
+    if cam_frame_ids is not None:
+        extra["cam_frame_ids"] = cam_frame_ids
+    if put_perf_c is not None:
+        extra["put_perf_c"] = put_perf_c
     if not queue.get_output(frame_buffer, frames_indices, timeout=0.1,
-                            frames_perf_c=frames_perf_c):
+                            frames_perf_c=frames_perf_c, **extra):
         return False
+    skipped = 0
     while (drain
            and not _is_end_of_recording(frames_indices)
            and queue.get_output(frame_buffer, frames_indices, timeout=0,
-                                frames_perf_c=frames_perf_c)):
-        pass
+                                frames_perf_c=frames_perf_c, **extra)):
+        skipped += 1
+    if stats is not None:
+        stats["skipped"] = skipped
     return True
 
 
@@ -382,6 +397,18 @@ class PoseProcess(Process):
         frames_perf_c1 = numpy.full(
             (input_q.camera_count, input_q.frames_per_camera), numpy.nan,
             dtype="float64")
+        # Each camera's own frame id and slot-write time for the batch, how
+        # many batches the drain skipped, and when the batch was taken: the
+        # latency record's identity and queue stages. pose_seq numbers the
+        # live batches so the monitor's two rows for one batch can be joined.
+        cam_frame_ids1 = numpy.full(
+            (input_q.camera_count, input_q.frames_per_camera), -1, dtype="int64")
+        put_perf_c1 = numpy.full(
+            (input_q.camera_count, input_q.frames_per_camera), numpy.nan,
+            dtype="float64")
+        drain_stats = {"skipped": 0}
+        dequeue_perf = math.nan
+        pose_seq = 0
         #
         frame_buffer = frame_buffer1
         frames_indices = frames_indices1
@@ -438,9 +465,14 @@ class PoseProcess(Process):
             # block=False, so a slow pose process can never stall it or cost a
             # recorded frame; skipping here discards inference work, never
             # acquisition.
-            return take_newest_live_batch(
+            nonlocal dequeue_perf
+            took = take_newest_live_batch(
                 live_input, frame_buffer1, frames_indices1, frames_perf_c1,
-                drain=live_drain)
+                drain=live_drain, cam_frame_ids=cam_frame_ids1,
+                put_perf_c=put_perf_c1, stats=drain_stats)
+            if took:
+                dequeue_perf = time.perf_counter()
+            return took
 
         def get_offline_input():
             nonlocal frame_buffer, frames_indices
@@ -508,6 +540,7 @@ class PoseProcess(Process):
             if not cur_get_output():
                 continue
             mode_used = InferenceMode.Live if i_q is live_input else InferenceMode.Offline
+            latency_record = None
             actual_release_output = cur_release_output
 
             p_last_data = p_now
@@ -547,6 +580,16 @@ class PoseProcess(Process):
                     predict_started = time.perf_counter()
                     pose = live_predict(live_predict_input)[:live_batch_size]
                     predict_done = time.perf_counter()
+                    latency_record = (
+                        pose_seq,
+                        cam_frame_ids1[:, -1].copy(),
+                        put_perf_c1[:, -1].copy(),
+                        dequeue_perf,
+                        int(drain_stats["skipped"]),
+                        predict_started,
+                        predict_done,
+                    )
+                    pose_seq += 1
                     predict_ms = (predict_done - predict_started) * 1000.0
                     live_predict_count += 1
                     window_predict_count += 1
@@ -593,6 +636,10 @@ class PoseProcess(Process):
             d_q_put((pose,
                      mode_used,
                      frames_indices_out,
+                     # The batch's latency stamps, closed with the moment it
+                     # is handed on; None for padding, markers and offline.
+                     None if latency_record is None
+                     else latency_record + (time.perf_counter(),),
                      ))
 
             if not sent_live:
