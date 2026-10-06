@@ -98,13 +98,13 @@ def test_a_preset_records_h264_and_the_base_keeps_mp4v(video_capture_model):
     assert video_capture_model.video_encoder == "mp4v"
 
 
-def test_a_preset_will_not_start_without_ffmpeg(video_capture_model, monkeypatch):
+def test_a_preset_will_not_start_without_libx264(video_capture_model, monkeypatch):
     from tools.acquisition.model import video_capture_model as module
 
-    monkeypatch.setattr(module, "ffmpeg_executable", lambda: None)
+    monkeypatch.setattr(module, "x264_available", lambda: False)
     _random_base(video_capture_model, capture_binning=2)
 
-    with pytest.raises(ValueError, match="ffmpeg"):
+    with pytest.raises(ValueError, match="libx264"):
         video_capture_model.on_prepare_capture()
     assert video_capture_model._video_capture is None
     assert video_capture_model._video_image_queue is None
@@ -137,6 +137,7 @@ def test_the_recorder_is_given_the_presets_encoder(video_capture_model, monkeypa
 
     _FakeCapture.seen = []
     monkeypatch.setattr(module, "VideoCapture", _FakeCapture)
+    monkeypatch.setattr(module, "x264_available", lambda: True)
     if preset is None:
         _random_base(video_capture_model)
     else:
@@ -144,3 +145,15 @@ def test_the_recorder_is_given_the_presets_encoder(video_capture_model, monkeypa
 
     assert video_capture_model.on_prepare_capture() is True
     assert _FakeCapture.seen == [expected]
+
+
+def test_a_camera_that_does_not_record_needs_no_libx264(video_capture_model, monkeypatch):
+    from tools.acquisition.model import video_capture_model as module
+
+    _FakeCapture.seen = []
+    monkeypatch.setattr(module, "VideoCapture", _FakeCapture)
+    monkeypatch.setattr(module, "x264_available", lambda: False)
+    _random_base(video_capture_model, capture_binning=2)
+    video_capture_model.is_recording_enabled = False
+
+    assert video_capture_model.on_prepare_capture() is True

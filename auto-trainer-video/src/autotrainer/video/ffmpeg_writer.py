@@ -7,6 +7,8 @@ recorder queue filled. libx264 at the ultrafast preset and CRF 18 encoded the
 same frames at 250-276 fps per stream, at 15-19 Mbit/s and a mean error of
 0.8-0.9 grey levels (christielab10, 2026-10-06).
 """
+import functools
+import os
 import shutil
 import subprocess
 import tempfile
@@ -26,6 +28,11 @@ X264_OUTPUT_ARGS = (
     "-pix_fmt", "yuv420p",
 )
 
+# The encoder runs below capture and live pose: it has throughput to spare at
+# every preset, they have a deadline. At 1024x1024 an unprioritised encoder
+# cut the share of frames posed live from 86% to 60% (christielab10, 2026-10-06).
+ENCODER_NICENESS = 10
+
 # Long enough for ffmpeg to encode what is still in the pipe and write the
 # file index at the end of a recording.
 _CLOSE_TIMEOUT_S = 120
@@ -33,6 +40,20 @@ _CLOSE_TIMEOUT_S = 120
 
 def ffmpeg_executable() -> Optional[str]:
     return shutil.which("ffmpeg")
+
+
+@functools.lru_cache(maxsize=None)
+def x264_available() -> bool:
+    """Whether the installed ffmpeg can encode with libx264 (checked once per process)."""
+    executable = ffmpeg_executable()
+    if executable is None:
+        return False
+    try:
+        encoders = subprocess.run([executable, "-hide_banner", "-encoders"],
+                                  capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return " libx264 " in encoders
 
 
 class FfmpegX264Writer:
@@ -45,7 +66,14 @@ class FfmpegX264Writer:
         width, height = size
         self._path = path
         self._stderr = tempfile.TemporaryFile()
-        self._process = subprocess.Popen(
+        try:
+            self._process = self._start(executable, width, height, fps, is_color, path)
+        except BaseException:
+            self._stderr.close()
+            raise
+
+    def _start(self, executable, width, height, fps, is_color, path) -> subprocess.Popen:
+        process = subprocess.Popen(
             [
                 executable, "-hide_banner", "-loglevel", "error", "-y",
                 "-f", "rawvideo", "-pix_fmt", "bgr24" if is_color else "gray",
@@ -55,7 +83,19 @@ class FfmpegX264Writer:
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=self._stderr,
+            # Its own session: the capture process ignores a terminal's Ctrl+C,
+            # and ffmpeg must not end the recording on one either.
+            start_new_session=True,
         )
+        try:
+            os.setpriority(os.PRIO_PROCESS, process.pid, ENCODER_NICENESS)
+        except (AttributeError, OSError):  # not POSIX, or not permitted: run at normal priority
+            logger.warning("could not lower the ffmpeg encoder's priority for %s", path)
+        return process
+
+    def _stderr_tail(self) -> str:
+        self._stderr.seek(0)
+        return self._stderr.read().decode(errors="replace").strip()[-500:]
 
     def isOpened(self) -> bool:  # noqa: N802 - cv2.VideoWriter's name
         return self._process.poll() is None
@@ -63,7 +103,16 @@ class FfmpegX264Writer:
     def write(self, frame: numpy.ndarray) -> None:
         # A C-contiguous copy only when the frame is a view (e.g. one channel
         # of a decoded frame); the flat byte view avoids a second copy.
-        self._process.stdin.write(memoryview(numpy.ascontiguousarray(frame)).cast("B"))
+        try:
+            self._process.stdin.write(memoryview(numpy.ascontiguousarray(frame)).cast("B"))
+        except OSError as err:  # BrokenPipeError: ffmpeg has exited
+            try:
+                returncode = self._process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                returncode = None
+            raise RuntimeError(
+                f"ffmpeg stopped (exit {returncode}) while recording {self._path}: {self._stderr_tail()}"
+            ) from err
 
     def release(self) -> None:
         process = self._process
@@ -75,12 +124,16 @@ class FfmpegX264Writer:
             try:
                 returncode = process.wait(timeout=_CLOSE_TIMEOUT_S)
             except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
+                # Terminate first: ffmpeg then still writes the file index, so
+                # what was encoded stays readable. Kill only if that hangs too.
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
                 raise RuntimeError(f"ffmpeg did not finish {self._path} within {_CLOSE_TIMEOUT_S} s")
             if returncode != 0:
-                self._stderr.seek(0)
-                detail = self._stderr.read().decode(errors="replace").strip()[-500:]
-                raise RuntimeError(f"ffmpeg exited with {returncode} writing {self._path}: {detail}")
+                raise RuntimeError(f"ffmpeg exited with {returncode} writing {self._path}: {self._stderr_tail()}")
         finally:
             self._stderr.close()

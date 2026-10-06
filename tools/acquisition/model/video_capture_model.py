@@ -35,7 +35,7 @@ from autotrainer.video.camera_discovery import (
     discover_spin_cameras,
 )
 
-from autotrainer.video.ffmpeg_writer import ffmpeg_executable
+from autotrainer.video.ffmpeg_writer import x264_available
 from tools.acquisition.model.capture_binning import (
     CAPTURE_BINNING_PARAM,
     OFFSET_ALIASES,
@@ -549,9 +549,10 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
         # Resolve the capture URL first: an impossible binning preset raises
         # here, before any queue or reader is allocated for this start.
         camera_url = None if self._camera_source is None else self._runtime_camera_url()
-        if self.video_encoder == "x264" and ffmpeg_executable() is None:
+        if self._is_recording_enabled and self.video_encoder == "x264" and not x264_available():
             raise ValueError(
-                f"capture binning {self.capture_binning} records H.264 through ffmpeg, which is not installed")
+                f"capture binning {self.capture_binning} records H.264 through ffmpeg's libx264, "
+                "which is not installed")
         self._frame_count = 0
         self._video_frame_index.value = -1
         self._errors.value = b""

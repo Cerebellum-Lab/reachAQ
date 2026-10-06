@@ -1,4 +1,6 @@
+import os
 import queue
+import shutil
 import threading
 from pathlib import Path
 
@@ -10,6 +12,9 @@ from autotrainer.core import SystemStatusMessageKind
 from autotrainer.core.project import ProjectInfo
 from autotrainer.video import VideoRecord, VideoRecordMode, VideoRecordProperties
 from autotrainer.video import ffmpeg_writer, video_record
+
+
+needs_ffmpeg = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is not installed here")
 
 
 @pytest.fixture
@@ -269,6 +274,7 @@ def test_the_default_encoder_is_still_mp4v(project_info):
     assert _fourcc(video) in {"mp4v", "fmp4"}
 
 
+@needs_ffmpeg
 def test_the_x264_encoder_records_grayscale_frames_as_h264(project_info):
     frames = _gradient_frames(20)
 
@@ -280,6 +286,7 @@ def test_the_x264_encoder_records_grayscale_frames_as_h264(project_info):
     assert numpy.abs(decoded[5][:, :, 0].astype(int) - frames[5].astype(int)).mean() < 2
 
 
+@needs_ffmpeg
 def test_the_x264_encoder_keeps_mono_fillers_in_a_colour_recording(project_info):
     colour = _gradient_frames(6, channels=3)
     frames = colour[:3] + [numpy.zeros((64, 64), numpy.uint8)] * 2 + colour[3:]
@@ -312,3 +319,52 @@ def test_x264_without_ffmpeg_is_reported_rather_than_silent(project_info, monkey
 def test_an_unknown_encoder_is_refused(project_info):
     with pytest.raises(ValueError, match="video encoder"):
         _recorder(project_info, "badenc", encoder="vp9")
+
+
+def test_a_frame_that_is_not_8_bit_is_refused_and_reported(project_info, writer_spy):
+    msg_queue = queue.Queue()
+    recorder, input_queue, stopped = _recorder(project_info, "floatframe", msg_queue=msg_queue)
+    recorder.start()
+    try:
+        input_queue.put([(idx, numpy.zeros((64, 64), numpy.float32), 0.0, 0.0) for idx in range(3)])
+        input_queue.put([])
+        assert stopped.acquire(timeout=10)
+    finally:
+        recorder.cancel()
+        recorder.join(5)
+
+    assert writer_spy == []
+    _cam_idx, _written, _project, _generation, diagnostics = _closed_message(msg_queue)
+    assert "dtype float32" in diagnostics["firstError"]
+
+
+def test_an_ffmpeg_that_fails_mid_recording_reports_its_own_error(project_info, monkeypatch, tmp_path):
+    fake = tmp_path / "ffmpeg"
+    fake.write_text("\n".join(("#!/bin/sh", "echo 'x264 encoder broke' >&2", "exit 3", "")))
+    fake.chmod(0o755)
+    monkeypatch.setattr(ffmpeg_writer, "ffmpeg_executable", lambda: str(fake))
+    msg_queue = queue.Queue()
+    recorder, input_queue, stopped = _recorder(project_info, "brokenffmpeg", msg_queue=msg_queue, encoder="x264")
+    recorder.start()
+    try:
+        # More than a pipe buffer, so the dead reader is noticed during the batch.
+        input_queue.put([(idx, frame, 0.0, 0.0) for idx, frame in enumerate(_gradient_frames(40))])
+        input_queue.put([])
+        assert stopped.acquire(timeout=20)
+    finally:
+        recorder.cancel()
+        recorder.join(5)
+
+    _cam_idx, _written, _project, _generation, diagnostics = _closed_message(msg_queue)
+    assert diagnostics["errorCount"] >= 1
+    assert "x264 encoder broke" in diagnostics["firstError"]
+
+
+@needs_ffmpeg
+def test_the_encoder_runs_below_capture_and_pose_priority(tmp_path):
+    writer = ffmpeg_writer.FfmpegX264Writer(str(tmp_path / "nice.mp4"), 30, (64, 64), False)
+    try:
+        assert os.getpriority(os.PRIO_PROCESS, writer._process.pid) == ffmpeg_writer.ENCODER_NICENESS
+        writer.write(_gradient_frames(1)[0])
+    finally:
+        writer.release()

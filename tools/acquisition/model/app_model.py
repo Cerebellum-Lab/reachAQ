@@ -482,7 +482,7 @@ def _camera_configured_metadata(camera) -> Dict[str, Any]:
         "captureShape": list(camera.capture_shape),
         "inferenceShape": list(camera.shape),
         "captureBinning": camera.effective_capture_binning,
-        "videoEncoder": camera.video_encoder,
+        "videoEncoder": camera.video_encoder if camera.is_recording_enabled else None,
     }
 
 

@@ -395,6 +395,9 @@ class VideoRecord(Thread):
         channels = 1 if len(shape) == 2 else shape[2] if len(shape) == 3 else 0
         if channels not in (1, 3):
             raise ValueError(f"cannot record a {channels}-channel frame of shape {shape}")
+        dtype = getattr(frame, "dtype", None)
+        if dtype != numpy.uint8:
+            raise ValueError(f"cannot record a frame of dtype {dtype}; 8-bit frames only")
         if tuple(shape[:2]) != (self._height, self._width):
             raise ValueError(f"frame of shape {shape} does not match the recording size "
                              f"{self._width}x{self._height}")
@@ -424,5 +427,7 @@ class VideoRecord(Thread):
             vid_ts_file = self._video_timestamp_file
             if vid_ts_file is not None:
                 self._video_timestamp_file = None
-                vid_ts_file.flush()
-                vid_ts_file.close()
+                try:
+                    vid_ts_file.flush()
+                finally:
+                    vid_ts_file.close()
