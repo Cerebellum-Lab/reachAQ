@@ -43,6 +43,26 @@ def _check_frame_count(file_path: Path) -> Optional[Tuple[cv2.VideoCapture, int]
     return capture, count
 
 
+def _fit_to_shape(frame: numpy.ndarray, shape: Tuple[int, ...]) -> numpy.ndarray:
+    """Area-average a recorded frame down to the pose input shape.
+
+    A recording made at less binning than the live inference input is k times
+    larger in each direction. Live capture averages k x k blocks before the
+    pose queue (autotrainer.video.frame_fit), so the replay must feed the
+    model the same thing, or the replayed poses come out in a different pixel
+    space from the live ones. Anything but one integer factor is refused.
+    """
+    rows, cols = frame.shape[:2]
+    t_rows, t_cols = int(shape[0]), int(shape[1])
+    if (rows, cols) == (t_rows, t_cols):
+        return frame
+    if rows % t_rows or cols % t_cols or rows // t_rows != cols // t_cols:
+        raise ValueError(
+            f"recorded frame {rows}x{cols} is not the pose input {t_rows}x{t_cols} "
+            "multiplied by one integer factor")
+    return cv2.resize(frame, (t_cols, t_rows), interpolation=cv2.INTER_AREA)
+
+
 class ConditionalSemaphore(object):
     # adapted from https://stackoverflow.com/a/60765044/30431755
 
@@ -234,6 +254,7 @@ class OfflineInputProcess:
             return False
         if len(numpy.shape(frame)) >= 3:  # unsure we want always this
             frame = frame[:, :, 0]
+        frame = _fit_to_shape(frame, self._frame_shape)
         return self._put_block(frame, cam_index, frame_idx, timeout=timeout)
 
     def _put_block(self, frame, cam_index, frame_idx, *, timeout: float=5):
