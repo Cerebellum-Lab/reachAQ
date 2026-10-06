@@ -136,6 +136,7 @@ from tools.acquisition.model.recording_session_controller import (
 )
 from tools.acquisition.model.camera_recording_validation import (
     ClosedVideoValidation,
+    closed_video_timeout_seconds,
     validate_closed_video,
 )
 from tools.acquisition.model.capture_binning import (
@@ -2606,7 +2607,7 @@ class AppModel(ObservableObject):
                                 timestamp_path,
                                 writer_frame_count=camera_frames,
                                 writer_diagnostics=writer_diagnostics,
-                                ffprobe_timeout_seconds=30.0,
+                                ffprobe_timeout_seconds=closed_video_timeout_seconds(camera_frames),
                             )
                             for (
                                 camera,

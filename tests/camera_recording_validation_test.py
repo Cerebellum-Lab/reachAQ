@@ -96,3 +96,25 @@ def test_ffprobe_timeout_is_bounded_failure_without_unbounded_fallback(
 
     assert result.counter_backend == "ffprobe_timeout"
     assert "timed out after 3.0 seconds" in result.failure
+
+
+def test_the_frame_count_decodes_with_threads(monkeypatch, tmp_path):
+    seen = {}
+
+    def fake_run(command, **kwargs):
+        seen["command"], seen["timeout"] = list(command), kwargs["timeout"]
+        return subprocess.CompletedProcess(command, 0, stdout="12\n", stderr="")
+
+    monkeypatch.setattr(validation_module.subprocess, "run", fake_run)
+
+    assert validation_module._ffprobe_frame_count(tmp_path / "left.mp4", 42.0) == 12
+    assert seen["command"][seen["command"].index("-threads") + 1] == "8"
+    assert seen["timeout"] == 42.0
+
+
+def test_the_validation_deadline_grows_with_the_recording():
+    deadline = validation_module.closed_video_timeout_seconds
+    assert deadline(0) == 30.0
+    assert deadline(18_000) == 30.0     # 2 minutes at 150 fps
+    assert deadline(54_052) == 54.052   # 6 minutes; decoded in 7.7 s at 1024x1024 H.264
+    assert deadline(270_000) == 270.0   # 30 minutes
