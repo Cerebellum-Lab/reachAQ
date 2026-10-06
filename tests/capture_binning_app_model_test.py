@@ -1,3 +1,4 @@
+import inspect
 import threading
 from types import SimpleNamespace
 
@@ -64,6 +65,61 @@ def test_the_preset_cannot_change_while_acquisition_starts_or_stops(phase):
     with pytest.raises(RuntimeError, match="while acquisition is running"):
         AppModel.set_reach_capture_binning(app, 2)
     assert (left.capture_binning, right.capture_binning) == (None, None) and saved == []
+
+
+def _differs_warnings(caplog):
+    return [r.getMessage() for r in caplog.records if "different binning" in r.getMessage()]
+
+
+def test_start_warns_when_left_and_right_capture_at_different_binning(caplog):
+    app, left, right, _ = _app()
+    left.name, right.name = "left", "right"
+    right.set_capture_binning(2)
+    with caplog.at_level("WARNING"):
+        AppModel._warn_if_stereo_capture_binning_differs(app)
+    message, = _differs_warnings(caplog)
+    assert "left bin 4" in message and "right bin 2" in message
+
+
+def test_start_does_not_warn_when_both_capture_at_the_same_binning(caplog):
+    app, left, right, _ = _app()
+    left.name, right.name = "left", "right"
+    left.set_capture_binning(2)
+    right.set_capture_binning(2)
+    with caplog.at_level("WARNING"):
+        AppModel._warn_if_stereo_capture_binning_differs(app)
+    assert _differs_warnings(caplog) == []
+
+
+def test_start_does_not_warn_about_a_camera_that_is_not_enabled(caplog):
+    app, left, right, _ = _app()
+    left.name, right.name = "left", "right"
+    right.set_capture_binning(2)
+    right.is_enabled = False
+    with caplog.at_level("WARNING"):
+        AppModel._warn_if_stereo_capture_binning_differs(app)
+    assert _differs_warnings(caplog) == []
+
+
+def test_a_malformed_binning_is_logged_not_raised_so_the_camera_start_can_refuse_it(caplog):
+    app, left, right, _ = _app()
+
+    class _Malformed(_Camera):
+        @property
+        def effective_capture_binning(self):
+            raise ValueError("capture_binning='two' is not a number")
+
+    app._right_camera = _Malformed()
+    with caplog.at_level("WARNING"):
+        AppModel._warn_if_stereo_capture_binning_differs(app)
+    assert "could not be compared: capture_binning='two' is not a number" in caplog.text
+    assert _differs_warnings(caplog) == []
+
+
+def test_capture_start_checks_the_stereo_binning_before_it_starts_the_cameras():
+    source = inspect.getsource(AppModel.capture_start)
+    assert source.index("self._warn_if_stereo_capture_binning_differs()") < source.index(
+        "self._start_reach_camera_domains(")
 
 
 def test_session_metadata_names_the_capture_and_inference_shapes():
