@@ -21,7 +21,11 @@ from autotrainer.core import ProjectInfo, ProjectInterval, SystemStatusMessageKi
 from autotrainer.core.capture import CaptureProcessStatus
 from autotrainer.core.logging import get_verbose_logger
 
+from .ffmpeg_writer import FfmpegX264Writer
+
 logger = get_verbose_logger(__name__)
+
+VIDEO_ENCODERS = ("mp4v", "x264")
 
 
 class VideoRecordMode(IntEnum):
@@ -57,6 +61,10 @@ class VideoRecordProperties:
 
     record_generation: Optional[Synchronized[int]] = None
     """Shared application session generation for stale-callback rejection."""
+
+    encoder: str = "mp4v"
+    """Video encoder: "mp4v" (OpenCV, MPEG-4 Part 2) or "x264" (H.264 through an ffmpeg
+    process, fast enough for the larger capture presets; see ffmpeg_writer)."""
 
     queue_batch_size = 60
     """Number of frames to batch for passing between capture and record queues."""
@@ -100,6 +108,9 @@ class VideoRecord(Thread):
         self._fps = properties.fps
         self._record_mode = properties.record_mode
         self._video_rotate_interval = properties.video_rotate_interval
+        if properties.encoder not in VIDEO_ENCODERS:
+            raise ValueError(f"unknown video encoder {properties.encoder!r}; expected one of {VIDEO_ENCODERS}")
+        self._encoder = properties.encoder
         self._image_interval = properties.image_interval
 
         self._input_queue: Queue = input_queue
@@ -358,14 +369,16 @@ class VideoRecord(Thread):
         self._video_file = video_file
 
     def _open_video_writer(self, *, is_color: bool):
-        # Grayscale frames, which every reach camera delivers, go to a grayscale
-        # writer. Expanding them to three channels first cost 2.2 ms per
-        # 1024x1024 frame and halved mp4v throughput (157 vs 304 fps per stream,
-        # two streams in parallel, christielab10 2026-10-06), which limited
-        # 1024x1024 recording to about five minutes before the queue filled.
-        vid_writer = cv2.VideoWriter(
-            self._video_file, cv2.VideoWriter_fourcc(*'mp4v'), self._fps, (self._width, self._height),
-            isColor=is_color)  # noqa
+        size = (self._width, self._height)
+        if self._encoder == "x264":
+            vid_writer = FfmpegX264Writer(self._video_file, self._fps, size, is_color)
+        else:
+            # Grayscale frames, which every reach camera delivers, go to a grayscale
+            # writer: expanding them to three channels first cost 2.2 ms per
+            # 1024x1024 frame and roughly halved mp4v throughput (christielab10,
+            # 2026-10-06).
+            vid_writer = cv2.VideoWriter(
+                self._video_file, cv2.VideoWriter_fourcc(*'mp4v'), self._fps, size, isColor=is_color)  # noqa
         if not vid_writer.isOpened():
             raise RuntimeError(f"Failed open {self._video_file} for writing")
         self._video_writer = vid_writer
@@ -398,15 +411,18 @@ class VideoRecord(Thread):
         return mono if mono is not None else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
     def _close_video_writer(self):
-        vid_writer = self._video_writer
-        if vid_writer is not None:
-            vid_writer.release()
-            logger.debug("Released %s", self._video_file)
-            self._video_writer = None
-        self._video_file = None
-
-        vid_ts_file = self._video_timestamp_file
-        if vid_ts_file is not None:
-            vid_ts_file.flush()
-            vid_ts_file.close()
-            self._video_timestamp_file = None
+        # Cleared before releasing: an ffmpeg writer can raise on release (it
+        # reports a failed encode then), and the recorder must still be left
+        # closed, with the timestamp file flushed, for the next recording.
+        vid_writer, self._video_writer = self._video_writer, None
+        video_file, self._video_file = self._video_file, None
+        try:
+            if vid_writer is not None:
+                vid_writer.release()
+                logger.debug("Released %s", video_file)
+        finally:
+            vid_ts_file = self._video_timestamp_file
+            if vid_ts_file is not None:
+                self._video_timestamp_file = None
+                vid_ts_file.flush()
+                vid_ts_file.close()
