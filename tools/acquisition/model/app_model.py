@@ -138,6 +138,11 @@ from tools.acquisition.model.camera_recording_validation import (
     ClosedVideoValidation,
     validate_closed_video,
 )
+from tools.acquisition.model.capture_binning import (
+    apply_capture_binning,
+    capture_binning_available,
+    common_capture_binning,
+)
 from tools.acquisition.model.camera_timing_alignment import (
     CameraTimestampInput,
     align_camera_timestamp_files,
@@ -461,6 +466,23 @@ def _metadata_without_nonfinite_numbers(value):
             for item in value
         ]
     return value
+
+
+def _camera_configured_metadata(camera) -> Dict[str, Any]:
+    """What a session records about one camera's capture.
+
+    Pose files are in the pixels of the frames inference receives
+    (``inferenceShape``); the video is in the captured frame's pixels
+    (``captureShape``). With a capture-binning preset the two differ by a
+    whole factor, and these fields are how a reader maps one onto the other.
+    """
+    return {
+        "previewEnabled": camera.is_enabled,
+        "recordEnabled": camera.is_recording_enabled,
+        "captureShape": list(camera.capture_shape),
+        "inferenceShape": list(camera.shape),
+        "captureBinning": camera.effective_capture_binning,
+    }
 
 
 def _compact_subsystem_snapshot(snapshot):
@@ -1600,8 +1622,11 @@ class AppModel(ObservableObject):
         total = 16 * 1024.0  # decoded events, timestamps, pose, laser, and logs
         for camera in self._get_recording_cams():
             params = camera.active_config.params
-            width = float(params.get("width", 2048))
-            height = float(params.get("height", 1536))
+            # The captured size: with a capture-binning preset the recorded
+            # frames are larger than the saved width/height.
+            rows, cols = camera.capture_shape
+            width = float(cols) if cols > 0 else float(params.get("width", 2048))
+            height = float(rows) if rows > 0 else float(params.get("height", 1536))
             fps = float(params.get("fps", 150))
             explicit_mbps = params.get("estimated_recording_mbps")
             if explicit_mbps is not None:
@@ -2792,6 +2817,36 @@ class AppModel(ObservableObject):
     @property
     def reach_cameras(self) -> Tuple[VideoCaptureModel, ...]:
         return self._reach_cameras
+
+    def _stereo_cameras(self) -> Tuple[VideoCaptureModel, ...]:
+        # Left and right only: the calibration and live inference are theirs.
+        # stimCam keeps its own capture settings.
+        return tuple(
+            camera for camera in (self._left_camera, self._right_camera)
+            if camera is not None
+        )
+
+    @property
+    def reach_capture_binning(self) -> Optional[int]:
+        """The binning left and right capture at, or None when they differ."""
+        return common_capture_binning(self._stereo_cameras())
+
+    def reach_capture_binning_available(self, binning: int) -> bool:
+        return capture_binning_available(self._stereo_cameras(), binning)
+
+    @_serialized_session_configuration
+    def set_reach_capture_binning(self, binning: int) -> None:
+        """Capture left and right at this binning over the same field of view, and save it.
+
+        Applies from the next Start. Live inference, the display and the
+        calibration keep the base frame size.
+        """
+        self._require_session_ready_for_configuration("Changing the camera resolution")
+        if self.acquisition_started:
+            raise RuntimeError("Changing the camera resolution is unavailable while acquisition is running")
+        apply_capture_binning(self._stereo_cameras(), binning)
+        logger.info("Left/right capture binning set to %s", binning)
+        self.save_configuration()
 
     @property
     def inference_cameras(self) -> Tuple[VideoCaptureModel, ...]:
@@ -10959,10 +11014,7 @@ class AppModel(ObservableObject):
             "liveInferenceEnabled": self._inference.is_enabled,
             "pelletFirmwareCompatibility": self._hardware.firmware_compatibility,
             "cameras": {
-                camera.name: {
-                    "previewEnabled": camera.is_enabled,
-                    "recordEnabled": camera.is_recording_enabled,
-                }
+                camera.name: _camera_configured_metadata(camera)
                 for camera in self._cameras
             },
         }
