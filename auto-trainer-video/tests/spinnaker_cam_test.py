@@ -1,3 +1,4 @@
+import math
 import pytest
 
 # PySpin is the FLIR Spinnaker SDK: a vendor wheel that is not on PyPI and is not installed in every environment this suite runs in. Skipping is honest - the test genuinely cannot run - and matches the importorskip already used for other optional dependencies in this suite. It is not a statement that Spinnaker is optional on a rig, where it is required.
@@ -113,3 +114,37 @@ def test_capture_timeout_reports_first_error_incomplete_image_and_trigger_nodes(
     assert "TriggerActivation=AnyEdge" in message
     assert incomplete_image.released
     capture._camera = None
+
+
+class _CompleteImage:
+    def IsIncomplete(self):
+        return False
+
+    def GetFrameID(self):
+        return 41
+
+    def GetTimeStamp(self):
+        return 5_000_000_000
+
+
+class _OneFrameCamera:
+    def GetNextImage(self, _timeout):
+        return _CompleteImage()
+
+
+def test_capture_keeps_the_measured_poll_and_arrival_times(monkeypatch):
+    capture = SpinCam.__new__(SpinCam)
+    CameraBase.__init__(capture, "left")
+    capture._camera = _OneFrameCamera()
+    capture._is_primary = True
+    capture._current_cam_frame_2_perf_offset = math.nan
+    capture._current_cam_frame_2_time_offset = math.nan
+    capture._consecutive_late_acquire = 0
+    # p_timeout, the timeout check, p_before, p_after
+    perf_values = iter((100.0, 100.0, 100.010, 100.012))
+    monkeypatch.setattr(spinnaker_cam.time, "perf_counter", lambda: next(perf_values))
+
+    capture._capture()
+
+    assert capture.frame_poll_perf_c == 100.010
+    assert capture.frame_arrival_perf_c == 100.012
