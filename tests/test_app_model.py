@@ -1546,8 +1546,9 @@ def test_final_metadata_uses_canonical_boundary_not_stale_project_timestamp(
         "watchdog",
     }
     # Keep the authoritative document bounded while retaining the complete
-    # versioned tone, laser, and automatic-shift policy snapshot.
-    assert len(serialized_json) < 20_000
+    # versioned tone, laser, and automatic-shift policy snapshot, and the
+    # capture and inference shape recorded for every camera.
+    assert len(serialized_json) < 21_000
     assert saved["artifacts"]["alignment"]["$ref"] == "streams/alignment.json"
     assert saved["artifacts"]["trialSummary"]["$ref"] == "streams/trial_summary.json"
     # The live counters the operator watched are kept with the session, so the
