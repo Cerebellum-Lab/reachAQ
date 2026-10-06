@@ -2,6 +2,7 @@ import os
 import queue
 import shutil
 import threading
+import time
 from pathlib import Path
 
 import cv2
@@ -366,5 +367,55 @@ def test_the_encoder_runs_below_capture_and_pose_priority(tmp_path):
     try:
         assert os.getpriority(os.PRIO_PROCESS, writer._process.pid) == ffmpeg_writer.ENCODER_NICENESS
         writer.write(_gradient_frames(1)[0])
+    finally:
+        writer.release()
+
+
+def test_efficiency_cpus_reads_the_kernels_range_list(tmp_path, monkeypatch):
+    listing = tmp_path / "cpus"
+    monkeypatch.setattr(ffmpeg_writer, "EFFICIENCY_CPUS_FILE", str(listing))
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(24)), raising=False)
+    listing.write_text("16-23\n")
+    assert ffmpeg_writer.efficiency_cpus() == frozenset(range(16, 24))
+    listing.write_text("0,2-3\n")
+    assert ffmpeg_writer.efficiency_cpus() == frozenset({0, 2, 3})
+
+
+def test_only_efficiency_cpus_this_process_may_use_are_kept(tmp_path, monkeypatch):
+    listing = tmp_path / "cpus"
+    listing.write_text("16-23\n")
+    monkeypatch.setattr(ffmpeg_writer, "EFFICIENCY_CPUS_FILE", str(listing))
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(18)), raising=False)
+    assert ffmpeg_writer.efficiency_cpus() == frozenset({16, 17})
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(16)), raising=False)
+    assert ffmpeg_writer.efficiency_cpus() is None
+
+
+def test_a_processor_without_efficiency_cores_leaves_the_encoder_unconfined(tmp_path, monkeypatch):
+    listing = tmp_path / "cpus"
+    monkeypatch.setattr(ffmpeg_writer, "EFFICIENCY_CPUS_FILE", str(listing))
+    assert ffmpeg_writer.efficiency_cpus() is None  # no such file
+    listing.write_text("\n")
+    assert ffmpeg_writer.efficiency_cpus() is None
+    listing.write_text("not a cpu list\n")
+    assert ffmpeg_writer.efficiency_cpus() is None
+
+
+@needs_ffmpeg
+@pytest.mark.skipif(not hasattr(os, "sched_setaffinity"), reason="CPU affinity is Linux-only")
+def test_the_encoder_and_its_threads_stay_on_the_efficiency_cores(tmp_path, monkeypatch):
+    one_cpu = frozenset({max(os.sched_getaffinity(0))})
+    monkeypatch.setattr(ffmpeg_writer, "efficiency_cpus", lambda: one_cpu)
+    writer = ffmpeg_writer.FfmpegX264Writer(str(tmp_path / "ecore.mp4"), 30, (256, 256), False)
+    try:
+        for frame in _gradient_frames(30, rows=256, cols=256):
+            writer.write(frame)
+        tasks = Path(f"/proc/{writer._process.pid}/task")
+        deadline = time.monotonic() + 5
+        while len(list(tasks.iterdir())) < 2 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        threads = [int(task.name) for task in tasks.iterdir()]
+        assert len(threads) > 1  # x264's threads exist, so inheritance is what is checked
+        assert {tid: os.sched_getaffinity(tid) for tid in threads} == {tid: one_cpu for tid in threads}
     finally:
         writer.release()

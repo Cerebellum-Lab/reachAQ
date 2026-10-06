@@ -12,7 +12,8 @@ import os
 import shutil
 import subprocess
 import tempfile
-from typing import Optional, Tuple
+from pathlib import Path
+from typing import FrozenSet, Optional, Tuple
 
 import numpy
 
@@ -29,11 +30,19 @@ X264_OUTPUT_ARGS = (
 )
 
 # The encoder runs below capture and live pose: it has throughput to spare at
-# every preset, they have a deadline. This does not restore live pose at
-# 1024x1024: with x264 running, 60% of frames were posed live (86% at the
-# 256 base) with or without the lower priority, so that cost is contention
-# for memory and cache, not CPU scheduling (christielab10, 2026-10-06).
+# every preset, they have a deadline. Priority alone does not protect live
+# pose at 1024x1024, though: with x264 free to use every core, 59% of frames
+# were posed live, with or without it. See EFFICIENCY_CPUS_FILE.
 ENCODER_NICENESS = 10
+
+# Hybrid Intel processors (Alder Lake and later) list their efficiency cores
+# here. On christielab10 (i9-12900: CPUs 0-15 are the 8 performance cores'
+# hyperthreads, 16-23 the 8 efficiency cores) x264 running on the
+# performance cores cut live pose at 1024x1024 to 59% of frames (5.89 ms
+# inference); confined to the efficiency cores it kept up with both cameras
+# and pose recovered to 87%, the same as the 256 base with no H.264 at all
+# (85%) (2026-10-06).
+EFFICIENCY_CPUS_FILE = "/sys/devices/cpu_atom/cpus"
 
 # Long enough for ffmpeg to encode what is still in the pipe and write the
 # file index at the end of a recording.
@@ -56,6 +65,24 @@ def x264_available() -> bool:
     except (OSError, subprocess.SubprocessError):
         return False
     return " libx264 " in encoders
+
+
+def efficiency_cpus() -> Optional[FrozenSet[int]]:
+    """The efficiency cores this process may use, or None if the processor has none.
+
+    The kernel writes the list as ranges ("16-23", "0,2-3"); anything else
+    reads as no efficiency cores, so the encoder is simply not confined.
+    """
+    try:
+        text = Path(EFFICIENCY_CPUS_FILE).read_text().strip()
+        cpus = set()
+        for part in text.split(","):
+            first, _, last = part.partition("-")
+            cpus.update(range(int(first), int(last or first) + 1))
+        cpus &= os.sched_getaffinity(0)
+    except (OSError, ValueError, AttributeError):  # no such file, unparsable, or not Linux
+        return None
+    return frozenset(cpus) or None
 
 
 class FfmpegX264Writer:
@@ -93,6 +120,15 @@ class FfmpegX264Writer:
             os.setpriority(os.PRIO_PROCESS, process.pid, ENCODER_NICENESS)
         except (AttributeError, OSError):  # not POSIX, or not permitted: run at normal priority
             logger.warning("could not lower the ffmpeg encoder's priority for %s", path)
+        cpus = efficiency_cpus()
+        if cpus:
+            # Set before the first frame is written: ffmpeg opens the encoder,
+            # and so starts x264's threads, only once a frame arrives on stdin,
+            # and those threads inherit this mask.
+            try:
+                os.sched_setaffinity(process.pid, cpus)
+            except OSError:
+                logger.warning("could not confine the ffmpeg encoder to the efficiency cores for %s", path)
         return process
 
     def _stderr_tail(self) -> str:
