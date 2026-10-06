@@ -145,3 +145,7 @@ def test_the_menu_is_wired_to_idle_availability_and_configuration_loads():
         MainWindow._refresh_ui_availability)
     assert "_sync_capture_binning_actions()" in inspect.getsource(
         MainWindow._on_app_model_configuration_loaded)
+    # Leaving the edit mode saves a camera whose source may have changed, which
+    # drops its preset; the checkmark has to follow.
+    saving_branch = inspect.getsource(MainWindow._edit_camera_settings).split("else:")[0]
+    assert "_sync_capture_binning_actions()" in saving_branch
