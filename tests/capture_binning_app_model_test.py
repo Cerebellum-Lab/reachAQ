@@ -27,13 +27,13 @@ class _Camera:
         self.capture_binning = value
 
 
-def _app(*, acquiring=False):
+def _app(*, acquiring=False, starting=False, stopping=False):
     left, right = _Camera(), _Camera()
     saved = []
     app = SimpleNamespace(
         _session_lifecycle_command_lock=threading.Lock(),
         _require_session_ready_for_configuration=lambda _action: None,
-        acquisition_started=acquiring,
+        _acquisition=SimpleNamespace(started=acquiring, starting=starting, stopping=stopping),
         _left_camera=left,
         _right_camera=right,
         save_configuration=lambda: saved.append(True),
@@ -55,6 +55,15 @@ def test_the_preset_cannot_change_while_acquiring():
     with pytest.raises(RuntimeError, match="while acquisition is running"):
         AppModel.set_reach_capture_binning(app, 2)
     assert left.capture_binning is None and saved == []
+
+
+@pytest.mark.parametrize("phase", ("starting", "stopping"))
+def test_the_preset_cannot_change_while_acquisition_starts_or_stops(phase):
+    # capture_start prepares the cameras before it marks the acquisition started.
+    app, left, right, saved = _app(**{phase: True})
+    with pytest.raises(RuntimeError, match="while acquisition is running"):
+        AppModel.set_reach_capture_binning(app, 2)
+    assert (left.capture_binning, right.capture_binning) == (None, None) and saved == []
 
 
 def test_session_metadata_names_the_capture_and_inference_shapes():

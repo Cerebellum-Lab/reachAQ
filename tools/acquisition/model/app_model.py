@@ -2842,7 +2842,11 @@ class AppModel(ObservableObject):
         calibration keep the base frame size.
         """
         self._require_session_ready_for_configuration("Changing the camera resolution")
-        if self.acquisition_started:
+        # Not only once started: capture_start prepares the cameras on a worker thread
+        # before it marks the acquisition started, and a preset changed in that window
+        # reaches left but not right. Stopping is refused for the same reason.
+        acquisition = self._acquisition
+        if acquisition.started or acquisition.starting or acquisition.stopping:
             raise RuntimeError("Changing the camera resolution is unavailable while acquisition is running")
         apply_capture_binning(self._stereo_cameras(), binning)
         logger.info("Left/right capture binning set to %s", binning)
