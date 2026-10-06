@@ -285,6 +285,13 @@ class SpinCam(CameraBase):
         self._set_bounded_bool_property_node(cam.AcquisitionFrameRateEnable, True)
         self._set_bounded_float_property_node(cam.AcquisitionFrameRate, self._fps)
 
+        # offsets to zero before anything is resized: the maximum width and height are
+        # what the sensor has left after the current offset, so a camera left at a larger
+        # offset by an earlier configuration would clamp the new size (and the readback
+        # below would refuse the start). The real offsets are set after the size.
+        self._set_bounded_int_property_node(cam.OffsetX, 0)
+        self._set_bounded_int_property_node(cam.OffsetY, 0)
+
         # binning first
         self._set_bounded_int_property_node(cam.BinningHorizontal, self._horizontal_binning)
         self._set_bounded_int_property_node(cam.BinningVertical, self._vertical_binning)

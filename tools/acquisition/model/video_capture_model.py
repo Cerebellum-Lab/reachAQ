@@ -831,6 +831,11 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
                              self._name, expected, cur_status)
                 return False
             time.sleep(0.001)
+        if cur_status == CaptureProcessStatus.FAILED:
+            # The child puts the reason it failed in _errors. Callers that wait for
+            # (RUNNING, FAILED) read last_error next, and would otherwise show only
+            # their generic text instead of e.g. a refused camera setting.
+            self._last_error = self._errors.value.decode()
         return True
 
     def wait_for_first_frame(self, *, timeout: float) -> bool:

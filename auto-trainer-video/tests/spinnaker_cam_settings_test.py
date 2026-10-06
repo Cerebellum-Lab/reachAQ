@@ -26,7 +26,7 @@ class _Node:
         return PySpin.RW
 
     def GetMax(self):
-        return self._max
+        return self._max() if callable(self._max) else self._max
 
     def SetValue(self, value):
         self.sets.append(value)
@@ -57,6 +57,30 @@ class _Camera:
         self.Gamma = _Node("Gamma", 0.7, 4.0)
 
 
+class _CoupledCamera(_Camera):
+    """A camera whose limits follow its current geometry, as the Blackfly's do.
+
+    The sensor is 1440x1080. A width (height) can only reach what the binning
+    leaves after the current horizontal (vertical) offset, an offset only what
+    the size leaves, and the frame-rate ceiling is 456.1 fps in the live 256-row
+    bin 4 geometry and far lower in any larger one.
+    """
+
+    def __init__(self, *, binning, size, offsets):
+        super().__init__()
+        self.BinningHorizontal = _Node("Binning Horizontal", binning, 4)
+        self.BinningVertical = _Node("Binning Vertical", binning, 4)
+        self.Width = _Node("Width", size[0], lambda: 1440 // self.BinningHorizontal.value - self.OffsetX.value)
+        self.Height = _Node("Height", size[1], lambda: 1080 // self.BinningVertical.value - self.OffsetY.value)
+        self.OffsetX = _Node("Offset X", offsets[0], lambda: 1440 // self.BinningHorizontal.value - self.Width.value)
+        self.OffsetY = _Node("Offset Y", offsets[1], lambda: 1080 // self.BinningVertical.value - self.Height.value)
+        self.AcquisitionFrameRate = _Node("Acquisition Frame Rate", 30.0, self._fps_max)
+
+    def _fps_max(self):
+        live_geometry = self.BinningVertical.value == 4 and self.Height.value == 256
+        return 456.1 if live_geometry else 100.0
+
+
 def _spincam(**overrides):
     cam = SpinCam.__new__(SpinCam)
     CameraBase.__init__(cam, "left")
@@ -74,9 +98,12 @@ def _spincam(**overrides):
 
 
 def test_the_live_settings_pass_and_fps_is_set_again_after_the_geometry():
-    camera = _Camera()
+    # Starting in a large geometry the camera's frame-rate ceiling is 100 fps, so
+    # the first set is clamped to 100. Only a set after the geometry reaches 150.
+    camera = _CoupledCamera(binning=1, size=(1024, 1024), offsets=(0, 0))
     _spincam()._apply_settings(camera)
-    assert camera.AcquisitionFrameRate.sets == [150, 150]
+    assert camera.AcquisitionFrameRate.sets == [100.0, 150]
+    assert camera.AcquisitionFrameRate.value == 150
     assert (camera.Width.value, camera.OffsetX.value, camera.Gain.value) == (256, 52, 1)
 
 
@@ -85,6 +112,29 @@ def test_a_clamped_width_is_refused_and_named():
     spin = _spincam(_width=512, _height=512, _horizontal_binning=2, _vertical_binning=2)
     with pytest.raises(RuntimeError, match=r"Width requested 512 applied 308 \(max 308\)"):
         spin._apply_settings(camera)
+
+
+@pytest.mark.parametrize(
+    "start,wanted",
+    (
+        # back from the 1024 preset (offset 208) to the live 256 frame
+        (dict(binning=1, size=(1024, 1024), offsets=(208, 24)),
+         dict(_horizontal_binning=4, _vertical_binning=4, _width=256, _height=256,
+              _offset_x=52, _offset_y=6, _fps=150)),
+        # the 3D calibration's full frame, after a live run left the offsets at 52 and 6
+        (dict(binning=4, size=(256, 256), offsets=(52, 6)),
+         dict(_horizontal_binning=1, _vertical_binning=1, _width=1440, _height=1080,
+              _offset_x=0, _offset_y=0, _fps=60)),
+    ),
+    ids=("preset_back_to_live", "full_frame_after_live"),
+)
+def test_a_size_that_only_fits_without_the_leftover_offset_is_applied(start, wanted):
+    camera = _CoupledCamera(**start)
+
+    _spincam(**wanted)._apply_settings(camera)
+
+    assert (camera.Width.value, camera.Height.value, camera.OffsetX.value, camera.OffsetY.value) == (
+        wanted["_width"], wanted["_height"], wanted["_offset_x"], wanted["_offset_y"])
 
 
 def test_a_clamped_gain_is_refused():
