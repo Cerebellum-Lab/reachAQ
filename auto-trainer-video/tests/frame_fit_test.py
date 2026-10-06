@@ -39,6 +39,21 @@ def test_a_queue_without_a_shape_gets_the_frame_itself():
     assert fit(frame) is frame
 
 
+def test_a_non_square_frame_keeps_rows_and_columns_apart():
+    # Non-square downscaling test: catches coordinate-order bugs in cv2.resize call.
+    # Using (512, 768) → (256, 384) ensures rows and cols are treated separately.
+    rng = numpy.random.default_rng(2)
+    frame = rng.integers(0, 256, (512, 768), dtype=numpy.uint8)
+
+    fit = QueueFit(frame.shape, (256, 384))
+    fitted = fit(frame)
+
+    assert fit.factor == 2
+    assert fitted.shape == (256, 384) and fitted.dtype == numpy.uint8
+    # Same tolerance as square case: OpenCV's fixed-point area average.
+    assert numpy.abs(fitted.astype(int) - _rounded_box_mean(frame, 2).astype(int)).max() <= 1
+
+
 @pytest.mark.parametrize("frame_shape,target", [
     ((500, 500), (256, 256)),    # not a whole multiple
     ((512, 1024), (256, 256)),   # different factor per direction
