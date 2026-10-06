@@ -144,7 +144,11 @@ def test_capture_keeps_the_measured_poll_and_arrival_times(monkeypatch):
     perf_values = iter((100.0, 100.0, 100.010, 100.012))
     monkeypatch.setattr(spinnaker_cam.time, "perf_counter", lambda: next(perf_values))
 
-    capture._capture()
+    try:
+        capture._capture()
 
-    assert capture.frame_poll_perf_c == 100.010
-    assert capture.frame_arrival_perf_c == 100.012
+        assert capture.frame_poll_perf_c == 100.010
+        assert capture.frame_arrival_perf_c == 100.012
+    finally:
+        # SpinCam.__del__ would call EndAcquisition() on this one-method fake.
+        capture._camera = None
