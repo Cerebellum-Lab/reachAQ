@@ -113,9 +113,10 @@ class LatencyStreamWriter:
     def append(self, dataset: str, row) -> None:
         """Copy one row into its batch. Never waits on I/O and never raises.
 
-        Invalid dataset names, bad row data (wrong arity, type error, overflow, NaN),
-        and a full queue all result in silent rejection, a count in
-        stats["rowsRejected"], and a single ERROR log per writer.
+        Invalid dataset names and bad row data (wrong arity, type error, overflow, NaN)
+        result in silent rejection, a count in stats["rowsRejected"], and a single ERROR
+        log per writer. A full queue silently drops the batch and counts it in
+        stats["rowsDropped"], with no log.
         """
         with self._lock:
             if self._closed:
@@ -222,7 +223,12 @@ class LatencyStreamWriter:
                     self._write(datasets, CLOCK_PAIRS, self._clock_pair())
                     next_pair = now + self._clock_pair_period
                 try:
-                    item = self._queue.get(timeout=max(0.0, next_pair - time.perf_counter()))
+                    # Once stop is signaled, use a short timeout like the drain path does,
+                    # so we notice the stop event promptly even if the queue fills.
+                    now = time.perf_counter()
+                    time_to_pair = max(0.0, next_pair - now)
+                    timeout = min(time_to_pair, 0.05) if self._stop_event.is_set() else time_to_pair
+                    item = self._queue.get(timeout=timeout)
                 except queue.Empty:
                     # No data and no stop signal: keep polling for clock pairs.
                     if self._stop_event.is_set() and self._queue.empty():
