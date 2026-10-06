@@ -159,3 +159,42 @@ def test_rearming_persists_pending_clip_as_incomplete():
     assert capture._stim_pending_clip is None
     assert len(capture._stim_evidence_writer.clips) == 1
     assert capture._stim_evidence_writer.clips[0][2] is False
+
+
+def test_capture_hot_path_stamps_evidence_clip_and_send():
+    configuration = _configuration()
+    detector = StimCameraDetector(configuration)
+    detector.arm(_arm())
+
+    class Writer:
+        def __init__(self):
+            self.rows = []
+
+        def append(self, **row):
+            self.rows.append(row)
+
+        def queue_clip(self, decision, frames):
+            return True
+
+    class Messages:
+        def __init__(self):
+            self.items = []
+
+        def put_nowait(self, item):
+            self.items.append(item)
+
+    capture = object.__new__(VideoCapture)
+    capture._stim_detector = detector
+    capture._stim_evidence_writer = Writer()
+    capture._stim_session_active = True
+    capture._camera_idx = 2
+    capture._stim_clip_prebuffer = __import__("collections").deque(maxlen=2)
+    capture._stim_pending_clip = None
+    capture._attrs = type("Attrs", (), {"msg_queue": Messages(), "stim_trigger_queue": None})()
+
+    capture._process_stim_frame(numpy.ones((10, 10)) * 4, 1, 10, 1.0)
+    capture._process_stim_frame(numpy.ones((10, 10)) * 6, 2, 20, 1.1)
+
+    record = capture._attrs.msg_queue.items[0][1][1]
+    assert (record["decision_perf_time"] <= record["evidence_done_perf_time"]
+            <= record["clip_done_perf_time"] <= record["msg_send_perf_time"])

@@ -1299,8 +1299,13 @@ class VideoCapture(Process):
             arm=arm,
             decision=decision,
         )
+        # Both run on this thread before the trigger leaves it, so the latency
+        # record times them as stages of the stim loop.
+        evidence_done = time.perf_counter()
+        clip_done = math.nan
         if decision is not None:
             self._begin_stim_clip(decision)
+            clip_done = time.perf_counter()
             if (
                 decision.arm.trigger_route == "direct_ni_software"
                 and self._attrs.stim_trigger_queue is not None
@@ -1309,6 +1314,8 @@ class VideoCapture(Process):
                     self._attrs.stim_trigger_queue.put_nowait({
                         **decision.to_record(),
                         "camera_index": self._camera_idx,
+                        "evidence_done_perf_time": evidence_done,
+                        "clip_done_perf_time": clip_done,
                         "ipc_send_perf_time": time.perf_counter(),
                     })
                 except queue.Full:
@@ -1317,7 +1324,12 @@ class VideoCapture(Process):
             try:
                 self._attrs.msg_queue.put_nowait((
                     SystemStatusMessageKind.STIM_CAMERA_TRIGGER,
-                    (self._camera_idx, decision.to_record()),
+                    (self._camera_idx, {
+                        **decision.to_record(),
+                        "evidence_done_perf_time": evidence_done,
+                        "clip_done_perf_time": clip_done,
+                        "msg_send_perf_time": time.perf_counter(),
+                    }),
                 ))
             except queue.Full:
                 logger.critical("Stim-camera trigger message queue is full")
