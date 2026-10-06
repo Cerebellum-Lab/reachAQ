@@ -18,6 +18,12 @@ from .camera_base import CameraBase
 
 logger = get_verbose_logger(__name__)
 
+# The __debug__ self-check in SpinCam.capture compares each of the first 150
+# frames against every earlier one. Above 256x256 that costs seconds of
+# capture-thread time at startup (about 24 GB of comparisons at 1024x1024),
+# so it is skipped there.
+_BUFFER_SELF_CHECK_MAX_PIXELS = 256 * 256
+
 def is_truthy_str_value(value: str):
     return value.lower() in {"true", "yes", "on", "1"}
 
@@ -291,6 +297,11 @@ class SpinCam(CameraBase):
         self._set_bounded_int_property_node(cam.OffsetX, self._offset_x)
         self._set_bounded_int_property_node(cam.OffsetY, self._offset_y)
 
+        # FPS again, now that the geometry is final: the maximum frame rate
+        # depends on binning and height, and the first set above was clamped
+        # against whatever geometry the camera was left in.
+        self._set_bounded_float_property_node(cam.AcquisitionFrameRate, self._fps)
+
         if self._gain is not None:
             self._set_bounded_float_property_node(cam.Gain, self._gain)
 
@@ -300,6 +311,53 @@ class SpinCam(CameraBase):
             self._set_bounded_float_property_node(cam.Gamma, gamma)
         else:
             self._set_bounded_bool_property_node(cam.GammaEnable, False)
+
+        self._verify_applied_settings(cam)
+
+    # A requested frame rate within this fraction of the camera's maximum
+    # passes: the camera reports 149.987 for a requested 150.
+    _FPS_TOLERANCE = 0.005
+
+    def _verify_applied_settings(self, cam) -> None:
+        """Refuse settings the camera silently clamped.
+
+        _set_bounded_property clamps every value to the node's maximum and logs
+        that only at debug level. A clamped width or offset shrinks or moves
+        the field of view, a clamped gain changes brightness, and a frame rate
+        the camera cannot reach leaves everything downstream assuming a rate it
+        is not getting. Exposure is not checked: the camera rounds it to its
+        own step (175 requested reads back 176), which is expected.
+        """
+        problems = []
+        for node, requested in (
+            (cam.BinningHorizontal, self._horizontal_binning),
+            (cam.BinningVertical, self._vertical_binning),
+            (cam.Width, self._width),
+            (cam.Height, self._height),
+            (cam.OffsetX, self._offset_x),
+            (cam.OffsetY, self._offset_y),
+        ):
+            if requested is None:
+                continue
+            applied = node.GetValue()
+            if int(applied) != int(requested):
+                problems.append(
+                    f"{node.GetDisplayName()} requested {requested} applied {applied} (max {node.GetMax()})")
+        if self._gain is not None:
+            applied = float(cam.Gain.GetValue())
+            if abs(applied - float(self._gain)) > 0.1:
+                problems.append(
+                    f"Gain requested {float(self._gain):.2f} dB applied {applied:.2f} dB "
+                    f"(max {float(cam.Gain.GetMax()):.2f})")
+        if self._fps is not None:
+            fps_max = float(cam.AcquisitionFrameRate.GetMax())
+            if fps_max < float(self._fps) * (1 - self._FPS_TOLERANCE):
+                problems.append(
+                    f"frame rate requested {float(self._fps):.1f} fps but at {self._width}x{self._height} "
+                    f"bin {self._horizontal_binning}x{self._vertical_binning} and exposure "
+                    f"{self._exposure} us the camera's maximum is {fps_max:.1f} fps")
+        if problems:
+            raise RuntimeError(f"<{self._name}> camera did not accept its settings: " + "; ".join(problems))
 
     def prepare_capture(self):
         super().prepare_capture()
@@ -549,7 +607,11 @@ class SpinCam(CameraBase):
 
         if __debug__:
             # ensure no frame in the first 150, shares its internal buffer with any of the other first 150 of them:
-            if self._frame_count < 150:
+            if self._frame_count < 150 and orig_frame.size > _BUFFER_SELF_CHECK_MAX_PIXELS:
+                if self._frame_count == 0:
+                    logger.info("skipping the shared-buffer self-check for %sx%s frames",
+                                orig_frame.shape[1], orig_frame.shape[0])
+            elif self._frame_count < 150:
                 logger.spam("frame-%s: shape=%s dtype=%s",
                              self._frame_count, orig_frame.shape, orig_frame.dtype)
                 self._start_frames.append((orig_frame, orig_frame.copy()))
