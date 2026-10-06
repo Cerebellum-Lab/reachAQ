@@ -1313,10 +1313,18 @@ class MainWindow(QMainWindow):
 
     def _sync_capture_binning_actions(self) -> None:
         app_model = self._app_model
-        current = app_model.reach_capture_binning
-        left = app_model.left_camera
-        rows, cols = left.shape if left is not None else (0, 0)
-        base = None if left is None else left.base_binning
+        try:
+            current = app_model.reach_capture_binning
+            left = app_model.left_camera
+            rows, cols = left.shape if left is not None else (0, 0)
+            base = None if left is None else left.base_binning
+        except ValueError as exc:
+            # A malformed capture_binning, hbin or vbin in the configuration.
+            # The model still refuses Run for it, but this runs in the
+            # configuration-load and availability handlers, so raising would
+            # skip every enablement after it. Show the entries as unavailable.
+            logger.warning("Camera resolution menu shows every entry unavailable: %s", exc)
+            current, rows, cols, base = None, 0, 0, None
         for binning, action in self.capture_binning_actions.items():
             k = base // binning if base and base % binning == 0 else None
             if k is None:
@@ -1330,8 +1338,15 @@ class MainWindow(QMainWindow):
             action.blockSignals(False)
 
     def _set_capture_binning_actions_enabled(self, enabled: bool) -> None:
-        for binning, action in self.capture_binning_actions.items():
-            action.setEnabled(enabled and self._app_model.reach_capture_binning_available(binning))
+        try:
+            for binning, action in self.capture_binning_actions.items():
+                action.setEnabled(enabled and self._app_model.reach_capture_binning_available(binning))
+        except ValueError as exc:
+            # See _sync_capture_binning_actions: leave the entries disabled
+            # rather than skip the enablement that follows this call.
+            logger.warning("Camera resolution menu left disabled: %s", exc)
+            for action in self.capture_binning_actions.values():
+                action.setEnabled(False)
 
     def _set_capture_binning_from_menu(self, binning: int, _checked: bool = False) -> None:
         logger.info("Camera resolution menu selection: capture binning %s", binning)
