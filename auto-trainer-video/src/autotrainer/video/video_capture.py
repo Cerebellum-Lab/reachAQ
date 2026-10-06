@@ -34,6 +34,7 @@ from autotrainer.core.capture import CaptureProcessStatus
 from .camera.camera_base import CameraBase
 
 from .video_manager import VideoManager
+from .frame_fit import QueueFit
 from .video_record import VideoRecord, VideoRecordProperties, VideoRecordMode
 from .stim_camera import StimCameraDetectionConfiguration, StimCameraDetector, StimEvidenceWriter
 from .realtime_priority import apply_realtime_priority
@@ -470,6 +471,23 @@ class VideoCapture(Process):
             # although is same than self._camera_idx
         image_queue_delay = self._image_queue_frame_delay
         empty_frame = numpy.zeros((camera.height, camera.width), dtype=numpy.uint8)
+        # The inference and display queues may be smaller than the camera frame
+        # by a whole factor: a capture at less binning than the consumers were
+        # sized for. They get each frame area-averaged to fit; recording keeps
+        # the full frame. Checked here so a mismatch fails the start once
+        # rather than every frame.
+        frame_shape = (camera.height, camera.width)
+        net_fit = None if net_q is None else QueueFit(frame_shape, net_q.shape)
+        img_fit = None if img_q is None else QueueFit(frame_shape, getattr(img_q, "shape", None))
+        # Padding and end-of-recording markers go to the inference queue, so
+        # they have its size, not the camera's.
+        net_empty_frame = empty_frame if net_fit is None else numpy.zeros(net_fit.shape, dtype=numpy.uint8)
+        if any(fit is not None and fit.factor > 1 for fit in (net_fit, img_fit)):
+            logger.info(
+                "<%s> %sx%s camera frames are area-averaged for consumers: inference=%s display=%s",
+                self._name, camera.width, camera.height,
+                None if net_fit is None else net_fit.shape,
+                None if img_fit is None else img_fit.shape)
         p_prev_watchdog = -math.inf
         if attrs.watchdog_perf_c is not None:
             def set_watchdog(value):
@@ -579,7 +597,7 @@ class VideoCapture(Process):
             if net_q is not None:
                 # we might eventually have written some extra frame(s) vs the other camera(s) used in
                 # the net_q, so this pad_to_batch_size :
-                net_q.pad_to_batch_size(net_q_idx, empty_frame, cnt_net_q_put, timeout=5)
+                net_q.pad_to_batch_size(net_q_idx, net_empty_frame, cnt_net_q_put, timeout=5)
                 # required: must set back to 0 given will now be same in all cams,
                 # and also aligned with frames_per_camera_per_batch
                 cnt_net_q_put = 0
@@ -588,7 +606,7 @@ class VideoCapture(Process):
                     "sending EOF_RECORDING batch frame indices to signify eof recording. "
                     "last frame_id: %s when=%.4f perf=%.4f",
                     cam_frame_id, when_secs, frame_perf_c)
-                net_q.put_frame_index_category(empty_frame, FrameIndexCategory.EOF_RECORDING,
+                net_q.put_frame_index_category(net_empty_frame, FrameIndexCategory.EOF_RECORDING,
                                                cam_idx=net_q_idx, timeout=5)
 
             self._set_status(CaptureProcessStatus.RUNNING)
@@ -885,6 +903,7 @@ class VideoCapture(Process):
                     else cam_frame_id - record_start_stop_frame_idx
                 )
 
+                net_frame = None
                 if net_q_put is not None:
                     # network queue goes to processing/inference
                     # frame_perf_c travels with the frame so the pose process
@@ -892,7 +911,8 @@ class VideoCapture(Process):
                     # call took. It is the host time the exposure maps to, from
                     # the camera's hardware timestamp - not when Python noticed
                     # the frame.
-                    if net_q_put(frame, net_q_idx, frame_idx_cat, block=False,
+                    net_frame = net_fit(frame)
+                    if net_q_put(net_frame, net_q_idx, frame_idx_cat, block=False,
                                  frame_perf_c=frame_perf_c) == BufferResult.Ok:
                         cnt_net_q_put += 1
 
@@ -913,10 +933,12 @@ class VideoCapture(Process):
                     if perf_now >= next_t_image_q:
                         if image_queue_delay is not None:
                             next_t_image_q = perf_now + image_queue_delay
-                        if len(numpy.shape(frame)) < 3:
-                            img_q.put(frame, frame_idx_cat)
+                        if len(numpy.shape(frame)) >= 3:
+                            img_q.put(img_fit(frame[:, :, 0]), frame_idx_cat)
+                        elif net_frame is not None and img_fit.shape == net_fit.shape:
+                            img_q.put(net_frame, frame_idx_cat)  # already averaged this frame
                         else:
-                            img_q.put(frame[:, :, 0], frame_idx_cat)
+                            img_q.put(img_fit(frame), frame_idx_cat)
 
 
                 # if not (is_record_active and record_start_stop_frame_idx is not None) and attrs.record_prebuffer_duration > 0:
