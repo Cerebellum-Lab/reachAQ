@@ -26,6 +26,7 @@ import dataclasses
 import enum
 import math
 import os
+import time
 import typing
 
 from autotrainer.core.logging import get_verbose_logger
@@ -163,17 +164,20 @@ class LiveTrackingReachProvider:
 
     DEFAULT_HANDS = ("R_Hand", "L_Hand")
 
-    def __init__(self, live_tracking, *, hands=DEFAULT_HANDS):
+    def __init__(self, live_tracking, *, hands=DEFAULT_HANDS, on_observe=None):
         self._live_tracking = live_tracking
         self._hands = tuple(hands)
+        self._on_observe = on_observe
 
     def __call__(self):
+        asked_at = time.perf_counter()
         try:
             sample = self._live_tracking.latest()
         except Exception as err:
             logger.warning("live tracking buffer failed: %s", err)
             return None
         if sample is None:
+            self._observed(asked_at, None, None)
             return None
         try:
             reaching = any(
@@ -183,8 +187,20 @@ class LiveTrackingReachProvider:
             observed_at = float(sample.source_perf)
         except Exception as err:
             logger.warning("live tracking sample is unusable: %s", err)
+            self._observed(asked_at, sample, None)
             return None
+        self._observed(asked_at, sample, reaching)
         return reaching, observed_at
+
+    def _observed(self, asked_at, sample, reaching):
+        # The latency record: which pose the gate read, and when. A failing
+        # recorder must never change the gate's answer.
+        if self._on_observe is None:
+            return
+        try:
+            self._on_observe(asked_at, sample, reaching)
+        except Exception:
+            logger.exception("reach observation could not be recorded")
 
 
 class ReachStateResolver:

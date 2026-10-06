@@ -21,6 +21,7 @@ import numpy as np
 
 from autotrainer.core import ProjectInfo
 from tools.acquisition.model.session_boundary import SessionBoundary
+from tools.acquisition.model.latency_event_log import LatencyEventLog
 from tools.acquisition.model.atomic_session_io import (
     atomic_publish_file,
     atomic_write_json,
@@ -258,6 +259,9 @@ class SessionDataRecorder:
         self._pending_stop_end_perf: Optional[float] = None
         self._nidaq_tone_edge_callback = nidaq_tone_edge_callback
         self._live_tone_states = {}
+        # GUI-process latency rows for the recording; the finalizer joins them
+        # with the per-process streams.
+        self._latency_events = LatencyEventLog()
 
         self._system_message_handler = system_message_handler
         self._hardware_model = hardware_model
@@ -271,6 +275,10 @@ class SessionDataRecorder:
         laser_model.property_changed += self._on_laser_property_changed
         self._log_handler = _SessionLogHandler(self)
         logging.getLogger().addHandler(self._log_handler)
+
+    @property
+    def latency_events(self) -> LatencyEventLog:
+        return self._latency_events
 
     def arm(
         self,
@@ -292,6 +300,7 @@ class SessionDataRecorder:
                     "previous session finalization is still pending; retry or abort it"
                 )
             self._armed = True
+            self._latency_events.begin()
             # BehaviorAlgorithm assigns the next session index immediately
             # after arming and before enabling the shared camera trigger.
             # Keep this object reference so the recorder follows that atomic
@@ -361,6 +370,7 @@ class SessionDataRecorder:
         with self._lock:
             if not self._armed or self._project is None or self._start_perf is None:
                 self._pending_stop_end_perf = None
+                self._latency_events.end()
                 self._clear_locked()
                 return None
             project = self._project
@@ -416,6 +426,7 @@ class SessionDataRecorder:
                 "trial_records": trial_records,
                 "trial_summary": trial_summary,
                 "metadata_generation_id": self._metadata_generation_id,
+                "latency_events": self._latency_events.end(),
             }
             self._armed = False
             self._pending_stop_end_perf = None
@@ -505,6 +516,7 @@ class SessionDataRecorder:
                     spool_path = pending_source.path
             self._pending_finalization = None
             self._pending_stop_end_perf = None
+            self._latency_events.end()
             self._clear_locked()
         if spool_path is not None:
             spool_path.unlink(missing_ok=True)
@@ -1534,6 +1546,7 @@ class SessionDataRecorder:
         trial_records=(),
         trial_summary=None,
         metadata_generation_id=None,
+        latency_events=None,
     ):
         session_dir = Path(project.get_session_path().location)
         streams_dir = session_dir / "streams"
@@ -1964,6 +1977,15 @@ class SessionDataRecorder:
             generation_id=metadata_generation_id,
             validate=SessionDataRecorder._validate_h5,
         )
+        latency_dir = streams_dir / "latency"
+        if latency_events is not None:
+            # Diagnostic data: a failure here is logged and the session
+            # publishes without these rows.
+            try:
+                LatencyEventLog.write(latency_dir / "events.h5", latency_events)
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "Latency events were not written; the session publishes without them")
         source_results = {} if source_results is None else dict(source_results)
         nidaq_health = SessionDataRecorder._nidaq_stream_health(
             nidaq_chunks,
