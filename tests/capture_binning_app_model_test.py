@@ -27,6 +27,10 @@ class _Camera:
     def set_capture_binning(self, value):
         self.capture_binning = value
 
+    @property
+    def video_encoder(self):
+        return "x264" if self.capture_shape != self.shape else "mp4v"
+
 
 def _app(*, acquiring=False, starting=False, stopping=False):
     left, right = _Camera(), _Camera()
@@ -130,6 +134,7 @@ def test_session_metadata_names_the_capture_and_inference_shapes():
         "captureShape": [512, 512],
         "inferenceShape": [256, 256],
         "captureBinning": 2,
+        "videoEncoder": "x264",
     }
 
 
