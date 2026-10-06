@@ -11,7 +11,6 @@ import threading
 import time
 from dataclasses import dataclass
 from enum import IntEnum
-from functools import partial
 from multiprocessing import Process
 from multiprocessing.synchronize import Semaphore as SemaphoreType
 from multiprocessing.sharedctypes import Synchronized, SynchronizedArray, SynchronizedString
@@ -35,6 +34,7 @@ from .camera.camera_base import CameraBase
 
 from .video_manager import VideoManager
 from .frame_fit import QueueFit
+from .record_backlog import RecordBacklog
 from .video_record import VideoRecord, VideoRecordProperties, VideoRecordMode
 from .stim_camera import StimCameraDetectionConfiguration, StimCameraDetector, StimEvidenceWriter
 from .realtime_priority import apply_realtime_priority
@@ -455,7 +455,13 @@ class VideoCapture(Process):
         record_q = self._record_queue  # record queue to file
         if record_q is None:
             raise RuntimeError("supposed be created")
-        rec_q_put = partial(record_q.put, timeout=3)
+        record_backlog = RecordBacklog(record_q.maxsize, self._record_batch_size, camera.width * camera.height)
+
+        def rec_q_put(batch):
+            record_q.put(batch, timeout=3)
+            warning = record_backlog.observe(record_q.qsize())
+            if warning is not None:
+                logger.warning("<%s> %s", self._name, warning)
         # using a ~small timeout on record_q put, to prevent deadlock if queue is full, given it has a maxsize.
         # but the size is quite large + we write batch of frames, and command handler is supposed to detect possible
         # exit of the record thread, and then trigger a full exit of the capture process.
@@ -591,6 +597,8 @@ class VideoCapture(Process):
                 final_frame_id = cam_frame_id
                 final_frame_perf = frame_perf_c
             rec_q_put([])  # empty list is mark for EOR for recorder thread
+            logger.info("<%s> recorder backlog peak for this recording: %s/%s batches",
+                        self._name, record_backlog.take_peak(), record_q.maxsize)
 
             synced_frame_idx = None  # don't forget now.
 
