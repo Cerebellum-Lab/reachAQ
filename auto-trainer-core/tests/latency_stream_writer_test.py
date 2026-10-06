@@ -144,7 +144,6 @@ def test_close_returns_quickly_even_if_the_final_write_fails(tmp_path, monkeypat
     writer = LatencyStreamWriter(tmp_path / "x.h5", {"frames": CAMERA_FRAME_DTYPE},
                                  batch_rows=2, clock_pair_period=10.0)
     original_write = writer._write
-    call_count = [0]
 
     def write_that_fails_on_closing_clock_pair(datasets, name, batch):
         if name == CLOCK_PAIRS and writer._stop_event.is_set():
@@ -153,6 +152,13 @@ def test_close_returns_quickly_even_if_the_final_write_fails(tmp_path, monkeypat
 
     monkeypatch.setattr(writer, "_write", write_that_fails_on_closing_clock_pair)
     writer.append("frames", _row(0))
+    # Wait for the opening clock pair to be written, so the failure is the closing one.
+    started_wait = time.perf_counter()
+    while time.perf_counter() - started_wait < 2.0:
+        if writer.stats["rowsWritten"][CLOCK_PAIRS] >= 1:
+            break
+        time.sleep(0.01)
+
     started = time.perf_counter()
     stats = writer.close(timeout=2.0)
     elapsed = time.perf_counter() - started
@@ -160,7 +166,7 @@ def test_close_returns_quickly_even_if_the_final_write_fails(tmp_path, monkeypat
     # Should return quickly, not wait the full timeout.
     assert elapsed < 1.0, f"close took {elapsed} s, expected < 1 s"
     assert stats["failed"] is True
-    assert "RuntimeError" in stats["firstError"]
+    assert "simulated closing clock-pair write failure" in stats["firstError"]
     # The file should have been closed by the finally block.
     with h5py.File(tmp_path / "x.h5", "r") as store:
         assert store.attrs["schema_version"] == LATENCY_SCHEMA_VERSION
@@ -200,48 +206,61 @@ def test_close_with_blocked_writer_and_full_queue_respects_deadline(tmp_path, mo
     assert elapsed < 1.0, f"close took {elapsed} s with 0.5 s timeout; expected < 1 s (one deadline)"
     # Some rows should have been dropped due to queue overflow.
     assert stats["rowsDropped"]["frames"] > 0
-    # After close returns, release the gate and give the thread time to exit.
+    # After close returns, release the gate and verify the thread exits promptly.
     gate.set()
-    time.sleep(0.5)
-    # The thread should have exited (or exited after gate opens).
-    assert not writer._thread.is_alive(), "writer thread should exit shortly after gate opens"
+    writer._thread.join(timeout=5.0)
+    # The thread should have exited.
+    assert not writer._thread.is_alive(), "writer thread should exit after gate opens"
 
 
 def test_queue_full_at_close_with_closing_write_failure(tmp_path, monkeypatch):
-    """Queue full at close and closing write fails: close() returns quickly, file is closed."""
+    """Queue full at close + closing write fails: thread exits, file closed, no spurious TimeoutError."""
     gate = threading.Event()
     writer = LatencyStreamWriter(tmp_path / "full_queue_fail.h5", {"frames": CAMERA_FRAME_DTYPE},
-                                 batch_rows=1, queue_batches=1, clock_pair_period=10.0)
+                                 batch_rows=1, queue_batches=1, clock_pair_period=0.05)
     original_write = writer._write
 
-    def slow_write_until_close(datasets, name, batch):
+    def slow_write_frames(datasets, name, batch):
         if name == "frames":
             gate.wait(10)
         original_write(datasets, name, batch)
 
-    def write_fails_on_closing_clock_pair(datasets, name, batch):
-        slow_write_until_close(datasets, name, batch)
-        # Fail only the closing clock-pair write when stop event is set.
+    def write_fails_on_closing(datasets, name, batch):
+        slow_write_frames(datasets, name, batch)
+        # Fail only the closing clock-pair write.
         if name == CLOCK_PAIRS and writer._stop_event.is_set():
-            raise RuntimeError("closing write failure")
+            raise RuntimeError("closing write failure with full queue")
 
-    monkeypatch.setattr(writer, "_write", write_fails_on_closing_clock_pair)
-    # Fill the batch and queue it; writer blocks on gate.
+    monkeypatch.setattr(writer, "_write", write_fails_on_closing)
+    # Wait for the opening clock pair to be written.
+    started_wait = time.perf_counter()
+    while time.perf_counter() - started_wait < 2.0:
+        if writer.stats["rowsWritten"][CLOCK_PAIRS] >= 1:
+            break
+        time.sleep(0.01)
+    # Fill the queue: writer is blocked on batch 0, append batch 1 to fill the single slot.
     writer.append("frames", _row(0))
     time.sleep(0.05)
-    # Append another row: second batch, queue is full, row is dropped.
     writer.append("frames", _row(1))
     time.sleep(0.05)
+    # Release gate after 0.2s so close() can proceed but the closing write will fail.
+    release_timer = threading.Timer(0.2, gate.set)
+    release_timer.start()
 
     started = time.perf_counter()
-    stats = writer.close(timeout=1.0)
+    stats = writer.close(timeout=3.0)
     elapsed = time.perf_counter() - started
+    release_timer.cancel()
 
-    # Even with queue full and closing write failure, close returns within deadline.
-    assert elapsed < 1.5, f"close took {elapsed} s; expected < 1.5 s (deadline + slack)"
+    # close() should return well under 3s despite queue full and closing write failure.
+    assert elapsed < 1.5, f"close took {elapsed} s; expected < 1.5 s"
     assert stats["failed"] is True
+    # The failure should be from the closing write, not from thread timeout.
+    assert "closing write failure with full queue" in stats["firstError"]
+    assert "did not stop" not in stats["firstError"]
     # The file should have been closed by the finally block.
     with h5py.File(tmp_path / "full_queue_fail.h5", "r") as store:
         assert store.attrs["schema_version"] == LATENCY_SCHEMA_VERSION
-    # Release the gate so the thread can finish.
-    gate.set()
+    # Verify thread exited after close().
+    writer._thread.join(2.0)
+    assert not writer._thread.is_alive()
