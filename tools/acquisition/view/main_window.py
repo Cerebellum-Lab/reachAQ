@@ -74,12 +74,6 @@ _TOOLBAR_ICON_COLOR = "#20242a"
 _TOOLBAR_ICON_WARNING_COLOR = "#b00020"
 _TRANSITIONAL_APP_MODE = "__transition__"
 _MINIMUM_RESIZABLE_WINDOW_SIZE = QSize(320, 240)
-# Two 150 fps mp4v encoders manage 151 fps each at 1024x1024 on christielab10
-# (2026-10-05) with nothing else running, so captures this large are flagged
-# in the Camera resolution menu.
-_CAPTURE_ENCODER_LIMIT_PIXELS = 1024 * 1024
-
-
 def _toolbar_icon(name: str, *, color: str = _TOOLBAR_ICON_COLOR) -> QIcon:
     return QIcon(qta.icon(name, color=color))
 
@@ -1333,7 +1327,9 @@ class MainWindow(QMainWindow):
             if k is None:
                 text = f"bin {binning} (unavailable)"
             else:
-                note = ", encoder at limit" if rows * k * cols * k >= _CAPTURE_ENCODER_LIMIT_PIXELS else ""
+                # The larger presets record H.264 (the base keeps mp4v): say so
+                # where the operator chooses, since the files change format.
+                note = ", H.264" if k > 1 else ""
                 text = f"{cols * k} x {rows * k} (bin {binning}{note})"
             action.blockSignals(True)
             action.setText(text)
