@@ -45,6 +45,17 @@ def test_the_offset_alias_is_the_base_offset_when_it_is_set():
     assert (resolved["offsetx"], resolved["offsety"]) == ("200", "20")
 
 
+@pytest.mark.parametrize("key,value,read", [
+    ("hbin", "4x", base_binning),
+    ("capture_binning", "two", capture_factor),
+    ("width", "wide", runtime_capture_params),
+])
+def test_a_malformed_value_is_refused_with_the_key_it_came_from(key, value, read):
+    params = {**BASE, "capture_binning": "2", key: value}
+    with pytest.raises(ValueError, match=f"{key}='{value}' is not a number"):
+        read(params)
+
+
 @pytest.mark.parametrize("params,message", [
     ({**BASE, "capture_binning": "3"}, "whole factor"),
     ({**BASE, "capture_binning": "8"}, "whole factor"),

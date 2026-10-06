@@ -30,7 +30,10 @@ def _number(params: Mapping[str, Any], key: str) -> Optional[float]:
     value = params.get(key)
     if value is None or (isinstance(value, str) and value.strip().lower() in {"", "none"}):
         return None
-    return float(value)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{key}={value!r} is not a number") from None
 
 
 def _base_offset(params: Mapping[str, Any], axis: str) -> int:

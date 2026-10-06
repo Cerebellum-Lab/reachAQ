@@ -1,6 +1,8 @@
 import inspect
 from types import SimpleNamespace
 
+import pytest
+
 from tools.acquisition.view.main_window import MainWindow
 
 
@@ -56,6 +58,59 @@ def test_entries_are_offered_only_while_idle_and_only_where_the_base_divides():
     assert {b: a.enabled for b, a in window.capture_binning_actions.items()} == {4: True, 2: True, 1: False}
     MainWindow._set_capture_binning_actions_enabled(window, False)
     assert not any(action.enabled for action in window.capture_binning_actions.values())
+
+
+class _MalformedBinningModel:
+    """An app model whose camera params hold a value the binning helpers cannot read."""
+
+    def __init__(self, fails_in):
+        self._fails_in = fails_in
+
+    @property
+    def reach_capture_binning(self):
+        if self._fails_in == "current":
+            raise ValueError("capture_binning='two' is not a number")
+        return 4
+
+    @property
+    def left_camera(self):
+        if self._fails_in == "base":
+            raise ValueError("hbin='4x' is not a number")
+        return SimpleNamespace(shape=(256, 256), base_binning=4)
+
+    def reach_capture_binning_available(self, _binning):
+        raise ValueError("hbin='4x' is not a number")
+
+
+@pytest.mark.parametrize("fails_in", ["current", "base"])
+def test_a_malformed_config_value_leaves_every_entry_unavailable_and_unchecked(fails_in, caplog):
+    # This runs from the configuration-load handler: raising would skip every
+    # enablement after it. The model still refuses Run for the same value.
+    window = SimpleNamespace(
+        _app_model=_MalformedBinningModel(fails_in),
+        capture_binning_actions={binning: _Action() for binning in (4, 2, 1)},
+    )
+    with caplog.at_level("WARNING"):
+        MainWindow._sync_capture_binning_actions(window)
+    assert {b: (a.text, a.checked) for b, a in window.capture_binning_actions.items()} == {
+        4: ("bin 4 (unavailable)", False),
+        2: ("bin 2 (unavailable)", False),
+        1: ("bin 1 (unavailable)", False),
+    }
+    assert "is not a number" in caplog.text
+
+
+def test_a_malformed_config_value_leaves_every_entry_disabled(caplog):
+    window = SimpleNamespace(
+        _app_model=_MalformedBinningModel("available"),
+        capture_binning_actions={binning: _Action() for binning in (4, 2, 1)},
+    )
+    for action in window.capture_binning_actions.values():
+        action.enabled = True  # enabled by an earlier, healthy refresh
+    with caplog.at_level("WARNING"):
+        MainWindow._set_capture_binning_actions_enabled(window, True)
+    assert [a.enabled for a in window.capture_binning_actions.values()] == [False, False, False]
+    assert "is not a number" in caplog.text
 
 
 def test_a_selection_goes_to_the_app_model_and_the_menu_resyncs():
