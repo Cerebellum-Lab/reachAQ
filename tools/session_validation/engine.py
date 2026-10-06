@@ -314,8 +314,12 @@ def _camera_rule(context):
         if len(counts) != 1 or not counts or next(iter(counts)) <= 0:
             errors.append(f"{source.get('id')}: stored frame counts differ {sorted(counts)}")
         if context.profile is ValidationProfile.FULL:
-            from tools.acquisition.model.camera_recording_validation import _ffprobe_frame_count
-            decoded = _ffprobe_frame_count(context.path(source["path"]), 120.0)
+            from tools.acquisition.model.camera_recording_validation import (
+                _ffprobe_frame_count,
+                closed_video_timeout_seconds,
+            )
+            timeout = max(120.0, closed_video_timeout_seconds(int(source.get("sampleCount") or 0)))
+            decoded = _ffprobe_frame_count(context.path(source["path"]), timeout)
             if decoded != source.get("sampleCount"):
                 errors.append(
                     f"{source.get('id')}: decoded {decoded}, stored {source.get('sampleCount')}"

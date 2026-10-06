@@ -27,12 +27,30 @@ class ClosedVideoValidation:
         return result
 
 
+# Decoding threads for the full-decode frame count. One thread counted a
+# 6-minute 1024x1024 H.264 recording in 45 s; eight did it in 7.7 s
+# (christielab10, 2026-10-06).
+_FFPROBE_DECODE_THREADS = 8
+
+
+def closed_video_timeout_seconds(frame_count: int) -> float:
+    """How long the full-decode frame count may take: 30 s, or 1 ms per frame when longer.
+
+    At the measured ~7,000 frames/s for 1024x1024 H.264 with eight threads,
+    1 ms per frame leaves a wide margin, while still bounding how long session
+    finalisation waits on a stuck ffprobe.
+    """
+    return max(30.0, int(frame_count) / 1000.0)
+
+
 def _ffprobe_frame_count(video_path: Path, timeout_seconds: float) -> int:
     completed = subprocess.run(
         (
             "ffprobe",
             "-v",
             "error",
+            "-threads",
+            str(_FFPROBE_DECODE_THREADS),
             "-select_streams",
             "v:0",
             "-count_frames",
