@@ -29,8 +29,10 @@ X264_OUTPUT_ARGS = (
 )
 
 # The encoder runs below capture and live pose: it has throughput to spare at
-# every preset, they have a deadline. At 1024x1024 an unprioritised encoder
-# cut the share of frames posed live from 86% to 60% (christielab10, 2026-10-06).
+# every preset, they have a deadline. This does not restore live pose at
+# 1024x1024: with x264 running, 60% of frames were posed live (86% at the
+# 256 base) with or without the lower priority, so that cost is contention
+# for memory and cache, not CPU scheduling (christielab10, 2026-10-06).
 ENCODER_NICENESS = 10
 
 # Long enough for ffmpeg to encode what is still in the pipe and write the
