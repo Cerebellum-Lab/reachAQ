@@ -42,7 +42,7 @@ def test_each_entry_names_the_size_it_captures_and_the_current_one_is_checked():
     MainWindow._sync_capture_binning_actions(window)
     actions = window.capture_binning_actions
     assert [actions[b].text for b in (4, 2, 1)] == [
-        "256 x 256 (bin 4)", "512 x 512 (bin 2)", "1024 x 1024 (bin 1, encoder at limit)"]
+        "256 x 256 (bin 4)", "512 x 512 (bin 2, H.264)", "1024 x 1024 (bin 1, H.264)"]
     assert [actions[b].checked for b in (4, 2, 1)] == [False, True, False]
 
 
