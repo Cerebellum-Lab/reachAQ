@@ -1037,7 +1037,10 @@ class AppModel(ObservableObject):
         # built first because the executor reads reach state through it.
         self._reach_state_resolver = ReachStateResolver(
             ReachStateConfiguration.from_environment(),
-            live_tracking_provider=LiveTrackingReachProvider(self._live_tracking),
+            live_tracking_provider=LiveTrackingReachProvider(
+                self._live_tracking,
+                on_observe=self._session_data_recorder.latency_events.record_gate_observation,
+            ),
         )
         self._trial_action_executor = TrialActionExecutor(
             move_absolute=self._move_protocol_motor_target,
@@ -10558,6 +10561,9 @@ class AppModel(ObservableObject):
                                   f"\nModel at {value} failed pre-validate:\n\n{err}")
 
     def _on_pose_response_ready(self, response: PoseResponse):
+        # One row per pose, on this receive thread rather than the Qt thread:
+        # the latency record's last pose stage.
+        self._session_data_recorder.latency_events.record_live_pose(response, time.perf_counter())
         boundary = self._recording_session.boundary
         if (
             boundary is not None
