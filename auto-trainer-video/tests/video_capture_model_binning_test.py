@@ -37,6 +37,18 @@ def test_a_preset_rewrites_only_the_runtime_url(video_capture_model):
     assert video_capture_model.effective_capture_binning == 2
 
 
+def test_a_preset_scales_the_offset_alias_and_drops_it_from_the_url(video_capture_model):
+    # SpinCam applies URL params in order, so an offset_x left in the URL would
+    # land after the scaled offsetx and put the offset back at its base value.
+    _random_base(video_capture_model, offset_x=100, offset_y=10, capture_binning=2)
+
+    query = parse_qs(urlsplit(video_capture_model._runtime_camera_url()).query)
+
+    assert "offset_x" not in query and "offset_y" not in query
+    # The alias, not the offsetx=52 / offsety=6 above, is the base offset: doubled at bin 2.
+    assert (query["offsetx"], query["offsety"]) == (["200"], ["20"])
+
+
 def test_setting_and_clearing_the_preset_round_trips(video_capture_model):
     _random_base(video_capture_model)
     assert video_capture_model.capture_binning is None
