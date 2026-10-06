@@ -54,6 +54,10 @@ def test_an_impossible_preset_fails_before_the_start_allocates_anything(video_ca
     _random_base(video_capture_model, capture_binning=3)
     with pytest.raises(ValueError, match="whole factor"):
         video_capture_model.on_prepare_capture()
+    # The queue and the reader are allocated after the URL is resolved; _video_capture
+    # alone would stay None even if the URL were resolved late.
+    assert video_capture_model._video_image_queue is None
+    assert video_capture_model._video_reader is None
     assert video_capture_model._video_capture is None
 
 
