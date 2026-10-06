@@ -110,6 +110,15 @@ class FixedArrayMultiQueue:
         self._frame_perf_c = mp_ctx.RawArray(
             ctypes.c_double, self._depth * self._frames_per_camera * self._cam_count)
 
+        # Each camera's own frame id, and the moment the frame was written into
+        # its slot, beside the recording-relative index. That index is -1
+        # outside a recording, so on its own it cannot say which exposure a
+        # pose came from; the latency record joins on these instead.
+        self._cam_frame_ids = mp_ctx.RawArray(
+            ctypes.c_int64, self._depth * self._frames_per_camera * self._cam_count)
+        self._put_perf_c = mp_ctx.RawArray(
+            ctypes.c_double, self._depth * self._frames_per_camera * self._cam_count)
+
         self._frame_indexing: List[int] = list(numpy.repeat(range(self._frames_per_camera), self._cam_count))
         self._camera_indexing: List[int] = list(numpy.tile(range(self._cam_count), self._frames_per_camera))
 
@@ -192,7 +201,8 @@ class FixedArrayMultiQueue:
 
     def put(self, content: numpy.ndarray, camera: int, frame_idx: Optional[int],
             *, block=True, timeout=0.01,
-            frame_perf_c: Optional[float] = None) -> BufferResult:
+            frame_perf_c: Optional[float] = None,
+            cam_frame_id: Optional[int] = None) -> BufferResult:
         batch_index = self._batch_index[camera]  # 0 ... up to frames per camera - 1
         if batch_index == 0:
             if not self._sem_free[camera].acquire(block, timeout):
@@ -212,6 +222,14 @@ class FixedArrayMultiQueue:
         ).reshape((self._cam_count, self._depth, self._frames_per_camera))[camera]
         stamps[buffer_index][batch_index] = (
             math.nan if frame_perf_c is None else frame_perf_c)
+        ids = numpy.frombuffer(
+            memoryview(self._cam_frame_ids).cast("B"), "int64", len(self._cam_frame_ids)
+        ).reshape((self._cam_count, self._depth, self._frames_per_camera))[camera]
+        ids[buffer_index][batch_index] = -1 if cam_frame_id is None else int(cam_frame_id)
+        put_stamps = numpy.frombuffer(
+            memoryview(self._put_perf_c).cast("B"), "float64", len(self._put_perf_c)
+        ).reshape((self._cam_count, self._depth, self._frames_per_camera))[camera]
+        put_stamps[buffer_index][batch_index] = time.perf_counter()
         self._put_count += 1
         #
         batch_index = self._batch_index[camera] = (batch_index + 1) % self._frames_per_camera
@@ -222,7 +240,9 @@ class FixedArrayMultiQueue:
         return BufferResult.Ok  # if not is_overflow else BufferResult.Overflow
 
     def get_output(self, output: numpy.ndarray, frames_indices: Optional[numpy.ndarray] = None, *, timeout: float=0.01,
-                   frames_perf_c: Optional[numpy.ndarray] = None) -> bool:
+                   frames_perf_c: Optional[numpy.ndarray] = None,
+                   cam_frame_ids: Optional[numpy.ndarray] = None,
+                   put_perf_c: Optional[numpy.ndarray] = None) -> bool:
         """Get the next available "output" : i.e: 1 batch of frames_per_camera * nbr_cameras"""
         for cdx in range(self._cam_count):
             if not self._read_sem_acquired[cdx]:
@@ -257,6 +277,22 @@ class FixedArrayMultiQueue:
             frames_perf_c[:, :] = numpy.frombuffer(
                 memoryview(self._frame_perf_c).cast("B"), "float64",
                 len(self._frame_perf_c)
+            ).reshape(
+                (self._cam_count, self._depth, self._frames_per_camera)
+            )[:, read_idx_value, :]
+
+        if cam_frame_ids is not None:
+            cam_frame_ids[:, :] = numpy.frombuffer(
+                memoryview(self._cam_frame_ids).cast("B"), "int64",
+                len(self._cam_frame_ids)
+            ).reshape(
+                (self._cam_count, self._depth, self._frames_per_camera)
+            )[:, read_idx_value, :]
+
+        if put_perf_c is not None:
+            put_perf_c[:, :] = numpy.frombuffer(
+                memoryview(self._put_perf_c).cast("B"), "float64",
+                len(self._put_perf_c)
             ).reshape(
                 (self._cam_count, self._depth, self._frames_per_camera)
             )[:, read_idx_value, :]
