@@ -2834,6 +2834,28 @@ class AppModel(ObservableObject):
     def reach_capture_binning_available(self, binning: int) -> bool:
         return capture_binning_available(self._stereo_cameras(), binning)
 
+    def _warn_if_stereo_capture_binning_differs(self) -> None:
+        """Say so when left and right will record at different resolutions.
+
+        Start does not refuse it: live inference gets base-size frames from
+        both cameras either way, and only the saved videos differ.
+        """
+        cameras = self._stereo_cameras()
+        if len(cameras) < 2 or not all(camera.is_enabled for camera in cameras):
+            return
+        try:
+            binnings = {camera.effective_capture_binning for camera in cameras}
+            described = ", ".join(
+                f"{camera.name} bin {camera.effective_capture_binning}" for camera in cameras)
+        except ValueError as exc:
+            # A malformed value: the camera's own start refuses it with its message.
+            logger.warning("Left and right capture binning could not be compared: %s", exc)
+            return
+        if len(binnings) > 1:
+            logger.warning(
+                "Left and right cameras capture at different binning (%s); "
+                "their recordings will differ in resolution", described)
+
     @_serialized_session_configuration
     def set_reach_capture_binning(self, binning: int) -> None:
         """Capture left and right at this binning over the same field of view, and save it.
@@ -8303,6 +8325,7 @@ class AppModel(ObservableObject):
         self._behavior.on_prepare_capture()  # might be better at the end...
 
         self._ensure_reach_primary_camera()
+        self._warn_if_stereo_capture_binning_differs()
         self._inference_queue = None
         self._inference_cameras = ()
         inference_camera_indices = {}
