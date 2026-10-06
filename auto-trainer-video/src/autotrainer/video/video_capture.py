@@ -261,6 +261,10 @@ class VideoCapture(Process):
         # once the recording has really ended, so its last frames are kept.
         self._latency: Optional[LatencyStreamWriter] = None
         self._latency_close_requested = False
+        # Writers whose close is still running on a LatencyClose thread. Only
+        # the capture loop adds to it; the command thread and process exit
+        # wait on it so no file is still open past them.
+        self._latency_closers: List[threading.Thread] = []
 
         self._command_handlers: Dict[CaptureCommandKind, Callable] = {
             CaptureCommandKind.TERMINATE: self._user_terminate,
@@ -980,7 +984,10 @@ class VideoCapture(Process):
                     if self._latency_close_requested and record_start_stop_frame_idx is None:
                         # The recording has wound down (or this camera never
                         # recorded): every frame of it is in the stream now.
-                        self._close_latency()
+                        # Not waited for: closing flushes to a disk the ffmpeg
+                        # writers may have saturated, and the watchdog watches
+                        # this loop.
+                        self._close_latency(wait=False)
 
                 if img_q is not None:
                     # image queue goes to GUI video reader frame, currently FixedArrayQueue.
@@ -1111,7 +1118,11 @@ class VideoCapture(Process):
             self._stim_session_active = False
             self._stim_detector.disarm()
             self._stop_stim_evidence()
-        if not is_from_start:
+        if not is_from_start and self._latency is not None:
+            # Only a stream that exists can be waiting to close. DISABLE with
+            # none open is routine (the app sends it to every camera on
+            # entering a calibration step), and a request left standing would
+            # end the next recording's stream on its first frame.
             self._latency_close_requested = True
         logger.verbose("_disable_record(is_triggered=%s, is_from_start=%s): is_record_active=%s",
                        entry_is_triggered, is_from_start, self._is_record_active)
@@ -1174,6 +1185,12 @@ class VideoCapture(Process):
             ))
 
     def _start_latency(self):
+        # First, whatever follows: a request left over from an earlier DISABLE
+        # must not close this recording's stream on its first frame.
+        self._latency_close_requested = False
+        # The previous recording's stream is this one's file: its close, if the
+        # loop handed it to a thread, must finish before a new writer truncates it.
+        self._wait_for_latency_closers()
         if self._latency is not None:
             # A previous recording that had not wound down yet.
             self._close_latency()
@@ -1194,11 +1211,39 @@ class VideoCapture(Process):
             logger.exception("<%s> latency stream could not start; recording continues without it",
                              self._name)
 
-    def _close_latency(self):
+    def _close_latency(self, wait: bool = True):
+        """Detach this recording's stream and close it.
+
+        The capture loop passes wait=False: close() joins the writer thread,
+        which can take as long as the disk takes to flush, and the loop must
+        not stop for it. The close then runs on its own short-lived thread.
+        Every other caller (a new recording, process exit) waits, so the file
+        is closed before they go on. close()'s timeout is left alone: a
+        timeout drops the rows still queued.
+        """
         writer, self._latency = self._latency, None
         self._latency_close_requested = False
-        if writer is None:
-            return
+        if writer is not None:
+            if wait:
+                self._finish_latency(writer)
+            else:
+                try:
+                    closer = threading.Thread(
+                        target=self._finish_latency, args=(writer,),
+                        name=f"LatencyClose-{self._name}", daemon=True)
+                    closer.start()
+                except Exception:
+                    # No thread to be had: closing here is slow but loses nothing.
+                    logger.exception("<%s> latency close thread could not start", self._name)
+                    self._finish_latency(writer)
+                else:
+                    self._latency_closers = [
+                        thread for thread in self._latency_closers if thread.is_alive()
+                    ] + [closer]
+        if wait:
+            self._wait_for_latency_closers()
+
+    def _finish_latency(self, writer):
         stats = writer.close()
         if stats["failed"] or any(stats["rowsDropped"].values()):
             logger.warning("<%s> latency stream incomplete: %s", self._name, stats)
@@ -1206,6 +1251,11 @@ class VideoCapture(Process):
             # A rejected row here means the row did not fit the schema.
             logger.error("<%s> latency stream rejected %d rows: %s", self._name,
                          stats["rowsRejected"], stats)
+
+    def _wait_for_latency_closers(self):
+        for closer in list(self._latency_closers):
+            # close() gives up on its own after 10 s; this only outlasts that.
+            closer.join(15)
 
     def _process_stim_frame(
         self,
