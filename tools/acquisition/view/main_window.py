@@ -74,6 +74,10 @@ _TOOLBAR_ICON_COLOR = "#20242a"
 _TOOLBAR_ICON_WARNING_COLOR = "#b00020"
 _TRANSITIONAL_APP_MODE = "__transition__"
 _MINIMUM_RESIZABLE_WINDOW_SIZE = QSize(320, 240)
+# Two 150 fps mp4v encoders manage 151 fps each at 1024x1024 on christielab10
+# (2026-10-05) with nothing else running, so captures this large are flagged
+# in the Camera resolution menu.
+_CAPTURE_ENCODER_LIMIT_PIXELS = 1024 * 1024
 
 
 def _toolbar_icon(name: str, *, color: str = _TOOLBAR_ICON_COLOR) -> QIcon:
@@ -341,6 +345,7 @@ class MainWindow(QMainWindow):
         self.daq_monitor_action.setEnabled(state.idle_configuration)
         self.refresh_hardware_action.setEnabled(state.hardware_refresh)
         self._set_hardware_menu_actions_enabled(state.idle_configuration)
+        self._set_capture_binning_actions_enabled(state.idle_configuration)
         self._animal_dropdown_combo.setEnabled(state.subject)
         self.animal_metadata_action.setEnabled(state.subject)
         self._training_plan_combo.setEnabled(state.protocol_selection)
@@ -1150,6 +1155,18 @@ class MainWindow(QMainWindow):
             )
             self.hardware_enable_actions[field_name] = action
 
+        # Left/right capture binning, for testing higher-resolution recording.
+        # Live inference, the display and calibration keep the base frame
+        # size: the capture process averages each frame back down for them.
+        # The text is set from the loaded configuration (_sync_capture_binning_actions).
+        self.capture_binning_actions = {}
+        for binning in (4, 2, 1):
+            action = QAction(f"bin {binning}", self)
+            action.setCheckable(True)
+            action.setEnabled(False)
+            action.triggered.connect(partial(self._set_capture_binning_from_menu, binning))
+            self.capture_binning_actions[binning] = action
+
         self.rfid_device_action = QAction("RFID Serial Device…", self)
         self.rfid_device_action.setEnabled(False)
         self.rfid_device_action.triggered.connect(self._edit_rfid_device_from_menu)
@@ -1265,6 +1282,10 @@ class MainWindow(QMainWindow):
         tools_menu.addSeparator()
         tools_menu.addAction(self.calib_diamond_triangle_action)
         tools_menu.addAction(self.make_3d_calib_action)
+        tools_menu.addSeparator()
+        resolution_menu = tools_menu.addMenu("Camera resolution")
+        for action in self.capture_binning_actions.values():
+            resolution_menu.addAction(action)
 
         view_menu = menu_bar.addMenu("View")
         view_menu.addAction(self.view_diagnostics_action)
@@ -1289,6 +1310,42 @@ class MainWindow(QMainWindow):
         for action in self.hardware_enable_actions.values():
             action.setEnabled(enabled)
         self.rfid_device_action.setEnabled(enabled)
+
+    def _sync_capture_binning_actions(self) -> None:
+        app_model = self._app_model
+        current = app_model.reach_capture_binning
+        left = app_model.left_camera
+        rows, cols = left.shape if left is not None else (0, 0)
+        base = None if left is None else left.base_binning
+        for binning, action in self.capture_binning_actions.items():
+            k = base // binning if base and base % binning == 0 else None
+            if k is None:
+                text = f"bin {binning} (unavailable)"
+            else:
+                note = ", encoder at limit" if rows * k * cols * k >= _CAPTURE_ENCODER_LIMIT_PIXELS else ""
+                text = f"{cols * k} x {rows * k} (bin {binning}{note})"
+            action.blockSignals(True)
+            action.setText(text)
+            action.setChecked(binning == current)
+            action.blockSignals(False)
+
+    def _set_capture_binning_actions_enabled(self, enabled: bool) -> None:
+        for binning, action in self.capture_binning_actions.items():
+            action.setEnabled(enabled and self._app_model.reach_capture_binning_available(binning))
+
+    def _set_capture_binning_from_menu(self, binning: int, _checked: bool = False) -> None:
+        logger.info("Camera resolution menu selection: capture binning %s", binning)
+        try:
+            self._app_model.set_reach_capture_binning(binning)
+        except Exception as exc:
+            logger.exception("Camera resolution was not changed")
+            self.statusBar().showMessage(f"Camera resolution not changed: {exc}", 8000)
+        else:
+            self.statusBar().showMessage(
+                f"Left/right cameras capture at binning {binning} from the next Start", 8000)
+        # Checkmarks always follow the model, including after a refusal or a
+        # click on the entry that was already checked.
+        self._sync_capture_binning_actions()
 
     def _hardware_menu_values(self, **overrides):
         configuration = self._app_model.loaded_configuration
@@ -2169,6 +2226,7 @@ class MainWindow(QMainWindow):
     def _on_app_model_configuration_loaded(self, config):
         self._set_training_plans(self._app_model.training_plans)
         self._sync_hardware_menu_actions()
+        self._sync_capture_binning_actions()
         self._set_hardware_menu_actions_enabled(
             not self._app_model.acquisition_started
             and self._app_model.status == AppModelStatus.IDLE

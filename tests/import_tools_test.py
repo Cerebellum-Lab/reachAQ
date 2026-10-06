@@ -145,6 +145,7 @@ def test_the_daq_monitor_is_offered_only_while_idle():
                 laser_calibration_active=calibrating,
             ),
             _set_hardware_menu_actions_enabled=lambda _enabled: None,
+            _set_capture_binning_actions_enabled=lambda _enabled: None,
             **{name: _EnableRecorder() for name in controls},
         )
         MainWindow._refresh_ui_availability(window)
