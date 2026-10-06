@@ -88,3 +88,59 @@ def test_a_bin_2_capture_feeds_averaged_256_frames_to_inference(video_capture_mo
         assert 25 < out[0, :, :, 0].std() < 50
     finally:
         video_capture_model.on_capture_stop()
+
+
+def test_a_preset_records_h264_and_the_base_keeps_mp4v(video_capture_model):
+    _random_base(video_capture_model, capture_binning=2)
+    assert video_capture_model.video_encoder == "x264"
+
+    video_capture_model.set_capture_binning(None)
+    assert video_capture_model.video_encoder == "mp4v"
+
+
+def test_a_preset_will_not_start_without_ffmpeg(video_capture_model, monkeypatch):
+    from tools.acquisition.model import video_capture_model as module
+
+    monkeypatch.setattr(module, "ffmpeg_executable", lambda: None)
+    _random_base(video_capture_model, capture_binning=2)
+
+    with pytest.raises(ValueError, match="ffmpeg"):
+        video_capture_model.on_prepare_capture()
+    assert video_capture_model._video_capture is None
+    assert video_capture_model._video_image_queue is None
+
+
+class _FakeCapture:
+    """Stands in for the capture process so only the handed-over properties are seen."""
+    seen = []
+    exitcode = 0
+
+    def __init__(self, _attrs, record_properties, project_info=None):
+        _FakeCapture.seen.append(record_properties.encoder)
+
+    def start(self):
+        pass
+
+    def is_alive(self):
+        return False
+
+    def join(self, *_args):
+        pass
+
+    def terminate(self):
+        pass
+
+
+@pytest.mark.parametrize("preset,expected", ((2, "x264"), (None, "mp4v")))
+def test_the_recorder_is_given_the_presets_encoder(video_capture_model, monkeypatch, preset, expected):
+    from tools.acquisition.model import video_capture_model as module
+
+    _FakeCapture.seen = []
+    monkeypatch.setattr(module, "VideoCapture", _FakeCapture)
+    if preset is None:
+        _random_base(video_capture_model)
+    else:
+        _random_base(video_capture_model, capture_binning=preset)
+
+    assert video_capture_model.on_prepare_capture() is True
+    assert _FakeCapture.seen == [expected]

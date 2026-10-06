@@ -35,6 +35,7 @@ from autotrainer.video.camera_discovery import (
     discover_spin_cameras,
 )
 
+from autotrainer.video.ffmpeg_writer import ffmpeg_executable
 from tools.acquisition.model.capture_binning import (
     CAPTURE_BINNING_PARAM,
     OFFSET_ALIASES,
@@ -447,6 +448,20 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
         return self.base_binning if preset is None else preset
 
     @property
+    def video_encoder(self) -> str:
+        """The recorder's encoder: "x264" at a capture-binning preset, else "mp4v".
+
+        OpenCV's mp4v writer cannot keep up with 1024x1024 at 150 fps on a lit
+        scene (136 fps per camera on christielab10); x264 through ffmpeg can.
+        The base capture keeps mp4v, so standard sessions keep today's files.
+        """
+        try:
+            larger = capture_factor(self._camera_properties) > 1
+        except ValueError:
+            larger = False  # an impossible preset fails the start instead
+        return "x264" if larger else "mp4v"
+
+    @property
     def capture_shape(self) -> Tuple[int, int]:
         """(rows, cols) of the frames the camera delivers. ``shape`` is what consumers receive.
 
@@ -534,6 +549,9 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
         # Resolve the capture URL first: an impossible binning preset raises
         # here, before any queue or reader is allocated for this start.
         camera_url = None if self._camera_source is None else self._runtime_camera_url()
+        if self.video_encoder == "x264" and ffmpeg_executable() is None:
+            raise ValueError(
+                f"capture binning {self.capture_binning} records H.264 through ffmpeg, which is not installed")
         self._frame_count = 0
         self._video_frame_index.value = -1
         self._errors.value = b""
@@ -593,6 +611,7 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
                 video_rotate_interval=rotate_interval,
                 image_interval=image_interval,
                 record_generation=self._record_generation,
+                encoder=self.video_encoder,
             )
             # Leave the watchdog counter unset (nan) until the capture child writes its first
             # real timestamp; the monitor ignores nan. Seeding a live perf_counter here makes the
