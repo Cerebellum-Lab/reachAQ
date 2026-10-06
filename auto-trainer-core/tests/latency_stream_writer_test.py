@@ -111,3 +111,84 @@ def test_the_record_can_be_switched_off(monkeypatch):
     assert latency_recording_enabled() is True
     monkeypatch.delenv("REACHAQ_LATENCY_RECORD")
     assert latency_recording_enabled() is True
+
+
+def test_append_never_raises_on_unknown_dataset_or_bad_row(tmp_path):
+    """Unknown dataset names, wrong arity, and type errors are silently rejected."""
+    writer = LatencyStreamWriter(tmp_path / "x.h5", {"frames": CAMERA_FRAME_DTYPE},
+                                 batch_rows=4)
+    # Unknown dataset: should not raise
+    writer.append("no_such_dataset", _row(0))
+    # Wrong arity: should not raise
+    writer.append("frames", (1,))
+    # Good row: should work
+    writer.append("frames", _row(1))
+    writer.append("frames", _row(2))
+    stats = writer.close()
+
+    assert stats["rowsRejected"]["frames"] == 1
+    assert stats["rowsRejected"]["no_such_dataset"] == 1
+    assert stats["rowsWritten"]["frames"] == 2
+    with h5py.File(tmp_path / "x.h5", "r") as store:
+        frames = store["frames"][:]
+        # Only the good rows landed
+        assert frames["frame_id"].tolist() == [1, 2]
+
+
+def test_close_returns_quickly_even_if_the_final_write_fails(tmp_path, monkeypatch):
+    """If the closing clock-pair write fails, close() still stops the thread and closes the file."""
+    writer = LatencyStreamWriter(tmp_path / "x.h5", {"frames": CAMERA_FRAME_DTYPE},
+                                 batch_rows=2)
+    original_write = writer._write
+
+    def write_that_fails_on_clock_pairs(datasets, name, batch):
+        if name == CLOCK_PAIRS:
+            raise RuntimeError("simulated final write failure")
+        original_write(datasets, name, batch)
+
+    monkeypatch.setattr(writer, "_write", write_that_fails_on_clock_pairs)
+    writer.append("frames", _row(0))
+    started = time.perf_counter()
+    stats = writer.close(timeout=2.0)
+    elapsed = time.perf_counter() - started
+
+    # Should return quickly, not wait the full timeout.
+    assert elapsed < 1.0, f"close took {elapsed} s, expected < 1 s"
+    assert stats["failed"] is True
+    assert "RuntimeError" in stats["firstError"]
+    # The file should have been closed by the finally block.
+    with h5py.File(tmp_path / "x.h5", "r") as store:
+        assert store.attrs["schema_version"] == LATENCY_SCHEMA_VERSION
+
+
+def test_close_with_blocked_writer_and_full_queue_respects_deadline(tmp_path, monkeypatch):
+    """When the writer is blocked and the queue is full, close() respects a single deadline."""
+    gate = threading.Event()
+    writer = LatencyStreamWriter(tmp_path / "slow.h5", {"frames": CAMERA_FRAME_DTYPE},
+                                 batch_rows=1, queue_batches=1)
+    original = writer._write
+
+    def slow_write(datasets, name, batch):
+        if name == "frames":
+            gate.wait(10)  # Wait for signal or timeout
+        original(datasets, name, batch)
+
+    monkeypatch.setattr(writer, "_write", slow_write)
+    # Fill the queue with one pending batch
+    writer.append("frames", _row(0))
+    # This append will block on the full queue check, but since the lock is brief,
+    # we can trigger it and then attempt close before the gate opens.
+    time.sleep(0.05)  # Give the writer thread time to start processing.
+
+    started = time.perf_counter()
+    close_stats = writer.close(timeout=0.5)
+    elapsed = time.perf_counter() - started
+
+    # With a single deadline, close should not wait longer than deadline + some slack.
+    # If two independent timeouts were used, it could wait up to 2x timeout.
+    assert elapsed < 1.0, f"close took {elapsed} s with 0.5 s timeout; expected < 1 s (one deadline)"
+    # After close returns, release the gate and give the thread time to exit.
+    gate.set()
+    time.sleep(0.1)
+    # The thread should have exited (or exited after gate opens).
+    assert not writer._thread.is_alive(), "writer thread should exit shortly after gate opens"

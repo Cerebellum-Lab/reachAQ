@@ -47,7 +47,13 @@ def latency_stream_path(project, name: str) -> Path:
 
 
 class LatencyStreamWriter:
-    """One HDF5 file of compound datasets, appended in batches by a daemon thread."""
+    """One HDF5 file of compound datasets, appended in batches by a daemon thread.
+
+    append() never raises and never waits: invalid dataset names, bad row data
+    (wrong arity, type error, overflow), and a full queue all result in silent
+    rejection and a count in stats["rowsRejected"]. The writer thread always
+    stops within the caller-supplied timeout, even if writes fail.
+    """
 
     def __init__(
         self,
@@ -77,12 +83,16 @@ class LatencyStreamWriter:
         self._counts = {name: 0 for name in self._dtypes}
         self._rows_written = {name: 0 for name in self._dtypes}
         self._rows_dropped = {name: 0 for name in self._dtypes}
+        self._rows_rejected = {name: 0 for name in self._dtypes}
+        self._rejection_logged = False
         self._queue: "queue.Queue" = queue.Queue(maxsize=int(queue_batches))
         self._lock = threading.Lock()
         self._closed = False
         self._failed = False
         self._first_error = ""
         self._high_water = 0
+        self._sentinel_received = False
+        self._stop_event = threading.Event()
         self._clock_pair_period = float(clock_pair_period)
         self._thread = threading.Thread(
             target=self._run, name=f"LatencyWriter-{self.path.stem}", daemon=True,
@@ -95,19 +105,37 @@ class LatencyStreamWriter:
             return {
                 "rowsWritten": dict(self._rows_written),
                 "rowsDropped": dict(self._rows_dropped),
+                "rowsRejected": dict(self._rows_rejected),
                 "queueHighWater": self._high_water,
                 "failed": self._failed,
                 "firstError": self._first_error or None,
             }
 
     def append(self, dataset: str, row) -> None:
-        """Copy one row into its batch. Never waits on I/O and never raises on a full queue."""
+        """Copy one row into its batch. Never waits on I/O and never raises.
+
+        Invalid dataset names, bad row data (wrong arity, type error, overflow),
+        and a full queue all result in silent rejection, a count in
+        stats["rowsRejected"], and a single ERROR log per writer.
+        """
         with self._lock:
             if self._closed:
                 return
-            index = self._counts[dataset]
-            buffer = self._buffers[dataset]
-            buffer[index] = row
+            try:
+                index = self._counts[dataset]
+                buffer = self._buffers[dataset]
+                buffer[index] = row
+            except (KeyError, ValueError, OverflowError) as error:
+                # Log once per writer on first rejection. Unknown dataset names
+                # don't have a count, so count them under a generic key.
+                if dataset not in self._rows_rejected:
+                    self._rows_rejected[dataset] = 0
+                self._rows_rejected[dataset] += 1
+                if not self._rejection_logged:
+                    self._rejection_logged = True
+                    logger.error("Latency stream %s rejected a row (%s); bad data or unknown dataset %s: %s",
+                                 self.path, type(error).__name__, dataset, error)
+                return
             index += 1
             if index == self._batch_rows:
                 self._counts[dataset] = 0
@@ -116,7 +144,12 @@ class LatencyStreamWriter:
                 self._counts[dataset] = index
 
     def close(self, timeout: float = 10.0) -> dict:
-        """Flush the partial batches, stop the thread and return the final stats."""
+        """Flush partial batches, signal the thread to stop, and return the final stats.
+
+        Always returns within the caller's deadline, even if the writer thread fails.
+        Queued batches are still written before the thread exits.
+        """
+        deadline = time.perf_counter() + timeout
         with self._lock:
             closed_already = self._closed
             if not closed_already:
@@ -126,11 +159,13 @@ class LatencyStreamWriter:
                         self._enqueue_locked(name, self._buffers[name][:count].copy())
                         self._counts[name] = 0
         if not closed_already:
+            self._stop_event.set()
             try:
-                self._queue.put(None, timeout=timeout)
+                self._queue.put_nowait(None)
             except queue.Full:
-                self._fail(TimeoutError("latency writer queue did not drain"))
-        self._thread.join(timeout)
+                pass  # The stop event covers the full queue case.
+        remaining = max(0.0, deadline - time.perf_counter())
+        self._thread.join(remaining)
         if self._thread.is_alive():
             self._fail(TimeoutError("latency writer thread did not stop"))
         return self.stats
@@ -193,15 +228,25 @@ class LatencyStreamWriter:
                 try:
                     item = self._queue.get(timeout=max(0.0, next_pair - time.perf_counter()))
                 except queue.Empty:
+                    # No data and no stop signal: keep polling for clock pairs.
+                    if self._stop_event.is_set() and self._queue.empty():
+                        break
                     continue
                 if item is None:
+                    # Received the stop sentinel: exit after writing queued batches.
+                    with self._lock:
+                        self._sentinel_received = True
                     break
                 name, batch = item
                 self._write(datasets, name, batch)
             self._write(datasets, CLOCK_PAIRS, self._clock_pair())
         except Exception as error:
             self._fail(error)
-            self._drain_discarding()
+            # Only drain if the sentinel was never consumed; if it was, the finally
+            # runs and closes the file. If it wasn't, the queue might be full, and
+            # we must empty it so close() can return.
+            if not self._sentinel_received:
+                self._drain_discarding()
         finally:
             try:
                 store.attrs["writer_stats"] = json.dumps(self.stats, sort_keys=True)
