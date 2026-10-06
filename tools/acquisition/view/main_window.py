@@ -991,6 +991,9 @@ class MainWindow(QMainWindow):
         if not self.edit_camera_settings_action.isChecked():
             self.main_content.set_is_editable(False)
             self._app_model.save_configuration()
+            # Changing a camera's source rebuilds its properties without the
+            # capture_binning preset, so the menu checkmark is stale until synced.
+            self._sync_capture_binning_actions()
             self.run_action.setEnabled(True)
         else:
             self.main_content.set_is_editable(True)
