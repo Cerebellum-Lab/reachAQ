@@ -110,6 +110,7 @@ class VideoRecord(Thread):
 
         self._is_video_enabled = self._video_rotate_interval >= 0
         self._video_writer = None
+        self._video_is_color = False
         self._video_file = None
         self._video_timestamp_file: Optional[TextIO] = None
 
@@ -245,13 +246,11 @@ class VideoRecord(Thread):
                             self._prepare_writers()
 
                         if self._video_file is not None:
-                            video_frame = frame
-                            if len(numpy.shape(video_frame)) == 3 and numpy.shape(video_frame)[2] == 1:
-                                video_frame = video_frame[:, :, 0]
+                            channels = self._frame_channels(frame)
                             if self._video_writer is None:
                                 # Opened on the first frame, when its channel count is known.
-                                self._open_video_writer(is_color=len(numpy.shape(video_frame)) == 3)
-                            self._video_writer.write(video_frame)
+                                self._open_video_writer(is_color=channels == 3)
+                            self._video_writer.write(self._fit_to_writer(frame, channels))
                             tot_written += 1
 
                         vid_ts_file = self._video_timestamp_file
@@ -370,6 +369,33 @@ class VideoRecord(Thread):
         if not vid_writer.isOpened():
             raise RuntimeError(f"Failed open {self._video_file} for writing")
         self._video_writer = vid_writer
+        self._video_is_color = is_color
+
+    def _frame_channels(self, frame: numpy.ndarray) -> int:
+        """1 for mono ((H, W) or (H, W, 1)), 3 for colour, at the recording's size; else refused.
+
+        A writer drops a frame it cannot take without any error, so a wrong
+        channel count or size would silently shift every later frame against
+        its timestamp row. Refusing it records a writer error instead.
+        """
+        shape = numpy.shape(frame)
+        channels = 1 if len(shape) == 2 else shape[2] if len(shape) == 3 else 0
+        if channels not in (1, 3):
+            raise ValueError(f"cannot record a {channels}-channel frame of shape {shape}")
+        if tuple(shape[:2]) != (self._height, self._width):
+            raise ValueError(f"frame of shape {shape} does not match the recording size "
+                             f"{self._width}x{self._height}")
+        return channels
+
+    def _fit_to_writer(self, frame: numpy.ndarray, channels: int) -> numpy.ndarray:
+        # The capture loop fills missed frames with mono zeros, so a colour
+        # recording also receives mono frames (and could, the other way round).
+        # Convert each frame to the writer's channel count rather than let the
+        # writer drop it.
+        mono = frame if numpy.ndim(frame) == 2 else frame[:, :, 0] if channels == 1 else None
+        if self._video_is_color:
+            return frame if channels == 3 else cv2.cvtColor(mono, cv2.COLOR_GRAY2BGR)
+        return mono if mono is not None else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
     def _close_video_writer(self):
         vid_writer = self._video_writer
