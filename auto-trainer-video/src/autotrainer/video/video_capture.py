@@ -298,9 +298,12 @@ class VideoCapture(Process):
 
     def _set_error(self, error: str):
         logger.error("set_error: %s", error)
-        self._set_status(CaptureProcessStatus.FAILED)
+        # The text goes in before FAILED: the parent polls the status every
+        # millisecond and reads the text the moment it sees FAILED, so the
+        # other order can show the generic "did not become ready" message.
         if self._errors:
             self._errors.value = f"{error}"[:len(self._errors)].encode()
+        self._set_status(CaptureProcessStatus.FAILED)
 
     def _prepare_to_run(self) -> bool:
         logger.info("<%s> process started: %s", self._name, self._attrs.inference)
