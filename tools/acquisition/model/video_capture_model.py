@@ -35,6 +35,14 @@ from autotrainer.video.camera_discovery import (
     discover_spin_cameras,
 )
 
+from tools.acquisition.model.capture_binning import (
+    CAPTURE_BINNING_PARAM,
+    OFFSET_ALIASES,
+    base_binning as params_base_binning,
+    capture_binning as params_capture_binning,
+    capture_factor,
+    runtime_capture_params,
+)
 from tools.acquisition.model.user_preferences import UserPreferences
 
 logger = get_verbose_logger(__name__)
@@ -374,20 +382,32 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
         self._is_primary = is_primary
 
     def _runtime_camera_url(self) -> str:
-        """Apply the effective capture role without mutating saved configuration."""
+        """Apply the effective capture role and binning preset without mutating saved configuration."""
         camera_url = self._camera_source.url
         parsed = urllib.parse.urlsplit(camera_url)
-        if parsed.scheme.lower() != "spinnaker":
+        is_spinnaker = parsed.scheme.lower() == "spinnaker"
+        # Resolved from the parsed properties, which include the camera
+        # class defaults (e.g. offsetx/offsety when the config omits them).
+        preset = runtime_capture_params(self._camera_properties)
+        if not is_spinnaker and preset is None:
             return camera_url
+        dropped = set()
+        if is_spinnaker:
+            dropped |= {"primary", "secondary"}
+        if preset is not None:
+            dropped |= {CAPTURE_BINNING_PARAM, *preset, *OFFSET_ALIASES}
         query = [
             (name, value)
             for name, value in urllib.parse.parse_qsl(
                 parsed.query,
                 keep_blank_values=True,
             )
-            if name.lower() not in {"primary", "secondary"}
+            if name.lower() not in dropped
         ]
-        query.append(("primary", "yes" if self._is_primary else "no"))
+        if preset is not None:
+            query.extend(preset.items())
+        if is_spinnaker:
+            query.append(("primary", "yes" if self._is_primary else "no"))
         return urllib.parse.urlunsplit(
             parsed._replace(query=urllib.parse.urlencode(query))
         )
@@ -409,6 +429,47 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
     def shape(self, value):
         prev, self._shape = self._shape, value
         self._on_property_changed(self.SHAPE_PROP, value, prev)
+
+    @property
+    def capture_binning(self) -> Optional[int]:
+        """The capture-binning preset, or None when the camera captures at its base binning."""
+        return params_capture_binning(self._camera_properties)
+
+    @property
+    def base_binning(self) -> Optional[int]:
+        """The saved hbin when it equals vbin; what ``shape`` and the calibration are sized for."""
+        return params_base_binning(self._camera_properties)
+
+    @property
+    def effective_capture_binning(self) -> Optional[int]:
+        """The binning the camera captures at: the preset, else the base."""
+        preset = self.capture_binning
+        return self.base_binning if preset is None else preset
+
+    @property
+    def capture_shape(self) -> Tuple[int, int]:
+        """(rows, cols) of the frames the camera delivers. ``shape`` is what consumers receive.
+
+        An impossible preset reports the base shape here; it fails the capture
+        start (on_prepare_capture), which is where it is reported.
+        """
+        rows, cols = self.shape
+        try:
+            k = capture_factor(self._camera_properties)
+        except ValueError:
+            k = 1
+        return rows * k, cols * k
+
+    def set_capture_binning(self, value: Optional[int]) -> None:
+        """Choose the capture-binning preset; it applies from the next capture start."""
+        if self._video_capture is not None:
+            raise RuntimeError("Capture binning cannot change while capture is active")
+        conf = self.save_configuration()
+        if value is None:
+            conf.params.pop(CAPTURE_BINNING_PARAM, None)
+        else:
+            conf.params[CAPTURE_BINNING_PARAM] = int(value)
+        self.load_configuration(conf)
 
     @property
     def last_error(self) -> str:
@@ -470,6 +531,9 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
         self._last_error = None
         if not self._is_enabled:
             return True
+        # Resolve the capture URL first: an impossible binning preset raises
+        # here, before any queue or reader is allocated for this start.
+        camera_url = None if self._camera_source is None else self._runtime_camera_url()
         self._frame_count = 0
         self._video_frame_index.value = -1
         self._errors.value = b""
@@ -485,7 +549,6 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
         self._video_reader_initialize()
 
         if self._camera_source is not None:
-            camera_url = self._runtime_camera_url()
             if "?" in camera_url:
                 url = camera_url + f"&name={self._name}"
             else:
