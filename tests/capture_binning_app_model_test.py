@@ -147,3 +147,10 @@ def test_the_storage_estimate_uses_the_captured_frame_size():
     )
     # 16 KiB base + 512*512*150*0.25 video + 150*64 timestamps
     assert AppModel._estimate_session_bytes_per_second(app) == 16 * 1024.0 + 9_830_400 + 9_600
+
+
+def test_a_camera_that_does_not_record_has_no_encoder_in_the_metadata():
+    camera = _Camera(preset=2)
+    camera.is_recording_enabled = False
+
+    assert _camera_configured_metadata(camera)["videoEncoder"] is None
