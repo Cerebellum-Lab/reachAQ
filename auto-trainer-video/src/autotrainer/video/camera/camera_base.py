@@ -39,6 +39,8 @@ class CameraBase:
         self._last_frame_id = -1
         self._last_frame_perf_c = -math.inf
         self._last_frame_time = -math.inf
+        self._last_poll_perf_c = -math.inf
+        self._last_arrival_perf_c = -math.inf
 
     @property
     def name(self) -> str:
@@ -96,6 +98,20 @@ class CameraBase:
         return self._last_frame_perf_c
 
     @property
+    def frame_poll_perf_c(self) -> float:
+        """perf_counter just before the poll that returned the last frame."""
+        return self._last_poll_perf_c
+
+    @property
+    def frame_arrival_perf_c(self) -> float:
+        """perf_counter when the last frame was handed to the host.
+
+        Not the same as frame_perf_c, which is an estimate fitted to these
+        host poll times; the latency record needs the measured times.
+        """
+        return self._last_arrival_perf_c
+
+    @property
     def frame_unix_time(self) -> float:
         return self._last_frame_time
 
@@ -134,6 +150,7 @@ class CameraBase:
         self._last_when = time.time_ns()
         self._last_frame_perf_c = get_perf_now()
         self._last_frame_time = time.time()
+        self._last_poll_perf_c = self._last_arrival_perf_c = self._last_frame_perf_c
 
         self._frame_count += 1
         self._last_frame_id += 1

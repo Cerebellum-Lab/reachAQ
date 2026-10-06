@@ -502,6 +502,10 @@ class SpinCam(CameraBase):
                     logger.warning("very long running late acquires ; frame=%s when=%.3f perf_c=%.3f late_delay=%.1f",
                                    self._frame_count, frame_when_sec, estimated_frame_perf_c, late_delay)
                     self._consecutive_late_acquire = 0
+            # Kept as measured, beside the fitted estimate: the latency record
+            # times exposure-to-host from these, not from the fit.
+            self._last_poll_perf_c = p_before
+            self._last_arrival_perf_c = p_after
             return image_result, frame_when, estimated_frame_perf_c, estimated_frame_time
         # end while True.
 
