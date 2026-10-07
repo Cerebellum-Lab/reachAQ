@@ -42,6 +42,15 @@ RECORD_BATCH_DTYPE = numpy.dtype([
     ("lost", "?"),
 ])
 
+# camera_<name>.h5 - the capture process, a few rows when the stream opens and
+# a few when it closes: the camera's own clock latched between two host reads,
+# so the finalizer can place each frame's camera timestamp on perf_counter.
+CLOCK_LATCH_DTYPE = numpy.dtype([
+    ("perf_before", "<f8"),
+    ("camera_ns", "<i8"),
+    ("perf_after", "<f8"),
+])
+
 # record_<name>.h5 - the recorder thread, one row per batch written.
 RECORD_WRITE_DTYPE = numpy.dtype([
     ("first_frame_id", "<i8"),

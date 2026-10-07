@@ -6,6 +6,7 @@ import h5py
 import numpy
 import pytest
 
+from autotrainer.core.latency import schema
 from autotrainer.core.latency.schema import (
     CAMERA_FRAME_DTYPE,
     CLOCK_PAIRS,
@@ -94,6 +95,14 @@ def test_append_after_close_is_ignored(tmp_path):
     writer.close()
     writer.append("frames", _row(1))
     assert writer.close()["rowsWritten"]["frames"] == 0
+
+
+def test_the_clock_latch_row_is_pinned():
+    # Read back by the finalizer from sessions already on disk: a change here
+    # is a schema change, not a refactor.
+    assert schema.CLOCK_LATCH_DTYPE == numpy.dtype([
+        ("perf_before", "<f8"), ("camera_ns", "<i8"), ("perf_after", "<f8"),
+    ])
 
 
 def test_stream_path_follows_the_session(project_info):

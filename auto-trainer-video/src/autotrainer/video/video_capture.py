@@ -37,6 +37,7 @@ from autotrainer.core.latency import (
 )
 from autotrainer.core.latency.schema import (
     CAMERA_FRAME_DTYPE,
+    CLOCK_LATCH_DTYPE,
     POSE_PUT_NOT_ATTEMPTED,
     POSE_PUT_OK,
     POSE_PUT_OVERFLOW,
@@ -57,6 +58,11 @@ logger = get_verbose_logger(__name__)
 # second is fast enough that an operator sees a drop while the animal is still
 # in the box, and slow enough to be invisible against a 150 fps capture loop.
 FRAME_STATS_REPORT_PERIOD = 0.5
+
+# Camera clock latches taken back to back when a latency stream opens and again
+# when it closes. The finalizer keeps the tightest, and three cost well under a
+# frame period (each is a USB round trip, about 0.2 ms on a Blackfly S).
+CLOCK_LATCHES_PER_MARK = 3
 
 
 # Always keep that extra more nbr of frames for cameras recording sync purpose:
@@ -265,6 +271,10 @@ class VideoCapture(Process):
         # the capture loop adds to it; the command thread and process exit
         # wait on it so no file is still open past them.
         self._latency_closers: List[threading.Thread] = []
+        # The stream still owed the clock latches taken after its first frame.
+        # Set by the command thread as a stream opens; only the capture loop
+        # latches, because it is the thread that talks to the camera.
+        self._latency_latch_pending: Optional[LatencyStreamWriter] = None
 
         self._command_handlers: Dict[CaptureCommandKind, Callable] = {
             CaptureCommandKind.TERMINATE: self._user_terminate,
@@ -981,12 +991,18 @@ class VideoCapture(Process):
                         cam_frame_id, int(when), camera.frame_poll_perf_c,
                         camera.frame_arrival_perf_c, perf_now, pose_put_result,
                     ))
+                    if self._latency_latch_pending is latency:
+                        # The fresh stream has its first frame: place the
+                        # camera clock on the host's from where it starts.
+                        self._latency_latch_pending = None
+                        self._append_clock_latches(camera, latency)
                     if self._latency_close_requested and record_start_stop_frame_idx is None:
                         # The recording has wound down (or this camera never
                         # recorded): every frame of it is in the stream now.
                         # Not waited for: closing flushes to a disk the ffmpeg
                         # writers may have saturated, and the watchdog watches
                         # this loop.
+                        self._append_clock_latches(camera, latency)
                         self._close_latency(wait=False)
 
                 if img_q is not None:
@@ -1198,15 +1214,19 @@ class VideoCapture(Process):
         if project is None or not latency_recording_enabled():
             return
         try:
-            self._latency = LatencyStreamWriter(
+            writer = LatencyStreamWriter(
                 latency_stream_path(project, f"camera_{self._name}"),
-                {"frames": CAMERA_FRAME_DTYPE, "record_batches": RECORD_BATCH_DTYPE},
+                {"frames": CAMERA_FRAME_DTYPE, "record_batches": RECORD_BATCH_DTYPE,
+                 "clock_latches": CLOCK_LATCH_DTYPE},
                 attrs={
                     "camera": self._name,
                     "camera_index": self._camera_idx,
                     "is_primary": bool(self._attrs.is_primary),
                 },
             )
+            # Owed its latches before the loop can see it, so its first frame gets them.
+            self._latency_latch_pending = writer
+            self._latency = writer
         except Exception:
             logger.exception("<%s> latency stream could not start; recording continues without it",
                              self._name)
@@ -1256,6 +1276,26 @@ class VideoCapture(Process):
         for closer in list(self._latency_closers):
             # close() gives up on its own after 10 s; this only outlasts that.
             closer.join(15)
+
+    def _append_clock_latches(self, camera: CameraBase, latency: LatencyStreamWriter) -> None:
+        """Latch the camera clock a few times, back to back, into the stream.
+
+        The finalizer pairs frames with NI exposure edges through these, by
+        where the camera says each exposure happened rather than when the host
+        received it. A camera with no clock to latch answers None, which ends
+        the mark after one call; a latch that raises is logged and ends it too.
+        Neither reaches the capture loop.
+        """
+        for _ in range(CLOCK_LATCHES_PER_MARK):
+            try:
+                latch = camera.latch_clock()
+            except Exception:
+                logger.warning("<%s> camera clock latch failed; the recording continues without it",
+                               self._name, exc_info=True)
+                return
+            if latch is None:
+                return
+            latency.append("clock_latches", latch)
 
     def _process_stim_frame(
         self,
