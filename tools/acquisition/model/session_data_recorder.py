@@ -8,6 +8,7 @@ import math
 import threading
 import time
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -21,6 +22,8 @@ import numpy as np
 
 from autotrainer.core import ProjectInfo
 from tools.acquisition.model.session_boundary import SessionBoundary
+from tools.acquisition.model.latency_event_log import LatencyEventLog
+from tools.latency import finalize_session_latency
 from tools.acquisition.model.atomic_session_io import (
     atomic_publish_file,
     atomic_write_json,
@@ -258,6 +261,9 @@ class SessionDataRecorder:
         self._pending_stop_end_perf: Optional[float] = None
         self._nidaq_tone_edge_callback = nidaq_tone_edge_callback
         self._live_tone_states = {}
+        # GUI-process latency rows for the recording; the finalizer joins them
+        # with the per-process streams.
+        self._latency_events = LatencyEventLog()
 
         self._system_message_handler = system_message_handler
         self._hardware_model = hardware_model
@@ -265,12 +271,21 @@ class SessionDataRecorder:
             system_message_handler.decoded_message_received += self._on_device_message
         if hardware_model is not None:
             hardware_model.device_event += self._on_hardware_device_event
+            # Looked up on the class: an Events-based model answers a missing
+            # instance attribute with EventsException (or a fresh slot), never
+            # AttributeError, so getattr's default would not guard it.
+            if hasattr(type(hardware_model), "set_can_latency_observer"):
+                hardware_model.set_can_latency_observer(self._latency_events.record_can)
         if event_manager is not None:
             event_manager.register_post_observer(self._on_structured_event)
         laser_model.trace_received += self._on_laser_trace
         laser_model.property_changed += self._on_laser_property_changed
         self._log_handler = _SessionLogHandler(self)
         logging.getLogger().addHandler(self._log_handler)
+
+    @property
+    def latency_events(self) -> LatencyEventLog:
+        return self._latency_events
 
     def arm(
         self,
@@ -292,6 +307,7 @@ class SessionDataRecorder:
                     "previous session finalization is still pending; retry or abort it"
                 )
             self._armed = True
+            self._latency_events.begin()
             # BehaviorAlgorithm assigns the next session index immediately
             # after arming and before enabling the shared camera trigger.
             # Keep this object reference so the recorder follows that atomic
@@ -351,6 +367,36 @@ class SessionDataRecorder:
             self._pressure_samples_since_start = 0
             self._pressure.clear()
 
+    @contextmanager
+    def _locked_then_log(self):
+        """Hold the recorder lock; log what the block collected once it is released.
+
+        The session log handler takes this lock, so logging while holding it can
+        deadlock against a thread that is mid-emit and holds the handler's own
+        lock. The block appends (message, error) pairs to the list it is given.
+        """
+        failures = []
+        try:
+            with self._lock:
+                yield failures
+        finally:
+            for message, error in failures:
+                logging.getLogger(__name__).error(message, exc_info=error)
+
+    def _end_latency_events(self, failures: list, consequence: str):
+        """End the latency log; None if that failed, so the caller carries on.
+
+        The log is a diagnostic and must not cost the session its finalization
+        or leave the recorder armed. Call with the recorder lock held: the
+        failure is added to `failures` to be logged after the lock is released.
+        """
+        try:
+            return self._latency_events.end()
+        except Exception as error:
+            failures.append((
+                f"Latency event log could not be ended; {consequence}", error))
+            return None
+
     def stop(self, end_perf: float):
         with self._event_capture_lock:
             self._event_capture_enabled = False
@@ -358,9 +404,11 @@ class SessionDataRecorder:
         with self._lock:
             self._pending_stop_end_perf = float(end_perf)
         self._stop_nidaq_thread()
-        with self._lock:
+        with self._locked_then_log() as failures:
             if not self._armed or self._project is None or self._start_perf is None:
                 self._pending_stop_end_perf = None
+                self._end_latency_events(
+                    failures, "the recorder is cleared without it")
                 self._clear_locked()
                 return None
             project = self._project
@@ -395,6 +443,13 @@ class SessionDataRecorder:
                 source_results["laser_outputs"] = laser_result
             trial_records = tuple(self._trial_records)
             trial_summary = dict(self._trial_summary)
+            # end() either way, so the log stops. None when the switch was off
+            # at arm: _write_session then writes no events.h5, and a session
+            # recorded with the record off carries no latency files at all.
+            latency_events = self._end_latency_events(
+                failures, "the session is finalized without it")
+            if not self._latency_events.enabled:
+                latency_events = None
             snapshot = {
                 "project": project,
                 "start_perf": start_perf,
@@ -416,6 +471,7 @@ class SessionDataRecorder:
                 "trial_records": trial_records,
                 "trial_summary": trial_summary,
                 "metadata_generation_id": self._metadata_generation_id,
+                "latency_events": latency_events,
             }
             self._armed = False
             self._pending_stop_end_perf = None
@@ -496,7 +552,7 @@ class SessionDataRecorder:
             self._event_capture_enabled = False
             self._drain_event_queue()
         self._stop_nidaq_thread()
-        with self._lock:
+        with self._locked_then_log() as failures:
             spool_path = self._nidaq_spool_path
             pending = self._pending_finalization
             if pending is not None:
@@ -505,6 +561,8 @@ class SessionDataRecorder:
                     spool_path = pending_source.path
             self._pending_finalization = None
             self._pending_stop_end_perf = None
+            self._end_latency_events(
+                failures, "the recorder is cleared without it")
             self._clear_locked()
         if spool_path is not None:
             spool_path.unlink(missing_ok=True)
@@ -841,6 +899,10 @@ class SessionDataRecorder:
         if manifest_path.is_file():
             with manifest_path.open("r", encoding="utf-8") as stream:
                 manifest = json.load(stream)
+            # A raw latency stream is listed here only if _write_session listed it. One
+            # it left out was still being closed by its writer then, and nothing in this
+            # later rewrite can say that it is final now.
+            listed = {entry.get("path") for entry in manifest.get("files", ())}
             manifest_paths = (
                 streams_dir / "device.csv",
                 streams_dir / "events.csv",
@@ -850,6 +912,9 @@ class SessionDataRecorder:
                 streams_dir.parent / "logs" / "session.log",
                 alignment_path,
                 *sorted((streams_dir / "tracking").glob("*.json")),
+                streams_dir / "latency.h5",
+                *(path for path in sorted((streams_dir / "latency").glob("*.h5"))
+                  if path.relative_to(streams_dir.parent).as_posix() in listed),
             )
             manifest["files"] = [
                 file_manifest_entry(path, relative_to=streams_dir.parent)
@@ -1534,6 +1599,7 @@ class SessionDataRecorder:
         trial_records=(),
         trial_summary=None,
         metadata_generation_id=None,
+        latency_events=None,
     ):
         session_dir = Path(project.get_session_path().location)
         streams_dir = session_dir / "streams"
@@ -1964,6 +2030,39 @@ class SessionDataRecorder:
             generation_id=metadata_generation_id,
             validate=SessionDataRecorder._validate_h5,
         )
+        latency_dir = streams_dir / "latency"
+        if latency_events is not None:
+            # Diagnostic data: a failure here is logged and the session
+            # publishes without these rows.
+            try:
+                LatencyEventLog.write(latency_dir / "events.h5", latency_events)
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "Latency events were not written; the session publishes without them")
+        # The latency analysis. It does not raise, and a failure becomes a
+        # status in the metadata rather than a reason to hold the session back.
+        try:
+            latency_status = finalize_session_latency(
+                session_dir,
+                primary_camera="" if boundary is None else str(boundary.primary_camera),
+                session_id=project.short_id,
+            )
+        except Exception as error:
+            logging.getLogger(__name__).exception("Latency finalization failed")
+            latency_status = {"status": "failed", "reasons": [f"{type(error).__name__}: {error}"]}
+        # The capture and pose processes close their raw streams with no handshake, so
+        # a close slower than the finalizer's open retry leaves a stream that is still
+        # changing. Hashing it into the manifest would record bytes that then change,
+        # and session.manifest would fail on the mismatch. A stream the finalizer could
+        # not read is left unlisted; it stays on disk for the rebuild CLI.
+        unlisted_latency = {
+            str(item.get("path")) for item in (latency_status.get("unreadable") or ())
+            if isinstance(item, dict)
+        }
+        if unlisted_latency:
+            logging.getLogger(__name__).warning(
+                "Latency streams left out of the stream manifest because they could not be read: %s",
+                ", ".join(sorted(unlisted_latency)))
         source_results = {} if source_results is None else dict(source_results)
         nidaq_health = SessionDataRecorder._nidaq_stream_health(
             nidaq_chunks,
@@ -2178,6 +2277,9 @@ class SessionDataRecorder:
             Path(project.get_frame_timing_path()),
             streams_dir / "nidaq.h5",
             *sorted((streams_dir / "tracking").glob("*.json")),
+            streams_dir / "latency.h5",
+            *(path for path in sorted(latency_dir.glob("*.h5"))
+              if path.relative_to(session_dir).as_posix() not in unlisted_latency),
         )
         stream_manifest = {
             "schemaVersion": 1,
@@ -2207,6 +2309,7 @@ class SessionDataRecorder:
             "sessionComplete": not incomplete_reasons,
             "incompleteReasons": tuple(incomplete_reasons),
             "enabledSources": finalized_sources,
+            "latency": latency_status,
         }
 
     @staticmethod

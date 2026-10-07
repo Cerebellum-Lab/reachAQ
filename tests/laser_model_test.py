@@ -811,3 +811,34 @@ def test_a_manual_pulse_event_needs_a_train_that_is_waited_for():
 
     assert told == []
     assert model.last_command_volts == {1: 0.0}
+
+
+def test_direct_trigger_records_when_validation_finished():
+    controller = _Controller()
+    model = LaserModel(controller)
+    profile = LaserPulseProfile("pulse", 1, 2.5, 5)
+    model.prepare_pulse_profile(profile, SOFTWARE, _recipe())
+    model.bind_direct_trigger_nonce("trial-op", "once")
+    trigger_queue = queue.Queue(maxsize=1)
+    result_ready = threading.Event()
+    results = []
+    model.start_direct_trigger_receiver(
+        trigger_queue,
+        lambda result: (results.append(result), result_ready.set()),
+    )
+    try:
+        trigger_queue.put_nowait({
+            "operation_id": "trial-op",
+            "session_generation": 3,
+            "logical_trial_id": 4,
+            "attempt_id": 1,
+            "nonce": "once",
+            "stim_frame_id": 9,
+            "ipc_send_perf_time": time.perf_counter(),
+        })
+        assert result_ready.wait(1)
+        result = results[0]
+        assert (result["ipc_receive_perf_time"] <= result["validated_perf_time"]
+                <= result["daqmx_start_entry_perf_time"])
+    finally:
+        model.stop_direct_trigger_receiver()

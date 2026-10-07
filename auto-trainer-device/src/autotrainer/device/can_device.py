@@ -254,6 +254,11 @@ class CanDevice(Device):
         self._commands_handler_watchdog_perf_c = math.nan
         self._pellet_status_check_thread: Optional[threading.Thread] = None
         self._next_clock_sync_perf = time.perf_counter() + 30.0
+        # Optional latency-record hook, called as (stage, fields) from the
+        # thread that reaches each stage: the caller (enqueue), the command
+        # thread (dequeue, send) and the bus reader (ack). Set by the host app;
+        # a failure in it never reaches the command path.
+        self.latency_observer: Optional[Callable[[str, dict], None]] = None
         # internal data cache:
         self._previous_stepper_status_pos_perf_c: MotorStatusCacheT = {}  # (None, -math.inf)
         self._previous_servo_status_pos_perf_c: MotorStatusCacheT = {}  # (None, -math.inf)
@@ -667,6 +672,8 @@ class CanDevice(Device):
                 break
             kind, data, ctx = raw
             raw = kind, data, ctx, p_now
+            if ctx is not None and p_now is not None:
+                self._latency("dequeue", token=str(ctx), perf=p_now)
             found_board_with_uuid_ack = None
             if kind is _uuid_ack:
                 msg_uuid, msg_perf_c = data
@@ -716,6 +723,7 @@ class CanDevice(Device):
             #
             p_now = get_perf_now()
             retrying_board = None
+            send_entry = send_return = None
             if kind is _uuid_ack or kind is not None:
                 # ensure we don't try to retry a command when we got an uuid ack
                 search_retry_boards = {}
@@ -870,6 +878,7 @@ class CanDevice(Device):
                     logger.warning("unhandled command queue message: %s", kind)
                     continue
                 success = False
+                send_entry = time.perf_counter()
                 for _ in range(self.default_command_write_failed_repeat_count):
                     logger.debug("executing cmd %s with ctx %s", kind, ctx)
                     if isinstance(data, SystemDataArgsKwargs):
@@ -893,6 +902,7 @@ class CanDevice(Device):
                         context=None if ctx is None else str(ctx),
                     )
                     raise err
+                send_return = time.perf_counter()
                 target_board.kind = kind  # only used for debug/log
             # end possible handling cases
             if self._want_exit.is_set():
@@ -900,6 +910,14 @@ class CanDevice(Device):
             #
             # get CAN uuid after, to distinguish both cases (with or without uuid used):
             after_uuid = self._interface.uuid()
+            if ctx is not None and send_entry is not None:
+                # The handler call encloses bus.send; the uuid binds this token
+                # to the board's ack, which arrives by uuid alone.
+                self._latency(
+                    "send", token=str(ctx), kind=getattr(kind, "name", str(kind)),
+                    can_uuid=after_uuid if after_uuid != before_uuid else None,
+                    perf=send_entry, perf_end=send_return,
+                )
             #
             if ctx is not None and target_board.ctx != ctx:
                 logger.debug("attaching ctx %s to target_board %s", ctx, target_board.target)
@@ -952,11 +970,26 @@ class CanDevice(Device):
                         target_board.ctx = None
                     target_board.kind = None
 
+    def _latency(self, stage: str, **fields) -> None:
+        observer = getattr(self, "latency_observer", None)
+        if observer is None:
+            return
+        try:
+            observer(stage, fields)
+        except Exception:
+            logger.exception("CAN latency observer failed")
+
     def _handle_ack(self, msg: Acknowledge):
         cur_can_uuid = self._interface.uuid()
         perf_c = msg.perf_c
         logger.debug("Received ack: target=%s - uuid=%s ; cur_can_uuid=%s ; perf_c=%.3f",
                      msg.target, msg.uuid, cur_can_uuid, perf_c)
+        kernel_ns = getattr(msg, "timestamp_ns", None)
+        self._latency(
+            "ack", can_uuid=int(msg.uuid), perf=perf_c,
+            kernel_wall=(kernel_ns / 1e9
+                         if isinstance(kernel_ns, int) and kernel_ns > 0 else None),
+        )
         self._put_to_cmd_queue((_uuid_ack, (msg.uuid, perf_c), None))
 
     @property
@@ -1299,6 +1332,9 @@ class CanDevice(Device):
         if self._interface is None:
             return
 
+        if context is not None:
+            self._latency("enqueue", token=str(context),
+                          kind=getattr(kind, "name", str(kind)), perf=time.perf_counter())
         self._put_to_cmd_queue((kind, data, context))
         return
 

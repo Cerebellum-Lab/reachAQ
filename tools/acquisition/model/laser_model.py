@@ -987,6 +987,7 @@ class LaserModel(ObservableObject):
                     if not prepared["enabled"]:
                         raise RuntimeError("direct trigger arrived before pellet presentation")
                     operation = prepared["operation"]
+                result["validated_perf_time"] = time.perf_counter()
                 result["daqmx_start_entry_perf_time"] = time.perf_counter()
                 operation.trigger()
                 result["daqmx_start_return_perf_time"] = time.perf_counter()

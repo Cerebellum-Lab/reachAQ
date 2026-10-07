@@ -78,6 +78,9 @@ class SpinCamDefaultParams:
 class SpinCam(CameraBase):
 
     _cameras: Dict[str, "SpinCam"] = {}  # class level cache
+    # A latch that raised is logged once per process: the latch is diagnostic,
+    # taken a few times per recording, and nothing in the recording waits on it.
+    _latch_error_logged = False
 
     default_params = dataclasses.asdict(SpinCamDefaultParams())
 
@@ -509,6 +512,10 @@ class SpinCam(CameraBase):
                     logger.warning("very long running late acquires ; frame=%s when=%.3f perf_c=%.3f late_delay=%.1f",
                                    self._frame_count, frame_when_sec, estimated_frame_perf_c, late_delay)
                     self._consecutive_late_acquire = 0
+            # Kept as measured, beside the fitted estimate: the latency record
+            # times exposure-to-host from these, not from the fit.
+            self._last_poll_perf_c = p_before
+            self._last_arrival_perf_c = p_after
             return image_result, frame_when, estimated_frame_perf_c, estimated_frame_time
         # end while True.
 
@@ -643,6 +650,40 @@ class SpinCam(CameraBase):
         self._frame_count += 1
 
         return frame, self._last_when
+
+    def latch_clock(self) -> Optional[Tuple[float, int, float]]:
+        """The camera clock latched between two perf_counter reads, or None.
+
+        TimestampLatch copies the clock that image timestamps (GetTimeStamp)
+        come from into TimestampLatchValue, in ns. The copy happens somewhere
+        between the two perf reads, which places the camera clock on the host's
+        to within half their gap; the value is read after the second read, so
+        that transfer stays out of the bracket. Never raises: a camera without
+        the nodes returns None, and so does one that fails, logged once.
+        """
+        try:
+            node_map = self._node_map
+            if node_map is None:
+                return None
+            latch_node = node_map.GetNode("TimestampLatch")
+            value_node = node_map.GetNode("TimestampLatchValue")
+            if latch_node is None or value_node is None:
+                return None
+            latch = PySpin.CCommandPtr(latch_node)
+            value = PySpin.CIntegerPtr(value_node)
+            if not (PySpin.IsAvailable(latch) and PySpin.IsWritable(latch)
+                    and PySpin.IsAvailable(value) and PySpin.IsReadable(value)):
+                return None
+            perf_before = time.perf_counter()
+            latch.Execute()
+            perf_after = time.perf_counter()
+            return perf_before, int(value.GetValue()), perf_after
+        except Exception as err:
+            if not SpinCam._latch_error_logged:
+                SpinCam._latch_error_logged = True
+                logger.warning("<%s> camera clock latch failed (further failures are not logged): %s",
+                               self._name, err)
+            return None
 
     def set_property(self, name: str, value: str) -> bool:
         if name == "primary":
