@@ -24,6 +24,7 @@ from autotrainer.behavior.pellet_trial import (
     TrialOutcome,
 )
 from autotrainer.device import CanFailure, CanFailureKind, Tone, Target
+from autotrainer.inference import InferenceStatus
 from tools.acquisition.model.app_model import (
     app_status_to_api_app_mode,
     app_status_to_behavior_algo_status,
@@ -34,6 +35,7 @@ from tools.acquisition.model.session_boundary import SessionBoundary
 from tools.acquisition.model.stimulus_profile_repository import (
     PROFILE_SCHEMA_VERSION,
 )
+from tools.acquisition.model.inference_model import InferenceModel
 from tools.acquisition.model.intertrial_analysis import (
     IntertrialAnalysisRequest,
     IntertrialAnalysisResult,
@@ -1573,6 +1575,105 @@ def test_final_metadata_uses_canonical_boundary_not_stale_project_timestamp(
         "metadata.json",
         "metadata.yaml",
     }
+
+
+def test_inference_returning_to_live_after_stop_keeps_the_session_figures(
+    app_model,
+):
+    """After Stop the pose process handles EOF_RECORDING, goes offline and
+    comes straight back to live, while the session is still being finalized.
+
+    That used to re-baseline the counters for preview. The final freeze then
+    used the last recorded frame's time, which predates the new baseline, so
+    every healthy session on christielab10 saved 0.0 s and 0 frames, and the
+    panel showed the same after Stop.
+    """
+    telemetry = app_model.session_telemetry
+    _, token = app_model._recording_session.begin_record(
+        app_model.project.short_id, {},
+    )
+    app_model._recording_session.transition(
+        SessionRecordingStatus.RECORDING,
+        expected=(SessionRecordingStatus.ARMING,),
+        token=token,
+    )
+    telemetry.begin(10.0)
+    telemetry.record_capture(0, acquired=18_000, dropped=0)
+    telemetry.record_capture(1, acquired=18_000, dropped=0)
+    telemetry.record_inference(17_900, mean_ms=5.0, max_ms=13.0)
+    app_model._recording_session.transition(
+        SessionRecordingStatus.STOPPING,
+        expected=(SessionRecordingStatus.RECORDING,),
+        token=token,
+    )
+    app_model._on_session_capture_ended(RecordingEndingReason.MANUAL_STOP)
+    stopped = telemetry.summary()
+
+    app_model._on_inference_property_changed(
+        InferenceModel.STATUS, InferenceStatus.live, None,
+    )
+    telemetry.record_inference(18_200, mean_ms=6.0, max_ms=7.0)
+    # _complete_stopped_recording, with the last recorded frame's time.
+    telemetry.end(130.0)
+
+    assert telemetry.summary() == stopped
+    assert stopped["framesAcquired"] == 18_000
+    assert stopped["framesInferenced"] == 17_900
+
+
+def test_session_metadata_keeps_the_capture_figures_it_was_finalized_with(
+    app_model,
+    tmp_path,
+):
+    """A note saved after Stop rewrites the session metadata. By then the
+    counters may have been re-baselined for preview - acquisition restarted,
+    inference came back to live - and the session's figures must not follow.
+    """
+    telemetry = app_model.session_telemetry
+    _, token = app_model._recording_session.begin_record(
+        app_model.project.short_id, {},
+    )
+    app_model._recording_session.set_pending_end(12.5, token)
+    app_model._recording_session.set_boundary(SessionBoundary(
+        session_id=app_model.project.short_id,
+        primary_camera="left",
+        primary_frame_id=42,
+        start_perf_time=10.0,
+        start_wall_time=100.0,
+        camera_when=1_000_000.0,
+    ), token)
+    telemetry.begin(10.0)
+    telemetry.record_capture(0, acquired=375, dropped=0)
+    telemetry.record_inference(370, mean_ms=5.0, max_ms=13.0)
+    app_model._recording_session.transition(
+        SessionRecordingStatus.STOPPING,
+        expected=(SessionRecordingStatus.ARMING,),
+        token=token,
+    )
+    with mock.patch.object(
+        app_model._session_data_recorder, "stop"
+    ), mock.patch.object(
+        app_model, "_save_project_metadata"
+    ), mock.patch.object(
+        app_model._intertrial_analysis, "is_idle", return_value=False,
+    ), mock.patch.object(
+        app_model, "_wait_and_finish_intertrial_session",
+    ):
+        app_model._complete_stopped_recording(app_model.project)
+    finalized = telemetry.summary()
+
+    telemetry.begin()
+    telemetry.record_capture(0, acquired=900, dropped=0)
+    telemetry.record_inference(880, mean_ms=6.0, max_ms=7.0)
+    project = app_model.project.to_local_value()
+    output = tmp_path / "metadata"
+    app_model._save_metadata(project, project.when, str(output), project.session)
+
+    saved = json.loads(output.with_suffix(".json").read_text())
+    assert saved["capture"] == finalized
+    assert saved["capture"]["elapsedSeconds"] == 2.5
+    assert saved["capture"]["framesAcquired"] == 375
+    assert saved["capture"]["framesInferenced"] == 370
 
 
 def test_metadata_pair_is_not_replaced_when_yaml_serialization_fails(
