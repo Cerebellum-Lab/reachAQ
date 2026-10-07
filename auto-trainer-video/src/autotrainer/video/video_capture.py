@@ -665,19 +665,28 @@ class VideoCapture(Process):
             synced_frame_idx = None  # don't forget now.
 
             if net_q is not None:
-                # we might eventually have written some extra frame(s) vs the other camera(s) used in
-                # the net_q, so this pad_to_batch_size :
-                net_q.pad_to_batch_size(net_q_idx, net_empty_frame, cnt_net_q_put, timeout=5)
+                # Live inference is told here that the recording has ended.
+                # Failing to tell it must not end this loop: the recording is
+                # complete, the report below has not been sent yet, and a dead
+                # loop takes the camera with it. On the rig, a pose queue whose
+                # reader had died timed this hand-off out after 5 s on every Stop.
+                try:
+                    # we might eventually have written some extra frame(s) vs the other camera(s) used in
+                    # the net_q, so this pad_to_batch_size :
+                    net_q.pad_to_batch_size(net_q_idx, net_empty_frame, cnt_net_q_put, timeout=5)
+                    # now
+                    logger.info(
+                        "sending EOF_RECORDING batch frame indices to signify eof recording. "
+                        "last frame_id: %s when=%.4f perf=%.4f",
+                        cam_frame_id, when_secs, frame_perf_c)
+                    net_q.put_frame_index_category(net_empty_frame, FrameIndexCategory.EOF_RECORDING,
+                                                   cam_idx=net_q_idx, timeout=5)
+                except Exception as err:
+                    logger.exception("<%s> could not hand the end of recording to live inference: %s",
+                                     self._name, err)
                 # required: must set back to 0 given will now be same in all cams,
                 # and also aligned with frames_per_camera_per_batch
                 cnt_net_q_put = 0
-                # now
-                logger.info(
-                    "sending EOF_RECORDING batch frame indices to signify eof recording. "
-                    "last frame_id: %s when=%.4f perf=%.4f",
-                    cam_frame_id, when_secs, frame_perf_c)
-                net_q.put_frame_index_category(net_empty_frame, FrameIndexCategory.EOF_RECORDING,
-                                               cam_idx=net_q_idx, timeout=5)
 
             self._set_status(CaptureProcessStatus.RUNNING)
 

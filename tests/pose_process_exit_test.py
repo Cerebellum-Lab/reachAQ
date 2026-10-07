@@ -194,10 +194,22 @@ def _spawning_inference(monkeypatch):
     model._offline_analysis_thread = None
     model._intersession_block = None
     model._intersession_detection = None
+    model._live_queue = None
     return model
 
 
-_LIVE_QUEUE = SimpleNamespace(shape=(256, 256), frames_per_camera=1)
+class _LiveQueue:
+    shape = (256, 256)
+    frames_per_camera = 1
+
+    def __init__(self):
+        self.consumer_closed = False
+
+    def close_consumer(self):
+        self.consumer_closed = True
+
+
+_LIVE_QUEUE = _LiveQueue()
 
 
 def test_inference_is_loading_from_the_moment_its_process_is_spawned(monkeypatch):
@@ -260,6 +272,44 @@ def test_a_process_that_dies_before_the_model_reports_loading_is_caught(monkeypa
     assert model._pose_process is None
     assert model.status == InferenceStatus.stopped
     assert model.pose_process_error == "pose process exited with code 1"
+
+
+# -- the live queue once nothing reads it ---------------------------------
+#
+# The cameras hand the end of a recording to live inference with a blocking put
+# into the live queue. With the pose process stopped nothing frees a slot, and
+# on the rig every Stop after a pose crash waited 5 s per camera and then
+# raised out of the capture loop. Stopping inference says so to the queue.
+
+def test_stopping_inference_tells_the_live_queue_nothing_reads_it(monkeypatch):
+    model = _spawning_inference(monkeypatch)
+    live_queue = _LiveQueue()
+    model.start(live_queue)
+    model._cmd_queue.process = model._pose_process
+
+    model.stop()
+
+    assert live_queue.consumer_closed
+
+
+def test_a_pose_process_that_dies_leaves_the_live_queue_closed(monkeypatch):
+    model = _spawning_inference(monkeypatch)
+    live_queue = _LiveQueue()
+    model.start(live_queue)
+    model._pose_process.exitcode = 0  # raised in predict, and returned
+
+    model._check_pose_process_exited()
+
+    assert live_queue.consumer_closed
+
+
+def test_a_live_queue_is_not_closed_while_its_reader_runs(monkeypatch):
+    model = _spawning_inference(monkeypatch)
+    live_queue = _LiveQueue()
+
+    model.start(live_queue)
+
+    assert not live_queue.consumer_closed
 
 
 # -- carrying the reason --------------------------------------------------
