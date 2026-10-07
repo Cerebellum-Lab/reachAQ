@@ -49,10 +49,11 @@ def latency_stream_path(project, name: str) -> Path:
 class LatencyStreamWriter:
     """One HDF5 file of compound datasets, appended in batches by a daemon thread.
 
-    append() never raises and never waits: invalid dataset names, bad row data
-    (wrong arity, type error, overflow), and a full queue all result in silent
-    rejection and a count in stats["rowsRejected"]. The writer thread always
-    stops within the caller-supplied timeout, even if writes fail.
+    append() never raises and never waits: invalid dataset names and bad row data
+    (wrong arity, type error, overflow) are rejected and counted in
+    stats["rowsRejected"], and a full queue drops the batch and counts it in
+    stats["rowsDropped"], with no log. The writer thread always stops within the
+    caller-supplied timeout, even if writes fail.
     """
 
     def __init__(
