@@ -367,3 +367,25 @@ def test_a_recording_rebaselines_counters_that_were_already_running():
 
     assert telemetry.frames_acquired == 150
     assert telemetry.frames_inferenced == 150
+
+
+def test_stim_p99_and_latency_status_are_reported(telemetry):
+    from tools.acquisition.model.session_telemetry import describe_latency_status
+
+    telemetry.begin(0.0)
+    telemetry.record_stim_p99(3.4)
+    telemetry.set_latency_status(describe_latency_status(
+        {"status": "complete", "loops": {"pose": {"summary": {"confidence": "mixed"}}}}))
+
+    assert telemetry.stim_p99_ms == pytest.approx(3.4)
+    assert telemetry.latency_status == "complete (mixed)"
+    assert telemetry.summary()["stimP99Ms"] == pytest.approx(3.4)
+
+
+def test_a_new_session_clears_the_stim_p99_and_status(telemetry):
+    telemetry.begin(0.0)
+    telemetry.record_stim_p99(3.4)
+    telemetry.set_latency_status("complete (mixed)")
+    telemetry.begin(10.0)
+    assert math.isnan(telemetry.stim_p99_ms)
+    assert telemetry.latency_status == ""

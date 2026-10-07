@@ -99,7 +99,8 @@ class FixedArrayMultiQueue:
 
         # a single shared array for all frames indices of all cameras:
         self._frame_indices = mp_ctx.RawArray(ctypes.c_int64, self._depth * self._frames_per_camera * self._cam_count)
-        # The host clock time each frame was exposed, carried beside its index.
+        # The host clock time of each frame, carried beside its index. It is
+        # fitted to host arrival (spinnaker_cam._capture), not to exposure.
         #
         # Without this the consumer knows WHICH frames it has but not WHEN they
         # were taken, so it can time its own work and nothing else. Sensor to

@@ -202,7 +202,7 @@ from tools.acquisition.model.softmouse_spreadsheet_source import (
     SoftMouseSpreadsheetSource,
 )
 from tools.acquisition.model.session_data_recorder import SessionDataRecorder
-from tools.acquisition.model.session_telemetry import SessionTelemetry
+from tools.acquisition.model.session_telemetry import SessionTelemetry, describe_latency_status
 from tools.acquisition.model.stim_latency_budget import StimLatencyBudget
 from tools.acquisition.model.atomic_session_io import (
     atomic_publish_file,
@@ -5945,6 +5945,9 @@ class AppModel(ObservableObject):
         self._stim_latency_budget.observe(payload)
         try:
             self._session_data_recorder.latency_events.record_stim_dispatch(payload)
+            total = self._stim_latency_budget.summary().total
+            if total is not None and math.isfinite(total.p99):
+                self._session_telemetry.record_stim_p99(total.p99 * 1000.0)
         except Exception:
             logger.exception("Direct stim dispatch latency row was not recorded")
         perf_time = float(
@@ -10038,6 +10041,8 @@ class AppModel(ObservableObject):
                     logger.warning("NI-DAQ alignment boundary update became stale")
             self._recording_session.set_stream_result(stream_result)
             self._latency_status = dict(stream_result.get("latency") or {})
+            self._session_telemetry.set_latency_status(
+                describe_latency_status(self._latency_status))
             if not self._recording_session.data_complete:
                 message = (
                     "Session auxiliary data is incomplete: "
