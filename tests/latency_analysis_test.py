@@ -60,6 +60,8 @@ def test_pose_loop_without_ni_falls_back_to_arrival_and_says_so():
     assert stages["sensor_to_pose"]["confidence"] == b"software"
     assert stages["sensor_to_pose"]["p50"] == pytest.approx(0.006)
     assert result["summary"]["coverage"] == pytest.approx(2 / 3)
+    # Software fallback does not emit exposure_to_arrival (would measure inter-camera skew, not exposure time)
+    assert "exposure_to_arrival" not in stages
 
 
 def test_recording_loop_joins_writes_by_first_frame():
@@ -74,6 +76,42 @@ def test_recording_loop_joins_writes_by_first_frame():
     assert result["status"] == "complete"
     assert stages["left.recorder_queue"]["p50"] == pytest.approx(0.0029)
     assert stages["left.write"]["p50"] == pytest.approx(0.002)
+
+
+def test_recording_loop_lost_rows_do_not_join_retried_batch():
+    batches = np.zeros(2, dtype=RECORD_BATCH_DTYPE)
+    batches[0] = (0, 59, 60, 1.0, 4.0, 128, True)  # Lost row with long put_block
+    batches[1] = (0, 89, 90, 4.1, 4.1001, 128, False)  # Recovered row (same first_frame_id)
+    writes = np.zeros(1, dtype=RECORD_WRITE_DTYPE)
+    writes[0] = (0, 89, 90, 4.2, 4.201, 4.21)
+
+    result = analysis.recording_loop({"left": (batches, writes)})
+
+    stages = _stages(result)
+    # Only the recovered batch (batch 1) contributes to recorder_queue
+    assert stages["left.recorder_queue"]["n"] == 1
+    assert stages["left.recorder_queue"]["p50"] == pytest.approx(0.0999)
+    assert stages["left.write"]["n"] == 1
+    # Lost row's first_frame_id 0 is recovered by batch 1's first_frame_id 0
+    assert result["summary"]["left"]["failedPuts"] == 1
+    assert result["summary"]["left"]["unrecoveredBatches"] == 0
+
+
+def test_recording_loop_unrecovered_lost_row():
+    batches = np.zeros(2, dtype=RECORD_BATCH_DTYPE)
+    batches[0] = (0, 59, 60, 1.0, 4.0, 128, True)  # Lost row
+    batches[1] = (10, 89, 90, 4.1, 4.1001, 128, False)  # Recovered row with different first_frame_id
+    writes = np.zeros(1, dtype=RECORD_WRITE_DTYPE)
+    writes[0] = (10, 89, 90, 4.2, 4.201, 4.21)
+
+    result = analysis.recording_loop({"left": (batches, writes)})
+
+    stages = _stages(result)
+    # Only the second batch contributes to recorder_queue
+    assert stages["left.recorder_queue"]["n"] == 1
+    # Lost row's first_frame_id 0 is NOT recovered (batch 1 has first_frame_id 10)
+    assert result["summary"]["left"]["failedPuts"] == 1
+    assert result["summary"]["left"]["unrecoveredBatches"] == 1
 
 
 def test_can_loop_joins_the_ack_by_uuid_after_the_send():
