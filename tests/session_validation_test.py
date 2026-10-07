@@ -605,8 +605,8 @@ def test_session_manifest_leaves_a_source_file_that_is_absent_to_the_source_rule
 
 
 def test_session_manifest_does_not_expect_video_or_pose_files_to_be_listed(tmp_path):
-    # The recorder lists none of these: capture processes close them asynchronously,
-    # so a hash taken at publication could be of bytes still changing.
+    # The recorder lists none of these; camera.frames and stim.evidence check the video
+    # and the evidence by content, and pose gets only an existence and sampleCount check.
     root = _session_with_sources(
         tmp_path,
         present=("s_left.mp4", "s_left_raw2D_live.h5", "streams/stim_camera_evidence.h5"),
@@ -647,6 +647,16 @@ def test_session_manifest_reports_a_source_path_that_leaves_the_session(tmp_path
     result = _manifest_result(root)
     assert result.status.value == "fail"
     assert "escapes session" in result.message
+
+
+def test_session_manifest_skips_an_empty_entry_among_a_sources_paths(tmp_path):
+    root = _session_with_sources(
+        tmp_path, present=(), listed=(),
+        sources=[{**_source("device", "decoded_can_and_device_events", "streams"),
+                  "paths": [None, ""]}],
+    )
+
+    assert _manifest_result(root).status.value == "pass"
 
 
 # What _write_session lists whenever it exists, bar alignment.json (every session has
