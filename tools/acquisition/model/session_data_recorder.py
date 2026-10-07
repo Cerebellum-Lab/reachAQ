@@ -269,6 +269,11 @@ class SessionDataRecorder:
             system_message_handler.decoded_message_received += self._on_device_message
         if hardware_model is not None:
             hardware_model.device_event += self._on_hardware_device_event
+            # Looked up on the class: an Events-based model answers a missing
+            # instance attribute with EventsException (or a fresh slot), never
+            # AttributeError, so getattr's default would not guard it.
+            if hasattr(type(hardware_model), "set_can_latency_observer"):
+                hardware_model.set_can_latency_observer(self._latency_events.record_can)
         if event_manager is not None:
             event_manager.register_post_observer(self._on_structured_event)
         laser_model.trace_received += self._on_laser_trace

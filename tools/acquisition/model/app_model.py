@@ -5518,6 +5518,9 @@ class AppModel(ObservableObject):
                     reason="session generation ended during preparation",
                 )
                 return
+            # The latency record's first CAN stage: the trial asks for SEND.
+            self._session_data_recorder.latency_events.record_can(
+                "trial_send", {"kind": "SEND_PELLET", "perf": time.perf_counter()})
             # The pellet machine's triggers are relayed to the behaviour
             # algorithm's thread without waiting, and the relay returns
             # nothing. Wait for this one, so the state below says whether
