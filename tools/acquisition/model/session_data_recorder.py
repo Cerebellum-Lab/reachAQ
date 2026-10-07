@@ -899,28 +899,38 @@ class SessionDataRecorder:
         if manifest_path.is_file():
             with manifest_path.open("r", encoding="utf-8") as stream:
                 manifest = json.load(stream)
-            # A raw latency stream is listed here only if _write_session listed it. One
-            # it left out was still being closed by its writer then, and nothing in this
-            # later rewrite can say that it is final now.
-            listed = {entry.get("path") for entry in manifest.get("files", ())}
-            manifest_paths = (
-                streams_dir / "device.csv",
-                streams_dir / "events.csv",
-                trial_path,
-                summary_path,
-                streams_dir / "laser.csv",
-                streams_dir.parent / "logs" / "session.log",
-                alignment_path,
-                *sorted((streams_dir / "tracking").glob("*.json")),
-                streams_dir / "latency.h5",
-                *(path for path in sorted((streams_dir / "latency").glob("*.h5"))
-                  if path.relative_to(streams_dir.parent).as_posix() in listed),
-            )
-            manifest["files"] = [
-                file_manifest_entry(path, relative_to=streams_dir.parent)
-                for path in manifest_paths
+            session_dir = streams_dir.parent
+            # Only these change after _write_session published the manifest: this method
+            # rewrites the ledger and its summary, and persist_trial_tracking rewrites a
+            # tracking file before every call. Every other entry keeps the size and hash
+            # _write_session recorded, in the order it wrote them. Re-hashing them here
+            # would drop what this list does not name (pressure, camera alignment, the
+            # frame timing, nidaq.h5), and would accept a later edit to a published file
+            # as if it had been published that way. Nothing else is added either, so a
+            # raw latency stream _write_session left out, still being closed by its
+            # writer then, stays out.
+            rewritten = {
+                path.relative_to(session_dir).as_posix(): path
+                for path in (
+                    trial_path,
+                    summary_path,
+                    *sorted((streams_dir / "tracking").glob("*.json")),
+                )
                 if path.is_file()
-            ]
+            }
+            files = []
+            for entry in manifest.get("files", ()):
+                path = rewritten.pop(entry.get("path"), None)
+                files.append(
+                    entry
+                    if path is None
+                    else file_manifest_entry(path, relative_to=session_dir)
+                )
+            files.extend(
+                file_manifest_entry(path, relative_to=session_dir)
+                for path in rewritten.values()
+            )
+            manifest["files"] = files
             atomic_write_json(
                 manifest_path,
                 manifest,

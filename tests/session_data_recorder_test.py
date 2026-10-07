@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import json
 import logging
 import time as stdlib_time
@@ -1221,6 +1222,118 @@ def test_post_analysis_trial_ledger_replaces_pending_records_atomically(tmp_path
         "scored_trials": 1,
     }
     assert not tuple(streams.glob("*.tmp"))
+
+
+def _publish_with_a_pending_trial(tmp_path):
+    """Publish a session whose one trial still awaits analysis, as Stop leaves it."""
+    project = ProjectInfo(
+        root=str(tmp_path),
+        device_id="test",
+        when=datetime(2026, 1, 2, 3, 4, 5),
+        session=7,
+    )
+    session_dir = Path(project.get_session_path().location)
+    streams = session_dir / "streams"
+    (streams / "tracking").mkdir(parents=True)
+    # Written by camera finalization and tracking before the recorder publishes.
+    (streams / "camera_alignment.json").write_text('{"status": "ok"}\n')
+    Path(project.get_frame_timing_path()).write_text("frame_id,utc_when\n1,100.0\n")
+    tracking = streams / "tracking" / "trial_000001_attempt_001.json"
+    tracking.write_text(json.dumps({"window": {"startPerf": 10.3, "endPerf": 11.0}}))
+    pending = {
+        "session_id": project.short_id,
+        "operation_id": "send-1",
+        "trial_id": 1,
+        "attempt_id": 1,
+        "attempt_label": "1.1",
+        "send_perf_time": 10.25,
+        "outcome": "pending_analysis",
+    }
+    SessionDataRecorder._write_session(
+        project, 10.0, 100.0, 12.0, (), (), (), (),
+        trial_records=(pending,),
+        trial_summary={"pending_analysis_attempts": 1},
+    )
+    return project, session_dir, tracking, pending
+
+
+def _manifest_entries(session_dir):
+    manifest = json.loads(
+        (session_dir / "streams" / "stream_manifest.json").read_text()
+    )
+    return {item["path"]: item for item in manifest["files"]}
+
+
+def test_trial_ledger_update_keeps_every_finalized_manifest_entry(tmp_path):
+    project, session_dir, tracking, pending = _publish_with_a_pending_trial(tmp_path)
+    before = _manifest_entries(session_dir)
+    for relative in (
+        "streams/pressure.csv",
+        "streams/camera_alignment.json",
+        Path(project.get_frame_timing_path()).name,
+        "streams/nidaq.h5",
+    ):
+        assert relative in before, relative
+    # persist_trial_tracking rewrites the tracking file before every ledger update.
+    record = json.loads(tracking.read_text())
+    tracking.write_text(json.dumps({**record, "result": {"outcome": "success"}}))
+
+    SessionDataRecorder.update_persisted_trial_ledger(
+        project,
+        ({**pending, "outcome": "success"},),
+        {"pending_analysis_attempts": 0, "scored_trials": 1},
+    )
+
+    after = _manifest_entries(session_dir)
+    assert set(before) <= set(after), sorted(set(before) - set(after))
+    # Every listed entry still describes the bytes on disk, as session.manifest checks.
+    for relative, item in after.items():
+        data = (session_dir / relative).read_bytes()
+        assert item["sizeBytes"] == len(data), relative
+        assert item["sha256"] == hashlib.sha256(data).hexdigest(), relative
+    # What the ledger update did not touch keeps what finalization recorded.
+    for relative in ("streams/nidaq.h5", "streams/pressure.csv", "streams/device.csv"):
+        assert after[relative] == before[relative]
+    # Order is part of what finalization wrote.
+    assert [path for path in after if path in before] == list(before)
+
+
+def test_trial_ledger_update_keeps_the_publication_hash_of_a_file_it_did_not_rewrite(
+    tmp_path,
+):
+    # A file edited after publication has to stay detectable: the entry keeps the
+    # hash it was published with, so session.manifest reports the edit.
+    project, session_dir, _, pending = _publish_with_a_pending_trial(tmp_path)
+    before = _manifest_entries(session_dir)["streams/device.csv"]
+    device_csv = session_dir / "streams" / "device.csv"
+    device_csv.write_bytes(device_csv.read_bytes() + b"edited after publication\n")
+    assert hashlib.sha256(device_csv.read_bytes()).hexdigest() != before["sha256"]
+
+    SessionDataRecorder.update_persisted_trial_ledger(
+        project,
+        ({**pending, "outcome": "success"},),
+        {"pending_analysis_attempts": 0, "scored_trials": 1},
+    )
+
+    assert _manifest_entries(session_dir)["streams/device.csv"] == before
+
+
+def test_trial_ledger_update_lists_a_tracking_file_finalization_did_not_see(tmp_path):
+    project, session_dir, tracking, pending = _publish_with_a_pending_trial(tmp_path)
+    late = tracking.with_name("trial_000002_attempt_001.json")
+    late.write_text(json.dumps({"window": {"startPerf": 11.0, "endPerf": 11.5}}))
+    assert "streams/tracking/trial_000002_attempt_001.json" not in _manifest_entries(
+        session_dir
+    )
+
+    SessionDataRecorder.update_persisted_trial_ledger(
+        project,
+        ({**pending, "outcome": "success"},),
+        {"pending_analysis_attempts": 0, "scored_trials": 1},
+    )
+
+    entry = _manifest_entries(session_dir)["streams/tracking/trial_000002_attempt_001.json"]
+    assert entry["sha256"] == hashlib.sha256(late.read_bytes()).hexdigest()
 
 
 def test_auxiliary_generation_is_shared_by_alignment_trials_and_manifest(tmp_path):
