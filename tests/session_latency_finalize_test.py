@@ -220,10 +220,12 @@ def test_the_narrower_rewrite_does_not_list_what_finalization_left_out(tmp_path,
             "streams/latency/events.h5"} <= set(listed)
 
 
-def test_session_manifest_expects_exactly_the_files_finalization_lists(tmp_path):
+def test_every_file_the_manifest_rule_expects_is_one_finalization_lists(tmp_path):
     # The validator names the files it expects to find listed, and the recorder decides
-    # which it lists. This holds the two together: neither can gain a file the other
-    # does not know about.
+    # which it lists. This pins that the validator's names are a subset of what
+    # finalization lists. It does not pin the reverse: a file written outside
+    # _write_session and added to its critical_paths is not on disk here, so it would
+    # not be caught.
     project = _latency_project(tmp_path)
     session_dir = tmp_path / "20260102" / "test" / "session001"
     (session_dir / "streams" / "tracking").mkdir(parents=True)
@@ -243,6 +245,7 @@ def test_session_manifest_expects_exactly_the_files_finalization_lists(tmp_path)
     # Every name is a file on disk, so what is left to compare is not empty by accident.
     assert [name for name in expected if not (session_dir / name).is_file()] == []
     assert expected <= set(listed), sorted(expected - set(listed))
-    # Beyond those it lists only the raw latency streams, which the rule leaves alone.
+    # Of what this session has on disk it lists nothing else but the raw latency
+    # streams, which the rule leaves alone.
     extra = {name for name in listed if name not in expected}
     assert extra and all(name.startswith("streams/latency/") for name in extra), sorted(extra)

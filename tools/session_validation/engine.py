@@ -193,12 +193,12 @@ def _sha256(path):
 
 
 # Sources whose files _write_session does not list in the stream manifest: recorded
-# video, the per-camera pose files and the stim camera's evidence. Capture processes close
-# them asynchronously, so a hash taken at publication could be of bytes still changing.
-# camera.frames and stim.evidence check the video and the evidence by content; pose gets
-# only the existence and stored sampleCount checks of sources.contract, and nothing reads
-# a raw2D_live.h5. A kind not named here has to be listed, so a new source whose file the
-# recorder forgets to list fails here and is not left unchecked.
+# video, the per-camera pose files and the stim camera's evidence. camera.frames checks
+# the video by content and stim.evidence the evidence; pose gets only the persistenceStatus,
+# existence and sampleCount checks of sources.contract, and nothing reads a raw2D_live.h5.
+# A pose writer that has not closed within its 10 s wait does not stop publication; it is
+# recorded as a source failure. A kind not named here has to be listed, so a new source
+# whose file the recorder forgets to list fails here and is not left unchecked.
 _SOURCE_KINDS_NOT_LISTED = frozenset({
     "camera",
     "pose",
@@ -292,6 +292,7 @@ def _manifest_rule(context):
         for source in stream_manifest.get("enabledSources", ())
         if str(source.get("kind", "")) not in _SOURCE_KINDS_NOT_LISTED
         for relative in _source_files(source)
+        if relative
     ]
     expected.extend((relative, "") for relative in _listed_stream_files(context))
     # Resolved paths that are listed, then ones already looked at, so that no spelling of
