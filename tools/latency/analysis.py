@@ -205,8 +205,12 @@ def pose_loop(*, batches, forwards, live_poses, gate, primary_frames,
     rows["gui_recv"] = gui_recv
 
     done = rows["predict_done"]
-    stages = [
-        summarize("exposure_to_arrival", rows["arrival"] - exposure, confidence),
+    stages = []
+    # Exposure-to-arrival is only meaningful when we have a camera-to-NI mapping; when confidence
+    # is software (fallback to host arrival), it would measure inter-camera arrival skew, not exposure time.
+    if confidence != SOFTWARE:
+        stages.append(summarize("exposure_to_arrival", rows["arrival"] - exposure, confidence))
+    stages += [
         summarize("arrival_to_queue", put[:, 0] - rows["arrival"], SOFTWARE),
         summarize("queue_wait", rows["dequeue"] - rows["put"], SOFTWARE),
         summarize("predict", done - rows["predict_start"], SOFTWARE),
@@ -246,14 +250,25 @@ def recording_loop(per_camera: Mapping[str, Tuple[Optional[numpy.ndarray], Optio
             dequeue = take_by_key(writes["first_frame_id"], writes["dequeue_perf"], keys)
             write_entry = take_by_key(writes["first_frame_id"], writes["write_entry_perf"], keys)
             write_return = take_by_key(writes["first_frame_id"], writes["write_return_perf"], keys)
+        # Lost rows are retried failed puts; do not join them to the retried batch's dequeue/write.
+        lost_mask = batches["lost"]
+        dequeue = numpy.where(lost_mask, NAN, dequeue)
+        write_entry = numpy.where(lost_mask, NAN, write_entry)
+        write_return = numpy.where(lost_mask, NAN, write_return)
         stages += [
             summarize(f"{name}.put_block", batches["put_return_perf"] - batches["put_entry_perf"], SOFTWARE),
             summarize(f"{name}.recorder_queue", dequeue - batches["put_return_perf"], SOFTWARE),
             summarize(f"{name}.write", write_return - write_entry, SOFTWARE),
         ]
+        # Unrecovered batches: lost rows whose first frame id does not appear in a later lost=False row.
+        failed_puts = int(numpy.count_nonzero(lost_mask))
+        lost_ids = set(batches[lost_mask]["first_frame_id"].tolist())
+        recovered_ids = set(batches[~lost_mask]["first_frame_id"].tolist())
+        unrecovered = len(lost_ids - recovered_ids)
         summary[name] = {
             "batches": int(len(batches)),
-            "lostBatches": int(numpy.count_nonzero(batches["lost"])),
+            "failedPuts": failed_puts,
+            "unrecoveredBatches": unrecovered,
             "maxQueueDepth": int(numpy.max(batches["queue_depth"])),
         }
     if not summary:
