@@ -31,6 +31,13 @@ LATCH_MAX_BRACKET_SECONDS = 0.002
 # frames within LATCH_WINDOW_SECONDS (20 ppm over 30 s is 0.6 ms).
 LATCH_DRIFT_SPAN_SECONDS = 10.0
 LATCH_WINDOW_SECONDS = 30.0
+# What may separate the NI edge from the latched camera time it is paired with
+# (and the NI path's exposure-to-arrival from the latch path's): a quarter
+# period, never more than this. A bias of whole periods plus a little passes a
+# quarter-period test at low frame rates; christielab10's NI stamps, paired
+# with their own blocks, put the edges 16.6 ms early and 50 fps paired a frame
+# off with a 3.39 ms residual. With the bias gone the residual is about 0.1 ms.
+LATCH_MAX_RESIDUAL_SECONDS = 0.002
 HOST_ARRIVAL = "host_arrival"
 CAMERA_LATCH = "camera_latch"
 
@@ -141,26 +148,37 @@ def rising_edges(values, *, min_swing: float) -> EdgeResult:
 
 
 def ni_block_ends(sample_index, observation_perf) -> Tuple[numpy.ndarray, numpy.ndarray]:
-    """The last sample each host read delivered, and when the host saw it."""
+    """Each read's stamp, paired with the last sample of the read before it.
+
+    The reader stamps a block with perf_counter taken before the blocking read
+    that returns it, so the stamp says nothing about the block's own samples:
+    with back-to-back reads it is when the previous read returned, about one
+    block before this block's last sample. It is an upper bound on when the
+    previous block's last sample was taken, though, which is what the lower
+    envelope in fit_ni_to_host needs; reads that are not back to back only
+    loosen the bound. The first read's stamp bounds nothing and is dropped.
+    """
     sample_index = numpy.asarray(sample_index, dtype=numpy.int64)
     observation_perf = numpy.asarray(observation_perf, dtype=numpy.float64)
     if observation_perf.size == 0:
         return numpy.empty(0, dtype=numpy.int64), numpy.empty(0)
     ends = numpy.flatnonzero(observation_perf[1:] != observation_perf[:-1])
     ends = numpy.append(ends, observation_perf.size - 1)
-    keep = numpy.isfinite(observation_perf[ends])
-    return sample_index[ends][keep], observation_perf[ends][keep]
+    previous_end, stamp = sample_index[ends[:-1]], observation_perf[ends[1:]]
+    keep = numpy.isfinite(stamp)
+    return previous_end[keep], stamp[keep]
 
 
 def fit_ni_to_host(end_index, seen_perf, sample_rate: float) -> ClockFit:
     """NI sample time (index / rate) -> host perf_counter, from the lower envelope.
 
-    A block can only be seen after its last sample was taken, so each read's
-    (seen - sample time) is the delivery delay plus whatever the reader was
-    doing. The smallest delays across the session trace the clock relation
-    with only the minimum delivery delay left in it; that delay is unknown and
-    makes every mapped time late by about that much. A sync pulse (sub-project
-    2) is what would bound it.
+    Each point pairs a sample with a host time no earlier than when it was
+    taken (ni_block_ends: a read's stamp, taken before the blocking read,
+    bounds the previous block's last sample). So each (seen - sample time) is
+    the delivery delay plus whatever the reader did before starting its next
+    read. The smallest across the session trace the clock relation with only
+    the minimum of that left in it; it is unknown and makes every mapped time
+    late by about that much. A sync pulse (sub-project 2) is what would bound it.
     """
     t = numpy.asarray(end_index, dtype=numpy.float64) / float(sample_rate)
     seen = numpy.asarray(seen_perf, dtype=numpy.float64)
@@ -283,6 +301,13 @@ def fit_latches(latches) -> ClockFit:
                     x_min=float(camera[tightest]), x_max=float(camera[tightest]))
 
 
+def latch_tolerance(frame_period: float) -> float:
+    """How far the NI path may sit from the latch path: P/4, at most LATCH_MAX_RESIDUAL_SECONDS."""
+    if not math.isfinite(frame_period):
+        return math.nan
+    return min(frame_period / 4, LATCH_MAX_RESIDUAL_SECONDS)
+
+
 def latch_window(fit: ClockFit, camera_seconds) -> numpy.ndarray:
     """Camera timestamps within LATCH_WINDOW_SECONDS of the latched span."""
     camera_seconds = numpy.asarray(camera_seconds, dtype=numpy.float64)
@@ -302,9 +327,16 @@ def choose_pairing_by_camera_clock(frame_ids, camera_ts_ns, latches, transition_
     The median residual (transition minus expected time, over the chosen shift)
     is where the camera stamps a frame relative to the NI edge, plus the NI-to-
     host bias, plus the latch uncertainty. All of it must stay well under half a
-    period for the nearest transition to be the right one, so a residual over a
-    quarter period, or agreement below PAIRING_MIN_AGREEMENT, marks the pairing
-    ambiguous. The lag is not measured here: median_lag is NaN.
+    period for the nearest transition to be the right one, and a bias near a
+    whole period would pair a frame off with a small residual, so a residual
+    over latch_tolerance() (a quarter period, at most 2 ms), or agreement below
+    PAIRING_MIN_AGREEMENT, marks the pairing ambiguous. The lag is not measured
+    here: median_lag is NaN.
+
+    The limit that sets: a Blackfly S stamps a frame at the end of its exposure
+    and the NI edge marks its start, so the residual approaches minus the
+    exposure time. An exposure longer than about 1.8 ms therefore reads
+    ambiguous, visibly, rather than being paired on a guess.
     """
     fit = fit_latches(latches)
     if not fit.valid:
@@ -330,11 +362,12 @@ def choose_pairing_by_camera_clock(frame_ids, camera_ts_ns, latches, transition_
     inside = (numbers >= 0) & (numbers < transition_perf.size)
     residual = transition_perf[numbers[inside]] - expected[inside]
     median_residual = float(numpy.median(residual)) if residual.size else math.nan
-    residual_ambiguous = not abs(median_residual) <= frame_period / 4
+    tolerance = latch_tolerance(frame_period)
+    residual_ambiguous = not abs(median_residual) <= tolerance
     agreement_ambiguous = agreement < PAIRING_MIN_AGREEMENT
     if residual_ambiguous:
-        reason = (f"median residual {median_residual * 1e3:.3f} ms is over a quarter "
-                  f"frame period ({frame_period / 4 * 1e3:.3f} ms)")
+        reason = (f"median residual {median_residual * 1e3:.3f} ms is over the latch "
+                  f"tolerance ({tolerance * 1e3:.3f} ms)")
     elif agreement_ambiguous:
         reason = f"agreement {agreement:.2f} below {PAIRING_MIN_AGREEMENT}"
     else:

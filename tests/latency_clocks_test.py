@@ -47,25 +47,40 @@ def test_a_floating_input_is_unusable():
     assert "noise" in result.reason
 
 
-def test_block_ends_are_the_last_sample_each_read_delivered():
+def test_each_read_stamp_bounds_the_last_sample_of_the_read_before_it():
+    # A block's stamp is taken before the blocking read that returns it: 2.0 is
+    # when the read of samples 4-6 began, after samples 0-3 were in hand.
     ends, seen = clocks.ni_block_ends(np.arange(10), np.array([1.0] * 4 + [2.0] * 3 + [3.0] * 3))
-    assert ends.tolist() == [3, 6, 9]
-    assert seen.tolist() == [1.0, 2.0, 3.0]
+    assert ends.tolist() == [3, 6]
+    assert seen.tolist() == [2.0, 3.0]
+
+
+def _back_to_back_reads(rate, block, blocks, seed=4):
+    """Per-sample NI arrays as the reader stores them, and the true NI-to-host relation.
+
+    Each read returns 0.2-3.2 ms after its block's last sample, the next read
+    starts at once, and every block carries the stamp taken before its read.
+    """
+    rng = np.random.default_rng(seed)
+
+    def truth(t):
+        return 100.0 + (1 + 11e-6) * np.asarray(t)
+
+    last = np.arange(1, blocks + 1) * block - 1
+    returned = truth(last / rate) + 0.0002 + rng.uniform(0, 0.003, blocks)
+    started = np.concatenate([[truth(0.0) - 0.001], returned[:-1]])
+    return np.arange(blocks * block), np.repeat(started, block), last / rate, truth
 
 
 def test_the_envelope_maps_late_by_about_the_minimum_delay_and_never_early():
-    rng = np.random.default_rng(4)
-    rate = 1000.0
-    ends = np.arange(1, 2001) * 50 - 1
-    t = ends / rate
-    truth = 100.0 + (1 + 11e-6) * t
-    seen = truth + 0.0002 + rng.uniform(0, 0.003, t.size)
+    index, stamps, t, truth = _back_to_back_reads(1000.0, 50, 2000)
 
-    fit = clocks.fit_ni_to_host(ends, seen, rate)
+    fit = clocks.fit_ni_to_host(*clocks.ni_block_ends(index, stamps), 1000.0)
 
     assert fit.valid, fit.reason
-    bias = fit.map(t) - truth
-    assert bias.min() > 0
+    bias = fit.map(t) - truth(t)
+    # Pairing a stamp with its own block maps a whole block (50 ms) early.
+    assert bias.min() > 0, f"bias.min() = {bias.min()}"
     assert bias.max() < 0.002
 
 
@@ -164,17 +179,12 @@ def test_wall_map_handles_backward_steps_with_nans():
 
 def test_the_envelope_fit_is_tighter_than_a_plain_fit():
     # Issue 5: bias.max() should be tighter than 0.002
-    rng = np.random.default_rng(4)
-    rate = 1000.0
-    ends = np.arange(1, 2001) * 50 - 1
-    t = ends / rate
-    truth = 100.0 + (1 + 11e-6) * t
-    seen = truth + 0.0002 + rng.uniform(0, 0.003, t.size)
+    index, stamps, t, truth = _back_to_back_reads(1000.0, 50, 2000)
 
-    fit = clocks.fit_ni_to_host(ends, seen, rate)
+    fit = clocks.fit_ni_to_host(*clocks.ni_block_ends(index, stamps), 1000.0)
 
     assert fit.valid, fit.reason
-    bias = fit.map(t) - truth
+    bias = fit.map(t) - truth(t)
     assert bias.min() > 0, f"bias.min() = {bias.min()}"
     assert bias.max() < 0.0005, f"bias.max() = {bias.max()}"
 
@@ -327,3 +337,42 @@ def test_unusable_latches_give_an_ambiguous_pairing_with_a_reason(latches, why):
     assert pairing.ambiguous
     assert pairing.method == "camera_latch"
     assert "no usable clock latch" in pairing.reason and why in pairing.reason
+
+
+def test_a_pairing_one_frame_off_at_50_fps_is_ambiguous():
+    # christielab10 with NI blocks paired to their own stamps: the mapped edges
+    # sat 16.6 ms before the camera stamps, so at 50 fps the nearest edge was
+    # the next frame's, 3.39 ms on: under P/4, and wrong.
+    period = 1 / 50
+    ids = np.arange(1000, 4000)
+    exposure = 50.0 + (ids - 1000 + 5) * period
+    camera_ts_ns = np.round(_camera_clock(exposure) * 1e9).astype(np.int64)
+    transition_perf = 50.0 + np.arange(ids.size + 10) * period - 0.01661
+    latches = _latches([exposure[0] + 0.001, exposure[-1] + 0.001])
+
+    pairing = clocks.choose_pairing_by_camera_clock(ids, camera_ts_ns, latches, transition_perf,
+                                                    period)
+
+    assert pairing.shift == 994  # frame 1000 is transition 5
+    assert pairing.median_residual == pytest.approx(0.00339, abs=1e-5)
+    assert pairing.ambiguous
+    assert "residual" in pairing.reason
+
+
+def test_a_correct_pairing_with_a_small_residual_is_accepted():
+    ids, exposure, transition_perf = _exposures(9000)
+    camera_ts_ns = np.round(_camera_clock(exposure) * 1e9).astype(np.int64)
+    latches = _latches([exposure[0] + 0.001, exposure[-1] + 0.001])
+
+    pairing = clocks.choose_pairing_by_camera_clock(ids, camera_ts_ns, latches,
+                                                    transition_perf + 0.0001, PERIOD_150)
+
+    assert pairing.shift == 995 and not pairing.ambiguous, pairing.reason
+    assert pairing.median_residual == pytest.approx(0.0001, abs=1e-6)
+
+
+@pytest.mark.parametrize("frame_period, tolerance", [
+    (1 / 150, 1 / 600), (1 / 50, 0.002), (1 / 25, 0.002), (float("nan"), float("nan")),
+], ids=["150fps", "50fps", "25fps", "unknown"])
+def test_the_latch_tolerance_is_a_quarter_period_capped_at_2_ms(frame_period, tolerance):
+    assert clocks.latch_tolerance(frame_period) == pytest.approx(tolerance, nan_ok=True)
