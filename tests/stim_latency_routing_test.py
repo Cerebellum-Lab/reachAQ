@@ -36,6 +36,7 @@ def harness(monkeypatch):
     )
     # What _on_direct_stim_trigger_result reaches after the dispatch row.
     model._stim_latency_budget = StimLatencyBudget()
+    model._session_stim_latency_budget = StimLatencyBudget()
     model._session_telemetry = SimpleNamespace(record_stim_p99=lambda p99_ms: None)
     # With no camera, _on_stim_camera_trigger returns at its unowned-trigger
     # guard, after the dispatch row and before any session state is touched.

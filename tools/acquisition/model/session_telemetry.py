@@ -125,6 +125,10 @@ class SessionTelemetry(ObservableObject):
             "dropped": self.dropped_frames,
             "dropped_by_camera": self.dropped_by_camera,
             "inferenced": self.frames_inferenced,
+            # The metadata is written after end(), while triggers still reach
+            # the live figure; without this the file would carry whichever
+            # p99 happened to be current when it was written.
+            "stim_p99_ms": self._stim_p99_ms,
         }
         self._active = False
         self.property_changed(self.ACTIVE_PROP, False, True)
@@ -303,6 +307,8 @@ class SessionTelemetry(ObservableObject):
 
     @property
     def stim_p99_ms(self) -> float:
+        if self._frozen is not None:
+            return self._frozen["stim_p99_ms"]
         return self._stim_p99_ms
 
     @property

@@ -121,10 +121,10 @@ class CaptureTelemetryPanel(QWidget):
                                           "0000000")
         self._inferenced = self._add_readout(body_layout, "Inferenced",
                                              "000%  0000000/0000000")
-        # Two separate figures. The call is what the model costs; sensor to
-        # result adds the queue wait and is what the sub-5 ms target is about.
-        # Showing only one of them would let a model look fast while missing
-        # the deadline that matters.
+        # Two separate figures. The call is what the model costs; arrival to
+        # result adds the queue wait and is the nearer of the two to what the
+        # sub-5 ms target is about. Showing only one of them would let a model
+        # look fast while missing the deadline that matters.
         self._inference_ms = self._add_readout(body_layout, "Inference call",
                                                "000.0 ms  max 0000.0")
         # Arrival, not sensor: the frame's time is fitted to when the host
@@ -132,7 +132,12 @@ class CaptureTelemetryPanel(QWidget):
         # latency record measures them after the session.
         self._e2e_ms = self._add_readout(body_layout, "Arrival → result",
                                           "000.0 ms  max 0000.0")
-        self._stim_p99 = self._add_readout(body_layout, "Stim p99", "000.0 ms")
+        self._stim_p99 = self._add_readout(body_layout, "Stim p99", "0000.0 ms")
+        # On the holder, so hovering the caption or the number both explain it.
+        self._stim_p99.parentWidget().setToolTip(
+            "Rolling p99 of the direct stim route this session: host arrival "
+            "of the frame to DAQmx start return. It excludes exposure, "
+            "readout and transfer.")
         # Widest status the finalizer can produce, plus a character of slack:
         # a label's size hint can run a pixel past the summed advances for
         # letter text, which would still move the panel when the status lands.
@@ -274,9 +279,9 @@ class CaptureTelemetryPanel(QWidget):
     def _collapsed_text(telemetry) -> str:
         """What the strip says while shut.
 
-        Sensor-to-result rather than the call time: if only one number is
-        visible without opening the panel, it should be the one the deadline
-        is set against.
+        Arrival-to-result rather than the call time: if only one number is
+        visible without opening the panel, it should be the one nearer the
+        deadline.
         """
         parts = [CaptureTelemetryPanel._format_elapsed(telemetry.elapsed_seconds),
                  f"{telemetry.inferenced_percent:.0f}% inferenced"]
