@@ -11,15 +11,19 @@ process that is killed outright, so the exit is detected from the process
 itself. The message only supplies the reason, when there is one to give.
 """
 
+import math
 import queue
 import threading
 from types import SimpleNamespace
 
 import pytest
 
-from autotrainer.inference import InferenceStatus, InferenceStatusMessageKind
+from autotrainer.inference import (
+    InferenceCommandMessageKind, InferenceStatus, InferenceStatusMessageKind,
+)
 from autotrainer.inference import pose_process
 from autotrainer.inference.pose_process import PoseProcess
+from tools.acquisition.model import inference_model as inference_model_module
 from tools.acquisition.model.app_model import AppModel
 from tools.acquisition.model.inference_model import InferenceModel
 from tools.acquisition.model.subsystem_status import SubsystemId, SubsystemState
@@ -82,6 +86,24 @@ def test_a_running_or_absent_process_is_left_alone(process):
     assert model.stop_calls == 0
 
 
+def test_a_process_that_gave_no_reason_is_described_by_its_exit_code():
+    """A killed process, or one that failed while still importing, says nothing."""
+    model = _inference(InferenceStatus.loading, _exited(-9))
+
+    model._check_pose_process_exited()
+
+    assert model.pose_process_error == "pose process exited with code -9"
+
+
+def test_a_reason_the_process_gave_is_not_replaced_by_its_exit_code():
+    model = _inference(InferenceStatus.live, _exited(0))
+    model._pose_process_error = "ValueError: boom"
+
+    model._check_pose_process_exited()
+
+    assert model.pose_process_error == "ValueError: boom"
+
+
 def test_the_message_loop_checks_for_the_exit_while_idle():
     model = _inference(InferenceStatus.waiting, _exited())
     model._notif_msg_queue = queue.Queue()
@@ -95,6 +117,143 @@ def test_the_message_loop_checks_for_the_exit_while_idle():
     finally:
         model._notif_msg_queue.put(None)  # the loop's exit sentinel
         loop.join(2.0)
+
+
+# -- before the model reports Loading -------------------------------------
+#
+# Spawning the pose process and importing and building its model take seconds
+# before the child's first Loading message. Status used to stay `stopped` all
+# that time, so a death there went unnoticed, and a stop() there returned at
+# once and left the process loading a model for a capture that had ended.
+
+class _FakePoseProcess:
+    def __init__(self, *args, **kwargs):
+        self.started = False
+        self.joined = False
+        self.exitcode = None
+
+    def start(self):
+        self.started = True
+
+    def is_alive(self):
+        return self.started and self.exitcode is None
+
+    def join(self, timeout=None):
+        self.joined = True
+
+
+class _CommandQueue(queue.Queue):
+    """Delivers Terminate to the fake process at once, and acknowledges it."""
+
+    def __init__(self, ack):
+        super().__init__()
+        self._ack = ack
+        self.process = None
+
+    def put(self, item, *args, **kwargs):
+        super().put(item, *args, **kwargs)
+        kind, _context = item
+        if kind == InferenceCommandMessageKind.Terminate and self.process is not None:
+            self.process.exitcode = 0
+        self._ack.set()
+
+
+def _spawning_inference(monkeypatch):
+    """The real start() and stop(), with the processes, pool and thread faked."""
+    monkeypatch.setattr(inference_model_module, "PoseProcess", _FakePoseProcess)
+    model = InferenceModel.__new__(InferenceModel)
+    model._on_property_changed = lambda name, new, old: None
+    model._status = InferenceStatus.stopped
+    model._model_location = "/unused"
+    model.can_start_live_inference = lambda: True
+    ack = threading.Event()
+    model._cmd_queue_ack = ack
+    model._cmd_queue = _CommandQueue(ack)
+    model._cmd_queue_lock = threading.Lock()
+    model._output_data_queue = queue.Queue()
+    model._notif_msg_queue = queue.Queue()
+    model._data_monitor_cmd_queue = queue.Queue()
+    model._record_stop_sema = None
+    model._mp_manager = SimpleNamespace(Event=threading.Event)
+    model._process_pool = SimpleNamespace(
+        close=lambda: None, terminate=lambda: None, join=lambda: None)
+    model._msg_thread = object()  # already running; start() must not add one
+    model._data_monitor_proc = SimpleNamespace(
+        stop_recorded=threading.Event(), is_alive=lambda: True,
+        join=lambda timeout=None: None, exitcode=0, pid=0)
+    model._pose_process = None
+    model._pose_process_error = None
+    model._pose_process_watchdog_perf_c = SimpleNamespace(value=math.nan)
+    model._offline_segmentation_thread = None
+    model._offline_analysis_thread = None
+    model._intersession_block = None
+    model._intersession_detection = None
+    return model
+
+
+_LIVE_QUEUE = SimpleNamespace(shape=(256, 256), frames_per_camera=1)
+
+
+def test_inference_is_loading_from_the_moment_its_process_is_spawned(monkeypatch):
+    model = _spawning_inference(monkeypatch)
+
+    assert model.start(_LIVE_QUEUE)
+
+    assert model._pose_process.started
+    assert model.status == InferenceStatus.loading
+
+
+def test_a_stop_before_the_model_reports_loading_still_stops_the_process(monkeypatch):
+    model = _spawning_inference(monkeypatch)
+    model.start(_LIVE_QUEUE)
+    process = model._pose_process
+    model._cmd_queue.process = process
+
+    model.stop()
+
+    assert process.exitcode == 0, "the process was never asked to terminate"
+    assert process.joined
+    assert model._pose_process is None
+    assert model.status == InferenceStatus.stopped
+
+
+@pytest.mark.parametrize("status", [InferenceStatus.stopping, InferenceStatus.stopped])
+@pytest.mark.parametrize("message", [
+    (InferenceStatusMessageKind.Loading, None),
+    (InferenceStatusMessageKind.Initialized, ["Nose"]),
+    (InferenceStatusMessageKind.Running, 0),
+])
+def test_a_process_being_stopped_cannot_make_inference_active_again(status, message):
+    """Stopped mid-load, the process keeps loading until it reads Terminate,
+    and reports Loading and Initialized on the way. On the rig, acting on them
+    moved the stopping inference back to loading and then waiting, and stalled
+    the message loop 3 s on the acknowledgement of a Start that could not come."""
+    model = _inference(status, _running())
+    calls = []
+    model._set_status = calls.append
+    model._send_message = lambda kind, context=None: calls.append(kind)
+    model._notif_msg_queue = queue.Queue()
+    model._notif_msg_queue.put(message)
+    model._notif_msg_queue.put(None)
+
+    model._monitor_msg_queue()
+
+    assert calls == []
+    assert model.status == status
+
+
+def test_a_process_that_dies_before_the_model_reports_loading_is_caught(monkeypatch):
+    model = _spawning_inference(monkeypatch)
+    model.start(_LIVE_QUEUE)
+    process = model._pose_process
+    process.exitcode = 1  # an import failed in the child, say
+
+    model._check_pose_process_exited()
+
+    assert process.joined
+    assert model._pose_process is None
+    assert model.status == InferenceStatus.stopped
+    assert model.pose_process_error == "pose process exited with code 1"
 
 
 # -- carrying the reason --------------------------------------------------

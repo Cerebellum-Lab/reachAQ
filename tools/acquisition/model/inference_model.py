@@ -353,6 +353,12 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
             record_stop_sema=self._record_stop_sema,
         )
         proc.start()
+        # Loading from the spawn, not from the child's first Loading message.
+        # Importing and building the model take seconds before that message,
+        # and while the status still read stopped a death there went unnoticed
+        # and stop() returned at once, leaving the process to load a model for
+        # a capture that had already ended.
+        self._set_status(InferenceStatus.loading)
 
         log_hardware_initialization(
             logger,
@@ -659,6 +665,19 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
                     self._handle_monitor_data_proc_msg(msg, context)
                     continue
                 logger.debug("Processing msg %s ...", msg)
+                if (msg in {InferenceStatusMessageKind.Loading,
+                            InferenceStatusMessageKind.Initialized,
+                            InferenceStatusMessageKind.Running}
+                        and self._status in {InferenceStatus.stopping, InferenceStatus.stopped}):
+                    # A process stopped while it loads keeps loading until it
+                    # reads Terminate, and reports Loading and Initialized on
+                    # the way. Acting on them moved a stopping inference back to
+                    # loading, then waiting, and held this loop 3 s for the
+                    # acknowledgement of a Start that could not come. Arriving
+                    # after stop() had finished, they would leave the status
+                    # active with no process behind it.
+                    logger.info("ignoring %s from a pose process being stopped", msg)
+                    continue
                 if msg == InferenceStatusMessageKind.Initialized:
                     self._pose_parts = context
                     self._set_status(InferenceStatus.waiting)
@@ -742,9 +761,12 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
             return
         if self._status in {InferenceStatus.stopping, InferenceStatus.stopped}:
             return
+        if self._pose_process_error is None:
+            # Killed, or failed before it could say anything - while still
+            # importing, say. The exit code is then all there is to go on.
+            self._pose_process_error = f"pose process exited with code {proc.exitcode}"
         logger.error("pose process exited on its own (exit code %s) while %s: %s",
-                     proc.exitcode, self._status.value,
-                     self._pose_process_error or "it gave no reason")
+                     proc.exitcode, self._status.value, self._pose_process_error)
         try:
             self.stop()
         except Exception:
