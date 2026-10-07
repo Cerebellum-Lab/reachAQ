@@ -103,11 +103,10 @@ class FixedArrayMultiQueue:
         # fitted to host arrival (spinnaker_cam._capture), not to exposure.
         #
         # Without this the consumer knows WHICH frames it has but not WHEN they
-        # were taken, so it can time its own work and nothing else. Sensor to
-        # result - the figure a closed loop actually waits on - needs the
-        # exposure time to travel with the frame. perf_counter is the same
-        # monotonic clock in every process on both platforms, so the two ends
-        # are directly comparable. NaN means the writer supplied nothing.
+        # arrived, so it can time its own work and nothing else. Arrival to
+        # result needs the frame's time to travel with it. perf_counter is the
+        # same monotonic clock in every process on both platforms, so the two
+        # ends are directly comparable. NaN means the writer supplied nothing.
         self._frame_perf_c = mp_ctx.RawArray(
             ctypes.c_double, self._depth * self._frames_per_camera * self._cam_count)
 

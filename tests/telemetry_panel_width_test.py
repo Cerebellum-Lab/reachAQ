@@ -76,7 +76,7 @@ GROWING = [
                dropped_frames=1234, has_dropped_frames=True,
                inference_mean_ms=444.2, inference_max_ms=555.5,
                sensor_to_result_mean_ms=666.1, sensor_to_result_max_ms=999.9,
-               stim_p99_ms=444.4, latency_status="complete (hardware)"),
+               stim_p99_ms=1234.5, latency_status="complete (hardware)"),
 ]
 
 
@@ -122,3 +122,13 @@ def test_a_readout_still_shows_its_value(qapp):
 
     assert "100%" in panel._inferenced.text()
     assert "13500" in panel._inferenced.text()
+
+
+def test_the_stim_p99_readout_says_what_it_spans(qapp):
+    """The figure starts at host arrival, so it must not be read as sensor-to-output."""
+    panel = _panel(qapp, GROWING[0])
+
+    tip = panel._stim_p99.parentWidget().toolTip()
+    assert "host arrival" in tip
+    assert "DAQmx start return" in tip
+    assert "excludes exposure" in tip

@@ -804,6 +804,9 @@ class AppModel(ObservableObject):
         proc_msg_queue = self._multiproc_msg_queue = mp_ctx.Queue()
         self._stim_direct_trigger_queue = mp_ctx.Queue(maxsize=16)
         self._stim_latency_budget = StimLatencyBudget()
+        # The panel's and the metadata's stim p99 is per session; the budget
+        # above rolls over triggers from every session since launch.
+        self._session_stim_latency_budget = StimLatencyBudget()
         self._handle_proc_msg_thread = threading.Thread(
             target=self._handle_proc_msg_queue, name="handle_proc_msg_queue", daemon=True)
         self._handle_proc_msg_thread.start()
@@ -2463,7 +2466,7 @@ class AppModel(ObservableObject):
                     # Counters are per session, and the session starts at the
                     # first recorded frame rather than at arm time, so elapsed
                     # matches the recording rather than the operator's clicking.
-                    self._session_telemetry.begin(first_frame_perf)
+                    self._begin_session_telemetry(first_frame_perf)
                     self._latency_status = {}
                     self._record_start_timer.cancel()
                     self._record_start_timer = no_op_timer
@@ -5924,6 +5927,22 @@ class AppModel(ObservableObject):
         """Rolling Tier 1 stim-loop latency view, aggregated from trigger records."""
         return self._stim_latency_budget
 
+    #: Whether this session's p99 feed has already reported a failure. A feed
+    #: that fails does so on every trigger, and one line per trigger would bury
+    #: the log; class-level so a bare instance has the default.
+    _stim_p99_failure_logged = False
+
+    def _begin_session_telemetry(self, started_perf=None) -> None:
+        """Start the session counters and the stim p99 that goes with them over.
+
+        Together because the p99 is read from a budget that has to be cleared at
+        the same moments the counters are: any begin() that left the budget
+        alone would show an earlier session's triggers in this one's figure.
+        """
+        self._session_telemetry.begin(started_perf)
+        self._session_stim_latency_budget.reset()
+        self._stim_p99_failure_logged = False
+
     def _log_stim_latency_budget(self) -> None:
         """Emit the Tier 1 breakdown once per capture stop, when triggers occurred."""
         try:
@@ -5945,11 +5964,20 @@ class AppModel(ObservableObject):
         self._stim_latency_budget.observe(payload)
         try:
             self._session_data_recorder.latency_events.record_stim_dispatch(payload)
-            total = self._stim_latency_budget.summary().total
+        except Exception:
+            logger.exception("Direct stim dispatch latency row was not recorded")
+        # Its own try, so a failure here is not reported as a lost latency row
+        # and cannot stop the trigger's event record below.
+        try:
+            session_budget = self._session_stim_latency_budget
+            session_budget.observe(payload)
+            total = session_budget.summary().total
             if total is not None and math.isfinite(total.p99):
                 self._session_telemetry.record_stim_p99(total.p99 * 1000.0)
         except Exception:
-            logger.exception("Direct stim dispatch latency row was not recorded")
+            if not self._stim_p99_failure_logged:
+                self._stim_p99_failure_logged = True
+                logger.exception("Live stim p99 was not updated")
         perf_time = float(
             payload.get("daqmx_start_entry_perf_time")
             or payload.get("ipc_receive_perf_time")
@@ -8500,7 +8528,7 @@ class AppModel(ObservableObject):
         # inference rate or percentage there - the panel simply showed a
         # dash. A recording re-baselines this at its first recorded frame,
         # so session figures stay session-relative.
-        self._session_telemetry.begin()
+        self._begin_session_telemetry()
         self.status = target_status
         self.property_changed(self.Props.ACQUISITION_RUNNING, True, False)
         self._event_manager.post_event_content(
@@ -10040,9 +10068,14 @@ class AppModel(ObservableObject):
                 ):
                     logger.warning("NI-DAQ alignment boundary update became stale")
             self._recording_session.set_stream_result(stream_result)
-            self._latency_status = dict(stream_result.get("latency") or {})
-            self._session_telemetry.set_latency_status(
-                describe_latency_status(self._latency_status))
+            # A status line is not worth skipping the completeness check, the
+            # end-home request or the analysis start below.
+            try:
+                self._latency_status = dict(stream_result.get("latency") or {})
+                self._session_telemetry.set_latency_status(
+                    describe_latency_status(self._latency_status))
+            except Exception:
+                logger.exception("Latency record status was not published")
             if not self._recording_session.data_complete:
                 message = (
                     "Session auxiliary data is incomplete: "
@@ -10547,7 +10580,7 @@ class AppModel(ObservableObject):
                 # never moves a session's baseline.
                 if (self._recording_session.status
                         is not SessionRecordingStatus.RECORDING):
-                    self._session_telemetry.begin()
+                    self._begin_session_telemetry()
             elif value == InferenceStatus.stopped:
                 current = self._acquisition.subsystems.get(
                     SubsystemId.LIVE_INFERENCE
