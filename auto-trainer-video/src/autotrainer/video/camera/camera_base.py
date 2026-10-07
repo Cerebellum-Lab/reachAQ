@@ -157,6 +157,15 @@ class CameraBase:
 
         return None, self._last_when
 
+    def latch_clock(self) -> Optional[Tuple[float, int, float]]:
+        """ Latches the camera's timestamp clock between two host perf_counter reads.
+
+        Returns (perf before, camera timestamp in ns, perf after), on the clock
+        capture() timestamps come from, or None for a camera with no such clock.
+        Must not raise. Called on the capture thread only.
+        """
+        return None
+
     def set_property(self, name: str, value: str) -> bool:
         """ Sets known property values, typically from the camera url.
 
