@@ -152,6 +152,12 @@ def test_wall_map_handles_backward_steps_with_nans():
     assert wall_map.map(np.array([10.0]))[0] == pytest.approx(1010.0)
     # Value in overlap (25.0): should be NaN
     assert np.isnan(wall_map.map(np.array([25.0]))[0])
+    # 20.5 and 48.5 sit inside the overlap but near its two ends. Sorting by wall
+    # time interleaves the segments there into singleton pieces that get
+    # dropped, leaving fits A=[0, 20] and B=[49, 69]; with the 2 s padding, 25.0
+    # lands in the gap between them and reads NaN by accident, while these two
+    # points fall in the padding and map to a value from the wrong segment.
+    assert np.isnan(wall_map.map(np.array([20.5, 48.5]))).all()
     # Value in segment B only (65.0): should map through B (slope=1, so 1049+(65-20)=1094)
     assert wall_map.map(np.array([65.0]))[0] == pytest.approx(1094.0)
 
