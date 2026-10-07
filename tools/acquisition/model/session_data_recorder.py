@@ -414,7 +414,16 @@ class SessionDataRecorder:
             # end() either way, so the log stops. None when the switch was off
             # at arm: _write_session then writes no events.h5, and a session
             # recorded with the record off carries no latency files at all.
-            latency_events = self._latency_events.end()
+            # A diagnostic must not cost the session its finalization. The
+            # failure is logged after the lock is released: the session log
+            # handler takes this lock, so logging under it could deadlock
+            # against a thread that is mid-emit.
+            latency_end_error = None
+            try:
+                latency_events = self._latency_events.end()
+            except Exception as error:
+                latency_end_error = error
+                latency_events = None
             if not self._latency_events.enabled:
                 latency_events = None
             snapshot = {
@@ -443,6 +452,11 @@ class SessionDataRecorder:
             self._armed = False
             self._pending_stop_end_perf = None
             self._pending_finalization = snapshot
+        if latency_end_error is not None:
+            logging.getLogger(__name__).error(
+                "Latency event log could not be ended; the session is finalized without it",
+                exc_info=latency_end_error,
+            )
         return self._publish_pending_finalization(max_attempts=2)
 
     def retry_pending_finalization(self):
