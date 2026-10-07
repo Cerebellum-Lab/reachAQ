@@ -22,21 +22,25 @@ ENVELOPE_BINS = 20
 PAIRING_MARGIN_SECONDS = 0.0001
 PAIRING_MIN_AGREEMENT = 0.95
 # A camera clock latch is one USB round trip: christielab10's BFS-U3-16S2M
-# brackets it in 0.18-0.36 ms (median 0.20 ms), idle or streaming. 2 ms admits
-# ten times that on a busy bus while keeping the latch's own uncertainty, half
-# the bracket, under a quarter of a 150 fps frame period (1.67 ms).
+# brackets it in 0.14-0.58 ms inside the running app (60 latches, median
+# 0.27 ms) and in about 0.20 ms with the app closed. 2 ms admits several times
+# that on a busy bus while keeping the latch's own uncertainty, half the
+# bracket, under a quarter of a 150 fps frame period (1.67 ms).
 LATCH_MAX_BRACKET_SECONDS = 0.002
 # Latches further apart than this are fitted with a line, which takes up the
 # camera oscillator's drift; closer ones give an offset only, trusted for
 # frames within LATCH_WINDOW_SECONDS (20 ppm over 30 s is 0.6 ms).
 LATCH_DRIFT_SPAN_SECONDS = 10.0
 LATCH_WINDOW_SECONDS = 30.0
-# What may separate the NI edge from the latched camera time it is paired with
-# (and the NI path's exposure-to-arrival from the latch path's): a quarter
-# period, never more than this. A bias of whole periods plus a little passes a
-# quarter-period test at low frame rates; christielab10's NI stamps, paired
-# with their own blocks, put the edges 16.6 ms early and 50 fps paired a frame
-# off with a 3.39 ms residual. With the bias gone the residual is about 0.1 ms.
+# What may separate the NI edge from the latched camera time it is paired with:
+# a quarter period, never more than this. This residual gate is the safeguard
+# against whole-period mispairing, because a bias of whole periods plus a
+# little passes a quarter-period test at low frame rates: christielab10's NI
+# stamps, paired with their own blocks, put the edges 16.6 ms early, and
+# 50 fps paired a frame off with a 3.39 ms residual. With the bias gone the
+# residual is about 0.1 ms. The finalizer's NI-versus-latch lag check uses the
+# same tolerance but sees this same residual again, through the fitted
+# camera-to-NI line; it is no reason to relax this gate.
 LATCH_MAX_RESIDUAL_SECONDS = 0.002
 HOST_ARRIVAL = "host_arrival"
 CAMERA_LATCH = "camera_latch"
@@ -148,15 +152,19 @@ def rising_edges(values, *, min_swing: float) -> EdgeResult:
 
 
 def ni_block_ends(sample_index, observation_perf) -> Tuple[numpy.ndarray, numpy.ndarray]:
-    """Each read's stamp, paired with the last sample of the read before it.
+    """Each run of equal stamps, paired with the last sample of the run before it.
 
-    The reader stamps a block with perf_counter taken before the blocking read
-    that returns it, so the stamp says nothing about the block's own samples:
-    with back-to-back reads it is when the previous read returned, about one
-    block before this block's last sample. It is an upper bound on when the
-    previous block's last sample was taken, though, which is what the lower
-    envelope in fit_ni_to_host needs; reads that are not back to back only
-    loosen the bound. The first read's stamp bounds nothing and is dropped.
+    In nidaq.h5 a run of equal block_observation_perf_time values is not one NI
+    read. It is one copy the session recorder makes from the NI sample ring
+    (every 10 ms) of whatever the ring gained since its last copy, stamped with
+    the stamp of the newest read in it. That stamp is perf_counter taken before
+    the blocking read, so it says nothing about the run's own samples: with
+    back-to-back reads it is when the read before the newest one returned. It
+    is an upper bound on when the previous run's last sample was taken, though
+    (that sample came from an earlier read, which had returned), and that is
+    what the lower envelope in fit_ni_to_host needs. The first run's stamp
+    bounds nothing and is dropped. How loose the bound is depends on the read
+    size; see fit_ni_to_host.
     """
     sample_index = numpy.asarray(sample_index, dtype=numpy.int64)
     observation_perf = numpy.asarray(observation_perf, dtype=numpy.float64)
@@ -173,17 +181,26 @@ def fit_ni_to_host(end_index, seen_perf, sample_rate: float) -> ClockFit:
     """NI sample time (index / rate) -> host perf_counter, from the lower envelope.
 
     Each point pairs a sample with a host time no earlier than when it was
-    taken (ni_block_ends: a read's stamp, taken before the blocking read,
-    bounds the previous block's last sample). So each (seen - sample time) is
-    the delivery delay plus whatever the reader did before starting its next
-    read. The smallest across the session trace the clock relation with only
-    the minimum of that left in it; it is unknown and makes every mapped time
-    late by about that much. A sync pulse (sub-project 2) is what would bound it.
+    taken (ni_block_ends: a recorder copy's stamp, taken before the blocking
+    read, bounds the previous copy's last sample). So each (seen - sample
+    time) is at least the delivery delay. The smallest across the session
+    trace the clock relation with only their minimum left in it, which makes
+    every mapped time late by about that much. A sync pulse (sub-project 2) is
+    what would bound it.
+
+    That minimum depends on the display refresh rate, which sets the NI read
+    size (sample rate / refresh). While reads are long against the 10 ms copy
+    period, some copies end on the read just before the stamped one and the
+    minimum is the delivery floor. When every copy spans two or more reads,
+    the previous copy ends a whole read or more before the stamp. Simulated
+    (Task 16 review): 60-165 Hz maps about 0.25 ms late, 200 Hz fails the
+    fit, and 240 Hz maps 4.45 ms late. christielab10 runs at 60 Hz.
     """
     t = numpy.asarray(end_index, dtype=numpy.float64) / float(sample_rate)
     seen = numpy.asarray(seen_perf, dtype=numpy.float64)
     if t.size < MIN_FIT_POINTS:
-        return invalid_fit(f"{t.size} host reads, need {MIN_FIT_POINTS}")
+        return invalid_fit(f"{t.size} read pairs, need {MIN_FIT_POINTS} "
+                           "(each a stamp and the last sample before it)")
     if numpy.any(numpy.diff(t) <= 0):
         return invalid_fit("NI sample index is not increasing (task restarted mid-session)")
     edges = numpy.linspace(t[0], t[-1], ENVELOPE_BINS + 1)
@@ -365,7 +382,11 @@ def choose_pairing_by_camera_clock(frame_ids, camera_ts_ns, latches, transition_
     tolerance = latch_tolerance(frame_period)
     residual_ambiguous = not abs(median_residual) <= tolerance
     agreement_ambiguous = agreement < PAIRING_MIN_AGREEMENT
-    if residual_ambiguous:
+    if not math.isfinite(tolerance):
+        reason = "the frame period is unknown, so the residual cannot be judged"
+    elif not math.isfinite(median_residual):
+        reason = "no frame of the chosen shift has a transition"
+    elif residual_ambiguous:
         reason = (f"median residual {median_residual * 1e3:.3f} ms is over the latch "
                   f"tolerance ({tolerance * 1e3:.3f} ms)")
     elif agreement_ambiguous:

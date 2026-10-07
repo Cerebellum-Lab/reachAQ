@@ -266,6 +266,24 @@ def test_without_clock_latches_the_host_arrival_pairing_is_used_and_says_so(tmp_
                                                             abs=1e-6)
 
 
+def test_latches_none_of_which_is_usable_are_counted_in_the_fallback_reason(tmp_path):
+    session = _session(tmp_path)
+    with h5py.File(session / "streams" / "latency" / "camera_left.h5", "r+") as store:
+        latches = store["clock_latches"][()]
+        latches["perf_after"] = latches["perf_before"] + 0.005
+        store["clock_latches"][...] = latches
+
+    status = finalize_session_latency(session, primary_camera="left")
+
+    assert status["status"] == "partial"
+    assert status["reasons"] == [
+        "camera-to-NI pairing by host arrival assumes exposure→arrival under one frame "
+        "period (6 camera clock latches, none usable: bracket over 2 ms or not finite)"]
+    camera = status["clocks"]["cameraToNi"]
+    assert camera["pairing"]["method"] == "host_arrival"
+    assert camera["assumes_lag_below_period"] is True
+
+
 def test_a_rebuild_of_streams_without_clock_latches_does_not_raise(tmp_path, capsys):
     session = _session(tmp_path, latches=False)
 
