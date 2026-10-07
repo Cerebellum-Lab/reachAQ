@@ -2,6 +2,7 @@ import hashlib
 import json
 from pathlib import Path
 
+import pytest
 import yaml
 
 from tools.session_validation import ValidationProfile, validate_session
@@ -24,17 +25,19 @@ def _session(tmp_path):
     metadata_json = root / "session001_metadata.json"
     _write(metadata_json, json.dumps(metadata))
     _write(root / "session001_metadata.yaml", yaml.safe_dump(metadata))
+    _write(root / "streams/alignment.json", json.dumps({
+        "schemaVersion": 2, "metadataGenerationId": generation,
+    }))
     stream_manifest = {
         "schemaVersion": 2,
         "metadataGenerationId": generation,
         "sessionId": "session001",
         "sessionComplete": True,
         "enabledSources": [],
+        # As _write_session publishes it: alignment.json is always listed.
+        "files": [_manifest_entry(root, "streams/alignment.json")],
     }
     _write(root / "streams/stream_manifest.json", json.dumps(stream_manifest))
-    _write(root / "streams/alignment.json", json.dumps({
-        "schemaVersion": 2, "metadataGenerationId": generation,
-    }))
     files = []
     for path in (
         metadata_json,
@@ -549,7 +552,10 @@ def _session_with_sources(tmp_path, *, present, listed, sources=None):
             _source("nidaq.cam_frames", "nidaq_digital", "streams/nidaq.h5"),
             _source("laser_outputs", "laser_commands_and_states", "streams/laser.csv"),
         ],
-        files=[_manifest_entry(root, relative) for relative in listed],
+        files=[
+            _manifest_entry(root, relative)
+            for relative in ("streams/alignment.json", *listed)
+        ],
     )
     return root
 
@@ -599,8 +605,8 @@ def test_session_manifest_leaves_a_source_file_that_is_absent_to_the_source_rule
 
 
 def test_session_manifest_does_not_expect_video_or_pose_files_to_be_listed(tmp_path):
-    # The recorder hashes neither a camera's video nor a pose file; camera.frames and
-    # sources.contract check them instead, and listing them would hash gigabytes.
+    # The recorder lists none of these: capture processes close them asynchronously,
+    # so a hash taken at publication could be of bytes still changing.
     root = _session_with_sources(
         tmp_path,
         present=("s_left.mp4", "s_left_raw2D_live.h5", "streams/stim_camera_evidence.h5"),
@@ -643,6 +649,80 @@ def test_session_manifest_reports_a_source_path_that_leaves_the_session(tmp_path
     assert "escapes session" in result.message
 
 
+# What _write_session lists whenever it exists, bar alignment.json (every session has
+# that one) and the raw latency streams (left out when their writer is still closing).
+_FINALIZED_FILES = (
+    "streams/device.csv",
+    "streams/events.csv",
+    "streams/trials.jsonl",
+    "streams/trial_summary.json",
+    "streams/laser.csv",
+    "streams/pressure.csv",
+    "logs/session.log",
+    "streams/camera_alignment.json",
+    "streams/nidaq.h5",
+    "streams/latency.h5",
+    "20260102_test_session001_frame_timing.csv",
+    "streams/tracking/trial_000001_attempt_001.json",
+)
+
+
+def _session_with_finalized_files(tmp_path, *, unlisted=()):
+    root = _session(tmp_path)
+    for relative in _FINALIZED_FILES:
+        _write(root / relative, f"{relative}\n")
+    _publish_stream_manifest(
+        root,
+        files=[
+            _manifest_entry(root, relative)
+            for relative in ("streams/alignment.json", *_FINALIZED_FILES)
+            if relative not in unlisted
+        ],
+    )
+    return root
+
+
+@pytest.mark.parametrize("relative", ("streams/alignment.json", *_FINALIZED_FILES))
+def test_session_manifest_fails_a_finalized_file_on_disk_that_is_not_listed(
+    tmp_path, relative,
+):
+    # No enabled source names pressure.csv, camera_alignment.json, the frame timing or a
+    # tracking file, so the source check cannot see them go missing from the list.
+    root = _session_with_finalized_files(tmp_path, unlisted=(relative,))
+
+    for profile in (ValidationProfile.QUICK, ValidationProfile.FULL):
+        result = _manifest_result(root, profile)
+        assert result.status.value == "fail", profile
+        assert f"unlisted {relative}" in result.message
+
+
+def test_session_manifest_passes_when_every_finalized_file_is_listed(tmp_path):
+    root = _session_with_finalized_files(tmp_path)
+
+    for profile in (ValidationProfile.QUICK, ValidationProfile.FULL):
+        assert _manifest_result(root, profile).status.value == "pass", profile
+
+
+def test_session_manifest_does_not_require_a_raw_latency_stream(tmp_path):
+    # Finalization leaves one out of the list when its writer was still closing it, and
+    # a later rewrite cannot say that it is final.
+    root = _session_with_finalized_files(tmp_path)
+    _write(root / "streams/latency/camera_right.h5", "raw")
+
+    assert _manifest_result(root, ValidationProfile.FULL).status.value == "pass"
+
+
+def test_session_manifest_matches_a_listed_file_whatever_its_spelling(tmp_path):
+    spellings = (
+        "./streams/device.csv",
+        "streams/../streams/nidaq.h5",
+        (tmp_path / "session001" / "streams/laser.csv").as_posix(),
+    )
+    root = _session_with_sources(tmp_path, present=_SOURCE_FILES, listed=spellings)
+
+    assert _manifest_result(root, ValidationProfile.FULL).status.value == "pass"
+
+
 def test_validation_passes_after_the_post_stop_trial_ledger_update(tmp_path):
     from datetime import datetime
 
@@ -660,19 +740,33 @@ def test_validation_passes_after_the_post_stop_trial_ledger_update(tmp_path):
         "attempt_id": 1, "attempt_label": "1.1", "send_perf_time": 10.25,
         "outcome": "pending_analysis",
     }
-    # The sources the app builds, less the camera, pose and stim-evidence ones: their
-    # files are written elsewhere and the recorder never lists them.
+    # The files other processes write: video, pose and stim evidence.
+    unlisted_files = (
+        "session007_left.mp4",
+        "session007_left_raw2D_live.h5",
+        "streams/stim_camera_evidence.h5",
+    )
+    for relative in unlisted_files:
+        (root / relative).write_bytes(b"written elsewhere")
     SessionDataRecorder._write_session(
         project, 10.0, 100.0, 12.0, (), (), (), (),
         trial_records=(pending,),
         trial_summary={"pending_analysis_attempts": 1},
+        # The sources the app builds (_build_session_source_manifest).
         source_manifest=(
+            _source("camera.left", "camera", "video/left"),
+            _source("pose", "pose", "pose"),
             _source("nidaq.force", "nidaq_analog", "streams/nidaq.h5"),
             _source("device", "decoded_can_and_device_events", "streams/device.csv"),
+            _source("stim_camera_evidence", "stim_camera_detection_evidence",
+                    "streams/stim_camera_evidence.h5"),
             _source("laser_outputs", "laser_commands_and_states", "streams/laser.csv"),
             _source("session_logs", "logs", "logs/session.log"),
             _source("trials", "pellet_trial_ledger", "streams/trials.jsonl"),
         ),
+        source_results={
+            "camera.left": {"sampleCount": 3, "path": "session007_left.mp4", "failure": ""},
+        },
     )
     # What persist_trial_tracking and then the ledger update do once analysis ends.
     record = json.loads(tracking.read_text())
@@ -690,7 +784,17 @@ def test_validation_passes_after_the_post_stop_trial_ledger_update(tmp_path):
     }))
 
     stream = json.loads((root / "streams/stream_manifest.json").read_text())
-    for source in stream["enabledSources"]:
-        assert (root / source["path"]).is_file(), source["id"]
+    listed = {item["path"] for item in stream["files"]}
+    on_disk = {
+        relative
+        for source in stream["enabledSources"]
+        for relative in (source.get("paths") or [source["path"]])
+        if (root / relative).is_file()
+    }
+    # Every source's file is there, so the pass is not for want of anything to check;
+    # and the recorder lists the exempt ones no more than the rule expects it to.
+    assert {"streams/nidaq.h5", *unlisted_files} <= on_disk
+    assert not set(unlisted_files) & listed
+    assert {"streams/pressure.csv", "streams/alignment.json"} <= listed
     result = _manifest_result(root, ValidationProfile.FULL)
     assert result.status.value == "pass", result.message

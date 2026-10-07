@@ -20,6 +20,7 @@ from autotrainer.core import (
 from tools.acquisition.model import session_data_recorder
 from tools.acquisition.model.session_boundary import SessionBoundary
 from tools.acquisition.model.session_data_recorder import SessionDataRecorder
+from tools.session_validation import ValidationProfile, validate_session
 
 
 class _EventSource(ObservableObject):
@@ -1306,7 +1307,9 @@ def test_trial_ledger_update_keeps_the_publication_hash_of_a_file_it_did_not_rew
     project, session_dir, _, pending = _publish_with_a_pending_trial(tmp_path)
     before = _manifest_entries(session_dir)["streams/device.csv"]
     device_csv = session_dir / "streams" / "device.csv"
-    device_csv.write_bytes(device_csv.read_bytes() + b"edited after publication\n")
+    # The same size, so only the hash can tell.
+    data = device_csv.read_bytes()
+    device_csv.write_bytes(b"X" + data[1:])
     assert hashlib.sha256(device_csv.read_bytes()).hexdigest() != before["sha256"]
 
     SessionDataRecorder.update_persisted_trial_ledger(
@@ -1316,6 +1319,25 @@ def test_trial_ledger_update_keeps_the_publication_hash_of_a_file_it_did_not_rew
     )
 
     assert _manifest_entries(session_dir)["streams/device.csv"] == before
+    # The metadata publish that follows analysis hashes the stream manifest it left.
+    metadata = session_dir / "metadata.json"
+    metadata.write_text(json.dumps({"metadataGenerationId": "g"}))
+    (session_dir / "manifest.json").write_text(json.dumps({
+        "schemaVersion": 1,
+        "files": [
+            {
+                "path": path.relative_to(session_dir).as_posix(),
+                "sizeBytes": len(path.read_bytes()),
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            }
+            for path in (metadata, session_dir / "streams" / "stream_manifest.json")
+        ],
+    }))
+    report = validate_session(
+        session_dir, profile=ValidationProfile.FULL, selected_rules=("session.manifest",))
+    result = next(item for item in report.results if item.rule_id == "session.manifest")
+    assert result.status.value == "fail"
+    assert result.message == "hash mismatch streams/device.csv"
 
 
 def test_trial_ledger_update_lists_a_tracking_file_finalization_did_not_see(tmp_path):
