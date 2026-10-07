@@ -89,6 +89,18 @@ class CameraBase:
     def frame_id(self) -> int:
         """Returns the last frame id (frame counter)"""
         return self._last_frame_id
+
+    @property
+    def is_trigger_synchronized(self) -> bool:
+        """Whether this camera exposes on a hardware trigger shared with the
+        other reach cameras, so that its frame_id names the same exposure as
+        theirs.
+
+        A free-running source counts only its own frames: two of them started a
+        few frames apart never share ids, and pairing their frames by id would
+        hold every batch until the later camera caught up.
+        """
+        return False
     
     @property
     def frame_perf_c(self) -> float:
