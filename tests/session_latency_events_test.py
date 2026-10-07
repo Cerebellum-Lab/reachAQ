@@ -1,3 +1,5 @@
+import logging
+import threading
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -57,8 +59,12 @@ def test_write_session_without_latency_rows_creates_no_latency_files(tmp_path):
     assert not (streams / "latency").exists()
 
 
-def _stopped_snapshot(monkeypatch, tmp_path):
-    """Arm, record one pose and stop; return what stop() handed to _write_session."""
+def _stopped_snapshot(monkeypatch, tmp_path, *, end_raises=False, probe=None):
+    """Arm, record one pose and stop; return what stop() handed to _write_session.
+
+    end_raises makes the log's first end() stop the log and then raise, which is
+    what a MemoryError while copying the tables does; the later end() in close()
+    behaves normally. probe(recorder), if given, runs once the recorder exists."""
     laser = _EventSource("trace_received")
     laser.configuration = SimpleNamespace(backend="disabled")
     recorder = SessionDataRecorder(SimpleNamespace(timing_plan=None), laser)
@@ -68,6 +74,20 @@ def _stopped_snapshot(monkeypatch, tmp_path):
     monkeypatch.setattr(recorder, "_snapshot_nidaq_locked", lambda: ())
     monkeypatch.setattr(recorder, "_write_session",
                         lambda **snapshot: seen.update(snapshot) or {})
+    if end_raises:
+        real_end = recorder.latency_events.end
+        calls = []
+
+        def end():
+            calls.append(None)
+            result = real_end()
+            if len(calls) == 1:
+                raise MemoryError("copying the latency tables")
+            return result
+
+        monkeypatch.setattr(recorder.latency_events, "end", end)
+    if probe is not None:
+        probe(recorder)
     project = ProjectInfo(root=str(tmp_path), device_id="test",
                           when=datetime(2026, 1, 2, 3, 4, 5), session=10)
     try:
@@ -101,3 +121,61 @@ def test_stop_hands_over_no_rows_when_the_record_was_off_at_arm(monkeypatch, tmp
 
     assert "latency_events" in seen
     assert seen["latency_events"] is None
+
+
+def test_a_failing_log_end_still_hands_the_session_to_finalization(monkeypatch, tmp_path):
+    # The latency log is a diagnostic. If ending it raises, the session's own
+    # finalization must still be set up, just without the events file.
+    monkeypatch.delenv("REACHAQ_LATENCY_RECORD", raising=False)
+
+    seen = _stopped_snapshot(monkeypatch, tmp_path, end_raises=True)
+
+    assert "latency_events" in seen  # _write_session was reached
+    assert seen["latency_events"] is None
+    assert seen["end_perf"] == 12.0
+
+
+def test_a_failing_log_end_is_logged_outside_the_recorder_lock(monkeypatch, tmp_path):
+    # The session log handler takes the recorder's lock, so a log call made
+    # while stop() holds it could wait on a thread that is mid-emit and holds
+    # the handler lock: a lock-order inversion. Probe from another thread.
+    monkeypatch.delenv("REACHAQ_LATENCY_RECORD", raising=False)
+    records = []
+    blocked = []
+
+    class _Probe(logging.Handler):
+        def __init__(self, recorder):
+            super().__init__(logging.NOTSET)
+            self._recorder = recorder
+
+        def emit(self, record):
+            if "Latency event log" not in record.getMessage():
+                return
+            records.append(record)
+
+            def take():
+                got = self._recorder._lock.acquire(timeout=2)
+                if got:
+                    self._recorder._lock.release()
+                blocked.append(not got)
+
+            thread = threading.Thread(target=take)
+            thread.start()
+            thread.join()
+
+    handlers = []
+
+    def probe(recorder):
+        handlers.append(_Probe(recorder))
+        logging.getLogger().addHandler(handlers[0])
+
+    try:
+        _stopped_snapshot(monkeypatch, tmp_path, end_raises=True, probe=probe)
+    finally:
+        for handler in handlers:
+            logging.getLogger().removeHandler(handler)
+
+    assert len(records) == 1
+    assert records[0].levelno == logging.ERROR
+    assert records[0].exc_info is not None  # the failure itself is in the log
+    assert blocked == [False]
