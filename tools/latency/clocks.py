@@ -20,6 +20,7 @@ NI_MAX_RESIDUAL_SECONDS = 0.0005
 WALL_SEGMENT_JUMP_SECONDS = 0.001
 ENVELOPE_BINS = 20
 PAIRING_MARGIN_SECONDS = 0.0001
+PAIRING_MIN_AGREEMENT = 0.95
 
 
 @dataclasses.dataclass(frozen=True)
@@ -151,8 +152,8 @@ def fit_ni_to_host(end_index, seen_perf, sample_rate: float) -> ClockFit:
     """
     t = numpy.asarray(end_index, dtype=numpy.float64) / float(sample_rate)
     seen = numpy.asarray(seen_perf, dtype=numpy.float64)
-    if t.size < ENVELOPE_BINS:
-        return invalid_fit(f"{t.size} host reads, need {ENVELOPE_BINS}")
+    if t.size < MIN_FIT_POINTS:
+        return invalid_fit(f"{t.size} host reads, need {MIN_FIT_POINTS}")
     if numpy.any(numpy.diff(t) <= 0):
         return invalid_fit("NI sample index is not increasing (task restarted mid-session)")
     edges = numpy.linspace(t[0], t[-1], ENVELOPE_BINS + 1)
@@ -209,13 +210,19 @@ def choose_pairing(frame_ids, arrival_perf, transition_perf, frame_period: float
     inside = (numbers >= 0) & (numbers < transition_perf.size)
     lag = arrival[inside] - transition_perf[numbers[inside]]
     median_lag = float(numpy.median(lag)) if lag.size else math.nan
-    ambiguous = not (PAIRING_MARGIN_SECONDS <= median_lag
-                     <= frame_period - PAIRING_MARGIN_SECONDS)
-    reason = (
-        f"median arrival lag {median_lag * 1e3:.3f} ms is within "
-        f"{PAIRING_MARGIN_SECONDS * 1e3:.1f} ms of 0 or one frame period"
-        if ambiguous else ""
-    )
+    lag_ambiguous = not (PAIRING_MARGIN_SECONDS <= median_lag
+                         <= frame_period - PAIRING_MARGIN_SECONDS)
+    agreement_ambiguous = agreement < PAIRING_MIN_AGREEMENT
+    ambiguous = lag_ambiguous or agreement_ambiguous
+    if lag_ambiguous:
+        reason = (
+            f"median arrival lag {median_lag * 1e3:.3f} ms is within "
+            f"{PAIRING_MARGIN_SECONDS * 1e3:.1f} ms of 0 or one frame period"
+        )
+    elif agreement_ambiguous:
+        reason = f"agreement {agreement:.2f} below {PAIRING_MIN_AGREEMENT}"
+    else:
+        reason = ""
     return Pairing(shift, median_lag, agreement, bool(ambiguous), reason)
 
 
@@ -223,8 +230,9 @@ def fit_camera_to_ni(frame_ids, camera_ts_ns, transition_index, sample_rate: flo
                      pairing: Pairing, frame_period: float) -> ClockFit:
     """Camera timestamp (s) -> NI time (s), over the paired frames.
 
-    Exposure times then come from each frame's own camera timestamp, so a
-    transition lost mid-session costs only that frame's point in the fit.
+    Each frame's camera timestamp maps to a specific transition index via the
+    pairing shift. A lost or spurious NI transition renumbers every later frame
+    by one, causing a ~P/4 residual slip if undetected; check pairing.ambiguous.
     """
     frame_ids = numpy.asarray(frame_ids, dtype=numpy.int64)
     camera_ts = numpy.asarray(camera_ts_ns, dtype=numpy.float64) / 1e9
@@ -242,11 +250,34 @@ class WallMap:
     def map(self, wall):
         wall = numpy.asarray(wall, dtype=numpy.float64)
         out = numpy.full(wall.shape, math.nan)
+        # First pass: apply padded ranges (extrapolation zone)
         for fit in self.fits:
             if not fit.valid:
                 continue
             inside = (wall >= fit.x_min - 2.0) & (wall <= fit.x_max + 2.0)
             out[inside] = fit.map(wall[inside])
+        # Second pass: apply exact ranges (measured zone), overwriting extrapolation
+        for fit in self.fits:
+            if not fit.valid:
+                continue
+            inside = (wall >= fit.x_min) & (wall <= fit.x_max)
+            out[inside] = fit.map(wall[inside])
+        # Third pass: detect overlaps from backward wall steps.
+        # If any wall value falls in multiple segments' exact ranges, it's ambiguous.
+        overlapping = numpy.zeros(wall.shape, dtype=bool)
+        for fit in self.fits:
+            if not fit.valid:
+                continue
+            inside = (wall >= fit.x_min) & (wall <= fit.x_max)
+            overlapping |= inside
+        # Mark overlaps (wall values in more than one segment) as NaN
+        overlap_count = numpy.zeros(wall.shape, dtype=int)
+        for fit in self.fits:
+            if not fit.valid:
+                continue
+            inside = (wall >= fit.x_min) & (wall <= fit.x_max)
+            overlap_count[inside] += 1
+        out[overlap_count > 1] = math.nan
         return out
 
 
@@ -258,7 +289,8 @@ def fit_wall_to_host(wall, perf) -> WallMap:
     wall, perf = wall[keep], perf[keep]
     if wall.size < 2:
         return WallMap(())
-    order = numpy.argsort(wall, kind="stable")
+    # Sort by perf (monotonic recorded order), not by wall (may step backward).
+    order = numpy.argsort(perf, kind="stable")
     wall, perf = wall[order], perf[order]
     offset = perf - wall
     breaks = numpy.flatnonzero(numpy.abs(numpy.diff(offset)) > WALL_SEGMENT_JUMP_SECONDS) + 1
