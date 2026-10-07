@@ -8,6 +8,7 @@ import math
 import threading
 import time
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -366,6 +367,36 @@ class SessionDataRecorder:
             self._pressure_samples_since_start = 0
             self._pressure.clear()
 
+    @contextmanager
+    def _locked_then_log(self):
+        """Hold the recorder lock; log what the block collected once it is released.
+
+        The session log handler takes this lock, so logging while holding it can
+        deadlock against a thread that is mid-emit and holds the handler's own
+        lock. The block appends (message, error) pairs to the list it is given.
+        """
+        failures = []
+        try:
+            with self._lock:
+                yield failures
+        finally:
+            for message, error in failures:
+                logging.getLogger(__name__).error(message, exc_info=error)
+
+    def _end_latency_events(self, failures: list, consequence: str):
+        """End the latency log; None if that failed, so the caller carries on.
+
+        The log is a diagnostic and must not cost the session its finalization
+        or leave the recorder armed. Call with the recorder lock held: the
+        failure is added to `failures` to be logged after the lock is released.
+        """
+        try:
+            return self._latency_events.end()
+        except Exception as error:
+            failures.append((
+                f"Latency event log could not be ended; {consequence}", error))
+            return None
+
     def stop(self, end_perf: float):
         with self._event_capture_lock:
             self._event_capture_enabled = False
@@ -373,10 +404,11 @@ class SessionDataRecorder:
         with self._lock:
             self._pending_stop_end_perf = float(end_perf)
         self._stop_nidaq_thread()
-        with self._lock:
+        with self._locked_then_log() as failures:
             if not self._armed or self._project is None or self._start_perf is None:
                 self._pending_stop_end_perf = None
-                self._latency_events.end()
+                self._end_latency_events(
+                    failures, "the recorder is cleared without it")
                 self._clear_locked()
                 return None
             project = self._project
@@ -414,16 +446,8 @@ class SessionDataRecorder:
             # end() either way, so the log stops. None when the switch was off
             # at arm: _write_session then writes no events.h5, and a session
             # recorded with the record off carries no latency files at all.
-            # A diagnostic must not cost the session its finalization. The
-            # failure is logged after the lock is released: the session log
-            # handler takes this lock, so logging under it could deadlock
-            # against a thread that is mid-emit.
-            latency_end_error = None
-            try:
-                latency_events = self._latency_events.end()
-            except Exception as error:
-                latency_end_error = error
-                latency_events = None
+            latency_events = self._end_latency_events(
+                failures, "the session is finalized without it")
             if not self._latency_events.enabled:
                 latency_events = None
             snapshot = {
@@ -452,11 +476,6 @@ class SessionDataRecorder:
             self._armed = False
             self._pending_stop_end_perf = None
             self._pending_finalization = snapshot
-        if latency_end_error is not None:
-            logging.getLogger(__name__).error(
-                "Latency event log could not be ended; the session is finalized without it",
-                exc_info=latency_end_error,
-            )
         return self._publish_pending_finalization(max_attempts=2)
 
     def retry_pending_finalization(self):
@@ -533,7 +552,7 @@ class SessionDataRecorder:
             self._event_capture_enabled = False
             self._drain_event_queue()
         self._stop_nidaq_thread()
-        with self._lock:
+        with self._locked_then_log() as failures:
             spool_path = self._nidaq_spool_path
             pending = self._pending_finalization
             if pending is not None:
@@ -542,7 +561,8 @@ class SessionDataRecorder:
                     spool_path = pending_source.path
             self._pending_finalization = None
             self._pending_stop_end_perf = None
-            self._latency_events.end()
+            self._end_latency_events(
+                failures, "the recorder is cleared without it")
             self._clear_locked()
         if spool_path is not None:
             spool_path.unlink(missing_ok=True)
