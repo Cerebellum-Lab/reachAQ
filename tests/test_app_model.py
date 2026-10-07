@@ -1670,10 +1670,58 @@ def test_session_metadata_keeps_the_capture_figures_it_was_finalized_with(
     app_model._save_metadata(project, project.when, str(output), project.session)
 
     saved = json.loads(output.with_suffix(".json").read_text())
-    assert saved["capture"] == finalized
+    # No session files were written here, so there are no exact counts.
+    assert saved["capture"] == {**finalized, "exact": None}
     assert saved["capture"]["elapsedSeconds"] == 2.5
     assert saved["capture"]["framesAcquired"] == 375
     assert saved["capture"]["framesInferenced"] == 370
+
+
+def test_finalized_capture_carries_exact_counts_from_the_session_files(
+    app_model,
+):
+    project = app_model.project
+    _, token = app_model._recording_session.begin_record(project.short_id, {})
+    app_model._recording_session.set_pending_end(12.5, token)
+    app_model._recording_session.set_boundary(SessionBoundary(
+        session_id=project.short_id,
+        primary_camera="left",
+        primary_frame_id=42,
+        start_perf_time=10.0,
+        start_wall_time=100.0,
+        camera_when=1_000_000.0,
+    ), token)
+    app_model._recording_session.transition(
+        SessionRecordingStatus.STOPPING,
+        expected=(SessionRecordingStatus.ARMING,),
+        token=token,
+    )
+    streams_dir = Path(project.get_session_path().location) / "streams"
+    streams_dir.mkdir(parents=True, exist_ok=True)
+    (streams_dir / "camera_alignment.json").write_text(json.dumps({
+        "primaryFrameCount": 4,
+        "cameras": {"left": {"presentFrames": 4}},
+    }))
+    _, _, posed_path = project.get_video_path("left", allow_overwrite=True)
+    Path(posed_path).write_text("0\n1\n3\n")
+
+    with mock.patch.object(
+        app_model._session_data_recorder, "stop"
+    ), mock.patch.object(
+        app_model, "_save_project_metadata"
+    ), mock.patch.object(
+        app_model._intertrial_analysis, "is_idle", return_value=False,
+    ), mock.patch.object(
+        app_model, "_wait_and_finish_intertrial_session",
+    ):
+        app_model._complete_stopped_recording(project)
+
+    assert app_model._recording_session.capture_telemetry["exact"] == {
+        "framesRecorded": 4,
+        "cameras": {
+            "left": {"framesDropped": 0, "framesPosed": 3, "posedPercent": 75.0},
+        },
+    }
 
 
 def test_metadata_pair_is_not_replaced_when_yaml_serialization_fails(

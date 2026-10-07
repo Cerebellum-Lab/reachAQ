@@ -419,3 +419,69 @@ def test_the_latency_status_line_for_each_outcome(status, expected):
     from tools.acquisition.model.session_telemetry import describe_latency_status
 
     assert describe_latency_status(status) == expected
+
+
+def _alignment(frames_recorded, present_by_camera):
+    return {
+        "primaryFrameCount": frames_recorded,
+        "cameras": {
+            name: {"presentFrames": present}
+            for name, present in present_by_camera.items()
+        },
+    }
+
+
+def test_exact_counts_come_from_the_session_files(tmp_path):
+    """The live counters are only good to a report period either way; the
+    session's own files say exactly what was recorded, dropped and posed."""
+    from tools.acquisition.model.session_telemetry import exact_session_capture
+
+    left = tmp_path / "left_processed_frames.txt"
+    right = tmp_path / "right_processed_frames.txt"
+    left.write_text("0\n1\n2\n3\n5\n6\n7\n8\n9\n", encoding="utf-8")
+    # A repeated slot is one posed frame, and a slot past the recording is
+    # not a frame of it.
+    right.write_text("0\n2\n2\n4\n6\n8\n10\n", encoding="utf-8")
+
+    exact = exact_session_capture(
+        _alignment(10, {"left": 10, "right": 9}),
+        {"left": left, "right": right},
+    )
+
+    assert exact == {
+        "framesRecorded": 10,
+        "cameras": {
+            "left": {"framesDropped": 0, "framesPosed": 9, "posedPercent": 90.0},
+            # Of the nine frames the camera delivered, not the ten recorded:
+            # the blank for the dropped one never reaches the pose queue.
+            "right": {"framesDropped": 1, "framesPosed": 5, "posedPercent": 55.56},
+        },
+    }
+
+
+def test_exact_counts_without_live_pose_still_report_drops(tmp_path):
+    from tools.acquisition.model.session_telemetry import exact_session_capture
+
+    exact = exact_session_capture(
+        _alignment(10, {"left": 8}),
+        {"left": tmp_path / "missing_processed_frames.txt"},
+    )
+
+    assert exact == {
+        "framesRecorded": 10,
+        "cameras": {
+            "left": {"framesDropped": 2, "framesPosed": None, "posedPercent": None},
+        },
+    }
+
+
+def test_no_exact_counts_when_the_timeline_could_not_be_aligned():
+    """A failed merge writes its diagnostics with no frames and no counts."""
+    from tools.acquisition.model.session_telemetry import exact_session_capture
+
+    failed = {
+        "primaryFrameCount": 0,
+        "cameras": {"left": {"integrityError": "left timestamp file is empty"}},
+    }
+
+    assert exact_session_capture(failed, {}) is None

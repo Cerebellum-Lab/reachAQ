@@ -1,6 +1,7 @@
 import math
 import time
 import typing
+from pathlib import Path
 
 from autotrainer.core.observable_object import ObservableObject
 
@@ -364,3 +365,49 @@ def describe_latency_status(status) -> str:
     confidence = pose.get("confidence")
     text = str(status.get("status", "failed"))
     return f"{text} ({confidence})" if confidence else text
+
+
+def exact_session_capture(alignment: dict,
+                          posed_frame_paths: typing.Mapping[str, Path]
+                          ) -> typing.Optional[typing.Dict[str, typing.Any]]:
+    """Exact counts for a finished session, from its own files.
+
+    The counters above come from totals reported every 0.5 s, so a session's
+    frames acquired and inferenced are each good to about 75 frames at 150 fps
+    either way, and a stale frame count reads as exactly 100% inferenced. The
+    files are exact. The merged timeline (frame_timing.csv, counted in
+    camera_alignment.json) has one row per recorded frame, and each camera's
+    processed-frames file lists the rows that got a live pose: the pose queue
+    indexes a frame by its camera frame id less the recording's first, which is
+    its row. That includes poses of recorded frames computed in the moment
+    after Stop, which the counters exclude.
+
+    Percentages are of the frames the camera delivered. A blank the capture
+    inserted for a dropped frame goes to the writers only, never to the pose
+    queue, so it can never be posed. None when the timeline was not merged;
+    per camera, None where the file is missing.
+    """
+    frames_recorded = int(alignment.get("primaryFrameCount") or 0)
+    if frames_recorded <= 0:
+        return None
+    cameras = {}
+    for name, camera in alignment.get("cameras", {}).items():
+        present = camera.get("presentFrames")
+        delivered = frames_recorded if present is None else int(present)
+        path = posed_frame_paths.get(name)
+        posed = (None if path is None or not path.is_file()
+                 else _count_posed_frames(path, frames_recorded))
+        cameras[name] = {
+            "framesDropped": (None if present is None
+                              else frames_recorded - delivered),
+            "framesPosed": posed,
+            "posedPercent": (None if posed is None or delivered <= 0
+                             else round(100.0 * posed / delivered, 2)),
+        }
+    return {"framesRecorded": frames_recorded, "cameras": cameras}
+
+
+def _count_posed_frames(path: Path, frames_recorded: int) -> int:
+    with path.open(encoding="utf-8") as stream:
+        slots = {int(line) for line in stream if line.strip()}
+    return sum(1 for slot in slots if 0 <= slot < frames_recorded)
