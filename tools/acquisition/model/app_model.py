@@ -10038,6 +10038,9 @@ class AppModel(ObservableObject):
                 self._recording_session.boundary.end_wall_time,
             )
             self._session_telemetry.end(end_perf)
+            self._recording_session.set_capture_telemetry(
+                self._session_telemetry.summary()
+            )
             stream_result = self._session_data_recorder.stop(end_perf)
         except Exception as first_error:
             logger.exception(
@@ -10576,10 +10579,16 @@ class AppModel(ObservableObject):
                 # that dropped nothing, and carried an 8.5 s end-to-end max
                 # from the first frame through the warming pipeline. Rebase
                 # here so the percentage measures the two running together.
-                # A recording owns the counters once it starts, so this
-                # never moves a session's baseline.
-                if (self._recording_session.status
-                        is not SessionRecordingStatus.RECORDING):
+                # A recording owns the counters from its first frame until it
+                # is finalized, so this never moves a session's baseline. That
+                # includes Stopping: the pose process handles EOF_RECORDING
+                # and comes straight back to live while the session is still
+                # being saved, and rebasing there zeroed the saved figures.
+                if self._recording_session.status not in {
+                    SessionRecordingStatus.RECORDING,
+                    SessionRecordingStatus.STOPPING,
+                    SessionRecordingStatus.ANALYZING,
+                }:
                     self._begin_session_telemetry()
             elif value == InferenceStatus.stopped:
                 current = self._acquisition.subsystems.get(
@@ -11242,8 +11251,14 @@ class AppModel(ObservableObject):
                 "artifacts": artifacts,
                 # What the operator watched during the recording, kept so the
                 # same numbers can be read back from the session rather than
-                # only having existed on screen.
-                "capture": self._session_telemetry.summary(),
+                # only having existed on screen. Taken as the session was
+                # finalized: a notes save rewrites this file later, by when
+                # the counters may have been rebased for preview.
+                "capture": (
+                    self._session_telemetry.summary()
+                    if self._recording_session.capture_telemetry is None
+                    else self._recording_session.capture_telemetry
+                ),
                 # The latency record's status: per-loop completeness, the
                 # clock fits it used, and why anything is missing.
                 "latency": dict(self._latency_status),
