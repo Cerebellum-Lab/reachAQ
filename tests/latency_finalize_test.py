@@ -323,6 +323,43 @@ def test_a_session_whose_loops_all_find_nothing_is_absent(tmp_path):
     assert {entry["status"] for entry in status["loops"].values()} == {"absent"}
 
 
+def _replace_can_events(session, rows):
+    with h5py.File(session / "streams" / "latency" / "events.h5", "r+") as store:
+        del store["can_events"]
+        store.create_dataset("can_events", data=rows)
+
+
+def test_a_can_disabled_run_leaves_the_can_loop_absent_and_the_session_complete(tmp_path):
+    # With CAN off the app still records a token row for the command it never
+    # sent; the CAN loop must not turn that into a measured loop.
+    session = _session(tmp_path)
+    rows = np.zeros(1, dtype=EVENT_TABLES["can_events"])
+    rows[0] = (b"token", b"t1", b"SET_RGB_LED", -1, HOST + 0.5, np.nan, np.nan)
+    _replace_can_events(session, rows)
+
+    status = finalize_session_latency(session, primary_camera="left")
+
+    assert status["loops"]["can"]["status"] == "absent"
+    assert status["loops"]["can"]["reason"] == "no CAN sends recorded"
+    assert status["status"] == "complete", status
+
+
+def test_can_sends_nobody_acknowledged_cap_the_session_at_partial(tmp_path):
+    session = _session(tmp_path)
+    rows = np.zeros(4, dtype=EVENT_TABLES["can_events"])
+    rows[0] = (b"token", b"t1", b"SET_RGB_LED", -1, HOST + 0.5, np.nan, np.nan)
+    rows[1] = (b"enqueue", b"t1", b"SET_RGB_LED", -1, HOST + 0.501, np.nan, np.nan)
+    rows[2] = (b"dequeue", b"t1", b"", -1, HOST + 0.504, np.nan, np.nan)
+    rows[3] = (b"send", b"t1", b"SET_RGB_LED", 5, HOST + 0.505, HOST + 0.506, np.nan)
+    _replace_can_events(session, rows)
+
+    status = finalize_session_latency(session, primary_camera="left")
+
+    assert status["loops"]["can"]["status"] == "partial"
+    assert status["loops"]["can"]["reason"] == "1 sends, none acknowledged"
+    assert status["status"] == "partial", status
+
+
 def test_a_session_whose_only_loop_fails_is_failed(tmp_path):
     _write(tmp_path / "streams" / "latency" / "pose.h5", {}, {"cameras": "not json"})
 

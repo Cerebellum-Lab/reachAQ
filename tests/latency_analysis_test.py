@@ -148,6 +148,52 @@ def test_an_ack_that_lands_before_the_send_hook_returns_still_joins():
     assert result["summary"]["acked"] == 1
 
 
+def _sent_command(events, first, token, uuid, send_perf):
+    events[first] = (b"token", token, b"SET_RGB_LED", -1, send_perf - 0.005, np.nan, np.nan)
+    events[first + 1] = (b"enqueue", token, b"SET_RGB_LED", -1, send_perf - 0.004, np.nan, np.nan)
+    events[first + 2] = (b"dequeue", token, b"", -1, send_perf - 0.001, np.nan, np.nan)
+    events[first + 3] = (b"send", token, b"SET_RGB_LED", uuid, send_perf, send_perf + 0.001, np.nan)
+
+
+def test_can_loop_with_a_token_but_no_send_is_absent():
+    # A CAN-disabled run still records the command's token row, but nothing
+    # is sent. That is no CAN traffic, not a complete loop that measured none.
+    events = np.zeros(1, dtype=CAN_EVENT_DTYPE)
+    events[0] = (b"token", b"t1", b"SET_RGB_LED", -1, 1.000, np.nan, np.nan)
+
+    result = analysis.can_loop(can_events=events, wall_map=None)
+
+    assert result["status"] == "absent"
+    assert result["reason"] == "no CAN sends recorded"
+
+
+def test_can_loop_with_sends_and_no_acks_is_partial():
+    events = np.zeros(9, dtype=CAN_EVENT_DTYPE)
+    _sent_command(events, 0, b"t1", 3, 1.005)
+    _sent_command(events, 4, b"t2", 4, 2.005)
+    # An ack for a uuid nobody sent does not count for either command.
+    events[8] = (b"ack", b"", b"", 99, 2.010, np.nan, np.nan)
+
+    result = analysis.can_loop(can_events=events, wall_map=None)
+
+    assert result["status"] == "partial"
+    assert result["reason"] == "2 sends, none acknowledged"
+    assert result["summary"] == {"commands": 2, "acked": 0}
+
+
+def test_can_loop_with_one_ack_among_the_sends_stays_complete():
+    events = np.zeros(9, dtype=CAN_EVENT_DTYPE)
+    _sent_command(events, 0, b"t1", 3, 1.005)
+    _sent_command(events, 4, b"t2", 4, 2.005)
+    events[8] = (b"ack", b"", b"", 4, 2.016, np.nan, np.nan)
+
+    result = analysis.can_loop(can_events=events, wall_map=None)
+
+    assert result["status"] == "complete"
+    assert result["reason"] == ""
+    assert result["summary"] == {"commands": 2, "acked": 1}
+
+
 def test_hardware_loop_without_output_edges_is_absent():
     result = analysis.hardware_loop(command_edges={}, diode_edges={}, trigger_edges={},
                                     unusable={"laser1_diode": "swing 0.0001 against noise"})
