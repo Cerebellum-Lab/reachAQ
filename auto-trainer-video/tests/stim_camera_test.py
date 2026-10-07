@@ -1,3 +1,6 @@
+import math
+import queue
+
 import h5py
 import numpy
 import pytest
@@ -198,3 +201,46 @@ def test_capture_hot_path_stamps_evidence_clip_and_send():
     record = capture._attrs.msg_queue.items[0][1][1]
     assert (record["decision_perf_time"] <= record["evidence_done_perf_time"]
             <= record["clip_done_perf_time"] <= record["msg_send_perf_time"])
+
+
+def test_direct_route_ipc_dict_carries_finite_capture_stamps():
+    # The direct trigger's queue dict is built apart from the message dict, so
+    # it needs its own check: the laser process forwards exactly these stamps.
+    detector = StimCameraDetector(_configuration())
+    detector.arm({**_arm(), "trigger_route": "direct_ni_software"})
+
+    class Writer:
+        def append(self, **row):
+            pass
+
+        def queue_clip(self, decision, frames):
+            return True
+
+    capture = object.__new__(VideoCapture)
+    capture._stim_detector = detector
+    capture._stim_evidence_writer = Writer()
+    capture._stim_session_active = True
+    capture._camera_idx = 2
+    capture._stim_clip_prebuffer = __import__("collections").deque(maxlen=2)
+    capture._stim_pending_clip = None
+    capture._attrs = type("Attrs", (), {
+        "msg_queue": queue.Queue(), "stim_trigger_queue": queue.Queue(),
+    })()
+
+    capture._process_stim_frame(numpy.ones((10, 10)) * 4, 1, 10, 1.0)
+    capture._process_stim_frame(numpy.ones((10, 10)) * 6, 2, 20, 1.1)
+
+    trigger = capture._attrs.stim_trigger_queue.get_nowait()
+    assert capture._attrs.stim_trigger_queue.empty()  # one-shot: one trigger
+    assert trigger["trigger_route"] == "direct_ni_software"
+    stamps = [trigger[key] for key in (
+        "decision_perf_time", "evidence_done_perf_time", "clip_done_perf_time",
+        "ipc_send_perf_time",
+    )]
+    assert all(math.isfinite(stamp) for stamp in stamps)
+    assert stamps == sorted(stamps)
+    # The GUI also gets the message for a direct trigger, with the same stamps
+    # (it records no row for it: the result carries the NI start).
+    message = capture._attrs.msg_queue.get_nowait()[1][1]
+    assert message["evidence_done_perf_time"] == trigger["evidence_done_perf_time"]
+    assert message["clip_done_perf_time"] == trigger["clip_done_perf_time"]
