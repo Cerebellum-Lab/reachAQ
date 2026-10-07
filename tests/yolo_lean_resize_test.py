@@ -67,6 +67,25 @@ def test_a_base_frame_is_scaled_to_the_model_and_back(imgsz):
         assert pose[0, 2] == 1.0
 
 
+@pytest.mark.parametrize("imgsz", [320, 512])
+def test_the_resize_is_the_one_ultralytics_letterbox_makes(imgsz):
+    """LetterBox resizes with cv2 INTER_LINEAR on half-pixel centres. A dot
+    test cannot tell align_corners=True from False, or a half-pixel shift; a
+    comparison of every input value can."""
+    cv2 = pytest.importorskip("cv2")
+    model = _graphed_model(imgsz)
+    frames = numpy.random.default_rng(0).uniform(0, 255, (2, 256, 256, 3))
+
+    model.predict(frames)
+
+    letterboxed = numpy.stack([
+        cv2.resize(frame, (imgsz, imgsz), interpolation=cv2.INTER_LINEAR)
+        for frame in frames])
+    expected = torch.from_numpy(numpy.ascontiguousarray(
+        letterboxed[..., ::-1].transpose(0, 3, 1, 2))).float().div_(255.0)
+    assert (model._graph_in - expected).abs().max().item() < 1e-4
+
+
 def test_a_frame_already_at_imgsz_reaches_the_graph_unchanged():
     """The 256 models, which is what the rig runs live, must not move at all."""
     model = _graphed_model(256)

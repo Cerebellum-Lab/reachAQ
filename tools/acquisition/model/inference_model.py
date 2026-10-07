@@ -39,6 +39,16 @@ logger = get_verbose_logger(__name__)
 _local_do_debug = False
 
 
+def _describe_exit(exitcode: int) -> str:
+    """How a process ended, as multiprocessing reports it: a negative code is a signal."""
+    if exitcode < 0:
+        try:
+            return f"pose process was killed by {signal.Signals(-exitcode).name}"
+        except ValueError:
+            pass
+    return f"pose process exited with code {exitcode}"
+
+
 class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
 
     IS_ENABLED = "is_enabled"
@@ -763,8 +773,9 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
             return
         if self._pose_process_error is None:
             # Killed, or failed before it could say anything - while still
-            # importing, say. The exit code is then all there is to go on.
-            self._pose_process_error = f"pose process exited with code {proc.exitcode}"
+            # importing, say. How it ended is then all there is to go on: the
+            # OOM killer sends SIGKILL, and a CUDA fault is a SIGSEGV.
+            self._pose_process_error = _describe_exit(proc.exitcode)
         logger.error("pose process exited on its own (exit code %s) while %s: %s",
                      proc.exitcode, self._status.value, self._pose_process_error)
         try:
