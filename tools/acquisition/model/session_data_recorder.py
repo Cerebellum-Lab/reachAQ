@@ -865,6 +865,10 @@ class SessionDataRecorder:
         if manifest_path.is_file():
             with manifest_path.open("r", encoding="utf-8") as stream:
                 manifest = json.load(stream)
+            # A raw latency stream is listed here only if _write_session listed it. One
+            # it left out was still being closed by its writer then, and nothing in this
+            # later rewrite can say that it is final now.
+            listed = {entry.get("path") for entry in manifest.get("files", ())}
             manifest_paths = (
                 streams_dir / "device.csv",
                 streams_dir / "events.csv",
@@ -875,7 +879,8 @@ class SessionDataRecorder:
                 alignment_path,
                 *sorted((streams_dir / "tracking").glob("*.json")),
                 streams_dir / "latency.h5",
-                *sorted((streams_dir / "latency").glob("*.h5")),
+                *(path for path in sorted((streams_dir / "latency").glob("*.h5"))
+                  if path.relative_to(streams_dir.parent).as_posix() in listed),
             )
             manifest["files"] = [
                 file_manifest_entry(path, relative_to=streams_dir.parent)
@@ -2006,10 +2011,24 @@ class SessionDataRecorder:
             latency_status = finalize_session_latency(
                 session_dir,
                 primary_camera="" if boundary is None else str(boundary.primary_camera),
+                session_id=project.short_id,
             )
         except Exception as error:
             logging.getLogger(__name__).exception("Latency finalization failed")
             latency_status = {"status": "failed", "reasons": [f"{type(error).__name__}: {error}"]}
+        # The capture and pose processes close their raw streams with no handshake, so
+        # a close slower than the finalizer's open retry leaves a stream that is still
+        # changing. Hashing it into the manifest would record bytes that then change,
+        # and session.manifest would fail on the mismatch. A stream the finalizer could
+        # not read is left unlisted; it stays on disk for the rebuild CLI.
+        unlisted_latency = {
+            str(item.get("path")) for item in (latency_status.get("unreadable") or ())
+            if isinstance(item, dict)
+        }
+        if unlisted_latency:
+            logging.getLogger(__name__).warning(
+                "Latency streams left out of the stream manifest because they could not be read: %s",
+                ", ".join(sorted(unlisted_latency)))
         source_results = {} if source_results is None else dict(source_results)
         nidaq_health = SessionDataRecorder._nidaq_stream_health(
             nidaq_chunks,
@@ -2225,7 +2244,8 @@ class SessionDataRecorder:
             streams_dir / "nidaq.h5",
             *sorted((streams_dir / "tracking").glob("*.json")),
             streams_dir / "latency.h5",
-            *sorted(latency_dir.glob("*.h5")),
+            *(path for path in sorted(latency_dir.glob("*.h5"))
+              if path.relative_to(session_dir).as_posix() not in unlisted_latency),
         )
         stream_manifest = {
             "schemaVersion": 1,
