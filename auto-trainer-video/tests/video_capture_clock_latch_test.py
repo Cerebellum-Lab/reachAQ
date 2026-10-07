@@ -23,6 +23,7 @@ from autotrainer.video import (
     VideoRecordMode,
     VideoRecordProperties,
 )
+from autotrainer.video import video_capture
 
 LOOP_THREAD = "CaptureLoopUnderTest"
 
@@ -157,16 +158,26 @@ def test_a_record_inside_the_stop_mark_keeps_the_stream_it_opened(project_info):
     assert len(stream["frames"]) > 5
 
 
-class _Camera:
-    """latch_clock stub: brackets of ``bracket`` seconds, each call taking ``takes``."""
+class _Clock:
+    """The perf_counter the mark budget reads, advanced only by the camera stub."""
 
-    def __init__(self, bracket, takes=0.0):
-        self.bracket, self.takes, self.calls = bracket, takes, 0
+    def __init__(self):
+        self.now = 1000.0
+
+    def perf_counter(self):
+        return self.now
+
+
+class _Camera:
+    """latch_clock stub: brackets of ``bracket`` seconds, each call taking ``takes`` on ``clock``."""
+
+    def __init__(self, clock, bracket, takes=0.0002):
+        self.clock, self.bracket, self.takes, self.calls = clock, bracket, takes, 0
 
     def latch_clock(self):
         self.calls += 1
-        before = time.perf_counter()
-        time.sleep(self.takes)
+        before = self.clock.now
+        self.clock.now += self.takes
         return before, self.calls, before + self.bracket
 
 
@@ -178,30 +189,34 @@ class _Rows:
         self.rows.append((dataset, row))
 
 
-def _mark(camera):
+def _mark(monkeypatch, bracket, takes=0.0002):
+    clock = _Clock()
+    monkeypatch.setattr(video_capture, "time", clock)
+    camera = _Camera(clock, bracket, takes)
     capture = object.__new__(VideoCapture)
     capture._name = "budget"
     rows = _Rows()
-    started = time.perf_counter()
     capture._append_clock_latches(camera, rows)
-    return rows.rows, time.perf_counter() - started
+    return camera, rows.rows
 
 
-def test_three_quick_latches_make_a_mark():
-    rows, _ = _mark(_Camera(bracket=0.0002))
+def test_three_quick_latches_make_a_mark(monkeypatch):
+    camera, rows = _mark(monkeypatch, bracket=0.0002)
     assert [dataset for dataset, _ in rows] == ["clock_latches"] * 3
 
 
-def test_a_latch_wider_than_the_finalizer_uses_ends_the_mark_after_its_row():
-    rows, _ = _mark(_Camera(bracket=0.003))
-    assert len(rows) == 1
+def test_a_wide_bracket_is_kept_and_the_mark_goes_on(monkeypatch):
+    # The finalizer drops what it cannot use; the next latch may be tight.
+    camera, rows = _mark(monkeypatch, bracket=0.003, takes=0.001)
+    assert camera.calls == 3 and len(rows) == 3
 
 
-def test_a_slow_mark_stops_at_its_time_budget():
-    # Tight brackets, but each call stalls 3 ms after the latch (the value read).
-    camera = _Camera(bracket=0.0002, takes=0.003)
-
-    rows, elapsed = _mark(camera)
-
+def test_a_slow_mark_stops_at_its_time_budget(monkeypatch):
+    # 3 ms per call: the second ends past the 5 ms budget.
+    camera, rows = _mark(monkeypatch, bracket=0.0002, takes=0.003)
     assert camera.calls == 2 and len(rows) == 2
-    assert elapsed < 0.009
+
+
+def test_a_stalled_latch_costs_one_call(monkeypatch):
+    camera, rows = _mark(monkeypatch, bracket=0.020, takes=0.020)
+    assert camera.calls == 1 and len(rows) == 1

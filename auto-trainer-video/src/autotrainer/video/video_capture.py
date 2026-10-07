@@ -65,10 +65,8 @@ FRAME_STATS_REPORT_PERIOD = 0.5
 # uses the tightest one alone. Three cost well under a frame period (each is a
 # USB round trip, about 0.2 ms on a Blackfly S).
 CLOCK_LATCHES_PER_MARK = 3
-# A mark ends early after a latch wider than the finalizer will use (its
-# LATCH_MAX_BRACKET_SECONDS), or once it has taken this long: a stalled USB
-# control transfer must not cost the loop three transport timeouts.
-CLOCK_LATCH_MAX_BRACKET_SECONDS = 0.002
+# A mark ends early once it has taken this long: a stalled USB control transfer
+# must not cost the loop three transport timeouts.
 CLOCK_LATCH_MARK_BUDGET_SECONDS = 0.005
 
 
@@ -1295,8 +1293,10 @@ class VideoCapture(Process):
         where the camera says each exposure happened rather than when the host
         received it. A camera with no clock to latch answers None, which ends
         the mark after one call; a latch that raises is logged and ends it too.
-        Neither reaches the capture loop. A slow latch also ends the mark (see
-        CLOCK_LATCH_MAX_BRACKET_SECONDS), after its row is kept.
+        Neither reaches the capture loop. A wide bracket is kept and the mark
+        goes on (the finalizer drops what it cannot use; the next latch may be
+        tight), but a mark past CLOCK_LATCH_MARK_BUDGET_SECONDS ends after the
+        latch in hand, so a stalled transfer costs one call.
         """
         started = time.perf_counter()
         for _ in range(CLOCK_LATCHES_PER_MARK):
@@ -1305,13 +1305,11 @@ class VideoCapture(Process):
                 if latch is None:
                     return
                 latency.append("clock_latches", latch)
-                bracket = latch[2] - latch[0]
             except Exception:
                 logger.warning("<%s> camera clock latch failed; the recording continues without it",
                                self._name, exc_info=True)
                 return
-            if (not bracket <= CLOCK_LATCH_MAX_BRACKET_SECONDS
-                    or time.perf_counter() - started > CLOCK_LATCH_MARK_BUDGET_SECONDS):
+            if time.perf_counter() - started > CLOCK_LATCH_MARK_BUDGET_SECONDS:
                 return
 
     def _process_stim_frame(
