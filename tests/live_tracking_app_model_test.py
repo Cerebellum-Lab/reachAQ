@@ -173,3 +173,27 @@ def test_a_sample_left_from_an_earlier_recording_does_not_set_the_rate():
         )
     )
     assert app._live_tracking_anchor(app._recording_session.boundary).frame_rate == 150.0
+
+
+def test_the_cue_gate_reads_pellet_presence_from_live_tracking(app_model):
+    # Uses the fully constructed app, because the provider is wired where the
+    # trial executor is built. Without it presence is unknown on every
+    # evaluation and no cued Tone 2 can fire.
+    app_model._live_tracking.append(
+        LiveTrackingSample(
+            sequence=1,
+            primary_frame_ids=(1,),
+            primary_frame_perf_times=(100.0,),
+            source_start_perf=100.0,
+            source_end_perf=100.02,
+            processing_perf=100.03,
+            pellet_seen=True,
+            locations_3d=(),
+            offsets_3d=(),
+        )
+    )
+
+    gate = app_model._trial_action_executor._cue_gate_state(100.05)
+
+    assert gate.pellet_present is True
+    assert gate.observed_at == pytest.approx(100.01)
