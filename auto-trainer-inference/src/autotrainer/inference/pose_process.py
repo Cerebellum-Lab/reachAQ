@@ -51,6 +51,17 @@ def _is_end_of_recording(frames_indices) -> bool:
     return bool((frames_indices == FrameIndexCategory.EOF_RECORDING).any())
 
 
+def _describe_error(err: BaseException) -> str:
+    """The reason sent with Terminated: the type and the message's first line.
+
+    This is what the operator reads in the failed subsystem, where a CUDA
+    error's several lines of advice would bury the one that matters. The full
+    traceback is in this process's log.
+    """
+    lines = str(err).strip().splitlines()
+    return f"{type(err).__name__}: {lines[0]}" if lines else type(err).__name__
+
+
 def take_newest_live_batch(queue, frame_buffer, frames_indices, frames_perf_c,
                            *, drain: bool) -> bool:
     """Fill the buffers from the freshest batch the live queue holds.
@@ -212,6 +223,10 @@ class PoseProcess(Process):
             self.__do_run()
         except BaseException as err:
             logger.exception("Fatal error: %s", err)
+            # A failure before processing starts - a model that will not load -
+            # otherwise exits without a word, and the parent could only say
+            # that live inference stopped, not why.
+            self._send_message(InferenceStatusMessageKind.Terminated, _describe_error(err))
 
     def __do_run(self):
         self._send_message(InferenceStatusMessageKind.Created)
@@ -272,6 +287,7 @@ class PoseProcess(Process):
             record_stop_sema=self._record_stop_sema,
         )
 
+        error = None
         try:
             should_process = self._wait_for_start()
             if should_process:
@@ -282,9 +298,12 @@ class PoseProcess(Process):
                 self._process(offline_input)
         except Exception as err:
             logger.exception("Error during processing: %s", err)
+            error = _describe_error(err)
         finally:
             offline_input.set_live(True)  # ensure it's interrupted if was running
-            self._send_message(InferenceStatusMessageKind.Terminated)
+            # None on a requested stop. Whether the exit was expected is decided
+            # in the parent from the process itself; this only says why.
+            self._send_message(InferenceStatusMessageKind.Terminated, error)
         logger.notice("exiting pose_predict")
 
     def _send_message(self, kind: InferenceStatusMessageKind, context=None):

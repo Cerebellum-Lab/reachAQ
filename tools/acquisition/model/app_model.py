@@ -10527,6 +10527,12 @@ class AppModel(ObservableObject):
                     and current.state is SubsystemState.READY
                 ):
                     reason = "live inference stopped unexpectedly"
+                    # The pose process's own reason, when it gave one. Its
+                    # traceback is in the log, but this is what the status
+                    # panel, the degraded tooltip and the Record refusal show.
+                    cause = self._inference.pose_process_error
+                    if cause:
+                        reason = f"{reason}: {cause}"
                     self._set_subsystem_status(
                         SubsystemId.LIVE_INFERENCE,
                         SubsystemState.FAILED,
