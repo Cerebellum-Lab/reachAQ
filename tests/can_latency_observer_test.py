@@ -1,10 +1,15 @@
+import itertools
+import logging
 import queue
 import threading
 from types import SimpleNamespace
 
+import pytest
+
 from autotrainer.core import ObservableObject, SystemCommandKind, SystemStatusMessageKind
 from autotrainer.device import DeviceApi, DeviceConnection
 from autotrainer.device.can_device import CanDevice
+from tools.acquisition.model import hardware_model as hardware_model_module
 from tools.acquisition.model.hardware_model import HardwareModel
 from tools.acquisition.model.session_data_recorder import SessionDataRecorder
 
@@ -157,3 +162,149 @@ def test_the_recorder_registers_its_latency_log_with_the_hardware_model():
         assert hardware.observer == recorder.latency_events.record_can
     finally:
         recorder.close()
+
+
+def _sending_model(order, sent):
+    """A HardwareModel with only what _send_with_token touches.
+
+    The transport is a stub that logs into `order`, so a test can say what came
+    before the command reached it."""
+    model = object.__new__(HardwareModel)
+    model._lock = threading.RLock()
+    model._pending_tokens = {}
+    model._command_outcomes = {}
+    model._refresh_cmd_in_progress = lambda commands: None
+
+    def send_command(device, cmd, data=None, context=None):
+        order.append("send_command")
+        sent.append((device, cmd, data, context))
+        return True
+
+    model._send_command = send_command
+    return model
+
+
+def test_the_token_stage_is_reported_before_the_command_reaches_the_transport(monkeypatch):
+    order, sent, rows = [], [], []
+    model = _sending_model(order, sent)
+    clock = itertools.count(100.0, 1.0)
+    monkeypatch.setattr(hardware_model_module, "get_perf_now", lambda: next(clock))
+
+    def observer(stage, fields):
+        order.append("observer")
+        rows.append((stage, dict(fields)))
+
+    model.set_can_latency_observer(observer)
+    device = object()
+
+    token = model._send_with_token(device, SystemCommandKind.SET_X, 10)
+
+    # Exactly the contract the recorder reads: stage, token, kind, perf.
+    assert rows == [("token", {"token": str(token), "kind": "SET_X", "perf": 100.0})]
+    assert order == ["observer", "send_command"]
+    # The transport gets the same id, so CanDevice's enqueue/send rows (which
+    # carry str(context)) join to this one.
+    assert sent == [(device, SystemCommandKind.SET_X, 10, token)]
+    # One clock read serves the pending-command record and the latency row.
+    assert model._pending_tokens[token] == (SystemCommandKind.SET_X, 100.0)
+
+
+def test_a_raising_token_observer_never_stops_the_command(caplog):
+    order, sent = [], []
+    model = _sending_model(order, sent)
+
+    def broken(stage, fields):
+        order.append("observer")
+        raise RuntimeError("recorder down")
+
+    model.set_can_latency_observer(broken)
+    device = object()
+
+    with caplog.at_level(logging.ERROR):
+        token = model._send_with_token(device, SystemCommandKind.SET_X, 10)
+
+    assert token is not None
+    assert order == ["observer", "send_command"]
+    assert sent == [(device, SystemCommandKind.SET_X, 10, token)]
+    assert token in model._pending_tokens
+    assert "CAN latency observer failed" in caplog.text
+
+
+@pytest.mark.parametrize("clear_after_setting", [False, True], ids=["init_default", "cleared"])
+def test_a_model_with_no_observer_sends_without_reporting_or_logging(clear_after_setting, caplog):
+    order, sent = [], []
+    model = _sending_model(order, sent)
+    model._can_latency_observer = None  # what HardwareModel.__init__ leaves
+    if clear_after_setting:
+        model.set_can_latency_observer(lambda stage, fields: order.append("observer"))
+        model.set_can_latency_observer(None)
+    device = object()
+
+    with caplog.at_level(logging.DEBUG):
+        token = model._send_with_token(device, SystemCommandKind.SET_X, 10)
+
+    assert token is not None
+    assert order == ["send_command"]
+    # A None observer must be skipped, not called and its TypeError swallowed.
+    assert "CAN latency observer failed" not in caplog.text
+
+
+class _ConnectStopped(Exception):
+    pass
+
+
+def _connect_until_the_connection_is_built(hardware, monkeypatch, built):
+    """Run the real HardwareModel connect, under the harness's emulated CAN,
+    up to the point it builds the DeviceConnection.
+
+    A full connect cannot finish on emulation: the emulated board never reports
+    a firmware version, so connect stops at "Pellet firmware version was not
+    reported" and leaves its reader thread running. The device is created and
+    wired before that point, so the DeviceConnection is replaced with a stub
+    that records what the device looked like when the connection was built."""
+
+    def build(device, *_args, **_kwargs):
+        built.append((device, device.latency_observer))
+        raise _ConnectStopped
+
+    monkeypatch.setattr(hardware_model_module, "DeviceConnection", build)
+    with pytest.raises(_ConnectStopped):
+        hardware.connect(queue.Queue())
+
+
+def test_connecting_hands_the_models_observer_to_the_new_device(hardware_model, monkeypatch):
+    def observer(stage, fields):
+        return None
+
+    hardware_model.set_can_latency_observer(observer)
+    built = []
+    try:
+        _connect_until_the_connection_is_built(hardware_model, monkeypatch, built)
+
+        (device, observer_when_built), = built
+        assert isinstance(device, CanDevice)
+        assert hardware_model._can_device is device
+        # Already in place when the connection starts, so no command can go
+        # out unobserved.
+        assert observer_when_built is observer
+        assert device.latency_observer is observer
+    finally:
+        hardware_model.disconnect()
+
+
+def test_a_reconnect_gives_the_replacement_device_the_observer_too(hardware_model, monkeypatch):
+    def observer(stage, fields):
+        return None
+
+    hardware_model.set_can_latency_observer(observer)
+    built = []
+    try:
+        for _ in range(2):
+            _connect_until_the_connection_is_built(hardware_model, monkeypatch, built)
+
+        (first, first_observer), (second, second_observer) = built
+        assert second is not first
+        assert first_observer is observer
+        assert second_observer is observer
+    finally:
+        hardware_model.disconnect()
