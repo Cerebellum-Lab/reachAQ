@@ -64,8 +64,9 @@ class FixedArrayMultiQueue:
         self._buffer_index = [0] * self._cam_count
         self._batch_index = [0] * self._cam_count
 
-        # reader:
-        self._read_index = 0
+        # reader: one position per camera, since a camera's frame can be skipped
+        # on its own (see _unpaired_heads).
+        self._read_index = [0] * self._cam_count
         self._read_sem_acquired = [False] * self._cam_count
 
         self._shape = shape
@@ -109,6 +110,12 @@ class FixedArrayMultiQueue:
         # are directly comparable. NaN means the writer supplied nothing.
         self._frame_perf_c = mp_ctx.RawArray(
             ctypes.c_double, self._depth * self._frames_per_camera * self._cam_count)
+        # The camera's own frame id for each slot, which names the exposure: the
+        # secondary is triggered by the primary, so both cameras give the same
+        # trigger the same id. The reader pairs the cameras by it - see
+        # _unpaired_heads. -1 means the writer supplied none.
+        self._frame_ids = mp_ctx.RawArray(
+            ctypes.c_int64, self._depth * self._frames_per_camera * self._cam_count)
 
         self._frame_indexing: List[int] = list(numpy.repeat(range(self._frames_per_camera), self._cam_count))
         self._camera_indexing: List[int] = list(numpy.tile(range(self._cam_count), self._frames_per_camera))
@@ -186,13 +193,19 @@ class FixedArrayMultiQueue:
         logger.debug("get_cam_missing_frames(%s): res=%s tot_puts=%s", cam_idx, res, tot_puts)
         return res
 
+    def _frame_id_view(self) -> numpy.ndarray:
+        return numpy.frombuffer(
+            memoryview(self._frame_ids).cast("B"), "int64", len(self._frame_ids)
+        ).reshape((self._cam_count, self._depth, self._frames_per_camera))
+
     def put_block(self, content: numpy.ndarray, camera: int, frame_idx: int, *, timeout: float=10):
         if self.put(content, camera, frame_idx, timeout=timeout) != BufferResult.Ok:
             raise RuntimeError(f"Timeout waiting space in queue for cam-{camera}")
 
     def put(self, content: numpy.ndarray, camera: int, frame_idx: Optional[int],
             *, block=True, timeout=0.01,
-            frame_perf_c: Optional[float] = None) -> BufferResult:
+            frame_perf_c: Optional[float] = None,
+            frame_id: Optional[int] = None) -> BufferResult:
         batch_index = self._batch_index[camera]  # 0 ... up to frames per camera - 1
         if batch_index == 0:
             if not self._sem_free[camera].acquire(block, timeout):
@@ -212,6 +225,8 @@ class FixedArrayMultiQueue:
         ).reshape((self._cam_count, self._depth, self._frames_per_camera))[camera]
         stamps[buffer_index][batch_index] = (
             math.nan if frame_perf_c is None else frame_perf_c)
+        self._frame_id_view()[camera][buffer_index][batch_index] = (
+            -1 if frame_id is None else frame_id)
         self._put_count += 1
         #
         batch_index = self._batch_index[camera] = (batch_index + 1) % self._frames_per_camera
@@ -224,19 +239,29 @@ class FixedArrayMultiQueue:
     def get_output(self, output: numpy.ndarray, frames_indices: Optional[numpy.ndarray] = None, *, timeout: float=0.01,
                    frames_perf_c: Optional[numpy.ndarray] = None) -> bool:
         """Get the next available "output" : i.e: 1 batch of frames_per_camera * nbr_cameras"""
-        for cdx in range(self._cam_count):
-            if not self._read_sem_acquired[cdx]:
-                p0 = time.perf_counter()
-                if not self._sem_busy[cdx].acquire(timeout=timeout):
-                    return False
-                p1 = time.perf_counter()
-                timeout -= p1 - p0
-                self._read_sem_acquired[cdx] = True
-        read_idx_value = self._read_index
-        buffer = self._buffers[read_idx_value]
+        while True:
+            for cdx in range(self._cam_count):
+                if not self._read_sem_acquired[cdx]:
+                    p0 = time.perf_counter()
+                    if not self._sem_busy[cdx].acquire(timeout=timeout):
+                        return False
+                    p1 = time.perf_counter()
+                    timeout -= p1 - p0
+                    self._read_sem_acquired[cdx] = True
+            unpaired = self._unpaired_heads()
+            if not unpaired:
+                break
+            # No other camera can match these frames: hand their slots back to
+            # the writers and wait for each camera's next frame instead.
+            for cdx in unpaired:
+                self._read_index[cdx] = (self._read_index[cdx] + 1) % self._depth
+                self._read_sem_acquired[cdx] = False
+                self._sem_free[cdx].release()
+        read_idx = self._read_index
+        cameras = list(range(self._cam_count))
         for idx, cdx in enumerate(self._camera_indexing):  # cdx: 0 1 0 1 0 1 0 1
             v = numpy.frombuffer(
-                buffer[cdx][self._frame_indexing[idx]], "uint8", self._byte_count
+                self._buffers[read_idx[cdx]][cdx][self._frame_indexing[idx]], "uint8", self._byte_count
             ).reshape(self.shape)
             # NB: current predict model expects an RGB frame,
             # we have so to copy 3 times the current gray image/frame into the 3 planes:
@@ -251,7 +276,7 @@ class FixedArrayMultiQueue:
                 memoryview(self._frame_indices).cast("B"), "int64", len(self._frame_indices)
             ).reshape(
                 (self._cam_count, self._depth, self._frames_per_camera)
-            )[:, read_idx_value, :]
+            )[cameras, read_idx, :]
 
         if frames_perf_c is not None:
             frames_perf_c[:, :] = numpy.frombuffer(
@@ -259,7 +284,7 @@ class FixedArrayMultiQueue:
                 len(self._frame_perf_c)
             ).reshape(
                 (self._cam_count, self._depth, self._frames_per_camera)
-            )[:, read_idx_value, :]
+            )[cameras, read_idx, :]
 
         # put back the used/copied bucket as free:
         for cdx in range(self._cam_count):
@@ -272,8 +297,47 @@ class FixedArrayMultiQueue:
                 output[idx, :, :, fn] = output[idx, :, :, 0]
 
         # don't forget to:
-        self._read_index = (read_idx_value + 1) % self._depth
+        for cdx in cameras:
+            self._read_index[cdx] = (read_idx[cdx] + 1) % self._depth
         return True
+
+    def _unpaired_heads(self) -> List[int]:
+        """The cameras whose next frame no other camera can match.
+
+        Each camera's ring fills and drains on its own: the capture loops put
+        with block=False, so a full ring drops that camera's frame alone, and a
+        frame a camera never received is simply absent from its ring. Paired by
+        slot position, one camera holding a frame the others lacked shifted
+        every later batch by a frame - left N+1 beside right N - until the rings
+        next refilled.
+
+        A ring holds its frames in order, so a head older than another camera's
+        head can never be matched. The end-of-recording marker sorts after
+        every frame, so frames still ahead of it are skipped and it arrives as
+        one batch; padding, which only evens out the writers' counts, sorts
+        before every frame and so is never paired with one. Without a frame id
+        from every camera, or with several frames per camera, where a skew
+        would sit inside a batch, pairing stays positional.
+        """
+        if self._frames_per_camera != 1:
+            return []
+        categories = numpy.frombuffer(
+            memoryview(self._frame_indices).cast("B"), "int64", len(self._frame_indices)
+        ).reshape((self._cam_count, self._depth, self._frames_per_camera))
+        frame_ids = self._frame_id_view()
+        keys = []
+        for cdx in range(self._cam_count):
+            head = self._read_index[cdx]
+            if categories[cdx, head, 0] == FrameIndexCategory.EOF_RECORDING:
+                keys.append(math.inf)
+            elif categories[cdx, head, 0] == FrameIndexCategory.PADDING:
+                keys.append(-math.inf)
+            elif frame_ids[cdx, head, 0] >= 0:
+                keys.append(int(frame_ids[cdx, head, 0]))
+            else:
+                return []
+        newest = max(keys)
+        return [cdx for cdx, key in enumerate(keys) if key < newest]
 
     def put_frame_index_category(self, frame, frame_idx: FrameIndexCategory, *,
                                  cam_idx: Optional[int] = None, timeout: float = 10):

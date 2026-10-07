@@ -478,6 +478,10 @@ class VideoCapture(Process):
             net_q_put = net_q.put
             net_q_idx = inference.index
             # although is same than self._camera_idx
+        # The inference queue pairs the cameras' frames by frame id, which only
+        # names the exposure when the cameras share a hardware trigger. Other
+        # sources leave it out and keep pairing by arrival.
+        net_q_shares_frame_ids = camera.is_trigger_synchronized
         image_queue_delay = self._image_queue_frame_delay
         empty_frame = numpy.zeros((camera.height, camera.width), dtype=numpy.uint8)
         # The inference and display queues may be smaller than the camera frame
@@ -921,10 +925,14 @@ class VideoCapture(Process):
                     # can report sensor-to-result, not just how long its own
                     # call took. It is the host time the exposure maps to, from
                     # the camera's hardware timestamp - not when Python noticed
-                    # the frame.
+                    # the frame. frame_id lets the queue pair this frame with the
+                    # other cameras' frames of the same exposure even when one of
+                    # them dropped a frame this camera kept.
                     net_frame = net_fit(frame)
                     if net_q_put(net_frame, net_q_idx, frame_idx_cat, block=False,
-                                 frame_perf_c=frame_perf_c) == BufferResult.Ok:
+                                 frame_perf_c=frame_perf_c,
+                                 frame_id=cam_frame_id if net_q_shares_frame_ids else None,
+                                 ) == BufferResult.Ok:
                         cnt_net_q_put += 1
 
                 if img_q is not None:
