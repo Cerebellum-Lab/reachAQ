@@ -202,7 +202,11 @@ from tools.acquisition.model.softmouse_spreadsheet_source import (
     SoftMouseSpreadsheetSource,
 )
 from tools.acquisition.model.session_data_recorder import SessionDataRecorder
-from tools.acquisition.model.session_telemetry import SessionTelemetry, describe_latency_status
+from tools.acquisition.model.session_telemetry import (
+    SessionTelemetry,
+    describe_latency_status,
+    exact_session_capture,
+)
 from tools.acquisition.model.stim_latency_budget import StimLatencyBudget
 from tools.acquisition.model.atomic_session_io import (
     atomic_publish_file,
@@ -2325,6 +2329,27 @@ class AppModel(ObservableObject):
         )
         self._remove_timestamps_txt_files(project, cams)
         return diagnostics
+
+    def _exact_session_capture(self, project: ProjectInfo) -> Optional[dict]:
+        """The session's exact frame counts, or None when its files cannot say.
+
+        Read at finalize, after the timeline merge and the pose files' close.
+        A statistic never fails a finalization, so any error is logged here.
+        """
+        try:
+            session_dir = Path(project.get_session_path(skip_ensure=True).location)
+            alignment_path = session_dir / "streams" / "camera_alignment.json"
+            if not alignment_path.is_file():
+                return None
+            alignment = json.loads(alignment_path.read_text(encoding="utf-8"))
+            posed_frame_paths = {
+                name: Path(project.get_video_path(name, allow_overwrite=True)[2])
+                for name in alignment.get("cameras", {})
+            }
+            return exact_session_capture(alignment, posed_frame_paths)
+        except Exception:
+            logger.exception("Exact session capture counts were not computed")
+            return None
 
     def _get_monitored_cams(self):
         return self._ordered_reach_cameras(enabled_only=True)
@@ -10038,9 +10063,10 @@ class AppModel(ObservableObject):
                 self._recording_session.boundary.end_wall_time,
             )
             self._session_telemetry.end(end_perf)
-            self._recording_session.set_capture_telemetry(
-                self._session_telemetry.summary()
-            )
+            self._recording_session.set_capture_telemetry({
+                **self._session_telemetry.summary(),
+                "exact": self._exact_session_capture(project),
+            })
             stream_result = self._session_data_recorder.stop(end_perf)
         except Exception as first_error:
             logger.exception(
