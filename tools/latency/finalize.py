@@ -43,6 +43,8 @@ ENVELOPE_BIAS_FLOOR = ("unmeasured; mapped NI times are late by about the minimu
                        "delivery delay, likely under 1 ms")
 SECONDARY_TRIGGER_DELAY = ("unmeasured; a secondary camera's exposure starts a trigger delay "
                            "(microseconds) after the primary's")
+HOST_ARRIVAL_PAIRING_REASON = ("camera-to-NI pairing by host arrival assumes exposure→arrival "
+                               "under one frame period (no camera clock latch)")
 
 
 def _text(value) -> str:
@@ -199,6 +201,20 @@ def _wall_record(wall_map: clocks.WallMap, reason: str = "") -> dict:
     return record
 
 
+def _latch_direct_lag_p50(frames, latches) -> float:
+    """Median of arrival minus camera timestamp mapped to host by the latches; NaN if none."""
+    try:
+        fit = clocks.fit_latches(latches)
+        camera = numpy.asarray(frames["camera_ts_ns"], dtype=numpy.float64) / 1e9
+        near = clocks.latch_window(fit, camera) if fit.valid else numpy.zeros(camera.shape, bool)
+        lag = numpy.asarray(frames["arrival_perf"], dtype=numpy.float64)[near] - fit.map(camera[near])
+        lag = lag[numpy.isfinite(lag)]
+        return float(numpy.median(lag)) if lag.size else math.nan
+    except Exception:
+        logger.exception("Latency latch-direct lag failed")
+        return math.nan
+
+
 def _flagged_primary(stream: dict) -> bool:
     try:
         return bool(stream["attrs"].get("is_primary", False))
@@ -293,10 +309,17 @@ class _Context:
                 or "needs a cam_frames channel, primary frames and a valid NI mapping",
             }
             return
+        # Older sessions, and cameras with no clock to latch, have no latches.
+        latches = self.cameras.get(self.primary_name, {}).get("clock_latches")
         try:
             transition_perf = self.ni_to_host.map(transition_index / ni["rate"])
-            self.pairing = clocks.choose_pairing(frames["frame_id"], frames["arrival_perf"],
-                                                 transition_perf, self.frame_period)
+            if clocks.usable_latches(latches)[0].size:
+                self.pairing = clocks.choose_pairing_by_camera_clock(
+                    frames["frame_id"], frames["camera_ts_ns"], latches, transition_perf,
+                    self.frame_period)
+            else:
+                self.pairing = clocks.choose_pairing(frames["frame_id"], frames["arrival_perf"],
+                                                     transition_perf, self.frame_period)
         except Exception as error:
             logger.exception("Latency camera pairing failed")
             self.camera_to_ni = clocks.invalid_fit(_describe(error))
@@ -308,6 +331,16 @@ class _Context:
             pairing, self.frame_period))
         record["cameraToNi"] = {**self.camera_to_ni.as_record(),
                                 "pairing": dataclasses.asdict(self.pairing)}
+        if pairing.method == clocks.HOST_ARRIVAL:
+            # Only arrival placed each exposure, so a lag over one period would
+            # read whole periods short; the next candidate is kept beside it.
+            record["cameraToNi"]["assumes_lag_below_period"] = True
+            record["cameraToNi"]["alternative_median_lag"] = pairing.median_lag + self.frame_period
+            self.status["reasons"].append(HOST_ARRIVAL_PAIRING_REASON)
+        else:
+            # Exposure to arrival measured without NI at all: an independent
+            # check on the NI-derived exposure_to_arrival.
+            record["cameraToNi"]["latchDirectLagP50"] = _latch_direct_lag_p50(frames, latches)
         if self.pairing.ambiguous:
             record["cameraToNi"]["valid"] = False
             record["cameraToNi"]["reason"] = self.pairing.reason

@@ -8,6 +8,7 @@ import pytest
 
 from autotrainer.core.latency.schema import (
     CAMERA_FRAME_DTYPE,
+    CLOCK_LATCH_DTYPE,
     CLOCK_PAIR_DTYPE,
     EVENT_TABLES,
     LIVE_POSE_DTYPE,
@@ -44,7 +45,8 @@ def _write(path, datasets, attrs=None):
             store.create_dataset(name, data=rows)
 
 
-def _session(tmp_path, *, first_sample=0, first_frame=0, primary="left"):
+def _session(tmp_path, *, first_sample=0, first_frame=0, primary="left", arrival_lag=ARRIVAL_LAG,
+             latches=True):
     rng = np.random.default_rng(7)
     session = tmp_path / "session001"
     streams = session / "streams"
@@ -79,7 +81,7 @@ def _session(tmp_path, *, first_sample=0, first_frame=0, primary="left"):
     frames = np.zeros(FRAMES, dtype=CAMERA_FRAME_DTYPE)
     frames["frame_id"] = ids + first_frame
     frames["camera_ts_ns"] = np.round((exposure_ni + CAMERA_OFFSET) * 1e9).astype(np.int64)
-    frames["arrival_perf"] = exposure_host + ARRIVAL_LAG
+    frames["arrival_perf"] = exposure_host + arrival_lag
     frames["poll_perf"] = frames["arrival_perf"] - 0.0005
     frames["capture_return_perf"] = frames["arrival_perf"] + 0.0001
     batches = np.zeros(2, dtype=RECORD_BATCH_DTYPE)
@@ -97,9 +99,18 @@ def _session(tmp_path, *, first_sample=0, first_frame=0, primary="left"):
     writes["write_entry_perf"] = writes["dequeue_perf"] + 0.0001
     writes["write_return_perf"] = writes["write_entry_perf"] + 0.002
     pairs = np.array([(1.7e9 + t, HOST + t) for t in (0.0, 1.0, 2.0)], dtype=CLOCK_PAIR_DTYPE)
+    camera_stream = {"frames": frames, "record_batches": batches, "clock_pairs": pairs}
+    if latches:
+        # Three latches after the stream's first frame and three at its close,
+        # as the capture loop takes them.
+        latch_ni = np.repeat([exposure_ni[0] + 0.001, exposure_ni[-1] + 0.001], 3)
+        clock_latches = np.zeros(latch_ni.size, dtype=CLOCK_LATCH_DTYPE)
+        clock_latches["perf_before"] = HOST + latch_ni - 0.00005
+        clock_latches["perf_after"] = HOST + latch_ni + 0.00005
+        clock_latches["camera_ns"] = np.round((latch_ni + CAMERA_OFFSET) * 1e9).astype(np.int64)
+        camera_stream["clock_latches"] = clock_latches
     for number, name in enumerate(("left", "right")):
-        _write(raw / f"camera_{name}.h5",
-               {"frames": frames, "record_batches": batches, "clock_pairs": pairs},
+        _write(raw / f"camera_{name}.h5", camera_stream,
                {"camera": name, "camera_index": number, "is_primary": name == primary})
         _write(raw / f"record_{name}.h5", {"record_writes": writes, "clock_pairs": pairs})
 
@@ -108,7 +119,7 @@ def _session(tmp_path, *, first_sample=0, first_frame=0, primary="left"):
     pose = np.zeros(count, dtype=pose_batch_dtype(2))
     pose["pose_seq"] = np.arange(count)
     pose["frame_ids"] = np.stack([posed + first_frame, posed + first_frame], axis=1)
-    put = exposure_host[posed] + ARRIVAL_LAG + 0.0002
+    put = exposure_host[posed] + arrival_lag + 0.0002
     pose["put_perf"] = np.stack([put, put], axis=1)
     pose["dequeue_perf"] = put + 0.001
     pose["predict_start_perf"] = pose["dequeue_perf"] + 0.0001
@@ -169,6 +180,68 @@ def test_a_synthetic_session_recovers_its_known_delays(tmp_path, start):
     assert pose["sensor_to_pose"]["n"] == FRAMES // 2
     assert hardware["laser1.command_to_diode"]["p50"] == pytest.approx(DIODE_DELAY, abs=1.5 / RATE)
     assert COMMAND_DELAY <= stim["direct.start_to_output_edge"]["p50"] <= COMMAND_DELAY + 0.0015
+
+
+FALLBACK_REASON = ("camera-to-NI pairing by host arrival assumes exposure→arrival under one "
+                   "frame period (no camera clock latch)")
+
+
+@pytest.mark.parametrize("lag", [ARRIVAL_LAG, 0.0189], ids=["under_one_period", "over_two_periods"])
+def test_camera_clock_latches_pair_frames_whatever_the_lag(tmp_path, lag):
+    session = _session(tmp_path, arrival_lag=lag)
+
+    status = finalize_session_latency(session, primary_camera="left")
+
+    assert status["status"] == "complete", status
+    camera = status["clocks"]["cameraToNi"]
+    assert camera["valid"] is True
+    assert camera["pairing"]["method"] == "camera_latch"
+    assert camera["pairing"]["shift"] == 0 and camera["pairing"]["ambiguous"] is False
+    # The latches are exact here, so the residual is the NI-to-host envelope's lateness.
+    assert 0 < camera["pairing"]["median_residual"] < 0.0015
+    assert camera["latchDirectLagP50"] == pytest.approx(lag, abs=1e-6)
+    with h5py.File(session / "streams" / "latency.h5", "r") as store:
+        pose = _stages(store, "pose")
+        attrs = dict(store["clock/camera_to_ni"].attrs)
+    assert lag - 0.0015 <= pose["exposure_to_arrival"]["p50"] <= lag
+    assert attrs["pairing_method"] == "camera_latch"
+    assert attrs["pairing_median_residual"] == pytest.approx(camera["pairing"]["median_residual"])
+    assert attrs["latchDirectLagP50"] == pytest.approx(lag, abs=1e-6)
+    assert "assumes_lag_below_period" not in attrs
+
+
+def test_without_clock_latches_the_host_arrival_pairing_is_used_and_says_so(tmp_path):
+    session = _session(tmp_path, latches=False)
+
+    status = finalize_session_latency(session, primary_camera="left")
+
+    assert status["status"] == "partial"
+    assert status["reasons"] == [FALLBACK_REASON]
+    camera = status["clocks"]["cameraToNi"]
+    assert camera["valid"] is True
+    assert camera["pairing"]["method"] == "host_arrival"
+    assert camera["assumes_lag_below_period"] is True
+    assert camera["alternative_median_lag"] == pytest.approx(
+        camera["pairing"]["median_lag"] + PERIOD, abs=1e-6)
+    assert "latchDirectLagP50" not in camera
+    with h5py.File(session / "streams" / "latency.h5", "r") as store:
+        attrs = dict(store["clock/camera_to_ni"].attrs)
+        assert ARRIVAL_LAG - 0.0015 <= _stages(store, "pose")["exposure_to_arrival"]["p50"] <= ARRIVAL_LAG
+    assert attrs["pairing_method"] == "host_arrival"
+    assert attrs["assumes_lag_below_period"]
+    assert attrs["alternative_median_lag"] == pytest.approx(attrs["pairing_median_lag"] + PERIOD,
+                                                            abs=1e-6)
+
+
+def test_a_rebuild_of_streams_without_clock_latches_does_not_raise(tmp_path, capsys):
+    session = _session(tmp_path, latches=False)
+
+    assert rebuild.main([str(session), "--primary-camera", "left"]) == 0
+
+    status = json.loads(capsys.readouterr().out)
+    assert status["status"] == "partial"
+    assert FALLBACK_REASON in status["reasons"]
+    assert status["clocks"]["cameraToNi"]["pairing"]["method"] == "host_arrival"
 
 
 def test_a_session_without_latency_streams_is_absent(tmp_path):
@@ -290,6 +363,7 @@ def test_one_truncated_stream_costs_only_what_depends_on_it(tmp_path, monkeypatc
 @pytest.mark.parametrize("broken, loops", [
     ("fit_ni_to_host", {"stim": "partial", "hardware": "complete"}),
     ("choose_pairing", {"pose": "partial", "hardware": "complete"}),
+    ("choose_pairing_by_camera_clock", {"pose": "partial", "hardware": "complete"}),
     ("fit_camera_to_ni", {"pose": "partial", "hardware": "complete"}),
     ("fit_wall_to_host", {"pose": "complete", "hardware": "complete"}),
 ])
@@ -299,9 +373,12 @@ def test_a_clock_fit_that_raises_is_an_invalid_fit_not_a_failure(tmp_path, monke
 
     monkeypatch.setattr(finalize.clocks, broken, explode)
 
-    status = finalize_session_latency(_session(tmp_path), primary_camera="left")
+    # The host-arrival pairing only runs on a session without clock latches.
+    session = _session(tmp_path, latches=broken != "choose_pairing")
+    status = finalize_session_latency(session, primary_camera="left")
 
     key = {"fit_ni_to_host": "niToHost", "choose_pairing": "cameraToNi",
+           "choose_pairing_by_camera_clock": "cameraToNi",
            "fit_camera_to_ni": "cameraToNi", "fit_wall_to_host": "wallToHost"}[broken]
     assert status["clocks"][key]["valid"] is False
     assert "boom" in status["clocks"][key]["reason"]
