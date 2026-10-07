@@ -10530,7 +10530,7 @@ class AppModel(ObservableObject):
                     # The pose process's own reason, when it gave one. Its
                     # traceback is in the log, but this is what the status
                     # panel, the degraded tooltip and the Record refusal show.
-                    cause = self._inference.pose_process_error
+                    cause = getattr(self._inference, "pose_process_error", None)
                     if cause:
                         reason = f"{reason}: {cause}"
                     self._set_subsystem_status(
@@ -10541,6 +10541,15 @@ class AppModel(ObservableObject):
                     self._handle_recording_subsystem_failure(
                         SubsystemId.LIVE_INFERENCE,
                         reason,
+                    )
+                    # As a pose watchdog timeout would. A pose process that
+                    # exits is caught within a poll of the message loop, and
+                    # stopping it unregisters that watchdog before it can fire,
+                    # so without this a crash while live raised no alert.
+                    self.on_error(
+                        "Hardware subsystem failure",
+                        f"{reason}. Unrelated hardware remains running; Record is "
+                        "blocked until the required subsystem is ready.",
                     )
 
             if new_is_live or value == InferenceStatus.intersession:

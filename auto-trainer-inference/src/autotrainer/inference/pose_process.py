@@ -56,10 +56,16 @@ def _describe_error(err: BaseException) -> str:
 
     This is what the operator reads in the failed subsystem, where a CUDA
     error's several lines of advice would bury the one that matters. The full
-    traceback is in this process's log.
+    traceback is in this process's log. TensorFlow leads a grouped error with
+    a count ("2 root error(s) found."), so that line is passed over for the
+    first cause beneath it.
     """
-    lines = str(err).strip().splitlines()
+    lines = [line.strip() for line in str(err).strip().splitlines()
+             if line.strip() and not _GROUPED_ERROR_HEADER.match(line.strip())]
     return f"{type(err).__name__}: {lines[0]}" if lines else type(err).__name__
+
+
+_GROUPED_ERROR_HEADER = re.compile(r"\d+ root error\(s\) found\.?$")
 
 
 def take_newest_live_batch(queue, frame_buffer, frames_indices, frames_perf_c,

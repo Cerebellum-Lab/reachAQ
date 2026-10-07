@@ -86,13 +86,19 @@ def test_a_running_or_absent_process_is_left_alone(process):
     assert model.stop_calls == 0
 
 
-def test_a_process_that_gave_no_reason_is_described_by_its_exit_code():
-    """A killed process, or one that failed while still importing, says nothing."""
-    model = _inference(InferenceStatus.loading, _exited(-9))
+@pytest.mark.parametrize("code, reason", [
+    (3, "pose process exited with code 3"),
+    (-9, "pose process was killed by SIGKILL"),
+    (-11, "pose process was killed by SIGSEGV"),
+])
+def test_a_process_that_gave_no_reason_is_described_by_how_it_ended(code, reason):
+    """A killed process, or one that failed while still importing, says nothing.
+    The kernel's OOM killer sends SIGKILL, and a CUDA fault is a SIGSEGV."""
+    model = _inference(InferenceStatus.loading, _exited(code))
 
     model._check_pose_process_exited()
 
-    assert model.pose_process_error == "pose process exited with code -9"
+    assert model.pose_process_error == reason
 
 
 def test_a_reason_the_process_gave_is_not_replaced_by_its_exit_code():
@@ -290,7 +296,18 @@ def test_a_pose_process_that_cannot_load_says_why(monkeypatch):
     )
 
 
-def _app(cause):
+def test_a_grouped_tensorflow_error_is_described_by_its_first_cause():
+    """TensorFlow leads with a count of its errors; the cause is on the next line."""
+    error = RuntimeError(
+        "2 root error(s) found.\n"
+        "  (0) RESOURCE_EXHAUSTED: OOM when allocating tensor with shape[6,256,256,3]\n"
+        "  (1) RESOURCE_EXHAUSTED: OOM when allocating tensor with shape[6,256,256,3]")
+
+    assert pose_process._describe_error(error) == (
+        "RuntimeError: (0) RESOURCE_EXHAUSTED: OOM when allocating tensor with shape[6,256,256,3]")
+
+
+def _app(cause, inference=None):
     calls = []
     app = SimpleNamespace(
         _acquisition=SimpleNamespace(
@@ -299,9 +316,11 @@ def _app(cause):
             subsystems={SubsystemId.LIVE_INFERENCE:
                         SimpleNamespace(state=SubsystemState.READY)},
         ),
-        _inference=SimpleNamespace(pose_process_error=cause),
+        _inference=(SimpleNamespace(pose_process_error=cause)
+                    if inference is None else inference),
         _set_subsystem_status=lambda *args, **kwargs: calls.append(("status", args, kwargs)),
         _handle_recording_subsystem_failure=lambda *args: calls.append(("recording", args)),
+        on_error=lambda title, text: calls.append(("alert", title, text)),
         _analysis=SimpleNamespace(
             watchdog_monitor=SimpleNamespace(unregister_watchdog=lambda key: None)),
         _reach_cameras=[],
@@ -310,8 +329,10 @@ def _app(cause):
     return app, calls
 
 
-def test_the_failed_subsystem_names_the_cause():
-    """What the status panel, the degraded tooltip and the Record refusal show."""
+def test_the_failed_subsystem_names_the_cause_and_the_operator_is_told():
+    """The status panel, the degraded tooltip and the Record refusal show the
+    reason, and the operator is alerted as a watchdog timeout would alert them:
+    the exit is now caught before that watchdog can fire."""
     app, calls = _app("RuntimeError: CUDA error: out of memory")
 
     AppModel._on_inference_property_changed(
@@ -321,6 +342,9 @@ def test_the_failed_subsystem_names_the_cause():
     assert calls == [
         ("status", (SubsystemId.LIVE_INFERENCE, SubsystemState.FAILED), {"error": expected}),
         ("recording", (SubsystemId.LIVE_INFERENCE, expected)),
+        ("alert", "Hardware subsystem failure",
+         f"{expected}. Unrelated hardware remains running; Record is blocked "
+         "until the required subsystem is ready."),
     ]
 
 
@@ -329,6 +353,17 @@ def test_a_process_that_gave_no_reason_still_fails_the_subsystem():
 
     AppModel._on_inference_property_changed(
         app, InferenceModel.STATUS, InferenceStatus.stopped, InferenceStatus.loading)
+
+    assert calls[0] == ("status", (SubsystemId.LIVE_INFERENCE, SubsystemState.FAILED),
+                        {"error": "live inference stopped unexpectedly"})
+
+
+def test_an_inference_that_keeps_no_pose_process_reason_still_fails_the_subsystem():
+    """Like the VoidInference test fixture, which has no pose process at all."""
+    app, calls = _app(None, inference=SimpleNamespace())
+
+    AppModel._on_inference_property_changed(
+        app, InferenceModel.STATUS, InferenceStatus.stopped, InferenceStatus.live)
 
     assert calls[0] == ("status", (SubsystemId.LIVE_INFERENCE, SubsystemState.FAILED),
                         {"error": "live inference stopped unexpectedly"})
