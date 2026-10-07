@@ -103,8 +103,13 @@ def test_a_command_with_a_uuid_is_stamped_at_every_stage_in_the_real_loop():
         SystemCommandKind.SET_X, 10, lambda stage, fields: seen.append((stage, dict(fields))))
 
     assert acknowledged
-    assert [stage for stage, _ in seen] == ["enqueue", "dequeue", "send", "ack"]
-    enqueue, dequeue, send, ack = (fields for _, fields in seen)
+    stages = [stage for stage, _ in seen]
+    # The ack is recorded on the bus reader's thread, which can beat the command
+    # thread's send row by microseconds, so only the order before them is fixed.
+    assert stages[:2] == ["enqueue", "dequeue"]
+    assert sorted(stages[2:]) == ["ack", "send"]
+    by_stage = dict(seen)
+    enqueue, dequeue, send, ack = (by_stage[s] for s in ("enqueue", "dequeue", "send", "ack"))
     assert enqueue["token"] == dequeue["token"] == send["token"] == token
     assert send["kind"] == "SET_X"
     # The uuid is what joins the token to the board's ack.
