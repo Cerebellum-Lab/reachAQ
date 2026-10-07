@@ -11,11 +11,13 @@ from autotrainer.inference.pose_result_process import (
 )
 
 
-def _put_pair(queue, cam_frame_id, index):
+def _put_pair(queue, frame_id, index):
+    # Both cameras give the exposure one id, as triggered cameras do: the
+    # queue pairs on it.
     frame = np.zeros((4, 4), dtype=np.uint8)
     for camera in range(2):
         queue.put(frame, camera, index, block=False, frame_perf_c=1.0,
-                  cam_frame_id=cam_frame_id + camera * 1000)
+                  frame_id=frame_id)
 
 
 def test_the_drain_reports_skips_and_the_newest_batches_ids():
@@ -34,7 +36,7 @@ def test_the_drain_reports_skips_and_the_newest_batches_ids():
 
     assert took is True
     assert stats["skipped"] == 2
-    assert ids[:, 0].tolist() == [12, 1012]
+    assert ids[:, 0].tolist() == [12, 12]
 
 
 def test_a_three_element_item_has_no_latency():

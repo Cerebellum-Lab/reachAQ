@@ -383,6 +383,13 @@ class SpinCam(CameraBase):
             self._configure_as_secondary(self._camera)
             logger.info(f"<{self.name}> configured as secondary")
 
+    @property
+    def is_trigger_synchronized(self) -> bool:
+        # Every Spinnaker camera is the primary, which emits the trigger, or a
+        # secondary exposing on it (prepare_capture above), and the secondaries
+        # are armed before the primary starts, so all count the same triggers.
+        return True
+
     def end_capture(self):
         super().end_capture()
         spincam = self._camera
