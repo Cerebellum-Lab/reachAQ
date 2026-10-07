@@ -68,13 +68,16 @@ class CueCancelReason(str, enum.Enum):
 class CueGateState:
     """One observation of whether the cue may be delivered.
 
-    ``pellet_present`` is ``None`` when presence is unknown.  ``observed_at``
-    is the monotonic time the evidence was captured, not the time it was read.
+    ``pellet_present`` is ``None`` when presence is unknown, and so is
+    ``reach_active`` when a reach source is in use and has no fresh answer.
+    ``False`` means reach is not gated at all, or the source says the animal is
+    still.  ``observed_at`` is the monotonic time the evidence was captured,
+    not the time it was read.
     """
 
     observed_at: float
     pellet_present: Optional[bool] = None
-    reach_active: bool = False
+    reach_active: Optional[bool] = False
 
     def __post_init__(self):
         if not math.isfinite(float(self.observed_at)):
@@ -269,6 +272,8 @@ class CueTimingPolicy:
             return CueCancelReason.GATE_STATE_STALE
         if not gate.pellet_present:
             return CueCancelReason.PELLET_MISSING
+        if gate.reach_active is None:
+            return CueCancelReason.GATE_STATE_STALE
         if gate.reach_active:
             return CueCancelReason.EARLY_REACH
         return None
