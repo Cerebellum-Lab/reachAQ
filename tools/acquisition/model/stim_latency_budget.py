@@ -15,10 +15,11 @@ Percentiles, not means, are the acceptance figure. A stim loop with a 2 ms mean
 and a 15 ms p99 is not a 5 ms loop.
 
 One subtlety in reading the output: the first stamp, `frame_perf_time`, is the
-camera driver's estimate of frame capture time mapped into the perf_counter
-domain, not the moment the frame reached the host. Spans measured from it
-therefore already carry sensor readout and transport, and inherit the accuracy
-of that clock mapping.
+camera timestamp mapped into perf_counter through an offset fitted to when the
+host's poll first saw a frame (spinnaker_cam._capture). It is effectively host
+arrival, so spans measured from it do not include exposure, readout or
+transport. The latency record (streams/latency.h5) measures those after the
+session, against the NI exposure edge where one is wired.
 """
 
 from __future__ import annotations

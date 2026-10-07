@@ -28,11 +28,14 @@ class SessionTelemetry(ObservableObject):
                       The CALL is what the model costs: preprocess, forward,
                       decode. It is what changes when the model changes.
 
-                      SENSOR TO RESULT is exposure to pose, so it also carries
-                      the queue wait between the two - which on this rig has
-                      been the larger term. This is the number the sub-5 ms
-                      goal is about, and a model can look fast on the first
-                      figure while missing the deadline on the second.
+                      SENSOR TO RESULT runs from when the host received the
+                      frame to the pose, so it also carries the queue wait
+                      between the two - which on this rig has been the larger
+                      term. It does not include exposure, readout or transfer:
+                      the frame's time is fitted to host arrival. The latency
+                      record (streams/latency.h5) measures those against the NI
+                      exposure edge after the session. The metadata keys keep
+                      their sensorToResult names for compatibility.
 
                       Both carry a max as well as a mean: a model averaging
                       4 ms with a 30 ms tail misses deadlines the mean hides.
@@ -52,6 +55,8 @@ class SessionTelemetry(ObservableObject):
     INFERENCED_PROP = "frames_inferenced"
     INFERENCE_TIME_PROP = "inference_time"
     ACTIVE_PROP = "is_active"
+    STIM_LATENCY_PROP = "stim_latency"
+    LATENCY_STATUS_PROP = "latency_status"
 
     def __init__(self):
         super().__init__()
@@ -73,6 +78,8 @@ class SessionTelemetry(ObservableObject):
         self._e2e_total_ms = 0.0
         self._e2e_count = 0
         self._e2e_max_ms = 0.0
+        self._stim_p99_ms = float("nan")
+        self._latency_status = ""
 
     # -- lifecycle --------------------------------------------------------
 
@@ -101,6 +108,8 @@ class SessionTelemetry(ObservableObject):
         self._e2e_total_ms = 0.0
         self._e2e_count = 0
         self._e2e_max_ms = 0.0
+        self._stim_p99_ms = float("nan")
+        self._latency_status = ""
         self.property_changed(self.ACTIVE_PROP, True, False)
 
     def end(self, ended_perf: typing.Optional[float] = None) -> None:
@@ -176,6 +185,18 @@ class SessionTelemetry(ObservableObject):
                                   None)
             self.property_changed(self.INFERENCE_TIME_PROP,
                                   self.inference_mean_ms, None)
+
+    def record_stim_p99(self, p99_ms: float) -> None:
+        """The direct stim route's rolling p99, from StimLatencyBudget."""
+        previous = self._stim_p99_ms
+        self._stim_p99_ms = float(p99_ms)
+        self.property_changed(self.STIM_LATENCY_PROP, self._stim_p99_ms, previous)
+
+    def set_latency_status(self, text: str) -> None:
+        """One line on the session's latency record, set once it is finalized."""
+        previous = self._latency_status
+        self._latency_status = str(text)
+        self.property_changed(self.LATENCY_STATUS_PROP, self._latency_status, previous)
 
     # -- state ------------------------------------------------------------
 
@@ -281,6 +302,14 @@ class SessionTelemetry(ObservableObject):
         return self._e2e_max_ms if self._e2e_count else float("nan")
 
     @property
+    def stim_p99_ms(self) -> float:
+        return self._stim_p99_ms
+
+    @property
+    def latency_status(self) -> str:
+        return self._latency_status
+
+    @property
     def dropped_by_camera(self) -> typing.Dict[int, int]:
         if self._frozen is not None:
             return dict(self._frozen["dropped_by_camera"])
@@ -317,4 +346,15 @@ class SessionTelemetry(ObservableObject):
             "inferenceCallMaxMs": finite(self.inference_max_ms),
             "sensorToResultMeanMs": finite(self.sensor_to_result_mean_ms),
             "sensorToResultMaxMs": finite(self.sensor_to_result_max_ms),
+            "stimP99Ms": finite(self.stim_p99_ms),
         }
+
+
+def describe_latency_status(status) -> str:
+    """'complete (mixed)', 'partial (software)', 'failed' - the panel's latency line."""
+    if not status:
+        return ""
+    pose = ((status.get("loops") or {}).get("pose") or {}).get("summary") or {}
+    confidence = pose.get("confidence")
+    text = str(status.get("status", "failed"))
+    return f"{text} ({confidence})" if confidence else text

@@ -41,6 +41,8 @@ class _Telemetry:
             inference_max_ms=float("nan"),
             sensor_to_result_mean_ms=float("nan"),
             sensor_to_result_max_ms=float("nan"),
+            stim_p99_ms=float("nan"),
+            latency_status="",
         ), **values)
 
 
@@ -63,16 +65,18 @@ GROWING = [
     _Telemetry(elapsed_seconds=9.0, frames_acquired=8, frames_inferenced=8,
                inferenced_percent=8.0, inference_mean_ms=4.2,
                inference_max_ms=5.0, sensor_to_result_mean_ms=6.1,
-               sensor_to_result_max_ms=6.9),
+               sensor_to_result_max_ms=6.9, stim_p99_ms=3.4),
     _Telemetry(elapsed_seconds=90.0, frames_acquired=13500,
                frames_inferenced=13500, inferenced_percent=100.0,
                inference_mean_ms=44.2, inference_max_ms=55.0,
-               sensor_to_result_mean_ms=66.1, sensor_to_result_max_ms=99.9),
+               sensor_to_result_mean_ms=66.1, sensor_to_result_max_ms=99.9,
+               stim_p99_ms=44.4, latency_status="partial (software)"),
     _Telemetry(elapsed_seconds=7200.0, frames_acquired=1080000,
                frames_inferenced=1079000, inferenced_percent=99.9,
                dropped_frames=1234, has_dropped_frames=True,
                inference_mean_ms=444.2, inference_max_ms=555.5,
-               sensor_to_result_mean_ms=666.1, sensor_to_result_max_ms=999.9),
+               sensor_to_result_mean_ms=666.1, sensor_to_result_max_ms=999.9,
+               stim_p99_ms=444.4, latency_status="complete (hardware)"),
 ]
 
 
@@ -83,7 +87,8 @@ def _effective_widths(panel):
     width, so this is the quantity that moves the panel when it changes.
     """
     labels = (panel._elapsed, panel._dropped, panel._inferenced,
-              panel._inference_ms, panel._e2e_ms, panel._collapsed_summary)
+              panel._inference_ms, panel._e2e_ms, panel._stim_p99,
+              panel._latency, panel._collapsed_summary)
     return tuple(max(label.sizeHint().width(), label.minimumWidth())
                  for label in labels)
 
@@ -104,8 +109,8 @@ def test_the_reservation_covers_the_widest_reading(qapp):
     _show(panel, GROWING[-1])
 
     for label in (panel._elapsed, panel._dropped, panel._inferenced,
-                  panel._inference_ms, panel._e2e_ms,
-                  panel._collapsed_summary):
+                  panel._inference_ms, panel._e2e_ms, panel._stim_p99,
+                  panel._latency, panel._collapsed_summary):
         assert label.sizeHint().width() <= label.minimumWidth(), (
             f"{label.text()!r} is wider than its reserved width")
 

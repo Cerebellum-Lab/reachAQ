@@ -92,7 +92,7 @@ class CaptureTelemetryPanel(QWidget):
             QFontDatabase.systemFont(QFontDatabase.FixedFont))
         self._collapsed_summary.setMinimumWidth(
             QFontMetrics(self._collapsed_summary.font()).horizontalAdvance(
-                "0:00:00   000% inferenced   000.0 ms sensor→result"))
+                "0:00:00   000% inferenced   000.0 ms arrival→result"))
         self._collapsed_summary.setAlignment(
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         header_layout.addWidget(self._collapsed_summary)
@@ -127,8 +127,17 @@ class CaptureTelemetryPanel(QWidget):
         # the deadline that matters.
         self._inference_ms = self._add_readout(body_layout, "Inference call",
                                                "000.0 ms  max 0000.0")
-        self._e2e_ms = self._add_readout(body_layout, "Sensor → result",
+        # Arrival, not sensor: the frame's time is fitted to when the host
+        # received it, so exposure and transfer are not in this figure. The
+        # latency record measures them after the session.
+        self._e2e_ms = self._add_readout(body_layout, "Arrival → result",
                                           "000.0 ms  max 0000.0")
+        self._stim_p99 = self._add_readout(body_layout, "Stim p99", "000.0 ms")
+        # Widest status the finalizer can produce, plus a character of slack:
+        # a label's size hint can run a pixel past the summed advances for
+        # letter text, which would still move the panel when the status lands.
+        self._latency = self._add_readout(body_layout, "Latency record",
+                                          "complete (hardware) ")
         body_layout.addStretch(1)
 
         body.setVisible(False)
@@ -247,6 +256,10 @@ class CaptureTelemetryPanel(QWidget):
             f"{e2e_mean:.1f} ms  max {e2e_max:.1f}"
             if math.isfinite(e2e_mean) else "-")
 
+        stim_p99 = telemetry.stim_p99_ms
+        self._stim_p99.setText(f"{stim_p99:.1f} ms" if math.isfinite(stim_p99) else "-")
+        self._latency.setText(telemetry.latency_status or "-")
+
         # The warning survives collapsing, and clears when the session ends.
         self._warning.setVisible(telemetry.has_dropped_frames
                                  and telemetry.is_active)
@@ -269,7 +282,7 @@ class CaptureTelemetryPanel(QWidget):
                  f"{telemetry.inferenced_percent:.0f}% inferenced"]
         e2e = telemetry.sensor_to_result_mean_ms
         if math.isfinite(e2e):
-            parts.append(f"{e2e:.1f} ms sensor→result")
+            parts.append(f"{e2e:.1f} ms arrival→result")
         return "   ".join(parts)
 
     @staticmethod
