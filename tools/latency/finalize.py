@@ -43,8 +43,9 @@ ENVELOPE_BIAS_FLOOR = ("unmeasured; mapped NI times are late by about the minimu
                        "delivery delay, likely under 1 ms")
 SECONDARY_TRIGGER_DELAY = ("unmeasured; a secondary camera's exposure starts a trigger delay "
                            "(microseconds) after the primary's")
-HOST_ARRIVAL_PAIRING_REASON = ("camera-to-NI pairing by host arrival assumes exposure→arrival "
-                               "under one frame period (no camera clock latch)")
+HOST_ARRIVAL_PAIRING = ("camera-to-NI pairing by host arrival assumes exposure→arrival "
+                        "under one frame period")
+HOST_ARRIVAL_PAIRING_REASON = f"{HOST_ARRIVAL_PAIRING} (no camera clock latch)"
 
 
 def _text(value) -> str:
@@ -215,6 +216,15 @@ def _latch_direct_lag_p50(frames, latches) -> float:
         return math.nan
 
 
+def _host_arrival_reason(latches) -> str:
+    """Why the fallback pairing ran: no latch at all, or how many and why none served."""
+    rows = 0 if latches is None else len(latches)
+    if not rows:
+        return HOST_ARRIVAL_PAIRING_REASON
+    return (f"{HOST_ARRIVAL_PAIRING} ({rows} camera clock latch{'es' if rows != 1 else ''}, "
+            f"none usable: bracket over {clocks.LATCH_MAX_BRACKET_SECONDS * 1e3:g} ms or not finite)")
+
+
 def _ni_derived_lag_p50(frames, latches, camera_to_ni, ni_to_host) -> float:
     """Median of arrival minus the NI-derived exposure, over the frames the latches cover."""
     try:
@@ -353,11 +363,16 @@ class _Context:
             # read whole periods short; the next candidate is kept beside it.
             record["cameraToNi"]["assumes_lag_below_period"] = True
             record["cameraToNi"]["alternative_median_lag"] = pairing.median_lag + self.frame_period
-            self.status["reasons"].append(HOST_ARRIVAL_PAIRING_REASON)
+            self.status["reasons"].append(_host_arrival_reason(latches))
         else:
-            # Exposure to arrival measured without NI at all, beside the NI
-            # path's figure over the same frames: two measurements of one lag,
-            # so a pairing they disagree on is not trusted.
+            # Exposure to arrival from the latches alone, beside the NI path's
+            # figure over the same frames. Not two measurements: their
+            # difference is the pairing residual again (ni - latch is about
+            # -median_residual), seen through the fitted camera-to-NI line, so
+            # this is a consistency check on fit_camera_to_ni. The residual
+            # gate in choose_pairing_by_camera_clock is the safeguard against
+            # whole-period mispairing and must not be relaxed on the strength
+            # of this check. Both figures stay in the record as diagnostics.
             latch_lag = _latch_direct_lag_p50(frames, latches)
             ni_lag = _ni_derived_lag_p50(frames, latches, self.camera_to_ni, self.ni_to_host)
             record["cameraToNi"]["latchDirectLagP50"] = latch_lag

@@ -100,7 +100,7 @@ def test_ni_fit_rejects_too_few_host_reads():
     seen = np.arange(30.0)
     fit = clocks.fit_ni_to_host(end_index, seen, 1000.0)
     assert not fit.valid
-    assert "30 host reads, need 100" in fit.reason
+    assert "30 read pairs, need 100" in fit.reason
 
 
 def test_pairing_picks_the_transition_before_arrival():
@@ -376,3 +376,15 @@ def test_a_correct_pairing_with_a_small_residual_is_accepted():
 ], ids=["150fps", "50fps", "25fps", "unknown"])
 def test_the_latch_tolerance_is_a_quarter_period_capped_at_2_ms(frame_period, tolerance):
     assert clocks.latch_tolerance(frame_period) == pytest.approx(tolerance, nan_ok=True)
+
+
+def test_an_unknown_frame_period_is_ambiguous_without_printing_nan():
+    ids, exposure, transition_perf = _exposures(300)
+    camera_ts_ns = np.round(_camera_clock(exposure) * 1e9).astype(np.int64)
+
+    pairing = clocks.choose_pairing_by_camera_clock(ids, camera_ts_ns, _latches([exposure[0]]),
+                                                    transition_perf, float("nan"))
+
+    assert pairing.ambiguous
+    assert "frame period is unknown" in pairing.reason
+    assert "nan" not in pairing.reason
