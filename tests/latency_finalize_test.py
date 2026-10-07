@@ -67,7 +67,10 @@ def _session(tmp_path, *, first_sample=0, first_frame=0, primary="left", arrival
     diode[edge + 1:edge + 101] += 2.0
     block = np.arange(samples) // 100
     block_last = np.arange(samples // 100) * 100 + 99
-    seen_per_block = HOST + block_last / RATE + 0.0002 + rng.uniform(0, 0.003, block_last.size)
+    # Each block is stamped before the blocking read that returns it: with
+    # back-to-back reads, when the previous read returned.
+    returned = HOST + block_last / RATE + 0.0002 + rng.uniform(0, 0.003, block_last.size)
+    seen_per_block = np.concatenate([[HOST - 0.001], returned[:-1]])
     _write(streams / "nidaq.h5", {
         "sample_index": first_sample + np.arange(samples, dtype=np.int64),
         "block_observation_perf_time": seen_per_block[block].astype(np.float64),
@@ -208,6 +211,36 @@ def test_camera_clock_latches_pair_frames_whatever_the_lag(tmp_path, lag):
     assert attrs["pairing_median_residual"] == pytest.approx(camera["pairing"]["median_residual"])
     assert attrs["latchDirectLagP50"] == pytest.approx(lag, abs=1e-6)
     assert "assumes_lag_below_period" not in attrs
+    # The NI path's own figure, over the same frames, beside the latch-direct one.
+    assert camera["niDerivedLagP50"] == pytest.approx(pose["exposure_to_arrival"]["p50"], abs=1e-4)
+
+
+@pytest.mark.parametrize("disagreement, gated", [(0.0025, True), (0.0005, False)],
+                         ids=["over_tolerance", "within_tolerance"])
+def test_a_latch_pairing_the_ni_path_disagrees_with_is_ambiguous(tmp_path, monkeypatch,
+                                                                  disagreement, gated):
+    real = finalize._latch_direct_lag_p50
+    monkeypatch.setattr(finalize, "_latch_direct_lag_p50",
+                        lambda frames, latches: real(frames, latches) + disagreement)
+
+    status = finalize_session_latency(_session(tmp_path), primary_camera="left")
+
+    camera = status["clocks"]["cameraToNi"]
+    assert camera["pairing"]["method"] == "camera_latch"
+    assert camera["pairing"]["ambiguous"] is gated
+    assert camera["valid"] is not gated
+    if gated:
+        # Both numbers, in ms, and the tolerance: a quarter of a 150 fps period.
+        reason = camera["pairing"]["reason"]
+        assert f"{camera['niDerivedLagP50'] * 1e3:.3f} ms" in reason
+        assert f"{camera['latchDirectLagP50'] * 1e3:.3f} ms" in reason
+        assert "1.667 ms" in reason
+        assert camera["reason"] == reason
+        # The mixed figures fall back as for any ambiguous pairing.
+        assert status["loops"]["pose"]["status"] == "partial"
+        assert status["loops"]["pose"]["summary"]["confidence"] == "software"
+    else:
+        assert status["status"] == "complete", status
 
 
 def test_without_clock_latches_the_host_arrival_pairing_is_used_and_says_so(tmp_path):

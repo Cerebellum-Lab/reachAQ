@@ -215,6 +215,23 @@ def _latch_direct_lag_p50(frames, latches) -> float:
         return math.nan
 
 
+def _ni_derived_lag_p50(frames, latches, camera_to_ni, ni_to_host) -> float:
+    """Median of arrival minus the NI-derived exposure, over the frames the latches cover."""
+    try:
+        if not (camera_to_ni.valid and ni_to_host.valid):
+            return math.nan
+        fit = clocks.fit_latches(latches)
+        camera = numpy.asarray(frames["camera_ts_ns"], dtype=numpy.float64) / 1e9
+        near = clocks.latch_window(fit, camera) if fit.valid else numpy.zeros(camera.shape, bool)
+        exposure = ni_to_host.map(camera_to_ni.map(camera[near]))
+        lag = numpy.asarray(frames["arrival_perf"], dtype=numpy.float64)[near] - exposure
+        lag = lag[numpy.isfinite(lag)]
+        return float(numpy.median(lag)) if lag.size else math.nan
+    except Exception:
+        logger.exception("Latency NI-derived lag failed")
+        return math.nan
+
+
 def _flagged_primary(stream: dict) -> bool:
     try:
         return bool(stream["attrs"].get("is_primary", False))
@@ -338,9 +355,19 @@ class _Context:
             record["cameraToNi"]["alternative_median_lag"] = pairing.median_lag + self.frame_period
             self.status["reasons"].append(HOST_ARRIVAL_PAIRING_REASON)
         else:
-            # Exposure to arrival measured without NI at all: an independent
-            # check on the NI-derived exposure_to_arrival.
-            record["cameraToNi"]["latchDirectLagP50"] = _latch_direct_lag_p50(frames, latches)
+            # Exposure to arrival measured without NI at all, beside the NI
+            # path's figure over the same frames: two measurements of one lag,
+            # so a pairing they disagree on is not trusted.
+            latch_lag = _latch_direct_lag_p50(frames, latches)
+            ni_lag = _ni_derived_lag_p50(frames, latches, self.camera_to_ni, self.ni_to_host)
+            record["cameraToNi"]["latchDirectLagP50"] = latch_lag
+            record["cameraToNi"]["niDerivedLagP50"] = ni_lag
+            tolerance = clocks.latch_tolerance(self.frame_period)
+            if not pairing.ambiguous and abs(ni_lag - latch_lag) > tolerance:
+                self.pairing = dataclasses.replace(pairing, ambiguous=True, reason=(
+                    f"NI-derived exposure-to-arrival p50 {ni_lag * 1e3:.3f} ms and latch-direct "
+                    f"p50 {latch_lag * 1e3:.3f} ms differ by more than {tolerance * 1e3:.3f} ms"))
+                record["cameraToNi"]["pairing"] = dataclasses.asdict(self.pairing)
         if self.pairing.ambiguous:
             record["cameraToNi"]["valid"] = False
             record["cameraToNi"]["reason"] = self.pairing.reason
