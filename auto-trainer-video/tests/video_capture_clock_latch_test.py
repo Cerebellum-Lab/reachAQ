@@ -58,6 +58,10 @@ def _record(project_info, latch, seconds=1.0):
     capture = VideoCapture(attrs, record_properties=record, project_info=project_info)
     assert capture._prepare_to_run()
     capture._camera.latch_clock = latch
+    # What the stub may need to act as the command thread, and which streams were closed.
+    latch.capture, finished = capture, []
+    latch.finished, finish = finished, capture._finish_latency
+    capture._finish_latency = lambda writer: (finished.append(writer), finish(writer))
     loop = threading.Thread(target=capture._run_capture_loop, args=(capture._camera,),
                             name=LOOP_THREAD, daemon=True)
     loop.start()
@@ -69,6 +73,7 @@ def _record(project_info, latch, seconds=1.0):
         time.sleep(0.7)
         assert status.value == CaptureProcessStatus.RUNNING
     finally:
+        latch.open_at_exit = capture._latency
         commands.put((CaptureCommandKind.TERMINATE, None))
         loop.join(10)
         capture._terminate_capture_loop(None)
@@ -121,3 +126,82 @@ def test_a_latch_that_raises_stays_out_of_the_capture_loop(project_info, caplog)
     assert len(stream["clock_latches"]) == 0
     _assert_capture_unaffected(stream["frames"], caplog)
     assert "camera clock latch failed" in caplog.text
+
+
+class _RecordDuringStopMark(_Latch):
+    """On the first latch of the stop mark, starts the next stream as an ENABLE would."""
+
+    closing = opened = None
+
+    def __call__(self):
+        if len(self.threads) == 3:  # the opening mark took three
+            self.closing = self.capture._latency
+            self.capture._start_latency()
+            self.opened = self.capture._latency
+        return super().__call__()
+
+
+def test_a_record_inside_the_stop_mark_keeps_the_stream_it_opened(project_info):
+    latch = _RecordDuringStopMark()
+
+    stream = _record(project_info, latch)
+
+    assert latch.closing is not None and latch.opened is not None
+    assert latch.opened is not latch.closing
+    # The old stream's close still happened, and the new one lived on to exit.
+    assert latch.closing in latch.finished
+    assert latch.open_at_exit is latch.opened
+    assert latch.finished.index(latch.closing) < latch.finished.index(latch.opened)
+    # The file now holds the new stream: its frames and its own opening latches.
+    assert len(stream["clock_latches"]) == 3
+    assert len(stream["frames"]) > 5
+
+
+class _Camera:
+    """latch_clock stub: brackets of ``bracket`` seconds, each call taking ``takes``."""
+
+    def __init__(self, bracket, takes=0.0):
+        self.bracket, self.takes, self.calls = bracket, takes, 0
+
+    def latch_clock(self):
+        self.calls += 1
+        before = time.perf_counter()
+        time.sleep(self.takes)
+        return before, self.calls, before + self.bracket
+
+
+class _Rows:
+    def __init__(self):
+        self.rows = []
+
+    def append(self, dataset, row):
+        self.rows.append((dataset, row))
+
+
+def _mark(camera):
+    capture = object.__new__(VideoCapture)
+    capture._name = "budget"
+    rows = _Rows()
+    started = time.perf_counter()
+    capture._append_clock_latches(camera, rows)
+    return rows.rows, time.perf_counter() - started
+
+
+def test_three_quick_latches_make_a_mark():
+    rows, _ = _mark(_Camera(bracket=0.0002))
+    assert [dataset for dataset, _ in rows] == ["clock_latches"] * 3
+
+
+def test_a_latch_wider_than_the_finalizer_uses_ends_the_mark_after_its_row():
+    rows, _ = _mark(_Camera(bracket=0.003))
+    assert len(rows) == 1
+
+
+def test_a_slow_mark_stops_at_its_time_budget():
+    # Tight brackets, but each call stalls 3 ms after the latch (the value read).
+    camera = _Camera(bracket=0.0002, takes=0.003)
+
+    rows, elapsed = _mark(camera)
+
+    assert camera.calls == 2 and len(rows) == 2
+    assert elapsed < 0.009

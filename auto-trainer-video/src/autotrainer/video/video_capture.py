@@ -60,9 +60,16 @@ logger = get_verbose_logger(__name__)
 FRAME_STATS_REPORT_PERIOD = 0.5
 
 # Camera clock latches taken back to back when a latency stream opens and again
-# when it closes. The finalizer keeps the tightest, and three cost well under a
-# frame period (each is a USB round trip, about 0.2 ms on a Blackfly S).
+# when it closes. The finalizer fits a line through every usable latch when they
+# span more than 10 s (a recording's opening and closing marks), and otherwise
+# uses the tightest one alone. Three cost well under a frame period (each is a
+# USB round trip, about 0.2 ms on a Blackfly S).
 CLOCK_LATCHES_PER_MARK = 3
+# A mark ends early after a latch wider than the finalizer will use (its
+# LATCH_MAX_BRACKET_SECONDS), or once it has taken this long: a stalled USB
+# control transfer must not cost the loop three transport timeouts.
+CLOCK_LATCH_MAX_BRACKET_SECONDS = 0.002
+CLOCK_LATCH_MARK_BUDGET_SECONDS = 0.005
 
 
 # Always keep that extra more nbr of frames for cameras recording sync purpose:
@@ -1003,7 +1010,11 @@ class VideoCapture(Process):
                         # writers may have saturated, and the watchdog watches
                         # this loop.
                         self._append_clock_latches(camera, latency)
-                        self._close_latency(wait=False)
+                        # A Record that arrived while the latches were taken has
+                        # closed this stream itself and opened the next one,
+                        # which is not this loop's to close.
+                        if self._latency is latency:
+                            self._close_latency(wait=False)
 
                 if img_q is not None:
                     # image queue goes to GUI video reader frame, currently FixedArrayQueue.
@@ -1284,18 +1295,24 @@ class VideoCapture(Process):
         where the camera says each exposure happened rather than when the host
         received it. A camera with no clock to latch answers None, which ends
         the mark after one call; a latch that raises is logged and ends it too.
-        Neither reaches the capture loop.
+        Neither reaches the capture loop. A slow latch also ends the mark (see
+        CLOCK_LATCH_MAX_BRACKET_SECONDS), after its row is kept.
         """
+        started = time.perf_counter()
         for _ in range(CLOCK_LATCHES_PER_MARK):
             try:
                 latch = camera.latch_clock()
+                if latch is None:
+                    return
+                latency.append("clock_latches", latch)
+                bracket = latch[2] - latch[0]
             except Exception:
                 logger.warning("<%s> camera clock latch failed; the recording continues without it",
                                self._name, exc_info=True)
                 return
-            if latch is None:
+            if (not bracket <= CLOCK_LATCH_MAX_BRACKET_SECONDS
+                    or time.perf_counter() - started > CLOCK_LATCH_MARK_BUDGET_SECONDS):
                 return
-            latency.append("clock_latches", latch)
 
     def _process_stim_frame(
         self,
