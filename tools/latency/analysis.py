@@ -347,6 +347,11 @@ def can_loop(*, can_events, wall_map) -> dict:
     def rows(name):
         return can_events[stage == name]
 
+    sends = rows(b"send")
+    if len(sends) == 0:
+        # With CAN disabled the app still records a token for a command it
+        # never sends, so tokens alone are not CAN traffic.
+        return {"status": "absent", "reason": "no CAN sends recorded"}
     token_rows = rows(b"token")
     if len(token_rows) == 0:
         return {"status": "partial", "reason": "CAN events without token rows",
@@ -355,7 +360,6 @@ def can_loop(*, can_events, wall_map) -> dict:
     token_perf = token_rows["perf"]
     enqueue = take_by_key(rows(b"enqueue")["token"], rows(b"enqueue")["perf"], tokens)
     dequeue = take_by_key(rows(b"dequeue")["token"], rows(b"dequeue")["perf"], tokens)
-    sends = rows(b"send")
     send = take_by_key(sends["token"], sends["perf"], tokens)
     send_end = take_by_key(sends["token"], sends["perf_end"], tokens)
     uuid = take_by_key(sends["token"], sends["can_uuid"], tokens, fill=-1.0)
@@ -390,8 +394,12 @@ def can_loop(*, can_events, wall_map) -> dict:
         summarize("round_trip", ack_perf - send, SOFTWARE),
         summarize("ack_kernel_to_decode", ack_perf - kernel_perf, SOFTWARE),
     ]
-    summary = {"commands": int(len(tokens)), "acked": int(numpy.isfinite(ack_perf).sum())}
-    return _result(stages, [], summary)
+    acked = int(numpy.isfinite(ack_perf).sum())
+    summary = {"commands": int(len(tokens)), "acked": acked}
+    # Sends that nothing acknowledged leave the round-trip stages empty, so
+    # the loop did not measure what it exists to measure.
+    reasons = [] if acked else [f"{len(sends)} sends, none acknowledged"]
+    return _result(stages, reasons, summary)
 
 
 def hardware_loop(*, command_edges: Mapping[str, numpy.ndarray],
