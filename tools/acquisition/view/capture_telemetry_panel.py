@@ -110,9 +110,17 @@ class CaptureTelemetryPanel(QWidget):
         body = self._body = QFrame()
         body.setObjectName("captureTelemetryBody")
         body.setFrameShape(QFrame.Shape.NoFrame)
-        body_layout = QHBoxLayout(body)
-        body_layout.setContentsMargins(10, 4, 10, 6)
+        # Two rows, so the readouts the latency record added do not widen the
+        # panel. Two panels share a camera row and neither can shrink below its
+        # minimum width, so each pixel here is paid twice in the window's
+        # minimum width; all seven on one row needed more than a 1920 px
+        # display has when both panels were open.
+        rows = QVBoxLayout(body)
+        rows.setContentsMargins(10, 4, 10, 6)
+        rows.setSpacing(4)
+        body_layout = QHBoxLayout()
         body_layout.setSpacing(18)
+        rows.addLayout(body_layout)
 
         # Widest reading each readout can show, so none of them resizes the
         # panel when a number grows a digit.
@@ -132,7 +140,13 @@ class CaptureTelemetryPanel(QWidget):
         # latency record measures them after the session.
         self._e2e_ms = self._add_readout(body_layout, "Arrival → result",
                                           "000.0 ms  max 0000.0")
-        self._stim_p99 = self._add_readout(body_layout, "Stim p99", "0000.0 ms")
+        body_layout.addStretch(1)
+
+        # The second row: what the latency record added.
+        detail_layout = QHBoxLayout()
+        detail_layout.setSpacing(18)
+        rows.addLayout(detail_layout)
+        self._stim_p99 = self._add_readout(detail_layout, "Stim p99", "0000.0 ms")
         # On the holder, so hovering the caption or the number both explain it.
         self._stim_p99.parentWidget().setToolTip(
             "Rolling p99 of the direct stim route this session: host arrival "
@@ -141,9 +155,9 @@ class CaptureTelemetryPanel(QWidget):
         # Widest status the finalizer can produce, plus a character of slack:
         # a label's size hint can run a pixel past the summed advances for
         # letter text, which would still move the panel when the status lands.
-        self._latency = self._add_readout(body_layout, "Latency record",
+        self._latency = self._add_readout(detail_layout, "Latency record",
                                           "complete (hardware) ")
-        body_layout.addStretch(1)
+        detail_layout.addStretch(1)
 
         body.setVisible(False)
         # Tracked explicitly rather than read back from isVisible(): a widget
