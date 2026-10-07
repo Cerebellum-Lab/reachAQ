@@ -67,6 +67,7 @@ def _dispatcher(accept):
         cancel_prepared_cover_policy=lambda: None,
     )
     errors = []
+    latency_rows = []
     model = SimpleNamespace(
         _compile_protocol_trial=lambda token, trial_id: object(),
         _trial_action_executor=executor,
@@ -76,6 +77,10 @@ def _dispatcher(accept):
         _protocol_action_lock=threading.Lock(),
         _protocol_action_thread=None,
         _notify_trial_protocol_state=lambda: None,
+        # The latency record's trial_send stamp, collected for the test below.
+        _session_data_recorder=SimpleNamespace(latency_events=SimpleNamespace(
+            record_can=lambda stage, fields: latency_rows.append((stage, fields)))),
+        latency_rows=latency_rows,
     )
     return model, executor, errors, ran_on
 
@@ -100,6 +105,15 @@ def test_an_accepted_protocol_send_is_not_failed(algorithm_thread):
     assert executor.operation.state is PreparedState.SEND_ACCEPTED
     assert executor.failures == []
     assert errors == []
+
+
+def test_the_dispatch_stamps_the_trials_send_request_for_the_latency_record(algorithm_thread):
+    model, _executor, _errors, _ran_on = _dispatcher(accept=True)
+    _dispatch(model)
+    [(stage, fields)] = model.latency_rows
+    assert stage == "trial_send"
+    assert fields["kind"] == "SEND_PELLET"
+    assert isinstance(fields["perf"], float)
 
 
 def test_a_refused_protocol_send_is_still_failed_and_reported(algorithm_thread):
