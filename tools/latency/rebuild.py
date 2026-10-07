@@ -22,7 +22,16 @@ def _primary_from_alignment(session_dir: Path) -> str:
     try:
         with path.open("r", encoding="utf-8") as stream:
             return str(json.load(stream)["canonicalBoundary"].get("primaryCamera") or "")
-    except (OSError, KeyError, ValueError):
+    except (OSError, KeyError, ValueError, TypeError, AttributeError):
+        return ""
+
+
+def _session_id_from_manifest(session_dir: Path) -> str:
+    path = session_dir / "streams" / "stream_manifest.json"
+    try:
+        with path.open("r", encoding="utf-8") as stream:
+            return str(json.load(stream)["sessionId"] or "")
+    except (OSError, KeyError, ValueError, TypeError):
         return ""
 
 
@@ -32,8 +41,11 @@ def main(argv=None) -> int:
     parser.add_argument("--primary-camera", default=None)
     args = parser.parse_args(argv)
     primary = args.primary_camera or _primary_from_alignment(args.session_dir)
-    name = f"latency.rebuilt-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}.h5"
-    status = finalize_session_latency(args.session_dir, primary_camera=primary, output_name=name)
+    # Microseconds, so two rebuilds in one second do not overwrite each other.
+    name = f"latency.rebuilt-{datetime.now(timezone.utc):%Y%m%dT%H%M%S%fZ}.h5"
+    status = finalize_session_latency(
+        args.session_dir, primary_camera=primary, output_name=name,
+        session_id=_session_id_from_manifest(args.session_dir))
     print(json.dumps(status, indent=2, sort_keys=True))
     return 1 if status["status"] == "failed" else 0
 
