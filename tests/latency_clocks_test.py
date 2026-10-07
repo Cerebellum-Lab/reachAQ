@@ -227,3 +227,103 @@ def test_camera_fit_with_nonzero_shift_and_chosen_pairing():
     assert fit.valid, fit.reason
     # Camera timestamp 5.05 should map to NI time 0.05
     assert fit.map(5.05) == pytest.approx(0.05, abs=1e-4)
+
+
+LATCH_DTYPE = np.dtype([("perf_before", "<f8"), ("camera_ns", "<i8"), ("perf_after", "<f8")])
+PERIOD_150 = 1 / 150
+CAMERA_BEHIND_HOST = 40.0  # camera clock = host perf_counter - 40 s
+
+
+def _camera_clock(host):
+    return np.asarray(host, dtype=np.float64) - CAMERA_BEHIND_HOST
+
+
+def _latches(host_times, *, camera_of=_camera_clock, bracket=100e-6, error=0.0):
+    host = np.asarray(host_times, dtype=np.float64)
+    rows = np.zeros(host.size, dtype=LATCH_DTYPE)
+    rows["perf_before"] = host - bracket / 2
+    rows["perf_after"] = host + bracket / 2
+    rows["camera_ns"] = np.round((camera_of(host) + error) * 1e9).astype(np.int64)
+    return rows
+
+
+def _exposures(count, *, early=5):
+    """Frame ids from 1000, their exposure host times, and NI transitions from ``early`` frames before."""
+    ids = np.arange(1000, 1000 + count)
+    exposure = 50.0 + (ids - 1000 + early) * PERIOD_150
+    transition_perf = 50.0 + np.arange(count + early + 5) * PERIOD_150
+    return ids, exposure, transition_perf
+
+
+def test_host_arrival_pairing_aliases_a_lag_over_one_period_and_the_camera_clock_does_not():
+    # christielab10, Task 15: exposure to arrival measured 18.9 ms, at 150 fps 2.8 frame periods.
+    lag = 0.0189
+    ids, exposure, transition_perf = _exposures(9000)
+    camera_ts_ns = np.round(_camera_clock(exposure) * 1e9).astype(np.int64)
+    latches = _latches([exposure[0] + 0.001, exposure[-1] + 0.001])
+
+    by_arrival = clocks.choose_pairing(ids, exposure + lag, transition_perf, PERIOD_150)
+    by_clock = clocks.choose_pairing_by_camera_clock(ids, camera_ts_ns, latches, transition_perf,
+                                                     PERIOD_150)
+
+    # The latest transition before each arrival is two frames on, and nothing says so.
+    assert by_arrival.method == "host_arrival"
+    assert by_arrival.shift == 993 and not by_arrival.ambiguous
+    assert by_arrival.median_lag == pytest.approx(lag - 2 * PERIOD_150, abs=1e-6)
+    assert by_clock.method == "camera_latch"
+    assert by_clock.shift == 995  # frame 1000 is transition 5
+    assert not by_clock.ambiguous, by_clock.reason
+    assert by_clock.agreement == 1.0
+    assert abs(by_clock.median_residual) < 1e-5
+
+
+def test_a_latch_off_by_more_than_half_a_period_is_ambiguous():
+    ids, exposure, transition_perf = _exposures(3000)
+    camera_ts_ns = np.round(_camera_clock(exposure) * 1e9).astype(np.int64)
+    latches = _latches([exposure[0] + 0.001], error=0.6 * PERIOD_150)
+
+    pairing = clocks.choose_pairing_by_camera_clock(ids, camera_ts_ns, latches, transition_perf,
+                                                    PERIOD_150)
+
+    assert pairing.ambiguous
+    assert "residual" in pairing.reason
+    assert abs(pairing.median_residual) > PERIOD_150 / 4
+
+
+def test_an_hour_of_camera_drift_is_fitted_through_two_latches_or_windowed_around_one():
+    drift = 20e-6
+
+    def drifting(host):
+        return _camera_clock(host) * (1 + drift)
+
+    ids, exposure, transition_perf = _exposures(150 * 3600)
+    camera_ts_ns = np.round(drifting(exposure) * 1e9).astype(np.int64)
+    start, end = exposure[0] + 0.001, exposure[-1] + 0.001
+
+    both = clocks.choose_pairing_by_camera_clock(
+        ids, camera_ts_ns, _latches([start, end], camera_of=drifting), transition_perf, PERIOD_150)
+    start_only = clocks.choose_pairing_by_camera_clock(
+        ids, camera_ts_ns, _latches([start], camera_of=drifting), transition_perf, PERIOD_150)
+
+    # 20 ppm over an hour is 72 ms, ten frame periods: one offset cannot pair the whole session.
+    for pairing in (both, start_only):
+        assert pairing.shift == 995 and not pairing.ambiguous, pairing.reason
+        assert abs(pairing.median_residual) < PERIOD_150 / 4
+    assert abs(both.median_residual) < 1e-5
+
+
+@pytest.mark.parametrize("latches, why", [
+    (np.zeros(0, dtype=LATCH_DTYPE), "0 rows"),
+    (np.concatenate([_latches([50.1], bracket=0.005),
+                     _latches([60.0], bracket=float("nan"))]), "2 rows"),
+], ids=["empty", "too_wide"])
+def test_unusable_latches_give_an_ambiguous_pairing_with_a_reason(latches, why):
+    ids, exposure, transition_perf = _exposures(300)
+    camera_ts_ns = np.round(_camera_clock(exposure) * 1e9).astype(np.int64)
+
+    pairing = clocks.choose_pairing_by_camera_clock(ids, camera_ts_ns, latches, transition_perf,
+                                                    PERIOD_150)
+
+    assert pairing.ambiguous
+    assert pairing.method == "camera_latch"
+    assert "no usable clock latch" in pairing.reason and why in pairing.reason

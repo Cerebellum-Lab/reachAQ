@@ -21,6 +21,18 @@ WALL_SEGMENT_JUMP_SECONDS = 0.001
 ENVELOPE_BINS = 20
 PAIRING_MARGIN_SECONDS = 0.0001
 PAIRING_MIN_AGREEMENT = 0.95
+# A camera clock latch is one USB round trip: christielab10's BFS-U3-16S2M
+# brackets it in 0.18-0.36 ms (median 0.20 ms), idle or streaming. 2 ms admits
+# ten times that on a busy bus while keeping the latch's own uncertainty, half
+# the bracket, under a quarter of a 150 fps frame period (1.67 ms).
+LATCH_MAX_BRACKET_SECONDS = 0.002
+# Latches further apart than this are fitted with a line, which takes up the
+# camera oscillator's drift; closer ones give an offset only, trusted for
+# frames within LATCH_WINDOW_SECONDS (20 ppm over 30 s is 0.6 ms).
+LATCH_DRIFT_SPAN_SECONDS = 10.0
+LATCH_WINDOW_SECONDS = 30.0
+HOST_ARRIVAL = "host_arrival"
+CAMERA_LATCH = "camera_latch"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -177,6 +189,9 @@ class Pairing:
     agreement: float
     ambiguous: bool
     reason: str = ""
+    method: str = HOST_ARRIVAL
+    median_residual: float = math.nan
+    """Camera-clock method: transition minus expected host time, over the chosen shift."""
 
 
 def choose_pairing(frame_ids, arrival_perf, transition_perf, frame_period: float) -> Pairing:
@@ -189,7 +204,10 @@ def choose_pairing(frame_ids, arrival_perf, transition_perf, frame_period: float
     the shift most frames agree on wins. This assumes the exposure-to-arrival
     lag is under one frame period; if the winning lag sits within a margin of
     zero or of a whole period, the NI-to-host bias could have tipped the
-    choice, and the pairing is marked ambiguous.
+    choice, and the pairing is marked ambiguous. A longer lag is not detected:
+    every frame is paired with an exposure whole periods after its own.
+    choose_pairing_by_camera_clock needs no such assumption and is preferred
+    when the camera stream has clock latches.
     """
     frame_ids = numpy.asarray(frame_ids, dtype=numpy.int64)
     arrival = numpy.asarray(arrival_perf, dtype=numpy.float64)
@@ -224,6 +242,105 @@ def choose_pairing(frame_ids, arrival_perf, transition_perf, frame_period: float
     else:
         reason = ""
     return Pairing(shift, median_lag, agreement, bool(ambiguous), reason)
+
+
+def usable_latches(latches) -> Tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray]:
+    """(camera seconds, host perf, uncertainty) of each clock latch worth using.
+
+    The latch happened somewhere inside its perf bracket, so the midpoint is its
+    host time and half the width its uncertainty. A bracket that is not finite
+    or wider than LATCH_MAX_BRACKET_SECONDS is left out.
+    """
+    if latches is None or len(latches) == 0:
+        return numpy.empty(0), numpy.empty(0), numpy.empty(0)
+    before = numpy.asarray(latches["perf_before"], dtype=numpy.float64)
+    after = numpy.asarray(latches["perf_after"], dtype=numpy.float64)
+    camera = numpy.asarray(latches["camera_ns"], dtype=numpy.float64) / 1e9
+    width = after - before
+    keep = numpy.isfinite(width) & (width >= 0) & (width <= LATCH_MAX_BRACKET_SECONDS)
+    return camera[keep], ((before + after) / 2)[keep], (width / 2)[keep]
+
+
+def fit_latches(latches) -> ClockFit:
+    """Camera timestamp (s) -> host perf_counter, from the camera clock latches.
+
+    Latches more than LATCH_DRIFT_SPAN_SECONDS apart are fitted with a line,
+    which takes up the camera's drift. Closer together they cannot measure it,
+    and the tightest one's offset is used alone; its uncertainty stands in for
+    the residual. Either way, x_min and x_max are the latched span, and only
+    timestamps latch_window() admits should be mapped.
+    """
+    camera, host, uncertainty = usable_latches(latches)
+    if camera.size == 0:
+        rows = 0 if latches is None else len(latches)
+        return invalid_fit(f"no usable clock latch: {rows} rows, none with a finite bracket "
+                           f"within {LATCH_MAX_BRACKET_SECONDS * 1e3:.1f} ms")
+    if camera.max() - camera.min() > LATCH_DRIFT_SPAN_SECONDS:
+        return fit_line(camera, host, max_residual=LATCH_MAX_BRACKET_SECONDS, min_points=2)
+    tightest = int(numpy.argmin(uncertainty))
+    return ClockFit(offset=float(host[tightest] - camera[tightest]), drift=1.0,
+                    residual_rms=float(uncertainty[tightest]), points=1, valid=True,
+                    x_min=float(camera[tightest]), x_max=float(camera[tightest]))
+
+
+def latch_window(fit: ClockFit, camera_seconds) -> numpy.ndarray:
+    """Camera timestamps within LATCH_WINDOW_SECONDS of the latched span."""
+    camera_seconds = numpy.asarray(camera_seconds, dtype=numpy.float64)
+    return ((camera_seconds >= fit.x_min - LATCH_WINDOW_SECONDS)
+            & (camera_seconds <= fit.x_max + LATCH_WINDOW_SECONDS))
+
+
+def choose_pairing_by_camera_clock(frame_ids, camera_ts_ns, latches, transition_perf,
+                                   frame_period: float) -> Pairing:
+    """Which exposure transition belongs to which frame, decided by the camera's clock.
+
+    The latches place camera time on host time, so a frame's camera timestamp
+    says when on the host clock it was exposed, however long it then waited to
+    be delivered. Each frame's candidate is the transition nearest that time,
+    and the shift most frames agree on wins.
+
+    The median residual (transition minus expected time, over the chosen shift)
+    is where the camera stamps a frame relative to the NI edge, plus the NI-to-
+    host bias, plus the latch uncertainty. All of it must stay well under half a
+    period for the nearest transition to be the right one, so a residual over a
+    quarter period, or agreement below PAIRING_MIN_AGREEMENT, marks the pairing
+    ambiguous. The lag is not measured here: median_lag is NaN.
+    """
+    fit = fit_latches(latches)
+    if not fit.valid:
+        return Pairing(0, math.nan, 0.0, True, fit.reason, method=CAMERA_LATCH)
+    frame_ids = numpy.asarray(frame_ids, dtype=numpy.int64)
+    camera = numpy.asarray(camera_ts_ns, dtype=numpy.float64) / 1e9
+    transition_perf = numpy.asarray(transition_perf, dtype=numpy.float64)
+    keep = numpy.isfinite(camera) & latch_window(fit, camera)
+    if not keep.any() or transition_perf.size == 0:
+        return Pairing(0, math.nan, 0.0, True, "no frames near a clock latch or no transitions",
+                       method=CAMERA_LATCH)
+    ids = frame_ids[keep]
+    expected = fit.map(camera[keep])
+    later = numpy.clip(numpy.searchsorted(transition_perf, expected), 0, transition_perf.size - 1)
+    earlier = numpy.clip(later - 1, 0, transition_perf.size - 1)
+    nearest = numpy.where(numpy.abs(transition_perf[later] - expected)
+                          < numpy.abs(transition_perf[earlier] - expected), later, earlier)
+    shifts = ids - nearest
+    values, counts = numpy.unique(shifts, return_counts=True)
+    shift = int(values[numpy.argmax(counts)])
+    agreement = float(counts.max() / shifts.size)
+    numbers = ids - shift
+    inside = (numbers >= 0) & (numbers < transition_perf.size)
+    residual = transition_perf[numbers[inside]] - expected[inside]
+    median_residual = float(numpy.median(residual)) if residual.size else math.nan
+    residual_ambiguous = not abs(median_residual) <= frame_period / 4
+    agreement_ambiguous = agreement < PAIRING_MIN_AGREEMENT
+    if residual_ambiguous:
+        reason = (f"median residual {median_residual * 1e3:.3f} ms is over a quarter "
+                  f"frame period ({frame_period / 4 * 1e3:.3f} ms)")
+    elif agreement_ambiguous:
+        reason = f"agreement {agreement:.2f} below {PAIRING_MIN_AGREEMENT}"
+    else:
+        reason = ""
+    return Pairing(shift, math.nan, agreement, bool(residual_ambiguous or agreement_ambiguous),
+                   reason, method=CAMERA_LATCH, median_residual=median_residual)
 
 
 def fit_camera_to_ni(frame_ids, camera_ts_ns, transition_index, sample_rate: float,
