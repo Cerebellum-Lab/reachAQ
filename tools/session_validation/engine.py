@@ -192,16 +192,61 @@ def _sha256(path):
     return digest.hexdigest()
 
 
-# Sources whose files _write_session never lists in the stream manifest: recorded video,
-# the per-camera pose files and the stim camera's evidence. camera.frames,
-# sources.contract and stim.evidence check them by content instead. A kind not named
-# here has to be listed, so a new source whose file the recorder forgets to list fails
-# here and is not left unchecked.
+# Sources whose files _write_session does not list in the stream manifest: recorded
+# video, the per-camera pose files and the stim camera's evidence. Capture processes close
+# them asynchronously, so a hash taken at publication could be of bytes still changing.
+# camera.frames and stim.evidence check the video and the evidence by content; pose gets
+# only the existence and stored sampleCount checks of sources.contract, and nothing reads
+# a raw2D_live.h5. A kind not named here has to be listed, so a new source whose file the
+# recorder forgets to list fails here and is not left unchecked.
 _SOURCE_KINDS_NOT_LISTED = frozenset({
     "camera",
     "pose",
     "stim_camera_detection_evidence",
 })
+
+# The stream files _write_session lists whenever they exist (its critical_paths), beside
+# the session's *_frame_timing.csv and streams/tracking/*.json. Not streams/latency/*.h5:
+# a raw latency stream is left out when its writer was still closing it. No enabled source
+# names several of these, so the source check alone cannot see them go missing from the
+# list. tests/session_latency_finalize_test.py holds this against the recorder.
+_STREAM_FILES_LISTED = (
+    "streams/device.csv",
+    "streams/events.csv",
+    "streams/trials.jsonl",
+    "streams/trial_summary.json",
+    "streams/laser.csv",
+    "streams/pressure.csv",
+    "logs/session.log",
+    "streams/alignment.json",
+    "streams/camera_alignment.json",
+    "streams/nidaq.h5",
+    "streams/latency.h5",
+)
+
+
+def _source_files(source):
+    """The files an enabled source wrote: its "paths" when it has any, else its "path".
+
+    A source written as several files lists them under "paths", and its "path" is then a
+    name rather than a file - pose writes one raw2D_live.h5 per camera.
+    """
+    if "paths" in source:
+        return tuple(source.get("paths") or ())
+    return (source["path"],) if source.get("path") else ()
+
+
+def _listed_stream_files(context):
+    """Session-relative paths of the stream files _write_session lists, as found on disk."""
+    found = [*_STREAM_FILES_LISTED]
+    found.extend(
+        path.relative_to(context.root).as_posix()
+        for path in (
+            *sorted(context.root.glob("*_frame_timing.csv")),
+            *sorted(context.path("streams/tracking").glob("*.json")),
+        )
+    )
+    return found
 
 
 def _manifest_rule(context):
@@ -238,29 +283,38 @@ def _manifest_rule(context):
             ):
                 errors.append(f"hash mismatch {relative}")
     # Size and hash are checked for listed files only, so a file that is left off the
-    # list is checked by nothing. A source's file that is on disk has to be listed here;
-    # one that is absent is named by sources.contract, not twice.
+    # list is checked by nothing. An enabled source's file, and each stream file
+    # _write_session lists, has to be listed when it is on disk; one that is absent is
+    # named by sources.contract, not twice. A source is named first: it says what wrote it.
     stream_manifest = manifests[1][1]
-    # Paths that are listed, then ones already looked at: several sources can share a
-    # file (every NI channel names nidaq.h5), and it is named once.
-    settled = {item.get("path") for item in stream_manifest.get("files", ())}
-    for source in stream_manifest.get("enabledSources", ()):
-        source_kind = str(source.get("kind", ""))
-        if source_kind in _SOURCE_KINDS_NOT_LISTED:
-            continue
-        for relative in (source["paths"] if "paths" in source else [source.get("path")]) or ():
-            if not relative or relative in settled:
-                continue
-            settled.add(relative)
-            try:
-                path = context.path(relative)
-            except ValueError as error:
+    expected = [
+        (relative, f" ({source.get('kind', '')} source {source.get('id', 'unknown')})")
+        for source in stream_manifest.get("enabledSources", ())
+        if str(source.get("kind", "")) not in _SOURCE_KINDS_NOT_LISTED
+        for relative in _source_files(source)
+    ]
+    expected.extend((relative, "") for relative in _listed_stream_files(context))
+    # Resolved paths that are listed, then ones already looked at, so that no spelling of
+    # a listed file reads as unlisted. Several sources can share a file (every NI channel
+    # names nidaq.h5), and it is named once.
+    settled = set()
+    for item in stream_manifest.get("files", ()):
+        try:
+            settled.add(context.path(item.get("path", "")))
+        except ValueError:
+            pass  # Reported above.
+    for relative, owner in expected:
+        try:
+            path = context.path(relative)
+        except ValueError as error:
+            if str(error) not in errors:
                 errors.append(str(error))
-                continue
-            if path.is_file():
-                errors.append(
-                    f"unlisted {relative} ({source_kind} source {source.get('id', 'unknown')})"
-                )
+            continue
+        if path in settled:
+            continue
+        settled.add(path)
+        if path.is_file():
+            errors.append(f"unlisted {relative}{owner}")
     return _result(
         "session.manifest",
         "fail" if errors else "pass",
@@ -295,21 +349,20 @@ def _source_contract_rule(context):
     for source in stream.get("enabledSources", ()):
         source_id = source.get("id", "unknown")
         source_kind = str(source.get("kind", ""))
-        relative = source.get("path")
+        files = _source_files(source)
         if "paths" in source:
             # A source written as several files lists them here, and its
             # "path" is then a name rather than a file - pose writes one
             # raw2D_live.h5 per camera. Checking "path" failed every session
             # that recorded pose, with the data sitting beside it.
-            listed = source.get("paths") or ()
-            if not listed:
+            if not files:
                 errors.append(f"{source_id}: artifact missing")
             errors.extend(
                 f"{source_id}: artifact missing: {item}"
-                for item in listed
+                for item in files
                 if not context.path(item).is_file()
             )
-        elif relative and not context.path(relative).is_file():
+        elif files and not context.path(files[0]).is_file():
             errors.append(f"{source_id}: artifact missing")
         if source.get("persistenceStatus") != "written":
             errors.append(f"{source_id}: not written")
