@@ -22,6 +22,7 @@ import numpy as np
 from autotrainer.core import ProjectInfo
 from tools.acquisition.model.session_boundary import SessionBoundary
 from tools.acquisition.model.latency_event_log import LatencyEventLog
+from tools.latency import finalize_session_latency
 from tools.acquisition.model.atomic_session_io import (
     atomic_publish_file,
     atomic_write_json,
@@ -873,6 +874,8 @@ class SessionDataRecorder:
                 streams_dir.parent / "logs" / "session.log",
                 alignment_path,
                 *sorted((streams_dir / "tracking").glob("*.json")),
+                streams_dir / "latency.h5",
+                *sorted((streams_dir / "latency").glob("*.h5")),
             )
             manifest["files"] = [
                 file_manifest_entry(path, relative_to=streams_dir.parent)
@@ -1997,6 +2000,16 @@ class SessionDataRecorder:
             except Exception:
                 logging.getLogger(__name__).exception(
                     "Latency events were not written; the session publishes without them")
+        # The latency analysis. It does not raise, and a failure becomes a
+        # status in the metadata rather than a reason to hold the session back.
+        try:
+            latency_status = finalize_session_latency(
+                session_dir,
+                primary_camera="" if boundary is None else str(boundary.primary_camera),
+            )
+        except Exception as error:
+            logging.getLogger(__name__).exception("Latency finalization failed")
+            latency_status = {"status": "failed", "reasons": [f"{type(error).__name__}: {error}"]}
         source_results = {} if source_results is None else dict(source_results)
         nidaq_health = SessionDataRecorder._nidaq_stream_health(
             nidaq_chunks,
@@ -2211,6 +2224,8 @@ class SessionDataRecorder:
             Path(project.get_frame_timing_path()),
             streams_dir / "nidaq.h5",
             *sorted((streams_dir / "tracking").glob("*.json")),
+            streams_dir / "latency.h5",
+            *sorted(latency_dir.glob("*.h5")),
         )
         stream_manifest = {
             "schemaVersion": 1,
@@ -2240,6 +2255,7 @@ class SessionDataRecorder:
             "sessionComplete": not incomplete_reasons,
             "incompleteReasons": tuple(incomplete_reasons),
             "enabledSources": finalized_sources,
+            "latency": latency_status,
         }
 
     @staticmethod

@@ -937,6 +937,8 @@ class AppModel(ObservableObject):
             event_manager=self._event_manager,
             nidaq_tone_edge_callback=self._on_intertrial_nidaq_tone_edge,
         )
+        # The last finalized session's latency status, for its metadata.
+        self._latency_status: dict = {}
 
         self._inference_queue = None
         self._inference_cameras: Tuple[VideoCaptureModel, ...] = ()
@@ -1449,6 +1451,7 @@ class AppModel(ObservableObject):
                     )
                 if retained_result is not None:
                     self._recording_session.set_stream_result(retained_result)
+                    self._latency_status = dict(retained_result.get("latency") or {})
                 if pending_project is not None:
                     self._pending_metadata_project = pending_project
                     self._save_project_metadata(
@@ -2461,6 +2464,7 @@ class AppModel(ObservableObject):
                     # first recorded frame rather than at arm time, so elapsed
                     # matches the recording rather than the operator's clicking.
                     self._session_telemetry.begin(first_frame_perf)
+                    self._latency_status = {}
                     self._record_start_timer.cancel()
                     self._record_start_timer = no_op_timer
                     self._abort_had_recording_started = True
@@ -10033,6 +10037,7 @@ class AppModel(ObservableObject):
                 ):
                     logger.warning("NI-DAQ alignment boundary update became stale")
             self._recording_session.set_stream_result(stream_result)
+            self._latency_status = dict(stream_result.get("latency") or {})
             if not self._recording_session.data_complete:
                 message = (
                     "Session auxiliary data is incomplete: "
@@ -11201,6 +11206,9 @@ class AppModel(ObservableObject):
                 # same numbers can be read back from the session rather than
                 # only having existed on screen.
                 "capture": self._session_telemetry.summary(),
+                # The latency record's status: per-loop completeness, the
+                # clock fits it used, and why anything is missing.
+                "latency": dict(self._latency_status),
             }
         out = _metadata_without_nonfinite_numbers(out)
         json_path = Path(file_name + ".json")
