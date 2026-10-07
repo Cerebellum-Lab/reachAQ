@@ -498,3 +498,199 @@ def test_manual_run_pulse_events_are_never_a_protocol_lasers_evidence(tmp_path):
     result = _rule(root, "trials.protocol")
     assert result.status.value == "fail"
     assert "laser prepared event is absent" in result.message
+
+
+def _manifest_entry(root, relative):
+    data = (root / relative).read_bytes()
+    return {
+        "path": relative,
+        "sizeBytes": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+    }
+
+
+def _publish_stream_manifest(root, **changes):
+    """Rewrite the stream manifest, then the top-level entries that hash it."""
+    stream_path = root / "streams/stream_manifest.json"
+    stream = json.loads(stream_path.read_text(encoding="utf-8"))
+    stream.update(changes)
+    _write(stream_path, json.dumps(stream))
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"] = [
+        _manifest_entry(root, item["path"]) for item in manifest["files"]
+    ]
+    _write(manifest_path, json.dumps(manifest))
+
+
+def _manifest_result(root, profile=ValidationProfile.QUICK):
+    report = validate_session(
+        root, profile=profile, selected_rules=("session.manifest",))
+    return next(item for item in report.results if item.rule_id == "session.manifest")
+
+
+def _source(source_id, kind, path):
+    return {
+        "id": source_id, "kind": kind, "path": path,
+        "sampleCount": 1, "persistenceStatus": "written",
+    }
+
+
+def _session_with_sources(tmp_path, *, present, listed, sources=None):
+    root = _session(tmp_path)
+    for relative in present:
+        _write(root / relative, f"{relative}\n")
+    _publish_stream_manifest(
+        root,
+        enabledSources=sources if sources is not None else [
+            _source("device", "decoded_can_and_device_events", "streams/device.csv"),
+            # Every NI channel names the one file they share.
+            _source("nidaq.force", "nidaq_analog", "streams/nidaq.h5"),
+            _source("nidaq.cam_frames", "nidaq_digital", "streams/nidaq.h5"),
+            _source("laser_outputs", "laser_commands_and_states", "streams/laser.csv"),
+        ],
+        files=[_manifest_entry(root, relative) for relative in listed],
+    )
+    return root
+
+
+_SOURCE_FILES = ("streams/device.csv", "streams/nidaq.h5", "streams/laser.csv")
+
+
+def test_session_manifest_fails_a_source_file_on_disk_that_is_not_listed(tmp_path):
+    # Listing is what puts a file under the size and hash checks; a file left off the
+    # list is checked by nothing, and every other check still passes.
+    root = _session_with_sources(
+        tmp_path, present=_SOURCE_FILES,
+        listed=("streams/device.csv", "streams/laser.csv"))
+
+    for profile in (ValidationProfile.QUICK, ValidationProfile.FULL):
+        result = _manifest_result(root, profile)
+        assert result.status.value == "fail", profile
+        assert "streams/nidaq.h5" in result.message
+        assert "nidaq_analog" in result.message
+        assert "streams/device.csv" not in result.message
+        assert "streams/laser.csv" not in result.message
+        # Two sources share that file; it is named once.
+        assert result.message.count("streams/nidaq.h5") == 1
+
+
+def test_session_manifest_passes_when_every_source_file_is_listed(tmp_path):
+    root = _session_with_sources(
+        tmp_path, present=_SOURCE_FILES, listed=_SOURCE_FILES)
+
+    for profile in (ValidationProfile.QUICK, ValidationProfile.FULL):
+        assert _manifest_result(root, profile).status.value == "pass", profile
+
+
+def test_session_manifest_leaves_a_source_file_that_is_absent_to_the_source_rule(
+    tmp_path,
+):
+    root = _session_with_sources(
+        tmp_path, present=("streams/device.csv",), listed=("streams/device.csv",))
+
+    assert _manifest_result(root).status.value == "pass"
+    report = validate_session(
+        root, profile=ValidationProfile.QUICK,
+        selected_rules=("session.manifest", "sources.contract"))
+    contract = next(item for item in report.results if item.rule_id == "sources.contract")
+    assert contract.status.value == "fail"
+    assert "nidaq.force: artifact missing" in contract.message
+
+
+def test_session_manifest_does_not_expect_video_or_pose_files_to_be_listed(tmp_path):
+    # The recorder hashes neither a camera's video nor a pose file; camera.frames and
+    # sources.contract check them instead, and listing them would hash gigabytes.
+    root = _session_with_sources(
+        tmp_path,
+        present=("s_left.mp4", "s_left_raw2D_live.h5", "streams/stim_camera_evidence.h5"),
+        listed=(),
+        sources=[
+            _source("camera.left", "camera", "s_left.mp4"),
+            {**_source("pose", "pose", "pose"), "paths": ["s_left_raw2D_live.h5"]},
+            _source("stim_camera_evidence", "stim_camera_detection_evidence",
+                    "streams/stim_camera_evidence.h5"),
+        ],
+    )
+
+    assert _manifest_result(root, ValidationProfile.FULL).status.value == "pass"
+
+
+def test_session_manifest_names_every_unlisted_file_of_a_source_with_several(tmp_path):
+    # "paths" is read the way sources.contract reads it, for a kind that is listed.
+    root = _session_with_sources(
+        tmp_path,
+        present=("streams/a.csv", "streams/b.csv"),
+        listed=("streams/a.csv",),
+        sources=[{**_source("device", "decoded_can_and_device_events", "streams"),
+                  "paths": ["streams/a.csv", "streams/b.csv"]}],
+    )
+
+    result = _manifest_result(root)
+    assert result.status.value == "fail"
+    assert "streams/b.csv" in result.message
+    assert "streams/a.csv" not in result.message
+
+
+def test_session_manifest_reports_a_source_path_that_leaves_the_session(tmp_path):
+    root = _session_with_sources(
+        tmp_path, present=(), listed=(),
+        sources=[_source("device", "decoded_can_and_device_events", "../outside.csv")],
+    )
+
+    result = _manifest_result(root)
+    assert result.status.value == "fail"
+    assert "escapes session" in result.message
+
+
+def test_validation_passes_after_the_post_stop_trial_ledger_update(tmp_path):
+    from datetime import datetime
+
+    from autotrainer.core import ProjectInfo
+    from tools.acquisition.model.session_data_recorder import SessionDataRecorder
+
+    project = ProjectInfo(root=str(tmp_path), device_id="test",
+                          when=datetime(2026, 1, 2, 3, 4, 5), session=7)
+    root = Path(project.get_session_path().location)
+    (root / "streams/tracking").mkdir(parents=True)
+    tracking = root / "streams/tracking/trial_000001_attempt_001.json"
+    tracking.write_text(json.dumps({"window": {"startPerf": 10.3, "endPerf": 11.0}}))
+    pending = {
+        "session_id": project.short_id, "operation_id": "send-1", "trial_id": 1,
+        "attempt_id": 1, "attempt_label": "1.1", "send_perf_time": 10.25,
+        "outcome": "pending_analysis",
+    }
+    # The sources the app builds, less the camera, pose and stim-evidence ones: their
+    # files are written elsewhere and the recorder never lists them.
+    SessionDataRecorder._write_session(
+        project, 10.0, 100.0, 12.0, (), (), (), (),
+        trial_records=(pending,),
+        trial_summary={"pending_analysis_attempts": 1},
+        source_manifest=(
+            _source("nidaq.force", "nidaq_analog", "streams/nidaq.h5"),
+            _source("device", "decoded_can_and_device_events", "streams/device.csv"),
+            _source("laser_outputs", "laser_commands_and_states", "streams/laser.csv"),
+            _source("session_logs", "logs", "logs/session.log"),
+            _source("trials", "pellet_trial_ledger", "streams/trials.jsonl"),
+        ),
+    )
+    # What persist_trial_tracking and then the ledger update do once analysis ends.
+    record = json.loads(tracking.read_text())
+    tracking.write_text(json.dumps({**record, "result": {"outcome": "success"}}))
+    SessionDataRecorder.update_persisted_trial_ledger(
+        project, ({**pending, "outcome": "success"},),
+        {"pending_analysis_attempts": 0, "scored_trials": 1},
+    )
+    # The metadata publish that follows analysis hashes the stream manifest it left.
+    _write(root / "metadata.json", json.dumps({"metadataGenerationId": "g"}))
+    _write(root / "manifest.json", json.dumps({
+        "schemaVersion": 1,
+        "files": [_manifest_entry(root, "metadata.json"),
+                  _manifest_entry(root, "streams/stream_manifest.json")],
+    }))
+
+    stream = json.loads((root / "streams/stream_manifest.json").read_text())
+    for source in stream["enabledSources"]:
+        assert (root / source["path"]).is_file(), source["id"]
+    result = _manifest_result(root, ValidationProfile.FULL)
+    assert result.status.value == "pass", result.message
