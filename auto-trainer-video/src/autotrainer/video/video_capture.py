@@ -533,6 +533,10 @@ class VideoCapture(Process):
             net_q_put = net_q.put
             net_q_idx = inference.index
             # although is same than self._camera_idx
+        # The inference queue pairs the cameras' frames by frame id, which only
+        # names the exposure when the cameras share a hardware trigger. Other
+        # sources leave it out and keep pairing by arrival.
+        net_q_shares_frame_ids = camera.is_trigger_synchronized
         image_queue_delay = self._image_queue_frame_delay
         empty_frame = numpy.zeros((camera.height, camera.width), dtype=numpy.uint8)
         # The inference and display queues may be smaller than the camera frame
@@ -978,13 +982,18 @@ class VideoCapture(Process):
                     # its own call took. It is fitted to when the host's poll
                     # first saw the frame (spinnaker_cam._capture), so it holds
                     # neither exposure nor readout; the latency record measures
-                    # those against the NI exposure edge instead. The camera's
-                    # own frame id goes too: the recording-relative index is -1
-                    # outside a recording.
+                    # those against the NI exposure edge instead. frame_id lets
+                    # the queue pair this frame with the other cameras' frames
+                    # of the same exposure even when one of them dropped a frame
+                    # this camera kept. The latency record also joins its pose
+                    # rows on frame_id, not on the recording-relative index,
+                    # which is -1 outside a recording; a camera without a shared
+                    # trigger passes none, and those rows carry -1.
                     net_frame = net_fit(frame)
                     if net_q_put(net_frame, net_q_idx, frame_idx_cat, block=False,
                                  frame_perf_c=frame_perf_c,
-                                 cam_frame_id=cam_frame_id) == BufferResult.Ok:
+                                 frame_id=cam_frame_id if net_q_shares_frame_ids else None,
+                                 ) == BufferResult.Ok:
                         cnt_net_q_put += 1
                         pose_put_result = POSE_PUT_OK
                     else:

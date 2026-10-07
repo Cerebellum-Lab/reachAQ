@@ -147,6 +147,11 @@ def pose_loop(*, batches, forwards, live_poses, gate, primary_frames,
     if _empty(batches):
         return {"status": "absent", "reason": "no live pose batches were recorded"}
     reasons = []
+    # A frame id is -1 when the capture loop gave the inference queue none:
+    # only trigger-synchronized cameras pass one, since an emulated or playback
+    # camera's own count names no shared exposure. -1 matches no frame row, so
+    # take_by_key leaves its arrival and exposure NaN and summarize drops it
+    # from every frame-anchored stage; pairing skew and coverage mask it below.
     ids = numpy.asarray(batches["frame_ids"], dtype=numpy.int64)
     if ids.ndim == 1:
         ids = ids[:, None]
