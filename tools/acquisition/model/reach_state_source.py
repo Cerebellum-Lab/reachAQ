@@ -203,6 +203,34 @@ class LiveTrackingReachProvider:
             logger.exception("reach observation could not be recorded")
 
 
+class LiveTrackingPelletPresenceProvider:
+    """Answer the cue gate's pellet question from the most recent pose sample.
+
+    Lives beside the reach provider because both read the same buffer for the
+    same gate. The criterion is the pose response's own ``pellet_seen``.
+    Freshness is not judged here: the cue policy's gate staleness limit already
+    applies to the oldest evidence in the gate. None means unknown, never
+    "absent" and never "present".
+    """
+
+    def __init__(self, live_tracking):
+        self._live_tracking = live_tracking
+
+    def __call__(self):
+        try:
+            sample = self._live_tracking.latest()
+        except Exception as err:
+            logger.warning("live tracking buffer failed: %s", err)
+            return None
+        if sample is None:
+            return None
+        try:
+            return bool(sample.pellet_seen), float(sample.source_perf)
+        except Exception as err:
+            logger.warning("live tracking sample is unusable: %s", err)
+            return None
+
+
 class ReachStateResolver:
     """
     Read reach state from the configured source, or report that it is unknown.
