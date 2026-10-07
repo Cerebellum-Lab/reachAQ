@@ -85,7 +85,10 @@ def take_newest_live_batch(queue, frame_buffer, frames_indices, frames_perf_c,
 
     When given, ``cam_frame_ids`` and ``put_perf_c`` receive each camera's own
     frame id and slot-write time, and ``stats["skipped"]`` how many batches
-    the drain overwrote: the latency record's identity and queue stages.
+    the drain overwrote: the latency record's identity and queue stages. The
+    frame ids are -1 unless the cameras are trigger-synchronized, since only
+    those give the queue an id, and ``skipped`` counts batches the drain
+    overwrote, not frames discarded to keep the cameras paired.
     They are only passed on when given, so a queue without them still works.
     """
     extra = {}
@@ -399,8 +402,11 @@ class PoseProcess(Process):
             dtype="float64")
         # Each camera's own frame id and slot-write time for the batch, how
         # many batches the drain skipped, and when the batch was taken: the
-        # latency record's identity and queue stages. pose_seq numbers the
-        # live batches so the monitor's two rows for one batch can be joined.
+        # latency record's identity and queue stages. The ids stay -1 unless
+        # the cameras are trigger-synchronized, and the skip count is batches
+        # the drain overwrote, not frames discarded to keep the cameras paired.
+        # pose_seq numbers the live batches so the monitor's two rows for one
+        # batch can be joined.
         cam_frame_ids1 = numpy.full(
             (input_q.camera_count, input_q.frames_per_camera), -1, dtype="int64")
         put_perf_c1 = numpy.full(

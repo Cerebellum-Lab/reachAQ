@@ -156,6 +156,11 @@ def pose_loop(*, batches, forwards, live_poses, gate, primary_frames,
     if ids.ndim == 1:
         ids = ids[:, None]
     count, cameras = ids.shape
+    if not numpy.any(ids[:, 0] >= 0):
+        # Without this the session reads "complete" with n=0 in every stage
+        # that is anchored to a frame, or carries only the host-arrival reason.
+        reasons.append("the pose batches carry no camera frame ids (cameras not "
+                       "trigger-synchronized): frame-anchored stages are empty")
     arrival = numpy.full((count, cameras), NAN)
     for index in range(cameras):
         frames = camera_frames[index] if index < len(camera_frames) else None

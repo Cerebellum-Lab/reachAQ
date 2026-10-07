@@ -5,6 +5,7 @@ import pytest
 
 from autotrainer.core.latency.schema import (
     CAN_EVENT_DTYPE,
+    LIVE_POSE_DTYPE,
     POSE_FORWARD_DTYPE,
     RECORD_BATCH_DTYPE,
     RECORD_WRITE_DTYPE,
@@ -62,6 +63,54 @@ def test_pose_loop_without_ni_falls_back_to_arrival_and_says_so():
     assert result["summary"]["coverage"] == pytest.approx(2 / 3)
     # Software fallback does not emit exposure_to_arrival (would measure inter-camera skew, not exposure time)
     assert "exposure_to_arrival" not in stages
+    # Real ids reached the table, so nothing is missing for that reason.
+    assert "frame ids" not in result["reason"]
+
+
+@pytest.mark.parametrize("exposure_of", [None, lambda ids: np.full(len(ids), np.nan)],
+                         ids=["no_ni_mapping", "ni_mapping"])
+def test_pose_loop_without_frame_ids_says_why_the_frame_anchored_stages_are_empty(exposure_of):
+    # Emulated and playback cameras are not trigger-synchronized, so the queue
+    # passes no frame id and every batch carries -1.
+    batches = np.zeros(2, dtype=pose_batch_dtype(2))
+    batches["pose_seq"] = [0, 1]
+    batches["frame_ids"] = [[-1, -1], [-1, -1]]
+    batches["put_perf"] = [[1.003, 1.003], [1.017, 1.017]]
+    batches["dequeue_perf"] = [1.004, 1.018]
+    batches["predict_start_perf"] = [1.004, 1.018]
+    batches["predict_done_perf"] = [1.008, 1.022]
+    batches["data_put_perf"] = [1.0081, 1.0221]
+    batches["monitor_recv_perf"] = [1.009, 1.023]
+    frames = np.zeros(3, dtype=[("frame_id", "<i8"), ("arrival_perf", "<f8")])
+    frames["frame_id"] = [10, 11, 12]
+    frames["arrival_perf"] = [1.002, 1.009, 1.016]
+    # Live 3D and the GUI answered, so the missing ids are the only gap an
+    # emulated session would otherwise hide behind a "complete" status.
+    forwards = np.zeros(2, POSE_FORWARD_DTYPE)
+    forwards["pose_seq"] = [0, 1]
+    forwards["live_sequence"] = [0, 1]
+    forwards["live_put_perf"] = [1.0095, 1.0235]
+    live_poses = np.zeros(2, LIVE_POSE_DTYPE)
+    live_poses["live_sequence"] = [0, 1]
+    live_poses["live_recv_perf"] = [1.010, 1.024]
+    live_poses["triangulated_perf"] = [1.011, 1.025]
+    live_poses["gui_recv_perf"] = [1.012, 1.026]
+
+    result = analysis.pose_loop(
+        batches=batches, forwards=forwards, live_poses=live_poses, gate=None,
+        primary_frames=frames, camera_frames=[frames, frames], exposure_of=exposure_of,
+        frame_period=1 / 150,
+    )
+
+    stages = _stages(result)
+    assert result["status"] == "partial"
+    assert "no camera frame ids" in result["reason"]
+    assert "frame-anchored stages are empty" in result["reason"]
+    # What the frame ids anchor is empty, and what they do not is still measured.
+    for name in ("arrival_to_queue", "sensor_to_pose", "sensor_to_3d", "sensor_to_gui"):
+        assert stages[name]["n"] == 0, name
+    for name in ("queue_wait", "predict", "predict_to_monitor"):
+        assert stages[name]["n"] == 2, name
 
 
 def test_recording_loop_joins_writes_by_first_frame():
