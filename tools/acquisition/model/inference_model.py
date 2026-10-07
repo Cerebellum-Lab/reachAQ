@@ -108,6 +108,7 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
         self._pose_process_watchdog_perf_c = mp_ctx.Value(ctypes.c_double, math.nan)
         self._pose_process: Optional[PoseProcess] = None
         self._pose_process_error: Optional[str] = None
+        self._live_queue: Optional[FixedArrayMultiQueue] = None
         self._is_predict_enabled = True
         self._status = InferenceStatus.stopped
         self._gpu_runtime_status: Optional[GpuRuntimeStatus] = None
@@ -350,6 +351,7 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
 
         self._pose_process_watchdog_perf_c.value = time.perf_counter()
         self._pose_process_error = None
+        self._live_queue = live_queue
         proc = self._pose_process = PoseProcess(
             live_queue,
             data_queue=self._output_data_queue,
@@ -461,6 +463,13 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
             clear_queue(self._output_data_queue, name="inference_output_data_queue")
             clear_queue(self._notif_msg_queue, name="inference_notif_messages_queue")
             clear_queue(self._cmd_queue, name="inference_cmd_queue")
+
+        live_queue, self._live_queue = self._live_queue, None
+        if live_queue is not None:
+            # Nothing reads it from here on. The cameras hand it the end of a
+            # recording with a blocking put, which would otherwise wait out
+            # its timeout and raise out of the capture loop.
+            live_queue.close_consumer()
 
         self._stop_data_monitor_proc()
         clear_queue(
