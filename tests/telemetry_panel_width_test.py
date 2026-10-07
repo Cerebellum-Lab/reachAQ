@@ -132,3 +132,45 @@ def test_the_stim_p99_readout_says_what_it_spans(qapp):
     assert "host arrival" in tip
     assert "DAQmx start return" in tip
     assert "excludes exposure" in tip
+
+
+# The five readouts that were the whole expanded row at bbf065d8, before the
+# latency record added two (caption, widest reading). Kept here, not read off
+# the panel, so the baseline cannot drift along with what is being checked.
+_PRE_LATENCY_RECORD_READOUTS = (
+    ("Elapsed", "0:00:00"),
+    ("Dropped frames", "0000000"),
+    ("Inferenced", "000%  0000000/0000000"),
+    ("Inference call", "000.0 ms  max 0000.0"),
+    ("Sensor → result", "000.0 ms  max 0000.0"),
+)
+
+
+def _pre_latency_record_expanded_width(qapp):
+    """The expanded body's width before the latency record: one row, these five."""
+    from PySide6.QtWidgets import QFrame, QHBoxLayout
+    from tools.acquisition.view.capture_telemetry_panel import (
+        CaptureTelemetryPanel)
+    body = QFrame()
+    row = QHBoxLayout(body)
+    row.setContentsMargins(10, 4, 10, 6)
+    row.setSpacing(18)
+    for caption, widest in _PRE_LATENCY_RECORD_READOUTS:
+        CaptureTelemetryPanel._add_readout(row, caption, widest)
+    row.addStretch(1)
+    return body.sizeHint().width()
+
+
+def test_the_expanded_panel_is_no_wider_than_before_the_latency_record(qapp):
+    """Two expanded panels share the camera row and neither can shrink below
+    its minimum, so a wider panel is paid for twice, in the window's minimum
+    width. The stim and record-status readouts therefore sit on a second line.
+    """
+    panel = _panel(qapp, GROWING[-1])
+    _show(panel, GROWING[-1])
+
+    before = _pre_latency_record_expanded_width(qapp)
+    assert panel.sizeHint().width() <= before, (
+        f"expanded panel is {panel.sizeHint().width()} px wide, "
+        f"it was {before} px before the latency record")
+    assert panel.minimumSizeHint().width() <= before
