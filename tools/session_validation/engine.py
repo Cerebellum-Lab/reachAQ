@@ -192,6 +192,18 @@ def _sha256(path):
     return digest.hexdigest()
 
 
+# Sources whose files _write_session never lists in the stream manifest: recorded video,
+# the per-camera pose files and the stim camera's evidence. camera.frames,
+# sources.contract and stim.evidence check them by content instead. A kind not named
+# here has to be listed, so a new source whose file the recorder forgets to list fails
+# here and is not left unchecked.
+_SOURCE_KINDS_NOT_LISTED = frozenset({
+    "camera",
+    "pose",
+    "stim_camera_detection_evidence",
+})
+
+
 def _manifest_rule(context):
     manifests = (
         ("manifest.json", context.json("manifest.json")),
@@ -225,6 +237,30 @@ def _manifest_rule(context):
                 and _sha256(path) != item.get("sha256")
             ):
                 errors.append(f"hash mismatch {relative}")
+    # Size and hash are checked for listed files only, so a file that is left off the
+    # list is checked by nothing. A source's file that is on disk has to be listed here;
+    # one that is absent is named by sources.contract, not twice.
+    stream_manifest = manifests[1][1]
+    # Paths that are listed, then ones already looked at: several sources can share a
+    # file (every NI channel names nidaq.h5), and it is named once.
+    settled = {item.get("path") for item in stream_manifest.get("files", ())}
+    for source in stream_manifest.get("enabledSources", ()):
+        source_kind = str(source.get("kind", ""))
+        if source_kind in _SOURCE_KINDS_NOT_LISTED:
+            continue
+        for relative in (source["paths"] if "paths" in source else [source.get("path")]) or ():
+            if not relative or relative in settled:
+                continue
+            settled.add(relative)
+            try:
+                path = context.path(relative)
+            except ValueError as error:
+                errors.append(str(error))
+                continue
+            if path.is_file():
+                errors.append(
+                    f"unlisted {relative} ({source_kind} source {source.get('id', 'unknown')})"
+                )
     return _result(
         "session.manifest",
         "fail" if errors else "pass",
