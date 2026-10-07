@@ -256,27 +256,16 @@ class WallMap:
                 continue
             inside = (wall >= fit.x_min - 2.0) & (wall <= fit.x_max + 2.0)
             out[inside] = fit.map(wall[inside])
-        # Second pass: apply exact ranges (measured zone), overwriting extrapolation
-        for fit in self.fits:
-            if not fit.valid:
-                continue
-            inside = (wall >= fit.x_min) & (wall <= fit.x_max)
-            out[inside] = fit.map(wall[inside])
-        # Third pass: detect overlaps from backward wall steps.
+        # Second pass: apply exact ranges (measured zone) and detect overlaps.
         # If any wall value falls in multiple segments' exact ranges, it's ambiguous.
-        overlapping = numpy.zeros(wall.shape, dtype=bool)
-        for fit in self.fits:
-            if not fit.valid:
-                continue
-            inside = (wall >= fit.x_min) & (wall <= fit.x_max)
-            overlapping |= inside
-        # Mark overlaps (wall values in more than one segment) as NaN
         overlap_count = numpy.zeros(wall.shape, dtype=int)
         for fit in self.fits:
             if not fit.valid:
                 continue
             inside = (wall >= fit.x_min) & (wall <= fit.x_max)
+            out[inside] = fit.map(wall[inside])
             overlap_count[inside] += 1
+        # Mark overlaps (wall values in more than one segment) as NaN
         out[overlap_count > 1] = math.nan
         return out
 

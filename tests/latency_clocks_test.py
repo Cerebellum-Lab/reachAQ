@@ -70,8 +70,22 @@ def test_the_envelope_maps_late_by_about_the_minimum_delay_and_never_early():
 
 
 def test_a_restarted_ni_task_is_not_fitted():
-    fit = clocks.fit_ni_to_host(np.array([10, 20, 5] * 10), np.arange(30.0), 1000.0)
+    # A restarted NI task has backward step in sample index, not increasing.
+    # Create 120 reads: first 60 with increasing indices, then restart (jump back), then 60 more.
+    end_index = np.concatenate([np.arange(100, 160), np.arange(50, 110)])
+    seen = np.arange(120.0)
+    fit = clocks.fit_ni_to_host(end_index, seen, 1000.0)
     assert not fit.valid
+    assert "not increasing" in fit.reason
+
+
+def test_ni_fit_rejects_too_few_host_reads():
+    # Fewer than 100 host reads are rejected before any processing.
+    end_index = np.arange(30)
+    seen = np.arange(30.0)
+    fit = clocks.fit_ni_to_host(end_index, seen, 1000.0)
+    assert not fit.valid
+    assert "30 host reads, need 100" in fit.reason
 
 
 def test_pairing_picks_the_transition_before_arrival():
@@ -124,16 +138,22 @@ def test_wall_map_splits_at_a_clock_step():
 
 
 def test_wall_map_handles_backward_steps_with_nans():
-    # Issue 2: backward wall steps can interleave segments; overlaps are NaN
-    wall = np.concatenate([np.arange(0.0, 50.0), np.arange(99.5, 150.0)])
-    perf = np.concatenate([np.arange(1000.0, 1050.0), np.arange(1050.5, 1101.0)])
+    # Issue 2: real backward wall step causes segment overlap; overlaps are NaN.
+    # Segment A: wall 0-49 at perf 1000-1049
+    # Segment B: wall 20-70 at perf 1049-1099 (wall goes backward from 49 to 20)
+    wall = np.concatenate([np.arange(0.0, 50.0), np.arange(20.0, 70.0)])
+    perf = np.concatenate([np.arange(1000.0, 1050.0), np.arange(1049.0, 1099.0)])
 
     wall_map = clocks.fit_wall_to_host(wall, perf)
 
-    # Map values in non-overlapping parts of the segments
-    result = wall_map.map(np.array([10.0, 130.0]))
-    assert result[0] == pytest.approx(1010.0)
-    assert result[1] == pytest.approx(1081.0)
+    # Walls 20-49 are in both segments' ranges: they should be NaN (ambiguous)
+    assert len(wall_map.fits) == 2
+    # Value in segment A only (10.0): should map through A
+    assert wall_map.map(np.array([10.0]))[0] == pytest.approx(1010.0)
+    # Value in overlap (25.0): should be NaN
+    assert np.isnan(wall_map.map(np.array([25.0]))[0])
+    # Value in segment B only (65.0): should map through B (slope=1, so 1049+(65-20)=1094)
+    assert wall_map.map(np.array([65.0]))[0] == pytest.approx(1094.0)
 
 
 def test_the_envelope_fit_is_tighter_than_a_plain_fit():
