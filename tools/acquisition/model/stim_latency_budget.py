@@ -15,10 +15,11 @@ Percentiles, not means, are the acceptance figure. A stim loop with a 2 ms mean
 and a 15 ms p99 is not a 5 ms loop.
 
 One subtlety in reading the output: the first stamp, `frame_perf_time`, is the
-camera driver's estimate of frame capture time mapped into the perf_counter
-domain, not the moment the frame reached the host. Spans measured from it
-therefore already carry sensor readout and transport, and inherit the accuracy
-of that clock mapping.
+camera timestamp mapped into perf_counter through an offset fitted to when the
+host's poll first saw a frame (spinnaker_cam._capture). It is effectively host
+arrival, so spans measured from it do not include exposure, readout or
+transport. The latency record (streams/latency.h5) measures those after the
+session, against the NI exposure edge where one is wired.
 """
 
 from __future__ import annotations
@@ -59,8 +60,8 @@ STIM_LATENCY_STAGES: Tuple[StimLatencyStage, ...] = (
         "capture_to_decision",
         "frame_perf_time",
         "decision_perf_time",
-        "estimated frame capture to detector decision; already includes sensor "
-        "readout, transport, and host handoff",
+        "frame time (fitted to host arrival) to detector decision; excludes "
+        "exposure, readout and transport",
     ),
     StimLatencyStage(
         "queue_put",
@@ -92,8 +93,8 @@ TOTAL_STAGE = StimLatencyStage(
     "total",
     "frame_perf_time",
     "daqmx_start_return_perf_time",
-    "estimated frame capture to DAQmx start return; excludes exposure and "
-    "physical output settling",
+    "frame time (fitted to host arrival) to DAQmx start return; excludes "
+    "exposure, readout, transport and physical output settling",
 )
 
 
@@ -211,11 +212,11 @@ class StimLatencyBudget:
             for stage in (*STIM_LATENCY_STAGES, TOTAL_STAGE)
         }
         # `frame_perf_time` already arrives mapped into the perf_counter domain
-        # by the camera driver. This series tracks that mapping's own stability:
-        # the driver only recalibrates its camera-to-perf offset when an acquire
-        # retries, so a drifting or stale offset silently biases every span
-        # measured from frame capture. Retained as a health signal, never
-        # reported as latency.
+        # by the camera driver, through an offset fitted to host arrival. This
+        # series tracks that mapping's own stability: the driver only refits its
+        # camera-to-perf offset when an acquire retries, so a drifting or stale
+        # offset silently biases every span measured from the frame's time.
+        # Retained as a health signal, never reported as latency.
         self._camera_clock_offsets: Deque[float] = deque(maxlen=self.window)
         self._accepted = 0
         self._rejected = 0

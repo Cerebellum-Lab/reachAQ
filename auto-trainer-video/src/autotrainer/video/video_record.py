@@ -20,6 +20,12 @@ import numpy
 from autotrainer.core import ProjectInfo, ProjectInterval, SystemStatusMessageKind
 from autotrainer.core.capture import CaptureProcessStatus
 from autotrainer.core.logging import get_verbose_logger
+from autotrainer.core.latency import (
+    LatencyStreamWriter,
+    latency_recording_enabled,
+    latency_stream_path,
+)
+from autotrainer.core.latency.schema import RECORD_WRITE_DTYPE
 
 from .ffmpeg_writer import FfmpegX264Writer
 
@@ -137,6 +143,9 @@ class VideoRecord(Thread):
         self._first_frame_perf_c = math.inf
         self._first_writer_error = ""
         self._writer_error_count = 0
+        # Per-recording latency stream (streams/latency/record_<name>.h5):
+        # opened on a recording's first batch, closed on its end marker.
+        self._latency: Optional[LatencyStreamWriter] = None
 
     def _record_writer_error(self, error: BaseException) -> None:
         self._writer_error_count += 1
@@ -183,6 +192,7 @@ class VideoRecord(Thread):
         except Exception as err:
             self._record_writer_error(err)
             logger.exception("%s: Error closing writers: %s", self, err)
+        self._close_latency()
 
     def _run(self) -> None:
         input_q = self._input_queue
@@ -213,6 +223,7 @@ class VideoRecord(Thread):
             except Empty:
                 continue
             input_q.task_done()  # always !
+            dequeued = time.perf_counter()
 
             try:
                 # if frame is None or when is None:
@@ -227,6 +238,9 @@ class VideoRecord(Thread):
                             self,
                             err,
                         )
+                    # Before the closed message: the finalizer reads this file
+                    # once every camera has reported its recording closed.
+                    self._close_latency()
                     closed_frames_written = tot_written
                     writer_diagnostics = self._take_writer_diagnostics()
                     logger.info("Closed video file: tot frames written: %s ; last_perf_now=%s",
@@ -245,6 +259,7 @@ class VideoRecord(Thread):
                     tot_written = 0
                     continue
 
+                write_entry = time.perf_counter()
                 for frame_id, frame, frame_when, frame_perf_now in queue_list:
                     # reconstructing frame_time (based on first frame start ~time):
                     estimated_frame_rel_t = (frame_id - self._first_frame_id) / fps
@@ -282,6 +297,22 @@ class VideoRecord(Thread):
                             cv2.imwrite(img_loc.joinpath(img_name.format(when=when_str)),
                                         frame)
 
+                write_return = time.perf_counter()
+                if self._latency is None and self._is_video_enabled:
+                    # After the batch, not before: opening starts a thread that
+                    # imports h5py, and opened ahead of the frame loop that
+                    # slowed the recorder enough for the writer to find an
+                    # encoder that exits at once already dead when it opened
+                    # (video_record_grayscale_test). The first batch's row is
+                    # appended below all the same, with the stamps taken above.
+                    self._open_latency()
+                latency = self._latency
+                if latency is not None:
+                    latency.append("record_writes", (
+                        queue_list[0][0], queue_list[-1][0], len(queue_list),
+                        dequeued, write_entry, write_return,
+                    ))
+
             except Exception as err:
                 self._record_writer_error(err)
                 if consecutive_failures < 5:
@@ -302,6 +333,31 @@ class VideoRecord(Thread):
 
     def cancel(self):
         self._is_running = False
+
+    def _open_latency(self) -> None:
+        project = self._project_info
+        if project is None or not project.is_valid() or not latency_recording_enabled():
+            return
+        try:
+            self._latency = LatencyStreamWriter(
+                latency_stream_path(project, f"record_{self._name}"),
+                {"record_writes": RECORD_WRITE_DTYPE},
+                attrs={"camera": self._name, "encoder": self._encoder},
+            )
+        except Exception:
+            logger.exception("%s: latency stream could not start; recording continues without it", self)
+
+    def _close_latency(self) -> None:
+        writer, self._latency = self._latency, None
+        if writer is None:
+            return
+        stats = writer.close()
+        if stats["failed"] or any(stats["rowsDropped"].values()):
+            logger.warning("%s: latency stream incomplete: %s", self, stats)
+        if stats.get("rowsRejected"):
+            # A rejected row here means the row did not fit the schema.
+            logger.error("%s: latency stream rejected %d rows: %s", self,
+                         stats["rowsRejected"], stats)
 
     def _check_writers(self):
         if self._interval_mode != ProjectInterval.NONE:

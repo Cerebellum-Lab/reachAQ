@@ -202,7 +202,7 @@ from tools.acquisition.model.softmouse_spreadsheet_source import (
     SoftMouseSpreadsheetSource,
 )
 from tools.acquisition.model.session_data_recorder import SessionDataRecorder
-from tools.acquisition.model.session_telemetry import SessionTelemetry
+from tools.acquisition.model.session_telemetry import SessionTelemetry, describe_latency_status
 from tools.acquisition.model.stim_latency_budget import StimLatencyBudget
 from tools.acquisition.model.atomic_session_io import (
     atomic_publish_file,
@@ -804,6 +804,9 @@ class AppModel(ObservableObject):
         proc_msg_queue = self._multiproc_msg_queue = mp_ctx.Queue()
         self._stim_direct_trigger_queue = mp_ctx.Queue(maxsize=16)
         self._stim_latency_budget = StimLatencyBudget()
+        # The panel's and the metadata's stim p99 is per session; the budget
+        # above rolls over triggers from every session since launch.
+        self._session_stim_latency_budget = StimLatencyBudget()
         self._handle_proc_msg_thread = threading.Thread(
             target=self._handle_proc_msg_queue, name="handle_proc_msg_queue", daemon=True)
         self._handle_proc_msg_thread.start()
@@ -937,6 +940,8 @@ class AppModel(ObservableObject):
             event_manager=self._event_manager,
             nidaq_tone_edge_callback=self._on_intertrial_nidaq_tone_edge,
         )
+        # The last finalized session's latency status, for its metadata.
+        self._latency_status: dict = {}
 
         self._inference_queue = None
         self._inference_cameras: Tuple[VideoCaptureModel, ...] = ()
@@ -1037,7 +1042,10 @@ class AppModel(ObservableObject):
         # built first because the executor reads reach state through it.
         self._reach_state_resolver = ReachStateResolver(
             ReachStateConfiguration.from_environment(),
-            live_tracking_provider=LiveTrackingReachProvider(self._live_tracking),
+            live_tracking_provider=LiveTrackingReachProvider(
+                self._live_tracking,
+                on_observe=self._session_data_recorder.latency_events.record_gate_observation,
+            ),
         )
         self._trial_action_executor = TrialActionExecutor(
             move_absolute=self._move_protocol_motor_target,
@@ -1446,6 +1454,7 @@ class AppModel(ObservableObject):
                     )
                 if retained_result is not None:
                     self._recording_session.set_stream_result(retained_result)
+                    self._latency_status = dict(retained_result.get("latency") or {})
                 if pending_project is not None:
                     self._pending_metadata_project = pending_project
                     self._save_project_metadata(
@@ -2457,7 +2466,8 @@ class AppModel(ObservableObject):
                     # Counters are per session, and the session starts at the
                     # first recorded frame rather than at arm time, so elapsed
                     # matches the recording rather than the operator's clicking.
-                    self._session_telemetry.begin(first_frame_perf)
+                    self._begin_session_telemetry(first_frame_perf)
+                    self._latency_status = {}
                     self._record_start_timer.cancel()
                     self._record_start_timer = no_op_timer
                     self._abort_had_recording_started = True
@@ -5515,6 +5525,9 @@ class AppModel(ObservableObject):
                     reason="session generation ended during preparation",
                 )
                 return
+            # The latency record's first CAN stage: the trial asks for SEND.
+            self._session_data_recorder.latency_events.record_can(
+                "trial_send", {"kind": "SEND_PELLET", "perf": time.perf_counter()})
             # The pellet machine's triggers are relayed to the behaviour
             # algorithm's thread without waiting, and the relay returns
             # nothing. Wait for this one, so the state below says whether
@@ -5748,9 +5761,12 @@ class AppModel(ObservableObject):
 
     def _trigger_protocol_stim3(self, profile, recipe, detail) -> None:
         firing = recipe.laser_firing
+        called = time.perf_counter()
         token = self._hardware.pulse_stim(
             firing.trigger_pulse_us, stim_line=firing.stim_line
         )
+        self._session_data_recorder.latency_events.record_stim3_pulse(
+            getattr(recipe, "operation_id", ""), token, called, time.perf_counter())
         if token is None:
             raise RuntimeError("Firmware STIM{} pulse was not queued".format(firing.stim_line))
         timeout = max(3.0, firing.trigger_pulse_us / 1e6 + 2.0)
@@ -5845,6 +5861,15 @@ class AppModel(ObservableObject):
 
     def _on_stim_camera_trigger(self, camera_index, decision) -> None:
         """Accept only the detector decision owned by the current attempt."""
+        received = time.perf_counter()
+        if decision.get("trigger_route") == "hardware_stim3":
+            # The direct route is recorded where its NI start returns; this
+            # message is the only GUI hop the STIM3 route has.
+            try:
+                self._session_data_recorder.latency_events.record_stim_dispatch(
+                    decision, gui_recv_perf=received)
+            except Exception:
+                logger.exception("STIM3 dispatch latency row was not recorded")
         camera = self._stim_camera
         token = self._recording_session.token()
         operation = self._trial_action_executor.operation
@@ -5902,6 +5927,22 @@ class AppModel(ObservableObject):
         """Rolling Tier 1 stim-loop latency view, aggregated from trigger records."""
         return self._stim_latency_budget
 
+    #: Whether this session's p99 feed has already reported a failure. A feed
+    #: that fails does so on every trigger, and one line per trigger would bury
+    #: the log; class-level so a bare instance has the default.
+    _stim_p99_failure_logged = False
+
+    def _begin_session_telemetry(self, started_perf=None) -> None:
+        """Start the session counters and the stim p99 that goes with them over.
+
+        Together because the p99 is read from a budget that has to be cleared at
+        the same moments the counters are: any begin() that left the budget
+        alone would show an earlier session's triggers in this one's figure.
+        """
+        self._session_telemetry.begin(started_perf)
+        self._session_stim_latency_budget.reset()
+        self._stim_p99_failure_logged = False
+
     def _log_stim_latency_budget(self) -> None:
         """Emit the Tier 1 breakdown once per capture stop, when triggers occurred."""
         try:
@@ -5921,6 +5962,22 @@ class AppModel(ObservableObject):
         # Aggregate before anything that can raise, so a recorder or capture
         # failure does not also lose the latency sample.
         self._stim_latency_budget.observe(payload)
+        try:
+            self._session_data_recorder.latency_events.record_stim_dispatch(payload)
+        except Exception:
+            logger.exception("Direct stim dispatch latency row was not recorded")
+        # Its own try, so a failure here is not reported as a lost latency row
+        # and cannot stop the trigger's event record below.
+        try:
+            session_budget = self._session_stim_latency_budget
+            session_budget.observe(payload)
+            total = session_budget.summary().total
+            if total is not None and math.isfinite(total.p99):
+                self._session_telemetry.record_stim_p99(total.p99 * 1000.0)
+        except Exception:
+            if not self._stim_p99_failure_logged:
+                self._stim_p99_failure_logged = True
+                logger.exception("Live stim p99 was not updated")
         perf_time = float(
             payload.get("daqmx_start_entry_perf_time")
             or payload.get("ipc_receive_perf_time")
@@ -8471,7 +8528,7 @@ class AppModel(ObservableObject):
         # inference rate or percentage there - the panel simply showed a
         # dash. A recording re-baselines this at its first recorded frame,
         # so session figures stay session-relative.
-        self._session_telemetry.begin()
+        self._begin_session_telemetry()
         self.status = target_status
         self.property_changed(self.Props.ACQUISITION_RUNNING, True, False)
         self._event_manager.post_event_content(
@@ -10011,6 +10068,14 @@ class AppModel(ObservableObject):
                 ):
                     logger.warning("NI-DAQ alignment boundary update became stale")
             self._recording_session.set_stream_result(stream_result)
+            # A status line is not worth skipping the completeness check, the
+            # end-home request or the analysis start below.
+            try:
+                self._latency_status = dict(stream_result.get("latency") or {})
+                self._session_telemetry.set_latency_status(
+                    describe_latency_status(self._latency_status))
+            except Exception:
+                logger.exception("Latency record status was not published")
             if not self._recording_session.data_complete:
                 message = (
                     "Session auxiliary data is incomplete: "
@@ -10515,7 +10580,7 @@ class AppModel(ObservableObject):
                 # never moves a session's baseline.
                 if (self._recording_session.status
                         is not SessionRecordingStatus.RECORDING):
-                    self._session_telemetry.begin()
+                    self._begin_session_telemetry()
             elif value == InferenceStatus.stopped:
                 current = self._acquisition.subsystems.get(
                     SubsystemId.LIVE_INFERENCE
@@ -10573,6 +10638,9 @@ class AppModel(ObservableObject):
                                   f"\nModel at {value} failed pre-validate:\n\n{err}")
 
     def _on_pose_response_ready(self, response: PoseResponse):
+        # One row per pose, on this receive thread rather than the Qt thread:
+        # the latency record's last pose stage.
+        self._session_data_recorder.latency_events.record_live_pose(response, time.perf_counter())
         boundary = self._recording_session.boundary
         if (
             boundary is not None
@@ -11191,6 +11259,9 @@ class AppModel(ObservableObject):
                 # same numbers can be read back from the session rather than
                 # only having existed on screen.
                 "capture": self._session_telemetry.summary(),
+                # The latency record's status: per-loop completeness, the
+                # clock fits it used, and why anything is missing.
+                "latency": dict(self._latency_status),
             }
         out = _metadata_without_nonfinite_numbers(out)
         json_path = Path(file_name + ".json")

@@ -367,3 +367,55 @@ def test_a_recording_rebaselines_counters_that_were_already_running():
 
     assert telemetry.frames_acquired == 150
     assert telemetry.frames_inferenced == 150
+
+
+def test_stim_p99_and_latency_status_are_reported(telemetry):
+    from tools.acquisition.model.session_telemetry import describe_latency_status
+
+    telemetry.begin(0.0)
+    telemetry.record_stim_p99(3.4)
+    telemetry.set_latency_status(describe_latency_status(
+        {"status": "complete", "loops": {"pose": {"summary": {"confidence": "mixed"}}}}))
+
+    assert telemetry.stim_p99_ms == pytest.approx(3.4)
+    assert telemetry.latency_status == "complete (mixed)"
+    assert telemetry.summary()["stimP99Ms"] == pytest.approx(3.4)
+
+
+def test_a_new_session_clears_the_stim_p99_and_status(telemetry):
+    telemetry.begin(0.0)
+    telemetry.record_stim_p99(3.4)
+    telemetry.set_latency_status("complete (mixed)")
+    telemetry.begin(10.0)
+    assert math.isnan(telemetry.stim_p99_ms)
+    assert telemetry.latency_status == ""
+
+
+def test_summary_after_end_keeps_the_stim_p99_the_session_ended_with(telemetry):
+    """The metadata is written after end(); a later trigger must not change it."""
+    telemetry.begin(0.0)
+    telemetry.record_stim_p99(3.4)
+    telemetry.end(5.0)
+
+    telemetry.record_stim_p99(9.9)
+
+    assert telemetry.stim_p99_ms == pytest.approx(3.4)
+    assert telemetry.summary()["stimP99Ms"] == pytest.approx(3.4)
+
+    telemetry.begin(10.0)
+    assert math.isnan(telemetry.stim_p99_ms)
+
+
+@pytest.mark.parametrize("status, expected", [
+    (None, ""),
+    ({}, ""),
+    ({"status": "failed"}, "failed"),
+    ({"status": "absent", "reason": "no pose stream"}, "absent"),
+    ({"status": "partial", "loops": {"pose": {"summary": {"confidence": "software"}}}},
+     "partial (software)"),
+    ({"status": "complete", "loops": {"pose": {"summary": {}}}}, "complete"),
+])
+def test_the_latency_status_line_for_each_outcome(status, expected):
+    from tools.acquisition.model.session_telemetry import describe_latency_status
+
+    assert describe_latency_status(status) == expected

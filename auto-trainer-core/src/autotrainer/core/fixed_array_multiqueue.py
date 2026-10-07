@@ -100,14 +100,14 @@ class FixedArrayMultiQueue:
 
         # a single shared array for all frames indices of all cameras:
         self._frame_indices = mp_ctx.RawArray(ctypes.c_int64, self._depth * self._frames_per_camera * self._cam_count)
-        # The host clock time each frame was exposed, carried beside its index.
+        # The host clock time of each frame, carried beside its index. It is
+        # fitted to host arrival (spinnaker_cam._capture), not to exposure.
         #
         # Without this the consumer knows WHICH frames it has but not WHEN they
-        # were taken, so it can time its own work and nothing else. Sensor to
-        # result - the figure a closed loop actually waits on - needs the
-        # exposure time to travel with the frame. perf_counter is the same
-        # monotonic clock in every process on both platforms, so the two ends
-        # are directly comparable. NaN means the writer supplied nothing.
+        # arrived, so it can time its own work and nothing else. Arrival to
+        # result needs the frame's time to travel with it. perf_counter is the
+        # same monotonic clock in every process on both platforms, so the two
+        # ends are directly comparable. NaN means the writer supplied nothing.
         self._frame_perf_c = mp_ctx.RawArray(
             ctypes.c_double, self._depth * self._frames_per_camera * self._cam_count)
         # The camera's own frame id for each slot, which names the exposure: the
@@ -116,6 +116,13 @@ class FixedArrayMultiQueue:
         # _unpaired_heads. -1 means the writer supplied none.
         self._frame_ids = mp_ctx.RawArray(
             ctypes.c_int64, self._depth * self._frames_per_camera * self._cam_count)
+
+        # The moment each frame was written into its slot, for the latency
+        # record's queue stage. The record names a pose's exposure by
+        # _frame_ids above rather than by the recording-relative index, which
+        # is -1 outside a recording.
+        self._put_perf_c = mp_ctx.RawArray(
+            ctypes.c_double, self._depth * self._frames_per_camera * self._cam_count)
 
         self._frame_indexing: List[int] = list(numpy.repeat(range(self._frames_per_camera), self._cam_count))
         self._camera_indexing: List[int] = list(numpy.tile(range(self._cam_count), self._frames_per_camera))
@@ -227,6 +234,10 @@ class FixedArrayMultiQueue:
             math.nan if frame_perf_c is None else frame_perf_c)
         self._frame_id_view()[camera][buffer_index][batch_index] = (
             -1 if frame_id is None else frame_id)
+        put_stamps = numpy.frombuffer(
+            memoryview(self._put_perf_c).cast("B"), "float64", len(self._put_perf_c)
+        ).reshape((self._cam_count, self._depth, self._frames_per_camera))[camera]
+        put_stamps[buffer_index][batch_index] = time.perf_counter()
         self._put_count += 1
         #
         batch_index = self._batch_index[camera] = (batch_index + 1) % self._frames_per_camera
@@ -237,7 +248,9 @@ class FixedArrayMultiQueue:
         return BufferResult.Ok  # if not is_overflow else BufferResult.Overflow
 
     def get_output(self, output: numpy.ndarray, frames_indices: Optional[numpy.ndarray] = None, *, timeout: float=0.01,
-                   frames_perf_c: Optional[numpy.ndarray] = None) -> bool:
+                   frames_perf_c: Optional[numpy.ndarray] = None,
+                   cam_frame_ids: Optional[numpy.ndarray] = None,
+                   put_perf_c: Optional[numpy.ndarray] = None) -> bool:
         """Get the next available "output" : i.e: 1 batch of frames_per_camera * nbr_cameras"""
         while True:
             for cdx in range(self._cam_count):
@@ -282,6 +295,17 @@ class FixedArrayMultiQueue:
             frames_perf_c[:, :] = numpy.frombuffer(
                 memoryview(self._frame_perf_c).cast("B"), "float64",
                 len(self._frame_perf_c)
+            ).reshape(
+                (self._cam_count, self._depth, self._frames_per_camera)
+            )[cameras, read_idx, :]
+
+        if cam_frame_ids is not None:
+            cam_frame_ids[:, :] = self._frame_id_view()[cameras, read_idx, :]
+
+        if put_perf_c is not None:
+            put_perf_c[:, :] = numpy.frombuffer(
+                memoryview(self._put_perf_c).cast("B"), "float64",
+                len(self._put_perf_c)
             ).reshape(
                 (self._cam_count, self._depth, self._frames_per_camera)
             )[cameras, read_idx, :]

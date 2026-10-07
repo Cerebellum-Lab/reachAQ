@@ -90,6 +90,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         self._device_ack_timeout_delay: Optional[float] = None
         self._device_conn: Optional[DeviceConnectionProtocol] = None
         self._can_device: Optional[CanDevice] = None
+        self._can_latency_observer = None
         self._device_uuid_ack_timeout_engaged = False
         self._device_pellet_status_timeout_engaged = False
         self._device_initialization_complete = False
@@ -618,6 +619,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         self.set_board_status_timeout(self._board_status_timeout)
 
         can_device.property_changed += self._can_device_property_changed
+        can_device.latency_observer = self._can_latency_observer
 
         device_conn = self._device_conn = DeviceConnection(
             can_device,
@@ -1023,6 +1025,13 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             previous.to_record(),
         )
 
+    def set_can_latency_observer(self, observer) -> None:
+        """Route CAN command latency stages to the session's latency record."""
+        self._can_latency_observer = observer
+        device = getattr(self, "_can_device", None)
+        if device is not None:
+            device.latency_observer = observer
+
     def _send_with_token(self, device: Optional[DeviceConnectionProtocol], cmd: SystemCommandKind, data=None) -> Optional[UUID]:
         with self._lock:
             # ensure only 1 command can be sent at the same time
@@ -1296,6 +1305,12 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
     def __send_with_token(self, device: DeviceConnectionProtocol, cmd: SystemCommandKind, data=None) -> Optional[UUID]:
         token = uuid4()
         perf_now = get_perf_now()
+        observer = self._can_latency_observer
+        if observer is not None:
+            try:
+                observer("token", {"token": str(token), "kind": cmd.name, "perf": perf_now})
+            except Exception:
+                logger.exception("CAN latency observer failed")
         logger.debug("send_command cmd=%s token=%s nbr=%s", cmd, token, len(self._pending_tokens))
         if self._send_command(device, cmd, data, token):
             self._pending_tokens[token] = (cmd, perf_now)

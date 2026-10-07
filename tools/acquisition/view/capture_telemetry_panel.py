@@ -92,7 +92,7 @@ class CaptureTelemetryPanel(QWidget):
             QFontDatabase.systemFont(QFontDatabase.FixedFont))
         self._collapsed_summary.setMinimumWidth(
             QFontMetrics(self._collapsed_summary.font()).horizontalAdvance(
-                "0:00:00   000% inferenced   000.0 ms sensor→result"))
+                "0:00:00   000% inferenced   000.0 ms arrival→result"))
         self._collapsed_summary.setAlignment(
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         header_layout.addWidget(self._collapsed_summary)
@@ -110,9 +110,17 @@ class CaptureTelemetryPanel(QWidget):
         body = self._body = QFrame()
         body.setObjectName("captureTelemetryBody")
         body.setFrameShape(QFrame.Shape.NoFrame)
-        body_layout = QHBoxLayout(body)
-        body_layout.setContentsMargins(10, 4, 10, 6)
+        # Two rows, so the readouts the latency record added do not widen the
+        # panel. Two panels share a camera row and neither can shrink below its
+        # minimum width, so each pixel here is paid twice in the window's
+        # minimum width; all seven on one row needed more than a 1920 px
+        # display has when both panels were open.
+        rows = QVBoxLayout(body)
+        rows.setContentsMargins(10, 4, 10, 6)
+        rows.setSpacing(4)
+        body_layout = QHBoxLayout()
         body_layout.setSpacing(18)
+        rows.addLayout(body_layout)
 
         # Widest reading each readout can show, so none of them resizes the
         # panel when a number grows a digit.
@@ -121,15 +129,35 @@ class CaptureTelemetryPanel(QWidget):
                                           "0000000")
         self._inferenced = self._add_readout(body_layout, "Inferenced",
                                              "000%  0000000/0000000")
-        # Two separate figures. The call is what the model costs; sensor to
-        # result adds the queue wait and is what the sub-5 ms target is about.
-        # Showing only one of them would let a model look fast while missing
-        # the deadline that matters.
+        # Two separate figures. The call is what the model costs; arrival to
+        # result adds the queue wait and is the nearer of the two to what the
+        # sub-5 ms target is about. Showing only one of them would let a model
+        # look fast while missing the deadline that matters.
         self._inference_ms = self._add_readout(body_layout, "Inference call",
                                                "000.0 ms  max 0000.0")
-        self._e2e_ms = self._add_readout(body_layout, "Sensor → result",
+        # Arrival, not sensor: the frame's time is fitted to when the host
+        # received it, so exposure and transfer are not in this figure. The
+        # latency record measures them after the session.
+        self._e2e_ms = self._add_readout(body_layout, "Arrival → result",
                                           "000.0 ms  max 0000.0")
         body_layout.addStretch(1)
+
+        # The second row: what the latency record added.
+        detail_layout = QHBoxLayout()
+        detail_layout.setSpacing(18)
+        rows.addLayout(detail_layout)
+        self._stim_p99 = self._add_readout(detail_layout, "Stim p99", "0000.0 ms")
+        # On the holder, so hovering the caption or the number both explain it.
+        self._stim_p99.parentWidget().setToolTip(
+            "Rolling p99 of the direct stim route this session: host arrival "
+            "of the frame to DAQmx start return. It excludes exposure, "
+            "readout and transfer.")
+        # Widest status the finalizer can produce, plus a character of slack:
+        # a label's size hint can run a pixel past the summed advances for
+        # letter text, which would still move the panel when the status lands.
+        self._latency = self._add_readout(detail_layout, "Latency record",
+                                          "complete (hardware) ")
+        detail_layout.addStretch(1)
 
         body.setVisible(False)
         # Tracked explicitly rather than read back from isVisible(): a widget
@@ -247,6 +275,10 @@ class CaptureTelemetryPanel(QWidget):
             f"{e2e_mean:.1f} ms  max {e2e_max:.1f}"
             if math.isfinite(e2e_mean) else "-")
 
+        stim_p99 = telemetry.stim_p99_ms
+        self._stim_p99.setText(f"{stim_p99:.1f} ms" if math.isfinite(stim_p99) else "-")
+        self._latency.setText(telemetry.latency_status or "-")
+
         # The warning survives collapsing, and clears when the session ends.
         self._warning.setVisible(telemetry.has_dropped_frames
                                  and telemetry.is_active)
@@ -261,15 +293,15 @@ class CaptureTelemetryPanel(QWidget):
     def _collapsed_text(telemetry) -> str:
         """What the strip says while shut.
 
-        Sensor-to-result rather than the call time: if only one number is
-        visible without opening the panel, it should be the one the deadline
-        is set against.
+        Arrival-to-result rather than the call time: if only one number is
+        visible without opening the panel, it should be the one nearer the
+        deadline.
         """
         parts = [CaptureTelemetryPanel._format_elapsed(telemetry.elapsed_seconds),
                  f"{telemetry.inferenced_percent:.0f}% inferenced"]
         e2e = telemetry.sensor_to_result_mean_ms
         if math.isfinite(e2e):
-            parts.append(f"{e2e:.1f} ms sensor→result")
+            parts.append(f"{e2e:.1f} ms arrival→result")
         return "   ".join(parts)
 
     @staticmethod
