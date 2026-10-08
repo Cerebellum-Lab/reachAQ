@@ -1719,6 +1719,7 @@ class SessionDataRecorder:
             boundary=boundary,
             camera_alignment=camera_nidaq_alignment,
             frame_timeline=recorded_frame_timeline,
+            ni_fit=ni_fit,
         )
         trial_records = tuple(
             dict(record)
@@ -1939,6 +1940,7 @@ class SessionDataRecorder:
                     count=len(laser_rows)),
             )),
             nidaq_chunks,
+            ni_fit=ni_fit,
         )
         pressure_nidaq_index = nidaq_index[:pressure_perf.size]
         laser_nidaq_index = nidaq_index[pressure_perf.size:]
@@ -2595,7 +2597,7 @@ class SessionDataRecorder:
         return {name: column[first:last] for name, column in columns.items()}
 
     @staticmethod
-    def _pressure_nidaq_indices(perf, chunks):
+    def _pressure_nidaq_indices(perf, chunks, *, ni_fit=None):
         """Map each pressure sample onto the NI-DAQ sample it landed within.
 
         And each laser row: any perf times map the same way. Both clocks are
@@ -2607,6 +2609,10 @@ class SessionDataRecorder:
         every session and through the rest of one whose NI stream stopped
         early. Inside the window a gap is not looked for: a time in one takes
         the sample before it.
+
+        With a valid NI-to-host fit the host time is taken back through its
+        inverse onto the NI clock and looked up there; the epoch timeline is
+        only the fallback, since it carries the epoch's offset and the drift.
         """
         missing = np.full(perf.shape, -1, dtype=np.int64)
         if perf.size == 0:
@@ -2616,9 +2622,41 @@ class SessionDataRecorder:
         )
         if indices.size == 0 or nidaq_perf.size == 0:
             return missing
-        position = np.searchsorted(nidaq_perf, perf, side="right") - 1
-        last_covered = nidaq_perf[-1] + SessionDataRecorder._nidaq_sample_period(chunks)
-        inside = (position >= 0) & (perf <= last_covered)
+        period = SessionDataRecorder._nidaq_sample_period(chunks)
+        perf = np.asarray(perf, dtype=np.float64)
+        position = inside = None
+        if ni_fit is not None and getattr(ni_fit, "valid", False) and 0 < period < math.inf:
+            try:
+                # The event's host time taken back onto the NI clock as a sample
+                # index and looked up in the stored indices: only the events are
+                # mapped, nothing the length of the spool is built.
+                event_index = ni_fit.inverse(perf) / period
+                known = np.isfinite(event_index)
+                if not known[np.isfinite(perf)].all():
+                    raise ArithmeticError("the NI-to-host inverse is not finite for a finite time")
+                # Searched as integers: a float key would make numpy promote the
+                # whole stored index (8 bytes a sample) to float64 for the search.
+                # Samples are whole, so index[j] <= x is index[j] <= floor(x), and
+                # the clip to one sample either side of the stored range keeps the
+                # cast to int64 in range without moving any answer.
+                first, last = float(indices[0]), float(indices[-1])
+                lookup = np.floor(np.clip(
+                    np.where(known, event_index, first - 1.0), first - 1.0, last + 2.0,
+                )).astype(np.int64)
+                position = np.searchsorted(indices, lookup, side="right") - 1
+                inside = known & (position >= 0) & (event_index <= last + 1)
+            except Exception as error:
+                # Including MemoryError: finalization goes on with the epoch lookup.
+                logging.getLogger(__name__).warning(
+                    "NI sample indices through the NI-to-host fit failed; "
+                    "using the epoch timeline: %s: %s",
+                    error.__class__.__name__,
+                    error,
+                )
+                position = inside = None
+        if position is None:
+            position = np.searchsorted(nidaq_perf, perf, side="right") - 1
+            inside = (position >= 0) & (perf <= nidaq_perf[-1] + period)
         missing[inside] = indices[position[inside]]
         return missing
 
@@ -3160,6 +3198,7 @@ class SessionDataRecorder:
         boundary=None,
         camera_alignment=None,
         frame_timeline=None,
+        ni_fit=None,
     ) -> dict:
         names, indices, perf, values, rate = SessionDataRecorder._nidaq_arrays(
             chunks,
@@ -3179,16 +3218,59 @@ class SessionDataRecorder:
                 rate * _MINIMUM_VALID_TONE_PULSE_SECONDS,
             )))
         )
-        pulses = {
-            channel: SessionDataRecorder._digital_pulses(
-                values[names.index(channel)], indices, perf,
-                start_perf=start_perf,
-                end_perf=end_perf,
-                minimum_samples=minimum_samples,
-                sample_rate=rate,
+        # NI edges land on the fitted host timeline, the one the frames are on,
+        # so a tone and the exposure it precedes keep their order. Only the
+        # samples in use are mapped, the pulse onsets here and the transitions
+        # in the annotation below: mapping the whole spool costs about 48 bytes
+        # a sample in temporaries, 1.7 GB an hour at 10 kHz, on the stop path.
+        if not (
+            ni_fit is not None
+            and getattr(ni_fit, "valid", False)
+            and rate is not None
+            and math.isfinite(float(rate))
+            and float(rate) > 0
+        ):
+            ni_fit = None
+        host_of = None
+        if ni_fit is not None:
+            def host_of(position):
+                host = float(ni_fit.map(float(indices[position]) / float(rate)))
+                if not math.isfinite(host):
+                    # A NaN here would drop the pulse at the window test, unseen.
+                    raise ArithmeticError(
+                        f"NI sample {int(indices[position])} has no finite host time"
+                    )
+                return host
+
+        def pulses_on(onset_host_of):
+            return {
+                channel: SessionDataRecorder._digital_pulses(
+                    values[names.index(channel)], indices, perf,
+                    start_perf=start_perf,
+                    end_perf=end_perf,
+                    minimum_samples=minimum_samples,
+                    sample_rate=rate,
+                    host_of=onset_host_of,
+                )
+                for channel in tone_channels
+            }
+
+        host_time_fallback = None
+        try:
+            pulses = pulses_on(host_of)
+        except Exception as error:
+            if host_of is None:
+                raise
+            # Including MemoryError: the tones fall back whole to the epoch
+            # timeline, and the annotation below with them, never half and half.
+            host_time_fallback = f"{error.__class__.__name__}: {error}"
+            logging.getLogger(__name__).warning(
+                "Tone onsets through the NI-to-host fit failed; "
+                "using the epoch timeline: %s",
+                host_time_fallback,
             )
-            for channel in tone_channels
-        }
+            pulses = pulses_on(None)
+            ni_fit = None
         events = []
         previous_states = {channel: False for channel in tone_channels}
         tone_status_states = {channel: False for channel in tone_channels}
@@ -3369,6 +3451,7 @@ class SessionDataRecorder:
             boundary=boundary,
             camera_alignment=camera_alignment,
             frame_timeline=frame_timeline,
+            ni_fit=ni_fit,
         )
 
         unmatched_edges = [
@@ -3404,6 +3487,12 @@ class SessionDataRecorder:
             "resolutionSeconds": None if rate is None else 1.0 / rate,
             "canonicalEventSource": "validated_nidaq_tone_pulse_onset",
             "frameRelation": "first_recorded_frame_at_or_after_event",
+            # Only when a valid fit was given and could not be used.
+            **(
+                {}
+                if host_time_fallback is None
+                else {"hostTimeFallbackReason": host_time_fallback}
+            ),
         }
 
     @staticmethod
@@ -3825,6 +3914,7 @@ class SessionDataRecorder:
         boundary,
         camera_alignment,
         frame_timeline=None,
+        ni_fit=None,
     ) -> None:
         """Attach final wall-clock and recorded-frame identity to NI tones."""
         wall_anchor_available = (
@@ -3903,7 +3993,27 @@ class SessionDataRecorder:
             else:
                 anchor_ordinal = int(anchor_matches[0])
 
-        transition_perf = perf[transition_positions]
+        try:
+            transition_perf = SessionDataRecorder._host_perf_of(
+                indices[transition_positions], perf[transition_positions], rate, ni_fit,
+            )
+        except Exception as error:
+            if ni_fit is None:
+                raise
+            # Including MemoryError. The tone onsets above are on the fit, and
+            # epoch transitions beside them would name a frame a few ms off, so
+            # no frame is named.
+            transition_perf = np.empty(0, dtype=np.float64)
+            problem = f"{error.__class__.__name__}: {error}"
+            logging.getLogger(__name__).warning(
+                "Camera transitions through the NI-to-host fit failed; "
+                "no tone frame is named: %s",
+                problem,
+            )
+            if unavailable_reason is None:
+                unavailable_reason = (
+                    f"NI-to-host mapping of the camera transitions failed ({problem})"
+                )
         for event in matched:
             association = {
                 "status": "unavailable",
@@ -3987,6 +4097,7 @@ class SessionDataRecorder:
         end_perf,
         minimum_samples,
         sample_rate,
+        host_of=None,
     ):
         binary = np.asarray(values, dtype=np.float32) >= 0.5
         if not binary.size:
@@ -3999,7 +4110,9 @@ class SessionDataRecorder:
             ends.append(len(binary))
         pulses = []
         for position, end_position in zip(starts, ends):
-            pulse_perf = float(perf[position])
+            # The onset's host time through the fit when the caller gives one,
+            # else the epoch timeline, as before.
+            pulse_perf = float(perf[position]) if host_of is None else host_of(position)
             if not start_perf <= pulse_perf <= end_perf:
                 continue
             sample_count = int(end_position - position)

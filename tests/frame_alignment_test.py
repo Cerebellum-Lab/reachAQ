@@ -1,7 +1,10 @@
 """The recorder's frame anchor and timeline on the drift-corrected NI-to-host fit
 (docs/superpowers/specs/2026-10-07-frame-alignment-design.md, Verification)."""
 
+import csv
+import dataclasses
 import json
+import tracemalloc
 from datetime import datetime
 from pathlib import Path
 
@@ -22,7 +25,8 @@ def _project(tmp_path, session=1):
 
 
 def _record(tmp_path, *, t0, lag, seconds=20.0, latches=True, stream=True, exposure=EXPOSURE,
-            polls=(), raw=False, stamps=True, tone_pulses=(), device_rows=(), trial_records=()):
+            polls=(), raw=False, stamps=True, tone_pulses=(), device_rows=(), laser_rows=(),
+            trial_records=()):
     """One finalized session: the spool holds 5 s before the recording and `seconds` of it."""
     rig = SyntheticRig(polls=polls)
     project = _project(tmp_path)
@@ -37,7 +41,7 @@ def _record(tmp_path, *, t0, lag, seconds=20.0, latches=True, stream=True, expos
     if stream:
         rig.write_latency_stream(project, "left", n0, count, lag, latches=latches)
     result = SessionDataRecorder._write_session(
-        project, start_perf, start_wall, end_perf, device_rows, (), (), spool,
+        project, start_perf, start_wall, end_perf, device_rows, laser_rows, (), spool,
         boundary=boundary, trial_records=trial_records,
         trial_summary={"pending_analysis_attempts": len(trial_records)},
         camera_exposure_seconds={"left": exposure},
@@ -255,3 +259,244 @@ def test_a_schema_two_alignment_and_a_nidaq_without_raw_still_read(tmp_path):
     assert frame["method"].endswith("nidaq_camera_exposure_timeline_verified_by_writer")
     assert status["clocks"]["niToHost"]["method"] == "piecewise_envelope"
     assert status["clocks"]["niToHost"]["valid"] is True
+
+
+def test_a_tone_just_after_an_exposure_edge_maps_to_the_next_frame_without_mapping_the_spool(
+    tmp_path, monkeypatch,
+):
+    # Tones on the epoch timeline sit 1.65 ms early beside frames on the fit, which
+    # would put a tone 0.8 ms after F+3's edge before it. Both go through the fit, and
+    # only the samples in use do: the spool here is 250 000 samples, its transitions
+    # about 3 750.
+    sizes = []
+    original_map = clocks.PiecewiseClockFit.map
+
+    def counting_map(self, x):
+        sizes.append(int(np.asarray(x).size))
+        return original_map(self, x)
+
+    monkeypatch.setattr(clocks.PiecewiseClockFit, "map", counting_map)
+    model = SyntheticRig()
+    n0 = model.first_edge_at_or_after(5.0)
+    t_tone = float(model.edge_time(n0 + 3)) + 0.0008
+    device_rows = ((float(model.host(t_tone)) + 0.002, 1.7e9, "inbound", "STIMULUS_INPUTS",
+                    "PELLET_DEVICE", "status-1", None, None, json.dumps({"tone1": True})),)
+    rig, project, n0, result = _record(tmp_path, t0=5.0, lag=0.001,
+                                       tone_pulses=((t_tone, 0.005),), device_rows=device_rows)
+
+    matched = result["toneConfirmation"]["matched"]
+    assert len(matched) == 1
+    assert matched[0]["frameAssociation"]["frameId"] == rig.frame_id(n0 + 4)
+    # The pulse's host time is the fitted one: late by the delivery floor, never early.
+    assert 0.0 < matched[0]["physicalEventPerfTime"] - float(rig.host(t_tone)) < 0.0006
+    assert matched[0]["latencySeconds"] == pytest.approx(-0.002, abs=0.0006)
+    assert sizes and max(sizes) < 5_000, max(sizes)
+
+
+def test_host_times_map_to_ni_sample_indices_through_the_inverse_fit(tmp_path):
+    rig = SyntheticRig()
+    spool = rig.write_spool(tmp_path / "spool.h5", t_from=0.0, t_to=20.0)
+    fit = SessionDataRecorder._fit_nidaq_to_host(spool)
+    assert fit.valid, fit.reason
+    host = np.array([float(rig.host(5.0)), float(rig.host(12.3456))])
+
+    indices = SessionDataRecorder._pressure_nidaq_indices(host, spool, ni_fit=fit)
+    legacy = SessionDataRecorder._pressure_nidaq_indices(host, spool)
+    beyond = SessionDataRecorder._pressure_nidaq_indices(
+        np.array([float(rig.host(25.0))]), spool, ni_fit=fit)
+
+    # The fit maps late by the delivery floor, so the inverse lands 2-3 samples early.
+    assert abs(indices[0] - 50_000) <= 4 and abs(indices[1] - 123_456) <= 4
+    assert abs(legacy[0] - 50_000) >= 15  # the epoch timeline: 1.65 ms is 16.5 samples off
+    assert beyond.tolist() == [-1]
+
+
+def test_the_host_to_ni_lookup_maps_only_the_events_and_builds_nothing_the_length_of_the_spool(
+    tmp_path, monkeypatch,
+):
+    rig = SyntheticRig()
+    spool = rig.write_spool(tmp_path / "spool.h5", t_from=0.0, t_to=20.0)
+    fit = SessionDataRecorder._fit_nidaq_to_host(spool)
+    host = np.array([float(rig.host(5.0)), float(rig.host(12.3456))])
+    sizes = []
+    original_inverse = clocks.PiecewiseClockFit.inverse
+
+    def counting_inverse(self, x):
+        sizes.append(int(np.asarray(x).size))
+        return original_inverse(self, x)
+
+    def peak_bytes(**keywords):
+        tracemalloc.start()
+        try:
+            tracemalloc.reset_peak()
+            before = tracemalloc.get_traced_memory()[0]
+            SessionDataRecorder._pressure_nidaq_indices(host, spool, **keywords)
+            return tracemalloc.get_traced_memory()[1] - before
+        finally:
+            tracemalloc.stop()
+
+    peak_bytes(), peak_bytes(ni_fit=fit)  # warm-up: first-use allocations belong to neither
+    monkeypatch.setattr(clocks.PiecewiseClockFit, "inverse", counting_inverse)
+    epoch_peak = peak_bytes()
+    fitted_peak = peak_bytes(ni_fit=fit)
+
+    assert sizes == [2]
+    # Both read the spool's index and time (16 bytes a sample) and nothing else of its
+    # length. A float key would make numpy promote the whole stored index to float64
+    # for the search, 8 bytes a sample more: 1.6 MB here, against the 0.4 MB allowed.
+    assert fitted_peak - epoch_peak < 0.25 * 8 * 200_000, (epoch_peak, fitted_peak)
+
+
+class _FitThatFails:
+    """A valid fit whose mapping runs out of memory: for every input, or only arrays."""
+    valid = True
+    method = "failing"
+
+    def __init__(self, real, *, only_arrays=False):
+        self._real, self._only_arrays = real, only_arrays
+
+    def _check(self, x):
+        if not self._only_arrays or np.ndim(x):
+            raise MemoryError("out of memory")
+
+    def map(self, x):
+        self._check(x)
+        return self._real.map(x)
+
+    def inverse(self, host):
+        self._check(host)
+        return self._real.inverse(host)
+
+
+class _FitReturningNaN:
+    valid = True
+    method = "nan"
+
+    def map(self, x):
+        return np.full(np.shape(x), np.nan)
+
+    inverse = map
+
+
+def test_host_to_ni_indices_fall_back_to_the_epoch_lookup_when_the_fit_cannot_be_used(
+    tmp_path, caplog,
+):
+    rig = SyntheticRig()
+    spool = rig.write_spool(tmp_path / "spool.h5", t_from=0.0, t_to=20.0)
+    fit = SessionDataRecorder._fit_nidaq_to_host(spool)
+    host = np.array([float(rig.host(5.0)), float(rig.host(12.3456))])
+    legacy = SessionDataRecorder._pressure_nidaq_indices(host, spool)
+    # A sample rate of 1e-320 is positive and finite, and its period is infinite.
+    useless_rate = dataclasses.replace(spool, sample_rate_hz=1e-320)
+
+    # A usable-looking fit that fails says why in the log; one known to be invalid already
+    # did, in alignment.json's niToHost.
+    for name, unusable, logged in (
+        ("no fit", None, ""),
+        ("an invalid fit", clocks.invalid_piecewise_fit("no read pairs"), ""),
+        ("a fit that runs out of memory", _FitThatFails(fit), "MemoryError: out of memory"),
+        ("a fit that maps to NaN", _FitReturningNaN(), "ArithmeticError: the NI-to-host inverse"),
+    ):
+        caplog.clear()
+        result = SessionDataRecorder._pressure_nidaq_indices(host, spool, ni_fit=unusable)
+        assert result.tolist() == legacy.tolist(), name
+        assert (logged in caplog.text) and bool(caplog.records) == bool(logged), name
+    assert (SessionDataRecorder._pressure_nidaq_indices(host, useless_rate, ni_fit=fit).tolist()
+            == SessionDataRecorder._pressure_nidaq_indices(host, useless_rate).tolist())
+
+
+def test_laser_rows_name_their_ni_sample_on_the_fitted_timeline(tmp_path):
+    rig = SyntheticRig()
+    event = 10.0
+    # perf, wall, event, channel, source, command, diode, command copy
+    row = (float(rig.host(event)), 1.7e9 + 10.0, "pulse", "laser1", "protocol", 0.0, 0.0, 0.0)
+    rig, project, n0, result = _record(tmp_path, t0=5.0, lag=0.001, laser_rows=(row,))
+
+    streams = Path(project.get_session_path().location) / "streams"
+    with (streams / "laser.csv").open(newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    assert len(rows) == 1
+    # The inverse fit lands 2-3 samples early (the delivery floor); the epoch lookup it
+    # replaces was 16-17 samples late here.
+    assert abs(int(rows[0]["nidaq_sample_index"]) - int(event * RATE)) <= 4
+
+
+def _tone_inputs(tmp_path):
+    """A spool with a tone 0.8 ms after F+3's exposure edge, the recording boundary
+    at frame n0, and the call finalization makes, minus the frame ledger: without a
+    ready frame timeline the tone's frame comes from the spool's own cam_frames."""
+    rig = SyntheticRig()
+    project = _project(tmp_path)
+    n0 = rig.first_edge_at_or_after(5.0)
+    t_tone = float(rig.edge_time(n0 + 3)) + 0.0008
+    spool = rig.write_spool(tmp_path / "spool.h5", t_from=0.0, t_to=25.0,
+                            tone_pulses=((t_tone, 0.005),))
+    fit = SessionDataRecorder._fit_nidaq_to_host(spool)
+    assert fit.valid, fit.reason
+    start_perf, start_wall, boundary = rig.start(project, n0, 0.001)
+    camera = SessionDataRecorder._match_camera_nidaq_edge(
+        boundary, start_perf, spool, ni_fit=fit, exposure_seconds=EXPOSURE)
+    assert camera["status"] == "matched", camera["reason"]
+    rows = ((float(rig.host(t_tone)) + 0.002, 1.7e9, "inbound", "STIMULUS_INPUTS",
+             "PELLET_DEVICE", "status-1", None, None, json.dumps({"tone1": True})),)
+
+    def correlate(ni_fit, chunks=spool):
+        return SessionDataRecorder._correlate_tone_confirmations(
+            rows, chunks, start_perf=start_perf, start_wall=start_wall, boundary=boundary,
+            camera_alignment=camera, ni_fit=ni_fit)
+
+    return rig, n0, t_tone, fit, correlate, spool
+
+
+def test_without_a_frame_ledger_a_tone_names_its_frame_from_the_fitted_transitions(tmp_path):
+    rig, n0, t_tone, fit, correlate, _ = _tone_inputs(tmp_path)
+
+    tone = correlate(fit)
+    legacy = correlate(None)
+
+    match, frame = tone["matched"][0], tone["matched"][0]["frameAssociation"]
+    assert frame["status"] == "matched" and frame["frameId"] == rig.frame_id(n0 + 4)
+    # F+4's edge on the fitted timeline: late by the delivery floor, where the epoch
+    # timeline (the legacy answer below) has it 1.65 ms early.
+    assert 0.0 < frame["frameStartPerfTime"] - float(rig.host(rig.edge_time(n0 + 4))) < 0.0006
+    assert frame["eventToFrameStartSeconds"] == pytest.approx(1 / FPS - 0.0008, abs=0.0006)
+    assert match["physicalEventPerfTime"] - legacy["matched"][0]["physicalEventPerfTime"] > 0.0015
+    assert legacy["matched"][0]["frameAssociation"]["frameId"] == rig.frame_id(n0 + 4)
+    assert "hostTimeFallbackReason" not in tone and "hostTimeFallbackReason" not in legacy
+
+
+def test_tones_fall_back_whole_to_the_epoch_timeline_when_the_fit_cannot_map_them(
+    tmp_path, caplog,
+):
+    rig, n0, t_tone, fit, correlate, spool = _tone_inputs(tmp_path)
+    legacy = correlate(None)
+
+    tone = correlate(_FitThatFails(fit))
+
+    assert tone["matched"] == legacy["matched"]
+    assert tone["hostTimeFallbackReason"] == "MemoryError: out of memory"
+    assert "MemoryError" in caplog.text
+    # An invalid fit, or none, is no failure here: the epoch timeline as before, and the
+    # reason is the fit's own, in alignment.json.
+    for quiet in (clocks.invalid_piecewise_fit("no read pairs"), None):
+        assert correlate(quiet)["matched"] == legacy["matched"]
+        assert "hostTimeFallbackReason" not in correlate(quiet)
+    # 1e-320 samples a second is a finite rate, yet no sample has a finite host time.
+    useless_rate = dataclasses.replace(spool, sample_rate_hz=1e-320)
+    assert "no finite host time" in correlate(fit, useless_rate)["hostTimeFallbackReason"]
+
+
+def test_a_fit_that_fails_only_on_the_transitions_names_no_frame_rather_than_mixing_timelines(
+    tmp_path, caplog,
+):
+    rig, n0, t_tone, fit, correlate, _ = _tone_inputs(tmp_path)
+
+    tone = correlate(_FitThatFails(fit, only_arrays=True))
+
+    match = tone["matched"][0]
+    assert 0.0 < match["physicalEventPerfTime"] - float(rig.host(t_tone)) < 0.0006
+    assert match["frameAssociation"]["status"] == "unavailable"
+    assert match["frameAssociation"]["frameId"] is None
+    assert "MemoryError" in match["frameAssociation"]["reason"]
+    assert "MemoryError" in caplog.text
+    assert "hostTimeFallbackReason" not in tone
