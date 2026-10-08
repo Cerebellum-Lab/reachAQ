@@ -1313,6 +1313,11 @@ class VideoCapture(Process):
                 latch = camera.latch_clock()
                 if latch is None:
                     return
+                if len(latch) == 3:
+                    # A camera class from before the RAW stamps: the row keeps
+                    # its shape, with the RAW pair unknown, rather than being
+                    # rejected by the writer for its length.
+                    latch = (*latch, math.nan, math.nan)
                 latency.append("clock_latches", latch)
             except Exception:
                 logger.warning("<%s> camera clock latch failed; the recording continues without it",
