@@ -136,6 +136,11 @@ def _addr2tgt(addr: int) -> Target:
     raise RuntimeError(f"unknown addr for _addr2tgt: {addr}")
 
 
+def _board_type_of_addr(addr: int) -> int:
+    """Board type is bits 2 and 3 of the 5-bit CAN address; the pellet is 0."""
+    return (addr >> 2) & 0x3
+
+
 def target_to_str(target: Target) -> str:
     """
     Args:
@@ -409,6 +414,7 @@ class CanInterface(DeviceInterface):
         }
 
         self._pellet_addr: Optional[int] = None
+        self._foreign_board_addresses = set()
         self._board_clock_model = BoardClockModel()
         self._board_sequence_tracker = BoardSequenceTracker()
         self._time_sync_requests = {}
@@ -1645,6 +1651,9 @@ class CanInterface(DeviceInterface):
         Returns:
             Populated class type (see device_interface.py) or None
         """
+        if not _is_pellet_by_addr(message.dst_id):
+            self._ignore_foreign_board(message.dst_id)
+            return None
         handler = self._handlers.get(message.type, None)
         if handler is None:
             logger.warning("Unhandled message type: %s", message.type)
@@ -1657,6 +1666,24 @@ class CanInterface(DeviceInterface):
             res.index = self._get_index(message)
             self._apply_board_timing(res, message)
         return res
+
+    def _ignore_foreign_board(self, address: int) -> None:
+        """Skip traffic from a board this host has no driver for.
+
+        Every handler resolves its target through _addr2tgt, which raises for
+        any non-pellet address, and read() translates a whole batch at once -
+        so a single frame from another board used to discard the pellet frames
+        read with it. Logged once per address: an IO board streams hundreds of
+        frames a second.
+        """
+        if address in self._foreign_board_addresses:
+            return
+        self._foreign_board_addresses.add(address)
+        logger.warning(
+            "Ignoring CAN traffic from board address %d (board type %d): "
+            "this reachAQ has no driver for that board",
+            address, _board_type_of_addr(address),
+        )
 
     def _apply_board_timing(self, source: Source, message) -> None:
         source.event_perf_time = source.index / 1e9
