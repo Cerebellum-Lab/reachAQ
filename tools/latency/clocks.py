@@ -39,6 +39,13 @@ RECORD_KNOT_SECONDS = 10.0
 PIECEWISE_ENVELOPE = "piecewise_envelope"
 RAW_BRIDGED = "raw_bridged"
 STRAIGHT_LINE = "straight_line"
+# A bridge knot's perf-minus-RAW offset is the median over the stamp pairs
+# this close to it (200 pairs at the 10 ms copy cadence), so one pair whose
+# reader was preempted between its two clock reads cannot move a knot. A knot
+# closer than BRIDGE_TAIL_SECONDS to the end is dropped for the end knot, so
+# no segment is milliseconds long with a drift made of noise.
+BRIDGE_WINDOW_SECONDS = 1.0
+BRIDGE_TAIL_SECONDS = 5.0
 # A camera clock latch is one USB round trip: christielab10's BFS-U3-16S2M
 # brackets it in 0.14-0.58 ms inside the running app (60 latches, median
 # 0.27 ms) and in about 0.20 ms with the app closed. 2 ms admits several times
@@ -494,6 +501,54 @@ def fit_from_record(record) -> Optional[PiecewiseClockFit]:
     except (KeyError, TypeError, ValueError):
         pass
     return None
+
+
+def fit_ni_to_host_timeline(stamps: BlockStamps, sample_rate: float, *,
+                            knot_seconds: float = KNOT_SECONDS,
+                            record_knot_seconds: float = RECORD_KNOT_SECONDS) -> PiecewiseClockFit:
+    """NI sample time -> host perf_counter: through CLOCK_MONOTONIC_RAW when the
+    stamps carry it, else the piecewise envelope of the perf stamps.
+
+    RAW is not slewed by NTP, so NI-to-RAW is the smooth relation of two
+    oscillators and the envelope fits it with nothing to hide; RAW-to-perf is
+    then exact at every stamp (both were read within a microsecond of each
+    other) and is interpolated between them, kinks and all. The result is
+    tabulated every record_knot_seconds so it can be stored and rebuilt. With
+    no RAW column (an older session, or a host without the clock) the perf
+    stamps are fitted directly, window by window.
+    """
+    finite = numpy.isfinite(stamps.raw) & numpy.isfinite(stamps.perf)
+    raw_reason = ""
+    if int(finite.sum()) >= MIN_FIT_POINTS:
+        ni_to_raw = fit_piecewise_envelope(stamps.end_index[finite], stamps.raw[finite], sample_rate,
+                                           knot_seconds=knot_seconds)
+        if ni_to_raw.valid:
+            raw, perf = stamps.raw[finite], stamps.perf[finite]
+            order = numpy.argsort(raw, kind="stable")
+            raw, offset = raw[order], (perf - raw)[order]
+            knots = numpy.arange(ni_to_raw.x_min, ni_to_raw.x_max, record_knot_seconds)
+            if knots.size and knots[-1] > ni_to_raw.x_max - BRIDGE_TAIL_SECONDS:
+                knots = knots[:-1]
+            knots = numpy.append(knots, ni_to_raw.x_max)
+            if knots.size < 2:
+                knots = numpy.array([ni_to_raw.x_min, ni_to_raw.x_max])
+            knot_raw = ni_to_raw.map(knots)
+            # perf - raw at each knot: the median of the pairs around it, not a
+            # line between the two nearest, so a single late pair is ignored.
+            low = numpy.searchsorted(raw, knot_raw - BRIDGE_WINDOW_SECONDS, side="left")
+            high = numpy.searchsorted(raw, knot_raw + BRIDGE_WINDOW_SECONDS, side="right")
+            nearest = numpy.clip(numpy.searchsorted(raw, knot_raw), 0, raw.size - 1)
+            knot_offset = numpy.array([
+                float(numpy.median(offset[a:b])) if b > a else float(offset[n])
+                for a, b, n in zip(low, high, nearest)
+            ])
+            return PiecewiseClockFit(knots, knot_raw + knot_offset, ni_to_raw.residual_rms,
+                                     ni_to_raw.points, True, "", RAW_BRIDGED)
+        raw_reason = f"NI-to-RAW: {ni_to_raw.reason}; "
+    fit = fit_piecewise_envelope(stamps.end_index, stamps.perf, sample_rate, knot_seconds=knot_seconds)
+    if fit.valid or not raw_reason:
+        return fit
+    return dataclasses.replace(fit, reason=raw_reason + fit.reason)
 
 
 @dataclasses.dataclass(frozen=True)
