@@ -545,3 +545,110 @@ def test_a_span_of_whole_windows_leaves_no_sliver_window_at_the_end():
         fit = clocks.fit_piecewise_envelope(ends, 1000.0 + ends / rate + 0.001, rate)
         assert fit.valid, (first, fit.reason)
         assert fit.knots.size == 8 and np.all(np.diff(fit.knots) > 100.0), first
+
+
+def _raw_stamped_reads(duration, host, raw_clock, rng, rate=10_000.0, read=167):
+    """As _stamped_reads, with CLOCK_MONOTONIC_RAW read at the same instants."""
+    reads = int(duration * rate // read)
+    last = np.arange(1, reads + 1) * read - 1
+    delay = 0.0002 + rng.uniform(0, 0.003, reads)
+    perf = host(last / rate) + delay
+    raw = raw_clock(last / rate) + delay
+    return clocks.BlockStamps(last[:-1], perf[:-1], raw[:-1])
+
+
+def test_the_raw_bridge_follows_a_slew_step_the_piecewise_fit_cannot():
+    rng = np.random.default_rng(21)
+    host = _slewed_host(-10.0, [(150.0, 0.010)])      # one 10 ms correction mid-session
+    raw_clock = _slewed_host(-10.0, [], host0=4000.0)  # the same clock without it
+    stamps = _raw_stamped_reads(300.0, host, raw_clock, rng)
+
+    bridged = clocks.fit_ni_to_host_timeline(stamps, 10_000.0)
+    piecewise = clocks.fit_piecewise_envelope(stamps.end_index, stamps.perf, 10_000.0)
+
+    assert bridged.valid, bridged.reason
+    assert bridged.method == clocks.RAW_BRIDGED
+    assert 29 <= bridged.knots.size <= 32  # tabulated every 10 s over 300 s
+    probe = np.linspace(stamps.end_index[0] / 10_000.0, stamps.end_index[-1] / 10_000.0, 30_000)
+    error = bridged.map(probe) - host(probe)
+    error -= np.median(error)
+    assert np.abs(error).max() < 0.00005
+    worse = piecewise.map(probe) - host(probe)
+    worse -= np.median(worse)
+    assert np.abs(worse).max() > 0.00015
+    assert np.allclose(bridged.inverse(bridged.map(probe)), probe, atol=1e-9)
+    record = bridged.as_record()
+    assert record["method"] == "raw_bridged" and record["knotSeconds"] == pytest.approx(10.0, abs=0.5)
+    assert clocks.fit_from_record(record).map(123.4) == pytest.approx(bridged.map(123.4), abs=1e-9)
+
+
+def test_without_raw_stamps_the_selector_fits_the_piecewise_envelope():
+    rng = np.random.default_rng(22)
+    host = _slewed_host(-10.0, [])
+    ends, seen = _stamped_reads(200.0, host, rng)
+    no_raw = clocks.BlockStamps(ends, seen, np.full(seen.shape, np.nan))
+    few_raw = clocks.BlockStamps(ends, seen, np.where(np.arange(seen.size) < 50, seen + 1.0, np.nan))
+
+    for stamps in (no_raw, few_raw):
+        fit = clocks.fit_ni_to_host_timeline(stamps, 10_000.0)
+        assert fit.valid, fit.reason
+        assert fit.method == clocks.PIECEWISE_ENVELOPE
+        assert fit.knots.size == 3  # 0, 120, 200
+
+
+def test_an_outlier_stamp_pair_does_not_move_a_bridge_knot():
+    # A reader preempted between perf_counter() and the RAW read leaves one pair
+    # whose perf is late; a knot built by interpolating between pairs would follow it.
+    rng = np.random.default_rng(23)
+    host = _slewed_host(-10.0, [])
+    raw_clock = _slewed_host(-10.0, [], host0=4000.0)
+    stamps = _raw_stamped_reads(100.0, host, raw_clock, rng)
+    perf = stamps.perf.copy()
+    perf[stamps.perf.size // 2] += 0.050
+    spoiled = clocks.BlockStamps(stamps.end_index, perf, stamps.raw)
+
+    fit = clocks.fit_ni_to_host_timeline(spoiled, 10_000.0)
+
+    assert fit.valid and fit.method == clocks.RAW_BRIDGED
+    probe = np.linspace(stamps.end_index[0] / 10_000.0, stamps.end_index[-1] / 10_000.0, 10_000)
+    error = fit.map(probe) - host(probe)
+    assert error.max() - error.min() < 0.0001  # the 50 ms pair left no mark
+    assert fit.knots[-1] - fit.knots[-2] >= 5.0  # no millisecond-long end segment
+
+
+def test_the_selector_reports_both_reasons_when_neither_path_fits():
+    stamps = clocks.BlockStamps(np.arange(30), np.arange(30.0), np.arange(30.0) + 1.0)
+    fit = clocks.fit_ni_to_host_timeline(stamps, 1000.0)
+    assert not fit.valid
+    assert "30 read pairs, need 100" in fit.reason
+
+
+def test_late_pairs_sitting_on_a_knot_do_not_move_it():
+    # The pair spoiled above sits 17 ms from the nearest knot, so a knot taken from
+    # its nearest pair, or a line between its two nearest, would pass that test too.
+    # Spoil the pairs the knot itself falls between.
+    rng = np.random.default_rng(24)
+    host = _slewed_host(-10.0, [])
+    raw_clock = _slewed_host(-10.0, [], host0=4000.0)
+    stamps = _raw_stamped_reads(100.0, host, raw_clock, rng)
+    knot = clocks.fit_ni_to_host_timeline(stamps, 10_000.0).knots[5]
+    at_knot = int(np.searchsorted(stamps.end_index / 10_000.0, knot))
+    perf = stamps.perf.copy()
+    perf[at_knot - 1:at_knot + 2] += 0.050
+    spoiled = clocks.BlockStamps(stamps.end_index, perf, stamps.raw)
+
+    fit = clocks.fit_ni_to_host_timeline(spoiled, 10_000.0)
+
+    probe = np.linspace(stamps.end_index[0] / 10_000.0, stamps.end_index[-1] / 10_000.0, 10_000)
+    error = fit.map(probe) - host(probe)
+    assert error.max() - error.min() < 0.0001
+
+
+def test_the_selector_prefixes_the_raw_reason_when_both_paths_fail():
+    restarted = np.concatenate([np.arange(100, 160), np.arange(50, 110)])
+    stamps = clocks.BlockStamps(restarted, np.arange(120.0), np.arange(120.0) + 1.0)
+
+    fit = clocks.fit_ni_to_host_timeline(stamps, 1000.0)
+
+    assert not fit.valid
+    assert fit.reason.startswith("NI-to-RAW: ") and fit.reason.count("not increasing") == 2
