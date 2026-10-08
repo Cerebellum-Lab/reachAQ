@@ -43,9 +43,13 @@ STRAIGHT_LINE = "straight_line"
 # this close to it (200 pairs at the 10 ms copy cadence), so one pair whose
 # reader was preempted between its two clock reads cannot move a knot. A knot
 # closer than BRIDGE_TAIL_SECONDS to the end is dropped for the end knot, so
-# no segment is milliseconds long with a drift made of noise.
+# no segment is milliseconds long with a drift made of noise. RAW stamps that
+# span less than BRIDGE_MIN_RAW_COVERAGE of the stamps' span are not bridged
+# over the rest: the bridge would carry the last offset it saw across slews it
+# never observed.
 BRIDGE_WINDOW_SECONDS = 1.0
 BRIDGE_TAIL_SECONDS = 5.0
+BRIDGE_MIN_RAW_COVERAGE = 0.9
 # A camera clock latch is one USB round trip: christielab10's BFS-U3-16S2M
 # brackets it in 0.14-0.58 ms inside the running app (60 latches, median
 # 0.27 ms) and in about 0.20 ms with the app closed. 2 ms admits several times
@@ -178,7 +182,9 @@ def rising_edges(values, *, min_swing: float) -> EdgeResult:
     return EdgeResult(positions.astype(numpy.int64), threshold, True)
 
 
-@dataclasses.dataclass(frozen=True)
+# eq=False on the two classes that hold arrays: a field-wise == raises on an
+# ndarray, and the field-wise hash a frozen dataclass would add is unhashable.
+@dataclasses.dataclass(frozen=True, eq=False)
 class BlockStamps:
     """One row per recorder copy: the last sample of the copy before it and the
     copy's stamps. raw is CLOCK_MONOTONIC_RAW taken beside the perf stamp, NaN
@@ -239,6 +245,35 @@ def ni_block_ends(sample_index, observation_perf) -> Tuple[numpy.ndarray, numpy.
     return stamps.end_index, stamps.perf
 
 
+def _sample_rate_problem(sample_rate) -> str:
+    """Why sample_rate cannot turn sample indices into seconds, or ''."""
+    try:
+        rate = float(sample_rate)
+    except (TypeError, ValueError):
+        rate = math.nan
+    return "" if math.isfinite(rate) and rate > 0 else f"sample rate {sample_rate} is not a positive number"
+
+
+def _read_pairs(end_index, seen_perf, sample_rate):
+    """(NI seconds, host seconds, why not): the read pairs a fit can use.
+
+    A pair with a value that is not finite is left out, as a NaN stamp always
+    has been. A sample rate that is not a positive number, or arrays of
+    different lengths, leave nothing to fit: the reason is returned for the
+    caller to make an invalid fit of, never raised.
+    """
+    problem = _sample_rate_problem(sample_rate)
+    if problem:
+        return None, None, problem
+    index = numpy.asarray(end_index, dtype=numpy.float64)
+    seen = numpy.asarray(seen_perf, dtype=numpy.float64)
+    if index.shape != seen.shape:
+        return None, None, f"{index.size} sample indices against {seen.size} stamps"
+    t = index / float(sample_rate)
+    finite = numpy.isfinite(t) & numpy.isfinite(seen)
+    return t[finite], seen[finite], ""
+
+
 def fit_ni_to_host(end_index, seen_perf, sample_rate: float) -> ClockFit:
     """NI sample time (index / rate) -> host perf_counter, from the lower envelope.
 
@@ -258,8 +293,9 @@ def fit_ni_to_host(end_index, seen_perf, sample_rate: float) -> ClockFit:
     (Task 16 review): 60-165 Hz maps about 0.25 ms late, 200 Hz fails the
     fit, and 240 Hz maps 4.45 ms late. christielab10 runs at 60 Hz.
     """
-    t = numpy.asarray(end_index, dtype=numpy.float64) / float(sample_rate)
-    seen = numpy.asarray(seen_perf, dtype=numpy.float64)
+    t, seen, problem = _read_pairs(end_index, seen_perf, sample_rate)
+    if problem:
+        return invalid_fit(problem)
     if t.size < MIN_FIT_POINTS:
         return invalid_fit(f"{t.size} read pairs, need {MIN_FIT_POINTS} "
                            "(each a stamp and the last sample before it)")
@@ -292,7 +328,7 @@ def _interp_extrapolate(x, xs, ys):
     return ys[j] + slope * (x - xs[j])
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, eq=False)
 class PiecewiseClockFit:
     """NI seconds -> host seconds through a continuous piecewise-linear table.
 
@@ -425,10 +461,9 @@ def fit_piecewise_envelope(end_index, seen_perf, sample_rate: float, *,
     continuous at every knot. The bias is the same as fit_ni_to_host's: mapped
     times are late by about the minimum delivery delay.
     """
-    t = numpy.asarray(end_index, dtype=numpy.float64) / float(sample_rate)
-    seen = numpy.asarray(seen_perf, dtype=numpy.float64)
-    finite = numpy.isfinite(seen)
-    t, seen = t[finite], seen[finite]
+    t, seen, problem = _read_pairs(end_index, seen_perf, sample_rate)
+    if problem:
+        return invalid_piecewise_fit(problem)
     if t.size < MIN_FIT_POINTS:
         return invalid_piecewise_fit(f"{t.size} read pairs, need {MIN_FIT_POINTS} "
                                      "(each a stamp and the last sample before it)")
@@ -464,11 +499,18 @@ def fit_piecewise_envelope(end_index, seen_perf, sample_rate: float, *,
             break
         x, y = x[inliers], y[inliers]
     rms = float(numpy.sqrt(numpy.mean(residual ** 2)))
+    knot_host = coefficients + y0
     valid = rms <= NI_MAX_RESIDUAL_SECONDS
+    reason = "" if valid else f"residual rms {rms:.6f} s above {NI_MAX_RESIDUAL_SECONDS:.6f} s"
+    drifts = numpy.diff(knot_host) / numpy.diff(knots)
+    if valid and not numpy.all(drifts > 0):
+        # Host time that runs backwards across a window is garbage stamps, and
+        # inverse() would not be a function.
+        valid = False
+        reason = f"a knot window runs backwards (segment drift {numpy.min(drifts):.6f}, not above 0)"
     return PiecewiseClockFit(
-        knots=knots, knot_host=coefficients + y0, residual_rms=rms, points=int(x.size),
-        valid=bool(valid),
-        reason="" if valid else f"residual rms {rms:.6f} s above {NI_MAX_RESIDUAL_SECONDS:.6f} s",
+        knots=knots, knot_host=knot_host, residual_rms=rms, points=int(x.size),
+        valid=bool(valid), reason=reason,
     )
 
 
@@ -476,25 +518,38 @@ def fit_from_record(record) -> Optional[PiecewiseClockFit]:
     """The fit a stored record describes, or None when there is none worth using.
 
     A record with a knot table (PiecewiseClockFit.as_record) comes back as it
-    was; a straight-line record (ClockFit.as_record) becomes a two-knot table
-    over its fitted span. Anything invalid, malformed or absent is None, so a
-    caller falls back rather than mapping through nonsense.
+    was, provided the whole table is there: both columns finite and strictly
+    increasing, as many knots as knotCount says. A straight-line record
+    (ClockFit.as_record: no knot keys at all) and a two-knot record stored
+    without its table (as_record(include_knots=False)) become a two-knot table
+    over the fitted span, which is exact for both. A record that needs a table
+    and has none, or a damaged one, is None and is never replaced by the line
+    through its summary keys: after an hour that line is milliseconds off,
+    unflagged. Anything invalid, malformed or absent is None, so a caller falls
+    back rather than mapping through nonsense.
     """
     if not isinstance(record, dict) or not record.get("valid"):
         return None
     try:
-        knots = numpy.asarray(record.get("knots") or (), dtype=numpy.float64)
-        host = numpy.asarray(record.get("knotHost") or (), dtype=numpy.float64)
+        count = record.get("knotCount")
+        count = None if count is None else int(count)
+        stored_knots, stored_host = record.get("knots") or (), record.get("knotHost") or ()
         residual = float(record.get("residual_rms") if record.get("residual_rms") is not None else math.nan)
         points = int(record.get("points") or 0)
-        # Both columns strictly increasing, or inverse() would not be a function.
-        if (knots.size >= 2 and host.size == knots.size and numpy.all(numpy.diff(knots) > 0)
-                and numpy.all(numpy.diff(host) > 0)):
-            return PiecewiseClockFit(knots, host, residual, points, True, "",
-                                     str(record.get("method") or PIECEWISE_ENVELOPE))
+        if stored_knots or stored_host or (count is not None and count > 2):
+            knots = numpy.asarray(stored_knots, dtype=numpy.float64)
+            host = numpy.asarray(stored_host, dtype=numpy.float64)
+            # Both columns strictly increasing, or inverse() would not be a function.
+            if (knots.size >= 2 and host.size == knots.size and count in (None, knots.size)
+                    and numpy.isfinite(knots).all() and numpy.isfinite(host).all()
+                    and numpy.all(numpy.diff(knots) > 0) and numpy.all(numpy.diff(host) > 0)):
+                return PiecewiseClockFit(knots, host, residual, points, True, "",
+                                         str(record.get("method") or PIECEWISE_ENVELOPE))
+            return None
         offset, drift = float(record["offset"]), float(record["drift"])
         x_min, x_max = float(record["x_min"]), float(record["x_max"])
-        if all(math.isfinite(value) for value in (offset, drift, x_min, x_max)) and x_max > x_min:
+        if (all(math.isfinite(value) for value in (offset, drift, x_min, x_max)) and x_max > x_min
+                and drift > 0):
             knots = numpy.array([x_min, x_max])
             return PiecewiseClockFit(knots, offset + drift * knots, residual, points, True, "",
                                      STRAIGHT_LINE)
@@ -510,45 +565,83 @@ def fit_ni_to_host_timeline(stamps: BlockStamps, sample_rate: float, *,
     stamps carry it, else the piecewise envelope of the perf stamps.
 
     RAW is not slewed by NTP, so NI-to-RAW is the smooth relation of two
-    oscillators and the envelope fits it with nothing to hide; RAW-to-perf is
-    then exact at every stamp (both were read within a microsecond of each
-    other) and is interpolated between them, kinks and all. The result is
-    tabulated every record_knot_seconds so it can be stored and rebuilt. With
-    no RAW column (an older session, or a host without the clock) the perf
-    stamps are fitted directly, window by window.
+    oscillators and the envelope fits it with nothing to hide. What NTP did to
+    the host clock is perf minus RAW, read at a knot every record_knot_seconds
+    (10 s) as the median of the stamp pairs within BRIDGE_WINDOW_SECONDS (1 s)
+    of it, and interpolated between knots. The median is what keeps a pair
+    whose reader was preempted between its two clock reads from moving a knot;
+    its price is that a kink in the slew is smoothed over the window, to about
+    50 us at 10 s knots. The table is stored and rebuilt as it is.
+
+    When RAW cannot be used (no RAW column, an older session or a host without
+    the clock; too few stamps; stamps over too little of the session; a NI-to-
+    RAW fit that fails; a bridge that is not increasing) the perf stamps are
+    fitted directly, window by window, and a RAW that was present and failed
+    is named at the front of the fit's reason.
     """
+    problem = _sample_rate_problem(sample_rate)
+    if problem:
+        return invalid_piecewise_fit(problem)
     finite = numpy.isfinite(stamps.raw) & numpy.isfinite(stamps.perf)
+    usable = int(finite.sum())
     raw_reason = ""
-    if int(finite.sum()) >= MIN_FIT_POINTS:
-        ni_to_raw = fit_piecewise_envelope(stamps.end_index[finite], stamps.raw[finite], sample_rate,
-                                           knot_seconds=knot_seconds)
-        if ni_to_raw.valid:
-            raw, perf = stamps.raw[finite], stamps.perf[finite]
-            order = numpy.argsort(raw, kind="stable")
-            raw, offset = raw[order], (perf - raw)[order]
-            knots = numpy.arange(ni_to_raw.x_min, ni_to_raw.x_max, record_knot_seconds)
-            if knots.size and knots[-1] > ni_to_raw.x_max - BRIDGE_TAIL_SECONDS:
-                knots = knots[:-1]
-            knots = numpy.append(knots, ni_to_raw.x_max)
-            if knots.size < 2:
-                knots = numpy.array([ni_to_raw.x_min, ni_to_raw.x_max])
-            knot_raw = ni_to_raw.map(knots)
-            # perf - raw at each knot: the median of the pairs around it, not a
-            # line between the two nearest, so a single late pair is ignored.
-            low = numpy.searchsorted(raw, knot_raw - BRIDGE_WINDOW_SECONDS, side="left")
-            high = numpy.searchsorted(raw, knot_raw + BRIDGE_WINDOW_SECONDS, side="right")
-            nearest = numpy.clip(numpy.searchsorted(raw, knot_raw), 0, raw.size - 1)
-            knot_offset = numpy.array([
-                float(numpy.median(offset[a:b])) if b > a else float(offset[n])
-                for a, b, n in zip(low, high, nearest)
-            ])
-            return PiecewiseClockFit(knots, knot_raw + knot_offset, ni_to_raw.residual_rms,
-                                     ni_to_raw.points, True, "", RAW_BRIDGED)
-        raw_reason = f"NI-to-RAW: {ni_to_raw.reason}; "
+    if usable >= MIN_FIT_POINTS:
+        bridged, raw_reason = _bridge_through_raw(stamps, finite, sample_rate, knot_seconds,
+                                                  record_knot_seconds)
+        if bridged is not None:
+            return bridged
+    elif usable:
+        raw_reason = f"RAW on {usable} stamps, need {MIN_FIT_POINTS}; "
     fit = fit_piecewise_envelope(stamps.end_index, stamps.perf, sample_rate, knot_seconds=knot_seconds)
-    if fit.valid or not raw_reason:
+    if not raw_reason:
         return fit
-    return dataclasses.replace(fit, reason=raw_reason + fit.reason)
+    return dataclasses.replace(fit, reason=(raw_reason + fit.reason).rstrip("; "))
+
+
+def _bridge_through_raw(stamps: BlockStamps, finite, sample_rate: float, knot_seconds: float,
+                        record_knot_seconds: float):
+    """(the RAW-bridged fit, "") or (None, why the bridge cannot be used)."""
+    end_index = numpy.asarray(stamps.end_index, dtype=numpy.float64)
+    stamped = end_index[numpy.isfinite(stamps.perf)] / float(sample_rate)
+    covered = end_index[finite] / float(sample_rate)
+    span = float(stamped.max() - stamped.min())
+    if span > 0 and covered.max() - covered.min() < BRIDGE_MIN_RAW_COVERAGE * span:
+        return None, (f"RAW covers {(covered.max() - covered.min()) / span:.0%} of the {span:.0f} s "
+                      f"of stamps, need {BRIDGE_MIN_RAW_COVERAGE:.0%}; ")
+    ni_to_raw = fit_piecewise_envelope(stamps.end_index[finite], stamps.raw[finite], sample_rate,
+                                       knot_seconds=knot_seconds)
+    if not ni_to_raw.valid:
+        return None, f"NI-to-RAW: {ni_to_raw.reason}; "
+    raw, perf = stamps.raw[finite], stamps.perf[finite]
+    order = numpy.argsort(raw, kind="stable")
+    raw, offset = raw[order], (perf - raw)[order]
+    knots = numpy.arange(ni_to_raw.x_min, ni_to_raw.x_max, record_knot_seconds)
+    if knots.size and knots[-1] > ni_to_raw.x_max - BRIDGE_TAIL_SECONDS:
+        knots = knots[:-1]
+    knots = numpy.append(knots, ni_to_raw.x_max)
+    if knots.size < 2:
+        knots = numpy.array([ni_to_raw.x_min, ni_to_raw.x_max])
+    knot_raw = ni_to_raw.map(knots)
+    # perf - raw at each knot: the median of the pairs around it, not a line
+    # between the two nearest, so a single late pair is ignored. A knot with no
+    # pair that close takes the closer of the pairs on either side of it.
+    low = numpy.searchsorted(raw, knot_raw - BRIDGE_WINDOW_SECONDS, side="left")
+    high = numpy.searchsorted(raw, knot_raw + BRIDGE_WINDOW_SECONDS, side="right")
+    after = numpy.clip(numpy.searchsorted(raw, knot_raw), 0, raw.size - 1)
+    before = numpy.clip(after - 1, 0, raw.size - 1)
+    nearest = numpy.where(numpy.abs(raw[before] - knot_raw) <= numpy.abs(raw[after] - knot_raw),
+                          before, after)
+    knot_offset = numpy.array([
+        float(numpy.median(offset[a:b])) if b > a else float(offset[n])
+        for a, b, n in zip(low, high, nearest)
+    ])
+    knot_host = knot_raw + knot_offset
+    if not numpy.all(numpy.diff(knot_host) > 0):
+        # Corrupt perf stamps, not a slew: NTP moves the clock by at most a few
+        # ms a second, and inverse() needs a table that only goes forward.
+        return None, "RAW bridge is not increasing; "
+    return PiecewiseClockFit(knots, knot_host, ni_to_raw.residual_rms, ni_to_raw.points, True, "",
+                             RAW_BRIDGED), ""
 
 
 @dataclasses.dataclass(frozen=True)
