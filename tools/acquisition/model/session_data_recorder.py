@@ -2663,17 +2663,28 @@ class SessionDataRecorder:
 
     @staticmethod
     def _nidaq_block_stamps(chunks) -> "clocks.BlockStamps":
-        """Every run of equal block stamps, paired as the NI-to-host fit wants.
+        """Every run of equal block stamps, paired as the NI-to-host fit wants."""
+        return SessionDataRecorder._nidaq_block_stamps_and_raw_problem(chunks)[0]
+
+    @staticmethod
+    def _nidaq_block_stamps_and_raw_problem(chunks):
+        """(the block stamps, why the RAW column was not used or "").
 
         block_observation_perf_time is read whole, as the latency finalizer
         reads it, then dropped for its run ends before block_observation_raw_time
         is read whole in turn, and sample_index is not read at all when it is one
         unbroken run (the usual case), so this holds one float64 array of the
         spool's length at a time and nothing per channel.
+
+        A RAW column that is there but not as long as the perf one is left out,
+        as the latency finalizer leaves it out: its values cannot be paired with
+        the stamps' run ends, and it costs the RAW bridge, not the fit.
         """
         if isinstance(chunks, _NidaqSpoolSnapshot):
+            raw_problem = ""
             with h5py.File(chunks.path, "r") as source:
-                seen = source["block_observation_perf_time"][()]
+                perf_column = source["block_observation_perf_time"]
+                seen = perf_column[()]
                 ends = clocks.run_ends(seen)
                 perf_at_ends = seen[ends]
                 del seen
@@ -2682,11 +2693,16 @@ class SessionDataRecorder:
                 first = int(stored[0]) if count else 0
                 consecutive = count > 0 and int(stored[count - 1]) - first == count - 1
                 index_at_ends = first + ends if consecutive else stored[()][ends]
-                raw_at_ends = (
-                    source["block_observation_raw_time"][()][ends]
-                    if "block_observation_raw_time" in source else None
-                )
-            return clocks.block_stamps_from_runs(index_at_ends, perf_at_ends, raw_at_ends)
+                raw_at_ends = None
+                if "block_observation_raw_time" in source:
+                    raw_column = source["block_observation_raw_time"]
+                    if raw_column.shape == perf_column.shape:
+                        raw_at_ends = raw_column[()][ends]
+                    else:
+                        raw_problem = (f"{raw_column.size} values against {perf_column.size} "
+                                       "block_observation_perf_time stamps")
+            return (clocks.block_stamps_from_runs(index_at_ends, perf_at_ends, raw_at_ends),
+                    raw_problem)
         index, perf, raw = [], [], []
         for chunk in chunks:
             count = len(chunk[0])
@@ -2694,9 +2710,9 @@ class SessionDataRecorder:
             perf.append(np.full(count, float(chunk[9]) if len(chunk) > 9 else math.nan))
             raw.append(np.full(count, float(chunk[11]) if len(chunk) > 11 else math.nan))
         if not index:
-            return clocks.block_stamps_from_runs(np.empty(0, dtype=np.int64), np.empty(0))
+            return clocks.block_stamps_from_runs(np.empty(0, dtype=np.int64), np.empty(0)), ""
         return clocks.ni_block_stamps(np.concatenate(index), np.concatenate(perf),
-                                      np.concatenate(raw))
+                                      np.concatenate(raw)), ""
 
     @staticmethod
     def _nidaq_perf_values(chunks, start_perf, end_perf):
@@ -2842,8 +2858,14 @@ class SessionDataRecorder:
             period = SessionDataRecorder._nidaq_sample_period(chunks)
             if period <= 0:
                 return clocks.invalid_piecewise_fit("NI sample rate unknown")
-            stamps = SessionDataRecorder._nidaq_block_stamps(chunks)
-            return clocks.fit_ni_to_host_timeline(stamps, 1.0 / period)
+            stamps, raw_problem = SessionDataRecorder._nidaq_block_stamps_and_raw_problem(chunks)
+            fit = clocks.fit_ni_to_host_timeline(stamps, 1.0 / period)
+            if raw_problem:
+                # As the selector names a RAW that failed: the perf stamps were fitted alone.
+                fit = dataclasses.replace(
+                    fit, reason=f"RAW stamps unusable ({raw_problem}); {fit.reason}".rstrip("; "),
+                )
+            return fit
         except Exception as error:
             logging.getLogger(__name__).exception(
                 "NI-to-host fit failed; the alignment falls back to the epoch timeline",
@@ -3055,6 +3077,12 @@ class SessionDataRecorder:
             else float(np.median(np.diff(transition_host)))
         )
         exposure_notes = []
+        if exposure_seconds is not None and exposure_seconds < 0:
+            # No exposure is negative (a sign slip in the configuration, say), and taken
+            # at its word it would move the expected edge and the lag gate together: a
+            # neighbouring frame's edge can then be the nearest and still pass the gate.
+            exposure_notes.append(f"exposure {exposure_seconds * 1e3:.3f} ms is negative")
+            exposure_seconds = None
         if exposure_seconds is not None and period is not None and exposure_seconds >= period:
             # An exposure cannot last as long as the frame (a units mix-up, say),
             # and taken at its word it would put the expected edge a whole number

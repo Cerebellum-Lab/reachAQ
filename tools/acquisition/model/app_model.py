@@ -502,8 +502,10 @@ def _camera_exposure_seconds(cameras) -> Dict[str, Optional[float]]:
         try:
             exposure = camera.save_configuration(runtime_mode=True).params.get("exposure")
             # alignment.json is written with allow_nan=False, so a NaN here would
-            # cost the session its finalization; it counts as unknown instead.
-            if exposure is not None and math.isfinite(float(exposure)):
+            # cost the session its finalization; it counts as unknown instead. So
+            # does a negative one: no exposure is, and the anchor would move its
+            # expected edge and lag gate together by it.
+            if exposure is not None and math.isfinite(float(exposure)) and float(exposure) >= 0:
                 value = float(exposure) * 1e-6
         except Exception:
             logger.warning("camera %s exposure is unknown to the session recorder", name,

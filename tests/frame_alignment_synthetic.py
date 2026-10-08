@@ -31,8 +31,12 @@ camera's frame ledger and its latency stream, from one model of the clocks
   exposure end on a camera clock = NI seconds + CAMERA_OFFSET, and
   frame_perf_c = H(t_n) + lag. The lag is against the true edge H(t_n). The
   drift report's L (0.8-1.8 ms measured) is against the edge as the NI-to-host
-  fit maps it, which is 0.2-0.3 ms late (a self-test pins that), so the same
-  frames have a lag here of about L plus 0.2-0.3 ms.
+  fit maps it, which is 0.2-0.3 ms late on the perf stamps of a spool a few
+  tens of seconds long (a self-test pins that, with and without two small
+  polls), so the same frames have a lag here of about L plus 0.2-0.3 ms. That
+  is not a property of the perf-only envelope in general: across a long
+  session of NTP polls it is not late-never-early (the final review's 4 h proof
+  measured up to 46 us early, 260 us late at most), and only the RAW bridge is.
 * Clock latches: three 1 ms after a frame's exposure start, each a +-0.1 ms
   perf bracket around H(t) holding the camera clock at t. The RAW pair of the
   latch row is NaN: no consumer reads it yet, and this rig does not model a

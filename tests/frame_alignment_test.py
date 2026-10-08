@@ -233,6 +233,58 @@ def test_an_exposure_as_long_as_the_frame_period_is_treated_as_unknown(tmp_path)
     assert camera["reason"].endswith("exposure unknown, assumed 0")
 
 
+def test_a_negative_exposure_is_treated_as_unknown_and_cannot_move_the_anchor(tmp_path):
+    # -5 ms would put the expected edge, and the lag gate with it, 5 ms later than it is. With a
+    # true lag of 2.1 ms the next frame's edge is then the nearest to it, and its implied lag
+    # (about -4.8 ms) sits inside the moved gate (-4.9..-2.9 ms): the wrong frame, anchored at
+    # full confidence. Unknown, it is the gate [0.1, 2.1] ms around 1.1 ms again.
+    rig, project, n0, result = _record(tmp_path / "expected", t0=5.0, lag=0.0021, stream=False,
+                                       exposure=-0.005)
+    camera = result["cameraNidaqAlignment"]
+    assert camera["matchedSampleIndex"] == rig.edge_sample(n0)
+    assert camera["anchorMethod"] == "expected_lag" and camera["confidence"] == "hardware_edge"
+    assert camera["exposureSeconds"] is None
+    assert camera["expectedLagSeconds"] == pytest.approx(0.0011)
+    assert camera["lagGateSeconds"] == pytest.approx([0.0001, 0.0021])
+    assert "exposure -5.000 ms is negative" in camera["reason"]
+    assert camera["reason"].endswith("exposure unknown, assumed 0")
+
+    # With the camera latches the anchor was right all along, but the moved expected edge
+    # disagreed with it and took the session's confidence.
+    rig, project, n0, result = _record(tmp_path / "latched", t0=5.0, lag=0.001, exposure=-0.005)
+    camera = result["cameraNidaqAlignment"]
+    assert camera["matchedSampleIndex"] == rig.edge_sample(n0)
+    assert camera["anchorMethod"] == "camera_latch" and camera["anchorsAgree"] is True
+    assert camera["confidence"] == "hardware_edge"
+    assert "negative" in camera["reason"] and "disagree" not in camera["reason"]
+
+
+@pytest.mark.parametrize("damage", ["shorter", "longer"])
+def test_a_raw_column_of_the_wrong_size_costs_the_bridge_and_not_the_fit(tmp_path, damage):
+    # A shorter column raised inside the run-end lookup and cost the whole fit (and with it the
+    # fitted anchor); a longer one lined up with nothing and was bridged through as if it did.
+    rig = SyntheticRig(polls=((10.0, 0.004),))
+    spool = rig.write_spool(tmp_path / "spool.h5", t_from=0.0, t_to=25.0, raw=True)
+    whole = SessionDataRecorder._fit_nidaq_to_host(spool)
+    assert whole.valid and whole.method == clocks.RAW_BRIDGED
+    with h5py.File(spool.path, "r+") as store:
+        column = store["block_observation_raw_time"][()]
+        del store["block_observation_raw_time"]
+        damaged = column[:-1] if damage == "shorter" else np.append(column, 1.0)
+        store.create_dataset("block_observation_raw_time", data=damaged)
+
+    fit = SessionDataRecorder._fit_nidaq_to_host(spool)
+
+    assert fit.valid, fit.reason
+    assert fit.method == clocks.PIECEWISE_ENVELOPE
+    assert fit.reason == (f"RAW stamps unusable ({damaged.size} values against {column.size} "
+                          "block_observation_perf_time stamps)")
+    # The perf stamps alone still map within the delivery floor of the host clock.
+    probe = np.linspace(fit.x_min, fit.x_max, 5_000)
+    late = fit.map(probe) - rig.host(probe)
+    assert late.min() > -0.0001 and late.max() < 0.0005
+
+
 def test_raw_stamps_bridge_the_fit_through_an_ntp_step(tmp_path):
     rig, project, n0, result = _record(tmp_path, t0=5.0, lag=0.00175, raw=True,
                                        polls=((10.0, 0.004),))

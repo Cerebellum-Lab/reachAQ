@@ -444,6 +444,24 @@ CAN warnings and errors remain in both logs.
   `persistenceStatus`;
 - `deviceEventOverruns`, `sessionComplete`, and `incompleteReasons`.
 
+Three things to know when reading `cameraNidaqAlignment`:
+
+- `niToHost.valid` says whether the fit was used; readers key on it, never on
+  `reason`. A valid fit can carry a non-empty `reason`, which then names what was
+  left out of it and is not a failure: *RAW on 40 stamps, need 100*, *RAW covers
+  62% of the 90 s of stamps, need 90%* or *RAW stamps unusable (…)* mean the fit
+  is `piecewise_envelope` on the perf stamps alone.
+- `ambiguitySeconds` is how much nearer the chosen transition is than the
+  runner-up, both measured to the expected edge (`start_perf` less the expected
+  lag), not to `start_perf`. When the camera-latch anchor wins it still
+  describes the expected-lag pick; the latch's own margin is
+  `latch.medianResidualSeconds` and `latch.agreement`. The epoch fallback
+  (`epoch_nearest_edge`) measures it to `start_perf`.
+- `latency.h5` (`clock/ni_to_host`) and `alignment.json` (`niToHost`) are
+  separate fits of the same stamps: the first from the published, boundary-trimmed
+  `nidaq.h5`, the second from the whole spool. Their `knotCount` and `x_min`
+  differ, and neither is derived from the other.
+
 Final session JSON/YAML uses `metadataSchemaVersion: 2`. It records the animal
 snapshot, `counts`, recording completion, stop policy/result, compact hardware
 state at Record, and only hardware entries that changed by finalization. The

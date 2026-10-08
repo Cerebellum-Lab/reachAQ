@@ -691,10 +691,13 @@ def test_the_raw_stream_reader_is_public_and_retries(tmp_path, monkeypatch):
     # The module's budget is read when the call is made: the 0.2 s patched in above, not the
     # 5 s the default would have bound at import (which also made every patched test slow).
     assert time.monotonic() - started < 2.0
+    # The caller's 0.05 s, not the module's: the default 5 s is put back, so a reader that
+    # ignored its argument would take all of it and the bound can leave room for a loaded rig.
+    monkeypatch.setattr(finalize, "OPEN_RETRY_SECONDS", 5.0)
     started = time.monotonic()
     with pytest.raises(OSError):
         finalize.read_raw_stream(tmp_path / "missing.h5", retry_seconds=0.05)
-    assert time.monotonic() - started < 0.15  # the caller's budget, not the module's
+    assert time.monotonic() - started < 0.5
 
 
 @pytest.mark.parametrize("damage", ["truncated", "not_numbers"])
