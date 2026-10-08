@@ -487,6 +487,31 @@ def _camera_configured_metadata(camera) -> Dict[str, Any]:
     }
 
 
+def _camera_exposure_seconds(cameras) -> Dict[str, Optional[float]]:
+    """Each camera's exposure in seconds, for the session recorder's frame anchor.
+
+    The capture URL's ``exposure`` query value is the Spinnaker ExposureTime in
+    microseconds (system_configuration.yaml cameras[].params.exposure, or a
+    profile's ordinary_exposure). A camera without it, or one whose
+    configuration cannot be read, is None; the anchor then assumes zero.
+    """
+    result = {}
+    for camera in cameras:
+        name = getattr(camera, "name", "")
+        value = None
+        try:
+            exposure = camera.save_configuration(runtime_mode=True).params.get("exposure")
+            # alignment.json is written with allow_nan=False, so a NaN here would
+            # cost the session its finalization; it counts as unknown instead.
+            if exposure is not None and math.isfinite(float(exposure)):
+                value = float(exposure) * 1e-6
+        except Exception:
+            logger.warning("camera %s exposure is unknown to the session recorder", name,
+                           exc_info=True)
+        result[name] = value
+    return result
+
+
 def _compact_subsystem_snapshot(snapshot):
     """Remove fields repeated by the subsystem key and empty defaults."""
     compact = {}
@@ -1599,6 +1624,7 @@ class AppModel(ObservableObject):
                 metadata_generation_id=(
                     self._recording_session.metadata_generation_id
                 ),
+                camera_exposure_seconds=_camera_exposure_seconds(self._cameras),
             )
             started = self._behavior.algorithm.start_session(
                 reason="manual_record",
