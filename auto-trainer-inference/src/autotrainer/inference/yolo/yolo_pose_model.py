@@ -275,16 +275,34 @@ class YoloPoseModel(PoseModel):
         would cost more than the decode it precedes.
 
         The head already returns pixel coordinates - channels are 4 box, 1
-        class, then 14 keypoint triples - so nothing here rescales, and a
-        change to the model's stride or input size cannot silently shift the
-        output without the captured shape check below failing first.
+        class, then 14 keypoint triples - in the pixels of the graph's imgsz
+        input.
+
+        A frame of another size is resized to imgsz on the way in and its
+        keypoints scaled back on the way out. The 320 and 512 models were
+        trained on the same 256x256 frames as the 256 ones, upscaled to imgsz,
+        and predict() treats live frames the same way: LetterBox pads nothing
+        around a square frame, and the bilinear resize here matches it to
+        within 0.004 of 255. Copying the frame in unscaled raised on the first
+        live call at any imgsz but 256, which took the pose process down while
+        the recording carried on. A non-square frame is refused rather than
+        stretched, because every model was trained on square ones.
         """
         import torch
 
         batch = numpy.asarray(frames)
+        rows, cols = batch.shape[1:3]
+        if rows != cols:
+            raise ValueError(
+                f"{rows}x{cols} frames cannot be scaled to the square imgsz "
+                f"{self._imgsz} input without stretching them")
         tensor = torch.from_numpy(
             numpy.ascontiguousarray(batch[..., ::-1].transpose(0, 3, 1, 2))
-        ).to("cuda", non_blocking=True).float().div_(255.0)
+        ).to(self._graph_in.device, non_blocking=True).float().div_(255.0)
+        if rows != self._imgsz:
+            tensor = torch.nn.functional.interpolate(
+                tensor, size=(self._imgsz, self._imgsz), mode="bilinear",
+                align_corners=False)
         self._graph_in.copy_(tensor)
         self._graph.replay()
 
@@ -294,6 +312,10 @@ class YoloPoseModel(PoseModel):
         index = best.view(-1, 1, 1).expand(-1, out.shape[1], 1)
         picked = out.gather(2, index).squeeze(2)
         keypoints = picked[:, 5:].reshape(len(frames), self._body_parts_count, 3)
+        if rows != self._imgsz:
+            # x and y only; confidence has no unit. The same division by the
+            # gain that ultralytics' scale_coords applies.
+            keypoints[..., :2] *= rows / self._imgsz
         return list(keypoints.detach().cpu().numpy().astype("float32"))
 
     # -- internals --------------------------------------------------------

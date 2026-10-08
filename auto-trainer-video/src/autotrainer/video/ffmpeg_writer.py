@@ -30,18 +30,21 @@ X264_OUTPUT_ARGS = (
 )
 
 # The encoder runs below capture and live pose: it has throughput to spare at
-# every preset, they have a deadline. Priority alone does not protect live
-# pose at 1024x1024, though: with x264 free to use every core, 59% of frames
-# were posed live, with or without it. See EFFICIENCY_CPUS_FILE.
+# every preset, they have a deadline. Priority alone did not protect live
+# pose at 1024x1024 on a power-saving CPU, though: with x264 free to use
+# every core, 59% of frames were posed live, with or without it. See
+# EFFICIENCY_CPUS_FILE.
 ENCODER_NICENESS = 10
 
 # Hybrid Intel processors (Alder Lake and later) list their efficiency cores
 # here. On christielab10 (i9-12900: CPUs 0-15 are the 8 performance cores'
-# hyperthreads, 16-23 the 8 efficiency cores) x264 running on the
-# performance cores cut live pose at 1024x1024 to 59% of frames (5.89 ms
-# inference); confined to the efficiency cores it kept up with both cameras
-# and pose recovered to 87%, the same as the 256 base with no H.264 at all
-# (85%) (2026-10-06).
+# hyperthreads, 16-23 the 8 efficiency cores), with the CPUs at EPP
+# balance_power, x264 running on the performance cores cut live pose at
+# 1024x1024 to 59% of frames (5.89 ms inference); confined to the efficiency
+# cores it kept up with both cameras and pose recovered to 87%, level with
+# the 256 base (85%) (2026-10-06). At EPP performance both placements pose
+# at least 99% of frames (pinned 99.2%, unpinned 99.9%; 2026-10-07), so the
+# confinement matters on a power-saving machine and costs nothing elsewhere.
 EFFICIENCY_CPUS_FILE = "/sys/devices/cpu_atom/cpus"
 
 # Long enough for ffmpeg to encode what is still in the pipe and write the
