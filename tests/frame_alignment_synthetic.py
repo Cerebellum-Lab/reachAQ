@@ -7,6 +7,10 @@ camera's frame ledger and its latency stream, from one model of the clocks
   DRIFT the NI clock against perf_counter (-10 ppm, as christielab10 runs),
   slew(t) the timesyncd corrections: a poll at T with offset theta adds
   theta * (1 - exp(-(t - T) / TAU)) and a permanent rate step theta * PLL_GAIN.
+  Polls are superposed, each acting as if it were alone. The kernel instead
+  replaces what is left of the previous offset at every poll, so the model is
+  exact only for polls far apart against TAU: the Task 6 review measured the
+  difference at 1.8 % with the real 2048 s spacing and 31 % at 90 s.
 * The epoch timeline the recorder stores (nidaq.h5 perf_time) is
       HOST0 - EPOCH_EARLY + t:
   stamped EPOCH_EARLY before sample 0, knowing no drift and no slew. Against
@@ -25,7 +29,10 @@ camera's frame ledger and its latency stream, from one model of the clocks
 * cam_frames toggles at every exposure start t_n = EDGE0 + n * PERIOD, at
   sample round(t_n * RATE). Frame n has id FIRST_ID + n, a camera stamp at its
   exposure end on a camera clock = NI seconds + CAMERA_OFFSET, and
-  frame_perf_c = H(t_n) + lag (the report's L, measured 0.8-1.8 ms).
+  frame_perf_c = H(t_n) + lag. The lag is against the true edge H(t_n). The
+  drift report's L (0.8-1.8 ms measured) is against the edge as the NI-to-host
+  fit maps it, which is 0.2-0.3 ms late (a self-test pins that), so the same
+  frames have a lag here of about L plus 0.2-0.3 ms.
 * Clock latches: three 1 ms after a frame's exposure start, each a +-0.1 ms
   perf bracket around H(t) holding the camera clock at t. The RAW pair of the
   latch row is NaN: no consumer reads it yet, and this rig does not model a
@@ -72,6 +79,7 @@ class SyntheticRig:
         self.rng = np.random.default_rng(seed)
 
     def slew(self, t):
+        """The timesyncd corrections at NI time t, polls superposed (see the module docstring)."""
         t = np.asarray(t, dtype=np.float64)
         out = np.zeros_like(t)
         for when, theta in self.polls:

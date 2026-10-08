@@ -7,6 +7,7 @@ slew, the pre-read stamping or the latch bracket fails at least one of them.
 """
 
 import csv
+import dataclasses
 from datetime import datetime
 from pathlib import Path
 
@@ -303,3 +304,40 @@ def test_a_stream_written_without_latches_has_an_empty_latch_table(tmp_path, pro
         assert store["frames"].shape == (10,)
     assert latches.shape == (0,) and latches.dtype == CLOCK_LATCH_DTYPE
     assert not clocks.fit_latches(latches).valid
+
+
+def test_the_snapshot_describes_the_spool_the_recorder_would_have_taken(tmp_path):
+    rig = SyntheticRig()
+    path = tmp_path / "snapshot.h5"
+    spool = rig.write_spool(path, t_from=5.2, t_to=8.0, tone_pulses=((5.1, 0.15),))
+
+    snapshot = dataclasses.asdict(spool)
+
+    # Hand-worked: samples 52 000..79 999 at 10 kHz, the epoch timeline 1.7 ms before the
+    # host (HOST0 - 0.0017 + t), and a spool nothing went wrong in.
+    assert snapshot.pop("first_perf_time") == pytest.approx(1000.0 - 0.0017 + 5.2, abs=1e-9)
+    assert snapshot.pop("last_perf_time") == pytest.approx(1000.0 - 0.0017 + 7.9999, abs=1e-9)
+    assert snapshot == {
+        "path": path, "channel_names": ("cam_frames", "tone1"), "sample_rate_hz": RATE,
+        "sample_count": 28_000, "first_sample_index": 52_000, "last_sample_index": 79_999,
+        "gap_count": 0, "overrun_samples": 0, "first_error": None, "last_error": None,
+        "error_count": 0, "worker_failed": False,
+    }
+
+
+@pytest.mark.parametrize("polls", [(), ((2.0, 0.004), (12.0, -0.003))], ids=["no_polls", "two_polls"])
+def test_the_rigs_stamps_drive_the_ni_fit_to_a_map_that_is_late_and_never_early(tmp_path, polls):
+    # With these stamps (0.2-3.2 ms delivery delay, perf stamps only) the envelope maps NI
+    # time 0.2-0.3 ms late, as it does on christielab10. A later test that finds the
+    # alignment off by more than that has found a recorder fault, not a rig one.
+    rig = SyntheticRig(polls=polls)
+    spool = rig.write_spool(tmp_path / "fit.h5", t_from=0.0, t_to=25.0)
+
+    fit = clocks.fit_ni_to_host_timeline(SessionDataRecorder._nidaq_block_stamps(spool), RATE)
+
+    assert fit.valid, fit.reason
+    assert fit.method == clocks.PIECEWISE_ENVELOPE and fit.knots.size == 2  # one 25 s window
+    probe = np.linspace(fit.x_min, fit.x_max, 20_000)
+    late = fit.map(probe) - rig.host(probe)
+    assert late.min() > 0.0001, late.min()
+    assert late.max() < 0.0003, late.max()
