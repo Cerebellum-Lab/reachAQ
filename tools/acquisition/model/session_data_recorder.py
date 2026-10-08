@@ -23,7 +23,7 @@ import numpy as np
 from autotrainer.core import ProjectInfo
 from tools.acquisition.model.session_boundary import SessionBoundary
 from tools.acquisition.model.latency_event_log import LatencyEventLog
-from tools.latency import finalize_session_latency
+from tools.latency import clocks, finalize_session_latency
 from tools.acquisition.model.atomic_session_io import (
     atomic_publish_file,
     atomic_write_json,
@@ -1498,6 +1498,7 @@ class SessionDataRecorder:
             ("epoch", np.uint64),
             ("block_observation_perf_time", np.float64),
             ("block_observation_wall_time", np.float64),
+            ("block_observation_raw_time", np.float64),
         ):
             output.create_dataset(name, shape=(0,), maxshape=(None,), dtype=dtype,
                                   chunks=True)
@@ -1532,6 +1533,9 @@ class SessionDataRecorder:
             ),
             "block_observation_wall_time": np.full(
                 count, read.source_wall_time, dtype=np.float64,
+            ),
+            "block_observation_raw_time": np.full(
+                count, getattr(read, "source_raw_time", math.nan), dtype=np.float64,
             ),
         }
         dataset_names = (*observations, "values")
@@ -2581,6 +2585,40 @@ class SessionDataRecorder:
         inside = (position >= 0) & (perf <= last_covered)
         missing[inside] = indices[position[inside]]
         return missing
+
+    @staticmethod
+    def _nidaq_block_stamps(chunks) -> "clocks.BlockStamps":
+        """Every run of equal block stamps, paired as the NI-to-host fit wants.
+
+        block_observation_perf_time is read whole, as the latency finalizer
+        reads it, and sample_index is not read at all when it is one unbroken
+        run (the usual case), so this costs one float64 array of the spool's
+        length and nothing per channel.
+        """
+        if isinstance(chunks, _NidaqSpoolSnapshot):
+            with h5py.File(chunks.path, "r") as source:
+                seen = source["block_observation_perf_time"][()]
+                ends = clocks.run_ends(seen)
+                stored = source["sample_index"]
+                count = int(stored.shape[0])
+                first = int(stored[0]) if count else 0
+                consecutive = count > 0 and int(stored[count - 1]) - first == count - 1
+                index_at_ends = first + ends if consecutive else stored[()][ends]
+                raw_at_ends = (
+                    source["block_observation_raw_time"][()][ends]
+                    if "block_observation_raw_time" in source else None
+                )
+            return clocks.block_stamps_from_runs(index_at_ends, seen[ends], raw_at_ends)
+        index, perf, raw = [], [], []
+        for chunk in chunks:
+            count = len(chunk[0])
+            index.append(np.asarray(chunk[0], dtype=np.int64))
+            perf.append(np.full(count, float(chunk[9]) if len(chunk) > 9 else math.nan))
+            raw.append(np.full(count, float(chunk[11]) if len(chunk) > 11 else math.nan))
+        if not index:
+            return clocks.block_stamps_from_runs(np.empty(0, dtype=np.int64), np.empty(0))
+        return clocks.ni_block_stamps(np.concatenate(index), np.concatenate(perf),
+                                      np.concatenate(raw))
 
     @staticmethod
     def _nidaq_perf_values(chunks, start_perf, end_perf):
@@ -3803,6 +3841,9 @@ class SessionDataRecorder:
             observation_wall = (
                 float(observation[1]) if len(observation) > 1 else math.nan
             )
+            observation_raw = (
+                float(observation[2]) if len(observation) > 2 else math.nan
+            )
             mask = (perf >= start_perf) & (perf <= end_perf)
             if np.any(mask):
                 selected.append((
@@ -3823,6 +3864,11 @@ class SessionDataRecorder:
                     np.full(
                         np.count_nonzero(mask),
                         observation_wall,
+                        dtype=np.float64,
+                    ),
+                    np.full(
+                        np.count_nonzero(mask),
+                        observation_raw,
                         dtype=np.float64,
                     ),
                 ))
@@ -3851,6 +3897,10 @@ class SessionDataRecorder:
                     data=np.empty(0, dtype=np.float64),
                 )
                 output.create_dataset(
+                    "block_observation_raw_time",
+                    data=np.empty(0, dtype=np.float64),
+                )
+                output.create_dataset(
                     "values",
                     data=np.empty((len(channel_names), 0), dtype=np.float32),
                 )
@@ -3861,6 +3911,7 @@ class SessionDataRecorder:
             epochs = np.concatenate([item[8] for item in selected])
             observation_perf = np.concatenate([item[9] for item in selected])
             observation_wall = np.concatenate([item[10] for item in selected])
+            observation_raw = np.concatenate([item[11] for item in selected])
             if indices.size > 1 and not np.all(np.diff(indices) == 1):
                 raise RuntimeError(
                     "NI-DAQ session sample indices are not strictly consecutive"
@@ -3881,6 +3932,11 @@ class SessionDataRecorder:
             output.create_dataset(
                 "block_observation_wall_time",
                 data=observation_wall,
+                compression="gzip",
+            )
+            output.create_dataset(
+                "block_observation_raw_time",
+                data=observation_raw,
                 compression="gzip",
             )
             output.create_dataset(
@@ -3950,15 +4006,22 @@ class SessionDataRecorder:
                 "epoch",
                 "block_observation_perf_time",
                 "block_observation_wall_time",
+                "block_observation_raw_time",
             )
             for name in one_dimensional:
-                source_dataset = source[name]
+                # A spool from before the RAW stamp has no such column; the
+                # published file still gets it, unknown throughout.
+                source_dataset = source.get(name)
                 output_dataset = output.create_dataset(
                     name,
                     shape=(selected_count,),
-                    dtype=source_dataset.dtype,
+                    dtype=np.float64 if source_dataset is None else source_dataset.dtype,
                     compression="gzip" if selected_count else None,
                 )
+                if source_dataset is None:
+                    if selected_count:
+                        output_dataset[...] = np.nan
+                    continue
                 for relative in range(0, selected_count, 65536):
                     amount = min(65536, selected_count - relative)
                     output_dataset[relative:relative + amount] = source_dataset[

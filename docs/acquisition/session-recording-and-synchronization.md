@@ -250,12 +250,17 @@ channel from acquisition or persistence. At 10 kHz, the nominal timestamp
 resolution is 0.1 ms.
 
 The primary datasets are `sample_index`, `perf_time`, `offset_seconds`,
-`wall_time`, `epoch`, `values`, `block_observation_perf_time`, and
-`block_observation_wall_time`. `values` is channel-by-sample and follows the
-`channel_names` attribute. File attributes include the recording boundaries,
-sample rate, epoch, gap/overrun counts, source clock, and serialized timing
-plan. Block-observation times are diagnostics only; `perf_time` is derived from
-the sample-index epoch.
+`wall_time`, `epoch`, `values`, `block_observation_perf_time`,
+`block_observation_wall_time` and `block_observation_raw_time`. `values` is
+channel-by-sample and follows the `channel_names` attribute. File attributes
+include the recording boundaries, sample rate, epoch, gap/overrun counts,
+source clock, and serialized timing plan. `perf_time` is derived from the
+sample-index epoch and carries the epoch's offset and the NI clock's drift.
+The block-observation times are the stamps taken before each NI read
+(`perf_time` on `time.perf_counter`, `raw_time` on `CLOCK_MONOTONIC_RAW`, NaN
+where the host has no such clock); the NI-to-host fit stored in
+`alignment.json` (`cameraNidaqAlignment.niToHost`) is built from them, and
+every host time derived from an NI sample goes through that fit.
 
 The NI-DAQ epoch is anchored once. Later block delivery time does not reconstruct
 each block independently, so host scheduling jitter cannot create backward

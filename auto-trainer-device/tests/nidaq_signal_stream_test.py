@@ -1,3 +1,4 @@
+import math
 from types import SimpleNamespace
 
 import numpy
@@ -11,7 +12,10 @@ from autotrainer.core import (
     NidaqTimingPlan,
 )
 from autotrainer.device import nidaq_signal_stream
-from autotrainer.device.nidaq_signal_stream import NidaqSignalStreamController
+from autotrainer.device.nidaq_signal_stream import (
+    NidaqSignalSampleBlock,
+    NidaqSignalStreamController,
+)
 
 from nidaq_daqmx_fake import FakeDaqError
 
@@ -682,3 +686,26 @@ def test_a_bare_export_line_is_named_on_the_master(monkeypatch):
         assert controller.read_chunk().sample_count == 3
     finally:
         controller.close()
+
+
+def test_read_chunk_stamps_the_raw_clock_beside_the_perf_stamp(monkeypatch):
+    fake_nidaqmx = _FakeNidaqmx()
+    monkeypatch.setattr(nidaq_signal_stream, "_load_nidaqmx", lambda: fake_nidaqmx)
+    raw_values = iter((77.5, 77.6))
+    monkeypatch.setattr(nidaq_signal_stream, "monotonic_raw_time", lambda: next(raw_values))
+
+    controller = NidaqSignalStreamController(_digital_configuration())
+    try:
+        controller.start()
+        first = controller.read_chunk()
+        second = controller.read_chunk()
+    finally:
+        controller.close()
+
+    assert first.raw_time == 77.5 and second.raw_time == 77.6
+
+
+def test_a_block_without_a_raw_stamp_reads_nan():
+    block = NidaqSignalSampleBlock(wall_time=1.0, perf_time=2.0, sample_rate_hz=1000.0,
+                                   sample_index=0, channels=(), values={})
+    assert math.isnan(block.raw_time)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import math
 import numbers
 import time
 from typing import Dict, List, Optional, Tuple
@@ -15,6 +16,7 @@ from autotrainer.core import (
 )
 from autotrainer.core.configuration.laser_configuration import pxi_trig_line
 from autotrainer.core.configuration.nidaq_port_configuration import slave_input_timing
+from autotrainer.core.latency.raw_clock import monotonic_raw_time
 from autotrainer.core.logging import log_hardware_initialization
 
 
@@ -67,6 +69,8 @@ class NidaqSignalSampleBlock:
     values: Dict[str, Tuple[float, ...]]
     epoch_perf_time: Optional[float] = None
     epoch_wall_time: Optional[float] = None
+    #: CLOCK_MONOTONIC_RAW taken beside perf_time; NaN where the host has none.
+    raw_time: float = math.nan
 
     @property
     def sample_count(self) -> int:
@@ -200,6 +204,9 @@ class NidaqSignalStreamController:
         values: Dict[str, Tuple[float, ...]] = {}
         wall_time = time.time()
         perf_time = time.perf_counter()
+        # The same instant on the clock NTP does not slew, so the session's
+        # frame alignment can bridge NI time to perf_counter through it.
+        raw_time = monotonic_raw_time()
         read_started = time.perf_counter()
 
         try:
@@ -237,6 +244,7 @@ class NidaqSignalStreamController:
             values=values,
             epoch_perf_time=self._epoch_perf_time,
             epoch_wall_time=self._epoch_wall_time,
+            raw_time=raw_time,
         )
 
     def _read_all_devices(self, values, chunk_size, timeout) -> None:
