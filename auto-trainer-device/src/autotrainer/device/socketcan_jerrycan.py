@@ -152,6 +152,11 @@ class JerryCANCmdType(enum.IntEnum):
     GPIO_PULSE_STATUS = 0x22
     CAPABILITIES_REQUEST = 0x23
     CAPABILITIES_RESPONSE = 0x24
+    SYNC_CLAP = 0x25
+    SYNC_CLAP_OBSERVED = 0x26
+    SYNC_BARCODE = 0x27
+    ANALOG_BLOCK = 0x28
+    PWM_SET = 0x29
     ACKNOWLEDGE = 0x30
 
 
@@ -421,6 +426,45 @@ class GPIOPulseStatus(GPIOPulse):
     error: int = 0
 
 
+@dataclasses.dataclass
+class SyncClap:
+    tick: int = 0
+
+
+@dataclasses.dataclass
+class SyncClapObserved:
+    tick: int = 0
+    clapper_node: int = 0
+
+
+@dataclasses.dataclass
+class SyncBarcode:
+    tick: int = 0
+
+
+#: Sample slots in one ANALOG_BLOCK frame; channel_count * scan_count may not exceed it.
+ANALOG_BLOCK_SAMPLE_SLOTS = 16
+
+
+@dataclasses.dataclass
+class AnalogBlock:
+    instance: int = 0
+    channel_count: int = 0
+    scan_count: int = 0
+    flags: int = 0
+    scan_period_us: int = 0
+    #: Raw ADC counts, scan-major: scan 0 channels 0..n-1, then scan 1, ...
+    samples: Tuple[int, ...] = ()
+
+
+@dataclasses.dataclass
+class PwmSet:
+    channel: int = 0
+    duty_permyriad: int = 0
+    #: 0 keeps the current period; non-zero applies to every channel on the timer.
+    period_us: int = 0
+
+
 class JerryCANMsg:
     def __init__(self):
         self.type = JerryCANCmdType.HEARTBEAT
@@ -465,6 +509,11 @@ class JerryCANMsg:
         self.capabilities_response = CapabilitiesResponse()
         self.gpio_pulse = GPIOPulse()
         self.gpio_pulse_status = GPIOPulseStatus()
+        self.sync_clap = SyncClap()
+        self.sync_clap_observed = SyncClapObserved()
+        self.sync_barcode = SyncBarcode()
+        self.analog_block = AnalogBlock()
+        self.pwm_set = PwmSet()
 
 
 _PAYLOAD_SIZES = {
@@ -505,6 +554,11 @@ _PAYLOAD_SIZES = {
     JerryCANCmdType.GPIO_PULSE_STATUS: 12,
     JerryCANCmdType.CAPABILITIES_REQUEST: 1,
     JerryCANCmdType.CAPABILITIES_RESPONSE: 9,
+    JerryCANCmdType.SYNC_CLAP: 4,
+    JerryCANCmdType.SYNC_CLAP_OBSERVED: 5,
+    JerryCANCmdType.SYNC_BARCODE: 4,
+    JerryCANCmdType.ANALOG_BLOCK: 38,
+    JerryCANCmdType.PWM_SET: 7,
     JerryCANCmdType.ACKNOWLEDGE: 4,
 }
 
@@ -635,6 +689,11 @@ def _pack_payload(message: JerryCANMsg) -> bytes:
             "<BHI", message.gpio_pulse.instance, message.gpio_pulse.gpio_idx,
             message.gpio_pulse.duration_us,
         )
+    if message_type == JerryCANCmdType.PWM_SET:
+        return struct.pack(
+            "<BHI", message.pwm_set.channel, message.pwm_set.duty_permyriad,
+            message.pwm_set.period_us,
+        )
     raise NotImplementedError(f"packing {message_type.name} is not implemented")
 
 
@@ -759,6 +818,24 @@ def _unpack_payload(message: JerryCANMsg, payload: bytes) -> None:
         message.capabilities_response = CapabilitiesResponse(*struct.unpack("<BII", payload))
     elif message_type == JerryCANCmdType.GPIO_PULSE_STATUS:
         message.gpio_pulse_status = GPIOPulseStatus(*struct.unpack("<BHIBi", payload))
+    elif message_type == JerryCANCmdType.SYNC_CLAP:
+        message.sync_clap = SyncClap(*struct.unpack("<I", payload))
+    elif message_type == JerryCANCmdType.SYNC_CLAP_OBSERVED:
+        message.sync_clap_observed = SyncClapObserved(*struct.unpack("<IB", payload))
+    elif message_type == JerryCANCmdType.SYNC_BARCODE:
+        message.sync_barcode = SyncBarcode(*struct.unpack("<I", payload))
+    elif message_type == JerryCANCmdType.ANALOG_BLOCK:
+        instance, channel_count, scan_count, flags, scan_period_us = struct.unpack_from("<BBBBH", payload)
+        used = channel_count * scan_count
+        if used > ANALOG_BLOCK_SAMPLE_SLOTS:
+            raise ValueError(
+                f"ANALOG_BLOCK claims {channel_count}x{scan_count} samples; "
+                f"a frame holds {ANALOG_BLOCK_SAMPLE_SLOTS}"
+            )
+        samples = struct.unpack_from(f"<{ANALOG_BLOCK_SAMPLE_SLOTS}H", payload, 6)
+        message.analog_block = AnalogBlock(
+            instance, channel_count, scan_count, flags, scan_period_us, tuple(samples[:used]),
+        )
 
 
 class SocketCanJerryCAN:
