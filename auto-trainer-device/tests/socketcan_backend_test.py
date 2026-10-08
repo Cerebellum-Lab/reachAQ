@@ -330,6 +330,62 @@ def test_receive_classifies_malformed_frame(monkeypatch):
     assert raised.value.category == "malformed_frame"
 
 
+def _malformed_analog_block(address):
+    # 8 channels x 3 scans claims 24 samples; one frame holds 16, so decode
+    # raises ValueError.
+    payload = struct.pack("<BBBBH16H", 0, 8, 3, 0, 1000, *range(16))
+    return _raw_message((JerryCANCmdType.ANALOG_BLOCK << 5) | address, payload + b"\x00")
+
+
+def _pellet_heartbeat():
+    return _raw_message(JerryCANCmdType.HEARTBEAT << 5, b"\xff\0")
+
+
+def test_receive_skips_undecodable_frame_from_another_board_and_keeps_reading():
+    backend = SocketCanJerryCAN(CanTransportConfiguration(kind="socketcan", fd=True))
+    backend._bus = FakeBus([_malformed_analog_block(0x08), _pellet_heartbeat()])
+
+    messages = backend.ReceiveMessages(max_count=1, collect_ms=5000)
+
+    assert [(m.type, m.dst_id) for m in messages] == [(JerryCANCmdType.HEARTBEAT, 0x00)]
+    # Ended by the heartbeat after the malformed frame was read past.
+    assert backend._bus.messages == []
+
+
+def test_receive_still_fails_on_undecodable_frame_from_the_pellet(monkeypatch):
+    monkeypatch.setattr(
+        "autotrainer.device.can_diagnostics.capture_can_diagnostics",
+        lambda channel: {"channel": channel},
+    )
+    backend = SocketCanJerryCAN(CanTransportConfiguration(kind="socketcan", fd=True))
+    backend._bus = FakeBus([_malformed_analog_block(0x00), _pellet_heartbeat()])
+
+    with pytest.raises(CanTransportReadError) as raised:
+        backend.ReceiveMessages(max_count=1, collect_ms=5000)
+
+    assert raised.value.category == "malformed_frame"
+
+
+def test_receive_warns_once_per_address_about_undecodable_foreign_frames(caplog):
+    backend = SocketCanJerryCAN(CanTransportConfiguration(kind="socketcan", fd=True))
+    backend._bus = FakeBus([
+        _malformed_analog_block(0x08),
+        _malformed_analog_block(0x08),
+        _malformed_analog_block(0x09),
+        _pellet_heartbeat(),
+    ])
+
+    with caplog.at_level(logging.WARNING, logger=socketcan_jerrycan.__name__):
+        messages = backend.ReceiveMessages(max_count=1, collect_ms=5000)
+
+    assert [m.type for m in messages] == [JerryCANCmdType.HEARTBEAT]
+    assert backend._bus.messages == []
+    warned = [r.getMessage() for r in caplog.records if "undecodable" in r.getMessage()]
+    assert len(warned) == 2
+    assert any("address 8" in w for w in warned)
+    assert any("address 9" in w for w in warned)
+
+
 def test_receive_preserves_can_operation_error_and_enetdown(monkeypatch):
     class CanOperationError(Exception):
         def __init__(self):

@@ -571,6 +571,15 @@ def encode_can_id(message_type: JerryCANCmdType, dst_id: int) -> int:
     return ((int(message_type) & 0x3F) << 5) | (dst_id & 0x1F)
 
 
+#: Board type (bits 2-3 of the 5-bit address) of the pellet device; see
+#: can_interface._is_pellet_by_addr.
+_PELLET_BOARD_TYPE = 0
+
+
+def _board_type_of_arbitration_id(arbitration_id: int) -> int:
+    return (arbitration_id >> 2) & 0x3
+
+
 def _jerrycan_filters():
     """Kernel-friendly filters for standard JerryCAN command identifiers."""
     return [
@@ -852,6 +861,9 @@ class SocketCanJerryCAN:
         # Per kind of error notice: when it may next be logged, and how many
         # were suppressed since it last was.
         self._error_notice_log: dict = {}
+        # Addresses of non-pellet boards already warned about for sending a
+        # frame that does not decode.
+        self._undecodable_foreign_addresses: set = set()
 
     @property
     def receive_statistics(self):
@@ -1034,13 +1046,18 @@ class SocketCanJerryCAN:
                             timestamp_ns=timestamp_ns,
                         )
                     except (IndexError, struct.error, ValueError) as exc:
-                        from .can_diagnostics import capture_can_diagnostics
-                        raise CanTransportReadError(
-                            "Malformed JerryCAN frame "
-                            f"id={raw_message.arbitration_id:#x} length={len(raw_message.data)}: {exc}",
-                            category="malformed_frame",
-                            diagnostics=capture_can_diagnostics(self.configuration.channel),
-                        )
+                        if _board_type_of_arbitration_id(raw_message.arbitration_id) == _PELLET_BOARD_TYPE:
+                            from .can_diagnostics import capture_can_diagnostics
+                            raise CanTransportReadError(
+                                "Malformed JerryCAN frame "
+                                f"id={raw_message.arbitration_id:#x} length={len(raw_message.data)}: {exc}",
+                                category="malformed_frame",
+                                diagnostics=capture_can_diagnostics(self.configuration.channel),
+                            )
+                        # Another board's garbled frame is not the pellet's
+                        # fault: raising ended the reader, and with it the
+                        # pellet connection. Read on.
+                        self._log_undecodable_foreign_frame(raw_message, exc)
                     else:
                         messages.append(decoded)
                         self._received_frames += 1
@@ -1062,6 +1079,19 @@ class SocketCanJerryCAN:
             self._receive_log_started = now
             self._next_receive_log = now + 60
         return messages
+
+    def _log_undecodable_foreign_frame(self, raw_message, exc: BaseException) -> None:
+        """Warn once per address; an IO board streams hundreds of frames a second."""
+        address = raw_message.arbitration_id & 0x1F
+        if address in self._undecodable_foreign_addresses:
+            return
+        self._undecodable_foreign_addresses.add(address)
+        logger.warning(
+            "Skipping undecodable CAN frame from board address %d (board type %d) "
+            "id=%#x length=%d: %s",
+            address, _board_type_of_arbitration_id(raw_message.arbitration_id),
+            raw_message.arbitration_id, len(raw_message.data), exc,
+        )
 
     def _log_error_notice(self, arbitration_id: int, description: str) -> None:
         now = time.perf_counter()
