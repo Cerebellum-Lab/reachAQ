@@ -2591,14 +2591,17 @@ class SessionDataRecorder:
         """Every run of equal block stamps, paired as the NI-to-host fit wants.
 
         block_observation_perf_time is read whole, as the latency finalizer
-        reads it, and sample_index is not read at all when it is one unbroken
-        run (the usual case), so this costs one float64 array of the spool's
-        length and nothing per channel.
+        reads it, then dropped for its run ends before block_observation_raw_time
+        is read whole in turn, and sample_index is not read at all when it is one
+        unbroken run (the usual case), so this holds one float64 array of the
+        spool's length at a time and nothing per channel.
         """
         if isinstance(chunks, _NidaqSpoolSnapshot):
             with h5py.File(chunks.path, "r") as source:
                 seen = source["block_observation_perf_time"][()]
                 ends = clocks.run_ends(seen)
+                perf_at_ends = seen[ends]
+                del seen
                 stored = source["sample_index"]
                 count = int(stored.shape[0])
                 first = int(stored[0]) if count else 0
@@ -2608,7 +2611,7 @@ class SessionDataRecorder:
                     source["block_observation_raw_time"][()][ends]
                     if "block_observation_raw_time" in source else None
                 )
-            return clocks.block_stamps_from_runs(index_at_ends, seen[ends], raw_at_ends)
+            return clocks.block_stamps_from_runs(index_at_ends, perf_at_ends, raw_at_ends)
         index, perf, raw = [], [], []
         for chunk in chunks:
             count = len(chunk[0])
@@ -4010,8 +4013,11 @@ class SessionDataRecorder:
             )
             for name in one_dimensional:
                 # A spool from before the RAW stamp has no such column; the
-                # published file still gets it, unknown throughout.
-                source_dataset = source.get(name)
+                # published file still gets it, unknown throughout. No other
+                # column may be missing: that is a damaged spool, and it fails
+                # here rather than publishing NaN for it.
+                source_dataset = (source.get(name) if name == "block_observation_raw_time"
+                                  else source[name])
                 output_dataset = output.create_dataset(
                     name,
                     shape=(selected_count,),

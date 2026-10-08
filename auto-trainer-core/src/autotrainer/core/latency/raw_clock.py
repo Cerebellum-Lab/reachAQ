@@ -19,7 +19,15 @@ RAW_CLOCK_AVAILABLE = _RAW_CLOCK_ID is not None
 
 
 def monotonic_raw_time() -> float:
-    """Seconds on CLOCK_MONOTONIC_RAW, or NaN where there is none."""
+    """Seconds on CLOCK_MONOTONIC_RAW, or NaN where there is none.
+
+    NaN too when the kernel refuses the read: this is called beside the NI read
+    and the camera latch, outside their error handling, and a stamp is not worth
+    stopping the stream for.
+    """
     if _RAW_CLOCK_ID is None:
         return math.nan
-    return time.clock_gettime(_RAW_CLOCK_ID)
+    try:
+        return time.clock_gettime(_RAW_CLOCK_ID)
+    except OSError:
+        return math.nan

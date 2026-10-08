@@ -1945,3 +1945,52 @@ def test_a_spool_from_before_the_raw_stamp_publishes_the_column_as_nan(tmp_path)
             assert np.isnan(raw[:]).all()
     finally:
         recorder.abort()
+
+
+@pytest.mark.parametrize("missing", ["sample_index", "epoch", "block_observation_perf_time",
+                                     "block_observation_wall_time"])
+def test_a_damaged_spool_fails_loudly_where_only_the_raw_column_may_be_absent(tmp_path, missing):
+    project, ring, recorder = _spool_recorder(tmp_path, 14)
+    try:
+        snapshot = _spool_with_two_reads(recorder, project, ring, raw=True)
+        with h5py.File(snapshot.path, "r+") as spool:
+            del spool[missing]
+
+        # Publishing NaN for a lost sample_index would look like a recording.
+        with pytest.raises(KeyError):
+            SessionDataRecorder._write_nidaq_spool_selection(
+                tmp_path / "selection.h5", 10.0, 100.0, 10.006, snapshot)
+    finally:
+        recorder.abort()
+
+
+def test_block_stamps_from_a_spool_hold_one_column_at_a_time(tmp_path):
+    import tracemalloc
+
+    samples, block = 2_000_000, 167
+    stamps = np.repeat(10.0 + np.arange(samples // block + 1) * 0.0167, block)[:samples]
+    path = tmp_path / "nidaq.h5"
+    with h5py.File(path, "w") as handle:
+        handle.create_dataset("sample_index", data=np.arange(samples, dtype=np.int64))
+        handle.create_dataset("block_observation_perf_time", data=stamps)
+        handle.create_dataset("block_observation_raw_time", data=stamps - 3.0)
+    snapshot = session_data_recorder._NidaqSpoolSnapshot(
+        path=path, channel_names=("cam_frames",), sample_rate_hz=10_000.0, sample_count=samples,
+        first_sample_index=0, last_sample_index=samples - 1, first_perf_time=10.0,
+        last_perf_time=10.0 + samples / 10_000.0, gap_count=0, overrun_samples=0,
+        first_error=None, last_error=None, error_count=0, worker_failed=False)
+    runs = samples // block + 1
+    del stamps
+
+    tracemalloc.start()
+    try:
+        result = SessionDataRecorder._nidaq_block_stamps(snapshot)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+    assert result.end_index.size == runs - 1
+    assert np.allclose(result.raw, result.perf - 3.0)
+    # The perf column is dropped before the RAW column is read: one float64 column
+    # (16 MB here) plus the run bookkeeping, not two.
+    assert peak < 1.5 * samples * 8, f"peak {peak / 1e6:.1f} MB"
