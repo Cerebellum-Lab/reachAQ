@@ -443,7 +443,7 @@ def test_the_piecewise_envelope_follows_ntp_slews_that_one_line_cannot():
     assert np.percentile(np.abs(line_error), 95) > 0.001
 
 
-def test_a_short_session_is_one_window_of_twenty_points_mapped_late_never_early():
+def test_a_short_session_without_polls_is_one_window_of_twenty_points_mapped_late_by_the_floor():
     rng = np.random.default_rng(12)
     host = _slewed_host(-10.0, [])
     ends, seen = _stamped_reads(60.0, host, rng)
@@ -455,7 +455,9 @@ def test_a_short_session_is_one_window_of_twenty_points_mapped_late_never_early(
     probe = np.linspace(ends[0] / 10_000.0, ends[-1] / 10_000.0, 5_000)
     bias = fit.map(probe) - host(probe)
     # Late by the 0.2 ms delivery floor and little more: a fit through the mean
-    # delay (1.7 ms) would pass a 2 ms bound, so the bound is tight.
+    # delay (1.7 ms) would pass a 2 ms bound, so the bound is tight. This holds
+    # within one window with no poll in it; across polls the envelope can be
+    # early (see fit_piecewise_envelope), which is why this does not say never.
     assert bias.min() > 0 and bias.max() < 0.0005
     # 20 envelope points over 60 s pin the drift to a few 1e-7 (seeds 12-21: within 3.2e-7).
     assert fit.drift == pytest.approx(1 - 10e-6, abs=6e-7)

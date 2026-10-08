@@ -458,8 +458,15 @@ def fit_piecewise_envelope(end_index, seen_perf, sample_rate: float, *,
     smallest delay in each bin), with a bin every knot_seconds / ENVELOPE_BINS
     so each knot window holds about 20 of them, and a session shorter than one
     window still has 20. A least-squares fit through them in the hat basis is
-    continuous at every knot. The bias is the same as fit_ni_to_host's: mapped
-    times are late by about the minimum delivery delay.
+    continuous at every knot. The bias is the same as fit_ni_to_host's within
+    one window and with no NTP poll in it: mapped times are late by about the
+    minimum delivery delay. Across polls this is not late-never-early: the
+    host clock's slew curves inside a window and a straight segment through
+    the envelope points cannot follow it, so a mapped time can be early. A 4 h
+    session of NTP polls measured it up to 46 us early and 260 us late at most,
+    inside the 0.36 ms budget. The RAW bridge (fit_ni_to_host_timeline), which
+    fits the envelope on the unslewed RAW clock and adds the slew back from the
+    stamp pairs, is the one that maps late and never early.
     """
     t, seen, problem = _read_pairs(end_index, seen_perf, sample_rate)
     if problem:
