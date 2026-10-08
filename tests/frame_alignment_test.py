@@ -1,6 +1,7 @@
 """The recorder's frame anchor and timeline on the drift-corrected NI-to-host fit
 (docs/superpowers/specs/2026-10-07-frame-alignment-design.md, Verification)."""
 
+import copy
 import csv
 import dataclasses
 import json
@@ -394,11 +395,41 @@ def test_host_times_map_to_ni_sample_indices_through_the_inverse_fit(tmp_path):
     legacy = SessionDataRecorder._pressure_nidaq_indices(host, spool)
     beyond = SessionDataRecorder._pressure_nidaq_indices(
         np.array([float(rig.host(25.0))]), spool, ni_fit=fit)
+    # Before the first stored sample (the spool starts at NI second 0): no match, as at the
+    # other edge.
+    before = SessionDataRecorder._pressure_nidaq_indices(
+        np.array([float(rig.host(-1.0))]), spool, ni_fit=fit)
 
     # The fit maps late by the delivery floor, so the inverse lands 2-3 samples early.
     assert abs(indices[0] - 50_000) <= 4 and abs(indices[1] - 123_456) <= 4
     assert abs(legacy[0] - 50_000) >= 15  # the epoch timeline: 1.65 ms is 16.5 samples off
     assert beyond.tolist() == [-1]
+    assert before.tolist() == [-1]
+
+
+def test_a_host_time_inside_a_sample_index_gap_takes_the_sample_before_the_gap(tmp_path):
+    rig = SyntheticRig()
+    whole = rig.write_spool(tmp_path / "whole.h5", t_from=0.0, t_to=20.0)
+    fit = SessionDataRecorder._fit_nidaq_to_host(whole)
+    assert fit.valid, fit.reason
+    # Samples 60 000-60 999 (NI seconds 6.0-6.1) were never stored, as when the task restarts.
+    with h5py.File(whole.path, "r") as source, h5py.File(tmp_path / "gapped.h5", "w") as target:
+        keep = (source["sample_index"][()] < 60_000) | (source["sample_index"][()] >= 61_000)
+        for name in source:
+            data = source[name][()]
+            target.create_dataset(name, data=data[:, keep] if data.ndim == 2 else data[keep])
+        for key, value in source.attrs.items():
+            target.attrs[key] = value
+    gapped = dataclasses.replace(whole, path=tmp_path / "gapped.h5")
+    host = np.array([float(rig.host(6.05)), float(rig.host(5.0)), float(rig.host(6.5))])
+
+    indices = SessionDataRecorder._pressure_nidaq_indices(host, gapped, ni_fit=fit)
+    legacy = SessionDataRecorder._pressure_nidaq_indices(host, gapped)
+
+    # Inside the window a gap is not looked for: a time in one takes the sample before it.
+    assert indices[0] == legacy[0] == 59_999
+    # And the times either side of it still map by their sample, 2-3 early as above.
+    assert abs(indices[1] - 50_000) <= 4 and abs(indices[2] - 65_000) <= 4
 
 
 def test_the_host_to_ni_lookup_maps_only_the_events_and_builds_nothing_the_length_of_the_spool(
@@ -563,7 +594,13 @@ def test_tones_fall_back_whole_to_the_epoch_timeline_when_the_fit_cannot_map_the
 
     tone = correlate(_FitThatFails(fit))
 
-    assert tone["matched"] == legacy["matched"]
+    # Everything is the epoch answer, with the one difference that the camera anchor was on
+    # the fit and this frame association no longer is: its confidence says so.
+    lowered = copy.deepcopy(legacy["matched"])
+    for match in lowered:
+        assert match["frameAssociation"]["confidence"] == "hardware_edge"
+        match["frameAssociation"]["confidence"] = "ambiguous_hardware_edge"
+    assert tone["matched"] == lowered
     assert tone["hostTimeFallbackReason"] == "MemoryError: out of memory"
     assert "MemoryError" in caplog.text
     # An invalid fit, or none, is no failure here: the epoch timeline as before, and the
@@ -576,17 +613,57 @@ def test_tones_fall_back_whole_to_the_epoch_timeline_when_the_fit_cannot_map_the
     assert "no finite host time" in correlate(fit, useless_rate)["hostTimeFallbackReason"]
 
 
-def test_a_fit_that_fails_only_on_the_transitions_names_no_frame_rather_than_mixing_timelines(
+def test_a_fit_that_fails_only_on_the_transitions_puts_tone_and_frame_whole_on_the_epoch(
     tmp_path, caplog,
 ):
+    # The onset maps (one scalar) and the camera transitions (an array) do not: the tone is
+    # recomputed whole on the epoch timeline rather than left on the fit beside epoch
+    # transitions, and it keeps its frame, which the events.tones rule requires.
     rig, n0, t_tone, fit, correlate, _ = _tone_inputs(tmp_path)
+    legacy = correlate(None)
 
     tone = correlate(_FitThatFails(fit, only_arrays=True))
 
-    match = tone["matched"][0]
-    assert 0.0 < match["physicalEventPerfTime"] - float(rig.host(t_tone)) < 0.0006
-    assert match["frameAssociation"]["status"] == "unavailable"
-    assert match["frameAssociation"]["frameId"] is None
-    assert "MemoryError" in match["frameAssociation"]["reason"]
+    match, frame = tone["matched"][0], tone["matched"][0]["frameAssociation"]
+    assert match["physicalEventPerfTime"] == legacy["matched"][0]["physicalEventPerfTime"]
+    assert frame["status"] == "matched" and frame["frameId"] == rig.frame_id(n0 + 4)
+    assert frame["frameStartPerfTime"] == legacy["matched"][0]["frameAssociation"]["frameStartPerfTime"]
+    assert legacy["matched"][0]["frameAssociation"]["confidence"] == "hardware_edge"
+    assert frame["confidence"] == "ambiguous_hardware_edge"
+    assert tone["hostTimeFallbackReason"] == "MemoryError: out of memory"
     assert "MemoryError" in caplog.text
-    assert "hostTimeFallbackReason" not in tone
+
+
+def test_a_tone_fallback_beside_a_ready_frame_timeline_keeps_its_frame_at_a_lower_confidence(
+    tmp_path, monkeypatch,
+):
+    # The frame timeline is built from the stored fit, so with one ready the tone's frame is
+    # compared against fitted frames and cannot be moved to the epoch with its onset. It keeps
+    # a frame and says what happened: the epoch onset beside fitted frames is flagged, not
+    # presented at the camera anchor's hardware_edge.
+    original_map = clocks.PiecewiseClockFit.map
+
+    def refuse_scalars(self, x):
+        if not np.ndim(x):  # a tone onset; the camera edges and the frame timeline map arrays
+            raise MemoryError("out of memory")
+        return original_map(self, x)
+
+    monkeypatch.setattr(clocks.PiecewiseClockFit, "map", refuse_scalars)
+    model = SyntheticRig()
+    n0 = model.first_edge_at_or_after(5.0)
+    t_tone = float(model.edge_time(n0 + 3)) + 0.0008
+    device_rows = ((float(model.host(t_tone)) + 0.002, 1.7e9, "inbound", "STIMULUS_INPUTS",
+                    "PELLET_DEVICE", "status-1", None, None, json.dumps({"tone1": True})),)
+    rig, project, n0, result = _record(tmp_path, t0=5.0, lag=0.001,
+                                       tone_pulses=((t_tone, 0.005),), device_rows=device_rows)
+
+    tone, camera = result["toneConfirmation"], result["cameraNidaqAlignment"]
+    match, frame = tone["matched"][0], tone["matched"][0]["frameAssociation"]
+    assert tone["status"] == "complete" and len(tone["matched"]) == 1
+    assert tone["hostTimeFallbackReason"] == "MemoryError: out of memory"
+    # The onset is the epoch's: the pulse's sample on the epoch clock, to a sample.
+    assert abs(match["physicalEventPerfTime"] - float(rig.epoch_perf(t_tone))) <= 1 / RATE
+    assert frame["status"] == "matched" and frame["frameId"] is not None
+    assert frame["method"].endswith("nidaq_camera_exposure_timeline_verified_by_writer")
+    assert camera["confidence"] == "hardware_edge"
+    assert frame["confidence"] == "ambiguous_hardware_edge"
