@@ -87,10 +87,16 @@ def _app_version() -> str:
         return ""
 
 
-def _read_h5(path: Path) -> dict:
-    """Every dataset and attribute of a raw stream, retrying while a writer still holds it."""
+def read_raw_stream(path: Path, *, retry_seconds: float = OPEN_RETRY_SECONDS) -> dict:
+    """Every dataset and attribute of a raw stream, retrying while a writer still holds it.
+
+    Also the session recorder's way in: its frame anchor reads the primary
+    camera's stream before this finalizer runs, and the capture process
+    closes that stream with no handshake. The anchor passes a shorter
+    retry_seconds, since it has a fallback and sits on the stop path.
+    """
     import h5py
-    deadline = time.monotonic() + OPEN_RETRY_SECONDS
+    deadline = time.monotonic() + float(retry_seconds)
     while True:
         try:
             with h5py.File(path, "r") as store:
@@ -102,6 +108,9 @@ def _read_h5(path: Path) -> dict:
             if time.monotonic() >= deadline:
                 raise
             time.sleep(0.1)
+
+
+_read_h5 = read_raw_stream
 
 
 def _read_nidaq(path: Path) -> dict:
@@ -118,7 +127,8 @@ def _read_nidaq(path: Path) -> dict:
         rate = float(store.attrs.get("sample_rate_hz", math.nan))
         result = {
             "names": names, "rate": rate,
-            "block_ends": (numpy.empty(0, dtype=numpy.int64), numpy.empty(0)),
+            "block_stamps": clocks.block_stamps_from_runs(numpy.empty(0, dtype=numpy.int64),
+                                                          numpy.empty(0)),
             "transitions": None, "edges": {}, "problems": {},
         }
         if not math.isfinite(rate):
@@ -134,8 +144,11 @@ def _read_nidaq(path: Path) -> dict:
         index = (numpy.arange(first, first + count, dtype=numpy.int64) if consecutive
                  else stored[()])
         seen = store["block_observation_perf_time"][()]
-        result["block_ends"] = clocks.ni_block_ends(index, seen)
-        del seen
+        # Older sessions have no RAW column; the selector then fits perf alone.
+        raw = (store["block_observation_raw_time"][()]
+               if "block_observation_raw_time" in store else None)
+        result["block_stamps"] = clocks.ni_block_stamps(index, seen, raw)
+        del seen, raw
         if consecutive:
             index = None
 
@@ -319,11 +332,13 @@ class _Context:
             record["niToHost"] = self.ni_to_host.as_record()
             record["cameraToNi"] = {"valid": False, "reason": "no NI stream"}
             return
-        ends, seen = ni["block_ends"]
+        stamps = ni["block_stamps"]
         self.ni_to_host = _guarded(
-            "NI-to-host", lambda: clocks.fit_ni_to_host(ends, seen, ni["rate"]))
+            "NI-to-host", lambda: clocks.fit_ni_to_host_timeline(stamps, ni["rate"]))
+        # The knot table is alignment.json's; here only its summary, which
+        # fits an HDF5 attribute and the session metadata.
         record["niToHost"] = {
-            **self.ni_to_host.as_record(),
+            **self.ni_to_host.as_record(include_knots=False),
             "note": "mapped NI times are late by the unmeasured minimum delivery delay",
         }
         transition_index = ni["transitions"]
