@@ -149,7 +149,7 @@ def _read_nidaq(path: Path) -> dict:
         seen = store["block_observation_perf_time"][()]
         # Older sessions have no RAW column; the selector then fits perf alone.
         # A column that is there but unusable costs the RAW bridge, not the file.
-        raw = None
+        raw = column = None
         if "block_observation_raw_time" in store:
             try:
                 column = numpy.asarray(store["block_observation_raw_time"][()], dtype=numpy.float64)
@@ -164,7 +164,8 @@ def _read_nidaq(path: Path) -> dict:
                 logger.warning("nidaq.h5 block_observation_raw_time is unusable (%s); "
                                "fitting the perf stamps alone", result["raw_problem"])
         result["block_stamps"] = clocks.ni_block_stamps(index, seen, raw)
-        del seen, raw
+        # column is the same array as raw: left bound it would outlive both through the scans.
+        del seen, raw, column
         if consecutive:
             index = None
 
