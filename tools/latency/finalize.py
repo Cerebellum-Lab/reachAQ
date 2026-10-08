@@ -14,7 +14,7 @@ import logging
 import math
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 import numpy
 
@@ -87,16 +87,19 @@ def _app_version() -> str:
         return ""
 
 
-def read_raw_stream(path: Path, *, retry_seconds: float = OPEN_RETRY_SECONDS) -> dict:
+def read_raw_stream(path: Path, *, retry_seconds: Optional[float] = None) -> dict:
     """Every dataset and attribute of a raw stream, retrying while a writer still holds it.
 
     Also the session recorder's way in: its frame anchor reads the primary
     camera's stream before this finalizer runs, and the capture process
     closes that stream with no handshake. The anchor passes a shorter
-    retry_seconds, since it has a fallback and sits on the stop path.
+    retry_seconds, since it has a fallback and sits on the stop path. None
+    means OPEN_RETRY_SECONDS as it is when the call is made (a default bound
+    at import would ignore a test's monkeypatch of it).
     """
     import h5py
-    deadline = time.monotonic() + float(retry_seconds)
+    budget = OPEN_RETRY_SECONDS if retry_seconds is None else retry_seconds
+    deadline = time.monotonic() + float(budget)
     while True:
         try:
             with h5py.File(path, "r") as store:
@@ -118,7 +121,7 @@ def _read_nidaq(path: Path) -> dict:
 
     An hour at 10 kHz is tens of millions of samples per channel, and this runs
     inside the live app's finalization, so nothing sample-sized outlives its
-    use: the block end times, the camera line's transitions and each laser
+    use: the block stamps, the camera line's transitions and each laser
     channel's edges are kept, and the samples they came from are dropped.
     """
     import h5py
@@ -129,7 +132,7 @@ def _read_nidaq(path: Path) -> dict:
             "names": names, "rate": rate,
             "block_stamps": clocks.block_stamps_from_runs(numpy.empty(0, dtype=numpy.int64),
                                                           numpy.empty(0)),
-            "transitions": None, "edges": {}, "problems": {},
+            "transitions": None, "edges": {}, "problems": {}, "raw_problem": "",
         }
         if not math.isfinite(rate):
             return result
@@ -145,8 +148,21 @@ def _read_nidaq(path: Path) -> dict:
                  else stored[()])
         seen = store["block_observation_perf_time"][()]
         # Older sessions have no RAW column; the selector then fits perf alone.
-        raw = (store["block_observation_raw_time"][()]
-               if "block_observation_raw_time" in store else None)
+        # A column that is there but unusable costs the RAW bridge, not the file.
+        raw = None
+        if "block_observation_raw_time" in store:
+            try:
+                column = numpy.asarray(store["block_observation_raw_time"][()], dtype=numpy.float64)
+                if column.shape == seen.shape:
+                    raw = column
+                else:
+                    result["raw_problem"] = (f"{column.size} values against {seen.size} "
+                                             "block_observation_perf_time stamps")
+            except Exception as error:
+                result["raw_problem"] = _describe(error)
+            if result["raw_problem"]:
+                logger.warning("nidaq.h5 block_observation_raw_time is unusable (%s); "
+                               "fitting the perf stamps alone", result["raw_problem"])
         result["block_stamps"] = clocks.ni_block_stamps(index, seen, raw)
         del seen, raw
         if consecutive:
@@ -193,7 +209,7 @@ def _frame_period(frames) -> float:
         return math.nan
 
 
-def _guarded(name: str, fit) -> clocks.ClockFit:
+def _guarded(name: str, fit) -> Union[clocks.ClockFit, clocks.PiecewiseClockFit]:
     """A fit that raised is an invalid fit with the exception as its reason."""
     try:
         return fit()
@@ -283,6 +299,9 @@ class _Context:
         if nidaq_path.is_file():
             try:
                 self.nidaq = _read_nidaq(nidaq_path)
+                if self.nidaq["raw_problem"]:
+                    status["reasons"].append(
+                        f"nidaq.h5 RAW stamps unusable: {self.nidaq['raw_problem']}")
             except Exception as error:
                 logger.exception("nidaq.h5 could not be read for the latency record")
                 self.faults["nidaq"] = _describe(error)

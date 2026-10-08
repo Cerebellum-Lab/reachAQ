@@ -651,9 +651,34 @@ def test_the_raw_stream_reader_is_public_and_retries(tmp_path, monkeypatch):
 
     assert len(data["frames"]) == 3 and data["attrs"]["camera"] == "left"
     assert finalize._read_h5 is finalize.read_raw_stream
+    started = time.monotonic()
     with pytest.raises(OSError):
         finalize.read_raw_stream(tmp_path / "missing.h5")
+    # The module's budget is read when the call is made: the 0.2 s patched in above, not the
+    # 5 s the default would have bound at import (which also made every patched test slow).
+    assert time.monotonic() - started < 2.0
     started = time.monotonic()
     with pytest.raises(OSError):
         finalize.read_raw_stream(tmp_path / "missing.h5", retry_seconds=0.05)
     assert time.monotonic() - started < 0.15  # the caller's budget, not the module's
+
+
+@pytest.mark.parametrize("damage", ["truncated", "not_numbers"])
+def test_a_malformed_raw_column_costs_the_bridge_not_the_whole_nidaq_file(tmp_path, damage):
+    session = _session(tmp_path, raw=True)
+    with h5py.File(session / "streams" / "nidaq.h5", "r+") as store:
+        column = store["block_observation_raw_time"][()]
+        del store["block_observation_raw_time"]
+        store.create_dataset("block_observation_raw_time",
+                             data=column[:100] if damage == "truncated"
+                             else np.full(column.shape, b"abc"))
+
+    status = finalize_session_latency(session, primary_camera="left")
+
+    ni = status["clocks"]["niToHost"]
+    assert ni["valid"] and ni["method"] == "piecewise_envelope", ni
+    assert status["loops"]["hardware"]["status"] == "complete", status["loops"]["hardware"]
+    assert status["clocks"]["cameraToNi"]["valid"] is True
+    assert any(reason.startswith("nidaq.h5 RAW stamps unusable: ") for reason in status["reasons"])
+    assert not any("nidaq.h5 unreadable" in reason for reason in status["reasons"])
+    assert status["status"] == "partial"  # a reason caps the session; the loops themselves are whole
