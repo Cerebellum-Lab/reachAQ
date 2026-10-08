@@ -208,17 +208,30 @@ def _counting_perf(monkeypatch, events):
     monkeypatch.setattr(spinnaker_cam.time, "perf_counter", perf)
 
 
-def test_latch_clock_brackets_the_latch_and_reads_the_value_after_it(monkeypatch):
+def _counting_raw(monkeypatch, events):
+    ticks = iter(range(1, 1_000_000))
+
+    def raw():
+        value = 5000.0 + next(ticks) * 0.001
+        events.append(("raw", value))
+        return value
+
+    monkeypatch.setattr(spinnaker_cam, "monotonic_raw_time", raw)
+
+
+def test_latch_clock_brackets_the_latch_on_both_clocks_and_reads_the_value_after_it(monkeypatch):
     events = []
     camera = _latching_camera(monkeypatch, {"TimestampLatch": _LatchCommand(events),
                                             "TimestampLatchValue": _LatchValue(events)})
     _counting_perf(monkeypatch, events)
+    _counting_raw(monkeypatch, events)
 
     latch = camera.latch_clock()
 
-    assert events == [("perf", 1000.001), "execute", ("perf", 1000.002), "read"]
-    assert latch == (1000.001, 123_456_789_000, 1000.002)
-    assert latch[0] <= latch[2]
+    # The RAW pair sits inside the perf pair, so both brackets hold the latch.
+    assert events == [("perf", 1000.001), ("raw", 5000.001), "execute",
+                      ("raw", 5000.002), ("perf", 1000.002), "read"]
+    assert latch == (1000.001, 123_456_789_000, 1000.002, 5000.001, 5000.002)
 
 
 @pytest.mark.parametrize("missing", ["TimestampLatch", "TimestampLatchValue", "inaccessible"])

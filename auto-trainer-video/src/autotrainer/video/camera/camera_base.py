@@ -169,12 +169,14 @@ class CameraBase:
 
         return None, self._last_when
 
-    def latch_clock(self) -> Optional[Tuple[float, int, float]]:
+    def latch_clock(self) -> Optional[Tuple[float, int, float, float, float]]:
         """ Latches the camera's timestamp clock between two host perf_counter reads.
 
-        Returns (perf before, camera timestamp in ns, perf after), on the clock
-        capture() timestamps come from, or None for a camera with no such clock.
-        Must not raise. Called on the capture thread only.
+        Returns (perf before, camera timestamp in ns, perf after, RAW before,
+        RAW after), on the clock capture() timestamps come from, or None for a
+        camera with no such clock. The RAW pair is CLOCK_MONOTONIC_RAW taken
+        just inside the perf pair, NaN where the host has none. Must not raise.
+        Called on the capture thread only.
         """
         return None
 
