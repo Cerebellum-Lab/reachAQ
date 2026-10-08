@@ -1832,3 +1832,116 @@ def test_no_matching_channel_returns_an_empty_block(tmp_path):
 
     assert names == ()
     assert values.shape == (0, len(indices))
+
+
+def _spool_recorder(tmp_path, session):
+    project = ProjectInfo(root=str(tmp_path), device_id="test",
+                          when=datetime(2026, 1, 2, 3, 4, 5), session=session)
+    ring = SimpleNamespace(channel_names=("barcode",), capacity=16, sample_rate_hz=1000.0)
+    recorder = SessionDataRecorder(SimpleNamespace(sample_ring=ring), _EventSource("trace_received"))
+    return project, ring, recorder
+
+
+def _spool_with_two_reads(recorder, project, ring, *, raw):
+    """Two recorder copies into the spool, as _copy_nidaq_once makes them. The caller
+    keeps the recorder until its finally: abort() (and close()) remove the spool file,
+    as test_nidaq_spool_is_incremental_and_final_output_is_boundary_clipped shows."""
+    with recorder._lock:
+        recorder._project = project
+        recorder._metadata_generation_id = f"{project.short_id}-g1"
+        recorder._open_nidaq_spool_locked()
+        for first, stamp, raw_stamp in ((0, 10.002, 7.002), (4, 10.006, 7.006)):
+            read = {"epoch": 1, "source_perf_time": stamp, "source_wall_time": stamp + 90.0,
+                    "gap_count": 0, "overrun_samples": 0}
+            if raw:
+                read["source_raw_time"] = raw_stamp
+            recorder._append_nidaq_spool_locked(
+                np.arange(first, first + 4, dtype=np.int64),
+                9.999 + np.arange(first, first + 4) / 1000.0,
+                99.999 + np.arange(first, first + 4) / 1000.0,
+                np.array(((0.0, 1.0, 0.0, 1.0),), dtype=np.float32),
+                ring.channel_names,
+                SimpleNamespace(**read),
+            )
+        recorder._close_nidaq_spool_locked()
+        return recorder._snapshot_nidaq_locked()
+
+
+def test_the_spool_and_the_published_nidaq_carry_the_raw_stamp_of_each_read(tmp_path):
+    project, ring, recorder = _spool_recorder(tmp_path, 11)
+    try:
+        snapshot = _spool_with_two_reads(recorder, project, ring, raw=True)
+        with h5py.File(snapshot.path, "r") as spool:
+            assert spool["block_observation_raw_time"][:].tolist() == [7.002] * 4 + [7.006] * 4
+        stamps = SessionDataRecorder._nidaq_block_stamps(snapshot)
+        assert stamps.end_index.tolist() == [3]
+        assert stamps.perf.tolist() == [10.006] and stamps.raw.tolist() == [7.006]
+
+        SessionDataRecorder._write_session(project, 10.0, 100.0, 10.006, (), (), (), snapshot)
+
+        streams = tmp_path / "20260102" / "test" / "session011" / "streams"
+        with h5py.File(streams / "nidaq.h5", "r") as published:
+            raw = published["block_observation_raw_time"][:]
+            assert raw.shape == published["block_observation_perf_time"].shape
+            # Sample 0 (perf 9.999) lies before the boundary and is not published.
+            assert raw.tolist() == [7.002] * 3 + [7.006] * 4
+    finally:
+        recorder.abort()
+
+
+def test_a_read_without_a_raw_stamp_spools_nan(tmp_path):
+    project, ring, recorder = _spool_recorder(tmp_path, 12)
+    try:
+        snapshot = _spool_with_two_reads(recorder, project, ring, raw=False)
+        with h5py.File(snapshot.path, "r") as spool:
+            assert np.isnan(spool["block_observation_raw_time"][:]).all()
+        stamps = SessionDataRecorder._nidaq_block_stamps(snapshot)
+        assert stamps.perf.tolist() == [10.006] and np.isnan(stamps.raw).all()
+    finally:
+        recorder.abort()
+
+
+def test_chunk_tuples_carry_raw_at_position_eleven(tmp_path):
+    project = ProjectInfo(root=str(tmp_path), device_id="test",
+                          when=datetime(2026, 1, 2, 3, 4, 5), session=12)
+    chunks = tuple(
+        (np.arange(first, first + 4, dtype=np.int64),
+         9.999 + np.arange(first, first + 4) / 1000.0,
+         99.999 + np.arange(first, first + 4) / 1000.0,
+         np.zeros((1, 4), dtype=np.float32), ("barcode",), 1000.0, 1, 0, 0,
+         stamp, stamp + 90.0, raw_stamp)
+        for first, stamp, raw_stamp in ((0, 10.002, 7.002), (4, 10.006, 7.006))
+    )
+    stamps = SessionDataRecorder._nidaq_block_stamps(chunks)
+    assert stamps.end_index.tolist() == [3] and stamps.raw.tolist() == [7.006]
+    old_style = tuple(chunk[:9] for chunk in chunks)
+    # Nine-element chunks carry no stamps at all, so there is no pair to keep.
+    assert SessionDataRecorder._nidaq_block_stamps(old_style).perf.size == 0
+
+    SessionDataRecorder._write_session(project, 10.0, 100.0, 10.006, (), (), (), chunks)
+
+    streams = tmp_path / "20260102" / "test" / "session012" / "streams"
+    with h5py.File(streams / "nidaq.h5", "r") as published:
+        # _write_nidaq keeps perf in [10.0, 10.006]: sample 0 at 9.999 is dropped.
+        assert published["block_observation_raw_time"][:].tolist() == [7.002] * 3 + [7.006] * 4
+
+
+def test_a_spool_from_before_the_raw_stamp_publishes_the_column_as_nan(tmp_path):
+    project, ring, recorder = _spool_recorder(tmp_path, 13)
+    try:
+        snapshot = _spool_with_two_reads(recorder, project, ring, raw=True)
+        with h5py.File(snapshot.path, "r+") as spool:
+            del spool["block_observation_raw_time"]
+        stamps = SessionDataRecorder._nidaq_block_stamps(snapshot)
+        assert stamps.perf.tolist() == [10.006] and np.isnan(stamps.raw).all()
+
+        SessionDataRecorder._write_session(project, 10.0, 100.0, 10.006, (), (), (), snapshot)
+
+        streams = tmp_path / "20260102" / "test" / "session013" / "streams"
+        with h5py.File(streams / "nidaq.h5", "r") as published:
+            raw = published["block_observation_raw_time"]
+            assert raw.dtype == np.float64
+            assert raw.shape == published["block_observation_perf_time"].shape == (7,)
+            assert np.isnan(raw[:]).all()
+    finally:
+        recorder.abort()
