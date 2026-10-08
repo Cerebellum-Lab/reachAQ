@@ -780,6 +780,9 @@ class AppModel(ObservableObject):
         self._aborting_project: Optional[ProjectInfo] = None
         self._aborted_session_ids = set()
         self._abort_had_recording_started = False
+        # Why live inference stopped during the current recording, if it did:
+        # its live pose files then end there, closed by the inference stop.
+        self._live_inference_failed_reason: Optional[str] = None
         self._abort_cleanup_timer = no_op_timer
         self._record_start_timer = no_op_timer
         self._writer_close_timer = no_op_timer
@@ -1592,6 +1595,7 @@ class AppModel(ObservableObject):
             reason="no completed pellet trial pending",
         )
         self._abort_had_recording_started = False
+        self._live_inference_failed_reason = None
         try:
             self._session_data_recorder.arm(
                 project,
@@ -2741,6 +2745,22 @@ class AppModel(ObservableObject):
                         None,
                     )
                     if (
+                        self._abort_had_recording_started
+                        and self._live_inference_failed_reason
+                    ):
+                        # The pose files were closed when inference stopped,
+                        # and end there; no end-of-recording marker reached
+                        # them, so waiting for one could only time out.
+                        message = (
+                            "Live pose ends early: live inference stopped during "
+                            f"the recording ({self._live_inference_failed_reason})."
+                        )
+                        logger.error(message)
+                        self._session_data_recorder.set_source_result(
+                            "pose",
+                            failure=message,
+                        )
+                    elif (
                         wait_pose_closed is not None
                         and self._abort_had_recording_started
                         and not wait_pose_closed(
@@ -9858,6 +9878,8 @@ class AppModel(ObservableObject):
             subsystem_key,
             reason,
         )
+        if subsystem_key == SubsystemId.LIVE_INFERENCE:
+            self._live_inference_failed_reason = reason
 
     def _on_intersession_property_changed(self, name, value, _):
         if name == IntersessionMachine.Properties.STATE_PROPERTY:

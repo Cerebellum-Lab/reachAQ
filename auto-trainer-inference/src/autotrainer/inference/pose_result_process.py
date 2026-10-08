@@ -464,6 +464,29 @@ class InferenceMonitorDataProc(multiprocessing.Process):
             if closer is not None:
                 pose_latency_closers.append(closer)
 
+        def close_live_recording(columns):
+            # Normally on the end-of-recording marker. Also when the loop ends
+            # mid-recording - live inference stopped, so no marker will come -
+            # or the poses since the last batch write, up to 5 s, are lost.
+            nonlocal recording_in_progress, cams_frame_idx_fhs
+            recording_in_progress = False
+            _close_fhs(cams_frame_idx_fhs)
+            cams_frame_idx_fhs = None
+            close_pose_latency_in_background()
+            for cam_pose_path, cam_indices, cam_h5_live in zip(pose_paths, cur_cams_indices, cur_h5_live_batch):
+                if len(cam_h5_live) == 0:
+                    continue
+                write_duration = write_h5_batch(cam_pose_path, cam_h5_live, cam_indices,
+                                                columns=columns)
+                writes_h5_live_durations.append(write_duration)
+            #
+            logger.debug("setting stop_recorded event")
+            self._stop_recorded.set()  # this is for the feeder thread to know when it can open the data files
+            self._send_msg(
+                InferenceMonitorDataMsg.LIVE_RECORDING_CLOSED,
+                cur_local_prj,
+            )
+
         def get_next_pose_data(timeout: Optional[float] = 0.25):
             nonlocal pose_data
             prev_pose_data = pose_data
@@ -734,25 +757,9 @@ class InferenceMonitorDataProc(multiprocessing.Process):
                 # this condition allows to know when to close/stopping writing to live files,
                 # and reopen for offline mode
                 if (frames_indices[:, 0] == FrameIndexCategory.EOF_RECORDING).any():
-                    recording_in_progress = False
                     logger.notice("Detected stop of recording in progress ; mode=%s prev=%s frames_indices=%s",
                                   mode, prev_mode, frames_indices.tolist())
-                    _close_fhs(cams_frame_idx_fhs)
-                    cams_frame_idx_fhs = None
-                    close_pose_latency_in_background()
-                    for cam_pose_path, cam_indices, cam_h5_live in zip(pose_paths, cur_cams_indices, cur_h5_live_batch):
-                        if len(cam_h5_live) == 0:
-                            continue
-                        write_duration = write_h5_batch(cam_pose_path, cam_h5_live, cam_indices,
-                                                        columns=pose_algo.pose_result_columns)
-                        writes_h5_live_durations.append(write_duration)
-                    #
-                    logger.debug("setting stop_recorded event")
-                    self._stop_recorded.set()  # this is for the feeder thread to know when it can open the data files
-                    self._send_msg(
-                        InferenceMonitorDataMsg.LIVE_RECORDING_CLOSED,
-                        cur_local_prj,
-                    )
+                    close_live_recording(pose_algo.pose_result_columns)
 
             if (
                 pose_latency is not None
@@ -961,6 +968,15 @@ class InferenceMonitorDataProc(multiprocessing.Process):
                                  mode, type(pose_data), err)
 
         # end while self._is_running
+        if recording_in_progress:
+            # Live inference stopped during the recording, so no
+            # end-of-recording marker will come to close the live files.
+            logger.warning("closing the live pose files of %s: inference stopped mid-recording",
+                           cur_local_prj)
+            try:
+                close_live_recording(self._pose_algo.pose_result_columns)
+            except Exception:
+                logger.exception("could not close the live pose files")
         # Here the close is waited on: nothing runs after this, and the file
         # must be closed before the process ends.
         if pose_latency is not None:
