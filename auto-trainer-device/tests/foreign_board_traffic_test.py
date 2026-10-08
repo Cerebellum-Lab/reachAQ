@@ -84,3 +84,18 @@ def test_pellet_frames_are_unaffected():
 
     assert isinstance(translated, Heartbeat)
     assert translated.target == Target.PELLET_DEVICE
+
+
+@pytest.mark.parametrize("message_type", [
+    JerryCANCmdType.SYNC_CLAP,
+    JerryCANCmdType.SYNC_CLAP_OBSERVED,
+    JerryCANCmdType.SYNC_BARCODE,
+    JerryCANCmdType.ANALOG_BLOCK,
+    JerryCANCmdType.PWM_SET,
+])
+def test_sync_and_io_types_from_the_pellet_arrive_silently(message_type, caplog):
+    with caplog.at_level(logging.WARNING):
+        translated = _interface()._translate(_message(message_type, PELLET_ADDRESS))
+
+    assert translated is None
+    assert "Unhandled message type" not in caplog.text

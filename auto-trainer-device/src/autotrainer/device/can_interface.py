@@ -490,6 +490,13 @@ class CanInterface(DeviceInterface):
             "TIME_SYNC_REQUEST": no_op,
             "CAPABILITIES_REQUEST": no_op,
             "GPIO_PULSE": no_op,
+            # Clock-chain and IO-module traffic. Received and dropped until the
+            # clock chain (T3) and the IO-module driver consume them.
+            "SYNC_CLAP": no_op,
+            "SYNC_CLAP_OBSERVED": no_op,
+            "SYNC_BARCODE": no_op,
+            "ANALOG_BLOCK": no_op,
+            "PWM_SET": no_op,
         }
         for name, handler in optional_handlers.items():
             kind = getattr(cmd_type, name, None)
