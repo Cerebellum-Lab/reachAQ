@@ -589,7 +589,9 @@ def test_camera_and_tone_edges_are_correlated_on_nidaq_timeline(tmp_path):
 
     camera = result["cameraNidaqAlignment"]
     assert camera["status"] == "matched"
-    assert camera["confidence"] == "hardware_edge"
+    # Chunks without block stamps give no fit, so the epoch method runs, flagged as such.
+    assert camera["confidence"] == "ambiguous_hardware_edge"
+    assert camera["anchorMethod"] == "epoch_nearest_edge"
     assert camera["matchedSampleIndex"] == 101
     assert camera["signedOffsetSeconds"] == 0.0
     assert camera["edgePolarity"] == "rising"
@@ -630,7 +632,7 @@ def test_camera_and_tone_edges_are_correlated_on_nidaq_timeline(tmp_path):
     )
     assert alignment["canonicalBoundary"]["primaryFrameId"] == 42
     assert alignment["canonicalBoundary"]["nidaqSampleIndex"] == 101
-    assert alignment["schemaVersion"] == 2
+    assert alignment["schemaVersion"] == 3
 
 
 def test_all_structured_events_receive_recorded_frame_alignment(tmp_path):
@@ -927,7 +929,8 @@ def test_camera_alignment_matches_falling_square_wave_transition():
     )
 
     assert alignment["status"] == "matched"
-    assert alignment["confidence"] == "hardware_edge"
+    assert alignment["confidence"] == "ambiguous_hardware_edge"
+    assert alignment["anchorMethod"] == "epoch_nearest_edge"
     assert alignment["matchedSampleIndex"] == 202
     assert alignment["signedOffsetSeconds"] == 0.0
     assert alignment["edgePolarity"] == "falling"
@@ -1994,3 +1997,24 @@ def test_block_stamps_from_a_spool_hold_one_column_at_a_time(tmp_path):
     # The perf column is dropped before the RAW column is read: one float64 column
     # (16 MB here) plus the run bookkeeping, not two.
     assert peak < 1.5 * samples * 8, f"peak {peak / 1e6:.1f} MB"
+
+
+def test_camera_exposures_given_at_arm_reach_finalization(tmp_path, monkeypatch):
+    captured = {}
+    monkeypatch.setattr(SessionDataRecorder, "_write_session",
+                        staticmethod(lambda **snapshot: captured.update(snapshot) or {}))
+    project = ProjectInfo(root=str(tmp_path), device_id="test",
+                          when=datetime(2026, 1, 2, 3, 4, 5), session=13)
+    ring = SimpleNamespace(channel_names=(), capacity=1, sample_rate_hz=1000.0,
+                           copy_since=lambda last, destination: None)
+    laser = _EventSource("trace_received")
+    laser.configuration = SimpleNamespace(backend="disabled")
+    recorder = SessionDataRecorder(SimpleNamespace(sample_ring=ring, timing_plan=None), laser)
+    try:
+        recorder.arm(project, camera_exposure_seconds={"left": 1.75e-4, "right": 1.75e-4})
+        recorder.commit_start(10.0, 100.0)
+        recorder.stop(11.0)
+    finally:
+        recorder.close()
+
+    assert captured["camera_exposure_seconds"] == {"left": 1.75e-4, "right": 1.75e-4}
