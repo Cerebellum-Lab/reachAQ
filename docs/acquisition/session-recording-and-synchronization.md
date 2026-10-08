@@ -256,11 +256,13 @@ channel-by-sample and follows the `channel_names` attribute. File attributes
 include the recording boundaries, sample rate, epoch, gap/overrun counts,
 source clock, and serialized timing plan. `perf_time` is derived from the
 sample-index epoch and carries the epoch's offset and the NI clock's drift.
-The block-observation times are the stamps taken before each NI read
-(`perf_time` on `time.perf_counter`, `raw_time` on `CLOCK_MONOTONIC_RAW`, NaN
-where the host has no such clock); the NI-to-host fit stored in
-`alignment.json` (`cameraNidaqAlignment.niToHost`) is built from them, and
-every host time derived from an NI sample goes through that fit.
+The block-observation times are the stamps taken before each NI read:
+`block_observation_perf_time` on `time.perf_counter` and
+`block_observation_raw_time` on `CLOCK_MONOTONIC_RAW` (NaN where the host has
+no such clock, or the file predates it). The NI-to-host fit (NI sample time to
+host `perf_counter`) is built from these two columns, not from `perf_time`; it
+is what `alignment.json` stores as `cameraNidaqAlignment.niToHost`, and the
+host times that file derives from NI samples go through it.
 
 The NI-DAQ epoch is anchored once. Later block delivery time does not reconstruct
 each block independently, so host scheduling jitter cannot create backward
