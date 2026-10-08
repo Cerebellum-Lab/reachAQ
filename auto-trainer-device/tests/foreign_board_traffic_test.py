@@ -46,9 +46,16 @@ def _message(message_type, address):
     JerryCANCmdType.TIME_SYNC_RESPONSE,
     JerryCANCmdType.CAPABILITIES_RESPONSE,
     JerryCANCmdType.GPIO_PULSE_STATUS,
+    JerryCANCmdType.ACKNOWLEDGE,
 ])
 def test_foreign_board_frame_translates_to_nothing(message_type):
     assert _interface()._translate(_message(message_type, IO_MODULE_ADDRESS)) is None
+
+
+def test_lowest_foreign_board_address_is_dropped():
+    # 0x04 is board type 1 (bit 2 only): a board-type shift of 3 reads it as
+    # the pellet's type 0.
+    assert _interface()._translate(_message(JerryCANCmdType.HEARTBEAT, 0x04)) is None
 
 
 def test_read_keeps_pellet_frames_when_a_foreign_board_shares_the_batch():
@@ -79,8 +86,9 @@ def test_foreign_board_is_logged_once_per_address(caplog):
     assert len(notices) == 2
 
 
-def test_pellet_frames_are_unaffected():
-    translated = _interface()._translate(_message(JerryCANCmdType.HEARTBEAT, PELLET_ADDRESS))
+@pytest.mark.parametrize("address", [PELLET_ADDRESS, 0x03])  # board type 0: nodes 0 and 3
+def test_pellet_frames_are_unaffected(address):
+    translated = _interface()._translate(_message(JerryCANCmdType.HEARTBEAT, address))
 
     assert isinstance(translated, Heartbeat)
     assert translated.target == Target.PELLET_DEVICE

@@ -341,9 +341,10 @@ def _pellet_heartbeat():
     return _raw_message(JerryCANCmdType.HEARTBEAT << 5, b"\xff\0")
 
 
-def test_receive_skips_undecodable_frame_from_another_board_and_keeps_reading():
+@pytest.mark.parametrize("address", [0x08, 0x04])  # board types 2 and 1; 0x04 is bit 2 only
+def test_receive_skips_undecodable_frame_from_another_board_and_keeps_reading(address):
     backend = SocketCanJerryCAN(CanTransportConfiguration(kind="socketcan", fd=True))
-    backend._bus = FakeBus([_malformed_analog_block(0x08), _pellet_heartbeat()])
+    backend._bus = FakeBus([_malformed_analog_block(address), _pellet_heartbeat()])
 
     messages = backend.ReceiveMessages(max_count=1, collect_ms=5000)
 
@@ -352,13 +353,14 @@ def test_receive_skips_undecodable_frame_from_another_board_and_keeps_reading():
     assert backend._bus.messages == []
 
 
-def test_receive_still_fails_on_undecodable_frame_from_the_pellet(monkeypatch):
+@pytest.mark.parametrize("address", [0x00, 0x03])  # board type 0: nodes 0 and 3
+def test_receive_still_fails_on_undecodable_frame_from_the_pellet(monkeypatch, address):
     monkeypatch.setattr(
         "autotrainer.device.can_diagnostics.capture_can_diagnostics",
         lambda channel: {"channel": channel},
     )
     backend = SocketCanJerryCAN(CanTransportConfiguration(kind="socketcan", fd=True))
-    backend._bus = FakeBus([_malformed_analog_block(0x00), _pellet_heartbeat()])
+    backend._bus = FakeBus([_malformed_analog_block(address), _pellet_heartbeat()])
 
     with pytest.raises(CanTransportReadError) as raised:
         backend.ReceiveMessages(max_count=1, collect_ms=5000)

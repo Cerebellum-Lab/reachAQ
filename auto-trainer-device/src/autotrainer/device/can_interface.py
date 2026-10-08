@@ -1677,11 +1677,12 @@ class CanInterface(DeviceInterface):
     def _ignore_foreign_board(self, address: int) -> None:
         """Skip traffic from a board this host has no driver for.
 
-        Every handler resolves its target through _addr2tgt, which raises for
-        any non-pellet address, and read() translates a whole batch at once -
-        so a single frame from another board used to discard the pellet frames
-        read with it. Logged once per address: an IO board streams hundreds of
-        frames a second.
+        Most handlers resolve their target through _addr2tgt, which raises for
+        any non-pellet address, and ACKNOWLEDGE matches by uuid alone, so a
+        foreign ACK could confirm a pellet command. read() translates a whole
+        batch at once, so a single frame from another board used to discard
+        the pellet frames read with it. Logged once per address: an IO board
+        streams hundreds of frames a second.
         """
         if address in self._foreign_board_addresses:
             return
