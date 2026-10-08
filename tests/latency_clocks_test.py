@@ -532,3 +532,16 @@ def test_ni_block_stamps_carry_raw_beside_perf():
     assert stamps.raw.tolist() == [12.0, 13.0]
     assert np.isnan(without.raw).all() and without.raw.shape == (2,)
     assert clocks.run_ends(perf).tolist() == [3, 6, 9]
+
+
+def test_a_span_of_whole_windows_leaves_no_sliver_window_at_the_end():
+    # numpy.arange(first, last, 120) can reach `last` itself, or a rounding step past it,
+    # when the span is a whole number of windows. That knot must not survive as a zero or
+    # negative window: np.histogram rejects it (ValueError), and finalization must not raise.
+    rate = 1000.0
+    total = 7 * 120 * 1000
+    for first in range(16336800, 16336830):
+        ends = np.unique(np.append(np.arange(first, first + total, total // 400), first + total))
+        fit = clocks.fit_piecewise_envelope(ends, 1000.0 + ends / rate + 0.001, rate)
+        assert fit.valid, (first, fit.reason)
+        assert fit.knots.size == 8 and np.all(np.diff(fit.knots) > 100.0), first

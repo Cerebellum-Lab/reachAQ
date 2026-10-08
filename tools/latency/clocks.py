@@ -432,8 +432,10 @@ def fit_piecewise_envelope(end_index, seen_perf, sample_rate: float, *,
         return invalid_piecewise_fit("the read pairs span no time")
     picks = _envelope_picks(t, seen, min(knot_seconds, span) / ENVELOPE_BINS)
     x, y = t[picks], seen[picks]
-    knots = _merge_sparse_windows(numpy.append(numpy.arange(t[0], t[-1], knot_seconds), t[-1]),
-                                  x, MIN_WINDOW_POINTS)
+    # arange can reach t[-1] itself, or a rounding step past it, when the span is a
+    # whole number of windows; only knots strictly inside make a real last window.
+    inner = numpy.arange(t[0], t[-1], knot_seconds)
+    knots = _merge_sparse_windows(numpy.append(inner[inner < t[-1]], t[-1]), x, MIN_WINDOW_POINTS)
     needed = ENVELOPE_BINS // 2
     for attempt in range(2):
         if x.size < max(needed, knots.size):
