@@ -7,6 +7,7 @@ import json
 import tracemalloc
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import h5py
 import numpy as np
@@ -65,7 +66,10 @@ def test_the_anchor_is_the_first_frames_own_edge_where_the_epoch_method_took_the
     assert camera["matchedSampleIndex"] == rig.edge_sample(n0)
     assert camera["status"] == "matched" and camera["confidence"] == "hardware_edge"
     assert camera["anchorMethod"] == "camera_latch" and camera["anchorsAgree"] is True
-    assert 0.0015 <= camera["impliedLagSeconds"] <= 0.0021
+    # The implied lag is the true 1.75 ms less the fit's lateness, the synthetic's
+    # documented 0.2-0.3 ms bias. A 1.5 ms bound left 8-68 us over the seeds, inside that
+    # bias; 1.45 ms leaves 58-118 us.
+    assert 0.00145 <= camera["impliedLagSeconds"] <= 0.0021
     assert camera["niToHost"]["valid"] and camera["niToHost"]["method"] == "piecewise_envelope"
     assert _alignment(project)["canonicalBoundary"]["nidaqSampleIndex"] == rig.edge_sample(n0)
 
@@ -140,6 +144,92 @@ def test_a_latch_anchor_that_disagrees_with_the_expected_lag_is_kept_but_flagged
     assert camera["anchorsAgree"] is False
     assert camera["confidence"] == "ambiguous_hardware_edge"
     assert "disagree" in camera["reason"] and "outside the gate" in camera["reason"]
+
+
+def test_a_fitted_anchor_that_raises_says_so_and_does_not_blame_the_fit(tmp_path, monkeypatch):
+    def broken(*arguments, **keywords):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(SessionDataRecorder, "_match_camera_nidaq_edge_on_fit",
+                        staticmethod(broken))
+    rig, project, n0, result = _record(tmp_path, t0=5.0, lag=0.001)
+
+    camera = result["cameraNidaqAlignment"]
+    assert camera["status"] == "matched" and camera["anchorMethod"] == "epoch_nearest_edge"
+    assert camera["confidence"] == "ambiguous_hardware_edge"
+    assert camera["reason"].startswith("fitted anchor failed (RuntimeError: boom); ")
+    assert "fit unavailable" not in camera["reason"]
+    # The fit is fine and stays in the record: the frame timeline maps through it.
+    assert camera["niToHost"]["valid"] is True
+    # The no-fit reason is unchanged.
+    rig, project, n0, result = _record(tmp_path / "no_stamps", t0=5.0, lag=0.001, stamps=False)
+    assert result["cameraNidaqAlignment"]["reason"].startswith("NI-to-host fit unavailable (")
+
+
+def test_a_latency_stream_that_cannot_be_looked_for_costs_the_latch_and_never_raises(
+    tmp_path, monkeypatch,
+):
+    # An existence check can fail too (PermissionError on a locked share), and finalization
+    # must go on with the expected-lag anchor.
+    def denied(self):
+        if self.suffix == ".h5":
+            raise PermissionError("access denied")
+        return original_is_file(self)
+
+    original_is_file = Path.is_file
+    monkeypatch.setattr(Path, "is_file", denied)
+
+    stream, reason = SessionDataRecorder._read_primary_latency_stream(
+        _project(tmp_path), SimpleNamespace(primary_camera="left"))
+
+    assert stream is None
+    assert "camera_left.h5" in reason and "PermissionError" in reason
+
+
+def test_the_latency_stream_is_read_only_when_the_fitted_anchor_can_use_it(tmp_path, monkeypatch):
+    reads = []
+    original = SessionDataRecorder._read_primary_latency_stream
+
+    def counting(project, boundary):
+        reads.append(boundary.primary_camera)
+        return original(project, boundary)
+
+    monkeypatch.setattr(SessionDataRecorder, "_read_primary_latency_stream",
+                        staticmethod(counting))
+
+    # No fit: the epoch method needs no latches, so a locked stream would cost its retry
+    # budget for nothing.
+    _record(tmp_path / "no_fit", t0=5.0, lag=0.001, stamps=False)
+    assert reads == []
+    rig, project, n0, result = _record(tmp_path / "fit", t0=5.0, lag=0.001)
+    assert reads == ["left"]
+    assert result["cameraNidaqAlignment"]["anchorMethod"] == "camera_latch"
+
+
+def test_an_exposure_that_is_not_known_is_said_so_in_the_anchor_reason(tmp_path):
+    rig, project, n0, result = _record(tmp_path / "unknown", t0=5.0, lag=0.001, exposure=None)
+    camera = result["cameraNidaqAlignment"]
+    assert camera["matchedSampleIndex"] == rig.edge_sample(n0)
+    assert camera["exposureSeconds"] is None
+    assert camera["expectedLagSeconds"] == pytest.approx(0.0011)
+    assert camera["reason"].endswith("exposure unknown, assumed 0")
+
+    rig, project, n0, result = _record(tmp_path / "known", t0=5.0, lag=0.001)
+    assert "exposure" not in result["cameraNidaqAlignment"]["reason"]
+
+
+def test_an_exposure_as_long_as_the_frame_period_is_treated_as_unknown(tmp_path):
+    # 6 "seconds" is a units mix-up, and any exposure of at least a frame is impossible. It
+    # would have put the expected edge 6 s from every transition: no match at all.
+    rig, project, n0, result = _record(tmp_path, t0=5.0, lag=0.001, exposure=6.0)
+
+    camera = result["cameraNidaqAlignment"]
+    assert camera["status"] == "matched"
+    assert camera["matchedSampleIndex"] == rig.edge_sample(n0)
+    assert camera["exposureSeconds"] is None
+    assert camera["expectedLagSeconds"] == pytest.approx(0.0011)
+    assert "exposure 6000.000 ms is not shorter than the frame period 6.700 ms" in camera["reason"]
+    assert camera["reason"].endswith("exposure unknown, assumed 0")
 
 
 def test_raw_stamps_bridge_the_fit_through_an_ntp_step(tmp_path):

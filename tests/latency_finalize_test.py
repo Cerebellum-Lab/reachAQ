@@ -1,6 +1,8 @@
+import gc
 import hashlib
 import json
 import time
+import weakref
 from pathlib import Path
 
 import h5py
@@ -628,6 +630,38 @@ def test_a_consecutive_sample_index_is_derived_and_a_gap_uses_the_stored_one(tmp
 
         assert ni["transitions"].tolist() == expected
         assert "values" not in ni and "channels" not in ni  # no samples are retained
+
+
+def test_the_raw_column_is_not_kept_alive_through_the_channel_scans(tmp_path, monkeypatch):
+    # The stamps keep only the run ends, so the whole RAW column (8 bytes a sample, 288 MB
+    # an hour at 10 kHz) must be gone before the channels are scanned.
+    path = tmp_path / "nidaq.h5"
+    seen = np.arange(10, dtype=np.float64)
+    _write(path, {"sample_index": (1000 + np.arange(10)).astype(np.int64),
+                  "block_observation_perf_time": seen,
+                  "block_observation_raw_time": seen + 3.0,
+                  "values": np.array([[0, 0, 1, 1, 0, 0, 1, 1, 0, 0]], dtype=np.float32)},
+           {"channel_names": np.array([b"cam_frames"]), "sample_rate_hz": 1000.0})
+    raw_arrays, alive_during_scan = [], []
+    real_stamps, real_transitions = finalize.clocks.ni_block_stamps, finalize.clocks.transitions
+
+    def stamps(index, observed, raw=None):
+        raw_arrays.append(weakref.ref(raw))
+        return real_stamps(index, observed, raw)
+
+    def transitions(channel):
+        gc.collect()
+        alive_during_scan.append(raw_arrays[0]() is not None)
+        return real_transitions(channel)
+
+    monkeypatch.setattr(finalize.clocks, "ni_block_stamps", stamps)
+    monkeypatch.setattr(finalize.clocks, "transitions", transitions)
+
+    ni = finalize._read_nidaq(path)
+
+    assert ni["transitions"].tolist() == [1002, 1004, 1006, 1008]
+    assert np.isfinite(ni["block_stamps"].raw).all()  # the RAW stamps were read and kept
+    assert alive_during_scan == [False]
 
 
 def test_a_raw_stamped_session_bridges_ni_to_host_through_raw(tmp_path):
