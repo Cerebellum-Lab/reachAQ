@@ -184,4 +184,14 @@ def maybe_crop(
     if roi.covers_shape(shape):
         logger.info("configured inference ROI covers the full frame; not cropping")
         return model
+    if not model.crop_preserves_scale:
+        # Not refused: the model still runs, on the full frame. A crop could
+        # not make it faster, only feed it the animal at the wrong scale.
+        logger.warning(
+            "%s is set but not applied: %s resizes every frame to its fixed "
+            "input, so a crop saves no time and changes the scale it was "
+            "trained at; inferring on the full frame",
+            INFERENCE_ROI_ENV_VAR, model,
+        )
+        return model
     return CroppedPoseModel(model, roi)
