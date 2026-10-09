@@ -110,6 +110,15 @@ class YoloPoseModel(PoseModel):
         """
         return True
 
+    @property
+    def crop_preserves_scale(self) -> bool:
+        """
+        False: every frame is resized to imgsz, so the graph's work does not
+        shrink with a crop, and a crop smaller than the trained frame would
+        reach the model magnified.
+        """
+        return False
+
     def is_valid(self) -> bool:
         try:
             self.pre_validate(self._source)
