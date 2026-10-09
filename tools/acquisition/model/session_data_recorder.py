@@ -198,6 +198,24 @@ _LAG_GATE_HALF_WIDTH_SECONDS = 0.0010
 _ANCHOR_STREAM_RETRY_SECONDS = 1.0
 
 
+def _persistence_reason(source) -> str:
+    """Why a source that was not cleanly written leaves the session incomplete.
+
+    A source can fail with its data on disk - live pose that ends early because
+    inference stopped mid-recording, camera frames only partly synchronized -
+    and "persistence failed" then says the opposite of what happened. A failed
+    source with samples is called incomplete; persistenceStatus is unchanged.
+    """
+    source_id = source.get("id", "unknown")
+    status = source["persistenceStatus"]
+    if status == "failed" and source.get("sampleCount", 0) > 0:
+        head = f"{source_id} incomplete"
+    else:
+        head = f"{source_id} persistence {status}"
+    failure = source.get("failure")
+    return head if not failure else f"{head}: {failure}"
+
+
 class _SessionLogHandler(logging.Handler):
     def __init__(self, recorder: "SessionDataRecorder"):
         super().__init__(logging.NOTSET)
@@ -2189,14 +2207,7 @@ class SessionDataRecorder:
         for source in finalized_sources:
             source_id = source.get("id", "unknown")
             if source["persistenceStatus"] != "written":
-                incomplete_reasons.append(
-                    f"{source_id} persistence {source['persistenceStatus']}"
-                    + (
-                        ""
-                        if not source.get("failure")
-                        else f": {source['failure']}"
-                    )
-                )
+                incomplete_reasons.append(_persistence_reason(source))
             if source["gapCount"] and not str(source_id).startswith("nidaq."):
                 incomplete_reasons.append(
                     f"{source_id} reported {source['gapCount']} acquisition gap(s)"
