@@ -99,6 +99,9 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
         self._calib_dir = calib_dir
 
         self._msg_thread: Optional[threading.Thread] = None
+        # Ends the message loop. The None sentinel alone was not enough: a
+        # stop() on the loop's own thread clears its queue and can drain it.
+        self._msg_thread_exit = threading.Event()
 
         self._data_monitor_watchdog_perf_c = mp_ctx.Value(ctypes.c_double, math.nan)
         self._data_monitor_proc: Optional[InferenceMonitorDataProc] = None
@@ -323,6 +326,7 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
             )
 
         if self._msg_thread is None:
+            self._msg_thread_exit.clear()
             thread = Thread(target=self._monitor_msg_queue, name="monitor_msg_queue", daemon=True)
             thread.start()
             self._msg_thread = thread
@@ -531,9 +535,13 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
         msg_thread = self._msg_thread
         msg_queue = self._notif_msg_queue
         if msg_thread is not None:
-            msg_queue.put(None)
+            self._msg_thread_exit.set()
+            msg_queue.put(None)  # wakes the loop at once rather than at its next poll
             logger.debug("joining msg_thread")
-            msg_thread.join()
+            msg_thread.join(timeout)
+            if msg_thread.is_alive():
+                logger.warning("msg_thread still running %.1f s after terminate; not waiting",
+                               timeout)
             self._msg_thread = None
 
         logger.verbose("closing mp queues")
@@ -669,7 +677,7 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
             logger.warning("unknown monitor proc data: %s - ctx=%s", msg, ctx)
 
     def _monitor_msg_queue(self):
-        while True:
+        while not self._msg_thread_exit.is_set():
             try:
                 raw = self._notif_msg_queue.get(timeout=0.1)
             except queue.Empty:
