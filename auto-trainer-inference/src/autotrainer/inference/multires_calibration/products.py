@@ -68,24 +68,31 @@ def preset_stereo_params(fit: MotorFrameFit, g: PresetGeometry, *, alpha: float 
 
 
 def motor_to_inference_signs() -> Tuple[int, int, int]:
-    """The sign of each inference axis relative to the same motor axis, read from the DCS chain.
+    """The sign of each oriented (inference) axis relative to the same motor axis, read from the DCS chain.
 
-    DiamondTriangleOffsetConfig defines how inference coordinates relate to motor
-    coordinates; the oriented 3D points must follow it so diamond_to_motor stays
-    unchanged. The signs are measured from motor_to_inference rather than copied from
-    its flips, so they follow any change there. A map that is not a per-axis sign flip
-    raises ValueError: no diagonal of signs could represent it.
+    The oriented axes are the DCS axes (flips_inference_diamond is (1, 1, 1)), so a part
+    the motor carries must move in oriented coordinates as motor_to_diamond says it does.
+    The production consumer depends on exactly that: drift monitoring computes
+    diamond_to_motor(offset) - motor_position, with offset = triangle - diamond in
+    oriented coordinates, and the drift is zero only when the triangle's oriented
+    displacement is motor_to_diamond's response to the motor's move.
+
+    The signs are measured from motor_to_diamond, not copied from its flips, so they
+    follow any change there. A map that is not a per-axis sign flip raises ValueError: no
+    diagonal of signs could represent it. DiamondTriangleOffsetConfig's motor_to_inference
+    and inference_to_motor are not used: they are test-only helpers that relate the motor
+    to a diamond - triangle offset, and they give the opposite signs.
     """
     zero = Offset3DTuple(0.0, 0.0, 0.0)
     dcs = DiamondTriangleOffsetConfig(used_position=zero, measured_offset=zero)
-    origin = np.array(dcs.motor_to_inference(zero), float)
-    # Column k is the inference displacement of a unit motor step along axis k.
+    origin = np.array(dcs.motor_to_diamond(zero), float)
+    # Column k is the DCS displacement of a unit motor step along axis k.
     J = np.column_stack([
-        np.array(dcs.motor_to_inference(Offset3DTuple(*np.eye(3)[k])), float) - origin for k in range(3)
+        np.array(dcs.motor_to_diamond(Offset3DTuple(*np.eye(3)[k])), float) - origin for k in range(3)
     ])
     signs = np.diag(J)
     if not (np.allclose(J, np.diag(signs)) and np.allclose(np.abs(signs), 1.0)):
-        raise ValueError(f"the DCS motor-to-inference map is not a per-axis sign flip:\n{J}")
+        raise ValueError(f"the DCS motor-to-diamond map is not a per-axis sign flip:\n{J}")
     return tuple(int(round(s)) for s in signs)
 
 
@@ -110,7 +117,8 @@ def anipose_toml(fit: MotorFrameFit, g: PresetGeometry) -> str:
     the preset's intrinsic matrix, the 5 distortion coefficients and the motor-frame
     pose: rotation is the Rodrigues vector of the motor-frame -> camera rotation and
     translation is in mm, as aniposelib's Camera projects with cv2.projectPoints.
-    metadata.error is the mean of the fit's per-camera RMS in sensor px.
+    metadata.error is the mean of the fit's per-camera RMS in the preset's px (sensor px /
+    binning), like every other pixel value in the file.
     """
     lines = []
     for i, cam in enumerate(_CAMERAS):
@@ -125,7 +133,7 @@ def anipose_toml(fit: MotorFrameFit, g: PresetGeometry) -> str:
             f"translation = {_toml_value(np.asarray(m.tvec, float).ravel())}",
             "",
         ]
-    error = float(np.mean([fit.rms_px[cam] for cam in _CAMERAS]))
+    error = float(np.mean([fit.rms_px[cam] for cam in _CAMERAS])) / g.binning
     lines += ["[metadata]", f"adjusted = {_toml_value(False)}", f"error = {_toml_value(error)}"]
     return "\n".join(lines) + "\n"
 

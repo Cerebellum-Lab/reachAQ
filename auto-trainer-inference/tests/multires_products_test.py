@@ -3,22 +3,21 @@
 The fit is in full-sensor pixels; every preset gets its own stereo_params with the
 intrinsics mapped to its pixels, so today's loaders and live path read it unchanged.
 The frame transform replaces the old reorientation in `oriented = (raw - offsets) @ M`
-and must give motor-axis millimetres with the signs the DCS chain expects, so a motor
-step maps back to that step. The DeepLabCut and anipose exports must reproduce the
-same 3D points as reachAQ's triangulation.
+and must give motor-axis millimetres with the signs the DCS chain expects, so the live
+drift monitor sees no drift when the motor carries the triangle. The DeepLabCut and
+anipose exports must reproduce the same 3D points as reachAQ's triangulation.
 
 The tests use the synthetic rig's truth cameras, noise-free, as the fit, and points
 in the working volume the board sweeps: board corners at a grid of motor positions
 spanning the waypoints, kept where both cameras see them inside the presets' ROI.
 
-The synthetic cameras stand symmetric about motor z, which makes their rectified
-frame the motor frame (R1 @ R_left is the identity), so M is just diag(signs) and a
-transposed or misordered M would pass. The frame tests therefore also run with the
-motor frame turned about a generic axis, as on the rig, where the cameras sit at
-unequal azimuths and elevations.
+The default synthetic cameras stand symmetric about motor z, which makes their
+rectified frame the motor frame (R1 @ R_left is the identity), so M is just
+diag(signs) and a transposed or misordered M would pass. The frame tests therefore
+also run on a rig whose scene is turned 35 degrees about a generic axis, as on the
+real rig, where the cameras sit at unequal azimuths and elevations.
 """
 
-import dataclasses
 import pickle
 
 import cv2
@@ -49,40 +48,26 @@ RIG = synthetic_rig(noise_px=0.0)
 FIT = RIG.truth  # noise-free, the truth cameras stand in for a fit
 PRESETS = presets_from_base(PresetGeometry(4, 256, 256, 52, 6))
 CAMERAS = ("left", "right")
-
-
-def turned(fit, Q):
-    """`fit` with its motor frame turned by the rotation Q: point X becomes Q @ X, and each
-    camera's rotation becomes R_c @ Q^T, so every point keeps its pixels."""
-    cameras = {
-        cam: dataclasses.replace(m, rvec=cv2.Rodrigues(cv2.Rodrigues(m.rvec)[0] @ Q.T)[0].ravel())
-        for cam, m in fit.cameras.items()
-    }
-    board_rvec = cv2.Rodrigues(Q @ cv2.Rodrigues(fit.board_rvec)[0])[0].ravel()
-    return dataclasses.replace(fit, cameras=cameras, board_rvec=board_rvec)
-
-
-# 35 degrees about a generic axis. frame -> (fit, Q), with motor-frame points X @ Q.T.
-_Q_TURN = cv2.Rodrigues(np.array([0.3, -0.5, 0.2]))[0]
-FRAMES = {"symmetric": (FIT, np.eye(3)), "turned": (turned(FIT, _Q_TURN), _Q_TURN)}
+# The scene, board and cameras together, turned 35 degrees about a generic axis in the motor frame.
+RIGS = {"symmetric": RIG, "turned": synthetic_rig(noise_px=0.0, frame_rotation_deg=35.0)}
 
 
 def preset_id(g):
     return g.name
 
 
-def working_volume_points():
+def working_volume_points(rig=RIG):
     """(N, 3) motor-frame points: board corners at a 3x3x3 grid of motor positions spanning
     the waypoints, kept where both truth cameras see them inside the presets' sensor ROI."""
-    motor = np.array([o.motor_mm for o in RIG.observations])
+    motor = np.array([o.motor_mm for o in rig.observations])
     axes = [np.linspace(lo, hi, 3) for lo, hi in zip(motor.min(axis=0), motor.max(axis=0))]
-    X = np.concatenate([RIG.world_corners(m) for m in np.stack(np.meshgrid(*axes), axis=-1).reshape(-1, 3)])
+    X = np.concatenate([rig.world_corners(m) for m in np.stack(np.meshgrid(*axes), axis=-1).reshape(-1, 3)])
     # sensor_roi is in pixel edges; in the pixel-centre convention the ROI spans [x0 - 0.5, x1 - 0.5].
     # Every preset covers the same sensor window.
     x0, y0, x1, y1 = PRESETS[0].sensor_roi()
     inside = np.ones(len(X), bool)
     for cam in CAMERAS:
-        u = sensor_pixels(X, cam)
+        u = sensor_pixels(X, cam, rig.truth)
         inside &= (u[:, 0] >= x0 - 0.5) & (u[:, 0] <= x1 - 0.5) & (u[:, 1] >= y0 - 0.5) & (u[:, 1] <= y1 - 0.5)
     assert inside.sum() > 500, "the working-volume grid barely overlaps the ROI; the tests would prove little"
     return X[inside]
@@ -201,21 +186,22 @@ def test_essential_and_fundamental_matrices_satisfy_the_epipolar_constraint():
 
 
 def test_signs_are_read_from_the_dcs_flips(monkeypatch):
-    # Today's DCS convention: inference x runs against motor x, y and z with it.
-    assert motor_to_inference_signs() == (-1, 1, 1)
-    monkeypatch.setattr(DiamondTriangleOffsetConfig, "flips_inference_motor", Offset3DTuple(-1, 1, -1))
-    assert motor_to_inference_signs() == (1, -1, 1)
+    # Today's DCS convention (flips_motor_diamond): DCS x runs with motor x, y and z against it.
+    # The oriented axes are the DCS axes, so the oriented 3D frame takes the same signs.
+    assert motor_to_inference_signs() == (1, -1, -1)
+    monkeypatch.setattr(DiamondTriangleOffsetConfig, "flips_motor_diamond", Offset3DTuple(-1, 1, -1))
+    assert motor_to_inference_signs() == (-1, 1, -1)
     # A DCS map that scales an axis is not a sign flip, and must not be read as one.
-    monkeypatch.setattr(DiamondTriangleOffsetConfig, "flips_inference_motor", Offset3DTuple(2, -1, -1))
+    monkeypatch.setattr(DiamondTriangleOffsetConfig, "flips_motor_diamond", Offset3DTuple(2, -1, -1))
     with pytest.raises(ValueError):
         motor_to_inference_signs()
 
 
-@pytest.mark.parametrize("frame", FRAMES)
+@pytest.mark.parametrize("frame", RIGS)
 @pytest.mark.parametrize("g", PRESETS, ids=preset_id)
 def test_live_pipeline_on_preset_points_recovers_motor_displacements(g, frame):
-    fit, Q = FRAMES[frame]
-    X = working_volume_points() @ Q.T
+    fit = RIGS[frame].truth
+    X = working_volume_points(RIGS[frame])
     stereo = preset_stereo_params(fit, g)
     signs = motor_to_inference_signs()
     raw = reachaq_raw(stereo, preset_pixels(X, g, fit))
@@ -224,22 +210,57 @@ def test_live_pipeline_on_preset_points_recovers_motor_displacements(g, frame):
     assert np.abs(oriented - expected).max() < 0.05
 
 
-@pytest.mark.parametrize("frame", FRAMES)
+# A DCS calibration away from zero: the motor position at which it recorded the offset.
+_USED_POSITION = Offset3DTuple(3.5, 22.0, -28.0)
+
+
+@pytest.mark.parametrize("frame", RIGS)
 @pytest.mark.parametrize("g", PRESETS, ids=preset_id)
-def test_a_motor_step_maps_back_through_the_dcs_chain(g, frame):
-    # The live chain's own float32 rounding (see exact_raw) is covered by the test above;
-    # this one pins the signs and axes, so it runs the same chain in float64.
-    fit, Q = FRAMES[frame]
+def test_live_drift_is_zero_when_the_motor_carries_the_triangle(g, frame):
+    # The production consumer of the oriented frame: drift = diamond_to_motor(offset) - motor_position
+    # (BehaviorAlgorithm.handle_diamond_triangle_offset), with offset = triangle - diamond in oriented
+    # coordinates (PoseResponse.get_parts_3d_offset(Diamond, Triangle)). The diamond stays put, the
+    # motor carries the triangle, and the DCS calibration recorded the offset at _USED_POSITION.
+    rig = RIGS[frame]
+    fit = rig.truth
     stereo = preset_stereo_params(fit, g)
     M = frame_transform(fit, stereo, motor_to_inference_signs())
-    zero = Offset3DTuple(0.0, 0.0, 0.0)
-    dcs = DiamondTriangleOffsetConfig(used_position=zero, measured_offset=zero)
-    start = (working_volume_points() @ Q.T).mean(axis=0)
+    camera_offsets = np.array([4.0, -6.0, 150.0])  # cancels in the offset; non-zero as live
+
+    def live_offset(triangle, diamond):
+        raw = reachaq_raw(stereo, preset_pixels(np.array([triangle, diamond]), g, fit))
+        oriented = (raw - camera_offsets) @ M
+        return oriented[0] - oriented[1]
+
+    volume = working_volume_points(rig)
+    diamond, triangle = volume[0], volume.mean(axis=0)
+    measured = live_offset(triangle, diamond)
+    assert np.linalg.norm(measured) > 1.0, "the calibrated offset should be away from zero"
+    cfg = DiamondTriangleOffsetConfig(used_position=_USED_POSITION, measured_offset=Offset3DTuple(*measured))
+    for k in range(3):
+        move = 2.0 * np.eye(3)[k]
+        offset = live_offset(triangle + move, diamond)
+        drift = np.array(cfg.diamond_to_motor(Offset3DTuple(*offset))) - (np.array(_USED_POSITION) + move)
+        assert np.abs(drift).max() < 1e-3, (k, drift)
+
+
+@pytest.mark.parametrize("frame", RIGS)
+@pytest.mark.parametrize("g", PRESETS, ids=preset_id)
+def test_a_motor_step_maps_back_through_diamond_to_motor(g, frame):
+    # The test above runs the live float32 chain; this one runs the same chain in float64
+    # (see exact_raw) so the signs and axes are pinned to 1e-6 mm.
+    rig = RIGS[frame]
+    fit = rig.truth
+    stereo = preset_stereo_params(fit, g)
+    M = frame_transform(fit, stereo, motor_to_inference_signs())
+    base = Offset3DTuple(-2.0, 5.0, 12.0)  # an oriented triangle - diamond offset
+    cfg = DiamondTriangleOffsetConfig(used_position=_USED_POSITION, measured_offset=base)
+    start = working_volume_points(rig).mean(axis=0)
     for k in range(3):
         e_k = np.eye(3)[k]
         raw = exact_raw(stereo, preset_pixels(np.array([start, start + e_k]), g, fit))
         d = (raw[1] - raw[0]) @ M
-        step = np.array(dcs.inference_to_motor(Offset3DTuple(*d))) - np.array(dcs.inference_to_motor(zero))
+        step = np.array(cfg.diamond_to_motor(base + Offset3DTuple(*d))) - np.array(cfg.diamond_to_motor(base))
         np.testing.assert_allclose(step, e_k, rtol=0, atol=1e-6)
 
 
@@ -260,7 +281,11 @@ def test_anipose_toml_reads_back():
         np.testing.assert_array_equal(table["translation"], m.tvec)
         assert len(table["distortions"]) == 5
     assert data["metadata"]["adjusted"] is False
-    assert data["metadata"]["error"] == np.mean([fit.rms_px[c] for c in CAMERAS]) > 0
+    # The error is in the preset's px, like the rest of the file: sensor px / binning.
+    sensor_rms = np.mean([fit.rms_px[c] for c in CAMERAS])
+    assert data["metadata"]["error"] == sensor_rms > 0
+    binned = PresetGeometry(4, 256, 256, 52, 6)
+    assert tomli.loads(anipose_toml(fit, binned))["metadata"]["error"] == pytest.approx(sensor_rms / 4, rel=1e-15)
 
 
 @pytest.mark.parametrize("g", PRESETS, ids=preset_id)
