@@ -475,6 +475,28 @@ def test_exact_counts_without_live_pose_still_report_drops(tmp_path):
     }
 
 
+def test_the_exact_counts_stay_until_the_next_session(telemetry):
+    """The panel shows them after Stop; a new session starts without them."""
+    seen = []
+    telemetry.property_changed += lambda name, new, old: seen.append(name)
+    exact = {
+        "framesRecorded": 10,
+        "cameras": {
+            "left": {"framesDropped": 0, "framesPosed": 9, "posedPercent": 90.0},
+        },
+    }
+    telemetry.end(110.0)
+    telemetry.set_exact_capture(exact, 10.1)
+
+    assert telemetry.exact_capture == exact
+    assert telemetry.exact_duration_seconds == pytest.approx(10.1)
+    assert SessionTelemetry.EXACT_PROP in seen
+
+    telemetry.begin(200.0)
+    assert telemetry.exact_capture is None
+    assert telemetry.exact_duration_seconds is None
+
+
 def test_a_reset_is_not_lost_to_a_pose_report_in_flight():
     """begin() and a pose report run on different threads.
 

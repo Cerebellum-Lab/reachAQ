@@ -1722,6 +1722,11 @@ def test_finalized_capture_carries_exact_counts_from_the_session_files(
             "left": {"framesDropped": 0, "framesPosed": 3, "posedPercent": 75.0},
         },
     }
+    # The panel shows the same figures, and the boundary's duration.
+    telemetry = app_model.session_telemetry
+    assert telemetry.exact_capture == (
+        app_model._recording_session.capture_telemetry["exact"])
+    assert telemetry.exact_duration_seconds == pytest.approx(2.5)
 
 
 def test_metadata_pair_is_not_replaced_when_yaml_serialization_fails(

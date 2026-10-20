@@ -10113,10 +10113,15 @@ class AppModel(ObservableObject):
                 self._recording_session.boundary.end_wall_time,
             )
             self._session_telemetry.end(end_perf)
+            exact_capture = self._exact_session_capture(project)
             self._recording_session.set_capture_telemetry({
                 **self._session_telemetry.summary(),
-                "exact": self._exact_session_capture(project),
+                "exact": exact_capture,
             })
+            self._session_telemetry.set_exact_capture(
+                exact_capture,
+                completed_boundary.to_metadata()["durationSeconds"],
+            )
             stream_result = self._session_data_recorder.stop(end_perf)
         except Exception as first_error:
             logger.exception(

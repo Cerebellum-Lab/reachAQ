@@ -43,6 +43,7 @@ class _Telemetry:
             sensor_to_result_max_ms=float("nan"),
             stim_p99_ms=float("nan"),
             latency_status="",
+            exact_capture=None, exact_duration_seconds=None,
         ), **values)
 
 
@@ -122,6 +123,65 @@ def test_a_readout_still_shows_its_value(qapp):
 
     assert "100%" in panel._inferenced.text()
     assert "13500" in panel._inferenced.text()
+
+
+def _finished(**values):
+    """A stopped, finalized session: live counters a report period stale."""
+    readings = dict(
+        is_active=False, elapsed_seconds=120.112, frames_acquired=17968,
+        frames_inferenced=17968, inferenced_percent=100.0,
+        exact_duration_seconds=120.121,
+        exact_capture={"framesRecorded": 18018, "cameras": {
+            "left": {"framesDropped": 0, "framesPosed": 18012,
+                     "posedPercent": 99.97},
+            "right": {"framesDropped": 2, "framesPosed": 18000,
+                      "posedPercent": 99.91},
+        }},
+    )
+    readings.update(values)
+    return _Telemetry(**readings)
+
+
+def test_after_stop_the_panel_shows_the_sessions_exact_figures(qapp):
+    telemetry = _finished()
+    panel = _panel(qapp, telemetry)
+    _show(panel, telemetry)
+
+    assert panel._elapsed.text() == "2:00"
+    # Drops summed over the cameras, as the live figure counts them.
+    assert panel._dropped.text() == "2"
+    # The worse camera, of the frames it delivered, and never rounded up to
+    # a 100% it did not reach.
+    assert panel._inferenced.text() == "99%  18000/18016"
+    assert "session's files" in panel._inferenced.parentWidget().toolTip()
+
+
+def test_without_exact_counts_the_panel_keeps_the_live_figures(qapp):
+    telemetry = _finished(exact_capture=None, exact_duration_seconds=None)
+    panel = _panel(qapp, telemetry)
+    _show(panel, telemetry)
+
+    assert panel._inferenced.text() == "100%  17968/17968"
+    assert panel._inferenced.parentWidget().toolTip() == ""
+
+
+def test_the_exact_figures_fit_the_live_readouts_widths(qapp):
+    """The switch at finalize must not move the panel either."""
+    widest_exact = _finished(
+        exact_duration_seconds=7200.4,
+        exact_capture={"framesRecorded": 1080000, "cameras": {
+            "left": {"framesDropped": 1234, "framesPosed": 1078000,
+                     "posedPercent": 99.93},
+            "right": {"framesDropped": 1234, "framesPosed": 1078000,
+                      "posedPercent": 99.93},
+        }},
+    )
+    panel = _panel(qapp, GROWING[-1])
+    _show(panel, GROWING[-1])
+    live = _effective_widths(panel)
+    _show(panel, widest_exact)
+
+    assert _effective_widths(panel) == live
 
 
 def test_the_stim_p99_readout_says_what_it_spans(qapp):

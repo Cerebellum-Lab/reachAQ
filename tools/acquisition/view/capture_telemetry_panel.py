@@ -245,23 +245,67 @@ class CaptureTelemetryPanel(QWidget):
         """
         self.counters_changed.emit()
 
+    @staticmethod
+    def _shown_figures(telemetry):
+        """Elapsed, dropped, the inferenced readout and its share, and a tooltip.
+
+        The live counters while recording. After Stop they are up to a report
+        period stale, so once the session is finalized its exact counts take
+        their place: the recording boundary's duration, drops summed over the
+        cameras as the live figure counts them, and the worse camera's share
+        of the frames it delivered, rounded down so it never claims a 100% it
+        did not reach.
+        """
+        elapsed = telemetry.elapsed_seconds
+        dropped = telemetry.dropped_frames
+        acquired = telemetry.frames_acquired
+        percent = telemetry.inferenced_percent
+        inferenced = (f"{percent:.0f}%  {telemetry.frames_inferenced}/{acquired}"
+                      if acquired else "-")
+        exact = None if telemetry.is_active else telemetry.exact_capture
+        if not exact:
+            return elapsed, dropped, inferenced, percent, ""
+        recorded = exact["framesRecorded"]
+        cameras = exact["cameras"]
+        if telemetry.exact_duration_seconds is not None:
+            elapsed = telemetry.exact_duration_seconds
+        drops = [camera["framesDropped"] for camera in cameras.values()]
+        if None not in drops:
+            dropped = sum(drops)
+        posed = [(camera["posedPercent"], camera["framesPosed"],
+                  recorded - (camera["framesDropped"] or 0))
+                 for camera in cameras.values()
+                 if camera["posedPercent"] is not None]
+        if posed:
+            share, frames, delivered = min(posed)
+            percent = math.floor(share)
+            inferenced = f"{percent}%  {frames}/{delivered}"
+        tip = [f"Exact, from the session's files: {recorded} frames recorded"]
+        for name, camera in cameras.items():
+            line = (f"{name}: not posed" if camera["posedPercent"] is None
+                    else f"{name}: {camera['framesPosed']} posed "
+                         f"({camera['posedPercent']:.2f}%)")
+            if camera["framesDropped"] is not None:
+                line += f", {camera['framesDropped']} dropped"
+            tip.append(line)
+        return elapsed, dropped, inferenced, percent, "\n".join(tip)
+
     @Slot()
     def _refresh(self):
         telemetry = self._telemetry
+        elapsed, dropped, inferenced, _, tip = self._shown_figures(telemetry)
+        for value in (self._elapsed, self._dropped, self._inferenced):
+            value.parentWidget().setToolTip(tip)
 
-        self._elapsed.setText(self._format_elapsed(telemetry.elapsed_seconds))
+        self._elapsed.setText(self._format_elapsed(elapsed))
 
-        dropped = telemetry.dropped_frames
         self._dropped.setText(f"{dropped}")
         self._dropped.setStyleSheet(
             "font-family: monospace; color: #d08a00; font-weight: bold;"
             if dropped else "font-family: monospace;")
 
         acquired = telemetry.frames_acquired
-        posed = telemetry.frames_inferenced
-        self._inferenced.setText(
-            f"{telemetry.inferenced_percent:.0f}%  {posed}/{acquired}"
-            if acquired else "-")
+        self._inferenced.setText(inferenced)
 
         mean_ms = telemetry.inference_mean_ms
         max_ms = telemetry.inference_max_ms
@@ -297,8 +341,9 @@ class CaptureTelemetryPanel(QWidget):
         visible without opening the panel, it should be the one nearer the
         deadline.
         """
-        parts = [CaptureTelemetryPanel._format_elapsed(telemetry.elapsed_seconds),
-                 f"{telemetry.inferenced_percent:.0f}% inferenced"]
+        elapsed, _, _, percent, _ = CaptureTelemetryPanel._shown_figures(telemetry)
+        parts = [CaptureTelemetryPanel._format_elapsed(elapsed),
+                 f"{percent:.0f}% inferenced"]
         e2e = telemetry.sensor_to_result_mean_ms
         if math.isfinite(e2e):
             parts.append(f"{e2e:.1f} ms arrival→result")
