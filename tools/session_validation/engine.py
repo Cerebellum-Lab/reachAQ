@@ -683,21 +683,13 @@ def _frame_alignment_rule(context):
     ):
         return _result(rule_id, "not_applicable", "NI-DAQ was not enabled", paths=paths)
     alignment = context.json("streams/alignment.json")
-    remediation = (
-        "Treat this session's event frame IDs as uncertain by one frame; "
-        "cameraNidaqAlignment.reason in alignment.json says why."
-    )
     schema = alignment.get("schemaVersion")
-    if not isinstance(schema, int) or schema < 3:
-        return _result(
-            rule_id, "warning",
-            f"alignment.json schema {schema} predates the drift-corrected frame "
-            "alignment: frame IDs can be one frame off from about 2 minutes after NI start",
-            observed={"schemaVersion": schema}, paths=paths, remediation=remediation,
-        )
     camera = alignment.get("cameraNidaqAlignment") or {}
     fit = camera.get("niToHost") or {}
+    latch = camera.get("latch") or {}
     status = camera.get("status")
+    # The reasons go in too: a pass can still carry one worth reading, such as
+    # a perf-only fit's or an exposure the recorder set aside as implausible.
     observed = {
         "schemaVersion": schema,
         "status": status,
@@ -706,10 +698,13 @@ def _frame_alignment_rule(context):
         "impliedLagSeconds": camera.get("impliedLagSeconds"),
         "lagGateSeconds": camera.get("lagGateSeconds"),
         "anchorsAgree": camera.get("anchorsAgree"),
-        "latchStatus": (camera.get("latch") or {}).get("status"),
         "exposureSeconds": camera.get("exposureSeconds"),
+        "latchStatus": latch.get("status"),
+        "latchReason": latch.get("reason"),
         "niToHostValid": fit.get("valid"),
         "niToHostMethod": fit.get("method"),
+        "niToHostReason": fit.get("reason"),
+        "reason": camera.get("reason"),
     }
     if status == "unavailable":
         return _result(
@@ -717,30 +712,54 @@ def _frame_alignment_rule(context):
             "No NI-DAQ samples were saved; nidaq.continuity reports that",
             observed=observed, paths=paths,
         )
+    frame_remediation = (
+        "Treat this session's event frame IDs as uncertain by one frame"
+        + ("; cameraNidaqAlignment.reason in alignment.json says why."
+           if camera.get("reason") else ".")
+    )
+    if not isinstance(schema, int) or schema < 3:
+        return _result(
+            rule_id, "warning",
+            f"alignment.json schema {schema} predates the drift-corrected frame "
+            "alignment: its anchor took the cam_frames transition nearest a single "
+            "NI epoch stamp, which put 15 of 36 checked sessions a frame off",
+            observed=observed, paths=paths, remediation=frame_remediation,
+        )
     reason = camera.get("reason") or "no reason recorded"
-    warnings = []
+    method = camera.get("anchorMethod")
+    warnings, remediations = [], []
     if not camera:
-        warnings.append("cameraNidaqAlignment is missing")
+        warnings.append("cameraNidaqAlignment is missing, so no frame anchor was recorded")
     elif status == "host_estimated":
         warnings.append(f"frames are host-estimated, with no hardware anchor: {reason}")
     elif status != "matched":
         warnings.append(f"the first frame has no NI anchor ({status}): {reason}")
-    elif camera.get("anchorMethod") == "epoch_nearest_edge" or not fit.get("valid", False):
-        warnings.append(f"anchored on the NI epoch timeline, not the NI-to-host fit: {reason}")
+    elif method == "epoch_nearest_edge" or not fit.get("valid", False):
+        warnings.append(f"the first frame was anchored on the NI epoch timeline: {reason}")
+    elif method not in ("camera_latch", "expected_lag"):
+        warnings.append(f"unrecognised anchor method {method!r}: {reason}")
     elif camera.get("confidence") != "hardware_edge" or camera.get("anchorsAgree") is False:
-        warnings.append(f"{camera.get('confidence')}: {reason}")
+        warnings.append(
+            f"the frame anchor is ambiguous ({camera.get('confidence')}): {reason}"
+        )
+    if warnings:
+        remediations.append(frame_remediation)
     fallback = (alignment.get("toneConfirmation") or {}).get("hostTimeFallbackReason")
     if fallback:
         warnings.append(f"tone times fell back to the NI epoch timeline: {fallback}")
+        remediations.append(
+            "Treat the tone frame associations as uncertain by one frame; "
+            "toneConfirmation.hostTimeFallbackReason says why."
+        )
     if warnings:
         return _result(
             rule_id, "warning", "; ".join(warnings),
-            observed=observed, paths=paths, remediation=remediation,
+            observed=observed, paths=paths, remediation=" ".join(remediations),
         )
     lag = camera.get("impliedLagSeconds")
     return _result(
         rule_id, "pass",
-        f"First frame anchored by {camera.get('anchorMethod')} at hardware_edge"
+        f"First frame anchored by {method} at hardware_edge"
         + ("" if lag is None else f", implied lag {lag * 1e3:.3f} ms"),
         observed=observed, paths=paths,
     )
