@@ -1,9 +1,20 @@
+import functools
 import math
+import threading
 import time
 import typing
 from pathlib import Path
 
 from autotrainer.core.observable_object import ObservableObject
+
+
+def _telemetry_locked(method):
+    @functools.wraps(method)
+    def serialized(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return serialized
 
 
 class SessionTelemetry(ObservableObject):
@@ -61,6 +72,12 @@ class SessionTelemetry(ObservableObject):
 
     def __init__(self):
         super().__init__()
+        # Frame counts, pose reports, begin/end and the panel's readings each
+        # arrive on their own thread. Unserialized, a reset could be undone by
+        # a report in flight, and a camera's first report could break a
+        # reading in progress. Change notifications go out after the lock is
+        # released, so an observer is free to read back.
+        self._lock = threading.RLock()
         self._active = False
         self._started_perf: typing.Optional[float] = None
         self._ended_perf: typing.Optional[float] = None
@@ -96,42 +113,44 @@ class SessionTelemetry(ObservableObject):
         45 s session measured that way claimed 7820 frames and 174 fps from a
         pair of 150 fps cameras.
         """
-        self._active = True
-        self._started_perf = time.perf_counter() if started_perf is None else started_perf
-        self._ended_perf = None
-        self._frozen = None
-        self._baseline_acquired = dict(self._acquired_by_camera)
-        self._baseline_dropped = dict(self._dropped_by_camera)
-        self._baseline_inferenced = self._inferenced
-        self._inference_total_ms = 0.0
-        self._inference_count = 0
-        self._inference_max_ms = 0.0
-        self._e2e_total_ms = 0.0
-        self._e2e_count = 0
-        self._e2e_max_ms = 0.0
-        self._stim_p99_ms = float("nan")
-        self._latency_status = ""
+        with self._lock:
+            self._active = True
+            self._started_perf = time.perf_counter() if started_perf is None else started_perf
+            self._ended_perf = None
+            self._frozen = None
+            self._baseline_acquired = dict(self._acquired_by_camera)
+            self._baseline_dropped = dict(self._dropped_by_camera)
+            self._baseline_inferenced = self._inferenced
+            self._inference_total_ms = 0.0
+            self._inference_count = 0
+            self._inference_max_ms = 0.0
+            self._e2e_total_ms = 0.0
+            self._e2e_count = 0
+            self._e2e_max_ms = 0.0
+            self._stim_p99_ms = float("nan")
+            self._latency_status = ""
         self.property_changed(self.ACTIVE_PROP, True, False)
 
     def end(self, ended_perf: typing.Optional[float] = None) -> None:
         """Freeze the counters. The summary stays readable for the metadata write."""
-        if not self._active:
-            return
-        self._ended_perf = time.perf_counter() if ended_perf is None else ended_perf
-        # Snapshot before clearing the flag: acquisition continues while the
-        # system stays in Running, so the underlying totals keep climbing and
-        # a live subtraction would make a finished session grow.
-        self._frozen = {
-            "acquired": self.frames_acquired,
-            "dropped": self.dropped_frames,
-            "dropped_by_camera": self.dropped_by_camera,
-            "inferenced": self.frames_inferenced,
-            # The metadata is written after end(), while triggers still reach
-            # the live figure; without this the file would carry whichever
-            # p99 happened to be current when it was written.
-            "stim_p99_ms": self._stim_p99_ms,
-        }
-        self._active = False
+        with self._lock:
+            if not self._active:
+                return
+            self._ended_perf = time.perf_counter() if ended_perf is None else ended_perf
+            # Snapshot before clearing the flag: acquisition continues while the
+            # system stays in Running, so the underlying totals keep climbing and
+            # a live subtraction would make a finished session grow.
+            self._frozen = {
+                "acquired": self.frames_acquired,
+                "dropped": self.dropped_frames,
+                "dropped_by_camera": self.dropped_by_camera,
+                "inferenced": self.frames_inferenced,
+                # The metadata is written after end(), while triggers still reach
+                # the live figure; without this the file would carry whichever
+                # p99 happened to be current when it was written.
+                "stim_p99_ms": self._stim_p99_ms,
+            }
+            self._active = False
         self.property_changed(self.ACTIVE_PROP, False, True)
 
     # -- producers --------------------------------------------------------
@@ -146,17 +165,20 @@ class SessionTelemetry(ObservableObject):
         Recorded even between sessions, because begin() subtracts whatever the
         totals had reached by then and it can only do that if it has seen them.
         """
-        previous_acquired = self.frames_acquired
-        previous_dropped = self.dropped_frames
-        self._acquired_by_camera[camera_index] = int(acquired)
-        self._dropped_by_camera[camera_index] = int(dropped)
-        if not self._active:
-            return
-        if self.frames_acquired != previous_acquired:
-            self.property_changed(self.ACQUIRED_PROP, self.frames_acquired,
+        with self._lock:
+            previous_acquired = self.frames_acquired
+            previous_dropped = self.dropped_frames
+            self._acquired_by_camera[camera_index] = int(acquired)
+            self._dropped_by_camera[camera_index] = int(dropped)
+            if not self._active:
+                return
+            frames_acquired = self.frames_acquired
+            dropped_frames = self.dropped_frames
+        if frames_acquired != previous_acquired:
+            self.property_changed(self.ACQUIRED_PROP, frames_acquired,
                                   previous_acquired)
-        if self.dropped_frames != previous_dropped:
-            self.property_changed(self.DROPPED_PROP, self.dropped_frames,
+        if dropped_frames != previous_dropped:
+            self.property_changed(self.DROPPED_PROP, dropped_frames,
                                   previous_dropped)
 
     def record_inference(self, count: int, mean_ms: float, max_ms: float,
@@ -169,39 +191,43 @@ class SessionTelemetry(ObservableObject):
         by how many calls it covered, so a slow burst is not averaged away by a
         later quiet one.
         """
-        previous = self._inferenced
-        new_calls = max(0, int(count) - previous)
-        self._inferenced = int(count)
-        if not self._active:
-            return
-        if new_calls and math.isfinite(mean_ms):
-            self._inference_total_ms += mean_ms * new_calls
-            self._inference_count += new_calls
-        if math.isfinite(max_ms):
-            self._inference_max_ms = max(self._inference_max_ms, float(max_ms))
-        if new_calls and math.isfinite(sensor_to_result_mean_ms):
-            self._e2e_total_ms += sensor_to_result_mean_ms * new_calls
-            self._e2e_count += new_calls
-        if math.isfinite(sensor_to_result_max_ms):
-            self._e2e_max_ms = max(self._e2e_max_ms,
-                                   float(sensor_to_result_max_ms))
-        if self._inferenced != previous:
-            self.property_changed(self.INFERENCED_PROP, self.frames_inferenced,
-                                  None)
-            self.property_changed(self.INFERENCE_TIME_PROP,
-                                  self.inference_mean_ms, None)
+        with self._lock:
+            previous = self._inferenced
+            new_calls = max(0, int(count) - previous)
+            self._inferenced = int(count)
+            if not self._active:
+                return
+            if new_calls and math.isfinite(mean_ms):
+                self._inference_total_ms += mean_ms * new_calls
+                self._inference_count += new_calls
+            if math.isfinite(max_ms):
+                self._inference_max_ms = max(self._inference_max_ms, float(max_ms))
+            if new_calls and math.isfinite(sensor_to_result_mean_ms):
+                self._e2e_total_ms += sensor_to_result_mean_ms * new_calls
+                self._e2e_count += new_calls
+            if math.isfinite(sensor_to_result_max_ms):
+                self._e2e_max_ms = max(self._e2e_max_ms,
+                                       float(sensor_to_result_max_ms))
+            if self._inferenced == previous:
+                return
+            frames_inferenced = self.frames_inferenced
+            inference_mean_ms = self.inference_mean_ms
+        self.property_changed(self.INFERENCED_PROP, frames_inferenced, None)
+        self.property_changed(self.INFERENCE_TIME_PROP, inference_mean_ms, None)
 
     def record_stim_p99(self, p99_ms: float) -> None:
         """The direct stim route's rolling p99, from StimLatencyBudget."""
-        previous = self._stim_p99_ms
-        self._stim_p99_ms = float(p99_ms)
-        self.property_changed(self.STIM_LATENCY_PROP, self._stim_p99_ms, previous)
+        current = float(p99_ms)
+        with self._lock:
+            previous, self._stim_p99_ms = self._stim_p99_ms, current
+        self.property_changed(self.STIM_LATENCY_PROP, current, previous)
 
     def set_latency_status(self, text: str) -> None:
         """One line on the session's latency record, set once it is finalized."""
-        previous = self._latency_status
-        self._latency_status = str(text)
-        self.property_changed(self.LATENCY_STATUS_PROP, self._latency_status, previous)
+        current = str(text)
+        with self._lock:
+            previous, self._latency_status = self._latency_status, current
+        self.property_changed(self.LATENCY_STATUS_PROP, current, previous)
 
     # -- state ------------------------------------------------------------
 
@@ -210,6 +236,7 @@ class SessionTelemetry(ObservableObject):
         return self._active
 
     @property
+    @_telemetry_locked
     def elapsed_seconds(self) -> float:
         if self._started_perf is None:
             return 0.0
@@ -228,6 +255,7 @@ class SessionTelemetry(ObservableObject):
         return latest if latest < baseline else latest - baseline
 
     @property
+    @_telemetry_locked
     def frames_acquired(self) -> int:
         if self._frozen is not None:
             return self._frozen["acquired"]
@@ -240,6 +268,7 @@ class SessionTelemetry(ObservableObject):
         )
 
     @property
+    @_telemetry_locked
     def dropped_frames(self) -> int:
         if self._frozen is not None:
             return self._frozen["dropped"]
@@ -255,6 +284,7 @@ class SessionTelemetry(ObservableObject):
         return self.dropped_frames > 0
 
     @property
+    @_telemetry_locked
     def frames_inferenced(self) -> int:
         """Poses computed this session, never more than frames acquired.
 
@@ -280,6 +310,7 @@ class SessionTelemetry(ObservableObject):
         return min(inferenced, acquired) if acquired > 0 else inferenced
 
     @property
+    @_telemetry_locked
     def inferenced_percent(self) -> float:
         acquired = self.frames_acquired
         if acquired <= 0:
@@ -287,26 +318,31 @@ class SessionTelemetry(ObservableObject):
         return 100.0 * self.frames_inferenced / acquired
 
     @property
+    @_telemetry_locked
     def inference_mean_ms(self) -> float:
         if self._inference_count <= 0:
             return float("nan")
         return self._inference_total_ms / self._inference_count
 
     @property
+    @_telemetry_locked
     def inference_max_ms(self) -> float:
         return self._inference_max_ms if self._inference_count else float("nan")
 
     @property
+    @_telemetry_locked
     def sensor_to_result_mean_ms(self) -> float:
         if self._e2e_count <= 0:
             return float("nan")
         return self._e2e_total_ms / self._e2e_count
 
     @property
+    @_telemetry_locked
     def sensor_to_result_max_ms(self) -> float:
         return self._e2e_max_ms if self._e2e_count else float("nan")
 
     @property
+    @_telemetry_locked
     def stim_p99_ms(self) -> float:
         if self._frozen is not None:
             return self._frozen["stim_p99_ms"]
@@ -317,6 +353,7 @@ class SessionTelemetry(ObservableObject):
         return self._latency_status
 
     @property
+    @_telemetry_locked
     def dropped_by_camera(self) -> typing.Dict[int, int]:
         if self._frozen is not None:
             return dict(self._frozen["dropped_by_camera"])
@@ -328,6 +365,7 @@ class SessionTelemetry(ObservableObject):
             for index, value in self._dropped_by_camera.items()
         }
 
+    @_telemetry_locked
     def summary(self) -> typing.Dict[str, typing.Any]:
         """What goes into the session metadata.
 
