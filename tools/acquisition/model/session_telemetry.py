@@ -69,6 +69,7 @@ class SessionTelemetry(ObservableObject):
     ACTIVE_PROP = "is_active"
     STIM_LATENCY_PROP = "stim_latency"
     LATENCY_STATUS_PROP = "latency_status"
+    EXACT_PROP = "exact_capture"
 
     def __init__(self):
         super().__init__()
@@ -98,6 +99,8 @@ class SessionTelemetry(ObservableObject):
         self._e2e_max_ms = 0.0
         self._stim_p99_ms = float("nan")
         self._latency_status = ""
+        self._exact_capture: typing.Optional[typing.Dict[str, typing.Any]] = None
+        self._exact_duration_seconds: typing.Optional[float] = None
 
     # -- lifecycle --------------------------------------------------------
 
@@ -129,6 +132,8 @@ class SessionTelemetry(ObservableObject):
             self._e2e_max_ms = 0.0
             self._stim_p99_ms = float("nan")
             self._latency_status = ""
+            self._exact_capture = None
+            self._exact_duration_seconds = None
         self.property_changed(self.ACTIVE_PROP, True, False)
 
     def end(self, ended_perf: typing.Optional[float] = None) -> None:
@@ -228,6 +233,17 @@ class SessionTelemetry(ObservableObject):
         with self._lock:
             previous, self._latency_status = self._latency_status, current
         self.property_changed(self.LATENCY_STATUS_PROP, current, previous)
+
+    def set_exact_capture(self, exact: typing.Optional[typing.Dict[str, typing.Any]],
+                          duration_seconds: typing.Optional[float]) -> None:
+        """The finished session's exact counts (exact_session_capture) and the
+        recording boundary's duration, set once it is finalized and kept until
+        the next begin(), so the panel can show them in place of the counters.
+        """
+        with self._lock:
+            self._exact_capture = exact
+            self._exact_duration_seconds = duration_seconds
+        self.property_changed(self.EXACT_PROP, exact, None)
 
     # -- state ------------------------------------------------------------
 
@@ -351,6 +367,14 @@ class SessionTelemetry(ObservableObject):
     @property
     def latency_status(self) -> str:
         return self._latency_status
+
+    @property
+    def exact_capture(self) -> typing.Optional[typing.Dict[str, typing.Any]]:
+        return self._exact_capture
+
+    @property
+    def exact_duration_seconds(self) -> typing.Optional[float]:
+        return self._exact_duration_seconds
 
     @property
     @_telemetry_locked
