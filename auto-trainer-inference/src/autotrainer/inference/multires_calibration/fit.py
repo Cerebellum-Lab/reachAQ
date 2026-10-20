@@ -14,10 +14,17 @@ board's own squares carry the metric scale, so sigma and the focal length are
 both determined. Camera c maps the motor frame into its own frame as
 X_cam = R(rvec_c) @ X + tvec_c, in mm.
 
-tvec_b is held at zero rather than fitted. Moving the board origin by d and every
-camera by -R_c @ d changes no projection, so the motor frame's origin is a choice,
-not a measurement: it is the board's corner 0 at motor position 0. Fitting it too
+tvec_b is held at zero rather than fitted: it is a gauge choice. Moving the board
+origin by d and every camera by -R_c @ d changes no projection, so the motor frame's
+origin is a choice, not a measurement. Here it is the board's corner 0 at motor
+position 0; the DCS calibration sets the live 3D origin later. Fitting tvec_b too
 would leave J^T J singular and the parameter uncertainties undefined.
+
+k3 is held at 0 (dist keeps all five coefficients, with k3 = 0.0). The board covers
+only the middle of the sensor, about 520 px from the principal point on the
+synthetic rig, and with k3 free the fit put it at -8 +/- 6. That moved the
+distortion at the corners of the 1024 preset's ROI by 2.7 px while fitting the
+covered area no better.
 """
 
 from dataclasses import dataclass
@@ -27,16 +34,19 @@ import cv2
 import numpy as np
 from scipy.optimize import least_squares
 
-# The order of the intrinsic parameters in param_std, and in each camera's block of
-# the parameter vector, matching cv2's distortion order (k1, k2, p1, p2, k3).
+# The order of the intrinsic parameters in param_std, matching cv2's distortion order
+# (k1, k2, p1, p2, k3).
 INTRINSIC_NAMES = ("fx", "fy", "cx", "cy", "k1", "k2", "p1", "p2", "k3")
-# Per camera: the nine intrinsics, then rvec (3) and tvec (3).
-_CAMERA_PARAMS = len(INTRINSIC_NAMES) + 6
+# The intrinsics the fit solves: all but k3, which is held at 0 (see above).
+_FITTED_INTRINSICS = INTRINSIC_NAMES[:-1]
+# Per camera: the fitted intrinsics in that order, then rvec (3) and tvec (3).
+_CAMERA_PARAMS = len(_FITTED_INTRINSICS) + 6
 # The planar calibration that starts the fit sees only parallel planes, so it is
 # degenerate in focal length, and free distortion terms let it wander further. With
 # all five free, its fx on the synthetic rig ranged from 0.6x to 5.5x the truth
 # (k2 down to -2800), and from such a start the joint fit diverged on 1 seed in 30.
-# Fitting k1 alone kept all 30 in the basin. The joint fit then frees all nine.
+# Fitting k1 alone kept all 30 in the basin. The joint fit then frees k2, p1 and p2
+# too; k3 stays at 0 in both.
 _INITIAL_CALIBRATION_FLAGS = cv2.CALIB_FIX_K2 | cv2.CALIB_FIX_K3 | cv2.CALIB_ZERO_TANGENT_DIST
 
 
@@ -134,8 +144,8 @@ def fit_motor_frame(
     def residuals(x: np.ndarray) -> np.ndarray:
         return np.concatenate(_camera_residuals(x, obj, data, camera_names))
 
-    # The Jacobian is by finite differences. With 15 parameters per camera plus 4 shared
-    # (34 for a pair) and one projectPoints call per camera per evaluation, a fit takes
+    # The Jacobian is by finite differences. With 14 parameters per camera plus 4 shared
+    # (32 for a pair) and one projectPoints call per camera per evaluation, a fit takes
     # 1-2 s on christielab10, so an analytic or sparse Jacobian would buy nothing.
     result = least_squares(
         residuals, x0, method="trf", x_scale="jac", loss="linear", ftol=1e-10, xtol=1e-10, gtol=1e-10
@@ -151,8 +161,10 @@ def fit_motor_frame(
         sq = (r.reshape(-1, 2) ** 2).sum(axis=1).reshape(len(data[cam].indices), len(obj))
         rms_px[cam] = float(np.sqrt(sq.mean()))
         per_view[cam] = {i: float(np.sqrt(v)) for i, v in zip(data[cam].indices, sq.mean(axis=1))}
-        block = std[c * _CAMERA_PARAMS:c * _CAMERA_PARAMS + len(INTRINSIC_NAMES)]
-        param_std[cam] = {name: float(v) for name, v in zip(INTRINSIC_NAMES, block)}
+        block = std[c * _CAMERA_PARAMS:c * _CAMERA_PARAMS + len(_FITTED_INTRINSICS)]
+        fitted = dict(zip(_FITTED_INTRINSICS, block))
+        # k3 is held, not estimated, so it has no spread of its own.
+        param_std[cam] = {name: float(fitted.get(name, 0.0)) for name in INTRINSIC_NAMES}
 
     return MotorFrameFit(
         cameras=cameras,
@@ -205,9 +217,9 @@ def _initial_camera(d: _CameraData, obj: np.ndarray, image_size) -> Tuple[np.nda
     tvec = t_mean - s * R_cm @ m_mean
     R_board = R_cm.T @ _mean_rotation(R_views)
 
-    dist = np.asarray(dist, float).ravel()[:5]
+    k1, k2, p1, p2 = np.asarray(dist, float).ravel()[:4]
     params = np.concatenate([
-        [K[0, 0], K[1, 1], K[0, 2], K[1, 2]], dist, cv2.Rodrigues(R_cm)[0].ravel(), tvec,
+        [K[0, 0], K[1, 1], K[0, 2], K[1, 2], k1, k2, p1, p2], cv2.Rodrigues(R_cm)[0].ravel(), tvec,
     ])
     return params, float(s), R_board
 
@@ -226,9 +238,10 @@ def _mean_rotation(rotations: np.ndarray) -> np.ndarray:
 
 
 def _unpack_camera(p: np.ndarray):
-    fx, fy, cx, cy = p[:4]
+    """(K, dist, rvec, tvec) from one camera's block; dist is cv2's five, with k3 = 0."""
+    fx, fy, cx, cy, k1, k2, p1, p2 = p[:8]
     K = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]])
-    return K, p[4:9].copy(), p[9:12].copy(), p[12:15].copy()
+    return K, np.array([k1, k2, p1, p2, 0.0]), p[8:11].copy(), p[11:14].copy()
 
 
 def _camera_residuals(x: np.ndarray, obj: np.ndarray, data: Dict[str, _CameraData], camera_names) -> List[np.ndarray]:
@@ -248,8 +261,9 @@ def _camera_residuals(x: np.ndarray, obj: np.ndarray, data: Dict[str, _CameraDat
 def _parameter_std(J: np.ndarray, r: np.ndarray) -> np.ndarray:
     """sqrt(diag(inv(J^T J)) * residual variance), per parameter.
 
-    The columns are normalised before the inverse because fx (~2000) and k3 differ by
-    orders of magnitude, which would otherwise cost the inverse most of its precision.
+    The columns are normalised before the inverse because fx (~2000) and p1 (~1e-4)
+    differ by orders of magnitude, which would otherwise cost the inverse most of its
+    precision.
     """
     dof = max(len(r) - J.shape[1], 1)
     variance = float(r @ r) / dof

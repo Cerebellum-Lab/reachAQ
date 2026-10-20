@@ -27,6 +27,35 @@ def rotation_angle_deg(a, b):
     return float(np.degrees(np.linalg.norm(cv2.Rodrigues(R)[0])))
 
 
+# Undistortion is iterative; cv2's default stops after 5 iterations, which would let the
+# triangulation test measure the undistortion instead of the fit.
+_UNDISTORT_CRITERIA = (cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, 200, 1e-12)
+
+
+def triangulate(cameras, pixels):
+    """Motor-frame points from the left and right pixels: undistort each camera's pixels to
+    normalised coordinates with its K and dist, then triangulate with its [R|t]."""
+    projections, normalised = [], []
+    for cam in ("left", "right"):
+        m = cameras[cam]
+        n = cv2.undistortPointsIter(
+            np.asarray(pixels[cam], float).reshape(-1, 1, 2), m.K, m.dist, None, None, _UNDISTORT_CRITERIA
+        )
+        normalised.append(n.reshape(-1, 2).T)
+        projections.append(np.hstack([cv2.Rodrigues(m.rvec)[0], np.reshape(m.tvec, (3, 1))]))
+    X = cv2.triangulatePoints(projections[0], projections[1], normalised[0], normalised[1])
+    return (X[:3] / X[3]).T
+
+
+def distortion_displacement(model, pixels):
+    """Distorted minus undistorted projection, in px, of the rays whose undistorted
+    projection through `model` lands on `pixels`."""
+    pixels = np.asarray(pixels, float)
+    rays = np.column_stack([(pixels - model.K[:2, 2]) / np.diag(model.K)[:2], np.ones(len(pixels))])
+    distorted = cv2.projectPoints(rays, np.zeros(3), np.zeros(3), model.K, model.dist)[0].reshape(-1, 2)
+    return distorted - pixels
+
+
 def test_fit_recovers_the_synthetic_rig():
     rig = synthetic_rig(noise_px=0.1)
     fit = fit_motor_frame(rig.observations, rig.board, (1440, 1080))
@@ -38,8 +67,9 @@ def test_fit_recovers_the_synthetic_rig():
         # target can measure, not at the plan's 1 px, 0.05 deg and 0.1 mm. The board's depth
         # range (13 mm at 150 mm) barely separates a principal-point shift from a sideways
         # camera move: they correlate at -1.0 in the fit. With 0.1 px of corner noise the
-        # fit's sigma is 1.1-1.25 px for cx and cy, matching the scatter over 30 seeds
-        # (max 3.2 px, 0.077 deg, 0.30 mm), and the plan's bounds failed 28 of those 30.
+        # fit's sigma is 1.07-1.26 px for cx and cy, matching the scatter over 30 seeds
+        # (max 3.2 px, 0.077 deg, 0.30 mm), and the plan's bounds failed 27 of those 30.
+        # What the cameras are for is unaffected: see the triangulation test.
         # Noise-free, the fit recovers them exactly (see the stereo test).
         assert abs(f.K[0, 2] - t.K[0, 2]) < 4.0 and abs(f.K[1, 2] - t.K[1, 2]) < 4.0
         assert abs(f.dist[0] - t.dist[0]) < 0.02
@@ -95,13 +125,48 @@ def test_fit_converges_when_the_planar_start_is_far_off():
     assert fit.motor_scale == pytest.approx(1.0, abs=0.002)
 
 
+def test_fit_triangulates_the_working_volume_like_truth():
+    rig = synthetic_rig(noise_px=0.1)
+    fit = fit_motor_frame(rig.observations, rig.board, (1440, 1080))
+    # A 10 x 10 x 5 grid over the bounding box of every corner at every waypoint. The
+    # board faces motor z, which the stage moves least, so that axis gets 5 steps.
+    corners = np.concatenate([rig.world_corners(o.motor_mm) for o in rig.observations])
+    lo, hi = corners.min(axis=0), corners.max(axis=0)
+    axes = [np.linspace(lo[i], hi[i], n) for i, n in enumerate((10, 10, 5))]
+    X = np.stack(np.meshgrid(*axes, indexing="ij"), axis=-1).reshape(-1, 3)
+
+    pixels = {
+        cam: cv2.projectPoints(X, t.rvec, t.tvec, t.K, t.dist)[0].reshape(-1, 2)
+        for cam, t in rig.truth.cameras.items()
+    }
+    # The measurement adds no error of its own: the truth models give the grid back.
+    assert np.linalg.norm(triangulate(rig.truth.cameras, pixels) - X, axis=1).max() < 1e-6
+    assert np.linalg.norm(triangulate(fit.cameras, pixels) - X, axis=1).max() < 0.05
+
+
+def test_fitted_distortion_matches_truth_at_the_1024_roi_corners():
+    rig = synthetic_rig(noise_px=0.1)
+    fit = fit_motor_frame(rig.observations, rig.board, (1440, 1080))
+    # The sensor ROI of the 1024x1024 bin-1 preset, PresetGeometry(1, 1024, 1024, 208, 24).
+    # The board does not reach these corners, so this is where the fitted distortion
+    # extrapolates furthest.
+    roi_corners = [(208.0, 24.0), (1232.0, 24.0), (208.0, 1048.0), (1232.0, 1048.0)]
+    for cam in ("left", "right"):
+        fitted = distortion_displacement(fit.cameras[cam], roi_corners)
+        truth = distortion_displacement(rig.truth.cameras[cam], roi_corners)
+        assert np.linalg.norm(fitted - truth, axis=1).max() < 1.0
+
+
 def test_param_std_covers_every_intrinsic():
     rig = synthetic_rig(noise_px=0.1)
     fit = fit_motor_frame(rig.observations, rig.board, (1440, 1080))
     for cam in ("left", "right"):
         std = fit.param_std[cam]
         assert tuple(std) == INTRINSIC_NAMES == ("fx", "fy", "cx", "cy", "k1", "k2", "p1", "p2", "k3")
-        assert all(np.isfinite(v) and v > 0 for v in std.values())
+        # k3 is held at 0, so it is reported as exactly 0 with no spread.
+        dist = fit.cameras[cam].dist
+        assert dist.shape == (5,) and dist[4] == 0.0 and std["k3"] == 0.0
+        assert all(np.isfinite(v) and v > 0 for name, v in std.items() if name != "k3")
         # 0.1 px of noise on ~1800 corners pins the focal length far inside the 0.5 % the
         # recovery test allows; a std near that size would mean the Jacobian is wrong.
         assert std["fx"] / fit.cameras[cam].K[0, 0] < 0.001
