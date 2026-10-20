@@ -12,6 +12,7 @@ import numpy
 import PySpin
 
 from autotrainer.core import get_perf_now
+from autotrainer.core.latency.raw_clock import monotonic_raw_time
 from autotrainer.core.logging import get_verbose_logger
 
 from .camera_base import CameraBase
@@ -651,15 +652,18 @@ class SpinCam(CameraBase):
 
         return frame, self._last_when
 
-    def latch_clock(self) -> Optional[Tuple[float, int, float]]:
+    def latch_clock(self) -> Optional[Tuple[float, int, float, float, float]]:
         """The camera clock latched between two perf_counter reads, or None.
 
         TimestampLatch copies the clock that image timestamps (GetTimeStamp)
         come from into TimestampLatchValue, in ns. The copy happens somewhere
         between the two perf reads, which places the camera clock on the host's
         to within half their gap; the value is read after the second read, so
-        that transfer stays out of the bracket. Never raises: a camera without
-        the nodes returns None, and so does one that fails, logged once.
+        that transfer stays out of the bracket. CLOCK_MONOTONIC_RAW is read
+        just inside the perf pair, so the latch sits in both brackets and a
+        reader may use whichever clock it maps NI time to. Never raises: a
+        camera without the nodes returns None, and so does one that fails,
+        logged once.
         """
         try:
             node_map = self._node_map
@@ -675,9 +679,11 @@ class SpinCam(CameraBase):
                     and PySpin.IsAvailable(value) and PySpin.IsReadable(value)):
                 return None
             perf_before = time.perf_counter()
+            raw_before = monotonic_raw_time()
             latch.Execute()
+            raw_after = monotonic_raw_time()
             perf_after = time.perf_counter()
-            return perf_before, int(value.GetValue()), perf_after
+            return perf_before, int(value.GetValue()), perf_after, raw_before, raw_after
         except Exception as err:
             if not SpinCam._latch_error_logged:
                 SpinCam._latch_error_logged = True

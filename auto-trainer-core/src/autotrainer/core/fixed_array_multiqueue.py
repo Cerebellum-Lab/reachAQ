@@ -124,6 +124,13 @@ class FixedArrayMultiQueue:
         self._put_perf_c = mp_ctx.RawArray(
             ctypes.c_double, self._depth * self._frames_per_camera * self._cam_count)
 
+        # Set once nothing will read this queue again. Frames go in with
+        # block=False, but the end-of-recording marker and its padding block
+        # for a free slot, and with the reader gone none is ever freed: on the
+        # rig every Stop after a pose crash waited 5 s per camera - the camera
+        # watchdog's own threshold - and then raised out of the capture loop.
+        self._consumer_closed = mp_ctx.RawValue(ctypes.c_bool, False)
+
         self._frame_indexing: List[int] = list(numpy.repeat(range(self._frames_per_camera), self._cam_count))
         self._camera_indexing: List[int] = list(numpy.tile(range(self._cam_count), self._frames_per_camera))
 
@@ -158,6 +165,19 @@ class FixedArrayMultiQueue:
     def buffer_index(self) -> int:
         return self._buffer_index[0]
 
+    @property
+    def consumer_closed(self) -> bool:
+        return bool(self._consumer_closed.value)
+
+    def close_consumer(self) -> None:
+        """Tell the writers nothing reads this queue any more.
+
+        Markers and padding are then not put at all: they only mean something
+        to a reader, and waiting for a slot that no reader will free only
+        stalls the writer. Frames are unaffected - they never wait.
+        """
+        self._consumer_closed.value = True
+
     def set_cam_tot_frames(self, cam_idx: int, tot_frames: int):
         """Set the total nbr of frames for cam_idx for eventual sync between camera writers"""
         self._cams_tot_frames[cam_idx].value = tot_frames
@@ -181,6 +201,10 @@ class FixedArrayMultiQueue:
         barrier_wait(timeout=timeout)
         logger.verbose("padding %s frames (put=%s) to sync with others writers",
                      missing, cnt_net_q_put)
+        if self.consumer_closed:
+            # After the barriers, so every writer still meets the others there.
+            logger.info("%s: nothing reads this queue; not padding %s frame(s)", self, missing)
+            return
         for _ in range(missing):
             p_now = time.perf_counter()
             timeout -= p_now - p_before
@@ -366,6 +390,9 @@ class FixedArrayMultiQueue:
     def put_frame_index_category(self, frame, frame_idx: FrameIndexCategory, *,
                                  cam_idx: Optional[int] = None, timeout: float = 10):
         logger.verbose("putting frame index category %s", frame_idx)
+        if self.consumer_closed:
+            logger.info("%s: nothing reads this queue; not sending %s", self, frame_idx)
+            return
         for _ in range(self._frames_per_camera):
             for cdx in range(self._cam_count):
                 if cam_idx is None or cam_idx == cdx:

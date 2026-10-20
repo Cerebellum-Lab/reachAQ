@@ -45,10 +45,15 @@ RECORD_BATCH_DTYPE = numpy.dtype([
 # camera_<name>.h5 - the capture process, a few rows when the stream opens and
 # a few when it closes: the camera's own clock latched between two host reads,
 # so the finalizer can place each frame's camera timestamp on perf_counter.
+# The RAW pair is CLOCK_MONOTONIC_RAW read just inside the perf pair (NaN where
+# the host has none, or from a camera class that does not take it); readers
+# that pair on perf_counter use the first three fields only.
 CLOCK_LATCH_DTYPE = numpy.dtype([
     ("perf_before", "<f8"),
     ("camera_ns", "<i8"),
     ("perf_after", "<f8"),
+    ("raw_before", "<f8"),
+    ("raw_after", "<f8"),
 ])
 
 # record_<name>.h5 - the recorder thread, one row per batch written.

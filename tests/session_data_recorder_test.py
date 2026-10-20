@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import json
 import logging
 import time as stdlib_time
@@ -19,6 +20,7 @@ from autotrainer.core import (
 from tools.acquisition.model import session_data_recorder
 from tools.acquisition.model.session_boundary import SessionBoundary
 from tools.acquisition.model.session_data_recorder import SessionDataRecorder
+from tools.session_validation import ValidationProfile, validate_session
 
 
 class _EventSource(ObservableObject):
@@ -587,7 +589,9 @@ def test_camera_and_tone_edges_are_correlated_on_nidaq_timeline(tmp_path):
 
     camera = result["cameraNidaqAlignment"]
     assert camera["status"] == "matched"
-    assert camera["confidence"] == "hardware_edge"
+    # Chunks without block stamps give no fit, so the epoch method runs, flagged as such.
+    assert camera["confidence"] == "ambiguous_hardware_edge"
+    assert camera["anchorMethod"] == "epoch_nearest_edge"
     assert camera["matchedSampleIndex"] == 101
     assert camera["signedOffsetSeconds"] == 0.0
     assert camera["edgePolarity"] == "rising"
@@ -628,7 +632,7 @@ def test_camera_and_tone_edges_are_correlated_on_nidaq_timeline(tmp_path):
     )
     assert alignment["canonicalBoundary"]["primaryFrameId"] == 42
     assert alignment["canonicalBoundary"]["nidaqSampleIndex"] == 101
-    assert alignment["schemaVersion"] == 2
+    assert alignment["schemaVersion"] == 3
 
 
 def test_all_structured_events_receive_recorded_frame_alignment(tmp_path):
@@ -925,7 +929,8 @@ def test_camera_alignment_matches_falling_square_wave_transition():
     )
 
     assert alignment["status"] == "matched"
-    assert alignment["confidence"] == "hardware_edge"
+    assert alignment["confidence"] == "ambiguous_hardware_edge"
+    assert alignment["anchorMethod"] == "epoch_nearest_edge"
     assert alignment["matchedSampleIndex"] == 202
     assert alignment["signedOffsetSeconds"] == 0.0
     assert alignment["edgePolarity"] == "falling"
@@ -1221,6 +1226,139 @@ def test_post_analysis_trial_ledger_replaces_pending_records_atomically(tmp_path
         "scored_trials": 1,
     }
     assert not tuple(streams.glob("*.tmp"))
+
+
+def _publish_with_a_pending_trial(tmp_path):
+    """Publish a session whose one trial still awaits analysis, as Stop leaves it."""
+    project = ProjectInfo(
+        root=str(tmp_path),
+        device_id="test",
+        when=datetime(2026, 1, 2, 3, 4, 5),
+        session=7,
+    )
+    session_dir = Path(project.get_session_path().location)
+    streams = session_dir / "streams"
+    (streams / "tracking").mkdir(parents=True)
+    # Written by camera finalization and tracking before the recorder publishes.
+    (streams / "camera_alignment.json").write_text('{"status": "ok"}\n')
+    Path(project.get_frame_timing_path()).write_text("frame_id,utc_when\n1,100.0\n")
+    tracking = streams / "tracking" / "trial_000001_attempt_001.json"
+    tracking.write_text(json.dumps({"window": {"startPerf": 10.3, "endPerf": 11.0}}))
+    pending = {
+        "session_id": project.short_id,
+        "operation_id": "send-1",
+        "trial_id": 1,
+        "attempt_id": 1,
+        "attempt_label": "1.1",
+        "send_perf_time": 10.25,
+        "outcome": "pending_analysis",
+    }
+    SessionDataRecorder._write_session(
+        project, 10.0, 100.0, 12.0, (), (), (), (),
+        trial_records=(pending,),
+        trial_summary={"pending_analysis_attempts": 1},
+    )
+    return project, session_dir, tracking, pending
+
+
+def _manifest_entries(session_dir):
+    manifest = json.loads(
+        (session_dir / "streams" / "stream_manifest.json").read_text()
+    )
+    return {item["path"]: item for item in manifest["files"]}
+
+
+def test_trial_ledger_update_keeps_every_finalized_manifest_entry(tmp_path):
+    project, session_dir, tracking, pending = _publish_with_a_pending_trial(tmp_path)
+    before = _manifest_entries(session_dir)
+    for relative in (
+        "streams/pressure.csv",
+        "streams/camera_alignment.json",
+        Path(project.get_frame_timing_path()).name,
+        "streams/nidaq.h5",
+    ):
+        assert relative in before, relative
+    # persist_trial_tracking rewrites the tracking file before every ledger update.
+    record = json.loads(tracking.read_text())
+    tracking.write_text(json.dumps({**record, "result": {"outcome": "success"}}))
+
+    SessionDataRecorder.update_persisted_trial_ledger(
+        project,
+        ({**pending, "outcome": "success"},),
+        {"pending_analysis_attempts": 0, "scored_trials": 1},
+    )
+
+    after = _manifest_entries(session_dir)
+    assert set(before) <= set(after), sorted(set(before) - set(after))
+    # Every listed entry still describes the bytes on disk, as session.manifest checks.
+    for relative, item in after.items():
+        data = (session_dir / relative).read_bytes()
+        assert item["sizeBytes"] == len(data), relative
+        assert item["sha256"] == hashlib.sha256(data).hexdigest(), relative
+    # What the ledger update did not touch keeps what finalization recorded.
+    for relative in ("streams/nidaq.h5", "streams/pressure.csv", "streams/device.csv"):
+        assert after[relative] == before[relative]
+    # Order is part of what finalization wrote.
+    assert [path for path in after if path in before] == list(before)
+
+
+def test_trial_ledger_update_keeps_the_publication_hash_of_a_file_it_did_not_rewrite(
+    tmp_path,
+):
+    # A file edited after publication has to stay detectable: the entry keeps the
+    # hash it was published with, so session.manifest reports the edit.
+    project, session_dir, _, pending = _publish_with_a_pending_trial(tmp_path)
+    before = _manifest_entries(session_dir)["streams/device.csv"]
+    device_csv = session_dir / "streams" / "device.csv"
+    # The same size, so only the hash can tell.
+    data = device_csv.read_bytes()
+    device_csv.write_bytes(b"X" + data[1:])
+    assert hashlib.sha256(device_csv.read_bytes()).hexdigest() != before["sha256"]
+
+    SessionDataRecorder.update_persisted_trial_ledger(
+        project,
+        ({**pending, "outcome": "success"},),
+        {"pending_analysis_attempts": 0, "scored_trials": 1},
+    )
+
+    assert _manifest_entries(session_dir)["streams/device.csv"] == before
+    # The metadata publish that follows analysis hashes the stream manifest it left.
+    metadata = session_dir / "metadata.json"
+    metadata.write_text(json.dumps({"metadataGenerationId": "g"}))
+    (session_dir / "manifest.json").write_text(json.dumps({
+        "schemaVersion": 1,
+        "files": [
+            {
+                "path": path.relative_to(session_dir).as_posix(),
+                "sizeBytes": len(path.read_bytes()),
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            }
+            for path in (metadata, session_dir / "streams" / "stream_manifest.json")
+        ],
+    }))
+    report = validate_session(
+        session_dir, profile=ValidationProfile.FULL, selected_rules=("session.manifest",))
+    result = next(item for item in report.results if item.rule_id == "session.manifest")
+    assert result.status.value == "fail"
+    assert result.message == "hash mismatch streams/device.csv"
+
+
+def test_trial_ledger_update_lists_a_tracking_file_finalization_did_not_see(tmp_path):
+    project, session_dir, tracking, pending = _publish_with_a_pending_trial(tmp_path)
+    late = tracking.with_name("trial_000002_attempt_001.json")
+    late.write_text(json.dumps({"window": {"startPerf": 11.0, "endPerf": 11.5}}))
+    assert "streams/tracking/trial_000002_attempt_001.json" not in _manifest_entries(
+        session_dir
+    )
+
+    SessionDataRecorder.update_persisted_trial_ledger(
+        project,
+        ({**pending, "outcome": "success"},),
+        {"pending_analysis_attempts": 0, "scored_trials": 1},
+    )
+
+    entry = _manifest_entries(session_dir)["streams/tracking/trial_000002_attempt_001.json"]
+    assert entry["sha256"] == hashlib.sha256(late.read_bytes()).hexdigest()
 
 
 def test_auxiliary_generation_is_shared_by_alignment_trials_and_manifest(tmp_path):
@@ -1697,3 +1835,186 @@ def test_no_matching_channel_returns_an_empty_block(tmp_path):
 
     assert names == ()
     assert values.shape == (0, len(indices))
+
+
+def _spool_recorder(tmp_path, session):
+    project = ProjectInfo(root=str(tmp_path), device_id="test",
+                          when=datetime(2026, 1, 2, 3, 4, 5), session=session)
+    ring = SimpleNamespace(channel_names=("barcode",), capacity=16, sample_rate_hz=1000.0)
+    recorder = SessionDataRecorder(SimpleNamespace(sample_ring=ring), _EventSource("trace_received"))
+    return project, ring, recorder
+
+
+def _spool_with_two_reads(recorder, project, ring, *, raw):
+    """Two recorder copies into the spool, as _copy_nidaq_once makes them. The caller
+    keeps the recorder until its finally: abort() (and close()) remove the spool file,
+    as test_nidaq_spool_is_incremental_and_final_output_is_boundary_clipped shows."""
+    with recorder._lock:
+        recorder._project = project
+        recorder._metadata_generation_id = f"{project.short_id}-g1"
+        recorder._open_nidaq_spool_locked()
+        for first, stamp, raw_stamp in ((0, 10.002, 7.002), (4, 10.006, 7.006)):
+            read = {"epoch": 1, "source_perf_time": stamp, "source_wall_time": stamp + 90.0,
+                    "gap_count": 0, "overrun_samples": 0}
+            if raw:
+                read["source_raw_time"] = raw_stamp
+            recorder._append_nidaq_spool_locked(
+                np.arange(first, first + 4, dtype=np.int64),
+                9.999 + np.arange(first, first + 4) / 1000.0,
+                99.999 + np.arange(first, first + 4) / 1000.0,
+                np.array(((0.0, 1.0, 0.0, 1.0),), dtype=np.float32),
+                ring.channel_names,
+                SimpleNamespace(**read),
+            )
+        recorder._close_nidaq_spool_locked()
+        return recorder._snapshot_nidaq_locked()
+
+
+def test_the_spool_and_the_published_nidaq_carry_the_raw_stamp_of_each_read(tmp_path):
+    project, ring, recorder = _spool_recorder(tmp_path, 11)
+    try:
+        snapshot = _spool_with_two_reads(recorder, project, ring, raw=True)
+        with h5py.File(snapshot.path, "r") as spool:
+            assert spool["block_observation_raw_time"][:].tolist() == [7.002] * 4 + [7.006] * 4
+        stamps = SessionDataRecorder._nidaq_block_stamps(snapshot)
+        assert stamps.end_index.tolist() == [3]
+        assert stamps.perf.tolist() == [10.006] and stamps.raw.tolist() == [7.006]
+
+        SessionDataRecorder._write_session(project, 10.0, 100.0, 10.006, (), (), (), snapshot)
+
+        streams = tmp_path / "20260102" / "test" / "session011" / "streams"
+        with h5py.File(streams / "nidaq.h5", "r") as published:
+            raw = published["block_observation_raw_time"][:]
+            assert raw.shape == published["block_observation_perf_time"].shape
+            # Sample 0 (perf 9.999) lies before the boundary and is not published.
+            assert raw.tolist() == [7.002] * 3 + [7.006] * 4
+    finally:
+        recorder.abort()
+
+
+def test_a_read_without_a_raw_stamp_spools_nan(tmp_path):
+    project, ring, recorder = _spool_recorder(tmp_path, 12)
+    try:
+        snapshot = _spool_with_two_reads(recorder, project, ring, raw=False)
+        with h5py.File(snapshot.path, "r") as spool:
+            assert np.isnan(spool["block_observation_raw_time"][:]).all()
+        stamps = SessionDataRecorder._nidaq_block_stamps(snapshot)
+        assert stamps.perf.tolist() == [10.006] and np.isnan(stamps.raw).all()
+    finally:
+        recorder.abort()
+
+
+def test_chunk_tuples_carry_raw_at_position_eleven(tmp_path):
+    project = ProjectInfo(root=str(tmp_path), device_id="test",
+                          when=datetime(2026, 1, 2, 3, 4, 5), session=12)
+    chunks = tuple(
+        (np.arange(first, first + 4, dtype=np.int64),
+         9.999 + np.arange(first, first + 4) / 1000.0,
+         99.999 + np.arange(first, first + 4) / 1000.0,
+         np.zeros((1, 4), dtype=np.float32), ("barcode",), 1000.0, 1, 0, 0,
+         stamp, stamp + 90.0, raw_stamp)
+        for first, stamp, raw_stamp in ((0, 10.002, 7.002), (4, 10.006, 7.006))
+    )
+    stamps = SessionDataRecorder._nidaq_block_stamps(chunks)
+    assert stamps.end_index.tolist() == [3] and stamps.raw.tolist() == [7.006]
+    old_style = tuple(chunk[:9] for chunk in chunks)
+    # Nine-element chunks carry no stamps at all, so there is no pair to keep.
+    assert SessionDataRecorder._nidaq_block_stamps(old_style).perf.size == 0
+
+    SessionDataRecorder._write_session(project, 10.0, 100.0, 10.006, (), (), (), chunks)
+
+    streams = tmp_path / "20260102" / "test" / "session012" / "streams"
+    with h5py.File(streams / "nidaq.h5", "r") as published:
+        # _write_nidaq keeps perf in [10.0, 10.006]: sample 0 at 9.999 is dropped.
+        assert published["block_observation_raw_time"][:].tolist() == [7.002] * 3 + [7.006] * 4
+
+
+def test_a_spool_from_before_the_raw_stamp_publishes_the_column_as_nan(tmp_path):
+    project, ring, recorder = _spool_recorder(tmp_path, 13)
+    try:
+        snapshot = _spool_with_two_reads(recorder, project, ring, raw=True)
+        with h5py.File(snapshot.path, "r+") as spool:
+            del spool["block_observation_raw_time"]
+        stamps = SessionDataRecorder._nidaq_block_stamps(snapshot)
+        assert stamps.perf.tolist() == [10.006] and np.isnan(stamps.raw).all()
+
+        SessionDataRecorder._write_session(project, 10.0, 100.0, 10.006, (), (), (), snapshot)
+
+        streams = tmp_path / "20260102" / "test" / "session013" / "streams"
+        with h5py.File(streams / "nidaq.h5", "r") as published:
+            raw = published["block_observation_raw_time"]
+            assert raw.dtype == np.float64
+            assert raw.shape == published["block_observation_perf_time"].shape == (7,)
+            assert np.isnan(raw[:]).all()
+    finally:
+        recorder.abort()
+
+
+@pytest.mark.parametrize("missing", ["sample_index", "epoch", "block_observation_perf_time",
+                                     "block_observation_wall_time"])
+def test_a_damaged_spool_fails_loudly_where_only_the_raw_column_may_be_absent(tmp_path, missing):
+    project, ring, recorder = _spool_recorder(tmp_path, 14)
+    try:
+        snapshot = _spool_with_two_reads(recorder, project, ring, raw=True)
+        with h5py.File(snapshot.path, "r+") as spool:
+            del spool[missing]
+
+        # Publishing NaN for a lost sample_index would look like a recording.
+        with pytest.raises(KeyError):
+            SessionDataRecorder._write_nidaq_spool_selection(
+                tmp_path / "selection.h5", 10.0, 100.0, 10.006, snapshot)
+    finally:
+        recorder.abort()
+
+
+def test_block_stamps_from_a_spool_hold_one_column_at_a_time(tmp_path):
+    import tracemalloc
+
+    samples, block = 2_000_000, 167
+    stamps = np.repeat(10.0 + np.arange(samples // block + 1) * 0.0167, block)[:samples]
+    path = tmp_path / "nidaq.h5"
+    with h5py.File(path, "w") as handle:
+        handle.create_dataset("sample_index", data=np.arange(samples, dtype=np.int64))
+        handle.create_dataset("block_observation_perf_time", data=stamps)
+        handle.create_dataset("block_observation_raw_time", data=stamps - 3.0)
+    snapshot = session_data_recorder._NidaqSpoolSnapshot(
+        path=path, channel_names=("cam_frames",), sample_rate_hz=10_000.0, sample_count=samples,
+        first_sample_index=0, last_sample_index=samples - 1, first_perf_time=10.0,
+        last_perf_time=10.0 + samples / 10_000.0, gap_count=0, overrun_samples=0,
+        first_error=None, last_error=None, error_count=0, worker_failed=False)
+    runs = samples // block + 1
+    del stamps
+
+    tracemalloc.start()
+    try:
+        result = SessionDataRecorder._nidaq_block_stamps(snapshot)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+    assert result.end_index.size == runs - 1
+    assert np.allclose(result.raw, result.perf - 3.0)
+    # The perf column is dropped before the RAW column is read: one float64 column
+    # (16 MB here) plus the run bookkeeping, not two.
+    assert peak < 1.5 * samples * 8, f"peak {peak / 1e6:.1f} MB"
+
+
+def test_camera_exposures_given_at_arm_reach_finalization(tmp_path, monkeypatch):
+    captured = {}
+    monkeypatch.setattr(SessionDataRecorder, "_write_session",
+                        staticmethod(lambda **snapshot: captured.update(snapshot) or {}))
+    project = ProjectInfo(root=str(tmp_path), device_id="test",
+                          when=datetime(2026, 1, 2, 3, 4, 5), session=13)
+    ring = SimpleNamespace(channel_names=(), capacity=1, sample_rate_hz=1000.0,
+                           copy_since=lambda last, destination: None)
+    laser = _EventSource("trace_received")
+    laser.configuration = SimpleNamespace(backend="disabled")
+    recorder = SessionDataRecorder(SimpleNamespace(sample_ring=ring, timing_plan=None), laser)
+    try:
+        recorder.arm(project, camera_exposure_seconds={"left": 1.75e-4, "right": 1.75e-4})
+        recorder.commit_start(10.0, 100.0)
+        recorder.stop(11.0)
+    finally:
+        recorder.close()
+
+    assert captured["camera_exposure_seconds"] == {"left": 1.75e-4, "right": 1.75e-4}
