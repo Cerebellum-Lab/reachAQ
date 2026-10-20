@@ -959,6 +959,19 @@ def test_frame_alignment_warns_on_a_degraded_anchor_with_the_recorders_reason(
     assert "cameraNidaqAlignment.reason" in result.remediation
 
 
+def test_frame_alignment_does_not_call_a_valid_fit_invalid_when_the_anchor_failed(
+        tmp_path):
+    # The fit still maps the frames; only the first frame's edge came off the epoch.
+    camera = _epoch_alignment(
+        reason="fitted anchor failed (ValueError: empty spool); nearest "
+               "cam_frames transition on the NI-DAQ epoch timeline")
+    result = _alignment_result(_alignment_session(tmp_path, camera))
+    assert result.status.value == "warning", result.message
+    assert result.message.startswith("the first frame was anchored on the NI epoch timeline")
+    assert "fit is invalid" not in result.message
+    assert result.observed["niToHostValid"] is True
+
+
 def test_frame_alignment_warns_when_no_anchor_was_recorded(tmp_path):
     root = _alignment_session(tmp_path)
     alignment_path = root / "streams/alignment.json"

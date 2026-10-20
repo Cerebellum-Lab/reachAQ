@@ -721,8 +721,8 @@ def _frame_alignment_rule(context):
         return _result(
             rule_id, "warning",
             f"alignment.json schema {schema} predates the drift-corrected frame "
-            "alignment: its anchor took the cam_frames transition nearest a single "
-            "NI epoch stamp, which put 15 of 36 checked sessions a frame off",
+            "alignment, whose single NI epoch anchor put 15 of 36 checked sessions "
+            "a frame off",
             observed=observed, paths=paths, remediation=frame_remediation,
         )
     reason = camera.get("reason") or "no reason recorded"
@@ -734,8 +734,10 @@ def _frame_alignment_rule(context):
         warnings.append(f"frames are host-estimated, with no hardware anchor: {reason}")
     elif status != "matched":
         warnings.append(f"the first frame has no NI anchor ({status}): {reason}")
-    elif method == "epoch_nearest_edge" or not fit.get("valid", False):
+    elif method == "epoch_nearest_edge":
         warnings.append(f"the first frame was anchored on the NI epoch timeline: {reason}")
+    elif not fit.get("valid", False):
+        warnings.append(f"the NI-to-host fit is invalid: {reason}")
     elif method not in ("camera_latch", "expected_lag"):
         warnings.append(f"unrecognised anchor method {method!r}: {reason}")
     elif camera.get("confidence") != "hardware_edge" or camera.get("anchorsAgree") is False:
