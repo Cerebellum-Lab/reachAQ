@@ -12,6 +12,7 @@ import cv2
 import numpy as np
 import pytest
 
+from autotrainer.inference.multires_calibration import fit as fit_module
 from autotrainer.inference.multires_calibration.fit import (
     INTRINSIC_NAMES,
     BoardSpec,
@@ -125,11 +126,14 @@ def test_fit_converges_when_the_planar_start_is_far_off():
     assert fit.motor_scale == pytest.approx(1.0, abs=0.002)
 
 
-def test_fit_triangulates_the_working_volume_like_truth():
-    rig = synthetic_rig(noise_px=0.1)
+@pytest.mark.parametrize("frame_rotation_deg", [0.0, 35.0])
+def test_fit_triangulates_the_working_volume_like_truth(frame_rotation_deg):
+    # At 35 degrees the motor axes are turned against the board and cameras about an
+    # oblique axis, so nothing in the fit can lean on them being aligned.
+    rig = synthetic_rig(noise_px=0.1, frame_rotation_deg=frame_rotation_deg)
     fit = fit_motor_frame(rig.observations, rig.board, (1440, 1080))
-    # A 10 x 10 x 5 grid over the bounding box of every corner at every waypoint. The
-    # board faces motor z, which the stage moves least, so that axis gets 5 steps.
+    # A 10 x 10 x 5 grid over the bounding box of every corner at every waypoint. Motor
+    # z, the axis the stage moves least, gets the 5 steps.
     corners = np.concatenate([rig.world_corners(o.motor_mm) for o in rig.observations])
     lo, hi = corners.min(axis=0), corners.max(axis=0)
     axes = [np.linspace(lo[i], hi[i], n) for i, n in enumerate((10, 10, 5))]
@@ -170,6 +174,55 @@ def test_param_std_covers_every_intrinsic():
         # 0.1 px of noise on ~1800 corners pins the focal length far inside the 0.5 % the
         # recovery test allows; a std near that size would mean the Jacobian is wrong.
         assert std["fx"] / fit.cameras[cam].K[0, 0] < 0.001
+
+
+def test_a_camera_the_capture_cannot_determine_reports_infinite_std():
+    rig = synthetic_rig()
+    # The right camera sees the board only at the 8 waypoints at z = -29.4, so its whole
+    # target is one plane and its focal length trades against its distance. Fitted, its
+    # fx lands near 1400 (truth 2310) with an ordinary rms.
+    at_one_height = [o for o in rig.observations if o.motor_mm[2] == -29.4]
+    assert len(at_one_height) == 8
+    for obs in rig.observations:
+        if obs.motor_mm[2] != -29.4:
+            obs.corners.pop("right")
+    fit = fit_motor_frame(rig.observations, rig.board, (1440, 1080))
+    right, left = fit.param_std["right"], fit.param_std["left"]
+    assert right["fx"] == np.inf
+    # Never 0.0, which would read as perfectly determined; k3 is held at 0 by design.
+    assert all(v != 0.0 for name, v in right.items() if name != "k3")
+    # The left camera saw every waypoint, and its uncertainty is still reported.
+    assert all(np.isfinite(v) and v > 0 for name, v in left.items() if name != "k3")
+
+
+def test_a_fit_that_runs_out_of_evaluations_raises(monkeypatch):
+    real_least_squares = fit_module.least_squares
+
+    def capped(*args, **kwargs):
+        # The production limit is explicit; cut it to 2 here so the solver stops early.
+        assert kwargs["max_nfev"] == 400
+        kwargs["max_nfev"] = 2
+        return real_least_squares(*args, **kwargs)
+
+    monkeypatch.setattr(fit_module, "least_squares", capped)
+    rig = synthetic_rig()
+    with pytest.raises(RuntimeError, match=r"status 0 after \d+ evaluations"):
+        fit_motor_frame(rig.observations, rig.board, (1440, 1080))
+
+
+def test_frame_rotation_turns_the_scene_against_the_motor_axes():
+    plain, turned = synthetic_rig(noise_px=0.0), synthetic_rig(noise_px=0.0, frame_rotation_deg=35.0)
+    # The same move list, but the board (and the cameras with it) turned 35 degrees about
+    # the default oblique axis, as seen from the motor frame.
+    np.testing.assert_array_equal(
+        [o.motor_mm for o in plain.observations], [o.motor_mm for o in turned.observations]
+    )
+    R_plain = cv2.Rodrigues(plain.truth.board_rvec)[0]
+    R_turned = cv2.Rodrigues(turned.truth.board_rvec)[0]
+    turn = cv2.Rodrigues(R_turned @ R_plain.T)[0].ravel()
+    assert np.degrees(np.linalg.norm(turn)) == pytest.approx(35.0, abs=1e-9)
+    axis = np.array([0.3, -0.5, 0.81])
+    np.testing.assert_allclose(turn / np.linalg.norm(turn), axis / np.linalg.norm(axis), atol=1e-12)
 
 
 def test_a_camera_with_too_few_waypoints_is_refused():

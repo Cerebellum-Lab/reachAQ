@@ -37,7 +37,7 @@ _RANGE_MM = ((-10.0, 10.0), (10.0, 35.0), (-35.0, -22.0))
 _N_WAYPOINTS = 37  # the start plus 36 moves, as on the rig
 _MIN_STEP_MM = 2.0
 
-_BOARD_ROTATION_DEG = 20.0  # about the motor z axis
+_BOARD_ROTATION_DEG = 20.0  # about the scene's z axis, which is motor z by default
 _CAMERA_DISTANCE_MM = 150.0
 _HALF_SEPARATION_DEG = 20.0  # the two cameras are 40 degrees apart
 _IMAGE_MARGIN_PX = 20.0
@@ -48,7 +48,7 @@ _INTRINSICS = {
     "left": (2300.0, 1.002, 3.0, -2.5, (-0.25, 0.1, 0.0005, -0.0003, 0.0)),
     "right": (2310.0, 1.002, -3.5, 4.0, (-0.24, 0.09, -0.0004, 0.0002, 0.0)),
 }
-# The side of the board each camera stands on, along motor x.
+# The side of the board each camera stands on, along the scene's x (motor x by default).
 _SIDE = {"left": -1.0, "right": 1.0}
 
 _TEXTURE_PX_PER_MM = 50
@@ -68,9 +68,22 @@ class SyntheticRig:
 
 
 def synthetic_rig(
-    *, motor_scale: float = 1.0, noise_px: float = 0.1, seed: int = 0, image_size=(1440, 1080)
+    *,
+    motor_scale: float = 1.0,
+    noise_px: float = 0.1,
+    seed: int = 0,
+    image_size=(1440, 1080),
+    frame_rotation_deg: float = 0.0,
+    frame_rotation_axis: Tuple[float, float, float] = (0.3, -0.5, 0.81),
 ) -> SyntheticRig:
     """Two cameras, 37 waypoints, and Gaussian corner noise of `noise_px` per coordinate.
+
+    By default the scene is aligned with the motor axes: the board faces motor z and the
+    cameras stand apart along motor x. `frame_rotation_deg` turns the whole scene, board
+    and cameras together, by that angle about `frame_rotation_axis` (motor coordinates,
+    normalised here). Seen from the scene, the motor axes are then oblique, so a frame
+    transform that is transposed or only flips signs no longer looks right. The move
+    list does not change.
 
     Raises ValueError if any corner of any waypoint falls behind a camera or within
     _IMAGE_MARGIN_PX of the image edge, so every observation is a full board.
@@ -78,7 +91,11 @@ def synthetic_rig(
     board = BoardSpec()
     width, height = int(image_size[0]), int(image_size[1])
     motor = _move_list()
-    board_rvec = cv2.Rodrigues(_rotation_z(np.radians(_BOARD_ROTATION_DEG)))[0].ravel()
+    axis = np.asarray(frame_rotation_axis, float)
+    # The scene's axes as columns, in motor coordinates. At 0 degrees this is exactly the
+    # identity, so the default rig is unchanged.
+    scene = cv2.Rodrigues(axis / np.linalg.norm(axis) * np.radians(frame_rotation_deg))[0]
+    board_rvec = cv2.Rodrigues(scene @ _rotation_z(np.radians(_BOARD_ROTATION_DEG)))[0].ravel()
 
     # Aim both cameras at the middle of the region the corners sweep, placed from the
     # commanded positions so the cameras do not move with motor_scale.
@@ -91,9 +108,10 @@ def synthetic_rig(
             [0.0, 0.0, 1.0],
         ])
         a = np.radians(_HALF_SEPARATION_DEG)
-        # Both cameras stand on the motor -z side of the board, 20 degrees either side of its normal.
-        eye = centre + _CAMERA_DISTANCE_MM * np.array([_SIDE[cam] * np.sin(a), 0.0, -np.cos(a)])
-        rvec, tvec = _look_at(eye, centre, down=np.array([0.0, 1.0, 0.0]))
+        # Both cameras stand on the scene's -z side of the board, 20 degrees either side of
+        # its normal, with image y along the scene's y.
+        eye = centre + _CAMERA_DISTANCE_MM * scene @ np.array([_SIDE[cam] * np.sin(a), 0.0, -np.cos(a)])
+        rvec, tvec = _look_at(eye, centre, down=scene @ np.array([0.0, 1.0, 0.0]))
         cameras[cam] = CameraModel(K=K, dist=np.array(dist, float), rvec=rvec, tvec=tvec)
 
     rng = np.random.default_rng(seed)

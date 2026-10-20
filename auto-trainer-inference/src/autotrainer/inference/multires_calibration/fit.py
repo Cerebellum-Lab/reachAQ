@@ -48,6 +48,15 @@ _CAMERA_PARAMS = len(_FITTED_INTRINSICS) + 6
 # Fitting k1 alone kept all 30 in the basin. The joint fit then frees k2, p1 and p2
 # too; k3 stays at 0 in both.
 _INITIAL_CALIBRATION_FLAGS = cv2.CALIB_FIX_K2 | cv2.CALIB_FIX_K3 | cv2.CALIB_ZERO_TANGENT_DIST
+# Converging fits on the synthetic rig took 7-44 evaluations. A fit that wanders along
+# an undetermined direction can take thousands (one took 105 s for 1586), so stop it
+# early and raise instead.
+_MAX_EVALUATIONS = 400
+# Directions of the normalised J^T J whose eigenvalue is below 1/_MAX_CONDITION of the
+# largest are treated as undetermined by the capture. Good captures on the synthetic
+# rig sit at a condition number of 4.5e6 in every one of 30 seeds; a camera that sees
+# the board in only one plane sits at 3.8e10 to 2.6e11, with its fx off by 40-60 %.
+_MAX_CONDITION = 1e9
 
 
 @dataclass(frozen=True)
@@ -148,8 +157,22 @@ def fit_motor_frame(
     # (32 for a pair) and one projectPoints call per camera per evaluation, a fit takes
     # 1-2 s on christielab10, so an analytic or sparse Jacobian would buy nothing.
     result = least_squares(
-        residuals, x0, method="trf", x_scale="jac", loss="linear", ftol=1e-10, xtol=1e-10, gtol=1e-10
+        residuals,
+        x0,
+        method="trf",
+        x_scale="jac",
+        loss="linear",
+        ftol=1e-10,
+        xtol=1e-10,
+        gtol=1e-10,
+        max_nfev=_MAX_EVALUATIONS,
     )
+    # Status 0 is the evaluation limit, and below that bad input: no usable fit either way.
+    if result.status <= 0:
+        raise RuntimeError(
+            f"the motor-frame fit did not converge: least_squares status {result.status}"
+            f" after {result.nfev} evaluations ({result.message})"
+        )
     x = result.x
 
     cameras, rms_px, per_view, param_std = {}, {}, {}, {}
@@ -259,19 +282,29 @@ def _camera_residuals(x: np.ndarray, obj: np.ndarray, data: Dict[str, _CameraDat
 
 
 def _parameter_std(J: np.ndarray, r: np.ndarray) -> np.ndarray:
-    """sqrt(diag(inv(J^T J)) * residual variance), per parameter.
+    """sqrt(diag(inv(J^T J)) * residual variance) per parameter, or inf where the
+    capture does not determine the parameter.
 
-    The columns are normalised before the inverse because fx (~2000) and p1 (~1e-4)
-    differ by orders of magnitude, which would otherwise cost the inverse most of its
-    precision.
+    The columns are normalised first because fx (~2000) and p1 (~1e-4) differ by orders
+    of magnitude. The inverse is taken through the eigenvectors of the normalised J^T J,
+    over the determined directions only, so no variance can come out negative or be
+    clipped to a 0 that would read as "perfectly determined". A parameter is reported
+    as inf when the undetermined directions outweigh the rest of its variance even at
+    the largest eigenvalue still counted as undetermined; the true weight is larger.
     """
     dof = max(len(r) - J.shape[1], 1)
     variance = float(r @ r) / dof
+    std = np.full(J.shape[1], np.inf)
     norms = np.linalg.norm(J, axis=0)
-    norms[norms == 0] = 1.0
-    Js = J / norms
-    try:
-        cov = np.linalg.inv(Js.T @ Js) / np.outer(norms, norms)
-    except np.linalg.LinAlgError:
-        return np.full(J.shape[1], np.inf)
-    return np.sqrt(np.clip(np.diag(cov), 0.0, None) * variance)
+    used = norms > 0  # a parameter that moves no residual is undetermined outright
+    w, V = np.linalg.eigh((J[:, used] / norms[used]).T @ (J[:, used] / norms[used]))
+    if w[-1] <= 0:
+        return std
+    floor = w[-1] / _MAX_CONDITION
+    weak = w <= floor
+    determined_var = (V[:, ~weak] ** 2 / w[~weak]).sum(axis=1)
+    undetermined = (V[:, weak] ** 2).sum(axis=1) / floor > determined_var
+    s = np.sqrt(determined_var * variance) / norms[used]
+    s[undetermined] = np.inf
+    std[used] = s
+    return std
