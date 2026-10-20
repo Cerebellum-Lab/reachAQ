@@ -1,0 +1,316 @@
+"""What a preset gets from the motor-frame fit: stereo parameters, the 3D frame and the exports.
+
+The fit is in full-sensor pixels; every preset gets its own stereo_params with the
+intrinsics mapped to its pixels, so today's loaders and live path read it unchanged.
+The frame transform replaces the old reorientation in `oriented = (raw - offsets) @ M`
+and must give motor-axis millimetres with the signs the DCS chain expects, so a motor
+step maps back to that step. The DeepLabCut and anipose exports must reproduce the
+same 3D points as reachAQ's triangulation.
+
+The tests use the synthetic rig's truth cameras, noise-free, as the fit, and points
+in the working volume the board sweeps: board corners at a grid of motor positions
+spanning the waypoints, kept where both cameras see them inside the presets' ROI.
+
+The synthetic cameras stand symmetric about motor z, which makes their rectified
+frame the motor frame (R1 @ R_left is the identity), so M is just diag(signs) and a
+transposed or misordered M would pass. The frame tests therefore also run with the
+motor frame turned about a generic axis, as on the rig, where the cameras sit at
+unequal azimuths and elevations.
+"""
+
+import dataclasses
+import pickle
+
+import cv2
+import numpy as np
+import pandas as pd
+import pytest
+
+from autotrainer.core import Offset3DTuple
+from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
+from autotrainer.inference.analysis.prepare_jetson_data import _undistort_points
+from autotrainer.inference.multires_calibration.geometry import (
+    PresetGeometry,
+    map_intrinsics,
+    presets_from_base,
+    sensor_to_preset_points,
+)
+from autotrainer.inference.multires_calibration.products import (
+    STEREO_KEY,
+    anipose_toml,
+    frame_transform,
+    motor_to_inference_signs,
+    preset_stereo_params,
+)
+from multires_synthetic import synthetic_rig
+
+
+RIG = synthetic_rig(noise_px=0.0)
+FIT = RIG.truth  # noise-free, the truth cameras stand in for a fit
+PRESETS = presets_from_base(PresetGeometry(4, 256, 256, 52, 6))
+CAMERAS = ("left", "right")
+
+
+def turned(fit, Q):
+    """`fit` with its motor frame turned by the rotation Q: point X becomes Q @ X, and each
+    camera's rotation becomes R_c @ Q^T, so every point keeps its pixels."""
+    cameras = {
+        cam: dataclasses.replace(m, rvec=cv2.Rodrigues(cv2.Rodrigues(m.rvec)[0] @ Q.T)[0].ravel())
+        for cam, m in fit.cameras.items()
+    }
+    board_rvec = cv2.Rodrigues(Q @ cv2.Rodrigues(fit.board_rvec)[0])[0].ravel()
+    return dataclasses.replace(fit, cameras=cameras, board_rvec=board_rvec)
+
+
+# 35 degrees about a generic axis. frame -> (fit, Q), with motor-frame points X @ Q.T.
+_Q_TURN = cv2.Rodrigues(np.array([0.3, -0.5, 0.2]))[0]
+FRAMES = {"symmetric": (FIT, np.eye(3)), "turned": (turned(FIT, _Q_TURN), _Q_TURN)}
+
+
+def preset_id(g):
+    return g.name
+
+
+def working_volume_points():
+    """(N, 3) motor-frame points: board corners at a 3x3x3 grid of motor positions spanning
+    the waypoints, kept where both truth cameras see them inside the presets' sensor ROI."""
+    motor = np.array([o.motor_mm for o in RIG.observations])
+    axes = [np.linspace(lo, hi, 3) for lo, hi in zip(motor.min(axis=0), motor.max(axis=0))]
+    X = np.concatenate([RIG.world_corners(m) for m in np.stack(np.meshgrid(*axes), axis=-1).reshape(-1, 3)])
+    # sensor_roi is in pixel edges; in the pixel-centre convention the ROI spans [x0 - 0.5, x1 - 0.5].
+    # Every preset covers the same sensor window.
+    x0, y0, x1, y1 = PRESETS[0].sensor_roi()
+    inside = np.ones(len(X), bool)
+    for cam in CAMERAS:
+        u = sensor_pixels(X, cam)
+        inside &= (u[:, 0] >= x0 - 0.5) & (u[:, 0] <= x1 - 0.5) & (u[:, 1] >= y0 - 0.5) & (u[:, 1] <= y1 - 0.5)
+    assert inside.sum() > 500, "the working-volume grid barely overlaps the ROI; the tests would prove little"
+    return X[inside]
+
+
+def sensor_pixels(X, cam, fit=FIT):
+    m = fit.cameras[cam]
+    return cv2.projectPoints(np.asarray(X, float), m.rvec, m.tvec, m.K, m.dist)[0].reshape(-1, 2)
+
+
+def preset_pixels(X, g, fit=FIT):
+    """{camera: (N, 2) pixel positions in preset g} of motor-frame points X, through fit's cameras."""
+    return {cam: sensor_to_preset_points(sensor_pixels(X, cam, fit), g) for cam in CAMERAS}
+
+
+def detections(pixels):
+    """One frame of (x, y, likelihood) per point, flattened, as pose detections arrive."""
+    return np.column_stack([pixels, np.ones(len(pixels))]).reshape(1, -1)
+
+
+def reachaq_raw(stereo, pixels):
+    """Rectified-left 3D points, computed as PoseAlgorithm._triangulate_3d_live does."""
+    m = stereo.matrix
+    undistorted = [
+        _undistort_points(
+            detections(pixels[cam]), m[f"cameraMatrix{i}"], m[f"distCoeffs{i}"], m[f"R{i}"], m[f"P{i}"], m["rot_cor"]
+        ).reshape(-1, 3)[:, :2].T.astype(np.float64)
+        for i, cam in enumerate(CAMERAS, start=1)
+    ]
+    homogeneous = cv2.triangulatePoints(m["P1"][:3], m["P2"][:3], undistorted[0], undistorted[1])
+    return (homogeneous / homogeneous[3])[:3].T
+
+
+# Converged undistortion: cv2's default stops after 5 iterations.
+_UNDISTORT_CRITERIA = (cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, 200, 1e-15)
+
+
+def exact_raw(stereo, pixels):
+    """reachaq_raw's chain (undistort with R_i and P_i, triangulate with P1 and P2) in float64 throughout.
+
+    _undistort_points casts the pixels to float32, and cv2 then returns float32. One
+    float32 ulp is 2e-6 mm in every preset here (7.6e-6 px at 128 px x 0.26 mm/px at
+    bin 4; 3.1e-5 px at 512 px x 0.065 mm/px at bin 1), and the live chain measured
+    up to 5.7e-6 mm against 1e-13 mm in float64. A check at 1e-6 mm therefore needs this.
+    """
+    m = stereo.matrix
+    undistorted = [
+        cv2.undistortPointsIter(
+            np.asarray(pixels[cam], np.float64).reshape(-1, 1, 2), m[f"cameraMatrix{i}"], m[f"distCoeffs{i}"],
+            m[f"R{i}"], m[f"P{i}"], _UNDISTORT_CRITERIA,
+        ).reshape(-1, 2).T
+        for i, cam in enumerate(CAMERAS, start=1)
+    ]
+    homogeneous = cv2.triangulatePoints(m["P1"][:3], m["P2"][:3], undistorted[0], undistorted[1])
+    return (homogeneous / homogeneous[3])[:3].T
+
+
+def test_preset_stereo_params_keys_and_shapes():
+    g = PresetGeometry(4, 256, 256, 52, 6)
+    sp = preset_stereo_params(FIT, g)
+    assert sp.key_name == STEREO_KEY == "left-right"
+    assert set(sp.matrix) >= {"cameraMatrix1", "cameraMatrix2", "distCoeffs1", "distCoeffs2", "R", "T",
+                              "E", "F", "R1", "R2", "P1", "P2", "roi1", "roi2", "Q", "image_shape", "rot_cor"}
+    assert sp.matrix["image_shape"] == [(256, 256), (256, 256)] and sp.matrix["rot_cor"] == 0.0
+    assert isinstance(sp.matrix["rot_cor"], float)
+    # The shapes today's stereoCalibrate pickles have, so code that indexes them keeps working.
+    shapes = {"cameraMatrix1": (3, 3), "cameraMatrix2": (3, 3), "distCoeffs1": (1, 5), "distCoeffs2": (1, 5),
+              "R": (3, 3), "T": (3, 1), "E": (3, 3), "F": (3, 3), "R1": (3, 3), "R2": (3, 3),
+              "P1": (3, 4), "P2": (3, 4), "Q": (4, 4)}
+    assert {k: np.shape(sp.matrix[k]) for k in shapes} == shapes
+    assert len(sp.matrix["roi1"]) == 4 and len(sp.matrix["roi2"]) == 4
+    for i, cam in enumerate(CAMERAS, start=1):
+        np.testing.assert_allclose(sp.matrix[f"cameraMatrix{i}"], map_intrinsics(FIT.cameras[cam].K, g), rtol=1e-12)
+        np.testing.assert_array_equal(sp.matrix[f"distCoeffs{i}"].ravel(), FIT.cameras[cam].dist)
+    R, T = FIT.stereo("left", "right")
+    np.testing.assert_allclose(sp.matrix["R"], R, atol=1e-12)
+    np.testing.assert_allclose(sp.matrix["T"].ravel(), T, atol=1e-9)
+
+
+@pytest.mark.parametrize("alpha", [1.0, 0.0])
+def test_rectification_uses_width_then_height(alpha):
+    # The presets are square, so only a non-square image tells (width, height) from the
+    # (height, width) the legacy calibration passed. The full sensor is 1440x1080.
+    g = PresetGeometry(1, 1440, 1080, 0, 0)
+    m = preset_stereo_params(FIT, g, alpha=alpha).matrix
+    args = (m["cameraMatrix1"], m["distCoeffs1"], m["cameraMatrix2"], m["distCoeffs2"])
+    R, T = FIT.stereo("left", "right")
+    right_order = cv2.stereoRectify(*args, (1440, 1080), R, T.reshape(3, 1), alpha=alpha)
+    swapped = cv2.stereoRectify(*args, (1080, 1440), R, T.reshape(3, 1), alpha=alpha)
+    names = ("R1", "R2", "P1", "P2", "Q", "roi1", "roi2")
+    for name, value in zip(names, right_order):
+        np.testing.assert_allclose(m[name], value, rtol=0, atol=1e-9)
+    # The comparison can tell the two orders apart: the rectified principal point moves.
+    assert np.abs(swapped[2] - right_order[2]).max() > 10.0
+    assert m["image_shape"] == [(1440, 1080), (1440, 1080)]
+
+
+def test_essential_and_fundamental_matrices_satisfy_the_epipolar_constraint():
+    g = PresetGeometry(2, 512, 512, 104, 12)
+    m = preset_stereo_params(FIT, g).matrix
+    X = working_volume_points()
+    # Undistorted projections: normalised camera coordinates, and preset pixels through the preset K.
+    normalised = {}
+    for cam in CAMERAS:
+        c = FIT.cameras[cam]
+        X_cam = X @ cv2.Rodrigues(c.rvec)[0].T + c.tvec
+        normalised[cam] = np.column_stack([X_cam[:, :2] / X_cam[:, 2:], np.ones(len(X))])
+    algebraic = np.einsum("ni,ij,nj->n", normalised["right"], m["E"], normalised["left"])
+    assert np.abs(algebraic).max() < 1e-9 * np.linalg.norm(m["T"])
+    x1 = normalised["left"] @ m["cameraMatrix1"].T
+    x2 = normalised["right"] @ m["cameraMatrix2"].T
+    lines = x1 @ m["F"].T  # epipolar line in the right image of each left point
+    distance_px = np.abs(np.sum(x2 * lines, axis=1)) / np.linalg.norm(lines[:, :2], axis=1)
+    assert distance_px.max() < 1e-6
+    assert m["F"][2, 2] == pytest.approx(1.0)
+
+
+def test_signs_are_read_from_the_dcs_flips(monkeypatch):
+    # Today's DCS convention: inference x runs against motor x, y and z with it.
+    assert motor_to_inference_signs() == (-1, 1, 1)
+    monkeypatch.setattr(DiamondTriangleOffsetConfig, "flips_inference_motor", Offset3DTuple(-1, 1, -1))
+    assert motor_to_inference_signs() == (1, -1, 1)
+    # A DCS map that scales an axis is not a sign flip, and must not be read as one.
+    monkeypatch.setattr(DiamondTriangleOffsetConfig, "flips_inference_motor", Offset3DTuple(2, -1, -1))
+    with pytest.raises(ValueError):
+        motor_to_inference_signs()
+
+
+@pytest.mark.parametrize("frame", FRAMES)
+@pytest.mark.parametrize("g", PRESETS, ids=preset_id)
+def test_live_pipeline_on_preset_points_recovers_motor_displacements(g, frame):
+    fit, Q = FRAMES[frame]
+    X = working_volume_points() @ Q.T
+    stereo = preset_stereo_params(fit, g)
+    signs = motor_to_inference_signs()
+    raw = reachaq_raw(stereo, preset_pixels(X, g, fit))
+    oriented = (raw - raw[0]) @ frame_transform(fit, stereo, signs)
+    expected = (X - X[0]) * np.array(signs)
+    assert np.abs(oriented - expected).max() < 0.05
+
+
+@pytest.mark.parametrize("frame", FRAMES)
+@pytest.mark.parametrize("g", PRESETS, ids=preset_id)
+def test_a_motor_step_maps_back_through_the_dcs_chain(g, frame):
+    # The live chain's own float32 rounding (see exact_raw) is covered by the test above;
+    # this one pins the signs and axes, so it runs the same chain in float64.
+    fit, Q = FRAMES[frame]
+    stereo = preset_stereo_params(fit, g)
+    M = frame_transform(fit, stereo, motor_to_inference_signs())
+    zero = Offset3DTuple(0.0, 0.0, 0.0)
+    dcs = DiamondTriangleOffsetConfig(used_position=zero, measured_offset=zero)
+    start = (working_volume_points() @ Q.T).mean(axis=0)
+    for k in range(3):
+        e_k = np.eye(3)[k]
+        raw = exact_raw(stereo, preset_pixels(np.array([start, start + e_k]), g, fit))
+        d = (raw[1] - raw[0]) @ M
+        step = np.array(dcs.inference_to_motor(Offset3DTuple(*d))) - np.array(dcs.inference_to_motor(zero))
+        np.testing.assert_allclose(step, e_k, rtol=0, atol=1e-6)
+
+
+def test_anipose_toml_reads_back():
+    tomli = pytest.importorskip("tomli")
+    # A noisy rig's truth carries the injected noise as its rms_px, so the error is not 0.
+    fit = synthetic_rig(noise_px=0.1).truth
+    g = PresetGeometry(1, 1024, 1024, 208, 24)
+    data = tomli.loads(anipose_toml(fit, g))
+    assert sorted(data) == ["cam_0", "cam_1", "metadata"]
+    for key, cam in (("cam_0", "left"), ("cam_1", "right")):
+        table, m = data[key], fit.cameras[cam]
+        assert table["name"] == cam and table["size"] == [1024, 1024]
+        # Written at repr precision, so every value reads back exactly.
+        np.testing.assert_array_equal(table["matrix"], map_intrinsics(m.K, g))
+        np.testing.assert_array_equal(table["distortions"], m.dist)
+        np.testing.assert_array_equal(table["rotation"], m.rvec)
+        np.testing.assert_array_equal(table["translation"], m.tvec)
+        assert len(table["distortions"]) == 5
+    assert data["metadata"]["adjusted"] is False
+    assert data["metadata"]["error"] == np.mean([fit.rms_px[c] for c in CAMERAS]) > 0
+
+
+@pytest.mark.parametrize("g", PRESETS, ids=preset_id)
+def test_anipose_toml_cameras_triangulate_preset_pixels_to_motor_points(g):
+    # aniposelib is not installed, so do what CameraGroup.triangulate does with the read-back
+    # cameras: cv2.undistortPoints to normalised coordinates, then a DLT with each [R|t].
+    tomli = pytest.importorskip("tomli")
+    data = tomli.loads(anipose_toml(FIT, g))
+    X = working_volume_points()
+    pixels = preset_pixels(X, g)
+    normalised, projections = [], []
+    for key, cam in (("cam_0", "left"), ("cam_1", "right")):
+        table = data[key]
+        n = cv2.undistortPoints(pixels[cam].reshape(-1, 1, 2), np.array(table["matrix"]), np.array(table["distortions"]))
+        normalised.append(n.reshape(-1, 2).T)
+        R = cv2.Rodrigues(np.array(table["rotation"]))[0]
+        projections.append(np.hstack([R, np.reshape(table["translation"], (3, 1))]))
+    homogeneous = cv2.triangulatePoints(projections[0], projections[1], normalised[0], normalised[1])
+    np.testing.assert_allclose((homogeneous[:3] / homogeneous[3]).T, X, rtol=0, atol=1e-4)
+
+
+@pytest.mark.parametrize("g", PRESETS, ids=preset_id)
+def test_deeplabcut_triangulates_the_export_like_reachaq(g, tmp_path):
+    dlc_tri = pytest.importorskip("deeplabcut.pose_estimation_3d.triangulation")
+    from deeplabcut.utils import auxiliaryfunctions, auxiliaryfunctions_3d
+
+    X = working_volume_points()
+    stereo = preset_stereo_params(FIT, g)
+    pixels = preset_pixels(X, g)
+    reachaq = reachaq_raw(stereo, pixels)
+
+    # Through a pickle and DLC's own reader, as deeplabcut.triangulate loads stereo_params.pickle.
+    path = tmp_path / "stereo_params.pickle"
+    with path.open("wb") as fh:
+        pickle.dump(stereo.as_pickle_dict(), fh)
+    stereo_file = auxiliaryfunctions.read_pickle(path)
+    # deeplabcut.triangulate keys the pair by the project's camera names, cam_names[0] + "-" + cam_names[1].
+    cam_names = list(CAMERAS)
+    stereo_matrix = stereo_file[cam_names[0] + "-" + cam_names[1]]
+
+    # A single-animal DLC frame: (scorer, bodyparts, coords) columns of x, y, likelihood.
+    columns = pd.MultiIndex.from_product(
+        [["synthetic"], [f"point{j}" for j in range(len(X))], ["x", "y", "likelihood"]],
+        names=["scorer", "bodyparts", "coords"],
+    )
+    views = tuple(pd.DataFrame(detections(pixels[cam]), columns=columns) for cam in CAMERAS)
+    left, right = dlc_tri._undistort_views([views], stereo_file)[0]
+    # As deeplabcut.triangulate reshapes them for one individual.
+    x1 = left.to_numpy().reshape((1, 1, -1, 3))[..., :2][:, 0].reshape((-1, 2)).T
+    x2 = right.to_numpy().reshape((1, 1, -1, 3))[..., :2][:, 0].reshape((-1, 2)).T
+    dlc = auxiliaryfunctions_3d.triangulatePoints(stereo_matrix["P1"], stereo_matrix["P2"], x1, x2)[:3].T
+
+    np.testing.assert_allclose(dlc, reachaq, rtol=0, atol=1e-6)
