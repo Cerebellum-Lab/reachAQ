@@ -146,10 +146,17 @@ def align_camera_timestamp_files(
         extra = tuple(frame_id for frame_id in ids if frame_id not in primary_id_set)
         early = tuple(frame_id for frame_id in extra if frame_id < primary_first)
         late = tuple(frame_id for frame_id in extra if frame_id > primary_last)
+        # The frame_present_<camera> column's total: a blank the capture
+        # inserted for a dropped frame has a row but no arrival time.
+        present = sum(
+            1 for frame_when in table["frame_when"].reindex(primary_ids)
+            if _finite(frame_when)
+        )
         camera_diagnostics[source.name] = {
             "firstFrameId": ids[0],
             "lastFrameId": ids[-1],
             "timestampRows": len(ids),
+            "presentFrames": present,
             "frameIdGapCount": gaps,
             "missingPrimaryFrameIds": list(missing),
             "extraFrameIds": list(extra),

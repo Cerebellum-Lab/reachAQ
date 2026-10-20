@@ -202,7 +202,11 @@ from tools.acquisition.model.softmouse_spreadsheet_source import (
     SoftMouseSpreadsheetSource,
 )
 from tools.acquisition.model.session_data_recorder import SessionDataRecorder
-from tools.acquisition.model.session_telemetry import SessionTelemetry, describe_latency_status
+from tools.acquisition.model.session_telemetry import (
+    SessionTelemetry,
+    describe_latency_status,
+    exact_session_capture,
+)
 from tools.acquisition.model.stim_latency_budget import StimLatencyBudget
 from tools.acquisition.model.atomic_session_io import (
     atomic_publish_file,
@@ -2357,6 +2361,27 @@ class AppModel(ObservableObject):
         )
         self._remove_timestamps_txt_files(project, cams)
         return diagnostics
+
+    def _exact_session_capture(self, project: ProjectInfo) -> Optional[dict]:
+        """The session's exact frame counts, or None when its files cannot say.
+
+        Read at finalize, after the timeline merge and the pose files' close.
+        A statistic never fails a finalization, so any error is logged here.
+        """
+        try:
+            session_dir = Path(project.get_session_path(skip_ensure=True).location)
+            alignment_path = session_dir / "streams" / "camera_alignment.json"
+            if not alignment_path.is_file():
+                return None
+            alignment = json.loads(alignment_path.read_text(encoding="utf-8"))
+            posed_frame_paths = {
+                name: Path(project.get_video_path(name, allow_overwrite=True)[2])
+                for name in alignment.get("cameras", {})
+            }
+            return exact_session_capture(alignment, posed_frame_paths)
+        except Exception:
+            logger.exception("Exact session capture counts were not computed")
+            return None
 
     def _get_monitored_cams(self):
         return self._ordered_reach_cameras(enabled_only=True)
@@ -10088,6 +10113,10 @@ class AppModel(ObservableObject):
                 self._recording_session.boundary.end_wall_time,
             )
             self._session_telemetry.end(end_perf)
+            self._recording_session.set_capture_telemetry({
+                **self._session_telemetry.summary(),
+                "exact": self._exact_session_capture(project),
+            })
             stream_result = self._session_data_recorder.stop(end_perf)
         except Exception as first_error:
             logger.exception(
@@ -10626,10 +10655,16 @@ class AppModel(ObservableObject):
                 # that dropped nothing, and carried an 8.5 s end-to-end max
                 # from the first frame through the warming pipeline. Rebase
                 # here so the percentage measures the two running together.
-                # A recording owns the counters once it starts, so this
-                # never moves a session's baseline.
-                if (self._recording_session.status
-                        is not SessionRecordingStatus.RECORDING):
+                # A recording owns the counters from its first frame until it
+                # is finalized, so this never moves a session's baseline. That
+                # includes Stopping: the pose process handles EOF_RECORDING
+                # and comes straight back to live while the session is still
+                # being saved, and rebasing there zeroed the saved figures.
+                if self._recording_session.status not in {
+                    SessionRecordingStatus.RECORDING,
+                    SessionRecordingStatus.STOPPING,
+                    SessionRecordingStatus.ANALYZING,
+                }:
                     self._begin_session_telemetry()
             elif value == InferenceStatus.stopped:
                 current = self._acquisition.subsystems.get(
@@ -11307,8 +11342,14 @@ class AppModel(ObservableObject):
                 "artifacts": artifacts,
                 # What the operator watched during the recording, kept so the
                 # same numbers can be read back from the session rather than
-                # only having existed on screen.
-                "capture": self._session_telemetry.summary(),
+                # only having existed on screen. Taken as the session was
+                # finalized: a notes save rewrites this file later, by when
+                # the counters may have been rebased for preview.
+                "capture": (
+                    self._session_telemetry.summary()
+                    if self._recording_session.capture_telemetry is None
+                    else self._recording_session.capture_telemetry
+                ),
                 # The latency record's status: per-loop completeness, the
                 # clock fits it used, and why anything is missing.
                 "latency": dict(self._latency_status),
