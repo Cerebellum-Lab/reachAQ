@@ -1,7 +1,10 @@
-"""Clock mappings for the latency record.
+"""Clock mappings for the latency record and the session's frame alignment.
 
-Every mapping is a straight line, y = offset + drift * x, fitted once per
-session. Each fit carries its own quality numbers and a validity verdict, so a
+A mapping is a straight line, y = offset + drift * x, or for NI to host a
+continuous piecewise-linear table (PiecewiseClockFit) with a knot every
+KNOT_SECONDS: time.perf_counter() is CLOCK_MONOTONIC, which systemd-timesyncd
+slews at every poll, and one line per session leaves millisecond errors after
+an hour. Each fit carries its own quality numbers and a validity verdict, so a
 figure derived through it can say how far to trust it, and an invalid mapping
 lowers the confidence of what depends on it instead of quietly producing a
 number.
@@ -11,7 +14,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy
 
@@ -21,6 +24,32 @@ WALL_SEGMENT_JUMP_SECONDS = 0.001
 ENVELOPE_BINS = 20
 PAIRING_MARGIN_SECONDS = 0.0001
 PAIRING_MIN_AGREEMENT = 0.95
+# NI-to-host is fitted window by window, joined at the knots, because the
+# host clock is slewed by NTP: timesyncd polls every 2048 s and the kernel
+# steps the rate by up to about 6.5 ppm, decaying over 512 s. Simulated on
+# christielab10's settings (ntp/pll_sim.py, 2026-10-07): one line per session
+# leaves p95 errors of 1.9-4.3 ms at 1 h; 120 s windows leave under 0.4 ms.
+# A window with fewer envelope points than MIN_WINDOW_POINTS (a short tail, a
+# gap) merges into its neighbour rather than fitting noise.
+KNOT_SECONDS = 120.0
+MIN_WINDOW_POINTS = 10
+# A RAW-bridged fit is exact at every stamp; its stored table samples it this
+# often, which keeps linear interpolation under 50 us across a 10 ppm kink.
+RECORD_KNOT_SECONDS = 10.0
+PIECEWISE_ENVELOPE = "piecewise_envelope"
+RAW_BRIDGED = "raw_bridged"
+STRAIGHT_LINE = "straight_line"
+# A bridge knot's perf-minus-RAW offset is the median over the stamp pairs
+# this close to it (200 pairs at the 10 ms copy cadence), so one pair whose
+# reader was preempted between its two clock reads cannot move a knot. A knot
+# closer than BRIDGE_TAIL_SECONDS to the end is dropped for the end knot, so
+# no segment is milliseconds long with a drift made of noise. RAW stamps that
+# span less than BRIDGE_MIN_RAW_COVERAGE of the stamps' span are not bridged
+# over the rest: the bridge would carry the last offset it saw across slews it
+# never observed.
+BRIDGE_WINDOW_SECONDS = 1.0
+BRIDGE_TAIL_SECONDS = 5.0
+BRIDGE_MIN_RAW_COVERAGE = 0.9
 # A camera clock latch is one USB round trip: christielab10's BFS-U3-16S2M
 # brackets it in 0.14-0.58 ms inside the running app (60 latches, median
 # 0.27 ms) and in about 0.20 ms with the app closed. 2 ms admits several times
@@ -60,7 +89,9 @@ class ClockFit:
     def map(self, x):
         return self.offset + self.drift * numpy.asarray(x, dtype=numpy.float64)
 
-    def as_record(self) -> dict:
+    def as_record(self, *, include_knots: bool = True) -> dict:
+        # include_knots is PiecewiseClockFit's; accepted here so a caller that
+        # may hold either kind of fit does not have to ask which.
         return dataclasses.asdict(self)
 
 
@@ -151,8 +182,29 @@ def rising_edges(values, *, min_swing: float) -> EdgeResult:
     return EdgeResult(positions.astype(numpy.int64), threshold, True)
 
 
-def ni_block_ends(sample_index, observation_perf) -> Tuple[numpy.ndarray, numpy.ndarray]:
-    """Each run of equal stamps, paired with the last sample of the run before it.
+# eq=False on the two classes that hold arrays: a field-wise == raises on an
+# ndarray, and the field-wise hash a frozen dataclass would add is unhashable.
+@dataclasses.dataclass(frozen=True, eq=False)
+class BlockStamps:
+    """One row per recorder copy: the last sample of the copy before it and the
+    copy's stamps. raw is CLOCK_MONOTONIC_RAW taken beside the perf stamp, NaN
+    where the host has no such clock or the file predates it."""
+    end_index: numpy.ndarray
+    perf: numpy.ndarray
+    raw: numpy.ndarray
+
+
+def run_ends(observation_perf) -> numpy.ndarray:
+    """Position of the last sample of each run of equal block stamps."""
+    observation_perf = numpy.asarray(observation_perf, dtype=numpy.float64)
+    if observation_perf.size == 0:
+        return numpy.empty(0, dtype=numpy.int64)
+    ends = numpy.flatnonzero(observation_perf[1:] != observation_perf[:-1])
+    return numpy.append(ends, observation_perf.size - 1).astype(numpy.int64)
+
+
+def block_stamps_from_runs(index_at_ends, perf_at_ends, raw_at_ends=None) -> BlockStamps:
+    """Pair each run's stamps with the last sample of the run before it.
 
     In nidaq.h5 a run of equal block_observation_perf_time values is not one NI
     read. It is one copy the session recorder makes from the NI sample ring
@@ -166,15 +218,60 @@ def ni_block_ends(sample_index, observation_perf) -> Tuple[numpy.ndarray, numpy.
     bounds nothing and is dropped. How loose the bound is depends on the read
     size; see fit_ni_to_host.
     """
+    index_at_ends = numpy.asarray(index_at_ends, dtype=numpy.int64)
+    perf_at_ends = numpy.asarray(perf_at_ends, dtype=numpy.float64)
+    raw_at_ends = (numpy.full(perf_at_ends.shape, math.nan) if raw_at_ends is None
+                   else numpy.asarray(raw_at_ends, dtype=numpy.float64))
+    if perf_at_ends.size < 2:
+        return BlockStamps(numpy.empty(0, dtype=numpy.int64), numpy.empty(0), numpy.empty(0))
+    previous_end, stamp, raw = index_at_ends[:-1], perf_at_ends[1:], raw_at_ends[1:]
+    keep = numpy.isfinite(stamp)
+    return BlockStamps(previous_end[keep], stamp[keep], raw[keep])
+
+
+def ni_block_stamps(sample_index, observation_perf, observation_raw=None) -> BlockStamps:
+    """block_stamps_from_runs over per-sample arrays, as nidaq.h5 stores them."""
     sample_index = numpy.asarray(sample_index, dtype=numpy.int64)
     observation_perf = numpy.asarray(observation_perf, dtype=numpy.float64)
-    if observation_perf.size == 0:
-        return numpy.empty(0, dtype=numpy.int64), numpy.empty(0)
-    ends = numpy.flatnonzero(observation_perf[1:] != observation_perf[:-1])
-    ends = numpy.append(ends, observation_perf.size - 1)
-    previous_end, stamp = sample_index[ends[:-1]], observation_perf[ends[1:]]
-    keep = numpy.isfinite(stamp)
-    return previous_end[keep], stamp[keep]
+    ends = run_ends(observation_perf)
+    raw = (None if observation_raw is None
+           else numpy.asarray(observation_raw, dtype=numpy.float64)[ends])
+    return block_stamps_from_runs(sample_index[ends], observation_perf[ends], raw)
+
+
+def ni_block_ends(sample_index, observation_perf) -> Tuple[numpy.ndarray, numpy.ndarray]:
+    """(last sample of the previous copy, this copy's perf stamp); see block_stamps_from_runs."""
+    stamps = ni_block_stamps(sample_index, observation_perf)
+    return stamps.end_index, stamps.perf
+
+
+def _sample_rate_problem(sample_rate) -> str:
+    """Why sample_rate cannot turn sample indices into seconds, or ''."""
+    try:
+        rate = float(sample_rate)
+    except (TypeError, ValueError):
+        rate = math.nan
+    return "" if math.isfinite(rate) and rate > 0 else f"sample rate {sample_rate} is not a positive number"
+
+
+def _read_pairs(end_index, seen_perf, sample_rate):
+    """(NI seconds, host seconds, why not): the read pairs a fit can use.
+
+    A pair with a value that is not finite is left out, as a NaN stamp always
+    has been. A sample rate that is not a positive number, or arrays of
+    different lengths, leave nothing to fit: the reason is returned for the
+    caller to make an invalid fit of, never raised.
+    """
+    problem = _sample_rate_problem(sample_rate)
+    if problem:
+        return None, None, problem
+    index = numpy.asarray(end_index, dtype=numpy.float64)
+    seen = numpy.asarray(seen_perf, dtype=numpy.float64)
+    if index.shape != seen.shape:
+        return None, None, f"{index.size} sample indices against {seen.size} stamps"
+    t = index / float(sample_rate)
+    finite = numpy.isfinite(t) & numpy.isfinite(seen)
+    return t[finite], seen[finite], ""
 
 
 def fit_ni_to_host(end_index, seen_perf, sample_rate: float) -> ClockFit:
@@ -196,8 +293,9 @@ def fit_ni_to_host(end_index, seen_perf, sample_rate: float) -> ClockFit:
     (Task 16 review): 60-165 Hz maps about 0.25 ms late, 200 Hz fails the
     fit, and 240 Hz maps 4.45 ms late. christielab10 runs at 60 Hz.
     """
-    t = numpy.asarray(end_index, dtype=numpy.float64) / float(sample_rate)
-    seen = numpy.asarray(seen_perf, dtype=numpy.float64)
+    t, seen, problem = _read_pairs(end_index, seen_perf, sample_rate)
+    if problem:
+        return invalid_fit(problem)
     if t.size < MIN_FIT_POINTS:
         return invalid_fit(f"{t.size} read pairs, need {MIN_FIT_POINTS} "
                            "(each a stamp and the last sample before it)")
@@ -214,6 +312,343 @@ def fit_ni_to_host(end_index, seen_perf, sample_rate: float) -> ClockFit:
     picks = numpy.asarray(picks, dtype=numpy.int64)
     return fit_line(t[picks], seen[picks], max_residual=NI_MAX_RESIDUAL_SECONDS,
                     min_points=ENVELOPE_BINS // 2)
+
+
+def _finite_or_none(value):
+    value = float(value)
+    return value if math.isfinite(value) else None
+
+
+def _interp_extrapolate(x, xs, ys):
+    """Piecewise-linear interpolation through (xs, ys), continued with the end
+    segments outside them; xs strictly increasing with at least two points."""
+    x = numpy.asarray(x, dtype=numpy.float64)
+    j = numpy.clip(numpy.searchsorted(xs, x, side="right") - 1, 0, xs.size - 2)
+    slope = (ys[j + 1] - ys[j]) / (xs[j + 1] - xs[j])
+    return ys[j] + slope * (x - xs[j])
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class PiecewiseClockFit:
+    """NI seconds -> host seconds through a continuous piecewise-linear table.
+
+    The same interface as ClockFit (map, as_record, valid, reason,
+    residual_rms, points, offset, drift, x_min, x_max) plus inverse() and the
+    per-segment drifts. offset and drift describe the straight line through
+    the end knots, so a reader of the old record keys still gets a usable
+    summary of the whole session.
+    """
+    knots: numpy.ndarray
+    knot_host: numpy.ndarray
+    residual_rms: float
+    points: int
+    valid: bool
+    reason: str = ""
+    method: str = PIECEWISE_ENVELOPE
+
+    @property
+    def x_min(self) -> float:
+        return float(self.knots[0]) if self.knots.size else math.nan
+
+    @property
+    def x_max(self) -> float:
+        return float(self.knots[-1]) if self.knots.size else math.nan
+
+    @property
+    def drift(self) -> float:
+        if self.knots.size < 2:
+            return math.nan
+        return float((self.knot_host[-1] - self.knot_host[0]) / (self.knots[-1] - self.knots[0]))
+
+    @property
+    def offset(self) -> float:
+        if self.knots.size < 2:
+            return math.nan
+        return float(self.knot_host[0] - self.drift * self.knots[0])
+
+    def segment_drifts(self) -> numpy.ndarray:
+        if self.knots.size < 2:
+            return numpy.empty(0)
+        return numpy.diff(self.knot_host) / numpy.diff(self.knots)
+
+    def map(self, x):
+        x = numpy.asarray(x, dtype=numpy.float64)
+        if not self.valid or self.knots.size < 2:
+            return numpy.full(x.shape, math.nan)
+        return _interp_extrapolate(x, self.knots, self.knot_host)
+
+    def inverse(self, host):
+        """Host seconds -> NI seconds; the table is increasing, so it inverts segment by segment."""
+        host = numpy.asarray(host, dtype=numpy.float64)
+        if not self.valid or self.knots.size < 2:
+            return numpy.full(host.shape, math.nan)
+        return _interp_extrapolate(host, self.knot_host, self.knots)
+
+    def as_record(self, *, include_knots: bool = True) -> dict:
+        drifts = self.segment_drifts()
+        record = {
+            "method": self.method,
+            "valid": bool(self.valid),
+            "reason": self.reason,
+            "residual_rms": _finite_or_none(self.residual_rms),
+            "points": int(self.points),
+            "offset": _finite_or_none(self.offset),
+            "drift": _finite_or_none(self.drift),
+            "x_min": _finite_or_none(self.x_min),
+            "x_max": _finite_or_none(self.x_max),
+            "knotCount": int(self.knots.size),
+            "knotSeconds": (_finite_or_none(numpy.median(numpy.diff(self.knots)))
+                            if self.knots.size > 1 else None),
+            "segmentDriftPpmMin": (_finite_or_none((drifts.min() - 1.0) * 1e6)
+                                   if drifts.size else None),
+            "segmentDriftPpmMax": (_finite_or_none((drifts.max() - 1.0) * 1e6)
+                                   if drifts.size else None),
+        }
+        if include_knots:
+            record["knots"] = [_finite_or_none(value) for value in self.knots]
+            record["knotHost"] = [_finite_or_none(value) for value in self.knot_host]
+        return record
+
+
+def invalid_piecewise_fit(reason: str) -> PiecewiseClockFit:
+    return PiecewiseClockFit(numpy.empty(0), numpy.empty(0), math.nan, 0, False, reason)
+
+
+def _envelope_picks(t, seen, bin_seconds: float) -> numpy.ndarray:
+    """In each bin of bin_seconds, the pair with the smallest (seen - t): the lower envelope."""
+    which = numpy.floor((t - t[0]) / bin_seconds).astype(numpy.int64)
+    # The last pair sits on the far edge of the last bin, which floor would
+    # make a bin of its own (21 points over a single window); clip it in.
+    bins = max(1, int(numpy.ceil((t[-1] - t[0]) / bin_seconds)))
+    which = numpy.minimum(which, bins - 1)
+    order = numpy.lexsort((seen - t, which))  # by bin, then by delay
+    first_of_bin = numpy.concatenate([[True], numpy.diff(which[order]) > 0])
+    return order[first_of_bin]
+
+
+def _hat_design(x, knots):
+    """Rows of the continuous piecewise-linear basis, one hat function per knot."""
+    j = numpy.clip(numpy.searchsorted(knots, x, side="right") - 1, 0, knots.size - 2)
+    u = (x - knots[j]) / (knots[j + 1] - knots[j])
+    design = numpy.zeros((x.size, knots.size))
+    design[numpy.arange(x.size), j] = 1 - u
+    design[numpy.arange(x.size), j + 1] = u
+    return design
+
+
+def _merge_sparse_windows(knots, x, min_points: int) -> numpy.ndarray:
+    """Drop the knot after a window with fewer than min_points points, so the
+    window joins the one after it; the last window joins the one before."""
+    knots = numpy.array(knots, dtype=numpy.float64)
+    while knots.size > 2:
+        counts = numpy.histogram(x, bins=knots)[0]
+        sparse = numpy.flatnonzero(counts < min_points)
+        if sparse.size == 0:
+            break
+        window = int(sparse[0])
+        knots = numpy.delete(knots, window + 1 if window < knots.size - 2 else window)
+    return knots
+
+
+def fit_piecewise_envelope(end_index, seen_perf, sample_rate: float, *,
+                           knot_seconds: float = KNOT_SECONDS) -> PiecewiseClockFit:
+    """NI sample time -> host time, a continuous piecewise-linear lower envelope.
+
+    The envelope points are chosen as fit_ni_to_host chooses them (the
+    smallest delay in each bin), with a bin every knot_seconds / ENVELOPE_BINS
+    so each knot window holds about 20 of them, and a session shorter than one
+    window still has 20. A least-squares fit through them in the hat basis is
+    continuous at every knot. The bias is the same as fit_ni_to_host's within
+    one window and with no NTP poll in it: mapped times are late by about the
+    minimum delivery delay. Across polls this is not late-never-early: the
+    host clock's slew curves inside a window and a straight segment through
+    the envelope points cannot follow it, so a mapped time can be early. A 4 h
+    session of NTP polls measured it up to 46 us early and 260 us late at most,
+    inside the 0.36 ms budget. The RAW bridge (fit_ni_to_host_timeline), which
+    fits the envelope on the unslewed RAW clock and adds the slew back from the
+    stamp pairs, is the one that maps late and never early.
+    """
+    t, seen, problem = _read_pairs(end_index, seen_perf, sample_rate)
+    if problem:
+        return invalid_piecewise_fit(problem)
+    if t.size < MIN_FIT_POINTS:
+        return invalid_piecewise_fit(f"{t.size} read pairs, need {MIN_FIT_POINTS} "
+                                     "(each a stamp and the last sample before it)")
+    if numpy.any(numpy.diff(t) <= 0):
+        return invalid_piecewise_fit("NI sample index is not increasing (task restarted mid-session)")
+    span = float(t[-1] - t[0])
+    if span <= 0:
+        return invalid_piecewise_fit("the read pairs span no time")
+    picks = _envelope_picks(t, seen, min(knot_seconds, span) / ENVELOPE_BINS)
+    x, y = t[picks], seen[picks]
+    # arange can reach t[-1] itself, or a rounding step past it, when the span is a
+    # whole number of windows; only knots strictly inside make a real last window.
+    inner = numpy.arange(t[0], t[-1], knot_seconds)
+    knots = _merge_sparse_windows(numpy.append(inner[inner < t[-1]], t[-1]), x, MIN_WINDOW_POINTS)
+    needed = ENVELOPE_BINS // 2
+    for attempt in range(2):
+        if x.size < max(needed, knots.size):
+            return invalid_piecewise_fit(f"{x.size} envelope points, need {max(needed, knots.size)}")
+        design = _hat_design(x, knots)
+        # Centre y: perf_counter values are large and the knot values would
+        # otherwise lose their last digits to the solve.
+        y0 = float(y.mean())
+        coefficients, _, rank, _ = numpy.linalg.lstsq(design, y - y0, rcond=None)
+        if rank < knots.size:
+            return invalid_piecewise_fit("a knot window has no envelope point")
+        residual = y - y0 - design @ coefficients
+        if attempt == 1:
+            break
+        median_residual = numpy.median(residual)
+        spread = 1.4826 * float(numpy.median(numpy.abs(residual - median_residual)))
+        inliers = numpy.abs(residual - median_residual) <= max(5.0 * spread, 1e-9)
+        if inliers.all() or inliers.sum() < needed:
+            break
+        x, y = x[inliers], y[inliers]
+    rms = float(numpy.sqrt(numpy.mean(residual ** 2)))
+    knot_host = coefficients + y0
+    valid = rms <= NI_MAX_RESIDUAL_SECONDS
+    reason = "" if valid else f"residual rms {rms:.6f} s above {NI_MAX_RESIDUAL_SECONDS:.6f} s"
+    drifts = numpy.diff(knot_host) / numpy.diff(knots)
+    if valid and not numpy.all(drifts > 0):
+        # Host time that runs backwards across a window is garbage stamps, and
+        # inverse() would not be a function.
+        valid = False
+        reason = f"a knot window runs backwards (segment drift {numpy.min(drifts):.6f}, not above 0)"
+    return PiecewiseClockFit(
+        knots=knots, knot_host=knot_host, residual_rms=rms, points=int(x.size),
+        valid=bool(valid), reason=reason,
+    )
+
+
+def fit_from_record(record) -> Optional[PiecewiseClockFit]:
+    """The fit a stored record describes, or None when there is none worth using.
+
+    A record with a knot table (PiecewiseClockFit.as_record) comes back as it
+    was, provided the whole table is there: both columns finite and strictly
+    increasing, as many knots as knotCount says. A straight-line record
+    (ClockFit.as_record: no knot keys at all) and a two-knot record stored
+    without its table (as_record(include_knots=False)) become a two-knot table
+    over the fitted span, which is exact for both. A record that needs a table
+    and has none, or a damaged one, is None and is never replaced by the line
+    through its summary keys: after an hour that line is milliseconds off,
+    unflagged. Anything invalid, malformed or absent is None, so a caller falls
+    back rather than mapping through nonsense.
+    """
+    if not isinstance(record, dict) or not record.get("valid"):
+        return None
+    try:
+        count = record.get("knotCount")
+        count = None if count is None else int(count)
+        stored_knots, stored_host = record.get("knots") or (), record.get("knotHost") or ()
+        residual = float(record.get("residual_rms") if record.get("residual_rms") is not None else math.nan)
+        points = int(record.get("points") or 0)
+        if stored_knots or stored_host or (count is not None and count > 2):
+            knots = numpy.asarray(stored_knots, dtype=numpy.float64)
+            host = numpy.asarray(stored_host, dtype=numpy.float64)
+            # Both columns strictly increasing, or inverse() would not be a function.
+            if (knots.size >= 2 and host.size == knots.size and count in (None, knots.size)
+                    and numpy.isfinite(knots).all() and numpy.isfinite(host).all()
+                    and numpy.all(numpy.diff(knots) > 0) and numpy.all(numpy.diff(host) > 0)):
+                return PiecewiseClockFit(knots, host, residual, points, True, "",
+                                         str(record.get("method") or PIECEWISE_ENVELOPE))
+            return None
+        offset, drift = float(record["offset"]), float(record["drift"])
+        x_min, x_max = float(record["x_min"]), float(record["x_max"])
+        if (all(math.isfinite(value) for value in (offset, drift, x_min, x_max)) and x_max > x_min
+                and drift > 0):
+            knots = numpy.array([x_min, x_max])
+            return PiecewiseClockFit(knots, offset + drift * knots, residual, points, True, "",
+                                     STRAIGHT_LINE)
+    except (KeyError, TypeError, ValueError):
+        pass
+    return None
+
+
+def fit_ni_to_host_timeline(stamps: BlockStamps, sample_rate: float, *,
+                            knot_seconds: float = KNOT_SECONDS,
+                            record_knot_seconds: float = RECORD_KNOT_SECONDS) -> PiecewiseClockFit:
+    """NI sample time -> host perf_counter: through CLOCK_MONOTONIC_RAW when the
+    stamps carry it, else the piecewise envelope of the perf stamps.
+
+    RAW is not slewed by NTP, so NI-to-RAW is the smooth relation of two
+    oscillators and the envelope fits it with nothing to hide. What NTP did to
+    the host clock is perf minus RAW, read at a knot every record_knot_seconds
+    (10 s) as the median of the stamp pairs within BRIDGE_WINDOW_SECONDS (1 s)
+    of it, and interpolated between knots. The median is what keeps a pair
+    whose reader was preempted between its two clock reads from moving a knot;
+    its price is that a kink in the slew is smoothed over the window, to about
+    50 us at 10 s knots. The table is stored and rebuilt as it is.
+
+    When RAW cannot be used (no RAW column, an older session or a host without
+    the clock; too few stamps; stamps over too little of the session; a NI-to-
+    RAW fit that fails; a bridge that is not increasing) the perf stamps are
+    fitted directly, window by window, and a RAW that was present and failed
+    is named at the front of the fit's reason.
+    """
+    problem = _sample_rate_problem(sample_rate)
+    if problem:
+        return invalid_piecewise_fit(problem)
+    finite = numpy.isfinite(stamps.raw) & numpy.isfinite(stamps.perf)
+    usable = int(finite.sum())
+    raw_reason = ""
+    if usable >= MIN_FIT_POINTS:
+        bridged, raw_reason = _bridge_through_raw(stamps, finite, sample_rate, knot_seconds,
+                                                  record_knot_seconds)
+        if bridged is not None:
+            return bridged
+    elif usable:
+        raw_reason = f"RAW on {usable} stamps, need {MIN_FIT_POINTS}; "
+    fit = fit_piecewise_envelope(stamps.end_index, stamps.perf, sample_rate, knot_seconds=knot_seconds)
+    if not raw_reason:
+        return fit
+    return dataclasses.replace(fit, reason=(raw_reason + fit.reason).rstrip("; "))
+
+
+def _bridge_through_raw(stamps: BlockStamps, finite, sample_rate: float, knot_seconds: float,
+                        record_knot_seconds: float):
+    """(the RAW-bridged fit, "") or (None, why the bridge cannot be used)."""
+    end_index = numpy.asarray(stamps.end_index, dtype=numpy.float64)
+    stamped = end_index[numpy.isfinite(stamps.perf)] / float(sample_rate)
+    covered = end_index[finite] / float(sample_rate)
+    span = float(stamped.max() - stamped.min())
+    if span > 0 and covered.max() - covered.min() < BRIDGE_MIN_RAW_COVERAGE * span:
+        return None, (f"RAW covers {(covered.max() - covered.min()) / span:.0%} of the {span:.0f} s "
+                      f"of stamps, need {BRIDGE_MIN_RAW_COVERAGE:.0%}; ")
+    ni_to_raw = fit_piecewise_envelope(stamps.end_index[finite], stamps.raw[finite], sample_rate,
+                                       knot_seconds=knot_seconds)
+    if not ni_to_raw.valid:
+        return None, f"NI-to-RAW: {ni_to_raw.reason}; "
+    raw, perf = stamps.raw[finite], stamps.perf[finite]
+    order = numpy.argsort(raw, kind="stable")
+    raw, offset = raw[order], (perf - raw)[order]
+    knots = numpy.arange(ni_to_raw.x_min, ni_to_raw.x_max, record_knot_seconds)
+    if knots.size and knots[-1] > ni_to_raw.x_max - BRIDGE_TAIL_SECONDS:
+        knots = knots[:-1]
+    knots = numpy.append(knots, ni_to_raw.x_max)
+    if knots.size < 2:
+        knots = numpy.array([ni_to_raw.x_min, ni_to_raw.x_max])
+    knot_raw = ni_to_raw.map(knots)
+    # perf - raw at each knot: the median of the pairs around it, not a line
+    # between the two nearest, so a single late pair is ignored. A knot with no
+    # pair that close takes the closer of the pairs on either side of it.
+    low = numpy.searchsorted(raw, knot_raw - BRIDGE_WINDOW_SECONDS, side="left")
+    high = numpy.searchsorted(raw, knot_raw + BRIDGE_WINDOW_SECONDS, side="right")
+    after = numpy.clip(numpy.searchsorted(raw, knot_raw), 0, raw.size - 1)
+    before = numpy.clip(after - 1, 0, raw.size - 1)
+    nearest = numpy.where(numpy.abs(raw[before] - knot_raw) <= numpy.abs(raw[after] - knot_raw),
+                          before, after)
+    knot_offset = numpy.array([
+        float(numpy.median(offset[a:b])) if b > a else float(offset[n])
+        for a, b, n in zip(low, high, nearest)
+    ])
+    knot_host = knot_raw + knot_offset
+    if not numpy.all(numpy.diff(knot_host) > 0):
+        # Corrupt perf stamps, not a slew: NTP moves the clock by at most a few
+        # ms a second, and inverse() needs a table that only goes forward.
+        return None, "RAW bridge is not increasing; "
+    return PiecewiseClockFit(knots, knot_host, ni_to_raw.residual_rms, ni_to_raw.points, True, "",
+                             RAW_BRIDGED), ""
 
 
 @dataclasses.dataclass(frozen=True)

@@ -250,12 +250,19 @@ channel from acquisition or persistence. At 10 kHz, the nominal timestamp
 resolution is 0.1 ms.
 
 The primary datasets are `sample_index`, `perf_time`, `offset_seconds`,
-`wall_time`, `epoch`, `values`, `block_observation_perf_time`, and
-`block_observation_wall_time`. `values` is channel-by-sample and follows the
-`channel_names` attribute. File attributes include the recording boundaries,
-sample rate, epoch, gap/overrun counts, source clock, and serialized timing
-plan. Block-observation times are diagnostics only; `perf_time` is derived from
-the sample-index epoch.
+`wall_time`, `epoch`, `values`, `block_observation_perf_time`,
+`block_observation_wall_time` and `block_observation_raw_time`. `values` is
+channel-by-sample and follows the `channel_names` attribute. File attributes
+include the recording boundaries, sample rate, epoch, gap/overrun counts,
+source clock, and serialized timing plan. `perf_time` is derived from the
+sample-index epoch and carries the epoch's offset and the NI clock's drift.
+The block-observation times are the stamps taken before each NI read:
+`block_observation_perf_time` on `time.perf_counter` and
+`block_observation_raw_time` on `CLOCK_MONOTONIC_RAW` (NaN where the host has
+no such clock, or the file predates it). The NI-to-host fit (NI sample time to
+host `perf_counter`) is built from these two columns, not from `perf_time`; it
+is what `alignment.json` stores as `cameraNidaqAlignment.niToHost`, and the
+host times that file derives from NI samples go through it.
 
 The NI-DAQ epoch is anchored once. Later block delivery time does not reconstruct
 each block independently, so host scheduling jitter cannot create backward
@@ -418,8 +425,17 @@ CAN warnings and errors remain in both logs.
 - `canonicalBoundary`;
 - first/last offsets for auxiliary streams;
 - the requested and resolved `nidaqTiming` topology;
-- `cameraNidaqAlignment`, including matched edge/sample, signed offset,
-  resolution, confidence, and ambiguity;
+- `cameraNidaqAlignment` (schemaVersion 3), including matched edge/sample,
+  signed offset, resolution, confidence, and ambiguity, plus how the anchor
+  was chosen (`anchorMethod`: `camera_latch` from the primary camera's clock
+  latches, `expected_lag` from the exposure plus the measured stamp delay,
+  `epoch_nearest_edge` when no NI-to-host fit could be made), the fit itself
+  (`niToHost`: a knot table from NI seconds to `time.perf_counter`, built from
+  the NI read stamps, `piecewise_envelope` or `raw_bridged` through
+  `CLOCK_MONOTONIC_RAW`), the exposure, the expected and implied lags, the
+  gate, and the latch evidence; every host time derived from an NI sample
+  (frame edges, tone onsets, NI sample indices of host events) goes through
+  that fit, and the post-analysis trial ledger reuses the stored table;
 - `toneConfirmation`, including canonical NI pulse onsets, grouped outbound
   command/immediate status/periodic GPIO observations, unmatched valid events
   and pulses, and separately classified short-pulse artifacts;
@@ -427,6 +443,24 @@ CAN warnings and errors remain in both logs.
   sample/frame count, first/last offsets, gap and overrun counts, failure, and
   `persistenceStatus`;
 - `deviceEventOverruns`, `sessionComplete`, and `incompleteReasons`.
+
+Three things to know when reading `cameraNidaqAlignment`:
+
+- `niToHost.valid` says whether the fit was used; readers key on it, never on
+  `reason`. A valid fit can carry a non-empty `reason`, which then names what was
+  left out of it and is not a failure: *RAW on 40 stamps, need 100*, *RAW covers
+  62% of the 90 s of stamps, need 90%* or *RAW stamps unusable (…)* mean the fit
+  is `piecewise_envelope` on the perf stamps alone.
+- `ambiguitySeconds` is how much nearer the chosen transition is than the
+  runner-up, both measured to the expected edge (`start_perf` less the expected
+  lag), not to `start_perf`. When the camera-latch anchor wins it still
+  describes the expected-lag pick; the latch's own margin is
+  `latch.medianResidualSeconds` and `latch.agreement`. The epoch fallback
+  (`epoch_nearest_edge`) measures it to `start_perf`.
+- `latency.h5` (`clock/ni_to_host`) and `alignment.json` (`niToHost`) are
+  separate fits of the same stamps: the first from the published, boundary-trimmed
+  `nidaq.h5`, the second from the whole spool. Their `knotCount` and `x_min`
+  differ, and neither is derived from the other.
 
 Final session JSON/YAML uses `metadataSchemaVersion: 2`. It records the animal
 snapshot, `counts`, recording completion, stop policy/result, compact hardware
@@ -486,8 +520,14 @@ The future-row edit check and SEND snapshot share one lock, and composite ledger
 public-event, protocol, and persistence mutations are serialized by the pellet-cycle
 controller.
 
-Camera/NI matching uses the nearest `cam_frames` transition within half the
-observed frame period and records whether it was rising or falling. The current
+Camera/NI matching puts every `cam_frames` transition on the host clock through
+the NI-to-host fit built from the NI read stamps, then takes the first recorded
+frame's transition from the primary camera's clock latches (its latency stream)
+or, without usable latches, the transition nearest the expected exposure edge
+(the first frame's stamp less its exposure and the measured stamp delay), gates
+the implied lag, and records whether the transition was rising or falling.
+Without a fit the transition nearest the stamp on the epoch timeline is used,
+at `ambiguous_hardware_edge` confidence. The current
 camera output is a square wave whose alternating peaks and troughs each identify
 one frame. Alignment reports `host_estimated` when the line is not configured,
 and `unmatched` when no plausible transition exists. For configured Tone 1 and
@@ -504,7 +544,7 @@ the raw host/CAN timing, while `alignedEventPerfTime` is the physical NI onset
 used to compare the event with camera frames. A command whose frequency does
 not identify Tone 1 or Tone 2 remains explicitly unmatched.
 
-Alignment schema version 2 materializes that comparison for every valid matched
+Alignment schema version 3 materializes that comparison for every valid matched
 tone. Each entry records the physical NI performance timestamp, Unix/UTC wall
 timestamp, offset from Record, and the first recorded primary-camera frame whose
 exposure-counter transition occurs at or after the tone onset. The frame record

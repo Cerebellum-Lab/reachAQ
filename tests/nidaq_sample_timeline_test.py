@@ -1,3 +1,5 @@
+import math
+
 import numpy as np
 
 from autotrainer.core import (
@@ -53,3 +55,27 @@ def test_one_epoch_anchor_keeps_times_monotonic_across_jittered_blocks():
     assert np.all(np.diff(perf) > 0)
     assert perf.tolist() == [10.0, 10.001, 10.002, 10.003, 10.004, 10.005]
     assert second.source_perf_time == 10.009
+
+
+def test_the_ring_carries_the_newest_reads_raw_stamp_or_nan():
+    channel = NidaqSignalChannelConfiguration("signal", "Dev1/ai0")
+    configuration = NidaqSignalStreamConfiguration(
+        channels=(channel,), is_enabled=True, sample_rate_hz=1000.0, read_chunk_size=3,
+    )
+    ring = SharedNidaqSampleRing(configuration, capacity=12)
+    destination = np.empty((1, ring.capacity), dtype=np.float32)
+
+    ring.write_block(NidaqSignalSampleBlock(
+        wall_time=100.010, perf_time=10.010, sample_rate_hz=1000.0, sample_index=0,
+        channels=(channel,), values={"signal": (1.0, 2.0, 3.0)},
+        epoch_perf_time=10.0, epoch_wall_time=100.0,
+    ))
+    assert math.isnan(ring.copy_since(None, destination).source_raw_time)
+    ring.write_block(NidaqSignalSampleBlock(
+        wall_time=100.013, perf_time=10.013, sample_rate_hz=1000.0, sample_index=3,
+        channels=(channel,), values={"signal": (4.0, 5.0, 6.0)},
+        epoch_perf_time=10.0, epoch_wall_time=100.0, raw_time=7.013,
+    ))
+    assert ring.copy_since(3, destination).source_raw_time == 7.013
+    ring.reset()
+    assert math.isnan(float(ring._source_raw_time.value))

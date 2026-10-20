@@ -388,3 +388,463 @@ def test_an_unknown_frame_period_is_ambiguous_without_printing_nan():
     assert pairing.ambiguous
     assert "frame period is unknown" in pairing.reason
     assert "nan" not in pairing.reason
+
+
+_TAU = 512.0
+_POLL = 2048.0
+_PLL_GAIN = 1024 / 2 ** 22
+
+
+def _slewed_host(drift_ppm, polls, host0=1000.0):
+    """perf_counter as systemd-timesyncd leaves it (kernel/time/ntp.c, pll_sim.py):
+    each poll's offset theta is slewed in with tau = 512 s and leaves a permanent
+    rate step of theta * 1024 / 2**22; the NI clock runs drift_ppm against it."""
+    def host(t):
+        t = np.asarray(t, dtype=np.float64)
+        out = host0 + (1 + drift_ppm * 1e-6) * t
+        for when, theta in polls:
+            after = np.clip(t - when, 0.0, None)
+            out = out + theta * (1 - np.exp(-after / _TAU)) + theta * _PLL_GAIN * after
+        return out
+    return host
+
+
+def _stamped_reads(duration, host, rng, rate=10_000.0, read=167):
+    """(last sample of the previous read, stamp before this read), as ni_block_ends gives
+    them: reads of `read` samples back to back, each returning 0.2-3.2 ms after its last
+    sample, the next read stamped at once."""
+    reads = int(duration * rate // read)
+    last = np.arange(1, reads + 1) * read - 1
+    returned = host(last / rate) + 0.0002 + rng.uniform(0, 0.003, reads)
+    return last[:-1], returned[:-1]
+
+
+def test_the_piecewise_envelope_follows_ntp_slews_that_one_line_cannot():
+    rng = np.random.default_rng(11)
+    duration = 4 * 3600.0
+    polls = [(when, rng.normal(0, 0.002)) for when in np.arange(900.0, duration, _POLL)]
+    host = _slewed_host(-10.0, polls)
+    ends, seen = _stamped_reads(duration, host, rng)
+
+    piecewise = clocks.fit_piecewise_envelope(ends, seen, 10_000.0)
+    line = clocks.fit_ni_to_host(ends, seen, 10_000.0)
+
+    assert piecewise.valid, piecewise.reason
+    assert piecewise.method == clocks.PIECEWISE_ENVELOPE
+    assert 100 <= piecewise.knots.size <= 125  # 4 h / 120 s, less a merged tail
+    probe = np.linspace(ends[0] / 10_000.0, ends[-1] / 10_000.0, 100_000)
+    truth = host(probe)
+    error = piecewise.map(probe) - truth
+    error -= np.median(error)  # the envelope's delivery floor, not its shape
+    assert np.percentile(np.abs(error), 95) < 0.0003
+    assert np.abs(error).max() < 0.0005
+    line_error = line.map(probe) - truth
+    line_error -= np.median(line_error)
+    assert np.percentile(np.abs(line_error), 95) > 0.001
+
+
+def test_a_short_session_without_polls_is_one_window_of_twenty_points_mapped_late_by_the_floor():
+    rng = np.random.default_rng(12)
+    host = _slewed_host(-10.0, [])
+    ends, seen = _stamped_reads(60.0, host, rng)
+
+    fit = clocks.fit_piecewise_envelope(ends, seen, 10_000.0)
+
+    assert fit.valid, fit.reason
+    assert fit.knots.size == 2 and fit.points == 20
+    probe = np.linspace(ends[0] / 10_000.0, ends[-1] / 10_000.0, 5_000)
+    bias = fit.map(probe) - host(probe)
+    # Late by the 0.2 ms delivery floor and little more: a fit through the mean
+    # delay (1.7 ms) would pass a 2 ms bound, so the bound is tight. This holds
+    # within one window with no poll in it; across polls the envelope can be
+    # early (see fit_piecewise_envelope), which is why this does not say never.
+    assert bias.min() > 0 and bias.max() < 0.0005
+    # 20 envelope points over 60 s pin the drift to a few 1e-7 (seeds 12-21: within 3.2e-7).
+    assert fit.drift == pytest.approx(1 - 10e-6, abs=6e-7)
+    assert fit.segment_drifts().shape == (1,)
+
+
+def test_a_sparse_tail_window_merges_into_the_window_before_it():
+    rng = np.random.default_rng(13)
+    ends, seen = _stamped_reads(125.0, _slewed_host(0.0, []), rng)
+    fit = clocks.fit_piecewise_envelope(ends, seen, 10_000.0)
+    assert fit.valid and fit.knots.size == 2
+    ends, seen = _stamped_reads(700.0, _slewed_host(0.0, []), rng)
+    fit = clocks.fit_piecewise_envelope(ends, seen, 10_000.0)
+    assert fit.valid and fit.knots.size == 7  # 0,120,...,600,700: the 100 s tail keeps its own window
+
+
+def test_map_and_inverse_round_trip_and_extrapolate_past_the_knots():
+    fit = clocks.PiecewiseClockFit(knots=np.array([0.0, 120.0, 240.0]),
+                                   knot_host=np.array([1000.0, 1120.001, 1239.999]),
+                                   residual_rms=1e-5, points=40, valid=True)
+    x = np.array([-5.0, 0.0, 60.0, 120.0, 200.0, 240.0, 300.0])
+    assert np.allclose(fit.inverse(fit.map(x)), x, atol=1e-9)
+    assert fit.map(-5.0) == pytest.approx(1000.0 - 5.0 * (120.001 / 120.0), abs=1e-9)
+    assert fit.map(300.0) == pytest.approx(1239.999 + 60.0 * (119.998 / 120.0), abs=1e-9)
+    assert fit.segment_drifts().tolist() == pytest.approx([120.001 / 120, 119.998 / 120])
+
+
+def test_an_invalid_piecewise_fit_maps_to_nan_and_says_why():
+    fit = clocks.fit_piecewise_envelope(np.arange(30), np.arange(30.0), 1000.0)
+    assert not fit.valid
+    assert "30 read pairs, need 100" in fit.reason
+    assert np.isnan(fit.map([1.0, 2.0])).all()
+    restarted = clocks.fit_piecewise_envelope(
+        np.concatenate([np.arange(100, 160), np.arange(50, 110)]), np.arange(120.0), 1000.0)
+    assert "not increasing" in restarted.reason
+
+
+def test_fit_from_record_rebuilds_the_table_and_accepts_a_straight_line_record():
+    rng = np.random.default_rng(14)
+    ends, seen = _stamped_reads(300.0, _slewed_host(5.0, [(100.0, 0.003)]), rng)
+    fit = clocks.fit_piecewise_envelope(ends, seen, 10_000.0)
+
+    record = fit.as_record()
+    rebuilt = clocks.fit_from_record(record)
+
+    assert set(record) >= {"offset", "drift", "residual_rms", "points", "valid", "reason",
+                           "x_min", "x_max", "method", "knotCount", "knotSeconds",
+                           "segmentDriftPpmMin", "segmentDriftPpmMax", "knots", "knotHost"}
+    assert "segmentDrifts" not in record  # derived from the table, not stored twice
+    assert "knots" not in fit.as_record(include_knots=False)
+    assert rebuilt is not None and rebuilt.method == clocks.PIECEWISE_ENVELOPE
+    probe = np.linspace(0.0, 300.0, 1000)
+    assert np.allclose(rebuilt.map(probe), fit.map(probe), atol=1e-9)
+    line = clocks.fit_line(np.linspace(0.0, 100.0, 200), 7.0 + 1.00001 * np.linspace(0.0, 100.0, 200),
+                           max_residual=1e-6)
+    from_line = clocks.fit_from_record(line.as_record())
+    assert from_line.method == clocks.STRAIGHT_LINE
+    assert from_line.map(50.0) == pytest.approx(line.map(50.0), abs=1e-9)
+    assert clocks.fit_from_record(None) is None
+    assert clocks.fit_from_record({"valid": False, "reason": "x"}) is None
+    # With the summary keys present, so it is the table check that refuses it, not a missing key.
+    assert clocks.fit_from_record({"valid": True, "knots": [1.0], "knotHost": [2.0], "offset": 1.0,
+                                   "drift": 1.0, "x_min": 0.0, "x_max": 10.0}) is None
+
+
+def test_ni_block_stamps_carry_raw_beside_perf():
+    index = np.arange(10)
+    perf = np.array([1.0] * 4 + [2.0] * 3 + [3.0] * 3)
+    raw = perf + 10.0
+
+    stamps = clocks.ni_block_stamps(index, perf, raw)
+    without = clocks.ni_block_stamps(index, perf)
+
+    assert stamps.end_index.tolist() == [3, 6]
+    assert stamps.perf.tolist() == [2.0, 3.0]
+    assert stamps.raw.tolist() == [12.0, 13.0]
+    assert np.isnan(without.raw).all() and without.raw.shape == (2,)
+    assert clocks.run_ends(perf).tolist() == [3, 6, 9]
+
+
+def test_a_span_of_whole_windows_leaves_no_sliver_window_at_the_end():
+    # numpy.arange(first, last, 120) can reach `last` itself, or a rounding step past it,
+    # when the span is a whole number of windows. That knot must not survive as a zero or
+    # negative window: np.histogram rejects it (ValueError), and finalization must not raise.
+    rate = 1000.0
+    total = 7 * 120 * 1000
+    for first in range(16336800, 16336830):
+        ends = np.unique(np.append(np.arange(first, first + total, total // 400), first + total))
+        fit = clocks.fit_piecewise_envelope(ends, 1000.0 + ends / rate + 0.001, rate)
+        assert fit.valid, (first, fit.reason)
+        assert fit.knots.size == 8 and np.all(np.diff(fit.knots) > 100.0), first
+
+
+def _raw_stamped_reads(duration, host, raw_clock, rng, rate=10_000.0, read=167):
+    """As _stamped_reads, with CLOCK_MONOTONIC_RAW read at the same instants."""
+    reads = int(duration * rate // read)
+    last = np.arange(1, reads + 1) * read - 1
+    delay = 0.0002 + rng.uniform(0, 0.003, reads)
+    perf = host(last / rate) + delay
+    raw = raw_clock(last / rate) + delay
+    return clocks.BlockStamps(last[:-1], perf[:-1], raw[:-1])
+
+
+def test_the_raw_bridge_follows_a_slew_step_the_piecewise_fit_cannot():
+    rng = np.random.default_rng(21)
+    host = _slewed_host(-10.0, [(150.0, 0.010)])      # one 10 ms correction mid-session
+    raw_clock = _slewed_host(-10.0, [], host0=4000.0)  # the same clock without it
+    stamps = _raw_stamped_reads(300.0, host, raw_clock, rng)
+
+    bridged = clocks.fit_ni_to_host_timeline(stamps, 10_000.0)
+    piecewise = clocks.fit_piecewise_envelope(stamps.end_index, stamps.perf, 10_000.0)
+
+    assert bridged.valid, bridged.reason
+    assert bridged.method == clocks.RAW_BRIDGED
+    assert 29 <= bridged.knots.size <= 32  # tabulated every 10 s over 300 s
+    probe = np.linspace(stamps.end_index[0] / 10_000.0, stamps.end_index[-1] / 10_000.0, 30_000)
+    error = bridged.map(probe) - host(probe)
+    error -= np.median(error)
+    assert np.abs(error).max() < 0.00005
+    worse = piecewise.map(probe) - host(probe)
+    worse -= np.median(worse)
+    assert np.abs(worse).max() > 0.00015
+    assert np.allclose(bridged.inverse(bridged.map(probe)), probe, atol=1e-9)
+    record = bridged.as_record()
+    assert record["method"] == "raw_bridged" and record["knotSeconds"] == pytest.approx(10.0, abs=0.5)
+    assert clocks.fit_from_record(record).map(123.4) == pytest.approx(bridged.map(123.4), abs=1e-9)
+
+
+def test_without_raw_stamps_the_selector_fits_the_piecewise_envelope():
+    rng = np.random.default_rng(22)
+    host = _slewed_host(-10.0, [])
+    ends, seen = _stamped_reads(200.0, host, rng)
+    no_raw = clocks.BlockStamps(ends, seen, np.full(seen.shape, np.nan))
+    few_raw = clocks.BlockStamps(ends, seen, np.where(np.arange(seen.size) < 50, seen + 1.0, np.nan))
+
+    for stamps in (no_raw, few_raw):
+        fit = clocks.fit_ni_to_host_timeline(stamps, 10_000.0)
+        assert fit.valid, fit.reason
+        assert fit.method == clocks.PIECEWISE_ENVELOPE
+        assert fit.knots.size == 3  # 0, 120, 200
+
+
+def test_an_outlier_stamp_pair_does_not_move_a_bridge_knot():
+    # A reader preempted between perf_counter() and the RAW read leaves one pair
+    # whose perf is late; a knot built by interpolating between pairs would follow it.
+    rng = np.random.default_rng(23)
+    host = _slewed_host(-10.0, [])
+    raw_clock = _slewed_host(-10.0, [], host0=4000.0)
+    stamps = _raw_stamped_reads(100.0, host, raw_clock, rng)
+    perf = stamps.perf.copy()
+    perf[stamps.perf.size // 2] += 0.050
+    spoiled = clocks.BlockStamps(stamps.end_index, perf, stamps.raw)
+
+    fit = clocks.fit_ni_to_host_timeline(spoiled, 10_000.0)
+
+    assert fit.valid and fit.method == clocks.RAW_BRIDGED
+    probe = np.linspace(stamps.end_index[0] / 10_000.0, stamps.end_index[-1] / 10_000.0, 10_000)
+    error = fit.map(probe) - host(probe)
+    assert error.max() - error.min() < 0.0001  # the 50 ms pair left no mark
+    assert fit.knots[-1] - fit.knots[-2] >= 5.0  # no millisecond-long end segment
+
+
+def test_the_selector_reports_both_reasons_when_neither_path_fits():
+    stamps = clocks.BlockStamps(np.arange(30), np.arange(30.0), np.arange(30.0) + 1.0)
+    fit = clocks.fit_ni_to_host_timeline(stamps, 1000.0)
+    assert not fit.valid
+    assert "30 read pairs, need 100" in fit.reason
+
+
+def test_late_pairs_sitting_on_a_knot_do_not_move_it():
+    # The pair spoiled above sits 17 ms from the nearest knot, so a knot taken from
+    # its nearest pair, or a line between its two nearest, would pass that test too.
+    # Spoil the pairs the knot itself falls between.
+    rng = np.random.default_rng(24)
+    host = _slewed_host(-10.0, [])
+    raw_clock = _slewed_host(-10.0, [], host0=4000.0)
+    stamps = _raw_stamped_reads(100.0, host, raw_clock, rng)
+    knot = clocks.fit_ni_to_host_timeline(stamps, 10_000.0).knots[5]
+    at_knot = int(np.searchsorted(stamps.end_index / 10_000.0, knot))
+    perf = stamps.perf.copy()
+    perf[at_knot - 1:at_knot + 2] += 0.050
+    spoiled = clocks.BlockStamps(stamps.end_index, perf, stamps.raw)
+
+    fit = clocks.fit_ni_to_host_timeline(spoiled, 10_000.0)
+
+    # A fit that fell back to the perf stamps would be spoiled too, but less visibly.
+    assert fit.valid and fit.method == clocks.RAW_BRIDGED, fit.reason
+    probe = np.linspace(stamps.end_index[0] / 10_000.0, stamps.end_index[-1] / 10_000.0, 10_000)
+    error = fit.map(probe) - host(probe)
+    assert error.max() - error.min() < 0.0001
+
+
+def test_the_selector_prefixes_the_raw_reason_when_both_paths_fail():
+    restarted = np.concatenate([np.arange(100, 160), np.arange(50, 110)])
+    stamps = clocks.BlockStamps(restarted, np.arange(120.0), np.arange(120.0) + 1.0)
+
+    fit = clocks.fit_ni_to_host_timeline(stamps, 1000.0)
+
+    assert not fit.valid
+    assert fit.reason.startswith("NI-to-RAW: ") and fit.reason.count("not increasing") == 2
+
+
+def _piecewise_record(duration=400.0, seed=31):
+    ends, seen = _stamped_reads(duration, _slewed_host(5.0, [(100.0, 0.003)]), np.random.default_rng(seed))
+    fit = clocks.fit_piecewise_envelope(ends, seen, 10_000.0)
+    assert fit.valid, fit.reason
+    return fit, fit.as_record()
+
+
+def test_fit_from_record_refuses_a_knot_table_it_cannot_rebuild():
+    # The line through a long record's summary keys is milliseconds off after an hour, so an
+    # unusable table is None, never a valid straight line that nothing flags.
+    fit, record = _piecewise_record()
+    assert record["knotCount"] > 2
+    host = list(record["knotHost"])
+    cases = {
+        "a truncated knotHost": {**record, "knotHost": host[:-1]},
+        "a None inside knotHost": {**record, "knotHost": host[:3] + [None] + host[4:]},
+        "both columns cut, knotCount unchanged": {**record, "knots": record["knots"][:-1],
+                                                  "knotHost": host[:-1]},
+        "host time running backwards": {**record, "knotHost": host[:3] + [host[2] - 1.0] + host[4:]},
+        "an absent table (as_record(include_knots=False))": fit.as_record(include_knots=False),
+        "knotCount above 2 and an empty table": {**record, "knots": [], "knotHost": []},
+    }
+    for why, bad in cases.items():
+        assert clocks.fit_from_record(bad) is None, why
+
+
+def test_a_two_knot_record_stored_without_its_table_still_rebuilds_exactly():
+    ends, seen = _stamped_reads(60.0, _slewed_host(-10.0, []), np.random.default_rng(32))
+    fit = clocks.fit_piecewise_envelope(ends, seen, 10_000.0)
+    assert fit.knots.size == 2
+
+    rebuilt = clocks.fit_from_record(fit.as_record(include_knots=False))
+
+    assert rebuilt is not None
+    probe = np.linspace(fit.x_min - 5.0, fit.x_max + 5.0, 500)
+    assert np.allclose(rebuilt.map(probe), fit.map(probe), atol=1e-9)
+
+
+def test_stamps_and_fits_compare_and_hash_by_identity_not_by_array_contents():
+    def stamps():
+        return clocks.BlockStamps(np.arange(3), np.arange(3.0), np.arange(3.0))
+
+    def fit():
+        return clocks.PiecewiseClockFit(np.array([0.0, 1.0]), np.array([5.0, 6.0]), 0.0, 2, True)
+
+    # A field-wise == on ndarray fields raises ("truth value of an array is ambiguous"), and a
+    # field-wise hash raises TypeError.
+    assert stamps() != stamps() and fit() != fit()
+    assert len({stamps(), stamps(), fit(), fit()}) == 4
+
+
+@pytest.mark.parametrize("shape", ["falling", "rising_then_falling"])
+def test_a_fit_whose_host_time_runs_backwards_is_invalid(shape):
+    # With a segment going backwards, inverse() would not be a function.
+    ends = np.arange(0, 600_000, 1_000)
+    t = ends / 1000.0
+    if shape == "falling":
+        seen = 1000.0 - 0.5 * t
+    else:
+        seen = np.where(t < 240.0, 100.0 + t, 340.0 - (t - 240.0))
+    forward = clocks.fit_piecewise_envelope(ends, 100.0 + t, 1000.0)
+    assert forward.valid, forward.reason
+
+    fit = clocks.fit_piecewise_envelope(ends, seen, 1000.0)
+
+    assert not fit.valid
+    assert "drift" in fit.reason
+    assert np.isnan(fit.map([5.0])).all() and np.isnan(fit.inverse([105.0])).all()
+
+
+@pytest.mark.parametrize("rate", [0.0, -10_000.0, float("nan"), float("inf"), None],
+                         ids=["zero", "negative", "nan", "inf", "none"])
+def test_an_unusable_sample_rate_is_an_invalid_fit_not_an_exception(rate):
+    ends, seen = _stamped_reads(60.0, _slewed_host(-10.0, []), np.random.default_rng(41))
+
+    for fit in (clocks.fit_piecewise_envelope(ends, seen, rate),
+                clocks.fit_ni_to_host(ends, seen, rate),
+                clocks.fit_ni_to_host_timeline(clocks.BlockStamps(ends, seen, seen + 1.0), rate)):
+        assert not fit.valid
+        assert fit.reason.startswith("sample rate") and "not a positive number" in fit.reason
+
+
+def test_a_non_finite_read_pair_is_left_out_not_raised_on():
+    ends, seen = _stamped_reads(60.0, _slewed_host(-10.0, []), np.random.default_rng(42))
+    holed_ends, holed_seen = ends.astype(np.float64), seen.copy()
+    holed_ends[[0, 50, -1]] = np.nan   # NaN at either end of the array is the case that raised
+    holed_seen[7], holed_seen[-2] = np.nan, np.inf
+
+    for fit in (clocks.fit_piecewise_envelope(holed_ends, holed_seen, 10_000.0),
+                clocks.fit_ni_to_host(holed_ends, holed_seen, 10_000.0)):
+        assert fit.valid, fit.reason
+
+    nothing = clocks.fit_piecewise_envelope(np.full(seen.shape, np.nan), seen, 10_000.0)
+    assert not nothing.valid and "0 read pairs, need 100" in nothing.reason
+    mismatched = clocks.fit_piecewise_envelope(ends[:-1], seen, 10_000.0)
+    assert not mismatched.valid and "against" in mismatched.reason
+
+
+def test_the_selector_says_why_it_fell_back_when_raw_cannot_be_used():
+    rng = np.random.default_rng(31)
+    host = _slewed_host(-10.0, [])
+    raw_clock = _slewed_host(-10.0, [], host0=4000.0)
+    stamps = _raw_stamped_reads(200.0, host, raw_clock, rng)
+    noisy = clocks.BlockStamps(stamps.end_index, stamps.perf,
+                               stamps.raw + rng.normal(0.0, 0.005, stamps.raw.size))
+    few = clocks.BlockStamps(stamps.end_index, stamps.perf,
+                             np.where(np.arange(stamps.perf.size) < 50, stamps.raw, np.nan))
+    absent = clocks.BlockStamps(stamps.end_index, stamps.perf, np.full(stamps.perf.shape, np.nan))
+
+    fit = clocks.fit_ni_to_host_timeline(noisy, 10_000.0)
+    assert fit.valid and fit.method == clocks.PIECEWISE_ENVELOPE
+    assert fit.reason.startswith("NI-to-RAW: ") and "residual rms" in fit.reason
+    few_fit = clocks.fit_ni_to_host_timeline(few, 10_000.0)
+    assert few_fit.valid and few_fit.method == clocks.PIECEWISE_ENVELOPE
+    assert few_fit.reason == "RAW on 50 stamps, need 100"
+    # No RAW at all is an older session or a host without the clock, not a failure.
+    assert clocks.fit_ni_to_host_timeline(absent, 10_000.0).reason == ""
+
+
+def test_a_bridge_whose_host_time_runs_backwards_falls_back_to_the_perf_stamps():
+    # A burst of corrupt perf stamps (20 s late) moves the knots inside it and none outside,
+    # so the bridged table steps back at the burst's far edge. RAW itself is clean, and the
+    # perf fit's robust refit survives the burst, so the bridge is what must be refused.
+    host = _slewed_host(-10.0, [])
+    raw_clock = _slewed_host(-10.0, [], host0=4000.0)
+    stamps = _raw_stamped_reads(200.0, host, raw_clock, np.random.default_rng(41))
+    t = stamps.end_index / 10_000.0
+    perf = np.where((t >= 80.0) & (t < 105.0), stamps.perf + 20.0, stamps.perf)
+
+    fit = clocks.fit_ni_to_host_timeline(clocks.BlockStamps(stamps.end_index, perf, stamps.raw), 10_000.0)
+
+    assert fit.valid and fit.method == clocks.PIECEWISE_ENVELOPE
+    assert fit.reason.startswith("RAW bridge is not increasing")
+    assert np.all(np.diff(fit.knot_host) > 0)
+
+
+def test_raw_on_only_part_of_the_session_is_not_bridged_over_the_rest():
+    # A 10 ms slew at 50 s is invisible to RAW stamps that stop at 15 s: a bridge would
+    # extrapolate the offset it last saw over the rest of the session.
+    host = _slewed_host(-10.0, [(50.0, 0.010)])
+    raw_clock = _slewed_host(-10.0, [], host0=4000.0)
+    stamps = _raw_stamped_reads(100.0, host, raw_clock, np.random.default_rng(42))
+    t = stamps.end_index / 10_000.0
+
+    def timeline(raw_until):
+        raw = np.where(t < raw_until, stamps.raw, np.nan)
+        return clocks.fit_ni_to_host_timeline(clocks.BlockStamps(stamps.end_index, stamps.perf, raw),
+                                              10_000.0)
+
+    for until in (15.0, 85.0):
+        fit = timeline(until)
+        assert fit.valid and fit.method == clocks.PIECEWISE_ENVELOPE, until
+        assert "RAW covers" in fit.reason and "need 90%" in fit.reason, fit.reason
+    assert timeline(95.0).method == clocks.RAW_BRIDGED
+
+
+@pytest.mark.parametrize("before, after", [(1.2, 3.0), (3.0, 1.2)],
+                         ids=["previous_pair_closer", "next_pair_closer"])
+def test_a_knot_with_no_pair_within_a_second_takes_the_closer_neighbour(before, after):
+    # A half-second NTP step at 40 s leaves perf minus RAW changing about 1 ms every second,
+    # so a neighbour 3 s from the knot is 3 ms off and one 1.2 s away about 1.2 ms.
+    host = _slewed_host(-10.0, [(40.0, 0.5)])
+    raw_clock = _slewed_host(-10.0, [], host0=4000.0)
+    stamps = _raw_stamped_reads(100.0, host, raw_clock, np.random.default_rng(43))
+    whole = clocks.fit_ni_to_host_timeline(stamps, 10_000.0)
+    knot = 5
+    target = raw_clock(whole.knots[knot])
+    gap = (stamps.raw > target - before) & (stamps.raw < target + after)
+    holed = clocks.BlockStamps(stamps.end_index[~gap], stamps.perf[~gap], stamps.raw[~gap])
+
+    fit = clocks.fit_ni_to_host_timeline(holed, 10_000.0)
+
+    assert fit.method == clocks.RAW_BRIDGED and fit.knots.size == whole.knots.size
+    assert abs(fit.knot_host[knot] - host(fit.knots[knot])) < 0.0025
+
+
+def test_a_knot_closer_than_five_seconds_to_the_end_is_dropped_for_the_end_knot():
+    host = _slewed_host(-10.0, [])
+    raw_clock = _slewed_host(-10.0, [], host0=4000.0)
+    # 100 s: the last 10 s knot (90.0) is 10 s from the end, so it stays. 103 s: the one at
+    # 100.0 is 3 s from the end and goes, leaving a 12.96 s segment rather than a 2.96 s one.
+    for duration, last_segment in ((100.0, 9.97), (103.0, 12.96)):
+        stamps = _raw_stamped_reads(duration, host, raw_clock, np.random.default_rng(32))
+
+        fit = clocks.fit_ni_to_host_timeline(stamps, 10_000.0)
+
+        assert fit.method == clocks.RAW_BRIDGED, fit.reason
+        assert np.diff(fit.knots)[-1] == pytest.approx(last_segment, abs=0.05), duration

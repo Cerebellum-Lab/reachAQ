@@ -491,6 +491,33 @@ def _camera_configured_metadata(camera) -> Dict[str, Any]:
     }
 
 
+def _camera_exposure_seconds(cameras) -> Dict[str, Optional[float]]:
+    """Each camera's exposure in seconds, for the session recorder's frame anchor.
+
+    The capture URL's ``exposure`` query value is the Spinnaker ExposureTime in
+    microseconds (system_configuration.yaml cameras[].params.exposure, or a
+    profile's ordinary_exposure). A camera without it, or one whose
+    configuration cannot be read, is None; the anchor then assumes zero.
+    """
+    result = {}
+    for camera in cameras:
+        name = getattr(camera, "name", "")
+        value = None
+        try:
+            exposure = camera.save_configuration(runtime_mode=True).params.get("exposure")
+            # alignment.json is written with allow_nan=False, so a NaN here would
+            # cost the session its finalization; it counts as unknown instead. So
+            # does a negative one: no exposure is, and the anchor would move its
+            # expected edge and lag gate together by it.
+            if exposure is not None and math.isfinite(float(exposure)) and float(exposure) >= 0:
+                value = float(exposure) * 1e-6
+        except Exception:
+            logger.warning("camera %s exposure is unknown to the session recorder", name,
+                           exc_info=True)
+        result[name] = value
+    return result
+
+
 def _compact_subsystem_snapshot(snapshot):
     """Remove fields repeated by the subsystem key and empty defaults."""
     compact = {}
@@ -784,6 +811,9 @@ class AppModel(ObservableObject):
         self._aborting_project: Optional[ProjectInfo] = None
         self._aborted_session_ids = set()
         self._abort_had_recording_started = False
+        # Why live inference stopped during the current recording, if it did:
+        # its live pose files then end there, closed by the inference stop.
+        self._live_inference_failed_reason: Optional[str] = None
         self._abort_cleanup_timer = no_op_timer
         self._record_start_timer = no_op_timer
         self._writer_close_timer = no_op_timer
@@ -1596,6 +1626,7 @@ class AppModel(ObservableObject):
             reason="no completed pellet trial pending",
         )
         self._abort_had_recording_started = False
+        self._live_inference_failed_reason = None
         try:
             self._session_data_recorder.arm(
                 project,
@@ -1603,6 +1634,7 @@ class AppModel(ObservableObject):
                 metadata_generation_id=(
                     self._recording_session.metadata_generation_id
                 ),
+                camera_exposure_seconds=_camera_exposure_seconds(self._cameras),
             )
             started = self._behavior.algorithm.start_session(
                 reason="manual_record",
@@ -2766,6 +2798,22 @@ class AppModel(ObservableObject):
                         None,
                     )
                     if (
+                        self._abort_had_recording_started
+                        and self._live_inference_failed_reason
+                    ):
+                        # The pose files were closed when inference stopped,
+                        # and end there; no end-of-recording marker reached
+                        # them, so waiting for one could only time out.
+                        message = (
+                            "Live pose ends early: live inference stopped during "
+                            f"the recording ({self._live_inference_failed_reason})."
+                        )
+                        logger.error(message)
+                        self._session_data_recorder.set_source_result(
+                            "pose",
+                            failure=message,
+                        )
+                    elif (
                         wait_pose_closed is not None
                         and self._abort_had_recording_started
                         and not wait_pose_closed(
@@ -9883,6 +9931,8 @@ class AppModel(ObservableObject):
             subsystem_key,
             reason,
         )
+        if subsystem_key == SubsystemId.LIVE_INFERENCE:
+            self._live_inference_failed_reason = reason
 
     def _on_intersession_property_changed(self, name, value, _):
         if name == IntersessionMachine.Properties.STATE_PROPERTY:
@@ -10627,6 +10677,12 @@ class AppModel(ObservableObject):
                     and current.state is SubsystemState.READY
                 ):
                     reason = "live inference stopped unexpectedly"
+                    # The pose process's own reason, when it gave one. Its
+                    # traceback is in the log, but this is what the status
+                    # panel, the degraded tooltip and the Record refusal show.
+                    cause = getattr(self._inference, "pose_process_error", None)
+                    if cause:
+                        reason = f"{reason}: {cause}"
                     self._set_subsystem_status(
                         SubsystemId.LIVE_INFERENCE,
                         SubsystemState.FAILED,
@@ -10635,6 +10691,15 @@ class AppModel(ObservableObject):
                     self._handle_recording_subsystem_failure(
                         SubsystemId.LIVE_INFERENCE,
                         reason,
+                    )
+                    # As a pose watchdog timeout would. A pose process that
+                    # exits is caught within a poll of the message loop, and
+                    # stopping it unregisters that watchdog before it can fire,
+                    # so without this a crash while live raised no alert.
+                    self.on_error(
+                        "Hardware subsystem failure",
+                        f"{reason}. Unrelated hardware remains running; Record is "
+                        "blocked until the required subsystem is ready.",
                     )
 
             if new_is_live or value == InferenceStatus.intersession:

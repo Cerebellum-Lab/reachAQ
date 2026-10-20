@@ -14,6 +14,7 @@ from autotrainer.core.latency import LatencyStreamWriter, latency_stream_path
 from autotrainer.core.latency.schema import CAMERA_FRAME_DTYPE, RECORD_BATCH_DTYPE
 from tools.acquisition.model.session_data_recorder import SessionDataRecorder
 from tools.latency import finalize
+from tools.session_validation import engine
 
 
 def _nidaq_chunk():
@@ -217,3 +218,34 @@ def test_the_narrower_rewrite_does_not_list_what_finalization_left_out(tmp_path,
     assert "streams/latency/camera_right.h5" not in listed
     assert {"streams/latency.h5", "streams/latency/camera_left.h5",
             "streams/latency/events.h5"} <= set(listed)
+
+
+def test_every_file_the_manifest_rule_expects_is_one_finalization_lists(tmp_path):
+    # The validator names the files it expects to find listed, and the recorder decides
+    # which it lists. This pins that the validator's names are a subset of what
+    # finalization lists. It does not pin the reverse: a file written outside
+    # _write_session and added to its critical_paths is not on disk here, so it would
+    # not be caught.
+    project = _latency_project(tmp_path)
+    session_dir = tmp_path / "20260102" / "test" / "session001"
+    (session_dir / "streams" / "tracking").mkdir(parents=True)
+    # Written by camera finalization and tracking before the recorder publishes.
+    (session_dir / "streams" / "camera_alignment.json").write_text("{}")
+    project.get_frame_timing_path().write_text("frame_id,utc_when\n")
+    tracking = "streams/tracking/trial_000001_attempt_001.json"
+    (session_dir / tracking).write_text(
+        json.dumps({"window": {"startPerf": 10.3, "endPerf": 11.0}}))
+
+    SessionDataRecorder._write_session(
+        project, 10.0, 100.0, 12.0, (), (), (), (_nidaq_chunk(),), latency_events={},
+    )
+
+    _, listed = _manifest(tmp_path)
+    expected = {*engine._STREAM_FILES_LISTED, project.get_frame_timing_path().name, tracking}
+    # Every name is a file on disk, so what is left to compare is not empty by accident.
+    assert [name for name in expected if not (session_dir / name).is_file()] == []
+    assert expected <= set(listed), sorted(expected - set(listed))
+    # Of what this session has on disk it lists nothing else but the raw latency
+    # streams, which the rule leaves alone.
+    extra = {name for name in listed if name not in expected}
+    assert extra and all(name.startswith("streams/latency/") for name in extra), sorted(extra)

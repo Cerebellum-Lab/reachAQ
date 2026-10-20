@@ -1,5 +1,8 @@
+import gc
 import hashlib
 import json
+import time
+import weakref
 from pathlib import Path
 
 import h5py
@@ -46,11 +49,12 @@ def _write(path, datasets, attrs=None):
 
 
 def _session(tmp_path, *, first_sample=0, first_frame=0, primary="left", arrival_lag=ARRIVAL_LAG,
-             latches=True):
+             latches=True, raw=False):
     rng = np.random.default_rng(7)
     session = tmp_path / "session001"
     streams = session / "streams"
-    raw = streams / "latency"
+    # Not `raw`: that name is the keyword above, and a Path there is always truthy.
+    latency_dir = streams / "latency"
 
     samples = int(2.5 * RATE)
     exposure_ni = 0.05 + np.arange(FRAMES) * PERIOD
@@ -71,13 +75,18 @@ def _session(tmp_path, *, first_sample=0, first_frame=0, primary="left", arrival
     # back-to-back reads, when the previous read returned.
     returned = HOST + block_last / RATE + 0.0002 + rng.uniform(0, 0.003, block_last.size)
     seen_per_block = np.concatenate([[HOST - 0.001], returned[:-1]])
-    _write(streams / "nidaq.h5", {
+    nidaq = {
         "sample_index": first_sample + np.arange(samples, dtype=np.int64),
         "block_observation_perf_time": seen_per_block[block].astype(np.float64),
         "epoch": np.ones(samples, dtype=np.uint64),
         "values": np.vstack([cam, command, diode]).astype(np.float32),
-    }, {"channel_names": np.array([b"cam_frames", b"laser1_command_copy", b"laser1_diode"]),
-        "sample_rate_hz": RATE})
+    }
+    if raw:
+        # RAW read beside each perf stamp; no NTP in the synthetic host, so a constant offset.
+        nidaq["block_observation_raw_time"] = nidaq["block_observation_perf_time"] + 3.0
+    _write(streams / "nidaq.h5", nidaq,
+           {"channel_names": np.array([b"cam_frames", b"laser1_command_copy", b"laser1_diode"]),
+            "sample_rate_hz": RATE})
 
     ids = np.arange(FRAMES)
     exposure_host = HOST + exposure_ni
@@ -113,9 +122,9 @@ def _session(tmp_path, *, first_sample=0, first_frame=0, primary="left", arrival
         clock_latches["camera_ns"] = np.round((latch_ni + CAMERA_OFFSET) * 1e9).astype(np.int64)
         camera_stream["clock_latches"] = clock_latches
     for number, name in enumerate(("left", "right")):
-        _write(raw / f"camera_{name}.h5", camera_stream,
+        _write(latency_dir / f"camera_{name}.h5", camera_stream,
                {"camera": name, "camera_index": number, "is_primary": name == primary})
-        _write(raw / f"record_{name}.h5", {"record_writes": writes, "clock_pairs": pairs})
+        _write(latency_dir / f"record_{name}.h5", {"record_writes": writes, "clock_pairs": pairs})
 
     posed = ids[::2]
     count = posed.size
@@ -133,7 +142,7 @@ def _session(tmp_path, *, first_sample=0, first_frame=0, primary="left", arrival
     forwards["pose_seq"] = np.arange(count)
     forwards["live_sequence"] = np.arange(count) + 100
     forwards["live_put_perf"] = pose["monitor_recv_perf"] + 0.0001
-    _write(raw / "pose.h5", {"batches": pose, "forwards": forwards, "clock_pairs": pairs},
+    _write(latency_dir / "pose.h5", {"batches": pose, "forwards": forwards, "clock_pairs": pairs},
            {"cameras": json.dumps(["left", "right"])})
 
     live = np.zeros(count, dtype=LIVE_POSE_DTYPE)
@@ -149,7 +158,7 @@ def _session(tmp_path, *, first_sample=0, first_frame=0, primary="left", arrival
     tables = {name: np.zeros(0, dtype=dtype) for name, dtype in EVENT_TABLES.items()}
     tables["live_poses"] = live
     tables["stim_dispatch"] = dispatch
-    LatencyEventLog.write(raw / "events.h5", tables)
+    LatencyEventLog.write(latency_dir / "events.h5", tables)
     return session
 
 
@@ -382,6 +391,10 @@ def test_the_file_records_its_clock_fits_session_and_app_version(tmp_path):
         camera = dict(store["clock/camera_to_ni"].attrs)
         wall = dict(store["clock/wall_to_host"].attrs)
     assert ni["valid"] and ni["points"] == 20 and ni["residual_rms"] < 0.0005
+    assert ni["method"] == "piecewise_envelope" and ni["knotCount"] == 2
+    assert "knots" not in ni  # the table lives in alignment.json, not in a 64 KB attribute
+    assert set(ni) >= {"offset", "drift", "x_min", "x_max", "reason", "segmentDriftPpmMin",
+                       "segmentDriftPpmMax", "knotSeconds"}
     assert "minimum delivery delay" in ni["note"]
     assert "unmeasured" in ni["envelope_bias_floor"]
     assert "unmeasured" in ni["secondary_trigger_delay"]
@@ -412,7 +425,7 @@ def test_one_truncated_stream_costs_only_what_depends_on_it(tmp_path, monkeypatc
 
 
 @pytest.mark.parametrize("broken, loops", [
-    ("fit_ni_to_host", {"stim": "partial", "hardware": "complete"}),
+    ("fit_ni_to_host_timeline", {"stim": "partial", "hardware": "complete"}),
     ("choose_pairing", {"pose": "partial", "hardware": "complete"}),
     ("choose_pairing_by_camera_clock", {"pose": "partial", "hardware": "complete"}),
     ("fit_camera_to_ni", {"pose": "partial", "hardware": "complete"}),
@@ -428,7 +441,7 @@ def test_a_clock_fit_that_raises_is_an_invalid_fit_not_a_failure(tmp_path, monke
     session = _session(tmp_path, latches=broken != "choose_pairing")
     status = finalize_session_latency(session, primary_camera="left")
 
-    key = {"fit_ni_to_host": "niToHost", "choose_pairing": "cameraToNi",
+    key = {"fit_ni_to_host_timeline": "niToHost", "choose_pairing": "cameraToNi",
            "choose_pairing_by_camera_clock": "cameraToNi",
            "fit_camera_to_ni": "cameraToNi", "fit_wall_to_host": "wallToHost"}[broken]
     assert status["clocks"][key]["valid"] is False
@@ -617,3 +630,92 @@ def test_a_consecutive_sample_index_is_derived_and_a_gap_uses_the_stored_one(tmp
 
         assert ni["transitions"].tolist() == expected
         assert "values" not in ni and "channels" not in ni  # no samples are retained
+
+
+def test_the_raw_column_is_not_kept_alive_through_the_channel_scans(tmp_path, monkeypatch):
+    # The stamps keep only the run ends, so the whole RAW column (8 bytes a sample, 288 MB
+    # an hour at 10 kHz) must be gone before the channels are scanned.
+    path = tmp_path / "nidaq.h5"
+    seen = np.arange(10, dtype=np.float64)
+    _write(path, {"sample_index": (1000 + np.arange(10)).astype(np.int64),
+                  "block_observation_perf_time": seen,
+                  "block_observation_raw_time": seen + 3.0,
+                  "values": np.array([[0, 0, 1, 1, 0, 0, 1, 1, 0, 0]], dtype=np.float32)},
+           {"channel_names": np.array([b"cam_frames"]), "sample_rate_hz": 1000.0})
+    raw_arrays, alive_during_scan = [], []
+    real_stamps, real_transitions = finalize.clocks.ni_block_stamps, finalize.clocks.transitions
+
+    def stamps(index, observed, raw=None):
+        raw_arrays.append(weakref.ref(raw))
+        return real_stamps(index, observed, raw)
+
+    def transitions(channel):
+        gc.collect()
+        alive_during_scan.append(raw_arrays[0]() is not None)
+        return real_transitions(channel)
+
+    monkeypatch.setattr(finalize.clocks, "ni_block_stamps", stamps)
+    monkeypatch.setattr(finalize.clocks, "transitions", transitions)
+
+    ni = finalize._read_nidaq(path)
+
+    assert ni["transitions"].tolist() == [1002, 1004, 1006, 1008]
+    assert np.isfinite(ni["block_stamps"].raw).all()  # the RAW stamps were read and kept
+    assert alive_during_scan == [False]
+
+
+def test_a_raw_stamped_session_bridges_ni_to_host_through_raw(tmp_path):
+    session = _session(tmp_path, raw=True)
+
+    status = finalize_session_latency(session, primary_camera="left")
+
+    assert status["status"] == "complete", status
+    ni = status["clocks"]["niToHost"]
+    assert ni["method"] == "raw_bridged" and ni["valid"]
+    assert ni["knotCount"] == 2  # the fixture spans 2.5 s: only the two end knots
+    assert status["clocks"]["cameraToNi"]["pairing"]["ambiguous"] is False
+
+
+def test_the_raw_stream_reader_is_public_and_retries(tmp_path, monkeypatch):
+    path = tmp_path / "camera_left.h5"
+    _write(path, {"frames": np.zeros(3, dtype=CAMERA_FRAME_DTYPE)}, {"camera": "left"})
+    monkeypatch.setattr(finalize, "OPEN_RETRY_SECONDS", 0.2)
+
+    data = finalize.read_raw_stream(path)
+
+    assert len(data["frames"]) == 3 and data["attrs"]["camera"] == "left"
+    assert finalize._read_h5 is finalize.read_raw_stream
+    started = time.monotonic()
+    with pytest.raises(OSError):
+        finalize.read_raw_stream(tmp_path / "missing.h5")
+    # The module's budget is read when the call is made: the 0.2 s patched in above, not the
+    # 5 s the default would have bound at import (which also made every patched test slow).
+    assert time.monotonic() - started < 2.0
+    # The caller's 0.05 s, not the module's: the default 5 s is put back, so a reader that
+    # ignored its argument would take all of it and the bound can leave room for a loaded rig.
+    monkeypatch.setattr(finalize, "OPEN_RETRY_SECONDS", 5.0)
+    started = time.monotonic()
+    with pytest.raises(OSError):
+        finalize.read_raw_stream(tmp_path / "missing.h5", retry_seconds=0.05)
+    assert time.monotonic() - started < 0.5
+
+
+@pytest.mark.parametrize("damage", ["truncated", "not_numbers"])
+def test_a_malformed_raw_column_costs_the_bridge_not_the_whole_nidaq_file(tmp_path, damage):
+    session = _session(tmp_path, raw=True)
+    with h5py.File(session / "streams" / "nidaq.h5", "r+") as store:
+        column = store["block_observation_raw_time"][()]
+        del store["block_observation_raw_time"]
+        store.create_dataset("block_observation_raw_time",
+                             data=column[:100] if damage == "truncated"
+                             else np.full(column.shape, b"abc"))
+
+    status = finalize_session_latency(session, primary_camera="left")
+
+    ni = status["clocks"]["niToHost"]
+    assert ni["valid"] and ni["method"] == "piecewise_envelope", ni
+    assert status["loops"]["hardware"]["status"] == "complete", status["loops"]["hardware"]
+    assert status["clocks"]["cameraToNi"]["valid"] is True
+    assert any(reason.startswith("nidaq.h5 RAW stamps unusable: ") for reason in status["reasons"])
+    assert not any("nidaq.h5 unreadable" in reason for reason in status["reasons"])
+    assert status["status"] == "partial"  # a reason caps the session; the loops themselves are whole

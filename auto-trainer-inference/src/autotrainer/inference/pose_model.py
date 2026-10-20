@@ -46,6 +46,18 @@ class PoseModel:
         """
         return False
 
+    @property
+    def crop_preserves_scale(self) -> bool:
+        """
+        Whether a crop of the frame reaches the model at the scale it was
+        trained at, so an inference ROI can cut its work.
+
+        True by default: the DeepLabCut backbone is fully convolutional, so a
+        crop only shifts the coordinate frame (see cropped_pose_model). A
+        backend that resizes every frame to a fixed input says False.
+        """
+        return True
+
     def prepare_live_batch(self, batch_size: int) -> None:
         """Tell the model how many frames the live path will hand it.
 

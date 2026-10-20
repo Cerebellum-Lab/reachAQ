@@ -42,6 +42,9 @@ class _Latch:
         if self.result is None:
             return None
         before = time.perf_counter()
+        if self.result == "raw":
+            return before, time.perf_counter_ns(), time.perf_counter(), 11.0, 12.0
+        # The three-field answer of a camera class from before the RAW stamps.
         return before, time.perf_counter_ns(), time.perf_counter()
 
 
@@ -98,6 +101,15 @@ def test_latches_follow_the_streams_first_frame_and_precede_its_close(project_in
     assert (opening["perf_after"] < frames["poll_perf"][1]).all()
     # After the last frame row: the stream closed right after them.
     assert (closing["perf_before"] > frames["capture_return_perf"][-1]).all()
+    # A three-field latch lands with its RAW pair unknown, not rejected.
+    assert numpy.isnan(rows["raw_before"]).all() and numpy.isnan(rows["raw_after"]).all()
+
+
+def test_a_five_field_latch_keeps_its_raw_pair(project_info):
+    stream = _record(project_info, _Latch(result="raw"))
+    rows = stream["clock_latches"]
+    assert len(rows) == 6
+    assert rows["raw_before"].tolist() == [11.0] * 6 and rows["raw_after"].tolist() == [12.0] * 6
 
 
 def _assert_capture_unaffected(frames, caplog):
