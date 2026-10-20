@@ -808,3 +808,221 @@ def test_validation_passes_after_the_post_stop_trial_ledger_update(tmp_path):
     assert {"streams/pressure.csv", "streams/alignment.json"} <= listed
     result = _manifest_result(root, ValidationProfile.FULL)
     assert result.status.value == "pass", result.message
+
+
+# ------------------------------------- the camera/NI frame anchor (alignment.frames)
+
+_FIT = {"valid": True, "method": "raw_bridged", "reason": "", "knotCount": 7}
+
+
+def _camera_alignment(**changes):
+    """cameraNidaqAlignment as the recorder writes a clean schema-3 latch anchor."""
+    return {
+        "status": "matched",
+        "confidence": "hardware_edge",
+        "anchorMethod": "camera_latch",
+        "niToHost": dict(_FIT),
+        "exposureSeconds": 0.000175,
+        "expectedLagSeconds": 0.001275,
+        "impliedLagSeconds": 0.001156,
+        "lagGateSeconds": [0.000275, 0.002275],
+        "latch": {"status": "paired", "shift": 0},
+        "anchorsAgree": True,
+        "reason": "Camera-clock latch pairing on the fitted NI timeline (shift 0)",
+        **changes,
+    }
+
+
+def _epoch_alignment(**changes):
+    """cameraNidaqAlignment from the epoch fallback, which leaves the fit-only fields unset."""
+    return _camera_alignment(**{
+        "confidence": "ambiguous_hardware_edge", "anchorMethod": "epoch_nearest_edge",
+        "expectedLagSeconds": None, "impliedLagSeconds": None, "lagGateSeconds": None,
+        "latch": None, "anchorsAgree": None,
+        **changes,
+    })
+
+
+def _alignment_session(tmp_path, camera=None, *, schema=3, nidaq=True, tone=None):
+    root = _session(tmp_path)
+    alignment_path = root / "streams/alignment.json"
+    alignment = json.loads(alignment_path.read_text(encoding="utf-8"))
+    alignment["schemaVersion"] = schema
+    alignment["cameraNidaqAlignment"] = (
+        _camera_alignment() if camera is None else camera
+    )
+    if tone is not None:
+        alignment["toneConfirmation"] = tone
+    _write(alignment_path, json.dumps(alignment))
+    if nidaq:
+        manifest_path = root / "streams/stream_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["enabledSources"] = [
+            _source("nidaq.cam_frames", "nidaq_digital", "streams/nidaq.h5")]
+        _write(manifest_path, json.dumps(manifest))
+    return root
+
+
+def _alignment_result(root, profile=ValidationProfile.QUICK):
+    report = validate_session(
+        root, profile=profile, selected_rules=("alignment.frames",))
+    return next(item for item in report.results if item.rule_id == "alignment.frames")
+
+
+def test_frame_alignment_passes_a_clean_anchor_in_the_automatic_quick_check(tmp_path):
+    result = _alignment_result(_alignment_session(tmp_path))
+    assert result.status.value == "pass", result.message
+    assert "camera_latch" in result.message
+    assert result.observed["anchorMethod"] == "camera_latch"
+    assert result.observed["niToHostMethod"] == "raw_bridged"
+
+
+@pytest.mark.parametrize("camera, key, value", (
+    # A perf-only fit: RAW was left out, and the fit says why without failing.
+    (_camera_alignment(niToHost={**_FIT, "method": "piecewise_envelope",
+                                 "reason": "RAW on 40 stamps, need 100"}),
+     "niToHostReason", "RAW on 40 stamps, need 100"),
+    # No exposure: the anchor took the bare allowance, and the gate still held.
+    (_camera_alignment(anchorMethod="expected_lag", exposureSeconds=None,
+                       anchorsAgree=None, latch={"status": "unavailable",
+                                                 "reason": "no latency stream"},
+                       reason="cam_frames transition nearest the expected exposure "
+                              "edge on the fitted NI timeline; exposure unknown, "
+                              "assumed 0"),
+     "reason", "cam_frames transition nearest the expected exposure edge on the "
+               "fitted NI timeline; exposure unknown, assumed 0"),
+    # A latch pairing that was tried and not used, with the gate passing.
+    (_camera_alignment(anchorMethod="expected_lag", anchorsAgree=None,
+                       latch={"status": "ambiguous", "reason": "two shifts tie"}),
+     "latchReason", "two shifts tie"),
+), ids=("perf-only-fit", "exposure-unknown", "latch-not-used"))
+def test_frame_alignment_records_what_does_not_degrade_the_anchor(
+        tmp_path, camera, key, value):
+    result = _alignment_result(_alignment_session(tmp_path, camera))
+    assert result.status.value == "pass", result.message
+    assert result.observed[key] == value
+
+
+@pytest.mark.parametrize("camera, expected", (
+    (_epoch_alignment(
+        niToHost={**_FIT, "valid": False, "reason": "fewer than 100 stamps"},
+        reason="NI-to-host fit unavailable (fewer than 100 stamps); nearest "
+               "cam_frames transition on the NI-DAQ epoch timeline"),
+     "fewer than 100 stamps"),
+    # The fit is valid and still maps the frames; only the edge was picked on the epoch.
+    (_epoch_alignment(
+        reason="fitted anchor failed (ValueError: empty spool); nearest "
+               "cam_frames transition on the NI-DAQ epoch timeline"),
+     "fitted anchor failed"),
+    (_epoch_alignment(
+        status="unmatched", confidence="none",
+        niToHost=None,
+        reason="NI-to-host fit unavailable (no NI-to-host fit); Nearest cam_frames "
+               "edge was outside half of the observed frame period"),
+     "no NI-to-host fit"),
+    (_camera_alignment(anchorMethod=None, reason="matched without a method"),
+     "unrecognised anchor method"),
+    (_camera_alignment(
+        confidence="ambiguous_hardware_edge", anchorMethod="expected_lag",
+        anchorsAgree=None, latch={"status": "unavailable"},
+        reason="cam_frames transition nearest the expected exposure edge on the "
+               "fitted NI timeline; implied lag 2.900 ms is outside the gate "
+               "0.275..2.275 ms"),
+     "outside the gate"),
+    (_camera_alignment(
+        confidence="ambiguous_hardware_edge", anchorsAgree=False,
+        reason="Camera-clock latch pairing on the fitted NI timeline (shift 1); "
+               "the camera-latch anchor (sample 40) and the expected-lag anchor "
+               "(sample 107) disagree"),
+     "disagree"),
+    (_camera_alignment(
+        status="unmatched", confidence="none", anchorMethod=None,
+        impliedLagSeconds=None, latch=None, anchorsAgree=None,
+        reason="Nearest cam_frames transition to the expected exposure edge was "
+               "outside half of the observed frame period"),
+     "outside half of the observed frame period"),
+    (_camera_alignment(
+        status="host_estimated", confidence="host_estimated",
+        anchorMethod="host_estimated", impliedLagSeconds=None, latch=None,
+        anchorsAgree=None,
+        reason="cam_frames was not configured; alignment uses the single NI-DAQ "
+               "epoch anchor"),
+     "cam_frames was not configured"),
+), ids=("epoch-fallback", "fitted-anchor-failed", "epoch-unmatched",
+        "unknown-method", "outside-gate", "anchors-disagree", "unmatched",
+        "host-estimated"))
+def test_frame_alignment_warns_on_a_degraded_anchor_with_the_recorders_reason(
+        tmp_path, camera, expected):
+    result = _alignment_result(_alignment_session(tmp_path, camera))
+    assert result.status.value == "warning", result.message
+    assert expected in result.message
+    assert "cameraNidaqAlignment.reason" in result.remediation
+
+
+def test_frame_alignment_does_not_call_a_valid_fit_invalid_when_the_anchor_failed(
+        tmp_path):
+    # The fit still maps the frames; only the first frame's edge came off the epoch.
+    camera = _epoch_alignment(
+        reason="fitted anchor failed (ValueError: empty spool); nearest "
+               "cam_frames transition on the NI-DAQ epoch timeline")
+    result = _alignment_result(_alignment_session(tmp_path, camera))
+    assert result.status.value == "warning", result.message
+    assert result.message.startswith("the first frame was anchored on the NI epoch timeline")
+    assert "fit is invalid" not in result.message
+    assert result.observed["niToHostValid"] is True
+
+
+def test_frame_alignment_warns_when_no_anchor_was_recorded(tmp_path):
+    root = _alignment_session(tmp_path)
+    alignment_path = root / "streams/alignment.json"
+    alignment = json.loads(alignment_path.read_text(encoding="utf-8"))
+    del alignment["cameraNidaqAlignment"]
+    _write(alignment_path, json.dumps(alignment))
+    result = _alignment_result(root)
+    assert result.status.value == "warning", result.message
+    assert "cameraNidaqAlignment is missing" in result.message
+    assert "cameraNidaqAlignment.reason" not in result.remediation
+
+
+def test_frame_alignment_warns_when_the_tones_fell_back_to_the_epoch(tmp_path):
+    tone = {"matched": [], "hostTimeFallbackReason": "ValueError: bad device row"}
+    result = _alignment_result(_alignment_session(tmp_path, tone=tone))
+    assert result.status.value == "warning", result.message
+    assert "ValueError: bad device row" in result.message
+    # The frame anchor itself is clean, so only the tones are pointed at.
+    assert "toneConfirmation.hostTimeFallbackReason" in result.remediation
+    assert "cameraNidaqAlignment" not in result.remediation
+
+
+def test_frame_alignment_warns_on_a_session_recorded_before_the_drift_correction(
+        tmp_path):
+    root = _alignment_session(tmp_path, schema=2)
+    result = _alignment_result(root)
+    assert result.status.value == "warning", result.message
+    assert "predates" in result.message and "15 of 36" in result.message
+    assert result.observed["schemaVersion"] == 2
+
+
+def _alignment_session_without_stream_manifest(tmp_path):
+    # Sessions from before the stream manifest (August 2026) have alignment.json alone.
+    root = _alignment_session(tmp_path, schema=1)
+    (root / "streams/stream_manifest.json").unlink()
+    return root
+
+
+@pytest.mark.parametrize("build", (
+    _alignment_session_without_stream_manifest,
+    lambda tmp_path: _alignment_session(tmp_path, nidaq=False),
+    lambda tmp_path: _alignment_session(tmp_path, schema=2, nidaq=False),
+    lambda tmp_path: _alignment_session(tmp_path, _camera_alignment(
+        status="unavailable", confidence="none", anchorMethod=None,
+        reason="No NI-DAQ samples were saved for the session")),
+    # An old session that saved no samples has no frame anchor to doubt.
+    lambda tmp_path: _alignment_session(tmp_path, _camera_alignment(
+        status="unavailable", confidence="none", anchorMethod=None,
+        reason="No NI-DAQ samples were saved for the session"), schema=2),
+), ids=("no-stream-manifest", "no-nidaq", "old-session-without-nidaq",
+        "no-samples-saved", "old-session-no-samples-saved"))
+def test_frame_alignment_is_not_applicable_without_ni_samples(tmp_path, build):
+    result = _alignment_result(build(tmp_path))
+    assert result.status.value == "not_applicable", result.message
