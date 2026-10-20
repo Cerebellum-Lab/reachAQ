@@ -1,0 +1,151 @@
+"""The motor-frame joint fit, checked on a synthetic rig with a known answer.
+
+The board only slides between waypoints, so each camera sees parallel planes and a
+planar calibration cannot separate focal length from distance. The fit treats all
+waypoints as one non-planar target in the motor frame (board corners plus the
+commanded motor translation, times an unknown motor scale). These tests check that
+it recovers the synthetic rig's cameras and motor scale, keeps a waypoint seen by
+only one camera for that camera, and reports a stereo pair consistent with its poses.
+"""
+
+import cv2
+import numpy as np
+import pytest
+
+from autotrainer.inference.multires_calibration.fit import (
+    INTRINSIC_NAMES,
+    BoardSpec,
+    fit_motor_frame,
+)
+from multires_synthetic import render_board_frame, synthetic_rig
+
+
+def rotation_angle_deg(a, b):
+    """The angle of R(a)^T R(b), in degrees."""
+    R = cv2.Rodrigues(np.asarray(a, float))[0].T @ cv2.Rodrigues(np.asarray(b, float))[0]
+    # The norm of the rotation vector is the angle, without arccos's loss near zero.
+    return float(np.degrees(np.linalg.norm(cv2.Rodrigues(R)[0])))
+
+
+def test_fit_recovers_the_synthetic_rig():
+    rig = synthetic_rig(noise_px=0.1)
+    fit = fit_motor_frame(rig.observations, rig.board, (1440, 1080))
+    for cam in ("left", "right"):
+        t, f = rig.truth.cameras[cam], fit.cameras[cam]
+        assert f.K[0, 0] == pytest.approx(t.K[0, 0], rel=0.005)
+        assert f.K[1, 1] == pytest.approx(t.K[1, 1], rel=0.005)
+        # The principal point and the camera pose are bounded at about 3 sigma of what this
+        # target can measure, not at the plan's 1 px, 0.05 deg and 0.1 mm. The board's depth
+        # range (13 mm at 150 mm) barely separates a principal-point shift from a sideways
+        # camera move: they correlate at -1.0 in the fit. With 0.1 px of corner noise the
+        # fit's sigma is 1.1-1.25 px for cx and cy, matching the scatter over 30 seeds
+        # (max 3.2 px, 0.077 deg, 0.30 mm), and the plan's bounds failed 28 of those 30.
+        # Noise-free, the fit recovers them exactly (see the stereo test).
+        assert abs(f.K[0, 2] - t.K[0, 2]) < 4.0 and abs(f.K[1, 2] - t.K[1, 2]) < 4.0
+        assert abs(f.dist[0] - t.dist[0]) < 0.02
+        assert rotation_angle_deg(f.rvec, t.rvec) < 0.15
+        assert np.linalg.norm(f.tvec - t.tvec) < 0.5
+        assert fit.rms_px[cam] < 0.2
+    assert fit.motor_scale == pytest.approx(1.0, abs=0.002)
+
+
+def test_fit_measures_a_motor_scale_error():
+    rig = synthetic_rig(motor_scale=1.01)
+    assert fit_motor_frame(rig.observations, rig.board, (1440, 1080)).motor_scale == pytest.approx(1.01, abs=0.002)
+
+
+def test_waypoints_seen_by_one_camera_still_constrain_that_camera():
+    rig = synthetic_rig()
+    for obs in rig.observations[::3]:
+        obs.corners.pop("right")
+    fit = fit_motor_frame(rig.observations, rig.board, (1440, 1080))
+    assert fit.cameras["right"].K[0, 0] == pytest.approx(rig.truth.cameras["right"].K[0, 0], rel=0.01)
+    # Each camera keeps exactly the waypoints it saw: the left camera all of them,
+    # the right camera all but the ones it missed.
+    assert sorted(fit.per_view_rms_px["left"]) == [o.index for o in rig.observations]
+    assert sorted(fit.per_view_rms_px["right"]) == [o.index for o in rig.observations if "right" in o.corners]
+
+
+def test_stereo_is_consistent_with_the_camera_poses():
+    rig = synthetic_rig(noise_px=0.0)
+    fit = fit_motor_frame(rig.observations, rig.board, (1440, 1080))
+    R, T = fit.stereo()
+    # A motor-frame point mapped to the left camera, then through (R, T), equals its right-camera mapping.
+    X = np.random.default_rng(1).uniform(-60.0, 60.0, (20, 3))
+    left, right = fit.cameras["left"], fit.cameras["right"]
+    X_left = X @ cv2.Rodrigues(left.rvec)[0].T + left.tvec
+    X_right = X @ cv2.Rodrigues(right.rvec)[0].T + right.tvec
+    np.testing.assert_allclose(X_left @ R.T + T, X_right, rtol=0, atol=1e-6)
+    # Without noise the fit lands on the truth, so the pair is the true one too.
+    R_true, T_true = rig.truth.stereo()
+    assert rotation_angle_deg(cv2.Rodrigues(R)[0], cv2.Rodrigues(R_true)[0]) < 1e-4
+    np.testing.assert_allclose(T, T_true, rtol=0, atol=1e-4)
+
+
+def test_fit_converges_when_the_planar_start_is_far_off():
+    # Parallel views leave the planar calibration that starts the fit degenerate in focal
+    # length. With this seed it starts the left camera at well over twice the true fx;
+    # with all five distortion terms free there it started at 5.5x, k2 = -2800, and the
+    # joint fit diverged to rms 4.4 px.
+    rig = synthetic_rig(seed=12)
+    fit = fit_motor_frame(rig.observations, rig.board, (1440, 1080))
+    for cam in ("left", "right"):
+        assert fit.rms_px[cam] < 0.2
+        assert fit.cameras[cam].K[0, 0] == pytest.approx(rig.truth.cameras[cam].K[0, 0], rel=0.005)
+    assert fit.motor_scale == pytest.approx(1.0, abs=0.002)
+
+
+def test_param_std_covers_every_intrinsic():
+    rig = synthetic_rig(noise_px=0.1)
+    fit = fit_motor_frame(rig.observations, rig.board, (1440, 1080))
+    for cam in ("left", "right"):
+        std = fit.param_std[cam]
+        assert tuple(std) == INTRINSIC_NAMES == ("fx", "fy", "cx", "cy", "k1", "k2", "p1", "p2", "k3")
+        assert all(np.isfinite(v) and v > 0 for v in std.values())
+        # 0.1 px of noise on ~1800 corners pins the focal length far inside the 0.5 % the
+        # recovery test allows; a std near that size would mean the Jacobian is wrong.
+        assert std["fx"] / fit.cameras[cam].K[0, 0] < 0.001
+
+
+def test_a_camera_with_too_few_waypoints_is_refused():
+    rig = synthetic_rig()
+    for obs in rig.observations[2:]:
+        obs.corners.pop("right")
+    with pytest.raises(ValueError, match="right"):
+        fit_motor_frame(rig.observations, rig.board, (1440, 1080))
+
+
+def test_board_object_points_are_row_major_with_columns_fastest():
+    pts = BoardSpec().object_points()
+    assert pts.shape == (48, 3)
+    np.testing.assert_array_equal(pts[:2], [[0.0, 0.0, 0.0], [4.0, 0.0, 0.0]])
+    np.testing.assert_array_equal(pts[8], [0.0, 4.0, 0.0])
+    np.testing.assert_array_equal(pts[-1], [28.0, 20.0, 0.0])
+
+
+def test_synthetic_moves_follow_the_rig_move_list_shape():
+    motor = np.array([o.motor_mm for o in synthetic_rig().observations])
+    assert motor.shape == (37, 3)
+    np.testing.assert_array_equal(motor[0], [-9.4, 10.0, -35.0])
+    for axis, (lo, hi) in enumerate([(-10.0, 10.0), (10.0, 35.0), (-35.0, -22.0)]):
+        assert lo <= motor[:, axis].min() and motor[:, axis].max() <= hi
+    # Every step moves exactly one axis, so no waypoint repeats the one before it.
+    assert np.all(np.count_nonzero(np.diff(motor, axis=0), axis=1) == 1)
+
+
+def test_rendered_board_is_detected_at_the_projected_corners():
+    rig = synthetic_rig(noise_px=0.0)
+    board, cam = rig.board, rig.truth.cameras["left"]
+    X = rig.world_corners(rig.observations[5].motor_mm)
+    gray = render_board_frame(cam, X, (1440, 1080), board)
+    assert gray.dtype == np.uint8 and gray.shape == (1080, 1440)
+
+    found, corners = cv2.findChessboardCorners(gray, (board.cols, board.rows))
+    assert found
+    corners = cv2.cornerSubPix(
+        gray, corners, (5, 5), (-1, -1), (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 1e-3)
+    ).reshape(-1, 2)
+    truth = cv2.projectPoints(X, cam.rvec, cam.tvec, cam.K, np.zeros(5))[0].reshape(-1, 2)
+    # The 6x8 board is symmetric under a 180 degree turn, so the detector may report either order.
+    err = min(np.linalg.norm(corners - truth, axis=1).max(), np.linalg.norm(corners[::-1] - truth, axis=1).max())
+    assert err < 0.25
