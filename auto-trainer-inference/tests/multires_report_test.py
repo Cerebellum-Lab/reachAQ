@@ -37,7 +37,7 @@ BASE = PresetGeometry(4, 256, 256, 52, 6)
 BASE_ROI = BASE.sensor_roi()  # (208, 24, 1232, 1048), pixel edges
 IMAGE_SIZE = (1440, 1080)
 CAMERAS = ("left", "right")
-CHANGE_METRICS = {"camera_rotation_change_deg", "camera_translation_change_mm", "focal_change_rel"}
+CHANGE_METRICS = {"camera_rotation_change_deg", "baseline_change_mm", "focal_change_rel"}
 STATUS_WORDS = ("FAIL", "WARN", "PASS")
 
 
@@ -205,30 +205,63 @@ def test_previous_calibration_change_warns_camera_moved(rig, fitted):
     assert left.status == "warn"
     assert "moved" in left.note
     # Turned about its own centre, the left camera did not translate; the right one did not change.
-    assert metric(report, "camera_translation_change_mm", "left").value == pytest.approx(0.0, abs=1e-9)
+    assert metric(report, "baseline_change_mm").value == pytest.approx(0.0, abs=1e-9)
     assert metric(report, "camera_rotation_change_deg", "right").status == "pass"
     assert metric(report, "camera_rotation_change_deg", "right").value == pytest.approx(0.0, abs=1e-9)
     assert any("left" in note and "moved" in note for note in report.notes)
     assert "no comparable previous calibration" not in report.notes
 
 
-def test_previous_calibration_measures_translation_and_focal_change(rig, fitted):
-    right = shifted(fitted.cameras["right"], (1.2, -1.6, 0.0))  # 2 mm
-    left = fitted.cameras["left"]
-    left_K = left.K.copy()
-    left_K[0, 0] *= 1.03
-    previous = with_camera(with_camera(fitted, "right", right), "left", dataclasses.replace(left, K=left_K))
+def test_a_common_shift_of_both_cameras_does_not_read_as_moved(rig, fitted):
+    # Remounting the board moves the motor frame's origin, which shifts every camera centre
+    # by the same vector: the cameras did not move relative to each other.
+    shift = (3.0, -2.0, 5.0)
+    previous = with_camera(
+        with_camera(fitted, "left", shifted(fitted.cameras["left"], shift)),
+        "right", shifted(fitted.cameras["right"], shift),
+    )
 
     report = report_for(
         fitted, rig.observations, rig.board, swept_roi(rig.observations),
         previous=PreviousCalibration(legacy=False, fit=previous),
     )
 
-    translation = metric(report, "camera_translation_change_mm", "right")
-    assert translation.value == pytest.approx(2.0, abs=1e-9)
-    assert translation.status == "warn"
-    assert "moved" in translation.note
+    baseline = metric(report, "baseline_change_mm")
+    assert baseline.value == pytest.approx(0.0, abs=1e-9)
+    assert baseline.status == "pass"
+    assert "moved" not in baseline.note
+    assert not any("moved" in note for note in report.notes)
+    assert "camera_translation_change_mm" not in {m.name for m in report.metrics}
+    assert report.verdict == "pass", not_passing(report)
+
+
+def test_moving_one_camera_changes_the_baseline(rig, fitted):
+    previous = with_camera(fitted, "right", shifted(fitted.cameras["right"], (1.2, -1.6, 0.0)))  # 2 mm
+
+    report = report_for(
+        fitted, rig.observations, rig.board, swept_roi(rig.observations),
+        previous=PreviousCalibration(legacy=False, fit=previous),
+    )
+
+    baseline = metric(report, "baseline_change_mm")
+    assert baseline.value == pytest.approx(2.0, abs=1e-9)
+    assert baseline.status == "warn"
+    assert "moved" in baseline.note
+    assert any("moved" in note for note in report.notes)
     assert metric(report, "camera_rotation_change_deg", "right").value == pytest.approx(0.0, abs=1e-9)
+
+
+def test_previous_calibration_measures_focal_change(rig, fitted):
+    left = fitted.cameras["left"]
+    left_K = left.K.copy()
+    left_K[0, 0] *= 1.03
+    previous = with_camera(fitted, "left", dataclasses.replace(left, K=left_K))
+
+    report = report_for(
+        fitted, rig.observations, rig.board, swept_roi(rig.observations),
+        previous=PreviousCalibration(legacy=False, fit=previous),
+    )
+
     focal = metric(report, "focal_change_rel", "left")
     assert focal.value == pytest.approx(abs(1 / 1.03 - 1))
     assert focal.status == "warn"

@@ -22,11 +22,17 @@ coordinates (pixel i is centred on i), and roi_sensor is in pixel edges, as
 PresetGeometry.sensor_roi() returns it, so a pixel-centre coordinate u sits at edge
 coordinate u + 0.5.
 
-Camera positions are compared in the motor frame, whose origin is the board's corner 0
-at motor position 0 (fit.py). Remounting the board on the stage, or a different motor
-zero, therefore moves every camera centre by the same vector, and the translation change
-cannot tell that from both cameras moving together. Camera rotations are relative to the
-motor axes and do not depend on where the board sits.
+The change since the previous calibration has to respect the fit's gauge. The motor
+frame's origin is the board's corner 0 at motor position 0 (fit.py), a choice rather than
+a measurement, and the board is remounted on the stage every month. Between calibrations
+the origin therefore moves by an unknown vector, and every camera centre (-R^T t) shifts
+with it, so comparing each camera's centre on its own would report "moved" every month.
+The report compares the baseline instead, the vector from the left camera's centre to
+the right's, which a common shift leaves unchanged: baseline_change_mm catches one camera
+moving relative to the other. A shift of both cameras together by the same vector cannot
+be told from an origin shift and is not visible here; the DCS calibration, redone after
+every 3D calibration, measures the origin. Camera rotations are relative to the motor
+axes, which are physical, so camera_rotation_change_deg compares each camera on its own.
 """
 
 import json
@@ -66,7 +72,7 @@ DEFAULT_THRESHOLDS: Thresholds = {
     "waypoints_unverified": (0.0, None),
     "cross_check_delta_px": (0.5, 1.5),
     "camera_rotation_change_deg": (0.5, None),
-    "camera_translation_change_mm": (1.0, None),
+    "baseline_change_mm": (1.0, None),
     "focal_change_rel": (0.02, None),
 }
 # The metrics where a smaller value is worse; see the module docstring.
@@ -448,7 +454,8 @@ def _stereo_checks(fit: MotorFrameFit, observations, board: BoardSpec, first: st
 
 
 def _change_metrics(fit: MotorFrameFit, previous: MotorFrameFit, add: Callable[..., Metric]) -> List[str]:
-    """Grade each camera's change since `previous`; return the report notes."""
+    """Grade the change since `previous`: each camera's rotation and focal length, and the
+    baseline between the first two cameras (see the module docstring). Return the report notes."""
     notes = []
     for cam, now in fit.cameras.items():
         before = previous.cameras.get(cam)
@@ -459,17 +466,26 @@ def _change_metrics(fit: MotorFrameFit, previous: MotorFrameFit, add: Callable[.
         R_before = cv2.Rodrigues(np.asarray(before.rvec, float))[0]
         # The norm of the rotation vector is the angle, without arccos's loss of precision near 0.
         angle = math.degrees(float(np.linalg.norm(cv2.Rodrigues(R_before.T @ R_now)[0])))
-        shift = float(np.linalg.norm(_centre(now) - _centre(before)))
         rotation = add("camera_rotation_change_deg", cam, angle, "deg")
-        translation = add("camera_translation_change_mm", cam, shift, "mm")
         focal = add("focal_change_rel", cam, abs(now.K[0, 0] / before.K[0, 0] - 1.0), "ratio")
-        moved = [m for m in (rotation, translation) if m.status != "pass"]
-        for m in moved:
-            m.note = MOVED_NOTE
-        if moved:
-            notes.append(f"{cam} {MOVED_NOTE}: turned {angle:.2f} deg, shifted {shift:.2f} mm")
+        if rotation.status != "pass":
+            rotation.note = MOVED_NOTE
+            notes.append(f"{cam} {MOVED_NOTE}: turned {angle:.2f} deg")
         if focal.status != "pass":
             focal.note = "focal length changed since the previous calibration"
+
+    pair = list(fit.cameras)[:2]
+    if len(pair) == 2 and all(cam in previous.cameras for cam in pair):
+        first, second = pair
+        baseline_now = _centre(fit.cameras[second]) - _centre(fit.cameras[first])
+        baseline_before = _centre(previous.cameras[second]) - _centre(previous.cameras[first])
+        change = float(np.linalg.norm(baseline_now - baseline_before))
+        baseline = add("baseline_change_mm", None, change, "mm")
+        if baseline.status != "pass":
+            baseline.note = f"a camera moved since the previous calibration: the {first}-{second} baseline changed"
+            notes.append(f"{baseline.note} by {change:.2f} mm")
+    else:
+        notes.append("the previous calibration lacks one of the pair, so the baseline change is not reported")
     return notes
 
 
