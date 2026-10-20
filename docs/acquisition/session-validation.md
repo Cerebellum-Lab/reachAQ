@@ -13,8 +13,8 @@ reachaq-validate-session /path/to/sessionNNN --rule events.tones
 Profiles:
 
 - `--quick`: publication identity, critical parsing, required enabled sources,
-  stored counts, and manifest values; automatically queued after successful
-  Stop and atomically written to `validation/quick.json`.
+  stored counts, manifest values, and the camera/NI frame anchor; automatically
+  queued after successful Stop and atomically written to `validation/quick.json`.
 - `--fast` (CLI default): schemas, merged frame ledger, summarized NI coverage,
   event/frame associations, board time, tone/laser/stim evidence, and trial/
   protocol lifecycle without decoding every frame or scanning every NI sample.
@@ -37,7 +37,7 @@ Current stable rule IDs:
 |---|---|
 | Publication | `session.layout`, `session.schema`, `session.generation`, `session.manifest`, `metadata.mirror` |
 | Sources/media | `sources.contract`, `camera.frames`, `camera.ledger` |
-| NI | `nidaq.continuity`, `nidaq.timing_graph` |
+| NI | `nidaq.continuity`, `nidaq.timing_graph`, `alignment.frames` |
 | Events | `events.alignment`, `events.frames`, `events.tones`, `events.laser`, `events.board_time`, `stim.evidence` |
 | Trials | `trials.lifecycle`, `trials.protocol` |
 
@@ -49,6 +49,11 @@ Sessions recorded before 2026-09-24 can also fail `events.alignment` and
 `events.frames` with `nonmonotonic performance timestamp`, because their
 `device.csv` rows were not written in time order. That is a fault in the
 recording, not in the validator.
+
+`alignment.frames` warns on every session that saved NI samples before the
+drift-corrected frame alignment (`alignment.json` schemaVersion below 3, written
+by builds older than the 2026-10-08 frame-alignment change), because its frame
+IDs can be one frame off. It never fails a session.
 
 The rule-to-checklist proof boundary is maintained in
 [session-validation-coverage.md](session-validation-coverage.md). In particular,
