@@ -475,6 +475,93 @@ def test_exact_counts_without_live_pose_still_report_drops(tmp_path):
     }
 
 
+def test_a_reset_is_not_lost_to_a_pose_report_in_flight():
+    """begin() and a pose report run on different threads.
+
+    The report reads the running sums, adds its window and writes them back.
+    A reset that landed between the read and the write was undone by the
+    write, and carried the preview's calls into the session it had just
+    started.
+    """
+    import threading
+
+    telemetry = SessionTelemetry()
+    telemetry.begin(100.0)
+    telemetry.record_inference(5000, mean_ms=4.0, max_ms=2700.0)
+    reading = threading.Event()
+    release = threading.Event()
+
+    class HeldMean(float):
+        # Evaluated after the report has read the running sum and before it
+        # writes it back: the window a racing reset fell into.
+        def __mul__(self, other):
+            reading.set()
+            release.wait(5)
+            return float(self) * other
+
+    report = threading.Thread(target=telemetry.record_inference,
+                              args=(5150, HeldMean(4.0), 5.0))
+    report.start()
+    assert reading.wait(5)
+    reset = threading.Thread(target=telemetry.begin, args=(200.0,))
+    reset.start()
+    reset.join(1.0)  # unserialized, the reset completes inside the window
+    release.set()
+    report.join(5)
+    reset.join(5)
+
+    # The reset came last, so the new session has had no calls yet.
+    assert math.isnan(telemetry.inference_mean_ms)
+    assert math.isnan(telemetry.inference_max_ms)
+
+
+def test_a_new_cameras_first_report_does_not_break_a_reading_in_progress():
+    """The panel reads on the GUI thread while frame counts arrive on another.
+
+    A camera's first report adds it to the per-camera totals. A reading that
+    was walking them at that moment raised "dictionary changed size during
+    iteration", once per camera at acquisition start.
+    """
+    import threading
+
+    telemetry = SessionTelemetry()
+    telemetry.begin(100.0)
+    telemetry.record_capture(0, acquired=150, dropped=0)
+    walking = threading.Event()
+    release = threading.Event()
+
+    class HeldTotals(dict):
+        def items(self):
+            entries = iter(dict.items(self))
+            yield next(entries)
+            walking.set()
+            release.wait(5)
+            yield from entries
+
+    telemetry._acquired_by_camera = HeldTotals(telemetry._acquired_by_camera)
+    errors = []
+
+    def read():
+        try:
+            telemetry.frames_acquired
+        except RuntimeError as error:
+            errors.append(error)
+
+    reader = threading.Thread(target=read)
+    reader.start()
+    assert walking.wait(5)
+    report = threading.Thread(target=telemetry.record_capture, args=(1,),
+                              kwargs=dict(acquired=150, dropped=0))
+    report.start()
+    report.join(1.0)  # unserialized, the new camera lands mid-reading
+    release.set()
+    reader.join(5)
+    report.join(5)
+
+    assert errors == []
+    assert telemetry.frames_acquired == 150
+
+
 def test_no_exact_counts_when_the_timeline_could_not_be_aligned():
     """A failed merge writes its diagnostics with no frames and no counts."""
     from tools.acquisition.model.session_telemetry import exact_session_capture
