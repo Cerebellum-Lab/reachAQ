@@ -49,11 +49,11 @@ Sessions recorded before 2026-09-24 can also fail `events.alignment` and
 `events.frames` with `nonmonotonic performance timestamp`, because their
 `device.csv` rows were not written in time order. That is a fault in the
 recording, not in the validator.
-`alignment.frames` warns on every NI session recorded before the
+
+`alignment.frames` warns on every session that saved NI samples before the
 drift-corrected frame alignment (`alignment.json` schemaVersion below 3, written
-by any build older than feature-dev `649f039a` of 2026-10-08), because its frame
-IDs can be one frame off.
-It never fails a session.
+by builds older than the 2026-10-08 frame-alignment change), because its frame
+IDs can be one frame off. It never fails a session.
 
 The rule-to-checklist proof boundary is maintained in
 [session-validation-coverage.md](session-validation-coverage.md). In particular,
