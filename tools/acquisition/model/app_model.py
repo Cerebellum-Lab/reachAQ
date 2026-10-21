@@ -98,10 +98,13 @@ from autotrainer.inference.backend_selection import (
 from autotrainer.inference.analysis import IntersessionResponse
 from autotrainer.inference.config import load_calib_stereo_params
 from autotrainer.inference.analysis.prepare_jetson_data import DEFAULT_CAM_OFFSET_FILE_NAME
+from autotrainer.inference.multires_calibration.geometry import PresetGeometry
 from autotrainer.inference.multires_calibration.store import (
     INDEX_FILE,
     CalibrationGeometryError,
     CalibrationIndex,
+    LoadedPreset,
+    calibration_created,
     is_multires_calibration,
     load_index,
     load_preset,
@@ -1047,6 +1050,10 @@ class AppModel(ObservableObject):
         self._inference: InferenceModel = None  # noqa. needed before reload_calib
         self._active_calibration_dir: Optional[Path] = None
         self._active_calibration_index: Optional[CalibrationIndex] = None
+        # For the session metadata: the preset live 3D loaded (format 2 only), and
+        # why live 3D is off when it is, as the operator was told.
+        self._active_calibration_preset: Optional[PresetGeometry] = None
+        self._live_3d_disabled_reason: Optional[str] = None
         # The camera configuration is not loaded yet, so a format-2 calibration's
         # preset is picked from SpinCam's default geometry here, and again from
         # the configured geometry at the end of every configuration load.
@@ -1055,7 +1062,10 @@ class AppModel(ObservableObject):
         if inference_model is None:
             inference_model = InferenceModel(
                 self._pose_algorithm,
+                # Offline analysis finds each session's own calibration under the root,
+                # unless this app was given a calibration folder explicitly.
                 calib_dir=calib_dir,
+                calib_root=Path(self._preferences.configuration_location),
                 mp_manager=self._mp_manager,
                 record_stop_sema=self._record_stop_sema,
             )
@@ -2290,6 +2300,8 @@ class AppModel(ObservableObject):
         logger.info("loading calib from %s", calib_src_dir)
         frame_transform = None
         calibration_index = None
+        live_preset = None
+        disabled_reason = None
         if (calib_src_dir.joinpath(INDEX_FILE).exists()
                 and not is_multires_calibration(calib_src_dir)):
             # A legacy folder has no index at all, so this one is a format-2
@@ -2300,14 +2312,21 @@ class AppModel(ObservableObject):
             square_size = None
             cam_names = None
             cam_offsets = None
-            self.on_error("3D calibration", f"{INDEX_FILE} unreadable: {calib_src_dir}")
+            disabled_reason = f"{INDEX_FILE} unreadable: {calib_src_dir}"
+            self.on_error("3D calibration", disabled_reason)
         elif calib_src_dir.exists() and is_multires_calibration(calib_src_dir):
             calibration_index = load_index(calib_src_dir)
             # The measured frame replaces the camera angles and the square size.
             calib_metadata = None
             square_size = None
             cam_offsets = _load_camera_offsets(calib_src_dir)
-            stereo_params, frame_transform, cam_names = self._load_live_preset(calib_src_dir)
+            live_preset, disabled_reason = self._load_live_preset(calib_src_dir)
+            if live_preset is None:
+                stereo_params = cam_names = None
+            else:
+                stereo_params, frame_transform = live_preset.stereo_params, live_preset.frame_transform
+                # The pair a format-2 calibration's stereo parameters are keyed by (STEREO_KEY).
+                cam_names = ["left", "right"]
         elif calib_src_dir.exists():
             stereo_params = load_calib_stereo_params(
                 calib_src_dir.joinpath('camera_matrix', 'stereo_params.pickle')
@@ -2324,9 +2343,12 @@ class AppModel(ObservableObject):
             square_size = None
             cam_names = None
             cam_offsets = None
+            disabled_reason = f"no 3D calibration at {calib_src_dir}"
             logger.warning("calib_src_dir=%r does not exist", calib_src_dir.as_posix())
         self._active_calibration_dir = calib_src_dir if calib_src_dir.exists() else None
         self._active_calibration_index = calibration_index
+        self._active_calibration_preset = None if live_preset is None else live_preset.geometry
+        self._live_3d_disabled_reason = disabled_reason
         self._install_pose_algorithm(
             stereo_params=stereo_params,
             calib_metadata=calib_metadata,
@@ -2352,8 +2374,10 @@ class AppModel(ObservableObject):
             logger.exception("live 3D is off: the 3D calibration in %s could not be loaded", folder)
             self._active_calibration_dir = folder if folder.exists() else None
             self._active_calibration_index = None
+            self._active_calibration_preset = None
+            self._live_3d_disabled_reason = f"could not load {folder}: {type(err).__name__}: {err}"
             self._install_pose_algorithm()
-            self.on_error("3D calibration", f"could not load {folder}: {type(err).__name__}: {err}")
+            self.on_error("3D calibration", self._live_3d_disabled_reason)
 
     def _install_pose_algorithm(
         self,
@@ -2404,8 +2428,8 @@ class AppModel(ObservableObject):
             inference.pose_algorithm = pose_algo
         self._pose_algorithm = pose_algo
 
-    def _load_live_preset(self, calib_dir: Path):
-        """(stereo_params, frame_transform, cam_names) of the preset the live frames are in.
+    def _load_live_preset(self, calib_dir: Path) -> Tuple[Optional[LoadedPreset], Optional[str]]:
+        """(the preset the live frames are in, None), or (None, why live 3D is off).
 
         Live frames reach inference pooled to the base capture, so the left camera's
         configured base geometry is their pixel space. Without a preset for it, live 3D
@@ -2415,12 +2439,10 @@ class AppModel(ObservableObject):
         left = self._left_camera
         params = left.active_config.params if left is not None else {}
         try:
-            preset = load_preset(calib_dir, live_inference_geometry(params))
+            return load_preset(calib_dir, live_inference_geometry(params)), None
         except (CalibrationGeometryError, ValueError) as err:
             self.on_error("3D calibration", str(err))
-            return None, None, None
-        # The pair a format-2 calibration's stereo parameters are keyed by (STEREO_KEY).
-        return preset.stereo_params, preset.frame_transform, ["left", "right"]
+            return None, str(err)
 
     @property
     def active_calibration_dir(self) -> Optional[Path]:
@@ -2431,6 +2453,39 @@ class AppModel(ObservableObject):
     def active_calibration_index(self) -> Optional[CalibrationIndex]:
         """The index of that folder; None for a legacy calibration or when there is none."""
         return self._active_calibration_index
+
+    def _calibration3d_metadata(self) -> Dict[str, Any]:
+        """hardware.configured.calibration3d: the 3D calibration live 3D used, or why it used none.
+
+        The id finds a format-2 calibration again offline wherever it then sits; a legacy
+        one has none and is found by the session's time. created is the index's, or for a
+        legacy folder its stereo pickle's time, as offline dates it. preset is the name of
+        the preset live 3D loaded, None for legacy. With live 3D off (no stereo parameters
+        loaded) the calibration is still named, preset is None, and live3dDisabledReason
+        says why, as the operator was told.
+        """
+        folder = self._active_calibration_dir
+        index = self._active_calibration_index
+        created = None
+        if index is not None:
+            created = index.created
+        elif folder is not None:
+            try:
+                created = calibration_created(folder)
+            except (OSError, ValueError) as err:
+                logger.warning("cannot date the 3D calibration in %s: %s", folder, err)
+        preset = self._active_calibration_preset
+        record = {
+            "id": None if index is None else index.id,
+            "created": None if created is None else created.isoformat(timespec="seconds"),
+            "preset": None if preset is None else preset.name,
+            "folder": None if folder is None else str(folder),
+            "override": None if index is None else index.override,
+        }
+        if self._pose_algorithm is None or self._pose_algorithm.stereo_params is None:
+            record["preset"] = None
+            record["live3dDisabledReason"] = self._live_3d_disabled_reason or "no stereo params"
+        return record
 
     def _identify_primary_main_cam_idx(self):
         ordered_cameras = self._ordered_reach_cameras(enabled_only=True) or self._ordered_reach_cameras()
@@ -11820,6 +11875,8 @@ class AppModel(ObservableObject):
                 camera.name: _camera_configured_metadata(camera)
                 for camera in self._cameras
             },
+            # Beside the cameras, not in them: the calibration is the stereo pair's.
+            "calibration3d": self._calibration3d_metadata(),
         }
         runtime_final = self._acquisition.subsystems.snapshot()
 

@@ -668,6 +668,41 @@ embedded under `configuration` so each recording is independently reproducible.
 values are normalized to JSON/YAML null; finalized metadata is never written
 with non-standard `NaN` tokens.
 
+`hardware.configured.calibration3d` names the 3D calibration that live 3D used.
+It sits beside `hardware.configured.cameras`, whose per-camera entries are
+unchanged, and is written in both the session and the acquisition metadata:
+
+- `id`: the calibration's id (`calibration.yaml`), or null for a legacy
+  calibration. Offline reprocessing finds the calibration by this id, in the
+  active folder or a timestamped backup.
+- `created`: when the calibration was made, local ISO time to the second. A
+  legacy folder records no date, so its `camera_matrix/stereo_params.pickle`
+  modification time stands in.
+- `preset`: the preset live 3D loaded, such as `256x256_bin4`; null for a legacy
+  calibration and whenever live 3D was off.
+- `folder`: the calibration folder when the session ran. Installing a newer
+  calibration renames it, so readers use `id`, not `folder`.
+- `override`: the operator's recorded override of a failed quality report, or
+  null.
+- `live3dDisabledReason`: present only when live 3D was off (no stereo
+  parameters loaded). It holds the message the operator was shown, for example
+  a camera geometry that matches no preset. The calibration is still named.
+
+Offline 3D (`python -m autotrainer.inference.analysis`, and the app's own
+intersession analysis) uses `--calib-dir` as given. Without it, it resolves the
+session's calibration under `--calib-root` (default the settings directory, `~/Autotrainer` unless
+`REACHAQ_CONFIG_DIR` moves it; the app's
+configuration location in the app): by `calibration3d.id` when the session has
+one, otherwise as the calibration active at the session's start. The start is
+the record start the app sets, else the metadata's `boundary.startWallTime`,
+the schema-1 `sessionBoundary.startWallTime` or `start_record_timestamp`, or
+`createdUtc`, else the session date. When only the date is known, the
+calibration must not have changed that day. A missing id, an ambiguous match,
+or no match refuses with "pass --calib-dir". A session older than every kept
+calibration uses the oldest one, with a warning. A format-2 calibration is read
+at the session's `preset`, or at its base preset (largest binning) when the
+session names none.
+
 The [local API](local-api.md) publishes explicit session and pellet-attempt
 events. ReachAQ's status schema contains no alarm, emergency,
 tunnel, head-fix, or magnet placeholders. Session events identify the continuous

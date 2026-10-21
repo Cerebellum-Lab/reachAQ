@@ -14,7 +14,7 @@ import math
 import pandas
 import yaml
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple, Literal
+from typing import TYPE_CHECKING, Dict, Any, List, Optional, Tuple, Literal
 
 import cv2
 import numpy as np
@@ -25,6 +25,10 @@ from autotrainer.core import ProjectInfo
 from autotrainer.core.logging import get_verbose_logger
 from autotrainer.inference.config import load_calib_stereo_params
 from autotrainer.inference import calibration_FLIR as cal_flir
+
+if TYPE_CHECKING:
+    # For annotations only: the live pose process imports this module and has no use for the store.
+    from autotrainer.inference.multires_calibration.store import LoadedPreset
 
 logger = get_verbose_logger(__name__)
 
@@ -537,16 +541,7 @@ def reorient_and_center(
     square_size, _, _, _ = cal_flir.get_calibration_info(src_dir)
     cam_names = cal_flir.get_video_list(src_dir)
 
-    path_offsets = os.path.join(src_dir, DEFAULT_CAM_OFFSET_FILE_NAME)
-    if os.path.isfile(path_offsets):
-        with open(path_offsets, "rb") as handle:
-            cam_offsets = pickle.load(handle)
-        save_offsets = False
-        logger.info("Reusing offsets file %s: %s", path_offsets, cam_offsets)
-    else:
-        cam_offsets = None
-        save_offsets = True
-        logger.warning("No camera offset file available, generated one will be saved.")
+    cam_offsets, save_offsets = _load_saved_offsets(src_dir)
 
     res_df_3d = reorient_and_center_step1(
         df_3d=df_3d,
@@ -562,6 +557,72 @@ def reorient_and_center(
         save_offsets=save_offsets,
     )
     res_df_3d.to_hdf(centered_path_3d, "df_with_missing", format="table", mode="w")
+    return res_df_3d
+
+
+def _load_saved_offsets(src_dir: str) -> Tuple[Optional[dict], bool]:
+    """(the camera offsets saved in src_dir or None, whether to save the generated ones there)."""
+    path_offsets = os.path.join(src_dir, DEFAULT_CAM_OFFSET_FILE_NAME)
+    if os.path.isfile(path_offsets):
+        with open(path_offsets, "rb") as handle:
+            cam_offsets = pickle.load(handle)
+        save_offsets = False
+        logger.info("Reusing offsets file %s: %s", path_offsets, cam_offsets)
+    else:
+        cam_offsets = None
+        save_offsets = True
+        logger.warning("No camera offset file available, generated one will be saved.")
+    return cam_offsets, save_offsets
+
+
+def triangulate_3d_measured(df_LR, preset: "LoadedPreset", bpts, min_cluster, p_thresh) -> pd.DataFrame:
+    """triangulate_3D for a format-2 calibration, with the stereo parameters of the session's preset.
+
+    The same undistortion and triangulation as triangulate_3D, from parameters already loaded
+    rather than from <calib_src_dir>/camera_matrix, which a format-2 calibration folder does
+    not have: each preset keeps its own under presets/<name>/.
+    """
+    stereo_file = preset.stereo_params.as_pickle_dict()
+    camera1_undistort, camera2_undistort = undistort_views([(df_LR[0], df_LR[1])], stereo_file)[0]
+    return triangulate_3d_step1(
+        df_LR,
+        camera1_undistort, camera2_undistort,
+        stereomatrix=preset.stereo_params.matrix, bpts=bpts, min_cluster=min_cluster, p_thresh=p_thresh,
+    )
+
+
+def reorient_and_center_measured(
+    filtered_df_3d: pandas.DataFrame,
+    centered_path_3d: str,
+    src_dir: str,
+    preset: "LoadedPreset",
+    bpts,
+    center_method,
+    frame_rate: int,
+):
+    """reorient_and_center for a format-2 calibration: the preset's measured frame replaces the angles.
+
+    A format-2 folder has no calibration_userset.yaml and no board in its name, so neither is
+    read: the frame is already in mm. The camera offsets are read from and saved to src_dir,
+    the calibration folder, exactly as for a legacy one, which is also where live 3D reads them.
+    """
+    cam_offsets, save_offsets = _load_saved_offsets(src_dir)
+    res_df_3d = reorient_and_center_step1(
+        df_3d=filtered_df_3d,
+        src_dir=src_dir,
+        bpts=bpts,
+        center_method=center_method,
+        frame_rate=frame_rate,
+        calib_metadata=None,
+        stereo_file=preset.stereo_params.as_pickle_dict(),
+        square_size=None,
+        # The pair the preset's stereo parameters are keyed by, "left-right".
+        cam_names=preset.stereo_params.key_name.split("-"),
+        cam_offsets=cam_offsets,
+        save_offsets=save_offsets,
+        frame_transform=preset.frame_transform,
+    )
+    res_df_3d.to_hdf(centered_path_3d, key="df_with_missing", format="table", mode="w")
     return res_df_3d
 
 
@@ -862,7 +923,13 @@ def process_raw_data(
     center_method,
     *,
     frame_rate: int,
+    preset: Optional["LoadedPreset"] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:  # df_LR, df_3D
+    """The 2D tracking of the session's videos, and its 3D in the calibration's frame.
+
+    `preset` is the session's preset of a format-2 calibration in calib_src_dir; None for a
+    legacy calibration, which is read from calib_src_dir as it always was.
+    """
     p_thresh = 0.9  # confidence threshold for DLC raw output
     min_cluster = 10  # maximum allowed interpolation
 
@@ -893,9 +960,14 @@ def process_raw_data(
         raise RuntimeError(f"No tracking obtained for {session}")
     #
     raw_path_3D = os.path.join(vid_dir, vid_name_base + '_filtered3D.h5')
+    centered_path_3d = os.path.join(vid_dir, vid_name_base + '_centered3D.h5')
+    if preset is not None:
+        filtered_df_3d = triangulate_3d_measured(df_LR, preset, bodyparts, min_cluster, p_thresh)
+        centered_df_3d = reorient_and_center_measured(
+            filtered_df_3d, centered_path_3d, calib_src_dir, preset, bodyparts, center_method, frame_rate)
+        return df_LR, centered_df_3d
     filtered_df_3d = triangulate_3D(df_LR, raw_path_3D, calib_src_dir, bodyparts, min_cluster, p_thresh)
     #
-    centered_path_3d = os.path.join(vid_dir, vid_name_base + '_centered3D.h5')
     centered_df_3d = reorient_and_center(
         filtered_df_3d, centered_path_3d, calib_src_dir, bodyparts, center_method, frame_rate)
     #

@@ -70,6 +70,7 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
         pose_algorithm: PoseAlgorithm,
         *,
         calib_dir: Optional[Path] = None,
+        calib_root: Optional[Path] = None,
         record_stop_sema: Optional[SemaphoreType] = None,
         mp_manager=None,
     ):
@@ -97,7 +98,10 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
         self._overlay_parts: tuple = ()
         self._pose_algorithm = pose_algorithm
         self._pose_parts: List[str] = []
+        # Offline analysis uses calib_dir as given. Without one it finds each session's own
+        # calibration under calib_root (~/Autotrainer when None), the one its live 3D used.
         self._calib_dir = calib_dir
+        self._calib_root = calib_root
 
         self._msg_thread: Optional[threading.Thread] = None
         # Ends the message loop. The None sentinel alone was not enough: a
@@ -823,6 +827,7 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
                 args=(project,),
                 kwds=dict(
                     calib_dir=self._calib_dir,
+                    calib_root=self._calib_root,
                     frame_rate=det_cfg.frame_rate,
                 ),
             )
