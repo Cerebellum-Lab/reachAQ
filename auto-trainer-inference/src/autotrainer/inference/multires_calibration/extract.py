@@ -7,10 +7,15 @@ no-op move leaves the board still, so it adds no segment). If a camera's segment
 differs from the number of distinct waypoints, frames cannot be matched to positions
 safely, and WaypointAlignmentError is raised instead of guessing.
 
+The cameras are hardware-synchronised, so the same dwell must start at the same frame in
+every camera; segments that drift apart also raise WaypointAlignmentError.
+
 In every segment the board is detected in a few frames at its middle, and the per-corner
 median of those detections is the waypoint's observation. The 6x8 board looks the same
-turned 180 degrees, so the detector may start from either end; normalize_corner_order puts
-every detection in one order, which fit_motor_frame needs across waypoints and cameras.
+turned 180 degrees, so the detector may start from either end. Each camera's detections
+are put in the order of its first detection (normalize_corner_order with a reference), so
+the order is consistent across that camera's waypoints. Two cameras can still label the
+board from opposite ends; fit.reconcile_corner_order settles that before the fit.
 """
 
 from dataclasses import dataclass
@@ -22,6 +27,7 @@ import numpy as np
 
 from autotrainer.core.logging import get_verbose_logger
 from autotrainer.inference.calibration_FLIR import (
+    adjust_gamma,
     average_chessboard_distance,
     imadjust_like_matlab,
     refine_corners,
@@ -32,6 +38,9 @@ from autotrainer.inference.multires_calibration.fit import BoardSpec, WaypointOb
 logger = get_verbose_logger(__name__)
 
 _REFINEMENTS = ("subpix", "legacy")
+# find_stationary_segments' defaults, which extract_observations also uses.
+_MIN_FRAMES = 8
+_SCALE = 8
 _SUBPIX_WINDOW = (5, 5)
 _SUBPIX_CRITERIA = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 1e-3)
 # The board cannot move while the stage is paused, so detections in one segment that
@@ -47,6 +56,12 @@ _MAX_CORNER_STD_PX = 1.0
 _NOISE_FLOOR = 0.05
 # A video whose 95th-percentile motion is within this factor of its noise level never moved.
 _STATIC_RATIO = 2.0
+# The cameras are hardware-synchronised, so a dwell starts at the same frame in each; this
+# allows for the threshold catching the slow end of a move a frame or two apart.
+_MAX_START_OFFSET_FRAMES = 3
+# The gamma today's calibration passes to create_corner_matrix (handle_3d_calibration.py).
+# refine_corners' fixed Canny thresholds were tuned on the image after that step.
+_LEGACY_GAMMA = 2.0
 
 _NOT_FOUND = "not found"
 _INCONSISTENT = "inconsistent"
@@ -64,6 +79,9 @@ class ExtractionResult:
     rejected: List[Tuple[int, str, str]]  # (waypoint index, camera, "not found" or "inconsistent")
     # camera -> median over its kept waypoints of the median per-corner std, in sensor px
     corner_scatter_px: Dict[str, float]
+    # camera -> p20, p95 and tau of the motion m_t, moving_fraction (the fraction of frames
+    # in no segment) and n_frames, so a real capture's segmentation can be checked
+    segmentation_stats: Dict[str, Dict[str, float]]
 
 
 def distinct_waypoints(motor_positions: Sequence[np.ndarray], tol: float = 1e-6) -> List[int]:
@@ -82,7 +100,9 @@ def distinct_waypoints(motor_positions: Sequence[np.ndarray], tol: float = 1e-6)
     return kept
 
 
-def find_stationary_segments(video: Path, *, min_frames: int = 8, scale: int = 8) -> List[Tuple[int, int]]:
+def find_stationary_segments(
+    video: Path, *, min_frames: int = _MIN_FRAMES, scale: int = _SCALE
+) -> List[Tuple[int, int]]:
     """Half-open frame ranges, in order, over which the scene in `video` holds still.
 
     Every frame is downscaled by `scale` (INTER_AREA) to float grey, and its motion is
@@ -90,6 +110,11 @@ def find_stationary_segments(video: Path, *, min_frames: int = 8, scale: int = 8
     stationary, with p20 floored at _NOISE_FLOOR, and a segment is a maximal stationary
     run of at least `min_frames`. A video that never moved is one segment.
     """
+    return _segment_video(video, min_frames=min_frames, scale=scale)[0]
+
+
+def _segment_video(video: Path, *, min_frames: int, scale: int) -> Tuple[List[Tuple[int, int]], Dict[str, float]]:
+    """find_stationary_segments' segments, and the statistics ExtractionResult.segmentation_stats records."""
     motion, previous = [], None
     for gray in _grey_frames(video):
         h, w = gray.shape
@@ -98,9 +123,27 @@ def find_stationary_segments(video: Path, *, min_frames: int = 8, scale: int = 8
         if previous is not None:
             motion.append(float(np.mean(np.abs(small - previous))))
         previous = small
-    if previous is None:
-        return []
-    return _segments_from_motion(np.asarray(motion), min_frames=min_frames)
+    n = len(motion) + 1 if previous is not None else 0
+    segments = _segments_from_motion(np.asarray(motion), min_frames=min_frames) if n else []
+    p20, p95, tau, _ = _motion_levels(np.asarray(motion)) if len(motion) else (np.nan,) * 4
+    still = sum(stop - start for start, stop in segments)
+    stats = {
+        "p20": p20,
+        "p95": p95,
+        "tau": tau,
+        "moving_fraction": 1.0 - still / n if n else float("nan"),
+        "n_frames": float(n),
+    }
+    return segments, stats
+
+
+def _motion_levels(motion: np.ndarray) -> Tuple[float, float, float, bool]:
+    """(p20, p95, tau, static) of m_t: tau = sqrt(max(p20, _NOISE_FLOOR) * p95)."""
+    p20, p95 = np.percentile(motion, [20, 95])
+    noise = max(float(p20), _NOISE_FLOOR)
+    # Nothing moved when the motion is all noise; the geometric mean would then split the
+    # video at random.
+    return float(p20), float(p95), float(np.sqrt(noise * p95)), bool(p95 <= _STATIC_RATIO * noise)
 
 
 def _segments_from_motion(motion: np.ndarray, *, min_frames: int) -> List[Tuple[int, int]]:
@@ -108,13 +151,9 @@ def _segments_from_motion(motion: np.ndarray, *, min_frames: int) -> List[Tuple[
     n = len(motion) + 1
     if n == 1:
         return [(0, 1)] if min_frames <= 1 else []
-    p20, p95 = np.percentile(motion, [20, 95])
-    noise = max(float(p20), _NOISE_FLOOR)
-    # Nothing moved: the motion is all noise, and the geometric mean would split the
-    # video at random. It is one segment.
-    if p95 <= _STATIC_RATIO * noise:
+    _, _, tau, static = _motion_levels(motion)
+    if static:
         return [(0, n)] if n >= min_frames else []
-    tau = np.sqrt(noise * p95)
     still = np.empty(n, bool)
     still[1:] = motion < tau
     # m_0 is undefined; frame 0 is stationary when frame 1 is.
@@ -133,18 +172,32 @@ def _segments_from_motion(motion: np.ndarray, *, min_frames: int) -> List[Tuple[
     return segments
 
 
-def normalize_corner_order(corners: np.ndarray, board: BoardSpec) -> np.ndarray:
-    """The corners as (rows*cols, 2) float64, starting from the end of the board nearer the image origin.
+def normalize_corner_order(
+    corners: np.ndarray, board: BoardSpec, reference: Optional[np.ndarray] = None
+) -> np.ndarray:
+    """The corners as (rows*cols, 2) float64, in one of the board's two 180-degree orders.
 
-    The board only translates during a capture, so the first and last corners never swap
-    sides; comparing x + y of the two ends resolves the 180-degree ambiguity the same way
-    at every waypoint.
+    Without a reference, the order starts from the end of the board nearer the image
+    origin (smaller x + y). That is ambiguous when the diagonal from the first corner to
+    the last points near the image's (1, -1) direction: there, perspective alone can tip
+    x + y either way from one waypoint to the next. With `reference`, an already-normalised
+    (rows*cols, 2) detection from the same camera, the corners are reversed when their
+    first-to-last diagonal points against the reference's. The board only translates, so
+    the diagonal keeps its direction across the capture and the order stays consistent.
     """
+    n = board.rows * board.cols
     points = np.asarray(corners, dtype=np.float64).reshape(-1, 2)
-    if len(points) != board.rows * board.cols:
-        raise ValueError(f"expected {board.rows * board.cols} corners, got {len(points)}")
+    if len(points) != n:
+        raise ValueError(f"expected {n} corners, got {len(points)}")
     grid = points.reshape(board.rows, board.cols, 2)
-    if grid[0, 0].sum() > grid[-1, -1].sum():
+    if reference is None:
+        flip = grid[0, 0].sum() > grid[-1, -1].sum()
+    else:
+        ref = np.asarray(reference, dtype=np.float64)
+        if ref.shape != (n, 2):
+            raise ValueError(f"expected a ({n}, 2) reference, got shape {ref.shape}")
+        flip = float(np.dot(grid[-1, -1] - grid[0, 0], ref[-1] - ref[0])) < 0.0
+    if flip:
         points = points[::-1]
     return points.copy()
 
@@ -152,8 +205,10 @@ def normalize_corner_order(corners: np.ndarray, board: BoardSpec) -> np.ndarray:
 def detect_board(gray: np.ndarray, board: BoardSpec, *, refine: str = "subpix") -> Optional[np.ndarray]:
     """The board's inner corners in `gray` as (rows*cols, 2) float64 px in normal order, or None.
 
-    The detector runs on a contrast-stretched copy, as the legacy calibration does; the
-    corners are then refined on the original grey, whose values the stretch has not bent.
+    The detector runs on a contrast-stretched copy, as the legacy calibration does.
+    "subpix" refines on the original grey, whose values the stretch has not bent.
+    "legacy" refines on the image today's calibration refines on: the stretched copy after
+    adjust_gamma(gamma=2), for which refine_corners' fixed Canny thresholds were tuned.
     """
     _check_refine(refine)
     if gray.ndim == 3:
@@ -167,9 +222,12 @@ def detect_board(gray: np.ndarray, board: BoardSpec, *, refine: str = "subpix") 
     if refine == "subpix":
         corners = cv2.cornerSubPix(gray, corners, _SUBPIX_WINDOW, (-1, -1), _SUBPIX_CRITERIA)
         return normalize_corner_order(corners, board)
+    legacy_image = adjust_gamma(stretched, gamma=_LEGACY_GAMMA)
     window = int(round(1.5 * average_chessboard_distance(corners, (board.cols, board.rows))))
     try:
-        refined = [np.asarray(refine_corners(gray, c, window), float).ravel() for c in corners.reshape(-1, 2)]
+        refined = [
+            np.asarray(refine_corners(legacy_image, c, window), float).ravel() for c in corners.reshape(-1, 2)
+        ]
     except (cv2.error, np.linalg.LinAlgError) as err:
         # The legacy line fit fails when a corner's window holds too few edge points or two
         # parallel lines. A board with an unrefinable corner is treated as not found.
@@ -190,10 +248,12 @@ def extract_observations(
 
     The board is detected in the `frames_per_waypoint` frames at the middle of each
     segment, and a camera's corners for the waypoint are the per-corner median over the
-    frames in which it was found. Raises WaypointAlignmentError, naming the camera, when a
-    camera's stationary segments do not number exactly the distinct waypoints. A board
-    found in none of the frames, or whose detections disagree by more than 1 px within the
-    segment, only drops that camera from that waypoint and is listed in `rejected`.
+    frames in which it was found, all in the order of the camera's first detection.
+    Raises WaypointAlignmentError, naming the camera, when a camera's stationary segments
+    do not number exactly the distinct waypoints, and naming both cameras when a segment
+    starts more than 3 frames apart in two of them. A board found in none of the frames,
+    or whose detections disagree by more than 1 px within the segment, only drops that
+    camera from that waypoint and is listed in `rejected`.
     """
     _check_refine(refine)
     if frames_per_waypoint < 1:
@@ -201,12 +261,14 @@ def extract_observations(
     distinct = distinct_waypoints(motor_positions)
 
     segments: Dict[str, List[Tuple[int, int]]] = {}
+    stats: Dict[str, Dict[str, float]] = {}
     for cam, video in videos.items():
-        segments[cam] = find_stationary_segments(Path(video))
+        segments[cam], stats[cam] = _segment_video(Path(video), min_frames=_MIN_FRAMES, scale=_SCALE)
         if len(segments[cam]) != len(distinct):
             raise WaypointAlignmentError(
                 f"{cam}: expected {len(distinct)} stationary segments, found {len(segments[cam])}"
             )
+    _check_segments_agree(segments)
 
     corners: List[Dict[str, np.ndarray]] = [{} for _ in distinct]
     rejected: List[Tuple[int, str, str]] = []
@@ -215,11 +277,15 @@ def extract_observations(
         windows = [_middle_frames(segment, frames_per_waypoint) for segment in segments[cam]]
         detections = _detect_in_windows(Path(video), windows, board, refine)
         kept_scatter = []
+        reference = None
         for i, (index, found) in enumerate(zip(distinct, detections)):
             if not found:
                 rejected.append((index, cam, _NOT_FOUND))
                 continue
-            stack = np.stack(found)  # (frames, corners, 2)
+            if reference is None:
+                reference = found[0]
+            # (frames, corners, 2), every frame in the order of the camera's first detection
+            stack = np.stack([normalize_corner_order(c, board, reference=reference) for c in found])
             # Per corner, the RMS distance of its detections from their mean.
             spread = np.sqrt(((stack - stack.mean(axis=0)) ** 2).sum(axis=2).mean(axis=0))
             if spread.max() > _MAX_CORNER_STD_PX:
@@ -235,7 +301,26 @@ def extract_observations(
     ]
     for index, cam, reason in rejected:
         logger.info("waypoint %d: %s camera rejected (%s)", index, cam, reason)
-    return ExtractionResult(observations=observations, segments=segments, rejected=rejected, corner_scatter_px=scatter)
+    return ExtractionResult(
+        observations=observations,
+        segments=segments,
+        rejected=rejected,
+        corner_scatter_px=scatter,
+        segmentation_stats=stats,
+    )
+
+
+def _check_segments_agree(segments: Mapping[str, List[Tuple[int, int]]]) -> None:
+    """Raise WaypointAlignmentError when a segment starts more than _MAX_START_OFFSET_FRAMES
+    apart in two cameras. The counts already match."""
+    cams = list(segments)
+    for cam in cams[1:]:
+        for i, ((first, _), (other, _)) in enumerate(zip(segments[cams[0]], segments[cam])):
+            if abs(first - other) > _MAX_START_OFFSET_FRAMES:
+                raise WaypointAlignmentError(
+                    f"segment {i}: {cams[0]} starts at frame {first} and {cam} at frame {other};"
+                    f" synchronised cameras must agree within {_MAX_START_OFFSET_FRAMES} frames"
+                )
 
 
 def _check_refine(refine: str) -> None:

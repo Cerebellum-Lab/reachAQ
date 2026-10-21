@@ -201,6 +201,48 @@ def fit_motor_frame(
     )
 
 
+def reconcile_corner_order(
+    observations: Sequence[WaypointObservation],
+    board: BoardSpec,
+    image_size: Tuple[int, int],
+    camera_names: Sequence[str] = ("left", "right"),
+) -> Tuple[List[WaypointObservation], Dict[str, bool]]:
+    """Put every camera's corners in the board order of the camera with the most views.
+
+    The 6x8 board looks the same turned 180 degrees about its normal, so two cameras can
+    each be consistent across their own waypoints yet label the board from opposite ends.
+    A camera labelling it from the other end sees, in its planar calibration, the board
+    turned 180 degrees about the board normal, so the board's rotation in the motor frame
+    from that camera (the initialisation fit_motor_frame starts from) is 180 degrees from
+    the reference camera's. Every corner array of a camera more than 90 degrees away is
+    reversed.
+
+    Returns new observations (the inputs are not changed) and, per camera, whether its
+    corners were reversed. Raises ValueError as fit_motor_frame does for a camera whose
+    waypoints cannot place it.
+    """
+    obj = board.object_points()
+    data = {cam: _camera_data(observations, cam, len(obj)) for cam in camera_names}
+    board_rotation = {cam: _initial_camera(data[cam], obj, image_size)[2] for cam in camera_names}
+    reference = max(camera_names, key=lambda cam: len(data[cam].indices))
+    # The angle between two rotations exceeds 90 degrees when trace(R_a^T R_b) < 1.
+    flipped = {
+        cam: bool(np.trace(board_rotation[reference].T @ board_rotation[cam]) < 1.0) for cam in camera_names
+    }
+    reconciled = [
+        WaypointObservation(
+            index=o.index,
+            motor_mm=np.array(o.motor_mm, dtype=float),
+            corners={
+                cam: np.array(np.asarray(c)[::-1] if flipped.get(cam, False) else c, dtype=float)
+                for cam, c in o.corners.items()
+            },
+        )
+        for o in observations
+    ]
+    return reconciled, flipped
+
+
 def _camera_data(observations: Sequence[WaypointObservation], cam: str, n_corners: int) -> _CameraData:
     seen = [o for o in observations if cam in o.corners]
     for o in seen:

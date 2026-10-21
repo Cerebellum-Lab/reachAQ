@@ -21,6 +21,7 @@ import cv2
 import numpy as np
 import pytest
 
+from autotrainer.inference.calibration_FLIR import adjust_gamma
 from autotrainer.inference.multires_calibration import extract as extract_module
 from autotrainer.inference.multires_calibration.extract import (
     WaypointAlignmentError,
@@ -48,6 +49,9 @@ BLANKED = 7  # the waypoint whose dwell the not-found right video blanks out
 JITTERED = 9  # the waypoint whose right detections the inconsistency test perturbs
 OUTLIER = 10  # the waypoint whose right detections the median test perturbs
 BLANK_GREY = 100
+# Extra still frames at the start of the right_shifted video's first dwell, which puts
+# every later dwell this many frames behind the left video's.
+SHIFT = 10
 # Grey-level sigma of the sensor-like noise in the "left_noisy" video. A real camera's
 # frames are never exactly equal, so the clean videos alone would test segmentation only
 # in the regime where p20 of the motion is 0.
@@ -58,7 +62,7 @@ SENSOR_NOISE = 2.0
 class Capture:
     board: BoardSpec
     positions: List[np.ndarray]
-    # "left", "right", "left_noisy", "right_missing_dwell", "right_blank"
+    # "left", "right", "left_noisy", "right_missing_dwell", "right_blank", "right_shifted"
     videos: Dict[str, Path]
     frame_count: int  # of the left, right and left_noisy videos
     still: Dict[int, Tuple[int, int]]  # waypoint -> [first, last + 1) still frame in those videos
@@ -72,7 +76,10 @@ def capture(tmp_path_factory) -> Capture:
     positions = [o.motor_mm.copy() for o in rig.observations[:11]]
     positions.insert(DUPLICATE, positions[DUPLICATE - 1].copy())
     folder = tmp_path_factory.mktemp("multires_extract")
-    names = {"left": ["left", "left_noisy"], "right": ["right", "right_missing_dwell", "right_blank"]}
+    names = {
+        "left": ["left", "left_noisy"],
+        "right": ["right", "right_missing_dwell", "right_blank", "right_shifted"],
+    }
     videos = {name: folder / f"{name}.mp4" for cam in names for name in names[cam]}
     blank = np.full((IMAGE_SIZE[1], IMAGE_SIZE[0]), BLANK_GREY, np.uint8)
     # A few fixed noise fields, cycled, keep the noisy video cheap to write.
@@ -106,6 +113,9 @@ def capture(tmp_path_factory) -> Capture:
             image = render_board_frame(model, X, IMAGE_SIZE, board)
             truth[(k, cam)] = cv2.projectPoints(X, model.rvec, model.tvec, model.K, np.zeros(5))[0].reshape(-1, 2)
             still[k] = (frame, frame + STILL_FRAMES)
+            if "right_shifted" in writers and k == 0:
+                for _ in range(SHIFT):
+                    writers["right_shifted"].write(image)
             for _ in range(STILL_FRAMES):
                 for name, w in writers.items():
                     if name == "right_missing_dwell" and k == DROPPED:
@@ -197,6 +207,48 @@ def test_reversed_corners_are_normalized(capture):
     out = normalize_corner_order(as_cv2, board)
     assert out.shape == (48, 2) and out.dtype == np.float64
     np.testing.assert_allclose(out, capture.truth[(0, "left")], atol=1e-4)
+    # A reference decides instead of x + y, in whichever order the reference is.
+    c, later = capture.truth[(0, "left")], capture.truth[(3, "left")]
+    for reference in (c, c[::-1]):
+        for detected in (later, later[::-1]):
+            out = normalize_corner_order(detected, board, reference=reference)
+            assert np.dot(out[-1] - out[0], reference[-1] - reference[0]) > 0
+    with pytest.raises(ValueError, match="reference"):
+        normalize_corner_order(c, board, reference=c[:10])
+
+
+def board_near_the_anti_diagonal(board: BoardSpec, w: int) -> np.ndarray:
+    """(48, 2) corners of waypoint w, in object_points order, for a camera that sees the board
+    turned so the diagonal from corner 0 to the last corner points within 1 degree of the
+    image's (1, -1) direction, on alternate sides of it from one waypoint to the next."""
+    obj = board.object_points()[:, :2] * 15.0  # 15 px squares
+    turn = np.radians(-45.0 + (1.0 if w % 2 else -1.0)) - np.arctan2(obj[-1, 1], obj[-1, 0])
+    R = np.array([[np.cos(turn), -np.sin(turn)], [np.sin(turn), np.cos(turn)]])
+    return obj @ R.T + np.array([700.0 + 3 * w, 500.0 + 2 * w])
+
+
+def test_order_stays_consistent_when_the_board_diagonal_is_near_the_anti_diagonal(capture, monkeypatch):
+    board = capture.board
+    truth = [board_near_the_anti_diagonal(board, w) for w in range(len(DISTINCT))]
+    # Precondition: x + y alone gives this camera both orders across its waypoints.
+    by_x_plus_y = [np.allclose(normalize_corner_order(t, board), t) for t in truth]
+    assert any(by_x_plus_y) and not all(by_x_plus_y)
+
+    calls = {"count": 0}
+
+    def detector(gray, board, *, refine="subpix"):
+        # Five frames per segment, in segment order: frame n belongs to segment n // 5.
+        w = calls["count"] // 5
+        calls["count"] += 1
+        return normalize_corner_order(truth[w], board)
+
+    monkeypatch.setattr(extract_module, "detect_board", detector)
+    result = extract_observations({"left": capture.videos["left"]}, capture.positions, board)
+    assert calls["count"] == 5 * len(DISTINCT) and result.rejected == []
+    # The first waypoint's x + y order is kept for every waypoint.
+    first_reversed = not by_x_plus_y[0]
+    for o, t in zip(result.observations, truth):
+        np.testing.assert_allclose(o.corners["left"], t[::-1] if first_reversed else t)
 
 
 def read_grey_frame(path: Path, index: int) -> np.ndarray:
@@ -233,10 +285,15 @@ def test_detect_board_normalises_whichever_end_the_detector_starts_from(capture,
 @pytest.mark.parametrize(
     "refine, owner, refiner", [("subpix", cv2, "cornerSubPix"), ("legacy", extract_module, "refine_corners")]
 )
-def test_corners_are_refined_on_the_original_grey(capture, monkeypatch, refine, owner, refiner):
-    # The stretched copy is only for finding the board. Its gamma curve reshapes the grey
-    # levels across every edge the refinement fits, so the refinement sees the frame as recorded.
+def test_corners_are_refined_on_the_image_each_refinement_expects(capture, monkeypatch, refine, owner, refiner):
+    # subpix refines on the frame as recorded: the stretch's gamma curve reshapes the grey
+    # levels across every edge it fits. legacy refines on today's preprocessed image, the
+    # stretched copy after adjust_gamma(2), which its fixed Canny thresholds were tuned on.
     gray = read_grey_frame(capture.videos["left"], capture.still[0][0] + 7)
+    if refine == "subpix":
+        expected = gray
+    else:
+        expected = adjust_gamma(extract_module._detection_image(gray), gamma=2)
     real = getattr(owner, refiner)
     images = []
 
@@ -246,7 +303,36 @@ def test_corners_are_refined_on_the_original_grey(capture, monkeypatch, refine, 
 
     monkeypatch.setattr(owner, refiner, spy)
     assert detect_board(gray, capture.board, refine=refine) is not None
-    assert images and all(np.array_equal(image, gray) for image in images)
+    assert images and all(np.array_equal(image, expected) for image in images)
+
+
+def test_segmentation_stats_are_recorded(capture, extraction):
+    for cam in ("left", "right"):
+        stats = extraction.segmentation_stats[cam]
+        assert set(stats) == {"p20", "p95", "tau", "moving_fraction", "n_frames"}
+        assert stats["n_frames"] == capture.frame_count
+        still = sum(stop - start for start, stop in extraction.segments[cam])
+        assert stats["moving_fraction"] == pytest.approx(1.0 - still / capture.frame_count)
+        assert 0.0 < stats["moving_fraction"] < 1.0
+        assert 0.0 <= stats["p20"] < stats["tau"] < stats["p95"]
+        # p20 of a clean video is 0, so tau is set by the noise floor.
+        assert stats["tau"] == pytest.approx(np.sqrt(max(stats["p20"], extract_module._NOISE_FLOOR) * stats["p95"]))
+
+
+def test_cameras_out_of_step_raise_alignment_error(capture):
+    # The cameras are hardware-synchronised, so the same dwell starts at the same frame in
+    # both; ten extra frames in one camera's first dwell put every later dwell out of step.
+    videos = {"left": capture.videos["left"], "right": capture.videos["right_shifted"]}
+    left = find_stationary_segments(capture.videos["left"])
+    right = find_stationary_segments(capture.videos["right_shifted"])
+    assert len(left) == len(right) == len(DISTINCT)
+    assert right[1][0] - left[1][0] == SHIFT
+    with pytest.raises(WaypointAlignmentError) as raised:
+        extract_observations(videos, capture.positions, capture.board)
+    assert str(raised.value) == (
+        f"segment 1: left starts at frame {left[1][0]} and right at frame {right[1][0]};"
+        " synchronised cameras must agree within 3 frames"
+    )
 
 
 def test_missing_dwell_raises_alignment_error(capture):

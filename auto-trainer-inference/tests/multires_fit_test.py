@@ -16,7 +16,9 @@ from autotrainer.inference.multires_calibration import fit as fit_module
 from autotrainer.inference.multires_calibration.fit import (
     INTRINSIC_NAMES,
     BoardSpec,
+    WaypointObservation,
     fit_motor_frame,
+    reconcile_corner_order,
 )
 from multires_synthetic import render_board_frame, synthetic_rig
 
@@ -146,6 +148,78 @@ def test_fit_triangulates_the_working_volume_like_truth(frame_rotation_deg):
     # The measurement adds no error of its own: the truth models give the grid back.
     assert np.linalg.norm(triangulate(rig.truth.cameras, pixels) - X, axis=1).max() < 1e-6
     assert np.linalg.norm(triangulate(fit.cameras, pixels) - X, axis=1).max() < 0.05
+
+
+def working_volume_error_mm(rig, cameras) -> float:
+    """The largest triangulation error of `cameras` over the working-volume grid of
+    test_fit_triangulates_the_working_volume_like_truth, in mm."""
+    corners = np.concatenate([rig.world_corners(o.motor_mm) for o in rig.observations])
+    lo, hi = corners.min(axis=0), corners.max(axis=0)
+    axes = [np.linspace(lo[i], hi[i], n) for i, n in enumerate((10, 10, 5))]
+    X = np.stack(np.meshgrid(*axes, indexing="ij"), axis=-1).reshape(-1, 3)
+    pixels = {
+        cam: cv2.projectPoints(X, t.rvec, t.tvec, t.K, t.dist)[0].reshape(-1, 2)
+        for cam, t in rig.truth.cameras.items()
+    }
+    return float(np.linalg.norm(triangulate(cameras, pixels) - X, axis=1).max())
+
+
+def with_reversed_corners(observations, cam):
+    """Copies of `observations` with every one of `cam`'s corner arrays in the other 180-degree order."""
+    return [
+        WaypointObservation(
+            index=o.index,
+            motor_mm=o.motor_mm.copy(),
+            corners={c: (v[::-1].copy() if c == cam else v.copy()) for c, v in o.corners.items()},
+        )
+        for o in observations
+    ]
+
+
+def test_reconcile_reverses_a_camera_that_labels_the_board_from_the_other_end():
+    # The 6x8 board looks the same turned 180 degrees, so the right camera here is
+    # consistent across its own waypoints but starts from the left camera's last corner.
+    rig = synthetic_rig(noise_px=0.1)
+    flipped = with_reversed_corners(rig.observations, "right")
+    inputs = [{c: v.copy() for c, v in o.corners.items()} for o in flipped]
+    reconciled, reversed_cameras = reconcile_corner_order(flipped, rig.board, (1440, 1080))
+    assert reversed_cameras == {"left": False, "right": True}
+    for o, before in zip(flipped, inputs):
+        for c in before:
+            np.testing.assert_array_equal(o.corners[c], before[c])  # the inputs are not changed
+    for r, o in zip(reconciled, rig.observations):
+        assert r.index == o.index
+        for c in ("left", "right"):
+            np.testing.assert_array_equal(r.corners[c], o.corners[c])
+    fit = fit_motor_frame(reconciled, rig.board, (1440, 1080))
+    assert working_volume_error_mm(rig, fit.cameras) < 0.05
+
+
+def test_reconcile_leaves_consistent_cameras_alone():
+    rig = synthetic_rig(noise_px=0.1)
+    reconciled, reversed_cameras = reconcile_corner_order(rig.observations, rig.board, (1440, 1080))
+    assert reversed_cameras == {"left": False, "right": False}
+    for r, o in zip(reconciled, rig.observations):
+        assert r is not o and r.index == o.index
+        np.testing.assert_array_equal(r.motor_mm, o.motor_mm)
+        for c in ("left", "right"):
+            assert r.corners[c] is not o.corners[c]
+            np.testing.assert_array_equal(r.corners[c], o.corners[c])
+
+
+def test_reconcile_takes_the_camera_with_the_most_views_as_reference():
+    # The left camera misses five waypoints, so the right camera is the reference even
+    # though it is the one reversed here; the left camera is turned to match it.
+    rig = synthetic_rig(noise_px=0.1)
+    flipped = with_reversed_corners(rig.observations, "right")
+    for o in flipped[:5]:
+        del o.corners["left"]
+    reconciled, reversed_cameras = reconcile_corner_order(flipped, rig.board, (1440, 1080))
+    assert reversed_cameras == {"left": True, "right": False}
+    for r, f in zip(reconciled, flipped):
+        np.testing.assert_array_equal(r.corners["right"], f.corners["right"])
+        if "left" in f.corners:
+            np.testing.assert_array_equal(r.corners["left"], f.corners["left"][::-1])
 
 
 def test_fitted_distortion_matches_truth_at_the_1024_roi_corners():
