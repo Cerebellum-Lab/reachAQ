@@ -70,7 +70,13 @@ DEFAULT_THRESHOLDS: Thresholds = {
     "square_size_rel_error": (0.01, 0.03),
     "motor_scale_dev": (0.01, None),
     "waypoints_unverified": (0.0, None),
-    "cross_check_delta_px": (0.5, 1.5),
+    # Informational: a preset's direct fit has a noise floor near 0.5 preset px in K even on
+    # perfect synthetic frames (0.33 and 0.87 px measured), so it cannot fail a calibration.
+    "cross_check_delta_px": (1.5, None),
+    # The pixel-centre mapping itself, which the spec holds to 0.1 px: on the synthetic
+    # capture the mean offset is about 0.001 preset px, and the pixel-edge convention, off by
+    # (b - 1) / 2b on each axis (0.53 px in all at bin 4), fails it.
+    "cross_check_corner_offset_px": (0.1, 0.25),
     "camera_rotation_change_deg": (0.5, None),
     "baseline_change_mm": (1.0, None),
     "focal_change_rel": (0.02, None),
@@ -195,6 +201,9 @@ class PresetCrossCheck:
 
     geometry: PresetGeometry
     max_intrinsic_delta_px: float  # max |dfx, dfy, dcx, dcy| over both cameras, preset px
+    # |mean over every corner of both cameras of (corner detected in the preset's frames -
+    # the sensor detection mapped into the preset)|, preset px: the mapping, free of fit noise
+    corner_offset_px: float
 
 
 @dataclass
@@ -277,6 +286,7 @@ def build_report(
     add("motor_scale_dev", None, abs(fit.motor_scale - 1.0), "ratio")
     for check in cross_checks:
         add("cross_check_delta_px", None, check.max_intrinsic_delta_px, "preset px", f"preset {check.geometry.name}")
+        add("cross_check_corner_offset_px", None, check.corner_offset_px, "preset px", f"preset {check.geometry.name}")
 
     # The change since the previous calibration.
     if previous is None or previous.legacy or previous.fit is None:

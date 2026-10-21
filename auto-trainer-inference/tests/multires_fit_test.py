@@ -224,6 +224,115 @@ def test_reconcile_takes_the_camera_with_the_most_views_as_reference():
             np.testing.assert_array_equal(r.corners["left"], f.corners["left"][::-1])
 
 
+def planar_start_at_ten_times_the_focal_length(monkeypatch, focal_px):
+    """Make the planar start's calibrateCamera land at 10 x `focal_px`, as the degenerate
+    planar calibration can: K is held there and the poses are solved for it, so the start is
+    self-consistent but far off. The focal-grid starts hold their own K and pass through."""
+    real = cv2.calibrateCamera
+
+    def calibrate(object_points, image_points, image_size, camera_matrix, dist_coeffs, *args, flags=0, **kwargs):
+        if flags & cv2.CALIB_FIX_FOCAL_LENGTH:
+            return real(object_points, image_points, image_size, camera_matrix, dist_coeffs, *args, flags=flags, **kwargs)
+        width, height = image_size
+        far = np.array([[10 * focal_px, 0.0, (width - 1) / 2], [0.0, 10 * focal_px, (height - 1) / 2], [0.0, 0.0, 1.0]])
+        held = cv2.CALIB_USE_INTRINSIC_GUESS | cv2.CALIB_FIX_FOCAL_LENGTH | cv2.CALIB_FIX_PRINCIPAL_POINT
+        return real(object_points, image_points, image_size, far, np.zeros(5), *args, flags=flags | held, **kwargs)
+
+    monkeypatch.setattr(fit_module.cv2, "calibrateCamera", calibrate)
+
+
+def test_fit_recovers_the_truth_when_the_planar_start_is_ten_times_the_focal_length(monkeypatch):
+    rig = synthetic_rig(noise_px=0.1)
+    planar_start_at_ten_times_the_focal_length(monkeypatch, rig.truth.cameras["left"].K[0, 0])
+    outcomes = []
+    real_solve = getattr(fit_module, "_solve", None)
+
+    def solve(*args, **kwargs):
+        result = real_solve(*args, **kwargs)
+        outcomes.append(result)
+        return result
+
+    monkeypatch.setattr(fit_module, "_solve", solve, raising=False)
+    fit = fit_motor_frame(rig.observations, rig.board, (1440, 1080))
+    # Precondition: from the planar start alone the fit fails (it runs out of evaluations).
+    planar, _, outcome = outcomes[0]
+    assert planar is None or max(planar.rms_px.values()) > 1.0, outcome
+    assert len(outcomes) == 1 + len(fit_module._FOCAL_GRID)
+    # The focal grid recovers the truth to the bounds of test_fit_recovers_the_synthetic_rig.
+    for cam in ("left", "right"):
+        t, f = rig.truth.cameras[cam], fit.cameras[cam]
+        assert f.K[0, 0] == pytest.approx(t.K[0, 0], rel=0.005)
+        assert f.K[1, 1] == pytest.approx(t.K[1, 1], rel=0.005)
+        assert abs(f.K[0, 2] - t.K[0, 2]) < 4.0 and abs(f.K[1, 2] - t.K[1, 2]) < 4.0
+        assert abs(f.dist[0] - t.dist[0]) < 0.02
+        assert rotation_angle_deg(f.rvec, t.rvec) < 0.15
+        assert np.linalg.norm(f.tvec - t.tvec) < 0.5
+        assert fit.rms_px[cam] < 0.2
+    assert fit.motor_scale == pytest.approx(1.0, abs=0.002)
+    # The kept fit is the converged one with the lowest cost.
+    converged = [(cost, result) for result, cost, _ in outcomes if result is not None]
+    assert fit is min(converged, key=lambda item: item[0])[1]
+
+
+def test_reconcile_detects_a_reversed_camera_when_the_planar_start_is_ten_times_the_focal_length(monkeypatch):
+    rig = synthetic_rig(noise_px=0.1)
+    planar_start_at_ten_times_the_focal_length(monkeypatch, rig.truth.cameras["left"].K[0, 0])
+    flipped = with_reversed_corners(rig.observations, "right")
+    _, reversed_cameras = reconcile_corner_order(flipped, rig.board, (1440, 1080))
+    assert reversed_cameras == {"left": False, "right": True}
+
+
+def test_reconcile_decides_from_a_converged_fit_not_the_planar_board_rotation(monkeypatch):
+    # The planar start's board rotation was up to 77 degrees off on the pipeline's capture.
+    # Turn the reversed right camera's by 100 degrees about the board normal: decided from
+    # the start, the two cameras would sit 80 degrees apart and the reversal would be missed.
+    rig = synthetic_rig(noise_px=0.1)
+    flipped = with_reversed_corners(rig.observations, "right")
+    first_right = flipped[0].corners["right"]
+    obj = rig.board.object_points()
+    turn = cv2.Rodrigues(np.array([0.0, 0.0, np.radians(100.0)]))[0]
+    real = fit_module._initial_camera
+
+    def initial_camera(d, obj, image_size, *args, **kwargs):
+        params, scale, R_board = real(d, obj, image_size, *args, **kwargs)
+        planar = not args and kwargs.get("K_fixed") is None
+        if planar and np.allclose(d.corners[:len(obj)], first_right):
+            R_board = R_board @ turn
+        return params, scale, R_board
+
+    monkeypatch.setattr(fit_module, "_initial_camera", initial_camera)
+    starts = {
+        cam: initial_camera(fit_module._camera_data(flipped, cam, len(obj)), obj, (1440, 1080))[2]
+        for cam in ("left", "right")
+    }
+    from_start = rotation_angle_deg(cv2.Rodrigues(starts["left"])[0], cv2.Rodrigues(starts["right"])[0])
+    assert 60.0 < from_start < 90.0  # precondition: the start alone would not reverse the right camera
+    _, reversed_cameras = reconcile_corner_order(flipped, rig.board, (1440, 1080))
+    assert reversed_cameras == {"left": False, "right": True}
+
+
+def test_reconcile_warns_when_the_board_rotations_are_ambiguous(monkeypatch, caplog):
+    # Two consistent cameras give board rotations about 0 degrees apart and a reversed one
+    # about 180; 75 degrees means one camera's fit is wrong, and the decision is logged.
+    rig = synthetic_rig(noise_px=0.1)
+    real = fit_module.fit_motor_frame
+    turn = cv2.Rodrigues(np.array([0.0, 0.0, np.radians(75.0)]))[0]
+
+    def fit(observations, board, image_size, camera_names=("left", "right"), **kwargs):
+        result = real(observations, board, image_size, camera_names, **kwargs)
+        if tuple(camera_names) == ("right",):
+            turned_board = cv2.Rodrigues(np.asarray(result.board_rvec, float))[0] @ turn
+            result = dataclasses.replace(result, board_rvec=cv2.Rodrigues(turned_board)[0].ravel())
+        return result
+
+    monkeypatch.setattr(fit_module, "fit_motor_frame", fit)
+    with caplog.at_level("WARNING", logger=fit_module.__name__):
+        _, reversed_cameras = reconcile_corner_order(rig.observations, rig.board, (1440, 1080))
+    assert reversed_cameras == {"left": False, "right": False}
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any(w.startswith("right:") and "degrees from left" in w and "ambiguous" in w for w in warnings), warnings
+
+
 def test_fitted_distortion_matches_truth_at_the_1024_roi_corners():
     rig = synthetic_rig(noise_px=0.1)
     fit = fit_motor_frame(rig.observations, rig.board, (1440, 1080))

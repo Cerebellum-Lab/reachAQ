@@ -19,12 +19,14 @@ calibrate_capture turns it into a calibration folder (store.py):
 4. Each binned preset is cross-checked: the frames the detection used are pooled the way the
    camera bins them (INTER_AREA by the binning) and cropped to the preset's ROI, the board is
    detected there and the preset is fitted directly in its own pixels, starting from the
-   mapped sensor fit. The report records the largest difference between that fit's K and the
-   mapped one. A bin-1 preset is a crop of the frames the sensor fit used, with the same
+   mapped sensor fit. The report records the mean offset of the preset's corners from the
+   sensor corners mapped into it, which checks the mapping (graded), and the largest
+   difference between the direct fit's K and the mapped one, which is limited by fit noise
+   (informational). A bin-1 preset is a crop of the frames the sensor fit used, with the same
    detections shifted, so it would only check the arithmetic of the shift and is not
-   cross-checked. A preset whose direct fit fails is
-   recorded as an undetermined (inf) difference with a note, which fails the report rather
-   than aborting the calibration.
+   cross-checked. A preset whose direct fit fails gets an undetermined (inf) K difference
+   and a note, which warns; its corner offset is graded all the same, and the calibration
+   is not aborted.
 5. The report compares with the previous calibration when that is one of these folders; a
    legacy folder has no motor-frame fit to compare with.
 6. The calibration is written with the coverage images, the source videos and waypoints.yaml,
@@ -296,6 +298,7 @@ def _cross_checks(
             )
             for i, o in enumerate(observations)
         ]
+        offset = _corner_offset(preset_observations, observations, g)
         try:
             # Started from the sensor fit mapped to the preset, not from the planar start,
             # which is degenerate in focal length: from it, the 512 preset's fit on the
@@ -308,13 +311,36 @@ def _cross_checks(
         except (RuntimeError, ValueError) as error:
             logger.warning("cross-check %s: the direct fit failed: %s", g.name, error)
             notes.append(f"cross-check {g.name}: the direct fit in the preset's pixels failed: {error}")
-            checks.append(PresetCrossCheck(geometry=g, max_intrinsic_delta_px=math.inf))
+            checks.append(PresetCrossCheck(geometry=g, max_intrinsic_delta_px=math.inf, corner_offset_px=offset))
             continue
         delta = max(
             _intrinsic_delta(direct.cameras[cam].K, map_intrinsics(fit.cameras[cam].K, g)) for cam in CAMERAS
         )
-        checks.append(PresetCrossCheck(geometry=g, max_intrinsic_delta_px=delta))
+        checks.append(PresetCrossCheck(geometry=g, max_intrinsic_delta_px=delta, corner_offset_px=offset))
     return checks
+
+
+def _corner_offset(
+    preset_observations: Sequence[WaypointObservation],
+    observations: Sequence[WaypointObservation],
+    g: PresetGeometry,
+) -> float:
+    """|mean of (corner detected in preset g's frames - the sensor detection mapped into g)|
+    over every corner of every camera and waypoint the preset found, in preset px; NaN when
+    it found none.
+
+    It tests the mapping where the K delta cannot: a convention error shifts every corner
+    alike, so the mean exposes it, while detection noise averages away over thousands of
+    corners (sem about 0.0007 px on the synthetic capture).
+    """
+    differences = [
+        p.corners[cam] - sensor_to_preset_points(o.corners[cam], g)
+        for p, o in zip(preset_observations, observations)
+        for cam in p.corners
+    ]
+    if not differences:
+        return math.nan
+    return float(np.linalg.norm(np.concatenate(differences).mean(axis=0)))
 
 
 def _mapped_fit(fit: MotorFrameFit, g: PresetGeometry) -> MotorFrameFit:

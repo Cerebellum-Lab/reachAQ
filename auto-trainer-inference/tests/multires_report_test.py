@@ -75,10 +75,14 @@ def capture_for(observations, unverified=0, views_kept=None, rejections=None):
     )
 
 
-def cross_checks(deltas=(0.1, 0.1)):
-    """One cross-check per preset the pipeline fits directly (binning > 1), with these deltas."""
+def cross_checks(deltas=(0.1, 0.1), offsets=(0.01, 0.01)):
+    """One cross-check per preset the pipeline fits directly (binning > 1), with these K
+    deltas and corner offsets."""
     presets = [g for g in presets_from_base(BASE) if g.binning > 1]
-    return [PresetCrossCheck(geometry=g, max_intrinsic_delta_px=d) for g, d in zip(presets, deltas)]
+    return [
+        PresetCrossCheck(geometry=g, max_intrinsic_delta_px=d, corner_offset_px=o)
+        for g, d, o in zip(presets, deltas, offsets)
+    ]
 
 
 def report_for(fit, observations, board, roi, *, previous=None, capture=None, checks=None):
@@ -400,7 +404,7 @@ def test_capture_problems_and_cross_checks_are_graded(rig, fitted):
 
     report = report_for(
         fitted, rig.observations, rig.board, swept_roi(rig.observations),
-        capture=capture, checks=cross_checks(deltas=(0.1, 2.0)),
+        capture=capture, checks=cross_checks(deltas=(0.1, 2.0), offsets=(0.15, 0.3)),
     )
 
     assert metric(report, "waypoints_unverified").value == 1
@@ -409,10 +413,14 @@ def test_capture_problems_and_cross_checks_are_graded(rig, fitted):
     assert metric(report, "views_kept", "left").value == 15
     assert metric(report, "views_kept", "left").status == "warn"
     assert any("left" in note and "blurred 2" in note for note in report.notes)
-    deltas = {m.note: m for m in report.metrics if m.name == "cross_check_delta_px"}
-    assert len(deltas) == 2
-    failing = [m for m in deltas.values() if m.status == "fail"]
-    assert len(failing) == 1 and "512x512_bin2" in failing[0].note
+    # The K delta is limited by fit noise, so it only ever warns, however large.
+    assert DEFAULT_THRESHOLDS["cross_check_delta_px"] == (1.5, None)
+    deltas = {m.note: m.status for m in report.metrics if m.name == "cross_check_delta_px"}
+    assert deltas == {"preset 256x256_bin4": "pass", "preset 512x512_bin2": "warn"}
+    # The corner offset checks the mapping itself, to the spec's 0.1 px.
+    assert DEFAULT_THRESHOLDS["cross_check_corner_offset_px"] == (0.1, 0.25)
+    offsets = {m.note: m.status for m in report.metrics if m.name == "cross_check_corner_offset_px"}
+    assert offsets == {"preset 256x256_bin4": "warn", "preset 512x512_bin2": "fail"}
     assert report.verdict == "fail"
 
 

@@ -27,12 +27,17 @@ distortion at the corners of the 1024 preset's ROI by 2.7 px while fitting the
 covered area no better.
 """
 
+import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
 from scipy.optimize import least_squares
+
+from autotrainer.core.logging import get_verbose_logger
+
+logger = get_verbose_logger(__name__)
 
 # The order of the intrinsic parameters in param_std, matching cv2's distortion order
 # (k1, k2, p1, p2, k3).
@@ -52,6 +57,19 @@ _INITIAL_CALIBRATION_FLAGS = cv2.CALIB_FIX_K2 | cv2.CALIB_FIX_K3 | cv2.CALIB_ZER
 # an undetermined direction can take thousands (one took 105 s for 1586), so stop it
 # early and raise instead.
 _MAX_EVALUATIONS = 400
+# The planar start can still land outside the joint fit's basin: on the pipeline's
+# synthetic capture it put fx at 3 to 13 times the truth and the board rotation up to 77
+# degrees off, and the fit of the 512 preset's detections ran out of evaluations from it.
+# When the planar start does not converge, or leaves a camera above _RETRY_RMS_PX, the fit
+# is retried with fx0 = fy0 = image width times each factor here, which brackets lenses
+# from wide to long (the synthetic rig's fx is 1.6 times its width).
+_FOCAL_GRID = (0.5, 1.0, 1.5, 2.0, 3.0)
+# Detected corners sit within a few tenths of a pixel of a good fit; a camera above this
+# RMS after the planar start is taken as a sign of a wrong basin, not of bad data.
+_RETRY_RMS_PX = 1.0
+# reconcile_corner_order's board rotations differ by about 0 or about 180 degrees; between
+# these the decision is ambiguous and is logged.
+_AMBIGUOUS_FLIP_DEG = (60.0, 120.0)
 # Directions of the normalised J^T J whose eigenvalue is below 1/_MAX_CONDITION of the
 # largest are treated as undetermined by the capture. Good captures on the synthetic
 # rig sit at a condition number of 4.5e6 in every one of 30 seeds; a camera that sees
@@ -137,32 +155,90 @@ def fit_motor_frame(
     A waypoint seen by only one camera still constrains that camera: each camera's
     residuals come from exactly the waypoints it observed.
 
-    `initial`, a fit whose cameras are in this image's pixels, starts the fit in place of
-    the planar initialisation. That start is degenerate in focal length (see
-    _INITIAL_CALIBRATION_FLAGS): on the pipeline's synthetic capture it put fx at 3 to 13
-    times the truth and the board rotation up to 77 degrees off, and from one such start
-    the fit of the 512 preset's own detections ran out of evaluations. The pipeline's
-    per-preset cross-check therefore starts from the sensor fit mapped to the preset. The
-    result is the least-squares optimum of these observations either way; only the
-    starting point differs.
+    Starts. The planar start (a planar calibration per camera, k1 its only distortion
+    term, then the motor axes from how the board moved in each camera) is tried first and
+    kept when it converges with every camera's RMS at most _RETRY_RMS_PX. It is degenerate
+    in focal length, because every view is a parallel plane, so otherwise the fit is
+    retried from each focal length in _FOCAL_GRID times the image width, with the principal
+    point at the image centre: the same planar calibration with that K held fixed gives k1
+    and every view's pose (zero distortion and per-view solvePnP if it cannot). Of all the
+    starts that converged, planar included, the one with the lowest total cost is kept,
+    even if its RMS is still high: that is what the data supports, and the report grades
+    it. RuntimeError, listing every start and its outcome, only when none converged.
+
+    `initial`, a fit whose cameras are in this image's pixels, is the only start when
+    given; RuntimeError if the fit does not converge from it. The pipeline's per-preset
+    cross-check starts from the sensor fit mapped to the preset this way. The result is the
+    least-squares optimum of these observations whichever start reaches it.
     """
     obj = board.object_points()
     data = {cam: _camera_data(observations, cam, len(obj)) for cam in camera_names}
 
     if initial is not None:
-        x0 = _parameters_of(initial, camera_names)
-    else:
-        # Initialisation: planar calibration per camera, then the motor axes from how the
-        # board origin moved in each camera (scaled Kabsch/Umeyama).
-        x0_cameras, scales, board_rotations = [], [], []
-        for cam in camera_names:
-            params, scale, R_board = _initial_camera(data[cam], obj, image_size)
-            x0_cameras.append(params)
-            scales.append(scale)
-            board_rotations.append((len(data[cam].indices), R_board))
-        # The camera with the most views gives the board rotation; s estimates sigma in each camera.
-        R_board0 = max(board_rotations, key=lambda item: item[0])[1]
-        x0 = np.concatenate(x0_cameras + [cv2.Rodrigues(R_board0)[0].ravel(), [float(np.mean(scales))]])
+        fit, _, outcome = _solve(_parameters_of(initial, camera_names), obj, data, camera_names, image_size)
+        if fit is None:
+            raise RuntimeError(f"the motor-frame fit did not converge from the given start: {outcome}")
+        return fit
+
+    attempts: List[str] = []
+    converged: List[Tuple[float, MotorFrameFit]] = []
+
+    def attempt(label: str, K_fixed: Optional[np.ndarray]) -> Optional[MotorFrameFit]:
+        try:
+            x0 = _initial_parameters(data, obj, image_size, camera_names, K_fixed)
+        except (cv2.error, np.linalg.LinAlgError) as error:
+            attempts.append(f"{label}: no start ({' '.join(str(error).split())})")
+            return None
+        fit, cost, outcome = _solve(x0, obj, data, camera_names, image_size)
+        attempts.append(f"{label}: {outcome}")
+        if fit is not None:
+            converged.append((cost, fit))
+        return fit
+
+    planar = attempt("planar start", None)
+    if planar is not None and max(planar.rms_px.values()) <= _RETRY_RMS_PX:
+        return planar
+    width, height = int(image_size[0]), int(image_size[1])
+    for factor in _FOCAL_GRID:
+        f0 = factor * width
+        K0 = np.array([[f0, 0.0, (width - 1) / 2], [0.0, f0, (height - 1) / 2], [0.0, 0.0, 1.0]])
+        attempt(f"fx0 = fy0 = {f0:g} px ({factor:g} x width)", K0)
+    if not converged:
+        raise RuntimeError("the motor-frame fit did not converge from any start: " + "; ".join(attempts))
+    cost, best = min(converged, key=lambda item: item[0])
+    logger.info("motor-frame fit retried from a focal grid; kept the lowest cost %.6g of: %s", cost, "; ".join(attempts))
+    return best
+
+
+def _initial_parameters(
+    data: Dict[str, _CameraData],
+    obj: np.ndarray,
+    image_size: Tuple[int, int],
+    camera_names: Sequence[str],
+    K_fixed: Optional[np.ndarray],
+) -> np.ndarray:
+    """The start vector: each camera's planar start (with K held at K_fixed when given), the
+    board rotation of the camera with the most views, and the mean scale over the cameras."""
+    x0_cameras, scales, board_rotations = [], [], []
+    for cam in camera_names:
+        params, scale, R_board = _initial_camera(data[cam], obj, image_size, K_fixed=K_fixed)
+        x0_cameras.append(params)
+        scales.append(scale)
+        board_rotations.append((len(data[cam].indices), R_board))
+    # The camera with the most views gives the board rotation; s estimates sigma in each camera.
+    R_board0 = max(board_rotations, key=lambda item: item[0])[1]
+    return np.concatenate(x0_cameras + [cv2.Rodrigues(R_board0)[0].ravel(), [float(np.mean(scales))]])
+
+
+def _solve(
+    x0: np.ndarray,
+    obj: np.ndarray,
+    data: Dict[str, _CameraData],
+    camera_names: Sequence[str],
+    image_size: Tuple[int, int],
+) -> Tuple[Optional[MotorFrameFit], float, str]:
+    """(fit, total cost, outcome) of the joint fit from x0; the fit is None and the cost inf
+    when it did not converge, and the outcome says how it ended."""
 
     def residuals(x: np.ndarray) -> np.ndarray:
         return np.concatenate(_camera_residuals(x, obj, data, camera_names))
@@ -183,9 +259,8 @@ def fit_motor_frame(
     )
     # Status 0 is the evaluation limit, and below that bad input: no usable fit either way.
     if result.status <= 0:
-        raise RuntimeError(
-            f"the motor-frame fit did not converge: least_squares status {result.status}"
-            f" after {result.nfev} evaluations ({result.message})"
+        return None, math.inf, (
+            f"least_squares status {result.status} after {result.nfev} evaluations ({result.message})"
         )
     x = result.x
 
@@ -203,7 +278,7 @@ def fit_motor_frame(
         # k3 is held, not estimated, so it has no spread of its own.
         param_std[cam] = {name: float(fitted.get(name, 0.0)) for name in INTRINSIC_NAMES}
 
-    return MotorFrameFit(
+    fit = MotorFrameFit(
         cameras=cameras,
         board_rvec=x[-4:-1].copy(),
         board_tvec=np.zeros(3),
@@ -213,6 +288,8 @@ def fit_motor_frame(
         per_view_rms_px=per_view,
         param_std=param_std,
     )
+    rms = ", ".join(f"{cam} {rms_px[cam]:.3g}" for cam in camera_names)
+    return fit, float(result.cost), f"converged in {result.nfev} evaluations, cost {result.cost:.6g}, rms px {rms}"
 
 
 def reconcile_corner_order(
@@ -225,24 +302,38 @@ def reconcile_corner_order(
 
     The 6x8 board looks the same turned 180 degrees about its normal, so two cameras can
     each be consistent across their own waypoints yet label the board from opposite ends.
-    A camera labelling it from the other end sees, in its planar calibration, the board
-    turned 180 degrees about the board normal, so the board's rotation in the motor frame
-    from that camera (the initialisation fit_motor_frame starts from) is 180 degrees from
-    the reference camera's. Every corner array of a camera more than 90 degrees away is
-    reversed.
+    A camera labelling it from the other end sees the board turned 180 degrees about the
+    board normal, so the board's rotation in the motor frame from that camera is 180
+    degrees from the reference camera's. Every corner array of a camera more than 90
+    degrees away is reversed.
+
+    Each camera's board rotation comes from a converged motor-frame fit of that camera
+    alone (fit_motor_frame with its starts), not from the planar start: that start was up
+    to 77 degrees off on the pipeline's synthetic capture, too close to the 90-degree
+    threshold to decide by. An angle between 60 and 120 degrees is logged as ambiguous.
 
     Returns new observations (the inputs are not changed) and, per camera, whether its
     corners were reversed. Raises ValueError as fit_motor_frame does for a camera whose
-    waypoints cannot place it.
+    waypoints cannot place it, and RuntimeError when a camera's fit converges from no start.
     """
     obj = board.object_points()
     data = {cam: _camera_data(observations, cam, len(obj)) for cam in camera_names}
-    board_rotation = {cam: _initial_camera(data[cam], obj, image_size)[2] for cam in camera_names}
-    reference = max(camera_names, key=lambda cam: len(data[cam].indices))
-    # The angle between two rotations exceeds 90 degrees when trace(R_a^T R_b) < 1.
-    flipped = {
-        cam: bool(np.trace(board_rotation[reference].T @ board_rotation[cam]) < 1.0) for cam in camera_names
+    board_rotation = {
+        cam: cv2.Rodrigues(np.asarray(fit_motor_frame(observations, board, image_size, (cam,)).board_rvec, float))[0]
+        for cam in camera_names
     }
+    reference = max(camera_names, key=lambda cam: len(data[cam].indices))
+    flipped = {}
+    for cam in camera_names:
+        relative = board_rotation[reference].T @ board_rotation[cam]
+        angle = math.degrees(float(np.linalg.norm(cv2.Rodrigues(relative)[0])))
+        low, high = _AMBIGUOUS_FLIP_DEG
+        if low < angle < high:
+            logger.warning(
+                "%s: its board rotation is %.1f degrees from %s's; between %g and %g degrees,"
+                " whether its corners are reversed is ambiguous", cam, angle, reference, low, high,
+            )
+        flipped[cam] = angle > 90.0
     reconciled = [
         WaypointObservation(
             index=o.index,
@@ -276,18 +367,33 @@ def _camera_data(observations: Sequence[WaypointObservation], cam: str, n_corner
     return _CameraData(indices=[o.index for o in seen], motor_mm=motor, corners=corners)
 
 
-def _initial_camera(d: _CameraData, obj: np.ndarray, image_size) -> Tuple[np.ndarray, float, np.ndarray]:
-    """(camera parameter block, scale s, board rotation in the motor frame) for one camera."""
+def _initial_camera(
+    d: _CameraData, obj: np.ndarray, image_size, K_fixed: Optional[np.ndarray] = None
+) -> Tuple[np.ndarray, float, np.ndarray]:
+    """(camera parameter block, scale s, board rotation in the motor frame) for one camera.
+
+    With K_fixed the planar calibration holds K there and fits only k1 and the views' poses;
+    if it cannot, the distortion is zero and each view's pose comes from solvePnP.
+    """
     n = len(d.indices)
     image_points = [c.reshape(-1, 1, 2).astype(np.float32) for c in d.corners.reshape(n, -1, 2)]
-    _, K, dist, rvecs, tvecs = cv2.calibrateCamera(
-        [obj.astype(np.float32)] * n,
-        image_points,
-        (int(image_size[0]), int(image_size[1])),
-        None,
-        None,
-        flags=_INITIAL_CALIBRATION_FLAGS,
-    )
+    object_points = [obj.astype(np.float32)] * n
+    size = (int(image_size[0]), int(image_size[1]))
+    if K_fixed is None:
+        _, K, dist, rvecs, tvecs = cv2.calibrateCamera(
+            object_points, image_points, size, None, None, flags=_INITIAL_CALIBRATION_FLAGS
+        )
+    else:
+        held = cv2.CALIB_USE_INTRINSIC_GUESS | cv2.CALIB_FIX_FOCAL_LENGTH | cv2.CALIB_FIX_PRINCIPAL_POINT
+        try:
+            _, K, dist, rvecs, tvecs = cv2.calibrateCamera(
+                object_points, image_points, size, np.array(K_fixed, float), np.zeros(5),
+                flags=_INITIAL_CALIBRATION_FLAGS | held,
+            )
+        except cv2.error:
+            K, dist = np.array(K_fixed, float), np.zeros(5)
+            poses = [cv2.solvePnP(object_points[0], p, K, dist)[1:] for p in image_points]
+            rvecs, tvecs = [r for r, _ in poses], [t for _, t in poses]
     R_views = np.array([cv2.Rodrigues(r)[0] for r in rvecs])  # board -> camera, per view
     t_views = np.array([t.ravel() for t in tvecs])  # board origin in the camera, per view
 

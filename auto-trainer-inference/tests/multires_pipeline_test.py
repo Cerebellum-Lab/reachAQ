@@ -13,8 +13,9 @@ Each calibrate_capture run takes a while, so a run is a module fixture and sever
 read it: the main run (all waypoints verified, capture settings logged, no previous
 calibration), a second run (one waypoint unverified, no capture settings logged, the main
 run as the previous calibration), a run against the legacy fixture folder, a run whose
-right camera labels the board from the other end, and a degraded run (the 256 cross-check
-fit fails and the previous calibration's fit cannot be read).
+right camera labels the board from the other end, a degraded run (the 256 cross-check
+fit fails and the previous calibration's fit cannot be read), and a run whose cross-check
+maps the sensor corners with the pixel-edge convention.
 """
 
 import filecmp
@@ -189,6 +190,18 @@ def degraded(main, tmp_path_factory) -> Run:
         return run(main.capture_dir, folder / "out" / NAME, previous_dir=damaged)
 
 
+@pytest.fixture(scope="module")
+def edge_mapped(main, tmp_path_factory) -> Run:
+    """The cross-check maps sensor corners with the pixel-edge convention (no 0.5 terms)."""
+
+    def edge(points, g):
+        return np.asarray(points, float) / g.binning - np.array([g.offset_x, g.offset_y], float)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(pipeline, "sensor_to_preset_points", edge)
+        return run(main.capture_dir, tmp_path_factory.mktemp("edge_mapped") / NAME)
+
+
 def test_end_to_end_on_synthetic_videos(main):
     out = main.output_dir
     assert is_multires_calibration(out)
@@ -199,6 +212,10 @@ def test_end_to_end_on_synthetic_videos(main):
     cross = metrics(main.report, "cross_check_delta_px")
     assert [m.note for m in cross] == ["preset 256x256_bin4", "preset 512x512_bin2"]
     assert all(m.value < 1.5 for m in cross), main.report.to_text()
+    # The mapping itself: each preset's corners sit on the mapped sensor corners to the spec's 0.1 px.
+    offsets = metrics(main.report, "cross_check_corner_offset_px")
+    assert [m.note for m in offsets] == ["preset 256x256_bin4", "preset 512x512_bin2"]
+    assert all(m.value < 0.1 and m.status == "pass" for m in offsets), main.report.to_text()
     assert load_index(out) == main.index
     assert main.index.verdict == main.report.verdict
     saved = QualityReport.from_json((out / "quality_report.json").read_text(encoding="utf-8"))
@@ -287,12 +304,26 @@ def test_a_failed_cross_check_fit_is_inf_with_a_note(degraded):
     report = degraded.report
     by_preset = {m.note: m for m in metrics(report, "cross_check_delta_px")}
     assert math.isinf(by_preset["preset 256x256_bin4"].value)
-    assert by_preset["preset 256x256_bin4"].status == "fail"
+    # The K delta is informational, so an undetermined one warns rather than fails.
+    assert by_preset["preset 256x256_bin4"].status == "warn"
     assert by_preset["preset 512x512_bin2"].value < 1.5
     assert any("256x256_bin4" in note and "did not converge" in note for note in report.notes), report.notes
-    # One preset's check failing grades the calibration; it does not abort it.
-    assert report.verdict == "fail"
+    # The mapping is still checked: the corner offset needs no fit.
+    offsets = {m.note: m for m in metrics(report, "cross_check_corner_offset_px")}
+    assert offsets["preset 256x256_bin4"].value < 0.1 and offsets["preset 256x256_bin4"].status == "pass"
+    # A failed preset fit grades the calibration; it does not abort it.
+    assert report.verdict == "warn", report.to_text()
     assert is_multires_calibration(degraded.output_dir)
+
+
+def test_a_pixel_edge_mapping_fails_the_corner_offset(edge_mapped):
+    # u_edge = u_sensor / b - offset leaves out the pixel-centre terms, so every corner the
+    # preset detects sits (0.5 / b - 0.5) px from it on each axis: 0.375 at bin 4, 0.25 at bin 2.
+    offsets = {m.note: m for m in metrics(edge_mapped.report, "cross_check_corner_offset_px")}
+    bin4, bin2 = offsets["preset 256x256_bin4"], offsets["preset 512x512_bin2"]
+    assert bin4.value == pytest.approx(0.375 * math.sqrt(2), abs=0.02) and bin4.status == "fail"
+    assert bin2.value == pytest.approx(0.25 * math.sqrt(2), abs=0.02) and bin2.status == "fail"
+    assert edge_mapped.report.verdict == "fail"
 
 
 def test_a_previous_calibration_whose_fit_cannot_be_read_is_noted(degraded):
