@@ -78,18 +78,6 @@ def _fit() -> MotorFrameFit:
 _FIT = _fit()
 
 
-@pytest.fixture
-def app_model(app_model):
-    # reload_calib reads the model location and pose parts off the inference model. The
-    # conftest's VoidInference declares neither: AppModel's constructor reloads before it
-    # has an inference model, so only a later reload, as these tests make, reaches them.
-    # Plain assignment, since reading an undeclared name off it raises (so monkeypatch
-    # cannot record a previous value); the inference double is made for each test.
-    app_model.inference.model_location = None
-    app_model.inference.pose_parts = PARTS
-    return app_model
-
-
 def _write_multires(folder: Path, base=BASE, *, binnings=(4, 2, 1), offsets=None) -> Path:
     folder.parent.mkdir(parents=True, exist_ok=True)
     store.write_calibration(folder, fit=_FIT, presets=presets_from_base(base, binnings),
@@ -115,6 +103,17 @@ def _legacy_copy_without_offsets(calib_dir: Path, tmp_path: Path) -> Path:
 def _configure_left(app_model, **params):
     app_model.left_camera.load_configuration(
         CameraConfiguration(id=CameraId.Left, name="left", scheme="random", params=params))
+
+
+def _save_left_camera_params(system_config, trainer_config_dir, **params):
+    """Set the left camera's params in the configuration file load_configuration reads."""
+    left = next(camera for camera in system_config.cameras if camera.id == CameraId.Left)
+    left.params = {**left.params, **params}
+    system_config.save_default(trainer_config_dir)
+
+
+def _calibration_errors(on_error):
+    return [call.args[1] for call in on_error.call_args_list if call.args[0] == "3D calibration"]
 
 
 def _assert_live_matches_reference(algorithm, seed=0):
@@ -204,6 +203,61 @@ def test_unequal_binning_disables_3d_with_message(app_model, tmp_path):
     title, message = on_error.call_args.args
     assert title == "3D calibration" and "hbin=4 vbin=2" in message
     assert app_model._pose_algorithm._live_3d_reason() == "no stereo params"
+
+
+def test_a_configuration_load_reloads_with_the_configured_geometry(
+        app_model, tmp_path, system_config, trainer_config_dir):
+    base = PresetGeometry(4, 256, 256, 40, 10)
+    folder = _write_multires(tmp_path / DEFAULT_3D_CALIB_DIR_NAME, base)
+    # Before any configuration the left camera is at SpinCam's default ROI, for which
+    # this calibration has no preset.
+    with mock.patch.object(app_model, "on_error"):
+        app_model.reload_calib(folder)
+    assert app_model._pose_algorithm.stereo_params is None
+    _save_left_camera_params(system_config, trainer_config_dir, hbin=4, vbin=4, width=256,
+                             height=256, offsetx=40, offsety=10, fps=150)
+    with mock.patch.object(app_model, "on_error") as on_error:
+        assert app_model.load_configuration() is True
+    assert _calibration_errors(on_error) == []
+
+    algorithm = app_model._pose_algorithm
+    np.testing.assert_array_equal(algorithm.frame_transform, store.load_preset(folder, base).frame_transform)
+    assert algorithm._live_3d_reason() is None
+    # The folder last loaded is kept, not the default, and the reload keeps the frame rate.
+    assert app_model.active_calibration_dir == folder
+    assert algorithm.frame_rate == 150
+
+
+def test_a_configured_roi_with_no_preset_disables_3d_on_load(
+        app_model, tmp_path, system_config, trainer_config_dir):
+    folder = _write_multires(tmp_path / DEFAULT_3D_CALIB_DIR_NAME)
+    app_model.reload_calib(folder)
+    assert app_model._pose_algorithm._live_3d_reason() is None, "SpinCam's defaults are the base"
+    # The operator's configuration moves the ROI to an offset no preset has.
+    _save_left_camera_params(system_config, trainer_config_dir, hbin=4, vbin=4, width=256,
+                             height=256, offsetx=60, offsety=6)
+    with mock.patch.object(app_model, "on_error") as on_error:
+        assert app_model.load_configuration() is True
+    message, = _calibration_errors(on_error)
+    assert "256x256_bin4 at ROI offset (60, 6)" in message
+    assert app_model._pose_algorithm.stereo_params is None
+    assert app_model._pose_algorithm._live_3d_reason() == "no stereo params"
+    assert app_model.active_calibration_dir == folder
+
+
+@pytest.mark.parametrize("index_text", ["format: [2\n", "format: 2\nid: abc\n"],
+                         ids=["not yaml", "missing fields"])
+def test_an_unreadable_index_disables_3d_instead_of_loading_legacy(app_model, calib_dir, tmp_path, index_text):
+    # The legacy files are there too, so falling through to the legacy loader would succeed.
+    folder = _legacy_copy_without_offsets(calib_dir, tmp_path)
+    (folder / "calibration.yaml").write_text(index_text)
+    with mock.patch.object(app_model, "on_error") as on_error:
+        app_model.reload_calib(folder)
+    on_error.assert_called_once_with("3D calibration", f"calibration.yaml unreadable: {folder}")
+    algorithm = app_model._pose_algorithm
+    assert algorithm.stereo_params is None and algorithm._live_3d_reason() == "no stereo params"
+    assert app_model.active_calibration_dir == folder
+    assert app_model.active_calibration_index is None
 
 
 @pytest.mark.parametrize("kind", ["legacy", "format 2"])

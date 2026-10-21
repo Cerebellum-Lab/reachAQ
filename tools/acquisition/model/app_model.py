@@ -99,6 +99,7 @@ from autotrainer.inference.analysis import IntersessionResponse
 from autotrainer.inference.config import load_calib_stereo_params
 from autotrainer.inference.analysis.prepare_jetson_data import DEFAULT_CAM_OFFSET_FILE_NAME
 from autotrainer.inference.multires_calibration.store import (
+    INDEX_FILE,
     CalibrationGeometryError,
     CalibrationIndex,
     is_multires_calibration,
@@ -1047,7 +1048,8 @@ class AppModel(ObservableObject):
         self._active_calibration_dir: Optional[Path] = None
         self._active_calibration_index: Optional[CalibrationIndex] = None
         # The camera configuration is not loaded yet, so a format-2 calibration's
-        # preset is picked from SpinCam's default geometry here.
+        # preset is picked from SpinCam's default geometry here, and again from
+        # the configured geometry at the end of every configuration load.
         self.reload_calib(calib_dir)
         #
         if inference_model is None:
@@ -2284,7 +2286,18 @@ class AppModel(ObservableObject):
         logger.info("loading calib from %s", calib_src_dir)
         frame_transform = None
         calibration_index = None
-        if calib_src_dir.exists() and is_multires_calibration(calib_src_dir):
+        if (calib_src_dir.joinpath(INDEX_FILE).exists()
+                and not is_multires_calibration(calib_src_dir)):
+            # A legacy folder has no index at all, so this one is a format-2
+            # calibration that cannot be read. Loading it the legacy way would
+            # put another calibration's files in its place, or fail obscurely.
+            stereo_params = None
+            calib_metadata = None
+            square_size = None
+            cam_names = None
+            cam_offsets = None
+            self.on_error("3D calibration", f"{INDEX_FILE} unreadable: {calib_src_dir}")
+        elif calib_src_dir.exists() and is_multires_calibration(calib_src_dir):
             calibration_index = load_index(calib_src_dir)
             # The measured frame replaces the camera angles and the square size.
             calib_metadata = None
@@ -2337,6 +2350,10 @@ class AppModel(ObservableObject):
                 model_path=model_location,
             ),
         )
+        if self._pose_algorithm is not None:
+            # The frame rate is the cameras', set by the configuration load, not
+            # the calibration's; a reload must not drop it.
+            pose_algo.frame_rate = self._pose_algorithm.frame_rate
         if inference is not None:
             pose_algo.initialize(inference.pose_parts)
             inference.pose_algorithm = pose_algo
@@ -9551,6 +9568,13 @@ class AppModel(ObservableObject):
         # and:
         self._load_animals()
         self._configure_animal_metadata_services()
+
+        # The 3D calibration again, now that the cameras are configured: a
+        # format-2 calibration's preset is picked by the left camera's
+        # configured geometry, which the startup load could not know. The
+        # folder is the one last loaded, which DCS and the 3D calibration set;
+        # with none, the default.
+        self.reload_calib(self._active_calibration_dir)
 
         self.configuration_loaded_event(configuration)
 

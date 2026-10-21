@@ -654,6 +654,10 @@ class VoidInference(InferenceProtocol):
     def __init__(self):
         super().__init__()
         self._stop_recorded_event = threading.Event()  # noqa
+        # AppModel.reload_calib reads these off the inference model, as InferenceModel
+        # has them, and every configuration load reloads the 3D calibration.
+        self.model_location = None
+        self.pose_parts = []
 
     @property
     def stop_recorded_event(self) -> synchronize.Event:
