@@ -8,6 +8,8 @@ it recovers the synthetic rig's cameras and motor scale, keeps a waypoint seen b
 only one camera for that camera, and reports a stereo pair consistent with its poses.
 """
 
+import dataclasses
+
 import cv2
 import numpy as np
 import pytest
@@ -282,6 +284,41 @@ def test_a_fit_that_runs_out_of_evaluations_raises(monkeypatch):
     rig = synthetic_rig()
     with pytest.raises(RuntimeError, match=r"status 0 after \d+ evaluations"):
         fit_motor_frame(rig.observations, rig.board, (1440, 1080))
+
+
+def test_a_given_start_replaces_the_planar_start_and_reaches_the_same_optimum(monkeypatch):
+    # The pipeline's per-preset cross-check starts from the sensor fit mapped to the preset,
+    # because the planar start is degenerate in focal length. A start must change where the
+    # solver begins, never where it ends.
+    rig = synthetic_rig(noise_px=0.1, frame_rotation_deg=35.0)
+    planar = fit_motor_frame(rig.observations, rig.board, (1440, 1080))
+    # The truth, 2 % off in focal length and 5 px off in the principal point.
+    off = np.array([[0.02, 0.0, 5.0], [0.0, 0.02, -5.0], [0.0, 0.0, 0.0]])
+    start = dataclasses.replace(
+        rig.truth,
+        cameras={cam: dataclasses.replace(m, K=m.K + off * [[m.K[0, 0], 0, 1], [0, m.K[1, 1], 1], [0, 0, 0]])
+                 for cam, m in rig.truth.cameras.items()},
+    )
+
+    def no_planar_start(*args, **kwargs):
+        raise AssertionError("the planar start ran although a start was given")
+
+    monkeypatch.setattr(fit_module, "_initial_camera", no_planar_start)
+    given = fit_motor_frame(rig.observations, rig.board, (1440, 1080), initial=start)
+
+    def intrinsics(m):
+        return np.array([m.K[0, 0], m.K[1, 1], m.K[0, 2], m.K[1, 2], *np.ravel(m.dist)[:4]])
+
+    for cam in ("left", "right"):
+        # The two fits stop within the solver's tolerance of one optimum, so they agree to a
+        # small fraction of each parameter's own uncertainty: at most 2.3e-4 sigma (k2) here.
+        std = np.array([planar.param_std[cam][name] for name in INTRINSIC_NAMES[:-1]])
+        difference = np.abs(intrinsics(given.cameras[cam]) - intrinsics(planar.cameras[cam]))
+        assert np.all(difference < 1e-3 * std), (cam, difference / std)
+        assert rotation_angle_deg(given.cameras[cam].rvec, planar.cameras[cam].rvec) < 1e-5
+        np.testing.assert_allclose(given.cameras[cam].tvec, planar.cameras[cam].tvec, rtol=0, atol=1e-4, err_msg=cam)
+        assert given.rms_px[cam] == pytest.approx(planar.rms_px[cam], rel=1e-6)
+    assert given.motor_scale == pytest.approx(planar.motor_scale, abs=1e-8)
 
 
 def test_frame_rotation_turns_the_scene_against_the_motor_axes():

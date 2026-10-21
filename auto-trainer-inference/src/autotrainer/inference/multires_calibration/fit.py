@@ -28,7 +28,7 @@ covered area no better.
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -129,26 +129,40 @@ def fit_motor_frame(
     board: BoardSpec,
     image_size: Tuple[int, int],
     camera_names: Sequence[str] = ("left", "right"),
+    *,
+    initial: Optional[MotorFrameFit] = None,
 ) -> MotorFrameFit:
     """Fit every camera's intrinsics and motor-frame pose, the board rotation and the motor scale.
 
     A waypoint seen by only one camera still constrains that camera: each camera's
     residuals come from exactly the waypoints it observed.
+
+    `initial`, a fit whose cameras are in this image's pixels, starts the fit in place of
+    the planar initialisation. That start is degenerate in focal length (see
+    _INITIAL_CALIBRATION_FLAGS): on the pipeline's synthetic capture it put fx at 3 to 13
+    times the truth and the board rotation up to 77 degrees off, and from one such start
+    the fit of the 512 preset's own detections ran out of evaluations. The pipeline's
+    per-preset cross-check therefore starts from the sensor fit mapped to the preset. The
+    result is the least-squares optimum of these observations either way; only the
+    starting point differs.
     """
     obj = board.object_points()
     data = {cam: _camera_data(observations, cam, len(obj)) for cam in camera_names}
 
-    # Initialisation: planar calibration per camera, then the motor axes from how the
-    # board origin moved in each camera (scaled Kabsch/Umeyama).
-    x0_cameras, scales, board_rotations = [], [], []
-    for cam in camera_names:
-        params, scale, R_board = _initial_camera(data[cam], obj, image_size)
-        x0_cameras.append(params)
-        scales.append(scale)
-        board_rotations.append((len(data[cam].indices), R_board))
-    # The camera with the most views gives the board rotation; s estimates sigma in each camera.
-    R_board0 = max(board_rotations, key=lambda item: item[0])[1]
-    x0 = np.concatenate(x0_cameras + [cv2.Rodrigues(R_board0)[0].ravel(), [float(np.mean(scales))]])
+    if initial is not None:
+        x0 = _parameters_of(initial, camera_names)
+    else:
+        # Initialisation: planar calibration per camera, then the motor axes from how the
+        # board origin moved in each camera (scaled Kabsch/Umeyama).
+        x0_cameras, scales, board_rotations = [], [], []
+        for cam in camera_names:
+            params, scale, R_board = _initial_camera(data[cam], obj, image_size)
+            x0_cameras.append(params)
+            scales.append(scale)
+            board_rotations.append((len(data[cam].indices), R_board))
+        # The camera with the most views gives the board rotation; s estimates sigma in each camera.
+        R_board0 = max(board_rotations, key=lambda item: item[0])[1]
+        x0 = np.concatenate(x0_cameras + [cv2.Rodrigues(R_board0)[0].ravel(), [float(np.mean(scales))]])
 
     def residuals(x: np.ndarray) -> np.ndarray:
         return np.concatenate(_camera_residuals(x, obj, data, camera_names))
@@ -300,6 +314,22 @@ def _mean_rotation(rotations: np.ndarray) -> np.ndarray:
     """The rotation closest, in the Frobenius norm, to the mean of `rotations`."""
     U, _, Vt = np.linalg.svd(rotations.sum(axis=0))
     return U @ np.diag([1.0, 1.0, np.sign(np.linalg.det(U @ Vt))]) @ Vt
+
+
+def _parameters_of(fit: MotorFrameFit, camera_names: Sequence[str]) -> np.ndarray:
+    """`fit` as the parameter vector fit_motor_frame solves, the inverse of _unpack_camera
+    per camera; k3 is not a parameter, since the fit holds it at 0."""
+    blocks = []
+    for cam in camera_names:
+        m = fit.cameras[cam]
+        K = np.asarray(m.K, float)
+        k1, k2, p1, p2 = np.asarray(m.dist, float).ravel()[:4]
+        blocks.append(np.concatenate([
+            [K[0, 0], K[1, 1], K[0, 2], K[1, 2], k1, k2, p1, p2],
+            np.asarray(m.rvec, float).ravel(),
+            np.asarray(m.tvec, float).ravel(),
+        ]))
+    return np.concatenate(blocks + [np.asarray(fit.board_rvec, float).ravel(), [float(fit.motor_scale)]])
 
 
 def _unpack_camera(p: np.ndarray):
