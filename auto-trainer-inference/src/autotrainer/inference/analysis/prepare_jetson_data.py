@@ -31,6 +31,11 @@ logger = get_verbose_logger(__name__)
 
 DEFAULT_CAM_OFFSET_FILE_NAME = "camera_offsets.pkl"
 
+# Hand-entered camera angles in degrees, which only legacy calibrations use. The
+# azimuth signs here (55 / 5) are opposite to the yaml camera_pos (-55 / -5), and
+# reorientation reads the yaml camera_pos, not these. A format-2 calibration
+# measures its 3D frame instead of using angles, so these values are deliberately
+# left unchanged: old calibrations keep their numbers (spec, bug 3).
 DEFAULT_CAM_OFFSET_VALS = {
     'camLele': 12.5,
     'camRele': 30,
@@ -573,7 +578,16 @@ def reorient_and_center_step1(
     cam_names,
     cam_offsets,
     save_offsets: bool = False,
+    frame_transform: Optional[np.ndarray] = None,
 ):
+    """Centre the triangulated points on the camera offsets and turn them into the 3D frame.
+
+    A legacy calibration builds the frame from the camera angles in calib_metadata's
+    camera_pos and rot_cor, flips the axes to (-x, -z, -y) and scales by square_size.
+    A format-2 calibration passes `frame_transform`, its measured 3x3 frame: each point
+    becomes (xyz - offsets) @ frame_transform, already in mm, and calib_metadata and
+    square_size are not read. Centring and the offsets are the same either way.
+    """
     orig_cam_offsets = copy.deepcopy(cam_offsets)
     num_frames = np.shape(df_3d)[0]
     mask = df_3d.columns.get_level_values("bodyparts").isin(bpts)
@@ -585,7 +599,8 @@ def reorient_and_center_step1(
     # Undistort points
     rot_cor = stereo_file[camera_pair]['rot_cor']
 
-    camera_pos = calib_metadata['camera_pos']
+    # A measured frame replaces the angles, so a format-2 calibration has none to read.
+    camera_pos = calib_metadata['camera_pos'] if frame_transform is None else None
     if camera_pos is not None:
         camLele = camera_pos['camLele']
         camRele = camera_pos['camRele']
@@ -595,15 +610,18 @@ def reorient_and_center_step1(
     if not cam_offsets:
         if center_method[0] == 0:
             logger.warning('No offset file found. Offset will be zero.')
-        cam_offsets = {
-            'x_off': 0,
-            'y_off': 0,
-            'z_off': 0,
-            'camLele': camLele,
-            'camRele': camRele,
-            'camLazi': camLazi,
-            'camRazi': camRazi
-        }
+        if frame_transform is not None:
+            cam_offsets = {'x_off': 0, 'y_off': 0, 'z_off': 0}
+        else:
+            cam_offsets = {
+                'x_off': 0,
+                'y_off': 0,
+                'z_off': 0,
+                'camLele': camLele,
+                'camRele': camRele,
+                'camLazi': camLazi,
+                'camRazi': camRazi
+            }
 
     if center_method[0] > 0:
         bp2use = center_method[1]
@@ -684,6 +702,11 @@ def reorient_and_center_step1(
 
         data = np.vstack((x, y, z)).T
 
+        if frame_transform is not None:
+            # The measured frame is the rotation, the flip and the scale below in one.
+            triangulate[:, bp, :] = data @ frame_transform
+            continue
+
         # Elevation of cameras, taken from CAD model
         avgCamEle = np.mean((camLele, camRele))
 
@@ -700,7 +723,8 @@ def reorient_and_center_step1(
         triangulate[:, bp, :] = data
 
     # Rescale the data
-    triangulate = triangulate * square_size
+    if frame_transform is None:
+        triangulate = triangulate * square_size
 
     high_conf_exp = np.expand_dims(high_conf, axis=-1)
     data_4d = np.concatenate([triangulate, high_conf_exp], axis=-1)

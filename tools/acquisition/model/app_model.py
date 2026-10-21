@@ -98,6 +98,13 @@ from autotrainer.inference.backend_selection import (
 from autotrainer.inference.analysis import IntersessionResponse
 from autotrainer.inference.config import load_calib_stereo_params
 from autotrainer.inference.analysis.prepare_jetson_data import DEFAULT_CAM_OFFSET_FILE_NAME
+from autotrainer.inference.multires_calibration.store import (
+    CalibrationGeometryError,
+    CalibrationIndex,
+    is_multires_calibration,
+    load_index,
+    load_preset,
+)
 
 from autotrainer.core.capture import CaptureProcessStatus
 
@@ -147,6 +154,7 @@ from tools.acquisition.model.capture_binning import (
     capture_binning_available,
     common_capture_binning,
 )
+from tools.acquisition.model.calibration_geometry import live_inference_geometry
 from tools.acquisition.model.camera_timing_alignment import (
     CameraTimestampInput,
     align_camera_timestamp_files,
@@ -508,6 +516,23 @@ def _camera_configured_metadata(camera) -> Dict[str, Any]:
         "captureBinning": camera.effective_capture_binning,
         "videoEncoder": camera.video_encoder if camera.is_recording_enabled else None,
     }
+
+
+def _load_camera_offsets(calib_dir: Path) -> Dict[str, Any]:
+    """The live 3D camera offsets saved in `calib_dir`, or zero offsets when it has none.
+
+    DCS calibration (Calibrate Coordinate System) writes camera_offsets.pkl later, from
+    the raw diamond position it measures with this calibration, so a freshly made
+    calibration has none yet. Zero offsets keep live 3D running meanwhile, and the
+    stale-DCS gate holds the DCS consumers off until DCS is redone.
+    """
+    path_offsets = calib_dir.joinpath(DEFAULT_CAM_OFFSET_FILE_NAME)
+    if not path_offsets.is_file():
+        logger.warning("%s has no %s; live 3D uses zero camera offsets until DCS writes one",
+                       calib_dir, DEFAULT_CAM_OFFSET_FILE_NAME)
+        return {"x_off": 0.0, "y_off": 0.0, "z_off": 0.0}
+    with open(path_offsets, "rb") as fh:
+        return pickle.load(fh)
 
 
 def _camera_exposure_seconds(cameras) -> Dict[str, Optional[float]]:
@@ -1019,6 +1044,10 @@ class AppModel(ObservableObject):
 
         self._pose_algorithm: PoseAlgorithm = None
         self._inference: InferenceModel = None  # noqa. needed before reload_calib
+        self._active_calibration_dir: Optional[Path] = None
+        self._active_calibration_index: Optional[CalibrationIndex] = None
+        # The camera configuration is not loaded yet, so a format-2 calibration's
+        # preset is picked from SpinCam's default geometry here.
         self.reload_calib(calib_dir)
         #
         if inference_model is None:
@@ -2249,11 +2278,20 @@ class AppModel(ObservableObject):
 
     def reload_calib(self, calib_dir: Optional[Path]):
         calib_src_dir = (
-            DEFAULT_CONFIG_DIR / DEFAULT_3D_CALIB_DIR_NAME if calib_dir is None
+            Path(self._preferences.configuration_location, DEFAULT_3D_CALIB_DIR_NAME) if calib_dir is None
             else calib_dir
         ).expanduser()
         logger.info("loading calib from %s", calib_src_dir)
-        if calib_src_dir.exists():
+        frame_transform = None
+        calibration_index = None
+        if calib_src_dir.exists() and is_multires_calibration(calib_src_dir):
+            calibration_index = load_index(calib_src_dir)
+            # The measured frame replaces the camera angles and the square size.
+            calib_metadata = None
+            square_size = None
+            cam_offsets = _load_camera_offsets(calib_src_dir)
+            stereo_params, frame_transform, cam_names = self._load_live_preset(calib_src_dir)
+        elif calib_src_dir.exists():
             stereo_params = load_calib_stereo_params(
                 calib_src_dir.joinpath('camera_matrix', 'stereo_params.pickle')
             )
@@ -2262,9 +2300,7 @@ class AppModel(ObservableObject):
                 calib_metadata = yaml.safe_load(fh)
             square_size, _, _, _ = calibration_FLIR.get_calibration_info(calib_src_dir.as_posix())
             cam_names = calibration_FLIR.get_video_list(calib_src_dir.as_posix())
-            path_offsets = calib_src_dir.joinpath(DEFAULT_CAM_OFFSET_FILE_NAME)
-            with open(path_offsets, "rb") as fh:
-                cam_offsets = pickle.load(fh)
+            cam_offsets = _load_camera_offsets(calib_src_dir)
         else:
             stereo_params = None
             calib_metadata = None
@@ -2272,6 +2308,8 @@ class AppModel(ObservableObject):
             cam_names = None
             cam_offsets = None
             logger.warning("calib_src_dir=%r does not exist", calib_src_dir.as_posix())
+        self._active_calibration_dir = calib_src_dir if calib_src_dir.exists() else None
+        self._active_calibration_index = calibration_index
 
         inference = self._inference
         model_location = inference.model_location if inference is not None else None
@@ -2281,6 +2319,7 @@ class AppModel(ObservableObject):
             cam_names=cam_names,
             square_size=square_size,
             cam_offsets=cam_offsets,
+            frame_transform=frame_transform,
             # Per backend, then per model. The TensorFlow engine saturates
             # its likelihood at 1.0 while the PyTorch engine reports a real
             # distribution, so a single constant cannot gate both - and the
@@ -2302,6 +2341,34 @@ class AppModel(ObservableObject):
             pose_algo.initialize(inference.pose_parts)
             inference.pose_algorithm = pose_algo
         self._pose_algorithm = pose_algo
+
+    def _load_live_preset(self, calib_dir: Path):
+        """(stereo_params, frame_transform, cam_names) of the preset the live frames are in.
+
+        Live frames reach inference pooled to the base capture, so the left camera's
+        configured base geometry is their pixel space. Without a preset for it, live 3D
+        stays off and the operator is told why; another preset is never substituted,
+        since its pixels are not the frames' pixels. 2D pose keeps running either way.
+        """
+        left = self._left_camera
+        params = left.active_config.params if left is not None else {}
+        try:
+            preset = load_preset(calib_dir, live_inference_geometry(params))
+        except (CalibrationGeometryError, ValueError) as err:
+            self.on_error("3D calibration", str(err))
+            return None, None, None
+        # The pair a format-2 calibration's stereo parameters are keyed by (STEREO_KEY).
+        return preset.stereo_params, preset.frame_transform, ["left", "right"]
+
+    @property
+    def active_calibration_dir(self) -> Optional[Path]:
+        """The 3D calibration folder reload_calib loaded, or None when there was none."""
+        return self._active_calibration_dir
+
+    @property
+    def active_calibration_index(self) -> Optional[CalibrationIndex]:
+        """The index of that folder; None for a legacy calibration or when there is none."""
+        return self._active_calibration_index
 
     def _identify_primary_main_cam_idx(self):
         ordered_cameras = self._ordered_reach_cameras(enabled_only=True) or self._ordered_reach_cameras()
