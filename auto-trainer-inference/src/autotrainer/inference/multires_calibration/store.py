@@ -185,18 +185,34 @@ def write_calibration(
 
 
 def is_multires_calibration(folder: Path) -> bool:
-    """True only when `folder` holds calibration.yaml at format 2."""
-    return _index_data(Path(folder)) is not None
+    """True only when `folder` holds a readable calibration.yaml at format 2.
+
+    An unreadable or corrupt index logs a warning and gives False; the loaders raise on it.
+    """
+    return _index_or_none(Path(folder)) is not None
 
 
 def load_index(folder: Path) -> CalibrationIndex:
-    data = _require_index_data(Path(folder))
+    """The index of `folder`. Raises ValueError when it has none at format 2 or it is corrupt."""
+    folder = Path(folder)
+    index = _parse_index(folder)
+    if index is None:
+        raise ValueError(
+            f"{folder} is not a multi-resolution calibration: it has no {INDEX_FILE} at format {CALIBRATION_FORMAT}"
+        )
+    return index
+
+
+def _index_from_data(data: dict) -> CalibrationIndex:
+    calibration_id = data["id"]
+    if not isinstance(calibration_id, str) or not calibration_id:
+        raise ValueError(f"id must be a non-empty string, got {calibration_id!r}")
     created = data["created"]
     if not isinstance(created, datetime):
         created = datetime.fromisoformat(created)
     board = data["board"]
     return CalibrationIndex(
-        id=str(data["id"]),
+        id=calibration_id,
         created=created,
         board=BoardSpec(square_mm=float(board["square_mm"]), rows=int(board["rows"]), cols=int(board["cols"])),
         presets=tuple(
@@ -212,7 +228,7 @@ def load_index(folder: Path) -> CalibrationIndex:
 
 def load_sensor_fit(folder: Path) -> MotorFrameFit:
     folder = Path(folder)
-    _require_index_data(folder)
+    load_index(folder)
     data = _read_yaml(folder / _SENSOR_FIT_FILE)
     return MotorFrameFit(
         cameras={
@@ -261,11 +277,13 @@ def calibration_created(folder: Path) -> datetime:
     """When the calibration in `folder` was made, as a local naive time to the second.
 
     A legacy folder records no date, so its stereo_params.pickle's mtime stands in: the
-    legacy install copies the folder with shutil.copytree, which keeps file times.
+    legacy install copies the folder with shutil.copytree, which keeps file times. A corrupt
+    index raises rather than falling back to a pickle a format-2 folder does not have.
     """
     folder = Path(folder)
-    if is_multires_calibration(folder):
-        return load_index(folder).created
+    index = _parse_index(folder)
+    if index is not None:
+        return index.created
     mtime = (folder / _CAMERA_MATRIX_DIR / _STEREO_FILE).stat().st_mtime
     return datetime.fromtimestamp(mtime).replace(microsecond=0)
 
@@ -353,7 +371,8 @@ def record_override(folder: Path, override: dict) -> None:
     changes nothing. Each file is replaced whole, and the index last.
     """
     folder = Path(folder)
-    index_data = _require_index_data(folder)
+    load_index(folder)  # refuses a folder that is not an intact calibration
+    index_data = _index_data(folder)
     report = QualityReport.from_json((folder / _REPORT_JSON).read_text(encoding="utf-8"))
     report.override = dict(override)
     report_json = report.to_json()
@@ -439,27 +458,54 @@ def _fit_to_plain(fit: MotorFrameFit) -> dict:
 
 
 def _index_data(folder: Path) -> Optional[dict]:
+    """The raw index of `folder`, or None when it has no calibration.yaml or one at another format.
+
+    Raises ValueError when the file is not a YAML mapping, and OSError when it cannot be read.
+    """
     path = folder / INDEX_FILE
     if not path.is_file():
         return None
-    data = _read_yaml(path)
-    if not isinstance(data, dict) or data.get("format") != CALIBRATION_FORMAT:
+    try:
+        data = _read_yaml(path)
+    except yaml.YAMLError as error:
+        raise ValueError(f"{path} is not valid YAML: {error}") from error
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} does not hold a mapping")
+    if data.get("format") != CALIBRATION_FORMAT:
         return None
     return data
 
 
-def _require_index_data(folder: Path) -> dict:
+def _parse_index(folder: Path) -> Optional[CalibrationIndex]:
+    """The index of `folder`, or None when it has no calibration.yaml at format 2.
+
+    Raises ValueError when the index is not valid YAML or a field is missing or garbled.
+    """
     data = _index_data(folder)
     if data is None:
-        raise ValueError(
-            f"{folder} is not a multi-resolution calibration: it has no {INDEX_FILE} at format {CALIBRATION_FORMAT}"
-        )
-    return data
+        return None
+    try:
+        return _index_from_data(data)
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(f"{folder / INDEX_FILE} is corrupt: {type(error).__name__}: {error}") from error
+
+
+def _index_or_none(folder: Path) -> Optional[CalibrationIndex]:
+    """_parse_index, with an unreadable or corrupt index logged and taken as no index.
+
+    For the predicate and the candidate listing: one corrupt backup must not stop every
+    other calibration from being found. It keeps its place in time by its folder name.
+    """
+    try:
+        return _parse_index(folder)
+    except (OSError, ValueError) as error:
+        logger.warning("%s is not treated as a multi-resolution calibration: %s", folder, error)
+        return None
 
 
 def _calibration_id(folder: Path) -> Optional[str]:
-    data = _index_data(folder)
-    return None if data is None else str(data["id"])
+    index = _index_or_none(folder)
+    return None if index is None else index.id
 
 
 def _describe(g: PresetGeometry) -> str:

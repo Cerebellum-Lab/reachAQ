@@ -340,6 +340,54 @@ def test_find_by_id(tmp_path, report):
         find_calibration(tmp_path, uuid.uuid4().hex)
 
 
+def corrupt_yaml(path):
+    # As a file cut short would read: an unclosed flow mapping.
+    path.write_text("format: 2\npresets:\n- {name: 256x256_bin4, binning: 4, wid\n")
+
+
+def drop_id(path):
+    data = yaml.safe_load(path.read_text())
+    del data["id"]
+    path.write_text(yaml.safe_dump(data, sort_keys=False))
+
+
+@pytest.mark.parametrize("corrupt", [corrupt_yaml, drop_id], ids=["invalid-yaml", "no-id"])
+def test_a_corrupt_backup_index_blocks_only_its_own_folder(tmp_path, report, caplog, corrupt):
+    damaged = tmp_path / f"{NAME}_20260303_090815"
+    second = tmp_path / f"{NAME}_20260701_120000"
+    active = tmp_path / NAME
+    write(damaged, report)
+    second_index = write(second, report)
+    active_index = write(active, report)
+    corrupt(damaged / INDEX_FILE)
+
+    with caplog.at_level(logging.WARNING, logger=store.__name__):
+        assert not is_multires_calibration(damaged)
+        # Still placed in time by its folder name; it just has no id.
+        assert resolve_for_time(tmp_path, datetime(2026, 2, 1)) == damaged
+        assert resolve_for_time(tmp_path, datetime(2026, 5, 1)) == second
+        assert resolve_for_time(tmp_path, datetime(2026, 8, 1)) == active
+        assert find_calibration(tmp_path, second_index.id) == second
+        assert find_calibration(tmp_path, active_index.id) == active
+        ids = {c.path.name: c.calibration_id for c in calibration_candidates(tmp_path)}
+    assert ids == {damaged.name: None, second.name: second_index.id, NAME: active_index.id}
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings and all(str(damaged) in w for w in warnings)
+
+    # Everything that would use the calibration still refuses it loudly.
+    loaders = {
+        "load_index": load_index,
+        "load_preset": lambda folder: load_preset(folder, BASE),
+        "load_sensor_fit": load_sensor_fit,
+        "calibration_created": calibration_created,
+        "record_override": lambda folder: record_override(folder, {"confirmed": True}),
+    }
+    for name, load in loaders.items():
+        with pytest.raises(ValueError, match=INDEX_FILE):
+            load(damaged)
+            pytest.fail(f"{name} accepted a corrupt index")
+
+
 def test_record_override_persists(tmp_path, report):
     folder = tmp_path / NAME
     written = write(folder, report)
