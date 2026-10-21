@@ -245,6 +245,40 @@ def test_a_configured_roi_with_no_preset_disables_3d_on_load(
     assert app_model.active_calibration_dir == folder
 
 
+@pytest.mark.parametrize("kind", ["truncated legacy pickle", "missing preset file"])
+def test_a_broken_calibration_never_fails_a_configuration_load(
+        app_model, calib_dir, tmp_path, system_config, trainer_config_dir, kind):
+    if kind == "truncated legacy pickle":
+        folder = _legacy_copy_without_offsets(calib_dir, tmp_path)
+        broken = folder / "camera_matrix" / "stereo_params.pickle"
+    else:
+        # calibration.yaml stays valid and the configured geometry has a preset, so
+        # neither of the failures reload_calib reports itself applies.
+        folder = _write_multires(tmp_path / DEFAULT_3D_CALIB_DIR_NAME)
+        _save_left_camera_params(system_config, trainer_config_dir, **BASE_PARAMS)
+        broken = folder / "presets" / BASE.name / "camera_matrix" / "stereo_params.pickle"
+    app_model.reload_calib(folder)
+    assert app_model._pose_algorithm._live_3d_reason() is None, "3D ran before the damage"
+    if kind == "truncated legacy pickle":
+        broken.write_bytes(broken.read_bytes()[:64])
+    else:
+        broken.unlink()
+
+    with mock.patch.object(app_model, "on_error") as on_error:
+        assert app_model.load_configuration() is True
+    assert app_model._configuration_load_incomplete is False
+    message, = _calibration_errors(on_error)
+    assert str(folder) in message
+    # Off, not left running on the calibration loaded before the damage.
+    algorithm = app_model._pose_algorithm
+    assert algorithm.stereo_params is None and algorithm._live_3d_reason() == "no stereo params"
+    assert app_model.active_calibration_dir == folder
+    assert app_model.active_calibration_index is None
+    # An explicit reload, as DCS and the 3D calibration make, still raises to its caller.
+    with pytest.raises((OSError, EOFError, pickle.UnpicklingError)):
+        app_model.reload_calib(folder)
+
+
 @pytest.mark.parametrize("index_text", ["format: [2\n", "format: 2\nid: abc\n"],
                          ids=["not yaml", "missing fields"])
 def test_an_unreadable_index_disables_3d_instead_of_loading_legacy(app_model, calib_dir, tmp_path, index_text):

@@ -2278,11 +2278,15 @@ class AppModel(ObservableObject):
             with status_file_path.open("w") as fh:
                 print(f"status={status.value!r}", file=fh)
 
-    def reload_calib(self, calib_dir: Optional[Path]):
-        calib_src_dir = (
+    def _calibration_folder(self, calib_dir: Optional[Path]) -> Path:
+        """The folder reload_calib loads: `calib_dir`, else the default in the configuration location."""
+        return (
             Path(self._preferences.configuration_location, DEFAULT_3D_CALIB_DIR_NAME) if calib_dir is None
             else calib_dir
         ).expanduser()
+
+    def reload_calib(self, calib_dir: Optional[Path]):
+        calib_src_dir = self._calibration_folder(calib_dir)
         logger.info("loading calib from %s", calib_src_dir)
         frame_transform = None
         calibration_index = None
@@ -2323,7 +2327,48 @@ class AppModel(ObservableObject):
             logger.warning("calib_src_dir=%r does not exist", calib_src_dir.as_posix())
         self._active_calibration_dir = calib_src_dir if calib_src_dir.exists() else None
         self._active_calibration_index = calibration_index
+        self._install_pose_algorithm(
+            stereo_params=stereo_params,
+            calib_metadata=calib_metadata,
+            cam_names=cam_names,
+            square_size=square_size,
+            cam_offsets=cam_offsets,
+            frame_transform=frame_transform,
+        )
 
+    def _reload_calib_after_configuration_load(self) -> None:
+        """reload_calib for the active folder, which never fails the configuration load.
+
+        reload_calib reports a geometry with no preset and an unreadable index itself.
+        Anything else it raises on, such as a truncated pickle or a missing preset file,
+        turns live 3D off and is reported the same way, and the rest of the configuration
+        stays loaded: the calibration is not part of it. Explicit reloads (DCS, the 3D
+        calibration) still raise to their callers.
+        """
+        folder = self._calibration_folder(self._active_calibration_dir)
+        try:
+            self.reload_calib(folder)
+        except Exception as err:
+            logger.exception("live 3D is off: the 3D calibration in %s could not be loaded", folder)
+            self._active_calibration_dir = folder if folder.exists() else None
+            self._active_calibration_index = None
+            self._install_pose_algorithm()
+            self.on_error("3D calibration", f"could not load {folder}: {type(err).__name__}: {err}")
+
+    def _install_pose_algorithm(
+        self,
+        *,
+        stereo_params=None,
+        calib_metadata=None,
+        cam_names=None,
+        square_size=None,
+        cam_offsets=None,
+        frame_transform=None,
+    ) -> None:
+        """Build the PoseAlgorithm for these calibration inputs and hand it to inference.
+
+        With no stereo parameters, live 3D is off and 2D pose runs as usual.
+        """
         inference = self._inference
         model_location = inference.model_location if inference is not None else None
         pose_algo = PoseAlgorithm(
@@ -9573,8 +9618,9 @@ class AppModel(ObservableObject):
         # format-2 calibration's preset is picked by the left camera's
         # configured geometry, which the startup load could not know. The
         # folder is the one last loaded, which DCS and the 3D calibration set;
-        # with none, the default.
-        self.reload_calib(self._active_calibration_dir)
+        # with none, the default. A calibration that fails to load turns live
+        # 3D off rather than failing this load.
+        self._reload_calib_after_configuration_load()
 
         self.configuration_loaded_event(configuration)
 
