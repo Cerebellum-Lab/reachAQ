@@ -12,6 +12,7 @@ import logging
 import pickle
 import shutil
 from pathlib import Path
+from typing import Optional
 from unittest import mock
 
 import cv2
@@ -88,8 +89,8 @@ def _write_multires(folder: Path, base=BASE, *, binnings=(4, 2, 1), offsets=None
     return folder
 
 
-def _legacy_copy_without_offsets(calib_dir: Path, tmp_path: Path) -> Path:
-    folder = tmp_path / "legacy" / DEFAULT_3D_CALIB_DIR_NAME
+def _legacy_copy_without_offsets(calib_dir: Path, tmp_path: Path, folder: Optional[Path] = None) -> Path:
+    folder = folder or tmp_path / "legacy" / DEFAULT_3D_CALIB_DIR_NAME
     (folder / "camera_matrix").mkdir(parents=True)
     for name in ("camera_matrix/stereo_params.pickle", "calibration_userset.yaml"):
         shutil.copyfile(calib_dir / name, folder / name)
@@ -332,27 +333,45 @@ def test_a_legacy_calibration_loads_as_before(app_model, calib_dir):
 
 
 @pytest.fixture
-def started_on_multires(mock_system, user_pref, system_config, monkeypatch, fake_system_msg_handler):
-    """An AppModel started with no calib_dir, a format-2 calibration in its default folder,
-    and, as at application start, no camera configuration loaded yet."""
-    folder = _write_multires(Path(user_pref.configuration_location) / DEFAULT_3D_CALIB_DIR_NAME)
+def start_app(mock_system, user_pref, system_config, monkeypatch, fake_system_msg_handler, caplog):
+    """Start an AppModel as the application does: no calib_dir, so the default folder, and
+    no camera configuration loaded yet. Returns it with the "3D calibration" errors raised
+    while it was built and that build's log records.
+
+    on_error cannot be patched on an instance that does not exist yet, so the errors are
+    read from the log line AppModel's own first on_error handler writes for each one.
+    """
     monkeypatch.setattr(BehaviorAlgorithm, "_no_handler_thread", True)
-    app = AppModel(
-        user_pref,
-        system_machine=mock_system.system_machine,
-        analysis=mock_system.sensor_analysis,
-        inference_model=mock_system.inference,
-        system_message_handler=fake_system_msg_handler,
-    )
+    apps = []
+
+    def start():
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            app = AppModel(
+                user_pref,
+                system_machine=mock_system.system_machine,
+                analysis=mock_system.sensor_analysis,
+                inference_model=mock_system.inference,
+                system_message_handler=fake_system_msg_handler,
+            )
+        apps.append(app)
+        records = list(caplog.records)
+        errors = [r.getMessage() for r in records
+                  if r.levelno == logging.ERROR and r.getMessage().startswith("3D calibration: ")]
+        return app, errors, records
+
     try:
-        yield app, folder
+        yield start
     finally:
-        unregister_fatal_exception_callback(app._on_fatal_exception)
-        top_fixtures.release_multiprocessing_resources(app)
+        for app in apps:
+            unregister_fatal_exception_callback(app._on_fatal_exception)
+            top_fixtures.release_multiprocessing_resources(app)
 
 
-def test_startup_loads_the_base_preset_from_the_default_folder(started_on_multires):
-    app, folder = started_on_multires
+def test_startup_loads_the_base_preset_from_the_default_folder(start_app, user_pref):
+    folder = _write_multires(Path(user_pref.configuration_location) / DEFAULT_3D_CALIB_DIR_NAME)
+    app, errors, _ = start_app()
+    assert errors == []
     # No camera configuration yet, so the geometry is SpinCam's default capture: the base.
     assert app.left_camera.active_config.params == {}
     algorithm = app._pose_algorithm
@@ -361,6 +380,64 @@ def test_startup_loads_the_base_preset_from_the_default_folder(started_on_multir
     assert algorithm._live_3d_reason() is None
     assert app.active_calibration_dir == folder
     assert app.active_calibration_index == store.load_index(folder)
+
+
+def test_a_corrupt_default_calibration_never_stops_the_app_starting(start_app, user_pref, calib_dir, tmp_path):
+    folder = _legacy_copy_without_offsets(
+        calib_dir, tmp_path, Path(user_pref.configuration_location) / DEFAULT_3D_CALIB_DIR_NAME)
+    pickle_path = folder / "camera_matrix" / "stereo_params.pickle"
+    pickle_path.write_bytes(pickle_path.read_bytes()[:64])
+
+    app, errors, records = start_app()
+    assert errors == [], "construction told the operator; only the configuration load should"
+    assert any(r.exc_info and str(folder) in r.getMessage() for r in records), "no traceback logged"
+    assert app._pose_algorithm.stereo_params is None
+    assert app._pose_algorithm._live_3d_reason() == "no stereo params"
+    # The folder stays active, so the configuration load tries it again and reports it.
+    assert app.active_calibration_dir == folder
+    with mock.patch.object(app, "on_error") as on_error:
+        assert app.load_configuration() is True
+    message, = _calibration_errors(on_error)
+    assert str(folder) in message
+
+
+# A base away from SpinCam's default ROI, so the geometry the constructor sees (the
+# defaults) has no preset in it, as on a rig whose configured ROI is not the default.
+_OFF_DEFAULT_BASE = PresetGeometry(4, 256, 256, 40, 10)
+
+
+def test_a_roi_with_no_preset_is_reported_once_after_the_configuration_loads(
+        start_app, user_pref, system_config, trainer_config_dir):
+    _write_multires(Path(user_pref.configuration_location) / DEFAULT_3D_CALIB_DIR_NAME, _OFF_DEFAULT_BASE)
+    _save_left_camera_params(system_config, trainer_config_dir, hbin=4, vbin=4, width=256,
+                             height=256, offsetx=60, offsety=6)
+    app, errors, records = start_app()
+    assert errors == []
+    # Logged, though: the defaults matched no preset.
+    assert any(r.levelno == logging.WARNING and "(52, 6)" in r.getMessage() for r in records)
+    with mock.patch.object(app, "on_error") as on_error:
+        assert app.load_configuration() is True
+    message, = _calibration_errors(on_error)
+    assert "(60, 6)" in message
+    assert app._pose_algorithm._live_3d_reason() == "no stereo params"
+
+
+def test_a_matching_configuration_is_never_reported(start_app, user_pref, system_config, trainer_config_dir):
+    folder = _write_multires(Path(user_pref.configuration_location) / DEFAULT_3D_CALIB_DIR_NAME,
+                             _OFF_DEFAULT_BASE)
+    _save_left_camera_params(system_config, trainer_config_dir, hbin=4, vbin=4, width=256,
+                             height=256, offsetx=40, offsety=10)
+    app, errors, _ = start_app()
+    # The constructor's defaults match no preset of this calibration, which is not the
+    # operator's problem: the configured ROI does.
+    assert errors == []
+    with mock.patch.object(app, "on_error") as on_error:
+        assert app.load_configuration() is True
+    assert _calibration_errors(on_error) == []
+    algorithm = app._pose_algorithm
+    assert algorithm._live_3d_reason() is None
+    np.testing.assert_array_equal(algorithm.frame_transform,
+                                  store.load_preset(folder, _OFF_DEFAULT_BASE).frame_transform)
 
 
 def test_no_calibration_folder_leaves_3d_off(app_model, tmp_path):

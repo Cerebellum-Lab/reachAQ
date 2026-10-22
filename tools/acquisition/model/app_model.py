@@ -1056,8 +1056,10 @@ class AppModel(ObservableObject):
         self._live_3d_disabled_reason: Optional[str] = None
         # The camera configuration is not loaded yet, so a format-2 calibration's
         # preset is picked from SpinCam's default geometry here, and again from
-        # the configured geometry at the end of every configuration load.
-        self.reload_calib(calib_dir)
+        # the configured geometry at the end of every configuration load. That
+        # load is what reports a problem to the operator; here a problem is only
+        # logged, as it may be the defaults', and never stops the app starting.
+        self._reload_calib_guarded(calib_dir, report=False)
         #
         if inference_model is None:
             inference_model = InferenceModel(
@@ -2296,6 +2298,21 @@ class AppModel(ObservableObject):
         ).expanduser()
 
     def reload_calib(self, calib_dir: Optional[Path]):
+        """Load the 3D calibration in `calib_dir`, else the configuration location's.
+
+        A geometry with no preset and an unreadable index turn live 3D off and are
+        reported through on_error; any other failure raises to the caller.
+        """
+        self._load_calibration(calib_dir, report=True)
+
+    def _calibration_problem(self, message: str, *, report: bool) -> None:
+        """Why live 3D is off: to the operator, or only to the log when not reporting."""
+        if report:
+            self.on_error("3D calibration", message)
+        else:
+            logger.warning("3D calibration, before the camera configuration is loaded: %s", message)
+
+    def _load_calibration(self, calib_dir: Optional[Path], *, report: bool):
         calib_src_dir = self._calibration_folder(calib_dir)
         logger.info("loading calib from %s", calib_src_dir)
         frame_transform = None
@@ -2313,14 +2330,14 @@ class AppModel(ObservableObject):
             cam_names = None
             cam_offsets = None
             disabled_reason = f"{INDEX_FILE} unreadable: {calib_src_dir}"
-            self.on_error("3D calibration", disabled_reason)
+            self._calibration_problem(disabled_reason, report=report)
         elif calib_src_dir.exists() and is_multires_calibration(calib_src_dir):
             calibration_index = load_index(calib_src_dir)
             # The measured frame replaces the camera angles and the square size.
             calib_metadata = None
             square_size = None
             cam_offsets = _load_camera_offsets(calib_src_dir)
-            live_preset, disabled_reason = self._load_live_preset(calib_src_dir)
+            live_preset, disabled_reason = self._load_live_preset(calib_src_dir, report=report)
             if live_preset is None:
                 stereo_params = cam_names = None
             else:
@@ -2358,26 +2375,29 @@ class AppModel(ObservableObject):
             frame_transform=frame_transform,
         )
 
-    def _reload_calib_after_configuration_load(self) -> None:
-        """reload_calib for the active folder, which never fails the configuration load.
+    def _reload_calib_guarded(self, calib_dir: Optional[Path], *, report: bool) -> None:
+        """reload_calib that never raises, for AppModel's construction and configuration loads.
 
-        reload_calib reports a geometry with no preset and an unreadable index itself.
-        Anything else it raises on, such as a truncated pickle or a missing preset file,
-        turns live 3D off and is reported the same way, and the rest of the configuration
-        stays loaded: the calibration is not part of it. Explicit reloads (DCS, the 3D
-        calibration) still raise to their callers.
+        A geometry with no preset and an unreadable index turn live 3D off as in
+        reload_calib. Anything else it would raise on, such as a truncated pickle or a
+        missing preset file, also turns live 3D off, with its traceback logged, and the
+        app starts or the configuration load completes: the calibration is part of
+        neither. With `report`, the reason reaches the operator through on_error;
+        without it, the log only. Explicit reloads (DCS, the 3D calibration) still raise.
         """
-        folder = self._calibration_folder(self._active_calibration_dir)
+        folder = self._calibration_folder(calib_dir)
         try:
-            self.reload_calib(folder)
+            self._load_calibration(folder, report=report)
         except Exception as err:
             logger.exception("live 3D is off: the 3D calibration in %s could not be loaded", folder)
+            # Kept, so the next configuration load tries this folder again.
             self._active_calibration_dir = folder if folder.exists() else None
             self._active_calibration_index = None
             self._active_calibration_preset = None
             self._live_3d_disabled_reason = f"could not load {folder}: {type(err).__name__}: {err}"
             self._install_pose_algorithm()
-            self.on_error("3D calibration", self._live_3d_disabled_reason)
+            if report:
+                self.on_error("3D calibration", self._live_3d_disabled_reason)
 
     def _install_pose_algorithm(
         self,
@@ -2428,7 +2448,9 @@ class AppModel(ObservableObject):
             inference.pose_algorithm = pose_algo
         self._pose_algorithm = pose_algo
 
-    def _load_live_preset(self, calib_dir: Path) -> Tuple[Optional[LoadedPreset], Optional[str]]:
+    def _load_live_preset(
+        self, calib_dir: Path, *, report: bool,
+    ) -> Tuple[Optional[LoadedPreset], Optional[str]]:
         """(the preset the live frames are in, None), or (None, why live 3D is off).
 
         Live frames reach inference pooled to the base capture, so the left camera's
@@ -2441,7 +2463,7 @@ class AppModel(ObservableObject):
         try:
             return load_preset(calib_dir, live_inference_geometry(params)), None
         except (CalibrationGeometryError, ValueError) as err:
-            self.on_error("3D calibration", str(err))
+            self._calibration_problem(str(err), report=report)
             return None, str(err)
 
     @property
@@ -9674,8 +9696,9 @@ class AppModel(ObservableObject):
         # configured geometry, which the startup load could not know. The
         # folder is the one last loaded, which DCS and the 3D calibration set;
         # with none, the default. A calibration that fails to load turns live
-        # 3D off rather than failing this load.
-        self._reload_calib_after_configuration_load()
+        # 3D off rather than failing this load, and this reload, unlike the
+        # constructor's, tells the operator why.
+        self._reload_calib_guarded(self._active_calibration_dir, report=True)
 
         self.configuration_loaded_event(configuration)
 
