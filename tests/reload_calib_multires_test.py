@@ -274,7 +274,9 @@ def test_a_broken_calibration_never_fails_a_configuration_load(
     algorithm = app_model._pose_algorithm
     assert algorithm.stereo_params is None and algorithm._live_3d_reason() == "no stereo params"
     assert app_model.active_calibration_dir == folder
-    assert app_model.active_calibration_index is None
+    # A format-2 index that still reads is kept, so the session metadata names the calibration.
+    assert app_model.active_calibration_index == (
+        None if kind == "truncated legacy pickle" else store.load_index(folder))
     # An explicit reload, as DCS and the 3D calibration make, still raises to its caller.
     with pytest.raises((OSError, EOFError, pickle.UnpicklingError)):
         app_model.reload_calib(folder)

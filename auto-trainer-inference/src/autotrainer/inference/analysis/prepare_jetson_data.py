@@ -560,18 +560,25 @@ def reorient_and_center(
     return res_df_3d
 
 
-def _load_saved_offsets(src_dir: str) -> Tuple[Optional[dict], bool]:
-    """(the camera offsets saved in src_dir or None, whether to save the generated ones there)."""
+def _load_saved_offsets(src_dir: str, *, save_missing: bool = True) -> Tuple[Optional[dict], bool]:
+    """(the camera offsets saved in src_dir or None, whether to save the generated ones there).
+
+    With save_missing False, missing offsets are generated for this run only and never saved.
+    """
     path_offsets = os.path.join(src_dir, DEFAULT_CAM_OFFSET_FILE_NAME)
     if os.path.isfile(path_offsets):
         with open(path_offsets, "rb") as handle:
             cam_offsets = pickle.load(handle)
         save_offsets = False
         logger.info("Reusing offsets file %s: %s", path_offsets, cam_offsets)
-    else:
+    elif save_missing:
         cam_offsets = None
         save_offsets = True
         logger.warning("No camera offset file available, generated one will be saved.")
+    else:
+        cam_offsets = None
+        save_offsets = False
+        logger.warning("No camera offset file in %s; offsets are generated for this run and not saved.", src_dir)
     return cam_offsets, save_offsets
 
 
@@ -603,10 +610,11 @@ def reorient_and_center_measured(
     """reorient_and_center for a format-2 calibration: the preset's measured frame replaces the angles.
 
     A format-2 folder has no calibration_userset.yaml and no board in its name, so neither is
-    read: the frame is already in mm. The camera offsets are read from and saved to src_dir,
-    the calibration folder, exactly as for a legacy one, which is also where live 3D reads them.
+    read: the frame is already in mm. The camera offsets are read from src_dir, the calibration
+    folder, where live 3D reads them too, but never written there: only DCS writes them
+    (ruling R33). Saved offsets from an offline run would otherwise pose as DCS for live 3D.
     """
-    cam_offsets, save_offsets = _load_saved_offsets(src_dir)
+    cam_offsets, save_offsets = _load_saved_offsets(src_dir, save_missing=False)
     res_df_3d = reorient_and_center_step1(
         df_3d=filtered_df_3d,
         src_dir=src_dir,

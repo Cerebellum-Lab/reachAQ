@@ -697,11 +697,15 @@ one, otherwise as the calibration active at the session's start. The start is
 the record start the app sets, else the metadata's `boundary.startWallTime`,
 the schema-1 `sessionBoundary.startWallTime` or `start_record_timestamp`, or
 `createdUtc`, else the session date. When only the date is known, the
-calibration must not have changed that day. A missing id, an ambiguous match,
-or no match refuses with "pass --calib-dir". A session older than every kept
-calibration uses the oldest one, with a warning. A format-2 calibration is read
-at the session's `preset`, or at its base preset (largest binning) when the
-session names none.
+calibration must not have changed that day. An id not found, an ambiguous
+match, or no match refuses with "pass --calib-dir". A session older than every
+kept calibration uses the oldest one, with a warning. A format-2 calibration is
+read at the session's `preset`. Only a session whose metadata has no
+`calibration3d` at all is read at the base preset (largest binning); a session
+whose `calibration3d` names no preset (live 3D was off, or used a legacy
+calibration) is refused with "pass --calib-dir", since the pixels of its 2D
+points are not known to match any preset. Offline 3D never writes
+`camera_offsets.pkl` into a format-2 calibration folder: only DCS does.
 
 The [local API](local-api.md) publishes explicit session and pellet-attempt
 events. ReachAQ's status schema contains no alarm, emergency,

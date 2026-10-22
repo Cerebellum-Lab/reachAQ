@@ -21,13 +21,14 @@ import os
 import pickle
 import sys
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import cv2
 import numpy as np
 import pandas as pd
 import pytest
+import yaml
 
 from autotrainer.core import ProjectInfo
 from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
@@ -234,9 +235,9 @@ def test_without_a_calib_dir_the_session_resolves_under_the_root(tmp_path, monke
 
 @pytest.mark.parametrize("named, expected", [
     ("512x512_bin2", PRESETS[1]),
-    (None, BASE),
+    # Recorded before calibration3d existed: the 2D points are in inference space, the base.
     ("no calibration3d", BASE),
-], ids=["named preset", "live 3D was off", "no calibration3d"])
+], ids=["named preset", "no calibration3d"])
 def test_a_format2_session_loads_its_preset(tmp_path, monkeypatch, named, expected):
     root = tmp_path / "Autotrainer"
     folder = root / NAME
@@ -255,6 +256,32 @@ def test_a_format2_session_loads_its_preset(tmp_path, monkeypatch, named, expect
     reference = store.load_preset(folder, expected)
     np.testing.assert_array_equal(preset.frame_transform, reference.frame_transform)
     np.testing.assert_array_equal(preset.stereo_params.matrix["P1"], reference.stereo_params.matrix["P1"])
+
+
+@pytest.mark.parametrize("live", ["live 3D was off", "legacy live 3D"])
+def test_a_session_whose_calibration3d_names_no_preset_is_refused(tmp_path, monkeypatch, live):
+    root = tmp_path / "Autotrainer"
+    folder = root / NAME
+    index = _write_format2(folder)
+    project = _project(tmp_path)
+    if live == "live 3D was off":
+        # The operator had moved the ROI, so live 3D matched no preset of this calibration.
+        reason = f"the calibration in {folder} has no preset for 256x256_bin4 at ROI offset (60, 6)"
+        calibration3d = dict(id=index.id, created=index.created.isoformat(), preset=None, folder=str(folder),
+                             override=None, live3dDisabledReason=reason)
+    else:
+        # Live 3D ran on a legacy calibration; by time, this format-2 folder is what is left.
+        calibration3d = dict(id=None, created="2026-03-03T09:08:15", preset=None, folder=str(folder),
+                             override=None)
+    _write_metadata(project, _metadata(IN_SECOND_WINDOW, **calibration3d))
+    seen = _capture_process_raw_data(monkeypatch)
+    with pytest.raises(CalibrationResolutionError, match="names no preset") as raised:
+        intersession_process(project, calib_root=root)
+    assert "pass --calib-dir" in str(raised.value)
+    if live == "live 3D was off":
+        assert "(60, 6)" in str(raised.value)
+    # Refused before any 3D: never read at the base preset as a guess.
+    assert seen == {}
 
 
 def test_a_preset_the_calibration_lacks_is_refused(tmp_path, monkeypatch):
@@ -284,6 +311,27 @@ def test_warns_when_the_session_predates_its_calibration(tmp_path, caplog):
         assert resolve_session_calibration(project, root) == root / f"{NAME}_20260303_090815"
     message, = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert "2026-01-05 08:00:00" in message and "2026-01-10 00:00:00" in message
+
+
+def test_an_aware_calibration_date_is_compared_in_local_time(tmp_path, caplog):
+    root = tmp_path / "Autotrainer"
+    folder = root / NAME
+    index = _write_format2(folder)
+    # An index whose created carries a UTC offset, as a hand-edited or future one might.
+    index_path = folder / store.INDEX_FILE
+    data = yaml.safe_load(index_path.read_text())
+    made = datetime(2026, 8, 1, 18, 0, tzinfo=timezone.utc)
+    data["created"] = made.isoformat()
+    index_path.write_text(yaml.safe_dump(data, sort_keys=False))
+    assert store.calibration_created(folder).tzinfo is not None
+    project = _project(tmp_path)
+    # The session (naive local time) began a day before the calibration was made.
+    _write_metadata(project, _metadata((made - timedelta(days=1)).astimezone().replace(tzinfo=None), id=index.id,
+                                       preset=BASE.name))
+    with caplog.at_level(logging.WARNING, logger=intersession_module.__name__):
+        assert resolve_session_calibration(project, root) == folder
+    message, = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert str(made.astimezone().replace(tzinfo=None)) in message
 
 
 def test_the_cli_resolves_unless_given_a_calib_dir(monkeypatch, tmp_path):
@@ -353,10 +401,13 @@ def test_format2_offline_3d_is_the_motor_frame(tmp_path, monkeypatch, g):
     for cam in ("left", "right"):
         (session / f"20260501_rig_session003_{cam}.mp4").touch()
 
-    _, centered = prepare_jetson_data.process_raw_data(
-        _project(tmp_path), session.as_posix(), ".mp4", "_raw2D", folder.as_posix(),
-        (1, SceneElement.Diamond), frame_rate=150, preset=preset,
-    )
+    def run():
+        return prepare_jetson_data.process_raw_data(
+            _project(tmp_path), session.as_posix(), ".mp4", "_raw2D", folder.as_posix(),
+            (1, SceneElement.Diamond), frame_rate=150, preset=preset,
+        )[1]
+
+    centered = run()
 
     # Centred on the Diamond, then the motor frame in mm with the DCS signs: a displacement
     # between two parts is the motor displacement, sign-flipped.
@@ -370,7 +421,13 @@ def test_format2_offline_3d_is_the_motor_frame(tmp_path, monkeypatch, g):
         np.testing.assert_allclose(oriented, np.tile(signs * (x - diamond), (frames, 1)), atol=0.05, err_msg=part)
     # The folder has neither a userset yaml nor a board in its name, and both were not needed.
     assert not (folder / "calibration_userset.yaml").exists()
-    # With no offsets file the generated ones are saved, as for a legacy folder.
-    with (folder / DEFAULT_CAM_OFFSET_FILE_NAME).open("rb") as fh:
-        assert set(pickle.load(fh)) == {"x_off", "y_off", "z_off"}
     assert (session / "20260501_rig_session003_centered3D.h5").is_file()
+    # Only DCS writes a format-2 calibration's offsets (R33): with none there, offline
+    # centres on this session alone and saves nothing, unlike a legacy folder.
+    offsets_path = folder / DEFAULT_CAM_OFFSET_FILE_NAME
+    assert not offsets_path.exists()
+    # Offsets that DCS wrote are read, and left exactly as they were.
+    offsets_path.write_bytes(pickle.dumps({"x_off": 1.0, "y_off": -2.0, "z_off": 140.0}))
+    written = offsets_path.read_bytes()
+    run()
+    assert offsets_path.read_bytes() == written

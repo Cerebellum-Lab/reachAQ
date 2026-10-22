@@ -539,6 +539,18 @@ def _load_camera_offsets(calib_dir: Path) -> Dict[str, Any]:
         return pickle.load(fh)
 
 
+def _readable_index(folder: Path) -> Optional[CalibrationIndex]:
+    """The index of a format-2 calibration in `folder` that failed to load, if it still reads.
+
+    A missing preset file does not make the index unreadable, and the index is what names
+    the calibration in the session metadata. None for a legacy folder or a corrupt index.
+    """
+    try:
+        return load_index(folder) if is_multires_calibration(folder) else None
+    except (OSError, ValueError):
+        return None
+
+
 def _camera_exposure_seconds(cameras) -> Dict[str, Optional[float]]:
     """Each camera's exposure in seconds, for the session recorder's frame anchor.
 
@@ -2392,7 +2404,7 @@ class AppModel(ObservableObject):
             logger.exception("live 3D is off: the 3D calibration in %s could not be loaded", folder)
             # Kept, so the next configuration load tries this folder again.
             self._active_calibration_dir = folder if folder.exists() else None
-            self._active_calibration_index = None
+            self._active_calibration_index = _readable_index(folder)
             self._active_calibration_preset = None
             self._live_3d_disabled_reason = f"could not load {folder}: {type(err).__name__}: {err}"
             self._install_pose_algorithm()

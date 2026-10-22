@@ -136,6 +136,9 @@ def _warn_if_made_after(folder: Path, start: datetime, project: ProjectInfo) -> 
     except (OSError, ValueError) as error:
         logger.warning("cannot tell when the calibration in %s was made: %s", folder, error)
         return
+    if created.tzinfo is not None:
+        # The start is local and naive; compare in the same terms, as resolve_for_time does.
+        created = created.astimezone().replace(tzinfo=None)
     if start < created:
         logger.warning(
             "session %s started at %s, before the calibration in %s was made (%s): the calibration"
@@ -147,15 +150,27 @@ def _warn_if_made_after(folder: Path, start: datetime, project: ProjectInfo) -> 
 def _session_preset(folder: Path, metadata: dict, project: ProjectInfo) -> LoadedPreset:
     """The preset of the format-2 calibration in `folder` that the session's 2D points are in.
 
-    That is the preset its live 3D used, named in its metadata. A session without one (live 3D
-    was off, or no calibration3d) takes the base preset, the largest binning: the 2D pose files
-    are in inference space, which is the base capture's pixels (spec, "Offline 3D input").
+    That is the preset its live 3D used, named in its metadata. A session recorded before
+    calibration3d existed takes the base preset, the largest binning: the 2D pose files are in
+    inference space, which is the base capture's pixels (spec, "Offline 3D input"). A session
+    whose calibration3d names no preset had live 3D off, for example because its camera
+    geometry matched no preset, so the pixels of its 2D points are unknown: it is refused
+    rather than read at a preset that may not be theirs (ruling R32).
     """
     index = load_index(folder)
-    name = _calibration3d(metadata).get("preset")
+    calibration3d = _calibration3d(metadata)
+    name = calibration3d.get("preset")
+    if calibration3d and name is None:
+        reason = calibration3d.get("live3dDisabledReason")
+        why = (f"live 3D was off: {reason}" if reason
+               else "its live 3D did not use a multi-resolution calibration")
+        raise CalibrationResolutionError(
+            f"the calibration3d of session {project.short_id} names no preset ({why}), so no preset"
+            f" of the calibration in {folder} is known to match its 2D points; {_CALIB_DIR_HINT}"
+        )
     if name is None:
         geometry = max(index.presets, key=lambda g: g.binning)
-        logger.info("session %s names no preset; using the base preset %s of %s",
+        logger.info("session %s has no calibration3d; using the base preset %s of %s",
                     project.short_id, geometry.name, folder)
     else:
         matches = [g for g in index.presets if g.name == name]

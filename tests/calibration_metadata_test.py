@@ -143,6 +143,10 @@ def test_metadata_says_why_a_broken_calibration_was_not_used(
     calibration3d = _saved_calibration3d(app_model, tmp_path)
     assert calibration3d["preset"] is None and calibration3d["folder"] == str(folder)
     assert calibration3d["live3dDisabledReason"] == shown
+    # A missing preset file leaves the index readable, so the calibration is still named.
+    index = store.load_index(folder)
+    assert calibration3d["id"] == index.id
+    assert calibration3d["created"] == index.created.isoformat(timespec="seconds")
 
 
 def test_the_app_resolves_each_session_s_own_calibration(
