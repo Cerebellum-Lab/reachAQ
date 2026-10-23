@@ -15,7 +15,6 @@ from pathlib import Path
 from typing import Optional
 from unittest import mock
 
-import cv2
 import numpy as np
 import pytest
 import yaml
@@ -27,18 +26,13 @@ from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
 from autotrainer.core.logging import unregister_fatal_exception_callback
 from autotrainer.inference.analysis.prepare_jetson_data import DEFAULT_CAM_OFFSET_FILE_NAME
 from autotrainer.inference.multires_calibration import store
-from autotrainer.inference.multires_calibration.fit import (
-    INTRINSIC_NAMES,
-    BoardSpec,
-    CameraModel,
-    MotorFrameFit,
-)
+from autotrainer.inference.multires_calibration.fit import BoardSpec
 from autotrainer.inference.multires_calibration.geometry import PresetGeometry, presets_from_base
 from autotrainer.inference.multires_calibration.report import QualityReport
+from multires_calibration_fakes import BASE, FIT
 from tools.acquisition.model.app_model import AppModel
 
 
-BASE = PresetGeometry(4, 256, 256, 52, 6)
 BASE_PARAMS = dict(hbin=4, vbin=4, width=256, height=256, offsetx=52, offsety=6)
 PARTS = ['Pellet', 'RH_flat', 'RH_spread', 'RH_grab', 'LH_flat', 'LH_spread', 'LH_grab',
          'Star', 'Tongue_mid', 'Tongue_tip', 'Nose', 'Triangle', 'Mouth', 'Diamond']
@@ -47,41 +41,9 @@ _REPORT = QualityReport(created="2026-10-20T12:00:00-06:00", verdict="pass", met
                         thresholds={}, notes=[])
 
 
-def _fit() -> MotorFrameFit:
-    """A plausible motor-frame fit in 1440x1080 sensor px: two cameras 40 degrees apart,
-    150 mm from the motor origin and looking at it."""
-    cameras = {}
-    for cam, side in (("left", -1.0), ("right", 1.0)):
-        a = np.radians(20.0)
-        eye = 150.0 * np.array([side * np.sin(a), 0.0, -np.cos(a)])
-        z = -eye / np.linalg.norm(eye)
-        x = np.cross([0.0, 1.0, 0.0], z)
-        x /= np.linalg.norm(x)
-        R = np.stack([x, np.cross(z, x), z])  # rows are the camera axes in the motor frame
-        cameras[cam] = CameraModel(
-            K=np.array([[2300.0, 0.0, 719.5], [0.0, 2300.0, 539.5], [0.0, 0.0, 1.0]]),
-            dist=np.zeros(5),
-            rvec=cv2.Rodrigues(R)[0].ravel(),
-            tvec=-R @ eye,
-        )
-    return MotorFrameFit(
-        cameras=cameras,
-        board_rvec=np.zeros(3),
-        board_tvec=np.zeros(3),
-        motor_scale=1.0,
-        image_size=(1440, 1080),
-        rms_px={cam: 0.1 for cam in cameras},
-        per_view_rms_px={cam: {0: 0.1} for cam in cameras},
-        param_std={cam: {name: 0.0 for name in INTRINSIC_NAMES} for cam in cameras},
-    )
-
-
-_FIT = _fit()
-
-
 def _write_multires(folder: Path, base=BASE, *, binnings=(4, 2, 1), offsets=None) -> Path:
     folder.parent.mkdir(parents=True, exist_ok=True)
-    store.write_calibration(folder, fit=_FIT, presets=presets_from_base(base, binnings),
+    store.write_calibration(folder, fit=FIT, presets=presets_from_base(base, binnings),
                             board=BoardSpec(), report=_REPORT, capture={})
     if offsets is not None:
         with (folder / DEFAULT_CAM_OFFSET_FILE_NAME).open("wb") as fh:

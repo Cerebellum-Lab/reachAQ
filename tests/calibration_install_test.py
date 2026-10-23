@@ -26,7 +26,7 @@ from autotrainer.inference.multires_calibration import store
 from autotrainer.inference.multires_calibration.fit import BoardSpec
 from autotrainer.inference.multires_calibration.geometry import presets_from_base
 from autotrainer.inference.multires_calibration.report import QualityReport
-from reload_calib_multires_test import BASE, _FIT
+from multires_calibration_fakes import BASE, FIT
 from tools.acquisition.model.calibration_install import decide_install, install_calibration, override_record
 from tools.acquisition.model.dcs_state import DcsState
 from tools.acquisition.view import main_window as main_window_module
@@ -164,7 +164,7 @@ def _produced(session: Path, verdict: str):
     capture_dir.mkdir(parents=True)
     report = QualityReport(created="2026-10-23T09:00:00-06:00", verdict=verdict, metrics=[], thresholds={}, notes=[])
     index = store.write_calibration(
-        session / f"{DEFAULT_3D_CALIB_DIR_NAME}.new", fit=_FIT, presets=presets_from_base(BASE),
+        session / f"{DEFAULT_3D_CALIB_DIR_NAME}.new", fit=FIT, presets=presets_from_base(BASE),
         board=BoardSpec(), report=report, capture={},
     )
     return capture_dir, index, report
