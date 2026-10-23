@@ -700,9 +700,14 @@ class MainWindow(QMainWindow):
                                 f"Calibration is being used immediately by now.",
                                 QMessageBox.StandardButton.Ok,
                                 )
-        # The calibration this was measured in: a later 3D calibration has another id,
-        # which makes this DCS stale. A legacy calibration has no id to record.
+        # The calibration this was measured in, and its folder: the offsets are written
+        # beside it and that folder is reloaded, so the DCS fits it at once. A later 3D
+        # calibration has another id, which makes this DCS stale; a legacy calibration has
+        # no id to record. Without an active folder, the default one, as before.
         calibration_index = app_model.active_calibration_index
+        calib_dir = app_model.active_calibration_dir
+        if calib_dir is None:
+            calib_dir = Path(self._preferences.configuration_location).joinpath(DEFAULT_3D_CALIB_DIR_NAME)
         new_cfg = DiamondTriangleOffsetConfig(
             used_position=avg_pos,
             measured_offset=avg_offset,
@@ -724,7 +729,6 @@ class MainWindow(QMainWindow):
             y_off=cam_off.y,
             z_off=cam_off.z,
         )
-        calib_dir = Path(self._preferences.configuration_location).joinpath(DEFAULT_3D_CALIB_DIR_NAME)
         cam_offsets_path = calib_dir.joinpath(DEFAULT_CAM_OFFSET_FILE_NAME)
         if cam_offsets_path.exists():
             now = datetime.now()

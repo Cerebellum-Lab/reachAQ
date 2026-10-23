@@ -528,10 +528,12 @@ def _load_camera_offsets(calib_dir: Path) -> Dict[str, Any]:
 
     DCS calibration (Calibrate Coordinate System) writes camera_offsets.pkl later, from
     the raw diamond position it measures with this calibration, so a freshly made
-    calibration has none yet. Zero offsets keep live 3D running meanwhile. The DCS
-    configuration was measured against another calibration then (its calibration_id is
-    not this one's), so refresh_dcs_state finds it STALE: the DCS consumers get no
-    configuration, and Record is blocked, until DCS is redone, which writes this file.
+    calibration has none yet. Zero offsets keep live 3D running meanwhile. For a format-2
+    calibration, the DCS configuration was then measured against another calibration
+    (its calibration_id is not this one's), so refresh_dcs_state finds it STALE: the DCS
+    consumers get no configuration, and Record is blocked, until DCS is redone, which
+    writes this file. A legacy calibration has no id to compare, so a legacy folder
+    without the file only gives zero offsets, and a valid DCS stays VALID.
     """
     path_offsets = calib_dir.joinpath(DEFAULT_CAM_OFFSET_FILE_NAME)
     if not path_offsets.is_file():
@@ -2325,8 +2327,15 @@ class AppModel(ObservableObject):
         """
         try:
             self._load_calibration(calib_dir, report=True)
-        finally:
-            self.refresh_dcs_state()
+        except BaseException:
+            # The load may have changed the active calibration before it failed. A
+            # recompute that fails too is only logged: the caller gets the load's error.
+            try:
+                self.refresh_dcs_state()
+            except Exception:
+                logger.exception("could not recompute the DCS state after the failed load of %s", calib_dir)
+            raise
+        self.refresh_dcs_state()
 
     def _calibration_problem(self, message: str, *, report: bool) -> None:
         """Why live 3D is off: to the operator, or only to the log when not reporting."""
@@ -11274,6 +11283,12 @@ class AppModel(ObservableObject):
             # Protocol actions temporarily move the motors without redefining
             # the animal's manually configured base position.
             if self._attached_plan is not None or self._protocol_positioning_active:
+                return
+            if animal.is_pellet_dcs and self._dcs_state is DcsState.STALE:
+                # A stale DCS is held off (None), which would rewrite the saved DCS
+                # position as a motor one below; it is kept for when DCS is redone.
+                logger.warning("Not saving %s's pellet position from a motor move: the coordinate "
+                               "system is out of date until DCS is redone", animal.name)
                 return
             coord = name[-1]
             coord_idx = "xyz".index(coord)

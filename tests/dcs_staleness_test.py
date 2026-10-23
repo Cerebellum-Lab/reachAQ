@@ -8,7 +8,8 @@ operator is told once. Redoing DCS against the active calibration makes it valid
 A legacy calibration has no id, so any valid DCS fits it, as before.
 """
 
-import inspect
+import pickle
+import uuid
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,9 +22,17 @@ from PySide6.QtWidgets import QMessageBox
 from autotrainer.core import AnimalSubject, Offset3DTuple
 from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
 from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
+from autotrainer.inference.analysis.prepare_jetson_data import DEFAULT_CAM_OFFSET_FILE_NAME
+from autotrainer.inference.multires_calibration import store
 from autotrainer.inference.multires_calibration.fit import BoardSpec
 from autotrainer.inference.multires_calibration.store import CalibrationIndex
-from reload_calib_multires_test import BASE, BASE_PARAMS, _save_left_camera_params, _write_multires
+from reload_calib_multires_test import (
+    BASE,
+    BASE_PARAMS,
+    _legacy_copy_without_offsets,
+    _save_left_camera_params,
+    _write_multires,
+)
 from tools.acquisition.model.app_model import AppModel
 from tools.acquisition.model.dcs_state import DcsState, dcs_state
 from tools.acquisition.view import main_window as main_window_module
@@ -196,26 +205,22 @@ def test_redoing_dcs_clears_stale(app_model, stale, dcs_path):
     assert _titled(on_error, "Coordinate system") == []
 
 
-def test_the_dcs_calibration_records_the_active_calibration_and_clears_stale(
-        app_model, stale, dcs_path, user_pref, monkeypatch):
-    folder, _ = stale
-    index = app_model.active_calibration_index
+def _run_dcs_calibration(app_model, user_pref, monkeypatch, dcs_path, raw_diamond) -> None:
+    """Complete a DCS calibration run through MainWindow's handler, as Calibrate Coordinate System does."""
     shown = []
     # The handler's message box, without a display.
     monkeypatch.setattr(main_window_module, "QMessageBox", SimpleNamespace(
         information=lambda *args, **kwargs: shown.append(args[1:3]),
         StandardButton=QMessageBox.StandardButton,
     ))
-    events = []
     window = SimpleNamespace(
         _app_model=app_model,
         _preferences=user_pref,
         _timer_calibrate_diamond_triangle=mock.Mock(),
-        _post_api_event=lambda kind, *args: events.append(kind),
+        _post_api_event=lambda kind, *args: None,
     )
-    raw_diamond = Offset3DTuple(3.0, -19.0, 0.5)
     # Saved to a new file: the overwrite confirmation and file dialog are not what this tests.
-    dcs_path.unlink()
+    dcs_path.unlink(missing_ok=True)
     MainWindow._handle_diamond_triangle_calib_run(
         window,
         positions=[Offset3DTuple(7.0, 4.5, 6.5)] * 10,
@@ -224,6 +229,14 @@ def test_the_dcs_calibration_records_the_active_calibration_and_clears_stale(
         raw_diamond_3d=[raw_diamond] * 10,
     )
     assert len(shown) == 1, "the run completed and saved"
+
+
+def test_the_dcs_calibration_records_the_active_calibration_and_clears_stale(
+        app_model, stale, dcs_path, user_pref, monkeypatch):
+    folder, _ = stale
+    index = app_model.active_calibration_index
+    raw_diamond = Offset3DTuple(3.0, -19.0, 0.5)
+    _run_dcs_calibration(app_model, user_pref, monkeypatch, dcs_path, raw_diamond)
 
     written = yaml.safe_load(dcs_path.read_text())
     assert written["calibration_id"] == index.id
@@ -234,11 +247,132 @@ def test_the_dcs_calibration_records_the_active_calibration_and_clears_stale(
     assert cfg is not None and cfg.calibration_id == index.id and cfg.raw_diamond_coord == raw_diamond
 
 
-def test_capture_start_recomputes_the_state_after_reloading_dcs():
-    # capture_start re-reads the DCS file and then sends the animal's positions; the state
-    # must follow that reload before the positions use it. Checked in the source, since
-    # capture_start needs cameras and hardware to run.
-    source = inspect.getsource(AppModel.capture_start)
-    reload_at = source.index("algo.reload_diamond_triangle_config()")
-    refresh_at = source.index("self.refresh_dcs_state()", reload_at)
-    assert refresh_at < source.index("self._set_animal_base_positions(animal)", reload_at)
+def test_the_dcs_calibration_writes_into_the_active_calibration_folder(
+        app_model, dcs_path, user_pref, system_config, trainer_config_dir, tmp_path, monkeypatch):
+    # The active calibration is not the default folder (the app was given another one).
+    folder = _write_multires(tmp_path / "elsewhere" / DEFAULT_3D_CALIB_DIR_NAME)
+    _save_left_camera_params(system_config, trainer_config_dir, **BASE_PARAMS)
+    _config().to_file(dcs_path)
+    assert app_model.load_configuration() is True
+    with mock.patch.object(app_model, "on_error"):
+        app_model.reload_calib(folder)
+    assert app_model.dcs_state is DcsState.STALE
+    raw_diamond = Offset3DTuple(3.0, -19.0, 0.5)
+    _run_dcs_calibration(app_model, user_pref, monkeypatch, dcs_path, raw_diamond)
+
+    with (folder / DEFAULT_CAM_OFFSET_FILE_NAME).open("rb") as fh:
+        offsets = pickle.load(fh)
+    assert (offsets["x_off"], offsets["y_off"], offsets["z_off"]) == tuple(raw_diamond)
+    assert not (Path(user_pref.configuration_location) / DEFAULT_3D_CALIB_DIR_NAME).exists()
+    assert app_model.active_calibration_dir == folder
+    assert yaml.safe_load(dcs_path.read_text())["calibration_id"] == store.load_index(folder).id
+    assert app_model.dcs_state is DcsState.VALID
+
+
+def test_the_dcs_calibration_against_a_legacy_folder_records_no_id(
+        app_model, dcs_path, user_pref, calib_dir, tmp_path, monkeypatch):
+    # A copy: the run writes camera_offsets.pkl into the active folder, never the repo's fixture.
+    folder = _legacy_copy_without_offsets(calib_dir, tmp_path)
+    app_model.reload_calib(folder)
+    raw_diamond = Offset3DTuple(3.0, -19.0, 0.5)
+    _run_dcs_calibration(app_model, user_pref, monkeypatch, dcs_path, raw_diamond)
+
+    assert (folder / DEFAULT_CAM_OFFSET_FILE_NAME).is_file()
+    assert "calibration_id" not in yaml.safe_load(dcs_path.read_text())
+    assert app_model.active_calibration_dir == folder
+    assert app_model.dcs_state is DcsState.VALID
+
+
+def _manual_move(app_model, monkeypatch, xyz) -> None:
+    """Set the motors as the Hardware Control panel's Set does, with the device accepting each command."""
+    hardware = app_model.hardware
+    monkeypatch.setattr(hardware, "_send_with_token", lambda *args, **kwargs: uuid.uuid4())
+    hardware.set_x(xyz[0])
+    hardware.set_y(xyz[1])
+    hardware.set_z(xyz[2])
+
+
+def test_a_manual_move_while_stale_keeps_the_animals_dcs_position(app_model, stale, user_pref, monkeypatch):
+    animal = AnimalSubject(name="m1", pellet_x=1.0, pellet_y=2.0, pellet_z=3.0, is_pellet_dcs=True)
+    with mock.patch.object(app_model, "on_error"):
+        app_model.selected_animal = animal
+    saved = Path(user_pref.animal_location) / f"{animal.id}.json"
+    before = saved.read_bytes() if saved.exists() else None
+
+    _manual_move(app_model, monkeypatch, (10.0, 20.0, 30.0))
+
+    assert app_model.hardware.last_set_position == Offset3DTuple(10.0, 20.0, 30.0)
+    assert (animal.pellet_x, animal.pellet_y, animal.pellet_z, animal.is_pellet_dcs) == (1.0, 2.0, 3.0, True)
+    assert (saved.read_bytes() if saved.exists() else None) == before
+
+
+def test_a_manual_move_while_valid_still_updates_the_animal(
+        app_model, dcs_path, system_config, trainer_config_dir, monkeypatch):
+    _config().to_file(dcs_path)
+    assert app_model.load_configuration() is True
+    assert app_model.dcs_state is DcsState.VALID
+    animal = AnimalSubject(name="m1", pellet_x=1.0, pellet_y=2.0, pellet_z=3.0, is_pellet_dcs=True)
+    app_model.selected_animal = animal
+
+    _manual_move(app_model, monkeypatch, (10.0, 20.0, 30.0))
+
+    # The move that completes the position updates its own axis, converted into DCS.
+    expected = _config().motor_to_diamond(Offset3DTuple(10.0, 20.0, 30.0))
+    assert animal.is_pellet_dcs
+    assert animal.pellet_z == pytest.approx(expected.z)
+
+
+def test_a_failing_recompute_never_hides_the_calibration_load_error(app_model, monkeypatch):
+    def broken_load(calib_dir, *, report):
+        raise ValueError("the load failed")
+
+    def broken_refresh():
+        raise RuntimeError("the recompute failed")
+
+    monkeypatch.setattr(app_model, "_load_calibration", broken_load)
+    monkeypatch.setattr(app_model, "refresh_dcs_state", broken_refresh)
+    with pytest.raises(ValueError, match="the load failed"):
+        app_model.reload_calib(None)
+
+
+def test_a_failing_recompute_after_a_good_load_still_raises(app_model, monkeypatch):
+    # Nothing to hide then, and a DCS state that did not follow the load must not pass silently.
+    def broken_refresh():
+        raise RuntimeError("the recompute failed")
+
+    monkeypatch.setattr(app_model, "_load_calibration", lambda calib_dir, *, report: None)
+    monkeypatch.setattr(app_model, "refresh_dcs_state", broken_refresh)
+    with pytest.raises(RuntimeError, match="the recompute failed"):
+        app_model.reload_calib(None)
+
+
+def test_capture_start_holds_a_dcs_file_gone_stale_before_positioning_the_animal(
+        app_model, dcs_path, user_pref, system_config, trainer_config_dir, monkeypatch):
+    # The DCS file changed on disk after the configuration load (an older copy restored):
+    # Run re-reads it, and must hold it off before it positions the selected animal.
+    folder = _write_multires(Path(user_pref.configuration_location) / DEFAULT_3D_CALIB_DIR_NAME)
+    _save_left_camera_params(system_config, trainer_config_dir, **BASE_PARAMS)
+    app_model.reload_calib(folder)
+    _config(calibration_id=app_model.active_calibration_index.id).to_file(dcs_path)
+    assert app_model.load_configuration() is True
+    assert app_model.dcs_state is DcsState.VALID
+    animal = AnimalSubject(name="m1", pellet_x=1.0, pellet_y=2.0, pellet_z=3.0, is_pellet_dcs=True)
+    app_model.selected_animal = animal
+    _config().to_file(dcs_path)
+    seen = []
+    positions = AppModel._set_animal_base_positions
+
+    def spy(self, subject):
+        seen.append(self.behavior.algorithm.diamond_triangle_config)
+        return positions(self, subject)
+
+    monkeypatch.setattr(AppModel, "_set_animal_base_positions", spy)
+    try:
+        with mock.patch.object(app_model, "on_error") as on_error:
+            assert app_model.capture_start() is True
+    finally:
+        app_model.capture_stop()
+    assert seen == [None]
+    assert app_model.dcs_state is DcsState.STALE
+    assert _titled(on_error, "Coordinate system") == [STALE_NOTICE]
+    assert (animal.pellet_x, animal.pellet_y, animal.pellet_z, animal.is_pellet_dcs) == (1.0, 2.0, 3.0, True)
