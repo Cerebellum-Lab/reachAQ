@@ -258,30 +258,46 @@ def test_a_format2_session_loads_its_preset(tmp_path, monkeypatch, named, expect
     np.testing.assert_array_equal(preset.stereo_params.matrix["P1"], reference.stereo_params.matrix["P1"])
 
 
-@pytest.mark.parametrize("live", ["live 3D was off", "legacy live 3D"])
-def test_a_session_whose_calibration3d_names_no_preset_is_refused(tmp_path, monkeypatch, live):
+def test_a_session_recorded_with_live_3d_off_is_refused(tmp_path, monkeypatch):
     root = tmp_path / "Autotrainer"
     folder = root / NAME
     index = _write_format2(folder)
     project = _project(tmp_path)
-    if live == "live 3D was off":
-        # The operator had moved the ROI, so live 3D matched no preset of this calibration.
-        reason = f"the calibration in {folder} has no preset for 256x256_bin4 at ROI offset (60, 6)"
-        calibration3d = dict(id=index.id, created=index.created.isoformat(), preset=None, folder=str(folder),
-                             override=None, live3dDisabledReason=reason)
-    else:
-        # Live 3D ran on a legacy calibration; by time, this format-2 folder is what is left.
-        calibration3d = dict(id=None, created="2026-03-03T09:08:15", preset=None, folder=str(folder),
-                             override=None)
-    _write_metadata(project, _metadata(IN_SECOND_WINDOW, **calibration3d))
+    # The operator had moved the ROI, so live 3D matched no preset of this calibration.
+    reason = f"the calibration in {folder} has no preset for 256x256_bin4 at ROI offset (60, 6)"
+    _write_metadata(project, _metadata(IN_SECOND_WINDOW, id=index.id, created=index.created.isoformat(),
+                                       preset=None, folder=str(folder), override=None,
+                                       live3dDisabledReason=reason))
     seen = _capture_process_raw_data(monkeypatch)
-    with pytest.raises(CalibrationResolutionError, match="names no preset") as raised:
+    with pytest.raises(CalibrationResolutionError, match="live 3D off") as raised:
         intersession_process(project, calib_root=root)
-    assert "pass --calib-dir" in str(raised.value)
-    if live == "live 3D was off":
-        assert "(60, 6)" in str(raised.value)
+    assert "pass --calib-dir" in str(raised.value) and "(60, 6)" in str(raised.value)
     # Refused before any 3D: never read at the base preset as a guess.
     assert seen == {}
+
+
+@pytest.mark.parametrize("route", ["explicit calib-dir", "legacy backup deleted"])
+def test_a_legacy_live_session_reaching_format2_uses_the_base_preset(tmp_path, monkeypatch, caplog, route):
+    root = tmp_path / "Autotrainer"
+    folder = root / NAME
+    _write_format2(folder)
+    project = _project(tmp_path)
+    # Live 3D ran on a legacy calibration: no id, no preset, and it was not off.
+    _write_metadata(project, _metadata(IN_SECOND_WINDOW, id=None, created="2026-03-03T09:08:15", preset=None,
+                                       folder=str(root / f"{NAME}_old"), override=None))
+    seen = _capture_process_raw_data(monkeypatch)
+    with caplog.at_level(logging.WARNING, logger=intersession_module.__name__), pytest.raises(_Stop):
+        if route == "explicit calib-dir":
+            intersession_process(project, calib_dir=folder)
+        else:
+            # The legacy backup is gone, so by time the session lands on this format-2 folder.
+            intersession_process(project, calib_root=root)
+    assert seen["calib_src_dir"] == folder.as_posix()
+    assert seen["preset"].geometry == BASE
+    np.testing.assert_array_equal(seen["preset"].frame_transform, store.load_preset(folder, BASE).frame_transform)
+    legacy_warnings = [r.getMessage() for r in caplog.records
+                       if r.levelno == logging.WARNING and "legacy calibration" in r.getMessage()]
+    assert len(legacy_warnings) == 1 and str(folder) in legacy_warnings[0]
 
 
 def test_a_preset_the_calibration_lacks_is_refused(tmp_path, monkeypatch):

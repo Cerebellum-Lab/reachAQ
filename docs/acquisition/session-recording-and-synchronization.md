@@ -700,11 +700,14 @@ the schema-1 `sessionBoundary.startWallTime` or `start_record_timestamp`, or
 calibration must not have changed that day. An id not found, an ambiguous
 match, or no match refuses with "pass --calib-dir". A session older than every
 kept calibration uses the oldest one, with a warning. A format-2 calibration is
-read at the session's `preset`. Only a session whose metadata has no
-`calibration3d` at all is read at the base preset (largest binning); a session
-whose `calibration3d` names no preset (live 3D was off, or used a legacy
-calibration) is refused with "pass --calib-dir", since the pixels of its 2D
-points are not known to match any preset. Offline 3D never writes
+read at the session's `preset`. A session whose `calibration3d` has a
+`live3dDisabledReason` (live 3D was off) is refused with "pass --calib-dir",
+since the pixels of its 2D points are not known to match any preset. A session
+with no `calibration3d` at all, or whose live 3D ran on a legacy calibration
+(`id` and `preset` null, no `live3dDisabledReason`), is read at the base preset
+(largest binning); the legacy case logs a warning naming the folder, since it
+reaches a format-2 folder only through `--calib-dir` or a deleted legacy
+backup. Offline 3D never writes
 `camera_offsets.pkl` into a format-2 calibration folder: only DCS does.
 
 The [local API](local-api.md) publishes explicit session and pellet-attempt
