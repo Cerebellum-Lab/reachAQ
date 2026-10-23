@@ -8,6 +8,9 @@ import threading
 import time
 import math
 import traceback
+import dataclasses
+import getpass
+import html
 from datetime import datetime
 from functools import partial
 from itertools import chain
@@ -35,6 +38,8 @@ from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
 from autotrainer.inference import InferenceStatus, PoseResponse
 from autotrainer.inference.analysis import IntersessionResponse
 from autotrainer.inference.analysis.prepare_jetson_data import DEFAULT_CAM_OFFSET_FILE_NAME, make_cam_offsets_dict
+from autotrainer.inference.multires_calibration.report import QualityReport
+from autotrainer.inference.multires_calibration.store import CalibrationIndex, record_override
 
 from autotrainer.behavior import SystemState
 from autotrainer.behavior.behavior_algorithm import BehaviorAlgoStatus, BehaviorAlgoProps
@@ -49,6 +54,8 @@ from autotrainer.pyside.xyz_label import XYZQLabel
 from tools.autotrainer_version import __version__ as app_version
 from tools.acquisition.model.app_model import AppModel
 from tools.acquisition.model.app_model_status import AppModelStatus, SessionRecordingStatus
+from tools.acquisition.model.calibration_install import decide_install, install_calibration, override_record
+from tools.acquisition.model.dcs_state import DcsState
 from tools.acquisition.model.handle_3d_calibration import make_3d_calib
 from tools.acquisition.model.nidaq_discovery import discover_nidaq_devices
 from tools.acquisition.model.rfid_resolution import RfidResolutionKind
@@ -102,6 +109,11 @@ def _allow_bidirectional_window_resizing(window: QMainWindow) -> None:
     window.setMinimumSize(_MINIMUM_RESIZABLE_WINDOW_SIZE)
     window.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
     window.layout().setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
+
+
+def _preformatted(text: str) -> str:
+    """`text` as rich text in a fixed-width font, so a message box keeps its columns."""
+    return f"<pre>{html.escape(text)}</pre>"
 
 
 class MainWindow(QMainWindow):
@@ -862,11 +874,11 @@ class MainWindow(QMainWindow):
         app_model = self._app_model
         prev_status, app_model.status = app_model.status, AppModelStatus.CALIBRATION_3D
         error = "Processing unfinished"
-        result_dir: Path = None
+        result: Optional[Tuple[Path, CalibrationIndex, QualityReport]] = None
         def handle_3d_calib():
-            nonlocal error, result_dir
+            nonlocal error, result
             try:
-                result_dir = make_3d_calib(self._app_model)
+                result = make_3d_calib(self._app_model)
             except Exception as err:
                 logger.exception("3d-calib failed: %s", err)
                 error = err
@@ -880,39 +892,7 @@ class MainWindow(QMainWindow):
             self.make_3d_calib_action.setEnabled(True)
             app_model.status = prev_status
             logger.verbose("3d-calib thread joined, error=%s", error)
-            if error is not None:
-                self._post_api_event(ApiEventKind.calibration3dFailed, dict(reason=str(error)))
-                return
-            self._post_api_event(ApiEventKind.calibration3dCompleted)
-            backup_path = None
-            target_calib_dir = Path(self._preferences.configuration_location).joinpath(DEFAULT_3D_CALIB_DIR_NAME)
-            if target_calib_dir.exists():
-                rsp = QMessageBox.question(
-                    self,
-                    "3D calibration success",
-                    f"Calibration dir already exists ({target_calib_dir}),\n\n"
-                    f"do you want to replace ?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-                if rsp != QMessageBox.StandardButton.Yes:
-                    return
-                now = datetime.now()
-                backup_path = target_calib_dir.parent.joinpath(f"{target_calib_dir.name}_{now.strftime(DATE_TIME_FORMAT)}")
-                target_calib_dir.rename(backup_path)
-                logger.debug("Previous 3d-calib moved to %s", backup_path)
-            shutil.copytree(
-                result_dir, target_calib_dir,
-                dirs_exist_ok=False,  # default already, but to be sure we want be clean
-            )
-            if backup_path is not None:
-                prev_cam_offsets = backup_path.joinpath(DEFAULT_CAM_OFFSET_FILE_NAME)
-                new_cam_offsets = target_calib_dir.joinpath(DEFAULT_CAM_OFFSET_FILE_NAME)
-                if prev_cam_offsets.exists() and not new_cam_offsets.exists():
-                    shutil.copyfile(prev_cam_offsets, target_calib_dir)
-                    logger.verbose("copied previous %s given no new one", DEFAULT_CAM_OFFSET_FILE_NAME)
-            self._app_model.reload_calib(target_calib_dir)
-            QMessageBox.information(
-                self,
-                "3D calibration success", f"Result saved into {target_calib_dir}", QMessageBox.StandardButton.Ok)
+            self._finish_3d_calib(error, result)
 
         def wait_3d_calib_done(thread):
             thread.join()
@@ -924,6 +904,75 @@ class MainWindow(QMainWindow):
         waiter_thread = threading.Thread(target=wait_3d_calib_done, name="wait-3d-calibration",
                                          args=(executor_thread,), daemon=True)
         waiter_thread.start()
+
+    def _finish_3d_calib(self, error, result) -> None:
+        """Install the calibration make_3d_calib produced, as its quality report allows, or show why it failed.
+
+        One API event per calibration: calibration3dFailed with the reason when the
+        calibration or its install raised, else calibration3dCompleted, also when the
+        operator kept a failed calibration out.
+        """
+        if error is None:
+            try:
+                self._install_3d_calib(*result)
+            except Exception as err:
+                logger.exception("3d-calib install failed: %s", err)
+                error = err
+        if error is not None:
+            reason = str(error)
+            self._post_api_event(ApiEventKind.calibration3dFailed, dict(reason=reason))
+            QMessageBox.critical(self, "3D calibration failed", reason or type(error).__name__)
+            return
+        self._post_api_event(ApiEventKind.calibration3dCompleted)
+
+    def _install_3d_calib(self, capture_dir: Path, index: CalibrationIndex, report: QualityReport) -> None:
+        """Install the new calibration on a pass or warn report, or on a fail the operator overrides."""
+        # make_3d_calib writes the calibration beside its capture, in the session folder.
+        new_dir = Path(capture_dir).parent / f"{DEFAULT_3D_CALIB_DIR_NAME}.new"
+        install, override = decide_install(report.verdict, lambda: self._ask_install_failed_3d_calib(report))
+        if not install:
+            logger.notice("kept the previous 3D calibration: %s (%s) failed its quality checks", new_dir, index.id)
+            return
+        if override:
+            record = override_record(getpass.getuser(), datetime.now())
+            # Before the install, so the installed copy carries the record.
+            record_override(new_dir, record)
+            report = dataclasses.replace(report, override=record)
+            logger.warning("installing 3D calibration %s despite its failed quality checks: %s", index.id, record)
+        installed, _ = install_calibration(new_dir, Path(self._preferences.configuration_location), now=datetime.now())
+        self._app_model.reload_calib(installed)
+        self._show_msg_box("3D calibration installed", _preformatted(report.to_text()), QMessageBox.Icon.Information)
+        # A DCS measured against the previous calibration is held off and blocks Record until
+        # it is redone. With no DCS at all, the existing missing-DCS warning applies instead.
+        if self._app_model.dcs_state is DcsState.STALE:
+            self._show_msg_box(
+                "Coordinate system out of date",
+                "Redo Tools → Calibrate Coordinate System before running sessions.",
+                QMessageBox.Icon.Warning)
+
+    def _ask_install_failed_3d_calib(self, report: QualityReport) -> bool:
+        """Whether to install a calibration whose quality report failed.
+
+        Keep previous is the default; Install anyway… asks a second time.
+        """
+        box = QMessageBox(self)
+        box.setWindowTitle("3D calibration failed its quality checks")
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setText(_preformatted(report.to_text()))
+        keep = box.addButton("Keep previous", QMessageBox.ButtonRole.RejectRole)
+        install = box.addButton("Install anyway…", QMessageBox.ButtonRole.AcceptRole)
+        box.setDefaultButton(keep)
+        box.setEscapeButton(keep)
+        box.exec()
+        if box.clickedButton() != install:
+            return False
+        rsp = QMessageBox.question(
+            self,
+            "3D calibration override",
+            "Install a calibration that failed its quality checks?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        return rsp == QMessageBox.StandardButton.Yes
 
     @invoke_method
     def _show_msg_box(self, title, text, icon):
