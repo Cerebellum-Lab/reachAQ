@@ -137,7 +137,7 @@ def test_the_daq_monitor_is_offered_only_while_idle():
             _stop_capture_thread=None,
             _hardware_refresh_thread=None,
             _nidaq_discovery_thread=None,
-            has_fully_valid_dcs=False,
+            has_loaded_valid_dcs=False,
             _app_model=SimpleNamespace(
                 status=status,
                 session_recording_status=recording,

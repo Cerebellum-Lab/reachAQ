@@ -174,6 +174,7 @@ INTERTRIAL_ANALYSIS_BLOCK_NAME = "intertrial_analysis"
 # The name a training plan's between-trials pause holds the pellet send under.
 TRAINING_PAUSE_BLOCK_NAME = "training_plan_pause"
 from tools.acquisition.model.coordinate_model import CoordinateModel
+from tools.acquisition.model.dcs_state import STALE_NOTICE, STALE_RECORDING_BLOCKER, DcsState, dcs_state
 from tools.autotrainer_version import __version__ as app_version
 from tools.acquisition.model.helpers import first_line, get_config_location
 from tools.acquisition.model.hardware_model import HardwareModel
@@ -527,8 +528,10 @@ def _load_camera_offsets(calib_dir: Path) -> Dict[str, Any]:
 
     DCS calibration (Calibrate Coordinate System) writes camera_offsets.pkl later, from
     the raw diamond position it measures with this calibration, so a freshly made
-    calibration has none yet. Zero offsets keep live 3D running meanwhile, and the
-    stale-DCS gate holds the DCS consumers off until DCS is redone.
+    calibration has none yet. Zero offsets keep live 3D running meanwhile. The DCS
+    configuration was measured against another calibration then (its calibration_id is
+    not this one's), so refresh_dcs_state finds it STALE: the DCS consumers get no
+    configuration, and Record is blocked, until DCS is redone, which writes this file.
     """
     path_offsets = calib_dir.joinpath(DEFAULT_CAM_OFFSET_FILE_NAME)
     if not path_offsets.is_file():
@@ -1066,6 +1069,10 @@ class AppModel(ObservableObject):
         # why live 3D is off when it is, as the operator was told.
         self._active_calibration_preset: Optional[PresetGeometry] = None
         self._live_3d_disabled_reason: Optional[str] = None
+        # No DCS configuration is loaded before the first configuration load, which
+        # recomputes this (refresh_dcs_state), as every later calibration or DCS load does.
+        self._dcs_state = DcsState.MISSING
+        self._dcs_state_lock = threading.RLock()
         # The camera configuration is not loaded yet, so a format-2 calibration's
         # preset is picked from SpinCam's default geometry here, and again from
         # the configured geometry at the end of every configuration load. That
@@ -2313,9 +2320,13 @@ class AppModel(ObservableObject):
         """Load the 3D calibration in `calib_dir`, else the configuration location's.
 
         A geometry with no preset and an unreadable index turn live 3D off and are
-        reported through on_error; any other failure raises to the caller.
+        reported through on_error; any other failure raises to the caller. Either way
+        dcs_state then follows the calibration now active.
         """
-        self._load_calibration(calib_dir, report=True)
+        try:
+            self._load_calibration(calib_dir, report=True)
+        finally:
+            self.refresh_dcs_state()
 
     def _calibration_problem(self, message: str, *, report: bool) -> None:
         """Why live 3D is off: to the operator, or only to the log when not reporting."""
@@ -2487,6 +2498,33 @@ class AppModel(ObservableObject):
     def active_calibration_index(self) -> Optional[CalibrationIndex]:
         """The index of that folder; None for a legacy calibration or when there is none."""
         return self._active_calibration_index
+
+    @property
+    def dcs_state(self) -> DcsState:
+        """Whether the loaded DCS configuration fits the active 3D calibration (refresh_dcs_state)."""
+        return self._dcs_state
+
+    def refresh_dcs_state(self) -> DcsState:
+        """Recompute dcs_state from the loaded DCS configuration and the active 3D calibration.
+
+        Runs after every calibration load and every DCS (re)load, the only things that
+        change it. A STALE configuration is held off every DCS consumer (they see None,
+        as with no DCS) and blocks Record, until DCS is redone; the 3D-calibration
+        capture still reads it as loaded. The operator is told once, as it becomes
+        STALE, and the Record button whenever the state changes.
+        """
+        with self._dcs_state_lock:
+            algo = self._behavior.algorithm
+            state = dcs_state(algo.loaded_diamond_triangle_config, self._active_calibration_index)
+            prev, self._dcs_state = self._dcs_state, state
+            algo.set_dcs_suppressed(state is DcsState.STALE)
+            if state is prev:
+                return state
+            logger.info("coordinate system (DCS) %s -> %s", prev.value, state.value)
+            if state is DcsState.STALE:
+                self.on_error("Coordinate system", STALE_NOTICE)
+            self.property_changed(self.Props.RECORDING_BLOCKERS, self.recording_blockers, None)
+            return state
 
     def _calibration3d_metadata(self) -> Dict[str, Any]:
         """hardware.configured.calibration3d: the 3D calibration live 3D used, or why it used none.
@@ -3278,6 +3316,10 @@ class AppModel(ObservableObject):
                 "Live intertrial analysis requires live inference; enable live "
                 "inference or disable live intertrial analysis"
             )
+        if self._dcs_state is DcsState.STALE:
+            # Its consumers are held off, and some (protocol positions) would use
+            # DCS values as motor values instead; no session runs until DCS is redone.
+            blockers.append(STALE_RECORDING_BLOCKER)
         if self._protocol_runner.protocol_complete:
             blockers.append("Selected protocol is complete")
         if self._selected_protocol_requires_stim_camera():
@@ -4772,7 +4814,9 @@ class AppModel(ObservableObject):
             logger.debug("animal pellet=%s is_dcs=%s",
                          (animal.pellet_x, animal.pellet_y, animal.pellet_z), animal.is_pellet_dcs)
             diamond_cfg = algo.diamond_triangle_config
-            if diamond_cfg is None or not diamond_cfg.fully_valid:
+            # A stale DCS is held off (None) but not gone: the position is kept for when
+            # DCS is redone, and _set_animal_base_positions does not send it meanwhile.
+            if self._dcs_state is not DcsState.STALE and (diamond_cfg is None or not diamond_cfg.fully_valid):
                 self.on_error("Notice", "Animal Send Pos reset to 0 due to not fully valid diamond-triangle config")
                 animal.is_pellet_dcs = False
                 animal.pellet_x = animal.pellet_y = animal.pellet_z = 0
@@ -9028,6 +9072,8 @@ class AppModel(ObservableObject):
         project_info = self.project = self.make_project_info()
 
         algo.reload_diamond_triangle_config()
+        # Before anything below uses it: a stale file stays held off.
+        self.refresh_dcs_state()
 
         self._behavior.on_prepare_capture()  # might be better at the end...
 
@@ -9623,6 +9669,9 @@ class AppModel(ObservableObject):
             configuration.nidaq_stream = nidaq_acquisition
             self.nidaq_signal_monitor.load_configuration(nidaq_acquisition)
         self.behavior.load_configuration(configuration.behavior)
+        # That re-read the DCS file. Against the calibration still active, before the
+        # animals below are loaded and positioned: a stale file stays held off.
+        self.refresh_dcs_state()
 
         self._analysis.watchdog_monitor.config = configuration.watchdog
 
@@ -9711,6 +9760,7 @@ class AppModel(ObservableObject):
         # 3D off rather than failing this load, and this reload, unlike the
         # constructor's, tells the operator why.
         self._reload_calib_guarded(self._active_calibration_dir, report=True)
+        self.refresh_dcs_state()
 
         self.configuration_loaded_event(configuration)
 
@@ -10253,6 +10303,11 @@ class AppModel(ObservableObject):
                        xyz.humanize(n_digits=1), animal.is_pellet_dcs)
         algo = self._behavior.algorithm
         diamond_cfg = algo.diamond_triangle_config
+        if diamond_cfg is None and animal.is_pellet_dcs and self._dcs_state is DcsState.STALE:
+            # Kept, not zeroed: it means the same place again once DCS is redone.
+            logger.warning("Not sending %s's pellet position: it is in the coordinate system, "
+                           "which is out of date until DCS is redone", animal.name)
+            return
         if diamond_cfg is None and animal.is_pellet_dcs:
             logger.warning("loaded animal with pellet DCS, but no diamond-triangle config, forcing to 0")
             animal.is_pellet_dcs = False
@@ -11187,6 +11242,8 @@ class AppModel(ObservableObject):
         animal = self._selected_animal
         #
         if name == props.DIAMOND_TRIANGLE_CONFIG:
+            # The configuration its consumers use: None while a stale one is held off
+            # (refresh_dcs_state), so moves given in DCS refuse meanwhile.
             self._hardware.set_diamond_triangle_config(value)
 
         elif name == props.PELLET_SHIFT_Y_LIMIT:

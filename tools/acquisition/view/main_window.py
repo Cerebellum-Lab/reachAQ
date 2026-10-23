@@ -270,7 +270,15 @@ class MainWindow(QMainWindow):
 
     @property
     def has_fully_valid_dcs(self) -> bool:
+        """A valid DCS configuration its consumers can use: not while a stale one is held off."""
         cfg = self._app_model.behavior.algorithm.diamond_triangle_config
+        return cfg is not None and cfg.fully_valid
+
+    @property
+    def has_loaded_valid_dcs(self) -> bool:
+        """A valid DCS configuration is loaded, stale or not: what Calibrate Coordinate System
+        needs, so that a stale one can always be redone."""
+        cfg = self._app_model.behavior.algorithm.loaded_diamond_triangle_config
         return cfg is not None and cfg.fully_valid
 
     def _add_box_to_open_dialogs(self, item: Union[QMessageBox, QDialog]):
@@ -332,7 +340,8 @@ class MainWindow(QMainWindow):
             capture_transition=capture_transition,
             hardware_refreshing=self._hardware_refresh_thread is not None,
             nidaq_discovering=self._nidaq_discovery_thread is not None,
-            has_valid_dcs=self.has_fully_valid_dcs,
+            # It gates only Calibrate Coordinate System, which must stay offered while stale.
+            has_valid_dcs=self.has_loaded_valid_dcs,
             laser_calibrating=self._app_model.laser_calibration_active,
         )
         self._app_model_status_combo.setEnabled(state.system_mode)
@@ -691,6 +700,9 @@ class MainWindow(QMainWindow):
                                 f"Calibration is being used immediately by now.",
                                 QMessageBox.StandardButton.Ok,
                                 )
+        # The calibration this was measured in: a later 3D calibration has another id,
+        # which makes this DCS stale. A legacy calibration has no id to record.
+        calibration_index = app_model.active_calibration_index
         new_cfg = DiamondTriangleOffsetConfig(
             used_position=avg_pos,
             measured_offset=avg_offset,
@@ -700,6 +712,7 @@ class MainWindow(QMainWindow):
             # so this allows to not have to calibrate twice.
             raw_diamond_coord=avg_rawdia_loc3,
             version=DiamondTriangleOffsetConfig.current_config_version,
+            calibration_id=None if calibration_index is None else calibration_index.id,
         )
         logger.success("Saving new config %s to %s", new_cfg, save_path.as_posix())
         new_cfg.to_file(save_path)
@@ -725,6 +738,9 @@ class MainWindow(QMainWindow):
         app_model.reload_calib(calib_dir)
         algo = app_model.behavior.algorithm
         algo.diamond_triangle_config = new_cfg
+        # Measured against the active calibration, so a stale DCS is valid again and its
+        # consumers get it back, before the animal's position is converted below.
+        app_model.refresh_dcs_state()
         animal = app_model.selected_animal
         # to ensure animal will get its x/y/z in DCS
         app_model.selected_animal = None
@@ -1950,7 +1966,8 @@ class MainWindow(QMainWindow):
         elif name == props.STATUS:
             logger.debug("got new app model status: %s", value)
 
-            valid_dcs = self.has_fully_valid_dcs
+            # For Calibrate Coordinate System only, which redoes a stale DCS.
+            valid_dcs = self.has_loaded_valid_dcs
 
             self.blockSignals(True)
 

@@ -61,6 +61,9 @@ def calculate_ui_availability(
         subject=session_identity,
         protocol_selection=session_identity,
         notes=True,
+        # Calibrate Coordinate System. has_valid_dcs is whether a fully valid DCS
+        # configuration is loaded, stale or not: this action is how a DCS made stale
+        # by a new 3D calibration is redone, so staleness must not disable it.
         calibration=(
             session_ready
             and stable_mode
