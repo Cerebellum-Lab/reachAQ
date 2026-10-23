@@ -1,7 +1,7 @@
-import collections
+import math
 import time
 import dataclasses
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Mapping, Sequence, Tuple
 from pathlib import Path
 
 from autotrainer.core import Offset3DTuple, get_verbose_logger, ProjectInterval
@@ -9,8 +9,20 @@ from autotrainer.inference import calibration_FLIR
 from autotrainer.pyside.content_widget import InvokeMethod
 from autotrainer.video import VideoRecordMode
 from autotrainer.core.capture import CaptureProcessStatus
+from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
+from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
+from autotrainer.inference.multires_calibration.geometry import PresetGeometry, presets_from_base
+from autotrainer.inference.multires_calibration.pipeline import (
+    WAYPOINT_LOG,
+    WaypointLog,
+    calibrate_capture,
+    write_waypoint_log,
+)
+from autotrainer.inference.multires_calibration.report import QualityReport
+from autotrainer.inference.multires_calibration.store import CalibrationIndex
 
 from tools.acquisition.model.app_model import AppModel
+from tools.acquisition.model.calibration_geometry import live_inference_geometry
 from tools.acquisition.model.video_capture_model import VideoCaptureModel
 
 logger = get_verbose_logger(__name__)
@@ -89,37 +101,191 @@ default_params = dict(
     # primary=cam is left,
     offsetx=0,
     offsety=0,
-    # gain=1,
-    # gamma: 0.7
+    # 1 dB, and the camera's gamma off. The URL carries gamma=None, which SpinCam reads as
+    # None (ast.literal_eval) and so disables gamma; left out, SpinCam's default 0.7 applies.
+    gain=1.0,
+    gamma=None,
 )
 
+AXES = "xyz"
 
-def process_capture(src_dir):
-    # Can be set to false while refining other variables
-    calibrate = True
-    # Of no consequence??
-    alpha = 1
-    # Threshold for qutomatic corner-finding quality assessment, between 0 and 1
-    quality = 0.925
-    # Gamma correction can improve chessboard corner finding
-    gamma = 2
-    # Number of frames to extract
-    num_frames = None
-    # Prepare for out-of-plane camera correction
-    camera_pos = {
-        'camLele': 12.5,
-        'camRele': 30,
-        'camLazi': -55,
-        'camRazi': -5,
+
+def capture_settings_of(params: Mapping[str, Any]) -> Dict[str, Any]:
+    """The capture settings the waypoint log records, from the camera params the capture sets."""
+    return {
+        "gain_db": params.get("gain"),
+        "gamma": params.get("gamma"),
+        "exposure_us": params.get("exposure"),
+        "fps": params.get("fps"),
     }
-    calibration_FLIR.create_corner_matrix(
-        src_dir,
-        num_frames=num_frames,
-        gamma=gamma,
-        camera_pos=camera_pos,
-        alpha=alpha,
-        quality=quality,
-        calibrate=calibrate,
+
+
+def _dcs_axis_to_motor(dcs: DiamondTriangleOffsetConfig, axis: str, value: float) -> float:
+    # Exactly as the moves were converted before waypoints (and as set_dcs_x/y/z in
+    # hardware_model.py convert): the DCS value on its own axis, zero on the other two, and
+    # that axis of the result. diamond_to_motor is per axis, a translation and the fixed
+    # flips (1, -1, -1), so the zeros never reach the axis read back.
+    i = AXES.index(axis)
+    dcs_xyz = [0, 0, 0]
+    dcs_xyz[i] = value
+    return float(dcs.diamond_to_motor(Offset3DTuple(*dcs_xyz))[i])
+
+
+def plan_waypoints(
+    start: Sequence[Tuple[str, float]],
+    moves: Sequence[Tuple[str, float]],
+    dcs: DiamondTriangleOffsetConfig,
+) -> List[Tuple[str, float, Tuple[float, float, float]]]:
+    """(axis, DCS value, commanded motor xyz after the move) for the start and each move.
+
+    Waypoint 0 is the start position, which the start's moves, one per axis, reach
+    together; its (axis, DCS value) is the last of them. Each move then changes one axis of
+    the waypoint before, so every motor xyz is the whole position the stage is commanded
+    to, in motor units (mm). Raises ValueError when the start does not set every axis.
+    """
+    if {axis for axis, _ in start} != set(AXES):
+        raise ValueError(f"the start {tuple(start)} must set every axis of {AXES}")
+    motor = [math.nan] * 3
+    for axis, value in start:
+        motor[AXES.index(axis)] = _dcs_axis_to_motor(dcs, axis, value)
+    last_axis, last_value = start[-1]
+    plan = [(last_axis, float(last_value), tuple(motor))]
+    for axis, value in moves:
+        motor[AXES.index(axis)] = _dcs_axis_to_motor(dcs, axis, value)
+        plan.append((axis, float(value), tuple(motor)))
+    return plan
+
+
+def _reported_position(hard) -> Optional[Tuple[float, float, float]]:
+    # NaN until the motor has reported the axis (after connect), so a partial report is none.
+    position = hard.last_position
+    if position is None or not all(math.isfinite(v) for v in position):
+        return None
+    return tuple(float(v) for v in position)
+
+
+def wait_until_arrived(
+    hard,
+    target_xyz: Sequence[float],
+    *,
+    tolerance: float = 0.05,
+    timeout: float = 2.0,
+    poll: float = 0.01,
+    sleep=time.sleep,
+    now=time.monotonic,
+) -> Tuple[bool, Optional[Tuple[float, float, float]]]:
+    """Poll hard.last_position until every axis is within `tolerance` of `target_xyz`.
+
+    Returns (arrived, the last reported position). The position is None while the motor
+    has reported none on some axis, which is never arrived. After `timeout` seconds without
+    arriving it returns False.
+    """
+    t_start = now()
+    while True:
+        reported = _reported_position(hard)
+        if reported is not None and all(abs(r - t) <= tolerance for r, t in zip(reported, target_xyz)):
+            return True, reported
+        if now() - t_start >= timeout:
+            return False, reported
+        sleep(poll)
+
+
+def _command(hard, axis: str, motor_value: float) -> None:
+    move = {"x": hard.move_x, "y": hard.move_y, "z": hard.move_z}[axis]
+    token = move(motor_value)
+    if token is None:
+        raise RuntimeError(f"the move of {axis} to {motor_value} was not queued")
+    hard.wait_pending_command_acked(token)
+
+
+def run_waypoints(
+    hard,
+    plan: Sequence[Tuple[str, float, Tuple[float, float, float]]],
+    *,
+    settle: float = 0.25,
+    dwell: float = 0.5,
+    sleep=time.sleep,
+    now=time.time,
+    tolerance: float = 0.05,
+    arrival_timeout: float = 2.0,
+    capture_settings: Optional[Mapping[str, Any]] = None,
+) -> WaypointLog:
+    """Visit each waypoint of `plan` (plan_waypoints) in turn and log it.
+
+    At each waypoint: command the move and wait for its ack, settle, check the motor's
+    reported position (wait_until_arrived), then dwell, so the video holds the board still
+    there long enough for calibrate_capture to find it. Waypoint 0 commands every axis of
+    the start. A waypoint the motor does not confirm is logged unverified and the capture
+    goes on; the calibration report counts them.
+
+    `now` stamps arrive and leave (time.time(), as WaypointLog.times records) and also
+    times the arrival wait, so one test clock drives both. `capture_settings` are those of
+    default_params unless given.
+    """
+    if capture_settings is None:
+        capture_settings = capture_settings_of(default_params)
+    log = WaypointLog(motor=[], reported=[], verified=[], dcs_moves=[], times=[],
+                      capture_settings=dict(capture_settings))
+    for i, (axis, value, motor) in enumerate(plan):
+        for move_axis in (AXES if i == 0 else (axis,)):
+            _command(hard, move_axis, motor[AXES.index(move_axis)])
+        sleep(settle)
+        arrived, reported = wait_until_arrived(
+            hard, motor, tolerance=tolerance, timeout=arrival_timeout, sleep=sleep, now=now)
+        arrive = now()
+        if not arrived:
+            logger.warning("waypoint %d: the motor reported %s, not within %s of the commanded %s",
+                           i, reported, tolerance, motor)
+        sleep(dwell)
+        leave = now()
+        log.motor.append(tuple(motor))
+        log.reported.append(reported)
+        log.verified.append(arrived)
+        log.dcs_moves.append((axis, value))
+        log.times.append((arrive, leave))
+    return log
+
+
+def wait_cams_capture_status(cameras, capture_status: CaptureProcessStatus, timeout: float = 3):
+    """Wait until every camera reports `capture_status`, all within `timeout` seconds.
+
+    Raises RuntimeError naming the first camera that did not.
+    """
+    p_timeout = time.perf_counter() + timeout
+    for cam in cameras:
+        if not cam.wait_for_capture_status(capture_status, timeout=p_timeout - time.perf_counter()):
+            raise RuntimeError(f"{cam.name}: no {capture_status.name} within {timeout} s")
+        logger.info("%s: got %s", cam.name, capture_status)
+
+
+def capture_presets(live_params: Mapping[str, Any]) -> List[PresetGeometry]:
+    """Every preset the capture calibrates: the presets covering the live camera geometry.
+
+    `live_params` are the left camera's configured params, read before the capture replaces
+    them with its own bin-1 full-frame params, which are no base for the binned presets.
+    """
+    return presets_from_base(live_inference_geometry(live_params))
+
+
+def calibrate_waypoint_capture(
+    capture_dir: Path,
+    log: WaypointLog,
+    *,
+    session_dir: Path,
+    presets: Sequence[PresetGeometry],
+    previous_dir: Optional[Path],
+) -> Tuple[CalibrationIndex, QualityReport]:
+    """Write `log` as the capture's waypoints.yaml beside its source_videos, then calibrate
+    every preset into <session_dir>/<DEFAULT_3D_CALIB_DIR_NAME>.new.
+
+    calibrate_capture's errors reach the caller.
+    """
+    write_waypoint_log(Path(capture_dir, WAYPOINT_LOG), log)
+    return calibrate_capture(
+        Path(capture_dir),
+        output_dir=Path(session_dir, f"{DEFAULT_3D_CALIB_DIR_NAME}.new"),
+        presets=presets,
+        previous_dir=previous_dir,
     )
 
 
@@ -127,11 +293,27 @@ def make_3d_calib(
     app_model: AppModel,
     cam_params: Optional[Dict[str, Any]] = None,
     record_mode: VideoRecordMode = VideoRecordMode.START_CONTINUOUS,
-) -> Path:
+) -> Tuple[Path, CalibrationIndex, QualityReport]:
+    """Capture the board paused at every waypoint, then calibrate every preset from it.
+
+    Returns (the capture folder, the new calibration's index, its quality report). The
+    calibration is written to <session>/<DEFAULT_3D_CALIB_DIR_NAME>.new; installing it is
+    left to the caller.
+    """
     if cam_params is None:
         cam_params = default_params
+    # The DCS as loaded: a new 3D calibration leaves it STALE, held off its consumers until
+    # DCS is redone, and the next 3D calibration must still be possible then. The waypoints
+    # only need to keep the board in view; the fit uses the commanded motor positions,
+    # whichever DCS placed them.
+    diamond_triangle_cfg = app_model.behavior.algorithm.loaded_diamond_triangle_config
+    if diamond_triangle_cfg is None or not diamond_triangle_cfg.fully_valid:
+        raise RuntimeError(f"Please first calibrate diamond-triangle by starting the acquisition")
+    plan = plan_waypoints(start, moves, diamond_triangle_cfg)
     left = app_model.left_camera
     right = app_model.right_camera
+    # Read before prepare() replaces the camera configurations with the capture's own.
+    presets = capture_presets(left.active_config.params)
     cameras: List[VideoCaptureModel] = []
     # put primary first:
     for camera in (left, right):
@@ -141,21 +323,6 @@ def make_3d_calib(
             cameras.append(camera)
     cams_before_cfg = tuple(camera.save_configuration() for camera in cameras)
     hard = app_model.hardware
-    diamond_triangle_cfg = app_model.behavior.algorithm.diamond_triangle_config
-    if diamond_triangle_cfg is None:
-        raise RuntimeError(f"Please first calibrate diamond-triangle by starting the acquisition")
-    d_to_m = diamond_triangle_cfg.diamond_to_motor
-    def m_x(v):
-        return hard.move_x(d_to_m(Offset3DTuple(v, 0, 0)).x)
-    def m_y(v):
-        return hard.move_y(d_to_m(Offset3DTuple(0, v, 0)).y)
-    def m_z(v):
-        return hard.move_z(d_to_m(Offset3DTuple(0, 0, v)).z)
-    coord2m = {
-        x: m_x,
-        y: m_y,
-        z: m_z,
-    }
     #
     project = app_model.make_project_info()
     project.calculate_next_session_index()
@@ -171,13 +338,6 @@ def make_3d_calib(
     src_dir = Path(
         calibration_FLIR.make_new_calibration(square_size, row_ct, col_ct, oversample, sess_path.location))
 
-    def wait_cams_capture_status(capture_status: CaptureProcessStatus, timeout: float = 3):
-        p_before = time.perf_counter()
-        p_timeout = p_before + timeout
-        for cam in cameras:
-            cam.wait_for_capture_status(capture_status, timeout=p_timeout - time.perf_counter())
-            logger.info("%s: got %s", cam.name, capture_status)
-
     def prepare():
         logger.notice("Preparing ..")
         #
@@ -186,11 +346,11 @@ def make_3d_calib(
         token = hard.send_home()
         hard.wait_pending_command_acked(token)
         #
+        # Waypoint 0 is reached before recording starts, so the video opens on it rather
+        # than on the move from home, which would add a stationary segment no waypoint has.
         logger.verbose("Setting start position")
-        key = None
-        for coord, value in start:
-            key = coord2m[coord](value)
-        hard.wait_pending_command_acked(key)
+        for axis, motor_value in zip(AXES, plan[0][2]):
+            _command(hard, axis, motor_value)
         #
         for cam, cfg in zip(cameras, cams_before_cfg):
             params = cam_params.copy()
@@ -222,7 +382,7 @@ def make_3d_calib(
                 if not cam.on_prepare_capture():
                     raise RuntimeError(f"{cam.name}.on_prepare_capture() failed")
 
-        wait_cams_capture_status(CaptureProcessStatus.RUNNING, timeout=5)
+        wait_cams_capture_status(cameras, CaptureProcessStatus.RUNNING, timeout=5)
 
         for cam in cameras:
             if not cam.is_primary:
@@ -239,43 +399,32 @@ def make_3d_calib(
                 cam.on_trigger_recording(True)
 
         logger.notice("Waiting RECORDING on cams")
-        wait_cams_capture_status(CaptureProcessStatus.RECORDING, 5)
+        wait_cams_capture_status(cameras, CaptureProcessStatus.RECORDING, 5)
 
-    def run():
+    def run() -> WaypointLog:
         logger.notice("Running 3d calib ..")
+        logger.info("Now executing calib moves, pausing at each waypoint ..")
 
-        max_requests = 1
-        cur_requests = collections.deque(maxlen=max_requests)
-        #
-        time.sleep(0.05)
-        logger.info("Now executing calib moves ..")
+        waypoint_log = run_waypoints(hard, plan, capture_settings=capture_settings_of(cam_params))
 
-        for coord, value in moves:
-            if len(cur_requests) >= max_requests:
-                hard.wait_pending_command_acked(cur_requests.popleft())
-            logger.verbose("coord-%s -> %s", coord, value)
-            key = coord2m[coord](value)
-            cur_requests.append(key)
-
-        while len(cur_requests) > 0:
-            hard.wait_pending_command_acked(cur_requests.popleft())
-
-        logger.success("executed %s moves", len(moves))
+        logger.success("executed %s moves; the motor confirmed %d of %d waypoints",
+                       len(moves), sum(waypoint_log.verified), len(waypoint_log.verified))
 
         if record_mode == VideoRecordMode.TRIGGER:
             logger.info("Requesting cameras stop recording")
             for cam in reversed(cameras):
                 cam.on_trigger_recording(False)
-            wait_cams_capture_status(CaptureProcessStatus.RUNNING, 15)
+            wait_cams_capture_status(cameras, CaptureProcessStatus.RUNNING, 15)
+        return waypoint_log
 
+    failed = None
+    log = None
     try:
         prepare()
-        run()
+        log = run()
     except Exception as err:
         logger.exception("Could not prepare and run 3d calib: %s", err)
         failed = err
-    else:
-        failed = None
     finally:
         for camera in reversed(cameras):
             logger.info("%s: notify end cam", camera.name)
@@ -284,7 +433,14 @@ def make_3d_calib(
             logger.info("%s: stopping cam", camera.name)
             camera.on_capture_stop()
         hard.disconnect()
-        wait_cams_capture_status(CaptureProcessStatus.TERMINATED, 5)
+        try:
+            wait_cams_capture_status(cameras, CaptureProcessStatus.TERMINATED, 5)
+        except RuntimeError as err:
+            # The configurations are restored all the same, but videos that may still be
+            # being written are not calibrated from.
+            logger.error("Cameras did not stop: %s", err)
+            if failed is None:
+                failed = err
         logger.verbose("Resetting cams to previous config")
         for camera, cam_cfg in zip(cameras, cams_before_cfg):
             camera.load_configuration(cam_cfg)
@@ -302,18 +458,15 @@ def make_3d_calib(
         logger.verbose("%s -> %s", vp.as_posix(), target.as_posix())
         vp.rename(target)
 
-    logger.notice("Processing capture in %s", src_dir)
-    process_capture(src_dir.as_posix())
+    logger.notice("Calibrating every preset from the capture in %s", src_dir)
+    index, report = calibrate_waypoint_capture(
+        src_dir,
+        log,
+        session_dir=Path(sess_path.location),
+        presets=presets,
+        previous_dir=app_model.active_calibration_dir,
+    )
 
-    # strip the session prefix from any path in the resulting processed directory:
-    prefixed_str = f"{sess_path.prefix}_"
-    renamed = 0
-    for path in src_dir.rglob("*"):
-        if path.name.startswith(prefixed_str):
-            path.rename(path.parent.joinpath(path.name[len(prefixed_str):]))
-            renamed += 1
-    logger.debug("renamed %s files from session and 3d processing", renamed)
+    logger.success("Successfully calibrated the capture: %s, verdict %s", index.id, report.verdict)
 
-    logger.success("Successfully processed capture")
-
-    return src_dir
+    return src_dir, index, report
