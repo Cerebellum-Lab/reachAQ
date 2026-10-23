@@ -276,31 +276,35 @@ def calibrate_waypoint_capture(
     session_dir: Path,
     presets: Sequence[PresetGeometry],
     previous_dir: Optional[Path],
-) -> Tuple[CalibrationIndex, QualityReport]:
+) -> Tuple[Path, CalibrationIndex, QualityReport]:
     """Write `log` as the capture's waypoints.yaml beside its source_videos, then calibrate
     every preset into <session_dir>/<DEFAULT_3D_CALIB_DIR_NAME>.new.
 
+    Returns (that folder, the calibration's index, its quality report). The folder is
+    named here only, and its installer takes it from the return value.
     calibrate_capture's errors reach the caller.
     """
     write_waypoint_log(Path(capture_dir, WAYPOINT_LOG), log)
-    return calibrate_capture(
+    output_dir = Path(session_dir, f"{DEFAULT_3D_CALIB_DIR_NAME}.new")
+    index, report = calibrate_capture(
         Path(capture_dir),
-        output_dir=Path(session_dir, f"{DEFAULT_3D_CALIB_DIR_NAME}.new"),
+        output_dir=output_dir,
         presets=presets,
         previous_dir=previous_dir,
     )
+    return output_dir, index, report
 
 
 def make_3d_calib(
     app_model: AppModel,
     cam_params: Optional[Dict[str, Any]] = None,
     record_mode: VideoRecordMode = VideoRecordMode.START_CONTINUOUS,
-) -> Tuple[Path, CalibrationIndex, QualityReport]:
+) -> Tuple[Path, Path, CalibrationIndex, QualityReport]:
     """Capture the board paused at every waypoint, then calibrate every preset from it.
 
-    Returns (the capture folder, the new calibration's index, its quality report). The
-    calibration is written to <session>/<DEFAULT_3D_CALIB_DIR_NAME>.new; installing it is
-    left to the caller.
+    Returns (the capture folder, the folder the new calibration was written to, its index,
+    its quality report). That folder is <session>/<DEFAULT_3D_CALIB_DIR_NAME>.new; installing
+    it is left to the caller.
     """
     if cam_params is None:
         cam_params = default_params
@@ -461,7 +465,7 @@ def make_3d_calib(
         vp.rename(target)
 
     logger.notice("Calibrating every preset from the capture in %s", src_dir)
-    index, report = calibrate_waypoint_capture(
+    output_dir, index, report = calibrate_waypoint_capture(
         src_dir,
         log,
         session_dir=Path(sess_path.location),
@@ -471,4 +475,4 @@ def make_3d_calib(
 
     logger.success("Successfully calibrated the capture: %s, verdict %s", index.id, report.verdict)
 
-    return src_dir, index, report
+    return src_dir, output_dir, index, report

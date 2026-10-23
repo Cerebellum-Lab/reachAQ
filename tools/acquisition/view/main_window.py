@@ -876,7 +876,7 @@ class MainWindow(QMainWindow):
         app_model = self._app_model
         prev_status, app_model.status = app_model.status, AppModelStatus.CALIBRATION_3D
         error = "Processing unfinished"
-        result: Optional[Tuple[Path, CalibrationIndex, QualityReport]] = None
+        result: Optional[Tuple[Path, Path, CalibrationIndex, QualityReport]] = None
         def handle_3d_calib():
             nonlocal error, result
             try:
@@ -889,12 +889,8 @@ class MainWindow(QMainWindow):
 
         @invoke_method
         def show_result():
-            self.run_action.setEnabled(True)
-            self.make_3d_calib_action.setChecked(False)
-            self.make_3d_calib_action.setEnabled(True)
-            app_model.status = prev_status
             logger.verbose("3d-calib thread joined, error=%s", error)
-            self._finish_3d_calib(error, result)
+            self._finish_3d_calib(error, result, prev_status)
 
         def wait_3d_calib_done(thread):
             thread.join()
@@ -907,50 +903,79 @@ class MainWindow(QMainWindow):
                                          args=(executor_thread,), daemon=True)
         waiter_thread.start()
 
-    def _finish_3d_calib(self, error, result) -> None:
+    def _finish_3d_calib(self, error, result, prev_status: AppModelStatus) -> None:
         """Install the calibration make_3d_calib produced, as its quality report allows, or show why it failed.
+
+        The app is given back (_end_3d_calib) only once the install decision, the install
+        and the reload are done, on every path. Until then it stays in CALIBRATION_3D, so
+        nothing, a remote client included, starts a session under the failed-report dialog
+        or while the new calibration loads.
 
         One API event per calibration: calibration3dFailed with the reason when the
         calibration or its install raised, else calibration3dCompleted, also when the
         operator kept a failed calibration out.
         """
-        if error is None:
-            try:
-                self._install_3d_calib(*result)
-            except Exception as err:
-                logger.exception("3d-calib install failed: %s", err)
-                error = err
+        installed_report = None
+        try:
+            if error is None:
+                try:
+                    _capture_dir, new_dir, index, report = result
+                    installed_report = self._install_3d_calib(new_dir, index, report)
+                except Exception as err:
+                    logger.exception("3d-calib could not be completed: %s", err)
+                    error = err
+        finally:
+            self._end_3d_calib(prev_status)
         if error is not None:
             reason = str(error)
             self._post_api_event(ApiEventKind.calibration3dFailed, dict(reason=reason))
             QMessageBox.critical(self, "3D calibration failed", reason or type(error).__name__)
             return
+        if installed_report is not None:
+            self._show_msg_box(
+                "3D calibration installed", _preformatted(installed_report.to_text()), QMessageBox.Icon.Information)
+            # A DCS measured against the previous calibration is held off and blocks Record until
+            # it is redone. With no DCS at all, the existing missing-DCS warning applies instead.
+            if self._app_model.dcs_state is DcsState.STALE:
+                self._show_msg_box(
+                    "Coordinate system out of date",
+                    "Redo Tools → Calibrate Coordinate System before running sessions.",
+                    QMessageBox.Icon.Warning)
         self._post_api_event(ApiEventKind.calibration3dCompleted)
 
-    def _install_3d_calib(self, capture_dir: Path, index: CalibrationIndex, report: QualityReport) -> None:
-        """Install the new calibration on a pass or warn report, or on a fail the operator overrides."""
-        # make_3d_calib writes the calibration beside its capture, in the session folder.
-        new_dir = Path(capture_dir).parent / f"{DEFAULT_3D_CALIB_DIR_NAME}.new"
+    def _end_3d_calib(self, prev_status: AppModelStatus) -> None:
+        """Give Run, the 3D calibration action and the app status back to the operator."""
+        self.run_action.setEnabled(True)
+        self.make_3d_calib_action.setChecked(False)
+        self.make_3d_calib_action.setEnabled(True)
+        self._app_model.status = prev_status
+
+    def _install_3d_calib(self, new_dir: Path, index: CalibrationIndex,
+                          report: QualityReport) -> Optional[QualityReport]:
+        """Install the calibration in `new_dir` on a pass or warn report, or on a fail the operator overrides.
+
+        Returns the report as installed, with any override, or None when the previous
+        calibration is kept.
+        """
         install, override = decide_install(report.verdict, lambda: self._ask_install_failed_3d_calib(report))
         if not install:
             logger.notice("kept the previous 3D calibration: %s (%s) failed its quality checks", new_dir, index.id)
-            return
+            return None
         if override:
             record = override_record(getpass.getuser(), datetime.now())
             # Before the install, so the installed copy carries the record.
             record_override(new_dir, record)
             report = dataclasses.replace(report, override=record)
-            logger.warning("installing 3D calibration %s despite its failed quality checks: %s", index.id, record)
-        installed, _ = install_calibration(new_dir, Path(self._preferences.configuration_location), now=datetime.now())
+            logger.warning("3D calibration %s: override recorded (install pending): %s", index.id, record)
+        try:
+            installed, _ = install_calibration(
+                new_dir, Path(self._preferences.configuration_location), now=datetime.now())
+        except Exception:
+            logger.error("3D calibration %s: install failed", index.id)
+            raise
+        logger.success("3D calibration %s: installed", index.id)
         self._app_model.reload_calib(installed)
-        self._show_msg_box("3D calibration installed", _preformatted(report.to_text()), QMessageBox.Icon.Information)
-        # A DCS measured against the previous calibration is held off and blocks Record until
-        # it is redone. With no DCS at all, the existing missing-DCS warning applies instead.
-        if self._app_model.dcs_state is DcsState.STALE:
-            self._show_msg_box(
-                "Coordinate system out of date",
-                "Redo Tools → Calibrate Coordinate System before running sessions.",
-                QMessageBox.Icon.Warning)
+        return report
 
     def _ask_install_failed_3d_calib(self, report: QualityReport) -> bool:
         """Whether to install a calibration whose quality report failed.

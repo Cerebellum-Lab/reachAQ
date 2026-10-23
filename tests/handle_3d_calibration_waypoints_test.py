@@ -397,7 +397,7 @@ def test_the_capture_is_calibrated_into_the_session_beside_its_sources(tmp_path,
     result = calibrate_waypoint_capture(
         capture_dir, log, session_dir=tmp_path / "session", presets=presets, previous_dir=previous)
 
-    assert result == ("index", "report")
+    assert result == (tmp_path / "session" / f"{DEFAULT_3D_CALIB_DIR_NAME}.new", "index", "report")
     [(capture, kwargs, written)] = calls
     assert capture == capture_dir
     assert kwargs == dict(
@@ -511,6 +511,7 @@ def _capture_app_model(tmp_path, calls, *, stops):
     project = SimpleNamespace(
         calculate_next_session_index=lambda: None,
         get_session_path=lambda: SimpleNamespace(location=str(session), prefix="20261023_000000"),
+        get_video_path=lambda name, **kwargs: (str(session / f"{name}_recording.mp4"),),
     )
     return SimpleNamespace(
         behavior=SimpleNamespace(algorithm=SimpleNamespace(diamond_triangle_config=_dcs(),
@@ -572,3 +573,29 @@ def test_cameras_that_do_not_stop_fail_a_capture_that_ran(tmp_path, monkeypatch)
 
     _assert_cameras_stopped_and_restored(app_model, calls)
     assert calibrated == []  # videos that may still be being written are not calibrated from
+
+
+def test_a_capture_that_ran_returns_where_its_calibration_was_written(tmp_path, monkeypatch):
+    calls = []
+    app_model = _capture_app_model(tmp_path, calls, stops=True)
+    session = tmp_path / "session"
+    for camera in ("left", "right"):
+        (session / f"{camera}_recording.mp4").touch()
+    log = SimpleNamespace(verified=[True])
+    index, report = SimpleNamespace(id="abc123"), SimpleNamespace(verdict="pass")
+    calibrated = []
+
+    def fake_calibrate_waypoint_capture(capture_dir, waypoint_log, **kwargs):
+        calibrated.append((Path(capture_dir), waypoint_log, kwargs))
+        return session / "written-here", index, report
+
+    monkeypatch.setattr(h3d, "run_waypoints", lambda *a, **k: log)
+    monkeypatch.setattr(h3d, "calibrate_waypoint_capture", fake_calibrate_waypoint_capture)
+
+    result = make_3d_calib(app_model)
+
+    capture_dir = session / DEFAULT_3D_CALIB_DIR_NAME
+    assert result == (capture_dir, session / "written-here", index, report)
+    [(calibrated_dir, calibrated_log, kwargs)] = calibrated
+    assert (calibrated_dir, calibrated_log, kwargs["session_dir"]) == (capture_dir, log, session)
+    assert sorted(p.name for p in (capture_dir / "source_videos").iterdir()) == ["left.mp4", "right.mp4"]

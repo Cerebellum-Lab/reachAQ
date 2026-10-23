@@ -9,6 +9,7 @@ new calibration.
 """
 
 import getpass
+import logging
 import os
 from datetime import datetime
 from functools import partial
@@ -27,6 +28,7 @@ from autotrainer.inference.multires_calibration.fit import BoardSpec
 from autotrainer.inference.multires_calibration.geometry import presets_from_base
 from autotrainer.inference.multires_calibration.report import QualityReport
 from multires_calibration_fakes import BASE, FIT
+from tools.acquisition.model.app_model_status import AppModelStatus
 from tools.acquisition.model.calibration_install import decide_install, install_calibration, override_record
 from tools.acquisition.model.dcs_state import DcsState
 from tools.acquisition.view import main_window as main_window_module
@@ -159,50 +161,80 @@ def test_an_unknown_verdict_installs_nothing():
 # for the window, the model and the dialogs.
 
 def _produced(session: Path, verdict: str):
-    """What make_3d_calib returns, with its calibration written where it writes it."""
+    """What make_3d_calib returns, with its calibration written where it says."""
     capture_dir = session / DEFAULT_3D_CALIB_DIR_NAME
     capture_dir.mkdir(parents=True)
+    output_dir = session / f"{DEFAULT_3D_CALIB_DIR_NAME}.new"
     report = QualityReport(created="2026-10-23T09:00:00-06:00", verdict=verdict, metrics=[], thresholds={}, notes=[])
     index = store.write_calibration(
-        session / f"{DEFAULT_3D_CALIB_DIR_NAME}.new", fit=FIT, presets=presets_from_base(BASE),
-        board=BoardSpec(), report=report, capture={},
+        output_dir, fit=FIT, presets=presets_from_base(BASE), board=BoardSpec(), report=report, capture={},
     )
-    return capture_dir, index, report
+    return capture_dir, output_dir, index, report
+
+
+class _Action:
+    def __init__(self, *, enabled: bool, checked: bool = False):
+        self.enabled = enabled
+        self.checked = checked
+
+    def setEnabled(self, enabled):
+        self.enabled = enabled
+
+    def setChecked(self, checked):
+        self.checked = checked
+
+
+def _given_back(window) -> bool:
+    """Run, the 3D action and the app status are the operator's again."""
+    return (window.run_action.enabled and window.make_3d_calib_action.enabled
+            and not window.make_3d_calib_action.checked and window._app_model.status is AppModelStatus.IDLE)
 
 
 def _window(location: Path, monkeypatch, *, override_answer=None, dcs_after=DcsState.VALID):
-    """A window whose dialogs, events and model calls are recorded.
+    """A window, mid-calibration, whose dialogs, events and model calls are recorded.
 
     override_answer is what the fail dialog and its confirmation answer together; None
     fails the test if they are shown. reload_calib sets dcs_state to dcs_after, as the
-    real one recomputes it against the calibration it loads.
+    real one recomputes it against the calibration it loads. given_back records, at each
+    call of the dialog and of reload_calib, whether the app had already been given back.
     """
-    seen = SimpleNamespace(boxes=[], errors=[], events=[], reloaded=[])
+    seen = SimpleNamespace(boxes=[], errors=[], events=[], reloaded=[], given_back=[])
 
     def reload_calib(path):
+        seen.given_back.append(("reload", _given_back(window)))
         seen.reloaded.append(Path(path))
         app_model.dcs_state = dcs_after
 
     def ask(report):
+        seen.given_back.append(("ask", _given_back(window)))
         if override_answer is None:
             raise AssertionError(f"asked to override a {report.verdict} report")
         return override_answer
 
-    app_model = SimpleNamespace(reload_calib=reload_calib, dcs_state=DcsState.VALID)
+    app_model = SimpleNamespace(reload_calib=reload_calib, dcs_state=DcsState.VALID,
+                                status=AppModelStatus.CALIBRATION_3D)
     window = SimpleNamespace(
         _app_model=app_model,
         _preferences=SimpleNamespace(configuration_location=str(location)),
         _post_api_event=lambda kind, *args: seen.events.append((kind, *args)),
         _show_msg_box=lambda title, text, icon: seen.boxes.append((title, text)),
         _ask_install_failed_3d_calib=ask,
+        run_action=_Action(enabled=False),
+        make_3d_calib_action=_Action(enabled=False, checked=True),
     )
     window._install_3d_calib = partial(MainWindow._install_3d_calib, window)
+    window._end_3d_calib = partial(MainWindow._end_3d_calib, window)
     monkeypatch.setattr(main_window_module, "QMessageBox", SimpleNamespace(
-        critical=lambda parent, title, text, *args: seen.errors.append((title, text)),
+        critical=lambda parent, title, text, *args: seen.errors.append((title, text, _given_back(window))),
         Icon=QMessageBox.Icon,
         StandardButton=QMessageBox.StandardButton,
     ))
     return window, seen
+
+
+def _finish(window, error, produced) -> None:
+    """The part of show_result after the capture, for a calibration started from IDLE."""
+    MainWindow._finish_3d_calib(window, error, produced, AppModelStatus.IDLE)
 
 
 @pytest.fixture
@@ -213,15 +245,23 @@ def location(tmp_path) -> Path:
     return location
 
 
-def test_a_confirmed_override_is_recorded_in_the_installed_calibration(tmp_path, location, monkeypatch):
+def _calibration_logs(caplog, calibration_id: str):
+    """What main_window logged about calibration `calibration_id`, after its "<id>: " prefix."""
+    prefix = f"3D calibration {calibration_id}: "
+    messages = [r.getMessage() for r in caplog.records if r.name == main_window_module.__name__]
+    return [m[len(prefix):] for m in messages if m.startswith(prefix)]
+
+
+def test_a_confirmed_override_is_recorded_in_the_installed_calibration(tmp_path, location, monkeypatch, caplog):
     produced = _produced(tmp_path / "session", "fail")
     window, seen = _window(location, monkeypatch, override_answer=True, dcs_after=DcsState.STALE)
 
-    MainWindow._finish_3d_calib(window, None, produced)
+    with caplog.at_level(logging.DEBUG):
+        _finish(window, None, produced)
 
     installed = location / DEFAULT_3D_CALIB_DIR_NAME
     index = store.load_index(installed)
-    assert index.id == produced[1].id
+    assert index.id == produced[2].id
     assert index.override["confirmed"] is True and index.override["by"] == getpass.getuser()
     assert datetime.fromisoformat(index.override["at"]) <= datetime.now()
     assert not (installed / DEFAULT_CAM_OFFSET_FILE_NAME).exists()
@@ -231,6 +271,55 @@ def test_a_confirmed_override_is_recorded_in_the_installed_calibration(tmp_path,
     assert seen.boxes[1][1] == STALE_DCS_TEXT
     assert seen.events == [(ApiEventKind.calibration3dCompleted,)]
     assert seen.errors == []
+    logs = _calibration_logs(caplog, index.id)
+    assert [m.split(":")[0] for m in logs] == ["override recorded (install pending)", "installed"]
+
+
+@pytest.mark.parametrize("override_answer", [True, False], ids=["install_anyway", "keep_previous"])
+def test_the_app_is_given_back_only_after_the_install_decision_and_the_reload(
+        tmp_path, location, monkeypatch, override_answer):
+    # Until then the app stays in CALIBRATION_3D, so nothing starts a session under the
+    # fail dialog or while the new calibration loads.
+    produced = _produced(tmp_path / "session", "fail")
+    window, seen = _window(location, monkeypatch, override_answer=override_answer)
+
+    _finish(window, None, produced)
+
+    expected = [("ask", False), ("reload", False)] if override_answer else [("ask", False)]
+    assert seen.given_back == expected
+    assert _given_back(window)
+
+
+class _InlineThread:
+    """A thread that runs its target as soon as it starts, so on_3d_calibrate runs start to end."""
+
+    def __init__(self, target, name, args=(), daemon=None):
+        self._target, self._args = target, args
+
+    def start(self):
+        self._target(*self._args)
+
+    def join(self):
+        pass
+
+
+def test_on_3d_calibrate_hands_the_calibration_to_the_install_flow_still_held(tmp_path, location, monkeypatch):
+    # The whole handler: make_3d_calib's result reaches the install flow, and show_result
+    # leaves giving the app back to it.
+    produced = _produced(tmp_path / "session", "fail")
+    window, seen = _window(location, monkeypatch, override_answer=False)
+    window._app_model.status = AppModelStatus.IDLE
+    window._finish_3d_calib = partial(MainWindow._finish_3d_calib, window)
+    monkeypatch.setattr(main_window_module, "make_3d_calib", lambda app_model: produced)
+    monkeypatch.setattr(main_window_module, "threading", SimpleNamespace(Thread=_InlineThread))
+    # show_result runs where it is called, instead of being posted to a Qt event loop.
+    monkeypatch.setattr(main_window_module, "invoke_method", lambda method: method)
+
+    MainWindow.on_3d_calibrate(window, True)
+
+    assert seen.given_back == [("ask", False)]
+    assert seen.events == [(ApiEventKind.calibration3dCompleted,)]
+    assert _given_back(window)
 
 
 def test_keep_previous_installs_nothing(tmp_path, location, monkeypatch):
@@ -238,12 +327,13 @@ def test_keep_previous_installs_nothing(tmp_path, location, monkeypatch):
     before = _contents(location)
     window, seen = _window(location, monkeypatch, override_answer=False)
 
-    MainWindow._finish_3d_calib(window, None, produced)
+    _finish(window, None, produced)
 
     assert _contents(location) == before
-    assert store.load_index(tmp_path / "session" / f"{DEFAULT_3D_CALIB_DIR_NAME}.new").override is None
+    assert store.load_index(produced[1]).override is None
     assert seen.reloaded == [] and seen.boxes == [] and seen.errors == []
     assert seen.events == [(ApiEventKind.calibration3dCompleted,)]
+    assert _given_back(window)
 
 
 @pytest.mark.parametrize("verdict", ["pass", "warn"])
@@ -253,15 +343,17 @@ def test_a_passing_report_installs_at_once_and_only_a_stale_dcs_gets_the_notice(
     produced = _produced(tmp_path / "session", verdict)
     window, seen = _window(location, monkeypatch, dcs_after=dcs_after)
 
-    MainWindow._finish_3d_calib(window, None, produced)
+    _finish(window, None, produced)
 
     installed = location / DEFAULT_3D_CALIB_DIR_NAME
-    assert store.load_index(installed).id == produced[1].id
+    assert store.load_index(installed).id == produced[2].id
     assert store.load_index(installed).override is None
     assert seen.reloaded == [installed]
+    assert seen.given_back == [("reload", False)]
     assert [title for title, _ in seen.boxes] == ["3D calibration installed"]
     assert f"3D calibration quality: {verdict.upper()}" in seen.boxes[0][1]
     assert seen.events == [(ApiEventKind.calibration3dCompleted,)]
+    assert _given_back(window)
 
 
 def test_a_calibration_error_is_shown_with_its_reason(tmp_path, location, monkeypatch):
@@ -269,11 +361,16 @@ def test_a_calibration_error_is_shown_with_its_reason(tmp_path, location, monkey
     window, seen = _window(location, monkeypatch)
     err = ValueError("the live camera geometry is not a valid base: width 250 is not a multiple of 4")
 
-    MainWindow._finish_3d_calib(window, err, None)
+    _finish(window, err, None)
 
-    assert seen.errors == [("3D calibration failed", str(err))]
+    assert seen.errors == [("3D calibration failed", str(err), True)]
     assert seen.events == [(ApiEventKind.calibration3dFailed, dict(reason=str(err)))]
     assert _contents(location) == before and seen.reloaded == []
+    assert _given_back(window)
+
+
+def _refuse_replace(src, dst):
+    raise PermissionError(f"cannot replace {dst}")
 
 
 def test_an_install_error_is_shown_and_reported_as_a_failure(tmp_path, location, monkeypatch):
@@ -281,16 +378,34 @@ def test_an_install_error_is_shown_and_reported_as_a_failure(tmp_path, location,
     before = _contents(location)
     window, seen = _window(location, monkeypatch)
 
-    def refuse(src, dst):
-        raise PermissionError(f"cannot replace {dst}")
-
-    monkeypatch.setattr(os, "replace", refuse)
-    MainWindow._finish_3d_calib(window, None, produced)
+    monkeypatch.setattr(os, "replace", _refuse_replace)
+    _finish(window, None, produced)
     monkeypatch.undo()
 
-    assert seen.errors == [("3D calibration failed", f"cannot replace {location / DEFAULT_3D_CALIB_DIR_NAME}")]
+    assert seen.errors == [("3D calibration failed", f"cannot replace {location / DEFAULT_3D_CALIB_DIR_NAME}", True)]
     assert seen.events == [(ApiEventKind.calibration3dFailed, dict(reason=seen.errors[0][1]))]
     assert seen.reloaded == [] and seen.boxes == []
+    assert _given_back(window)
     # The previous calibration is back in place; the copy is left for the next install to clear.
     partial = f"{DEFAULT_3D_CALIB_DIR_NAME}.partial/"
     assert {k: v for k, v in _contents(location).items() if not k.startswith(partial)} == before
+
+
+def test_an_override_whose_install_fails_is_logged_as_failed(tmp_path, location, monkeypatch, caplog):
+    # The record is in the session's folder by then, but the calibration never went live.
+    produced = _produced(tmp_path / "session", "fail")
+    window, seen = _window(location, monkeypatch, override_answer=True)
+
+    def refuse_install(new_dir, configuration_location, *, now):
+        raise PermissionError(f"cannot install {new_dir}")
+
+    # Not os.replace: record_override replaces its files with it too.
+    monkeypatch.setattr(main_window_module, "install_calibration", refuse_install)
+    with caplog.at_level(logging.DEBUG):
+        _finish(window, None, produced)
+
+    assert store.load_index(produced[1]).override["confirmed"] is True
+    logs = _calibration_logs(caplog, produced[2].id)
+    assert [m.split(":")[0] for m in logs] == ["override recorded (install pending)", "install failed"]
+    assert [kind for kind, *_ in seen.events] == [ApiEventKind.calibration3dFailed]
+    assert _given_back(window)
