@@ -111,13 +111,13 @@ AXES = "xyz"
 
 
 def capture_settings_of(params: Mapping[str, Any]) -> Dict[str, Any]:
-    """The capture settings the waypoint log records, from the camera params the capture sets."""
-    return {
-        "gain_db": params.get("gain"),
-        "gamma": params.get("gamma"),
-        "exposure_us": params.get("exposure"),
-        "fps": params.get("fps"),
-    }
+    """The capture settings the waypoint log records, from the camera params the capture sets.
+
+    Only the params present are recorded: one left out is whatever the camera does without
+    it, not None. (gamma=None present is recorded; it turns the camera's gamma off.)
+    """
+    names = {"gain_db": "gain", "gamma": "gamma", "exposure_us": "exposure", "fps": "fps"}
+    return {setting: params[param] for setting, param in names.items() if param in params}
 
 
 def _dcs_axis_to_motor(dcs: DiamondTriangleOffsetConfig, axis: str, value: float) -> float:
@@ -206,6 +206,7 @@ def run_waypoints(
     dwell: float = 0.5,
     sleep=time.sleep,
     now=time.time,
+    clock=time.monotonic,
     tolerance: float = 0.05,
     arrival_timeout: float = 2.0,
     capture_settings: Optional[Mapping[str, Any]] = None,
@@ -218,9 +219,10 @@ def run_waypoints(
     the start. A waypoint the motor does not confirm is logged unverified and the capture
     goes on; the calibration report counts them.
 
-    `now` stamps arrive and leave (time.time(), as WaypointLog.times records) and also
-    times the arrival wait, so one test clock drives both. `capture_settings` are those of
-    default_params unless given.
+    `now` stamps arrive and leave (time.time(), as WaypointLog.times records). `clock`
+    times the arrival wait, so a step of the wall clock cannot stretch or cut it short; a
+    test may pass one fake for both. `capture_settings` are those of default_params unless
+    given.
     """
     if capture_settings is None:
         capture_settings = capture_settings_of(default_params)
@@ -231,7 +233,7 @@ def run_waypoints(
             _command(hard, move_axis, motor[AXES.index(move_axis)])
         sleep(settle)
         arrived, reported = wait_until_arrived(
-            hard, motor, tolerance=tolerance, timeout=arrival_timeout, sleep=sleep, now=now)
+            hard, motor, tolerance=tolerance, timeout=arrival_timeout, sleep=sleep, now=clock)
         arrive = now()
         if not arrived:
             logger.warning("waypoint %d: the motor reported %s, not within %s of the commanded %s",

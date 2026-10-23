@@ -59,8 +59,9 @@ _STATIC_RATIO = 2.0
 # The cameras are hardware-synchronised, so a dwell starts at the same frame in each; this
 # allows for the threshold catching the slow end of a move a frame or two apart.
 _MAX_START_OFFSET_FRAMES = 3
-# The gamma today's calibration passes to create_corner_matrix (handle_3d_calibration.py).
-# refine_corners' fixed Canny thresholds were tuned on the image after that step.
+# The gamma the legacy calibration passed to create_corner_matrix (the former
+# handle_3d_calibration.process_capture). refine_corners' fixed Canny thresholds were tuned
+# on the image after that step.
 _LEGACY_GAMMA = 2.0
 
 _NOT_FOUND = "not found"
@@ -207,7 +208,7 @@ def detect_board(gray: np.ndarray, board: BoardSpec, *, refine: str = "subpix") 
 
     The detector runs on a contrast-stretched copy, as the legacy calibration does.
     "subpix" refines on the original grey, whose values the stretch has not bent.
-    "legacy" refines on the image today's calibration refines on: the stretched copy after
+    "legacy" refines on the image the legacy calibration refines on: the stretched copy after
     adjust_gamma(gamma=2), for which refine_corners' fixed Canny thresholds were tuned.
     """
     _check_refine(refine)

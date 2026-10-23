@@ -17,7 +17,7 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from autotrainer.core import Offset3DTuple
+from autotrainer.core import CameraConfiguration, Offset3DTuple
 from autotrainer.core.capture import CaptureProcessStatus
 from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
 from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
@@ -208,7 +208,7 @@ def test_capture_loop_logs_dwell_and_verification(tmp_path):
     motor = _Motor(clock, travel=0.3, stop_short={("x", 20.0): 0.2})
     assert plan[23][0:2] == ("x", 10.0) and plan[23][2][0] == pytest.approx(20.0)
 
-    log = run_waypoints(motor, plan, sleep=clock.sleep, now=clock.now)
+    log = run_waypoints(motor, plan, sleep=clock.sleep, now=clock.now, clock=clock.now)
 
     assert len(log.motor) == 37
     assert log.motor == [motor_xyz for _, _, motor_xyz in plan]
@@ -258,7 +258,7 @@ def test_capture_loop_logs_dwell_and_verification(tmp_path):
 def test_waypoint_log_writes_all_four_capture_settings(tmp_path):
     plan = plan_waypoints(start, moves, _dcs())
     clock = _Clock()
-    log = run_waypoints(_Motor(clock, travel=0.0), plan, sleep=clock.sleep, now=clock.now)
+    log = run_waypoints(_Motor(clock, travel=0.0), plan, sleep=clock.sleep, now=clock.now, clock=clock.now)
 
     write_waypoint_log(tmp_path / WAYPOINT_LOG, log)
 
@@ -274,8 +274,48 @@ def test_capture_settings_follow_the_camera_params():
     clock = _Clock()
     params = dict(default_params, gain=2.5, gamma=0.8, exposure=3000, fps=30)
     log = run_waypoints(_Motor(clock, travel=0.0), plan_waypoints(start, moves, _dcs()),
-                        sleep=clock.sleep, now=clock.now, capture_settings=h3d.capture_settings_of(params))
+                        sleep=clock.sleep, now=clock.now, clock=clock.now,
+                        capture_settings=h3d.capture_settings_of(params))
     assert log.capture_settings == {"gain_db": 2.5, "gamma": 0.8, "exposure_us": 3000, "fps": 30}
+
+
+def test_capture_settings_record_only_the_params_the_capture_sets():
+    # A param the capture leaves out is whatever the camera does without it, not None, so
+    # the log does not claim a value for it. default_params sets gamma to None explicitly,
+    # which is recorded.
+    without_gamma = {k: v for k, v in default_params.items() if k != "gamma"}
+    assert h3d.capture_settings_of(without_gamma) == {"gain_db": 1.0, "exposure_us": 4500, "fps": 40}
+    assert h3d.capture_settings_of(default_params) == SETTINGS
+    assert h3d.capture_settings_of({}) == {}
+
+
+def test_the_arrival_timeout_runs_on_clock_not_on_now():
+    # `now` stamps arrive and leave on the wall clock, which can step; `clock` times the
+    # arrival wait. Here `now` never advances and `clock` does: a waypoint the motor never
+    # reaches must still give up after arrival_timeout on `clock`.
+    plan = plan_waypoints(start, moves, _dcs())[:2]
+    clock = _Clock()
+    polls = []
+
+    def sleep(seconds):
+        if len(polls) > 10_000:
+            raise AssertionError("the arrival wait never timed out")
+        polls.append(seconds)
+        clock.sleep(seconds)
+
+    def frozen_wall_clock():
+        return 5_000.0
+
+    motor = _Motor(clock, travel=0.0, stop_short={("z", plan[1][2][2]): 0.2})
+
+    log = run_waypoints(motor, plan, sleep=sleep, now=frozen_wall_clock, clock=clock.now)
+
+    assert log.verified == [True, False]
+    assert log.times == [(5_000.0, 5_000.0), (5_000.0, 5_000.0)]
+    # waypoint 1's sleeps: its settle, its arrival polls, then its dwell
+    waypoint_1 = polls[polls.index(0.5) + 1:]
+    assert waypoint_1[0] == 0.25 and waypoint_1[-1] == 0.5
+    assert sum(waypoint_1[1:-1]) == pytest.approx(2.0, abs=0.011)
 
 
 def test_a_move_that_is_not_queued_stops_the_capture():
@@ -283,7 +323,8 @@ def test_a_move_that_is_not_queued_stops_the_capture():
     motor = _Motor(clock)
     motor.move_y = lambda value, *, absolute=True: None
     with pytest.raises(RuntimeError, match="not queued"):
-        run_waypoints(motor, plan_waypoints(start, moves, _dcs()), sleep=clock.sleep, now=clock.now)
+        run_waypoints(motor, plan_waypoints(start, moves, _dcs()),
+                      sleep=clock.sleep, now=clock.now, clock=clock.now)
 
 
 def test_capture_params_set_gain_1_db_and_turn_camera_gamma_off():
@@ -341,7 +382,7 @@ def test_the_capture_is_calibrated_into_the_session_beside_its_sources(tmp_path,
     capture_dir.mkdir(parents=True)
     clock = _Clock()
     log = run_waypoints(_Motor(clock, travel=0.0), plan_waypoints(start, moves, _dcs()),
-                        sleep=clock.sleep, now=clock.now)
+                        sleep=clock.sleep, now=clock.now, clock=clock.now)
     presets = capture_presets(LIVE_PARAMS)
     previous = tmp_path / "Autotrainer" / DEFAULT_3D_CALIB_DIR_NAME
     calls = []
@@ -397,3 +438,137 @@ def test_calibration_uses_the_loaded_dcs_while_stale_and_refuses_without_one():
     for missing in (None, _dcs(version=1), _dcs(used=(NAN, 20, 30))):
         with pytest.raises(RuntimeError, match="calibrate diamond-triangle"):
             make_3d_calib(_app_model(effective=missing, loaded=missing))
+
+
+class _CaptureCamera:
+    """A camera that records the calls make_3d_calib makes on it; `stops` is whether it
+    reaches TERMINATED when stopped."""
+
+    def __init__(self, name, primary, calls, *, stops):
+        self.name = name
+        self.is_primary = primary
+        self.saved = CameraConfiguration(name=name, params=dict(LIVE_PARAMS, primary="on" if primary else "off"))
+        self.active_config = self.saved
+        self.project = None
+        self._calls = calls
+        self._stops = stops
+
+    def _call(self, *what):
+        self._calls.append((self.name, *what))
+
+    def save_configuration(self):
+        return self.saved
+
+    def load_configuration(self, cfg):
+        self._call("load_configuration", cfg)
+
+    def on_prepare_capture(self):
+        self._call("on_prepare_capture")
+        return True
+
+    def wait_for_capture_status(self, status, *, timeout):
+        self._call("wait_for_capture_status", status)
+        return self._stops or status is not CaptureProcessStatus.TERMINATED
+
+    def on_capture_start(self):
+        self._call("on_capture_start")
+
+    def on_trigger_recording(self, on):
+        self._call("on_trigger_recording", on)
+
+    def on_capture_notify_end(self):
+        self._call("on_capture_notify_end")
+
+    def on_capture_stop(self):
+        self._call("on_capture_stop")
+
+
+class _CaptureMotor:
+    def __init__(self, calls):
+        self._calls = calls
+
+    def connect(self, queue):
+        self._calls.append(("motor", "connect"))
+
+    def send_home(self):
+        return uuid.uuid4()
+
+    def move_x(self, value, *, absolute=True):
+        return uuid.uuid4()
+
+    move_y = move_z = move_x
+
+    def wait_pending_command_acked(self, token, *, timeout=3, raise_on_timeout=True):
+        pass
+
+    def disconnect(self):
+        self._calls.append(("motor", "disconnect"))
+
+
+def _capture_app_model(tmp_path, calls, *, stops):
+    session = tmp_path / "session"
+    session.mkdir()
+    project = SimpleNamespace(
+        calculate_next_session_index=lambda: None,
+        get_session_path=lambda: SimpleNamespace(location=str(session), prefix="20261023_000000"),
+    )
+    return SimpleNamespace(
+        behavior=SimpleNamespace(algorithm=SimpleNamespace(diamond_triangle_config=_dcs(),
+                                                           loaded_diamond_triangle_config=_dcs())),
+        left_camera=_CaptureCamera("left", True, calls, stops=stops),
+        right_camera=_CaptureCamera("right", False, calls, stops=stops),
+        hardware=_CaptureMotor(calls),
+        message_handler=SimpleNamespace(input_queue=None),
+        make_project_info=lambda: project,
+        active_calibration_dir=None,
+    )
+
+
+def _assert_cameras_stopped_and_restored(app_model, calls):
+    for camera in (app_model.left_camera, app_model.right_camera):
+        mine = [call[1:] for call in calls if call[0] == camera.name]
+        assert ("on_capture_stop",) in mine
+        # the capture loaded its own configuration; the last one loaded is the operator's again
+        loads = [call for call in mine if call[0] == "load_configuration"]
+        assert len(loads) == 2 and loads[0][1] is not camera.saved and loads[-1][1] is camera.saved
+        assert mine[-1] == loads[-1]
+        assert mine.index(("on_capture_stop",)) < len(mine) - 1
+    assert ("motor", "disconnect") in calls
+
+
+@pytest.mark.parametrize("stops", [True, False], ids=["cameras_stop", "cameras_do_not_stop"])
+def test_a_failed_capture_stops_and_restores_the_cameras_and_raises_its_own_error(tmp_path, monkeypatch, stops):
+    calls = []
+    app_model = _capture_app_model(tmp_path, calls, stops=stops)
+    fault = RuntimeError("motor fault mid-capture")
+
+    def failing_run_waypoints(*args, **kwargs):
+        raise fault
+
+    calibrated = []
+    monkeypatch.setattr(h3d, "run_waypoints", failing_run_waypoints)
+    monkeypatch.setattr(h3d, "calibrate_waypoint_capture", lambda *a, **k: calibrated.append(a))
+
+    with pytest.raises(RuntimeError) as raised:
+        make_3d_calib(app_model)
+
+    # the capture's own error, also when the cameras then fail to stop as well
+    assert raised.value is fault
+    _assert_cameras_stopped_and_restored(app_model, calls)
+    terminated = [call for call in calls if call[1:] == ("wait_for_capture_status", CaptureProcessStatus.TERMINATED)]
+    assert terminated  # the stop was waited for, and failed in the second case
+    assert calibrated == []
+
+
+def test_cameras_that_do_not_stop_fail_a_capture_that_ran(tmp_path, monkeypatch):
+    calls = []
+    app_model = _capture_app_model(tmp_path, calls, stops=False)
+    calibrated = []
+    monkeypatch.setattr(h3d, "run_waypoints", lambda *a, **k: SimpleNamespace(verified=[True]))
+    monkeypatch.setattr(h3d, "calibrate_waypoint_capture", lambda *a, **k: calibrated.append(a))
+
+    with pytest.raises(RuntimeError, match="TERMINATED"):
+        make_3d_calib(app_model)
+
+    _assert_cameras_stopped_and_restored(app_model, calls)
+    assert calibrated == []  # videos that may still be being written are not calibrated from
