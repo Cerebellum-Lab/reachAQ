@@ -39,7 +39,7 @@ from autotrainer.inference import InferenceStatus, PoseResponse
 from autotrainer.inference.analysis import IntersessionResponse
 from autotrainer.inference.analysis.prepare_jetson_data import DEFAULT_CAM_OFFSET_FILE_NAME, make_cam_offsets_dict
 from autotrainer.inference.multires_calibration.report import QualityReport
-from autotrainer.inference.multires_calibration.store import CalibrationIndex, record_override
+from autotrainer.inference.multires_calibration.store import CalibrationIndex, calibration_created, record_override
 
 from autotrainer.behavior import SystemState
 from autotrainer.behavior.behavior_algorithm import BehaviorAlgoStatus, BehaviorAlgoProps
@@ -55,6 +55,7 @@ from tools.autotrainer_version import __version__ as app_version
 from tools.acquisition.model.app_model import AppModel
 from tools.acquisition.model.app_model_status import AppModelStatus, SessionRecordingStatus
 from tools.acquisition.model.calibration_install import decide_install, install_calibration, override_record
+from tools.acquisition.model.calibration_reminder import calibration_due, reminder_text
 from tools.acquisition.model.dcs_state import DcsState
 from tools.acquisition.model.handle_3d_calibration import make_3d_calib
 from tools.acquisition.model.nidaq_discovery import discover_nidaq_devices
@@ -172,6 +173,7 @@ class MainWindow(QMainWindow):
         self._training_plan_index_by_plan_id: Dict[Optional[str], int] = {}
         self._diamond_triangle_calib_run = None
         self._warned_invalid_dcs_config = False
+        self._calibration_reminder_shown = False
 
         self._previous_intersession_analysis_rsp: Optional[Tuple[ProjectInfo, IntersessionResponse]] = None
 
@@ -2383,6 +2385,32 @@ class MainWindow(QMainWindow):
             and self._nidaq_discovery_thread is None
         )
         self._refresh_ui_availability()
+        self._remind_if_calibration_due()
+
+    def _remind_if_calibration_due(self) -> None:
+        """Suggest a new 3D calibration, once per run, when the active one is old or there is none.
+
+        Checked at the run's first configuration load, due or not: by then the app has loaded its
+        calibration, and a month-old threshold crossed later in a run is not worth a second look.
+        It only shows the message, non-modal; the operator starts a calibration from the menu it
+        names. Runs on the GUI thread, as its caller is an invoke_method. An unreadable
+        calibration counts as due, and nothing here may fail a configuration load.
+        """
+        if self._calibration_reminder_shown:
+            return
+        self._calibration_reminder_shown = True
+        created = None
+        calib_dir = self._app_model.active_calibration_dir
+        if calib_dir is not None:
+            try:
+                created = calibration_created(calib_dir)
+            except Exception as err:
+                logger.warning("3D calibration reminder: the date of %s is unreadable, taken as due: %s: %s",
+                               calib_dir, type(err).__name__, err)
+        # A format-2 index may carry a UTC offset; comparing with a naive now would raise.
+        now = datetime.now(None if created is None else created.tzinfo)
+        if calibration_due(created, now, self._preferences.calibration_reminder_days):
+            self._show_msg_box("Calibration due", reminder_text(created), QMessageBox.Icon.Information)
 
     @invoke_method
     def _on_inference_analysis_result_ready(self, prj: ProjectInfo, rsp: IntersessionResponse):
