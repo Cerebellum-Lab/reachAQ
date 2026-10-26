@@ -23,6 +23,7 @@ import sys
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -70,10 +71,19 @@ class _Stop(Exception):
     """Raised by a stand-in for process_raw_data once it has seen its arguments."""
 
 
-def _write_format2(folder: Path) -> store.CalibrationIndex:
+def _write_format2(folder: Path, made: Optional[datetime] = None) -> store.CalibrationIndex:
+    """A format-2 calibration in `folder`, made now or, for a session resolved by time that
+    must not predate it (resolve_for_time refuses that), at `made`."""
     folder.parent.mkdir(parents=True, exist_ok=True)
-    return store.write_calibration(folder, fit=RIG.truth, presets=PRESETS, board=RIG.board, report=_REPORT,
-                                   capture={})
+    index = store.write_calibration(folder, fit=RIG.truth, presets=PRESETS, board=RIG.board, report=_REPORT,
+                                    capture={})
+    if made is not None:
+        index_path = folder / store.INDEX_FILE
+        data = yaml.safe_load(index_path.read_text())
+        data["created"] = made.isoformat(timespec="seconds")
+        index_path.write_text(yaml.safe_dump(data, sort_keys=False))
+        index = store.load_index(folder)
+    return index
 
 
 def _write_legacy(folder: Path, made: datetime) -> Path:
@@ -241,7 +251,8 @@ def test_without_a_calib_dir_the_session_resolves_under_the_root(tmp_path, monke
 def test_a_format2_session_loads_its_preset(tmp_path, monkeypatch, named, expected):
     root = tmp_path / "Autotrainer"
     folder = root / NAME
-    index = _write_format2(folder)
+    # Made before the session, which the one without calibration3d is resolved against by time.
+    index = _write_format2(folder, made=datetime(2026, 6, 1))
     project = _project(tmp_path)
     if named == "no calibration3d":
         _write_metadata(project, _metadata(IN_SECOND_WINDOW))
@@ -280,7 +291,9 @@ def test_a_session_recorded_with_live_3d_off_is_refused(tmp_path, monkeypatch):
 def test_a_legacy_live_session_reaching_format2_uses_the_base_preset(tmp_path, monkeypatch, caplog, route):
     root = tmp_path / "Autotrainer"
     folder = root / NAME
-    _write_format2(folder)
+    # Made before the session: by time, a format-2 calibration made after it would be refused
+    # (test_a_session_older_than_every_kept_calibration_is_refused).
+    _write_format2(folder, made=datetime(2026, 6, 1))
     project = _project(tmp_path)
     # Live 3D ran on a legacy calibration: no id, no preset, and it was not off.
     _write_metadata(project, _metadata(IN_SECOND_WINDOW, id=None, created="2026-03-03T09:08:15", preset=None,
@@ -318,15 +331,33 @@ def test_an_unreadable_index_is_never_read_as_legacy(tmp_path, monkeypatch):
         intersession_process(_project(tmp_path), calib_dir=folder)
 
 
-def test_warns_when_the_session_predates_its_calibration(tmp_path, caplog):
+def test_a_session_older_than_every_kept_calibration_is_refused(tmp_path, monkeypatch):
+    # The calibration it was recorded with is not kept, and the oldest one that is cannot
+    # stand in for it: processing refuses and asks for --calib-dir (spec, Old sessions;
+    # ruling R49).
     root = _legacy_root(tmp_path)
     project = _project(tmp_path)
-    # Older than every calibration: the oldest surviving backup is the closest match.
     _write_metadata(project, _metadata(datetime(2026, 1, 5, 8)))
-    with caplog.at_level(logging.WARNING, logger=intersession_module.__name__):
-        assert resolve_session_calibration(project, root) == root / f"{NAME}_20260303_090815"
-    message, = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-    assert "2026-01-05 08:00:00" in message and "2026-01-10 00:00:00" in message
+    with pytest.raises(CalibrationResolutionError, match="pass --calib-dir") as refused:
+        resolve_session_calibration(project, root)
+    assert "2026-01-05 08:00:00" in str(refused.value) and "2026-01-10 00:00:00" in str(refused.value)
+
+    # An explicit calib_dir still processes it.
+    seen = _capture_process_raw_data(monkeypatch)
+    folder = root / f"{NAME}_20260303_090815"
+    with pytest.raises(_Stop):
+        intersession_process(project, calib_dir=folder)
+    assert seen["calib_src_dir"] == folder.as_posix()
+
+    # The same with only a format-2 calibration kept, made after the session (its legacy
+    # predecessor deleted): the session is not read at that calibration's base preset.
+    only = tmp_path / "only_format2"
+    index = _write_format2(only / NAME)
+    later = _project(tmp_path / "later")
+    _write_metadata(later, _metadata(IN_SECOND_WINDOW))
+    with pytest.raises(CalibrationResolutionError, match="pass --calib-dir") as refused:
+        intersession_process(later, calib_root=only)
+    assert str(IN_SECOND_WINDOW) in str(refused.value) and str(index.created) in str(refused.value)
 
 
 def test_an_aware_calibration_date_is_compared_in_local_time(tmp_path, caplog):

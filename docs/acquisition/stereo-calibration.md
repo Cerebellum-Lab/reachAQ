@@ -241,8 +241,13 @@ never substituted, because its pixels are not the frames' pixels.
   binning).
 - A session recorded with live 3D off (`live3dDisabledReason`), an id not found,
   an ambiguous match or no match is refused with "pass --calib-dir".
-- A session older than every kept calibration uses the oldest one, with a
-  warning.
+- A session older than every kept calibration is refused too, with
+  "pass --calib-dir", the session's time and when the calibration it would have
+  landed on was made: the calibration it was recorded with is gone, and the
+  oldest kept one is no stand-in. By time, a calibration made after the session
+  is never picked. A session that names its calibration by id is not affected.
+  On christielab10 this means sessions before 2026-07-07 (the legacy
+  calibration's date) need `--calib-dir`.
 - `--calib-dir` overrides all of it.
 
 reachAQ itself triangulates only at the base preset: live frames and the

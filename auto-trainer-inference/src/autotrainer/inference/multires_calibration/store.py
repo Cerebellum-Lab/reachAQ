@@ -336,7 +336,11 @@ def resolve_for_time(root: Path, when: datetime) -> Path:
 
     That is the backup with the earliest end after `when`, or the active folder when no
     backup ended after it. Refuses when two backups end at the same time, since which one
-    was active is then unknown, and when no folder qualifies.
+    was active is then unknown, and when no folder qualifies. Refuses too when that folder's
+    calibration was made after `when` (calibration_created): `when` is older than every kept
+    calibration, the one in force then is gone, and the oldest kept one is no stand-in for
+    it (spec, Old sessions). A folder that cannot be dated is warned about and returned; it
+    fails when it is loaded.
     """
     root = Path(root)
     if when.tzinfo is not None:
@@ -354,14 +358,35 @@ def resolve_for_time(root: Path, when: datetime) -> Path:
         detail = "; ".join(f"{' and '.join(names)} both end at {end}" for end, names in shared)
         raise CalibrationResolutionError(f"ambiguous calibration backups under {root}: {detail}")
     later = [c for c in backups if c.active_until > when]
-    if later:
-        return min(later, key=lambda c: c.active_until).path
     active = [c for c in candidates if c.active_until is None]
-    if active:
-        return active[0].path
-    raise CalibrationResolutionError(
-        f"no calibration under {root} was active at {when}: every backup ended earlier and there is no active folder"
-    )
+    if later:
+        folder = min(later, key=lambda c: c.active_until).path
+    elif active:
+        folder = active[0].path
+    else:
+        raise CalibrationResolutionError(
+            f"no calibration under {root} was active at {when}: every backup ended earlier and there is no"
+            " active folder"
+        )
+    _check_made_by(folder, when)
+    return folder
+
+
+def _check_made_by(folder: Path, when: datetime) -> None:
+    """Refuse `folder` for a time `when` (local, naive) before its calibration was made."""
+    try:
+        created = calibration_created(folder)
+    except (OSError, ValueError) as error:
+        logger.warning("cannot tell when the calibration in %s was made, so not whether it was in force at %s: %s",
+                       folder, when, error)
+        return
+    if created.tzinfo is not None:
+        created = created.astimezone().replace(tzinfo=None)
+    if when < created:
+        raise CalibrationResolutionError(
+            f"no kept calibration under {folder.parent} was in force at {when}: {folder.name}, the one active"
+            f" then by its end time, was made later, at {created}"
+        )
 
 
 def record_override(folder: Path, override: dict) -> None:

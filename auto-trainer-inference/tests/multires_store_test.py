@@ -301,6 +301,43 @@ def test_resolve_without_a_backup_uses_the_active_folder_or_refuses(tmp_path):
     assert resolve_for_time(tmp_path, datetime(2026, 5, 1)) == tmp_path / NAME
 
 
+def _made(index, folder: Path, when: datetime):
+    """`index`, the calibration in `folder`, as if it had been made at `when`."""
+    data = yaml.safe_load((folder / INDEX_FILE).read_text())
+    data["created"] = when.isoformat(timespec="seconds")
+    (folder / INDEX_FILE).write_text(yaml.safe_dump(data, sort_keys=False))
+    made = load_index(folder)
+    assert made == dataclasses.replace(index, created=when)
+    return made
+
+
+def _dated_legacy(folder: Path, made: datetime) -> Path:
+    """A legacy folder whose stereo_params.pickle is dated `made`, as copytree keeps it."""
+    pickle_path = folder / "camera_matrix" / "stereo_params.pickle"
+    pickle_path.parent.mkdir(parents=True)
+    pickle_path.write_bytes(b"not read, only dated")
+    os.utime(pickle_path, (made.timestamp(), made.timestamp()))
+    return folder
+
+
+def test_resolve_refuses_a_time_before_every_kept_calibration_was_made(tmp_path, report):
+    # Spec, Old sessions (ruling R49): the calibration such a session was recorded with is
+    # not kept, and the oldest one that is cannot stand in for it.
+    backup = _dated_legacy(tmp_path / f"{NAME}_20260303_090815", datetime(2026, 1, 10, 9, 30))
+    with pytest.raises(CalibrationResolutionError) as refused:
+        resolve_for_time(tmp_path, datetime(2026, 1, 5, 8))
+    assert "2026-01-05 08:00:00" in str(refused.value) and "2026-01-10 09:30:00" in str(refused.value)
+    assert resolve_for_time(tmp_path, datetime(2026, 1, 10, 9, 31)) == backup
+
+    # The same for a format-2 active folder, dated by its index.
+    only = tmp_path / "format2"
+    only.mkdir()
+    written = write(only / NAME, report)
+    with pytest.raises(CalibrationResolutionError, match=str(written.created)):
+        resolve_for_time(only, written.created.replace(year=written.created.year - 1))
+    assert resolve_for_time(only, written.created) == only / NAME
+
+
 def test_resolve_refuses_duplicate_windows(tmp_path):
     # Folder names are unique, but DATE_TIME_FORMAT also parses an hour typed without its
     # leading zero, so two backups can claim the same end time.
@@ -358,8 +395,10 @@ def test_a_corrupt_backup_index_blocks_only_its_own_folder(tmp_path, report, cap
     second = tmp_path / f"{NAME}_20260701_120000"
     active = tmp_path / NAME
     write(damaged, report)
-    second_index = write(second, report)
-    active_index = write(active, report)
+    # Each made before it became active, as installs leave them: resolve_for_time refuses a
+    # time before the calibration it would pick was made.
+    second_index = _made(write(second, report), second, datetime(2026, 3, 3, 9))
+    active_index = _made(write(active, report), active, datetime(2026, 7, 1, 11))
     corrupt(damaged / INDEX_FILE)
 
     with caplog.at_level(logging.WARNING, logger=store.__name__):

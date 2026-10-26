@@ -51,8 +51,10 @@ def resolve_session_calibration(project: ProjectInfo, calib_root: Path) -> Path:
     changed that day. Raises CalibrationResolutionError, saying to pass --calib-dir, when the
     id is not found, the match is ambiguous, or no calibration qualifies.
 
-    A session older than every surviving calibration resolves to the oldest one, with a
-    warning: the calibration it was recorded with is gone, so its 3D will not reproduce.
+    A session older than every kept calibration is refused the same way (resolve_for_time):
+    the calibration it was recorded with is gone, and the oldest kept one is no stand-in
+    for it (spec, Old sessions). A session that names its calibration by id only gets a
+    warning if it seems to predate it, since the id says which calibration it used.
     """
     calib_root = Path(calib_root).expanduser()
     metadata = _session_metadata(project)
@@ -73,7 +75,8 @@ def resolve_session_calibration(project: ProjectInfo, calib_root: Path) -> Path:
                 )
     except CalibrationResolutionError as error:
         raise CalibrationResolutionError(f"{error}; {_CALIB_DIR_HINT}") from error
-    if window is not None:
+    if calibration_id and window is not None:
+        # By time, resolve_for_time has refused a calibration made after the session.
         _warn_if_made_after(folder, window[1], project)
     logger.info("session %s uses the calibration in %s", project.short_id, folder)
     return folder
