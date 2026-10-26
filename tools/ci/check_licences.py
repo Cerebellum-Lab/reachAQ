@@ -25,6 +25,7 @@ from pathlib import Path
 _FLAGS_NEEDING_ALLOWLIST = ("AGPL", "GPL")
 _FLAGS_UNIDENTIFIED = ("unknown", "none")
 _MAX_CELL_CHARS = 80
+_MAX_DECLARATION_CHARS = 500  # a longer License field is a bundled-notice blob
 
 # Checked in this order. A letter directly before the name is excluded so that
 # "LGPL" does not read as "GPL" and "GPLv3" still matches.
@@ -71,23 +72,34 @@ def _join(parts) -> str:
     return " | ".join(p.strip() for p in parts if p and p.strip() and p.strip().upper() != "UNKNOWN")
 
 
-def _licence_text(dist: metadata.Distribution) -> str:
-    """License-Expression, License and the "License ::" classifiers, in that order.
+def _is_notice_blob(text: str) -> bool:
+    """True for a License field that holds licence texts rather than a declaration."""
+    return "\n" in text or len(text) > _MAX_DECLARATION_CHARS
 
-    The free-text License field is used only when the expression and classifiers
-    do not identify a licence: wheels such as numpy, scipy and pandas put the
-    texts of their bundled third-party components (GPL, Affero, ...) in that
-    field while declaring BSD in the classifiers, and matching those texts would
-    flag them as AGPL/GPL.
+
+def _licence_text(dist: metadata.Distribution) -> str:
+    """The licence declared by a distribution, from its metadata.
+
+    A License-Expression is authoritative (PEP 639) and is used alone. Otherwise
+    the free-text License field is joined with the "License ::" classifiers, so
+    a short "GPL-3.0-or-later" is caught even next to an MIT classifier. The one
+    exception is a License field that is a bundled-notice blob (multi-line or
+    long): numpy, scipy and pandas put the texts of their bundled third-party
+    components (GPL, Affero, ...) there while declaring BSD in the classifiers,
+    and matching the blob would flag them as AGPL/GPL. The classifiers override
+    a blob only when they identify a licence; otherwise the blob is still used.
     """
     meta = dist.metadata
-    expression = meta.get("License-Expression")
-    free_text = meta.get("License")
+    expression = _join([meta.get("License-Expression")])
+    if expression:
+        return expression
+    free_text = _join([meta.get("License")])
     classifiers = [c for c in meta.get_all("Classifier") or () if c.startswith("License ::")]
-    structured = _join([expression, *classifiers])
-    if classify_licence(structured) not in _FLAGS_UNIDENTIFIED:
-        return structured
-    return _join([expression, free_text, *classifiers])
+    if _is_notice_blob(free_text):
+        structured = _join(classifiers)
+        if classify_licence(structured) not in _FLAGS_UNIDENTIFIED:
+            return structured
+    return _join([free_text, *classifiers])
 
 
 def installed_licences() -> list[DistLicence]:
