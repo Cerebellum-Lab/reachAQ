@@ -83,9 +83,17 @@ DEFAULT_THRESHOLDS: Thresholds = {
     "camera_rotation_change_deg": (0.5, None),
     "baseline_change_mm": (1.0, None),
     "focal_change_rel": (0.02, None),
+    # Informational (ruling R50): reported for the record and for months to be compared,
+    # never graded. The stereo fit's RMS over every corner of both cameras, in sensor px;
+    # each camera's RMS in each preset's own px (sensor RMS / binning); the length of the
+    # left-to-right baseline; and each camera's board coverage of the full sensor frame.
+    "stereo_reprojection_rms_px": (None, None),
+    "preset_reprojection_rms_px": (None, None),
+    "baseline_mm": (None, None),
+    "coverage_frame_fraction": (None, None),
 }
 # The metrics where a smaller value is worse; see the module docstring.
-LOWER_IS_WORSE = frozenset({"views_kept", "coverage_roi_fraction"})
+LOWER_IS_WORSE = frozenset({"views_kept", "coverage_roi_fraction", "coverage_frame_fraction"})
 NO_PREVIOUS_NOTE = "no comparable previous calibration"
 MOVED_NOTE = "camera moved since the previous calibration"
 # The motor's position report echoes its target (christielab10 motor check, 2026-10-26), so a
@@ -234,12 +242,14 @@ def build_report(
     cross_checks: Sequence[PresetCrossCheck],
     previous: Optional[PreviousCalibration],
     thresholds: Thresholds = DEFAULT_THRESHOLDS,
+    presets: Sequence[PresetGeometry] = (),
 ) -> QualityReport:
     """Grade `fit` and its capture against `thresholds`.
 
     roi_sensor is the base preset's sensor_roi(), in pixel edges. The stereo checks use
-    the first two cameras of the fit. The verdict is "fail" if any metric fails, else
-    "warn" if any warns, else "pass".
+    the first two cameras of the fit. Each camera's RMS is also reported in the pixels of
+    every preset in `presets`. The verdict is "fail" if any metric fails, else "warn" if
+    any warns, else "pass".
     """
     missing = sorted(set(DEFAULT_THRESHOLDS) - set(thresholds))
     if missing:
@@ -272,11 +282,17 @@ def build_report(
             notes.append(f"{cam}: {rejected} views rejected ({detail})")
 
     # Each camera: its residual, its coverage and the sanity of its intrinsics.
+    frame = (0.0, 0.0, float(fit.image_size[0]), float(fit.image_size[1]))
     for cam in cameras:
         model = fit.cameras[cam]
         fx, fy = model.K[0, 0], model.K[1, 1]
-        add("reprojection_rms_px", cam, fit.rms_px.get(cam, math.inf), "sensor px")
+        rms = fit.rms_px.get(cam, math.inf)
+        add("reprojection_rms_px", cam, rms, "sensor px")
+        for g in presets:
+            # A binned pixel is b sensor pixels wide, so a distance in sensor px is 1/b of it in preset px.
+            add("preset_reprojection_rms_px", cam, rms / g.binning, "preset px", f"preset {g.name}")
         add("coverage_roi_fraction", cam, coverage_fraction(observations, cam, roi), "of ROI")
+        add("coverage_frame_fraction", cam, coverage_fraction(observations, cam, frame), "of frame")
         add("fx_fy_ratio_dev", cam, abs(fx / fy - 1.0), "ratio")
         fx_std = fit.param_std.get(cam, {}).get("fx", math.inf)
         undetermined = "" if math.isfinite(fx_std) else "the capture does not determine fx"
@@ -285,14 +301,18 @@ def build_report(
         add("max_distortion_shift_px", cam, _max_distortion_shift(model, roi), "sensor px")
 
     # The pair.
+    add("stereo_reprojection_rms_px", None, _joint_rms(fit), "sensor px")
     if len(cameras) >= 2:
         first, second = cameras[:2]
         fx_a, fx_b = fit.cameras[first].K[0, 0], fit.cameras[second].K[0, 0]
         add("focal_left_right_rel", None, abs(fx_a - fx_b) / ((fx_a + fx_b) / 2), "ratio")
+        add("baseline_mm", None, float(np.linalg.norm(_centre(fit.cameras[second]) - _centre(fit.cameras[first]))),
+            "mm")
         epipolar, square, stereo_note = _stereo_checks(fit, observations, board, first, second)
     else:
         stereo_note = f"the fit has {len(cameras)} camera(s); a pair is needed"
         add("focal_left_right_rel", None, math.inf, "ratio", stereo_note)
+        add("baseline_mm", None, math.inf, "mm", stereo_note)
         epipolar = square = math.inf
     add("epipolar_error_px", None, epipolar, "sensor px", stereo_note)
     add("square_size_rel_error", None, square, "ratio", stereo_note)
@@ -510,6 +530,14 @@ def _change_metrics(fit: MotorFrameFit, previous: MotorFrameFit, add: Callable[.
     else:
         notes.append("the previous calibration lacks one of the pair, so the baseline change is not reported")
     return notes
+
+
+def _joint_rms(fit: MotorFrameFit) -> float:
+    """The RMS reprojection distance over every corner of every camera together, in sensor
+    px: the residual of the stereo fit itself. Every view has the same corners, so the mean
+    of the per-view mean squares is the mean over the corners. Infinite with no views."""
+    squares = [v * v for views in fit.per_view_rms_px.values() for v in views.values()]
+    return math.sqrt(sum(squares) / len(squares)) if squares else math.inf
 
 
 def _normalised(pixels: np.ndarray, model: CameraModel) -> np.ndarray:

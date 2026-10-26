@@ -254,7 +254,8 @@ def calibrate_capture(
         rejections=rejections,
     )
     previous = _previous(previous_dir, notes)
-    report = build_report(fit, observations, board, base.sensor_roi(), summary, cross_checks, previous)
+    report = build_report(fit, observations, board, base.sensor_roi(), summary, cross_checks, previous,
+                          presets=presets)
     report.notes.extend(notes)
 
     capture = {

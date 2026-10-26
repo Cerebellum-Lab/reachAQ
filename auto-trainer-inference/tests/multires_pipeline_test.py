@@ -222,6 +222,9 @@ def test_end_to_end_on_synthetic_videos(main):
     offsets = metrics(main.report, "cross_check_corner_offset_px")
     assert [m.note for m in offsets] == ["preset 256x256_bin4", "preset 512x512_bin2"]
     assert all(m.value < 0.1 and m.status == "pass" for m in offsets), main.report.to_text()
+    # Every preset's RMS is reported in its own pixels, for both cameras.
+    per_preset = {(m.camera, m.note) for m in metrics(main.report, "preset_reprojection_rms_px")}
+    assert per_preset == {(cam, f"preset {g.name}") for cam in CAMERAS for g in PRESETS}
     assert load_index(out) == main.index
     assert main.index.verdict == main.report.verdict
     saved = QualityReport.from_json((out / "quality_report.json").read_text(encoding="utf-8"))

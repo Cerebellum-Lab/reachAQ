@@ -258,10 +258,14 @@ thresholds it was graded with.
 | --- | --- | --- | --- | --- |
 | `views_kept` | camera | < 20 | < 10 | Distinct positions where this camera's board detection was kept (at most 36) |
 | `reprojection_rms_px` | camera | > 0.5 | > 1.0 | RMS distance between detected corners and the fit's projection, sensor px |
+| `preset_reprojection_rms_px` | camera, per preset | none | none | Informational. The same RMS in that preset's pixels (sensor RMS / binning); the note names the preset |
 | `coverage_roi_fraction` | camera | < 0.5 | < 0.25 | Fraction of the base preset's sensor window inside the union of the detected-corner hulls |
+| `coverage_frame_fraction` | camera | none | none | Informational. The same coverage as a fraction of the full 1440 x 1080 sensor frame |
 | `fx_fy_ratio_dev` | camera | > 0.01 | > 0.03 | \|fx/fy - 1\|; a large value is a sign of a poorly constrained fit |
 | `focal_rel_std` | camera | > 0.005 | > 0.02 | One-sigma uncertainty of fx, relative to fx; fails if the capture does not determine it |
 | `focal_left_right_rel` | pair | > 0.10 | none | \|fx left - fx right\| over their mean |
+| `stereo_reprojection_rms_px` | pair | none | none | Informational. RMS of the joint (stereo) fit over every corner of both cameras, sensor px |
+| `baseline_mm` | pair | none | none | Informational. Distance between the left and right camera centres, mm |
 | `principal_point_offset_frac` | camera | > 0.2 | > 0.4 | Distance of (cx, cy) from the window centre, each axis as a fraction of the window half-side |
 | `max_distortion_shift_px` | camera | > 60 | > 150 | Largest displacement the distortion model makes along the window border, sensor px |
 | `epipolar_error_px` | pair | > 0.5 | > 1.0 | Mean symmetric epipolar distance, sensor px, over positions both cameras saw |
@@ -275,6 +279,8 @@ thresholds it was graded with.
 | `baseline_change_mm` | pair, vs previous | > 1.0 | none | Change of the left-to-right camera-centre vector since the previous calibration |
 | `focal_change_rel` | camera, vs previous | > 0.02 | none | Relative change of fx since the previous calibration |
 
+- An informational metric has no limits: it is recorded so months can be
+  compared and never changes the verdict.
 - The change metrics appear only when the previous calibration is a format-2
   folder whose fit can be read. Otherwise the report notes "no comparable
   previous calibration".

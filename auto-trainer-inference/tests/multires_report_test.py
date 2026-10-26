@@ -34,6 +34,7 @@ from multires_synthetic import synthetic_rig
 
 
 BASE = PresetGeometry(4, 256, 256, 52, 6)
+PRESETS = presets_from_base(BASE)
 BASE_ROI = BASE.sensor_roi()  # (208, 24, 1232, 1048), pixel edges
 IMAGE_SIZE = (1440, 1080)
 CAMERAS = ("left", "right")
@@ -95,6 +96,7 @@ def report_for(fit, observations, board, roi, *, previous=None, capture=None, ch
         capture_for(observations) if capture is None else capture,
         cross_checks() if checks is None else checks,
         previous,
+        presets=PRESETS,
     )
 
 
@@ -425,6 +427,59 @@ def test_capture_problems_and_cross_checks_are_graded(rig, fitted):
     offsets = {m.note: m.status for m in report.metrics if m.name == "cross_check_corner_offset_px"}
     assert offsets == {"preset 256x256_bin4": "warn", "preset 512x512_bin2": "fail"}
     assert report.verdict == "fail"
+
+
+# Informational metrics (ruling R50): the spec's report contents that grade nothing.
+INFORMATIONAL = ("stereo_reprojection_rms_px", "preset_reprojection_rms_px", "baseline_mm", "coverage_frame_fraction")
+
+
+def test_informational_metrics_have_no_limits_and_never_grade(rig, fitted):
+    assert {name: DEFAULT_THRESHOLDS[name] for name in INFORMATIONAL} == {name: (None, None) for name in INFORMATIONAL}
+    # Few views and a small ROI fail other metrics; these stay pass whatever their value.
+    report = report_for(fitted, rig.observations[:4], rig.board, BASE_ROI)
+    informational = [m for m in report.metrics if m.name in INFORMATIONAL]
+    assert {m.name for m in informational} == set(INFORMATIONAL)
+    assert all(m.status == "pass" and m.warn is None and m.fail is None for m in informational)
+
+
+def test_the_stereo_fit_rms_pools_every_corner_of_both_cameras(rig, fitted):
+    report = report_for(fitted, rig.observations, rig.board, swept_roi(rig.observations))
+    # Every view has the same corners, so pooling the per-view RMS pools the corners.
+    per_view = [v for cam in CAMERAS for v in fitted.per_view_rms_px[cam].values()]
+    joint = metric(report, "stereo_reprojection_rms_px")
+    assert joint.value == pytest.approx(math.sqrt(np.mean(np.square(per_view))), rel=1e-12)
+    assert joint.unit == "sensor px"
+    assert min(fitted.rms_px.values()) <= joint.value <= max(fitted.rms_px.values())
+
+
+def test_reprojection_rms_is_reported_in_each_presets_px(rig, fitted):
+    report = report_for(fitted, rig.observations, rig.board, swept_roi(rig.observations))
+    for cam in CAMERAS:
+        found = {m.note: m for m in report.metrics if m.name == "preset_reprojection_rms_px" and m.camera == cam}
+        assert set(found) == {f"preset {g.name}" for g in PRESETS}, cam
+        for g in PRESETS:
+            m = found[f"preset {g.name}"]
+            assert m.value == pytest.approx(fitted.rms_px[cam] / g.binning, rel=1e-12) and m.unit == "preset px"
+
+
+def test_the_baseline_length_is_the_distance_between_the_camera_centres(exact_rig):
+    report = report_for(exact_rig.truth, exact_rig.observations, exact_rig.board, swept_roi(exact_rig.observations))
+    centres = {}
+    for cam in CAMERAS:
+        model = exact_rig.truth.cameras[cam]
+        centres[cam] = -cv2.Rodrigues(np.asarray(model.rvec, float))[0].T @ np.asarray(model.tvec, float).reshape(3)
+    baseline = metric(report, "baseline_mm")
+    assert baseline.value == pytest.approx(float(np.linalg.norm(centres["right"] - centres["left"])), rel=1e-12)
+    assert baseline.unit == "mm" and baseline.value > 0
+
+
+def test_coverage_of_the_full_frame_is_reported_beside_the_roi_coverage(rig, fitted):
+    report = report_for(fitted, rig.observations, rig.board, BASE_ROI)
+    for cam in CAMERAS:
+        full = metric(report, "coverage_frame_fraction", cam)
+        assert full.value == pytest.approx(coverage_fraction(rig.observations, cam, (0, 0, *IMAGE_SIZE)))
+        assert 0 < full.value <= 1 and full.unit == "of frame"
+        metric(report, "coverage_roi_fraction", cam)
 
 
 def test_verified_means_the_motor_reported_the_commanded_position(rig, fitted):
