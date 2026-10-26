@@ -83,6 +83,7 @@ def report():
     capture = CaptureSummary(
         waypoints_total=n,
         waypoints_verified=n,
+        waypoints_unreached=0,
         views_kept={cam: n for cam in CAMERAS},
         rejections={cam: {} for cam in CAMERAS},
     )

@@ -11,8 +11,9 @@ the rig's cameras with zero distortion.
 
 Each calibrate_capture run takes a while, so a run is a module fixture and several tests
 read it: the main run (all waypoints verified, capture settings logged, no previous
-calibration), a second run (one waypoint unverified, no capture settings logged, the main
-run as the previous calibration), a run against the legacy fixture folder, a run whose
+calibration), a second run (one waypoint unverified and reported 1.7 mm from where it was
+commanded, no capture settings logged, the main run as the previous calibration), a run
+against the legacy fixture folder, a run whose
 right camera labels the board from the other end, a degraded run (the 256 cross-check
 fit fails and the previous calibration's fit cannot be read), and a run whose cross-check
 maps the sensor corners with the pixel-edge convention.
@@ -111,12 +112,12 @@ def capture_frames(model):
             yield still
 
 
-def make_log(motor=None, verified=None, capture_settings=None) -> WaypointLog:
+def make_log(motor=None, verified=None, capture_settings=None, reported=None) -> WaypointLog:
     motor = [tuple(float(v) for v in p) for p in (MOTOR if motor is None else motor)]
     n = len(motor)
     return WaypointLog(
         motor=motor,
-        reported=[tuple(v + 0.01 for v in p) for p in motor],
+        reported=[tuple(v + 0.01 for v in p) for p in motor] if reported is None else list(reported),
         verified=[True] * n if verified is None else list(verified),
         dcs_moves=[("xyz"[i % 3], float(i)) for i in range(n)],
         times=[(1000.0 + i, 1000.75 + i) for i in range(n)],
@@ -154,7 +155,12 @@ def second(videos, main, tmp_path_factory) -> Run:
     folder = tmp_path_factory.mktemp("second")
     verified = [True] * N_WAYPOINTS
     verified[UNVERIFIED] = False
-    capture = make_capture(folder / "capture", videos["left"], videos["right"], make_log(verified=verified))
+    # ... because the motor reported it 1.7 mm short in x, as a stage stopped at its travel
+    # limit is (christielab10, 2026-10-26). The videos still show the commanded position.
+    reported = [tuple(float(v) + 0.01 for v in p) for p in MOTOR]
+    reported[UNVERIFIED] = (float(MOTOR[UNVERIFIED][0]) - 1.7, *reported[UNVERIFIED][1:])
+    log = make_log(verified=verified, reported=reported)
+    capture = make_capture(folder / "capture", videos["left"], videos["right"], log)
     return run(capture, folder / "out" / NAME, previous_dir=main.output_dir)
 
 
@@ -222,6 +228,10 @@ def test_end_to_end_on_synthetic_videos(main):
     assert saved.verdict == main.report.verdict and saved.notes == main.report.notes
     (unverified,) = metrics(main.report, "waypoints_unverified")
     assert unverified.value == 0 and unverified.status == "pass"
+    # reported 0.01 mm from where commanded on every axis: within 0.1 mm
+    (unreached,) = metrics(main.report, "waypoints_unreached")
+    assert unreached.value == 0 and unreached.status == "pass"
+    assert main.index.capture["waypoints_unreached"] == 0
     assert NO_PREVIOUS_NOTE in main.report.notes
 
 
@@ -264,6 +274,31 @@ def test_unverified_waypoints_warn(second):
     assert unverified.value == 1 and unverified.status == "warn"
     assert second.index.capture["waypoints_verified"] == N_WAYPOINTS - 1
     assert second.index.capture["waypoints_total"] == N_WAYPOINTS
+
+
+def test_a_waypoint_reported_away_from_its_commanded_position_fails(second):
+    # The fit tags the view with the commanded position, which the stage did not reach.
+    (unreached,) = metrics(second.report, "waypoints_unreached")
+    assert unreached.value == 1 and unreached.status == "fail"
+    assert second.report.verdict == "fail" and second.index.verdict == "fail"
+    assert second.index.capture["waypoints_unreached"] == 1
+    assert any(note.startswith(f"waypoint {UNVERIFIED}:") and "1.70 mm" in note for note in second.report.notes), \
+        second.report.notes
+
+
+def _log_reported(*reported):
+    motor = [(1.0, 2.0, 3.0)] * len(reported)
+    return make_log(motor=motor, reported=reported)
+
+
+@pytest.mark.parametrize("reported, unreached", [
+    ([(1.0, 2.0, 3.0), (1.0 - 1.7, 2.0, 3.0), (1.05, 2.05, 2.95)], [1]),  # one 1.7 mm off in x
+    ([None, None, (1.0, 2.0, 3.0)], []),  # no report: no evidence either way
+    ([(1.09, 1.91, 3.09), (1.0, 2.0, 3.0), (0.95, 2.0, 3.0)], []),  # all within 0.1 mm
+    ([(1.0, 2.0, 3.2), (math.nan, 2.0, 3.0), (1.0, math.inf, 3.0)], [0]),  # z 0.2 off; non-finite: none
+], ids=["one_off", "none", "within", "one_axis_and_non_finite"])
+def test_unreached_waypoints_are_the_finite_reports_beyond_0_1_mm(reported, unreached):
+    assert pipeline.unreached_waypoints(_log_reported(*reported)) == unreached
 
 
 def test_capture_settings_default_when_the_log_has_none(second):

@@ -70,6 +70,9 @@ DEFAULT_THRESHOLDS: Thresholds = {
     "square_size_rel_error": (0.01, 0.03),
     "motor_scale_dev": (0.01, None),
     "waypoints_unverified": (0.0, None),
+    # A waypoint the motor reported elsewhere than commanded puts its view where the board
+    # was not: the fit takes the commanded position, so any such waypoint fails.
+    "waypoints_unreached": (None, 0.0),
     # Informational: a preset's direct fit has a noise floor near 0.5 preset px in K even on
     # perfect synthetic frames (0.33 and 0.87 px measured), so it cannot fail a calibration.
     "cross_check_delta_px": (1.5, None),
@@ -191,6 +194,9 @@ class QualityReport:
 class CaptureSummary:
     waypoints_total: int
     waypoints_verified: int  # waypoints whose arrival the motor's last_position confirmed
+    # waypoints whose finite reported position is more than 0.1 mm from the commanded one
+    # on some axis (pipeline.unreached_waypoints)
+    waypoints_unreached: int
     views_kept: Dict[str, int]  # camera -> waypoints with the board found
     rejections: Dict[str, Dict[str, int]]  # camera -> reason -> views rejected
 
@@ -252,6 +258,7 @@ def build_report(
         counted = sum(cam in o.corners for o in observations)
         add("views_kept", cam, capture.views_kept.get(cam, counted), "views")
     add("waypoints_unverified", None, capture.waypoints_total - capture.waypoints_verified, "waypoints")
+    add("waypoints_unreached", None, capture.waypoints_unreached, "waypoints")
     for cam, reasons in capture.rejections.items():
         rejected = sum(reasons.values())
         if rejected:

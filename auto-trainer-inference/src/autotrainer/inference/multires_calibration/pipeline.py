@@ -100,6 +100,11 @@ _DEFAULT_CAPTURE_SETTINGS = {"gain_db": 1.0, "gamma": None, "exposure_us": 4500,
 _FRAMES_PER_WAYPOINT = 5
 # The WaypointLog fields that hold one entry per waypoint, beside `motor`.
 _PER_WAYPOINT_FIELDS = ("reported", "verified", "dcs_moves", "times")
+# A waypoint whose reported position is further than this from its commanded one, on any
+# axis, was not where the fit puts the board (mm). The christielab10 motor check
+# (2026-10-26) measured arrivals within 0.007 mm, and a stage stopped at its travel limit
+# 1.72 mm short.
+UNREACHED_TOLERANCE_MM = 0.1
 
 
 @dataclass
@@ -148,6 +153,19 @@ def load_waypoint_log(path: Path) -> WaypointLog:
         raise ValueError(f"{path} is not a waypoint log: {type(error).__name__}: {error}") from error
     _check_waypoint_log(log)
     return log
+
+
+def unreached_waypoints(log: WaypointLog, tolerance: float = UNREACHED_TOLERANCE_MM) -> List[int]:
+    """The waypoints whose reported position is more than `tolerance` mm from the commanded
+    one on some axis. A waypoint with no finite reported position carries no evidence
+    either way and is not counted."""
+    unreached = []
+    for k, (motor, reported) in enumerate(zip(log.motor, log.reported)):
+        if reported is None or not all(math.isfinite(v) for v in reported):
+            continue
+        if max(abs(r - m) for r, m in zip(reported, motor)) > tolerance:
+            unreached.append(k)
+    return unreached
 
 
 def calibrate_capture(
@@ -200,6 +218,16 @@ def calibrate_capture(
                 " (the board looks the same turned 180 degrees)"
             )
 
+    # The fit tags each view with its commanded position, so a waypoint the motor reported
+    # elsewhere puts its view in the wrong place; the report fails it.
+    unreached = unreached_waypoints(log)
+    for k in unreached:
+        off = max(abs(r - m) for r, m in zip(log.reported[k], log.motor[k]))
+        notes.append(
+            f"waypoint {k}: the motor reported {_format_xyz(log.reported[k])}, {off:.2f} mm from the"
+            f" commanded {_format_xyz(log.motor[k])}"
+        )
+
     base = max(presets, key=lambda g: g.binning)
     rejections: Dict[str, Dict[str, int]] = {cam: {} for cam in CAMERAS}
     for _, cam, reason in extraction.rejected:
@@ -207,6 +235,7 @@ def calibrate_capture(
     summary = CaptureSummary(
         waypoints_total=len(log.motor),
         waypoints_verified=sum(log.verified),
+        waypoints_unreached=len(unreached),
         views_kept={cam: sum(cam in o.corners for o in observations) for cam in CAMERAS},
         rejections=rejections,
     )
@@ -220,6 +249,7 @@ def calibrate_capture(
         "waypoints_total": len(log.motor),
         "waypoints_distinct": len(observations),
         "waypoints_verified": sum(log.verified),
+        "waypoints_unreached": len(unreached),
         "corner_refinement": refine,
         "segmentation_stats": extraction.segmentation_stats,
         "corner_order_reversed": reversed_order,
@@ -424,6 +454,10 @@ def _check_waypoint_log(log: WaypointLog) -> None:
 def _triple(values) -> Tuple[float, float, float]:
     x, y, z = (float(v) for v in values)
     return x, y, z
+
+
+def _format_xyz(values) -> str:
+    return "(" + ", ".join(f"{float(v):.3f}" for v in values) + ")"
 
 
 def _yaml_safe(value):

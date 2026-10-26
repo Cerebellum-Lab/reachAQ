@@ -65,11 +65,12 @@ def swept_roi(observations):
     return (float(lo[0]), float(lo[1]), float(hi[0]), float(hi[1]))
 
 
-def capture_for(observations, unverified=0, views_kept=None, rejections=None):
+def capture_for(observations, unverified=0, views_kept=None, rejections=None, unreached=0):
     counted = {cam: sum(cam in o.corners for o in observations) for cam in CAMERAS}
     return CaptureSummary(
         waypoints_total=len(observations),
         waypoints_verified=len(observations) - unverified,
+        waypoints_unreached=unreached,
         views_kept=counted if views_kept is None else views_kept,
         rejections={cam: {} for cam in CAMERAS} if rejections is None else rejections,
     )
@@ -409,6 +410,8 @@ def test_capture_problems_and_cross_checks_are_graded(rig, fitted):
 
     assert metric(report, "waypoints_unverified").value == 1
     assert metric(report, "waypoints_unverified").status == "warn"
+    assert metric(report, "waypoints_unreached").value == 0
+    assert metric(report, "waypoints_unreached").status == "pass"
     # The capture's own count wins over the observations'.
     assert metric(report, "views_kept", "left").value == 15
     assert metric(report, "views_kept", "left").status == "warn"
@@ -422,6 +425,22 @@ def test_capture_problems_and_cross_checks_are_graded(rig, fitted):
     offsets = {m.note: m.status for m in report.metrics if m.name == "cross_check_corner_offset_px"}
     assert offsets == {"preset 256x256_bin4": "warn", "preset 512x512_bin2": "fail"}
     assert report.verdict == "fail"
+
+
+def test_a_waypoint_the_stage_did_not_reach_fails_the_calibration(rig, fitted):
+    # The fit tags each view with the commanded position, so one waypoint the motor reported
+    # elsewhere is a view placed in the wrong spot: the calibration fails, not just warns.
+    assert DEFAULT_THRESHOLDS["waypoints_unreached"] == (None, 0.0)
+    clean = report_for(fitted, rig.observations, rig.board, swept_roi(rig.observations))
+    assert metric(clean, "waypoints_unreached").value == 0 and clean.verdict == "pass"
+
+    report = report_for(fitted, rig.observations, rig.board, swept_roi(rig.observations),
+                        capture=capture_for(rig.observations, unreached=1))
+
+    assert metric(report, "waypoints_unreached").value == 1
+    assert metric(report, "waypoints_unreached").status == "fail"
+    assert report.verdict == "fail"
+    assert not_passing(report) == [("waypoints_unreached", None, 1.0, "fail")]
 
 
 def test_write_coverage_images(rig, tmp_path):
