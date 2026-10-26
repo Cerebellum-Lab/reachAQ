@@ -2,14 +2,12 @@ name: Run unit tests
 on:
   push:
     branches:
-      - main
-      - develop
+      - feature-dev
       - devel
-      - github-actions
+      - 'ci/**'
   pull_request:
     branches:
-      - main
-      - develop
+      - feature-dev
       - devel
   workflow_dispatch:
     inputs:
@@ -27,19 +25,28 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.8"]
+        python-version: ["3.10"]
     env:
       FORCE_COLOR: '1'
     steps:
       - uses: actions/checkout@v4
         with:
-          lfs: true  # required for real data test files
+          lfs: false  # fetch LFS selectively in the step below, not the whole tree
           fetch-depth: 0  # required to fetch all history and all tags
           fetch-tags: true
+      - name: Cache Git LFS objects
+        uses: actions/cache@v4
+        with:
+          path: .git/lfs
+          key: lfs-${{ hashFiles('.gitattributes') }}-${{ github.sha }}
+          restore-keys: |
+            lfs-${{ hashFiles('.gitattributes') }}-
+      - name: Pull the LFS test data
+        run: git lfs pull --include="auto-trainer-inference/tests/**,tools/acquisition/view/*.png"
       - name: Install EGL and GL libraries
         run: |
           sudo apt-get update
-          sudo apt-get install -y libegl1 libgl1
+          sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3 ffmpeg
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
@@ -57,19 +64,24 @@ jobs:
           pip install --upgrade pip  # might be risky
           pip -V
           cat /home/runner/.config/pip/pip.conf
+          pip install "torch>=2.7,<2.8" "torchvision>=0.22,<0.23" --index-url https://download.pytorch.org/whl/cpu
           pip install -e ".[test]"
+      - name: Licence check
+        run: python -m tools.ci.check_licences --allowlist .github/licence-allowlist.txt
       - name: Show current version
         run: python -m setuptools_scm
       - name: Show auto-trainer and ensure we don't use sub-projects wheel(s)
         run: ./.check_sub_projects_not_installed.sh
       - name: Test with pytest
+        env:
+          QT_QPA_PLATFORM: offscreen
         run: |
           set -x
           export PYTEST_ADDOPTS="--color=yes"
           export COVERAGE_PROCESS_START="$PWD/.coveragerc"
           site_pkgs_dir=$(python -c "import site; print(site.getsitepackages()[0])")
           echo "import coverage; coverage.process_startup()" > "${site_pkgs_dir}/usercustomize.pth"
-          coverage run -m pytest -v -s ${{ github.event.inputs.pytest_extra_args }}
+          coverage run -m pytest auto-trainer-core/tests auto-trainer-video/tests auto-trainer-inference/tests auto-trainer-device/tests tests tools/acquisition/tests -q -p no:randomly -rs ${{ github.event.inputs.pytest_extra_args }}
       - name: Coverage
         run: |
           set -x
@@ -96,16 +108,8 @@ jobs:
             coverage report --include="${include}" || true
             echo
           done
-      - name: Sub-projects
-        run: |
-          set -e
-          set -x
-          pip uninstall auto-trainer -y
-          for sub_prj in $(cat auto_trainer_projects_order.txt)
-          do
-            pushd "${sub_prj}"
-            pip install -e .
-            ln -s ../top_fixtures.py
-            pytest -xvs || true  # TODO: top_fixtures contains everything mixed...
-            popd
-          done
+      - name: Upload HTML coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: htmlcov
+          path: htmlcov/
