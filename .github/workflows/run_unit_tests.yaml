@@ -46,7 +46,7 @@ jobs:
       - name: Install EGL and GL libraries
         run: |
           sudo apt-get update
-          sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3 ffmpeg
+          sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3 ffmpeg fonts-ubuntu
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
