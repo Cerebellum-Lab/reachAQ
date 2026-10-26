@@ -1,4 +1,7 @@
+import codecs
 from email.message import Message
+
+import pytest
 
 from tools.ci.check_licences import (
     DistLicence,
@@ -6,6 +9,7 @@ from tools.ci.check_licences import (
     evaluate,
     installed_licences,
     load_allowlist,
+    main,
     render_markdown,
 )
 
@@ -18,12 +22,32 @@ def test_classify_order():
     assert classify_licence("AGPL-3.0-only") == "AGPL"
     assert classify_licence("LGPL-3.0 OR GPL-2.0 OR GPL-3.0") == "LGPL"
     assert classify_licence("GPL-3.0-only") == "GPL"
+    # Expressions are not parsed: the first of AGPL, LGPL, GPL to match wins.
+    assert classify_licence("LGPL-2.1-only AND GPL-3.0-only") == "LGPL"
     assert classify_licence("BSD-3-Clause") == "permissive"
     assert classify_licence(None) == "none"
 
 
 def test_allowlist_normalizes_names():
     assert load_allowlist("Auto_Trainer.API  # why\n\n# c\n") == {"auto-trainer-api": "why"}
+
+
+@pytest.mark.parametrize("line", ["auto-trainer-api", "auto-trainer-api  #", "auto-trainer-api #   "])
+def test_allowlist_entry_without_a_reason_is_rejected(line):
+    with pytest.raises(ValueError, match="allowlist line 1"):
+        load_allowlist(line)
+
+
+def test_allowlist_file_with_a_byte_order_mark_has_no_bom_entry(tmp_path, monkeypatch, capsys):
+    # Windows editors save UTF-8 with a BOM. Read as plain utf-8 it stays glued to the
+    # first name, which then matches nothing: a violation plus a stale entry.
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_bytes(codecs.BOM_UTF8 + b"auto-trainer-api  # why\r\n")
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+    monkeypatch.setattr(
+        "tools.ci.check_licences.installed_licences", lambda: [d("auto-trainer-api", "AGPL")])
+    assert main(["--allowlist", str(allowlist)]) == 0
+    assert "\ufeff" not in capsys.readouterr().out
 
 
 def test_unlisted_agpl_and_gpl_are_violations_lgpl_is_not():
