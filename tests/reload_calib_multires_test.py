@@ -244,6 +244,32 @@ def test_a_broken_calibration_never_fails_a_configuration_load(
         app_model.reload_calib(folder)
 
 
+def test_an_explicit_reload_that_fails_leaves_the_next_configuration_load_retrying_its_folder(
+        app_model, tmp_path, system_config, trainer_config_dir):
+    # As after an install whose reload fails partway: the folder that was active (the legacy
+    # fixture) is not the one reloaded, and the reload cannot read a preset file. The next
+    # configuration load must try the installed folder, not the one before it.
+    _save_left_camera_params(system_config, trainer_config_dir, **BASE_PARAMS)
+    assert app_model.load_configuration() is True
+    previous = app_model.active_calibration_dir
+    folder = _write_multires(tmp_path / "installed" / DEFAULT_3D_CALIB_DIR_NAME)
+    assert previous is not None and previous != folder
+    preset_file = folder / "presets" / BASE.name / "camera_matrix" / "stereo_params.pickle"
+    kept = preset_file.read_bytes()
+    preset_file.unlink()
+
+    with pytest.raises(OSError):
+        app_model.reload_calib(folder)
+    assert app_model.active_calibration_dir == folder
+
+    preset_file.write_bytes(kept)
+    with mock.patch.object(app_model, "on_error") as on_error:
+        assert app_model.load_configuration() is True
+    assert _calibration_errors(on_error) == []
+    assert app_model.active_calibration_index == store.load_index(folder)
+    assert app_model._pose_algorithm.stereo_params is not None
+
+
 @pytest.mark.parametrize("index_text", ["format: [2\n", "format: 2\nid: abc\n"],
                          ids=["not yaml", "missing fields"])
 def test_an_unreadable_index_disables_3d_instead_of_loading_legacy(app_model, calib_dir, tmp_path, index_text):

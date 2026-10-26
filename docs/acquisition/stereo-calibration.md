@@ -89,7 +89,10 @@ value and limits, then notes. The thresholds are in
   session folder.
 
 An install takes effect at once: live 3D reloads the new calibration without a
-restart.
+restart. If that reload fails (an I/O fault, say), the calibration is still
+installed and the app says "3D calibration installed, but it could not be
+loaded: <reason>. Restart the app."; live 3D keeps what it had until the next
+configuration load or restart, which loads the installed folder.
 
 ## After a new calibration: redo the coordinate system
 

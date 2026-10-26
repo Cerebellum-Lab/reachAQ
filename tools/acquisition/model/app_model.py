@@ -2349,6 +2349,11 @@ class AppModel(ObservableObject):
     def _load_calibration(self, calib_dir: Optional[Path], *, report: bool):
         calib_src_dir = self._calibration_folder(calib_dir)
         logger.info("loading calib from %s", calib_src_dir)
+        # The folder is committed before anything in it is read, so the next configuration
+        # load retries it even when this load raises: after an install, the folder active
+        # before may be a dated backup by now. The index and the live 3D inputs change only
+        # once the load succeeds, so they keep describing the calibration live 3D still runs.
+        self._active_calibration_dir = calib_src_dir if calib_src_dir.exists() else None
         frame_transform = None
         calibration_index = None
         live_preset = None
@@ -2396,7 +2401,6 @@ class AppModel(ObservableObject):
             cam_offsets = None
             disabled_reason = f"no 3D calibration at {calib_src_dir}"
             logger.warning("calib_src_dir=%r does not exist", calib_src_dir.as_posix())
-        self._active_calibration_dir = calib_src_dir if calib_src_dir.exists() else None
         self._active_calibration_index = calibration_index
         self._active_calibration_preset = None if live_preset is None else live_preset.geometry
         self._live_3d_disabled_reason = disabled_reason

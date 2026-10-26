@@ -204,13 +204,14 @@ def _given_back(window) -> bool:
             and not window.make_3d_calib_action.checked and window._app_model.status is AppModelStatus.IDLE)
 
 
-def _window(location: Path, monkeypatch, *, override_answer=None, dcs_after=DcsState.VALID):
+def _window(location: Path, monkeypatch, *, override_answer=None, dcs_after=DcsState.VALID, reload_error=None):
     """A window, mid-calibration, whose dialogs, events and model calls are recorded.
 
     override_answer is what the fail dialog and its confirmation answer together; None
     fails the test if they are shown. reload_calib sets dcs_state to dcs_after, as the
-    real one recomputes it against the calibration it loads. given_back records, at each
-    call of the dialog and of reload_calib, whether the app had already been given back.
+    real one recomputes it against the calibration it loads, and then raises reload_error
+    if one is given. given_back records, at each call of the dialog and of reload_calib,
+    whether the app had already been given back.
     """
     seen = SimpleNamespace(boxes=[], errors=[], events=[], reloaded=[], given_back=[])
 
@@ -218,6 +219,8 @@ def _window(location: Path, monkeypatch, *, override_answer=None, dcs_after=DcsS
         seen.given_back.append(("reload", _given_back(window)))
         seen.reloaded.append(Path(path))
         app_model.dcs_state = dcs_after
+        if reload_error is not None:
+            raise reload_error
 
     def ask(report):
         seen.given_back.append(("ask", _given_back(window)))
@@ -238,6 +241,7 @@ def _window(location: Path, monkeypatch, *, override_answer=None, dcs_after=DcsS
         _calibration_due_label=_Label(),
     )
     window._install_3d_calib = partial(MainWindow._install_3d_calib, window)
+    window._show_3d_calib_installed = partial(MainWindow._show_3d_calib_installed, window)
     window._end_3d_calib = partial(MainWindow._end_3d_calib, window)
     window._set_calibration_due_label = partial(MainWindow._set_calibration_due_label, window)
     monkeypatch.setattr(main_window_module, "QMessageBox", SimpleNamespace(
@@ -425,6 +429,61 @@ def test_an_override_whose_install_fails_is_logged_as_failed(tmp_path, location,
     assert [m.split(":")[0] for m in logs] == ["override recorded (install pending)", "install failed"]
     assert [kind for kind, *_ in seen.events] == [ApiEventKind.calibration3dFailed]
     assert _given_back(window)
+
+
+# Once the new calibration is installed, the calibration has completed: a reload that fails
+# after it, or a dialog that cannot be shown, must neither call it failed nor lose the event.
+
+def test_a_reload_that_fails_after_the_install_says_installed_but_not_loaded(tmp_path, location, monkeypatch):
+    produced = _produced(tmp_path / "session", "pass")
+    window, seen = _window(location, monkeypatch, reload_error=OSError("the preset file is gone"))
+
+    _finish(window, None, produced)
+
+    installed = location / DEFAULT_3D_CALIB_DIR_NAME
+    assert store.load_index(installed).id == produced[2].id
+    assert seen.reloaded == [installed]
+    assert seen.errors == [], "not reported as a failed calibration"
+    assert ("3D calibration not loaded",
+            "3D calibration installed, but it could not be loaded: the preset file is gone. Restart the app."
+            ) in seen.boxes
+    assert seen.events == [(ApiEventKind.calibration3dCompleted,)]
+    assert window._calibration_due_label.visible is False
+    assert _given_back(window)
+
+
+def test_a_dialog_that_fails_after_the_install_still_reports_completed(tmp_path, location, monkeypatch, caplog):
+    produced = _produced(tmp_path / "session", "pass")
+    window, seen = _window(location, monkeypatch)
+
+    def no_display(title, text, icon):
+        raise RuntimeError("no display")
+
+    window._show_msg_box = no_display
+    with caplog.at_level(logging.ERROR, logger=main_window_module.__name__):
+        _finish(window, None, produced)
+
+    assert store.load_index(location / DEFAULT_3D_CALIB_DIR_NAME).id == produced[2].id
+    assert seen.events == [(ApiEventKind.calibration3dCompleted,)]
+    assert _given_back(window)
+    assert any(r.exc_info and "no display" in str(r.exc_info[1]) for r in caplog.records)
+
+
+def test_a_status_restore_that_fails_still_shows_the_install_and_reports_completed(
+        tmp_path, location, monkeypatch, caplog):
+    produced = _produced(tmp_path / "session", "pass")
+    window, seen = _window(location, monkeypatch)
+
+    def refused(prev_status):
+        raise RuntimeError("status refused")
+
+    window._end_3d_calib = refused
+    with caplog.at_level(logging.ERROR, logger=main_window_module.__name__):
+        _finish(window, None, produced)
+
+    assert [title for title, _ in seen.boxes] == ["3D calibration installed"]
+    assert seen.events == [(ApiEventKind.calibration3dCompleted,)]
+    assert any(r.exc_info and "status refused" in str(r.exc_info[1]) for r in caplog.records)
 
 
 # The status bar's "3D calibration due" label (shown by the monthly reminder) goes away when a

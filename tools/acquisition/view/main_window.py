@@ -914,38 +914,67 @@ class MainWindow(QMainWindow):
 
         One API event per calibration: calibration3dFailed with the reason when the
         calibration or its install raised, else calibration3dCompleted, also when the
-        operator kept a failed calibration out.
+        operator kept a failed calibration out. Once installed, the calibration has
+        completed: a reload that fails after the install says so and asks for a restart,
+        and a status restore or a dialog that fails is logged without losing the event.
         """
         installed_report = None
+        load_error = None
         try:
             if error is None:
                 try:
                     _capture_dir, new_dir, index, report = result
-                    installed_report = self._install_3d_calib(new_dir, index, report)
+                    installed = self._install_3d_calib(new_dir, index, report)
                 except Exception as err:
                     logger.exception("3d-calib could not be completed: %s", err)
                     error = err
+                else:
+                    if installed is not None:
+                        installed_dir, installed_report = installed
+                        try:
+                            self._app_model.reload_calib(installed_dir)
+                        except Exception as err:
+                            # The next configuration load retries this folder (reload_calib
+                            # commits it first); until then live 3D runs on what it had.
+                            logger.exception("3D calibration %s: installed, but could not be loaded", index.id)
+                            load_error = err
         finally:
-            self._end_3d_calib(prev_status)
+            try:
+                self._end_3d_calib(prev_status)
+            except Exception:
+                logger.exception("could not give the app back after the 3D calibration")
         if error is not None:
             reason = str(error)
             self._post_api_event(ApiEventKind.calibration3dFailed, dict(reason=reason))
             QMessageBox.critical(self, "3D calibration failed", reason or type(error).__name__)
             return
         if installed_report is not None:
-            # A new calibration is active, so the monthly reminder's status-bar label is out of date. It
-            # stays when the previous calibration is kept or the install failed: that one is still active.
-            self._set_calibration_due_label(None)
-            self._show_msg_box(
-                "3D calibration installed", _preformatted(installed_report.to_text()), QMessageBox.Icon.Information)
-            # A DCS measured against the previous calibration is held off and blocks Record until
-            # it is redone. With no DCS at all, the existing missing-DCS warning applies instead.
-            if self._app_model.dcs_state is DcsState.STALE:
-                self._show_msg_box(
-                    "Coordinate system out of date",
-                    "Redo Tools → Calibrate Coordinate System before running sessions.",
-                    QMessageBox.Icon.Warning)
+            try:
+                self._show_3d_calib_installed(installed_report, load_error)
+            except Exception:
+                logger.exception("the installed 3D calibration's outcome could not be shown")
         self._post_api_event(ApiEventKind.calibration3dCompleted)
+
+    def _show_3d_calib_installed(self, report: QualityReport, load_error: Optional[BaseException]) -> None:
+        """Tell the operator a new calibration is installed: its report, and that it is not
+        loaded yet when its reload failed, or that DCS must be redone when it is stale."""
+        # A new calibration is active, so the monthly reminder's status-bar label is out of date. It
+        # stays when the previous calibration is kept or the install failed: that one is still active.
+        self._set_calibration_due_label(None)
+        if load_error is not None:
+            reason = str(load_error) or type(load_error).__name__
+            self._show_msg_box(
+                "3D calibration not loaded",
+                f"3D calibration installed, but it could not be loaded: {reason}. Restart the app.",
+                QMessageBox.Icon.Warning)
+        self._show_msg_box("3D calibration installed", _preformatted(report.to_text()), QMessageBox.Icon.Information)
+        # A DCS measured against the previous calibration is held off and blocks Record until
+        # it is redone. With no DCS at all, the existing missing-DCS warning applies instead.
+        if self._app_model.dcs_state is DcsState.STALE:
+            self._show_msg_box(
+                "Coordinate system out of date",
+                "Redo Tools → Calibrate Coordinate System before running sessions.",
+                QMessageBox.Icon.Warning)
 
     def _end_3d_calib(self, prev_status: AppModelStatus) -> None:
         """Give Run, the 3D calibration action and the app status back to the operator."""
@@ -955,11 +984,11 @@ class MainWindow(QMainWindow):
         self._app_model.status = prev_status
 
     def _install_3d_calib(self, new_dir: Path, index: CalibrationIndex,
-                          report: QualityReport) -> Optional[QualityReport]:
+                          report: QualityReport) -> Optional[Tuple[Path, QualityReport]]:
         """Install the calibration in `new_dir` on a pass or warn report, or on a fail the operator overrides.
 
-        Returns the report as installed, with any override, or None when the previous
-        calibration is kept.
+        Returns (the installed folder, the report as installed, with any override), or None
+        when the previous calibration is kept. Loading it is left to the caller.
         """
         install, override = decide_install(report.verdict, lambda: self._ask_install_failed_3d_calib(report))
         if not install:
@@ -978,8 +1007,7 @@ class MainWindow(QMainWindow):
             logger.error("3D calibration %s: install failed", index.id)
             raise
         logger.success("3D calibration %s: installed", index.id)
-        self._app_model.reload_calib(installed)
-        return report
+        return installed, report
 
     def _ask_install_failed_3d_calib(self, report: QualityReport) -> bool:
         """Whether to install a calibration whose quality report failed.
