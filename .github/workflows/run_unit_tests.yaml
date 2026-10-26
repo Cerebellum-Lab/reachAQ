@@ -16,13 +16,16 @@ on:
         required: true
         default: ''
         type: string
+permissions:
+  contents: read
 concurrency:  # allow cancel if new commit pushed
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 jobs:
   build-and-test:
     name: Setup env. and run tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     strategy:
       matrix:
         python-version: ["3.10"]
@@ -38,15 +41,21 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .git/lfs
-          key: lfs-${{ hashFiles('.gitattributes') }}-${{ github.sha }}
+          key: lfs-${{ hashFiles('.gitattributes', 'auto-trainer-inference/tests/**', 'tools/acquisition/view/*.png') }}
           restore-keys: |
-            lfs-${{ hashFiles('.gitattributes') }}-
+            lfs-
       - name: Pull the LFS test data
-        run: git lfs pull --include="auto-trainer-inference/tests/**,tools/acquisition/view/*.png"
-      - name: Install EGL and GL libraries
+        run: |
+          git lfs pull --include="auto-trainer-inference/tests/**,tools/acquisition/view/*.png" --exclude="vendor/**"
+          du -sh .git/lfs
+          test "$(find .git/lfs/objects -type f | wc -l)" -eq 25
+      - name: Install system libraries, ffmpeg and the Ubuntu font
         run: |
           sudo apt-get update
           sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3 ffmpeg fonts-ubuntu
+      - name: Check the Ubuntu font is installed
+        run: |
+          fc-list : family | grep -qx Ubuntu
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
@@ -66,6 +75,8 @@ jobs:
           cat /home/runner/.config/pip/pip.conf
           pip install "torch>=2.7,<2.8" "torchvision>=0.22,<0.23" --index-url https://download.pytorch.org/whl/cpu
           pip install -e ".[test]"
+      - name: Check torch is the CPU build
+        run: python -c "import torch,sys; print(torch.__version__); sys.exit(not torch.__version__.endswith('+cpu'))"
       - name: Licence check
         run: python -m tools.ci.check_licences --allowlist .github/licence-allowlist.txt
       - name: Show current version
@@ -75,14 +86,16 @@ jobs:
       - name: Test with pytest
         env:
           QT_QPA_PLATFORM: offscreen
+          PYTEST_EXTRA_ARGS: ${{ github.event.inputs.pytest_extra_args }}
         run: |
           set -x
           export PYTEST_ADDOPTS="--color=yes"
           export COVERAGE_PROCESS_START="$PWD/.coveragerc"
           site_pkgs_dir=$(python -c "import site; print(site.getsitepackages()[0])")
           echo "import coverage; coverage.process_startup()" > "${site_pkgs_dir}/usercustomize.pth"
-          coverage run -m pytest auto-trainer-core/tests auto-trainer-video/tests auto-trainer-inference/tests auto-trainer-device/tests tests tools/acquisition/tests -q -p no:randomly -rs ${{ github.event.inputs.pytest_extra_args }}
+          coverage run -m pytest auto-trainer-core/tests auto-trainer-video/tests auto-trainer-inference/tests auto-trainer-device/tests tests tools/acquisition/tests -q -p no:randomly -rs $PYTEST_EXTRA_ARGS
       - name: Coverage
+        if: ${{ !cancelled() }}
         run: |
           set -x
           coverage combine
@@ -109,6 +122,7 @@ jobs:
             echo
           done
       - name: Upload HTML coverage report
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
           name: htmlcov

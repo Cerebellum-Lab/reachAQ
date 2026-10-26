@@ -8,6 +8,10 @@ no longer matches an installed AGPL/GPL distribution is stale and also fails
 the check. LGPL is allowed. Distributions whose licence cannot be identified
 are reported but do not fail the check.
 
+Licence expressions are not parsed. Classification is first-match in the order
+AGPL, then LGPL, then GPL, so an expression such as "LGPL-2.1-only AND
+GPL-3.0-only" classifies as LGPL.
+
 Usage, from the repository root:
     python -m tools.ci.check_licences --allowlist .github/licence-allowlist.txt
 """
@@ -122,7 +126,11 @@ def installed_licences() -> list[DistLicence]:
 
 
 def load_allowlist(text: str) -> dict[str, str]:
-    """Parse "name  # reason" lines into {normalized name: reason}."""
+    """Parse "name  # reason" lines into {normalized name: reason}.
+
+    Every entry must give a reason: an allowlisted exception nobody can explain
+    is not one the list should keep.
+    """
     allowlist: dict[str, str] = {}
     for number, line in enumerate(text.splitlines(), start=1):
         line = line.strip()
@@ -130,9 +138,10 @@ def load_allowlist(text: str) -> dict[str, str]:
             continue
         name, _, reason = line.partition("#")
         name = name.strip()
-        if not name or len(name.split()) != 1:
+        reason = reason.strip()
+        if not name or len(name.split()) != 1 or not reason:
             raise ValueError(f"allowlist line {number}: expected 'name  # reason', got {line!r}")
-        allowlist[_normalize(name)] = reason.strip()
+        allowlist[_normalize(name)] = reason
     return allowlist
 
 
@@ -200,7 +209,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--allowlist", type=Path, required=True)
     args = parser.parse_args(argv)
 
-    allowlist = load_allowlist(args.allowlist.read_text(encoding="utf-8"))
+    allowlist = load_allowlist(args.allowlist.read_text(encoding="utf-8-sig"))
     dists = installed_licences()
     ev = evaluate(dists, allowlist)
     markdown = render_markdown(ev, dists)
