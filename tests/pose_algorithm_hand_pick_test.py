@@ -9,9 +9,10 @@ which sorts every row to read one. Measured on the rig that is 313 us per call
 and it runs once per hand per camera on every live batch: 1.25 ms of a 6.57 ms
 PoseAlgorithm.process, in a loop with a 10-20 ms budget.
 
-`iloc[argmax(likelihood)]` selects the same row. These tests pin that, because
-the two are only equivalent as long as both resolve a tie to the first row at
-the maximum, and a future change to either side could silently diverge.
+`iloc[argmax(likelihood)]` selects the same row as the old call except on exact
+likelihood ties, where quicksort's choice was platform-dependent (see
+`previous()`). These tests hold argmax to the stable-sort pick, which takes the
+first row at the maximum.
 """
 
 import numpy
