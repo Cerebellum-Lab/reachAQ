@@ -173,7 +173,8 @@ A format-2 folder:
 4mm_6r_8c_4x/
   calibration.yaml          the index, written last: format, id, created, board,
                             presets (name, binning, size, ROI offset), verdict,
-                            override, motor_scale, capture settings
+                            override, motor_scale, capture (settings, statistics,
+                            and capture_folder: the capture's absolute path)
   sensor/fit.yaml           the full fit in sensor pixels: K, dist, rvec, tvec per
                             camera, board rotation, motor scale, RMS, parameter std
   presets/<WxH_binB>/       one per preset, for example presets/256x256_bin4/
@@ -186,7 +187,7 @@ A format-2 folder:
   quality_report.json       the report, with the thresholds it was graded with
   quality_report.txt        the operator's summary
   coverage_left.png, coverage_right.png
-  waypoints.yaml, source_videos/    copied from the capture
+  waypoints.yaml            copied from the capture
   camera_offsets.pkl        only after DCS is redone; written by DCS, never by the calibration
 ```
 
@@ -199,8 +200,11 @@ A format-2 folder:
   new folder has one, and nothing copies the previous calibration's into the
   new one. Offsets are measured by DCS against a particular calibration, so the
   previous ones are wrong in the new frame. They stay in the dated backup.
-- Because the capture videos and `waypoints.yaml` are in the folder, a
-  calibration can be recomputed later; see Part 3.
+- **The capture videos are not copied** into the calibration, nor into its
+  install and backups. They stay in the session's capture folder, which
+  `calibration.yaml` names as `capture.capture_folder` (absolute), so a
+  calibration can be recomputed later as long as that session folder is kept;
+  see Part 3.
 
 ## Presets
 
@@ -464,8 +468,9 @@ drift monitor uses, not copied from its flips and not taken from the test-only
 
 `calibrate_capture` takes a capture folder and writes a new calibration. The
 capture folder needs `waypoints.yaml` and `source_videos/left.mp4` and
-`right.mp4`, so a session's `4mm_6r_8c_4x/` works, and so does an installed
-calibration folder, which carries copies of both.
+`right.mp4`: a session's `4mm_6r_8c_4x/`, which an installed calibration names
+as `capture.capture_folder` in its `calibration.yaml`. The calibration folder
+itself holds no videos.
 
 ```python
 from pathlib import Path

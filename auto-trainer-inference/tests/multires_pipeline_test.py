@@ -19,7 +19,6 @@ fit fails and the previous calibration's fit cannot be read), and a run whose cr
 maps the sensor corners with the pixel-edge convention.
 """
 
-import filecmp
 import math
 import shutil
 import time
@@ -249,7 +248,7 @@ def test_fit_recovers_the_rendered_cameras(main):
     assert fit.motor_scale == pytest.approx(1.0, abs=2e-3)
 
 
-def test_capture_info_and_sources_are_kept(main):
+def test_capture_info_is_kept_and_the_source_videos_are_named_not_copied(main):
     out, capture = main.output_dir, main.index.capture
     assert {key: capture[key] for key in LOGGED_SETTINGS} == LOGGED_SETTINGS
     assert capture["waypoints_total"] == capture["waypoints_distinct"] == capture["waypoints_verified"] == N_WAYPOINTS
@@ -265,9 +264,14 @@ def test_capture_info_and_sources_are_kept(main):
     # The index is plain YAML: safe_load reads back what load_index returned.
     assert yaml.safe_load((out / INDEX_FILE).read_text(encoding="utf-8"))["capture"] == capture
 
+    # The videos stay in the capture, which the calibration names, absolute, rather than
+    # copied into every calibration and again into every install (M5).
+    assert capture["capture_folder"] == str(main.capture_dir.resolve())
+    assert Path(capture["capture_folder"]).is_absolute()
+    assert not (out / SOURCE_VIDEOS).exists()
+    assert not list(out.rglob("*.mp4"))
     for cam in CAMERAS:
-        source = main.capture_dir / SOURCE_VIDEOS / f"{cam}.mp4"
-        assert filecmp.cmp(source, out / SOURCE_VIDEOS / f"{cam}.mp4", shallow=False), cam
+        assert (main.capture_dir / SOURCE_VIDEOS / f"{cam}.mp4").is_file(), cam
         assert (out / f"coverage_{cam}.png").is_file(), cam
     assert load_waypoint_log(out / WAYPOINT_LOG) == load_waypoint_log(main.capture_dir / WAYPOINT_LOG)
 

@@ -29,9 +29,9 @@ calibrate_capture turns it into a calibration folder (store.py):
    is not aborted.
 5. The report compares with the previous calibration when that is one of these folders; a
    legacy folder has no motor-frame fit to compare with.
-6. The calibration is written with the coverage images, the source videos and waypoints.yaml,
-   all before its index (store.write_calibration's extra_files), so a folder that loads always
-   has its sources.
+6. The calibration is written with the coverage images and waypoints.yaml, both before its
+   index (store.write_calibration's extra_files). The source videos are not copied: the
+   index's capture.capture_folder names the capture folder, absolute, where they stay.
 
 Errors are not caught here: WaypointAlignmentError from extraction, RuntimeError and
 ValueError from the sensor fit and FileExistsError for an existing output folder reach the
@@ -270,13 +270,14 @@ def calibrate_capture(
         "still_frames": still,
         "corner_order_reversed": reversed_order,
         "corner_scatter_px": extraction.corner_scatter_px,
+        # Where the source videos stay: they are not copied into the calibration, which the
+        # install copies again and every backup keeps (two 1440x1080 videos a month).
+        "capture_folder": str(capture_dir.resolve()),
     }
     with tempfile.TemporaryDirectory(prefix="calibration_coverage_") as tmp:
         coverage = write_coverage_images(observations, image_size, base.sensor_roi(), Path(tmp), CAMERAS)
         extra_files = {path.name: path for path in coverage}
         extra_files[WAYPOINT_LOG] = capture_dir / WAYPOINT_LOG
-        for source in sorted(p for p in (capture_dir / SOURCE_VIDEOS).rglob("*") if p.is_file()):
-            extra_files[source.relative_to(capture_dir).as_posix()] = source
         index = write_calibration(
             output_dir,
             fit=fit,
