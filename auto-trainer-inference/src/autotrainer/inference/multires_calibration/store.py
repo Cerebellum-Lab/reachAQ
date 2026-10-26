@@ -29,6 +29,7 @@ the two compare directly. The calibration in force at time t is the backup with 
 suffix after t, or the active folder when no backup ended after t.
 """
 
+import logging
 import os
 import shutil
 import uuid
@@ -36,7 +37,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import yaml
@@ -74,6 +75,8 @@ _REPORT_TEXT = "quality_report.txt"
 _PARTIAL_SUFFIX = ".partial"
 # The pair the stereo parameters describe, in their order: cameraMatrix1 is the first.
 _CAMERAS = tuple(STEREO_KEY.split("-"))
+# The folders calibration_candidates has warned about as named like a backup but not one.
+_WARNED_MISNAMED: Set[Path] = set()
 
 _README = """\
 {name}: one preset of a reachAQ multi-resolution 3D calibration.
@@ -292,7 +295,8 @@ def calibration_candidates(root: Path, name: str = DEFAULT_3D_CALIB_DIR_NAME) ->
     """The backups of `root/name`, earliest end first, then the active folder if it exists.
 
     A backup is a folder named f"{name}_" plus a suffix that parses with DATE_TIME_FORMAT.
-    Another folder starting with f"{name}_" is ignored with a warning; folders such as
+    Another folder starting with f"{name}_" is ignored with a warning (once per process,
+    then at debug level); folders such as
     f"{name}.partial" or f"{name}.new" are not backups and are ignored silently.
     """
     root = Path(root)
@@ -306,9 +310,13 @@ def calibration_candidates(root: Path, name: str = DEFAULT_3D_CALIB_DIR_NAME) ->
         try:
             active_until = datetime.strptime(suffix, DATE_TIME_FORMAT)
         except ValueError:
-            logger.warning(
-                "ignoring %s: it is named like a backup of %s, but %r is not a %s time", child, name, suffix,
-                DATE_TIME_FORMAT,
+            # Every lookup lists the folders again (christielab10's 4mm_6r_8c_4x_crop256, for
+            # every session processed), so the warning is given once per process per folder.
+            level = logging.DEBUG if child in _WARNED_MISNAMED else logging.WARNING
+            _WARNED_MISNAMED.add(child)
+            logger.log(
+                level, "ignoring %s: it is named like a backup of %s, but %r is not a %s time", child, name,
+                suffix, DATE_TIME_FORMAT,
             )
             continue
         backups.append(CalibrationCandidate(child, active_until, _calibration_id(child)))

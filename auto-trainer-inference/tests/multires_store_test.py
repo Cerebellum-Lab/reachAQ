@@ -362,6 +362,18 @@ def test_backup_names_that_do_not_parse_are_ignored_with_a_warning(tmp_path, cap
     assert len(warnings) == 1 and f"{NAME}_crop256" in warnings[0]
 
 
+def test_a_folder_named_like_a_backup_is_warned_about_once_per_process(tmp_path, caplog):
+    # Every lookup lists the folders again (the rig's 4mm_6r_8c_4x_crop256, on every session's
+    # offline 3D): one warning says it, later lookups log it at debug level.
+    for name in (NAME, f"{NAME}_crop256"):
+        (tmp_path / name).mkdir()
+    with caplog.at_level(logging.DEBUG, logger=store.__name__):
+        for _ in range(3):
+            calibration_candidates(tmp_path)
+    about = [r.levelno for r in caplog.records if f"{NAME}_crop256" in r.getMessage()]
+    assert about == [logging.WARNING, logging.DEBUG, logging.DEBUG]
+
+
 def test_find_by_id(tmp_path, report):
     active = tmp_path / NAME
     backup = tmp_path / f"{NAME}_20260303_090815"
