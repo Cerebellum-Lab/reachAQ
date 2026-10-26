@@ -121,6 +121,8 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         message_handler.decoded_message_received += self._decoded_device_message
 
         self._dcs_config: Optional[DiamondTriangleOffsetConfig] = None
+        # Why moves given in DCS refuse while _dcs_config is None, when the app says (set_diamond_triangle_config).
+        self._dcs_unavailable_reason: Optional[str] = None
         # Cache physical and requested coordinates separately so relative moves
         # cannot silently overwrite the saved pellet-send position.
         self._last_motor_coordinates = _nans_offset3dTuple
@@ -219,11 +221,20 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         if cfg is None or not cfg.fully_valid:
             if return_none:
                 return None
+            if cfg is None and self._dcs_unavailable_reason:
+                raise RuntimeError(f"DCS move refused: {self._dcs_unavailable_reason}")
             raise RuntimeError(f"DCS config not defined or not fully valid: {None if cfg is None else cfg.__dict__}")
         return cfg
 
-    def set_diamond_triangle_config(self, config: Optional[DiamondTriangleOffsetConfig]):
+    def set_diamond_triangle_config(self, config: Optional[DiamondTriangleOffsetConfig], *,
+                                    unavailable_reason: Optional[str] = None):
+        """The DCS configuration moves given in DCS convert with; None refuses them.
+
+        `unavailable_reason` says why a None is held back rather than missing (the app's
+        stale DCS), and a refused move says it; it is dropped with any configuration.
+        """
         self._dcs_config = config
+        self._dcs_unavailable_reason = unavailable_reason if config is None else None
 
     @property
     def load_arm_position(self) -> float:

@@ -60,6 +60,7 @@ from autotrainer.core import (
     normalize_rfid,
 )
 from autotrainer.core.configuration.json_compat import SystemConfigurationJSONEncoder
+from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
 from autotrainer.core.interfaces import RecordingEndingReason, CaptureAnalysisResult
 from autotrainer.core.project import ProjectInfo, ProjectDependentProtocol
 from autotrainer.core.config_directory import DEFAULT_CONFIG_DIR
@@ -2528,6 +2529,9 @@ class AppModel(ObservableObject):
             state = dcs_state(algo.loaded_diamond_triangle_config, self._active_calibration_index)
             prev, self._dcs_state = self._dcs_state, state
             algo.set_dcs_suppressed(state is DcsState.STALE)
+            # The hold announces only a changed configuration, so a None that stays None
+            # (stale, then missing) would leave the hardware the old reason to refuse with.
+            self._hand_dcs_to_hardware(algo.diamond_triangle_config)
             if state is prev:
                 return state
             logger.info("coordinate system (DCS) %s -> %s", prev.value, state.value)
@@ -2535,6 +2539,13 @@ class AppModel(ObservableObject):
                 self.on_error("Coordinate system", STALE_NOTICE)
             self.property_changed(self.Props.RECORDING_BLOCKERS, self.recording_blockers, None)
             return state
+
+    def _hand_dcs_to_hardware(self, cfg: Optional[DiamondTriangleOffsetConfig]) -> None:
+        """Give the hardware the DCS configuration its consumers use: None while a stale one is
+        held off (refresh_dcs_state), so moves given in DCS refuse meanwhile, and say why."""
+        stale = cfg is None and self._dcs_state is DcsState.STALE
+        self._hardware.set_diamond_triangle_config(
+            cfg, unavailable_reason=STALE_RECORDING_BLOCKER if stale else None)
 
     def _calibration3d_metadata(self) -> Dict[str, Any]:
         """hardware.configured.calibration3d: the 3D calibration live 3D used, or why it used none.
@@ -11252,9 +11263,7 @@ class AppModel(ObservableObject):
         animal = self._selected_animal
         #
         if name == props.DIAMOND_TRIANGLE_CONFIG:
-            # The configuration its consumers use: None while a stale one is held off
-            # (refresh_dcs_state), so moves given in DCS refuse meanwhile.
-            self._hardware.set_diamond_triangle_config(value)
+            self._hand_dcs_to_hardware(value)
 
         elif name == props.PELLET_SHIFT_Y_LIMIT:
             if animal is None:

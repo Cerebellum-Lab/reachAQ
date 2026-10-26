@@ -103,8 +103,8 @@ the active calibration is not the one the DCS was measured against:
   against a different 3D calibration. Redo Tools → Calibrate Coordinate
   System".
 - Everything that uses DCS-space coordinates is held off as if no DCS were
-  loaded: motor moves given in DCS, drift monitoring, the pellet checks, the
-  pellet shift. Live 2D pose and raw 3D keep running. The DCS files are left in
+  loaded: motor moves given in DCS (refused with "DCS move refused:" and the
+  message above), drift monitoring, the pellet checks, the pellet shift. Live 2D pose and raw 3D keep running. The DCS files are left in
   place, not deleted; they count as out of date because the calibration id they
   recorded differs from the active one.
 - **Make 3D calibration still works**, so a capture you are not happy with can

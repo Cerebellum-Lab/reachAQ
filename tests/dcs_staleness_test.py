@@ -162,9 +162,11 @@ def test_stale_hides_config_from_consumers(app_model, stale):
     algo = app_model.behavior.algorithm
     assert algo.diamond_triangle_config is None
     assert algo.loaded_diamond_triangle_config == _config()
-    # The consumers were handed None: motor moves in DCS refuse, the pellet monitor has none.
-    with pytest.raises(RuntimeError, match="DCS config"):
+    # The consumers were handed None: motor moves in DCS refuse and say why, the pellet
+    # monitor has none.
+    with pytest.raises(RuntimeError) as refused:
         app_model.hardware.set_dcs_x(1.0)
+    assert str(refused.value) == f"DCS move refused: {STALE_BLOCKER}"
     assert app_model.analysis.pellet_misplaced_monitor.dcs_config is None
     # The operator is told once, as it goes stale, and not again while it stays stale.
     assert _titled(on_error, "Coordinate system") == [STALE_NOTICE]
@@ -175,6 +177,24 @@ def test_stale_hides_config_from_consumers(app_model, stale):
         assert app_model.load_configuration() is True
     again.assert_not_called()
     assert app_model.dcs_state is DcsState.STALE
+
+
+MISSING_REFUSAL = "DCS config not defined or not fully valid"
+
+
+def test_a_missing_dcs_refuses_moves_as_before(app_model):
+    assert app_model.dcs_state is DcsState.MISSING
+    with pytest.raises(RuntimeError, match=MISSING_REFUSAL):
+        app_model.hardware.set_dcs_y(1.0)
+
+
+def test_a_stale_dcs_that_goes_missing_refuses_moves_as_missing(app_model, stale, dcs_path):
+    dcs_path.unlink()
+    with mock.patch.object(app_model, "on_error"):
+        assert app_model.load_configuration() is True
+    assert app_model.dcs_state is DcsState.MISSING
+    with pytest.raises(RuntimeError, match=MISSING_REFUSAL):
+        app_model.hardware.set_dcs_z(1.0)
 
 
 def test_stale_keeps_the_animals_dcs_position(app_model, stale):
