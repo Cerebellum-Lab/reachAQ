@@ -34,7 +34,7 @@ import yaml
 
 from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
 from autotrainer.inference.multires_calibration import pipeline
-from autotrainer.inference.multires_calibration.extract import WaypointAlignmentError
+from autotrainer.inference.multires_calibration.extract import WaypointAlignmentError, find_stationary_segments
 from autotrainer.inference.multires_calibration.geometry import PresetGeometry, presets_from_base
 from autotrainer.inference.multires_calibration.pipeline import (
     SOURCE_VIDEOS,
@@ -267,6 +267,22 @@ def test_capture_info_and_sources_are_kept(main):
         assert filecmp.cmp(source, out / SOURCE_VIDEOS / f"{cam}.mp4", shallow=False), cam
         assert (out / f"coverage_{cam}.png").is_file(), cam
     assert load_waypoint_log(out / WAYPOINT_LOG) == load_waypoint_log(main.capture_dir / WAYPOINT_LOG)
+
+
+def test_the_still_frames_at_each_waypoint_are_recorded(main):
+    # The margin the dwells leave over extraction's shortest segment, for the real capture.
+    still = main.index.capture["still_frames"]
+    assert set(still) == set(CAMERAS)
+    for cam in CAMERAS:
+        lengths = [stop - start for start, stop in find_stationary_segments(main.capture_dir / SOURCE_VIDEOS / f"{cam}.mp4")]
+        assert len(lengths) == N_WAYPOINTS
+        # every waypoint is distinct here, so segment i is waypoint i
+        assert still[cam] == {"min": min(lengths), "median": float(np.median(lengths)),
+                              "min_waypoint": int(np.argmin(lengths))}, cam
+    # The operator sees them in the report too.
+    (note,) = [n for n in main.report.notes if n.startswith("still frames per waypoint")]
+    for cam in CAMERAS:
+        assert f"{cam} min {still[cam]['min']} (waypoint {still[cam]['min_waypoint']})" in note
 
 
 def test_unverified_waypoints_warn(second):

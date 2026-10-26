@@ -1,30 +1,38 @@
 """The 3D calibration capture pauses at every motor waypoint and verifies it got there.
 
 The stage visits the start position and 36 single-axis DCS moves. At each waypoint the
-capture commands the move, waits for the motor's ack, settles 0.25 s, checks the motor's
-reported position against the commanded one, and dwells 0.5 s, so every waypoint is a
-still stretch of video that calibrate_capture can tag with its commanded position.
+capture commands the move, waits for the motor's ack, settles for as long as the move
+takes at the axis's configured speed plus 0.25 s (1.0 s when the speed is not known),
+checks the motor's reported position against the commanded one, and dwells 0.5 s, so
+every waypoint is a still stretch of video that calibrate_capture can tag with its
+commanded position.
 
 Nothing here touches hardware: the motor, the cameras and the clock are fakes.
 """
 
+import contextlib
+import logging
 import math
 import urllib.parse
 import uuid
 from pathlib import Path
+from queue import Queue
 from types import SimpleNamespace
 
 import pytest
 import yaml
 
-from autotrainer.core import CameraConfiguration, Offset3DTuple
+from autotrainer.core import CameraConfiguration, Offset3DTuple, SystemCommandKind
 from autotrainer.core.capture import CaptureProcessStatus
 from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
 from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
+from autotrainer.device import MotorConfigurationFile
 from autotrainer.inference.multires_calibration.extract import distinct_waypoints
 from autotrainer.inference.multires_calibration.geometry import PresetGeometry
 from autotrainer.inference.multires_calibration.pipeline import WAYPOINT_LOG, load_waypoint_log, write_waypoint_log
 from tools.acquisition.model import handle_3d_calibration as h3d
+from tools.acquisition.model import hardware_model as hardware_model_module
+from tools.acquisition.model.hardware_model import HardwareModel
 from tools.acquisition.model.handle_3d_calibration import (
     calibrate_waypoint_capture,
     capture_presets,
@@ -287,7 +295,8 @@ def test_capture_loop_logs_dwell_and_verification(tmp_path):
     motor = _Motor(clock, travel=0.3, stop_short={("x", 20.0): 0.2})
     assert plan[23][0:2] == ("x", 10.0) and plan[23][2][0] == pytest.approx(20.0)
 
-    log = run_waypoints(motor, plan, sleep=clock.sleep, now=clock.now, clock=clock.now)
+    # A settle fixed at 0.25 s, shorter than the 0.3 s travel, so arrival must be polled for.
+    log = run_waypoints(motor, plan, settle=0.25, sleep=clock.sleep, now=clock.now, clock=clock.now)
 
     assert len(log.motor) == 37
     assert log.motor == [motor_xyz for _, _, motor_xyz in plan]
@@ -387,7 +396,7 @@ def test_the_arrival_timeout_runs_on_clock_not_on_now():
 
     motor = _Motor(clock, travel=0.0, stop_short={("z", plan[1][2][2]): 0.2})
 
-    log = run_waypoints(motor, plan, sleep=sleep, now=frozen_wall_clock, clock=clock.now)
+    log = run_waypoints(motor, plan, settle=0.25, sleep=sleep, now=frozen_wall_clock, clock=clock.now)
 
     assert log.verified == [True, False]
     assert log.times == [(5_000.0, 5_000.0), (5_000.0, 5_000.0)]
@@ -404,6 +413,160 @@ def test_a_move_that_is_not_queued_stops_the_capture():
     with pytest.raises(RuntimeError, match="not queued"):
         run_waypoints(motor, plan_waypoints(start, moves, _dcs()),
                       sleep=clock.sleep, now=clock.now, clock=clock.now)
+
+
+# The settle after each move's ack (ruling R52). The 2026-10-26 motor check showed that
+# last_position echoes the target about 0.1 s after the command, so the arrival check cannot
+# see the stage still moving: the settle alone has to cover the move, as if the ack meant
+# only "received".
+
+def _motor_configurations(**axes):
+    """Motor configurations as HardwareModel keeps them from connect; axis -> (max_vel mm/s, max_acc mm/s^2)."""
+    pellet = {axis: {"max_vel": v, "max_acc": a} for axis, (v, a) in axes.items()}
+    return MotorConfigurationFile.from_yaml_dict({"pellet": pellet}, source=None)
+
+
+SPEEDS = {"x": (20.0, 600.0), "y": (40.0, 1000.0), "z": (10.0, 300.0)}
+
+
+def _settles(events):
+    """Each waypoint's settle: the first sleep after its moves' acks."""
+    return [events[k + 1][1] for k in range(len(events) - 1)
+            if events[k][0] == "ack" and events[k + 1][0] == "sleep"]
+
+
+def test_a_17_mm_move_settles_for_its_travel_at_the_configured_speed():
+    # At the device package's 20 mm/s a 17 mm move, the longest in the list, takes 0.85 s.
+    assert h3d.settle_time(17.0, (20.0, 600.0)) == pytest.approx(17.0 / 20.0 + 20.0 / 600.0 + 0.25)
+    assert h3d.settle_time(17.0, (120.0, 600.0)) == pytest.approx(17.0 / 120.0 + 120.0 / 600.0 + 0.25)
+
+
+def test_a_settle_without_a_known_speed_is_1_s():
+    assert h3d.settle_time(17.0, None) == 1.0
+    assert h3d.settle_time(0.0, None) == 1.0
+    # No configuration yet, or none usable on an axis, gives that axis no limits.
+    assert h3d.axis_limits(None) == {"x": None, "y": None, "z": None}
+    configs = _motor_configurations(x=(20.0, 600.0), y=(0.0, 600.0), z=(math.nan, 600.0))
+    assert h3d.axis_limits(configs) == {"x": (20.0, 600.0), "y": None, "z": None}
+
+
+def test_a_short_move_settles_at_least_0_25_s():
+    assert h3d.settle_time(0.0, (120.0, 1e12)) == pytest.approx(0.25)
+    for distance in (0.0, 0.01, 0.5, 2.7):
+        for limits in ((20.0, 1000.0), (120.0, 600.0), (61.0, 244.0)):
+            assert h3d.settle_time(distance, limits) >= 0.25
+
+
+def test_each_move_settles_for_its_own_axis_and_distance(caplog):
+    plan = plan_waypoints(start, moves, _dcs())
+    clock = _Clock()
+    motor = _Motor(clock, travel=0.0)
+    motor.motor_configurations = _motor_configurations(**SPEEDS)
+
+    with caplog.at_level(logging.DEBUG, logger=h3d.logger.name):
+        run_waypoints(motor, plan, sleep=clock.sleep, now=clock.now, clock=clock.now)
+
+    settles = _settles(clock.events)
+    assert len(settles) == len(plan)
+    # The motor had reported no position before waypoint 0 (NaN after connect), so that
+    # move's distance is unknown.
+    assert settles[0] == 1.0
+    for i in range(1, len(plan)):
+        axis = plan[i][0]
+        k = "xyz".index(axis)
+        distance = abs(plan[i][2][k] - plan[i - 1][2][k])
+        assert settles[i] == pytest.approx(h3d.settle_time(distance, SPEEDS[axis])), i
+    # Waypoint 23 is the 17 mm x move, DCS -7 to 10.
+    assert plan[23][0] == "x" and plan[23][2][0] - plan[22][2][0] == pytest.approx(17.0)
+    assert settles[23] == pytest.approx(17.0 / 20.0 + 20.0 / 600.0 + 0.25)
+    logged = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG and "settle" in r.getMessage()]
+    assert len(logged) == len(plan)
+
+
+def test_waypoint_0_settles_for_its_slowest_axis_from_where_the_motor_reported_it():
+    plan = plan_waypoints(start, moves, _dcs())[:1]
+    clock = _Clock()
+    motor = _Motor(clock, travel=0.0)
+    motor.motor_configurations = _motor_configurations(**SPEEDS)
+    # Where prepare() left the stage, near the start: x 4 mm and y 1 mm away, z on it.
+    target = plan[0][2]
+    for move, value in zip((motor.move_x, motor.move_y, motor.move_z), (target[0] - 4.0, target[1] + 1.0, target[2])):
+        move(value)
+    before = len(clock.events)
+
+    run_waypoints(motor, plan, sleep=clock.sleep, now=clock.now, clock=clock.now)
+
+    (settle,) = _settles(clock.events[before:])
+    expected = [h3d.settle_time(4.0, SPEEDS["x"]), h3d.settle_time(1.0, SPEEDS["y"]), h3d.settle_time(0.0, SPEEDS["z"])]
+    assert settle == pytest.approx(max(expected))
+
+
+def test_without_motor_configurations_every_move_settles_1_s():
+    plan = plan_waypoints(start, moves, _dcs())
+    clock = _Clock()
+    run_waypoints(_Motor(clock, travel=0.0), plan, sleep=clock.sleep, now=clock.now, clock=clock.now)
+    assert _settles(clock.events) == [1.0] * len(plan)
+
+
+class _Subscribers:
+    """An event that handlers are added to with +=."""
+
+    def __iadd__(self, handler):
+        return self
+
+
+def test_the_hardware_model_keeps_the_motor_configurations_it_writes_at_connect(hardware_model, monkeypatch):
+    # The capture times its settles from these, so they must be what connect sent the motors
+    # (WRITE_MOTOR_CONFIGURATION, from ~/Autotrainer/motor_config.yaml), not a package default.
+    written = _motor_configurations(x=(120.0, 600.0), y=(120.0, 600.0), z=(120.0, 600.0))
+    assert hardware_model.motor_configurations is None, "nothing is written before a connect"
+
+    class Device:
+        default_command_ack_timeout_duration = 0.1
+        default_board_status_timeout_delay = 1.0
+
+        def __init__(self, **kwargs):
+            self.property_changed = _Subscribers()
+            self.latency_observer = None
+            self.device_interface = None
+
+    class Connection:
+        def __init__(self, can_device, cmd_queue, **kwargs):
+            self.device = SimpleNamespace(connected=True)
+
+        def request_connect(self):
+            pass
+
+        def wait_connected(self, *, timeout):
+            pass
+
+        @contextlib.contextmanager
+        def await_acknowledge(self, tokens, timeout):
+            yield
+
+        def send_message(self, kind, data=None, context=None):
+            if kind is SystemCommandKind.REQUEST_VERSION:
+                hardware_model._firmware_version_received.set()
+
+        def load_default_motor_config(self):
+            return written
+
+        def load_default_move_config(self):
+            pass
+
+    class Homing(Exception):
+        """Connect got past the motor configuration to homing, where this test stops it."""
+
+    def home(send_acknowledged_command):
+        raise Homing
+
+    monkeypatch.setattr(hardware_model_module, "CanDevice", Device)
+    monkeypatch.setattr(hardware_model_module, "DeviceConnection", Connection)
+    monkeypatch.setattr(HardwareModel, "pellet_commands_allowed", property(lambda self: True))
+    monkeypatch.setattr(HardwareModel, "_home_and_detach_pellet", staticmethod(home))
+    with pytest.raises(Homing):
+        hardware_model.connect(Queue())
+    assert hardware_model.motor_configurations is written
 
 
 def test_capture_params_set_gain_1_db_and_turn_camera_gamma_off():

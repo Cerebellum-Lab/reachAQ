@@ -37,10 +37,20 @@ used, see
    homes, goes to the start position, and then visits **37 positions**. Waypoint
    0 is the start and the other 36 are single-axis moves; one move repeats the
    previous position, so 36 are distinct. At each position the app commands the
-   move, waits for the motor's acknowledgement, settles 0.25 s, checks the
-   position the motor reports, and **pauses 0.5 s** with the board still. The
-   settle and the pause add about 28 s in all. The cameras then stop and their
+   move, waits for the motor's acknowledgement, **settles** for as long as the
+   move takes at the motor's configured speed (below), checks the position the
+   motor reports, and **pauses 0.5 s** with the board still. On christielab10
+   the settles and pauses add about 37 s in all. The cameras then stop and their
    own configurations are restored.
+
+The settle after each move is `distance / v_max + v_max / a_max + 0.25 s`, at
+least 0.25 s, with `v_max` and `a_max` the moving axis's maximum velocity and
+acceleration as the app wrote them to the motors at connect (from
+`~/Autotrainer/motor_config.yaml`). An axis without a usable configuration
+settles 1.0 s, and so does waypoint 0 when the motor has reported no position
+before it. On christielab10 (120 mm/s and 600 mm/s² on every axis) the settles
+run from 0.45 s to 0.59 s, the longest for the 17 mm x move. Each settle is
+logged at debug level.
 4. The app finds the board at each pause, fits both cameras, grades the fit, and
    shows the **report** (below).
 5. **Redo the coordinate system.** Every new calibration makes the DCS out of
@@ -250,7 +260,7 @@ thresholds it was graded with.
 | `epipolar_error_px` | pair | > 0.5 | > 1.0 | Mean symmetric epipolar distance, sensor px, over positions both cameras saw |
 | `square_size_rel_error` | pair | > 0.01 | > 0.03 | \|mean triangulated square - 4 mm\| / 4 mm |
 | `motor_scale_dev` | capture | > 0.01 | none | \|motor scale - 1\|: true travel (from the board's squares) against commanded travel |
-| `waypoints_unverified` | capture | > 0 | none | Positions where the motor's reported position did not come within 0.05 mm of the command in time |
+| `waypoints_unverified` | capture | > 0 | none | Positions where the motor's reported position did not come within 0.05 mm of the command in time. Verified means the motor reported the commanded position, not a traced arrival |
 | `waypoints_unreached` | capture | none | > 0 | Positions where the reported position was more than 0.1 mm from the commanded one on some axis. The fit places the board at the commanded position, so any such view is in the wrong place. A position with no finite reported position is not counted |
 | `cross_check_delta_px` | binned preset | > 1.5 | none | Largest difference in fx, fy, cx or cy between a direct fit in the preset's own pooled frames and the mapped sensor fit, preset px. Informational: the direct fit has a noise floor near 0.5 px |
 | `cross_check_corner_offset_px` | binned preset | > 0.1 | > 0.25 | Mean offset between corners detected in the preset's pooled frames and the sensor corners mapped into it, preset px. Tests the pixel-centre mapping itself |
@@ -265,8 +275,8 @@ thresholds it was graded with.
   cross-check.
 - Notes list what the metrics do not: views rejected per camera and the reason
   (`not found`, `inconsistent`), a camera whose corner order was reversed to
-  match the other, and each unreached waypoint with the position the motor
-  reported.
+  match the other, each unreached waypoint with the position the motor
+  reported, and the still frames per waypoint (shortest, where, median).
 - `coverage_<cam>.png` shows the full sensor, the covered area, the ROI
   rectangle and every detected corner.
 
@@ -314,9 +324,14 @@ folder repeats this.
 - **`last_position` reports once per move, before the acknowledgement.** On the
   same check it updated about 0.10 s after the command, to the target (error at
   most 0.007 mm), and the acknowledgement followed 0.20 to 0.30 s after the
-  command. "Verified" therefore means the firmware reported the target, not that
-  the arrival was traced. The 0.25 s settle after the acknowledgement stays as
-  the mechanical settle.
+  command. "Verified" therefore means the motor reported the commanded
+  position, not that the arrival was traced; the report's `waypoints_unverified`
+  line says so. Whether the acknowledgement means the move ended was not shown
+  for long moves, so the settle covers the whole move as if it meant only
+  "received" (see the routine above). `still_frames` in `calibration.yaml`
+  records how long the board held still at each waypoint, per camera (the
+  shortest, the waypoint it was at, and the median, in frames), and the report
+  notes it; a waypoint needs 8.
 - **Older code cannot read a format-2 calibration folder.** Code from before
   this branch has no loader for `calibration.yaml`, and the DCS file written
   against a format-2 calibration has a `calibration_id` field it does not

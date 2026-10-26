@@ -15,7 +15,7 @@ from typing import Optional, Tuple, Dict, Union, List
 from autotrainer.core.api import ApiEventKind, ApiDetectorKind
 from autotrainer.core import (ObservableObject, SystemCommandKind, MessageHandler, AnimalSubject, Offset3DTuple,
                               get_verbose_logger, Motor, EventManager, HardwareConfiguration,
-                              get_perf_now, SystemStatusMessageKind)
+                              get_perf_now, SystemStatusMessageKind, MotorConfigurations)
 from autotrainer.core.logging import log_hardware_initialization
 from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
 from autotrainer.core.event import post_api_detector_event_content
@@ -94,6 +94,8 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         self._board_status_timeout: Optional[float] = None
         self._device_ack_timeout_delay: Optional[float] = None
         self._device_conn: Optional[DeviceConnectionProtocol] = None
+        # What the last connect wrote to the pellet controller (WRITE_MOTOR_CONFIGURATION).
+        self._motor_configurations: Optional[MotorConfigurations] = None
         self._can_device: Optional[CanDevice] = None
         self._can_latency_observer = None
         self._device_uuid_ack_timeout_engaged = False
@@ -230,6 +232,12 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
     @property
     def cover_arm_position(self) -> float:
         return self._cover_arm_position
+
+    @property
+    def motor_configurations(self) -> Optional[MotorConfigurations]:
+        """The motor configurations the last connect wrote to the pellet controller, or None
+        before one. A stepper moves at its configuration's maximum velocity and acceleration."""
+        return self._motor_configurations
 
     @property
     def last_position(self) -> Optional[Offset3DTuple]:
@@ -735,7 +743,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         # 1)
         config_started = time.perf_counter()
         log_hardware_initialization(logger, "START | pellet motor configuration")
-        device_conn.load_default_motor_config()
+        self._motor_configurations = device_conn.load_default_motor_config()
         log_hardware_initialization(
             logger,
             "READY | pellet motor configuration | elapsed=%.3fs",

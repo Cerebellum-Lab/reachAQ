@@ -115,6 +115,24 @@ AXES = "xyz"
 # christielab10 a MOVE to x -1.722 left the stage at 0.000.
 MOTOR_LOWER_LIMIT = 0.0
 
+# The settle after each move's ack, before the arrival check and the dwell (ruling R52):
+#
+#     settle = max(SETTLE_FLOOR_S, distance / v_max + v_max / a_max + SETTLE_MARGIN_S)
+#
+# with v_max (mm/s) and a_max (mm/s^2) the moving axis's, from the motor configurations
+# HardwareModel wrote at connect (~/Autotrainer/motor_config.yaml), and SETTLE_FALLBACK_S when
+# the axis has none. The 2026-10-26 motor check on christielab10 showed last_position is the
+# firmware echoing the target about 0.1 s after the command, so the arrival check cannot see
+# the stage still moving; the ack came 0.20-0.30 s after the command for 2.7-5 mm moves, which
+# fits "ack at motion end" but was not shown for long moves. The settle therefore covers the
+# whole move as if the ack meant only "received": distance / v_max + v_max / a_max is a
+# trapezoidal profile's duration, an upper bound for a move too short to reach v_max, and the
+# margin is for the stage coming to rest. Without it a 17 mm move at 20 mm/s would still be
+# moving through most of the 0.5 s dwell, leaving fewer still frames than extraction needs.
+SETTLE_MARGIN_S = 0.25
+SETTLE_FLOOR_S = 0.25
+SETTLE_FALLBACK_S = 1.0
+
 
 def capture_settings_of(params: Mapping[str, Any]) -> Dict[str, Any]:
     """The capture settings the waypoint log records, from the camera params the capture sets.
@@ -226,6 +244,45 @@ def wait_until_arrived(
         sleep(poll)
 
 
+def axis_limits(motor_configurations) -> Dict[str, Optional[Tuple[float, float]]]:
+    """Per axis, (maximum velocity mm/s, maximum acceleration mm/s^2) of its stepper in
+    `motor_configurations` (HardwareModel.motor_configurations); None for an axis whose values
+    are missing or not positive and finite, and for every axis when there are none."""
+    limits = {}
+    for axis in AXES:
+        try:
+            _, config = getattr(motor_configurations, f"{axis}_config")
+            values = (float(config.maximum_velocity), float(config.maximum_acceleration))
+        except (AttributeError, TypeError, ValueError):
+            limits[axis] = None
+            continue
+        limits[axis] = values if all(math.isfinite(v) and v > 0 for v in values) else None
+    return limits
+
+
+def settle_time(distance: float, limits: Optional[Tuple[float, float]]) -> float:
+    """The settle after a move of `distance` mm on an axis with `limits` (axis_limits); see SETTLE_MARGIN_S."""
+    if limits is None:
+        return SETTLE_FALLBACK_S
+    v_max, a_max = limits
+    return max(SETTLE_FLOOR_S, abs(distance) / v_max + v_max / a_max + SETTLE_MARGIN_S)
+
+
+def _move_settle(
+    limits: Mapping[str, Optional[Tuple[float, float]]],
+    axes: Sequence[str],
+    target: Sequence[float],
+    origin: Optional[Sequence[float]],
+) -> float:
+    """The settle for moving `axes` from `origin` to `target`: the slowest axis's, or the
+    fallback when where the stage started is unknown."""
+    if origin is None:
+        return SETTLE_FALLBACK_S
+    return max(
+        settle_time(target[AXES.index(axis)] - origin[AXES.index(axis)], limits[axis]) for axis in axes
+    )
+
+
 def _command(hard, axis: str, motor_value: float) -> None:
     move = {"x": hard.move_x, "y": hard.move_y, "z": hard.move_z}[axis]
     token = move(motor_value)
@@ -238,7 +295,7 @@ def run_waypoints(
     hard,
     plan: Sequence[Tuple[str, float, Tuple[float, float, float]]],
     *,
-    settle: float = 0.25,
+    settle: Optional[float] = None,
     dwell: float = 0.5,
     sleep=time.sleep,
     now=time.time,
@@ -255,6 +312,10 @@ def run_waypoints(
     the start. A waypoint the motor does not confirm is logged unverified and the capture
     goes on; the calibration report counts them.
 
+    The settle is per move, from the distance and hard.motor_configurations (settle_time);
+    waypoint 0's starts from the position the motor last reported, and is the fallback when
+    there is none. A `settle` given in seconds replaces it for every move, for tests.
+
     `now` stamps arrive and leave (time.time(), as WaypointLog.times records). `clock`
     times the arrival wait, so a step of the wall clock cannot stretch or cut it short; a
     test may pass one fake for both. `capture_settings` are those of default_params unless
@@ -262,12 +323,21 @@ def run_waypoints(
     """
     if capture_settings is None:
         capture_settings = capture_settings_of(default_params)
+    limits = axis_limits(getattr(hard, "motor_configurations", None))
+    if settle is None:
+        logger.info("settling each move at the motor's configured speed, (v_max mm/s, a_max mm/s^2): %s",
+                    ", ".join(f"{axis} {limits[axis]}" for axis in AXES))
     log = WaypointLog(motor=[], reported=[], verified=[], dcs_moves=[], times=[],
                       capture_settings=dict(capture_settings))
+    origin = _reported_position(hard)  # where prepare() left the stage, if the motor said
     for i, (axis, value, motor) in enumerate(plan):
-        for move_axis in (AXES if i == 0 else (axis,)):
+        moved = AXES if i == 0 else (axis,)
+        for move_axis in moved:
             _command(hard, move_axis, motor[AXES.index(move_axis)])
-        sleep(settle)
+        wait = _move_settle(limits, moved, motor, origin) if settle is None else settle
+        logger.debug("waypoint %d: %s to %s, settle %.3f s", i, "".join(moved), motor, wait)
+        sleep(wait)
+        origin = motor  # the next move starts where this one was commanded to
         arrived, reported = wait_until_arrived(
             hard, motor, tolerance=tolerance, timeout=arrival_timeout, sleep=sleep, now=clock)
         arrive = now()
@@ -449,7 +519,7 @@ def make_3d_calib(
 
         waypoint_log = run_waypoints(hard, plan, capture_settings=capture_settings_of(cam_params))
 
-        logger.success("executed %s moves; the motor confirmed %d of %d waypoints",
+        logger.success("executed %s moves; the motor reported %d of %d waypoints at their commanded position",
                        len(moves), sum(waypoint_log.verified), len(waypoint_log.verified))
 
         if record_mode == VideoRecordMode.TRIGGER:

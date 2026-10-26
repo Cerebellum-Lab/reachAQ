@@ -88,6 +88,9 @@ DEFAULT_THRESHOLDS: Thresholds = {
 LOWER_IS_WORSE = frozenset({"views_kept", "coverage_roi_fraction"})
 NO_PREVIOUS_NOTE = "no comparable previous calibration"
 MOVED_NOTE = "camera moved since the previous calibration"
+# The motor's position report echoes its target (christielab10 motor check, 2026-10-26), so a
+# waypoint counts as verified on the motor's word alone.
+VERIFIED_NOTE = "verified: the motor reported the commanded position, not a traced arrival"
 
 _STATUS_ORDER = ("fail", "warn", "pass")
 # The coverage mask is rasterised at 1/4 of sensor resolution: one mask pixel is 16 sensor
@@ -193,7 +196,9 @@ class QualityReport:
 @dataclass
 class CaptureSummary:
     waypoints_total: int
-    waypoints_verified: int  # waypoints whose arrival the motor's last_position confirmed
+    # waypoints at which the motor reported the commanded position: its word, not a traced
+    # arrival (pipeline.WaypointLog.verified)
+    waypoints_verified: int
     # waypoints whose finite reported position is more than 0.1 mm from the commanded one
     # on some axis (pipeline.unreached_waypoints)
     waypoints_unreached: int
@@ -257,7 +262,8 @@ def build_report(
     for cam in cameras:
         counted = sum(cam in o.corners for o in observations)
         add("views_kept", cam, capture.views_kept.get(cam, counted), "views")
-    add("waypoints_unverified", None, capture.waypoints_total - capture.waypoints_verified, "waypoints")
+    add("waypoints_unverified", None, capture.waypoints_total - capture.waypoints_verified, "waypoints",
+        VERIFIED_NOTE)
     add("waypoints_unreached", None, capture.waypoints_unreached, "waypoints")
     for cam, reasons in capture.rejections.items():
         rejected = sum(reasons.values())

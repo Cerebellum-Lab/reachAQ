@@ -427,6 +427,15 @@ def test_capture_problems_and_cross_checks_are_graded(rig, fitted):
     assert report.verdict == "fail"
 
 
+def test_verified_means_the_motor_reported_the_commanded_position(rig, fitted):
+    # The motor's position report echoes its target about 0.1 s after the command
+    # (christielab10 motor check, 2026-10-26), so "verified" is the motor's word, not a
+    # traced arrival (ruling R53), and the report says so.
+    report = report_for(fitted, rig.observations, rig.board, swept_roi(rig.observations))
+    note = metric(report, "waypoints_unverified").note
+    assert "the motor reported the commanded position" in note and "not a traced arrival" in note
+
+
 def test_a_waypoint_the_stage_did_not_reach_fails_the_calibration(rig, fitted):
     # The fit tags each view with the commanded position, so one waypoint the motor reported
     # elsewhere is a view placed in the wrong spot: the calibration fails, not just warns.

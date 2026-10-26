@@ -3,7 +3,7 @@
 A capture folder holds what the capture wrote:
 
     waypoints.yaml          the WaypointLog: the commanded motor position of every waypoint,
-                            whether the motor confirmed arriving there, and the times
+                            whether the motor reported arriving there, and the times
     source_videos/left.mp4  both cameras at full sensor resolution, bin 1, while the stage
     source_videos/right.mp4 paused at each waypoint in turn
 
@@ -53,6 +53,7 @@ from autotrainer.core.logging import get_verbose_logger
 # The cross-check must detect in exactly the frames extraction used, so it takes extraction's
 # own frame window (_middle_frames) and sequential reader (_grey_frames) rather than copies.
 from autotrainer.inference.multires_calibration.extract import (
+    _MIN_FRAMES,
     _grey_frames,
     _middle_frames,
     detect_board,
@@ -113,7 +114,10 @@ class WaypointLog:
 
     motor: List[Tuple[float, float, float]]  # commanded motor coordinates
     reported: List[Optional[Tuple[float, float, float]]]  # the motor's last_position; None if it reported none
-    verified: List[bool]  # True when the reported position confirmed the arrival
+    # True when the motor reported the commanded position (within 0.05 mm, in time). That is
+    # the firmware's word, not a traced arrival: last_position echoes the target about 0.1 s
+    # after the command (christielab10 motor check, 2026-10-26).
+    verified: List[bool]
     dcs_moves: List[Tuple[str, float]]  # (axis, DCS value) of the move to the waypoint
     times: List[Tuple[float, float]]  # (arrive, leave), time.time()
     # gain_db, gamma, exposure_us and fps as the capture set them; empty when not logged
@@ -227,6 +231,16 @@ def calibrate_capture(
             f"waypoint {k}: the motor reported {_format_xyz(log.reported[k])}, {off:.2f} mm from the"
             f" commanded {_format_xyz(log.motor[k])}"
         )
+    # How long the board held still at each waypoint, against what extraction needs: the
+    # margin the settle and the dwell leave, which only a real capture measures.
+    still = _still_frames(extraction.segments, extraction.observations)
+    if still:
+        notes.append(
+            "still frames per waypoint: "
+            + "; ".join(f"{cam} min {s['min']} (waypoint {s['min_waypoint']}), median {s['median']:g}"
+                        for cam, s in still.items())
+            + f" (segments shorter than {_MIN_FRAMES} frames are not found)"
+        )
 
     base = max(presets, key=lambda g: g.binning)
     rejections: Dict[str, Dict[str, int]] = {cam: {} for cam in CAMERAS}
@@ -252,6 +266,7 @@ def calibrate_capture(
         "waypoints_unreached": len(unreached),
         "corner_refinement": refine,
         "segmentation_stats": extraction.segmentation_stats,
+        "still_frames": still,
         "corner_order_reversed": reversed_order,
         "corner_scatter_px": extraction.corner_scatter_px,
     }
@@ -348,6 +363,28 @@ def _cross_checks(
         )
         checks.append(PresetCrossCheck(geometry=g, max_intrinsic_delta_px=delta, corner_offset_px=offset))
     return checks
+
+
+def _still_frames(
+    segments: Mapping[str, List[Tuple[int, int]]], observations: Sequence[WaypointObservation]
+) -> Dict[str, Dict[str, float]]:
+    """Per camera, the length in frames of its stationary segments: the shortest ("min"), the
+    waypoint it belongs to ("min_waypoint", as the waypoint log numbers it) and the median.
+
+    segments[cam][i] is distinct waypoint observations[i], as extraction returned them.
+    """
+    still = {}
+    for cam, ranges in segments.items():
+        lengths = [stop - start for start, stop in ranges]
+        if not lengths:
+            continue
+        shortest = int(np.argmin(lengths))
+        still[cam] = {
+            "min": int(lengths[shortest]),
+            "median": float(np.median(lengths)),
+            "min_waypoint": int(observations[shortest].index),
+        }
+    return still
 
 
 def _corner_offset(
