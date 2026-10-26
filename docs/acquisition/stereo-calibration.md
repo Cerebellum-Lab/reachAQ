@@ -1,0 +1,482 @@
+# Multi-resolution stereo calibration
+
+One calibration session a month gives a rig a 3D calibration for every
+supported camera preset. The presets share one field of view, so a single
+capture serves all of them as long as the cameras have not moved since.
+
+Part 1 is the operator routine. Part 2 is the reference: files, presets, the
+quality report, exports, and the limits of what has been measured. Part 3 is for
+developers. For the session metadata that names the calibration a recording
+used, see
+[`alignment.json` and final metadata](session-recording-and-synchronization.md#alignmentjson-and-final-metadata).
+
+---
+
+# Part 1: the monthly routine
+
+## Before you start
+
+- **System Mode** is Idle and acquisition is stopped. **Make 3D calibration** is
+  unavailable otherwise.
+- A valid coordinate system (DCS) is loaded. The capture places the board
+  through the DCS mapping, so a DCS that is out of date is fine; with none, the
+  capture stops with "Please first calibrate diamond-triangle by starting the
+  acquisition".
+- The left camera is configured at binning 4, the live preset. A binning that
+  is not a multiple of 4 stops the capture before the stage moves.
+
+## Steps
+
+1. **Mount the board on the motor.** It is the 4 mm board with 6 x 8 inner
+   corners. Mount it so it moves with the stage and both cameras see it at the
+   start position. The board is only translated, never tilted, and its
+   orientation on the stage does not need to be measured: the fit solves for it.
+2. Choose **Tools → Make 3D calibration**.
+3. Wait while the stage runs. Both cameras record the full sensor (1440 x 1080,
+   binning 1, gain 1.0 dB, gamma off, 4500 µs exposure, 40 fps) while the stage
+   homes, goes to the start position, and then visits **37 positions**. Waypoint
+   0 is the start and the other 36 are single-axis moves; one move repeats the
+   previous position, so 36 are distinct. At each position the app commands the
+   move, waits for the motor's acknowledgement, settles 0.25 s, checks the
+   position the motor reports, and **pauses 0.5 s** with the board still. The
+   settle and the pause add about 28 s in all. The cameras then stop and their
+   own configurations are restored.
+4. The app finds the board at each pause, fits both cameras, grades the fit, and
+   shows the **report** (below).
+5. **Redo the coordinate system.** Every new calibration makes the DCS out of
+   date (below).
+
+The waypoints are DCS coordinates (x -9.4 to 10, y 10 to 35, z -35 to -22 mm),
+converted to motor coordinates through the loaded DCS. A coordinate that would be
+below the stage's lower limit is commanded at the limit and logged; see
+[Known rig facts and limits](#known-rig-facts-and-limits).
+
+## The report
+
+The report lists failures first, then warnings, then passes, each with its
+value and limits, then notes. The thresholds are in
+[The quality report](#the-quality-report).
+
+| Verdict | Meaning | What happens |
+| --- | --- | --- |
+| pass | Every metric is within its warn limit | Installed at once; the report is shown |
+| warn | At least one metric is beyond its warn limit, none beyond its fail limit | Installed at once; the report is shown. Read the warnings; nothing blocks |
+| fail | At least one metric is beyond its fail limit | Not installed. A dialog offers **Keep previous** (the default) or **Install anyway…** |
+
+- **Keep previous** changes nothing: the active calibration and the DCS stay as
+  they are. The failed calibration remains in the capture's session folder as
+  `4mm_6r_8c_4x.new` with its report, so you can see why. Correct the cause and
+  run the capture again.
+- **Install anyway…** asks a second time, defaulting to No. On Yes the override
+  is recorded as `confirmed`, `by` (the operating-system user) and `at` (local
+  time). It is written into the new calibration before it is installed, in
+  `calibration.yaml`, `quality_report.json`, and a line in `quality_report.txt`.
+  Every later session that uses this calibration records it in its metadata as
+  `hardware.configured.calibration3d.override`.
+- If the capture or the fit itself raises (for example, a camera's pauses do not
+  match the waypoints, or the fit does not converge), nothing is installed and
+  **3D calibration failed** shows the reason. The capture folder stays in the
+  session folder.
+
+An install takes effect at once: live 3D reloads the new calibration without a
+restart.
+
+## After a new calibration: redo the coordinate system
+
+A 3D calibration changes the frame that every DCS value was measured in. When
+the installed calibration is not the one the DCS was measured against:
+
+- The app says so once: "Out of date after a new 3D calibration: redo Tools →
+  Calibrate Coordinate System before running sessions."
+- **Record is blocked** with "Coordinate system out of date: redo Tools →
+  Calibrate Coordinate System".
+- Everything that uses DCS-space coordinates is held off as if no DCS were
+  loaded: motor moves given in DCS, drift monitoring, the pellet checks, the
+  pellet shift. Live 2D pose and raw 3D keep running. The DCS files are left in
+  place, not deleted; they count as out of date because the calibration id they
+  recorded differs from the active one.
+- **Make 3D calibration still works**, so a capture you are not happy with can
+  be repeated before the DCS is redone.
+
+To redo it, set System Mode to Running, move the pellet spoon to a typical
+delivery position with the Set and Send buttons, and choose **Tools → Calibrate
+Coordinate System**. DCS records the id of the calibration it was measured
+against in `diamond_triangle_offset.yaml` and writes fresh `camera_offsets.pkl`
+into the active calibration folder. That clears the out-of-date state and
+unblocks Record. A DCS saved before calibration ids existed has none, so it is
+out of date against any format-2 calibration. A legacy calibration has no id,
+and any valid DCS is accepted with it.
+
+## The monthly reminder
+
+When the active calibration is 30 days old or more, or there is none, or its
+date cannot be read, the app suggests a new one. It checks once per run, at the
+first configuration load:
+
+- a non-modal **Calibration due** box gives the date of the last calibration
+  ("never" if there is none, "unknown (could not be read)" if the date is
+  unreadable) and names **Tools → Make 3D calibration**;
+- the status bar shows **3D calibration due (last: YYYY-MM-DD)**. It stays until
+  a new calibration is installed. Keeping the previous calibration after a fail,
+  or a failed install, leaves it up.
+
+The reminder never starts a calibration; the operator does, when the rig is
+ready. The threshold is the Qt setting `calibration/reminder_days` (an integer,
+default 30), read as `UserPreferences.calibration_reminder_days`. There is no
+field for it in the Preferences dialog. A value of 0 or less counts every
+calibration as due; there is no off switch. A threshold crossed mid-run is not
+noticed until the next launch.
+
+---
+
+# Part 2: reference
+
+## What gets written and where
+
+The capture creates a session folder in the normal data location. In it:
+
+- `4mm_6r_8c_4x/` is the capture: `source_videos/left.mp4`,
+  `source_videos/right.mp4` and `waypoints.yaml` (the commanded and reported
+  motor positions, which waypoints were verified, the times, and the camera
+  settings).
+- `4mm_6r_8c_4x.new/` is the new calibration, at format 2. It stays after an
+  install as the session's record, and when a fail is kept out.
+
+An install copies `.new` into the configuration location (default
+`~/Autotrainer`) as `4mm_6r_8c_4x.partial`, renames the active folder to its
+**dated backup**, then renames the copy into place. The backup is
+`4mm_6r_8c_4x_<YYYYMMDD_HHMMSS>`, where the suffix is the local time the folder
+stopped being active. A backup is never overwritten or deleted by the app: an
+install refuses a backup name that already exists. A copy that fails leaves the
+previous calibration untouched, and a final rename that fails puts it back.
+
+A format-2 folder:
+
+```
+4mm_6r_8c_4x/
+  calibration.yaml          the index, written last: format, id, created, board,
+                            presets (name, binning, size, ROI offset), verdict,
+                            override, motor_scale, capture settings
+  sensor/fit.yaml           the full fit in sensor pixels: K, dist, rvec, tvec per
+                            camera, board rotation, motor scale, RMS, parameter std
+  presets/<WxH_binB>/       one per preset, for example presets/256x256_bin4/
+    camera_matrix/stereo_params.pickle
+    camera_matrix/left_intrinsic_params.pickle
+    camera_matrix/right_intrinsic_params.pickle
+    frame.yaml              the 3D frame: transform, units, signs
+    calibration.toml        the anipose export
+    README.txt
+  quality_report.json       the report, with the thresholds it was graded with
+  quality_report.txt        the operator's summary
+  coverage_left.png, coverage_right.png
+  waypoints.yaml, source_videos/    copied from the capture
+  camera_offsets.pkl        only after DCS is redone; written by DCS, never by the calibration
+```
+
+- A folder without `calibration.yaml` at format 2 is a **legacy** calibration
+  (`camera_matrix/stereo_params.pickle` at the top) and is loaded the old way.
+  It has no id; its date is its `stereo_params.pickle` modification time.
+- `calibration.yaml` is written last, into a `.partial` folder that is renamed
+  into place, so a half-written folder never loads.
+- **`camera_offsets.pkl` is never carried over.** The install skips it if the
+  new folder has one, and nothing copies the previous calibration's into the
+  new one. Offsets are measured by DCS against a particular calibration, so the
+  previous ones are wrong in the new frame. They stay in the dated backup.
+- Because the capture videos and `waypoints.yaml` are in the folder, a
+  calibration can be recomputed later; see Part 3.
+
+## Presets
+
+The presets are `geometry.presets_from_base` of the live camera geometry, with
+binnings 4, 2 and 1. For the base geometry of 256 x 256 at binning 4 and ROI
+offset (52, 6), which is the SpinCam default and the rig's:
+
+| Preset (folder) | Binning | Size | ROI offset (binned px) | Sensor window (px) |
+| --- | --- | --- | --- | --- |
+| `256x256_bin4` | 4 | 256 x 256 | (52, 6) | 1024 x 1024 at (208, 24) |
+| `512x512_bin2` | 2 | 512 x 512 | (104, 12) | same |
+| `1024x1024_bin1` | 1 | 1024 x 1024 | (208, 24) | same |
+
+Each preset holds intrinsics in that preset's exact pixels and the same
+extrinsics. A different base gives different presets; the base binning must be
+a multiple of 4.
+
+**Live inference** picks the preset by the left camera's configuration. Live
+frames reach inference pooled to the base capture whatever the capture-binning
+preset, so the base geometry (binning, size, ROI offset, as saved, with
+SpinCam's defaults for anything left out) is the pixel space live 3D works in.
+The preset whose geometry equals it is loaded. If there is none, live 3D stays
+off, the operator is told why, and 2D pose keeps running. Another preset is
+never substituted, because its pixels are not the frames' pixels.
+
+**Offline analysis** resolves the calibration a session used from its metadata,
+`hardware.configured.calibration3d`:
+
+- `id` finds the calibration under `--calib-root` (default `~/Autotrainer`),
+  whether it is the active folder or a dated backup. With no id, the session's
+  start time picks the calibration that was active then.
+- `preset` names the preset to read. A session with no `calibration3d`, or one
+  recorded on a legacy calibration, is read at the base preset (the largest
+  binning).
+- A session recorded with live 3D off (`live3dDisabledReason`), an id not found,
+  an ambiguous match or no match is refused with "pass --calib-dir".
+- A session older than every kept calibration uses the oldest one, with a
+  warning.
+- `--calib-dir` overrides all of it.
+
+reachAQ itself triangulates only at the base preset: live frames and the
+recorded live 2D files are in that space. The 512 and 1024 presets are for
+external tools (see Exports).
+
+## The quality report
+
+Each metric has a (warn, fail) pair. For most, the status is fail when the value
+is above the fail limit, else warn when above the warn limit. For `views_kept`
+and `coverage_roi_fraction`, a smaller value is worse. The verdict is the worst
+status. A value that cannot be determined is infinite and takes the worst status
+its limits allow, so an undetermined quantity cannot pass. The report records the
+thresholds it was graded with.
+
+| Metric | Scope | Warn | Fail | Meaning |
+| --- | --- | --- | --- | --- |
+| `views_kept` | camera | < 20 | < 10 | Distinct positions where this camera's board detection was kept (at most 36) |
+| `reprojection_rms_px` | camera | > 0.5 | > 1.0 | RMS distance between detected corners and the fit's projection, sensor px |
+| `coverage_roi_fraction` | camera | < 0.5 | < 0.25 | Fraction of the base preset's sensor window inside the union of the detected-corner hulls |
+| `fx_fy_ratio_dev` | camera | > 0.01 | > 0.03 | \|fx/fy - 1\|; a large value is a sign of a poorly constrained fit |
+| `focal_rel_std` | camera | > 0.005 | > 0.02 | One-sigma uncertainty of fx, relative to fx; fails if the capture does not determine it |
+| `focal_left_right_rel` | pair | > 0.10 | none | \|fx left - fx right\| over their mean |
+| `principal_point_offset_frac` | camera | > 0.2 | > 0.4 | Distance of (cx, cy) from the window centre, each axis as a fraction of the window half-side |
+| `max_distortion_shift_px` | camera | > 60 | > 150 | Largest displacement the distortion model makes along the window border, sensor px |
+| `epipolar_error_px` | pair | > 0.5 | > 1.0 | Mean symmetric epipolar distance, sensor px, over positions both cameras saw |
+| `square_size_rel_error` | pair | > 0.01 | > 0.03 | \|mean triangulated square - 4 mm\| / 4 mm |
+| `motor_scale_dev` | capture | > 0.01 | none | \|motor scale - 1\|: true travel (from the board's squares) against commanded travel |
+| `waypoints_unverified` | capture | > 0 | none | Positions where the motor's reported position did not come within 0.05 mm of the command in time |
+| `waypoints_unreached` | capture | none | > 0 | Positions where the reported position was more than 0.1 mm from the commanded one on some axis. The fit places the board at the commanded position, so any such view is in the wrong place. A position with no finite reported position is not counted |
+| `cross_check_delta_px` | binned preset | > 1.5 | none | Largest difference in fx, fy, cx or cy between a direct fit in the preset's own pooled frames and the mapped sensor fit, preset px. Informational: the direct fit has a noise floor near 0.5 px |
+| `cross_check_corner_offset_px` | binned preset | > 0.1 | > 0.25 | Mean offset between corners detected in the preset's pooled frames and the sensor corners mapped into it, preset px. Tests the pixel-centre mapping itself |
+| `camera_rotation_change_deg` | camera, vs previous | > 0.5 | none | Rotation relative to the motor axes since the previous calibration; above the limit the report says the camera moved |
+| `baseline_change_mm` | pair, vs previous | > 1.0 | none | Change of the left-to-right camera-centre vector since the previous calibration |
+| `focal_change_rel` | camera, vs previous | > 0.02 | none | Relative change of fx since the previous calibration |
+
+- The change metrics appear only when the previous calibration is a format-2
+  folder whose fit can be read. Otherwise the report notes "no comparable
+  previous calibration".
+- A binning-1 preset is a crop of the frames the sensor fit used, so it has no
+  cross-check.
+- Notes list what the metrics do not: views rejected per camera and the reason
+  (`not found`, `inconsistent`), a camera whose corner order was reversed to
+  match the other, and each unreached waypoint with the position the motor
+  reported.
+- `coverage_<cam>.png` shows the full sensor, the covered area, the ROI
+  rectangle and every detected corner.
+
+## Exports
+
+Every preset folder is a DeepLabCut 3D `camera_matrix` folder and an anipose
+calibration. All pixel values are in that preset's pixels, so use a preset's
+files only with video recorded at that binning and ROI. `README.txt` in the
+folder repeats this.
+
+- **DeepLabCut 3D.** `camera_matrix/stereo_params.pickle` holds one key,
+  `"left-right"`, with the keys and shapes of the pre-existing file
+  (`cameraMatrix1/2`, `distCoeffs1/2`, `R`, `T`, `E`, `F`, `R1/R2`, `P1/P2`,
+  `roi1/roi2`, `Q`, `image_shape`, `rot_cor`), so existing loaders read it
+  unchanged. `T` is in mm and `rot_cor` is 0.0: new calibrations rotate no
+  pixels. `{left,right}_intrinsic_params.pickle` hold `{cam: {"mtx", "dist"}}`.
+  DLC keys the pair by the project's camera names, so the DLC project's
+  `config.yaml` must set `camera_names: ["left", "right"]`. Triangulated points
+  are in the rectified left-camera frame, in mm.
+- **anipose.** `calibration.toml` is in aniposelib's `CameraGroup` format:
+  `cam_0` (left) and `cam_1` (right) each with name, size `[w, h]`, matrix, five
+  distortion coefficients, rotation (Rodrigues, motor frame to camera) and
+  translation in mm, plus `[metadata]`. The camera poses are in the motor frame.
+  `metadata.error` is the mean of the two cameras' RMS in the preset's pixels.
+- **Frame transform.** `frame.yaml` holds the 3 x 3 `transform` M, `units: mm`
+  and the per-axis `signs`. Live and offline 3D compute
+  `oriented = (raw - camera_offsets) @ M`, where `raw` is the triangulation
+  with P1 and P2. M turns the rectified left-camera frame into the motor axes in
+  millimetres, with the signs of the DCS motor-to-diamond map, so
+  `diamond_to_motor` is unchanged. It replaces the earlier reorientation from
+  hand-entered camera angles and the square-size scaling. The origin comes from
+  DCS, through `camera_offsets.pkl`.
+
+## Known rig facts and limits
+
+- **Motor x stops at 0.** Measured on christielab10 on 2026-10-26: a move to x
+  -1.722 left the stage at 0.000. The firmware stops there; `_move_axis` does not
+  clamp, `HardwareModel._set_axis` does. `plan_waypoints` therefore commands any
+  motor coordinate below 0 at 0, on every axis, and logs which waypoints were
+  clamped. On that rig's DCS, 12 of the 37 waypoints were affected (DCS x -9.4
+  and -9.0). The fit uses the clamped positions, which are where the stage is, so
+  the low-x sweep is shorter by up to 1.7 mm there; watch `coverage_roi_fraction`.
+  The upper travel limit is unknown; `waypoints_unreached` fails any waypoint
+  that does not arrive.
+- **`last_position` reports once per move, before the acknowledgement.** On the
+  same check it updated about 0.10 s after the command, to the target (error at
+  most 0.007 mm), and the acknowledgement followed 0.20 to 0.30 s after the
+  command. "Verified" therefore means the firmware reported the target, not that
+  the arrival was traced. The 0.25 s settle after the acknowledgement stays as
+  the mechanical settle.
+- **Older code cannot read a format-2 calibration folder.** Code from before
+  this branch has no loader for `calibration.yaml`, and the DCS file written
+  against a format-2 calibration has a `calibration_id` field it does not
+  accept. Install a format-2 calibration only on a rig running this branch or
+  later.
+- **A crash between the install's two renames.** If the app dies after the
+  backup rename and before the final one, the configuration location has no
+  `4mm_6r_8c_4x`; the dated backup and `4mm_6r_8c_4x.partial` both survive. On
+  the next start live 3D is off with an error; rename one back into place by
+  hand.
+- **Camera movement is checked against the previous calibration only.** Both
+  cameras shifting by the same vector cannot be told from the board being
+  remounted, and the change metrics do not see it. The DCS, redone after every
+  calibration, measures the origin.
+- **The anipose file has been checked without aniposelib.** It is tested by
+  reading it back and repeating `CameraGroup.triangulate`'s arithmetic
+  (`cv2.undistortPoints`, then a DLT per camera pose); aniposelib was not
+  installed. The DeepLabCut pickle is tested against DLC's own reader.
+- **The fit holds k3 at 0** (see Part 3).
+
+---
+
+# Part 3: developer notes
+
+## Where the maths lives
+
+`auto-trainer-inference/src/autotrainer/inference/multires_calibration/`:
+
+| Module | Holds |
+| --- | --- |
+| `geometry.py` | `PresetGeometry`, `presets_from_base`, the sensor-to-preset mapping |
+| `extract.py` | stationary segments, board detection, per-waypoint observations |
+| `fit.py` | the joint motor-frame fit (`fit_motor_frame`) |
+| `report.py` | `build_report`, `DEFAULT_THRESHOLDS`, coverage |
+| `products.py` | per-preset stereo parameters, the frame transform, the anipose export |
+| `store.py` | the folder format, loading, resolving by id or time |
+| `pipeline.py` | `calibrate_capture`, which ties them together |
+
+Capture and install live in `tools/acquisition`: `model/handle_3d_calibration.py`
+(waypoints, pauses, `capture_settings`), `model/calibration_install.py`,
+`model/dcs_state.py` (VALID, STALE or MISSING), `model/calibration_reminder.py`,
+`model/calibration_geometry.py` (the live preset from the camera configuration)
+and `view/main_window.py` (`on_3d_calibrate`, `_finish_3d_calib`, the reminder
+and the status-bar label).
+
+## Pixel-centre mapping
+
+The fit is done once, in full-sensor binning-1 pixels (1440 x 1080), and each
+preset is derived from it. Pixel i is centred on coordinate i, and a binned
+pixel averages b sensor pixels, so for binning b and ROI offset (ox, oy) in
+binned pixels:
+
+```
+u_b = (u_s + 0.5) / b - 0.5 - ox        v_b = (v_s + 0.5) / b - 0.5 - oy
+fx_b = fx_s / b                          fy_b = fy_s / b
+cx_b = (cx_s + 0.5) / b - 0.5 - ox       cy_b = (cy_s + 0.5) / b - 0.5 - oy
+```
+
+Distortion, R and T are unchanged: the distortion acts on normalised
+coordinates, before the intrinsic matrix. Rectification is recomputed at the
+preset's (width, height). Treating a binned pixel as a point at its corner
+(the pixel-edge convention) is off by (b - 1) / 2b per axis, 0.375 px at binning
+4, which is what `cross_check_corner_offset_px` would catch.
+
+## The fit and its gauge
+
+The board never tilts, so each camera's views are parallel planes, and a planar
+calibration cannot separate focal length from distance. The commanded motor
+positions can: all corners together form one non-planar target,
+
+```
+X_w,j = R(board_rvec) P_j + board_tvec + sigma * m_w
+X_cam = R(rvec_c) X_w + tvec_c        (mm)
+```
+
+with `P_j` the board corner, `m_w` the commanded position of waypoint w and
+`sigma` the motor scale, which the fit measures against the board's squares.
+Both cameras' intrinsics and poses are fitted jointly by least squares.
+
+- **Gauge.** `board_tvec` is held at zero. Moving the board origin by d and
+  every camera by -R_c d changes no projection, so the motor frame's origin is a
+  choice, not a measurement; here it is board corner 0 at motor position 0.
+  Fitting it too would leave the normal equations singular. The DCS sets the live
+  origin later. This is why the change metrics compare the baseline between the
+  cameras and each camera's rotation against the motor axes, never a camera's
+  own position: the board is remounted every month, so a lone camera position
+  would read "moved" every time.
+- **k3 is held at 0.** The board covers only the middle of the sensor, and with
+  k3 free the fit pushed it to about -8 +/- 6 on the synthetic rig, moving the
+  distortion at the corners of the 1024 window by 2.7 px while fitting the
+  covered area no better.
+- Parameter standard deviations come from the Jacobian. A direction below 1/1e9
+  of the largest eigenvalue counts as undetermined, and its standard deviation
+  is infinite.
+- The planar start is tried first and kept if it converges with every camera at
+  or below 1.0 px RMS. Otherwise the fit is also started from a grid of focal
+  lengths, and of all the starts that converged the lowest cost is kept. A start
+  that has not converged in 400 evaluations is abandoned; `RuntimeError` is
+  raised only when every start fails.
+
+Extraction splits each video into stationary segments by frame-to-frame motion
+and matches segment i to distinct waypoint i by order, not by timestamp. A camera
+whose segment count differs from the number of distinct waypoints, or whose
+dwells start more than 3 frames apart, raises `WaypointAlignmentError`. At each
+segment the board is detected in the 5 middle frames and the per-corner median is
+the observation. A camera is dropped from a waypoint as `not found` if no frame
+has the board, or as `inconsistent` if any corner's detections spread by more
+than 1.0 px (RMS from their mean).
+
+The frame transform is `M = (diag(signs) @ R_left^T @ R1^T)^T`, with `R_left`
+the left camera's rotation and `R1` the rectification rotation. The signs are
+measured from `DiamondTriangleOffsetConfig.motor_to_diamond`, the path the live
+drift monitor uses, not copied from its flips and not taken from the test-only
+`motor_to_inference` helpers, which give the opposite signs.
+
+## Re-running a calibration offline
+
+`calibrate_capture` takes a capture folder and writes a new calibration. The
+capture folder needs `waypoints.yaml` and `source_videos/left.mp4` and
+`right.mp4`, so a session's `4mm_6r_8c_4x/` works, and so does an installed
+calibration folder, which carries copies of both.
+
+```python
+from pathlib import Path
+
+from autotrainer.inference.multires_calibration.geometry import PresetGeometry, presets_from_base
+from autotrainer.inference.multires_calibration.pipeline import calibrate_capture
+
+base = PresetGeometry(binning=4, width=256, height=256, offset_x=52, offset_y=6)
+index, report = calibrate_capture(
+    Path("<session>/4mm_6r_8c_4x"),
+    output_dir=Path("recalibrated/4mm_6r_8c_4x.new"),  # must not exist
+    presets=presets_from_base(base),
+    previous_dir=None,        # a format-2 folder, to get the change metrics
+    refine="subpix",          # or "legacy"
+)
+print(report.to_text())
+```
+
+- `refine` is the corner refinement. `"subpix"` (the default, and what the app
+  uses) is `cv2.cornerSubPix` on the original grey frame. `"legacy"` is the
+  older Canny and line-fit refinement from `calibration_FLIR`, on the
+  contrast-stretched, gamma-2 image. The one used is recorded in
+  `calibration.yaml` as `capture.corner_refinement`.
+- The base must match the camera geometry the capture's presets were meant for;
+  the app reads it from the left camera's saved configuration through
+  `live_inference_geometry`.
+- Every preset with binning above 1 is cross-checked: the frames the detection
+  used are pooled by that binning (area averaging) and cropped to the ROI, the
+  board is detected again, and the preset is fitted directly, starting from the
+  mapped sensor fit. A direct fit that fails gives an infinite
+  `cross_check_delta_px` and a note, which warns; it does not abort.
+- `calibrate_capture` grades with `DEFAULT_THRESHOLDS`. `build_report` accepts
+  other thresholds, but the pipeline does not pass them: to tune a limit, change
+  the constant. Reports carry the limits they were graded with, so months stay
+  comparable after a change.
+- Errors are not caught: `WaypointAlignmentError`, `RuntimeError` and
+  `ValueError` from the fit, and `FileExistsError` for an existing output folder,
+  reach the caller. The app shows them in **3D calibration failed** and posts the
+  `calibration3dFailed` API event; any other outcome posts
+  `calibration3dCompleted`.
+- A synthetic rig for capture-free tests, with known K, dist, R and T, is in
+  `auto-trainer-inference/tests/multires_synthetic.py`.

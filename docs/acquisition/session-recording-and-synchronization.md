@@ -710,6 +710,8 @@ reaches a format-2 folder only through `--calib-dir` or a deleted legacy
 backup. Offline 3D never writes
 `camera_offsets.pkl` into a format-2 calibration folder: only DCS does.
 
+How the calibration is made, stored and graded: [Multi-resolution stereo calibration](stereo-calibration.md).
+
 The [local API](local-api.md) publishes explicit session and pellet-attempt
 events. ReachAQ's status schema contains no alarm, emergency,
 tunnel, head-fix, or magnet placeholders. Session events identify the continuous
