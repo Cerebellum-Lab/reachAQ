@@ -368,8 +368,8 @@ def test_capture_settings_follow_the_camera_params():
 
 
 def test_capture_settings_record_only_the_params_the_capture_sets():
-    # A param the capture leaves out is whatever the camera does without it, not None, so
-    # the log does not claim a value for it. default_params sets gamma to None explicitly,
+    # The log never claims a value for a param the capture did not set (one without gain or
+    # gamma would not open SpinCam at all). default_params sets gamma to None explicitly,
     # which is recorded.
     without_gamma = {k: v for k, v in default_params.items() if k != "gamma"}
     assert h3d.capture_settings_of(without_gamma) == {"gain_db": 1.0, "exposure_us": 4500, "fps": 40}

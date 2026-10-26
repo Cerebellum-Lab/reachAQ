@@ -102,7 +102,10 @@ default_params = dict(
     offsetx=0,
     offsety=0,
     # 1 dB, and the camera's gamma off. The URL carries gamma=None, which SpinCam reads as
-    # None (ast.literal_eval) and so disables gamma; left out, SpinCam's default 0.7 applies.
+    # None (ast.literal_eval) and so disables gamma. Both must be set: left out, SpinCam
+    # cannot open the camera at all, since VideoManager.parse_params fills in the class's
+    # non-string default (0.7 for gamma), which SpinCam.set_property's ast.literal_eval
+    # rejects ("Could not create camera").
     gain=1.0,
     gamma=None,
 )
@@ -137,8 +140,10 @@ SETTLE_FALLBACK_S = 1.0
 def capture_settings_of(params: Mapping[str, Any]) -> Dict[str, Any]:
     """The capture settings the waypoint log records, from the camera params the capture sets.
 
-    Only the params present are recorded: one left out is whatever the camera does without
-    it, not None. (gamma=None present is recorded; it turns the camera's gamma off.)
+    Only the params present are recorded: the log never claims a value the capture did not
+    set. (gamma=None present is recorded; it turns the camera's gamma off.) A capture that
+    left gain or gamma out would not run, though: SpinCam fails to open a camera without
+    them (see default_params).
     """
     names = {"gain_db": "gain", "gamma": "gamma", "exposure_us": "exposure", "fps": "fps"}
     return {setting: params[param] for setting, param in names.items() if param in params}
