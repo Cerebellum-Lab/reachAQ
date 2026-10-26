@@ -21,6 +21,7 @@ from autotrainer.core import CameraConfiguration, Offset3DTuple
 from autotrainer.core.capture import CaptureProcessStatus
 from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
 from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
+from autotrainer.inference.multires_calibration.extract import distinct_waypoints
 from autotrainer.inference.multires_calibration.geometry import PresetGeometry
 from autotrainer.inference.multires_calibration.pipeline import WAYPOINT_LOG, load_waypoint_log, write_waypoint_log
 from tools.acquisition.model import handle_3d_calibration as h3d
@@ -43,7 +44,8 @@ LIVE_PARAMS = dict(hbin=4, vbin=4, width=256, height=256, offsetx=52, offsety=6,
 SETTINGS = {"gain_db": 1.0, "gamma": None, "exposure_us": 4500, "fps": 40}
 
 
-def _dcs(used=(10, 20, 30), offset=(0, 0, 0), **overrides) -> DiamondTriangleOffsetConfig:
+def _dcs(used=(10, 40, 30), offset=(0, 0, 0), **overrides) -> DiamondTriangleOffsetConfig:
+    # The default places every waypoint at a positive motor position, so nothing is clamped.
     values = dict(
         used_position=Offset3DTuple(*used),
         measured_offset=Offset3DTuple(*offset),
@@ -140,35 +142,112 @@ class _Reports:
         return position
 
 
-@pytest.mark.parametrize("used, offset", [((10, 20, 30), (0, 0, 0)), ((7.0, 4.5, 6.5), (4.7, -34.0, -8.4))])
+def _todays_waypoints(dcs):
+    """The motor position after the start and after each move, as today's commands left it, unclamped."""
+    position, waypoints = {}, []
+    for i, (axis, value) in enumerate(_todays_commands(dcs)):
+        position[axis] = value
+        if i >= len(start) - 1:
+            waypoints.append(tuple(position[a] for a in "xyz"))
+    return waypoints
+
+
+def _no_ops(positions):
+    """The waypoints that leave the stage where the one before left it."""
+    return [i for i in range(1, len(positions)) if positions[i] == positions[i - 1]]
+
+
+# christielab10's DCS (2026-10-26 motor check), rounded as the motor check logged it. Its DCS
+# x -9.4 and -9.0 land at motor x -1.72 and -1.32, below the stage's travel.
+RIG_DCS = dict(used=(0.48, 19.01, 5.98), offset=(-7.20, 16.12, -8.19))
+RIG_CLAMPED = [0, 1, 7, 8, 9, 13, 14, 15, 33, 34, 35, 36]
+
+
+@pytest.mark.parametrize("used, offset", [((10, 40, 30), (0, 0, 0)), ((12.0, 40.5, 6.5), (1.7, -4.0, -8.4))])
 def test_plan_matches_todays_moves(used, offset):
     dcs = _dcs(used, offset)
+    expected = _todays_waypoints(dcs)
+    # these DCS put every waypoint inside the stage's travel, so nothing is clamped
+    assert min(v for position in expected for v in position) > 0
 
     plan = plan_waypoints(start, moves, dcs)
 
     assert len(plan) == 37
     # Waypoint 0 is where the three start moves leave the stage, and each move then
     # changes one axis of the previous waypoint.
-    position, expected = {}, []
-    for i, (axis, value) in enumerate(_todays_commands(dcs)):
-        position[axis] = value
-        if i >= len(start) - 1:
-            expected.append(tuple(position[a] for a in "xyz"))
     assert [motor for _, _, motor in plan] == expected
     assert [(axis, value) for axis, value, _ in plan] == [start[-1], *moves]
     assert all(isinstance(v, float) for _, value, motor in plan for v in (value, *motor))
 
 
 def test_plan_motor_values_by_hand():
-    # used (10, 20, 30), offset 0: motor x = 10 + x, but y and z are flipped: 20 - y, 30 - z.
+    # used (10, 40, 30), offset 0: motor x = 10 + x, but y and z are flipped: 40 - y, 30 - z.
     plan = plan_waypoints(start, moves, _dcs())
 
     assert plan[0][0:2] == ("z", -35.0)
-    assert plan[0][2] == pytest.approx((0.6, 10.0, 65.0))  # start (-9.4, 10, -35)
-    assert plan[1] == ("z", -30.0, pytest.approx((0.6, 10.0, 60.0)))
-    assert plan[2] == ("x", -5.0, pytest.approx((5.0, 10.0, 60.0)))
-    assert plan[3] == ("y", 15.0, pytest.approx((5.0, 5.0, 60.0)))
-    assert plan[-1] == ("y", 15.0, pytest.approx((1.0, 5.0, 65.0)))  # x -9, y 15, z -35
+    assert plan[0][2] == pytest.approx((0.6, 30.0, 65.0))  # start (-9.4, 10, -35)
+    assert plan[1] == ("z", -30.0, pytest.approx((0.6, 30.0, 60.0)))
+    assert plan[2] == ("x", -5.0, pytest.approx((5.0, 30.0, 60.0)))
+    assert plan[3] == ("y", 15.0, pytest.approx((5.0, 25.0, 60.0)))
+    assert plan[-1] == ("y", 15.0, pytest.approx((1.0, 25.0, 65.0)))  # x -9, y 15, z -35
+
+
+def test_a_rig_like_dcs_plans_no_motor_position_below_the_stage_travel(caplog):
+    dcs = _dcs(**RIG_DCS)
+    unclamped = _todays_waypoints(dcs)
+    below = [i for i, position in enumerate(unclamped) if min(position) < 0]
+    assert below == RIG_CLAMPED  # all of them on x, at DCS x -9.4 and -9.0
+    assert all(position[0] < 0 and min(position[1:]) > 0 for position in (unclamped[i] for i in below))
+
+    with caplog.at_level("WARNING", logger=h3d.logger.name):
+        plan = plan_waypoints(start, moves, dcs)
+
+    motors = [motor for _, _, motor in plan]
+    assert min(v for position in motors for v in position) >= 0
+    # Commanded at the limit, where the stage stops anyway; every other coordinate as today.
+    assert motors == [tuple(max(v, 0.0) for v in position) for position in unclamped]
+    assert [i for i, position in enumerate(motors) if position != unclamped[i]] == RIG_CLAMPED
+    assert all(motors[i][0] == 0.0 for i in RIG_CLAMPED)
+    # The DCS moves stay as planned; only where the stage can go changed.
+    assert [(axis, value) for axis, value, _ in plan] == [start[-1], *moves]
+
+    # Every clamped waypoint is named in the warning, with its axis and the position it lost.
+    [warning] = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert "12 of 37 waypoints" in warning
+    for i in RIG_CLAMPED:
+        assert f"waypoint {i}: x {unclamped[i][0]:.3f} -> 0.000" in warning
+
+
+def test_clamping_on_this_rig_leaves_every_move_moving():
+    plan = plan_waypoints(start, moves, _dcs(**RIG_DCS))
+    motors = [motor for _, _, motor in plan]
+
+    # Only today's own no-op (z -30 again at waypoint 32): no clamped move lands where the
+    # stage already was, so the capture has the same 36 distinct waypoints as before.
+    assert _no_ops(motors) == _no_ops(_todays_waypoints(_dcs(**RIG_DCS))) == [32]
+    assert distinct_waypoints(motors) == [i for i in range(37) if i != 32]
+
+
+def test_a_move_that_clamping_leaves_motionless_is_one_dwell_with_the_waypoint_before(caplog):
+    # motor x = 4 + DCS x: x -9.4, -9, -7 and -5 all land below 0. The move to x -5 right
+    # after the start (waypoint 2), and the move to x -9 after x -5 (waypoint 33), then
+    # command the stage where it already is.
+    dcs = _dcs(used=(4, 40, 30))
+    assert _no_ops(_todays_waypoints(dcs)) == [32]
+
+    with caplog.at_level("WARNING", logger=h3d.logger.name):
+        plan = plan_waypoints(start, moves, dcs)
+
+    motors = [motor for _, _, motor in plan]
+    assert len(plan) == 37  # kept: the log still has one entry per move
+    assert _no_ops(motors) == [2, 32, 33]
+    # calibrate_capture collapses each run of equal commanded positions into the one
+    # stationary segment the stage really made, as it does today's no-op.
+    assert distinct_waypoints(motors) == [i for i in range(37) if i not in (2, 32, 33)]
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("waypoint 2" in w and "where waypoint 1 left it" in w for w in warnings), warnings
+    assert any("waypoint 33" in w and "where waypoint 32 left it" in w for w in warnings), warnings
+    assert not any("waypoint 32" in w and "where waypoint 31 left it" in w for w in warnings), warnings
 
 
 def test_plan_needs_a_start_that_sets_every_axis():

@@ -109,6 +109,12 @@ default_params = dict(
 
 AXES = "xyz"
 
+# The stage's lower travel limit on every axis, in motor units (mm). HardwareModel._set_axis
+# clamps SET targets below it (hardware_model.py, "limited move to 0"); _move_axis sends MOVE
+# targets as they are, but the firmware stops there: in the 2026-10-26 motor check on
+# christielab10 a MOVE to x -1.722 left the stage at 0.000.
+MOTOR_LOWER_LIMIT = 0.0
+
 
 def capture_settings_of(params: Mapping[str, Any]) -> Dict[str, Any]:
     """The capture settings the waypoint log records, from the camera params the capture sets.
@@ -142,18 +148,48 @@ def plan_waypoints(
     together; its (axis, DCS value) is the last of them. Each move then changes one axis of
     the waypoint before, so every motor xyz is the whole position the stage is commanded
     to, in motor units (mm). Raises ValueError when the start does not set every axis.
+
+    A motor coordinate below MOTOR_LOWER_LIMIT is commanded at the limit, where the stage
+    stops anyway, so the commands and the waypoint log hold where the stage really is; the
+    calibration fits on those positions. The clamped waypoints are logged. A move that
+    clamping leaves where the stage already was stays in the plan and is logged: the log
+    keeps one entry per move, and calibrate_capture collapses a run of equal positions into
+    the one stationary segment it is, as it does the no-op move already in `moves`.
     """
     if {axis for axis, _ in start} != set(AXES):
         raise ValueError(f"the start {tuple(start)} must set every axis of {AXES}")
-    motor = [math.nan] * 3
+    target = [math.nan] * 3  # where the DCS puts the stage, before clamping
     for axis, value in start:
-        motor[AXES.index(axis)] = _dcs_axis_to_motor(dcs, axis, value)
+        target[AXES.index(axis)] = _dcs_axis_to_motor(dcs, axis, value)
     last_axis, last_value = start[-1]
-    plan = [(last_axis, float(last_value), tuple(motor))]
-    for axis, value in moves:
-        motor[AXES.index(axis)] = _dcs_axis_to_motor(dcs, axis, value)
-        plan.append((axis, float(value), tuple(motor)))
+    steps = [(last_axis, last_value), *moves]
+    plan, targets = [], []
+    for k, (axis, value) in enumerate(steps):
+        if k > 0:
+            target[AXES.index(axis)] = _dcs_axis_to_motor(dcs, axis, value)
+        targets.append(tuple(target))
+        plan.append((axis, float(value), tuple(max(t, MOTOR_LOWER_LIMIT) for t in target)))
+    _log_clamping(plan, targets)
     return plan
+
+
+def _log_clamping(plan, targets) -> None:
+    clamped = [
+        f"waypoint {k}: {axis} {t:.3f} -> {MOTOR_LOWER_LIMIT:.3f}"
+        for k, target in enumerate(targets)
+        for axis, t in zip(AXES, target)
+        if t < MOTOR_LOWER_LIMIT
+    ]
+    if clamped:
+        n_clamped = sum(1 for target in targets if min(target) < MOTOR_LOWER_LIMIT)
+        logger.warning(
+            "%d of %d waypoints are below the stage's travel limit %.1f and are commanded at it: %s",
+            n_clamped, len(plan), MOTOR_LOWER_LIMIT, "; ".join(clamped))
+    for k in range(1, len(plan)):
+        if plan[k][2] == plan[k - 1][2] and targets[k] != targets[k - 1]:
+            logger.warning(
+                "waypoint %d (%s %s) is clamped where waypoint %d left it, so the stage does not move;"
+                " the calibration takes the two as one waypoint", k, plan[k][0], plan[k][1], k - 1)
 
 
 def _reported_position(hard) -> Optional[Tuple[float, float, float]]:
