@@ -55,7 +55,8 @@ from tools.autotrainer_version import __version__ as app_version
 from tools.acquisition.model.app_model import AppModel
 from tools.acquisition.model.app_model_status import AppModelStatus, SessionRecordingStatus
 from tools.acquisition.model.calibration_install import decide_install, install_calibration, override_record
-from tools.acquisition.model.calibration_reminder import calibration_due, reminder_text
+from tools.acquisition.model.calibration_reminder import (
+    MAKE_CALIBRATION_MENU_PATH, calibration_due, due_label_text, reminder_text)
 from tools.acquisition.model.dcs_state import DcsState
 from tools.acquisition.model.handle_3d_calibration import make_3d_calib
 from tools.acquisition.model.nidaq_discovery import discover_nidaq_devices
@@ -932,6 +933,9 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "3D calibration failed", reason or type(error).__name__)
             return
         if installed_report is not None:
+            # A new calibration is active, so the monthly reminder's status-bar label is out of date. It
+            # stays when the previous calibration is kept or the install failed: that one is still active.
+            self._set_calibration_due_label(None)
             self._show_msg_box(
                 "3D calibration installed", _preformatted(installed_report.to_text()), QMessageBox.Icon.Information)
             # A DCS measured against the previous calibration is held off and blocks Record until
@@ -1763,6 +1767,13 @@ class MainWindow(QMainWindow):
         hbox.addWidget(_make_separator())
         lbl = self._status_label_send_pos = XYZQLabel(prefix="Send: ", sep=", ", tail=" mm")
         hbox.addWidget(lbl)
+        # Shown by the monthly reminder (_remind_if_calibration_due) once the app finds the calibration
+        # due, and hidden again when a new one is installed. Left of the position widget, which stays rightmost.
+        lbl = self._calibration_due_label = QLabel("")
+        lbl.setStyleSheet("font-weight: 600; color: #b45309;")
+        lbl.setToolTip(f"Choose {MAKE_CALIBRATION_MENU_PATH} when the rig is ready.")
+        lbl.setVisible(False)
+        bar.addPermanentWidget(self._calibration_due_label)
         bar.addPermanentWidget(widget)
         self.setStatusBar(bar)
         status_log_handler = self._status_log_handler = StatusLogHandler(self._show_logged_error)
@@ -2417,25 +2428,42 @@ class MainWindow(QMainWindow):
 
         Checked at the run's first configuration load, due or not: by then the app has loaded its
         calibration, and a month-old threshold crossed later in a run is not worth a second look.
-        It only shows the message, non-modal; the operator starts a calibration from the menu it
-        names. Runs on the GUI thread, as its caller is an invoke_method. An unreadable
-        calibration counts as due, and nothing here may fail a configuration load.
+        It only shows the message, non-modal, and a status-bar label that stays until a new
+        calibration is installed (_finish_3d_calib); the operator starts a calibration from the
+        menu they name. An unreadable calibration counts as due, and nothing here may fail a
+        configuration load.
         """
         if self._calibration_reminder_shown:
             return
         self._calibration_reminder_shown = True
         created = None
+        unreadable = False
         calib_dir = self._app_model.active_calibration_dir
         if calib_dir is not None:
             try:
                 created = calibration_created(calib_dir)
             except Exception as err:
+                unreadable = True
+                # An unreadable or corrupt calibration is expected; anything else is a bug worth its traceback.
                 logger.warning("3D calibration reminder: the date of %s is unreadable, taken as due: %s: %s",
-                               calib_dir, type(err).__name__, err)
+                               calib_dir, type(err).__name__, err,
+                               exc_info=not isinstance(err, (OSError, ValueError)))
         # A format-2 index may carry a UTC offset; comparing with a naive now would raise.
         now = datetime.now(None if created is None else created.tzinfo)
         if calibration_due(created, now, self._preferences.calibration_reminder_days):
-            self._show_msg_box("Calibration due", reminder_text(created), QMessageBox.Icon.Information)
+            self._set_calibration_due_label(due_label_text(created, unreadable=unreadable))
+            self._show_msg_box(
+                "Calibration due", reminder_text(created, unreadable=unreadable), QMessageBox.Icon.Information)
+
+    @invoke_method
+    def _set_calibration_due_label(self, text: Optional[str]) -> None:
+        """Show `text` in the status bar's calibration-due label, or hide the label for None."""
+        label = self._calibration_due_label
+        if text is None:
+            label.setVisible(False)
+            return
+        label.setText(text)
+        label.setVisible(True)
 
     @invoke_method
     def _on_inference_analysis_result_ready(self, prj: ProjectInfo, rsp: IntersessionResponse):

@@ -184,6 +184,20 @@ class _Action:
         self.checked = checked
 
 
+class _Label:
+    """The status bar's calibration-due label, as the monthly reminder left it: shown."""
+
+    def __init__(self):
+        self.text = "3D calibration due (last: 2026-09-01)"
+        self.visible = True
+
+    def setText(self, text):
+        self.text = text
+
+    def setVisible(self, visible):
+        self.visible = visible
+
+
 def _given_back(window) -> bool:
     """Run, the 3D action and the app status are the operator's again."""
     return (window.run_action.enabled and window.make_3d_calib_action.enabled
@@ -221,9 +235,11 @@ def _window(location: Path, monkeypatch, *, override_answer=None, dcs_after=DcsS
         _ask_install_failed_3d_calib=ask,
         run_action=_Action(enabled=False),
         make_3d_calib_action=_Action(enabled=False, checked=True),
+        _calibration_due_label=_Label(),
     )
     window._install_3d_calib = partial(MainWindow._install_3d_calib, window)
     window._end_3d_calib = partial(MainWindow._end_3d_calib, window)
+    window._set_calibration_due_label = partial(MainWindow._set_calibration_due_label, window)
     monkeypatch.setattr(main_window_module, "QMessageBox", SimpleNamespace(
         critical=lambda parent, title, text, *args: seen.errors.append((title, text, _given_back(window))),
         Icon=QMessageBox.Icon,
@@ -409,3 +425,43 @@ def test_an_override_whose_install_fails_is_logged_as_failed(tmp_path, location,
     assert [m.split(":")[0] for m in logs] == ["override recorded (install pending)", "install failed"]
     assert [kind for kind, *_ in seen.events] == [ApiEventKind.calibration3dFailed]
     assert _given_back(window)
+
+
+# The status bar's "3D calibration due" label (shown by the monthly reminder) goes away when a
+# new calibration is installed, and stays while the old one is still the active one.
+
+@pytest.mark.parametrize("verdict, override_answer", [("pass", None), ("warn", None), ("fail", True)])
+def test_installing_a_calibration_hides_the_due_label(tmp_path, location, monkeypatch, verdict, override_answer):
+    produced = _produced(tmp_path / "session", verdict)
+    window, seen = _window(location, monkeypatch, override_answer=override_answer)
+
+    _finish(window, None, produced)
+
+    assert seen.reloaded == [location / DEFAULT_3D_CALIB_DIR_NAME]
+    assert window._calibration_due_label.visible is False
+
+
+def test_keeping_the_previous_calibration_leaves_the_due_label_shown(tmp_path, location, monkeypatch):
+    produced = _produced(tmp_path / "session", "fail")
+    window, seen = _window(location, monkeypatch, override_answer=False)
+
+    _finish(window, None, produced)
+
+    assert seen.reloaded == []
+    assert window._calibration_due_label.visible is True
+    assert window._calibration_due_label.text == "3D calibration due (last: 2026-09-01)"
+
+
+def test_a_calibration_or_an_install_that_fails_leaves_the_due_label_shown(tmp_path, location, monkeypatch):
+    window, seen = _window(location, monkeypatch)
+    _finish(window, ValueError("the board was not seen"), None)
+    assert window._calibration_due_label.visible is True
+
+    def refuse_install(new_dir, configuration_location, *, now):
+        raise PermissionError(f"cannot install {new_dir}")
+
+    monkeypatch.setattr(main_window_module, "install_calibration", refuse_install)
+    window, seen = _window(location, monkeypatch)
+    _finish(window, None, _produced(tmp_path / "session", "pass"))
+    assert [kind for kind, *_ in seen.events] == [ApiEventKind.calibration3dFailed]
+    assert window._calibration_due_label.visible is True

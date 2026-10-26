@@ -5,18 +5,20 @@ first configuration load, against the calibration the app actually loaded.
 """
 
 import inspect
+import logging
 import os
 from datetime import datetime, timedelta, timezone
 from functools import partial
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
 import pytest
-from PySide6.QtWidgets import QMessageBox
+from PySide6.QtWidgets import QApplication, QMainWindow, QMessageBox
 
 from autotrainer.inference.multires_calibration.store import CALIBRATION_FORMAT, INDEX_FILE
-from tools.acquisition.model.calibration_reminder import calibration_due, reminder_text
+from tools.acquisition.model.calibration_reminder import calibration_due, due_label_text, reminder_text
 from tools.acquisition.model.user_preferences import UserPreferences
 from tools.acquisition.view import main_window as main_window_module
 from tools.acquisition.view.main_window import MainWindow
@@ -80,6 +82,52 @@ def test_reminder_text_for_no_calibration_says_never():
     assert MENU_PATH in text
 
 
+def test_reminder_text_for_a_calibration_that_could_not_be_read_says_unknown_not_never():
+    text = reminder_text(None, unreadable=True)
+
+    assert "unknown (could not be read)" in text
+    assert "never" not in text
+    assert "3D calibration" in text and MENU_PATH in text
+
+
+def test_the_status_bar_label_names_the_date_never_or_unknown():
+    assert due_label_text(datetime(2026, 9, 20, 14, 5)) == "3D calibration due (last: 2026-09-20)"
+    assert due_label_text(None) == "3D calibration due (last: never)"
+    assert due_label_text(None, unreadable=True) == "3D calibration due (last: unknown)"
+
+
+@pytest.fixture
+def qapp():
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication([])
+    return app
+
+
+def test_the_status_bar_label_is_a_hidden_permanent_widget_until_a_calibration_is_due(qapp):
+    # The real status bar of a bare QMainWindow, with the real label and its real show and hide.
+    class Window(QMainWindow):
+        def _show_logged_error(self, message):
+            pass
+
+    window = Window()
+    try:
+        MainWindow._configure_statusbar(window)
+        label = window._calibration_due_label
+
+        assert label in window.statusBar().children()
+        assert label.isHidden() and label.text() == ""
+
+        MainWindow._set_calibration_due_label(window, "3D calibration due (last: never)")
+        assert not label.isHidden() and label.text() == "3D calibration due (last: never)"
+
+        MainWindow._set_calibration_due_label(window, None)
+        assert label.isHidden()
+    finally:
+        # _configure_statusbar puts a handler on the root logger, for the window's life.
+        logging.getLogger().removeHandler(window._status_log_handler)
+
+
 def test_the_menu_path_in_the_text_is_where_the_action_is():
     # The text sends the operator to a menu; it must not drift from the real one.
     source = inspect.getsource(MainWindow._configure_menubar)
@@ -92,8 +140,22 @@ def test_the_menu_path_in_the_text_is_where_the_action_is():
 # The main window's reminder, driven through the real configuration-load handler with a stub
 # window: every other call that handler makes lands on a MagicMock and is not under test.
 
+class _Label:
+    """The status bar's calibration-due label, as the reminder finds it: hidden and empty."""
+
+    def __init__(self):
+        self.text = ""
+        self.visible = False
+
+    def setText(self, text):
+        self.text = text
+
+    def setVisible(self, visible):
+        self.visible = visible
+
+
 def _window(monkeypatch, *, active_dir, created=None, days=30):
-    """A window whose reminder, message box and calibration lookup are recorded.
+    """A window whose reminder, message box, status-bar label and calibration lookup are recorded.
 
     `created` is what calibration_created returns for the active folder: a datetime, or an
     exception to raise. None leaves the real calibration_created in place, for tests that
@@ -105,6 +167,8 @@ def _window(monkeypatch, *, active_dir, created=None, days=30):
     window._app_model.active_calibration_dir = active_dir
     window._preferences.calibration_reminder_days = days
     window._show_msg_box = lambda title, text, icon: seen.boxes.append((title, text, icon))
+    window._calibration_due_label = _Label()
+    window._set_calibration_due_label = partial(MainWindow._set_calibration_due_label, window)
     window._remind_if_calibration_due = partial(MainWindow._remind_if_calibration_due, window)
 
     if created is not None:
@@ -132,6 +196,26 @@ def test_reminder_shown_once_per_run(monkeypatch, tmp_path):
     assert seen.boxes == [("Calibration due", reminder_text(created), QMessageBox.Icon.Information)]
     assert seen.looked_up == [tmp_path]
     assert window._calibration_reminder_shown is True
+
+
+def test_a_due_calibration_also_shows_the_status_bar_label_with_its_date(monkeypatch, tmp_path):
+    created = datetime.now() - timedelta(days=45)
+    window, seen = _window(monkeypatch, active_dir=tmp_path, created=created)
+
+    _load_configuration(window)
+
+    label = window._calibration_due_label
+    assert label.visible is True
+    assert label.text == f"3D calibration due (last: {created.strftime('%Y-%m-%d')})"
+
+
+def test_a_calibration_that_is_not_due_leaves_the_status_bar_label_hidden(monkeypatch, tmp_path):
+    window, seen = _window(monkeypatch, active_dir=tmp_path, created=datetime.now() - timedelta(days=5))
+
+    _load_configuration(window)
+
+    label = window._calibration_due_label
+    assert label.visible is False and label.text == ""
 
 
 def test_reminder_never_starts_a_calibration(monkeypatch, tmp_path):
@@ -166,6 +250,8 @@ def test_no_active_calibration_is_reminded_as_never(monkeypatch):
     assert [title for title, _, _ in seen.boxes] == ["Calibration due"]
     assert seen.boxes[0][1] == reminder_text(None)
     assert "never" in seen.boxes[0][1]
+    assert window._calibration_due_label.visible is True
+    assert window._calibration_due_label.text == "3D calibration due (last: never)"
     assert seen.looked_up == []
 
 
@@ -198,6 +284,37 @@ def test_a_calibration_that_cannot_be_read_is_due_and_does_not_break_the_load(mo
     assert "calibration.yaml is corrupt" in caplog.text
     # The rest of the handler still ran.
     window._refresh_ui_availability.assert_called_once()
+
+
+def test_a_calibration_that_cannot_be_read_is_unknown_not_never(monkeypatch, tmp_path):
+    window, seen = _window(monkeypatch, active_dir=tmp_path, created=ValueError("calibration.yaml is corrupt"))
+
+    _load_configuration(window)
+
+    assert seen.boxes[0][1] == reminder_text(None, unreadable=True)
+    assert "unknown (could not be read)" in seen.boxes[0][1] and "never" not in seen.boxes[0][1]
+    assert window._calibration_due_label.visible is True
+    assert window._calibration_due_label.text == "3D calibration due (last: unknown)"
+
+
+@pytest.mark.parametrize("error, has_traceback", [
+    (ValueError("calibration.yaml is corrupt"), False),
+    (FileNotFoundError("no stereo_params.pickle"), False),
+    (PermissionError("calibration.yaml"), False),
+    (RuntimeError("a bug in the lookup"), True),
+    (KeyError("created"), True),
+])
+def test_only_an_unexpected_failure_of_the_lookup_is_logged_with_a_traceback(
+        monkeypatch, tmp_path, caplog, error, has_traceback):
+    window, seen = _window(monkeypatch, active_dir=tmp_path, created=error)
+
+    with caplog.at_level("WARNING"):
+        _load_configuration(window)
+
+    records = [r for r in caplog.records if r.name == main_window_module.__name__ and r.levelname == "WARNING"]
+    assert len(records) == 1
+    assert bool(records[0].exc_info) is has_traceback
+    assert [title for title, _, _ in seen.boxes] == ["Calibration due"]
 
 
 def test_an_empty_folder_and_a_corrupt_index_are_due_with_the_real_lookup(monkeypatch, tmp_path):
