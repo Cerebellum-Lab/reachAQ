@@ -94,12 +94,14 @@ restart.
 ## After a new calibration: redo the coordinate system
 
 A 3D calibration changes the frame that every DCS value was measured in. When
-the installed calibration is not the one the DCS was measured against:
+the active calibration is not the one the DCS was measured against:
 
-- The app says so once: "Out of date after a new 3D calibration: redo Tools →
-  Calibrate Coordinate System before running sessions."
-- **Record is blocked** with "Coordinate system out of date: redo Tools →
-  Calibrate Coordinate System".
+- The app says so once: "Coordinate system out of date: it was measured against
+  a different 3D calibration. Redo Tools → Calibrate Coordinate System before
+  running sessions."
+- **Record is blocked** with "Coordinate system out of date: it was measured
+  against a different 3D calibration. Redo Tools → Calibrate Coordinate
+  System".
 - Everything that uses DCS-space coordinates is held off as if no DCS were
   loaded: motor moves given in DCS, drift monitoring, the pellet checks, the
   pellet shift. Live 2D pose and raw 3D keep running. The DCS files are left in
@@ -114,8 +116,10 @@ Coordinate System**. DCS records the id of the calibration it was measured
 against in `diamond_triangle_offset.yaml` and writes fresh `camera_offsets.pkl`
 into the active calibration folder. That clears the out-of-date state and
 unblocks Record. A DCS saved before calibration ids existed has none, so it is
-out of date against any format-2 calibration. A legacy calibration has no id,
-and any valid DCS is accepted with it.
+out of date against any format-2 calibration. A legacy calibration has no id: a
+DCS without one is accepted with it, but a DCS that records an id was measured
+in a format-2 calibration's frame and is out of date under a legacy one, for
+example after rolling back to a legacy backup.
 
 ## The monthly reminder
 

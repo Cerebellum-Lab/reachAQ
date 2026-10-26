@@ -5,7 +5,8 @@ in the oriented frame of the calibration that was active then. A format-2 calibr
 an id, and DCS records it; when the active calibration's id differs, DCS is stale. Its
 consumers then see no configuration at all, Record is blocked with the reason, and the
 operator is told once. Redoing DCS against the active calibration makes it valid again.
-A legacy calibration has no id, so any valid DCS fits it, as before.
+A legacy calibration has no id, so a DCS without one fits it, as before; a DCS that records
+an id was measured in a format-2 calibration's frame, so it is stale under a legacy one.
 """
 
 import pickle
@@ -39,10 +40,13 @@ from tools.acquisition.view import main_window as main_window_module
 from tools.acquisition.view.main_window import MainWindow
 
 
-STALE_BLOCKER = "Coordinate system out of date: redo Tools → Calibrate Coordinate System"
+STALE_BLOCKER = (
+    "Coordinate system out of date: it was measured against a different 3D calibration. "
+    "Redo Tools → Calibrate Coordinate System"
+)
 STALE_NOTICE = (
-    "Out of date after a new 3D calibration: redo Tools → Calibrate Coordinate System "
-    "before running sessions."
+    "Coordinate system out of date: it was measured against a different 3D calibration. "
+    "Redo Tools → Calibrate Coordinate System before running sessions."
 )
 _ID = "0123456789abcdef0123456789abcdef"
 
@@ -66,9 +70,11 @@ def _index(calibration_id=_ID) -> CalibrationIndex:
 
 
 @pytest.mark.parametrize("cfg, index, expected", [
-    # A legacy active calibration has no id: any valid DCS fits it, with an id or without.
+    # A legacy active calibration has no id: a DCS without one fits it, as before ids. One
+    # with an id was measured in a format-2 motor frame, a different frame (after a rollback
+    # to a legacy backup, say), so it is stale.
     (_config(), None, DcsState.VALID),
-    (_config(calibration_id=_ID), None, DcsState.VALID),
+    (_config(calibration_id=_ID), None, DcsState.STALE),
     # A format-2 calibration: only the DCS measured against it.
     (_config(calibration_id=_ID), _index(), DcsState.VALID),
     (_config(calibration_id="f" * 32), _index(), DcsState.STALE),
@@ -119,6 +125,22 @@ def _titled(on_error, title):
 def test_stale_blocks_recording_with_reason(app_model, stale):
     assert app_model.dcs_state is DcsState.STALE
     assert STALE_BLOCKER in app_model.recording_blockers
+
+
+def test_an_id_stamped_dcs_under_a_legacy_calibration_is_stale_and_blocks_recording(
+        app_model, dcs_path, system_config):
+    # The DCS was measured against a format-2 calibration; then the legacy folder is active
+    # again, as after a rollback to its dated backup. The legacy frame is another frame.
+    assert app_model.active_calibration_dir is not None and app_model.active_calibration_index is None, \
+        "the fixture calibration is legacy"
+    _config(calibration_id=_ID).to_file(dcs_path)
+    with mock.patch.object(app_model, "on_error") as on_error:
+        assert app_model.load_configuration() is True
+    assert app_model.active_calibration_index is None
+    assert app_model.dcs_state is DcsState.STALE
+    assert STALE_BLOCKER in app_model.recording_blockers
+    assert app_model.behavior.algorithm.diamond_triangle_config is None
+    assert _titled(on_error, "Coordinate system") == [STALE_NOTICE]
 
 
 def test_the_record_button_is_told_when_dcs_goes_stale(app_model, dcs_path, user_pref, system_config,

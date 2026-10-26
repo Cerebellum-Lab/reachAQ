@@ -533,7 +533,8 @@ def _load_camera_offsets(calib_dir: Path) -> Dict[str, Any]:
     (its calibration_id is not this one's), so refresh_dcs_state finds it STALE: the DCS
     consumers get no configuration, and Record is blocked, until DCS is redone, which
     writes this file. A legacy calibration has no id to compare, so a legacy folder
-    without the file only gives zero offsets, and a valid DCS stays VALID.
+    without the file only gives zero offsets, and a valid DCS without an id stays VALID
+    (one with an id is STALE under any legacy folder, dcs_state.py).
     """
     path_offsets = calib_dir.joinpath(DEFAULT_CAM_OFFSET_FILE_NAME)
     if not path_offsets.is_file():
