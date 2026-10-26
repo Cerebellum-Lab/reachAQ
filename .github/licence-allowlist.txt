@@ -3,3 +3,4 @@
 auto-trainer-api       # AGPL-3.0-only, scheduled for removal
 auto-trainer-training  # AGPL-3.0-only, scheduled for removal
 ultralytics            # AGPL-3.0, scheduled for removal
+ultralytics-thop       # AGPL-3.0, scheduled for removal

@@ -64,12 +64,26 @@ def installed(monkeypatch, *dists):
     return {x.name: x for x in installed_licences()}
 
 
+BSD_CLASSIFIER = "License :: OSI Approved :: BSD License"
+MIT_CLASSIFIER = "License :: OSI Approved :: MIT License"
+
+
 def test_bundled_notices_in_license_field_do_not_override_classifiers(monkeypatch):
     # numpy, scipy and pandas ship the bundled third-party licence texts (GPL,
     # Affero, ...) in the free-text License field and declare BSD in classifiers.
-    notices = "BSD\n\nGNU Affero General Public License\nGNU General Public License"
-    got = installed(monkeypatch, FakeDist("numpy", notices, classifiers=["License :: OSI Approved :: BSD License"]))
-    assert got["numpy"].flag == "permissive"
+    multiline = "BSD\n\nGNU Affero General Public License\nGNU General Public License"
+    one_long_line = "BSD " + "x" * 600 + " GNU General Public License"
+    got = installed(
+        monkeypatch,
+        FakeDist("multiline", multiline, classifiers=[BSD_CLASSIFIER]),
+        FakeDist("long", one_long_line, classifiers=[BSD_CLASSIFIER]),
+    )
+    assert got["multiline"].flag == "permissive" and got["long"].flag == "permissive"
+
+
+def test_short_license_field_naming_gpl_is_not_overridden_by_a_permissive_classifier(monkeypatch):
+    got = installed(monkeypatch, FakeDist("g", "GPL-3.0-or-later", classifiers=[MIT_CLASSIFIER]))
+    assert got["g"].flag == "GPL"
 
 
 def test_license_field_is_used_when_nothing_structured_identifies_it(monkeypatch):
@@ -77,14 +91,20 @@ def test_license_field_is_used_when_nothing_structured_identifies_it(monkeypatch
         monkeypatch,
         FakeDist("g", "GPL-3.0-only", classifiers=["License :: OSI Approved"]),
         FakeDist("p", "NVIDIA Proprietary Software", classifiers=["License :: Other/Proprietary License"]),
+        FakeDist("blob", "text\nGNU General Public License\nmore text"),
     )
-    assert got["g"].flag == "GPL" and got["p"].flag == "unknown"
+    assert got["g"].flag == "GPL" and got["p"].flag == "unknown" and got["blob"].flag == "GPL"
 
 
-def test_license_expression_wins_and_names_are_normalized_and_deduplicated(monkeypatch):
+def test_license_expression_is_authoritative_over_the_license_field(monkeypatch):
+    got = installed(monkeypatch, FakeDist("m", "GPL-3.0", expression="MIT", classifiers=[BSD_CLASSIFIER]))
+    assert got["m"].flag == "permissive" and got["m"].licence_text == "MIT"
+
+
+def test_names_are_normalized_and_the_first_duplicate_wins(monkeypatch):
     got = installed(
         monkeypatch,
-        FakeDist("Auto_Trainer.API", "GPL-2.0", expression="AGPL-3.0-only"),
+        FakeDist("Auto_Trainer.API", expression="AGPL-3.0-only"),
         FakeDist("auto-trainer-api", expression="MIT"),
     )
     assert list(got) == ["auto-trainer-api"] and got["auto-trainer-api"].flag == "AGPL"
