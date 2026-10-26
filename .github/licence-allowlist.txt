@@ -1,0 +1,5 @@
+# AGPL/GPL packages the licence check tolerates: name  # reason
+# The list may only shrink. An entry with no matching installed AGPL/GPL package is stale and fails CI.
+auto-trainer-api       # AGPL-3.0-only, scheduled for removal
+auto-trainer-training  # AGPL-3.0-only, scheduled for removal
+ultralytics            # AGPL-3.0, scheduled for removal
