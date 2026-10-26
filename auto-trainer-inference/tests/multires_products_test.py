@@ -18,6 +18,7 @@ also run on a rig whose scene is turned 35 degrees about a generic axis, as on t
 real rig, where the cameras sit at unequal azimuths and elevations.
 """
 
+import dataclasses
 import pickle
 
 import cv2
@@ -286,6 +287,22 @@ def test_anipose_toml_reads_back():
     assert data["metadata"]["error"] == sensor_rms > 0
     binned = PresetGeometry(4, 256, 256, 52, 6)
     assert tomli.loads(anipose_toml(fit, binned))["metadata"]["error"] == pytest.approx(sensor_rms / 4, rel=1e-15)
+
+
+@pytest.mark.parametrize("value", [np.nan, np.inf, -np.inf], ids=["nan", "inf", "-inf"])
+@pytest.mark.parametrize("field", ["K", "dist", "rvec", "tvec"])
+def test_anipose_toml_refuses_non_finite_camera_parameters(field, value):
+    # TOML can spell nan and inf, but a calibration holding them would be read back by
+    # anipose as if it were one; the export refuses it instead.
+    model = FIT.cameras["right"]
+    broken = np.array(getattr(model, field), float)
+    broken.flat[-1] = value
+    fit = dataclasses.replace(FIT, cameras={**FIT.cameras, "right": dataclasses.replace(model, **{field: broken})})
+    with pytest.raises(ValueError, match="right") as refused:
+        anipose_toml(fit, PRESETS[0])
+    assert "finite" in str(refused.value)
+    # The cameras as fitted still export.
+    anipose_toml(FIT, PRESETS[0])
 
 
 @pytest.mark.parametrize("g", PRESETS, ids=preset_id)

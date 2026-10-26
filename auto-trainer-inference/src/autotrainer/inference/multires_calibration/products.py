@@ -14,6 +14,7 @@ Each preset gets:
 """
 
 import json
+import math
 from typing import Tuple
 
 import cv2
@@ -119,20 +120,26 @@ def anipose_toml(fit: MotorFrameFit, g: PresetGeometry) -> str:
     translation is in mm, as aniposelib's Camera projects with cv2.projectPoints.
     metadata.error is the mean of the fit's per-camera RMS in the preset's px (sensor px /
     binning), like every other pixel value in the file.
+
+    Raises ValueError, naming the camera, for a camera parameter that is not finite: TOML
+    can spell nan and inf, and anipose would read them back as a calibration.
     """
     lines = []
     for i, cam in enumerate(_CAMERAS):
         m = fit.cameras[cam]
-        lines += [
-            f"[cam_{i}]",
-            f"name = {_toml_value(cam)}",
-            f"size = {_toml_value([g.width, g.height])}",
-            f"matrix = {_toml_value(map_intrinsics(m.K, g))}",
-            f"distortions = {_toml_value(np.asarray(m.dist, float).ravel())}",
-            f"rotation = {_toml_value(np.asarray(m.rvec, float).ravel())}",
-            f"translation = {_toml_value(np.asarray(m.tvec, float).ravel())}",
-            "",
-        ]
+        try:
+            lines += [
+                f"[cam_{i}]",
+                f"name = {_toml_value(cam)}",
+                f"size = {_toml_value([g.width, g.height])}",
+                f"matrix = {_toml_value(map_intrinsics(m.K, g))}",
+                f"distortions = {_toml_value(np.asarray(m.dist, float).ravel())}",
+                f"rotation = {_toml_value(np.asarray(m.rvec, float).ravel())}",
+                f"translation = {_toml_value(np.asarray(m.tvec, float).ravel())}",
+                "",
+            ]
+        except ValueError as error:
+            raise ValueError(f"anipose export of preset {g.name}, camera {cam}: {error}") from error
     error = float(np.mean([fit.rms_px[cam] for cam in _CAMERAS])) / g.binning
     lines += ["[metadata]", f"adjusted = {_toml_value(False)}", f"error = {_toml_value(error)}"]
     return "\n".join(lines) + "\n"
@@ -144,13 +151,18 @@ def _cross_matrix(t: np.ndarray) -> np.ndarray:
 
 
 def _toml_value(value) -> str:
-    """A TOML literal for the few types the export writes; floats at repr precision so they read back exactly."""
+    """A TOML literal for the few types the export writes; floats at repr precision so they read back exactly.
+
+    Raises ValueError for a float that is not finite.
+    """
     if isinstance(value, (bool, np.bool_)):
         return "true" if value else "false"
     if isinstance(value, (int, np.integer)):
         return str(int(value))
     if isinstance(value, (float, np.floating)):
-        # repr gives the shortest exact form; nan and inf are spelled as TOML spells them.
+        if not math.isfinite(value):
+            raise ValueError(f"{float(value)!r} is not a finite calibration value")
+        # repr gives the shortest exact form.
         return repr(float(value))
     if isinstance(value, str):
         # A JSON string is a valid TOML basic string for the camera names written here.
