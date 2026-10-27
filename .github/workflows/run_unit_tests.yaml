@@ -55,7 +55,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: .git/lfs
-          key: lfs-${{ hashFiles('.gitattributes', 'auto-trainer-inference/tests/**', 'tools/acquisition/view/*.png') }}
+          key: ${{ steps.lfs-cache.outputs.cache-primary-key }}
       - name: Install system libraries, ffmpeg and the Ubuntu font
         run: |
           sudo apt-get update
@@ -71,6 +71,7 @@ jobs:
         shell: bash  # this is to get color output
         env:
           TERM: xterm-256color
+          GIT_LFS_SKIP_SMUDGE: '1'  # setuptools_scm runs git archive, which would download every LFS pointer
         run: |
           set -x
           pip config --user set install.progress_bar off
@@ -92,8 +93,6 @@ jobs:
         run: python -m setuptools_scm
       - name: Show auto-trainer and ensure we don't use sub-projects wheel(s)
         run: ./.check_sub_projects_not_installed.sh
-      - name: Diagnostic LFS storage before pytest
-        run: du -sh .git/lfs; find .git/lfs/objects -type f | wc -l
       - name: Test with pytest
         env:
           QT_QPA_PLATFORM: offscreen
@@ -105,9 +104,6 @@ jobs:
           site_pkgs_dir=$(python -c "import site; print(site.getsitepackages()[0])")
           echo "import coverage; coverage.process_startup()" > "${site_pkgs_dir}/usercustomize.pth"
           coverage run -m pytest auto-trainer-core/tests auto-trainer-video/tests auto-trainer-inference/tests auto-trainer-device/tests tests tools/acquisition/tests -q -p no:randomly -rs $PYTEST_EXTRA_ARGS
-      - name: Diagnostic LFS storage after pytest
-        if: ${{ !cancelled() }}
-        run: du -sh .git/lfs; find .git/lfs/objects -type f | wc -l
       - name: Coverage
         if: ${{ !cancelled() }}
         run: |
