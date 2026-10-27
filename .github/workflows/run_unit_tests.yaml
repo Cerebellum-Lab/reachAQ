@@ -37,8 +37,9 @@ jobs:
           lfs: false  # fetch LFS selectively in the step below, not the whole tree
           fetch-depth: 0  # required to fetch all history and all tags
           fetch-tags: true
-      - name: Cache Git LFS objects
-        uses: actions/cache@v4
+      - name: Restore Git LFS objects
+        id: lfs-cache
+        uses: actions/cache/restore@v4
         with:
           path: .git/lfs
           key: lfs-${{ hashFiles('.gitattributes', 'auto-trainer-inference/tests/**', 'tools/acquisition/view/*.png') }}
@@ -49,6 +50,12 @@ jobs:
           git lfs pull --include="auto-trainer-inference/tests/**,tools/acquisition/view/*.png" --exclude="vendor/**"
           du -sh .git/lfs
           test "$(find .git/lfs/objects -type f | wc -l)" -eq 25
+      - name: Save Git LFS objects
+        if: steps.lfs-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .git/lfs
+          key: lfs-${{ hashFiles('.gitattributes', 'auto-trainer-inference/tests/**', 'tools/acquisition/view/*.png') }}
       - name: Install system libraries, ffmpeg and the Ubuntu font
         run: |
           sudo apt-get update
@@ -75,6 +82,8 @@ jobs:
           cat /home/runner/.config/pip/pip.conf
           pip install "torch>=2.7,<2.8" "torchvision>=0.22,<0.23" --index-url https://download.pytorch.org/whl/cpu
           pip install -e ".[test]"
+      - name: Diagnostic LFS storage after install
+        run: du -sh .git/lfs; find .git/lfs/objects -type f | wc -l
       - name: Check torch is the CPU build
         run: python -c "import torch,sys; print(torch.__version__); sys.exit(not torch.__version__.endswith('+cpu'))"
       - name: Licence check
@@ -83,6 +92,8 @@ jobs:
         run: python -m setuptools_scm
       - name: Show auto-trainer and ensure we don't use sub-projects wheel(s)
         run: ./.check_sub_projects_not_installed.sh
+      - name: Diagnostic LFS storage before pytest
+        run: du -sh .git/lfs; find .git/lfs/objects -type f | wc -l
       - name: Test with pytest
         env:
           QT_QPA_PLATFORM: offscreen
@@ -94,6 +105,9 @@ jobs:
           site_pkgs_dir=$(python -c "import site; print(site.getsitepackages()[0])")
           echo "import coverage; coverage.process_startup()" > "${site_pkgs_dir}/usercustomize.pth"
           coverage run -m pytest auto-trainer-core/tests auto-trainer-video/tests auto-trainer-inference/tests auto-trainer-device/tests tests tools/acquisition/tests -q -p no:randomly -rs $PYTEST_EXTRA_ARGS
+      - name: Diagnostic LFS storage after pytest
+        if: ${{ !cancelled() }}
+        run: du -sh .git/lfs; find .git/lfs/objects -type f | wc -l
       - name: Coverage
         if: ${{ !cancelled() }}
         run: |
