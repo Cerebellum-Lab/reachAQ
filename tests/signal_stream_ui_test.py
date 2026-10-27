@@ -771,15 +771,20 @@ def test_signal_monitor_contains_native_worker_failure_outside_application_proce
 
 
 def test_signal_monitor_worker_publishes_directly_to_shared_ring():
+    # The worker is a forkserver child that must import this module before it reports
+    # ready. It was still not running after 5 s on slower CI runners (the model's own
+    # startup timeout is 10 s), so both limits are wide; the loop exits as soon as
+    # the worker is running.
     monitor = NidaqSignalMonitorModel(
         worker_target=_shared_ring_signal_worker,
         device_discovery=_discover_dev1,
+        startup_timeout_seconds=30.0,
     )
     monitor._configuration = _stream_configuration()
     monitor._hardware_enabled = True
     try:
         assert monitor.start()
-        deadline = time.monotonic() + 5.0
+        deadline = time.monotonic() + 30.0
         while not monitor.is_running and time.monotonic() < deadline:
             time.sleep(0.01)
 
