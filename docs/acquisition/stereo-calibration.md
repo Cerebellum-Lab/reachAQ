@@ -43,14 +43,14 @@ used, see
    the settles and pauses add about 37 s in all. The cameras then stop and their
    own configurations are restored.
 
-The settle after each move is `distance / v_max + v_max / a_max + 0.25 s`, at
-least 0.25 s, with `v_max` and `a_max` the moving axis's maximum velocity and
-acceleration as the app wrote them to the motors at connect (from
-`~/Autotrainer/motor_config.yaml`). An axis without a usable configuration
-settles 1.0 s, and so does waypoint 0 when the motor has reported no position
-before it. On christielab10 (120 mm/s and 600 mm/s² on every axis) the settles
-run from 0.45 s to 0.59 s, the longest for the 17 mm x move. Each settle is
-logged at debug level.
+   The settle after each move is `distance / v_max + v_max / a_max + 0.25 s`, at
+   least 0.25 s, with `v_max` and `a_max` the moving axis's maximum velocity and
+   acceleration as the app wrote them to the motors at connect (from
+   `~/Autotrainer/motor_config.yaml`). An axis without a usable configuration
+   settles 1.0 s, and so does waypoint 0 when the motor has reported no position
+   before it. On christielab10 (120 mm/s and 600 mm/s² on every axis) the settles
+   run from 0.45 s to 0.59 s, the longest for the 17 mm x move. Each settle is
+   logged at debug level.
 4. The app finds the board at each pause, fits both cameras, grades the fit, and
    shows the **report** (below).
 5. **Redo the coordinate system.** Every new calibration makes the DCS out of
