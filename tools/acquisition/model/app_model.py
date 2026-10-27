@@ -2324,14 +2324,22 @@ class AppModel(ObservableObject):
         """Load the 3D calibration in `calib_dir`, else the configuration location's.
 
         A geometry with no preset and an unreadable index turn live 3D off and are
-        reported through on_error; any other failure raises to the caller. Either way
-        dcs_state then follows the calibration now active.
+        reported through on_error. Any other failure turns live 3D off for that folder as
+        a guarded load does (_live_3d_off_after_failed_load) and raises to the caller,
+        which reports it. Either way dcs_state then follows the calibration now active.
         """
         try:
             self._load_calibration(calib_dir, report=True)
-        except BaseException:
-            # The load may have changed the active calibration before it failed. A
-            # recompute that fails too is only logged: the caller gets the load's error.
+        except BaseException as err:
+            # Live 3D must not carry on with the parameters loaded before: after an install the
+            # folder holds another calibration, and sessions recorded meanwhile would name it
+            # while their 3D used the old one (ruling R56). A fallback or a recompute that
+            # fails too is only logged: the caller gets the load's error.
+            if isinstance(err, Exception):
+                try:
+                    self._live_3d_off_after_failed_load(self._calibration_folder(calib_dir), err, report=False)
+                except Exception:
+                    logger.exception("could not turn live 3D off after the failed load of %s", calib_dir)
             try:
                 self.refresh_dcs_state()
             except Exception:
@@ -2351,8 +2359,10 @@ class AppModel(ObservableObject):
         logger.info("loading calib from %s", calib_src_dir)
         # The folder is committed before anything in it is read, so the next configuration
         # load retries it even when this load raises: after an install, the folder active
-        # before may be a dated backup by now. The index and the live 3D inputs change only
-        # once the load succeeds, so they keep describing the calibration live 3D still runs.
+        # before may be a dated backup by now. The index, preset and disabled reason are
+        # committed below, just before the pose algorithm is installed. A load that raises
+        # anywhere is turned into live 3D off for this folder by its caller (reload_calib,
+        # _reload_calib_guarded: _live_3d_off_after_failed_load).
         self._active_calibration_dir = calib_src_dir if calib_src_dir.exists() else None
         frame_transform = None
         calibration_index = None
@@ -2421,21 +2431,32 @@ class AppModel(ObservableObject):
         missing preset file, also turns live 3D off, with its traceback logged, and the
         app starts or the configuration load completes: the calibration is part of
         neither. With `report`, the reason reaches the operator through on_error;
-        without it, the log only. Explicit reloads (DCS, the 3D calibration) still raise.
+        without it, the log only. Explicit reloads (DCS, the 3D calibration) turn live 3D
+        off the same way, then raise.
         """
         folder = self._calibration_folder(calib_dir)
         try:
             self._load_calibration(folder, report=report)
         except Exception as err:
-            logger.exception("live 3D is off: the 3D calibration in %s could not be loaded", folder)
-            # Kept, so the next configuration load tries this folder again.
-            self._active_calibration_dir = folder if folder.exists() else None
-            self._active_calibration_index = _readable_index(folder)
-            self._active_calibration_preset = None
-            self._live_3d_disabled_reason = f"could not load {folder}: {type(err).__name__}: {err}"
-            self._install_pose_algorithm()
-            if report:
-                self.on_error("3D calibration", self._live_3d_disabled_reason)
+            self._live_3d_off_after_failed_load(folder, err, report=report)
+
+    def _live_3d_off_after_failed_load(self, folder: Path, err: Exception, *, report: bool) -> None:
+        """After a load of `folder` raised: live 3D off, and `folder` the active calibration.
+
+        The folder is kept, so the next configuration load tries it again, and so is its
+        index when it still reads, so the DCS state follows that calibration's id (a DCS
+        measured against another one is STALE and blocks Record) and the session metadata
+        names it with a live3dDisabledReason, which offline 3D refuses. With `report`, the
+        reason reaches the operator through on_error.
+        """
+        logger.exception("live 3D is off: the 3D calibration in %s could not be loaded", folder)
+        self._active_calibration_dir = folder if folder.exists() else None
+        self._active_calibration_index = _readable_index(folder)
+        self._active_calibration_preset = None
+        self._live_3d_disabled_reason = f"could not load {folder}: {type(err).__name__}: {err}"
+        self._install_pose_algorithm()
+        if report:
+            self.on_error("3D calibration", self._live_3d_disabled_reason)
 
     def _install_pose_algorithm(
         self,

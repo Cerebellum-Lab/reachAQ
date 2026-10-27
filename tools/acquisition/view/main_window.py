@@ -934,8 +934,9 @@ class MainWindow(QMainWindow):
                         try:
                             self._app_model.reload_calib(installed_dir)
                         except Exception as err:
-                            # The next configuration load retries this folder (reload_calib
-                            # commits it first); until then live 3D runs on what it had.
+                            # reload_calib has turned live 3D off for this folder (a DCS measured
+                            # against the previous calibration is STALE), and the next
+                            # configuration load or a restart retries it.
                             logger.exception("3D calibration %s: installed, but could not be loaded", index.id)
                             load_error = err
         finally:

@@ -9,7 +9,10 @@ A legacy calibration has no id, so a DCS without one fits it, as before; a DCS t
 an id was measured in a format-2 calibration's frame, so it is stale under a legacy one.
 """
 
+import importlib
+import json
 import pickle
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -20,13 +23,13 @@ import pytest
 import yaml
 from PySide6.QtWidgets import QMessageBox
 
-from autotrainer.core import AnimalSubject, Offset3DTuple
+from autotrainer.core import AnimalSubject, Offset3DTuple, ProjectInfo
 from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
 from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
 from autotrainer.inference.analysis.prepare_jetson_data import DEFAULT_CAM_OFFSET_FILE_NAME
 from autotrainer.inference.multires_calibration import store
 from autotrainer.inference.multires_calibration.fit import BoardSpec
-from autotrainer.inference.multires_calibration.store import CalibrationIndex
+from autotrainer.inference.multires_calibration.store import CalibrationIndex, CalibrationResolutionError
 from reload_calib_multires_test import (
     BASE,
     BASE_PARAMS,
@@ -35,6 +38,7 @@ from reload_calib_multires_test import (
     _write_multires,
 )
 from tools.acquisition.model.app_model import AppModel
+from tools.acquisition.model.calibration_install import install_calibration
 from tools.acquisition.model.dcs_state import DcsState, dcs_state
 from tools.acquisition.view import main_window as main_window_module
 from tools.acquisition.view.main_window import MainWindow
@@ -141,6 +145,58 @@ def test_an_id_stamped_dcs_under_a_legacy_calibration_is_stale_and_blocks_record
     assert STALE_BLOCKER in app_model.recording_blockers
     assert app_model.behavior.algorithm.diamond_triangle_config is None
     assert _titled(on_error, "Coordinate system") == [STALE_NOTICE]
+
+
+def test_an_install_whose_reload_fails_turns_live_3d_off_and_blocks_recording(
+        app_model, dcs_path, calib_dir, user_pref, system_config, trainer_config_dir, tmp_path, monkeypatch):
+    # christielab10's first install (ruling R56): a legacy calibration is active in the
+    # configuration location, and the DCS, measured against it, has no id. The install
+    # succeeds, but reloading the installed folder raises. Live 3D must not carry on with the
+    # legacy parameters while that folder holds the new calibration: sessions would record no
+    # id, and offline would resolve them by time to the new frame.
+    location = Path(user_pref.configuration_location)
+    legacy = _legacy_copy_without_offsets(calib_dir, tmp_path, location / DEFAULT_3D_CALIB_DIR_NAME)
+    app_model.reload_calib(legacy)
+    _config().to_file(dcs_path)
+    _save_left_camera_params(system_config, trainer_config_dir, **BASE_PARAMS)
+    assert app_model.load_configuration() is True
+    assert app_model.dcs_state is DcsState.VALID and app_model._pose_algorithm.stereo_params is not None
+
+    new = _write_multires(tmp_path / "session" / f"{DEFAULT_3D_CALIB_DIR_NAME}.new")
+    installed, backup = install_calibration(new, location, now=datetime.now())
+    assert installed == legacy and backup is not None
+    # An I/O fault straight after the copy.
+    (installed / "presets" / BASE.name / "camera_matrix" / "stereo_params.pickle").unlink()
+    with mock.patch.object(app_model, "on_error"):
+        with pytest.raises(OSError):
+            app_model.reload_calib(installed)
+
+    index = store.load_index(installed)
+    assert app_model._pose_algorithm.stereo_params is None, "live 3D is off"
+    assert app_model.active_calibration_index == index
+    assert app_model.dcs_state is DcsState.STALE
+    assert STALE_BLOCKER in app_model.recording_blockers
+    record = app_model._calibration3d_metadata()
+    assert record["id"] == index.id and record["preset"] is None
+    assert str(installed) in record["live3dDisabledReason"]
+
+    # A session recorded meanwhile names the new calibration, and offline refuses it.
+    intersession = importlib.import_module("autotrainer.inference.analysis.intersession_process")
+    project = ProjectInfo(root=(tmp_path / "Data").as_posix(), device_id="rig", when=datetime.now(), session=1)
+    metadata = Path(project.get_metadata_file() + ".json")
+    metadata.parent.mkdir(parents=True, exist_ok=True)
+    metadata.write_text(json.dumps({
+        "metadataSchemaVersion": 2,
+        "boundary": {"startWallTime": time.time()},
+        "hardware": {"configured": {"calibration3d": record}},
+    }), encoding="utf-8")
+
+    def not_reached(*args, **kwargs):
+        raise AssertionError("offline 3D ran for a session whose live 3D was off")
+
+    monkeypatch.setattr(intersession, "process_raw_data", not_reached)
+    with pytest.raises(CalibrationResolutionError, match="live 3D off"):
+        intersession.intersession_process(project, calib_root=location)
 
 
 def test_the_record_button_is_told_when_dcs_goes_stale(app_model, dcs_path, user_pref, system_config,

@@ -91,8 +91,13 @@ value and limits, then notes. The thresholds are in
 An install takes effect at once: live 3D reloads the new calibration without a
 restart. If that reload fails (an I/O fault, say), the calibration is still
 installed and the app says "3D calibration installed, but it could not be
-loaded: <reason>. Restart the app."; live 3D keeps what it had until the next
-configuration load or restart, which loads the installed folder.
+loaded: <reason>. Restart the app." Live 3D is then off, never left on the
+previous calibration's parameters: the installed calibration is the active one,
+so a DCS measured against the previous one is out of date and Record is blocked,
+and a session recorded meanwhile carries `live3dDisabledReason`, which offline
+3D refuses. The next configuration load or a restart loads the installed folder
+again. Any explicit reload that fails (the DCS run's too) leaves live 3D off the
+same way.
 
 ## After a new calibration: redo the coordinate system
 
