@@ -598,9 +598,9 @@ def _write_output(path: Path, results: dict, status: dict, *, session_id: str,
 def _read_streams(session_dir: Path, raw_dir: Path, status: dict) -> tuple:
     """Every raw stream that opens, and a reason for each that does not.
 
-    The open-retry budget is OPEN_RETRY_SECONDS for the whole directory, not per
-    file, so a session with several streams still being closed does not hold
-    finalization for a multiple of it.
+    One OPEN_RETRY_SECONDS deadline covers reading and retrying across the whole
+    directory, not each file, so a session with several streams still being
+    closed does not hold finalization for a multiple of it.
     """
     raw, faults = {}, {}
     deadline = time.monotonic() + OPEN_RETRY_SECONDS
