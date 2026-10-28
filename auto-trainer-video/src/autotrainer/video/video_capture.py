@@ -269,7 +269,8 @@ class VideoCapture(Process):
         self._stim_pending_clip = None
         # Per-recording latency stream (streams/latency/camera_<name>.h5).
         # Opened by the command thread on Record; closed by the capture loop
-        # once the recording has really ended, so its last frames are kept.
+        # once the recording has really ended, or once capture is disabled
+        # with a close pending, so its last frames are kept.
         self._latency: Optional[LatencyStreamWriter] = None
         self._latency_close_requested = False
         # Writers whose close is still running on a LatencyClose thread. Only
@@ -739,6 +740,7 @@ class VideoCapture(Process):
                 if record_start_stop_frame_idx is not None:
                     synced_frame_idx = cam_frame_id  # ensure immediate stop
                     perform_stop_recording(force=True)
+                self._end_latency_if_requested(camera)
                 time.sleep(0.001)
                 frame_time = time.time()
                 continue
@@ -1019,18 +1021,8 @@ class VideoCapture(Process):
                         # camera clock on the host's from where it starts.
                         self._latency_latch_pending = None
                         self._append_clock_latches(camera, latency)
-                    if self._latency_close_requested and record_start_stop_frame_idx is None:
-                        # The recording has wound down (or this camera never
-                        # recorded): every frame of it is in the stream now.
-                        # Not waited for: closing flushes to a disk the ffmpeg
-                        # writers may have saturated, and the watchdog watches
-                        # this loop.
-                        self._append_clock_latches(camera, latency)
-                        # A Record that arrived while the latches were taken has
-                        # closed this stream itself and opened the next one,
-                        # which is not this loop's to close.
-                        if self._latency is latency:
-                            self._close_latency(wait=False)
+                    if record_start_stop_frame_idx is None:
+                        self._end_latency_if_requested(camera)
 
                 if img_q is not None:
                     # image queue goes to GUI video reader frame, currently FixedArrayQueue.
@@ -1289,6 +1281,25 @@ class VideoCapture(Process):
                     ] + [closer]
         if wait:
             self._wait_for_latency_closers()
+
+    def _end_latency_if_requested(self, camera: CameraBase) -> None:
+        """Close this recording's stream if the command thread has asked for it.
+
+        Capture loop only, and only once no recording is in progress: every
+        frame of it is in the stream by then. It runs on every frame and on
+        every idle pass, because a Stop that lands while capture is disabled
+        gets no further frame to run it. The close is not waited for: it
+        flushes to a disk the ffmpeg writers may have saturated, and the
+        watchdog watches this loop.
+        """
+        latency = self._latency
+        if latency is None or not self._latency_close_requested:
+            return
+        self._append_clock_latches(camera, latency)
+        # A Record that arrived while the latches were taken has closed this
+        # stream itself and opened the next one, which is not this call's to close.
+        if self._latency is latency:
+            self._close_latency(wait=False)
 
     def _finish_latency(self, writer):
         stats = writer.close()
