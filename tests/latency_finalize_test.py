@@ -738,3 +738,5 @@ def test_unreadable_streams_share_one_open_retry_budget(tmp_path, monkeypatch):
     assert status["status"] == "failed"
     # One 0.3 s budget shared by the three files, not 0.3 s each (0.9 s).
     assert elapsed < 0.6, f"{elapsed:.2f} s for three unreadable streams"
+    # The first file is retried until the deadline, so the budget is spent, not skipped.
+    assert elapsed >= 0.3, f"{elapsed:.2f} s: the open retries did not use the budget"

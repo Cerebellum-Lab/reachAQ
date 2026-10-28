@@ -139,6 +139,9 @@ def test_a_stop_that_lands_while_capture_is_disabled_still_closes_the_stream(pro
         commands.put((CaptureCommandKind.DISABLE_RECORDING, None))
         assert _closed_within(latency_stream_path(project_info, "camera_lat"), 3.0), \
             "the stream was still open 3 s after the stop; it would close only at TERMINATE"
+        # The idle close must not cost the recording its frames (about 0.5 s of them).
+        with h5py.File(latency_stream_path(project_info, "camera_lat"), "r") as store:
+            assert len(store["frames"]) > 0
     finally:
         commands.put((CaptureCommandKind.TERMINATE, None))
         assert _wait(status, CaptureProcessStatus.TERMINATED, 10)
@@ -161,6 +164,9 @@ def test_the_apps_stop_order_closes_the_stream_before_the_process_ends(project_i
         commands.put((CaptureCommandKind.DISABLE_RECORDING, None))
         commands.put((CaptureCommandKind.DISABLE_CAPTURE, None))
         assert _closed_within(latency_stream_path(project_info, "camera_lat"), 3.0)
+        # The idle close must not cost the recording its frames (about 0.5 s of them).
+        with h5py.File(latency_stream_path(project_info, "camera_lat"), "r") as store:
+            assert len(store["frames"]) > 0
     finally:
         commands.put((CaptureCommandKind.TERMINATE, None))
         assert _wait(status, CaptureProcessStatus.TERMINATED, 10)
