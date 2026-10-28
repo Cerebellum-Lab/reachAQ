@@ -719,3 +719,22 @@ def test_a_malformed_raw_column_costs_the_bridge_not_the_whole_nidaq_file(tmp_pa
     assert any(reason.startswith("nidaq.h5 RAW stamps unusable: ") for reason in status["reasons"])
     assert not any("nidaq.h5 unreadable" in reason for reason in status["reasons"])
     assert status["status"] == "partial"  # a reason caps the session; the loops themselves are whole
+
+
+def test_unreadable_streams_share_one_open_retry_budget(tmp_path, monkeypatch):
+    monkeypatch.setattr(finalize, "OPEN_RETRY_SECONDS", 0.3)
+    raw = tmp_path / "streams" / "latency"
+    raw.mkdir(parents=True)
+    for stem in ("camera_left", "camera_right", "pose"):
+        (raw / f"{stem}.h5").write_bytes(b"not hdf5")
+
+    started = time.monotonic()
+    status = finalize_session_latency(tmp_path, primary_camera="left")
+    elapsed = time.monotonic() - started
+
+    assert [item["path"] for item in status["unreadable"]] == [
+        "streams/latency/camera_left.h5", "streams/latency/camera_right.h5",
+        "streams/latency/pose.h5"]
+    assert status["status"] == "failed"
+    # One 0.3 s budget shared by the three files, not 0.3 s each (0.9 s).
+    assert elapsed < 0.6, f"{elapsed:.2f} s for three unreadable streams"
