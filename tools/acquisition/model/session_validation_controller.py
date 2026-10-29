@@ -66,6 +66,9 @@ class SessionValidationController:
     def start(self, session_path, profile, *, automatic=False, reduced_priority=True):
         session_path = Path(session_path).resolve()
         profile = ValidationProfile(profile)
+        # Callbacks are delivered with the lock released (the app model's
+        # callback takes its own lock first), so collect the states here.
+        states = []
         with self._lock:
             if self._state.active:
                 raise RuntimeError("Another session validation is already running")
@@ -97,10 +100,17 @@ class SessionValidationController:
                 report_path=output_path.as_posix(),
                 started_perf=time.perf_counter(),
             )
-            self._notify()
+            states.append(self._state)
             process.start()
             self._state = dataclasses.replace(self._state, status="running")
-            self._notify()
+            states.append(self._state)
+        try:
+            for state in states:
+                self._notify(state)
+        finally:
+            # The monitor starts only after pending and running are delivered,
+            # so its final state cannot overtake them; the finally keeps a
+            # raising callback from leaving the process unmonitored.
             monitor = threading.Thread(
                 target=self._monitor_process,
                 args=(process, result_queue),
@@ -109,7 +119,7 @@ class SessionValidationController:
             )
             self._monitor = monitor
             monitor.start()
-            return output_path
+        return output_path
 
     def cancel(self):
         with self._lock:
@@ -124,8 +134,9 @@ class SessionValidationController:
                 elapsed_seconds=time.perf_counter() - self._state.started_perf,
             )
             self._process = None
-            self._notify()
-            return True
+            state = self._state
+        self._notify(state)
+        return True
 
     def wait(self, timeout=None):
         monitor = self._monitor
@@ -160,8 +171,9 @@ class SessionValidationController:
                 error=error,
             )
             self._process = None
-            self._notify()
+            state = self._state
+        self._notify(state)
 
-    def _notify(self):
+    def _notify(self, state):
         if self._callback is not None:
-            self._callback(self._state)
+            self._callback(state)
