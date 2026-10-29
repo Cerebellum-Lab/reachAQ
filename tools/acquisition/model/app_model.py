@@ -738,6 +738,14 @@ class AppModel(ObservableObject):
         self._notes = ""
         self._editable_notes_project: Optional[ProjectInfo] = None
         self._last_stopped_session_path: Optional[Path] = None
+        # One gate for every write to a stopped session's published files
+        # (metadata json/yaml, manifest.json) and for the start of a
+        # validation that reads them. Order: this lock, then the validation
+        # controller's lock; never the reverse.
+        self._session_publication_lock = threading.RLock()
+        # Set when a notes save waited for a running validation; the
+        # validation's end state replays the save once.
+        self._notes_save_pending = False
         self._session_validation = SessionValidationController(
             self._on_session_validation_state
         )
@@ -1572,7 +1580,7 @@ class AppModel(ObservableObject):
             )
             logger.warning(message)
             self.on_error("Storage capacity warning", message)
-        self.persist_stopped_session_notes()
+        self._flush_stopped_session_notes_now()
         self._editable_notes_project = None
         self.notes = ""
         reservation = self._recording_session.begin_record(
@@ -4617,20 +4625,47 @@ class AppModel(ObservableObject):
         self._on_property_changed(self.Props.NOTES, value, prev)
 
     def persist_stopped_session_notes(self) -> bool:
-        """Atomically update notes for the most recently stopped session."""
-        project = self._editable_notes_project
-        if project is None:
-            return False
-        try:
-            self._save_project_metadata(
-                project,
-                caller="session_notes_updated",
+        """Atomically update notes for the most recently stopped session.
+
+        While a validation reads the session the save waits: it returns False
+        and the validation's end state replays it once.
+        """
+        with self._session_publication_lock:
+            project = self._editable_notes_project
+            if project is None:
+                return False
+            validation = self._session_validation.state
+            if validation.active:
+                self._notes_save_pending = True
+                logger.info(
+                    "Session notes wait for the running %s validation",
+                    validation.profile,
+                )
+                return False
+            try:
+                self._save_project_metadata(
+                    project,
+                    caller="session_notes_updated",
+                )
+            except Exception as exc:
+                logger.exception("Failed to update stopped-session notes")
+                self.on_error("Session notes were not saved", str(exc))
+                return False
+            return True
+
+    def _flush_stopped_session_notes_now(self) -> None:
+        """Save the stopped session's notes before Record or close drops them.
+
+        Notes waiting on a running validation cannot wait any longer, so the
+        validation is cancelled; its cancelled-state callback replays the save.
+        """
+        if self._notes_save_pending and self._session_validation.cancel():
+            logger.warning(
+                "Cancelled the running session validation: notes were waiting "
+                "to be saved"
             )
-        except Exception as exc:
-            logger.exception("Failed to update stopped-session notes")
-            self.on_error("Session notes were not saved", str(exc))
-            return False
-        return True
+            return
+        self.persist_stopped_session_notes()
 
     @property
     def session_validation_state(self):
@@ -4646,7 +4681,8 @@ class AppModel(ObservableObject):
         path = self._last_stopped_session_path
         if path is None or not path.is_dir():
             raise RuntimeError("No successfully stopped session is available")
-        self._session_validation.start(path, profile, automatic=False)
+        with self._session_publication_lock:
+            self._session_validation.start(path, profile, automatic=False)
         return True
 
     def cancel_session_validation(self) -> bool:
@@ -4658,6 +4694,14 @@ class AppModel(ObservableObject):
             dataclasses.asdict(state),
             None,
         )
+        if state.active:
+            return
+        # Delivered with the controller's lock released, so taking the
+        # publication lock here keeps the order: publication, then controller.
+        with self._session_publication_lock:
+            pending, self._notes_save_pending = self._notes_save_pending, False
+            if pending:
+                self.persist_stopped_session_notes()
 
     @property
     def trial_protocol_rows(self) -> Tuple[dict, ...]:
@@ -9413,7 +9457,7 @@ class AppModel(ObservableObject):
         # laser back before anything below can end the process.
         self._finish_laser_calibration_for_close()
         self._storage_monitor.abort()
-        self.persist_stopped_session_notes()
+        self._flush_stopped_session_notes_now()
 
         if self._rfid_metadata_controller is not None:
             self._rfid_metadata_controller.stop()
@@ -10310,52 +10354,59 @@ class AppModel(ObservableObject):
         self._send_block_reasons.clear_all()
         self._recording_session.set_analysis_finished(time.perf_counter())
         try:
-            self._save_project_metadata(
-                project,
-                caller="intertrial_analysis_finished",
-            )
-        except Exception as error:
-            self._pending_metadata_project = project.to_local_value()
-            self._recording_session.add_data_error(
-                f"final metadata save failed: {error}"
-            )
-            self._set_subsystem_status(
-                SubsystemId.INTERTRIAL_ANALYSIS,
-                SubsystemState.FAILED,
-                error=f"final metadata save failed: {error}",
-            )
-            logger.exception("Final intertrial metadata save failed")
-        else:
-            self._pending_metadata_project = None
-            self._last_stopped_session_path = Path(
-                project.get_session_path(skip_ensure=True).location
-            ).resolve()
-            try:
-                self._session_validation.start(
-                    self._last_stopped_session_path,
-                    "quick",
-                    automatic=True,
-                )
-            except Exception:
-                logger.exception("Could not schedule automatic quick session validation")
-            self._set_subsystem_status(
-                SubsystemId.INTERTRIAL_ANALYSIS,
-                (
-                    SubsystemState.READY
-                    if self._recording_session.data_complete
-                    else SubsystemState.FAILED
-                ),
-                reason=(
-                    "all closed pellet-trial analyses completed"
-                    if self._recording_session.data_complete
-                    else "trial analysis completed; session data is incomplete"
-                ),
-                error=(
-                    ""
-                    if self._recording_session.data_complete
-                    else "; ".join(self._recording_session.data_errors)
-                ),
-            )
+            # The final save, the seal against late ledger/tracking writes and
+            # the start of the quick validation that reads the files are one
+            # publication. READY is set after the lock is released: Record can
+            # begin once it is, and its notes flush takes this lock.
+            with self._session_publication_lock:
+                try:
+                    self._save_project_metadata(
+                        project,
+                        caller="intertrial_analysis_finished",
+                    )
+                except Exception as error:
+                    self._pending_metadata_project = project.to_local_value()
+                    self._recording_session.add_data_error(
+                        f"final metadata save failed: {error}"
+                    )
+                    self._set_subsystem_status(
+                        SubsystemId.INTERTRIAL_ANALYSIS,
+                        SubsystemState.FAILED,
+                        error=f"final metadata save failed: {error}",
+                    )
+                    logger.exception("Final intertrial metadata save failed")
+                else:
+                    self._pending_metadata_project = None
+                    self._last_stopped_session_path = Path(
+                        project.get_session_path(skip_ensure=True).location
+                    ).resolve()
+                    self._session_data_recorder.seal_session(project.short_id)
+                    try:
+                        self._session_validation.start(
+                            self._last_stopped_session_path,
+                            "quick",
+                            automatic=True,
+                        )
+                    except Exception:
+                        logger.exception("Could not schedule automatic quick session validation")
+                    self._set_subsystem_status(
+                        SubsystemId.INTERTRIAL_ANALYSIS,
+                        (
+                            SubsystemState.READY
+                            if self._recording_session.data_complete
+                            else SubsystemState.FAILED
+                        ),
+                        reason=(
+                            "all closed pellet-trial analyses completed"
+                            if self._recording_session.data_complete
+                            else "trial analysis completed; session data is incomplete"
+                        ),
+                        error=(
+                            ""
+                            if self._recording_session.data_complete
+                            else "; ".join(self._recording_session.data_errors)
+                        ),
+                    )
         finally:
             self._set_session_recording_status(
                 SessionRecordingStatus.READY,
@@ -11140,57 +11191,58 @@ class AppModel(ObservableObject):
                                when: Optional[datetime] = None, session: Optional[int] = -1,
                                caller: str="NA"):
         """Save the given project_info metadata, if session is None : it's main/global metadata"""
-        when = when if when is not None else project_info.when
-        file_name = project_info.get_metadata_file(session, when)
-        logger.verbose(
-            "Saving metadata to %s ; caller=%s when=%s sess=%s prj=%s",
-            file_name, caller, when, session, project_info,
-        )
-        if session is not None and session < 0:
-            session = project_info.session  # ensure use this one
-        if caller in {
-            "raw_writers_closed",
-            "session_analysis_ended",
-            "intertrial_analysis_finished",
-            "session_notes_updated",
-            "retained_finalization_retry",
-        }:
-            boundary = self._recording_session.boundary
-            if boundary is None or boundary.session_id != project_info.short_id:
-                raise RuntimeError(
-                    f"Cannot finalize {project_info.short_id} without a canonical "
-                    "recording boundary"
-                )
-            if not (
-                math.isfinite(boundary.start_perf_time)
-                and math.isfinite(boundary.start_wall_time)
-            ):
-                raise RuntimeError(
-                    f"Cannot finalize {project_info.short_id} with a non-finite "
-                    "recording boundary"
-                )
-            alignment_path = Path(
-                project_info.get_session_path().location
-            ) / "streams" / "alignment.json"
-            if not alignment_path.is_file():
-                raise RuntimeError(
-                    f"Cannot finalize {project_info.short_id}: "
-                    "streams/alignment.json is missing"
-                )
-            with alignment_path.open(encoding="utf-8") as stream:
-                alignment = json.load(stream)
-            alignment_boundary = alignment.get("canonicalBoundary", {})
-            if (
-                alignment_boundary.get("startPerfTime")
-                != boundary.start_perf_time
-                or alignment_boundary.get("startWallTime")
-                != boundary.start_wall_time
-            ):
-                raise RuntimeError(
-                    f"Cannot finalize {project_info.short_id}: canonical "
-                    "boundary differs from streams/alignment.json"
-                )
-        self._save_metadata(project_info, when, file_name, session)
+        with self._session_publication_lock:
+            when = when if when is not None else project_info.when
+            file_name = project_info.get_metadata_file(session, when)
+            logger.verbose(
+                "Saving metadata to %s ; caller=%s when=%s sess=%s prj=%s",
+                file_name, caller, when, session, project_info,
+            )
+            if session is not None and session < 0:
+                session = project_info.session  # ensure use this one
+            if caller in {
+                "raw_writers_closed",
+                "session_analysis_ended",
+                "intertrial_analysis_finished",
+                "session_notes_updated",
+                "retained_finalization_retry",
+            }:
+                boundary = self._recording_session.boundary
+                if boundary is None or boundary.session_id != project_info.short_id:
+                    raise RuntimeError(
+                        f"Cannot finalize {project_info.short_id} without a canonical "
+                        "recording boundary"
+                    )
+                if not (
+                    math.isfinite(boundary.start_perf_time)
+                    and math.isfinite(boundary.start_wall_time)
+                ):
+                    raise RuntimeError(
+                        f"Cannot finalize {project_info.short_id} with a non-finite "
+                        "recording boundary"
+                    )
+                alignment_path = Path(
+                    project_info.get_session_path().location
+                ) / "streams" / "alignment.json"
+                if not alignment_path.is_file():
+                    raise RuntimeError(
+                        f"Cannot finalize {project_info.short_id}: "
+                        "streams/alignment.json is missing"
+                    )
+                with alignment_path.open(encoding="utf-8") as stream:
+                    alignment = json.load(stream)
+                alignment_boundary = alignment.get("canonicalBoundary", {})
+                if (
+                    alignment_boundary.get("startPerfTime")
+                    != boundary.start_perf_time
+                    or alignment_boundary.get("startWallTime")
+                    != boundary.start_wall_time
+                ):
+                    raise RuntimeError(
+                        f"Cannot finalize {project_info.short_id}: canonical "
+                        "boundary differs from streams/alignment.json"
+                    )
+            self._save_metadata(project_info, when, file_name, session)
 
     def _save_metadata(self, project: ProjectInfo, when: datetime, file_name: str, session: Optional[int] = -1):
         when_as_utc = when.astimezone(timezone.utc)
