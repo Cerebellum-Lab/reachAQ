@@ -746,6 +746,10 @@ class AppModel(ObservableObject):
         # Set when a notes save waited for a running validation; the
         # validation's end state replays the save once.
         self._notes_save_pending = False
+        # Edits to a stopped session's notes, and the edit the last session
+        # metadata save wrote; they differ while typed notes are unsaved.
+        self._notes_revision = 0
+        self._notes_saved_revision = 0
         self._session_validation = SessionValidationController(
             self._on_session_validation_state
         )
@@ -4622,6 +4626,8 @@ class AppModel(ObservableObject):
     @notes.setter
     def notes(self, value: str):
         prev, self._notes = self._notes, value
+        if self._editable_notes_project is not None and value != prev:
+            self._notes_revision += 1
         self._on_property_changed(self.Props.NOTES, value, prev)
 
     def persist_stopped_session_notes(self) -> bool:
@@ -4651,20 +4657,37 @@ class AppModel(ObservableObject):
                 logger.exception("Failed to update stopped-session notes")
                 self.on_error("Session notes were not saved", str(exc))
                 return False
+            # Saved now, so a replay still queued would only repeat it.
+            self._notes_save_pending = False
             return True
 
     def _flush_stopped_session_notes_now(self) -> None:
         """Save the stopped session's notes before Record or close drops them.
 
-        Notes waiting on a running validation cannot wait any longer, so the
-        validation is cancelled; its cancelled-state callback replays the save.
+        Unsaved notes cannot wait for a running validation any longer, so it
+        is cancelled; its cancelled-state callback replays the save. Notes
+        already saved leave a running validation alone.
         """
-        if self._notes_save_pending and self._session_validation.cancel():
-            logger.warning(
-                "Cancelled the running session validation: notes were waiting "
-                "to be saved"
+        with self._session_publication_lock:
+            unsaved = (
+                self._notes_save_pending
+                or self._notes_revision != self._notes_saved_revision
             )
-            return
+            active = self._session_validation.state.active
+            if active and unsaved:
+                self._notes_save_pending = True
+        if active:
+            if not unsaved:
+                return
+            # Cancelled with the publication lock released: its callback
+            # takes that lock to replay the save.
+            if self._session_validation.cancel():
+                logger.warning(
+                    "Cancelled the running session validation: notes were "
+                    "waiting to be saved"
+                )
+                return
+            # The validation ended on its own meanwhile: save directly.
         self.persist_stopped_session_notes()
 
     @property
@@ -11192,6 +11215,9 @@ class AppModel(ObservableObject):
                                caller: str="NA"):
         """Save the given project_info metadata, if session is None : it's main/global metadata"""
         with self._session_publication_lock:
+            # Read before _save_metadata reads the live notes: an edit made
+            # meanwhile then still counts as unsaved.
+            notes_revision = self._notes_revision
             when = when if when is not None else project_info.when
             file_name = project_info.get_metadata_file(session, when)
             logger.verbose(
@@ -11243,6 +11269,9 @@ class AppModel(ObservableObject):
                         "boundary differs from streams/alignment.json"
                     )
             self._save_metadata(project_info, when, file_name, session)
+            if session is not None:
+                # Only session metadata carries the live notes.
+                self._notes_saved_revision = notes_revision
 
     def _save_metadata(self, project: ProjectInfo, when: datetime, file_name: str, session: Optional[int] = -1):
         when_as_utc = when.astimezone(timezone.utc)
