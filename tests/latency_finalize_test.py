@@ -424,6 +424,49 @@ def test_one_truncated_stream_costs_only_what_depends_on_it(tmp_path, monkeypatc
         assert _stages(store, "hardware")["laser1.command_to_diode"]["n"] == 1
 
 
+LOST = "MemoryError: copying the latency tables"
+
+
+def test_an_unwritten_events_stream_is_named_by_every_loop_that_needed_it(tmp_path):
+    session = _session(tmp_path)
+    (session / "streams" / "latency" / "events.h5").unlink()
+
+    status = finalize_session_latency(session, primary_camera="left",
+                                      unwritten={"events": LOST})
+
+    assert status["unwritten"] == [{"path": "streams/latency/events.h5", "reason": LOST}]
+    assert status["unreadable"] == []
+    assert f"streams/latency/events.h5 not written: {LOST}" in status["reasons"]
+    assert status["status"] == "partial"
+    for loop in ("stim", "can"):
+        assert status["loops"][loop]["status"] == "absent"
+        assert status["loops"][loop]["reason"] == f"events.h5 not written: {LOST}"
+    for loop in ("recording", "hardware"):
+        assert status["loops"][loop]["status"] == "complete"
+    json.dumps(status)  # metadata-safe
+    assert (session / "streams" / "latency.h5").is_file()
+
+
+def test_an_unwritten_events_stream_with_no_other_stream_is_a_failure(tmp_path):
+    (tmp_path / "streams").mkdir()
+
+    status = finalize_session_latency(tmp_path, primary_camera="left",
+                                      unwritten={"events": LOST})
+
+    assert status["status"] == "failed"
+    assert status["reasons"] == [f"streams/latency/events.h5 not written: {LOST}"]
+    assert status["unwritten"] == [{"path": "streams/latency/events.h5", "reason": LOST}]
+    assert status["output"] is None
+    assert not (tmp_path / "streams" / "latency.h5").exists()
+
+
+def test_a_status_without_losses_lists_no_unwritten_stream(tmp_path):
+    status = finalize_session_latency(_session(tmp_path), primary_camera="left")
+
+    assert status["status"] == "complete"
+    assert status["unwritten"] == []
+
+
 @pytest.mark.parametrize("broken, loops", [
     ("fit_ni_to_host_timeline", {"stim": "partial", "hardware": "complete"}),
     ("choose_pairing", {"pose": "partial", "hardware": "complete"}),
