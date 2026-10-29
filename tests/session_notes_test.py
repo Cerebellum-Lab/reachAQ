@@ -1,10 +1,14 @@
+import threading
 from types import SimpleNamespace
 
 from tools.acquisition.model.app_model import AppModel
+from tools.acquisition.model.session_validation_controller import SessionValidationState
 
 
 def test_stopped_session_notes_use_the_snapshotted_project(monkeypatch):
     model = object.__new__(AppModel)
+    model._session_publication_lock = threading.RLock()
+    model._session_validation = SimpleNamespace(state=SessionValidationState())
     project = SimpleNamespace(short_id="animal_session005")
     model._editable_notes_project = project
     calls = []
@@ -20,6 +24,7 @@ def test_stopped_session_notes_use_the_snapshotted_project(monkeypatch):
 
 def test_notes_save_is_a_noop_without_a_stopped_session(monkeypatch):
     model = object.__new__(AppModel)
+    model._session_publication_lock = threading.RLock()
     model._editable_notes_project = None
     monkeypatch.setattr(
         model,

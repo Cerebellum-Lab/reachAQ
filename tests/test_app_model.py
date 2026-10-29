@@ -2,6 +2,7 @@ import dataclasses
 import math
 import json
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -54,6 +55,7 @@ from tools.acquisition.model.session_stop_policy import (
     SessionStopPolicy,
     SessionStopReason,
 )
+from tools.acquisition.model.session_validation_controller import SessionValidationState
 from tools.acquisition.model.subsystem_status import (
     SubsystemId,
     SubsystemState,
@@ -2179,3 +2181,114 @@ def test_session_end_home_failure_does_not_raise_or_change_can_status(app_model)
         SubsystemId.CAN_PELLET.value
     ].state is SubsystemState.READY
     on_error.assert_called_once()
+
+
+def _analyzing_session(app_model):
+    project = app_model.project
+    _, token = app_model._recording_session.begin_record(project.short_id, {})
+    app_model._recording_session.set_boundary(SessionBoundary(
+        session_id=project.short_id, primary_camera="left", primary_frame_id=42,
+        start_perf_time=10.0, start_wall_time=100.0, camera_when=1_000_000.0,
+    ), token)
+    app_model._recording_session.transition(
+        SessionRecordingStatus.STOPPING, expected=(SessionRecordingStatus.ARMING,), token=token)
+    app_model._recording_session.set_analysis_started(time.perf_counter())
+    app_model._recording_session.transition(
+        SessionRecordingStatus.ANALYZING, expected=(SessionRecordingStatus.STOPPING,), token=token)
+    return project, token
+
+
+def test_the_final_save_seals_the_session_before_quick_validation_starts(app_model):
+    project, token = _analyzing_session(app_model)
+    order = mock.Mock()
+    with mock.patch.object(
+        app_model._session_data_recorder, "load_trial_tracking_requests", return_value=((), ()),
+    ), mock.patch.object(app_model, "_save_project_metadata") as save, mock.patch.object(
+        app_model._session_data_recorder, "seal_session",
+    ) as seal, mock.patch.object(app_model._session_validation, "start") as start:
+        order.attach_mock(save, "save")
+        order.attach_mock(seal, "seal")
+        order.attach_mock(start, "start")
+        app_model._finish_intertrial_session(project, token)
+
+    session_path = Path(project.get_session_path(skip_ensure=True).location).resolve()
+    assert order.mock_calls == [
+        mock.call.save(project, caller="intertrial_analysis_finished"),
+        mock.call.seal(project.short_id),
+        mock.call.start(session_path, "quick", automatic=True),
+    ]
+    assert app_model.last_stopped_session_path == session_path
+    assert app_model.session_recording_status is SessionRecordingStatus.READY
+
+
+def test_a_failed_final_save_neither_seals_nor_validates(app_model):
+    project, token = _analyzing_session(app_model)
+    with mock.patch.object(
+        app_model._session_data_recorder, "load_trial_tracking_requests", return_value=((), ()),
+    ), mock.patch.object(
+        app_model, "_save_project_metadata", side_effect=RuntimeError("disk full"),
+    ), mock.patch.object(app_model._session_data_recorder, "seal_session") as seal, mock.patch.object(
+        app_model._session_validation, "start",
+    ) as start:
+        app_model._finish_intertrial_session(project, token)
+
+    seal.assert_not_called()
+    start.assert_not_called()
+    assert app_model._pending_metadata_project is not None
+    assert "final metadata save failed: disk full" in app_model._recording_session.data_errors
+    assert app_model.session_recording_status is SessionRecordingStatus.READY
+
+
+def test_notes_save_without_a_running_validation_writes_at_once(app_model):
+    app_model._editable_notes_project = app_model.project.to_local_value()
+    with mock.patch.object(app_model, "_save_project_metadata") as save:
+        assert app_model.persist_stopped_session_notes() is True
+    save.assert_called_once_with(app_model._editable_notes_project, caller="session_notes_updated")
+
+
+def test_notes_wait_for_a_running_validation_and_are_saved_when_it_ends(app_model):
+    app_model._editable_notes_project = app_model.project.to_local_value()
+    states = [SessionValidationState(status="running", profile="quick")]
+    with mock.patch.object(
+        type(app_model._session_validation), "state",
+        new_callable=mock.PropertyMock, side_effect=lambda: states[-1],
+    ), mock.patch.object(app_model, "_save_project_metadata") as save:
+        assert app_model.persist_stopped_session_notes() is False
+        save.assert_not_called()
+        app_model._on_session_validation_state(states[-1])  # still running: nothing
+        save.assert_not_called()
+        states.append(SessionValidationState(status="pass", profile="quick"))
+        app_model._on_session_validation_state(states[-1])
+        save.assert_called_once_with(
+            app_model._editable_notes_project, caller="session_notes_updated")
+        app_model._on_session_validation_state(states[-1])  # a second end state: no second save
+        save.assert_called_once()
+
+
+def test_record_with_notes_waiting_on_a_validation_cancels_it_and_saves_them(app_model):
+    app_model._editable_notes_project = app_model.project.to_local_value()
+    app_model._notes_save_pending = True
+
+    def cancel():
+        app_model._on_session_validation_state(
+            SessionValidationState(status="cancelled", profile="quick"))
+        return True
+
+    with mock.patch.object(
+        app_model._session_validation, "cancel", side_effect=cancel,
+    ) as cancelled, mock.patch.object(app_model, "_save_project_metadata") as save:
+        app_model._flush_stopped_session_notes_now()
+
+    cancelled.assert_called_once_with()
+    save.assert_called_once_with(app_model._editable_notes_project, caller="session_notes_updated")
+    assert app_model._notes_save_pending is False
+
+
+def test_record_without_pending_notes_saves_without_touching_validation(app_model):
+    app_model._editable_notes_project = app_model.project.to_local_value()
+    with mock.patch.object(app_model._session_validation, "cancel") as cancelled, \
+            mock.patch.object(app_model, "_save_project_metadata") as save:
+        app_model._flush_stopped_session_notes_now()
+
+    cancelled.assert_not_called()
+    save.assert_called_once_with(app_model._editable_notes_project, caller="session_notes_updated")
