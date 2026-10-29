@@ -2268,13 +2268,17 @@ def test_notes_wait_for_a_running_validation_and_are_saved_when_it_ends(app_mode
 def test_record_with_notes_waiting_on_a_validation_cancels_it_and_saves_them(app_model):
     app_model._editable_notes_project = app_model.project.to_local_value()
     app_model._notes_save_pending = True
+    states = [SessionValidationState(status="running", profile="quick")]
 
     def cancel():
-        app_model._on_session_validation_state(
-            SessionValidationState(status="cancelled", profile="quick"))
+        states.append(SessionValidationState(status="cancelled", profile="quick"))
+        app_model._on_session_validation_state(states[-1])
         return True
 
     with mock.patch.object(
+        type(app_model._session_validation), "state",
+        new_callable=mock.PropertyMock, side_effect=lambda: states[-1],
+    ), mock.patch.object(
         app_model._session_validation, "cancel", side_effect=cancel,
     ) as cancelled, mock.patch.object(app_model, "_save_project_metadata") as save:
         app_model._flush_stopped_session_notes_now()
@@ -2292,3 +2296,68 @@ def test_record_without_pending_notes_saves_without_touching_validation(app_mode
 
     cancelled.assert_not_called()
     save.assert_called_once_with(app_model._editable_notes_project, caller="session_notes_updated")
+
+
+def test_record_within_the_autosave_window_of_a_running_validation_saves_the_notes(app_model):
+    project = app_model.project.to_local_value()
+    app_model._editable_notes_project = project
+    states = [SessionValidationState(status="running", profile="quick")]
+    saved_while_set = []
+
+    def cancel():
+        states.append(SessionValidationState(status="cancelled", profile="quick"))
+        app_model._on_session_validation_state(states[-1])
+        return True
+
+    with mock.patch.object(
+        type(app_model._session_validation), "state",
+        new_callable=mock.PropertyMock, side_effect=lambda: states[-1],
+    ), mock.patch.object(
+        app_model._session_validation, "cancel", side_effect=cancel,
+    ) as cancelled, mock.patch.object(
+        app_model, "_save_project_metadata",
+        side_effect=lambda *_args, **_kwargs: saved_while_set.append(
+            app_model._editable_notes_project),
+    ) as save:
+        app_model.notes = "typed"  # Record comes before the 500 ms autosave fires
+        assert app_model._notes_save_pending is False
+        app_model._flush_stopped_session_notes_now()
+
+    cancelled.assert_called_once_with()
+    save.assert_called_once_with(project, caller="session_notes_updated")
+    assert saved_while_set == [project]
+    assert app_model._notes_save_pending is False
+
+
+def test_record_with_saved_notes_leaves_a_running_validation_alone(app_model):
+    project = app_model.project.to_local_value()
+    app_model._editable_notes_project = project
+    app_model.notes = "typed"
+    with mock.patch.object(app_model, "_save_metadata"):
+        app_model._save_project_metadata(project, caller="NA")  # writes the live notes
+    with mock.patch.object(
+        type(app_model._session_validation), "state", new_callable=mock.PropertyMock,
+        return_value=SessionValidationState(status="running", profile="quick"),
+    ), mock.patch.object(app_model._session_validation, "cancel") as cancelled, \
+            mock.patch.object(app_model, "_save_project_metadata") as save:
+        app_model._flush_stopped_session_notes_now()
+
+    cancelled.assert_not_called()
+    save.assert_not_called()
+    assert app_model._notes_save_pending is False  # no replay is queued to race Record
+
+
+def test_only_a_successful_session_metadata_save_marks_the_live_notes_saved(app_model):
+    project = app_model.project.to_local_value()
+    app_model._editable_notes_project = project
+    app_model.notes = "typed"
+    with mock.patch.object(app_model, "_save_metadata"):
+        app_model._save_project_metadata(project, session=None, caller="capture_start")
+    assert app_model._notes_saved_revision != app_model._notes_revision  # no notes in it
+    with mock.patch.object(app_model, "_save_metadata", side_effect=OSError("disk full")):
+        with pytest.raises(OSError):
+            app_model._save_project_metadata(project, caller="NA")
+    assert app_model._notes_saved_revision != app_model._notes_revision
+    with mock.patch.object(app_model, "_save_metadata"):
+        app_model._save_project_metadata(project, caller="NA")
+    assert app_model._notes_saved_revision == app_model._notes_revision
