@@ -290,6 +290,9 @@ class SessionDataRecorder:
         self._metadata_generation_id: Optional[str] = None
         self._pending_finalization: Optional[dict] = None
         self._pending_stop_end_perf: Optional[float] = None
+        # The session whose files were published and must not be rewritten by a
+        # late ledger or tracking write; arm() lifts it for the next session.
+        self._sealed_session_id: Optional[str] = None
         # Each camera's exposure (s) from the app at arm, for the frame anchor.
         self._camera_exposure_seconds = {}
         self._nidaq_tone_edge_callback = nidaq_tone_edge_callback
@@ -341,6 +344,7 @@ class SessionDataRecorder:
                     "previous session finalization is still pending; retry or abort it"
                 )
             self._armed = True
+            self._sealed_session_id = None
             self._latency_events.begin()
             # BehaviorAlgorithm assigns the next session index immediately
             # after arming and before enabling the shared camera trigger.
@@ -376,6 +380,29 @@ class SessionDataRecorder:
         )
         self._nidaq_thread = thread
         thread.start()
+
+    def seal_session(self, session_id: str) -> None:
+        """Refuse late ledger and tracking writes for a published session.
+
+        Call it once the session's final metadata is saved: from then on the
+        validation reads the session's files, and a late write would rewrite
+        them under it. arm() lifts the seal for the next session.
+        """
+        with self._lock:
+            self._sealed_session_id = str(session_id)
+        logging.getLogger(__name__).info(
+            "Session %s sealed against late ledger and tracking writes", session_id)
+
+    def _refuses_late_write(self, project, what: str) -> bool:
+        """True, after logging the refusal, when `project` is the sealed session."""
+        with self._lock:
+            sealed = self._sealed_session_id == project.short_id
+        if sealed:
+            logging.getLogger(__name__).error(
+                "Late %s write for %s refused: "
+                "the session's files were published and sealed",
+                what, project.short_id)
+        return sealed
 
     def commit_start(
         self,
@@ -722,6 +749,8 @@ class SessionDataRecorder:
 
     def persist_trial_ledger(self, project, records, summary) -> None:
         """Publish live trial progress, or update the closed-session ledger."""
+        if self._refuses_late_write(project, "trial ledger"):
+            return
         self.set_trial_ledger(records, summary)
         streams_dir = Path(project.get_session_path().location) / "streams"
         alignment_path = streams_dir / "alignment.json"
@@ -797,15 +826,17 @@ class SessionDataRecorder:
 
     def persist_trial_tracking(self, project, request, result=None) -> Path:
         """Atomically retain the exact live data used for one trial result."""
+        session_dir = Path(project.get_session_path().location)
+        tracking_dir = session_dir / "streams" / "tracking"
+        trial = "unindexed" if request.trial_id is None else f"{request.trial_id:06d}"
+        path = tracking_dir / f"trial_{trial}_attempt_{request.attempt_id:03d}.json"
+        if self._refuses_late_write(project, "trial tracking"):
+            return path
         from tools.acquisition.model.intertrial_analysis import (
             tracking_request_record,
         )
 
-        session_dir = Path(project.get_session_path().location)
-        tracking_dir = session_dir / "streams" / "tracking"
         tracking_dir.mkdir(parents=True, exist_ok=True)
-        trial = "unindexed" if request.trial_id is None else f"{request.trial_id:06d}"
-        path = tracking_dir / f"trial_{trial}_attempt_{request.attempt_id:03d}.json"
         generation_id = self._metadata_generation_id
         alignment_path = session_dir / "streams" / "alignment.json"
         if alignment_path.is_file():
