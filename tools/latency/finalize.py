@@ -14,7 +14,7 @@ import logging
 import math
 import time
 from pathlib import Path
-from typing import Optional, Union
+from typing import Mapping, Optional, Union
 
 import numpy
 
@@ -305,7 +305,7 @@ class _Context:
                         f"nidaq.h5 RAW stamps unusable: {self.nidaq['raw_problem']}")
             except Exception as error:
                 logger.exception("nidaq.h5 could not be read for the latency record")
-                self.faults["nidaq"] = _describe(error)
+                self.faults["nidaq"] = f"unreadable: {_describe(error)}"
                 status["reasons"].append(f"nidaq.h5 unreadable: {_describe(error)}")
         self.ni_to_host = clocks.invalid_fit("no NI stream")
         self.camera_to_ni = clocks.invalid_fit("not fitted")
@@ -455,7 +455,7 @@ def _blame(result: dict, ctx: _Context, *keys: str) -> dict:
     """An absent loop whose input could not be read says so, not 'no rows'."""
     if result.get("status") != "absent":
         return result
-    broken = [f"{key}.h5 unreadable: {ctx.faults[key]}" for key in keys if key in ctx.faults]
+    broken = [f"{key}.h5 {ctx.faults[key]}" for key in keys if key in ctx.faults]
     return {**result, "reason": "; ".join(broken)} if broken else result
 
 
@@ -532,7 +532,7 @@ def _writer_problem(path: str, attrs: dict) -> str:
     return f"{path}: writer lost rows: {detail}" + (f" ({first_error})" if first_error else "")
 
 
-def _overall(results: dict, reasons: list, unreadable: list) -> str:
+def _overall(results: dict, reasons: list, unreadable: list, unwritten: list) -> str:
     states = {result.get("status") for result in results.values()}
     produced = any(
         result.get("status") in ("complete", "partial") and len(result.get("stages", ())) > 0
@@ -540,7 +540,7 @@ def _overall(results: dict, reasons: list, unreadable: list) -> str:
     if not produced:
         # Nothing was measured. That is only "absent" when nothing went wrong:
         # a loop that failed, or a stream that could not be read, is a failure.
-        return "failed" if ("failed" in states or unreadable) else "absent"
+        return "failed" if ("failed" in states or unreadable or unwritten) else "absent"
     complete = states <= {"complete", "absent"} and not reasons
     return "complete" if complete else "partial"
 
@@ -610,22 +610,27 @@ def _read_streams(session_dir: Path, raw_dir: Path, status: dict) -> tuple:
         except Exception as error:
             relative = path.relative_to(session_dir).as_posix()
             logger.warning("Latency stream %s could not be read: %s", relative, _describe(error))
-            faults[path.stem] = _describe(error)
+            faults[path.stem] = f"unreadable: {_describe(error)}"
             status["unreadable"].append({"path": relative, "reason": _describe(error)})
             status["reasons"].append(f"{relative} unreadable: {_describe(error)}")
     return raw, faults
 
 
 def _finalize(session_dir, primary_camera: str, output_name: str, session_id: str,
-              status: dict) -> None:
+              status: dict, unwritten: Mapping[str, str]) -> None:
     session_dir = Path(session_dir)
     streams = session_dir / "streams"
     raw_dir = streams / "latency"
+    for stem, reason in unwritten.items():
+        status["unwritten"].append({"path": f"streams/latency/{stem}.h5", "reason": reason})
+        status["reasons"].append(f"streams/latency/{stem}.h5 not written: {reason}")
     if not raw_dir.is_dir() or not any(raw_dir.glob("*.h5")):
-        status["status"] = "absent"
-        status["reasons"].append("no raw latency streams in this session")
+        status["status"] = "failed" if unwritten else "absent"
+        if not unwritten:
+            status["reasons"].append("no raw latency streams in this session")
         return
     raw, faults = _read_streams(session_dir, raw_dir, status)
+    faults.update({stem: f"not written: {reason}" for stem, reason in unwritten.items()})
     context = _Context(raw, faults, streams, primary_camera, status)
     for stem, stream in raw.items():
         problem = _writer_problem(f"streams/latency/{stem}.h5", stream.get("attrs", {}))
@@ -640,7 +645,8 @@ def _finalize(session_dir, primary_camera: str, output_name: str, session_id: st
             results[loop] = {"status": "failed", "reason": _describe(error)}
         status["loops"][loop] = {key: results[loop].get(key)
                                  for key in ("status", "reason", "summary")}
-    status["status"] = _overall(results, status["reasons"], status["unreadable"])
+    status["status"] = _overall(results, status["reasons"], status["unreadable"],
+                                status["unwritten"])
     status["output"] = output_name
     try:
         _write_output(streams / output_name, results, status, session_id=session_id,
@@ -654,12 +660,14 @@ def _finalize(session_dir, primary_camera: str, output_name: str, session_id: st
 
 def finalize_session_latency(session_dir, *, primary_camera: str,
                              output_name: str = LATENCY_OUTPUT_NAME,
-                             session_id: str = "") -> dict:
+                             session_id: str = "",
+                             unwritten: Optional[Mapping[str, str]] = None) -> dict:
     """Analyse one session's latency streams; never raises."""
     status = {"status": "failed", "output": None, "loops": {}, "clocks": {}, "reasons": [],
-              "unreadable": []}
+              "unreadable": [], "unwritten": []}
     try:
-        _finalize(session_dir, primary_camera, output_name, session_id, status)
+        _finalize(session_dir, primary_camera, output_name, session_id, status,
+                  dict(unwritten or {}))
     except Exception as error:
         logger.exception("Latency finalization failed")
         status["status"] = "failed"
@@ -669,4 +677,4 @@ def finalize_session_latency(session_dir, *, primary_camera: str,
     except Exception as error:
         return {"status": "failed", "output": None, "loops": {}, "clocks": {},
                 "reasons": [f"status could not be serialised: {_describe(error)}"],
-                "unreadable": []}
+                "unreadable": [], "unwritten": []}
