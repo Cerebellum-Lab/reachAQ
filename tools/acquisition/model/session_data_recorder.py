@@ -418,19 +418,23 @@ class SessionDataRecorder:
             for message, error in failures:
                 logging.getLogger(__name__).error(message, exc_info=error)
 
-    def _end_latency_events(self, failures: list, consequence: str):
-        """End the latency log; None if that failed, so the caller carries on.
+    def _end_latency_events(
+        self, failures: list, consequence: str,
+    ) -> Tuple[Optional[dict], str]:
+        """End the latency log; return (tables, "") or (None, why it failed).
 
-        The log is a diagnostic and must not cost the session its finalization
-        or leave the recorder armed. Call with the recorder lock held: the
-        failure is added to `failures` to be logged after the lock is released.
+        A log that cannot be ended must not cost the session its finalization
+        or leave the recorder armed, so the caller carries on. The loss is not
+        silent: the text is carried into the finalizer's status, which marks
+        the session incomplete. Call with the recorder lock held: the failure
+        is added to `failures` to be logged after the lock is released.
         """
         try:
-            return self._latency_events.end()
+            return self._latency_events.end(), ""
         except Exception as error:
             failures.append((
                 f"Latency event log could not be ended; {consequence}", error))
-            return None
+            return None, f"{type(error).__name__}: {error}"
 
     def stop(self, end_perf: float):
         with self._event_capture_lock:
@@ -481,10 +485,10 @@ class SessionDataRecorder:
             # end() either way, so the log stops. None when the switch was off
             # at arm: _write_session then writes no events.h5, and a session
             # recorded with the record off carries no latency files at all.
-            latency_events = self._end_latency_events(
+            latency_events, latency_events_failure = self._end_latency_events(
                 failures, "the session is finalized without it")
             if not self._latency_events.enabled:
-                latency_events = None
+                latency_events, latency_events_failure = None, ""
             snapshot = {
                 "project": project,
                 "start_perf": start_perf,
@@ -507,6 +511,7 @@ class SessionDataRecorder:
                 "trial_summary": trial_summary,
                 "metadata_generation_id": self._metadata_generation_id,
                 "latency_events": latency_events,
+                "latency_events_failure": latency_events_failure,
                 "camera_exposure_seconds": dict(self._camera_exposure_seconds),
             }
             self._armed = False
@@ -1651,6 +1656,7 @@ class SessionDataRecorder:
         trial_summary=None,
         metadata_generation_id=None,
         latency_events=None,
+        latency_events_failure: str = "",
         camera_exposure_seconds=None,
     ):
         session_dir = Path(project.get_session_path().location)
@@ -2102,20 +2108,28 @@ class SessionDataRecorder:
         )
         latency_dir = streams_dir / "latency"
         if latency_events is not None:
-            # Diagnostic data: a failure here is logged and the session
-            # publishes without these rows.
+            # A failure here does not hold the session back: it is logged, the
+            # session publishes without these rows, and the loss is handed to
+            # the finalizer below so the latency status names it and the
+            # session is marked incomplete.
             try:
                 LatencyEventLog.write(latency_dir / "events.h5", latency_events)
-            except Exception:
+            except Exception as error:
+                latency_events_failure = f"{type(error).__name__}: {error}"
                 logging.getLogger(__name__).exception(
-                    "Latency events were not written; the session publishes without them")
+                    "Latency events were not written; the latency status carries "
+                    "the loss and the session publishes without them")
         # The latency analysis. It does not raise, and a failure becomes a
         # status in the metadata rather than a reason to hold the session back.
+        # A lost events.h5 is passed in as `unwritten`, so the status reports
+        # it instead of "absent".
         try:
             latency_status = finalize_session_latency(
                 session_dir,
                 primary_camera="" if boundary is None else str(boundary.primary_camera),
                 session_id=project.short_id,
+                unwritten=(
+                    {"events": latency_events_failure} if latency_events_failure else None),
             )
         except Exception as error:
             logging.getLogger(__name__).exception("Latency finalization failed")
@@ -2220,6 +2234,11 @@ class SessionDataRecorder:
                 incomplete_reasons.append(
                     f"{source_id} overran by {source['overrunCount']} sample/event(s)"
                 )
+        if latency_events_failure:
+            # The latency record is part of the session: a lost events.h5 makes
+            # the session incomplete, however the rest of it was written.
+            incomplete_reasons.append(
+                f"streams/latency/events.h5 not written: {latency_events_failure}")
         alignment = {
             "schemaVersion": 3,
             "metadataGenerationId": metadata_generation_id,

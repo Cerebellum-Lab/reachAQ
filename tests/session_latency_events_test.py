@@ -8,6 +8,7 @@ import numpy as np
 
 from autotrainer.core import ObservableObject, ProjectInfo
 from autotrainer.core.latency.schema import LIVE_POSE_DTYPE
+from tools.acquisition.model.latency_event_log import LatencyEventLog
 from tools.acquisition.model.session_data_recorder import SessionDataRecorder
 
 
@@ -110,6 +111,7 @@ def test_stop_hands_the_recorded_rows_to_the_session_write(monkeypatch, tmp_path
     seen = _stopped_snapshot(monkeypatch, tmp_path)
 
     assert seen["latency_events"]["live_poses"]["live_sequence"].tolist() == [3]
+    assert seen["latency_events_failure"] == ""
 
 
 def test_stop_hands_over_no_rows_when_the_record_was_off_at_arm(monkeypatch, tmp_path):
@@ -133,6 +135,24 @@ def test_a_failing_log_end_still_hands_the_session_to_finalization(monkeypatch, 
     assert "latency_events" in seen  # _write_session was reached
     assert seen["latency_events"] is None
     assert seen["end_perf"] == 12.0
+
+
+def test_a_failing_log_end_names_the_loss_for_the_finalizer(monkeypatch, tmp_path):
+    monkeypatch.delenv("REACHAQ_LATENCY_RECORD", raising=False)
+
+    seen = _stopped_snapshot(monkeypatch, tmp_path, end_raises=True)
+
+    assert seen["latency_events"] is None
+    assert seen["latency_events_failure"] == "MemoryError: copying the latency tables"
+
+
+def test_a_record_that_was_off_at_arm_lost_nothing(monkeypatch, tmp_path):
+    monkeypatch.setenv("REACHAQ_LATENCY_RECORD", "0")
+
+    seen = _stopped_snapshot(monkeypatch, tmp_path)
+
+    assert seen["latency_events"] is None
+    assert seen["latency_events_failure"] == ""
 
 
 def test_a_failing_log_end_is_logged_outside_the_recorder_lock(monkeypatch, tmp_path):
@@ -274,3 +294,60 @@ def test_a_failing_log_end_in_abort_still_clears_the_recorder(monkeypatch, tmp_p
     finally:
         logging.getLogger().removeHandler(probe)
         recorder.close()
+
+
+def test_write_session_reports_an_events_write_failure_in_the_latency_status(monkeypatch, tmp_path):
+    project = ProjectInfo(root=str(tmp_path), device_id="test",
+                          when=datetime(2026, 1, 2, 3, 4, 5), session=1)
+    tables = {"live_poses": np.array([(1, 1.0, 1.1, 1.2, 1.3)], dtype=LIVE_POSE_DTYPE)}
+
+    def write(path, tables):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(LatencyEventLog, "write", staticmethod(write))
+    result = SessionDataRecorder._write_session(
+        project, 10.0, 100.0, 12.0, (), (), (), (_nidaq_chunk(),),
+        latency_events=tables,
+    )
+
+    streams = tmp_path / "20260102" / "test" / "session001" / "streams"
+    assert (streams / "nidaq.h5").exists()  # the session itself was written
+    assert not (streams / "latency" / "events.h5").exists()
+    assert result["latency"]["status"] == "failed"
+    assert result["latency"]["unwritten"] == [
+        {"path": "streams/latency/events.h5", "reason": "OSError: disk full"}]
+    assert "streams/latency/events.h5 not written: OSError: disk full" in result["latency"]["reasons"]
+    assert result["sessionComplete"] is False
+    assert "streams/latency/events.h5 not written: OSError: disk full" in result["incompleteReasons"]
+
+
+def test_write_session_without_a_latency_record_stays_complete(tmp_path):
+    project = ProjectInfo(root=str(tmp_path), device_id="test",
+                          when=datetime(2026, 1, 2, 3, 4, 5), session=1)
+
+    result = SessionDataRecorder._write_session(
+        project, 10.0, 100.0, 12.0, (), (), (), (_nidaq_chunk(),),
+        latency_events=None,
+    )
+
+    assert not any("events.h5" in r for r in result["incompleteReasons"])
+
+
+def test_write_session_carries_a_lost_log_into_the_latency_status(tmp_path):
+    project = ProjectInfo(root=str(tmp_path), device_id="test",
+                          when=datetime(2026, 1, 2, 3, 4, 5), session=1)
+
+    result = SessionDataRecorder._write_session(
+        project, 10.0, 100.0, 12.0, (), (), (), (_nidaq_chunk(),),
+        latency_events=None,
+        latency_events_failure="MemoryError: copying the latency tables",
+    )
+
+    streams = tmp_path / "20260102" / "test" / "session001" / "streams"
+    assert not (streams / "latency").exists()
+    assert result["latency"]["status"] == "failed"
+    assert result["latency"]["reasons"] == [
+        "streams/latency/events.h5 not written: MemoryError: copying the latency tables"]
+    assert result["sessionComplete"] is False
+    assert ("streams/latency/events.h5 not written: MemoryError: copying the latency tables"
+            in result["incompleteReasons"])
