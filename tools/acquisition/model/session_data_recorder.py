@@ -293,6 +293,10 @@ class SessionDataRecorder:
         # The session whose files were published and must not be rewritten by a
         # late ledger or tracking write; arm() lifts it for the next session.
         self._sealed_session_id: Optional[str] = None
+        # Held by a ledger or tracking write from its seal check to the end of
+        # its file I/O, and by seal_session, so a seal waits for a write in
+        # flight. Taken before self._lock, never while holding it.
+        self._ledger_write_lock = threading.Lock()
         # Each camera's exposure (s) from the app at arm, for the frame anchor.
         self._camera_exposure_seconds = {}
         self._nidaq_tone_edge_callback = nidaq_tone_edge_callback
@@ -384,17 +388,28 @@ class SessionDataRecorder:
     def seal_session(self, session_id: str) -> None:
         """Refuse late ledger and tracking writes for a published session.
 
-        Call it once the session's final metadata is saved: from then on the
-        validation reads the session's files, and a late write would rewrite
-        them under it. arm() lifts the seal for the next session.
+        Call it before the session's final metadata save: that save hashes the
+        stream manifest, and the validation then reads the session's files, so
+        a late write would leave the manifest stale or rewrite files under the
+        validation. A write already in flight finishes before this returns.
+        arm() lifts the seal for the next session.
         """
-        with self._lock:
-            self._sealed_session_id = str(session_id)
+        if not session_id:
+            logging.getLogger(__name__).warning(
+                "Session seal ignored: no session id was given")
+            return
+        with self._ledger_write_lock:
+            with self._lock:
+                self._sealed_session_id = str(session_id)
         logging.getLogger(__name__).info(
             "Session %s sealed against late ledger and tracking writes", session_id)
 
     def _refuses_late_write(self, project, what: str) -> bool:
-        """True, after logging the refusal, when `project` is the sealed session."""
+        """True, after logging the refusal, when `project` is the sealed session.
+
+        The caller holds self._ledger_write_lock. The refusal is logged with
+        self._lock released; the session log handler takes only that one.
+        """
         with self._lock:
             sealed = self._sealed_session_id == project.short_id
         if sealed:
@@ -749,47 +764,50 @@ class SessionDataRecorder:
 
     def persist_trial_ledger(self, project, records, summary) -> None:
         """Publish live trial progress, or update the closed-session ledger."""
-        if self._refuses_late_write(project, "trial ledger"):
-            return
-        self.set_trial_ledger(records, summary)
-        streams_dir = Path(project.get_session_path().location) / "streams"
-        alignment_path = streams_dir / "alignment.json"
-        if alignment_path.is_file():
-            self.update_persisted_trial_ledger(project, records, summary)
-            return
-        with self._lock:
-            if not self._armed or self._start_perf is None:
+        # Held from the seal check to the end of the file I/O: a seal waits
+        # for this write rather than letting it rewrite published files.
+        with self._ledger_write_lock:
+            if self._refuses_late_write(project, "trial ledger"):
                 return
-            start_perf = self._start_perf
-            generation_id = (
-                self._metadata_generation_id or f"{project.short_id}-live"
+            self.set_trial_ledger(records, summary)
+            streams_dir = Path(project.get_session_path().location) / "streams"
+            alignment_path = streams_dir / "alignment.json"
+            if alignment_path.is_file():
+                self.update_persisted_trial_ledger(project, records, summary)
+                return
+            with self._lock:
+                if not self._armed or self._start_perf is None:
+                    return
+                start_perf = self._start_perf
+                generation_id = (
+                    self._metadata_generation_id or f"{project.short_id}-live"
+                )
+            session_dir = Path(project.get_session_path().location)
+            streams_dir.mkdir(parents=True, exist_ok=True)
+            live_records = []
+            for original in records:
+                record = dict(original)
+                if float(record["send_perf_time"]) < start_perf:
+                    continue
+                record["metadata_generation_id"] = generation_id
+                record["send_offset_seconds"] = (
+                    float(record["send_perf_time"]) - start_perf
+                )
+                live_records.append(record)
+            self._atomic_write_json_lines(
+                streams_dir / "trials.jsonl",
+                session_dir,
+                generation_id,
+                live_records,
             )
-        session_dir = Path(project.get_session_path().location)
-        streams_dir.mkdir(parents=True, exist_ok=True)
-        live_records = []
-        for original in records:
-            record = dict(original)
-            if float(record["send_perf_time"]) < start_perf:
-                continue
-            record["metadata_generation_id"] = generation_id
-            record["send_offset_seconds"] = (
-                float(record["send_perf_time"]) - start_perf
+            live_summary = dict(summary)
+            live_summary["metadata_generation_id"] = generation_id
+            atomic_write_json(
+                streams_dir / "trial_summary.json",
+                live_summary,
+                session_dir=session_dir,
+                generation_id=generation_id,
             )
-            live_records.append(record)
-        self._atomic_write_json_lines(
-            streams_dir / "trials.jsonl",
-            session_dir,
-            generation_id,
-            live_records,
-        )
-        live_summary = dict(summary)
-        live_summary["metadata_generation_id"] = generation_id
-        atomic_write_json(
-            streams_dir / "trial_summary.json",
-            live_summary,
-            session_dir=session_dir,
-            generation_id=generation_id,
-        )
 
     def trial_stream_references(self, start_perf: float, end_perf: float):
         """Return decoded tone and laser records inside one pellet window."""
@@ -830,42 +848,45 @@ class SessionDataRecorder:
         tracking_dir = session_dir / "streams" / "tracking"
         trial = "unindexed" if request.trial_id is None else f"{request.trial_id:06d}"
         path = tracking_dir / f"trial_{trial}_attempt_{request.attempt_id:03d}.json"
-        if self._refuses_late_write(project, "trial tracking"):
-            return path
-        from tools.acquisition.model.intertrial_analysis import (
-            tracking_request_record,
-        )
+        # Held from the seal check to the end of the file I/O: a seal waits
+        # for this write rather than letting it rewrite published files.
+        with self._ledger_write_lock:
+            if self._refuses_late_write(project, "trial tracking"):
+                return path
+            from tools.acquisition.model.intertrial_analysis import (
+                tracking_request_record,
+            )
 
-        tracking_dir.mkdir(parents=True, exist_ok=True)
-        generation_id = self._metadata_generation_id
-        alignment_path = session_dir / "streams" / "alignment.json"
-        if alignment_path.is_file():
-            try:
-                with alignment_path.open("r", encoding="utf-8") as stream:
-                    generation_id = json.load(stream).get("metadataGenerationId")
-            except (OSError, ValueError, TypeError):
-                pass
-        generation_id = generation_id or f"{project.short_id}-live"
-        record = tracking_request_record(
-            request,
-            result,
-            metadata_generation_id=generation_id,
-        )
-        if path.is_file():
-            try:
-                with path.open("r", encoding="utf-8") as stream:
-                    previous = json.load(stream)
-                if "eventAlignment" in previous:
-                    record["eventAlignment"] = previous["eventAlignment"]
-            except (OSError, TypeError, ValueError):
-                pass
-        atomic_write_json(
-            path,
-            record,
-            session_dir=session_dir,
-            generation_id=generation_id,
-        )
-        return path
+            tracking_dir.mkdir(parents=True, exist_ok=True)
+            generation_id = self._metadata_generation_id
+            alignment_path = session_dir / "streams" / "alignment.json"
+            if alignment_path.is_file():
+                try:
+                    with alignment_path.open("r", encoding="utf-8") as stream:
+                        generation_id = json.load(stream).get("metadataGenerationId")
+                except (OSError, ValueError, TypeError):
+                    pass
+            generation_id = generation_id or f"{project.short_id}-live"
+            record = tracking_request_record(
+                request,
+                result,
+                metadata_generation_id=generation_id,
+            )
+            if path.is_file():
+                try:
+                    with path.open("r", encoding="utf-8") as stream:
+                        previous = json.load(stream)
+                    if "eventAlignment" in previous:
+                        record["eventAlignment"] = previous["eventAlignment"]
+                except (OSError, TypeError, ValueError):
+                    pass
+            atomic_write_json(
+                path,
+                record,
+                session_dir=session_dir,
+                generation_id=generation_id,
+            )
+            return path
 
     @staticmethod
     def load_trial_tracking_requests(project):

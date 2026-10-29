@@ -1585,8 +1585,11 @@ class AppModel(ObservableObject):
             logger.warning(message)
             self.on_error("Storage capacity warning", message)
         self._flush_stopped_session_notes_now()
-        self._editable_notes_project = None
-        self.notes = ""
+        # Cleared under the publication lock, so a notes save replaying from a
+        # validation's end state finishes with the project it already read.
+        with self._session_publication_lock:
+            self._editable_notes_project = None
+            self.notes = ""
         reservation = self._recording_session.begin_record(
             project.short_id,
             self._acquisition.subsystems.snapshot(),
@@ -4669,7 +4672,7 @@ class AppModel(ObservableObject):
         already saved leave a running validation alone.
         """
         with self._session_publication_lock:
-            unsaved = (
+            unsaved = self._editable_notes_project is not None and (
                 self._notes_save_pending
                 or self._notes_revision != self._notes_saved_revision
             )
@@ -9480,7 +9483,10 @@ class AppModel(ObservableObject):
         # laser back before anything below can end the process.
         self._finish_laser_calibration_for_close()
         self._storage_monitor.abort()
-        self._flush_stopped_session_notes_now()
+        try:
+            self._flush_stopped_session_notes_now()
+        except Exception as err:
+            logger.exception("Failed to save the stopped session's notes on close: %s", err)
 
         if self._rfid_metadata_controller is not None:
             self._rfid_metadata_controller.stop()
@@ -10382,6 +10388,11 @@ class AppModel(ObservableObject):
             # publication. READY is set after the lock is released: Record can
             # begin once it is, and its notes flush takes this lock.
             with self._session_publication_lock:
+                # Sealed before the final save, which hashes the stream
+                # manifest: a ledger or tracking write in flight finishes
+                # first, and a later one is refused. A failed save leaves the
+                # session sealed; _write_session already published its streams.
+                self._session_data_recorder.seal_session(project.short_id)
                 try:
                     self._save_project_metadata(
                         project,
@@ -10403,7 +10414,6 @@ class AppModel(ObservableObject):
                     self._last_stopped_session_path = Path(
                         project.get_session_path(skip_ensure=True).location
                     ).resolve()
-                    self._session_data_recorder.seal_session(project.short_id)
                     try:
                         self._session_validation.start(
                             self._last_stopped_session_path,

@@ -1,6 +1,8 @@
 import json
 import multiprocessing
+import queue
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -149,3 +151,31 @@ def test_validation_controller_monitors_the_process_when_a_callback_raises(tmp_p
 
     assert state.status == "pass"
     assert delivered[-1] == "pass"
+
+
+def test_a_validator_that_cannot_start_leaves_the_controller_inactive(tmp_path):
+    session = tmp_path / "session001"
+    session.mkdir()
+
+    class UnstartableProcess:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            raise OSError("cannot fork")
+
+    mp_ctx = SimpleNamespace(Queue=queue.Queue, Process=UnstartableProcess)
+    delivered = []
+    controller = SessionValidationController(delivered.append, mp_ctx=mp_ctx)
+
+    with pytest.raises(OSError, match="cannot fork"):
+        controller.start(session, "quick", automatic=True, reduced_priority=False)
+
+    state = controller.state
+    assert state.status == "error"
+    assert state.error == "OSError: cannot fork"
+    assert not state.active
+    assert delivered[-1].status == "error"
+    assert controller._monitor is None  # nothing to monitor
+    # Notes no longer wait on it, and Record or close can cancel without raising.
+    assert controller.cancel() is False

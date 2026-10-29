@@ -126,8 +126,9 @@ def test_stop_hands_over_no_rows_when_the_record_was_off_at_arm(monkeypatch, tmp
 
 
 def test_a_failing_log_end_still_hands_the_session_to_finalization(monkeypatch, tmp_path):
-    # The latency log is a diagnostic. If ending it raises, the session's own
-    # finalization must still be set up, just without the events file.
+    # If ending the latency log raises, the session's own finalization must
+    # still be set up, just without the events file; the loss then marks the
+    # session incomplete rather than holding it back.
     monkeypatch.delenv("REACHAQ_LATENCY_RECORD", raising=False)
 
     seen = _stopped_snapshot(monkeypatch, tmp_path, end_raises=True)

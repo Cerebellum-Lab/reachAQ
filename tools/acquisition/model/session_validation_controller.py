@@ -101,9 +101,28 @@ class SessionValidationController:
                 started_perf=time.perf_counter(),
             )
             states.append(self._state)
-            process.start()
-            self._state = dataclasses.replace(self._state, status="running")
-            states.append(self._state)
+            try:
+                process.start()
+            except BaseException as error:
+                # Never left active with a process that did not start: notes
+                # would wait on it forever, and cancel() would terminate it.
+                self._state = dataclasses.replace(
+                    self._state,
+                    status="error",
+                    error=f"{type(error).__name__}: {error}",
+                    elapsed_seconds=time.perf_counter() - self._state.started_perf,
+                )
+                self._process = None
+                failure = (error, self._state)
+            else:
+                failure = None
+                self._state = dataclasses.replace(self._state, status="running")
+                states.append(self._state)
+        if failure is not None:
+            # Only the error is delivered, and no monitor starts.
+            error, state = failure
+            self._notify(state)
+            raise error
         try:
             for state in states:
                 self._notify(state)

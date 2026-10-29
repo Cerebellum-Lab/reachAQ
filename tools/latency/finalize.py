@@ -662,7 +662,12 @@ def finalize_session_latency(session_dir, *, primary_camera: str,
                              output_name: str = LATENCY_OUTPUT_NAME,
                              session_id: str = "",
                              unwritten: Optional[Mapping[str, str]] = None) -> dict:
-    """Analyse one session's latency streams; never raises."""
+    """Analyse one session's latency streams; never raises.
+
+    `unwritten` maps the stem of a raw stream whose writer failed (e.g. "events") to why it
+    failed; each is named in the status's "unwritten" and "reasons", so the status is never
+    "complete" or "absent".
+    """
     status = {"status": "failed", "output": None, "loops": {}, "clocks": {}, "reasons": [],
               "unreadable": [], "unwritten": []}
     try:
