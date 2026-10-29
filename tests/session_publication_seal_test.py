@@ -1,4 +1,5 @@
 import logging
+import threading
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -61,12 +62,70 @@ def test_a_sealed_session_refuses_late_ledger_and_tracking_writes(monkeypatch, t
         recorder.close()
 
     assert _bytes(session_dir) == before
+    assert not (session_dir / "streams" / "tracking").exists()
     refused = [record.getMessage() for record in caplog.records
                if record.levelno == logging.ERROR and "refused" in record.getMessage()]
     assert refused == [
         f"Late trial ledger write for {project.short_id} refused: "
         "the session's files were published and sealed",
         f"Late trial tracking write for {project.short_id} refused: "
+        "the session's files were published and sealed",
+    ]
+
+
+def test_a_seal_waits_for_a_write_in_flight_and_refuses_the_next(monkeypatch, tmp_path, caplog):
+    recorder = _recorder(monkeypatch)
+    project = _published_session(tmp_path, 7)
+    session_dir = Path(project.get_session_path().location)
+    trials = session_dir / "streams" / "trials.jsonl"
+    real_update = SessionDataRecorder.update_persisted_trial_ledger
+    in_flight = threading.Event()
+    release = threading.Event()
+    order = []
+
+    def blocked_update(*args):
+        # The ledger write has passed the seal check and is now reading and
+        # rewriting the session's files.
+        in_flight.set()
+        release.wait(5)
+        real_update(*args)
+        order.append("write finished")
+
+    def seal():
+        recorder.seal_session(project.short_id)
+        order.append("sealed")
+
+    monkeypatch.setattr(recorder, "update_persisted_trial_ledger", blocked_update)
+    writer = threading.Thread(target=recorder.persist_trial_ledger, args=(
+        project, ({**_pending(project), "outcome": "success"},),
+        {"pending_analysis_attempts": 0, "scored_trials": 1}))
+    sealer = threading.Thread(target=seal)
+    try:
+        try:
+            writer.start()
+            assert in_flight.wait(5)
+            sealer.start()
+            sealer.join(0.3)
+            assert sealer.is_alive(), "the seal returned while a ledger write was in flight"
+        finally:
+            release.set()
+            writer.join(5)
+            if sealer.ident is not None:
+                sealer.join(5)
+        assert order == ["write finished", "sealed"]
+        assert b'"success"' in trials.read_bytes()
+        before = _bytes(session_dir)
+        with caplog.at_level(logging.ERROR):
+            recorder.persist_trial_ledger(
+                project, ({**_pending(project), "outcome": "failure"},),
+                {"pending_analysis_attempts": 0, "scored_trials": 1})
+    finally:
+        recorder.close()
+
+    assert _bytes(session_dir) == before
+    assert [record.getMessage() for record in caplog.records
+            if record.levelno == logging.ERROR and "refused" in record.getMessage()] == [
+        f"Late trial ledger write for {project.short_id} refused: "
         "the session's files were published and sealed",
     ]
 

@@ -240,14 +240,29 @@ class LatencyEventLog:
 
     @staticmethod
     def write(path, tables: Mapping[str, numpy.ndarray]) -> None:
+        """Write the tables to `path`; a failed write never leaves a partial file.
+
+        The file is staged beside `path` (the finalizer's *.h5 glob skips the
+        staging name) and moved into place only once it is complete.
+        """
         import h5py
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        with h5py.File(path, "w") as store:
-            store.attrs["schema_version"] = LATENCY_SCHEMA_VERSION
-            for name, dtype in EVENT_TABLES.items():
-                rows = tables.get(name)
-                if rows is None:
-                    rows = numpy.empty(0, dtype=dtype)
-                options = {"compression": "lzf", "shuffle": True} if len(rows) else {}
-                store.create_dataset(name, data=numpy.asarray(rows, dtype=dtype), **options)
+        staged = path.with_name(path.name + ".partial")
+        try:
+            with h5py.File(staged, "w") as store:
+                store.attrs["schema_version"] = LATENCY_SCHEMA_VERSION
+                for name, dtype in EVENT_TABLES.items():
+                    rows = tables.get(name)
+                    if rows is None:
+                        rows = numpy.empty(0, dtype=dtype)
+                    options = {"compression": "lzf", "shuffle": True} if len(rows) else {}
+                    store.create_dataset(name, data=numpy.asarray(rows, dtype=dtype), **options)
+            staged.replace(path)
+        except BaseException:
+            # A partial events.h5 would be read and hashed as if it were whole.
+            try:
+                staged.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise

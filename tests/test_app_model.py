@@ -2198,7 +2198,7 @@ def _analyzing_session(app_model):
     return project, token
 
 
-def test_the_final_save_seals_the_session_before_quick_validation_starts(app_model):
+def test_the_session_is_sealed_before_the_final_save_and_quick_validation(app_model):
     project, token = _analyzing_session(app_model)
     order = mock.Mock()
     with mock.patch.object(
@@ -2213,15 +2213,15 @@ def test_the_final_save_seals_the_session_before_quick_validation_starts(app_mod
 
     session_path = Path(project.get_session_path(skip_ensure=True).location).resolve()
     assert order.mock_calls == [
-        mock.call.save(project, caller="intertrial_analysis_finished"),
         mock.call.seal(project.short_id),
+        mock.call.save(project, caller="intertrial_analysis_finished"),
         mock.call.start(session_path, "quick", automatic=True),
     ]
     assert app_model.last_stopped_session_path == session_path
     assert app_model.session_recording_status is SessionRecordingStatus.READY
 
 
-def test_a_failed_final_save_neither_seals_nor_validates(app_model):
+def test_a_failed_final_save_still_seals_but_does_not_validate(app_model):
     project, token = _analyzing_session(app_model)
     with mock.patch.object(
         app_model._session_data_recorder, "load_trial_tracking_requests", return_value=((), ()),
@@ -2232,7 +2232,8 @@ def test_a_failed_final_save_neither_seals_nor_validates(app_model):
     ) as start:
         app_model._finish_intertrial_session(project, token)
 
-    seal.assert_not_called()
+    # The stream files were already published by _write_session; arm() lifts the seal.
+    seal.assert_called_once_with(project.short_id)
     start.assert_not_called()
     assert app_model._pending_metadata_project is not None
     assert "final metadata save failed: disk full" in app_model._recording_session.data_errors

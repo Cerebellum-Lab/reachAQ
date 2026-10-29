@@ -100,6 +100,32 @@ def test_write_creates_every_table_even_when_empty(tmp_path):
         assert set(store) == set(EVENT_TABLES)
         assert len(store["stim3_pulses"]) == 1
         assert len(store["live_poses"]) == 0
+    assert sorted(item.name for item in tmp_path.iterdir()) == ["events.h5"]
+
+
+def test_a_write_that_fails_part_way_leaves_no_events_file(monkeypatch, tmp_path):
+    # A partial events.h5 would be read, analysed and hashed into the manifest
+    # while the latency status says it was not written.
+    real_create = h5py.Group.create_dataset
+    created = []
+
+    def create_dataset(self, name, *args, **kwargs):
+        created.append(name)
+        if len(created) == 2:
+            raise OSError("disk full")
+        return real_create(self, name, *args, **kwargs)
+
+    log = LatencyEventLog()
+    log.begin()
+    log.record_stim3_pulse("op-2", "tok", 1.0, 1.002)
+    path = tmp_path / "latency" / "events.h5"
+    monkeypatch.setattr(h5py.Group, "create_dataset", create_dataset)
+
+    with pytest.raises(OSError, match="disk full"):
+        LatencyEventLog.write(path, log.end())
+
+    assert len(created) == 2
+    assert list(path.parent.iterdir()) == []  # neither events.h5 nor its staging file
 
 
 def test_a_disabled_record_keeps_nothing(monkeypatch):
