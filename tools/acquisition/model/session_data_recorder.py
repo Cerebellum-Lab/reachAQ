@@ -2977,28 +2977,31 @@ class SessionDataRecorder:
             rows = tuple(
                 SessionDataRecorder._normalize_device_row(row) for row in device_rows
             )
-            names, indices, perf, values, rate = SessionDataRecorder._nidaq_arrays(
-                nidaq_chunks, requested_names=board_clock_chain.NIDAQ_CHANNELS,
-            )
-            # The chain does not use host stamps; 8 bytes a sample, 288 MB an
-            # hour at 10 kHz, is not held while it decodes the barcode.
-            del perf
-            channels = {name: values[row] for row, name in enumerate(names)}
+            if board_clock_chain.has_barcode_reports(rows):
+                names, indices, perf, values, rate = SessionDataRecorder._nidaq_arrays(
+                    nidaq_chunks, requested_names=board_clock_chain.NIDAQ_CHANNELS,
+                )
+                # The chain does not use host stamps; 8 bytes a sample, 288 MB an
+                # hour at 10 kHz, is not held while it decodes the barcode.
+                del perf
+                channels = {name: values[row] for row, name in enumerate(names)}
+            else:
+                # No timekeeper was on the bus, as in most sessions: there is
+                # nothing to decode, so the spool is not read for it.
+                indices, rate, channels = (), None, {}
             record = board_clock_chain.board_clock_chain(
                 rows, sample_indices=indices, sample_rate_hz=rate, channels=channels,
             )
-            # alignment.json is written with allow_nan=False, so a NaN or a numpy
-            # scalar in the record would fail the write, not just this section.
-            json.dumps(record, allow_nan=False)
+            # alignment.json is written with allow_nan=False and sort_keys=True, so
+            # a NaN, a numpy scalar or keys that cannot be sorted in the record
+            # would fail the write, not just this section.
+            json.dumps(record, allow_nan=False, sort_keys=True)
             return record
         except Exception as error:  # finalization must never fail on this evidence
             logging.getLogger(__name__).exception("Board clock chain failed")
-            return {
-                "status": "unavailable",
-                "reason": f"board clock chain failed: {type(error).__name__}: {error}",
-                "method": board_clock_chain.METHOD,
-                "boards": [],
-            }
+            return board_clock_chain.unavailable(
+                f"board clock chain failed: {type(error).__name__}: {error}",
+            )
 
     @staticmethod
     def _read_primary_latency_stream(project, boundary):

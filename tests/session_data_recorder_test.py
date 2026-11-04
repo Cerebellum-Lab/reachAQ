@@ -2050,6 +2050,7 @@ def test_alignment_without_a_timekeeper_says_so_and_still_finalizes(tmp_path):
     result = SessionDataRecorder._write_session(project, 10.0, 100.0, 11.0, (), (), (), ())
 
     assert result["boardClockChain"]["status"] == "unavailable"
+    assert "no SYNC_BARCODE reports" in result["boardClockChain"]["reason"]
 
 
 def test_board_clock_chain_uses_rows_outside_the_session_window(tmp_path):
@@ -2087,7 +2088,8 @@ def test_board_clock_chain_failure_never_fails_finalization(tmp_path, monkeypatc
 
     chain = result["boardClockChain"]
     assert chain["status"] == "unavailable"
-    assert "synthetic chain failure" in chain["reason"]
+    assert chain["reason"] == "board clock chain failed: ValueError: synthetic chain failure"
+    assert chain["boards"] == [] and chain["timekeeper"] is None
     session_dir = next(Path(tmp_path).rglob("alignment.json")).parent
     alignment = json.loads((session_dir / "alignment.json").read_text(encoding="utf-8"))
     assert alignment["boardClockChain"] == chain
@@ -2125,3 +2127,63 @@ def test_board_clock_chain_reads_a_spooled_capture_in_the_rig_channel_order(tmp_
 
     assert record["status"] == "fitted"
     assert record["boards"][0]["toneCrossCheck"]["matched"] == 2
+
+
+def test_board_clock_chain_does_not_read_the_spool_without_a_barcode_report(tmp_path, monkeypatch):
+    from board_clock_chain_synthetic import device_row
+
+    reads = []
+    monkeypatch.setattr(
+        SessionDataRecorder, "_nidaq_arrays",
+        staticmethod(lambda *args, **kwargs: reads.append(args) or pytest.fail("the spool was read")),
+    )
+    # Most sessions have no timekeeper: tone and clap rows, no barcode report.
+    rows = (
+        device_row(1.0, "TONE_STATUS", {"frequency_hz": 5000}, 1, 1, 1_000_000, "physical_start"),
+        device_row(2.0, "SYNC_CLAP_OBSERVATION", {"board_address": 0, "tick": 1, "clapper_node": 8},
+                   1, 2, 2_000_000, "observed"),
+    )
+
+    record = SessionDataRecorder._board_clock_chain(rows, ("a spool that must not be opened",))
+
+    assert reads == []
+    assert record["status"] == "unavailable"
+    assert "no SYNC_BARCODE reports" in record["reason"]
+
+
+def test_board_clock_chain_record_with_keys_json_cannot_sort_is_replaced(tmp_path, monkeypatch):
+    from tools.acquisition.model import board_clock_chain
+
+    # The writer sorts keys; a record that dumps without sorting must not slip past the backstop.
+    monkeypatch.setattr(
+        board_clock_chain, "board_clock_chain",
+        lambda *_args, **_kwargs: {"status": "fitted", "boards": [], 1: "a", "b": 2},
+    )
+    project = ProjectInfo(root=str(tmp_path), device_id="test", when=datetime(2026, 1, 2, 3, 4, 5), session=9)
+
+    result = SessionDataRecorder._write_session(project, 10.0, 100.0, 11.0, (), (), (), ())
+
+    assert result["boardClockChain"]["status"] == "unavailable"
+    assert "TypeError" in result["boardClockChain"]["reason"]
+    assert next(Path(tmp_path).rglob("alignment.json")).is_file()
+
+
+def test_a_malformed_row_outside_the_window_leaves_finalization_and_device_csv_unchanged(tmp_path):
+    from board_clock_chain_synthetic import device_row
+
+    in_window = device_row(10.5, "TONE_STATUS", {"frequency_hz": 5000}, 1, 1, 1_000_000, "physical_start")
+    # Five fields: not a row shape _normalize_device_row knows. It is outside the
+    # window, so the trim has always dropped it before it could matter.
+    malformed = (500.0, 1.0, "inbound", "TONE_STATUS", "")
+    project = ProjectInfo(root=str(tmp_path), device_id="test", when=datetime(2026, 1, 2, 3, 4, 5), session=10)
+
+    result = SessionDataRecorder._write_session(
+        project, 10.0, 100.0, 11.0, (in_window, malformed), (), (), (),
+    )
+
+    assert result["boardClockChain"]["status"] == "unavailable"
+    assert "ValueError" in result["boardClockChain"]["reason"]
+    streams_dir = next(Path(tmp_path).rglob("alignment.json")).parent
+    with (streams_dir / "device.csv").open(newline="", encoding="utf-8") as stream:
+        csv_rows = list(csv.DictReader(stream))
+    assert [row["kind"] for row in csv_rows] == ["TONE_STATUS"]  # only the row inside the window
