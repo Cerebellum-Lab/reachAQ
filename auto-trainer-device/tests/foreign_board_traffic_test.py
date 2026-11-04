@@ -11,7 +11,7 @@ import logging
 
 import pytest
 
-from autotrainer.device import CanTransportConfiguration, Heartbeat, Target
+from autotrainer.device import CanTransportConfiguration, Heartbeat, Target, socketcan_jerrycan
 from autotrainer.device.can_interface import CanInterface
 from autotrainer.device.socketcan_jerrycan import JerryCANCmdType, JerryCANMsg
 
@@ -107,3 +107,23 @@ def test_sync_and_io_types_from_the_pellet_arrive_silently(message_type, caplog)
 
     assert translated is None
     assert "Unhandled message type" not in caplog.text
+
+
+def test_a_rejected_time_sync_exchange_does_not_escape_translate():
+    interface = _interface()
+    message = _message(JerryCANCmdType.TIME_SYNC_RESPONSE, PELLET_ADDRESS)
+    message.index = 1_000_000_000
+    message.board_timing_valid = True
+    message.timing = socketcan_jerrycan.JerryCANTiming(
+        version=1, kind=socketcan_jerrycan.JerryCANTimestampKind.TX_QUEUE,
+        boot_id=9, sequence=1, board_time_us=2_000,
+    )
+    # Board send before board receive: observe() rejects it as out of order.
+    message.time_sync_response = socketcan_jerrycan.TimeSyncResponse(
+        request_id=7, request_receive_time_us=2_000, response_queue_time_us=1_000,
+    )
+    interface._time_sync_requests[7] = 999_000_000
+
+    translated = interface._translate(message)
+
+    assert translated.clock_model == {}

@@ -1733,15 +1733,21 @@ class CanInterface(DeviceInterface):
             and bool(getattr(message, "board_timing_valid", False))
             and timing is not None
         ):
-            estimate = self._board_clock_model.observe(
-                request_id=request_id,
-                host_send_perf_ns=host_send_ns,
-                board_receive_time_us=int(response.request_receive_time_us),
-                board_send_time_us=int(response.response_queue_time_us),
-                host_receive_perf_ns=self._get_index(message),
-                boot_id=int(timing.boot_id),
-            )
-            model = dataclasses.asdict(estimate)
+            try:
+                estimate = self._board_clock_model.observe(
+                    request_id=request_id,
+                    host_send_perf_ns=host_send_ns,
+                    board_receive_time_us=int(response.request_receive_time_us),
+                    board_send_time_us=int(response.response_queue_time_us),
+                    host_receive_perf_ns=self._get_index(message),
+                    boot_id=int(timing.boot_id),
+                )
+            except ValueError as error:
+                # One bad exchange must not abort read(): open() and the
+                # 30 s resync both run through it.
+                logger.warning("Rejected board time-sync exchange %d: %s", request_id, error)
+            else:
+                model = dataclasses.asdict(estimate)
         return BoardTimeSync(
             target=_addr2tgt(message.dst_id),
             request_id=request_id,

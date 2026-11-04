@@ -47,3 +47,48 @@ def test_board_sequence_reports_gaps_duplicates_and_reboot():
     assert tracker.observe(1, 12)["duplicate"]
     assert tracker.observe(1, 11)["backward"]
     assert tracker.observe(2, 1)["reboot"]
+
+
+def _exchange(model, request_id, board_us, host_mid, *, rtt=0.0006, boot_id=7):
+    return model.observe(
+        request_id=request_id,
+        host_send_perf_ns=int((host_mid - rtt / 2) * 1e9),
+        host_receive_perf_ns=int((host_mid + rtt / 2) * 1e9),
+        board_receive_time_us=board_us - 50,
+        board_send_time_us=board_us + 50,
+        boot_id=boot_id,
+    )
+
+
+def test_closely_spaced_noisy_exchanges_fit_an_offset_and_never_raise():
+    # reachAQ's open() sends 4 exchanges a few ms apart; host receive times are
+    # quantized by 5 ms read windows, so a slope fitted to them is noise.
+    model = BoardClockModel()
+    noise = (0.0, 0.0009, -0.0007, 0.0012)
+    for request_id, jitter in enumerate(noise):
+        board_us = 2_000_000 + request_id * 5_000
+        estimate = _exchange(model, request_id, board_us, 50.0 + board_us / 1e6 + jitter)
+
+    assert estimate.slope == 1.0
+    assert not estimate.slope_fitted
+    assert model.align(2_010_000)["perf_time"] == pytest.approx(52.01, abs=0.002)
+
+
+def test_slope_is_fitted_once_the_board_span_is_long_enough():
+    model = BoardClockModel()
+    for request_id in range(4):
+        board_us = 1_000_000 + request_id * 4_000_000  # 12 s span
+        estimate = _exchange(model, request_id, board_us, 10.0 + (board_us / 1e6) * 1.00002)
+
+    assert estimate.slope_fitted
+    assert estimate.slope == pytest.approx(1.00002, abs=2e-6)
+
+
+def test_implausible_slope_falls_back_to_an_offset_instead_of_raising():
+    model = BoardClockModel()
+    for request_id in range(4):
+        board_us = 1_000_000 + request_id * 5_000_000
+        estimate = _exchange(model, request_id, board_us, 10.0 + (board_us / 1e6) * 1.01)
+
+    assert estimate.slope == 1.0
+    assert not estimate.slope_fitted
