@@ -439,6 +439,9 @@ CAN warnings and errors remain in both logs.
 - `toneConfirmation`, including canonical NI pulse onsets, grouped outbound
   command/immediate status/periodic GPIO observations, unmatched valid events
   and pulses, and separately classified short-pulse artifacts;
+- `boardClockChain`: pellet board time linked to NI-DAQ time through the IO
+  module's clap and barcode, or why that is unavailable (see Board clock chain,
+  below);
 - `enabledSources`, including source role/binding, runtime state, actual paths,
   sample/frame count, first/last offsets, gap and overrun counts, failure, and
   `persistenceStatus`;
@@ -704,6 +707,82 @@ The frozen runtime mode is derived from, but never written back over, the
 operator's saved camera configuration. Interrupted arming/session boundaries
 retain a truncated clip with an explicit completeness warning instead of
 silently discarding its pre-trigger evidence.
+
+### Board clock chain (`alignment.json` `boardClockChain`)
+
+The IO module, the timekeeper, ties pellet board time to the NI-DAQ. It sends a
+clap on CAN every second and plays the same tick as a barcode on the NI
+`barcode` line. A barcode frame is a 1 ms high start pulse, the 32-bit tick least
+significant bit first at 1 ms per bit (high is 1), then low: 33 ms in all. Every
+board stamps the end of a clap frame on its own clock and reports it as
+`SYNC_CLAP_OBSERVED`; the timekeeper reports its own claps the same way, and the
+board time of each barcode's start edge as `SYNC_BARCODE`. reachAQ records them
+in `device.csv` as `SYNC_CLAP_OBSERVATION` and `SYNC_BARCODE_REPORT` rows, with
+the usual `board_boot_id`, `board_sequence`, `board_time_us` and
+`board_timestamp_kind` columns. They are the only frame types it records from a
+board it has no driver for; everything else such a board sends is ignored.
+
+After the session, finalization links three clocks. NI time is the NI sample
+index divided by the sample rate. The chain reads every device row captured and
+the whole NI spool, including pre-roll and post-roll outside the session window:
+those rows are as good evidence as any inside it.
+
+- **Timekeeper to NI.** Barcode frames are decoded from the `barcode` line by
+  position from the start edge, and a frame is kept only if every edge its tick
+  implies is where it should be, which rejects glitches and frames the recording
+  cut. Each kept frame whose tick the timekeeper reported gives its start-edge
+  board time against the sampled NI edges. This needs the `barcode` role on the
+  NI-DAQ at 5 kHz or more.
+- **Board to timekeeper.** For each board and boot, the board's clap stamps are
+  paired by tick with the timekeeper's own stamps of the same claps.
+- **Board to NI.** The two are composed for each board, under `boards[].toNi`.
+  Host `perf_counter` follows through `cameraNidaqAlignment.niToHost`, as for
+  every other time derived from an NI sample.
+
+`boards[].toneCrossCheck` is the accuracy evidence. The links' own residuals say
+only how well their points agree, and the tones are used in none of them. Each
+pellet tone start (a `TONE_STATUS` row stamped `physical_start`, for the 5 kHz
+`tone1` or 6 kHz `tone2` line) is mapped through the board-to-NI link and
+compared with the rising edge the NI-DAQ sampled on that line. The target is a
+95th percentile of the absolute residual under 0.1 ms, which is one sample at
+10 kHz, and `meetsTarget` says whether it was met.
+
+Device event times are never rewritten. No `device.csv` row's `perf_time`,
+`event_perf_time`, `event_timestamp_method` or `event_timing_confidence` changes,
+and `device.csv` gets no NI-time column. A pellet event's NI time is its
+`board_time_us` through the board-to-NI link whose `bootId` equals the row's
+`board_boot_id`. The result lives only in `alignment.json`, whose `schemaVersion`
+stays 3.
+
+`status` is `fitted` when the timekeeper-to-NI link was made, and `unavailable`
+with a `reason` when it was not. It says nothing about a board: a board is usable
+only when its own `toNi` is valid, and `boards` is empty when no board reported
+the timekeeper's claps. The reasons:
+
+- `no SYNC_BARCODE reports: no timekeeper was on the bus`.
+- `the NI-DAQ recorded no barcode channel`.
+- `NI-DAQ rate N Hz is below the 5000 Hz a barcode needs`.
+- `timekeeper to NI-DAQ: ...`: too few matched barcode edges, or too large a
+  residual. The reason carries the fit's own text, and the record keeps the
+  timekeeper's decoded, rejected and matched frame counts.
+- `board clock chain failed: <exception>`: the chain raised.
+
+Finalization never fails because of the chain. Any exception, or a record that
+cannot be written as JSON, becomes the last record, is logged, and the session
+is written as usual. Only synthetic captures have exercised the chain so far;
+end-to-end validation needs an IO module on the bus.
+
+`events.board_time` judges each board boot's rows in that boot's sequence order,
+not in `device.csv` order. Rows are in `perf_time` order, where an aligned
+board-timed row sits at its event time, and an `observed` or `physical_start`
+event precedes the frame that reports it, so a healthy board's rows are not in
+its sequence order. The rule used to read them in file order and could report a
+sequence or clock moving backward that never did. It now groups rows by
+`board_boot_id` and sorts each group by `board_sequence`. A repeated sequence is
+an error and a gap is a warning (*N board message(s) missing*). *Board clock moved
+backward* is an error only among `tx_queue` rows, with 1 ms of tolerance, because
+only queue stamps are taken in queue order. A sequence can no longer be seen to
+move backward, so that error is no longer reported.
 
 ## Storage, discovery, and safe hardware boundaries
 

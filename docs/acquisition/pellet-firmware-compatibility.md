@@ -25,6 +25,18 @@ uncertainty, transport estimate, and selected event time remain distinct in
 then a valid in-range board clock model, then kernel/host receive time. No
 derived value overwrites raw evidence.
 
+Pellet firmware 2.4.0 is the first to advertise `time_sync`; through 2.3.0 the
+capability is never reported. A board that advertises it makes `open()` run four
+time-sync exchanges a few milliseconds apart. Earlier reachAQ fitted a clock
+slope to those closely spaced exchanges and raised `ValueError` when it fell
+outside 0.999 to 1.001, so it failed to open the board. The board-clock fit now
+never raises from the receive path: it fits an offset only until the exchanges
+span 10 s of board time, and falls back to an offset when a slope is
+implausible. The `2.4.0` entry is therefore not in the table above. It is added
+at that firmware's release, and only in a reachAQ that has this fix; a checkout
+has it when `auto-trainer-device/src/autotrainer/device/board_clock.py` defines
+`MIN_SLOPE_SPAN_SECONDS`.
+
 ## Updating a rig to new firmware
 
 Update reachAQ first, then the board. reachAQ reads the list from the checkout
