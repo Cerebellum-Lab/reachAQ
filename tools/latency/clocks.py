@@ -94,10 +94,11 @@ class ClockFit:
     clock: str = "perf"
     """A latch map's host clock: "perf" or "raw"."""
     uncertainty: float = math.nan
-    """A latch map's bound, in seconds over x_min..x_max, on how far any straight
-    map through its latches' brackets is from it."""
+    """A latch map's bound, in seconds over x_min..x_max, on how far any map of its
+    kind (a line, or an offset at drift 1) through its latches' brackets is from it."""
     dropped: tuple = ()
-    """Latch rows a latch map left out: no line through the others' brackets passes theirs."""
+    """Latch rows a latch map left out: no map of its kind through the others' brackets
+    passes theirs."""
 
     def map(self, x):
         return self.offset + self.drift * numpy.asarray(x, dtype=numpy.float64)
@@ -933,13 +934,21 @@ def fit_latches(latches, *, clock: str) -> ClockFit:
     the middle of that range at the first and the last latch, and uncertainty
     is half the range where it is widest. The range's width is convex in time,
     so it is widest at one end, and every straight map through the brackets
-    lies within uncertainty of the fit between x_min and x_max. Kept latches closer
-    together cannot measure drift: the tightest one's offset is used alone,
-    with its half-bracket (widened as above) as uncertainty and the bare half-
-    bracket standing in for the residual. residual_rms is otherwise the rms of
-    the kept latches' midpoints about the line, a diagnostic that caps nothing.
-    Either way x_min and x_max are the latched span, and only timestamps
-    latch_window() admits should be mapped. valid needs one usable latch.
+    lies within uncertainty of the fit between x_min and x_max.
+
+    When that set spans no more than LATCH_DRIFT_SPAN_SECONDS it cannot
+    measure drift, and the map is an offset at drift 1. A free slope says
+    little within one mark (any two latches there have a line through both),
+    so the latches are chosen again under the map actually used
+    (_largest_common_offset): each bracket minus its camera time is the range
+    of offsets it allows, and the largest set of those with a common offset is
+    kept (ties: the narrower brackets), the rest dropped and named. The offset
+    is the middle of their overlap and uncertainty half its width.
+
+    residual_rms is the rms of the kept latches' midpoints about the map, a
+    diagnostic that caps nothing. Either way x_min and x_max are the kept
+    latches' span, and only timestamps latch_window() admits should be mapped.
+    valid needs one usable latch.
     """
     if clock not in _LATCH_BRACKETS:
         return dataclasses.replace(invalid_fit(f"unknown clock {clock!r}, not perf or raw"),
@@ -953,34 +962,36 @@ def fit_latches(latches, *, clock: str) -> ClockFit:
     high = [Fraction(float(value)) + resolution for value in after]
     kept, lines = _largest_consistent_set(x, low, high)
     inside = [k for k in range(len(x)) if kept[k]]
-    dropped = tuple(int(rows[k]) for k in range(len(x)) if not kept[k])
-    reason = _dropped_reason(dropped, len(inside))
     first, last = min(x[k] for k in inside), max(x[k] for k in inside)
-    if not last - first > LATCH_DRIFT_SPAN_SECONDS:
-        tightest = min(inside, key=lambda k: high[k] - low[k])
-        camera = float(camera_ns[tightest] / 1e9)
-        return ClockFit(offset=float((before[tightest] + after[tightest]) / 2 - camera), drift=1.0,
-                        residual_rms=float((after[tightest] - before[tightest]) / 2), points=1,
-                        valid=True, reason=reason, x_min=camera, x_max=camera, clock=clock,
-                        uncertainty=float((high[tightest] - low[tightest]) / 2), dropped=dropped)
-    at_first = [value + slope * (first - start) for start, value, slope in lines]
-    at_last = [value + slope * (last - start) for start, value, slope in lines]
-    middle_first = (max(at_first) + min(at_first)) / 2
-    middle_last = (max(at_last) + min(at_last)) / 2
-    drift = (middle_last - middle_first) / (last - first)
+    if last - first > LATCH_DRIFT_SPAN_SECONDS:
+        model = "line"
+        at_first = [value + slope * (first - start) for start, value, slope in lines]
+        at_last = [value + slope * (last - start) for start, value, slope in lines]
+        middle_first = (max(at_first) + min(at_first)) / 2
+        middle_last = (max(at_last) + min(at_last)) / 2
+        drift = (middle_last - middle_first) / (last - first)
+        offset = middle_first - drift * first
+        uncertainty = max(max(at_first) - min(at_first), max(at_last) - min(at_last)) / 2
+    else:
+        model = "offset at drift 1"
+        kept, offset, uncertainty = _largest_common_offset(x, low, high)
+        inside = [k for k in range(len(x)) if kept[k]]
+        first, last = min(x[k] for k in inside), max(x[k] for k in inside)
+        drift = Fraction(1)
+    dropped = tuple(int(rows[k]) for k in range(len(x)) if not kept[k])
     residual = [float((Fraction(float(before[k])) + Fraction(float(after[k]))) / 2
-                      - middle_first - drift * (x[k] - first)) for k in inside]
+                      - offset - drift * x[k]) for k in inside]
     return ClockFit(
-        offset=float(middle_first - drift * first),
+        offset=float(offset),
         drift=float(drift),
         residual_rms=math.sqrt(sum(value * value for value in residual) / len(residual)),
         points=len(inside),
         valid=True,
-        reason=reason,
+        reason=_dropped_reason(dropped, len(inside), model),
         x_min=float(first),
         x_max=float(last),
         clock=clock,
-        uncertainty=float(max(max(at_first) - min(at_first), max(at_last) - min(at_last)) / 2),
+        uncertainty=float(uncertainty),
         dropped=dropped,
     )
 
@@ -1024,6 +1035,28 @@ def _largest_consistent_set(x, low, high):
     return best, [line for line, passes in lines if passes == best]
 
 
+def _largest_common_offset(x, low, high):
+    """(which intervals share an offset at drift 1, the middle of their overlap, half its width).
+
+    x, low and high are as _largest_consistent_set takes them. At drift 1,
+    interval k allows the offsets [low[k] - x[k], high[k] - x[k]]. A set of these with a common
+    point has the largest of their lower ends among its common points, so of
+    the lower ends, the one inside the most intervals finds the largest such
+    set, exactly, in O(n^2). Ties go to the set whose intervals are narrower
+    in sum.
+    """
+    count = len(x)
+    start = [low[k] - x[k] for k in range(count)]
+    end = [high[k] - x[k] for k in range(count)]
+    width = [high[k] - low[k] for k in range(count)]
+    sets = [tuple(start[k] <= value <= end[k] for k in range(count)) for value in start]
+    best = max(sets, key=lambda inside: (sum(inside),
+                                         -sum(w for w, on in zip(width, inside) if on)))
+    common_start = max(start[k] for k in range(count) if best[k])
+    common_end = min(end[k] for k in range(count) if best[k])
+    return best, (common_start + common_end) / 2, (common_end - common_start) / 2
+
+
 def _no_latch_reason(latches, clock: str) -> str:
     rows = 0 if latches is None else len(latches)
     names = getattr(getattr(latches, "dtype", None), "names", None) or ()
@@ -1033,14 +1066,15 @@ def _no_latch_reason(latches, clock: str) -> str:
     return f"no usable clock latch: {rows} rows, none with a finite, non-negative {clock} bracket"
 
 
-def _dropped_reason(dropped: tuple, kept: int) -> str:
+def _dropped_reason(dropped: tuple, kept: int, model: str) -> str:
+    """model names the map: "line", or "offset at drift 1"."""
     if not dropped:
         return ""
     if len(dropped) == 1:
-        return (f"latch {dropped[0]} left out: no line through the other {kept} latches' "
+        return (f"latch {dropped[0]} left out: no {model} through the other {kept} latches' "
                 f"brackets passes through its own")
     rows = ", ".join(str(row) for row in dropped)
-    return (f"latches {rows} left out: no line through the {kept} kept latches' brackets "
+    return (f"latches {rows} left out: no {model} through the {kept} kept latches' brackets "
             f"passes through any of theirs")
 
 

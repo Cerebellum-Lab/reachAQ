@@ -553,11 +553,36 @@ def test_latches_at_one_end_only_give_an_offset():
     fit = clocks.fit_latches(latches, clock="perf")
 
     resolution = time.get_clock_info("perf_counter").resolution
-    assert fit.valid and fit.points == 1 and fit.drift == 1.0 and fit.dropped == ()
-    # The tightest latch alone, trusted to its half-bracket widened by the clock's resolution.
-    assert fit.uncertainty == pytest.approx(0.00005 + resolution, abs=1e-12)
-    assert fit.x_min == fit.x_max == pytest.approx(float(_camera_clock(50.0003)), abs=1e-9)
-    assert fit.map(_camera_clock(50.0003)) == pytest.approx(50.0003, abs=1e-9)
+    assert fit.valid and fit.drift == 1.0 and fit.dropped == ()
+    assert fit.points == 3
+    # Half the three brackets' overlap: no wider than the tightest, widened by
+    # the clock's resolution.
+    half_bracket = float((latches["perf_after"] - latches["perf_before"]).min() / 2)
+    assert 0 < fit.uncertainty <= half_bracket + resolution
+    assert fit.x_min == pytest.approx(float(_camera_clock(50.0)), abs=1e-9)
+    assert fit.x_max == pytest.approx(float(_camera_clock(50.0006)), abs=1e-9)
+    host = _burst(50.0)
+    assert np.abs(fit.map(_camera_clock(host)) - host).max() <= fit.uncertainty
+
+
+def test_one_burst_with_a_wrong_latch_drops_that_latch():
+    # With a free slope inside one 0.6 ms mark, every pair of these is
+    # consistent and the narrowest pair, {1, 2}, would win; the offset-only map
+    # has drift 1, and under it latch 2, 3 ms off, agrees with neither other.
+    latches = _latches(_burst(50.0), bracket=np.array([3e-4, 2e-4, 1e-4]))
+    for name in ("perf_before", "perf_after"):
+        latches[name][2] += 0.003
+
+    fit = clocks.fit_latches(latches, clock="perf")
+
+    resolution = time.get_clock_info("perf_counter").resolution
+    assert fit.valid and fit.drift == 1.0, fit.reason
+    assert fit.dropped == (2,) and fit.points == 2
+    assert "latch 2" in fit.reason
+    host = _burst(50.0)
+    assert np.abs(fit.map(_camera_clock(host)) - host).max() <= fit.uncertainty
+    half_bracket = float((latches["perf_after"] - latches["perf_before"])[:2].min() / 2)
+    assert fit.uncertainty <= half_bracket + resolution
 
 
 def test_the_mapping_uncertainty_bounds_every_feasible_line():
@@ -606,7 +631,8 @@ def test_a_zero_width_latch_bracket_is_padded_by_the_clock_resolution():
     # widened by the clock's resolution, they are.
     assert fit.valid and fit.dropped == (), fit.reason
     assert fit.uncertainty > 0
-    assert offset_only.valid and offset_only.uncertainty == pytest.approx(resolution)
+    assert offset_only.valid and offset_only.dropped == (), offset_only.reason
+    assert 0 < offset_only.uncertainty <= resolution
 
 
 def _two_marks(exposure, bracket):
