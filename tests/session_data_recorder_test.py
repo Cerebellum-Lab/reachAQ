@@ -1745,14 +1745,17 @@ def test_nidaq_coverage_allows_less_than_one_sample_period_at_a_boundary(
     assert "end boundary coverage" not in messages
 
 
-def _nidaq_spool(tmp_path, channel_names, values):
-    """A spooled NI-DAQ capture, as the stream writer leaves it on disk."""
+def _nidaq_spool(tmp_path, channel_names, values, perf_offset=0.0):
+    """A spooled NI-DAQ capture, as the stream writer leaves it on disk.
+
+    Sample i is stamped perf_offset + i / 10 kHz, so a host clock that reads NI seconds plus perf_offset.
+    """
     path = tmp_path / "nidaq.h5"
     samples = len(values[0])
     with h5py.File(path, "w") as handle:
         handle.create_dataset("sample_index", data=np.arange(samples, dtype=np.int64))
         handle.create_dataset("perf_time",
-                              data=np.arange(samples, dtype=np.float64) / 10_000.0)
+                              data=perf_offset + np.arange(samples, dtype=np.float64) / 10_000.0)
         handle.create_dataset("values", data=np.asarray(values, dtype=np.float32))
     return session_data_recorder._NidaqSpoolSnapshot(
         path=path,
@@ -1761,8 +1764,8 @@ def _nidaq_spool(tmp_path, channel_names, values):
         sample_count=samples,
         first_sample_index=0,
         last_sample_index=samples - 1,
-        first_perf_time=0.0,
-        last_perf_time=(samples - 1) / 10_000.0,
+        first_perf_time=perf_offset,
+        last_perf_time=perf_offset + (samples - 1) / 10_000.0,
         gap_count=0,
         overrun_samples=0,
         first_error=None,
@@ -2038,6 +2041,7 @@ def test_alignment_records_the_board_clock_chain(tmp_path):
     )
 
     assert result["boardClockChain"]["status"] == "fitted"
+    assert result["boardClockChain"]["pairing"] == "host_endpoints"  # one chunk gives no NI-to-host fit
     session_dir = next(Path(tmp_path).rglob("alignment.json")).parent
     alignment = json.loads((session_dir / "alignment.json").read_text(encoding="utf-8"))
     assert alignment["boardClockChain"]["boards"][0]["toneCrossCheck"]["matched"] == 2
@@ -2122,6 +2126,7 @@ def test_board_clock_chain_reads_a_spooled_capture_in_the_rig_channel_order(tmp_
         tmp_path,
         ("cam_frames", "barcode", "tone1", "tone2"),
         [silent, channels["barcode"], channels["tone1"], silent],
+        perf_offset=1000.0,
     )
 
     record = SessionDataRecorder._board_clock_chain(rows, snapshot)
@@ -2241,17 +2246,89 @@ def test_board_clock_chain_is_given_the_ni_fit(monkeypatch):
     assert seen["ni_to_host"] is fit
 
 
-def test_board_clock_chain_reads_a_spooled_capture_and_pairs_by_host_time_when_the_fit_is_valid(tmp_path):
+def test_board_clock_chain_reads_a_spooled_capture_and_pairs_by_the_fit_or_by_the_endpoints(tmp_path):
     from board_clock_chain_synthetic import rig_ni_to_host, synthetic_rig
 
     rows, channels, indices = synthetic_rig()
     silent = np.zeros(indices.size, dtype=np.float32)
     snapshot = _nidaq_spool(
         tmp_path, ("cam_frames", "barcode", "tone1", "tone2"), [silent, channels["barcode"], channels["tone1"], silent],
+        perf_offset=1000.0,
     )
 
-    by_tick = SessionDataRecorder._board_clock_chain(rows, snapshot)
-    by_host = SessionDataRecorder._board_clock_chain(rows, snapshot, ni_fit=rig_ni_to_host())
+    by_endpoints = SessionDataRecorder._board_clock_chain(rows, snapshot)
+    by_fit = SessionDataRecorder._board_clock_chain(rows, snapshot, ni_fit=rig_ni_to_host())
 
-    assert (by_tick["status"], by_tick["pairing"]) == ("fitted", "tick_cluster")
-    assert (by_host["status"], by_host["pairing"]) == ("fitted", "host_time")
+    assert (by_endpoints["status"], by_endpoints["pairing"]) == ("fitted", "host_endpoints")
+    assert (by_fit["status"], by_fit["pairing"]) == ("fitted", "host_time")
+
+
+def _spooled_arrays(rows_indices, perf_of, channels):
+    """A stand-in for _nidaq_arrays that makes its per-sample stamps fresh on each call and lets the test watch them."""
+    import weakref
+
+    made = []
+
+    def arrays(_chunks, requested_names=None):
+        perf = perf_of(rows_indices)
+        made.append(weakref.ref(perf))
+        return ("barcode",), rows_indices, perf, channels["barcode"][None, :], 10_000.0
+
+    return arrays, made
+
+
+def test_board_clock_chain_is_given_the_ni_endpoints_and_never_the_stamps(monkeypatch):
+    from board_clock_chain_synthetic import synthetic_rig
+    from tools.acquisition.model import board_clock_chain
+
+    rows, channels, indices = synthetic_rig()
+    arrays, made = _spooled_arrays(indices, lambda index: 1000.0 + index / 10_000.0, channels)
+    seen = {}
+
+    def spy(*_args, **kwargs):
+        seen.update(kwargs)
+        seen["stamps_alive"] = made[0]() is not None
+        return board_clock_chain.unavailable("spy")
+
+    monkeypatch.setattr(SessionDataRecorder, "_nidaq_arrays", staticmethod(arrays))
+    monkeypatch.setattr(board_clock_chain, "board_clock_chain", spy)
+
+    SessionDataRecorder._board_clock_chain(rows, ("chunks",))
+
+    last = float(indices[-1]) / 10_000.0
+    assert seen["ni_host_endpoints"] == ((0.0, 1000.0), (last, 1000.0 + last))
+    assert all(type(value) is float for pair in seen["ni_host_endpoints"] for value in pair)
+    assert seen["stamps_alive"] is False  # `del perf` ran before the chain did, and only four floats were kept
+    assert seen["ni_to_host"] is None
+
+
+def test_board_clock_chain_endpoints_skip_samples_without_a_finite_stamp(monkeypatch):
+    from board_clock_chain_synthetic import synthetic_rig
+
+    rows, channels, indices = synthetic_rig()
+
+    def stamps(index):
+        perf = 1000.0 + index / 10_000.0
+        perf[:50] = np.nan
+        perf[-70:] = np.inf
+        return perf
+
+    arrays, _ = _spooled_arrays(indices, stamps, channels)
+    monkeypatch.setattr(SessionDataRecorder, "_nidaq_arrays", staticmethod(arrays))
+
+    record = SessionDataRecorder._board_clock_chain(rows, ("chunks",))
+
+    assert record["status"] == "fitted" and record["pairing"] == "host_endpoints"
+
+
+def test_board_clock_chain_without_a_fit_or_a_finite_stamp_is_unavailable(monkeypatch):
+    from board_clock_chain_synthetic import synthetic_rig
+
+    rows, channels, indices = synthetic_rig()
+    arrays, _ = _spooled_arrays(indices, lambda index: np.full(index.size, np.nan), channels)
+    monkeypatch.setattr(SessionDataRecorder, "_nidaq_arrays", staticmethod(arrays))
+
+    record = SessionDataRecorder._board_clock_chain(rows, ("chunks",))
+
+    assert record["status"] == "unavailable" and "without host time" in record["reason"]
+    assert record["pairing"] is None

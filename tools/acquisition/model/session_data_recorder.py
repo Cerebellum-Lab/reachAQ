@@ -2967,6 +2967,27 @@ class SessionDataRecorder:
             return clocks.invalid_piecewise_fit(f"{type(error).__name__}: {error}")
 
     @staticmethod
+    def _ni_host_endpoints(indices, perf, rate):
+        """((NI seconds, host perf seconds) of the first NI sample with a finite stamp, and of the last), or None.
+
+        The host reference the board clock chain falls back on when the session has
+        no NI-to-host fit. Four floats: the per-sample stamps are not kept.
+        """
+        try:
+            finite = np.isfinite(np.asarray(perf, dtype=np.float64))
+            if not finite.size or not rate:
+                return None
+            first = int(np.argmax(finite))
+            last = int(finite.size - 1 - np.argmax(finite[::-1]))
+            if not finite[first]:
+                return None
+            return tuple(
+                (float(indices[position]) / float(rate), float(perf[position])) for position in (first, last)
+            )
+        except (TypeError, ValueError, IndexError):
+            return None
+
+    @staticmethod
     def _board_clock_chain(device_rows, nidaq_chunks, ni_fit=None):
         """Pellet-to-NI clock chain, or why there is none; never raised.
 
@@ -2974,7 +2995,8 @@ class SessionDataRecorder:
         and pre-roll and post-roll claps and barcodes are as good as any.
         ni_fit, the session's NI-to-host map, tells the chain which host time
         each barcode frame was played at, and so which timekeeper boot its
-        tick belongs to; the per-sample host stamps are not passed, only the fit.
+        tick belongs to. When it is not valid, the host times of the first and
+        last NI samples stand in. The per-sample host stamps are never passed.
         """
         try:
             rows = tuple(
@@ -2984,17 +3006,18 @@ class SessionDataRecorder:
                 names, indices, perf, values, rate = SessionDataRecorder._nidaq_arrays(
                     nidaq_chunks, requested_names=board_clock_chain.NIDAQ_CHANNELS,
                 )
-                # The chain does not use host stamps; 8 bytes a sample, 288 MB an
+                ni_host_endpoints = SessionDataRecorder._ni_host_endpoints(indices, perf, rate)
+                # The chain needs only those two points; 8 bytes a sample, 288 MB an
                 # hour at 10 kHz, is not held while it decodes the barcode.
                 del perf
                 channels = {name: values[row] for row, name in enumerate(names)}
             else:
                 # No timekeeper was on the bus, as in most sessions: there is
                 # nothing to decode, so the spool is not read for it.
-                indices, rate, channels = (), None, {}
+                indices, rate, channels, ni_host_endpoints = (), None, {}, None
             record = board_clock_chain.board_clock_chain(
                 rows, sample_indices=indices, sample_rate_hz=rate, channels=channels,
-                ni_to_host=ni_fit,
+                ni_to_host=ni_fit, ni_host_endpoints=ni_host_endpoints,
             )
             # alignment.json is written with allow_nan=False and sort_keys=True, so
             # a NaN, a numpy scalar or keys that cannot be sorted in the record
