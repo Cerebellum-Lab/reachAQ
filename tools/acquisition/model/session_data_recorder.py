@@ -21,6 +21,7 @@ import h5py
 import numpy as np
 
 from autotrainer.core import ProjectInfo
+from tools.acquisition.model import board_clock_chain
 from tools.acquisition.model.session_boundary import SessionBoundary
 from tools.acquisition.model.latency_event_log import LatencyEventLog
 from tools.latency import clocks, finalize_session_latency
@@ -1720,8 +1721,14 @@ class SessionDataRecorder:
             metadata_generation_id or f"{project.short_id}-legacy"
         )
 
+        # The board clock chain is a fit, and pre-roll and post-roll rows are as
+        # good as any, so it reads the rows from before the window trim. They are
+        # not normalized here: a row of an unsupported shape outside the window
+        # has always been dropped by the trim, and must not start failing
+        # finalization now. The chain normalizes them inside its own guard.
+        untrimmed_device_rows = tuple(device_rows)
         device_rows = tuple(
-            row for row in device_rows if start_perf <= row[0] <= end_perf
+            row for row in untrimmed_device_rows if start_perf <= row[0] <= end_perf
         )
         event_rows = tuple(
             row for row in event_rows if start_perf <= row[0] <= end_perf
@@ -1759,6 +1766,9 @@ class SessionDataRecorder:
         # its reason, rather than raised when the spool cannot support one; the
         # anchor and every timeline below then use the epoch mapping as before.
         ni_fit = SessionDataRecorder._fit_nidaq_to_host(nidaq_chunks)
+        board_clock_chain_record = SessionDataRecorder._board_clock_chain(
+            untrimmed_device_rows, nidaq_chunks,
+        )
         primary_exposure = (
             None
             if boundary is None or not camera_exposure_seconds
@@ -2367,6 +2377,7 @@ class SessionDataRecorder:
             "enabledSources": finalized_sources,
             "cameraNidaqAlignment": camera_nidaq_alignment,
             "toneConfirmation": tone_confirmation,
+            "boardClockChain": board_clock_chain_record,
             "eventAlignmentContract": {
                 "scope": (
                     "all discrete structured API/application, device, laser, "
@@ -2437,6 +2448,7 @@ class SessionDataRecorder:
             "metadataGenerationId": metadata_generation_id,
             "cameraNidaqAlignment": camera_nidaq_alignment,
             "toneConfirmation": tone_confirmation,
+            "boardClockChain": board_clock_chain_record,
             "deviceEventOverruns": int(device_event_overruns),
             "structuredEventOverruns": int(structured_event_overruns),
             "retentionLimited": retention,
@@ -2953,6 +2965,33 @@ class SessionDataRecorder:
                 "NI-to-host fit failed; the alignment falls back to the epoch timeline",
             )
             return clocks.invalid_piecewise_fit(f"{type(error).__name__}: {error}")
+
+    @staticmethod
+    def _board_clock_chain(device_rows, nidaq_chunks):
+        """Pellet-to-NI clock chain, or why there is none; never raised.
+
+        Read from the whole spool and the untrimmed rows: the chain is a fit,
+        and pre-roll and post-roll claps and barcodes are as good as any.
+        """
+        try:
+            rows = tuple(
+                SessionDataRecorder._normalize_device_row(row) for row in device_rows
+            )
+            names, indices, _perf, values, rate = SessionDataRecorder._nidaq_arrays(
+                nidaq_chunks, requested_names=board_clock_chain.NIDAQ_CHANNELS,
+            )
+            channels = {name: values[row] for row, name in enumerate(names)}
+            return board_clock_chain.board_clock_chain(
+                rows, sample_indices=indices, sample_rate_hz=rate, channels=channels,
+            )
+        except Exception as error:  # finalization must never fail on this evidence
+            logging.getLogger(__name__).exception("Board clock chain failed")
+            return {
+                "status": "unavailable",
+                "reason": f"board clock chain failed: {type(error).__name__}: {error}",
+                "method": board_clock_chain.METHOD,
+                "boards": [],
+            }
 
     @staticmethod
     def _read_primary_latency_stream(project, boundary):

@@ -2018,3 +2018,76 @@ def test_camera_exposures_given_at_arm_reach_finalization(tmp_path, monkeypatch)
         recorder.close()
 
     assert captured["camera_exposure_seconds"] == {"left": 1.75e-4, "right": 1.75e-4}
+
+
+def test_alignment_records_the_board_clock_chain(tmp_path):
+    from board_clock_chain_synthetic import RATE, synthetic_rig
+
+    rows, channels, indices = synthetic_rig()
+    perf = 1000.0 + indices / RATE
+    names = ("barcode", "tone1")
+    chunk = (
+        indices, perf, 2000.0 + (perf - 1000.0),
+        np.vstack([channels["barcode"], channels["tone1"]]).astype(np.float32),
+        names, RATE, 1, 0, 0,
+    )
+    project = ProjectInfo(root=str(tmp_path), device_id="test", when=datetime(2026, 1, 2, 3, 4, 5), session=4)
+
+    result = SessionDataRecorder._write_session(
+        project, 1000.0, 2000.0, float(perf[-1]), rows, (), (), (chunk,),
+    )
+
+    assert result["boardClockChain"]["status"] == "fitted"
+    session_dir = next(Path(tmp_path).rglob("alignment.json")).parent
+    alignment = json.loads((session_dir / "alignment.json").read_text(encoding="utf-8"))
+    assert alignment["boardClockChain"]["boards"][0]["toneCrossCheck"]["matched"] == 2
+    assert alignment["schemaVersion"] == 3
+
+
+def test_alignment_without_a_timekeeper_says_so_and_still_finalizes(tmp_path):
+    project = ProjectInfo(root=str(tmp_path), device_id="test", when=datetime(2026, 1, 2, 3, 4, 5), session=5)
+
+    result = SessionDataRecorder._write_session(project, 10.0, 100.0, 11.0, (), (), (), ())
+
+    assert result["boardClockChain"]["status"] == "unavailable"
+
+
+def test_board_clock_chain_uses_rows_outside_the_session_window(tmp_path):
+    from board_clock_chain_synthetic import RATE, synthetic_rig
+
+    rows, channels, indices = synthetic_rig()
+    perf = 1000.0 + indices / RATE
+    chunk = (
+        indices, perf, 2000.0 + (perf - 1000.0),
+        np.vstack([channels["barcode"], channels["tone1"]]).astype(np.float32),
+        ("barcode", "tone1"), RATE, 1, 0, 0,
+    )
+    project = ProjectInfo(root=str(tmp_path), device_id="test", when=datetime(2026, 1, 2, 3, 4, 5), session=6)
+
+    # Only ticks 5-7 fall inside the window: too few barcode edges to fit on
+    # their own, so a fit proves the pre-roll and post-roll rows were used.
+    result = SessionDataRecorder._write_session(
+        project, 1005.0, 2005.0, 1007.0, rows, (), (), (chunk,),
+    )
+
+    assert result["boardClockChain"]["status"] == "fitted"
+    assert result["boardClockChain"]["timekeeper"]["barcodeFramesMatched"] > 20
+
+
+def test_board_clock_chain_failure_never_fails_finalization(tmp_path, monkeypatch):
+    from tools.acquisition.model import board_clock_chain
+
+    def explode(*_args, **_kwargs):
+        raise ValueError("synthetic chain failure")
+
+    monkeypatch.setattr(board_clock_chain, "board_clock_chain", explode)
+    project = ProjectInfo(root=str(tmp_path), device_id="test", when=datetime(2026, 1, 2, 3, 4, 5), session=7)
+
+    result = SessionDataRecorder._write_session(project, 10.0, 100.0, 11.0, (), (), (), ())
+
+    chain = result["boardClockChain"]
+    assert chain["status"] == "unavailable"
+    assert "synthetic chain failure" in chain["reason"]
+    session_dir = next(Path(tmp_path).rglob("alignment.json")).parent
+    alignment = json.loads((session_dir / "alignment.json").read_text(encoding="utf-8"))
+    assert alignment["boardClockChain"] == chain
