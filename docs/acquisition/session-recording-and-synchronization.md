@@ -288,8 +288,11 @@ timestamps, and device indices. Events buffer continuously before Record and
 are sliced at the canonical boundary. Raw byte-for-byte CAN frame capture is not
 part of this format.
 
-Rows are in host receive-time order (`perf_time`); rows received at the same
-time keep their arrival order. Sessions recorded before 2026-09-24 can have
+Rows are in `perf_time` order. For an inbound row `perf_time` is the event time:
+the host receive time, or, for a board-timed row with a usable clock model, the
+board's time aligned to the host clock; `host_receive_perf_time` always keeps
+the receive time. Rows at the same time keep their arrival order. Sessions
+recorded before 2026-09-24 can have
 rows out of order, and fail `events.alignment` and `events.frames` with
 `nonmonotonic performance timestamp`.
 
@@ -725,27 +728,68 @@ board it has no driver for; everything else such a board sends is ignored.
 After the session, finalization links three clocks. NI time is the NI sample
 index divided by the sample rate. The chain reads every device row captured and
 the whole NI spool, including pre-roll and post-roll outside the session window:
-those rows are as good evidence as any inside it.
+those rows are as good evidence as any inside it. A session with no
+`SYNC_BARCODE_REPORT` row, as most sessions are, does not read the NI spool for
+the chain at all. Only a barcode report stamped `physical_start` and a clap
+stamped `observed` are used; rows with another stamp kind are counted in
+`rowsRejectedForStampKind` and left out.
+
+Each link is a continuous piecewise-linear fit, one segment per 120 s, not one
+straight line. A crystal's rate moves with temperature, and one line per link
+would lose the whole chain to a drift that wanders by a fraction of a part per
+million over an hour. The fit is least squares, repeated once without points
+beyond five robust sigmas, and a link is valid only when it has enough points
+over enough time, its residual is small, and every segment runs forward. Each
+link is recorded with its knot table (`knots` and `knotHost`, the mapped-to
+time at each knot), so any time can be mapped through it.
 
 - **Timekeeper to NI.** Barcode frames are decoded from the `barcode` line by
   position from the start edge, and a frame is kept only if every edge its tick
   implies is where it should be, which rejects glitches and frames the recording
-  cut. Each kept frame whose tick the timekeeper reported gives its start-edge
-  board time against the sampled NI edges. This needs the `barcode` role on the
-  NI-DAQ at 5 kHz or more.
-- **Board to timekeeper.** For each board and boot, the board's clap stamps are
-  paired by tick with the timekeeper's own stamps of the same claps.
-- **Board to NI.** The two are composed for each board, under `boards[].toNi`.
-  Host `perf_counter` follows through `cameraNidaqAlignment.niToHost`, as for
-  every other time derived from an NI sample.
+  cut. A decoded frame is paired with the timekeeper's `SYNC_BARCODE` report of
+  the same tick *from the same boot*: a timekeeper reset restarts the tick
+  numbering, so a tick alone names two moments. Of one boot's pairs, only the
+  largest group that agree on NI time minus board time is kept (pairs chain into
+  a group while neighbours are within 0.5 s, which hours of drift do not break
+  and a repeated tick from another boot does). The boot with the largest group
+  is the timekeeper; every other boot is listed under `ignoredTimekeeperBoots`
+  with its `address`, `bootId`, `reports` and `framesPaired`, so a reset is
+  visible. Every edge of every kept frame is a fit point: the report's
+  start-edge board time plus the edge's offset in the frame, against the NI time
+  of the sample where that edge was seen. Ten frames spanning ten seconds are the
+  least a link is fitted from. This needs the `barcode` role on the NI-DAQ at
+  5 kHz or more.
+- **Board to timekeeper.** For each board and boot, the board's
+  `SYNC_CLAP_OBSERVATION` of a tick is paired with the timekeeper's own clap of
+  that tick, from the timekeeper boot in use, only if the host received the two
+  within 0.5 s of each other. A tick the timekeeper repeats after a reset cannot
+  pair with the wrong clap. The timekeeper's own claps are never listed as a
+  board, from any of its boots. Ten claps spanning ten seconds are the least a
+  link is fitted from; a board whose claps could not be paired is still listed,
+  with `clapsMatched` 0 and an invalid link.
+- **Board to NI.** The two links are composed exactly for each board, under
+  `boards[].toNi`: a table whose knots are the board link's knots and the board
+  times at which it reaches the timekeeper link's knots, so every bend of either
+  link is a knot. It is valid only when both links are. Host `perf_counter`
+  follows through `cameraNidaqAlignment.niToHost`, as for every other time
+  derived from an NI sample.
 
 `boards[].toneCrossCheck` is the accuracy evidence. The links' own residuals say
 only how well their points agree, and the tones are used in none of them. Each
 pellet tone start (a `TONE_STATUS` row stamped `physical_start`, for the 5 kHz
-`tone1` or 6 kHz `tone2` line) is mapped through the board-to-NI link and
-compared with the rising edge the NI-DAQ sampled on that line. The target is a
-95th percentile of the absolute residual under 0.1 ms, which is one sample at
-10 kHz, and `meetsTarget` says whether it was met.
+`tone1` or 6 kHz `tone2` line) is mapped through the board-to-NI table and
+compared with the nearest rising edge the NI-DAQ sampled on that line, within
+5 ms. A tone inside the NI recording with no edge that close is a failure of the
+chain, not a tone to leave out: its error counts as infinite. A tone outside the
+recording, or on a tone line the NI-DAQ did not record, cannot be judged and is
+counted apart (`outsideRecording`; `tonesWithoutChannel` and `channelsMissing`).
+`tonesConsidered` is the tones judged, `matched` plus `unmatched`. The target is
+the spec's: the 95th percentile of the absolute error under 0.1 ms, which is one
+sample at 10 kHz, over at least 100 tones. `meetsTarget` is true or false over
+the tones judged, and `null` only when none were; `enoughTonesForAcceptance` says
+whether there were 100, so a handful of tones that all land is not a pass of the
+acceptance. `p95AbsResidualSeconds` is `null` when the 95th percentile is itself
+a failure. The mean, median and maximum residuals are over the tones that matched.
 
 Device event times are never rewritten. No `device.csv` row's `perf_time`,
 `event_perf_time`, `event_timestamp_method` or `event_timing_confidence` changes,
@@ -757,20 +801,29 @@ stays 3.
 `status` is `fitted` when the timekeeper-to-NI link was made, and `unavailable`
 with a `reason` when it was not. It says nothing about a board: a board is usable
 only when its own `toNi` is valid, and `boards` is empty when no board reported
-the timekeeper's claps. The reasons:
+the timekeeper's claps. Every record has the same top-level keys whatever its
+status; `niTime` and `timekeeper` are `null` when no timekeeper could be
+identified. The reasons:
 
-- `no SYNC_BARCODE reports: no timekeeper was on the bus`.
-- `the NI-DAQ recorded no barcode channel`.
-- `NI-DAQ rate N Hz is below the 5000 Hz a barcode needs`.
-- `timekeeper to NI-DAQ: ...`: too few matched barcode edges, or too large a
-  residual. The reason carries the fit's own text, and the record keeps the
-  timekeeper's decoded, rejected and matched frame counts.
+- `no SYNC_BARCODE reports: no timekeeper was on the bus`, or `N SYNC_BARCODE
+  reports, none stamped physical_start: no usable timekeeper`.
+- `SYNC_BARCODE reports carry no tick`.
+- `the NI-DAQ recorded no barcode channel`, `the NI-DAQ sample rate is unknown`,
+  `NI-DAQ rate N Hz is below the 5000 Hz a barcode needs`, or `NI-DAQ sample
+  index (N samples) and barcode line (M) differ in length`.
+- `timekeeper to NI-DAQ: ...`: no barcode frames decoded (is the barcode line
+  wired?), none of the decoded frames matches a report, fewer than ten matched,
+  or the fit's own reason (too few points, too short a span, too large a
+  residual, a segment running backward). The timekeeper entry keeps its decoded,
+  rejected, matched and inconsistent frame counts.
 - `board clock chain failed: <exception>`: the chain raised.
 
-Finalization never fails because of the chain. Any exception, or a record that
-cannot be written as JSON, becomes the last record, is logged, and the session
-is written as usual. Only synthetic captures have exercised the chain so far;
-end-to-end validation needs an IO module on the bus.
+Finalization never fails because of the chain. If the chain raises, or its record
+cannot be written as JSON (the writer rejects NaN and infinity and sorts keys),
+the single `boardClockChain` record is replaced by an `unavailable` record whose
+reason is `board clock chain failed: <exception>`; the exception is logged and
+the session is written as usual. Only synthetic captures have exercised the chain
+so far; end-to-end validation needs an IO module on the bus.
 
 `events.board_time` judges each board boot's rows in that boot's sequence order,
 not in `device.csv` order. Rows are in `perf_time` order, where an aligned
