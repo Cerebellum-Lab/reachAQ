@@ -949,3 +949,20 @@ def test_piecewise_line_over_a_long_session_is_not_held_as_a_dense_matrix():
     assert fit.knots.size > 200
     # the dense design matrix alone would be 480 000 x 241 x 8 bytes = 925 MB
     assert peak < 200e6, peak
+
+
+def test_every_result_of_the_piecewise_line_fitter_carries_its_own_method():
+    # An invalid fit is a record too: labelled with the method that tried, not the NI-to-host default.
+    for fit in (
+        clocks.fit_piecewise_line([0.0, 1.0], [0.0, 1.0], max_residual=1.0, min_points=10),
+        clocks.fit_piecewise_line(np.full(50, 3.0), np.arange(50.0), max_residual=1.0, min_points=10),
+        clocks.fit_piecewise_line(np.linspace(0, 5, 200), np.linspace(0, 5, 200), max_residual=1.0,
+                                  min_points=10, min_span=10.0),
+        clocks.fit_piecewise_line(np.arange(300.0), np.where(np.arange(300.0) < 150, np.arange(300.0),
+                                                              300.0 - np.arange(300.0)),
+                                  max_residual=100.0, min_points=5, knot_seconds=150.0),
+        clocks.invalid_piecewise_line_fit("by hand"),
+    ):
+        assert fit.method == clocks.PIECEWISE_LINE and not fit.valid
+    # the NI-to-host helper keeps its own label
+    assert clocks.invalid_piecewise_fit("x").method == clocks.PIECEWISE_ENVELOPE

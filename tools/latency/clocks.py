@@ -548,6 +548,11 @@ def _hat_normal_equations(x, y, knots, chunk_rows: int = 20_000):
     return normal, rhs
 
 
+def invalid_piecewise_line_fit(reason: str) -> PiecewiseClockFit:
+    """invalid_piecewise_fit, labelled as fit_piecewise_line's: for a link that is not NI to host."""
+    return dataclasses.replace(invalid_piecewise_fit(reason), method=PIECEWISE_LINE)
+
+
 def fit_piecewise_line(x, y, *, max_residual: float, min_points: int = MIN_FIT_POINTS,
                        min_span: float = 0.0, knot_seconds: float = KNOT_SECONDS,
                        min_window_points: int = MIN_WINDOW_POINTS) -> PiecewiseClockFit:
@@ -573,26 +578,26 @@ def fit_piecewise_line(x, y, *, max_residual: float, min_points: int = MIN_FIT_P
     x, y = x[keep], y[keep]
     needed = max(2, int(min_points))
     if x.size < needed:
-        return invalid_piecewise_fit(f"{x.size} points, need {needed}")
+        return invalid_piecewise_line_fit(f"{x.size} points, need {needed}")
     order = numpy.argsort(x, kind="stable")
     x, y = x[order], y[order]
     span = float(x[-1] - x[0])
     if span <= 0:
-        return invalid_piecewise_fit("the points span no time")
+        return invalid_piecewise_line_fit("the points span no time")
     if span < min_span:
-        return invalid_piecewise_fit(f"the points span {span:.1f} s, need {min_span:.1f} s")
+        return invalid_piecewise_line_fit(f"the points span {span:.1f} s, need {min_span:.1f} s")
     inner = numpy.arange(x[0], x[-1], knot_seconds)
     knots = _merge_sparse_windows(numpy.append(inner[inner < x[-1]], x[-1]), x, min_window_points)
     for attempt in range(2):
         if x.size < max(needed, knots.size):
-            return invalid_piecewise_fit(f"{x.size} points, need {max(needed, knots.size)}")
+            return invalid_piecewise_line_fit(f"{x.size} points, need {max(needed, knots.size)}")
         # Centre y: sample and perf_counter values are large and the knot values
         # would otherwise lose their last digits to the solve.
         y0 = float(y.mean())
         normal, rhs = _hat_normal_equations(x, y - y0, knots)
         coefficients, _, rank, _ = numpy.linalg.lstsq(normal, rhs, rcond=None)
         if rank < knots.size:
-            return invalid_piecewise_fit("a knot window has no points")
+            return invalid_piecewise_line_fit("a knot window has no points")
         residual = y - y0 - _interp_extrapolate(x, knots, coefficients)
         if attempt == 1:
             break
