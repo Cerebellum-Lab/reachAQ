@@ -184,14 +184,6 @@ class _NidaqPerfSummary:
 _PELLET_STIMULUS_CHANNEL_NAMES = ("tone1", "tone2", "stim2", "stim3")
 _LIVE_TONE_CHANNEL_NAMES = ("tone1", "tone2")
 _MINIMUM_VALID_TONE_PULSE_SECONDS = 0.002
-# The first recorded frame's frame_perf_c lags its exposure-start edge by the
-# exposure plus the frame_perf_c estimator's own delay. Measured on the 11
-# christielab10 sessions with a camera-latch or host-arrival truth (drift
-# report, 2026-10-07): lag minus exposure 0.60-1.63 ms, centre 1.1 ms. The gate
-# admits a millisecond either side of that, more than the measured spread and
-# under a quarter of a 150 fps frame period, so one transition at most passes.
-_EXPECTED_LAG_ALLOWANCE_SECONDS = 0.0011
-_LAG_GATE_HALF_WIDTH_SECONDS = 0.0010
 # The anchor reads the primary camera's latency stream on the stop path, before
 # the latency finalizer does with its own 5 s retry; it has a fallback, so it
 # waits less for a stream the capture process is still closing.
@@ -2292,7 +2284,7 @@ class SessionDataRecorder:
             incomplete_reasons.append(
                 f"streams/latency/events.h5 not written: {latency_events_failure}")
         alignment = {
-            "schemaVersion": 3,
+            "schemaVersion": 4,
             "metadataGenerationId": metadata_generation_id,
             "canonicalBoundary": {
                 "source": "primary_camera_recorded_frames",
@@ -2978,12 +2970,28 @@ class SessionDataRecorder:
             return None, f"{path.name} unreadable: {type(error).__name__}: {error}"
 
     @staticmethod
+    def _frames_in_spool(frames, transition_host, period):
+        """Mask of the latency frames that arrived while the spool held transitions.
+
+        The camera runs on before the NI task starts and after it stops; those
+        frames have no transition of their own, and each would pair with an
+        edge it does not belong to and count against the agreement of both
+        anchors. A frame arrives after its exposure edge, so one inside the
+        spool arrives no later than a period past the last transition (with no
+        period known, no later than the last).
+        """
+        arrival = np.asarray(frames["arrival_perf"], dtype=np.float64)
+        last = float(transition_host[-1]) + (0.0 if period is None else float(period))
+        return np.isfinite(arrival) & (arrival >= transition_host[0]) & (arrival <= last)
+
+    @staticmethod
     def _latch_anchor(boundary, stream, stream_reason, transition_host, period):
         """(evidence, the first recorded frame's transition number or None), by camera clock.
 
         The latency finalizer's pairing: each frame's camera timestamp, placed
         on host time by the latches, is matched to the nearest transition and
-        the majority shift wins. Transition number = frame id - shift.
+        the majority shift wins. Transition number = frame id - shift. Only the
+        frames _frames_in_spool admits take part.
         """
         if stream is None:
             return {"status": "unavailable", "reason": stream_reason}, None
@@ -2999,8 +3007,9 @@ class SessionDataRecorder:
                 return {"status": "unavailable", "latches": rows, "usableLatches": 0,
                         "reason": (f"{rows} clock latches, none usable" if rows
                                    else "no clock latches")}, None
+            kept = SessionDataRecorder._frames_in_spool(frames, transition_host, period)
             pairing = clocks.choose_pairing_by_camera_clock(
-                frames["frame_id"], frames["camera_ts_ns"], latches, transition_host,
+                frames["frame_id"][kept], frames["camera_ts_ns"][kept], latches, transition_host,
                 math.nan if period is None else float(period),
             )
             residual = float(pairing.median_residual)
@@ -3013,7 +3022,7 @@ class SessionDataRecorder:
                 "reason": pairing.reason,
                 "latches": rows,
                 "usableLatches": usable,
-                "frames": int(len(frames)),
+                "frames": int(kept.sum()),
             }
             if pairing.ambiguous:
                 return evidence, None
@@ -3030,19 +3039,87 @@ class SessionDataRecorder:
             return {"status": "failed", "reason": f"{type(error).__name__}: {error}"}, None
 
     @staticmethod
+    def _arrival_anchor(boundary, stream, stream_reason, transition_host, period):
+        """(evidence, the first recorded frame's transition number or None), by host arrival.
+
+        The latency finalizer's other pairing, which needs no camera clock: each
+        frame's candidate is the latest transition at or before its host arrival,
+        and the majority shift wins. Transition number = frame id - shift.
+
+        It rests on one assumption, that a frame arrives within one frame period
+        of its exposure edge. A longer lag pairs every frame with a later edge
+        and shows up as a disagreement with the camera-clock match. Only the
+        frames _frames_in_spool admits take part.
+        """
+        if stream is None:
+            return {"status": "unavailable", "reason": stream_reason}, None
+        try:
+            frames = stream.get("frames")
+            if frames is None or len(frames) == 0:
+                return {"status": "unavailable", "reason": "no frames in the latency stream"}, None
+            kept = SessionDataRecorder._frames_in_spool(frames, transition_host, period)
+            pairing = clocks.choose_pairing(
+                frames["frame_id"][kept], frames["arrival_perf"][kept], transition_host,
+                math.nan if period is None else float(period),
+            )
+            lag = float(pairing.median_lag)
+            evidence = {
+                "status": "ambiguous" if pairing.ambiguous else "paired",
+                "shift": int(pairing.shift),
+                "agreement": float(pairing.agreement),
+                "medianLagSeconds": lag if math.isfinite(lag) else None,
+                "ambiguous": bool(pairing.ambiguous),
+                "reason": pairing.reason,
+                "frames": int(kept.sum()),
+            }
+            if pairing.ambiguous:
+                return evidence, None
+            number = int(boundary.primary_frame_id) - int(pairing.shift)
+            if not 0 <= number < transition_host.size:
+                evidence["status"] = "outside"
+                evidence["reason"] = (
+                    f"the first recorded frame's transition ({number}) is outside the spool"
+                )
+                return evidence, None
+            return evidence, number
+        except Exception as error:
+            logging.getLogger(__name__).exception("Host-arrival anchor failed")
+            return {"status": "failed", "reason": f"{type(error).__name__}: {error}"}, None
+
+    @staticmethod
+    def _first_frame_stamp_anchor(start_perf, transition_host, period):
+        """The first recorded frame's transition number by its own host stamp, or None.
+
+        The stamp is taken after the exposure starts, so the frame's transition
+        is the latest one at or before it. None when the stamp precedes every
+        transition, or (with the period known) is over a period past the one
+        found: then no transition can be the frame's.
+        """
+        number = int(np.searchsorted(transition_host, start_perf, side="right")) - 1
+        if number < 0:
+            return None
+        if period is not None and not (start_perf - transition_host[number] <= period):
+            return None
+        return number
+
+    @staticmethod
     def _match_camera_nidaq_edge(boundary, start_perf, chunks, *, ni_fit=None,
                                  read_latency_stream=None,
                                  exposure_seconds=None) -> dict:
         """The cam_frames transition of the first recorded frame.
 
-        On the drift-corrected NI-to-host fit, anchored by the primary camera's
-        clock latches when its latency stream has usable ones, else by the
-        transition nearest the expected exposure edge (start_perf less the lag
-        frame_perf_c has behind it); the implied lag is gated either way.
+        On the drift-corrected NI-to-host fit, two measured matches over the
+        primary camera's latency stream: the camera-clock latch pairing and the
+        host-arrival pairing. Neither takes a lag as an input. The latch
+        pairing anchors; the arrival pairing must name the same transition for
+        hardware_edge, and a disagreement is kept and flagged. With one match
+        the anchor is that one, and with neither it is the transition at or
+        before the first frame's own host stamp; both at lower confidence.
+        The arrival pairing assumes only that a frame arrives within one frame
+        period of its exposure edge, and a longer lag shows as a disagreement.
         read_latency_stream, a callable returning (stream, why not), is called
-        only where the latches are about to be used: a locked stream costs its
-        whole retry budget, which the epoch method and an unmatched result
-        have no use for.
+        only where the matches are about to be used: a locked stream costs its
+        whole retry budget, which the epoch method has no use for.
         Without a valid fit the epoch-timeline method this replaces runs, at a
         lower confidence: the epoch is stamped 1.5-7 ms before the task starts
         and drifts about 10 ppm, which put 15 of 36 sessions a frame off
@@ -3078,16 +3155,16 @@ class SessionDataRecorder:
             "resolutionSeconds": resolution,
             "ambiguitySeconds": None,
             "edgePolarity": None,
-            # schemaVersion 3: how the anchor was chosen, and the evidence.
+            # schemaVersion 4: how the anchor was chosen, and the two matches behind it.
+            # The exposure is recorded and moves nothing.
             "anchorMethod": None,
             "niToHost": None if ni_fit is None else ni_fit.as_record(include_knots=True),
             "exposureSeconds": exposure_seconds,
-            "expectedLagSeconds": None,
             "impliedLagSeconds": None,
-            "lagGateSeconds": None,
             "framePeriodSeconds": None,
             "latch": None,
-            "expectedLagSampleIndex": None,
+            "arrival": None,
+            "arrivalSampleIndex": None,
             "anchorsAgree": None,
         }
         if indices.size == 0 or rate is None:
@@ -3133,7 +3210,7 @@ class SessionDataRecorder:
         try:
             return SessionDataRecorder._match_camera_nidaq_edge_on_fit(
                 base, boundary, start_perf, indices, rate, channel_values, edge_positions,
-                ni_fit, read_latency_stream, exposure_seconds,
+                ni_fit, read_latency_stream,
             )
         except Exception as error:
             logging.getLogger(__name__).exception(
@@ -3149,64 +3226,17 @@ class SessionDataRecorder:
     @staticmethod
     def _match_camera_nidaq_edge_on_fit(base, boundary, start_perf, indices, rate,
                                         channel_values, edge_positions, ni_fit,
-                                        read_latency_stream, exposure_seconds) -> dict:
+                                        read_latency_stream) -> dict:
         transition_host = ni_fit.map(indices[edge_positions] / float(rate))
         # The median interval, as the epoch method and the latency finalizer
         # take it (it reads 6.7 ms at 150 fps on 0.1 ms samples; close enough
-        # for a half-period test and a quarter-period latch tolerance).
+        # for the arrival window and a quarter-period latch tolerance).
         period = (
             None if edge_positions.size < 2
             else float(np.median(np.diff(transition_host)))
         )
-        exposure_notes = []
-        if exposure_seconds is not None and exposure_seconds < 0:
-            # No exposure is negative (a sign slip in the configuration, say), and taken
-            # at its word it would move the expected edge and the lag gate together: a
-            # neighbouring frame's edge can then be the nearest and still pass the gate.
-            exposure_notes.append(f"exposure {exposure_seconds * 1e3:.3f} ms is negative")
-            exposure_seconds = None
-        if exposure_seconds is not None and period is not None and exposure_seconds >= period:
-            # An exposure cannot last as long as the frame (a units mix-up, say),
-            # and taken at its word it would put the expected edge a whole number
-            # of frames from every transition.
-            exposure_notes.append(
-                f"exposure {exposure_seconds * 1e3:.3f} ms is not shorter than the "
-                f"frame period {period * 1e3:.3f} ms"
-            )
-            exposure_seconds = None
-        if exposure_seconds is None:
-            exposure_notes.append("exposure unknown, assumed 0")
-        expected_lag = (
-            (0.0 if exposure_seconds is None else float(exposure_seconds))
-            + _EXPECTED_LAG_ALLOWANCE_SECONDS
-        )
-        gate = (expected_lag - _LAG_GATE_HALF_WIDTH_SECONDS,
-                expected_lag + _LAG_GATE_HALF_WIDTH_SECONDS)
-        distances = np.abs(transition_host - (float(start_perf) - expected_lag))
-        order = np.argsort(distances)
-        expected = int(order[0])
-        runner_up = None if order.size < 2 else int(order[1])
-        half_period = 0.05 if period is None else max(2.0 / rate, period / 2.0)
-        details = {
-            **base,
-            "exposureSeconds": exposure_seconds,
-            "expectedLagSeconds": expected_lag,
-            "lagGateSeconds": [gate[0], gate[1]],
-            "framePeriodSeconds": period,
-        }
-        if float(distances[expected]) > half_period:
-            return {
-                **details,
-                "status": "unmatched",
-                "confidence": "none",
-                "ambiguitySeconds": None if runner_up is None else float(distances[runner_up]),
-                "reason": "; ".join([
-                    "Nearest cam_frames transition to the expected exposure edge was "
-                    "outside half of the observed frame period",
-                    *exposure_notes,
-                ]),
-            }
-        # Only here, where the latches are about to be used.
+        details = {**base, "framePeriodSeconds": period}
+        # The only read of the stream, here, where the matches are used.
         latency_stream, stream_reason = (
             (None, "no latency stream reader") if read_latency_stream is None
             else read_latency_stream()
@@ -3214,60 +3244,87 @@ class SessionDataRecorder:
         latch, latched = SessionDataRecorder._latch_anchor(
             boundary, latency_stream, stream_reason, transition_host, period,
         )
-        anchor, method = (
-            (latched, "camera_latch") if latched is not None else (expected, "expected_lag")
+        arrival, arrived = SessionDataRecorder._arrival_anchor(
+            boundary, latency_stream, stream_reason, transition_host, period,
         )
-        implied = float(start_perf) - float(transition_host[anchor])
-        agree = None if latched is None else bool(latched == expected)
-        problems = []
-        if not gate[0] <= implied <= gate[1]:
-            problems.append(
-                f"implied lag {implied * 1e3:.3f} ms is outside the gate "
-                f"{gate[0] * 1e3:.3f}..{gate[1] * 1e3:.3f} ms"
+        if latched is not None:
+            anchor, method = latched, "camera_latch"
+        elif arrived is not None:
+            anchor, method = arrived, "host_arrival"
+        else:
+            anchor = SessionDataRecorder._first_frame_stamp_anchor(
+                start_perf, transition_host, period,
             )
+            method = None if anchor is None else "first_frame_stamp"
+        missing = []
+        if latched is None:
+            missing.append(
+                f"camera-clock match not available ({latch['status']}: {latch.get('reason', '')})"
+            )
+        if arrived is None:
+            missing.append(
+                f"arrival match not available ({arrival['status']}: {arrival.get('reason', '')})"
+            )
+        if anchor is None:
+            return {
+                **details,
+                "status": "unmatched",
+                "confidence": "none",
+                "latch": latch,
+                "arrival": arrival,
+                "reason": "; ".join([
+                    "No cam_frames transition could be matched to the first recorded frame",
+                    *missing,
+                    "no transition lies at or before the first frame's host stamp within "
+                    "a frame period",
+                ]),
+            }
+        implied = float(start_perf) - float(transition_host[anchor])
+        agree = None if latched is None or arrived is None else bool(latched == arrived)
+        problems = []
         if agree is False:
             problems.append(
-                f"the camera-latch anchor (sample {int(indices[edge_positions[latched]])}) "
-                f"and the expected-lag anchor (sample {int(indices[edge_positions[expected]])}) "
+                f"the camera-clock anchor (sample {int(indices[edge_positions[latched]])}) "
+                f"and the arrival anchor (sample {int(indices[edge_positions[arrived]])}) "
                 "disagree"
             )
-        if (
-            latched is None and runner_up is not None
-            and gate[0] <= float(start_perf) - float(transition_host[runner_up]) <= gate[1]
-        ):
-            problems.append("two transitions lie inside the lag gate")
+        problems.extend(missing)
         position = int(edge_positions[anchor])
-        how = (
-            f"Camera-clock latch pairing on the fitted NI timeline (shift {latch['shift']})"
-            if method == "camera_latch"
-            else "cam_frames transition nearest the expected exposure edge on the fitted NI timeline"
-        )
-        if method == "expected_lag" and latch.get("status") != "unavailable":
-            # A latch pairing that was tried and not used (ambiguous, outside
-            # the spool, failed) says so; the gate decides the confidence.
-            how += f"; camera-latch pairing not used ({latch['status']}: {latch.get('reason', '')})"
+        if method == "camera_latch":
+            how = f"Camera-clock latch pairing on the fitted NI timeline (shift {latch['shift']})"
+        elif method == "host_arrival":
+            how = f"Host-arrival pairing on the fitted NI timeline (shift {arrival['shift']})"
+        else:
+            how = (
+                "cam_frames transition at or before the first frame's host stamp on the "
+                "fitted NI timeline"
+            )
+        lag = arrival.get("medianLagSeconds")
+        if agree is True and lag is not None:
+            how += ("; confirmed by the arrival pairing "
+                    f"(median exposure to arrival {lag * 1e3:.3f} ms)")
         return {
             **details,
             "status": "matched",
-            "confidence": "hardware_edge" if not problems else "ambiguous_hardware_edge",
+            "confidence": "hardware_edge" if agree is True else "ambiguous_hardware_edge",
             "anchorMethod": method,
             "matchedSampleIndex": int(indices[position]),
             "matchedNidaqPerfTime": float(transition_host[anchor]),
             "signedOffsetSeconds": float(transition_host[anchor] - start_perf),
-            # As before: how much closer the chosen candidate is than the runner-up,
-            # here measured to the expected edge. It describes the expected-lag
-            # pick even when the latch anchor won; the latch's own margin is in
-            # latch.medianResidualSeconds and latch.agreement.
+            # How far the arrival pick is from flipping to a neighbouring transition: its
+            # median lag from one edge, or the rest of the period from the next.
             "ambiguitySeconds": (
-                None if runner_up is None
-                else float(distances[runner_up] - distances[expected])
+                None if lag is None or period is None else float(min(lag, period - lag))
             ),
             "edgePolarity": "rising" if channel_values[position] > 0.5 else "falling",
             "impliedLagSeconds": implied,
             "latch": latch,
-            "expectedLagSampleIndex": int(indices[edge_positions[expected]]),
+            "arrival": arrival,
+            "arrivalSampleIndex": (
+                None if arrived is None else int(indices[edge_positions[arrived]])
+            ),
             "anchorsAgree": agree,
-            "reason": "; ".join([how, *problems, *exposure_notes]),
+            "reason": "; ".join([how, *problems]),
         }
 
     @staticmethod
