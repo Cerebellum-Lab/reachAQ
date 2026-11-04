@@ -251,6 +251,9 @@ def test_latency_frames_before_the_ni_spool_do_not_cost_either_pairing(tmp_path)
     assert camera["latch"]["slip"] is None
     assert camera["arrival"]["status"] == "paired"
     assert camera["confidence"] == "hardware_edge"
+    # Both pairings counted exactly the frames from the spool's first edge to the last one.
+    in_spool = n0 - rig.first_edge_at_or_after(10.0 - 5.0) + int(20.0 * FPS) - 2
+    assert camera["latch"]["frames"] == camera["arrival"]["frames"] == in_spool
 
 
 def test_the_first_frame_stamp_anchor_is_the_latest_transition_at_or_before_it():
