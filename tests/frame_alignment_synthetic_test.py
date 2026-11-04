@@ -221,7 +221,10 @@ def test_the_ledger_and_the_latency_stream_describe_the_recorded_frames(tmp_path
     camera, host, _ = clocks.usable_latches(latches, clock="perf")
     assert camera.size == 6
     fit = clocks.fit_latches(latches, clock="perf")
-    assert fit.valid and fit.map(camera[0]) == pytest.approx(host[0], abs=1e-9)
+    # 60 ms of latches: an offset at drift 1, the middle of the six brackets'
+    # overlap, which the -10 ppm drift moves 0.6 us from one mark to the other.
+    assert fit.valid and fit.points == 6
+    assert fit.map(camera[0]) == pytest.approx(host[0], abs=1e-6)
     assert rig.edge_time(n0 + 1) - rig.edge_time(n0) == pytest.approx(PERIOD)
 
 
