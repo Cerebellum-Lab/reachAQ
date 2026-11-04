@@ -730,15 +730,24 @@ index divided by the sample rate. The chain reads every device row captured and
 the whole NI spool, including pre-roll and post-roll outside the session window:
 those rows are as good evidence as any inside it. Rows of earlier sessions are
 not: the device-row ring holds 100 000 rows and is not cleared between
-sessions. So with a valid NI-to-host fit (the one `cameraNidaqAlignment` uses),
-only rows the host received (`host_receive_perf_time`) within the NI
+sessions.
+
+The chain also needs a host reference for the NI recording, to tie a barcode
+frame to the timekeeper boot that played it: the session's NI-to-host fit (the
+one `cameraNidaqAlignment` uses) when it is valid, else the line through the
+host times of the recording's first and last NI samples. That line is a
+reference only if both points are finite, the second is later, and its slope is
+within 1 % of 1; a failed gate is no reference. `pairing` says which was used,
+`host_time` or `host_endpoints`, and is `null` when neither was. With neither
+the chain is `unavailable`: a tick alone does not say which timekeeper boot
+reported it. Only rows the host received (`host_receive_perf_time`) within the
 recording's host span, widened by 5 s each side, are used, and
-`rowsOutsideNiSpan` counts the rest; without one, every row is used. A session
-with no
-`SYNC_BARCODE_REPORT` row, as most sessions are, does not read the NI spool for
-the chain at all. Only a barcode report stamped `physical_start` and a clap
-stamped `observed` are used; rows with another stamp kind are counted in
-`rowsRejectedForStampKind` and left out.
+`rowsOutsideNiSpan` counts the rest.
+
+A session with no `SYNC_BARCODE_REPORT` row, as most sessions are, does not read
+the NI spool for the chain at all. Only a barcode report stamped `physical_start`
+and a clap stamped `observed` are used; rows with another stamp kind are counted
+in `rowsRejectedForStampKind` and left out.
 
 Each link is a continuous piecewise-linear fit, one segment per 120 s, not one
 straight line. A crystal's rate moves with temperature, and one line per link
@@ -753,16 +762,14 @@ time at each knot), so any time can be mapped through it.
   position from the start edge, and a frame is kept only if every edge its tick
   implies is where it should be, which rejects glitches and frames the recording
   cut. A timekeeper reset restarts the tick numbering, and an NI frame carries
-  only a tick, so a tick alone names two moments; host time ties a frame to the
-  boot whose report it is paired with. The timekeeper reports a barcode 0.5 s
-  after its start edge, so a decoded frame is paired with a `SYNC_BARCODE`
-  report of its tick that the host received between the frame's host time and
-  a second after it (`host_receive_perf_time`; the frame's host time is its NI
-  time through the session's NI-to-host fit). With no valid NI-to-host fit,
-  ticks alone are paired and only the largest group that agree on NI time minus
-  board time is kept (pairs chain into a group while neighbours are within
-  0.5 s, which hours of drift do not break and a repeated tick from another
-  boot does). `pairing` says which rule was used, `host_time` or `tick_cluster`.
+  only a tick, so a tick never pairs alone: host time ties a frame to the boot
+  whose report it is paired with. The timekeeper reports a barcode 0.5 s after
+  its start edge, so a decoded frame is paired with a `SYNC_BARCODE` report of
+  its tick that the host received between the frame's host time and a second
+  after it (`host_receive_perf_time`; the frame's host time is its NI time
+  through the host reference above). Of one boot's pairs, only the largest group
+  that agree on NI time minus board time is kept, in every mode (pairs chain into
+  a group while neighbours are within 0.5 s, which hours of drift do not break).
   The boot with the largest group of pairs is the timekeeper, and a tie never
   decides: if two boots, or two runs inside one boot, pair the same number of
   frames, the record is `unavailable` with a reason that names the tie, and
@@ -788,7 +795,10 @@ time at each knot), so any time can be mapped through it.
   `boards[].toNi`: a table whose knots are the board link's knots and the board
   times at which the board link, carried on past its ends by its end segments,
   reaches each of the timekeeper link's knots, so every bend of either link is
-  a knot. It is valid only when both links are. Host `perf_counter`
+  a knot. It is valid only when both links are. Its `x_min` and `x_max` can run
+  past the evidence for the board: `boards[].toTimekeeper.x_min` and `x_max` are
+  the span the claps cover, and `toNi` beyond that is extrapolation. Host
+  `perf_counter`
   follows through `cameraNidaqAlignment.niToHost`, as for every other time
   derived from an NI sample.
 
@@ -831,9 +841,12 @@ reasons:
 - `the NI-DAQ recorded no barcode channel`, `the NI-DAQ sample rate is unknown`,
   `NI-DAQ rate N Hz is below the 5000 Hz a barcode needs`, or `NI-DAQ sample
   index (N samples) and barcode line (M) differ in length`.
+- `ticks cannot be tied to a timekeeper boot without host time (spec section 9)`:
+  the session has no valid NI-to-host fit and no usable host times of the first
+  and last NI samples.
 - `timekeeper to NI-DAQ: ...`: no barcode frames decoded (is the barcode line
   wired?), none of the decoded frames matches a report (of the same tick and
-  host time, with a valid NI-to-host fit), fewer than ten matched, a tie
+  host time), fewer than ten matched, a tie
   between timekeeper boots (or inside one) that pair the same number of
   frames, or the fit's own reason (too few points, too short a span, too large
   a residual, a segment running backward). The timekeeper entry keeps its
