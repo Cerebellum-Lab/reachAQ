@@ -246,13 +246,35 @@ def _latch_direct_lag_p50(frames, latches) -> float:
         return math.nan
 
 
-def _host_arrival_reason(latches) -> str:
-    """Why the fallback pairing ran: no latch at all, or how many and why none served."""
+def _host_arrival_reason(latches, latch_fit: clocks.ClockFit, gate_reason: str) -> str:
+    """Why the fallback pairing ran: no latch at all, none usable, or a latch map too
+    uncertain to choose an exposure edge by (gate_reason, from clocks.latch_gate_reason)."""
     rows = 0 if latches is None else len(latches)
     if not rows:
         return HOST_ARRIVAL_PAIRING_REASON
-    return (f"{HOST_ARRIVAL_PAIRING} ({rows} camera clock latch{'es' if rows != 1 else ''}, "
-            "none usable: no finite, non-negative bracket)")
+    if not latch_fit.valid:
+        return f"{HOST_ARRIVAL_PAIRING} ({latch_fit.reason})"
+    return (f"{HOST_ARRIVAL_PAIRING} ({rows} camera clock latch{'es' if rows != 1 else ''} "
+            f"not trusted: {gate_reason})")
+
+
+def _confirmed_by_arrival(latch: clocks.Pairing, arrival: clocks.Pairing) -> clocks.Pairing:
+    """The camera-clock pairing, made ambiguous unless host arrival names its shift.
+
+    A latch map off by whole periods puts every frame whole periods off, with
+    a residual as small as the right pairing's, and nothing on the latch side
+    can see it. Host arrival reads no latch, so it can. An ambiguous arrival
+    pairing confirms nothing: choose_pairing reports shift 0 when it cannot
+    pair at all, so its shift is compared only when it is unambiguous.
+    """
+    if not arrival.ambiguous and arrival.shift == latch.shift:
+        return latch
+    state = (f"ambiguous: {arrival.reason}" if arrival.ambiguous
+             else f"median lag {arrival.median_lag * 1e3:.3f} ms")
+    why = (f"host-arrival pairing (shift {arrival.shift}, {state}) does not confirm "
+           f"camera-clock pairing (shift {latch.shift})")
+    return dataclasses.replace(latch, ambiguous=True,
+                               reason="; ".join(part for part in (latch.reason, why) if part))
 
 
 def _ni_derived_lag_p50(frames, latches, camera_to_ni, ni_to_host) -> float:
@@ -310,6 +332,8 @@ class _Context:
         self.ni_to_host = clocks.invalid_fit("no NI stream")
         self.camera_to_ni = clocks.invalid_fit("not fitted")
         self.pairing: Optional[clocks.Pairing] = None
+        # The host-arrival pairing run beside a camera-clock one, to confirm it.
+        self.arrival_pairing: Optional[clocks.Pairing] = None
         self._fit_clocks()
         self._fit_wall(raw)
 
@@ -374,16 +398,45 @@ class _Context:
         # Older sessions, and cameras with no clock to latch, have no latches.
         latches = self.cameras.get(self.primary_name, {}).get("clock_latches")
         try:
-            transition_perf = self.ni_to_host.map(transition_index / ni["rate"])
-            if clocks.usable_latches(latches, clock="perf")[0].size:
-                self.pairing = clocks.choose_pairing_by_camera_clock(
-                    frames["frame_id"], frames["camera_ts_ns"], latches, transition_perf,
-                    self.frame_period, ni_residual_rms=self.ni_to_host.residual_rms,
-                    clock="perf")
+            ni_seconds = transition_index / ni["rate"]
+            transition_perf = self.ni_to_host.map(ni_seconds)
+            residual = self.ni_to_host.residual_rms
+            # Both pairings take only the frames that arrived while the NI spool held
+            # transitions: the camera runs on either side of it, and those frames have
+            # no edge of their own to pair with. With no period known, a frame may
+            # arrive no later than the last transition.
+            period = self.frame_period if math.isfinite(self.frame_period) else None
+            within = numpy.zeros(len(frames), dtype=bool)
+            if transition_perf.size:
+                within = clocks.frames_within_transitions(frames["arrival_perf"], transition_perf,
+                                                          period)
+            ids, arrival = frames["frame_id"][within], frames["arrival_perf"][within]
+            # The latches pair on CLOCK_MONOTONIC_RAW when the NI fit and the latch rows
+            # both carry it: no NTP slew is in it, so one latch line holds all session.
+            # Otherwise on perf, where that line ignores the slews; Pairing.clock says which.
+            raw_fit = (clocks.fit_latches(latches, clock="raw")
+                       if getattr(self.ni_to_host, "has_raw", False) else None)
+            if raw_fit is not None and raw_fit.valid:
+                clock, latch_fit = "raw", raw_fit
             else:
-                self.pairing = clocks.choose_pairing(frames["frame_id"], frames["arrival_perf"],
-                                                     transition_perf, self.frame_period,
-                                                     ni_residual_rms=self.ni_to_host.residual_rms)
+                clock, latch_fit = "perf", clocks.fit_latches(latches, clock="perf")
+            fallback = ""
+            if latch_fit.valid and clocks.latch_gate_ok(latch_fit, residual, self.frame_period):
+                transition_times = (self.ni_to_host.to_raw(ni_seconds) if clock == "raw"
+                                    else transition_perf)
+                latch_pairing = clocks.choose_pairing_by_camera_clock(
+                    ids, frames["camera_ts_ns"][within], latches, transition_times,
+                    self.frame_period, ni_residual_rms=residual, clock=clock)
+                self.arrival_pairing = clocks.choose_pairing(
+                    ids, arrival, transition_perf, self.frame_period, ni_residual_rms=residual)
+                self.pairing = _confirmed_by_arrival(latch_pairing, self.arrival_pairing)
+            else:
+                # No usable latch, or a latch map too uncertain to choose an edge by:
+                # host arrival alone, as for a stream with no latch at all.
+                fallback = _host_arrival_reason(latches, latch_fit, clocks.latch_gate_reason(
+                    latch_fit, residual, self.frame_period))
+                self.pairing = clocks.choose_pairing(ids, arrival, transition_perf,
+                                                     self.frame_period, ni_residual_rms=residual)
         except Exception as error:
             logger.exception("Latency camera pairing failed")
             self.camera_to_ni = clocks.invalid_fit(_describe(error))
@@ -395,21 +448,24 @@ class _Context:
             pairing, self.frame_period))
         record["cameraToNi"] = {**self.camera_to_ni.as_record(),
                                 "pairing": dataclasses.asdict(self.pairing)}
+        if self.arrival_pairing is not None:
+            record["cameraToNi"]["arrivalPairing"] = dataclasses.asdict(self.arrival_pairing)
         if pairing.method == clocks.HOST_ARRIVAL:
             # Only arrival placed each exposure, so a lag over one period would
             # read whole periods short; the next candidate is kept beside it.
             record["cameraToNi"]["assumes_lag_below_period"] = True
             record["cameraToNi"]["alternative_median_lag"] = pairing.median_lag + self.frame_period
-            self.status["reasons"].append(_host_arrival_reason(latches))
+            self.status["reasons"].append(fallback)
         else:
             # Exposure to arrival from the latches alone, beside the NI path's
             # figure over the same frames. Not two measurements: their
             # difference is the pairing residual again (ni - latch is about
             # -median_residual), seen through the fitted camera-to-NI line, so
             # this is a consistency check on fit_camera_to_ni. The residual
-            # gate in choose_pairing_by_camera_clock is the safeguard against
-            # whole-period mispairing and must not be relaxed on the strength
-            # of this check. Both figures stay in the record as diagnostics.
+            # gate in choose_pairing_by_camera_clock and the host-arrival
+            # confirmation are the safeguards against whole-period mispairing
+            # and must not be relaxed on the strength of this check. Both
+            # figures stay in the record as diagnostics.
             latch_lag = _latch_direct_lag_p50(frames, latches)
             ni_lag = _ni_derived_lag_p50(frames, latches, self.camera_to_ni, self.ni_to_host)
             record["cameraToNi"]["latchDirectLagP50"] = latch_lag
