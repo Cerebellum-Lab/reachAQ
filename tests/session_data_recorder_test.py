@@ -2107,3 +2107,21 @@ def test_board_clock_chain_record_that_cannot_be_written_is_replaced(tmp_path, m
 
     assert result["boardClockChain"]["status"] == "unavailable"
     assert (next(Path(tmp_path).rglob("alignment.json"))).is_file()
+
+
+def test_board_clock_chain_reads_a_spooled_capture_in_the_rig_channel_order(tmp_path):
+    from board_clock_chain_synthetic import synthetic_rig
+
+    rows, channels, indices = synthetic_rig()
+    silent = np.zeros(indices.size, dtype=np.float32)
+    # cam_frames is stored before the barcode and the tones on the bench rig.
+    snapshot = _nidaq_spool(
+        tmp_path,
+        ("cam_frames", "barcode", "tone1", "tone2"),
+        [silent, channels["barcode"], channels["tone1"], silent],
+    )
+
+    record = SessionDataRecorder._board_clock_chain(rows, snapshot)
+
+    assert record["status"] == "fitted"
+    assert record["boards"][0]["toneCrossCheck"]["matched"] == 2
