@@ -68,6 +68,8 @@ from .device_interface import (
     Version,
     BoardTimeSync,
     BoardCapabilities,
+    SyncClapObservation,
+    SyncBarcodeReport,
     DigitalPulseStatus,
     PressureReading,
 )
@@ -490,11 +492,12 @@ class CanInterface(DeviceInterface):
             "TIME_SYNC_REQUEST": no_op,
             "CAPABILITIES_REQUEST": no_op,
             "GPIO_PULSE": no_op,
-            # Clock-chain and IO-module traffic. Received and dropped until the
-            # clock chain (T3) and the IO-module driver consume them.
+            # Clock-chain and IO-module traffic. SYNC_CLAP_OBSERVED and SYNC_BARCODE
+            # are translated to recorded Sources; the rest is received and dropped
+            # until the clock chain (T3) and the IO-module driver consume it.
             "SYNC_CLAP": no_op,
-            "SYNC_CLAP_OBSERVED": no_op,
-            "SYNC_BARCODE": no_op,
+            "SYNC_CLAP_OBSERVED": self._translate_sync_clap_observed,
+            "SYNC_BARCODE": self._translate_sync_barcode,
             "ANALOG_BLOCK": no_op,
             "PWM_SET": no_op,
         }
@@ -502,6 +505,15 @@ class CanInterface(DeviceInterface):
             kind = getattr(cmd_type, name, None)
             if kind is not None:
                 self._handlers[kind] = handler
+        # Sync reports are evidence for the clock chain whichever board sends
+        # them; everything else from a board without a driver stays ignored.
+        self._any_board_types = frozenset(
+            kind for kind in (
+                getattr(cmd_type, "SYNC_CLAP_OBSERVED", None),
+                getattr(cmd_type, "SYNC_BARCODE", None),
+            )
+            if kind is not None
+        )
 
     def __allow_fake_status_time(self, motor):
         if _debug_path_fake_status_timeout.exists():
@@ -1658,7 +1670,7 @@ class CanInterface(DeviceInterface):
         Returns:
             Populated class type (see device_interface.py) or None
         """
-        if not _is_pellet_by_addr(message.dst_id):
+        if not _is_pellet_by_addr(message.dst_id) and message.type not in self._any_board_types:
             self._ignore_foreign_board(message.dst_id)
             return None
         handler = self._handlers.get(message.type, None)
@@ -1764,6 +1776,21 @@ class CanInterface(DeviceInterface):
             wire_schema_version=int(response.wire_schema_version),
             capabilities=int(response.capabilities),
             boot_id=int(response.boot_id),
+        )
+
+    @staticmethod
+    def _translate_sync_clap_observed(message) -> SyncClapObservation:
+        observed = message.sync_clap_observed
+        return SyncClapObservation(
+            board_address=int(message.dst_id),
+            tick=int(observed.tick),
+            clapper_node=int(observed.clapper_node),
+        )
+
+    @staticmethod
+    def _translate_sync_barcode(message) -> SyncBarcodeReport:
+        return SyncBarcodeReport(
+            board_address=int(message.dst_id), tick=int(message.sync_barcode.tick),
         )
 
     @staticmethod

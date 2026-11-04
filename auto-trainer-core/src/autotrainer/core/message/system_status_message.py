@@ -62,6 +62,12 @@ class SystemStatusMessageKind(IntEnum):
     PRESSURE_READING = 310
     """One pellet-board FSR sample as a PressureReading (raw 12-bit ADC count)."""
 
+    SYNC_CLAP_OBSERVATION = 311
+    """A board's SYNC_CLAP_OBSERVED report as a SyncClapObservation (clock-chain evidence)."""
+
+    SYNC_BARCODE_REPORT = 312
+    """The timekeeper's SYNC_BARCODE report as a SyncBarcodeReport (clock-chain evidence)."""
+
     COLOR_LED = 403
     """Message is the original ColorLed message"""
 

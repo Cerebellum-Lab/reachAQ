@@ -11,7 +11,8 @@ import logging
 
 import pytest
 
-from autotrainer.device import CanTransportConfiguration, Heartbeat, Target, socketcan_jerrycan
+from autotrainer.device import (CanTransportConfiguration, Heartbeat, SyncBarcodeReport,
+                                SyncClapObservation, Target, socketcan_jerrycan)
 from autotrainer.device.can_interface import CanInterface
 from autotrainer.device.socketcan_jerrycan import JerryCANCmdType, JerryCANMsg
 
@@ -96,8 +97,6 @@ def test_pellet_frames_are_unaffected(address):
 
 @pytest.mark.parametrize("message_type", [
     JerryCANCmdType.SYNC_CLAP,
-    JerryCANCmdType.SYNC_CLAP_OBSERVED,
-    JerryCANCmdType.SYNC_BARCODE,
     JerryCANCmdType.ANALOG_BLOCK,
     JerryCANCmdType.PWM_SET,
 ])
@@ -127,3 +126,44 @@ def test_a_rejected_time_sync_exchange_does_not_escape_translate():
     translated = interface._translate(message)
 
     assert translated.clock_model == {}
+
+
+@pytest.mark.parametrize("address", [PELLET_ADDRESS, IO_MODULE_ADDRESS])
+def test_clap_observations_are_recorded_from_any_board(address):
+    message = _message(JerryCANCmdType.SYNC_CLAP_OBSERVED, address)
+    message.sync_clap_observed = socketcan_jerrycan.SyncClapObserved(tick=41, clapper_node=IO_MODULE_ADDRESS)
+
+    translated = _interface()._translate(message)
+
+    assert isinstance(translated, SyncClapObservation)
+    assert (translated.board_address, translated.tick, translated.clapper_node) == (address, 41, IO_MODULE_ADDRESS)
+
+
+def test_barcode_reports_are_recorded_from_the_timekeeper():
+    message = _message(JerryCANCmdType.SYNC_BARCODE, IO_MODULE_ADDRESS)
+    message.sync_barcode = socketcan_jerrycan.SyncBarcode(tick=41)
+
+    translated = _interface()._translate(message)
+
+    assert isinstance(translated, SyncBarcodeReport)
+    assert (translated.board_address, translated.tick) == (IO_MODULE_ADDRESS, 41)
+
+
+@pytest.mark.parametrize("message_type", [
+    JerryCANCmdType.HEARTBEAT, JerryCANCmdType.ANALOG_BLOCK, JerryCANCmdType.GPIO_READ,
+])
+def test_other_io_module_traffic_is_still_ignored(message_type):
+    assert _interface()._translate(_message(message_type, IO_MODULE_ADDRESS)) is None
+
+
+def test_the_message_handler_passes_sync_reports_through_silently(caplog):
+    from queue import Queue
+    from autotrainer.core import SystemStatusMessageKind
+    from autotrainer.core.message.system_message_handler import SystemMessageHandler
+
+    handler = SystemMessageHandler(Queue())
+    with caplog.at_level(logging.WARNING):
+        handler.message_received(SystemStatusMessageKind.SYNC_CLAP_OBSERVATION, object())
+        handler.message_received(SystemStatusMessageKind.SYNC_BARCODE_REPORT, object())
+
+    assert "unhandled msg" not in caplog.text
