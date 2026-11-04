@@ -3,7 +3,7 @@ import json
 import numpy as np
 import pytest
 
-from board_clock_chain_synthetic import RATE, barcode_line
+from board_clock_chain_synthetic import IO_ADDRESS, IO_BOOT, PELLET_ADDRESS, PELLET_BOOT, RATE, barcode_line, synthetic_rig
 from tools.acquisition.model import board_clock_chain as chain
 
 
@@ -66,3 +66,43 @@ def test_five_kilohertz_still_decodes():
     line = barcode_line(5000.0, 2.0, [(0.5, 0xA5A5A5A5)])
     frames, _ = chain.decode_barcode_frames(line, 5000.0)
     assert [frame.tick for frame in frames] == [0xA5A5A5A5]
+
+
+def test_chain_composes_pellet_to_ni_and_tones_land_within_a_sample():
+    rows, channels, indices = synthetic_rig()
+
+    record = chain.board_clock_chain(rows, sample_indices=indices, sample_rate_hz=RATE, channels=channels)
+
+    assert record["status"] == "fitted"
+    timekeeper = record["timekeeper"]
+    assert (timekeeper["address"], timekeeper["bootId"]) == (IO_ADDRESS, IO_BOOT)
+    assert timekeeper["barcodeFramesMatched"] == 29
+    assert timekeeper["toNi"]["drift"] == pytest.approx(1.00002, abs=2e-6)
+    (board,) = record["boards"]
+    assert (board["address"], board["bootId"]) == (PELLET_ADDRESS, PELLET_BOOT)
+    assert board["toNi"]["valid"]
+    check = board["toneCrossCheck"]
+    assert check["matched"] == 2 and check["unmatched"] == 0
+    assert check["maxAbsResidualSeconds"] <= 1.0 / RATE
+    json.dumps(record, allow_nan=False)  # alignment.json rejects NaN
+
+
+def test_no_barcode_reports_means_no_timekeeper():
+    record = chain.board_clock_chain((), sample_indices=np.arange(10), sample_rate_hz=RATE, channels={})
+    assert record["status"] == "unavailable"
+    assert "no timekeeper" in record["reason"]
+
+
+def test_missing_barcode_channel_is_unavailable():
+    rows, channels, indices = synthetic_rig(seconds=5)
+    del channels["barcode"]
+    record = chain.board_clock_chain(rows, sample_indices=indices, sample_rate_hz=RATE, channels=channels)
+    assert record["status"] == "unavailable"
+    assert "barcode" in record["reason"]
+
+
+def test_too_few_barcodes_leave_the_fit_invalid_and_json_safe():
+    rows, channels, indices = synthetic_rig(seconds=2)
+    record = chain.board_clock_chain(rows, sample_indices=indices, sample_rate_hz=RATE, channels=channels)
+    assert record["status"] == "unavailable"
+    json.dumps(record, allow_nan=False)
