@@ -1109,13 +1109,18 @@ def _optional_int(row, name):
     return int(value)
 
 
+# Queue stamps are taken before the queue insert, so an interrupt that queues
+# between them can put a later stamp first; anything beyond this is a real reset.
+_QUEUE_CLOCK_TOLERANCE_US = 1000
+
+
 def _board_time_rule(context):
     path = context.path("streams/device.csv")
     if not path.is_file():
         return _result("events.board_time", "not_applicable", "Device stream is absent")
     errors, warnings = [], []
     timestamped = 0
-    previous = {}
+    envelopes = {}
     model_ids = set()
     with path.open("r", encoding="utf-8", newline="") as stream:
         reader = csv.DictReader(stream)
@@ -1144,21 +1149,9 @@ def _board_time_rule(context):
                 if None in (boot, sequence, board_us):
                     errors.append(f"row {line_number}: partial board timing envelope")
                     continue
-                prior = previous.get(boot)
-                if prior is not None:
-                    prior_sequence, prior_us = prior
-                    delta = (sequence - prior_sequence) & 0xFFFFFFFF
-                    if delta == 0:
-                        errors.append(f"row {line_number}: duplicate board sequence {sequence}")
-                    elif delta >= 0x80000000:
-                        errors.append(f"row {line_number}: board sequence moved backward")
-                    elif delta > 1:
-                        warnings.append(
-                            f"row {line_number}: {delta - 1} board message(s) missing"
-                        )
-                    if board_us < prior_us:
-                        errors.append(f"row {line_number}: board clock moved backward")
-                previous[boot] = (sequence, board_us)
+                envelopes.setdefault(boot, []).append(
+                    (line_number, sequence, board_us, row.get("board_timestamp_kind") or "")
+                )
 
                 aligned = _optional_float(row, "board_aligned_perf_time")
                 model_id = row.get("board_clock_model_id") or None
@@ -1189,6 +1182,26 @@ def _board_time_rule(context):
                         warnings.append(f"row {line_number}: transport delay exceeds 1 s")
             except (TypeError, ValueError) as error:
                 errors.append(f"row {line_number}: {error}")
+    # device.csv is ordered by event time, and a board stamps observed and
+    # physical events before the frame that reports them is queued, so a
+    # board's rows are judged in the order the board numbered them.
+    for entries in envelopes.values():
+        entries.sort(key=lambda entry: entry[1])
+        previous_sequence = None
+        latest_queue_us = None
+        for line_number, sequence, board_us, kind in entries:
+            if previous_sequence is not None:
+                if sequence == previous_sequence:
+                    errors.append(f"row {line_number}: duplicate board sequence {sequence}")
+                elif sequence - previous_sequence > 1:
+                    warnings.append(
+                        f"row {line_number}: {sequence - previous_sequence - 1} board message(s) missing"
+                    )
+            previous_sequence = sequence
+            if kind == "tx_queue":
+                if latest_queue_us is not None and board_us < latest_queue_us - _QUEUE_CLOCK_TOLERANCE_US:
+                    errors.append(f"row {line_number}: board clock moved backward")
+                latest_queue_us = board_us if latest_queue_us is None else max(latest_queue_us, board_us)
     if not timestamped:
         return _result(
             "events.board_time", "not_applicable",
@@ -1201,7 +1214,7 @@ def _board_time_rule(context):
         "; ".join(details[:20]) if details else "Board clocks, sequences, and aligned events are valid",
         observed={
             "timestamped_rows": timestamped,
-            "boot_epochs": len(previous),
+            "boot_epochs": len(envelopes),
             "clock_models": sorted(model_ids),
             "warnings": len(warnings),
             "errors": len(errors),

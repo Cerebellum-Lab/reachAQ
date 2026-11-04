@@ -1026,3 +1026,57 @@ def _alignment_session_without_stream_manifest(tmp_path):
 def test_frame_alignment_is_not_applicable_without_ni_samples(tmp_path, build):
     result = _alignment_result(build(tmp_path))
     assert result.status.value == "not_applicable", result.message
+
+
+_BOARD_COLUMNS = (
+    "perf_time", "host_receive_perf_time", "board_boot_id",
+    "board_sequence", "board_time_us", "board_timestamp_kind",
+    "board_aligned_perf_time", "board_clock_model_id",
+    "board_clock_uncertainty_seconds", "estimated_transport_delay_seconds",
+    "event_perf_time", "event_timestamp_method", "event_timing_confidence",
+)
+
+
+def _board_time_result(tmp_path, rows):
+    import csv
+    root = _session(tmp_path)
+    path = root / "streams/device.csv"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(_BOARD_COLUMNS)
+        writer.writerows(rows)
+    report = validate_session(root, profile=ValidationProfile.FAST)
+    return next(item for item in report.results if item.rule_id == "events.board_time")
+
+
+def _host_row(perf, boot, sequence, board_us, kind):
+    return (perf, perf + 0.01, boot, sequence, board_us, kind, "", "", "", "", perf,
+            "host_receive_perf_time", "host_timestamp")
+
+
+def test_board_rows_out_of_sequence_order_by_event_time_are_valid(tmp_path):
+    # A clap heard (sequence 2) is stamped before the queued frame (sequence 1) it follows.
+    rows = (
+        _host_row(10.000, 7, 2, 900, "observed"),
+        _host_row(10.001, 7, 1, 1000, "tx_queue"),
+        _host_row(10.002, 7, 3, 2000, "tx_queue"),
+    )
+    assert _board_time_result(tmp_path, rows).status.value == "pass"
+
+
+def test_duplicate_board_sequence_still_fails(tmp_path):
+    rows = (_host_row(10.0, 7, 1, 1000, "tx_queue"), _host_row(10.1, 7, 1, 2000, "tx_queue"))
+    assert _board_time_result(tmp_path, rows).status.value == "fail"
+
+
+def test_queue_clock_moving_backward_in_sequence_order_fails(tmp_path):
+    rows = (_host_row(10.0, 7, 1, 50_000, "tx_queue"), _host_row(10.1, 7, 2, 10_000, "tx_queue"))
+    assert _board_time_result(tmp_path, rows).status.value == "fail"
+
+
+def test_board_sequence_gap_is_a_warning(tmp_path):
+    rows = (_host_row(10.0, 7, 1, 1000, "tx_queue"), _host_row(10.1, 7, 4, 2000, "tx_queue"))
+    result = _board_time_result(tmp_path, rows)
+    assert result.status.value == "warning"
+    assert "2 board message(s) missing" in result.message
