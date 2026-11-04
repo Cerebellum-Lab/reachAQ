@@ -1,3 +1,5 @@
+import math
+
 import numpy as np
 import pytest
 
@@ -109,7 +111,8 @@ def test_pairing_picks_the_transition_before_arrival():
     exposure = 50.0 + (ids - 1000) * period
     transition_perf = 50.0 + np.arange(-5, 300) * period  # the window starts 5 exposures early
 
-    pairing = clocks.choose_pairing(ids, exposure + 0.002, transition_perf, period)
+    pairing = clocks.choose_pairing(ids, exposure + 0.002, transition_perf, period,
+                                    ni_residual_rms=0.00002)
 
     assert pairing.shift == 995  # frame 1000 is transition number 5
     assert pairing.median_lag == pytest.approx(0.002, abs=1e-9)
@@ -120,7 +123,10 @@ def test_a_lag_too_close_to_zero_is_ambiguous():
     period = 1 / 150
     ids = np.arange(100)
     exposure = 10.0 + ids * period
-    pairing = clocks.choose_pairing(ids, exposure + 0.00005, exposure, period)
+    pairing = clocks.choose_pairing(ids, exposure + 0.00005, exposure, period,
+                                    ni_residual_rms=0.0001)
+    # The NI mapping is only good to 0.1 ms, so the margin is 4.89 times that.
+    assert pairing.limit == pytest.approx(clocks.coverage_factor() * 0.0001, rel=1e-6)
     assert pairing.ambiguous
 
 
@@ -189,21 +195,94 @@ def test_the_envelope_fit_is_tighter_than_a_plain_fit():
     assert bias.max() < 0.0005, f"bias.max() = {bias.max()}"
 
 
-def test_pairing_marks_slips_as_ambiguous():
-    # Issue 4: a lost transition mid-session drops agreement and marks pairing ambiguous
+@pytest.mark.parametrize("drop", [30, 140])
+def test_a_lost_transition_is_a_slip_reported_at_its_change_point(drop):
+    # Every frame from the lost transition on votes one shift on. Where the run is the
+    # first stretch of the session (drop 30) the slip is still reported where the votes
+    # change, not at the first frame.
     period = 1 / 150
     ids = np.arange(200)
     exposure = 50.0 + ids * period
-    # Create transitions: continuous for first 100, then drop one mid-session
-    transition_perf = 50.0 + np.arange(200) * period
-    # Drop transition 100: frames after it are now off by one
-    transition_perf = np.delete(transition_perf, 100)
+    transition_perf = np.delete(50.0 + np.arange(200) * period, drop)
 
-    pairing = clocks.choose_pairing(ids, exposure + 0.002, transition_perf, period)
+    pairing = clocks.choose_pairing(ids, exposure + 0.002, transition_perf, period,
+                                    ni_residual_rms=0.00002)
 
-    assert pairing.ambiguous, f"dropped transition should mark pairing ambiguous: {pairing.reason}"
-    # Should be marked ambiguous due to low agreement from the slip
-    assert pairing.agreement < 0.95, f"agreement {pairing.agreement} should be < 0.95"
+    assert pairing.ambiguous, pairing.reason
+    assert pairing.slip["frameId"] == ids[drop]
+    assert {pairing.slip["fromShift"], pairing.slip["toShift"]} == {0, 1}
+    assert pairing.slip["frames"] == min(drop, 200 - drop)
+    assert "slip" in pairing.reason
+
+
+def test_frame_id_gaps_are_not_slips():
+    # Dropped frames still had their exposure edge, so the ids skip and the shift does not.
+    period = 1 / 150
+    ids = np.delete(np.arange(3000), range(1000, 1040))
+    exposure = 50.0 + ids * period
+    transition_perf = 50.0 + np.arange(3000) * period
+
+    pairing = clocks.choose_pairing(ids, exposure + 0.002, transition_perf, period,
+                                    ni_residual_rms=0.00002)
+
+    assert pairing.slip is None and not pairing.ambiguous, pairing.reason
+
+
+def test_a_single_stray_vote_is_not_a_slip():
+    ids, exposure, transition_perf = _exposures(9000)
+    arrival = exposure + 0.002
+    arrival[4000] += PERIOD_150  # one frame that waited a whole period to be delivered
+
+    pairing = clocks.choose_pairing(ids, arrival, transition_perf, PERIOD_150,
+                                    ni_residual_rms=0.00002)
+
+    assert pairing.slip is None and not pairing.ambiguous, pairing.reason
+
+
+def test_the_arrival_margin_is_measured():
+    ids, exposure, transition_perf = _exposures(9000)
+    lags = 0.002 + np.random.default_rng(5).normal(0, 0.0003, 9000)
+
+    pairing = clocks.choose_pairing(ids, exposure + lags, transition_perf, PERIOD_150,
+                                    ni_residual_rms=0.00002)
+
+    assert pairing.limit == pytest.approx(
+        clocks.coverage_factor() * math.hypot(0.00002, 1.2533 * clocks.robust_spread(lags)
+                                              / math.sqrt(9000)), rel=1e-6)
+    assert not pairing.ambiguous, pairing.reason
+
+    # The same spread of lags, centred half a margin short of one period.
+    late = lags - np.median(lags) + PERIOD_150 - 0.5 * pairing.limit
+    pairing = clocks.choose_pairing(ids, exposure + late, transition_perf, PERIOD_150,
+                                    ni_residual_rms=0.00002)
+
+    assert pairing.ambiguous
+    assert "margin" in pairing.reason
+
+
+def test_a_two_frame_session_pairs_without_raising():
+    ids, exposure, transition_perf = _exposures(2)
+
+    pairing = clocks.choose_pairing(ids, exposure + 0.002, transition_perf, PERIOD_150,
+                                    ni_residual_rms=0.00002)
+
+    assert math.isfinite(pairing.limit)
+    assert pairing.slip is None
+
+
+def test_frames_within_transitions_keeps_one_period_past_the_last():
+    edges = np.array([10.0, 10.01, 10.02])
+
+    def kept(stamp, period):
+        return bool(clocks.frames_within_transitions([stamp], edges, period)[0])
+
+    assert kept(10.015, 0.01)
+    assert kept(10.0, 0.01) and kept(10.02, 0.01)  # at a transition counts
+    assert kept(10.025, 0.01)                      # a frame still arriving for the last edge
+    assert not kept(9.999, 0.01)                   # before every transition
+    assert not kept(10.031, 0.01)                  # over a period past the last
+    assert not kept(10.025, None)                  # unknown period: no later than the last
+    assert not kept(float("nan"), 0.01) and not kept(float("-inf"), 0.01)  # no arrival yet
 
 
 def test_camera_fit_with_nonzero_shift_and_chosen_pairing():
@@ -225,7 +304,8 @@ def test_camera_fit_with_nonzero_shift_and_chosen_pairing():
     arrival_perf = exposure_ni + 0.002
 
     # Choose pairing
-    pairing = clocks.choose_pairing(ids, arrival_perf, transition_perf, period)
+    pairing = clocks.choose_pairing(ids, arrival_perf, transition_perf, period,
+                                    ni_residual_rms=0.00002)
 
     # Verify pairing is correct and not ambiguous
     assert not pairing.ambiguous, f"pairing should not be ambiguous: {pairing.reason}"
@@ -272,9 +352,10 @@ def test_host_arrival_pairing_aliases_a_lag_over_one_period_and_the_camera_clock
     camera_ts_ns = np.round(_camera_clock(exposure) * 1e9).astype(np.int64)
     latches = _latches([exposure[0] + 0.001, exposure[-1] + 0.001])
 
-    by_arrival = clocks.choose_pairing(ids, exposure + lag, transition_perf, PERIOD_150)
+    by_arrival = clocks.choose_pairing(ids, exposure + lag, transition_perf, PERIOD_150,
+                                       ni_residual_rms=0.00002)
     by_clock = clocks.choose_pairing_by_camera_clock(ids, camera_ts_ns, latches, transition_perf,
-                                                     PERIOD_150)
+                                                     PERIOD_150, ni_residual_rms=0.00002)
 
     # The latest transition before each arrival is two frames on, and nothing says so.
     assert by_arrival.method == "host_arrival"
@@ -293,7 +374,7 @@ def test_a_latch_off_by_more_than_half_a_period_is_ambiguous():
     latches = _latches([exposure[0] + 0.001], error=0.6 * PERIOD_150)
 
     pairing = clocks.choose_pairing_by_camera_clock(ids, camera_ts_ns, latches, transition_perf,
-                                                    PERIOD_150)
+                                                    PERIOD_150, ni_residual_rms=0.00002)
 
     assert pairing.ambiguous
     assert "residual" in pairing.reason
@@ -311,9 +392,11 @@ def test_an_hour_of_camera_drift_is_fitted_through_two_latches_or_windowed_aroun
     start, end = exposure[0] + 0.001, exposure[-1] + 0.001
 
     both = clocks.choose_pairing_by_camera_clock(
-        ids, camera_ts_ns, _latches([start, end], camera_of=drifting), transition_perf, PERIOD_150)
+        ids, camera_ts_ns, _latches([start, end], camera_of=drifting), transition_perf, PERIOD_150,
+        ni_residual_rms=0.00002)
     start_only = clocks.choose_pairing_by_camera_clock(
-        ids, camera_ts_ns, _latches([start], camera_of=drifting), transition_perf, PERIOD_150)
+        ids, camera_ts_ns, _latches([start], camera_of=drifting), transition_perf, PERIOD_150,
+        ni_residual_rms=0.00002)
 
     # 20 ppm over an hour is 72 ms, ten frame periods: one offset cannot pair the whole session.
     for pairing in (both, start_only):
@@ -332,7 +415,7 @@ def test_unusable_latches_give_an_ambiguous_pairing_with_a_reason(latches, why):
     camera_ts_ns = np.round(_camera_clock(exposure) * 1e9).astype(np.int64)
 
     pairing = clocks.choose_pairing_by_camera_clock(ids, camera_ts_ns, latches, transition_perf,
-                                                    PERIOD_150)
+                                                    PERIOD_150, ni_residual_rms=0.00002)
 
     assert pairing.ambiguous
     assert pairing.method == "camera_latch"
@@ -351,7 +434,7 @@ def test_a_pairing_one_frame_off_at_50_fps_is_ambiguous():
     latches = _latches([exposure[0] + 0.001, exposure[-1] + 0.001])
 
     pairing = clocks.choose_pairing_by_camera_clock(ids, camera_ts_ns, latches, transition_perf,
-                                                    period)
+                                                    period, ni_residual_rms=0.00002)
 
     assert pairing.shift == 994  # frame 1000 is transition 5
     assert pairing.median_residual == pytest.approx(0.00339, abs=1e-5)
@@ -365,10 +448,27 @@ def test_a_correct_pairing_with_a_small_residual_is_accepted():
     latches = _latches([exposure[0] + 0.001, exposure[-1] + 0.001])
 
     pairing = clocks.choose_pairing_by_camera_clock(ids, camera_ts_ns, latches,
-                                                    transition_perf + 0.0001, PERIOD_150)
+                                                    transition_perf + 0.0001, PERIOD_150,
+                                                    ni_residual_rms=0.00002)
 
     assert pairing.shift == 995 and not pairing.ambiguous, pairing.reason
     assert pairing.median_residual == pytest.approx(0.0001, abs=1e-6)
+
+
+@pytest.mark.parametrize("drop", [60, 140])
+def test_a_lost_transition_is_a_slip_for_the_camera_clock_too(drop):
+    ids, exposure, transition_perf = _exposures(200)
+    camera_ts_ns = np.round(_camera_clock(exposure) * 1e9).astype(np.int64)
+    latches = _latches([exposure[0] + 0.001, exposure[-1] + 0.001])
+
+    pairing = clocks.choose_pairing_by_camera_clock(
+        ids, camera_ts_ns, latches, np.delete(transition_perf, 5 + drop), PERIOD_150,
+        ni_residual_rms=0.00002)
+
+    assert pairing.ambiguous
+    # The lost edge's own frame sits midway between its neighbours; either may take it.
+    assert abs(pairing.slip["frameId"] - ids[drop]) <= 1
+    assert "slip" in pairing.reason
 
 
 @pytest.mark.parametrize("frame_period, tolerance", [
@@ -383,7 +483,8 @@ def test_an_unknown_frame_period_is_ambiguous_without_printing_nan():
     camera_ts_ns = np.round(_camera_clock(exposure) * 1e9).astype(np.int64)
 
     pairing = clocks.choose_pairing_by_camera_clock(ids, camera_ts_ns, _latches([exposure[0]]),
-                                                    transition_perf, float("nan"))
+                                                    transition_perf, float("nan"),
+                                                    ni_residual_rms=0.00002)
 
     assert pairing.ambiguous
     assert "frame period is unknown" in pairing.reason

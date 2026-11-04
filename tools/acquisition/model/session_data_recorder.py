@@ -2971,27 +2971,12 @@ class SessionDataRecorder:
 
     @staticmethod
     def _frames_in_spool(frames, transition_host, period):
-        """Mask of the latency frames that arrived while the spool held transitions.
-
-        The camera runs on before the NI task starts and after it stops; those
-        frames have no transition of their own, and each would pair with an
-        edge it does not belong to and count against the agreement of both
-        anchors. A frame arrives after its exposure edge, so one inside the
-        spool arrives no later than a period past the last transition (with no
-        period known, no later than the last).
-
-        The mask is built on arrival_perf for both pairings, although the
-        camera-clock pairing matches by camera timestamp. That field is always
-        present in CAMERA_FRAME_DTYPE and camera_base falls it back to the
-        frame's own host stamp, so only a frame with no arrival yet (-inf)
-        is left out of the latch pairing for want of one.
-        """
-        arrival = np.asarray(frames["arrival_perf"], dtype=np.float64)
-        last = float(transition_host[-1]) + (0.0 if period is None else float(period))
-        return np.isfinite(arrival) & (arrival >= transition_host[0]) & (arrival <= last)
+        """Mask of the latency frames that arrived while the spool held transitions."""
+        return clocks.frames_within_transitions(frames["arrival_perf"], transition_host, period)
 
     @staticmethod
-    def _latch_anchor(boundary, stream, stream_reason, transition_host, period):
+    def _latch_anchor(boundary, stream, stream_reason, transition_host, period, *,
+                      ni_residual_rms):
         """(evidence, the first recorded frame's transition number or None), by camera clock.
 
         The latency finalizer's pairing: each frame's camera timestamp, placed
@@ -3016,7 +3001,7 @@ class SessionDataRecorder:
             kept = SessionDataRecorder._frames_in_spool(frames, transition_host, period)
             pairing = clocks.choose_pairing_by_camera_clock(
                 frames["frame_id"][kept], frames["camera_ts_ns"][kept], latches, transition_host,
-                math.nan if period is None else float(period),
+                math.nan if period is None else float(period), ni_residual_rms=ni_residual_rms,
             )
             residual = float(pairing.median_residual)
             evidence = {
@@ -3045,7 +3030,8 @@ class SessionDataRecorder:
             return {"status": "failed", "reason": f"{type(error).__name__}: {error}"}, None
 
     @staticmethod
-    def _arrival_anchor(boundary, stream, stream_reason, transition_host, period):
+    def _arrival_anchor(boundary, stream, stream_reason, transition_host, period, *,
+                        ni_residual_rms):
         """(evidence, the first recorded frame's transition number or None), by host arrival.
 
         The latency finalizer's other pairing, which needs no camera clock: each
@@ -3066,7 +3052,7 @@ class SessionDataRecorder:
             kept = SessionDataRecorder._frames_in_spool(frames, transition_host, period)
             pairing = clocks.choose_pairing(
                 frames["frame_id"][kept], frames["arrival_perf"][kept], transition_host,
-                math.nan if period is None else float(period),
+                math.nan if period is None else float(period), ni_residual_rms=ni_residual_rms,
             )
             lag = float(pairing.median_lag)
             evidence = {
@@ -3249,9 +3235,11 @@ class SessionDataRecorder:
         )
         latch, latched = SessionDataRecorder._latch_anchor(
             boundary, latency_stream, stream_reason, transition_host, period,
+            ni_residual_rms=ni_fit.residual_rms,
         )
         arrival, arrived = SessionDataRecorder._arrival_anchor(
             boundary, latency_stream, stream_reason, transition_host, period,
+            ni_residual_rms=ni_fit.residual_rms,
         )
         if latched is not None:
             anchor, method = latched, "camera_latch"
