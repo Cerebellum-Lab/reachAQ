@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import statistics
 from typing import Optional, Tuple
 
 import numpy
@@ -22,8 +23,11 @@ MIN_FIT_POINTS = 100
 NI_MAX_RESIDUAL_SECONDS = 0.0005
 WALL_SEGMENT_JUMP_SECONDS = 0.001
 ENVELOPE_BINS = 20
-PAIRING_MARGIN_SECONDS = 0.0001
-PAIRING_MIN_AGREEMENT = 0.95
+# The chance, per check and per session, that a pairing check flags a session
+# whose pairing is sound. It sets every statistical limit on a pairing: the
+# arrival margin (coverage_factor() standard errors) and how long a run of
+# frames voting another shift must be to count as a slip (find_slip).
+FALSE_ALARM_PROBABILITY = 1e-6
 # NI-to-host is fitted window by window, joined at the knots, because the
 # host clock is slewed by NTP: timesyncd polls every 2048 s and the kernel
 # steps the rate by up to about 6.5 ppm, decaying over 512 s. Simulated on
@@ -657,14 +661,104 @@ class Pairing:
     """Transition number = frame id - shift."""
     median_lag: float
     agreement: float
+    """Share of frames voting the chosen shift: a diagnostic, not a gate."""
     ambiguous: bool
     reason: str = ""
     method: str = HOST_ARRIVAL
     median_residual: float = math.nan
     """Camera-clock method: transition minus expected host time, over the chosen shift."""
+    slip: Optional[dict] = None
+    """Where the votes change shift, as find_slip gives it; None when they do not."""
+    limit: float = math.nan
+    """What the verdict was judged against, in seconds: the arrival margin or the latch tolerance."""
 
 
-def choose_pairing(frame_ids, arrival_perf, transition_perf, frame_period: float) -> Pairing:
+def coverage_factor() -> float:
+    """How many standard errors a two-sided test must allow to false-alarm at
+    FALSE_ALARM_PROBABILITY: 4.89 at 1e-6. A Gaussian quantile on a robust
+    spread is an approximation, not a guarantee."""
+    return statistics.NormalDist().inv_cdf(1 - FALSE_ALARM_PROBABILITY / 2)
+
+
+def robust_spread(values) -> float:
+    """1.4826 times the median absolute deviation of the finite values: the
+    standard deviation of a Gaussian, which a few stray values cannot move.
+    0.0 with fewer than two values."""
+    values = numpy.asarray(values, dtype=numpy.float64)
+    values = values[numpy.isfinite(values)]
+    if values.size < 2:
+        return 0.0
+    return 1.4826 * float(numpy.median(numpy.abs(values - numpy.median(values))))
+
+
+def find_slip(frame_ids, votes, majority: int) -> Optional[dict]:
+    """Where the pairing changes shift, or None.
+
+    votes[i] is the shift frame_ids[i]'s own transition implies, in frame-id
+    order, and majority is the shift most of them name. A lost or spurious NI
+    transition renumbers every later frame by one, so every frame from there on
+    votes the same other shift: a long run. A stray vote is a run of one.
+    The stray rate is (non-majority votes + 1) / (n + 2), and the longest run L
+    of one non-majority shift is a slip when n * rate ** L, the number of runs
+    that long to expect among n votes at that rate, is under
+    FALSE_ALARM_PROBABILITY.
+
+    The record names the frame where the votes change: the first of the run,
+    or, when the run opens the session, the frame after it, which is the first
+    to vote the majority. frames is the run's length. Frame-id gaps are not
+    runs: a dropped frame had its exposure edge and still votes the same shift.
+    """
+    votes = numpy.asarray(votes, dtype=numpy.int64)
+    frame_ids = numpy.asarray(frame_ids, dtype=numpy.int64)
+    n = int(votes.size)
+    others = int(numpy.count_nonzero(votes != majority))
+    if not others:
+        return None
+    starts = numpy.concatenate(([0], numpy.flatnonzero(numpy.diff(votes)) + 1))
+    lengths = numpy.diff(numpy.append(starts, n))
+    longest = int(numpy.argmax(numpy.where(votes[starts] != majority, lengths, 0)))
+    start, length = int(starts[longest]), int(lengths[longest])
+    stray_rate = (others + 1) / (n + 2)
+    if not n * stray_rate ** length < FALSE_ALARM_PROBABILITY:
+        return None
+    shift = int(votes[start])
+    opens_session = start == 0 and length < n
+    return {
+        "frameId": int(frame_ids[start + length] if opens_session else frame_ids[start]),
+        "frames": length,
+        "fromShift": shift if opens_session else int(majority),
+        "toShift": int(majority) if opens_session else shift,
+    }
+
+
+def _slip_reason(slip: dict, majority: int) -> str:
+    stray = slip["toShift"] if slip["fromShift"] == majority else slip["fromShift"]
+    return (f"slip at frame {slip['frameId']}: {slip['frames']} frames vote shift {stray}, "
+            f"not {majority}")
+
+
+def frames_within_transitions(arrival_perf, transition_perf, frame_period) -> numpy.ndarray:
+    """Mask of the frames that arrived while the NI spool held transitions.
+
+    The camera runs on before the NI task starts and after it stops; those
+    frames have no transition of their own, and each would pair with an edge it
+    does not belong to, a stray vote in either pairing. A frame arrives after
+    its exposure edge, so one inside the spool arrives no later than a period
+    past the last transition (with no period known, no later than the last).
+
+    The mask is built on arrival_perf for both pairings, although the
+    camera-clock pairing matches by camera timestamp. That field is always
+    present in CAMERA_FRAME_DTYPE and camera_base falls it back to the
+    frame's own host stamp, so only a frame with no arrival yet (-inf)
+    is left out of the latch pairing for want of one.
+    """
+    arrival = numpy.asarray(arrival_perf, dtype=numpy.float64)
+    last = float(transition_perf[-1]) + (0.0 if frame_period is None else float(frame_period))
+    return numpy.isfinite(arrival) & (arrival >= transition_perf[0]) & (arrival <= last)
+
+
+def choose_pairing(frame_ids, arrival_perf, transition_perf, frame_period: float, *,
+                   ni_residual_rms: float) -> Pairing:
     """Which exposure transition belongs to which frame, decided by host time.
 
     A straight-line fit of camera time to NI time cannot tell the right pairing
@@ -678,6 +772,12 @@ def choose_pairing(frame_ids, arrival_perf, transition_perf, frame_period: float
     every frame is paired with an exposure whole periods after its own.
     choose_pairing_by_camera_clock needs no such assumption and is preferred
     when the camera stream has clock latches.
+
+    The margin is measured: coverage_factor() standard errors of the median
+    lag, which are the NI-to-host fit's residual (ni_residual_rms) and the
+    median's own error from the spread of the lags (1.2533, the square root
+    of pi/2, is a median's error over a mean's). A shift that changes partway
+    through (find_slip) is ambiguous too, and is reported where it changes.
     """
     frame_ids = numpy.asarray(frame_ids, dtype=numpy.int64)
     arrival = numpy.asarray(arrival_perf, dtype=numpy.float64)
@@ -690,28 +790,29 @@ def choose_pairing(frame_ids, arrival_perf, transition_perf, frame_period: float
     found = candidate >= 0
     if not found.any():
         return Pairing(0, math.nan, 0.0, True, "every frame arrived before the first transition")
-    shifts = ids[found] - candidate[found]
-    values, counts = numpy.unique(shifts, return_counts=True)
+    order = numpy.argsort(ids[found], kind="stable")
+    voters, votes = ids[found][order], (ids[found] - candidate[found])[order]
+    values, counts = numpy.unique(votes, return_counts=True)
     shift = int(values[numpy.argmax(counts)])
-    agreement = float(counts.max() / shifts.size)
+    agreement = float(counts.max() / votes.size)
     numbers = ids - shift
     inside = (numbers >= 0) & (numbers < transition_perf.size)
     lag = arrival[inside] - transition_perf[numbers[inside]]
     median_lag = float(numpy.median(lag)) if lag.size else math.nan
-    lag_ambiguous = not (PAIRING_MARGIN_SECONDS <= median_lag
-                         <= frame_period - PAIRING_MARGIN_SECONDS)
-    agreement_ambiguous = agreement < PAIRING_MIN_AGREEMENT
-    ambiguous = lag_ambiguous or agreement_ambiguous
+    margin = math.nan if not lag.size else coverage_factor() * math.hypot(
+        ni_residual_rms, 1.2533 * robust_spread(lag) / math.sqrt(lag.size))
+    lag_ambiguous = not (margin <= median_lag <= frame_period - margin)
+    slip = find_slip(voters, votes, shift)
+    problems = []
+    if slip is not None:
+        problems.append(_slip_reason(slip, shift))
     if lag_ambiguous:
-        reason = (
-            f"median arrival lag {median_lag * 1e3:.3f} ms is within "
-            f"{PAIRING_MARGIN_SECONDS * 1e3:.1f} ms of 0 or one frame period"
+        problems.append(
+            f"median arrival lag {median_lag * 1e3:.3f} ms is within the measured margin "
+            f"{margin * 1e3:.3f} ms of 0 or one frame period"
         )
-    elif agreement_ambiguous:
-        reason = f"agreement {agreement:.2f} below {PAIRING_MIN_AGREEMENT}"
-    else:
-        reason = ""
-    return Pairing(shift, median_lag, agreement, bool(ambiguous), reason)
+    return Pairing(shift, median_lag, agreement, bool(problems), "; ".join(problems),
+                   slip=slip, limit=margin)
 
 
 def usable_latches(latches) -> Tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray]:
@@ -768,7 +869,7 @@ def latch_window(fit: ClockFit, camera_seconds) -> numpy.ndarray:
 
 
 def choose_pairing_by_camera_clock(frame_ids, camera_ts_ns, latches, transition_perf,
-                                   frame_period: float) -> Pairing:
+                                   frame_period: float, *, ni_residual_rms: float) -> Pairing:
     """Which exposure transition belongs to which frame, decided by the camera's clock.
 
     The latches place camera time on host time, so a frame's camera timestamp
@@ -781,9 +882,11 @@ def choose_pairing_by_camera_clock(frame_ids, camera_ts_ns, latches, transition_
     host bias, plus the latch uncertainty. All of it must stay well under half a
     period for the nearest transition to be the right one, and a bias near a
     whole period would pair a frame off with a small residual, so a residual
-    over latch_tolerance() (a quarter period, at most 2 ms), or agreement below
-    PAIRING_MIN_AGREEMENT, marks the pairing ambiguous. The lag is not measured
-    here: median_lag is NaN.
+    over latch_tolerance() (a quarter period, at most 2 ms), or a shift that
+    changes partway through (find_slip), marks the pairing ambiguous. The lag
+    is not measured here: median_lag is NaN. The limit applied, the tolerance,
+    is in Pairing.limit. ni_residual_rms, the NI-to-host fit's residual, is
+    taken as choose_pairing takes it; this tolerance does not use it.
 
     The limit that sets: a Blackfly S stamps a frame at the end of its exposure
     and the NI edge marks its start, so the residual approaches minus the
@@ -806,30 +909,31 @@ def choose_pairing_by_camera_clock(frame_ids, camera_ts_ns, latches, transition_
     earlier = numpy.clip(later - 1, 0, transition_perf.size - 1)
     nearest = numpy.where(numpy.abs(transition_perf[later] - expected)
                           < numpy.abs(transition_perf[earlier] - expected), later, earlier)
-    shifts = ids - nearest
-    values, counts = numpy.unique(shifts, return_counts=True)
+    order = numpy.argsort(ids, kind="stable")
+    voters, votes = ids[order], (ids - nearest)[order]
+    values, counts = numpy.unique(votes, return_counts=True)
     shift = int(values[numpy.argmax(counts)])
-    agreement = float(counts.max() / shifts.size)
+    agreement = float(counts.max() / votes.size)
     numbers = ids - shift
     inside = (numbers >= 0) & (numbers < transition_perf.size)
     residual = transition_perf[numbers[inside]] - expected[inside]
     median_residual = float(numpy.median(residual)) if residual.size else math.nan
     tolerance = latch_tolerance(frame_period)
     residual_ambiguous = not abs(median_residual) <= tolerance
-    agreement_ambiguous = agreement < PAIRING_MIN_AGREEMENT
+    slip = find_slip(voters, votes, shift)
+    problems = []
+    if slip is not None:
+        problems.append(_slip_reason(slip, shift))
     if not math.isfinite(tolerance):
-        reason = "the frame period is unknown, so the residual cannot be judged"
+        problems.append("the frame period is unknown, so the residual cannot be judged")
     elif not math.isfinite(median_residual):
-        reason = "no frame of the chosen shift has a transition"
+        problems.append("no frame of the chosen shift has a transition")
     elif residual_ambiguous:
-        reason = (f"median residual {median_residual * 1e3:.3f} ms is over the latch "
-                  f"tolerance ({tolerance * 1e3:.3f} ms)")
-    elif agreement_ambiguous:
-        reason = f"agreement {agreement:.2f} below {PAIRING_MIN_AGREEMENT}"
-    else:
-        reason = ""
-    return Pairing(shift, math.nan, agreement, bool(residual_ambiguous or agreement_ambiguous),
-                   reason, method=CAMERA_LATCH, median_residual=median_residual)
+        problems.append(f"median residual {median_residual * 1e3:.3f} ms is over the latch "
+                        f"tolerance ({tolerance * 1e3:.3f} ms)")
+    return Pairing(shift, math.nan, agreement, bool(residual_ambiguous or slip is not None),
+                   "; ".join(problems), method=CAMERA_LATCH, median_residual=median_residual,
+                   slip=slip, limit=tolerance)
 
 
 def fit_camera_to_ni(frame_ids, camera_ts_ns, transition_index, sample_rate: float,

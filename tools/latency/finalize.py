@@ -378,10 +378,11 @@ class _Context:
             if clocks.usable_latches(latches)[0].size:
                 self.pairing = clocks.choose_pairing_by_camera_clock(
                     frames["frame_id"], frames["camera_ts_ns"], latches, transition_perf,
-                    self.frame_period)
+                    self.frame_period, ni_residual_rms=self.ni_to_host.residual_rms)
             else:
                 self.pairing = clocks.choose_pairing(frames["frame_id"], frames["arrival_perf"],
-                                                     transition_perf, self.frame_period)
+                                                     transition_perf, self.frame_period,
+                                                     ni_residual_rms=self.ni_to_host.residual_rms)
         except Exception as error:
             logger.exception("Latency camera pairing failed")
             self.camera_to_ni = clocks.invalid_fit(_describe(error))
