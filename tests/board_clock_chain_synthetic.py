@@ -36,6 +36,13 @@ def device_row(perf, kind, payload, boot, sequence, board_us, stamp_kind, event_
             "host_receive_perf_time", "host_timestamp")
 
 
+def rig_ni_endpoints(indices, rate=RATE):
+    """((NI seconds, host seconds) of the first sample, and of the last): what the recorder takes of the
+    per-sample host stamps of a rig whose host clock is NI seconds plus NI_HOST_OFFSET."""
+    first, last = float(indices[0]) / rate, float(indices[-1]) / rate
+    return (first, NI_HOST_OFFSET + first), (last, NI_HOST_OFFSET + last)
+
+
 def rig_ni_to_host():
     """The NI-to-host fit of a rig whose host clock is NI seconds plus NI_HOST_OFFSET."""
     return clocks.PiecewiseClockFit(

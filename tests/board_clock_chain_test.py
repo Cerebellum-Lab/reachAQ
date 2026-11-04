@@ -7,7 +7,7 @@ import pytest
 
 from board_clock_chain_synthetic import (
     IO_ADDRESS, IO_BOOT, PELLET_ADDRESS, PELLET_BOOT, RATE, barcode_line, clock_rig, linear_clock,
-    rig_ni_to_host, synthetic_rig, wandering_clock,
+    rig_ni_endpoints, rig_ni_to_host, synthetic_rig, wandering_clock,
 )
 from tools.acquisition.model import board_clock_chain as chain
 from tools.latency import clocks
@@ -76,16 +76,14 @@ def test_five_kilohertz_still_decodes():
     assert [frame.tick for frame in frames] == [0xA5A5A5A5]
 
 
-@pytest.mark.parametrize("ni_fit", [None, NI_TO_HOST], ids=["tick_cluster", "host_time"])
-def test_chain_composes_pellet_to_ni_and_tones_land_within_a_sample(ni_fit):
+@pytest.mark.parametrize("mode", ["host_time", "host_endpoints"])
+def test_chain_composes_pellet_to_ni_and_tones_land_within_a_sample(mode):
     rows, channels, indices = synthetic_rig()
 
-    record = chain.board_clock_chain(
-        rows, sample_indices=indices, sample_rate_hz=RATE, channels=channels, ni_to_host=ni_fit,
-    )
+    record = _chain(rows, channels, indices, **_reference(mode, indices))
 
     assert record["status"] == "fitted"
-    assert record["pairing"] == ("tick_cluster" if ni_fit is None else "host_time")
+    assert record["pairing"] == mode
     timekeeper = record["timekeeper"]
     assert (timekeeper["address"], timekeeper["bootId"]) == (IO_ADDRESS, IO_BOOT)
     assert timekeeper["barcodeFramesMatched"] == 29
@@ -120,10 +118,18 @@ def test_too_few_barcodes_leave_the_fit_invalid_and_json_safe():
     json.dumps(record, allow_nan=False)
 
 
-def _chain(rows, channels, indices, rate=RATE, ni_to_host=None):
+def _chain(rows, channels, indices, rate=RATE, ni_to_host=NI_TO_HOST, ni_host_endpoints=None):
     return chain.board_clock_chain(
-        rows, sample_indices=indices, sample_rate_hz=rate, channels=channels, ni_to_host=ni_to_host,
+        rows, sample_indices=indices, sample_rate_hz=rate, channels=channels,
+        ni_to_host=ni_to_host, ni_host_endpoints=ni_host_endpoints,
     )
+
+
+def _reference(mode, indices):
+    """The host reference a rig of this mode gives the chain: the session's fit, or only the recording's end points."""
+    if mode == "host_time":
+        return {"ni_to_host": NI_TO_HOST}
+    return {"ni_to_host": None, "ni_host_endpoints": rig_ni_endpoints(indices)}
 
 
 def _map_error(link_record, board_seconds, true_seconds):
@@ -138,18 +144,18 @@ PELLET_CLOCK = linear_clock(500.0, 0.99999)
 # -- Spec 9: ticks pair with boot_id, never alone ------------------------------------------------------
 
 
-@pytest.mark.parametrize("ni_fit", [None, NI_TO_HOST], ids=["tick_cluster", "host_time"])
-def test_a_timekeeper_reboot_is_fitted_from_the_larger_boot_and_the_other_is_listed(ni_fit):
+@pytest.mark.parametrize("mode", ["host_time", "host_endpoints"])
+def test_a_timekeeper_reboot_is_fitted_from_the_larger_boot_and_the_other_is_listed(mode):
     rows, channels, indices = clock_rig(
         io_eras=[(0xA, IO_CLOCK, 1, 100, 10.0), (0xB, linear_clock(-110.0, 1.00003), 1, 30, 113.0)],
         pellet_eras=[(PELLET_BOOT, PELLET_CLOCK, -20.0, 400.0)],
         ni_seconds=150.0, tones=[(60.30043, 5000), (130.30071, 5000)],
     )
 
-    record = _chain(rows, channels, indices, ni_to_host=ni_fit)
+    record = _chain(rows, channels, indices, **_reference(mode, indices))
 
     assert record["status"] == "fitted", record["reason"]
-    assert record["pairing"] == ("tick_cluster" if ni_fit is None else "host_time")
+    assert record["pairing"] == mode
     timekeeper = record["timekeeper"]
     assert (timekeeper["address"], timekeeper["bootId"]) == (IO_ADDRESS, 0xA)
     assert timekeeper["barcodeFramesMatched"] == 100  # not 130: boot B's frames repeat ticks 1-30
@@ -167,8 +173,8 @@ def test_a_timekeeper_reboot_is_fitted_from_the_larger_boot_and_the_other_is_lis
     json.dumps(record, allow_nan=False)
 
 
-@pytest.mark.parametrize("ni_fit", [None, NI_TO_HOST], ids=["tick_cluster", "host_time"])
-def test_a_timekeeper_boot_that_never_reached_the_nidaq_makes_no_board_and_spoils_nothing(ni_fit):
+@pytest.mark.parametrize("mode", ["host_time", "host_endpoints"])
+def test_a_timekeeper_boot_that_never_reached_the_nidaq_makes_no_board_and_spoils_nothing(mode):
     # Boot B plays ticks 1-30 after the recording ended: its reports and claps
     # are post-roll rows whose ticks repeat boot A's.
     rows, channels, indices = clock_rig(
@@ -177,7 +183,7 @@ def test_a_timekeeper_boot_that_never_reached_the_nidaq_makes_no_board_and_spoil
         ni_seconds=112.0, tones=[(60.30043, 5000), (114.30071, 5000)],
     )
 
-    record = _chain(rows, channels, indices, ni_to_host=ni_fit)
+    record = _chain(rows, channels, indices, **_reference(mode, indices))
 
     assert record["status"] == "fitted", record["reason"]
     assert record["timekeeper"]["bootId"] == 0xA
@@ -214,9 +220,10 @@ def test_a_pellet_reboot_gives_each_boot_its_own_board_entry():
 
 def test_claps_pair_only_within_half_a_second_of_host_time():
     rows, channels, indices = synthetic_rig(seconds=30)
-    # Received a minute away from the timekeeper's clap of the same tick, no pair is trustworthy.
+    # Received three seconds from the timekeeper's clap of the same tick, inside the recording's span
+    # but far outside the pairing window: no pair is trustworthy.
     moved = tuple(
-        row[:9] + (row[9] + 60.0,) + row[10:]
+        row[:9] + (row[9] + 3.0,) + row[10:]
         if row[3] == "SYNC_CLAP_OBSERVATION" and json.loads(row[8])["board_address"] == PELLET_ADDRESS else row
         for row in rows
     )
@@ -459,13 +466,14 @@ def test_every_record_has_the_same_top_level_keys():
     short_rows, short_channels, short_indices = synthetic_rig(seconds=2)
     records = [
         _chain(rows, channels, indices),
-        _chain(rows, channels, indices, ni_to_host=NI_TO_HOST),
+        _chain(rows, channels, indices, ni_to_host=None, ni_host_endpoints=rig_ni_endpoints(indices)),
         _chain(short_rows, short_channels, short_indices),
         _chain((), {}, np.arange(10)),
         _chain(rows, {}, indices),
         _chain(rows, channels, indices, rate=1000.0),
         _chain(rows, channels, indices, rate=None),
         chain.unavailable("because"),
+        _chain(rows, channels, indices, ni_to_host=None),
     ]
     assert len({tuple(sorted(record)) for record in records}) == 1
     assert records[3]["niTime"] is None and records[3]["timekeeper"] is None and records[3]["boards"] == []
@@ -547,21 +555,30 @@ def test_the_chain_does_not_copy_the_spool_index_or_the_lines_to_float64():
     assert peak < indices.size * 8 // 2, f"peak {peak} bytes for {indices.size} samples"
 
 
-# -- Spec 9, round 2: which boot a frame belongs to is told by host time, and a tie is not a pick -----------
+# -- Spec 9: a tick never pairs alone; host time ties a frame to its boot -------------------------------
 
 
-def test_an_older_timekeeper_boot_with_more_reports_does_not_win():
+def _drop_reports(rows, boot, ticks):
+    """The rows without the SYNC_BARCODE reports of `boot` for `ticks`: a lost CAN frame, which the firmware tolerates."""
+    return tuple(
+        row for row in rows
+        if not (row[3] == "SYNC_BARCODE_REPORT" and row[12] == boot and json.loads(row[8])["tick"] in ticks)
+    )
+
+
+@pytest.mark.parametrize("mode", ["host_time", "host_endpoints"])
+def test_an_older_timekeeper_boot_with_more_reports_does_not_win(mode):
     # Boot B ran before this session: 300 reports left in the rows, none of its barcodes on the line.
     tones = [(40.30043, 5000), (90.30071, 5000), (140.30011, 5000)]
     rows, channels, indices = clock_rig(
-        io_eras=[(0xB, linear_clock(5.0, 1.00003), 1, 300, -400.0), (0xA, IO_CLOCK, 1, 150, 10.0)],
+        io_eras=[(0xB, linear_clock(405.0, 1.00003), 1, 300, -400.0), (0xA, IO_CLOCK, 1, 150, 10.0)],
         pellet_eras=[(PELLET_BOOT, PELLET_CLOCK, -1000.0, 1000.0)], ni_seconds=170.0, tones=tones,
     )
 
-    record = _chain(rows, channels, indices, ni_to_host=NI_TO_HOST)
+    record = _chain(rows, channels, indices, **_reference(mode, indices))
 
     assert record["status"] == "fitted", record["reason"]
-    assert record["pairing"] == "host_time"
+    assert record["pairing"] == mode
     assert record["timekeeper"]["bootId"] == 0xA
     assert record["ignoredTimekeeperBoots"] == []  # boot B's rows are outside the recording's host span
     assert record["rowsOutsideNiSpan"] >= 300
@@ -571,14 +588,31 @@ def test_an_older_timekeeper_boot_with_more_reports_does_not_win():
         assert _map_error(board["toNi"], PELLET_CLOCK(true_s), true_s) == pytest.approx(0.0, abs=80e-6)
     assert board["toneCrossCheck"]["matched"] == 3 and board["toneCrossCheck"]["meetsTarget"] is True
 
-    # Without host time the two boots tie at 150 pairs, and report counts do not break a tie.
-    unknown = _chain(rows, channels, indices)
-    assert unknown["status"] == "unavailable" and "tie" in unknown["reason"]
-    assert unknown["timekeeper"] is None and unknown["boards"] == [] and unknown["pairing"] == "tick_cluster"
-    assert {entry["bootId"] for entry in unknown["ignoredTimekeeperBoots"]} == {0xA, 0xB}
+
+@pytest.mark.parametrize("mode", ["host_time", "host_endpoints"])
+def test_an_older_boot_does_not_win_by_a_frame_when_the_real_boot_lost_reports(mode):
+    # The firmware tolerates a lost tick. Boot A lost 3 of its 150 reports, so by tick alone boot B's 300
+    # reports pair 150 of A's frames to A's 147: B would win by three frames and be wrong by minutes.
+    tones = [(40.30043, 5000), (90.30071, 5000), (140.30011, 5000)]
+    rows, channels, indices = clock_rig(
+        io_eras=[(0xB, linear_clock(405.0, 1.00003), 1, 300, -400.0), (0xA, IO_CLOCK, 1, 150, 10.0)],
+        pellet_eras=[(PELLET_BOOT, PELLET_CLOCK, -1000.0, 1000.0)], ni_seconds=170.0, tones=tones,
+    )
+    lossy = _drop_reports(rows, 0xA, {20, 70, 120})
+
+    record = _chain(lossy, channels, indices, **_reference(mode, indices))
+
+    assert record["status"] == "fitted", record["reason"]
+    assert record["pairing"] == mode
+    assert record["timekeeper"]["bootId"] == 0xA and record["timekeeper"]["barcodeFramesMatched"] == 147
+    (board,) = record["boards"]
+    for true_s, _ in tones:
+        assert _map_error(board["toNi"], PELLET_CLOCK(true_s), true_s) == pytest.approx(0.0, abs=80e-6)
+    assert board["toneCrossCheck"]["matched"] == 3
 
 
-def test_host_time_rules_out_reports_of_a_boot_whose_barcodes_never_reached_the_line():
+@pytest.mark.parametrize("mode", ["host_time", "host_endpoints"])
+def test_host_time_rules_out_reports_of_a_boot_whose_barcodes_never_reached_the_line(mode):
     # Boot B's reports sit inside the recording's span, but its barcodes were not on the NI-DAQ line;
     # boot A's frames repeat its ticks a few minutes later.
     rows, channels, indices = clock_rig(
@@ -586,7 +620,7 @@ def test_host_time_rules_out_reports_of_a_boot_whose_barcodes_never_reached_the_
         pellet_eras=[(PELLET_BOOT, PELLET_CLOCK, -20.0, 600.0)], ni_seconds=380.0, tones=[(250.30043, 5000)],
     )
 
-    record = _chain(rows, channels, indices, ni_to_host=NI_TO_HOST)
+    record = _chain(rows, channels, indices, **_reference(mode, indices))
 
     assert record["status"] == "fitted", record["reason"]
     assert record["timekeeper"]["bootId"] == 0xA and record["timekeeper"]["barcodeFramesMatched"] == 150
@@ -597,11 +631,95 @@ def test_host_time_rules_out_reports_of_a_boot_whose_barcodes_never_reached_the_
     assert _map_error(board["toNi"], PELLET_CLOCK(250.30043), 250.30043) == pytest.approx(0.0, abs=80e-6)
     assert board["toneCrossCheck"]["matched"] == 1
 
-    unknown = _chain(rows, channels, indices)  # tick numbers alone cannot tell the boots apart
-    assert unknown["status"] == "unavailable" and "tie" in unknown["reason"]
+
+@pytest.mark.parametrize("mode", ["host_time", "host_endpoints"])
+def test_a_boot_inside_the_span_does_not_win_by_a_frame_when_the_real_boot_lost_reports(mode):
+    rows, channels, indices = clock_rig(
+        io_eras=[(0xB, linear_clock(5.0, 1.00003), 1, 150, 10.0, False), (0xA, IO_CLOCK, 1, 150, 200.0)],
+        pellet_eras=[(PELLET_BOOT, PELLET_CLOCK, -20.0, 600.0)], ni_seconds=380.0, tones=[(250.30043, 5000)],
+    )
+    lossy = _drop_reports(rows, 0xA, {20, 70, 120})
+
+    record = _chain(lossy, channels, indices, **_reference(mode, indices))
+
+    assert record["status"] == "fitted", record["reason"]
+    assert record["timekeeper"]["bootId"] == 0xA and record["timekeeper"]["barcodeFramesMatched"] == 147
+    assert record["ignoredTimekeeperBoots"] == [
+        {"address": IO_ADDRESS, "bootId": 0xB, "reports": 150, "framesPaired": 0},
+    ]
+    (board,) = record["boards"]
+    assert _map_error(board["toNi"], PELLET_CLOCK(250.30043), 250.30043) == pytest.approx(0.0, abs=80e-6)
 
 
-def test_two_timekeeper_boots_that_both_drove_the_line_equally_are_a_tie_not_a_pick():
+def test_without_a_host_reference_ticks_are_not_paired_at_all():
+    rows, channels, indices = clock_rig(
+        io_eras=[(0xB, linear_clock(405.0, 1.00003), 1, 300, -400.0), (0xA, IO_CLOCK, 1, 150, 10.0)],
+        pellet_eras=[(PELLET_BOOT, PELLET_CLOCK, -1000.0, 1000.0)], ni_seconds=170.0, tones=[(40.30043, 5000)],
+    )
+
+    for rows_ in (rows, _drop_reports(rows, 0xA, {20, 70, 120})):
+        record = _chain(rows_, channels, indices, ni_to_host=None)
+
+        assert record["status"] == "unavailable"
+        assert "without host time" in record["reason"] and "spec section 9" in record["reason"]
+        assert record["pairing"] is None and record["timekeeper"] is None and record["boards"] == []
+        json.dumps(record, allow_nan=False, sort_keys=True)
+
+
+@pytest.mark.parametrize("endpoints", [
+    ((0.0, 1000.0), (170.0, 1000.0 + 170.0 * 1.05)),       # slope 1.05
+    ((0.0, 1000.0), (170.0, 1000.0 + 170.0 * 0.95)),       # slope 0.95
+    ((0.0, 1000.0), (170.0, float("nan"))),                # not finite
+    ((0.0, float("inf")), (170.0, 1170.0)),
+    ((170.0, 1170.0), (0.0, 1000.0)),                      # the second is not later
+    ((0.0, 1000.0), (0.0, 1000.0)),                        # the same sample twice
+    ((0.0, 1000.0),),                                      # one point
+    (("a", "b"), ("c", "d")),                              # not numbers
+    42,
+], ids=["slope_up", "slope_down", "nan", "inf", "reversed", "same_point", "one_point", "text", "not_pairs"])
+def test_endpoints_that_fail_their_gate_are_no_reference(endpoints):
+    rows, channels, indices = clock_rig(
+        io_eras=[(IO_BOOT, IO_CLOCK, 1, 40, 10.0)],
+        pellet_eras=[(PELLET_BOOT, PELLET_CLOCK, -20.0, 400.0)], ni_seconds=60.0,
+    )
+
+    record = _chain(rows, channels, indices, ni_to_host=None, ni_host_endpoints=endpoints)
+
+    assert record["status"] == "unavailable" and "without host time" in record["reason"]
+    assert record["pairing"] is None
+
+
+def test_endpoints_a_second_off_pair_nothing_instead_of_pairing_wrongly():
+    rows, channels, indices = clock_rig(
+        io_eras=[(IO_BOOT, IO_CLOCK, 1, 40, 10.0)],
+        pellet_eras=[(PELLET_BOOT, PELLET_CLOCK, -20.0, 400.0)], ni_seconds=60.0,
+    )
+    second_off = ((0.0, 1002.0), (59.99, 1002.0 + 59.99))
+
+    record = _chain(rows, channels, indices, ni_to_host=None, ni_host_endpoints=second_off)
+
+    assert record["status"] == "unavailable" and "tick and host time" in record["reason"]
+    assert record["pairing"] == "host_endpoints" and record["boards"] == []
+
+
+def test_a_valid_fit_is_preferred_to_the_endpoints_and_an_invalid_one_gives_way_to_them():
+    rows, channels, indices = clock_rig(
+        io_eras=[(IO_BOOT, IO_CLOCK, 1, 40, 10.0)],
+        pellet_eras=[(PELLET_BOOT, PELLET_CLOCK, -20.0, 400.0)], ni_seconds=60.0,
+    )
+    endpoints = rig_ni_endpoints(indices)
+    invalid = clocks.invalid_piecewise_fit("NI sample rate unknown")
+    line = clocks.ClockFit(offset=1000.0, drift=1.0, residual_rms=0.0, points=100, valid=True)
+
+    assert _chain(rows, channels, indices, ni_to_host=NI_TO_HOST, ni_host_endpoints=endpoints)["pairing"] == "host_time"
+    assert _chain(rows, channels, indices, ni_to_host=line)["pairing"] == "host_time"
+    assert _chain(rows, channels, indices, ni_to_host=invalid, ni_host_endpoints=endpoints)["pairing"] == "host_endpoints"
+    assert _chain(rows, channels, indices, ni_to_host=None, ni_host_endpoints=endpoints)["pairing"] == "host_endpoints"
+    assert _chain(rows, channels, indices, ni_to_host=invalid)["status"] == "unavailable"
+
+
+@pytest.mark.parametrize("mode", ["host_time", "host_endpoints"])
+def test_two_timekeeper_boots_that_both_drove_the_line_equally_are_a_tie_not_a_pick(mode):
     # Both boots have 100 frames on the NI-DAQ line; boot B has 20 more reports, in post-roll.
     rows, channels, indices = clock_rig(
         io_eras=[(0xA, IO_CLOCK, 1, 100, 10.0), (0xB, linear_clock(-110.0, 1.00003), 1, 120, 113.0)],
@@ -609,23 +727,23 @@ def test_two_timekeeper_boots_that_both_drove_the_line_equally_are_a_tie_not_a_p
         ni_seconds=213.0, tones=[(60.30043, 5000), (160.30071, 5000)],
     )
 
-    for ni_fit in (NI_TO_HOST, None):
-        record = _chain(rows, channels, indices, ni_to_host=ni_fit)
+    record = _chain(rows, channels, indices, **_reference(mode, indices))
 
-        assert record["status"] == "unavailable" and "tie" in record["reason"]
-        assert record["timekeeper"] is None and record["boards"] == []
-        assert {entry["bootId"] for entry in record["ignoredTimekeeperBoots"]} == {0xA, 0xB}
-        json.dumps(record, allow_nan=False, sort_keys=True)
+    assert record["status"] == "unavailable" and "tie" in record["reason"]
+    assert record["pairing"] == mode
+    assert record["timekeeper"] is None and record["boards"] == []
+    assert {entry["bootId"] for entry in record["ignoredTimekeeperBoots"]} == {0xA, 0xB}
+    json.dumps(record, allow_nan=False, sort_keys=True)
 
 
-@pytest.mark.parametrize("ni_fit", [None, NI_TO_HOST], ids=["tick_cluster", "host_time"])
-def test_the_boot_with_more_frames_on_the_line_wins_with_or_without_host_time(ni_fit):
+@pytest.mark.parametrize("mode", ["host_time", "host_endpoints"])
+def test_the_boot_with_more_frames_on_the_line_wins(mode):
     rows, channels, indices = clock_rig(
         io_eras=[(0xA, IO_CLOCK, 1, 100, 10.0), (0xB, linear_clock(-110.0, 1.00003), 1, 80, 113.0)],
         pellet_eras=[(PELLET_BOOT, PELLET_CLOCK, -20.0, 400.0)], ni_seconds=213.0, tones=[(60.30043, 5000)],
     )
 
-    record = _chain(rows, channels, indices, ni_to_host=ni_fit)
+    record = _chain(rows, channels, indices, **_reference(mode, indices))
 
     assert record["status"] == "fitted", record["reason"]
     assert record["timekeeper"]["bootId"] == 0xA and record["timekeeper"]["barcodeFramesMatched"] == 100
@@ -634,7 +752,8 @@ def test_the_boot_with_more_frames_on_the_line_wins_with_or_without_host_time(ni
     assert _map_error(board["toNi"], PELLET_CLOCK(60.30043), 60.30043) == pytest.approx(0.0, abs=80e-6)
 
 
-def test_a_barcode_report_must_arrive_about_half_a_second_after_its_frame():
+@pytest.mark.parametrize("mode", ["host_time", "host_endpoints"])
+def test_a_barcode_report_must_arrive_about_half_a_second_after_its_frame(mode):
     rows, channels, indices = clock_rig(
         io_eras=[(IO_BOOT, IO_CLOCK, 1, 40, 10.0)],
         pellet_eras=[(PELLET_BOOT, PELLET_CLOCK, -20.0, 400.0)], ni_seconds=60.0,
@@ -645,28 +764,14 @@ def test_a_barcode_report_must_arrive_about_half_a_second_after_its_frame():
             row[:9] + (row[9] + seconds,) + row[10:] if row[3] == "SYNC_BARCODE_REPORT" else row for row in rows
         )
 
-    assert _chain(received_later(0.4), channels, indices, ni_to_host=NI_TO_HOST)["status"] == "fitted"
-    late = _chain(received_later(0.6), channels, indices, ni_to_host=NI_TO_HOST)
+    assert _chain(received_later(0.4), channels, indices, **_reference(mode, indices))["status"] == "fitted"
+    late = _chain(received_later(0.6), channels, indices, **_reference(mode, indices))
     assert late["status"] == "unavailable"
     assert "tick and host time" in late["reason"]
-    # The same rows, with no host time to check them against, pair by tick alone.
-    assert _chain(received_later(0.6), channels, indices)["status"] == "fitted"
 
 
-def test_a_host_fit_that_is_not_valid_falls_back_to_pairing_by_tick():
-    rows, channels, indices = clock_rig(
-        io_eras=[(IO_BOOT, IO_CLOCK, 1, 40, 10.0)],
-        pellet_eras=[(PELLET_BOOT, PELLET_CLOCK, -20.0, 400.0)], ni_seconds=60.0,
-    )
-    invalid = clocks.invalid_piecewise_fit("NI sample rate unknown")
-    line = clocks.ClockFit(offset=1000.0, drift=1.0, residual_rms=0.0, points=100, valid=True)
-
-    assert _chain(rows, channels, indices, ni_to_host=invalid)["pairing"] == "tick_cluster"
-    assert _chain(rows, channels, indices, ni_to_host=None)["pairing"] == "tick_cluster"
-    assert _chain(rows, channels, indices, ni_to_host=line)["pairing"] == "host_time"
-
-
-def test_rows_outside_the_nidaq_recordings_host_span_are_not_used():
+@pytest.mark.parametrize("mode", ["host_time", "host_endpoints"])
+def test_rows_outside_the_nidaq_recordings_host_span_are_not_used(mode):
     # A pellet boot that only an earlier session heard: its rows are in the ring, far from this recording.
     rows, channels, indices = clock_rig(
         io_eras=[(0xC, linear_clock(7.0, 1.00001), 1, 30, -2000.0), (IO_BOOT, IO_CLOCK, 1, 60, 10.0)],
@@ -674,16 +779,10 @@ def test_rows_outside_the_nidaq_recordings_host_span_are_not_used():
         ni_seconds=80.0, tones=[(30.30043, 5000)],
     )
 
-    record = _chain(rows, channels, indices, ni_to_host=NI_TO_HOST)
+    record = _chain(rows, channels, indices, **_reference(mode, indices))
 
     assert [board["bootId"] for board in record["boards"]] == [PELLET_BOOT]
     assert record["rowsOutsideNiSpan"] > 60 and record["ignoredTimekeeperBoots"] == []
-    # With no valid NI-to-host fit every row is kept, and the earlier session's pellet is listed, unpaired.
-    everything = _chain(rows, channels, indices)
-    assert {board["bootId"] for board in everything["boards"]} == {0x99, PELLET_BOOT}
-    assert everything["rowsOutsideNiSpan"] == 0
-    old = next(board for board in everything["boards"] if board["bootId"] == 0x99)
-    assert old["clapsMatched"] == 0 and not old["toNi"]["valid"]
 
 
 def test_a_report_just_outside_the_recording_is_still_inside_the_five_second_margin():
@@ -691,21 +790,21 @@ def test_a_report_just_outside_the_recording_is_still_inside_the_five_second_mar
         io_eras=[(IO_BOOT, IO_CLOCK, 1, 80, 10.0)],
         pellet_eras=[(PELLET_BOOT, PELLET_CLOCK, -20.0, 400.0)], ni_seconds=60.0, tones=[(62.30043, 5000)],
     )
-    record = _chain(rows, channels, indices, ni_to_host=NI_TO_HOST)
+    record = _chain(rows, channels, indices)
     # The tone 2 s after the NI-DAQ stopped is counted, apart, rather than dropped with the far rows.
     assert record["boards"][0]["toneCrossCheck"]["outsideRecording"] == 1
     assert record["rowsOutsideNiSpan"] > 0
 
 
-def test_claps_pair_on_host_receive_time_not_on_the_rows_perf_time():
+@pytest.mark.parametrize("mode", ["host_time", "host_endpoints"])
+def test_claps_pair_on_host_receive_time_not_on_the_rows_perf_time(mode):
     # An aligned board time can sit anywhere near the truth; the receive time (column 9) is what pairs.
     rows, channels, indices = clock_rig(
         io_eras=[(IO_BOOT, IO_CLOCK, 1, 40, 10.0)],
         pellet_eras=[(PELLET_BOOT, PELLET_CLOCK, -20.0, 400.0)], ni_seconds=60.0, pellet_event_skew=100.0,
     )
-    for ni_fit in (None, NI_TO_HOST):
-        (board,) = _chain(rows, channels, indices, ni_to_host=ni_fit)["boards"]
-        assert board["clapsMatched"] == 40 and board["toNi"]["valid"]
+    (board,) = _chain(rows, channels, indices, **_reference(mode, indices))["boards"]
+    assert board["clapsMatched"] == 40 and board["toNi"]["valid"]
 
 
 def test_invalid_links_carry_the_method_of_the_fit_that_made_them():

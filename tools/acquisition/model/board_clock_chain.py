@@ -135,7 +135,10 @@ NIDAQ_CHANNELS = (BARCODE_CHANNEL, "tone1", "tone2")
 TONE_CHANNEL_BY_FREQUENCY_HZ = {5000: "tone1", 6000: "tone2"}
 METHOD = "board_clap_and_nidaq_barcode"
 COMPOSED_METHOD = "piecewise_line_composed"
-PAIRING_HOST_TIME, PAIRING_TICK_CLUSTER = "host_time", "tick_cluster"
+PAIRING_HOST_TIME, PAIRING_HOST_ENDPOINTS = "host_time", "host_endpoints"
+#: The line through the NI recording's first and last host times is a reference only if its
+#: slope is within this of 1: the two clocks differ by tens of ppm, so anything else is a bad stamp.
+ENDPOINT_SLOPE_TOLERANCE = 0.01
 NI_TIME_NOTE = "NI sample index / sample rate (s); cameraNidaqAlignment.niToHost maps it to host perf time"
 #: Every edge of a kept frame is a fit point, and a frame has 2 to 34 of them.
 BARCODE_FIT_MIN_FRAMES = 10
@@ -156,18 +159,17 @@ BARCODE_REPORT_DELAY_SECONDS = 0.5
 #: delay after the frame's start edge, the NI time of the edge mapped to host
 #: time: the same tick a boot reports hours earlier or later is not the frame.
 BARCODE_REPORT_WINDOW_SECONDS = 0.5
-#: Without host time, frames paired to one boot's reports by tick agree on (NI
-#: seconds - board seconds) to within the clocks' drift, which is milliseconds an
-#: hour. A reset restarts the ticks, so frames of another boot that repeat a tick
-#: sit seconds or more away. Pairs chain into one cluster while neighbours are
-#: this close.
+#: Frames paired to one boot's reports agree on (NI seconds - board seconds) to
+#: within the clocks' drift, which is milliseconds an hour. A pair that does not
+#: (a mistimed stamp, a repeated tick that slipped through) sits seconds or more
+#: away. Pairs chain into one cluster while neighbours are this close.
 PAIRING_CLUSTER_SECONDS = 0.5
 #: An observer's clap and the timekeeper's own clap of the same tick are one
 #: event only if the host received them this close together (row column 9).
 CLAP_HOST_WINDOW_SECONDS = 0.5
 #: The device-row ring holds 100 000 rows and is not cleared between sessions,
-#: so older sessions' rows are in it. With a valid NI-to-host fit a row counts
-#: only if the host received it within the NI recording's host span widened by this.
+#: so older sessions' rows are in it. A row counts only if the host received it
+#: within the NI recording's host span widened by this.
 NI_SPAN_MARGIN_SECONDS = 5.0
 TONE_MATCH_WINDOW_SECONDS = 0.005
 #: The spec's end-to-end acceptance: |error| 95th percentile under 0.1 ms over at least 100 tones.
@@ -270,9 +272,7 @@ def _stamped(envelopes, stamp_kind):
 
 
 def _within(envelopes, span):
-    """The envelopes the host received inside `span` (all of them when there is none), and how many were not."""
-    if span is None:
-        return envelopes, 0
+    """The envelopes the host received inside `span`, and how many were not."""
     inside = tuple(
         envelope for envelope in envelopes if envelope.host_perf is not None and span[0] <= envelope.host_perf <= span[1]
     )
@@ -289,6 +289,40 @@ def _host_span(ni_to_host, indices, rate):
     if ends.shape != (2,) or not numpy.isfinite(ends).all():
         return None
     return float(ends[0]) - NI_SPAN_MARGIN_SECONDS, float(ends[1]) + NI_SPAN_MARGIN_SECONDS
+
+
+def _endpoint_line(endpoints):
+    """A line from NI seconds to host seconds through two (NI seconds, host seconds) points, or None.
+
+    None unless both points are finite, the second is later in NI time, and the
+    slope is within ENDPOINT_SLOPE_TOLERANCE of 1. A failed gate is no reference.
+    """
+    try:
+        (ni0, host0), (ni1, host1) = ((float(ni), float(host)) for ni, host in endpoints)
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(value) for value in (ni0, host0, ni1, host1)) or not ni1 > ni0:
+        return None
+    drift = (host1 - host0) / (ni1 - ni0)
+    if not abs(drift - 1.0) <= ENDPOINT_SLOPE_TOLERANCE:
+        return None
+    return clocks.ClockFit(
+        offset=host0 - drift * ni0, drift=drift, residual_rms=math.nan, points=2, valid=True, x_min=ni0, x_max=ni1,
+    )
+
+
+def _host_reference(ni_to_host, ni_host_endpoints, indices, rate):
+    """(NI-to-host map, which reference it is, the recording's host span widened by the margin), or None.
+
+    The session's NI-to-host fit when it is valid, else the line through the
+    recording's first and last host times. Either must put both ends of the
+    recording at finite host times.
+    """
+    for fit, label in ((ni_to_host, PAIRING_HOST_TIME), (_endpoint_line(ni_host_endpoints), PAIRING_HOST_ENDPOINTS)):
+        span = _host_span(fit, indices, rate)
+        if span is not None:
+            return fit, label, span
+    return None
 
 
 def has_barcode_reports(device_rows) -> bool:
@@ -317,18 +351,18 @@ def _consistent_frames(pairs, indices, rate):
 
 
 def _pair_frames(frames, ticks, frame_host):
-    """One boot's (frame, report) pairs: the same tick and, when the frames' host times are known, a report
-    the host received BARCODE_REPORT_DELAY_SECONDS (plus or minus the window) after the frame's start edge."""
+    """One boot's (frame, report) pairs: the same tick, and a report the host received
+    BARCODE_REPORT_DELAY_SECONDS (plus or minus the window) after the frame's start edge.
+
+    A tick never pairs alone: a boot that repeats it hours earlier or later reported it at another host time.
+    """
     pairs = []
     for position, frame in enumerate(frames):
         report = ticks.get(frame.tick)
-        if report is None:
+        if report is None or report.host_perf is None:
             continue
-        if frame_host is not None:
-            if report.host_perf is None or not abs(report.host_perf - frame_host[position] - BARCODE_REPORT_DELAY_SECONDS) \
-                    <= BARCODE_REPORT_WINDOW_SECONDS:
-                continue
-        pairs.append((frame, report))
+        if abs(report.host_perf - frame_host[position] - BARCODE_REPORT_DELAY_SECONDS) <= BARCODE_REPORT_WINDOW_SECONDS:
+            pairs.append((frame, report))
     return pairs
 
 
@@ -433,14 +467,13 @@ def _tone_cross_check(tones, link, indices, rate, channels) -> dict:
     return summary
 
 
-def _timekeeper_link(frames, chosen, by_host, indices, rate):
+def _timekeeper_link(frames, chosen, indices, rate):
     """Timekeeper boot seconds -> NI seconds from every edge of the kept frames, or why not."""
     if not frames:
         return clocks.invalid_piecewise_line_fit("no barcode frames decoded (is the barcode line wired?)")
     if not chosen.paired:
         return clocks.invalid_piecewise_line_fit(
-            f"{len(frames)} barcode frames decoded, none matches a SYNC_BARCODE report of the same tick"
-            + (" and host time" if by_host else ""),
+            f"{len(frames)} barcode frames decoded, none matches a SYNC_BARCODE report of the same tick and host time",
         )
     if len(chosen.kept) < BARCODE_FIT_MIN_FRAMES:
         return clocks.invalid_piecewise_line_fit(
@@ -460,7 +493,9 @@ def _timekeeper_link(frames, chosen, by_host, indices, rate):
     )
 
 
-def board_clock_chain(device_rows, *, sample_indices, sample_rate_hz, channels, ni_to_host=None) -> dict:
+def board_clock_chain(
+    device_rows, *, sample_indices, sample_rate_hz, channels, ni_to_host=None, ni_host_endpoints=None,
+) -> dict:
     """Fit every clapping board's time to NI seconds through the timekeeper.
 
     NI seconds are NI sample index / sample rate; cameraNidaqAlignment.niToHost
@@ -468,13 +503,16 @@ def board_clock_chain(device_rows, *, sample_indices, sample_rate_hz, channels, 
     segment per KNOT_SECONDS, so a drifting crystal does not fail a link.
 
     Ticks pair with their boot, never alone (spec section 9): a timekeeper reset
-    restarts the tick numbering, and an NI frame carries only a tick. `ni_to_host`,
-    the session's NI-to-host fit (anything with `valid` and `map`), supplies what
-    ties a frame to its boot: the host time at which it was played. A report pairs
-    with a frame by tick and by being received about half a second after the
-    frame's start edge, and only rows received within the NI recording's host span
-    count. Without a valid fit the pairing falls back to ticks that agree on NI
-    minus board time, and a tie in either mode is `unavailable`, never a pick.
+    restarts the tick numbering, and an NI frame carries only a tick. What ties a
+    frame to its boot is the host time at which it was played, so the chain needs
+    a host reference for the NI recording: `ni_to_host`, the session's NI-to-host
+    fit (anything with `valid` and `map`), or failing that `ni_host_endpoints`,
+    ((NI seconds, host seconds), (NI seconds, host seconds)) of the recording's
+    first and last samples, taken as a line when its slope is within 1 % of 1. A
+    report pairs with a frame by tick and by being received about half a second
+    after the frame's start edge, and only rows received within the NI
+    recording's host span count. With neither reference the chain is
+    `unavailable`; so is a tie between boots (or inside one), never a pick.
     """
     barcode_rows = _envelopes(device_rows, _KIND_BARCODE)
     reports, wrong_stamp = _stamped(barcode_rows, _STAMP_START_EDGE)
@@ -503,10 +541,14 @@ def board_clock_chain(device_rows, *, sample_indices, sample_rate_hz, channels, 
             rejected=rejected,
         )
 
+    reference = _host_reference(ni_to_host, ni_host_endpoints, indices, rate)
+    if reference is None:
+        return unavailable(
+            "ticks cannot be tied to a timekeeper boot without host time (spec section 9): the session has no "
+            "valid NI-to-host fit and no usable first and last NI sample host times", rejected=rejected,
+        )
+    host_map, pairing, span = reference
     # Rows the host received outside the recording (earlier sessions', left in the ring) are not evidence.
-    span = _host_span(ni_to_host, indices, rate)
-    by_host = span is not None
-    pairing = PAIRING_HOST_TIME if by_host else PAIRING_TICK_CLUSTER
     barcode_rows, outside = _within(barcode_rows, span)
     claps, outside_claps = _within(_envelopes(device_rows, _KIND_CLAP), span)
     tones, outside_tones = _within(_envelopes(device_rows, _KIND_TONE), span)
@@ -529,14 +571,10 @@ def board_clock_chain(device_rows, *, sample_indices, sample_rate_hz, channels, 
     if not ticks_by_boot:
         return unavailable("SYNC_BARCODE reports carry no tick", rejected=rejected, pairing=pairing, outside=outside)
 
-    # Per timekeeper boot: the frames whose tick it reported (and, with host time, that it reported when the
-    # frame was played), and of those the largest set that agree on NI seconds minus board seconds.
-    frame_host = None
-    if by_host:
-        starts = numpy.fromiter((frame.start_position for frame in frames), dtype=numpy.int64, count=len(frames))
-        frame_host = numpy.asarray(
-            ni_to_host.map(indices[starts].astype(numpy.float64) / rate), dtype=numpy.float64,
-        )
+    # Per timekeeper boot: the frames whose tick it reported when the frame was played, and of those the
+    # largest set that agree on NI seconds minus board seconds.
+    starts = numpy.fromiter((frame.start_position for frame in frames), dtype=numpy.int64, count=len(frames))
+    frame_host = numpy.asarray(host_map.map(indices[starts].astype(numpy.float64) / rate), dtype=numpy.float64)
     candidates = []
     for key, ticks in ticks_by_boot.items():
         pairs = _pair_frames(frames, ticks, frame_host)
@@ -552,7 +590,7 @@ def board_clock_chain(device_rows, *, sample_indices, sample_rate_hz, channels, 
     best = max(len(candidate.kept) for candidate in candidates)
     leaders = [candidate for candidate in candidates if len(candidate.kept) == best]
     if best and (len(leaders) > 1 or leaders[0].tied):
-        how = "by tick and host time" if by_host else "by tick (there is no valid NI-to-host fit to check host time)"
+        how = "by tick and host time"
         if len(leaders) > 1:
             names = " and ".join(f"{leader.key[1]:#x}" for leader in leaders)
             why = (f"tie between timekeeper boots {names}: each pairs {best} barcode frames with its reports {how}, "
@@ -569,7 +607,7 @@ def board_clock_chain(device_rows, *, sample_indices, sample_rate_hz, channels, 
     ignored = [listed(candidate) for candidate in candidates if candidate is not chosen]
     (address, boot_id) = chosen.key
 
-    to_ni = _timekeeper_link(frames, chosen, by_host, indices, rate)
+    to_ni = _timekeeper_link(frames, chosen, indices, rate)
     timekeeper = {
         "address": address, "bootId": int(boot_id), "reports": len(chosen.ticks),
         "barcodeFramesDecoded": len(frames), "barcodeFramesRejected": int(rejected_frames),
