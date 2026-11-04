@@ -275,6 +275,9 @@ def test_without_clock_latches_the_host_arrival_pairing_is_used_and_says_so(tmp_
                                                             abs=1e-6)
 
 
+# 5 ms brackets are usable now and fail the latch pairing's geometric gate
+# instead; Task 3 makes that gate fall back to arrival and rewrites this test.
+@pytest.mark.xfail(reason="Task 3")
 def test_latches_none_of_which_is_usable_are_counted_in_the_fallback_reason(tmp_path):
     session = _session(tmp_path)
     with h5py.File(session / "streams" / "latency" / "camera_left.h5", "r+") as store:

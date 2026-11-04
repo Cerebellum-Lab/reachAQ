@@ -218,9 +218,9 @@ def test_the_ledger_and_the_latency_stream_describe_the_recorded_frames(tmp_path
     with h5py.File(path, "r") as store:
         frames, latches = store["frames"][()], store["clock_latches"][()]
     assert frames["frame_id"].tolist() == list(range(FIRST_ID + n0, FIRST_ID + n0 + 10))
-    camera, host, _ = clocks.usable_latches(latches)
+    camera, host, _ = clocks.usable_latches(latches, clock="perf")
     assert camera.size == 6
-    fit = clocks.fit_latches(latches)
+    fit = clocks.fit_latches(latches, clock="perf")
     assert fit.valid and fit.map(camera[0]) == pytest.approx(host[0], abs=1e-9)
     assert rig.edge_time(n0 + 1) - rig.edge_time(n0) == pytest.approx(PERIOD)
 
@@ -279,7 +279,7 @@ def test_each_latch_brackets_the_host_time_of_the_camera_clock_reading(tmp_path,
     assert np.isnan(latches["raw_before"]).all() and np.isnan(latches["raw_after"]).all()
     # Three latches 1 ms after the first frame's exposure start, three after the last's.
     when = np.repeat([float(rig.edge_time(n0)) + 0.001, float(rig.edge_time(n0 + 9)) + 0.001], 3)
-    camera, host, uncertainty = clocks.usable_latches(latches)
+    camera, host, uncertainty = clocks.usable_latches(latches, clock="perf")
     assert np.allclose(camera, when + CAMERA_OFFSET, rtol=0, atol=1e-9)
     # The bracket is centred on the host time of that instant, slew included, and 0.2 ms wide.
     assert np.allclose(host, rig.host(when), rtol=0, atol=1e-9)
@@ -289,7 +289,7 @@ def test_each_latch_brackets_the_host_time_of_the_camera_clock_reading(tmp_path,
     assert (latches["perf_before"] < latches["perf_after"]).all()
     # Placed on the host through the latches, each frame's exposure end lands on its own host
     # time to within the drift across the 60 ms the stream spans (0.6 us).
-    fit = clocks.fit_latches(latches)
+    fit = clocks.fit_latches(latches, clock="perf")
     placed = fit.map(frames["camera_ts_ns"] / 1e9)
     assert np.allclose(placed, rig.host(rig.edge_time(np.arange(n0, n0 + 10)) + EXPOSURE),
                        rtol=0, atol=2e-6)
@@ -303,7 +303,7 @@ def test_a_stream_written_without_latches_has_an_empty_latch_table(tmp_path, pro
         latches = store["clock_latches"][()]
         assert store["frames"].shape == (10,)
     assert latches.shape == (0,) and latches.dtype == CLOCK_LATCH_DTYPE
-    assert not clocks.fit_latches(latches).valid
+    assert not clocks.fit_latches(latches, clock="perf").valid
 
 
 def test_the_snapshot_describes_the_spool_the_recorder_would_have_taken(tmp_path):

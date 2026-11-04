@@ -15,6 +15,8 @@ from __future__ import annotations
 import dataclasses
 import math
 import statistics
+import time
+from fractions import Fraction
 from typing import Optional, Tuple
 
 import numpy
@@ -56,10 +58,10 @@ BRIDGE_TAIL_SECONDS = 5.0
 BRIDGE_MIN_RAW_COVERAGE = 0.9
 # A camera clock latch is one USB round trip: christielab10's BFS-U3-16S2M
 # brackets it in 0.14-0.58 ms inside the running app (60 latches, median
-# 0.27 ms) and in about 0.20 ms with the app closed. 2 ms admits several times
-# that on a busy bus while keeping the latch's own uncertainty, half the
-# bracket, under a quarter of a 150 fps frame period (1.67 ms).
-LATCH_MAX_BRACKET_SECONDS = 0.002
+# 0.27 ms) and in about 0.20 ms with the app closed; the widest in the
+# 2026-11-03 sweep was 1.78 ms. No width is refused: fit_latches fits through
+# the brackets themselves and says how far its map could be wrong, and
+# latch_gate_ok judges that against the frame period.
 # Latches further apart than this are fitted with a line, which takes up the
 # camera oscillator's drift; closer ones give an offset only, trusted for
 # frames within LATCH_WINDOW_SECONDS (20 ppm over 30 s is 0.6 ms).
@@ -89,6 +91,13 @@ class ClockFit:
     reason: str = ""
     x_min: float = math.nan
     x_max: float = math.nan
+    clock: str = "perf"
+    """A latch map's host clock: "perf" or "raw"."""
+    uncertainty: float = math.nan
+    """A latch map's bound, in seconds over x_min..x_max, on how far any straight
+    map through its latches' brackets is from it."""
+    dropped: tuple = ()
+    """Latch rows a latch map left out: no line through the others' brackets passes theirs."""
 
     def map(self, x):
         return self.offset + self.drift * numpy.asarray(x, dtype=numpy.float64)
@@ -671,6 +680,8 @@ class Pairing:
     """Where the votes change shift, as find_slip gives it; None when they do not."""
     limit: float = math.nan
     """What the verdict was judged against, in seconds: the arrival margin or the latch tolerance."""
+    clock: str = "perf"
+    """The host clock the frames and transitions were compared on: "perf" or "raw"."""
 
 
 def coverage_factor() -> float:
@@ -815,43 +826,187 @@ def choose_pairing(frame_ids, arrival_perf, transition_perf, frame_period: float
                    slip=slip, limit=margin)
 
 
-def usable_latches(latches) -> Tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray]:
-    """(camera seconds, host perf, uncertainty) of each clock latch worth using.
+_LATCH_BRACKETS = {"perf": ("perf_before", "perf_after"), "raw": ("raw_before", "raw_after")}
 
-    The latch happened somewhere inside its perf bracket, so the midpoint is its
-    host time and half the width its uncertainty. A bracket that is not finite
-    or wider than LATCH_MAX_BRACKET_SECONDS is left out.
-    """
-    if latches is None or len(latches) == 0:
-        return numpy.empty(0), numpy.empty(0), numpy.empty(0)
-    before = numpy.asarray(latches["perf_before"], dtype=numpy.float64)
-    after = numpy.asarray(latches["perf_after"], dtype=numpy.float64)
-    camera = numpy.asarray(latches["camera_ns"], dtype=numpy.float64) / 1e9
+
+def _latch_brackets(latches, clock: str):
+    """(row numbers, camera ns, bracket start, bracket end) of the latches whose
+    bracket on clock is finite and does not end before it starts. A latch table
+    without that clock's pair of fields has none."""
+    fields = _LATCH_BRACKETS.get(clock)
+    names = getattr(getattr(latches, "dtype", None), "names", None) or ()
+    if latches is None or fields is None or not set(fields) <= set(names) or len(latches) == 0:
+        return (numpy.empty(0, dtype=numpy.int64), numpy.empty(0, dtype=numpy.int64),
+                numpy.empty(0), numpy.empty(0))
+    before = numpy.asarray(latches[fields[0]], dtype=numpy.float64)
+    after = numpy.asarray(latches[fields[1]], dtype=numpy.float64)
     width = after - before
-    keep = numpy.isfinite(width) & (width >= 0) & (width <= LATCH_MAX_BRACKET_SECONDS)
-    return camera[keep], ((before + after) / 2)[keep], (width / 2)[keep]
+    rows = numpy.flatnonzero(numpy.isfinite(width) & (width >= 0))
+    camera_ns = numpy.asarray(latches["camera_ns"], dtype=numpy.int64)
+    return rows, camera_ns[rows], before[rows], after[rows]
 
 
-def fit_latches(latches) -> ClockFit:
-    """Camera timestamp (s) -> host perf_counter, from the camera clock latches.
+def usable_latches(latches, *, clock: str) -> Tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray]:
+    """(camera seconds, host time, half the bracket) of each clock latch on clock.
 
-    Latches more than LATCH_DRIFT_SPAN_SECONDS apart are fitted with a line,
-    which takes up the camera's drift. Closer together they cannot measure it,
-    and the tightest one's offset is used alone; its uncertainty stands in for
-    the residual. Either way, x_min and x_max are the latched span, and only
-    timestamps latch_window() admits should be mapped.
+    clock is "perf" (perf_before, perf_after) or "raw" (raw_before, raw_after).
+    The latch happened somewhere inside its bracket, so the midpoint is its
+    host time and half the width its uncertainty. Only the physical checks
+    apply: a bracket that is not finite, or ends before it starts, is left out.
+    Rows with the RAW pair NaN, or a table without it (older streams), have no
+    RAW latch.
     """
-    camera, host, uncertainty = usable_latches(latches)
-    if camera.size == 0:
-        rows = 0 if latches is None else len(latches)
-        return invalid_fit(f"no usable clock latch: {rows} rows, none with a finite bracket "
-                           f"within {LATCH_MAX_BRACKET_SECONDS * 1e3:.1f} ms")
-    if camera.max() - camera.min() > LATCH_DRIFT_SPAN_SECONDS:
-        return fit_line(camera, host, max_residual=LATCH_MAX_BRACKET_SECONDS, min_points=2)
-    tightest = int(numpy.argmin(uncertainty))
-    return ClockFit(offset=float(host[tightest] - camera[tightest]), drift=1.0,
-                    residual_rms=float(uncertainty[tightest]), points=1, valid=True,
-                    x_min=float(camera[tightest]), x_max=float(camera[tightest]))
+    _, camera_ns, before, after = _latch_brackets(latches, clock)
+    return camera_ns / 1e9, (before + after) / 2, (after - before) / 2
+
+
+def fit_latches(latches, *, clock: str) -> ClockFit:
+    """Camera timestamp (s) -> host time on clock ("perf" or "raw"), from the camera clock latches.
+
+    A latch says the camera clock read camera_ns somewhere inside the latch's
+    host bracket, which is widened by the host clock's resolution
+    (time.get_clock_info, measured) so that a zero-width bracket still holds
+    it. A straight map must pass through every bracket, and no other test is
+    applied. When no line passes through them all, the largest set of latches
+    one line passes through is kept (ties: the narrower brackets), and each
+    latch left out is in dropped and named in the reason. The set is found
+    exactly, by trying every line through two bracket ends
+    (_largest_consistent_set).
+
+    Kept latches more than LATCH_DRIFT_SPAN_SECONDS apart give a line, which
+    takes up the camera's drift. The lines through all their brackets range,
+    at each camera time, between a highest and a lowest; the fit runs through
+    the middle of that range at the first and the last latch, and uncertainty
+    is half the range where it is widest. The range's width is convex in time,
+    so it is widest at one end, and every straight map through the brackets
+    lies within uncertainty of the fit between x_min and x_max. Kept latches closer
+    together cannot measure drift: the tightest one's offset is used alone,
+    with its half-bracket (widened as above) as uncertainty and the bare half-
+    bracket standing in for the residual. residual_rms is otherwise the rms of
+    the kept latches' midpoints about the line, a diagnostic that caps nothing.
+    Either way x_min and x_max are the latched span, and only timestamps
+    latch_window() admits should be mapped. valid needs one usable latch.
+    """
+    if clock not in _LATCH_BRACKETS:
+        return dataclasses.replace(invalid_fit(f"unknown clock {clock!r}, not perf or raw"),
+                                   clock=str(clock))
+    rows, camera_ns, before, after = _latch_brackets(latches, clock)
+    if not rows.size:
+        return dataclasses.replace(invalid_fit(_no_latch_reason(latches, clock)), clock=clock)
+    resolution = Fraction(time.get_clock_info("perf_counter").resolution)
+    x = [Fraction(int(value), 1_000_000_000) for value in camera_ns]
+    low = [Fraction(float(value)) - resolution for value in before]
+    high = [Fraction(float(value)) + resolution for value in after]
+    kept, lines = _largest_consistent_set(x, low, high)
+    inside = [k for k in range(len(x)) if kept[k]]
+    dropped = tuple(int(rows[k]) for k in range(len(x)) if not kept[k])
+    reason = _dropped_reason(dropped, len(inside))
+    first, last = min(x[k] for k in inside), max(x[k] for k in inside)
+    if not last - first > LATCH_DRIFT_SPAN_SECONDS:
+        tightest = min(inside, key=lambda k: high[k] - low[k])
+        camera = float(camera_ns[tightest] / 1e9)
+        return ClockFit(offset=float((before[tightest] + after[tightest]) / 2 - camera), drift=1.0,
+                        residual_rms=float((after[tightest] - before[tightest]) / 2), points=1,
+                        valid=True, reason=reason, x_min=camera, x_max=camera, clock=clock,
+                        uncertainty=float((high[tightest] - low[tightest]) / 2), dropped=dropped)
+    at_first = [value + slope * (first - start) for start, value, slope in lines]
+    at_last = [value + slope * (last - start) for start, value, slope in lines]
+    middle_first = (max(at_first) + min(at_first)) / 2
+    middle_last = (max(at_last) + min(at_last)) / 2
+    drift = (middle_last - middle_first) / (last - first)
+    residual = [float((Fraction(float(before[k])) + Fraction(float(after[k]))) / 2
+                      - middle_first - drift * (x[k] - first)) for k in inside]
+    return ClockFit(
+        offset=float(middle_first - drift * first),
+        drift=float(drift),
+        residual_rms=math.sqrt(sum(value * value for value in residual) / len(residual)),
+        points=len(inside),
+        valid=True,
+        reason=reason,
+        x_min=float(first),
+        x_max=float(last),
+        clock=clock,
+        uncertainty=float(max(max(at_first) - min(at_first), max(at_last) - min(at_last)) / 2),
+        dropped=dropped,
+    )
+
+
+def _largest_consistent_set(x, low, high):
+    """(which intervals one line passes through together, the lines found through exactly those).
+
+    x, low and high are Fractions: interval k is [low[k], high[k]] at x[k].
+    Each line is (x0, value at x0, slope). Exact, in O(n^3): the lines (an
+    offset and a slope) through every interval of a set form a convex polygon,
+    bounded once two of the intervals are at different x, and each corner of
+    it lies on the boundaries of two intervals at different x, which is a line
+    through an end of each. So of the lines through two interval ends at
+    different x, the one through the most intervals finds the largest set any
+    line passes through, and those through exactly that set include every
+    corner of its polygon, where a line's value at any x is highest and
+    lowest. Ties go to the set whose intervals are narrower in sum. With every
+    interval at one x there is no such line, and an interval end inside the
+    most intervals stands in for one, of slope 0.
+    """
+    count = len(x)
+    width = [high[k] - low[k] for k in range(count)]
+    lines = []
+    for i in range(count):
+        offsets = [x[k] - x[i] for k in range(count)]
+        for j in range(i + 1, count):
+            if not offsets[j]:
+                continue
+            for start in (low[i], high[i]):
+                for end in (low[j], high[j]):
+                    slope = (end - start) / offsets[j]
+                    passes = tuple(low[k] <= start + slope * offsets[k] <= high[k]
+                                   for k in range(count))
+                    lines.append(((x[i], start, slope), passes))
+    if not lines:
+        for value in low + high:
+            lines.append(((x[0], value, Fraction(0)),
+                          tuple(low[k] <= value <= high[k] for k in range(count))))
+    _, best = max(lines, key=lambda line: (sum(line[1]),
+                                           -sum(w for w, on in zip(width, line[1]) if on)))
+    return best, [line for line, passes in lines if passes == best]
+
+
+def _no_latch_reason(latches, clock: str) -> str:
+    rows = 0 if latches is None else len(latches)
+    names = getattr(getattr(latches, "dtype", None), "names", None) or ()
+    before, after = _LATCH_BRACKETS[clock]
+    if rows and not {before, after} <= set(names):
+        return f"no usable clock latch: {rows} rows, none with {before} and {after} fields"
+    return f"no usable clock latch: {rows} rows, none with a finite, non-negative {clock} bracket"
+
+
+def _dropped_reason(dropped: tuple, kept: int) -> str:
+    if not dropped:
+        return ""
+    if len(dropped) == 1:
+        return (f"latch {dropped[0]} left out: no line through the other {kept} latches' "
+                f"brackets passes through its own")
+    rows = ", ".join(str(row) for row in dropped)
+    return (f"latches {rows} left out: no line through the {kept} kept latches' brackets "
+            f"passes through any of theirs")
+
+
+def latch_gate_ok(fit: ClockFit, ni_residual_rms: float, frame_period: float) -> bool:
+    """Whether a latch map is trusted to choose the transitions: its uncertainty
+    plus coverage_factor() NI-to-host residuals (ni_residual_rms) is under a
+    quarter frame period, the bound latch_tolerance() also puts on the residual
+    (below its cap). At 150 fps the quarter is 1.67 ms; the worst session of
+    the 2026-11-03 sweep needs 0.89 + 4.89 x 0.039 = 1.08 ms. False when the
+    fit's uncertainty, the residual or the period is not finite, which covers
+    an invalid fit.
+    """
+    try:
+        values = (float(fit.uncertainty), float(ni_residual_rms), float(frame_period))
+    except (AttributeError, TypeError, ValueError):
+        return False
+    if not all(math.isfinite(value) for value in values):
+        return False
+    uncertainty, residual, period = values
+    return uncertainty + coverage_factor() * residual < period / 4
 
 
 def latch_tolerance(frame_period: float) -> float:
@@ -868,58 +1023,65 @@ def latch_window(fit: ClockFit, camera_seconds) -> numpy.ndarray:
             & (camera_seconds <= fit.x_max + LATCH_WINDOW_SECONDS))
 
 
-def choose_pairing_by_camera_clock(frame_ids, camera_ts_ns, latches, transition_perf,
-                                   frame_period: float, *, ni_residual_rms: float) -> Pairing:
+def choose_pairing_by_camera_clock(frame_ids, camera_ts_ns, latches, transition_times,
+                                   frame_period: float, *, ni_residual_rms: float,
+                                   clock: str) -> Pairing:
     """Which exposure transition belongs to which frame, decided by the camera's clock.
 
-    The latches place camera time on host time, so a frame's camera timestamp
-    says when on the host clock it was exposed, however long it then waited to
-    be delivered. Each frame's candidate is the transition nearest that time,
-    and the shift most frames agree on wins.
+    The latches place camera time on the host clock named by clock ("perf" or
+    "raw", as fit_latches reads them), and transition_times are the NI
+    transitions on that same clock. So a frame's camera timestamp says when on
+    that clock it was exposed, however long it then waited to be delivered.
+    Each frame's candidate is the transition nearest that time, and the shift
+    most frames agree on wins.
 
     The median residual (transition minus expected time, over the chosen shift)
     is where the camera stamps a frame relative to the NI edge, plus the NI-to-
-    host bias, plus the latch uncertainty. All of it must stay well under half a
+    host bias, plus the latch map's error. All of it must stay well under half a
     period for the nearest transition to be the right one, and a bias near a
     whole period would pair a frame off with a small residual, so a residual
     over latch_tolerance() (a quarter period, at most 2 ms), or a shift that
-    changes partway through (find_slip), marks the pairing ambiguous. The lag
-    is not measured here: median_lag is NaN. The limit applied, the tolerance,
-    is in Pairing.limit. ni_residual_rms, the NI-to-host fit's residual, is
-    taken as choose_pairing takes it; this tolerance does not use it.
+    changes partway through (find_slip), marks the pairing ambiguous. So does a
+    latch map too uncertain to choose a transition by (latch_gate_ok: the map's
+    uncertainty plus coverage_factor() times ni_residual_rms, the NI-to-host
+    fit's residual, against a quarter period); the shift it found is still
+    reported. The lag is not measured here: median_lag is NaN. The residual
+    tolerance is in Pairing.limit.
 
     The limit that sets: a Blackfly S stamps a frame at the end of its exposure
     and the NI edge marks its start, so the residual approaches minus the
     exposure time. An exposure longer than about 1.8 ms therefore reads
     ambiguous, visibly, rather than being paired on a guess.
     """
-    fit = fit_latches(latches)
+    fit = fit_latches(latches, clock=clock)
     if not fit.valid:
-        return Pairing(0, math.nan, 0.0, True, fit.reason, method=CAMERA_LATCH)
+        return Pairing(0, math.nan, 0.0, True, fit.reason, method=CAMERA_LATCH, clock=clock)
     frame_ids = numpy.asarray(frame_ids, dtype=numpy.int64)
     camera = numpy.asarray(camera_ts_ns, dtype=numpy.float64) / 1e9
-    transition_perf = numpy.asarray(transition_perf, dtype=numpy.float64)
+    transition_times = numpy.asarray(transition_times, dtype=numpy.float64)
     keep = numpy.isfinite(camera) & latch_window(fit, camera)
-    if not keep.any() or transition_perf.size == 0:
+    if not keep.any() or transition_times.size == 0:
         return Pairing(0, math.nan, 0.0, True, "no frames near a clock latch or no transitions",
-                       method=CAMERA_LATCH)
+                       method=CAMERA_LATCH, clock=clock)
     ids = frame_ids[keep]
     expected = fit.map(camera[keep])
-    later = numpy.clip(numpy.searchsorted(transition_perf, expected), 0, transition_perf.size - 1)
-    earlier = numpy.clip(later - 1, 0, transition_perf.size - 1)
-    nearest = numpy.where(numpy.abs(transition_perf[later] - expected)
-                          < numpy.abs(transition_perf[earlier] - expected), later, earlier)
+    later = numpy.clip(numpy.searchsorted(transition_times, expected), 0,
+                       transition_times.size - 1)
+    earlier = numpy.clip(later - 1, 0, transition_times.size - 1)
+    nearest = numpy.where(numpy.abs(transition_times[later] - expected)
+                          < numpy.abs(transition_times[earlier] - expected), later, earlier)
     order = numpy.argsort(ids, kind="stable")
     voters, votes = ids[order], (ids - nearest)[order]
     values, counts = numpy.unique(votes, return_counts=True)
     shift = int(values[numpy.argmax(counts)])
     agreement = float(counts.max() / votes.size)
     numbers = ids - shift
-    inside = (numbers >= 0) & (numbers < transition_perf.size)
-    residual = transition_perf[numbers[inside]] - expected[inside]
+    inside = (numbers >= 0) & (numbers < transition_times.size)
+    residual = transition_times[numbers[inside]] - expected[inside]
     median_residual = float(numpy.median(residual)) if residual.size else math.nan
     tolerance = latch_tolerance(frame_period)
     residual_ambiguous = not abs(median_residual) <= tolerance
+    gate_ok = latch_gate_ok(fit, ni_residual_rms, frame_period)
     slip = find_slip(voters, votes, shift)
     problems = []
     if slip is not None:
@@ -931,9 +1093,19 @@ def choose_pairing_by_camera_clock(frame_ids, camera_ts_ns, latches, transition_
     elif residual_ambiguous:
         problems.append(f"median residual {median_residual * 1e3:.3f} ms is over the latch "
                         f"tolerance ({tolerance * 1e3:.3f} ms)")
-    return Pairing(shift, math.nan, agreement, bool(residual_ambiguous or slip is not None),
+    # An unknown frame period fails the gate too, and is already the reason.
+    if not gate_ok and math.isfinite(tolerance):
+        if not math.isfinite(ni_residual_rms):
+            problems.append("the NI fit's residual is unknown, so the latch map cannot be judged")
+        else:
+            spread = coverage_factor() * ni_residual_rms
+            problems.append(f"latch mapping uncertainty {fit.uncertainty * 1e3:.3f} ms plus "
+                            f"{coverage_factor():.2f} NI residuals ({spread * 1e3:.3f} ms) "
+                            f"exceeds a quarter frame period ({frame_period / 4 * 1e3:.3f} ms)")
+    return Pairing(shift, math.nan, agreement,
+                   bool(residual_ambiguous or slip is not None or not gate_ok),
                    "; ".join(problems), method=CAMERA_LATCH, median_residual=median_residual,
-                   slip=slip, limit=tolerance)
+                   slip=slip, limit=tolerance, clock=clock)
 
 
 def fit_camera_to_ni(frame_ids, camera_ts_ns, transition_index, sample_rate: float,
