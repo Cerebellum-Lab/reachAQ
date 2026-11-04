@@ -425,17 +425,19 @@ CAN warnings and errors remain in both logs.
 - `canonicalBoundary`;
 - first/last offsets for auxiliary streams;
 - the requested and resolved `nidaqTiming` topology;
-- `cameraNidaqAlignment` (schemaVersion 3), including matched edge/sample,
+- `cameraNidaqAlignment` (schemaVersion 4), including matched edge/sample,
   signed offset, resolution, confidence, and ambiguity, plus how the anchor
   was chosen (`anchorMethod`: `camera_latch` from the primary camera's clock
-  latches, `expected_lag` from the exposure plus the measured stamp delay,
+  latches, `host_arrival` from when its frames reached the host,
+  `first_frame_stamp` from the first frame's own host stamp,
   `epoch_nearest_edge` when no NI-to-host fit could be made), the fit itself
   (`niToHost`: a knot table from NI seconds to `time.perf_counter`, built from
   the NI read stamps, `piecewise_envelope` or `raw_bridged` through
-  `CLOCK_MONOTONIC_RAW`), the exposure, the expected and implied lags, the
-  gate, and the latch evidence; every host time derived from an NI sample
-  (frame edges, tone onsets, NI sample indices of host events) goes through
-  that fit, and the post-analysis trial ledger reuses the stored table;
+  `CLOCK_MONOTONIC_RAW`), the exposure, the implied lag, and the evidence of
+  both measured matches (`latch`, `arrival`, `arrivalSampleIndex`,
+  `anchorsAgree`); every host time derived from an NI sample (frame edges,
+  tone onsets, NI sample indices of host events) goes through that fit, and
+  the post-analysis trial ledger reuses the stored table;
 - `toneConfirmation`, including canonical NI pulse onsets, grouped outbound
   command/immediate status/periodic GPIO observations, unmatched valid events
   and pulses, and separately classified short-pulse artifacts;
@@ -444,6 +446,56 @@ CAN warnings and errors remain in both logs.
   `persistenceStatus`;
 - `deviceEventOverruns`, `sessionComplete`, and `incompleteReasons`.
 
+How schemaVersion 4 chooses the first recorded frame's transition on the
+fitted timeline. No lag is assumed anywhere; both matches are measured over
+the primary camera's latency stream:
+
+- `latch` pairs each frame's camera timestamp, placed on host time by the clock
+  latches, with the nearest transition; the shift most frames agree on wins
+  (transition number = frame ID - `shift`). `arrival` pairs each frame with the
+  latest transition at or before its host arrival, by the same majority.
+  Each records `status` (`unavailable`, `paired`, `ambiguous`, `outside` when
+  the first frame's transition lies outside the spool, or `failed`), `shift`,
+  `agreement`, `ambiguous`, `reason` and `frames`; `latch` adds
+  `medianResidualSeconds`, `latches` and `usableLatches`, and `arrival` adds
+  `medianLagSeconds`, the median time from the paired transition to the
+  frame's arrival; evidence of a match that could not run is `unavailable` or
+  `failed` and carries little more than `status` and `reason`.
+  `arrivalSampleIndex` is the NI sample the arrival match names for the first
+  recorded frame (null without one). `latch.frames` and `arrival.frames` count
+  only the latency frames that arrived while the spool held transitions; the
+  camera runs on before the NI task starts and after it stops, and those frames
+  are left out of both pairings.
+- `anchorMethod` is the first that yields a transition: `camera_latch` when the
+  latch match is `paired`, else `host_arrival` when the arrival match is, else
+  `first_frame_stamp`, the latest transition at or before the first recorded
+  frame's host stamp (`cameraPerfTime`), which counts only within one frame
+  period of that transition (when the period is known). With none of them the
+  alignment is `unmatched` at `none` confidence, and `reason` gives each
+  method's reason.
+- `confidence` is `hardware_edge` only when both measured matches exist and
+  name the same transition, which is what `anchorsAgree` compares (null when
+  either match is missing). Every other matched anchor is
+  `ambiguous_hardware_edge`: one method alone, or the two disagreeing. A
+  disagreement keeps the camera-clock anchor and names both sample indices in
+  `reason`; a missing match is noted there as *camera-clock match not
+  available* or *arrival match not available*, with its status and reason.
+- The arrival match makes one assumption: a frame reaches the host within one
+  frame period of its exposure edge. A longer lag pairs every frame with a
+  later transition, and shows as a disagreement with the camera clock rather
+  than as an agreement. `impliedLagSeconds` (the first frame's host stamp
+  less the anchor transition) and `arrival.medianLagSeconds` are measurements,
+  never compared with an expected value.
+- `exposureSeconds` is the exposure the app was given (null when unknown or
+  not a finite number). It is recorded and moves no anchor.
+- schemaVersion 3 files differ here. They carry `expectedLagSeconds`,
+  `lagGateSeconds` and `expectedLagSampleIndex`, which schema 4 drops; their
+  `anchorMethod` is `camera_latch` or `expected_lag`, the transition nearest
+  the first frame's stamp less the exposure and a fixed 1.1 ms, with the
+  implied lag gated to within 1 ms of that expectation; they have no
+  `arrival` or `arrivalSampleIndex`; and their `latch.frames` counts every
+  frame of the latency stream. They are not rewritten.
+
 Three things to know when reading `cameraNidaqAlignment`:
 
 - `niToHost.valid` says whether the fit was used; readers key on it, never on
@@ -451,12 +503,18 @@ Three things to know when reading `cameraNidaqAlignment`:
   left out of it and is not a failure: *RAW on 40 stamps, need 100*, *RAW covers
   62% of the 90 s of stamps, need 90%* or *RAW stamps unusable (…)* mean the fit
   is `piecewise_envelope` on the perf stamps alone.
-- `ambiguitySeconds` is how much nearer the chosen transition is than the
-  runner-up, both measured to the expected edge (`start_perf` less the expected
-  lag), not to `start_perf`. When the camera-latch anchor wins it still
-  describes the expected-lag pick; the latch's own margin is
-  `latch.medianResidualSeconds` and `latch.agreement`. The epoch fallback
-  (`epoch_nearest_edge`) measures it to `start_perf`.
+- `ambiguitySeconds` depends on the anchor method. On the fitted timeline
+  (`camera_latch`, `host_arrival`, `first_frame_stamp`) it is
+  `min(arrival.medianLagSeconds, framePeriodSeconds - arrival.medianLagSeconds)`:
+  how far the arrival match's median lag is from the nearest transition
+  boundary, so how much margin it has before it would name a neighbouring
+  transition. It describes the arrival match whichever method anchored, and is
+  only meaningful when `arrival.status` is `paired`; it is null without a
+  median lag, and `latch.medianResidualSeconds` and `latch.agreement` are the
+  latch's own margin. The epoch fallback (`epoch_nearest_edge`) records how much
+  nearer the chosen transition is than the runner-up, both measured to
+  `start_perf`. schemaVersion 3 measured the runner-up distance to the expected
+  edge (`start_perf` less the expected lag) on the fitted path.
 - `latency.h5` (`clock/ni_to_host`) and `alignment.json` (`niToHost`) are
   separate fits of the same stamps: the first from the published, boundary-trimmed
   `nidaq.h5`, the second from the whole spool. Their `knotCount` and `x_min`
@@ -522,14 +580,16 @@ controller.
 
 Camera/NI matching puts every `cam_frames` transition on the host clock through
 the NI-to-host fit built from the NI read stamps, then takes the first recorded
-frame's transition from the primary camera's clock latches (its latency stream)
-or, without usable latches, the transition nearest the expected exposure edge
-(the first frame's stamp less its exposure and the measured stamp delay), gates
-the implied lag, and records whether the transition was rising or falling.
-Without a fit the transition nearest the stamp on the epoch timeline is used,
-at `ambiguous_hardware_edge` confidence. The current
-camera output is a square wave whose alternating peaks and troughs each identify
-one frame. Alignment reports `host_estimated` when the line is not configured,
+frame's transition from two measured matches over the primary camera's latency
+stream, the camera's clock latches and the frames' host arrival, with no lag
+assumed. The latch match anchors, and `hardware_edge` needs the arrival match to
+name the same transition; with one match the anchor is that one, and with
+neither it is the transition at or before the first frame's own host stamp, at
+`ambiguous_hardware_edge` confidence. The alignment records whether the
+transition was rising or falling. Without a fit the transition nearest the stamp
+on the epoch timeline is used, also at `ambiguous_hardware_edge` confidence. The
+current camera output is a square wave whose alternating peaks and troughs each
+identify one frame. Alignment reports `host_estimated` when the line is not configured,
 and `unmatched` when no plausible transition exists. For configured Tone 1 and
 Tone 2 inputs, the NI pulse onset is the canonical physical time. Pulses shorter
 than 2 ms are classified as electrical artifacts and do not become tone events.
