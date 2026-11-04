@@ -632,7 +632,7 @@ def test_camera_and_tone_edges_are_correlated_on_nidaq_timeline(tmp_path):
     )
     assert alignment["canonicalBoundary"]["primaryFrameId"] == 42
     assert alignment["canonicalBoundary"]["nidaqSampleIndex"] == 101
-    assert alignment["schemaVersion"] == 3
+    assert alignment["schemaVersion"] == 4
 
 
 def test_all_structured_events_receive_recorded_frame_alignment(tmp_path):

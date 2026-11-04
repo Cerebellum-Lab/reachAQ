@@ -206,8 +206,13 @@ class SyntheticRig:
                     f"{start_wall + self.frame_perf_c(n, lag) - start_perf:.6f}",
                 ])
 
-    def write_latency_stream(self, project, name, n_first, count, lag, *, latches=True):
-        """streams/latency/camera_<name>.h5 as the capture process writes it."""
+    def write_latency_stream(self, project, name, n_first, count, lag, *, latches=True,
+                             arrival=ARRIVAL, latch_error=0.0):
+        """streams/latency/camera_<name>.h5 as the capture process writes it.
+
+        arrival is each frame's host arrival after its true exposure edge, and
+        latch_error shifts every latch's perf bracket off the true host time of
+        its camera stamp (a camera clock mapped a frame off, at 1 / FPS)."""
         session = Path(project.get_session_path().location)
         path = session / "streams" / "latency" / f"camera_{name}.h5"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -216,13 +221,13 @@ class SyntheticRig:
         frames = np.zeros(count, dtype=CAMERA_FRAME_DTYPE)
         frames["frame_id"] = self.frame_id(n)
         frames["camera_ts_ns"] = np.round((edge + EXPOSURE + CAMERA_OFFSET) * 1e9).astype(np.int64)
-        frames["arrival_perf"] = self.host(edge) + ARRIVAL
+        frames["arrival_perf"] = self.host(edge) + arrival
         frames["poll_perf"] = frames["arrival_perf"] - 0.0005
         frames["capture_return_perf"] = frames["arrival_perf"] + 0.0001
         rows = []
         if latches:
             for when in (float(edge[0]) + 0.001, float(edge[-1]) + 0.001):
-                host = float(self.host(when))
+                host = float(self.host(when)) + latch_error
                 rows.extend([(host - 0.0001, self.camera_ns(when), host + 0.0001, np.nan, np.nan)] * 3)
         latch_rows = np.zeros(len(rows), dtype=CLOCK_LATCH_DTYPE)
         for position, row in enumerate(rows):
