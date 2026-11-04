@@ -1767,7 +1767,7 @@ class SessionDataRecorder:
         # anchor and every timeline below then use the epoch mapping as before.
         ni_fit = SessionDataRecorder._fit_nidaq_to_host(nidaq_chunks)
         board_clock_chain_record = SessionDataRecorder._board_clock_chain(
-            untrimmed_device_rows, nidaq_chunks,
+            untrimmed_device_rows, nidaq_chunks, ni_fit=ni_fit,
         )
         primary_exposure = (
             None
@@ -2967,11 +2967,14 @@ class SessionDataRecorder:
             return clocks.invalid_piecewise_fit(f"{type(error).__name__}: {error}")
 
     @staticmethod
-    def _board_clock_chain(device_rows, nidaq_chunks):
+    def _board_clock_chain(device_rows, nidaq_chunks, ni_fit=None):
         """Pellet-to-NI clock chain, or why there is none; never raised.
 
         Read from the whole spool and the untrimmed rows: the chain is a fit,
         and pre-roll and post-roll claps and barcodes are as good as any.
+        ni_fit, the session's NI-to-host map, tells the chain which host time
+        each barcode frame was played at, and so which timekeeper boot its
+        tick belongs to; the per-sample host stamps are not passed, only the fit.
         """
         try:
             rows = tuple(
@@ -2991,6 +2994,7 @@ class SessionDataRecorder:
                 indices, rate, channels = (), None, {}
             record = board_clock_chain.board_clock_chain(
                 rows, sample_indices=indices, sample_rate_hz=rate, channels=channels,
+                ni_to_host=ni_fit,
             )
             # alignment.json is written with allow_nan=False and sort_keys=True, so
             # a NaN, a numpy scalar or keys that cannot be sorted in the record

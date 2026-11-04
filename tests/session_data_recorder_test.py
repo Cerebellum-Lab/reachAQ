@@ -2065,10 +2065,11 @@ def test_board_clock_chain_uses_rows_outside_the_session_window(tmp_path):
     )
     project = ProjectInfo(root=str(tmp_path), device_id="test", when=datetime(2026, 1, 2, 3, 4, 5), session=6)
 
-    # Only ticks 5-7 fall inside the window: too few barcode edges to fit on
-    # their own, so a fit proves the pre-roll and post-roll rows were used.
+    # Only the rows of ticks 8 and 9 fall inside the window: too few barcode
+    # edges to fit on their own, so a fit proves the pre-roll and post-roll
+    # rows were used.
     result = SessionDataRecorder._write_session(
-        project, 1005.0, 2005.0, 1007.0, rows, (), (), (chunk,),
+        project, 1020.0, 2020.0, 1022.0, rows, (), (), (chunk,),
     )
 
     assert result["boardClockChain"]["status"] == "fitted"
@@ -2187,3 +2188,70 @@ def test_a_malformed_row_outside_the_window_leaves_finalization_and_device_csv_u
     with (streams_dir / "device.csv").open(newline="", encoding="utf-8") as stream:
         csv_rows = list(csv.DictReader(stream))
     assert [row["kind"] for row in csv_rows] == ["TONE_STATUS"]  # only the row inside the window
+
+
+def _blocked_nidaq_chunks(channels, names, rate=10_000.0, block=100):
+    """A capture as the recorder holds it: a chunk per 10 ms copy, each stamped with the host time of its read.
+
+    The host clock reads NI seconds plus 1000, and a copy is stamped 0.3 ms after the last sample before it,
+    so the NI-to-host fit the recorder makes of these is valid and close to that.
+    """
+    samples = len(channels[names[0]])
+    indices = np.arange(samples, dtype=np.int64)
+    values = np.vstack([channels[name] for name in names]).astype(np.float32)
+    chunks = []
+    for start in range(0, samples, block):
+        stop = min(start + block, samples)
+        stamp = 1000.0 + (start - 1) / rate + 0.0003
+        chunks.append((
+            indices[start:stop], 1000.0 + indices[start:stop] / rate, 2000.0 + indices[start:stop] / rate,
+            values[:, start:stop], tuple(names), rate, 1, 0, 0, stamp, 1000.0 + stamp, float("nan"),
+        ))
+    return tuple(chunks)
+
+
+def test_alignment_pairs_the_board_clock_chain_by_host_time_through_the_sessions_ni_fit(tmp_path):
+    from board_clock_chain_synthetic import synthetic_rig
+
+    rows, channels, _ = synthetic_rig()
+    chunks = _blocked_nidaq_chunks(channels, ("barcode", "tone1"))
+    assert SessionDataRecorder._fit_nidaq_to_host(chunks).valid  # the fit _write_session will hand the chain
+    project = ProjectInfo(root=str(tmp_path), device_id="test", when=datetime(2026, 1, 2, 3, 4, 5), session=11)
+
+    result = SessionDataRecorder._write_session(project, 1000.0, 2000.0, 1042.0, rows, (), (), chunks)
+
+    chain = result["boardClockChain"]
+    assert chain["status"] == "fitted", chain["reason"]
+    assert chain["pairing"] == "host_time"
+    assert chain["boards"][0]["toneCrossCheck"]["matched"] == 2
+
+
+def test_board_clock_chain_is_given_the_ni_fit(monkeypatch):
+    from tools.acquisition.model import board_clock_chain
+
+    seen = {}
+    monkeypatch.setattr(
+        board_clock_chain, "board_clock_chain",
+        lambda *_args, **kwargs: seen.update(kwargs) or board_clock_chain.unavailable("spy"),
+    )
+    fit = object()
+
+    SessionDataRecorder._board_clock_chain((), (), ni_fit=fit)
+
+    assert seen["ni_to_host"] is fit
+
+
+def test_board_clock_chain_reads_a_spooled_capture_and_pairs_by_host_time_when_the_fit_is_valid(tmp_path):
+    from board_clock_chain_synthetic import rig_ni_to_host, synthetic_rig
+
+    rows, channels, indices = synthetic_rig()
+    silent = np.zeros(indices.size, dtype=np.float32)
+    snapshot = _nidaq_spool(
+        tmp_path, ("cam_frames", "barcode", "tone1", "tone2"), [silent, channels["barcode"], channels["tone1"], silent],
+    )
+
+    by_tick = SessionDataRecorder._board_clock_chain(rows, snapshot)
+    by_host = SessionDataRecorder._board_clock_chain(rows, snapshot, ni_fit=rig_ni_to_host())
+
+    assert (by_tick["status"], by_tick["pairing"]) == ("fitted", "tick_cluster")
+    assert (by_host["status"], by_host["pairing"]) == ("fitted", "host_time")
