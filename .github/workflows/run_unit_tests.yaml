@@ -2,14 +2,12 @@ name: Run unit tests
 on:
   push:
     branches:
-      - main
-      - develop
+      - feature-dev
       - devel
-      - github-actions
+      - 'ci/**'
   pull_request:
     branches:
-      - main
-      - develop
+      - feature-dev
       - devel
   workflow_dispatch:
     inputs:
@@ -18,28 +16,56 @@ on:
         required: true
         default: ''
         type: string
+permissions:
+  contents: read
 concurrency:  # allow cancel if new commit pushed
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 jobs:
   build-and-test:
     name: Setup env. and run tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     strategy:
       matrix:
-        python-version: ["3.8"]
+        python-version: ["3.10"]
     env:
       FORCE_COLOR: '1'
     steps:
       - uses: actions/checkout@v4
         with:
-          lfs: true  # required for real data test files
+          lfs: false  # fetch LFS selectively in the step below, not the whole tree
           fetch-depth: 0  # required to fetch all history and all tags
           fetch-tags: true
-      - name: Install EGL and GL libraries
+      - name: Restore Git LFS objects
+        id: lfs-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .git/lfs
+          key: lfs-${{ hashFiles('.gitattributes', 'auto-trainer-inference/tests/**', 'tools/acquisition/view/*.png') }}
+          restore-keys: |
+            lfs-
+      - name: Pull the LFS test data
+        shell: bash  # -eo pipefail: a failing ls-files must fail the step, not feed jq nothing
+        run: |
+          git lfs pull --include="auto-trainer-inference/tests/**,tools/acquisition/view/*.png" --exclude="vendor/**"
+          du -sh .git/lfs
+          find .git/lfs/objects -type f | wc -l
+          git lfs ls-files --json --include="vendor/**" | jq -e '(.files | length) > 0 and all(.files[]; .downloaded == false)'
+          git lfs ls-files --json --include="auto-trainer-inference/tests/**,tools/acquisition/view/*.png" | jq -e '(.files | length) > 0 and all(.files[]; .checkout == true and .downloaded == true)'
+      - name: Save Git LFS objects
+        if: steps.lfs-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .git/lfs
+          key: ${{ steps.lfs-cache.outputs.cache-primary-key }}
+      - name: Install system libraries, ffmpeg and the Ubuntu font
         run: |
           sudo apt-get update
-          sudo apt-get install -y libegl1 libgl1
+          sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3 ffmpeg fonts-ubuntu
+      - name: Check the Ubuntu font is installed
+        run: |
+          fc-list : family | grep -qx Ubuntu
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
@@ -48,6 +74,7 @@ jobs:
         shell: bash  # this is to get color output
         env:
           TERM: xterm-256color
+          GIT_LFS_SKIP_SMUDGE: '1'  # setuptools_scm runs git archive, which would download every LFS pointer
         run: |
           set -x
           pip config --user set install.progress_bar off
@@ -57,20 +84,31 @@ jobs:
           pip install --upgrade pip  # might be risky
           pip -V
           cat /home/runner/.config/pip/pip.conf
+          pip install "torch>=2.7,<2.8" "torchvision>=0.22,<0.23" --index-url https://download.pytorch.org/whl/cpu
           pip install -e ".[test]"
+          git lfs ls-files --json --include="vendor/**" | jq -e '(.files | length) > 0 and all(.files[]; .downloaded == false)'
+      - name: Check torch is the CPU build
+        run: python -c "import torch,sys; print(torch.__version__); sys.exit(not torch.__version__.endswith('+cpu'))"
+      - name: Licence check
+        run: python -m tools.ci.check_licences --allowlist .github/licence-allowlist.txt
       - name: Show current version
         run: python -m setuptools_scm
       - name: Show auto-trainer and ensure we don't use sub-projects wheel(s)
         run: ./.check_sub_projects_not_installed.sh
       - name: Test with pytest
+        id: pytest
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PYTEST_EXTRA_ARGS: ${{ github.event.inputs.pytest_extra_args }}
         run: |
           set -x
-          export PYTEST_ADDOPTS="--color=yes"
+          export PYTEST_ADDOPTS="--color=yes $PYTEST_EXTRA_ARGS"
           export COVERAGE_PROCESS_START="$PWD/.coveragerc"
           site_pkgs_dir=$(python -c "import site; print(site.getsitepackages()[0])")
           echo "import coverage; coverage.process_startup()" > "${site_pkgs_dir}/usercustomize.pth"
-          coverage run -m pytest -v -s ${{ github.event.inputs.pytest_extra_args }}
+          coverage run -m pytest auto-trainer-core/tests auto-trainer-video/tests auto-trainer-inference/tests auto-trainer-device/tests tests tools/acquisition/tests -q -p no:randomly -rs
       - name: Coverage
+        if: ${{ !cancelled() && steps.pytest.outcome != 'skipped' }}
         run: |
           set -x
           coverage combine
@@ -96,16 +134,9 @@ jobs:
             coverage report --include="${include}" || true
             echo
           done
-      - name: Sub-projects
-        run: |
-          set -e
-          set -x
-          pip uninstall auto-trainer -y
-          for sub_prj in $(cat auto_trainer_projects_order.txt)
-          do
-            pushd "${sub_prj}"
-            pip install -e .
-            ln -s ../top_fixtures.py
-            pytest -xvs || true  # TODO: top_fixtures contains everything mixed...
-            popd
-          done
+      - name: Upload HTML coverage report
+        if: ${{ !cancelled() && steps.pytest.outcome != 'skipped' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: htmlcov
+          path: htmlcov/

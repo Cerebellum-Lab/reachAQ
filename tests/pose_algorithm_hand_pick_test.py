@@ -9,9 +9,10 @@ which sorts every row to read one. Measured on the rig that is 313 us per call
 and it runs once per hand per camera on every live batch: 1.25 ms of a 6.57 ms
 PoseAlgorithm.process, in a loop with a 10-20 ms budget.
 
-`iloc[argmax(likelihood)]` selects the same row. These tests pin that, because
-the two are only equivalent as long as both resolve a tie to the first row at
-the maximum, and a future change to either side could silently diverge.
+`iloc[argmax(likelihood)]` selects the same row as the old call except on exact
+likelihood ties, where quicksort's choice was platform-dependent (see
+`previous()`). These tests hold argmax to the stable-sort pick, which takes the
+first row at the maximum.
 """
 
 import numpy
@@ -22,8 +23,16 @@ COLUMNS = ["x", "y", "likelihood"]
 
 
 def previous(frame):
-    """What the code did before."""
-    return frame.sort_values(by="likelihood", ascending=False).reset_index().iloc[0]
+    """What the code did before, with its tie-break pinned.
+
+    The old call used sort_values' default kind="quicksort", which is not
+    stable. On the rig numpy sorts a short array by insertion and tied rows
+    keep their order, but where numpy sorts with its SIMD argsort (AVX-512
+    in numpy 1.26) they need not: CI picked the second of two tied rows for
+    seed 12. kind="stable" is the order the rig gave, and the one argmax keeps.
+    """
+    return frame.sort_values(
+        by="likelihood", ascending=False, kind="stable").reset_index().iloc[0]
 
 
 def current(frame):
@@ -45,7 +54,7 @@ def test_the_same_row_is_chosen():
 
 
 def test_a_tie_resolves_to_the_first_row_either_way():
-    """sort_values is stable and argmax returns the first maximum."""
+    """A stable sort_values and argmax both return the first maximum."""
     frame = _frame([[1.0, 2.0, 0.80],
                     [3.0, 4.0, 0.80],
                     [5.0, 6.0, 0.10]])

@@ -2,6 +2,7 @@ import hashlib
 import json
 from pathlib import Path
 
+import pytest
 import yaml
 
 from tools.session_validation import ValidationProfile, validate_session
@@ -24,17 +25,19 @@ def _session(tmp_path):
     metadata_json = root / "session001_metadata.json"
     _write(metadata_json, json.dumps(metadata))
     _write(root / "session001_metadata.yaml", yaml.safe_dump(metadata))
+    _write(root / "streams/alignment.json", json.dumps({
+        "schemaVersion": 2, "metadataGenerationId": generation,
+    }))
     stream_manifest = {
         "schemaVersion": 2,
         "metadataGenerationId": generation,
         "sessionId": "session001",
         "sessionComplete": True,
         "enabledSources": [],
+        # As _write_session publishes it: alignment.json is always listed.
+        "files": [_manifest_entry(root, "streams/alignment.json")],
     }
     _write(root / "streams/stream_manifest.json", json.dumps(stream_manifest))
-    _write(root / "streams/alignment.json", json.dumps({
-        "schemaVersion": 2, "metadataGenerationId": generation,
-    }))
     files = []
     for path in (
         metadata_json,
@@ -498,3 +501,528 @@ def test_manual_run_pulse_events_are_never_a_protocol_lasers_evidence(tmp_path):
     result = _rule(root, "trials.protocol")
     assert result.status.value == "fail"
     assert "laser prepared event is absent" in result.message
+
+
+def _manifest_entry(root, relative):
+    data = (root / relative).read_bytes()
+    return {
+        "path": relative,
+        "sizeBytes": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+    }
+
+
+def _publish_stream_manifest(root, **changes):
+    """Rewrite the stream manifest, then the top-level entries that hash it."""
+    stream_path = root / "streams/stream_manifest.json"
+    stream = json.loads(stream_path.read_text(encoding="utf-8"))
+    stream.update(changes)
+    _write(stream_path, json.dumps(stream))
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"] = [
+        _manifest_entry(root, item["path"]) for item in manifest["files"]
+    ]
+    _write(manifest_path, json.dumps(manifest))
+
+
+def _manifest_result(root, profile=ValidationProfile.QUICK):
+    report = validate_session(
+        root, profile=profile, selected_rules=("session.manifest",))
+    return next(item for item in report.results if item.rule_id == "session.manifest")
+
+
+def _source(source_id, kind, path):
+    return {
+        "id": source_id, "kind": kind, "path": path,
+        "sampleCount": 1, "persistenceStatus": "written",
+    }
+
+
+def _session_with_sources(tmp_path, *, present, listed, sources=None):
+    root = _session(tmp_path)
+    for relative in present:
+        _write(root / relative, f"{relative}\n")
+    _publish_stream_manifest(
+        root,
+        enabledSources=sources if sources is not None else [
+            _source("device", "decoded_can_and_device_events", "streams/device.csv"),
+            # Every NI channel names the one file they share.
+            _source("nidaq.force", "nidaq_analog", "streams/nidaq.h5"),
+            _source("nidaq.cam_frames", "nidaq_digital", "streams/nidaq.h5"),
+            _source("laser_outputs", "laser_commands_and_states", "streams/laser.csv"),
+        ],
+        files=[
+            _manifest_entry(root, relative)
+            for relative in ("streams/alignment.json", *listed)
+        ],
+    )
+    return root
+
+
+_SOURCE_FILES = ("streams/device.csv", "streams/nidaq.h5", "streams/laser.csv")
+
+
+def test_session_manifest_fails_a_source_file_on_disk_that_is_not_listed(tmp_path):
+    # Listing is what puts a file under the size and hash checks; a file left off the
+    # list is checked by nothing, and every other check still passes.
+    root = _session_with_sources(
+        tmp_path, present=_SOURCE_FILES,
+        listed=("streams/device.csv", "streams/laser.csv"))
+
+    for profile in (ValidationProfile.QUICK, ValidationProfile.FULL):
+        result = _manifest_result(root, profile)
+        assert result.status.value == "fail", profile
+        assert "streams/nidaq.h5" in result.message
+        assert "nidaq_analog" in result.message
+        assert "streams/device.csv" not in result.message
+        assert "streams/laser.csv" not in result.message
+        # Two sources share that file; it is named once.
+        assert result.message.count("streams/nidaq.h5") == 1
+
+
+def test_session_manifest_passes_when_every_source_file_is_listed(tmp_path):
+    root = _session_with_sources(
+        tmp_path, present=_SOURCE_FILES, listed=_SOURCE_FILES)
+
+    for profile in (ValidationProfile.QUICK, ValidationProfile.FULL):
+        assert _manifest_result(root, profile).status.value == "pass", profile
+
+
+def test_session_manifest_leaves_a_source_file_that_is_absent_to_the_source_rule(
+    tmp_path,
+):
+    root = _session_with_sources(
+        tmp_path, present=("streams/device.csv",), listed=("streams/device.csv",))
+
+    assert _manifest_result(root).status.value == "pass"
+    report = validate_session(
+        root, profile=ValidationProfile.QUICK,
+        selected_rules=("session.manifest", "sources.contract"))
+    contract = next(item for item in report.results if item.rule_id == "sources.contract")
+    assert contract.status.value == "fail"
+    assert "nidaq.force: artifact missing" in contract.message
+
+
+def test_session_manifest_does_not_expect_video_or_pose_files_to_be_listed(tmp_path):
+    # The recorder lists none of these; camera.frames and stim.evidence check the video
+    # and the evidence by content, and pose gets only an existence and sampleCount check.
+    root = _session_with_sources(
+        tmp_path,
+        present=("s_left.mp4", "s_left_raw2D_live.h5", "streams/stim_camera_evidence.h5"),
+        listed=(),
+        sources=[
+            _source("camera.left", "camera", "s_left.mp4"),
+            {**_source("pose", "pose", "pose"), "paths": ["s_left_raw2D_live.h5"]},
+            _source("stim_camera_evidence", "stim_camera_detection_evidence",
+                    "streams/stim_camera_evidence.h5"),
+        ],
+    )
+
+    assert _manifest_result(root, ValidationProfile.FULL).status.value == "pass"
+
+
+def test_session_manifest_names_every_unlisted_file_of_a_source_with_several(tmp_path):
+    # "paths" is read the way sources.contract reads it, for a kind that is listed.
+    root = _session_with_sources(
+        tmp_path,
+        present=("streams/a.csv", "streams/b.csv"),
+        listed=("streams/a.csv",),
+        sources=[{**_source("device", "decoded_can_and_device_events", "streams"),
+                  "paths": ["streams/a.csv", "streams/b.csv"]}],
+    )
+
+    result = _manifest_result(root)
+    assert result.status.value == "fail"
+    assert "streams/b.csv" in result.message
+    assert "streams/a.csv" not in result.message
+
+
+def test_session_manifest_reports_a_source_path_that_leaves_the_session(tmp_path):
+    root = _session_with_sources(
+        tmp_path, present=(), listed=(),
+        sources=[_source("device", "decoded_can_and_device_events", "../outside.csv")],
+    )
+
+    result = _manifest_result(root)
+    assert result.status.value == "fail"
+    assert "escapes session" in result.message
+
+
+def test_session_manifest_skips_an_empty_entry_among_a_sources_paths(tmp_path):
+    root = _session_with_sources(
+        tmp_path, present=(), listed=(),
+        sources=[{**_source("device", "decoded_can_and_device_events", "streams"),
+                  "paths": [None, ""]}],
+    )
+
+    assert _manifest_result(root).status.value == "pass"
+
+
+# What _write_session lists whenever it exists, bar alignment.json (every session has
+# that one) and the raw latency streams (left out when their writer is still closing).
+_FINALIZED_FILES = (
+    "streams/device.csv",
+    "streams/events.csv",
+    "streams/trials.jsonl",
+    "streams/trial_summary.json",
+    "streams/laser.csv",
+    "streams/pressure.csv",
+    "logs/session.log",
+    "streams/camera_alignment.json",
+    "streams/nidaq.h5",
+    "streams/latency.h5",
+    "20260102_test_session001_frame_timing.csv",
+    "streams/tracking/trial_000001_attempt_001.json",
+)
+
+
+def _session_with_finalized_files(tmp_path, *, unlisted=()):
+    root = _session(tmp_path)
+    for relative in _FINALIZED_FILES:
+        _write(root / relative, f"{relative}\n")
+    _publish_stream_manifest(
+        root,
+        files=[
+            _manifest_entry(root, relative)
+            for relative in ("streams/alignment.json", *_FINALIZED_FILES)
+            if relative not in unlisted
+        ],
+    )
+    return root
+
+
+@pytest.mark.parametrize("relative", ("streams/alignment.json", *_FINALIZED_FILES))
+def test_session_manifest_fails_a_finalized_file_on_disk_that_is_not_listed(
+    tmp_path, relative,
+):
+    # No enabled source names pressure.csv, camera_alignment.json, the frame timing or a
+    # tracking file, so the source check cannot see them go missing from the list.
+    root = _session_with_finalized_files(tmp_path, unlisted=(relative,))
+
+    for profile in (ValidationProfile.QUICK, ValidationProfile.FULL):
+        result = _manifest_result(root, profile)
+        assert result.status.value == "fail", profile
+        assert f"unlisted {relative}" in result.message
+
+
+def test_session_manifest_passes_when_every_finalized_file_is_listed(tmp_path):
+    root = _session_with_finalized_files(tmp_path)
+
+    for profile in (ValidationProfile.QUICK, ValidationProfile.FULL):
+        assert _manifest_result(root, profile).status.value == "pass", profile
+
+
+def test_session_manifest_does_not_require_a_raw_latency_stream(tmp_path):
+    # Finalization leaves one out of the list when its writer was still closing it, and
+    # a later rewrite cannot say that it is final.
+    root = _session_with_finalized_files(tmp_path)
+    _write(root / "streams/latency/camera_right.h5", "raw")
+
+    assert _manifest_result(root, ValidationProfile.FULL).status.value == "pass"
+
+
+def test_session_manifest_matches_a_listed_file_whatever_its_spelling(tmp_path):
+    spellings = (
+        "./streams/device.csv",
+        "streams/../streams/nidaq.h5",
+        (tmp_path / "session001" / "streams/laser.csv").as_posix(),
+    )
+    root = _session_with_sources(tmp_path, present=_SOURCE_FILES, listed=spellings)
+
+    assert _manifest_result(root, ValidationProfile.FULL).status.value == "pass"
+
+
+def test_validation_passes_after_the_post_stop_trial_ledger_update(tmp_path):
+    from datetime import datetime
+
+    from autotrainer.core import ProjectInfo
+    from tools.acquisition.model.session_data_recorder import SessionDataRecorder
+
+    project = ProjectInfo(root=str(tmp_path), device_id="test",
+                          when=datetime(2026, 1, 2, 3, 4, 5), session=7)
+    root = Path(project.get_session_path().location)
+    (root / "streams/tracking").mkdir(parents=True)
+    tracking = root / "streams/tracking/trial_000001_attempt_001.json"
+    tracking.write_text(json.dumps({"window": {"startPerf": 10.3, "endPerf": 11.0}}))
+    pending = {
+        "session_id": project.short_id, "operation_id": "send-1", "trial_id": 1,
+        "attempt_id": 1, "attempt_label": "1.1", "send_perf_time": 10.25,
+        "outcome": "pending_analysis",
+    }
+    # The files other processes write: video, pose and stim evidence.
+    unlisted_files = (
+        "session007_left.mp4",
+        "session007_left_raw2D_live.h5",
+        "streams/stim_camera_evidence.h5",
+    )
+    for relative in unlisted_files:
+        (root / relative).write_bytes(b"written elsewhere")
+    SessionDataRecorder._write_session(
+        project, 10.0, 100.0, 12.0, (), (), (), (),
+        trial_records=(pending,),
+        trial_summary={"pending_analysis_attempts": 1},
+        # The sources the app builds (_build_session_source_manifest).
+        source_manifest=(
+            _source("camera.left", "camera", "video/left"),
+            _source("pose", "pose", "pose"),
+            _source("nidaq.force", "nidaq_analog", "streams/nidaq.h5"),
+            _source("device", "decoded_can_and_device_events", "streams/device.csv"),
+            _source("stim_camera_evidence", "stim_camera_detection_evidence",
+                    "streams/stim_camera_evidence.h5"),
+            _source("laser_outputs", "laser_commands_and_states", "streams/laser.csv"),
+            _source("session_logs", "logs", "logs/session.log"),
+            _source("trials", "pellet_trial_ledger", "streams/trials.jsonl"),
+        ),
+        source_results={
+            "camera.left": {"sampleCount": 3, "path": "session007_left.mp4", "failure": ""},
+        },
+    )
+    # What persist_trial_tracking and then the ledger update do once analysis ends.
+    record = json.loads(tracking.read_text())
+    tracking.write_text(json.dumps({**record, "result": {"outcome": "success"}}))
+    SessionDataRecorder.update_persisted_trial_ledger(
+        project, ({**pending, "outcome": "success"},),
+        {"pending_analysis_attempts": 0, "scored_trials": 1},
+    )
+    # The metadata publish that follows analysis hashes the stream manifest it left.
+    _write(root / "metadata.json", json.dumps({"metadataGenerationId": "g"}))
+    _write(root / "manifest.json", json.dumps({
+        "schemaVersion": 1,
+        "files": [_manifest_entry(root, "metadata.json"),
+                  _manifest_entry(root, "streams/stream_manifest.json")],
+    }))
+
+    stream = json.loads((root / "streams/stream_manifest.json").read_text())
+    listed = {item["path"] for item in stream["files"]}
+    on_disk = {
+        relative
+        for source in stream["enabledSources"]
+        for relative in (source.get("paths") or [source["path"]])
+        if (root / relative).is_file()
+    }
+    # Every source's file is there, so the pass is not for want of anything to check;
+    # and the recorder lists the exempt ones no more than the rule expects it to.
+    assert {"streams/nidaq.h5", *unlisted_files} <= on_disk
+    assert not set(unlisted_files) & listed
+    assert {"streams/pressure.csv", "streams/alignment.json"} <= listed
+    result = _manifest_result(root, ValidationProfile.FULL)
+    assert result.status.value == "pass", result.message
+
+
+# ------------------------------------- the camera/NI frame anchor (alignment.frames)
+
+_FIT = {"valid": True, "method": "raw_bridged", "reason": "", "knotCount": 7}
+
+
+def _camera_alignment(**changes):
+    """cameraNidaqAlignment as the recorder writes a clean schema-3 latch anchor."""
+    return {
+        "status": "matched",
+        "confidence": "hardware_edge",
+        "anchorMethod": "camera_latch",
+        "niToHost": dict(_FIT),
+        "exposureSeconds": 0.000175,
+        "expectedLagSeconds": 0.001275,
+        "impliedLagSeconds": 0.001156,
+        "lagGateSeconds": [0.000275, 0.002275],
+        "latch": {"status": "paired", "shift": 0},
+        "anchorsAgree": True,
+        "reason": "Camera-clock latch pairing on the fitted NI timeline (shift 0)",
+        **changes,
+    }
+
+
+def _epoch_alignment(**changes):
+    """cameraNidaqAlignment from the epoch fallback, which leaves the fit-only fields unset."""
+    return _camera_alignment(**{
+        "confidence": "ambiguous_hardware_edge", "anchorMethod": "epoch_nearest_edge",
+        "expectedLagSeconds": None, "impliedLagSeconds": None, "lagGateSeconds": None,
+        "latch": None, "anchorsAgree": None,
+        **changes,
+    })
+
+
+def _alignment_session(tmp_path, camera=None, *, schema=3, nidaq=True, tone=None):
+    root = _session(tmp_path)
+    alignment_path = root / "streams/alignment.json"
+    alignment = json.loads(alignment_path.read_text(encoding="utf-8"))
+    alignment["schemaVersion"] = schema
+    alignment["cameraNidaqAlignment"] = (
+        _camera_alignment() if camera is None else camera
+    )
+    if tone is not None:
+        alignment["toneConfirmation"] = tone
+    _write(alignment_path, json.dumps(alignment))
+    if nidaq:
+        manifest_path = root / "streams/stream_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["enabledSources"] = [
+            _source("nidaq.cam_frames", "nidaq_digital", "streams/nidaq.h5")]
+        _write(manifest_path, json.dumps(manifest))
+    return root
+
+
+def _alignment_result(root, profile=ValidationProfile.QUICK):
+    report = validate_session(
+        root, profile=profile, selected_rules=("alignment.frames",))
+    return next(item for item in report.results if item.rule_id == "alignment.frames")
+
+
+def test_frame_alignment_passes_a_clean_anchor_in_the_automatic_quick_check(tmp_path):
+    result = _alignment_result(_alignment_session(tmp_path))
+    assert result.status.value == "pass", result.message
+    assert "camera_latch" in result.message
+    assert result.observed["anchorMethod"] == "camera_latch"
+    assert result.observed["niToHostMethod"] == "raw_bridged"
+
+
+@pytest.mark.parametrize("camera, key, value", (
+    # A perf-only fit: RAW was left out, and the fit says why without failing.
+    (_camera_alignment(niToHost={**_FIT, "method": "piecewise_envelope",
+                                 "reason": "RAW on 40 stamps, need 100"}),
+     "niToHostReason", "RAW on 40 stamps, need 100"),
+    # No exposure: the anchor took the bare allowance, and the gate still held.
+    (_camera_alignment(anchorMethod="expected_lag", exposureSeconds=None,
+                       anchorsAgree=None, latch={"status": "unavailable",
+                                                 "reason": "no latency stream"},
+                       reason="cam_frames transition nearest the expected exposure "
+                              "edge on the fitted NI timeline; exposure unknown, "
+                              "assumed 0"),
+     "reason", "cam_frames transition nearest the expected exposure edge on the "
+               "fitted NI timeline; exposure unknown, assumed 0"),
+    # A latch pairing that was tried and not used, with the gate passing.
+    (_camera_alignment(anchorMethod="expected_lag", anchorsAgree=None,
+                       latch={"status": "ambiguous", "reason": "two shifts tie"}),
+     "latchReason", "two shifts tie"),
+), ids=("perf-only-fit", "exposure-unknown", "latch-not-used"))
+def test_frame_alignment_records_what_does_not_degrade_the_anchor(
+        tmp_path, camera, key, value):
+    result = _alignment_result(_alignment_session(tmp_path, camera))
+    assert result.status.value == "pass", result.message
+    assert result.observed[key] == value
+
+
+@pytest.mark.parametrize("camera, expected", (
+    (_epoch_alignment(
+        niToHost={**_FIT, "valid": False, "reason": "fewer than 100 stamps"},
+        reason="NI-to-host fit unavailable (fewer than 100 stamps); nearest "
+               "cam_frames transition on the NI-DAQ epoch timeline"),
+     "fewer than 100 stamps"),
+    # The fit is valid and still maps the frames; only the edge was picked on the epoch.
+    (_epoch_alignment(
+        reason="fitted anchor failed (ValueError: empty spool); nearest "
+               "cam_frames transition on the NI-DAQ epoch timeline"),
+     "fitted anchor failed"),
+    (_epoch_alignment(
+        status="unmatched", confidence="none",
+        niToHost=None,
+        reason="NI-to-host fit unavailable (no NI-to-host fit); Nearest cam_frames "
+               "edge was outside half of the observed frame period"),
+     "no NI-to-host fit"),
+    (_camera_alignment(anchorMethod=None, reason="matched without a method"),
+     "unrecognised anchor method"),
+    (_camera_alignment(
+        confidence="ambiguous_hardware_edge", anchorMethod="expected_lag",
+        anchorsAgree=None, latch={"status": "unavailable"},
+        reason="cam_frames transition nearest the expected exposure edge on the "
+               "fitted NI timeline; implied lag 2.900 ms is outside the gate "
+               "0.275..2.275 ms"),
+     "outside the gate"),
+    (_camera_alignment(
+        confidence="ambiguous_hardware_edge", anchorsAgree=False,
+        reason="Camera-clock latch pairing on the fitted NI timeline (shift 1); "
+               "the camera-latch anchor (sample 40) and the expected-lag anchor "
+               "(sample 107) disagree"),
+     "disagree"),
+    (_camera_alignment(
+        status="unmatched", confidence="none", anchorMethod=None,
+        impliedLagSeconds=None, latch=None, anchorsAgree=None,
+        reason="Nearest cam_frames transition to the expected exposure edge was "
+               "outside half of the observed frame period"),
+     "outside half of the observed frame period"),
+    (_camera_alignment(
+        status="host_estimated", confidence="host_estimated",
+        anchorMethod="host_estimated", impliedLagSeconds=None, latch=None,
+        anchorsAgree=None,
+        reason="cam_frames was not configured; alignment uses the single NI-DAQ "
+               "epoch anchor"),
+     "cam_frames was not configured"),
+), ids=("epoch-fallback", "fitted-anchor-failed", "epoch-unmatched",
+        "unknown-method", "outside-gate", "anchors-disagree", "unmatched",
+        "host-estimated"))
+def test_frame_alignment_warns_on_a_degraded_anchor_with_the_recorders_reason(
+        tmp_path, camera, expected):
+    result = _alignment_result(_alignment_session(tmp_path, camera))
+    assert result.status.value == "warning", result.message
+    assert expected in result.message
+    assert "cameraNidaqAlignment.reason" in result.remediation
+
+
+def test_frame_alignment_does_not_call_a_valid_fit_invalid_when_the_anchor_failed(
+        tmp_path):
+    # The fit still maps the frames; only the first frame's edge came off the epoch.
+    camera = _epoch_alignment(
+        reason="fitted anchor failed (ValueError: empty spool); nearest "
+               "cam_frames transition on the NI-DAQ epoch timeline")
+    result = _alignment_result(_alignment_session(tmp_path, camera))
+    assert result.status.value == "warning", result.message
+    assert result.message.startswith("the first frame was anchored on the NI epoch timeline")
+    assert "fit is invalid" not in result.message
+    assert result.observed["niToHostValid"] is True
+
+
+def test_frame_alignment_warns_when_no_anchor_was_recorded(tmp_path):
+    root = _alignment_session(tmp_path)
+    alignment_path = root / "streams/alignment.json"
+    alignment = json.loads(alignment_path.read_text(encoding="utf-8"))
+    del alignment["cameraNidaqAlignment"]
+    _write(alignment_path, json.dumps(alignment))
+    result = _alignment_result(root)
+    assert result.status.value == "warning", result.message
+    assert "cameraNidaqAlignment is missing" in result.message
+    assert "cameraNidaqAlignment.reason" not in result.remediation
+
+
+def test_frame_alignment_warns_when_the_tones_fell_back_to_the_epoch(tmp_path):
+    tone = {"matched": [], "hostTimeFallbackReason": "ValueError: bad device row"}
+    result = _alignment_result(_alignment_session(tmp_path, tone=tone))
+    assert result.status.value == "warning", result.message
+    assert "ValueError: bad device row" in result.message
+    # The frame anchor itself is clean, so only the tones are pointed at.
+    assert "toneConfirmation.hostTimeFallbackReason" in result.remediation
+    assert "cameraNidaqAlignment" not in result.remediation
+
+
+def test_frame_alignment_warns_on_a_session_recorded_before_the_drift_correction(
+        tmp_path):
+    root = _alignment_session(tmp_path, schema=2)
+    result = _alignment_result(root)
+    assert result.status.value == "warning", result.message
+    assert "predates" in result.message and "15 of 36" in result.message
+    assert result.observed["schemaVersion"] == 2
+
+
+def _alignment_session_without_stream_manifest(tmp_path):
+    # Sessions from before the stream manifest (August 2026) have alignment.json alone.
+    root = _alignment_session(tmp_path, schema=1)
+    (root / "streams/stream_manifest.json").unlink()
+    return root
+
+
+@pytest.mark.parametrize("build", (
+    _alignment_session_without_stream_manifest,
+    lambda tmp_path: _alignment_session(tmp_path, nidaq=False),
+    lambda tmp_path: _alignment_session(tmp_path, schema=2, nidaq=False),
+    lambda tmp_path: _alignment_session(tmp_path, _camera_alignment(
+        status="unavailable", confidence="none", anchorMethod=None,
+        reason="No NI-DAQ samples were saved for the session")),
+    # An old session that saved no samples has no frame anchor to doubt.
+    lambda tmp_path: _alignment_session(tmp_path, _camera_alignment(
+        status="unavailable", confidence="none", anchorMethod=None,
+        reason="No NI-DAQ samples were saved for the session"), schema=2),
+), ids=("no-stream-manifest", "no-nidaq", "old-session-without-nidaq",
+        "no-samples-saved", "old-session-no-samples-saved"))
+def test_frame_alignment_is_not_applicable_without_ni_samples(tmp_path, build):
+    result = _alignment_result(build(tmp_path))
+    assert result.status.value == "not_applicable", result.message

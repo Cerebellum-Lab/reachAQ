@@ -43,6 +43,7 @@ def _inference(status, process):
     model._status = status
     model._pose_process = process
     model._pose_process_error = None
+    model._msg_thread_exit = threading.Event()
     model.stop_calls = 0
 
     def stop():
@@ -310,6 +311,41 @@ def test_a_live_queue_is_not_closed_while_its_reader_runs(monkeypatch):
     model.start(live_queue)
 
     assert not live_queue.consumer_closed
+
+
+# -- closing the message loop ---------------------------------------------
+#
+# The loop used to end only on a None that terminate() puts in its queue. A
+# stop() running on the loop's own thread - a pose crash at close - clears that
+# queue and could drain the None, and terminate() then waited on
+# msg_thread.join() with no timeout: the app hung on close.
+
+def test_the_message_loop_ends_on_its_exit_event_without_a_sentinel():
+    model = _inference(InferenceStatus.stopped, None)
+    model._notif_msg_queue = queue.Queue()
+    loop = threading.Thread(target=model._monitor_msg_queue, daemon=True)
+    loop.start()
+
+    model._msg_thread_exit.set()
+    loop.join(2.0)
+
+    assert not loop.is_alive(), "the loop ran on with its exit event set"
+
+
+def test_terminate_does_not_wait_forever_for_the_message_loop():
+    model = _inference(InferenceStatus.stopped, None)  # stop() is a no-op here
+    joins = []
+    model._msg_thread = SimpleNamespace(
+        join=lambda timeout=None: joins.append(timeout), is_alive=lambda: True)
+    model._notif_msg_queue = queue.Queue()
+    model._data_monitor_cmd_queue = queue.Queue()
+    model._output_data_queue = queue.Queue()
+    model._cmd_queue = queue.Queue()
+
+    model.terminate(timeout=0.5)
+
+    assert model._msg_thread_exit.is_set()
+    assert joins == [0.5]
 
 
 # -- carrying the reason --------------------------------------------------

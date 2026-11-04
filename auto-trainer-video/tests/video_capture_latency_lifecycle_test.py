@@ -155,3 +155,64 @@ def test_a_close_thread_that_cannot_start_falls_back_to_closing_in_place(project
 
     assert writer.finished.is_set()
     assert capture._latency is None
+
+
+class _NoClockCamera:
+    """A camera with no clock to latch, as CameraBase.latch_clock answers by default."""
+
+    def latch_clock(self):
+        return None
+
+
+def test_a_requested_close_runs_when_the_loop_has_nothing_to_record(project_info):
+    capture = _capture(project_info)
+    writer = capture._latency = _SlowWriter(delay=0.05)
+    capture._latency_close_requested = True
+
+    capture._end_latency_if_requested(_NoClockCamera())
+
+    assert capture._latency is None
+    assert capture._latency_close_requested is False
+    assert writer.finished.wait(5)
+    assert writer.closed_on.name == "LatencyClose-lifecycle"
+
+
+class _RecordLandsDuringMarkCamera:
+    """A camera whose clock latch is the moment a Record arrives (what _start_latency does)."""
+
+    def __init__(self, capture, other):
+        self._capture = capture
+        self._other = other
+
+    def latch_clock(self):
+        # _start_latency: the Record closes the old stream, clears the request
+        # and opens the next stream, all while the idle close is taking its latches.
+        self._capture._latency_close_requested = False
+        self._capture._latency = self._other
+        return None
+
+
+def test_an_idle_close_leaves_a_stream_a_record_opened_meanwhile(project_info):
+    capture = _capture(project_info)
+    writer = capture._latency = _SlowWriter(delay=0.05)
+    capture._latency_close_requested = True
+    other = _SlowWriter(delay=0.05)
+
+    capture._end_latency_if_requested(_RecordLandsDuringMarkCamera(capture, other))
+
+    assert capture._latency is other
+    # Longer than either writer's 0.05 s close: this call closes neither, since
+    # the Record owns both from here (it closed the old one, and the new one is its own).
+    time.sleep(0.3)
+    assert not other.finished.is_set()
+    assert not writer.finished.is_set()
+
+
+def test_without_a_request_the_idle_loop_leaves_the_stream_open(project_info):
+    capture = _capture(project_info)
+    writer = capture._latency = _SlowWriter(delay=0.05)
+
+    capture._end_latency_if_requested(_NoClockCamera())
+
+    assert capture._latency is writer
+    assert not writer.finished.is_set()

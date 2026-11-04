@@ -14,7 +14,7 @@ import logging
 import math
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Mapping, Optional, Union
 
 import numpy
 
@@ -87,10 +87,19 @@ def _app_version() -> str:
         return ""
 
 
-def _read_h5(path: Path) -> dict:
-    """Every dataset and attribute of a raw stream, retrying while a writer still holds it."""
+def read_raw_stream(path: Path, *, retry_seconds: Optional[float] = None) -> dict:
+    """Every dataset and attribute of a raw stream, retrying while a writer still holds it.
+
+    Also the session recorder's way in: its frame anchor reads the primary
+    camera's stream before this finalizer runs, and the capture process
+    closes that stream with no handshake. The anchor passes a shorter
+    retry_seconds, since it has a fallback and sits on the stop path. None
+    means OPEN_RETRY_SECONDS as it is when the call is made (a default bound
+    at import would ignore a test's monkeypatch of it).
+    """
     import h5py
-    deadline = time.monotonic() + OPEN_RETRY_SECONDS
+    budget = OPEN_RETRY_SECONDS if retry_seconds is None else retry_seconds
+    deadline = time.monotonic() + float(budget)
     while True:
         try:
             with h5py.File(path, "r") as store:
@@ -104,12 +113,15 @@ def _read_h5(path: Path) -> dict:
             time.sleep(0.1)
 
 
+_read_h5 = read_raw_stream
+
+
 def _read_nidaq(path: Path) -> dict:
     """What the loops need from nidaq.h5, reduced one array at a time.
 
     An hour at 10 kHz is tens of millions of samples per channel, and this runs
     inside the live app's finalization, so nothing sample-sized outlives its
-    use: the block end times, the camera line's transitions and each laser
+    use: the block stamps, the camera line's transitions and each laser
     channel's edges are kept, and the samples they came from are dropped.
     """
     import h5py
@@ -118,8 +130,9 @@ def _read_nidaq(path: Path) -> dict:
         rate = float(store.attrs.get("sample_rate_hz", math.nan))
         result = {
             "names": names, "rate": rate,
-            "block_ends": (numpy.empty(0, dtype=numpy.int64), numpy.empty(0)),
-            "transitions": None, "edges": {}, "problems": {},
+            "block_stamps": clocks.block_stamps_from_runs(numpy.empty(0, dtype=numpy.int64),
+                                                          numpy.empty(0)),
+            "transitions": None, "edges": {}, "problems": {}, "raw_problem": "",
         }
         if not math.isfinite(rate):
             return result
@@ -134,8 +147,25 @@ def _read_nidaq(path: Path) -> dict:
         index = (numpy.arange(first, first + count, dtype=numpy.int64) if consecutive
                  else stored[()])
         seen = store["block_observation_perf_time"][()]
-        result["block_ends"] = clocks.ni_block_ends(index, seen)
-        del seen
+        # Older sessions have no RAW column; the selector then fits perf alone.
+        # A column that is there but unusable costs the RAW bridge, not the file.
+        raw = column = None
+        if "block_observation_raw_time" in store:
+            try:
+                column = numpy.asarray(store["block_observation_raw_time"][()], dtype=numpy.float64)
+                if column.shape == seen.shape:
+                    raw = column
+                else:
+                    result["raw_problem"] = (f"{column.size} values against {seen.size} "
+                                             "block_observation_perf_time stamps")
+            except Exception as error:
+                result["raw_problem"] = _describe(error)
+            if result["raw_problem"]:
+                logger.warning("nidaq.h5 block_observation_raw_time is unusable (%s); "
+                               "fitting the perf stamps alone", result["raw_problem"])
+        result["block_stamps"] = clocks.ni_block_stamps(index, seen, raw)
+        # column is the same array as raw: left bound it would outlive both through the scans.
+        del seen, raw, column
         if consecutive:
             index = None
 
@@ -180,7 +210,7 @@ def _frame_period(frames) -> float:
         return math.nan
 
 
-def _guarded(name: str, fit) -> clocks.ClockFit:
+def _guarded(name: str, fit) -> Union[clocks.ClockFit, clocks.PiecewiseClockFit]:
     """A fit that raised is an invalid fit with the exception as its reason."""
     try:
         return fit()
@@ -270,9 +300,12 @@ class _Context:
         if nidaq_path.is_file():
             try:
                 self.nidaq = _read_nidaq(nidaq_path)
+                if self.nidaq["raw_problem"]:
+                    status["reasons"].append(
+                        f"nidaq.h5 RAW stamps unusable: {self.nidaq['raw_problem']}")
             except Exception as error:
                 logger.exception("nidaq.h5 could not be read for the latency record")
-                self.faults["nidaq"] = _describe(error)
+                self.faults["nidaq"] = f"unreadable: {_describe(error)}"
                 status["reasons"].append(f"nidaq.h5 unreadable: {_describe(error)}")
         self.ni_to_host = clocks.invalid_fit("no NI stream")
         self.camera_to_ni = clocks.invalid_fit("not fitted")
@@ -319,11 +352,13 @@ class _Context:
             record["niToHost"] = self.ni_to_host.as_record()
             record["cameraToNi"] = {"valid": False, "reason": "no NI stream"}
             return
-        ends, seen = ni["block_ends"]
+        stamps = ni["block_stamps"]
         self.ni_to_host = _guarded(
-            "NI-to-host", lambda: clocks.fit_ni_to_host(ends, seen, ni["rate"]))
+            "NI-to-host", lambda: clocks.fit_ni_to_host_timeline(stamps, ni["rate"]))
+        # The knot table is alignment.json's; here only its summary, which
+        # fits an HDF5 attribute and the session metadata.
         record["niToHost"] = {
-            **self.ni_to_host.as_record(),
+            **self.ni_to_host.as_record(include_knots=False),
             "note": "mapped NI times are late by the unmeasured minimum delivery delay",
         }
         transition_index = ni["transitions"]
@@ -420,7 +455,7 @@ def _blame(result: dict, ctx: _Context, *keys: str) -> dict:
     """An absent loop whose input could not be read says so, not 'no rows'."""
     if result.get("status") != "absent":
         return result
-    broken = [f"{key}.h5 unreadable: {ctx.faults[key]}" for key in keys if key in ctx.faults]
+    broken = [f"{key}.h5 {ctx.faults[key]}" for key in keys if key in ctx.faults]
     return {**result, "reason": "; ".join(broken)} if broken else result
 
 
@@ -497,7 +532,7 @@ def _writer_problem(path: str, attrs: dict) -> str:
     return f"{path}: writer lost rows: {detail}" + (f" ({first_error})" if first_error else "")
 
 
-def _overall(results: dict, reasons: list, unreadable: list) -> str:
+def _overall(results: dict, reasons: list, unreadable: list, unwritten: list) -> str:
     states = {result.get("status") for result in results.values()}
     produced = any(
         result.get("status") in ("complete", "partial") and len(result.get("stages", ())) > 0
@@ -505,7 +540,7 @@ def _overall(results: dict, reasons: list, unreadable: list) -> str:
     if not produced:
         # Nothing was measured. That is only "absent" when nothing went wrong:
         # a loop that failed, or a stream that could not be read, is a failure.
-        return "failed" if ("failed" in states or unreadable) else "absent"
+        return "failed" if ("failed" in states or unreadable or unwritten) else "absent"
     complete = states <= {"complete", "absent"} and not reasons
     return "complete" if complete else "partial"
 
@@ -561,30 +596,41 @@ def _write_output(path: Path, results: dict, status: dict, *, session_id: str,
 
 
 def _read_streams(session_dir: Path, raw_dir: Path, status: dict) -> tuple:
-    """Every raw stream that opens, and a reason for each that does not."""
+    """Every raw stream that opens, and a reason for each that does not.
+
+    One OPEN_RETRY_SECONDS deadline covers reading and retrying across the whole
+    directory, not each file, so a session with several streams still being
+    closed does not hold finalization for a multiple of it.
+    """
     raw, faults = {}, {}
+    deadline = time.monotonic() + OPEN_RETRY_SECONDS
     for path in sorted(raw_dir.glob("*.h5")):
         try:
-            raw[path.stem] = _read_h5(path)
+            raw[path.stem] = _read_h5(path, retry_seconds=max(0.0, deadline - time.monotonic()))
         except Exception as error:
             relative = path.relative_to(session_dir).as_posix()
             logger.warning("Latency stream %s could not be read: %s", relative, _describe(error))
-            faults[path.stem] = _describe(error)
+            faults[path.stem] = f"unreadable: {_describe(error)}"
             status["unreadable"].append({"path": relative, "reason": _describe(error)})
             status["reasons"].append(f"{relative} unreadable: {_describe(error)}")
     return raw, faults
 
 
 def _finalize(session_dir, primary_camera: str, output_name: str, session_id: str,
-              status: dict) -> None:
+              status: dict, unwritten: Mapping[str, str]) -> None:
     session_dir = Path(session_dir)
     streams = session_dir / "streams"
     raw_dir = streams / "latency"
+    for stem, reason in unwritten.items():
+        status["unwritten"].append({"path": f"streams/latency/{stem}.h5", "reason": reason})
+        status["reasons"].append(f"streams/latency/{stem}.h5 not written: {reason}")
     if not raw_dir.is_dir() or not any(raw_dir.glob("*.h5")):
-        status["status"] = "absent"
-        status["reasons"].append("no raw latency streams in this session")
+        status["status"] = "failed" if unwritten else "absent"
+        if not unwritten:
+            status["reasons"].append("no raw latency streams in this session")
         return
     raw, faults = _read_streams(session_dir, raw_dir, status)
+    faults.update({stem: f"not written: {reason}" for stem, reason in unwritten.items()})
     context = _Context(raw, faults, streams, primary_camera, status)
     for stem, stream in raw.items():
         problem = _writer_problem(f"streams/latency/{stem}.h5", stream.get("attrs", {}))
@@ -599,7 +645,8 @@ def _finalize(session_dir, primary_camera: str, output_name: str, session_id: st
             results[loop] = {"status": "failed", "reason": _describe(error)}
         status["loops"][loop] = {key: results[loop].get(key)
                                  for key in ("status", "reason", "summary")}
-    status["status"] = _overall(results, status["reasons"], status["unreadable"])
+    status["status"] = _overall(results, status["reasons"], status["unreadable"],
+                                status["unwritten"])
     status["output"] = output_name
     try:
         _write_output(streams / output_name, results, status, session_id=session_id,
@@ -613,12 +660,19 @@ def _finalize(session_dir, primary_camera: str, output_name: str, session_id: st
 
 def finalize_session_latency(session_dir, *, primary_camera: str,
                              output_name: str = LATENCY_OUTPUT_NAME,
-                             session_id: str = "") -> dict:
-    """Analyse one session's latency streams; never raises."""
+                             session_id: str = "",
+                             unwritten: Optional[Mapping[str, str]] = None) -> dict:
+    """Analyse one session's latency streams; never raises.
+
+    `unwritten` maps the stem of a raw stream whose writer failed (e.g. "events") to why it
+    failed; each is named in the status's "unwritten" and "reasons", so the status is never
+    "complete" or "absent".
+    """
     status = {"status": "failed", "output": None, "loops": {}, "clocks": {}, "reasons": [],
-              "unreadable": []}
+              "unreadable": [], "unwritten": []}
     try:
-        _finalize(session_dir, primary_camera, output_name, session_id, status)
+        _finalize(session_dir, primary_camera, output_name, session_id, status,
+                  dict(unwritten or {}))
     except Exception as error:
         logger.exception("Latency finalization failed")
         status["status"] = "failed"
@@ -628,4 +682,4 @@ def finalize_session_latency(session_dir, *, primary_camera: str,
     except Exception as error:
         return {"status": "failed", "output": None, "loops": {}, "clocks": {},
                 "reasons": [f"status could not be serialised: {_describe(error)}"],
-                "unreadable": []}
+                "unreadable": [], "unwritten": []}

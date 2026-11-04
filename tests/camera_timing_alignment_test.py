@@ -51,6 +51,38 @@ def test_alignment_joins_by_actual_frame_id_and_marks_missing(tmp_path):
     assert json.loads(diagnostics_path.read_text()) == diagnostics
 
 
+def test_alignment_counts_each_cameras_present_frames(tmp_path):
+    """The exact count the session metadata derives frames dropped from.
+
+    A frame is present when the camera has an arrival time for it. A frame
+    the capture filled with a blank has a row but no arrival time, and one
+    the camera never reported has no row at all.
+    """
+    primary = tmp_path / "left.txt"
+    secondary = tmp_path / "right.txt"
+    _write_timestamps(primary, (100, 101, 102, 103))
+    _write_timestamps(secondary, (100, 101, 103))
+    lines = secondary.read_text(encoding="utf-8").splitlines()
+    fields = lines[1].split(", ")
+    fields[2] = "nan"
+    lines[1] = ", ".join(fields)
+    secondary.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    diagnostics = align_camera_timestamp_files(
+        (
+            CameraTimestampInput("left", "left", primary),
+            CameraTimestampInput("right", "right", secondary),
+        ),
+        output_path=tmp_path / "frame_timing.csv",
+        diagnostics_path=tmp_path / "camera_alignment.json",
+        primary_frame_id=100,
+        primary_fps=150,
+    )
+
+    assert diagnostics["cameras"]["left"]["presentFrames"] == 4
+    assert diagnostics["cameras"]["right"]["presentFrames"] == 2
+
+
 @pytest.mark.parametrize(
     ("frame_ids", "message"),
     (

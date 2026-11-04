@@ -102,6 +102,7 @@ def test_the_clock_latch_row_is_pinned():
     # is a schema change, not a refactor.
     assert schema.CLOCK_LATCH_DTYPE == numpy.dtype([
         ("perf_before", "<f8"), ("camera_ns", "<i8"), ("perf_after", "<f8"),
+        ("raw_before", "<f8"), ("raw_after", "<f8"),
     ])
 
 

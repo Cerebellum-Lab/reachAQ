@@ -191,6 +191,29 @@ def test_maybe_crop_wraps_for_a_real_region():
     assert result.inner is inner
 
 
+def test_models_are_cropped_by_default():
+    """DeepLabCut is fully convolutional: a crop keeps the scale it was trained at."""
+    assert _RecordingModel().crop_preserves_scale
+
+
+def test_a_yolo_model_is_never_cropped_and_the_roi_is_said_to_be_ignored(monkeypatch):
+    """A YOLO graph runs at its imgsz whatever it is handed, so a crop saves no
+    time and only changes the scale the model was trained at. YOLO is the live
+    model because it is the fastest; it keeps running, on the full frame."""
+    from autotrainer.inference import cropped_pose_model
+    from autotrainer.inference.yolo import YoloPoseModel
+
+    warnings = []
+    monkeypatch.setattr(cropped_pose_model.logger, "warning",
+                        lambda message, *args: warnings.append(message % args))
+    yolo = YoloPoseModel("/unused", batch_size=2)
+
+    result = maybe_crop(yolo, (256, 256), roi=InferenceRoi(16, 16, 128, 128))
+
+    assert result is yolo
+    assert any(INFERENCE_ROI_ENV_VAR in warning for warning in warnings)
+
+
 def test_maybe_crop_rejects_a_region_outside_the_frame():
     with pytest.raises(ValueError):
         maybe_crop(_RecordingModel(), (256, 256), roi=InferenceRoi(200, 0, 128, 64))

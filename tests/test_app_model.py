@@ -2,6 +2,7 @@ import dataclasses
 import math
 import json
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -24,6 +25,7 @@ from autotrainer.behavior.pellet_trial import (
     TrialOutcome,
 )
 from autotrainer.device import CanFailure, CanFailureKind, Tone, Target
+from autotrainer.inference import InferenceStatus
 from tools.acquisition.model.app_model import (
     app_status_to_api_app_mode,
     app_status_to_behavior_algo_status,
@@ -34,6 +36,7 @@ from tools.acquisition.model.session_boundary import SessionBoundary
 from tools.acquisition.model.stimulus_profile_repository import (
     PROFILE_SCHEMA_VERSION,
 )
+from tools.acquisition.model.inference_model import InferenceModel
 from tools.acquisition.model.intertrial_analysis import (
     IntertrialAnalysisRequest,
     IntertrialAnalysisResult,
@@ -52,6 +55,7 @@ from tools.acquisition.model.session_stop_policy import (
     SessionStopPolicy,
     SessionStopReason,
 )
+from tools.acquisition.model.session_validation_controller import SessionValidationState
 from tools.acquisition.model.subsystem_status import (
     SubsystemId,
     SubsystemState,
@@ -1575,6 +1579,158 @@ def test_final_metadata_uses_canonical_boundary_not_stale_project_timestamp(
     }
 
 
+def test_inference_returning_to_live_after_stop_keeps_the_session_figures(
+    app_model,
+):
+    """After Stop the pose process handles EOF_RECORDING, goes offline and
+    comes straight back to live, while the session is still being finalized.
+
+    That used to re-baseline the counters for preview. The final freeze then
+    used the last recorded frame's time, which predates the new baseline, so
+    every healthy session on christielab10 saved 0.0 s and 0 frames, and the
+    panel showed the same after Stop.
+    """
+    telemetry = app_model.session_telemetry
+    _, token = app_model._recording_session.begin_record(
+        app_model.project.short_id, {},
+    )
+    app_model._recording_session.transition(
+        SessionRecordingStatus.RECORDING,
+        expected=(SessionRecordingStatus.ARMING,),
+        token=token,
+    )
+    telemetry.begin(10.0)
+    telemetry.record_capture(0, acquired=18_000, dropped=0)
+    telemetry.record_capture(1, acquired=18_000, dropped=0)
+    telemetry.record_inference(17_900, mean_ms=5.0, max_ms=13.0)
+    app_model._recording_session.transition(
+        SessionRecordingStatus.STOPPING,
+        expected=(SessionRecordingStatus.RECORDING,),
+        token=token,
+    )
+    app_model._on_session_capture_ended(RecordingEndingReason.MANUAL_STOP)
+    stopped = telemetry.summary()
+
+    app_model._on_inference_property_changed(
+        InferenceModel.STATUS, InferenceStatus.live, None,
+    )
+    telemetry.record_inference(18_200, mean_ms=6.0, max_ms=7.0)
+    # _complete_stopped_recording, with the last recorded frame's time.
+    telemetry.end(130.0)
+
+    assert telemetry.summary() == stopped
+    assert stopped["framesAcquired"] == 18_000
+    assert stopped["framesInferenced"] == 17_900
+
+
+def test_session_metadata_keeps_the_capture_figures_it_was_finalized_with(
+    app_model,
+    tmp_path,
+):
+    """A note saved after Stop rewrites the session metadata. By then the
+    counters may have been re-baselined for preview - acquisition restarted,
+    inference came back to live - and the session's figures must not follow.
+    """
+    telemetry = app_model.session_telemetry
+    _, token = app_model._recording_session.begin_record(
+        app_model.project.short_id, {},
+    )
+    app_model._recording_session.set_pending_end(12.5, token)
+    app_model._recording_session.set_boundary(SessionBoundary(
+        session_id=app_model.project.short_id,
+        primary_camera="left",
+        primary_frame_id=42,
+        start_perf_time=10.0,
+        start_wall_time=100.0,
+        camera_when=1_000_000.0,
+    ), token)
+    telemetry.begin(10.0)
+    telemetry.record_capture(0, acquired=375, dropped=0)
+    telemetry.record_inference(370, mean_ms=5.0, max_ms=13.0)
+    app_model._recording_session.transition(
+        SessionRecordingStatus.STOPPING,
+        expected=(SessionRecordingStatus.ARMING,),
+        token=token,
+    )
+    with mock.patch.object(
+        app_model._session_data_recorder, "stop"
+    ), mock.patch.object(
+        app_model, "_save_project_metadata"
+    ), mock.patch.object(
+        app_model._intertrial_analysis, "is_idle", return_value=False,
+    ), mock.patch.object(
+        app_model, "_wait_and_finish_intertrial_session",
+    ):
+        app_model._complete_stopped_recording(app_model.project)
+    finalized = telemetry.summary()
+
+    telemetry.begin()
+    telemetry.record_capture(0, acquired=900, dropped=0)
+    telemetry.record_inference(880, mean_ms=6.0, max_ms=7.0)
+    project = app_model.project.to_local_value()
+    output = tmp_path / "metadata"
+    app_model._save_metadata(project, project.when, str(output), project.session)
+
+    saved = json.loads(output.with_suffix(".json").read_text())
+    # No session files were written here, so there are no exact counts.
+    assert saved["capture"] == {**finalized, "exact": None}
+    assert saved["capture"]["elapsedSeconds"] == 2.5
+    assert saved["capture"]["framesAcquired"] == 375
+    assert saved["capture"]["framesInferenced"] == 370
+
+
+def test_finalized_capture_carries_exact_counts_from_the_session_files(
+    app_model,
+):
+    project = app_model.project
+    _, token = app_model._recording_session.begin_record(project.short_id, {})
+    app_model._recording_session.set_pending_end(12.5, token)
+    app_model._recording_session.set_boundary(SessionBoundary(
+        session_id=project.short_id,
+        primary_camera="left",
+        primary_frame_id=42,
+        start_perf_time=10.0,
+        start_wall_time=100.0,
+        camera_when=1_000_000.0,
+    ), token)
+    app_model._recording_session.transition(
+        SessionRecordingStatus.STOPPING,
+        expected=(SessionRecordingStatus.ARMING,),
+        token=token,
+    )
+    streams_dir = Path(project.get_session_path().location) / "streams"
+    streams_dir.mkdir(parents=True, exist_ok=True)
+    (streams_dir / "camera_alignment.json").write_text(json.dumps({
+        "primaryFrameCount": 4,
+        "cameras": {"left": {"presentFrames": 4}},
+    }))
+    _, _, posed_path = project.get_video_path("left", allow_overwrite=True)
+    Path(posed_path).write_text("0\n1\n3\n")
+
+    with mock.patch.object(
+        app_model._session_data_recorder, "stop"
+    ), mock.patch.object(
+        app_model, "_save_project_metadata"
+    ), mock.patch.object(
+        app_model._intertrial_analysis, "is_idle", return_value=False,
+    ), mock.patch.object(
+        app_model, "_wait_and_finish_intertrial_session",
+    ):
+        app_model._complete_stopped_recording(project)
+
+    assert app_model._recording_session.capture_telemetry["exact"] == {
+        "framesRecorded": 4,
+        "cameras": {
+            "left": {"framesDropped": 0, "framesPosed": 3, "posedPercent": 75.0},
+        },
+    }
+    # The panel shows the same figures, and the boundary's duration.
+    telemetry = app_model.session_telemetry
+    assert telemetry.exact_capture == (
+        app_model._recording_session.capture_telemetry["exact"])
+    assert telemetry.exact_duration_seconds == pytest.approx(2.5)
+
+
 def test_metadata_pair_is_not_replaced_when_yaml_serialization_fails(
     app_model,
     tmp_path,
@@ -2025,3 +2181,184 @@ def test_session_end_home_failure_does_not_raise_or_change_can_status(app_model)
         SubsystemId.CAN_PELLET.value
     ].state is SubsystemState.READY
     on_error.assert_called_once()
+
+
+def _analyzing_session(app_model):
+    project = app_model.project
+    _, token = app_model._recording_session.begin_record(project.short_id, {})
+    app_model._recording_session.set_boundary(SessionBoundary(
+        session_id=project.short_id, primary_camera="left", primary_frame_id=42,
+        start_perf_time=10.0, start_wall_time=100.0, camera_when=1_000_000.0,
+    ), token)
+    app_model._recording_session.transition(
+        SessionRecordingStatus.STOPPING, expected=(SessionRecordingStatus.ARMING,), token=token)
+    app_model._recording_session.set_analysis_started(time.perf_counter())
+    app_model._recording_session.transition(
+        SessionRecordingStatus.ANALYZING, expected=(SessionRecordingStatus.STOPPING,), token=token)
+    return project, token
+
+
+def test_the_session_is_sealed_before_the_final_save_and_quick_validation(app_model):
+    project, token = _analyzing_session(app_model)
+    order = mock.Mock()
+    with mock.patch.object(
+        app_model._session_data_recorder, "load_trial_tracking_requests", return_value=((), ()),
+    ), mock.patch.object(app_model, "_save_project_metadata") as save, mock.patch.object(
+        app_model._session_data_recorder, "seal_session",
+    ) as seal, mock.patch.object(app_model._session_validation, "start") as start:
+        order.attach_mock(save, "save")
+        order.attach_mock(seal, "seal")
+        order.attach_mock(start, "start")
+        app_model._finish_intertrial_session(project, token)
+
+    session_path = Path(project.get_session_path(skip_ensure=True).location).resolve()
+    assert order.mock_calls == [
+        mock.call.seal(project.short_id),
+        mock.call.save(project, caller="intertrial_analysis_finished"),
+        mock.call.start(session_path, "quick", automatic=True),
+    ]
+    assert app_model.last_stopped_session_path == session_path
+    assert app_model.session_recording_status is SessionRecordingStatus.READY
+
+
+def test_a_failed_final_save_still_seals_but_does_not_validate(app_model):
+    project, token = _analyzing_session(app_model)
+    with mock.patch.object(
+        app_model._session_data_recorder, "load_trial_tracking_requests", return_value=((), ()),
+    ), mock.patch.object(
+        app_model, "_save_project_metadata", side_effect=RuntimeError("disk full"),
+    ), mock.patch.object(app_model._session_data_recorder, "seal_session") as seal, mock.patch.object(
+        app_model._session_validation, "start",
+    ) as start:
+        app_model._finish_intertrial_session(project, token)
+
+    # The stream files were already published by _write_session; arm() lifts the seal.
+    seal.assert_called_once_with(project.short_id)
+    start.assert_not_called()
+    assert app_model._pending_metadata_project is not None
+    assert "final metadata save failed: disk full" in app_model._recording_session.data_errors
+    assert app_model.session_recording_status is SessionRecordingStatus.READY
+
+
+def test_notes_save_without_a_running_validation_writes_at_once(app_model):
+    app_model._editable_notes_project = app_model.project.to_local_value()
+    with mock.patch.object(app_model, "_save_project_metadata") as save:
+        assert app_model.persist_stopped_session_notes() is True
+    save.assert_called_once_with(app_model._editable_notes_project, caller="session_notes_updated")
+
+
+def test_notes_wait_for_a_running_validation_and_are_saved_when_it_ends(app_model):
+    app_model._editable_notes_project = app_model.project.to_local_value()
+    states = [SessionValidationState(status="running", profile="quick")]
+    with mock.patch.object(
+        type(app_model._session_validation), "state",
+        new_callable=mock.PropertyMock, side_effect=lambda: states[-1],
+    ), mock.patch.object(app_model, "_save_project_metadata") as save:
+        assert app_model.persist_stopped_session_notes() is False
+        save.assert_not_called()
+        app_model._on_session_validation_state(states[-1])  # still running: nothing
+        save.assert_not_called()
+        states.append(SessionValidationState(status="pass", profile="quick"))
+        app_model._on_session_validation_state(states[-1])
+        save.assert_called_once_with(
+            app_model._editable_notes_project, caller="session_notes_updated")
+        app_model._on_session_validation_state(states[-1])  # a second end state: no second save
+        save.assert_called_once()
+
+
+def test_record_with_notes_waiting_on_a_validation_cancels_it_and_saves_them(app_model):
+    app_model._editable_notes_project = app_model.project.to_local_value()
+    app_model._notes_save_pending = True
+    states = [SessionValidationState(status="running", profile="quick")]
+
+    def cancel():
+        states.append(SessionValidationState(status="cancelled", profile="quick"))
+        app_model._on_session_validation_state(states[-1])
+        return True
+
+    with mock.patch.object(
+        type(app_model._session_validation), "state",
+        new_callable=mock.PropertyMock, side_effect=lambda: states[-1],
+    ), mock.patch.object(
+        app_model._session_validation, "cancel", side_effect=cancel,
+    ) as cancelled, mock.patch.object(app_model, "_save_project_metadata") as save:
+        app_model._flush_stopped_session_notes_now()
+
+    cancelled.assert_called_once_with()
+    save.assert_called_once_with(app_model._editable_notes_project, caller="session_notes_updated")
+    assert app_model._notes_save_pending is False
+
+
+def test_record_without_pending_notes_saves_without_touching_validation(app_model):
+    app_model._editable_notes_project = app_model.project.to_local_value()
+    with mock.patch.object(app_model._session_validation, "cancel") as cancelled, \
+            mock.patch.object(app_model, "_save_project_metadata") as save:
+        app_model._flush_stopped_session_notes_now()
+
+    cancelled.assert_not_called()
+    save.assert_called_once_with(app_model._editable_notes_project, caller="session_notes_updated")
+
+
+def test_record_within_the_autosave_window_of_a_running_validation_saves_the_notes(app_model):
+    project = app_model.project.to_local_value()
+    app_model._editable_notes_project = project
+    states = [SessionValidationState(status="running", profile="quick")]
+    saved_while_set = []
+
+    def cancel():
+        states.append(SessionValidationState(status="cancelled", profile="quick"))
+        app_model._on_session_validation_state(states[-1])
+        return True
+
+    with mock.patch.object(
+        type(app_model._session_validation), "state",
+        new_callable=mock.PropertyMock, side_effect=lambda: states[-1],
+    ), mock.patch.object(
+        app_model._session_validation, "cancel", side_effect=cancel,
+    ) as cancelled, mock.patch.object(
+        app_model, "_save_project_metadata",
+        side_effect=lambda *_args, **_kwargs: saved_while_set.append(
+            app_model._editable_notes_project),
+    ) as save:
+        app_model.notes = "typed"  # Record comes before the 500 ms autosave fires
+        assert app_model._notes_save_pending is False
+        app_model._flush_stopped_session_notes_now()
+
+    cancelled.assert_called_once_with()
+    save.assert_called_once_with(project, caller="session_notes_updated")
+    assert saved_while_set == [project]
+    assert app_model._notes_save_pending is False
+
+
+def test_record_with_saved_notes_leaves_a_running_validation_alone(app_model):
+    project = app_model.project.to_local_value()
+    app_model._editable_notes_project = project
+    app_model.notes = "typed"
+    with mock.patch.object(app_model, "_save_metadata"):
+        app_model._save_project_metadata(project, caller="NA")  # writes the live notes
+    with mock.patch.object(
+        type(app_model._session_validation), "state", new_callable=mock.PropertyMock,
+        return_value=SessionValidationState(status="running", profile="quick"),
+    ), mock.patch.object(app_model._session_validation, "cancel") as cancelled, \
+            mock.patch.object(app_model, "_save_project_metadata") as save:
+        app_model._flush_stopped_session_notes_now()
+
+    cancelled.assert_not_called()
+    save.assert_not_called()
+    assert app_model._notes_save_pending is False  # no replay is queued to race Record
+
+
+def test_only_a_successful_session_metadata_save_marks_the_live_notes_saved(app_model):
+    project = app_model.project.to_local_value()
+    app_model._editable_notes_project = project
+    app_model.notes = "typed"
+    with mock.patch.object(app_model, "_save_metadata"):
+        app_model._save_project_metadata(project, session=None, caller="capture_start")
+    assert app_model._notes_saved_revision != app_model._notes_revision  # no notes in it
+    with mock.patch.object(app_model, "_save_metadata", side_effect=OSError("disk full")):
+        with pytest.raises(OSError):
+            app_model._save_project_metadata(project, caller="NA")
+    assert app_model._notes_saved_revision != app_model._notes_revision
+    with mock.patch.object(app_model, "_save_metadata"):
+        app_model._save_project_metadata(project, caller="NA")
+    assert app_model._notes_saved_revision == app_model._notes_revision

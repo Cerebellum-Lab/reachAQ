@@ -202,7 +202,11 @@ from tools.acquisition.model.softmouse_spreadsheet_source import (
     SoftMouseSpreadsheetSource,
 )
 from tools.acquisition.model.session_data_recorder import SessionDataRecorder
-from tools.acquisition.model.session_telemetry import SessionTelemetry, describe_latency_status
+from tools.acquisition.model.session_telemetry import (
+    SessionTelemetry,
+    describe_latency_status,
+    exact_session_capture,
+)
 from tools.acquisition.model.stim_latency_budget import StimLatencyBudget
 from tools.acquisition.model.atomic_session_io import (
     atomic_publish_file,
@@ -487,6 +491,33 @@ def _camera_configured_metadata(camera) -> Dict[str, Any]:
     }
 
 
+def _camera_exposure_seconds(cameras) -> Dict[str, Optional[float]]:
+    """Each camera's exposure in seconds, for the session recorder's frame anchor.
+
+    The capture URL's ``exposure`` query value is the Spinnaker ExposureTime in
+    microseconds (system_configuration.yaml cameras[].params.exposure, or a
+    profile's ordinary_exposure). A camera without it, or one whose
+    configuration cannot be read, is None; the anchor then assumes zero.
+    """
+    result = {}
+    for camera in cameras:
+        name = getattr(camera, "name", "")
+        value = None
+        try:
+            exposure = camera.save_configuration(runtime_mode=True).params.get("exposure")
+            # alignment.json is written with allow_nan=False, so a NaN here would
+            # cost the session its finalization; it counts as unknown instead. So
+            # does a negative one: no exposure is, and the anchor would move its
+            # expected edge and lag gate together by it.
+            if exposure is not None and math.isfinite(float(exposure)) and float(exposure) >= 0:
+                value = float(exposure) * 1e-6
+        except Exception:
+            logger.warning("camera %s exposure is unknown to the session recorder", name,
+                           exc_info=True)
+        result[name] = value
+    return result
+
+
 def _compact_subsystem_snapshot(snapshot):
     """Remove fields repeated by the subsystem key and empty defaults."""
     compact = {}
@@ -707,6 +738,18 @@ class AppModel(ObservableObject):
         self._notes = ""
         self._editable_notes_project: Optional[ProjectInfo] = None
         self._last_stopped_session_path: Optional[Path] = None
+        # One gate for every write to a stopped session's published files
+        # (metadata json/yaml, manifest.json) and for the start of a
+        # validation that reads them. Order: this lock, then the validation
+        # controller's lock; never the reverse.
+        self._session_publication_lock = threading.RLock()
+        # Set when a notes save waited for a running validation; the
+        # validation's end state replays the save once.
+        self._notes_save_pending = False
+        # Edits to a stopped session's notes, and the edit the last session
+        # metadata save wrote; they differ while typed notes are unsaved.
+        self._notes_revision = 0
+        self._notes_saved_revision = 0
         self._session_validation = SessionValidationController(
             self._on_session_validation_state
         )
@@ -780,6 +823,9 @@ class AppModel(ObservableObject):
         self._aborting_project: Optional[ProjectInfo] = None
         self._aborted_session_ids = set()
         self._abort_had_recording_started = False
+        # Why live inference stopped during the current recording, if it did:
+        # its live pose files then end there, closed by the inference stop.
+        self._live_inference_failed_reason: Optional[str] = None
         self._abort_cleanup_timer = no_op_timer
         self._record_start_timer = no_op_timer
         self._writer_close_timer = no_op_timer
@@ -1538,9 +1584,12 @@ class AppModel(ObservableObject):
             )
             logger.warning(message)
             self.on_error("Storage capacity warning", message)
-        self.persist_stopped_session_notes()
-        self._editable_notes_project = None
-        self.notes = ""
+        self._flush_stopped_session_notes_now()
+        # Cleared under the publication lock, so a notes save replaying from a
+        # validation's end state finishes with the project it already read.
+        with self._session_publication_lock:
+            self._editable_notes_project = None
+            self.notes = ""
         reservation = self._recording_session.begin_record(
             project.short_id,
             self._acquisition.subsystems.snapshot(),
@@ -1592,6 +1641,7 @@ class AppModel(ObservableObject):
             reason="no completed pellet trial pending",
         )
         self._abort_had_recording_started = False
+        self._live_inference_failed_reason = None
         try:
             self._session_data_recorder.arm(
                 project,
@@ -1599,6 +1649,7 @@ class AppModel(ObservableObject):
                 metadata_generation_id=(
                     self._recording_session.metadata_generation_id
                 ),
+                camera_exposure_seconds=_camera_exposure_seconds(self._cameras),
             )
             started = self._behavior.algorithm.start_session(
                 reason="manual_record",
@@ -2326,6 +2377,27 @@ class AppModel(ObservableObject):
         self._remove_timestamps_txt_files(project, cams)
         return diagnostics
 
+    def _exact_session_capture(self, project: ProjectInfo) -> Optional[dict]:
+        """The session's exact frame counts, or None when its files cannot say.
+
+        Read at finalize, after the timeline merge and the pose files' close.
+        A statistic never fails a finalization, so any error is logged here.
+        """
+        try:
+            session_dir = Path(project.get_session_path(skip_ensure=True).location)
+            alignment_path = session_dir / "streams" / "camera_alignment.json"
+            if not alignment_path.is_file():
+                return None
+            alignment = json.loads(alignment_path.read_text(encoding="utf-8"))
+            posed_frame_paths = {
+                name: Path(project.get_video_path(name, allow_overwrite=True)[2])
+                for name in alignment.get("cameras", {})
+            }
+            return exact_session_capture(alignment, posed_frame_paths)
+        except Exception:
+            logger.exception("Exact session capture counts were not computed")
+            return None
+
     def _get_monitored_cams(self):
         return self._ordered_reach_cameras(enabled_only=True)
 
@@ -2741,6 +2813,22 @@ class AppModel(ObservableObject):
                         None,
                     )
                     if (
+                        self._abort_had_recording_started
+                        and self._live_inference_failed_reason
+                    ):
+                        # The pose files were closed when inference stopped,
+                        # and end there; no end-of-recording marker reached
+                        # them, so waiting for one could only time out.
+                        message = (
+                            "Live pose ends early: live inference stopped during "
+                            f"the recording ({self._live_inference_failed_reason})."
+                        )
+                        logger.error(message)
+                        self._session_data_recorder.set_source_result(
+                            "pose",
+                            failure=message,
+                        )
+                    elif (
                         wait_pose_closed is not None
                         and self._abort_had_recording_started
                         and not wait_pose_closed(
@@ -4541,23 +4629,69 @@ class AppModel(ObservableObject):
     @notes.setter
     def notes(self, value: str):
         prev, self._notes = self._notes, value
+        if self._editable_notes_project is not None and value != prev:
+            self._notes_revision += 1
         self._on_property_changed(self.Props.NOTES, value, prev)
 
     def persist_stopped_session_notes(self) -> bool:
-        """Atomically update notes for the most recently stopped session."""
-        project = self._editable_notes_project
-        if project is None:
-            return False
-        try:
-            self._save_project_metadata(
-                project,
-                caller="session_notes_updated",
+        """Atomically update notes for the most recently stopped session.
+
+        While a validation reads the session the save waits: it returns False
+        and the validation's end state replays it once.
+        """
+        with self._session_publication_lock:
+            project = self._editable_notes_project
+            if project is None:
+                return False
+            validation = self._session_validation.state
+            if validation.active:
+                self._notes_save_pending = True
+                logger.info(
+                    "Session notes wait for the running %s validation",
+                    validation.profile,
+                )
+                return False
+            try:
+                self._save_project_metadata(
+                    project,
+                    caller="session_notes_updated",
+                )
+            except Exception as exc:
+                logger.exception("Failed to update stopped-session notes")
+                self.on_error("Session notes were not saved", str(exc))
+                return False
+            # Saved now, so a replay still queued would only repeat it.
+            self._notes_save_pending = False
+            return True
+
+    def _flush_stopped_session_notes_now(self) -> None:
+        """Save the stopped session's notes before Record or close drops them.
+
+        Unsaved notes cannot wait for a running validation any longer, so it
+        is cancelled; its cancelled-state callback replays the save. Notes
+        already saved leave a running validation alone.
+        """
+        with self._session_publication_lock:
+            unsaved = self._editable_notes_project is not None and (
+                self._notes_save_pending
+                or self._notes_revision != self._notes_saved_revision
             )
-        except Exception as exc:
-            logger.exception("Failed to update stopped-session notes")
-            self.on_error("Session notes were not saved", str(exc))
-            return False
-        return True
+            active = self._session_validation.state.active
+            if active and unsaved:
+                self._notes_save_pending = True
+        if active:
+            if not unsaved:
+                return
+            # Cancelled with the publication lock released: its callback
+            # takes that lock to replay the save.
+            if self._session_validation.cancel():
+                logger.warning(
+                    "Cancelled the running session validation: notes were "
+                    "waiting to be saved"
+                )
+                return
+            # The validation ended on its own meanwhile: save directly.
+        self.persist_stopped_session_notes()
 
     @property
     def session_validation_state(self):
@@ -4573,7 +4707,8 @@ class AppModel(ObservableObject):
         path = self._last_stopped_session_path
         if path is None or not path.is_dir():
             raise RuntimeError("No successfully stopped session is available")
-        self._session_validation.start(path, profile, automatic=False)
+        with self._session_publication_lock:
+            self._session_validation.start(path, profile, automatic=False)
         return True
 
     def cancel_session_validation(self) -> bool:
@@ -4585,6 +4720,14 @@ class AppModel(ObservableObject):
             dataclasses.asdict(state),
             None,
         )
+        if state.active:
+            return
+        # Delivered with the controller's lock released, so taking the
+        # publication lock here keeps the order: publication, then controller.
+        with self._session_publication_lock:
+            pending, self._notes_save_pending = self._notes_save_pending, False
+            if pending:
+                self.persist_stopped_session_notes()
 
     @property
     def trial_protocol_rows(self) -> Tuple[dict, ...]:
@@ -9340,7 +9483,10 @@ class AppModel(ObservableObject):
         # laser back before anything below can end the process.
         self._finish_laser_calibration_for_close()
         self._storage_monitor.abort()
-        self.persist_stopped_session_notes()
+        try:
+            self._flush_stopped_session_notes_now()
+        except Exception as err:
+            logger.exception("Failed to save the stopped session's notes on close: %s", err)
 
         if self._rfid_metadata_controller is not None:
             self._rfid_metadata_controller.stop()
@@ -9858,6 +10004,8 @@ class AppModel(ObservableObject):
             subsystem_key,
             reason,
         )
+        if subsystem_key == SubsystemId.LIVE_INFERENCE:
+            self._live_inference_failed_reason = reason
 
     def _on_intersession_property_changed(self, name, value, _):
         if name == IntersessionMachine.Properties.STATE_PROPERTY:
@@ -10038,6 +10186,15 @@ class AppModel(ObservableObject):
                 self._recording_session.boundary.end_wall_time,
             )
             self._session_telemetry.end(end_perf)
+            exact_capture = self._exact_session_capture(project)
+            self._recording_session.set_capture_telemetry({
+                **self._session_telemetry.summary(),
+                "exact": exact_capture,
+            })
+            self._session_telemetry.set_exact_capture(
+                exact_capture,
+                completed_boundary.to_metadata()["durationSeconds"],
+            )
             stream_result = self._session_data_recorder.stop(end_perf)
         except Exception as first_error:
             logger.exception(
@@ -10226,52 +10383,63 @@ class AppModel(ObservableObject):
         self._send_block_reasons.clear_all()
         self._recording_session.set_analysis_finished(time.perf_counter())
         try:
-            self._save_project_metadata(
-                project,
-                caller="intertrial_analysis_finished",
-            )
-        except Exception as error:
-            self._pending_metadata_project = project.to_local_value()
-            self._recording_session.add_data_error(
-                f"final metadata save failed: {error}"
-            )
-            self._set_subsystem_status(
-                SubsystemId.INTERTRIAL_ANALYSIS,
-                SubsystemState.FAILED,
-                error=f"final metadata save failed: {error}",
-            )
-            logger.exception("Final intertrial metadata save failed")
-        else:
-            self._pending_metadata_project = None
-            self._last_stopped_session_path = Path(
-                project.get_session_path(skip_ensure=True).location
-            ).resolve()
-            try:
-                self._session_validation.start(
-                    self._last_stopped_session_path,
-                    "quick",
-                    automatic=True,
-                )
-            except Exception:
-                logger.exception("Could not schedule automatic quick session validation")
-            self._set_subsystem_status(
-                SubsystemId.INTERTRIAL_ANALYSIS,
-                (
-                    SubsystemState.READY
-                    if self._recording_session.data_complete
-                    else SubsystemState.FAILED
-                ),
-                reason=(
-                    "all closed pellet-trial analyses completed"
-                    if self._recording_session.data_complete
-                    else "trial analysis completed; session data is incomplete"
-                ),
-                error=(
-                    ""
-                    if self._recording_session.data_complete
-                    else "; ".join(self._recording_session.data_errors)
-                ),
-            )
+            # The final save, the seal against late ledger/tracking writes and
+            # the start of the quick validation that reads the files are one
+            # publication. READY is set after the lock is released: Record can
+            # begin once it is, and its notes flush takes this lock.
+            with self._session_publication_lock:
+                # Sealed before the final save, which hashes the stream
+                # manifest: a ledger or tracking write in flight finishes
+                # first, and a later one is refused. A failed save leaves the
+                # session sealed; _write_session already published its streams.
+                self._session_data_recorder.seal_session(project.short_id)
+                try:
+                    self._save_project_metadata(
+                        project,
+                        caller="intertrial_analysis_finished",
+                    )
+                except Exception as error:
+                    self._pending_metadata_project = project.to_local_value()
+                    self._recording_session.add_data_error(
+                        f"final metadata save failed: {error}"
+                    )
+                    self._set_subsystem_status(
+                        SubsystemId.INTERTRIAL_ANALYSIS,
+                        SubsystemState.FAILED,
+                        error=f"final metadata save failed: {error}",
+                    )
+                    logger.exception("Final intertrial metadata save failed")
+                else:
+                    self._pending_metadata_project = None
+                    self._last_stopped_session_path = Path(
+                        project.get_session_path(skip_ensure=True).location
+                    ).resolve()
+                    try:
+                        self._session_validation.start(
+                            self._last_stopped_session_path,
+                            "quick",
+                            automatic=True,
+                        )
+                    except Exception:
+                        logger.exception("Could not schedule automatic quick session validation")
+                    self._set_subsystem_status(
+                        SubsystemId.INTERTRIAL_ANALYSIS,
+                        (
+                            SubsystemState.READY
+                            if self._recording_session.data_complete
+                            else SubsystemState.FAILED
+                        ),
+                        reason=(
+                            "all closed pellet-trial analyses completed"
+                            if self._recording_session.data_complete
+                            else "trial analysis completed; session data is incomplete"
+                        ),
+                        error=(
+                            ""
+                            if self._recording_session.data_complete
+                            else "; ".join(self._recording_session.data_errors)
+                        ),
+                    )
         finally:
             self._set_session_recording_status(
                 SessionRecordingStatus.READY,
@@ -10576,10 +10744,16 @@ class AppModel(ObservableObject):
                 # that dropped nothing, and carried an 8.5 s end-to-end max
                 # from the first frame through the warming pipeline. Rebase
                 # here so the percentage measures the two running together.
-                # A recording owns the counters once it starts, so this
-                # never moves a session's baseline.
-                if (self._recording_session.status
-                        is not SessionRecordingStatus.RECORDING):
+                # A recording owns the counters from its first frame until it
+                # is finalized, so this never moves a session's baseline. That
+                # includes Stopping: the pose process handles EOF_RECORDING
+                # and comes straight back to live while the session is still
+                # being saved, and rebasing there zeroed the saved figures.
+                if self._recording_session.status not in {
+                    SessionRecordingStatus.RECORDING,
+                    SessionRecordingStatus.STOPPING,
+                    SessionRecordingStatus.ANALYZING,
+                }:
                     self._begin_session_telemetry()
             elif value == InferenceStatus.stopped:
                 current = self._acquisition.subsystems.get(
@@ -11050,57 +11224,64 @@ class AppModel(ObservableObject):
                                when: Optional[datetime] = None, session: Optional[int] = -1,
                                caller: str="NA"):
         """Save the given project_info metadata, if session is None : it's main/global metadata"""
-        when = when if when is not None else project_info.when
-        file_name = project_info.get_metadata_file(session, when)
-        logger.verbose(
-            "Saving metadata to %s ; caller=%s when=%s sess=%s prj=%s",
-            file_name, caller, when, session, project_info,
-        )
-        if session is not None and session < 0:
-            session = project_info.session  # ensure use this one
-        if caller in {
-            "raw_writers_closed",
-            "session_analysis_ended",
-            "intertrial_analysis_finished",
-            "session_notes_updated",
-            "retained_finalization_retry",
-        }:
-            boundary = self._recording_session.boundary
-            if boundary is None or boundary.session_id != project_info.short_id:
-                raise RuntimeError(
-                    f"Cannot finalize {project_info.short_id} without a canonical "
-                    "recording boundary"
-                )
-            if not (
-                math.isfinite(boundary.start_perf_time)
-                and math.isfinite(boundary.start_wall_time)
-            ):
-                raise RuntimeError(
-                    f"Cannot finalize {project_info.short_id} with a non-finite "
-                    "recording boundary"
-                )
-            alignment_path = Path(
-                project_info.get_session_path().location
-            ) / "streams" / "alignment.json"
-            if not alignment_path.is_file():
-                raise RuntimeError(
-                    f"Cannot finalize {project_info.short_id}: "
-                    "streams/alignment.json is missing"
-                )
-            with alignment_path.open(encoding="utf-8") as stream:
-                alignment = json.load(stream)
-            alignment_boundary = alignment.get("canonicalBoundary", {})
-            if (
-                alignment_boundary.get("startPerfTime")
-                != boundary.start_perf_time
-                or alignment_boundary.get("startWallTime")
-                != boundary.start_wall_time
-            ):
-                raise RuntimeError(
-                    f"Cannot finalize {project_info.short_id}: canonical "
-                    "boundary differs from streams/alignment.json"
-                )
-        self._save_metadata(project_info, when, file_name, session)
+        with self._session_publication_lock:
+            # Read before _save_metadata reads the live notes: an edit made
+            # meanwhile then still counts as unsaved.
+            notes_revision = self._notes_revision
+            when = when if when is not None else project_info.when
+            file_name = project_info.get_metadata_file(session, when)
+            logger.verbose(
+                "Saving metadata to %s ; caller=%s when=%s sess=%s prj=%s",
+                file_name, caller, when, session, project_info,
+            )
+            if session is not None and session < 0:
+                session = project_info.session  # ensure use this one
+            if caller in {
+                "raw_writers_closed",
+                "session_analysis_ended",
+                "intertrial_analysis_finished",
+                "session_notes_updated",
+                "retained_finalization_retry",
+            }:
+                boundary = self._recording_session.boundary
+                if boundary is None or boundary.session_id != project_info.short_id:
+                    raise RuntimeError(
+                        f"Cannot finalize {project_info.short_id} without a canonical "
+                        "recording boundary"
+                    )
+                if not (
+                    math.isfinite(boundary.start_perf_time)
+                    and math.isfinite(boundary.start_wall_time)
+                ):
+                    raise RuntimeError(
+                        f"Cannot finalize {project_info.short_id} with a non-finite "
+                        "recording boundary"
+                    )
+                alignment_path = Path(
+                    project_info.get_session_path().location
+                ) / "streams" / "alignment.json"
+                if not alignment_path.is_file():
+                    raise RuntimeError(
+                        f"Cannot finalize {project_info.short_id}: "
+                        "streams/alignment.json is missing"
+                    )
+                with alignment_path.open(encoding="utf-8") as stream:
+                    alignment = json.load(stream)
+                alignment_boundary = alignment.get("canonicalBoundary", {})
+                if (
+                    alignment_boundary.get("startPerfTime")
+                    != boundary.start_perf_time
+                    or alignment_boundary.get("startWallTime")
+                    != boundary.start_wall_time
+                ):
+                    raise RuntimeError(
+                        f"Cannot finalize {project_info.short_id}: canonical "
+                        "boundary differs from streams/alignment.json"
+                    )
+            self._save_metadata(project_info, when, file_name, session)
+            if session is not None:
+                # Only session metadata carries the live notes.
+                self._notes_saved_revision = notes_revision
 
     def _save_metadata(self, project: ProjectInfo, when: datetime, file_name: str, session: Optional[int] = -1):
         when_as_utc = when.astimezone(timezone.utc)
@@ -11257,8 +11438,14 @@ class AppModel(ObservableObject):
                 "artifacts": artifacts,
                 # What the operator watched during the recording, kept so the
                 # same numbers can be read back from the session rather than
-                # only having existed on screen.
-                "capture": self._session_telemetry.summary(),
+                # only having existed on screen. Taken as the session was
+                # finalized: a notes save rewrites this file later, by when
+                # the counters may have been rebased for preview.
+                "capture": (
+                    self._session_telemetry.summary()
+                    if self._recording_session.capture_telemetry is None
+                    else self._recording_session.capture_telemetry
+                ),
                 # The latency record's status: per-loop completeness, the
                 # clock fits it used, and why anything is missing.
                 "latency": dict(self._latency_status),
