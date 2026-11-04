@@ -135,6 +135,7 @@ NIDAQ_CHANNELS = (BARCODE_CHANNEL, "tone1", "tone2")
 TONE_CHANNEL_BY_FREQUENCY_HZ = {5000: "tone1", 6000: "tone2"}
 METHOD = "board_clap_and_nidaq_barcode"
 COMPOSED_METHOD = "piecewise_line_composed"
+PAIRING_HOST_TIME, PAIRING_TICK_CLUSTER = "host_time", "tick_cluster"
 NI_TIME_NOTE = "NI sample index / sample rate (s); cameraNidaqAlignment.niToHost maps it to host perf time"
 #: Every edge of a kept frame is a fit point, and a frame has 2 to 34 of them.
 BARCODE_FIT_MIN_FRAMES = 10
@@ -148,14 +149,26 @@ CLAP_FIT_MAX_RESIDUAL_SECONDS = 0.0001
 #: seconds is noise multiplied by the whole recording; the host's TIME_SYNC fit
 #: asks the same (board_clock.MIN_SLOPE_SPAN_SECONDS).
 LINK_FIT_MIN_SPAN_SECONDS = 10.0
-#: Frames paired to one boot's reports by tick agree on (NI seconds - board
-#: seconds) to within the clocks' drift, which is milliseconds an hour. A reboot
-#: restarts the ticks, so frames of another boot that repeat a tick sit seconds
-#: or more away. Pairs chain into one cluster while neighbours are this close.
+#: The timekeeper reports a barcode this long after the frame's start edge (the
+#: firmware's BARCODE_CALLBACK_SLOT), and the host receives it a few ms later.
+BARCODE_REPORT_DELAY_SECONDS = 0.5
+#: A report pairs with a frame only if the host received it within this of that
+#: delay after the frame's start edge, the NI time of the edge mapped to host
+#: time: the same tick a boot reports hours earlier or later is not the frame.
+BARCODE_REPORT_WINDOW_SECONDS = 0.5
+#: Without host time, frames paired to one boot's reports by tick agree on (NI
+#: seconds - board seconds) to within the clocks' drift, which is milliseconds an
+#: hour. A reset restarts the ticks, so frames of another boot that repeat a tick
+#: sit seconds or more away. Pairs chain into one cluster while neighbours are
+#: this close.
 PAIRING_CLUSTER_SECONDS = 0.5
 #: An observer's clap and the timekeeper's own clap of the same tick are one
-#: event only if the host heard them this close together.
+#: event only if the host received them this close together (row column 9).
 CLAP_HOST_WINDOW_SECONDS = 0.5
+#: The device-row ring holds 100 000 rows and is not cleared between sessions,
+#: so older sessions' rows are in it. With a valid NI-to-host fit a row counts
+#: only if the host received it within the NI recording's host span widened by this.
+NI_SPAN_MARGIN_SECONDS = 5.0
 TONE_MATCH_WINDOW_SECONDS = 0.005
 #: The spec's end-to-end acceptance: |error| 95th percentile under 0.1 ms over at least 100 tones.
 TONE_TARGET_P95_SECONDS = 0.0001
@@ -165,7 +178,9 @@ _SAME_KNOT_SECONDS = 1e-6
 
 _KIND_CLAP, _KIND_BARCODE, _KIND_TONE = "SYNC_CLAP_OBSERVATION", "SYNC_BARCODE_REPORT", "TONE_STATUS"
 _STAMP_START_EDGE, _STAMP_OBSERVED = "physical_start", "observed"
-_ROW_PERF, _ROW_KIND, _ROW_PAYLOAD, _ROW_BOOT, _ROW_BOARD_US, _ROW_STAMP_KIND = 0, 3, 8, 12, 14, 15
+#: Column 9 is host_receive_perf_time. Column 0 (perf_time) is the event time, which for
+#: a time-synced board is its aligned board time and can be tens of ms from the receive time.
+_ROW_KIND, _ROW_PAYLOAD, _ROW_HOST_RECEIVE, _ROW_BOOT, _ROW_BOARD_US, _ROW_STAMP_KIND = 3, 8, 9, 12, 14, 15
 
 
 @dataclasses.dataclass(frozen=True)
@@ -173,9 +188,19 @@ class _Envelope:
     address: Optional[int]
     boot_id: int
     board_us: int
-    perf: Optional[float]
+    host_perf: Optional[float]
     stamp_kind: str
     payload: Mapping
+
+
+@dataclasses.dataclass(frozen=True)
+class _Candidate:
+    """One timekeeper boot's frames, paired to its reports."""
+    key: tuple
+    ticks: Dict[int, _Envelope]
+    paired: int
+    kept: list
+    tied: bool
 
 
 def _int_or_none(value) -> Optional[int]:
@@ -195,7 +220,7 @@ def _float_or_none(value) -> Optional[float]:
     return value if math.isfinite(value) else None
 
 
-def _record(status, reason, *, timekeeper=None, ignored=(), rejected=None, boards=()) -> dict:
+def _record(status, reason, *, timekeeper=None, ignored=(), rejected=None, boards=(), pairing=None, outside=0) -> dict:
     """Every record has these keys, whatever the status, so a reader never has to ask which are there."""
     rejected = rejected or {}
     return {
@@ -203,17 +228,19 @@ def _record(status, reason, *, timekeeper=None, ignored=(), rejected=None, board
         "reason": reason,
         "method": METHOD,
         "niTime": None if timekeeper is None else NI_TIME_NOTE,
+        "pairing": pairing,
         "timekeeper": timekeeper,
         "ignoredTimekeeperBoots": list(ignored),
         "rowsRejectedForStampKind": {
             _KIND_BARCODE: int(rejected.get(_KIND_BARCODE, 0)), _KIND_CLAP: int(rejected.get(_KIND_CLAP, 0)),
         },
+        "rowsOutsideNiSpan": int(outside),
         "boards": list(boards),
     }
 
 
-def unavailable(reason: str, *, rejected=None) -> dict:
-    return _record("unavailable", reason, rejected=rejected)
+def unavailable(reason: str, *, rejected=None, ignored=(), pairing=None, outside=0) -> dict:
+    return _record("unavailable", reason, rejected=rejected, ignored=ignored, pairing=pairing, outside=outside)
 
 
 def _envelopes(device_rows, kind_name):
@@ -231,7 +258,7 @@ def _envelopes(device_rows, kind_name):
         if isinstance(payload, dict):
             found.append(_Envelope(
                 _int_or_none(payload.get("board_address")), boot, board_us,
-                _float_or_none(row[_ROW_PERF]), str(row[_ROW_STAMP_KIND] or ""), payload,
+                _float_or_none(row[_ROW_HOST_RECEIVE]), str(row[_ROW_STAMP_KIND] or ""), payload,
             ))
     return tuple(found)
 
@@ -242,44 +269,81 @@ def _stamped(envelopes, stamp_kind):
     return usable, len(envelopes) - len(usable)
 
 
+def _within(envelopes, span):
+    """The envelopes the host received inside `span` (all of them when there is none), and how many were not."""
+    if span is None:
+        return envelopes, 0
+    inside = tuple(
+        envelope for envelope in envelopes if envelope.host_perf is not None and span[0] <= envelope.host_perf <= span[1]
+    )
+    return inside, len(envelopes) - len(inside)
+
+
+def _host_span(ni_to_host, indices, rate):
+    """(first, last) host perf seconds of the NI recording, widened by the margin; None without a valid fit."""
+    if ni_to_host is None or not getattr(ni_to_host, "valid", False) or not indices.size:
+        return None
+    ends = numpy.asarray(
+        ni_to_host.map(numpy.array([float(indices[0]), float(indices[-1])]) / rate), dtype=numpy.float64,
+    )
+    if ends.shape != (2,) or not numpy.isfinite(ends).all():
+        return None
+    return float(ends[0]) - NI_SPAN_MARGIN_SECONDS, float(ends[1]) + NI_SPAN_MARGIN_SECONDS
+
+
 def has_barcode_reports(device_rows) -> bool:
     """Whether the rows hold a timekeeper's SYNC_BARCODE report, from the rows alone: no NI-DAQ read needed."""
     return bool(_stamped(_envelopes(device_rows, _KIND_BARCODE), _STAMP_START_EDGE)[0])
 
 
-def _largest_cluster(values, gap) -> numpy.ndarray:
-    """Positions in `values` of the largest run that never has a gap above `gap` between sorted neighbours."""
+def _largest_cluster(values, gap):
+    """(positions in `values` of the largest run with no gap above `gap` between sorted neighbours, whether another run is as large)."""
     order = numpy.argsort(values, kind="stable")
-    breaks = numpy.flatnonzero(numpy.diff(values[order]) > gap) + 1
-    runs = numpy.split(order, breaks)
-    return max(runs, key=len)
+    runs = numpy.split(order, numpy.flatnonzero(numpy.diff(values[order]) > gap) + 1)
+    sizes = [len(run) for run in runs]
+    largest = max(sizes)
+    return runs[sizes.index(largest)], sizes.count(largest) > 1
 
 
 def _consistent_frames(pairs, indices, rate):
-    """The (frame, board_us) pairs that agree with each other on NI seconds minus board seconds."""
+    """The (frame, report) pairs that agree with each other on NI seconds minus board seconds, and whether two runs tie."""
     if not pairs:
-        return []
+        return [], False
     starts = numpy.fromiter((frame.start_position for frame, _ in pairs), dtype=numpy.int64, count=len(pairs))
-    boards = numpy.fromiter((board_us for _, board_us in pairs), dtype=numpy.float64, count=len(pairs))
+    boards = numpy.fromiter((report.board_us for _, report in pairs), dtype=numpy.float64, count=len(pairs))
     offsets = indices[starts].astype(numpy.float64) / rate - boards / 1e6
-    return [pairs[position] for position in sorted(_largest_cluster(offsets, PAIRING_CLUSTER_SECONDS).tolist())]
+    positions, tied = _largest_cluster(offsets, PAIRING_CLUSTER_SECONDS)
+    return [pairs[position] for position in sorted(positions.tolist())], tied
+
+
+def _pair_frames(frames, ticks, frame_host):
+    """One boot's (frame, report) pairs: the same tick and, when the frames' host times are known, a report
+    the host received BARCODE_REPORT_DELAY_SECONDS (plus or minus the window) after the frame's start edge."""
+    pairs = []
+    for position, frame in enumerate(frames):
+        report = ticks.get(frame.tick)
+        if report is None:
+            continue
+        if frame_host is not None:
+            if report.host_perf is None or not abs(report.host_perf - frame_host[position] - BARCODE_REPORT_DELAY_SECONDS) \
+                    <= BARCODE_REPORT_WINDOW_SECONDS:
+                continue
+        pairs.append((frame, report))
+    return pairs
 
 
 def compose(inner, outer):
-    """`outer` after `inner` as one exact table: x -> outer(inner(x)), over inner's span.
+    """`outer` after `inner` as one exact table: x -> outer(inner(x)).
 
-    The knots are inner's and the board seconds at which inner reaches each of
-    outer's knots, so every bend of either link is a knot and the table between
-    them is straight. The residual adds in quadrature, outer's rate carrying
-    inner's. Invalid unless both links are valid.
+    The knots are inner's and the x at which inner, carried on past its ends by
+    its end segments, reaches each of outer's knots, so every bend of either
+    link is a knot and the table between them is straight. The residual adds in
+    quadrature, outer's rate carrying inner's. Invalid unless both links are valid.
     """
     if not inner.valid or not outer.valid:
-        return clocks.invalid_piecewise_fit("a link of the chain is not valid")
-    bends = inner.inverse(outer.knots)
-    bends = bends[(bends > inner.knots[0]) & (bends < inner.knots[-1])]
-    if bends.size:
-        bends = bends[numpy.abs(inner.knots[:, None] - bends[None, :]).min(axis=0) > _SAME_KNOT_SECONDS]
-    knots = numpy.sort(numpy.concatenate([inner.knots, bends]))
+        return clocks.invalid_piecewise_line_fit("a link of the chain is not valid")
+    knots = numpy.sort(numpy.concatenate([inner.knots, inner.inverse(outer.knots)]))
+    knots = knots[numpy.concatenate([[True], numpy.diff(knots) > _SAME_KNOT_SECONDS])]
     return clocks.PiecewiseClockFit(
         knots, outer.map(inner.map(knots)),
         float(math.hypot(outer.drift * inner.residual_rms, outer.residual_rms)),
@@ -369,23 +433,24 @@ def _tone_cross_check(tones, link, indices, rate, channels) -> dict:
     return summary
 
 
-def _timekeeper_link(frames, matched_pairs, tick_matched, indices, rate):
+def _timekeeper_link(frames, chosen, by_host, indices, rate):
     """Timekeeper boot seconds -> NI seconds from every edge of the kept frames, or why not."""
     if not frames:
-        return clocks.invalid_piecewise_fit("no barcode frames decoded (is the barcode line wired?)")
-    if not tick_matched:
-        return clocks.invalid_piecewise_fit(
-            f"{len(frames)} barcode frames decoded, none matches a SYNC_BARCODE report of the same tick",
+        return clocks.invalid_piecewise_line_fit("no barcode frames decoded (is the barcode line wired?)")
+    if not chosen.paired:
+        return clocks.invalid_piecewise_line_fit(
+            f"{len(frames)} barcode frames decoded, none matches a SYNC_BARCODE report of the same tick"
+            + (" and host time" if by_host else ""),
         )
-    if len(matched_pairs) < BARCODE_FIT_MIN_FRAMES:
-        return clocks.invalid_piecewise_fit(
-            f"only {len(matched_pairs)} barcode frames matched SYNC_BARCODE reports, need {BARCODE_FIT_MIN_FRAMES}",
+    if len(chosen.kept) < BARCODE_FIT_MIN_FRAMES:
+        return clocks.invalid_piecewise_line_fit(
+            f"only {len(chosen.kept)} barcode frames matched SYNC_BARCODE reports, need {BARCODE_FIT_MIN_FRAMES}",
         )
     positions = numpy.fromiter(
-        (position for frame, _ in matched_pairs for position, _ in frame.edges), dtype=numpy.int64,
+        (position for frame, _ in chosen.kept for position, _ in frame.edges), dtype=numpy.int64,
     )
     board_seconds = numpy.fromiter(
-        (board_us / 1e6 + offset for frame, board_us in matched_pairs for _, offset in frame.edges),
+        (report.board_us / 1e6 + offset for frame, report in chosen.kept for _, offset in frame.edges),
         dtype=numpy.float64,
     )
     return clocks.fit_piecewise_line(
@@ -395,16 +460,24 @@ def _timekeeper_link(frames, matched_pairs, tick_matched, indices, rate):
     )
 
 
-def board_clock_chain(device_rows, *, sample_indices, sample_rate_hz, channels) -> dict:
+def board_clock_chain(device_rows, *, sample_indices, sample_rate_hz, channels, ni_to_host=None) -> dict:
     """Fit every clapping board's time to NI seconds through the timekeeper.
 
     NI seconds are NI sample index / sample rate; cameraNidaqAlignment.niToHost
     maps them to host perf time. Each link is a piecewise-linear table, one
     segment per KNOT_SECONDS, so a drifting crystal does not fail a link.
-    Ticks pair with their boot, never alone (spec section 9): a timekeeper
-    reset restarts the tick numbering.
+
+    Ticks pair with their boot, never alone (spec section 9): a timekeeper reset
+    restarts the tick numbering, and an NI frame carries only a tick. `ni_to_host`,
+    the session's NI-to-host fit (anything with `valid` and `map`), supplies what
+    ties a frame to its boot: the host time at which it was played. A report pairs
+    with a frame by tick and by being received about half a second after the
+    frame's start edge, and only rows received within the NI recording's host span
+    count. Without a valid fit the pairing falls back to ticks that agree on NI
+    minus board time, and a tie in either mode is `unavailable`, never a pick.
     """
-    reports, wrong_stamp = _stamped(_envelopes(device_rows, _KIND_BARCODE), _STAMP_START_EDGE)
+    barcode_rows = _envelopes(device_rows, _KIND_BARCODE)
+    reports, wrong_stamp = _stamped(barcode_rows, _STAMP_START_EDGE)
     rejected = {_KIND_BARCODE: wrong_stamp}
     if not reports:
         if wrong_stamp:
@@ -429,62 +502,103 @@ def board_clock_chain(device_rows, *, sample_indices, sample_rate_hz, channels) 
             f"NI-DAQ sample index ({indices.size} samples) and barcode line ({line.size}) differ in length",
             rejected=rejected,
         )
+
+    # Rows the host received outside the recording (earlier sessions', left in the ring) are not evidence.
+    span = _host_span(ni_to_host, indices, rate)
+    by_host = span is not None
+    pairing = PAIRING_HOST_TIME if by_host else PAIRING_TICK_CLUSTER
+    barcode_rows, outside = _within(barcode_rows, span)
+    claps, outside_claps = _within(_envelopes(device_rows, _KIND_CLAP), span)
+    tones, outside_tones = _within(_envelopes(device_rows, _KIND_TONE), span)
+    outside += outside_claps + outside_tones
+    reports, rejected[_KIND_BARCODE] = _stamped(barcode_rows, _STAMP_START_EDGE)
+    claps, rejected[_KIND_CLAP] = _stamped(claps, _STAMP_OBSERVED)
+    if not reports:
+        return unavailable(
+            f"no SYNC_BARCODE report was received within the NI recording's host span ({span[0]:.1f} to "
+            f"{span[1]:.1f} s, which includes {NI_SPAN_MARGIN_SECONDS:g} s either side)",
+            rejected=rejected, pairing=pairing, outside=outside,
+        )
     frames, rejected_frames = decode_barcode_frames(line, rate)
 
-    by_boot: Dict[tuple, Dict[int, int]] = {}
+    ticks_by_boot: Dict[tuple, Dict[int, _Envelope]] = {}
     for report in reports:
         tick = _int_or_none(report.payload.get("tick"))
         if tick is not None:
-            by_boot.setdefault((report.address, report.boot_id), {})[tick] = report.board_us
-    if not by_boot:
-        return unavailable("SYNC_BARCODE reports carry no tick", rejected=rejected)
+            ticks_by_boot.setdefault((report.address, report.boot_id), {})[tick] = report
+    if not ticks_by_boot:
+        return unavailable("SYNC_BARCODE reports carry no tick", rejected=rejected, pairing=pairing, outside=outside)
 
-    # Per timekeeper boot: the frames whose tick it reported, and of those the
-    # largest set that agree on NI seconds minus board seconds. Another boot's
-    # frames that repeat a tick disagree, and are dropped.
+    # Per timekeeper boot: the frames whose tick it reported (and, with host time, that it reported when the
+    # frame was played), and of those the largest set that agree on NI seconds minus board seconds.
+    frame_host = None
+    if by_host:
+        starts = numpy.fromiter((frame.start_position for frame in frames), dtype=numpy.int64, count=len(frames))
+        frame_host = numpy.asarray(
+            ni_to_host.map(indices[starts].astype(numpy.float64) / rate), dtype=numpy.float64,
+        )
     candidates = []
-    for key, ticks in by_boot.items():
-        pairs = [(frame, ticks[frame.tick]) for frame in frames if frame.tick in ticks]
-        candidates.append((key, ticks, len(pairs), _consistent_frames(pairs, indices, rate)))
-    (address, boot_id), ticks, tick_matched, kept = max(candidates, key=lambda c: (len(c[3]), len(c[1])))
-    ignored = [
-        {"address": key[0], "bootId": int(key[1]), "reports": len(other_ticks), "framesPaired": len(other_kept)}
-        for key, other_ticks, _, other_kept in candidates if key != (address, boot_id)
-    ]
+    for key, ticks in ticks_by_boot.items():
+        pairs = _pair_frames(frames, ticks, frame_host)
+        kept, tied = _consistent_frames(pairs, indices, rate)
+        candidates.append(_Candidate(key, ticks, len(pairs), kept, tied))
 
-    to_ni = _timekeeper_link(frames, kept, tick_matched, indices, rate)
+    def listed(candidate):
+        return {
+            "address": candidate.key[0], "bootId": int(candidate.key[1]),
+            "reports": len(candidate.ticks), "framesPaired": len(candidate.kept),
+        }
+
+    best = max(len(candidate.kept) for candidate in candidates)
+    leaders = [candidate for candidate in candidates if len(candidate.kept) == best]
+    if best and (len(leaders) > 1 or leaders[0].tied):
+        how = "by tick and host time" if by_host else "by tick (there is no valid NI-to-host fit to check host time)"
+        if len(leaders) > 1:
+            names = " and ".join(f"{leader.key[1]:#x}" for leader in leaders)
+            why = (f"tie between timekeeper boots {names}: each pairs {best} barcode frames with its reports {how}, "
+                   "so which one drove the NI-DAQ line cannot be told")
+        else:
+            why = (f"tie inside timekeeper boot {leaders[0].key[1]:#x}: two runs of {best} barcode frames paired "
+                   f"{how} disagree on NI time minus board time, so which belongs to it cannot be told")
+        return unavailable(
+            f"timekeeper to NI-DAQ: {why}", rejected=rejected, ignored=[listed(c) for c in candidates],
+            pairing=pairing, outside=outside,
+        )
+    # With nothing paired there is no link to make; show the boot that reported most.
+    chosen = leaders[0] if best else max(candidates, key=lambda candidate: len(candidate.ticks))
+    ignored = [listed(candidate) for candidate in candidates if candidate is not chosen]
+    (address, boot_id) = chosen.key
+
+    to_ni = _timekeeper_link(frames, chosen, by_host, indices, rate)
     timekeeper = {
-        "address": address, "bootId": int(boot_id), "reports": len(ticks),
+        "address": address, "bootId": int(boot_id), "reports": len(chosen.ticks),
         "barcodeFramesDecoded": len(frames), "barcodeFramesRejected": int(rejected_frames),
-        "barcodeFramesMatched": len(kept), "barcodeFramesInconsistent": tick_matched - len(kept),
+        "barcodeFramesMatched": len(chosen.kept), "barcodeFramesInconsistent": chosen.paired - len(chosen.kept),
         "toNi": to_ni.as_record(),
     }
     if not to_ni.valid:
         return _record(
-            "unavailable", f"timekeeper to NI-DAQ: {to_ni.reason}",
-            timekeeper=timekeeper, ignored=ignored, rejected=rejected,
+            "unavailable", f"timekeeper to NI-DAQ: {to_ni.reason}", timekeeper=timekeeper, ignored=ignored,
+            rejected=rejected, pairing=pairing, outside=outside,
         )
 
-    claps, wrong_stamp = _stamped(_envelopes(device_rows, _KIND_CLAP), _STAMP_OBSERVED)
-    rejected[_KIND_CLAP] = wrong_stamp
-    own: Dict[int, tuple] = {}
+    own: Dict[int, _Envelope] = {}
     heard: Dict[tuple, list] = {}
     for clap in claps:
         tick = _int_or_none(clap.payload.get("tick"))
-        if tick is None or clap.perf is None or _int_or_none(clap.payload.get("clapper_node")) != address:
+        if tick is None or clap.host_perf is None or _int_or_none(clap.payload.get("clapper_node")) != address:
             continue
         if clap.address == address:
             # The timekeeper's own claps are what the boards are paired to, and are never a board.
             if clap.boot_id == boot_id:
-                own[tick] = (clap.board_us, clap.perf)
+                own[tick] = clap
         else:
-            heard.setdefault((clap.address, clap.boot_id), []).append((tick, clap.board_us, clap.perf))
-    tones = _envelopes(device_rows, _KIND_TONE)
+            heard.setdefault((clap.address, clap.boot_id), []).append((tick, clap))
     boards = []
     for (board_address, board_boot), entries in sorted(heard.items(), key=lambda item: (item[0][0] or 0, item[0][1])):
         pairs = [
-            (board_us / 1e6, own[tick][0] / 1e6) for tick, board_us, perf in entries
-            if tick in own and abs(perf - own[tick][1]) <= CLAP_HOST_WINDOW_SECONDS
+            (clap.board_us / 1e6, own[tick].board_us / 1e6) for tick, clap in entries
+            if tick in own and abs(clap.host_perf - own[tick].host_perf) <= CLAP_HOST_WINDOW_SECONDS
         ]
         to_timekeeper = clocks.fit_piecewise_line(
             [pair[0] for pair in pairs], [pair[1] for pair in pairs],
@@ -495,7 +609,7 @@ def board_clock_chain(device_rows, *, sample_indices, sample_rate_hz, channels) 
             "address": board_address, "bootId": int(board_boot),
             "clapsHeard": len(entries), "clapsMatched": len(pairs),
             "toTimekeeper": to_timekeeper.as_record(),
-            "toNi": clocks.invalid_piecewise_fit(f"board to timekeeper: {to_timekeeper.reason}").as_record(),
+            "toNi": clocks.invalid_piecewise_line_fit(f"board to timekeeper: {to_timekeeper.reason}").as_record(),
             "toneCrossCheck": None,
         }
         if to_timekeeper.valid:
@@ -505,4 +619,7 @@ def board_clock_chain(device_rows, *, sample_indices, sample_rate_hz, channels) 
                 [tone for tone in tones if tone.boot_id == board_boot], to_ni_time, indices, rate, channels,
             )
         boards.append(board)
-    return _record("fitted", "", timekeeper=timekeeper, ignored=ignored, rejected=rejected, boards=boards)
+    return _record(
+        "fitted", "", timekeeper=timekeeper, ignored=ignored, rejected=rejected, boards=boards,
+        pairing=pairing, outside=outside,
+    )
