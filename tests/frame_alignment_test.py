@@ -233,6 +233,24 @@ def test_a_fitted_anchor_that_raises_says_so_and_does_not_blame_the_fit(tmp_path
     assert result["cameraNidaqAlignment"]["reason"].startswith("NI-to-host fit unavailable (")
 
 
+def test_with_no_anchor_on_the_fit_the_session_is_unmatched_and_says_why(tmp_path, monkeypatch):
+    # No latency stream and no first-frame-stamp anchor: nothing names the first frame's
+    # transition. A fault in the unmatched branch is swallowed into the epoch fallback by
+    # the outer try, so this also pins that the session did not quietly take that way out.
+    monkeypatch.setattr(SessionDataRecorder, "_first_frame_stamp_anchor",
+                        staticmethod(lambda *arguments, **keywords: None))
+    rig, project, n0, result = _record(tmp_path, t0=5.0, lag=0.001, stream=False)
+
+    camera = result["cameraNidaqAlignment"]
+    assert camera["status"] == "unmatched" and camera["confidence"] == "none"
+    assert camera["anchorMethod"] is None and camera["anchorMethod"] != "epoch_nearest_edge"
+    assert camera["latch"]["status"] == camera["arrival"]["status"] == "unavailable"
+    for fragment in ("camera-clock match not available", "arrival match not available",
+                     "no transition lies at or before the first frame's host stamp"):
+        assert fragment in camera["reason"]
+    assert "fitted anchor failed" not in camera["reason"]
+
+
 def test_a_latency_stream_that_cannot_be_looked_for_costs_the_latch_and_never_raises(
     tmp_path, monkeypatch,
 ):

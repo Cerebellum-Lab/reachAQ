@@ -2979,6 +2979,12 @@ class SessionDataRecorder:
         anchors. A frame arrives after its exposure edge, so one inside the
         spool arrives no later than a period past the last transition (with no
         period known, no later than the last).
+
+        The mask is built on arrival_perf for both pairings, although the
+        camera-clock pairing matches by camera timestamp. That field is always
+        present in CAMERA_FRAME_DTYPE and camera_base falls it back to the
+        frame's own host stamp, so only a frame with no arrival yet (-inf)
+        is left out of the latch pairing for want of one.
         """
         arrival = np.asarray(frames["arrival_perf"], dtype=np.float64)
         last = float(transition_host[-1]) + (0.0 if period is None else float(period))
