@@ -33,11 +33,12 @@ def _record(tmp_path, *, t0, lag, seconds=20.0, latches=True, stream=True, expos
             polls=(), raw=False, stamps=True, tone_pulses=(), device_rows=(), laser_rows=(),
             trial_records=(), arrival=ARRIVAL, latch_error=0.0, stream_tail_seconds=0.0,
             raw_latches=False, drop_edge_at=None, latch_half_bracket=LATCH_HALF_BRACKET,
-            spool_tail_seconds=0.0):
+            spool_tail_seconds=0.0, stream_head_seconds=0.0):
     """One finalized session: the spool holds 5 s before the recording and `seconds` of it.
 
-    The latency stream runs stream_tail_seconds past the recording. raw puts RAW
-    stamps on the NI reads and raw_latches a RAW bracket on the latches; drop_edge_at
+    The latency stream starts stream_head_seconds before the recording (more than 5 s
+    starts it before the spool) and runs stream_tail_seconds past the recording. raw puts
+    RAW stamps on the NI reads and raw_latches a RAW bracket on the latches; drop_edge_at
     (NI seconds) loses one cam_frames transition. The spool runs spool_tail_seconds past
     the recording, as it does through Stop."""
     rig = SyntheticRig(polls=polls)
@@ -52,9 +53,10 @@ def _record(tmp_path, *, t0, lag, seconds=20.0, latches=True, stream=True, expos
                             drop_edge_at=drop_edge_at)
     rig.write_frame_ledger(project, n0, count, lag)
     if stream:
+        head = int(stream_head_seconds * FPS)
         rig.write_latency_stream(
-            project, "left", n0, count + int(stream_tail_seconds * FPS), lag, latches=latches,
-            arrival=arrival, latch_error=latch_error, raw_latches=raw_latches,
+            project, "left", n0 - head, head + count + int(stream_tail_seconds * FPS), lag,
+            latches=latches, arrival=arrival, latch_error=latch_error, raw_latches=raw_latches,
             latch_half_bracket=latch_half_bracket)
     result = SessionDataRecorder._write_session(
         project, start_perf, start_wall, end_perf, device_rows, laser_rows, (), spool,
@@ -235,6 +237,20 @@ def test_a_delivery_backlog_leaves_the_arrival_anchor_paired():
     assert evidence["ambiguous"] is False and evidence["reason"] == ""
     assert evidence["slip"]["reverts"] is True and evidence["slip"]["frames"] == 3
     assert number == early
+
+
+def test_latency_frames_before_the_ni_spool_do_not_cost_either_pairing(tmp_path):
+    # The camera can start before the NI task: frames exposed before the spool's first
+    # transition have no edge of their own. Counted, the camera-clock pairing would put every
+    # one of them on transition 0, and each would vote a shift of its own.
+    rig, project, n0, result = _record(tmp_path, t0=10.0, lag=0.001, stream_head_seconds=7.0)
+
+    camera = result["cameraNidaqAlignment"]
+    assert camera["matchedSampleIndex"] == rig.edge_sample(n0)
+    assert camera["latch"]["status"] == "paired" and camera["latch"]["agreement"] == 1.0
+    assert camera["latch"]["slip"] is None
+    assert camera["arrival"]["status"] == "paired"
+    assert camera["confidence"] == "hardware_edge"
 
 
 def test_the_first_frame_stamp_anchor_is_the_latest_transition_at_or_before_it():

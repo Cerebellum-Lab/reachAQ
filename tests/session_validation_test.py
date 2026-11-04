@@ -889,6 +889,11 @@ def test_frame_alignment_passes_a_clean_anchor_in_the_automatic_quick_check(tmp_
     assert "camera_latch" in result.message
     assert result.observed["anchorMethod"] == "camera_latch"
     assert result.observed["niToHostMethod"] == "raw_bridged"
+    # A schema-3 record has no arrival match: nothing to report and no lag to add.
+    assert "exposure-to-arrival" not in result.message
+    for key in ("arrivalStatus", "arrivalReason", "arrivalMedianLagSeconds",
+                "arrivalSampleIndex"):
+        assert result.observed[key] is None, key
 
 
 def test_frame_alignment_passes_a_clean_schema_four_anchor(tmp_path):
@@ -897,6 +902,9 @@ def test_frame_alignment_passes_a_clean_schema_four_anchor(tmp_path):
     assert result.status.value == "pass", result.message
     assert "exposure-to-arrival 4.380 ms" in result.message
     assert result.observed["arrivalStatus"] == "paired"
+    assert result.observed["arrivalReason"] == ""
+    assert result.observed["arrivalMedianLagSeconds"] == pytest.approx(0.00438)
+    assert result.observed["arrivalSampleIndex"] == 40
 
 
 def test_frame_alignment_still_passes_a_clean_schema_three_expected_lag_anchor(
@@ -1014,7 +1022,7 @@ def test_frame_alignment_warns_on_a_degraded_anchor_with_the_recorders_reason(
                "(unavailable: no latency stream)"),
      "camera-clock match not available"),
     (_schema_four_alignment(
-        confidence="ambiguous_hardware_edge", anchorsAgree=False,
+        confidence="ambiguous_hardware_edge", anchorsAgree=False, arrivalSampleIndex=107,
         reason="Camera-clock latch pairing on the fitted NI timeline (shift 1); "
                "the camera-clock anchor (sample 40) and the arrival anchor "
                "(sample 107) disagree"),
