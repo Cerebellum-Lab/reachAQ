@@ -2977,13 +2977,20 @@ class SessionDataRecorder:
             rows = tuple(
                 SessionDataRecorder._normalize_device_row(row) for row in device_rows
             )
-            names, indices, _perf, values, rate = SessionDataRecorder._nidaq_arrays(
+            names, indices, perf, values, rate = SessionDataRecorder._nidaq_arrays(
                 nidaq_chunks, requested_names=board_clock_chain.NIDAQ_CHANNELS,
             )
+            # The chain does not use host stamps; 8 bytes a sample, 288 MB an
+            # hour at 10 kHz, is not held while it decodes the barcode.
+            del perf
             channels = {name: values[row] for row, name in enumerate(names)}
-            return board_clock_chain.board_clock_chain(
+            record = board_clock_chain.board_clock_chain(
                 rows, sample_indices=indices, sample_rate_hz=rate, channels=channels,
             )
+            # alignment.json is written with allow_nan=False, so a NaN or a numpy
+            # scalar in the record would fail the write, not just this section.
+            json.dumps(record, allow_nan=False)
+            return record
         except Exception as error:  # finalization must never fail on this evidence
             logging.getLogger(__name__).exception("Board clock chain failed")
             return {

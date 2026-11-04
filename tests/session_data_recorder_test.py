@@ -2091,3 +2091,19 @@ def test_board_clock_chain_failure_never_fails_finalization(tmp_path, monkeypatc
     session_dir = next(Path(tmp_path).rglob("alignment.json")).parent
     alignment = json.loads((session_dir / "alignment.json").read_text(encoding="utf-8"))
     assert alignment["boardClockChain"] == chain
+
+
+def test_board_clock_chain_record_that_cannot_be_written_is_replaced(tmp_path, monkeypatch):
+    from tools.acquisition.model import board_clock_chain
+
+    # alignment.json is written with allow_nan=False: a NaN would fail the whole write.
+    monkeypatch.setattr(
+        board_clock_chain, "board_clock_chain",
+        lambda *_args, **_kwargs: {"status": "fitted", "boards": [], "residual": float("nan")},
+    )
+    project = ProjectInfo(root=str(tmp_path), device_id="test", when=datetime(2026, 1, 2, 3, 4, 5), session=8)
+
+    result = SessionDataRecorder._write_session(project, 10.0, 100.0, 11.0, (), (), (), ())
+
+    assert result["boardClockChain"]["status"] == "unavailable"
+    assert (next(Path(tmp_path).rglob("alignment.json"))).is_file()
