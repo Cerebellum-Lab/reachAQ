@@ -417,8 +417,10 @@ class CanInterface(DeviceInterface):
 
         self._pellet_addr: Optional[int] = None
         self._foreign_board_addresses = set()
-        self._board_clock_model = BoardClockModel()
-        self._board_sequence_tracker = BoardSequenceTracker()
+        # One clock and one sequence per board address: a second board's
+        # trailer is not a reboot of the first.
+        self._board_clocks: Dict[int, BoardClockModel] = {}
+        self._board_sequences: Dict[int, BoardSequenceTracker] = {}
         self._time_sync_requests = {}
         self._next_time_sync_request_id = 1
 
@@ -1670,6 +1672,7 @@ class CanInterface(DeviceInterface):
         Returns:
             Populated class type (see device_interface.py) or None
         """
+        sequence_status = self._observe_board_sequence(message)
         if not _is_pellet_by_addr(message.dst_id) and message.type not in self._any_board_types:
             self._ignore_foreign_board(message.dst_id)
             return None
@@ -1683,7 +1686,7 @@ class CanInterface(DeviceInterface):
                 raise TypeError(f"CAN decoder returned unsupported value: {type(res)}")
             res.timestamp_ns = self._get_timestamp_ns(message)
             res.index = self._get_index(message)
-            self._apply_board_timing(res, message)
+            self._apply_board_timing(res, message, sequence_status)
         return res
 
     def _ignore_foreign_board(self, address: int) -> None:
@@ -1705,7 +1708,28 @@ class CanInterface(DeviceInterface):
             address, _board_type_of_addr(address),
         )
 
-    def _apply_board_timing(self, source: Source, message) -> None:
+    def _board_clock(self, address: int) -> BoardClockModel:
+        model = self._board_clocks.get(address)
+        if model is None:
+            model = self._board_clocks[address] = BoardClockModel()
+        return model
+
+    def _observe_board_sequence(self, message) -> dict:
+        """Track every trailer, whatever becomes of its frame.
+
+        A trailer-bearing frame the host does not turn into a Source - a no-op
+        type, a foreign board's frame - still used up a sequence number on the
+        board; skipping it made the next tracked frame report a lost message.
+        """
+        if not bool(getattr(message, "board_timing_valid", False)):
+            return {}
+        tracker = self._board_sequences.get(message.dst_id)
+        if tracker is None:
+            tracker = self._board_sequences[message.dst_id] = BoardSequenceTracker()
+        timing = message.timing
+        return tracker.observe(int(timing.boot_id), int(timing.sequence))
+
+    def _apply_board_timing(self, source: Source, message, sequence_status: dict) -> None:
         source.event_perf_time = source.index / 1e9
         if not bool(getattr(message, "board_timing_valid", False)):
             return
@@ -1715,16 +1739,14 @@ class CanInterface(DeviceInterface):
         source.board_time_us = int(timing.board_time_us)
         kind = getattr(timing.kind, "name", str(timing.kind))
         source.board_timestamp_kind = str(kind).lower()
-        source.board_sequence_status = self._board_sequence_tracker.observe(
-            source.board_boot_id, source.board_sequence,
-        )
-        estimate = self._board_clock_model.estimate
-        if (
-            source.board_sequence_status.get("reboot")
-            and (estimate is None or estimate.boot_id != source.board_boot_id)
-        ):
-            self._board_clock_model.reset(source.board_boot_id)
-        aligned = self._board_clock_model.align(source.board_time_us)
+        source.board_sequence_status = sequence_status
+        model = self._board_clock(message.dst_id)
+        estimate = model.estimate
+        # Compare boot ids directly: the tracker's reboot flag is spent on
+        # whichever frame of the new boot arrived first, which may not be this one.
+        if estimate is not None and estimate.boot_id != source.board_boot_id:
+            model.reset(source.board_boot_id)
+        aligned = model.align(source.board_time_us)
         if aligned is None:
             return
         source.board_aligned_perf_time = aligned["perf_time"]
@@ -1746,7 +1768,7 @@ class CanInterface(DeviceInterface):
             and timing is not None
         ):
             try:
-                estimate = self._board_clock_model.observe(
+                estimate = self._board_clock(message.dst_id).observe(
                     request_id=request_id,
                     host_send_perf_ns=host_send_ns,
                     board_receive_time_us=int(response.request_receive_time_us),
