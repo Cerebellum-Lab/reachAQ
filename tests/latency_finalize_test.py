@@ -36,6 +36,18 @@ ARRIVAL_LAG = 0.002
 COMMAND_DELAY = 0.0003
 DIODE_DELAY = 0.0001
 START_ENTRY_NI = 1.0
+RAW_OFFSET = 3.0       # CLOCK_MONOTONIC_RAW = the unslewed host clock + 3 s
+SLEW_HALF_WIDTH = 0.2  # seconds either side of mid-session
+
+
+def _slew(host, slew):
+    """What a perf-only slew adds at host time `host`: 0, rising to `slew` at mid-session
+    (1.25 s) and back to 0 within SLEW_HALF_WIDTH of it. The RAW bridge reads perf minus RAW
+    within 1 s of its knots, and a 2.5 s session has only its two end knots: a slew that
+    reached them would move the whole bridged perf map, which is the fixture's shortness
+    (a real session has a knot every 10 s), not anything under test."""
+    t = np.asarray(host, dtype=np.float64) - HOST
+    return slew * np.clip(1.0 - np.abs(t - 1.25) / SLEW_HALF_WIDTH, 0.0, None)
 
 
 def _write(path, datasets, attrs=None):
@@ -49,7 +61,9 @@ def _write(path, datasets, attrs=None):
 
 
 def _session(tmp_path, *, first_sample=0, first_frame=0, primary="left", arrival_lag=ARRIVAL_LAG,
-             latches=True, raw=False):
+             latches=True, raw=False, raw_ni=False, raw_latches=False, slew=0.0):
+    # raw puts CLOCK_MONOTONIC_RAW on both sides: nidaq.h5's stamps and the latch brackets.
+    raw_ni, raw_latches = raw_ni or raw, raw_latches or raw
     rng = np.random.default_rng(7)
     session = tmp_path / "session001"
     streams = session / "streams"
@@ -75,15 +89,16 @@ def _session(tmp_path, *, first_sample=0, first_frame=0, primary="left", arrival
     # back-to-back reads, when the previous read returned.
     returned = HOST + block_last / RATE + 0.0002 + rng.uniform(0, 0.003, block_last.size)
     seen_per_block = np.concatenate([[HOST - 0.001], returned[:-1]])
+    seen = seen_per_block[block].astype(np.float64)
     nidaq = {
         "sample_index": first_sample + np.arange(samples, dtype=np.int64),
-        "block_observation_perf_time": seen_per_block[block].astype(np.float64),
+        "block_observation_perf_time": seen + _slew(seen, slew),
         "epoch": np.ones(samples, dtype=np.uint64),
         "values": np.vstack([cam, command, diode]).astype(np.float32),
     }
-    if raw:
-        # RAW read beside each perf stamp; no NTP in the synthetic host, so a constant offset.
-        nidaq["block_observation_raw_time"] = nidaq["block_observation_perf_time"] + 3.0
+    if raw_ni:
+        # RAW read beside each perf stamp: a constant offset, and none of perf's slew.
+        nidaq["block_observation_raw_time"] = seen + RAW_OFFSET
     _write(streams / "nidaq.h5", nidaq,
            {"channel_names": np.array([b"cam_frames", b"laser1_command_copy", b"laser1_diode"]),
             "sample_rate_hz": RATE})
@@ -93,7 +108,8 @@ def _session(tmp_path, *, first_sample=0, first_frame=0, primary="left", arrival
     frames = np.zeros(FRAMES, dtype=CAMERA_FRAME_DTYPE)
     frames["frame_id"] = ids + first_frame
     frames["camera_ts_ns"] = np.round((exposure_ni + CAMERA_OFFSET) * 1e9).astype(np.int64)
-    frames["arrival_perf"] = exposure_host + arrival_lag
+    arrival = exposure_host + arrival_lag
+    frames["arrival_perf"] = arrival + _slew(arrival, slew)
     frames["poll_perf"] = frames["arrival_perf"] - 0.0005
     frames["capture_return_perf"] = frames["arrival_perf"] + 0.0001
     batches = np.zeros(2, dtype=RECORD_BATCH_DTYPE)
@@ -117,8 +133,12 @@ def _session(tmp_path, *, first_sample=0, first_frame=0, primary="left", arrival
         # as the capture loop takes them.
         latch_ni = np.repeat([exposure_ni[0] + 0.001, exposure_ni[-1] + 0.001], 3)
         clock_latches = np.zeros(latch_ni.size, dtype=CLOCK_LATCH_DTYPE)
-        clock_latches["perf_before"] = HOST + latch_ni - 0.00005
-        clock_latches["perf_after"] = HOST + latch_ni + 0.00005
+        before, after = HOST + latch_ni - 0.00005, HOST + latch_ni + 0.00005
+        clock_latches["perf_before"] = before + _slew(before, slew)
+        clock_latches["perf_after"] = after + _slew(after, slew)
+        # The capture loop leaves RAW NaN where the host or the camera class has none.
+        clock_latches["raw_before"] = before + RAW_OFFSET if raw_latches else np.nan
+        clock_latches["raw_after"] = after + RAW_OFFSET if raw_latches else np.nan
         clock_latches["camera_ns"] = np.round((latch_ni + CAMERA_OFFSET) * 1e9).astype(np.int64)
         camera_stream["clock_latches"] = clock_latches
     for number, name in enumerate(("left", "right")):
@@ -204,14 +224,28 @@ def test_camera_clock_latches_pair_frames_whatever_the_lag(tmp_path, lag):
 
     status = finalize_session_latency(session, primary_camera="left")
 
-    assert status["status"] == "complete", status
     camera = status["clocks"]["cameraToNi"]
-    assert camera["valid"] is True
     assert camera["pairing"]["method"] == "camera_latch"
-    assert camera["pairing"]["shift"] == 0 and camera["pairing"]["ambiguous"] is False
+    assert camera["pairing"]["shift"] == 0
     # The latches are exact here, so the residual is the NI-to-host envelope's lateness.
     assert 0 < camera["pairing"]["median_residual"] < 0.0015
     assert camera["latchDirectLagP50"] == pytest.approx(lag, abs=1e-6)
+    if lag > PERIOD:
+        # No real configuration lags a frame period (2.2-4.4 ms measured, 2026-11-03); 18.9 ms
+        # was most likely the old 16.6 ms NI stamp bias. Host arrival pairs these frames two
+        # periods on, which does not confirm the latches, and the session is flagged.
+        assert camera["arrivalPairing"]["shift"] == -2
+        assert camera["arrivalPairing"]["ambiguous"] is False
+        assert camera["valid"] is False and camera["pairing"]["ambiguous"] is True
+        assert "host-arrival pairing (shift -2," in camera["reason"]
+        assert "does not confirm camera-clock pairing (shift 0)" in camera["reason"]
+        assert status["status"] != "complete"
+        assert status["loops"]["pose"]["status"] == "partial"
+        assert status["loops"]["pose"]["summary"]["confidence"] == "software"
+        return
+    assert status["status"] == "complete", status
+    assert camera["valid"] is True and camera["pairing"]["ambiguous"] is False
+    assert camera["arrivalPairing"]["shift"] == 0 and camera["arrivalPairing"]["ambiguous"] is False
     with h5py.File(session / "streams" / "latency.h5", "r") as store:
         pose = _stages(store, "pose")
         attrs = dict(store["clock/camera_to_ni"].attrs)
@@ -275,25 +309,114 @@ def test_without_clock_latches_the_host_arrival_pairing_is_used_and_says_so(tmp_
                                                             abs=1e-6)
 
 
-# 5 ms brackets are usable now and fail the latch pairing's geometric gate
-# instead; Task 3 makes that gate fall back to arrival and rewrites this test.
-@pytest.mark.xfail(reason="Task 3")
-def test_latches_none_of_which_is_usable_are_counted_in_the_fallback_reason(tmp_path):
+@pytest.mark.parametrize("damage, why", [
+    # 5 ms brackets are usable, but map frames to within 2.5 ms at best: over a quarter of
+    # a 150 fps period, so the geometric gate does not trust them to choose an edge.
+    ("wide", ("6 camera clock latches not trusted: latch mapping uncertainty 2.500 ms",
+              "exceeds a quarter frame period (1.667 ms)")),
+    ("not_finite", ("no usable clock latch: 6 rows, none with a finite, non-negative perf "
+                    "bracket",)),
+], ids=["wide", "not_finite"])
+def test_latches_that_cannot_pair_frames_are_named_in_the_fallback_reason(tmp_path, damage, why):
     session = _session(tmp_path)
     with h5py.File(session / "streams" / "latency" / "camera_left.h5", "r+") as store:
         latches = store["clock_latches"][()]
-        latches["perf_after"] = latches["perf_before"] + 0.005
+        latches["perf_after"] = latches["perf_before"] + 0.005 if damage == "wide" else np.nan
         store["clock_latches"][...] = latches
 
     status = finalize_session_latency(session, primary_camera="left")
 
+    # Host arrival, as for a stream with no latch (decision 7), and the reason says why.
     assert status["status"] == "partial"
-    assert status["reasons"] == [
-        "camera-to-NI pairing by host arrival assumes exposure→arrival under one frame "
-        "period (6 camera clock latches, none usable: bracket over 2 ms or not finite)"]
+    assert len(status["reasons"]) == 1, status["reasons"]
+    reason = status["reasons"][0]
+    assert reason.startswith("camera-to-NI pairing by host arrival assumes exposure→arrival "
+                             "under one frame period (")
+    for fragment in why:
+        assert fragment in reason, reason
     camera = status["clocks"]["cameraToNi"]
+    assert camera["valid"] is True
     assert camera["pairing"]["method"] == "host_arrival"
     assert camera["assumes_lag_below_period"] is True
+    assert "arrivalPairing" not in camera and "latchDirectLagP50" not in camera
+
+
+def test_with_raw_the_latch_pairing_ignores_a_perf_slew(tmp_path):
+    # 5 ms of slew, over half a 150 fps period, in every perf stamp and in no RAW one.
+    session = _session(tmp_path, raw=True, slew=0.005)
+
+    status = finalize_session_latency(session, primary_camera="left")
+
+    camera = status["clocks"]["cameraToNi"]
+    assert status["clocks"]["niToHost"]["method"] == "raw_bridged"
+    assert camera["valid"] is True, camera
+    assert camera["pairing"]["method"] == "camera_latch" and camera["pairing"]["clock"] == "raw"
+    assert camera["pairing"]["slip"] is None and camera["pairing"]["ambiguous"] is False
+    # Host arrival stays on perf, slewed arrivals and all, and names the same shift.
+    assert camera["arrivalPairing"]["ambiguous"] is False, camera["arrivalPairing"]
+    assert camera["arrivalPairing"]["shift"] == camera["pairing"]["shift"] == 0
+
+
+def test_without_raw_the_latch_pairing_is_on_perf_and_says_so(tmp_path):
+    status = finalize_session_latency(_session(tmp_path, raw=False), primary_camera="left")
+
+    camera = status["clocks"]["cameraToNi"]
+    assert camera["valid"] is True, camera
+    assert camera["pairing"]["method"] == "camera_latch" and camera["pairing"]["clock"] == "perf"
+
+
+@pytest.mark.parametrize("side, ni_method", [("raw_ni", "raw_bridged"),
+                                             ("raw_latches", "piecewise_envelope")])
+def test_raw_on_only_one_side_pairs_on_perf_and_says_so(tmp_path, side, ni_method):
+    # A RAW-bridged NI fit beside latches with NaN RAW brackets, or RAW latches beside an
+    # nidaq.h5 without the RAW column: no clock both sides share but perf.
+    status = finalize_session_latency(_session(tmp_path, **{side: True}), primary_camera="left")
+
+    camera = status["clocks"]["cameraToNi"]
+    assert status["clocks"]["niToHost"]["method"] == ni_method
+    assert camera["valid"] is True, camera
+    assert camera["pairing"]["method"] == "camera_latch" and camera["pairing"]["clock"] == "perf"
+    assert status["status"] == "complete", status
+
+
+def test_latches_one_period_off_disagree_with_arrival_and_are_invalid(tmp_path):
+    # Latches that read the camera clock a period early place every frame on the next
+    # frame's edge, with a residual as small as the right pairing's. Host arrival reads no
+    # latch, so it is what sees it.
+    session = _session(tmp_path, raw=True)
+    with h5py.File(session / "streams" / "latency" / "camera_left.h5", "r+") as store:
+        latches = store["clock_latches"][()]
+        latches["camera_ns"] -= int(round(PERIOD * 1e9))
+        store["clock_latches"][...] = latches
+
+    status = finalize_session_latency(session, primary_camera="left")
+
+    camera = status["clocks"]["cameraToNi"]
+    assert camera["pairing"]["method"] == "camera_latch" and camera["pairing"]["clock"] == "raw"
+    assert camera["pairing"]["shift"] == -1
+    assert 0 < camera["pairing"]["median_residual"] < 0.0015
+    assert camera["arrivalPairing"]["shift"] == 0 and camera["arrivalPairing"]["ambiguous"] is False
+    assert camera["valid"] is False and camera["pairing"]["ambiguous"] is True
+    assert "host-arrival pairing (shift 0," in camera["reason"]
+    assert "does not confirm camera-clock pairing (shift -1)" in camera["reason"]
+    assert camera["reason"] == camera["pairing"]["reason"]
+    assert status["loops"]["pose"]["status"] == "partial"
+
+
+def test_an_ambiguous_arrival_pairing_does_not_confirm_the_latches(tmp_path):
+    # Arrival a whole period after exposure: host arrival names the latches' shift, 0, but
+    # with its lag within the measured margin of one period. choose_pairing also says
+    # shift 0 when it fails outright, so the same shift is no confirmation on its own.
+    status = finalize_session_latency(_session(tmp_path, arrival_lag=PERIOD),
+                                      primary_camera="left")
+
+    camera = status["clocks"]["cameraToNi"]
+    arrival = camera["arrivalPairing"]
+    assert arrival["ambiguous"] is True and "within the measured margin" in arrival["reason"]
+    assert arrival["shift"] == camera["pairing"]["shift"] == 0
+    assert camera["valid"] is False and camera["pairing"]["ambiguous"] is True
+    assert "host-arrival pairing (shift 0, ambiguous: " in camera["reason"]
+    assert "does not confirm camera-clock pairing (shift 0)" in camera["reason"]
 
 
 def test_a_rebuild_of_streams_without_clock_latches_does_not_raise(tmp_path, capsys):

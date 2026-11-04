@@ -332,6 +332,13 @@ def _finite_or_none(value):
     return value if math.isfinite(value) else None
 
 
+def _float_or_nan(value) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return math.nan
+
+
 def _interp_extrapolate(x, xs, ys):
     """Piecewise-linear interpolation through (xs, ys), continued with the end
     segments outside them; xs strictly increasing with at least two points."""
@@ -350,6 +357,11 @@ class PiecewiseClockFit:
     per-segment drifts. offset and drift describe the straight line through
     the end knots, so a reader of the old record keys still gets a usable
     summary of the whole session.
+
+    A RAW-bridged fit also keeps knot_raw, the NI-to-RAW envelope at the same
+    knots, which to_raw() interpolates: NI time on CLOCK_MONOTONIC_RAW, which
+    no NTP slew touches. Any other fit, and a record stored before the column
+    was, has none (has_raw is False).
     """
     knots: numpy.ndarray
     knot_host: numpy.ndarray
@@ -358,6 +370,13 @@ class PiecewiseClockFit:
     valid: bool
     reason: str = ""
     method: str = PIECEWISE_ENVELOPE
+    knot_raw: Optional[numpy.ndarray] = None
+
+    @property
+    def has_raw(self) -> bool:
+        """Whether to_raw() can map: a valid table with a RAW value at every knot."""
+        return bool(self.valid and self.knot_raw is not None and self.knots.size >= 2
+                    and self.knot_raw.shape == self.knots.shape)
 
     @property
     def x_min(self) -> float:
@@ -397,6 +416,17 @@ class PiecewiseClockFit:
             return numpy.full(host.shape, math.nan)
         return _interp_extrapolate(host, self.knot_host, self.knots)
 
+    def to_raw(self, x):
+        """NI seconds -> CLOCK_MONOTONIC_RAW seconds; all NaN without a RAW view (has_raw).
+
+        Late by the delivery floor, as map() is: both rest on the same NI-to-RAW
+        envelope, and map() adds only the perf-minus-RAW offset to it.
+        """
+        x = numpy.asarray(x, dtype=numpy.float64)
+        if not self.has_raw:
+            return numpy.full(x.shape, math.nan)
+        return _interp_extrapolate(x, self.knots, self.knot_raw)
+
     def as_record(self, *, include_knots: bool = True) -> dict:
         drifts = self.segment_drifts()
         record = {
@@ -420,6 +450,8 @@ class PiecewiseClockFit:
         if include_knots:
             record["knots"] = [_finite_or_none(value) for value in self.knots]
             record["knotHost"] = [_finite_or_none(value) for value in self.knot_host]
+            if self.knot_raw is not None:
+                record["knotRaw"] = [_finite_or_none(value) for value in self.knot_raw]
         return record
 
 
@@ -547,6 +579,11 @@ def fit_from_record(record) -> Optional[PiecewiseClockFit]:
     through its summary keys: after an hour that line is milliseconds off,
     unflagged. Anything invalid, malformed or absent is None, so a caller falls
     back rather than mapping through nonsense.
+
+    The RAW column (knotRaw) comes back with the table when it is whole: one
+    finite value per knot, strictly increasing. A record without it, which is
+    every record written before it was stored, or with a damaged one, rebuilds
+    its perf table all the same, without a RAW view (has_raw is False).
     """
     if not isinstance(record, dict) or not record.get("valid"):
         return None
@@ -564,7 +601,8 @@ def fit_from_record(record) -> Optional[PiecewiseClockFit]:
                     and numpy.isfinite(knots).all() and numpy.isfinite(host).all()
                     and numpy.all(numpy.diff(knots) > 0) and numpy.all(numpy.diff(host) > 0)):
                 return PiecewiseClockFit(knots, host, residual, points, True, "",
-                                         str(record.get("method") or PIECEWISE_ENVELOPE))
+                                         str(record.get("method") or PIECEWISE_ENVELOPE),
+                                         _stored_knot_raw(record.get("knotRaw"), knots))
             return None
         offset, drift = float(record["offset"]), float(record["drift"])
         x_min, x_max = float(record["x_min"]), float(record["x_max"])
@@ -576,6 +614,21 @@ def fit_from_record(record) -> Optional[PiecewiseClockFit]:
     except (KeyError, TypeError, ValueError):
         pass
     return None
+
+
+def _stored_knot_raw(stored, knots) -> Optional[numpy.ndarray]:
+    """A record's RAW column at knots, or None unless it is whole: one finite,
+    strictly increasing value per knot."""
+    if stored is None:
+        return None
+    try:
+        raw = numpy.asarray(stored, dtype=numpy.float64)
+    except (TypeError, ValueError):
+        return None
+    if (raw.shape != knots.shape or not numpy.isfinite(raw).all()
+            or not numpy.all(numpy.diff(raw) > 0)):
+        return None
+    return raw
 
 
 def fit_ni_to_host_timeline(stamps: BlockStamps, sample_rate: float, *,
@@ -591,7 +644,8 @@ def fit_ni_to_host_timeline(stamps: BlockStamps, sample_rate: float, *,
     of it, and interpolated between knots. The median is what keeps a pair
     whose reader was preempted between its two clock reads from moving a knot;
     its price is that a kink in the slew is smoothed over the window, to about
-    50 us at 10 s knots. The table is stored and rebuilt as it is.
+    50 us at 10 s knots. The table is stored and rebuilt as it is, with the
+    NI-to-RAW values at its knots beside it (to_raw).
 
     When RAW cannot be used (no RAW column, an older session or a host without
     the clock; too few stamps; stamps over too little of the session; a NI-to-
@@ -661,7 +715,7 @@ def _bridge_through_raw(stamps: BlockStamps, finite, sample_rate: float, knot_se
         # ms a second, and inverse() needs a table that only goes forward.
         return None, "RAW bridge is not increasing; "
     return PiecewiseClockFit(knots, knot_host, ni_to_raw.residual_rms, ni_to_raw.points, True, "",
-                             RAW_BRIDGED), ""
+                             RAW_BRIDGED, knot_raw), ""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1009,6 +1063,23 @@ def latch_gate_ok(fit: ClockFit, ni_residual_rms: float, frame_period: float) ->
     return uncertainty + coverage_factor() * residual < period / 4
 
 
+def latch_gate_reason(fit: ClockFit, ni_residual_rms: float, frame_period: float) -> str:
+    """Why latch_gate_ok() does not trust fit, or "" when it does."""
+    if latch_gate_ok(fit, ni_residual_rms, frame_period):
+        return ""
+    if not getattr(fit, "valid", False):
+        return getattr(fit, "reason", "") or "no latch map"
+    residual, period = _float_or_nan(ni_residual_rms), _float_or_nan(frame_period)
+    if not math.isfinite(period):
+        return "the frame period is unknown, so the latch map cannot be judged"
+    if not math.isfinite(residual):
+        return "the NI fit's residual is unknown, so the latch map cannot be judged"
+    spread = coverage_factor() * residual
+    return (f"latch mapping uncertainty {fit.uncertainty * 1e3:.3f} ms plus "
+            f"{coverage_factor():.2f} NI residuals ({spread * 1e3:.3f} ms) "
+            f"exceeds a quarter frame period ({period / 4 * 1e3:.3f} ms)")
+
+
 def latch_tolerance(frame_period: float) -> float:
     """How far the NI path may sit from the latch path: P/4, at most LATCH_MAX_RESIDUAL_SECONDS."""
     if not math.isfinite(frame_period):
@@ -1095,13 +1166,7 @@ def choose_pairing_by_camera_clock(frame_ids, camera_ts_ns, latches, transition_
                         f"tolerance ({tolerance * 1e3:.3f} ms)")
     # An unknown frame period fails the gate too, and is already the reason.
     if not gate_ok and math.isfinite(tolerance):
-        if not math.isfinite(ni_residual_rms):
-            problems.append("the NI fit's residual is unknown, so the latch map cannot be judged")
-        else:
-            spread = coverage_factor() * ni_residual_rms
-            problems.append(f"latch mapping uncertainty {fit.uncertainty * 1e3:.3f} ms plus "
-                            f"{coverage_factor():.2f} NI residuals ({spread * 1e3:.3f} ms) "
-                            f"exceeds a quarter frame period ({frame_period / 4 * 1e3:.3f} ms)")
+        problems.append(latch_gate_reason(fit, ni_residual_rms, frame_period))
     return Pairing(shift, math.nan, agreement,
                    bool(residual_ambiguous or slip is not None or not gate_ok),
                    "; ".join(problems), method=CAMERA_LATCH, median_residual=median_residual,

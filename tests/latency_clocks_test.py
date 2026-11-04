@@ -1,3 +1,4 @@
+import json
 import math
 import time
 
@@ -879,6 +880,75 @@ def test_the_raw_bridge_follows_a_slew_step_the_piecewise_fit_cannot():
     record = bridged.as_record()
     assert record["method"] == "raw_bridged" and record["knotSeconds"] == pytest.approx(10.0, abs=0.5)
     assert clocks.fit_from_record(record).map(123.4) == pytest.approx(bridged.map(123.4), abs=1e-9)
+
+
+def _raw_bridged(seed=21):
+    """(the RAW-bridged fit, the RAW clock, its stamps, probe NI times) over 300 s, with a
+    10 ms NTP correction at 150 s in perf and none in RAW."""
+    host = _slewed_host(-10.0, [(150.0, 0.010)])
+    raw_clock = _slewed_host(-10.0, [], host0=4000.0)
+    stamps = _raw_stamped_reads(300.0, host, raw_clock, np.random.default_rng(seed))
+    fit = clocks.fit_ni_to_host_timeline(stamps, 10_000.0)
+    assert fit.valid and fit.method == clocks.RAW_BRIDGED, fit.reason
+    probe = np.linspace(stamps.end_index[0] / 10_000.0, stamps.end_index[-1] / 10_000.0, 30_000)
+    return fit, raw_clock, stamps, probe
+
+
+def test_the_raw_bridge_keeps_its_raw_view():
+    fit, raw_clock, stamps, probe = _raw_bridged()
+
+    raw = fit.to_raw(probe)
+
+    assert fit.has_raw and fit.knot_raw.shape == fit.knots.shape
+    # The RAW clock, late by the stamps' 0.2 ms delivery floor as map() is, and blind to
+    # the 10 ms perf took at 150 s.
+    assert np.abs(raw - (raw_clock(probe) + 0.0002)).max() < 0.00005
+    # A fit of the perf stamps alone has no RAW view, and nor has an invalid fit.
+    for other in (clocks.fit_piecewise_envelope(stamps.end_index, stamps.perf, 10_000.0),
+                  clocks.invalid_piecewise_fit("no stamps")):
+        assert not other.has_raw and np.isnan(other.to_raw(probe)).all()
+
+
+def test_a_record_without_knot_raw_rebuilds_and_has_no_raw_view():
+    # alignment.json written before the RAW view was stored: the perf table is all there is.
+    fit, _, stamps, probe = _raw_bridged()
+    record = fit.as_record()
+    del record["knotRaw"]
+
+    rebuilt = clocks.fit_from_record(record)
+
+    assert rebuilt is not None and rebuilt.method == clocks.RAW_BRIDGED
+    assert np.allclose(rebuilt.map(probe), fit.map(probe), atol=1e-9)
+    assert rebuilt.knot_raw is None and not rebuilt.has_raw
+    assert np.isnan(rebuilt.to_raw(probe)).all()
+    # A fit of the perf stamps alone, and a straight line, have no RAW view to store.
+    piecewise = clocks.fit_piecewise_envelope(stamps.end_index, stamps.perf, 10_000.0)
+    x = np.linspace(0.0, 100.0, 200)
+    line = clocks.fit_line(x, 7.0 + 1.00001 * x, max_residual=1e-6)
+    for other in (piecewise.as_record(), line.as_record()):
+        assert "knotRaw" not in other
+        assert not clocks.fit_from_record(other).has_raw
+
+
+def test_knot_raw_round_trips_through_the_record():
+    fit, _, _, probe = _raw_bridged()
+    record = fit.as_record()
+
+    rebuilt = clocks.fit_from_record(json.loads(json.dumps(record)))
+
+    assert len(record["knotRaw"]) == record["knotCount"]
+    assert "knotRaw" not in fit.as_record(include_knots=False)
+    assert rebuilt.has_raw
+    assert np.allclose(rebuilt.to_raw(probe), fit.to_raw(probe), atol=1e-9)
+    # A damaged RAW column costs the RAW view, never the perf table beside it.
+    raw = list(record["knotRaw"])
+    damage = {"truncated": raw[:-1], "a None inside": raw[:3] + [None] + raw[4:],
+              "running backwards": raw[:3] + [raw[2] - 1.0] + raw[4:],
+              "not numbers": ["x"] * len(raw)}
+    for why, bad in damage.items():
+        damaged = clocks.fit_from_record({**record, "knotRaw": bad})
+        assert damaged is not None and not damaged.has_raw, why
+        assert np.allclose(damaged.map(probe), fit.map(probe), atol=1e-9), why
 
 
 def test_without_raw_stamps_the_selector_fits_the_piecewise_envelope():
