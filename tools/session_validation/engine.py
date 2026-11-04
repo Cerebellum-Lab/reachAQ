@@ -690,7 +690,8 @@ def _frame_alignment_rule(context):
     arrival = camera.get("arrival") or {}
     status = camera.get("status")
     # The reasons go in too: a pass can still carry one worth reading, such as
-    # a perf-only fit's or an exposure the recorder set aside as implausible.
+    # a perf-only fit's or, in a schema-3 file only, an exposure the recorder set
+    # aside as implausible.
     # The schema-3 lag keys stay (None in schema 4); the arrival keys are None in schema 3.
     observed = {
         "schemaVersion": schema,

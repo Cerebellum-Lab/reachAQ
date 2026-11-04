@@ -447,7 +447,7 @@ CAN warnings and errors remain in both logs.
 - `deviceEventOverruns`, `sessionComplete`, and `incompleteReasons`.
 
 How schemaVersion 4 chooses the first recorded frame's transition on the
-fitted timeline. No lag is assumed anywhere; both matches are measured over
+fitted timeline. No lag value is an input; both matches are measured over
 the primary camera's latency stream:
 
 - `latch` pairs each frame's camera timestamp, placed on host time by the clock
@@ -582,7 +582,7 @@ Camera/NI matching puts every `cam_frames` transition on the host clock through
 the NI-to-host fit built from the NI read stamps, then takes the first recorded
 frame's transition from two measured matches over the primary camera's latency
 stream, the camera's clock latches and the frames' host arrival, with no lag
-assumed. The latch match anchors, and `hardware_edge` needs the arrival match to
+value as an input. The latch match anchors, and `hardware_edge` needs the arrival match to
 name the same transition; with one match the anchor is that one, and with
 neither it is the transition at or before the first frame's own host stamp, at
 `ambiguous_hardware_edge` confidence. The alignment records whether the
