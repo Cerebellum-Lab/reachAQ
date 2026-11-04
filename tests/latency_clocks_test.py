@@ -1,4 +1,5 @@
 import math
+import time
 
 import numpy as np
 import pytest
@@ -319,7 +320,8 @@ def test_camera_fit_with_nonzero_shift_and_chosen_pairing():
     assert fit.map(5.05) == pytest.approx(0.05, abs=1e-4)
 
 
-LATCH_DTYPE = np.dtype([("perf_before", "<f8"), ("camera_ns", "<i8"), ("perf_after", "<f8")])
+LATCH_DTYPE = np.dtype([("perf_before", "<f8"), ("camera_ns", "<i8"), ("perf_after", "<f8"),
+                        ("raw_before", "<f8"), ("raw_after", "<f8")])
 PERIOD_150 = 1 / 150
 CAMERA_BEHIND_HOST = 40.0  # camera clock = host perf_counter - 40 s
 
@@ -334,7 +336,13 @@ def _latches(host_times, *, camera_of=_camera_clock, bracket=100e-6, error=0.0):
     rows["perf_before"] = host - bracket / 2
     rows["perf_after"] = host + bracket / 2
     rows["camera_ns"] = np.round((camera_of(host) + error) * 1e9).astype(np.int64)
+    rows["raw_before"] = rows["raw_after"] = np.nan
     return rows
+
+
+def _burst(when):
+    """Three latch times, 0.3 ms apart, as one mark of the capture loop takes them."""
+    return when + 0.0003 * np.arange(3)
 
 
 def _exposures(count, *, early=5):
@@ -355,7 +363,8 @@ def test_host_arrival_pairing_aliases_a_lag_over_one_period_and_the_camera_clock
     by_arrival = clocks.choose_pairing(ids, exposure + lag, transition_perf, PERIOD_150,
                                        ni_residual_rms=0.00002)
     by_clock = clocks.choose_pairing_by_camera_clock(ids, camera_ts_ns, latches, transition_perf,
-                                                     PERIOD_150, ni_residual_rms=0.00002)
+                                                     PERIOD_150, ni_residual_rms=0.00002,
+                                                     clock="perf")
 
     # The latest transition before each arrival is two frames on, and nothing says so.
     assert by_arrival.method == "host_arrival"
@@ -374,7 +383,8 @@ def test_a_latch_off_by_more_than_half_a_period_is_ambiguous():
     latches = _latches([exposure[0] + 0.001], error=0.6 * PERIOD_150)
 
     pairing = clocks.choose_pairing_by_camera_clock(ids, camera_ts_ns, latches, transition_perf,
-                                                    PERIOD_150, ni_residual_rms=0.00002)
+                                                    PERIOD_150, ni_residual_rms=0.00002,
+                                                    clock="perf")
 
     assert pairing.ambiguous
     assert "residual" in pairing.reason
@@ -393,10 +403,10 @@ def test_an_hour_of_camera_drift_is_fitted_through_two_latches_or_windowed_aroun
 
     both = clocks.choose_pairing_by_camera_clock(
         ids, camera_ts_ns, _latches([start, end], camera_of=drifting), transition_perf, PERIOD_150,
-        ni_residual_rms=0.00002)
+        ni_residual_rms=0.00002, clock="perf")
     start_only = clocks.choose_pairing_by_camera_clock(
         ids, camera_ts_ns, _latches([start], camera_of=drifting), transition_perf, PERIOD_150,
-        ni_residual_rms=0.00002)
+        ni_residual_rms=0.00002, clock="perf")
 
     # 20 ppm over an hour is 72 ms, ten frame periods: one offset cannot pair the whole session.
     for pairing in (both, start_only):
@@ -407,15 +417,18 @@ def test_an_hour_of_camera_drift_is_fitted_through_two_latches_or_windowed_aroun
 
 @pytest.mark.parametrize("latches, why", [
     (np.zeros(0, dtype=LATCH_DTYPE), "0 rows"),
-    (np.concatenate([_latches([50.1], bracket=0.005),
+    (np.concatenate([_latches([50.1], bracket=float("nan")),
                      _latches([60.0], bracket=float("nan"))]), "2 rows"),
-], ids=["empty", "too_wide"])
+], ids=["empty", "not_finite"])
 def test_unusable_latches_give_an_ambiguous_pairing_with_a_reason(latches, why):
+    # A wide bracket is usable now (the geometric gate judges it); only a bracket
+    # that is not finite, or reversed, is left out.
     ids, exposure, transition_perf = _exposures(300)
     camera_ts_ns = np.round(_camera_clock(exposure) * 1e9).astype(np.int64)
 
     pairing = clocks.choose_pairing_by_camera_clock(ids, camera_ts_ns, latches, transition_perf,
-                                                    PERIOD_150, ni_residual_rms=0.00002)
+                                                    PERIOD_150, ni_residual_rms=0.00002,
+                                                    clock="perf")
 
     assert pairing.ambiguous
     assert pairing.method == "camera_latch"
@@ -434,7 +447,7 @@ def test_a_pairing_one_frame_off_at_50_fps_is_ambiguous():
     latches = _latches([exposure[0] + 0.001, exposure[-1] + 0.001])
 
     pairing = clocks.choose_pairing_by_camera_clock(ids, camera_ts_ns, latches, transition_perf,
-                                                    period, ni_residual_rms=0.00002)
+                                                    period, ni_residual_rms=0.00002, clock="perf")
 
     assert pairing.shift == 994  # frame 1000 is transition 5
     assert pairing.median_residual == pytest.approx(0.00339, abs=1e-5)
@@ -449,7 +462,7 @@ def test_a_correct_pairing_with_a_small_residual_is_accepted():
 
     pairing = clocks.choose_pairing_by_camera_clock(ids, camera_ts_ns, latches,
                                                     transition_perf + 0.0001, PERIOD_150,
-                                                    ni_residual_rms=0.00002)
+                                                    ni_residual_rms=0.00002, clock="perf")
 
     assert pairing.shift == 995 and not pairing.ambiguous, pairing.reason
     assert pairing.median_residual == pytest.approx(0.0001, abs=1e-6)
@@ -463,7 +476,7 @@ def test_a_lost_transition_is_a_slip_for_the_camera_clock_too(drop):
 
     pairing = clocks.choose_pairing_by_camera_clock(
         ids, camera_ts_ns, latches, np.delete(transition_perf, 5 + drop), PERIOD_150,
-        ni_residual_rms=0.00002)
+        ni_residual_rms=0.00002, clock="perf")
 
     assert pairing.ambiguous
     # The lost edge's own frame sits midway between its neighbours; either may take it.
@@ -484,11 +497,192 @@ def test_an_unknown_frame_period_is_ambiguous_without_printing_nan():
 
     pairing = clocks.choose_pairing_by_camera_clock(ids, camera_ts_ns, _latches([exposure[0]]),
                                                     transition_perf, float("nan"),
-                                                    ni_residual_rms=0.00002)
+                                                    ni_residual_rms=0.00002, clock="perf")
 
     assert pairing.ambiguous
     assert "frame period is unknown" in pairing.reason
     assert "nan" not in pairing.reason
+
+
+def test_a_latch_whose_stamp_is_3_ms_off_is_dropped_and_named():
+    latches = _latches(np.concatenate([_burst(50.0), _burst(650.0)]))
+    latches["perf_before"][4] += 0.003
+    latches["perf_after"][4] += 0.003
+
+    fit = clocks.fit_latches(latches, clock="perf")
+
+    assert fit.valid, fit.reason
+    assert fit.dropped == (4,) and fit.points == 5
+    assert "latch 4" in fit.reason
+    host = np.linspace(50.0, 650.0, 1000)
+    half_bracket = float((latches["perf_after"] - latches["perf_before"]).max() / 2)
+    assert np.abs(fit.map(_camera_clock(host)) - host).max() < half_bracket
+
+
+def test_two_inconsistent_latches_of_one_burst_keep_the_larger_consistent_set():
+    # The opening mark's latches are off by +h, +h and -h, in brackets wide
+    # enough to hold the truth. The closing mark's third sits 0.3 ms off the
+    # other two, in a bracket too tight to reach theirs.
+    h = 0.0002
+    opening = _latches(_burst(50.0), bracket=0.0005)
+    closing = _latches(_burst(650.0))
+    for name in ("perf_before", "perf_after"):
+        opening[name] += np.array([h, h, -h])
+        closing[name][2] += 0.0003
+    latches = np.concatenate([opening, closing])
+    # The least-squares line misses latch 2, a good one, by the most: dropping
+    # its largest miss would lose a right latch and keep the wrong one.
+    camera = latches["camera_ns"] / 1e9
+    centred = camera - camera.mean()
+    middle = (latches["perf_before"] + latches["perf_after"]) / 2
+    slope, intercept = np.polyfit(centred, middle, 1)
+    assert int(np.argmax(np.abs(middle - intercept - slope * centred))) == 2
+
+    fit = clocks.fit_latches(latches, clock="perf")
+
+    assert fit.valid, fit.reason
+    assert fit.dropped == (5,) and fit.points == 5
+    host = np.linspace(50.0, 650.0, 1000)
+    assert np.abs(fit.map(_camera_clock(host)) - host).max() < 50e-6
+
+
+def test_latches_at_one_end_only_give_an_offset():
+    latches = _latches(_burst(50.0), bracket=np.array([0.0003, 0.0001, 0.0002]))
+
+    fit = clocks.fit_latches(latches, clock="perf")
+
+    resolution = time.get_clock_info("perf_counter").resolution
+    assert fit.valid and fit.points == 1 and fit.drift == 1.0 and fit.dropped == ()
+    # The tightest latch alone, trusted to its half-bracket widened by the clock's resolution.
+    assert fit.uncertainty == pytest.approx(0.00005 + resolution, abs=1e-12)
+    assert fit.x_min == fit.x_max == pytest.approx(float(_camera_clock(50.0003)), abs=1e-9)
+    assert fit.map(_camera_clock(50.0003)) == pytest.approx(50.0003, abs=1e-9)
+
+
+def test_the_mapping_uncertainty_bounds_every_feasible_line():
+    rng = np.random.default_rng(11)
+    host = np.concatenate([_burst(50.0), _burst(650.0)])
+    width = rng.uniform(0.0001, 0.0006, host.size)
+    latches = _latches(host, bracket=width)
+    # Each bracket still holds its latch's true host time, anywhere inside it.
+    slide = rng.uniform(-0.5, 0.5, host.size) * width
+    for name in ("perf_before", "perf_after"):
+        latches[name] += slide
+
+    fit = clocks.fit_latches(latches, clock="perf")
+
+    assert fit.valid and fit.dropped == (), fit.reason
+    # Lines through every bracket: a value at each end, drawn where that mark's
+    # brackets overlap, kept when the line passes all six.
+    camera = latches["camera_ns"] / 1e9
+    first, last = camera.min(), camera.max()
+    low = latches["perf_before"] - (camera + CAMERA_BEHIND_HOST)
+    high = latches["perf_after"] - (camera + CAMERA_BEHIND_HOST)
+    start = first + CAMERA_BEHIND_HOST + rng.uniform(low[:3].max(), high[:3].min(), 2000)
+    end = last + CAMERA_BEHIND_HOST + rng.uniform(low[3:].max(), high[3:].min(), 2000)
+    slope = (end - start) / (last - first)
+    at = start[:, None] + slope[:, None] * (camera - first)
+    through = ((at >= latches["perf_before"]) & (at <= latches["perf_after"])).all(axis=1)
+    assert through.sum() >= 200
+    start, slope = start[through][:200], slope[through][:200]
+    frames = np.linspace(first, last, 500)
+    sampled = start[:, None] + slope[:, None] * (frames - first)
+    miss = float(np.abs(sampled - fit.map(frames)).max())
+    assert miss <= fit.uncertainty + 1e-12  # float rounding
+    # And the bound is not loose: the sampled lines come close to it.
+    assert miss > 0.8 * fit.uncertainty
+
+
+def test_a_zero_width_latch_bracket_is_padded_by_the_clock_resolution():
+    resolution = time.get_clock_info("perf_counter").resolution
+    latches = _latches(np.concatenate([_burst(50.0), _burst(650.0)]), bracket=0.0)
+    assert (latches["perf_before"] == latches["perf_after"]).all()
+
+    fit = clocks.fit_latches(latches, clock="perf")
+    offset_only = clocks.fit_latches(latches[:3], clock="perf")
+
+    # Rounded to the nanosecond, the six points are not exactly on one line;
+    # widened by the clock's resolution, they are.
+    assert fit.valid and fit.dropped == (), fit.reason
+    assert fit.uncertainty > 0
+    assert offset_only.valid and offset_only.uncertainty == pytest.approx(resolution)
+
+
+def _two_marks(exposure, bracket):
+    return np.concatenate([_latches(_burst(exposure[0] + 0.001), bracket=bracket),
+                           _latches(_burst(exposure[-1] + 0.001), bracket=bracket)])
+
+
+def test_wide_latch_brackets_fail_the_geometric_gate_at_150_fps():
+    ids, exposure, transition_perf = _exposures(9000)
+    camera_ts_ns = np.round(_camera_clock(exposure) * 1e9).astype(np.int64)
+    latches = _two_marks(exposure, 0.004)
+
+    pairing = clocks.choose_pairing_by_camera_clock(ids, camera_ts_ns, latches, transition_perf,
+                                                    PERIOD_150, ni_residual_rms=0.00002,
+                                                    clock="perf")
+
+    # Every bracket is centred on the truth, so the pairing is right; what fails
+    # is how far the map could be wrong, 2 ms, over a quarter period (1.67 ms).
+    assert clocks.fit_latches(latches, clock="perf").uncertainty == pytest.approx(0.002, abs=1e-6)
+    assert pairing.shift == 995 and abs(pairing.median_residual) < 1e-5
+    assert pairing.ambiguous
+    assert "quarter frame period" in pairing.reason
+    assert pairing.clock == "perf"
+
+
+def test_brackets_of_1_78_ms_still_pair_at_150_fps():
+    # The sweep's worst session (2026-11-03): brackets up to 1.78 ms and an NI
+    # residual of 0.039 ms, so 0.89 + 4.89 * 0.039 = 1.08 ms, under 1.67 ms.
+    ids, exposure, transition_perf = _exposures(9000)
+    camera_ts_ns = np.round(_camera_clock(exposure) * 1e9).astype(np.int64)
+    latches = _two_marks(exposure, 0.00178)
+
+    pairing = clocks.choose_pairing_by_camera_clock(ids, camera_ts_ns, latches, transition_perf,
+                                                    PERIOD_150, ni_residual_rms=0.000039,
+                                                    clock="perf")
+
+    assert pairing.shift == 995
+    assert not pairing.ambiguous, pairing.reason
+
+
+def test_the_geometric_gate_counts_the_ni_residual_beside_the_mapping_uncertainty():
+    fit = clocks.ClockFit(0.0, 1.0, 0.0, 6, True, uncertainty=0.001)
+    # u + k * sigma against P / 4: the NI residual at the edge, for u = 1 ms at 150 fps.
+    edge = (PERIOD_150 / 4 - 0.001) / clocks.coverage_factor()
+
+    assert clocks.latch_gate_ok(fit, 0.9 * edge, PERIOD_150)
+    assert not clocks.latch_gate_ok(fit, 1.1 * edge, PERIOD_150)
+    assert not clocks.latch_gate_ok(fit, float("nan"), PERIOD_150)
+    assert not clocks.latch_gate_ok(fit, 0.00002, float("nan"))
+    assert not clocks.latch_gate_ok(clocks.invalid_fit("no latch"), 0.00002, PERIOD_150)
+
+
+def test_raw_latches_read_their_raw_bracket_and_a_stream_without_one_has_none():
+    host = np.concatenate([_burst(50.0), _burst(650.0)])
+    latches = _latches(host)
+    latches["raw_before"] = latches["perf_before"] - 7.0  # RAW 7 s behind perf here
+    latches["raw_after"] = latches["perf_after"] - 7.0
+
+    camera, raw, half = clocks.usable_latches(latches, clock="raw")
+    fit = clocks.fit_latches(latches, clock="raw")
+
+    assert camera.size == 6 and np.allclose(raw, host - 7.0, rtol=0, atol=1e-9)
+    assert fit.valid and fit.clock == "raw" and fit.dropped == (), fit.reason
+    assert fit.map(_camera_clock(300.0)) == pytest.approx(293.0, abs=1e-6)
+    # RAW left NaN by a camera class without it, and a stream from before the
+    # RAW pair: neither has a RAW latch, and both keep their perf ones.
+    three_fields = np.zeros(6, dtype=LATCH_DTYPE.descr[:3])
+    for name in three_fields.dtype.names:
+        three_fields[name] = latches[name]
+    for rows in (_latches(host), three_fields):
+        assert clocks.usable_latches(rows, clock="raw")[0].size == 0
+        unusable = clocks.fit_latches(rows, clock="raw")
+        assert not unusable.valid and unusable.clock == "raw"
+        assert "no usable clock latch" in unusable.reason
+        assert clocks.fit_latches(rows, clock="perf").valid
+    unknown = clocks.fit_latches(latches, clock="wall")
+    assert not unknown.valid and "wall" in unknown.reason
 
 
 _TAU = 512.0

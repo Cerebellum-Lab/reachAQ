@@ -2990,7 +2990,7 @@ class SessionDataRecorder:
             frames = stream.get("frames")
             latches = stream.get("clock_latches")
             rows = 0 if latches is None else int(len(latches))
-            usable = int(clocks.usable_latches(latches)[0].size)
+            usable = int(clocks.usable_latches(latches, clock="perf")[0].size)
             if frames is None or len(frames) == 0:
                 return {"status": "unavailable", "reason": "no frames in the latency stream",
                         "latches": rows, "usableLatches": usable}, None
@@ -3002,6 +3002,7 @@ class SessionDataRecorder:
             pairing = clocks.choose_pairing_by_camera_clock(
                 frames["frame_id"][kept], frames["camera_ts_ns"][kept], latches, transition_host,
                 math.nan if period is None else float(period), ni_residual_rms=ni_residual_rms,
+                clock="perf",
             )
             residual = float(pairing.median_residual)
             evidence = {

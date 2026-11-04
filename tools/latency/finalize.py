@@ -235,7 +235,7 @@ def _wall_record(wall_map: clocks.WallMap, reason: str = "") -> dict:
 def _latch_direct_lag_p50(frames, latches) -> float:
     """Median of arrival minus camera timestamp mapped to host by the latches; NaN if none."""
     try:
-        fit = clocks.fit_latches(latches)
+        fit = clocks.fit_latches(latches, clock="perf")
         camera = numpy.asarray(frames["camera_ts_ns"], dtype=numpy.float64) / 1e9
         near = clocks.latch_window(fit, camera) if fit.valid else numpy.zeros(camera.shape, bool)
         lag = numpy.asarray(frames["arrival_perf"], dtype=numpy.float64)[near] - fit.map(camera[near])
@@ -252,7 +252,7 @@ def _host_arrival_reason(latches) -> str:
     if not rows:
         return HOST_ARRIVAL_PAIRING_REASON
     return (f"{HOST_ARRIVAL_PAIRING} ({rows} camera clock latch{'es' if rows != 1 else ''}, "
-            f"none usable: bracket over {clocks.LATCH_MAX_BRACKET_SECONDS * 1e3:g} ms or not finite)")
+            "none usable: no finite, non-negative bracket)")
 
 
 def _ni_derived_lag_p50(frames, latches, camera_to_ni, ni_to_host) -> float:
@@ -260,7 +260,7 @@ def _ni_derived_lag_p50(frames, latches, camera_to_ni, ni_to_host) -> float:
     try:
         if not (camera_to_ni.valid and ni_to_host.valid):
             return math.nan
-        fit = clocks.fit_latches(latches)
+        fit = clocks.fit_latches(latches, clock="perf")
         camera = numpy.asarray(frames["camera_ts_ns"], dtype=numpy.float64) / 1e9
         near = clocks.latch_window(fit, camera) if fit.valid else numpy.zeros(camera.shape, bool)
         exposure = ni_to_host.map(camera_to_ni.map(camera[near]))
@@ -375,10 +375,11 @@ class _Context:
         latches = self.cameras.get(self.primary_name, {}).get("clock_latches")
         try:
             transition_perf = self.ni_to_host.map(transition_index / ni["rate"])
-            if clocks.usable_latches(latches)[0].size:
+            if clocks.usable_latches(latches, clock="perf")[0].size:
                 self.pairing = clocks.choose_pairing_by_camera_clock(
                     frames["frame_id"], frames["camera_ts_ns"], latches, transition_perf,
-                    self.frame_period, ni_residual_rms=self.ni_to_host.residual_rms)
+                    self.frame_period, ni_residual_rms=self.ni_to_host.residual_rms,
+                    clock="perf")
             else:
                 self.pairing = clocks.choose_pairing(frames["frame_id"], frames["arrival_perf"],
                                                      transition_perf, self.frame_period,
