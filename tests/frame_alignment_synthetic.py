@@ -27,7 +27,8 @@ camera's frame ledger and its latency stream, from one model of the clocks
   HOST0 + RAW_OFFSET + (1 + DRIFT) * t, read beside each stamp; NaN unless
   asked for, as on a host without the clock.
 * cam_frames toggles at every exposure start t_n = EDGE0 + n * PERIOD, at
-  sample round(t_n * RATE). Frame n has id FIRST_ID + n, a camera stamp at its
+  sample round(t_n * RATE), save one when asked (drop_edge_at: a lost NI
+  transition). Frame n has id FIRST_ID + n, a camera stamp at its
   exposure end on a camera clock = NI seconds + CAMERA_OFFSET, and
   frame_perf_c = H(t_n) + lag. The lag is against the true edge H(t_n). The
   drift report's L (0.8-1.8 ms measured) is against the edge as the NI-to-host
@@ -37,10 +38,11 @@ camera's frame ledger and its latency stream, from one model of the clocks
   is not a property of the perf-only envelope in general: across a long
   session of NTP polls it is not late-never-early (the final review's 4 h proof
   measured up to 46 us early, 260 us late at most), and only the RAW bridge is.
-* Clock latches: three 1 ms after a frame's exposure start, each a +-0.1 ms
-  perf bracket around H(t) holding the camera clock at t. The RAW pair of the
-  latch row is NaN: no consumer reads it yet, and this rig does not model a
-  camera-side RAW latch.
+* Clock latches: three 1 ms after a frame's exposure start, each a perf
+  bracket of +-LATCH_HALF_BRACKET (0.1 ms) around H(t) holding the camera
+  clock at t. The RAW pair of the latch row is NaN, as on a host without the
+  clock, unless asked for (raw_latches): then a bracket of the same width
+  around the RAW time of the same instant, read with the perf one.
 """
 
 from __future__ import annotations
@@ -75,6 +77,7 @@ RAW_OFFSET = 3.0
 EXPOSURE = 175e-6
 FIRST_ID = 1000
 ARRIVAL = 0.0023
+LATCH_HALF_BRACKET = 0.0001
 
 
 class SyntheticRig:
@@ -126,9 +129,13 @@ class SyntheticRig:
     def frame_perf_c(self, n, lag):
         return float(self.host(self.edge_time(n))) + lag
 
-    def write_spool(self, path, *, t_from, t_to, tone_pulses=(), raw=False, stamps=True):
+    def write_spool(self, path, *, t_from, t_to, tone_pulses=(), raw=False, stamps=True,
+                    drop_edge_at=None):
         """The recorder's spool for NI seconds [t_from, t_to): the layout
-        _open_nidaq_spool_locked creates, and the snapshot _write_session takes."""
+        _open_nidaq_spool_locked creates, and the snapshot _write_session takes.
+
+        drop_edge_at (NI seconds) omits the toggle of the first exposure edge at
+        or after it, so cam_frames has one transition fewer from there on."""
         first = int(round(t_from * RATE))
         last = int(round(t_to * RATE))
         index = np.arange(first, last, dtype=np.int64)
@@ -145,6 +152,8 @@ class SyntheticRig:
         block_perf = stamp[per_sample]
         block_raw = raw_stamp[per_sample]
         edges = np.array([self.edge_sample(n) for n in range(int((t_to + 1.0 - EDGE0) / PERIOD) + 1)])
+        if drop_edge_at is not None:
+            edges = np.delete(edges, self.first_edge_at_or_after(drop_edge_at))
         cam = (np.searchsorted(edges, index, side="right") % 2).astype(np.float32)
         channels, rows = ["cam_frames"], [cam]
         if tone_pulses:
@@ -207,12 +216,15 @@ class SyntheticRig:
                 ])
 
     def write_latency_stream(self, project, name, n_first, count, lag, *, latches=True,
-                             arrival=ARRIVAL, latch_error=0.0):
+                             arrival=ARRIVAL, latch_error=0.0, raw_latches=False,
+                             latch_half_bracket=LATCH_HALF_BRACKET):
         """streams/latency/camera_<name>.h5 as the capture process writes it.
 
         arrival is each frame's host arrival after its true exposure edge, and
-        latch_error shifts every latch's perf bracket off the true host time of
-        its camera stamp (a camera clock mapped a frame off, at 1 / FPS)."""
+        latch_error shifts every latch's brackets off the true host time of
+        its camera stamp (a camera clock mapped a frame off, at 1 / FPS).
+        raw_latches fills the RAW pair, self.raw(when) +- latch_half_bracket,
+        and latch_half_bracket is the half-width of both brackets."""
         session = Path(project.get_session_path().location)
         path = session / "streams" / "latency" / f"camera_{name}.h5"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -226,9 +238,12 @@ class SyntheticRig:
         frames["capture_return_perf"] = frames["arrival_perf"] + 0.0001
         rows = []
         if latches:
+            half = latch_half_bracket
             for when in (float(edge[0]) + 0.001, float(edge[-1]) + 0.001):
                 host = float(self.host(when)) + latch_error
-                rows.extend([(host - 0.0001, self.camera_ns(when), host + 0.0001, np.nan, np.nan)] * 3)
+                raw = float(self.raw(when)) + latch_error if raw_latches else np.nan
+                rows.extend([(host - half, self.camera_ns(when), host + half,
+                              raw - half, raw + half)] * 3)
         latch_rows = np.zeros(len(rows), dtype=CLOCK_LATCH_DTYPE)
         for position, row in enumerate(rows):
             latch_rows[position] = row[:len(CLOCK_LATCH_DTYPE.names)]

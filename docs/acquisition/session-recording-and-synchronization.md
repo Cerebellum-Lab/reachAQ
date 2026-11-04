@@ -450,22 +450,66 @@ How schemaVersion 4 chooses the first recorded frame's transition on the
 fitted timeline. No lag value is an input; both matches are measured over
 the primary camera's latency stream:
 
-- `latch` pairs each frame's camera timestamp, placed on host time by the clock
-  latches, with the nearest transition; the shift most frames agree on wins
-  (transition number = frame ID - `shift`). `arrival` pairs each frame with the
-  latest transition at or before its host arrival, by the same majority.
+- `latch` pairs each frame's camera timestamp, placed on a host clock by the
+  clock latches, with the nearest transition on that clock; the shift most
+  frames agree on wins (transition number = frame ID - `shift`). `arrival`
+  pairs each frame with the latest transition at or before its host arrival
+  (`perf_counter`), by the same majority.
   Each records `status` (`unavailable`, `paired`, `ambiguous`, `outside` when
   the first frame's transition lies outside the spool, or `failed`), `shift`,
-  `agreement`, `ambiguous`, `reason` and `frames`; `latch` adds
-  `medianResidualSeconds`, `latches` and `usableLatches`, and `arrival` adds
-  `medianLagSeconds`, the median time from the paired transition to the
-  frame's arrival; evidence of a match that could not run is `unavailable` or
-  `failed` and carries little more than `status` and `reason`.
+  `agreement`, `ambiguous`, `reason`, `frames`, `limitSeconds` and `slip`;
+  `latch` adds `medianResidualSeconds`, `latches`, `usableLatches`, `clock`,
+  `uncertaintySeconds` and `dropped`, and `arrival` adds `medianLagSeconds`,
+  the median time from the paired transition to the frame's arrival; evidence
+  of a match that could not run is `unavailable` or `failed` and carries little
+  more than `status` and `reason`. `limitSeconds`, `slip`, `clock`,
+  `uncertaintySeconds` and `dropped` were added within schemaVersion 4, so
+  earlier schema-4 files lack them; read them with a default.
   `arrivalSampleIndex` is the NI sample the arrival match names for the first
   recorded frame (null without one). `latch.frames` and `arrival.frames` count
   only the latency frames that arrived while the spool held transitions; the
   camera runs on before the NI task starts and after it stops, and those frames
   are left out of both pairings.
+- `latch.clock` is `raw` when both sides carry `CLOCK_MONOTONIC_RAW`: the NI fit
+  is `raw_bridged`, whose RAW view places the transitions, and the latch rows
+  have usable RAW brackets (`raw_before`, `raw_after`). RAW is never slewed, so
+  one straight latch map holds for the whole session. Otherwise it is `perf`:
+  the map is a straight line over `perf_counter`, which timesyncd slews, and it
+  ignores the slews (simulated, one line misses by 1.9-4.3 ms p95 after an
+  hour). `usableLatches` counts on that clock.
+- The latch map is a straight line through every latch's bracket (the host
+  times before and after the camera clock was read, widened by the clock's
+  resolution). Latches no such line passes through together with the rest are
+  left out, the largest consistent set kept; `dropped` lists their latch row
+  numbers and `reason` names them. Kept latches spanning no more than 10 s
+  give an offset at drift 1 instead. `uncertaintySeconds` is how far any map
+  of the same kind through the kept brackets can sit from the one used, over
+  the latched span.
+- The limits are measured, with one constant: `FALSE_ALARM_PROBABILITY`
+  (1e-6, per check and per session, in `tools/latency/clocks.py`), which gives
+  k = 4.89 standard errors (the two-sided Gaussian quantile; on a robust
+  spread, 1.4826 × MAD, an approximation). σ_NI is `niToHost.residual_rms`
+  and P is `framePeriodSeconds`.
+  - The latch match is trusted only while `uncertaintySeconds + k·σ_NI` is
+    under P/4. Otherwise it is `ambiguous`, its shift still recorded, and
+    `reason` reads *latch mapping uncertainty X ms plus 4.89 NI residuals (Y ms)
+    exceeds a quarter frame period (Z ms)*.
+  - `latch.limitSeconds` is the residual tolerance, min(P/4, 2 ms): a
+    `medianResidualSeconds` beyond it is `ambiguous`. The 2 ms cap stays until
+    the NI delivery delay is measured.
+  - `arrival.limitSeconds` is the margin k·√(σ_NI² + (1.2533·MAD_lag/√n)²),
+    MAD_lag the robust spread of the per-frame lags and n the frames counted:
+    a `medianLagSeconds` within it of 0 or of P is `ambiguous`.
+  - `slip` is null, or where the votes change shift: `frameId`, `frames` (the
+    run's length), `fromShift` and `toShift`. In frame-ID order the stray
+    rate is p̂ = (votes off the majority + 1) / (n + 2), and the longest run L
+    of one other shift is a slip when n·p̂^L is under
+    `FALSE_ALARM_PROBABILITY`. `frameId` is the run's first frame, or, for a
+    run that opens the session, the frame after it. A lost or spurious NI
+    transition puts every later frame on the next shift, a slip in both
+    matches, which are then `ambiguous`. `agreement` stays as a diagnostic.
+  - These replace the fixed 0.95 agreement, 0.1 ms arrival margin and 2 ms
+    latch bracket cap.
 - `anchorMethod` is the first that yields a transition: `camera_latch` when the
   latch match is `paired`, else `host_arrival` when the arrival match is, else
   `first_frame_stamp`, the latest transition at or before the first recorded
@@ -510,8 +554,9 @@ Three things to know when reading `cameraNidaqAlignment`:
   boundary, so how much margin it has before it would name a neighbouring
   transition. It describes the arrival match whichever method anchored, and is
   only meaningful when `arrival.status` is `paired`; it is null without a
-  median lag, and `latch.medianResidualSeconds` and `latch.agreement` are the
-  latch's own margin. The epoch fallback (`epoch_nearest_edge`) records how much
+  median lag, and `latch.medianResidualSeconds` against `latch.limitSeconds`,
+  with `latch.uncertaintySeconds`, is the latch's own margin. The epoch
+  fallback (`epoch_nearest_edge`) records how much
   nearer the chosen transition is than the runner-up, both measured to
   `start_perf`. schemaVersion 3 measured the runner-up distance to the expected
   edge (`start_perf` less the expected lag) on the fitted path.

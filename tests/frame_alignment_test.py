@@ -17,8 +17,10 @@ import pytest
 from autotrainer.core import ProjectInfo
 from tools.acquisition.model.session_data_recorder import SessionDataRecorder
 from tools.latency import clocks
-from tools.latency.finalize import finalize_session_latency
-from frame_alignment_synthetic import ARRIVAL, EXPOSURE, FPS, RATE, SyntheticRig
+from tools.latency.finalize import finalize_session_latency, read_raw_stream
+from frame_alignment_synthetic import (
+    ARRIVAL, EXPOSURE, FPS, LATCH_HALF_BRACKET, RATE, SyntheticRig,
+)
 
 
 def _project(tmp_path, session=1):
@@ -28,10 +30,13 @@ def _project(tmp_path, session=1):
 
 def _record(tmp_path, *, t0, lag, seconds=20.0, latches=True, stream=True, exposure=EXPOSURE,
             polls=(), raw=False, stamps=True, tone_pulses=(), device_rows=(), laser_rows=(),
-            trial_records=(), arrival=ARRIVAL, latch_error=0.0, stream_tail_seconds=0.0):
+            trial_records=(), arrival=ARRIVAL, latch_error=0.0, stream_tail_seconds=0.0,
+            raw_latches=False, drop_edge_at=None, latch_half_bracket=LATCH_HALF_BRACKET):
     """One finalized session: the spool holds 5 s before the recording and `seconds` of it.
 
-    The latency stream runs stream_tail_seconds past the end of the spool."""
+    The latency stream runs stream_tail_seconds past the end of the spool. raw puts RAW
+    stamps on the NI reads and raw_latches a RAW bracket on the latches; drop_edge_at
+    (NI seconds) loses one cam_frames transition."""
     rig = SyntheticRig(polls=polls)
     project = _project(tmp_path)
     session_dir = Path(project.get_session_path().location)
@@ -40,12 +45,14 @@ def _record(tmp_path, *, t0, lag, seconds=20.0, latches=True, stream=True, expos
     start_perf, start_wall, boundary = rig.start(project, n0, lag)
     end_perf = rig.frame_perf_c(n0 + count - 1, lag)
     spool = rig.write_spool(session_dir / "nidaq_capture.h5", t_from=t0 - 5.0, t_to=t0 + seconds,
-                            tone_pulses=tone_pulses, raw=raw, stamps=stamps)
+                            tone_pulses=tone_pulses, raw=raw, stamps=stamps,
+                            drop_edge_at=drop_edge_at)
     rig.write_frame_ledger(project, n0, count, lag)
     if stream:
         rig.write_latency_stream(
             project, "left", n0, count + int(stream_tail_seconds * FPS), lag, latches=latches,
-            arrival=arrival, latch_error=latch_error)
+            arrival=arrival, latch_error=latch_error, raw_latches=raw_latches,
+            latch_half_bracket=latch_half_bracket)
     result = SessionDataRecorder._write_session(
         project, start_perf, start_wall, end_perf, device_rows, laser_rows, (), spool,
         boundary=boundary, trial_records=trial_records,
@@ -345,6 +352,100 @@ def test_raw_stamps_bridge_the_fit_through_an_ntp_step(tmp_path):
     assert 0.0 < error.min() and error.max() < 0.0006  # late by the delivery floor, through the step
 
 
+def test_with_raw_latches_a_perf_slew_does_not_cost_the_anchor(tmp_path):
+    # A 5 ms timesyncd correction at 12 s slews perf_counter under the latches and the
+    # transitions; both are placed on CLOCK_MONOTONIC_RAW, which it does not touch.
+    rig, project, n0, result = _record(tmp_path, t0=5.0, lag=0.001, raw=True, raw_latches=True,
+                                       polls=((12.0, 0.005),))
+
+    camera = result["cameraNidaqAlignment"]
+    latch, arrival = camera["latch"], camera["arrival"]
+    assert camera["confidence"] == "hardware_edge"
+    assert camera["matchedSampleIndex"] == rig.edge_sample(n0)
+    assert latch["clock"] == "raw" and latch["slip"] is None
+    assert arrival["slip"] is None
+    # Six identical +-0.1 ms brackets, three at each end: every line through them lies within
+    # the half-bracket (plus the clock's resolution) of the map, and none is left out.
+    assert latch["uncertaintySeconds"] == pytest.approx(1e-4, abs=1e-6)
+    assert latch["dropped"] == []
+    # The residual tolerance is a quarter of the measured period (under the 2 ms cap here).
+    assert latch["limitSeconds"] == pytest.approx(camera["framePeriodSeconds"] / 4)
+
+
+@pytest.mark.parametrize("raw, raw_latches", [(False, False), (True, False), (False, True)],
+                         ids=["neither", "ni_only", "latches_only"])
+def test_without_raw_latches_the_anchor_says_perf(tmp_path, raw, raw_latches):
+    # RAW on one side only is no RAW map: the transitions and the latches must share a clock.
+    rig, project, n0, result = _record(tmp_path, t0=5.0, lag=0.001, raw=raw,
+                                       raw_latches=raw_latches)
+
+    camera = result["cameraNidaqAlignment"]
+    latch = camera["latch"]
+    assert latch["clock"] == "perf"
+    assert camera["confidence"] == "hardware_edge" and latch["slip"] is None
+    assert latch["uncertaintySeconds"] == pytest.approx(1e-4, abs=1e-6)
+
+
+@pytest.mark.parametrize("share", [0.3, 0.7])
+def test_a_lost_ni_transition_is_a_slip_in_both_pairings(tmp_path, share):
+    # One cam_frames toggle missing: every frame after it pairs one transition earlier, so the
+    # votes change shift there. Before mid-session the minority run opens the session, after
+    # it the run closes it; either way the slip names where the votes change.
+    t0, seconds = 5.0, 20.0
+    drop = t0 + share * seconds
+    rig, project, n0, result = _record(tmp_path, t0=t0, lag=0.001, seconds=seconds,
+                                       drop_edge_at=drop)
+
+    camera = result["cameraNidaqAlignment"]
+    lost = rig.frame_id(rig.first_edge_at_or_after(drop))
+    assert camera["confidence"] == "ambiguous_hardware_edge"
+    slips = [camera["latch"]["slip"], camera["arrival"]["slip"]]
+    assert any(slip is not None and abs(slip["frameId"] - lost) <= 1 for slip in slips), slips
+    for name in ("latch", "arrival"):
+        evidence = camera[name]
+        assert evidence["status"] == "ambiguous", (name, evidence["reason"])
+        assert evidence["slip"] is not None and abs(evidence["slip"]["frameId"] - lost) <= 1, name
+        assert f"slip at frame {evidence['slip']['frameId']}" in evidence["reason"], name
+
+
+def test_wide_latch_brackets_leave_the_anchor_ambiguous(tmp_path):
+    # 4 ms brackets: the latch map alone is 2 ms uncertain, over a quarter of the 6.7 ms
+    # period, so the camera clock cannot choose a transition and only the arrival match is left.
+    rig, project, n0, result = _record(tmp_path, t0=5.0, lag=0.001, latch_half_bracket=0.002)
+
+    camera = result["cameraNidaqAlignment"]
+    latch = camera["latch"]
+    assert "latch mapping uncertainty 2.000 ms" in latch["reason"]
+    assert "exceeds a quarter frame period" in latch["reason"]
+    assert latch["status"] == "ambiguous" and latch["uncertaintySeconds"] == pytest.approx(
+        0.002, abs=1e-6)
+    assert camera["confidence"] == "ambiguous_hardware_edge"
+    assert camera["anchorMethod"] == "host_arrival"
+    assert camera["matchedSampleIndex"] == rig.edge_sample(n0)
+
+
+def test_a_latch_left_out_of_the_map_is_listed_in_the_anchor_evidence(tmp_path):
+    # One latch's host stamp 3 ms off: no line through the other five passes through its
+    # bracket, so the map is made without it and the evidence says which one and why.
+    rig = SyntheticRig()
+    n0 = rig.first_edge_at_or_after(5.0)
+    count = 3000
+    stream = read_raw_stream(rig.write_latency_stream(_project(tmp_path), "left", n0, count, 0.001))
+    stream["clock_latches"]["perf_before"][4] += 0.003
+    stream["clock_latches"]["perf_after"][4] += 0.003
+    # The true host time of every edge from ten before the first frame's.
+    transitions = rig.host(rig.edge_time(np.arange(n0 - 10, n0 + count + 10)))
+
+    evidence, number = SessionDataRecorder._latch_anchor(
+        SimpleNamespace(primary_frame_id=rig.frame_id(n0)), stream, "", transitions, 1 / FPS,
+        ni_residual_rms=4e-5, transition_raw=None)
+
+    assert evidence["status"] == "paired" and number == 10
+    assert evidence["dropped"] == [4]
+    assert "latch 4 left out" in evidence["reason"]
+    assert evidence["clock"] == "perf" and evidence["usableLatches"] == 6
+
+
 def test_alignment_schema_four_keeps_the_old_fields_and_records_both_matches(tmp_path):
     rig, project, n0, result = _record(tmp_path, t0=5.0, lag=0.001)
 
@@ -369,7 +470,14 @@ def test_alignment_schema_four_keeps_the_old_fields_and_records_both_matches(tmp
     assert len(camera["niToHost"]["knotHost"]) == len(camera["niToHost"]["knots"]) >= 2
     assert camera["latch"]["status"] == "paired" and camera["latch"]["usableLatches"] == 6
     assert camera["arrival"]["status"] == "paired" and camera["arrival"]["agreement"] == 1.0
+    # The measured limits, additive inside the evidence (still schemaVersion 4).
+    for key in ("clock", "uncertaintySeconds", "limitSeconds", "slip", "dropped"):
+        assert key in camera["latch"], key
+    for key in ("limitSeconds", "slip"):
+        assert key in camera["arrival"], key
     lag, period = camera["arrival"]["medianLagSeconds"], camera["framePeriodSeconds"]
+    # The arrival margin is measured, and the lag clears it on both sides.
+    assert 0.0 < camera["arrival"]["limitSeconds"] < min(lag, period - lag)
     assert camera["ambiguitySeconds"] == pytest.approx(min(lag, period - lag))
     assert camera["edgePolarity"] in ("rising", "falling")
 

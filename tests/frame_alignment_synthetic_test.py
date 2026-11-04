@@ -298,6 +298,44 @@ def test_each_latch_brackets_the_host_time_of_the_camera_clock_reading(tmp_path,
                        rtol=0, atol=2e-6)
 
 
+def test_raw_latches_bracket_the_raw_time_of_the_same_instant(tmp_path, project):
+    rig = SyntheticRig(polls=((1.0, 0.002),))
+    n0 = rig.first_edge_at_or_after(5.0)
+    when = np.repeat([float(rig.edge_time(n0)) + 0.001, float(rig.edge_time(n0 + 9)) + 0.001], 3)
+    for half_bracket in (1e-4, 0.002):
+        path = rig.write_latency_stream(project, "left", n0, 10, 0.001, raw_latches=True,
+                                        latch_half_bracket=half_bracket)
+        with h5py.File(path, "r") as store:
+            latches = store["clock_latches"][()]
+        camera, raw, half = clocks.usable_latches(latches, clock="raw")
+        _, perf, perf_half = clocks.usable_latches(latches, clock="perf")
+        assert np.allclose(camera, when + CAMERA_OFFSET, rtol=0, atol=1e-9)
+        # RAW is HOST0 + 3 s + (1 - 10 ppm) t, which no poll slews; the perf bracket around the
+        # same instant carries the slew the poll at 1 s has put on the host (17 us by 5 s).
+        assert np.allclose(raw, HOST0 + 3.0 + (1 + DRIFT) * when, rtol=0, atol=1e-9)
+        assert np.allclose(perf - raw, -3.0 + rig.slew(when), rtol=0, atol=1e-9)
+        assert (perf - raw + 3.0 > 1.5e-5).all()
+        # Both brackets are the half-width asked for: 0.1 ms unless told otherwise.
+        assert np.allclose(half, half_bracket, rtol=0, atol=1e-12)
+        assert np.allclose(perf_half, half_bracket, rtol=0, atol=1e-12)
+
+
+def test_a_dropped_edge_is_one_cam_frames_transition_missing(tmp_path):
+    rig = SyntheticRig()
+    spool = rig.write_spool(tmp_path / "spool.h5", t_from=0.0, t_to=20.0, drop_edge_at=11.0)
+    _, indices, _, values, _ = SessionDataRecorder._nidaq_arrays(
+        spool, requested_names=("cam_frames",))
+    transitions = indices[SessionDataRecorder._transition_positions(values[0])]
+    # Hand-worked: the first edge at or after 11 s is n = ceil((11 - 0.0123) * 150) = 1649,
+    # at 11.005633 s, sample 110 056; the 20 s spool has 2999 transitions without the drop.
+    lost = rig.first_edge_at_or_after(11.0)
+    assert lost == 1649 and rig.edge_sample(lost) == 110_056
+    assert transitions.size == 2998 and 110_056 not in transitions.tolist()
+    expected = [rig.edge_sample(n) for n in range(0, 3000)
+                if rig.edge_sample(n) < 200_000 and n != lost]
+    assert transitions.tolist() == expected
+
+
 def test_a_stream_written_without_latches_has_an_empty_latch_table(tmp_path, project):
     rig = SyntheticRig()
     n0 = rig.first_edge_at_or_after(5.0)
