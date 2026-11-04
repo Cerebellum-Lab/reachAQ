@@ -1,3 +1,6 @@
+import json
+import tracemalloc
+
 import numpy as np
 import pytest
 
@@ -848,3 +851,101 @@ def test_a_knot_closer_than_five_seconds_to_the_end_is_dropped_for_the_end_knot(
 
         assert fit.method == clocks.RAW_BRIDGED, fit.reason
         assert np.diff(fit.knots)[-1] == pytest.approx(last_segment, abs=0.05), duration
+
+
+def _wandering(x, wander=1e-6, seconds=3600.0):
+    """y = x + 5 with a drift that moves linearly by `wander` over `seconds`."""
+    return 5.0 + x + 0.5 * (wander / seconds) * x ** 2
+
+
+def test_piecewise_line_follows_a_wandering_drift_that_one_line_cannot():
+    rng = np.random.default_rng(7)
+    x = np.arange(0.0, 3600.0, 1.0)
+    truth = _wandering(x)
+    y = truth + rng.normal(0, 20e-6, x.size)
+
+    straight = clocks.fit_line(x, y, max_residual=1e-4, min_points=5)
+    fit = clocks.fit_piecewise_line(x, y, max_residual=1e-4, min_points=5)
+
+    assert not straight.valid  # a parabola's rms about its best line is about 134 us here
+    assert fit.valid, fit.reason
+    assert fit.method == clocks.PIECEWISE_LINE and fit.knots.size > 20
+    assert np.abs(fit.map(x) - truth).max() < 40e-6
+    assert fit.residual_rms == pytest.approx(20e-6, rel=0.15)
+
+
+def test_piecewise_line_over_less_than_a_window_is_one_straight_segment():
+    x = np.arange(0.0, 60.0, 0.5)
+    y = 3.0 + 1.00002 * x
+
+    fit = clocks.fit_piecewise_line(x, y, max_residual=1e-6, min_points=5)
+
+    assert fit.valid and fit.knots.tolist() == [0.0, 59.5]
+    assert fit.drift == pytest.approx(1.00002, rel=1e-12) and fit.offset == pytest.approx(3.0, abs=1e-9)
+
+
+def test_piecewise_line_is_continuous_and_exact_on_a_bent_line():
+    x = np.arange(0.0, 400.0, 0.25)
+    knots, values = np.array([0.0, 150.0, 300.0, 399.75]), np.array([1.0, 151.0, 300.5, 400.25])
+    y = np.interp(x, knots, values)
+
+    fit = clocks.fit_piecewise_line(x, y, max_residual=1e-9, min_points=5, knot_seconds=150.0)
+
+    assert fit.valid, fit.reason
+    assert fit.knots.tolist() == knots.tolist()
+    assert fit.knot_host == pytest.approx(values, abs=1e-9)
+
+
+def test_piecewise_line_drops_an_outlier():
+    x = np.arange(0.0, 600.0, 1.0)
+    y = _wandering(x)
+    y[300] += 0.01
+
+    fit = clocks.fit_piecewise_line(x, y, max_residual=1e-5, min_points=5)
+
+    assert fit.valid and fit.points == x.size - 1
+
+
+def test_piecewise_line_needs_points_and_span():
+    few = clocks.fit_piecewise_line(np.arange(5.0), np.arange(5.0), max_residual=1.0, min_points=10)
+    assert not few.valid and "need 10" in few.reason
+
+    short = clocks.fit_piecewise_line(np.linspace(0, 5, 200), np.linspace(0, 5, 200), max_residual=1.0,
+                                      min_points=10, min_span=10.0)
+    assert not short.valid and "span" in short.reason
+
+    flat = clocks.fit_piecewise_line(np.full(50, 3.0), np.arange(50.0), max_residual=1.0, min_points=10)
+    assert not flat.valid and "span" in flat.reason
+
+
+def test_piecewise_line_with_a_rms_above_the_gate_is_invalid_and_its_record_is_json_safe():
+    rng = np.random.default_rng(3)
+    x = np.arange(0.0, 300.0, 1.0)
+    fit = clocks.fit_piecewise_line(x, x + rng.normal(0, 1e-3, x.size), max_residual=1e-4, min_points=5)
+    assert not fit.valid and "residual rms" in fit.reason
+    json.dumps(fit.as_record(), allow_nan=False)
+    json.dumps(clocks.fit_piecewise_line([], [], max_residual=1.0, min_points=5).as_record(), allow_nan=False)
+
+
+def test_piecewise_line_refuses_a_window_that_runs_backwards():
+    x = np.arange(0.0, 300.0, 1.0)
+    y = np.where(x < 150.0, x, 300.0 - x)  # host time that turns around
+
+    fit = clocks.fit_piecewise_line(x, y, max_residual=100.0, min_points=5, knot_seconds=150.0)
+
+    assert not fit.valid and "backwards" in fit.reason
+
+
+def test_piecewise_line_over_a_long_session_is_not_held_as_a_dense_matrix():
+    x = np.arange(0.0, 28_800.0, 0.06)  # eight hours, 480 000 points, 240 windows
+    y = _wandering(x, 2e-6, 28_800.0)
+    tracemalloc.start()
+    try:
+        fit = clocks.fit_piecewise_line(x, y, max_residual=1e-6, min_points=5)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert fit.valid, fit.reason
+    assert fit.knots.size > 200
+    # the dense design matrix alone would be 480 000 x 241 x 8 bytes = 925 MB
+    assert peak < 200e6, peak
