@@ -35,12 +35,21 @@ and prints a banner naming what it could not confirm: the shutter line cannot be
 read from here, and only the reopen closes it. A signal can stop the run only
 inside the run itself (InterruptGate); during the recovery and the report it is
 held, so they always finish. The rows are appended to a .rows.jsonl file as each
-ends, so a lost terminal or a broken `| tee` loses none of them. The exit status
-is 0 only for a run that finished with no reopen or reset still running in the
-driver, no victim alive, and the last row's reopen and reset clean and its output
-read at the minimum. A refusal (-50103) in an earlier row is data and the run goes
-on; one in the last row, or an output still up, is not confirmed safe, so it goes
-down the same path as a failure: recovery, banner, status 1.
+ends, so a lost terminal or a broken `| tee` loses none of them.
+
+A refusal (-50103) in a row is data, on any row, the last included: a hang row's
+reopen runs while its victim still holds the output, and the table wants that
+text. What decides the exit status is the end state (check_end_state): every run
+that reaches its last row, the tracking check included, ends with one more
+time-bounded reopen and device reset, with no victim alive, and a fresh reading
+of the output. Status 0, with a plain line naming the three results, if what ran
+succeeded and the output reads its minimum; otherwise the same banner and status
+1. --skip-reopen and --skip-reset skip those parts of the check too. A skipped
+part is neither a failure nor a confirmation: the reader is what confirms the
+output, so such a run is status 0 only if it reads the minimum. Status 0 then
+says nothing of the shutter line, which nothing closed, and --skip-reopen always
+ends with a warning saying so. A call that wedges in the check stops the run as
+a wedged row does, and a run stopped early takes that path and not the check.
 """
 
 from __future__ import annotations
@@ -135,10 +144,10 @@ Before any row: laser {laser} must be unable to emit.
   - the command output on a BNC tee: a dummy load of 1 kOhm or more (10 kOhm
     termination; the 6713 drives +-5 mA) on one arm, the DMM on the other
   - the operator's reachAQ not running (it holds the 6221 inputs and the laser)
-Every row reopens the laser controller as reachAQ does, which rewrites
-EVERY configured laser channel, not only laser {laser}: each command to its
-minimum, each shutter closed. The device reset after it resets every output
-on {command_device}."""
+Every row, and the check at the end of every run, reopens the laser controller
+as reachAQ does, which rewrites EVERY configured laser channel, not only laser
+{laser}: each command to its minimum, each shutter closed. The device reset
+after it resets every output on {command_device}."""
 
 _REFUSAL = (
     "refusing to drive the laser output: pass --laser-disconnected once the key "
@@ -723,36 +732,19 @@ def _wedged(observation: KillObservation) -> Optional[str]:
     read safe; a victim that survived SIGKILL may still hold the output. Neither
     is a measurement: the run stops there, with the recovery and its banner.
     """
-    for label, text in (("reopen", observation.reopen_error),
-                        ("reset", observation.reset_error)):
-        if isinstance(text, WedgedText):
-            return f"the {label} {text}"
+    wedged = _wedged_call(observation.reopen_error, observation.reset_error)
+    if wedged:
+        return wedged
     if isinstance(observation.victim_exit, WedgedText):
         return f"the victim {observation.victim_exit}"
     return None
 
 
-def _not_recovered(observation: KillObservation, minimum_volts: float) -> Optional[str]:
-    """Why the output after the LAST row is not confirmed at its minimum, or None.
-
-    An earlier row's refusal is data and the next row's victim starts the
-    output afresh. After the last, nothing does: its reopen or reset refused,
-    or the last thing the reader saw was above the minimum, or it saw nothing,
-    and nothing has closed the shutter line if the reopen refused. A row the
-    controller refused by design ran nothing and is not held to this.
-    """
-    if observation.case.refusal:
-        return None
-    for label, text in (("reopen", observation.reopen_error),
-                        ("reset", observation.reset_error)):
-        if text:
-            return f"its {label} said: {text}"
-    last = observation.after_reset or observation.after_reopen or observation.after_hold
-    if last is None:
-        return "the reader saw nothing after it"
-    if last.mean > minimum_volts + LEVEL_TOLERANCE_V:
-        return (f"the output read {last.mean:.3f} V after it "
-                f"(its minimum is {minimum_volts:g} V)")
+def _wedged_call(reopen_text: Optional[str], reset_text: Optional[str]) -> Optional[str]:
+    """Which of a reopen and a reset is still running in the driver, or None."""
+    for label, text in (("reopen", reopen_text), ("reset", reset_text)):
+        if isinstance(text, WedgedText):
+            return f"the {label} {text}"
     return None
 
 
@@ -1035,9 +1027,10 @@ def run_matrix(
     Appended as each row ends (and handed to `on_row`, which writes it to
     disk), so the rows finished before a failure survive it. Each row's line
     names its victim's pid, so that process can be found by hand if this one
-    dies, then its verdict, notes and refusals. A row that leaves a reopen or
-    reset outstanding in the driver, or a victim alive after SIGKILL, is kept and
-    then stops the run (RunStopped): no further row starts while that is so.
+    dies, then its verdict, notes and refusals. A refusal is data on any row, the
+    last included. A row that leaves a reopen or reset outstanding in the driver,
+    or a victim alive after SIGKILL, is kept and then stops the run (RunStopped):
+    no further row starts while that is so.
     """
     channel = configuration.laser.get_channel(args.laser)
     # Both recoveries are bounded: a kill can wedge the driver, and a call into
@@ -1074,12 +1067,6 @@ def run_matrix(
             raise RunStopped(
                 f"{case.case_id}: {wedged}; the run stops here so that no row starts "
                 "while it is outstanding")
-    if cases:
-        reason = _not_recovered(observation, minimum_volts)
-        if reason:
-            raise RunStopped(
-                f"{case.case_id}, the last row: {reason}; the output is not confirmed at "
-                "its minimum and the shutter line is not confirmed closed")
 
 
 def repository_revision() -> Optional[str]:
@@ -1229,6 +1216,137 @@ _DO_NOT_RECONNECT = (
     "until the output is confirmed at its minimum on the DMM and the shutter line "
     "is confirmed closed."
 )
+#: What a call the run was told to skip reports, in place of its result.
+_SKIPPED = {"reopen": "skipped (--skip-reopen)", "reset": "skipped (--skip-reset)"}
+
+
+def _reopen_reset_and_read(
+    *,
+    args,
+    configuration,
+    plan: Plan,
+    nidaqmx,
+    log: LevelLog,
+    now: Callable[[], float],
+    sleep: Callable[[float], None],
+    skip_reopen: bool = False,
+    skip_reset: bool = False,
+) -> dict:
+    """The reopen, then the device reset, each time-bounded, then a fresh reading.
+
+    Each call's result is "ok", its error as text (a WedgedText if it is still
+    running in the driver), or its _SKIPPED text. The reading is taken after a
+    settle whichever of them ran.
+    """
+    command_device = device_of(plan.channel.analog_output)
+
+    def attempt(part: str, skip: bool, call: Callable[[], Optional[str]]) -> str:
+        if skip:
+            return _SKIPPED[part]
+        error = bounded(call, RECOVERY_TIMEOUT_S, part)
+        return "ok" if error is None else error
+
+    reopen_result = attempt(
+        "reopen", skip_reopen, functools.partial(reopen, configuration, args.laser))
+    reset_result = attempt(
+        "reset", skip_reset, functools.partial(reset_device, nidaqmx, command_device))
+    sleep(RECOVERY_SETTLE_S)
+    reading = log.at(now(), plan.reader_channel)
+    return {
+        "reopen": reopen_result,
+        "reset": reset_result,
+        "volts": None if reading is None else reading.mean,
+        "reader_channel": plan.reader_channel,
+        "shutter_line": plan.channel.shutter_output,
+    }
+
+
+def _at_minimum(volts: Optional[float], minimum_volts: float) -> bool:
+    return volts is not None and abs(volts - minimum_volts) <= LEVEL_TOLERANCE_V
+
+
+def _banner_headline(why: str) -> None:
+    _say()
+    _say(f"!!! THE RUN DID NOT COMPLETE ({why}). THE LASER IS NOT CONFIRMED SAFE.")
+
+
+def _banner_results(result: dict, plan: Plan) -> None:
+    """The rest of the banner: what the calls said, the volts, what cannot be confirmed."""
+    command_device = device_of(plan.channel.analog_output)
+    volts = result["volts"]
+    _say(f"    reopen: {result['reopen']}")
+    _say(f"    reset of {command_device}: {result['reset']}")
+    if volts is None:
+        _say(f"    command output on {plan.reader_channel}: NO READING (the reader has "
+             "no samples just now)")
+    else:
+        flag = ""
+        if not _at_minimum(volts, plan.minimum_volts):
+            flag = " - ABOVE THE MINIMUM" if volts > plan.minimum_volts else " - BELOW THE MINIMUM"
+        _say(f"    command output on {plan.reader_channel}: {volts:.3f} V (its minimum is "
+             f"{plan.minimum_volts:g} V){flag}")
+    _say(f"    shutter line {result['shutter_line']}: NOT READABLE by this tool. Only the "
+         f"reopen closes it ({command_device}'s reset does not touch it), and it is closed "
+         "only if the reopen above says ok.")
+    _say(_DO_NOT_RECONNECT)
+
+
+def _why_not_confirmed(result: dict, minimum_volts: float) -> Optional[str]:
+    """What keeps an end state from being confirmed, or None. A skipped call does not."""
+    problems = [f"its {part} said: {result[part]}" for part in ("reopen", "reset")
+                if result[part] not in ("ok", _SKIPPED[part])]
+    volts = result["volts"]
+    if volts is None:
+        problems.append("the reader has no reading")
+    elif not _at_minimum(volts, minimum_volts):
+        problems.append(f"the output reads {volts:.3f} V, not its minimum of {minimum_volts:g} V")
+    return "; ".join(problems) or None
+
+
+def check_end_state(
+    *,
+    args,
+    configuration,
+    plan: Plan,
+    nidaqmx,
+    log: LevelLog,
+    now: Callable[[], float] = time.perf_counter,
+    sleep: Callable[[float], None] = time.sleep,
+) -> dict:
+    """Is the output safe now? What every run that reached its last row ends with.
+
+    Called with no victim alive (a survivor stops the run first), so unlike a
+    hang row's own reopen this one has nothing holding the lines against it. It
+    makes the same bounded calls and the same reading as the recovery, but it
+    honours --skip-reopen and --skip-reset: the operator asked for the output to
+    be left alone, and a call that was skipped is no failure, though it confirms
+    nothing either. The reading is what confirms the output.
+
+    Prints one plain line if every call that ran succeeded and the output reads
+    its minimum, and the banner otherwise. A wedged call prints neither: the
+    caller stops the run on it, and the recovery's banner reports it. Returns
+    what it found, with "confirmed" and the "reason" it is not.
+    """
+    _say()
+    _say("end-state check: every row has run and no victim is alive ...")
+    result = _reopen_reset_and_read(
+        args=args, configuration=configuration, plan=plan, nidaqmx=nidaqmx, log=log,
+        now=now, sleep=sleep, skip_reopen=args.skip_reopen, skip_reset=args.skip_reset)
+    why = _why_not_confirmed(result, plan.minimum_volts)
+    result["minimum_volts"] = plan.minimum_volts
+    result["confirmed"] = why is None
+    result["reason"] = why
+    if _wedged_call(result["reopen"], result["reset"]):
+        return result
+    if why is None:
+        _say(f"end state: reopen {result['reopen']}, reset of "
+             f"{device_of(plan.channel.analog_output)} {result['reset']}, command output on "
+             f"{plan.reader_channel} {result['volts']:.3f} V, at its minimum of "
+             f"{plan.minimum_volts:g} V")
+    else:
+        _banner_headline(f"every row ran, but the end state is not confirmed: {why}")
+        _banner_results(result, plan)
+    return result
 
 
 def recover_after_failure(
@@ -1251,10 +1369,7 @@ def recover_after_failure(
     on a port0 line would reconfigure it), only the reopen closes it, and the
     reset covers the command device only. Returns what the banner says.
     """
-    command_device = device_of(plan.channel.analog_output)
-    shutter_line = plan.channel.shutter_output
-    _say()
-    _say(f"!!! THE RUN DID NOT COMPLETE ({why}). THE LASER IS NOT CONFIRMED SAFE.")
+    _banner_headline(why)
     running = outstanding_calls()
     waited: List[dict] = []
     if running:
@@ -1270,42 +1385,19 @@ def recover_after_failure(
                      "recovery's own calls may collide with it, and a refusal below may be that "
                      "collision, not a fault of the hardware.")
     _say("    reopening the controller, then resetting the command device ...")
-    reopen_error = bounded(
-        functools.partial(reopen, configuration, args.laser), RECOVERY_TIMEOUT_S, "reopen")
-    reset_error = bounded(
-        functools.partial(reset_device, nidaqmx, command_device), RECOVERY_TIMEOUT_S, "reset")
-    sleep(RECOVERY_SETTLE_S)
-    reading = log.at(now(), plan.reader_channel)
-    volts = None if reading is None else reading.mean
-    _say(f"    reopen: {'ok' if reopen_error is None else reopen_error}")
-    _say(f"    reset of {command_device}: {'ok' if reset_error is None else reset_error}")
-    if volts is None:
-        _say(f"    command output on {plan.reader_channel}: NO READING (the reader has "
-             "no samples just now)")
-    else:
-        above = volts > plan.minimum_volts + LEVEL_TOLERANCE_V
-        _say(f"    command output on {plan.reader_channel}: {volts:.3f} V (its minimum is "
-             f"{plan.minimum_volts:g} V){' - ABOVE THE MINIMUM' if above else ''}")
-    _say(f"    shutter line {shutter_line}: NOT READABLE by this tool. Only the reopen "
-         f"closes it ({command_device}'s reset does not touch it), and it is closed only "
-         f"if the reopen above says ok.")
-    _say(_DO_NOT_RECONNECT)
-    return {
-        "reason": why,
-        "reopen": "ok" if reopen_error is None else reopen_error,
-        "reset": "ok" if reset_error is None else reset_error,
-        "volts": volts,
-        "reader_channel": plan.reader_channel,
-        "shutter_line": shutter_line,
-        "outstanding": waited,
-    }
+    result = _reopen_reset_and_read(
+        args=args, configuration=configuration, plan=plan, nidaqmx=nidaqmx, log=log,
+        now=now, sleep=sleep)
+    _banner_results(result, plan)
+    return {"reason": why, **result, "outstanding": waited}
 
 
 def warn_reopen_skipped(plan: Plan, recovery: Optional[dict] = None) -> None:
     """The --skip-reopen warning, saying what is true of this run's shutter line.
 
-    No row reopened the controller, so no row's end closed the line. If the run
-    then failed and the recovery's own reopen succeeded, that closed it.
+    Neither a row nor the end-state check reopened the controller, so nothing
+    closed the line. If the run then failed and the recovery's own reopen
+    succeeded, that closed it.
     """
     line = plan.channel.shutter_output
     _say()
@@ -1317,10 +1409,10 @@ def warn_reopen_skipped(plan: Plan, recovery: Optional[dict] = None) -> None:
     after = ""
     if recovery is not None:
         after = " The recovery's reopen did not succeed either (see above)."
-    _say("!!! --skip-reopen: this run never reopened the controller after a row, so "
-         f"nothing in it closed the shutter line {line} (a pulse victim opens it and a "
-         "killed one never closes it), and the output was left as the last row left it "
-         f"unless the device reset moved it.{after}")
+    _say("!!! --skip-reopen: this run never reopened the controller, after a row or at "
+         f"its end, so nothing in it closed the shutter line {line} (a pulse victim opens "
+         "it and a killed one never closes it), and the output was left as the last row "
+         f"left it unless the device reset moved it.{after}")
     _say(_DO_NOT_RECONNECT)
 
 
@@ -1345,11 +1437,22 @@ def execute(
     `spawn_factory`, `reader_factory`, the clock, `kill`, `prompt`) are for the
     tests, which hand it fakes; None takes the real one at the time of the call.
     `interrupts` is the gate the signal handlers feed (None: one nothing feeds).
-    Returns the exit status: 0 for a run that finished, 1 for any that did not,
-    including one that ended with a reopen or reset still outstanding in the
-    driver, a victim still alive, or the last row's reopen or reset refused or its
-    output read above the minimum (a refusal in an earlier row is data, and the
-    run goes on).
+
+    Returns the exit status. A run that reached its last row ends with
+    check_end_state, and that decides it: 0 if every call it ran succeeded and
+    the output reads its minimum, 1 and the banner otherwise. A refusal in a row,
+    the last included, is data and does not decide it. A run that stopped early
+    (an error, a signal, a reopen or reset still outstanding in the driver in a
+    row or in the check, a victim alive) gets the recovery and its banner instead,
+    and 1. So does a record that could not be written.
+
+    A run that skipped a part of the check is held to the same rule: a skipped
+    call is not a failure, the reading has to be at the minimum, and with no
+    reading or any other reading the status is 1. Status 1 for every skip would
+    be right about the shutter line and wrong about the output, and would teach
+    the operator to read status 1 as normal; so after --skip-reopen, status 0 says
+    only that the reader has the output at its minimum. The shutter line is what
+    the warning that ends that run is for.
 
     It refuses a namespace that has not attested --laser-disconnected, so that
     no caller can reach it around the parser.
@@ -1392,10 +1495,15 @@ def execute(
         return 1
 
     rows_path = args.record_dir / f"laser-kill-{stamp}.rows.jsonl"
-    tracking_path = args.record_dir / f"laser-kill-{stamp}.tracking.jsonl"
+    results_path = (
+        args.record_dir / f"laser-kill-{stamp}.tracking.jsonl" if args.tracking_check else rows_path)
+    # The matrix's file starts before any row. A tracking check has no rows, so
+    # its own file starts with the first result it has to keep.
+    results_started = not args.tracking_check
     observations: List[KillObservation] = []
     status = 0
     recovery = None
+    end_state = None
     if not args.tracking_check:
         try:
             args.record_dir.mkdir(parents=True, exist_ok=True)
@@ -1412,6 +1520,18 @@ def execute(
         except OSError as error:
             _say(f"    could not append this row to {rows_path}: {error}")
 
+    def keep_result(key: str, result: dict) -> None:
+        # On disk, so that a dropped terminal loses none of it.
+        nonlocal results_started
+        try:
+            args.record_dir.mkdir(parents=True, exist_ok=True)
+            if not results_started:
+                _append_json(results_path, {"header": _record_header(args, started, extra)})
+                results_started = True
+            _append_json(results_path, {key: result})
+        except OSError as io_error:
+            _say(f"could not write the {key} to {results_path}: {io_error}")
+
     spawn = spawn_factory(args, stamp=stamp)
     if gate.pending:
         # A signal during the setup. Nothing has been started, so nothing needs
@@ -1423,8 +1543,8 @@ def execute(
         return 1
     try:
         # Only inside this `with` may a signal stop the run. Out of it, to the
-        # last line this function prints, signals are held, so the recovery, the
-        # banner, the table and the record always finish.
+        # last line this function prints, signals are held, so the end-state
+        # check, the recovery, the banner, the table and the record always finish.
         with gate.interruptible():
             if args.tracking_check:
                 dmm = functools.partial(prompt, "tracking") if args.pause_for_dmm else None
@@ -1437,6 +1557,20 @@ def execute(
                     level_volts=plan.level_volts, minimum_volts=plan.minimum_volts,
                     now=now, sleep=sleep, kill=kill, prompt=prompt, on_row=on_row,
                     interrupts=gate)
+        # Only a run whose rows all ran gets here, so no victim is alive (a
+        # survivor stopped it). Signals are held from here on: the check is
+        # time-bounded and always finishes.
+        end_state = check_end_state(
+            args=args, configuration=configuration, plan=plan, nidaqmx=nidaqmx, log=log,
+            now=now, sleep=sleep)
+        if gate.pending:
+            end_state["signals_held"] = _signal_counts(gate.pending)
+        keep_result("end_state", end_state)
+        wedged = _wedged_call(end_state["reopen"], end_state["reset"])
+        if wedged:
+            raise RunStopped(f"the end-state check: {wedged}, so the output is not confirmed")
+        if not end_state["confirmed"]:
+            status = 1
     except (Exception, KeyboardInterrupt) as error:
         # The victim in hand has been sent SIGKILL by its pid (run_case, or
         # tracking_check), and a survivor reported there. What is left is the
@@ -1460,16 +1594,7 @@ def execute(
             recovery["victim"] = fate
         if gate.pending:
             recovery["signals_held"] = _signal_counts(gate.pending)
-        # On disk, so that a dropped terminal loses none of it. A failed tracking
-        # check has no rows file, so it gets one of its own.
-        failure_path = tracking_path if args.tracking_check else rows_path
-        try:
-            args.record_dir.mkdir(parents=True, exist_ok=True)
-            if args.tracking_check:
-                _append_json(failure_path, {"header": _record_header(args, started, extra)})
-            _append_json(failure_path, {"recovery": recovery})
-        except OSError as io_error:
-            _say(f"could not write the recovery to {failure_path}: {io_error}")
+        keep_result("recovery", recovery)
     finally:
         stop.set()
         reader.join(END_TIMEOUT_S)
@@ -1490,6 +1615,8 @@ def execute(
             for o in observations)
         _say("verdicts: " + ", ".join(f"{verdict} {n}" for verdict, n in sorted(counts.items())))
         record_extra = dict(extra)
+        if end_state is not None:
+            record_extra["end_state"] = end_state
         if recovery is not None:
             record_extra["recovery"] = recovery
         try:
@@ -1499,7 +1626,7 @@ def execute(
             status = 1
         else:
             _say(f"record: {path}")
-    if args.skip_reopen and not args.tracking_check:
+    if args.skip_reopen:
         warn_reopen_skipped(plan, recovery)
     if gate.pending:
         _say(f"{_signal_summary(gate.pending)} arrived after the run had stopped or finished "
