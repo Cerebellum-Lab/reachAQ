@@ -2042,5 +2042,14 @@ def test_a_tracking_check_that_leaves_the_output_up_is_status_1_and_the_banner(d
         assert needle in text, needle
     assert _tracking_lines(args)[-1]["end_state"]["confirmed"] is False
 
+def test_a_tracking_check_whose_end_state_call_wedges_has_one_header_and_the_recovery(daq, tmp_path, capsys, monkeypatch):
+    # A tracking check has no row reopen: the first call is the check's.
+    wedged = tool.WedgedText("timed out after 20 s (the reopen call is still running)")
+    monkeypatch.setattr(tool, "reopen", _answering(wedged, None))
+    status, args, _ = _execute(daq, tmp_path, _tracking_victim, "--tracking-check", samples=_samples(_tracked_then_down))
+    text = capsys.readouterr().out
+    assert status == 1 and "RunStopped" in text and "NOT CONFIRMED SAFE" in text
+    assert [list(line)[0] for line in _tracking_lines(args)] == ["header", "end_state", "recovery"]
+
 def test_the_preconditions_say_the_check_at_the_end_of_a_run_rewrites_the_outputs_too():
     assert "the check at the end of every run" in tool.preconditions(1, "PXI1Slot4")
