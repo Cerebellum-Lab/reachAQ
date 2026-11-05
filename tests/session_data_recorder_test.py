@@ -2416,3 +2416,69 @@ def test_the_validator_reads_the_gap_totals_the_recorder_wrote(tmp_path):
     result = next(item for item in report.results if item.rule_id == "events.board_time")
     assert result.status.value == "warning", result.message
     assert "board boot 7: the live tracker counted 4 missing message(s)" in result.message
+
+
+def test_a_clap_and_a_barcode_report_reach_the_chain_as_the_recorder_wrote_them():
+    """CAN frame -> Source -> recorder row -> what the chain reads.
+
+    The translators, the recorder and the chain were each tested against rows
+    their own author wrote. This runs one clap and one barcode report through
+    all three and checks the columns and names the chain reads.
+    """
+    from autotrainer.device import CanTransportConfiguration, Target
+    from autotrainer.device.can_interface import CanInterface
+    from autotrainer.device.socketcan_jerrycan import (
+        JerryCANCmdType, JerryCANMsg, JerryCANTimestampKind, JerryCANTiming, SyncBarcode, SyncClapObserved,
+    )
+    from tools.acquisition.model import board_clock_chain as chain
+
+    io_module, boot = 0x08, 0xB007
+    interface = CanInterface(
+        required_targets=(Target.PELLET_DEVICE,),
+        can_transport=CanTransportConfiguration(kind="socketcan", fd=True),
+    )
+    interface._get_index = lambda item: item.index
+    interface._get_timestamp_ns = lambda item: item.timestamp_ns
+
+    def frame(message_type, stamp, sequence, board_us, index):
+        message = JerryCANMsg()
+        message.type = message_type
+        message.dst_id = io_module
+        message.index = index
+        message.board_timing_valid = True
+        message.timing = JerryCANTiming(
+            version=1, kind=stamp, boot_id=boot, sequence=sequence, board_time_us=board_us,
+        )
+        return message
+
+    clap_frame = frame(JerryCANCmdType.SYNC_CLAP_OBSERVED, JerryCANTimestampKind.OBSERVED, 5, 7_200_000, 101_200_000_000)
+    clap_frame.sync_clap_observed = SyncClapObserved(tick=41, clapper_node=io_module)
+    barcode_frame = frame(
+        JerryCANCmdType.SYNC_BARCODE, JerryCANTimestampKind.PHYSICAL_START, 6, 7_000_000, 101_500_000_000,
+    )
+    barcode_frame.sync_barcode = SyncBarcode(tick=41)
+    clap, barcode = interface._translate(clap_frame), interface._translate(barcode_frame)
+    # What a time-synced board's row carries: an event time apart from the receive time.
+    clap.event_perf_time = 99.0
+
+    recorder = SessionDataRecorder(object(), _EventSource("trace_received"))
+    try:
+        recorder._on_device_message(SystemStatusMessageKind.SYNC_CLAP_OBSERVATION, clap, 101.2, 1.0)
+        recorder._on_device_message(SystemStatusMessageKind.SYNC_BARCODE_REPORT, barcode, 101.5, 1.0)
+        rows = tuple(SessionDataRecorder._normalize_device_row(row) for row in recorder._device_rows)
+    finally:
+        recorder.close()
+
+    assert rows[0][0] == pytest.approx(99.0) and rows[0][9] == pytest.approx(101.2)
+    assert chain.has_barcode_reports(rows)
+    (clap_seen,) = chain._envelopes(rows, SystemStatusMessageKind.SYNC_CLAP_OBSERVATION.name)
+    assert (clap_seen.address, clap_seen.boot_id, clap_seen.board_us) == (io_module, boot, 7_200_000)
+    assert clap_seen.payload["tick"] == 41
+    assert clap_seen.payload["clapper_node"] == io_module
+    assert clap_seen.stamp_kind == chain._STAMP_OBSERVED == "observed"
+    assert clap_seen.host_perf == pytest.approx(101.2)  # the receive time, not the event time
+    (barcode_seen,) = chain._envelopes(rows, SystemStatusMessageKind.SYNC_BARCODE_REPORT.name)
+    assert (barcode_seen.address, barcode_seen.boot_id, barcode_seen.board_us) == (io_module, boot, 7_000_000)
+    assert barcode_seen.payload["tick"] == 41
+    assert barcode_seen.stamp_kind == chain._STAMP_START_EDGE == "physical_start"
+    assert barcode_seen.host_perf == pytest.approx(101.5)
