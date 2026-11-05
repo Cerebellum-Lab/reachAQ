@@ -788,7 +788,7 @@ def find_slip(frame_ids, votes, majority: int) -> Optional[dict]:
     only fall; a run above the majority is not a backlog. A lost or spurious
     NI transition renumbers every frame after it, so its run reaches an end of
     the session, or leads to another shift (a staircase), and does not revert.
-    Every other run that passes is tested first and the longest of those is
+    Every other run that passes is tried first and the longest of those is
     returned (reverts False). Only when none passes is the longest backlog-like
     run that does (reverts True), so a long backlog cannot hide a real slip.
     """
@@ -801,15 +801,18 @@ def find_slip(frame_ids, votes, majority: int) -> Optional[dict]:
     starts = numpy.concatenate(([0], numpy.flatnonzero(numpy.diff(votes)) + 1))
     lengths = numpy.diff(numpy.append(starts, n))
     stray_rate = (others + 1) / (n + 2)
-    runs = [(int(start), int(length)) for start, length in zip(starts, lengths)
-            if votes[start] != majority]
-    backlog_like = [
-        (start, length) for start, length in runs
-        if 0 < start and start + length < n
-        and votes[start - 1] == majority and votes[start + length] == majority
-        and votes[start] < majority
-    ]
-    not_a_backlog = [run for run in runs if run not in backlog_like]
+    # One pass, for the runs in two groups: a session of scattered votes has a
+    # run per other frame, and a list scan per run would be quadratic in them.
+    values = votes.tolist()
+    backlog_like, not_a_backlog = [], []
+    for start, length in zip(starts.tolist(), lengths.tolist()):
+        vote = values[start]
+        if vote == majority:
+            continue
+        end = start + length
+        backlog = (0 < start and end < n and values[start - 1] == majority
+                   and values[end] == majority and vote < majority)
+        (backlog_like if backlog else not_a_backlog).append((start, length))
     for candidates, reverts in ((not_a_backlog, False), (backlog_like, True)):
         passing = [run for run in candidates
                    if n * stray_rate ** run[1] < FALSE_ALARM_PROBABILITY]
@@ -882,11 +885,13 @@ def choose_pairing(frame_ids, arrival_perf, transition_perf, frame_period: float
     votes for the majority, that votes below it (late delivery can only move
     a frame's candidate transition later, so its vote only falls). It stays in
     Pairing.slip (reverts True) as a diagnostic and does not make the pairing
-    ambiguous. Two limits: a spurious transition later cancelled by a lost
-    one votes below the majority and reads as a backlog here (the camera-clock
-    pairing still flags it, a session with no latches does not); and a stall
-    holding the first or last frames reaches a session end and reads as a lost
-    transition, which errs on the side of flagging.
+    ambiguous. It has three limits. A spurious transition later cancelled by
+    a lost one votes below the majority and reads as a backlog here (the
+    camera-clock pairing still flags it; a session with no latches does not).
+    A stall holding the first or last frames reaches a session end and reads
+    as a lost transition, which errs on the side of flagging. A backlog that
+    grows past one period (votes s, s-1, s-2, s-1, s) is not flanked by the
+    majority, so it is flagged, which errs on the side of flagging too.
     """
     frame_ids = numpy.asarray(frame_ids, dtype=numpy.int64)
     arrival = numpy.asarray(arrival_perf, dtype=numpy.float64)

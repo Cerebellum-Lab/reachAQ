@@ -266,9 +266,9 @@ def _confirmed_by_arrival(latch: clocks.Pairing, arrival: clocks.Pairing) -> clo
     can see it. Host arrival reads no latch, so it can. An ambiguous arrival
     pairing confirms nothing: choose_pairing reports shift 0 when it cannot
     pair at all, so its shift is compared only when it is unambiguous. A
-    delivery backlog, a run of late frames that returns to the majority from
-    below, leaves it unambiguous (Pairing.slip records it, reverts True); any
-    other slip makes it ambiguous.
+    delivery backlog, an interior run of late frames with the majority on both
+    sides, voting below it, leaves it unambiguous (Pairing.slip records it,
+    reverts True); any other slip makes it ambiguous.
     """
     if not arrival.ambiguous and arrival.shift == latch.shift:
         return latch

@@ -242,9 +242,11 @@ def test_a_single_stray_vote_is_not_a_slip():
 
 
 def test_a_short_delivery_backlog_is_not_a_slip_for_arrival():
-    # A brief host stall holds three frames a period late and then the votes return to the
-    # majority; a lost NI transition never returns. 3 of 9000 is a run that long by the rule,
-    # recorded as a diagnostic, and it must not cost a correct session its pairing.
+    # A brief host stall holds three frames a period late. Their votes fall (late delivery
+    # moves the candidate transition later) and the majority is on both sides: an interior
+    # run voting below the majority, which is what a backlog looks like. 3 of 9000 is a run
+    # that long by the rule, recorded as a diagnostic, and it must not cost a correct
+    # session its pairing.
     ids, exposure, transition_perf = _exposures(9000)
     arrival = exposure + 0.002
     arrival[4000:4003] += PERIOD_150
@@ -318,7 +320,7 @@ def test_a_staircase_of_shifts_is_a_slip_that_does_not_revert():
 def test_a_run_voting_above_the_majority_is_not_a_backlog():
     # Late delivery moves a frame's candidate to a later transition, so a backlog can only
     # vote below the majority. A lost transition cancelled 30 frames later by a spurious one
-    # is an interior run of +1 votes that returns to the majority, and is still a slip.
+    # is an interior run of +1 votes with the majority on both sides, and is still a slip.
     ids, exposure, transition_perf = _exposures(9000)
     spurious = exposure[4029] + PERIOD_150 / 2
     transitions = np.sort(np.append(np.delete(transition_perf, 5 + 4000), spurious))
@@ -332,6 +334,23 @@ def test_a_run_voting_above_the_majority_is_not_a_backlog():
     assert pairing.slip["frames"] == 30 and pairing.slip["frameId"] == ids[4000]
     assert pairing.slip["toShift"] == 996  # above the majority
     assert f"slip at frame {ids[4000]}" in pairing.reason
+
+
+def test_find_slip_stays_fast_on_alternating_votes():
+    # 150,000 runs of one vote, each below the majority and flanked by it: the most runs a
+    # session can have, and every one a backlog-like candidate. Sorting them into groups must
+    # take time linear in the runs (it ran in minutes at this size when it scanned a list per
+    # run). Votes this scattered are no slip: a run of one at a stray rate of a half is
+    # expected 150,000 times.
+    votes = np.tile([1, 0], 150_000)
+    ids = np.arange(votes.size)
+
+    started = time.perf_counter()
+    slip = clocks.find_slip(ids, votes, 1)
+    elapsed = time.perf_counter() - started
+
+    assert slip is None
+    assert elapsed < 5.0, f"find_slip took {elapsed:.1f} s on {votes.size} votes"
 
 
 def test_the_statistical_constants_are_pinned():
@@ -588,7 +607,7 @@ def test_a_lost_transition_is_a_slip_for_the_camera_clock_too(drop):
 def test_the_camera_clock_flags_a_run_that_reverts():
     # Delivery cannot move a hardware timestamp, so a run of frames the camera clock puts a
     # period late is the latch map's or the stamps' fault, not a backlog: ambiguous even
-    # though the votes return to the majority.
+    # though the run looks like one (interior, majority on both sides, voting below it).
     ids, exposure, transition_perf = _exposures(9000)
     camera_ts_ns = np.round(_camera_clock(exposure) * 1e9).astype(np.int64)
     camera_ts_ns[4000:4030] += int(round(PERIOD_150 * 1e9))

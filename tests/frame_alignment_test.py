@@ -215,8 +215,9 @@ def test_latency_frames_beyond_the_ni_spool_do_not_cost_the_arrival_match(tmp_pa
 
 def test_a_delivery_backlog_leaves_the_arrival_anchor_paired():
     # Three of 9000 frames held a period late in delivery (a host stall): a run by the slip
-    # rule, but one that returns to the majority, as a lost NI transition never does. The
-    # anchor stays paired, names the first frame's own transition, and records the run.
+    # rule, but an interior one with the majority on both sides, voting below it, which is
+    # what a backlog looks like. The anchor stays paired, names the first frame's own
+    # transition, and records the run.
     period, early = 1 / FPS, 5
     transition_host = 100.0 + np.arange(9000 + 2 * early) * period
     frames = np.zeros(9000, dtype=CAMERA_FRAME_DTYPE)
