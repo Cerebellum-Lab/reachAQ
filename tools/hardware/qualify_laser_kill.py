@@ -36,7 +36,11 @@ read from here, and only the reopen closes it. A signal can stop the run only
 inside the run itself (InterruptGate); during the recovery and the report it is
 held, so they always finish. The rows are appended to a .rows.jsonl file as each
 ends, so a lost terminal or a broken `| tee` loses none of them. The exit status
-is 0 only for a run that finished with nothing outstanding.
+is 0 only for a run that finished with no reopen or reset still running in the
+driver, no victim alive, and the last row's reopen and reset clean and its output
+read at the minimum. A refusal (-50103) in an earlier row is data and the run goes
+on; one in the last row, or an output still up, is not confirmed safe, so it goes
+down the same path as a failure: recovery, banner, status 1.
 """
 
 from __future__ import annotations
@@ -75,6 +79,7 @@ for _path in (
 
 from autotrainer.core.configuration import SystemConfiguration
 from autotrainer.device import NidaqLaserController
+from autotrainer.device.nidaq_laser import LaserControllerStillClosing
 from autotrainer.device.nidaq_signal_stream import resolve_analog_terminal_config
 from tools.acquisition.model.laser_kill_matrix import (
     EXPECTED_VICTIM_EXIT, KillCase, KillObservation, LevelReading, LevelSample,
@@ -102,6 +107,10 @@ BEFORE_PROMPT_LIMIT_S = 20.0
 #: The longest one reopen or one device reset is waited for. A kill can leave
 #: nipalk wedged, and a call into it then never returns.
 RECOVERY_TIMEOUT_S = 20.0
+#: How long the recovery waits for a call an earlier row gave up on (a timed-out
+#: reopen or reset, a controller's close after a refused open) before it makes
+#: calls of its own, which could collide with it.
+OUTSTANDING_WAIT_S = 20.0
 #: The same bound on the reader's restart of its task, and how many restarts in
 #: a row (with no good read between) it will make.
 RESTART_TIMEOUT_S = 5.0
@@ -152,8 +161,10 @@ def _say(text: str = "") -> None:
 
 
 def parse_args(argv=None) -> argparse.Namespace:
+    # No abbreviations: --laser-d must not be taken for --laser-disconnected.
     parser = argparse.ArgumentParser(
-        description="Kill a process that holds the laser command output and read the output.")
+        description="Kill a process that holds the laser command output and read the output.",
+        allow_abbrev=False)
     parser.add_argument(
         "--config", default=os.path.expanduser("~/Autotrainer/system_configuration.yaml"))
     parser.add_argument("--laser", type=int, default=1)
@@ -263,12 +274,82 @@ class LevelLog:
         return level_between(self.samples(), start, end, instrument=instrument)
 
 
+class WedgedText(str):
+    """An error text that says something is still outstanding.
+
+    A call into the driver that was given up on and may yet act, or a victim
+    that survived SIGKILL. It is made at the source, from what happened (a
+    timeout, a LaserControllerStillClosing, a survivor), and the run stops on
+    its type, never on its wording.
+    """
+
+
+#: Calls given up on that may still be running, as (what, waiter), where
+#: waiter(timeout) is True once the call has ended. Under the lock.
+_outstanding_lock = threading.Lock()
+_outstanding: List[Tuple[str, Callable[[float], bool]]] = []
+
+
+def _note_outstanding(what: str, waiter: Callable[[float], bool]) -> None:
+    with _outstanding_lock:
+        _outstanding.append((what, waiter))
+
+
+def outstanding_calls() -> List[str]:
+    """What was given up on and is still running; the ones that have ended are dropped."""
+    with _outstanding_lock:
+        _outstanding[:] = [(what, waiter) for what, waiter in _outstanding if not waiter(0)]
+        return [what for what, _ in _outstanding]
+
+
+def wait_for_outstanding(timeout: float) -> List[dict]:
+    """Wait, up to `timeout` s in all, for each call still running; what became of each.
+
+    {"call", "finished", "waited_s"} for every call that was still running when
+    this began. A call that had already ended is not listed.
+    """
+    with _outstanding_lock:
+        running = [(what, waiter) for what, waiter in _outstanding if not waiter(0)]
+    deadline = time.monotonic() + timeout
+    results = []
+    for what, waiter in running:
+        began = time.monotonic()
+        finished = bool(waiter(max(0.0, deadline - began)))
+        results.append({"call": what, "finished": finished,
+                        "waited_s": round(time.monotonic() - began, 2)})
+    outstanding_calls()
+    return results
+
+
+def _signal_name(number: int) -> str:
+    try:
+        return signal.Signals(number).name
+    except ValueError:
+        return str(number)
+
+
+def _signal_counts(signals: Sequence[int]) -> dict:
+    """{"count": n, "by_signal": {"SIGINT": k, ...}}, which a storm of signals does not blow up."""
+    by_signal: dict = {}
+    for number in signals:
+        name = _signal_name(number)
+        by_signal[name] = by_signal.get(name, 0) + 1
+    return {"count": len(signals), "by_signal": by_signal}
+
+
+def _signal_summary(signals: Sequence[int]) -> str:
+    counts = _signal_counts(signals)
+    detail = ", ".join(f"{name} x{n}" for name, n in sorted(counts["by_signal"].items()))
+    return f"{counts['count']} signal(s) ({detail})"
+
+
 def bounded(call: Callable[[], Optional[str]], timeout: float, what: str) -> Optional[str]:
     """`call()` on a daemon thread, waited for at most `timeout` seconds.
 
     Its result (None, or an error as text); an exception becomes its text; and
-    a call still running at the timeout gives "timed out ...", and is left
-    running in the driver, which is all that can be done about it.
+    a call still running at the timeout gives a WedgedText, "timed out ...", and
+    is left running in the driver, which is all that can be done about it. It is
+    noted as outstanding, for the recovery to wait for first and name.
     """
     outcome: List[Optional[str]] = []
 
@@ -282,7 +363,9 @@ def bounded(call: Callable[[], Optional[str]], timeout: float, what: str) -> Opt
     thread.start()
     thread.join(timeout)
     if thread.is_alive():
-        return f"timed out after {timeout:g} s (the {what} call is still running)"
+        _note_outstanding(
+            f"the {what} call", lambda wait: (thread.join(wait), not thread.is_alive())[1])
+        return WedgedText(f"timed out after {timeout:g} s (the {what} call is still running)")
     return outcome[0]
 
 
@@ -462,7 +545,7 @@ def end_victim(
     except subprocess.TimeoutExpired:
         pass
     if not kill_victim(process, kill=kill, timeout=timeout):
-        return f"still alive after sigkill by pid {process.pid}"
+        return WedgedText(f"still alive after sigkill by pid {process.pid}")
     if mode == "hang":
         return "killed after hang (sigkill by pid)"
     return f"did not exit within {timeout:g} s; ended by sigkill by pid"
@@ -473,7 +556,10 @@ def reopen(system_configuration, laser: int) -> Optional[str]:
 
     Opening writes every channel's minimum command and closes its shutter.
     `laser` names the row's channel, which the configuration must have. None
-    when it worked; otherwise the error as text, for the record.
+    when it worked; otherwise the error as text, for the record. A refused open
+    whose own close is still running in the driver (LaserControllerStillClosing:
+    laser work over the same lines must wait for it) gives a WedgedText and is
+    noted as outstanding: it can write the minimum at any moment.
     """
     try:
         system_configuration.laser.get_channel(laser)
@@ -485,7 +571,24 @@ def reopen(system_configuration, laser: int) -> Optional[str]:
         )
         controller.close()
     except Exception as error:
-        return f"{type(error).__name__}: {error}"
+        text = f"{type(error).__name__}: {error}"
+        closing = _still_closing(error)
+        if closing is not None:
+            _note_outstanding(
+                "the controller's close after a refused open", closing.still_closing.wait)
+            return WedgedText(f"{text} (its close is still running in the driver)")
+        return text
+    return None
+
+
+def _still_closing(error: BaseException) -> Optional[LaserControllerStillClosing]:
+    """The LaserControllerStillClosing in `error`'s chain, however it was wrapped."""
+    seen = set()
+    while error is not None and id(error) not in seen:
+        if isinstance(error, LaserControllerStillClosing):
+            return error
+        seen.add(id(error))
+        error = error.__cause__ or error.__context__
     return None
 
 
@@ -606,10 +709,34 @@ def _wedged(observation: KillObservation) -> Optional[str]:
     """
     for label, text in (("reopen", observation.reopen_error),
                         ("reset", observation.reset_error)):
-        if text and text.startswith("timed out"):
+        if isinstance(text, WedgedText):
             return f"the {label} {text}"
-    if observation.victim_exit.startswith("still alive"):
+    if isinstance(observation.victim_exit, WedgedText):
         return f"the victim {observation.victim_exit}"
+    return None
+
+
+def _not_recovered(observation: KillObservation, minimum_volts: float) -> Optional[str]:
+    """Why the output after the LAST row is not confirmed at its minimum, or None.
+
+    An earlier row's refusal is data and the next row's victim starts the
+    output afresh. After the last, nothing does: its reopen or reset refused,
+    or the last thing the reader saw was above the minimum, or it saw nothing,
+    and nothing has closed the shutter line if the reopen refused. A row the
+    controller refused by design ran nothing and is not held to this.
+    """
+    if observation.case.refusal:
+        return None
+    for label, text in (("reopen", observation.reopen_error),
+                        ("reset", observation.reset_error)):
+        if text:
+            return f"its {label} said: {text}"
+    last = observation.after_reset or observation.after_reopen or observation.after_hold
+    if last is None:
+        return "the reader saw nothing after it"
+    if last.mean > minimum_volts + LEVEL_TOLERANCE_V:
+        return (f"the output read {last.mean:.3f} V after it "
+                f"(its minimum is {minimum_volts:g} V)")
     return None
 
 
@@ -632,29 +759,56 @@ def _victim_in_hand(spawn_call: Callable, announce: Optional[Callable], kill, ga
                 announce(process)
         gate.raise_if_pending()
         yield process
-    except BaseException:
+    except BaseException as error:
         if process is not None:
-            with gate.deferred():
-                _abandon_victim(process, kill)
+            fate = _abandon_protected(process, kill, gate)
+            if fate is not None:
+                # Where the recovery finds it, for the record (a survivor's pid
+                # must not live only on a terminal that may have gone).
+                try:
+                    error.victim_fate = fate
+                except Exception:
+                    pass
         raise
 
 
-def _abandon_victim(process, kill) -> None:
+def _abandon_protected(process, kill, gate: InterruptGate) -> Optional[dict]:
+    """_abandon_victim with signals held, tried once more if one got through.
+
+    After a failure that was not a signal the gate may still be raising for the
+    first instants of this, so a signal can raise here before the deferral takes
+    hold. That spends the gate, and the second try cannot be interrupted.
+    """
+    for _ in range(2):
+        try:
+            with gate.deferred():
+                return _abandon_victim(process, kill)
+        except KeyboardInterrupt:
+            continue
+    return None
+
+
+def _abandon_victim(process, kill) -> dict:
     """A row has failed: SIGKILL its victim by its pid now, and say if it survives.
 
-    What this prints is the only report of the victim's fate on a failure path,
-    so a survivor (stuck in the driver, holding the output) is named loudly.
+    Returns {"pid", "ended", "detail"} for the record. What this prints is the
+    other report of the victim's fate on a failure path, so a survivor (stuck in
+    the driver, holding the output) is named loudly.
     """
     try:
         ended = kill_victim(process, kill=kill)
     except Exception as error:
+        detail = f"could not end the victim: {type(error).__name__}: {error}"
         _say(f"    could not end the victim, pid {process.pid}: {type(error).__name__}: {error}")
-        return
+        return {"pid": process.pid, "ended": False, "detail": detail}
     if ended:
+        detail = "ended by sigkill after the failure"
         _say(f"    victim pid {process.pid} ended by sigkill after the failure")
     else:
+        detail = "STILL ALIVE after sigkill: it may still hold the output"
         _say(f"    VICTIM pid {process.pid} IS STILL ALIVE after sigkill: "
              "it may still hold the output")
+    return {"pid": process.pid, "ended": ended, "detail": detail}
 
 
 def run_case(
@@ -828,7 +982,7 @@ def tracking_check(
             value = dmm(f"{level:g} V") if dmm is not None else None
             apply_kill(case, process.pid, kill=kill)
             ended = end_victim(process, kill=kill, mode="clean")
-        if ended.startswith("still alive"):
+        if isinstance(ended, WedgedText):
             raise RunStopped(f"the victim at {level:g} V {ended}")
         if ended != EXPECTED_VICTIM_EXIT["clean"]:
             _say(f"    the victim at {level:g} V did not end cleanly: {ended}")
@@ -904,6 +1058,12 @@ def run_matrix(
             raise RunStopped(
                 f"{case.case_id}: {wedged}; the run stops here so that no row starts "
                 "while it is outstanding")
+    if cases:
+        reason = _not_recovered(observation, minimum_volts)
+        if reason:
+            raise RunStopped(
+                f"{case.case_id}, the last row: {reason}; the output is not confirmed at "
+                "its minimum and the shutter line is not confirmed closed")
 
 
 def repository_revision() -> Optional[str]:
@@ -1079,6 +1239,20 @@ def recover_after_failure(
     shutter_line = plan.channel.shutter_output
     _say()
     _say(f"!!! THE RUN DID NOT COMPLETE ({why}). THE LASER IS NOT CONFIRMED SAFE.")
+    running = outstanding_calls()
+    waited: List[dict] = []
+    if running:
+        _say(f"    still running in the driver from earlier: {'; '.join(running)}. "
+             f"Waiting up to {OUTSTANDING_WAIT_S:g} s for it before the recovery's own calls ...")
+        waited = wait_for_outstanding(OUTSTANDING_WAIT_S)
+        for entry in waited:
+            if entry["finished"]:
+                _say(f"    {entry['call']} finished after {entry['waited_s']:g} s, "
+                     "before the recovery made calls of its own.")
+            else:
+                _say(f"    {entry['call']} is STILL RUNNING after {entry['waited_s']:g} s: the "
+                     "recovery's own calls may collide with it, and a refusal below may be that "
+                     "collision, not a fault of the hardware.")
     _say("    reopening the controller, then resetting the command device ...")
     reopen_error = bounded(
         functools.partial(reopen, configuration, args.laser), RECOVERY_TIMEOUT_S, "reopen")
@@ -1107,6 +1281,7 @@ def recover_after_failure(
         "volts": volts,
         "reader_channel": plan.reader_channel,
         "shutter_line": shutter_line,
+        "outstanding": waited,
     }
 
 
@@ -1156,7 +1331,9 @@ def execute(
     `interrupts` is the gate the signal handlers feed (None: one nothing feeds).
     Returns the exit status: 0 for a run that finished, 1 for any that did not,
     including one that ended with a reopen or reset still outstanding in the
-    driver or a victim still alive.
+    driver, a victim still alive, or the last row's reopen or reset refused or its
+    output read above the minimum (a refusal in an earlier row is data, and the
+    run goes on).
 
     It refuses a namespace that has not attested --laser-disconnected, so that
     no caller can reach it around the parser.
@@ -1199,6 +1376,7 @@ def execute(
         return 1
 
     rows_path = args.record_dir / f"laser-kill-{stamp}.rows.jsonl"
+    tracking_path = args.record_dir / f"laser-kill-{stamp}.tracking.jsonl"
     observations: List[KillObservation] = []
     status = 0
     recovery = None
@@ -1222,8 +1400,8 @@ def execute(
     if gate.pending:
         # A signal during the setup. Nothing has been started, so nothing needs
         # putting back.
-        _say(f"interrupted (signal {gate.pending[0]}) before any victim was started; "
-             "nothing was started or signalled.")
+        _say(f"interrupted ({_signal_summary(gate.pending)}) before any victim was "
+             "started; nothing was started or signalled.")
         stop.set()
         reader.join(END_TIMEOUT_S)
         return 1
@@ -1250,22 +1428,32 @@ def execute(
         # reports on.
         status = 1
         why = f"{type(error).__name__}: {error}"
+        if gate.raised and not isinstance(error, KeyboardInterrupt):
+            why += f" (and {_signal_summary(gate.raised)} arrived)"
         _say(f"stopped: {why}")
         try:
             recovery = recover_after_failure(
                 why, args=args, configuration=configuration, plan=plan, nidaqmx=nidaqmx,
                 log=log, now=now, sleep=sleep)
-            if gate.pending:
-                recovery["signals_held"] = list(gate.pending)
         except Exception as recovery_error:
             _say("the recovery itself failed: "
                  f"{type(recovery_error).__name__}: {recovery_error}")
             recovery = {"reason": why, "recovery_failed": str(recovery_error)}
-        if not args.tracking_check:
-            try:
-                _append_json(rows_path, {"recovery": recovery})
-            except OSError as io_error:
-                _say(f"could not append the recovery to {rows_path}: {io_error}")
+        fate = getattr(error, "victim_fate", None)
+        if fate is not None:
+            recovery["victim"] = fate
+        if gate.pending:
+            recovery["signals_held"] = _signal_counts(gate.pending)
+        # On disk, so that a dropped terminal loses none of it. A failed tracking
+        # check has no rows file, so it gets one of its own.
+        failure_path = tracking_path if args.tracking_check else rows_path
+        try:
+            args.record_dir.mkdir(parents=True, exist_ok=True)
+            if args.tracking_check:
+                _append_json(failure_path, {"header": _record_header(args, started, extra)})
+            _append_json(failure_path, {"recovery": recovery})
+        except OSError as io_error:
+            _say(f"could not write the recovery to {failure_path}: {io_error}")
     finally:
         stop.set()
         reader.join(END_TIMEOUT_S)
@@ -1298,8 +1486,8 @@ def execute(
     if args.skip_reopen and not args.tracking_check:
         warn_reopen_skipped(plan, recovery)
     if gate.pending:
-        _say(f"signal(s) {gate.pending} arrived after the run had stopped or finished and "
-             "were held until everything above was complete.")
+        _say(f"{_signal_summary(gate.pending)} arrived after the run had stopped or finished "
+             "and were held until everything above was complete.")
     return status
 
 
