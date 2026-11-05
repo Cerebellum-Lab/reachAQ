@@ -738,14 +738,23 @@ sessions.
 The chain also needs a host reference for the NI recording, to tie a barcode
 frame to the timekeeper boot that played it: the session's NI-to-host fit (the
 one `cameraNidaqAlignment` uses) when it is valid, else the line through the
-host times of the recording's first and last NI samples. That line is a
-reference only if both points are finite, the second is later, and its slope is
-within 1 % of 1; a failed gate is no reference. `pairing` says which was used,
-`host_time` or `host_endpoints`, and is `null` when neither was. With neither
-the chain is `unavailable`: a tick alone does not say which timekeeper boot
-reported it. Only rows the host received (`host_receive_perf_time`) within the
-recording's host span, widened by 5 s each side, are used, and
-`rowsOutsideNiSpan` counts the rest.
+host times of the first and the last NI samples that have a finite host stamp.
+That line is a reference only if both points are finite, the second is later,
+and its slope is within 1 % of 1; a failed gate is no reference. `pairing` says
+which was used, `host_time` or `host_endpoints`, and is `null` when neither was.
+With neither the chain is `unavailable`: a tick alone does not say which
+timekeeper boot reported it. Only rows the host received
+(`host_receive_perf_time`) within the recording's host span, widened by 5 s each
+side, are used, and `rowsOutsideNiSpan` counts the rest.
+
+The `host_endpoints` line has a slope of exactly 1. The host time the spool
+stores for a sample is the epoch's anchor plus the sample index over the nominal
+rate, so the line through two of them carries no NI-versus-host drift, which the
+session's fit measures. Without a valid fit, then, barcode frames stop pairing
+with their reports once that drift has moved the line by the 0.5 s pairing
+window: after about 0.5 s divided by the drift, 1.4 hours at 100 ppm. This fails
+safe. Frames that no longer pair are lost, and a record that cannot pair enough
+of them is `unavailable`; none is ever paired to the wrong boot.
 
 A session with no `SYNC_BARCODE_REPORT` row, as most sessions are, does not read
 the NI spool for the chain at all. Only a barcode report stamped `physical_start`
@@ -778,7 +787,9 @@ time at each knot), so any time can be mapped through it.
   frames, the record is `unavailable` with a reason that names the tie, and
   report counts do not break it. Every boot not used is listed under
   `ignoredTimekeeperBoots` with its `address`, `bootId`, `reports` and
-  `framesPaired`, so a reset is visible. Every edge of every kept frame is a fit
+  `framesPaired`, so a reset is visible. If no boot paired a frame, none is known
+  to be the timekeeper: `timekeeper` is `null` and every boot that reported is in
+  `ignoredTimekeeperBoots`. Every edge of every kept frame is a fit
   point: the report's
   start-edge board time plus the edge's offset in the frame, against the NI time
   of the sample where that edge was seen. Ten frames spanning ten seconds are the
@@ -848,12 +859,13 @@ reasons:
   the session has no valid NI-to-host fit and no usable host times of the first
   and last NI samples.
 - `timekeeper to NI-DAQ: ...`: no barcode frames decoded (is the barcode line
-  wired?), none of the decoded frames matches a report (of the same tick and
-  host time), fewer than ten matched, a tie
-  between timekeeper boots (or inside one) that pair the same number of
-  frames, or the fit's own reason (too few points, too short a span, too large
-  a residual, a segment running backward). The timekeeper entry keeps its
-  decoded, rejected, matched and inconsistent frame counts.
+  wired?), or none of the decoded frames matches a report (of the same tick and
+  host time); a tie between timekeeper boots (or inside one) that pair the same
+  number of frames. Those three name no timekeeper. Or, with a boot that paired
+  frames, fewer than ten matched, or the fit's own reason (too few points, too
+  short a span, too large a residual, a segment running backward); the
+  timekeeper entry then keeps its decoded, rejected, matched and inconsistent
+  frame counts.
 - `board clock chain failed: <exception>`: the chain raised.
 
 Finalization never fails because of the chain. If the chain raises, or its record

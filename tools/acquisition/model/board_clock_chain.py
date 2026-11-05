@@ -469,12 +469,6 @@ def _tone_cross_check(tones, link, indices, rate, channels) -> dict:
 
 def _timekeeper_link(frames, chosen, indices, rate):
     """Timekeeper boot seconds -> NI seconds from every edge of the kept frames, or why not."""
-    if not frames:
-        return clocks.invalid_piecewise_line_fit("no barcode frames decoded (is the barcode line wired?)")
-    if not chosen.paired:
-        return clocks.invalid_piecewise_line_fit(
-            f"{len(frames)} barcode frames decoded, none matches a SYNC_BARCODE report of the same tick and host time",
-        )
     if len(chosen.kept) < BARCODE_FIT_MIN_FRAMES:
         return clocks.invalid_piecewise_line_fit(
             f"only {len(chosen.kept)} barcode frames matched SYNC_BARCODE reports, need {BARCODE_FIT_MIN_FRAMES}",
@@ -589,21 +583,30 @@ def board_clock_chain(
 
     best = max(len(candidate.kept) for candidate in candidates)
     leaders = [candidate for candidate in candidates if len(candidate.kept) == best]
-    if best and (len(leaders) > 1 or leaders[0].tied):
-        how = "by tick and host time"
-        if len(leaders) > 1:
-            names = " and ".join(f"{leader.key[1]:#x}" for leader in leaders)
-            why = (f"tie between timekeeper boots {names}: each pairs {best} barcode frames with its reports {how}, "
-                   "so which one drove the NI-DAQ line cannot be told")
-        else:
-            why = (f"tie inside timekeeper boot {leaders[0].key[1]:#x}: two runs of {best} barcode frames paired "
-                   f"{how} disagree on NI time minus board time, so which belongs to it cannot be told")
+    if not best:
+        # Nothing paired, so no boot is known to have driven the line: none is named the timekeeper, and every
+        # boot that reported is listed as not used.
+        why = (
+            "no barcode frames decoded (is the barcode line wired?)" if not frames else
+            f"{len(frames)} barcode frames decoded, none matches a SYNC_BARCODE report of the same tick and host time"
+        )
         return unavailable(
             f"timekeeper to NI-DAQ: {why}", rejected=rejected, ignored=[listed(c) for c in candidates],
             pairing=pairing, outside=outside,
         )
-    # With nothing paired there is no link to make; show the boot that reported most.
-    chosen = leaders[0] if best else max(candidates, key=lambda candidate: len(candidate.ticks))
+    if len(leaders) > 1 or leaders[0].tied:
+        if len(leaders) > 1:
+            names = " and ".join(f"{leader.key[1]:#x}" for leader in leaders)
+            why = (f"tie between timekeeper boots {names}: each pairs {best} barcode frames with its reports by tick "
+                   "and host time, so which one drove the NI-DAQ line cannot be told")
+        else:
+            why = (f"tie inside timekeeper boot {leaders[0].key[1]:#x}: two runs of {best} barcode frames paired by "
+                   "tick and host time disagree on NI time minus board time, so which belongs to it cannot be told")
+        return unavailable(
+            f"timekeeper to NI-DAQ: {why}", rejected=rejected, ignored=[listed(c) for c in candidates],
+            pairing=pairing, outside=outside,
+        )
+    chosen = leaders[0]
     ignored = [listed(candidate) for candidate in candidates if candidate is not chosen]
     (address, boot_id) = chosen.key
 

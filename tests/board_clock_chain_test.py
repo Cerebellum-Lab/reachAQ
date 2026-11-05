@@ -837,3 +837,45 @@ def test_composition_extends_over_every_bend_of_the_outer_link_even_beyond_the_i
     assert composed.knots.tolist() == pytest.approx(sorted([0.0, 100.0, 250.0, -50.0, 10.0, 80.0, 190.0, 320.0]))
     x = np.linspace(-60.0, 330.0, 3901)
     assert composed.map(x) == pytest.approx(outer.map(inner.map(x)), abs=1e-12)
+
+
+def _shift_reports(rows, seconds):
+    """The rows with every SYNC_BARCODE report received `seconds` later than its frame's start edge implies."""
+    return [
+        (row[0] + seconds, row[1] + seconds, *row[2:9], row[9] + seconds, row[10] + seconds, *row[11:])
+        if row[3] == "SYNC_BARCODE_REPORT" else row
+        for row in rows
+    ]
+
+
+@pytest.mark.parametrize("mode", ["host_time", "host_endpoints"])
+def test_when_no_barcode_frame_pairs_no_boot_is_named_the_timekeeper(mode):
+    # Frames decode and two boots reported their ticks, but every report arrived 3 s after its frame.
+    rows, channels, indices = clock_rig(
+        io_eras=[(0xA, IO_CLOCK, 1, 100, 10.0), (0xB, linear_clock(-110.0, 1.00003), 1, 120, 113.0)],
+        pellet_eras=[(PELLET_BOOT, PELLET_CLOCK, -20.0, 400.0)],
+        ni_seconds=240.0, tones=[(60.30043, 5000)],
+    )
+
+    record = _chain(_shift_reports(rows, 3.0), channels, indices, **_reference(mode, indices))
+
+    assert record["status"] == "unavailable" and "none matches" in record["reason"]
+    assert record["timekeeper"] is None and record["niTime"] is None and record["boards"] == []
+    assert record["ignoredTimekeeperBoots"] == [
+        {"address": IO_ADDRESS, "bootId": 0xA, "reports": 100, "framesPaired": 0},
+        {"address": IO_ADDRESS, "bootId": 0xB, "reports": 120, "framesPaired": 0},
+    ]
+    json.dumps(record, allow_nan=False, sort_keys=True)
+
+
+def test_a_line_with_no_frames_names_no_timekeeper_either():
+    rows, channels, indices = synthetic_rig(seconds=20)
+    channels["barcode"][:] = 0.0
+
+    record = _chain(rows, channels, indices)
+
+    assert record["status"] == "unavailable" and "no barcode frames decoded" in record["reason"]
+    assert record["timekeeper"] is None and record["niTime"] is None
+    assert record["ignoredTimekeeperBoots"] == [
+        {"address": IO_ADDRESS, "bootId": IO_BOOT, "reports": 19, "framesPaired": 0},
+    ]
