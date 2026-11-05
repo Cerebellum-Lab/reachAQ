@@ -61,6 +61,12 @@ class PoseResponse:
     associate live tracking with an exact recording/trial window.
     """
 
+    source_frame_perf_times: Tuple[Tuple[float, ...], ...] = ()
+    """Host perf time each source frame was exposed, parallel to ``source_frame_ids``.
+
+    Empty when the producer did not supply them.
+    """
+
     live_recv_perf_c: float = math.nan
     """perf_counter when a live worker took this pose off its queue; NaN off the live path."""
 
@@ -150,6 +156,7 @@ class PoseResponse:
             sequence=self.sequence,
             perf_c=self.perf_c,
             source_frame_ids=self.source_frame_ids,
+            source_frame_perf_times=self.source_frame_perf_times,
             live_recv_perf_c=self.live_recv_perf_c,
             live_put_perf_c=self.live_put_perf_c,
             parts_flags=self.parts_flags,

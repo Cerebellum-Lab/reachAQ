@@ -29,6 +29,26 @@ class FrameTimelineAnchor:
             int(frame_id) - self.primary_frame_id
         ) / self.frame_rate
 
+    def frame_id_bounds(self, start_perf: float, end_perf: float) -> Tuple[int, int]:
+        """First and last frame IDs captured within the interval, inverse of perf_time."""
+        start_frame_id = max(
+            self.primary_frame_id,
+            math.ceil(
+                self.primary_frame_id
+                + (start_perf - self.start_perf_time) * self.frame_rate
+                - 1e-9
+            ),
+        )
+        end_frame_id = max(
+            start_frame_id,
+            math.floor(
+                self.primary_frame_id
+                + (end_perf - self.start_perf_time) * self.frame_rate
+                + 1e-9
+            ),
+        )
+        return start_frame_id, end_frame_id
+
 
 @dataclass(frozen=True)
 class TrackingLocation:
@@ -83,6 +103,12 @@ class LiveTrackingSample:
             return None
         if any(current <= previous for previous, current in zip(primary_ids, primary_ids[1:])):
             raise ValueError("Live primary source frame IDs must be strictly increasing")
+        # The camera's own exposure time for each frame when the response has
+        # one for every frame; the anchor's nominal rate drifts from it.
+        source_perfs = tuple(getattr(response, "source_frame_perf_times", ()))
+        primary_perfs = tuple(float(value) for value in source_perfs[0]) if source_perfs else ()
+        if len(primary_perfs) != len(primary_ids) or not all(map(math.isfinite, primary_perfs)):
+            primary_perfs = tuple(anchor.perf_time(frame_id) for frame_id in primary_ids)
 
         def xyz(value):
             return float(value[0]), float(value[1]), float(value[2])
@@ -101,11 +127,9 @@ class LiveTrackingSample:
         return cls(
             sequence=int(response.sequence),
             primary_frame_ids=primary_ids,
-            primary_frame_perf_times=tuple(
-                anchor.perf_time(frame_id) for frame_id in primary_ids
-            ),
-            source_start_perf=anchor.perf_time(primary_ids[0]),
-            source_end_perf=anchor.perf_time(primary_ids[-1]),
+            primary_frame_perf_times=primary_perfs,
+            source_start_perf=min(primary_perfs),
+            source_end_perf=max(primary_perfs),
             processing_perf=float(response.perf_c),
             pellet_seen=bool(response.pellet_seen),
             locations_3d=locations,

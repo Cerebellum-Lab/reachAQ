@@ -113,11 +113,14 @@ class LivePoseResultProcessWorker(multiprocessing.Process):
             received = time.perf_counter()
             if len(payload) == 2:
                 # Compatibility with callers/tests that predate source-frame
-                # propagation. New monitor processes always send three items.
+                # propagation. New monitor processes always send four items.
                 pose_data, seq_nr = payload
-                source_frame_ids = ()
-            else:
+                source_frame_ids = source_frame_perf_times = ()
+            elif len(payload) == 3:
                 pose_data, seq_nr, source_frame_ids = payload
+                source_frame_perf_times = ()
+            else:
+                pose_data, seq_nr, source_frame_ids, source_frame_perf_times = payload
             count_processed += 1
             rsp = self._pose_algo.process(
                 pose_data,
@@ -130,6 +133,10 @@ class LivePoseResultProcessWorker(multiprocessing.Process):
                 source_frame_ids=tuple(
                     tuple(int(frame_id) for frame_id in camera_ids)
                     for camera_ids in source_frame_ids
+                ),
+                source_frame_perf_times=tuple(
+                    tuple(float(frame_perf) for frame_perf in camera_perf)
+                    for camera_perf in source_frame_perf_times
                 ),
                 # The latency record: when this worker took the pose, and when
                 # it hands the result on (perf_c already marks triangulation).
