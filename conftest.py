@@ -104,7 +104,7 @@ def pytest_unconfigure(config):
         )
         out.flush()
         subprocess.run(
-            ["ps", "--forest", "-u", str(os.getuid()), "-o", "pid,ppid,etimes,stat,wchan:20,comm,args"],
+            ["ps", "-ww", "--forest", "-u", str(os.getuid()), "-o", "pid,ppid,etimes,stat,wchan:20,comm,args"],
             stdout=out,
             check=False,
             timeout=30,
