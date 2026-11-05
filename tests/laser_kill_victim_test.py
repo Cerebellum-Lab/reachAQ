@@ -159,12 +159,41 @@ def test_wait_for_cue_gives_up_at_once_when_its_parent_has_gone(monkeypatch):
     assert victim.wait_for_cue(30.0) is False
     assert time.monotonic() - started < 2.0
 
-def test_an_orphaned_victim_closes_the_output_and_says_it_was_orphaned(daq, monkeypatch):
-    monkeypatch.setattr(victim, "_PARENT_PID", os.getppid() + 1)
-    code, lines = _run(daq, _args(timing="software", mode="hang"), cued=False)
+def test_a_victim_whose_parent_goes_while_it_waits_for_its_cue_closes_and_says_orphaned(daq, monkeypatch):
+    monkeypatch.setattr(victim, "_PARENT_PID", victim._PARENT_PID)     # restored afterwards
+    def parent_goes_while_waiting(timeout):
+        monkeypatch.setattr(victim, "_PARENT_PID", os.getppid() + 1)
+        return False
+    lines = []
+    code = victim.run(_args(timing="software", mode="hang"),
+                      load=lambda path, save_backup: _system(fake.rig_lasers()),
+                      announce=lines.append, wait_for_cue=parent_goes_while_waiting)
     assert code == 3 and lines[-1] == "ORPHANED"
     assert daq.task("laser_1_ao").closed
     assert daq.writes_to("PXI1Slot4/ao0", task_suffix="laser_1_ao")[-1] == 0.0
+
+def test_a_victim_whose_orchestrator_went_while_it_was_starting_opens_nothing(daq, monkeypatch):
+    # The orchestrator died during this process's imports: its pid, passed on the
+    # command line, is no longer the parent at the very first check.
+    monkeypatch.setattr(victim, "_PARENT_PID", victim._PARENT_PID)     # restored afterwards
+    victim.adopt_parent(os.getppid() + 1)
+    lines = []
+    code = victim.run(_args(timing="software", mode="hang"),
+                      load=lambda path, save_backup: _system(fake.rig_lasers()),
+                      announce=lines.append, wait_for_cue=lambda timeout: True)
+    assert code == 3 and lines == ["ORPHANED"] and daq.tasks == []
+
+def test_adopt_parent_takes_the_given_pid_or_the_current_parent(monkeypatch):
+    monkeypatch.setattr(victim, "_PARENT_PID", victim._PARENT_PID)
+    victim.adopt_parent(4321)
+    assert victim._PARENT_PID == 4321
+    victim.adopt_parent(None)
+    assert victim._PARENT_PID == os.getppid()
+
+def test_the_victim_takes_the_orchestrators_pid_from_its_arguments():
+    base = ["--timing=software", "--waveform=dc", "--mode=clean", "--laser-disconnected"]
+    assert victim.parse_args(base + ["--orchestrator-pid=777"]).orchestrator_pid == 777
+    assert victim.parse_args(base).orchestrator_pid is None
 
 def _pause_that_gives_up(calls):
     """A pause for a loop that must end: a loop that never does fails the test, not hangs it."""

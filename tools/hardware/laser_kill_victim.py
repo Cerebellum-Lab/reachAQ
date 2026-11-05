@@ -64,8 +64,11 @@ _CUE_POLL_S = 0.01
 #: Set by the SIGUSR1 handler; wait_for_cue polls it.
 _cued = threading.Event()
 
-#: The pid of whoever started this process, taken at start. When it changes the
-#: parent is gone (the process was reparented) and no cue or kill can come.
+#: The pid of the process that started this one. When os.getppid() stops being
+#: it, that process is gone (this one was reparented) and no cue or kill can
+#: come. The orchestrator passes its own pid (--orchestrator-pid), so a parent
+#: that died while this process was still importing is noticed too; a victim run
+#: by hand takes its parent at the start of main. adopt_parent sets it.
 _PARENT_PID = os.getppid()
 
 _REFUSAL = (
@@ -73,6 +76,12 @@ _REFUSAL = (
     "is off, the command BNC and shutter cable are unplugged and the output is "
     "on the dummy load"
 )
+
+
+def adopt_parent(orchestrator_pid: Optional[int]) -> None:
+    """Take `orchestrator_pid` as the parent to watch; None takes the current one."""
+    global _PARENT_PID
+    _PARENT_PID = os.getppid() if orchestrator_pid is None else orchestrator_pid
 
 
 def orphaned() -> bool:
@@ -92,6 +101,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--pulse-seconds", type=float, default=30.0)
     parser.add_argument("--ready-settle", type=float, default=0.5)
     parser.add_argument("--cue-timeout", type=float, default=60.0)
+    parser.add_argument(
+        "--orchestrator-pid", type=int, default=None,
+        help="the pid of the process that started this one; this one closes the "
+             "output and exits if that process goes away (default: its parent at start)")
     parser.add_argument(
         "--laser-disconnected", action="store_true",
         help="the laser is unable to emit (key off, command BNC and shutter cable "
@@ -272,6 +285,11 @@ def run(
     announce=_announce,
     wait_for_cue=wait_for_cue,
 ) -> int:
+    # The orchestrator may have gone while this process was starting up: then
+    # there is nobody to cue it or kill it, and nothing has been opened yet.
+    if orphaned():
+        announce("ORPHANED")
+        return 3
     # Only .laser and .nidaq_stream.analog_terminal_config are read. Never saved:
     # save_backup=False, and no AppModel is built (it saves on exit).
     configuration = load(args.config, save_backup=False)
@@ -305,7 +323,9 @@ def main() -> int:
     # A handler for the cue only. The application has none for SIGTERM or
     # SIGINT either; `hang` installs its own ignore when cued.
     signal.signal(signal.SIGUSR1, _on_cue)
-    return run(parse_args())
+    args = parse_args()
+    adopt_parent(args.orchestrator_pid)
+    return run(args)
 
 
 if __name__ == "__main__":
