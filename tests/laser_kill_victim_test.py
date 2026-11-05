@@ -228,3 +228,10 @@ def test_announcing_into_a_closed_pipe_does_not_raise(monkeypatch):
             raise BrokenPipeError("the orchestrator is gone")
     monkeypatch.setattr(sys, "stdout", _Closed())
     victim._announce("READY pid=1")
+
+def test_an_abbreviation_cannot_attest_the_laser_is_disconnected(capsys):
+    base = ["--timing=software", "--waveform=dc", "--mode=clean"]
+    for abbreviation in ("--laser-d", "--laser-disconnect"):
+        with pytest.raises(SystemExit):
+            victim.parse_args(base + [abbreviation])
+    assert "unrecognized arguments" in capsys.readouterr().err

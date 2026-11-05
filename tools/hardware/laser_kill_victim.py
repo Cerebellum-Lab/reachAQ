@@ -89,8 +89,10 @@ def orphaned() -> bool:
 
 
 def parse_args(argv=None) -> argparse.Namespace:
+    # No abbreviations: --laser-d must not be taken for --laser-disconnected.
     parser = argparse.ArgumentParser(
-        description="Hold the laser output in one state and die on a SIGUSR1 cue.")
+        description="Hold the laser output in one state and die on a SIGUSR1 cue.",
+        allow_abbrev=False)
     parser.add_argument(
         "--config", default=os.path.expanduser("~/Autotrainer/system_configuration.yaml"))
     parser.add_argument("--laser", type=int, default=1)
